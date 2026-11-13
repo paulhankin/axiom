@@ -67,6 +67,8 @@ pub struct VLoc {
     size: u32,
     ind: bool,   // the variable is in memory at the value (a variable length array: its address)
     gsym: []u8,  // LK_GADDR: the datum
+    inst: u32,   // a variable of a function inlined: its inline instance (ir.DbgMark.inst; var indexes its
+                 // function's), 0: the function's own
 }
 
 pub const LK_REG: u8 = 0;
@@ -95,6 +97,8 @@ struct Ent {
     psize: u32,
     size: u32,  // its values' bytes
     ind: bool,  // its values are its address (dbinfo's indirect)
+    inst: u32,  // (an inlined function's variable: its inline instance)
+    nxt: i32,   // the entity of the same var and piece of another instance (-1: none)
 }
 
 // A value the marks name (or a phi's input, or the base of one).
@@ -232,18 +236,23 @@ fn low_fits(v: *ir.Value, ty: i32, psize: u32) u32 {
     return @truncate(u32, d.size);
 }
 
-fn ent_of(var: i32, poff: u32, psize: u32, size: u32) i32 {
+fn ent_of(var: i32, poff: u32, psize: u32, size: u32, inst: u32) i32 {
     let kv = (@as(u64, @bit_cast(u32, var)) << 40) | (@as(u64, poff) << 20) | @as(u64, psize & 0xfffff);
     let kk = key(@truncate(usize, kv + 1));
     let k = by_ent.get(kk);
-    if k > 0 {
-        let en = ENTS.at(@int_cast(usize, k - 1));
-        if en.size == 0 {
-            en.size = size;  // (a kill made it first)
+    let mut j = k - 1;
+    while j >= 0 {
+        let en = ENTS.at(@int_cast(usize, j));
+        if en.inst == inst {
+            if en.size == 0 {
+                en.size = size;  // (a kill made it first)
+            }
+            return j;
         }
-        return k - 1;
+        j = en.nxt;
     }
-    ENTS.push(Ent.{ var: @bit_cast(u32, var), poff: poff, psize: psize, size: size, ind: false });
+    ENTS.push(Ent.{ var: @bit_cast(u32, var), poff: poff, psize: psize, size: size, ind: false, inst: inst,
+                    nxt: k - 1 });
     by_ent.put(kk, @int_cast(i32, ENTS.len));
     return @int_cast(i32, ENTS.len - 1);
 }
@@ -399,7 +408,7 @@ pub fn begin(f: *mut ir.Func, on: bool) void {
             let mut k = ir.dbg_marks_at(i);
             while k >= 0 {
                 let m = ir.dbg_marks.get(@int_cast(usize, k));
-                if @int_from_ptr(m.owner) == @int_from_ptr(f) {
+                if (@int_from_ptr(m.owner) == @int_from_ptr(f)) or (m.inst != 0) {
                     let v = ir.dbg_mark_value(k);
                     if u.notnil(v) and (cst_of(v) < 0) {
                         _ = val_of(v, 0);
@@ -449,14 +458,20 @@ pub fn before(i: *ir.Value, b: *mut mc.MBlock) void {
     if k < 0 {
         return;
     }
-    let vs = dbi.vars_of(FN.name);
+    let own = dbi.vars_of(FN.name);
     let mut chain: i32 = 0;
     while k >= 0 {
         let m = ir.dbg_marks.get(@int_cast(usize, k));
         let mk = k;
         k = m.next;
-        if (@int_from_ptr(m.owner) != @int_from_ptr(FN)) or (m.var < 0) or (@int_cast(usize, m.var) >= vs.len) {
-            continue;  // (an inlined function's)
+        let mut vs = own;
+        if m.inst != 0 {
+            vs = dbi.vars_of(m.owner.name);  // (an inlined function's, of its instance)
+        } else if @int_from_ptr(m.owner) != @int_from_ptr(FN) {
+            continue;
+        }
+        if (m.var < 0) or (@int_cast(usize, m.var) >= vs.len) {
+            continue;
         }
         let x = vs[@int_cast(usize, m.var)];
         if u.notnil(x.global) {
@@ -488,9 +503,9 @@ pub fn before(i: *ir.Value, b: *mut mc.MBlock) void {
                 vi = val_of(v, 0);
             }
         }
-        let e = ent_of(m.var, m.off, m.size, size);
+        let e = ent_of(m.var, m.off, m.size, size, m.inst);
         ENTS.at(@int_cast(usize, e)).ind = x.indirect;
-        if (vi >= 0) and x.param and (VALS.get(@int_cast(usize, vi)).v.kind == ir.V_PARAM) {
+        if (vi >= 0) and x.param and (m.inst == 0) and (VALS.get(@int_cast(usize, vi)).v.kind == ir.V_PARAM) {
             PENTS.push([e, vi]);
         }
         MKS.push(MMark.{ ent: e, val: vi, cst: ci, add: madd });
@@ -1388,7 +1403,7 @@ fn run_block(an: *An, b: usize, s: *mut State) void {
 fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
     let en = ENTS.get(e);
     let mut r = VLoc.{ var: en.var, poff: en.poff, psize: en.psize, kind: 0xff, start: 0, end: 0, reg: -1, off: 0,
-                       add: s.a[e], size: en.size, ind: en.ind, gsym: "" };
+                       add: s.a[e], size: en.size, ind: en.ind, gsym: "", inst: en.inst };
     let id = s.d[e];
     if id <= 0 {
         return r;

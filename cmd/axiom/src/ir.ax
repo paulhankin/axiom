@@ -2692,6 +2692,10 @@ pub struct DbgRef {
 }
 
 pub let mut dbg_on: bool = false;
+// Inlining records where inlined code came from (inline.ax: the inline
+// instances of dbginfo.ax's scopes, in Value.scope): with any debug
+// information (line tables too, which crash traces read the chain from).
+pub let mut dbg_scopes: bool = false;
 pub let mut dbg_refs: u.List.[DbgRef] = u.List.[DbgRef].{ data: @ptr_from_int(*mut DbgRef, 0), len: 0, cap: 0 };
 // an instruction (its address) -> the first entry of dbg_refs following it + 1
 let mut dbg_at: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
@@ -2930,6 +2934,7 @@ pub struct DbgMark {
     ref: i32,   // a dbg_refs index (the value), -1: a kill
     src: i32,   // a copy's (a kill): the mark it is a copy of, for dbg_mark_set (-1: none)
     next: i32,  // the next mark at the same place (-1: none)
+    inst: u32,  // a variable of an inlined function's: the root of its inline instance (dbginfo.ax's scopes), 0: owner's own
 }
 
 // The marks at a place (an instruction, or a block's end): the first one
@@ -2998,24 +3003,25 @@ fn mk_cat(x: i32, y: i32) i32 {
 /// A mark before instruction `at`, after the others there: variable `var`
 /// of function `owner` (its piece of `size` bytes at `off`; size 0: all of
 /// it) is v from there on (nil: not known).
-pub fn dbg_mark(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value) void {
+pub fn dbg_mark(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value, inst: u32) void {
     let mut r: i32 = -1;
     if u.notnil(v) {
         r = dbg_track(v);
     }
     let k = @int_cast(i32, dbg_marks.len);
-    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: -1 });
+    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: -1, inst: inst });
     mk_set(at, mk_cat(dbg_marks_at(at), k));
 }
 
 /// The same, before the marks at `at` already.
-pub fn dbg_mark_first(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value) void {
+pub fn dbg_mark_first(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value, inst: u32) void {
     let mut r: i32 = -1;
     if u.notnil(v) {
         r = dbg_track(v);
     }
     let k = @int_cast(i32, dbg_marks.len);
-    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: dbg_marks_at(at) });
+    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: dbg_marks_at(at),
+                             inst: inst });
     mk_set(at, k);
 }
 
@@ -3045,6 +3051,16 @@ pub fn dbg_mark_set(k: i32, v: *mut Value, low: bool, plus: i64) void {
     let m = dbg_marks.at(@int_cast(usize, k));
     m.ref = r;
     m.src = -1;
+}
+
+/// The inline instance of mark k's variable (DbgMark.inst; 0: its owner's own).
+pub fn dbg_mark_inst(k: i32) u32 {
+    return dbg_marks.get(@int_cast(usize, k)).inst;
+}
+
+/// Mark k's variable is of inline instance `inst` (DbgMark.inst).
+pub fn dbg_mark_set_inst(k: i32, inst: u32) void {
+    dbg_marks.at(@int_cast(usize, k)).inst = inst;
 }
 
 /// The mark mark k is a copy (a kill) of, -1: none.
@@ -3102,7 +3118,7 @@ fn mk_copy_kills(y: *mut Value, k0: i32) void {
     let mut k = k0;
     while k >= 0 {
         let m = dbg_marks.get(@int_cast(usize, k));
-        dbg_mark(y, m.owner, m.var, m.off, m.size, vnil());
+        dbg_mark(y, m.owner, m.var, m.off, m.size, vnil(), m.inst);
         dbg_marks.at(dbg_marks.len - 1).src = k;
         k = m.next;
     }
@@ -3142,7 +3158,7 @@ fn mk_block_gone(b: *mut Block) void {
         while j > 0 {
             j -= 1;
             let m = dbg_marks.get(@int_cast(usize, ks.get(j)));
-            dbg_mark_first(at, m.owner, m.var, m.off, m.size, vnil());
+            dbg_mark_first(at, m.owner, m.var, m.off, m.size, vnil(), m.inst);
         }
     }
     ks.deinit();
@@ -3157,6 +3173,7 @@ pub struct DbgSlot {
     var: i32,
     off: u32,
     size: u32,  // (0: all of the variable)
+    inst: u32,  // (an inlined function's variable: its inline instance, DbgMark.inst)
 }
 
 pub let mut dbg_slots: u.List.[DbgSlot] = u.List.[DbgSlot].{ data: @ptr_from_int(*mut DbgSlot, 0), len: 0, cap: 0 };
@@ -3176,8 +3193,8 @@ pub fn dbg_slot_of(a: *Value) i32 {
 }
 
 /// Alloca a holds variable `var` of `owner` (its `size` bytes from off; 0: all).
-pub fn dbg_slot_note(a: *Value, owner: *mut Func, var: i32, off: u32, size: u32) void {
-    dbg_slots.push(DbgSlot.{ id: a.id, owner: owner, var: var, off: off, size: size });
+pub fn dbg_slot_note(a: *Value, owner: *mut Func, var: i32, off: u32, size: u32, inst: u32) void {
+    dbg_slots.push(DbgSlot.{ id: a.id, owner: owner, var: var, off: off, size: size, inst: inst });
     dbg_slot_at.put(mk_key(@int_from_ptr(a)), @int_cast(i32, dbg_slots.len));
 }
 
@@ -3189,7 +3206,7 @@ pub fn dbg_slot_part(part: *Value, whole: *Value, off: u64, size: u64) void {
         return;
     }
     let s = dbg_slots.get(@int_cast(usize, k));
-    dbg_slot_note(part, s.owner, s.var, s.off + @truncate(u32, off), @truncate(u32, size));
+    dbg_slot_note(part, s.owner, s.var, s.off + @truncate(u32, off), @truncate(u32, size), s.inst);
 }
 
 // Rewrites every operand of f's instructions through resolve().

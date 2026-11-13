@@ -2310,11 +2310,35 @@ is read at run time), also where no call was recorded (all of a program inlined 
 
 At `-O2` and `-O3` the trace is correct for the frames that exist, and the calls the
 optimizer inlined into them are in it too (an inlined call's record carries the calls
-it was inlined into). What is absent: a function whose last act was a call
-(`return f(x);`) leaves its frame first, so the trace lacks it; and a crash in code
-inlined into a function that makes no call between it and its caller (all of a small
-program inlined into `main`, say) shows only the frames from that function's caller
-up, which can be none: then only the crash line is printed. At `-O0` and `-O1` the
+it was inlined into), each such frame marked with the function it was inlined into:
+
+```
+stack trace (innermost first):
+  at <indirect call>
+  at early (crash2.c:9:16) (inlined into tailer)
+  at tailer (crash2.c:15:12) (inlined into deep)
+  at deep (crash2.c:18:16) (inlined into main)
+  at main (crash2.c:22:12)
+```
+
+With line tables the code a crash is in is shown with the functions inlined there too
+(the frame table's line rows hold the inline chain: the line, then the call each
+inlined function was inlined at), also where no call was recorded:
+
+```
+stack trace (innermost first):
+  at deref (crash.c:2) (inlined into middle)
+  at middle (crash.c:5) (inlined into main)
+  at main (crash.c:9) (inlined into main)
+  at main (std/internal/runtime/c_start.ax:50)
+```
+
+(C's `main` is inlined into the start-up's; a call the compiler made, without a
+location, is not shown.) What is absent: a function whose last act was a call
+(`return f(x);`) leaves its frame first, so the trace lacks it; and without line tables
+a crash in code inlined into a function that makes no call between it and its caller
+(all of a small program inlined into `main`, say) shows only the frames from that
+function's caller up, which can be none: then only the crash line is printed. At `-O0` and `-O1` the
 functions are not inlined and the trace is complete in the programs tried. C code has none of
 Axiom's run-time checks: no bounds or overflow checks, so a bad pointer is a crash if it
 is one at all. On WebAssembly C functions leave no call records: a trap (such as a
@@ -2354,6 +2378,20 @@ either, where the debug information itself is in the `.dSYM`).
   statements (in pieces at `-O2`, `.debug_rnglists`), its variables, its block-scope
   `static` objects, typedefs, structures, unions and enumerations: a name declared
   again inside a block is told apart from the outer one.
+- **Inlined functions**: code the optimizer inlined is an inline instance of the
+  function (`DW_TAG_inlined_subroutine`: its code, the call's file and line, in the
+  scope of the call), of an abstract instance of it in the unit (`DW_AT_inline`, its
+  name, declaration, result, parameters and variables), with the instance's
+  parameters and variables located as any (below) and its lexical blocks; instances
+  inlined into instances are nested. An instruction's scope says its inline chain
+  (`dbginfo.ax`: inlining copies the scopes of the code it copies, `inline.ax`), at
+  `--debug-info=lines` too, where the instances are without variables. The debuggers
+  show inlined frames in a backtrace, with their arguments, and `step` enters them
+  (x86-64; AArch64 under emulation). The name index has the abstract and inline
+  instances. The PDB has the same as inline sites (`S_INLINESITE`, its binary
+  annotations giving its code and lines from the function's declaration, which the
+  module's `DEBUG_S_INLINEELINES` gives; the inlined function's id, `LF_FUNC_ID`; its
+  variables), at `-g`.
 - **Locations at `-O0`**: every variable is in memory, in its frame slot (`-O0` keeps
   it there, with or without `-g`), from the end of the prologue on. A parameter passed
   by reference (a large structure on AArch64 and Windows) and a variable length array

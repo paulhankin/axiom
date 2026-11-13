@@ -156,7 +156,19 @@ fn exact_digits(frac: u64, ex: i32, out: []mut u8, dexp: *mut i32) usize {
 }
 
 pub fn call_at(ss: *ShadowStack, i: u32) *Site {
-    return ss.calls[@as(usize, i & (SS_CAP - 1))];
+    return untag(ss.calls[@as(usize, i & (SS_CAP - 1))]);
+}
+
+/// Was the function of the call recorded at i inlined into the next one's
+/// (outward: i - 1)? (Native frame tables mark such a record's address in
+/// a chain, and the walk keeps the mark: cmd/axiom/src/ftab.ax.)
+pub fn call_inlined(ss: *ShadowStack, i: u32) bool {
+    return (@int_from_ptr(ss.calls[@as(usize, i & (SS_CAP - 1))]) & 1) != 0;
+}
+
+// A record's address without the mark of a frame inlined.
+fn untag(s: *Site) *Site {
+    return @ptr_from_int(*Site, @int_from_ptr(s) & ~@as(usize, 1));
 }
 
 pub fn trap_name(code: u32) []u8 {
@@ -427,6 +439,12 @@ pub fn format_trap(o: *mut Fmt, s: *Site, info: *TrapInfo) void {
 }
 
 fn frame_line(o: *mut Fmt, c: *Site) void {
+    frame_line_in(o, c, @ptr_from_int(*Site, 0));
+}
+
+// A frame's line; `into`: the record of the call its function was inlined
+// at (null: not inlined).
+fn frame_line_in(o: *mut Fmt, c: *Site, into: *Site) void {
     o.s("  at ");
     o.s(cstr(c.fn_()));
     o.s(" (");
@@ -435,22 +453,70 @@ fn frame_line(o: *mut Fmt, c: *Site) void {
     o.u(@as(u64, c.line));
     o.c(':');
     o.u(@as(u64, c.col));
-    o.s(")\n");
+    o.s(")");
+    inlined_into(o, into);
+    o.s("\n");
+}
+
+fn inlined_into(o: *mut Fmt, into: *Site) void {
+    if not is_null(@ptr_cast(*void, into)) {
+        o.s(" (inlined into ");
+        o.s(cstr(into.fn_()));
+        o.s(")");
+    }
+}
+
+// The lines of the code a crash is in (line_chain_at's chain): each record
+// but the last is of a function inlined into the next one's, at the next
+// one's location; the last is the function's own (whose name the first call
+// record's callee also is). Their number.
+fn line_frames(o: *mut Fmt, chain: usize) u32 {
+    let mut n: u32 = 0;
+    let mut c = chain;
+    while rd_usize(c) != 0 {
+        let x = rd_usize(c);
+        let site = untag(@ptr_from_int(*Site, x));
+        o.s("  at ");
+        o.s(cstr(site.fn_()));
+        if site.line != 0 {
+            o.s(" (");
+            o.s(cstr(site.file()));
+            o.c(':');
+            o.u(@as(u64, site.line));
+            o.s(")");
+        }
+        if ((x & 1) != 0) and (rd_usize(c + 8) != 0) {
+            inlined_into(o, untag(@ptr_from_int(*Site, rd_usize(c + 8))));
+        }
+        o.s("\n");
+        n += 1;
+        c += 8;
+    }
+    return n;
 }
 
 // "stack trace" lines for a trap at `top` (0: location unknown).
 pub fn format_stack(o: *mut Fmt, top: *Site, ss: *ShadowStack) void {
-    format_stack_line(o, top, ss, @ptr_from_int(*Site, 0));
+    format_stack_line(o, top, ss, @ptr_from_int(*Site, 0), 0);
 }
 
 /// format_stack for a crash at pc, with the frame table tab: the innermost
 /// frame's line also shows the faulting instruction's file and line when
 /// the program has line tables (-g: line_at).
 pub fn format_crash_stack(o: *mut Fmt, ss: *ShadowStack, tab: *usize, pc: usize) void {
-    format_stack_line(o, @ptr_from_int(*Site, 0), ss, line_at(tab, pc));
+    let mut ch = line_chain_at(tab, pc);
+    let mut line = @ptr_from_int(*Site, 0);
+    if ch != 0 {
+        line = untag(@ptr_from_int(*Site, rd_usize(ch)));
+        if rd_usize(ch + 8) == 0 {
+            ch = 0;  // (not inlined: the line alone)
+        }
+    }
+    format_stack_line(o, @ptr_from_int(*Site, 0), ss, line, ch);
 }
 
-fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site) void {
+// (`chain`: the lines of code inlined that a crash is in, line_frames; 0: none)
+fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site, chain: usize) void {
     let has_ss = not is_null(@ptr_cast(*void, ss));
     let mut depth: u32 = 0;
     if has_ss {
@@ -458,7 +524,10 @@ fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site) voi
     }
     let has_top = not is_null(@ptr_cast(*void, top));
     if not has_top and (depth == 0) {
-        if not is_null(@ptr_cast(*void, line)) {
+        if chain != 0 {
+            o.s("stack trace (innermost first):\n");
+            _ = line_frames(o, chain);
+        } else if not is_null(@ptr_cast(*void, line)) {
             // (no call recorded: the faulting function's line alone)
             o.s("stack trace (innermost first):\n  at ");
             o.s(cstr(line.fn_()));
@@ -473,6 +542,8 @@ fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site) voi
     o.s("stack trace (innermost first):\n");
     if has_top {
         frame_line(o, top);
+    } else if chain != 0 {
+        _ = line_frames(o, chain);
     } else {
         let c = call_at(ss, depth - 1);
         o.s("  at ");
@@ -511,7 +582,11 @@ fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site) voi
               (call_at(ss, @truncate(u32, @bit_cast(u64, j - 1))) == c) {
             j -= 1;
         }
-        frame_line(o, c);
+        let mut into = @ptr_from_int(*Site, 0);
+        if (j > 0) and call_inlined(ss, @truncate(u32, @bit_cast(u64, j))) {
+            into = call_at(ss, @truncate(u32, @bit_cast(u64, j - 1)));
+        }
+        frame_line_in(o, c, into);
         shown += 1;
         if j < i {
             o.s("  ... the frame above repeats ");
@@ -675,10 +750,21 @@ fn rets_frameless(a: usize, n: usize, pc: usize) bool {
 /// whose chain holds the record (the other markers' chains are empty).
 pub fn line_at(tab: *usize, pc: usize) *Site {
     let none = @ptr_from_int(*Site, 0);
+    let ch = line_chain_at(tab, pc);
+    if ch == 0 {
+        return none;
+    }
+    return untag(@ptr_from_int(*Site, rd_usize(ch)));
+}
+
+/// The chain of the records of the code at pc (line_at): its line's, then,
+/// in code inlined, those of the calls it was inlined at (innermost first,
+/// each but the last marked as inlined into the next); 0: none.
+pub fn line_chain_at(tab: *usize, pc: usize) usize {
     let mut n: usize = 0;
     let a = rets_table(tab, &mut n);
     if (a == 0) or (pc == 0) or not rets_sorted(a, n) {
-        return none;
+        return 0;
     }
     let mut i = rets_lower(a, n, pc + 1);
     while i > 0 {
@@ -687,15 +773,15 @@ pub fn line_at(tab: *usize, pc: usize) *Site {
         if (ent_flags(e) & RET_MARKER) != 0 {
             let s = rd_usize(ent_chain(e));
             if s != 0 {
-                let site = @ptr_from_int(*Site, s);
+                let site = untag(@ptr_from_int(*Site, s));
                 if site.line == 0 {
-                    return none;
+                    return 0;
                 }
-                return site;
+                return ent_chain(e);
             }
         }
     }
-    return none;
+    return 0;
 }
 
 // The frame table: its first entry and their number (0: there is none).

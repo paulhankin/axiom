@@ -51,12 +51,15 @@ pub struct Func {
     self_fix: []u32,  // where syms holds offsets in itself (to become offsets in the module's stream)
     module: u32,      // its module (an index in write's mods)
     external: bool,
+    file_fix: []u32,  // where syms holds a file (an index in write's files, in a u32) to become the offset of its
+                      // checksum entry, in the 4-byte form of an inline site's compressed annotation
 }
 
 /// A module (an object): its name and its symbols at the top level.
 pub struct Mod {
     name: []u8,
     syms: []u8,
+    inlinees: []u32,  // the functions inlined in its code: id (IPI), file (an index in write's files), line each
 }
 
 // -----------------------------------------------------------------------------
@@ -653,6 +656,10 @@ fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: []
     rec_end(&mut m, r1);
     let mut first: i32 = -1;
     let mut mfiles = u.List.[u32].empty();
+    let mut ffix = u.List.[usize].empty();  // (the inline sites' files in m: file_fix)
+    for k in 0..md.inlinees.len / 3 {
+        add_file(&mut mfiles, md.inlinees[(3 * k) + 1]);
+    }
     for fi in 0..funcs.len {
         let f = funcs[fi];
         if f.module != mi {
@@ -662,15 +669,7 @@ fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: []
             first = @int_cast(i32, fi);
         }
         for l in f.lines {
-            let mut seen = false;
-            for x in mfiles.items() {
-                if x == l.file {
-                    seen = true;
-                }
-            }
-            if not seen {
-                mfiles.push(l.file);
-            }
+            add_file(&mut mfiles, l.file);
         }
         let base = m.len();
         proc_at[fi] = @truncate(u32, base);
@@ -679,6 +678,11 @@ fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: []
             for o in f.self_fix {
                 let at = base + @as(usize, o);
                 m.set_u32(at, bn.rd32(m.view(), at) + @as(u64, base));
+            }
+            for o in f.file_fix {
+                let at = base + @as(usize, o);
+                add_file(&mut mfiles, @truncate(u32, bn.rd32(m.view(), at)));
+                ffix.push(at);
             }
             continue;
         }
@@ -729,6 +733,30 @@ fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: []
         m.u32_(@as(u64, c.len()));
         m.put(c.view());
     }
+    // the inline sites' files: their entries' offsets (CVCompressData's 4-byte form, big-endian)
+    for fa in ffix.items() {
+        let e = @as(u64, file_entry[@truncate(usize, bn.rd32(m.view(), fa))]);
+        m.set_u8(fa, @truncate(u8, ((e >> 24) & 0x1f) | 0xc0));
+        m.set_u8(fa + 1, @truncate(u8, e >> 16));
+        m.set_u8(fa + 2, @truncate(u8, e >> 8));
+        m.set_u8(fa + 3, @truncate(u8, e));
+    }
+    ffix.deinit();
+    // the functions inlined: where each is declared, from which its inline
+    // sites' lines count (DEBUG_S_INLINEELINES, CV_INLINEE_SOURCE_LINE_SIGNATURE)
+    if md.inlinees.len >= 3 {
+        let mut c = bn.new_bytes();
+        c.u32_(0);
+        for k in 0..md.inlinees.len / 3 {
+            c.u32_(@as(u64, md.inlinees[3 * k]));
+            c.u32_(@as(u64, file_entry[@as(usize, md.inlinees[(3 * k) + 1])]));
+            c.u32_(@as(u64, md.inlinees[(3 * k) + 2]));
+        }
+        m.u32_(0xf6);
+        m.u32_(@as(u64, c.len()));
+        m.put(c.view());
+        c.free();
+    }
     for f in funcs {
         if (f.module != mi) or (f.lines.len == 0) {
             continue;
@@ -738,6 +766,16 @@ fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: []
     let c13_size = m.len() - sym_size;
     m.u32_(0);  // global references: none
     return Module.{ name: md.name, b: m, sym_size: sym_size, c13_size: c13_size, files: mfiles, first: first };
+}
+
+// Adds file k to the module's files, once.
+fn add_file(l: *mut u.List.[u32], k: u32) void {
+    for x in l.items() {
+        if x == k {
+            return;
+        }
+    }
+    l.push(k);
 }
 
 fn pick(c: bool, a: u64, b: u64) u64 {

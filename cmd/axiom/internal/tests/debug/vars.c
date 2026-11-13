@@ -6,7 +6,8 @@
    a thread-local object, and values a debugger reads at -O1 and above
    (a parameter, a variable assigned once, one whose address is taken; one
    assigned again and again, a structure taken apart, a pointer into a
-   frame object, a variable length array). */
+   frame object, a variable length array), and a function inlined (its
+   inline instance, its variables). */
 typedef int count_t;
 typedef count_t *count_ptr;
 _Thread_local int per_thread = 3;
@@ -73,8 +74,15 @@ int again(int a, int b) {
     return (int)(r + q.x + q.y) + arr[1];
 }
 
+static int scaled(int v, int k) {
+    int m = v * k;
+    sink = m;
+    return m + 1;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     per_thread++;
-    return shadow(argc + 2) + vla(argc + 3) + once(argc, 5) + again(argc, 7) == 0;
+    int z = scaled(argc, 3);                     /* line: scaled-call */
+    return shadow(argc + 2) + vla(argc + 3) + once(argc, 5) + again(argc, 7) + z == 0;
 }

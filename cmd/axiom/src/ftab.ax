@@ -31,8 +31,18 @@
 // the line, column 0, the function's name; line 0 at a function's start
 // with no line), and F_FRAMELESS where the code runs without the frame. An
 // entry of another marker has the empty chain. Without line tables there
-// are none: the table is what it was.
+// are none: the table is what it was. Code inlined has, after its own
+// record (its location, the inlined function's name), one for each call it
+// was inlined at, from the innermost (the call's location, the name of the
+// function the call is in).
+//
+// In a chain, a record whose function was inlined into the next one's (the
+// next record is that of the call it was inlined at) is referred to with
+// its address's low bit set (records are 8-aligned): trap_format.ax shows
+// such a frame as inlined.
 // =============================================================================
+import "dbginfo.ax" as dbi;
+import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "isel.ax" as is;
@@ -116,10 +126,15 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
                         at = @as(u64, cs.data.len()) + 1;
                         c = ir.chain_of(i);
                         while u.notnil(c) {
+                            // (a call inlined into the next one's function: marked)
+                            let mut inl: i64 = 0;
+                            if u.notnil(c.next) {
+                                inl = 1;
+                            }
                             cs.relocs.push(
                                 elf.Rel.{
                                     off: @as(u64, cs.data.len()), ty: abs64, sym: is.gsym_at(o, gsym, ir.gv_of(c.site)),
-                                    addend: 0 });
+                                    addend: inl });
                             cs.data.zeros(8);
                             c = c.next;
                         }
@@ -161,6 +176,19 @@ struct Lines {
     k: usize,
     name: []u8,
     started: bool,
+    scopes: []u64,  // where the scope changes (dwarf.Func.scopes), for the inline instances
+    sk: usize,
+}
+
+// The scope of the code at offset `at` (rows are visited in order).
+fn scope_at(l: *mut Lines, at: u64) u32 {
+    while ((l.sk + 1) < l.scopes.len) and ((l.scopes[l.sk + 1] >> 32) <= at) {
+        l.sk += 1;
+    }
+    if (l.sk < l.scopes.len) and ((l.scopes[l.sk] >> 32) <= at) {
+        return @truncate(u32, l.scopes[l.sk]);
+    }
+    return 0;
 }
 
 // The offset of the next row of l (none: u64 max), skipping those of the
@@ -190,23 +218,90 @@ fn put_row(t: *mut Tab, l: *mut Lines, base: u64, frameless: bool) void {
             src = @truncate(u32, l.rows[0]);
             l.k = 1;
         }
-        entry(t, base, line_chain(t, src, l.name), fl);
+        entry(t, base, line_chain(t, src, scope_at(l, 0), l.name), fl);
         return;
     }
     let r = l.rows[l.k];
     l.k += 1;
-    entry(t, base + ((r >> 32) & 0x7fff_ffff), line_chain(t, @truncate(u32, r), l.name), fl);
+    let at = (r >> 32) & 0x7fff_ffff;
+    entry(t, base + at, line_chain(t, @truncate(u32, r), scope_at(l, at), l.name), fl);
 }
 
-// The chain of one record for source location src in the function named
-// name (see the header), made once per object; a location without a file
-// or line has line 0.
-fn line_chain(t: *mut Tab, src: u32, name: []u8) u64 {
-    let key = u.intern(u.f2("%s/%s", u.dec(@as(i64, src)), name));
+// The function of the code of scope sc for people: an inline instance's,
+// or (none) the function's, `name`.
+fn scope_func(sc: u32, name: []u8) []u8 {
+    let r = dbi.inline_root(sc);
+    if r == 0 {
+        return name;
+    }
+    return dw.abs_name(dbi.scopes.get(@as(usize, r)).func);
+}
+
+// The chain of the records for source location src in scope sc of the
+// function named name (see the header), made once per object: the
+// location's, then those of the calls its code was inlined at (sc's inline
+// instances, from the innermost; but a call without a location, which the
+// compiler made: C's main is called by a function of the start-up's).
+fn line_chain(t: *mut Tab, src: u32, sc: u32, name: []u8) u64 {
+    let mut kb = u.Buf.init();
+    kb.s(u.dec(@as(i64, src)));
+    kb.s("/");
+    kb.s(scope_func(sc, name));
+    let mut r = dbi.inline_root(sc);
+    while r != 0 {
+        let x = dbi.scopes.get(@as(usize, r));
+        if ir.src_line(x.call) == 0 {
+            r = dbi.inline_root(x.parent);  // (a call the compiler made: its function is not shown)
+            continue;
+        }
+        kb.s("|");
+        kb.s(u.dec(@as(i64, x.call)));
+        kb.s("/");
+        kb.s(scope_func(x.parent, name));
+        r = dbi.inline_root(x.parent);
+    }
+    let key = u.intern(kb.done());
     let at = t.line_recs.get(key);
     if at != 0 {
         return at - 1;
     }
+    let mut recs = u.List.[u64].empty();
+    recs.push(line_rec(t, src, scope_func(sc, name)));
+    r = dbi.inline_root(sc);
+    while r != 0 {
+        let x = dbi.scopes.get(@as(usize, r));
+        if ir.src_line(x.call) == 0 {
+            r = dbi.inline_root(x.parent);
+            continue;
+        }
+        recs.push(line_rec(t, x.call, scope_func(x.parent, name)));
+        r = dbi.inline_root(x.parent);
+    }
+    // the chain: the records (each but the last inlined into the next), then null
+    let cs = t.obj.secs.get(@int_cast(usize, t.chains));
+    cs.data.align(8);
+    let ch = @as(u64, cs.data.len());
+    for j in 0..recs.len {
+        let mut inl: u64 = 0;
+        if (j + 1) < recs.len {
+            inl = 1;
+        }
+        cs.relocs.push(
+            elf.Rel.{
+                off: @as(u64, cs.data.len()), ty: t.abs64, sym: t.chains_sym,
+                addend: @bit_cast(i64, recs.get(j) + inl) });
+        cs.data.zeros(8);
+    }
+    cs.data.zeros(8);
+    recs.deinit();
+    t.line_recs.put(key, ch + 1);
+    return ch;
+}
+
+// A record (shaped as a call site's) of source location src in the
+// function named name: its offset in `chains`; a location without a file
+// or line has line 0.
+fn line_rec(t: *mut Tab, src: u32, name: []u8) u64 {
     let file = ir.src_file(src);
     let mut fname: []u8 = "";
     let mut line: u64 = 0;
@@ -240,20 +335,15 @@ fn line_chain(t: *mut Tab, src: u32, name: []u8) u64 {
     cs.data.u8_(0);
     cs.data.put(name);
     cs.data.zeros(2);
-    cs.data.align(8);
-    // the chain: the record, then null
-    let ch = @as(u64, cs.data.len());
-    cs.relocs.push(elf.Rel.{ off: ch, ty: t.abs64, sym: t.chains_sym, addend: @bit_cast(i64, rec) });
-    cs.data.zeros(16);
-    t.line_recs.put(key, ch + 1);
-    return ch;
+    return rec;
 }
 
 // A function's entries, once its code is at `base` in .text (`size` bytes):
 // `calls` holds pairs of the offset after a call and its MInst.aux; `rows`
-// its line table's rows when it has one (else empty), `name` its name.
+// its line table's rows when it has one (else empty), `scopes` where its
+// scope changes (dwarf.Func.scopes: the inline instances), `name` its name.
 pub fn func(t: *mut Tab, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64, rows: []u64,
-            name: []u8) void {
+            scopes: []u64, name: []u8) void {
     if not t.on {
         return;
     }
@@ -262,7 +352,7 @@ pub fn func(t: *mut Tab, base: u64, size: u64, frameless: bool, noframe: []u64, 
     if u.starts(nm, "axiom.export.") and (nm.len > 13) {
         nm = nm[13..];
     }
-    let mut ls = Lines.{ rows: rows, k: 0, name: nm, started: not t.lines };
+    let mut ls = Lines.{ rows: rows, k: 0, name: nm, started: not t.lines, scopes: scopes, sk: 0 };
     if not t.lines {
         ls.rows = rows[0..0];
     }

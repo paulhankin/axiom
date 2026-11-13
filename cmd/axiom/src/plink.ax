@@ -1596,9 +1596,10 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
     let mut idedup = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     for oi in 0..nl.objs.len {
         let o = nl.objs.get(oi);
-        let mut lines = object_lines(o, files, &mut file_map);
+        let mut local = u.List.[u32].empty();
+        let mut lines = object_lines(o, files, &mut file_map, &mut local);
         let mut cv = CvObj.{ blobs: u.List.[CvBlob].empty(), tmap: u.List.[u32].empty(), imap: u.List.[u32].empty(),
-                             names: u.List.[[]u8].empty(), oi: oi };
+                             names: u.List.[[]u8].empty(), oi: oi, files: local.items() };
         cv_read(o, &mut cv);
         // the types, then the ids (which refer to types)
         for bl in cv.blobs.items() {
@@ -1646,12 +1647,13 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
             let off = @truncate(u32, addr - BASE - text_rva);
             let mut f = pdb.Func.{ name: name, sec: 1, off: off, size: @truncate(u32, sy.size), lines: ls,
                                    syms: u.nil_slice.[u8](), self_fix: u.nil_slice.[u32](), module: mi,
-                                   external: sy.bind != elf.B_LOCAL };
+                                   external: sy.bind != elf.B_LOCAL, file_fix: u.nil_slice.[u32]() };
             let bk = procs.get(u.intern(cvw.func_key(sy.sec, sy.value)));
             if bk != 0 {
                 let p = patch_syms(cv.blobs.at(@as(usize, bk - 1)), &cv, off);
                 f.syms = p.data;
                 f.self_fix = p.self_fix;
+                f.file_fix = p.file_fix;
             }
             r.funcs.push(f);
         }
@@ -1661,8 +1663,19 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
                 gs = patch_syms(cv.blobs.at(k), &cv, 0).data;
             }
         }
+        // the functions inlined: their ids, files and lines ('L': codeview.ax)
+        let mut inl = u.List.[u32].empty();
+        for k in 0..cv.blobs.len {
+            let bl = cv.blobs.get(k);
+            if (bl.tag == 'L') and (bl.data.len >= 12) {
+                inl.push(@truncate(u32, remap(&cv, cvw.FK_ID, bn.rd32(bl.data, 0))));
+                inl.push(cv_file(&cv, bn.rd32(bl.data, 4)));
+                inl.push(@truncate(u32, bn.rd32(bl.data, 8)));
+            }
+        }
         if (r.funcs.len > nf) or (gs.len > 0) {
-            r.mods.push(pdb.Mod.{ name: module_name(r.funcs.items()[nf..], files.items(), mi), syms: gs });
+            r.mods.push(pdb.Mod.{ name: module_name(r.funcs.items()[nf..], files.items(), mi), syms: gs,
+                                  inlinees: inl.items() });
         }
     }
     return r;
@@ -1698,6 +1711,16 @@ struct CvObj {
     imap: u.List.[u32],    // and its ids'
     names: u.List.[[]u8],  // its data symbols' names (FK_DATA's arguments)
     oi: usize,
+    files: []u32,  // its line tables' file numbers -> the program's files (FK_FILE)
+}
+
+// The program's file of the object's line-table file k (FK_FILE).
+fn cv_file(cv: *CvObj, k: u64) u32 {
+    if k >= @as(u64, cv.files.len) {
+        nl.err("internal: a debug file number out of range");
+        return 0;
+    }
+    return cv.files[@truncate(usize, k)];
 }
 
 fn cv_read(o: *mut elf.Obj, cv: *mut CvObj) void {
@@ -1788,9 +1811,12 @@ fn merge_records(bl: *CvBlob, cv: *mut CvObj, ids: bool, out: *mut u.List.[[]u8]
 // .text): the records whose data no longer is in the image left out, the
 // blob's own references (FK_SELF, made offsets in the new blob) for pdb.ax
 // to make offsets in the module's stream.
+// (file_fix: where it holds a file of the program, FK_FILE, for pdb.ax to
+// make the offset of its checksum entry)
 struct Patched {
     data: []u8,
     self_fix: []u32,
+    file_fix: []u32,
 }
 
 fn patch_syms(bl: *CvBlob, cv: *CvObj, off: u32) Patched {
@@ -1832,6 +1858,7 @@ fn patch_syms(bl: *CvBlob, cv: *CvObj, off: u32) Patched {
     }
     let out = u.newn.[u8](size + 1);
     let mut self_fix = u.List.[u32].empty();
+    let mut file_fix = u.List.[u32].empty();
     let mut j: usize = 0;
     for k in 0..(starts.len - 1) {
         let a = starts.get(k);
@@ -1866,12 +1893,15 @@ fn patch_syms(bl: *CvBlob, cv: *CvObj, off: u32) Patched {
                 }
                 bn.w32(r, @as(u64, o), @as(u64, newat[t]));
                 self_fix.push(@truncate(u32, at2 + o));
+            } else if x.kind == cvw.FK_FILE {
+                bn.w32(r, @as(u64, o), @as(u64, cv_file(cv, @as(u64, x.arg))));
+                file_fix.push(@truncate(u32, at2 + o));
             }
             j += 1;
         }
     }
     starts.deinit();
-    return Patched.{ data: out[0..size], self_fix: self_fix.items() };
+    return Patched.{ data: out[0..size], self_fix: self_fix.items(), file_fix: file_fix.items() };
 }
 
 // The address of the object's data symbol named by its 'N' blob `k`
@@ -1908,11 +1938,11 @@ fn sec_off(rva: u64) u64 {
 
 // An object's line tables (.axiom.lines: winlines.ax), by function (its
 // symbol's place: codeview.func_key); file numbers become indexes in `files`.
-fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
-                file_map: *mut u.SymMap.[u32]) u.SymMap.[*mut u.List.[pdb.Line]] {
+// (local: the object's file number -> index)
+fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8], file_map: *mut u.SymMap.[u32],
+                local: *mut u.List.[u32]) u.SymMap.[*mut u.List.[pdb.Line]] {
     let mut m = u.SymMap.[*mut u.List.[pdb.Line]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[pdb.Line]](),
                                                     cap: 0, len: 0 };
-    let mut local = u.List.[u32].empty();  // the object's file number -> index
     for k in 0..o.secs.len {
         let sec = o.secs.get(k);
         if (sec.kind != elf.S_DEBUG) or not u.str_eq(sec.name, ".axiom.lines") {

@@ -148,7 +148,36 @@ const symbolTypeFields = (kind) => ({
   0x110c: [4], 0x110d: [4], 0x1112: [4], 0x1113: [4],          // S_LDATA32 S_GDATA32 S_LTHREAD32 S_GTHREAD32
   0x1111: [8], 0x113e: [4],                                    // S_REGREL32 S_LOCAL
   0x1141: [], 0x1142: [], 0x1143: [], 0x1145: [],              // S_DEFRANGE_REGISTER, _FRAMEPOINTER_REL, _SUBFIELD_REGISTER, _REGISTER_REL
+  0x114d: [], 0x114e: [],                                      // S_INLINESITE (its inlinee: an id), S_INLINESITE_END
 }[kind] ?? null);
+
+// The code ranges of an inline site's binary annotations (cvinfo.h's
+// BinaryAnnotationOpcode, numbers compressed as CVCompressData), from the
+// procedure's start: { ranges: [[lo, hi)], files: [checksum entry offsets], bad: a problem or null }.
+export function siteRanges(ann) {
+  let p = 0, off = 0, start = -1;
+  const ranges = [], files = [];
+  const num = () => {
+    const b = ann[p++];
+    if ((b & 0x80) === 0) return b;
+    if ((b & 0xc0) === 0x80) return ((b & 0x3f) << 8) | ann[p++];
+    if ((b & 0xe0) === 0xc0) { const v = ((b & 0x1f) << 24) | (ann[p] << 16) | (ann[p + 1] << 8) | ann[p + 2]; p += 3; return v >>> 0; }
+    return NaN;
+  };
+  while (p < ann.length) {
+    if (ann[p] === 0 || ann[p] >= 0xf1) break;  // (the end, or the record's padding)
+    const op = num();
+    if (op === 3) { off += num(); if (start < 0) start = off; }
+    else if (op === 4) { const n = num(); if (start < 0) start = off; ranges.push([start, off + n]); off += n; start = -1; }
+    else if (op === 5) files.push(num());
+    else if (op === 6 || op === 9 || op === 10 || op === 13 || op === 7 || op === 8) num();
+    else if (op === 11) { off += num() & 0xf; if (start < 0) start = off; }
+    else if (op === 12) { const n = num(); off += num(); if (start < 0) start = off; ranges.push([start, off + n]); off += n; start = -1; }
+    else return { ranges, files, bad: `annotation ${op}` };
+  }
+  if (start >= 0) return { ranges, files, bad: 'a range without its length' };
+  return { ranges, files, bad: null };
+}
 
 const kindName = (k) => '0x' + k.toString(16);
 
@@ -339,14 +368,16 @@ export function checkPDB(p, opts = {}) {
   }
   // each module's symbols and lines
   const procs = new Map();  // module stream offset -> procedure record, per module
+  let sites = 0, inlinees = 0;
   mods.forEach((md, mi) => {
     const s = S[md.stream];
     const where = `module ${mi} (${md.name})`;
     if (!s) { errs.push(`${where}: no stream ${md.stream}`); return; }
     if (4 + md.symSize - 4 + md.c11 + md.c13 > s.length) errs.push(`${where}: sizes beyond its stream`);
     if (s.readUInt32LE(0) !== 4) errs.push(`${where}: signature`);
-    const stack = [];  // open scopes: [offset, kind, start, end]
+    const stack = [];  // open scopes: [offset, kind, start, end, section, its end's offset, an inline site's ranges]
     const mprocs = new Map();
+    const siteFiles = [];  // (the inline sites' files: checksum entries)
     let n = 0;
     for (let a = 4; a < md.symSize;) {
       const len = s.readUInt16LE(a), kind = s.readUInt16LE(a + 2), r = s.subarray(a, a + len + 2);
@@ -357,7 +388,31 @@ export function checkPDB(p, opts = {}) {
       if (!tf) errs.push(`${w}: unknown kind`);
       else for (const o of tf) { const v = r.readUInt32LE(o); if (!typeOk(v, tpi.end)) errs.push(`${w}: type 0x${v.toString(16)} does not resolve`); }
       const top = stack[stack.length - 1];
-      if (kind === 0x110f || kind === 0x1110 || kind === 0x1103) {
+      if (kind === 0x114d) {
+        // an inline site: in a procedure, its code (annotations) inside its parent's, of an id
+        const parent = r.readUInt32LE(4), end = r.readUInt32LE(8), id = r.readUInt32LE(12);
+        if (parent !== (top ? top[0] : 0)) errs.push(`${w}: parent ${parent}, not ${top ? top[0] : 0}`);
+        if (!top) errs.push(`${w}: an inline site outside a procedure`);
+        if (!(id >= 0x1000 && id < ipi.end)) errs.push(`${w}: inlinee 0x${id.toString(16)} is not an id`);
+        if (end <= a || end >= md.symSize || s.readUInt16LE(end + 2) !== 0x114e) errs.push(`${w}: end ${end} is not an S_INLINESITE_END`);
+        const proc = stack.find((x) => x[1] !== 0x1103 && x[1] !== 0x114d);
+        const sr = siteRanges(r.subarray(16));
+        if (sr.bad) errs.push(`${w}: ${sr.bad}`);
+        if (!sr.ranges.length) errs.push(`${w}: no code`);
+        const pr = top ? (top[1] === 0x114d ? top[6] : [[top[2] - (proc ? proc[2] : 0), top[3] - (proc ? proc[2] : 0)]]) : [];
+        for (const [lo, hi] of sr.ranges) {
+          if (!(hi > lo) || !pr.some(([c, d]) => lo >= c && hi <= d)) errs.push(`${w}: code [${lo.toString(16)}, ${hi.toString(16)}) outside its parent's`);
+        }
+        siteFiles.push(...sr.files.map((f) => [w, f]));
+        stack.push([a, kind, 0, 0, 0, end, sr.ranges]);
+        sites++;
+      } else if (kind === 0x114e) {
+        if (!top || top[1] !== 0x114d) errs.push(`${w}: S_INLINESITE_END outside an inline site`);
+        else {
+          if (top[5] !== a) errs.push(`${w}: closes the inline site at ${top[0]} whose end is ${top[5]}`);
+          stack.pop();
+        }
+      } else if (kind === 0x110f || kind === 0x1110 || kind === 0x1103) {
         const parent = r.readUInt32LE(4), end = r.readUInt32LE(8);
         if (parent !== (top ? top[0] : 0)) errs.push(`${w}: parent ${parent}, not ${top ? top[0] : 0}`);
         const isProc = kind !== 0x1103;
@@ -365,7 +420,12 @@ export function checkPDB(p, opts = {}) {
         const sec = r.readUInt16LE(isProc ? 36 : 20);
         if (isProc && top) errs.push(`${w}: a procedure inside a scope`);
         if (!isProc && !top) errs.push(`${w}: a block outside a procedure`);
-        if (top && (off < top[2] || off + size > top[3] || sec !== top[4])) errs.push(`${w}: [${off.toString(16)}, +${size}) outside its parent`);
+        if (top && top[1] === 0x114d) {
+          // (in an inline site: inside one of its pieces)
+          const proc = stack.find((x) => x[1] !== 0x1103 && x[1] !== 0x114d);
+          const lo = off - proc[2];
+          if (!top[6].some(([c, d]) => lo >= c && lo + size <= d) || sec !== proc[4]) errs.push(`${w}: [${off.toString(16)}, +${size}) outside its inline site`);
+        } else if (top && (off < top[2] || off + size > top[3] || sec !== top[4])) errs.push(`${w}: [${off.toString(16)}, +${size}) outside its parent`);
         if (end <= a || end >= md.symSize || s.readUInt16LE(end + 2) !== 6) errs.push(`${w}: end ${end} is not an S_END`);
         stack.push([a, kind, off, off + size, sec, end]);
         if (isProc) {
@@ -382,7 +442,7 @@ export function checkPDB(p, opts = {}) {
         // a location's range: inside the procedure
         const ro = kind === 0x1145 || kind === 0x1143 ? 12 : 8;
         const off = r.readUInt32LE(ro), sec = r.readUInt16LE(ro + 4), cb = r.readUInt16LE(ro + 6);
-        const proc = stack.find((x) => x[1] !== 0x1103);
+        const proc = stack.find((x) => x[1] !== 0x1103 && x[1] !== 0x114d);
         if (!proc) errs.push(`${w}: a range outside a procedure`);
         else if (cb === 0 || off < proc[2] || off + cb > proc[3] || sec !== proc[4]) errs.push(`${w}: range [${off.toString(16)}, +${cb}) outside its procedure`);
       } else if (kind === 0x113e || kind === 0x1111 || kind === 0x1107) {
@@ -410,6 +470,15 @@ export function checkPDB(p, opts = {}) {
           if (strings && (name >= strings.length)) errs.push(`${where}: a file name at ${name} beyond /names`);
           o = (o + 6 + cs + 3) & ~3;
         }
+      } else if (kind === 0xf6) {
+        // the functions inlined: an id, a file, a line each
+        if (sub.readUInt32LE(0) !== 0) errs.push(`${where}: inlinee lines' signature`);
+        for (let o = 4; o + 12 <= sub.length; o += 12) {
+          const id = sub.readUInt32LE(o), file = sub.readUInt32LE(o + 4);
+          if (!(id >= 0x1000 && id < ipi.end)) errs.push(`${where}: inlinee lines of 0x${id.toString(16)}, not an id`);
+          if (!checksums || !checksums.has(file)) errs.push(`${where}: inlinee lines of file entry ${file}, not in its checksums`);
+          inlinees++;
+        }
       } else if (kind === 0xf2) {
         const off = sub.readUInt32LE(0), size = sub.readUInt32LE(8);
         for (let o = 12; o < sub.length;) {
@@ -426,7 +495,10 @@ export function checkPDB(p, opts = {}) {
       }
       a += 8 + ((len + 3) & ~3);
     }
+    for (const [w, f] of siteFiles) if (!checksums || !checksums.has(f)) errs.push(`${w}: a file entry ${f}, not in the checksums`);
   });
+  out.sites = sites;
+  out.inlinees = inlinees;
 
   // the publics' and globals' symbol records and hashes
   const recs = S[symStream] || Buffer.alloc(0);

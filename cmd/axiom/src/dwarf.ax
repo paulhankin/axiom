@@ -129,6 +129,11 @@ pub struct Unit {
     sums: u.List.[[16]u8],  // the line table's files' MD5 checksums (in files' order)
     nosum: bool,            // a file of the line table has none (a presumed name of C's #line): none are given
     names: u.List.[Named],  // DEBUG_FULL: the entries .debug_names indexes
+    // the functions inlined: their abstract instances (abs_ref; interned IR
+    // name -> index + 1 in abs_fns), and the references to them
+    abs_fns: u.List.[[]u8],
+    abs_map: u.SymMap.[u32],
+    arefs: u.List.[Fix],
 }
 
 // An entry of the name index: its name (interned), tag, and offset in the
@@ -149,7 +154,9 @@ pub fn none() Unit {
                   gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   toff: u.List.[u64].empty(), drefs: u.List.[Fix].empty(), gdone: u.List.[bool].empty(),
                   voffs: u.List.[u64].empty(), tls_rel: 0, cies: [0; 4], size_fix: false, sums: u.List.[[16]u8].empty(),
-                  nosum: false, names: u.List.[Named].empty() };
+                  nosum: false, names: u.List.[Named].empty(), abs_fns: u.List.[[]u8].empty(),
+                  abs_map: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                  arefs: u.List.[Fix].empty() };
 }
 
 fn new_part() Part {
@@ -614,7 +621,9 @@ fn subprogram(d: *mut Unit, f: *Func) void {
         vs = dbi.vars_of(f.irf.name);
         sc = dbi.scopes_of(f.irf.name);
     }
-    let mut kids = vs.len > 0;
+    // (its lexical blocks and the inline instances of the functions inlined into it)
+    let mut tr = scope_tree(f, sc);
+    let mut kids = (vs.len > 0) or (tr.kids.get(0).len > 0);
     if sc[0] != 0 {
         kids = kids or (dbi.scopes.at(@as(usize, sc[0])).types.len > 0);
     }
@@ -651,17 +660,11 @@ fn subprogram(d: *mut Unit, f: *Func) void {
         for _k in 0..vs.len {
             d.voffs.push(0);
         }
-        if sc[0] == 0 {
-            for k in 0..vs.len {
-                var_die(d, f, k, vs[k], u.nil_slice.[Piece]());
-            }
-        } else {
-            let rg = scope_ranges(f, sc);
-            scope_body(d, f, vs, sc, rg, sc[0]);
-        }
+        scope_body(d, f, vs, sc, &tr, 0);
         d.voffs.clear();
         d.parts[D_INFO].b.u8_(0);
     }
+    free_tree(&mut tr);
 }
 
 // DW_AT_frame_base (an exprloc): the CFA natively; on WebAssembly the value
@@ -693,20 +696,95 @@ fn frame_base(d: *mut Unit, f: *Func) void {
     e.free();
 }
 
-// A piece of code of a lexical block: [start, end) offsets in its function.
-struct Piece {
+/// A piece of code of a lexical block: [start, end) offsets in its function.
+pub struct Piece {
     start: u64,
     end: u64,
 }
 
-// The code of each of f's scopes sc[0]..sc[1] (by index - sc[0]): the
-// pieces whose instructions are in it or in a block inside it (f.scopes;
-// code of another function's scopes, inlined, is its root's).
-fn scope_ranges(f: *Func, sc: [2]u32) []u.List.[Piece] {
-    let n = @as(usize, sc[1] - sc[0]) + 1;
-    let out = u.newn.[u.List.[Piece]](n + 1);
-    for k in 0..n {
-        out[k] = u.List.[Piece].empty();
+// The scopes of a function's code: its root (node 0: its outermost scope,
+// sc[0], or none), its lexical blocks (dbginfo.scopes_of), and the inline
+// instances (their roots, the copies of their blocks: dbginfo.add_inline)
+// its code is in, each node with its parent's, its children and its code:
+// the pieces whose instructions are in it or in a scope inside it
+// (codeview.ax's blocks and inline sites too).
+pub struct Tree {
+    ids: u.List.[u32],            // node -> its scope (node 0: sc[0], which may be 0)
+    up: u.List.[u32],             // node -> its parent's node
+    idx: u.SymMap.[u32],          // scope + 1 -> its node + 1
+    kids: u.List.[u.List.[u32]],  // node -> its children's nodes
+    pieces: u.List.[u.List.[Piece]],
+}
+
+/// Frees tree t (scope_tree).
+pub fn free_tree(t: *mut Tree) void {
+    for k in 0..t.kids.len {
+        t.kids.at(k).deinit();
+        t.pieces.at(k).deinit();
+    }
+    t.ids.deinit();
+    t.up.deinit();
+    t.kids.deinit();
+    t.pieces.deinit();
+}
+
+// Is scope s one of the function's (sc: its own scopes), or a scope of
+// code inlined into it (an inline instance in one of its scopes)? Code moved
+// from another function (outlined) is not.
+fn scope_mine(s: u32, sc: [2]u32) bool {
+    let mut x = s;
+    let mut n: u32 = 0;
+    while (x != 0) and (n < 100000) {
+        if (x >= sc[0]) and (x <= sc[1]) and (sc[0] != 0) {
+            return true;
+        }
+        if @as(usize, x) >= dbi.scopes.len {
+            return false;
+        }
+        let ds = dbi.scopes.get(@as(usize, x));
+        if not ds.inl and not ds.copy {
+            return false;  // (another function's)
+        }
+        x = ds.parent;
+        n += 1;
+    }
+    return true;  // (an inline instance at the top: in the outermost scope)
+}
+
+// The node of scope s (made, with its parents', if new).
+fn tree_node(t: *mut Tree, s: u32, sc: [2]u32) u32 {
+    if (s == 0) or (s == sc[0]) {
+        return 0;
+    }
+    let k = u.addr_key(@as(usize, s) + 1);
+    let at = t.idx.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let pn = tree_node(t, dbi.scopes.get(@as(usize, s)).parent, sc);
+    let n = @truncate(u32, t.ids.len);
+    t.ids.push(s);
+    t.up.push(pn);
+    t.kids.push(u.List.[u32].empty());
+    t.pieces.push(u.List.[Piece].empty());
+    t.kids.at(@as(usize, pn)).push(n);
+    t.idx.put(k, n + 1);
+    return n;
+}
+
+/// The tree of f's scopes (sc: its own, dbginfo.scopes_of; see Tree).
+pub fn scope_tree(f: *Func, sc: [2]u32) Tree {
+    let mut t = Tree.{ ids: u.List.[u32].empty(), up: u.List.[u32].empty(),
+                       idx: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                       kids: u.List.[u.List.[u32]].empty(), pieces: u.List.[u.List.[Piece]].empty() };
+    t.ids.push(sc[0]);
+    t.up.push(0);
+    t.kids.push(u.List.[u32].empty());
+    t.pieces.push(u.List.[Piece].empty());
+    if sc[0] != 0 {
+        for s in (sc[0] + 1)..(sc[1] + 1) {
+            _ = tree_node(&mut t, s, sc);
+        }
     }
     let mut k: usize = 0;
     while k < f.scopes.len {
@@ -715,64 +793,82 @@ fn scope_ranges(f: *Func, sc: [2]u32) []u.List.[Piece] {
         if k + 1 < f.scopes.len {
             end = f.scopes[k + 1] >> 32;
         }
-        let mut s = @truncate(u32, f.scopes[k]);
+        let s = @truncate(u32, f.scopes[k]);
         k += 1;
         if (end <= start) or (start >= f.size) {
             continue;
         }
-        if (s < sc[0]) or (s > sc[1]) {
-            s = sc[0];
+        let mut n: u32 = 0;
+        if scope_mine(s, sc) {
+            n = tree_node(&mut t, s, sc);
         }
-        while (s >= sc[0]) and (s <= sc[1]) {
-            let l = &mut out[@as(usize, s - sc[0])];
+        loop {
+            let l = t.pieces.at(@as(usize, n));
             if (l.len > 0) and (l.last().end == start) {
                 l.at(l.len - 1).end = @min(end, f.size);
             } else {
                 l.push(Piece.{ start: start, end: @min(end, f.size) });
             }
-            s = dbi.scopes.at(@as(usize, s)).parent;
-            if s == 0 {
+            if n == 0 {
                 break;
             }
+            n = t.up.get(@as(usize, n));
         }
     }
-    return out[0..n];
+    return t;
 }
 
-// The entries in scope s of f (sc: f's scopes, rg: their code): its
-// variables, its types, then its lexical blocks that have code (a block
-// without any is left out with what it declares: no code is in its scope).
-fn scope_body(d: *mut Unit, f: *Func, vs: []dbi.DVar, sc: [2]u32, rg: []u.List.[Piece], s: u32) void {
-    for k in 0..vs.len {
-        let mut vsc = vs[k].scope;
-        if (vsc < sc[0]) or (vsc > sc[1]) {
-            vsc = sc[0];
-        }
-        if vsc == s {
-            let mut clip = u.nil_slice.[Piece]();
-            if s != sc[0] {
-                clip = rg[@as(usize, s - sc[0])].items();
+// The entries in node n of f's scopes (sc: f's own, tr: the tree): its
+// variables, its types, then its lexical blocks and inline instances that
+// have code (a block without any is left out with what it declares: no code
+// is in its scope).
+fn scope_body(d: *mut Unit, f: *Func, vs: []dbi.DVar, sc: [2]u32, tr: *Tree, n: u32) void {
+    let s = tr.ids.get(@as(usize, n));
+    let mut clip = u.nil_slice.[Piece]();
+    if n != 0 {
+        clip = tr.pieces.at(@as(usize, n)).items();
+    }
+    let mut own = n == 0;
+    if (n != 0) and (@as(usize, s) < dbi.scopes.len) {
+        let ds = dbi.scopes.get(@as(usize, s));
+        own = not ds.inl and not ds.copy;
+    }
+    if own {
+        for k in 0..vs.len {
+            let mut vsc = vs[k].scope;
+            if (vsc < sc[0]) or (vsc > sc[1]) {
+                vsc = sc[0];
             }
-            var_die(d, f, k, vs[k], clip);
+            if vsc == s {
+                var_die(d, f, k, vs[k], clip);
+            }
         }
-    }
-    for t in dbi.scopes.at(@as(usize, s)).types.items() {
-        write_type(d, t);
-    }
-    for c in (s + 1)..(sc[1] + 1) {
-        if dbi.scopes.at(@as(usize, c)).parent != s {
-            continue;
+        if s != 0 {
+            for t in dbi.scopes.at(@as(usize, s)).types.items() {
+                write_type(d, t);
+            }
         }
-        let ps = rg[@as(usize, c - sc[0])].items();
+    } else {
+        inline_vars(d, f, s, clip);
+    }
+    for c in tr.kids.at(@as(usize, n)).items() {
+        let ps = tr.pieces.at(@as(usize, c)).items();
         if ps.len == 0 {
             continue;
         }
+        let cs = dbi.scopes.get(@as(usize, tr.ids.get(@as(usize, c))));
+        if cs.inl {
+            // (an inline instance: DWARF 5, 3.3.8.2)
+            named(d, abs_name(cs.func), TAG_INLINED_SUBROUTINE, @as(u64, ib(d).len()));
+            ib(d).uleb(pk(ps.len == 1, AB_INL, AB_INL_RANGES));
+            abs_ref(d, cs.func, 0);
+        } else {
+            ib(d).uleb(pk(ps.len == 1, AB_LEX, AB_LEX_RANGES));
+        }
         if ps.len == 1 {
-            ib(d).uleb(AB_LEX);
             addr_ref(d, &mut d.parts[D_INFO], f.sym, ps[0].start);
             ib(d).u32_(ps[0].end - ps[0].start);
         } else {
-            ib(d).uleb(AB_LEX_RANGES);
             sec_ref(d, &mut d.parts[D_INFO], D_RNGLISTS, @as(u64, list_start(d, D_RNGLISTS)));
             let r = &mut d.parts[D_RNGLISTS];
             for pc in ps {
@@ -782,9 +878,145 @@ fn scope_body(d: *mut Unit, f: *Func, vs: []dbi.DVar, sc: [2]u32, rg: []u.List.[
             }
             r.b.u8_(RLE_END_OF_LIST);
         }
-        scope_body(d, f, vs, sc, rg, c);
+        if cs.inl {
+            // (DW_AT_call_file, DW_AT_call_line; line 0 where the compiler
+            // made the call: debuggers show an instance only with them)
+            decl_at(d, cs.call);
+        }
+        scope_body(d, f, vs, sc, tr, c);
         ib(d).u8_(0);
     }
+}
+
+// The variables of an inlined function in scope s of one of its inline
+// instances (the instance's root, or a copy of one of its blocks), within
+// the code `clip`: each one's entry refers to its abstract instance's
+// (DW_AT_abstract_origin), with its location list (dloc.ax: the
+// instance's), if any.
+fn inline_vars(d: *mut Unit, f: *Func, s: u32, clip: []Piece) void {
+    if not d.full {
+        return;
+    }
+    let inst = dbi.inline_root(s);
+    if inst == 0 {
+        return;
+    }
+    let g = dbi.scopes.get(@as(usize, inst)).func;
+    let gs = dbi.vars_of(g);
+    let gsc = dbi.scopes_of(g);
+    let mut want = dbi.origin(s);
+    if s == inst {
+        want = gsc[0];
+    }
+    for k in 0..gs.len {
+        let v = gs[k];
+        if (v.ty < 0) or u.notnil(v.global) or v.artificial {
+            continue;
+        }
+        let mut vsc = v.scope;
+        if (vsc < gsc[0]) or (vsc > gsc[1]) {
+            vsc = gsc[0];
+        }
+        if vsc != want {
+            continue;
+        }
+        let pv = pk(v.param, @as(u64, 1), @as(u64, 0));
+        if (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip, false, inst, g) {
+            continue;
+        }
+        ib(d).uleb(AB_IVAR + pv);
+        abs_ref(d, g, k + 1);
+    }
+}
+
+/// The name for people of function `ir_name` (interned), which was inlined.
+pub fn abs_name(ir_name: []u8) []u8 {
+    let n = dbi.func_name(ir_name, elf.display_name(ir_name));
+    if u.starts(n, "axiom.export.") and (n.len > 13) {
+        return n[13..];
+    }
+    return n;
+}
+
+// A reference to the abstract instance of function `ir_name` (interned;
+// k 0), or to that of its variable k - 1 (DWARF 5, 3.3.8.1), which finish
+// writes.
+fn abs_ref(d: *mut Unit, ir_name: []u8, k: usize) void {
+    let key = u.intern(ir_name);
+    let mut a = d.abs_map.get(key);
+    if a == 0 {
+        d.abs_fns.push(key);
+        a = @truncate(u32, d.abs_fns.len);
+        d.abs_map.put(key, a);
+    }
+    d.arefs.push(Fix.{ off: @as(u64, ib(d).len()), kind: FX_SEC, sym: a - 1, addend: @int_cast(i64, k) });
+    ib(d).u32_(0);
+}
+
+// The abstract instances of the functions inlined (abs_ref): each a
+// subprogram with DW_AT_inline, its name, declaration and result, and its
+// parameters and variables (their names, declarations and types); then the
+// references to them.
+fn abstracts(d: *mut Unit) void {
+    let mut offs = u.List.[u.List.[u64]].empty();
+    let mut j: usize = 0;
+    while j < d.abs_fns.len {
+        let g = d.abs_fns.get(j);
+        j += 1;
+        let mut l = u.List.[u64].empty();
+        let mut gs: []dbi.DVar = u.nil_slice.[dbi.DVar]();
+        let mut rt: i32 = -2;
+        if d.full {
+            gs = dbi.vars_of(g);
+            rt = dbi.result_of(g);
+        }
+        let nm = abs_name(g);
+        let at = @as(u64, ib(d).len());
+        l.push(at);
+        named(d, nm, TAG_SUBPROGRAM, at);
+        let kids = gs.len > 0;
+        let mut code = pk(kids, AB_ABS_KIDS, AB_ABS);
+        if rt >= 0 {
+            code += 2;
+        }
+        ib(d).uleb(code);
+        strp(d, nm);
+        decl_at(d, dbi.decl_of(g));
+        if rt >= 0 {
+            tref(d, rt);
+        }
+        ib(d).u8_(1);  // DW_INL_inlined
+        for k in 0..gs.len {
+            let v = gs[k];
+            if (v.ty < 0) or u.notnil(v.global) or v.artificial {
+                l.push(0);
+                continue;
+            }
+            l.push(@as(u64, ib(d).len()));
+            ib(d).uleb(AB_AVAR + pk(v.param, @as(u64, 1), @as(u64, 0)));
+            strp(d, v.name);
+            decl_at(d, v.src);
+            tref(d, v.ty);
+        }
+        if kids {
+            ib(d).u8_(0);
+        }
+        offs.push(l);
+    }
+    for x in d.arefs.items() {
+        let l = offs.at(@as(usize, x.sym));
+        let k = @bit_cast(u64, x.addend);
+        let mut v = l.get(0);
+        if (k < @as(u64, l.len)) and (l.get(@truncate(usize, k)) != 0) {
+            v = l.get(@truncate(usize, k));
+        }
+        d.drefs.push(Fix.{ off: x.off, kind: FX_SEC, sym: 0, addend: @bit_cast(i64, v) });
+    }
+    d.arefs.deinit();
+    for k in 0..offs.len {
+        offs.at(k).deinit();
+    }
+    offs.deinit();
 }
 
 // Where the next list of .debug_rnglists or .debug_loclists (sec) starts:
@@ -882,6 +1114,18 @@ const AB_VARIANT: u64 = 66;
 const AB_VARIANT_EMPTY: u64 = 67;
 const AB_ART_LIST: u64 = 68;    // an artificial variable with a location list
 const AB_OTHER_TYPE: u64 = 69;  // a type of a kind not described otherwise (DW_TAG_unspecified_type)
+const AB_ABS: u64 = 70;         // an abstract instance (+ 1: with children; + 2: with a result type)
+const AB_ABS_KIDS: u64 = 71;
+const AB_AVAR: u64 = 74;        // + 0 a variable, 1 a parameter: of an abstract instance
+const AB_INL: u64 = 76;         // an inline instance (DW_TAG_inlined_subroutine), its code in one piece
+const AB_INL_RANGES: u64 = 77;  // in several
+const AB_IVAR: u64 = 78;        // + 0 a variable, 1 a parameter: of an inline instance, without a location
+const AB_IVAR_LIST: u64 = 80;   // + 0 a variable, 1 a parameter: of an inline instance, a location list
+pub const TAG_INLINED_SUBROUTINE: u64 = 0x1d;
+pub const AT_INLINE: u64 = 0x20;
+pub const AT_ABSTRACT_ORIGIN: u64 = 0x31;
+pub const AT_CALL_FILE: u64 = 0x58;
+pub const AT_CALL_LINE: u64 = 0x59;
 pub const TAG_VARIANT: u64 = 0x19;
 pub const TAG_VARIANT_PART: u64 = 0x33;
 pub const AT_DISCR: u64 = 0x15;
@@ -977,6 +1221,30 @@ fn type_abbrevs(b: *mut bn.Bytes) void {
                          [AT_TYPE, FORM_REF4], [AT_CONST_VALUE, FORM_BLOCK1]];
     abbrev(b, AB_LVAR_CONST, TAG_VARIABLE, false, cv[..]);
     abbrev(b, AB_LVAR_CONST + 1, TAG_FORMAL_PARAMETER, false, cv[..]);
+    let ab: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA], [AT_INLINE, FORM_DATA1]];
+    abbrev(b, AB_ABS, TAG_SUBPROGRAM, false, ab[..]);
+    abbrev(b, AB_ABS_KIDS, TAG_SUBPROGRAM, true, ab[..]);
+    let abt: [6][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                          [AT_PROTOTYPED, FORM_FLAG_PRESENT], [AT_TYPE, FORM_REF4], [AT_INLINE, FORM_DATA1]];
+    abbrev(b, AB_ABS + 2, TAG_SUBPROGRAM, false, abt[..]);
+    abbrev(b, AB_ABS_KIDS + 2, TAG_SUBPROGRAM, true, abt[..]);
+    let av: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA], [AT_TYPE, FORM_REF4]];
+    abbrev(b, AB_AVAR, TAG_VARIABLE, false, av[..]);
+    abbrev(b, AB_AVAR + 1, TAG_FORMAL_PARAMETER, false, av[..]);
+    let inl: [5][2]u64 = [[AT_ABSTRACT_ORIGIN, FORM_REF4], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                          [AT_CALL_FILE, FORM_UDATA], [AT_CALL_LINE, FORM_UDATA]];
+    abbrev(b, AB_INL, TAG_INLINED_SUBROUTINE, true, inl[..]);
+    let inlr: [4][2]u64 = [[AT_ABSTRACT_ORIGIN, FORM_REF4], [AT_RANGES, FORM_SEC_OFFSET], [AT_CALL_FILE, FORM_UDATA],
+                           [AT_CALL_LINE, FORM_UDATA]];
+    abbrev(b, AB_INL_RANGES, TAG_INLINED_SUBROUTINE, true, inlr[..]);
+    let iv: [1][2]u64 = [[AT_ABSTRACT_ORIGIN, FORM_REF4]];
+    abbrev(b, AB_IVAR, TAG_VARIABLE, false, iv[..]);
+    abbrev(b, AB_IVAR + 1, TAG_FORMAL_PARAMETER, false, iv[..]);
+    let ivl: [2][2]u64 = [[AT_ABSTRACT_ORIGIN, FORM_REF4], [AT_LOCATION, FORM_SEC_OFFSET]];
+    abbrev(b, AB_IVAR_LIST, TAG_VARIABLE, false, ivl[..]);
+    abbrev(b, AB_IVAR_LIST + 1, TAG_FORMAL_PARAMETER, false, ivl[..]);
     let vp: [1][2]u64 = [[AT_DISCR, FORM_REF4]];
     abbrev(b, AB_VPART, TAG_VARIANT_PART, true, vp[..]);
     let vv: [1][2]u64 = [[AT_DISCR_VALUE, FORM_SDATA]];
@@ -1107,7 +1375,7 @@ fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
         if loc == NO_LOC {
             // (optimized code: its location list, if it has one)
             let at = @as(u64, ib(d).len()) + 1;
-            if (f.vlocs.len > 0) and optimized_var(d, f, k, v, 0, clip, true) {
+            if (f.vlocs.len > 0) and optimized_var(d, f, k, v, 0, clip, true, 0, "") {
                 d.voffs.set(k, at);
             }
             return;
@@ -1119,7 +1387,7 @@ fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
         return;
     }
     let pv = pk(v.param, @as(u64, 1), @as(u64, 0));
-    if (loc == NO_LOC) and (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip, false) {
+    if (loc == NO_LOC) and (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip, false, 0, "") {
         return;
     }
     let mut code = AB_LVAR + pv;
@@ -1160,12 +1428,13 @@ fn global_loc(d: *mut Unit, g: *ir.Global, sym: u32) void {
 // has one (true: written). A variable taken apart (pieces) is in pieces at
 // each address (DW_OP_piece; one not known there: a piece without a
 // location).
-fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: []Piece, art: bool) bool {
-    let mut segs = var_segments(d, f, k, type_size(v.ty));
+fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: []Piece, art: bool, inst: u32,
+                 g: []u8) bool {
+    let mut segs = var_segments(d, f, k, type_size(v.ty), inst);
     let mut n: usize = 0;
     for sg in segs.items() {
         let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
-                            size: 0, ind: false, gsym: "" };
+                            size: 0, ind: false, gsym: "", inst: 0 };
         if clipped(x, clip, 0).end > 0 {
             n += 1;
         }
@@ -1174,7 +1443,10 @@ fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: [
         free_segments(&mut segs);
         return false;
     }
-    if art {
+    if inst != 0 {
+        ib(d).uleb(AB_IVAR_LIST + pv);  // (of an inline instance)
+        abs_ref(d, g, k + 1);
+    } else if art {
         ib(d).uleb(AB_ART_LIST);
         tref(d, v.ty);
     } else {
@@ -1186,7 +1458,7 @@ fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: [
     sec_ref(d, &mut d.parts[D_INFO], D_LOCLISTS, @as(u64, list_start(d, D_LOCLISTS)));
     for sg in segs.items() {
         let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
-                            size: 0, ind: false, gsym: "" };
+                            size: 0, ind: false, gsym: "", inst: 0 };
         let mut ci: usize = 0;
         loop {
             let c = clipped(x, clip, ci);
@@ -1324,12 +1596,12 @@ fn loc_expr(d: *mut Unit, e: *mut bn.Bytes, fx: *mut u.List.[SFix], x: *dloc.VLo
 // The stretches of variable k's locations (in f.vlocs), in order: one
 // whole value's, or the pieces' (of a variable of `size` bytes) put
 // together at each address where at least one of them has one.
-fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64) u.List.[Seg] {
+fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[Seg] {
     let mut out = u.List.[Seg].empty();
     let mut xs = u.List.[dloc.VLoc].empty();
     let mut whole = false;
     for x in f.vlocs {
-        if @as(usize, x.var) == k {
+        if (@as(usize, x.var) == k) and (x.inst == inst) {
             xs.push(x);
             whole = whole or (x.psize == 0);
         }
@@ -1775,11 +2047,19 @@ fn named(d: *mut Unit, name: []u8, tag: u64, off: u64) void {
     }
 }
 
-// The hash of the name index (DWARF 5, 6.1.1.4.5: Bernstein's, from 5381).
+// The hash of the name index (DWARF 5, 6.1.1.4.5: Bernstein's, from 5381,
+// of the name case-folded: its ASCII capitals as small letters; a byte
+// beyond ASCII as it is, which folds a name in Latin, Greek or Cyrillic
+// capitals differently from the specification's Unicode folding, but no
+// name the compilers make has those).
 pub fn djb_hash(s: []u8) u32 {
     let mut h: u32 = 5381;
     for c in s {
-        h = (h *% 33) +% @as(u32, c);
+        let mut x = c;
+        if (x >= 'A') and (x <= 'Z') {
+            x += 32;
+        }
+        h = (h *% 33) +% @as(u32, x);
     }
     return h;
 }
@@ -2222,6 +2502,7 @@ fn finish(d: *mut Unit, text_size: u64) void {
     addr_ref(d, &mut h, d.text_sym, 0);
     size_ref(d, &mut h, 4, text_size);
     sec_ref(d, &mut h, D_LINE, 0);
+    abstracts(d);
     let toff = types_and_data(d);
     let hn = @as(u64, h.b.len());
     prepend(&mut d.parts[D_INFO], &mut h);

@@ -37,7 +37,7 @@ for (const d of which === 'all' ? ['prog', 'run'] : [which]) {
   for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.c')).sort()) sources.push(path.join(dir, f));
 }
 
-const TAG_VAR = 0x34, TAG_PARAM = 0x05, TAG_SUB = 0x2e, TAG_LEX = 0x0b;
+const TAG_VAR = 0x34, TAG_PARAM = 0x05, TAG_SUB = 0x2e, TAG_LEX = 0x0b, TAG_INL = 0x1d, AT_INLINE = 0x20, AT_ORIGIN = 0x31;
 const AT_NAME = 0x03, AT_LOC = 0x02, AT_CONST = 0x1c, AT_ART = 0x34, AT_FILE = 0x3a, AT_LINE = 0x3b;
 let total = 0, located = 0, built = 0;
 const missing = [];
@@ -61,9 +61,14 @@ for (const f of sources.slice(0, max)) {
     const files = seq.files;
     const walk = (die, fn) => {
       for (const c of die.children) {
-        if (c.tag === TAG_SUB) { walk(c, c.attrs.get(AT_NAME)); continue; }
+        if (c.tag === TAG_SUB) {
+          if (!c.attrs.has(AT_INLINE)) walk(c, c.attrs.get(AT_NAME));  // (not an abstract instance: no code)
+          continue;
+        }
         if ((c.tag === TAG_VAR || c.tag === TAG_PARAM) && fn && !c.attrs.has(AT_ART)) {
-          const fi = c.attrs.get(AT_FILE);
+          // (a variable of an inline instance: its abstract instance's says what it is)
+          const o = c.attrs.has(AT_ORIGIN) ? un.dies.get(c.attrs.get(AT_ORIGIN)) : c;
+          const fi = o.attrs.get(AT_FILE);
           const fname = files[fi] || '';
           if (!fname.endsWith(base) && !units.some((u) => fname.endsWith(path.basename(u)))) continue;
           // (a block-scope static: always at its address)
@@ -74,9 +79,9 @@ for (const f of sources.slice(0, max)) {
           else if (loc instanceof Uint8Array) ok = loc.length > 0;
           else if (typeof loc === 'number') ok = locList(dw, loc).length > 0;
           if (ok) located++;
-          else missing.push(`${base}:${c.attrs.get(AT_LINE)} ${fn} ${c.attrs.get(AT_NAME)}`);
+          else missing.push(`${base}:${o.attrs.get(AT_LINE)} ${fn} ${o.attrs.get(AT_NAME)}`);
         }
-        if (c.tag === TAG_LEX) walk(c, fn);
+        if (c.tag === TAG_LEX || c.tag === TAG_INL) walk(c, fn);
       }
     };
     walk(un.die, null);

@@ -13,6 +13,7 @@
 // The shadow stack records (stack traces) are explicit stores around each
 // call in the IR, so inlining keeps traces the same.
 // =============================================================================
+import "dbginfo.ax" as dbi;
 import "ir.ax" as ir;
 import "target.ax" as tg;
 import "util.ax" as u;
@@ -133,6 +134,31 @@ fn map_blk(b: *mut ir.Block) *mut ir.Block {
 // aux2.
 let mut clone_chain: i64 = 0;
 
+// The scopes of the code inline_call copies (with debug information): the
+// inline instance's root, the callee's root, and the copies made of the
+// callee's other scopes (by scope + 1).
+struct InlScopes {
+    root: u32,
+    groot: u32,
+    memo: u.SymMap.[u32],
+}
+
+// The copy of callee scope s in the inline instance (dbginfo.ax: copy_scope).
+fn scope_copy(m: *mut InlScopes, s: u32) u32 {
+    if (s == 0) or (s == m.groot) or (@as(usize, s) >= dbi.scopes.len) {
+        return m.root;
+    }
+    let k = u.addr_key(@as(usize, s) + 1);
+    let at = m.memo.get(k);
+    if at != 0 {
+        return at;
+    }
+    let p = scope_copy(m, dbi.scopes.get(@as(usize, s)).parent);
+    let c = dbi.copy_scope(s, p);
+    m.memo.put(k, c);
+    return c;
+}
+
 // Inlines call c (in f) of g.
 pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     let g = ir.fnp_of(c.a);
@@ -172,12 +198,23 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     }
     let entry = f.first;
     let mut clones = u.List.[*mut ir.Value].empty();
+    let mut origs = u.List.[*mut ir.Value].empty();
+    // (debug information: the copied code is an inline instance of g, at c)
+    let mut isc = InlScopes.{ root: 0, groot: 0, memo: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](),
+                                                                        cap: 0, len: 0 } };
+    if ir.dbg_scopes {
+        isc.root = dbi.add_inline(g.name, g.src, c.scope, c.src);
+        isc.groot = dbi.scopes_of(g.name)[0];
+    }
     gb = g.first;
     while u.notnil(gb) {
         let nb = map_blk(gb);
         let mut x = gb.first;
         while u.notnil(x) {
             let y = ir.copy_inst(f, x);
+            if ir.dbg_scopes {
+                y.scope = scope_copy(&mut isc, x.scope);
+            }
             if x.op == ir.OP_CALL {
                 // the inlined call's records follow those of its code's calls
                 ir.set_chain(y, ir.chain_cat(ir.chain_of(x), ir.chain_of(c)));
@@ -195,9 +232,13 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
                 ir.append_inst(nb, y);
             }
             clones.push(y);
+            origs.push(x);
             x = x.next;
         }
         gb = gb.next;
+    }
+    if ir.dbg_on {
+        inline_marks(f, g, &mut isc, &clones, &origs, &args);
     }
     // operands, and returns become branches to the continuation (a result
     // in registers, ir.EXT_REGS: their values, of each return in turn, in
@@ -285,10 +326,75 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     }
     args.deinit();
     clones.deinit();
+    origs.deinit();
     rets.deinit();
     rblocks.deinit();
     regs.deinit();
     regblocks.deinit();
+}
+
+// The assignments of variables in the code inline_call copied (clones, of
+// origs; -g, optimized): the copies of the marks (ir.copy_inst made kills
+// of them) give the copies of the values of g's (a parameter: the call's
+// argument), and are of variables of the inline instance (DbgMark.inst):
+// g's own of its root, those of functions inlined into g before of the
+// copies of their instances. The objects of g's variables (allocas not
+// promoted yet) are of the instance too.
+fn inline_marks(f: *mut ir.Func, g: *mut ir.Func, isc: *mut InlScopes, clones: *u.List.[*mut ir.Value],
+                origs: *u.List.[*mut ir.Value], args: *u.List.[*mut ir.Value]) void {
+    for j in 0..clones.len {
+        let y = clones.get(j);
+        let x = origs.get(j);
+        if x.op == ir.OP_ALLOCA {
+            let ds = ir.dbg_slot_of(x);
+            if ds >= 0 {
+                let sl = ir.dbg_slots.get(@int_cast(usize, ds));
+                let mut inst = isc.root;
+                if sl.inst != 0 {
+                    inst = scope_copy(isc, sl.inst);
+                } else if sl.owner != g {
+                    continue;
+                }
+                if inst != 0 {
+                    ir.dbg_slot_note(y, sl.owner, sl.var, sl.off, sl.size, inst);
+                }
+            }
+        }
+        let mut k = ir.dbg_marks_at(y);
+        while k >= 0 {
+            let src = ir.dbg_mark_src(k);
+            let nx = ir.dbg_mark_next(k);
+            if src >= 0 {
+                let m = ir.dbg_marks.get(@int_cast(usize, src));
+                let mut inst = isc.root;
+                if m.inst != 0 {
+                    inst = scope_copy(isc, m.inst);
+                } else if m.owner != g {
+                    inst = 0;
+                }
+                if inst != 0 {
+                    ir.dbg_mark_set_inst(k, inst);
+                    let v = ir.dbg_mark_value(src);
+                    let mut w = vnil();
+                    if u.notnil(v) and (v.kind == ir.V_INST) {
+                        if u.notnil(v.blk) and (v.blk.fnp == g) {
+                            w = map_val(g, v, args);
+                        }
+                    } else if u.notnil(v) and (v.kind == ir.V_PARAM) {
+                        if ir.fnp_of(v) == g {
+                            w = map_val(g, v, args);
+                        }
+                    } else if u.notnil(v) {
+                        w = v;  // (a constant, a datum's address)
+                    }
+                    if u.notnil(w) {
+                        ir.dbg_mark_set(k, w, ir.dbg_mark_low(src), ir.dbg_mark_add(src));
+                    }
+                }
+            }
+            k = nx;
+        }
+    }
 }
 
 // The number of registers of call c's result, when it is in registers

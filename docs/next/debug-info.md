@@ -37,3 +37,11 @@
   types and enumerators, for debuggers' lookups by name.
 - A structure, union or enumeration defined in the members of one declared in a block
   is in that block's scope too.
+- Functions the optimizer inlined are described: each copy is an inline instance
+  (`DW_TAG_inlined_subroutine`, with the call's file and line) of an abstract instance
+  of the function, with its own parameters and variables located, so debuggers show
+  the inlined frames in a backtrace and `step` into them; the PDB has them as inline
+  sites (`S_INLINESITE`, `DEBUG_S_INLINEELINES`). Crash traces mark the frames of
+  functions inlined ("at f (file:line) (inlined into g)"), and with line tables show
+  the functions inlined at the faulting instruction as frames of their own.
+- The name index (`.debug_names`) hashes names case-folded, as DWARF 5 says.

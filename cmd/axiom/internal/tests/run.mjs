@@ -1237,9 +1237,10 @@ function cDriverCases() {
       return /at deref\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
     },
     // At -O2 the frames that exist are all there, with the calls inlined
-    // into them (their call-site records carry the inlining): here deep,
-    // tailer and early are inlined into main, and the crash is in a
-    // function reached by an indirect call, which names it only so.
+    // into them (their call-site records carry the inlining, and say which
+    // function each was inlined into): here deep, tailer and early are
+    // inlined into main, and the crash is in a function reached by an
+    // indirect call, which names it only so.
     'C: native stack traces through C functions at -O2': async () => {
       if (skip()) return skip();
       if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
@@ -1252,12 +1253,13 @@ function cDriverCases() {
       const c = await ax(['build', 'crash2.c', '-O2', nativeTarget, '-o', out]);
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
-      return /at <indirect call>\n\s+at early \(crash2\.c:9:16\)\n\s+at tailer \(crash2\.c:15:12\)\n\s+at deep \(crash2\.c:18:16\)\n\s+at main \(crash2\.c:22:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+      return /at <indirect call>\n\s+at early \(crash2\.c:9:16\) \(inlined into tailer\)\n\s+at tailer \(crash2\.c:15:12\) \(inlined into deep\)\n\s+at deep \(crash2\.c:18:16\) \(inlined into main\)\n\s+at main \(crash2\.c:22:12\)\n/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
     },
     // With line tables (-g, --debug-info=lines) the innermost frame shows
     // the faulting instruction's line too (the frame table's line rows:
     // cmd/axiom/src/ftab.ax), also where no call was recorded (all of the
-    // program inlined into main at -O2); the code is the same.
+    // program inlined into main at -O2), with the functions inlined there
+    // as frames of their own; the code is the same.
     'C: native stack traces with the faulting line (-g)': async () => {
       if (skip()) return skip();
       if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
@@ -1271,8 +1273,10 @@ function cDriverCases() {
       const out = path.join(dir, 'crash-g');
       const cases = [['crash.c', ['-O0', '-g'], /at deref \(crash\.c:2\)\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/],
         ['crash.c', ['-O0', '--debug-info=lines'], /at deref \(crash\.c:2\)\n\s+at middle \(crash\.c:5:12\)/],
-        ['crash.c', ['-O2', '-g'], /stack trace \(innermost first\):\n\s+at main \(crash\.c:[25]\)\n/],
-        ['crash2.c', ['-O2', '-g'], /at leafcrash \(crash2\.c:4\)\n\s+at early \(crash2\.c:9:16\)/]];
+        // (the faulting load is deref's, or folded into middle's addition)
+        ['crash.c', ['-O2', '-g'], /stack trace \(innermost first\):\n\s+at (deref \(crash\.c:2\) \(inlined into middle\)\n\s+at )?middle \(crash\.c:5\) \(inlined into main\)\n\s+at main \(crash\.c:9\) \(inlined into main\)\n/],
+        ['crash.c', ['-O2', '--debug-info=lines'], /stack trace \(innermost first\):\n\s+at (deref \(crash\.c:2\) \(inlined into middle\)\n\s+at )?middle \(crash\.c:5\) \(inlined into main\)\n\s+at main \(crash\.c:9\) \(inlined into main\)\n/],
+        ['crash2.c', ['-O2', '-g'], /at leafcrash \(crash2\.c:4\)\n\s+at early \(crash2\.c:9:16\) \(inlined into tailer\)\n/]];
       for (const [src, flags, want] of cases) {
         const c = await ax(['build', src, ...flags, nativeTarget, '-o', out]);
         if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
@@ -2546,6 +2550,14 @@ if (!skipPlatform) {
               if (lvl === '-O0' && (l.flags & 0x100)) return `${fn}: ${n} has no location at -O0`;
             }
             if (fn === 'shadow' && p.locals.filter((x) => x.name === 'x').length < 2) return 'shadow: the inner x is missing';
+          }
+          // optimized: scaled inlined into main, an inline site (S_INLINESITE,
+          // its inlinee's lines) with its variables, one located
+          if (lvl !== '-O0') {
+            if (!r.sites || !r.inlinees) return `no inline sites (${r.sites}) or inlinee lines (${r.inlinees})`;
+            // (in main, or what main is inlined into)
+            const ls = r.procs.flatMap((p) => p.locals).filter((x) => x.name === 'v' || x.name === 'm');
+            if (!ls.some((x) => x.name === 'm') || ls.every((x) => x.flags & 0x100)) return 'scaled\'s variables are not in its inline site';
           }
           if (!r.types.some((x) => x.readUInt16LE(2) === 0x1505 && x.includes(Buffer.from('pair\0')))) return 'no struct pair';
           return null;

@@ -118,8 +118,18 @@ pub struct DVar {
 /// parent 0). Index 0 of `scopes` is no scope.
 pub struct DScope {
     parent: u32,
-    func: []u8,           // its function's IR name (interned)
+    func: []u8,           // its function's IR name (interned); an inline instance's: the inlined function's
     types: u.List.[i32],  // the types declared in it (DType.scope)
+    // Inlining (inline.ax) copies the scopes of the code it copies: the root
+    // of an inline instance (`inl`) is the inlined function's root in the
+    // caller, a child of the call's scope, `call` the call's location; a
+    // copy of another scope (`orig`: the scope copied, which may itself be a
+    // copy, of a function inlined before) is in the copy of that one's
+    // parent. A root's orig is the inlined function's root (0: none).
+    inl: bool,
+    call: u32,
+    orig: u32,
+    copy: bool,  // a copy (of a lexical block or an inline instance's root), made by inlining
 }
 
 pub let mut scopes: u.List.[DScope] = u.List.[DScope].{ data: @ptr_from_int(*mut DScope, 0), len: 0, cap: 0 };
@@ -134,10 +144,12 @@ let mut func_scopes: u.SymMap.[u64] = u.SymMap.[u64].{
 /// the other); its index (from 1).
 pub fn add_scope(ir_name: []u8, parent: u32) u32 {
     if scopes.len == 0 {
-        scopes.push(DScope.{ parent: 0, func: "", types: u.List.[i32].empty() });
+        scopes.push(DScope.{ parent: 0, func: "", types: u.List.[i32].empty(), inl: false, call: 0, orig: 0,
+                             copy: false });
     }
     let k = u.intern(ir_name);
-    scopes.push(DScope.{ parent: parent, func: k, types: u.List.[i32].empty() });
+    scopes.push(DScope.{ parent: parent, func: k, types: u.List.[i32].empty(), inl: false, call: 0, orig: 0,
+                         copy: false });
     let id = @as(u64, scopes.len - 1);
     let at = func_scopes.get(k);
     if (parent == 0) or (at == 0) {
@@ -146,6 +158,66 @@ pub fn add_scope(ir_name: []u8, parent: u32) u32 {
         func_scopes.put(k, (at & ~@as(u64, 0xffff_ffff)) | id);
     }
     return @truncate(u32, id);
+}
+
+// IR function name (interned) -> where it is declared (of the functions inlined)
+let mut decls: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                 cap: 0, len: 0 };
+
+/// Where function `ir_name`, which was inlined, is declared (0: not known).
+pub fn decl_of(ir_name: []u8) u32 {
+    return decls.get(u.intern(ir_name));
+}
+
+/// The root of an inline instance of function `ir_name` (declared at
+/// `decl`; inline.ax), in scope `parent` of the function it is inlined into
+/// (0: that one's outermost), the call at source location `call`; its index.
+pub fn add_inline(ir_name: []u8, decl: u32, parent: u32, call: u32) u32 {
+    decls.put(u.intern(ir_name), decl);
+    if scopes.len == 0 {
+        scopes.push(DScope.{ parent: 0, func: "", types: u.List.[i32].empty(), inl: false, call: 0, orig: 0,
+                             copy: false });
+    }
+    let k = u.intern(ir_name);
+    let sc = scopes_of(k);
+    scopes.push(DScope.{ parent: parent, func: k, types: u.List.[i32].empty(), inl: true, call: call, orig: sc[0],
+                         copy: false });
+    return @truncate(u32, scopes.len - 1);
+}
+
+/// A copy of scope s (a lexical block or inline instance of the code
+/// inlined), in scope `parent`; its index.
+pub fn copy_scope(s: u32, parent: u32) u32 {
+    let x = scopes.get(@as(usize, s));
+    scopes.push(DScope.{ parent: parent, func: x.func, types: u.List.[i32].empty(), inl: x.inl, call: x.call, orig: s,
+                         copy: true });
+    return @truncate(u32, scopes.len - 1);
+}
+
+/// The scope that scope s is a copy of, through copies of copies (s
+/// itself if it is none: a function's own, or an inline instance's root).
+pub fn origin(s: u32) u32 {
+    let mut x = s;
+    while (x != 0) and scopes.get(@as(usize, x)).copy {
+        x = scopes.get(@as(usize, x)).orig;
+    }
+    return x;
+}
+
+/// The root of the inline instance scope s is in (s itself for a root),
+/// 0: none (its function's own code).
+pub fn inline_root(s: u32) u32 {
+    let mut x = s;
+    let mut n: u32 = 0;
+    while (x != 0) and (@as(usize, x) < scopes.len) and (n < 100000) {
+        let d = scopes.get(@as(usize, x));
+        if d.inl {
+            return x;
+        }
+        x = d.parent;
+        n += 1;
+    }
+    return 0;
 }
 
 /// The scopes of function `ir_name`: [first, last] (0, 0: none).

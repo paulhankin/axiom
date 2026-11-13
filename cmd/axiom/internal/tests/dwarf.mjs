@@ -13,7 +13,11 @@
 //   - lexical blocks lie inside their parents' code (ranges: low and high
 //     pc, or a list of .debug_rnglists); variables' locations are
 //     expressions of the forms the compiler writes, and a location list's
-//     ranges lie inside the variable's block.
+//     ranges lie inside the variable's block;
+//   - an inline instance (DW_TAG_inlined_subroutine) lies inside its
+//     parent's code, names its abstract instance (a subprogram of its unit
+//     with DW_AT_inline, without code), and its variables name that one's
+//     (of the same tag) and are located as above.
 // Files: ELF executables and relocatable objects (x86-64, AArch64), a
 // Mach-O debug bundle's DWARF file, WebAssembly modules (the DWARF custom
 // sections, code-section offsets). Formats as in the DWARF 5 standard.
@@ -373,7 +377,8 @@ export function readDwarf(img) {
 }
 
 // The hash of .debug_names (DWARF 5, 6.1.1.4.5).
-const djb = (s) => { let h = 5381; for (const c of Buffer.from(s, 'latin1')) h = (h * 33 + c) >>> 0; return h; };
+// (DWARF 5 6.1.1.4.5: of the name case-folded; ASCII capitals as small letters)
+const djb = (s) => { let h = 5381; for (const c of Buffer.from(s, 'latin1')) h = (h * 33 + (c >= 65 && c <= 90 ? c + 32 : c)) >>> 0; return h; };
 
 // The name indexes of .debug_names, checked as read (errs): [{ cus, names:
 // [{ name, entries: [{ tag, die (an offset in .debug_info) }] }] }]. Every
@@ -436,7 +441,8 @@ export function readNames(S, errs) {
 // -----------------------------------------------------------------------------
 // Checks
 // -----------------------------------------------------------------------------
-const AT_NAME = 0x03, AT_LOW = 0x11, AT_HIGH = 0x12, AT_DECL_LINE = 0x3b, AT_RANGES = 0x55;
+const AT_NAME = 0x03, AT_LOW = 0x11, AT_HIGH = 0x12, AT_DECL_LINE = 0x3b, AT_RANGES = 0x55, AT_INLINE = 0x20,
+  AT_ORIGIN = 0x31, AT_CALL_FILE = 0x58, AT_CALL_LINE = 0x59;
 const TAG_SUBPROGRAM = 0x2e;
 
 // The problems found in img's debug information (an empty list: none).
@@ -454,6 +460,13 @@ export function checkDebug(img, opts = {}) {
     const lo = cu.attrs.get(AT_LOW), hi = lo + cu.attrs.get(AT_HIGH);
     for (const c of cu.children) {
       if (c.tag !== TAG_SUBPROGRAM) continue;
+      if (c.attrs.has(AT_INLINE)) {
+        // (an abstract instance: no code; its variables without locations)
+        if (!c.attrs.get(AT_NAME)) E(`an abstract instance without a name at 0x${c.off.toString(16)}`);
+        if (c.attrs.has(AT_LOW) || c.attrs.has(AT_RANGES)) E(`${c.attrs.get(AT_NAME)}: an abstract instance with code`);
+        for (const v of c.children) if (v.attrs.has(0x02) || !v.attrs.get(AT_NAME)) E(`${c.attrs.get(AT_NAME)}: an abstract variable at 0x${v.off.toString(16)} with a location or without a name`);
+        continue;
+      }
       const name = c.attrs.get(AT_NAME), low = c.attrs.get(AT_LOW), high = low + c.attrs.get(AT_HIGH);
       // (WebAssembly: a function the linker did not keep is at the tombstone
       // address, -1, as the tool conventions' DWARF has it)
@@ -541,7 +554,10 @@ export function checkDebug(img, opts = {}) {
       for (const e of n.entries) {
         const un = dw.units.find((x) => ix.cus.includes(x.off) && x.dies.has(e.die));
         const die = un && un.dies.get(e.die);
-        if (!die || die.tag !== e.tag || die.attrs.get(AT_NAME) !== n.name) E(`.debug_names: ${n.name} (tag 0x${e.tag.toString(16)}) is not the DIE at 0x${e.die.toString(16)}`);
+        // (an inline instance has its abstract instance's name)
+        const org = die && die.attrs.has(AT_ORIGIN) ? un.dies.get(die.attrs.get(AT_ORIGIN)) : null;
+        const dname = die && (die.attrs.get(AT_NAME) || (org && org.attrs.get(AT_NAME)));
+        if (!die || die.tag !== e.tag || dname !== n.name) E(`.debug_names: ${n.name} (tag 0x${e.tag.toString(16)}) is not the DIE at 0x${e.die.toString(16)}`);
         indexed.add(e.die);
       }
     }
@@ -556,7 +572,7 @@ export function checkDebug(img, opts = {}) {
   const sc = checkScopes(dw, img.machine === 'wasm' ? null : img.machine);
   for (const m of sc.errs) E(m);
   return { errs, nsubs: subs.length, nfuncs: nf, nseqs: dw.seqs.length, nfdes: dw.fdes.length, nrets: img.rets.length, dw,
-           nblocks: sc.blocks, nvars: sc.vars, nlocated: sc.located };
+           nblocks: sc.blocks, nvars: sc.vars, nlocated: sc.located, ninlined: sc.inlined };
 }
 
 // The ranges [[lo, hi)] of a DIE with low/high pc or DW_AT_ranges (DWARF 5,
@@ -702,25 +718,38 @@ export function exprRegs(expr) {
 // (machine: 'x64', 'a64'). Returns { errs, blocks, vars, located }.
 export function checkScopes(dw, machine) {
   const errs = [];
-  let blocks = 0, vars = 0, located = 0;
+  let blocks = 0, vars = 0, located = 0, inlined = 0;
   const E = (m) => { if (errs.length < 40) errs.push(m); };
   const inside = (rs, outer) => rs.every(([a, b]) => outer.some(([c, d]) => a >= c && b <= d));
-  const walk = (die, rs, fname) => {
+  const walk = (die, rs, fname, un, abs) => {
     for (const c of die.children) {
-      if (c.tag === 0x0b) {
-        blocks++;
-        let r;
+      if (c.tag === 0x0b || c.tag === 0x1d) {
+        let r, a = abs;
+        if (c.tag === 0x1d) {
+          // (an inline instance: of an abstract instance of its unit)
+          inlined++;
+          a = un.dies.get(c.attrs.get(AT_ORIGIN));
+          if (!a || a.tag !== TAG_SUBPROGRAM || !a.attrs.has(AT_INLINE)) { E(`${fname}: an inline instance at 0x${c.off.toString(16)} of no abstract instance`); continue; }
+          if (c.attrs.has(AT_CALL_FILE) !== c.attrs.has(AT_CALL_LINE)) E(`${fname}: an inline instance's call has a file or a line only`);
+        } else blocks++;
         try { r = dieRanges(dw, c); } catch (e) { E(`${fname}: ${e.message}`); continue; }
-        if (!r || !r.length) { E(`${fname}: a lexical block without code at 0x${c.off.toString(16)}`); continue; }
-        if (r.some(([a, b]) => !(b > a))) E(`${fname}: an empty range in a lexical block`);
-        if (!inside(r, rs)) E(`${fname}: a lexical block at 0x${c.off.toString(16)} outside its parent's code`);
-        walk(c, r, fname);
+        const what = c.tag === 0x0b ? 'a lexical block' : `an inline instance of ${a.attrs.get(AT_NAME)}`;
+        if (!r || !r.length) { E(`${fname}: ${what} without code at 0x${c.off.toString(16)}`); continue; }
+        if (r.some(([a, b]) => !(b > a))) E(`${fname}: an empty range in ${what}`);
+        if (!inside(r, rs)) E(`${fname}: ${what} at 0x${c.off.toString(16)} outside its parent's code`);
+        walk(c, r, fname, un, a);
       } else if (c.tag === 0x34 || c.tag === 0x05) {
         vars++;
+        if (c.attrs.has(AT_ORIGIN)) {
+          // (a variable of an inline instance: its abstract instance's)
+          const o = un.dies.get(c.attrs.get(AT_ORIGIN));
+          if (!abs || !o || o.tag !== c.tag || !abs.children.includes(o)) E(`${fname}: a variable at 0x${c.off.toString(16)} not of its abstract instance`);
+        }
         const loc = c.attrs.get(0x02);
         if (loc === undefined) continue;
         located++;
-        const name = c.attrs.get(AT_NAME) || '(artificial)';
+        const org = c.attrs.has(AT_ORIGIN) ? un.dies.get(c.attrs.get(AT_ORIGIN)) : null;
+        const name = c.attrs.get(AT_NAME) || (org && org.attrs.get(AT_NAME)) || '(artificial)';
         if (typeof loc === 'number') {
           let l;
           try { l = locList(dw, loc); } catch (e) { E(`${fname}.${name}: ${e.message}`); continue; }
@@ -738,14 +767,14 @@ export function checkScopes(dw, machine) {
   };
   for (const un of dw.units) {
     for (const c of un.die.children) {
-      if (c.tag !== TAG_SUBPROGRAM) continue;
+      if (c.tag !== TAG_SUBPROGRAM || c.attrs.has(AT_INLINE)) continue;
       // (WebAssembly, machine null: a function the linker did not keep is at -1)
       const low = c.attrs.get(AT_LOW);
       if (machine === null && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
-      walk(c, dieRanges(dw, c), c.attrs.get(AT_NAME));
+      walk(c, dieRanges(dw, c), c.attrs.get(AT_NAME), un, null);
     }
   }
-  return { errs, blocks, vars, located };
+  return { errs, blocks, vars, located, inlined };
 }
 
 // The addresses of the rows of line `line` of a file whose name ends in `file`.
@@ -761,7 +790,7 @@ export function addrsOfLine(dw, file, line) {
 export function subprogramAt(dw, a) {
   for (const un of dw.units) {
     for (const c of un.die.children) {
-      if (c.tag !== TAG_SUBPROGRAM) continue;
+      if (c.tag !== TAG_SUBPROGRAM || c.attrs.has(AT_INLINE)) continue;
       const low = c.attrs.get(AT_LOW), high = low + c.attrs.get(AT_HIGH);
       if (a >= low && a < high) return c;
     }
@@ -780,7 +809,7 @@ export function checkVars(dw, opts) {
   const typeName = (un, die) => { const t = die && dieAt(un, die.attrs.get(0x49)); return t ? `${t.tag.toString(16)}:${t.attrs.get(AT_NAME) || ''}` : 'none'; };
   const kids = (die, tag, name) => die.children.filter((c) => c.tag === tag && (name === undefined || c.attrs.get(AT_NAME) === name));
   let un = null, sub = null;
-  for (const u of dw.units) for (const c of u.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'shadow') { un = u; sub = c; }
+  for (const u of dw.units) for (const c of u.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'shadow') { un = u; sub = c; }
   if (!sub) return ['no subprogram shadow'];
   const TD = '16:', V = 0x34, P = 0x05, LB = 0x0b;
   const n = kids(sub, P, 'n')[0], x = kids(sub, V, 'x')[0], px = kids(sub, V, 'px')[0];
@@ -810,7 +839,7 @@ export function checkVars(dw, opts) {
     walk(sub);
     // the VLA: through its address, its bound an artificial variable's
     let vsub = null;
-    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'vla') vsub = c;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'vla') vsub = c;
     const v = vsub && kids(vsub, LB).concat([vsub]).flatMap((b) => kids(b, V, 'v'))[0];
     const loc = v && v.attrs.get(0x02);
     if (!v || !(loc instanceof Uint8Array) || loc[0] !== 0x91 || loc[loc.length - 1] !== 0x06) E('vla: v has no location through its address');
@@ -824,7 +853,7 @@ export function checkVars(dw, opts) {
   if (!opts.O0) {
     // optimized: the parameters of once in their argument registers at its entry, s somewhere
     let osub = null;
-    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'once') osub = c;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'once') osub = c;
     if (!osub) E('no subprogram once');
     else {
       const regs = opts.machine === 'x64' ? [5, 4] : [0, 1];
@@ -840,7 +869,7 @@ export function checkVars(dw, opts) {
     // a variable assigned again: locations of its values; a
     // structure in pieces; a pointer into a frame object (its address)
     let asub = null;
-    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'again') asub = c;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'again') asub = c;
     if (!asub) E('no subprogram again');
     else {
       const all = (d) => [d, ...d.children.flatMap((c) => (c.tag === LB ? all(c) : []))];
@@ -853,6 +882,21 @@ export function checkVars(dw, opts) {
       if (!q || q.attrs.get(0x02) === undefined) E('again: q has no location');
       else if (opts.machine === 'x64' && opts.tls && !ll(q).some((x) => x.expr.includes(0x93))) E('again: q is not in pieces');
       if (!ll(vof('pa')).some((x) => x.expr[0] === 0x91 && x.expr[x.expr.length - 1] === 0x9f)) E('again: pa is not a frame address');
+    }
+    // scaled, inlined into main: its inline instance there, at the call's
+    // line, and its parameter v and variable m located in it
+    const insts = [];
+    const find = (d) => { for (const c of d.children) { if (c.tag === 0x1d) { const o = dieAt(un, c.attrs.get(AT_ORIGIN)); if (o && o.attrs.get(AT_NAME) === 'scaled') insts.push([c, o]); } find(c); } };
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE)) find(c);
+    if (!insts.length) E('scaled: no inline instance');
+    else {
+      const [ins, abs] = insts[0];
+      if (ins.attrs.get(AT_CALL_LINE) !== opts.markLine(opts.src, 'scaled-call')) E(`scaled: the inline instance's call line ${ins.attrs.get(AT_CALL_LINE)}`);
+      for (const [tag, nm] of [[P, 'v'], [V, 'm']]) {
+        const a = kids(abs, tag, nm)[0];
+        const c = a && ins.children.find((x) => x.attrs.get(AT_ORIGIN) === a.off);
+        if (!c || c.attrs.get(0x02) === undefined) E(`scaled: ${nm} has no location in its inline instance`);
+      }
     }
   }
   const tl = un.die.children.find((c) => c.tag === V && c.attrs.get(AT_NAME) === 'per_thread');
@@ -873,7 +917,7 @@ export function checkAxVars(dw) {
   let un = null, sub = null;
   for (const u of dw.units) {
     for (const c of u.die.children) {
-      if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'main' && c.children.some((x) => x.attrs.get(AT_NAME) === 'sh')) { un = u; sub = c; }
+      if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'main' && c.children.some((x) => x.attrs.get(AT_NAME) === 'sh')) { un = u; sub = c; }
     }
   }
   if (!sub) return ['no subprogram main with variables'];

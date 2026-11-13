@@ -27,6 +27,13 @@
 //            stream (a record's parent or end)
 //   FK_DATA  a u32 offset (0), then a u16 section: data symbol `argument`'s
 //            (its 'N' blob's) offset in its section, and the section
+//   FK_FILE  a u32: file `argument` of the object's line tables
+//            (winlines.ax), which plink.ax makes the program's file and
+//            pdb.ax the offset of its entry in the module's file checksums
+//            (in an inline site's binary annotations: in the 4-byte form of
+//            a compressed number, written then)
+// and an 'L' blob is an inlined function's id, file and line (FK_ID,
+// FK_FILE, u32), for the module's DEBUG_S_INLINEELINES.
 // Records as CodeView defines them (Microsoft's published description of
 // the CodeView and PDB formats: cvinfo.h's records and leaves).
 //
@@ -47,12 +54,14 @@ import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "util.ax" as u;
+import "winlines.ax" as wl;
 
 pub const FK_TYPE: u8 = 0;
 pub const FK_ID: u8 = 1;
 pub const FK_CODE: u8 = 2;
 pub const FK_SELF: u8 = 3;
 pub const FK_DATA: u8 = 4;
+pub const FK_FILE: u8 = 5;
 
 // Primitive types (cvinfo.h's CV_PRIMITIVE_TYPE: the type in the low byte,
 // the mode, 6 for 64-bit pointers to it, in the next)
@@ -101,6 +110,15 @@ pub const S_LOCAL: u64 = 0x113e;
 pub const S_DEFRANGE_REGISTER: u64 = 0x1141;
 pub const S_DEFRANGE_FRAMEPOINTER_REL: u64 = 0x1142;
 pub const S_DEFRANGE_REGISTER_REL: u64 = 0x1145;
+pub const S_INLINESITE: u64 = 0x114d;
+pub const S_INLINESITE_END: u64 = 0x114e;
+
+// The binary annotations of an inline site (cvinfo.h's BinaryAnnotationOpcode)
+const BA_CHANGE_CODE_OFFSET: u64 = 3;
+const BA_CHANGE_CODE_LENGTH: u64 = 4;
+const BA_CHANGE_FILE: u64 = 5;
+const BA_CHANGE_LINE_OFFSET: u64 = 6;
+const BA_CHANGE_CODE_OFFSET_AND_LINE_OFFSET: u64 = 11;
 
 // S_LOCAL's flags (CV_LVARFLAGS)
 const LV_PARAM: u64 = 0x01;
@@ -204,6 +222,9 @@ let mut gdone: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0)
 let mut files: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
                                                  cap: 0, len: 0 };  // file name -> its LF_STRING_ID
 let mut full: bool = false;
+// the functions inlined: IR name (interned) -> their LF_FUNC_ID
+let mut inlinees: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 
 /// Starts object o's section (Windows, -g: full is DEBUG_FULL, else only
 /// the functions' procedure records are made); arm64: the object is ARM64's.
@@ -227,6 +248,7 @@ pub fn begin(o: *mut elf.Obj, arm64: bool, is_full: bool) void {
     gsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     gdone = u.List.[bool].empty();
     files = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    inlinees = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
 }
 
 /// Datum `name` (an IR global) is symbol `sym` of the object.
@@ -974,12 +996,6 @@ fn has_fp(f: *dw.Func) bool {
     return false;
 }
 
-// A piece of code: [start, end) in the function.
-struct Piece {
-    start: u64,
-    end: u64,
-}
-
 /// The key of a function's 'P' blob: its symbol's section and offset
 /// (names are not unique: a function's cold part may share its name).
 pub fn func_key(sec: i32, value: u64) []u8 {
@@ -1024,16 +1040,10 @@ pub fn add_func(f: *dw.Func, sym: *elf.Sym) void {
     s.b.u32_((enc << 14) | (enc << 16));
     sym_end(&mut s, fr);
     if full {
-        let mut pieces = u.List.[u.List.[Piece]].empty();
-        if sc[0] != 0 {
-            scope_pieces(f, sc, &mut pieces);
-        }
-        let all: [1]Piece = [Piece.{ start: 0, end: f.size }];
-        body(&mut s, f, vs, sc, pieces.items(), sc[0], all[..], p, fp);
-        for k in 0..pieces.len {
-            pieces.at(k).deinit();
-        }
-        pieces.deinit();
+        let mut tr = dw.scope_tree(f, sc);
+        let all: [1]dw.Piece = [dw.Piece.{ start: 0, end: f.size }];
+        body(&mut s, f, vs, sc, &tr, 0, all[..], p, fp);
+        dw.free_tree(&mut tr);
     }
     let e = sym_begin(&mut s, S_END);
     sym_end(&mut s, e);
@@ -1062,8 +1072,16 @@ fn prologue_end(f: *dw.Func) u64 {
 }
 
 // The procedure type of function `ir_name`: its result's and its
-// parameters' types (its parameter variables, in order).
+// parameters' types (its parameter variables, in order); and its id.
 fn func_type(ir_name: []u8, vs: []dbi.DVar) u32 {
+    let x = proc_type(ir_name, vs);
+    if x != 0 {
+        _ = func_id(ir_name, x);
+    }
+    return x;
+}
+
+fn proc_type(ir_name: []u8, vs: []dbi.DVar) u32 {
     let rt = dbi.result_of(ir_name);
     if rt == -2 {
         return 0;
@@ -1076,94 +1094,128 @@ fn func_type(ir_name: []u8, vs: []dbi.DVar) u32 {
     }
     let x = procedure(type_index(rt), ps.items());
     ps.deinit();
+    return x;
+}
+
+// A function's id (LF_FUNC_ID: its type, its name).
+fn func_id(ir_name: []u8, x: u32) u32 {
     let mut r = rec(LF_FUNC_ID);
     r.b.u32_(0);  // scope: none
     ti(&mut r, x, FK_TYPE);
     cstr(&mut r.b, dbi.func_name(ir_name, elf.display_name(ir_name)));
-    _ = add_rec(&mut r, true);
+    return add_rec(&mut r, true);
+}
+
+// The id of function `ir_name`, inlined (made once per object, with its
+// 'L' blob: where it is declared, from which its inline sites' lines count).
+fn inlinee(ir_name: []u8) u32 {
+    let key = u.intern(ir_name);
+    let at = inlinees.get(key);
+    if at != 0 {
+        return at;
+    }
+    let x = func_id(ir_name, proc_type(ir_name, dbi.vars_of(ir_name)));
+    inlinees.put(key, x);
+    let decl = dbi.decl_of(ir_name);
+    if decl != 0 {
+        let mut line: u32 = 0;
+        let fnum = wl.file_num(decl, &mut line);
+        let mut b = bn.new_bytes();
+        b.u32_(@as(u64, x));
+        b.u32_(@as(u64, fnum));
+        b.u32_(@as(u64, line));
+        let mut fx: [2]u64 = [fix(0, FK_ID, 0), fix(4, FK_FILE, @as(u64, fnum))];
+        blob('L', "", b.view(), fx[..]);
+        b.free();
+    }
     return x;
 }
 
-// The code of each of f's scopes sc[0]..sc[1] (by index - sc[0]): the
-// pieces whose instructions are in it or in a block inside it (as dwarf.ax's
-// scope_ranges).
-fn scope_pieces(f: *dw.Func, sc: [2]u32, out: *mut u.List.[u.List.[Piece]]) void {
-    let n = @as(usize, sc[1] - sc[0]) + 1;
-    for _k in 0..n {
-        out.push(u.List.[Piece].empty());
-    }
-    let mut k: usize = 0;
-    while k < f.scopes.len {
-        let start = f.scopes[k] >> 32;
-        let mut end = f.size;
-        if k + 1 < f.scopes.len {
-            end = f.scopes[k + 1] >> 32;
-        }
-        let mut s = @truncate(u32, f.scopes[k]);
-        k += 1;
-        if (end <= start) or (start >= f.size) {
-            continue;
-        }
-        if (s < sc[0]) or (s > sc[1]) {
-            s = sc[0];
-        }
-        while (s >= sc[0]) and (s <= sc[1]) {
-            let l = out.at(@as(usize, s - sc[0]));
-            if (l.len > 0) and (l.last().end == start) {
-                l.at(l.len - 1).end = @min(end, f.size);
-            } else {
-                l.push(Piece.{ start: start, end: @min(end, f.size) });
-            }
-            s = dbi.scopes.at(@as(usize, s)).parent;
-            if s == 0 {
-                break;
-            }
-        }
-    }
-}
-
 // The pieces of `ps` within `clip`.
-fn clip_pieces(ps: []Piece, clip: []Piece, out: *mut u.List.[Piece]) void {
+fn clip_pieces(ps: []dw.Piece, clip: []dw.Piece, out: *mut u.List.[dw.Piece]) void {
     for p in ps {
         for c in clip {
             let a = @max(p.start, c.start);
             let b = @min(p.end, c.end);
             if b > a {
-                out.push(Piece.{ start: a, end: b });
+                out.push(dw.Piece.{ start: a, end: b });
             }
         }
     }
 }
 
-// What is in scope s of f within code `clip` (its variables, the types it
-// declares, then its blocks: an S_BLOCK32 for each piece of a block's code
-// in clip, holding what is in that block there); parent: the enclosing
-// record's offset in the blob.
-fn body(s: *mut Syms, f: *dw.Func, vs: []dbi.DVar, sc: [2]u32, pieces: []u.List.[Piece], scope: u32, clip: []Piece,
-        parent: usize, fp: bool) void {
-    for k in 0..vs.len {
-        let mut vsc = vs[k].scope;
-        if (vsc < sc[0]) or (vsc > sc[1]) {
-            vsc = sc[0];
+// What is in node n of f's scopes (tr: dwarf.scope_tree) within code
+// `clip`: its variables, the types it declares, then its blocks and inline
+// sites: an S_BLOCK32 for each piece of a block's code in clip, an
+// S_INLINESITE for an inline instance's code in clip (its binary
+// annotations: the pieces and their lines), holding what is in it there;
+// parent: the enclosing record's offset in the blob.
+fn body(s: *mut Syms, f: *dw.Func, vs: []dbi.DVar, sc: [2]u32, tr: *dw.Tree, n: u32, clip: []dw.Piece, parent: usize,
+        fp: bool) void {
+    let scope = tr.ids.get(@as(usize, n));
+    let mut own = n == 0;
+    if n != 0 {
+        let ds = dbi.scopes.get(@as(usize, scope));
+        own = not ds.inl and not ds.copy;
+    }
+    if own {
+        for k in 0..vs.len {
+            let mut vsc = vs[k].scope;
+            if (vsc < sc[0]) or (vsc > sc[1]) {
+                vsc = sc[0];
+            }
+            if vsc == scope {
+                variable(s, f, k, vs[k], clip, fp, 0);
+            }
         }
-        if vsc == scope {
-            variable(s, f, k, vs[k], clip, fp);
+        if scope != 0 {
+            for t in dbi.scopes.at(@as(usize, scope)).types.items() {
+                udt(s, t);
+            }
+        }
+    } else {
+        // (of an inline instance: the inlined function's variables there)
+        let inst = dbi.inline_root(scope);
+        let g = dbi.scopes.get(@as(usize, inst)).func;
+        let gs = dbi.vars_of(g);
+        let gsc = dbi.scopes_of(g);
+        let mut want = dbi.origin(scope);
+        if scope == inst {
+            want = gsc[0];
+        }
+        for k in 0..gs.len {
+            let mut vsc = gs[k].scope;
+            if (vsc < gsc[0]) or (vsc > gsc[1]) {
+                vsc = gsc[0];
+            }
+            if (vsc == want) and u.isnil(gs[k].global) {
+                variable(s, f, k, gs[k], clip, fp, inst);
+            }
         }
     }
-    if scope != 0 {
-        for t in dbi.scopes.at(@as(usize, scope)).types.items() {
-            udt(s, t);
-        }
-    }
-    if scope == 0 {
-        return;
-    }
-    for c in (scope + 1)..(sc[1] + 1) {
-        if dbi.scopes.at(@as(usize, c)).parent != scope {
+    for c in tr.kids.at(@as(usize, n)).items() {
+        let mut cp = u.List.[dw.Piece].empty();
+        clip_pieces(tr.pieces.at(@as(usize, c)).items(), clip, &mut cp);
+        let cs = dbi.scopes.get(@as(usize, tr.ids.get(@as(usize, c))));
+        if cs.inl {
+            if cp.len > 0 {
+                let b = sym_begin(s, S_INLINESITE);
+                sym_self(s, parent);
+                let end_at = s.b.len();
+                s.b.u32_(0);
+                s.fx.push(fix(s.b.len(), FK_ID, 0));
+                s.b.u32_(@as(u64, inlinee(cs.func)));
+                annotations(s, f, tr.ids.get(@as(usize, c)), cs.func, cp.items());
+                sym_end(s, b);
+                body(s, f, vs, sc, tr, c, cp.items(), b, fp);
+                let e = sym_begin(s, S_INLINESITE_END);
+                sym_end(s, e);
+                s.fx.push(fix(end_at, FK_SELF, 0));
+                s.b.set_u32(end_at, @as(u64, e));
+            }
+            cp.deinit();
             continue;
         }
-        let mut cp = u.List.[Piece].empty();
-        clip_pieces(pieces[@as(usize, c - sc[0])].items(), clip, &mut cp);
         for pc in cp.items() {
             let b = sym_begin(s, S_BLOCK32);
             sym_self(s, parent);
@@ -1173,8 +1225,8 @@ fn body(s: *mut Syms, f: *dw.Func, vs: []dbi.DVar, sc: [2]u32, pieces: []u.List.
             sym_code(s, pc.start);
             cstr(&mut s.b, "");
             sym_end(s, b);
-            let one: [1]Piece = [pc];
-            body(s, f, vs, sc, pieces, c, one[..], b, fp);
+            let one: [1]dw.Piece = [pc];
+            body(s, f, vs, sc, tr, c, one[..], b, fp);
             let e = sym_begin(s, S_END);
             sym_end(s, e);
             s.fx.push(fix(end_at, FK_SELF, 0));
@@ -1182,6 +1234,142 @@ fn body(s: *mut Syms, f: *dw.Func, vs: []dbi.DVar, sc: [2]u32, pieces: []u.List.
         }
         cp.deinit();
     }
+}
+
+// A number of an annotation (cvinfo.h's CVCompressData: 1, 2 or 4 bytes,
+// big-endian, the first with 0, 10 or 110 in its top bits).
+fn ba_num(b: *mut bn.Bytes, v: u64) void {
+    if v < 0x80 {
+        b.u8_(@truncate(u8, v));
+    } else if v < 0x4000 {
+        b.u8_(@truncate(u8, (v >> 8) | 0x80));
+        b.u8_(@truncate(u8, v));
+    } else {
+        b.u8_(@truncate(u8, ((v >> 24) & 0x1f) | 0xc0));
+        b.u8_(@truncate(u8, v >> 16));
+        b.u8_(@truncate(u8, v >> 8));
+        b.u8_(@truncate(u8, v));
+    }
+}
+
+// A signed one (a line's change): its magnitude << 1, the sign in bit 0.
+fn ba_signed(d: i64) u64 {
+    if d < 0 {
+        return (@bit_cast(u64, 0 -% d) << 1) | 1;
+    }
+    return @bit_cast(u64, d) << 1;
+}
+
+// The binary annotations of inline site `inst` (the root of an inline
+// instance of function g) whose code in f is `ps`: at each place in it
+// where the line changes, the file, the line and the code offset (from the
+// procedure's start) by how they change, from the inlined function's
+// declaration (its DEBUG_S_INLINEELINES entry); the end of each piece by its
+// length. The line of code of another function inlined into it is that of
+// the call it was inlined at.
+fn annotations(s: *mut Syms, f: *dw.Func, inst: u32, g: []u8, ps: []dw.Piece) void {
+    let mut cur_file: u32 = 0xffff_ffff;
+    let mut cur_line: u32 = 0;
+    let decl = dbi.decl_of(g);
+    if decl != 0 {
+        cur_file = wl.file_num(decl, &mut cur_line);
+    }
+    let mut cur_off: u64 = 0;
+    for pc in ps {
+        // the places in the piece where the row or the scope changes
+        let mut at = u.List.[u64].empty();
+        at.push(pc.start);
+        for r in f.rows {
+            let o = (r >> 32) & 0x7fff_ffff;
+            if (o > pc.start) and (o < pc.end) {
+                at.push(o);
+            }
+        }
+        for x in f.scopes {
+            let o = x >> 32;
+            if (o > pc.start) and (o < pc.end) {
+                at.push(o);
+            }
+        }
+        u.sort.[u64](at.items(), cmp_u64);
+        let mut first = true;
+        let mut prev: u64 = 0xffff_ffff_ffff_ffff;
+        for o in at.items() {
+            if o == prev {
+                continue;
+            }
+            prev = o;
+            let src = site_src(f, inst, o);
+            if src == 0 {
+                continue;
+            }
+            let mut line: u32 = 0;
+            let fnum = wl.file_num(src, &mut line);
+            if not first and (fnum == cur_file) and (line == cur_line) {
+                continue;
+            }
+            if fnum != cur_file {
+                s.b.u8_(@truncate(u8, BA_CHANGE_FILE));
+                s.fx.push(fix(s.b.len(), FK_FILE, @as(u64, fnum)));
+                s.b.u32_(0);  // (the 4-byte form: pdb.ax)
+                cur_file = fnum;
+            }
+            let dl = ba_signed(@as(i64, line) - @as(i64, cur_line));
+            let dc = o - cur_off;
+            if (dl < 8) and (dc <= 0xf) {
+                s.b.u8_(@truncate(u8, BA_CHANGE_CODE_OFFSET_AND_LINE_OFFSET));
+                ba_num(&mut s.b, (dl << 4) | dc);
+            } else {
+                if dl != 0 {
+                    s.b.u8_(@truncate(u8, BA_CHANGE_LINE_OFFSET));
+                    ba_num(&mut s.b, dl);
+                }
+                s.b.u8_(@truncate(u8, BA_CHANGE_CODE_OFFSET));
+                ba_num(&mut s.b, dc);
+            }
+            cur_off = o;
+            cur_line = line;
+            first = false;
+        }
+        at.deinit();
+        if not first {
+            s.b.u8_(@truncate(u8, BA_CHANGE_CODE_LENGTH));
+            ba_num(&mut s.b, pc.end - cur_off);
+            cur_off = pc.end;
+        }
+    }
+}
+
+// The source location of the code at offset o of f, as inline site `inst`
+// has it: the row's, or, in code of a function inlined into inst's, the
+// location of the call (in inst's code) it was inlined at (0: none).
+fn site_src(f: *dw.Func, inst: u32, o: u64) u32 {
+    let mut src: u32 = 0;
+    for r in f.rows {
+        if ((r >> 32) & 0x7fff_ffff) > o {
+            break;
+        }
+        if @truncate(u32, r) != 0 {
+            src = @truncate(u32, r);
+        }
+    }
+    let mut sc: u32 = 0;
+    for x in f.scopes {
+        if (x >> 32) > o {
+            break;
+        }
+        sc = @truncate(u32, x);
+    }
+    let mut r = dbi.inline_root(sc);
+    while (r != 0) and (r != inst) {
+        let d = dbi.scopes.get(@as(usize, r));
+        let up = dbi.inline_root(d.parent);
+        if up == inst {
+            return d.call;
+        }
+        r = up;
+    }
+    return src;
 }
 
 // A user-defined type's name (S_UDT): a typedef, or a named structure,
@@ -1212,7 +1400,8 @@ fn udt(s: *mut Syms, t: i32) void {
 // where dloc.ax places it (S_LOCAL and its ranges: opt_ranges), or its
 // constant value (S_CONSTANT) where it is that constant throughout; else
 // without a location.
-fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []Piece, fp: bool) void {
+// (inst: an inline instance's variable, of the function inlined: dloc.VLoc.inst)
+fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []dw.Piece, fp: bool, inst: u32) void {
     if (v.ty < 0) or v.artificial {
         return;
     }
@@ -1233,7 +1422,7 @@ fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []Piece, fp:
         return;
     }
     let mut loc = dw.NO_LOC;
-    if k < f.vars.len {
+    if (k < f.vars.len) and (inst == 0) {
         loc = f.vars[k];
     }
     let in_slot = (loc != dw.NO_LOC) and not v.indirect;  // (indirect: the slot holds its address, which no range says)
@@ -1249,7 +1438,7 @@ fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []Piece, fp:
         return;
     }
     let size = type_size(v.ty);
-    if (loc == dw.NO_LOC) and constant(s, f, k, v, t, size, clip) {
+    if (loc == dw.NO_LOC) and constant(s, f, k, v, t, size, clip, inst) {
         return;
     }
     let at = sym_begin(s, S_LOCAL);
@@ -1262,7 +1451,7 @@ fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []Piece, fp:
     if in_slot {
         n = cfa_ranges(s, f, loc, clip);
     } else if loc == dw.NO_LOC {
-        n = opt_ranges(s, f, k, size, clip);
+        n = opt_ranges(s, f, k, size, clip, inst);
     }
     if n == 0 {
         s.b.set_u8(flags_at, @truncate(u8, pk(v.param, LV_PARAM, 0)));
@@ -1277,15 +1466,15 @@ fn whole(x: *dloc.VLoc, size: u64) bool {
 
 // Variable k of f (v, of type t) as an S_CONSTANT, if its locations are
 // all one constant of all of it, which they give for all of code `clip`.
-fn constant(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, t: u32, size: u64, clip: []Piece) bool {
+fn constant(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, t: u32, size: u64, clip: []dw.Piece, inst: u32) bool {
     if (size == 0) or (size > 8) {
         return false;
     }
     let mut bits: u64 = 0;
     let mut have = false;
-    let mut cover = u.List.[Piece].empty();
+    let mut cover = u.List.[dw.Piece].empty();
     for x in f.vlocs {
-        if @as(usize, x.var) != k {
+        if (@as(usize, x.var) != k) or (x.inst != inst) {
             continue;
         }
         if (x.kind != dloc.LK_CONST) or not whole(&x, size) or (have and (@bit_cast(u64, x.off) != bits)) {
@@ -1294,7 +1483,7 @@ fn constant(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, t: u32, size: u64,
         }
         bits = @bit_cast(u64, x.off);
         have = true;
-        let one: [1]Piece = [Piece.{ start: x.start, end: x.end }];
+        let one: [1]dw.Piece = [dw.Piece.{ start: x.start, end: x.end }];
         clip_pieces(one[..], clip, &mut cover);
     }
     // (the pieces of clip covered: each of its bytes by one of them)
@@ -1339,14 +1528,14 @@ fn constant(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, t: u32, size: u64,
 // slot, a constant for part of the code, and pieces (a structure taken
 // apart): CodeView's subfield ranges are read by the system's symbol
 // handler as the whole variable (a wrong value). Their count.
-fn opt_ranges(s: *mut Syms, f: *dw.Func, k: usize, size: u64, clip: []Piece) usize {
+fn opt_ranges(s: *mut Syms, f: *dw.Func, k: usize, size: u64, clip: []dw.Piece, inst: u32) usize {
     let mut n: usize = 0;
     for x in f.vlocs {
-        if (@as(usize, x.var) != k) or not whole(&x, size) {
+        if (@as(usize, x.var) != k) or (x.inst != inst) or not whole(&x, size) {
             continue;
         }
-        let one: [1]Piece = [Piece.{ start: x.start, end: x.end }];
-        let mut cp = u.List.[Piece].empty();
+        let one: [1]dw.Piece = [dw.Piece.{ start: x.start, end: x.end }];
+        let mut cp = u.List.[dw.Piece].empty();
         clip_pieces(one[..], clip, &mut cp);
         for pc in cp.items() {
             if x.kind == dloc.LK_REG {
@@ -1362,7 +1551,7 @@ fn opt_ranges(s: *mut Syms, f: *dw.Func, k: usize, size: u64, clip: []Piece) usi
                     }
                 }
             } else if (x.kind == dloc.LK_SLOT) and (x.add == 0) and not x.ind {
-                let pcs: [1]Piece = [pc];
+                let pcs: [1]dw.Piece = [pc];
                 n += cfa_ranges_in(s, f, x.off, pcs[..]);
             }
         }
@@ -1413,15 +1602,15 @@ fn reg_range(s: *mut Syms, r: u64, start: u64, end: u64) usize {
 // The ranges of a value at `off` from the CFA, in code `clip` (empty: all
 // of f): an S_DEFRANGE_REGISTER_REL from the CFA's register in each of the
 // call frame's states (f.cfi; none: the state at the entry).
-fn cfa_ranges(s: *mut Syms, f: *dw.Func, off: i64, clip: []Piece) usize {
+fn cfa_ranges(s: *mut Syms, f: *dw.Func, off: i64, clip: []dw.Piece) usize {
     if clip.len == 0 {
-        let all: [1]Piece = [Piece.{ start: 0, end: f.size }];
+        let all: [1]dw.Piece = [dw.Piece.{ start: 0, end: f.size }];
         return cfa_ranges_in(s, f, off, all[..]);
     }
     return cfa_ranges_in(s, f, off, clip);
 }
 
-fn cfa_ranges_in(s: *mut Syms, f: *dw.Func, off: i64, clip: []Piece) usize {
+fn cfa_ranges_in(s: *mut Syms, f: *dw.Func, off: i64, clip: []dw.Piece) usize {
     let mut n: usize = 0;
     let nst = @max(f.cfi.len, 1);
     for k in 0..nst {
