@@ -1576,13 +1576,21 @@ fn int_compare(v: *mut ir.Value) i32 {
     return icc(p);
 }
 
-// ucomis* for an fcmp; returns the condition code, or -1 for OEQ (E and NP)
-// and -2 for UNE (NE or P).
+// ucomis* for an fcmp (comis* for a signaling one: ir.F_SIGNALING);
+// returns the condition code, or -1 for OEQ (E and NP) and -2 for UNE (NE
+// or P).
 fn float_compare(v: *mut ir.Value) i32 {
     let p = @truncate(i32, @bit_cast(i64, v.cv));
+    let sig = (v.flags & ir.F_SIGNALING) != 0;
     let mut op = xe.UCOMISD;
     if v.a.ty.bits == 32 {
         op = xe.UCOMISS;
+    }
+    if sig {
+        op = xe.COMISD;
+        if v.a.ty.bits == 32 {
+            op = xe.COMISS;
+        }
     }
     let a = reg(v.a);
     let b = reg(v.b);
@@ -1921,7 +1929,7 @@ fn cond_code(c: *mut ir.Value) i32 {
     // a comparison in this block that other instructions use too: compare
     // again rather than test its materialized result
     if (c.kind == ir.V_INST) and (c.blk == IB) and ((c.op == ir.OP_ICMP) or (c.op == ir.OP_FCMP)) and
-       (c.a.ty.kind != ir.T_VEC) {
+       (c.a.ty.kind != ir.T_VEC) and not ir.fp_pinned(c) {
         if c.op == ir.OP_ICMP {
             return int_compare(c);
         }
@@ -7734,6 +7742,9 @@ fn mark_cmp_values(i: *mut ir.Value) void {
 // F_BTR on the shift).
 fn mark_fused_cmp(i: *mut ir.Value) void {
     let b = i.blk;
+    if ir.fp_pinned(i) {
+        return;  // (strict floating point: compared where it is, once)
+    }
     if (is_scalar_cmp(i) or ptest_cond(i)) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
         i.flag = i.flag | 2;
     }
@@ -8723,7 +8734,7 @@ fn sinkable2(i: *mut ir.Value) bool {
 }
 
 fn sinkable(i: *mut ir.Value) bool {
-    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.uses < 1) or remat(i) {
+    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.uses < 1) or remat(i) or ir.fp_pinned(i) {
         return false;
     }
     if i.op == ir.OP_PTRADD {
@@ -9229,8 +9240,8 @@ fn hoistable(i: *mc.MInst) bool {
     if (op == xe.LOAD) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.MOV_RR) or (op == xe.MOV_RI) {
         return true;
     }
-    return (op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST) and
-           (i.cc != xe.KORTESTQ) and (i.ops[0].reg != xe.K1);
+    return (op == xe.SSE) and not xe.sse_compare(i.cc) and (i.cc != xe.PTEST) and (i.cc != xe.KORTESTQ) and
+           (i.ops[0].reg != xe.K1);
 }
 
 // May i write memory?

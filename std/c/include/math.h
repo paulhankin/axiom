@@ -69,6 +69,32 @@ typedef double double_t;
 #endif
 
 #if __STDC_VERSION__ >= 202311L
+/* the rounding directions of fromfp and the like (7.12p17) */
+#define FP_INT_UPWARD 0
+#define FP_INT_DOWNWARD 1
+#define FP_INT_TOWARDZERO 2
+#define FP_INT_TONEARESTFROMZERO 3
+#define FP_INT_TONEAREST 4
+
+/* llogb's results for 0 and NaN: LONG_MIN and LONG_MAX of the build's long */
+#if __AXIOM_LONG_WIDTH__ == 32
+#define FP_LLOGB0 (-2147483647L - 1)
+#define FP_LLOGBNAN 2147483647L
+#else
+#define FP_LLOGB0 (-9223372036854775807L - 1)
+#define FP_LLOGBNAN 9223372036854775807L
+#endif
+
+/* FP_FAST_FMA, FP_FAST_FMAF, FP_FAST_FMAL and the FP_FAST_ macros of the
+   narrowing functions are not defined: each is a call of the library's
+   function, slower than a multiplication and an addition */
+
+/* the signaling comparison: "invalid" and a domain error for a NaN */
+#define iseqsig(x, y) __builtin_axiom_tg(2, __axc_iseqsigf, __axc_iseqsig, __axc_iseqsigl, 0, 0, 0, x, y)
+int __axc_iseqsigf(float __x, float __y);
+int __axc_iseqsig(double __x, double __y);
+int __axc_iseqsigl(long double __x, long double __y);
+
 #define issubnormal(x) __builtin_axiom_issubnormal(x)
 #define iszero(x) __builtin_axiom_iszero(x)
 #define issignaling(x) __builtin_axiom_issignaling(x)
@@ -255,7 +281,7 @@ long double fmal(long double __x, long double __y, long double __z);
 #endif
 
 #if __STDC_VERSION__ >= 202311L
-/* the functions of C23 that the library has */
+/* the functions of C23 */
 /* double */
 double exp10(double __x);
 double roundeven(double __x);
@@ -301,6 +327,106 @@ long double fmaximum_numl(long double __x, long double __y);
 long double fminimum_numl(long double __x, long double __y);
 long double fmaximum_mag_numl(long double __x, long double __y);
 long double fminimum_mag_numl(long double __x, long double __y);
+/* C23's functions of double */
+double exp2m1(double __x);
+double exp10m1(double __x);
+double log2p1(double __x);
+double log10p1(double __x);
+double logp1(double __x);
+double rsqrt(double __x);
+double tanpi(double __x);
+double asinpi(double __x);
+double acospi(double __x);
+double atanpi(double __x);
+double atan2pi(double __y, double __x);
+double rootn(double __x, long long __n);
+double pown(double __x, long long __n);
+double powr(double __x, double __y);
+double compoundn(double __x, long long __n);
+double fromfp(double __x, int __r, unsigned int __w);
+double ufromfp(double __x, int __r, unsigned int __w);
+double fromfpx(double __x, int __r, unsigned int __w);
+double ufromfpx(double __x, int __r, unsigned int __w);
+double getpayload(const double *__x);
+int setpayload(double *__r, double __pl);
+int setpayloadsig(double *__r, double __pl);
+int totalorder(const double *__x, const double *__y);
+int totalordermag(const double *__x, const double *__y);
+int canonicalize(double *__c, const double *__x);
+long llogb(double __x);
+/* C23's functions of float */
+float exp2m1f(float __x);
+float exp10m1f(float __x);
+float log2p1f(float __x);
+float log10p1f(float __x);
+float logp1f(float __x);
+float rsqrtf(float __x);
+float tanpif(float __x);
+float asinpif(float __x);
+float acospif(float __x);
+float atanpif(float __x);
+float atan2pif(float __y, float __x);
+float rootnf(float __x, long long __n);
+float pownf(float __x, long long __n);
+float powrf(float __x, float __y);
+float compoundnf(float __x, long long __n);
+float fromfpf(float __x, int __r, unsigned int __w);
+float ufromfpf(float __x, int __r, unsigned int __w);
+float fromfpxf(float __x, int __r, unsigned int __w);
+float ufromfpxf(float __x, int __r, unsigned int __w);
+float getpayloadf(const float *__x);
+int setpayloadf(float *__r, float __pl);
+int setpayloadsigf(float *__r, float __pl);
+int totalorderf(const float *__x, const float *__y);
+int totalordermagf(const float *__x, const float *__y);
+int canonicalizef(float *__c, const float *__x);
+long llogbf(float __x);
+/* C23's functions of long double */
+long double exp2m1l(long double __x);
+long double exp10m1l(long double __x);
+long double log2p1l(long double __x);
+long double log10p1l(long double __x);
+long double logp1l(long double __x);
+long double rsqrtl(long double __x);
+long double tanpil(long double __x);
+long double asinpil(long double __x);
+long double acospil(long double __x);
+long double atanpil(long double __x);
+long double atan2pil(long double __y, long double __x);
+long double rootnl(long double __x, long long __n);
+long double pownl(long double __x, long long __n);
+long double powrl(long double __x, long double __y);
+long double compoundnl(long double __x, long long __n);
+long double fromfpl(long double __x, int __r, unsigned int __w);
+long double ufromfpl(long double __x, int __r, unsigned int __w);
+long double fromfpxl(long double __x, int __r, unsigned int __w);
+long double ufromfpxl(long double __x, int __r, unsigned int __w);
+long double getpayloadl(const long double *__x);
+int setpayloadl(long double *__r, long double __pl);
+int setpayloadsigl(long double *__r, long double __pl);
+int totalorderl(const long double *__x, const long double *__y);
+int totalordermagl(const long double *__x, const long double *__y);
+int canonicalizel(long double *__c, const long double *__x);
+long llogbl(long double __x);
+/* the narrowing operations (7.12.14) */
+float fadd(double __x, double __y);
+float faddl(long double __x, long double __y);
+double daddl(long double __x, long double __y);
+float fsub(double __x, double __y);
+float fsubl(long double __x, long double __y);
+double dsubl(long double __x, long double __y);
+float fmul(double __x, double __y);
+float fmull(long double __x, long double __y);
+double dmull(long double __x, long double __y);
+float fdiv(double __x, double __y);
+float fdivl(long double __x, long double __y);
+double ddivl(long double __x, long double __y);
+float ffma(double __x, double __y, double __z);
+float ffmal(long double __x, long double __y, long double __z);
+double dfmal(long double __x, long double __y, long double __z);
+float fsqrt(double __x);
+float fsqrtl(long double __x);
+double dsqrtl(long double __x);
 #endif
 
 #endif

@@ -16,7 +16,7 @@
 // format, from the exact sum of its three parts (td_to_ld). The kernels are
 // those of the double functions with more terms and tables of triple-doubles
 // (math_ld_tables.ax): Tang's table-driven exp and log (2^(j/64), and the
-// reciprocals c of math_tables.ax with log c), sin and cos from sin and cos
+// reciprocals c of std/internal/math/tables.ax with log c), sin and cos from sin and cos
 // of j/64 and the series of the remainder, after an exact reduction by
 // multiples of pi/2 (Payne and Hanek's, with 2/pi to 16896 bits), atan from a
 // table of atan c; the others from these. Within about 2^-118 relative before
@@ -28,10 +28,10 @@
 // function's value of the argument converted (and its errno and flags);
 // overflow and underflow of the format set ERANGE and raise the flags.
 // =============================================================================
+import "../../internal/math/core.ax" as m;
+import "../../internal/math/tables.ax" as t;
 import "ldouble.ax" as ld;
-import "math.ax" as m;
 import "math_ld_tables.ax" as lt;
-import "math_tables.ax" as t;
 
 extern "C" {
     fn __axc_math_err(e: i32, flags: u32) void;
@@ -59,6 +59,16 @@ extern "C" {
     fn pow(x: f64, y: f64) f64;
     fn atan2(y: f64, x: f64) f64;
     fn hypot(x: f64, y: f64) f64;
+    fn exp2m1(x: f64) f64;
+    fn exp10m1(x: f64) f64;
+    fn log2p1(x: f64) f64;
+    fn log10p1(x: f64) f64;
+    fn rsqrt(x: f64) f64;
+    fn sinpi(x: f64) f64;
+    fn cospi(x: f64) f64;
+    fn tanpi(x: f64) f64;
+    fn rootn(x: f64, n: i64) f64;
+    fn compoundn(x: f64, n: i64) f64;
 }
 
 // -----------------------------------------------------------------------------
@@ -441,6 +451,34 @@ fn via_double(r: *mut ld.W, v: f64, f: u32) void {
     td_to_ld(r, c, 0, f);
 }
 
+/// td_to_ld, of v/pi if post.
+fn put(r: *mut ld.W, v: TD, k: i32, f: u32, post: bool) void {
+    if post {
+        td_to_ld(r, tmul(v, td(lt.INVPI_H, lt.INVPI_M, lt.INVPI_L)), k, f);
+        return;
+    }
+    td_to_ld(r, v, k, f);
+}
+
+/// via_double, of v/pi if post (where v is a multiple of pi/4, exactly).
+fn via_double_p(r: *mut ld.W, v: f64, f: u32, post: bool) void {
+    let a = @abs(v);
+    if post and ((a == lt.PIO4_H) or (a == lt.PIO2_H) or (a == lt.PI_H) or (a == 2.356194490192345)) {
+        // (1/4, 1/2, 1, 3/4: exact)
+        let mut q: f64 = 0.25;
+        if a == lt.PIO2_H {
+            q = 0.5;
+        } else if a == lt.PI_H {
+            q = 1.0;
+        } else if a == 2.356194490192345 {
+            q = 0.75;
+        }
+        ld.from_f64(r, m.bits(@copysign(q, v)), f);
+        return;
+    }
+    via_double(r, v, f);
+}
+
 inline fn to_d(a: *ld.W, f: u32) f64 {
     return m.from_bits(ld.to_f64(a, f));
 }
@@ -508,7 +546,7 @@ inline fn t_exp_c(n: usize) u64 {
 }
 
 /// log of x = s 2^e (s a triple-double in [1, 2)): s = 2^k m, m in [0.709,
-/// 1.418), m c = 1 + r exactly but for 2^-159 (c from math_tables.ax's
+/// 1.418), m c = 1 + r exactly but for 2^-159 (c from tables.ax's
 /// LOG_C, of 10 bits), log x = (e + k) ln2 - log c + log1p(r) (LOG_L);
 /// log1p(r) = r - r^2/2 + r^3/3 - r^4/4 + r^5 P(r), the first four in
 /// triple-double, P's terms from 1/5 in double-double (to r^10/10) and double
@@ -945,30 +983,35 @@ fn expm1_tk(v: TD) TK @multiversion("fma") {
 }
 
 /// The long double functions of one argument: r = op(x) in format f.
-export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiversion("fma") {
-    let f = @truncate(u32, f64fmt);
+export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void {
+    ld1(op, @truncate(u32, f64fmt), r, x, false);
+}
+
+/// r = op(x), or op(x)/pi if post (asinpi, acospi, atanpi: the value
+/// divided before its rounding).
+fn ld1(op: u64, f: u32, r: *mut ld.W, x: *ld.W, post: bool) void @multiversion("fma") {
     let xv = decode(x, f);
     if xv.cls != C_FIN {
-        via_double(r, dfn1(op, to_d(x, f)), f);
+        via_double_p(r, dfn1(op, to_d(x, f)), f, post);
         return;
     }
     let huge = xv.e > 900;
     let tiny = xv.e < -900;
     if op == OP_EXP or op == OP_EXP2 or op == OP_EXP10 or op == OP_EXPM1 {
         if huge {
-            via_double(r, dfn1(op, to_d(x, f)), f);  // (overflow or underflow)
+            via_double_p(r, dfn1(op, to_d(x, f)), f, post);  // (overflow or underflow)
             return;
         }
         if tiny {
             // e^x = 1 + x (and expm1 x = x) within 2^-1800
             if op == OP_EXPM1 {
-                td_to_ld(r, sig_td(xv), xv.e, f);
+                put(r, sig_td(xv), xv.e, f, post);
                 if xv.neg {
                     ld.negate(r, r, f);
                 }
                 return;
             }
-            td_to_ld(r, renorm(1.0, m.from_bits(0x0010000000000000) * @copysign(1.0, to_d(x, f)), 0.0, 0.0), 0, f);
+            put(r, renorm(1.0, m.from_bits(0x0010000000000000) * @copysign(1.0, to_d(x, f)), 0.0, 0.0), 0, f, post);
             return;
         }
         let mut v = val_td(xv);
@@ -979,7 +1022,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         }
         if op == OP_EXPM1 {
             let e = expm1_tk(v);
-            td_to_ld(r, e.v, e.k, f);
+            put(r, e.v, e.k, f, post);
             check_range(r, f);
             return;
         }
@@ -988,7 +1031,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
     }
     if op == OP_LOG or op == OP_LOG2 or op == OP_LOG10 {
         if xv.neg {
-            via_double(r, dfn1(op, -1.0), f);  // a domain error
+            via_double_p(r, dfn1(op, -1.0), f, post);  // a domain error
             return;
         }
         if (xv.e == 0) and (xv.sh == 0x8000000000000000) and (xv.sl == 0) {
@@ -1001,36 +1044,36 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         } else if op == OP_LOG10 {
             l = tmul(l, td(lt.INVLN10_H, lt.INVLN10_M, lt.INVLN10_L));
         }
-        td_to_ld(r, l, 0, f);
+        put(r, l, 0, f, post);
         return;
     }
     if op == OP_LOG1P {
         if tiny {
-            td_to_ld(r, sig_td(xv), xv.e, f);  // log1p x = x within 2^-900
+            put(r, sig_td(xv), xv.e, f, post);  // log1p x = x within 2^-900
             if xv.neg {
                 ld.negate(r, r, f);
             }
             return;
         }
         if huge {
-            td_to_ld(r, log_x(xv), 0, f);  // (1 + x = x to 2^-900)
+            put(r, log_x(xv), 0, f, post);  // (1 + x = x to 2^-900)
             return;
         }
         let v = val_td(xv);
         if v.h <= -1.0 {
-            via_double(r, log1p(to_d(x, f)), f);  // a pole or a domain error
+            via_double_p(r, log1p(to_d(x, f)), f, post);  // a pole or a domain error
             return;
         }
-        td_to_ld(r, log1p_td(v), 0, f);
+        put(r, log1p_td(v), 0, f, post);
         return;
     }
     if op == OP_SIN or op == OP_COS or op == OP_TAN {
         if tiny {
             // sin x = tan x = x, cos x = 1 within 2^-1800
             if op == OP_COS {
-                td_to_ld(r, renorm(1.0, -m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f);
+                put(r, renorm(1.0, -m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f, post);
             } else {
-                td_to_ld(r, sig_td(xv), xv.e, f);
+                put(r, sig_td(xv), xv.e, f, post);
                 if xv.neg {
                     ld.negate(r, r, f);
                 }
@@ -1054,9 +1097,9 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         }
         if op == OP_TAN {
             if (n & 1) == 0 {
-                td_to_ld(r, tdiv(sc.s, sc.c), 0, f);
+                put(r, tdiv(sc.s, sc.c), 0, f, post);
             } else {
-                td_to_ld(r, tneg(tdiv(sc.c, sc.s)), 0, f);
+                put(r, tneg(tdiv(sc.c, sc.s)), 0, f, post);
             }
             return;
         }
@@ -1068,12 +1111,12 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         } else if q == 3 {
             v = tneg(sc.c);
         }
-        td_to_ld(r, v, 0, f);
+        put(r, v, 0, f, post);
         return;
     }
     if op == OP_ATAN {
         if tiny {
-            td_to_ld(r, sig_td(xv), xv.e, f);
+            put(r, sig_td(xv), xv.e, f, post);
             if xv.neg {
                 ld.negate(r, r, f);
             }
@@ -1092,15 +1135,15 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if xv.neg {
             v = tneg(v);
         }
-        td_to_ld(r, v, 0, f);
+        put(r, v, 0, f, post);
         return;
     }
     if op == OP_SINH or op == OP_COSH or op == OP_TANH {
         if tiny {
             if op == OP_COSH {
-                td_to_ld(r, renorm(1.0, m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f);
+                put(r, renorm(1.0, m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f, post);
             } else {
-                td_to_ld(r, sig_td(xv), xv.e, f);
+                put(r, sig_td(xv), xv.e, f, post);
                 if xv.neg {
                     ld.negate(r, r, f);
                 }
@@ -1114,7 +1157,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
                 ld.from_f64(r, m.bits(@copysign(1.0, to_d(x, f))), f);
                 return;
             }
-            via_double(r, dfn1(op, to_d(x, f)), f);
+            via_double_p(r, dfn1(op, to_d(x, f)), f, post);
             return;
         }
         let mut a = val_td(xv);
@@ -1124,7 +1167,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if op == OP_TANH {
             // tanh a = em / (em + 2), em = e^(2a) - 1
             if a.h > 45.0 {
-                td_to_ld(r, tdd(@copysign(1.0, to_d(x, f))), 0, f);  // (1 within 2^-129)
+                put(r, tdd(@copysign(1.0, to_d(x, f))), 0, f, post);  // (1 within 2^-129)
                 return;
             }
             let em = expm1_tk(tscale(a, 2.0));
@@ -1133,7 +1176,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
             if xv.neg {
                 v = tneg(v);
             }
-            td_to_ld(r, v, 0, f);
+            put(r, v, 0, f, post);
             return;
         }
         if a.h > 400.0 {
@@ -1145,7 +1188,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
             if xv.neg and (op == OP_SINH) {
                 ev = tneg(ev);
             }
-            td_to_ld(r, ev, ec.k, f);
+            put(r, ev, ec.k, f, post);
             check_range(r, f);
             return;
         }
@@ -1154,7 +1197,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
             let ec = exp_core(a);
             let e1 = tscale(ec.v, p2(ec.k - 1));
             let e2 = tdiv(tdd(0.25), e1);
-            td_to_ld(r, tadd(e1, e2), 0, f);
+            put(r, tadd(e1, e2), 0, f, post);
             return;
         }
         // sinh a = (em + em / (em + 1)) / 2, em = e^a - 1
@@ -1164,7 +1207,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if xv.neg {
             v = tneg(v);
         }
-        td_to_ld(r, v, 0, f);
+        put(r, v, 0, f, post);
         return;
     }
     if op == OP_CBRT {
@@ -1184,21 +1227,21 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if xv.neg {
             y = tneg(y);
         }
-        td_to_ld(r, y, q, f);
+        put(r, y, q, f, post);
         return;
     }
     if op == OP_ASIN or op == OP_ACOS {
         let v = val_td(xv);
         let a = @abs(v.h);
         if (a > 1.0) or ((a == 1.0) and (v.m != 0.0) and ((v.m > 0.0) == (v.h > 0.0))) {
-            via_double(r, dfn1(op, 2.0), f);  // a domain error
+            via_double_p(r, dfn1(op, 2.0), f, post);  // a domain error
             return;
         }
         // asin x = atan(x / sqrt((1 - x)(1 + x))); acos x = 2 atan(sqrt((1 - x)/(1 + x)))
         let one = tdd(1.0);
         if op == OP_ASIN {
             if tiny {
-                td_to_ld(r, sig_td(xv), xv.e, f);
+                put(r, sig_td(xv), xv.e, f, post);
                 if xv.neg {
                     ld.negate(r, r, f);
                 }
@@ -1218,7 +1261,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
             if xv.neg {
                 res = tneg(res);
             }
-            td_to_ld(r, res, 0, f);
+            put(r, res, 0, f, post);
             return;
         }
         let num = tsub(one, v);
@@ -1228,19 +1271,19 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         }
         let den = tadd(one, v);
         if den.h == 0.0 {
-            td_to_ld(r, td(lt.PI_H, lt.PI_M, lt.PI_L), 0, f);
+            put(r, td(lt.PI_H, lt.PI_M, lt.PI_L), 0, f, post);
             return;
         }
-        td_to_ld(r, tscale(atan_core(tsqrt(tdiv(num, den))), 2.0), 0, f);
+        put(r, tscale(atan_core(tsqrt(tdiv(num, den))), 2.0), 0, f, post);
         return;
     }
     if op == OP_ASINH or op == OP_ACOSH or op == OP_ATANH {
         if (op == OP_ACOSH) and (xv.neg or (xv.e < 0)) {
-            via_double(r, dfn1(op, 0.0), f);  // x < 1: a domain error
+            via_double_p(r, dfn1(op, 0.0), f, post);  // x < 1: a domain error
             return;
         }
         if tiny {
-            td_to_ld(r, sig_td(xv), xv.e, f);
+            put(r, sig_td(xv), xv.e, f, post);
             if xv.neg {
                 ld.negate(r, r, f);
             }
@@ -1249,7 +1292,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         }
         if huge {
             if op == OP_ATANH {
-                via_double(r, dfn1(op, 2.0), f);
+                via_double_p(r, dfn1(op, 2.0), f, post);
                 return;
             }
             // log 2|x|
@@ -1257,7 +1300,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
             if xv.neg {
                 l = tneg(l);
             }
-            td_to_ld(r, l, 0, f);
+            put(r, l, 0, f, post);
             return;
         }
         let v = val_td(xv);
@@ -1270,7 +1313,7 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if op == OP_ATANH {
             // atanh a = log1p(2a / (1 - a)) / 2
             if (a.h > 1.0) or ((a.h == 1.0) and (a.m >= 0.0)) {
-                via_double(r, dfn1(op, @copysign(a.h, to_d(x, f))), f);  // a pole or a domain error
+                via_double_p(r, dfn1(op, @copysign(a.h, to_d(x, f))), f, post);  // a pole or a domain error
                 return;
             }
             l = tscale(log1p_td(tdiv(tscale(a, 2.0), tsub(one, a))), 0.5);
@@ -1286,10 +1329,10 @@ export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiver
         if xv.neg {
             l = tneg(l);
         }
-        td_to_ld(r, l, 0, f);
+        put(r, l, 0, f, post);
         return;
     }
-    via_double(r, dfn1(op, to_d(x, f)), f);
+    via_double_p(r, dfn1(op, to_d(x, f)), f, post);
 }
 
 /// log1p(v) for v > -1 (a triple-double): log of 1 + v, taken apart.
@@ -1345,8 +1388,12 @@ fn int_kind(x: X) u32 {
 }
 
 /// The long double functions of two arguments: r = op(x, y) in format f.
-export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void @multiversion("fma") {
-    let f = @truncate(u32, f64fmt);
+export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
+    ld2(op, @truncate(u32, f64fmt), r, x, y, false);
+}
+
+/// r = op(x, y), or op(x, y)/pi if post (atan2pi).
+fn ld2(op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, post: bool) void @multiversion("fma") {
     let xv = decode(x, f);
     let yv = decode(y, f);
     if op == OP_CLOGRE {
@@ -1368,12 +1415,12 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
             e2 = 1;
         }
         let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
-        td_to_ld(r, l, 0, f);
+        put(r, l, 0, f, post);
         return;
     }
     if op == OP_HYPOT {
         if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
-            via_double(r, hypot(to_d(x, f), to_d(y, f)), f);
+            via_double_p(r, hypot(to_d(x, f), to_d(y, f)), f, post);
             return;
         }
         // sqrt(a^2 + b^2) 2^e, scaled by the larger exponent (the smaller
@@ -1387,13 +1434,13 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
         if (e - yv.e) < 600 {
             b = tscale(sig_td(yv), p2(yv.e - e));
         }
-        td_to_ld(r, tsqrt(tadd(tmul(a, a), tmul(b, b))), e, f);
+        put(r, tsqrt(tadd(tmul(a, a), tmul(b, b))), e, f, post);
         check_range(r, f);
         return;
     }
     if op == OP_ATAN2 {
         if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
-            via_double(r, atan2(to_d(x, f), to_d(y, f)), f);
+            via_double_p(r, atan2(to_d(x, f), to_d(y, f)), f, post);
             return;
         }
         // x is y's argument here: atan2(x, y), x the ordinate
@@ -1417,7 +1464,7 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
             }
             // |y/x| below 2^-600: atan2 = y/x
             if not dx.neg {
-                td_to_ld(r, tdiv(sig_td(dy), sig_td(dx)), dy.e - dx.e, f);
+                put(r, tdiv(sig_td(dy), sig_td(dx)), dy.e - dx.e, f, post);
                 if dy.neg {
                     ld.negate(r, r, f);
                 }
@@ -1436,7 +1483,7 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
         if dy.neg {
             v = tneg(v);
         }
-        td_to_ld(r, v, 0, f);
+        put(r, v, 0, f, post);
         return;
     }
     // pow(x, y): the special cases are the double function's, of the
@@ -1459,11 +1506,11 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
                 yd = @copysign(0.5, yd);
             }
         }
-        via_double(r, pow(to_d(x, f), yd), f);
+        via_double_p(r, pow(to_d(x, f), yd), f, post);
         return;
     }
     if xv.neg and (kind == 0) {
-        via_double(r, pow(-1.0, 0.5), f);  // a domain error
+        via_double_p(r, pow(-1.0, 0.5), f, post);  // a domain error
         return;
     }
     let neg_r = xv.neg and (kind == 1);
@@ -1496,6 +1543,345 @@ export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void
     if neg_r {
         ld.negate(r, r, f);
     }
+}
+
+// -----------------------------------------------------------------------------
+// C23's functions (math_c23.ax's in double)
+// -----------------------------------------------------------------------------
+
+const OP_EXP2M1: u64 = 0;
+const OP_EXP10M1: u64 = 1;
+const OP_LOG2P1: u64 = 2;
+const OP_LOG10P1: u64 = 3;
+const OP_RSQRT: u64 = 4;
+const OP_SINPI: u64 = 5;
+const OP_COSPI: u64 = 6;
+const OP_TANPI: u64 = 7;
+const OP_ASINPI: u64 = 8;
+const OP_ACOSPI: u64 = 9;
+const OP_ATANPI: u64 = 10;
+const OP_ATAN2PI: u64 = 11;
+const OP_ROOTN: u64 = 12;
+const OP_COMPOUNDN: u64 = 13;
+
+/// A finite x (|x| >= 1/4, exponent below the format's precision) as n/2 +
+/// r, n an integer (its low two bits) and r in [-1/4, 1/4] exactly, for
+/// |x|: the significand's bits from the half units down, n rounded half
+/// up.
+struct Half {
+    q: u32,
+    r: TD,
+}
+
+fn halves(x: X) Half {
+    // 2|x| = M / 2^s, M = (sh:sl), s = 126 - e in [0, 128]
+    let s = @bit_cast(u32, 126 - x.e);
+    let mut nh: u64 = 0;  // the integer M >> s (its low 64 bits)
+    let mut fh: u64 = 0;  // the fraction's bits, M mod 2^s, aligned to bit 127
+    let mut fl: u64 = 0;
+    if s == 0 {
+        nh = x.sl;
+    } else if s < 64 {
+        nh = (x.sh << (64 - s)) | (x.sl >> s);
+        fh = x.sl << (64 - s);
+    } else if s == 64 {
+        nh = x.sh;
+        fh = x.sl;
+    } else if s < 128 {
+        nh = x.sh >> (s - 64);
+        fh = (x.sh << (128 - s)) | (x.sl >> (s - 64));
+        fl = x.sl << (128 - s);
+    } else {
+        fh = x.sh;
+        fl = x.sl;
+    }
+    // the fraction f in [0, 1) is (fh:fl) 2^-128; at f >= 1/2, n + 1 and f - 1
+    let mut neg = false;
+    if (fh >> 63) != 0 {
+        nh = nh +% 1;
+        neg = true;
+        fl = (~fl) +% 1;
+        fh = ~fh;
+        if fl == 0 {
+            fh = fh +% 1;
+        }
+    }
+    // r = f / 2 = (fh:fl) 2^-129 (or minus): exact in three doubles of the
+    // 128 bits' parts (53, 53 and 22 bits)
+    let hh = @float_from_int(f64, fh >> 11) * 5.551115123125783e-17;  // 2^-54
+    let mm = @float_from_int(f64, ((fh & 0x7FF) << 42) | (fl >> 22)) * 6.162975822039155e-33;  // 2^-107
+    let ll = @float_from_int(f64, fl & 0x3FFFFF) * 1.4693679385278594e-39;                     // 2^-129
+    let mut r = renorm(hh, mm, ll, 0.0);
+    if neg {
+        r = tneg(r);
+    }
+    return Half.{ q: @truncate(u32, nh & 3), r: r };
+}
+
+/// The C23 functions of a wide long double: r = op(x) (and of y, the second
+/// argument, for atan2pi, rootn and compoundn, where y is the integer n).
+export fn __axc_ld23(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    if op == OP_ASINPI {
+        ld1(OP_ASIN, f, r, x, true);
+        return;
+    }
+    if op == OP_ACOSPI {
+        ld1(OP_ACOS, f, r, x, true);
+        return;
+    }
+    if op == OP_ATANPI {
+        ld1(OP_ATAN, f, r, x, true);
+        return;
+    }
+    if op == OP_ATAN2PI {
+        ld2(OP_ATAN2, f, r, x, y, true);
+        return;
+    }
+    let xd = to_d(x, f);
+    let tiny = xv.e < -900;
+    let huge = xv.e > 900;
+    if (op == OP_EXP2M1) or (op == OP_EXP10M1) {
+        if (xv.cls != C_FIN) or huge {
+            if op == OP_EXP2M1 {
+                via_double(r, exp2m1(xd), f);
+            } else {
+                via_double(r, exp10m1(xd), f);
+            }
+            return;
+        }
+        let mut c = td(lt.LN2_H, lt.LN2_M, lt.LN2_L);
+        if op == OP_EXP10M1 {
+            c = td(lt.LN10_H, lt.LN10_M, lt.LN10_L);
+        }
+        if tiny {
+            // x ln2 (x ln10) within 2^-1800
+            let mut v = tmul(sig_td(xv), c);
+            if xv.neg {
+                v = tneg(v);
+            }
+            td_to_ld(r, v, xv.e, f);
+            check_range(r, f);
+            return;
+        }
+        let e = expm1_tk(tmul(val_td(xv), c));
+        td_to_ld(r, e.v, e.k, f);
+        check_range(r, f);
+        return;
+    }
+    if (op == OP_LOG2P1) or (op == OP_LOG10P1) {
+        let mut c = td(lt.INVLN2_H, lt.INVLN2_M, lt.INVLN2_L);
+        if op == OP_LOG10P1 {
+            c = td(lt.INVLN10_H, lt.INVLN10_M, lt.INVLN10_L);
+        }
+        if xv.cls != C_FIN {
+            if op == OP_LOG2P1 {
+                via_double(r, log2p1(xd), f);
+            } else {
+                via_double(r, log10p1(xd), f);
+            }
+            return;
+        }
+        if tiny {
+            let mut v = tmul(sig_td(xv), c);
+            if xv.neg {
+                v = tneg(v);
+            }
+            td_to_ld(r, v, xv.e, f);
+            check_range(r, f);
+            return;
+        }
+        let mut l = tdd(0.0);
+        if huge {
+            if xv.neg {
+                via_double(r, log2p1(-2.0), f);  // a domain error
+                return;
+            }
+            l = log_x(xv);
+        } else {
+            let v = val_td(xv);
+            if v.h <= -1.0 {
+                // a pole (x = -1) or a domain error
+                if (v.h == -1.0) and (v.m == 0.0) {
+                    via_double(r, log2p1(-1.0), f);
+                } else {
+                    via_double(r, log2p1(-2.0), f);
+                }
+                return;
+            }
+            l = log1p_td(v);
+        }
+        td_to_ld(r, tmul(l, c), 0, f);
+        return;
+    }
+    if op == OP_RSQRT {
+        if (xv.cls != C_FIN) or xv.neg {
+            via_double(r, rsqrt(xd), f);
+            return;
+        }
+        // x = s 2^(2k), s in [1, 4)
+        let mut s = sig_td(xv);
+        let mut e = xv.e;
+        if (e & 1) != 0 {
+            s = tscale(s, 2.0);
+            e -= 1;
+        }
+        td_to_ld(r, tdiv(tdd(1.0), tsqrt(s)), -(e >> 1), f);
+        return;
+    }
+    if (op == OP_SINPI) or (op == OP_COSPI) or (op == OP_TANPI) {
+        if xv.cls != C_FIN {
+            if op == OP_SINPI {
+                via_double(r, sinpi(xd), f);
+            } else if op == OP_COSPI {
+                via_double(r, cospi(xd), f);
+            } else {
+                via_double(r, tanpi(xd), f);
+            }
+            return;
+        }
+        let mut q: u32 = 0;
+        let mut rr = tdd(0.0);
+        if xv.e < -2 {
+            if tiny and (op != OP_COSPI) {
+                // pi x within 2^-1800
+                let mut v = tmul(sig_td(xv), td(lt.PI_H, lt.PI_M, lt.PI_L));
+                if xv.neg {
+                    v = tneg(v);
+                }
+                td_to_ld(r, v, xv.e, f);
+                check_range(r, f);
+                return;
+            }
+            if not tiny {
+                rr = tscale(sig_td(xv), p2(xv.e));  // |x| < 1/4: n = 0
+            }
+        } else if xv.e < (ld.precision(f) - 1) {
+            let h = halves(xv);
+            q = h.q;
+            rr = h.r;
+        }
+        // (beyond: |x| an even integer, n = 0 mod 4 and r = 0)
+        let pr = tmul(rr, td(lt.PI_H, lt.PI_M, lt.PI_L));
+        let sc = sincos_k(pr);
+        let zero = rr.h == 0.0;
+        let mut v = tdd(0.0);
+        if op == OP_TANPI {
+            if (q & 1) == 0 {
+                if zero {
+                    // an integer: +0 for even, -0 for odd |x| (then x's sign)
+                    v = tdd(0.0);
+                    if q == 2 {
+                        v = tdd(-0.0);
+                    }
+                } else {
+                    v = tdiv(sc.s, sc.c);
+                }
+            } else {
+                if zero {
+                    // |x| = k + 1/2: +inf for an even k (q = 1), -inf for an odd k
+                    let mut pd = tanpi(0.5);
+                    if q == 3 {
+                        pd = tanpi(1.5);
+                    }
+                    if xv.neg {
+                        pd = -pd;
+                    }
+                    ld.from_f64(r, m.bits(pd), f);
+                    return;
+                }
+                v = tneg(tdiv(sc.c, sc.s));
+            }
+        } else {
+            let mut qq = q;
+            if op == OP_COSPI {
+                qq = (q + 1) & 3;
+            }
+            if qq == 0 {
+                v = sc.s;
+            } else if qq == 1 {
+                v = sc.c;
+            } else if qq == 2 {
+                v = tneg(sc.s);
+            } else {
+                v = tneg(sc.c);
+            }
+            if zero and ((qq & 1) == 0) {
+                v = tdd(0.0);  // sinpi of an integer, cospi of k + 1/2: +0
+            }
+        }
+        if xv.neg and (op != OP_COSPI) {
+            v = tneg(v);
+        }
+        if v.h == 0.0 {
+            ld.from_f64(r, m.bits(v.h), f);
+            return;
+        }
+        td_to_ld(r, v, 0, f);
+        return;
+    }
+    // rootn and compoundn: y is the integer n
+    let n = ld.to_i64(y, f);
+    let nv = tdd(@float_from_int(f64, n >> 32) * 4294967296.0);
+    let ntd = tadd(nv, tdd(@float_from_int(f64, n & 0xffffffff)));
+    if op == OP_ROOTN {
+        if (xv.cls != C_FIN) or (n == 0) or (n == 1) or (n == -1) or (xv.neg and ((n & 1) == 0)) {
+            if n == 1 {
+                r.* = x.*;
+                return;
+            }
+            if (n == -1) and (xv.cls == C_FIN) {
+                td_to_ld(r, tdiv(tdd(1.0), sig_td(xv)), -xv.e, f);
+                if xv.neg {
+                    ld.negate(r, r, f);
+                }
+                check_range(r, f);
+                return;
+            }
+            via_double(r, rootn(xd, n), f);
+            return;
+        }
+        // e^(log|x| / n) (|log|x| / n| < 5700: within the exponent range)
+        let v = tdiv(log_x(xv), ntd);
+        let ec = exp_core(v);
+        td_to_ld(r, ec.v, ec.k, f);
+        if xv.neg {
+            ld.negate(r, r, f);
+        }
+        return;
+    }
+    // compoundn: e^(n log1p(x))
+    if (xv.cls != C_FIN) or (n == 0) {
+        via_double(r, compoundn(xd, n), f);
+        return;
+    }
+    let mut l = tdd(0.0);
+    if huge {
+        if xv.neg {
+            via_double(r, compoundn(-2.0, n), f);
+            return;
+        }
+        l = log_x(xv);
+    } else if tiny {
+        let mut v = sig_td(xv);
+        if xv.neg {
+            v = tneg(v);
+        }
+        l = tscale(v, p2(@max(xv.e, -1000)));  // (log1p x = x; n x below 2^-900)
+    } else {
+        let v = val_td(xv);
+        if v.h <= -1.0 {
+            if (v.h == -1.0) and (v.m == 0.0) {
+                via_double(r, compoundn(-1.0, n), f);
+            } else {
+                via_double(r, compoundn(-2.0, n), f);
+            }
+            return;
+        }
+        l = log1p_td(v);
+    }
+    put_exp(r, tmul(l, ntd), f);
 }
 
 /// An overflow (+-inf) or an underflow (+-0) into r, with ERANGE and the flags.

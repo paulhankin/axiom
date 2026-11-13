@@ -1,0 +1,591 @@
+// =============================================================================
+// std/internal/math/float.ax - the float forms of the elementary functions
+// (std/math's and the C library's: C17 7.12). expf, logf, powf, sinf and cosf
+// have kernels of their own, in double arithmetic to about 2^-36 relative
+// (polynomials of lower degree than double's, and the double functions'
+// tables); the others compute the double function of their argument (exactly
+// converted). Either way the double result is within 2^-36 of the value, a
+// 2^-12th of an ulp of float, and is rounded once to float: the result is
+// within 0.5 + 2^-12 ulp of float (correctly rounded but in the rare cases
+// where the double is that close to a halfway point); overflow and underflow
+// of float are range errors there (core.ax: to_f32).
+// =============================================================================
+import "atrig.ax" as at;
+import "core.ax" as m;
+import "exp.ax" as ex;
+import "hyp.ax" as hy;
+import "log.ax" as lg;
+import "pow.ax" as pw;
+import "special.ax" as sp;
+import "tables.ax" as t;
+import "trig.ax" as tr;
+
+inline fn d(x: f32) f64 {
+    return @float_cast(f64, x);
+}
+
+// -----------------------------------------------------------------------------
+// The kernels
+// -----------------------------------------------------------------------------
+
+const SHIFT: f64 = 6755399441055744.0;  // 1.5 2^52: adding it rounds to an integer
+
+/// e^x for |x| < 1000 (the double's exponent range is not left): x =
+/// (128 k + j) ln2/128 + r (math_exp.ax's reduction, k and j from a shifter,
+/// so that in a directed rounding mode |r| is within ln2/128 and the
+/// polynomial still within 2^-34), e^x = 2^k 2^(j/128) e^r.
+inline fn exp_k(x: f64) f64 {
+    let kd0 = (x * t.EXP_INVLN2N) + SHIFT;
+    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+    let kd = kd0 - SHIFT;
+    let r = (x - (kd * t.EXP_LN2N_HI)) - (kd * t.EXP_LN2N_LO);
+    let th = m.from_bits(t.EXP_T[@as(usize, @bit_cast(u32, n & 127)) * 2]);
+    let p = 1.0 + (r + ((r * r) * (t.EXPF_P0 + (r * t.EXPF_P1))));
+    return m.from_bits(m.bits(th * p) +% (@bit_cast(u64, @as(i64, n >> 7)) << 52));
+}
+
+/// 2^e for |e| < 1000, as exp_k: e = (128 k + j)/128 + f (f exact), r = f ln2.
+inline fn exp2_k(e: f64) f64 {
+    let kd0 = (e * 128.0) + SHIFT;
+    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+    let r = (e - ((kd0 - SHIFT) * 0.0078125)) * (t.LN2_HI + t.LN2_LO);
+    let th = m.from_bits(t.EXP_T[@as(usize, @bit_cast(u32, n & 127)) * 2]);
+    let p = 1.0 + (r + ((r * r) * (t.EXPF_P0 + (r * t.EXPF_P1))));
+    return m.from_bits(m.bits(th * p) +% (@bit_cast(u64, @as(i64, n >> 7)) << 52));
+}
+
+/// log x for a positive normal double x of 24 significant bits (a float):
+/// x = 2^k m, m c = 1 + r exactly (math_log.ax's table: m has 24 bits and c
+/// 10), log x = k ln2 - log c + log1p(r).
+struct LogF {
+    k: f64,
+    i: usize,
+    r: f64,
+}
+
+inline fn log_red(ix: u64) LogF {
+    let tmp = ix -% t.LOG_OFF;
+    let i = @as(usize, @truncate(u8, (tmp >> 45) & 127));
+    let k = @bit_cast(i64, tmp) >> 52;
+    let mm = m.from_bits(ix -% (tmp & 0xfff0000000000000));
+    let r = (mm * m.from_bits(t.LOG_C[i])) - 1.0;
+    return LogF.{ k: @float_from_int(f64, k), i: i, r: r };
+}
+
+/// log1p(r) for the reduction's r.
+inline fn log1p_k(r: f64) f64 {
+    let z = r * r;
+    return r + (z * ((t.LOGF_P0 + (r * t.LOGF_P1)) + (z * (t.LOGF_P2 + (r * t.LOGF_P3)))));
+}
+
+/// sin r and cos r for |r| <= pi/4 (+ a little).
+inline fn sin_k(r: f64) f64 {
+    let z = r * r;
+    return r + ((r * z) * ((t.SINF_P0 + (z * t.SINF_P1)) + ((z * z) * (t.SINF_P2 + (z * t.SINF_P3)))));
+}
+
+inline fn cos_k(r: f64) f64 {
+    let z = r * r;
+    let w = z * z;
+    return 1.0 + (z * (((t.COSF_P0 + (z * t.COSF_P1)) + (w * (t.COSF_P2 + (z * t.COSF_P3)))) + ((w * w) * t.COSF_P4)));
+}
+
+/// x = n pi/2 + r for a finite float x beyond pi/4 (exactly converted): for
+/// |x| < 2^20 pi/2, x - n PIO2_1 and n PIO2_2 are exact (n by adding 1.5
+/// 2^52), and the two subtractions that follow each round once, to 2^-52
+/// relative (for a float x, |r| is above 2^-28); beyond, the double reduction.
+struct RedF {
+    n: i32,
+    r: f64,
+}
+
+inline fn reduce_f(x: f64) RedF {
+    if m.abits(x) < 0x413921fb54442d18 {
+        let kd = (x * t.INVPIO2) + SHIFT;
+        let fnv = kd - SHIFT;
+        let r = ((x - (fnv * t.PIO2_1)) - (fnv * t.PIO2_2)) - (fnv * t.PIO2_3);
+        return RedF.{ n: @bit_cast(i32, @truncate(u32, m.bits(kd))), r: r };
+    }
+    let rd = tr.reduce(x);
+    return RedF.{ n: rd.n, r: rd.hi + rd.lo };
+}
+
+/// sin x (cos x: q = 1) for finite x beyond pi/4: the kernel of the quadrant
+/// (a branch is faster than computing both kernels and choosing).
+inline fn sincos_red(x: f64, q: i32) f64 {
+    let rd = reduce_f(x);
+    let n = (rd.n + q) & 3;
+    if n == 0 {
+        return sin_k(rd.r);
+    }
+    if n == 1 {
+        return cos_k(rd.r);
+    }
+    if n == 2 {
+        return -sin_k(rd.r);
+    }
+    return -cos_k(rd.r);
+}
+
+/// log x for a positive normal double x: x = 2^k m, m c = 1 + r (rounded
+/// once, within 2^-53; exact in the interval of 1), log x = k ln2 - log c +
+/// log1p(r): within 2^-44 relative, and 2^-52 absolute.
+inline fn logd(x: f64) f64 {
+    let rd = log_red(m.bits(x));
+    return ((rd.k * t.LN2_HI) + m.from_bits(t.LOG_L[2 * rd.i])) + ((rd.k * t.LN2_LO) + log1p_k(rd.r));
+}
+
+/// atan a for a >= 0 (or +inf) in double, to 2^-39: a reduced to |u| <=
+/// tan(pi/8) by atan a = pi/4 + atan((a - 1)/(a + 1)) and pi/2 - atan(1/a).
+inline fn atan_d(a: f64) f64 {
+    let mut u = a;
+    let mut base: f64 = 0.0;
+    if a > 2.414213562373095 {
+        u = -1.0 / a;
+        base = t.PIO2_HI;
+    } else if a > 0.41421356237309503 {
+        u = (a - 1.0) / (a + 1.0);
+        base = t.PIO4_HI;
+    }
+    let z = u * u;
+    let w = z * z;
+    let p = ((t.ATANF_P0 + (z * t.ATANF_P1)) + (w * (t.ATANF_P2 + (z * t.ATANF_P3)))) +
+            ((w * w) * ((t.ATANF_P4 + (z * t.ATANF_P5)) + (w * t.ATANF_P6)));
+    return base + (u + ((u * z) * p));
+}
+
+/// asin s - s for 0 <= s <= 1/2, z = s^2, to 2^-37 of itself (a 24th of asin s).
+inline fn asin_tail_f(s: f64, z: f64) f64 {
+    let w = z * z;
+    let p =
+        (((t.ASINF_P0 + (z * t.ASINF_P1)) + (w * (t.ASINF_P2 + (z * t.ASINF_P3)))) +
+         ((w * w) * ((t.ASINF_P4 + (z * t.ASINF_P5)) + (w * (t.ASINF_P6 + (z * t.ASINF_P7)))))) +
+        (((w * w) * (w * w)) * t.ASINF_P8);
+    return (s * z) * p;
+}
+
+/// erfc a e^(a^2) for 1/2 <= a < 11 (float's pieces), to 2^-42.
+inline fn erfc_scaled_f(a: f64) f64 {
+    if a <= 4.0 {
+        // equal pieces of width 1/4 from 1/2
+        let i = @as(usize, @min(@int_from_float(u32, (a - 0.5) * 4.0), 13)) * t.ERFCF_A_W;
+        let u = a - m.from_bits(t.ERFCF_A[i + 2]);
+        let mut p = m.from_bits(t.ERFCF_A[(i + t.ERFCF_A_W) - 1]);
+        let mut k = t.ERFCF_A_W - 1;
+        while k > 4 {
+            k -= 1;
+            p = (p * u) + m.from_bits(t.ERFCF_A[i + k]);
+        }
+        return p;
+    }
+    let v = 1.0 / a;
+    let mut i: usize = 0;
+    if v > m.from_bits(t.ERFCF_B[1]) {
+        i = t.ERFCF_B_W;
+    }
+    let u = v - m.from_bits(t.ERFCF_B[i + 2]);
+    let mut p = m.from_bits(t.ERFCF_B[(i + t.ERFCF_B_W) - 1]);
+    let mut k = t.ERFCF_B_W - 1;
+    while k > 4 {
+        k -= 1;
+        p = (p * u) + m.from_bits(t.ERFCF_B[i + k]);
+    }
+    return p * v;
+}
+
+/// erf x / x for |x| < 1, z = x^2 (2^-40).
+inline fn erf_ratio_f(z: f64) f64 {
+    let w = z * z;
+    return (((t.ERFF_P0 + (z * t.ERFF_P1)) + (w * (t.ERFF_P2 + (z * t.ERFF_P3)))) +
+            ((w * w) * ((t.ERFF_P4 + (z * t.ERFF_P5)) + (w * (t.ERFF_P6 + (z * t.ERFF_P7)))))) +
+           (((w * w) * (w * w)) * t.ERFF_P8);
+}
+
+pub inline fn expf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    if @abs(xd) < 87.0 {
+        return @float_cast(f32, exp_k(xd));  // (normal: e^87 < 2^126)
+    }
+    return m.to_f32(rep, ex.exp(xd, rep));  // overflow, underflow, inf, NaN
+}
+
+pub fn exp2f(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    if @abs(xd) < 126.0 {
+        return @float_cast(f32, exp2_k(xd));  // (exact for integers: r = 0)
+    }
+    return m.to_f32(rep, ex.exp2(xd, rep));
+}
+
+pub fn expm1f(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if a <= 0.25 {
+        // x + x^2 P(x) (EXPM1F_P, 2^-46.8)
+        let z = xd * xd;
+        let w = z * z;
+        let p = ((t.EXPM1F_P0 + (xd * t.EXPM1F_P1)) + (z * (t.EXPM1F_P2 + (xd * t.EXPM1F_P3)))) +
+                (w * ((t.EXPM1F_P4 + (xd * t.EXPM1F_P5)) + (z * (t.EXPM1F_P6 + (xd * t.EXPM1F_P7)))));
+        return m.to_f32(rep, xd + (z * p));
+    }
+    if a < 88.0 {
+        // (e^x within 2^-40, |e^x - 1| at least a fifth of e^x or of 1)
+        return @float_cast(f32, exp_k(xd) - 1.0);
+    }
+    return m.to_f32(rep, ex.expm1(xd, rep));
+}
+
+pub fn exp10f(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    if @abs(xd) < 37.5 {
+        // e^(x ln10), x ln10 within 2^-46 relative of the result's exponent
+        return @float_cast(f32, exp_k(xd * t.LN10_HI));
+    }
+    return m.to_f32(rep, ex.exp10(xd, rep));
+}
+
+pub inline fn logf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ix = m.bits(xd);
+    if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
+        return m.to_f32(rep, lg.log(xd, rep));  // not positive and finite
+    }
+    let rd = log_red(ix);
+    // (k ln2 - log c in double: 2^-52 relative at worst)
+    let a = (rd.k * t.LN2_HI) + m.from_bits(t.LOG_L[2 * rd.i]);
+    return @float_cast(f32, a + ((rd.k * t.LN2_LO) + log1p_k(rd.r)));
+}
+
+pub fn log2f(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ix = m.bits(xd);
+    if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
+        return m.to_f32(rep, lg.log2(xd, rep));  // not positive and finite
+    }
+    // k - log2 c + log1p(r)/ln2 (exact for powers of two: r = 0)
+    let rd = log_red(ix);
+    return @float_cast(f32,
+                       (rd.k + m.from_bits(t.LOG2_L[2 * rd.i])) +
+                       (m.from_bits(t.LOG2_L[(2 * rd.i) + 1]) + (log1p_k(rd.r) * t.INVLN2_HI)));
+}
+
+pub fn log10f(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ix = m.bits(xd);
+    if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
+        return m.to_f32(rep, lg.log10(xd, rep));
+    }
+    let rd = log_red(ix);
+    let a = (rd.k * t.LOG10_2_HI) + m.from_bits(t.LOG10_L[2 * rd.i]);
+    return @float_cast(f32,
+                       a +
+                       (((rd.k * t.LOG10_2_LO) + m.from_bits(t.LOG10_L[(2 * rd.i) + 1])) +
+                        (log1p_k(rd.r) * t.INVLN10_HI)));
+}
+
+pub fn log1pf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if (xd <= -1.0) or (ax >= 0x7ff0000000000000) or (ax < 0x3e20000000000000) {
+        // x <= -1, inf, NaN, and |x| < 2^-29 (where 1 + x is not exact)
+        return m.to_f32(rep, lg.log1p(xd, rep));
+    }
+    return @float_cast(f32, logd(1.0 + xd));  // (1 + x exact: in the interval of 1, r = x)
+}
+
+pub inline fn sinf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if ax <= 0x3fe921fb54442d18 {
+        return m.to_f32(rep, sin_k(xd));  // |x| <= pi/4 (to_f32: a subnormal x)
+    }
+    if ax >= 0x7ff0000000000000 {
+        return m.to_f32(rep, tr.sin(xd, rep));  // inf, NaN
+    }
+    return @float_cast(f32, sincos_red(xd, 0));
+}
+
+pub inline fn cosf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if ax <= 0x3fe921fb54442d18 {
+        return @float_cast(f32, cos_k(xd));
+    }
+    if ax >= 0x7ff0000000000000 {
+        return m.to_f32(rep, tr.cos(xd, rep));
+    }
+    return @float_cast(f32, sincos_red(xd, 1));
+}
+
+pub fn tanf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if (ax < 0x3f30000000000000) or (ax >= 0x7ff0000000000000) {
+        return m.to_f32(rep, tr.tan(xd, rep));  // |x| < 2^-12, inf, NaN
+    }
+    // sin r / cos r, or -cos r / sin r in the odd quadrants (each to 2^-36.8)
+    let mut n: i32 = 0;
+    let mut r = xd;
+    if ax > 0x3fe921fb54442d18 {
+        let rd = reduce_f(xd);
+        n = rd.n;
+        r = rd.r;
+    }
+    let s = sin_k(r);
+    let c = cos_k(r);
+    if (n & 1) != 0 {
+        return @float_cast(f32, -c / s);
+    }
+    return @float_cast(f32, s / c);
+}
+
+pub fn asinf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if ax < 0x3fe0000000000000 {
+        if ax < 0x3f30000000000000 {
+            return m.to_f32(rep, at.asin(xd, rep));  // |x| < 2^-12
+        }
+        return @float_cast(f32, xd + asin_tail_f(xd, xd * xd));
+    }
+    if ax >= 0x3ff0000000000000 {
+        return m.to_f32(rep, at.asin(xd, rep));  // |x| >= 1, NaN
+    }
+    // pi/2 - 2 asin s, s = sqrt z, z = (1 - |x|)/2 exactly
+    let z = (1.0 - m.from_bits(ax)) * 0.5;
+    let sq = @sqrt(z);
+    return @float_cast(f32, @copysign(t.PIO2_HI - (2.0 * (sq + asin_tail_f(sq, z))), xd));
+}
+
+pub fn acosf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if ax < 0x3fe0000000000000 {
+        return @float_cast(f32, t.PIO2_HI - (xd + asin_tail_f(xd, xd * xd)));
+    }
+    if ax >= 0x3ff0000000000000 {
+        return m.to_f32(rep, at.acos(xd, rep));
+    }
+    let z = (1.0 - m.from_bits(ax)) * 0.5;
+    let sq = @sqrt(z);
+    let a = 2.0 * (sq + asin_tail_f(sq, z));
+    if xd > 0.0 {
+        return @float_cast(f32, a);
+    }
+    return @float_cast(f32, t.PI_HI - a);
+}
+
+pub fn atanf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ax = m.abits(xd);
+    if (ax < 0x3f30000000000000) or (ax > 0x7ff0000000000000) {
+        return m.to_f32(rep, at.atan(xd, rep));  // |x| < 2^-12, NaN
+    }
+    return @float_cast(f32, @copysign(atan_d(m.from_bits(ax)), xd));
+}
+
+pub fn sinhf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a < 0.000244140625) or (a >= 89.0) or (xd != xd) {
+        return m.to_f32(rep, hy.sinh(xd, rep));  // |x| < 2^-12, overflow, inf, NaN
+    }
+    if a < 0.5 {
+        let z = xd * xd;
+        let p = (t.SINHF_P0 + (z * t.SINHF_P1)) + ((z * z) * (t.SINHF_P2 + (z * t.SINHF_P3)));
+        return @float_cast(f32, xd + ((xd * z) * p));
+    }
+    // (e^a - e^-a)/2 (no more than a doubling of e^a's error: a >= 1/2)
+    let e = exp_k(a);
+    return @float_cast(f32, @copysign((e - (1.0 / e)) * 0.5, xd));
+}
+
+pub fn coshf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a >= 89.0) or (xd != xd) {
+        return m.to_f32(rep, hy.cosh(xd, rep));
+    }
+    let e = exp_k(a);
+    return @float_cast(f32, (e + (1.0 / e)) * 0.5);
+}
+
+pub fn tanhf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a < 0.000244140625) or (xd != xd) {
+        return m.to_f32(rep, hy.tanh(xd, rep));  // |x| < 2^-12, NaN
+    }
+    if a < 0.5 {
+        let z = xd * xd;
+        let w = z * z;
+        let p = ((t.TANHF_P0 + (z * t.TANHF_P1)) + (w * (t.TANHF_P2 + (z * t.TANHF_P3)))) +
+                ((w * w) * ((t.TANHF_P4 + (z * t.TANHF_P5)) + (w * t.TANHF_P6)));
+        return @float_cast(f32, xd + ((xd * z) * p));
+    }
+    if a >= 9.1 {
+        return @float_cast(f32, @copysign(1.0, xd) - @copysign(1.0e-30, xd));  // (rounds to +-1, inexact)
+    }
+    // (e^2a - 1)/(e^2a + 1), e^2a - 1 at least 0.6 e^2a
+    let e = exp_k(2.0 * a);
+    return @float_cast(f32, @copysign((e - 1.0) / (e + 1.0), xd));
+}
+
+pub fn asinhf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a < 0.000244140625) or (a == m.inf()) or (xd != xd) {
+        return m.to_f32(rep, hy.asinh(xd, rep));
+    }
+    // log(a + sqrt(a^2 + 1)): the argument within 2^-52, the result at least
+    // 2^-12 (2^-40 relative)
+    return @float_cast(f32, @copysign(logd(a + @sqrt((a * a) + 1.0)), xd));
+}
+
+pub fn acoshf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    if (xd < 1.0) or (xd == m.inf()) or (xd != xd) {
+        return m.to_f32(rep, hy.acosh(xd, rep));
+    }
+    // log(x + sqrt((x - 1)(x + 1))), the product exact; near 1 the result is
+    // about sqrt(2 (x - 1)) >= 2^-11
+    return @float_cast(f32, logd(xd + @sqrt((xd - 1.0) * (xd + 1.0))));
+}
+
+pub fn atanhf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a < 0.000244140625) or (a >= 1.0) or (xd != xd) {
+        return m.to_f32(rep, hy.atanh(xd, rep));
+    }
+    // log((1 + a)/(1 - a))/2, 1 + a and 1 - a exact
+    return @float_cast(f32, @copysign(0.5 * logd((1.0 + a) / (1.0 - a)), xd));
+}
+
+pub fn cbrtf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let ix = m.bits(xd);
+    let ax = ix & 0x7fffffffffffffff;
+    if (ax >= 0x7ff0000000000000) or (ax == 0) {
+        return x + x;  // +-0, +-inf, NaN
+    }
+    // as cbrt: |x| = 2^(3k + j) f, the polynomial (2^-19.6), one Newton step
+    // (2^-39); x is normal as a double
+    let ub = m.exponent(xd) - 1023;
+    let mut k = ub / 3;
+    if (ub - (3 * k)) < 0 {
+        k -= 1;
+    }
+    let j = ub - (3 * k);
+    let f = m.from_bits((ax & 0x000fffffffffffff) | 0x3ff0000000000000);
+    let mm = f * m.pow2(j);
+    let f2 = f * f;
+    let p = ((t.CBRT_P0 + (f * t.CBRT_P1)) + (f2 * (t.CBRT_P2 + (f * t.CBRT_P3)))) +
+            ((f2 * f2) * (t.CBRT_P4 + (f * t.CBRT_P5)));
+    let sc: [3]f64 = [1.0, t.CBRT2, t.CBRT4];
+    let y = p * sc[@as(usize, @bit_cast(u32, j))];
+    let yy = y * y;
+    let r = y - (((yy * y) - mm) / (3.0 * yy));
+    return @float_cast(
+        f32, m.from_bits((m.bits(r) +% (@bit_cast(u64, @as(i64, k)) << 52)) | (ix & 0x8000000000000000)));
+}
+
+pub fn erff(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if (a < 1.0e-30) or (xd != xd) {
+        return m.to_f32(rep, sp.erf(xd, rep));  // (subnormal results), NaN
+    }
+    if a < 1.0 {
+        return @float_cast(f32, xd * erf_ratio_f(xd * xd));
+    }
+    if a >= 3.92 {
+        return @float_cast(f32, @copysign(1.0, xd) - @copysign(1.0e-30, xd));  // (rounds to +-1, inexact)
+    }
+    // 1 - erfc a, erfc a = e^(-a^2) F(a), a^2 exact (at most a sixth of 1)
+    return @float_cast(f32, @copysign(1.0 - (exp_k(-(a * a)) * erfc_scaled_f(a)), xd));
+}
+
+pub fn erfcf(x: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let a = @abs(xd);
+    if xd != xd {
+        return x + x;
+    }
+    if a < 0.5 {
+        return @float_cast(f32, 1.0 - (xd * erf_ratio_f(xd * xd)));
+    }
+    if xd < 0.0 {
+        if a >= 3.92 {
+            return @float_cast(f32, 2.0 - 1.0e-30);  // (rounds to 2, inexact)
+        }
+        return @float_cast(f32, 2.0 - (exp_k(-(a * a)) * erfc_scaled_f(a)));
+    }
+    if a >= 10.05 {
+        return m.to_f32(rep, sp.erfc(xd, rep));  // underflow, +inf
+    }
+    return m.to_f32(rep, exp_k(-(a * a)) * erfc_scaled_f(a));
+}
+
+pub fn lgammaf(x: f32, rep: m.Rep) f32 {
+    return m.to_f32(rep, sp.lgamma(d(x), rep));
+}
+
+pub fn tgammaf(x: f32, rep: m.Rep) f32 {
+    return m.to_f32(rep, sp.tgamma(d(x), rep));
+}
+
+pub inline fn powf(x: f32, y: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let yd = d(y);
+    let ix = m.bits(xd);
+    if ((ix -% 0x0010000000000000) >= 0x7fe0000000000000) or (m.abits(yd) >= 0x7ff0000000000000) or (yd == 0.0) or
+       (xd == 1.0) {
+        return m.to_f32(rep, pw.pow(xd, yd, rep));  // x <= 0, x or y not finite, the exact cases
+    }
+    // x^y = 2^(y log2 x): log2 x within 2^-44 relative (its parts as for
+    // logf, with math_log.ax's -log2 c), so y log2 x within 2^-36.5 where the
+    // result is in float's range (and to_f32 overflows or underflows just
+    // beyond it); further out, the double function
+    let rd = log_red(ix);
+    let l = (rd.k + m.from_bits(t.LOG2_L[2 * rd.i])) +
+            (m.from_bits(t.LOG2_L[(2 * rd.i) + 1]) + (log1p_k(rd.r) * t.INVLN2_HI));
+    let e = yd * l;
+    if @abs(e) < 160.0 {
+        return m.to_f32(rep, exp2_k(e));
+    }
+    return m.to_f32(rep, pw.pow(xd, yd, rep));
+}
+
+pub fn atan2f(y: f32, x: f32, rep: m.Rep) f32 {
+    let yd = d(y);
+    let xd = d(x);
+    if (yd == 0.0) or (xd == 0.0) or (@abs(yd) == m.inf()) or (@abs(xd) == m.inf()) or (yd != yd) or (xd != xd) {
+        return m.to_f32(rep, at.atan2(yd, xd, rep));  // zeros, infinities, NaNs
+    }
+    // atan(|y/x|) in double (the quotient within 2^-53, exact in range), then
+    // the quadrant
+    let mut v = atan_d(@abs(yd / xd));
+    if xd < 0.0 {
+        v = t.PI_HI - v;
+    }
+    return m.to_f32(rep, @copysign(v, yd));
+}
+
+pub fn hypotf(x: f32, y: f32, rep: m.Rep) f32 {
+    let xd = d(x);
+    let yd = d(y);
+    if (@abs(xd) == m.inf()) or (@abs(yd) == m.inf()) {
+        return @float_cast(f32, m.inf());  // even with a NaN (F.10.4.3)
+    }
+    // the squares exact, their sum within 2^-53: one more rounding to float
+    return m.to_f32(rep, @sqrt((xd * xd) + (yd * yd)));
+}
+
+pub fn sinpif(x: f32, rep: m.Rep) f32 {
+    return m.to_f32(rep, sp.sinpi(d(x), rep));
+}
+
+pub fn cospif(x: f32, rep: m.Rep) f32 {
+    return m.to_f32(rep, sp.cospi(d(x), rep));
+}

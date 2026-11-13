@@ -94,6 +94,8 @@ struct Parser {
     binds: u.List.[Bind],
     names: u.SymMap.[i32],  // name -> its innermost binding (index + 1)
     level: i32,
+    fp: u32,       // the floating-point pragmas' state here (cpragma.ax)
+    fp_any: bool,  // the function being parsed has a nonzero state somewhere
 }
 
 // -----------------------------------------------------------------------------
@@ -1855,7 +1857,12 @@ fn parse_function_def(P: *mut Parser, d: *mut cast.Decl, dc: *mut cast.Declarato
         }
         check_param_names(P, fd);
     }
+    // (the pragmas' state of the function: at its start, and in its blocks)
+    let any = P.fp_any;
+    P.fp_any = P.fp != 0;
     d.body = parse_compound(P, false);
+    d.fp_strict = P.fp_any;
+    P.fp_any = any;
     pop_scope(P);
     d.span = span_from(P, start);
     return d;
@@ -2676,11 +2683,25 @@ fn parse_compound(P: *mut Parser, new_scope: bool) *mut cast.Stmt {
     if new_scope {
         push_scope(P);
     }
+    // the floating-point pragmas hold to the end of the block (6.10.6p2;
+    // before any item, and here also between items)
+    let fp_outer = P.fp;
+    P.fp = cpg.fp_apply(P.fp, P.pos);
+    s.fp = P.fp;
+    if s.fp != 0 {
+        P.fp_any = true;
+    }
     let mut seen_stmt: i32 = 0;
     while not at_p(P, ct.P_RBRACE) and not at_eof(P) {
         let before = P.pos;
+        P.fp = cpg.fp_apply(P.fp, P.pos);
+        let st = P.fp;
+        if st != 0 {
+            P.fp_any = true;
+        }
         let it = parse_block_item(P, &mut seen_stmt);
         if u.notnil(it) {
+            it.fp = st;
             s.items.push(it);
         }
         if P.pos == before {
@@ -2691,6 +2712,7 @@ fn parse_compound(P: *mut Parser, new_scope: bool) *mut cast.Stmt {
     if new_scope {
         pop_scope(P);
     }
+    P.fp = fp_outer;
     leave(P);
     _ = expect_p(P, ct.P_RBRACE);
     s.span = span_from(P, start);
@@ -3029,6 +3051,8 @@ pub fn parse(toks0: []ct.Token, o: *co.COptions) *mut cast.Unit {
         binds: u.List.[Bind].empty(),
         names: u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 },
         level: 0,
+        fp: 0,
+        fp_any: false,
     };
     while not at_eof(&P) {
         let before = P.pos;
@@ -3042,8 +3066,12 @@ pub fn parse(toks0: []ct.Token, o: *co.COptions) *mut cast.Unit {
             _ = advance(&mut P);
             continue;
         }
+        // the floating-point pragmas between external declarations
+        P.fp = cpg.fp_apply(P.fp, P.pos);
+        let st = P.fp;
         let d = parse_declaration(&mut P, CTX_FILE);
         if u.notnil(d) {
+            d.fp = st;
             unit.decls.push(d);
         }
         if P.pos == before {

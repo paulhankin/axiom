@@ -121,6 +121,9 @@ let mut XDATA_SYM: u32 = 0;
 
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
+// The function's floating point is strict (ir.Func's strict_fp): its
+// floating-point instructions raise exceptions, effects that mc.dce keeps.
+let mut strict_fp: bool = false;
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut nlocal: i32 = 0;
 let mut out_area: u64 = 0;        // outgoing stack-argument bytes
@@ -877,11 +880,16 @@ fn fty(t: *ir.Ty) u64 {
 fn float_compare(v: *mut ir.Value) i32 {
     let p = @truncate(i32, @bit_cast(i64, v.cv));
     let a = reg(v.a);
+    // fcmpe (opc bit 4) for a signaling compare (ir.F_SIGNALING)
+    let mut e: u64 = 0;
+    if (v.flags & ir.F_SIGNALING) != 0 {
+        e = 0x10;
+    }
     if ((v.b.kind == ir.V_CFP) or (v.b.kind == ir.V_ZERO)) and ir.is_zero(v.b) {
-        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | 8, NONE(), R(a), NONE(), NONE());  // fcmp a, #0.0
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | 8 | e, NONE(), R(a), NONE(), NONE());  // fcmp a, #0.0
     } else {
         let b = reg(v.b);
-        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0), NONE(), R(a), R(b), NONE());
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | e, NONE(), R(a), R(b), NONE());
     }
     if p == ir.RealOEQ {
         return EQ;
@@ -3534,10 +3542,13 @@ fn prepare(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
+            if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) and
+               not ir.fp_pinned(i) {
                 let us = i.user;
                 if (us.blk == b) and (us.a == i) {
-                    // (the compare is made at its user, whose condition it is)
+                    // (the compare is made at its user, whose condition it is;
+                    // not under strict floating point, where it stays before
+                    // a call between them)
                     if (us.op == ir.OP_CONDBR) or (us.op == ir.OP_SELECT) {
                         i.flag = i.flag | 2;
                     }
@@ -3993,6 +4004,9 @@ fn pure_word(w: u64) bool {
         }
         return (k == 4) or (k == 6) or (k >= 8);  // csel, 1-/2-source, 3-source (not ccmp)
     }
+    if ((op0 & 7) == 7) and strict_fp {
+        return false;  // (strict floating point: the exceptions are effects)
+    }
     if (op0 & 7) == 7 {
         // SIMD and floating point: all but the comparisons that set flags (fcmp, fccmp)
         if (((w >> 24) & 0xff) == 0x1e) and (((w >> 21) & 1) == 1) {
@@ -4152,6 +4166,7 @@ fn compile_func(f: *mut ir.Func) void {
                           spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
     let dn = debug_ra_suffix();
     mc.debug_ra = (dn.len > 0) and (dn.len <= f.name.len) and u.str_eq(f.name[(f.name.len - dn.len)..f.name.len], dn);
+    strict_fp = f.strict_fp;
     mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
     mc.drop_reloads(MF, is_label, no_copy);

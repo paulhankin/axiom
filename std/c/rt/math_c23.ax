@@ -1,0 +1,674 @@
+// =============================================================================
+// std/c/rt/math_c23.ax - the functions C23 adds to <math.h> (7.12; F.10)
+// that compute: exp2m1, exp10m1, log2p1, log10p1, logp1, rootn, pown, powr,
+// compoundn, rsqrt, and the trigonometric functions of pi x and their
+// inverses over pi (tanpi, asinpi, acospi, atanpi, atan2pi; sinpi and cospi
+// are math_special.ax's), in double, with the float forms rounded once from
+// the double ones (within 0.5 + 2^-29 ulp of float). They are the kernels'
+// (std/internal/math/) methods: the arguments of the exponentials and the
+// logarithms as double-doubles, so that the last rounding is the only one
+// that matters (within about 0.51 ulp), and the special cases of Annex F.
+// =============================================================================
+import "../../internal/math/atrig.ax" as at;
+import "../../internal/math/core.ax" as m;
+import "../../internal/math/exp.ax" as ex;
+import "../../internal/math/log.ax" as lg;
+import "../../internal/math/pow.ax" as pw;
+import "../../internal/math/tables.ax" as t;
+import "../../internal/math/trig.ax" as tr;
+import "math.ax" as c;
+
+inline fn d(x: f32) f64 {
+    return @float_cast(f64, x);
+}
+
+// -----------------------------------------------------------------------------
+// exp2m1, exp10m1
+// -----------------------------------------------------------------------------
+
+/// e^(y + yl) - 1 for |y| <= 1/16 (|yl| <= ulp(y)): y + y^2 Q(y) (expm1's
+/// polynomial) + yl e^y, rounded once.
+inline fn expm1_small(y: f64, yl: f64) f64 {
+    let z = y * y;
+    let w = z * z;
+    let q = ((t.EXPM1_P0 + (y * t.EXPM1_P1)) + (z * (t.EXPM1_P2 + (y * t.EXPM1_P3)))) +
+            (w * (((t.EXPM1_P4 + (y * t.EXPM1_P5)) + (z * (t.EXPM1_P6 + (y * t.EXPM1_P7)))) + (w * t.EXPM1_P8)));
+    return y + ((z * q) + (yl * (1.0 + y)));
+}
+
+/// 2^k (s + e) - 1 rounded once (the parts of an exponential no larger than
+/// 2^64): the first part exact when 2^k s is near 1, its error kept by
+/// two_sum otherwise.
+inline fn em1_parts(p: ex.Parts) f64 {
+    let sc = m.pow2(p.k);
+    let a = m.two_sum(sc * p.s, -1.0);
+    return a.hi + (a.lo + (sc * p.e));
+}
+
+/// x times the double-double h + l, rounded once (for |x| < 2^-54 with h
+/// near 1: a subnormal product is an underflow).
+inline fn scaled(x: f64, h: f64, l: f64) f64 {
+    if m.abits(x) < 0x0060000000000000 {
+        return c.check_tiny(x * h);
+    }
+    let p = m.two_prod(x, h);
+    return p.hi + (p.lo + (x * l));
+}
+
+/// 2^x - 1 (C23 7.12.6.5).
+export fn exp2m1(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x404e000000000000 {
+        // |x| >= 60: -1 (2^x below 2^-60), or 2^x (1 below its ulp)
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if x < 0.0 {
+            return -1.0;
+        }
+        return ex.exp2(x, c.rep());
+    }
+    if ax < 0x3c90000000000000 {
+        return scaled(x, t.LN2D_HI, t.LN2D_LO);  // |x| < 2^-54: x ln2
+    }
+    if ax <= 0x3fb7154769768e73 {
+        // |x| <= 1/(16 ln2): e^(x ln2) - 1, x ln2 as a double-double
+        let y = m.two_prod(x, t.LN2D_HI);
+        return expm1_small(y.hi, y.lo + (x * t.LN2D_LO));
+    }
+    return em1_parts(ex.parts2(x));
+}
+
+/// 10^x - 1 (C23 7.12.6.6).
+export fn exp10m1(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x4032000000000000 {
+        // |x| >= 18
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if x < 0.0 {
+            return -1.0;
+        }
+        return ex.exp10(x, c.rep());
+    }
+    if ax < 0x3c90000000000000 {
+        return scaled(x, t.LN10_HI, t.LN10_LO);
+    }
+    let y = m.two_prod(x, t.LN10_HI);
+    let yl = y.lo + (x * t.LN10_LO);
+    if ax <= 0x3f9bcb7b1526e50e {
+        return expm1_small(y.hi, yl);  // |x| <= 1/(16 ln10)
+    }
+    return em1_parts(ex.parts(y.hi, yl));
+}
+
+export fn exp2m1f(x: f32) f32 {
+    return c.to_f32(exp2m1(d(x)));
+}
+
+export fn exp10m1f(x: f32) f32 {
+    return c.to_f32(exp10m1(d(x)));
+}
+
+// -----------------------------------------------------------------------------
+// log2p1, log10p1, logp1
+// -----------------------------------------------------------------------------
+
+/// log1p(x) times h + l (1/ln2 or 1/ln10), rounded once; the special cases
+/// of log1p.
+inline fn logp1_scaled(x: f64, h: f64, l: f64) f64 {
+    let ix = m.bits(x);
+    let ax = ix & 0x7fffffffffffffff;
+    if ax < 0x3c90000000000000 {
+        return scaled(x, h, l);  // |x| < 2^-54 (and +-0)
+    }
+    if ix >= 0xbff0000000000000 {
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if ix == 0xbff0000000000000 {
+            return c.pole(true);  // x = -1
+        }
+        return c.domain();  // x < -1
+    }
+    if (ix >= 0x7ff0000000000000) and (ix < 0x8000000000000000) {
+        return x + x;  // +inf, NaN
+    }
+    let v = lg.log1p_fast(x);
+    let p = m.two_prod(v.hi, h);
+    return p.hi + (p.lo + ((v.lo * h) + (v.hi * l)));
+}
+
+/// log2(1 + x) (C23 7.12.6.14).
+export fn log2p1(x: f64) f64 @multiversion("fma") {
+    return logp1_scaled(x, t.INVLN2_HI, t.INVLN2_LO);
+}
+
+/// log10(1 + x) (C23 7.12.6.13).
+export fn log10p1(x: f64) f64 @multiversion("fma") {
+    return logp1_scaled(x, t.INVLN10_HI, t.INVLN10_LO);
+}
+
+/// log(1 + x) (C23 7.12.6.15): log1p's other name.
+export fn logp1(x: f64) f64 {
+    return lg.log1p(x, c.rep());
+}
+
+export fn log2p1f(x: f32) f32 {
+    return c.to_f32(log2p1(d(x)));
+}
+
+export fn log10p1f(x: f32) f32 {
+    return c.to_f32(log10p1(d(x)));
+}
+
+export fn logp1f(x: f32) f32 {
+    return c.to_f32(lg.log1p(d(x), c.rep()));
+}
+
+// -----------------------------------------------------------------------------
+// rsqrt, rootn, pown, powr, compoundn
+// -----------------------------------------------------------------------------
+
+/// 1/sqrt(x) (C23 7.12.7.9): x scaled by an even power of two into [1, 4),
+/// r = 1/sqrt(x) once rounded, then r (1 + e/2), e = 1 - x r^2 from the
+/// exact square: within 0.5 + 2^-50 ulp.
+export fn rsqrt(x: f64) f64 @multiversion("fma") {
+    let ix = m.bits(x);
+    if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
+        // not a positive normal number
+        if (ix << 1) == 0 {
+            return c.pole((ix >> 63) != 0);  // +-0: +-inf
+        }
+        if (ix & 0x7fffffffffffffff) > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if ix == 0x7ff0000000000000 {
+            return 0.0;
+        }
+        if (ix >> 63) != 0 {
+            return c.domain();
+        }
+    }
+    let mut a = x;
+    let mut e = m.exponent(a) - 1023;
+    if e == -1023 {
+        a = a * 18014398509481984.0;  // 2^54, a subnormal x
+        e = (m.exponent(a) - 1023) - 54;
+    }
+    // x = s 2^(2k), s in [1, 4) (a's significand)
+    let k = e >> 1;
+    let s = m.from_bits((m.bits(a) & 0x000fffffffffffff) | (@as(u64, @bit_cast(u32, (1023 + e) - (2 * k))) << 52));
+    let sq = @sqrt(s);
+    let r = 1.0 / sq;
+    let p = m.two_sqr(r);
+    let q = m.dd_mul_d(p, s);
+    let err = (1.0 - q.hi) - q.lo;
+    let v = r + ((0.5 * r) * err);
+    return v * m.pow2(-k);
+}
+
+/// n as a double-double (exactly: its two halves of 32 bits).
+inline fn i64_dd(n: i64) m.DD {
+    let hi = @float_from_int(f64, n >> 32) * 4294967296.0;
+    let lo = @float_from_int(f64, n & 0xffffffff);
+    return m.fast_two_sum(hi, lo);
+}
+
+/// e^(l n) for a double-double l and an integer n, with the range errors
+/// (negated if neg).
+inline fn exp_mul(l: m.DD, n: i64, neg: bool) f64 {
+    let nd = i64_dd(n);
+    let p = m.two_prod(nd.hi, l.hi);
+    let lo = p.lo + ((nd.hi * l.lo) + (nd.lo * l.hi));
+    let mut r: f64 = 0.0;
+    if p.hi > 710.0 {
+        r = c.overflow(false);
+    } else if p.hi < -746.0 {
+        r = c.underflow(false);
+    } else {
+        r = ex.exp_dd(p.hi, lo, c.rep());
+    }
+    if neg {
+        return -r;
+    }
+    return r;
+}
+
+/// x^n for an integer n (C23 7.12.7.6): pow's where n is exact as a double,
+/// e^(n log|x|) with n as a double-double beyond (F.10.4.6).
+export fn pown(x: f64, n: i64) f64 @multiversion("fma") {
+    if (n <= 9007199254740992) and (n >= -9007199254740992) {
+        return pw.pow(x, @float_from_int(f64, n), c.rep());
+    }
+    // |n| > 2^53
+    let odd = (n & 1) != 0;
+    let ax = m.abits(x);
+    if ax > 0x7ff0000000000000 {
+        return x + x;
+    }
+    let neg = odd and (x < 0.0);
+    if ax == 0 {
+        if n < 0 {
+            return c.pole(odd and ((m.bits(x) >> 63) != 0));
+        }
+        if neg or (odd and ((m.bits(x) >> 63) != 0)) {
+            return -0.0;
+        }
+        return 0.0;
+    }
+    if ax == 0x7ff0000000000000 {
+        let mut r = m.inf();
+        if n < 0 {
+            r = 0.0;
+        }
+        if odd and (x < 0.0) {
+            return -r;
+        }
+        return r;
+    }
+    if ax == 0x3ff0000000000000 {
+        if neg {
+            return -1.0;
+        }
+        return 1.0;
+    }
+    return exp_mul(lg.log_dd(m.from_bits(ax)), n, neg);
+}
+
+/// The n-th root of x (C23 7.12.7.8, F.10.4.8): e^(log|x| / n).
+export fn rootn(x: f64, n: i64) f64 @multiversion("fma") {
+    if n == 0 {
+        return c.domain();
+    }
+    let ax = m.abits(x);
+    if ax > 0x7ff0000000000000 {
+        return x + x;
+    }
+    let odd = (n & 1) != 0;
+    let sgn = (m.bits(x) >> 63) != 0;
+    if ax == 0 {
+        if n < 0 {
+            return c.pole(odd and sgn);  // +-inf for odd n, +inf for even
+        }
+        if odd {
+            return x;
+        }
+        return 0.0;
+    }
+    if sgn and not odd {
+        return c.domain();  // x < 0, n even
+    }
+    if ax == 0x7ff0000000000000 {
+        if n < 0 {
+            return @copysign(0.0, x);
+        }
+        return x;
+    }
+    if n == 1 {
+        return x;
+    }
+    if n == -1 {
+        return c.check_tiny(c.check_huge(1.0 / x));
+    }
+    if n == 2 {
+        return @sqrt(x);
+    }
+    if n == -2 {
+        return rsqrt(x);
+    }
+    if n == 3 {
+        return pw.cbrt(x);
+    }
+    // (|n| >= 3 or n = -3: the result is within 2^-358 .. 2^358)
+    let l = lg.log_dd(m.from_bits(ax));
+    let q = m.dd_div(l, i64_dd(n));
+    let r = ex.exp_dd(q.hi, q.lo, c.rep());
+    if sgn {
+        return -r;
+    }
+    return r;
+}
+
+/// x^y for x >= 0 (C23 7.12.7.7, F.10.4.7): e^(y log x), with the special
+/// cases of IEEE 754's powr (no integer y is special).
+export fn powr(x: f64, y: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    let ay = m.abits(y);
+    if (ax > 0x7ff0000000000000) or (ay > 0x7ff0000000000000) {
+        return x + y;
+    }
+    if (ax != 0) and ((m.bits(x) >> 63) != 0) {
+        return c.domain();  // x < 0 (-0 is a zero)
+    }
+    if ax == 0 {
+        if ay == 0 {
+            return c.domain();  // powr(+-0, +-0)
+        }
+        if y < 0.0 {
+            if ay == 0x7ff0000000000000 {
+                return m.inf();  // powr(+-0, -inf)
+            }
+            return c.pole(false);
+        }
+        return 0.0;
+    }
+    if ax == 0x7ff0000000000000 {
+        if ay == 0 {
+            return c.domain();  // powr(+inf, +-0)
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        return m.inf();
+    }
+    if ax == 0x3ff0000000000000 {
+        if ay == 0x7ff0000000000000 {
+            return c.domain();  // powr(1, +-inf)
+        }
+        return 1.0;
+    }
+    if ay == 0 {
+        return 1.0;
+    }
+    return pw.pow(x, y, c.rep());  // (x positive, finite, not 1: pow's value)
+}
+
+/// (1 + x)^n (C23 7.12.7.2, F.10.4.2): e^(n log1p(x)), log1p(x) as a
+/// double-double.
+export fn compoundn(x: f64, n: i64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax > 0x7ff0000000000000 {
+        if n == 0 {
+            return 1.0;  // compoundn(NaN, 0) = 1
+        }
+        return x + x;
+    }
+    if x < -1.0 {
+        return c.domain();
+    }
+    if n == 0 {
+        return 1.0;
+    }
+    if x == -1.0 {
+        if n < 0 {
+            return c.pole(false);
+        }
+        return 0.0;
+    }
+    if ax == 0x7ff0000000000000 {
+        if n < 0 {
+            return 0.0;
+        }
+        return m.inf();
+    }
+    if ax == 0 {
+        return 1.0;
+    }
+    if n == 1 {
+        return 1.0 + x;
+    }
+    return exp_mul(lg.log1p_dd(m.dd(x, 0.0)), n, false);
+}
+
+export fn rsqrtf(x: f32) f32 {
+    return c.to_f32(rsqrt(d(x)));
+}
+
+export fn pownf(x: f32, n: i64) f32 {
+    return c.to_f32(pown(d(x), n));
+}
+
+export fn rootnf(x: f32, n: i64) f32 {
+    return c.to_f32(rootn(d(x), n));
+}
+
+export fn powrf(x: f32, y: f32) f32 {
+    return c.to_f32(powr(d(x), d(y)));
+}
+
+export fn compoundnf(x: f32, n: i64) f32 {
+    return c.to_f32(compoundn(d(x), n));
+}
+
+// -----------------------------------------------------------------------------
+// tanpi, asinpi, acospi, atanpi, atan2pi
+// -----------------------------------------------------------------------------
+
+/// tan(pi x) (C23 7.12.4.14, F.10.1.14): x reduced exactly modulo 1 to r in
+/// [-1/2, 1/2], then tan(pi |r|) for |r| <= 1/4, 1/tan(pi (1/2 - |r|))
+/// beyond (trig.ax's kernel on pi r as a double-double).
+export fn tanpi(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x7ff0000000000000 {
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return c.domain();
+    }
+    if ax < 0x3c90000000000000 {
+        return scaled(x, t.PI_HI, t.PI_LO);  // |x| < 2^-54: pi x
+    }
+    let n = @nearest(x);
+    let r = x - n;  // exact, in [-1/2, 1/2]
+    // the parity of the integer nearest x (for |x| >= 2^53, even)
+    let odd = (@abs(n) < 9007199254740992.0) and ((n - (2.0 * @nearest(0.5 * n))) != 0.0);
+    if r == 0.0 {
+        // +0 for positive even and negative odd integers, -0 for the others
+        if odd {
+            return -@copysign(0.0, x);
+        }
+        return @copysign(0.0, x);
+    }
+    let a = @abs(r);
+    if a == 0.5 {
+        // n + 1/2: +inf for an even n, -inf for an odd one (n = floor(x))
+        let f = @floor(x);
+        return c.pole((f - (2.0 * @floor(0.5 * f))) != 0.0);
+    }
+    let mut v = m.dd(0.0, 0.0);
+    if a <= 0.25 {
+        let p = m.two_prod(t.PI_HI, a);
+        v = tr.tan_dd(p.hi, p.lo + (t.PI_LO * a), false);
+    } else {
+        // tan(pi a) = 1/tan(pi u), u = 1/2 - a exact; tan_dd's odd form is
+        // -1/tan
+        let u = 0.5 - a;
+        let p = m.two_prod(t.PI_HI, u);
+        v = m.dd_neg(tr.tan_dd(p.hi, p.lo + (t.PI_LO * u), true));
+    }
+    return @copysign(v.hi + v.lo, r);
+}
+
+/// The double-double h + l times 1/pi, rounded once.
+inline fn over_pi(h: f64, l: f64) f64 {
+    let p = m.two_prod(h, t.INVPI_HI);
+    return p.hi + (p.lo + ((l * t.INVPI_HI) + (h * t.INVPI_LO)));
+}
+
+/// asin(x)/pi and acos(x)/pi for 1/2 <= |x| < 1 share 2 asin(s)/pi, s =
+/// sqrt((1 - |x|)/2): as a double-double.
+inline fn two_asin_s_over_pi(a: f64) m.DD {
+    let z = (1.0 - a) * 0.5;
+    let s = at.sqrt_dd(z, a);
+    let q = at.asin_tail(s.hi, z);
+    // (2/pi as a double-double: twice 1/pi's)
+    let p = m.two_prod(s.hi, 2.0 * t.INVPI_HI);
+    return m.fast_two_sum(p.hi, p.lo + (((s.lo + q) * (2.0 * t.INVPI_HI)) + (s.hi * (2.0 * t.INVPI_LO))));
+}
+
+/// asin(x)/pi (C23 7.12.4.9, F.10.1.9).
+export fn asinpi(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x3ff0000000000000 {
+        if ax == 0x3ff0000000000000 {
+            return 0.5 * x;  // asinpi(+-1) = +-1/2
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return c.domain();
+    }
+    if ax < 0x3c90000000000000 {
+        return scaled(x, t.INVPI_HI, t.INVPI_LO);
+    }
+    if ax < 0x3fe0000000000000 {
+        return over_pi(x, at.asin_tail(x, x * x));  // asin x = x + tail
+    }
+    // 1/2 - 2 asin(s)/pi
+    let w = two_asin_s_over_pi(m.from_bits(ax));
+    let a = m.fast_two_sum(0.5, -w.hi);
+    return @copysign(a.hi + (a.lo - w.lo), x);
+}
+
+/// acos(x)/pi (C23 7.12.4.7, F.10.1.7).
+export fn acospi(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x3ff0000000000000 {
+        if x == 1.0 {
+            return 0.0;
+        }
+        if x == -1.0 {
+            return 1.0;
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return c.domain();
+    }
+    if ax < 0x3fe0000000000000 {
+        // 1/2 - asin(x)/pi
+        let tl = at.asin_tail(x, x * x);
+        let p = m.two_prod(x, t.INVPI_HI);
+        let a = m.fast_two_sum(0.5, -p.hi);
+        return a.hi + (a.lo - (p.lo + ((tl * t.INVPI_HI) + (x * t.INVPI_LO))));
+    }
+    let w = two_asin_s_over_pi(m.from_bits(ax));
+    if x > 0.0 {
+        return w.hi + w.lo;  // 2 asin(s)/pi
+    }
+    let a = m.fast_two_sum(1.0, -w.hi);  // 1 - 2 asin(s)/pi
+    return a.hi + (a.lo - w.lo);
+}
+
+/// atan(x)/pi (C23 7.12.4.11, F.10.1.11).
+export fn atanpi(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x7ff0000000000000 {
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return @copysign(0.5, x);
+    }
+    if ax < 0x3c90000000000000 {
+        return scaled(x, t.INVPI_HI, t.INVPI_LO);
+    }
+    let v = at.atan_pos(m.from_bits(ax), 0.0);
+    return @copysign(over_pi(v.hi, v.lo), x);
+}
+
+/// atan2(y, x)/pi (C23 7.12.4.12, F.10.1.12): as atan2, the angle as a
+/// double-double, then over pi (the special values come out exact: 1, 3/4,
+/// 1/2, 1/4).
+export fn atan2pi(y: f64, x: f64) f64 @multiversion("fma") {
+    let bx = m.bits(x);
+    let by = m.bits(y);
+    let ax = bx & 0x7fffffffffffffff;
+    let ay = by & 0x7fffffffffffffff;
+    if (ax > 0x7ff0000000000000) or (ay > 0x7ff0000000000000) {
+        return x + y;
+    }
+    let neg_x = (bx >> 63) != 0;
+    let mut v: f64 = 0.0;
+    if ay == 0 {
+        if neg_x {
+            return @copysign(1.0, y);  // atan2pi(+-0, x) = +-1 for x < 0 or -0
+        }
+        return y;
+    }
+    if ax == 0 {
+        v = 0.5;
+    } else if (ax == 0x7ff0000000000000) or (ay == 0x7ff0000000000000) {
+        if ax != 0x7ff0000000000000 {
+            v = 0.5;
+        } else if ay == 0x7ff0000000000000 {
+            if neg_x {
+                v = 0.75;
+            } else {
+                v = 0.25;
+            }
+        } else if neg_x {
+            v = 1.0;
+        } else {
+            v = 0.0;
+        }
+    } else {
+        let ex2 = m.exponent(m.from_bits(ax));
+        let ey = m.exponent(m.from_bits(ay));
+        if ((ex2 - ey) > 60) and not neg_x {
+            // |y/x| < 2^-59: y/(x pi) (subnormal results: underflow)
+            // (y scaled by 2^200 where the quotient is tiny: its residual
+            // exact, and the scaling back exact but for a subnormal result)
+            let mut yy = m.from_bits(ay);
+            let mut back: f64 = 1.0;
+            if (yy / m.from_bits(ax)) < 1.0e-280 {
+                yy = yy * m.pow2(200);
+                back = m.pow2(-200);
+            }
+            let q = yy / m.from_bits(ax);
+            let pr = m.two_prod(q, m.from_bits(ax));
+            let ql = ((yy - pr.hi) - pr.lo) / m.from_bits(ax);
+            v = c.check_tiny(over_pi(q, ql) * back);
+        } else {
+            let mut r = m.dd(0.0, 0.0);
+            if (ex2 - ey) > 60 {
+                r = m.dd(t.PI_HI, t.PI_LO);
+            } else if (ey - ex2) > 60 {
+                r = m.dd(t.PIO2_HI, t.PIO2_LO);
+            } else {
+                // both scaled near 1, the smaller over the larger as a
+                // double-double, atan, then the quadrant (as atan2)
+                let k = 1023 - ex2;
+                let sc1 = m.pow2(k / 2);
+                let sc2 = m.pow2(k - (k / 2));
+                let fx = (m.from_bits(ax) * sc1) * sc2;
+                let fy = (m.from_bits(ay) * sc1) * sc2;
+                let small = @min(fx, fy);
+                let big = @max(fx, fy);
+                let q = small / big;
+                let pr = m.two_prod(q, big);
+                let ql = ((small - pr.hi) - pr.lo) / big;
+                r = at.atan_pos(q, ql);
+                if fy > fx {
+                    r = m.dd_add(m.dd(t.PIO2_HI, t.PIO2_LO), m.dd_neg(r));
+                }
+                if neg_x {
+                    r = m.dd_add(m.dd(t.PI_HI, t.PI_LO), m.dd_neg(r));
+                }
+            }
+            v = over_pi(r.hi, r.lo);
+        }
+    }
+    return @copysign(v, y);
+}
+
+export fn tanpif(x: f32) f32 {
+    return c.to_f32(tanpi(d(x)));
+}
+
+export fn asinpif(x: f32) f32 {
+    return c.to_f32(asinpi(d(x)));
+}
+
+export fn acospif(x: f32) f32 {
+    return c.to_f32(acospi(d(x)));
+}
+
+export fn atanpif(x: f32) f32 {
+    return c.to_f32(atanpi(d(x)));
+}
+
+export fn atan2pif(y: f32, x: f32) f32 {
+    return c.to_f32(atan2pi(d(y), d(x)));
+}

@@ -5,7 +5,8 @@ arbitrary precision (mpmath) and rounded correctly:
     cmd/axiom/internal/tests/tools/gen_math_tests.py      # needs mpmath
 
 writes cmd/axiom/internal/tests/c/lib/math/math_values_double.c and
-math_values_float.c. Each holds, for every function, inputs (random over the
+math_values_float.c (C99's functions), math_values_c23_double.c and
+math_values_c23_float.c (C23's). Each holds, for every function, inputs (random over the
 function's domain, and its hard places: near zeros, poles, overflow and
 underflow thresholds, huge arguments of the trigonometric functions) and
 the correctly rounded results; the program checks that each result is
@@ -34,6 +35,8 @@ def fb(x):
 
 def to_f32(v):
     """mpf v rounded to binary32 (correctly: via its exact rational)."""
+    if isinstance(v, float):
+        return v
     if mp.isnan(v):
         return float('nan')
     if mp.isinf(v):
@@ -50,6 +53,8 @@ def to_f32(v):
 
 
 def to_f64(v):
+    if isinstance(v, float):
+        return v
     if mp.isnan(v):
         return float('nan')
     if mp.isinf(v):
@@ -99,6 +104,48 @@ def F(name, *xs):
         if a <= 0 and a == mp.floor(a):
             return mp.inf
         return mp.re(mp.loggamma(a))
+    if name == 'exp2m1':
+        return mp.expm1(a * mp.log(2))
+    if name == 'exp10m1':
+        return mp.expm1(a * mp.log(10))
+    if name in ('logp1', 'log2p1', 'log10p1'):
+        if a < -1:
+            return mp.nan
+        if a == -1:
+            return -mp.inf
+        return mp.log1p(a) / {'logp1': 1, 'log2p1': mp.log(2), 'log10p1': mp.log(10)}[name]
+    if name == 'rsqrt':
+        return mp.nan if a < 0 else (mp.inf if a == 0 else 1 / mp.sqrt(a))
+    if name in ('sinpi', 'cospi', 'tanpi'):
+        r = a - 2 * mp.floor(a / 2)  # (exact: a is a double)
+        v = {'sinpi': mp.sinpi, 'cospi': mp.cospi, 'tanpi': lambda t: mp.sinpi(t) / mp.cospi(t)}[name](r)
+        if v == 0:
+            # the zeros' signs (F.10.1.13-15): sinpi(n) is x's sign; tanpi(n)
+            # +0 for positive even and negative odd n, -0 for the others;
+            # cospi(n + 1/2) +0
+            neg = math.copysign(1, float(xs[0])) < 0
+            if name == 'tanpi' and (int(a) % 2 == 1):
+                neg = not neg
+            if name == 'cospi':
+                neg = False
+            return -0.0 if neg else 0.0  # (a float: mpmath's zeros have no sign)
+        return v
+    if name in ('asinpi', 'acospi'):
+        return mp.nan if abs(a) > 1 else getattr(mp, name[:4])(a) / mp.pi
+    if name == 'atanpi':
+        return mp.atan(a) / mp.pi
+    if name == 'atan2pi':
+        return mp.atan2(a, x[1]) / mp.pi
+    if name == 'powr':
+        return mp.nan if a < 0 else mp.power(a, x[1])
+    if name == 'pown':
+        return mp.power(a, int(x[1]))
+    if name == 'rootn':
+        n = int(x[1])
+        r = mp.root(abs(a), n) if n > 0 else 1 / mp.root(abs(a), -n)
+        return -r if a < 0 else r
+    if name == 'compoundn':
+        return mp.exp(int(x[1]) * mp.log1p(a))
     if name == 'pow':
         return mp.power(a, x[1])
     if name == 'atan2':
@@ -135,6 +182,25 @@ SPECIAL = {
     'erfc': [26.5, 27.2], 'erf': [1e-300, 5e-324],
 }
 
+# C23's (the second argument of pown, rootn and compoundn an integer)
+ONE23 = {
+    'exp2m1': [(-60, 1023), (-0.1, 0.1)], 'exp10m1': [(-18, 308), (-0.03, 0.03)], 'logp1': [(-0.999, 1e300)],
+    'log2p1': [(-0.999, 1e300), (-1e-3, 1e-3)], 'log10p1': [(-0.999, 1e300), (-1e-3, 1e-3)],
+    'rsqrt': [(1e-300, 1e300), (0.5, 4)], 'sinpi': [(-10, 10), (-1e15, 1e15)], 'cospi': [(-10, 10), (-1e15, 1e15)],
+    'tanpi': [(-10, 10), (0.2, 0.3)], 'asinpi': [(-1, 1)], 'acospi': [(-1, 1)], 'atanpi': [(-100, 100), (1e10, 1e300)],
+}
+TWO23 = {'atan2pi': [((-10, 10), (-10, 10))], 'powr': [((0, 4), (-300, 300)), ((1e-10, 1e10), (-30, 30))]}
+INT23 = {'pown': [((-3, 3), (-300, 300)), ((0.9, 1.1), (-5000, 5000))],
+         'rootn': [((1e-300, 1e300), (2, 40)), ((-1e300, -1e-300), (3, 41)), ((1e-10, 1e10), (-20, -2))],
+         'compoundn': [((-0.99, 3), (-300, 300)), ((-1e-3, 1e-3), (-100000, 100000))]}
+SPECIAL23 = {
+    'exp2m1': [1.0, 2.0, 10.0, -1.0, 1e-300, 5e-324], 'exp10m1': [1.0, 2.0, 15.0, -1.0, 1e-300],
+    'log2p1': [1.0, 3.0, 1023.0, 5e-324], 'log10p1': [9.0, 99.0, 999.0], 'rsqrt': [4.0, 0.25, 5e-324, 1.7976931348623157e308],
+    'sinpi': [0.5, 1.0, 1.5, -2.0, 0.25, 1e-300], 'cospi': [0.5, 1.0, 0.25, 1e300],
+    'tanpi': [0.25, -0.25, 1.0, 2.0, -3.0, 0.75, 1e-300], 'asinpi': [1.0, -1.0, 0.5], 'acospi': [1.0, -1.0, 0.5],
+    'atanpi': [1.0, -1.0, 1e-300],
+}
+
 
 def rand_in(rng, lo, hi):
     if lo > 0 and hi / lo > 100:
@@ -142,10 +208,10 @@ def rand_in(rng, lo, hi):
     return float(rng.uniform(lo, hi))
 
 
-def gen(single):
-    rng = random.Random(1 if single else 2)
+def gen(single, one=ONE, two=TWO, special=SPECIAL, ints=None, seed=0):
+    rng = random.Random((1 if single else 2) + seed)
     out = []
-    for name, ranges in ONE.items():
+    for name, ranges in one.items():
         xs = []
         for lo, hi in ranges:
             if single:
@@ -155,7 +221,7 @@ def gen(single):
                 if lo >= hi:
                     lo = hi / 1e10
             xs += [rand_in(rng, lo, hi) for _ in range(40 // len(ranges))]
-        xs += SPECIAL.get(name, [])
+        xs += special.get(name, [])
         rows = []
         for x in xs:
             if single:
@@ -166,7 +232,25 @@ def gen(single):
             r = to_f32(v) if single else to_f64(v)
             rows.append(([x], r))
         out.append((name, 1, rows))
-    for name, ranges in TWO.items():
+    for name, ranges in (ints or {}).items():
+        rows = []
+        for rx, rn in ranges:
+            for _ in range(30 // len(ranges)):
+                x = rand_in(rng, *rx)
+                if single:
+                    x = to_f32(mp.mpf(x))
+                    if abs(x) > 3e38:
+                        continue
+                n = rng.randint(*rn)
+                if name == 'rootn' and n == 0:
+                    n = 3
+                if name == 'rootn' and x < 0 and n % 2 == 0:
+                    n += 1  # (an even root of a negative x is a domain error)
+                v = F(name, x, n)
+                r = to_f32(v) if single else to_f64(v)
+                rows.append(([x, n], r))
+        out.append((name, -2, rows))
+    for name, ranges in two.items():
         rows = []
         for rx, ry in ranges:
             for _ in range(30):
@@ -187,15 +271,24 @@ def gen(single):
     return out
 
 
-def write(single):
+def write(single, c23=False):
     ty = 'float' if single else 'double'
     sfx = 'f' if single else ''
     ut = 'unsigned long' if single else 'unsigned long long'
     bits = fb if single else db
-    funcs = gen(single)
-    L = ['/* math_values_%s.c - generated by cmd/axiom/internal/tests/tools/gen_math_tests.py (do not edit):' % ty,
-         '   <math.h>\'s %s functions within one ulp of the correctly rounded results */' % ty,
-         '/* flags: --c-std=c99 */', '#include "host.h"', '#include <math.h>', '',
+    if c23:
+        funcs = gen(single, ONE23, TWO23, SPECIAL23, INT23, 10)
+        fname = 'math_values_c23_%s.c' % ty
+        which = 'C23\'s %s functions' % ty
+        std = 'c23'
+    else:
+        funcs = gen(single)
+        fname = 'math_values_%s.c' % ty
+        which = '<math.h>\'s %s functions' % ty
+        std = 'c99'
+    L = ['/* %s - generated by cmd/axiom/internal/tests/tools/gen_math_tests.py (do not edit):' % fname,
+         '   %s within one ulp of the correctly rounded results */' % which,
+         '/* flags: --c-std=%s */' % std, '#include "print.h"', '#include <math.h>', '',
          'typedef %s U;' % ut, '',
          '/* x as an integer that orders the values (adjacent values differ by 1) */',
          'static long long ord(U b)', '{',
@@ -210,8 +303,15 @@ def write(single):
          '    if (val(want) == 0 || isinf(val(want)))', '        return b == want;',
          '    return d >= -1 && d <= 1 && signbit(r) == signbit(val(want));', '}', '']
     for name, ar, rows in funcs:
-        L.append('static const U t_%s[][%d] = {' % (name, ar + 1))
+        L.append('static const U t_%s[][%d] = {' % (name, abs(ar) + 1))
         for xs, r in rows:
+            if ar < 0:
+                # (x, the integer n as two's complement bits)
+                # (U is 32 bits wide for float on 32-bit targets: n's low 32 bits there)
+                mask = 0xffffffff if single else 0xffffffffffffffff
+                L.append('    {%s},' % ', '.join(['0x%x' % bits(float(xs[0])), '0x%x' % (xs[1] & mask),
+                                                    '0x%x' % bits(r)]))
+                continue
             L.append('    {%s},' % ', '.join(['0x%x' % bits(float(x)) for x in xs] + ['0x%x' % bits(r)]))
         L.append('};')
         L.append('')
@@ -219,9 +319,15 @@ def write(single):
     L.append('{')
     L.append('    unsigned i, bad;')
     for name, ar, rows in funcs:
-        args = ', '.join('val(t_%s[i][%d])' % (name, k) for k in range(ar))
+        if ar < 0:
+            if single:
+                args = 'val(t_%s[i][0]), (long long)(int)(unsigned int)t_%s[i][1]' % (name, name)
+            else:
+                args = 'val(t_%s[i][0]), (long long)t_%s[i][1]' % (name, name)
+        else:
+            args = ', '.join('val(t_%s[i][%d])' % (name, k) for k in range(ar))
         L.append('    for (bad = i = 0; i < sizeof t_%s / sizeof t_%s[0]; i++)' % (name, name))
-        L.append('        bad += !ok(%s%s(%s), t_%s[i][%d]);' % (name, sfx, args, name, ar))
+        L.append('        bad += !ok(%s%s(%s), t_%s[i][%d]);' % (name, sfx, args, name, abs(ar)))
         L.append('    print_str("%s%s", %d);' % (name, sfx, len(name + sfx)))
         L.append('    print_i64(bad);')
     L.append('    return 0;')
@@ -231,9 +337,11 @@ def write(single):
         L.append('/* expect: 0 */')
     res = L
     os.makedirs(OUT, exist_ok=True)
-    with open(os.path.join(OUT, 'math_values_%s.c' % ty), 'w') as f:
+    with open(os.path.join(OUT, fname), 'w') as f:
         f.write('\n'.join(res) + '\n')
 
 
 write(False)
 write(True)
+write(False, True)
+write(True, True)

@@ -1,0 +1,337 @@
+// =============================================================================
+// std/internal/math/atrig.ax - asin, acos, atan and atan2 (std/math's and the
+// C library's: 7.12.4.1-4, F.10.1.1-4).
+//
+// asin and acos: a minimax polynomial for |x| <= 1/2, and beyond, the
+// identities asin x = pi/2 - 2 asin(sqrt((1 - x)/2)) and acos x =
+// 2 asin(sqrt((1 - x)/2)) (and pi - ... for x < 0; see Abramowitz and
+// Stegun 4.4), with the square root as a double-double and (1 - x)/2 exact.
+// atan: atan x = atan c + atan((x - c)/(1 + x c)) for c the middle of x's
+// sixteenth of its binade, in [2^-6, 2^6) (a table of atan c to 106 bits,
+// indexed by x's top bits), first in plain double with a bound on its error,
+// and in double-double when that does not decide the rounding (Ziv's
+// strategy); the series below, and pi/2 - atan(1/x) above. atan2 reduces to
+// atan of the smaller over the larger magnitude (as a double-double), and
+// puts the quadrant back in double-double. Each is rounded once at the end:
+// within about 0.52 ulp.
+// =============================================================================
+import "core.ax" as m;
+import "tables.ax" as t;
+
+/// asin(s) - s for 0 <= s <= 1/2 and z = s^2: s z P(z), within 2^-52 of
+/// itself (at most a 24th of asin s).
+pub inline fn asin_tail(s: f64, z: f64) f64 {
+    let z2 = z * z;
+    let z4 = z2 * z2;
+    let z8 = z4 * z4;
+    let q0 = ((t.ASIN_P0 + (z * t.ASIN_P1)) + (z2 * (t.ASIN_P2 + (z * t.ASIN_P3)))) +
+             (z4 * ((t.ASIN_P4 + (z * t.ASIN_P5)) + (z2 * (t.ASIN_P6 + (z * t.ASIN_P7)))));
+    let q1 = ((t.ASIN_P8 + (z * t.ASIN_P9)) + (z2 * (t.ASIN_P10 + (z * t.ASIN_P11)))) + (z4 * t.ASIN_P12);
+    return (s * z) * (q0 + (z8 * q1));
+}
+
+/// sqrt(z) as a double-double, z = (1 - a)/2 exactly (1/2 <= a < 1): the
+/// residual's correction divided by 2 sqrt z = 2 z / sqrt z, through 1/(1 - a)
+/// (which the division computes beside the square root).
+pub inline fn sqrt_dd(z: f64, a: f64) m.DD {
+    let inv = 1.0 / (1.0 - a);
+    let s = @sqrt(z);
+    let p = m.two_sqr(s);
+    return m.dd(s, ((z - p.hi) - p.lo) * (s * inv));
+}
+
+/// The arcsine.
+pub inline fn asin(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax < 0x3fe0000000000000 {
+        // |x| < 1/2
+        if ax < 0x3e40000000000000 {
+            // |x| < 2^-27: asin x = x + x^3/6 rounds to x
+            if (ax < 0x0010000000000000) and (ax != 0) {
+                m.raise_underflow(rep);
+            }
+            return x;
+        }
+        return x + asin_tail(x, x * x);
+    }
+    if ax >= 0x3ff0000000000000 {
+        if ax == 0x3ff0000000000000 {
+            return x * t.PIO2_HI;  // asin(+-1) = +-pi/2
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain(rep);
+    }
+    // asin|x| = pi/2 - 2 asin s, s = sqrt(z), z = (1 - |x|)/2
+    let z = (1.0 - m.from_bits(ax)) * 0.5;
+    // (2 s <= 1: pi/2 - 2 s.hi is exact as a + a.lo; the tail is at most a
+    // 24th of 2 asin s, which is at most two thirds of the result)
+    let s = sqrt_dd(z, m.from_bits(ax));
+    let q = asin_tail(s.hi, z);
+    let a = m.fast_two_sum(t.PIO2_HI, -2.0 * s.hi);
+    return @copysign(a.hi + ((a.lo + t.PIO2_LO) - (2.0 * (s.lo + q))), x);
+}
+
+/// The arccosine.
+pub inline fn acos(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax < 0x3fe0000000000000 {
+        // acos x = pi/2 - asin x
+        if ax < 0x3c80000000000000 {
+            return t.PIO2_HI;  // |x| < 2^-55
+        }
+        let q = asin_tail(x, x * x);
+        let a = m.fast_two_sum(t.PIO2_HI, -x);
+        return a.hi + ((a.lo + t.PIO2_LO) - q);
+    }
+    if ax >= 0x3ff0000000000000 {
+        if x == 1.0 {
+            return 0.0;
+        }
+        if x == -1.0 {
+            return t.PI_HI;
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain(rep);
+    }
+    let z = (1.0 - m.from_bits(ax)) * 0.5;
+    let s = sqrt_dd(z, m.from_bits(ax));
+    let q = asin_tail(s.hi, z);
+    if x > 0.0 {
+        return 2.0 * (s.hi + (s.lo + q));  // 2 asin s
+    }
+    // pi - 2 asin s
+    let a = m.fast_two_sum(t.PI_HI, -2.0 * s.hi);
+    return a.hi + ((a.lo + t.PI_LO) - (2.0 * (s.lo + q)));
+}
+
+/// atan(u) - u for |u| <= 1/32 (z = u^2).
+inline fn atan_tail(u: f64, z: f64) f64 {
+    let z2 = z * z;
+    let p = ((t.ATAN_P0 + (z * t.ATAN_P1)) + (z2 * (t.ATAN_P2 + (z * t.ATAN_P3)))) +
+            ((z2 * z2) * ((t.ATAN_P4 + (z * t.ATAN_P5)) + (z2 * t.ATAN_P6)));
+    return (u * z) * p;
+}
+
+/// atan(a + al) for 2^-6 <= a < 2^6 (|al| <= 2 ulp(a)), as a double-double:
+/// atan c + atan(u), u = (a - c)/(1 + a c), c the middle of a's sixteenth
+/// of its binade (tables.ax: ATAN_B, so |u| <= 1/32); a - c is exact,
+/// u is a double-double from one division and the exact residual.
+inline fn atan_k(a: f64, al: f64) m.DD {
+    let row = @as(usize,
+                  @bit_cast(
+                      u32,
+                      ((m.exponent(a) - (1023 - 6)) * 16) + @bit_cast(
+                          i32, @truncate(u32, (m.bits(a) >> 48) & 15)))) * 3;
+    let c = m.from_bits(t.ATAN_B[row]);
+    let n = m.two_sum(a - c, al);
+    let p = m.two_prod(a, c);
+    let s = m.two_sum(1.0, p.hi);
+    let dl = (s.lo + p.lo) + (al * c);
+    let inv = 1.0 / s.hi;
+    let q = n.hi * inv;
+    let pr = m.two_prod(q, s.hi);
+    let ql = ((((n.hi - pr.hi) - pr.lo) + n.lo) - (q * dl)) * inv;
+    let tail = atan_tail(q, q * q);
+    let b = m.fast_two_sum(m.from_bits(t.ATAN_B[row + 1]), q);
+    return m.fast_two_sum(b.hi, ((b.lo + m.from_bits(t.ATAN_B[row + 2])) + ql) + tail);
+}
+
+inline fn b2u(c: bool) u64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+/// An estimate hi + lo of a value, within e.
+struct Est {
+    hi: f64,
+    lo: f64,
+    e: f64,
+}
+
+/// atan(a + al) for 2^-6 <= a < 2^6 (|al| <= 2^-50 a) as an estimate in
+/// plain double arithmetic (atan_k's reduction without the residuals): u is
+/// within 3.01 2^-53 |u| (a - c is exact; a c, 1 + a c and the division
+/// each round once), 4.01 2^-53 |u| with al (one more rounding), the series
+/// (ATAN_Q) within 2^-60 |u|, and the sum's low part within 2^-103 atan a.
+inline fn atan_est(a: f64, al: f64, with_lo: bool) Est {
+    // the exponent and the significand's top 4 bits
+    let row = @as(usize, @truncate(u32, (m.bits(a) >> 48) - ((1023 - 6) * 16))) * 3;
+    let c = m.from_bits(t.ATAN_B[row]);
+    let mut n = a - c;
+    if with_lo {
+        n = n + al;
+    }
+    let q = n / (1.0 + (a * c));
+    let z = q * q;
+    let tail = (q * z) *
+               ((t.ATAN_Q0 + (z * t.ATAN_Q1)) + ((z * z) * ((t.ATAN_Q2 + (z * t.ATAN_Q3)) + (z * (z * t.ATAN_Q4)))));
+    let b = m.fast_two_sum(m.from_bits(t.ATAN_B[row + 1]), q);
+    let lo = (b.lo + m.from_bits(t.ATAN_B[row + 2])) + tail;
+    let mut eq: f64 = 3.352873534367973e-16;  // 3.02 2^-53
+    if with_lo {
+        eq = 4.463096558993129e-16;  // 4.02 2^-53
+    }
+    return Est.{ hi: b.hi, lo: lo, e: (@abs(q) * eq) + (b.hi * 9.860761315262648e-32) };
+}
+
+/// atan(1/(a + al)) for a >= 2^6, as a double-double: 1/a by one division
+/// and the exact residual, then the series.
+inline fn atan_inv(a: f64, al: f64) m.DD {
+    let inv = 1.0 / a;
+    if a > 1.0e100 {
+        return m.dd(inv, 0.0);  // atan(1/a) = 1/a within 2^-300 relative
+    }
+    let p = m.two_prod(inv, a);
+    let ul = (((1.0 - p.hi) - p.lo) - (inv * al)) * inv;
+    return m.fast_two_sum(inv, ul + atan_tail(inv, inv * inv));
+}
+
+/// atan(a + al) for 0 <= a (finite), as a double-double.
+pub inline fn atan_pos(a: f64, al: f64) m.DD {
+    if a < 0.015625 {
+        return m.fast_two_sum(a, al + atan_tail(a, a * a));  // a < 2^-6: the series
+    }
+    if a < 64.0 {
+        return atan_k(a, al);
+    }
+    let v = atan_inv(a, al);
+    return m.dd_add(m.dd(t.PIO2_HI, t.PIO2_LO), m.dd_neg(v));
+}
+
+/// The arctangent.
+pub inline fn atan(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax < 0x3e40000000000000 {
+        if (ax < 0x0010000000000000) and (ax != 0) {
+            m.raise_underflow(rep);
+        }
+        return x;  // |x| < 2^-27
+    }
+    if ax >= 0x7ff0000000000000 {
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return @copysign(t.PIO2_HI, x);
+    }
+    let a = m.from_bits(ax);
+    if (ax - 0x3f90000000000000) < (0x4050000000000000 - 0x3f90000000000000) {
+        // 2^-6 <= |x| < 2^6
+        let f = atan_est(a, 0.0, false);
+        if m.rounds(f.hi, f.lo, f.e) {
+            return @copysign(f.hi + f.lo, x);
+        }
+    }
+    let r = m.dd_round(atan_pos(a, 0.0));
+    return @copysign(r, x);
+}
+
+/// The arctangent of y/x, in the quadrant of (x, y).
+pub inline fn atan2(y: f64, x: f64, rep: m.Rep) f64 {
+    let bx = m.bits(x);
+    let by = m.bits(y);
+    let ax = bx & 0x7fffffffffffffff;
+    let ay = by & 0x7fffffffffffffff;
+    if (ax > 0x7ff0000000000000) or (ay > 0x7ff0000000000000) {
+        return x + y;
+    }
+    let neg_y = (by >> 63) != 0;
+    let neg_x = (bx >> 63) != 0;
+    let mut r = m.dd(0.0, 0.0);
+    if ay == 0 {
+        // atan2(+-0, x): +-0 for x > 0 or +0, +-pi for x < 0 or -0
+        if neg_x {
+            r = m.dd(t.PI_HI, t.PI_LO);
+        } else {
+            return y;
+        }
+    } else if ax == 0 {
+        r = m.dd(t.PIO2_HI, t.PIO2_LO);
+    } else if (ax == 0x7ff0000000000000) or (ay == 0x7ff0000000000000) {
+        if ax != 0x7ff0000000000000 {
+            r = m.dd(t.PIO2_HI, t.PIO2_LO);  // y infinite
+        } else if ay == 0x7ff0000000000000 {
+            if neg_x {
+                r = m.dd(t.PI3O4_HI, t.PI3O4_LO);
+            } else {
+                r = m.dd(t.PIO4_HI, t.PIO4_LO);
+            }
+        } else if neg_x {
+            r = m.dd(t.PI_HI, t.PI_LO);  // x = -inf
+        } else {
+            r = m.dd(0.0, 0.0);  // x = +inf
+        }
+    } else {
+        let ex = m.exponent(m.from_bits(ax));
+        let ey = m.exponent(m.from_bits(ay));
+        if (ex - ey) > 60 {
+            // |y/x| < 2^-59: atan(y/x) = y/x to within 2^-118 relative
+            if not neg_x {
+                let q = m.from_bits(ay) / m.from_bits(ax);
+                if q < 2.2250738585072014e-308 {
+                    m.raise_underflow(rep);
+                }
+                if neg_y {
+                    return -q;
+                }
+                return q;
+            }
+            r = m.dd(t.PI_HI, t.PI_LO);
+        } else if (ey - ex) > 60 {
+            r = m.dd(t.PIO2_HI, t.PIO2_LO);
+        } else {
+            // scaled near 1 (exactly: their exponents are within 60) where
+            // either is far from it
+            let mut fx = m.from_bits(ax);
+            let mut fy = m.from_bits(ay);
+            if ((ex - 0x200) >= 0x400) or ((ey - 0x200) >= 0x400) or (ex < 0x200) or (ey < 0x200) {
+                let k = 1023 - ex;
+                let sc1 = m.pow2(k / 2);
+                let sc2 = m.pow2(k - (k / 2));
+                fx = (fx * sc1) * sc2;
+                fy = (fy * sc1) * sc2;
+            }
+            // the smaller over the larger as a double-double (one division,
+            // the residual exact), then atan
+            let small = @min(fx, fy);
+            let big = @max(fx, fy);
+            let inv = 1.0 / big;
+            let q = small * inv;
+            let pr = m.two_prod(q, big);
+            let ql = ((small - pr.hi) - pr.lo) * inv;
+            if q >= 0.015625 {
+                // the estimate, then pi/2 - it and pi - it (without branches:
+                // the quadrants are unpredictable), exactly but for the low
+                // parts' roundings (each within 2^-104 of the result)
+                let f = atan_est(q, ql, true);
+                let swap = @as(u64, 0) -% b2u(fy > fx);
+                let a = m.fast_two_sum(m.select(swap, t.PIO2_HI, 0.0), m.flip(f.hi, swap & 0x8000000000000000));
+                let alo = (a.lo + m.select(swap, t.PIO2_LO, 0.0)) + m.flip(f.lo, swap & 0x8000000000000000);
+                let nx = @as(u64, 0) -% (bx >> 63);
+                let b = m.fast_two_sum(m.select(nx, t.PI_HI, 0.0), m.flip(a.hi, nx & 0x8000000000000000));
+                let blo = (b.lo + m.select(nx, t.PI_LO, 0.0)) + m.flip(alo, nx & 0x8000000000000000);
+                let e = (f.e + (@abs(a.hi) * 9.860761315262648e-32)) + (@abs(b.hi) * 9.860761315262648e-32);
+                if m.rounds(b.hi, blo, e) {
+                    return @copysign(b.hi + blo, y);
+                }
+            }
+            r = atan_pos(q, ql);
+            if fy > fx {
+                r = m.dd_add(m.dd(t.PIO2_HI, t.PIO2_LO), m.dd_neg(r));
+            }
+            if neg_x {
+                r = m.dd_add(m.dd(t.PI_HI, t.PI_LO), m.dd_neg(r));
+            }
+        }
+    }
+    let v = m.dd_round(r);
+    if neg_y {
+        return -v;
+    }
+    return v;
+}

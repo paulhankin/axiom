@@ -1,7 +1,7 @@
 /* flags: --c-std=c11 */
 /* The pragmas, in every mode: once, push_macro and pop_macro, message,
-   pack (its forms), weak, STDC (FENV_ACCESS ON is warned about: not
-   honoured), GCC diagnostic, visibility, system_header (no effect in the
+   pack (its forms), weak, STDC (FENV_ROUND FE_TONEARESTFROMZERO is warned
+   about: no target has that direction), GCC diagnostic, visibility, system_header (no effect in the
    main file), and _Pragma; unknown ones are ignored. */
 /* expect-warning: C4110 */
 /* expect-warning: C4113 */
@@ -35,6 +35,8 @@ N
 #pragma STDC FP_CONTRACT OFF
 #pragma STDC CX_LIMITED_RANGE ON
 #pragma STDC FENV_ACCESS ON
+#pragma STDC FENV_ACCESS OFF
+#pragma STDC FENV_ROUND FE_TONEARESTFROMZERO
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #pragma GCC diagnostic pop

@@ -26,6 +26,7 @@ import "cgen_sjlj.ax" as sj;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "cgen_wint.ax" as cgw;
+import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
 import "csema_attr.ax" as catr;
 import "csema_gnu.ax" as cgn;
@@ -109,8 +110,11 @@ fn function_body(s: *mut cast.CSym) void {
         }
     }
     param_lengths(d);
+    // floating point under FENV_ACCESS ON or FENV_ROUND anywhere in it:
+    // strict for the whole function (the passes consult ir.Func's strict_fp)
+    f.strict_fp = d.fp_strict or cg.fenv_all;
     for x in d.body.items.items() {
-        stmt(x);
+        item(x);
     }
     if not cg.terminated() {
         // the end of the body: main returns 0 (5.1.2.2.3); the value of
@@ -160,6 +164,17 @@ fn param_lengths(d: *cast.Decl) void {
     }
 }
 
+// A block item, under its floating-point pragmas' state (cpragma.ax).
+fn item(s: *mut cast.Stmt) void {
+    if u.notnil(s) {
+        gx.fp_state = s.fp;
+        if cg.fenv_all {
+            gx.fp_state = gx.fp_state | cpg.FP_ACCESS;
+        }
+    }
+    stmt(s);
+}
+
 fn stmt(s: *mut cast.Stmt) void {
     if u.isnil(s) {
         return;
@@ -169,9 +184,11 @@ fn stmt(s: *mut cast.Stmt) void {
     if k == cast.StmtKind.COMPOUND {
         let d = gv.depth();
         let sc = cdbg.open_block(s.items.items());
+        let outer = gx.fp_state;
         for x in s.items.items() {
-            stmt(x);
+            item(x);
         }
+        gx.fp_state = outer;
         gv.leave(d);
         cdbg.close_scope(sc);
     } else if k == cast.StmtKind.DECL {
@@ -179,7 +196,7 @@ fn stmt(s: *mut cast.Stmt) void {
     } else if k == cast.StmtKind.EXPR {
         if u.notnil(s.e) {
             cg.continue_after();
-            _ = gx.rv(s.e);
+            _ = gx.full(s.e);
         }
     } else if k == cast.StmtKind.IF {
         if_stmt(s);
@@ -257,7 +274,7 @@ fn asm_stmt(a: *mut cast.Asm) void {
 // table's start; any other value is undefined (the switch's default).
 fn computed_goto(s: *mut cast.Stmt) void {
     cg.continue_after();
-    let p = gx.rv(s.e);
+    let p = gx.full(s.e);
     let f = cg.F.sym;
     let ls = css.addr_labels(f);
     let base = cg.label_table(f);
@@ -429,16 +446,16 @@ fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
             }
             _ = ir.memop(cg.B, ir.OP_MEMCPY, at, cg.string_addr(it.e), cg.usz(n * es));
         } else if cty.is_wide(t) {
-            gld.copy(at, gx.rv(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
+            gld.copy(at, gx.full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_wint(t) and u.isnil(it.bits) {
-            cgw.copy(t, at, gx.rv(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
+            cgw.copy(t, at, gx.full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_record(t) {
-            gx.copy(t, at, gx.rv(it.e));
+            gx.copy(t, at, gx.full(it.e));
         } else if u.notnil(it.bits) {
-            _ = cgb.store(it.bits, cty.qualify(t, vol), gx.rv(it.e), at);
+            _ = cgb.store(it.bits, cty.qualify(t, vol), gx.full(it.e), at);
         } else {
             // (a volatile object's initialization is a volatile access too)
-            gx.store(cty.qualify(t, vol), gx.rv(it.e), at);
+            gx.store(cty.qualify(t, vol), gx.full(it.e), at);
         }
     }
 }
@@ -459,7 +476,7 @@ fn if_stmt(s: *mut cast.Stmt) void {
     if u.notnil(s.els) {
         no = cg.new_block("else");
     }
-    gx.branch(s.e, yes, no);
+    gx.branch_full(s.e, yes, no);
     cg.at_end(yes);
     stmt(s.body);
     cg.br(done);
@@ -477,7 +494,7 @@ fn while_stmt(s: *mut cast.Stmt) void {
     let done = cg.new_block("endwhile");
     cg.br(head);
     cg.at_end(head);
-    gx.branch(s.e, body, done);
+    gx.branch_full(s.e, body, done);
     cg.at_end(body);
     BD.jumps.push(Jump.{ brk: done, cont: head, brk_depth: gv.depth(), cont_depth: gv.depth() });
     stmt(s.body);
@@ -497,7 +514,7 @@ fn do_stmt(s: *mut cast.Stmt) void {
     _ = BD.jumps.pop();
     cg.br(cond);
     cg.at_end(cond);
-    gx.branch(s.e, body, done);
+    gx.branch_full(s.e, body, done);
     cg.at_end(done);
 }
 
@@ -508,7 +525,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
         decl(s.decl);
     } else if u.notnil(s.first) {
         cg.continue_after();
-        _ = gx.rv(s.first);
+        _ = gx.full(s.first);
     }
     let d1 = gv.depth();
     let head = cg.new_block("for");
@@ -524,7 +541,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
     cg.br(head);
     cg.at_end(head);
     if u.notnil(s.e) {
-        gx.branch(s.e, body, exit);
+        gx.branch_full(s.e, body, exit);
     } else {
         ir.br(cg.B, body);
     }
@@ -535,7 +552,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
     cg.br(step);
     cg.at_end(step);
     if u.notnil(s.step) {
-        _ = gx.rv(s.step);
+        _ = gx.full(s.step);
     }
     cg.br(head);
     if d1 > d0 {
@@ -549,7 +566,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
 
 fn switch_stmt(s: *mut cast.Stmt) void {
     cg.continue_after();
-    let v = gx.rv(s.e);
+    let v = gx.full(s.e);
     if cty.is_wint(s.e.ty) {
         wide_switch(s, v);
         return;
@@ -685,7 +702,7 @@ fn return_stmt(s: *mut cast.Stmt) void {
         gva.ret_default(F.sig.plan, F.sret);
         return;
     }
-    let mut v = gx.rv(s.e);
+    let mut v = gx.full(s.e);
     if cty.is_void(F.ret) {
         cleanups();
         ir.ret_void(cg.B);

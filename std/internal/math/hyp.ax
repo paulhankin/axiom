@@ -1,0 +1,247 @@
+// =============================================================================
+// std/internal/math/hyp.ax - sinh, cosh, tanh, asinh, acosh and atanh
+// (std/math's and the C library's: 7.12.5, F.10.2).
+//
+// From their definitions in exponentials and logarithms (Abramowitz and
+// Stegun 4.5, 4.6), each term a double-double from exp.ax's and
+// log.ax's kernels, so that nothing cancels at double precision, and a
+// minimax polynomial near 0 for sinh and tanh, whose exponential form
+// cancels there (cosh's two exponentials need only their parts in double:
+// within 2^-57). Rounded once: within about 0.52 ulp (cosh 0.57).
+// =============================================================================
+import "core.ax" as m;
+import "exp.ax" as ex;
+import "log.ax" as lg;
+import "tables.ax" as t;
+
+/// e^x as a double-double, |x| <= 22.
+fn exp_dd2(x: f64) m.DD {
+    let p = ex.parts(x, 0.0);
+    let sc = m.pow2(p.k);
+    return m.fast_two_sum(sc * p.s, sc * p.e);
+}
+
+/// sign(x) e^(|x| - ln 2) = sign(x) e^|x| / 2: sinh and cosh beyond 22.
+fn half_exp(x: f64, rep: m.Rep) f64 {
+    let a = @abs(x);
+    let r = ex.exp_dd(a - t.LN2_HI, -t.LN2_LO, rep);
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The hyperbolic sine.
+pub inline fn sinh(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax <= 0x3fd0000000000000 {
+        // |x| <= 1/4
+        if ax < 0x3e40000000000000 {
+            if (ax < 0x0010000000000000) and (ax != 0) {
+                m.raise_underflow(rep);
+            }
+            return x;  // |x| < 2^-27
+        }
+        let z = x * x;
+        let w = z * z;
+        let p = ((t.SINH_P0 + (z * t.SINH_P1)) + (w * (t.SINH_P2 + (z * t.SINH_P3)))) +
+                ((w * w) * (t.SINH_P4 + (z * t.SINH_P5)));
+        return x + ((x * z) * p);
+    }
+    if ax >= 0x4036000000000000 {
+        // |x| >= 22: e^-|x| is below an ulp
+        if ax >= 0x7ff0000000000000 {
+            return x + x;  // +-inf, NaN
+        }
+        return half_exp(x, rep);
+    }
+    // (e^|x| - e^-|x|) / 2
+    let e = exp_dd2(m.from_bits(ax));
+    let r = m.dd_round(m.dd_add(e, m.dd_neg(m.dd_recip(e)))) * 0.5;
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The hyperbolic cosine.
+pub inline fn cosh(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax < 0x3e40000000000000 {
+        return 1.0;  // |x| < 2^-27
+    }
+    if ax >= 0x4036000000000000 {
+        if ax >= 0x7ff0000000000000 {
+            return m.from_bits(ax) + m.from_bits(ax);  // +inf, NaN
+        }
+        return half_exp(m.from_bits(ax), rep);
+    }
+    // (e^|x| + e^-|x|)/2 from the two exponentials' parts (each within
+    // 2^-59.2 relative: the roundings of r, of 2^(j/128) p and of the low
+    // part), the larger and the sum's error exact, the low part rounded:
+    // within 2^-57 of the result, so within 0.57 ulp once rounded
+    let a = m.from_bits(ax);
+    let p1 = ex.parts(a, 0.0);
+    let p2 = ex.parts(-a, 0.0);
+    let sc1 = m.pow2(p1.k - 1);
+    let sc2 = m.pow2(p2.k - 1);
+    let b = m.fast_two_sum(sc1 * p1.s, sc2 * p2.s);
+    return b.hi + (b.lo + ((sc1 * p1.e) + (sc2 * p2.e)));
+}
+
+/// The hyperbolic tangent.
+pub inline fn tanh(x: f64, rep: m.Rep) f64 {
+    let ax = m.abits(x);
+    if ax <= 0x3fa0000000000000 {
+        // |x| <= 1/32
+        if ax < 0x3e30000000000000 {
+            if (ax < 0x0010000000000000) and (ax != 0) {
+                m.raise_underflow(rep);
+            }
+            return x;  // |x| < 2^-28
+        }
+        let z = x * x;
+        let p = t.TANH_P0 + (z * ((t.TANH_P1 + (z * t.TANH_P2)) + ((z * z) * (t.TANH_P3 + (z * t.TANH_P4)))));
+        return x + ((x * z) * p);
+    }
+    let mut r: f64 = 1.0;
+    if ax < 0x4036000000000000 {
+        // tanh|x| = em / (em + 2), em = e^(2|x|) - 1
+        let p = ex.parts(2.0 * m.from_bits(ax), 0.0);
+        let sc = m.pow2(p.k);
+        let a = m.two_sum(sc * p.s, -1.0);
+        let em = m.fast_two_sum(a.hi, a.lo + (sc * p.e));
+        r = m.dd_round(m.dd_div(em, m.dd_add_d(em, 2.0)));
+    } else if ax > 0x7ff0000000000000 {
+        return x + x;
+    }
+    // (|x| >= 22: 1, which is tanh|x| rounded)
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// log(a + sqrt(w)) for a >= 1/4 and a double-double w > 0 with sqrt(w)
+/// comparable to a, rounded once: with s = sqrt(w.hi), the argument is
+/// u + e + res/(2s) (u + e = s + a exactly, res = w - s^2 exactly enough),
+/// so the logarithm is log(u) + (2 s e + res)/(2 s u): one division, beside
+/// the logarithm's reduction.
+inline fn log_sum_sqrt(a: f64, w: m.DD) f64 {
+    let s = @sqrt(w.hi);
+    let p = m.two_sqr(s);
+    let res = ((w.hi - p.hi) - p.lo) + w.lo;
+    let u = m.two_sum(s, a);
+    let l = lg.log_fast(u.hi);
+    let s2 = 2.0 * s;
+    return l.hi + (l.lo + (((s2 * u.lo) + res) / (s2 * u.hi)));
+}
+
+/// The inverse hyperbolic sine.
+pub fn asinh(x: f64, rep: m.Rep) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax < 0x3e40000000000000 {
+        if (ax < 0x0010000000000000) and (ax != 0) {
+            m.raise_underflow(rep);
+        }
+        return x;  // |x| < 2^-27
+    }
+    if ax >= 0x7ff0000000000000 {
+        return x + x;
+    }
+    let a = m.from_bits(ax);
+    if a <= 0.25 {
+        // a + a z P(z) (ASINH_P, within 2^-53.9 of the tail, which is at
+        // most a/96)
+        let z = a * a;
+        let w = z * z;
+        let p =
+            (((t.ASINH_P0 + (z * t.ASINH_P1)) + (w * (t.ASINH_P2 + (z * t.ASINH_P3)))) +
+             ((w * w) * ((t.ASINH_P4 + (z * t.ASINH_P5)) + (w * (t.ASINH_P6 + (z * t.ASINH_P7)))))) +
+            (((w * w) * (w * w)) * t.ASINH_P8);
+        return @copysign(a + ((a * z) * p), x);
+    }
+    let mut r: f64 = 0.0;
+    if ax >= 0x41b0000000000000 {
+        // |x| >= 2^28: log(2|x|)
+        let l = lg.log_fast(a);
+        let b = m.fast_two_sum(l.hi, t.LN2_HI);
+        r = b.hi + ((b.lo + l.lo) + t.LN2_LO);
+    } else {
+        // log(u), u = |x| + sqrt(x^2 + 1) as a double-double: log(u.hi) +
+        // u.lo/u.hi, rounded once
+        r = log_sum_sqrt(a, m.dd_add_d(m.two_sqr(a), 1.0));
+    }
+    return @copysign(r, x);
+}
+
+/// The inverse hyperbolic cosine.
+pub fn acosh(x: f64, rep: m.Rep) f64 @multiversion("fma") {
+    let ix = m.bits(x);
+    if ((ix >> 63) != 0) or (ix <= 0x3ff0000000000000) {
+        if ix == 0x3ff0000000000000 {
+            return 0.0;
+        }
+        if (ix & 0x7fffffffffffffff) > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain(rep);  // x < 1
+    }
+    if ix >= 0x7ff0000000000000 {
+        return x + x;  // +inf, NaN
+    }
+    if ix >= 0x41b0000000000000 {
+        // x >= 2^28: log(2x)
+        let l = lg.log_fast(x);
+        let b = m.fast_two_sum(l.hi, t.LN2_HI);
+        return b.hi + ((b.lo + l.lo) + t.LN2_LO);
+    }
+    if x <= 2.0 {
+        // log1p(v), v = u + sqrt(2u + u^2) as a double-double, u = x - 1
+        // exactly: log1p(v.hi) + v.lo/(1 + v.hi), rounded once
+        let u = x - 1.0;
+        let q = m.dd_sqrt(m.dd_add_d(m.two_sqr(u), 2.0 * u));
+        let v = m.dd_add_d(q, u);
+        let l = lg.log1p_fast(v.hi);
+        return l.hi + (l.lo + (v.lo / (1.0 + v.hi)));
+    }
+    // log(x + sqrt(x^2 - 1)), the argument as a double-double
+    return log_sum_sqrt(x, m.dd_add_d(m.two_sqr(x), -1.0));
+}
+
+/// The inverse hyperbolic tangent.
+pub fn atanh(x: f64, rep: m.Rep) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax < 0x3e30000000000000 {
+        if (ax < 0x0010000000000000) and (ax != 0) {
+            m.raise_underflow(rep);
+        }
+        return x;  // |x| < 2^-28
+    }
+    if ax >= 0x3ff0000000000000 {
+        if ax == 0x3ff0000000000000 {
+            return m.pole(rep, x < 0.0);  // atanh(+-1) = +-inf
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain(rep);
+    }
+    let a = m.from_bits(ax);
+    if a <= 0.25 {
+        // a + a z P(z) (ATANH_P, within 2^-54 of the tail, which is at most
+        // a/48)
+        let z = a * a;
+        let w = z * z;
+        let p =
+            (((t.ATANH_P0 + (z * t.ATANH_P1)) + (w * (t.ATANH_P2 + (z * t.ATANH_P3)))) +
+             ((w * w) * ((t.ATANH_P4 + (z * t.ATANH_P5)) + (w * (t.ATANH_P6 + (z * t.ATANH_P7)))))) +
+            (((w * w) * (w * w)) * (t.ATANH_P8 + (z * t.ATANH_P9)));
+        return @copysign(a + ((a * z) * p), x);
+    }
+    // log1p(q)/2, q = 2|x| / (1 - |x|) as a double-double
+    let d = m.two_sum(1.0, -a);
+    let q = m.dd_div(m.dd(2.0 * a, 0.0), d);
+    let l = lg.log1p_fast(q.hi);
+    return @copysign(0.5 * (l.hi + (l.lo + (q.lo / (1.0 + q.hi)))), x);
+}

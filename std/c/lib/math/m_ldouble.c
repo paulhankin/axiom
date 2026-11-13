@@ -2,8 +2,8 @@
    but the exact ones of a wide long double: where long double is double
    (Windows, macOS, --c-long-double=64), the double functions; where it is
    wider, the elementary functions in its precision (std/c/rt/math_ld.ax),
-   but erfl, erfcl, lgammal, tgammal, sinpil and cospil, which compute in
-   double (their results have double's precision; docs/c.md). The exact
+   but erfl, erfcl, lgammal and tgammal, which compute in double (their
+   results have double's precision; docs/c.md); C23's are m_c23.c's. The exact
    functions of a wide long double are m_ldwide.c's. */
 #if __STDC_VERSION__ >= 199901L
 
@@ -121,10 +121,6 @@ double lgamma(double);
 long double lgammal(long double x) { return (long double)lgamma((double)x); }
 double tgamma(double);
 long double tgammal(long double x) { return (long double)tgamma((double)x); }
-double sinpi(double);
-long double sinpil(long double x) { return (long double)sinpi((double)x); }
-double cospi(double);
-long double cospil(long double x) { return (long double)cospi((double)x); }
 
 #else
 typedef int __axc_ldouble_c89;

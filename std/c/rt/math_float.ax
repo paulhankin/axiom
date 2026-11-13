@@ -1,43 +1,19 @@
 // =============================================================================
 // std/c/rt/math_float.ax - the float forms of <math.h>'s functions (C17
-// 7.12). expf, logf, powf, sinf and cosf have kernels of their own, in
-// double arithmetic to about 2^-36 relative (polynomials of lower degree than
-// double's, and the double functions' tables); the others compute the double
-// function of their argument (exactly converted). Either way the double
-// result is within 2^-36 of the value, a 2^-12th of an ulp of float, and is
-// rounded once to float: the result is within 0.5 + 2^-12 ulp of float
-// (correctly rounded but in the rare cases where the double is that close to
-// a halfway point); overflow and underflow of float are range errors there
-// (math.ax: to_f32). The exact operations are exact either way (and +, sqrt,
-// fma-free ones correctly rounded: double has more than 2 x 24 + 2 bits).
-// nextafterf, the fma and the functions with int arguments are their own
-// (math_exact.ax, and the C wrappers of std/c/lib/math/).
+// 7.12): the elementary ones are std/internal/math/float.ax's kernels, with
+// the library's errors (math.ax); the exact operations compute the double
+// function of their argument (exactly converted), which is exact (and +,
+// sqrt, fma-free ones correctly rounded: double has more than 2 x 24 + 2
+// bits). nextafterf, the fma and the functions with int arguments are their
+// own (math_exact.ax, and the C wrappers of std/c/lib/math/).
 // =============================================================================
-import "math.ax" as m;
-import "math_tables.ax" as t;
-import "math_trig.ax" as tr;
+import "../../internal/math/float.ax" as k;
+import "math.ax" as c;
 
 // the double functions (this library's, the C units' names for them)
 extern "C" {
-    fn acos(x: f64) f64;
-    fn acosh(x: f64) f64;
-    fn asin(x: f64) f64;
-    fn asinh(x: f64) f64;
-    fn atan(x: f64) f64;
-    fn atan2(x: f64, y: f64) f64;
-    fn atanh(x: f64) f64;
-    fn cbrt(x: f64) f64;
     fn ceil(x: f64) f64;
     fn copysign(x: f64, y: f64) f64;
-    fn cos(x: f64) f64;
-    fn cosh(x: f64) f64;
-    fn cospi(x: f64) f64;
-    fn erf(x: f64) f64;
-    fn erfc(x: f64) f64;
-    fn exp(x: f64) f64;
-    fn exp10(x: f64) f64;
-    fn exp2(x: f64) f64;
-    fn expm1(x: f64) f64;
     fn fabs(x: f64) f64;
     fn fdim(x: f64, y: f64) f64;
     fn floor(x: f64) f64;
@@ -52,25 +28,12 @@ extern "C" {
     fn fminimum_mag_num(x: f64, y: f64) f64;
     fn fminimum_num(x: f64, y: f64) f64;
     fn fmod(x: f64, y: f64) f64;
-    fn hypot(x: f64, y: f64) f64;
-    fn lgamma(x: f64) f64;
-    fn log(x: f64) f64;
-    fn log10(x: f64) f64;
-    fn log1p(x: f64) f64;
-    fn log2(x: f64) f64;
     fn logb(x: f64) f64;
     fn modf(x: f64, ip: *mut f64) f64;
-    fn pow(x: f64, y: f64) f64;
     fn remainder(x: f64, y: f64) f64;
     fn rint(x: f64) f64;
     fn round(x: f64) f64;
     fn roundeven(x: f64) f64;
-    fn sin(x: f64) f64;
-    fn sinh(x: f64) f64;
-    fn sinpi(x: f64) f64;
-    fn tan(x: f64) f64;
-    fn tanh(x: f64) f64;
-    fn tgamma(x: f64) f64;
     fn trunc(x: f64) f64;
 }
 
@@ -78,259 +41,116 @@ inline fn d(x: f32) f64 {
     return @float_cast(f64, x);
 }
 
-// -----------------------------------------------------------------------------
-// The kernels
-// -----------------------------------------------------------------------------
-
-const SHIFT: f64 = 6755399441055744.0;  // 1.5 2^52: adding it rounds to an integer
-
-/// e^x for |x| < 1000 (the double's exponent range is not left): x =
-/// (128 k + j) ln2/128 + r (math_exp.ax's reduction, k and j from a shifter,
-/// so that in a directed rounding mode |r| is within ln2/128 and the
-/// polynomial still within 2^-34), e^x = 2^k 2^(j/128) e^r.
-inline fn exp_k(x: f64) f64 {
-    let kd0 = (x * t.EXP_INVLN2N) + SHIFT;
-    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
-    let kd = kd0 - SHIFT;
-    let r = (x - (kd * t.EXP_LN2N_HI)) - (kd * t.EXP_LN2N_LO);
-    let th = m.from_bits(t.EXP_T[@as(usize, @bit_cast(u32, n & 127)) * 2]);
-    let p = 1.0 + (r + ((r * r) * (t.EXPF_P0 + (r * t.EXPF_P1))));
-    return m.from_bits(m.bits(th * p) +% (@bit_cast(u64, @as(i64, n >> 7)) << 52));
-}
-
-/// 2^e for |e| < 1000, as exp_k: e = (128 k + j)/128 + f (f exact), r = f ln2.
-inline fn exp2_k(e: f64) f64 {
-    let kd0 = (e * 128.0) + SHIFT;
-    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
-    let r = (e - ((kd0 - SHIFT) * 0.0078125)) * (t.LN2_HI + t.LN2_LO);
-    let th = m.from_bits(t.EXP_T[@as(usize, @bit_cast(u32, n & 127)) * 2]);
-    let p = 1.0 + (r + ((r * r) * (t.EXPF_P0 + (r * t.EXPF_P1))));
-    return m.from_bits(m.bits(th * p) +% (@bit_cast(u64, @as(i64, n >> 7)) << 52));
-}
-
-/// log x for a positive normal double x of 24 significant bits (a float):
-/// x = 2^k m, m c = 1 + r exactly (math_log.ax's table: m has 24 bits and c
-/// 10), log x = k ln2 - log c + log1p(r).
-struct LogF {
-    k: f64,
-    i: usize,
-    r: f64,
-}
-
-inline fn log_red(ix: u64) LogF {
-    let tmp = ix -% t.LOG_OFF;
-    let i = @as(usize, @truncate(u8, (tmp >> 45) & 127));
-    let k = @bit_cast(i64, tmp) >> 52;
-    let mm = m.from_bits(ix -% (tmp & 0xfff0000000000000));
-    let r = (mm * m.from_bits(t.LOG_C[i])) - 1.0;
-    return LogF.{ k: @float_from_int(f64, k), i: i, r: r };
-}
-
-/// log1p(r) for the reduction's r.
-inline fn log1p_k(r: f64) f64 {
-    let z = r * r;
-    return r + (z * ((t.LOGF_P0 + (r * t.LOGF_P1)) + (z * (t.LOGF_P2 + (r * t.LOGF_P3)))));
-}
-
-/// sin r and cos r for |r| <= pi/4 (+ a little).
-inline fn sin_k(r: f64) f64 {
-    let z = r * r;
-    return r + ((r * z) * ((t.SINF_P0 + (z * t.SINF_P1)) + ((z * z) * (t.SINF_P2 + (z * t.SINF_P3)))));
-}
-
-inline fn cos_k(r: f64) f64 {
-    let z = r * r;
-    let w = z * z;
-    return 1.0 + (z * (((t.COSF_P0 + (z * t.COSF_P1)) + (w * (t.COSF_P2 + (z * t.COSF_P3)))) + ((w * w) * t.COSF_P4)));
-}
-
-/// sin x (cos x: q = 1) for finite x beyond pi/4: x = n pi/2 + r (the double
-/// reduction), and the kernel of the quadrant, chosen without a branch (the
-/// quadrants are unpredictable; both kernels are short).
-inline fn sincos_red(x: f64, q: i32) f64 {
-    let mut r: f64 = 0.0;
-    let mut n: i32 = 0;
-    if m.abits(x) < 0x413921fb54442d18 {
-        // |x| < 2^20 pi/2: x - n PIO2_1 and n PIO2_2 are exact, and the
-        // two subtractions that follow each round once, to 2^-52 relative
-        // (for a float x, |r| is above 2^-28)
-        n = @int_from_float(i32, (x * t.INVPIO2) + @copysign(0.5, x));
-        let fnv = @float_from_int(f64, n);
-        r = ((x - (fnv * t.PIO2_1)) - (fnv * t.PIO2_2)) - (fnv * t.PIO2_3);
-    } else {
-        let rd = tr.reduce(x);
-        r = rd.hi + rd.lo;
-        n = rd.n;
-    }
-    n = (n + q) & 3;
-    if n == 0 {
-        return sin_k(r);
-    }
-    if n == 1 {
-        return cos_k(r);
-    }
-    if n == 2 {
-        return -sin_k(r);
-    }
-    return -cos_k(r);
-}
-
 export fn expf(x: f32) f32 {
-    let xd = d(x);
-    if @abs(xd) < 87.0 {
-        return @float_cast(f32, exp_k(xd));  // (normal: e^87 < 2^126)
-    }
-    return m.to_f32(exp(xd));  // overflow, underflow, inf, NaN
+    return k.expf(x, c.rep());
 }
 
 export fn exp2f(x: f32) f32 {
-    return m.to_f32(exp2(d(x)));
+    return k.exp2f(x, c.rep());
 }
 
 export fn expm1f(x: f32) f32 {
-    return m.to_f32(expm1(d(x)));
+    return k.expm1f(x, c.rep());
 }
 
 export fn exp10f(x: f32) f32 {
-    return m.to_f32(exp10(d(x)));
+    return k.exp10f(x, c.rep());
 }
 
 export fn logf(x: f32) f32 {
-    let xd = d(x);
-    let ix = m.bits(xd);
-    if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
-        return m.to_f32(log(xd));  // not positive and finite
-    }
-    let rd = log_red(ix);
-    // (k ln2 - log c in double: 2^-52 relative at worst)
-    let a = (rd.k * t.LN2_HI) + m.from_bits(t.LOG_L[2 * rd.i]);
-    return @float_cast(f32, a + ((rd.k * t.LN2_LO) + log1p_k(rd.r)));
+    return k.logf(x, c.rep());
 }
 
 export fn log2f(x: f32) f32 {
-    return m.to_f32(log2(d(x)));
+    return k.log2f(x, c.rep());
 }
 
 export fn log10f(x: f32) f32 {
-    return m.to_f32(log10(d(x)));
+    return k.log10f(x, c.rep());
 }
 
 export fn log1pf(x: f32) f32 {
-    return m.to_f32(log1p(d(x)));
+    return k.log1pf(x, c.rep());
 }
 
 export fn sinf(x: f32) f32 {
-    let xd = d(x);
-    let ax = m.abits(xd);
-    if ax <= 0x3fe921fb54442d18 {
-        return m.to_f32(sin_k(xd));  // |x| <= pi/4 (to_f32: a subnormal x)
-    }
-    if ax >= 0x7ff0000000000000 {
-        return m.to_f32(sin(xd));  // inf, NaN
-    }
-    return @float_cast(f32, sincos_red(xd, 0));
+    return k.sinf(x, c.rep());
 }
 
 export fn cosf(x: f32) f32 {
-    let xd = d(x);
-    let ax = m.abits(xd);
-    if ax <= 0x3fe921fb54442d18 {
-        return @float_cast(f32, cos_k(xd));
-    }
-    if ax >= 0x7ff0000000000000 {
-        return m.to_f32(cos(xd));
-    }
-    return @float_cast(f32, sincos_red(xd, 1));
+    return k.cosf(x, c.rep());
 }
 
 export fn tanf(x: f32) f32 {
-    return m.to_f32(tan(d(x)));
+    return k.tanf(x, c.rep());
 }
 
 export fn asinf(x: f32) f32 {
-    return m.to_f32(asin(d(x)));
+    return k.asinf(x, c.rep());
 }
 
 export fn acosf(x: f32) f32 {
-    return m.to_f32(acos(d(x)));
+    return k.acosf(x, c.rep());
 }
 
 export fn atanf(x: f32) f32 {
-    return m.to_f32(atan(d(x)));
+    return k.atanf(x, c.rep());
 }
 
 export fn sinhf(x: f32) f32 {
-    return m.to_f32(sinh(d(x)));
+    return k.sinhf(x, c.rep());
 }
 
 export fn coshf(x: f32) f32 {
-    return m.to_f32(cosh(d(x)));
+    return k.coshf(x, c.rep());
 }
 
 export fn tanhf(x: f32) f32 {
-    return m.to_f32(tanh(d(x)));
+    return k.tanhf(x, c.rep());
 }
 
 export fn asinhf(x: f32) f32 {
-    return m.to_f32(asinh(d(x)));
+    return k.asinhf(x, c.rep());
 }
 
 export fn acoshf(x: f32) f32 {
-    return m.to_f32(acosh(d(x)));
+    return k.acoshf(x, c.rep());
 }
 
 export fn atanhf(x: f32) f32 {
-    return m.to_f32(atanh(d(x)));
+    return k.atanhf(x, c.rep());
 }
 
 export fn cbrtf(x: f32) f32 {
-    return m.to_f32(cbrt(d(x)));
+    return k.cbrtf(x, c.rep());
 }
 
 export fn erff(x: f32) f32 {
-    return m.to_f32(erf(d(x)));
+    return k.erff(x, c.rep());
 }
 
 export fn erfcf(x: f32) f32 {
-    return m.to_f32(erfc(d(x)));
+    return k.erfcf(x, c.rep());
 }
 
 export fn lgammaf(x: f32) f32 {
-    return m.to_f32(lgamma(d(x)));
+    return k.lgammaf(x, c.rep());
 }
 
 export fn tgammaf(x: f32) f32 {
-    return m.to_f32(tgamma(d(x)));
+    return k.tgammaf(x, c.rep());
 }
 
 export fn powf(x: f32, y: f32) f32 {
-    let xd = d(x);
-    let yd = d(y);
-    let ix = m.bits(xd);
-    if ((ix -% 0x0010000000000000) >= 0x7fe0000000000000) or (m.abits(yd) >= 0x7ff0000000000000) or (yd == 0.0) or
-       (xd == 1.0) {
-        return m.to_f32(pow(xd, yd));  // x <= 0, x or y not finite, the exact cases
-    }
-    // x^y = 2^(y log2 x): log2 x within 2^-44 relative (its parts as for
-    // logf, with math_log.ax's -log2 c), so y log2 x within 2^-36.5 where the
-    // result is in float's range (and to_f32 overflows or underflows just
-    // beyond it); further out, the double function
-    let rd = log_red(ix);
-    let l = (rd.k + m.from_bits(t.LOG2_L[2 * rd.i])) +
-            (m.from_bits(t.LOG2_L[(2 * rd.i) + 1]) + (log1p_k(rd.r) * t.INVLN2_HI));
-    let e = yd * l;
-    if @abs(e) < 160.0 {
-        return m.to_f32(exp2_k(e));
-    }
-    return m.to_f32(pow(xd, yd));
+    return k.powf(x, y, c.rep());
 }
 
 export fn atan2f(x: f32, y: f32) f32 {
-    return m.to_f32(atan2(d(x), d(y)));
+    return k.atan2f(x, y, c.rep());
 }
 
 export fn hypotf(x: f32, y: f32) f32 {
-    return m.to_f32(hypot(d(x), d(y)));
+    return k.hypotf(x, y, c.rep());
 }
 
 export fn ceilf(x: f32) f32 {
@@ -422,16 +242,16 @@ export fn fminimum_mag_numf(x: f32, y: f32) f32 {
 }
 
 export fn sinpif(x: f32) f32 {
-    return m.to_f32(sinpi(d(x)));
+    return k.sinpif(x, c.rep());
 }
 
 export fn cospif(x: f32) f32 {
-    return m.to_f32(cospi(d(x)));
+    return k.cospif(x, c.rep());
 }
 
 export fn sqrtf(x: f32) f32 {
     if x < 0.0 {
-        return @float_cast(f32, m.domain());
+        return @float_cast(f32, c.domain());
     }
     return @sqrt(x);
 }

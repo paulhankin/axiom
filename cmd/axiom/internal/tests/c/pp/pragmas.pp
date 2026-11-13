@@ -8,6 +8,8 @@ N
 #pragma pack()
 #pragma pack(8)
 #pragma pack()
+#pragma STDC FENV_ACCESS ON
+#pragma STDC FENV_ACCESS OFF
 #pragma GCC visibility push(hidden)
 #pragma GCC visibility pop
 after

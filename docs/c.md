@@ -515,30 +515,45 @@ status 3 if it still lives.
 
 ## `<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions
 
-The library's mathematics (C17 7.12, 7.6, 7.25, 7.3.5-7.3.9, and the C23 functions listed
-below) are its own: written from the standard and the published methods each source file
+The library's mathematics (C17 7.12, 7.6, 7.25, 7.3.5-7.3.9, and C23's additions to
+them) are its own: written from the standard and the published methods each source file
 cites, with polynomial coefficients and tables computed by
-`cmd/internal/tools/gen_math_tables.py` (in arbitrary precision; `std/c/rt/math_tables.ax`).
-The double and float functions are Axiom (`std/c/rt/math*.ax`); those that take or return
-`int` or `long`, the `long double` forms, `<fenv.h>` and the complex functions are C
-(`std/c/lib/math/`).
+`cmd/internal/tools/gen_math_tables.py` (in arbitrary precision; `std/internal/math/tables.ax`).
+The elementary double and float functions are kernels shared with Axiom's `std/math`
+(`std/internal/math/`), which report their errors through the library's wrappers
+(`std/c/rt/math*.ax`); C23's that compute are `std/c/rt/math_c23.ax`, its narrowing
+operations `math_narrow.ax`; those that take or return `int` or `long`, the bit-level ones
+(payloads, total order, `fromfp`), the `long double` forms, `<fenv.h>` and the complex
+functions are C (`std/c/lib/math/`).
 
 - **Accuracy.** `sqrt`, `fma`, the rounding functions, `fmod`, `remainder`, `remquo`,
   `ldexp`/`scalbn`, `frexp`, `nextafter` and the other exact ones are exact or correctly
   rounded, in every rounding mode. The elementary functions are within 1 ulp over their
   whole domains (the table below). Trigonometric arguments are reduced
   exactly (Payne and Hanek's method beyond 2^20 pi/2), so `sin(1e300)` is accurate. The
-  float functions compute in double (`expf`, `logf`, `powf`, `sinf` and `cosf` with
-  kernels of their own, to about 2^-36) and round once (within 0.5 + 2^-12 ulp). Errors
-  are measured against mpmath on a million random and boundary arguments per function.
-- **Speed.** Where an estimate in plain double has a bound on its error that decides the
-  rounding, the double-double form is not computed (Ziv's strategy: `atan`, `atan2`,
-  `log2`, `log1p`); `tan` divides once from a table of tan(j/256), `cosh` adds two
-  exponentials' parts, the float kernels are short polynomials. Against the x86-64 Linux
-  system C library (`-O2`, one core, the time of a call on a stream of
-  arguments): `exp`, `expm1`, `sinh` and `tanh` are faster; `sin`, `cos`, `tan`,
-  `atan`, `atan2`, `log1p`, `log10`, `cosh`, `cbrt`, `pow`, `expf`, `logf` and `powf`
-  take up to 2 times as long; `log`, `log2`, `asin`, `acos` and `sinf` 2 to 2.6 times.
+  float functions compute in double, most with kernels of their own (short polynomials
+  to about 2^-37: `expf`, `exp2f`, `exp10f`, `expm1f`, `logf`, `log2f`, `log10f`,
+  `log1pf`, `sinf`, `cosf`, `tanf`, `asinf`, `acosf`, `atanf`, `atan2f`, the hyperbolic
+  ones, `cbrtf`, `hypotf`, `erff`, `erfcf`, `powf`), the others with the double
+  function, and round once (within 0.5 + 2^-12 ulp; measured 0.500 for each). Errors
+  are measured against an arbitrary-precision reference on 200000 random and boundary
+  arguments per function.
+- **Speed.** The kernels compute in plain double where the error bound allows
+  (`log2`, `log10` and `log1p` from log's table, `log10` with a table of its own, `asin`
+  and `acos` with their tails in double, `cbrt` from a polynomial and one division, the
+  inverse hyperbolic functions from double-double arguments with one division, `erf`,
+  `erfc` and the gamma pieces by Estrin's scheme with the first terms compensated), and
+  in double-double only where cancellation needs it (Ziv's strategy in `atan` and
+  `atan2`). Against the x86-64 Linux system C library (`-O2`, one core, the time of a
+  call on a stream of arguments, measured on a loaded machine: CPU time, best of five):
+  most functions take 0.5 to 1.5 times as long, `log`, `log2`, `pow`, `atan2`, `cosh`,
+  `exp10`, `powf`, `exp2f` and `sinf` 1.5 to 2 times, `tan` and `hypot` about 2 times,
+  and `erf`, `erfc`, `lgamma`, `lgammaf` and `erfcf` (near 0 and beyond 10) 2.2 to 3.7
+  times (not yet tuned). `std/math` has the same kernels: against its former functions,
+  most are as fast or faster (the error and gamma functions, `exp2`, `pow`, `hypot`,
+  `tanh` and the float ones several times), `log10` and `sin` within 10%, and `atan`,
+  `cbrt`, `tan`, `sinh`, `lgamma` and `atan2` 1.3 to 2 times slower (their former
+  versions were less accurate: up to 2 ulps for `tan` and `sinh`).
 - **The complex functions** follow Annex G's special values (G.6) and Kahan's methods;
   each part is within a few ulps (measured: `clog` 0.5; `cexp`, `csqrt`, `csin`, `ccos`,
   `csinh`, `ccosh` 1.9; `casin`, `cacos`, `catan`, `casinh`, `cacosh`, `catanh` 3.8; `ctan`,
@@ -578,23 +593,32 @@ The double and float functions are Axiom (`std/c/rt/math*.ax`); those that take 
 - **`nan("n-char-sequence")`** reads the sequence as an unsigned integer (decimal, `0x`
   hexadecimal or `0` octal) and puts its low bits (51, or 22 for `nanf`) in the payload;
   any other sequence gives the payload 0.
-- **C23 functions** provided: `exp10`, `roundeven`, `nextup`, `nextdown`, `sinpi`, `cospi`,
-  `fmaximum`, `fminimum`, `fmaximum_mag`, `fminimum_mag`, `fmaximum_num`, `fminimum_num`,
-  `fmaximum_mag_num`, `fminimum_mag_num` (each in three types); `issubnormal`, `iszero`,
-  `issignaling`, `iscanonical`; `<fenv.h>`'s `fegetmode`, `fesetmode`, `fesetexcept`,
-  `fetestexceptflag`. Not provided (and not declared): the other C23 additions (`exp2m1`,
-  `log2p1`, `rootn`, `pown`, `compoundn`, `fromfp`, the narrowing `fadd`... functions,
-  `getpayload`, `totalorder`, `iseqsig`, ...).
+- **C23 functions**: all of 7.12's, each in three types: `exp10`, `exp2m1`, `exp10m1`,
+  `log2p1`, `log10p1`, `logp1`, `rootn`, `pown`, `powr`, `compoundn`, `rsqrt`, `sinpi`,
+  `cospi`, `tanpi`, `asinpi`, `acospi`, `atanpi`, `atan2pi` (within about 0.52 ulp, the
+  arguments of their exponentials and logarithms as double-doubles; `long double`'s in
+  its precision), `roundeven`, `nextup`, `nextdown`, `llogb`, `fromfp`, `ufromfp`,
+  `fromfpx`, `ufromfpx`, the `fmaximum` family, the narrowing operations (`fadd`, `fsub`,
+  `fmul`, `fdiv`, `ffma`, `fsqrt` of doubles and of long doubles to float, `daddl` ... to
+  double: exact in 512-bit integer arithmetic and rounded once in the current direction,
+  tininess after rounding), `getpayload`, `setpayload`, `setpayloadsig` (the payload is
+  the fraction below the quiet bit, as `nan` writes it), `totalorder`, `totalordermag`
+  (on the encodings), `canonicalize` (the x87's pseudo-denormals made canonical; its
+  invalid encodings give a nonzero result), and the macros `iseqsig` (a domain error and
+  "invalid" for a NaN), `issubnormal`, `iszero`, `issignaling`, `iscanonical`,
+  `FP_INT_UPWARD` ... `FP_INT_TONEAREST`, `FP_LLOGB0`, `FP_LLOGBNAN`. `FP_FAST_FMA` and the
+  other `FP_FAST_` macros are not defined: each of those operations is a call of the
+  library's function, slower than the operations it fuses. `<fenv.h>`'s `fegetmode`,
+  `fesetmode`, `fesetexcept`, `fetestexceptflag`.
 
 | Largest error measured (ulps) | |
 |---|---|
-| `log`, `log2`, `log10`, `log1p`, `cbrt`, `atan`, `atan2`, `tan`, `asinh`, `acosh`, `atanh` | 0.501 |
-| `exp`, `exp2`, `exp10`, `pow`, `cosh`, `sinh`, `tanh` | 0.51 |
-| `tgamma`, `hypot`, `erfc`, `acos`, `asin`, `expm1` | 0.52-0.56 (`cosh` is bounded by 0.57) |
-| `cos`, `sin` | 0.58 |
-| `erf` | 0.62 (0.54 for normal results) |
-| `lgamma` | 0.73 |
-| every float function | 0.501 |
+| `log`, `log2`, `log10`, `atan2`, `acosh`, `tan`, `atan`, `pow`, `hypot` | 0.50-0.51 |
+| `exp`, `exp2`, `exp10`, `log1p`, `cosh`, `sinh`, `tanh`, `asinh`, `tgamma`, `cbrt`, the C23 functions | 0.51-0.53 |
+| `atanh`, `erfc`, `expm1` | 0.54-0.56 |
+| `acos`, `asin` | 0.65-0.66 |
+| `lgamma`, `sin`, `cos`, `erf` | 0.69-0.77 |
+| every float function | 0.500 |
 
 The results are the same bits on every target (the error-free transformations the
 functions use give the same bits with and without fused multiply-add).
@@ -612,18 +636,43 @@ other modes are not done in software: the program's own arithmetic would need it
 look at the mode, a cost to all code), and a `fesetround` that succeeded while `a + b`
 still rounded to nearest would mislead the programs that use it (7.6.4.3 lets it fail).
 
-What the compiler assumes: **the default environment.** `#pragma STDC FENV_ACCESS` is
-accepted and has no effect. The optimizer folds floating-point constant expressions as
-rounding to nearest with no flags raised (a folded `1.0 / 0.0` raises nothing at run
-time), and treats floating-point arithmetic as having no side effects: it may evaluate
-an operation whose result is not used never, move an operation across a call of a
-`<fenv.h>` function, or compute an expression once for two rounding modes. A program
-that changes the rounding mode or tests flags gets what it expects for operations on
-values the compiler cannot see (read through `volatile` objects or from outside) at
-`-O0`, and should not rely on the order of operations around the `<fenv.h>` calls at
-`-O2`. The library's functions raise their exceptions through the environment itself,
-not by arithmetic the optimizer could fold, and honor the rounding mode where the
-standard asks (`rint`, `lrint`, `nearbyint`, `sqrt`, `fma`, `scalbn` round in it).
+**`#pragma STDC FENV_ACCESS ON`** (7.6.1), and `--c-fenv-access` for every function, is
+honoured. A function with floating operations in its scope (anywhere in its body) has
+strict floating point (the IR function's `strict_fp`, which the passes consult): its
+floating operations (arithmetic, comparisons, conversions, sqrt and fma) are not folded
+(`opt.ax`, `combine.ax`), merged (`gvn.ax`), moved out of loops (its LICM), sunk to their
+uses or fused into a later branch across a call (`gvn.ax`, `x64.ax`, `a64.ax`), packed
+into vectors (`slp.ax`), interleaved with other iterations (`unroll.ax`'s jamming) or
+removed when their results are unused (`ir.has_effects`, and the AArch64 backend's own
+dead code removal); a function inlined into another makes that one strict, and outlined
+code stays strict (`inline.ax`, `outline.ax`; `divconst.ax` turns only integer divisions
+into multiplications). In the C front end, an operation on floating values in the
+pragma's scope is done at run time though its operands are constants (F.8.4, F.8.5:
+automatic objects' initializers too; static ones are still folded at translation time).
+Outside its scope, and without the option, the optimizer assumes the default environment
+as before: it folds constants as rounding to nearest with no flags, and may move or drop
+floating operations. The relational operators `<`, `<=`, `>` and `>=` signal "invalid"
+for a NaN operand (F.9.3; `comisd`, `fcmpe`), the macros `isless` ... do not.
+
+**`#pragma STDC FENV_ROUND direction`** (C23 7.6.2) sets the static rounding direction
+of its scope: each full expression in it (a statement's expression, a condition, an
+initializer) is evaluated with the direction set in the environment's rounding bits and
+the dynamic mode's restored after it (the flags it raised kept); a call in it of a
+function that 7.6.2p4's table does not list (other than `<math.h>`'s and the
+conversions of `<stdlib.h>`, `<stdio.h>` and `<wchar.h>`) runs in the dynamic mode, which
+is read again after the call. `FE_DYNAMIC` is the dynamic mode; `FE_TONEARESTFROMZERO`
+is `C4113` (no target has it), and so is any directed rounding on WebAssembly. Not done:
+the translation-time evaluation of floating constants and of static initializers in the
+static direction (they are rounded to nearest).
+
+**FP_CONTRACT**: no floating expression is ever contracted (an FMA is only made where the
+program calls `fma`), so the default is OFF, and both `#pragma STDC FP_CONTRACT ON` and
+`OFF` hold: results are the same bits at every optimization level and on every target.
+
+The library's functions raise their exceptions through the environment itself, not by
+arithmetic the optimizer could fold, and honor the rounding mode where the standard asks
+(`rint`, `lrint`, `nearbyint`, `sqrt`, `fma`, `scalbn` and the narrowing operations round
+in it).
 
 ## Standards
 
@@ -844,8 +893,17 @@ as the standard says.
 
 - `_Imaginary` (the imaginary types, which are optional), decimal floating types and
   constants: each is `C3901` (a decimal constant is `C1019`).
-- Annex F, which the library's `<math.h>` and `<fenv.h>` do not claim (they follow it
-  where the section on them says). Annex K is not provided (`__STDC_LIB_EXT1__` is not
+- Annex F and Annex G: `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`,
+  `__STDC_IEC_559_COMPLEX__` and `__STDC_IEC_60559_COMPLEX__` are not defined on any
+  target. What keeps them off: a `long double` wider than `double` (x86-64 Linux, AArch64
+  Linux) has software arithmetic that rounds to nearest only and raises no exception
+  flags (F.3, F.8); `FENV_ROUND`'s static direction does not apply to floating constants
+  and static initializers (F.8.2, 7.6.2); WebAssembly has no floating-point environment;
+  `erfl`, `erfcl`, `lgammal` and `tgammal` of a wide `long double` compute in double;
+  there are no imaginary types (Annex G). The rest is Annex F's: IEC 60559 formats for
+  float and double, the operations correctly rounded in the dynamic mode, the
+  exceptions, `FENV_ACCESS`, signaling relational operators, the functions' special
+  values (F.10) and `math_errhandling` with `MATH_ERREXCEPT` on x86-64 and AArch64. Annex K is not provided (`__STDC_LIB_EXT1__` is not
   defined).
 - `setjmp` on WebAssembly without its exception-handling extension (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).

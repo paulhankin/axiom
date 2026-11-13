@@ -277,7 +277,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4110` | `#pragma message`; the message is its text. |
 | `C4111` | An unknown pragma (only with `--c-warn-unknown-pragmas`); it is ignored. |
 | `C4112` | A known pragma that is malformed (`#pragma pack(3)`, ...); it is ignored. |
-| `C4113` | A pragma that is not honoured: `#pragma STDC FENV_ACCESS ON`, `FENV_ROUND` of a direction other than to nearest. |
+| `C4113` | A pragma that is not honoured: `#pragma STDC FENV_ROUND FE_TONEARESTFROMZERO` (no target has the direction), and `FENV_ROUND` of a directed rounding on WebAssembly (which rounds to nearest only). |
 | `C4114` | `#pragma pack(show)`: the value in force. |
 | `C4120` | An empty case range (`case 5 ... 3:`); it matches nothing. |
 | `C4121` | A null pointer constant passed for a parameter declared `nonnull`. |

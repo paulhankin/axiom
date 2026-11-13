@@ -1,0 +1,324 @@
+// =============================================================================
+// std/internal/math/core.ax - what the elementary functions of std/math and
+// of the C library's <math.h> (std/c/rt/math*.ax) share: the bits of a
+// double, error-free transformations and double-double arithmetic, and the
+// reporting of errors.
+//
+// The kernels (this directory) are one implementation for both: they take a
+// Rep, through which a function reports a domain, pole or range error (C17
+// 7.12.1) and the floating-point exceptions it raises. std/math's ignores
+// them; the C library's sets errno and raises the flags through <fenv.h>'s
+// layer, rather than by arithmetic, which the optimizer could fold.
+//
+// The double-double operations are the error-free transformations of
+// T. J. Dekker, "A floating-point technique for extending the available
+// precision", Numer. Math. 18 (1971), and D. E. Knuth, TAOCP vol. 2,
+// 4.2.2 (TwoSum): with round to nearest, two_sum(a, b) is a + b exactly as
+// hi + lo, and two_prod(a, b) is a * b exactly (barring underflow). With
+// hardware fused multiply-add (AArch64; x86-64 with FMA, which the
+// functions that use them most are compiled for too: @multiversion), two_prod
+// uses it; the results are the same bits either way, since both are exact.
+// =============================================================================
+
+// errno values (the same on every target the library supports)
+pub const EDOM: i32 = 33;
+pub const ERANGE: i32 = 34;
+
+// The exception flags, as <fenv.h> numbers them.
+pub const FE_INVALID: u32 = 0x01;
+pub const FE_DIVBYZERO: u32 = 0x04;
+pub const FE_OVERFLOW: u32 = 0x08;
+pub const FE_UNDERFLOW: u32 = 0x10;
+pub const FE_INEXACT: u32 = 0x20;
+
+pub inline fn bits(x: f64) u64 {
+    return @bit_cast(u64, x);
+}
+
+pub inline fn from_bits(b: u64) f64 {
+    return @bit_cast(f64, b);
+}
+
+pub inline fn fbits(x: f32) u32 {
+    return @bit_cast(u32, x);
+}
+
+pub inline fn from_fbits(b: u32) f32 {
+    return @bit_cast(f32, b);
+}
+
+/// The biased exponent field of x.
+pub inline fn exponent(x: f64) i32 {
+    return @as(i32, @truncate(u16, (bits(x) >> 52) & 0x7ff));
+}
+
+/// |x| as bits.
+pub inline fn abits(x: f64) u64 {
+    return bits(x) & 0x7fffffffffffffff;
+}
+
+pub inline fn is_nan(x: f64) bool {
+    return x != x;
+}
+
+/// 2^k for -1022 <= k <= 1023.
+pub inline fn pow2(k: i32) f64 {
+    return from_bits(@as(u64, @bit_cast(u32, k + 1023)) << 52);
+}
+
+pub inline fn inf() f64 {
+    return from_bits(0x7ff0000000000000);
+}
+
+pub inline fn qnan() f64 {
+    return from_bits(0x7ff8000000000000);
+}
+
+// -----------------------------------------------------------------------------
+// Errors (7.12.1). Each returns the value the function returns, having
+// reported the error and the exceptions to rep.
+// -----------------------------------------------------------------------------
+
+/// Where a function reports its errors: err(e, flags) is called with the
+/// errno value (0 for none) and the exceptions to raise.
+pub struct Rep {
+    err: fn(i32, u32) void,
+}
+
+fn ignore(e: i32, flags: u32) void {}
+
+/// The Rep that ignores the errors (std/math).
+pub fn quiet() Rep {
+    return Rep.{ err: ignore };
+}
+
+/// A domain error: NaN, "invalid", EDOM.
+pub fn domain(rep: Rep) f64 {
+    rep.err(EDOM, FE_INVALID);
+    return from_bits(0x7ff8000000000000);
+}
+
+/// A pole error: an exact infinity of the given sign, "divide-by-zero", ERANGE.
+pub fn pole(rep: Rep, neg: bool) f64 {
+    rep.err(ERANGE, FE_DIVBYZERO);
+    if neg {
+        return -inf();
+    }
+    return inf();
+}
+
+/// An overflow: +-inf (round to nearest), "overflow" and "inexact", ERANGE.
+pub fn overflow(rep: Rep, neg: bool) f64 {
+    rep.err(ERANGE, FE_OVERFLOW | FE_INEXACT);
+    if neg {
+        return -inf();
+    }
+    return inf();
+}
+
+/// An underflow to zero: +-0, "underflow" and "inexact", ERANGE.
+pub fn underflow(rep: Rep, neg: bool) f64 {
+    rep.err(ERANGE, FE_UNDERFLOW | FE_INEXACT);
+    if neg {
+        return -0.0;
+    }
+    return 0.0;
+}
+
+/// r, a result computed (rounded) from a nonzero true result: if it is
+/// subnormal or zero, it underflowed (ERANGE; the arithmetic that rounded it
+/// raised the flags).
+pub inline fn check_tiny(rep: Rep, r: f64) f64 {
+    if abits(r) < 0x0010000000000000 {
+        rep.err(ERANGE, 0);
+    }
+    return r;
+}
+
+/// r, a result computed from finite operands: if it is infinite, it
+/// overflowed (ERANGE).
+pub inline fn check_huge(rep: Rep, r: f64) f64 {
+    if abits(r) == 0x7ff0000000000000 {
+        rep.err(ERANGE, 0);
+    }
+    return r;
+}
+
+/// Sets errno alone (the flags having been raised by the arithmetic).
+pub fn set_errno(rep: Rep, e: i32) void {
+    rep.err(e, 0);
+}
+
+/// A subnormal result that was rounded: "underflow" (and "inexact", which
+/// the rounding raised), ERANGE.
+pub fn raise_underflow(rep: Rep) void {
+    rep.err(ERANGE, FE_UNDERFLOW | FE_INEXACT);
+}
+
+/// Raises flags alone.
+pub fn raise(rep: Rep, flags: u32) void {
+    rep.err(0, flags);
+}
+
+/// A float result rounded from the double r, which a float function
+/// computed: overflow and underflow of the float format are range errors
+/// (the conversion raised the flags).
+pub inline fn to_f32(rep: Rep, r: f64) f32 {
+    let f = @float_cast(f32, r);
+    let b = fbits(f) & 0x7fffffff;
+    if (b == 0x7f800000) and (abits(r) < 0x7ff0000000000000) {
+        rep.err(ERANGE, 0);
+    } else if (b < 0x00800000) and (r != 0.0) {
+        rep.err(ERANGE, 0);
+    }
+    return f;
+}
+
+/// The float r (exactly representable as a double) of an exact operation on
+/// floats, rounded to float: overflow, and an inexact underflow (the
+/// conversion raised the flags), are range errors.
+pub inline fn to_f32_exact(rep: Rep, r: f64, nonzero: bool) f32 {
+    let f = @float_cast(f32, r);
+    let b = fbits(f) & 0x7fffffff;
+    if (b == 0x7f800000) and (abits(r) < 0x7ff0000000000000) {
+        rep.err(ERANGE, 0);
+    } else if (b < 0x00800000) and nonzero and (@float_cast(f64, f) != r) {
+        rep.err(ERANGE, 0);
+    }
+    return f;
+}
+
+// -----------------------------------------------------------------------------
+// Double-double arithmetic
+// -----------------------------------------------------------------------------
+
+/// hi + lo with |lo| <= ulp(hi) / 2.
+pub struct DD {
+    hi: f64,
+    lo: f64,
+}
+
+/// a + b exactly, given |a| >= |b| or a = 0 (Dekker's Fast2Sum).
+pub inline fn fast_two_sum(a: f64, b: f64) DD {
+    let s = a + b;
+    return DD.{ hi: s, lo: b - (s - a) };
+}
+
+/// a + b exactly (Knuth's TwoSum).
+pub inline fn two_sum(a: f64, b: f64) DD {
+    let s = a + b;
+    let bb = s - a;
+    return DD.{ hi: s, lo: (a - (s - bb)) + (b - bb) };
+}
+
+/// The two halves of a (Veltkamp's split), for Dekker's product: a = h + l,
+/// each with 26 significant bits or fewer. |a| < 2^996.
+inline fn split(a: f64) DD {
+    let t = 134217729.0 * a;  // 2^27 + 1
+    let h = t - (t - a);
+    return DD.{ hi: h, lo: a - h };
+}
+
+/// a * b exactly, as hi + lo (|a b| < 2^996, and no underflow of lo).
+pub inline fn two_prod(a: f64, b: f64) DD {
+    let p = a * b;
+    if @target_has("fma") or @target_arch("aarch64") {
+        return DD.{ hi: p, lo: @fma(a, b, -p) };
+    }
+    let x = split(a);
+    let y = split(b);
+    let e = (((x.hi * y.hi) - p) + (x.hi * y.lo) + (x.lo * y.hi)) + (x.lo * y.lo);
+    return DD.{ hi: p, lo: e };
+}
+
+/// a^2 exactly.
+pub inline fn two_sqr(a: f64) DD {
+    let p = a * a;
+    if @target_has("fma") or @target_arch("aarch64") {
+        return DD.{ hi: p, lo: @fma(a, a, -p) };
+    }
+    let x = split(a);
+    let e = (((x.hi * x.hi) - p) + (2.0 * (x.hi * x.lo))) + (x.lo * x.lo);
+    return DD.{ hi: p, lo: e };
+}
+
+pub inline fn dd(hi: f64, lo: f64) DD {
+    return DD.{ hi: hi, lo: lo };
+}
+
+/// a if mask is all ones, b if it is zero (without a branch).
+pub inline fn select(mask: u64, a: f64, b: f64) f64 {
+    return from_bits((bits(a) & mask) | (bits(b) & ~mask));
+}
+
+/// x with its sign bit flipped where sgn has it (sgn: 0 or the sign bit).
+pub inline fn flip(x: f64, sgn: u64) f64 {
+    return from_bits(bits(x) ^ sgn);
+}
+
+/// Ziv's rounding test for an approximation hi + lo (|lo| < ulp(hi)) of a
+/// value within e of it: whether every value in that interval rounds to
+/// hi + lo, which is then the correctly rounded value.
+pub inline fn rounds(hi: f64, lo: f64, e: f64) bool {
+    return (hi + (lo + e)) == (hi + (lo - e));
+}
+
+/// a + b (relative error about 2^-104).
+pub inline fn dd_add(a: DD, b: DD) DD {
+    let s = two_sum(a.hi, b.hi);
+    let t = two_sum(a.lo, b.lo);
+    let u = fast_two_sum(s.hi, s.lo + t.hi);
+    return fast_two_sum(u.hi, (u.lo + t.lo));
+}
+
+/// a + b for a double b.
+pub inline fn dd_add_d(a: DD, b: f64) DD {
+    let s = two_sum(a.hi, b);
+    return fast_two_sum(s.hi, s.lo + a.lo);
+}
+
+/// a * b.
+pub inline fn dd_mul(a: DD, b: DD) DD {
+    let p = two_prod(a.hi, b.hi);
+    return fast_two_sum(p.hi, p.lo + ((a.hi * b.lo) + (a.lo * b.hi)));
+}
+
+/// a * b for a double b.
+pub inline fn dd_mul_d(a: DD, b: f64) DD {
+    let p = two_prod(a.hi, b);
+    return fast_two_sum(p.hi, p.lo + (a.lo * b));
+}
+
+/// a / b.
+pub inline fn dd_div(a: DD, b: DD) DD {
+    let q = a.hi / b.hi;
+    // the remainder a - q b, nearly exactly
+    let p = two_prod(q, b.hi);
+    let r = (((a.hi - p.hi) - p.lo) + a.lo) - (q * b.lo);
+    return fast_two_sum(q, r / b.hi);
+}
+
+/// 1 / b.
+pub inline fn dd_recip(b: DD) DD {
+    let q = 1.0 / b.hi;
+    let p = two_prod(q, b.hi);
+    let r = ((1.0 - p.hi) - p.lo) - (q * b.lo);
+    return fast_two_sum(q, r / b.hi);
+}
+
+/// sqrt(a), a > 0.
+pub inline fn dd_sqrt(a: DD) DD {
+    let s = @sqrt(a.hi);
+    let p = two_sqr(s);
+    let r = ((a.hi - p.hi) - p.lo) + a.lo;
+    return fast_two_sum(s, r / (2.0 * s));
+}
+
+pub inline fn dd_neg(a: DD) DD {
+    return DD.{ hi: -a.hi, lo: -a.lo };
+}
+
+/// a rounded to a double.
+pub inline fn dd_round(a: DD) f64 {
+    return a.hi + a.lo;
+}

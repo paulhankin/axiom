@@ -30,6 +30,7 @@ import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "cgen_wint.ax" as cgw;
 import "cldbl.ax" as cl;
+import "cpragma.ax" as cpg;
 import "csema_atomic.ax" as catm;
 import "csema_attr.ax" as catr;
 import "csema_builtin.ax" as csb;
@@ -495,9 +496,164 @@ fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: *mut ir.Value, neg: bool) *
 // Values
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// The floating-point pragmas (cpragma.ax): FENV_ACCESS and FENV_ROUND
+// -----------------------------------------------------------------------------
+
+/// The floating-point pragmas' state of the block item being generated
+/// (cgen_stmt.ax sets it).
+pub let mut fp_state: u32 = 0;
+
+// While a full expression is evaluated under FENV_ROUND's static direction
+// (fp_enter): the slot that holds the dynamic mode's rounding bits; nil
+// otherwise.
+let mut fp_slot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+// Under FENV_ACCESS ON or FENV_ROUND (F.8.4, and 7.6.2 for FENV_ROUND's
+// static mode): is e an operation on floating values whose constant value
+// (folded by semantic analysis) is not used, the operation done at run time
+// instead, in the mode of that moment and raising its exceptions? (Not the
+// constants themselves, nor what is not of a floating type and has no
+// floating operand.)
+fn fp_runtime(e: *cast.Expr) bool {
+    if not cpg.fp_strict(fp_state) {
+        return false;
+    }
+    let k = e.kind;
+    if (k != cast.ExprKind.BINARY) and (k != cast.ExprKind.UNARY) and (k != cast.ExprKind.CAST) and
+       (k != cast.ExprKind.COND) {
+        return false;
+    }
+    if cty.is_floating(e.ty) or (cty.is_complex(e.ty)) {
+        return true;
+    }
+    return u.notnil(e.a) and u.notnil(e.a.ty) and (cty.is_floating(e.a.ty) or cty.is_complex(e.a.ty));
+}
+
+// The rounding-control bits of the environment's register (fenv_get's
+// value: MXCSR's RC, bits 13-14; AArch64's FPCR RMode, bits 22-23), and
+// their value for a static direction (cpragma.ax's FPR_).
+fn rm_mask() u64 {
+    if tg.g_arch == tg.ARCH_A64 {
+        return 0xC00000;
+    }
+    return 0x6000;
+}
+
+fn rm_bits(dir: u32) u64 {
+    let x86: [5]u64 = [0, 0, 0x4000, 0x2000, 0x6000];
+    let a64: [5]u64 = [0, 0, 0x400000, 0x800000, 0xC00000];
+    if tg.g_arch == tg.ARCH_A64 {
+        return a64[@as(usize, dir)];
+    }
+    return x86[@as(usize, dir)];
+}
+
+fn fenv_get() *mut ir.Value {
+    let p = cg.alloca(cty.t_ullong, "fenv");
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
+    return ir.load(cg.B, ir.t_int(64), p);
+}
+
+fn fenv_set(v: *mut ir.Value) void {
+    let p = cg.alloca(cty.t_ullong, "fenv");
+    _ = ir.store(cg.B, v, p);
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
+}
+
+// The environment with its rounding bits replaced by r (a value of those bits).
+fn with_rounding(r: *mut ir.Value) void {
+    let t64 = ir.t_int(64);
+    let cur = fenv_get();
+    fenv_set(ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), r));
+}
+
+// Starts a full expression under FENV_ROUND with a static direction: the
+// dynamic mode's rounding bits saved (in a slot of their own, so that full
+// expressions nest: GNU statement expressions), the static ones set. The
+// previous slot, for fp_leave.
+fn fp_enter() *mut ir.Value {
+    let prev = fp_slot;
+    let dir = cpg.fp_round(fp_state);
+    if (dir == cpg.FPR_DYNAMIC) or tg.is_wasm() or u.isnil(cg.F) or cg.terminated() {
+        return prev;
+    }
+    let t64 = ir.t_int(64);
+    let slot = cg.alloca(cty.t_ullong, "fpround");
+    let cur = fenv_get();
+    _ = ir.store(cg.B, ir.and_(cg.B, cur, ir.cint(t64, rm_mask())), slot);
+    fenv_set(ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(dir))));
+    fp_slot = slot;
+    return prev;
+}
+
+// Ends it: the dynamic mode's rounding bits back (the exception flags the
+// expression raised are kept).
+fn fp_leave(prev: *mut ir.Value) void {
+    if (fp_slot != prev) and not cg.terminated() {
+        with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
+    }
+    fp_slot = prev;
+}
+
+/// The value of e, a full expression (a statement's, a condition, an
+/// initializer): under FENV_ROUND, evaluated in the static direction.
+pub fn full(e: *mut cast.Expr) *mut ir.Value {
+    let prev = fp_enter();
+    let v = rv(e);
+    fp_leave(prev);
+    return v;
+}
+
+/// Branches on e, a full expression (to t if it is nonzero, else to f).
+pub fn branch_full(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
+    if (cpg.fp_round(fp_state) == cpg.FPR_DYNAMIC) or tg.is_wasm() {
+        branch(e, t, f);
+        return;
+    }
+    let prev = fp_enter();
+    let v = rv(e);
+    fp_leave(prev);
+    ir.condbr(cg.B, truth(v, e.ty), t, f);
+}
+
+// The functions that FENV_ROUND's static direction applies to when called
+// in its scope (C23 7.6.2p4's table: <math.h>'s, and the conversions of
+// <stdlib.h>, <stdio.h> and <wchar.h>): the others run in the dynamic mode.
+fn static_rounding_fn(name: []u8) bool {
+    let mut n = name;
+    let fixed = ["atof", "strtod", "strtof", "strtold", "wcstod", "wcstof", "wcstold", "printf", "fprintf", "sprintf",
+                 "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "scanf", "fscanf", "sscanf", "vscanf",
+                 "vfscanf", "vsscanf", "wprintf", "fwprintf", "swprintf", "vwprintf", "vfwprintf", "vswprintf",
+                 "wscanf", "fwscanf", "swscanf", "vwscanf", "vfwscanf", "vswscanf"];
+    for f in fixed {
+        if u.str_eq(n, f) {
+            return true;
+        }
+    }
+    let base = ["acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh", "tanh",
+                "exp", "exp2", "expm1", "exp10", "exp10m1", "exp2m1", "log", "log10", "log1p", "log2", "logp1",
+                "log10p1", "log2p1", "cbrt", "hypot", "pow", "pown", "powr", "rootn", "compoundn", "rsqrt", "sqrt",
+                "erf", "erfc", "lgamma", "tgamma", "rint", "nearbyint", "lrint", "llrint", "fma", "acospi", "asinpi",
+                "atanpi", "atan2pi", "cospi", "sinpi", "tanpi", "fmod", "remainder", "remquo", "fdim", "scalbn",
+                "scalbln", "ldexp", "fadd", "fsub", "fmul", "fdiv", "ffma", "fsqrt", "dadd", "dsub", "dmul", "ddiv",
+                "dfma", "dsqrt"];
+    for b in base {
+        if u.str_eq(n, b) {
+            return true;
+        }
+        if (n.len == (b.len + 1)) and u.str_eq(n[0..b.len], b) and ((n[b.len] == 'f') or (n[b.len] == 'l')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// The value of e.
 pub fn rv(e: *mut cast.Expr) *mut ir.Value {
-    if e.is_const and cty.is_arith(e.ty) {
+    if e.is_const and cty.is_arith(e.ty) and not fp_runtime(e) {
         return const_value(e);
     }
     let k = e.kind;
@@ -783,7 +939,15 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
         } else if op == ct.P_GE {
             p = ir.RealOGE;
         }
-        return i1_to(e.ty, ir.fcmp(cg.B, p, x, y));
+        let c = ir.fcmp(cg.B, p, x, y);
+        if (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) {
+            // (the relational operators signal "invalid" for a NaN, F.9.3;
+            // isless and the like do not: cgen_fp.ax)
+            if c.kind == ir.V_INST {
+                c.flags = c.flags | ir.F_SIGNALING;
+            }
+        }
+        return i1_to(e.ty, c);
     }
     let mut sg = cty.is_integer(t) and t.is_signed and (t.kind != cty.TK_BOOL);
     if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
@@ -1240,7 +1404,21 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         fname = cg.F.sym.name;
     }
     cg.next_site = cg.call_site(e.span, fname, callee_name);
+    // under FENV_ROUND's static direction, a function that it does not apply
+    // to runs in the dynamic mode (and may change it): restored for the
+    // call, read again after it, and the static direction set again
+    let dynamic = u.notnil(fp_slot) and not static_rounding_fn(callee_name);
+    if dynamic {
+        with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
+    }
     let r = gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
+    if dynamic and not noreturn {
+        let t64 = ir.t_int(64);
+        let cur = fenv_get();
+        _ = ir.store(cg.B, ir.and_(cg.B, cur, ir.cint(t64, rm_mask())), fp_slot);
+        fenv_set(
+            ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(cpg.fp_round(fp_state)))));
+    }
     if noreturn {
         // (a function declared _Noreturn or [[noreturn]] does not return)
         ir.unreachable(cg.B);

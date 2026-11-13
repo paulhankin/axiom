@@ -993,6 +993,11 @@ pub const F_NUW: u32 = 16;
 pub const F_NO_WRAP: u32 = 24;
 // Alloca flags
 pub const F_VAR: u32 = 32;  // a C variable: -O0 keeps it in memory (opt.mem2reg), where debuggers find it
+// An fcmp of an ordered relation (<, <=, >, >=) that signals: "invalid" for
+// any NaN operand, quiet or signaling (IEEE 754's compareSignaling: C's
+// relational operators, F.9.3), where the plain one does for a signaling
+// NaN only (isless ...)
+pub const F_SIGNALING: u32 = 64;
 
 // Does v (an add, sub, mul or shl) have flag fl (F_NSW, F_NUW)?
 pub fn no_wrap(v: *Value, fl: u32) bool {
@@ -1655,6 +1660,12 @@ pub struct Func {
     // optimized (its objects stay in memory, their slots apart), not inlined,
     // no sibling calls or shrink-wrapping (passes.ax, inline.ax, the backends)
     returns_twice: bool,
+    // its floating-point operations read and write the floating-point
+    // environment (C's FENV_ACCESS ON or FENV_ROUND, --c-fenv-access: c/cgen.ax):
+    // each is done where and as often as the program says, in the rounding
+    // mode of that moment, and raises its exceptions, so the passes do not
+    // fold, merge, move or remove them (fp_pinned)
+    strict_fp: bool,
 }
 
 pub struct Global {
@@ -2760,11 +2771,46 @@ pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
 // What the passes ask of instructions
 // -----------------------------------------------------------------------------
 
+// A floating-point operation whose result depends on the rounding mode or
+// that may raise an exception: the arithmetic, comparisons, conversions to,
+// from and between floating types, and the floating intrinsics (sqrt, fma,
+// the roundings, min and max). Negation and the absolute value are exact
+// and raise nothing.
+pub fn fp_env_op(i: *Value) bool {
+    let op = i.op;
+    if ((op >= OP_FADD) and (op <= OP_FREM)) or (op == OP_FCMP) or (op == OP_FPEXT) or (op == OP_FPTRUNC) {
+        return true;
+    }
+    if (op == OP_SITOFP) or (op == OP_UITOFP) or (op == OP_FPTOSI_SAT) or (op == OP_FPTOUI_SAT) {
+        return true;
+    }
+    if op == OP_INTR {
+        let id = intr_id(i);
+        return (id == IN_SQRT) or (id == IN_FMA) or (id == IN_FMIN) or (id == IN_FMAX) or
+               ((id >= IN_FLOOR) and (id <= IN_NEAREST));
+    }
+    return false;
+}
+
+// Is i a floating-point operation of a function with strict floating
+// point (Func's strict_fp), which the passes must leave where it is, as it
+// is: not folded, merged with another, moved (across a call that changes or
+// tests the environment) or removed (its exceptions are effects)?
+pub fn fp_pinned(i: *Value) bool {
+    if (i.kind != V_INST) or u.isnil(i.blk) or u.isnil(i.blk.fnp) or not i.blk.fnp.strict_fp {
+        return false;
+    }
+    return fp_env_op(i);
+}
+
 // Must instruction i be kept though its result is unused (it writes memory,
-// ends its block, is a volatile or atomic load, or an intrinsic with an
-// effect)?
+// ends its block, is a volatile or atomic load, an intrinsic with an
+// effect, or a floating-point operation under strict floating point)?
 pub fn has_effects(i: *Value) bool {
     let op = i.op;
+    if fp_pinned(i) {
+        return true;
+    }
     if (op_props(op) & (OPF_WRITES_MEM | OPF_TERM)) != 0 {
         return true;
     }

@@ -1,0 +1,772 @@
+// =============================================================================
+// std/c/rt/math_narrow.ax - C23's narrowing operations (7.12.14, F.10.11):
+// fadd, fsub, fmul, fdiv, ffma and fsqrt of doubles to float, and the
+// library's common core of the long double forms (faddl ... to float,
+// daddl ... to double; std/c/lib/math/m_narrow.c): the result of the
+// operation correctly rounded once to the narrower format, in the current
+// rounding direction, with the IEEE 754 exceptions (as if the operation were
+// computed with unbounded range and precision and rounded once).
+//
+// The method: the operands are taken apart exactly (sign, exponent, a
+// significand of up to 113 bits), the operation is exact in integer
+// arithmetic on 512 bits (the product of two significands and a third
+// aligned beside it; a quotient and a square root to 66 bits with the
+// remainder's sticky bit, which decides every rounding to 53 bits or fewer),
+// and one rounding produces the result. Tininess is detected after rounding
+// (IEEE 754-2019 7.5, as the x86-64 SSE unit does); an underflow is
+// signalled when a tiny result is inexact. The flags and errno come through
+// the library's error function (EDOM for an invalid operation; ERANGE for a
+// division by zero, an overflow and an underflow).
+// =============================================================================
+import "../../internal/math/core.ax" as m;
+import "ldouble.ax" as ld;
+
+extern "C" {
+    fn __axc_math_err(e: i32, flags: u32) void;
+    fn fegetround() i32;
+}
+
+const Z: u32 = 0;  // zero
+const N: u32 = 1;  // finite, nonzero
+const I: u32 = 2;  // infinity
+const Q: u32 = 3;  // NaN
+
+/// An operand: (h:l) 2^(e - 127), bit 127 of (h:l) set, for N; the NaN's
+/// fraction (its top bits at the top of h) and whether it signals, for Q.
+struct Opnd {
+    cls: u32,
+    neg: bool,
+    snan: bool,
+    e: i32,
+    h: u64,
+    l: u64,
+}
+
+fn num_f64(b: u64) Opnd {
+    let neg = (b >> 63) != 0;
+    let ef = @bit_cast(i32, @truncate(u32, (b >> 52) & 0x7ff));
+    let fr = b & 0x000fffffffffffff;
+    if ef == 0x7ff {
+        if fr == 0 {
+            return Opnd.{ cls: I, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+        }
+        return Opnd.{ cls: Q, neg: neg, snan: (fr >> 51) == 0, e: 0, h: fr << 12, l: 0 };
+    }
+    if ef == 0 {
+        if fr == 0 {
+            return Opnd.{ cls: Z, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+        }
+        let z = @as(u32, @truncate(u32, @clz(fr)));
+        return Opnd.{ cls: N, neg: neg, snan: false, e: -1011 - @bit_cast(i32, z), h: fr << z, l: 0 };
+    }
+    return Opnd.{ cls: N, neg: neg, snan: false, e: ef - 1023, h: (fr | 0x0010000000000000) << 11, l: 0 };
+}
+
+fn num_ld(a: *ld.W, f: u32) Opnd {
+    if f == ld.FMT_X {
+        let ef = @bit_cast(i32, @truncate(u32, a.hi & 0x7FFF));
+        let neg = (a.hi & 0x8000) != 0;
+        let mm = a.lo;
+        if (ef == 0x7FFF) or ((ef != 0) and ((mm >> 63) == 0)) {
+            if (ef == 0x7FFF) and ((mm << 1) == 0) and ((mm >> 63) != 0) {
+                return Opnd.{ cls: I, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+            }
+            // a NaN; unnormals, pseudo-infinities and pseudo-NaNs are invalid
+            // operands (as the x87 has them since the 80387): signaling
+            let quiet = ((mm >> 62) & 1) != 0;
+            return Opnd.{ cls: Q, neg: neg, snan: (not quiet) or ((mm >> 63) == 0), e: 0, h: mm << 2, l: 0 };
+        }
+        if mm == 0 {
+            return Opnd.{ cls: Z, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+        }
+        let mut efe = ef;
+        if ef == 0 {
+            efe = 1;
+        }
+        let z = @as(u32, @truncate(u32, @clz(mm)));
+        return Opnd.{ cls: N, neg: neg, snan: false, e: (efe - 16383) - @bit_cast(i32, z), h: mm << z, l: 0 };
+    }
+    let ef = @bit_cast(i32, @truncate(u32, (a.hi >> 48) & 0x7FFF));
+    let neg = (a.hi >> 63) != 0;
+    let fh = a.hi & 0xFFFF_FFFF_FFFF;
+    let fl = a.lo;
+    if ef == 0x7FFF {
+        if (fh | fl) == 0 {
+            return Opnd.{ cls: I, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+        }
+        return Opnd.{ cls: Q, neg: neg, snan: (fh >> 47) == 0, e: 0, h: (fh << 17) | (fl >> 47), l: fl << 17 };
+    }
+    if ef == 0 {
+        if (fh | fl) == 0 {
+            return Opnd.{ cls: Z, neg: neg, snan: false, e: 0, h: 0, l: 0 };
+        }
+        let mut h = fh;
+        let mut l = fl;
+        let mut z: u32 = 0;
+        if h == 0 {
+            h = l;
+            l = 0;
+            z = 64;
+        }
+        let z2 = @as(u32, @truncate(u32, @clz(h)));
+        if z2 != 0 {
+            h = (h << z2) | (l >> (64 - z2));
+            l = l << z2;
+        }
+        return Opnd.{ cls: N, neg: neg, snan: false, e: ((1 - 16383) + 15) - @bit_cast(i32, z + z2), h: h, l: l };
+    }
+    return Opnd.{ cls: N, neg: neg, snan: false, e: ef - 16383, h: ((fh | 0x1_0000_0000_0000) << 15) | (fl >> 49),
+                  l: fl << 15 };
+}
+
+// -----------------------------------------------------------------------------
+// 512-bit integers: w[0] the low word
+// -----------------------------------------------------------------------------
+
+/// A value (w) 2^(e - 511) (w nonzero, not normalized), and its sign.
+struct Wide {
+    neg: bool,
+    e: i32,
+    w: [8]u64,
+}
+
+fn mul64(a: u64, b: u64) [2]u64 {
+    let a0 = a & 0xffffffff;
+    let a1 = a >> 32;
+    let b0 = b & 0xffffffff;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = ((p00 >> 32) + (p01 & 0xffffffff)) + (p10 & 0xffffffff);
+    let hi = ((p11 + (p01 >> 32)) + (p10 >> 32)) + (mid >> 32);
+    return [(mid << 32) | (p00 & 0xffffffff), hi];
+}
+
+/// The operand as a Wide: its 128 bits at the top.
+fn wide_of(a: Opnd) Wide {
+    let mut w: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    w[7] = a.h;
+    w[6] = a.l;
+    return Wide.{ neg: a.neg, e: a.e, w: w };
+}
+
+/// a b exactly: the 256-bit product at the top.
+fn wide_mul(a: Opnd, b: Opnd) Wide {
+    let mut w: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let x = [a.l, a.h];
+    let y = [b.l, b.h];
+    for i in @as(usize, 0)..2 {
+        let mut carry: u64 = 0;
+        for j in @as(usize, 0)..2 {
+            let p = mul64(x[i], y[j]);
+            let k = (4 + i) + j;
+            let s = w[k] +% p[0];
+            let c1 = b2u(s < w[k]);
+            let s2 = s +% carry;
+            let c2 = b2u(s2 < s);
+            w[k] = s2;
+            carry = (p[1] + c1) + c2;
+        }
+        w[(4 + i) + 2] = w[(4 + i) + 2] +% carry;
+    }
+    // (h:l) 2^(e - 127) each: the product (w) 2^(ea + eb - 254 - 256)
+    return Wide.{ neg: a.neg != b.neg, e: ((a.e + b.e) - 254) + 255, w: w };
+}
+
+/// w shifted right by n bits (n >= 0), the bits shifted out kept as a
+/// sticky bit in the lowest.
+fn shr_sticky(w: *mut [8]u64, n: i32) void {
+    if n <= 0 {
+        return;
+    }
+    let mut sticky = false;
+    if n >= 512 {
+        for i in @as(usize, 0)..8 {
+            sticky = sticky or (w[i] != 0);
+            w[i] = 0;
+        }
+        if sticky {
+            w[0] = 1;
+        }
+        return;
+    }
+    let words = @as(usize, @bit_cast(u32, n / 64));
+    let bitsn = @as(u32, @bit_cast(u32, n % 64));
+    for i in @as(usize, 0)..words {
+        sticky = sticky or (w[i] != 0);
+    }
+    if bitsn != 0 {
+        sticky = sticky or ((w[words] << (64 - bitsn)) != 0);
+    }
+    for i in @as(usize, 0)..8 {
+        let s = i + words;
+        let mut v: u64 = 0;
+        if s < 8 {
+            v = w[s] >> bitsn;
+            if (bitsn != 0) and ((s + 1) < 8) {
+                v = v | (w[s + 1] << (64 - bitsn));
+            }
+        }
+        w[i] = v;
+    }
+    if sticky {
+        w[0] = w[0] | 1;
+    }
+}
+
+fn is_zero8(w: *[8]u64) bool {
+    for i in @as(usize, 0)..8 {
+        if w[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// a + b (each with its sign) exactly enough: the one with the smaller
+/// exponent shifted right with a sticky bit (it is then far below the
+/// other's top bits: the sum rounds as the exact one does), after both are
+/// moved one word down for the carry.
+fn wide_add(a0: Wide, b0: Wide) Wide {
+    let mut a = a0;
+    let mut b = b0;
+    if b.e > a.e {
+        a = b0;
+        b = a0;
+    }
+    shr_sticky(&mut a.w, 64);
+    shr_sticky(&mut b.w, 64 + (a.e - b.e));
+    let mut r = Wide.{ neg: a.neg, e: a.e + 64, w: [0, 0, 0, 0, 0, 0, 0, 0] };
+    if a.neg == b.neg {
+        let mut carry: u64 = 0;
+        for i in @as(usize, 0)..8 {
+            let s = a.w[i] +% b.w[i];
+            let c1 = b2u(s < a.w[i]);
+            let s2 = s +% carry;
+            let c2 = b2u(s2 < s);
+            r.w[i] = s2;
+            carry = c1 + c2;
+        }
+        return r;
+    }
+    // a - b in magnitude: the larger minus the smaller
+    let mut alt = false;
+    let mut i: usize = 8;
+    while i > 0 {
+        i -= 1;
+        if a.w[i] != b.w[i] {
+            alt = a.w[i] < b.w[i];
+            break;
+        }
+    }
+    let mut x = a.w;
+    let mut y = b.w;
+    if alt {
+        x = b.w;
+        y = a.w;
+        r.neg = b.neg;
+    }
+    let mut borrow: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        let d1 = x[k] -% y[k];
+        let b1 = b2u(x[k] < y[k]);
+        let d2 = d1 -% borrow;
+        let b2 = b2u(d1 < borrow);
+        r.w[k] = d2;
+        borrow = b1 + b2;
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// The rounding
+// -----------------------------------------------------------------------------
+
+/// The target format: precision, smallest and largest normal exponents.
+struct Fmt {
+    p: i32,
+    emin: i32,
+    emax: i32,
+}
+
+inline fn fmt_of(dbl: bool) Fmt {
+    if dbl {
+        return Fmt.{ p: 53, emin: -1022, emax: 1023 };
+    }
+    return Fmt.{ p: 24, emin: -126, emax: 127 };
+}
+
+/// The current rounding direction: 0 to nearest, 1 upward, 2 downward, 3
+/// toward zero (from <fenv.h>'s values, the same on every target).
+fn direction() u32 {
+    let d = fegetround();
+    if d == 0x800 {
+        return 1;
+    }
+    if d == 0x400 {
+        return 2;
+    }
+    if d == 0xc00 {
+        return 3;
+    }
+    return 0;
+}
+
+/// Whether a magnitude rounds up, given its last kept bit, the guard bit
+/// below it and whether anything below that is set.
+fn up(dir: u32, neg: bool, lsb: bool, guard: bool, sticky: bool) bool {
+    if dir == 0 {
+        return guard and (sticky or lsb);
+    }
+    if dir == 1 {
+        return (guard or sticky) and not neg;
+    }
+    if dir == 2 {
+        return (guard or sticky) and neg;
+    }
+    return false;
+}
+
+/// The bits of a result of format t: sign, exponent field, fraction (a
+/// fraction one bit too wide carries into the exponent field, as a
+/// subnormal rounded up to the smallest normal does).
+fn encode(t: Fmt, neg: bool, ef: i32, frac: u64) u64 {
+    let s = b2u(neg);
+    let sh = @as(u64, @bit_cast(u32, t.p - 1));
+    return ((s << if_dbl(t, 63, 31)) | (@as(u64, @bit_cast(u32, ef)) << sh)) + frac;
+}
+
+inline fn if_dbl(t: Fmt, a: u64, b: u64) u64 {
+    if t.p == 53 {
+        return a;
+    }
+    return b;
+}
+
+/// The value (sh:sl) 2^(ex - 127) (bit 127 set), with the bits below it
+/// that sticky stands for, rounded to t in the current direction, with its
+/// exceptions: the bits of the result.
+fn round_to(t: Fmt, neg: bool, ex: i32, sh: u64, sl: u64, sticky0: bool) u64 {
+    let dir = direction();
+    let one: u64 = 1;
+    // the number of bits kept: p, fewer for a subnormal result
+    let mut keep = t.p;
+    if ex < t.emin {
+        keep = t.p - (t.emin - ex);
+    }
+    let mut mant: u64 = 0;
+    let mut guard = false;
+    let mut sticky = sticky0 or (sl != 0);
+    if keep >= 1 {
+        let k = @as(u64, @bit_cast(u32, keep));
+        mant = sh >> (64 - k);
+        guard = ((sh >> (63 - k)) & 1) != 0;
+        sticky = sticky or ((sh & ((one << (63 - k)) - 1)) != 0);
+    } else if keep == 0 {
+        guard = true;  // the leading bit
+        sticky = sticky or ((sh << 1) != 0);
+    } else {
+        sticky = true;
+    }
+    let inexact = guard or sticky;
+    // tininess after rounding: below 2^emin, unless the value rounded to p
+    // bits with an unbounded exponent is 2^emin
+    let mut tiny = ex < t.emin;
+    if ex == (t.emin - 1) {
+        let k = @as(u64, @bit_cast(u32, t.p));
+        let mp = sh >> (64 - k);
+        let gp = ((sh >> (63 - k)) & 1) != 0;
+        let sp = sticky0 or (sl != 0) or ((sh & ((one << (63 - k)) - 1)) != 0);
+        if (mp == ((one << k) - 1)) and up(dir, neg, true, gp, sp) {
+            tiny = false;
+        }
+    }
+    if up(dir, neg, (mant & 1) != 0, guard, sticky) {
+        mant += 1;
+    }
+    let mut flags: u32 = 0;
+    let mut err: i32 = 0;
+    if inexact {
+        flags = 0x20;
+    }
+    if tiny and inexact {
+        flags = flags | 0x10;
+        err = m.ERANGE;
+    }
+    let mut e2 = ex;
+    if ex >= t.emin {
+        if mant == (one << @as(u64, @bit_cast(u32, t.p))) {
+            mant = mant >> 1;
+            e2 += 1;
+        }
+        if e2 > t.emax {
+            // overflow: an infinity or the largest finite, by the direction
+            __axc_math_err(m.ERANGE, 0x08 | 0x20);
+            if (dir == 0) or ((dir == 1) and not neg) or ((dir == 2) and neg) {
+                return encode(t, neg, (2 * t.emax) + 1, 0);
+            }
+            return encode(t, neg, 2 * t.emax,
+                          (one << @as(u64, @bit_cast(u32, t.p))) - 1 - (one << @as(u64, @bit_cast(u32, t.p - 1))));
+        }
+        if flags != 0 {
+            __axc_math_err(err, flags);
+        }
+        return encode(t, neg, e2 + t.emax, mant - (one << @as(u64, @bit_cast(u32, t.p - 1))));
+    }
+    if flags != 0 {
+        __axc_math_err(err, flags);
+    }
+    return encode(t, neg, 0, mant);  // a subnormal (or zero, or the smallest normal)
+}
+
+/// w (nonzero) rounded to t: its top 128 bits and a sticky bit for the rest.
+fn round_wide(t: Fmt, v: Wide) u64 {
+    let mut i: usize = 7;
+    while v.w[i] == 0 {
+        if i == 0 {
+            // an exact zero (a sum): +0, or -0 rounding downward
+            return encode(t, direction() == 2, 0, 0);
+        }
+        i -= 1;
+    }
+    let lz = @as(u64, @clz(v.w[i]));
+    let mut hi = v.w[i] << lz;
+    let mut lo: u64 = 0;
+    let mut sticky = false;
+    if i >= 1 {
+        if lz != 0 {
+            hi = hi | (v.w[i - 1] >> (64 - lz));
+        }
+        lo = v.w[i - 1] << lz;
+    }
+    if i >= 2 {
+        if lz != 0 {
+            lo = lo | (v.w[i - 2] >> (64 - lz));
+        }
+        sticky = (v.w[i - 2] << lz) != 0;
+        for k in @as(usize, 0)..(i - 2) {
+            sticky = sticky or (v.w[k] != 0);
+        }
+    }
+    let top = (@bit_cast(i32, @as(u32, @truncate(u32, i))) * 64) + (63 - @as(i32, @truncate(u8, lz)));
+    return round_to(t, v.neg, (v.e - 511) + top, hi, lo, sticky);
+}
+
+/// A NaN result: the first NaN operand's, quieted (its fraction's top bits),
+/// or the default NaN; "invalid" if an operand signals or for an invalid
+/// operation.
+fn nan_of(t: Fmt, a: Opnd, b: Opnd, c: Opnd, invalid: bool) u64 {
+    let mut src = a;
+    if a.cls != Q {
+        src = b;
+        if b.cls != Q {
+            src = c;
+        }
+    }
+    if invalid or a.snan or b.snan or c.snan {
+        if invalid {
+            __axc_math_err(m.EDOM, 0x01);
+        } else {
+            __axc_math_err(0, 0x01);
+        }
+    }
+    let q = @as(u64, 1) << @as(u64, @bit_cast(u32, t.p - 2));
+    if (src.cls != Q) or invalid {
+        return encode(t, false, (2 * t.emax) + 1, q);
+    }
+    let pb = @as(u64, @bit_cast(u32, t.p - 2));
+    let pay = (src.h << 1) >> (64 - pb);
+    return encode(t, src.neg, (2 * t.emax) + 1, q | pay);
+}
+
+inline fn b2u(c: bool) u64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+inline fn nonum() Opnd {
+    return Opnd.{ cls: Z, neg: false, snan: false, e: 0, h: 0, l: 0 };
+}
+
+/// A finite nonzero operand rounded to t.
+fn round_num(t: Fmt, a: Opnd) u64 {
+    return round_to(t, a.neg, a.e, a.h, a.l, false);
+}
+
+inline fn zero(t: Fmt, neg: bool) u64 {
+    return encode(t, neg, 0, 0);
+}
+
+inline fn inf(t: Fmt, neg: bool) u64 {
+    return encode(t, neg, (2 * t.emax) + 1, 0);
+}
+
+// -----------------------------------------------------------------------------
+// The operations
+// -----------------------------------------------------------------------------
+
+/// a + b.
+fn op_add(t: Fmt, a: Opnd, b: Opnd) u64 {
+    if (a.cls == Q) or (b.cls == Q) {
+        return nan_of(t, a, b, nonum(), false);
+    }
+    if (a.cls == I) or (b.cls == I) {
+        if (a.cls == I) and (b.cls == I) and (a.neg != b.neg) {
+            return nan_of(t, a, b, nonum(), true);  // inf - inf
+        }
+        if a.cls == I {
+            return inf(t, a.neg);
+        }
+        return inf(t, b.neg);
+    }
+    if a.cls == Z {
+        if b.cls == Z {
+            // +0 for zeros of different signs (-0 rounding downward)
+            if a.neg == b.neg {
+                return zero(t, a.neg);
+            }
+            return zero(t, direction() == 2);
+        }
+        return round_num(t, b);
+    }
+    if b.cls == Z {
+        return round_num(t, a);
+    }
+    return round_wide(t, wide_add(wide_of(a), wide_of(b)));
+}
+
+/// a b.
+fn op_mul(t: Fmt, a: Opnd, b: Opnd) u64 {
+    if (a.cls == Q) or (b.cls == Q) {
+        return nan_of(t, a, b, nonum(), false);
+    }
+    let neg = a.neg != b.neg;
+    if (a.cls == I) or (b.cls == I) {
+        if (a.cls == Z) or (b.cls == Z) {
+            return nan_of(t, a, b, nonum(), true);  // 0 inf
+        }
+        return inf(t, neg);
+    }
+    if (a.cls == Z) or (b.cls == Z) {
+        return zero(t, neg);
+    }
+    return round_wide(t, wide_mul(a, b));
+}
+
+/// a / b: the quotient of the significands to 128 bits by restoring
+/// division, the remainder's sticky bit.
+fn op_div(t: Fmt, a: Opnd, b: Opnd) u64 {
+    if (a.cls == Q) or (b.cls == Q) {
+        return nan_of(t, a, b, nonum(), false);
+    }
+    let neg = a.neg != b.neg;
+    if a.cls == I {
+        if b.cls == I {
+            return nan_of(t, a, b, nonum(), true);  // inf / inf
+        }
+        return inf(t, neg);
+    }
+    if b.cls == I {
+        return zero(t, neg);
+    }
+    if b.cls == Z {
+        if a.cls == Z {
+            return nan_of(t, a, b, nonum(), true);  // 0 / 0
+        }
+        __axc_math_err(m.ERANGE, 0x04);  // division by zero
+        return inf(t, neg);
+    }
+    if a.cls == Z {
+        return zero(t, neg);
+    }
+    let mut rh = a.h;
+    let mut rl = a.l;
+    let mut rc = false;  // the remainder's bit 128
+    let mut qh: u64 = 0;
+    let mut ql: u64 = 0;
+    for i in @as(i32, 0)..128 {
+        _ = i;
+        let ge = rc or (rh > b.h) or ((rh == b.h) and (rl >= b.l));
+        qh = (qh << 1) | (ql >> 63);
+        ql = ql << 1;
+        if ge {
+            let nl = rl -% b.l;
+            let br = b2u(rl < b.l);
+            rh = (rh -% b.h) -% br;
+            rl = nl;
+            ql = ql | 1;
+        }
+        rc = (rh >> 63) != 0;
+        rh = (rh << 1) | (rl >> 63);
+        rl = rl << 1;
+    }
+    let sticky = rc or (rh != 0) or (rl != 0);
+    // q = floor(A/B 2^127): its top bit at 127 (A >= B) or 126
+    let mut ex = a.e - b.e;
+    if (qh >> 63) == 0 {
+        qh = (qh << 1) | (ql >> 63);
+        ql = ql << 1;
+        ex -= 1;
+    }
+    return round_to(t, neg, ex, qh, ql, sticky);
+}
+
+/// sqrt(a): the integer square root of the significand (64 bits, digit by
+/// digit), the remainder's sticky bit.
+fn op_sqrt(t: Fmt, a: Opnd) u64 {
+    if a.cls == Q {
+        return nan_of(t, a, nonum(), nonum(), false);
+    }
+    if a.cls == Z {
+        return zero(t, a.neg);
+    }
+    if a.neg {
+        return nan_of(t, a, nonum(), nonum(), true);  // a negative operand
+    }
+    if a.cls == I {
+        return inf(t, false);
+    }
+    // a = M 2^(e - 127); M'' = M (e - 127 even) or M / 2 (exact: the low
+    // bits are zero), so that sqrt(a) = sqrt(M'') 2^E2, M'' in [2^126, 2^128)
+    let ee = a.e - 127;
+    let mut mh = a.h;
+    let mut ml = a.l;
+    let mut e2 = ee >> 1;
+    if (ee & 1) != 0 {
+        ml = (ml >> 1) | (mh << 63);
+        mh = mh >> 1;
+        e2 = (ee + 1) >> 1;
+    }
+    // s = floor(sqrt(M'')), 64 bits; the remainder M'' - s^2
+    let mut s: u64 = 0;
+    let mut remh: u64 = 0;
+    let mut reml: u64 = 0;
+    let mut remc: u64 = 0;  // the remainder's bits above 128
+    for i in @as(i32, 0)..64 {
+        _ = i;
+        // bring down two bits of M''
+        remc = (remc << 2) | (remh >> 62);
+        remh = (remh << 2) | (reml >> 62);
+        reml = (reml << 2) | (mh >> 62);
+        mh = (mh << 2) | (ml >> 62);
+        ml = ml << 2;
+        // the trial divisor 4 s + 1 (s has fewer than 63 bits until the end)
+        let th = s >> 62;
+        let tl = (s << 2) | 1;
+        let ge = (remc != 0) or (remh > th) or ((remh == th) and (reml >= tl));
+        s = s << 1;
+        if ge {
+            let nl = reml -% tl;
+            let br = b2u(reml < tl);
+            let nh = (remh -% th) -% br;
+            let bh = b2u(((remh < th) or ((remh == th) and (br != 0))));
+            remc = remc -% bh;
+            remh = nh;
+            reml = nl;
+            s = s | 1;
+        }
+    }
+    let sticky = (remc | remh | reml) != 0;
+    // sqrt(a) = s 2^(E2 - 63) + ..., bit 63 of s set
+    return round_to(t, false, e2 + 63, s, 0, sticky);
+}
+
+/// a b + c: the product exact, the sum exactly enough (wide_add), one
+/// rounding.
+fn op_fma(t: Fmt, a: Opnd, b: Opnd, c: Opnd) u64 {
+    let zero_inf = ((a.cls == Z) and (b.cls == I)) or ((a.cls == I) and (b.cls == Z));
+    if (a.cls == Q) or (b.cls == Q) or (c.cls == Q) {
+        return nan_of(t, a, b, c, zero_inf);
+    }
+    if zero_inf {
+        return nan_of(t, a, b, c, true);
+    }
+    let pneg = a.neg != b.neg;
+    if (a.cls == I) or (b.cls == I) {
+        if (c.cls == I) and (c.neg != pneg) {
+            return nan_of(t, a, b, c, true);  // inf - inf
+        }
+        return inf(t, pneg);
+    }
+    if c.cls == I {
+        return inf(t, c.neg);
+    }
+    if (a.cls == Z) or (b.cls == Z) {
+        // a zero product: c, or a zero's sign by the rule for sums
+        if c.cls == Z {
+            if pneg == c.neg {
+                return zero(t, pneg);
+            }
+            return zero(t, direction() == 2);
+        }
+        return round_num(t, c);
+    }
+    let p = wide_mul(a, b);
+    if c.cls == Z {
+        return round_wide(t, p);
+    }
+    return round_wide(t, wide_add(p, wide_of(c)));
+}
+
+// -----------------------------------------------------------------------------
+// The functions
+// -----------------------------------------------------------------------------
+
+inline fn f32_of(b: u64) f32 {
+    return @bit_cast(f32, @truncate(u32, b));
+}
+
+export fn fadd(x: f64, y: f64) f32 {
+    return f32_of(op_add(fmt_of(false), num_f64(m.bits(x)), num_f64(m.bits(y))));
+}
+
+export fn fsub(x: f64, y: f64) f32 {
+    return f32_of(op_add(fmt_of(false), num_f64(m.bits(x)), num_f64(m.bits(y) ^ 0x8000000000000000)));
+}
+
+export fn fmul(x: f64, y: f64) f32 {
+    return f32_of(op_mul(fmt_of(false), num_f64(m.bits(x)), num_f64(m.bits(y))));
+}
+
+export fn fdiv(x: f64, y: f64) f32 {
+    return f32_of(op_div(fmt_of(false), num_f64(m.bits(x)), num_f64(m.bits(y))));
+}
+
+export fn ffma(x: f64, y: f64, z: f64) f32 {
+    return f32_of(op_fma(fmt_of(false), num_f64(m.bits(x)), num_f64(m.bits(y)), num_f64(m.bits(z))));
+}
+
+export fn fsqrt(x: f64) f32 {
+    return f32_of(op_sqrt(fmt_of(false), num_f64(m.bits(x))));
+}
+
+/// The long double forms (std/c/lib/math/m_narrow.c): op 0 add, 1 subtract,
+/// 2 multiply, 3 divide, 4 fma, 5 sqrt of the format f's operands, to double
+/// (dbl) or float: the result's bits.
+export fn __axc_narrow(op: u64, f: u64, dbl: u64, x: *ld.W, y: *ld.W, z: *ld.W) u64 {
+    let fm = @truncate(u32, f);
+    let t = fmt_of(dbl != 0);
+    let a = num_ld(x, fm);
+    if op == 5 {
+        return op_sqrt(t, a);
+    }
+    let mut b = num_ld(y, fm);
+    if op == 0 {
+        return op_add(t, a, b);
+    }
+    if op == 1 {
+        b.neg = not b.neg;
+        return op_add(t, a, b);
+    }
+    if op == 2 {
+        return op_mul(t, a, b);
+    }
+    if op == 3 {
+        return op_div(t, a, b);
+    }
+    return op_fma(t, a, b, num_ld(z, fm));
+}
