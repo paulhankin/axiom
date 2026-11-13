@@ -124,7 +124,15 @@ a null pointer (`EOVERFLOW`) and `mktime` and `timegm` `(time_t)-1`.
   `$TZ`, it is the system's setting (`GetDynamicTimeZoneInformation`, with each year's
   rules from 1970 to 2037 from `GetTimeZoneInformationForYear` and the last year's
   after; `%Z` gives the system's names, such as "Eastern Standard Time"), read once as
-  well. On WebAssembly local time is UTC.
+  well. On WebAssembly, where the files are the host's, a host without them (a
+  browser; node on Windows), or a `$TZ` naming a zone that is not in the database,
+  gives the zone the host knows (`ax_tz_local`, `std/README.md`): the node host's is
+  the JavaScript engine's own, for `$TZ` or the system's setting, with its offsets to
+  the second from 1900 on and its rule after 2100, and its abbreviations in English
+  where it has them (else numeric, as `+0530`); daylight saving time is an offset
+  above one the zone has both in the year before and in the year after, which is the
+  database's flag except for negative daylight saving time (Ireland, Morocco) and
+  daylight saving time ended by a change of the standard offset.
 - **`mktime`** takes fields out of their ranges (each excess carried into the next field,
   as C17 7.27.2.3p2 says) and reads `tm_isdst` as POSIX does: positive presumes daylight
   saving time, 0 standard time, negative whichever is in force. A local time that occurs

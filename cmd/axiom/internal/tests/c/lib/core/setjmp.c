@@ -2,7 +2,7 @@
    (1 for 0); longjmp from nested calls, through a function pointer, from
    within a loop, with two buffers; objects not modified after setjmp
    (7.13.2.1p3) and volatile ones that were have their values. */
-/* native-only */
+/* wasm-flags: --features=+exception-handling */
 #include <setjmp.h>
 #include "print.h"
 

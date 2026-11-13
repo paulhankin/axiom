@@ -92,11 +92,6 @@ int main(void) {
     thrd_t t[THREADS];
     int i;
     mtx_init(&qm, mtx_plain);
-    /* (the memory the threads need, taken first: on WebAssembly a thread
-       that touches memory another thread's memory.grow has just added
-       sometimes traps out of bounds under node, an issue of the runtime's
-       memory growth that this test is not about) */
-    free(malloc(64 << 20));
     for (i = 0; i < THREADS; i++)
         thrd_create(&t[i], work, (void *)(long)(i + 1));
     for (i = 0; i < THREADS; i++)

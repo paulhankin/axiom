@@ -11,15 +11,11 @@
 // imported because this module must not make a program threaded: std/sync
 // imports std/thread (for its tests), and a WebAssembly program that has
 // std/thread runs on a shared memory, which needs the atomics extension.
-// Every wait goes through `wait`, which knows two things std/sync does not:
-//   - on WebAssembly, while no thread has been started (std/mem's
-//     threads_enabled), nothing can wake a waiting thread and the memory
-//     may not be shared (where @atomic_wait traps): a wait sleeps until its
-//     timeout (or for ever);
-//   - on WebAssembly a thread other than the main one cannot end the process
-//     (its host ends only that thread): its exit asks the main thread to,
-//     and the main thread's waits here look for that request (in slices of
-//     at most 50 ms) and end the process with the status (exit_request).
+// Every wait goes through `wait`, which knows what std/sync does not: on
+// WebAssembly, while no thread has been started (std/mem's
+// threads_enabled), nothing can wake a waiting thread and the memory may
+// not be shared (where @atomic_wait traps): a wait sleeps until its timeout
+// (or for ever).
 //
 // No int crosses (its width is the build's, --c-int): results are the
 // <threads.h> codes as i64 (std/c/include/threads.h: thrd_success 0,
@@ -29,7 +25,6 @@
 // mtx_t is Mtx, cnd_t Cnd, once_flag Once, all of 64-bit fields.
 // =============================================================================
 import "../../mem.ax" as mem;
-import "../../os.ax" as os;
 
 import host "axiom" {
     fn ax_clock_ns(clock: u32) i64;
@@ -61,7 +56,6 @@ const TIMED: u64 = 2;
 const DTOR_ITERATIONS: u32 = 4;
 
 const FOREVER: i64 = -1;
-const SLICE_NS: i64 = 50_000_000;
 
 fn is_wasm() bool {
     return @target_arch("wasm32") or @target_arch("wasm64");
@@ -110,49 +104,14 @@ pub fn me() u64 {
 }
 
 // -----------------------------------------------------------------------------
-// Waiting, and the exit of a WebAssembly program from another thread
+// Waiting
 // -----------------------------------------------------------------------------
-
-/// Whether the calling thread is a WebAssembly worker that thrd_create
-/// started (threads_spawn.ax sets it): it cannot end the process.
-pub threadlocal let mut on_worker: bool = false;
-
-// exit's request to the main thread: its status, and 1 once made
-let mut exit_requested: u32 = 0;
-let mut exit_status: i64 = 0;
-// the word the main thread waits on (0: none), which a request wakes
-let mut main_waits_on: usize = 0;
-
-/// Ends the process with the status an exit on another thread asked for,
-/// if it did (on the main thread of a WebAssembly program).
-pub fn exit_request() void {
-    if @atomic_load(&exit_requested) != 0 {
-        os.exit(@truncate(i32, @atomic_load(&exit_status)));
-    }
-}
-
-/// (WebAssembly, a worker: exit's end, std/c/lib/threads/__axc_thrd_atexit)
-/// Asks the main thread to end the process with `status`, and waits for it.
-pub fn request_exit(status: i64) void {
-    @atomic_store(&mut exit_status, status);
-    @atomic_store(&mut exit_requested, 1);
-    let w = @atomic_load(&main_waits_on);
-    if w != 0 {
-        _ = @atomic_notify(@ptr_from_int(*u32, w), 0xFFFF_FFFF);
-    }
-    loop {
-        ax_sleep_ns(3_600_000_000_000);
-    }
-}
 
 /// Waits while *p is v, for at most timeout_ns nanoseconds (FOREVER: no
 /// limit), as @atomic_wait: 0 woken, 1 *p was not v, 2 timed out. (See the
-/// header for WebAssembly's two cases.)
+/// header for WebAssembly without threads.)
 pub fn wait(p: *u32, v: u32, timeout_ns: i64) u32 {
-    if not is_wasm() {
-        return @atomic_wait(p, v, timeout_ns);
-    }
-    if not mem.threads_enabled() {
+    if is_wasm() and not mem.threads_enabled() {
         if @atomic_load(p) != v {
             return 1;
         }
@@ -164,32 +123,7 @@ pub fn wait(p: *u32, v: u32, timeout_ns: i64) u32 {
         ax_sleep_ns(@bit_cast(u64, timeout_ns));
         return 2;
     }
-    if on_worker {
-        return @atomic_wait(p, v, timeout_ns);
-    }
-    // the main thread: in slices, between which it looks for a request
-    let mut left = timeout_ns;
-    loop {
-        exit_request();
-        let mut t = SLICE_NS;
-        if (left >= 0) and (left < t) {
-            t = left;
-        }
-        @atomic_store(&mut main_waits_on, @int_from_ptr(p));
-        let start = ax_clock_ns(1);
-        let r = @atomic_wait(p, v, t);
-        @atomic_store(&mut main_waits_on, 0);
-        if r != 2 {
-            exit_request();
-            return r;
-        }
-        if left >= 0 {
-            left -= @max(ax_clock_ns(1) - start, 1);
-            if left <= 0 {
-                return 2;
-            }
-        }
-    }
+    return @atomic_wait(p, v, timeout_ns);
 }
 
 // The nanoseconds from now to the real-time deadline (FOREVER for none),
@@ -597,24 +531,11 @@ pub fn run_dtors() void {
 // thrd_sleep, thrd_yield
 // -----------------------------------------------------------------------------
 
-let mut never: u32 = 0;  // (a word nothing changes, to sleep on)
-
 /// thrd_sleep (7.26.5.7): sleeps for ns nanoseconds; 0 (it is not ended
 /// early by a signal: the runtime's sleep resumes after one).
 export fn __axc_thrd_sleep(ns: i64) i64 {
     if ns <= 0 {
         return 0;
-    }
-    if is_wasm() and mem.threads_enabled() and not on_worker {
-        // (the main thread: so that it sees an exit request)
-        let end = ax_clock_ns(1) + ns;
-        loop {
-            let left = end - ax_clock_ns(1);
-            if left <= 0 {
-                return 0;
-            }
-            _ = wait(&never, 0, left);
-        }
     }
     ax_sleep_ns(@bit_cast(u64, ns));
     return 0;

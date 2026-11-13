@@ -974,6 +974,14 @@ int32_t ax_os(void) {
 #endif
 }
 
+/* The host's local time zone as a TZif file (std/time/tz, Zone.from_host): none
+   (-2), where the local zone is the system's files. */
+intptr_t ax_tz_local(uint8_t *buf, size_t cap) {
+    (void)buf;
+    (void)cap;
+    return -2;
+}
+
 // The processor's extensions as std/os/cpu.ax's A_* bits, on AArch64 Linux
 // (the kernel's hardware capabilities). x86-64 programs ask cpuid: 0.
 #if defined(__aarch64__) && defined(__linux__)

@@ -16,8 +16,10 @@
 // file's last transition follow its POSIX TZ rule, as do zones made from a
 // TZ string by parse_posix ("EST5EDT,M3.2.0,M11.1.0"). local follows $TZ
 // (a zone name, a file or a rule) and then /etc/localtime, like the C
-// library; on Windows, without $TZ, the system's setting (windows_local).
-// Leap seconds are ignored, as they are by time.Time.
+// library; on Windows, without $TZ, the system's setting (windows_local);
+// and then the host's zone (from_host: on WebAssembly, the zone the
+// JavaScript engine has, which needs no database). Leap seconds are
+// ignored, as they are by time.Time.
 //
 // Zone names are checked before they are used as paths ("../x" and
 // absolute names are refused), and TZif files are validated, so neither
@@ -40,6 +42,11 @@ extern "C" {
 }
 
 pub error TzError { UnknownZone, Corrupt, NonExistent, Ambiguous, OutOfMemory, NotFound, Done, InvalidUtf8 }
+
+import host "axiom" {
+    // the host's local zone as a TZif file; -2 if it has none (std/README.md)
+    fn ax_tz_local(buf: *mut u8, cap: usize) isize;
+}
 
 /// What a zone says of an instant.
 pub struct Info {
@@ -140,14 +147,16 @@ pub struct Zone {
     }
 
     /// The local time zone: from $TZ (":name", "name", "/path" or a POSIX
-    /// rule), else /etc/localtime (on Windows the system's setting:
-    /// windows_local), else UTC.
+    /// rule), else the platform's: /etc/localtime (on Windows the system's
+    /// setting: windows_local), else the host's zone (from_host:
+    /// WebAssembly), else UTC. A zone name that is not in the database is
+    /// the host's zone too (the host follows $TZ).
     pub fn local() TzError!Zone {
         let tzv = os.getenv("TZ") catch {
             if @target_os("windows") {
                 return windows_local();
             }
-            let data = fs.read_file("/etc/localtime") catch return Zone.utc();
+            let data = fs.read_file("/etc/localtime") catch return Zone.from_host() catch Zone.utc();
             defer mem.free(data);
             return Zone.parse_tzif(data) catch Zone.utc();
         };
@@ -165,9 +174,32 @@ pub struct Zone {
             return Zone.parse_tzif(data) catch Zone.utc();
         }
         let z = Zone.load(s) catch {
-            return Zone.parse_posix(s) catch Zone.utc();
+            return Zone.parse_posix(s) catch (Zone.from_host() catch Zone.utc());
         };
         return z;
+    }
+
+    /// The host's local zone: on WebAssembly, the zone the host knows
+    /// (std/internal/runtime/host.mjs: the JavaScript engine's, from its
+    /// Date and Intl, as a TZif file, for 1900 to 2100 and its rule after).
+    /// NotFound where the host has none (native targets, whose local zone
+    /// is the files local reads).
+    pub fn from_host() TzError!Zone {
+        let mut cap: usize = 8192;
+        loop {
+            let buf = mem.alloc.[u8](cap)!;
+            let n = ax_tz_local(buf.ptr, cap);
+            if n < 0 {
+                mem.free(buf);
+                return error.NotFound;
+            }
+            if @int_cast(usize, n) <= cap {
+                defer mem.free(buf);
+                return Zone.parse_tzif(buf[..@int_cast(usize, n)]);
+            }
+            mem.free(buf);
+            cap = @int_cast(usize, n);
+        }
     }
 
     /// A zone from a POSIX TZ string, such as "EST5EDT,M3.2.0,M11.1.0" or

@@ -8,8 +8,11 @@
    address cannot be taken (C3301). The linkers provide both functions
    (cmd/axiom/src/jstub.ax), which save and restore the registers the
    platform's calling convention keeps across a call; longjmp unwinds
-   nothing (on Windows, no handlers of the frames it leaves run). Not
-   available on WebAssembly (C3300). Jumping out of Axiom functions that
+   nothing (on Windows, no handlers of the frames it leaves run). On
+   WebAssembly, with its exception-handling extension
+   (--features=+exception-handling; else C3300), longjmp throws an
+   exception that the function which called setjmp catches
+   (cmd/axiom/src/c/cgen_sjlj.ax). Jumping out of Axiom functions that
    C called, or into a function whose variable length arrays have changed
    since setjmp, is undefined. */
 #ifndef __AXIOM_SETJMP_H

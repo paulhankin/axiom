@@ -217,10 +217,83 @@ fn table_index(fi: i64) u32 {
     return slot;
 }
 
+// The exception tag of setjmp and longjmp (the exception-handling
+// extension: wasm.ax, "setjmp and longjmp"): one, __axc_longjmp_tag,
+// defined by the module, carrying a jmp_buf's address. Its type index.
+let mut tag_used: bool = false;
+let mut tag_type: u32 = 0;
+
+fn tag_index(ui: usize, si: u32, w64: bool) u64 {
+    let s = U()[ui].syms.at(@as(usize, si));
+    if not u.str_eq(s.name, "__axc_longjmp_tag") {
+        err(u.f1("undefined tag '%s'", s.name));
+    }
+    if not tag_used {
+        tag_used = true;
+        tag_type = final_type_enc(u.pick(w64, "\x60\x01\x7e\x00", "\x60\x01\x7f\x00"));
+    }
+    return 0;
+}
+
+/// longjmp for WebAssembly with the exception-handling extension (a unit of
+/// its own, weak, kept if referenced, as the native linkers' jstub.ax):
+/// stores its value (1 for 0) as the jmp_buf's third word (byte 16) and
+/// throws __axc_longjmp_tag with the jmp_buf's address. A function that
+/// calls setjmp catches it (wasm.ax). Two entries: longjmp(env, int) for a
+/// freestanding program, and __axc_longjmp_restore(env, val: i64), where
+/// the hosted C library's longjmp ends (std/c/rt/core_jump.ax).
+pub fn longjmp_unit(w64: bool) *mut wo.Unit {
+    let un = wo.new_unit(w64);
+    let pt = u.pick(w64, "\x7e", "\x7f");
+    un.timports.push(wo.Import.{ module: "env", name: "__axc_longjmp_tag", ty: wo.type_index(un, pt, ""),
+                                 mutable: false });
+    let tag = wo.add_sym(un, wo.Sym.{ kind: wo.SYM_TAG, flags: wo.F_UNDEFINED, name: "__axc_longjmp_tag", index: 0,
+                                      seg: 0, off: 0, size: 0 });
+    jump_func(un, "longjmp", wo.type_index(un, u.cat2(pt, "\x7f"), ""), false, tag);
+    jump_func(un, "__axc_longjmp_restore", wo.type_index(un, u.cat2(pt, "\x7e"), ""), true, tag);
+    return un;
+}
+
+// One of longjmp_unit's functions: (env, val), val an i64 if wide.
+fn jump_func(un: *mut wo.Unit, name: []u8, ty: u32, wide: bool, tag: u32) void {
+    let f = u.new.[wo.Func]();
+    f.ty = ty;
+    f.name = name;
+    let mut b = bn.new_bytes();
+    b.uleb(0);  // no locals
+    // env[2] = val != 0 ? val : 1 (i32.store offset=16)
+    b.put("\x20\x00\x20\x01");
+    if wide {
+        b.u8_(0xa7);  // i32.wrap_i64
+    }
+    b.put("\x41\x01\x20\x01");
+    if wide {
+        b.u8_(0xa7);
+    }
+    b.put("\x1b\x36\x02\x10");
+    b.put("\x20\x00\x08");  // throw
+    f.relocs.push(wo.Reloc.{ ty: wo.R_TAG_INDEX_LEB, off: @int_cast(u32, b.len()), sym: tag, addend: 0 });
+    b.uleb5(0);
+    b.u8_(0x0b);
+    f.body = b;
+    let fi = @int_cast(u32, un.funcs.len);
+    f.sym = wo.add_sym(un, wo.Sym.{ kind: wo.SYM_FUNC, flags: wo.F_WEAK, name: name, index: fi, seg: 0, off: 0,
+                                    size: 0 });
+    un.funcs.push(f);
+}
+
+// The address of the word __axiom_memory_pages (the memory's size in pages
+// as the threads have grown it; wasm.ax, "A thread's view of a growing
+// shared memory"), after the data.
+let mut pages_addr: u64 = 0;
+
 fn data_addr(ui: usize, si: u32) u64 {
     let r = resolve(ui, si);
     if r.un < 0 {
         let s = U()[ui].syms.at(@as(usize, si));
+        if u.str_eq(s.name, "__axiom_memory_pages") {
+            return pages_addr;
+        }
         if (s.flags & wo.F_WEAK) == 0 {
             err(u.f1("undefined symbol '%s'", s.name));
         }
@@ -297,6 +370,8 @@ fn apply(ui: usize, d: *mut bn.Bytes, rs: *u.List.[wo.Reloc], w64: bool) void {
             d.set_uleb_n(off, @bit_cast(u64, global_index(ui, r.sym)), 5);
         } else if t == wo.R_TABLE_NUMBER_LEB {
             d.set_uleb_n(off, 0, 5);
+        } else if t == wo.R_TAG_INDEX_LEB {
+            d.set_uleb_n(off, tag_index(ui, r.sym, w64), 5);
         } else {
             err(u.f1("unsupported relocation type %s", u.idec(@as(i32, t))));
         }
@@ -335,6 +410,7 @@ pub fn link(us: []mut *mut wo.Unit, o: *Options) []u8 {
     units_p = us.ptr;
     nunits = us.len;
     failed = false;
+    tag_used = false;
     new_maps();
     collect_defs();
     liveness(o);
@@ -436,7 +512,8 @@ fn number_funcs(m: *mut Mod) void {
 }
 
 // Memory: the stack, then the live segments (and a shared memory's
-// initialization flag). False if it is too large (reported).
+// initialization flag), then the word __axiom_memory_pages. False if it is
+// too large (reported).
 fn lay_out_memory(m: *mut Mod, o: *Options) bool {
     let mut addr: u64 = (o.stack_size + 15) & ~@as(u64, 15);
     m.stack_top = addr;
@@ -457,6 +534,8 @@ fn lay_out_memory(m: *mut Mod, o: *Options) bool {
     if o.shared_memory {
         addr = m.flag_addr + 4;
     }
+    pages_addr = (addr + 7) & ~@as(u64, 7);
+    addr = pages_addr + 8;
     let data_end = (addr + 15) & ~@as(u64, 15);
     if not m.w64 and (data_end > 0x1_0000_0000) {
         // (the globals together fit an object, E0473, but not with a stack this large)
@@ -648,6 +727,14 @@ fn emit(m: *mut Mod, o: *Options) []u8 {
         c.uleb(m.pages);
         section(&mut out, 5, &mut c);
     }
+    // tag (longjmp's)
+    if tag_used {
+        c = bn.new_bytes();
+        c.uleb(1);
+        c.u8_(0);
+        c.uleb(@as(u64, tag_type));
+        section(&mut out, 13, &mut c);
+    }
     // global
     c = bn.new_bytes();
     c.uleb(@as(u64, m.gtypes.len));
@@ -819,11 +906,20 @@ fn body_addr(k: u32) u64 {
     return body_offs.get(@as(usize, k));
 }
 
+// The debug sections: each unit's own DWARF (DEBUG_FULL: wobj.ax's
+// Unit.dbg), its pieces appended in the units' order and its fixups
+// resolved; then, for the units without (their functions' line tables
+// only), one compilation unit made here, at the level of lines. A unit none
+// of whose functions are kept contributes nothing; a reference to a
+// function or datum that is not kept is the tombstone address -1 (the
+// tool conventions' for DWARF), and a unit's code is the span of its kept
+// functions, which the linker keeps together and in order.
 fn debug_sections(out: *mut bn.Bytes, m: *Mod, code_size: u64) void {
     let mut any = false;
     for k in 0..m.fbody.len {
         let r = m.fbody.get(k);
-        any = any or (U()[@int_cast(usize, r.un)].funcs.get(@as(usize, r.sym)).lines.len > 0);
+        let un = U()[@int_cast(usize, r.un)];
+        any = any or (un.funcs.get(@as(usize, r.sym)).lines.len > 0) or (un.dbg.len > 0);
     }
     if not any {
         return;
@@ -832,38 +928,171 @@ fn debug_sections(out: *mut bn.Bytes, m: *Mod, code_size: u64) void {
     if m.w64 {
         asz = 8;
     }
-    let mut d = dw.begin(dw.ARCH_WASM, asz, 1);
-    d.lang = dw.lang();
-    for k in 0..m.fbody.len {
-        let r = m.fbody.get(k);
-        let f = U()[@int_cast(usize, r.un)].funcs.get(@as(usize, r.sym));
-        let df = dw.Func.{ sym: @int_cast(u32, k), name: dw.name_of(f.name), external: false, size: body_sizes.get(k),
-                           src: f.src, rows: f.lines.items(), scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](),
-                           regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
-                           vlocs: u.nil_slice.[dloc.VLoc]() };
-        dw.add_func(&mut d, &df);
-    }
-    if body_offs.len > m.fbody.len {
-        // the start function (a shared memory's segments initialized), which
-        // has no source: a subprogram all of whose code is line 0
-        let k = m.fbody.len;
-        let df = dw.Func.{ sym: @int_cast(u32, k), name: "axiom.start", external: false, size: body_sizes.get(k),
-                           src: 0, rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](),
-                           regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
-                           vlocs: u.nil_slice.[dloc.VLoc]() };
-        dw.add_func(&mut d, &df);
-    }
-    let secs = dw.finish_linked(&mut d, 0, code_size, body_addr);
     for k in 0..dw.NSEC {
-        let mut b = secs[k];
-        if b.len() > 0 {
-            let mut c = bn.new_bytes();
-            c.name(dw.SEC_NAMES[k]);
-            c.put(b.view());
-            b.free();
-            section(out, 0, &mut c);
+        MERGED[k] = bn.new_bytes();
+    }
+    // the units' own
+    for ui in 0..nunits {
+        let un = U()[ui];
+        if un.dbg.len == 0 {
+            continue;
+        }
+        let mut lo: u64 = 0xffff_ffff_ffff_ffff;
+        let mut hi: u64 = 0;
+        for di in 0..un.funcs.len {
+            let fi = MP()[ui].fidx[un.fimports.len + di];
+            if fi >= 0 {
+                let k = @int_cast(usize, fi) - m.nimp;
+                lo = @min(lo, body_offs.get(k));
+                hi = @max(hi, body_offs.get(k) + body_sizes.get(k));
+            }
+        }
+        if hi > 0 {
+            merge_dwarf(un.dbg.items(), un.dbg_fx.items(), @int_cast(i64, ui), lo, hi, m);
         }
     }
+    // the others' line tables: one unit made here, over their functions (and
+    // the start function, a shared memory's segments initialized, which has
+    // no source: a subprogram all of whose code is line 0)
+    let mut d = dw.begin(dw.ARCH_WASM, asz, 1);
+    d.lang = dw.lang();
+    let mut lo: u64 = 0xffff_ffff_ffff_ffff;
+    let mut hi: u64 = 0;
+    for k in 0..body_offs.len {
+        let mut name = "axiom.start";
+        let mut src: u32 = 0;
+        let mut rows = u.nil_slice.[u64]();
+        if k < m.fbody.len {
+            let r = m.fbody.get(k);
+            let un = U()[@int_cast(usize, r.un)];
+            if un.dbg.len > 0 {
+                continue;
+            }
+            let f = un.funcs.get(@as(usize, r.sym));
+            name = dw.name_of(f.name);
+            src = f.src;
+            rows = f.lines.items();
+        }
+        lo = @min(lo, body_offs.get(k));
+        hi = @max(hi, body_offs.get(k) + body_sizes.get(k));
+        let df = dw.Func.{ sym: @int_cast(u32, k), name: name, external: false, size: body_sizes.get(k), src: src,
+                           rows: rows, scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](), regs: u.nil_slice.[u64](),
+                           irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                           frame_local: -1 };
+        dw.add_func(&mut d, &df);
+    }
+    if hi > 0 {
+        let parts = dw.finish_parts(&mut d);
+        let mut secs = u.List.[wo.DbgSec].empty();
+        let mut fxs = u.List.[wo.DbgFix].empty();
+        for k in 0..dw.NSEC {
+            secs.push(wo.DbgSec.{ name: dw.SEC_NAMES[k], data: parts[k].b });
+            for x in parts[k].fx.items() {
+                fxs.push(wo.DbgFix.{ sec: @int_cast(u32, k), off: x.off, kind: x.kind, sym: x.sym, addend: x.addend });
+            }
+        }
+        merge_dwarf(secs.items(), fxs.items(), -1, lo, hi, m);
+    }
+    for k in 0..dw.NSEC {
+        if MERGED[k].len() > 0 {
+            let mut c = bn.new_bytes();
+            c.name(dw.SEC_NAMES[k]);
+            c.put(MERGED[k].view());
+            section(out, 0, &mut c);
+        }
+        MERGED[k].free();
+    }
+    _ = code_size;
+}
+
+// The module's debug sections, as debug_sections builds them.
+let mut MERGED: [9]bn.Bytes = [bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } }; 9];
+
+// Appends one unit's DWARF (its sections, by name, and its fixups) to the
+// module's, its fixups resolved: an address of a symbol of unit ui (ui < 0:
+// of function k of the module, the unit made here), of the unit's code
+// (lo), its size (hi - lo), offsets in its own sections.
+fn merge_dwarf(secs: []wo.DbgSec, fxs: []wo.DbgFix, ui: i64, lo: u64, hi: u64, m: *Mod) void {
+    let mut asz: u64 = 4;
+    if m.w64 {
+        asz = 8;
+    }
+    let mut base: [9]u64 = [0; 9];
+    let mut at: [9]i64 = [-1; 9];  // the unit's sections' kinds (dwarf.ax's D_*), by its numbering
+    for j in 0..@min(secs.len, 9) {
+        for k in 0..dw.NSEC {
+            if u.str_eq(dw.SEC_NAMES[k], secs[j].name) {
+                at[j] = @int_cast(i64, k);
+                base[k] = @as(u64, MERGED[k].len());
+                MERGED[k].put(secs[j].data.view());
+            }
+        }
+    }
+    for x in fxs {
+        if (x.sec >= 9) or (at[@as(usize, x.sec)] < 0) {
+            continue;
+        }
+        let k = @int_cast(usize, at[@as(usize, x.sec)]);
+        let off = @truncate(usize, base[k] + x.off);
+        if x.kind == wo.DFX_SEC {
+            let mut tb: u64 = 0;
+            if (x.sym < 9) and (at[@as(usize, x.sym)] >= 0) {
+                tb = base[@int_cast(usize, at[@as(usize, x.sym)])];
+            }
+            MERGED[k].set_u32(off, (tb + @bit_cast(u64, x.addend)) & 0xffff_ffff);
+        } else if x.kind == wo.DFX_SIZE {
+            put_n(&mut MERGED[k], off, @as(u64, x.sym), hi - lo);
+        } else if x.kind == wo.DFX_ADDR {
+            let mut a: u64 = 0xffff_ffff_ffff_ffff;
+            if x.sym == dw.TEXT_SYM {
+                a = lo;
+            } else {
+                let mut w: u64 = 0xffff_ffff_ffff_ffff;
+                if ui < 0 {
+                    w = body_offs.get(@as(usize, x.sym));
+                } else {
+                    w = sym_addr(@int_cast(usize, ui), x.sym, m);
+                }
+                if w != 0xffff_ffff_ffff_ffff {
+                    a = w +% @bit_cast(u64, x.addend);
+                }
+            }
+            put_n(&mut MERGED[k], off, asz, a);
+        }
+    }
+}
+
+// n bytes (4 or 8) of v at offset off.
+fn put_n(b: *mut bn.Bytes, off: usize, n: u64, v: u64) void {
+    if n == 8 {
+        b.set_u64(off, v);
+    } else {
+        b.set_u32(off, v & 0xffff_ffff);
+    }
+}
+
+// The address of symbol si of unit ui (a function's code offset, a
+// datum's address), or -1 if it is not kept.
+fn sym_addr(ui: usize, si: u32, m: *Mod) u64 {
+    let un = U()[ui];
+    if @as(usize, si) >= un.syms.len {
+        return 0xffff_ffff_ffff_ffff;
+    }
+    let s = un.syms.at(@as(usize, si));
+    if s.kind == wo.SYM_FUNC {
+        if (s.flags & wo.F_UNDEFINED) != 0 {
+            return 0xffff_ffff_ffff_ffff;
+        }
+        let fi = MP()[ui].fidx[@as(usize, s.index)];
+        if fi < 0 {
+            return 0xffff_ffff_ffff_ffff;
+        }
+        return body_offs.get(@int_cast(usize, fi) - m.nimp);
+    }
+    if (s.kind == wo.SYM_DATA) and ((s.flags & wo.F_UNDEFINED) == 0) and MP()[ui].slive[@as(usize, s.seg)] {
+        return MP()[ui].saddr[@as(usize, s.seg)] + s.off;
+    }
+    return 0xffff_ffff_ffff_ffff;
 }
 
 // The function names (for engine stack traces).

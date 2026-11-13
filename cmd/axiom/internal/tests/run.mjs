@@ -13,6 +13,7 @@
 //   // selfhost-only: <why>    skip with the bootstrap compiler (whose LLVM differs:
 //                              it folds an integer round trip of a pointer, say)
 //   // x86-64-flags: --cpu=x86-64  extra flags for a native build on an x86-64 host
+//   // wasm-flags: --features=+tail-call  extra flags for a WebAssembly build
 //   // link: file.c            C source (next to the test) compiled and linked in
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
@@ -113,7 +114,7 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, linuxOnly: false, selfhostOnly: null, links: [], header: null };
+  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmFlags: [], wasmOnly: false, nativeOnly: false, linuxOnly: false, selfhostOnly: null, links: [], header: null };
   for (const [i, line] of src.split('\n').entries()) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
@@ -122,6 +123,7 @@ function directives(src) {
     else if ((m = line.match(/\/\/ expect-error: (E\d+)/))) d.errors.push(m[1]);
     else if ((m = line.match(/\/\/ flags: (.*)$/))) d.flags.push(...m[1].trim().split(/\s+/));
     else if ((m = line.match(/\/\/ x86-64-flags: (.*)$/))) d.x64Flags.push(...m[1].trim().split(/\s+/));
+    else if ((m = line.match(/\/\/ wasm-flags: (.*)$/))) d.wasmFlags.push(...m[1].trim().split(/\s+/));
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
     else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
     else if (/\/\/ linux-only\b/.test(line)) d.linuxOnly = true;
@@ -379,6 +381,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
   if (native) args.push(nativeTarget, `--link=${path.join(root, noC ? 'cmd/axiom/internal/tests/native_rt.ax' : 'cmd/axiom/internal/tests/native_rt.c')}`);
   if (native && process.arch === 'x64' && !process.env.AXIOM_NATIVE_TARGET) args.push(...d.x64Flags);
+  if (!native) args.push(...d.wasmFlags);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
   if (d.header) args.push(`--emit-header=${path.join(dir, d.header)}`);
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
@@ -446,7 +449,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // c/host_native.c's, compiled by the system's C compiler, or for Windows and
 // macOS c/host_c.c's, a second translation unit over the platform's C library
 // (tests marked /* linux-only */ need the former; /* not-windows */ ones are
-// skipped for a Windows target). /* units: a.c */ names more
+// skipped for a Windows target; /* wasm-flags: */ are more flags for a
+// WebAssembly build). /* units: a.c */ names more
 // translation units, next to the test (c/run/abi/). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
 // only checked (axiom check, with its own --target), not built or run.
@@ -459,6 +463,8 @@ const cRunTest = async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   if (native && noC && /\/\* linux-only \*\//.test(src)) return { skip: true, reason: 'links C code' };
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
+  // (/* wasm-flags: ... */: more flags for a WebAssembly build)
+  if (!native) flags.push(...[...src.matchAll(/\/\* wasm-flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/)));
   // (/* units: a.c b.c */: more translation units, next to the test)
   flags.push(...[...src.matchAll(/\/\* units: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/)).map((u) => path.join(path.dirname(f), u)));
   const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
@@ -485,9 +491,6 @@ const cRunTest = async (f) => {
   // library, not the compiler's, whose names would take the place of its)
   else if (native && !pinned) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`, '--c-freestanding');
   else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
-  // (the test host runs no wasm64 program that uses the runtime's host
-  // functions, as the C library's exit does: those tests are freestanding)
-  if (!native && (flags.includes('--target=wasm64') || (process.env.AXIOM_C_TARGET === 'wasm64' && !flags.some((x) => x.startsWith('--target='))))) args.push('--c-freestanding');
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
   if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
   let json = null;
@@ -517,7 +520,7 @@ await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/pr
 // with C units) or main.c (a C program with Axiom modules) is built with the
 // directory's other .c files (and, for main.c, its .ax files), sorted, then
 // those its `uses:` directive names, at the suite's optimization level for
-// wasm32 (not for AXIOM_C_TARGET=wasm64) or with --native for the machine,
+// wasm32 (AXIOM_C_TARGET=wasm64: wasm64) or with --native for the machine,
 // with no system C compiler or library: the tests print through
 // c/mix/print.ax. Directives of the main file, in // or /* */ comments:
 // expect: <line>, expect-error: <code> (the build fails with it),
@@ -540,8 +543,6 @@ const cMixTest = async (dir) => {
   if (!native && has('linux-only')) return { skip: true, reason: 'Linux only' };
   if (has('windows-only') && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
   if (has('x86-64-only') && native && /aarch64/.test(process.env.AXIOM_NATIVE_TARGET || '')) return { skip: true, reason: 'x86-64 only' };
-  // (the node host's CLI does not run std/io programs for wasm64)
-  if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return { skip: true, reason: 'wasm32 only' };
   const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
   const uses = dv('uses').flatMap((x) => x.trim().split(/\s+/)).map((x) => path.resolve(dir, x));
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
@@ -578,7 +579,7 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // cmd/axiom/internal/tests/c/lib/<part>/*.c is a hosted C program, built
 // with the library (and c/mix/print.ax, which print.h declares, and the
 // files of its uses: directive) at the suite's optimization level for wasm32
-// (AXIOM_C_TARGET=wasm64: wasm64, built only), or with --native for the
+// (AXIOM_C_TARGET=wasm64: wasm64), or with --native for the
 // machine, and run in a process of its own whose working directory is a
 // scratch directory. Directives, in // or /* */ comments: expect: <line>
 // (standard output, in order), expect-status: <n> (default 0),
@@ -592,7 +593,10 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // <line> (the lines are the standard input, else it is empty);
 // merge-stderr (standard error goes to standard output's file, so that the
 // order of the two shows); check-only (only checked, with axiom check:
-// with expect-error: codes, it must fail with them).
+// with expect-error: codes, it must fail with them); host-flags: <flags>
+// (on WebAssembly, for the node host: --files=memory, --root=dir);
+// wasm-flags: <flags> (more compiler flags on WebAssembly, such as
+// --features=+exception-handling).
 const cLibDir = path.join(root, 'cmd/axiom/internal/tests/c/lib');
 const cLibFiles = fs.existsSync(cLibDir) ? fs.readdirSync(cLibDir).filter((n) => fs.statSync(path.join(cLibDir, n)).isDirectory()).sort()
   .flatMap((n) => cFilesIn(path.join(cLibDir, n))) : [];
@@ -608,6 +612,7 @@ const cLibTest = async (f) => {
   if (has('windows-only') && !(native && /windows/.test(nt))) return { skip: true, reason: 'Windows only' };
   if (has('x86-64-only') && native && /aarch64/.test(nt)) return { skip: true, reason: 'x86-64 only' };
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
+  if (!native) flags.push(...dv('wasm-flags').flatMap((x) => x.trim().split(/\s+/)));
   const errors = dv('expect-error');
   if (has('check-only')) {
     const c = await spawnAsync(compiler, ['check', f, '--format=agent-json', ...flags], { encoding: 'utf8', timeout: compileTimeout });
@@ -637,8 +642,6 @@ const cLibTest = async (f) => {
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
   if (buildOnly) return checkBuilt(out);
   { const bad = checkWindowsExe(out); if (bad) return bad; }
-  // (the node host's CLI does not run std/io programs for wasm64: built only)
-  if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return null;
   const cwd = path.join(tmp, `clib-${rel}.dir`);
   fs.mkdirSync(cwd, { recursive: true });
   const stdinLines = dv('stdin');
@@ -646,7 +649,8 @@ const cLibTest = async (f) => {
   const merged = has('merge-stderr');
   const outFile = path.join(cwd, 'out.txt'), errFile = path.join(cwd, 'err.txt');
   const outFd = fs.openSync(outFile, 'w'), errFd = merged ? outFd : fs.openSync(errFile, 'w');
-  const [cmd, ...cargs] = native ? [...execWrap, out] : [process.execPath, path.join(root, 'std/internal/runtime/host.mjs'), out];
+  const hostFlags = dv('host-flags').flatMap((x) => x.trim().split(/\s+/));
+  const [cmd, ...cargs] = native ? [...execWrap, out] : [process.execPath, path.join(root, 'std/internal/runtime/host.mjs'), ...hostFlags, out];
   const r = await new Promise((resolve) => {
     let p;
     // (env: NAME=value: in the program's environment)
@@ -1150,7 +1154,11 @@ await section('', {
     if (!json.tests) return `no test results (status ${c.status}):\n${c.stdout}${c.stderr}`;
     const render = (frames) => frames.map((x) => (x.repeat ? `~${x.repeat}` : x.omitted ? null : x.line ? `${x.function}@${x.line}` : x.function))
       .filter((x) => x !== null).join(' ');
-    for (const [, kind, tname, want] of src.matchAll(/^\/\/ (stack|errors): (.+?) \| (.+)$/gm)) {
+    // (// stack-wasm-O0: on WebAssembly below -O2, in place of that test's stack:)
+    const wasmStack = new Map([...src.matchAll(/^\/\/ stack-wasm-O0: (.+?) \| (.+)$/gm)].map((m) => [m[1], m[2]]));
+    const low = !extraFlags.some((a) => a === '-O2' || a === '-O3') && !bootstrapCompiler();
+    for (const [, kind, tname, want0] of src.matchAll(/^\/\/ (stack|errors): (.+?) \| (.+)$/gm)) {
+      const want = !native && low && kind === 'stack' && wasmStack.has(tname) ? wasmStack.get(tname) : want0;
       const t = json.tests.find((x) => x.name === tname);
       const frames = t && t.failure && (kind === 'stack' ? t.failure.stack : t.failure.error_trace);
       const got = frames ? render(frames) : '(none)';
@@ -1375,6 +1383,22 @@ await section('std/internal/runtime/host.mjs', {
     if (o.removed !== -2 && o.removed !== -40) return `remove through the handle: ${o.removed}`;
     if (o.opened !== -40) return `opening the link: ${o.opened}`;
     return fs.existsSync(path.join(dir, 'victim/keep')) ? null : 'victim/keep was removed';
+  },
+  // ax_tz_local (std/README.md): the zone that the host builds from what the
+  // JavaScript engine knows of $TZ is the database's, for zones whose
+  // daylight saving flags the engine's offsets show (tests/host/tz_host.ax)
+  'the local zone without a database (ax_tz_local)': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'tz_host.ax is checked with the compiler' };
+    const out = path.join(tmp, 'tz_host.wasm');
+    const c = spawnSync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/host/tz_host.ax'), '--target=wasm32', '-o', out], { encoding: 'utf8' });
+    if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+    for (const z of ['America/New_York', 'Europe/Paris', 'Asia/Kolkata', 'Australia/Lord_Howe', 'America/Sao_Paulo', 'Pacific/Chatham', 'Asia/Tehran', 'UTC']) {
+      const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out, '--', z],
+        { encoding: 'utf8', env: { ...process.env, TZ: z } });
+      if (r.status === 3) return { skip: true, reason: 'no time zone database' };
+      if (r.status !== 0 || r.stdout.trim() !== '0') return `${z}: status ${r.status}, mismatches: ${r.stdout}${r.stderr}`;
+    }
+    return null;
   },
 }, { timed: false });
 
@@ -2127,14 +2151,17 @@ if (!skipPlatform) {
             if (r.errs.length) return r.errs.join('\n');
             if (obj && !r.nrets) return 'no frame table entries checked';
             if (file === 'vars.c') {
-              // (types and variables: not on WebAssembly, which has lines only)
-              if (t.startsWith('wasm')) return r.nblocks || r.nvars ? 'variables on WebAssembly' : null;
-              const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !mac, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
+              // (WebAssembly: the variables at -O0, in their frame slots from the
+              // frame's local; optimized code's are not described there, and a
+              // thread-local has no one location)
+              const wasm = t.startsWith('wasm');
+              if (wasm && lvl !== '-O0') return r.nvars ? null : 'no variables';
+              const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !mac && !wasm, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
               return errs.length ? errs.join('\n') : null;
             }
             if (file === 'shared.ax') return null;  // (checkDebug: every function has its subprogram)
             if (file === 'vars.ax') {
-              if (t.startsWith('wasm') || lvl !== '-O0') return null;
+              if (lvl !== '-O0') return null;
               const errs = checkAxVars(r.dw);
               return errs.length ? errs.join('\n') : null;
             }

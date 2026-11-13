@@ -381,6 +381,9 @@ export function checkDebug(img, opts = {}) {
     for (const c of cu.children) {
       if (c.tag !== TAG_SUBPROGRAM) continue;
       const name = c.attrs.get(AT_NAME), low = c.attrs.get(AT_LOW), high = low + c.attrs.get(AT_HIGH);
+      // (WebAssembly: a function the linker did not keep is at the tombstone
+      // address, -1, as the tool conventions' DWARF has it)
+      if (img.kind === 'wasm' && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
       if (!name) E(`a subprogram without a name at 0x${c.off.toString(16)}`);
       if (!(high > low)) E(`${name}: empty range`);
       if (low < lo || high > hi) E(`${name}: [0x${low.toString(16)}, 0x${high.toString(16)}) outside its unit`);
@@ -406,8 +409,10 @@ export function checkDebug(img, opts = {}) {
   }
   // line table: one sequence per subprogram, covering it, increasing
   const seqByLow = new Map();
+  const tomb = (a) => img.kind === 'wasm' && (a === 0xffffffff || a >= 2 ** 64 - 2 ** 16);
   for (const sq of dw.seqs) {
     const rows = sq.rows;
+    if (rows.length && tomb(rows[0].addr)) continue;  // (a function the linker did not keep: above)
     if (rows.length < 2) { E('a line sequence with no rows'); continue; }
     for (let k = 1; k < rows.length; k++) {
       if (rows[k].addr < rows[k - 1].addr || (!rows[k].end && rows[k].addr === rows[k - 1].addr)) {
@@ -469,13 +474,15 @@ export function dieRanges(dw, die) {
   const off = die.attrs.get(AT_RANGES);
   if (off === undefined) return null;
   const r = new Rd(dw.S.rnglists, off), out = [];
+  // (addresses of the units' size: 4 on wasm32)
+  const asz = dw.units.length ? dw.units[0].asz : 8, A = () => r.addr(asz);
   let base = 0;
   for (;;) {
     const k = r.u8();
     if (k === 0) return out;
-    if (k === 7) { const a = r.u64(); out.push([a, a + r.uleb()]); }
-    else if (k === 6) { const a = r.u64(); out.push([a, r.u64()]); }
-    else if (k === 5) base = r.u64();
+    if (k === 7) { const a = A(); out.push([a, a + r.uleb()]); }
+    else if (k === 6) { const a = A(); out.push([a, A()]); }
+    else if (k === 5) base = A();
     else if (k === 4) { const a = r.uleb(); out.push([base + a, base + r.uleb()]); }
     else throw new Error(`range list entry ${k}`);
   }
@@ -581,6 +588,9 @@ export function checkScopes(dw, machine) {
   for (const un of dw.units) {
     for (const c of un.die.children) {
       if (c.tag !== TAG_SUBPROGRAM) continue;
+      // (WebAssembly, machine null: a function the linker did not keep is at -1)
+      const low = c.attrs.get(AT_LOW);
+      if (machine === null && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
       walk(c, dieRanges(dw, c), c.attrs.get(AT_NAME));
     }
   }

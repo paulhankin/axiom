@@ -1,7 +1,7 @@
 /* setjmp is only called: a call through a pointer would not be known to
    return twice, so taking the address of the function is an error
    (C3301). */
-/* native-only */
+/* wasm-flags: --features=+exception-handling */
 /* expect-error: C3301 */
 #include <setjmp.h>
 

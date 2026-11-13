@@ -1,4 +1,4 @@
-/* native-only */
+/* wasm-flags: --features=+tail-call */
 /* flags: -O2 */
 /* Ten million calls in tail position in a row (cmd/axiom/src/tailrec.ax:
    sibling calls), which as calls would need far more stack than a thread

@@ -18,6 +18,7 @@ pub const V128: u8 = 0x7b;
 pub const SYM_FUNC: u8 = 0;
 pub const SYM_DATA: u8 = 1;
 pub const SYM_GLOBAL: u8 = 2;
+pub const SYM_TAG: u8 = 4;  // an exception tag (the exception-handling extension)
 pub const SYM_TABLE: u8 = 5;
 pub const F_WEAK: u32 = 0x1;
 pub const F_LOCAL: u32 = 0x2;
@@ -37,6 +38,7 @@ pub const R_MEMORY_ADDR_SLEB: u8 = 4;
 pub const R_MEMORY_ADDR_I32: u8 = 5;
 pub const R_TYPE_INDEX_LEB: u8 = 6;
 pub const R_GLOBAL_INDEX_LEB: u8 = 7;
+pub const R_TAG_INDEX_LEB: u8 = 10;
 pub const R_MEMORY_ADDR_LEB64: u8 = 14;
 pub const R_MEMORY_ADDR_SLEB64: u8 = 15;
 pub const R_MEMORY_ADDR_I64: u8 = 16;
@@ -83,6 +85,16 @@ pub struct Func {
     // changes (in an object: the custom section "axiom.lines"), and the declaration
     lines: u.List.[u64],
     src: u32,
+    // -g, the types and variables (DEBUG_FULL), for a unit linked in the process
+    // that compiled it (not in objects: such a unit's DWARF has lines only):
+    // the IR function (dbginfo.ax's records are by its name), where the
+    // lexical block changes ((offset in body << 32) | scope), each variable's
+    // frame offset (dwarf.var_locs), the local holding the frame's address (-1:
+    // none)
+    irf: *mut void,
+    scopes: u.List.[u64],
+    vars: []i64,
+    frame_local: i64,
 }
 
 pub struct Global {
@@ -104,11 +116,34 @@ pub struct Export {
     func: u32,  // function index
 }
 
+// -g (DEBUG_FULL): the unit's own DWARF (dwarf.finish_parts: wasm.ax), its
+// sections by name in dwarf.ax's order, and their fixups, which wlink.ax
+// resolves: in an object, the sections ".debug_*" and our own custom
+// section "axiom.dwarf.fixups" (other linkers keep the sections as they
+// are, unrelocated).
+pub struct DbgSec {
+    name: []u8,
+    data: bn.Bytes,
+}
+
+pub const DFX_ADDR: u8 = 0;  // the address (4 or 8 bytes) of symbol `sym` (0xffff_ffff: the unit's code) + addend
+pub const DFX_SEC: u8 = 1;   // 4 bytes: offset `addend` in the unit's debug section number `sym`
+pub const DFX_SIZE: u8 = 3;  // `sym` bytes: the size of the unit's code
+
+pub struct DbgFix {
+    sec: u32,  // the section it is in (an index into Unit.dbg)
+    off: u64,
+    kind: u8,
+    sym: u32,
+    addend: i64,
+}
+
 pub struct Unit {
     wasm64: bool,
     types: u.List.[[]u8],       // encoded function types (0x60 params results)
     fimports: u.List.[Import],  // function imports: function indices 0..n-1
     gimports: u.List.[Import],  // global imports
+    timports: u.List.[Import],  // tag imports (ty: the tag's function type index)
     funcs: u.List.[*mut Func],
     globals: u.List.[Global],
     segs: u.List.[*mut Seg],
@@ -117,6 +152,8 @@ pub struct Unit {
     uses_table: bool,
     shared_memory: bool,
     symmap: u.SymMap.[u32],  // name -> symbol index + 1 (non-local symbols)
+    dbg: u.List.[DbgSec],    // (above)
+    dbg_fx: u.List.[DbgFix],
 }
 
 pub fn new_unit(wasm64: bool) *mut Unit {
@@ -271,18 +308,75 @@ pub fn write_object(un: *mut Unit) []u8 {
     // target features, so wasm-ld accepts the features we use
     c = bn.new_bytes();
     let feats = ["bulk-memory", "mutable-globals", "nontrapping-fptoint", "sign-ext", "simd128"];
-    c.uleb(@as(u64, feats.len));
+    let eh = un.timports.len > 0;
+    c.uleb(@as(u64, feats.len) + @as(u64, eh));
     for f in feats {
         c.u8_('+');
         c.name(f);
     }
+    if eh {
+        c.u8_('+');
+        c.name("exception-handling");
+    }
     add_custom(&mut w, "target_features", &mut c);
     lines_section(&mut w, un);
+    dwarf_sections(&mut w, un);
     code_relocs.deinit();
     data_relocs.deinit();
     let r = u.dup(w.out.view());
     w.out.free();
     return r;
+}
+
+// -g (DEBUG_FULL): the unit's DWARF (Unit.dbg), then its fixups: a count,
+// then each one's section, offset, kind, symbol and addend.
+fn dwarf_sections(w: *mut Writer, un: *Unit) void {
+    if un.dbg.len == 0 {
+        return;
+    }
+    for s in un.dbg.items() {
+        let mut c = bn.new_bytes();
+        c.put(s.data.view());
+        add_custom(w, s.name, &mut c);
+    }
+    let mut c = bn.new_bytes();
+    c.uleb(@as(u64, un.dbg.len));
+    for s in un.dbg.items() {
+        c.name(s.name);
+    }
+    c.uleb(@as(u64, un.dbg_fx.len));
+    for x in un.dbg_fx.items() {
+        c.uleb(@as(u64, x.sec));
+        c.uleb(x.off);
+        c.u8_(x.kind);
+        c.uleb(@as(u64, x.sym));
+        c.sleb(x.addend);
+    }
+    add_custom(w, "axiom.dwarf.fixups", &mut c);
+}
+
+// The sections that "axiom.dwarf.fixups" names, in its order, and the fixups.
+fn read_dwarf(r: *mut bn.Reader, un: *mut Unit, secs: *u.List.[DbgSec]) void {
+    let n = r.uleb();
+    for i in @as(u64, 0)..n {
+        let nm = r.name();
+        let mut data = bn.new_bytes();
+        for s in secs.items() {
+            if u.str_eq(s.name, nm) {
+                data.put(s.data.view());
+            }
+        }
+        un.dbg.push(DbgSec.{ name: nm, data: data });
+    }
+    let nf = r.uleb();
+    for i in @as(u64, 0)..nf {
+        let sec = @truncate(u32, r.uleb());
+        let off = r.uleb();
+        let kind = r.u8_();
+        let sym = @truncate(u32, r.uleb());
+        let add = r.sleb();
+        un.dbg_fx.push(DbgFix.{ sec: sec, off: off, kind: kind, sym: sym, addend: add });
+    }
 }
 
 // -g: the functions' line tables (Func.lines), for wlink.ax's DWARF, in a
@@ -405,7 +499,7 @@ fn src_of(file: i32, line: u64) u32 {
 // The imports: memory, table, globals, functions.
 fn import_section(un: *Unit) bn.Bytes {
     let mut c = bn.new_bytes();
-    let mut nimp = 1 + un.gimports.len + un.fimports.len;
+    let mut nimp = 1 + un.gimports.len + un.fimports.len + un.timports.len;
     if un.uses_table {
         nimp += 1;
     }
@@ -441,6 +535,14 @@ fn import_section(un: *Unit) bn.Bytes {
         c.name(f.name);
         c.u8_(0);
         c.uleb(@as(u64, f.ty));
+    }
+    for i in 0..un.timports.len {
+        let t = un.timports.get(i);
+        c.name(t.module);
+        c.name(t.name);
+        c.u8_(4);
+        c.u8_(0);  // (an exception)
+        c.uleb(@as(u64, t.ty));
     }
     return c;
 }
@@ -591,6 +693,8 @@ pub fn read_object(d: []u8) *mut Unit {
     }
     r.pos = 8;
     let un = new_unit(false);
+    let mut dsecs = u.List.[DbgSec].empty();  // (the .debug_* sections, until axiom.dwarf.fixups names them)
+    let mut fix_at: usize = 0;
     let mut rd = Reading.{ code_relocs: u.List.[Reloc].empty(), data_relocs: u.List.[Reloc].empty(),
                            ftypes: u.List.[u32].empty(), body_offs: u.List.[usize].empty(),
                            seg_offs: u.List.[usize].empty(), seg_names: u.List.[[]u8].empty(),
@@ -671,12 +775,22 @@ pub fn read_object(d: []u8) *mut Unit {
                 read_relocs(&mut r, &mut rd.data_relocs);
             } else if u.str_eq(nm, "axiom.lines") {
                 read_lines(&mut r, un);
+            } else if u.str_eq(nm, "axiom.dwarf.fixups") {
+                fix_at = r.pos;
+            } else if u.starts(nm, ".debug_") {
+                let mut data = bn.new_bytes();
+                data.put(d[r.pos..end]);
+                dsecs.push(DbgSec.{ name: nm, data: data });
             }
         }
         r.pos = end;
     }
     if r.bad {
         return u.nil.[Unit]();
+    }
+    if fix_at != 0 {
+        r.pos = fix_at;
+        read_dwarf(&mut r, un, &dsecs);
     }
     // distribute relocations to functions and segments
     for i in 0..rd.code_relocs.len {
@@ -745,6 +859,10 @@ fn read_imports(r: *mut bn.Reader, un: *mut Unit) void {
             let vt = r.u8_();
             let mu = r.u8_() != 0;
             un.gimports.push(Import.{ module: m, name: nm, ty: @as(u32, vt), mutable: mu });
+        } else if kind == 4 {
+            _ = r.u8_();
+            let t = @truncate(u32, r.uleb());
+            un.timports.push(Import.{ module: m, name: nm, ty: t, mutable: false });
         }
     }
 }
@@ -793,6 +911,8 @@ fn read_sym(r: *mut bn.Reader, un: *Unit) Sym {
             s.name = un.fimports.get(@as(usize, s.index)).name;
         } else if (s.kind == SYM_GLOBAL) and (@as(usize, s.index) < un.gimports.len) {
             s.name = un.gimports.get(@as(usize, s.index)).name;
+        } else if (s.kind == SYM_TAG) and (@as(usize, s.index) < un.timports.len) {
+            s.name = un.timports.get(@as(usize, s.index)).name;
         }
     }
     return s;

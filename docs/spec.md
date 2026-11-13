@@ -1853,6 +1853,7 @@ Threads use host functions from module `"axiom"`:
 | `ax_thread_stack_size() usize` | the stack size the program must allocate for a new thread, or `0` if the host provides stacks (native) |
 | `ax_thread_exit()` | end the calling thread, which `ax_thread_spawn` started, as the return of its `entry` would (`*exited` is set); on another thread (the main thread), return at once |
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns: u64)` | |
+| `ax_exit(code: i32)` | end the program, every thread of it, with status `code`, at once, from any thread; it does not return |
 
 On WebAssembly, a program that uses threads is linked with a **shared, imported**
 memory. The compiler also exports `axiom_thread_start(entry, arg, stack_top)`. The
@@ -1861,6 +1862,47 @@ Web Worker or node worker, and calling that export. The export switches the new
 instance's stack pointer to `stack_top` and calls `entry(arg)`. Data segments are
 initialized only once, by the first instance. Programs that never spawn threads
 keep an unshared memory and need no worker support.
+
+On WebAssembly, pointers and sizes (`usize`, `isize`, `*T`) are `i32`s on wasm32 and
+`i64`s on wasm64, in the host functions' signatures as in the program's own.
+
+**Ending the program.** `ax_exit` ends the whole program from whichever thread calls it,
+while the others run or wait. A host where a thread cannot end the process itself (node
+and browser workers: node's `process.exit` on a worker ends that worker alone) must
+arrange it: `std/internal/runtime/host.mjs` runs every thread of a threaded program on a
+worker, the main thread too, and keeps node's main thread free as their supervisor,
+which ends the process as soon as any thread asks (and does for them what only node's
+main thread may: change the working directory, set the terminal's mode). The C
+library's `exit`, `_Exit`, `quick_exit` and `abort` end through it.
+
+**Memory growth.** Memory that one thread adds with `memory.grow` (the allocator's
+`@memory_grow`) is usable by every thread that the growth happens-before (§12.8.2).
+An engine may instead keep, per instance, the size of the memory as that thread last
+saw it, check some accesses against it (atomic and bulk-memory instructions; on
+memory64, all of them), and update it only some time after another thread grew the
+memory, so that such an access traps as out of bounds. `memory.grow` by 0 pages
+brings the calling instance's view up to date. Code compiled with the atomics
+extension keeps each thread's view current itself:
+
+- after each `memory.grow` that succeeds, it raises the pointer-sized word
+  `__axiom_memory_pages` (in linear memory, placed by the linker after the data) to the
+  memory's size in pages, before anything in the new pages can be published;
+- after each atomic operation that can observe another thread's writes (an atomic
+  load, read-modify-write or compare-exchange, `wait`, a fence), it compares that word
+  with its own `memory.size` and, if the word is larger, grows the memory by 0. Every
+  access that happens after another thread's growth is ordered after such an operation
+  (a host function that hands over memory, as `ax_thread_spawn` does, does so before
+  the new instance is made);
+- before an atomic or bulk-memory access that reaches beyond its `memory.size` (memory
+  reached through a pointer read in a race), it grows the memory by 0.
+
+A host needs nothing for this beyond the WebAssembly semantics. Its own functions must
+read a memory's current buffer at each call (in JavaScript, `memory.buffer`, never a
+buffer or view kept from an earlier call), as memory may have grown in between. One
+case is not covered: on an engine that checks plain (non-atomic) accesses against the
+stale view too (memory64 under some engines), a plain access through a pointer that
+was read in a race, with nothing ordering it after the growth, can trap until the
+thread's view catches up.
 
 On native targets, threads are POSIX threads, and `wait`/`notify` are futexes (Linux).
 
@@ -1985,7 +2027,7 @@ same result with or without one. Extensions have the names `--features` takes:
 |---|---|
 | `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
 | `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
-| `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
+| `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call`, `exception-handling` |
 
 An extension implies those it builds on (`avx2` implies `avx`, which implies `sse4.2`, and
 so on; `avx512bw` implies `avx512f`, which implies `avx2`, `fma` and `f16c`), and removing

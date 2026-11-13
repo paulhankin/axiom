@@ -14,6 +14,7 @@ import fs from 'fs';
 import net from 'net';
 import os from 'os';
 import path from 'path';
+import { MemFS } from './memfs.mjs';
 
 const handles = new Map();
 let nextHandle = 3;
@@ -495,6 +496,45 @@ function spawnErr(e) {
     default: return ERR;
   }
 }
+
+// The program's in-memory file system (host.mjs --files=memory: RemoteFS),
+// one for every thread. A call's result is ctrl[1]: >= 0 the method's
+// number (or the length of its result in data: JSON or bytes), < 0 the
+// index of its error's code in MEM_CODES, negated, less one.
+let memfs = null;
+const MEM_CODES = ['ENOENT', 'EACCES', 'EPERM', 'EEXIST', 'ENOTDIR', 'EISDIR', 'ENOTEMPTY', 'ELOOP', 'EBADF', 'EINVAL', 'EBUSY'];
+ops.memfs = (req, { m, a }, payload) => {
+  memfs ||= new MemFS();
+  const data = new Uint8Array(req.data);
+  const put = (bytes) => {
+    if (bytes.length > data.length) return -1 - MEM_CODES.indexOf('EINVAL');
+    data.set(bytes);
+    return bytes.length;
+  };
+  const json = (x) => put(Buffer.from(JSON.stringify(x, (k, v) => (typeof v === 'bigint' ? String(v) : v))));
+  const stat = (st) => json({ kind: st.isFile() ? 1 : st.isDirectory() ? 2 : 3, size: Number(st.size), mtime: st.mtimeNs,
+    mode: Number(st.mode), ino: Number(st.ino) });
+  try {
+    if (m === 'readSync') {
+      const buf = new Uint8Array(Math.min(a[2], data.length));
+      return reply(req, put(buf.subarray(0, memfs.readSync(a[0], buf, 0, buf.length, a[3]))));
+    }
+    if (m === 'writeSync') return reply(req, memfs.writeSync(a[0], payload, 0, payload.length, a[1]));
+    if (m === 'statSync' || m === 'lstatSync') return reply(req, stat(memfs[m](a[0], { bigint: true })));
+    if (m === 'fstatSync') return reply(req, stat(memfs.fstatSync(a[0], { bigint: true })));
+    if (m === 'readdirSync') {
+      const kind = (e) => (e.isFile() ? 1 : e.isDirectory() ? 2 : 3);
+      return reply(req, json(memfs.readdirSync(a[0], { withFileTypes: true }).map((e) => [e.name, kind(e)])));
+    }
+    if (m === 'readlinkSync') return reply(req, put(memfs.readlinkSync(a[0], { encoding: 'buffer' })));
+    if (m === 'cwd') return reply(req, json(memfs.cwd()));
+    const r = memfs[m](...a);
+    reply(req, typeof r === 'number' ? r : 0);
+  } catch (e) {
+    const k = MEM_CODES.indexOf(e && e.code);
+    reply(req, -1 - (k < 0 ? MEM_CODES.indexOf('EINVAL') : k));
+  }
+};
 
 function serve(port) {
   port.on('message', (m) => {

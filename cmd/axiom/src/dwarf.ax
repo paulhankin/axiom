@@ -61,9 +61,11 @@ pub fn is_debug_name(name: []u8) bool {
 }
 
 // Fixups: where a section refers to code or to another section.
-pub const FX_ADDR: u8 = 0;  // 8 bytes (4 on wasm32): the address of function `sym` + addend
-pub const FX_SEC: u8 = 1;   // 4 bytes: offset `addend` in this unit's debug section `sym` (a D_*)
-pub const FX_TLS: u8 = 2;   // 8 bytes: the offset of thread-local datum `sym` + addend in the TLS block
+pub const FX_ADDR: u8 = 0;              // 8 bytes (4 on wasm32): the address of function `sym` + addend
+pub const FX_SEC: u8 = 1;               // 4 bytes: offset `addend` in this unit's debug section `sym` (a D_*)
+pub const FX_TLS: u8 = 2;               // 8 bytes: the offset of thread-local datum `sym` + addend in the TLS block
+pub const FX_SIZE: u8 = 3;              // `sym` bytes: the size of the unit's code (finish_parts: WebAssembly objects)
+pub const TEXT_SYM: u32 = 0xffff_ffff;  // FX_ADDR's sym for the start of the unit's code
 
 pub struct Fix {
     off: u64,
@@ -116,6 +118,7 @@ pub struct Unit {
     gdone: u.List.[bool],  // per dbinfo global: written in a lexical block
     voffs: u.List.[u64],   // (while a function is written: its variables' entries' offsets + 1)
     tls_rel: u32,          // the relocation of an offset in the TLS block (FX_TLS), 0: thread-locals have no location
+    size_fix: bool,        // the unit's code size is a fixup (FX_SIZE: finish_parts)
 }
 
 pub fn none() Unit {
@@ -127,7 +130,7 @@ pub fn none() Unit {
                   nfuncs: 0, first_src: 0, text_sym: 0, trefs: u.List.[Fix].empty(),
                   gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   toff: u.List.[u64].empty(), drefs: u.List.[Fix].empty(), gdone: u.List.[bool].empty(),
-                  voffs: u.List.[u64].empty(), tls_rel: 0 };
+                  voffs: u.List.[u64].empty(), tls_rel: 0, size_fix: false };
 }
 
 fn new_part() Part {
@@ -294,6 +297,9 @@ pub struct Func {
     irf: *ir.Func,       // (DEBUG_FULL: its variables, dbginfo.ax)
     vars: []i64,         // DEBUG_FULL: per variable of dbinfo.vars_of(irf), its frame offset from the CFA, or NO_LOC
     vlocs: []dloc.VLoc,  // optimized code: the variables' location pieces and constant values (dloc.ax)
+    // WebAssembly: the local holding the frame's address (its frame base, from
+    // which vars count), or -1 (no frame; natively: the CFA is the frame base)
+    frame_local: i64,
 }
 
 // Is source location `src` in the standard library?
@@ -319,6 +325,11 @@ pub fn func_name(f: *ir.Func, sym: []u8) []u8 {
         return n[13..];
     }
     return n;
+}
+
+/// func_name for IR function f by its symbol's own name (WebAssembly).
+pub fn func_name_of(f: *ir.Func) []u8 {
+    return func_name(f, elf.display_name(f.name));
 }
 
 /// Adds function `f`'s line table, subprogram and frame description.
@@ -586,8 +597,7 @@ fn subprogram(d: *mut Unit, f: *Func) void {
     p.b.u32_(0);
     addr_ref(d, p, f.sym, 0);
     p.b.u32_(f.size);
-    p.b.uleb(1);
-    p.b.u8_(OP_CALL_FRAME_CFA);
+    frame_base(d, f);
     let w = where_of(d, f.src);
     p.b.uleb(@as(u64, w.file));
     p.b.uleb(@as(u64, w.line));
@@ -610,6 +620,35 @@ fn subprogram(d: *mut Unit, f: *Func) void {
         d.voffs.clear();
         d.parts[D_INFO].b.u8_(0);
     }
+}
+
+// DW_AT_frame_base (an exprloc): the CFA natively; on WebAssembly the value
+// of the local that holds the frame's address (WebAssembly's DWARF
+// extension, DW_OP_WASM_location 0 (a local) index, then DW_OP_stack_value),
+// or of __stack_pointer (global 0) for a function without a frame.
+const OP_WASM_LOCATION: u8 = 0xed;
+const OP_STACK_VALUE: u8 = 0x9f;
+
+fn frame_base(d: *mut Unit, f: *Func) void {
+    let p = &mut d.parts[D_INFO];
+    if d.arch != ARCH_WASM {
+        p.b.uleb(1);
+        p.b.u8_(OP_CALL_FRAME_CFA);
+        return;
+    }
+    let mut e = bn.new_bytes();
+    e.u8_(OP_WASM_LOCATION);
+    if f.frame_local >= 0 {
+        e.u8_(0);
+        e.uleb(@bit_cast(u64, f.frame_local));
+    } else {
+        e.u8_(3);  // (a global, its index a fixed 4 bytes)
+        e.u32_(0);
+    }
+    e.u8_(OP_STACK_VALUE);
+    p.b.uleb(@as(u64, e.len()));
+    p.b.put(e.view());
+    e.free();
 }
 
 // A piece of code of a lexical block: [start, end) offsets in its function.
@@ -1620,7 +1659,7 @@ fn finish(d: *mut Unit, text_size: u64) void {
     sec_ref(d, &mut h, D_STR, @as(u64, str_off(d, name_s)));
     sec_ref(d, &mut h, D_STR, @as(u64, str_off(d, comp_dir)));
     addr_ref(d, &mut h, d.text_sym, 0);
-    h.b.u32_(text_size);
+    size_ref(d, &mut h, 4, text_size);
     sec_ref(d, &mut h, D_LINE, 0);
     let toff = types_and_data(d);
     let hn = @as(u64, h.b.len());
@@ -1701,15 +1740,26 @@ fn finish(d: *mut Unit, text_size: u64) void {
         ar.b.u8_(0);
     }
     addr_ref(d, ar, d.text_sym, 0);
+    size_ref(d, ar, d.addr_size, text_size);
     if d.addr_size == 4 {
-        ar.b.u32_(text_size);
         ar.b.u64_(0);
     } else {
-        ar.b.u64_(text_size);
         ar.b.u64_(0);
         ar.b.u64_(0);
     }
     ar.b.set_u32(0, @as(u64, ar.b.len() - 4));
+}
+
+// The unit's code size in n bytes: text_size, or a fixup (size_fix).
+fn size_ref(d: *mut Unit, p: *mut Part, n: u64, text_size: u64) void {
+    if d.size_fix {
+        p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_SIZE, sym: @truncate(u32, n), addend: 0 });
+    }
+    if n == 4 {
+        p.b.u32_(text_size);
+    } else {
+        p.b.u64_(text_size);
+    }
 }
 
 // Puts `h` (bytes and fixups) before `p`'s.
@@ -1769,6 +1819,27 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
         p.fx.deinit();
     }
     d.on = false;
+}
+
+/// The unit's sections and their fixups, unresolved (a WebAssembly
+/// object's, which wlink.ax merges with the others'): FX_ADDR of a function
+/// or datum `sym`, or of TEXT_SYM (the start of the unit's code), FX_SIZE
+/// (the size of the unit's code), FX_SEC (offset `addend` in the unit's
+/// section `sym`). The parts are the caller's.
+pub fn finish_parts(d: *mut Unit) [9]Part {
+    let mut out: [9]Part = [new_part(); 9];
+    if not d.on or (d.nfuncs == 0) {
+        return out;
+    }
+    d.text_sym = TEXT_SYM;
+    d.size_fix = true;
+    finish(d, 0);
+    for k in 0..NSEC {
+        out[k] = d.parts[k];
+        d.parts[k] = new_part();
+    }
+    d.on = false;
+    return out;
 }
 
 /// The unit's sections with their fixups resolved, for a linker that knows

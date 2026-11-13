@@ -17,7 +17,16 @@
 typedef int sig_atomic_t;
 
 #define SIG_DFL ((void (*)(int))0)
+#ifdef __AXIOM_WASM__
+/* (WebAssembly: a function pointer is its index in the module's table, the
+   first function's 1, so SIG_IGN is the address of a function of the
+   library's own, which no program can declare: 7.14p3 has it compare
+   unequal to any function's address; std/c/lib/core/__axc_sig_ign.c) */
+void __axc_sig_ign(int);
+#define SIG_IGN (&__axc_sig_ign)
+#else
 #define SIG_IGN ((void (*)(int))1)
+#endif
 #define SIG_ERR ((void (*)(int))-1)
 
 #define SIGINT 2

@@ -1,4 +1,6 @@
-/* setjmp is not available on WebAssembly targets (C3300). */
+/* setjmp on WebAssembly without the exception-handling extension (not in
+   the default features), which it needs to return to a frame: C3300,
+   naming --features=+exception-handling. */
 /* wasm-only */
 /* expect-error: C3300 */
 #include <setjmp.h>

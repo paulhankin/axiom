@@ -3,7 +3,15 @@
 #include <string.h>
 #include "word.h"
 
+#ifdef __AXIOM_WASM_BULK_MEMORY__
+/* WebAssembly with the bulk-memory extension: memory.fill (std/c/rt/string_bulk.ax) */
+void *__axc_mem_set(void *, unsigned char, size_t);
+#endif
+
 void *memset(void *s, int c, size_t n) {
+#ifdef __AXIOM_WASM_BULK_MEMORY__
+    return __axc_mem_set(s, (unsigned char)c, n);
+#else
     unsigned char *d = s;
     unsigned char b = (unsigned char)c;
     if (n >= 4 * __AXIOM_WSIZE) {
@@ -31,4 +39,5 @@ void *memset(void *s, int c, size_t n) {
         *d++ = b;
     }
     return s;
+#endif
 }

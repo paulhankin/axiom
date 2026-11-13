@@ -400,7 +400,12 @@ C17's 7.21 with C23's additions, and the wide-character input/output of `<wchar.
   `tmpfile` creates a file in the directory for temporary files (`TMPDIR`, else `/tmp`;
   on Windows `TMP`, `TEMP`, ...) and removes it at once (on Windows when it is closed
   or the program exits); `tmpnam` gives names there that no file has. `remove`
-  removes an empty directory too. On WebAssembly the files are the node host's.
+  removes an empty directory too. On WebAssembly the files are the host's: the node
+  host's are node's own, or with `--root=dir` those under `dir`, which the program sees
+  as `/` (no path, `..` or symbolic link leads out of it), or with `--files=memory` a
+  file system in memory shared by the program's threads
+  (`std/internal/runtime/memfs.mjs`, which needs nothing of node's: a browser's host
+  can use it as it is).
 - **Pushback**: `ungetc` takes up to 8 bytes, `ungetwc` a wide character as its
   multibyte bytes (one at least). Output after input, and input after output, need no
   `fflush` or seek between them (7.21.5.3p7 asks for one); `fflush` of an input stream
@@ -462,8 +467,19 @@ call through a pointer would not be known to return twice.
   `setjmp` call frees them (the stack pointer goes back); jumping out of, or over,
   Axiom functions that C called (an Axiom function on the stack between the `setjmp`
   and the `longjmp`) is undefined: their `defer`s do not run.
-- WebAssembly cannot return to a frame without its exception handling, which the code
-  generator does not use: `setjmp` there is `C3300`.
+- On WebAssembly, `setjmp` needs the exception-handling extension
+  (`--features=+exception-handling`, not among the default features; else `C3300`),
+  in its standard form (`try_table`, `throw`, a tag; node 22 and current browsers have
+  it). `longjmp` stores its value in the `jmp_buf` and throws an exception that carries
+  the `jmp_buf`'s address; the function that called `setjmp` runs its body in a
+  `try_table` that catches it, and if the `jmp_buf` was set by that very activation
+  (`setjmp` stored the activation's frame address in it, with the call's number and
+  the stack pointer), runs its body again from a dispatch to that `setjmp` call, with
+  the stack pointer back as it was there; otherwise it throws it on. Values the
+  expression around a `setjmp` call computed before it are kept in memory, as the
+  objects are. A `longjmp` to a `jmp_buf` whose function has returned ends the program
+  as a trap. Frames between are left without running anything, as natively; a
+  signal handler that `raise` called may `longjmp`.
 - `setjmp` saves no signal mask: a signal handler that leaves with `longjmp` leaves
   its signal blocked (on Linux and macOS).
 
@@ -590,7 +606,11 @@ builtins `__builtin_axiom_fenv_get` and `__builtin_axiom_fenv_set`, the backends
 `ldmxcsr`, `mrs` and `msr`): all four rounding modes and the five exception flags. Exceptions
 are never trapped. WebAssembly has no floating-point environment: rounding is to nearest,
 `fesetround` fails for the other modes, no flag is ever set (`fetestexcept` is 0) and
-`feraiseexcept` fails for a nonzero argument; the macros are defined all the same.
+`feraiseexcept` fails for a nonzero argument; the macros are defined all the same. The
+other modes are not done in software: the program's own arithmetic would need it too
+(`FENV_ACCESS` has no effect, so every floating-point operation of every function would
+look at the mode, a cost to all code), and a `fesetround` that succeeded while `a + b`
+still rounded to nearest would mislead the programs that use it (7.6.4.3 lets it fail).
 
 What the compiler assumes: **the default environment.** `#pragma STDC FENV_ACCESS` is
 accepted and has no effect. The optimizer folds floating-point constant expressions as
@@ -669,6 +689,8 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_BITFIELD_LAYOUT__` | Whose rules lay out bit-fields ("Implementation-defined behavior"): 0 the System V ABI's (x86-64 Linux, macOS, WebAssembly), 1 AAPCS64's (AArch64 Linux), 2 Windows x64's. |
 | `__AXIOM_<T>_TYPE__`, `__AXIOM_<T>_MIN__`, `__AXIOM_<T>_MAX__`, `__AXIOM_<T>_WIDTH__`, `__AXIOM_<T>_C__(c)` | For `<T>` one of `SIZE`, `PTRDIFF`, `INT64`, `UINT64`, `INTMAX`, `UINTMAX`, `INT_FAST16`, `UINT_FAST16`, `INT_FAST32`, `UINT_FAST32`: the type the platform gives that typedef (`__AXIOM_SIZE_TYPE__` is `unsigned long`, ...), its limits, width and constant macro, which the headers use. `__AXIOM_WINT_TYPE__`, `_MIN__`, `_MAX__` and `_WIDTH__` are `wint_t`'s; `__AXIOM_MAX_ALIGN__` is `max_align_t`'s alignment. |
 | `__CHAR_UNSIGNED__` | 1, defined only if plain `char` is unsigned. |
+| `__AXIOM_WASM__` | 1, defined only for a WebAssembly target. |
+| `__AXIOM_WASM_BULK_MEMORY__`, `__AXIOM_WASM_EXCEPTION_HANDLING__` | 1, defined only for a WebAssembly target with that extension (`--features`): the C library's `memcpy`, `memmove` and `memset` are `memory.copy` and `memory.fill` with the first; `setjmp` needs the second. |
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
 | `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` | 1, defined only in a GNU dialect on x86-64 or AArch64 targets: the language of inline assembly's templates ("Inline assembly"). |
 
@@ -825,7 +847,7 @@ as the standard says.
 - Annex F, which the library's `<math.h>` and `<fenv.h>` do not claim (they follow it
   where the section on them says). Annex K is not provided (`__STDC_LIB_EXT1__` is not
   defined).
-- `setjmp` on WebAssembly (`C3300`).
+- `setjmp` on WebAssembly without its exception-handling extension (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
   and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
@@ -1220,14 +1242,10 @@ main ones:
   before the others (threads that Axiom code started are not waited for).
 - **`exit` from any thread**: the first thread to call it runs the `atexit` functions
   (once), the destructors and the flushing, and ends the process with its status; a
-  second thread's `exit` meanwhile waits for the end. On WebAssembly a worker cannot end
-  the process (node ends only that worker): its `exit` (and `_Exit`, `quick_exit`, and
-  `abort`'s end), once the handlers have run on it, asks the main thread to end it with
-  the status, and the main thread does so as soon as it waits in `<threads.h>`
-  (`thrd_join`, a mutex, a condition variable, `call_once`, `thrd_sleep`, the `thrd_exit`
-  of the main thread, its own `exit`): those waits look for the request at least every
-  50 ms. A main thread that computes without waiting there goes on until it does, or
-  until `main` returns.
+  second thread's `exit` meanwhile waits for the end. The end is at once, whatever the
+  other threads do, on WebAssembly too: the host ends the program from any thread
+  (`ax_exit`, spec §12.8.5, "Ending the program"); so do `_Exit`, `quick_exit` and
+  `abort`'s.
 - **Mutexes**: `mtx_plain`, `mtx_timed`, and either with `mtx_recursive`; another type
   is `thrd_error`. A futex-style lock (no system call unless contended; while no thread
   has been started, not even an atomic instruction); `mtx_timedlock` takes any mutex.
@@ -1479,7 +1497,7 @@ Where it goes, per target:
 | `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's code is the same as without `-g` (its frame table has the line rows). It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30; on x86-64 rbp and the return address) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30, or on x86-64 at the stack pointer). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
 | `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
 | `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |
-| `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section (lines; no frames, which WebAssembly has no use for). |
+| `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section, a compilation unit per unit compiled (each object carries its own, which the linker merges; a function it did not keep is at the tombstone address -1). With `-g` the types and variables too: at `-O0` each variable in its frame slot (`DW_OP_fbreg`), the frame base being the local that holds the frame's address (`DW_OP_WASM_location`); optimized code's variables have no location, and a thread-local none (each thread's instance is elsewhere). No call frame information, which WebAssembly has no use for. |
 
 The objects of `--emit=obj` carry the same sections (ELF targets), with relocations,
 for the system's linker. Axiom functions in the same program are described in the same
@@ -1520,8 +1538,6 @@ claims less than the standard allows. None is hidden: each is said above or here
   from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
   algorithms are always used).
 - Decimal floating types are absent, as the feature macros say.
-- On WebAssembly, `exit` on a thread other than the main one ends the process only once
-  the main thread waits in `<threads.h>` or returns from `main` ("Threads").
 - `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
   honoured (C4113).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;

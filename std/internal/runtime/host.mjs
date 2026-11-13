@@ -5,15 +5,28 @@
 //
 // calls `export` (default: main, else run). If it returns a number, that is
 // the process exit code. A trap exits with status 134. Arguments after `--`
-// are the program's (its argument 0 is program.wasm).
+// are the program's (its argument 0 is program.wasm). Its files are node's,
+// or with --root=dir node's under dir, which the program sees as `/`, or
+// with --files=memory a file system in memory (memfs.mjs). A threaded program
+// (one that imports a shared memory) runs all its threads on workers, its
+// main thread too, under a Supervisor on node's main thread, which ends the
+// process as soon as any of them asks (ax_exit; spec §12.8.5, "Ending the
+// program").
 //
 // As a library: createHost(opts) returns
 //   { imports, instantiate(bytes, extraImports), instantiateModule(module, extraImports),
 //     setMemory, close }.
 // instantiate() handles modules that import a shared memory (threaded programs).
+// opts.exit is the embedder's end of the program (default process.exit):
+// it must end every thread and not return. Threads that the program
+// starts reach it only through a Supervisor (opts.supervisor, which
+// thread_worker.mjs passes on to each): without one (a program run on the
+// embedder's own thread, which is then busy), an exit on such a thread ends
+// that thread alone.
 import fs from 'fs';
 import os from 'os';
-import { MessageChannel, Worker, isMainThread } from 'worker_threads';
+import path from 'path';
+import { MessageChannel, SHARE_ENV, Worker } from 'worker_threads';
 import tty from 'tty';
 
 const READ_CHUNK = 1 << 16;
@@ -47,6 +60,10 @@ export function describeTrap(instance, memory, err) {
       if (kind) t.values = formatValues(kind, dv, base, memory, instance);
       dv.setBigUint64(base, 0n, true);  // consumed
     }
+  }
+  if (!t && err instanceof WebAssembly.Exception) {
+    // (C's longjmp, whose exception no function caught: C17 7.13.2.1p2)
+    t = { code: 0, name: TRAP_NAMES[0], engineMessage: 'longjmp to a jmp_buf whose setjmp is no longer active' };
   }
   if (!t) {
     let code = 0;
@@ -217,13 +234,14 @@ export function trapMessage(t) {
 const THREAD_STACK = 1 << 20;
 
 // Limits of an imported memory, read from the module binary (the JS API does
-// not expose them).
+// not expose them): pages, whether it is shared and whether it is a memory64.
 function memoryImportLimits(bytes) {
   let i = 8;
   const u32 = () => {
-    let r = 0, shift = 0, b;
-    do { b = bytes[i++]; r |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-    return r >>> 0;
+    // (a Number: a memory64's limits may pass 32 bits)
+    let r = 0, scale = 1, b;
+    do { b = bytes[i++]; r += (b & 0x7f) * scale; scale *= 128; } while (b & 0x80);
+    return r;
   };
   const skipName = () => { const n = u32(); i += n; };
   while (i < bytes.length) {
@@ -241,7 +259,7 @@ function memoryImportLimits(bytes) {
           const flags = u32();
           const initial = u32();
           const maximum = flags & 1 ? u32() : undefined;
-          return { initial, maximum, shared: (flags & 2) !== 0 };
+          return { initial, maximum, shared: (flags & 2) !== 0, memory64: (flags & 4) !== 0 };
         } else if (kind === 3) { i += 2; }
         else { i++; u32(); }
       }
@@ -293,6 +311,322 @@ class NetClient {
   }
 }
 
+// The local time zone as the bytes of a TZif file (RFC 8536, version 2), for
+// ax_tz_local: built from what the JavaScript engine knows of the zone (its
+// Date offsets and Intl's abbreviations), so that it needs no time zone
+// database (browsers, node on Windows). The transitions from 1900 to 2100
+// are found by looking at every day's offset and bisecting to the second
+// (two changes within a day are missed); the footer (a POSIX TZ rule, for
+// later times) is the last year's rule, or its fixed offset. Whether a kind
+// is daylight saving time is a judgement (isDst), as the engine does not
+// say.
+export function localTzif() {
+  // (Date's offset is in whole minutes, enough to find the changes; a
+  // kind's exact one, with the seconds of a local mean time, is Intl's
+  // local clock less the UTC one)
+  const off = (t) => Math.round(-new Date(t * 1000).getTimezoneOffset() * 60);
+  const clock = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric',
+    minute: 'numeric', second: 'numeric', hourCycle: 'h23', era: 'short' });
+  const exactOff = (t) => {
+    const f = {};
+    for (const x of clock.formatToParts(new Date(t * 1000))) f[x.type] = x.value;
+    const y = f.era === 'BC' || f.era === 'B' ? 1 - Number(f.year) : Number(f.year);
+    const d = new Date(0);
+    d.setUTCFullYear(y, Number(f.month) - 1, Number(f.day));
+    d.setUTCHours(Number(f.hour), Number(f.minute), Number(f.second), 0);
+    const o = Math.round(d.getTime() / 1000 - t);
+    return Math.abs(o - off(t)) < 60 ? o : off(t);
+  };
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' });
+  const abbr = (t) => {
+    const part = fmt.formatToParts(new Date(t * 1000)).find((x) => x.type === 'timeZoneName');
+    let a = part ? part.value : '';
+    // ("GMT+5:30", where the zone has no abbreviation in English: "+0530")
+    const m = /^(?:GMT|UTC)([+-])(\d{1,2})(?::(\d\d))?$/.exec(a);
+    if (m) a = m[1] + m[2].padStart(2, '0') + (m[3] && m[3] !== '00' ? m[3] : '');
+    a = a.replace(/[^A-Za-z0-9+-]/g, '');
+    return a.length >= 3 ? a : (a === '' ? 'UTC' : a.padEnd(3, '-'));
+  };
+  const yearStart = (y) => Date.UTC(y, 0, 1) / 1000;
+  // daylight saving time: an offset above one the zone has in the year
+  // before and in the year after (a change of the standard offset has no
+  // lower one on one side)
+  const isDst = (t) => {
+    const o = off(t);
+    let before = false, after = false;
+    for (let d = 15; d <= 366 && !(before && after); d += 15) {
+      before ||= off(t - d * 86400) < o;
+      after ||= off(t + d * 86400) < o;
+    }
+    return before && after;
+  };
+  const kinds = [], index = new Map();
+  const kindOf = (t) => {
+    const o = exactOff(t), k = { o, dst: isDst(t), a: abbr(t) };
+    const key = `${k.o}/${k.dst}/${k.a}`;
+    if (!index.has(key)) { index.set(key, kinds.length); kinds.push(k); }
+    return index.get(key);
+  };
+  const first = yearStart(1900), end = yearStart(2101);
+  kindOf(first);  // type 0: the time before the first transition
+  const trans = [], types = [];
+  let prevT = first, prev = off(first), prevKind = 0;
+  for (let t = first + 86400; t <= end; t += 86400) {
+    const o = off(t);
+    if (o === prev) {
+      prevT = t;
+      continue;
+    }
+    // the first second of the new offset, in (prevT, t]
+    let lo = prevT, hi = t;
+    while (hi - lo > 1) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      if (off(mid) === prev) lo = mid; else hi = mid;
+    }
+    const k = kindOf(hi);
+    if (k !== prevKind) { trans.push(hi); types.push(k); }
+    prevT = t; prev = o; prevKind = k;
+  }
+  // the footer: POSIX TZ offsets are hours west, as [-]hh[:mm[:ss]]
+  const posixOff = (o) => {
+    const w = -o, a = Math.abs(w);
+    const h = Math.floor(a / 3600), m = Math.floor((a % 3600) / 60), sec = a % 60;
+    return (w < 0 ? '-' : '') + h + (m || sec ? ':' + String(m).padStart(2, '0') : '') + (sec ? ':' + String(sec).padStart(2, '0') : '');
+  };
+  const name = (a) => (/^[A-Za-z]+$/.test(a) ? a : `<${a}>`);
+  // a transition as a POSIX date rule Mm.w.d/time (local time before it)
+  const when = (t, before) => {
+    const l = new Date((t + before) * 1000);
+    const y = l.getUTCFullYear(), mo = l.getUTCMonth(), dom = l.getUTCDate();
+    const dim = new Date(Date.UTC(y, mo + 1, 0)).getUTCDate();
+    const w = dom + 7 > dim ? 5 : Math.ceil(dom / 7);
+    const secs = l.getUTCHours() * 3600 + l.getUTCMinutes() * 60 + l.getUTCSeconds();
+    return `M${mo + 1}.${w}.${l.getUTCDay()}` + (secs === 7200 ? '' : '/' + posixOff(-secs).replace(/^-/, ''));
+  };
+  let footer = '';
+  const last = trans.map((t, i) => [t, types[i]]).filter(([t]) => t >= yearStart(2100));
+  const lastKind = kinds[types.length ? types[types.length - 1] : 0];
+  if (last.length === 0) footer = name(lastKind.a) + posixOff(lastKind.o);
+  else if (last.length === 2 && kinds[last[0][1]].dst !== kinds[last[1][1]].dst) {
+    const [on, back] = kinds[last[0][1]].dst ? [last[0], last[1]] : [last[1], last[0]];
+    const ds = kinds[on[1]], st = kinds[back[1]];
+    footer = name(st.a) + posixOff(st.o) + name(ds.a) + (ds.o === st.o + 3600 ? '' : posixOff(ds.o)) +
+      ',' + when(on[0], st.o) + ',' + when(back[0], ds.o);
+  }
+  // the file: a version 1 header and block of no transitions, then version 2's
+  const chars = [], at = new Map();
+  for (const k of kinds) if (!at.has(k.a)) { at.set(k.a, chars.length); chars.push(...Buffer.from(k.a + '\0')); }
+  const head = (timecnt, typecnt, charcnt) => {
+    const b = Buffer.alloc(44);
+    b.write('TZif2', 0, 'latin1');
+    [0, 0, 0, timecnt, typecnt, charcnt].forEach((n, i) => b.writeUInt32BE(n, 20 + 4 * i));
+    return b;
+  };
+  const v1 = Buffer.from([0, 0, 0, 0, 0, 0, 0]);  // one type (UTC, abbreviation ""), one char
+  const body = Buffer.alloc(trans.length * 9 + kinds.length * 6);
+  let p = 0;
+  for (const t of trans) { body.writeBigInt64BE(BigInt(t), p); p += 8; }
+  for (const k of types) body[p++] = k;
+  for (const k of kinds) { body.writeInt32BE(k.o, p); body[p + 4] = k.dst ? 1 : 0; body[p + 5] = at.get(k.a); p += 6; }
+  return Buffer.concat([head(0, 1, 1), v1, head(trans.length, kinds.length, chars.length), body, Buffer.from(chars),
+    Buffer.from(`\n${footer}\n`, 'latin1')]);
+}
+
+// The end of a supervised program, from any thread: the first thread to ask
+// records its status and wakes the supervisor, which ends the process; the
+// asking thread waits for that (ctl: Supervisor.ctl).
+export function endProgram(ctl, code) {
+  if (Atomics.compareExchange(ctl, 3, 0, 1) === 0) {
+    Atomics.store(ctl, 1, code | 0);
+    Atomics.store(ctl, 0, 1);
+    Atomics.notify(ctl, 0);
+  }
+  for (;;) Atomics.wait(ctl, 2, 0);
+}
+
+// The thread that supervises a threaded program (on node's main thread):
+// node lets only the main thread end the process (a worker's process.exit
+// ends that worker), and only it change directory or put a terminal in raw
+// mode; the program's threads all run on workers and ask it (endProgram,
+// SuperClient). ctl: [0] 1 once the program has asked to end, [1] the
+// status, [2] a word nobody changes, [3] 1 once a thread has claimed the end.
+export class Supervisor {
+  constructor(ops = {}) {
+    this.ctl = new Int32Array(new SharedArrayBuffer(16));
+    this.ops = ops;  // more requests: name -> async (args) => result
+  }
+  // A port of a thread's SuperClient.
+  attach(port) {
+    port.on('message', (m) => this.handle(m));
+  }
+  async handle(m) {
+    if (m.op === 'port') {
+      this.attach(m.port);
+      return;
+    }
+    const reply = new Int32Array(m.reply);
+    let r = -1;
+    try {
+      if (m.op === 'chdir') {
+        process.chdir(m.args.path);
+        r = 0;
+      } else if (m.op === 'term_raw') {
+        r = -1;
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(m.args.enable);
+          r = 0;
+        }
+      } else if (m.op === 'term_size') {
+        const st = m.args.fd === 1 ? process.stdout : m.args.fd === 2 ? process.stderr : null;
+        if (st && st.isTTY && st.getWindowSize) {
+          [reply[2], reply[3]] = st.getWindowSize();
+          r = 0;
+        }
+      } else if (this.ops[m.op]) {
+        r = await this.ops[m.op](m.args);
+      }
+    } catch (e) {
+      r = fsErr(e);
+    }
+    Atomics.store(reply, 1, r);
+    Atomics.store(reply, 0, 1);
+    Atomics.notify(reply, 0);
+  }
+  // Resolves with the status once a thread has asked to end the program.
+  ended() {
+    const w = Atomics.waitAsync(this.ctl, 0, 0);
+    return (w.async ? w.value : Promise.resolve()).then(() => Atomics.load(this.ctl, 1));
+  }
+}
+
+// A worker's side of the Supervisor: requests it serves at once (the
+// worker waits), on a port of its own.
+class SuperClient {
+  constructor(sup) {
+    this.ctl = sup.ctl;
+    this.port = sup.port;
+    this.reply = new Int32Array(new SharedArrayBuffer(16));
+  }
+  call(op, args) {
+    Atomics.store(this.reply, 0, 0);
+    this.port.postMessage({ op, args, reply: this.reply.buffer });
+    while (Atomics.load(this.reply, 0) === 0) Atomics.wait(this.reply, 0, 0);
+    return Atomics.load(this.reply, 1);
+  }
+  // A new port to the supervisor, for another thread.
+  newPort() {
+    const ch = new MessageChannel();
+    this.port.postMessage({ op: 'port', port: ch.port2 }, [ch.port2]);
+    return ch.port1;
+  }
+}
+
+// node's error codes as the negated errno values the host functions return
+function fsErr(e) {
+  return ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
+}
+
+// The in-memory file system of a program (--files=memory), with node's fs
+// interface: its calls go to the one MemFS (memfs.mjs) on the net worker,
+// which every thread of the program shares (see the net worker's memfs op).
+const MEM_CODES = ['ENOENT', 'EACCES', 'EPERM', 'EEXIST', 'ENOTDIR', 'EISDIR', 'ENOTEMPTY', 'ELOOP', 'EBADF', 'EINVAL', 'EBUSY'];
+class RemoteFS {
+  constructor(net) {
+    this.net = net;
+    this.virtual = true;
+    this.constants = { O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 0o100, O_EXCL: 0o200, O_TRUNC: 0o1000, O_APPEND: 0o2000,
+      O_DIRECTORY: 0o200000, O_NOFOLLOW: 0o400000 };
+  }
+  call(m, a, payload) {
+    const r = this.net().call('memfs', { m, a }, payload);
+    if (r < 0) throw Object.assign(new Error(MEM_CODES[-1 - r]), { code: MEM_CODES[-1 - r] });
+    return r;
+  }
+  result(n) { return this.net().data.subarray(0, n); }
+  json(m, a) { return JSON.parse(Buffer.from(this.result(this.call(m, a))).toString('utf8')); }
+  stats(m, a, o) {
+    const j = this.json(m, a), big = !!(o && o.bigint);
+    const num = (x) => (big ? BigInt(x) : Number(x));
+    return { size: num(j.size), mode: num(j.mode), ino: num(j.ino), dev: num(1), mtimeNs: BigInt(j.mtime),
+      isFile: () => j.kind === 1, isDirectory: () => j.kind === 2, isSymbolicLink: () => j.kind === 3 };
+  }
+  openSync(p, flags = 'r', mode = 0o666) { return this.call('openSync', [p, flags, mode]); }
+  closeSync(fd) { this.call('closeSync', [fd]); }
+  readSync(fd, buf, off, len, at) {
+    const n = this.call('readSync', [fd, null, Math.min(len, READ_CHUNK), at]);
+    buf.set(this.result(n), off);
+    return n;
+  }
+  writeSync(fd, buf, off = 0, len = buf.length - off, at = null) {
+    return this.call('writeSync', [fd, at], buf.slice(off, off + len));
+  }
+  fstatSync(fd, o) { return this.stats('fstatSync', [fd], o); }
+  statSync(p, o) { return this.stats('statSync', [p], o); }
+  lstatSync(p, o) { return this.stats('lstatSync', [p], o); }
+  readdirSync(p) {
+    return this.json('readdirSync', [p]).map(([name, k]) => ({ name, isFile: () => k === 1, isDirectory: () => k === 2,
+      isSymbolicLink: () => k === 3 }));
+  }
+  readlinkSync(p) { return Buffer.from(this.result(this.call('readlinkSync', [p]))); }
+  mkdirSync(p, o = {}) { this.call('mkdirSync', [p, { mode: o.mode }]); }
+  rmdirSync(p) { this.call('rmdirSync', [p]); }
+  unlinkSync(p) { this.call('unlinkSync', [p]); }
+  renameSync(a, b) { this.call('renameSync', [a, b]); }
+  chmodSync(p, m) { this.call('chmodSync', [p, m]); }
+  symlinkSync(t, p) { this.call('symlinkSync', [t, p]); }
+  linkSync(a, b) { this.call('linkSync', [a, b]); }
+  utimesSync(p, a, m) { this.call('utimesSync', [p, a, m]); }
+  ftruncateSync(fd, n) { this.call('ftruncateSync', [fd, n]); }
+  fsyncSync(fd) { this.call('fsyncSync', [fd]); }
+  cwd() { return this.json('cwd', []); }
+  chdir(p) { this.call('chdir', [p]); }
+}
+
+// Node's files under the directory `root` (--root=dir), which the program
+// sees as `/`: every path is resolved against the program's working
+// directory (node's, as a path under the root) and taken there; a path
+// whose existing part leads outside the root through a symbolic link (or
+// `..`, which stops at the root) fails with EACCES. The root's `tmp` is the
+// program's /tmp (made if missing).
+function rootFs(root) {
+  const real = fs.realpathSync(root);
+  try { fs.mkdirSync(path.join(real, 'tmp')); } catch { /* there */ }
+  const inside = (r) => r === real || r.startsWith(real + path.sep);
+  const cwd = () => {
+    const c = process.cwd();
+    return inside(c) ? '/' + path.relative(real, c).split(path.sep).join('/') : '/';
+  };
+  // The real path of p, checked: its deepest existing ancestor (or itself,
+  // links followed but for a final one when follow is false) must be inside.
+  const map = (p, follow = true) => {
+    const v = path.posix.resolve(cwd(), String(p));
+    const r = path.join(real, ...v.split('/').filter((x) => x));
+    let probe = follow ? r : path.dirname(r);
+    for (;;) {
+      try {
+        if (!inside(fs.realpathSync(probe))) throw Object.assign(new Error('outside the root'), { code: 'EACCES' });
+        break;
+      } catch (e) {
+        if (e.code === 'EACCES') throw e;
+        if (probe === real) break;
+        probe = path.dirname(probe);
+      }
+    }
+    return r;
+  };
+  const F = Object.create(fs);
+  F.real = map;
+  F.cwd = cwd;
+  F.chdir = (p) => process.chdir(map(p));
+  for (const m of ['openSync', 'statSync', 'mkdirSync', 'rmdirSync', 'readdirSync', 'chmodSync', 'utimesSync'])
+    F[m] = (p, ...a) => fs[m](map(p), ...a);
+  for (const m of ['lstatSync', 'unlinkSync', 'readlinkSync']) F[m] = (p, ...a) => fs[m](map(p, false), ...a);
+  F.renameSync = (a, b) => fs.renameSync(map(a, false), map(b, false));
+  F.linkSync = (a, b) => fs.linkSync(map(a, false), map(b, false));
+  F.symlinkSync = (t, l) => fs.symlinkSync(t, map(l, false));  // (the target is checked when followed)
+  return F;
+}
+
 // File positions shared by the threads: a table in shared memory for the
 // first POS_FDS descriptors (stored as position + 2; 0 means untracked, 1
 // means append), a plain map beyond (those are not shared).
@@ -324,11 +658,31 @@ function addrOf(r) {
   return { host: g.join(':'), port, family: 6 };
 }
 
+// The parameters (by position) of host functions that are i64 on every
+// target. On wasm64 the other i64 parameters are pointers and sizes, which
+// the host functions take as Numbers, like on wasm32 (std's declarations of
+// the `axiom` imports).
+const I64_PARAMS = { ax_ftruncate: [1], ax_mmap: [1], ax_seek: [1], ax_signal_take: [0], ax_sleep_ns: [0],
+  ax_syscall: [0], ax_utimes: [2, 3] };
+
 // The host functions whose result is an isize or usize (std's declarations
 // of the `axiom` imports).
-const SIZE_RESULTS = new Set(['ax_arg', 'ax_dir_read', 'ax_environ', 'ax_getcwd', 'ax_getenv', 'ax_mmap', 'ax_pipe_read',
+const SIZE_RESULTS = new Set(['ax_arg', 'ax_dir_read', 'ax_environ', 'ax_getcwd', 'ax_getenv', 'ax_mmap', 'ax_pipe_read', 'ax_tz_local',
   'ax_pipe_write', 'ax_read', 'ax_readdir', 'ax_readlink', 'ax_sock_read', 'ax_sock_write', 'ax_start_sp', 'ax_syscall',
   'ax_thread_create', 'ax_thread_stack_size', 'ax_udp_recv', 'ax_udp_send', 'ax_watch_read', 'ax_write']);
+
+// A memory for a module that imports one (lim from memoryImportLimits). A
+// memory64 is asked for with the JS API's `index: 'i64'` (Numbers) or, where
+// the engine has the later form, `address: 'i64'` (BigInts).
+function newMemory(lim) {
+  const maximum = lim.maximum ?? (lim.memory64 ? 262144 : 65536);
+  if (!lim.memory64) return new WebAssembly.Memory({ initial: lim.initial, maximum, shared: lim.shared });
+  try {
+    return new WebAssembly.Memory({ initial: lim.initial, maximum, shared: lim.shared, index: 'i64' });
+  } catch {
+    return new WebAssembly.Memory({ initial: BigInt(lim.initial), maximum: BigInt(maximum), shared: lim.shared, address: 'i64' });
+  }
+}
 
 export function createHost(opts = {}) {
   let memory = opts.memory || null;
@@ -343,9 +697,14 @@ export function createHost(opts = {}) {
   // positions of the files it opened (node has no lseek, so reads and
   // writes of them are positioned explicitly). Threads get it through
   // workerData.
-  const shared = opts.shared || { args: opts.args || [], pos: new SharedArrayBuffer(POS_FDS * 8) };
+  const shared = opts.shared || { args: opts.args || [], pos: new SharedArrayBuffer(POS_FDS * 8), files: opts.files || null,
+    root: opts.root || null };
   const programArgs = shared.args;
   const pos = new SharedPositions(shared.pos);
+  // The program's files (shared.files: one choice for every thread): node's
+  // (fs), node's under a root directory (rootFs), or in memory (RemoteFS,
+  // on the net worker, where every thread reaches the same files).
+  const F = shared.files === 'memory' ? new RemoteFS(net) : shared.root ? rootFs(shared.root) : fs;
   // ax_stat's out[0..4]: kind, size, modification time, permission bits
   const statOut = (st, out) => {
     const kind = st.isFile() ? 1n : st.isDirectory() ? 2n : st.isSymbolicLink() ? 3n : 4n;
@@ -356,7 +715,8 @@ export function createHost(opts = {}) {
     dv.setBigInt64(o + 16, st.mtimeNs, true);
     dv.setBigInt64(o + 24, st.mode & 0o7777n, true);
   };
-  const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
+  // (a worker of a supervised program: its requests to the supervisor)
+  const sup = opts.supervisor ? new SuperClient(opts.supervisor) : null;
   // Directory handles (see ax_dir_open): a descriptor of the directory,
   // opened without following links, pins it. Node has no openat, so names
   // under it are resolved through the descriptor where the system allows
@@ -365,16 +725,16 @@ export function createHost(opts = {}) {
   // window, where a swapped-in link could still be followed.
   const dirs = new Map();
   let nextDir = 1;
-  const O = fs.constants;
+  const O = F.constants;
   const DIR_FLAGS = O.O_RDONLY | (O.O_DIRECTORY || 0) | (O.O_NOFOLLOW || 0);
-  const PROC_FD = (() => { try { return fs.statSync('/proc/self/fd').isDirectory() ? '/proc/self/fd/' : null; } catch { return null; } })();
+  const PROC_FD = F !== fs ? null : (() => { try { return fs.statSync('/proc/self/fd').isDirectory() ? '/proc/self/fd/' : null; } catch { return null; } })();
   // The path to use for the directory handle d (its descriptor's, or its
   // own after a check); throws ELOOP if the path is no longer it.
   const dirBase = (d) => {
     const dir = dirs.get(d);
     if (dir.via) return dir.via;
     if (dir.fd >= 0) {
-      const st = fs.lstatSync(dir.path);
+      const st = F.lstatSync(dir.path);
       if (!st.isDirectory() || st.dev !== dir.dev || st.ino !== dir.ino) throw Object.assign(new Error('replaced'), { code: 'ELOOP' });
     }
     return dir.path;
@@ -408,7 +768,7 @@ export function createHost(opts = {}) {
   const readdirPath = (dir, out, cap) => {
     try {
       const parts = [];
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      for (const e of F.readdirSync(dir, { withFileTypes: true })) {
         const kind = e.isFile() ? 1 : e.isDirectory() ? 2 : e.isSymbolicLink() ? 3 : 4;
         parts.push(Buffer.from([kind]), Buffer.from(e.name, 'utf8'), Buffer.from([0]));
       }
@@ -422,7 +782,7 @@ export function createHost(opts = {}) {
       try {
         if (!pos.has(fd)) return writeFd(fd, bytes(p, n).slice());
         const at = pos.get(fd);
-        const w = fs.writeSync(fd, bytes(p, n).slice(), 0, n >>> 0, at < 0 ? null : at);
+        const w = F.writeSync(fd, bytes(p, n).slice(), 0, n >>> 0, at < 0 ? null : at);
         if (at >= 0) pos.set(fd, at + w);
         return w;
       } catch { return -1; }
@@ -431,7 +791,7 @@ export function createHost(opts = {}) {
       try {
         const buf = Buffer.alloc(Math.min(n >>> 0, READ_CHUNK));
         const at = pos.has(fd) ? pos.get(fd) : -1;
-        const got = fs.readSync(fd, buf, 0, buf.length, at < 0 ? null : at);
+        const got = (at >= 0 || pos.has(fd) ? F : fs).readSync(fd, buf, 0, buf.length, at < 0 ? null : at);
         if (at >= 0) pos.set(fd, at + got);
         bytes(p, got).set(buf.subarray(0, got));
         return got;
@@ -444,7 +804,7 @@ export function createHost(opts = {}) {
         // (flags 4 and 5: w+ and a+; flag 8: the file must not exist)
         const excl = (flags & 8) && [1, 4].includes(flags & 7);
         const mode = excl ? ((flags & 7) === 1 ? 'wx' : 'wx+') : (['r', 'w', 'a', 'r+', 'w+', 'a+'][flags & 7] || 'r');
-        const fd = fs.openSync(str(p, n), mode);
+        const fd = F.openSync(str(p, n), mode);
         pos.set(fd, (flags & 7) === 2 ? -1 : 0);  // appends go to the end
         return fd;
       } catch (e) {
@@ -453,7 +813,7 @@ export function createHost(opts = {}) {
     },
     ax_create(p, n, mode) {
       try {
-        const fd = fs.openSync(str(p, n), 'w', mode & 0o777);
+        const fd = F.openSync(str(p, n), 'w', mode & 0o777);
         pos.set(fd, 0);
         return fd;
       } catch (e) {
@@ -462,14 +822,14 @@ export function createHost(opts = {}) {
     },
     ax_close(fd) {
       pos.delete(fd);
-      try { fs.closeSync(fd); } catch { /* ignore */ }
+      try { (F !== fs && fd > 2 ? F : fs).closeSync(fd); } catch { /* ignore */ }
     },
     ax_seek(fd, off, whence) {
       if (!pos.has(fd)) return -1n;
       try {
         let base = 0;
         if (whence === 1) base = Math.max(pos.get(fd), 0);
-        else if (whence === 2) base = fs.fstatSync(fd).size;
+        else if (whence === 2) base = Number(F.fstatSync(fd).size);
         const at = base + Number(off);
         if (at < 0) return -1n;
         if (pos.get(fd) >= 0) pos.set(fd, at);
@@ -481,29 +841,29 @@ export function createHost(opts = {}) {
     ax_stat(p, n, follow, out) {
       try {
         const path = str(p, n);
-        statOut(follow ? fs.statSync(path, { bigint: true }) : fs.lstatSync(path, { bigint: true }), out);
+        statOut(follow ? F.statSync(path, { bigint: true }) : F.lstatSync(path, { bigint: true }), out);
         return 0;
       } catch (e) {
         return fsErr(e);
       }
     },
     ax_fstat(fd, out) {
-      try { statOut(fs.fstatSync(fd, { bigint: true }), out); return 0; } catch (e) { return fsErr(e); }
+      try { statOut((F !== fs && fd > 2 ? F : fs).fstatSync(fd, { bigint: true }), out); return 0; } catch (e) { return fsErr(e); }
     },
     ax_mkdir(p, n, mode) {
-      try { fs.mkdirSync(str(p, n), { mode: mode & 0o7777 }); return 0; } catch (e) { return fsErr(e); }
+      try { F.mkdirSync(str(p, n), { mode: mode & 0o7777 }); return 0; } catch (e) { return fsErr(e); }
     },
     ax_remove(p, n, dir) {
       try {
-        if (dir) fs.rmdirSync(str(p, n));
-        else fs.unlinkSync(str(p, n));
+        if (dir) F.rmdirSync(str(p, n));
+        else F.unlinkSync(str(p, n));
         return 0;
       } catch (e) {
         return fsErr(e);
       }
     },
     ax_rename(a, an, b, bn) {
-      try { fs.renameSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
+      try { F.renameSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
     ax_readdir(p, n, out, cap) { return readdirPath(str(p, n), out, cap); },
     ax_dir_open(d, p, n) {
@@ -511,18 +871,18 @@ export function createHost(opts = {}) {
         if (d >= 0 && !dirs.has(d)) return -1;
         const name = str(p, n);
         const full = d >= 0 && name === '..' ? parentPath(d) : dirPath(d, name);
-        const st = fs.lstatSync(full);
+        const st = F.lstatSync(full);
         if (st.isSymbolicLink()) return -40;
         if (!st.isDirectory()) return -20;
         let fd = -1, dev = 0, ino = 0;
         try {
-          fd = fs.openSync(full, DIR_FLAGS);
-          const fst = fs.fstatSync(fd);
-          if (!fst.isDirectory()) { fs.closeSync(fd); return -20; }
+          fd = F.openSync(full, DIR_FLAGS);
+          const fst = F.fstatSync(fd);
+          if (!fst.isDirectory()) { F.closeSync(fd); return -20; }
           dev = fst.dev;
           ino = fst.ino;
         } catch (e) {
-          if (fd >= 0) fs.closeSync(fd);
+          if (fd >= 0) F.closeSync(fd);
           if (e.code === 'ELOOP' || e.code === 'ENOTDIR') return fsErr(e);
           fd = -1;  // directories cannot be opened here: by path, as before
         }
@@ -542,8 +902,8 @@ export function createHost(opts = {}) {
       try {
         if (d >= 0 && !dirs.has(d)) return -1;
         const full = dirPath(d, str(p, n));
-        if (dir) fs.rmdirSync(full);
-        else fs.unlinkSync(full);
+        if (dir) F.rmdirSync(full);
+        else F.unlinkSync(full);
         return 0;
       } catch (e) {
         return fsErr(e);
@@ -551,7 +911,7 @@ export function createHost(opts = {}) {
     },
     ax_dir_close(d) {
       const dir = dirs.get(d);
-      if (dir && dir.fd >= 0) try { fs.closeSync(dir.fd); } catch {}
+      if (dir && dir.fd >= 0) try { F.closeSync(dir.fd); } catch {}
       dirs.delete(d);
     },
     // The identity (device, inode) of an open directory, to check one
@@ -560,7 +920,7 @@ export function createHost(opts = {}) {
       const dir = dirs.get(d);
       if (!dir) return -1;
       try {
-        const st = dir.fd >= 0 ? fs.fstatSync(dir.fd, { bigint: true }) : fs.lstatSync(dir.path, { bigint: true });
+        const st = dir.fd >= 0 ? F.fstatSync(dir.fd, { bigint: true }) : F.lstatSync(dir.path, { bigint: true });
         const dv = new DataView(memory.buffer);
         dv.setBigInt64(Number(out), st.dev, true);
         dv.setBigInt64(Number(out) + 8, st.ino, true);
@@ -569,7 +929,7 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ax_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
+    ax_getcwd(p, cap) { return give(Buffer.from(F === fs ? process.cwd() : F.cwd(), 'utf8'), p, cap); },
     ax_argc: () => programArgs.length,
     ax_arg(i, p, cap) {
       if (i < 0 || i >= programArgs.length) return -1;
@@ -580,7 +940,12 @@ export function createHost(opts = {}) {
       if (v === undefined) return -2;
       return give(Buffer.from(v, 'utf8'), out, cap);
     },
-    ax_exit(code) { (opts.exit || process.exit)(code); },  // (opts.exit: an embedder's, which must not return)
+    // Ends the program, every thread (spec §12.8.5): through the supervisor
+    // on a worker, else the embedder's opts.exit, which must not return.
+    ax_exit(code) {
+      if (sup) endProgram(sup.ctl, code);
+      (opts.exit || process.exit)(code);
+    },
     ax_tcp_connect: (p, n, port) => net().call('connect', { host: str(p, n), port }),
     ax_tcp_listen: (p, n, port) => net().call('listen', { host: str(p, n), port }),
     ax_tcp_accept: (h) => net().call('accept', { h }),
@@ -594,15 +959,23 @@ export function createHost(opts = {}) {
     ax_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ax_sock_close: (h) => { net().call('close', { h }); },
     ax_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
-    // Processes and the environment. process.env and the directory are the
-    // calling thread's (node gives each worker its own copy of the
-    // environment, and only the main thread may change directory). Signals
-    // are not supported: node delivers them only to the main thread's event
-    // loop, which a running program does not return to.
+    // Processes and the environment. The program's threads share the
+    // environment (workers are started with SHARE_ENV) and the directory,
+    // which only node's main thread may change: a worker asks the
+    // supervisor. Signals are not supported: node delivers them only to the
+    // main thread's event loop, which a running program does not return to.
     ax_getpid: () => process.pid,
     ax_fork: () => -38,  // ENOSYS: an instance cannot be copied
     ax_chdir(p, n) {
-      try { process.chdir(str(p, n)); return 0; } catch (e) { return fsErr(e); }
+      try {
+        if (F.virtual) { F.chdir(str(p, n)); return 0; }  // (the in-memory files' own directory)
+        const real = F.real ? F.real(str(p, n)) : str(p, n);
+        if (sup) return sup.call('chdir', { path: real });
+        process.chdir(real);
+        return 0;
+      } catch (e) {
+        return fsErr(e);
+      }
     },
     ax_setenv(k, kn, v, vn) {
       const name = str(k, kn), value = str(v, vn);
@@ -744,19 +1117,19 @@ export function createHost(opts = {}) {
     // the program's memory: ax_flock reports -95 (not supported) and ax_mmap
     // 0, for std/os/fs to fall back on. Watching runs on the net worker.
     ax_chmod(p, n, mode) {
-      try { fs.chmodSync(str(p, n), mode & 0o7777); return 0; } catch (e) { return fsErr(e); }
+      try { F.chmodSync(str(p, n), mode & 0o7777); return 0; } catch (e) { return fsErr(e); }
     },
     ax_symlink(t, tn, l, ln) {
-      try { fs.symlinkSync(str(t, tn), str(l, ln)); return 0; } catch (e) { return fsErr(e); }
+      try { F.symlinkSync(str(t, tn), str(l, ln)); return 0; } catch (e) { return fsErr(e); }
     },
     ax_link(a, an, b, bn) {
-      try { fs.linkSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
+      try { F.linkSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
     // (none: argument 0 is the module's path)
     ax_self_path() { return -1; },
     ax_readlink(p, n, buf, cap) {
       try {
-        const b = fs.readlinkSync(str(p, n), { encoding: 'buffer' });
+        const b = F.readlinkSync(str(p, n), { encoding: 'buffer' });
         if (b.length <= cap >>> 0) bytes(buf, b.length).set(b);
         return b.length;
       } catch (e) {
@@ -764,13 +1137,13 @@ export function createHost(opts = {}) {
       }
     },
     ax_utimes(p, n, atime, mtime) {
-      try { fs.utimesSync(str(p, n), utimeSeconds(atime), utimeSeconds(mtime)); return 0; } catch (e) { return fsErr(e); }
+      try { F.utimesSync(str(p, n), utimeSeconds(atime), utimeSeconds(mtime)); return 0; } catch (e) { return fsErr(e); }
     },
     ax_ftruncate(fd, size) {
-      try { fs.ftruncateSync(fd, Number(size)); return 0; } catch (e) { return fsErr(e); }
+      try { F.ftruncateSync(fd, Number(size)); return 0; } catch (e) { return fsErr(e); }
     },
     ax_fsync(fd) {
-      try { fs.fsyncSync(fd); return 0; } catch { return -1; }
+      try { F.fsyncSync(fd); return 0; } catch { return -1; }
     },
     ax_flock: () => -95,
     ax_mmap: () => 0,
@@ -786,10 +1159,15 @@ export function createHost(opts = {}) {
       return got;
     },
     ax_watch_close: (h) => { net().call('close', { h }); },
-    // Terminals: the size of stdout's and stderr's, raw mode for stdin (on
-    // the main thread only).
-    ax_isatty: (fd) => (tty.isatty(fd) ? 1 : 0),
+    // Terminals: the size of stdout's and stderr's, raw mode for stdin (node's
+    // main thread's: the supervisor's for a worker).
+    ax_isatty: (fd) => (!(F !== fs && fd > 2) && tty.isatty(fd) ? 1 : 0),
     ax_term_size(fd, out) {
+      if (sup) {
+        const r = sup.call('term_size', { fd });
+        if (r === 0) new Uint32Array(memory.buffer, out >>> 0, 2).set([sup.reply[2], sup.reply[3]]);
+        return r;
+      }
       const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
       if (!s || !s.isTTY || !s.getWindowSize) return -1;
       const [cols, rows] = s.getWindowSize();
@@ -799,6 +1177,7 @@ export function createHost(opts = {}) {
       return 0;
     },
     ax_term_raw(fd, enable) {
+      if (sup) return fd === 0 ? sup.call('term_raw', { enable: enable !== 0 }) : -1;
       if (fd !== 0 || !process.stdin.isTTY || !process.stdin.setRawMode) return -1;
       try { process.stdin.setRawMode(enable !== 0); return 0; } catch { return -1; }
     },
@@ -806,9 +1185,13 @@ export function createHost(opts = {}) {
     ax_thread_spawn(entry, arg, stackTop, exited) {
       // The new thread shares this program's sockets.
       const netPort = net().newPort();
+      // (and reaches the supervisor, if there is one, on a port of its own)
+      const superPort = sup ? sup.newPort() : null;
+      const supervisor = sup ? { ctl: sup.ctl, port: superPort } : null;
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
-        workerData: { module, memory, entry, arg, stackTop, exited, netPort, shared, testTrap: opts.testTrap || null },
-        transferList: [netPort],
+        workerData: { module, memory, entry, arg, stackTop, exited, netPort, shared, supervisor, testTrap: opts.testTrap || null },
+        transferList: sup ? [netPort, superPort] : [netPort],
+        env: SHARE_ENV,
       });
       // A trap in any thread terminates the whole program (spec §12.8).
       w.on('error', (e) => {
@@ -819,12 +1202,17 @@ export function createHost(opts = {}) {
       return nextThread++;
     },
     ax_thread_stack_size: () => THREAD_STACK,
-    // Ends the calling thread (a worker): thread_worker.mjs catches this,
-    // as the return of the thread's entry. Nothing on the main thread.
+    // Ends the calling thread (one ax_thread_spawn started): thread_worker.mjs
+    // catches this, as the return of the thread's entry. Nothing on another.
     ax_thread_exit() {
-      if (!isMainThread) throw THREAD_EXIT;
+      if (opts.thread) throw THREAD_EXIT;
     },
     ax_os: () => ({ linux: 1, darwin: 2, win32: 3 }[process.platform] || 0),
+    // The local time zone, as a TZif file (localTzif: from the engine's own
+    // knowledge of the zone, which follows $TZ, so no database is needed).
+    ax_tz_local(p, cap) {
+      try { return give(localTzif(), p, cap); } catch { return -2; }
+    },
     // WebAssembly cannot ask the processor (std/os/cpu.ax): no extensions.
     ax_cpu_features: () => 0n,
     ax_cpu_count: () => (os.availableParallelism ? os.availableParallelism() : os.cpus().length),
@@ -855,6 +1243,8 @@ export function createHost(opts = {}) {
     imports: { axiom },
     setMemory(m) { memory = m; },
     memory() { return memory; },
+    // a request to the supervisor (on a worker of a supervised program)
+    superCall(op, args) { return sup.call(op, args); },
     close() { if (netClient) netClient.close(); },
     // Builds the import object for `mod`: the host ABI, the shared memory if
     // the module imports one, `extra`, and trapping stubs for anything else
@@ -868,9 +1258,14 @@ export function createHost(opts = {}) {
       for (const imp of WebAssembly.Module.imports(mod)) {
         imports[imp.module] ||= {};
         let v;
-        if (imp.module === 'axiom' && axiom[imp.name] && wide && SIZE_RESULTS.has(imp.name)) {
-          const f = axiom[imp.name];
-          v = (...a) => { const r = f(...a); return typeof r === 'number' ? BigInt(r) : r; };
+        if (imp.module === 'axiom' && axiom[imp.name] && wide) {
+          // (pointer and size arguments as Numbers, size results as BigInts)
+          const f = axiom[imp.name], keep = I64_PARAMS[imp.name] || [], size = SIZE_RESULTS.has(imp.name);
+          v = (...a) => {
+            for (let k = 0; k < a.length; k++) if (typeof a[k] === 'bigint' && !keep.includes(k)) a[k] = Number(a[k]);
+            const r = f(...a);
+            return size && typeof r === 'number' ? BigInt(r) : r;
+          };
         } else if (imp.module === 'axiom' && axiom[imp.name]) v = axiom[imp.name];
         else if (imp.kind === 'memory') v = memory;
         else if (extra[imp.module] && extra[imp.module][imp.name] !== undefined) v = extra[imp.module][imp.name];
@@ -883,9 +1278,7 @@ export function createHost(opts = {}) {
     },
     instantiate(bytes, extra = {}) {
       const lim = memoryImportLimits(bytes);
-      if (lim && !memory) {
-        memory = new WebAssembly.Memory({ initial: lim.initial, maximum: lim.maximum ?? 65536, shared: lim.shared });
-      }
+      if (lim && !memory) memory = newMemory(lim);
       return host.instantiateModule(new WebAssembly.Module(bytes), extra);
     },
   };
@@ -893,14 +1286,14 @@ export function createHost(opts = {}) {
 }
 
 // Sampling profiler (spec §16.6): a worker samples the main thread's shadow
-// stack; the result is written in the raw format read by `axiom profile`
-// (see std/internal/runtime/profile.c).
-function startProfiler(instance, memory, hz) {
+// stack (at ss; wide: wasm64); the result is written in the raw format read
+// by `axiom profile` (see std/internal/runtime/profile.c).
+function startProfiler({ ss, wide }, memory, hz) {
   if (!(memory.buffer instanceof SharedArrayBuffer)) throw new Error('--profile needs a program built by axiom profile (shared memory)');
   const control = new SharedArrayBuffer(8);
-  const ss = Number(instance.exports.axiom_shadow_stack());
+  const instance = { exports: { axiom_wasm64: wide ? 1 : undefined } };  // (all readSite needs)
   const w = new Worker(new URL('./profile_worker.mjs', import.meta.url),
-    { workerData: { memory, ss, wide: !!instance.exports.axiom_wasm64, hz, control } });
+    { workerData: { memory, ss, wide, hz, control } });
   let ready;
   const started = new Promise((resolve) => { ready = resolve; });
   const result = new Promise((resolve, reject) => {
@@ -946,32 +1339,80 @@ async function main() {
   const own = dash < 0 ? args : args.slice(0, dash);
   const [file, entry] = own.filter((a) => !a.startsWith('--'));
   if (!file) {
-    console.error('usage: node std/internal/runtime/host.mjs [--profile=out.raw [--profile-hz=N]] program.wasm [export] [-- args...]');
+    console.error('usage: node std/internal/runtime/host.mjs [--profile=out.raw [--profile-hz=N]] [--root=dir | --files=memory] program.wasm [export] [-- args...]');
     process.exit(2);
   }
-  const host = createHost({ args: [file, ...(dash < 0 ? [] : args.slice(dash + 1))] });
-  const instance = host.instantiate(fs.readFileSync(file));
+  const programArgs = [file, ...(dash < 0 ? [] : args.slice(dash + 1))];
+  // (--files=memory: the program's files in memory; --root=dir: node's under dir)
+  const files = own.includes('--files=memory') ? 'memory' : null;
+  const root = (own.find((a) => a.startsWith('--root=')) || '').slice(7) || null;
+  const bytes = fs.readFileSync(file);
+  const lim = memoryImportLimits(bytes);
+  if (lim && lim.shared) {
+    await supervise(bytes, lim, entry, { args: programArgs, pos: new SharedArrayBuffer(POS_FDS * 8), files, root }, profile, hz);
+    return;
+  }
+  if (profile) {
+    console.error('axiom: --profile needs a program built by axiom profile (shared memory)');
+    process.exit(2);
+  }
+  const host = createHost({ args: programArgs, files, root });
+  const instance = host.instantiate(bytes);
   const name = entry || (instance.exports.main ? 'main' : 'run');
   const fn = instance.exports[name];
   if (typeof fn !== 'function') {
     console.error(`axiom: no export named '${entry || 'main'}'`);
     process.exit(2);
   }
-  const profiler = profile ? startProfiler(instance, host.memory(), hz) : null;
-  if (profiler) await profiler.started;
   let code = 0;
   try {
     const r = fn();
     if (typeof r === 'number') code = r;
   } catch (e) {
-    if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError)) throw e;
+    if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError || e instanceof WebAssembly.Exception)) throw e;
     const t = describeTrap(instance, host.memory(), e);
     console.error(formatTrap(t));
     code = 134;
   }
-  if (profiler) await profiler.stop(name, profile);
   host.close();
   process.exit(code);
+}
+
+// A threaded program: its main thread on a worker (thread_worker.mjs, with
+// workerData.main), this thread its supervisor, which ends the process with
+// the status of the first thread to ask (ax_exit, or the main thread when
+// its entry returns).
+async function supervise(bytes, lim, entry, shared, profile, hz) {
+  const module = new WebAssembly.Module(bytes);
+  const memory = newMemory(lim);
+  let profiler = null;
+  const sup = new Supervisor({
+    // the main thread, before it runs: starts the profiler on its shadow stack
+    async profile_start(info) {
+      profiler = startProfiler(info, memory, hz);
+      await profiler.started;
+      return 0;
+    },
+    // the main thread's entry returned (code), or was not there (-1)
+    async main_done({ code, name }) {
+      if (profiler) await profiler.stop(name, profile);
+      process.exit(code);
+    },
+  });
+  const ch = new MessageChannel();
+  sup.attach(ch.port1);
+  const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
+    workerData: { module, memory, shared, supervisor: { ctl: sup.ctl, port: ch.port2 },
+                  main: { entry: entry || null, profile: !!profile } },
+    transferList: [ch.port2],
+    env: SHARE_ENV,
+  });
+  w.on('error', (e) => {
+    process.stderr.write(`axiom: ${e && e.message}\n`);
+    process.exit(134);
+  });
+  w.on('exit', (c) => process.exit(c === 0 ? 0 : 134));
+  process.exit(await sup.ended());
 }
 
 if (process.argv[1] && new URL(import.meta.url).pathname === fs.realpathSync(process.argv[1])) main();

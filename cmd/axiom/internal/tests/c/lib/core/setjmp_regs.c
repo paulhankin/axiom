@@ -3,7 +3,7 @@
    there are (more than registers: integers, doubles and floats, the
    registers a call keeps among them), at every optimization level; and so
    do the caller's. */
-/* native-only */
+/* wasm-flags: --features=+exception-handling */
 #include <setjmp.h>
 #include "print.h"
 

@@ -370,7 +370,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_getcwd(buf, cap) isize` | the working directory; returns its length |
 | `ax_argc() i32`, `ax_arg(i, buf, cap) isize` | the program's arguments (argument 0 is its name); returns the length |
 | `ax_getenv(name, len, buf, cap) isize` | an environment variable; `-2` if unset |
-| `ax_exit(code)` | ends the process |
+| `ax_exit(code)` | ends the process, from any thread (spec §12.8.5) |
 | `ax_os() i32` | the operating system: `1` Linux, `2` macOS, `3` Windows, `0` another (or none) |
 | `ax_tcp_connect(name, len, port) i32`, `ax_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ax_tcp_accept(h) i32`, `ax_tcp_local_port(h) i32` | |
@@ -380,6 +380,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns)` | |
 | `ax_random(p, n) i32` | fills `p[0..n]` with cryptographically secure random bytes |
 | `ax_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970), `1` (monotonic) or `2` (the processor time of the process) |
+| `ax_tz_local(buf, cap) isize` | the host's local time zone as the bytes of a TZif file (RFC 8536, version 2 or later, with a footer rule for later times); `-2` if the host has none (native targets, whose zone is the system's files). `std/time/tz`'s `Zone.local` asks for it when `$TZ` and `/etc/localtime` give no zone: the node host builds one from what the JavaScript engine knows of its zone (`Date`, `Intl`), so that no time zone database is needed |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection
 refused / not found, `-3` address in use, `-4` invalid address, `-5` timed out, `-13`
@@ -394,7 +395,13 @@ The implementations:
 - **[`std/internal/runtime/host.mjs`](internal/runtime/host.mjs)** for node, usable as a runner:
   `node std/internal/runtime/host.mjs prog.wasm`. Node sockets are asynchronous, so they live in
   a worker thread, and the wasm thread blocks on `Atomics.wait` until each
-  operation completes.
+  operation completes. The program's files are node's; with `--root=dir`, node's under
+  `dir`, which the program sees as `/` (its `tmp` the program's `/tmp`; a path that
+  leads out of it, through `..` or a symbolic link, does not); with `--files=memory`, a
+  file system in memory ([`memfs.mjs`](internal/runtime/memfs.mjs), on the same
+  worker, so that every thread sees the same files), which a host without files of
+  its own (a browser) can use. A threaded program runs all its threads on workers,
+  under a supervisor on node's main thread (spec §12.8.5, "Ending the program").
 - **[`std/internal/runtime/native_host.c`](internal/runtime/native_host.c)** for POSIX. The bootstrap compiler
   links it automatically when a native program uses the host ABI. The compiler
   builds the same host ABI written in Axiom,

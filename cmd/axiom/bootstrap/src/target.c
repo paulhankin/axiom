@@ -93,6 +93,7 @@ static const Feature TABLE[] = {
     {"multivalue", W, B(6), 0, "multivalue"},
     {"relaxed-simd", W, B(7), B(0), "relaxed-simd"},
     {"tail-call", W, B(8), 0, "tail-call"},
+    {"exception-handling", W, B(9), 0, "exception-handling"},
 };
 #define NFEAT (int)(sizeof TABLE / sizeof *TABLE)
 
@@ -212,7 +213,7 @@ bool cpu_preset(int arch, const char *name, uint64_t *out) {
         uint64_t generic = B(0) | B(1) | B(2) | B(3) | B(4) | B(5) | B(6);
         if (!strcmp(name, "mvp")) *out = B(4);
         else if (!strcmp(name, "generic") || !*name) *out = generic;
-        else if (!strcmp(name, "bleeding-edge")) *out = generic | B(7) | B(8);
+        else if (!strcmp(name, "bleeding-edge")) *out = generic | B(7) | B(8) | B(9);
         else ok = false;
         return ok;
     }

@@ -1,0 +1,117 @@
+// Memory another thread has just added by growing the memory (spec §12.8.5,
+// "Memory growth"): producers allocate large blocks, each from memory grown
+// for it, and publish them at once; consumers take each block as soon as it
+// appears and use it at once with an atomic read-modify-write, a fill
+// (memory.fill) and a copy (memory.copy), and also raw pages grown with
+// @memory_grow. An engine that checks such accesses against a thread's
+// stale view of the memory's size would trap here without the compiler's
+// refresh of that view.
+import "../lib/io.ax" as io;
+import "std/mem" as mem;
+import "std/thread" as thread;
+
+const PRODUCERS: usize = 3;
+const CONSUMERS: usize = 4;
+const BLOCKS: usize = 24;  // per producer
+const BLOCK: usize = 384 * 1024;
+const RAW: usize = 60;  // raw pages grown by the last producer
+
+// slot k: the address of a published block (0: none yet)
+let mut slots: [96]usize = [0; 96];
+let mut raw_top: usize = 0;  // the end of the last raw page grown
+let mut taken: [96]u32 = [0; 96];
+let mut bad: u64 = 0;
+let mut uses: u64 = 0;
+let mut producing: u32 = 0;
+
+fn produce(p: usize) void {
+    for i in 0..BLOCKS {
+        let b = mem.alloc.[u8](BLOCK) catch {
+            _ = @atomic_add(&mut bad, 1);
+            continue;
+        };
+        b[0] = @truncate(u8, p * 31 + i);
+        @atomic_store(&mut slots[(p * BLOCKS) + i], @int_from_ptr(b.ptr));
+    }
+    if p == (PRODUCERS - 1) {
+        for _i in 0..RAW {
+            let prev = @memory_grow(1) catch break;
+            @atomic_store(&mut raw_top, (prev + 1) * 65536);
+        }
+    }
+    _ = @atomic_sub(&mut producing, 1);
+}
+
+// Uses the block at a (BLOCK bytes) at once: an atomic add on its last
+// word, a fill of its second half and a copy into its first.
+fn use_block(a: usize) void {
+    let w = @ptr_from_int(*mut u32, a + BLOCK - 4);
+    _ = @atomic_add(w, 1);
+    let blk = @slice_from_ptr(@ptr_from_int(*mut u8, a), BLOCK);
+    @mem_set(blk[(BLOCK / 2)..(BLOCK - 4)], 0x5a);
+    @mem_copy(blk[1..1025], blk[(BLOCK / 2)..((BLOCK / 2) + 1024)]);
+    if blk[1024] != 0x5a {
+        _ = @atomic_add(&mut bad, 1);
+    }
+    _ = @atomic_add(&mut uses, 1);
+}
+
+fn consume(c: usize) void {
+    let mut last_raw: usize = 0;
+    while true {
+        let busy = @atomic_load(&mut producing) != 0;
+        let r = @atomic_load(&mut raw_top);
+        if (r != 0) and (r != last_raw) {
+            // the newest raw page, at once
+            let w = @ptr_from_int(*mut u32, r - (4 * (c + 1)));
+            _ = @atomic_add(w, 1);
+            last_raw = r;
+        }
+        for k in 0..(PRODUCERS * BLOCKS) {
+            let a = @atomic_load(&mut slots[k]);
+            if (a != 0) and (@atomic_cas(&mut taken[k], 0, 1) == 0) {
+                use_block(a);
+            }
+        }
+        if not busy {
+            break;
+        }
+    }
+}
+
+export fn run() void {
+    @atomic_store(&mut producing, @truncate(u32, PRODUCERS));
+    let cs = mem.alloc.[thread.Thread.[usize]](CONSUMERS) catch return;
+    let ps = mem.alloc.[thread.Thread.[usize]](PRODUCERS) catch return;
+    for c in 0..CONSUMERS {
+        cs[c] = thread.spawn(consume, c) catch return;
+    }
+    for p in 0..PRODUCERS {
+        ps[p] = thread.spawn(produce, p) catch return;
+    }
+    for p in 0..PRODUCERS {
+        ps[p].join();
+    }
+    for c in 0..CONSUMERS {
+        cs[c].join();
+    }
+    // every block used once, by whichever consumer took it
+    let mut ok = true;
+    for k in 0..(PRODUCERS * BLOCKS) {
+        let a = slots[k];
+        if a == 0 {
+            ok = false;
+            continue;
+        }
+        let w = @ptr_from_int(*mut u32, a + BLOCK - 4);
+        if (@atomic_load(w) != 1) or (taken[k] != 1) {
+            ok = false;
+        }
+        mem.free(@slice_from_ptr(@ptr_from_int(*mut u8, a), BLOCK));
+    }
+    mem.free(ps);
+    mem.free(cs);
+    io.uint(bad);    // expect: 0
+    io.boolean(ok);  // expect: true
+    io.boolean(uses == @as(u64, PRODUCERS * BLOCKS));  // expect: true
+}

@@ -19,6 +19,8 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "combine.ax" as cb;
+import "dloc.ax" as dloc;
+import "dwarf.ax" as dw;
 import "ir.ax" as ir;
 import "isel.ax" as is;
 import "opt.ax" as opt;
@@ -181,6 +183,220 @@ fn pconst(x: u64) void {
 
 fn reloc(t: u8, sym: u32, addend: i64) void {
     RL.push(wo.Reloc.{ ty: t, off: @int_cast(u32, C.len()), sym: sym, addend: addend });
+}
+
+// -----------------------------------------------------------------------------
+// A thread's view of a growing shared memory (spec §12.8.5, "Memory growth")
+//
+// An engine may keep, in each thread's instance, the memory's size as that
+// thread last saw it, check atomic and bulk accesses (and, on memory64,
+// every access) against it, and bring it up to date only some time after
+// another thread has grown the memory: an access to memory that another
+// thread added, which the program has every right to make (it happens after
+// the growth), then traps as out of bounds. `memory.grow` by 0 pages brings
+// the calling thread's view up to date. So, with the atomics extension:
+// - each `memory.grow` that succeeds raises the word __axiom_memory_pages
+//   (linker-provided) to the memory's size in pages, before the program can
+//   use the new pages;
+// - each atomic operation that can observe another thread's writes (loads,
+//   read-modify-writes, compare-exchanges, waits, fences) is followed by a
+//   look at that word: if it is beyond the thread's own memory.size, the
+//   thread grows the memory by 0. Whatever happens after another thread's
+//   growth reaches the thread through such an operation, so the thread's
+//   view covers it by then;
+// - an atomic or bulk access whose end is beyond the view (memory reached
+//   through a pointer read in a race) refreshes it first.
+// The cost is a load and a compare per atomic operation; the refresh itself
+// happens only after another thread has grown the memory.
+// -----------------------------------------------------------------------------
+let mut pages_sym: u32 = 0;
+let mut view_sync: bool = false;
+
+// -----------------------------------------------------------------------------
+// setjmp and longjmp (the exception-handling extension; ir.ax's IN_SJLJ_*,
+// made by c/cgen_sjlj.ax)
+//
+// longjmp (wlink.ax's longjmp_unit) stores its value in the jmp_buf and
+// throws the tag __axc_longjmp_tag with the jmp_buf's address. A function
+// that calls setjmp runs its body as
+//     loop $again
+//       block $caught (result ptr)
+//         try_table (catch $tag $caught)  <the body>  end
+//         unreachable
+//       end
+//       (the jmp_buf) its first word is not this activation's token (its
+//       frame's address, which setjmp stored): throw it on
+//       resumed = 1; br $again
+//     end
+// and its entry block asks IN_SJLJ_CAUGHT whether it was resumed: then
+// the code the C front end made goes to the setjmp call the jmp_buf names.
+// The rethrow is outside the try_table, so it leaves the function.
+// -----------------------------------------------------------------------------
+let mut tag_sym: u32 = 0;
+let mut sj_resumed: u32 = 0;  // locals: the flag, the caught jmp_buf
+let mut sj_env: u32 = 0;
+
+// Pushes the address of __axiom_memory_pages.
+fn pages_word() void {
+    if W64 {
+        op(0x42);
+        reloc(wo.R_MEMORY_ADDR_SLEB64, pages_sym, 0);
+        C.sleb10(0);
+    } else {
+        op(0x41);
+        reloc(wo.R_MEMORY_ADDR_SLEB, pages_sym, 0);
+        C.sleb5(0);
+    }
+}
+
+// memory.size
+fn mem_size() void {
+    op(0x3f);
+    op(0);
+}
+
+// The unsigned > and != of the memory's address width.
+fn ptr_gt_u() void {
+    op(u.pick(W64, "\x56", "\x4b")[0]);
+}
+
+fn ptr_ne() void {
+    op(u.pick(W64, "\x52", "\x47")[0]);
+}
+
+// memory.grow 0 (its result dropped): the thread's view brought up to date.
+fn view_refresh() void {
+    pconst(0);
+    op(0x40);
+    op(0);
+    op(0x1a);
+}
+
+// The pointer-sized atomic load and compare-exchange of __axiom_memory_pages.
+fn pages_atomic(load: bool) void {
+    let mut code: u64 = 0x48;
+    if load {
+        code = 0x10;
+    }
+    if W64 {
+        code += 1;
+        op_fe(code);
+        memarg(8, 8, 0);
+    } else {
+        op_fe(code);
+        memarg(4, 4, 0);
+    }
+}
+
+// After an atomic operation that may observe another thread's writes: the
+// view refreshed if another thread has grown the memory beyond it.
+fn view_after_acquire() void {
+    if not view_sync {
+        return;
+    }
+    pages_word();
+    if W64 {
+        op(0x29);
+        memarg(8, 8, 0);
+    } else {
+        op(0x28);
+        memarg(4, 4, 0);
+    }
+    mem_size();
+    ptr_gt_u();
+    op(0x04);
+    op(0x40);
+    view_refresh();
+    op(0x0b);
+}
+
+// Before an atomic or bulk access of [a, a + n + len) (a in local la, n
+// constant, len in local nl if has_nl): the view refreshed if the access
+// reaches beyond it. Computed in 64 bits, so that the end of a 4 GiB wasm32
+// memory does not wrap.
+fn view_before(la: u32, n: u64, nl: u32, has_nl: bool) void {
+    if not view_sync {
+        return;
+    }
+    local_get(la);
+    if not W64 {
+        op(0xad);  // i64.extend_i32_u
+    }
+    if has_nl {
+        local_get(nl);
+        if not W64 {
+            op(0xad);
+        }
+        op(0x7c);
+    }
+    if n != 0 {
+        i64c(@bit_cast(i64, n));
+        op(0x7c);
+    }
+    mem_size();
+    if not W64 {
+        op(0xad);
+    }
+    i64c(16);
+    op(0x86);  // i64.shl
+    op(0x56);  // i64.gt_u
+    op(0x04);
+    op(0x40);
+    view_refresh();
+    op(0x0b);
+}
+
+// After memory.grow (its result on the stack, kept): on success, raises
+// __axiom_memory_pages to the memory's size, which this thread's view now
+// has, atomically (another thread may be raising it too).
+fn view_after_grow() void {
+    if not view_sync {
+        return;
+    }
+    let g = new_local(ptr_vt());
+    let old = new_local(ptr_vt());
+    local_set(g);
+    local_get(g);
+    pconst(~@as(u64, 0));
+    ptr_ne();
+    op(0x04);
+    op(0x40);
+    op(0x02);
+    op(0x40);
+    op(0x03);
+    op(0x40);
+    pages_word();
+    pages_atomic(true);
+    local_set(old);
+    mem_size();
+    local_get(old);
+    ptr_gt_u();
+    op(0x45);  // i32.eqz: not higher, done
+    op(0x0d);
+    C.uleb(1);
+    pages_word();
+    local_get(old);
+    mem_size();
+    pages_atomic(false);
+    local_get(old);
+    ptr_ne();  // another thread raised it meanwhile: again
+    op(0x0d);
+    C.uleb(0);
+    op(0x0b);
+    op(0x0b);
+    op(0x0b);
+    local_get(g);
+}
+
+// After push_addr of an atomic access of `size` bytes at offset `off`: the
+// view checked for it (the address kept on the stack).
+fn view_before_addr(off: u64, size: u64) void {
+    if not view_sync {
+        return;
+    }
+    let la = new_local(ptr_vt());
+    local_tee(la);
+    view_before(la, off + size, 0, false);
 }
 
 fn is64(t: *ir.Ty) bool {
@@ -1115,12 +1331,18 @@ fn gen_load(v: *mut ir.Value) void {
     }
     let off = push_addr(v.a);
     let atomic = (v.flags & ir.F_ATOMIC) != 0;
+    if atomic {
+        view_before_addr(off, v.ty.size);
+    }
     load_op(v.ty, atomic and tg.has(tg.W_ATOMICS));
     let mut al = v.align;
     if atomic {
         al = @int_cast(u32, v.ty.size);
     }
     memarg(al, v.ty.size, off);
+    if atomic {
+        view_after_acquire();
+    }
 }
 
 fn gen_store(v: *mut ir.Value) void {
@@ -1132,8 +1354,11 @@ fn gen_store(v: *mut ir.Value) void {
         return;
     }
     let off = push_addr(v.b);
-    push(v.a);
     let atomic = (v.flags & ir.F_ATOMIC) != 0;
+    if atomic {
+        view_before_addr(off, v.a.ty.size);
+    }
+    push(v.a);
     let t = v.a.ty;
     store_op(t, atomic and tg.has(tg.W_ATOMICS));
     let mut al = v.align;
@@ -1166,6 +1391,7 @@ fn gen_rmw(v: *mut ir.Value) void {
         return;
     }
     let off = push_addr(v.a);
+    view_before_addr(off, sz);
     push(v.b);
     let mut base: u64 = 0x1e;
     if o == ir.RMW_SUB {
@@ -1181,6 +1407,7 @@ fn gen_rmw(v: *mut ir.Value) void {
     }
     op_fe(rmw_code(base, t));
     memarg(@int_cast(u32, sz), sz, off);
+    view_after_acquire();
 }
 
 // old = *p; loop { new = op(old, x); cur = cmpxchg(p, old, new); if cur == old break; old = cur }
@@ -1197,6 +1424,9 @@ fn rmw_loop(v: *mut ir.Value, o: i32) void {
     push(v.b);
     local_set(xl);
     let atomics = tg.has(tg.W_ATOMICS);
+    if atomics {
+        view_before(pl, sz, 0, false);
+    }
     local_get(pl);
     load_op(t, atomics);
     memarg(@int_cast(u32, sz), sz, 0);
@@ -1295,6 +1525,9 @@ fn rmw_loop(v: *mut ir.Value, o: i32) void {
     C.uleb(1);
     op(0x0b);
     op(0x0b);
+    if atomics {
+        view_after_acquire();
+    }
     local_get(old);
 }
 
@@ -1339,10 +1572,12 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
         return;
     }
     let off = push_addr(v.a);
+    view_before_addr(off, sz);
     push_ext(v.b, false);
     push(v.c);
     op_fe(rmw_code(0x48, t));
     memarg(@int_cast(u32, sz), sz, off);
+    view_after_acquire();
 }
 
 fn gen_memop(v: *mut ir.Value) void {
@@ -1392,9 +1627,30 @@ fn gen_memop(v: *mut ir.Value) void {
         mem_loop(v);
         return;
     }
-    push(v.a);
-    push(v.b);
-    push(v.c);
+    if view_sync {
+        // (the operands in locals, in order, to check the ranges' ends)
+        let pv = ptr_vt();
+        let d = new_local(pv);
+        let s = new_local(vt(v.b.ty));
+        let n = new_local(pv);
+        push(v.a);
+        local_set(d);
+        push(v.b);
+        local_set(s);
+        push(v.c);
+        local_set(n);
+        view_before(d, 0, n, true);
+        if o != ir.OP_MEMSET {
+            view_before(s, 0, n, true);
+        }
+        local_get(d);
+        local_get(s);
+        local_get(n);
+    } else {
+        push(v.a);
+        push(v.b);
+        push(v.c);
+    }
     if o == ir.OP_MEMSET {
         op_fc(11);
         op(0);
@@ -1572,8 +1828,12 @@ fn gen_call(v: *mut ir.Value) void {
         arg_ext(v.xs.get(i), e);
     }
     let cal = v.a;
+    let tail = tail_call(v);
     if u.notnil(ir.direct_callee(v)) {
-        op(0x10);
+        if tail {
+            epilogue();
+        }
+        op(u.pick(tail, "\x12", "\x10")[0]);  // return_call / call
         reloc(wo.R_FUNCTION_INDEX_LEB, fsyms.get(@int_cast(usize, ir.fnp_of(cal).id)), 0);
         C.uleb5(0);
         return;
@@ -1583,11 +1843,35 @@ fn gen_call(v: *mut ir.Value) void {
         op(0xa7);
     }
     let ti = fn_type(ir.fty_of(v));
-    op(0x11);
+    if tail {
+        epilogue();
+    }
+    op(u.pick(tail, "\x13", "\x11")[0]);  // return_call_indirect / call_indirect
     reloc(wo.R_TYPE_INDEX_LEB, ti, 0);
     C.uleb5(@as(u64, ti));
     C.u8_(0);
     UN.uses_table = true;
+}
+
+// Is call v a sibling call (tailrec.ax, ir.F_TAIL: its block returns its
+// result, or nothing, right after it) to make with the tail-call extension:
+// the frame released (the epilogue) after the arguments are computed, then
+// return_call, which needs the callee's results to be the caller's? The
+// return after it is dead code then.
+fn tail_call(v: *mut ir.Value) bool {
+    if ((v.flags & ir.F_TAIL) == 0) or not tg.has(tg.W_TAIL_CALL) or ir.fty_of(v).vararg or F.returns_twice {
+        return false;
+    }
+    let r = v.next;
+    if u.isnil(r) or (r.op != ir.OP_RET) {
+        return false;
+    }
+    let ct = ir.fty_of(v).ret;
+    let ft = F.ty.ret;
+    if (ct.kind == ir.T_VOID) or (ft.kind == ir.T_VOID) {
+        return (ct.kind == ir.T_VOID) and (ft.kind == ir.T_VOID) and u.isnil(r.a);
+    }
+    return (vt(ct) == vt(ft)) and (@int_from_ptr(r.a) == @int_from_ptr(v));
 }
 
 pub fn fn_type(t: *ir.Ty) u32 {
@@ -1690,18 +1974,22 @@ fn gen_sys_intr(v: *mut ir.Value, id: i32) bool {
         push(v.xs.get(0));
         op(0x40);
         op(0);
+        view_after_grow();
         return true;
     }
     if id == ir.IN_WAIT32 {
         push(v.xs.get(0));
+        view_before_addr(0, 4);
         push(v.xs.get(1));
         push(v.xs.get(2));
         op_fe(1);
         memarg(4, 4, 0);
+        view_after_acquire();
         return true;
     }
     if id == ir.IN_NOTIFY {
         push(v.xs.get(0));
+        view_before_addr(0, 4);
         push(v.xs.get(1));
         op_fe(0);
         memarg(4, 4, 0);
@@ -1709,6 +1997,21 @@ fn gen_sys_intr(v: *mut ir.Value, id: i32) bool {
     }
     if id == ir.IN_GET_SP {
         sp_global(0x23);
+        return true;
+    }
+    if id == ir.IN_SJLJ_TOKEN {
+        local_get(fp_local);
+        return true;
+    }
+    if id == ir.IN_SJLJ_CAUGHT {
+        // (the flag, cleared)
+        local_get(sj_resumed);
+        i32c(0);
+        local_set(sj_resumed);
+        return true;
+    }
+    if id == ir.IN_SJLJ_ENV {
+        local_get(sj_env);
         return true;
     }
     if id == ir.IN_SET_SP {
@@ -2287,6 +2590,7 @@ fn expr(v: *mut ir.Value) void {
         if tg.has(tg.W_ATOMICS) {
             op_fe(3);
             op(0);
+            view_after_acquire();
         }
         return;
     }
@@ -2336,7 +2640,8 @@ fn pure_op(v: *ir.Value) bool {
     if o == ir.OP_INTR {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         return not ((id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_MEMSIZE) or (id == ir.IN_WAIT32) or
-                    (id == ir.IN_NOTIFY) or (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP) or ir.is_dyn_stack(id));
+                    (id == ir.IN_NOTIFY) or (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP) or ir.is_dyn_stack(id) or
+                    (id >= ir.IN_SJLJ_TOKEN));
     }
     return false;
 }
@@ -2997,6 +3302,25 @@ fn line_row(src: u32) void {
     ln_last = src;
 }
 
+// -g (DEBUG_FULL): where the lexical block changes ((code offset << 32) |
+// its scope: ir.Value.scope), as the native code generators record it.
+let mut SC: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut sc_last: u32 = 0;
+
+fn scope_row(scope: u32) void {
+    if (tg.g_debug != tg.DEBUG_FULL) or (scope == sc_last) {
+        return;
+    }
+    SC.push((@as(u64, C.len()) << 32) | @as(u64, scope));
+    sc_last = scope;
+}
+
+// The frame offset of alloca a, from the frame's address (lay_out_frame):
+// its variable's location (dwarf.var_locs).
+fn var_slot_off(a: *ir.Value) i64 {
+    return a.aux;
+}
+
 fn emit_block(x: *mut ir.Block) *mut ir.Block {
     let mut i = x.first;
     while u.notnil(i) {
@@ -3006,6 +3330,7 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
             continue;
         }
         line_row(i.src);
+        scope_row(i.scope);
         expr(i);
         if i.ty.kind != ir.T_VOID {
             if i.uses > 0 {
@@ -3018,6 +3343,7 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
     }
     let t = ir.terminator(x);
     line_row(t.src);
+    scope_row(t.scope);
     let o = t.op;
     if o == ir.OP_BR {
         return branch_next(x, t.t1);
@@ -3331,6 +3657,59 @@ fn put_locals(body: *mut bn.Bytes) void {
     }
 }
 
+// The start and the end of the body of a function that calls setjmp (see
+// "setjmp and longjmp", above).
+fn sjlj_begin() void {
+    sj_resumed = new_local(wo.I32);
+    sj_env = new_local(ptr_vt());
+    op(0x03);
+    op(0x40);
+    op(0x02);
+    op(ptr_vt());
+    op(0x1f);
+    op(0x40);
+    C.uleb(1);
+    op(0x00);  // catch $tag $caught (label 0: the block)
+    reloc(wo.R_TAG_INDEX_LEB, tag_sym, 0);
+    C.uleb5(0);
+    C.uleb(0);
+    for _k in @as(usize, 0)..3 {
+        ctx.push(Ctx.{ kind: CTX_OTHER, target: u.nil.[ir.Block]() });
+    }
+}
+
+fn sjlj_end() void {
+    for _k in @as(usize, 0)..3 {
+        _ = ctx.pop();
+    }
+    op(0x0b);  // try_table
+    op(0x00);
+    op(0x0b);  // block: the jmp_buf on the stack
+    local_tee(sj_env);
+    if W64 {
+        op(0x29);
+        memarg(8, 8, 0);
+    } else {
+        op(0x28);
+        memarg(4, 4, 0);
+    }
+    local_get(fp_local);
+    ptr_ne();
+    op(0x04);
+    op(0x40);
+    local_get(sj_env);
+    op(0x08);
+    reloc(wo.R_TAG_INDEX_LEB, tag_sym, 0);
+    C.uleb5(0);
+    op(0x0b);
+    i32c(1);
+    local_set(sj_resumed);
+    op(0x0c);
+    C.uleb(0);
+    op(0x0b);  // loop
+    op(0x00);
+}
+
 fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     F = f;
     C = bn.new_bytes();
@@ -3338,6 +3717,8 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     RL = u.List.[wo.Reloc].empty();
     LN = u.List.[u64].empty();
     ln_last = 0;
+    SC = u.List.[u64].empty();
+    sc_last = 0;
     line_row(f.src);
     LT = u.List.[u8].empty();
     ctx.clear();
@@ -3382,8 +3763,14 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
         local_tee(fp_local);
         sp_global(0x24);
     }
+    let sjlj = f.returns_twice and tg.has(tg.W_EXCEPTION_HANDLING) and (frame_size > 0);
+    if sjlj {
+        sjlj_begin();
+    }
     do_tree(order.get(0));
-    if f.ty.ret.kind != ir.T_VOID {
+    if sjlj {
+        sjlj_end();
+    } else if f.ty.ret.kind != ir.T_VOID {
         op(0x00);
     }
     op(0x0b);
@@ -3398,6 +3785,24 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
         wf.lines.push(r + (@as(u64, base) << 32));
     }
     LN.deinit();
+    if tg.g_debug == tg.DEBUG_FULL {
+        // (the types and variables: wlink.ax, from dbginfo.ax's records; the
+        // lists on the heap, which outlives this function's scratch scope)
+        wf.irf = @ptr_cast(*mut void, f);
+        for r in SC.items() {
+            wf.scopes.push(r + (@as(u64, base) << 32));
+        }
+        let mut vs = u.List.[i64].empty();
+        for x in dw.var_locs(f, var_slot_off, 0) {
+            vs.push(x);
+        }
+        wf.vars = vs.items();
+        wf.frame_local = -1;
+        if frame_size > 0 {
+            wf.frame_local = @as(i64, fp_local);
+        }
+    }
+    SC.deinit();
     for i in 0..RL.len {
         let mut r = RL.get(i);
         r.off += base;
@@ -3474,6 +3879,24 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
     UN.gimports.push(wo.Import.{ module: "env", name: "__stack_pointer", ty: @as(u32, ptr_vt()), mutable: true });
     sp_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: wo.F_UNDEFINED, name: "__stack_pointer", index: 0,
                                      seg: 0, off: 0, size: 0 });
+    // (longjmp's tag, for functions that call setjmp: above)
+    let mut sjlj = false;
+    for i in 0..m.funcs.len {
+        sjlj = sjlj or m.funcs.get(i).returns_twice;
+    }
+    if sjlj and tg.has(tg.W_EXCEPTION_HANDLING) {
+        let pt: [1]u8 = [ptr_vt()];
+        UN.timports.push(wo.Import.{ module: "env", name: "__axc_longjmp_tag", ty: wo.type_index(UN, pt[..], ""),
+                                     mutable: false });
+        tag_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_TAG, flags: wo.F_UNDEFINED, name: "__axc_longjmp_tag", index: 0,
+                                          seg: 0, off: 0, size: 0 });
+    }
+    // (the size word of a thread's view of the memory, above)
+    view_sync = tg.has(tg.W_ATOMICS);
+    if view_sync {
+        pages_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: wo.F_UNDEFINED, name: "__axiom_memory_pages",
+                                            index: 0, seg: 0, off: 0, size: 0 });
+    }
     // globals: wasm globals (imports first), then data
     for i in 0..m.globals.len {
         gsyms.push(0);
@@ -3587,5 +4010,50 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
     if errors {
         return u.nil.[wo.Unit]();
     }
+    if tg.g_debug == tg.DEBUG_FULL {
+        unit_dwarf();
+    }
     return UN;
+}
+
+// -g (DEBUG_FULL): the unit's DWARF, with the types and variables
+// (dbginfo.ax), its fixups for wlink.ax to resolve (wobj.ax: Unit.dbg): the
+// functions at their symbols, code offsets from their bodies (the locals'
+// declarations included, as WebAssembly's DWARF counts them), variables at
+// offsets from the frame's address in its local (the frame base), the data
+// at its symbols.
+fn unit_dwarf() void {
+    let mut asz: u64 = 4;
+    if W64 {
+        asz = 8;
+    }
+    let mut d = dw.begin(dw.ARCH_WASM, asz, 2);
+    d.lang = dw.lang();
+    for si in 0..UN.syms.len {
+        let s = UN.syms.at(si);
+        if (s.kind == wo.SYM_DATA) and ((s.flags & wo.F_UNDEFINED) == 0) {
+            dw.add_data_sym(&mut d, s.name, @int_cast(u32, si));
+        }
+    }
+    for wf in UN.funcs.items() {
+        let s = UN.syms.at(@as(usize, wf.sym));
+        let mut name = dw.name_of(wf.name);
+        if @int_from_ptr(wf.irf) != 0 {
+            name = dw.func_name_of(@ptr_cast(*ir.Func, wf.irf));
+        }
+        let df = dw.Func.{ sym: wf.sym, name: name, external: (s.flags & wo.F_LOCAL) == 0,
+                           size: @as(u64, wf.body.len()), src: wf.src, rows: wf.lines.items(),
+                           scopes: wf.scopes.items(), cfi: u.nil_slice.[u64](), regs: u.nil_slice.[u64](),
+                           irf: @ptr_cast(*mut ir.Func, wf.irf), vars: wf.vars, vlocs: u.nil_slice.[dloc.VLoc](),
+                           frame_local: wf.frame_local };
+        dw.add_func(&mut d, &df);
+    }
+    let parts = dw.finish_parts(&mut d);
+    for k in 0..dw.NSEC {
+        UN.dbg.push(wo.DbgSec.{ name: dw.SEC_NAMES[k], data: parts[k].b });
+        for x in parts[k].fx.items() {
+            UN.dbg_fx.push(wo.DbgFix.{ sec: @int_cast(u32, k), off: x.off, kind: x.kind, sym: x.sym,
+                                       addend: x.addend });
+        }
+    }
 }

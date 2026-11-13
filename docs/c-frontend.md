@@ -318,6 +318,7 @@ comments, so that they are valid in every standard:
 /* check-only */            only checked (axiom check, with the flags' --target)
 /* units: abi/x.c */        more translation units, relative to the test
 /* linux-only */            natively, only where host_native.c is linked
+/* wasm-flags: --features=+tail-call */  more flags for a WebAssembly build
 ```
 
 Programs print through functions the test host provides (`print_i64`, `print_u64`,
@@ -340,7 +341,8 @@ writes `c/run/wint_gen_*.c`: every operation on those integers at run time and f
 against Python's values.
 The hosted C library's tests are `c/lib/<part>/*.c` (`[c-lib]`: programs built with
 the library, which print through it, with directives for standard input, standard
-error and their order), and `c/mix/stdio_threads/` (streams written by several
+error and their order, `wasm-flags:` for a WebAssembly build's extensions and
+`host-flags:` for the node host's files, `--files=memory` or `--root=dir`), and `c/mix/stdio_threads/` (streams written by several
 threads).
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
