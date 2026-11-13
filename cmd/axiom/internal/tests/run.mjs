@@ -1243,7 +1243,8 @@ function cDriverCases() {
     // into them (their call-site records carry the inlining, and say which
     // function each was inlined into): here deep, tailer and early are
     // inlined into main, and the crash is in a function reached by an
-    // indirect call, which names it only so.
+    // indirect call, which names it only so. (The C main may itself be
+    // inlined into the runtime's.)
     'C: native stack traces through C functions at -O2': async () => {
       if (skip()) return skip();
       if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
@@ -1256,7 +1257,7 @@ function cDriverCases() {
       const c = await ax(['build', 'crash2.c', '-O2', nativeTarget, '-o', out]);
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
-      return /at <indirect call>\n\s+at early \(crash2\.c:9:16\) \(inlined into tailer\)\n\s+at tailer \(crash2\.c:15:12\) \(inlined into deep\)\n\s+at deep \(crash2\.c:18:16\) \(inlined into main\)\n\s+at main \(crash2\.c:22:12\)\n/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+      return /at <indirect call>\n\s+at early \(crash2\.c:9:16\) \(inlined into tailer\)\n\s+at tailer \(crash2\.c:15:12\) \(inlined into deep\)\n\s+at deep \(crash2\.c:18:16\) \(inlined into main\)\n\s+at main \(crash2\.c:22:12\)(?: \(inlined into main\))?\n/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
     },
     // With line tables (-g, --debug-info=lines) the innermost frame shows
     // the faulting instruction's line too (the frame table's line rows:
