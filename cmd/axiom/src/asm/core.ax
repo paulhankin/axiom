@@ -143,8 +143,19 @@ pub struct Asm {
     files: u.List.[[]u8],
     loc_file: []u8,
     loc_line: i32,
-    uses_sp: bool,  // an instruction names the stack pointer, or pushes, pops or calls (stack_use)
-    calls: bool,    // an instruction calls (x86-64 call, AArch64 bl, blr ...)
+    uses_sp: bool,       // an instruction names the stack pointer, or pushes, pops or calls (stack_use)
+    calls: bool,         // an instruction calls (x86-64 call, AArch64 bl, blr ...)
+    lits: u.List.[Lit],  // AArch64: the literal pool's entries of this pass (`ldr x0, =value`)
+}
+
+/// An entry of a literal pool: the value's text, its size, its section and
+/// label (a Def), and whether it has been placed (.ltorg, or the pass's end).
+pub struct Lit {
+    expr: []u8,
+    size: u32,
+    sec: i32,
+    def: i32,
+    placed: bool,
 }
 
 /// A new assembly of `text` for arch (inline_: an asm statement's template).
@@ -1127,6 +1138,13 @@ pub const RM_LO12: u8 = 3;      // :lo12:
 pub const RM_GOT: u8 = 4;       // :got:
 pub const RM_GOT_LO12: u8 = 5;  // :got_lo12:
 pub const RM_PG_HI21: u8 = 6;   // (adrp's page: no modifier written)
+// the Mach-O spellings of AArch64's: sym@PAGE, @PAGEOFF, @GOTPAGE, @GOTPAGEOFF, @TLVPPAGE, @TLVPPAGEOFF
+pub const RM_PAGE: u8 = 7;
+pub const RM_PAGEOFF: u8 = 8;
+pub const RM_GOTPAGE: u8 = 9;
+pub const RM_GOTPAGEOFF: u8 = 10;
+pub const RM_TLVPPAGE: u8 = 11;
+pub const RM_TLVPPAGEOFF: u8 = 12;
 
 /// An expression's value: k, plus a symbol's address (sym: a Def index, or
 /// -1), minus another's (neg, same section: then a constant once both are
@@ -1657,6 +1675,15 @@ fn ex_primary(E: *mut Ex) Val {
                 rm = RM_PLT;
             } else if u.str_eq(m, "gotpcrel") {
                 rm = RM_GOTPCREL;
+            } else if (E.A.arch == tg.ARCH_A64) and
+                      (u.str_eq(m, "page") or u.str_eq(m, "pageoff") or u.str_eq(m, "gotpage") or
+                       u.str_eq(m, "gotpageoff") or u.str_eq(m, "tlvppage") or u.str_eq(m, "tlvppageoff")) {
+                let ms2 = ["page", "pageoff", "gotpage", "gotpageoff", "tlvppage", "tlvppageoff"];
+                for j in 0..ms2.len {
+                    if u.str_eq(m, ms2[j]) {
+                        rm = RM_PAGE + @truncate(u8, j);
+                    }
+                }
             } else {
                 fail(E.A, u.f1("the relocation '@%s' is not supported", s[ms..E.i]));
                 return bad_val();
@@ -1906,9 +1933,10 @@ pub fn local_target(A: *Asm, v: Val, off: *mut u64) bool {
 pub struct Arch {
     insn: fn(*mut Asm, *mut Stmt) void,
     directive: fn(*mut Asm, *mut Stmt) bool,
-    nop: u8,           // the byte that pads code (x86-64 0x90), or 0: words (AArch64's nop)
-    align_pow2: bool,  // .align n is 2^n (AArch64), else n bytes (x86-64)
-    word: u32,         // .word's size: 2 (x86-64) or 4 (AArch64)
+    nop: u8,                    // the byte that pads code (x86-64 0x90), or 0: words (AArch64's nop)
+    align_pow2: bool,           // .align n is 2^n (AArch64), else n bytes (x86-64)
+    word: u32,                  // .word's size: 2 (x86-64) or 4 (AArch64)
+    finish: fn(*mut Asm) void,  // after each pass's statements (AArch64: the literal pools)
 }
 
 /// Assembles A's text: passes until no label moves (at most 12).
@@ -1966,6 +1994,7 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
     A.prev = A.cur;
     A.intel = A.intel0;
     A.procs.clear();
+    A.lits.clear();
     A.icfi.clear();
     A.sehs.clear();
     A.in_seh = false;
@@ -2012,6 +2041,22 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
             return;
         }
     }
+    arch.finish(A);
+}
+
+/// Emits data of n bytes (1, 2, 4, 8) for each comma-separated value of args, as
+/// `.byte` ... `.quad` do (an address is a relocation).
+pub fn data_values(A: *mut Asm, args: []u8, n: u32) void {
+    data(A, args, n);
+}
+
+/// Makes the Def d a label here (a label the arch places itself).
+pub fn place_label(A: *mut Asm, d: i32) void {
+    let p = A.defs.at(@int_cast(usize, d));
+    p.sec = A.cur;
+    p.off = here(A);
+    p.defined = true;
+    p.intext = true;
 }
 
 // What the text's instructions do with the stack (A.uses_sp, A.calls):

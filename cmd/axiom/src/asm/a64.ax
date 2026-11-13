@@ -3,8 +3,8 @@
 // (`op dst, src...`, registers x0-x30, w0-w30, sp, xzr; v0-v31 as b, h, s,
 // d, q or with an arrangement; immediates with or without '#'; addressing
 // [xn], [xn, #imm], [xn, #imm]!, [xn], #imm, [xn, xm, lsl #s], [xn, wm,
-// sxtw]; shifted and extended register operands; conditions; :lo12: and
-// :got: relocation operators), into instruction words, for inline assembly
+// sxtw]; shifted and extended register operands; conditions; relocation
+// operators), into instruction words, for inline assembly
 // and file-scope asm (asm/core.ax reads the text and does the passes).
 //
 // What it encodes (the Arm Architecture Reference Manual's A64 encodings,
@@ -13,20 +13,24 @@
 // conditional selects and compares, bit operations, CRC32), branches,
 // loads and stores of every addressing form (pairs, exclusives,
 // acquire/release, LSE atomics), system instructions (svc, brk, hints,
-// barriers, mrs, msr of named registers), scalar floating point (moves,
-// arithmetic, compares, conversions, rounding), the vector moves, and
-// Advanced SIMD's groups from the table (asm/a64tab.ax, "The instruction
-// table" below). Others are an error naming them.
+// barriers, mrs, msr of named registers, the SYS aliases by operation name
+// from asm/a64sysop.ax), pointer authentication, memory tagging, the RCpc,
+// 128-bit and read-check-write atomics, the memory-copy instructions, scalar
+// floating point (moves, arithmetic, compares, conversions, rounding), the
+// vector moves, and Advanced SIMD's groups from the table (asm/a64tab.ax,
+// "The instruction table" below). Others are an error naming them.
 //
-// Relocations: b and bl to other symbols (R_AARCH64_JUMP26, _CALL26),
-// adrp (_ADR_PREL_PG_HI21; :got: _ADR_GOT_PAGE), :lo12: in add and in
-// loads and stores (_ADD_ABS_LO12_NC, _LDSTn_ABS_LO12_NC; :got_lo12:
-// _LD64_GOT_LO12_NC), .quad and .word of addresses.
+// Relocations: the ELF for the Arm 64-bit Architecture ABI's operators
+// (`:lo12:`, `:got:`, the move-wide groups, the thread-local ones; "Relocation
+// operators" below) and the Mach-O spellings (`sym@PAGE` ...), branches,
+// adr, adrp and literal loads to symbols of other sections and units, .quad
+// and .word of addresses.
 // =============================================================================
 import "../a64enc.ax" as ae;
 import "../elf.ax" as elf;
 import "../target.ax" as tg;
 import "../util.ax" as u;
+import "a64sysop.ax" as so;
 import "a64sysreg.ax" as sr;
 import "a64tab.ax" as atab;
 import "core.ax" as cr;
@@ -71,12 +75,13 @@ struct AOp {
     pre: bool,   // AK_MEM: [xn, #i]!
     name: []u8,  // AK_EXPR: the text (a condition, option or register name)
     nregs: u32,  // AK_LIST
+    text: []u8,  // the operand as written (a label may have a register's name)
 }
 
 fn none_op() AOp {
     return AOp.{ kind: AK_NONE, reg: -1, x: false, sp: false, view: 0, esize: 0, lanes: 0, index: -1, v: cr.konst(0),
                  fp: false, f: 0.0, base: -1, off: false, rm: -1, rmx: false, sh: 0, amt: -1, pre: false, name: "",
-                 nregs: 0 };
+                 nregs: 0, text: "" };
 }
 
 fn zr(x: bool) AOp {
@@ -268,16 +273,12 @@ fn imm_op(A: *mut cr.Asm, s0: []u8) AOp {
             return op;
         }
         let name = cr.lower(s[1..@int_cast(usize, e) + 1]);
-        if u.str_eq(name, "lo12") {
-            rm = cr.RM_LO12;
-        } else if u.str_eq(name, "got") {
-            rm = cr.RM_GOT;
-        } else if u.str_eq(name, "got_lo12") {
-            rm = cr.RM_GOT_LO12;
-        } else {
+        let k = ro_index(name);
+        if k < 0 {
             cr.fail(A, u.f1("the relocation operator ':%s:' is not supported", name));
             return op;
         }
+        rm = RO_BASE + @truncate(u8, @bit_cast(u64, k));
         s = cr.trim(s[@int_cast(usize, e) + 2..]);
     }
     // a floating constant
@@ -325,7 +326,161 @@ fn is_float_text(s: []u8) bool {
     return digits and dot;
 }
 
+// -----------------------------------------------------------------------------
+// Relocation operators: `:lo12:sym` and the rest of the ELF for the Arm 64-bit
+// Architecture ABI's (Val.rm RO_BASE + their index in ROPS), and the Mach-O
+// spellings `sym@PAGE` ... (core's RM_PAGE ...; the same relocations as
+// :pg_hi21:, :lo12:, :got: and :got_lo12:). Which relocation an operator
+// makes depends on the instruction (rel_for).
+// -----------------------------------------------------------------------------
+const RO_BASE: u8 = 32;
+let ROPS: [50][]u8 = ["lo12", "got", "got_lo12", "pg_hi21", "pg_hi21_nc", "abs_g0", "abs_g0_nc", "abs_g1", "abs_g1_nc",
+                      "abs_g2", "abs_g2_nc", "abs_g3", "abs_g0_s", "abs_g1_s", "abs_g2_s", "prel_g0", "prel_g0_nc",
+                      "prel_g1", "prel_g1_nc", "prel_g2", "prel_g2_nc", "prel_g3", "gottprel", "gottprel_lo12",
+                      "gottprel_g1", "gottprel_g0_nc", "tprel_hi12", "tprel_lo12", "tprel_lo12_nc", "tprel_g2",
+                      "tprel_g1", "tprel_g1_nc", "tprel_g0", "tprel_g0_nc", "dtprel_hi12", "dtprel_lo12",
+                      "dtprel_lo12_nc", "dtprel_g2", "dtprel_g1", "dtprel_g1_nc", "dtprel_g0", "dtprel_g0_nc",
+                      "tlsdesc", "tlsdesc_lo12", "tlsdesc_off_g1", "tlsdesc_off_g0_nc", "secrel_lo12", "secrel_hi12",
+                      "tlsgd", "tlsgd_lo12"];
+
+fn ro_index(n: []u8) i64 {
+    for k in 0..ROPS.len {
+        if u.str_eq(n, ROPS[k]) {
+            return @int_cast(i64, k);
+        }
+    }
+    return -1;
+}
+
+// The operator's name ("" for none; the Mach-O spellings as the ELF ones).
+fn ro_name(rm: u8) []u8 {
+    if rm >= RO_BASE {
+        return ROPS[@as(usize, rm - RO_BASE)];
+    }
+    if rm == cr.RM_PAGE {
+        return "pg_hi21";
+    }
+    if rm == cr.RM_PAGEOFF {
+        return "lo12";
+    }
+    if rm == cr.RM_GOTPAGE {
+        return "got";
+    }
+    if rm == cr.RM_GOTPAGEOFF {
+        return "got_lo12";
+    }
+    if rm == cr.RM_TLVPPAGE {
+        return "@tlvppage";
+    }
+    if rm == cr.RM_TLVPPAGEOFF {
+        return "@tlvppageoff";
+    }
+    if rm != cr.RM_NONE {
+        return "@";
+    }
+    return "";
+}
+
+const CL_ADRP: u32 = 0;
+const CL_ADR: u32 = 1;
+const CL_ADD: u32 = 2;
+const CL_LDST: u32 = 3;  // with the access's size (log2 bytes)
+const CL_MOVW: u32 = 4;
+const CL_LIT: u32 = 5;  // ldr (literal), ldrsw, prfm
+
+// The relocation that operator rm makes in an instruction of class cl (and
+// access size sz, log2 bytes), or 0 (an error) if it makes none there.
+fn rel_for(A: *mut cr.Asm, rm: u8, cl: u32, sz: i64, m: []u8) u32 {
+    let n = ro_name(rm);
+    let mut t: u32 = 0;
+    if cl == CL_ADRP {
+        let names = ["", "pg_hi21", "pg_hi21_nc", "got", "gottprel", "tlsdesc", "tlsgd"];
+        let ty: [7]u32 = [275, 275, 276, 311, 541, 562, 513];
+        for k in 0..names.len {
+            if u.str_eq(n, names[k]) {
+                t = ty[k];
+            }
+        }
+    } else if cl == CL_ADR {
+        if n.len == 0 {
+            t = elf.R_AARCH64_ADR_PREL_LO21;
+        } else if u.str_eq(n, "tlsdesc") {
+            t = elf.R_AARCH64_TLSDESC_ADR_PREL21;
+        }
+    } else if cl == CL_ADD {
+        let names = ["lo12", "tprel_hi12", "tprel_lo12", "tprel_lo12_nc", "dtprel_hi12", "dtprel_lo12",
+                     "dtprel_lo12_nc", "tlsdesc_lo12", "secrel_lo12", "secrel_hi12", "tlsgd_lo12"];
+        let ty: [11]u32 = [277, 549, 550, 551, 528, 529, 530, 564, 551, 549, 514];
+        for k in 0..names.len {
+            if u.str_eq(n, names[k]) {
+                t = ty[k];
+            }
+        }
+    } else if cl == CL_LDST {
+        let s = @bit_cast(u32, @truncate(i32, sz));
+        if u.str_eq(n, "lo12") {
+            t = LO12_TYPES[@int_cast(usize, sz)];
+        } else if (u.str_eq(n, "got_lo12") or u.str_eq(n, "gottprel_lo12") or u.str_eq(n, "tlsdesc_lo12")) and
+                  (sz == 3) {
+            t = u32_pick(n[0] == 'g', u32_pick(n.len == 8, 312, 542), 563);
+        } else if u.str_eq(n, "tprel_lo12") or u.str_eq(n, "tprel_lo12_nc") or u.str_eq(n, "secrel_lo12") {
+            let nc = u32_pick(n.len != 10, 1, 0);
+            t = u32_pick(sz == 4, 570, 552 + (2 * s)) + nc;
+        } else if u.str_eq(n, "dtprel_lo12") or u.str_eq(n, "dtprel_lo12_nc") {
+            let nc = u32_pick(n.len != 11, 1, 0);
+            t = u32_pick(sz == 4, 572, 531 + (2 * s)) + nc;
+        }
+    } else if cl == CL_MOVW {
+        let names = ["abs_g0", "abs_g0_nc", "abs_g1", "abs_g1_nc", "abs_g2", "abs_g2_nc", "abs_g3", "abs_g0_s",
+                     "abs_g1_s", "abs_g2_s", "prel_g0", "prel_g0_nc", "prel_g1", "prel_g1_nc", "prel_g2", "prel_g2_nc",
+                     "prel_g3", "tprel_g2", "tprel_g1", "tprel_g1_nc", "tprel_g0", "tprel_g0_nc", "dtprel_g2",
+                     "dtprel_g1", "dtprel_g1_nc", "dtprel_g0", "dtprel_g0_nc", "gottprel_g1", "gottprel_g0_nc",
+                     "tlsdesc_off_g1", "tlsdesc_off_g0_nc"];
+        let ty: [31]u32 = [263, 264, 265, 266, 267, 268, 269, 270, 271, 272, 287, 288, 289, 290, 291, 292, 293, 544,
+                           545, 546, 547, 548, 523, 524, 525, 526, 527, 539, 540, 565, 566];
+        for k in 0..names.len {
+            if u.str_eq(n, names[k]) {
+                t = ty[k];
+            }
+        }
+    } else if cl == CL_LIT {
+        let names = ["", "got", "gottprel", "tlsdesc"];
+        let ty: [4]u32 = [273, 309, 543, 560];
+        for k in 0..names.len {
+            if u.str_eq(n, names[k]) {
+                t = ty[k];
+            }
+        }
+    }
+    if (t == 0) and not cr.failed(A) {
+        if n.len == 0 {
+            cr.fail(A, u.f1("'%s' needs a relocation operator here", m));
+        } else if n[0] == '@' {
+            cr.fail(A, u.f1("this relocation modifier is not one of '%s'", m));
+        } else {
+            cr.fail(A, u.f2("the relocation operator ':%s:' is not one of '%s'", n, m));
+        }
+    }
+    return t;
+}
+
+// The 16-bit group a move-wide operator names (g0 0 ... g3 3), or -1.
+fn ro_group(rm: u8) i64 {
+    let n = ro_name(rm);
+    let g = u.rfind(n, 'g');
+    if (g < 0) or ((@int_cast(usize, g) + 1) >= n.len) or not u.is_digit(n[@int_cast(usize, g) + 1]) {
+        return -1;
+    }
+    return @as(i64, n[@int_cast(usize, g) + 1] - '0');
+}
+
 fn parse_op(A: *mut cr.Asm, s0: []u8) AOp {
+    let mut op = parse_op1(A, s0);
+    op.text = cr.trim(s0);
+    return op;
+}
+
+fn parse_op1(A: *mut cr.Asm, s0: []u8) AOp {
     let s = cr.trim(s0);
     let mut op = none_op();
     if s.len == 0 {
@@ -343,6 +498,11 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) AOp {
     }
     let low = cr.lower(s);
     if gpr_name(low, &mut op) or vreg_name(low, &mut op) {
+        return op;
+    }
+    // a register with writeback (the memory-copy instructions' `xn!`)
+    if (low.len > 1) and (low[low.len - 1] == '!') and gpr_name(cr.trim(low[0..low.len - 1]), &mut op) {
+        op.pre = true;
         return op;
     }
     // lsl #3, uxtw, sxtw #2
@@ -372,6 +532,9 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) AOp {
         return op;
     }
     op.v = cr.eval(A, s);
+    if op.v.rm != cr.RM_NONE {
+        op.kind = AK_IMM;  // (sym@PAGEOFF and the like: an immediate, as :lo12:sym is)
+    }
     return op;
 }
 
@@ -611,13 +774,46 @@ fn cond_op(A: *mut cr.Asm, o: *AOp) u64 {
 
 // A branch target: the label's offset from here in units of `scale` (bits
 // wide), else a relocation of type ty (0: none allowed) at the word.
+// Whether o can be a label: an expression, or a name that reads as a
+// register, a condition or a shift where an operand must be an address (the
+// conventional assembler takes `b x1` or `ldr x0, s1` as symbols of those names).
+fn labelish(o: *AOp) bool {
+    if (o.kind == AK_EXPR) or (o.kind == AK_IMM) {
+        return true;
+    }
+    if ((o.kind != AK_REG) and (o.kind != AK_VREG) and (o.kind != AK_SHIFT)) or (o.text.len == 0) or o.pre {
+        return false;
+    }
+    if u.is_digit(o.text[0]) {
+        return false;
+    }
+    for c in o.text {
+        if not cr.is_sym_char(c) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The value of a label operand (labelish).
+fn label_val(A: *mut cr.Asm, o: *AOp) cr.Val {
+    if (o.kind == AK_IMM) or ((o.kind == AK_EXPR) and (cond_of(o.name) < 0)) {
+        return o.v;
+    }
+    return cr.eval(A, o.text);
+}
+
 fn target(A: *mut cr.Asm, o: *AOp, ty: u32, bits: u32, scale: i64, what: []u8) i64 {
-    if (o.kind != AK_EXPR) and (o.kind != AK_IMM) {
+    if not labelish(o) {
         cr.fail(A, u.f1("%s needs a label", what));
         return 0;
     }
-    let v = cr.settle(A, o.v);
+    let v = cr.settle(A, label_val(A, o));
     if not v.ok {
+        return 0;
+    }
+    if v.rm != cr.RM_NONE {
+        cr.fail(A, u.f1("%s does not take a relocation operator", what));
         return 0;
     }
     let here = cr.here(A);
@@ -734,10 +930,131 @@ fn mov_imm(A: *mut cr.Asm, d: AOp, x0: i64) void {
 // -----------------------------------------------------------------------------
 /// The arch description core.run takes.
 pub fn arch() cr.Arch {
-    return cr.Arch.{ insn: insn, directive: directive, nop: 0, align_pow2: true, word: 4 };
+    return cr.Arch.{ insn: insn, directive: directive, nop: 0, align_pow2: true, word: 4, finish: finish };
+}
+
+// -----------------------------------------------------------------------------
+// The literal pool: `ldr Rt, =value` loads a literal that the pool of its
+// section holds (one entry per value and size until the pool is placed), at
+// .ltorg or .pool, or at the end of the section (each entry aligned to its
+// size). In inline assembly the pool follows the template with a branch
+// around it.
+// -----------------------------------------------------------------------------
+fn literal(A: *mut cr.Asm, m: []u8, t: AOp, e: []u8) void {
+    let mut size: u32 = 0;
+    let sw = u.str_eq(m, "ldrsw");
+    if sw {
+        if is_x(&t) {
+            size = 4;
+        }
+    } else if is_x(&t) or is_w(&t) {
+        size = u32_pick(t.x, 8, 4);
+    } else if t.kind == AK_VREG {
+        let k = u.find("sdq", t.view);
+        if k >= 0 {
+            size = @as(u32, 4) << @truncate(u32, @bit_cast(u64, k));
+        }
+    }
+    if size == 0 {
+        bad(A, m);
+        return;
+    }
+    let mut d: i32 = -1;
+    for l in A.lits.items() {
+        if not l.placed and (l.sec == A.cur) and (l.size == size) and u.str_eq(l.expr, e) {
+            d = l.def;
+        }
+    }
+    let name = u.f1(".L__axiom_lit_%s", u.zdec(A.lits.len));
+    if d < 0 {
+        d = cr.sym(A, name);
+        A.defs.at(@int_cast(usize, d)).intext = true;
+        A.lits.push(cr.Lit.{ expr: e, size: size, sec: A.cur, def: d, placed: false });
+    }
+    let mut o = none_op();
+    o.kind = AK_EXPR;
+    o.name = cr.def_of(A, d).name;
+    o.v = cr.eval(A, o.name);
+    let ops = u.newn.[AOp](2);
+    ops[0] = t;
+    ops[1] = o;
+    single(A, m, pick_us(sw, 8, 0), ops[0..2]);
+}
+
+// Places the current section's pending literals here (by size: the 4-byte
+// ones, then the 8- and 16-byte ones, as the conventional assembler does).
+fn place_pool(A: *mut cr.Asm) void {
+    for sz in @as(u32, 2)..5 {
+        place_pool_of(A, @as(u32, 1) << sz);
+    }
+}
+
+fn place_pool_of(A: *mut cr.Asm, size: u32) void {
+    for k in 0..A.lits.len {
+        let l = A.lits.at(k);
+        if l.placed or (l.sec != A.cur) or (l.size != size) {
+            continue;
+        }
+        l.placed = true;
+        while ((cr.here(A) + A.origin) % @as(u64, l.size)) != 0 {
+            cr.emit8(A, 0);
+        }
+        cr.place_label(A, l.def);
+        if l.size == 16 {
+            let v = cr.settle(A, cr.eval(A, l.expr));
+            if not cr.is_const(v) {
+                cr.fail(A, "a 16-byte literal of an address");
+                return;
+            }
+            cr.emit64(A, @bit_cast(u64, v.k));
+            cr.emit64(A, u64_pick(v.k < 0, ~@as(u64, 0), 0));
+        } else {
+            cr.data_values(A, l.expr, l.size);
+        }
+    }
+}
+
+// The pass's end: the pools not yet placed, at the end of their sections.
+fn finish(A: *mut cr.Asm) void {
+    let cur = A.cur;
+    for k in 0..A.lits.len {
+        let l = A.lits.at(k);
+        if l.placed or cr.failed(A) {
+            continue;
+        }
+        A.cur = l.sec;
+        if A.inline_ {
+            // a branch over the pool
+            let at = cr.here(A);
+            w32(A, 0x14000000);
+            place_pool(A);
+            let s = A.secs.at(@int_cast(usize, A.cur));
+            let w = 0x14000000 | ((cr.here(A) - at) / 4);
+            for j in @as(u64, 0)..4 {
+                s.data.set(@int_cast(usize, at + j), @truncate(u8, w >> (j * 8)));
+            }
+        } else {
+            place_pool(A);
+        }
+    }
+    A.cur = cur;
 }
 
 fn directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
+    if u.str_eq(st.op, ".tlsdesccall") {
+        // R_AARCH64_TLSDESC_CALL at the next instruction (the descriptor's blr)
+        let v = cr.settle(A, cr.eval(A, st.args));
+        if v.ok and ((v.sym < 0) or (v.neg >= 0)) {
+            cr.fail(A, ".tlsdesccall needs a symbol");
+        } else if v.ok {
+            cr.reloc(A, cr.here(A), elf.R_AARCH64_TLSDESC_CALL, v, v.k);
+        }
+        return true;
+    }
+    if u.str_eq(st.op, ".ltorg") or u.str_eq(st.op, ".pool") {
+        place_pool(A);
+        return true;
+    }
     if u.str_eq(st.op, ".inst") {
         for a in cr.split_args(st.args) {
             let x = cr.eval_const(A, a, "an instruction word");
@@ -751,6 +1068,16 @@ fn directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
 fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
     let m = st.op;
     let xs = cr.split_args(st.args);
+    if (u.str_eq(m, "ldr") or u.str_eq(m, "ldrsw")) and (xs.len == 2) {
+        let e = cr.trim(xs[1]);
+        if (e.len > 1) and (e[0] == '=') {
+            let t = parse_op(A, xs[0]);
+            if not cr.failed(A) {
+                literal(A, m, t, cr.trim(e[1..]));
+            }
+            return;
+        }
+    }
     let ops0 = u.newn.[AOp](xs.len + 1);
     for k in 0..xs.len {
         ops0[k] = parse_op(A, xs[k]);
@@ -763,8 +1090,21 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
         cr.fail(A, "an instruction at an offset that is not a multiple of 4");
         return;
     }
-    if vimm(A, m, ops) or table(A, m, ops) or integer(A, m, ops) or branch(A, m, ops) or ldst(A, m, ops) or
-       system(A, m, ops) or fp(A, m, ops) or simd(A, m, ops) {
+    // (a register with writeback, and [xn]!, are operands of the memory-copy instructions
+    // only; and of ldraa/ldrab, [xn]!)
+    for o in ops {
+        let mo = u.starts(m, "cpy") or u.starts(m, "set") or u.starts(m, "ldra");
+        if (o.kind == AK_REG) and o.pre and not mo {
+            cr.fail(A, u.f1("'%s' does not take a register with writeback", m));
+            return;
+        }
+        if (o.kind == AK_MEM) and o.pre and not o.off and not mo {
+            cr.fail(A, u.f1("'%s': a pre-indexed address without an offset", m));
+            return;
+        }
+    }
+    if vimm(A, m, ops) or table(A, m, ops) or base_rest(A, m, ops) or integer(A, m, ops) or branch(A, m, ops) or
+       ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or simd(A, m, ops) {
         return;
     }
     if not cr.failed(A) {
@@ -895,6 +1235,38 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             bad(A, m);
             return true;
         }
+        let opc: u64 = u64_pick(m[3] == 'n', 0, u64_pick(m[3] == 'z', 2, 3));
+        if (ops[1].kind == AK_IMM) and not ops[1].fp and (ops[1].v.rm != cr.RM_NONE) {
+            // movz xd, #:abs_g1:sym and the like: the operator's group is the shift
+            if ops.len != 2 {
+                bad(A, m);
+                return true;
+            }
+            let rv = cr.settle(A, ops[1].v);
+            let ty = rel_for(A, rv.rm, CL_MOVW, 0, m);
+            let g = ro_group(rv.rm);
+            if (ty == 0) or (g < 0) {
+                return true;
+            }
+            // (the signed groups' instruction is the linker's choice, movz or movn by
+            // the value's sign: not a movk)
+            let nc = u.ends(ro_name(rv.rm), "_nc");
+            let signed = u.ends(ro_name(rv.rm), "_s") or
+                         (not nc and
+                          (u.starts(ro_name(rv.rm), "prel") or u.starts(ro_name(rv.rm), "tprel") or
+                           u.starts(ro_name(rv.rm), "dtprel")));
+            if signed and (opc == 3) {
+                cr.fail(A, u.f1("the relocation operator ':%s:' is not one of movk", ro_name(rv.rm)));
+                return true;
+            }
+            if (g >= 2) and not ops[0].x {
+                cr.fail(A, u.f1("the relocation operator ':%s:' needs a 64-bit register", ro_name(rv.rm)));
+                return true;
+            }
+            cr.reloc(A, cr.here(A), ty, rv, rv.k);
+            w32(A, ae.movw(bx(ops[0].x), opc, ops[0].reg, 0, @bit_cast(u64, g)));
+            return true;
+        }
         let v = konst(A, &ops[1], "the immediate");
         let mut hw: u64 = 0;
         if ops.len == 3 {
@@ -908,7 +1280,6 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             bad(A, m);
             return true;
         }
-        let opc: u64 = u64_pick(m[3] == 'n', 0, u64_pick(m[3] == 'z', 2, 3));
         w32(A, ae.movw(bx(ops[0].x), opc, ops[0].reg, @bit_cast(u64, v), hw));
         return true;
     }
@@ -1061,14 +1432,26 @@ fn add_sub(A: *mut cr.Asm, m: []u8, sub0: bool, s: bool, ops: []AOp) void {
             }
             sh = ops[3].amt == 12;
         }
-        if v.rm == cr.RM_LO12 {
-            // add xd, xn, :lo12:sym
-            if sub or s or sh {
+        if v.rm != cr.RM_NONE {
+            // add xd, xn, :lo12:sym (and the TLS ones; :..._hi12: sets the shift)
+            if sub or s or (sh and (ops[3].amt != 12)) {
                 bad(A, m);
                 return;
             }
-            cr.reloc(A, cr.here(A), elf.R_AARCH64_ADD_ABS_LO12_NC, v, v.k);
-            w32(A, ae.addsub_imm(bx(d.x), false, false, d.reg, n.reg, 0, false));
+            let ty = rel_for(A, v.rm, CL_ADD, 0, m);
+            if ty == 0 {
+                return;
+            }
+            let hi = (ty == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (ty == elf.R_AARCH64_TLSLD_ADD_DTPREL_HI12);
+            if sh and not hi {
+                bad(A, m);
+                return;
+            }
+            // (the shift of :tprel_hi12: is set here, :dtprel_hi12:'s as written,
+            // as the conventional assembler does; the linker sets both)
+            cr.reloc(A, cr.here(A), ty, v, v.k);
+            w32(A, ae.addsub_imm(bx(d.x), false, false, d.reg, n.reg, 0,
+                                 sh or (ty == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12)));
             return;
         }
         if not cr.is_const(v) {
@@ -1448,7 +1831,11 @@ fn csel_word(x: bool, op: u64, o2: u64, d: i32, n: i32, mm: i32, c: u64) u64 {
 }
 
 fn adr(A: *mut cr.Asm, page: bool, d: i32, o: *AOp) void {
-    let v = cr.settle(A, o.v);
+    if not labelish(o) {
+        cr.fail(A, u.f1("'%s' needs a label", u.pick(page, "adrp", "adr")));
+        return;
+    }
+    let v = cr.settle(A, label_val(A, o));
     if not v.ok {
         return;
     }
@@ -1458,24 +1845,25 @@ fn adr(A: *mut cr.Asm, page: bool, d: i32, o: *AOp) void {
             cr.fail(A, "adrp needs a symbol");
             return;
         }
-        if A.inline_ and cr.def_of(A, v.sym).intext {
-            cr.fail(A, "adrp to a label of inline assembly");
-            return;
+        let ty = rel_for(A, v.rm, CL_ADRP, 0, "adrp");
+        if ty != 0 {
+            cr.reloc(A, here, ty, v, v.k);
+            w32(A, 0x90000000 | r5(d));
         }
-        let mut ty = elf.R_AARCH64_ADR_PREL_PG_HI21;
-        if v.rm == cr.RM_GOT {
-            ty = elf.R_AARCH64_ADR_GOT_PAGE;
-        } else if v.rm != cr.RM_NONE {
-            cr.fail(A, "this relocation operator is not one of adrp");
-            return;
-        }
-        cr.reloc(A, here, ty, v, v.k);
-        w32(A, 0x90000000 | r5(d));
         return;
     }
     let mut toff: u64 = 0;
     if not cr.local_target(A, v, &mut toff) or (v.rm != cr.RM_NONE) {
-        cr.fail(A, "adr needs a label of this section (adrp and add reach symbols)");
+        // a symbol of another section or unit: a relocation
+        if cr.is_const(v) or (v.sym < 0) {
+            cr.fail(A, "adr to an absolute address");
+            return;
+        }
+        let ty = rel_for(A, v.rm, CL_ADR, 0, "adr");
+        if ty != 0 {
+            cr.reloc(A, here, ty, v, v.k);
+            w32(A, 0x10000000 | r5(d));
+        }
         return;
     }
     let rel = (@bit_cast(i64, toff) + v.k) - @bit_cast(i64, here);
@@ -1506,7 +1894,7 @@ fn branch(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         if not n_ops(A, ops, 1, m) {
             return true;
         }
-        let off = target(A, &ops[0], 0, 19, 4, m);
+        let off = target(A, &ops[0], elf.R_AARCH64_CONDBR19, 19, 4, m);
         w32(A, (0x54000000 | (@bit_cast(u64, off) << 5)) | @bit_cast(u64, c));
         return true;
     }
@@ -1515,7 +1903,7 @@ fn branch(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             bad(A, m);
             return true;
         }
-        let off = target(A, &ops[1], 0, 19, 4, m);
+        let off = target(A, &ops[1], elf.R_AARCH64_CONDBR19, 19, 4, m);
         w32(A,
             ((u64_pick(m.len == 4, 0x35000000, 0x34000000) | sfb(ops[0].x)) | (@bit_cast(u64,
                                                                                          off) << 5)) | r5(ops[0].reg));
@@ -1530,7 +1918,7 @@ fn branch(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         if not range(A, b, 0, pick_i64(ops[0].x, 63, 31), "the bit") {
             return true;
         }
-        let off = target(A, &ops[2], 0, 14, 4, m);
+        let off = target(A, &ops[2], elf.R_AARCH64_TSTBR14, 14, 4, m);
         let bu = @bit_cast(u64, b);
         w32(A, ((u64_pick(m.len == 4, 0x37000000,
                           0x36000000) | ((bu >> 5) << 31)) | (
@@ -1678,12 +2066,25 @@ fn single(A: *mut cr.Asm, m: []u8, k0: usize, ops: []AOp) void {
     let vb: u64 = u64_pick(v, 1 << 26, 0);
     let rt = prf_or_reg(A, &t);
     // a literal: ldr xt, label
-    if (mem.kind == AK_EXPR) or (mem.kind == AK_IMM) {
-        if not load or unscaled or ((k != 0) and (k != 8) and not prfm) {
+    if labelish(&mem) {
+        if not load or unscaled or ((k != 0) and (k != 8) and not prfm) or (ops.len != 2) {
             bad(A, m);
             return;
         }
-        let off = target(A, &mem, 0, 19, 4, m);
+        let lv = cr.settle(A, label_val(A, &mem));
+        let mut off: i64 = 0;
+        if lv.ok and (lv.rm != cr.RM_NONE) {
+            // ldr xt, :got:sym and the TLS literals
+            let ty = rel_for(A, lv.rm, CL_LIT, 0, m);
+            // (the GOT and TLS literals are 8-byte loads: into an x or d register)
+            if (ty == 0) or ((ty != elf.R_AARCH64_LD_PREL_LO19) and (prfm or (k != 0) or (size != 3))) {
+                bad(A, m);
+                return;
+            }
+            cr.reloc(A, cr.here(A), ty, lv, lv.k);
+        } else {
+            off = target(A, &mem, elf.R_AARCH64_LD_PREL_LO19, 19, 4, m);
+        }
         let mut lopc: u64 = 0;
         if prfm {
             lopc = 3;
@@ -1763,19 +2164,17 @@ fn single(A: *mut cr.Asm, m: []u8, k0: usize, ops: []AOp) void {
     if not ov.ok {
         return;
     }
-    if (ov.rm == cr.RM_LO12) or (ov.rm == cr.RM_GOT_LO12) {
+    if ov.rm != cr.RM_NONE {
         if mem.pre or unscaled {
             bad(A, m);
             return;
         }
-        let mut ty = LO12_TYPES[@int_cast(usize, size)];
-        if ov.rm == cr.RM_GOT_LO12 {
-            if (size != 3) or v {
-                bad(A, m);
-                return;
-            }
-            ty = elf.R_AARCH64_LD64_GOT_LO12_NC;
+        let ty = rel_for(A, ov.rm, CL_LDST, size, m);
+        if ty == 0 {
+            return;
         }
+        // (a load of a GOT slot is of 8 bytes, into an x or d register: not of
+        // other sizes as the conventional assembler lets it be)
         cr.reloc(A, cr.here(A), ty, ov, ov.k);
         w32(A, w0 | 0x01000000);
         return;
@@ -2004,6 +2403,32 @@ fn exclusive(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             return true;
         }
     }
+    // casp caspa caspl caspal Ws, W(s+1), Wt, W(t+1), [Xn|SP] (and of x registers)
+    let cp = ["casp", "caspa", "caspl", "caspal"];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, cp[k]) {
+            if not n_ops(A, ops, 5, m) {
+                return true;
+            }
+            let mut ok = true;
+            for j in @as(usize, 0)..4 {
+                let o = ops[j];
+                ok = ok and is_rz(&o) and (o.x == ops[0].x);
+            }
+            if not ok or ((ops[0].reg & 1) != 0) or ((ops[2].reg & 1) != 0) or (ops[1].reg != (ops[0].reg + 1)) or
+               (ops[3].reg != (ops[2].reg + 1)) {
+                bad(A, m);
+                return true;
+            }
+            let b = base_only(A, &ops[4], m);
+            if b >= 0 {
+                w32(A,
+                    ((((0x08207c00 | (bx(ops[0].x) << 30)) | (bx((k & 1) != 0) << 22)) | (bx(k >= 2) << 15)) |
+                     (r5(ops[0].reg) << 16)) | ((r5(b) << 5) | r5(ops[2].reg)));
+            }
+            return true;
+        }
+    }
     if u.str_eq(m, "clrex") {
         let mut crm: u64 = 15;
         if ops.len == 1 {
@@ -2111,6 +2536,1078 @@ fn lse(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
 }
 
 // -----------------------------------------------------------------------------
+// The rest of the base set: pointer authentication, memory tagging, the
+// unprivileged and RCpc loads and stores, the 128-bit atomics, read-check-
+// write, the memory-copy and memory-set instructions, the common short
+// sequence compression instructions (FEAT_CSSC) and the 64-byte accesses
+// -----------------------------------------------------------------------------
+// An x register or xzr (not sp, no writeback).
+fn is_x(o: *AOp) bool {
+    return (o.kind == AK_REG) and o.x and not o.sp and not o.pre;
+}
+
+// An x register or sp (not xzr).
+fn is_xsp(o: *AOp) bool {
+    return (o.kind == AK_REG) and o.x and (o.sp or (o.reg != 31)) and not o.pre;
+}
+
+// An x register other than xzr and sp.
+fn is_xn(o: *AOp) bool {
+    return is_x(o) and (o.reg != 31);
+}
+
+// A w register or wzr.
+fn is_w(o: *AOp) bool {
+    return (o.kind == AK_REG) and not o.x and not o.sp and not o.pre;
+}
+
+// The ordering suffix of an atomic as the bits it sets from bit 22: a
+// (acquire, bit 23) 2, l (release, bit 22) 1, al 3, none 0; or -1.
+fn order_of(t: []u8) i64 {
+    if t.len == 0 {
+        return 0;
+    }
+    if u.str_eq(t, "a") {
+        return 2;
+    }
+    if u.str_eq(t, "l") {
+        return 1;
+    }
+    if u.str_eq(t, "al") {
+        return 3;
+    }
+    return -1;
+}
+
+// A constant immediate in lo..hi; else an error (and lo - 1).
+fn imm_in(A: *mut cr.Asm, o: *AOp, lo: i64, hi: i64, what: []u8) i64 {
+    let x = konst(A, o, what);
+    if cr.failed(A) or not range(A, x, lo, hi, what) {
+        return lo - 1;
+    }
+    return x;
+}
+
+// The constant offset of a memory operand without a register offset (0 if
+// none is written); else an error.
+fn mem_imm(A: *mut cr.Asm, o: *AOp, m: []u8) i64 {
+    if (o.kind != AK_MEM) or (o.rm >= 0) {
+        bad(A, m);
+        return 0;
+    }
+    if not o.off {
+        return 0;
+    }
+    let v = cr.settle(A, o.v);
+    if not cr.is_const(v) {
+        cr.fail(A, u.f1("the offset of '%s' must be a constant", m));
+        return 0;
+    }
+    return v.k;
+}
+
+const WB_OFF: u64 = 0;   // [xn, #i]
+const WB_POST: u64 = 1;  // [xn], #i
+const WB_PRE: u64 = 2;   // [xn, #i]!
+
+// The offset and addressing mode of a memory operand at ops[k] that may be
+// followed by a post-index immediate: a multiple of `scale` in lo..hi.
+fn wb_off(A: *mut cr.Asm, m: []u8, ops: []AOp, k: usize, scale: i64, lo: i64, hi: i64, mode: *mut u64) i64 {
+    let o = ops[k];
+    mode.* = WB_OFF;
+    let mut off: i64 = 0;
+    if ops.len == (k + 2) {
+        if (o.kind != AK_MEM) or o.off or o.pre or (o.rm >= 0) {
+            bad(A, m);
+            return 0;
+        }
+        mode.* = WB_POST;
+        off = konst(A, &ops[k + 1], "the offset");
+    } else if ops.len == (k + 1) {
+        off = mem_imm(A, &o, m);
+        if o.pre {
+            mode.* = WB_PRE;
+        }
+    } else {
+        bad(A, m);
+        return 0;
+    }
+    if cr.failed(A) {
+        return 0;
+    }
+    if (off % scale) != 0 {
+        cr.fail(A, u.f2("the offset of '%s' must be a multiple of %s", m, u.dec(scale)));
+        return 0;
+    }
+    if not range(A, off, lo, hi, "the offset") {
+        return 0;
+    }
+    return off / scale;
+}
+
+fn base_rest(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    return pauth(A, m, ops) or mte(A, m, ops) or rcpc(A, m, ops) or atomics128(A, m, ops) or mops(A, m, ops) or
+           cssc(A, m, ops);
+}
+
+// Pointer authentication (FEAT_PAuth): the data-processing forms, the
+// authenticated branches and returns, ldraa/ldrab (the hint-space ones are
+// with the hints, in `system`).
+fn pauth(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    // pac*/aut* Xd, Xn|SP and their z forms Xd (data-processing (1 source), opcode 0-15)
+    let names = ["pacia", "pacib", "pacda", "pacdb", "autia", "autib", "autda", "autdb"];
+    for k in @as(usize, 0)..8 {
+        let kk = @as(u64, k) << 10;
+        if u.str_eq(m, names[k]) {
+            if not n_ops(A, ops, 2, m) {
+                return true;
+            }
+            if not is_x(&ops[0]) or not is_xsp(&ops[1]) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ((0xdac10000 | kk) | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+            return true;
+        }
+        if u.str_eq(m, u.cat2(u.cat2(names[k][0..4], "z"), names[k][4..])) {
+            if not n_ops(A, ops, 1, m) {
+                return true;
+            }
+            if not is_x(&ops[0]) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ((0xdac12000 | kk) | (31 << 5)) | r5(ops[0].reg));
+            return true;
+        }
+    }
+    if u.str_eq(m, "xpaci") or u.str_eq(m, "xpacd") {
+        if n_ops(A, ops, 1, m) {
+            if not is_x(&ops[0]) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, u64_pick(m[4] == 'i', 0xdac143e0, 0xdac147e0) | r5(ops[0].reg));
+        }
+        return true;
+    }
+    if u.str_eq(m, "pacga") {
+        if n_ops(A, ops, 3, m) {
+            if not is_x(&ops[0]) or not is_x(&ops[1]) or not is_xsp(&ops[2]) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ((0x9ac03000 | (r5(ops[2].reg) << 16)) | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+        }
+        return true;
+    }
+    // retaa retab eretaa eretab (and eret, drps)
+    let rets = ["retaa", "retab", "eretaa", "eretab", "eret", "drps"];
+    let retw: [6]u64 = [0xd65f0bff, 0xd65f0fff, 0xd69f0bff, 0xd69f0fff, 0xd69f03e0, 0xd6bf03e0];
+    for k in 0..rets.len {
+        if u.str_eq(m, rets[k]) {
+            if n_ops(A, ops, 0, m) {
+                w32(A, retw[k]);
+            }
+            return true;
+        }
+    }
+    // braa brab blraa blrab Xn, Xm|SP; braaz brabz blraaz blrabz Xn
+    let brs = ["braa", "brab", "blraa", "blrab", "braaz", "brabz", "blraaz", "blrabz"];
+    let brw: [8]u64 = [0xd71f0800, 0xd71f0c00, 0xd73f0800, 0xd73f0c00, 0xd61f081f, 0xd61f0c1f, 0xd63f081f, 0xd63f0c1f];
+    for k in 0..brs.len {
+        if u.str_eq(m, brs[k]) {
+            let z = k >= 4;
+            if not n_ops(A, ops, pick_us(z, 1, 2), m) {
+                return true;
+            }
+            if not is_x(&ops[0]) or (not z and not is_xsp(&ops[1])) {
+                bad(A, m);
+                return true;
+            }
+            let mut w = brw[k] | (r5(ops[0].reg) << 5);
+            if not z {
+                w = w | r5(ops[1].reg);
+            }
+            w32(A, w);
+            return true;
+        }
+    }
+    // ldraa ldrab Xt, [Xn|SP{, #simm10 * 8}]{!}
+    if u.str_eq(m, "ldraa") or u.str_eq(m, "ldrab") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        if not is_x(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let mut mode: u64 = 0;
+        let q = wb_off(A, m, ops, 1, 8, -4096, 4088, &mut mode);
+        if cr.failed(A) {
+            return true;
+        }
+        let qu = @bit_cast(u64, q);
+        w32(A,
+            ((0xf8200400 | (bx(m[4] == 'b') << 23)) | (((qu >> 9) & 1) << 22)) |
+            ((((qu & 0x1ff) << 12) | (bx(mode == WB_PRE) << 11)) | ((r5(ops[1].base) << 5) | r5(ops[0].reg))));
+        return true;
+    }
+    return false;
+}
+
+// Memory tagging (FEAT_MTE): irg gmi addg subg subp subps cmpp, the tag
+// loads and stores.
+fn mte(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "irg") {
+        if (ops.len < 2) or (ops.len > 3) or not is_xsp(&ops[0]) or not is_xsp(&ops[1]) or
+           ((ops.len == 3) and not is_x(&ops[2])) {
+            bad(A, m);
+            return true;
+        }
+        let mut r: i32 = 31;
+        if ops.len == 3 {
+            r = ops[2].reg;
+        }
+        w32(A, ((0x9ac01000 | (r5(r) << 16)) | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+        return true;
+    }
+    if u.str_eq(m, "gmi") {
+        if not n_ops(A, ops, 3, m) {
+            return true;
+        }
+        if not is_x(&ops[0]) or not is_xsp(&ops[1]) or not is_x(&ops[2]) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((0x9ac01400 | (r5(ops[2].reg) << 16)) | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+        return true;
+    }
+    if u.str_eq(m, "addg") or u.str_eq(m, "subg") {
+        if not n_ops(A, ops, 4, m) {
+            return true;
+        }
+        if not is_xsp(&ops[0]) or not is_xsp(&ops[1]) {
+            bad(A, m);
+            return true;
+        }
+        let off = imm_in(A, &ops[2], 0, 1008, "the offset");
+        let tag = imm_in(A, &ops[3], 0, 15, "the tag offset");
+        if cr.failed(A) {
+            return true;
+        }
+        if (off % 16) != 0 {
+            cr.fail(A, u.f1("the offset of '%s' must be a multiple of 16", m));
+            return true;
+        }
+        w32(A,
+            ((u64_pick(m[0] == 'a', 0x91800000, 0xd1800000) | (@bit_cast(u64, off / 16) << 16)) | (@bit_cast(u64,
+                                                                                                             tag) <<
+                                                                                                   10)) |
+            ((r5(ops[1].reg) << 5) | r5(ops[0].reg)));
+        return true;
+    }
+    if u.str_eq(m, "subp") or u.str_eq(m, "subps") or u.str_eq(m, "cmpp") {
+        let o = pick_us(m[0] == 'c', 1, 0);
+        if not n_ops(A, ops, 3 - o, m) {
+            return true;
+        }
+        let mut d: i32 = 31;
+        if o == 0 {
+            if not is_x(&ops[0]) {
+                bad(A, m);
+                return true;
+            }
+            d = ops[0].reg;
+        }
+        if not is_xsp(&ops[1 - o]) or not is_xsp(&ops[2 - o]) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((u64_pick(u.str_eq(m, "subp"), 0x9ac00000,
+                          0xbac00000) | (r5(ops[2 - o].reg) << 16)) | (r5(ops[1 - o].reg) << 5)) | r5(d));
+        return true;
+    }
+    // stg stzg st2g stz2g Xt|SP, [Xn|SP, #simm9 * 16] (with the three modes); ldg (offset only)
+    let tags = ["stg", "stzg", "st2g", "stz2g", "ldg"];
+    for k in 0..tags.len {
+        if u.str_eq(m, tags[k]) {
+            if (ops.len < 2) or not pick_bool(k == 4, is_x(&ops[0]), is_xsp(&ops[0])) {
+                bad(A, m);
+                return true;
+            }
+            let mut mode: u64 = 0;
+            let q = wb_off(A, m, ops, 1, 16, -4096, 4080, &mut mode);
+            if cr.failed(A) {
+                return true;
+            }
+            if (k == 4) and (mode != WB_OFF) {
+                bad(A, m);
+                return true;
+            }
+            let modes: [3]u64 = [0x800, 0x400, 0xc00];
+            let mut w = (0xd9200000 | (@as(u64, k) << 22)) | modes[@int_cast(usize, mode)];
+            if k == 4 {
+                w = 0xd9600000;
+            }
+            w32(A, (w | ((@bit_cast(u64, q) & 0x1ff) << 12)) | ((r5(ops[1].base) << 5) | r5(ops[0].reg)));
+            return true;
+        }
+    }
+    // ldgm stgm stzgm Xt, [Xn|SP]
+    let bulk = ["ldgm", "stgm", "stzgm"];
+    let bulkw: [3]u64 = [0xd9e00000, 0xd9a00000, 0xd9200000];
+    for k in 0..bulk.len {
+        if u.str_eq(m, bulk[k]) {
+            if not n_ops(A, ops, 2, m) {
+                return true;
+            }
+            if not is_x(&ops[0]) {
+                bad(A, m);
+                return true;
+            }
+            let b = base_only(A, &ops[1], m);
+            if b >= 0 {
+                w32(A, (bulkw[k] | (r5(b) << 5)) | r5(ops[0].reg));
+            }
+            return true;
+        }
+    }
+    // stgp Xt1, Xt2, [Xn|SP, #simm7 * 16] (the three modes)
+    if u.str_eq(m, "stgp") {
+        if (ops.len < 3) or not is_x(&ops[0]) or not is_x(&ops[1]) {
+            bad(A, m);
+            return true;
+        }
+        let mut mode: u64 = 0;
+        let q = wb_off(A, m, ops, 2, 16, -1024, 1008, &mut mode);
+        if cr.failed(A) {
+            return true;
+        }
+        let modes: [3]u64 = [0x69000000, 0x68800000, 0x69800000];
+        w32(A, (modes[@int_cast(usize, mode)] | ((@bit_cast(u64,
+                                                            q) & 0x7f) << 15)) |
+            (((r5(ops[1].reg) << 10) | (r5(ops[2].base) << 5)) | r5(ops[0].reg)));
+        return true;
+    }
+    return false;
+}
+
+fn pick_bool(c: bool, a: bool, b: bool) bool {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The size and opc of a load or store of the unscaled-offset kinds (by
+// form k: 0 b, 1 h, 2 sb, 3 sh, 4 sw, 5 plain load, 6 b store, 7 h store,
+// 8 plain store) for register t; false if t does not fit the form.
+fn unscaled_sz(k: usize, t: *AOp, size: *mut u64, opc: *mut u64) bool {
+    if not is_x(t) and not is_w(t) {
+        return false;
+    }
+    let szs: [9]u64 = [0, 1, 0, 1, 2, 2, 0, 1, 2];
+    size.* = szs[k];
+    if (k <= 1) or (k == 6) or (k == 7) {
+        opc.* = u64_pick(k <= 1, 1, 0);
+        return not t.x;
+    }
+    if (k == 2) or (k == 3) {
+        opc.* = u64_pick(t.x, 2, 3);
+        return true;
+    }
+    if k == 4 {
+        opc.* = 2;
+        return t.x;
+    }
+    opc.* = u64_pick(k == 5, 1, 0);
+    if t.x {
+        size.* = 3;
+    }
+    return true;
+}
+
+// The RCpc and unprivileged loads and stores: ldtr/sttr (b h sb sh sw),
+// ldapur/stlur (b h sb sh sw, and of b h s d q registers), ldiapp/stilp,
+// stlr and ldapr with writeback, ldap1/stl1; gcsstr/gcssttr; ld64b/st64b*.
+fn rcpc(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let un = ["ldtrb", "ldtrh", "ldtrsb", "ldtrsh", "ldtrsw", "ldtr", "sttrb", "sttrh", "sttr", "ldapurb", "ldapurh",
+              "ldapursb", "ldapursh", "ldapursw", "ldapur", "stlurb", "stlurh", "stlur"];
+    for k0 in 0..un.len {
+        if u.str_eq(m, un[k0]) {
+            let k = k0 % 9;
+            let tr = k0 < 9;
+            if not n_ops(A, ops, 2, m) {
+                return true;
+            }
+            let t = ops[0];
+            let mut size: u64 = 0;
+            let mut opc: u64 = 0;
+            let mut base: u64 = u64_pick(tr, 0x38000800, 0x19000000);
+            if not tr and ((k == 5) or (k == 8)) and (t.kind == AK_VREG) and (t.view != 'v') {
+                // of a floating-point/vector register (FEAT_LRCPC3)
+                let mut v = false;
+                let sz = reg_size(&t, &mut v);
+                base = 0x1d000800;
+                size = @bit_cast(u64, sz & 3);
+                opc = u64_pick(k == 5, 1, 0) | u64_pick(sz == 4, 2, 0);
+            } else if not unscaled_sz(k, &t, &mut size, &mut opc) {
+                bad(A, m);
+                return true;
+            }
+            let mem = ops[1];
+            let off = mem_imm(A, &mem, m);
+            if cr.failed(A) {
+                return true;
+            }
+            if mem.pre {
+                bad(A, m);
+                return true;
+            }
+            if range(A, off, -256, 255, "the offset") {
+                w32(A,
+                    ((base | (size << 30)) | ((opc << 22) | ((@bit_cast(u64,
+                                                                        off) & 0x1ff) << 12))) |
+                    ((r5(mem.base) << 5) | r5(t.reg)));
+            }
+            return true;
+        }
+    }
+    // ldiapp Rt1, Rt2, [Xn|SP]{, #8 or #16}; stilp Rt1, Rt2, [Xn|SP{, #-8 or #-16}]{!}
+    if u.str_eq(m, "ldiapp") or u.str_eq(m, "stilp") {
+        let ld = m[0] == 'l';
+        if (ops.len < 3) or (ops.len > 4) or not (is_x(&ops[0]) or is_w(&ops[0])) or
+           not (is_x(&ops[1]) or is_w(&ops[1])) or (ops[0].x != ops[1].x) {
+            bad(A, m);
+            return true;
+        }
+        let x = ops[0].x;
+        let sz = pick_i64(x, 16, 8);
+        let mut mode: u64 = 0;
+        let q = wb_off(A, m, ops, 2, 1, -sz, sz, &mut mode);
+        if cr.failed(A) {
+            return true;
+        }
+        let wb = mode != WB_OFF;
+        if (wb and ((mode == WB_POST) != ld)) or (wb and (q != pick_i64(ld, sz, -sz))) or (not wb and (q != 0)) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((u64_pick(ld, 0x99400800,
+                          0x99000800) | (bx(x) << 30)) | ((r5(ops[1].reg) << 16) | (bx(not wb) << 12))) |
+            ((r5(ops[2].base) << 5) | r5(ops[0].reg)));
+        return true;
+    }
+    // stlr Rt, [Xn|SP, #-size]!; ldapr Rt, [Xn|SP], #size (FEAT_LRCPC3)
+    if (u.str_eq(m, "stlr") and (ops.len == 2) and (ops[1].kind == AK_MEM) and ops[1].pre) or
+       (u.str_eq(m, "ldapr") and (ops.len == 3)) {
+        let ld = m[0] == 'l';
+        if not (is_x(&ops[0]) or is_w(&ops[0])) {
+            bad(A, m);
+            return true;
+        }
+        let x = ops[0].x;
+        let sz = pick_i64(x, 8, 4);
+        let mut mode: u64 = 0;
+        let q = wb_off(A, m, ops, 1, 1, -sz, sz, &mut mode);
+        if cr.failed(A) {
+            return true;
+        }
+        if q != pick_i64(ld, sz, -sz) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, (u64_pick(ld, 0x99c00800, 0x99800800) | (bx(x) << 30)) | ((r5(ops[1].base) << 5) | r5(ops[0].reg)));
+        return true;
+    }
+    // ldap1 stl1 {Vt.d}[i], [Xn|SP]
+    if u.str_eq(m, "ldap1") or u.str_eq(m, "stl1") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let l = ops[0];
+        if (l.kind != AK_LIST) or (l.nregs != 1) or (l.esize != 64) or (l.lanes != 0) or (l.index < 0) or
+           (l.index > 1) {
+            bad(A, m);
+            return true;
+        }
+        let b = base_only(A, &ops[1], m);
+        if b >= 0 {
+            w32(A,
+                ((u64_pick(m[0] == 'l', 0x0d418400, 0x0d018400) | (@as(u64, @bit_cast(u32,
+                                                                                      l.index)) << 30)) |
+                 (r5(b) << 5)) | r5(l.reg));
+        }
+        return true;
+    }
+    // gcsstr gcssttr Xt, [Xn|SP] (FEAT_GCS)
+    if u.str_eq(m, "gcsstr") or u.str_eq(m, "gcssttr") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        if not is_x(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let b = base_only(A, &ops[1], m);
+        if b >= 0 {
+            w32(A, (u64_pick(m.len == 6, 0xd91f0c00, 0xd91f1c00) | (r5(b) << 5)) | r5(ops[0].reg));
+        }
+        return true;
+    }
+    // ld64b st64b Xt, [Xn|SP]; st64bv st64bv0 Xs, Xt, [Xn|SP] (FEAT_LS64; Xt even, at most x22)
+    let ls = ["ld64b", "st64b", "st64bv", "st64bv0"];
+    let lsw: [4]u64 = [0xf83fd000, 0xf83f9000, 0xf820b000, 0xf820a000];
+    for k in 0..ls.len {
+        if u.str_eq(m, ls[k]) {
+            let n = pick_us(k >= 2, 3, 2);
+            if not n_ops(A, ops, n, m) {
+                return true;
+            }
+            let t = ops[n - 2];
+            if not is_x(&t) or ((t.reg & 1) != 0) or (t.reg > 22) or ((k >= 2) and not is_x(&ops[0])) {
+                bad(A, m);
+                return true;
+            }
+            let b = base_only(A, &ops[n - 1], m);
+            if b < 0 {
+                return true;
+            }
+            let mut w = (lsw[k] | (r5(b) << 5)) | r5(t.reg);
+            if k >= 2 {
+                w = w | (r5(ops[0].reg) << 16);
+            }
+            w32(A, w);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether registers a and b are an even register and its successor.
+fn reg_pair(a: *AOp, b: *AOp) bool {
+    return is_x(a) and is_x(b) and ((a.reg & 1) == 0) and (b.reg == (a.reg + 1));
+}
+
+// The 128-bit atomics (FEAT_LSE128: ldclrp ldsetp swpp) and the
+// read-check-write instructions (FEAT_THE: rcw[s]cas[p], rcw[s]clr[p],
+// rcw[s]set[p], rcw[s]swp[p]), with their ordering suffixes.
+fn atomics128(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let mut t = "";
+    let mut w: u64 = 0;
+    let mut pairop = false;  // Xt1, Xt2, [Xn|SP]
+    let mut casp = false;    // Xs, Xs+1, Xt, Xt+1, [Xn|SP]
+    let mut nozr = false;    // (the 128-bit atomics' registers are not xzr)
+    let p128 = ["ldclrp", "ldsetp", "swpp"];
+    let p128w: [3]u64 = [0x19201000, 0x19203000, 0x19208000];
+    for k in 0..p128.len {
+        if u.starts(m, p128[k]) and (order_of(m[p128[k].len..]) >= 0) {
+            t = m[p128[k].len..];
+            w = p128w[k];
+            pairop = true;
+            nozr = true;
+        }
+    }
+    if (w == 0) and u.starts(m, "rcw") {
+        let mut r = m[3..];
+        let mut s: u64 = 0;
+        let kinds = ["cas", "clr", "set", "swp"];
+        let mut kind: i64 = -1;
+        for pass in @as(usize, 0)..2 {
+            for k in 0..kinds.len {
+                if (kind < 0) and u.starts(r, kinds[k]) {
+                    kind = @int_cast(i64, k);
+                }
+            }
+            if (kind < 0) and (pass == 0) and (r.len > 0) and (r[0] == 's') {
+                r = r[1..];
+                s = 1;
+            }
+        }
+        if kind < 0 {
+            return false;
+        }
+        r = r[3..];
+        let p = (r.len > 0) and (r[0] == 'p');
+        if p {
+            r = r[1..];
+        }
+        if order_of(r) < 0 {
+            return false;
+        }
+        t = r;
+        let one: [4]u64 = [0x19200800, 0x38209000, 0x3820b000, 0x3820a000];
+        let pairs: [4]u64 = [0x19200c00, 0x19209000, 0x1920b000, 0x1920a000];
+        let ku = @int_cast(usize, kind);
+        w = u64_pick(p, pairs[ku], one[ku]) | (s << 30);
+        casp = p and (kind == 0);
+        pairop = p and (kind != 0);
+    }
+    if w == 0 {
+        return false;
+    }
+    w = w | (@bit_cast(u64, order_of(t)) << 22);
+    let n = pick_us(casp, 5, 3);
+    if not n_ops(A, ops, n, m) {
+        return true;
+    }
+    let b = base_only(A, &ops[n - 1], m);
+    if b < 0 {
+        return true;
+    }
+    if casp {
+        if not reg_pair(&ops[0], &ops[1]) or not reg_pair(&ops[2], &ops[3]) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((w | (r5(ops[0].reg) << 16)) | (r5(b) << 5)) | r5(ops[2].reg));
+        return true;
+    }
+    if pairop {
+        if not is_x(&ops[0]) or not is_x(&ops[1]) or (nozr and ((ops[0].reg == 31) or (ops[1].reg == 31))) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((w | (r5(ops[1].reg) << 16)) | (r5(b) << 5)) | r5(ops[0].reg));
+        return true;
+    }
+    if not is_x(&ops[0]) or not is_x(&ops[1]) {
+        bad(A, m);
+        return true;
+    }
+    w32(A, ((w | (r5(ops[0].reg) << 16)) | (r5(b) << 5)) | r5(ops[1].reg));
+    return true;
+}
+
+// The memory-copy and memory-set instructions (FEAT_MOPS): cpy[f]{p,m,e}
+// with the unprivileged (wt rt t) and non-temporal (wn rn n) options,
+// [Xd]!, [Xs]!, Xn!; set[g]{p,m,e} with t and n, [Xd]!, Xn!, Xs. The
+// registers are distinct and not 31 (Xs of set may be xzr).
+fn mops(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let cpy = u.starts(m, "cpy");
+    if not cpy and not u.starts(m, "set") {
+        return false;
+    }
+    let mut r = m[3..];
+    let mut w: u64 = 0;
+    let mut stage: i64 = -1;
+    if cpy {
+        w = 0x1d000400;
+        if (r.len > 0) and (r[0] == 'f') {
+            w = 0x19000400;
+            r = r[1..];
+        }
+    } else {
+        w = 0x19c00400;
+        if (r.len > 0) and (r[0] == 'g') {
+            w = 0x1dc00400;
+            r = r[1..];
+        }
+    }
+    if r.len == 0 {
+        return false;
+    }
+    stage = u.find("pme", r[0]);
+    if stage < 0 {
+        return false;
+    }
+    r = r[1..];
+    // the options: an unprivileged part, then a non-temporal part
+    let mut opt: i64 = -1;
+    if cpy {
+        let up = ["wt", "rt", "t"];
+        let np = ["wn", "rn", "n"];
+        let mut a: u64 = 0;
+        for k in 0..up.len {
+            if (a == 0) and u.starts(r, up[k]) {
+                a = @as(u64, k) + 1;
+                r = r[up[k].len..];
+            }
+        }
+        let mut b: u64 = 0;
+        for k in 0..np.len {
+            if (b == 0) and u.str_eq(r, np[k]) {
+                b = @as(u64, k) + 1;
+                r = "";
+            }
+        }
+        if r.len == 0 {
+            opt = @bit_cast(i64, (b << 2) | a);
+        }
+    } else {
+        let sopt = ["", "t", "n", "tn"];
+        for k in 0..sopt.len {
+            if u.str_eq(r, sopt[k]) {
+                opt = @int_cast(i64, k);
+            }
+        }
+    }
+    if opt < 0 {
+        return false;
+    }
+    if not n_ops(A, ops, 3, m) {
+        return true;
+    }
+    let d = ops[0];
+    let s = ops[1];
+    let n = ops[2];
+    let mut ok = (d.kind == AK_MEM) and d.pre and not d.off and (d.rm < 0) and (d.base != 31);
+    let mut rs: i32 = 0;
+    let mut rn: i32 = 0;
+    if cpy {
+        ok = ok and (s.kind == AK_MEM) and s.pre and not s.off and (s.rm < 0) and (s.base != 31);
+        ok = ok and (n.kind == AK_REG) and n.pre and n.x and not n.sp and (n.reg != 31);
+        rs = s.base;
+        rn = n.reg;
+    } else {
+        ok = ok and (s.kind == AK_REG) and s.pre and s.x and not s.sp and (s.reg != 31);
+        ok = ok and is_x(&n);
+        rn = s.reg;
+        rs = n.reg;
+    }
+    if not ok {
+        bad(A, m);
+        return true;
+    }
+    if (d.base == rs) or (d.base == rn) or (rs == rn) {
+        cr.fail(A, u.f1("the registers of '%s' must be distinct", m));
+        return true;
+    }
+    let st = @bit_cast(u64, stage);
+    let o = @bit_cast(u64, opt);
+    if cpy {
+        w = (w | (st << 22)) | (o << 12);
+    } else {
+        w = (w | (st << 14)) | (o << 12);
+    }
+    w32(A, ((w | (r5(rs) << 16)) | (r5(rn) << 5)) | r5(d.base));
+    return true;
+}
+
+// FEAT_CSSC: abs cnt ctz Rd, Rn; smax smin umax umin Rd, Rn, Rm or #imm8.
+fn cssc(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if (ops.len == 0) or (ops[0].kind != AK_REG) {
+        return false;
+    }
+    let ones = ["ctz", "cnt", "abs"];
+    for k in 0..ones.len {
+        if u.str_eq(m, ones[k]) {
+            if not n_ops(A, ops, 2, m) {
+                return true;
+            }
+            if not all_rz(ops) or not same_width(ops) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.dp1(bx(ops[0].x), @as(u64, k) + 6, ops[0].reg, ops[1].reg));
+            return true;
+        }
+    }
+    let mm = ["smax", "umax", "smin", "umin"];
+    for k in 0..mm.len {
+        if u.str_eq(m, mm[k]) {
+            if not n_ops(A, ops, 3, m) {
+                return true;
+            }
+            if not all_rz(ops[0..2]) or not same_width(ops) {
+                bad(A, m);
+                return true;
+            }
+            let sf = sfb(ops[0].x);
+            let ku = @as(u64, k);
+            let rr = (r5(ops[1].reg) << 5) | r5(ops[0].reg);
+            if is_rz(&ops[2]) {
+                w32(A, ((0x1ac06000 | sf) | ((r5(ops[2].reg) << 16) | (ku << 10))) | rr);
+                return true;
+            }
+            let sg = (k & 1) == 0;
+            let x = imm_in(A, &ops[2], pick_i64(sg, -128, 0), pick_i64(sg, 127, 255), "the immediate");
+            if not cr.failed(A) {
+                w32(A, ((0x11c00000 | sf) | ((ku << 18) | ((@bit_cast(u64, x) & 0xff) << 10))) | rr);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// The SYS aliases' operation (atab-like `alias.operation` in asm/a64sysop.ax):
+// its value, or -1.
+fn sysop(alias: []u8, name: []u8) i64 {
+    let key = u.f2("%s.%s", alias, name);
+    for k in 0..so.NAMES.len {
+        if u.str_eq(key, so.NAMES[k]) {
+            return @as(i64, so.ENC[k]);
+        }
+    }
+    return -1;
+}
+
+// A Cn operand (c0-c15) of sys and the like, or -1.
+fn creg(o: *AOp) i64 {
+    if o.kind != AK_EXPR {
+        return -1;
+    }
+    let c = cnum(o.name);
+    if (c < 0) or (c > 15) {
+        return -1;
+    }
+    return c;
+}
+
+// sys/sysl/sysp's #op1, Cn, Cm, #op2 at ops[k..k+4] as op1:CRn:CRm:op2, or -1.
+fn sys_fields(A: *mut cr.Asm, ops: []AOp, k: usize) i64 {
+    let op1 = imm_in(A, &ops[k], 0, 7, "op1");
+    let n = creg(&ops[k + 1]);
+    let mm = creg(&ops[k + 2]);
+    let op2 = imm_in(A, &ops[k + 3], 0, 7, "op2");
+    if cr.failed(A) {
+        return -1;
+    }
+    if (n < 0) or (mm < 0) {
+        cr.fail(A, "a system instruction's CRn and CRm are c0 to c15");
+        return -1;
+    }
+    return (((op1 << 11) | (n << 7)) | (mm << 3)) | op2;
+}
+
+// The rest of the system instructions: the SYS aliases by operation name
+// (at, dc, ic, tlbi, tlbip, cfp, dvp, cosp, cpp), sys, sysl, sysp, mrrs,
+// msrr, the hint-space instructions of the later extensions, dsb with nXS,
+// wfet/wfit, the flag manipulation instructions, transactional memory and
+// the guarded control stack's.
+fn sys_rest(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let aliases = ["at", "dc", "ic", "tlbi", "cfp", "dvp", "cosp", "cpp"];
+    for k in 0..aliases.len {
+        if u.str_eq(m, aliases[k]) {
+            if (ops.len == 0) or (ops.len > 2) or (ops[0].kind != AK_EXPR) {
+                bad(A, m);
+                return true;
+            }
+            let e = sysop(m, ops[0].name);
+            if e < 0 {
+                cr.fail(A, u.f2("'%s' is not an operation of '%s'", ops[0].name, m));
+                return true;
+            }
+            let reg = (e & 1) != 0;
+            if (ops.len == 2) != reg {
+                cr.fail(A, u.f3("'%s %s' %s", m, ops[0].name, u.pick(reg, "takes a register", "takes no register")));
+                return true;
+            }
+            let mut t: i32 = 31;
+            if reg {
+                if not is_x(&ops[1]) {
+                    bad(A, m);
+                    return true;
+                }
+                t = ops[1].reg;
+            }
+            w32(A, (0xd5080000 | (@bit_cast(u64, e >> 3) << 5)) | r5(t));
+            return true;
+        }
+    }
+    // tlbip <op>{, Xt1, Xt2} (FEAT_D128; xzr, xzr when not written)
+    if u.str_eq(m, "tlbip") {
+        if (ops.len == 0) or (ops.len > 3) or (ops[0].kind != AK_EXPR) {
+            bad(A, m);
+            return true;
+        }
+        let e = sysop("tlbi", ops[0].name);
+        if (e < 0) or ((e & 4) == 0) {
+            cr.fail(A, u.f1("'%s' is not an operation of 'tlbip'", ops[0].name));
+            return true;
+        }
+        if ops.len == 1 {
+            cr.fail(A, u.f1("'tlbip %s' takes a register pair", ops[0].name));
+            return true;
+        }
+        let t = sys_pair(A, m, ops, 1);
+        if t >= 0 {
+            w32(A, (0xd5480000 | (@bit_cast(u64, e >> 3) << 5)) | r5(t));
+        }
+        return true;
+    }
+    // sys #op1, Cn, Cm, #op2{, Xt}; sysl Xt, #op1, Cn, Cm, #op2; sysp #op1, Cn, Cm, #op2{, Xt1, Xt2}
+    if u.str_eq(m, "sys") or u.str_eq(m, "sysp") {
+        let p = m.len == 4;
+        if (ops.len < 4) or (ops.len > pick_us(p, 6, 5)) {
+            bad(A, m);
+            return true;
+        }
+        let e = sys_fields(A, ops, 0);
+        if e < 0 {
+            return true;
+        }
+        if p and (((((e >> 7) & 15) != 8) and (((e >> 7) & 15) != 9)) or (((e >> 3) & 15) > 7)) {
+            cr.fail(A, "the CRn of sysp is c8 or c9, its CRm c0 to c7");
+            return true;
+        }
+        let mut t: i32 = 31;
+        if p {
+            t = sys_pair(A, m, ops, 4);
+            if t < 0 {
+                return true;
+            }
+        } else if ops.len == 5 {
+            if not is_x(&ops[4]) {
+                bad(A, m);
+                return true;
+            }
+            t = ops[4].reg;
+        }
+        w32(A, (u64_pick(p, 0xd5480000, 0xd5080000) | (@bit_cast(u64, e) << 5)) | r5(t));
+        return true;
+    }
+    if u.str_eq(m, "sysl") {
+        if not n_ops(A, ops, 5, m) {
+            return true;
+        }
+        if not is_x(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let e = sys_fields(A, ops, 1);
+        if e >= 0 {
+            w32(A, (0xd5280000 | (@bit_cast(u64, e) << 5)) | r5(ops[0].reg));
+        }
+        return true;
+    }
+    // mrrs Xt1, Xt2, <reg>; msrr <reg>, Xt1, Xt2 (FEAT_SYSREG128)
+    if u.str_eq(m, "mrrs") or u.str_eq(m, "msrr") {
+        if not n_ops(A, ops, 3, m) {
+            return true;
+        }
+        let rd = m[1] == 'r';
+        let s = ops[pick_us(rd, 2, 0)];
+        let k = pick_us(rd, 0, 1);
+        if not reg_pair(&ops[k], &ops[k + 1]) or (s.kind != AK_EXPR) {
+            bad(A, m);
+            return true;
+        }
+        let e = sysreg(s.name);
+        if e < 0 {
+            cr.fail(A, u.f1("the system register '%s' is not supported", s.name));
+            return true;
+        }
+        w32(A, (u64_pick(rd, 0xd5700000, 0xd5500000) | (@bit_cast(u64, e) << 5)) | r5(ops[k].reg));
+        return true;
+    }
+    // instructions of no operands
+    let plain = ["cfinv", "xaflag", "axflag", "clrbhb", "sb", "ssbb", "pssbb", "dgh", "tcommit", "gcspushx", "gcspopcx",
+                 "gcspopx"];
+    let plainw: [12]u64 = [0xd500401f, 0xd500403f, 0xd500405f, 0xd50322df, 0xd50330ff, 0xd503309f, 0xd503349f,
+                           0xd50320df, 0xd503307f, 0xd508779f, 0xd50877bf, 0xd50877df];
+    for k in 0..plain.len {
+        if u.str_eq(m, plain[k]) {
+            if n_ops(A, ops, 0, m) {
+                w32(A, plainw[k]);
+            }
+            return true;
+        }
+    }
+    // psb csync, tsb csync, gcsb dsync
+    if u.str_eq(m, "psb") or u.str_eq(m, "tsb") or u.str_eq(m, "gcsb") {
+        let opn = u.pick(m[0] == 'g', "dsync", "csync");
+        if (ops.len != 1) or (ops[0].kind != AK_EXPR) or not u.str_eq(ops[0].name, opn) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, u64_pick(m[0] == 'p', 0xd503223f, u64_pick(m[0] == 't', 0xd503225f, 0xd503227f)));
+        return true;
+    }
+    // instructions of one x register: wfet wfit (FEAT_WFxT), tstart ttest
+    // (FEAT_TME), trcit (FEAT_ITE), chkfeat x16 (FEAT_CHK), the GCS ones
+    let onex = ["wfet", "wfit", "tstart", "ttest", "trcit", "gcspushm", "gcsss1", "gcsss2", "gcspopm", "chkfeat"];
+    let onexw: [10]u64 = [0xd5031000, 0xd5031020, 0xd5233060, 0xd5233160, 0xd50b72e0, 0xd50b7700, 0xd50b7740,
+                          0xd52b7760, 0xd52b7720, 0xd503251f];
+    for k in 0..onex.len {
+        if u.str_eq(m, onex[k]) {
+            if (k == 8) and (ops.len == 0) {
+                w32(A, onexw[k] | 31);
+                return true;
+            }
+            if not n_ops(A, ops, 1, m) {
+                return true;
+            }
+            if not is_x(&ops[0]) or ((k == 9) and (ops[0].reg != 16)) {
+                bad(A, m);
+                return true;
+            }
+            if k != 9 {
+                w32(A, onexw[k] | r5(ops[0].reg));
+            } else {
+                w32(A, onexw[k]);
+            }
+            return true;
+        }
+    }
+    if u.str_eq(m, "tcancel") {
+        if n_ops(A, ops, 1, m) {
+            let x = imm_in(A, &ops[0], 0, 65535, "the reason");
+            if not cr.failed(A) {
+                w32(A, 0xd4600000 | (@bit_cast(u64, x) << 5));
+            }
+        }
+        return true;
+    }
+    // rmif Xn, #shift, #mask; setf8 setf16 Wn (FEAT_FlagM)
+    if u.str_eq(m, "rmif") {
+        if not n_ops(A, ops, 3, m) {
+            return true;
+        }
+        if not is_x(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let sh = imm_in(A, &ops[1], 0, 63, "the shift");
+        let mk = imm_in(A, &ops[2], 0, 15, "the mask");
+        if not cr.failed(A) {
+            w32(A, ((0xba000400 | (@bit_cast(u64, sh) << 15)) | (r5(ops[0].reg) << 5)) | @bit_cast(u64, mk));
+        }
+        return true;
+    }
+    if u.str_eq(m, "setf8") or u.str_eq(m, "setf16") {
+        if not n_ops(A, ops, 1, m) {
+            return true;
+        }
+        if not is_w(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, (u64_pick(m.len == 5, 0x3a00080d, 0x3a00480d) | (r5(ops[0].reg) << 5)));
+        return true;
+    }
+    return false;
+}
+
+// The register pair of tlbip and sysp at ops[k..] (an even register and its
+// successor, or xzr, xzr; none written: xzr): the first's number, or -1.
+fn sys_pair(A: *mut cr.Asm, m: []u8, ops: []AOp, k: usize) i32 {
+    if ops.len == k {
+        return 31;
+    }
+    let a = ops[k];
+    if not is_x(&a) {
+        bad(A, m);
+        return -1;
+    }
+    if ops.len == (k + 1) {
+        if ((a.reg & 1) != 0) and (a.reg != 31) {
+            bad(A, m);
+            return -1;
+        }
+        return a.reg;
+    }
+    let b = ops[k + 1];
+    if (ops.len != (k + 2)) or not (reg_pair(&a, &b) or ((a.reg == 31) and is_x(&b) and (b.reg == 31))) {
+        bad(A, m);
+        return -1;
+    }
+    return a.reg;
+}
+
+// -----------------------------------------------------------------------------
 // System instructions
 // -----------------------------------------------------------------------------
 // The system registers programs read and write: their o0:op1:CRn:CRm:op2
@@ -2151,9 +3648,13 @@ let BARRIERS: [12][]u8 = ["oshld", "oshst", "osh", "nshld", "nshst", "nsh", "ish
 let BARV: [12]u64 = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15];
 
 fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if sys_rest(A, m, ops) {
+        return true;
+    }
     let hints = ["nop", "yield", "wfe", "wfi", "sev", "sevl", "esb", "csdb", "paciasp", "autiasp", "bti", "pacibsp",
-                 "autibsp", "xpaclri"];
-    let hv: [14]u64 = [0, 1, 2, 3, 4, 5, 16, 20, 25, 29, 32, 27, 31, 7];
+                 "autibsp", "xpaclri", "pacia1716", "pacib1716", "autia1716", "autib1716", "paciaz", "pacibz", "autiaz",
+                 "autibz", "sevl"];
+    let hv: [23]u64 = [0, 1, 2, 3, 4, 5, 16, 20, 25, 29, 32, 27, 31, 7, 8, 10, 12, 14, 24, 26, 28, 30, 5];
     for k in 0..hints.len {
         if u.str_eq(m, hints[k]) {
             let mut x = hv[k];
@@ -2188,6 +3689,47 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         }
         return true;
     }
+    // smstart smstop {sm | za}: msr svcrsm/svcrza/svcrsmza, #1 or #0
+    if u.str_eq(m, "smstart") or u.str_eq(m, "smstop") {
+        let mut crm: u64 = 6;
+        if ops.len == 1 {
+            if u.str_eq(ops[0].name, "sm") {
+                crm = 2;
+            } else if u.str_eq(ops[0].name, "za") {
+                crm = 4;
+            } else {
+                bad(A, m);
+                return true;
+            }
+        } else if ops.len != 0 {
+            bad(A, m);
+            return true;
+        }
+        w32(A, (0xd503407f | (crm << 8)) | (bx(m.len == 7) << 8));
+        return true;
+    }
+    // hvc smc #imm16; dcps1 dcps2 dcps3 {#imm16}
+    let ex = ["hvc", "smc", "dcps1", "dcps2", "dcps3"];
+    let exw: [5]u64 = [0xd4000002, 0xd4000003, 0xd4a00001, 0xd4a00002, 0xd4a00003];
+    for k in 0..ex.len {
+        if u.str_eq(m, ex[k]) {
+            let mut x: i64 = 0;
+            if (ops.len == 1) or (k < 2) {
+                if not n_ops(A, ops, 1, m) {
+                    return true;
+                }
+                x = imm_in(A, &ops[0], 0, 65535, "the immediate");
+                if cr.failed(A) {
+                    return true;
+                }
+            } else if ops.len != 0 {
+                bad(A, m);
+                return true;
+            }
+            w32(A, exw[k] | (@bit_cast(u64, x) << 5));
+            return true;
+        }
+    }
     if u.str_eq(m, "svc") or u.str_eq(m, "brk") or u.str_eq(m, "hlt") or u.str_eq(m, "udf") {
         if not n_ops(A, ops, 1, m) {
             return true;
@@ -2203,6 +3745,27 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         let base = u64_pick(m[0] == 's', 0xd4000001, u64_pick(m[0] == 'b', 0xd4200000, 0xd4400000));
         w32(A, base | (@bit_cast(u64, x) << 5));
         return true;
+    }
+    // dsb with the nXS qualifier (FEAT_XS): oshnxs nshnxs ishnxs synxs, #16 #20 #24 #28
+    if u.str_eq(m, "dsb") and (ops.len == 1) {
+        let nxs = ["oshnxs", "nshnxs", "ishnxs", "synxs"];
+        let mut x: i64 = -1;
+        if ops[0].kind == AK_EXPR {
+            for k in 0..nxs.len {
+                if u.str_eq(ops[0].name, nxs[k]) {
+                    x = @int_cast(i64, k);
+                }
+            }
+        } else if (ops[0].kind == AK_IMM) and not ops[0].fp {
+            let v = cr.settle(A, ops[0].v);
+            if cr.is_const(v) and (v.k >= 16) and (v.k <= 28) and ((v.k % 4) == 0) {
+                x = (v.k - 16) / 4;
+            }
+        }
+        if x >= 0 {
+            w32(A, 0xd503323f | (@bit_cast(u64, x) << 10));
+            return true;
+        }
     }
     if u.str_eq(m, "dmb") or u.str_eq(m, "dsb") or u.str_eq(m, "isb") {
         let mut crm: u64 = 15;
@@ -2238,8 +3801,10 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         // the pstate-immediate form: msr <field>, #imm
         let fields = ["spsel", "daifset", "daifclr", "uao", "pan", "dit", "ssbs", "tco", "allint", "svcrsm", "svcrza",
                       "svcrsmza"];
+        // (the Arm ARM's MSR (immediate) table: op1, op2; the svcr fields have
+        // op2 3 and CRm 0b0sz1x: sm 001x, za 010x, both 011x, x the value)
         let fop1: [12]u64 = [0, 3, 3, 0, 0, 3, 3, 3, 1, 3, 3, 3];
-        let fop2: [12]u64 = [5, 6, 7, 3, 4, 6, 6, 7, 0, 3, 4, 5];
+        let fop2: [12]u64 = [5, 6, 7, 3, 4, 2, 1, 4, 0, 3, 3, 3];
         let mut fi: i64 = -1;
         for k in 0..fields.len {
             if u.str_eq(ops[0].name, fields[k]) {
@@ -2247,11 +3812,14 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             }
         }
         if fi >= 0 {
-            let x = konst(A, &ops[1], "the pstate immediate");
-            if not range(A, x, 0, 15, "the pstate immediate") {
+            let k = @int_cast(usize, fi);
+            let mut x = konst(A, &ops[1], "the pstate immediate");
+            if not range(A, x, 0, pick_i64((k == 1) or (k == 2), 15, 1), "the pstate immediate") {
                 return true;
             }
-            let k = @int_cast(usize, fi);
+            if k >= 9 {
+                x = x | (@int_cast(i64, k - 8) << 1);
+            }
             w32(A, (((0xd500401f | (fop1[k] << 16)) | (@bit_cast(u64, x) << 8)) | (fop2[k] << 5)));
             return true;
         }
@@ -2322,13 +3890,14 @@ fn fp(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             return true;
         }
     }
+    // (opcode 16-19: frint32z frint32x frint64z frint64x of FEAT_FRINTTS, single and double only)
     let one = ["fmov", "fabs", "fneg", "fsqrt", "", "", "", "", "frintn", "frintp", "frintm", "frintz", "frinta", "",
-               "frintx", "frinti"];
+               "frintx", "frinti", "frint32z", "frint32x", "frint64z", "frint64x"];
     for k in 0..one.len {
         if (one[k].len > 0) and u.str_eq(m, one[k]) and (ops.len == 2) and (ftype(&ops[0]) >= 0) and
            (ftype(&ops[1]) >= 0) {
             let t = same_ft(ops);
-            if t < 0 {
+            if (t < 0) or ((k >= 16) and (t > 1)) {
                 bad(A, m);
                 return true;
             }
@@ -2338,6 +3907,17 @@ fn fp(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
     }
     if u.str_eq(m, "fmov") {
         return fmov(A, m, ops);
+    }
+    // fjcvtzs Wd, Dn (FEAT_JSCVT)
+    if u.str_eq(m, "fjcvtzs") {
+        if n_ops(A, ops, 2, m) {
+            if not is_w(&ops[0]) or (ops[1].kind != AK_VREG) or (ops[1].view != 'd') {
+                bad(A, m);
+                return true;
+            }
+            w32(A, (0x1e7e0000 | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+        }
+        return true;
     }
     if u.str_eq(m, "fcvt") {
         if not n_ops(A, ops, 2, m) {
@@ -2447,6 +4027,26 @@ fn fp(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
                 return true;
             }
             w32(A, ae.fcvt_int(bx(g.x), @bit_cast(u64, t), rmo[k], opo[k], ops[0].reg, ops[1].reg));
+            return true;
+        }
+        // the fixed-point forms (scvtf ucvtf fcvtzs fcvtzu with #fbits, 1 to the
+        // integer's width): conversion between floating-point and fixed-point,
+        // scale 64 - fbits at bit 10, bit 21 clear
+        if u.str_eq(m, cvs[k]) and (ops.len == 3) and ((ops[0].kind == AK_REG) or (ops[1].kind == AK_REG)) and
+           ((k == 2) or (k == 3) or (k >= 10)) {
+            let to_fp = (k == 2) or (k == 3);
+            let g = ops[pick_us(to_fp, 1, 0)];
+            let f = ops[pick_us(to_fp, 0, 1)];
+            let t = ftype(&f);
+            if not is_rz(&g) or (t < 0) {
+                bad(A, m);
+                return true;
+            }
+            let fb = imm_in(A, &ops[2], 1, pick_i64(g.x, 64, 32), "the number of fraction bits");
+            if not cr.failed(A) {
+                let w = ae.fcvt_int(bx(g.x), @bit_cast(u64, t), rmo[k], opo[k], ops[0].reg, ops[1].reg);
+                w32(A, (w & ~(@as(u64, 1) << 21)) | (@bit_cast(u64, 64 - fb) << 10));
+            }
             return true;
         }
     }

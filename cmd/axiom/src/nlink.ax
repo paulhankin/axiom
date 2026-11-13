@@ -849,7 +849,8 @@ pub fn is_got_reloc(x64: bool, ty: u32) bool {
     if x64 {
         return (ty == elf.R_X86_64_GOTPCREL) or (ty == elf.R_X86_64_GOTPCRELX) or (ty == elf.R_X86_64_REX_GOTPCRELX);
     }
-    return (ty == elf.R_AARCH64_ADR_GOT_PAGE) or (ty == elf.R_AARCH64_LD64_GOT_LO12_NC);
+    return (ty == elf.R_AARCH64_ADR_GOT_PAGE) or (ty == elf.R_AARCH64_LD64_GOT_LO12_NC) or
+           (ty == elf.R_AARCH64_GOT_LD_PREL19);
 }
 
 pub fn is_call_reloc(x64: bool, ty: u32) bool {
@@ -900,6 +901,8 @@ fn rd32(b: []u8, off: u64) u64 {
 pub fn a64_got(b: []mut u8, fo: u64, p: u64, ty: u32, ga: u64) void {
     if ty == elf.R_AARCH64_ADR_GOT_PAGE {
         a64_adrp(b, fo, p, ga);
+    } else if ty == elf.R_AARCH64_GOT_LD_PREL19 {
+        a64_imm19(b, fo, p, ga, "a GOT literal");
     } else {
         a64_imm12(b, fo, (ga & 0xfff) >> 3);
     }
@@ -929,8 +932,229 @@ pub fn a64_reloc(b: []mut u8, fo: u64, p: u64, ty: u32, sa: u64) bool {
         a64_imm12(b, fo, (sa & 0xfff) >> 4);
     } else if (ty == elf.R_AARCH64_CALL26) or (ty == elf.R_AARCH64_JUMP26) {
         a64_branch(b, fo, p, sa);
+    } else if ty == elf.R_AARCH64_ADR_PREL_PG_HI21_NC {
+        let pages = (@bit_cast(i64, sa & ~@as(u64, 0xfff)) - @bit_cast(i64, p & ~@as(u64, 0xfff))) >> 12;
+        let v = @bit_cast(u64, pages) & 0x1f_ffff;
+        bn.w32(b, fo, (rd32(b, fo) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+    } else if (ty == elf.R_AARCH64_LD_PREL_LO19) or (ty == elf.R_AARCH64_CONDBR19) {
+        a64_imm19(b, fo, p, sa, u.pick(ty == elf.R_AARCH64_CONDBR19, "a conditional branch", "a literal load"));
+    } else if ty == elf.R_AARCH64_TSTBR14 {
+        let d = @bit_cast(i64, sa -% p);
+        if ((d & 3) != 0) or (d < -0x8000) or (d >= 0x8000) {
+            err("relocation out of range (tbz/tbnz: 32 KiB)");
+        }
+        bn.w32(b, fo, (rd32(b, fo) & 0xfff8_001f) | (((@bit_cast(u64, d) >> 2) & 0x3fff) << 5));
+    } else if ty == elf.R_AARCH64_ADR_PREL_LO21 {
+        let d = @bit_cast(i64, sa -% p);
+        if (d < -0x10_0000) or (d >= 0x10_0000) {
+            err("relocation out of range (adr: 1 MiB)");
+        }
+        let v = @bit_cast(u64, d) & 0x1f_ffff;
+        bn.w32(b, fo, (rd32(b, fo) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+    } else if ty == elf.R_AARCH64_PREL64 {
+        bn.w64(b, fo, sa -% p);
+    } else if ty == elf.R_AARCH64_PREL16 {
+        let v = @bit_cast(i64, sa) - @bit_cast(i64, p);
+        if (v < -0x8000) or (v > 0xffff) {
+            err("relocation out of range (prel16)");
+        }
+        bn.w16(b, fo, @bit_cast(u64, v) & 0xffff);
+    } else if (ty >= elf.R_AARCH64_MOVW_PREL_G0) and (ty <= elf.R_AARCH64_MOVW_PREL_G3) {
+        // (G0 G0_NC G1 G1_NC G2 G2_NC G3: the checked ones a movz or movn by the sign)
+        let k = ty - elf.R_AARCH64_MOVW_PREL_G0;
+        let mut mode = MW_SIGNED;
+        if k == 6 {
+            mode = MW_SIGNED_NC;
+        } else if (k & 1) != 0 {
+            mode = MW_NC;
+        }
+        a64_movw(b, fo, @bit_cast(i64, sa -% p), k / 2, mode, "movw prel");
     } else {
         return false;
     }
     return true;
+}
+
+// The ABI's move-wide relocations: an unsigned value checked to fit the
+// group's and lower bits, a movk's 16 bits (not checked), a signed value
+// that makes the instruction movz (>= 0) or movn (< 0) checked to fit, or not.
+pub const MW_UNSIGNED: u32 = 0;
+pub const MW_NC: u32 = 1;
+pub const MW_SIGNED: u32 = 2;
+pub const MW_SIGNED_NC: u32 = 3;
+
+pub fn a64_movw(b: []mut u8, fo: u64, x: i64, group: u32, mode: u32, what: []u8) void {
+    let sh = @as(u64, group) * 16;
+    let mut w = rd32(b, fo) & 0xffe0_001f;
+    let mut v = @bit_cast(u64, x);
+    if mode == MW_UNSIGNED {
+        if (group < 3) and ((v >> (sh + 16)) != 0) {
+            err(u.f1("relocation out of range (%s)", what));
+        }
+    } else if (mode == MW_SIGNED) or (mode == MW_SIGNED_NC) {
+        if (mode == MW_SIGNED) and (group < 3) {
+            let lim = @as(i64, 1) << @truncate(u32, sh + 16);
+            if (x < -lim) or (x >= lim) {
+                err(u.f1("relocation out of range (%s)", what));
+            }
+        }
+        // opc (bits 30:29): movz 10, movn 00
+        w = w & ~(@as(u64, 3) << 29);
+        if x < 0 {
+            v = ~v;
+        } else {
+            w = w | (@as(u64, 2) << 29);
+        }
+    }
+    bn.w32(b, fo, w | (((v >> sh) & 0xffff) << 5));
+}
+
+// A 19-bit pc-relative word offset at bit 5 (literal loads, b.cond, cbz).
+pub fn a64_imm19(b: []mut u8, fo: u64, p: u64, target: u64, what: []u8) void {
+    let d = @bit_cast(i64, target -% p);
+    if ((d & 3) != 0) or (d < -0x10_0000) or (d >= 0x10_0000) {
+        err(u.f1("relocation out of range (%s: 1 MiB)", what));
+    }
+    bn.w32(b, fo, (rd32(b, fo) & 0xff00_001f) | (((@bit_cast(u64, d) >> 2) & 0x7_ffff) << 5));
+}
+
+/// The absolute AArch64 relocations of a position-dependent image (ELF
+/// executables): .word/.hword of addresses and the move-wide UABS and SABS
+/// groups; false if ty is not one of them.
+pub fn a64_abs(b: []mut u8, fo: u64, ty: u32, sa: u64) bool {
+    if ty == elf.R_AARCH64_ABS32 {
+        let v = @bit_cast(i64, sa);
+        if (v < -0x8000_0000) or (v > 0xffff_ffff) {
+            err("relocation out of range (abs32)");
+        }
+        bn.w32(b, fo, sa & 0xffff_ffff);
+    } else if ty == elf.R_AARCH64_ABS16 {
+        let v = @bit_cast(i64, sa);
+        if (v < -0x8000) or (v > 0xffff) {
+            err("relocation out of range (abs16)");
+        }
+        bn.w16(b, fo, sa & 0xffff);
+    } else if (ty >= elf.R_AARCH64_MOVW_UABS_G0) and (ty <= elf.R_AARCH64_MOVW_UABS_G3) {
+        // G0 G0_NC G1 G1_NC G2 G2_NC G3
+        let k = ty - elf.R_AARCH64_MOVW_UABS_G0;
+        let mut mode = MW_UNSIGNED;
+        if ((k & 1) != 0) or (k == 6) {
+            mode = MW_NC;
+        }
+        a64_movw(b, fo, @bit_cast(i64, sa), k / 2, mode, "movw uabs");
+    } else if (ty >= elf.R_AARCH64_MOVW_SABS_G0) and (ty <= elf.R_AARCH64_MOVW_SABS_G2) {
+        a64_movw(b, fo, @bit_cast(i64, sa), ty - elf.R_AARCH64_MOVW_SABS_G0, MW_SIGNED, "movw sabs");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// Whether ty is one of the AArch64 thread-local relocations a64_tls applies.
+pub fn is_a64_tls(ty: u32) bool {
+    // the DTPREL ones (523-538), initial exec by adrp, ldr and literal
+    // (541-543), local exec (544-559), the descriptor's adrp, ldr, add and
+    // call (562-564, 569), the 128-bit loads and stores (570-573)
+    if ((ty >= elf.R_AARCH64_TLSLD_MOVW_DTPREL_G2) and (ty <= elf.R_AARCH64_TLSLD_LDST64_DTPREL_LO12_NC)) or
+       ((ty >= elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21) and (ty <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC)) {
+        return true;
+    }
+    return (ty == elf.R_AARCH64_TLSDESC_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSDESC_LD64_LO12) or
+           (ty == elf.R_AARCH64_TLSDESC_ADD_LO12) or (ty == elf.R_AARCH64_TLSDESC_CALL) or
+           ((ty >= elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) and (ty <= elf.R_AARCH64_TLSLD_LDST128_DTPREL_LO12_NC));
+}
+
+/// Applies an AArch64 thread-local relocation of an executable's own
+/// variable: tp its offset from the thread pointer (local exec), dtp its
+/// offset in the module's block (the local-dynamic DTPREL ones). The
+/// initial-exec and TLS-descriptor sequences are relaxed to local exec, as
+/// the ABI describes: adrp xd, :gottprel:v -> movz xd, #:tprel_g1:v; ldr xt,
+/// [xd, :gottprel_lo12:v] -> movk xt, #:tprel_g0_nc:v (xt must be xd);
+/// adrp x0, :tlsdesc:v -> movz x0, #:tprel_g1:v; ldr x1, [x0,
+/// :tlsdesc_lo12:v] -> movk x0, #:tprel_g0_nc:v; add x0, x0,
+/// :tlsdesc_lo12:v and the .tlsdesccall's blr -> nop.
+pub fn a64_tls(b: []mut u8, fo: u64, ty: u32, tp: i64, dtp: i64) void {
+    let w = rd32(b, fo);
+    let mut x = tp;
+    let mut t = ty;
+    let mut dt = false;
+    // the DTPREL kinds are the TPREL ones of dtp (their numbers in the same order)
+    if (ty >= elf.R_AARCH64_TLSLD_MOVW_DTPREL_G2) and (ty <= elf.R_AARCH64_TLSLD_MOVW_DTPREL_G0_NC) {
+        t = ty + (elf.R_AARCH64_TLSLE_MOVW_TPREL_G2 - elf.R_AARCH64_TLSLD_MOVW_DTPREL_G2);
+        dt = true;
+    } else if (ty >= elf.R_AARCH64_TLSLD_ADD_DTPREL_HI12) and (ty <= elf.R_AARCH64_TLSLD_ADD_DTPREL_LO12_NC) {
+        t = ty + (elf.R_AARCH64_TLSLE_ADD_TPREL_HI12 - elf.R_AARCH64_TLSLD_ADD_DTPREL_HI12);
+        dt = true;
+    } else if (ty >= elf.R_AARCH64_TLSLD_LDST8_DTPREL_LO12) and (ty <= elf.R_AARCH64_TLSLD_LDST64_DTPREL_LO12_NC) {
+        t = ty + (elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12 - elf.R_AARCH64_TLSLD_LDST8_DTPREL_LO12);
+        dt = true;
+    } else if (ty == elf.R_AARCH64_TLSLD_LDST128_DTPREL_LO12) or (ty == elf.R_AARCH64_TLSLD_LDST128_DTPREL_LO12_NC) {
+        t = ty - 2;
+        dt = true;
+    }
+    if dt {
+        x = dtp;
+    }
+    let xu = @bit_cast(u64, x);
+    if (t >= elf.R_AARCH64_TLSLE_MOVW_TPREL_G2) and (t <= elf.R_AARCH64_TLSLE_MOVW_TPREL_G0_NC) {
+        // G2 G1 G1_NC G0 G0_NC
+        let k = t - elf.R_AARCH64_TLSLE_MOVW_TPREL_G2;
+        let group: [5]u32 = [2, 1, 1, 0, 0];
+        let mut mode = MW_SIGNED;
+        if (k == 2) or (k == 4) {
+            mode = MW_NC;
+        }
+        a64_movw(b, fo, x, group[@as(usize, k)], mode, "a thread-local offset");
+    } else if t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12 {
+        if (x < 0) or (x >= 0x100_0000) {
+            err("thread-local offset out of range");
+        }
+        bn.w32(b, fo, (w & 0xff80_03ff) | (@as(u64, 1) << 22) | (((xu >> 12) & 0xfff) << 10));
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+        if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12) and ((x < 0) or (x >= 0x1000)) {
+            err("thread-local offset out of range (lo12)");
+        }
+        a64_imm12(b, fo, xu & 0xfff);
+    } else if ((t >= elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12) and (t <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC)) or
+              (t == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) or (t == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC) {
+        let mut sz: u64 = 4;
+        let mut chk = (t & 1) == 0;
+        if t <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC {
+            sz = @as(u64, (t - elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12) / 2);
+        } else {
+            chk = t == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12;
+        }
+        if chk and ((x < 0) or (x >= 0x1000)) {
+            err("thread-local offset out of range (lo12)");
+        }
+        if (xu & ((@as(u64, 1) << sz) - 1)) != 0 {
+            err("a thread-local offset not aligned to its access");
+        }
+        a64_imm12(b, fo, (xu & 0xfff) >> sz);
+    } else if (t == elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21) or (t == elf.R_AARCH64_TLSDESC_ADR_PAGE21) {
+        tls_relax_check(x);
+        bn.w32(b, fo, 0xd2a0_0000 | (((xu >> 16) & 0xffff) << 5) | (w & 31));  // movz xd, #hi, lsl #16
+    } else if (t == elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) or (t == elf.R_AARCH64_TLSDESC_LD64_LO12) {
+        // the ldr's base register is the adrp's (now the movz's) destination
+        let rn = (w >> 5) & 31;
+        if (t == elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) and (rn != (w & 31)) {
+            err("an initial-exec thread-local load whose register is not its base's (it cannot be relaxed)");
+        }
+        bn.w32(b, fo, 0xf280_0000 | ((xu & 0xffff) << 5) | rn);  // movk xn, #lo
+    } else if t == elf.R_AARCH64_TLSIE_LD_GOTTPREL_PREL19 {
+        if (x < 0) or (x >= 0x1_0000) {
+            err("an initial-exec thread-local literal whose offset needs more than 16 bits (it cannot be relaxed)");
+        }
+        bn.w32(b, fo, 0xd280_0000 | (xu << 5) | (w & 31));  // movz xt, #tp
+    } else if (t == elf.R_AARCH64_TLSDESC_ADD_LO12) or (t == elf.R_AARCH64_TLSDESC_CALL) {
+        bn.w32(b, fo, 0xd503_201f);  // nop
+    } else {
+        err(u.f1("the thread-local relocation %s is not supported", u.udec(@as(u64, ty))));
+    }
+}
+
+fn tls_relax_check(x: i64) void {
+    if (x < 0) or (x >= 0x1_0000_0000) {
+        err("thread-local offset out of range (32 bits)");
+    }
 }
