@@ -51,6 +51,27 @@ static void xk2_ld(int op, long double y, long double x, long double *r)
 #define XK1(op, x, r) xk1_ld((op), (x), (r))
 #define XK2(op, y, x, r) xk2_ld((op), (y), (x), (r))
 #define PROD_ERR(a, b, p) fmal((a), (b), -(p))
+#if __AXIOM_LDBL_WIDTH__ == 80
+/* cpow where |w| |log z| is beyond 2^50 (the pairs of the x87 format hold
+   the real functions to about 2^-128): w log z in triple-double
+   (std/c/rt/math_ld.ax); binary128's pairs are as precise as that */
+unsigned __axc_ldcpow(unsigned long long f, long double *r, const long double *z, const long double *w);
+
+static int xpow_l(long double complex z, long double complex w, long double complex *r)
+{
+    long double zz[2], ww[2], rr[2];
+    zz[0] = __builtin_creal(z);
+    zz[1] = __builtin_cimag(z);
+    ww[0] = __builtin_creal(w);
+    ww[1] = __builtin_cimag(w);
+    if (!__axc_ldcpow(1, rr, zz, ww))
+        return 0;
+    *r = __builtin_complex(rr[0], rr[1]);
+    return 1;
+}
+#define XPOW(z, w, r) xpow_l((z), (w), (r))
+#define K_POW_WIDE 0x1p50L
+#endif
 
 #include "complex_impl.h"
 #else

@@ -48,6 +48,27 @@ static double prod_err(double a, double b, double p)
 }
 #define PROD_ERR(a, b, p) prod_err((a), (b), (p))
 
+/* cpow where |w| |log z| is beyond 2^12 (the pairs' angle would lose
+   more than a tenth of an ulp): w log z in triple-double in binary128
+   (std/c/rt/math_ld.ax), each part rounded to binary128 and then to
+   double (within half an ulp and 2^-60 more) */
+unsigned __axc_ldcpow(unsigned long long f, _Float128 *r, const _Float128 *z, const _Float128 *w);
+
+static int xpow_d(double complex z, double complex w, double complex *r)
+{
+    _Float128 zz[2], ww[2], rr[2];
+    zz[0] = __builtin_creal(z);
+    zz[1] = __builtin_cimag(z);
+    ww[0] = __builtin_creal(w);
+    ww[1] = __builtin_cimag(w);
+    if (!__axc_ldcpow(0, rr, zz, ww))
+        return 0;
+    *r = __builtin_complex((double)rr[0], (double)rr[1]);
+    return 1;
+}
+#define XPOW(z, w, r) xpow_d((z), (w), (r))
+#define K_POW_WIDE 0x1p12
+
 #include "complex_impl.h"
 #else
 typedef int __axc_complex_c89;

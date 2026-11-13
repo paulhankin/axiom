@@ -1221,14 +1221,23 @@ functions are C (`std/c/lib/math/`).
   random bits, the unit circle, near +-1 and +-i, along and across the branch cuts, the
   poles and zeros of `ctan` and `ccos`, the overflow and underflow thresholds of `e^x`,
   huge and mixed magnitudes): each part within 0.5 to 0.93 ulp where it is normal, up to
-  1.4 ulps where it is subnormal (rounded twice there); the float, `_Float16`, `long double`
-  and `_Float128` forms within half an ulp and a small fraction (600 to 6,000 arguments
-  each). The float and `_Float16` functions are the double ones' values
+  1.4 ulps where it is subnormal (rounded twice there); the float and `_Float16` forms
+  within 0.500 ulp (6,000 arguments per function), the x87 format's and binary128's
+  (`long double`, `_Float128`) within 0.50 to 0.58 ulp where the part is normal and 1.1
+  where it is subnormal (600 arguments per function). The float and `_Float16` functions are the double ones' values
   rounded to the type. `cpow` is `e^(w log z)` with `log z` and its product with `w` in
-  pairs: within an ulp while `|w log z|` is below about 2^40 (beyond, the error grows as
-  `|w log z| 2^-2p`: the angle `w log z` would need `log z` to more than twice the type's
-  precision), and for a real `w` and an argument of `z` too small for the angle's pair,
-  that angle scaled. A double complex function takes 1.2 to 2.5 times the time of the
+  pairs, and where `B = (|Re w| + |Im w|)(|log |z|| + |arg z|)` is beyond what the
+  pairs hold to the precision the angle `Im(w log z)` needs (2^12 for double, 2^50 for
+  the x87 format), in triple-double (`std/c/rt/math_ld.ax`'s `__axc_ldcpow`: `log |z|`
+  and `arg z` within 2^-150, the angle reduced exactly by multiples of pi/2, a part at a
+  time): each part within 2 ulps while `B` is below 2^90 for double, 2^120 for float
+  (`_Float16`: everywhere), 2^70 for the x87 format and 2^26 for binary128 (whose pairs
+  are as precise as triple-double already). Beyond those bounds the error grows as `B
+  2^-150` relative: the angle modulo 2 pi then needs `log z` and `arg z` to more than
+  150 bits, which would take kernels and tables wider than triple-double (not written).
+  Also left to the pairs (and their bound) are a `w` with a part of 2^800 or more and a
+  complex `w` with `|arg z|` below 2^-600 or `|log |z||` below 2^-600; a real `w` and an
+  argument of `z` too small for the angle's pair take that angle scaled. A double complex function takes 1.2 to 2.5 times the time of the
   former, less accurate one (`cexp` 90 ns, `csqrt` 140, `casin` 460).
 - **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
   the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128

@@ -408,7 +408,11 @@ CT FN(csqrt)(CT z)
 
 /* z^w = e^(w log z) (G.6.4.1 leaves the special cases to cexp and clog):
    log z and its product with w in pairs, so that the error is about
-   |w log z| 2^-2p, not |w log z| 2^-p */
+   |w log z| 2^-2p, not |w log z| 2^-p; where |w| |log z| is beyond
+   K_POW_WIDE (whose real functions' pairs are within 2^-(p + 30) or so,
+   which the angle Im(w log z) then needs more than), the including unit's
+   XPOW(z, w, &r) if it defines one: w log z in triple-double
+   (std/c/rt/math_ld.ax's __axc_ldcpow), nonzero where it gave r */
 CT FN(cpow)(CT z, CT w)
 {
     CT l;
@@ -417,11 +421,24 @@ CT FN(cpow)(CT z, CT w)
         return C(1.0, 0.0);
     if (x == 0.0 && y == 0.0 && v == 0.0 && u > 0.0)
         return C(0.0, 0.0);
-    if (isfinite(x) && isfinite(y) && isfinite(u) && isfinite(v) && (x != 0.0 || y != 0.0) &&
-        M(fabs)(u) < 0x1p60 && M(fabs)(v) < 0x1p60) {
+    if (isfinite(x) && isfinite(y) && isfinite(u) && isfinite(v) && (x != 0.0 || y != 0.0)) {
         DT lr = xhalflog(M(fabs)(x), M(fabs)(y)), li = xk2(0, y, x);
-        DT pr = dt_sub(dt_mul(dt(u, 0.0), lr), dt_mul(dt(v, 0.0), li));
-        DT pi = dt_add(dt_mul(dt(u, 0.0), li), dt_mul(dt(v, 0.0), lr));
+        DT pr, pi;
+#ifdef XPOW
+        if ((M(fabs)(u) + M(fabs)(v)) * (M(fabs)(lr.h) + M(fabs)(li.h)) > K_POW_WIDE) {
+            /* the terms of w log z beyond what the pairs hold to the
+               precision the angle needs: the wider computation */
+            CT r;
+            if (XPOW(z, w, &r))
+                return r;
+        }
+#endif
+        /* (a real w of any size: its products with log z are pairs, as
+           exact as the small argument's branch below needs) */
+        if (!((M(fabs)(u) < 0x1p60 && M(fabs)(v) < 0x1p60) || v == 0.0))
+            goto plain;
+        pr = dt_sub(dt_mul(dt(u, 0.0), lr), dt_mul(dt(v, 0.0), li));
+        pi = dt_add(dt_mul(dt(u, 0.0), li), dt_mul(dt(v, 0.0), lr));
         if (v == 0.0 && x > 0.0 && y != 0.0 && M(fabs)(pi.h) < K_SQ_LOV * K_SQ_LOV &&
             M(fabs)(pr.h) <= K_EXP_BIG) {
             /* a real w and arg z = y/x (nearly) so small that the angle u arg
@@ -436,6 +453,7 @@ CT FN(cpow)(CT z, CT w)
         if (M(fabs)(pr.h) < 2.0 * K_EXP_BIG && isfinite(pi.h))
             return cexp_dt(pr, pi);
     }
+plain:
     l = FN(clog)(z);
     return FN(cexp)(C(u * RE(l) - v * IM(l), u * IM(l) + v * RE(l)));
 }

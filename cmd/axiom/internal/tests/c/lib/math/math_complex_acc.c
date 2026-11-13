@@ -99,5 +99,16 @@ int main(void)
     pc(cpow(CMPLX(-2.0, -0.0), CMPLX(1.5, 0.5)));
 /* expect: -4.621675737279188 */
 /* expect: 12.797095547102828 */
+    /* |w log z| beyond the pairs (2^40, 2^50 and 2^70): w log z in
+       triple-double, the angle reduced exactly */
+    pc(cpow(CMPLX(0.6, 0.8), CMPLX(1e12, 0.0)));
+/* expect: -0.9134325693911012 */
+/* expect: 0.4070446548999837 */
+    pc(cpow(CMPLX(2.0, 1e-15), CMPLX(3.0, 1e15)));
+/* expect: 1.4033743101065363 */
+/* expect: -4.6448708034460235 */
+    pc(cpow(CMPLX(3.0, 0x3p-62), CMPLX(-0.5, 0x1p70)));
+/* expect: 7.176221335373761e-113 */
+/* expect: -3.751886893768801e-112 */
     return 0;
 }

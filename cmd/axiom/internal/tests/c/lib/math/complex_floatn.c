@@ -29,6 +29,13 @@ int main(void)
     /* (binary128's precision: beyond double's) */
     _Float128 one = 1;
     print_bool(cabsf128(__builtin_complex(one, (_Float128)0x1p-50)) > one);
+    /* log|z| near |z| = 1, where the squares' sum needs 226 bits: (1 +
+       2^-110) + 2^-56 i (the reference 8.666684749742561e-34) */
+    {
+        double q = (double)(crealf128(clogf128(__builtin_complex(one + (_Float128)0x1p-110, (_Float128)0x1p-56))) /
+                            (_Float128)8.666684749742561e-34);
+        print_bool(q > 1 - 1e-15 && q < 1 + 1e-15);
+    }
     _Float16 _Complex eh = cexpf16(h);
     print_bool(crealf16(eh) == (_Float16)0.51987868600849365733 && cimagf16(eh) == (_Float16)-1.5646111274988195279);
     print_bool(cargf16(h) == (_Float16)-1.1902899496825317 && cabsf16(h) == (_Float16)1.3462912017836260078);
@@ -41,6 +48,7 @@ int main(void)
     print_bool(_Generic(pow(z, one), _Float128 _Complex: 1, default: 0) && creal(exp(z)) == crealf128(e));
     return 0;
 }
+// expect: true
 // expect: true
 // expect: true
 // expect: true

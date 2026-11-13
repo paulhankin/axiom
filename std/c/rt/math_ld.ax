@@ -1362,6 +1362,96 @@ fn log1p_td(v: TD) TD @multiversion("fma") {
     return log_core(tscale(s, p2(-e)), e);
 }
 
+/// e[0..n] + b exactly into e (an expansion: nonoverlapping components of
+/// increasing magnitude, without zeros): J. R. Shewchuk's Grow-Expansion with
+/// zero elimination ("Adaptive precision floating-point arithmetic and fast
+/// robust geometric predicates", Discrete Comput. Geom. 18, 1997). The new
+/// length.
+fn grow(e: *mut [32]f64, n: usize, b: f64) usize {
+    let mut q = b;
+    let mut k: usize = 0;
+    for i in @as(usize, 0)..n {
+        let s = m.two_sum(q, e[i]);
+        q = s.hi;
+        if s.lo != 0.0 {
+            e[k] = s.lo;
+            k += 1;
+        }
+    }
+    if q != 0.0 {
+        e[k] = q;
+        k += 1;
+    }
+    return k;
+}
+
+/// The square of a significand's triple-double (sig_td's parts, or them
+/// scaled: no product underflows) added exactly to the expansion e.
+fn grow_sqr(e: *mut [32]f64, n0: usize, a: TD) usize {
+    let mut n = n0;
+    let ps: [6]m.DD = [m.two_sqr(a.h), m.two_prod(2.0 * a.h, a.m), m.two_sqr(a.m), m.two_prod(2.0 * a.h, a.l),
+                       m.two_prod(2.0 * a.m, a.l), m.two_sqr(a.l)];
+    for i in @as(usize, 0)..6 {
+        n = grow(e, n, ps[i].lo);
+        n = grow(e, n, ps[i].hi);
+    }
+    return n;
+}
+
+/// log|x + iy| for finite x >= y >= 0, x > 0, as v 2^k: log(a^2 + b^2)/2 +
+/// e ln2, a and b scaled by 2^-e (b dropped below 2^-600 of a). The squares'
+/// sum to 2^-150 leaves log's reduction nothing to cancel, except near |z| =
+/// 1 (e = 0 and the sum near 1, or e = -1 and the sum near 4), where the
+/// logarithm is small: there it is log1p(d)/2 of d = a^2 + b^2 - 1 (or
+/// (a^2 + b^2 - 4)/4) summed exactly (binary128's squares need 226 bits).
+fn half_log_sq(xv: X, yv: X) TK @multiversion("fma") {
+    let e = xv.e;
+    let a = sig_td(xv);
+    let mut b = tdd(0.0);
+    if (yv.cls == C_FIN) and ((e - yv.e) < 600) {
+        b = tscale(sig_td(yv), p2(yv.e - e));
+    }
+    let mut s2 = tadd(tmul(a, a), tmul(b, b));
+    if ((e == 0) and (s2.h < 1.0625)) or ((e == -1) and (s2.h > 3.75) and (s2.h < 4.25)) {
+        let mut c: f64 = 1.0;
+        if e == -1 {
+            c = 4.0;
+        }
+        let ya = (yv.cls == C_FIN) and ((e - yv.e) <= 300);
+        if (e == 0) and (a.h == 1.0) and (a.m == 0.0) and (a.l == 0.0) and not ya {
+            // |x| = 1, y below 2^-300: log1p(y^2)/2 = y^2/2 within 2^-600
+            if yv.cls != C_FIN {
+                return TK.{ v: tdd(0.0), k: 0 };
+            }
+            let sy = sig_td(yv);
+            return TK.{ v: tscale(tmul(sy, sy), 0.5), k: 2 * yv.e };
+        }
+        // (b dropped below 2^-300 of a otherwise: a^2 - c is then 2^-112
+        // or more, b^2 below 2^-600)
+        let mut ex: [32]f64 = [0.0; 32];
+        let mut n = grow(&mut ex, 0, -c);
+        n = grow_sqr(&mut ex, n, a);
+        if ya {
+            n = grow_sqr(&mut ex, n, b);
+        }
+        let mut d = tdd(0.0);
+        for i in @as(usize, 0)..n {
+            d = tadd(d, tdd(ex[i]));
+        }
+        return TK.{ v: tscale(log1p_td(tscale(d, 1.0 / c)), 0.5), k: 0 };
+    }
+    let mut e2: i32 = 0;
+    if s2.h >= 4.0 {
+        s2 = tscale(s2, 0.25);
+        e2 = 2;
+    } else if s2.h >= 2.0 {
+        s2 = tscale(s2, 0.5);
+        e2 = 1;
+    }
+    let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
+    return TK.{ v: l, k: 0 };
+}
+
 /// Is x (finite) an integer, and odd? 0: not an integer, 1: odd, 2: even.
 fn int_kind(x: X) u32 {
     if x.e < 0 {
@@ -1479,25 +1569,8 @@ fn ld2(op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, post: bool) void @mult
     let xv = decode(x, f);
     let yv = decode(y, f);
     if op == OP_CLOGRE {
-        // log(a^2 + b^2)/2 + e ln2, a and b scaled by 2^-e (the squares'
-        // sum to 2^-150: log's reduction leaves nothing to cancel near 1)
-        let e = xv.e;
-        let a = sig_td(xv);
-        let mut b = tdd(0.0);
-        if (yv.cls == C_FIN) and ((e - yv.e) < 600) {
-            b = tscale(sig_td(yv), p2(yv.e - e));
-        }
-        let mut s2 = tadd(tmul(a, a), tmul(b, b));
-        let mut e2: i32 = 0;
-        if s2.h >= 4.0 {
-            s2 = tscale(s2, 0.25);
-            e2 = 2;
-        } else if s2.h >= 2.0 {
-            s2 = tscale(s2, 0.5);
-            e2 = 1;
-        }
-        let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
-        put(r, l, 0, f, post);
+        let l = half_log_sq(xv, yv);
+        put(r, l.v, l.k, f, post);
         return;
     }
     if op == OP_HYPOT {
@@ -2785,30 +2858,18 @@ export fn __axc_ldcx(op: u64, f64fmt: u64, r: *mut [4]ld.W, x: *ld.W, y: *ld.W) 
     }
     let yv = decode(y, f);
     if op == 5 {
-        // log(a^2 + b^2)/2 + e ln2, a and b scaled by 2^-e (as ld2's clog
-        // part: the squares' sum to 2^-150, nothing cancels near 1)
-        let e = xv.e;
-        let a = sig_td(xv);
-        let mut b = tdd(0.0);
-        if (yv.cls == C_FIN) and ((e - yv.e) < 600) {
-            b = tscale(sig_td(yv), p2(yv.e - e));
-        }
-        let mut s2 = tadd(tmul(a, a), tmul(b, b));
-        let mut e2: i32 = 0;
-        if s2.h >= 4.0 {
-            s2 = tscale(s2, 0.25);
-            e2 = 2;
-        } else if s2.h >= 2.0 {
-            s2 = tscale(s2, 0.5);
-            e2 = 1;
-        }
-        let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
-        put_pair(r, 0, l, 0, f);
+        let l = half_log_sq(xv, yv);
+        put_pair(r, 0, l.v, l.k, f);
         return;
     }
     // atan2(x, y): x the ordinate
-    let dy = xv;
-    let dx = yv;
+    let a = atan2_tk(xv, yv);
+    put_pair(r, 0, a.v, a.k, f);
+}
+
+/// atan2(y, x) for finite y and x, not both 0, as v 2^k (k = 0 but where
+/// |y/x| is below 2^-600).
+fn atan2_tk(dy: X, dx: X) TK @multiversion("fma") {
     let mut v = tdd(0.0);
     if dy.cls == C_ZERO {
         v = tdd(0.0);
@@ -2821,8 +2882,7 @@ export fn __axc_ldcx(op: u64, f64fmt: u64, r: *mut [4]ld.W, x: *ld.W, y: *ld.W) 
             if dy.neg {
                 q = tneg(q);
             }
-            put_pair(r, 0, q, dy.e - dx.e, f);
-            return;
+            return TK.{ v: q, k: dy.e - dx.e };
         }
         v = tdd(0.0);
     } else {
@@ -2849,5 +2909,112 @@ export fn __axc_ldcx(op: u64, f64fmt: u64, r: *mut [4]ld.W, x: *ld.W, y: *ld.W) 
     if dy.neg {
         v = tneg(v);
     }
-    put_pair(r, 0, v, 0, f);
+    return TK.{ v: v, k: 0 };
+}
+
+/// A double as a long double's parts (decode's form).
+fn x_of(c: f64) X {
+    let mut w = ld.W.{ lo: 0, hi: 0 };
+    ld.from_f64(&mut w, m.bits(c), ld.FMT_Q);
+    return decode(&w, ld.FMT_Q);
+}
+
+/// |x| with its parts.
+inline fn x_abs(x: X) X {
+    return X.{ cls: x.cls, neg: false, e: x.e, sh: x.sh, sl: x.sl };
+}
+
+/// z^w = e^(w log z) for <complex.h>'s cpow (complex_impl.h) where pairs of
+/// its own type do not hold the angle Im(w log z) or Re(w log z) well
+/// enough: w log z from the triple-double log|z| and arg z (within 2^-150),
+/// the angle reduced exactly by multiples of pi/2, a part at a time, e^Re(w
+/// log z) and the angle's sine and cosine in triple-double, and each part
+/// of the result rounded once to format f: within 2 ulps while |w| |log z|
+/// is below about 2^(147 - p) for a format of p bits. For finite z != 0 and
+/// w; 0 (nothing written) where |Re w| or |Im w| is 2^800 or more, |log|z||
+/// or |arg z| is nonzero and below 2^-600, or |Re(w log z)| beyond 11000:
+/// the caller's own path then.
+export fn __axc_ldcpow(f64fmt: u64, r: *mut [2]ld.W, z: *[2]ld.W, w: *[2]ld.W) u32 @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(&z[0], f);
+    let yv = decode(&z[1], f);
+    let uv = decode(&w[0], f);
+    let vv = decode(&w[1], f);
+    if (uv.cls > C_FIN) or (vv.cls > C_FIN) or ((uv.cls == C_FIN) and (uv.e >= 800)) or
+       ((vv.cls == C_FIN) and (vv.e >= 800)) {
+        return 0;
+    }
+    let mut u = tdd(0.0);
+    let mut v = tdd(0.0);
+    if uv.cls == C_FIN {
+        u = val_td(uv);
+    }
+    if vv.cls == C_FIN {
+        v = val_td(vv);
+    }
+    // log|z| from the larger part and the smaller
+    let mut big = x_abs(xv);
+    let mut sml = x_abs(yv);
+    if (yv.cls == C_FIN) and
+       ((xv.cls != C_FIN) or (yv.e > xv.e) or
+        ((yv.e == xv.e) and ((yv.sh > xv.sh) or ((yv.sh == xv.sh) and (yv.sl > xv.sl))))) {
+        big = x_abs(yv);
+        sml = x_abs(xv);
+    }
+    if (big.cls != C_FIN) or (xv.cls > C_FIN) or (yv.cls > C_FIN) {
+        return 0;
+    }
+    let l = half_log_sq(big, sml);
+    let a = atan2_tk(yv, xv);
+    if (l.k != 0) or (a.k != 0) or ((l.v.h != 0.0) and (@abs(l.v.h) < 2.409919865102884e-181)) or
+       ((a.v.h != 0.0) and (@abs(a.v.h) < 2.409919865102884e-181)) {
+        return 0;  // (2^-600)
+    }
+    let re = tsub(tmul(u, l.v), tmul(v, a.v));
+    let th = tadd(tmul(u, a.v), tmul(v, l.v));
+    if not (@abs(re.h) <= 11000.0) {
+        return 0;
+    }
+    // the angle less n pi/2: each part reduced (exactly, as sin's argument),
+    // the remainders summed and brought back to [-pi/4, pi/4]
+    let cs: [3]f64 = [th.h, th.m, th.l];
+    let mut n: i32 = 0;
+    let mut rr = tdd(0.0);
+    for i in @as(usize, 0)..3 {
+        let c = cs[i];
+        if @abs(c) <= 0.7853981633974483 {
+            rr = tadd(rr, tdd(c));
+        } else {
+            let rd = reduce(x_of(c));
+            n += rd.n;
+            rr = tadd(rr, rd.r);
+        }
+    }
+    let pio2 = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+    while rr.h > 0.7853981633974483 {
+        rr = tsub(rr, pio2);
+        n += 1;
+    }
+    while rr.h < -0.7853981633974483 {
+        rr = tadd(rr, pio2);
+        n -= 1;
+    }
+    let sc = sincos_k(rr);
+    let q = n & 3;
+    let mut s = sc.s;
+    let mut c = sc.c;
+    if q == 1 {
+        s = sc.c;
+        c = tneg(sc.s);
+    } else if q == 2 {
+        s = tneg(sc.s);
+        c = tneg(sc.c);
+    } else if q == 3 {
+        s = tneg(sc.c);
+        c = sc.s;
+    }
+    let e = exp_core(re);
+    td_to_ld(&mut r[0], tmul(e.v, c), e.k, f);
+    td_to_ld(&mut r[1], tmul(e.v, s), e.k, f);
+    return 1;
 }
