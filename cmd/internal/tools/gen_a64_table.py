@@ -287,6 +287,199 @@ for name, u, opc in (('fmla', 0, 0x1), ('fmls', 0, 0x5), ('fmul', 0, 0x9), ('fmu
     ln(name, 'v0,v5,x16', base, 'EF')
     ln(name, 'v0,v5,x16', base, 'EH')
 
+# Advanced SIMD three same extra (0 Q U 01110 size 0 Rm 1 opcode 1 Rn Rd) and
+# the dot products, matrix multiplies and complex arithmetic around it.
+# `q`: Vd of T's elements four times as wide; `u`: twice as wide, as many lanes.
+ln('sqrdmlah', 'v0,v5,v16', 0x2e008400, 'H4')
+ln('sqrdmlsh', 'v0,v5,v16', 0x2e008c00, 'H4')
+ARRS.update({'DOT': qset('8b', '16b'), 'M16': '16b:0', 'M8H': '8h:0', 'HH': '2h:0 4h:%x' % Q,
+             'CX': iset('4h', '8h', '2s', '4s', '2d'), 'CA': iset('4h', '8h', '2s', '4s', '2d'),
+             'C4': iset('4h', '8h', '4s'), 'F4S': '4s:0'})
+for name, base in (('sdot', 0x0e809400), ('udot', 0x2e809400), ('usdot', 0x0e809c00)):
+    ln(name, 'q0,v5,v16', base, 'DOT')
+for name, base in (('smmla', 0x4e80a400), ('ummla', 0x6e80a400), ('usmmla', 0x4e80ac00)):
+    ln(name, 'q0,v5,v16', base, 'M16')
+# fcmla Vd.T, Vn.T, Vm.T, #rot (rot at 11); fcadd ..., #90/#270 (rot at 12)
+ln('fcmla', 'v0,v5,v16,o11', 0x2e00c400, 'CX')
+ln('fcadd', 'v0,v5,v16,a12', 0x2e00e400, 'CA')
+# BF16: bfdot (Vd.2s/4s, Vn.4h/8h), bfmmla, bfmlalb/t, bfcvtn
+ln('bfdot', 'p0,v5,v16', 0x2e40fc00, 'FH')
+ln('bfmmla', 'p0,v5,v16', 0x6e40ec00, 'M8H')
+ln('bfmlalb', 'p0,v5,v16', 0x2ec0fc00, 'M8H')
+ln('bfmlalt', 'p0,v5,v16', 0x6ec0fc00, 'M8H')
+ln('bfcvtn', 'v0,w5', 0x0ea16800, 'FN0')
+ln('bfcvtn2', 'v0,w5', 0x4ea16800, 'FN20')
+ARRS.update({'FN0': '4h:0', 'FN20': '8h:0'})
+# FEAT_FHM: fmlal Vd.2s/4s, Vn.2h/4h, Vm.2h/4h (and the elements' high halves: 2)
+for name, base in (('fmlal', 0x0e20ec00), ('fmlal2', 0x2e20cc00), ('fmlsl', 0x0ea0ec00),
+                   ('fmlsl2', 0x2ea0cc00)):
+    ln(name, 'u0,v5,v16', base, 'HH')
+# by element: the dot products' groups (`g` .4b[i], `G` .2h[i]), fcmla (`c`),
+# fmlal and bfmlal (`x`: Vm.h[i])
+for name, base in (('sdot', 0x0f80e000), ('udot', 0x2f80e000), ('usdot', 0x0f80f000),
+                   ('sudot', 0x0f00f000)):
+    ln(name, 'q0,v5,g16', base, 'DOT')
+ln('bfdot', 'p0,v5,G16', 0x0f40f000, 'FH')
+ln('fcmla', 'v0,v5,c16,o13', 0x2f001000, 'C4')
+for name, base in (('fmlal', 0x0f800000), ('fmlal2', 0x2f808000), ('fmlsl', 0x0f804000),
+                   ('fmlsl2', 0x2f80c000)):
+    ln(name, 'u0,v5,x16', base, 'HH')
+ln('bfmlalb', 'p0,v5,x16', 0x0fc0f000, 'M8H')
+ln('bfmlalt', 'p0,v5,x16', 0x4fc0f000, 'M8H')
+
+# floating-point across lanes: 4s (single) and 4h/8h (FEAT_FP16); the result a scalar
+for name, base, hbase in (('fmaxnmv', 0x6e30c800, 0x0e30c800), ('fmaxv', 0x6e30f800, 0x0e30f800),
+                          ('fminnmv', 0x6eb0c800, 0x0eb0c800), ('fminv', 0x6eb0f800, 0x0eb0f800)):
+    ln(name, 'e0,v5', base, 'F4S')
+    ln(name, 'e0,v5', hbase, 'FH')
+# ext Vd.T, Vn.T, Vm.T, #index (bytes; imm4 at 11)
+ln('ext', 'v0,v5,v16,j11', 0x2e000000, 'B2')
+
+# ---------------------------------------------------------------------------
+# Advanced SIMD scalar: `S` a scalar register (b h s d) whose element is T;
+# the sets' members are element letters with the bits they set
+# ---------------------------------------------------------------------------
+def sset(*els, sz=False):
+    out = []
+    for e in els:
+        k = 'bhsd'.index(e)
+        if sz:
+            out.append('%s:%x' % (e, SZ if e == 'd' else 0))
+        else:
+            out.append('%s:%x' % (e, k << 22))
+    return ' '.join(out)
+
+
+ARRS.update({'SBHSD': sset('b', 'h', 's', 'd'), 'SD': sset('d'), 'SHS': sset('h', 's'),
+             'SBHS': sset('b', 'h', 's'), 'SFSD': sset('s', 'd', sz=True), 'SFH': 'h:0',
+             # shifts by immediate: immh has the size
+             'SID': 'd:0', 'SIBHSD': 'b:0 h:0 s:0 d:0', 'SIBHS': 'b:0 h:0 s:0', 'SIHSD': 'h:0 s:0 d:0',
+             # by element: size 01 h, 10 s, 11 d; the floating ones size 00 h
+             'SEHS': sset('h', 's'), 'SEF': 's:%x d:%x' % (2 << 22, 3 << 22), 'SEFH': 'h:0'})
+# scalar three same: 01 U 11110 size 1 Rm opcode 1 Rn Rd
+SC3 = [('sqadd', 0, 0x01, 'SBHSD'), ('sqsub', 0, 0x05, 'SBHSD'), ('cmgt', 0, 0x06, 'SD'),
+       ('cmge', 0, 0x07, 'SD'), ('sshl', 0, 0x08, 'SD'), ('sqshl', 0, 0x09, 'SBHSD'),
+       ('srshl', 0, 0x0a, 'SD'), ('sqrshl', 0, 0x0b, 'SBHSD'), ('add', 0, 0x10, 'SD'),
+       ('cmtst', 0, 0x11, 'SD'), ('sqdmulh', 0, 0x16, 'SHS'),
+       ('uqadd', 1, 0x01, 'SBHSD'), ('uqsub', 1, 0x05, 'SBHSD'), ('cmhi', 1, 0x06, 'SD'),
+       ('cmhs', 1, 0x07, 'SD'), ('ushl', 1, 0x08, 'SD'), ('uqshl', 1, 0x09, 'SBHSD'),
+       ('urshl', 1, 0x0a, 'SD'), ('uqrshl', 1, 0x0b, 'SBHSD'), ('sub', 1, 0x10, 'SD'),
+       ('cmeq', 1, 0x11, 'SD'), ('sqrdmulh', 1, 0x16, 'SHS')]
+for name, u, opc, arr in SC3:
+    ln(name, 'S0,S5,S16', 0x5e200400 | (u << 29) | (opc << 11), arr)
+ln('sqrdmlah', 'S0,S5,S16', 0x7e008400, 'SHS')
+ln('sqrdmlsh', 'S0,S5,S16', 0x7e008c00, 'SHS')
+# the floating-point ones (sz; FEAT_FP16's own encoding for h)
+SCF3 = [('fmulx', 0, 0, 0x1b), ('fcmeq', 0, 0, 0x1c), ('frecps', 0, 0, 0x1f), ('frsqrts', 0, 1, 0x1f),
+        ('fcmge', 1, 0, 0x1c), ('facge', 1, 0, 0x1d), ('fabd', 1, 1, 0x1a), ('fcmgt', 1, 1, 0x1c),
+        ('facgt', 1, 1, 0x1d)]
+for name, u, a, opc in SCF3:
+    ln(name, 'S0,S5,S16', 0x5e200400 | (u << 29) | (a << 23) | (opc << 11), 'SFSD')
+    ln(name, 'S0,S5,S16', 0x5e400400 | (u << 29) | (a << 23) | ((opc & 7) << 11), 'SFH')
+# scalar three different (Vd twice T's element: `f`)
+for name, opc in (('sqdmlal', 0x9), ('sqdmlsl', 0xb), ('sqdmull', 0xd)):
+    ln(name, 'f0,S5,S16', 0x5e200000 | (opc << 12), 'SHS')
+# scalar two-register miscellaneous: 01 U 11110 size 10000 opcode 10 Rn Rd
+SC2 = [('suqadd', 0, 0x03, 'S0,S5', 'SBHSD'), ('sqabs', 0, 0x07, 'S0,S5', 'SBHSD'),
+       ('cmgt', 0, 0x08, 'S0,S5,z', 'SD'), ('cmeq', 0, 0x09, 'S0,S5,z', 'SD'),
+       ('cmlt', 0, 0x0a, 'S0,S5,z', 'SD'), ('abs', 0, 0x0b, 'S0,S5', 'SD'),
+       ('sqxtn', 0, 0x14, 'S0,f5', 'SBHS'),
+       ('usqadd', 1, 0x03, 'S0,S5', 'SBHSD'), ('sqneg', 1, 0x07, 'S0,S5', 'SBHSD'),
+       ('cmge', 1, 0x08, 'S0,S5,z', 'SD'), ('cmle', 1, 0x09, 'S0,S5,z', 'SD'),
+       ('neg', 1, 0x0b, 'S0,S5', 'SD'), ('sqxtun', 1, 0x12, 'S0,f5', 'SBHS'),
+       ('uqxtn', 1, 0x14, 'S0,f5', 'SBHS')]
+for name, u, opc, ops, arr in SC2:
+    ln(name, ops, 0x5e200800 | (u << 29) | (opc << 12), arr)
+SCF2 = [('fcvtns', 0, 0, 0x1a, 'S0,S5'), ('fcvtms', 0, 0, 0x1b, 'S0,S5'), ('fcvtas', 0, 0, 0x1c, 'S0,S5'),
+        ('scvtf', 0, 0, 0x1d, 'S0,S5'), ('fcmgt', 0, 1, 0x0c, 'S0,S5,y'), ('fcmeq', 0, 1, 0x0d, 'S0,S5,y'),
+        ('fcmlt', 0, 1, 0x0e, 'S0,S5,y'), ('fcvtps', 0, 1, 0x1a, 'S0,S5'), ('fcvtzs', 0, 1, 0x1b, 'S0,S5'),
+        ('frecpe', 0, 1, 0x1d, 'S0,S5'), ('frecpx', 0, 1, 0x1f, 'S0,S5'),
+        ('fcvtnu', 1, 0, 0x1a, 'S0,S5'), ('fcvtmu', 1, 0, 0x1b, 'S0,S5'), ('fcvtau', 1, 0, 0x1c, 'S0,S5'),
+        ('ucvtf', 1, 0, 0x1d, 'S0,S5'), ('fcmge', 1, 1, 0x0c, 'S0,S5,y'), ('fcmle', 1, 1, 0x0d, 'S0,S5,y'),
+        ('fcvtpu', 1, 1, 0x1a, 'S0,S5'), ('fcvtzu', 1, 1, 0x1b, 'S0,S5'), ('frsqrte', 1, 1, 0x1d, 'S0,S5')]
+for name, u, a, opc, ops in SCF2:
+    ln(name, ops, 0x5e200800 | (u << 29) | (a << 23) | (opc << 12), 'SFSD')
+    ln(name, ops, 0x5e780800 | (u << 29) | (a << 23) | (opc << 12), 'SFH')
+ln('fcvtxn', 'S0,f5', 0x7e616800, 'SFS0')
+ARRS.update({'SFS0': 's:0'})
+# scalar pairwise: 01 U 11110 size 11000 opcode 10 Rn Rd (`e`: T's element)
+ARRS.update({'P2D': '2d:0', 'PF': '2s:0 2d:%x' % SZ, 'PH': '2h:0'})
+ln('addp', 'e0,v5', 0x5ef1b800, 'P2D')
+for name, base, hbase in (('faddp', 0x7e30d800, 0x5e30d800), ('fmaxnmp', 0x7e30c800, 0x5e30c800),
+                          ('fmaxp', 0x7e30f800, 0x5e30f800), ('fminnmp', 0x7eb0c800, 0x5eb0c800),
+                          ('fminp', 0x7eb0f800, 0x5eb0f800)):
+    ln(name, 'e0,v5', base, 'PF')
+    ln(name, 'e0,v5', hbase, 'PH')
+# scalar shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
+SCSH = [('sshr', 0, 0x00, 'r', 'SID'), ('ssra', 0, 0x02, 'r', 'SID'), ('srshr', 0, 0x04, 'r', 'SID'),
+        ('srsra', 0, 0x06, 'r', 'SID'), ('shl', 0, 0x0a, 'l', 'SID'), ('sqshl', 0, 0x0e, 'l', 'SIBHSD'),
+        ('scvtf', 0, 0x1c, 'r', 'SIHSD'), ('fcvtzs', 0, 0x1f, 'r', 'SIHSD'),
+        ('ushr', 1, 0x00, 'r', 'SID'), ('usra', 1, 0x02, 'r', 'SID'), ('urshr', 1, 0x04, 'r', 'SID'),
+        ('ursra', 1, 0x06, 'r', 'SID'), ('sri', 1, 0x08, 'r', 'SID'), ('sli', 1, 0x0a, 'l', 'SID'),
+        ('sqshlu', 1, 0x0c, 'l', 'SIBHSD'), ('uqshl', 1, 0x0e, 'l', 'SIBHSD'),
+        ('ucvtf', 1, 0x1c, 'r', 'SIHSD'), ('fcvtzu', 1, 0x1f, 'r', 'SIHSD')]
+for name, u, opc, k, arr in SCSH:
+    ln(name, 'S0,S5,' + k, 0x5f000400 | (u << 29) | (opc << 11), arr)
+for name, u, opc in (('sqshrn', 0, 0x12), ('sqrshrn', 0, 0x13), ('sqshrun', 1, 0x10),
+                     ('sqrshrun', 1, 0x11), ('uqshrn', 1, 0x12), ('uqrshrn', 1, 0x13)):
+    ln(name, 'S0,f5,r', 0x5f000400 | (u << 29) | (opc << 11), 'SIBHS')
+# scalar x indexed element: 01 U 11111 size L M Rm opcode H 0 Rn Rd
+for name, u, opc in (('sqdmulh', 0, 0xc), ('sqrdmulh', 0, 0xd), ('sqrdmlah', 1, 0xd), ('sqrdmlsh', 1, 0xf)):
+    ln(name, 'S0,S5,x16', 0x5f000000 | (u << 29) | (opc << 12), 'SEHS')
+for name, opc in (('sqdmlal', 0x3), ('sqdmlsl', 0x7), ('sqdmull', 0xb)):
+    ln(name, 'f0,S5,x16', 0x5f000000 | (opc << 12), 'SEHS')
+for name, u, opc in (('fmla', 0, 0x1), ('fmls', 0, 0x5), ('fmul', 0, 0x9), ('fmulx', 1, 0x9)):
+    ln(name, 'S0,S5,x16', 0x5f000000 | (u << 29) | (opc << 12), 'SEF')
+    ln(name, 'S0,S5,x16', 0x5f000000 | (u << 29) | (opc << 12), 'SEFH')
+
+# the three-different ones of h and s only (saturating doubling) and pmull
+# (8h from 8b; 1q from 1d with FEAT_PMULL)
+for name, opc in (('sqdmlal', 0x9), ('sqdmlsl', 0xb), ('sqdmull', 0xd)):
+    base = 0x0e200000 | (opc << 12)
+    ln(name, 'w0,v5,v16', base, 'EL')
+    ln(name + '2', 'w0,v5,v16', base, 'EL2')
+ARRS.update({'PM': '8b:0 1d:%x' % (3 << 22), 'PM2': '16b:%x 2d:%x' % (Q, Q | (3 << 22))})
+ln('pmull', 'w0,v5,v16', 0x0e20e000, 'PM')
+ln('pmull2', 'w0,v5,v16', 0x0e20e000, 'PM2')
+# bfcvt Hd, Sn (`e` would be T's element: the destination is half of it, `h`)
+ln('bfcvt', 'h0,S5', 0x1e634000, 'SFS0')
+
+# ---------------------------------------------------------------------------
+# Cryptographic extensions: AES, SHA1, SHA-256, SHA-512, SHA3, SM3, SM4
+# (`=q0`: a register of the fixed view q at bit 0, whatever the arrangement)
+# ---------------------------------------------------------------------------
+ARRS.update({'C4S': '4s:0', 'C2D': '2d:0'})
+for name, opc in (('aese', 0x4), ('aesd', 0x5), ('aesmc', 0x6), ('aesimc', 0x7)):
+    ln(name, 'v0,v5', 0x4e280800 | (opc << 12), 'M16')
+# SHA three-register: 01011110 000 Rm 0 opcode 00 Rn Rd
+for name, opc in (('sha1c', 0), ('sha1p', 1), ('sha1m', 2)):
+    ln(name, '=q0,=s5,v16', 0x5e000000 | (opc << 12), 'C4S')
+ln('sha1su0', 'v0,v5,v16', 0x5e003000, 'C4S')
+ln('sha256h', '=q0,=q5,v16', 0x5e004000, 'C4S')
+ln('sha256h2', '=q0,=q5,v16', 0x5e005000, 'C4S')
+ln('sha256su1', 'v0,v5,v16', 0x5e006000, 'C4S')
+# SHA two-register: 01011110 0010100 opcode 10 Rn Rd
+ln('sha1h', '=s0,=s5', 0x5e280800, 'C4S')
+ln('sha1su1', 'v0,v5', 0x5e281800, 'C4S')
+ln('sha256su0', 'v0,v5', 0x5e282800, 'C4S')
+# SHA-512 and SHA3: 11001110 011 Rm 1 0 00 opcode Rn Rd and the two-register forms
+ln('sha512h', '=q0,=q5,v16', 0xce608000, 'C2D')
+ln('sha512h2', '=q0,=q5,v16', 0xce608400, 'C2D')
+ln('sha512su1', 'v0,v5,v16', 0xce608800, 'C2D')
+ln('rax1', 'v0,v5,v16', 0xce608c00, 'C2D')
+ln('sha512su0', 'v0,v5', 0xcec08000, 'C2D')
+ln('eor3', 'v0,v5,v16,v10', 0xce000000, 'M16')
+ln('bcax', 'v0,v5,v16,v10', 0xce200000, 'M16')
+ln('xar', 'v0,v5,v16,m10', 0xce800000, 'C2D')
+# SM3 and SM4
+ln('sm3ss1', 'v0,v5,v16,v10', 0xce400000, 'C4S')
+for name, opc in (('sm3tt1a', 0), ('sm3tt1b', 1), ('sm3tt2a', 2), ('sm3tt2b', 3)):
+    ln(name, 'v0,v5,n16', 0xce408000 | (opc << 10), 'C4S')
+ln('sm3partw1', 'v0,v5,v16', 0xce60c000, 'C4S')
+ln('sm3partw2', 'v0,v5,v16', 0xce60c400, 'C4S')
+ln('sm4ekey', 'v0,v5,v16', 0xce60c800, 'C4S')
+ln('sm4e', 'v0,v5', 0xcec08400, 'C4S')
+
 print('''// =============================================================================
 // asm/a64tab.ax - the table of the AArch64 assembler's instruction forms
 // beyond those asm/a64.ax encodes by hand (asm/a64.ax, "The instruction
