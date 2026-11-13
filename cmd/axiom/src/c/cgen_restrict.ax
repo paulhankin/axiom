@@ -1,24 +1,69 @@
 // =============================================================================
 // cgen_restrict.ax - IR generation for C's restrict (6.7.3.1) on block-scope
-// pointer objects and on structure members: ir.IN_RSCOPE and ir.IN_RESTRICT
-// (see ir.ax for what they mean to the optimizer). Parameters are marked
-// ir.F_NOALIAS (cgen_stmt.ax), which holds while the function's own body
-// runs, and which inlining makes a scope (inline.ax).
+// pointer objects and on structure members: ir.IN_RSCOPE, ir.IN_RESTRICT and
+// the tags of loads, stores and calls (see ir.ax for what they mean to the
+// optimizer). Parameters are marked ir.F_NOALIAS (cgen_stmt.ax), which holds
+// while the function's own body runs, and which inlining makes a scope
+// (inline.ax).
 //
-// A block that declares restrict-qualified pointer objects begins a scope
-// where it begins (a function's body too): an
-// IN_RSCOPE, each object a number in it. A block with a label in it (or a
-// case or default label of a switch around it) has none: a jump into it
-// would bypass the IN_RSCOPE. Then the address of an access through such an
-// object, read in that scope (`*p`, `p[i]`, `p->m`, and the same with
-// `p + n`, `p - n` or a pointer cast for p, n without effects), is based on
-// IN_RESTRICT(p, scope, number) instead of p: the read's value goes nowhere
-// else, so every access based on it is in the block (a copy of p made in it
-// is a plain read, and accesses through the copy are not marked). Likewise
-// a read of a restrict-qualified member of a structure (not a union) for
-// an access: IN_RESTRICT(p, the structure's address, the member's offset).
+// Block scopes. A block that declares restrict-qualified pointer objects
+// (automatic, no linkage) begins a scope where it begins (a function's body
+// too): an IN_RSCOPE, in the scope of the block around it if that has one,
+// each object a number in it. A block with a label in it (or a case or
+// default label of a switch around it) has none: a jump into it would bypass
+// the IN_RSCOPE. While the block's code is made, every load, store and call
+// is tagged with its scope (ir.rtag). Once the function is made (finish),
+// each such object whose stack slot is only loaded and stored (its address
+// taken by nothing else: no `&p`, no nested function's use, no asm operand,
+// nothing volatile or atomic) gets IN_RESTRICT(v, scope, number) as every
+// value v it is given, unless v is its own value plus an offset (`p++`,
+// `p += n`, a select of such), which is based on its earlier value already.
+//
+// Why the optimizer's rules are sound (6.7.3.1p4: during each execution of
+// B, an object modified through an lvalue based on the restricted P is
+// accessed only through lvalues based on P, and P is not given a value based
+// on another restricted object of B):
+//   - The tags: an operation is tagged with scope s only if it was made
+//     inside the block's code, so it runs during an execution of the block
+//     (and of every block around it); a tag whose scope does not come before
+//     its operation (the WebAssembly back end's dispatch blocks, code
+//     reached otherwise) is dropped. The passes copy tags with their
+//     operations and never invent them (the inliner tags the copy of a
+//     callee with the call's scope: it runs during the call), and move them
+//     to the scope around when they drop a scope begun in a loop
+//     (opt.loop_restricts). Where two operations' tags are in s and s is in
+//     no cycle, both run in s's one instance in that call of the function;
+//     for a scope in a cycle only the rule between two restricted objects is
+//     used, whose addresses depend on s's value (ir.ax).
+//   - The values: each value the object is given is an IN_RESTRICT of it, or
+//     its earlier value plus offsets, so every value it has in the IR is
+//     based on one of its IN_RESTRICTs (through ptradds and mem2reg's phis),
+//     and so is every value computed from it by pointer arithmetic, copies,
+//     casts, phis and selects. A value that went through memory (the slot's
+//     address escapes: no marks at all; another object holding a copy: a
+//     load), through an integer or through a call has no root the rules
+//     accept (ir.rroot). So an access whose address is based in the IR on a
+//     parameter, a global, a stack slot, or another restricted object not
+//     based on P, is not based on P. ("Based on" is taken as the flow of the
+//     pointer value: an integer offset added to another pointer, which holds
+//     no pointer's bits within a few operations, and a comparison do not
+//     make an address based on P.)
+//   - Copies of P's value that leave the block (stored in an outer object,
+//     returned) are based on P, but the operations that use them after the
+//     block are not tagged with s: no rule applies to them.
+//
+// Structure members. A read of a restrict-qualified member of a structure
+// (not a union) whose member list is at file scope, made for an access
+// through it (`s.m[i]`, `*s.m`, `s.m->x`; not under `&` or in an array's
+// decay, whose address may go anywhere: g_addr), is IN_RESTRICT(p, the
+// structure's address, the member's offset); the read's value goes only to
+// that access. The block of 6.7.3.1p2 for such a member is main's (the
+// program's execution: what runs after main returns, exit's handlers, is
+// taken to be in it too), so two accesses through two of a structure
+// object's members are apart wherever they are.
 // =============================================================================
 import "../ir.ax" as ir;
+import "../opt.ax" as opt;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
@@ -32,9 +77,21 @@ let mut g_scope: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @pt
                                                                        cap: 0, len: 0 };
 let mut g_num: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
                                                  cap: 0, len: 0 };
+// The restricted objects of the function being generated that have a scope.
+let mut g_objs: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0), len: 0,
+                                                                    cap: 0 };
+
+/// Set while the address of an lvalue is made for something else than an
+/// access through it (`&e`, an array's decay): no member read is marked
+/// then (cgen_expr.ax sets and restores it).
+pub let mut g_addr: bool = false;
 
 fn key(s: *cast.CSym) []u8 {
     return u.addr_key(@int_from_ptr(s));
+}
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
 }
 
 // Is s a restricted pointer object?
@@ -43,58 +100,80 @@ fn restricted(s: *cast.CSym) bool {
            ((s.ty.quals & cty.Q_RESTRICT) != 0);
 }
 
-fn none() []mut *mut ir.Value {
-    let xs = u.newn.[*mut ir.Value](1);
-    return xs[0..0];
-}
-
-// A new scope here, its objects numbered from 0.
+// A new scope here, in the current one, its objects numbered from 0.
 fn open(syms: []*mut cast.CSym) void {
     if cg.terminated() {
         return;
     }
-    let t = ir.intr(cg.B, ir.IN_RSCOPE, ir.t_int(32), none());
+    let ps = u.newn.[*mut ir.Value](1);
+    let mut n: usize = 0;
+    if u.notnil(ir.rtag) and (ir.rtag.blk.fnp == cg.F.f) {
+        ps[0] = ir.rtag;
+        n = 1;
+    }
+    let t = ir.intr(cg.B, ir.IN_RSCOPE, ir.t_int(32), ps[0..n]);
+    cg.F.f.rscopes = true;
     let mut k: u64 = 0;
     for s in syms {
         g_scope.put(key(s), t);
         g_num.put(key(s), k);
+        g_objs.push(s);
         k += 1;
     }
+    ir.rtag = t;  // (what the block does is tagged with it)
 }
 
 /// The start of a function's body: a scope for the restricted objects its
 /// outermost block declares (its restrict parameters are ir.F_NOALIAS,
 /// which inlining makes a scope: inline.ax).
 pub fn function(body: []*mut cast.Stmt) void {
+    g_objs.clear();
+    g_addr = false;
+    ir.rtag = vnil();
     let mut syms = u.List.[*mut cast.CSym].empty();
+    defer syms.deinit();
     declared(body, &mut syms);
-    if syms.len > 0 {
-        open(syms.items());
+    if syms.len == 0 {
+        return;
     }
+    for x in body {
+        if has_label(x, false) {
+            return;
+        }
+    }
+    open(syms.items());
 }
 
 /// The start of a block of items `items` (a compound statement), or of a
 /// for statement s with a declaration: a scope if it declares restricted
-/// objects and has no label in it.
-pub fn block(items: []*mut cast.Stmt, s: *cast.Stmt) void {
+/// objects and has no label in it. Returns what to pass to close at its end.
+pub fn block(items: []*mut cast.Stmt, s: *cast.Stmt) *mut ir.Value {
+    let prev = ir.rtag;
     let mut syms = u.List.[*mut cast.CSym].empty();
+    defer syms.deinit();
     if u.notnil(s) {
         decl_syms(s.decl, &mut syms);
         if (syms.len == 0) or has_label(s.body, false) {
-            return;
+            return prev;
         }
     } else {
         declared(items, &mut syms);
         if syms.len == 0 {
-            return;
+            return prev;
         }
         for x in items {
             if has_label(x, false) {
-                return;
+                return prev;
             }
         }
     }
     open(syms.items());
+    return prev;
+}
+
+/// The end of a block that block began (prev: its result).
+pub fn close(prev: *mut ir.Value) void {
+    ir.rtag = prev;
 }
 
 fn declared(items: []*mut cast.Stmt, syms: *mut u.List.[*mut cast.CSym]) void {
@@ -110,7 +189,7 @@ fn decl_syms(d: *cast.Decl, syms: *mut u.List.[*mut cast.CSym]) void {
         return;
     }
     for x in d.decls.items() {
-        if restricted(x.sym) and (x.sym.linkage == cast.LK_NONE) {
+        if restricted(x.sym) and (x.sym.linkage == cast.LK_NONE) and (x.sym.duration == cast.SD_AUTO) {
             syms.push(x.sym);
         }
     }
@@ -138,28 +217,157 @@ fn has_label(s: *cast.Stmt, in_switch: bool) bool {
     return has_label(s.body, sw) or has_label(s.els, sw);
 }
 
-// Has e no effects (so that its value cannot hold a pointer it reads)?
-fn no_effects(e: *cast.Expr) bool {
-    if u.isnil(e) or e.is_const {
-        return true;
+// -----------------------------------------------------------------------------
+// The end of a function: tags checked, the restricted objects' values marked
+// -----------------------------------------------------------------------------
+
+// Does scope s come before instruction i (earlier in i's block, or in a
+// block that dominates i's)? seen: the scopes before i in its block.
+fn before(s: *mut ir.Value, i: *ir.Value, seen: *mut u.SymMap.[bool]) bool {
+    if s.blk == i.blk {
+        return seen.get(u.addr_key(@int_from_ptr(s)));
     }
-    let k = e.kind;
-    if (k == cast.ExprKind.CALL) or (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.POSTFIX) or
-       (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.VA_ARG) or
-       (k == cast.ExprKind.COND) or (k == cast.ExprKind.COMMA) or
-       ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
-        return false;
-    }
-    for x in e.args.items() {
-        if not no_effects(x) {
-            return false;
-        }
-    }
-    return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+    return opt.dominates(s.blk, i.blk);
 }
 
-// The read of a restricted pointer that pointer expression e is, plus
-// offsets (a CV_LOAD cast of the object), or nil.
+// Drops the tags and scope operands of f whose scope does not come before
+// them.
+fn check_tags(f: *mut ir.Func) void {
+    let mut seen = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ir.has_tag_slot(i) and u.notnil(i.c) {
+                if not ir.is_rscope(i.c) or not before(i.c, i, &mut seen) {
+                    i.c = vnil();
+                }
+            } else if ir.is_rscope(i) {
+                let p = ir.rscope_parent(i);
+                if (i.xs.len > 0) and (u.isnil(p) or not before(p, i, &mut seen)) {
+                    i.xs.clear();
+                }
+                seen.put(u.addr_key(@int_from_ptr(i)), true);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Is v (stored in the slot a) a's own value plus offsets: a load of a,
+// offset by ptradds, or a select of two such?
+fn own_value(v0: *mut ir.Value, a: *mut ir.Value, depth: i32) bool {
+    let mut v = v0;
+    while ir.is_op(v, ir.OP_PTRADD) {
+        v = v.a;
+    }
+    if ir.is_op(v, ir.OP_LOAD) {
+        return v.a == a;
+    }
+    if ir.is_op(v, ir.OP_SELECT) and (depth < 4) {
+        return own_value(v.b, a, depth + 1) and own_value(v.c, a, depth + 1);
+    }
+    return false;
+}
+
+// Does instruction i use the slot a otherwise than as the address of a load
+// or the address a store stores a value at?
+fn other_use(i: *ir.Value, a: *mut ir.Value) bool {
+    if i.op == ir.OP_LOAD {
+        return false;  // (its address, or none)
+    }
+    if i.op == ir.OP_STORE {
+        return i.a == a;
+    }
+    if (i.a == a) or (i.b == a) or ((i.c == a) and not ir.has_tag_slot(i)) {
+        return true;
+    }
+    for x in i.xs.items() {
+        if x == a {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Marks the values of the restricted object in slot a, of scope t and
+// number k, if its slot is only loaded and stored (as a pointer, not
+// volatile or atomic) and t comes before every store.
+fn mark_object(f: *mut ir.Func, a: *mut ir.Value, t: *mut ir.Value, k: u64) void {
+    let mut stores = u.List.[*mut ir.Value].empty();
+    defer stores.deinit();
+    let mut seen = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i == t {
+                seen.put(u.addr_key(@int_from_ptr(t)), true);
+            }
+            if other_use(i, a) {
+                return;
+            }
+            if ((i.op == ir.OP_LOAD) and (i.a == a)) or ((i.op == ir.OP_STORE) and (i.b == a)) {
+                if (i.flags != 0) or ((i.op == ir.OP_LOAD) and (i.ty.kind != ir.T_PTR)) or
+                   ((i.op == ir.OP_STORE) and (i.a.ty.kind != ir.T_PTR)) {
+                    return;
+                }
+                if i.op == ir.OP_STORE {
+                    if not before(t, i, &mut seen) {
+                        return;
+                    }
+                    stores.push(i);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let bd = ir.new_builder();
+    for st in stores.items() {
+        if not own_value(st.a, a, 0) {
+            ir.at_before(bd, st);
+            let mut xs: [3]*mut ir.Value = [st.a, t, ir.cint(ir.t_int(64), k)];
+            st.a = ir.intr(bd, ir.IN_RESTRICT, st.a.ty, xs[..]);
+        }
+    }
+}
+
+/// The end of function f's generation (once its blocks are final): the
+/// tags whose scopes do not come before them dropped, and the restricted
+/// objects' values marked (see the header).
+pub fn finish(f: *mut ir.Func) void {
+    ir.rtag = vnil();
+    g_addr = false;
+    if not f.rscopes {
+        g_objs.clear();
+        return;
+    }
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    order.deinit();
+    check_tags(f);
+    for s in g_objs.items() {
+        let t = g_scope.get(key(s));
+        if u.isnil(t) or u.isvnil(s.ir) or u.isnil(t.blk) or (t.blk.fnp != f) {
+            continue;
+        }
+        let a = @ptr_cast(*mut ir.Value, s.ir);
+        if not ir.is_op(a, ir.OP_ALLOCA) or u.isnil(a.blk) or (a.blk.fnp != f) {
+            continue;
+        }
+        mark_object(f, a, t, g_num.get(key(s)));
+    }
+    g_objs.clear();
+}
+
+// -----------------------------------------------------------------------------
+// Restrict-qualified members
+// -----------------------------------------------------------------------------
+
+// The read of a restrict-qualified member that pointer expression e is,
+// plus offsets (a CV_LOAD cast of the member), or nil.
 fn read_of(e: *cast.Expr) *cast.Expr {
     if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind != cty.TK_POINTER) {
         return u.nil.[cast.Expr]();
@@ -167,9 +375,6 @@ fn read_of(e: *cast.Expr) *cast.Expr {
     if e.kind == cast.ExprKind.CAST {
         if e.op == cast.CV_LOAD {
             let x = e.a;
-            if (x.kind == cast.ExprKind.IDENT) and restricted(x.sym) {
-                return e;
-            }
             if (x.kind == cast.ExprKind.MEMBER) and u.notnil(x.ty) and ((x.ty.quals & cty.Q_RESTRICT) != 0) and
                struct_member(x) {
                 return e;
@@ -192,7 +397,30 @@ fn read_of(e: *cast.Expr) *cast.Expr {
     return u.nil.[cast.Expr]();
 }
 
-// Is member access x (a.m, p->m) a member of a structure (not a union)?
+// Has e no effects (so that its value cannot hold a pointer it reads)?
+fn no_effects(e: *cast.Expr) bool {
+    if u.isnil(e) or e.is_const {
+        return true;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.CALL) or (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.POSTFIX) or
+       (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.VA_ARG) or
+       (k == cast.ExprKind.COND) or (k == cast.ExprKind.COMMA) or
+       ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
+        return false;
+    }
+    for x in e.args.items() {
+        if not no_effects(x) {
+            return false;
+        }
+    }
+    return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+}
+
+// Is member access x (a.m, p->m) a member of a structure (not a union)
+// whose member list is at file scope? (Then the block of 6.7.3.1p2 is
+// main's, the whole execution of the program; one in a block may run again,
+// in a loop, where each execution is another, with no tags for it here.)
 fn struct_member(x: *cast.Expr) bool {
     let mut t = x.a.ty;
     if u.isnil(t) {
@@ -204,20 +432,22 @@ fn struct_member(x: *cast.Expr) bool {
         }
         t = t.elem;
     }
-    return u.notnil(t) and (t.unq.kind == cty.TK_STRUCT);
+    return u.notnil(t) and (t.unq.kind == cty.TK_STRUCT) and u.notnil(t.unq.tag) and not t.unq.tag.in_block;
 }
 
-/// The address v of pointer expression e (generated just now, for an
-/// access through it): based on an IN_RESTRICT if e is a restricted
-/// pointer's read in its scope, or a restrict-qualified member's, plus
-/// offsets.
+/// The address v of pointer expression e (generated just now): based on an
+/// IN_RESTRICT if e is a restrict-qualified member's read, plus offsets,
+/// and the address is for an access through it (not g_addr).
 pub fn wrap(e: *cast.Expr, v: *mut ir.Value) *mut ir.Value {
+    if g_addr {
+        return v;
+    }
     let r = read_of(e);
     if u.isnil(r) or u.isnil(v) {
         return v;
     }
     // the read: the load under v's ptradds
-    let mut user = u.nil.[ir.Value]();
+    let mut user = vnil();
     let mut x = v;
     while ir.is_op(x, ir.OP_PTRADD) {
         user = x;
@@ -226,26 +456,12 @@ pub fn wrap(e: *cast.Expr, v: *mut ir.Value) *mut ir.Value {
     if not ir.is_op(x, ir.OP_LOAD) or (x.ty.kind != ir.T_PTR) or ((x.flags & ir.F_VOLATILE) != 0) {
         return v;
     }
-    let o = r.a;
-    let mut s = u.nil.[ir.Value]();
+    // (the structure's address and the member's offset in it)
+    let mut s = x.a;
     let mut k: u64 = 0;
-    if o.kind == cast.ExprKind.IDENT {
-        let t = g_scope.get(key(o.sym));
-        if u.isnil(t) or u.isvnil(o.sym.ir) or (x.a != @ptr_cast(*mut ir.Value, o.sym.ir)) or (t.blk.fnp != cg.F.f) {
-            return v;
-        }
-        s = t;
-        k = g_num.get(key(o.sym));
-    } else {
-        // (the structure's address and the member's offset in it)
-        let mut a = x.a;
-        let mut off: u64 = 0;
-        while ir.is_op(a, ir.OP_PTRADD) and ir.is_cint(a.b) {
-            off = off +% ir.cint_val(a.b);
-            a = a.a;
-        }
-        s = a;
-        k = off;
+    while ir.is_op(s, ir.OP_PTRADD) and ir.is_cint(s.b) {
+        k = k +% ir.cint_val(s.b);
+        s = s.a;
     }
     let cur = ir.insert_block(cg.B);
     if u.notnil(x.next) {

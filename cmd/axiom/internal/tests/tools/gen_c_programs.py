@@ -34,9 +34,16 @@ restrict-qualified pointers, only in the uses C allows (6.7.3.1): block-scope
 restricted pointers into different arrays (one written, one read), or into one
 array only read, a block in a loop's body whose two restricted pointers
 reach different elements in each iteration (the next iteration's overlap the
-last's), a structure with restrict-qualified members into different arrays,
+last's), a structure (of a type declared at file scope) with restrict-qualified
+members into different arrays,
 and calls of static inline functions with restrict parameters, given
-different arrays.
+different arrays; and against other accesses: a block's restricted pointer
+into one array with the other read by its name, pointers based on the
+restricted one (a copy, a conditional, a cast; through memory and an
+integer; an inner block's restricted pointer; a function's plain parameter)
+writing what it reads, a copy used after the block with the array's own
+name, and a block in a loop's body whose restricted pointer writes what the
+array's name reads in the next iteration.
 """
 import random
 import sys
@@ -700,7 +707,7 @@ class Gen:
         T = spell(t)
         kind = self.r.randint(0, 9)
         if self.restrict and self.chance(0.5):
-            kind = self.r.randint(10, 14)
+            kind = self.r.randint(10, 21)
         b = ['%s{' % ind, '%s    unsigned lo_ = %s, hi_ = %s, ii;' % (ind, lo, hi)]
         i2 = ind + '    '
         # (the arithmetic of an element: unsigned for integers)
@@ -708,8 +715,10 @@ class Gen:
             mix = lambda x, y: '%s * (%s)0.5 + %s' % (x, T, y)
         else:
             mix = lambda x, y: '(%s)((unsigned long long)%s * 3u + (unsigned long long)%s)' % (T, x, y)
-        if kind >= 10 and kind != 11 and kind != 12 and src == name:
-            kind = 11  # (one array: through restricted pointers only read, or apart each iteration)
+        if kind in (10, 13, 14, 15, 16, 18, 19, 21) and src == name:
+            # (one array: through restricted pointers only read, apart each
+            # iteration, or reached through other pointers after the block)
+            kind = self.pick([11, 12, 17, 20])
         if kind == 10:
             # block-scope restricted pointers into two arrays
             b.append('%s{ %s *restrict d_ = %s + %d; const %s *restrict s_ = %s + %d;' % (i2, T, name, dx, T, src, dy))
@@ -731,12 +740,58 @@ class Gen:
             b.append('%s}' % i2)
         elif kind == 13:
             # restrict-qualified members into two arrays
-            b.append('%s{ struct { %s *restrict d; const %s *restrict s; } r_ = { %s + %d, %s + %d };'
-                     % (i2, T, T, name, dx, src, dy))
+            b.append('%s{ struct rm_%s r_ = { %s + %d, %s + %d };' % (i2, t, name, dx, src, dy))
             b.append('%s  for (ii = lo_; ii < hi_; ii++) r_.d[ii] = %s; }' % (i2, mix('r_.s[ii]', 'r_.d[ii]')))
         elif kind == 14:
             # an inlined function's restrict parameters, two arrays
             b.append('%sif (hi_ > lo_) rmix_%s(%s + lo_ + %d, %s + lo_ + %d, hi_ - lo_);' % (i2, t, name, dx, src, dy))
+        elif kind == 15:
+            # a block's restricted pointer into one array, the other read by
+            # its name (not based on it)
+            b.append('%s{ %s *restrict d_ = %s + %d;' % (i2, T, name, dx))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) d_[ii] = %s; }' % (i2, mix('%s[ii + %d]' % (src, dy), 'd_[ii]')))
+        elif kind == 16:
+            # pointers based on the restricted one (a copy, a conditional,
+            # a cast) writing what it reads
+            b.append('%s{ %s *restrict d_ = %s + %d; %s *q_ = (lo_ & 1) ? d_ : (%s *)(void *)d_;'
+                     % (i2, T, name, dx, T, T))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) { d_[ii] = %s; q_[ii] = %s; } }'
+                     % (i2, mix('%s[ii + %d]' % (src, dy), 'd_[ii]'), mix('d_[ii]', 'q_[ii]')))
+        elif kind == 17:
+            # a copy of the restricted pointer used after its block, with
+            # the array's own name
+            b.append('%s{ %s *e_; { %s *restrict d_ = %s + %d; e_ = d_;' % (i2, T, T, name, dx))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) d_[ii] = %s; }' % (i2, mix('d_[ii]', 'd_[ii]')))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) { e_[ii] = %s; %s[ii + %d] = %s; } }'
+                     % (i2, mix('%s[ii + %d]' % (name, dx), 'e_[ii]'), name, dx, mix('e_[ii]', '%s[ii + %d]' % (name, dx))))
+        elif kind == 18:
+            # a pointer based on the restricted one through memory and an
+            # integer, the other array read by its name
+            b.append('%s{ %s *restrict d_ = %s + %d; %s *box_[1]; box_[0] = d_; %s *volatile *vb_ = box_;'
+                     % (i2, T, name, dx, T, T))
+            b.append('%s  %s *q_ = vb_[0]; %s *w_ = (%s *)(unsigned long long)q_;' % (i2, T, T, T))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) { d_[ii] = %s; w_[ii] = %s; } }'
+                     % (i2, mix('%s[ii + %d]' % (src, dy), 'q_[ii]'), mix('w_[ii]', 'd_[ii]')))
+        elif kind == 19:
+            # an inner block's restricted pointer based on the outer one's,
+            # the other array read by its name in both
+            b.append('%s{ %s *restrict d_ = %s + %d;' % (i2, T, name, dx))
+            b.append('%s  { %s *restrict e_ = d_; for (ii = lo_; ii < hi_; ii++) e_[ii] = %s; }'
+                     % (i2, T, mix('%s[ii + %d]' % (src, dy), 'e_[ii]')))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) d_[ii] = %s; }' % (i2, mix('d_[ii]', '%s[ii + %d]' % (src, dy))))
+        elif kind == 20:
+            # a block in the loop's body: its restricted pointer writes the
+            # element the array's name reads in the next iteration
+            b.append('%sfor (ii = lo_; ii + 1 < hi_; ii++) {' % i2)
+            b.append('%s    %s *restrict a_ = %s + ii + 1;' % (i2, T, name))
+            b.append('%s    a_[0] = %s;' % (i2, mix('%s[ii]' % name, 'a_[0]')))
+            b.append('%s}' % i2)
+        elif kind == 21:
+            # the restricted pointer passed to a function that writes
+            # through its plain parameter (inlined into the block)
+            b.append('%s{ %s *restrict d_ = %s + %d;' % (i2, T, name, dx))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) rput_%s(d_ + ii, %s); }'
+                     % (i2, t, mix('%s[ii + %d]' % (src, dy), 'd_[ii]')))
         elif kind == 0:
             b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = %s[ii + %d];' % (i2, name, dx, src, dy))
         elif kind == 1:
@@ -1035,6 +1090,8 @@ class Gen:
                 o.append('static inline void rmix_%s(%s *restrict d, const %s *restrict s, unsigned n) {' % (t, T, T))
                 o.append('    for (unsigned i = 0; i < n; i++) d[i] = %s;' % e)
                 o.append('}')
+                o.append('static inline void rput_%s(%s *d, %s v) { *d = v; }' % (t, T, T))
+                o.append('struct rm_%s { %s *restrict d; const %s *restrict s; };' % (t, T, T))
         for i in range(self.r.randint(0, 4)):
             self.gen_struct(i)
         genv = {'vars': [], 'arrays': [], 'fields': [], 'ptrs': [], 'svars': [], 'struct_globals': {}, 'pure': [],

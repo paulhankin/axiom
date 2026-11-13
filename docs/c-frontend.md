@@ -78,9 +78,11 @@ lists the diagnostics.
   argument, `abi.add_chain`) and the trampoline pools, and the non-local gotos to its
   local labels (a `jmp_buf` armed before each call).
 - **restrict** beyond parameters: cgen_restrict.ax marks a block's restricted pointer
-  objects and restrict-qualified members (`ir.IN_RSCOPE`, `ir.IN_RESTRICT`, which
-  `ir.restrict_apart` reads); inline.ax makes an inlined call of a function with
-  restrict parameters a scope.
+  objects' values and restrict-qualified members' reads (`ir.IN_RSCOPE`,
+  `ir.IN_RESTRICT`), and tags the loads, stores and calls made in the block with its
+  scope (`ir.rtag`), which `ir.restrict_apart` and `ir.restrict_tagged` read; its header
+  argues why that is sound. inline.ax makes an inlined call of a function with restrict
+  parameters a scope and tags the inlined code.
 - **Format checks**: csema_format.ax, from the attribute `format` (csema_gnu.ax).
 - **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
   `dd` `dl` constants; `__STDC_IEC_60559_DFP__`; Annex H's `_Decimal64x`, `d64x`,

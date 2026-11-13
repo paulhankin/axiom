@@ -65,6 +65,7 @@ struct Write {
     lmin: i32,  // a lower bound of the offset (from obj, or from base) whatever rok says; LMIN_NONE: none
     rlo: i64,
     rhi: i64,
+    tag: *mut ir.Value,  // the restrict scope of the operation (ir.tag_of), or nil
 }
 
 struct Loc {
@@ -76,6 +77,7 @@ struct Loc {
     lmin: i32,  // the offset from obj (or base) is at least lmin (min_offset), or LMIN_NONE
     rlo: i64,
     rhi: i64,
+    tag: *mut ir.Value,  // the restrict scope of the operation (ir.tag_of), or nil
 }
 
 // (no lower bound known; lmin sits in the padding after rok, so the
@@ -482,7 +484,7 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     }
     let lm = min_offset(p0);
     return Loc.{ base: base, obj: obj, off: off, size: size, rok: r.ok and
-                 u.notnil(obj), lmin: lmin_of(lm), rlo: r.lo, rhi: r.hi };
+                 u.notnil(obj), lmin: lmin_of(lm), rlo: r.lo, rhi: r.hi, tag: vnil() };
 }
 
 // Where in the shadow stack record: 0 the depth, 2 the call site slots.
@@ -576,7 +578,18 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if ir.restrict_apart(root_of(x.base, x.obj), root_of(w.base, w.obj)) {
         return false;
     }
+    // (and on a block's restricted objects: both operations in its scope)
+    if u.notnil(x.tag) and u.notnil(w.tag) and ir.restrict_tagged(x.base, x.tag, w.base, w.tag) {
+        return false;
+    }
     return true;
+}
+
+// The location operation i (a load or store) accesses at p, tagged.
+fn loc_at(i: *ir.Value, p: *mut ir.Value, size: i64) Loc {
+    let mut l = loc_of(p, size);
+    l.tag = ir.tag_of(i);
+    return l;
 }
 
 // The root an access's address is based on, for ir.restrict_apart: its
@@ -810,11 +823,12 @@ fn from_param(p0: *ir.Value) bool {
 
 fn push_write(kind: i32, l: Loc) void {
     writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, lmin: l.lmin,
-                        rlo: l.rlo, rhi: l.rhi });
+                        rlo: l.rlo, rhi: l.rhi, tag: l.tag });
 }
 
 fn nowhere() Loc {
-    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1, rok: false, lmin: LMIN_NONE, rlo: 0, rhi: 0 };
+    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1, rok: false, lmin: LMIN_NONE, rlo: 0, rhi: 0,
+                 tag: vnil() };
 }
 
 // Marks allocas whose address stays private (aux2 = 1): used only as the
@@ -955,7 +969,7 @@ fn note_writes(i: *mut ir.Value) void {
         if i.flags != 0 {
             push_write(W_ALL, nowhere());
         } else {
-            push_write(W_LOC, loc_of(i.b, @bit_cast(i64, i.a.ty.size)));
+            push_write(W_LOC, loc_at(i, i.b, @bit_cast(i64, i.a.ty.size)));
         }
     } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
         push_write(W_LOC, loc_of(i.a, size_of(i.c)));
@@ -1205,7 +1219,7 @@ fn narrowed_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
         let mut d: i64 = 0;
         while (d + size) <= w {
             let wl = Loc.{ base: l.base, obj: l.obj, off: l.off - d, size: w, rok: l.rok, lmin: lmin_add(l.lmin, 0 - d),
-                           rlo: l.rlo - d, rhi: l.rhi - d };
+                           rlo: l.rlo - d, rhi: l.rhi - d, tag: l.tag };
             let x = find_mem(&wl, ir.t_int(@truncate(i32, w * 8)));
             if u.notnil(x) {
                 if u.isnil(B) {
@@ -1309,7 +1323,7 @@ fn quiet_since(h: usize, l: *Loc) bool {
 
 fn sub_loc(l: *Loc, off: i64, size: i64) Loc {
     return Loc.{ base: l.base, obj: l.obj, off: l.off + off, size: size, rok: l.rok, lmin: lmin_add(l.lmin, off),
-                 rlo: l.rlo + off, rhi: l.rhi + off };
+                 rlo: l.rlo + off, rhi: l.rhi + off, tag: l.tag };
 }
 
 // The value of load i (at l) from its copy's source, or nil.
@@ -1350,7 +1364,7 @@ fn forward_copy(i: *mut ir.Value, l: *Loc) *mut ir.Value {
         let src = loc_of(c.b, n);
         let sl = sub_loc(&src, from, size);
         let dw = Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: x.off, size: n, rok: false, lmin: LMIN_NONE,
-                         rlo: 0, rhi: 0 };
+                         rlo: 0, rhi: 0, tag: vnil() };
         if may_alias(&sl, &dw) or not quiet_since(x.height, &sl) {
             return vnil();
         }
@@ -3197,7 +3211,7 @@ fn visit_block(b: *mut ir.Block) void {
             if i.flags != 0 {
                 note_writes(i);
             } else {
-                let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+                let l = loc_at(i, i.a, @bit_cast(i64, i.ty.size));
                 let mut r = find_mem(&l, i.ty);
                 if u.isnil(r) {
                     r = compose_load(i, &l);
@@ -3221,7 +3235,7 @@ fn visit_block(b: *mut ir.Block) void {
             if i.flags != 0 {
                 note_writes(i);
             } else {
-                let l = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+                let l = loc_at(i, i.b, @bit_cast(i64, i.a.ty.size));
                 let r = find_mem(&l, i.a.ty);
                 if u.notnil(r) and (ir.resolve(r) == i.a) {
                     ir.remove_inst(i);  // memory already holds the value
@@ -3299,7 +3313,8 @@ pub fn gvn(f: *mut ir.Func) bool {
         B = ir.new_builder();
     }
     g_fn = f;
-    sw_of = vnil();  // (switch_case_to's table: made again in each walk)
+    _ = opt.rscope_cycles(f);  // (C's restrict: ir.restrict_tagged)
+    sw_of = vnil();            // (switch_case_to's table: made again in each walk)
     changed = false;
     opt.compute_preds(f);
     let order = opt.dominators(f);
@@ -3578,7 +3593,7 @@ fn pre_loads(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
 }
 
 fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mut ir.Value) void {
-    let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+    let l = loc_at(i, i.a, @bit_cast(i64, i.ty.size));
     if not avail_over(l.base, b) {
         return;
     }
@@ -3665,7 +3680,7 @@ fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mu
 // -----------------------------------------------------------------------------
 fn loc_write(l: *Loc) Write {
     return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, lmin: l.lmin,
-                   rlo: l.rlo, rhi: l.rhi };
+                   rlo: l.rlo, rhi: l.rhi, tag: l.tag };
 }
 
 // Is a covered by b (both exact)?
@@ -3759,7 +3774,7 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
                 at_ret = false;
                 ss_reads();
             } else {
-                let l = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+                let l = loc_at(i, i.b, @bit_cast(i64, i.a.ty.size));
                 let sf = ss_field(&l);
                 let mut dead = at_ret and private_obj(l.obj) and not has_obj(read_objs, l.obj);
                 if (sf == 2) and (ss_dead or uses_any(i.b, &restored, 0)) {
@@ -3786,7 +3801,7 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
                 at_ret = false;
                 ss_reads();
             } else {
-                let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+                let l = loc_at(i, i.a, @bit_cast(i64, i.ty.size));
                 read_loc(killed, &l);
                 if noalias_global(l.obj) and (ss_field(&l) != 0) {
                     ss_reads();
@@ -3864,6 +3879,7 @@ pub fn dse(f: *mut ir.Func) bool {
         return false;
     }
     escapes(f);
+    _ = opt.rscope_cycles(f);  // (C's restrict: ir.restrict_tagged)
     let mut killed = u.List.[Loc].empty();
     let mut read_objs = u.List.[*mut ir.Value].empty();
     let mut any = false;

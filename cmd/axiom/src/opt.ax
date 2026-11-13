@@ -969,20 +969,89 @@ let mut make_insts: bool = false;
 
 let mut rs_tag: i64 = 0x4000_0000_0000;
 
+/// Marks C's restrict scopes (ir.IN_RSCOPE) of f that are in a cycle of its
+/// blocks (ir.F_RCYCLE), and clears the mark of the others: before a pass
+/// that relies on it (ir.restrict_tagged). False if f has none.
+pub fn rscope_cycles(f: *mut ir.Func) bool {
+    if not f.rscopes {
+        return false;
+    }
+    let mut any = false;
+    let mut work = u.List.[*mut ir.Block].empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ir.is_rscope(i) {
+                any = true;
+                i.flags = i.flags & ~ir.F_RCYCLE;
+                if reaches_itself(b, &mut work) {
+                    i.flags = i.flags | ir.F_RCYCLE;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    work.deinit();
+    return any;
+}
+
+// Does a path of one or more edges lead from b back to b?
+fn reaches_itself(b: *mut ir.Block, work: *mut u.List.[*mut ir.Block]) bool {
+    rs_tag += 1;
+    work.clear();
+    work.push(b);
+    while work.len > 0 {
+        let x = work.pop();
+        let t = ir.terminator(x);
+        for k in 0..ir.succ_count(t) {
+            let y = ir.succ(t, k);
+            if y == b {
+                return true;
+            }
+            if y.mark != rs_tag {
+                y.mark = rs_tag;
+                work.push(y);
+            }
+        }
+    }
+    return false;
+}
+
+// The nearest scope around restrict scope s that is not gone, or nil.
+fn kept_parent(s: *mut ir.Value, gone: *mut u.SymMap.[bool]) *mut ir.Value {
+    let mut p = ir.rscope_parent(s);
+    let mut n: i32 = 0;
+    while u.notnil(p) and gone.get(u.addr_key(@int_from_ptr(p))) and (n < 64) {
+        p = ir.rscope_parent(p);
+        n += 1;
+    }
+    if n >= 64 {
+        return u.nil.[ir.Value]();
+    }
+    return p;
+}
+
 /// C's restrict scopes (ir.IN_RSCOPE) that begin inside a loop: their
 /// restricted pointers' reads (ir.IN_RESTRICT) become the pointers again,
-/// before the passes that move code out of loops and transform them. What
-/// such a scope says holds within one iteration (an execution of its
-/// block), which value numbering has used; the loop passes reason about
-/// all iterations, and there the reads, which depend on the scope, would
-/// keep the addresses from being invariant or sequences.
+/// and what their operations' tags and their inner scopes said of them is
+/// said of the scope around them, before the passes that move code out of
+/// loops and transform them. What such a scope says holds within one
+/// iteration (an execution of its block), which value numbering has used;
+/// the loop passes reason about all iterations, and there the reads, which
+/// depend on the scope, would keep the addresses from being invariant or
+/// sequences. Then the scopes in cycles are marked (rscope_cycles).
 pub fn loop_restricts(f: *mut ir.Func) void {
+    if not f.rscopes {
+        return;
+    }
     let mut scopes = u.List.[*mut ir.Value].empty();
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_RSCOPE) {
+            if ir.is_rscope(i) {
                 scopes.push(i);
             }
             i = i.next;
@@ -1011,6 +1080,14 @@ pub fn loop_restricts(f: *mut ir.Func) void {
         }
     }
     if gone.len > 0 {
+        // (each gone scope's replacement: the nearest kept scope around it)
+        let mut repl = u.SymMap.[*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Value](), cap: 0,
+                                                  len: 0 };
+        for t in scopes.items() {
+            if gone.get(u.addr_key(@int_from_ptr(t))) {
+                repl.put(u.addr_key(@int_from_ptr(t)), kept_parent(t, &mut gone));
+            }
+        }
         b = f.first;
         while u.notnil(b) {
             let mut i = b.first;
@@ -1020,6 +1097,16 @@ pub fn loop_restricts(f: *mut ir.Func) void {
                    gone.get(u.addr_key(@int_from_ptr(ir.resolve(i.xs.get(1))))) {
                     ir.forward(i, ir.resolve(i.xs.get(0)));
                     ir.remove_inst(i);
+                } else if ir.has_tag_slot(i) and u.notnil(i.c) and
+                          gone.get(u.addr_key(@int_from_ptr(ir.resolve(i.c)))) {
+                    i.c = repl.get(u.addr_key(@int_from_ptr(ir.resolve(i.c))));
+                } else if ir.is_rscope(i) and not gone.get(u.addr_key(@int_from_ptr(i))) and (i.xs.len == 1) and
+                          gone.get(u.addr_key(@int_from_ptr(ir.resolve(i.xs.get(0))))) {
+                    let p = repl.get(u.addr_key(@int_from_ptr(ir.resolve(i.xs.get(0)))));
+                    i.xs.clear();
+                    if u.notnil(p) {
+                        i.xs.push(p);
+                    }
                 }
                 i = next;
             }
@@ -1036,6 +1123,7 @@ pub fn loop_restricts(f: *mut ir.Func) void {
     members.deinit();
     hs.deinit();
     order.deinit();
+    _ = rscope_cycles(f);
 }
 
 /// The object size intrinsics left in f: their values (objsize's last).
@@ -1060,8 +1148,10 @@ pub fn finish_objsizes(f: *mut ir.Func) void {
                 ir.forward(i, ir.resolve(i.xs.get(0)));
                 ir.remove_inst(i);
             } else if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_RSCOPE) {
-                ir.forward(i, ir.cint(i.ty, 0));
+                ir.forward(i, ir.czero(i.ty));
                 ir.remove_inst(i);
+            } else if ir.has_tag_slot(i) {
+                i.c = u.nil.[ir.Value]();  // (its tag, if any)
             }
             i = next;
         }

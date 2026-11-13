@@ -161,24 +161,32 @@ fn scope_copy(m: *mut InlScopes, s: u32) u32 {
 }
 
 // C's restrict parameters (ir.F_NOALIAS) hold while g's body runs, which
-// its copy in f does not tell: with two or more, the call becomes a scope
-// of its own (ir.IN_RSCOPE before it), and the arguments for them are read
-// as restricted pointers of it (ir.IN_RESTRICT), numbered as the
-// parameters are.
-fn restrict_scope(g: *mut ir.Func, c: *mut ir.Value, args: *mut u.List.[*mut ir.Value]) void {
+// its copy in f does not tell: with one or more, the call becomes a scope
+// of its own (ir.IN_RSCOPE before it, in the scope the call is tagged
+// with), and the arguments for them are the values of restricted pointers
+// of it (ir.IN_RESTRICT), numbered as the parameters are: in g every use of
+// such a parameter is its value, and the copy's loads, stores and calls are
+// tagged with the scope (inline_call). Returns the scope, or nil.
+fn restrict_scope(g: *mut ir.Func, c: *mut ir.Value, args: *mut u.List.[*mut ir.Value]) *mut ir.Value {
     let mut n: usize = 0;
     for k in 0..@min(g.params.len, args.len) {
-        if (g.params[k].flags & ir.F_NOALIAS) != 0 {
+        if ((g.params[k].flags & ir.F_NOALIAS) != 0) and (args.get(k).ty.kind == ir.T_PTR) {
             n += 1;
         }
     }
-    if n < 2 {
-        return;
+    if n == 0 {
+        return u.nil.[ir.Value]();
     }
     let bd = ir.new_builder();
     ir.at_before(bd, c);
     let none = u.newn.[*mut ir.Value](1);
-    let t = ir.intr(bd, ir.IN_RSCOPE, ir.t_int(32), none[0..0]);
+    let outer = ir.tag_of(c);
+    let mut ps = none[0..0];
+    if u.notnil(outer) {
+        none[0] = outer;
+        ps = none[0..1];
+    }
+    let t = ir.intr(bd, ir.IN_RSCOPE, ir.t_int(32), ps);
     for k in 0..@min(g.params.len, args.len) {
         let a = args.get(k);
         if ((g.params[k].flags & ir.F_NOALIAS) != 0) and (a.ty.kind == ir.T_PTR) {
@@ -186,6 +194,7 @@ fn restrict_scope(g: *mut ir.Func, c: *mut ir.Value, args: *mut u.List.[*mut ir.
             args.set(k, ir.intr(bd, ir.IN_RESTRICT, a.ty, xs[..]));
         }
     }
+    return t;
 }
 
 // Inlines call c (in f) of g.
@@ -199,7 +208,13 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     for k in 0..c.xs.len {
         args.push(ir.resolve(c.xs.get(k)));
     }
-    restrict_scope(g, c, &mut args);
+    let mut rs = restrict_scope(g, c, &mut args);
+    if u.isnil(rs) {
+        rs = ir.tag_of(c);
+    }
+    if g.rscopes or u.notnil(rs) {
+        f.rscopes = true;
+    }
     // the continuation: everything after the call
     let cont = ir.append_block(f, "inl.cont");
     ir.move_block_after(cont, b);
@@ -291,6 +306,12 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
         }
         y.t1 = map_blk(y.t1);
         y.t2 = map_blk(y.t2);
+        if u.notnil(rs) and ir.has_tag_slot(y) and u.isnil(ir.tag_of(y)) {
+            y.c = rs;  // (executed in the restrict scope: tag_copies)
+        } else if u.notnil(rs) and ir.is_rscope(y) and u.isnil(ir.rscope_parent(y)) {
+            y.xs.clear();
+            y.xs.push(rs);
+        }
         if y.op == ir.OP_RET {
             if u.notnil(y.a) {
                 rets.push(y.a);

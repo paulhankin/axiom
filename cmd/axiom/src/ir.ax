@@ -666,28 +666,49 @@ pub const IN_CAS16: i32 = 116;
 // level folds what is left, so no backend sees it. Pure.
 pub const IN_OBJSIZE: i32 = 117;
 // C's restrict on pointers other than parameters (6.7.3.1), made only by the
-// C front end (cgen_expr.ax), and removed by the last pass over a function
+// C front end (c/cgen_restrict.ax, whose header gives the soundness
+// argument) and the inliner, and removed by the last pass over a function
 // (passes.finish_funcs, at every level: no backend sees them).
-// IN_RSCOPE() -> i32: an execution of a block of C that declares restricted
-// pointer objects begins (a function's body, for its restrict parameters):
-// each time it runs is another instance of the scope. A hint, kept where it
-// is and never merged with another, copied with its block (inlining,
-// unrolling: each copy is a scope of its own); its value means nothing.
-// IN_RESTRICT(p, s, k) -> ptr: p, read from a restricted pointer object to
-// access memory through it (an address based on it, through ptradds, phis
-// and selects: based_restrict). Pure. Either s is an IN_RSCOPE and k (a
-// constant) numbers the restricted objects of that scope, or s is the
-// address of a structure object and k (a constant) the offset in it of the
-// restrict-qualified member p was read from. Two accesses through
-// addresses based on IN_RESTRICTs a and b (one of them a write) are apart
-// (restrict_apart) when a and b have the same IN_RSCOPE s and different k
-// (two restricted objects of one block, neither based on the other within
-// it, 6.7.3.1p4, and both accesses in the same execution of the block,
-// since the addresses depend on s: an IN_RESTRICT of a scope begun in a
-// loop is not invariant in it), or the same structure address s and
-// different k (two restrict-qualified members of one structure object);
-// and an access through a member's read whose structure address s is a
-// stack slot or a global is apart from one based on s itself.
+// IN_RSCOPE(parent?) -> i32: an execution of a block of C that declares
+// restricted pointer objects begins (a function's body, for its restrict
+// parameters once inlined): each time it runs is another instance of the
+// scope. Its operand, if any, is the scope of the block it is in (another
+// IN_RSCOPE, which dominates it). A hint, kept where it is and never merged
+// with another, copied with its block (inlining, unrolling: each copy is a
+// scope of its own); its value means nothing. The same intrinsic of type
+// ptr, without operands, stands for a structure object that scalar
+// replacement took apart (sroa.ax), in IN_RESTRICT's s below.
+// Loads, stores and calls executed in such a block (in an instance of the
+// scope: the front end's and the inliner's, the only ones that know) carry
+// the innermost IN_RSCOPE as their operand c, their "tag" (tag_of; nothing
+// else gives those operations a c); in a block it is in an enclosing
+// scope's instance too. An operation without a tag may be anywhere.
+// IN_RESTRICT(p, s, k) -> ptr: p, the value of a restricted object.
+// Pure. Either s is an IN_RSCOPE (i32) and k (a constant) numbers the
+// restricted pointer objects of that scope, and every value of the object
+// is such an IN_RESTRICT or based on one (stores of other values are
+// marked: an address based on the object in the IR is based on one of its
+// IN_RESTRICTs, through ptradds, phis and selects, unless it went through
+// memory, an integer or a call, which no rule here sees through); or s is
+// the address of a structure object (ptr) and k the offset in it of the
+// restrict-qualified member p was read from, for an access through it only.
+// Two accesses, one of them a write, are apart (restrict_apart,
+// restrict_tagged) when:
+//   - both are tagged in instance s, based on IN_RESTRICTs of s with
+//     different k (two restricted objects of one block, neither based on
+//     the other within it, 6.7.3.1p4); for a scope in a cycle too, since
+//     what passes compare across iterations depends on s's value;
+//   - both are tagged in instance s, one based on an IN_RESTRICT (s, k), the
+//     other on a parameter, a global, a stack slot or IN_RESTRICTs of other
+//     objects not based on (s, k) (an object not based on the restricted
+//     one: 6.7.3.1p4 again), when s is in no cycle of the function
+//     (F_RCYCLE clear: then all its tagged operations are of its one
+//     instance, while a known value from before the scope may meet writes of
+//     another iteration's instance in a loop);
+//   - their addresses are based on IN_RESTRICTs with the same structure
+//     address s and different k (two restrict-qualified members of one
+//     structure object), or one is a member's read whose structure address
+//     s is a stack slot or a global and the other is based on s itself.
 pub const IN_RSCOPE: i32 = 118;
 pub const IN_RESTRICT: i32 = 119;
 
@@ -1302,15 +1323,16 @@ pub fn restrict_apart(ra0: *Value, rb0: *Value) bool {
     return distinct_root(ra) and distinct_root(rb);
 }
 
-// Are IN_RESTRICTs a and b two restricted pointer objects of one scope, or
-// two restrict-qualified members of one structure object (IN_RESTRICT)?
+// Are IN_RESTRICTs a and b two restrict-qualified members of one structure
+// object (IN_RESTRICT)? (Two restricted objects of a block scope need the
+// operations' tags: restrict_tagged.)
 fn scoped_apart(a: *Value, b: *Value) bool {
     if (a.xs.len != 3) or (b.xs.len != 3) {
         return false;
     }
     let sa = resolve(a.xs.get(1));
     let sb = resolve(b.xs.get(1));
-    if (sa != sb) or not is_cint(a.xs.get(2)) or not is_cint(b.xs.get(2)) {
+    if (sa != sb) or (sa.ty.kind != T_PTR) or not is_cint(a.xs.get(2)) or not is_cint(b.xs.get(2)) {
         return false;
     }
     return cint_val(a.xs.get(2)) != cint_val(b.xs.get(2));
@@ -1330,6 +1352,205 @@ fn in_own_struct(r: *Value, o: *Value) bool {
         return false;
     }
     return @int_from_ptr(s) == @int_from_ptr(o);
+}
+
+/// Is v a block's restrict scope (IN_RSCOPE of type i32; not a structure
+/// object's)?
+pub fn is_rscope(v: *Value) bool {
+    return is_op(v, OP_INTR) and (intr_id(v) == IN_RSCOPE) and (v.ty.kind == T_INT);
+}
+
+/// The scope that restrict scope s is in (its operand), or nil.
+pub fn rscope_parent(s: *Value) *mut Value {
+    if s.xs.len == 1 {
+        let p = resolve(s.xs.get(0));
+        if is_rscope(p) {
+            return p;
+        }
+    }
+    return u.nil.[Value]();
+}
+
+/// Does operation i (a load, store or call) take its operand c as its tag,
+/// the restrict scope it is executed in (see IN_RSCOPE)?
+pub fn has_tag_slot(i: *Value) bool {
+    return (i.kind == V_INST) and ((i.op == OP_LOAD) or (i.op == OP_STORE) or (i.op == OP_CALL));
+}
+
+/// The restrict scope operation i is tagged with (IN_RSCOPE), or nil.
+pub fn tag_of(i: *Value) *mut Value {
+    if u.isnil(i) or not has_tag_slot(i) or u.isnil(i.c) {
+        return u.nil.[Value]();
+    }
+    let t = resolve(i.c);
+    if is_rscope(t) {
+        return t;
+    }
+    return u.nil.[Value]();
+}
+
+/// The C front end's: the restrict scope that the loads, stores and calls
+/// made now are tagged with (nil: none). Only for the function it is in.
+pub let mut rtag: *mut Value = @ptr_from_int(*mut Value, 0);
+
+// Tags operation v (just made by bd) with rtag.
+fn tag_new(bd: *Builder, v: *mut Value) void {
+    if u.notnil(rtag) and u.notnil(rtag.blk) and (rtag.blk.fnp == bd.blk.fnp) {
+        v.c = rtag;
+    }
+}
+
+// Is t (a tag, or nil) in scope instance s: s or a scope around it?
+fn in_rscope(t0: *Value, s: *Value) bool {
+    let mut t = t0;
+    let mut n: i32 = 0;
+    while u.notnil(t) and (n < 64) {
+        if t == s {
+            return true;
+        }
+        t = rscope_parent(t);
+        n += 1;
+    }
+    return false;
+}
+
+// May integer x (an address's offset) hold the bits of a pointer converted
+// to an integer, within a few operations? (Then the address may be based on
+// that pointer, not on the one it is offset from.)
+fn holds_ptr(x0: *mut Value, depth: i32) bool {
+    let x = resolve(x0);
+    if u.isnil(x) or (x.kind != V_INST) {
+        return false;
+    }
+    if x.op == OP_PTRTOINT {
+        return true;
+    }
+    if depth >= 4 {
+        return false;
+    }
+    let op = x.op;
+    if (op == OP_ADD) or (op == OP_SUB) or (op == OP_MUL) or (op == OP_SHL) or (op == OP_AND) or (op == OP_OR) or
+       (op == OP_XOR) or (op == OP_SDIV) or (op == OP_UDIV) or (op == OP_ASHR) or (op == OP_LSHR) {
+        return holds_ptr(x.a, depth + 1) or holds_ptr(x.b, depth + 1);
+    }
+    if (op == OP_SEXT) or (op == OP_ZEXT) or (op == OP_TRUNC) {
+        return holds_ptr(x.a, depth + 1);
+    }
+    return false;
+}
+
+// The root of address p for restrict_tagged: the IN_RESTRICT, parameter,
+// global or stack slot it is based on through ptradds (whose offsets hold
+// no pointer's bits: holds_ptr), and phis and selects whose operands all
+// have that root (or step from the phi itself); else nil.
+fn rroot(p0: *mut Value, depth: i32) *mut Value {
+    let mut p = resolve(p0);
+    let mut n: i32 = 0;
+    while is_op(p, OP_PTRADD) and (n < 32) {
+        if holds_ptr(p.b, 0) {
+            return u.nil.[Value]();
+        }
+        p = resolve(p.a);
+        n += 1;
+    }
+    if u.isnil(p) {
+        return p;
+    }
+    if (p.kind == V_PARAM) or (p.kind == V_GLOBAL) or is_op(p, OP_ALLOCA) or is_restrict_root(p) {
+        return p;
+    }
+    if (depth >= 4) or (p.kind != V_INST) or ((p.op != OP_PHI) and (p.op != OP_SELECT)) {
+        return u.nil.[Value]();
+    }
+    let mut r = u.nil.[Value]();
+    let mut n_ops: usize = 2;
+    if p.op == OP_PHI {
+        n_ops = p.xs.len;
+    }
+    for k in 0..n_ops {
+        let mut x = u.nil.[Value]();
+        if p.op == OP_PHI {
+            x = p.xs.get(k);
+        } else if k == 0 {
+            x = p.b;
+        } else {
+            x = p.c;
+        }
+        let mut y = resolve(x);
+        let mut m: i32 = 0;
+        while is_op(y, OP_PTRADD) and (m < 32) {
+            y = resolve(y.a);
+            m += 1;
+        }
+        if y != p {
+            let q = rroot(x, depth + 1);
+            if u.isnil(q) or (u.notnil(r) and (q != r)) {
+                return u.nil.[Value]();
+            }
+            r = q;
+        }
+    }
+    return r;
+}
+
+// Is root r (rroot's) not based on restricted object k of scope s: a
+// parameter, a global, a stack slot, or the read of another restricted
+// object whose value is not based on it either?
+fn not_based(r0: *mut Value, s: *mut Value, k: u64) bool {
+    let mut r = r0;
+    let mut n: i32 = 0;
+    while u.notnil(r) and (n < 8) {
+        if (r.kind == V_PARAM) or (r.kind == V_GLOBAL) or is_op(r, OP_ALLOCA) {
+            return true;
+        }
+        if not is_restrict_root(r) or (r.xs.len != 3) {
+            return false;
+        }
+        if (resolve(r.xs.get(1)) == s) and is_cint(r.xs.get(2)) and (cint_val(r.xs.get(2)) == k) {
+            return false;
+        }
+        r = rroot(r.xs.get(0), 0);
+        n += 1;
+    }
+    return false;
+}
+
+// restrict_tagged's rules with the restricted object's read ra (rroot of the
+// one access, tagged ta) first, rb (of the other, tagged tb) second.
+fn tagged_apart(ra: *mut Value, ta: *Value, rb: *mut Value, tb: *Value) bool {
+    if not is_restrict_root(ra) or (ra.xs.len != 3) or not is_cint(ra.xs.get(2)) {
+        return false;
+    }
+    let s = resolve(ra.xs.get(1));
+    if not is_rscope(s) or not in_rscope(ta, s) or not in_rscope(tb, s) {
+        return false;
+    }
+    let k = cint_val(ra.xs.get(2));
+    if is_restrict_root(rb) and (rb.xs.len == 3) and (resolve(rb.xs.get(1)) == s) {
+        // (two objects of the scope: apart; one: not)
+        return is_cint(rb.xs.get(2)) and (cint_val(rb.xs.get(2)) != k);
+    }
+    if (s.flags & F_RCYCLE) != 0 {
+        return false;
+    }
+    return not_based(rb, s, k);
+}
+
+/// Are the accesses at addresses pa and pb, by operations tagged ta and tb
+/// (tag_of, or nil), apart by C's restrict on block-scope objects (see
+/// IN_RESTRICT: both executed in a scope's instance, one through one of its
+/// restricted objects, the other through another or through something not
+/// based on it)?
+pub fn restrict_tagged(pa: *mut Value, ta: *Value, pb: *mut Value, tb: *Value) bool {
+    if u.isnil(pa) or u.isnil(pb) or u.isnil(ta) or u.isnil(tb) {
+        return false;
+    }
+    let ra = rroot(pa, 0);
+    let rb = rroot(pb, 0);
+    if u.isnil(ra) or u.isnil(rb) or (ra == rb) {
+        return false;
+    }
+    return tagged_apart(ra, ta, rb, tb) or tagged_apart(rb, tb, ra, ta);
 }
 
 /// Are a and b two different objects: globals (not aliases of one another)
@@ -1420,13 +1641,16 @@ pub const F_NO_WRAP: u32 = 24;
 // parameter, a global or a stack slot (based_param, gvn.may_alias,
 // idioms.ax); nothing else (a pointer loaded from memory may be based on
 // it). A copy of the function's body elsewhere (inlining) has no
-// parameter, so the fact is not carried there.
+// parameter: the inliner makes the call a restrict scope (IN_RSCOPE).
 pub const F_NOALIAS: u32 = 0x10000;
 // F_NONNULL: a pointer parameter that is never null when the function is
 // called (C's attribute nonnull, a parameter declared `[static n]`: a call
 // with a null pointer there is undefined): passes may fold a test of it
 // against null (known_nonnull). Not carried to a copy of the body elsewhere.
 pub const F_NONNULL: u32 = 0x20000;
+// IN_RSCOPE flags: the scope is in a cycle of its function's blocks (as
+// opt.rscope_cycles last found: the passes that rely on it find it first)
+pub const F_RCYCLE: u32 = 0x40000;
 // Alloca flags
 pub const F_VAR: u32 = 32;  // a C variable: -O0 keeps it in memory (opt.mem2reg), where debuggers find it
 // An fcmp of an ordered relation (<, <=, >, >=) that signals: "invalid" for
@@ -2106,6 +2330,7 @@ pub struct Func {
     // optimized (its objects stay in memory, their slots apart), not inlined,
     // no sibling calls or shrink-wrapping (passes.ax, inline.ax, the backends)
     returns_twice: bool,
+    rscopes: bool,   // it has (or had) C's restrict scopes (IN_RSCOPE): the C front end's, the inliner's
     hot: bool,       // C's attribute hot: the inliner allows its calls, and the calls in it, twice the size
     section: []u8,   // the object file section it goes in (C's attribute section), or empty
     visibility: u8,  // C's attribute visibility (and #pragma GCC visibility): VIS_
@@ -4491,6 +4716,7 @@ pub fn load(bd: *mut Builder, t: *mut Ty, p: *mut Value) *mut Value {
     let v = emit(bd, OP_LOAD, t);
     v.a = p;
     v.align = @int_cast(u32, t.align);
+    tag_new(bd, v);
     return v;
 }
 
@@ -4499,6 +4725,7 @@ pub fn store(bd: *mut Builder, x: *mut Value, p: *mut Value) *mut Value {
     v.a = x;
     v.b = p;
     v.align = @int_cast(u32, x.ty.align);
+    tag_new(bd, v);
     return v;
 }
 
@@ -4691,6 +4918,7 @@ pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut
         v.xs.push(x);
     }
     set_ext(v, u.perm_newn.[u8](args.len + 1)[0..args.len + 1]);
+    tag_new(bd, v);
     return v;
 }
 

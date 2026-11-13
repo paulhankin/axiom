@@ -19,6 +19,12 @@
   restrict-qualified members of one structure object, are apart: loads after stores are
   forwarded, loops vectorized without an overlap check), and a function's restrict
   parameters keep telling it once the function is inlined (the call becomes a scope).
+  A block's restricted pointer is also apart from everything not based on it within
+  the block (parameters, globals, locals, other pointers), through copies, arithmetic,
+  casts and loops' pointers, inlined calls included; a local structure with
+  restrict-qualified members is still taken apart into registers. A copy of a restricted
+  pointer used after its block, or a pointer to restricted members taken with `&`, was
+  taken as apart from another such copy before.
 - `#pragma GCC optimize`, `target`, `push_options`, `pop_options` and `reset_options`
   give the functions defined after them their optimization level and extensions (as the
   attributes `optimize` and `target`); `#pragma GCC unroll n`, `ivdep` and `novector`

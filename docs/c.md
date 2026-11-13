@@ -2974,19 +2974,27 @@ parameter, a global or a local object while the function runs (6.7.3.1): loads m
 of loops past stores through it, and copy and vector loops need no overlap check. A
 pointer loaded from memory may hold its value, and is not taken as apart from it.
 
-Within a block that declares restrict-qualified pointer objects (and has no label in it,
-which a jump could enter it by), an access through one of them, as `*p`, `p[i]`,
-`p->m`, or the same with `p + n`, `p - n` or a cast of p, is taken as apart from one
-through another of them while the block runs (6.7.3.1: neither is based on the other
-there, p4), in each of its executions: a loop's iterations, each a new execution of a
-block in its body, are not taken as apart. When a function with two or more restrict
-parameters is inlined, its call is such a block, with its parameters for those objects,
-so what they tell survives inlining. Likewise an access through a restrict-qualified
-member of a structure (not a union) read for it is apart from one through another such
-member of the same structure object (the same address), and, when that object is a
-local or static one, from an access to the object itself. Accesses through a copy of a
-restricted pointer (`q = p; *q`) are not marked. The IR marks them with `IN_RSCOPE` and
-`IN_RESTRICT` (`ir.ax`), which the last pass removes.
+Within a block that declares restrict-qualified pointer objects (automatic ones, in a
+block with no label in it, which a jump could enter it by), an access through one of them
+(through any pointer based on it: arithmetic, casts, copies, conditionals, a loop's
+pointer, an inner block's restricted pointer) is taken as apart from one through another
+of them, and from one through anything not based on it (a parameter, a global, a local
+object, another restricted pointer), while the block runs (6.7.3.1p4), in each of its
+executions. Only accesses made in the block count: a copy of the pointer used after the
+block, an access after it, one in another iteration of a loop the block is in, and one
+through a pointer that went through memory, an integer or a call (which may be based on
+it) are not taken as apart; nor are any of an object whose address is taken (`&p`). When
+a function with restrict parameters is inlined, its call is such a block for its body,
+with its parameters for those objects, and the code of an inlined function is in the
+blocks its call is in, so what they tell survives inlining. Likewise an access through a
+restrict-qualified member of a structure (not a union) read for it is apart from one
+through another such member of the same structure object, and, when that object is a
+local or static one, from an access to the object itself; a local structure with such
+members is still taken apart into its members' values. "Based on" is the flow of the
+pointer's value: an integer added to another pointer, and a comparison, do not make an
+address based on the restricted one. The IR marks these with `IN_RSCOPE`,
+`IN_RESTRICT` and the tags of loads, stores and calls (`ir.ax`; the argument that this
+is sound is in `c/cgen_restrict.ax`), which the last pass removes.
 
 A parameter that the attribute `nonnull` names (a GNU dialect), or that is declared
 `[static n]` (6.7.6.3p7), and the result of a call of a function declared

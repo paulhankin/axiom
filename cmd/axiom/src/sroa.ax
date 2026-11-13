@@ -32,6 +32,9 @@ struct Part {
     write: *mut ir.Value,  // the last write seen
     uses: u.List.[*mut ir.Value],
     leaves: u.List.[Leaf],
+    // C's restrict-qualified members read from it (ir.IN_RESTRICT, its
+    // address their operand s): the slot's identity, not an access
+    rmarks: u.List.[*mut ir.Value],
 }
 
 fn vnil() *mut ir.Value {
@@ -315,6 +318,16 @@ fn classify(i: *mut ir.Value) void {
         }
         return;
     }
+    // (a restrict-qualified member's read: ir.IN_RESTRICT with the slot as
+    // the structure object; its value is a use like any other)
+    if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_RESTRICT) and (i.xs.len == 3) {
+        let p = part_of(i.xs.get(1));
+        if u.notnil(p) and (i.xs.get(1) == p.a) {
+            escape(i.xs.get(0));
+            p.rmarks.push(i);
+            return;
+        }
+    }
     // any other use lets the address escape
     escape(i.a);
     escape(i.b);
@@ -398,6 +411,21 @@ fn rewrite(f: *mut ir.Func, p: *mut Part) void {
             }
             ir.remove_inst(i);
         }
+    }
+}
+
+// The slot p is taken apart or deleted: the restrict-qualified members read
+// from it name the structure object by a token of their own (ir.IN_RSCOPE
+// of type ptr, where the slot was).
+fn retoken(p: *mut Part) void {
+    if p.rmarks.len == 0 {
+        return;
+    }
+    ir.at_before(B, p.a);
+    let none = u.newn.[*mut ir.Value](1);
+    let t = ir.intr(B, ir.IN_RSCOPE, ir.t_ptr(), none[0..0]);
+    for m in p.rmarks.items() {
+        m.xs.set(1, t);
     }
 }
 
@@ -596,17 +624,19 @@ pub fn sroa(f: *mut ir.Func) bool {
         if not p.reads {
             defer_partners(p);
             delete_writes(p);
+            retoken(p);
             ir.remove_inst(p.a);
             any = true;
         } else if const_copy(p) {
             // only ever a copy of constant memory: read the constant
+            retoken(p);
             ir.remove_inst(p.write);
             ir.forward(p.a, p.write.b);
             ir.remove_inst(p.a);
             any = true;
         } else if p.split_ok or int_leaves_fit(p) {
             // a scalar slot accessed only with its own type is mem2reg's
-            let mut trivial = (p.leaves.len == 1) and (p.leaves.get(0).ty == ir.aty_of(p.a));
+            let mut trivial = (p.leaves.len == 1) and (p.leaves.get(0).ty == ir.aty_of(p.a)) and (p.rmarks.len == 0);
             for ui in 0..p.uses.len {
                 let i = p.uses.get(ui);
                 if (i.op != ir.OP_LOAD) and (i.op != ir.OP_STORE) {
@@ -623,6 +653,7 @@ pub fn sroa(f: *mut ir.Func) bool {
                 }
                 defer_partners(p);
                 rewrite(f, p);
+                retoken(p);
                 ir.remove_inst(p.a);
                 any = true;
             }
@@ -632,6 +663,7 @@ pub fn sroa(f: *mut ir.Func) bool {
         let p = parts.get(k);
         p.uses.deinit();
         p.leaves.deinit();
+        p.rmarks.deinit();
     }
     if any {
         ir.apply_forwarding(f);
