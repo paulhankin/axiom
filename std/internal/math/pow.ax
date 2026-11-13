@@ -144,50 +144,40 @@ pub inline fn sqrt(x: f64, rep: m.Rep) f64 {
     return @sqrt(x);
 }
 
-/// The cube root: |x| = 2^(3k + j) f, f in [1, 2), j in {0, 1, 2}; an
-/// estimate cbrt(f) 2^(j/3) from a polynomial (CBRT_P, within 2^-19.6), one
-/// Newton step (2^-39), then one with the residual 2^j f - y^3 in
-/// double-double, which leaves an error far below an ulp.
+/// The cube root: |x| = 2^(3k + j) f, f in [1, 2), j in {0, 1, 2}, and
+/// m = 2^j f; with c the middle of m's 64th of its binade (CBRT_T, by m's
+/// top bits), cbrt m = cbrt(c) (1 + t)^(1/3), t = (m - c)/c (m - c exact,
+/// |t| <= 1/129), from a polynomial (CBRT_Q, within 2^-59.9) and cbrt c as
+/// a double-double, without a division: rounded once at the end, within
+/// 0.5 + 2^-7 ulp.
 pub inline fn cbrt(x: f64) f64 {
     let ix = m.bits(x);
     let ax = ix & 0x7fffffffffffffff;
-    if (ax >= 0x7ff0000000000000) or (ax == 0) {
+    if (ax -% 1) >= (0x7ff0000000000000 - 1) {
         return x + x;  // +-0, +-inf, NaN
     }
     let mut a = m.from_bits(ax);
-    let mut e = m.exponent(a);
-    if e == 0 {
+    // u = e + 54 (e the biased exponent, from -53 for the subnormals scaled
+    // by 2^54), so that u >= 1 and u - 1077 = 3k + j (1077 = 3 359)
+    let mut u = @truncate(u32, ax >> 52) + 54;
+    if u == 54 {
         a = a * 18014398509481984.0;  // 2^54
-        e = m.exponent(a) - 54;
+        u = @truncate(u32, m.bits(a) >> 52);
     }
-    let ub = e - 1023;
-    // k = floor(ub / 3), j = ub - 3k
-    let mut k = ub / 3;
-    if (ub - (3 * k)) < 0 {
-        k -= 1;
-    }
-    let j = ub - (3 * k);
-    let f = m.from_bits((m.bits(a) & 0x000fffffffffffff) | 0x3ff0000000000000);
-    let mm = f * m.pow2(j);
-    let f2 = f * f;
-    let p = ((t.CBRT_P0 + (f * t.CBRT_P1)) + (f2 * (t.CBRT_P2 + (f * t.CBRT_P3)))) +
-            ((f2 * f2) * (t.CBRT_P4 + (f * t.CBRT_P5)));
-    // (without a branch: j is unpredictable)
-    let sc: [3]f64 = [1.0, t.CBRT2, t.CBRT4];
-    let mut y = p * sc[@as(usize, @bit_cast(u32, j))];
-    // one division: w = 1/(3 y^2) serves both steps (in the second, w is
-    // within 2^-18.6 of 1/(3 y^2) for the new y, which multiplies a
-    // correction of 2^-39 relative)
-    let yy = y * y;
-    let w = 1.0 / (3.0 * yy);
-    y = y - (((yy * y) - mm) * w);
-    // y + (mm - y^3) w, the residual exact
-    let y2 = m.two_sqr(y);
-    let y3 = m.dd_mul_d(y2, y);
-    let res = (mm - y3.hi) - y3.lo;
-    let r = y + (res * w);
-    // 2^k r with x's sign
-    return m.from_bits((m.bits(r) +% (@bit_cast(u64, @as(i64, k)) << 52)) | (ix & 0x8000000000000000));
+    let q = u / 3;
+    let j = u - (3 * q);
+    // m = 2^j f, its interval's row and middle
+    let mm = m.from_bits((m.bits(a) & 0x000fffffffffffff) | (@as(u64, j + 1023) << 52));
+    let row = @min(@as(usize, (j * 64) + @truncate(u32, (m.bits(a) >> 46) & 63)), 191) * 3;
+    let c = m.from_bits((m.bits(mm) & 0xffffc00000000000) | 0x0000200000000000);
+    let tt = (mm - c) * m.from_bits(t.CBRT_T[row]);
+    let t2 = tt * tt;
+    let p = ((t.CBRT_Q0 + (tt * t.CBRT_Q1)) + (t2 * (t.CBRT_Q2 + (tt * t.CBRT_Q3)))) +
+            ((t2 * t2) * (t.CBRT_Q4 + (tt * t.CBRT_Q5)));
+    let ch = m.from_bits(t.CBRT_T[row + 1]);
+    let r = ch + (((ch * tt) * p) + m.from_bits(t.CBRT_T[row + 2]));
+    // 2^k r with x's sign, k = q - 359
+    return m.from_bits((m.bits(r) +% ((@as(u64, q) -% 359) << 52)) | (ix & 0x8000000000000000));
 }
 
 /// sqrt(x^2 + y^2) without undue overflow or underflow: the sum of the
@@ -216,11 +206,19 @@ pub inline fn hypot(x: f64, y: f64, rep: m.Rep) f64 {
         b = b * m.pow2(600);
         scale = m.pow2(-600);
     }
-    let s = m.dd_add(m.two_sqr(a), m.two_sqr(b));
-    let h = @sqrt(s.hi);
-    let hh = m.two_sqr(h);
-    let res = ((s.hi - hh.hi) - hh.lo) + s.lo;
-    let r = (h + (res / (2.0 * h))) * scale;
+    // a^2 + b^2 as sh + sl (a >= b: the high parts' sum's error exact; sl
+    // within 2^-104 of the sum), its square root h and the correction
+    // res/(2h) = res h/(2 sh) to first order, res = sh + sl - h^2 exactly
+    // enough: 1/sh is computed beside the square root, not after it
+    let pa = m.two_sqr(a);
+    let pb = m.two_sqr(b);
+    let sm = m.fast_two_sum(pa.hi, pb.hi);
+    let sh = sm.hi;
+    let sl = sm.lo + (pa.lo + pb.lo);
+    let h = @sqrt(sh);
+    let hinv = 0.5 / sh;
+    let res = m.residual(sh, h, h) + sl;
+    let r = (h + (res * (h * hinv))) * scale;
     if scale > 1.0 {
         return m.check_huge(rep, r);
     }

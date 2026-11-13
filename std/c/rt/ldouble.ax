@@ -595,14 +595,388 @@ fn nan_result(r: *mut W, a: *W, ua: Un, b: *W, ub: Un, f: u32, c: *mut Env) void
 
 /// r = a + b.
 pub fn add(r: *mut W, a: *W, b: *W, f: u32) void {
+    if f == FMT_X {
+        if fast_add_x(r, a, b, 0) {
+            return;
+        }
+    } else if fast_add_q(r, a, b, 0) {
+        return;
+    }
     let mut c = env_nearest();
     addsub(r, a, b, false, f, &mut c);
 }
 
 /// r = a - b.
 pub fn sub(r: *mut W, a: *W, b: *W, f: u32) void {
+    if f == FMT_X {
+        if fast_add_x(r, a, b, 0x8000) {
+            return;
+        }
+    } else if fast_add_q(r, a, b, 0x8000_0000_0000_0000) {
+        return;
+    }
     let mut c = env_nearest();
     addsub(r, a, b, true, f, &mut c);
+}
+
+// -----------------------------------------------------------------------------
+// Fast paths: the x87 format's +, -, * and / to nearest (the functions
+// without an Env) of normal operands with a normal result, in 64-bit
+// integers on the 64-bit significands, without taking the operands apart
+// into Un or the general rounding; anything else (zeros, subnormals,
+// infinities, NaNs, invalid encodings, a result that overflows or is
+// subnormal) is left to the general code, which these agree with bit for
+// bit.
+// -----------------------------------------------------------------------------
+
+// Is the x87 encoding (sign and exponent field se, significand m) a normal
+// number: exponent field 1 .. 0x7FFE and the integer bit set?
+inline fn x_normal(se: u64, m: u64) bool {
+    return (((se & 0x7FFF) -% 1) < 0x7FFE) and ((m >> 63) != 0);
+}
+
+// The significand hi with the 64 bits below it in lo (and, below those,
+// something nonzero if sticky), rounded to nearest with ties to even, and
+// put with sign and exponent field se into r; false (r untouched) if the
+// rounded exponent field leaves 1 .. 0x7FFE.
+inline fn put_x(r: *mut W, se: u64, hi: u64, lo: u64, sticky: bool) bool {
+    let mut m = hi;
+    let mut e = se & 0x7FFF;
+    if ((lo >> 63) != 0) and ((((lo << 1) != 0) or sticky) or ((m & 1) != 0)) {
+        m = m +% 1;
+        if m == 0 {
+            m = @as(u64, 1) << 63;
+            e += 1;
+        }
+    }
+    if (e -% 1) >= 0x7FFE {
+        return false;
+    }
+    r.lo = m;
+    r.hi = (se & 0x8000) | e;
+    return true;
+}
+
+// r = a + b (b's sign flipped by nb: 0 or 0x8000), if the fast path applies.
+fn fast_add_x(r: *mut W, a: *W, b: *W, nb: u64) bool {
+    let mut sa = a.hi & 0xFFFF;
+    let mut sb = (b.hi & 0xFFFF) ^ nb;
+    let mut ma = a.lo;
+    let mut mb = b.lo;
+    if not (x_normal(sa, ma) and x_normal(sb, mb)) {
+        return false;
+    }
+    // the larger magnitude first
+    if ((sb & 0x7FFF) > (sa & 0x7FFF)) or (((sb & 0x7FFF) == (sa & 0x7FFF)) and (mb > ma)) {
+        let t = sa;
+        sa = sb;
+        sb = t;
+        let u = ma;
+        ma = mb;
+        mb = u;
+    }
+    let d = (sa & 0x7FFF) - (sb & 0x7FFF);
+    if d >= 66 {
+        // b is below a quarter of an ulp of a: a is the sum rounded
+        r.lo = ma;
+        r.hi = sa;
+        return true;
+    }
+    // b aligned to a as bh:bl (and the bits shifted out of it: sticky)
+    let mut bh = mb;
+    let mut bl: u64 = 0;
+    let mut sticky = false;
+    if d > 64 {
+        bh = 0;
+        bl = mb >> @truncate(u32, d - 64);
+        sticky = (mb << @truncate(u32, 128 - d)) != 0;
+    } else if d == 64 {
+        bh = 0;
+        bl = mb;
+    } else if d > 0 {
+        let k = @truncate(u32, d);
+        bh = mb >> k;
+        bl = mb << (64 - k);
+    }
+    if ((sa ^ sb) & 0x8000) == 0 {
+        let h = ma +% bh;
+        if h < ma {
+            // a carry: one bit down
+            sticky = sticky or ((bl & 1) != 0);
+            return put_x(r, sa + 1, (h >> 1) | (@as(u64, 1) << 63), (bl >> 1) | (h << 63), sticky);
+        }
+        return put_x(r, sa, h, bl, sticky);
+    }
+    // a - b: ma:0 - bh:bl, and the bits below if sticky (then 1 less at
+    // the bottom, and something below)
+    let mut l = (@as(u64, 0) -% bl);
+    let mut h = ma -% bh;
+    if bl != 0 {
+        h = h -% 1;
+    }
+    if sticky {
+        if l == 0 {
+            h = h -% 1;
+        }
+        l = l -% 1;
+    }
+    if (h | l) == 0 {
+        r.lo = 0;
+        r.hi = 0;  // +0 (to nearest)
+        return true;
+    }
+    // normalize (by more than one bit only for d <= 1: then nothing is
+    // below l)
+    let mut e = sa & 0x7FFF;
+    if h == 0 {
+        h = l;
+        l = 0;
+        if e <= 64 {
+            return false;
+        }
+        e -= 64;
+    }
+    let z = @as(u64, @clz(h));
+    if z != 0 {
+        if e <= z {
+            return false;  // (subnormal)
+        }
+        h = (h << @truncate(u32, z)) | (l >> @truncate(u32, 64 - z));
+        l = l << @truncate(u32, z);
+        e -= z;
+    }
+    return put_x(r, (sa & 0x8000) | e, h, l, sticky);
+}
+
+// r = a * b, if the fast path applies.
+fn fast_mul_x(r: *mut W, a: *W, b: *W) bool {
+    let sa = a.hi & 0xFFFF;
+    let sb = b.hi & 0xFFFF;
+    if not (x_normal(sa, a.lo) and x_normal(sb, b.lo)) {
+        return false;
+    }
+    let p = mul64(a.lo, b.lo);
+    // the product in [2^126, 2^128): its leading bit at 127, or at 126
+    let mut e = @bit_cast(i64, ((sa & 0x7FFF) + (sb & 0x7FFF))) - (@as(i64, BIAS) - 1);
+    let mut h = p.h;
+    let mut l = p.l;
+    if (h >> 63) == 0 {
+        h = (h << 1) | (l >> 63);
+        l = l << 1;
+        e -= 1;
+    }
+    if (e < 1) or (e >= 0x7FFF) {
+        return false;
+    }
+    return put_x(r, ((sa ^ sb) & 0x8000) | @bit_cast(u64, e), h, l, false);
+}
+
+// binary128's: the 113-bit significands shifted up 15 bits (bit 127 their
+// leading one, 15 guard bits below the last).
+
+// Is the binary128 value with high word h normal (exponent 1 .. 0x7FFE)?
+inline fn q_normal(h: u64) bool {
+    return (((h >> 48) & 0x7FFF) -% 1) < 0x7FFE;
+}
+
+// The significand of a normal binary128 value, shifted to bit 127.
+inline fn q_sig(a: *W) U2 {
+    let h = (a.hi & 0xFFFF_FFFF_FFFF) | (@as(u64, 1) << 48);
+    return u2((h << 15) | (a.lo >> 49), a.lo << 15);
+}
+
+// The 128-bit significand s (bit 127 set; something nonzero below it if
+// sticky) rounded to 113 bits to nearest with ties to even and put with sign
+// (bit 63 of sg) and biased exponent e into r; false (r untouched) if the
+// rounded exponent leaves 1 .. 0x7FFE.
+inline fn put_q(r: *mut W, sg: u64, e0: i64, s: U2, sticky: bool) bool {
+    let mut e = e0;
+    let mut mh = s.h >> 15;
+    let mut ml = (s.h << 49) | (s.l >> 15);
+    let half = ((s.l >> 14) & 1) != 0;
+    let rest = ((s.l & 0x3FFF) != 0) or sticky;
+    if half and (rest or ((ml & 1) != 0)) {
+        ml = ml +% 1;
+        if ml == 0 {
+            mh += 1;
+            if (mh >> 49) != 0 {
+                mh = mh >> 1;  // (2^113: the low word is 0)
+                e += 1;
+            }
+        }
+    }
+    if ((e - 1) < 0) or ((e - 1) >= 0x7FFE) {
+        return false;
+    }
+    r.lo = ml;
+    r.hi = (sg & 0x8000_0000_0000_0000) | (@bit_cast(u64, e) << 48) | (mh & 0xFFFF_FFFF_FFFF);
+    return true;
+}
+
+// r = a + b (b's sign flipped by nb: 0 or bit 63), if the fast path applies.
+fn fast_add_q(r: *mut W, a: *W, b: *W, nb: u64) bool {
+    let ha = a.hi;
+    let hb = b.hi ^ nb;
+    if not (q_normal(ha) and q_normal(hb)) {
+        return false;
+    }
+    let mut ea = @bit_cast(i64, (ha >> 48) & 0x7FFF);
+    let mut eb = @bit_cast(i64, (hb >> 48) & 0x7FFF);
+    let mut sa = ha;
+    let mut sb = hb;
+    let mut x = q_sig(a);
+    let mut y = q_sig(b);
+    if (eb > ea) or ((eb == ea) and lt2(x, y)) {
+        let t = x;
+        x = y;
+        y = t;
+        let te = ea;
+        ea = eb;
+        eb = te;
+        let ts = sa;
+        sa = sb;
+        sb = ts;
+    }
+    let d = ea - eb;
+    if d >= 116 {
+        // b is below a quarter of an ulp of a: a is the sum rounded
+        r.lo = a.lo;
+        r.hi = a.hi;
+        if sa != ha {
+            r.lo = b.lo;
+            r.hi = hb;
+        }
+        return true;
+    }
+    // y aligned (its bits shifted out: sticky)
+    let k = @truncate(u32, @bit_cast(u64, d));
+    let sticky = low_set(y, k);
+    let ya = shr(y, k);
+    if ((sa ^ sb) >> 63) == 0 {
+        let z = add2(x, ya);
+        if lt2(z, x) {
+            // a carry: one bit down
+            return put_q(r, sa, ea + 1, u2((z.h >> 1) | (@as(u64, 1) << 63), (z.l >> 1) | (z.h << 63)), sticky or
+                         ((z.l & 1) != 0));
+        }
+        return put_q(r, sa, ea, z, sticky);
+    }
+    // x - y, and 1 less at the bottom if bits were shifted out (then
+    // something below)
+    let mut z = sub2(x, ya);
+    if sticky {
+        z = sub2(z, u2(0, 1));
+    }
+    if is0(z) {
+        r.lo = 0;
+        r.hi = 0;  // +0 (to nearest)
+        return true;
+    }
+    let n = clz2(z);
+    if @as(i64, n) >= ea {
+        return false;  // (subnormal)
+    }
+    return put_q(r, sa, ea - @as(i64, n), shl(z, n), sticky);
+}
+
+// r = a * b, if the fast path applies.
+fn fast_mul_q(r: *mut W, a: *W, b: *W) bool {
+    if not (q_normal(a.hi) and q_normal(b.hi)) {
+        return false;
+    }
+    let x = q_sig(a);
+    let y = q_sig(b);
+    // the 256-bit product in [2^254, 2^256): its high 128 bits, the low
+    // ones as sticky
+    let ll = mul64(x.l, y.l);
+    let lh = mul64(x.l, y.h);
+    let hl = mul64(x.h, y.l);
+    let hh = mul64(x.h, y.h);
+    let mid = add2(add2(u2(0, ll.h), u2(0, lh.l)), u2(0, hl.l));
+    let mut hi = add2(add2(hh, u2(0, lh.h)), add2(u2(0, hl.h), u2(0, mid.h)));
+    let mut lo = mid.l;
+    let sticky = ll.l != 0;
+    let mut e = (@bit_cast(i64, (a.hi >> 48) & 0x7FFF) + @bit_cast(i64, (b.hi >> 48) & 0x7FFF)) - (@as(i64, BIAS) - 1);
+    if (hi.h >> 63) == 0 {
+        hi = u2((hi.h << 1) | (hi.l >> 63), (hi.l << 1) | (lo >> 63));
+        lo = lo << 1;
+        e -= 1;
+    }
+    return put_q(r, a.hi ^ b.hi, e, hi, sticky or (lo != 0));
+}
+
+// The quotient and remainder of the 128-bit u1:u0 by v, for u1 < v and v's
+// top bit set: two 64-bit divisions by v's high half, each corrected (H. S.
+// Warren, "Hacker's Delight", 2nd ed., 9-4, divlu).
+inline fn udiv128(u1: u64, u0: u64, v: u64) U2 {
+    let b: u64 = 0x1_0000_0000;
+    let vn1 = v >> 32;
+    let vn0 = v & 0xFFFF_FFFF;
+    let un1 = u0 >> 32;
+    let un0 = u0 & 0xFFFF_FFFF;
+    let mut q1 = u1 / vn1;
+    let mut rhat = u1 - (q1 * vn1);
+    while (q1 >= b) or ((q1 * vn0) > ((rhat << 32) | un1)) {
+        q1 -= 1;
+        rhat += vn1;
+        if rhat >= b {
+            break;
+        }
+    }
+    let un21 = ((u1 << 32) | un1) -% (q1 *% v);
+    let mut q0 = un21 / vn1;
+    rhat = un21 - (q0 * vn1);
+    while (q0 >= b) or ((q0 * vn0) > ((rhat << 32) | un0)) {
+        q0 -= 1;
+        rhat += vn1;
+        if rhat >= b {
+            break;
+        }
+    }
+    return u2((q1 << 32) | q0, ((un21 << 32) | un0) -% (q0 *% v));
+}
+
+// r = a / b, if the fast path applies.
+fn fast_div_x(r: *mut W, a: *W, b: *W) bool {
+    let sa = a.hi & 0xFFFF;
+    let sb = b.hi & 0xFFFF;
+    let ma = a.lo;
+    let mb = b.lo;
+    if not (x_normal(sa, ma) and x_normal(sb, mb)) {
+        return false;
+    }
+    let mut e = (@bit_cast(i64, sa & 0x7FFF) - @bit_cast(i64, sb & 0x7FFF)) + @as(i64, BIAS);
+    let se = (sa ^ sb) & 0x8000;
+    if ma >= mb {
+        // the quotient ma 2^64/mb in [2^64, 2^65): 2^64 + q (q the quotient
+        // of (ma - mb) 2^64), the bit below the 64 kept that of q
+        let qr = udiv128(ma - mb, 0, mb);
+        if (e < 1) or (e >= 0x7FFF) {
+            return false;
+        }
+        return put_x(r, se | @bit_cast(u64, e), (qr.h >> 1) | (@as(u64, 1) << 63), qr.h << 63, qr.l != 0);
+    }
+    // ma 2^64/mb in [2^63, 2^64): rounded by the remainder (2 rem against
+    // mb: above, below or exactly half)
+    let qr = udiv128(ma, 0, mb);
+    e -= 1;
+    if (e < 1) or (e >= 0x7FFF) {
+        return false;
+    }
+    let rem = qr.l;
+    let mut lo: u64 = 0;
+    if (rem >> 63) != 0 {
+        lo = @as(u64, 1) << 63;  // 2 rem >= 2^64 > mb: above half
+        return put_x(r, se | @bit_cast(u64, e), qr.h, lo, true);
+    }
+    let twice = rem << 1;
+    if twice > mb {
+        return put_x(r, se | @bit_cast(u64, e), qr.h, @as(u64, 1) << 63, true);
+    }
+    if twice == mb {
+        return put_x(r, se | @bit_cast(u64, e), qr.h, @as(u64, 1) << 63, false);
+    }
+    return put_x(r, se | @bit_cast(u64, e), qr.h, 0, rem != 0);
 }
 
 /// r = a op b (op: 0 +, 1 -, 2 *, 3 /) in the environment of the register
@@ -696,6 +1070,13 @@ fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32, c: *mut Env) void {
 
 /// r = a * b.
 pub fn mul(r: *mut W, a: *W, b: *W, f: u32) void {
+    if f == FMT_X {
+        if fast_mul_x(r, a, b) {
+            return;
+        }
+    } else if fast_mul_q(r, a, b) {
+        return;
+    }
     let mut c = env_nearest();
     mul_c(r, a, b, f, &mut c);
 }
@@ -737,6 +1118,9 @@ fn mul_c(r: *mut W, a: *W, b: *W, f: u32, c: *mut Env) void {
 
 /// r = a / b.
 pub fn div(r: *mut W, a: *W, b: *W, f: u32) void {
+    if (f == FMT_X) and fast_div_x(r, a, b) {
+        return;
+    }
     let mut c = env_nearest();
     div_c(r, a, b, f, &mut c);
 }
@@ -774,21 +1158,90 @@ fn div_c(r: *mut W, a: *W, b: *W, f: u32, c: *mut Env) void {
         pack_zero(r, neg, f);
         return;
     }
-    // q = floor(x.s * 2^127 / y.s), a bit at a time
-    let mut rem = x.s;
-    let mut q = u2(0, 0);
-    let mut carry = false;
-    for i in @as(u32, 0)..128 {
-        _ = i;
-        q = shl(q, 1);
-        if carry or not lt2(rem, y.s) {
-            rem = sub2(rem, y.s);
-            q.l = q.l | 1;
+    let qr = div256(x.s, y.s);
+    finish(r, neg, x.e - y.e, qr.q, qr.inexact, f, c);
+}
+
+// A 128-bit quotient, and whether the division left a remainder.
+struct Quot {
+    q: U2,
+    inexact: bool,
+}
+
+// floor(a 2^127 / b) for a and b with their bit 127 set (the quotient is
+// below 2^128), by D. E. Knuth's algorithm D (TAOCP vol. 2, 4.3.1) in base
+// 2^64: two digits, each estimated from the remainder's top two words by
+// udiv128 and corrected by the divisor's second word.
+fn div256(a: U2, b: U2) Quot {
+    // the dividend a 2^127 as four words u3 u2 u1 u0 (u0 = 0)
+    let mut u3 = a.h >> 1;
+    let mut u2w = (a.h << 63) | (a.l >> 1);
+    let mut u1 = a.l << 63;
+    let mut u0: u64 = 0;
+    let d1 = b.h;
+    let d0 = b.l;
+    let mut q: [2]u64 = [0, 0];
+    for j in @as(usize, 0)..2 {
+        // the digit of (u3 u2 u1) / (d1 d0), u3 u2 < d1 d0
+        let mut qh: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        let mut rh: u64 = 0;
+        let mut rh_big = false;
+        if u3 < d1 {
+            let t = udiv128(u3, u2w, d1);
+            qh = t.h;
+            rh = t.l;
+        } else {
+            // (u3 == d1) q = 2^64 - 1, its remainder u3 u2 - q d1 = u2 + d1
+            rh = u2w +% d1;
+            rh_big = rh < d1;
         }
-        carry = (rem.h >> 63) != 0;
-        rem = shl(rem, 1);
+        // q d0 > rh 2^64 + u1: q one too large (at most twice)
+        while not rh_big {
+            let p = mul64(qh, d0);
+            if (p.h > rh) or ((p.h == rh) and (p.l > u1)) {
+                qh -= 1;
+                rh = rh +% d1;
+                rh_big = rh < d1;
+            } else {
+                break;
+            }
+        }
+        // (u3 u2 u1) -= q (d1 d0), adding the divisor back if it went below 0
+        let p0 = mul64(qh, d0);
+        let p1 = mul64(qh, d1);
+        let w0 = u1 -% p0.l;
+        let b0 = b01(u1 < p0.l);
+        let m1 = p1.l +% p0.h;
+        let c1 = b01(m1 < p1.l);
+        let w1 = (u2w -% m1) -% b0;
+        let b1 = b01((u2w < m1) or ((u2w == m1) and (b0 != 0)));
+        // (p1.h <= 2^64 - 2: the top word u3 - t1 - b1 without overflow)
+        let t1 = p1.h + c1;
+        if (u3 < t1) or ((u3 - t1) < b1) {
+            qh -= 1;
+            let s0 = w0 +% d0;
+            let k0 = b01(s0 < w0);
+            u1 = s0;
+            u2w = (w1 +% d1) +% k0;
+        } else {
+            u1 = w0;
+            u2w = w1;
+        }
+        q[j] = qh;
+        // the next digit's window: shift the dividend's words up
+        u3 = u2w;
+        u2w = u1;
+        u1 = u0;
+        u0 = 0;
     }
-    finish(r, neg, x.e - y.e, q, carry or not is0(rem), f, c);
+    return Quot.{ q: u2(q[0], q[1]), inexact: (u3 | u2w) != 0 };
+}
+
+fn b01(c: bool) u64 {
+    if c {
+        return 1;
+    }
+    return 0;
 }
 
 /// The order of a and b: -1 (a < b), 0 (equal), 1 (a > b), or 2

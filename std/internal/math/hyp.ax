@@ -6,29 +6,19 @@
 // Stegun 4.5, 4.6), each term a double-double from exp.ax's and
 // log.ax's kernels, so that nothing cancels at double precision, and a
 // minimax polynomial near 0 for sinh and tanh, whose exponential form
-// cancels there (cosh's two exponentials need only their parts in double:
-// within 2^-57). Rounded once: within about 0.52 ulp (cosh 0.57).
+// cancels there (the two exponentials of cosh, and of sinh from 1/4 on,
+// need only their parts in double: within 2^-57). Rounded once: within
+// about 0.52 ulp (cosh 0.57).
 // =============================================================================
 import "core.ax" as m;
 import "exp.ax" as ex;
 import "log.ax" as lg;
 import "tables.ax" as t;
 
-/// e^x as a double-double, |x| <= 22.
-fn exp_dd2(x: f64) m.DD {
-    let p = ex.parts(x, 0.0);
-    let sc = m.pow2(p.k);
-    return m.fast_two_sum(sc * p.s, sc * p.e);
-}
-
 /// sign(x) e^(|x| - ln 2) = sign(x) e^|x| / 2: sinh and cosh beyond 22.
 fn half_exp(x: f64, rep: m.Rep) f64 {
     let a = @abs(x);
-    let r = ex.exp_dd(a - t.LN2_HI, -t.LN2_LO, rep);
-    if x < 0.0 {
-        return -r;
-    }
-    return r;
+    return @copysign(ex.exp_dd(a - t.LN2_HI, -t.LN2_LO, rep), x);
 }
 
 /// The hyperbolic sine.
@@ -55,13 +45,17 @@ pub inline fn sinh(x: f64, rep: m.Rep) f64 {
         }
         return half_exp(x, rep);
     }
-    // (e^|x| - e^-|x|) / 2
-    let e = exp_dd2(m.from_bits(ax));
-    let r = m.dd_round(m.dd_add(e, m.dd_neg(m.dd_recip(e)))) * 0.5;
-    if x < 0.0 {
-        return -r;
-    }
-    return r;
+    // (e^|x| - e^-|x|)/2 from the two exponentials' parts, as cosh's (each
+    // within 2^-59.2 relative, the difference's high part exact): within
+    // 2^-59.2 coth|x| <= 2^-57.2 of the result, 2^-59 for |x| >= 1
+    let a = m.from_bits(ax);
+    let p1 = ex.parts(a, 0.0);
+    let p2 = ex.parts(-a, 0.0);
+    let sc1 = m.pow2(p1.k - 1);
+    let sc2 = m.pow2(p2.k - 1);
+    let b = m.fast_two_sum(sc1 * p1.s, -(sc2 * p2.s));
+    let r = b.hi + (b.lo + ((sc1 * p1.e) - (sc2 * p2.e)));
+    return @copysign(r, x);  // (without a branch: the sign is unpredictable)
 }
 
 /// The hyperbolic cosine.
@@ -122,16 +116,19 @@ pub inline fn tanh(x: f64, rep: m.Rep) f64 {
     return r;
 }
 
-/// log(a + sqrt(w)) for a >= 1/4 and a double-double w > 0 with sqrt(w)
-/// comparable to a, rounded once: with s = sqrt(w.hi), the argument is
-/// u + e + res/(2s) (u + e = s + a exactly, res = w - s^2 exactly enough),
-/// so the logarithm is log(u) + (2 s e + res)/(2 s u): one division, beside
-/// the logarithm's reduction.
-inline fn log_sum_sqrt(a: f64, w: m.DD) f64 {
-    let s = @sqrt(w.hi);
-    let p = m.two_sqr(s);
-    let res = ((w.hi - p.hi) - p.lo) + w.lo;
-    let u = m.two_sum(s, a);
+/// log(a + sqrt(w)) for a >= 1/4 and w = wh + wl > 0 (wl within a few ulps
+/// of wh) with sqrt(w) comparable to a, rounded once: with s = sqrt(wh),
+/// the argument is u + e + res/(2s) (u + e = s + a exactly: fast_two_sum,
+/// big the larger of s and a; res = w - s^2 exactly enough), so the
+/// logarithm is log(u) + (2 s e + res)/(2 s u): one division, beside the
+/// logarithm's reduction.
+inline fn log_sum_sqrt(a: f64, wh: f64, wl: f64, s_big: bool) f64 {
+    let s = @sqrt(wh);
+    let res = m.residual(wh, s, s) + wl;
+    let mut u = m.fast_two_sum(a, s);
+    if s_big {
+        u = m.fast_two_sum(s, a);
+    }
     let l = lg.log_fast(u.hi);
     let s2 = 2.0 * s;
     return l.hi + (l.lo + (((s2 * u.lo) + res) / (s2 * u.hi)));
@@ -169,8 +166,10 @@ pub fn asinh(x: f64, rep: m.Rep) f64 @multiversion("fma") {
         r = b.hi + ((b.lo + l.lo) + t.LN2_LO);
     } else {
         // log(u), u = |x| + sqrt(x^2 + 1) as a double-double: log(u.hi) +
-        // u.lo/u.hi, rounded once
-        r = log_sum_sqrt(a, m.dd_add_d(m.two_sqr(a), 1.0));
+        // u.lo/u.hi, rounded once (x^2 + 1 exactly as wh + wl)
+        let p = m.two_sqr(a);
+        let w = m.two_sum(p.hi, 1.0);
+        r = log_sum_sqrt(a, w.hi, w.lo + p.lo, true);
     }
     return @copysign(r, x);
 }
@@ -205,8 +204,11 @@ pub fn acosh(x: f64, rep: m.Rep) f64 @multiversion("fma") {
         let l = lg.log1p_fast(v.hi);
         return l.hi + (l.lo + (v.lo / (1.0 + v.hi)));
     }
-    // log(x + sqrt(x^2 - 1)), the argument as a double-double
-    return log_sum_sqrt(x, m.dd_add_d(m.two_sqr(x), -1.0));
+    // log(x + sqrt(x^2 - 1)), the argument as a double-double (x^2 - 1
+    // exactly as wh + wl: x^2 >= 4)
+    let p = m.two_sqr(x);
+    let w = m.fast_two_sum(p.hi, -1.0);
+    return log_sum_sqrt(x, w.hi, w.lo + p.lo, false);
 }
 
 /// The inverse hyperbolic tangent.

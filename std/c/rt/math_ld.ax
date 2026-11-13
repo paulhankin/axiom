@@ -2134,8 +2134,11 @@ fn fma_c(f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, c: *mut ld.Env) voi
 // The error function and the gamma functions (erfl, erfcl, lgammal, tgammal)
 //
 // erf |x| below 2 from its Taylor series (Abramowitz and Stegun 7.1.5:
-// the terms at most 2^3 times the sum there), to within 2^-156 of the sum;
-// erfc a above 2 from the continued fraction
+// the terms at most 2^3 times the sum there), to within 2^-156 of the sum,
+// and from 2 to 6 from the series of positive terms times e^(-x^2) (A&S
+// 7.1.6), both by Horner's rule on tables of their coefficients (and 1
+// minus the latter for the x87's erfc a below 4); erfc a otherwise from 2
+// on from the continued fraction
 //   erfc a = e^(-a^2)/sqrt(pi) 1/(a + (1/2)/(a + 1/(a + (3/2)/(a + ...))))
 // (A&S 7.1.14) evaluated from its depth 1600/a^2 + 40 back (that depth is
 // within 2^-150 for every a >= 2: measured in arbitrary precision), the
@@ -2174,31 +2177,70 @@ fn tlog(v: TD) TD @multiversion("fma") {
     return log_core(tscale(v, p2(-e)), e);
 }
 
-/// erf a, 2^-80 <= a < 2 (a triple-double): the alternating Taylor series
-/// 2/sqrt(pi) sum (-1)^n a^(2n+1) / (n! (2n+1)) (A&S 7.1.5), its terms at
-/// most 2^3 times the sum: within 2^-146, without an exponential.
-fn erf_series(a: TD) TD @multiversion("fma") {
-    let a2 = tmul(a, a);
-    let mut p = a;  // a^(2n+1) / n!, signed
-    let mut sum = a;
-    let mut n: f64 = 1.0;
-    while n < 100.0 {
-        p = tneg(tdiv(tmul(p, a2), tdd(n)));
-        let tm = tdiv(p, tdd((2.0 * n) + 1.0));
-        sum = tadd(sum, tm);
-        if @abs(tm.h) < (sum.h * 1.1479437019748901e-47) {
-            break;  // (2^-156)
+/// The number of terms of a series sum t_n z^n (t_n = r_n t_(n-1), t_0 = 1)
+/// before they fall below 2^-160 (terms estimated in double).
+inline fn series_len(z: f64, positive: bool, nmax: usize) usize {
+    let mut tn: f64 = 1.0;
+    let mut n: usize = 0;
+    while (tn > 6.8e-49) and (n < nmax) {
+        n += 1;
+        let k = @float_from_int(f64, n);
+        if positive {
+            tn = (tn * 2.0 * z) / ((2.0 * k) + 1.0);
+        } else {
+            tn = (tn * z) / k;
         }
-        n += 1.0;
     }
-    return tmul(sum, td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L));
+    return n + 1;
+}
+
+/// erf a, 2^-80 <= a < 2 (a triple-double): the alternating Taylor series
+/// 2/sqrt(pi) a sum (-1)^n a^(2n) / (n! (2n+1)) (A&S 7.1.5) by Horner's rule
+/// on its coefficients (ERF_A), to the terms below 2^-160 (at most 61), its
+/// terms at most 2^3 times the sum: within 2^-146, without an exponential.
+fn erf_series(a: TD) TD @multiversion("fma") {
+    let z = tmul(a, a);
+    let mut i = series_len(z.h, false, 80);
+    let mut p = tab(lt.ERF_A[..], 3 * i);
+    while i > 0 {
+        i -= 1;
+        p = tadd(tab(lt.ERF_A[..], 3 * i), tmul(z, p));
+    }
+    return tmul(tmul(p, a), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L));
+}
+
+/// erf a = 2/sqrt(pi) a e^(-a^2) sum 2^n a^(2n) / (1 3 ... (2n+1)) for
+/// 2 <= a < 6 (A&S 7.1.6: no cancellation; to the terms below 2^-160, at
+/// most 190), with exp_core's exponential: within about 2^-125.
+fn erf_pos(a: TD) TD @multiversion("fma") {
+    let z = tmul(a, a);
+    let mut i = series_len(z.h, true, 200);
+    let mut p = tab(lt.ERF_P[..], 3 * i);
+    while i > 0 {
+        i -= 1;
+        p = tadd(tab(lt.ERF_P[..], 3 * i), tmul(z, p));
+    }
+    let ec = exp_core(tneg(z));
+    return tscale(tmul(tmul(tmul(p, a), ec.v), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L)), p2(ec.k));
 }
 
 /// erfc a = v 2^k, 2 <= a < 107 (a triple-double).
 fn erfc_cf(a: TD) TK @multiversion("fma") {
     let depth = @int_from_float(i32, 1600.0 / (a.h * a.h)) + 40;
+    // (the backward recurrence forgets its errors as it goes: the levels
+    // below the last 64 in double-double, whose 2^-104 the last 64 levels
+    // make far smaller than the triple-doubles' errors)
     let mut tm = tdd(0.0);
     let mut k = depth;
+    if k > 24 {
+        let ad = m.dd(a.h, a.m);
+        let mut t2 = m.dd(0.0, 0.0);
+        while k > 24 {
+            t2 = m.dd_div(m.dd(@float_from_int(f64, k) * 0.5, 0.0), m.dd_add(ad, t2));
+            k -= 1;
+        }
+        tm = td(t2.hi, t2.lo, 0.0);
+    }
     while k > 0 {
         tm = tdiv(tdd(@float_from_int(f64, k) * 0.5), tadd(a, tm));
         k -= 1;
@@ -2400,6 +2442,8 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
             let mut v = tdd(0.0);
             if a.h < 2.0 {
                 v = erf_series(a);
+            } else if a.h < 6.0 {
+                v = erf_pos(a);
             } else {
                 let c = erfc_cf(a);
                 v = tsub(tdd(1.0), tscale(c.v, p2(c.k)));
@@ -2428,6 +2472,8 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
             }
             if a.h < 2.0 {
                 put(r, tadd(tdd(1.0), erf_series(a)), 0, f, false);
+            } else if a.h < 6.0 {
+                put(r, tadd(tdd(1.0), erf_pos(a)), 0, f, false);
             } else {
                 let c = erfc_cf(a);
                 put(r, tsub(tdd(2.0), tscale(c.v, p2(c.k))), 0, f, false);
@@ -2441,6 +2487,12 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
         }
         if a.h < 2.0 {
             put(r, tsub(tdd(1.0), erf_series(a)), 0, f, false);
+            return;
+        }
+        if (a.h < 4.0) and (f == ld.FMT_X) {
+            // (1 - erf loses up to 26 bits: the x87's 64 bits keep within
+            // 2^-110 of the result, binary128's would not)
+            put(r, tsub(tdd(1.0), erf_pos(a)), 0, f, false);
             return;
         }
         let c = erfc_cf(a);

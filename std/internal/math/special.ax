@@ -135,7 +135,7 @@ fn eval_pieces(tab: []u64, n: usize, w: usize, invw: f64, x: f64) m.DD @multiver
 // -----------------------------------------------------------------------------
 
 /// erf x / x for |x| < 1 (z = x^2 as a double-double).
-fn erf_ratio(z: m.DD) m.DD @multiversion("fma") {
+inline fn erf_ratio(z: m.DD) m.DD {
     // P0 + P1 z exactly but for 2^-106 (the product and the sum's errors
     // kept), the rest (z^2 P2 + ..., at most a ninth of the value) by Estrin's
     // scheme in plain double
@@ -143,48 +143,80 @@ fn erf_ratio(z: m.DD) m.DD @multiversion("fma") {
     let z2 = zz * zz;
     let z4 = z2 * z2;
     let z8 = z4 * z4;
-    let q0 = ((t.ERF_P2 + (zz * t.ERF_P3)) + (z2 * (t.ERF_P4 + (zz * t.ERF_P5)))) +
-             (z4 * ((t.ERF_P6 + (zz * t.ERF_P7)) + (z2 * (t.ERF_P8 + (zz * t.ERF_P9)))));
-    let q1 = ((t.ERF_P10 + (zz * t.ERF_P11)) + (z2 * (t.ERF_P12 + (zz * t.ERF_P13)))) +
-             (z4 * (t.ERF_P14 + (zz * t.ERF_P15)));
+    let q0 = m.madd(z4, m.madd(z2, m.madd(zz, t.ERF_P9, t.ERF_P8), m.madd(zz, t.ERF_P7, t.ERF_P6)),
+                    m.madd(z2, m.madd(zz, t.ERF_P5, t.ERF_P4), m.madd(zz, t.ERF_P3, t.ERF_P2)));
+    let q1 = m.madd(z4, m.madd(zz, t.ERF_P15, t.ERF_P14),
+                    m.madd(z2, m.madd(zz, t.ERF_P13, t.ERF_P12), m.madd(zz, t.ERF_P11, t.ERF_P10)));
     let a = m.two_prod(t.ERF_P1, zz);
     let b = m.fast_two_sum(t.ERF_P0, a.hi);
     // P0's low part, and z's through P'(z) (to a few percent)
     let d = t.ERF_P1 + (zz * ((2.0 * t.ERF_P2) + (zz * (3.0 * t.ERF_P3))));
-    return m.fast_two_sum(b.hi, ((b.lo + a.lo) + (z2 * (q0 + (z8 * q1)))) + (t.ERF_P0_LO + (z.lo * d)));
+    return m.fast_two_sum(b.hi, ((b.lo + a.lo) + (z2 * m.madd(z8, q1, q0))) + (t.ERF_P0_LO + (z.lo * d)));
 }
 
-/// erf x for |x| < 1 as a double-double.
+/// erf x for |x| < 1 as hi + lo (not normalized).
 inline fn erf_small(x: f64) m.DD {
     let r = erf_ratio(m.two_sqr(x));
-    return m.dd_mul_d(r, x);
+    let p = m.two_prod(r.hi, x);
+    return m.dd(p.hi, p.lo + (r.lo * x));
 }
 
-/// erfc x = 2^k (hi + lo) for 1/2 <= x <= 27.3.
+/// A piece's polynomial at t (exact) as a double-double: the row at r of a
+/// table of pieces (tables.ax: rows of lo, hi, c, the constant coefficient's
+/// low part, then the n coefficients): c0 + c1 t with the product's and the
+/// sum's errors kept, the rest (t^2 times the polynomial of c2..) in plain
+/// double, for |c1 t| and the rest small enough beside c0 that their
+/// roundings are far below an ulp of the value (the pieces: |t| <= 1/8).
+inline fn piece_poly(tab: []u64, r: usize, n: usize, tt: f64) m.DD {
+    let p = &tab[r + n + 3];  // (the bounds checked once)
+    let q = tail_estrin(@ptr_sub(p, n - 1), n, tt);
+    let a = m.two_prod(m.from_bits(tab[r + 5]), tt);
+    let b = m.fast_two_sum(m.from_bits(tab[r + 4]), a.hi);
+    return m.fast_two_sum(b.hi, ((b.lo + a.lo) + m.from_bits(tab[r + 3])) + ((tt * tt) * q));
+}
+
+/// erfc x e^(x^2) for 1/2 <= x <= 4, and x erfc x e^(x^2) beyond (in v =
+/// 1/x), as a double-double: the pieces' polynomials, each piece found
+/// exactly from x's bits (ERFC_A's are eighths from 1/2, ERFC_B's 64ths of v
+/// from 0), at t = x - c, exactly (c is the piece's middle: Sterbenz), and
+/// for v + vl (vl the residual of 1/x, through G(v) + v G'(v), about
+/// G(v) (1 - v^2)).
+inline fn erfc_f(x: f64) m.DD {
+    if x <= 4.0 {
+        let r = @min(@as(usize, @int_from_float(u32, (x - 0.5) * 8.0)), t.ERFC_A_N - 1) * t.ERFC_A_W;
+        return piece_poly(t.ERFC_A[..], r, t.ERFC_A_W - 4, x - m.from_bits(t.ERFC_A[r + 2]));
+    }
+    let v = 1.0 / x;
+    let vl = m.residual(1.0, v, x) * v;
+    let r = @min(@as(usize, @int_from_float(u32, v * 64.0)), t.ERFC_B_N - 1) * t.ERFC_B_W;
+    let g = piece_poly(t.ERFC_B[..], r, t.ERFC_B_W - 4, v - m.from_bits(t.ERFC_B[r + 2]));
+    let p = m.two_prod(g.hi, v);
+    return m.fast_two_sum(p.hi, p.lo + ((g.lo * v) + (vl * (g.hi * (1.0 - (v * v))))));
+}
+
+/// erfc x for 1/2 <= x <= 26 as 2^k (hi + lo) (hi + lo in [0.5, 2.1)):
+/// e^(-x^2) (x^2 exact as a double-double: exp's parts, to 2^-59.2) times F
+/// (to 2^-57.5), the product's error kept.
 struct Scaled {
     k: i32,
     v: m.DD,
 }
 
-fn erfc_pos(x: f64) Scaled @multiversion("fma") {
-    // e^(-x^2)
+inline fn erfc_k(x: f64) Scaled {
     let x2 = m.two_sqr(x);
     let e = ex.parts(-x2.hi, -x2.lo);
-    let mut f = m.dd(0.0, 0.0);
-    if x <= 4.0 {
-        f = eval_pieces(t.ERFC_A[..], t.ERFC_A_N, t.ERFC_A_W, t.ERFC_A_INVW, x);
-    } else {
-        // F = G(v) v, v = 1/x as a double-double: G(v + vl) (v + vl) =
-        // G(v) v + vl (G(v) + v G'(v)), the last about G(v) (1 - v^2)
-        let v = m.dd_recip(m.dd(x, 0.0));
-        let g = eval_pieces(t.ERFC_B[..], t.ERFC_B_N, t.ERFC_B_W, t.ERFC_B_INVW, v.hi);
-        f = m.dd_add_d(m.dd_mul_d(g, v.hi), v.lo * (g.hi * (1.0 - (v.hi * v.hi))));
-    }
-    let p = m.dd_mul(m.dd(e.s, e.e), f);
-    // normalized to [1, 2) for the scaling
-    let ep = m.exponent(p.hi) - 1023;
+    let f = erfc_f(x);
+    let p = m.two_prod(e.s, f.hi);
+    return Scaled.{ k: e.k, v: m.dd(p.hi, p.lo + ((e.s * f.lo) + (e.e * f.hi))) };
+}
+
+/// erfc x for x > 26 (to its underflow at 27.3), as 2^k (hi + lo) with hi
+/// in [1, 2): erfc_k's, normalized for the scaling of a subnormal result.
+fn erfc_far(x: f64) Scaled @multiversion("fma") {
+    let c = erfc_k(x);
+    let ep = m.exponent(c.v.hi) - 1023;
     let sc = m.pow2(-ep);
-    return Scaled.{ k: e.k + ep, v: m.dd(p.hi * sc, p.lo * sc) };
+    return Scaled.{ k: c.k + ep, v: m.dd(c.v.hi * sc, c.v.lo * sc) };
 }
 
 /// The error function.
@@ -208,44 +240,56 @@ pub fn erf(x: f64, rep: m.Rep) f64 @multiversion("fma") {
     if ax < 0x3ff0000000000000 {
         return m.dd_round(erf_small(x));
     }
-    let c = erfc_pos(m.from_bits(ax));
+    // 1 - erfc|x| (erfc|x| < 1/6; the difference's error kept)
+    let c = erfc_k(m.from_bits(ax));
     let sc = m.pow2(c.k);
-    let r = m.dd_round(m.dd_add_d(m.dd(-c.v.hi * sc, -c.v.lo * sc), 1.0));
-    return @copysign(r, x);
+    let a = m.fast_two_sum(1.0, -(c.v.hi * sc));
+    return @copysign(a.hi + (a.lo - (c.v.lo * sc)), x);
 }
 
 /// The complementary error function.
 pub fn erfc(x: f64, rep: m.Rep) f64 @multiversion("fma") {
     let ax = m.abits(x);
-    let neg = x < 0.0;
+    if ax < 0x3fe0000000000000 {
+        // |x| < 1/2: 1 - erf x (|erf x| < 0.53; the difference's error kept)
+        if ax < 0x3c70000000000000 {
+            return 1.0 - x;  // |x| < 2^-56
+        }
+        let e = erf_small(x);
+        let a = m.fast_two_sum(1.0, -e.hi);
+        return a.hi + (a.lo - e.lo);
+    }
+    if ax <= 0x403a000000000000 {
+        // 1/2 <= |x| <= 26
+        let c = erfc_k(m.from_bits(ax));
+        let sc = m.pow2(c.k);
+        if (m.bits(x) >> 63) != 0 {
+            if ax >= 0x4018000000000000 {
+                return 2.0;  // x <= -6: 2 - erfc|x| rounds to 2
+            }
+            // 2 - erfc|x| (erfc|x| <= 0.48; the error kept as before)
+            let a = m.fast_two_sum(2.0, -(c.v.hi * sc));
+            return a.hi + (a.lo - (c.v.lo * sc));
+        }
+        // (normal: erfc 26 > 2^-982)
+        return (c.v.hi + c.v.lo) * sc;
+    }
     if ax >= 0x7ff0000000000000 {
         if ax > 0x7ff0000000000000 {
             return x + x;
         }
-        if neg {
+        if x < 0.0 {
             return 2.0;
         }
         return 0.0;
     }
-    if ax < 0x3fe0000000000000 {
-        // |x| < 1/2: 1 - erf x
-        if ax < 0x3c70000000000000 {
-            return 1.0 - x;  // |x| < 2^-56
-        }
-        return m.dd_round(m.dd_add_d(m.dd_neg(erf_small(x)), 1.0));
-    }
-    if neg {
-        if ax >= 0x4018000000000000 {
-            return 2.0;  // x <= -6: 2 - erfc|x| rounds to 2
-        }
-        let c = erfc_pos(m.from_bits(ax));
-        let sc = m.pow2(c.k);
-        return m.dd_round(m.dd_add_d(m.dd(-c.v.hi * sc, -c.v.lo * sc), 2.0));
+    if x < 0.0 {
+        return 2.0;
     }
     if x >= 27.3 {
         return m.underflow(rep, false);
     }
-    let c = erfc_pos(x);
+    let c = erfc_far(x);
     return ex.scale(c.v.hi, c.v.lo, c.k, rep);
 }
 
@@ -363,6 +407,30 @@ fn stirling(x: f64, fast: bool) m.DD @multiversion("fma") {
     return m.dd_add_d(b, s);
 }
 
+/// lgamma(x) for 12 <= x <= 2^900 by Stirling's series, as hi + lo (not
+/// normalized) within about 2^-59.5 relative: stirling(x, true) with its
+/// sums in double where they are exact (log x as log_fast's double-double,
+/// within 2^-60, (x - 1/2) log x within 2^-60 of itself and at least 2.38 x;
+/// log(2 pi)/2 - x exact as a pair beside the logarithm), and S(x) from one
+/// division (|S| <= 1/144: its roundings are far below an ulp).
+inline fn stirling_lg(x: f64) m.DD {
+    let lx = lg.log_fast(x);
+    let h = x - 0.5;  // exact
+    let p = m.two_prod(h, lx.hi);
+    let v = m.two_sum(t.HLN2PI_HI, -x);
+    let r = 1.0 / x;
+    let w = r * r;
+    let w2 = w * w;
+    let w4 = w2 * w2;
+    let sp = m.madd(w4,
+                    m.madd(
+                        w4, t.STIRLING_P8,
+                        m.madd(w2, m.madd(w, t.STIRLING_P7, t.STIRLING_P6), m.madd(w, t.STIRLING_P5, t.STIRLING_P4))),
+                    m.madd(w2, m.madd(w, t.STIRLING_P3, t.STIRLING_P2), m.madd(w, t.STIRLING_P1, t.STIRLING_P0)));
+    let a = m.fast_two_sum(p.hi, v.hi);
+    return m.dd(a.hi, a.lo + (((p.lo + (h * lx.lo)) + (v.lo + t.HLN2PI_LO)) + (r * sp)));
+}
+
 /// gamma(x) for 0 < x < 12 as a double-double (x >= 2^-990).
 fn gamma_small(x: f64) m.DD @multiversion("fma") {
     if x < 1.0 {
@@ -469,7 +537,8 @@ fn lgamma_pos(x: f64) m.DD @multiversion("fma") {
     if x < 12.0 {
         return log_fast2(gamma_small(x));
     }
-    return stirling(x, true);
+    let r = stirling_lg(x);
+    return m.fast_two_sum(r.hi, r.lo);
 }
 
 /// The logarithm of the absolute value of the gamma function.
@@ -480,6 +549,10 @@ pub fn lgamma(x: f64, rep: m.Rep) f64 @multiversion("fma") {
     }
     if (x <= 0.0) and (@floor(x) == x) {
         return m.pole(rep, false);  // 0 and the negative integers: +inf
+    }
+    if (x >= 12.0) and (x <= 1.0e270) {
+        // (the common case first, inline)
+        return m.dd_round(stirling_lg(x));
     }
     if x > 0.0 {
         if x > 1.0e270 {

@@ -121,11 +121,7 @@ inline fn atan_tail(u: f64, z: f64) f64 {
 /// of its binade (tables.ax: ATAN_B, so |u| <= 1/32); a - c is exact,
 /// u is a double-double from one division and the exact residual.
 inline fn atan_k(a: f64, al: f64) m.DD {
-    let row = @as(usize,
-                  @bit_cast(
-                      u32,
-                      ((m.exponent(a) - (1023 - 6)) * 16) + @bit_cast(
-                          i32, @truncate(u32, (m.bits(a) >> 48) & 15)))) * 3;
+    let row = @as(usize, @truncate(u32, (m.bits(a) >> 48) & 255)) * 3;
     let c = m.from_bits(t.ATAN_B[row]);
     let n = m.two_sum(a - c, al);
     let p = m.two_prod(a, c);
@@ -147,37 +143,79 @@ inline fn b2u(c: bool) u64 {
     return 0;
 }
 
-/// An estimate hi + lo of a value, within e.
+/// An estimate hi + (lo + tail) of a value, within e.
 struct Est {
     hi: f64,
     lo: f64,
+    tail: f64,
     e: f64,
 }
 
-/// atan(a + al) for 2^-6 <= a < 2^6 (|al| <= 2^-50 a) as an estimate in
-/// plain double arithmetic (atan_k's reduction without the residuals): u is
-/// within 3.01 2^-53 |u| (a - c is exact; a c, 1 + a c and the division
-/// each round once), 4.01 2^-53 |u| with al (one more rounding), the series
-/// (ATAN_Q) within 2^-60 |u|, and the sum's low part within 2^-103 atan a.
-inline fn atan_est(a: f64, al: f64, with_lo: bool) Est {
+/// Whether every value within f.e of f's sum rounds to the same double
+/// (Ziv's test: rounds(), whose error bound e covers the rounding of
+/// lo + tail).
+inline fn est_rounds(f: Est) bool {
+    return m.rounds(f.hi, f.lo + f.tail, f.e);
+}
+
+/// atan(a) for 2^-6 <= a < 2^6 as an estimate in plain double arithmetic
+/// (atan_k's reduction without the residuals): with |u| <= 1/65, u is within
+/// 3.02 2^-53 |u| (a - c is exact; a c, 1 + a c and the division each round
+/// once; 2.02 2^-53 |u| with a fused multiply-add for 1 + a c); the series
+/// (ATAN_R) within 2^-70 |u|, and the sum's low part within 2^-103 atan a.
+inline fn atan_est(a: f64) Est {
     // the exponent and the significand's top 4 bits
-    let row = @as(usize, @truncate(u32, (m.bits(a) >> 48) - ((1023 - 6) * 16))) * 3;
+    let row = @as(usize, @truncate(u32, (m.bits(a) >> 48) & 255)) * 3;
     let c = m.from_bits(t.ATAN_B[row]);
-    let mut n = a - c;
-    if with_lo {
-        n = n + al;
-    }
-    let q = n / (1.0 + (a * c));
+    let q = (a - c) / m.mla(a, c, 1.0);
     let z = q * q;
-    let tail = (q * z) *
-               ((t.ATAN_Q0 + (z * t.ATAN_Q1)) + ((z * z) * ((t.ATAN_Q2 + (z * t.ATAN_Q3)) + (z * (z * t.ATAN_Q4)))));
+    let tail = (q * z) * (m.mla(z * z, m.mla(z, t.ATAN_R3, t.ATAN_R2), m.mla(z, t.ATAN_R1, t.ATAN_R0)));
     let b = m.fast_two_sum(m.from_bits(t.ATAN_B[row + 1]), q);
-    let lo = (b.lo + m.from_bits(t.ATAN_B[row + 2])) + tail;
     let mut eq: f64 = 3.352873534367973e-16;  // 3.02 2^-53
-    if with_lo {
-        eq = 4.463096558993129e-16;  // 4.02 2^-53
+    if @target_has("fma") or @target_arch("aarch64") {
+        eq = 2.242650509742816e-16;  // 2.02 2^-53
     }
-    return Est.{ hi: b.hi, lo: lo, e: (@abs(q) * eq) + (b.hi * 9.860761315262648e-32) };
+    return Est.{
+        hi: b.hi,
+        lo: b.lo + m.from_bits(t.ATAN_B[row + 2]),
+        tail: tail,
+        e: m.mla(@abs(q), eq, 1.55e-31),  // (+ 2^-103 pi/2)
+    };
+}
+
+/// atan2's estimate of atan(s/b) = atan c + atan u + ul, c from a table: the
+/// parts that come from the table (c_hi, c_lo) apart from those computed.
+struct Est2 {
+    c_hi: f64,
+    c_lo: f64,
+    u: f64,
+    ul: f64,
+    tail: f64,
+    e: f64,
+}
+
+/// atan(s/b) for 2^-6 <= s/b <= 1 (q = s/b rounded) as an estimate in plain
+/// double arithmetic: atan c + atan u, u = (s - c b)/(b + c s), c from q's
+/// interval as in atan_est (|u| <= 1/64): the numerator rounded once (b c
+/// is near s), the denominator once or twice, the quotient once: u within
+/// 3.02 2^-53 |u| (4.02 without a fused multiply-add).
+inline fn atan2_est(s: f64, b: f64, q: f64) Est2 {
+    let row = @as(usize, @truncate(u32, (m.bits(q) >> 48) & 255)) * 3;
+    let c = m.from_bits(t.ATAN_B[row]);
+    let u = m.sub_prod(s, c, b) / m.mla(c, s, b);
+    let z = u * u;
+    let mut eq: f64 = 4.463096558993129e-16;  // 4.02 2^-53
+    if @target_has("fma") or @target_arch("aarch64") {
+        eq = 3.352873534367973e-16;  // 3.02 2^-53
+    }
+    return Est2.{
+        c_hi: m.from_bits(t.ATAN_B[row + 1]),
+        c_lo: m.from_bits(t.ATAN_B[row + 2]),
+        u: u,
+        ul: 0.0,
+        tail: (u * z) * (m.mla(z * z, m.mla(z, t.ATAN_R3, t.ATAN_R2), m.mla(z, t.ATAN_R1, t.ATAN_R0))),
+        e: @abs(u) * eq,
+    };
 }
 
 /// atan(1/(a + al)) for a >= 2^6, as a double-double: 1/a by one division
@@ -222,17 +260,84 @@ pub inline fn atan(x: f64, rep: m.Rep) f64 {
     let a = m.from_bits(ax);
     if (ax - 0x3f90000000000000) < (0x4050000000000000 - 0x3f90000000000000) {
         // 2^-6 <= |x| < 2^6
-        let f = atan_est(a, 0.0, false);
-        if m.rounds(f.hi, f.lo, f.e) {
-            return @copysign(f.hi + f.lo, x);
+        let f = atan_est(a);
+        if est_rounds(f) {
+            return @copysign(f.hi + (f.lo + f.tail), x);
         }
     }
     let r = m.dd_round(atan_pos(a, 0.0));
     return @copysign(r, x);
 }
 
-/// The arctangent of y/x, in the quadrant of (x, y).
+// atan2's quadrants for |y| > |x| (1) and x < 0 (2): O (hi, lo) and the
+// sign of atan(min/max) in O +- atan
+let QUAD: [12]f64 = [
+    0.0, 0.0, 1.0,               // atan
+    t.PIO2_HI, t.PIO2_LO, -1.0,  // pi/2 - atan
+    t.PI_HI, t.PI_LO, -1.0,      // pi - atan
+    t.PIO2_HI, t.PIO2_LO, 1.0,   // pi - (pi/2 - atan)
+];
+
+/// The arctangent of y/x, in the quadrant of (x, y): for exponents within
+/// 60 of each other and in [0x200, 0x600) (neither zero, infinite nor NaN,
+/// and no scaling needed), an estimate in double and a rounding test
+/// (Ziv's strategy), else atan2_slow.
 pub inline fn atan2(y: f64, x: f64, rep: m.Rep) f64 {
+    let bx = m.bits(x);
+    let by = m.bits(y);
+    let ax = bx & 0x7fffffffffffffff;
+    let ay = by & 0x7fffffffffffffff;
+    let ex = ax >> 52;
+    let ey = ay >> 52;
+    if ((ex -% 0x200) < 0x400) and ((ey -% 0x200) < 0x400) and (((ex -% ey) +% 60) <= 120) {
+        // atan of the smaller over the larger, from their quotient (the
+        // order of positive doubles is that of their bits)
+        let sw = b2u(ay > ax);
+        let small = m.from_bits(@min(ax, ay));
+        let big = m.from_bits(@max(ax, ay));
+        let q = small / big;
+        let mut f = Est2.{ c_hi: 0.0, c_lo: 0.0, u: 0.0, ul: 0.0, tail: 0.0, e: 0.0 };
+        if q >= 0.015625 {
+            f = atan2_est(small, big, q);
+        } else {
+            // c = 0 and u + ul = small/big, the residual exact (ul within
+            // 2^-105 u), the series within 2^-70 u
+            let z = q * q;
+            f = Est2.{
+                c_hi: 0.0,
+                c_lo: 0.0,
+                u: q,
+                ul: m.residual(small, q, big) / big,
+                tail: (q * z) * (m.mla(z * z, m.mla(z, t.ATAN_R3, t.ATAN_R2), m.mla(z, t.ATAN_R1, t.ATAN_R0))),
+                e: q * 8.470329472543003e-22,  // 2^-70
+            };
+        }
+        // O + atan or O - atan for the quadrant's O in {0, pi/2, pi} (QUAD's
+        // row, without branches: the quadrants are unpredictable): O + s c
+        // (from the tables, early) and then s u, exactly (|u| <= |O + s c|
+        // or both are 0) but for the low parts' roundings (each within
+        // 2^-104 of the result)
+        let row = @min(@as(usize, @truncate(u32, sw + ((bx >> 63) * 2))), 3) * 3;
+        let sg = QUAD[row + 2];
+        let a = m.fast_two_sum(QUAD[row], f.c_hi * sg);
+        let b = m.fast_two_sum(a.hi, f.u * sg);
+        let g = Est.{
+            hi: b.hi,
+            lo: b.lo + ((a.lo + QUAD[row + 1]) + ((f.c_lo + f.ul) * sg)),
+            tail: f.tail * sg,
+            e: f.e + 3.1e-31,  // (+ 2^-103 pi)
+        };
+        if est_rounds(g) {
+            return @copysign(g.hi + (g.lo + g.tail), y);
+        }
+    }
+    return atan2_slow(y, x, rep);
+}
+
+/// atan2 where its fast path does not decide: the special operands, the
+/// operands of exponents far apart or far from 0, and the estimates that
+/// fail the rounding test (in double-double, rounded once).
+fn atan2_slow(y: f64, x: f64, rep: m.Rep) f64 @multiversion("fma") {
     let bx = m.bits(x);
     let by = m.bits(y);
     let ax = bx & 0x7fffffffffffffff;
@@ -296,32 +401,18 @@ pub inline fn atan2(y: f64, x: f64, rep: m.Rep) f64 {
                 fx = (fx * sc1) * sc2;
                 fy = (fy * sc1) * sc2;
             }
-            // the smaller over the larger as a double-double (one division,
-            // the residual exact), then atan
-            let small = @min(fx, fy);
-            let big = @max(fx, fy);
-            let inv = 1.0 / big;
-            let q = small * inv;
-            let pr = m.two_prod(q, big);
-            let ql = ((small - pr.hi) - pr.lo) * inv;
-            if q >= 0.015625 {
-                // the estimate, then pi/2 - it and pi - it (without branches:
-                // the quadrants are unpredictable), exactly but for the low
-                // parts' roundings (each within 2^-104 of the result)
-                let f = atan_est(q, ql, true);
-                let swap = @as(u64, 0) -% b2u(fy > fx);
-                let a = m.fast_two_sum(m.select(swap, t.PIO2_HI, 0.0), m.flip(f.hi, swap & 0x8000000000000000));
-                let alo = (a.lo + m.select(swap, t.PIO2_LO, 0.0)) + m.flip(f.lo, swap & 0x8000000000000000);
-                let nx = @as(u64, 0) -% (bx >> 63);
-                let b = m.fast_two_sum(m.select(nx, t.PI_HI, 0.0), m.flip(a.hi, nx & 0x8000000000000000));
-                let blo = (b.lo + m.select(nx, t.PI_LO, 0.0)) + m.flip(alo, nx & 0x8000000000000000);
-                let e = (f.e + (@abs(a.hi) * 9.860761315262648e-32)) + (@abs(b.hi) * 9.860761315262648e-32);
-                if m.rounds(b.hi, blo, e) {
-                    return @copysign(b.hi + blo, y);
-                }
-            }
+            // atan of the smaller over the larger, from their quotient (the
+            // order of positive doubles is that of their bits) as a
+            // double-double (the residual exact)
+            let ix = m.bits(fx);
+            let iy = m.bits(fy);
+            let sw = b2u(iy > ix);
+            let small = m.from_bits(@min(ix, iy));
+            let big = m.from_bits(@max(ix, iy));
+            let q = small / big;
+            let ql = m.residual(small, q, big) / big;
             r = atan_pos(q, ql);
-            if fy > fx {
+            if sw != 0 {
                 r = m.dd_add(m.dd(t.PIO2_HI, t.PIO2_LO), m.dd_neg(r));
             }
             if neg_x {

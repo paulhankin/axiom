@@ -839,7 +839,9 @@ C23's `_Decimal32`, `_Decimal64` and `_Decimal128` (`__STDC_IEC_60559_DFP__` is
 `202311L` in C23 mode) are IEEE 754-2019's decimal32, decimal64 and decimal128 formats,
 encoded in BID (binary integer decimal), the encoding the C ABIs of x86-64 and AArch64
 specify: 4, 8 and 16 bytes, aligned to their sizes. Their arithmetic is software of the
-compiler's (`std/c/rt/decimal.ax`), the same on every target:
+compiler's (`std/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
+`_Decimal64`'s `+` and `*` in 64-bit integers where the exact result's coefficient fits
+128 bits and its exponent is far from the format's limits):
 
 - **Constants** (`1.20df`, `1.2E+3dd`, `5.dl`; C23 only, not hexadecimal: `C1019`) are
   rounded once to the type (to nearest), with the quantum they are written with:
@@ -1093,20 +1095,23 @@ functions are C (`std/c/lib/math/`).
   arguments per function.
 - **Speed.** The kernels compute in plain double where the error bound allows
   (`log2`, `log10` and `log1p` from log's table, `log10` with a table of its own, `asin`
-  and `acos` with their tails in double, `cbrt` from a polynomial and one division, the
+  and `acos` with their tails in double, `cbrt` from a table of 1/c and cbrt(c) and a
+  polynomial without a division, `sinh` and `cosh` from the exponential's parts, the
   inverse hyperbolic functions from double-double arguments with one division, `erf`,
-  `erfc` and the gamma pieces by Estrin's scheme with the first terms compensated), and
-  in double-double only where cancellation needs it (Ziv's strategy in `atan` and
-  `atan2`). Against the x86-64 Linux system C library (`-O2`, one core, the time of a
-  call on a stream of arguments, measured on a loaded machine: CPU time, best of five):
-  most functions take 0.5 to 1.5 times as long, `log`, `log2`, `pow`, `atan2`, `cosh`,
-  `exp10`, `powf`, `exp2f` and `sinf` 1.5 to 2 times, `tan` and `hypot` about 2 times,
-  and `erf`, `erfc`, `lgamma`, `lgammaf` and `erfcf` (near 0 and beyond 10) 2.2 to 3.7
-  times (not yet tuned). `std/math` has the same kernels: against its former functions,
-  most are as fast or faster (the error and gamma functions, `exp2`, `pow`, `hypot`,
-  `tanh` and the float ones several times), `log10` and `sin` within 10%, and `atan`,
-  `cbrt`, `tan`, `sinh`, `lgamma` and `atan2` 1.3 to 2 times slower (their former
-  versions were less accurate: up to 2 ulps for `tan` and `sinh`).
+  `erfc` and the gamma pieces by Estrin's scheme with the first terms compensated, `erf`
+  and `erfc` taking their piece from the argument's bits), and in double-double only
+  where cancellation needs it, with Ziv's strategy (an estimate in double, with fused
+  multiply-adds where the hardware has them, and a rounding test, the double-double
+  kernel only when the test fails) in `atan`, `atan2` (reduced directly from y and x)
+  and `powf` (whose float result is correctly rounded or computed by the double
+  function); `tan` takes its odd form from a table of -cot c rather than a branch.
+  Against the x86-64 Linux system C library (`-O2`, one core, the time of a call on a
+  stream of arguments, measured on a loaded machine: CPU time, best of seven): most
+  functions take 0.5 to 1.5 times as long, `erf`, `erfc` and `exp10` about 1.15 to 1.3,
+  `lgamma`, `tan`, `asinh`, `pow` and `powf` 1.4 to 1.65, and `log2`, `acosh` 1.7 to 1.8.
+  `std/math` has the same kernels: against its former functions, every one is as fast or
+  faster, or within 15% (`atan`, `atan2`, `tan`, `cbrt`, `lgamma`; their former versions
+  were less accurate: up to 2 ulps for `tan` and `sinh`).
 - **The complex functions** follow Annex G's special values (G.6) and Kahan's methods;
   each part is within a few ulps, not correctly rounded: the steps where roundings
   add up (Kahan's `1 + t^2` and `1 + b s^2` of `ctanh`, the products of the square roots
@@ -1132,17 +1137,18 @@ functions are C (`std/c/lib/math/`).
   from the format's bits taken apart exactly, with tables of triple-doubles and an exact
   reduction of the trigonometric arguments over the whole exponent range, and round once
   (`std/c/rt/math_ld.ax`): within 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's
-  (measured: 0.500 for each, both formats). They take about 1 to 2 us a call (x86-64,
-  x87 format; the software arithmetic of the format is part of a call's cost), 10 to 80
-  times the x87 hardware's functions of the system library (`powl` and `fmal` about the
-  same). The complex `l` functions are the double ones' methods on these (each part within
-  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 2, the
-  continued fraction above it), `lgammal` and `tgammal` (Stirling's series from 24 up, the
+  (measured: 0.500 for each, both formats). They take about 0.3 to 3 us a call (x86-64,
+  x87 format), 3 to 80 times the x87 hardware's functions of the system library (most
+  5 to 20 times). The complex `l` functions are the double ones' methods on these (each part within
+  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 2 and the
+  series of positive terms times e^-x^2 from 2 to 6, by Horner's rule on tables of
+  their coefficients; the continued fraction above, its deeper levels in
+  double-double), `lgammal` and `tgammal` (Stirling's series from 24 up, the
   Taylor series of `lgamma(2 + z)` and the recurrence below, the reflection for negative
   arguments, with the Taylor series about each zero of `lgamma` in (-34, -2) where the
   reflection cancels) compute in triple-double too: within 0.55 ulp of binary128 and
   0.5 + 2^-6 of the x87's (measured on 900 arguments each, near the zeros of `lgamma`
-  included); 4 to 15 us a call. `_Float128`'s `erff128` ... `tgammaf128` are the same.
+  included); 3 to 5 us a call. `_Float128`'s `erff128` ... `tgammaf128` are the same.
 - **Errors** (7.12.1): `math_errhandling` is `MATH_ERRNO | MATH_ERREXCEPT` on x86-64 and
   AArch64 and `MATH_ERRNO` on WebAssembly. A domain error sets `errno` to `EDOM` and raises
   "invalid"; a pole error `ERANGE` and "divide-by-zero"; an overflow `ERANGE` and
@@ -1427,7 +1433,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later; also of `_Float16` ... `_Float64x`) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. The imaginary types (`float _Imaginary`, `double _Imaginary`, `long double _Imaginary`, C99 and later, Annex G) have their real type's representation (the imaginary part); their arithmetic is G.5's (an imaginary times an imaginary is real, a real plus an imaginary complex, ...), their conversions G.4's (an imaginary converted to a real type is 0, a complex one to an imaginary type its imaginary part). |
 | Interchange and extended floating types | (C23 Annex H, and in every mode before C23.) `_Float16` is binary16, `_Float32` binary32, `_Float64` and `_Float32x` binary64, `_Float128` binary128 (`__float128` in a GNU dialect), `_Float64x` the x87 format where `long double` has it, else binary128; each a type of its own. `_Float16`'s operations are rounded to binary16 each (`FLT_EVAL_METHOD` 0: computed in `float`, which is exact enough that the one rounding is correct), `_Float128`'s and `_Float64x`'s are `long double`'s software arithmetic in that format. The usual arithmetic conversions take the type with more values, then of two with the same values an interchange type over a standard one over an extended one (`float + _Float32` is `_Float32`, `double + _Float32x` is `double`). Constants take `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` (either case). `<float.h>` has their macros (`FLT16_MAX` ...) under `__STDC_WANT_IEC_60559_TYPES_EXT__`; `__STDC_IEC_60559_TYPES__` is not defined (it needs Annex F). |
-| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
+| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals (`+ - * /` of normal operands with a normal result by 64-bit integer fast paths, division by Knuth's Algorithm D); constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |

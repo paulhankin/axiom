@@ -1125,8 +1125,256 @@ pub fn add(xw: ld.W, yw: ld.W, sub: bool, f: u32, c: *mut Ctx) ld.W {
     return addf(xw, yw, sub, f, f, c);
 }
 
+// -----------------------------------------------------------------------------
+// Fast paths: decimal32's and decimal64's + and * of finite canonical
+// nonzero operands in 64-bit integers: + when the larger operand's
+// coefficient on the smaller one's exponent fits (19 digits), * always (the
+// product of the coefficients in 128 bits, divided by a power of ten at
+// most twice), when the result's exponent is far from the format's limits; they agree with the general code (add_core, finish) bit
+// for bit, flags included. Anything else is left to the general code.
+// -----------------------------------------------------------------------------
+
+// 10^k, k = 0 .. 19.
+let P10_64: [20]u64 = [
+    1,
+    10,
+    100,
+    1000,
+    10000,
+    100000,
+    1000000,
+    10000000,
+    100000000,
+    1000000000,
+    10000000000,
+    100000000000,
+    1000000000000,
+    10000000000000,
+    100000000000000,
+    1000000000000000,
+    10000000000000000,
+    100000000000000000,
+    1000000000000000000,
+    10000000000000000000,
+];
+
+// The number of decimal digits of x (x < 10^20).
+inline fn digits64(x: u64) i32 {
+    let mut n: usize = 1;
+    while (n < 20) and (x >= P10_64[n]) {
+        n += 1;
+    }
+    return @bit_cast(i32, @truncate(u32, n));
+}
+
+// A finite canonical decimal32 or decimal64 (BID) taken apart from its bits:
+// ok false for an infinity, a NaN or a non-canonical coefficient.
+struct Fin {
+    ok: bool,
+    neg: bool,
+    q: i32,
+    c: u64,
+}
+
+inline fn fin_of(w: ld.W, f: u32) Fin {
+    let mut x = w.lo;
+    let mut kb: u32 = 64;
+    let mut eb: u32 = 10;
+    if f == D32 {
+        x = x & 0xFFFF_FFFF;
+        kb = 32;
+        eb = 8;
+    }
+    let neg = ((x >> (kb - 1)) & 1) != 0;
+    let cb = kb - 1 - eb;  // the coefficient's bits in the first form
+    let g = (x >> (kb - 3)) & 3;
+    let mut e: u64 = 0;
+    let mut c: u64 = 0;
+    if g != 3 {
+        e = (x >> cb) & ((@as(u64, 1) << eb) - 1);
+        c = x & ((@as(u64, 1) << cb) - 1);
+    } else {
+        if ((x >> (kb - 5)) & 3) == 3 {
+            return Fin.{ ok: false, neg: neg, q: 0, c: 0 };  // (infinity, NaN)
+        }
+        e = (x >> (cb - 2)) & ((@as(u64, 1) << eb) - 1);
+        c = (x & ((@as(u64, 1) << (cb - 2)) - 1)) | (@as(u64, 4) << (cb - 2));
+    }
+    let p = @as(usize, @bit_cast(u32, prec(f)));
+    if c >= P10_64[p] {
+        return Fin.{ ok: false, neg: neg, q: 0, c: 0 };  // (non-canonical)
+    }
+    return Fin.{ ok: true, neg: neg, q: @bit_cast(i32, @truncate(u32, e)) - bias(f), c: c };
+}
+
+// (-1)^neg n 10^q (n < 2^64, exact), rounded to format f as finish does:
+// ok false where the result's exponent comes near the format's limits.
+struct Fast {
+    ok: bool,
+    w: ld.W,
+}
+
+inline fn fast_finish(neg: bool, n: u64, q: i32, f: u32, c: *mut Ctx) Fast {
+    let p = prec(f);
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    if (q < (qmin(f) + 20)) or (q > (qmax(f) - 20)) {
+        return no;
+    }
+    let nd = digits64(n);
+    if nd <= p {
+        // exact: the preferred exponent q itself represents it
+        return Fast.{ ok: true, w: pack(neg, u2(0, n), q, f) };
+    }
+    // (nd - p) digits dropped: the first of them and whether any other is
+    // nonzero
+    let k = @as(usize, @bit_cast(u32, nd - p));
+    let mut m = n / P10_64[k];
+    let rm = n - (m * P10_64[k]);
+    let d = @truncate(u32, rm / P10_64[k - 1]);
+    let rest = (rm - (@as(u64, d) * P10_64[k - 1])) != 0;
+    let mut e = q + @bit_cast(i32, @truncate(u32, k));
+    if rounds_up(c.mode, neg, (m & 1) != 0, d, rest) {
+        m += 1;
+        if m == P10_64[@as(usize, @bit_cast(u32, p))] {
+            m = P10_64[@as(usize, @bit_cast(u32, p - 1))];
+            e += 1;
+        }
+    }
+    if (d != 0) or rest {
+        c.flags = c.flags | F_INEXACT;
+    }
+    return Fast.{ ok: true, w: pack(neg, u2(0, m), e, f) };
+}
+
+// The 128-bit product of two 64-bit integers (in 32-bit halves).
+inline fn mul_64(a: u64, b: u64) U2 {
+    let m: u64 = 0xFFFF_FFFF;
+    let a0 = a & m;
+    let a1 = a >> 32;
+    let b0 = b & m;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = ((p00 >> 32) + (p01 & m)) + (p10 & m);
+    return u2(((p11 + (p01 >> 32)) + (p10 >> 32)) + (mid >> 32), (p00 & m) | (mid << 32));
+}
+
+// fast_finish for a 128-bit n (10^19 <= n < 10^38): divided by 10^k, k at
+// most the digits beyond p (from n's bit length, within one), by divsm2's
+// divisions by at most 10^9, then once more by 10 if that left p + 1
+// digits; the remainder (below 10^19) gives the rounding.
+inline fn fast_finish2(neg: bool, n: U2, q: i32, f: u32, c: *mut Ctx) Fast {
+    let p = prec(f);
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    if (q < (qmin(f) + 40)) or (q > (qmax(f) - 40)) {
+        return no;
+    }
+    // floor((bits - 1) log10 2) + 1 <= digits (1233/4096 gives that floor
+    // exactly up to 199 bits; in integers: binary floating-point arithmetic
+    // here would raise its flags)
+    let bl = 128 - @as(i32, @bit_cast(i32, @truncate(u32, @clz(n.h))));
+    let nd_lo = (((bl - 1) * 1233) >> 12) + 1;
+    let k = nd_lo - p;
+    if (k < 1) or (k > 18) {
+        return no;
+    }
+    let mut t = n;
+    let k1 = @min(k, 9);
+    let r1 = divsm2(&mut t, P10_64[@as(usize, @bit_cast(u32, k1))]);
+    let mut rm = r1;
+    if k > 9 {
+        let r2 = divsm2(&mut t, P10_64[@as(usize, @bit_cast(u32, k - 9))]);
+        rm = r1 + (r2 * P10_64[9]);
+    }
+    if t.h != 0 {
+        return no;
+    }
+    let mut m = t.l;
+    let mut kk = k;
+    if m >= P10_64[@as(usize, @bit_cast(u32, p))] {
+        let d = m % 10;
+        m = m / 10;
+        rm = rm + (d * P10_64[@as(usize, @bit_cast(u32, kk))]);
+        kk += 1;
+    }
+    // (kk <= 19: rm below 10^19)
+    let u = @as(usize, @bit_cast(u32, kk));
+    let d = @truncate(u32, rm / P10_64[u - 1]);
+    let rest = (rm - (@as(u64, d) * P10_64[u - 1])) != 0;
+    let mut e = q + kk;
+    if rounds_up(c.mode, neg, (m & 1) != 0, d, rest) {
+        m += 1;
+        if m == P10_64[@as(usize, @bit_cast(u32, p))] {
+            m = P10_64[@as(usize, @bit_cast(u32, p - 1))];
+            e += 1;
+        }
+    }
+    if (d != 0) or rest {
+        c.flags = c.flags | F_INEXACT;
+    }
+    return Fast.{ ok: true, w: pack(neg, u2(0, m), e, f) };
+}
+
+// x + y (y's sign flipped if sub) by the fast path, if it applies.
+fn fast_add(xw: ld.W, yw: ld.W, sub: bool, f: u32, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let mut x = fin_of(xw, f);
+    let mut y = fin_of(yw, f);
+    if not (x.ok and y.ok) or (x.c == 0) or (y.c == 0) {
+        return no;
+    }
+    if sub {
+        y.neg = not y.neg;
+    }
+    if x.q < y.q {
+        let t = x;
+        x = y;
+        y = t;
+    }
+    let dq = x.q - y.q;
+    if (dq > 18) or ((digits64(x.c) + dq) > 19) {
+        return no;
+    }
+    // x's coefficient on y's exponent (below 10^19: exact, and so is the sum)
+    let a = x.c * P10_64[@as(usize, @bit_cast(u32, dq))];
+    if x.neg == y.neg {
+        return fast_finish(x.neg, a + y.c, y.q, f, c);
+    }
+    if a == y.c {
+        // (an exact zero: +0, -0 rounding downward, with the lesser exponent)
+        return Fast.{ ok: true, w: zero(c.mode == R_DOWN, y.q, f) };
+    }
+    if a > y.c {
+        return fast_finish(x.neg, a - y.c, y.q, f, c);
+    }
+    return fast_finish(y.neg, y.c - a, y.q, f, c);
+}
+
+// x * y by the fast path, if it applies.
+fn fast_mul(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let x = fin_of(xw, f);
+    let y = fin_of(yw, f);
+    if not (x.ok and y.ok) or (x.c == 0) or (y.c == 0) {
+        return no;
+    }
+    let pr = mul_64(x.c, y.c);
+    if (pr.h == 0) and (pr.l < P10_64[19]) {
+        return fast_finish(x.neg != y.neg, pr.l, x.q + y.q, f, c);
+    }
+    return fast_finish2(x.neg != y.neg, pr, x.q + y.q, f, c);
+}
+
 /// x + y (sub: x - y) of format fi, rounded to format f.
 pub fn addf(xw: ld.W, yw: ld.W, sub: bool, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    if (fi == f) and (f != D128) {
+        let r = fast_add(xw, yw, sub, f, c);
+        if r.ok {
+            return r.w;
+        }
+    }
     let x = unpack(xw, fi);
     let mut y = unpack(yw, fi);
     if is_nan(x) or is_nan(y) {
@@ -1160,6 +1408,12 @@ pub fn mul(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) ld.W {
 
 /// x * y of format fi, rounded to format f.
 pub fn mulf(xw: ld.W, yw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    if (fi == f) and (f != D128) {
+        let r = fast_mul(xw, yw, f, c);
+        if r.ok {
+            return r.w;
+        }
+    }
     let x = unpack(xw, fi);
     let y = unpack(yw, fi);
     if is_nan(x) or is_nan(y) {

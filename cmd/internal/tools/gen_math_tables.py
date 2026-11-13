@@ -360,17 +360,25 @@ coeffs('ATAN_P', cs, err, 'atan u = u + u z (P0 + P1 z + ... + P6 z^6), z = u^2,
 cs, err = fit('AT', lambda z: (mp.atan(mp.sqrt(z)) / mp.sqrt(z) - 1) / z if z != 0 else -mp.mpf(1) / 3, range(5), 0, U,
               lambda z: z * mp.sqrt(z) / mp.atan(mp.sqrt(z)) if z != 0 else 0)
 coeffs('ATAN_Q', cs, err, 'atan u = u + u z (Q0 + Q1 z + ... + Q4 z^4), z = u^2, |u| <= 1/32 (the fast path)')
+# (the reduction below leaves |u| <= 1/65)
+U64 = (mp.mpf(1) / 64) ** 2
+cs, err = fit('AT', lambda z: (mp.atan(mp.sqrt(z)) / mp.sqrt(z) - 1) / z if z != 0 else -mp.mpf(1) / 3, range(4), 0, U64,
+              lambda z: z * mp.sqrt(z) / mp.atan(mp.sqrt(z)) if z != 0 else 0)
+coeffs('ATAN_R', cs, err, 'atan u = u + u z (R0 + R1 z + R2 z^2 + R3 z^3), z = u^2, |u| <= 1/64 (the fast path)')
 # atan x = atan c + atan((x - c)/(1 + x c)): for x in [2^-6, 2^6), c the middle of
 # x's sixteenth of its binade (the exponent's 12 binades and 4 bits of the
 # significand index the table), so |u| <= 1/32
-at = []
+# (the row of x is bits(x) >> 48 modulo 256: the 192 values of x's top 16
+# bits in [2^-6, 2^6) are distinct modulo 256; the other 64 rows are zero)
+at = [0] * (256 * 3)
 for e in range(-6, 6):
     for k in range(16):
         c = mp.mpf(2) ** e * (1 + (mp.mpf(k) + mp.mpf('0.5')) / 16)
         v = mp.atan(c)
         h = d(v)
-        at += [bits(d(c)), bits(h), bits(d(v - mp.mpf(h)))]
-u64_array('ATAN_B', at, 'for x in [2^-6, 2^6): rows of c, atan(c) (hi, lo), c = 2^e (1 + (k + 1/2)/16), row (e + 6) 16 + k')
+        row = ((e + 1023) * 16 + k) % 256
+        at[3 * row:3 * row + 3] = [bits(d(c)), bits(h), bits(d(v - mp.mpf(h)))]
+u64_array('ATAN_B', at, 'for x in [2^-6, 2^6): rows of c, atan(c) (hi, lo), c = 2^e (1 + (k + 1/2)/16), row ((e + 1023) 16 + k) mod 256')
 
 # -----------------------------------------------------------------------------
 # sinh and tanh near 0
@@ -440,8 +448,10 @@ cs, err = fit('ERF', lambda z: mp.erf(mp.sqrt(z)) / mp.sqrt(z) if z != 0 else tw
 coeffs('ERF_P', cs, err, 'erf x = x (P0 + P1 z + ... + P15 z^15), z = x^2 <= 1 (P0 = 2/sqrt(pi) to 106 bits: P0 + ERF_P0_LO)')
 const('ERF_P0_LO', d(two_sqrtpi - mp.mpf(cs[0])))
 pieces('ERFC_A', lambda x: mp.erfc(x) * mp.exp(x * x), '0.5', 4, 28, 9, 'erfc x e^(x^2) for 1/2 <= x <= 4')
-pieces('ERFC_B', lambda v: mp.erfc(1 / v) * mp.exp(1 / (v * v)) / v, mp.mpf(1) / 28, mp.mpf('0.25'), 8, 9,
-       'erfc x e^(x^2) x for 4 <= x <= 28, in v = 1/x', 'v')
+# (in pieces of 1/64 from 0, so that v's piece is floor(64 v), exactly: the
+# first two are those of x > 32, beyond erfc's underflow)
+pieces('ERFC_B', lambda v: mp.erfc(1 / v) * mp.exp(1 / (v * v)) / v if v != 0 else 1 / mp.sqrt(mp.pi), 0,
+       mp.mpf('0.25'), 16, 9, 'erfc x e^(x^2) x for x >= 4, in v = 1/x', 'v')
 pieces('ERFCF_A', lambda x: mp.erfc(x) * mp.exp(x * x), '0.5', 4, 14, 8, 'erfc x e^(x^2) for 1/2 <= x <= 4 (float)')
 pieces('ERFCF_B', lambda v: mp.erfc(1 / v) * mp.exp(1 / (v * v)) / v, mp.mpf(1) / 11, mp.mpf('0.25'), 2, 7,
        'erfc x e^(x^2) x for 4 <= x <= 11, in v = 1/x (float)', 'v')
@@ -501,6 +511,19 @@ cs, err = fit('CB', mp.cbrt, range(6), 1, 2, lambda f: 1 / mp.cbrt(f))
 coeffs('CBRT_P', cs, err, 'cbrt f = P0 + P1 f + ... + P5 f^5 for 1 <= f <= 2')
 const('CBRT2', d(mp.cbrt(2)), '2^(1/3)')
 const('CBRT4', d(mp.cbrt(4)), '2^(2/3)')
+# cbrt's table: m = 2^j f in [1, 8) (j = 0, 1, 2), in 64 intervals a binade;
+# the middle c of m's interval, cbrt m = cbrt(c) (1 + t)^(1/3), t = (m - c)/c
+cb = []
+for j in range(3):
+    for i in range(64):
+        c = mp.mpf(2) ** j * (1 + (mp.mpf(i) + mp.mpf(1) / 2) / 64)
+        h = d(mp.cbrt(c))
+        cb += [bits(d(1 / c)), bits(h), bits(d(mp.cbrt(c) - mp.mpf(h)))]
+u64_array('CBRT_T', cb, 'for m = 2^j f in [1, 8): rows of 1/c, cbrt(c) (hi, lo), c = 2^j (1 + (i + 1/2)/64), row 64 j + i')
+CBT = mp.mpf(1) / 129
+cs, err = fit('CBQ', lambda t: (mp.cbrt(1 + t) - 1) / t if t != 0 else mp.mpf(1) / 3, range(6), -CBT, CBT,
+              lambda t: abs(t))
+coeffs('CBRT_Q', cs, err, '(1 + t)^(1/3) = 1 + t (Q0 + Q1 t + ... + Q5 t^5) for |t| <= 1/129 (error relative to 1)')
 # log1p's for |x| <= 1/32, without a reduction
 cs, err = fit('L1P', lambda r: (mp.log1p(r) - r) / (r * r) if r != 0 else mp.mpf(-0.5), range(9), -mp.mpf(1) / 32,
               mp.mpf(1) / 32, lambda r: r * r / mp.log1p(r) if r != 0 else 0, fixed=[-0.5])
@@ -512,7 +535,15 @@ for j in range(256):
     v = mp.tan(mp.mpf(j) / 256)
     h = d(v)
     tt += [bits(h), bits(d(v - mp.mpf(h)))]
-u64_array('TAN_T', tt, 'tan(j/256) as pairs (hi, lo), j = 0 .. 255')
+# and -cot(j/256) = tan(j/256 - pi/2), for the odd form -1/tan (j = 0: unused)
+for j in range(256):
+    if j == 0:
+        tt += [0, 0]
+        continue
+    v = -mp.cot(mp.mpf(j) / 256)
+    h = d(v)
+    tt += [bits(h), bits(d(v - mp.mpf(h)))]
+u64_array('TAN_T', tt, 'tan(j/256), then -cot(j/256), as pairs (hi, lo), j = 0 .. 255 (row j, row 256 + j)')
 Z = (mp.mpf(1) / 512 * mp.mpf('1.0001')) ** 2
 cs, err = fit('TN', lambda z: (mp.tan(mp.sqrt(z)) / mp.sqrt(z) - 1) / z if z != 0 else mp.mpf(1) / 3, range(3), 0, Z,
               lambda z: z * mp.sqrt(z) / mp.tan(mp.sqrt(z)) if z != 0 else 0)
@@ -529,6 +560,14 @@ coeffs('EXPF_P', cs, err, 'e^r = 1 + r + r^2 (P0 + P1 r), |r| <= ln2/256')
 cs, err = fit('LF', lambda r: (mp.log1p(r) - r) / (r * r) if r != 0 else mp.mpf(-0.5), range(4), -RM, RM,
               lambda r: r * r / mp.log1p(r) if r != 0 else 0)
 coeffs('LOGF_P', cs, err, 'log1p(r) = r + r^2 (P0 + P1 r + P2 r^2 + P3 r^3) for |r| <= the bound of LOG_P')
+# powf's: log2(1 + r) directly, and 2^u, without the conversions by ln2
+cs, err = fit('L2F', lambda r: mp.log1p(r) / r / LN2 if r != 0 else 1 / LN2, range(5), -RM, RM,
+              lambda r: r * LN2 / mp.log1p(r) if r != 0 else LN2)
+coeffs('LOG2F_P', cs, err, 'log2(1 + r) = r (P0 + P1 r + ... + P4 r^4) for |r| <= the bound of LOG_P')
+U2 = mp.mpf(1) / 256 * mp.mpf('1.0001')
+cs, err = fit('E2F', lambda u: (mp.mpf(2) ** u - 1) / u if u != 0 else LN2, range(4), -U2, U2,
+              lambda u: u / mp.mpf(2) ** u)
+coeffs('EXP2F_P', cs, err, '2^u = 1 + u (P0 + P1 u + P2 u^2 + P3 u^3) for |u| <= 1/256')
 Z = (mp.pi / 4 * mp.mpf('1.0001')) ** 2
 cs, err = fit('SF', lambda z: (mp.sin(mp.sqrt(z)) / mp.sqrt(z) - 1) / z if z != 0 else -mp.mpf(1) / 6, range(4), 0, Z,
               lambda z: z * mp.sqrt(z) / mp.sin(mp.sqrt(z)) if z != 0 else 0)
@@ -716,6 +755,17 @@ with mp.workprec(800):
     u64_array('LGAMMA2_C', tab, '(-1)^k (zeta(k) - 1) / k, k = 2 .. 81: lgamma(2 + z) = (1 - gamma) z + sum of '
               'these z^k, |z| < 2 (as triple-doubles)')
     td_const('ONE_MINUS_EULER', 1 - mp.euler, "1 - Euler's constant")
+    tab = []
+    for n in range(0, 81):
+        tab += [bits(v) for v in td(mp.mpf((-1) ** n) / (mp.factorial(n) * (2 * n + 1)))]
+    u64_array('ERF_A', tab, '(-1)^n / (n! (2n + 1)), n = 0 .. 80: erf a = 2/sqrt(pi) a sum of these a^(2n) (A&S 7.1.5)')
+    tab = []
+    dfac = mp.mpf(1)
+    for n in range(0, 201):
+        dfac *= 2 * n + 1
+        tab += [bits(v) for v in td(mp.mpf(2) ** n / dfac)]
+    u64_array('ERF_P', tab, '2^n / (1 3 5 ... (2n + 1)), n = 0 .. 200: erf a = 2/sqrt(pi) a e^(-a^2) sum of these '
+              'a^(2n) (A&S 7.1.6: positive terms)')
     # the zeros x0 of lgamma in (-(n+1), -n), n = 2 .. 33 (two each: the one
     # nearer -(n+1), then the one nearer -n), to about 2^-300 (two
     # triple-doubles: x0 and what is left), with the Taylor coefficients

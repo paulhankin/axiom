@@ -528,7 +528,21 @@ pub fn erfcf(x: f32, rep: m.Rep) f32 {
 }
 
 pub fn lgammaf(x: f32, rep: m.Rep) f32 {
-    return m.to_f32(rep, sp.lgamma(d(x), rep));
+    let xd = d(x);
+    if (xd >= 12.0) and (xd <= 1.0e30) {
+        // Stirling's series in double: (x - 1/2) log x (log x within 2^-60,
+        // the product at least 2.38 x and within 2^-52 of itself) - x +
+        // log(2 pi)/2 + S(x), S to its fourth term (the fifth below 2^-46 of
+        // the result): within 2^-50 of the result
+        let lx = lg.log_fast(xd);
+        let h = xd - 0.5;
+        let r = 1.0 / xd;
+        let w = r * r;
+        // (plain products and sums: the same bits on every target)
+        let sv = r * (t.STIRLING_P0 + (w * (t.STIRLING_P1 + (w * (t.STIRLING_P2 + (w * t.STIRLING_P3))))));
+        return m.to_f32(rep, ((h * lx.hi) - xd) + ((t.HLN2PI_HI + sv) + (h * lx.lo)));
+    }
+    return m.to_f32(rep, sp.lgamma(xd, rep));
 }
 
 pub fn tgammaf(x: f32, rep: m.Rep) f32 {
@@ -541,19 +555,41 @@ pub inline fn powf(x: f32, y: f32, rep: m.Rep) f32 {
     let ix = m.bits(xd);
     if ((ix -% 0x0010000000000000) >= 0x7fe0000000000000) or (m.abits(yd) >= 0x7ff0000000000000) or (yd == 0.0) or
        (xd == 1.0) {
-        return m.to_f32(rep, pw.pow(xd, yd, rep));  // x <= 0, x or y not finite, the exact cases
+        return powf_d(xd, yd, rep);  // x <= 0, x or y not finite, the exact cases
     }
-    // x^y = 2^(y log2 x): log2 x within 2^-44 relative (its parts as for
-    // logf, with math_log.ax's -log2 c), so y log2 x within 2^-36.5 where the
-    // result is in float's range (and to_f32 overflows or underflows just
-    // beyond it); further out, the double function
+    // x^y = 2^(y log2 x): log2 x = k - log2 c + log2(1 + r) (r exact, the
+    // first two exact as A from log2's table, log2(1 + r) by LOG2F_P within
+    // 2^-45.2), e = y A + y B within 2^-36.5 where the result is a normal
+    // float (|e| < 126: |y A| and |y B| are below 360 there); further out,
+    // the double function. 2^e = 2^(n/128) 2^u, |u| <= 1/256 exactly, 2^u by
+    // EXP2F_P (2^-52.7): the double rv is within 2^-36 of x^y. Its rounding
+    // to float is then correct unless rv is within 2^-35 of a halfway point
+    // (the bits below float's are near 2^28, one case in 2^11; then the
+    // double function): so the result is the same bits whether the products
+    // and sums are fused (mla) or not.
     let rd = log_red(ix);
-    let l = (rd.k + m.from_bits(t.LOG2_L[2 * rd.i])) +
-            (m.from_bits(t.LOG2_L[(2 * rd.i) + 1]) + (log1p_k(rd.r) * t.INVLN2_HI));
-    let e = yd * l;
-    if @abs(e) < 160.0 {
-        return m.to_f32(rep, exp2_k(e));
+    let ya = yd * (rd.k + m.from_bits(t.LOG2_L[2 * rd.i]));
+    let r = rd.r;
+    let z = r * r;
+    let q = m.mla(z, m.mla(z, t.LOG2F_P4, m.mla(r, t.LOG2F_P3, t.LOG2F_P2)), m.mla(r, t.LOG2F_P1, t.LOG2F_P0));
+    let e = m.mla(yd, m.mla(r, q, m.from_bits(t.LOG2_L[(2 * rd.i) + 1])), ya);
+    if @abs(e) < 126.0 {
+        let kd0 = m.mla(e, 128.0, SHIFT);
+        let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+        let u = m.mla(kd0 - SHIFT, -0.0078125, e);  // (exact)
+        let sc = m.from_bits(t.EXP_T[@as(usize, @bit_cast(u32, n & 127)) * 2]) * m.pow2(n >> 7);
+        let w = u * u;
+        let p = m.mla(w, m.mla(u, t.EXP2F_P3, t.EXP2F_P2), m.mla(u, t.EXP2F_P1, t.EXP2F_P0));
+        let rv = m.mla(sc, u * p, sc);
+        if ((m.bits(rv) & 0x1fffffff) -% (0x10000000 - 0x20000)) > 0x40000 {
+            return @float_cast(f32, rv);
+        }
     }
+    return powf_d(xd, yd, rep);
+}
+
+/// powf by the double function (out of line: powf's own path stays small).
+fn powf_d(xd: f64, yd: f64, rep: m.Rep) f32 @multiversion("fma") {
     return m.to_f32(rep, pw.pow(xd, yd, rep));
 }
 
