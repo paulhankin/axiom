@@ -86,6 +86,7 @@ struct Arg {
 }
 
 struct PP {
+    asm_: bool,  // preprocessing assembly (preprocess_asm): `#` and an unknown directive's line are a comment
     o: *co.COptions,
     macros: u.SymMap.[*mut Macro],
     files: u.List.[Src],
@@ -2310,6 +2311,10 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
     }
     let nt = lx.next(L);
     let std = P.o.std;
+    if P.asm_ and ((nt.kind != lx.PK_IDENT) or not known_directive(nt.name)) {
+        lx.skip_line(L);  // (assembly: a comment, as the assembler reads `#` at a line's start)
+        return;
+    }
     if nt.kind != lx.PK_IDENT {
         _ = dg.err(nt.span, "C1041", u.f1("invalid preprocessing directive '#%s'", nt.text));
         lx.skip_line(L);
@@ -2477,6 +2482,10 @@ fn predefined_text(P: *PP) []u8 {
         } else if tg.g_arch == tg.ARCH_A64 {
             b.s("#define __AXIOM_ASM_AARCH64__ 1\n");
         }
+    } else if P.asm_ and (tg.g_arch == tg.ARCH_X64) {
+        b.s("#define __AXIOM_ASM_X86_64__ 1\n");  // (an assembly source: its language, in any mode)
+    } else if P.asm_ and (tg.g_arch == tg.ARCH_A64) {
+        b.s("#define __AXIOM_ASM_AARCH64__ 1\n");
     }
     if not o.char_signed {
         b.s("#define __CHAR_UNSIGNED__ 1\n");
@@ -2581,12 +2590,93 @@ fn protect_all(P: *mut PP) void {
     }
 }
 
+// Is `name` a directive of the preprocessor (assembly: any other line
+// starting with `#` is a comment)?
+fn known_directive(name: []u8) bool {
+    let ds = ["define", "undef", "include", "include_next", "line", "error", "warning", "ident", "pragma", "embed",
+              "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif"];
+    for d in ds {
+        if u.str_eq(name, d) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The text of the assembly source at `path` (a `.S` file) preprocessed,
+/// with __ASSEMBLER__ defined as 1: its directives done, its macros
+/// replaced, the other tokens as written (no C tokens are made of them), on
+/// the lines they were on in the file (a line of an included file or of a
+/// macro's expansion where it is used), `#` and an unknown directive at a
+/// line's start a comment (as the assembler reads them). Errors are
+/// reported through diag.ax.
+pub fn preprocess_asm(path: []u8, o: *co.COptions) []u8 {
+    let mut o2 = o.*;
+    let mut ds = u.List.[co.Define].empty();
+    ds.push(co.Define.{ name: "__ASSEMBLER__", body: "1", undef: false });
+    for d in o.defines {
+        ds.push(d);
+    }
+    o2.defines = ds.items();
+    let oo = u.new.[co.COptions]();
+    oo.* = o2;
+    g_asm = true;
+    let toks = preprocess(path, oo);
+    g_asm = false;
+    _ = toks;
+    let mut b = u.Buf.init();
+    let mut line: i32 = 1;
+    let mut first = true;
+    for t in g_asm_out.items() {
+        if t.kind == lx.PK_EOF {
+            break;
+        }
+        if t.bol and not first {
+            let lc = u.span_linecol(t.span);
+            if (t.span.file == g_asm_file) and not t.exp and (lc.sl > line) {
+                while line < lc.sl {
+                    b.c('\n');
+                    line += 1;
+                }
+            } else {
+                b.c('\n');
+                line += 1;
+            }
+        } else if t.bol and first {
+            let lc = u.span_linecol(t.span);
+            while (t.span.file == g_asm_file) and (line < lc.sl) {
+                b.c('\n');
+                line += 1;
+            }
+        } else if t.space {
+            b.c(' ');
+        }
+        first = false;
+        b.s(t.text);
+    }
+    b.c('\n');
+    g_asm_out.deinit();
+    g_asm_out = u.List.[lx.PTok].empty();
+    return b.done();
+}
+
+/// The file preprocess_asm read last (its id in u.g_files).
+pub fn asm_file_id() i32 {
+    return g_asm_file;
+}
+
+// (preprocess_asm's: the preprocessing tokens, not converted, and the file)
+let mut g_asm: bool = false;
+let mut g_asm_out: u.List.[lx.PTok] = u.List.[lx.PTok].{ data: @ptr_from_int(*mut lx.PTok, 0), len: 0, cap: 0 };
+let mut g_asm_file: i32 = 0;
+
 /// The tokens of the translation unit at `path`, preprocessed, ending with a
 /// T_EOF token. Errors are reported through diag.ax.
 pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     let mut toks = u.List.[ct.Token].empty();
     let P = u.new.[PP]();
     P.o = o;
+    P.asm_ = g_asm;
     P.eof_tok = lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
     P.eof_tok.bol = true;
     P.inject = u.nil_slice.[lx.PTok]();
@@ -2634,6 +2724,13 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     let mut e = P.eof_tok;
     e.span = u.mkspan(sf.id, @int_cast(u32, sf.text.len), @int_cast(u32, sf.text.len));
     P.out.push(e);
+    if P.asm_ {
+        // (assembly: its tokens as they are)
+        g_asm_out = P.out;
+        g_asm_file = sf.id;
+        P.out = u.List.[lx.PTok].empty();
+        return toks;
+    }
     // (as many tokens at most as there are preprocessing tokens: the list is
     // not grown, and theirs is given back once converted)
     toks.reserve(P.out.len);

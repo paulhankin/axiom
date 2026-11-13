@@ -36,6 +36,7 @@ fn stand_in(b: *ai.Blob, k: usize) ai.ROp {
     }
     let x86 = b.arch == tg.ARCH_X64;
     let mut o = ai.rop_reg(0, op.bits, op.fp);
+    o.mbits = op.mbits;
     if (op.kind == ai.OK_REG) or (op.kind == ai.OK_FIXED) {
         let mut r = op.reg;
         if op.kind == ai.OK_REG {
@@ -84,7 +85,7 @@ fn render(b: *ai.Blob, k: usize, mod: u8) []u8 {
     let mut err = "";
     let mut t = "";
     if b.arch == tg.ARCH_X64 {
-        t = x64.render(&o, mod, &mut err);
+        t = x64.render(&o, mod, b.intel, &mut err);
     } else {
         t = a64.render(&o, mod, &mut err);
     }
@@ -102,7 +103,7 @@ fn label(k: i32) []u8 {
 }
 
 /// Why blob b's template does not assemble, or "".
-pub fn check(b: *ai.Blob) []u8 {
+pub fn check(b: *mut ai.Blob) []u8 {
     g_arch = b.arch;
     g_err = "";
     let mut text = ai.expand(b, render, label, 0);
@@ -116,23 +117,40 @@ pub fn check(b: *ai.Blob) []u8 {
             text = u.cat2(text, a64.goto_tail(b.nlabels, 0));
         }
     }
-    return check_text(b.arch, text, true);
+    let msg = check_text(b.arch, text, true, b.intel);
+    b.sp = g_sp;
+    b.calls = g_calls;
+    b.defines = g_defines;
+    return msg;
 }
 
+// (what check_text's last assembly did with the stack)
+let mut g_sp: bool = false;
+let mut g_calls: bool = false;
+let mut g_defines: bool = false;
+
 /// Why asm text does not assemble (inline_: as a template, else as
-/// file-scope asm), or "".
-pub fn check_text(arch: i32, text: []u8, inline_: bool) []u8 {
+/// file-scope asm; intel: x86-64 text that starts in the Intel syntax), or "".
+pub fn check_text(arch: i32, text: []u8, inline_: bool, intel: bool) []u8 {
     let mut A = u.nil.[cr.Asm]();
     if arch == tg.ARCH_X64 {
         if inline_ {
-            A = x64.assemble_inline(text, 0);
+            A = x64.assemble_inline(text, 0, intel);
         } else {
-            A = x64.assemble_file(text);
+            A = x64.assemble_file(text, intel);
         }
     } else if inline_ {
         A = a64.assemble_inline(text, 0);
     } else {
         A = a64.assemble_file(text);
+    }
+    g_sp = A.uses_sp;
+    g_calls = A.calls;
+    g_defines = false;
+    for d in A.defs.items() {
+        if d.global or d.weak or (d.intext and not d.numeric and not u.starts(d.name, ".L") and not d.tmp) {
+            g_defines = true;  // (symbols of the object: asm/obj.ax)
+        }
     }
     if cr.failed(A) {
         return cr.message(A);

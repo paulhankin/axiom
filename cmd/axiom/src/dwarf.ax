@@ -118,6 +118,7 @@ pub struct Unit {
     gdone: u.List.[bool],  // per dbinfo global: written in a lexical block
     voffs: u.List.[u64],   // (while a function is written: its variables' entries' offsets + 1)
     tls_rel: u32,          // the relocation of an offset in the TLS block (FX_TLS), 0: thread-locals have no location
+    cies: [4]u64,          // file-scope asm's other CIEs (add_asm_fde: bit 0 simple, bit 1 a signal frame): offset + 1
     size_fix: bool,        // the unit's code size is a fixup (FX_SIZE: finish_parts)
 }
 
@@ -130,7 +131,7 @@ pub fn none() Unit {
                   nfuncs: 0, first_src: 0, text_sym: 0, trefs: u.List.[Fix].empty(),
                   gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   toff: u.List.[u64].empty(), drefs: u.List.[Fix].empty(), gdone: u.List.[bool].empty(),
-                  voffs: u.List.[u64].empty(), tls_rel: 0, size_fix: false };
+                  voffs: u.List.[u64].empty(), tls_rel: 0, cies: [0; 4], size_fix: false };
 }
 
 fn new_part() Part {
@@ -284,9 +285,18 @@ pub fn saved_reg(reg: u32, off: i64) u64 {
     return (@as(u64, reg) << 32) | (@bit_cast(u64, off) & 0xffff_ffff);
 }
 
+/// Call frame instructions of their own at code offset `off` of a function
+/// (an inline template's: the registers it saves on the stack), after the
+/// state changes at that offset.
+pub struct XCfi {
+    off: u64,
+    bytes: []u8,
+}
+
 pub struct Func {
-    sym: u32,    // its symbol (ELF: in the object; wasm: the linker's function number)
-    name: []u8,  // for people
+    xcfi: []XCfi,  // (in code order)
+    sym: u32,      // its symbol (ELF: in the object; wasm: the linker's function number)
+    name: []u8,    // for people
     external: bool,
     size: u64,
     src: u32,            // its declaration
@@ -1755,6 +1765,83 @@ fn frame_cie(d: *mut Unit) void {
     pad_entry(b, 0);
 }
 
+// A CIE for file-scope asm's procedures (add_asm_fde): `simple`, without
+// the initial instructions (.cfi_startproc simple), and with the
+// augmentation "S" for a signal frame (.cfi_signal_frame: the return
+// address is that of the instruction to run, not after a call); its offset.
+fn asm_cie(d: *mut Unit, simple: bool, signal: bool) u64 {
+    let mut k: usize = 0;
+    if simple {
+        k = 1;
+    }
+    if signal {
+        k += 2;
+    }
+    if k == 0 {
+        return 0;
+    }
+    if d.cies[k] != 0 {
+        return d.cies[k] - 1;
+    }
+    let b = &mut d.parts[D_FRAME].b;
+    let at = b.len();
+    b.u32_(0);
+    b.u32_(0xffff_ffff);
+    b.u8_(4);
+    if signal {
+        b.u8_('S');
+    }
+    b.u8_(0);
+    b.u8_(@truncate(u8, d.addr_size));
+    b.u8_(0);
+    b.uleb(code_align(d));
+    b.sleb(DATA_ALIGN);
+    if d.arch == ARCH_A64 {
+        b.uleb(@as(u64, A64_LR));
+        if not simple {
+            b.u8_(CFA_DEF_CFA);
+            b.uleb(@as(u64, A64_SP));
+            b.uleb(0);
+        }
+    } else {
+        b.uleb(@as(u64, X64_RA));
+        if not simple {
+            b.u8_(CFA_DEF_CFA);
+            b.uleb(@as(u64, X64_RSP));
+            b.uleb(8);
+            b.u8_(CFA_OFFSET | @truncate(u8, X64_RA));
+            b.uleb(1);
+        }
+    }
+    pad_entry(b, at);
+    d.cies[k] = @as(u64, at) + 1;
+    return @as(u64, at);
+}
+
+/// An FDE for a procedure of file-scope asm (asm/core.ax Proc): at symbol
+/// `sym` + `add`, `size` bytes, its call frame instructions `prog` (what
+/// its .cfi_* directives say), after the CIE of its kind.
+pub fn add_asm_fde(d: *mut Unit, sym: u32, add: u64, size: u64, prog: []u8, simple: bool, signal: bool) void {
+    if not d.on or (d.arch == ARCH_WASM) {
+        return;
+    }
+    let cie = asm_cie(d, simple, signal);
+    let p = &mut d.parts[D_FRAME];
+    let at = p.b.len();
+    p.b.u32_(0);
+    sec_ref(d, p, D_FRAME, cie);
+    addr_ref(d, p, sym, add);
+    if d.addr_size == 4 {
+        p.b.u32_(size);
+    } else {
+        p.b.u64_(size);
+    }
+    for c in prog {
+        p.b.u8_(c);
+    }
+    pad_entry(&mut p.b, at);
+}
+
 // Pads the entry at `at` to a multiple of the address size with nops and
 // sets its length.
 fn pad_entry(b: *mut bn.Bytes, at: usize) void {
@@ -1788,31 +1875,25 @@ fn fde(d: *mut Unit, f: *Func) void {
     let ca = code_align(d);
     let mut cur = cfa_entry_state(d);
     let mut loc: u64 = 0;
+    let mut xi: usize = 0;
     for s in f.cfi {
         let off = s & 0xffff_ffff;
         if off >= f.size {
             break;  // (at the end: no code follows)
         }
+        // (the instructions of their own before this offset, or at the one before)
+        while (xi < f.xcfi.len) and (f.xcfi[xi].off < off) {
+            advance(b, &mut loc, f.xcfi[xi].off, ca);
+            for c in f.xcfi[xi].bytes {
+                b.u8_(c);
+            }
+            xi += 1;
+        }
         let st = s & ~@as(u64, 0xffff_ffff);
         if st == (cur & ~@as(u64, 0xffff_ffff)) {
             continue;
         }
-        if off > loc {
-            let delta = (off - loc) / ca;
-            if delta < 64 {
-                b.u8_(CFA_ADVANCE_LOC | @truncate(u8, delta));
-            } else if delta < 256 {
-                b.u8_(CFA_ADVANCE_LOC1);
-                b.u8_(@truncate(u8, delta));
-            } else if delta < 65536 {
-                b.u8_(CFA_ADVANCE_LOC2);
-                b.u16_(delta);
-            } else {
-                b.u8_(CFA_ADVANCE_LOC4);
-                b.u32_(delta);
-            }
-            loc = off;
-        }
+        advance(b, &mut loc, off, ca);
         let creg = (st >> 56) & 31;
         let ck = (st >> 61) * 8;
         let oreg = (cur >> 56) & 31;
@@ -1853,7 +1934,35 @@ fn fde(d: *mut Unit, f: *Func) void {
         }
         cur = s;
     }
+    while (xi < f.xcfi.len) and (f.xcfi[xi].off < f.size) {
+        advance(b, &mut loc, f.xcfi[xi].off, ca);
+        for c in f.xcfi[xi].bytes {
+            b.u8_(c);
+        }
+        xi += 1;
+    }
     pad_entry(b, at);
+}
+
+// The advance of an FDE's program from `loc` to code offset `off`.
+fn advance(b: *mut bn.Bytes, loc: *mut u64, off: u64, ca: u64) void {
+    if off <= loc.* {
+        return;
+    }
+    let delta = (off - loc.*) / ca;
+    if delta < 64 {
+        b.u8_(CFA_ADVANCE_LOC | @truncate(u8, delta));
+    } else if delta < 256 {
+        b.u8_(CFA_ADVANCE_LOC1);
+        b.u8_(@truncate(u8, delta));
+    } else if delta < 65536 {
+        b.u8_(CFA_ADVANCE_LOC2);
+        b.u16_(delta);
+    } else {
+        b.u8_(CFA_ADVANCE_LOC4);
+        b.u32_(delta);
+    }
+    loc.* = off;
 }
 
 // -----------------------------------------------------------------------------

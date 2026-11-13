@@ -252,7 +252,11 @@ function checkX64Unwind(d, { E, off, secOf, text, pdata, funcs, r }) {
     // saves from rbp: its codes for the pushes and stores after mov rbp, rsp
     // are UWOP_SAVE_* at the offset of their instruction, its set_fpreg and
     // the lift of the frame offset at mov rbp, rsp's)
-    const dyn = freg === 5;
+    // (a prologue written by hand, assembly's .seh_* directives, may set rbp
+    // with lea rbp, [rsp + d] instead: its pushes and allocations are coded as such)
+    let movrbp = false;
+    for (let x = p.begin; x + 3 <= p.begin + plen; x++) if (byte(x) === 0x48 && byte(x + 1) === 0x89 && byte(x + 2) === 0xe5) movrbp = true;
+    const dyn = freg === 5 && movrbp;
     // (a machine frame at the entry: core_signal.ax's trampoline, plink.ax)
     while (want[used] && want[used].op === 'push_machframe' && want[used].off === 0) used++;
     while (a - p.begin < plen) {
@@ -272,6 +276,10 @@ function checkX64Unwind(d, { E, off, secOf, text, pdata, funcs, r }) {
           if (fo) ok = take(want[used] && want[used].op === 'alloc_large' ? 'alloc_large' : 'alloc_small', (c) => c.size === 16 * fo);
           if (ok) ok = take('set_fpreg', () => true);
         }
+      } else if (b0 === 0x48 && b1 === 0x8d && b2 === 0x6c && byte(a + 3) === 0x24 && !dyn) {
+        // lea rbp, [rsp + d8]: the frame register set (assembly's .seh_setframe)
+        a += 5;
+        ok = take('set_fpreg', () => true);
       } else if (b0 === 0x48 && b1 === 0x83 && b2 === 0xec) {
         const v = byte(a + 3);
         a += 4;

@@ -891,6 +891,107 @@ let IN_PROPS: [115]u32 = [
     INF_OPAQUE,      // IN_SJLJ_ENV
 ];
 
+// Inline assembly (IN_ASM, whose first operand is its index in asm/inline.ax's
+// table): what each statement is, for the passes (the front end notes it:
+// note_asm). ASM_NODUP: its template defines symbols (named labels), so
+// the statement is not copied (inlined, unrolled, threaded). ASM_PURE: not
+// volatile, no "memory" clobber and no memory operands, its outputs in
+// registers (IN_CALL_RESULT(asm, k): output operand k): a function of its
+// inputs, which is removed when its outputs are unused and may be merged
+// with an equal one or moved (INF_PURE). ASM_HINT: volatile, but with no
+// "memory" clobber and no memory operands: kept where it is, and no
+// barrier to memory accesses (INF_HINT). Neither: it may read and write
+// any memory (INF_OPAQUE: a "memory" clobber, memory operands, operands in
+// registers the compiler does not allocate, asm goto).
+pub const ASM_NODUP: u32 = 1;
+pub const ASM_PURE: u32 = 2;
+pub const ASM_HINT: u32 = 4;
+pub const ASM_STACK: u32 = 8;  // its template calls, or uses the stack (pushes, pops, names the stack pointer): its function makes no sibling calls
+pub let mut asm_flags: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+/// Notes the flags (ASM_*) of the asm statement of index k.
+pub fn note_asm(k: i64, flags: u32) void {
+    let n = @int_cast(usize, k);
+    while asm_flags.len <= n {
+        asm_flags.push(0);
+    }
+    asm_flags.set(n, flags);
+}
+
+/// The ASM_* flags of IN_ASM v (0 for another instruction).
+pub fn asm_of(v: *Value) u32 {
+    if (intr_id(v) != IN_ASM) or (v.xs.len == 0) or not is_cint(v.xs.get(0)) {
+        return 0;
+    }
+    let k = @int_cast(usize, cint_val(v.xs.get(0)));
+    if k >= asm_flags.len {
+        return 0;
+    }
+    return asm_flags.get(k);
+}
+
+/// The INF_* properties of intrinsic v: its intrinsic's, but an asm
+/// statement's are its own (ASM_*), and the results of a pure one
+/// (IN_CALL_RESULT of it) are pure too.
+pub fn inst_props(v: *Value) u32 {
+    let id = intr_id(v);
+    if id == IN_ASM {
+        let f = asm_of(v);
+        if (f & ASM_PURE) != 0 {
+            return INF_PURE;
+        }
+        if (f & ASM_HINT) != 0 {
+            return INF_HINT;
+        }
+        return INF_OPAQUE;
+    }
+    if (id == IN_CALL_RESULT) and (v.xs.len > 0) {
+        let c = resolve(v.xs.get(0));
+        if (intr_id(c) == IN_ASM) and ((asm_of(c) & ASM_PURE) != 0) {
+            return INF_PURE;
+        }
+    }
+    return intr_props(id);
+}
+
+/// Is intrinsic v pure (inst_props)?
+pub fn inst_pure(v: *Value) bool {
+    return (inst_props(v) & INF_PURE) != 0;
+}
+
+/// Is intrinsic v opaque (inst_props)?
+pub fn inst_opaque(v: *Value) bool {
+    return (inst_props(v) & INF_OPAQUE) != 0;
+}
+
+/// Does intrinsic v write memory, or might it (inst_props)?
+pub fn inst_writes_mem(v: *Value) bool {
+    return (inst_props(v) & (INF_WRITES_MEM | INF_OPAQUE)) != 0;
+}
+
+/// Must intrinsic v be kept though its result is unused (inst_props)?
+pub fn inst_has_effects(v: *Value) bool {
+    return (inst_props(v) & (INF_WRITES_MEM | INF_HINT | INF_OPAQUE)) != 0;
+}
+
+/// May instruction v be copied (a statement of inline assembly whose
+/// template defines symbols may not)?
+pub fn can_copy(v: *Value) bool {
+    return (asm_of(v) & ASM_NODUP) == 0;
+}
+
+/// May block b's instructions be copied?
+pub fn can_copy_block(b: *Block) bool {
+    let mut i = b.first;
+    while u.notnil(i) {
+        if not can_copy(i) {
+            return false;
+        }
+        i = i.next;
+    }
+    return true;
+}
+
 pub fn intr_props(id: i32) u32 {
     if (id < 0) or (id > IN_SJLJ_ENV) {
         return 0;
@@ -3211,7 +3312,7 @@ pub fn has_effects(i: *Value) bool {
         return i.flags != 0;
     }
     if op == OP_INTR {
-        return intr_has_effects(intr_id(i));
+        return inst_has_effects(i);
     }
     return false;
 }

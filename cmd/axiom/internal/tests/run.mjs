@@ -41,7 +41,7 @@ import { Worker } from 'worker_threads';
 import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars } from './dwarf.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, readDwarf, frameAt } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -473,6 +473,8 @@ const cRunTest = async (f) => {
   if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   // (/* not-windows */: a rule of the other ABIs, whose Windows counterpart is another test)
   if (native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || '') && /\/\* not-windows \*\//.test(src)) return { skip: true, reason: 'not for Windows' };
+  // (/* windows-only */: natively for Windows targets only)
+  if (/\/\* windows-only \*\//.test(src) && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
   const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
   if (/\/\* check-only \*\//.test(src)) {
     const c = await spawnAsync(compiler, ['check', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, ...flags], { encoding: 'utf8', timeout: compileTimeout });
@@ -542,8 +544,10 @@ const cMixTest = async (dir) => {
   if (native && has('linux-only') && (noC || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
   if (!native && has('linux-only')) return { skip: true, reason: 'Linux only' };
   if (has('windows-only') && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
+  // (the node host's CLI does not run std/io programs for wasm64)
+  if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return { skip: true, reason: 'wasm32 only' };
   if (has('x86-64-only') && native && /aarch64/.test(process.env.AXIOM_NATIVE_TARGET || '')) return { skip: true, reason: 'x86-64 only' };
-  const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
+  const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || n.endsWith('.s') || n.endsWith('.S') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
   const uses = dv('uses').flatMap((x) => x.trim().split(/\s+/)).map((x) => path.resolve(dir, x));
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
   const errors = dv('expect-error'), want = dv('expect').join('\n');
@@ -975,13 +979,13 @@ function cDriverCases() {
         const main = path.join(d, axMain ? 'main.ax' : 'main.c');
         const src = fs.readFileSync(main, 'utf8');
         if (/expect-error|linux-only|windows-only/.test(src)) continue;
-        const others = fs.readdirSync(d).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).map((n) => path.join(d, n));
+        const others = fs.readdirSync(d).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || n.endsWith('.s') || n.endsWith('.S') || (!axMain && n.endsWith('.ax')))).map((n) => path.join(d, n));
         const uses = [...src.matchAll(/(?:\/\/ |\/\* )uses: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/)).map((x) => path.resolve(d, x));
         const flags = [...src.matchAll(/(?:\/\/ |\/\* )flags: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/));
         for (const t of ['aarch64-macos', 'x86_64-windows']) {
           const out = path.join(dir, `mix-${path.basename(d)}-${t}`);
           const c = await ax(['build', main, ...others, ...uses, ...flags, `--target=${t}`, '--pdb=off', '-o', out]);
-          if (c.status !== 0) return `${path.basename(d)} for ${t}: ${c.stdout}${c.stderr}`;
+          if (c.status !== 0) return `${path.basename(d)} for ${t}: status ${c.status} ${c.signal || ""} ${c.error || ""} ${c.stdout}${c.stderr}`;
           const bytes = fs.readFileSync(out);
           if (t === 'aarch64-macos') {
             const m = checkMachO(bytes);
@@ -2182,6 +2186,83 @@ if (!skipPlatform) {
       }
     }
   }
+  // call frame information of assembly (debug/asm_cfi.c): a file-scope asm
+  // procedure's .cfi_* directives, and an inline template's saved register
+  for (const t of ['x86_64', 'aarch64', 'x86_64-macos', 'aarch64-macos']) {
+    for (const lvl of ['-O0', '-O2']) {
+      dcases[`asm_cfi.c ${t} ${lvl}`] = async () => {
+        const src = path.join(ddir, 'asm_cfi.c');
+        const o = path.join(tmp, `debug-asm-cfi-${t}${lvl}`, 'prog');
+        fs.mkdirSync(path.dirname(o), { recursive: true });
+        const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+        const r = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, '-g', '--c-std=gnu17', '-o', o],
+          { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+        if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+        const mac = t.endsWith('macos'), x64 = t.startsWith('x86');
+        const img = loadImage(fs.readFileSync(mac ? path.join(`${o}.dSYM/Contents/Resources/DWARF`, 'prog') : o));
+        const dw = readDwarf(img);
+        const fn = (n) => (img.funcs || []).find((f) => f.name === n);
+        const fdeOf = (f) => dw.fdes.find((d) => d.low === f.addr);
+        const show = (st) => `CFA ${st.cfa} ${[...st.regs].map(([k, v]) => `${k}:${v}`).join(' ')}`;
+        const isExpr = (x, r) => x.regs.has(r) && x.regs.get(r)[0] === 'expr';
+        // (Mach-O's symbols have no sizes: asmf's FDE is the one of its size, inl's the one with expressions)
+        const asmf = mac ? dw.fdes.filter((d) => d.high - d.low === (x64 ? 17 : 28)).map((d) => ({ addr: d.low, size: d.high - d.low }))[0] : fn('asmf');
+        const inl = mac ? dw.fdes.filter((d) => d.rows.some((x) => isExpr(x, x64 ? 3 : 19))).map((d) => ({ addr: d.low }))[0] : fn('inl');
+        if (!asmf || !inl) return 'no symbol asmf or inl';
+        const fa = fdeOf(asmf);
+        if (!fa || fa.high !== asmf.addr + asmf.size) return 'no FDE (or of another size) for asmf';
+        // (offset, CFA register and offset, a register and its rule) at points of asmf
+        const want = x64
+          ? [[0, 7, 8, 3, 'u'], [1, 7, 16, 3, 'off,-16'], [3, 7, 24, 12, 'off,-24'], [7, 7, 32, 3, 'off,-16'],
+             [13, 7, 24, 12, 'off,-24'], [15, 7, 16, 12, 'same'], [16, 7, 8, 3, 'same']]
+          : [[0, 31, 0, 29, 'u'], [4, 31, 32, 30, 'off,-24'], [8, 29, 32, 29, 'off,-32'], [12, 29, 32, 19, 'off,-16'],
+             [20, 29, 32, 19, 'same'], [24, 31, 0, 30, 'same']];
+        for (const [off, cr, co, reg, rule] of want) {
+          const st = frameAt(fa, asmf.addr + off);
+          const got = st.regs.has(reg) ? String(st.regs.get(reg)) : 'u';
+          if (st.cfa[0] !== cr || st.cfa[1] !== co || got !== rule) return `asmf+${off}: ${show(st)}`;
+        }
+        // inl: the saved register's rule is an expression (from the stack
+        // pointer) while the template has it on the stack, and its own
+        // value again at the end; the CFA is the frame pointer's throughout
+        const fi = fdeOf(inl);
+        if (!fi) return 'no FDE for inl';
+        const reg = x64 ? 3 : 19, fp = x64 ? 6 : 29;
+        const exprs = fi.rows.filter((x) => x.regs.has(reg) && x.regs.get(reg)[0] === 'expr');
+        if (exprs.length < (x64 ? 2 : 1)) return `inl: no rows with the saved register: ${fi.rows.map(show).join('; ')}`;
+        if (exprs.some((x) => x.cfa[0] !== fp)) return 'inl: the CFA is not the frame pointer\'s while the template runs';
+        // (x86-64: at rsp + 0 after the push, at rsp + 8 after the second)
+        if (x64 && (exprs[0].regs.get(reg)[1] !== '7700' || !exprs.some((x) => x.regs.get(reg)[1] === '7708')))
+          return `inl: the saved register's rules: ${exprs.map(show).join('; ')}`;
+        const after = fi.rows[fi.rows.indexOf(exprs[exprs.length - 1]) + 1];
+        if (!after || (after.regs.has(reg) && after.regs.get(reg)[0] === 'expr')) return 'inl: the register is not given back';
+        return null;
+      };
+    }
+  }
+  // line information of assembly sources: each statement's line (.S and
+  // .s), and what .file and .loc say where they do
+  for (const t of ['x86_64', 'aarch64', 'x86_64-macos', 'aarch64-macos']) {
+    dcases[`assembly sources' lines ${t}`] = async () => {
+      const dir = path.join(root, 'cmd/axiom/internal/tests/c/mix/asm_units');
+      const loc = path.join(tmp, `debug-asm-loc-${t}.s`);
+      fs.writeFileSync(loc, '    .file 1 "virtual.c"\n    .text\n    .globl asm_loc\nasm_loc:\n    .loc 1 42\n' +
+        (t.startsWith('x86') ? '    nop\n    ret\n' : '    nop\n    ret\n'));
+      const o = path.join(tmp, `debug-asm-lines-${t}`, 'prog.o');
+      fs.mkdirSync(path.dirname(o), { recursive: true });
+      const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+      const r = await spawnAsync(compiler, ['build', path.join(dir, 'calls.c'), path.join(dir, 'routines.S'), path.join(dir, 'table.s'), loc,
+        `--target=${t}`, '-g', '--emit=obj', '-o', o], { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+      if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+      const dw = readDwarf(loadImage(fs.readFileSync(o)));
+      const lines = fs.readFileSync(path.join(dir, 'routines.S'), 'utf8').split('\n');
+      const first = lines.findIndex((l) => l.includes(t.startsWith('x86') ? 'xorl %eax, %eax' : 'mov x2, #0')) + 1;
+      const loop = lines.findIndex((l) => l.includes(t.startsWith('x86') ? 'addq (A0), %rax' : 'ldr x3, [x0], #8')) + 1;
+      for (const n of [first, loop]) if (!addrsOfLine(dw, 'routines.S', n).length) return `no code for routines.S:${n}`;
+      if (!addrsOfLine(dw, 'virtual.c', 42).length) return 'no code for virtual.c:42 (.loc)';
+      return null;
+    };
+  }
   await section('debug information', dcases, {
     parallel: true,
     supported: () => (bootstrapCompiler() ? 'the compiler\'s own code generators only' : null),
@@ -2583,6 +2664,16 @@ if (!skipPlatform) {
       if (p || !onArm64Windows) return p;
       const r = spawnSync(out('a-hello'), [], { encoding: 'utf8' });
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'aarch64-windows: file-scope asm with .seh_ directives (its unwind record, checked against its code)': () => {
+      const src = path.join(tmp, 'windows-a-seh.c');
+      fs.writeFileSync(src, '__asm__(".text\\n.p2align 2\\n.globl sa\\nsa:\\n.seh_proc sa\\n"\n' +
+        '  "stp x29, x30, [sp, #-16]!\\n.seh_save_fplr_x 16\\nmov x29, sp\\n.seh_set_fp\\nsub sp, sp, #32\\n.seh_stackalloc 32\\n"\n' +
+        '  "stp x19, x20, [sp, #16]\\n.seh_save_regp x19, 16\\nstr d8, [sp, #8]\\n.seh_save_freg d8, 8\\n.seh_endprologue\\n"\n' +
+        '  "blr x0\\n.seh_startepilogue\\nldr d8, [sp, #8]\\n.seh_save_freg d8, 8\\nldp x19, x20, [sp, #16]\\n.seh_save_regp x19, 16\\n"\n' +
+        '  "add sp, sp, #32\\n.seh_stackalloc 32\\nmov sp, x29\\n.seh_set_fp\\nldp x29, x30, [sp], #16\\n.seh_save_fplr_x 16\\n.seh_endepilogue\\nret\\n.seh_endproc\\n.size sa, .-sa\\n");\n' +
+        'void sa(void (*)(void));\nstatic void cb(void) {}\nint main(void) { sa(cb); return 0; }\n');
+      return arm(src, 'a-seh', ['--c-std=gnu17']);
     },
     'aarch64-windows: examples, at -O0, -O1 and -O2': () => {
       for (const e of ['wordcount', 'http_server', 'texmath', 'pi']) {

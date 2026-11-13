@@ -34,6 +34,7 @@
 //   --c-std=c89|c90|c95|c99|c11|c17|c18|c23|gnu89|gnu90|gnu99|gnu11|gnu17|gnu18|gnu23   (default c17)
 //   --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)
 //   --c-long-double=64|80|128  long double's format (default: the target's C ABI)
+//   --c-asm-dialect=att|intel  the x86-64 assembly syntax of asm statements (default att)
 //   -DNAME[=value]  -UNAME  -I<dir> (also -D NAME, -U NAME, -I <dir>)
 //   --emit=c-pp|c-tokens|c-ast   preprocessed text, tokens, syntax tree
 // =============================================================================
@@ -100,6 +101,7 @@ fn usage() void {
     u.eprint("  --c-std=c89|c90|c95|c99|c11|c17|c18|c23   the standard (default c17); gnu89 ... gnu23: with GNU extensions\n");
     u.eprint("  --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)\n");
     u.eprint("  --c-long-double=64|80|128   long double's format (default: the target's C ABI)\n");
+    u.eprint("  --c-asm-dialect=att|intel   the x86-64 syntax of asm statements (default att)\n");
     u.eprint("  --c-fenv-access   every function as under #pragma STDC FENV_ACCESS ON\n");
     u.eprint("  -DNAME[=value]  -UNAME  -I<dir>   macros and include directories, in order\n");
     u.eprint("  --emit=c-pp|c-tokens|c-ast   the preprocessed text, the tokens or the syntax tree\n");
@@ -356,8 +358,8 @@ fn c_option(o: *mut Options, a: []u8) bool {
         return true;
     }
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
-       u.str_eq(a, "--c-warn-unknown-pragmas") or u.starts(a, "--c-long-double=") or u.str_eq(a, "--c-fenv-access") or
-       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
+       u.str_eq(a, "--c-warn-unknown-pragmas") or u.starts(a, "--c-long-double=") or u.starts(a, "--c-asm-dialect=") or
+       u.str_eq(a, "--c-fenv-access") or ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
         o.c_args.push(a);
         return true;
     }
@@ -435,6 +437,9 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
             c.fenv_access = true;
         } else if u.str_eq(a, "--c-warn-unknown-pragmas") {
             c.warn_pragmas = true;
+        } else if u.starts(a, "--c-asm-dialect=") {
+            c.asm_intel = u.str_eq(a[16..], "intel");
+            ok = c.asm_intel or u.str_eq(a[16..], "att");
         } else if u.starts(a, "--c-char=") {
             c.char_signed = u.str_eq(a[9..], "signed");
             ok = c.char_signed or u.str_eq(a[9..], "unsigned");
@@ -483,9 +488,18 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     return true;
 }
 
-// Is `path` a C source (its name ends in .c)?
+// Is `path` a C source (its name ends in .c), or an assembly source (.s,
+// .S: a translation unit of a C program too, cfront.check_asm)?
 fn is_c_source(path: []u8) bool {
-    return (path.len > 2) and u.ends(path, ".c");
+    return ((path.len > 2) and u.ends(path, ".c")) or cfront.is_asm_source(path);
+}
+
+// Checks C or assembly translation unit `path` (cfront.check or check_asm).
+fn check_unit(path: []u8, c: *cop.COptions) bool {
+    if cfront.is_asm_source(path) {
+        return cfront.check_asm(path, c);
+    }
+    return cfront.check(path, c, false);
 }
 
 // Is `path` an Axiom source (its name ends in .ax)?
@@ -1061,9 +1075,9 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     if o.testing or o.profiling or o.ide_mode {
         return fatal(o.json, "E9001", u.f1("axiom %s does not take a C source", o.cmd));
     }
-    let mut ok = cfront.check(o.input, c, false);
+    let mut ok = check_unit(o.input, c);
     for k in 0..o.c_inputs.len {
-        ok = cfront.check(o.c_inputs.get(k), c, false) and ok;
+        ok = check_unit(o.c_inputs.get(k), c) and ok;
     }
     let exe = u.str_eq(o.emit, "exe");
     let mut lib_modules = u.List.[[]u8].empty();
@@ -1337,7 +1351,7 @@ fn threads_named(o: *Options) bool {
         srcs.push(o.c_inputs.get(k));
     }
     for k in 0..srcs.len {
-        if not is_c_source(srcs.get(k)) {
+        if not is_c_source(srcs.get(k)) or cfront.is_asm_source(srcs.get(k)) {
             continue;
         }
         let t = u.read_file(srcs.get(k));
@@ -1412,7 +1426,7 @@ fn set_strip(o: *Options) void {
 fn check_c_units(o: *Options, c: *cop.COptions, lib_modules: bool) bool {
     let mut ok = true;
     for k in 0..o.c_inputs.len {
-        ok = cfront.check(o.c_inputs.get(k), c, false) and ok;
+        ok = check_unit(o.c_inputs.get(k), c) and ok;
     }
     if ok and u.str_eq(o.emit, "exe") {
         ok = c_library_units(o, c);

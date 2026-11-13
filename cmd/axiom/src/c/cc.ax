@@ -33,9 +33,14 @@
 //
 // (docs/c.md describes the options; docs/c-frontend.md the design.)
 // =============================================================================
+import "../asm/a64.ax" as asm64;
+import "../asm/core.ax" as acr;
+import "../asm/inline.ax" as ai;
+import "../asm/x64.ax" as asm86;
 import "../dbginfo.ax" as dbi;
 import "../diag.ax" as dg;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cast_dump.ax" as cdump;
@@ -149,8 +154,12 @@ pub fn last_refs() [][]u8 {
     return g_units.get(g_units.len - 1).refs.items();
 }
 
-/// The external names that the units checked so far define.
+/// The external names that the units checked so far define (and the
+/// assembly sources' global symbols).
 pub fn defined_names(out: *mut u.SymMap.[i32]) void {
+    for n in g_asm_def_names.items() {
+        out.put(n, 1);
+    }
     for cu in g_units.items() {
         for f in cu.funcs.items() {
             if f.linkage == cast.LK_EXTERNAL {
@@ -165,8 +174,12 @@ pub fn defined_names(out: *mut u.SymMap.[i32]) void {
     }
 }
 
-/// The external names the units checked so far use and do not define.
+/// The external names the units checked so far use and do not define (and
+/// the names the assembly sources refer to).
 pub fn all_refs(out: *mut u.List.[[]u8]) void {
+    for r in g_asm_refs.items() {
+        out.push(r);
+    }
     for cu in g_units.items() {
         for r in cu.refs.items() {
             out.push(r);
@@ -183,6 +196,7 @@ pub fn lib_options(o: *co.COptions) *co.COptions {
     lo.std = co.C17;
     lo.gnu = false;  // (C17 without extensions: the library's sources are C17)
     lo.warn_pragmas = false;
+    lo.asm_intel = false;
     lo.defines = u.nil_slice.[co.Define]();
     lo.include_dirs = u.nil_slice.[[]u8]();
     lo.hosted = true;  // (its headers are all found)
@@ -327,9 +341,104 @@ fn is_lib_sym(s: *mut cast.CSym) bool {
     return false;
 }
 
-/// Does a unit define the external name `name` (after link_check)?
+/// Does a unit define the external name `name` (after link_check)? (An
+/// assembly source's global symbol too.)
 pub fn defines(name: []u8) bool {
-    return u.notnil(g_defs.get(u.intern(name)));
+    return u.notnil(g_defs.get(u.intern(name))) or (g_asm_defs.get(u.intern(name)) != 0);
+}
+
+// -----------------------------------------------------------------------------
+// Assembly sources (axiom build main.c x.s y.S): translation units of
+// assembly, assembled into the program's object as file-scope asm is (a
+// `.S` source preprocessed first, with __ASSEMBLER__ defined). What they
+// define and refer to joins the units' names: a C unit refers to their
+// global symbols, and the C library's units they use are linked.
+// -----------------------------------------------------------------------------
+let mut g_asm_blobs: u.List.[*mut ai.Blob] = u.List.[*mut ai.Blob].{ data: @ptr_from_int(*mut *mut ai.Blob, 0), len: 0,
+                                                                     cap: 0 };
+let mut g_asm_defs: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut g_asm_refs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut g_asm_def_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+/// Is `path` an assembly source (.s, or .S to preprocess)?
+pub fn is_asm_source(path: []u8) bool {
+    return (path.len > 2) and (u.ends(path, ".s") or u.ends(path, ".S"));
+}
+
+/// Reads (and for a .S source preprocesses) the assembly source at `path`
+/// and assembles it for the target, to check it and learn its names; true
+/// if it has no errors (reported: C3097 at its line, C3901 on WebAssembly).
+pub fn check_asm(path: []u8, o: *co.COptions) bool {
+    let before = dg.error_count();
+    let mut text = u.nosym();
+    let mut fid: i32 = -1;
+    if u.ends(path, ".S") {
+        text = cpp.preprocess_asm(path, o);
+        fid = cpp.asm_file_id();
+    } else {
+        let sf = u.load_file(path, u.nosym());
+        if u.isnil(sf) {
+            dg.emit_fatal(false, "E0211", u.f1("cannot read '%s'", path));
+            return false;
+        }
+        text = sf.text;
+        fid = sf.id;
+    }
+    if dg.error_count() > before {
+        return false;
+    }
+    let sp = u.mkspan(fid, 0, 0);
+    if (tg.g_arch != tg.ARCH_X64) and (tg.g_arch != tg.ARCH_A64) {
+        _ = dg.err(sp, "C3901", "assembly sources are not supported on WebAssembly targets");
+        return false;
+    }
+    let intel = (tg.g_arch == tg.ARCH_X64) and o.asm_intel;
+    let mut A = u.nil.[acr.Asm]();
+    if tg.g_arch == tg.ARCH_X64 {
+        A = asm86.assemble_file(text, intel);
+    } else {
+        A = asm64.assemble_file(text);
+    }
+    if acr.failed(A) {
+        // (at its line: the text keeps the source's lines)
+        let line = @max(A.err_line, 1);
+        let mut at: u32 = 0;
+        let sf = u.file_of(fid);
+        let mut l: i32 = 1;
+        while (@as(usize, at) < sf.text.len) and (l < line) {
+            if sf.text[@as(usize, at)] == '\n' {
+                l += 1;
+            }
+            at += 1;
+        }
+        _ = dg.err(u.mkspan(fid, at, at), "C3097", A.err);
+        return false;
+    }
+    // its names: the global symbols it defines, and those it refers to and does not define
+    for d in A.defs.items() {
+        if (d.global or d.weak) and (d.sec >= 0) and not d.abs {
+            g_asm_defs.put(u.intern(d.name), 1);
+            g_asm_def_names.push(u.intern(d.name));
+        }
+    }
+    for r in A.relocs.items() {
+        let k = A.names.get(u.intern(r.name));
+        if (k == 0) or (A.defs.get(@int_cast(usize, k - 1)).sec < 0) {
+            g_asm_refs.push(u.intern(r.name));
+        }
+    }
+    let b = u.perm_new.[ai.Blob]();
+    b.arch = tg.g_arch;
+    b.basic = true;
+    b.text = u.perm_dup(text);
+    b.file_id = fid;
+    b.intel = intel;
+    b.loc = u.perm_dup(u.file_of(fid).display);
+    b.memory = true;
+    b.volatile_ = true;
+    g_asm_blobs.push(b);
+    return true;
 }
 
 /// An external name of the Axiom program: an `export fn` (span: its name).
@@ -407,7 +516,7 @@ pub fn has_main() bool {
 
 /// Are there C translation units for gen_ir?
 pub fn pending() bool {
-    return g_units.len > 0;
+    return (g_units.len > 0) or (g_asm_blobs.len > 0);
 }
 
 /// Whether the program creates threads on WebAssembly, where the units'
@@ -459,6 +568,11 @@ pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut i
     if ok {
         cgt.define_start();  // (a C program's or an Axiom program's: its threads' start calls it)
     }
+    // (the assembly sources: file-scope asm of the program)
+    for b in g_asm_blobs.items() {
+        ai.toplevel.push(b);
+    }
+    g_asm_blobs.clear();
     g_units.clear();
     return ok;
 }

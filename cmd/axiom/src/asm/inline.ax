@@ -51,6 +51,9 @@ pub struct Op {
     via: u8,      // OK_MEM of a register the compiler does not allocate (VIA_*): its value goes through memory
     x87: u8,      // VIA_X87: the constraint ('t' st(0), 'u' st(1), 'f' any)
     inout: bool,  // an output also read ('+')
+    mbits: u32,   // OK_MEM: the object's size in bits when it is 8, 16, 32, 64 or 128 (80: the x87's long double), else 0
+    pair: i32,    // x86-64 'A' of a 128-bit value: the operand of its other half (the low half in rax is the one the template names; its high half, in rdx, is `hi`, after all the others), or -1
+    hi: bool,
 }
 
 // Registers an operand can be in that the compiler never allocates: the
@@ -76,11 +79,12 @@ pub struct ROp {
     k: i64,
     name: []u8,  // a symbol: OK_IMM's (sym), or OK_MEM's (base -1)
     sym: bool,
+    mbits: u32,  // OK_MEM: Op.mbits (the Intel syntax's size keyword)
 }
 
 pub fn rop_reg(r: i32, bits: u32, fp: bool) ROp {
     return ROp.{ kind: OK_REG, reg: r, bits: bits, fp: fp, base: -1, index: -1, scale: 1, disp: 0, seg: 0, k: 0,
-                 name: "", sym: false };
+                 name: "", sym: false, mbits: 0 };
 }
 
 // Template pieces (Piece.kind)
@@ -109,10 +113,16 @@ pub struct Blob {
     memory: bool,  // "memory"
     volatile_: bool,
     goto_: bool,
-    loc: []u8,    // "file:line", for the messages of the backends
-    stclob: u32,  // x86-64: the x87 registers clobbered (bit n: st(n)): inputs the template pops
-    kclob: u32,   // x86-64: the mask registers clobbered (bit n: kn)
-    mmclob: u32,  // x86-64: the MMX registers clobbered
+    loc: []u8,        // "file:line", for the messages of the backends
+    stclob: u32,      // x86-64: the x87 registers clobbered (bit n: st(n)): inputs the template pops
+    kclob: u32,       // x86-64: the mask registers clobbered (bit n: kn)
+    mmclob: u32,      // x86-64: the MMX registers clobbered
+    sp: bool,         // the template uses the stack (pushes, pops, calls or names the stack pointer: asm/core.ax stack_use): its function has a frame
+    calls: bool,      // the template calls a function
+    defines: bool,    // the template defines symbols (named labels): the statement is not copied (ir.ASM_NODUP)
+    aliases: [][]u8,  // names in the text of functions and objects of internal linkage, and their symbols': name, symbol, name, symbol ...
+    file_id: i32,     // an assembly source (axiom build x.s): its file (u.g_files), for line information; else -1
+    intel: bool,      // x86-64: the template is in the Intel syntax (--c-asm-dialect=intel): its `{att|intel}` alternatives give their second, operands are written in it
 }
 
 /// A list of blobs in permanent memory (the IR's lifetime: the front end's
@@ -191,6 +201,7 @@ pub struct Con {
     tie_name: []u8,  // a matching constraint by name ([name])
     via: u8,         // VIA_*: a register the compiler does not allocate
     x87: u8,
+    pair: bool,  // x86-64 'A': rax, or for a 128-bit value the rdx:rax pair
 }
 
 fn no_con(msg: []u8) Con {
@@ -203,7 +214,7 @@ fn no_con(msg: []u8) Con {
 fn new_con() Con {
     return Con.{ ok: true, msg: "", output: false, inout: false, early: false, reg: false, cls: CL_GPR, fixed: -1,
                  subset: 0, mem: false, mem_q: false, imm: false, imm_lo: 0, imm_hi: 0, sym_ok: false, imm_letter: 0,
-                 tie: -1, tie_name: "", via: VIA_NONE, x87: 0 };
+                 tie: -1, tie_name: "", via: VIA_NONE, x87: 0, pair: false };
 }
 
 fn set_imm(c: *mut Con, lo: i64, hi: i64, which: u8) void {
@@ -409,7 +420,12 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
             return ok;
         }
         if ch == 'A' {
-            return no_con("the constraint 'A' (a value in the rdx:rax pair) is not supported");
+            // the a and d registers: a value of up to 64 bits in rax, a
+            // 128-bit one in the pair, rdx its high half (csema_asm.ax)
+            c.reg = true;
+            c.fixed = 0;
+            c.pair = true;
+            return ok;
         }
         return no_con(u.f1("'%s' is not a constraint of x86-64", ch_text(ch)));
     }
@@ -733,13 +749,19 @@ pub fn reg_reserved(arch: i32, r: i32, pinned: bool) []u8 {
 // -----------------------------------------------------------------------------
 /// A template's pieces, or an error (msg) in `err`. On x86-64 the
 /// dialect alternatives `{att|intel}` give their first (the AT&T syntax),
-/// and `%{`, `%|`, `%}` are those characters.
-pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
+/// or with `intel` their second (an alternative missing is empty), and `%{`,
+/// `%|`, `%}` are those characters.
+pub fn parse_template(arch: i32, t: []u8, intel: bool, err: *mut []u8) []Piece {
     let mut ps = u.List.[Piece].empty();
     let mut b = u.Buf.init();
     let x86 = arch == tg.ARCH_X64;
-    let mut alt: i32 = 0;  // 0: outside braces, 1: in the first alternative, 2: in a later one
+    let mut alt: i32 = 0;  // 0: outside braces, 1: in the first alternative, 2: in the second, 3: in a later one
     let mut i: usize = 0;
+    // (the alternative that is kept: the dialect's)
+    let mut keep: i32 = 1;
+    if intel {
+        keep = 2;
+    }
     while i < t.len {
         let ch = t[i];
         if x86 and (ch == '{') and (alt == 0) {
@@ -748,7 +770,7 @@ pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
             continue;
         }
         if x86 and (ch == '|') and (alt != 0) {
-            alt = 2;
+            alt += 1;
             i += 1;
             continue;
         }
@@ -758,7 +780,7 @@ pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
             continue;
         }
         if ch != '%' {
-            if alt != 2 {
+            if (alt == 0) or (alt == keep) {
                 b.c(ch);
             }
             i += 1;
@@ -770,7 +792,7 @@ pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
         }
         let n = t[i + 1];
         if (n == '%') or (x86 and ((n == '{') or (n == '|') or (n == '}'))) {
-            if alt != 2 {
+            if (alt == 0) or (alt == keep) {
                 b.c(n);
             }
             i += 2;
@@ -818,7 +840,7 @@ pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
             }
             i = j;
         }
-        if alt != 2 {
+        if (alt == 0) or (alt == keep) {
             if b.len() > 0 {
                 ps.push(Piece.{ kind: PK_TEXT, mod: 0, op: -1, text: b.done() });
                 b = u.Buf.init();
@@ -863,7 +885,11 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         if (op.via == VIA_NONE) or (op.out and not op.inout) {
             continue;
         }
-        if op.via == VIA_K {
+        if (op.via == VIA_K) and b.intel {
+            out.s(u.f3("kmov%s k%s, %s\n", kmask_sfx(op.bits), u.idec(vr[k]), render(b, k, 0)));
+        } else if (op.via == VIA_MM) and b.intel {
+            out.s(u.f3("mov%s mm%s, %s\n", u.pick(op.bits == 32, "d", "q"), u.idec(vr[k]), render(b, k, 0)));
+        } else if op.via == VIA_K {
             out.s(u.f3("kmov%s %s, %%k%s\n", kmask_sfx(op.bits), render(b, k, 0), u.idec(vr[k])));
         } else if op.via == VIA_MM {
             out.s(u.f3("mov%s %s, %%mm%s\n", u.pick(op.bits == 32, "d", "q"), render(b, k, 0), u.idec(vr[k])));
@@ -877,7 +903,11 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         for k in 0..n {
             let op = b.ops[k];
             if (op.via == VIA_X87) and (not op.out or op.inout) and (vr[k] == p) and not x87_tied_dup(b, k, vr) {
-                out.s(u.f2("fld%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+                if b.intel {
+                    out.s(u.cat3("fld ", render(b, k, 0), "\n"));
+                } else {
+                    out.s(u.f2("fld%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+                }
                 break;
             }
         }
@@ -889,7 +919,7 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         } else if pc.kind == PK_OP {
             let k = @int_cast(usize, pc.op);
             if (k < n) and (b.ops[k].via != VIA_NONE) {
-                out.s(via_text(b.ops[k], vr[k]));
+                out.s(via_text(b.ops[k], vr[k], b.intel));
             } else {
                 out.s(render(b, k, pc.mod));
             }
@@ -910,13 +940,18 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
     if not any {
         return out.done();
     }
-    out.s("\n");
+    // (in the dialect's syntax, whatever the template left in force)
+    out.s(u.pick(b.intel, "\n.intel_syntax noprefix\n", "\n.att_syntax\n"));
     for k in 0..n {
         let op = b.ops[k];
         if not op.out or (op.via == VIA_NONE) {
             continue;
         }
-        if op.via == VIA_K {
+        if (op.via == VIA_K) and b.intel {
+            out.s(u.f3("kmov%s %s, k%s\n", kmask_sfx(op.bits), render(b, k, 0), u.idec(vr[k])));
+        } else if (op.via == VIA_MM) and b.intel {
+            out.s(u.f3("mov%s %s, mm%s\n", u.pick(op.bits == 32, "d", "q"), render(b, k, 0), u.idec(vr[k])));
+        } else if op.via == VIA_K {
             out.s(u.f3("kmov%s %%k%s, %s\n", kmask_sfx(op.bits), u.idec(vr[k]), render(b, k, 0)));
         } else if op.via == VIA_MM {
             out.s(u.f3("mov%s %%mm%s, %s\n", u.pick(op.bits == 32, "d", "q"), u.idec(vr[k]), render(b, k, 0)));
@@ -932,12 +967,16 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         for k in 0..n {
             let op = b.ops[k];
             if op.out and (op.via == VIA_X87) and (vr[k] == pos) {
-                out.s(u.f2("fstp%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+                if b.intel {
+                    out.s(u.cat3("fstp ", render(b, k, 0), "\n"));
+                } else {
+                    out.s(u.f2("fstp%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+                }
             }
         }
     }
     for _k in @as(i32, 0)..x87_survivors(b, vr) {
-        out.s("fstp %st(0)\n");
+        out.s(u.pick(b.intel, "fstp st(0)\n", "fstp %st(0)\n"));
     }
     return out.done();
 }
@@ -1039,17 +1078,21 @@ pub fn x87_survivors(b: *Blob, vr: []i32) i32 {
     return n;
 }
 
-fn via_text(op: Op, r: i32) []u8 {
+fn via_text(op: Op, r: i32, intel: bool) []u8 {
+    let mut t = "";
     if op.via == VIA_K {
-        return u.cat2("%k", u.idec(r));
+        t = u.cat2("%k", u.idec(r));
+    } else if op.via == VIA_MM {
+        t = u.cat2("%mm", u.idec(r));
+    } else if r == 0 {
+        t = "%st";
+    } else {
+        t = u.f1("%%st(%s)", u.idec(r));
     }
-    if op.via == VIA_MM {
-        return u.cat2("%mm", u.idec(r));
+    if intel {
+        return t[1..];
     }
-    if r == 0 {
-        return "%st";
-    }
-    return u.f1("%%st(%s)", u.idec(r));
+    return t;
 }
 
 fn kmask_sfx(bits: u32) []u8 {

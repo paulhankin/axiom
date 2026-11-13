@@ -766,7 +766,7 @@ fn cse_able(i: *ir.Value) bool {
         return false;  // (strict floating point: each computed where it is)
     }
     if op == ir.OP_INTR {
-        return ir.intr_pure(ir.intr_id(i));
+        return ir.inst_pure(i);
     }
     return ir.op_pure(op) and (op != ir.OP_EXTRACTVALUE) and (op != ir.OP_INSERTVALUE);
 }
@@ -804,7 +804,7 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if ir.intr_id(i) == ir.IN_STORE_PARTIAL {
         push_write(W_LOC, partial_loc(i));
-    } else if ir.intr_opaque(ir.intr_id(i)) {
+    } else if ir.inst_opaque(i) {
         push_write(W_ALL, nowhere());
     }
 }
@@ -3525,7 +3525,7 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
         } else if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
             // (writes part of its location: nothing it makes dead, nothing it
             // reads; a prefetch neither reads nor writes)
-        } else if ir.intr_opaque(ir.intr_id(i)) {
+        } else if ir.inst_opaque(i) {
             killed.clear();
             at_ret = false;
             ss_reads();
@@ -3590,7 +3590,7 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
         return false;
     }
-    if ir.intr_opaque(ir.intr_id(i)) {
+    if ir.inst_opaque(i) {
         return true;
     }
     if (op == ir.OP_RET) and depth {
@@ -4242,7 +4242,7 @@ fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut 
             } else if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
                 return false;
             } else if (op == ir.OP_INTR) and
-                      ((ir.intr_props(ir.intr_id(i)) & (ir.INF_READS_MEM | ir.INF_WRITES_MEM | ir.INF_OPAQUE)) != 0) {
+                      ((ir.inst_props(i) & (ir.INF_READS_MEM | ir.INF_WRITES_MEM | ir.INF_OPAQUE)) != 0) {
                 return false;
             } else if ir.op_writes_mem(op) {
                 return false;
@@ -4616,6 +4616,9 @@ fn exit_phi(bld: *mut ir.Builder, v: *mut ir.Value, h: *mut ir.Block, x: *mut ir
 }
 
 fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    if not ir.can_copy_block(h) {
+        return false;  // (inline assembly that defines symbols: not copied)
+    }
     let mut pre = ir.bnil();
     for k in 0..h.preds.len {
         if h.preds.get(k).mark != tag {
@@ -4737,7 +4740,8 @@ fn invariant(o: *ir.Value, tag: i64) bool {
 // memory access that faults is not counted: a load moved above it that
 // faults instead stops the program the same way.)
 fn may_stop(i: *ir.Value) bool {
-    if (i.op == ir.OP_CALL) or ((i.op == ir.OP_INTR) and ir.intr_opaque(ir.intr_id(i))) {
+    // (inline assembly may trap, as a call may stop: it is never run where it was not)
+    if (i.op == ir.OP_CALL) or ((i.op == ir.OP_INTR) and (ir.inst_opaque(i) or (ir.intr_id(i) == ir.IN_ASM))) {
         return true;
     }
     return ir.is_int_div(i.op) and not licm_speculatable(i);
@@ -5081,6 +5085,11 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     if h.split or u.isnil(ht) or (ht.op != ir.OP_CONDBR) {
         return false;
     }
+    for k in 0..members.len {
+        if not ir.can_copy_block(members.get(k)) {
+            return false;  // (inline assembly that defines symbols: not copied)
+        }
+    }
     // the header's test: i < end
     let c = ir.resolve(ht.a);
     if not ir.is_op(c, ir.OP_ICMP) {
@@ -5301,7 +5310,8 @@ fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
 
 fn writes_mem(x: *ir.Value) bool {
     let op = x.op;
-    return ir.op_writes_mem(op) or ir.intr_writes_mem(ir.intr_id(x)) or ((op == ir.OP_LOAD) and (x.flags != 0));
+    return ir.op_writes_mem(op) or ((op == ir.OP_INTR) and ir.inst_writes_mem(x)) or
+           ((op == ir.OP_LOAD) and (x.flags != 0));
 }
 
 // The blocks using v: their common dominator (nil: no uses).

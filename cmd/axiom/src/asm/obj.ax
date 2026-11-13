@@ -5,6 +5,7 @@
 // local otherwise) and its relocations.
 // =============================================================================
 import "../elf.ax" as elf;
+import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "core.ax" as cr;
 
@@ -25,8 +26,89 @@ fn sym_name(d: cr.Def) []u8 {
     return b.done();
 }
 
-/// Adds assembled file-scope asm A to obj, whose code section is `text`.
-pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm) void {
+/// A procedure of the text (its .cfi_* directives) placed in the object:
+/// a local symbol at its start, its size and call frame instructions, for
+/// the backend's frame description (dwarf.ax add_asm_fde).
+pub struct FileProc {
+    sym: u32,
+    size: u64,
+    prog: []u8,
+    simple: bool,
+    signal: bool,
+}
+
+/// The procedures of the file-scope asm added to the object being written
+/// (add_file), in order; the backend gives them to its debug information
+/// (dwarf.ax add_asm_fde) and clears the list.
+pub let mut procs: u.List.[FileProc] = u.List.[FileProc].{ data: @ptr_from_int(*mut FileProc, 0), len: 0, cap: 0 };
+
+/// A procedure's Windows unwind record (.seh_*): a local symbol at its
+/// start, its size, its .xdata bytes, for the backend's .pdata entry.
+pub struct FileSeh {
+    sym: u32,
+    size: u64,
+    xdata: []u8,
+}
+
+pub let mut sehs: u.List.[FileSeh] = u.List.[FileSeh].{ data: @ptr_from_int(*mut FileSeh, 0), len: 0, cap: 0 };
+
+// The object's named symbols (all, local ones too): name -> index + 1, for
+// the symbols of internal linkage asm text names (Blob.aliases); `scanned`:
+// how many of obj's symbols the map has seen.
+let mut named: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                 cap: 0, len: 0 };
+let mut named_obj: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
+let mut scanned: usize = 0;
+
+/// The symbol of name `n` in the alias list of a blob (name, symbol name,
+/// ...): the object's symbol of that name, or -1.
+pub fn alias_sym(obj: *mut elf.Obj, aliases: [][]u8, n: []u8) i64 {
+    let mut k: usize = 0;
+    while (k + 1) < aliases.len {
+        if u.str_eq(aliases[k], n) {
+            if named_obj != obj {
+                named_obj = obj;
+                named = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+                scanned = 0;
+            }
+            while scanned < obj.syms.len {
+                let s = obj.syms.get(scanned);
+                if (s.name.len > 0) and (s.sec >= 0) {
+                    named.put(u.intern(s.name), @truncate(u32, scanned) + 1);
+                }
+                scanned += 1;
+            }
+            let x = named.get(u.intern(aliases[k + 1]));
+            if x != 0 {
+                return @as(i64, x - 1);
+            }
+        }
+        k += 2;
+    }
+    return -1;
+}
+
+/// A part of an assembly source's code, from one of its labels to the next
+/// (add_file), for the line information: its symbol (at its start), name,
+/// size, and rows (offset << 32 | ir.src_loc, as dwarf.Func's).
+pub struct FileFunc {
+    sym: u32,
+    name: []u8,
+    external: bool,
+    size: u64,
+    rows: []u64,
+}
+
+/// An error add_file found (a global symbol defined twice), or "": the backend reports it.
+pub let mut add_error: []u8 = "";
+
+pub let mut funcs: u.List.[FileFunc] = u.List.[FileFunc].{ data: @ptr_from_int(*mut FileFunc, 0), len: 0, cap: 0 };
+
+/// Adds assembled file-scope asm A to obj, whose code section is `text`;
+/// `aliases`: its blob's (the names of internal linkage in it); `file_id`:
+/// the assembly source's file, whose lines its code's line information
+/// gives (.loc's where it says), or -1.
+pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, file_id: i32) void {
     // sections: where each of A's starts in obj's
     let secmap = u.newn.[i32](A.secs.len + 1);
     let base = u.newn.[u64](A.secs.len + 1);
@@ -91,9 +173,21 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm) void {
         if (ty == elf.T_NOTYPE) and (A.secs.at(si).kind == elf.S_TEXT) {
             ty = elf.T_FUNC;  // (a label in code; untyped ones would be written as objects)
         }
+        if bind != elf.B_LOCAL {
+            let prev = obj.symmap.get(u.intern(sym_name(d)));
+            if (prev != 0) and (obj.syms.get(@as(usize, prev - 1)).sec >= 0) and (bind == elf.B_GLOBAL) and
+               (obj.syms.get(@as(usize, prev - 1)).bind == elf.B_GLOBAL) {
+                add_error = u.f1("the symbol '%s' that assembly defines is defined elsewhere in the program too",
+                                 d.name);
+            }
+        }
         let s = elf.add_sym(obj, elf.Sym.{ name: u.perm_dup(sym_name(d)), sec: secmap[si], value: base[si] + d.off,
                                            size: size, bind: bind, ty: ty, hidden: false });
         syms[k] = @as(i64, s);
+        if (bind == elf.B_LOCAL) and not d.numeric {
+            use_obj(obj);
+            note_local(d.name, s);
+        }
     }
     // relocations
     for r in A.relocs.items() {
@@ -110,11 +204,459 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm) void {
                     found = true;
                 }
             }
-            if not found {
+            let al = alias_sym(obj, aliases, r.name);
+            if not found and (al >= 0) {
+                sym = @truncate(u32, @bit_cast(u64, al));
+            } else if not found {
                 sym = elf.ext_sym(obj, u.perm_dup(r.name), false);
             }
         }
         let os = obj.secs.get(@int_cast(usize, secmap[si]));
         os.relocs.push(elf.Rel.{ off: base[si] + r.off, ty: r.ty, sym: sym, addend: r.addend });
     }
+    if file_id >= 0 {
+        file_lines(obj, text, A, secmap, base, syms, file_id);
+    }
+    // procedures
+    for p in A.procs.items() {
+        let si = @int_cast(usize, p.sec);
+        let s = elf.add_sym(obj, elf.Sym.{ name: "", sec: secmap[si], value: base[si] + p.start, size: 0,
+                                           bind: elf.B_LOCAL, ty: elf.T_NOTYPE, hidden: false });
+        procs.push(FileProc.{ sym: s, size: p.end - p.start, prog: u.perm_dup(p.prog), simple: p.simple,
+                              signal: p.signal });
+    }
+    for p in A.sehs.items() {
+        let si = @int_cast(usize, p.sec);
+        let s = elf.add_sym(obj, elf.Sym.{ name: "", sec: secmap[si], value: base[si] + p.start, size: 0,
+                                           bind: elf.B_LOCAL, ty: elf.T_NOTYPE, hidden: false });
+        sehs.push(FileSeh.{ sym: s, size: p.end - p.start, xdata: u.perm_dup(p.xdata) });
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Inline templates' symbols and sections. A template's .text bytes are its
+// function's code (the backend's); its other sections' bytes (.pushsection,
+// .section ... .popsection, .previous) go into the object's sections of those
+// names, after what is there; its named labels (but .L and numeric ones)
+// become local symbols, its .globl and .weak ones global and weak symbols;
+// relocations name the function's symbol (a label in its code), a section's
+// symbol (a label in another section) or the symbol named. A backend calls
+// inline_pass at the start of each encoding pass of a function, inline_asm
+// for each template (the text relocations it returns, from the template's
+// start, are the backend's to add), and inline_place once the function's
+// place in its section is final.
+// -----------------------------------------------------------------------------
+/// A relocation in a template's code (from its start).
+pub struct TRel {
+    off: u64,
+    ty: u32,
+    sym: u32,
+    addend: i64,
+}
+
+struct Side {
+    sec: i32,  // the object's section
+    off: u64,  // where the bytes go in it
+    data: []u8,
+    size: u64,  // (bss: no data)
+}
+
+struct PSym {
+    name: []u8,
+    sec: i32,  // the object's section, or -1: the function's code (off from its start)
+    off: u64,
+    bind: u8,
+    ty: u8,
+    size: u64,
+}
+
+let mut sides: u.List.[Side] = u.List.[Side].{ data: @ptr_from_int(*mut Side, 0), len: 0, cap: 0 };
+let mut side_rels: u.List.[elf.Rel] = u.List.[elf.Rel].{ data: @ptr_from_int(*mut elf.Rel, 0), len: 0, cap: 0 };
+let mut side_rsec: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut psyms: u.List.[PSym] = u.List.[PSym].{ data: @ptr_from_int(*mut PSym, 0), len: 0, cap: 0 };
+// (each object section's next free offset in this pass, and its local symbol)
+let mut next_off: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut sec_syms: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+let mut cur_obj: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
+// the names of the local symbols asm defines in the object (file-scope asm's
+// labels, templates' labels): name -> symbol + 1 (0: none; a name defined
+// twice: DUP), for references by name from elsewhere (resolve)
+let mut locals: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                  cap: 0, len: 0 };
+const DUP: u32 = 0xffff_ffff;
+const DUP_SIZE: u64 = 0xffff_ffff_ffff_fff1;  // (a global symbol's size: defined twice)
+
+fn use_obj(obj: *mut elf.Obj) void {
+    if cur_obj != obj {
+        cur_obj = obj;
+        locals = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+        sec_syms.clear();
+        next_off.clear();
+    }
+}
+
+fn note_local(name: []u8, s: u32) void {
+    let k = u.intern(name);
+    if locals.get(k) != 0 {
+        locals.put(k, DUP);
+        return;
+    }
+    locals.put(k, s + 1);
+}
+
+/// The start of an encoding pass of a function: what the templates encoded
+/// before it is forgotten.
+pub fn inline_pass(obj: *mut elf.Obj) void {
+    use_obj(obj);
+    sides.clear();
+    side_rels.clear();
+    side_rsec.clear();
+    psyms.clear();
+    next_off.clear();
+}
+
+fn sec_sym(obj: *mut elf.Obj, sec: i32) u32 {
+    let k = @int_cast(usize, sec);
+    while sec_syms.len <= k {
+        sec_syms.push(-1);
+    }
+    if sec_syms.get(k) < 0 {
+        sec_syms.set(k, @as(i64, elf.add_sym(obj, elf.Sym.{ name: "", sec: sec, value: 0, size: 0, bind: elf.B_LOCAL,
+                                                            ty: elf.T_NOTYPE, hidden: false })));
+    }
+    return @truncate(u32, @bit_cast(u64, sec_syms.get(k)));
+}
+
+// The object's section of a template's section (made if new), and where
+// this template's bytes of it go (aligned).
+fn side_place(obj: *mut elf.Obj, s: *cr.Sec, at: *mut u64) i32 {
+    let mut idx: i32 = -1;
+    for k in 0..obj.secs.len {
+        if u.str_eq(obj.secs.get(k).name, s.name) {
+            idx = @int_cast(i32, k);
+        }
+    }
+    if idx < 0 {
+        // (in permanent memory: functions are compiled in scratch scopes)
+        let ns = u.perm_new.[elf.Sec]();
+        ns.name = u.perm_dup(s.name);
+        ns.kind = s.kind;
+        ns.align = @max(s.align, 1);
+        obj.secs.push(ns);
+        idx = @int_cast(i32, obj.secs.len - 1);
+    }
+    let os = obj.secs.get(@int_cast(usize, idx));
+    if s.align > os.align {
+        os.align = s.align;
+    }
+    let k = @int_cast(usize, idx);
+    while next_off.len <= k {
+        next_off.push(0xffff_ffff_ffff_ffff);
+    }
+    if next_off.get(k) == 0xffff_ffff_ffff_ffff {
+        next_off.set(k, elf.sec_size(os));
+    }
+    let al = @max(s.align, 1);
+    let o = (next_off.get(k) + al - 1) & ~(al - 1);
+    at.* = o;
+    let mut n = @as(u64, s.data.len);
+    if (s.kind == elf.S_BSS) or (s.kind == elf.S_TBSS) {
+        n = s.size;
+    }
+    next_off.set(k, o + n);
+    return idx;
+}
+
+/// A template A assembled at function-relative offset `start` of the
+/// function whose symbol is `fsym`: its other sections' bytes and symbols
+/// noted for inline_place; the relocations of its code returned. `sym_of`
+/// is the backend's symbol of a name the template does not define.
+pub fn inline_asm(obj: *mut elf.Obj, A: *mut cr.Asm, fsym: u32, start: u64, sym_of: fn([]u8) u32) []TRel {
+    use_obj(obj);
+    let n = A.secs.len;
+    let osec = u.newn.[i32](n + 1);  // -1: the function's code
+    let obase = u.newn.[u64](n + 1);
+    for k in 0..n {
+        let s = A.secs.at(k);
+        osec[k] = -1;
+        obase[k] = start;
+        if (k == 0) or ((s.kind == elf.S_TEXT) and u.str_eq(s.name, ".text")) {
+            if k != 0 {
+                osec[k] = -2;  // (.text again, after a .section: not supported, below)
+            }
+            continue;
+        }
+        let mut at: u64 = 0;
+        osec[k] = side_place(obj, s, &mut at);
+        obase[k] = at;
+        sides.push(Side.{ sec: osec[k], off: at, data: u.perm_dup(s.data.items()), size: s.size });
+    }
+    // the template's labels: their places (a symbol's, for a relocation to one)
+    let byname = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let mut bn = byname;
+    for k in 0..A.defs.len {
+        let d = A.defs.get(k);
+        if d.intext or d.defined {
+            bn.put(u.intern(d.name), @int_cast(i32, k) + 1);
+        }
+        if not d.defined or d.tmp or d.abs or (d.sec < 0) {
+            continue;
+        }
+        let local = not d.global and not d.weak;
+        if local and (d.numeric or u.starts(d.name, ".L")) {
+            continue;
+        }
+        let si = @int_cast(usize, d.sec);
+        let mut bind = elf.B_LOCAL;
+        if d.weak {
+            bind = elf.B_WEAK;
+        } else if d.global {
+            bind = elf.B_GLOBAL;
+        }
+        // (a label in a function's code is no function of its own: its type is .type's)
+        let ty = d.ty;
+        let mut size: u64 = 0;
+        if d.has_size {
+            size = @bit_cast(u64, d.size);
+        }
+        psyms.push(PSym.{ name: u.perm_dup(d.name), sec: osec[si], off: obase[si] + d.off, bind: bind, ty: ty,
+                          size: size });
+    }
+    let mut out = u.List.[TRel].empty();
+    for r in A.relocs.items() {
+        let si = @int_cast(usize, r.sec);
+        if osec[si] == -2 {
+            cr.fail(A,
+                    "inline assembly that returns to .text after another section (use .pushsection and .popsection, or .previous)");
+            return out.items();
+        }
+        // the target: a label of the template, or a symbol of the object
+        let mut sym: u32 = 0;
+        let mut add = r.addend;
+        let di = bn.get(u.intern(r.name));
+        if (di > 0) and (A.defs.get(@int_cast(usize, di - 1)).sec >= 0) and
+           not A.defs.get(@int_cast(usize, di - 1)).abs {
+            let d = A.defs.get(@int_cast(usize, di - 1));
+            let ts = @int_cast(usize, d.sec);
+            if osec[ts] == -1 {
+                sym = fsym;
+            } else {
+                sym = sec_sym(obj, osec[ts]);
+            }
+            add = add + @bit_cast(i64, obase[ts] + d.off);
+        } else {
+            sym = sym_of(r.name);
+        }
+        if osec[si] == -1 {
+            out.push(TRel.{ off: r.off, ty: r.ty, sym: sym, addend: add });
+        } else {
+            side_rels.push(elf.Rel.{ off: obase[si] + r.off, ty: r.ty, sym: sym, addend: add });
+            side_rsec.push(osec[si]);
+        }
+    }
+    return out.items();
+}
+
+/// The function's templates' bytes of other sections and their symbols into
+/// the object, the function being placed at `fbase` in its code section
+/// `text` (once its encoding is final).
+pub fn inline_place(obj: *mut elf.Obj, text: i32, fbase: u64) void {
+    use_obj(obj);
+    for s in sides.items() {
+        let os = obj.secs.get(@int_cast(usize, s.sec));
+        if (os.kind == elf.S_BSS) or (os.kind == elf.S_TBSS) {
+            if (s.off + s.size) > os.size {
+                os.size = s.off + s.size;
+            }
+            continue;
+        }
+        while @as(u64, os.data.len()) < s.off {
+            os.data.u8_(0);
+        }
+        os.data.put(s.data);
+    }
+    for k in 0..side_rels.len {
+        let os = obj.secs.get(@int_cast(usize, side_rsec.get(k)));
+        os.relocs.push(side_rels.get(k));
+    }
+    for p in psyms.items() {
+        let mut sec = p.sec;
+        let mut v = p.off;
+        if sec == -1 {
+            sec = text;
+            v = fbase + p.off;
+        }
+        let s = elf.add_sym(obj, elf.Sym.{ name: p.name, sec: sec, value: v, size: p.size, bind: p.bind, ty: p.ty,
+                                           hidden: false });
+        if p.bind == elf.B_LOCAL {
+            note_local(p.name, s);
+        } else if obj.syms.get(@as(usize, s)).value != v {
+            // (a global defined again: the template's function was copied, by inlining or unrolling)
+            obj.syms.at(@as(usize, s)).size = DUP_SIZE;
+        }
+    }
+    inline_pass(obj);
+}
+
+/// References by name to the local symbols asm defines (from C, from other
+/// templates, from file-scope asm: undefined symbols of the object of those
+/// names) are to them; an error message if a name referred to so is
+/// defined twice (a template copied), else "".
+pub fn resolve(obj: *mut elf.Obj) []u8 {
+    use_obj(obj);
+    let map = u.newn.[u32](obj.syms.len + 1);
+    let mut any = false;
+    for k in 0..obj.syms.len {
+        map[k] = @truncate(u32, k);
+        let s = obj.syms.get(k);
+        if (s.sec < 0) and (s.name.len > 0) {
+            let l = locals.get(u.intern(s.name));
+            if l == DUP {
+                return u.f1("the symbol '%s' that inline assembly defines is defined more than once (its asm statement was copied: give the label a number, `1:`, or `%=`)",
+                            s.name);
+            }
+            if l != 0 {
+                map[k] = l - 1;
+                any = true;
+                // (and the reference's own entry, which nothing names now, a copy of the definition)
+                let d = obj.syms.get(@as(usize, l - 1));
+                obj.syms.at(k).* = d;
+            }
+        }
+        if (s.sec >= 0) and (s.size == DUP_SIZE) and (s.bind != elf.B_LOCAL) {
+            return u.f1("the symbol '%s' that inline assembly defines is defined more than once (its asm statement was copied)",
+                        s.name);
+        }
+    }
+    if not any {
+        return "";
+    }
+    for k in 0..obj.secs.len {
+        let os = obj.secs.get(k);
+        for j in 0..os.relocs.len {
+            let r = os.relocs.at(j);
+            r.sym = map[@as(usize, r.sym)];
+        }
+    }
+    return "";
+}
+
+// The line information of an assembly source's code (A's .text): each part
+// from a label that is a symbol to the next, with a row for each statement
+// (its line in the source, or what .loc says).
+fn file_lines(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, secmap: []i32, base: []u64, syms: []i64,
+              file_id: i32) void {
+    let mut ti: i32 = -1;
+    for k in 0..A.secs.len {
+        if secmap[k] == text {
+            ti = @int_cast(i32, k);
+        }
+    }
+    if ti < 0 {
+        return;
+    }
+    let tb = base[@int_cast(usize, ti)];
+    let end = tb + @as(u64, A.secs.at(@int_cast(usize, ti)).data.len);
+    // the parts' starts: the text's start, and each label symbol in it (in order)
+    let mut starts = u.List.[u64].empty();
+    let mut names = u.List.[[]u8].empty();
+    let mut ext = u.List.[bool].empty();
+    let mut ss = u.List.[i64].empty();
+    starts.push(tb);
+    names.push(u.file_of(file_id).display);
+    ext.push(false);
+    ss.push(-1);
+    for k in 0..A.defs.len {
+        let d = A.defs.get(k);
+        if (syms[k] < 0) or (d.sec != ti) {
+            continue;
+        }
+        let at = tb + d.off;
+        let mut j = starts.len;
+        while (j > 0) and (starts.get(j - 1) > at) {
+            j -= 1;
+        }
+        if (j > 0) and (starts.get(j - 1) == at) {
+            names.set(j - 1, d.name);
+            ext.set(j - 1, d.global or d.weak);
+            ss.set(j - 1, syms[k]);
+            continue;
+        }
+        starts.push(0);
+        names.push("");
+        ext.push(false);
+        ss.push(-1);
+        let mut m = starts.len - 1;
+        while m > j {
+            starts.set(m, starts.get(m - 1));
+            names.set(m, names.get(m - 1));
+            ext.set(m, ext.get(m - 1));
+            ss.set(m, ss.get(m - 1));
+            m -= 1;
+        }
+        starts.set(j, at);
+        names.set(j, d.name);
+        ext.set(j, d.global or d.weak);
+        ss.set(j, syms[k]);
+    }
+    for p in 0..starts.len {
+        let lo = starts.get(p);
+        let mut hi = end;
+        if (p + 1) < starts.len {
+            hi = starts.get(p + 1);
+        }
+        if hi <= lo {
+            continue;
+        }
+        let mut rows = u.List.[u64].empty();
+        for st in A.stmts.items() {
+            if (st.sec != ti) or (st.op.len == 0) {
+                continue;
+            }
+            let at = tb + st.at;
+            if (at < lo) or (at >= hi) {
+                continue;
+            }
+            let mut src = ir.src_loc(file_id, st.line);
+            if st.lfile.len > 0 {
+                src = ir.src_loc(loc_file_id(st.lfile), st.lline);
+            }
+            rows.push(((at - lo) << 32) | @as(u64, src));
+        }
+        let mut sym = ss.get(p);
+        if sym < 0 {
+            sym = @as(i64, elf.add_sym(obj, elf.Sym.{ name: "", sec: text, value: lo, size: 0, bind: elf.B_LOCAL,
+                                                      ty: elf.T_NOTYPE, hidden: false }));
+        }
+        let rs = u.perm_newn.[u64](rows.len + 1);
+        for k in 0..rows.len {
+            rs[k] = rows.get(k);
+        }
+        funcs.push(FileFunc.{ sym: @truncate(u32, @bit_cast(u64, sym)), name: u.perm_dup(names.get(p)),
+                              external: ext.get(p), size: hi - lo, rows: rs[0..rows.len] });
+    }
+}
+
+// The file (u.g_files) of a name .file gives: the file's, or one of that
+// name with no text when there is none (a source the assembly came from).
+let mut loc_files: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+fn loc_file_id(name: []u8) i32 {
+    let k = u.intern(name);
+    let x = loc_files.get(k);
+    if x != 0 {
+        return x - 1;
+    }
+    let mut f = u.load_file(name, u.nosym());
+    if u.isnil(f) {
+        f = u.perm_new.[u.SourceFile]();
+        f.path = u.perm_dup(name);
+        f.display = f.path;
+        f.text = "";
+        f.id = @int_cast(i32, u.g_files.len);
+        u.g_files.push(f);
+    }
+    loc_files.put(k, f.id + 1);
+    return f.id;
 }

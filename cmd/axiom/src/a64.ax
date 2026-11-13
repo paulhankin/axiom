@@ -3248,6 +3248,12 @@ fn gen_inst(v: *mut ir.Value) void {
             return;
         }
         if id == ir.IN_ASM {
+            // (a template that uses the stack: a frame, addressed from x29 as
+            // with a dynamic allocation, so that CFA = x29 + 16 stays exact,
+            // and on Windows the unwind information's set_fp)
+            if ai.blob(is.cval(v.xs.get(0))).sp {
+                dyn_frame = true;
+            }
             gen_asm(v);
             return;
         }
@@ -3802,7 +3808,9 @@ fn gen_asm(v: *mut ir.Value) void {
         }
         regs[k] = r;
         if op.out {
-            if op.early or mc.is_vreg(r) {
+            // (an early-clobber output is written before the inputs are read:
+            // in none of their registers; another may share one)
+            if op.early {
                 ops[k] = mc.reg(r, mc.RD | mc.RE);
             } else {
                 ops[k] = W(r);
@@ -3855,12 +3863,8 @@ fn gen_asm(v: *mut ir.Value) void {
             copy(t, r, u8_of(vec, VR, GPR));
             r = t;
         }
-        let m = addr(v.xs.get(k + 1));
-        if vec {
-            _ = e2(FSTR, @truncate(u8, op.bits / 8), m, R(r));
-        } else {
-            _ = e2(STR, @truncate(u8, op.bits / 8), m, R(r));
-        }
+        // (the asm's result k: IN_CALL_RESULT(asm, k) reads it)
+        copy(call_result_vreg(v, k, u8_of(vec, VR, GPR)), r, u8_of(vec, VR, GPR));
     }
 }
 
@@ -3935,10 +3939,20 @@ fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
 }
 
 fn asm_symbol(name: []u8) i32 {
+    return @bit_cast(i32, asm_symbol_u(name));
+}
+
+// (asm/obj.ax's form: an operand's symbol, a name of internal linkage the
+// text names, else the symbol of the name)
+fn asm_symbol_u(name: []u8) u32 {
     if u.starts(name, "__axiom_sym_") {
-        return @truncate(i32, u.atol(name[12..]));
+        return @truncate(u32, @bit_cast(u64, u.atol(name[12..])));
     }
-    return @bit_cast(i32, elf.ext_sym(OBJ, u.perm_dup(name), false));
+    let al = aob.alias_sym(OBJ, ai.blob(asm_inst.aux).aliases, name);
+    if al >= 0 {
+        return @truncate(u32, @bit_cast(u64, al));
+    }
+    return elf.ext_sym(OBJ, u.perm_dup(name), false);
 }
 
 // The template with the operands where they were allocated, assembled
@@ -3962,8 +3976,36 @@ fn enc_asm(i: *mut mc.MInst) void {
         return;
     }
     code.put(A.secs.at(0).data.items());
-    for r in A.relocs.items() {
-        rls.push(Rl.{ off: start + r.off, ty: r.ty, sym: asm_symbol(r.name), addend: r.addend });
+    let rels = aob.inline_asm(OBJ, A, fsym.get(@int_cast(usize, F.id)), start, asm_symbol_u);
+    if acr.failed(A) {
+        fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
+        return;
+    }
+    for r in rels {
+        rls.push(Rl.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
+    }
+    if DBG.on and (A.icfi.len > 0) {
+        // (the registers the template saves: rules from sp; the frame's: x29
+        // and x30 at CFA - 16 and - 8, the callee-saved ones in their slots)
+        let n = @int_cast(usize, nsaved) + 2;
+        let regs = u.newn.[u32](n);
+        let offs = u.newn.[i64](n);
+        regs[0] = dw.A64_FP;
+        offs[0] = -16;
+        regs[1] = dw.A64_LR;
+        offs[1] = -8;
+        for k in 0..@int_cast(usize, nsaved) {
+            let r = saved[k];
+            let mut dr = @bit_cast(u32, r);
+            if r >= V0 {
+                dr = 64 + @bit_cast(u32, r - V0);
+            }
+            regs[k + 2] = dr;
+            offs[k + 2] = -16 - frame + save_off[k];
+        }
+        for c in acr.inline_cfi(A, dw.A64_SP, regs[0..n], offs[0..n]) {
+            xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
+        }
     }
 }
 
@@ -4534,7 +4576,7 @@ let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), re
                                                           vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };  // frame tables (ftab.ax)
 
 fn needs_frame() bool {
-    if (frame != 0) or (nsaved > 0) {
+    if (frame != 0) or (nsaved > 0) or dyn_frame {
         return true;
     }
     for bi in 0..MF.blocks.len {
@@ -4586,8 +4628,9 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                  drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
                                  gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
                                  voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, tls_rel: 0,
-                                 size_fix: false };
+                                 cies: [0; 4], size_fix: false };
 let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut xcfis: u.List.[dw.XCfi] = u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 };
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
@@ -5203,6 +5246,8 @@ fn encode_func(f: *mut ir.Func) void {
     local_off.clear();
     frameless = not needs_frame();
     cfis.clear();
+    xcfis.clear();
+    aob.inline_pass(OBJ);
     prologue();
     let nb = MF.blocks.len;
     let boff = u.newn.[u64](nb + 1);
@@ -5291,6 +5336,7 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, code.len());
+    aob.inline_place(OBJ, TEXT, base);
     ft.func(&mut FT, base, s.size, frameless, calls.items()[0..0], calls.items(), rows.items(),
             dw.func_name(f, elf.display_name(s.name)));
     if WIN_ and not frameless {
@@ -5311,11 +5357,11 @@ fn encode_func(f: *mut ir.Func) void {
             }
             regs[k + 2] = dw.saved_reg(dr, -16 - frame + save_off[k]);
         }
-        let df = dw.Func.{ sym: fsym.get(@int_cast(usize, f.id)), name: dw.func_name(f, elf.display_name(s.name)),
-                           external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
-                           scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..nsaved + 2], irf: f,
-                           vars: dw.var_locs(f, var_slot_off, 16 + frame), vlocs: dloc.compute(MF, &DLOC, s.size),
-                           frame_local: -1 };
+        let df = dw.Func.{ xcfi: xcfis.items(), sym: fsym.get(@int_cast(usize, f.id)),
+                           name: dw.func_name(f, elf.display_name(s.name)), external: s.bind != elf.B_LOCAL,
+                           size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: cfis.items(),
+                           regs: regs[0..nsaved + 2], irf: f, vars: dw.var_locs(f, var_slot_off, 16 + frame),
+                           vlocs: dloc.compute(MF, &DLOC, s.size), frame_local: -1 };
         dw.add_func(&mut DBG, &df);
     }
     rows.deinit();
@@ -5440,8 +5486,29 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             u.eprint(u.f2("axiom: AArch64 code generation: file-scope asm at %s: %s\n", b.loc, acr.message(A)));
             return u.nil.[elf.Obj]();
         }
-        aob.add_file(OBJ, TEXT, A);
+        aob.add_file(OBJ, TEXT, A, b.aliases, b.file_id);
+        if aob.add_error.len > 0 {
+            u.eprint(u.f2("axiom: AArch64 code generation: asm at %s: %s\n", b.loc, aob.add_error));
+            aob.add_error = "";
+            return u.nil.[elf.Obj]();
+        }
     }
+    // (its procedures' Windows unwind records: .xdata, and their .pdata entries)
+    for p in aob.sehs.items() {
+        if WIN_ {
+            let x = OBJ.secs.get(@int_cast(usize, XDATA));
+            x.data.align(4);
+            let xoff = @as(u64, x.data.len());
+            x.data.put(p.xdata);
+            let pd = OBJ.secs.get(@int_cast(usize, PDATA));
+            let poff = @as(u64, pd.data.len());
+            pd.data.zeros(8);
+            pd.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: p.sym, addend: 0 });
+            pd.relocs.push(
+                elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
+        }
+    }
+    aob.sehs.clear();
     // each global's known alignment (mem_sym)
     galign.clear();
     for i in 0..m.globals.len {
@@ -5458,6 +5525,24 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         level = tg.DEBUG_NONE;  // (Windows: the PDB, from .axiom.lines)
     }
     DBG = dw.begin(dw.ARCH_A64, 8, level);
+    for p in aob.procs.items() {
+        dw.add_asm_fde(&mut DBG, p.sym, 0, p.size, p.prog, p.simple, p.signal);
+    }
+    aob.procs.clear();
+    // (assembly sources' line information: DWARF, or on Windows the PDB's)
+    for p in aob.funcs.items() {
+        let df = dw.Func.{ xcfi: u.nil_slice.[dw.XCfi](), sym: p.sym, name: p.name, external: p.external, size: p.size,
+                           src: 0, rows: p.rows, scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](),
+                           regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
+                           vlocs: u.nil_slice.[dloc.VLoc](), frame_local: -1 };
+        if p.rows.len > 0 {
+            dw.add_func(&mut DBG, &df);
+            if WIN_ and (LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
+                wlines.emit(OBJ, LINES, p.name, p.rows);
+            }
+        }
+    }
+    aob.funcs.clear();
     DBG.lang = dw.module_lang(m);
     if not tg.is_darwin() {
         DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
@@ -5480,6 +5565,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
                 return u.nil.[elf.Obj]();
             }
         }
+    }
+    let msg = aob.resolve(OBJ);
+    if msg.len > 0 {
+        u.eprint(u.f1("axiom: AArch64 code generation: %s\n", msg));
+        return u.nil.[elf.Obj]();
     }
     dw.finish_elf(&mut DBG, OBJ, TEXT, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
     return OBJ;

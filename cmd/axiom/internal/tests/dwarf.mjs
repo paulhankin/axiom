@@ -338,6 +338,15 @@ function run(cie, prog, state, fde, low, initial) {
     else if (op === 0x0c) state.cfa = [r.uleb(), r.uleb()];
     else if (op === 0x0d) state.cfa = [r.uleb(), state.cfa[1]];
     else if (op === 0x0e) state.cfa = [state.cfa[0], r.uleb()];
+    else if (op === 0x06) { const g = r.uleb(); state.regs.set(g, initial && initial.regs.has(g) ? initial.regs.get(g) : ['same']); }
+    else if (op === 0x09) { const g = r.uleb(); state.regs.set(g, ['reg', r.uleb()]); }
+    else if (op === 0x0a) { (state.stack ||= []).push({ cfa: [...state.cfa], regs: new Map(state.regs) }); }
+    else if (op === 0x0b) { const t = state.stack.pop(); state.cfa = t.cfa; state.regs = t.regs; }
+    else if (op === 0x10) { const g = r.uleb(), n = r.uleb(); state.regs.set(g, ['expr', Buffer.from(prog.subarray(r.p, r.p + n)).toString('hex')]); r.p += n; }
+    else if (op === 0x11) { const g = r.uleb(); state.regs.set(g, ['off', r.sleb() * cie.daf]); }
+    else if (op === 0x12) state.cfa = [r.uleb(), r.sleb() * cie.daf];
+    else if (op === 0x13) state.cfa = [state.cfa[0], r.sleb() * cie.daf];
+    else if (op === 0x2d) state.regs.set('ra_sign', ['negate']);
     else throw new Error(`call frame instruction 0x${op.toString(16)}`);
     if (fde && (hi === 0x40 || op === 2 || op === 3 || op === 4)) continue;
     if (fde) row();

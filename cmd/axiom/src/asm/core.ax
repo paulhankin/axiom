@@ -10,15 +10,17 @@
 // passes end).
 //
 // Two kinds of text are assembled: an asm statement's template (`inline_`:
-// its bytes go into its function's code, it defines no symbols and
-// switches to no section) and file-scope asm (sections and symbols of the
-// object). The syntax is the conventional assembler's for the architecture (AT&T for
-// x86-64); what an instruction or directive this does not know is, is an
-// error naming it, never silently wrong bytes.
+// its .text bytes go into its function's code, its other sections' into the
+// object's, its labels and .globl symbols become the object's: asm/obj.ax)
+// and file-scope asm (sections and symbols of the object). The syntax is the
+// conventional assembler's for the architecture (AT&T or Intel for x86-64);
+// what an instruction or directive this does not know is, is an error
+// naming it, never silently wrong bytes.
 // =============================================================================
 import "../elf.ax" as elf;
 import "../target.ax" as tg;
 import "../util.ax" as u;
+import "inline.ax" as ai;
 
 // -----------------------------------------------------------------------------
 // The assembly
@@ -30,6 +32,10 @@ pub struct Stmt {
     args: []u8,     // the rest of the statement
     long_: bool,    // (the encoder's: a jump that needs its long form)
     aux: i64,       // (the encoder's)
+    sec: i32,       // where it was assembled (the last pass): its section and offset
+    at: u64,
+    lfile: []u8,  // the location .loc gave before it (empty: none), and its line
+    lline: i32,
 }
 
 pub struct Sec {
@@ -65,6 +71,7 @@ pub struct Def {
     abs: bool,      // `.set name, value` of a constant: value in off
     tmp: bool,      // the current place (`.`) where an expression was read
     intext: bool,   // a label this text defines
+    set_si: usize,  // abs: the statement that set it (.set)
 }
 
 /// A statement of the text before the expander: its text (labels and all).
@@ -105,9 +112,39 @@ pub struct Asm {
     err_line: i32,
     pass: i32,
     changed: bool,
-    origin: u64,  // inline: where the text starts in its section (for alignment)
-    si: usize,    // the statement being assembled
-    comment: u8,  // the comment character ('#' for x86-64, 0: '//' only)
+    origin: u64,   // inline: where the text starts in its section (for alignment)
+    si: usize,     // the statement being assembled
+    comment: u8,   // the comment character ('#' for x86-64, 0: '//' only)
+    intel: bool,   // x86-64: the Intel syntax is in force (.intel_syntax)
+    intel0: bool,  // x86-64: the syntax the text starts in (each pass)
+    // call frame information (.cfi_*: cfi_directive)
+    procs: u.List.[Proc],  // file-scope: the procedures
+    icfi: u.List.[ICfi],   // inline: the template's events
+    in_proc: bool,
+    cfi_simple: bool,
+    cfi_signal: bool,
+    cfi_sec: i32,
+    cfi_start: u64,
+    cfi_loc: u64,  // the place the program has advanced to
+    cfi_prog: u.Buf,
+    cfi_reg: u64,  // the CFA's register (DWARF) and offset (inline: the stack pointer's move)
+    cfi_off: i64,
+    cfi_stack: u.List.[i64],  // .cfi_remember_state's
+    // Windows unwind information (.seh_*: seh_directive)
+    sehs: u.List.[SehProc],
+    in_seh: bool,
+    seh_sec: i32,
+    seh_start: u64,
+    seh_prolog: i64,  // the prologue's size (.seh_endprologue), or -1
+    seh_codes: u.List.[[]u8],
+    seh_epis: u.List.[i64],  // ARM64: each epilogue's offset and its first code's index in seh_codes
+    seh_frame: u64,          // x86-64: the frame register and offset (UNWIND_INFO's fourth byte)
+    // debug information: .file N "name" (the names), .loc N line (the place in force)
+    files: u.List.[[]u8],
+    loc_file: []u8,
+    loc_line: i32,
+    uses_sp: bool,  // an instruction names the stack pointer, or pushes, pops or calls (stack_use)
+    calls: bool,    // an instruction calls (x86-64 call, AArch64 bl, blr ...)
 }
 
 /// A new assembly of `text` for arch (inline_: an asm statement's template).
@@ -253,8 +290,10 @@ fn split(A: *mut Asm) void {
             b.c(' ');
             continue;
         }
+        // (AArch64: `//`, and `#` first on a line, as the conventional assembler has them)
         let line_comment = ((c == '/') and ((i + 1) < t.len) and (t[i + 1] == '/') and (A.comment == 0)) or
-                           ((A.comment != 0) and (c == A.comment));
+                           ((A.comment != 0) and (c == A.comment)) or
+                           ((A.comment == 0) and (c == '#') and (trim(b.view()).len == 0));
         if line_comment {
             while (i < t.len) and (t[i] != '\n') {
                 i += 1;
@@ -307,7 +346,7 @@ fn add_stmt(A: *mut Asm, s0: []u8, line: i32) void {
     let rest = trim(s[k..]);
     if (k > 0) and (rest.len > 1) and (rest[0] == '=') and (rest[1] != '=') {
         A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: ".set", args: u.cat3(s[0..k], ",", rest[1..]),
-                            long_: false, aux: 0 });
+                            long_: false, aux: 0, sec: 0, at: 0, lfile: "", lline: 0 });
         return;
     }
     while (k < s.len) and not is_space(s[k]) {
@@ -318,7 +357,8 @@ fn add_stmt(A: *mut Asm, s0: []u8, line: i32) void {
     if (op.len == 0) and (labels.len == 0) {
         return;
     }
-    A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: op, args: args, long_: false, aux: 0 });
+    A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: op, args: args, long_: false, aux: 0, sec: 0, at: 0,
+                        lfile: "", lline: 0 });
 }
 
 // -----------------------------------------------------------------------------
@@ -1039,7 +1079,7 @@ fn label_def(A: *mut Asm, name: []u8, line: i32) i32 {
 fn new_def(A: *mut Asm, name: []u8) i32 {
     A.defs.push(Def.{ name: name, sec: -1, off: 0, prev_sec: -1, prev_off: 0, defined: false, global: false,
                       weak: false, ty: elf.T_NOTYPE, size: 0, has_size: false, numeric: false, abs: false, tmp: false,
-                      intext: false });
+                      intext: false, set_si: 0 });
     return @int_cast(i32, A.defs.len - 1);
 }
 
@@ -1878,6 +1918,7 @@ pub fn run(A: *mut Asm, arch: *Arch) void {
     if failed(A) {
         return;
     }
+    stack_use(A);
     let mut pass: i32 = 0;
     while pass < 12 {
         A.pass = pass;
@@ -1905,6 +1946,7 @@ pub fn run(A: *mut Asm, arch: *Arch) void {
                 let d = A.defs.at(k);
                 d.defined = d.sec >= 0;
             }
+            cfi_finish(A);
             return;
         }
         pass += 1;
@@ -1922,6 +1964,13 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
         A.cur = section(A, ".text", elf.S_TEXT);
     }
     A.prev = A.cur;
+    A.intel = A.intel0;
+    A.procs.clear();
+    A.icfi.clear();
+    A.sehs.clear();
+    A.in_seh = false;
+    A.in_proc = false;
+    A.cfi_off = 0;
     for k in 0..A.defs.len {
         let d = A.defs.at(k);
         d.defined = false;
@@ -1930,9 +1979,15 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
             d.off = 0;
         }
     }
+    A.loc_file = "";
+    A.loc_line = 0;
     for i in 0..A.stmts.len {
         A.si = i;
         let st = A.stmts.at(i);
+        st.sec = A.cur;
+        st.at = here(A);
+        st.lfile = A.loc_file;
+        st.lline = A.loc_line;
         for l in st.labels {
             let d = A.defs.at(@int_cast(usize, l));
             if d.defined or d.abs {
@@ -1955,6 +2010,66 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
         }
         if failed(A) {
             return;
+        }
+    }
+}
+
+// What the text's instructions do with the stack (A.uses_sp, A.calls):
+// x86-64 push, pop, call, enter, leave, ret and the stack pointer (rsp, esp,
+// sp, spl) as an operand; AArch64 bl, blr and its kin, and sp or wsp as an
+// operand. (The backends give a function whose asm uses the stack a frame,
+// and make no sibling calls from one whose asm does: docs/c.md.)
+fn stack_use(A: *mut Asm) void {
+    let a64 = A.arch == tg.ARCH_A64;
+    for st in A.stmts.items() {
+        let op = st.op;
+        if (op.len == 0) or (op[0] == '.') {
+            continue;
+        }
+        if a64 {
+            if u.str_eq(op, "bl") or u.starts(op, "blr") {
+                A.calls = true;
+                A.uses_sp = true;
+            }
+        } else {
+            // (after prefixes: the instruction's own mnemonic)
+            let mut m = op;
+            let mut rest = st.args;
+            while u.str_eq(m, "lock") or u.starts(m, "rep") or u.starts(m, "{") or u.str_eq(m, "notrack") or
+                  u.str_eq(m, "bnd") {
+                let t = trim(rest);
+                let mut k: usize = 0;
+                while (k < t.len) and not is_space(t[k]) {
+                    k += 1;
+                }
+                m = lower(t[0..k]);
+                rest = t[k..];
+            }
+            if u.starts(m, "call") {
+                A.calls = true;
+            }
+            if u.starts(m, "push") or u.starts(m, "pop") or u.starts(m, "call") or u.starts(m, "enter") or
+               u.starts(m, "leave") or u.starts(m, "ret") or u.starts(m, "iret") {
+                A.uses_sp = true;
+            }
+        }
+        // the stack pointer named
+        let s = lower(st.args);
+        let mut i: usize = 0;
+        while i < s.len {
+            if is_sym_start(s[i]) and ((i == 0) or not is_sym_char(s[i - 1])) {
+                let b0 = i;
+                while (i < s.len) and is_sym_char(s[i]) {
+                    i += 1;
+                }
+                let w = s[b0..i];
+                if (a64 and (u.str_eq(w, "sp") or u.str_eq(w, "wsp"))) or
+                   (not a64 and (u.str_eq(w, "rsp") or u.str_eq(w, "esp") or u.str_eq(w, "sp") or u.str_eq(w, "spl"))) {
+                    A.uses_sp = true;
+                }
+                continue;
+            }
+            i += 1;
         }
     }
 }
@@ -2077,10 +2192,6 @@ fn data(A: *mut Asm, args: []u8, n: u32) void {
                 continue;
             }
             fail(A, "a difference of symbols of different sections");
-            return;
-        }
-        if A.inline_ {
-            fail(A, "an address in data in inline assembly (a relocation in a function's code)");
             return;
         }
         let ty = abs_type(A, n);
@@ -2478,6 +2589,9 @@ fn incbin(A: *mut Asm, args: []u8) void {
 fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
     let op = st.op;
     let args = st.args;
+    if cfi_directive(A, op, args) or seh_directive(A, op, args) {
+        return;
+    }
     if u.str_eq(op, ".byte") {
         data(A, args, 1);
         return;
@@ -2644,10 +2758,6 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
             }
         }
         let kind = kind_of_section(name, flags, ty);
-        if A.inline_ and not (u.str_eq(name, ".text") and not u.str_eq(op, ".pushsection")) {
-            fail(A, u.f1("inline assembly cannot change the section (%s)", st.args));
-            return;
-        }
         if u.str_eq(op, ".pushsection") {
             A.stack.push(A.cur);
         }
@@ -2672,10 +2782,6 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
     }
     if u.str_eq(op, ".globl") or u.str_eq(op, ".global") or u.str_eq(op, ".weak") or u.str_eq(op, ".local") or
        u.str_eq(op, ".hidden") or u.str_eq(op, ".protected") or u.str_eq(op, ".internal") {
-        if A.inline_ {
-            fail(A, u.f1("inline assembly cannot define symbols (%s)", op));
-            return;
-        }
         for n in split_args(args) {
             let d = A.defs.at(@int_cast(usize, sym(A, n)));
             if u.str_eq(op, ".weak") {
@@ -2759,9 +2865,6 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         return;
     }
     if u.str_eq(op, ".size") {
-        if A.inline_ {
-            return;
-        }
         let xs = split_args(args);
         if xs.len == 2 {
             let d = sym(A, xs[0]);
@@ -2788,6 +2891,7 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         if is_const(v) {
             d.abs = true;
             d.off = @bit_cast(u64, v.k);
+            d.set_si = A.si;
             return;
         }
         if (v.sym >= 0) and (v.neg < 0) {
@@ -2802,15 +2906,15 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         fail(A, u.f1("%s of a value that is not a constant or a label of this assembly", op));
         return;
     }
-    // what changes nothing here: debug information, call frame information
-    // (a template that changes the frame is not supported: docs/c.md), the
-    // file's name, identification, the syntax and target already in force
-    let ignored = [".file", ".loc", ".ident", ".att_syntax", ".code64", ".arch", ".cpu", ".arch_extension",
-                   ".cfi_startproc", ".cfi_endproc", ".cfi_def_cfa", ".cfi_def_cfa_offset", ".cfi_def_cfa_register",
-                   ".cfi_offset", ".cfi_adjust_cfa_offset", ".cfi_rel_offset", ".cfi_restore", ".cfi_remember_state",
-                   ".cfi_restore_state", ".cfi_sections", ".cfi_signal_frame", ".cfi_undefined", ".cfi_same_value",
-                   ".cfi_register", ".cfi_escape", ".cfi_window_save", ".cfi_negate_ra_state", ".cfi_personality",
-                   ".cfi_lsda", ".nops_off", ".variant_pcs", ".addrsig", ".addrsig_sym"];
+    // what changes nothing here: debug information (but asm/obj.ax reads
+    // .file and .loc), the file's name, identification, the target already
+    // in force
+    if u.str_eq(op, ".file") or u.str_eq(op, ".loc") {
+        loc_directive(A, op, args);
+        return;
+    }
+    let ignored = [".ident", ".code64", ".arch", ".cpu", ".arch_extension", ".nops_off", ".variant_pcs", ".addrsig",
+                   ".addrsig_sym"];
     for x in ignored {
         if u.str_eq(op, x) {
             return;
@@ -2819,7 +2923,1043 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
     fail(A, u.f1("the directive '%s' is not supported", op));
 }
 
+/// Is expression text s a constant symbol alone (.set) that is set only
+/// after the statement being assembled? (The Intel syntax reads such an
+/// operand, as the conventional assembler does, as memory at that address.)
+pub fn set_later(A: *mut Asm, s: []u8) bool {
+    for c in s {
+        if not is_sym_char(c) {
+            return false;
+        }
+    }
+    let mut i: usize = 0;
+    while i < s.len {
+        if is_sym_start(s[i]) and ((i == 0) or not is_sym_char(s[i - 1])) {
+            let st = i;
+            while (i < s.len) and is_sym_char(s[i]) {
+                i += 1;
+            }
+            let k = A.names.get(u.intern(s[st..i]));
+            if k > 0 {
+                let d = A.defs.get(@int_cast(usize, k - 1));
+                if d.abs and (d.set_si > A.si) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 /// The value of symbol s, a label placed by this text: its section and offset.
 pub fn def_of(A: *Asm, s: i32) Def {
     return A.defs.get(@int_cast(usize, s));
+}
+
+// -----------------------------------------------------------------------------
+// Call frame information: the .cfi_* directives (as the conventional
+// assembler's manual describes them), read into DWARF call frame
+// instructions (DWARF 5, 6.4.2) for the procedures of file-scope asm
+// (.cfi_startproc ... .cfi_endproc: a Proc, whose program the backends put
+// in an FDE of .debug_frame: dwarf.ax add_asm_fde), and for an inline
+// template the events the enclosing function's frame description takes
+// (ICfi: the stack pointer moved by .cfi_adjust_cfa_offset, a register
+// saved on the stack by .cfi_rel_offset, given back by .cfi_restore).
+// The code and data alignment factors are those of the compiler's CIE: 1
+// (x86-64) or 4 (AArch64), and -8.
+// -----------------------------------------------------------------------------
+pub struct Proc {
+    sec: i32,
+    start: u64,
+    end: u64,
+    prog: []u8,    // the FDE's call frame instructions
+    simple: bool,  // .cfi_startproc simple: no initial instructions (the CIE's)
+    signal: bool,  // .cfi_signal_frame
+}
+
+pub const IC_ADJUST: u8 = 1;   // the stack pointer moves down by val (from the template's start, in total)
+pub const IC_SAVE: u8 = 2;     // register reg (DWARF) saved at the stack pointer + val
+pub const IC_RESTORE: u8 = 3;  // register reg has its value again
+
+/// An event of an inline template's call frame information, at offset `off`
+/// of the template.
+pub struct ICfi {
+    off: u64,
+    kind: u8,
+    reg: u32,
+    val: i64,
+}
+
+// DWARF call frame instructions
+const DW_ADVANCE_LOC: u8 = 0x40;
+const DW_OFFSET: u8 = 0x80;
+const DW_RESTORE: u8 = 0xc0;
+const DW_ADVANCE_LOC1: u8 = 0x02;
+const DW_ADVANCE_LOC2: u8 = 0x03;
+const DW_ADVANCE_LOC4: u8 = 0x04;
+const DW_OFFSET_EXTENDED: u8 = 0x05;
+const DW_RESTORE_EXTENDED: u8 = 0x06;
+const DW_UNDEFINED: u8 = 0x07;
+const DW_SAME_VALUE: u8 = 0x08;
+const DW_REGISTER: u8 = 0x09;
+const DW_REMEMBER_STATE: u8 = 0x0a;
+const DW_RESTORE_STATE: u8 = 0x0b;
+const DW_DEF_CFA: u8 = 0x0c;
+const DW_DEF_CFA_REGISTER: u8 = 0x0d;
+const DW_DEF_CFA_OFFSET: u8 = 0x0e;
+const DW_OFFSET_EXTENDED_SF: u8 = 0x11;
+const DW_DEF_CFA_SF: u8 = 0x12;
+const DW_DEF_CFA_OFFSET_SF: u8 = 0x13;
+const DW_NEGATE_RA_STATE: u8 = 0x2d;
+
+pub fn uleb_to(b: *mut u.Buf, x0: u64) void {
+    let mut x = x0;
+    loop {
+        let c = x & 0x7f;
+        x = x >> 7;
+        if x == 0 {
+            b.c(@truncate(u8, c));
+            return;
+        }
+        b.c(@truncate(u8, c | 0x80));
+    }
+}
+
+pub fn sleb_to(b: *mut u.Buf, x0: i64) void {
+    let mut x = x0;
+    loop {
+        let c = @bit_cast(u64, x) & 0x7f;
+        x = x >> 7;
+        if ((x == 0) and ((c & 0x40) == 0)) or ((x == -1) and ((c & 0x40) != 0)) {
+            b.c(@truncate(u8, c));
+            return;
+        }
+        b.c(@truncate(u8, c | 0x80));
+    }
+}
+
+// x86-64's DWARF register numbers of ours (rax rcx rdx rbx rsp rbp rsi rdi r8-r15)
+let X64_DWARF: [16]i64 = [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The DWARF register number (the platform ABIs': x86-64 rax 0, rdx 1, rcx 2,
+/// rbx 3, rsi 4, rdi 5, rbp 6, rsp 7, r8-r15, rip 16, xmm0-15 17-32, st0-7
+/// 33-40, mm0-7 41-48; AArch64 x0-x30 0-30, sp 31, v0-v31 64-95) of the
+/// register named s, or a number written as such; -1 if s is neither.
+pub fn dwarf_reg(A: *Asm, s0: []u8) i64 {
+    let mut s = lower(trim(s0));
+    if (s.len > 0) and (s[0] == '%') {
+        s = s[1..];
+    }
+    let n = ai.num(s);
+    if n >= 0 {
+        return n;
+    }
+    if A.arch == tg.ARCH_A64 {
+        let r = ai.a64_reg(s);
+        if r.reg < 0 {
+            return -1;
+        }
+        if r.cls == ai.CL_VEC {
+            return 64 + @as(i64, r.reg - 32);
+        }
+        return @as(i64, r.reg);
+    }
+    if u.str_eq(s, "rip") {
+        return 16;
+    }
+    let r = ai.x86_reg(s);
+    if (r.reg >= 0) and (r.reg < 16) and (r.bits == 64) {
+        return X64_DWARF[@int_cast(usize, r.reg)];
+    }
+    if (r.reg >= 16) and (r.reg < 32) {
+        return 17 + @as(i64, r.reg - 16);
+    }
+    let pres = ["st", "mm"];
+    let bases: [2]i64 = [33, 41];
+    for k in @as(usize, 0)..2 {
+        if u.starts(s, pres[k]) {
+            let mut t = s[2..];
+            if (t.len == 3) and (t[0] == '(') and (t[2] == ')') {
+                t = t[1..2];
+            }
+            let x = ai.num(t);
+            if (x >= 0) and (x < 8) {
+                return bases[k] + x;
+            }
+        }
+    }
+    return -1;
+}
+
+fn cfi_reg(A: *mut Asm, s: []u8) u64 {
+    let r = dwarf_reg(A, s);
+    if r < 0 {
+        fail(A, u.f1("'%s' is not a register of call frame information", trim(s)));
+        return 0;
+    }
+    return @bit_cast(u64, r);
+}
+
+// The advance of the procedure's program to the current place.
+fn cfi_advance(A: *mut Asm) void {
+    let at = here(A);
+    if at <= A.cfi_loc {
+        return;
+    }
+    let mut ca: u64 = 1;
+    if A.arch == tg.ARCH_A64 {
+        ca = 4;
+    }
+    let d = (at - A.cfi_loc) / ca;
+    let b = &mut A.cfi_prog;
+    if d < 64 {
+        b.c(DW_ADVANCE_LOC | @truncate(u8, d));
+    } else if d < 256 {
+        b.c(DW_ADVANCE_LOC1);
+        b.c(@truncate(u8, d));
+    } else if d < 65536 {
+        b.c(DW_ADVANCE_LOC2);
+        b.c(@truncate(u8, d));
+        b.c(@truncate(u8, d >> 8));
+    } else {
+        b.c(DW_ADVANCE_LOC4);
+        for k in @as(u32, 0)..4 {
+            b.c(@truncate(u8, d >> (8 * k)));
+        }
+    }
+    A.cfi_loc = at;
+}
+
+// A register saved at CFA + off.
+fn cfi_offset(A: *mut Asm, r: u64, off: i64) void {
+    if (off % 8) != 0 {
+        fail(A, u.f1("a register's offset from the CFA (%s) that is not a multiple of 8", u.dec(off)));
+        return;
+    }
+    let f = off / -8;
+    let b = &mut A.cfi_prog;
+    if f < 0 {
+        b.c(DW_OFFSET_EXTENDED_SF);
+        uleb_to(b, r);
+        sleb_to(b, f);
+    } else if r < 64 {
+        b.c(DW_OFFSET | @truncate(u8, r));
+        uleb_to(b, @bit_cast(u64, f));
+    } else {
+        b.c(DW_OFFSET_EXTENDED);
+        uleb_to(b, r);
+        uleb_to(b, @bit_cast(u64, f));
+    }
+}
+
+fn cfi_def_offset(A: *mut Asm, off: i64) void {
+    A.cfi_off = off;
+    let b = &mut A.cfi_prog;
+    if off < 0 {
+        if (off % 8) != 0 {
+            fail(A, "a negative CFA offset that is not a multiple of 8");
+            return;
+        }
+        b.c(DW_DEF_CFA_OFFSET_SF);
+        sleb_to(b, off / -8);
+        return;
+    }
+    b.c(DW_DEF_CFA_OFFSET);
+    uleb_to(b, @bit_cast(u64, off));
+}
+
+// Two operands (a register and a value, or two registers).
+fn cfi_two(A: *mut Asm, args: []u8, op: []u8) [][]u8 {
+    let xs = split_args(args);
+    if xs.len != 2 {
+        fail(A, u.f1("%s takes two operands", op));
+    }
+    return xs;
+}
+
+/// A .cfi_* directive: false if `op` is not one.
+fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
+    if not u.starts(op, ".cfi_") {
+        return false;
+    }
+    if u.str_eq(op, ".cfi_sections") {
+        return true;  // (the frame description goes in .debug_frame whatever it says)
+    }
+    if A.inline_ {
+        cfi_inline(A, op, args);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_startproc") {
+        if A.in_proc {
+            fail(A, ".cfi_startproc inside a procedure (no .cfi_endproc)");
+            return true;
+        }
+        let a = lower(trim(args));
+        if (a.len > 0) and not u.str_eq(a, "simple") {
+            fail(A, u.f1("'.cfi_startproc %s' is not supported", args));
+            return true;
+        }
+        A.in_proc = true;
+        A.cfi_simple = a.len > 0;
+        A.cfi_signal = false;
+        A.cfi_sec = A.cur;
+        A.cfi_start = here(A);
+        A.cfi_loc = A.cfi_start;
+        A.cfi_prog = u.Buf.init();
+        A.cfi_stack.clear();
+        // (the CIE's state: x86-64 CFA = rsp + 8, AArch64 CFA = sp)
+        A.cfi_reg = 7;
+        A.cfi_off = 8;
+        if A.arch == tg.ARCH_A64 {
+            A.cfi_reg = 31;
+            A.cfi_off = 0;
+        }
+        return true;
+    }
+    if not A.in_proc {
+        fail(A, u.f1("%s outside a procedure (.cfi_startproc)", op));
+        return true;
+    }
+    if A.cur != A.cfi_sec {
+        fail(A, u.f1("%s in another section than its procedure's", op));
+        return true;
+    }
+    if u.str_eq(op, ".cfi_endproc") {
+        A.in_proc = false;
+        A.procs.push(Proc.{ sec: A.cfi_sec, start: A.cfi_start, end: here(A), prog: A.cfi_prog.done(),
+                            simple: A.cfi_simple, signal: A.cfi_signal });
+        return true;
+    }
+    if u.str_eq(op, ".cfi_signal_frame") {
+        A.cfi_signal = true;
+        return true;
+    }
+    if u.str_eq(op, ".cfi_personality") or u.str_eq(op, ".cfi_lsda") {
+        // (only the encoding 0xff, "none", is accepted: there are no personality routines here)
+        let xs = split_args(args);
+        if (xs.len >= 1) and (eval_const(A, xs[0], "the encoding") == 255) {
+            return true;
+        }
+        fail(A, u.f1("%s with a routine is not supported", op));
+        return true;
+    }
+    cfi_advance(A);
+    if u.str_eq(op, ".cfi_def_cfa") {
+        let xs = cfi_two(A, args, op);
+        if failed(A) {
+            return true;
+        }
+        let r = cfi_reg(A, xs[0]);
+        let off = eval_const(A, xs[1], "the offset");
+        A.cfi_reg = r;
+        A.cfi_off = off;
+        if off < 0 {
+            A.cfi_prog.c(DW_DEF_CFA_SF);
+            uleb_to(&mut A.cfi_prog, r);
+            sleb_to(&mut A.cfi_prog, off / -8);
+        } else {
+            A.cfi_prog.c(DW_DEF_CFA);
+            uleb_to(&mut A.cfi_prog, r);
+            uleb_to(&mut A.cfi_prog, @bit_cast(u64, off));
+        }
+        return true;
+    }
+    if u.str_eq(op, ".cfi_def_cfa_register") {
+        let r = cfi_reg(A, args);
+        A.cfi_reg = r;
+        A.cfi_prog.c(DW_DEF_CFA_REGISTER);
+        uleb_to(&mut A.cfi_prog, r);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_def_cfa_offset") {
+        cfi_def_offset(A, eval_const(A, args, "the offset"));
+        return true;
+    }
+    if u.str_eq(op, ".cfi_adjust_cfa_offset") {
+        cfi_def_offset(A, A.cfi_off + eval_const(A, args, "the adjustment"));
+        return true;
+    }
+    if u.str_eq(op, ".cfi_offset") or u.str_eq(op, ".cfi_rel_offset") {
+        let xs = cfi_two(A, args, op);
+        if failed(A) {
+            return true;
+        }
+        let r = cfi_reg(A, xs[0]);
+        let mut off = eval_const(A, xs[1], "the offset");
+        if u.str_eq(op, ".cfi_rel_offset") {
+            off = off - A.cfi_off;  // (from the CFA register's value: CFA - its offset)
+        }
+        cfi_offset(A, r, off);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_restore") or u.str_eq(op, ".cfi_undefined") or u.str_eq(op, ".cfi_same_value") {
+        for x in split_args(args) {
+            let r = cfi_reg(A, x);
+            if u.str_eq(op, ".cfi_restore") {
+                if r < 64 {
+                    A.cfi_prog.c(DW_RESTORE | @truncate(u8, r));
+                } else {
+                    A.cfi_prog.c(DW_RESTORE_EXTENDED);
+                    uleb_to(&mut A.cfi_prog, r);
+                }
+            } else {
+                A.cfi_prog.c(u.pick(u.str_eq(op, ".cfi_undefined"), "\x07", "\x08")[0]);
+                uleb_to(&mut A.cfi_prog, r);
+            }
+        }
+        return true;
+    }
+    if u.str_eq(op, ".cfi_register") {
+        let xs = cfi_two(A, args, op);
+        if failed(A) {
+            return true;
+        }
+        A.cfi_prog.c(DW_REGISTER);
+        uleb_to(&mut A.cfi_prog, cfi_reg(A, xs[0]));
+        uleb_to(&mut A.cfi_prog, cfi_reg(A, xs[1]));
+        return true;
+    }
+    if u.str_eq(op, ".cfi_remember_state") {
+        A.cfi_stack.push(@bit_cast(i64, A.cfi_reg));
+        A.cfi_stack.push(A.cfi_off);
+        A.cfi_prog.c(DW_REMEMBER_STATE);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_restore_state") {
+        if A.cfi_stack.len < 2 {
+            fail(A, ".cfi_restore_state without .cfi_remember_state");
+            return true;
+        }
+        A.cfi_off = A.cfi_stack.pop();
+        A.cfi_reg = @bit_cast(u64, A.cfi_stack.pop());
+        A.cfi_prog.c(DW_RESTORE_STATE);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_escape") {
+        for x in split_args(args) {
+            let v = eval_const(A, x, "a byte");
+            if (v < 0) or (v > 255) {
+                fail(A, u.f1(".cfi_escape of '%s', not a byte", x));
+                return true;
+            }
+            A.cfi_prog.c(@truncate(u8, @bit_cast(u64, v)));
+        }
+        return true;
+    }
+    if (u.str_eq(op, ".cfi_negate_ra_state") or u.str_eq(op, ".cfi_window_save")) and (A.arch == tg.ARCH_A64) {
+        A.cfi_prog.c(DW_NEGATE_RA_STATE);
+        return true;
+    }
+    fail(A, u.f1("the directive '%s' is not supported", op));
+    return true;
+}
+
+// A .cfi_* directive in an inline template, which describes what the
+// template does to the enclosing function's frame: the stack pointer it
+// moves (.cfi_adjust_cfa_offset), the registers it saves on the stack
+// (.cfi_rel_offset: from the stack pointer there) and gives back
+// (.cfi_restore). The template must not change the frame otherwise.
+fn cfi_inline(A: *mut Asm, op: []u8, args: []u8) void {
+    let at = here(A);
+    if u.str_eq(op, ".cfi_adjust_cfa_offset") {
+        A.cfi_off = A.cfi_off + eval_const(A, args, "the adjustment");
+        A.icfi.push(ICfi.{ off: at, kind: IC_ADJUST, reg: 0, val: A.cfi_off });
+        return;
+    }
+    if u.str_eq(op, ".cfi_rel_offset") {
+        let xs = cfi_two(A, args, op);
+        if failed(A) {
+            return;
+        }
+        let r = cfi_reg(A, xs[0]);
+        let off = eval_const(A, xs[1], "the offset");
+        A.icfi.push(ICfi.{ off: at, kind: IC_SAVE, reg: @truncate(u32, r), val: off });
+        return;
+    }
+    if u.str_eq(op, ".cfi_restore") or u.str_eq(op, ".cfi_same_value") {
+        for x in split_args(args) {
+            let r = cfi_reg(A, x);
+            A.icfi.push(ICfi.{ off: at, kind: IC_RESTORE, reg: @truncate(u32, r), val: 0 });
+        }
+        return;
+    }
+    if u.str_eq(op, ".cfi_startproc") or u.str_eq(op, ".cfi_endproc") {
+        fail(A, u.f1("%s in inline assembly (a template is a part of its function)", op));
+        return;
+    }
+    fail(A,
+         u.f1("%s in inline assembly: a template cannot change its function's frame (only .cfi_adjust_cfa_offset, .cfi_rel_offset and .cfi_restore)",
+              op));
+}
+
+// After the last pass: a procedure must be closed, and an inline template
+// must leave the stack and the registers it saved as it found them.
+fn cfi_finish(A: *mut Asm) void {
+    if A.in_seh {
+        fail(A, ".seh_proc without its .seh_endproc");
+        return;
+    }
+    if A.in_proc {
+        fail(A, ".cfi_startproc without its .cfi_endproc");
+        return;
+    }
+    if not A.inline_ {
+        return;
+    }
+    if A.cfi_off != 0 {
+        fail(A, "the template's .cfi_adjust_cfa_offset do not add up to 0 (the stack pointer must be where it was)");
+        return;
+    }
+    let mut saved = u.List.[u32].empty();
+    for e in A.icfi.items() {
+        if e.kind == IC_SAVE {
+            saved.push(e.reg);
+        } else if e.kind == IC_RESTORE {
+            let mut k: usize = 0;
+            while k < saved.len {
+                if saved.get(k) == e.reg {
+                    saved.set(k, 0xffff_ffff);
+                }
+                k += 1;
+            }
+        }
+    }
+    for r in saved.items() {
+        if r != 0xffff_ffff {
+            fail(A, u.f1("the template saves register %s (.cfi_rel_offset) and does not restore it (.cfi_restore)",
+                         u.udec(@as(u64, r))));
+            return;
+        }
+    }
+}
+
+/// Call frame instructions at an offset of an inline template (inline_cfi).
+pub struct CfiOut {
+    off: u64,
+    bytes: []u8,
+}
+
+// A register saved at the stack pointer + off: DW_CFA_expression(reg,
+// DW_OP_bregN(off)), N the stack pointer's DWARF number.
+fn sp_save(b: *mut u.Buf, reg: u32, sp: u32, off: i64) void {
+    let mut e = u.Buf.init();
+    if sp < 32 {
+        e.c(0x70 + @truncate(u8, sp));  // DW_OP_breg0 + sp
+    } else {
+        e.c(0x92);  // DW_OP_bregx
+        uleb_to(&mut e, @as(u64, sp));
+    }
+    sleb_to(&mut e, off);
+    let x = e.done();
+    b.c(0x10);  // DW_CFA_expression
+    uleb_to(b, @as(u64, reg));
+    uleb_to(b, @as(u64, x.len));
+    for c in x {
+        b.c(c);
+    }
+}
+
+/// The call frame instructions of an inline template's events (A.icfi): a
+/// register the template saves (.cfi_rel_offset reg, off) is at the stack
+/// pointer + off then, and as the template moves the stack pointer
+/// (.cfi_adjust_cfa_offset) its rule follows; .cfi_restore gives it back
+/// the function's rule: at its CFA offset `saved_offs[k]` for the registers
+/// `saved_regs` the function's frame saves, else its own value. (The
+/// function has a frame: its CFA does not depend on the stack pointer.)
+pub fn inline_cfi(A: *Asm, sp: u32, saved_regs: []u32, saved_offs: []i64) []CfiOut {
+    let mut out = u.List.[CfiOut].empty();
+    let mut regs = u.List.[u32].empty();
+    let mut at = u.List.[i64].empty();  // (each saved register's offset from the stack pointer at the template's start)
+    let mut delta: i64 = 0;
+    for e in A.icfi.items() {
+        let mut b = u.Buf.init();
+        if e.kind == IC_ADJUST {
+            delta = e.val;
+            for k in 0..regs.len {
+                if regs.get(k) != 0xffff_ffff {
+                    sp_save(&mut b, regs.get(k), sp, at.get(k) + delta);
+                }
+            }
+        } else if e.kind == IC_SAVE {
+            regs.push(e.reg);
+            at.push(e.val - delta);
+            sp_save(&mut b, e.reg, sp, e.val);
+        } else {
+            for k in 0..regs.len {
+                if regs.get(k) == e.reg {
+                    regs.set(k, 0xffff_ffff);
+                }
+            }
+            let mut done = false;
+            for k in 0..saved_regs.len {
+                if saved_regs[k] == e.reg {
+                    let f = saved_offs[k] / -8;
+                    if e.reg < 64 {
+                        b.c(DW_OFFSET | @truncate(u8, e.reg));
+                    } else {
+                        b.c(DW_OFFSET_EXTENDED);
+                        uleb_to(&mut b, @as(u64, e.reg));
+                    }
+                    uleb_to(&mut b, @bit_cast(u64, f));
+                    done = true;
+                }
+            }
+            if not done {
+                b.c(DW_SAME_VALUE);
+                uleb_to(&mut b, @as(u64, e.reg));
+            }
+        }
+        let bytes = b.done();
+        if bytes.len > 0 {
+            out.push(CfiOut.{ off: e.off, bytes: bytes });
+        }
+    }
+    return out.items();
+}
+
+// -----------------------------------------------------------------------------
+// Windows unwind information: the .seh_* directives of file-scope asm, read
+// into the procedure's unwind record (.xdata; asm/obj.ax places it and the
+// backend adds its .pdata entry): x86-64's UNWIND_INFO (the x64 exception
+// handling documentation: version 1, the prologue's size, the codes in the
+// reverse order of the prologue's instructions, the frame register), and
+// ARM64's record (the ARM64 exception handling documentation: a header word,
+// the epilogue scopes, the prologue's codes in reverse order then `end`,
+// each epilogue's codes then `end`). There are no exception handlers here:
+// .seh_handler is an error.
+// -----------------------------------------------------------------------------
+pub struct SehProc {
+    sec: i32,
+    start: u64,
+    end: u64,
+    xdata: []u8,
+}
+
+// x86-64 UNWIND_CODE operations
+const UWOP_PUSH_NONVOL: u8 = 0;
+const UWOP_ALLOC_LARGE: u8 = 1;
+const UWOP_ALLOC_SMALL: u8 = 2;
+const UWOP_SET_FPREG: u8 = 3;
+const UWOP_SAVE_NONVOL: u8 = 4;
+const UWOP_SAVE_NONVOL_FAR: u8 = 5;
+const UWOP_SAVE_XMM128: u8 = 8;
+const UWOP_SAVE_XMM128_FAR: u8 = 9;
+const UWOP_PUSH_MACHFRAME: u8 = 10;
+
+// One x86-64 code: its prologue offset, operation and information, and the
+// slots that follow it (n of them, little-endian in x).
+fn seh_code(A: *mut Asm, op: u8, info: u64, x: u64, n: u32) void {
+    let off = here(A) - A.seh_start;
+    if off > 255 {
+        fail(A, "a prologue of more than 255 bytes (.seh_*)");
+        return;
+    }
+    let mut b = u.Buf.init();
+    b.c(@truncate(u8, off));
+    b.c(op | @truncate(u8, info << 4));
+    for k in @as(u32, 0)..n {
+        b.c(@truncate(u8, x >> (16 * k)));
+        b.c(@truncate(u8, x >> ((16 * k) + 8)));
+    }
+    A.seh_codes.push(b.done());
+}
+
+fn x64_reg_num(A: *mut Asm, s: []u8, xmm: bool) u64 {
+    let mut n = lower(trim(s));
+    if (n.len > 0) and (n[0] == '%') {
+        n = n[1..];
+    }
+    let r = ai.x86_reg(n);
+    if xmm and (r.reg >= 16) and (r.reg < 32) {
+        return @int_cast(u64, r.reg - 16);
+    }
+    if not xmm and (r.reg >= 0) and (r.reg < 16) and (r.bits == 64) {
+        return @int_cast(u64, r.reg);  // (ours are Windows's numbers: rax rcx rdx rbx rsp rbp rsi rdi r8-r15)
+    }
+    fail(A, u.f1("'%s' is not a register of this .seh_ directive", trim(s)));
+    return 0;
+}
+
+// The AArch64 register of an ARM64 .seh_ directive: x19-x30 (fp, lr), d8-d15.
+fn a64_seh_reg(A: *mut Asm, s: []u8, base: i32, fp: bool) u64 {
+    let r = ai.a64_reg(lower(trim(s)));
+    let mut n = r.reg;
+    if fp and (r.cls == ai.CL_VEC) {
+        n = r.reg - 32;
+    } else if fp or (r.cls != ai.CL_GPR) {
+        n = -1;
+    }
+    if n < base {
+        fail(A, u.f1("'%s' is not a register of this .seh_ directive", trim(s)));
+        return 0;
+    }
+    return @int_cast(u64, n - base);
+}
+
+/// A .seh_* directive: false if `op` is not one.
+fn seh_directive(A: *mut Asm, op: []u8, args: []u8) bool {
+    if not u.starts(op, ".seh_") {
+        return false;
+    }
+    if A.inline_ {
+        fail(A, u.f1("%s in inline assembly", op));
+        return true;
+    }
+    if u.str_eq(op, ".seh_proc") {
+        if A.in_seh {
+            fail(A, ".seh_proc inside a procedure (no .seh_endproc)");
+            return true;
+        }
+        A.in_seh = true;
+        A.seh_sec = A.cur;
+        A.seh_start = here(A);
+        A.seh_prolog = -1;
+        A.seh_codes.clear();
+        A.seh_epis.clear();
+        A.seh_frame = 0;
+        return true;
+    }
+    if not A.in_seh {
+        fail(A, u.f1("%s outside a procedure (.seh_proc)", op));
+        return true;
+    }
+    let a64 = A.arch == tg.ARCH_A64;
+    let xs = split_args(args);
+    let n1 = xs.len >= 1;
+    let n2 = xs.len >= 2;
+    if u.str_eq(op, ".seh_endprologue") {
+        A.seh_prolog = @bit_cast(i64, here(A) - A.seh_start);
+        if a64 {
+            A.seh_codes.push("\xe4");  // end
+        }
+        return true;
+    }
+    if u.str_eq(op, ".seh_endproc") or u.str_eq(op, ".seh_endfunclet") {
+        A.in_seh = false;
+        if A.seh_prolog < 0 {
+            fail(A, ".seh_endproc without .seh_endprologue");
+            return true;
+        }
+        if a64 {
+            seh_a64_record(A);
+        } else {
+            seh_x64_record(A);
+        }
+        return true;
+    }
+    if u.str_eq(op, ".seh_handler") or u.str_eq(op, ".seh_handlerdata") {
+        fail(A, u.f1("%s: exception handlers are not supported", op));
+        return true;
+    }
+    if (A.seh_prolog >= 0) and not a64 {
+        fail(A, u.f1("%s after .seh_endprologue", op));
+        return true;
+    }
+    if not a64 {
+        if u.str_eq(op, ".seh_pushreg") and n1 {
+            seh_code(A, UWOP_PUSH_NONVOL, x64_reg_num(A, xs[0], false), 0, 0);
+        } else if u.str_eq(op, ".seh_stackalloc") and n1 {
+            let n = eval_const(A, xs[0], "the size");
+            if (n <= 0) or ((n % 8) != 0) {
+                fail(A, ".seh_stackalloc of a size that is not a positive multiple of 8");
+            } else if n <= 128 {
+                seh_code(A, UWOP_ALLOC_SMALL, @bit_cast(u64, (n / 8) - 1), 0, 0);
+            } else if n <= 524280 {
+                seh_code(A, UWOP_ALLOC_LARGE, 0, @bit_cast(u64, n / 8), 1);
+            } else {
+                seh_code(A, UWOP_ALLOC_LARGE, 1, @bit_cast(u64, n), 2);
+            }
+        } else if u.str_eq(op, ".seh_setframe") and n2 {
+            let r = x64_reg_num(A, xs[0], false);
+            let off = eval_const(A, xs[1], "the offset");
+            if (off < 0) or (off > 240) or ((off % 16) != 0) {
+                fail(A, ".seh_setframe's offset must be a multiple of 16 up to 240");
+                return true;
+            }
+            A.seh_frame = r | (@bit_cast(u64, off / 16) << 4);
+            seh_code(A, UWOP_SET_FPREG, 0, 0, 0);
+        } else if (u.str_eq(op, ".seh_savereg") or u.str_eq(op, ".seh_savexmm")) and n2 {
+            let xmm = u.str_eq(op, ".seh_savexmm");
+            let r = x64_reg_num(A, xs[0], xmm);
+            let off = eval_const(A, xs[1], "the offset");
+            let mut unit: i64 = 8;
+            if xmm {
+                unit = 16;
+            }
+            if (off < 0) or ((off % unit) != 0) {
+                fail(A, u.f1("%s's offset must be a multiple of its register's size", op));
+            } else if (off / unit) < 65536 {
+                seh_code(A, u.pick(xmm, "\x08", "\x04")[0], r, @bit_cast(u64, off / unit), 1);
+            } else {
+                seh_code(A, u.pick(xmm, "\x09", "\x05")[0], r, @bit_cast(u64, off), 2);
+            }
+        } else if u.str_eq(op, ".seh_pushframe") {
+            seh_code(A, UWOP_PUSH_MACHFRAME, u64_pick(n1, 1, 0), 0, 0);
+        } else {
+            fail(A, u.f1("the directive '%s' is not supported", op));
+        }
+        return true;
+    }
+    // ARM64: each directive is one code for one instruction
+    let mut b = u.Buf.init();
+    let off = eval_off(A, xs, 1);
+    if u.str_eq(op, ".seh_startepilogue") {
+        A.seh_epis.push(@bit_cast(i64, here(A) - A.seh_start));
+        A.seh_epis.push(@as(i64, @int_cast(i64, A.seh_codes.len)));
+        return true;
+    }
+    if u.str_eq(op, ".seh_endepilogue") {
+        A.seh_codes.push("\xe4");
+        return true;
+    }
+    if u.str_eq(op, ".seh_stackalloc") and n1 {
+        let n = eval_const(A, xs[0], "the size") / 16;
+        if n < 32 {
+            b.c(@truncate(u8, @bit_cast(u64, n)));
+        } else if n < 2048 {
+            b.c(0xc0 | @truncate(u8, @bit_cast(u64, n) >> 8));
+            b.c(@truncate(u8, @bit_cast(u64, n)));
+        } else {
+            b.c(0xe0);
+            b.c(@truncate(u8, @bit_cast(u64, n) >> 16));
+            b.c(@truncate(u8, @bit_cast(u64, n) >> 8));
+            b.c(@truncate(u8, @bit_cast(u64, n)));
+        }
+    } else if u.str_eq(op, ".seh_save_fplr") and n1 {
+        b.c(0x40 | @truncate(u8, eval_off(A, xs, 0) / 8));
+    } else if u.str_eq(op, ".seh_save_fplr_x") and n1 {
+        b.c(0x80 | @truncate(u8, (eval_off(A, xs, 0) / 8) - 1));
+    } else if u.str_eq(op, ".seh_save_regp") and n2 {
+        let x = a64_seh_reg(A, xs[0], 19, false);
+        b.c(0xc8 | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | (off / 8)));
+    } else if u.str_eq(op, ".seh_save_regp_x") and n2 {
+        let x = a64_seh_reg(A, xs[0], 19, false);
+        b.c(0xcc | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | ((off / 8) - 1)));
+    } else if u.str_eq(op, ".seh_save_reg") and n2 {
+        let x = a64_seh_reg(A, xs[0], 19, false);
+        b.c(0xd0 | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | (off / 8)));
+    } else if u.str_eq(op, ".seh_save_reg_x") and n2 {
+        let x = a64_seh_reg(A, xs[0], 19, false);
+        b.c(0xd4 | @truncate(u8, x >> 3));
+        b.c(@truncate(u8, (x << 5) | ((off / 8) - 1)));
+    } else if u.str_eq(op, ".seh_save_lrpair") and n2 {
+        let x = a64_seh_reg(A, xs[0], 19, false) / 2;
+        b.c(0xd6 | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | (off / 8)));
+    } else if u.str_eq(op, ".seh_save_fregp") and n2 {
+        let x = a64_seh_reg(A, xs[0], 8, true);
+        b.c(0xd8 | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | (off / 8)));
+    } else if u.str_eq(op, ".seh_save_fregp_x") and n2 {
+        let x = a64_seh_reg(A, xs[0], 8, true);
+        b.c(0xda | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | ((off / 8) - 1)));
+    } else if u.str_eq(op, ".seh_save_freg") and n2 {
+        let x = a64_seh_reg(A, xs[0], 8, true);
+        b.c(0xdc | @truncate(u8, x >> 2));
+        b.c(@truncate(u8, (x << 6) | (off / 8)));
+    } else if u.str_eq(op, ".seh_save_freg_x") and n2 {
+        let x = a64_seh_reg(A, xs[0], 8, true);
+        b.c(0xde);
+        b.c(@truncate(u8, (x << 5) | ((off / 8) - 1)));
+    } else if u.str_eq(op, ".seh_set_fp") {
+        b.c(0xe1);
+    } else if u.str_eq(op, ".seh_add_fp") and n1 {
+        b.c(0xe2);
+        b.c(@truncate(u8, eval_off(A, xs, 0) / 8));
+    } else if u.str_eq(op, ".seh_nop") {
+        b.c(0xe3);
+    } else if u.str_eq(op, ".seh_save_next") {
+        b.c(0xe6);
+    } else if u.str_eq(op, ".seh_pac_sign_lr") {
+        b.c(0xfc);
+    } else {
+        fail(A, u.f1("the directive '%s' is not supported (or lacks its operands)", op));
+        return true;
+    }
+    A.seh_codes.push(b.done());
+    return true;
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// Operand k of an ARM64 .seh_ directive: an offset, a multiple of 8 below 512.
+fn eval_off(A: *mut Asm, xs: [][]u8, k: usize) u64 {
+    if k >= xs.len {
+        return 0;
+    }
+    let v = eval_const(A, xs[k], "the offset");
+    if (v < 0) or (v > 4088) or ((v % 8) != 0) {
+        fail(A, u.f1("the offset %s is not a multiple of 8 in range", u.dec(v)));
+        return 0;
+    }
+    return @bit_cast(u64, v);
+}
+
+// The procedure's UNWIND_INFO (x86-64).
+fn seh_x64_record(A: *mut Asm) void {
+    let mut b = u.Buf.init();
+    let mut n: u64 = 0;
+    for c in A.seh_codes.items() {
+        n += @as(u64, c.len) / 2;
+    }
+    if (n > 255) or (A.seh_prolog > 255) {
+        fail(A, "too many unwind codes, or too long a prologue (.seh_*)");
+        return;
+    }
+    b.c(1);  // version 1, no flags
+    b.c(@truncate(u8, @bit_cast(u64, A.seh_prolog)));
+    b.c(@truncate(u8, n));
+    b.c(@truncate(u8, A.seh_frame));
+    let mut k = A.seh_codes.len;
+    while k > 0 {
+        k -= 1;
+        b.s(A.seh_codes.get(k));
+    }
+    if (n & 1) != 0 {
+        b.c(0);
+        b.c(0);
+    }
+    A.sehs.push(SehProc.{ sec: A.seh_sec, start: A.seh_start, end: here(A), xdata: b.done() });
+}
+
+// The procedure's ARM64 unwind record.
+fn seh_a64_record(A: *mut Asm) void {
+    // the codes: the prologue's (before its `end`) reversed, then the epilogues'
+    let codes = A.seh_codes.items();
+    let mut pend: usize = 0;
+    while (pend < codes.len) and not u.str_eq(codes[pend], "\xe4") {
+        pend += 1;
+    }
+    let mut c = u.Buf.init();
+    let mut k = pend;
+    while k > 0 {
+        k -= 1;
+        c.s(codes[k]);
+    }
+    c.c(0xe4);
+    // (each epilogue: where it starts, and the byte index of its first code)
+    let mut epis = u.List.[u64].empty();
+    let mut ci = pend + 1;
+    let mut e: usize = 0;
+    while e < A.seh_epis.len {
+        let eoff = @bit_cast(u64, A.seh_epis.get(e));
+        let first = @as(usize, @int_cast(usize, A.seh_epis.get(e + 1)));
+        while ci < first {
+            c.s(codes[ci]);
+            ci += 1;
+        }
+        epis.push((eoff / 4) | (@as(u64, c.len()) << 22));
+        e += 2;
+    }
+    while ci < codes.len {
+        c.s(codes[ci]);
+        ci += 1;
+    }
+    while (c.len() % 4) != 0 {
+        c.c(0xe3);  // (nop to a word)
+    }
+    let words = @as(u64, c.len()) / 4;
+    let len = (here(A) - A.seh_start) / 4;
+    let mut b = u.Buf.init();
+    let mut hdr = len & 0x3ffff;
+    let mut ext = false;
+    if (epis.len < 32) and (words < 32) {
+        hdr = hdr | ((@as(u64, epis.len) << 22) | (words << 27));
+    } else {
+        ext = true;
+    }
+    for i in @as(u32, 0)..4 {
+        b.c(@truncate(u8, hdr >> (8 * i)));
+    }
+    if ext {
+        let w2 = @as(u64, epis.len) | (words << 16);
+        for i in @as(u32, 0)..4 {
+            b.c(@truncate(u8, w2 >> (8 * i)));
+        }
+    }
+    for w in epis.items() {
+        for i in @as(u32, 0)..4 {
+            b.c(@truncate(u8, w >> (8 * i)));
+        }
+    }
+    b.s(c.done());
+    A.sehs.push(SehProc.{ sec: A.seh_sec, start: A.seh_start, end: here(A), xdata: b.done() });
+}
+
+// .file N "name" (the file table of .loc; .file "name" alone names the
+// source, which changes nothing) and .loc N line [column ...]: the source
+// place of the statements after it (the backends' line information).
+fn loc_directive(A: *mut Asm, op: []u8, args: []u8) void {
+    let xs = split_args(args);
+    if u.str_eq(op, ".file") {
+        let ws = macro_words_of(args);
+        if (ws.len >= 2) and all_digits(ws[0]) {
+            let n = @int_cast(usize, u.atol(ws[0]));
+            let mut name = string(A, ws[ws.len - 1]);
+            if ws.len >= 3 {
+                // (.file N "dir" "name")
+                name = u.cat3(string(A, ws[1]), "/", name);
+            }
+            while A.files.len <= n {
+                A.files.push("");
+            }
+            A.files.set(n, name);
+        }
+        return;
+    }
+    let ws = macro_words_of(args);
+    if (ws.len < 2) or not all_digits(ws[0]) or not all_digits(ws[1]) {
+        _ = xs;
+        fail(A, u.f1("'.loc %s' is not a source place (.loc file line)", args));
+        return;
+    }
+    let n = @int_cast(usize, u.atol(ws[0]));
+    if (n >= A.files.len) or (A.files.get(n).len == 0) {
+        fail(A, u.f1(".loc of file %s, which no .file names", ws[0]));
+        return;
+    }
+    A.loc_file = A.files.get(n);
+    A.loc_line = @truncate(i32, u.atol(ws[1]));
+}
+
+// The words of s split at spaces (a string is one word).
+fn macro_words_of(s: []u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    let mut i: usize = 0;
+    while i < s.len {
+        while (i < s.len) and (is_space(s[i]) or (s[i] == ',')) {
+            i += 1;
+        }
+        if i >= s.len {
+            break;
+        }
+        let st = i;
+        if s[i] == '"' {
+            i += 1;
+            while (i < s.len) and (s[i] != '"') {
+                if s[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else {
+            while (i < s.len) and not is_space(s[i]) and (s[i] != ',') {
+                i += 1;
+            }
+        }
+        out.push(s[st..@min(i, s.len)]);
+    }
+    return out.items();
 }

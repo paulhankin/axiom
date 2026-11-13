@@ -166,7 +166,26 @@ fn reg_name_at(s: []u8, i: usize, end: *mut usize) []u8 {
     return cr.lower(s[i..j]);
 }
 
+// A memory operand's segment override that names its default segment (ds,
+// or ss with rsp or rbp the base) is no prefix, as the conventional assembler
+// has it.
+fn drop_default_seg(op: XOp) XOp {
+    let mut o = op;
+    if o.kind != XK_MEM {
+        return o;
+    }
+    let ssb = (o.base == 4) or (o.base == 5);
+    if ((o.seg == 0x3e) and not ssb) or ((o.seg == 0x36) and ssb) {
+        o.seg = 0;
+    }
+    return o;
+}
+
 fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
+    return drop_default_seg(parse_op1(A, s0));
+}
+
+fn parse_op1(A: *mut cr.Asm, s0: []u8) XOp {
     let mut op = none_op();
     let mut s = cr.trim(s0);
     if s.len == 0 {
@@ -340,6 +359,518 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
     op.v = cr.eval(A, s);
     op.bare = op.seg == 0;
     return op;
+}
+
+// -----------------------------------------------------------------------------
+// The Intel syntax (`.intel_syntax noprefix`, and inline assembly under
+// --c-asm-dialect=intel): the destination first, registers without '%' (a
+// '%' is allowed), immediates without '$', memory as
+// `SIZE PTR seg:disp[base + index*scale + disp]`, `OFFSET [FLAT:]sym` for a
+// symbol's address, no size suffixes on mnemonics (a memory operand's size
+// keyword gives the size), `movsx`/`movzx`/`movsxd`, AVX-512 decorations
+// `{k1}{z}`, `{1to16}`, `{rn-sae}`. Operands are read into the same XOp the
+// AT&T syntax gives (insn reverses their order and names the instruction
+// as the AT&T syntax does), so one encoder serves both.
+// -----------------------------------------------------------------------------
+// The bits of a memory size keyword (BYTE ... ZMMWORD), or 0.
+fn size_keyword(w: []u8) u32 {
+    let names = ["byte", "word", "dword", "qword", "mmword", "tbyte", "tword", "oword", "xmmword", "ymmword", "zmmword",
+                 "fword"];
+    let bits: [12]u32 = [8, 16, 32, 64, 64, 80, 80, 128, 128, 256, 512, 48];
+    for k in 0..names.len {
+        if u.str_eq(w, names[k]) {
+            return bits[k];
+        }
+    }
+    return 0;
+}
+
+// The first word of s (letters, digits, '_') lower case, and where it ends.
+fn first_word(s: []u8, end: *mut usize) []u8 {
+    let mut k: usize = 0;
+    while (k < s.len) and (u.is_alnum(s[k]) or (s[k] == '_')) {
+        k += 1;
+    }
+    end.* = k;
+    return cr.lower(s[0..k]);
+}
+
+// A register named by s (with or without '%'), into op: false if s is not one.
+fn intel_reg(A: *mut cr.Asm, s0: []u8, op: *mut XOp) bool {
+    let mut s = cr.trim(s0);
+    if (s.len > 0) and (s[0] == '%') {
+        s = cr.trim(s[1..]);
+    }
+    let n = cr.lower(s);
+    // st(i), st (i)
+    if u.starts(n, "st") and (n.len > 2) {
+        let r = cr.trim(n[2..]);
+        if (r.len == 3) and (r[0] == '(') and (r[2] == ')') and (r[1] >= '0') and (r[1] <= '7') {
+            op.kind = XK_REG;
+            op.reg = R_ST + @as(i32, r[1] - '0');
+            op.bits = 80;
+            return true;
+        }
+    }
+    if n.len == 0 {
+        return false;
+    }
+    for c in n {
+        if not cr.is_sym_char(c) {
+            return false;
+        }
+    }
+    return reg_of(A, n, op);
+}
+
+// The register of an address term (a general register, rip, or a vector
+// index: `vec`), and its width in bits; -2 if the term is not a register.
+fn intel_addr_reg(s0: []u8, bits: *mut u32, vec: *mut bool) i32 {
+    let mut s = cr.trim(s0);
+    if (s.len > 0) and (s[0] == '%') {
+        s = cr.trim(s[1..]);
+    }
+    let n = cr.lower(s);
+    vec.* = false;
+    if u.str_eq(n, "rip") or u.str_eq(n, "eip") {
+        bits.* = 64;
+        return RIP;
+    }
+    let r = ai.x86_reg(n);
+    if (r.reg >= 0) and (r.reg < 16) {
+        bits.* = r.bits;
+        if r.hi8 {
+            bits.* = 0;
+        }
+        return r.reg;
+    }
+    let mut vb: u32 = 0;
+    let vx = xreg(n, &mut vb);
+    if (vx >= R_VEC) and (vx < R_K) {
+        bits.* = vb;
+        vec.* = true;
+        return vx;
+    }
+    if (r.reg >= 16) and (r.reg < 32) {
+        bits.* = 128;
+        vec.* = true;
+        return r.reg;
+    }
+    if vx >= 0 {
+        bits.* = 0;
+        return vx;
+    }
+    return -2;
+}
+
+// The terms of s split at its top-level '+' and '-' (each with its sign).
+fn intel_terms(s: []u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    let mut depth: i32 = 0;
+    let mut st: usize = 0;
+    let mut k: usize = 0;
+    while k < s.len {
+        let c = s[k];
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        } else if ((c == '+') or (c == '-')) and (depth == 0) and (k > st) {
+            // (a sign after an operator, `4*-2`, belongs to its term)
+            let prev = cr.trim(s[st..k]);
+            if (prev.len > 0) and (u.find("*/%<>&|^~!+-", prev[prev.len - 1]) < 0) {
+                out.push(prev);
+                st = k;
+            }
+        }
+        k += 1;
+    }
+    let last = cr.trim(s[st..]);
+    if last.len > 0 {
+        out.push(last);
+    }
+    return out.items();
+}
+
+// One operand in the Intel syntax; `is_br`: a jump's or call's (an
+// expression alone is its target); msize: the size keyword's bits (0: none).
+fn parse_intel_op(A: *mut cr.Asm, s0: []u8, is_br: bool, msize: *mut u32) XOp {
+    let mut op = none_op();
+    msize.* = 0;
+    let mut s = cr.trim(s0);
+    if s.len == 0 {
+        cr.fail(A, "an operand is missing");
+        return op;
+    }
+    // AVX-512 decorations: {k1} {z} {1toN}; a rounding operand {rn-sae}
+    while (s.len > 0) and (s[s.len - 1] == '}') {
+        let ob = u.rfind(s, '{');
+        if ob < 0 {
+            break;
+        }
+        let mut d = cr.lower(cr.trim(s[@int_cast(usize, ob) + 1..s.len - 1]));
+        s = cr.trim(s[0..@int_cast(usize, ob)]);
+        if (d.len > 0) and (d[0] == '%') {
+            d = d[1..];
+        }
+        if s.len == 0 {
+            let rcs = ["rn-sae", "rd-sae", "ru-sae", "rz-sae", "sae"];
+            for k in 0..rcs.len {
+                if u.str_eq(d, rcs[k]) {
+                    op.kind = XK_RC;
+                    op.v = cr.konst(@int_cast(i64, k));
+                    return op;
+                }
+            }
+            cr.fail(A, u.f1("'{%s}' is not an operand", d));
+            return op;
+        }
+        if u.str_eq(d, "z") {
+            op.zero = true;
+        } else if (d.len == 2) and (d[0] == 'k') and (d[1] >= '0') and (d[1] <= '7') {
+            op.mask = @as(i32, d[1] - '0');
+            if op.mask == 0 {
+                cr.fail(A, "{k0} is not a mask (k0 means no masking)");
+                return op;
+            }
+        } else if u.starts(d, "1to") and (ai.num(d[3..]) > 0) {
+            op.bcst = @truncate(u32, @bit_cast(u64, ai.num(d[3..])));
+        } else {
+            cr.fail(A, u.f1("'{%s}' is not a decoration of an operand", d));
+            return op;
+        }
+    }
+    // SIZE PTR
+    let mut e: usize = 0;
+    let w = first_word(s, &mut e);
+    let sz = size_keyword(w);
+    if (sz != 0) and ((e == s.len) or not cr.is_sym_char(s[e])) {
+        msize.* = sz;
+        s = cr.trim(s[e..]);
+        let w2 = first_word(s, &mut e);
+        if (u.str_eq(w2, "ptr") or u.str_eq(w2, "bcst")) and ((e == s.len) or not cr.is_sym_char(s[e])) {
+            s = cr.trim(s[e..]);
+            if u.str_eq(w2, "bcst") and (op.bcst == 0) {
+                op.bcst = 1;  // (`DWORD BCST [m]`: a broadcast of the instruction's count, found by intel_insn)
+            }
+        }
+        if s.len == 0 {
+            cr.fail(A, "a size without an operand");
+            return op;
+        }
+    }
+    // OFFSET [FLAT:]expr: the address as an immediate
+    let w3 = first_word(s, &mut e);
+    if u.str_eq(w3, "offset") and (e < s.len) and not cr.is_sym_char(s[e]) {
+        let mut x = cr.trim(s[e..]);
+        let mut e2: usize = 0;
+        let fl = first_word(x, &mut e2);
+        if u.str_eq(fl, "flat") and (e2 < x.len) and (x[e2] == ':') {
+            x = cr.trim(x[e2 + 1..]);
+        }
+        op.kind = XK_IMM;
+        op.v = cr.eval(A, x);
+        return op;
+    }
+    // a register
+    if (msize.* == 0) and intel_reg(A, s, &mut op) {
+        return op;
+    }
+    // a segment override: fs:...
+    let colon = u.find(s, ':');
+    if colon > 0 {
+        let mut sn = cr.trim(s[0..@int_cast(usize, colon)]);
+        if (sn.len > 0) and (sn[0] == '%') {
+            sn = sn[1..];
+        }
+        let pf = seg_prefix(cr.lower(sn));
+        if pf != 0 {
+            op.seg = pf;
+            s = cr.trim(s[@int_cast(usize, colon) + 1..]);
+        }
+    }
+    if s.len == 0 {
+        cr.fail(A, "an operand is missing");
+        return op;
+    }
+    let ob = u.find(s, '[');
+    if ob < 0 {
+        let v = cr.settle(A, cr.eval(A, s));
+        if (op.seg == 0) and (msize.* == 0) and not is_br and v.ok and ((v.sym < 0) or (v.neg >= 0)) and
+           (v.rm == cr.RM_NONE) and not cr.set_later(A, s) {
+            op.kind = XK_IMM;
+            op.v = v;
+            return op;
+        }
+        // an address alone: a jump's target, or memory at an absolute address
+        op.kind = XK_MEM;
+        op.v = v;
+        op.bare = (op.seg == 0) and is_br;
+        return op;
+    }
+    // memory: the text outside the brackets is a displacement, the terms
+    // inside registers (base, then index), register*scale, or displacement
+    op.kind = XK_MEM;
+    let mut disp = u.Buf.init();
+    let mut abits: u32 = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        let b0 = i;
+        while (i < s.len) and (s[i] != '[') {
+            i += 1;
+        }
+        let outside = cr.trim(s[b0..i]);
+        if outside.len > 0 {
+            if disp.len() > 0 {
+                disp.c('+');
+            }
+            disp.c('(');
+            disp.s(outside);
+            disp.c(')');
+        }
+        if i >= s.len {
+            break;
+        }
+        let st = i + 1;
+        while (i < s.len) and (s[i] != ']') {
+            i += 1;
+        }
+        if i >= s.len {
+            cr.fail(A, u.f1("a '[' without its ']' in '%s'", s));
+            return op;
+        }
+        let inner = s[st..i];
+        i += 1;
+        for t0 in intel_terms(inner) {
+            let mut t = t0;
+            let mut neg = false;
+            if t[0] == '+' {
+                t = cr.trim(t[1..]);
+            } else if t[0] == '-' {
+                neg = true;
+                t = cr.trim(t[1..]);
+            }
+            let mut reg: i32 = -2;
+            let mut rb: u32 = 0;
+            let mut vec = false;
+            let mut scale: i64 = 1;
+            let star = u.find(t, '*');
+            if star > 0 {
+                let a = t[0..@int_cast(usize, star)];
+                let b = t[@int_cast(usize, star) + 1..];
+                reg = intel_addr_reg(a, &mut rb, &mut vec);
+                let mut sc = b;
+                if reg == -2 {
+                    reg = intel_addr_reg(b, &mut rb, &mut vec);
+                    sc = a;
+                }
+                if reg != -2 {
+                    scale = cr.eval_const(A, sc, "the scale");
+                }
+            } else {
+                reg = intel_addr_reg(t, &mut rb, &mut vec);
+            }
+            if reg == -2 {
+                if disp.len() > 0 {
+                    disp.c('+');
+                }
+                disp.s(u.pick(neg, "-(", "("));
+                disp.s(t);
+                disp.c(')');
+                continue;
+            }
+            if neg {
+                cr.fail(A, u.f1("a register cannot be subtracted in '%s'", s));
+                return op;
+            }
+            if (scale != 1) and (scale != 2) and (scale != 4) and (scale != 8) {
+                cr.fail(A, u.f1("the scale %s is not 1, 2, 4 or 8", u.dec(scale)));
+                return op;
+            }
+            if vec {
+                if op.index >= 0 {
+                    cr.fail(A, u.f1("'%s' has two index registers", s));
+                    return op;
+                }
+                op.index = reg;
+                op.vix = true;
+                op.bits = rb;
+                op.scale = @truncate(u8, @bit_cast(u64, scale));
+                continue;
+            }
+            if reg == RIP {
+                if (op.base >= 0) or (op.index >= 0) or (scale != 1) {
+                    cr.fail(A, u.f1("rip with other registers in '%s'", s));
+                    return op;
+                }
+                op.base = RIP;
+                continue;
+            }
+            if (rb != 64) and (rb != 32) {
+                cr.fail(A, u.f1("'%s' is not an address register", t));
+                return op;
+            }
+            if (abits != 0) and (abits != rb) {
+                cr.fail(A, "address registers of different sizes");
+                return op;
+            }
+            abits = rb;
+            if op.base == RIP {
+                cr.fail(A, u.f1("rip with other registers in '%s'", s));
+                return op;
+            }
+            if (op.base < 0) and (star < 0) {
+                op.base = reg;
+            } else if op.index < 0 {
+                if reg == 4 {
+                    if (scale == 1) and (op.base >= 0) and (op.base != 4) {
+                        // ([rax + rsp]: rsp is the base)
+                        op.index = op.base;
+                        op.base = 4;
+                        continue;
+                    }
+                    cr.fail(A, "rsp cannot be an index register");
+                    return op;
+                }
+                op.index = reg;
+                op.scale = @truncate(u8, @bit_cast(u64, scale));
+            } else {
+                cr.fail(A, u.f1("'%s' has too many registers", s));
+                return op;
+            }
+        }
+    }
+    let ds = disp.done();
+    if ds.len > 0 {
+        op.v = cr.eval(A, ds);
+    }
+    op.a32 = abits == 32;
+    return op;
+}
+
+// Is m (Intel) a jump or call, whose operand is a target?
+fn intel_branch(m: []u8) bool {
+    if (m.len > 1) and (m[0] == 'j') {
+        return true;
+    }
+    let names = ["call", "loop", "loope", "loopz", "loopne", "loopnz", "xbegin"];
+    for n in names {
+        if u.str_eq(m, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn suffix_bits_name(bits: u32) []u8 {
+    if bits == 8 {
+        return "b";
+    }
+    if bits == 16 {
+        return "w";
+    }
+    if bits == 32 {
+        return "l";
+    }
+    if bits == 64 {
+        return "q";
+    }
+    return "";
+}
+
+// The AT&T mnemonics to try for Intel mnemonic m with operands ops (in
+// AT&T order; msize: the memory operand's size keyword, bits; bc: its
+// broadcast count), in order: with the size suffix the AT&T syntax writes
+// where registers do not give the size (b w l q for integers; s l t and
+// s l ll for the x87's float and integer operands; x y z for the vector
+// conversions whose memory operand's width the suffix says), then m itself.
+fn intel_names(m: []u8, ops: []XOp, msize: u32, bc: u32) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    // movzx, movsx, movsxd: movzbl ...
+    if (u.str_eq(m, "movzx") or u.str_eq(m, "movsx")) and (ops.len == 2) {
+        let mut from = ops[0].bits;
+        if ops[0].kind == XK_MEM {
+            from = msize;
+        }
+        let a = suffix_bits_name(from);
+        let b = suffix_bits_name(ops[1].bits);
+        if (a.len > 0) and (b.len > 0) and (ops[0].kind != XK_IMM) {
+            out.push(u.cat3(m[0..4], a, b));
+            return out.items();
+        }
+    }
+    if u.str_eq(m, "movsxd") {
+        out.push("movslq");
+        return out.items();
+    }
+    // the string instructions' doubleword forms without operands (movsd ...)
+    if ops.len == 0 {
+        let sd = ["movsd", "cmpsd", "lodsd", "stosd", "scasd", "insd", "outsd"];
+        for n in sd {
+            if u.str_eq(m, n) {
+                out.push(u.cat2(m[0..m.len - 1], "l"));
+                return out.items();
+            }
+        }
+    }
+    if u.str_eq(m, "retf") {
+        out.push("lret");
+        return out.items();
+    }
+    // the string instructions with their (implicit) operands written:
+    // `movs BYTE PTR [rdi], BYTE PTR [rsi]`, `xlat BYTE PTR [rbx]` ...
+    let strs = ["movs", "cmps", "stos", "lods", "scas", "ins", "outs"];
+    for n in strs {
+        if u.str_eq(m, n) and (ops.len > 0) and (suffix_bits_name(msize).len > 0) {
+            out.push(u.cat2(m, suffix_bits_name(msize)));
+            return out.items();
+        }
+    }
+    if u.str_eq(m, "xlat") and (ops.len == 1) {
+        out.push("xlatb");
+        return out.items();
+    }
+    let mut has_mem = false;
+    for o in ops {
+        if o.kind == XK_MEM {
+            has_mem = true;
+        }
+    }
+    if has_mem and (msize != 0) and not intel_branch(m) {
+        if m[0] == 'f' {
+            let int = u.starts(m, "fi");
+            if int and (msize == 16) {
+                out.push(u.cat2(m, "s"));
+            } else if int and (msize == 32) {
+                out.push(u.cat2(m, "l"));
+            } else if int and (msize == 64) {
+                out.push(u.cat2(m, "ll"));
+            } else if not int and (msize == 32) {
+                out.push(u.cat2(m, "s"));
+            } else if not int and (msize == 64) {
+                out.push(u.cat2(m, "l"));
+            } else if not int and (msize == 80) {
+                out.push(u.cat2(m, "t"));
+            }
+        } else {
+            let mut total = msize;
+            if bc > 0 {
+                total = msize * bc;
+            }
+            let s = suffix_bits_name(total);
+            if s.len > 0 {
+                out.push(u.cat2(m, s));
+            } else if total == 128 {
+                out.push(u.cat2(m, "x"));
+            } else if total == 256 {
+                out.push(u.cat2(m, "y"));
+            } else if total == 512 {
+                out.push(u.cat2(m, "z"));
+            }
+        }
+    }
+    out.push(m);
+    return out.items();
 }
 
 // -----------------------------------------------------------------------------
@@ -807,12 +1338,28 @@ fn bad_form(A: *mut cr.Asm, m: []u8) void {
 
 /// The arch description core.run takes.
 pub fn arch() cr.Arch {
-    return cr.Arch.{ insn: insn, directive: no_directive, nop: 0x90, align_pow2: false, word: 2 };
+    return cr.Arch.{ insn: insn, directive: x64_directive, nop: 0x90, align_pow2: false, word: 2 };
 }
 
-fn no_directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
-    _ = A;
-    _ = st;
+// The directives of x86-64: the syntax (.intel_syntax [noprefix|prefix],
+// .att_syntax [prefix]; in the Intel syntax a '%' before a register is
+// allowed either way).
+fn x64_directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
+    let op = st.op;
+    if u.str_eq(op, ".intel_syntax") or u.str_eq(op, ".att_syntax") {
+        let a = cr.lower(cr.trim(st.args));
+        let intel = u.str_eq(op, ".intel_syntax");
+        if (a.len > 0) and not u.str_eq(a, "noprefix") and not u.str_eq(a, "prefix") {
+            cr.fail(A, u.f2("'%s %s' is not a syntax", op, st.args));
+            return true;
+        }
+        if not intel and u.str_eq(a, "noprefix") {
+            cr.fail(A, "'.att_syntax noprefix' is not supported");
+            return true;
+        }
+        A.intel = intel;
+        return true;
+    }
     return false;
 }
 
@@ -873,11 +1420,201 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
             return;
         }
     }
+    if A.intel {
+        intel_insn(A, st, m, rest, evex, vex3, vexp);
+        return;
+    }
     let saved = st.args;
     st.args = rest;
     let ops = args_of(A, st);
     st.args = saved;
     if cr.failed(A) {
+        return;
+    }
+    encode(A, st, m, ops, evex, vex3, vexp);
+}
+
+// An instruction in the Intel syntax: its operands read and put in the AT&T
+// order (but `enter`'s two immediates, which are in the same order in
+// both), and the AT&T mnemonics for it tried in turn (intel_names: the
+// first that encodes is the instruction; the last one's error otherwise).
+fn intel_insn(A: *mut cr.Asm, st: *mut cr.Stmt, m0: []u8, rest: []u8, evex: bool, vex3: bool, vexp: bool) void {
+    // (a rounding decoration written on the last register, `zmm1{rn-sae}`,
+    // is an operand of its own)
+    let mut xl = u.List.[[]u8].empty();
+    for x0 in cr.split_args(rest) {
+        let x = cr.trim(x0);
+        let ob = u.rfind(x, '{');
+        if (ob > 0) and (x[x.len - 1] == '}') and u.ends(cr.lower(x), "sae}") {
+            xl.push(cr.trim(x[0..@int_cast(usize, ob)]));
+            xl.push(x[@int_cast(usize, ob)..]);
+        } else {
+            xl.push(x);
+        }
+    }
+    let xs = xl.items();
+    let ops = u.newn.[XOp](xs.len + 1);
+    let br = intel_branch(m0);
+    let mut msize: u32 = 0;
+    let mut bc: u32 = 0;
+    let rev = not u.str_eq(m0, "enter");
+    for k in 0..xs.len {
+        let mut ms: u32 = 0;
+        let o = drop_default_seg(parse_intel_op(A, xs[k], br, &mut ms));
+        if cr.failed(A) {
+            return;
+        }
+        if ms != 0 {
+            msize = ms;
+            bc = o.bcst;
+        }
+        let mut x = o;
+        if br and ((x.kind == XK_REG) or ((x.kind == XK_MEM) and not x.bare)) {
+            x.star = true;  // (an indirect jump or call)
+        }
+        if rev {
+            ops[xs.len - 1 - k] = x;
+        } else {
+            ops[k] = x;
+        }
+    }
+    let mut ops2 = ops[0..xs.len];
+    let m = intel_x87_swap(m0, ops2);
+    if (u.str_eq(m, "ins") or u.str_eq(m, "outs") or u.str_eq(m, "xlat")) and (ops2.len > 0) {
+        // (their operands are implicit: es:[rdi], [rsi], [rbx], dx)
+        for o in ops2 {
+            if (o.kind == XK_MEM) and (o.seg != 0) and not ((o.seg == 0x26) and (o.base == 7)) {
+                cr.fail(A, u.f1("a segment override on '%s' is not supported", m));
+                return;
+            }
+        }
+        let names = intel_names(m, ops2, msize, bc);
+        encode(A, st, names[0], ops2[0..0], evex, vex3, vexp);
+        return;
+    }
+    // `BCST`: the broadcast counts in turn, the first that encodes
+    let mut bi: i32 = -1;
+    for k in 0..ops2.len {
+        if ops2[k].bcst == 1 {
+            bi = @int_cast(i32, k);
+        }
+    }
+    let counts: [5]u32 = [2, 4, 8, 16, 32];
+    let sec = A.secs.at(@int_cast(usize, A.cur));
+    let n0 = sec.data.len;
+    let r0 = A.relocs.len;
+    let np = g_npfx;
+    let mut nc: usize = 1;
+    if bi >= 0 {
+        nc = 5;
+    }
+    for c in 0..nc {
+        if bi >= 0 {
+            ops2[@int_cast(usize, bi)].bcst = counts[c];
+            bc = counts[c];
+        }
+        let names = intel_names(m, ops2, msize, bc);
+        for k in 0..names.len {
+            encode(A, st, names[k], ops2, evex, vex3, vexp);
+            if not cr.failed(A) or (((k + 1) == names.len) and ((c + 1) == nc)) {
+                return;
+            }
+            // (not this one: as before it)
+            A.err = "";
+            A.err_line = -1;
+            A.secs.at(@int_cast(usize, A.cur)).data.len = n0;
+            A.relocs.len = r0;
+            g_npfx = np;
+        }
+    }
+}
+
+// The x87's arithmetic with st(i) the destination: the AT&T mnemonics of
+// these, as the conventional assembler has them, name fsub and fsubr (fdiv
+// and fdivr) the other way round (Intel `fsub st(1), st` is AT&T
+// `fsubr %st, %st(1)`), and so do their popping forms.
+fn intel_x87_swap(m: []u8, ops: []XOp) []u8 {
+    let names = ["fsub", "fsubr", "fdiv", "fdivr", "fsubp", "fsubrp", "fdivp", "fdivrp"];
+    let swap = ["fsubr", "fsub", "fdivr", "fdiv", "fsubrp", "fsubp", "fdivrp", "fdivp"];
+    for k in 0..names.len {
+        if not u.str_eq(m, names[k]) {
+            continue;
+        }
+        // (in the AT&T order the destination is last)
+        let dst_sti = (ops.len == 2) and (ops[1].kind == XK_REG) and (ops[1].reg > R_ST) and (ops[1].reg < R_SEG);
+        let popping = (m[m.len - 1] == 'p') and (ops.len <= 1);
+        // (every popping form: its destination is st(i), st(0) too)
+        if dst_sti or popping or (m[m.len - 1] == 'p') {
+            return swap[k];
+        }
+    }
+    return m;
+}
+
+// The comparison predicates of vcmpps ... (Intel SDM vol. 2, CMPPS's
+// table: imm8 0-31) and of vpcmp[u]b/w/d/q (0-7), as the mnemonics'
+// pseudo-ops name them (vcmpltps is vcmpps with the predicate 1).
+let VCMP_PRED: [40][]u8 = ["eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord", "eq_uq", "nge", "ngt", "false",
+                           "neq_oq", "ge", "gt", "true", "eq_os", "lt_oq", "le_oq", "unord_s", "neq_us", "nlt_uq",
+                           "nle_uq", "ord_s", "eq_us", "nge_uq", "ngt_uq", "false_os", "neq_os", "ge_oq", "gt_oq",
+                           "true_us", "eq_oq", "lt_os", "le_os", "unord_q", "neq_uq", "nlt_us", "nle_us", "ord_q"];
+let VCMP_VAL: [40]i64 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+                         26, 27, 28, 29, 30, 31, 0, 1, 2, 3, 4, 5, 6, 7];
+let VPCMP_PRED: [6][]u8 = ["eq", "lt", "le", "neq", "nlt", "nle"];
+let VPCMP_VAL: [6]i64 = [0, 1, 2, 4, 5, 6];
+
+// A comparison pseudo-op (vcmpltps, vpcmpnleud ...): its instruction's
+// mnemonic in `base` and the predicate, or -1.
+fn cmp_pseudo(m: []u8, base: *mut []u8) i64 {
+    if u.starts(m, "vcmp") and (m.len > 6) {
+        let ty = m[m.len - 2..];
+        if u.str_eq(ty, "ps") or u.str_eq(ty, "pd") or u.str_eq(ty, "ss") or u.str_eq(ty, "sd") {
+            let p = m[4..m.len - 2];
+            for k in 0..VCMP_PRED.len {
+                if u.str_eq(p, VCMP_PRED[k]) {
+                    base.* = u.cat2("vcmp", ty);
+                    return VCMP_VAL[k];
+                }
+            }
+        }
+    }
+    if u.starts(m, "vpcmp") and (m.len > 6) {
+        // vpcmp<pred>[u]{b,w,d,q}; the signed eq (vpcmpeqd ...) is an instruction of its own
+        let mut ty = m[m.len - 1..];
+        if u.find("bwdq", ty[0]) < 0 {
+            return -1;
+        }
+        let mut p = m[5..m.len - 1];
+        if (p.len > 0) and (p[p.len - 1] == 'u') {
+            ty = m[m.len - 2..];
+            p = p[0..p.len - 1];
+        } else if u.str_eq(p, "eq") {
+            return -1;
+        }
+        for k in 0..VPCMP_PRED.len {
+            if u.str_eq(p, VPCMP_PRED[k]) {
+                base.* = u.cat2("vpcmp", ty);
+                return VPCMP_VAL[k];
+            }
+        }
+    }
+    return -1;
+}
+
+// Encodes instruction m (an AT&T mnemonic) with operands ops (AT&T order).
+fn encode(A: *mut cr.Asm, st: *mut cr.Stmt, m: []u8, ops: []XOp, evex: bool, vex3: bool, vexp: bool) void {
+    let mut base = "";
+    let pred = cmp_pseudo(m, &mut base);
+    if pred >= 0 {
+        // (the predicate: the imm8 operand, first in the AT&T order)
+        let xs = u.newn.[XOp](ops.len + 2);
+        xs[0] = none_op();
+        xs[0].kind = XK_IMM;
+        xs[0].v = cr.konst(pred);
+        for k in 0..ops.len {
+            xs[k + 1] = ops[k];
+        }
+        encode(A, st, base, xs[0..ops.len + 1], evex, vex3, vexp);
         return;
     }
     g_hi8 = false;
@@ -1271,7 +2008,8 @@ fn mov(A: *mut cr.Asm, m: []u8, sfx: u32, ops: []XOp) void {
             }
             if sz == 8 {
                 if dst.hi8 {
-                    op1(&mut e, 0xb0 + 4 + @truncate(u8, @bit_cast(u32, dst.reg)));
+                    // (ah ch dh bh: their number is already 4-7)
+                    op1(&mut e, 0xb0 + @truncate(u8, @bit_cast(u32, dst.reg)));
                 } else {
                     op1(&mut e, 0xb0);
                     e.plus = dst.reg;
@@ -2081,6 +2819,16 @@ fn strings(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
         for o in ops {
             if (o.kind == XK_IMM) or is_xmm(&o) {
                 return false;
+            }
+        }
+        // a segment override of the source ([rsi]; es:[rdi], the destination's, is no override)
+        for o in ops {
+            if (o.kind == XK_MEM) and (o.seg != 0) and not ((o.seg == 0x26) and (o.base == 7)) {
+                if o.base == 7 {
+                    cr.fail(A, u.f1("'%s': the destination's segment cannot be overridden", m));
+                    return true;
+                }
+                cr.emit8(A, @as(u64, o.seg));
             }
         }
         let mut e = new_enc();
@@ -3068,6 +3816,57 @@ fn mem_text(o: *ai.ROp, extra: i64) []u8 {
     return b.done();
 }
 
+// A memory operand in the Intel syntax: `SIZE PTR seg:[base + index*scale + disp]`
+// (no size keyword for `%a` and for an object of another size), or
+// `sym[rip]` for a symbol.
+fn intel_mem_text(o: *ai.ROp, extra: i64, sized: bool) []u8 {
+    let mut b = u.Buf.init();
+    if sized {
+        let kws = ["BYTE", "WORD", "DWORD", "QWORD", "TBYTE", "XMMWORD"];
+        let bits: [6]u32 = [8, 16, 32, 64, 80, 128];
+        for k in 0..kws.len {
+            if o.mbits == bits[k] {
+                b.s(kws[k]);
+                b.s(" PTR ");
+            }
+        }
+    }
+    if o.seg == 0x64 {
+        b.s("fs:");
+    } else if o.seg == 0x65 {
+        b.s("gs:");
+    }
+    let d = o.disp + extra;
+    if o.base < 0 {
+        // rip-relative to a symbol
+        b.s(o.name);
+        if d > 0 {
+            b.c('+');
+        }
+        if d != 0 {
+            b.s(u.dec(d));
+        }
+        b.s("[rip]");
+        return b.done();
+    }
+    b.c('[');
+    b.s(ai.x86_reg_text(o.base, 64, false));
+    if o.index >= 0 {
+        b.c('+');
+        b.s(ai.x86_reg_text(o.index, 64, false));
+        b.c('*');
+        b.s(u.udec(@as(u64, o.scale)));
+    }
+    if d > 0 {
+        b.c('+');
+    }
+    if d != 0 {
+        b.s(u.dec(d));
+    }
+    b.c(']');
+    return b.done();
+}
+
 fn imm_text(o: *ai.ROp) []u8 {
     if o.sym {
         if o.k == 0 {
@@ -3085,8 +3884,13 @@ fn imm_text(o: *ai.ROp) []u8 {
 /// b w k q h for a register's widths, x for its xmm register, c and P for a
 /// constant without '$', n for its negation, a for an address, A for an
 /// indirect operand, H for memory 8 bytes on, V for a register without '%',
-/// z for the size suffix); `err` says why not.
-pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
+/// z for the size suffix); `err` says why not. With `intel`, in the Intel
+/// syntax (the dialect's rendering there: no '%' or '$', memory with its
+/// size keyword, `OFFSET FLAT:sym` for an address constant, `%z` nothing).
+pub fn render(o: *ai.ROp, mod: u8, intel: bool, err: *mut []u8) []u8 {
+    if intel {
+        return render_intel(o, mod, err);
+    }
     if mod == 'z' {
         return suffix_of(o.bits);
     }
@@ -3151,6 +3955,9 @@ pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
         return "";
     }
     // a constant
+    if (mod == 'a') and o.sym {
+        return u.cat2(imm_text(o), "(%rip)");  // (an address operand: rip-relative)
+    }
     if (mod == 'c') or (mod == 'P') or (mod == 'p') or (mod == 'a') {
         return imm_text(o);
     }
@@ -3168,6 +3975,56 @@ pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
     return "";
 }
 
+// render's Intel syntax: the AT&T text's registers without '%', memory and
+// constants as the Intel syntax writes them.
+fn render_intel(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
+    if mod == 'z' {
+        return "";
+    }
+    if o.kind == ai.OK_REG {
+        let t = render(o, mod, false, err);
+        if err.*.len > 0 {
+            return "";
+        }
+        if mod == 'a' {
+            return u.cat3("[", t[2..t.len - 1], "]");
+        }
+        if mod == 'A' {
+            return t[2..];
+        }
+        if (t.len > 0) and (t[0] == '%') {
+            return t[1..];
+        }
+        return t;
+    }
+    if o.kind == ai.OK_MEM {
+        if mod == 'H' {
+            return intel_mem_text(o, 8, true);
+        }
+        if mod == 'a' {
+            return intel_mem_text(o, 0, false);
+        }
+        if (mod == 0) or (mod == 'A') or (mod == 'P') or (mod == 'p') {
+            return intel_mem_text(o, 0, true);
+        }
+        err.* = u.f1("the modifier '%s' of a memory operand", ai.ch_text(mod));
+        return "";
+    }
+    if mod == 'a' {
+        if o.sym {
+            return u.cat2(imm_text(o), "[rip]");
+        }
+        return u.cat2("ds:", imm_text(o));
+    }
+    if (mod == 0) and o.sym {
+        return u.cat2("OFFSET FLAT:", imm_text(o));
+    }
+    if mod == 0 {
+        return imm_text(o);
+    }
+    return render(o, mod, false, err);
+}
+
 /// The text of asm goto's label k in its template.
 pub fn label_text(k: i32) []u8 {
     return u.cat2(".L__axiom_label_", u.idec(k));
@@ -3179,7 +4036,8 @@ pub fn label_text(k: i32) []u8 {
 pub fn goto_tail(n: i32, r: i32) []u8 {
     let reg = ai.x86_reg_text(r, 32, false);
     let mut b = u.Buf.init();
-    b.s(u.f1("\n\tmovl $0, %%%s\n\tjmp .L__axiom_goto_end\n", reg));
+    // (in the AT&T syntax, whichever the template is in)
+    b.s(u.f1("\n.att_syntax\n\tmovl $0, %%%s\n\tjmp .L__axiom_goto_end\n", reg));
     for k in 0..n {
         b.s(u.f3("%s:\n\tmovl $%s, %%%s\n", label_text(k), u.idec(k + 1), reg));
         if (k + 1) < n {
@@ -3196,17 +4054,19 @@ pub fn goto_tail(n: i32, r: i32) []u8 {
 /// Assembles inline text (an asm statement's template, operands substituted)
 /// whose first byte will be at `origin` in its section: the assembly, whose
 /// .text section and relocations hold the result (or its error).
-pub fn assemble_inline(text: []u8, origin: u64) *mut cr.Asm {
+pub fn assemble_inline(text: []u8, origin: u64, intel: bool) *mut cr.Asm {
     let A = cr.new_asm(tg.ARCH_X64, text, true, '#');
     A.origin = origin;
+    A.intel0 = intel;
     let ar = arch();
     cr.run(A, &ar);
     return A;
 }
 
 /// Assembles file-scope asm text: its sections, symbols and relocations.
-pub fn assemble_file(text: []u8) *mut cr.Asm {
+pub fn assemble_file(text: []u8, intel: bool) *mut cr.Asm {
     let A = cr.new_asm(tg.ARCH_X64, text, false, '#');
+    A.intel0 = intel;
     let ar = arch();
     cr.run(A, &ar);
     return A;
@@ -3522,6 +4382,14 @@ fn build_table() void {
         }
         if (f.digit == -2) and (f.enc != TE_L) {
             f.digit = -1;
+        }
+        // (the EVEX instructions that write a mask register, the compares,
+        // tests and classifications, take a write mask, merging: SDM vol. 2,
+        // `VCMPPS k1 {k2}, ...`; but the moves of vector bits into a mask
+        // and vp2intersect)
+        if (f.enc == TE_E) and (f.n > 0) and (f.role[0] == 'R') and (f.ty[0] == TT_K) and
+           not u.starts(f.name, "vpmov") and not u.starts(f.name, "vp2intersect") {
+            f.kmask = true;
         }
         let mut has_m = false;
         for k in 0..f.n {

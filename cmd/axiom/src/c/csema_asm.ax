@@ -59,9 +59,10 @@ pub fn toplevel(a: *mut cast.Asm) void {
         return;
     }
     let b = new_blob(a);
-    if template_ok(a, ack.check_text(b.arch, b.text, false)) {
+    if template_ok(a, ack.check_text(b.arch, b.text, false, b.intel)) {
         a.blob = b;
     }
+    cs.unit().asm_tops.push(a);
 }
 
 // Reports an error of the assembler in a's template (C3097): false if any.
@@ -75,8 +76,11 @@ fn template_ok(a: *cast.Asm, msg: []u8) bool {
 
 // The identifiers of asm text t, as names it may refer to: an external
 // function or object a unit declares that t names is used (so that a
-// library's definition of it is linked).
-fn note_names(t: []u8) void {
+// library's definition of it is linked); one of internal linkage, or a
+// static object of a block, visible where the asm is, is used too and is
+// what the name refers to in the text (a.statics: the backend resolves the
+// name to its symbol, which the compiler makes unique).
+fn note_names(a: *mut cast.Asm, t: []u8) void {
     let mut i: usize = 0;
     while i < t.len {
         let c = t[i];
@@ -85,23 +89,27 @@ fn note_names(t: []u8) void {
             while (i < t.len) and (u.is_alnum(t[i]) or (t[i] == '_') or (t[i] == '.') or (t[i] == '$')) {
                 i += 1;
             }
-            cs.unit().asm_names.push(u.intern(t[st..i]));
+            let n = u.intern(t[st..i]);
+            cs.unit().asm_names.push(n);
+            cs.asm_static(a, n);
             continue;
         }
         i += 1;
     }
 }
 
-fn new_blob(a: *cast.Asm) *mut ai.Blob {
-    note_names(a.tmpl);
+fn new_blob(a: *mut cast.Asm) *mut ai.Blob {
+    note_names(a, a.tmpl);
     let b = u.perm_new.[ai.Blob]();
     b.arch = tg.g_arch;
+    b.file_id = -1;
     b.basic = a.basic;
     b.text = u.perm_dup(a.tmpl);
     b.volatile_ = a.volatile_ or a.basic or (a.outputs.len == 0) or a.goto_;
     b.goto_ = a.goto_;
     b.cc = true;
     b.memory = a.basic;
+    b.intel = (tg.g_arch == tg.ARCH_X64) and cs.opts().asm_intel;
     let lc = u.span_linecol(a.span);
     b.loc = u.perm_dup(u.f2("%s:%s", u.file_of(a.span.file).display, u.idec(lc.sl)));
     return b;
@@ -133,6 +141,24 @@ fn reg_bits(t: *cty.CType) u32 {
     return 0;
 }
 
+// The size of an object of type t in a memory operand, as the Intel
+// syntax's size keyword gives it (BYTE PTR ... XMMWORD PTR; the x87's
+// 80-bit long double TBYTE PTR): its bits when it has 1, 2, 4, 8 or 16 bytes,
+// 80 for the long double, else 0 (no keyword).
+fn mem_bits(t: *cty.CType) u32 {
+    if cty.is_wide(t) and not cty.is_complex(t) and (cty.ld_bits() == 80) {
+        return 80;
+    }
+    if (t.kind == cty.TK_FUNCTION) or (t.kind == cty.TK_VOID) or not cty.is_complete(t) {
+        return 0;
+    }
+    let n = cty.size_of(t);
+    if (n == 1) or (n == 2) or (n == 4) or (n == 8) or (n == 16) {
+        return @truncate(u32, n * 8);
+    }
+    return 0;
+}
+
 // The type of e's value (an array or function decays to a pointer).
 fn value_type(e: *cast.Expr) *mut cty.CType {
     let t = e.ty;
@@ -153,6 +179,16 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
     op.fp = cty.is_floating(t);
     op.bits = reg_bits(t);
     let rv = register_var(e);
+    if c.pair and cty.is_wint(t) and (cty.size_of(t) == 16) and (rv < 0) {
+        // 'A' of a 128-bit integer: its low half in rax (and its high half
+        // in rdx: an operand of its own that stmt adds)
+        op.kind = ai.OK_FIXED;
+        op.cls = ai.CL_GPR;
+        op.reg = 0;
+        op.bits = 64;
+        op.pair = 0;
+        return true;
+    }
     if cty.is_wint(t) and not c.mem {
         // (wider than a register: a pair of registers, as other compilers
         // allow for some constraints, is not chosen here; in memory, "m", it is)
@@ -249,6 +285,7 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         }
         op.kind = ai.OK_MEM;
         op.q = c.mem_q;
+        op.mbits = mem_bits(e.ty);
         return true;
     }
     if c.imm {
@@ -280,6 +317,12 @@ pub fn stmt(a: *mut cast.Asm) void {
         }
         return;
     }
+    // the alternative of the constraints ("r,m" ...) that costs least, the
+    // same for every operand (else C3096)
+    let alt = choose_alt(a);
+    if alt < 0 {
+        return;
+    }
     let arch = tg.g_arch;
     let b = new_blob(a);
     let mut ops = u.List.[ai.Op].empty();
@@ -292,9 +335,10 @@ pub fn stmt(a: *mut cast.Asm) void {
     let mut plus = u.List.[usize].empty();
     for k in 0..nout {
         let o = a.outputs.get(k);
-        let c = ai.constraint(arch, o.constraint, true);
+        let c = ai.constraint(arch, alt_of(o.constraint, alt), true);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: true, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false };
+                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
+                             hi: false };
         if not c.ok {
             report_con(o, c.msg);
             ok = false;
@@ -317,9 +361,10 @@ pub fn stmt(a: *mut cast.Asm) void {
     }
     for k in 0..nin {
         let o = a.inputs.get(k);
-        let c = ai.constraint(arch, o.constraint, false);
+        let c = ai.constraint(arch, alt_of(o.constraint, alt), false);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: false, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false };
+                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
+                             hi: false };
         let mut e = o.e;
         if not c.ok {
             report_con(o, c.msg);
@@ -364,6 +409,18 @@ pub fn stmt(a: *mut cast.Asm) void {
                 } else if (to.kind != ai.OK_REG) and (to.kind != ai.OK_FIXED) {
                     bad(o.cspan, "a matching constraint ties an input to an output in a register");
                     ok = false;
+                } else if to.pair >= 0 {
+                    // (an output in the rdx:rax pair: the input's 128-bit value there too)
+                    if not cty.is_wint(e.ty) or (cty.size_of(e.ty) != 16) {
+                        bad(o.span, "an input tied to an output in the rdx:rax pair must have 128 bits");
+                        ok = false;
+                    }
+                    op = to;
+                    op.out = false;
+                    op.early = false;
+                    op.inout = false;
+                    op.tie = tie;
+                    op.name = u.perm_dup(o.name);
                 } else {
                     e = cx.value_of(e);
                     op.kind = to.kind;
@@ -400,6 +457,31 @@ pub fn stmt(a: *mut cast.Asm) void {
         }
         ops.push(op);
         exprs.push(cx.value_of(a.outputs.get(k).e));
+    }
+    // the high halves of the operands in the rdx:rax pair ('A' of a 128-bit
+    // value): operands of their own in rdx, after all the others (the
+    // template does not name them), tied as their low halves are
+    let nlow = ops.len;
+    let his = u.newn.[i32](nlow + 1);
+    for k in 0..nlow {
+        his[k] = -1;
+        let mut lo = ops.get(k);
+        if lo.pair < 0 {
+            continue;
+        }
+        let mut hop = lo;
+        hop.reg = 2;
+        hop.hi = true;
+        hop.pair = @int_cast(i32, k);
+        hop.name = "";
+        if lo.tie >= 0 {
+            hop.tie = his[@int_cast(usize, lo.tie)];
+        }
+        lo.pair = @int_cast(i32, ops.len);
+        his[k] = lo.pair;
+        ops.set(k, lo);
+        ops.push(hop);
+        exprs.push(exprs.get(k));
     }
     // names are unique
     for i in 0..names.len {
@@ -556,7 +638,7 @@ pub fn stmt(a: *mut cast.Asm) void {
     }
     // the template's references
     let mut err = "";
-    let ps = ai.parse_template(arch, a.tmpl, &mut err);
+    let ps = ai.parse_template(arch, a.tmpl, b.intel, &mut err);
     if err.len > 0 {
         bad(a.tspan, err);
         ok = false;
@@ -622,6 +704,140 @@ pub fn stmt(a: *mut cast.Asm) void {
     }
     a.blob = b;
     a.exprs = exprs;
+}
+
+// The modifiers of constraint s (its leading '=' or '+'), and its
+// alternatives (separated by ',').
+fn con_mods(s: []u8) []u8 {
+    let mut k: usize = 0;
+    while (k < s.len) and ((s[k] == '=') or (s[k] == '+')) {
+        k += 1;
+    }
+    return s[0..k];
+}
+
+fn con_alts(s: []u8) [][]u8 {
+    let body = s[con_mods(s).len..];
+    let mut out = u.List.[[]u8].empty();
+    let mut st: usize = 0;
+    let mut k: usize = 0;
+    let mut depth: i32 = 0;
+    while k <= body.len {
+        if (k < body.len) and (body[k] == '[') {
+            depth += 1;
+        } else if (k < body.len) and (body[k] == ']') {
+            depth -= 1;
+        }
+        if (k == body.len) or ((body[k] == ',') and (depth == 0)) {
+            out.push(body[st..k]);
+            st = k + 1;
+        }
+        k += 1;
+    }
+    return out.items();
+}
+
+// Constraint s with only its alternative j (its modifiers kept).
+fn alt_of(s: []u8, j: i32) []u8 {
+    let alts = con_alts(s);
+    if alts.len <= 1 {
+        return s;
+    }
+    return u.cat2(con_mods(s), alts[@int_cast(usize, j)]);
+}
+
+// The cost of operand o (an output if `output`) in alternative text alt
+// (with its modifiers `mods`): the dialect's disparagement, `?` 1 and `!`
+// 600 for each, or -1 if the alternative cannot take the operand (a
+// constant it needs and the operand is not; a register of a type no
+// register holds; memory for an output that is no lvalue).
+fn alt_cost(arch: i32, o: *cast.AsmOperand, mods: []u8, alt: []u8, output: bool) i64 {
+    let mut cost: i64 = 0;
+    for ch in alt {
+        if ch == '?' {
+            cost += 1;
+        } else if ch == '!' {
+            cost += 600;
+        }
+    }
+    let c = ai.constraint(arch, u.cat2(mods, alt), output);
+    if not c.ok {
+        return cost;  // (reported when the alternative is the one chosen)
+    }
+    if (c.tie >= 0) or (c.tie_name.len > 0) {
+        return cost;  // (a matching constraint: its output's choice)
+    }
+    let t = value_type(o.e);
+    let rok = c.reg and (reg_bits(t) != 0) and not ((c.cls == ai.CL_VEC) and (reg_bits(t) < 32));
+    let kok = not output and c.imm and o.e.is_const and cty.is_integer(t);
+    let sok = not output and c.imm and c.sym_ok and cty.is_pointer(t) and cc.address(cx.value_of(o.e)).ok;
+    let mok = (c.mem or (c.via != ai.VIA_NONE)) and (o.e.lvalue or not output);
+    if kok or sok {
+        return cost;
+    }
+    if rok {
+        return cost + 1;  // (a register: the value loaded into it)
+    }
+    if mok {
+        return cost + 2;  // (memory: the value stored to it, or read through it)
+    }
+    return -1;
+}
+
+// The alternative of asm a's constraints that its operands fit at the
+// least cost (the first of those), or -1 after an error (reported: the
+// operands have different numbers of alternatives).
+fn choose_alt(a: *cast.Asm) i32 {
+    let mut n: usize = 1;
+    let mut first = true;
+    let mut all = u.List.[*mut cast.AsmOperand].empty();
+    for o in a.outputs.items() {
+        all.push(o);
+    }
+    for o in a.inputs.items() {
+        all.push(o);
+    }
+    for o in all.items() {
+        let m = con_alts(o.constraint).len;
+        if first {
+            n = m;
+            first = false;
+        } else if (m != n) and (m > 1) and (n > 1) {
+            bad(o.cspan, u.f2("the constraint '%s' has %s alternatives, and the others do not", o.constraint,
+                              u.zdec(m)));
+            return -1;
+        } else if m > n {
+            n = m;
+        }
+    }
+    if n <= 1 {
+        return 0;
+    }
+    let mut best: i32 = 0;
+    let mut best_cost: i64 = -1;
+    for j in 0..n {
+        let mut cost: i64 = 0;
+        let mut k: usize = 0;
+        for o in all.items() {
+            let alts = con_alts(o.constraint);
+            let mut x = alts[0];
+            if alts.len > 1 {
+                x = alts[j];
+            }
+            let c = alt_cost(tg.g_arch, o, con_mods(o.constraint), x, k < a.outputs.len);
+            k += 1;
+            if c < 0 {
+                cost = -1;
+                break;
+            }
+            cost += c;
+        }
+        if (cost >= 0) and ((best_cost < 0) or (cost < best_cost)) {
+            best = @int_cast(i32, j);
+            best_cost = cost;
+        }
+    }
+    return best;
 }
 
 fn report_con(o: *cast.AsmOperand, msg: []u8) void {

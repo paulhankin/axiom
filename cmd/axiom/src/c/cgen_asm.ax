@@ -31,7 +31,26 @@ pub fn toplevel(a: *mut cast.Asm) void {
     if u.isnil(a.blob) {
         return;
     }
+    a.blob.aliases = aliases(a);
     ai.toplevel.push(a.blob);
+}
+
+// The functions and objects of internal linkage asm a's text names (made
+// in the IR if they are not yet): each name and its symbol's.
+fn aliases(a: *cast.Asm) [][]u8 {
+    let out = u.perm_newn.[[]u8](2 * a.statics.len + 1);
+    for k in 0..a.statics.len {
+        let s = a.statics.get(k);
+        // (kept: only the text refers to it, which the optimizer does not see)
+        if s.kind == cast.SK_FUNC {
+            cg.keep(cg.func_of(s, cg.func_sig(s)).val);
+        } else {
+            cg.keep(cg.object_addr(s));
+        }
+        out[2 * k] = u.perm_dup(s.name);
+        out[(2 * k) + 1] = u.perm_dup(cg.symbol_name(s));
+    }
+    return out[0..2 * a.statics.len];
 }
 
 // v (of C type t) as the type a register of op's class holds.
@@ -61,27 +80,92 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     if u.isnil(b) {
         return u.nil.[ir.Value]();
     }
-    let index = ai.add(b);
+    b.aliases = aliases(a);
+    let mut index = ai.add(b);
+    let mut flags: u32 = 0;
+    if b.defines {
+        flags = flags | ir.ASM_NODUP;
+    }
+    if b.sp or b.calls {
+        flags = flags | ir.ASM_STACK;
+    }
+    // (what the passes may do with it: ir.ASM_PURE, ASM_HINT)
+    let mut mem_ops = b.memory or b.goto_;
+    let mut nout: usize = 0;
+    for op in b.ops {
+        if (op.kind == ai.OK_MEM) or (op.via != ai.VIA_NONE) or (op.pair >= 0) {
+            mem_ops = true;
+        }
+        if op.out {
+            nout += 1;
+        }
+    }
+    if not mem_ops and not b.volatile_ and (nout > 0) {
+        flags = flags | ir.ASM_PURE;
+        // (one index for equal pure statements, so that value numbering
+        // merges them: the same template, operands and clobbers)
+        let key = u.intern(pure_key(a, b));
+        let prev = pure_keys.get(key);
+        if prev != 0 {
+            index = prev - 1;
+        } else {
+            pure_keys.put(key, index + 1);
+        }
+    } else if not mem_ops {
+        flags = flags | ir.ASM_HINT;
+    }
+    ir.note_asm(@as(i64, index), flags);
     let mut xs = u.List.[*mut ir.Value].empty();
     xs.push(ir.ci32(@as(u64, @bit_cast(u32, index))));
-    // outputs in registers: (lvalue, its address, the temporary)
+    // outputs in registers: (operand, lvalue, its address), their values
+    // the asm's results (IN_CALL_RESULT(asm, k): the backend's registers)
+    let mut outk = u.List.[usize].empty();
     let mut outs = u.List.[*mut cast.Expr].empty();
     let mut addrs = u.List.[*mut ir.Value].empty();
-    let mut tmps = u.List.[*mut ir.Value].empty();
+    // (an output in the rdx:rax pair: its temporary, which its halves go to)
+    let mut pouts = u.List.[usize].empty();
+    let mut pes = u.List.[*mut cast.Expr].empty();
+    let mut paddrs = u.List.[*mut ir.Value].empty();
+    let mut ptmps = u.List.[*mut ir.Value].empty();
+    // (the operands in the rdx:rax pair: each low half's temporary or value
+    // address, which its high half, 8 bytes on, reads too)
+    let pairv = u.newn.[*mut ir.Value](b.ops.len + 1);
     for k in 0..b.ops.len {
         let op = b.ops[k];
         let e = a.exprs.get(k);
+        if op.hi {
+            if op.out {
+                xs.push(ir.ci32(0));
+            } else {
+                let at = ir.ptradd(cg.B, pairv[@int_cast(usize, op.pair)], ir.cint(ir.isz(), 8));
+                xs.push(ir.load(cg.B, ir.t_int(64), at));
+            }
+            continue;
+        }
+        if op.pair >= 0 {
+            if op.out {
+                let t = cty.unqual(e.ty);
+                pouts.push(k);
+                pes.push(e);
+                paddrs.push(gx.lv(e));
+                ptmps.push(cg.alloca(t, "asm.out"));
+                xs.push(ir.ci32(0));
+            } else {
+                let p = gx.rv(e);  // (a 128-bit value: its address)
+                pairv[k] = p;
+                xs.push(ir.load(cg.B, ir.t_int(64), p));
+            }
+            continue;
+        }
         if op.out {
             if op.kind == ai.OK_MEM {
                 xs.push(gx.lv(e));
                 continue;
             }
-            let t = cty.unqual(e.ty);
-            let tmp = cg.alloca(t, "asm.out");
+            outk.push(k);
             outs.push(e);
             addrs.push(gx.lv(e));
-            tmps.push(tmp);
-            xs.push(tmp);
+            xs.push(ir.ci32(0));  // (its register: the asm's result k)
             continue;
         }
         if op.kind == ai.OK_MEM {
@@ -111,12 +195,92 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
         rt = cg.T_i32;
     }
     let r = ir.intr(cg.B, ir.IN_ASM, rt, xs.items());
-    for k in 0..outs.len {
-        let e = outs.get(k);
+    // (the results first, just after it: then the stores)
+    let vs = u.newn.[*mut ir.Value](outk.len + 1);
+    for j in 0..outk.len {
+        vs[j] = result(r, outk.get(j), b.ops[outk.get(j)]);
+    }
+    let lo = u.newn.[*mut ir.Value](pouts.len + 1);
+    let hi = u.newn.[*mut ir.Value](pouts.len + 1);
+    for j in 0..pouts.len {
+        let k = pouts.get(j);
+        lo[j] = result(r, k, b.ops[k]);
+        hi[j] = result(r, @int_cast(usize, b.ops[k].pair), b.ops[@int_cast(usize, b.ops[k].pair)]);
+    }
+    for j in 0..outk.len {
+        let e = outs.get(j);
         let t = cty.unqual(e.ty);
-        _ = gx.store_lv(e, t, gx.load(t, tmps.get(k)), addrs.get(k));
+        _ = gx.store_lv(e, t, from_class(vs[j], t), addrs.get(j));
+    }
+    for j in 0..pouts.len {
+        let e = pes.get(j);
+        let t = cty.unqual(e.ty);
+        let tmp = ptmps.get(j);
+        _ = ir.store(cg.B, lo[j], tmp);
+        _ = ir.store(cg.B, hi[j], ir.ptradd(cg.B, tmp, ir.cint(ir.isz(), 8)));
+        _ = gx.store_lv(e, t, gx.load(t, tmp), paddrs.get(j));
     }
     return r;
+}
+
+// The pure asm statements so far, by what they are (pure_key): index + 1.
+let mut pure_keys: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+// What makes two asm statements the same: the template, each operand's
+// constraint and what was chosen for it, the clobbers, the syntax.
+fn pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
+    let mut k = u.Buf.init();
+    k.s(a.tmpl);
+    for o in a.outputs.items() {
+        k.c(1);
+        k.s(o.constraint);
+    }
+    for o in a.inputs.items() {
+        k.c(2);
+        k.s(o.constraint);
+    }
+    for c in a.clobbers.items() {
+        k.c(3);
+        k.s(c.name);
+    }
+    for op in b.ops {
+        k.s(u.f4("\x04%s.%s.%s.%s", u.udec(@as(u64, op.kind)), u.idec(op.reg), u.udec(@as(u64, op.bits)),
+                 u.udec(op.subset)));
+        k.s(
+            u.f4(
+                ".%s.%s.%s.%s", u.pick(op.fp, "f", "i"), u.udec(@as(u64, op.cls)), u.idec(op.tie),
+                u.pick(op.early, "e", "")));
+    }
+    k.s(u.pick(b.intel, "\x05intel", ""));
+    for n in b.aliases {
+        k.c(6);
+        k.s(n);
+    }
+    return k.done();
+}
+
+// Output k (op) of asm r: the register its value is in, as the type of its
+// class (an integer of its width, or a floating type of it).
+fn result(r: *mut ir.Value, k: usize, op: ai.Op) *mut ir.Value {
+    let mut ty = ir.t_int(@as(i32, @bit_cast(i32, op.bits)));
+    if op.cls == ai.CL_VEC {
+        ty = ir.t_float(@as(i32, @bit_cast(i32, op.bits)));
+    }
+    let mut args: [2]*mut ir.Value = [r, ir.ci32(@as(u64, k))];
+    return ir.intr(cg.B, ir.IN_CALL_RESULT, ty, args[..]);
+}
+
+// A register's value v as C type t (to_class's inverse).
+fn from_class(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let want = cg.lty(t);
+    if v.ty == want {
+        return v;
+    }
+    if want.kind == ir.T_PTR {
+        return ir.inttoptr(cg.B, v);
+    }
+    return ir.bitcast(cg.B, v, want);
 }
 
 /// A function with the attribute naked, of symbol `name`: no IR body; its
@@ -127,6 +291,7 @@ pub fn naked(name: []u8, f: *mut ir.Func, body: *cast.Stmt) void {
     f.linkage = ir.LINK_EXTERNAL;
     let mut t = u.Buf.init();
     let mut first = u.nil.[ai.Blob]();
+    let mut al = u.List.[[]u8].empty();
     t.s(".text\n");
     if tg.g_arch == tg.ARCH_X64 {
         t.s(".p2align 4\n");
@@ -142,6 +307,9 @@ pub fn naked(name: []u8, f: *mut ir.Func, body: *cast.Stmt) void {
         let b = x.asm.blob;
         if u.isnil(first) {
             first = b;
+        }
+        for n in aliases(x.asm) {
+            al.push(n);
         }
         if b.basic {
             t.s(b.text);
@@ -160,10 +328,17 @@ pub fn naked(name: []u8, f: *mut ir.Func, body: *cast.Stmt) void {
     }
     let nb = u.perm_new.[ai.Blob]();
     nb.arch = first.arch;
+    nb.file_id = -1;
     nb.basic = true;
     nb.text = u.perm_dup(t.done());
     nb.loc = first.loc;
-    let msg = ack.check_text(nb.arch, nb.text, false);
+    nb.intel = first.intel;
+    let als = u.perm_newn.[[]u8](al.len + 1);
+    for k in 0..al.len {
+        als[k] = al.get(k);
+    }
+    nb.aliases = als[0..al.len];
+    let msg = ack.check_text(nb.arch, nb.text, false, nb.intel);
     if msg.len > 0 {
         _ = dg.err(body.span, "C3097", msg);
         return;

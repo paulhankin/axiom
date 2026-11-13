@@ -82,6 +82,7 @@ Axiom in one program").
 | `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
+| `--c-asm-dialect=att\|intel` | The syntax of x86-64 inline and file-scope assembly (default `att`; "Inline assembly"). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
 | `-Idir` | Add a directory to the include path. |
 | `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
@@ -166,6 +167,40 @@ with its own macros, types and internal names. Then the units are linked:
 
 All the units are one program for the optimizer, so calls are inlined across them at
 `-O2` and `-O3`.
+
+### Assembly sources
+
+```
+axiom build main.c memops.S table.s -o prog
+```
+
+On x86-64 and AArch64 targets (Linux, macOS, Windows; on WebAssembly C3901) a source
+whose name ends in `.s` or `.S` is a translation unit of assembly, beside C units and an
+Axiom program (`axiom build main.ax x.s`), or alone (`--emit=obj`). Its text is assembled
+as file-scope asm is ("Inline assembly"): AT&T syntax, or Intel under
+`--c-asm-dialect=intel` and after `.intel_syntax`. A `.S` source is first preprocessed
+by the C preprocessor with `__ASSEMBLER__` defined as 1, `-D`, `-U` and `-I`, the
+predefined macros (`__AXIOM_ASM_X86_64__` or `__AXIOM_ASM_AARCH64__` in any mode), its
+directives done and its macros replaced, its other text as written; a line whose `#`
+does not begin a directive is a comment (as is `#` first on a line on AArch64, `//`
+anywhere there, and `#` anywhere on x86-64). A `.s` source is not preprocessed.
+
+- Its global symbols (`.globl`, `.weak`) are external names of the program: C and
+  Axiom (`extern "C"`) call its functions and read its data; a name it defines that a
+  C unit or the Axiom program defines too is an error of the build; the C library's
+  functions it calls are linked for it (its references are
+  the library's roots as a C unit's are). On macOS the leading underscore is added to
+  every name, as for C. A name it defines keeps the C library's definition of that name
+  out.
+- Nothing of an assembly source is stripped: its sections are the object's whatever
+  refers to them (dead-code removal does not look into assembly), and the functions and
+  objects it names are kept.
+- Under `-g` its code has line information: each instruction's line in the source (a
+  `.S` source's lines are its own, a line of an included file or of a macro's
+  expansion being the line it is used on), or the place the last `.loc file line`
+  gave (`.file N "name"` names the files), for debuggers and in the PDB on Windows;
+  its parts from one label symbol to the next are subprograms of that name.
+  `.cfi_*` and `.seh_*` procedures describe its frames ("Inline assembly").
 
 ## C and Axiom in one program
 
@@ -1073,13 +1108,29 @@ function, `extern inline` is an inline definition (C99's `inline`).
 ### Inline assembly
 
 On x86-64 (Linux, Windows) and AArch64 (Linux, macOS) targets; on WebAssembly an asm
-statement is C3901. The compiler has its own assemblers (`cmd/axiom/src/asm/`), so no
+statement is C3901: file-scope asm and `asm goto` have nothing to map to there (a module
+is not free-form code, and its control flow is structured: a template cannot jump to a
+C label), and templates in the WebAssembly text instructions with operands as locals
+(`r`), linear-memory addresses (`m`) and constants (`i`), which would map soundly, are
+not implemented. The compiler has its own assemblers (`cmd/axiom/src/asm/`), so no
 other tool is needed:
 
 - **x86-64**: the AT&T syntax (source operands first; `%reg`, `$imm`,
   `disp(base, index, scale)`, `%fs:`/`%gs:` overrides, `*` for indirect jumps and calls,
   size suffixes b, w, l, q or the size of a register operand, `lock`, `rep`, `repe`,
-  `repne`); `{att|intel}` dialect alternatives give their first. Instructions: the
+  `repne`), and the Intel syntax, after `.intel_syntax [noprefix|prefix]` (until
+  `.att_syntax`) or everywhere under `--c-asm-dialect=intel`: the destination first,
+  registers with or without `%`, immediates without `$`, memory as
+  `SIZE PTR seg:disp[base + index*scale + disp]` (`BYTE` `WORD` `DWORD` `QWORD`
+  `MMWORD` `TBYTE` `XMMWORD` `YMMWORD` `ZMMWORD`; `DWORD BCST [m]` a broadcast),
+  `OFFSET [FLAT:]sym` for an address, an expression alone as memory at that address
+  (a constant as an immediate; a jump's or call's operand as its target), mnemonics
+  without size suffixes (the memory operand's size keyword gives the size),
+  `movsx`/`movzx`/`movsxd`, `{k1}{z}`, `{1to16}`, `{rn-sae}` (also written on the last
+  register), the string instructions with their operands written. A redundant segment
+  override (`ds:` of an address, `ss:` at rsp or rbp) is no prefix, in both syntaxes.
+  The comparison pseudo-ops `vcmpltps`, `vcmpnge_uqpd` ..., `vpcmpnleud` ... are the
+  compare with that predicate. Instructions: the
   general-purpose ones a program runs (moves, arithmetic, logic, shifts and rotates, bit
   operations, `cmovcc`, `setcc`, jumps, calls, `push`/`pop`, string instructions, `xchg`,
   `xadd`, `cmpxchg`, `cmpxchg8b`/`16b`, `bswap`, `cpuid`, `rdtsc`/`rdtscp`, `syscall`,
@@ -1119,9 +1170,38 @@ other tool is needed:
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
   (`@GOTPCREL`), absolute 32- and 64-bit addresses; AArch64 `b`/`bl` to symbols,
   `adrp` (`:got:`), `:lo12:` and `:got_lo12:` in `add` and loads and stores, `.quad` and
-  `.word` of addresses. `.cfi_*`, `.file`, `.loc`, `.ident`, `.arch` and the like are
+  `.word` of addresses. `.file`, `.loc`, `.ident`, `.arch` and the like are
   accepted and do nothing. An instruction, operand form or directive that is not
   supported is C3097, naming it, at the statement.
+- Call frame information: in file-scope asm `.cfi_startproc [simple]` ... `.cfi_endproc`
+  make a procedure whose `.cfi_def_cfa`, `.cfi_def_cfa_register`, `.cfi_def_cfa_offset`,
+  `.cfi_adjust_cfa_offset`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`,
+  `.cfi_undefined`, `.cfi_same_value`, `.cfi_register`, `.cfi_remember_state`,
+  `.cfi_restore_state`, `.cfi_escape`, `.cfi_signal_frame` (a CIE with the augmentation
+  `S`) and on AArch64 `.cfi_negate_ra_state` are its FDE in `.debug_frame` under `-g`
+  (registers by name or DWARF number); `.cfi_personality` and `.cfi_lsda` only with
+  the encoding 255 (none: there are no personality routines), `.cfi_sections` changes
+  nothing. Without `-g` there is no call frame information for any function (the
+  stack traces walk frame pointers), and none is in `.eh_frame`: nothing in a program
+  unwinds by it. On Windows, `.seh_proc` ... `.seh_endproc` make the procedure's unwind
+  record in `.xdata` and its `.pdata` entry: x86-64 `.seh_pushreg`, `.seh_stackalloc`,
+  `.seh_setframe`, `.seh_savereg`, `.seh_savexmm`, `.seh_pushframe`,
+  `.seh_endprologue`; ARM64 `.seh_stackalloc`, `.seh_save_fplr`, `.seh_save_fplr_x`,
+  `.seh_save_reg`, `.seh_save_reg_x`, `.seh_save_regp`, `.seh_save_regp_x`,
+  `.seh_save_lrpair`, `.seh_save_freg`, `.seh_save_freg_x`, `.seh_save_fregp`,
+  `.seh_save_fregp_x`, `.seh_set_fp`, `.seh_add_fp`, `.seh_nop`, `.seh_save_next`,
+  `.seh_pac_sign_lr`, `.seh_endprologue`, `.seh_startepilogue`, `.seh_endepilogue` (each
+  directive one instruction's code, as the ARM64 format counts them); exception
+  handlers (`.seh_handler`) are not supported.
+
+Under `--c-asm-dialect=intel` an asm statement's template, its `{att|intel}`
+alternatives giving their second, is in the Intel syntax, and so are its operands as
+they are written into it: registers without `%`, constants without `$`, an address
+constant as `OFFSET FLAT:sym` (with `%a`, `sym[rip]`), memory as `DWORD PTR [rbp-8]`
+with the size keyword of its object's size (1, 2, 4, 8 or 16 bytes, `TBYTE` for the
+80-bit long double; none for another size or with `%a`), `%A` without `*`, `%z`
+nothing; file-scope asm starts in the Intel syntax too. Without the option `{att|intel}`
+gives its first alternative.
 
 `asm [volatile] [inline] [goto] ("template" : outputs : inputs : clobbers : labels)`, as
 The GNU dialect's documentation describes extended asm, with these rules:
@@ -1130,8 +1210,12 @@ The GNU dialect's documentation describes extended asm, with these rules:
   names one. An output's constraint starts with `=` or `+` (also an input: it is read and
   written), and its operand is a modifiable lvalue; `&` is early clobber. Matching
   constraints (`"0"`, `"[name]"`) tie an input to an output in a register.
-- Constraints (the first alternative of `"r,m"`): `r`, `g`, `X`, `m`, `o`, `V`, `i`, `n`,
-  `s`, the digits; x86-64 `a b c d S D` (those registers), `q`, `R`, `Q`, `U`, `l`, `x`,
+- Constraints: of several alternatives (`"r,m"`, `"=r,r" : "!r,m"`) one is chosen for
+  all the operands, the one they fit at the least cost: for each operand a constant
+  where the alternative allows it 0, a register 1, memory 2, and each `?` 1 and `!` 600;
+  the first of the cheapest (an alternative an operand cannot take is never chosen;
+  operands with different numbers of alternatives are C3096). Letters: `r`, `g`, `X`, `m`, `o`, `V`, `i`, `n`,
+  `s`, the digits; x86-64 `a b c d S D` (those registers), `A`, `q`, `R`, `Q`, `U`, `l`, `x`,
   `v`, `Y`, `I J K M N O e Z` (constants in their ranges); AArch64 `w` (any v register),
   `x` (v0-v15), `y` (v0-v7), `Q` (memory at a base register), `I J K L M N Z S`. An operand
   chooses a constant when it is one (and the constraint allows it), else a register, else
@@ -1147,8 +1231,10 @@ The GNU dialect's documentation describes extended asm, with these rules:
   them), an output tied to an input (`"=t"(r) : "0"(x)`) replaces it, the inputs the
   template pops are clobbered (`"st(1)"`) and must be the topmost (C3096 otherwise; also a
   `u` operand without a `t` one), the outputs are popped after it, `t` first, and then the
-  inputs the template left on the stack. An `asm goto` cannot have such outputs. `A` (the
-  rdx:rax pair) is C3901.
+  inputs the template left on the stack. An `asm goto` cannot have such outputs. `A`:
+  a value of up to 64 bits in rax, a 128-bit integer (`__int128`) in the rdx:rax pair,
+  rdx its high half (an output, an input, `+`, or tied with a matching constraint to an
+  output in the pair); the template names the pair as rax.
 - Explicit register variables, `register long x asm("rax")` (or `"x8"`, `"w19"`, `"d0"`
   ...): such a variable is in that register when it is an asm operand in a register (the
   usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
@@ -1168,18 +1254,57 @@ The GNU dialect's documentation describes extended asm, with these rules:
   `%l[label]`.
 - `asm goto`'s template may jump to its labels (`%l[name]`); outputs are stored on every
   path. A jump out of a scope leaves it as `goto` would.
-- Every asm statement is treated as `volatile` and as clobbering memory: none is removed,
-  moved or merged, and none is reordered with memory accesses (the optimizer sees an
-  opaque operation). Outputs in registers are stored to temporaries just after the
-  template and then assigned to their lvalues. An output is never given an input's
-  register (as though every output were early clobber), which is always correct.
+- What the optimizer may do with an asm statement (an asm without outputs, an `asm
+  goto` and a basic asm are `volatile`; a basic asm clobbers memory):
+  - not `volatile`, no `"memory"` clobber and no memory operands (nor operands in mask,
+    MMX or x87 registers, which go through memory, nor the rdx:rax pair): a function of
+    its inputs. It is removed when its outputs are unused, merged with an equal one (the
+    same template, constraints, operands' kinds and clobbers) on the same inputs, and
+    moved (out of a loop too, so that it may run before the loop's first iteration even
+    when that never comes); it is never run in a branch it was not in.
+  - `volatile`, no `"memory"` clobber and no memory operands: kept where it is, once
+    each time it is reached, but no barrier to memory: values in memory may stay in
+    registers across it.
+  - with a `"memory"` clobber or memory operands: kept where it is, and as reading and
+    writing any memory (stores before it are done, loads after it done again; for memory
+    operands this is more than the dialect's rule, that it reads its inputs' objects and
+    writes its outputs', and is always correct).
+  An output in a register is the statement's result in that register, which the register
+  allocator places (no store and load around it), then assigned to its lvalue (in
+  `asm goto`, on every path, the label's too). An early-clobber output (`&`) is in no
+  input's register; another may be in an input's register (the template must read its
+  inputs before it writes such an output, as the dialect says).
 - The template must leave the stack pointer where it was (pushes and pops in pairs are
-  fine) and must not change the frame or the frame pointer: call frame information and
-  stack traces describe the function as compiled (`.cfi_*` directives are ignored). A
-  template that calls a function aligns the stack itself (as with other compilers). A
-  function with an asm statement makes no sibling calls. Named labels in a template are
-  local to it (the template is assembled on its own); a symbol a template refers to by
-  name has external linkage (or is defined by file-scope asm), and is kept in the program.
+  fine) and must not change the frame or the frame pointer. A function whose asm uses the
+  stack (an instruction pushes, pops, calls or names the stack pointer) has a frame, its
+  CFA the frame pointer's (rbp + 16, x29 + 16), so its call frame information and stack
+  traces stay exact while the template moves the stack pointer; on Windows the frame
+  pointer is its unwind information's frame register. In a template
+  `.cfi_adjust_cfa_offset` says how far it has moved the stack pointer (in all, they must
+  add up to 0: C3097), `.cfi_rel_offset reg, off` that it saved a register at the stack
+  pointer + off (the function's FDE then gives the register that rule, as an expression
+  on the stack pointer that follows the template's later adjustments) and `.cfi_restore`
+  that the register has its value again (each saved register must be restored); the
+  other `.cfi_*` directives, which would change the frame, are C3097 there, and the
+  `.seh_*` ones too (the Windows unwind codes describe prologues only, so on Windows a
+  register a template saves is not described). A template that calls a function aligns
+  the stack itself (as with other compilers). A function whose asm calls or uses the stack
+  makes no sibling calls.
+- Symbols and sections: a template's named labels (but `.L` and numeric ones) are local
+  symbols of the unit's object, its `.globl` and `.weak` ones global and weak symbols
+  (`.type` and `.size` apply); C (an `extern` declaration), other templates and
+  file-scope asm refer to them by name, as to file-scope asm's labels. A template's
+  `.pushsection`/`.popsection`, `.section` ... `.previous` (back to `.text`: by
+  `.popsection` or `.previous`) put its bytes in the object's sections of those names,
+  after what is there, with relocations to the template's labels (in its function's
+  code) and to symbols; numeric labels (`1:`, `1f`) refer across them. A template that
+  defines symbols is never copied by the optimizer (its function is not inlined, its
+  loop not unrolled, its block not duplicated), so each label has one definition; a
+  name defined twice that something refers to is an error. A template or file-scope asm
+  that names a function or object of internal linkage (or a block's static object)
+  visible where it is refers to it (to the symbol the compiler gives it, made unique in
+  the program), which is kept though only the text refers to it; any other symbol it
+  names has external linkage (or is defined by asm), and is kept in the program.
   `.p2align` in a template aligns relative to the function's start (16 bytes on x86-64).
 - File-scope `asm("...")` is a basic asm (operands are C3096) whose text is assembled into
   the unit's object: its labels are local symbols unless `.globl`, and C refers to its

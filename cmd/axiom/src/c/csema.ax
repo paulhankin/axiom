@@ -127,6 +127,7 @@ pub struct CUnit {
     main: *mut cast.CSym,              // the function main, if defined
     asms: u.List.[*mut cast.Asm],      // the file-scope asm (a GNU dialect), in order
     asm_names: u.List.[[]u8],          // the identifiers of asm text (a GNU dialect): what it may refer to
+    asm_tops: u.List.[*mut cast.Asm],  // its file-scope asm (asm_static: names resolved at the unit's end too)
     refs: u.List.[[]u8],               // the external names used and not defined here (the C library's on demand)
 }
 
@@ -314,6 +315,28 @@ fn innermost(sp: *mut Space, name: []u8) *mut Bind {
     return sp.binds.at(@int_cast(usize, k - 1));
 }
 
+/// Notes that asm text a names `n`, if that is a function or object of
+/// internal linkage (or a block's static object) visible here: it is used,
+/// and the backend resolves the name in the text to its symbol (a.statics).
+pub fn asm_static(a: *mut cast.Asm, n: []u8) void {
+    let s = lookup(n);
+    if u.isnil(s) or ((s.kind != cast.SK_FUNC) and (s.kind != cast.SK_OBJECT)) {
+        return;
+    }
+    let internal = (s.linkage == cast.LK_INTERNAL) or
+                   ((s.kind == cast.SK_OBJECT) and (s.duration == cast.SD_STATIC) and (s.linkage != cast.LK_EXTERNAL));
+    if not internal {
+        return;
+    }
+    s.used = true;
+    for x in a.statics.items() {
+        if x == s {
+            return;
+        }
+    }
+    a.statics.push(s);
+}
+
 /// The ordinary identifier `name` as seen here, or nil.
 pub fn lookup(name: []u8) *mut cast.CSym {
     let b = innermost(&mut S.ordinary, name);
@@ -471,6 +494,22 @@ pub fn run(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
             if not cty.is_complete(s.ty) {
                 err(s.span, "C3007", u.f2("the definition of '%s' has incomplete type %s", s.name, tq(s.ty)));
             }
+        }
+    }
+    // (file-scope asm may name a static function or object declared after it)
+    for a in S.unit.asm_tops.items() {
+        let tx = a.tmpl;
+        let mut i: usize = 0;
+        while i < tx.len {
+            if (tx[i] == '_') or (u.is_alnum(tx[i]) and not u.is_digit(tx[i])) {
+                let st = i;
+                while (i < tx.len) and (u.is_alnum(tx[i]) or (tx[i] == '_') or (tx[i] == '.') or (tx[i] == '$')) {
+                    i += 1;
+                }
+                asm_static(a, u.intern(tx[st..i]));
+                continue;
+            }
+            i += 1;
         }
     }
     // (the names asm text uses: csema_asm.ax)

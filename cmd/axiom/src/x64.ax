@@ -4667,11 +4667,12 @@ fn asm_pick(b: *ai.Blob, subset: u64, cls: u8, taken: u64) i32 {
 // The asm statement's MInst xe.ASM: one operand for each of the blob's (a
 // register, memory or a constant), the clobbered registers (written before
 // the inputs are read, so that no operand is in one), and for asm goto the
-// register of its result. Outputs in registers are written early too (an
-// output is never in an input's register, a cautious reading of the rules
-// that is always right), and stored to their temporaries after it; inputs
-// tied to outputs are copied into them first; operands in specific
-// registers are copied into and out of them.
+// register of its result. An output in a register is the asm's result of
+// its operand's number (IN_CALL_RESULT), written by the asm: early (before
+// the inputs are read, in none of their registers) if it is early clobber,
+// else at its end, so that it may share an input's register; inputs tied to
+// outputs are copied into them first; operands in specific registers are
+// copied into and out of them.
 fn gen_asm(v: *mut ir.Value) void {
     let bi = is.cval(v.xs.get(0));
     let b = ai.blob(bi);
@@ -4732,7 +4733,9 @@ fn gen_asm(v: *mut ir.Value) void {
         }
         regs[k] = r;
         if op.out {
-            if op.early or mc.is_vreg(r) {
+            // (an early-clobber output is written before the inputs are read:
+            // in none of their registers; another may share one)
+            if op.early {
                 ops[k] = mc.reg(r, mc.RD | mc.RE);
             } else {
                 ops[k] = W(r);
@@ -4789,16 +4792,8 @@ fn gen_asm(v: *mut ir.Value) void {
             copy(t, r, u8_of(vec, XMM, GPR));
             r = t;
         }
-        let m = addr(v.xs.get(k + 1));
-        if vec {
-            if op.bits == 32 {
-                _ = sse2(xe.MOVSS_ST, R(r), m);
-            } else {
-                _ = sse2(xe.MOVSD_ST, R(r), m);
-            }
-        } else {
-            _ = e2(xe.STORE, @truncate(u8, op.bits / 8), m, R(r));
-        }
+        // (the asm's result k: IN_CALL_RESULT(asm, k) reads it)
+        copy(call_result_vreg(v, k, u8_of(vec, XMM, GPR)), r, u8_of(vec, XMM, GPR));
     }
 }
 
@@ -8276,7 +8271,7 @@ fn quiet_between(from: *mut ir.Value, to: *mut ir.Value) bool {
 fn intr_writes(x: *ir.Value) bool {
     let id = @truncate(i32, @bit_cast(i64, x.cv));
     return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
-           (id == ir.IN_SET_SP) or (id == ir.IN_STORE_PARTIAL) or (id == ir.IN_ASM);
+           (id == ir.IN_SET_SP) or (id == ir.IN_STORE_PARTIAL) or ((id == ir.IN_ASM) and ir.inst_opaque(x));
 }
 
 let gpr_order: [14]i32 = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15];
@@ -9636,13 +9631,36 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     let relro = is.add_symbols(em.OBJ, m, em.TEXT, RODATA, elf.R_X86_64_64, &mut em.fsym, &mut gsym);
     // file-scope asm (the C front end's GNU dialects): its sections and symbols
     for b in ai.toplevel.items() {
-        let A = ax.assemble_file(b.text);
+        let A = ax.assemble_file(b.text, b.intel);
         if acr.failed(A) {
             em.fail(u.f2("file-scope asm at %s: %s", b.loc, acr.message(A)));
             return u.nil.[elf.Obj]();
         }
-        aob.add_file(em.OBJ, em.TEXT, A);
+        aob.add_file(em.OBJ, em.TEXT, A, b.aliases, b.file_id);
+        if aob.add_error.len > 0 {
+            em.fail(u.f2("asm at %s: %s", b.loc, aob.add_error));
+            aob.add_error = "";
+            return u.nil.[elf.Obj]();
+        }
     }
+    // (its procedures' Windows unwind records: .xdata, and their .pdata entries)
+    for p in aob.sehs.items() {
+        if em.WIN {
+            let x = em.OBJ.secs.get(@int_cast(usize, em.XDATA));
+            x.data.align(4);
+            let xoff = @as(u64, x.data.len());
+            x.data.put(p.xdata);
+            let pd = em.OBJ.secs.get(@int_cast(usize, em.PDATA));
+            let poff = @as(u64, pd.data.len());
+            pd.data.zeros(12);
+            pd.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: p.sym, addend: 0 });
+            pd.relocs.push(
+                elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: p.sym, addend: @bit_cast(i64, p.size) });
+            pd.relocs.push(
+                elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: em.XDATA_SYM, addend: @bit_cast(i64, xoff) });
+        }
+    }
+    aob.sehs.clear();
     em.FT = ft.begin(em.OBJ, m, em.TEXT, relro, &mut gsym, elf.R_X86_64_PC32, elf.R_X86_64_64);
     let mut level = tg.g_debug;
     if em.WIN {
@@ -9650,6 +9668,24 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     em.DBG = dw.begin(dw.ARCH_X64, 8, level);
     em.DBG.lang = dw.module_lang(m);
+    for p in aob.procs.items() {
+        dw.add_asm_fde(&mut em.DBG, p.sym, 0, p.size, p.prog, p.simple, p.signal);
+    }
+    aob.procs.clear();
+    // (assembly sources' line information: DWARF, or on Windows the PDB's)
+    for p in aob.funcs.items() {
+        let df = dw.Func.{ xcfi: u.nil_slice.[dw.XCfi](), sym: p.sym, name: p.name, external: p.external, size: p.size,
+                           src: 0, rows: p.rows, scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](),
+                           regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
+                           vlocs: u.nil_slice.[dloc.VLoc](), frame_local: -1 };
+        if p.rows.len > 0 {
+            dw.add_func(&mut em.DBG, &df);
+            if em.WIN and (em.LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
+                wlines.emit(em.OBJ, em.LINES, p.name, p.rows);
+            }
+        }
+    }
+    aob.funcs.clear();
     if not em.MACOS {
         // (macOS: thread-locals are in a block a TSD slot holds, which no
         // DWARF location describes: they have none, as on Apple silicon)
@@ -9673,6 +9709,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
                 return u.nil.[elf.Obj]();
             }
         }
+    }
+    let msg = aob.resolve(em.OBJ);
+    if msg.len > 0 {
+        em.fail(msg);
+        return u.nil.[elf.Obj]();
     }
     dw.finish_elf(&mut em.DBG, em.OBJ, em.TEXT, elf.R_X86_64_64, elf.R_X86_64_32);
     return em.OBJ;
