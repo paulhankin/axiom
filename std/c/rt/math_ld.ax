@@ -32,6 +32,7 @@ import "../../internal/math/core.ax" as m;
 import "../../internal/math/tables.ax" as t;
 import "ldouble.ax" as ld;
 import "math_ld_tables.ax" as lt;
+import "math_ldx.ax" as xk;
 
 extern "C" {
     fn __axc_math_err(e: i32, flags: u32) void;
@@ -989,7 +990,11 @@ fn expm1_tk(v: TD) TK @multiversion("fma") {
 
 /// The long double functions of one argument: r = op(x) in format f.
 export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void {
-    ld1(op, @truncate(u32, f64fmt), r, x, false);
+    let f = @truncate(u32, f64fmt);
+    if (f == ld.FMT_X) and xk.fast1(op, r, x) {
+        return;  // (the x87 format's double-double path: math_ldx.ax)
+    }
+    ld1(op, f, r, x, false);
 }
 
 /// r = op(x), or op(x)/pi if post (asinpi, acospi, atanpi: the value
@@ -1094,6 +1099,10 @@ fn ld1(op: u64, f: u32, r: *mut ld.W, x: *ld.W, post: bool) void @multiversion("
             let red = reduce(xv);
             n = red.n;
             rr = red.r;
+            if (f == ld.FMT_X) and (not post) and
+               xk.trig_out(@truncate(u32, op - OP_SIN), r, n, m.dd(rr.h, rr.m + rr.l)) {
+                return;  // (the exact reduction, the double-double kernel)
+            }
         }
         let sc = sincos_k(rr);
         let mut q = n;
@@ -1295,12 +1304,12 @@ fn ld1(op: u64, f: u32, r: *mut ld.W, x: *ld.W, post: bool) void @multiversion("
             check_range(r, f);
             return;
         }
-        if huge {
+        if huge or ((op != OP_ATANH) and (xv.e >= 64)) {
             if op == OP_ATANH {
                 via_double_p(r, dfn1(op, 2.0), f, post);
                 return;
             }
-            // log 2|x|
+            // log 2|x| (the next term, 1/(4 x^2), below 2^-130 of it)
             let mut l = log_core(sig_td(xv), xv.e + 1);
             if xv.neg {
                 l = tneg(l);
@@ -1392,9 +1401,77 @@ fn int_kind(x: X) u32 {
     return 2;
 }
 
+/// |x|^y for an integer 1 <= y < 128 where x's odd significand m has m^y <
+/// 2^128: m^y exactly in a 128-bit integer, rounded once (so that the exact
+/// results and those halfway between two values of the format, which no
+/// approximation of e^(y log x) decides, are correctly rounded); false when
+/// m^y is wider.
+fn pow_exact(r: *mut ld.W, xv: X, yv: X, neg: bool, f: u32) bool {
+    if (yv.e < 0) or (yv.e > 6) {
+        return false;
+    }
+    let y = @truncate(u32, yv.sh >> @bit_cast(u32, 63 - yv.e));
+    // x = (sh:sl) 2^(e - 127): its trailing zeros out
+    let mut h = xv.sh;
+    let mut l = xv.sl;
+    let mut tz: u32 = 0;
+    if l == 0 {
+        l = h;
+        h = 0;
+        tz = 64;
+    }
+    let z = @as(u32, @truncate(u32, @ctz(l)));
+    if z != 0 {
+        l = (l >> z) | (h << (64 - z));
+        h = h >> z;
+    }
+    tz += z;
+    if h != 0 {
+        return false;  // (m beyond 64 bits)
+    }
+    let bits = 64 - @as(u32, @truncate(u32, @clz(l)));
+    if (bits * y) > 128 {
+        return false;
+    }
+    // P = m^y
+    let mut ph: u64 = 0;
+    let mut pl: u64 = 1;
+    for i in 0..y {
+        _ = i;
+        let lo = mul128(pl, l);
+        let hi = mul128(ph, l);
+        pl = lo[1];
+        ph = lo[0] +% hi[1];
+    }
+    // P 2^(y (e - 127 + tz)), P normalized to bit 127
+    let mut lz = @as(u32, @truncate(u32, @clz(ph)));
+    if ph == 0 {
+        lz = 64 + @as(u32, @truncate(u32, @clz(pl)));
+    }
+    if lz >= 64 {
+        ph = pl << (lz - 64);
+        pl = 0;
+    } else if lz != 0 {
+        ph = (ph << lz) | (pl >> (64 - lz));
+        pl = pl << lz;
+    }
+    let ex = (xv.e - 127) + @bit_cast(i32, tz);
+    let e = ((ex * @bit_cast(i32, y)) - @bit_cast(i32, lz)) + 127;
+    if (e > 20000) or (e < -20000) {
+        return false;
+    }
+    ld.from_parts(r, neg, e, ph, pl, false, f);
+    check_range(r, f);
+    return true;
+}
+
 /// The long double functions of two arguments: r = op(x, y) in format f.
 export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
-    ld2(op, @truncate(u32, f64fmt), r, x, y, false);
+    let f = @truncate(u32, f64fmt);
+    if (f == ld.FMT_X) and (op <= OP_HYPOT) and xk.fast2(op, r, x, y) {
+        return;  // (the x87 format's double-double path: math_ldx.ax)
+    }
+    ld2(op, f, r, x, y, false);
 }
 
 /// r = op(x, y), or op(x, y)/pi if post (atan2pi).
@@ -1526,6 +1603,9 @@ fn ld2(op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, post: bool) void @mult
         } else {
             ld.from_f64(r, m.bits(1.0), f);
         }
+        return;
+    }
+    if (not yv.neg) and (kind != 0) and pow_exact(r, xv, yv, neg_r, f) {
         return;
     }
     // |x|^y = e^(y log|x|), y log|x| a triple-double
@@ -2133,16 +2213,12 @@ fn fma_c(f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, c: *mut ld.Env) voi
 // -----------------------------------------------------------------------------
 // The error function and the gamma functions (erfl, erfcl, lgammal, tgammal)
 //
-// erf |x| below 2 from its Taylor series (Abramowitz and Stegun 7.1.5:
-// the terms at most 2^3 times the sum there), to within 2^-156 of the sum,
-// and from 2 to 6 from the series of positive terms times e^(-x^2) (A&S
-// 7.1.6), both by Horner's rule on tables of their coefficients (and 1
-// minus the latter for the x87's erfc a below 4); erfc a otherwise from 2
-// on from the continued fraction
-//   erfc a = e^(-a^2)/sqrt(pi) 1/(a + (1/2)/(a + 1/(a + (3/2)/(a + ...))))
-// (A&S 7.1.14) evaluated from its depth 1600/a^2 + 40 back (that depth is
-// within 2^-150 for every a >= 2: measured in arbitrary precision), the
-// others as 1 - erf, 2 - erfc, 1 + erf (erfc below 2 loses at most 8 bits).
+// erf |x| below 1/2 from its Taylor series (Abramowitz and Stegun 7.1.5),
+// by Horner's rule on a table of its coefficients, to within 2^-156 of the
+// sum; erfc a from 1/2 on as e^(-a^2) erfcx(a), erfcx(a) = e^(a^2) erfc(a)
+// from Taylor polynomials of degree 31 about the middles of 64 pieces of
+// [1/2, 128) (ERFCX_Q, within 2^-121); the others as 1 - erf, 1 - erfc,
+// 2 - erfc, 1 + erf.
 // lgamma from Stirling's series with the Bernoulli numbers (A&S 6.1.41) for
 // x >= 24 (to the term below 2^-156 of the sum: at most 30), from
 // x (x + 1) ... up to 24 below it, and from the Taylor series of lgamma(2 +
@@ -2209,45 +2285,38 @@ fn erf_series(a: TD) TD @multiversion("fma") {
     return tmul(tmul(p, a), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L));
 }
 
-/// erf a = 2/sqrt(pi) a e^(-a^2) sum 2^n a^(2n) / (1 3 ... (2n+1)) for
-/// 2 <= a < 6 (A&S 7.1.6: no cancellation; to the terms below 2^-160, at
-/// most 190), with exp_core's exponential: within about 2^-125.
-fn erf_pos(a: TD) TD @multiversion("fma") {
-    let z = tmul(a, a);
-    let mut i = series_len(z.h, true, 200);
-    let mut p = tab(lt.ERF_P[..], 3 * i);
-    while i > 0 {
-        i -= 1;
-        p = tadd(tab(lt.ERF_P[..], 3 * i), tmul(z, p));
+/// erfc a = v 2^k for 1/2 <= a < 107: e^(-a^2) erfcx(a), erfcx from the
+/// piece of ERFCX_Q that holds a (the exponent and three bits of a: |a - c|
+/// <= 2^e/16), its terms from n = 17 in double, from n = 4 in double-double
+/// (below 2^-68 and 2^-16 of the sum), the rest in triple-double: within
+/// 2^-121 (the terms after the 31st below 2^-130).
+fn erfc_q(a: TD) TK @multiversion("fma") {
+    let hb = m.bits(a.h);
+    let e = @bit_cast(i32, @truncate(u32, hb >> 52)) - 1023;
+    let kk = @as(usize, @truncate(u32, (hb >> 49) & 7));
+    let row = ((@as(usize, @bit_cast(u32, e + 1)) * 8) + kk) * 96;
+    let c = p2(e) * (1.0 + ((@float_from_int(f64, kk) + 0.5) * 0.125));
+    let u = tadd(a, tdd(-c));
+    let tb = lt.ERFCX_Q[..];
+    let mut q = m.from_bits(tb[row + 93]);
+    let mut n: usize = 30;
+    while n >= 17 {
+        q = m.from_bits(tb[row + (3 * n)]) + (u.h * q);
+        n -= 1;
     }
-    let ec = exp_core(tneg(z));
-    return tscale(tmul(tmul(tmul(p, a), ec.v), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L)), p2(ec.k));
-}
-
-/// erfc a = v 2^k, 2 <= a < 107 (a triple-double).
-fn erfc_cf(a: TD) TK @multiversion("fma") {
-    let depth = @int_from_float(i32, 1600.0 / (a.h * a.h)) + 40;
-    // (the backward recurrence forgets its errors as it goes: the levels
-    // below the last 64 in double-double, whose 2^-104 the last 64 levels
-    // make far smaller than the triple-doubles' errors)
-    let mut tm = tdd(0.0);
-    let mut k = depth;
-    if k > 24 {
-        let ad = m.dd(a.h, a.m);
-        let mut t2 = m.dd(0.0, 0.0);
-        while k > 24 {
-            t2 = m.dd_div(m.dd(@float_from_int(f64, k) * 0.5, 0.0), m.dd_add(ad, t2));
-            k -= 1;
-        }
-        tm = td(t2.hi, t2.lo, 0.0);
+    let ud = m.dd(u.h, u.m);
+    let mut pd = m.dd_add(m.dd(m.from_bits(tb[row + 48]), m.from_bits(tb[row + 49])), m.dd_mul_d(ud, q));
+    n = 16;
+    while n > 4 {
+        n -= 1;
+        pd = m.dd_add(m.dd(m.from_bits(tb[row + (3 * n)]), m.from_bits(tb[(row + (3 * n)) + 1])), m.dd_mul(ud, pd));
     }
-    while k > 0 {
-        tm = tdiv(tdd(@float_from_int(f64, k) * 0.5), tadd(a, tm));
-        k -= 1;
-    }
+    let mut p = tadd(tab(tb, row + 9), tmul(u, tdd2(pd)));
+    p = tadd(tab(tb, row + 6), tmul(u, p));
+    p = tadd(tab(tb, row + 3), tmul(u, p));
+    p = tadd(tab(tb, row), tmul(u, p));
     let ec = exp_core(tneg(tmul(a, a)));
-    let v = tmul(tdiv(ec.v, tadd(a, tm)), td(lt.INV_SQRTPI_H, lt.INV_SQRTPI_M, lt.INV_SQRTPI_L));
-    return TK.{ v: v, k: ec.k };
+    return TK.{ v: tmul(ec.v, p), k: ec.k };
 }
 
 /// lgamma(2 + z), |z| <= 1/2: (1 - gamma) z + sum c_k z^k.
@@ -2414,6 +2483,9 @@ fn is_int(x: X, f: u32) bool {
 /// erfl, erfcl, lgammal, tgammal (op: SF_) in format f: r = op(x).
 export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiversion("fma") {
     let f = @truncate(u32, f64fmt);
+    if (f == ld.FMT_X) and xk.fast_sf(op, r, x) {
+        return;  // (the x87 format's double-double path: math_ldx.ax)
+    }
     let xv = decode(x, f);
     if xv.cls != C_FIN {
         via_double(r, dsf(op, to_d(x, f)), f);
@@ -2440,13 +2512,11 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
                 return;
             }
             let mut v = tdd(0.0);
-            if a.h < 2.0 {
+            if a.h < 0.5 {
                 v = erf_series(a);
-            } else if a.h < 6.0 {
-                v = erf_pos(a);
             } else {
-                let c = erfc_cf(a);
-                v = tsub(tdd(1.0), tscale(c.v, p2(c.k)));
+                let c = erfc_q(a);
+                v = tsub(tdd(1.0), tscale(c.v, p2(c.k)));  // (erfc a <= 0.48)
             }
             if xv.neg {
                 v = tneg(v);
@@ -2470,12 +2540,10 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
                 put(r, renorm(2.0, -1.0e-60, 0.0, 0.0), 0, f, false);
                 return;
             }
-            if a.h < 2.0 {
+            if a.h < 0.5 {
                 put(r, tadd(tdd(1.0), erf_series(a)), 0, f, false);
-            } else if a.h < 6.0 {
-                put(r, tadd(tdd(1.0), erf_pos(a)), 0, f, false);
             } else {
-                let c = erfc_cf(a);
+                let c = erfc_q(a);
                 put(r, tsub(tdd(2.0), tscale(c.v, p2(c.k))), 0, f, false);
             }
             return;
@@ -2485,17 +2553,11 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
             ld.from_f64(r, 0, f);
             return;
         }
-        if a.h < 2.0 {
+        if a.h < 0.5 {
             put(r, tsub(tdd(1.0), erf_series(a)), 0, f, false);
             return;
         }
-        if (a.h < 4.0) and (f == ld.FMT_X) {
-            // (1 - erf loses up to 26 bits: the x87's 64 bits keep within
-            // 2^-110 of the result, binary128's would not)
-            put(r, tsub(tdd(1.0), erf_pos(a)), 0, f, false);
-            return;
-        }
-        let c = erfc_cf(a);
+        let c = erfc_q(a);
         td_to_ld(r, c.v, c.k, f);
         check_range(r, f);
         return;
@@ -2586,4 +2648,28 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
     if s.h > 0.0 {
         ld.negate(r, r, f);
     }
+}
+
+// -----------------------------------------------------------------------------
+// The binary128 functions for the decimal functions' binary path (dfp_fast.ax)
+// -----------------------------------------------------------------------------
+
+/// __axc_ld1 in binary128.
+pub fn bq1(op: u64, r: *mut ld.W, x: *ld.W) void {
+    __axc_ld1(op, 0, r, x);
+}
+
+/// __axc_ld2 in binary128.
+pub fn bq2(op: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
+    __axc_ld2(op, 0, r, x, y);
+}
+
+/// __axc_ld23 in binary128.
+pub fn bq23(op: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
+    __axc_ld23(op, 0, r, x, y);
+}
+
+/// __axc_ld_sf in binary128.
+pub fn bqsf(op: u64, r: *mut ld.W, x: *ld.W) void {
+    __axc_ld_sf(op, 0, r, x);
 }

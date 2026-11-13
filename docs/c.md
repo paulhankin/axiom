@@ -846,8 +846,10 @@ C23's `_Decimal32`, `_Decimal64` and `_Decimal128` (`__STDC_IEC_60559_DFP__` is
 encoded in BID (binary integer decimal), the encoding the C ABIs of x86-64 and AArch64
 specify: 4, 8 and 16 bytes, aligned to their sizes. Their arithmetic is software of the
 compiler's (`std/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
-`_Decimal64`'s `+` and `*` in 64-bit integers where the exact result's coefficient fits
-128 bits and its exponent is far from the format's limits):
+`_Decimal64`'s `+`, `*` and `/` in 64- and 128-bit integers, `_Decimal128`'s `+`, `-`, `*`
+and `/` in 128- and 256-bit integers (Knuth's Algorithm D for the quotients), where the
+result's exponent is far from the format's limits; elsewhere the general code, whose
+results and flags these paths give bit for bit in every direction):
 
 - **Constants** (`1.20df`, `1.2E+3dd`, `5.dl`; C23 only, not hexadecimal: `C1019`) are
   rounded once to the type (to nearest), with the quantum they are written with:
@@ -887,7 +889,19 @@ compiler's (`std/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
   compute in decimal arithmetic of the format's precision and 12 more digits (and as
   many as cancellation needs; trigonometric arguments reduced exactly, up to 10^6145)
   and round once: within 1 ulp (measured against mpmath, a few hundred arguments of
-  every magnitude per function and format: the largest error 0.500 ulp). An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
+  every magnitude per function and format: the largest error 0.500 ulp). For
+  `_Decimal32` and `_Decimal64` they first take a binary path (`std/c/rt/dfp_fast.ax`):
+  the argument converted to binary128 (within 2^-111, by a table of the powers of ten,
+  `std/c/rt/dfp_tables.ax`), the binary128 function (`math_ld.ax`), and the result
+  converted back with a rounding test that allows for the error of both and the
+  function's condition number at the argument; where the test cannot decide, or the
+  result may be exact (it then needs its preferred quantum), or the argument or the
+  result is out of the ranges that path takes, the decimal computation does. So these
+  results are correctly rounded in every direction (checked against mpmath on 760,000
+  results, 38 functions, both formats, the five directions: the only differences from
+  the decimal computation were 270 results of tiny arguments in directed modes that it
+  rounded wrong, which this path rounds correctly), and the flags are those of the
+  decimal computation. An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
   `expd64(0)` is `1`, `powd64(2.0dd, 10)` is `1024.0000000000`, `atan2pid64(1, -1)` is
   `0.75`, `exp2d64(-3.0dd)` `0.125`, `tanpid64(0.25dd)` `1`, `powd64(2.25dd, 0.5dd)` `1.5`,
   `compoundnd64(0.1dd, 2)` `1.21`: the exact values of the `pi` functions, `exp2`,
@@ -908,11 +922,12 @@ compiler's (`std/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
   `FE_DEC_TONEAREST`, `FE_DEC_TONEARESTFROMZERO`, `FE_DEC_TOWARDZERO`, `FE_DEC_UPWARD`,
   `fe_dec_getround` and `fe_dec_setround`, and `fenv_t` and `femode_t` hold the decimal
   direction too.
-- **Speed** (x86-64, `-O2`): an operation is a call of the software, about 200 ns for a
-  `_Decimal64` multiplication or addition, 600 ns for a `_Decimal128` division; an
-  elementary function tens of microseconds (`expd64` about 50 us), a trigonometric one
-  of an argument beyond 10^17 milliseconds (the exact reduction). Speed was not this
-  implementation's aim.
+- **Speed** (x86-64, `-O2`): an operation is a call of the software, about 100 ns for a
+  `_Decimal64` multiplication, addition or division, 75 to 200 ns for `_Decimal128`'s
+  (were 350 to 630); an elementary function of `_Decimal32` or `_Decimal64` about 0.5 to
+  1 us (were 40 to 140 us), of `_Decimal128` tens of microseconds (the decimal
+  computation: binary128 does not hold its 34 digits with a margin), a trigonometric one
+  of an argument beyond 10^17 milliseconds (the exact reduction).
 
 ### Standard input/output: `<stdio.h>`
 
@@ -1150,18 +1165,29 @@ functions are C (`std/c/lib/math/`).
   from the format's bits taken apart exactly, with tables of triple-doubles and an exact
   reduction of the trigonometric arguments over the whole exponent range, and round once
   (`std/c/rt/math_ld.ax`): within 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's
-  (measured: 0.500 for each, both formats). They take about 0.3 to 3 us a call (x86-64,
-  x87 format), 3 to 80 times the x87 hardware's functions of the system library (most
-  5 to 20 times). The complex `l` functions are the double ones' methods on these (each part within
-  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 2 and the
-  series of positive terms times e^-x^2 from 2 to 6, by Horner's rule on tables of
-  their coefficients; the continued fraction above, its deeper levels in
-  double-double), `lgammal` and `tgammal` (Stirling's series from 24 up, the
+  (measured: 0.500 for each, both formats). An integer power `powl(x, n)` whose exact
+  value fits 128 bits is computed exactly and rounded once (so `x * x`'s halfway cases
+  round to even). For the x87 format these functions (and the four below) first take a
+  double-double path (`std/c/rt/math_ldx.ax`: the same methods with fewer terms, the
+  `asin` and `acos` kernel from Taylor polynomials about j/32, within 2^-84 to 2^-98)
+  with Ziv's rounding test: where it cannot decide the 64-bit result (about once in
+  2^20 calls, and at exact halfway results) the triple-double path does, so the results
+  are the same bits. Speed (x86-64, `-O2`, against the x87 hardware's functions of the
+  system library): `sinl`, `cosl`, `tanl`, `powl`, `tgammal` 0.4 to 0.8 times their time,
+  most others 1.3 to 3.4 (`expl` 1.9, `logl` 3.4, `atanl` 2.2), `asinl` 4.5 and
+  `lgammal` 3.9; binary128's (triple-double only) take 0.2 to 1.2 times the system
+  library's `_Float128` functions (most 0.3 to 0.7). The complex `l` functions are the
+  double ones' methods on these (each part within
+  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 1/2, by
+  Horner's rule on a table of its coefficients; above, `erfc x = e^-x^2 erfcx(x)` with
+  `erfcx` from Taylor polynomials of degree 31 about the middles of 64 pieces of
+  [1/2, 128), whose coefficients `cmd/internal/tools/gen_math_tables.py` computes from
+  `erfcx`'s differential equation), `lgammal` and `tgammal` (Stirling's series from 24 up, the
   Taylor series of `lgamma(2 + z)` and the recurrence below, the reflection for negative
   arguments, with the Taylor series about each zero of `lgamma` in (-34, -2) where the
   reflection cancels) compute in triple-double too: within 0.55 ulp of binary128 and
   0.5 + 2^-6 of the x87's (measured on 900 arguments each, near the zeros of `lgamma`
-  included); 3 to 5 us a call. `_Float128`'s `erff128` ... `tgammaf128` are the same.
+  included). `_Float128`'s `erff128` ... `tgammaf128` are the same.
 - **Errors** (7.12.1): `math_errhandling` is `MATH_ERRNO | MATH_ERREXCEPT` on x86-64 and
   AArch64 and `MATH_ERRNO` on WebAssembly. A domain error sets `errno` to `EDOM` and raises
   "invalid"; a pole error `ERANGE` and "divide-by-zero"; an overflow `ERANGE` and

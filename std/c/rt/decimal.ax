@@ -288,14 +288,9 @@ pub fn divsm2(a: *mut U2, m: u64) u64 {
     return r;
 }
 
-// 10^n as a 128-bit integer (n <= 38).
+// 10^n as a 128-bit integer (n <= 38): from the 64-bit powers (P10_64).
 pub fn p10u2(n: i32) U2 {
-    let mut x = u2(0, 1);
-    for i in 0..n {
-        _ = i;
-        x = mulsm2(x, 10, 0);
-    }
-    return x;
+    return p10_2(n);
 }
 
 // -----------------------------------------------------------------------------
@@ -1367,10 +1362,451 @@ fn fast_mul(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) Fast {
     return fast_finish2(x.neg != y.neg, pr, x.q + y.q, f, c);
 }
 
+// 10^k as a 128-bit integer (k <= 38).
+inline fn p10_2(k: i32) U2 {
+    if k <= 19 {
+        return u2(0, P10_64[@as(usize, @bit_cast(u32, k))]);
+    }
+    return mul_64(P10_64[19], P10_64[@as(usize, @bit_cast(u32, k - 19))]);
+}
+
+// The number of decimal digits of x (x < 10^38; 0 for 0): from its bit
+// length (floor((bits - 1) log10 2) + 1 or one more).
+fn ndig2(x: U2) i32 {
+    let bl = bitlen2(x);
+    if bl == 0 {
+        return 0;
+    }
+    let n = (((bl - 1) * 1233) >> 12) + 1;
+    if (n <= 38) and not lt2(x, p10_2(n)) {
+        return n + 1;
+    }
+    return n;
+}
+
+// The quotient of (h:l) by d (h < d, d > 0) and the remainder: Knuth's
+// Algorithm D for two 32-bit digits of quotient (D. E. Knuth, TAOCP 2,
+// 4.3.1; H. S. Warren, "Hacker's Delight", 9-4).
+fn div2by1(h: u64, l: u64, d: u64) [2]u64 {
+    let s = @as(u32, @truncate(u32, @clz(d)));
+    let dn = d << s;
+    let mut un32 = h << s;
+    if s != 0 {
+        un32 = un32 | (l >> (64 - s));
+    }
+    let un10 = l << s;
+    let vn1 = dn >> 32;
+    let vn0 = dn & 0xFFFF_FFFF;
+    let un1 = un10 >> 32;
+    let un0 = un10 & 0xFFFF_FFFF;
+    let mut q1 = un32 / vn1;
+    let mut rhat = un32 - (q1 * vn1);
+    while (q1 >= 0x1_0000_0000) or ((q1 * vn0) > ((rhat << 32) + un1)) {
+        q1 -= 1;
+        rhat += vn1;
+        if rhat >= 0x1_0000_0000 {
+            break;
+        }
+    }
+    let un21 = ((un32 << 32) +% un1) -% (q1 *% dn);
+    let mut q0 = un21 / vn1;
+    rhat = un21 - (q0 * vn1);
+    while (q0 >= 0x1_0000_0000) or ((q0 * vn0) > ((rhat << 32) + un0)) {
+        q0 -= 1;
+        rhat += vn1;
+        if rhat >= 0x1_0000_0000 {
+            break;
+        }
+    }
+    let r = (((un21 << 32) +% un0) -% (q0 *% dn)) >> s;
+    return [(q1 << 32) + q0, r];
+}
+
+// (-1)^neg n 10^q (n < 10^38 exact, plus less than a unit more if sticky),
+// rounded to format f as finish does (preferred exponent pref when exact):
+// ok false where the result's exponent comes near the format's limits.
+fn fast_finish_x(neg: bool, n: U2, q: i32, sticky: bool, pref: i32, f: u32, c: *mut Ctx) Fast {
+    let p = prec(f);
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let mg = (2 * p) + 8;
+    if (q < (qmin(f) + mg)) or (q > (qmax(f) - mg)) or is0(n) {
+        return no;
+    }
+    let nd = ndig2(n);
+    if not sticky {
+        // exact: the exponents that represent it, the one nearest pref
+        let mut tz: i32 = 0;
+        let mut t = n;
+        while tz < nd {
+            let mut u = t;
+            if divsm2(&mut u, 10) != 0 {
+                break;
+            }
+            t = u;
+            tz += 1;
+        }
+        let elo = q + (nd - p);
+        let ehi = q + tz;
+        if elo <= ehi {
+            let e = @max(elo, @min(ehi, pref));
+            let mut v = n;
+            if e > q {
+                v = t;
+                let mut k = tz - (e - q);
+                while k > 0 {
+                    v = mulsm2(v, 10, 0);
+                    k -= 1;
+                }
+            } else {
+                let mut k = q - e;
+                while k > 0 {
+                    v = mulsm2(v, 10, 0);
+                    k -= 1;
+                }
+            }
+            return Fast.{ ok: true, w: pack(neg, v, e, f) };
+        }
+    }
+    if nd <= p {
+        // (sticky with p digits or fewer: the caller's quotient has more)
+        return no;
+    }
+    // drop k = nd - p digits (at most 38): the first of them, and the rest
+    let k = nd - p;
+    let mut t = n;
+    let mut rest = sticky;
+    let mut left = k - 1;
+    while left > 0 {
+        let s = @min(left, 9);
+        if divsm2(&mut t, P10_64[@as(usize, @bit_cast(u32, s))]) != 0 {
+            rest = true;
+        }
+        left -= s;
+    }
+    let dg = @truncate(u32, divsm2(&mut t, 10));
+    let mut e = q + k;
+    let odd = (t.l & 1) != 0;
+    if rounds_up(c.mode, neg, odd, dg, rest) {
+        t = add2(t, u2(0, 1));
+        if eq2(t, p10_2(p)) {
+            t = p10_2(p - 1);
+            e += 1;
+        }
+    }
+    if (dg != 0) or rest {
+        c.flags = c.flags | F_INEXACT;
+    }
+    return Fast.{ ok: true, w: pack(neg, t, e, f) };
+}
+
+// A finite canonical value of any format as (neg, c, q), ok false for an
+// infinity, a NaN, a zero or a non-canonical coefficient.
+struct Fin2 {
+    ok: bool,
+    neg: bool,
+    q: i32,
+    c: U2,
+}
+
+inline fn fin2_of(w: ld.W, f: u32) Fin2 {
+    if f != D128 {
+        let x = fin_of(w, f);
+        return Fin2.{ ok: x.ok and (x.c != 0), neg: x.neg, q: x.q, c: u2(0, x.c) };
+    }
+    let x = unpack(w, f);
+    if (x.cls != K_FIN) or is0(x.c) {
+        return Fin2.{ ok: false, neg: x.neg, q: 0, c: x.c };
+    }
+    return Fin2.{ ok: true, neg: x.neg, q: x.q, c: x.c };
+}
+
+// decimal128's x + y when x's coefficient on the lesser exponent fits 38
+// digits.
+fn fast_add128(xw: ld.W, yw: ld.W, sub: bool, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let mut x = fin2_of(xw, D128);
+    let mut y = fin2_of(yw, D128);
+    if not (x.ok and y.ok) {
+        return no;
+    }
+    if sub {
+        y.neg = not y.neg;
+    }
+    if x.q < y.q {
+        let t = x;
+        x = y;
+        y = t;
+    }
+    let dq = x.q - y.q;
+    if (dq > 38) or ((ndig2(x.c) + dq) > 38) {
+        return no;
+    }
+    let mut a = x.c;
+    let mut k = dq;
+    while k > 0 {
+        let s = @min(k, 9);
+        a = mulsm2(a, P10_64[@as(usize, @bit_cast(u32, s))], 0);
+        k -= s;
+    }
+    if x.neg == y.neg {
+        return fast_finish_x(x.neg, add2(a, y.c), y.q, false, y.q, D128, c);
+    }
+    if eq2(a, y.c) {
+        return Fast.{ ok: true, w: zero(c.mode == R_DOWN, y.q, D128) };
+    }
+    if lt2(y.c, a) {
+        return fast_finish_x(x.neg, sub2(a, y.c), y.q, false, y.q, D128, c);
+    }
+    return fast_finish_x(y.neg, sub2(y.c, a), y.q, false, y.q, D128, c);
+}
+
+// A 256-bit integer, r[0] the low word, divided by m < 2^32: the remainder.
+fn div4s(r: *mut [4]u64, m: u64) u64 {
+    let mut rm: u64 = 0;
+    let mut i: usize = 4;
+    while i > 0 {
+        i -= 1;
+        let hi = (rm << 32) | (r[i] >> 32);
+        let qh = hi / m;
+        rm = hi - (qh * m);
+        let lo = (rm << 32) | (r[i] & 0xFFFF_FFFF);
+        let ql = lo / m;
+        rm = lo - (ql * m);
+        r[i] = (qh << 32) | ql;
+    }
+    return rm;
+}
+
+// r * m (m < 2^32; the product below 2^256).
+fn mul4s(r: *mut [4]u64, m: u64) void {
+    let mut carry: u64 = 0;
+    for i in @as(usize, 0)..4 {
+        let lo = ((r[i] & 0xFFFF_FFFF) * m) + carry;
+        let hi = ((r[i] >> 32) * m) + (lo >> 32);
+        r[i] = (hi << 32) | (lo & 0xFFFF_FFFF);
+        carry = hi >> 32;
+    }
+}
+
+// (-1)^neg r 10^q (r < 2^256, plus less than a unit if sticky) rounded to
+// decimal128 as finish does: r's low digits dropped into the sticky part
+// (by 10^9, then by 10) until it is below 10^38 (it keeps more than 34
+// digits, so fast_finish_x still sees the first digit it drops).
+fn fast_finish4(neg: bool, r0: [4]u64, q: i32, sticky: bool, pref: i32, c: *mut Ctx) Fast {
+    let mut r = r0;
+    let mut e = q;
+    let mut st = sticky;
+    while (r[3] != 0) or (r[2] >= 0x1000_0000) {
+        if div4s(&mut r, 1000000000) != 0 {
+            st = true;
+        }
+        e += 9;
+    }
+    while (r[2] != 0) or not lt2(u2(r[1], r[0]), p10_2(38)) {
+        if div4s(&mut r, 10) != 0 {
+            st = true;
+        }
+        e += 1;
+    }
+    return fast_finish_x(neg, u2(r[1], r[0]), e, st, pref, D128, c);
+}
+
+// decimal128's x * y: the 256-bit product of the coefficients.
+fn fast_mul128w(xw: ld.W, yw: ld.W, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let x = fin2_of(xw, D128);
+    let y = fin2_of(yw, D128);
+    if not (x.ok and y.ok) {
+        return no;
+    }
+    let ll = mul_64(x.c.l, y.c.l);
+    let lh = mul_64(x.c.l, y.c.h);
+    let hl = mul_64(x.c.h, y.c.l);
+    let hh = mul_64(x.c.h, y.c.h);
+    let mut r: [4]u64 = [ll.l, 0, 0, 0];
+    let s1 = ll.h +% lh.l;
+    let c1 = @as(u64, s1 < ll.h);
+    let s2 = s1 +% hl.l;
+    let c2 = @as(u64, s2 < s1);
+    r[1] = s2;
+    let t1 = lh.h +% hl.h;
+    let c3 = @as(u64, t1 < lh.h);
+    let t2 = t1 +% hh.l;
+    let c4 = @as(u64, t2 < t1);
+    let t3 = t2 +% (c1 + c2);
+    let c5 = @as(u64, t3 < t2);
+    r[2] = t3;
+    r[3] = hh.h +% ((c3 + c4) + c5);
+    return fast_finish4(x.neg != y.neg, r, x.q + y.q, false, x.q + y.q, c);
+}
+
+// The quotient and remainder of a 256-bit u (u's top 128 bits below v) by a
+// 128-bit v (v.h != 0): Knuth's Algorithm D (TAOCP 2, 4.3.1) in 64-bit
+// digits, two of quotient.
+fn div4by2(u0: [4]u64, v0: U2) [4]u64 {
+    let s = @as(u32, @truncate(u32, @clz(v0.h)));
+    let v = shl2(v0, s);
+    let mut u: [5]u64 = [0, 0, 0, 0, 0];
+    if s == 0 {
+        u = [u0[0], u0[1], u0[2], u0[3], 0];
+    } else {
+        u[0] = u0[0] << s;
+        u[1] = (u0[1] << s) | (u0[0] >> (64 - s));
+        u[2] = (u0[2] << s) | (u0[1] >> (64 - s));
+        u[3] = (u0[3] << s) | (u0[2] >> (64 - s));
+        u[4] = u0[3] >> (64 - s);
+    }
+    let mut qd: [2]u64 = [0, 0];
+    let mut j: usize = 2;
+    while j > 0 {
+        j -= 1;
+        // the estimate from the top two digits, corrected (at most twice)
+        let mut qhat: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        let mut rhat: u64 = 0;
+        let mut rbig = false;
+        if u[j + 2] < v.h {
+            let qr = div2by1(u[j + 2], u[j + 1], v.h);
+            qhat = qr[0];
+            rhat = qr[1];
+        } else {
+            // (qhat = 2^64 - 1: rhat = u[j+2]:u[j+1] - qhat v.h)
+            rhat = u[j + 1] +% v.h;
+            rbig = rhat < v.h;
+        }
+        while not rbig {
+            let pr = mul_64(qhat, v.l);
+            if lt2(u2(rhat, u[j]), pr) {
+                qhat -= 1;
+                let nr = rhat +% v.h;
+                rbig = nr < rhat;
+                rhat = nr;
+            } else {
+                break;
+            }
+        }
+        // u[j..j+3] -= qhat v
+        let p0 = mul_64(qhat, v.l);
+        let p1 = mul_64(qhat, v.h);
+        let m0 = p0.l;
+        let m1 = p0.h +% p1.l;
+        let mc = @as(u64, m1 < p0.h);
+        let m2 = p1.h +% mc;
+        let d0 = u[j] -% m0;
+        let b0 = @as(u64, u[j] < m0);
+        let d1a = u[j + 1] -% m1;
+        let b1a = @as(u64, u[j + 1] < m1);
+        let d1 = d1a -% b0;
+        let b1 = b1a | @as(u64, d1a < b0);
+        let d2a = u[j + 2] -% m2;
+        let b2a = @as(u64, u[j + 2] < m2);
+        let d2 = d2a -% b1;
+        let b2 = b2a | @as(u64, d2a < b1);
+        u[j] = d0;
+        u[j + 1] = d1;
+        u[j + 2] = d2;
+        if b2 != 0 {
+            // (one too many: add v back)
+            qhat -= 1;
+            let a0 = u[j] +% v.l;
+            let ca = @as(u64, a0 < u[j]);
+            let a1 = (u[j + 1] +% v.h) +% ca;
+            let cb = @as(u64, (a1 < u[j + 1]) or ((ca != 0) and (a1 == u[j + 1])));
+            u[j] = a0;
+            u[j + 1] = a1;
+            u[j + 2] = u[j + 2] +% cb;
+        }
+        qd[j] = qhat;
+    }
+    // the remainder (u[1]:u[0]) shifted back
+    let mut rl = u[0];
+    let mut rh = u[1];
+    if s != 0 {
+        rl = (u[0] >> s) | (u[1] << (64 - s));
+        rh = u[1] >> s;
+    }
+    return [qd[0], qd[1], rl, rh];
+}
+
+// decimal128's x / y: x's coefficient times 10^k (a quotient of at least 35
+// digits) in 256 bits, divided by y's.
+fn fast_div128(xw: ld.W, yw: ld.W, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let x = fin2_of(xw, D128);
+    let y = fin2_of(yw, D128);
+    if not (x.ok and y.ok) {
+        return no;
+    }
+    let nx = ndig2(x.c);
+    let ny = ndig2(y.c);
+    let k = @max(1, (35 + ny) - nx);
+    let mut a: [4]u64 = [x.c.l, x.c.h, 0, 0];
+    let mut kk = k;
+    while kk > 0 {
+        let st = @min(kk, 9);
+        mul4s(&mut a, P10_64[@as(usize, @bit_cast(u32, st))]);
+        kk -= st;
+    }
+    let pref = x.q - y.q;
+    if y.c.h == 0 {
+        // a 64-bit divisor: the quotient digit by digit (a below 10^71)
+        let mut r: u64 = 0;
+        let mut q4: [4]u64 = [0, 0, 0, 0];
+        let mut i: usize = 4;
+        while i > 0 {
+            i -= 1;
+            let qr = div2by1(r, a[i], y.c.l);
+            q4[i] = qr[0];
+            r = qr[1];
+        }
+        return fast_finish4(x.neg != y.neg, q4, pref - k, r != 0, pref, c);
+    }
+    if not lt2(u2(a[3], a[2]), y.c) {
+        return no;
+    }
+    let qr = div4by2(a, y.c);
+    return fast_finish4(x.neg != y.neg, [qr[0], qr[1], 0, 0], pref - k, (qr[2] | qr[3]) != 0, pref, c);
+}
+
+// x / y of decimal32 and decimal64: the quotient of x's coefficient times 10^k by y's
+// (at least p + 1 digits) in 128 bits by 64, as divf does.
+fn fast_div(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) Fast {
+    let no = Fast.{ ok: false, w: ld.W.{ lo: 0, hi: 0 } };
+    let x = fin2_of(xw, f);
+    let y = fin2_of(yw, f);
+    if not (x.ok and y.ok) or (x.c.h != 0) or (y.c.h != 0) {
+        return no;
+    }
+    let p = prec(f);
+    let nx = digits64(x.c.l);
+    let ny = digits64(y.c.l);
+    let k = @max(1, ((p + 1) + ny) - nx);
+    if (nx + k) > 37 {
+        return no;
+    }
+    // a = x.c 10^k (below 10^37)
+    let mut a = mul_64(x.c.l, P10_64[@as(usize, @bit_cast(u32, @min(k, 19)))]);
+    if k > 19 {
+        let m2 = P10_64[@as(usize, @bit_cast(u32, k - 19))];
+        let lo = mul_64(a.l, m2);
+        a = u2(lo.h +% (a.h *% m2), lo.l);
+    }
+    if a.h >= y.c.l {
+        return no;  // (a quotient beyond 64 bits)
+    }
+    let qr = div2by1(a.h, a.l, y.c.l);
+    let pref = x.q - y.q;
+    return fast_finish_x(x.neg != y.neg, u2(0, qr[0]), pref - k, qr[1] != 0, pref, f, c);
+}
+
 /// x + y (sub: x - y) of format fi, rounded to format f.
 pub fn addf(xw: ld.W, yw: ld.W, sub: bool, fi: u32, f: u32, c: *mut Ctx) ld.W {
     if (fi == f) and (f != D128) {
         let r = fast_add(xw, yw, sub, f, c);
+        if r.ok {
+            return r.w;
+        }
+    } else if (fi == f) and (f == D128) {
+        let r = fast_add128(xw, yw, sub, c);
         if r.ok {
             return r.w;
         }
@@ -1413,6 +1849,11 @@ pub fn mulf(xw: ld.W, yw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
         if r.ok {
             return r.w;
         }
+    } else if (fi == f) and (f == D128) {
+        let r = fast_mul128w(xw, yw, c);
+        if r.ok {
+            return r.w;
+        }
     }
     let x = unpack(xw, fi);
     let y = unpack(yw, fi);
@@ -1445,6 +1886,17 @@ pub fn div(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) ld.W {
 
 /// x / y of format fi, rounded to format f.
 pub fn divf(xw: ld.W, yw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    if (fi == f) and (f != D128) {
+        let r = fast_div(xw, yw, f, c);
+        if r.ok {
+            return r.w;
+        }
+    } else if (fi == f) and (f == D128) {
+        let r = fast_div128(xw, yw, c);
+        if r.ok {
+            return r.w;
+        }
+    }
     let x = unpack(xw, fi);
     let y = unpack(yw, fi);
     if is_nan(x) or is_nan(y) {

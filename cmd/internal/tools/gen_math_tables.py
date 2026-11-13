@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generates std/internal/math/tables.ax: the tables and polynomial coefficients
 of the elementary functions of std/math and the C library (std/internal/math/),
-and std/c/rt/math_ld_tables.ax, those of the C library's wide long double
-functions (math_ld.ax).
+std/c/rt/math_ld_tables.ax, those of the C library's wide long double
+functions (math_ld.ax, math_ldx.ax), and std/c/rt/dfp_tables.ax, the powers
+of ten of the decimal functions' binary path (dfp_fast.ax).
 
     python3 cmd/internal/tools/gen_math_tables.py      # needs mpmath
 
@@ -715,6 +716,18 @@ with mp.workprec(800):
     for i, v in enumerate(parts):
         emit('pub const LN2_S%d: f64 = %s;' % (i, lit(v)))
     emit('pub const INVLN2_64: f64 = %s;' % lit(d(64 / mp.log(2))))
+    # pi/2 in parts of 30 bits and a last double (k times each of the first
+    # three is exact for |k| < 2^23), for the x87 format's reduction
+    rest = mp.pi / 2
+    parts = []
+    for _ in range(3):
+        v = split_hi(rest, 30)
+        parts.append(v)
+        rest -= mp.mpf(v)
+    parts.append(d(rest))
+    emit('// pi/2 = PIO2_30_0 + ... + PIO2_30_3, the first three of 30 bits')
+    for i, v in enumerate(parts):
+        emit('pub const PIO2_30_%d: f64 = %s;' % (i, lit(v)))
     emit()
     tab = []
     for j in range(64):
@@ -759,13 +772,6 @@ with mp.workprec(800):
     for n in range(0, 81):
         tab += [bits(v) for v in td(mp.mpf((-1) ** n) / (mp.factorial(n) * (2 * n + 1)))]
     u64_array('ERF_A', tab, '(-1)^n / (n! (2n + 1)), n = 0 .. 80: erf a = 2/sqrt(pi) a sum of these a^(2n) (A&S 7.1.5)')
-    tab = []
-    dfac = mp.mpf(1)
-    for n in range(0, 201):
-        dfac *= 2 * n + 1
-        tab += [bits(v) for v in td(mp.mpf(2) ** n / dfac)]
-    u64_array('ERF_P', tab, '2^n / (1 3 5 ... (2n + 1)), n = 0 .. 200: erf a = 2/sqrt(pi) a e^(-a^2) sum of these '
-              'a^(2n) (A&S 7.1.6: positive terms)')
     # the zeros x0 of lgamma in (-(n+1), -n), n = 2 .. 33 (two each: the one
     # nearer -(n+1), then the one nearer -n), to about 2^-300 (two
     # triple-doubles: x0 and what is left), with the Taylor coefficients
@@ -801,6 +807,64 @@ with mp.workprec(800):
             tab += [bits(v) for v in row]
     u64_array('LGZERO', tab, 'the zeros of lgamma in (-(n+1), -n), n = 2 .. 33, two each (the one nearer -(n+1) first): '
               'x0 (two triple-doubles), then psi^(j-1)(x0) / j!, j = 1 .. 16 (18 triple-doubles a row)')
+# the x87 format's double-double paths (math_ldx.ax): Taylor polynomials of
+# degree 23 about the middles c of pieces, each coefficient a double-double.
+# erfcx(x) = e^(x^2) erfc(x) on [1/2, 128): 8 pieces a binade, c = 2^e (1 +
+# (k + 1/2)/8), |x - c| <= 2^e/16; its derivatives from erfcx' = 2x erfcx -
+# 2/sqrt(pi): (n + 1) b_(n+1) = 2c b_n + 2 b_(n-1) (the recurrence loses bits
+# forward, which the working precision covers); the terms after the 23rd are
+# below 2^-96 of the value on every piece.
+with mp.workprec(1500):
+    tab = []
+    for e in range(-1, 7):
+        for k in range(8):
+            c = mp.mpf(2) ** e * (1 + (mp.mpf(k) + mp.mpf('0.5')) / 8)
+            y0 = mp.exp(c * c) * mp.erfc(c)
+            b = [y0, 2 * c * y0 - 2 / mp.sqrt(mp.pi)]
+            for n in range(1, 23):
+                b.append((2 * c * b[n] + 2 * b[n - 1]) / (n + 1))
+            tab += [bits(v) for co in b[:24] for v in ddv(co)]
+    u64_array('ERFCX_T', tab, 'erfcx(c + t) = sum b_n t^n, n = 0 .. 23, for x in [2^e, 2^(e + 1)), e = -1 .. 6, '
+              'in eighths k: c = 2^e (1 + (k + 1/2)/8), row (e + 1) 8 + k (pairs)')
+    # the same to degree 31 in triple-doubles, for binary128 (math_ld.ax:
+    # the terms after the 31st below 2^-124)
+    tab = []
+    for e in range(-1, 7):
+        for k in range(8):
+            c = mp.mpf(2) ** e * (1 + (mp.mpf(k) + mp.mpf('0.5')) / 8)
+            y0 = mp.exp(c * c) * mp.erfc(c)
+            b = [y0, 2 * c * y0 - 2 / mp.sqrt(mp.pi)]
+            for n in range(1, 31):
+                b.append((2 * c * b[n] + 2 * b[n - 1]) / (n + 1))
+            tab += [bits(v) for co in b[:32] for v in td(co)]
+    u64_array('ERFCX_Q', tab, 'erfcx(c + t) = sum b_n t^n, n = 0 .. 31, the pieces of ERFCX_T (triple-doubles)')
+# lgamma(c + t) = sum b_n t^n, n = 0 .. 23 (b_n = psi^(n-1)(c)/n!), c = 3/2 + j/8,
+# j = 0 .. 8, |t| <= 1/16 (lgamma(2) = 0: the piece about 2 keeps the relative
+# precision near that zero); the terms after the 23rd below 2^-96
+with mp.workprec(400):
+    tab = []
+    for j in range(9):
+        c = mp.mpf(3) / 2 + mp.mpf(j) / 8
+        b = [mp.mpf(0) if j == 4 else mp.loggamma(c)]
+        b += [mp.polygamma(n - 1, c) / mp.factorial(n) for n in range(1, 24)]
+        tab += [bits(v) for co in b for v in ddv(co)]
+    u64_array('LGK_T', tab, 'lgamma(c + t) = sum b_n t^n, n = 0 .. 23, c = 3/2 + j/8, j = 0 .. 8 (pairs)')
+# asin(c + t) = sum b_n t^n, n = 0 .. 23, c = j/32, j = 0 .. 24, |t| <= 1/64
+# (asin' = g = u^(-1/2), u = 1 - (c + t)^2 = a0 + a1 t - t^2: u g' = -u' g/2
+# gives g's coefficients; the radius of convergence is 1 - c >= 1/4, so the
+# terms after the 23rd are below 2^-96)
+with mp.workprec(600):
+    tab = []
+    for j in range(25):
+        c = mp.mpf(j) / 32
+        a0, a1, a2 = 1 - c * c, -2 * c, mp.mpf(-1)
+        g = [1 / mp.sqrt(a0)]
+        for n in range(0, 23):
+            gm = g[n - 1] if n >= 1 else 0
+            g.append((-(a1 * g[n] + 2 * a2 * gm) / 2 - a1 * n * g[n] - a2 * (n - 1) * gm) / (a0 * (n + 1)))
+        b = [mp.asin(c)] + [g[n] / (n + 1) for n in range(23)]
+        tab += [bits(v) for co in b for v in ddv(co)]
+    u64_array('ASIN_T', tab, 'asin(c + t) = sum b_n t^n, n = 0 .. 23, c = j/32, j = 0 .. 24 (pairs)')
 # 2/pi for the reduction of any binary128 (exponent up to 16383): 16896 bits
 with mp.workprec(17500):
     v = 2 / mp.pi
@@ -816,3 +880,34 @@ OUT2 = os.path.join(ROOT, 'std', 'c', 'rt', 'math_ld_tables.ax')
 with open(OUT2, 'w') as f:
     f.write('\n'.join(out).rstrip('\n') + '\n')
 print('wrote', OUT2)
+
+# =============================================================================
+# std/c/rt/dfp_tables.ax: the powers of ten of the decimal functions' binary
+# path (dfp_fast.ax): 10^q = M 2^(E - 127), M a 128-bit integer in [2^127,
+# 2^128) (10^q rounded down to it), for q = -440 .. 440
+# =============================================================================
+out = []
+emit('// =============================================================================')
+emit('// std/c/rt/dfp_tables.ax - generated by cmd/internal/tools/gen_math_tables.py')
+emit('// (do not edit): 10^q = M 2^(E - 127) for q = -440 .. 440, M in [2^127, 2^128)')
+emit('// rounded down, as rows of three u64: M\'s high and low words, then E (two\'s')
+emit('// complement), row q + 440.')
+emit('// =============================================================================')
+emit()
+tab = []
+with mp.workprec(3000):
+    for q in range(-440, 441):
+        v = mp.mpf(10) ** q
+        e = int(mp.floor(mp.log(v, 2)))
+        while mp.mpf(2) ** e > v:
+            e -= 1
+        while mp.mpf(2) ** (e + 1) <= v:
+            e += 1
+        mm = int(mp.floor(v * mp.mpf(2) ** (127 - e)))
+        assert (1 << 127) <= mm < (1 << 128)
+        tab += [mm >> 64, mm & ((1 << 64) - 1), e & ((1 << 64) - 1)]
+u64_array('P10_T', tab, '')
+OUT3 = os.path.join(ROOT, 'std', 'c', 'rt', 'dfp_tables.ax')
+with open(OUT3, 'w') as f:
+    f.write('\n'.join(out).rstrip('\n') + '\n')
+print('wrote', OUT3)
