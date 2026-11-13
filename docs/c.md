@@ -1652,7 +1652,23 @@ other tool is needed:
   is the offset in the module's block. The absolute move-wide groups and `.word`/
   `.hword` of addresses are the ELF linker's only (Mach-O and PE images are
   position-independent). An operator in an instruction it does not fit is an error
-  (where the conventional assembler makes some other relocation of it). Not yet: SVE,
+  (where the conventional assembler makes some other relocation of it). SVE and SVE2
+  (the `z0`-`z31`, `p0`-`p15` and `ffr` registers, the element-size suffixes, `/m` and
+  `/z` predication): the integer arithmetic (predicated and unpredicated, the immediate
+  and by-element forms), the logical, shift, compare, multiply, reduction, permute,
+  move (`dup`, `cpy`-class `mov`, `insr`, `movprfx`), index and bitwise-immediate
+  instructions; the predicate operations (`ptrue`/`ptrues` with every pattern, `pfalse`,
+  `ptest`, `pfirst`, `pnext`, the predicate logical ops, `brk*`, `rdffr`/`wrffr`/`setffr`,
+  the `while*` comparisons, `cntp`); the element counts (`cnt[bhwd]`, `inc*`/`dec*` with
+  their saturating forms, `addvl`/`addpl`/`rdvl`); the floating point (arithmetic,
+  compares, the fused multiply-adds, rounding, the estimates, complex `fcadd`/`fcmla`,
+  and the conversions); and the loads and stores `ldr`/`str` of a `z` or `p` register
+  and the contiguous `ld1`/`st1` (with the sign-extending forms) in the scalar+immediate
+  and scalar+scalar addressing forms. Not yet: the SVE gather/scatter loads and stores,
+  the first-fault and non-fault loads, the structure (`ld2`-`ld4`, `st2`-`st4`) and
+  replicating (`ld1r`, `ld1rq`) loads, the SVE prefetches, and the SVE2 widening,
+  narrowing, saturating, `match`/`nmatch`, histogram, bit-permute, polynomial, complex
+  integer and crypto instructions. Not yet either:
   `@TLVPPAGE`/`@TLVPPAGEOFF` (Mach-O's thread-local descriptors), `:tlsldm:` (local
   dynamic's module base), `:gottprel_g1:`/
   `:gottprel_g0_nc:` and `:tlsdesc_off_*:` at link time (they assemble; the linkers

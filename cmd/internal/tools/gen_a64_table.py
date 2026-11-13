@@ -480,6 +480,243 @@ ln('sm3partw2', 'v0,v5,v16', 0xce60c400, 'C4S')
 ln('sm4ekey', 'v0,v5,v16', 0xce60c800, 'C4S')
 ln('sm4e', 'v0,v5', 0xcec08400, 'C4S')
 
+# ===========================================================================
+# SVE and SVE2 (the Arm ARM's SVE encoding classes). A second table SV, with
+# its element-size sets SVSZ (the size field, bits [23:22], for each element).
+# The operand mini-language (asm/a64.ax skind): z/u sized/unsized Z, p/q
+# sized/unsized P, g/m/e a 3-bit Pg (plain, /m, /z), h/n a 4-bit Pg (plain,
+# /z), w/x/y a W/X/X-or-SP register, r a size-width register, d a Z equal to
+# the destination; the immediate kinds A (pattern) R/L (unpred shift) S/T
+# (predicated shift) B/C (signed imm, +lsl8) U/V (unsigned imm, +lsl8) F (FP8)
+# M (bitmask) I (indexed element) Z (#0.0) O/P (rotations) D<lo>-<hi> (a range).
+# Each token is a kind then its bit position (none for d/A/.. that are fixed).
+# ===========================================================================
+SV = []
+SVSZ = {}
+_SB = {'b': 0, 'h': 1, 's': 2, 'd': 3}
+
+
+def _sz(*els):
+    return ' '.join('%s:%x' % (e, _SB[e] << 22) for e in els)
+
+
+SVSZ['BHSD'] = _sz('b', 'h', 's', 'd')
+SVSZ['HSD'] = _sz('h', 's', 'd')
+SVSZ['BHS'] = _sz('b', 'h', 's')
+SVSZ['SD'] = _sz('s', 'd')
+SVSZ['HS'] = _sz('h', 's')
+SVSZ['B'] = _sz('b')
+SVSZ['H'] = _sz('h')
+SVSZ['S'] = _sz('s')
+SVSZ['D'] = _sz('d')
+# element-size fixed in the opcode: the member sets no bit
+SVSZ['DX'] = 'd:0'
+SVSZ['SX'] = 's:0'
+SVSZ['BX'] = 'b:0'
+
+
+def sv(name, ops, base, sz):
+    SV.append('%s %s %08x %s' % (name, ops, base, sz))
+
+
+# SVE integer add/subtract (vectors, unpredicated): 00000100 size 1 Zm 000 opc Zn Zd
+for name, opc in (('add', 0), ('sub', 1), ('sqadd', 4), ('uqadd', 5), ('sqsub', 6), ('uqsub', 7)):
+    sv(name, 'z0,z5,z16', 0x04200000 | (opc << 10), 'BHSD')
+# the logical ones (unpredicated): element always .d, the two size bits select the op
+for name, bits in (('and', 0), ('orr', 1), ('eor', 2), ('bic', 3)):
+    sv(name, 'z0,z5,z16', 0x04203000 | (bits << 22), 'DX')
+# SVE integer binary arithmetic (predicated): 00000100 size 0 op8 Pg Zdn Zm
+PRED2 = [('add', 0x00, 'BHSD'), ('sub', 0x01, 'BHSD'), ('subr', 0x03, 'BHSD'), ('smax', 0x08, 'BHSD'),
+         ('umax', 0x09, 'BHSD'), ('smin', 0x0a, 'BHSD'), ('umin', 0x0b, 'BHSD'), ('sabd', 0x0c, 'BHSD'),
+         ('uabd', 0x0d, 'BHSD'), ('mul', 0x10, 'BHSD'), ('smulh', 0x12, 'BHSD'), ('umulh', 0x13, 'BHSD'),
+         ('sdiv', 0x14, 'SD'), ('udiv', 0x15, 'SD'), ('sdivr', 0x16, 'SD'), ('udivr', 0x17, 'SD'),
+         ('orr', 0x18, 'BHSD'), ('eor', 0x19, 'BHSD'), ('and', 0x1a, 'BHSD'), ('bic', 0x1b, 'BHSD')]
+for name, op8, sz in PRED2:
+    sv(name, 'z0,m10,d,z5', 0x04000000 | (op8 << 16), sz)
+SVSZ['N'] = ''  # no element size (movprfx of whole registers)
+
+# SVE integer unary (predicated): 00000100 size 1 0 opc(3) 101 Pg Zn Zd
+UN = [('sxtb', 0x0, 'HSD'), ('uxtb', 0x1, 'HSD'), ('sxth', 0x2, 'SD'), ('uxth', 0x3, 'SD'),
+      ('sxtw', 0x4, 'D'), ('uxtw', 0x5, 'D'), ('abs', 0x6, 'BHSD'), ('neg', 0x7, 'BHSD'),
+      ('cls', 0x8, 'BHSD'), ('clz', 0x9, 'BHSD'), ('cnt', 0xa, 'BHSD'), ('cnot', 0xb, 'BHSD'),
+      ('fabs', 0xc, 'HSD'), ('fneg', 0xd, 'HSD'), ('not', 0xe, 'BHSD')]
+for name, opc, sz in UN:
+    sv(name, 'z0,m10,z5', 0x0410a000 | (opc << 16), sz)
+# the byte/halfword/word reverses and bit-reverse: 00000101 size 1 opc 100 Pg Zn Zd
+for name, opc, sz in (('revb', 0x0, 'HSD'), ('revh', 0x1, 'SD'), ('revw', 0x2, 'D'), ('rbit', 0x3, 'BHSD')):
+    sv(name, 'z0,m10,z5', 0x05248000 | (opc << 16), sz)
+
+# MOVPRFX: unpredicated (whole register) and predicated (/m sets bit 16, /z clears)
+sv('movprfx', 'u0,u5', 0x0420bc00, 'N')
+sv('movprfx', 'z0,e10,z5', 0x04102000, 'BHSD')
+sv('movprfx', 'z0,m10,z5', 0x04112000, 'BHSD')
+
+# SVE shifts. The element size is carried in the tsz field, so the size set
+# adds no size bits (TSZ): all of b h s d, no [23:22] contribution.
+SVSZ['TSZ'] = 'b:0 h:0 s:0 d:0'
+# unpredicated by immediate: tszh[23:22]:tszl[20:19]:imm3[18:16]
+sv('asr', 'z0,z5,R', 0x04209000, 'TSZ')
+sv('lsr', 'z0,z5,R', 0x04209400, 'TSZ')
+sv('lsl', 'z0,z5,L', 0x04209c00, 'TSZ')
+# predicated by immediate: tszh[23:22]:tszl[9:8]:imm3[7:5]
+for name, opc in (('asr', 0), ('lsr', 1), ('lsl', 3), ('asrd', 4), ('sqshl', 6), ('uqshl', 7),
+                  ('srshr', 0xc), ('urshr', 0xd), ('sqshlu', 0xf)):
+    k = 'T' if name in ('lsl', 'sqshl', 'uqshl', 'sqshlu') else 'S'
+    sv(name, 'z0,m10,d,' + k, 0x04008000 | (opc << 16), 'TSZ')
+# predicated by vector (destructive): size in [23:22]
+for name, opc in (('asr', 0x0), ('lsr', 0x1), ('lsl', 0x3), ('asrr', 0x4), ('lsrr', 0x5), ('lslr', 0x7)):
+    sv(name, 'z0,m10,d,z5', 0x04108000 | (opc << 16), 'BHSD')
+# predicated by wide element (Zm is .d), destructive; Zdn b/h/s
+for name, opc in (('asr', 0x0), ('lsr', 0x1), ('lsl', 0x3)):
+    sv(name, 'z0,m10,d,c5', 0x04188000 | (opc << 16), 'BHS')
+# unpredicated by wide element (Zn b/h/s, Zm .d)
+for name, opc in (('asr', 0x0), ('lsr', 0x1), ('lsl', 0x3)):
+    sv(name, 'z0,z5,c16', 0x04208000 | (opc << 10), 'BHS')
+
+# SVE integer compares (predicated, result a predicate). Pd[3:0], Pg/z[12:10],
+# Zn[9:5], Zm[20:16]. The same-size vector forms:
+for name, base in (('cmpeq', 0x2400a000), ('cmpne', 0x2400a010), ('cmpge', 0x24008000),
+                   ('cmpgt', 0x24008010), ('cmphi', 0x24000010), ('cmphs', 0x24000000)):
+    sv(name, 'p0,e10,z5,z16', base, 'BHSD')
+# the wide forms (Zm is .d; Zn b/h/s):
+for name, base in (('cmpeq', 0x24002000), ('cmpne', 0x24002010), ('cmpge', 0x24004000),
+                   ('cmpgt', 0x24004010), ('cmphi', 0x2400c010), ('cmphs', 0x2400c000),
+                   ('cmple', 0x24006010), ('cmplt', 0x24006000), ('cmplo', 0x2400e000), ('cmpls', 0x2400e010)):
+    sv(name, 'p0,e10,z5,c16', base, 'BHS')
+# the signed-immediate forms (-16..15 at bit 16):
+for name, base in (('cmpeq', 0x25008000), ('cmpne', 0x25008010), ('cmpge', 0x25000000),
+                   ('cmpgt', 0x25000010), ('cmplt', 0x25002000), ('cmple', 0x25002010)):
+    sv(name, 'p0,e10,z5,K', base, 'BHSD')
+# the unsigned-immediate forms (0..127 at bit 14):
+for name, base in (('cmphi', 0x24200010), ('cmphs', 0x24200000), ('cmplo', 0x24202000), ('cmpls', 0x24202010)):
+    sv(name, 'p0,e10,z5,G', base, 'BHSD')
+
+# SVE integer reductions (predicated): a scalar of T's element size, Pg[12:10],
+# Zn[9:5]. andv/orv/eorv and the min/max; saddv/uaddv widen to a d register.
+for name, base in (('orv', 0x04182000), ('eorv', 0x04192000), ('andv', 0x041a2000), ('smaxv', 0x04082000),
+                   ('sminv', 0x040a2000), ('umaxv', 0x04092000), ('uminv', 0x040b2000)):
+    sv(name, 'v0,g10,z5', base, 'BHSD')
+sv('saddv', 'a0,g10,z5', 0x04002000, 'BHS')
+sv('uaddv', 'a0,g10,z5', 0x04012000, 'BHSD')
+
+# INDEX: start and step from immediates (-16..15) or general registers.
+sv('index', 'z0,i5,i16', 0x04204000, 'BHSD')
+sv('index', 'z0,r5,i16', 0x04204400, 'BHSD')
+sv('index', 'z0,i5,r16', 0x04204800, 'BHSD')
+sv('index', 'z0,r5,r16', 0x04204c00, 'BHSD')
+
+# SVE permutes: zip/uzp/trn on vectors and on predicates, rev of each.
+for name, opc in (('zip1', 0), ('zip2', 1), ('uzp1', 2), ('uzp2', 3), ('trn1', 4), ('trn2', 5)):
+    sv(name, 'z0,z5,z16', 0x05206000 | (opc << 10), 'BHSD')
+    sv(name, 'p0,p5,p16', 0x05204000 | (opc << 10), 'BHSD')
+sv('rev', 'z0,z5', 0x05383800, 'BHSD')
+sv('rev', 'p0,p5', 0x05344000, 'BHSD')
+# SEL (vectors): a 4-bit governing predicate, no qualifier.
+sv('sel', 'z0,h10,z5,z16', 0x0520c000, 'BHSD')
+# SPLICE (destructive), COMPACT (s/d), the vector CLASTA/CLASTB (destructive).
+sv('splice', 'z0,g10,d,z5', 0x052c8000, 'BHSD')
+sv('compact', 'z0,g10,z5', 0x05218000, 'SD')
+sv('clasta', 'z0,g10,d,z5', 0x05288000, 'BHSD')
+sv('clastb', 'z0,g10,d,z5', 0x05298000, 'BHSD')
+
+# SVE predicate operations. The predicate logical ops (.b only): Pd[3:0],
+# Pg/z[13:10], Pn[8:5], Pm[19:16].
+for name, base in (('and', 0x25004000), ('orr', 0x25804000), ('eor', 0x25004200), ('bic', 0x25004010),
+                   ('nand', 0x25804210), ('nor', 0x25804200), ('orn', 0x25804010), ('ands', 0x25404000),
+                   ('bics', 0x25404010), ('eors', 0x25404200), ('orrs', 0x25c04000), ('nands', 0x25c04210),
+                   ('nors', 0x25c04200), ('orns', 0x25c04010)):
+    sv(name, 'p0,n10,p5,p16', base, 'B')
+sv('sel', 'p0,h10,p5,p16', 0x25004210, 'B')
+# BRKA/BRKB (predicated, /z or /m), and their flag-setting /z-only variants.
+sv('brka', 'p0,n10,p5', 0x25104000, 'B')
+sv('brka', 'p0,j10,p5', 0x25104010, 'B')
+sv('brkb', 'p0,n10,p5', 0x25904000, 'B')
+sv('brkb', 'p0,j10,p5', 0x25904010, 'B')
+sv('brkas', 'p0,n10,p5', 0x25504000, 'B')
+sv('brkbs', 'p0,n10,p5', 0x25d04000, 'B')
+# BRKN/BRKNS (destructive): Pdm = Pd.
+sv('brkn', 'p0,n10,p5,k', 0x25184000, 'B')
+sv('brkns', 'p0,n10,p5,k', 0x25584000, 'B')
+# BRKPA/BRKPB and their flag-setting variants: Pd, Pg/z, Pn, Pm.
+sv('brkpa', 'p0,n10,p5,p16', 0x2500c000, 'B')
+sv('brkpb', 'p0,n10,p5,p16', 0x2500c010, 'B')
+sv('brkpas', 'p0,n10,p5,p16', 0x2540c000, 'B')
+sv('brkpbs', 'p0,n10,p5,p16', 0x2540c010, 'B')
+# CNTP Xd, Pg, Pn.T
+sv('cntp', 'x0,h10,p5', 0x25208000, 'BHSD')
+# PFIRST (.b, destructive), PNEXT (destructive): Pdn, Pg, Pdn.
+sv('pfirst', 'p0,h5,k', 0x2558c000, 'B')
+sv('pnext', 'p0,h5,k', 0x2519c400, 'BHSD')
+# PTRUE/PTRUES: a pattern operand (defaulting to ALL when omitted).
+sv('ptrue', 'p0', 0x2518e3e0, 'BHSD')
+sv('ptrue', 'p0,A', 0x2518e000, 'BHSD')
+sv('ptrues', 'p0', 0x2519e3e0, 'BHSD')
+sv('ptrues', 'p0,A', 0x2519e000, 'BHSD')
+sv('pfalse', 'p0', 0x2518e400, 'B')
+# PTEST Pg, Pn.b
+sv('ptest', 'h10,p5', 0x2550c000, 'B')
+# RDFFR (unpredicated and predicated), RDFFRS, WRFFR.
+sv('rdffr', 'p0', 0x2519f000, 'B')
+sv('rdffr', 'p0,n5', 0x2518f000, 'B')
+sv('rdffrs', 'p0,n5', 0x2558f000, 'B')
+sv('wrffr', 'p5', 0x25289000, 'B')
+
+# SVE floating point. Predicated binary arithmetic (destructive, h/s/d):
+for name, op8 in (('fadd', 0x00), ('fsub', 0x01), ('fmul', 0x02), ('fsubr', 0x03), ('fmaxnm', 0x04),
+                  ('fminnm', 0x05), ('fmax', 0x06), ('fmin', 0x07), ('fabd', 0x08), ('fscale', 0x09),
+                  ('fmulx', 0x0a), ('fdivr', 0x0c), ('fdiv', 0x0d)):
+    sv(name, 'z0,m10,d,z5', 0x65008000 | (op8 << 16), 'HSD')
+# predicated binary with a one-bit floating immediate (the set per op):
+for name, op, st in (('fadd', 0x18, 0), ('fsub', 0x19, 0), ('fmul', 0x1a, 1), ('fsubr', 0x1b, 0),
+                     ('fmaxnm', 0x1c, 2), ('fminnm', 0x1d, 2), ('fmax', 0x1e, 2), ('fmin', 0x1f, 2)):
+    sv(name, 'z0,m10,d,f%d' % st, 0x65008000 | (op << 16), 'HSD')
+# unpredicated arithmetic:
+for name, opc in (('fadd', 0x0), ('fsub', 0x1), ('fmul', 0x2), ('ftsmul', 0x3), ('frecps', 0x6), ('frsqrts', 0x7)):
+    sv(name, 'z0,z5,z16', 0x65000000 | (opc << 10), 'HSD')
+# the predicated fused multiply-adds (three sources):
+for name, op in (('fmla', 0x0), ('fmls', 0x1), ('fnmla', 0x2), ('fnmls', 0x3), ('fmad', 0x4), ('fmsb', 0x5),
+                 ('fnmad', 0x6), ('fnmsb', 0x7)):
+    sv(name, 'z0,m10,z5,z16', 0x65200000 | (op << 13), 'HSD')
+# the FP compares (result a predicate):
+for name, base in (('fcmge', 0x65004000), ('fcmgt', 0x65004010), ('fcmeq', 0x65006000), ('fcmne', 0x65006010),
+                   ('fcmuo', 0x6500c000), ('facge', 0x6500c010), ('facgt', 0x6500e010)):
+    sv(name, 'p0,e10,z5,z16', base, 'HSD')
+# the FP compares with zero:
+for name, base in (('fcmge', 0x65102000), ('fcmgt', 0x65102010), ('fcmlt', 0x65112000), ('fcmle', 0x65112010),
+                   ('fcmeq', 0x65122000), ('fcmne', 0x65132000)):
+    sv(name, 'p0,e10,z5,Z', base, 'HSD')
+# the predicated FP unary ops:
+for name, opc in (('frintn', 0x0), ('frintp', 0x1), ('frintm', 0x2), ('frintz', 0x3), ('frinta', 0x4),
+                  ('frintx', 0x6), ('frinti', 0x7), ('frecpx', 0xc), ('fsqrt', 0xd)):
+    sv(name, 'z0,m10,z5', 0x6500a000 | (opc << 16), 'HSD')
+# the unpredicated estimates, fexpa, ftssel:
+sv('frecpe', 'z0,z5', 0x650e3000, 'HSD')
+sv('frsqrte', 'z0,z5', 0x650f3000, 'HSD')
+sv('fexpa', 'z0,z5', 0x0420b800, 'HSD')
+sv('ftssel', 'z0,z5,z16', 0x0420b000, 'HSD')
+# complex arithmetic: fcadd (#90/#270) and fcmla (#0/#90/#180/#270):
+sv('fcadd', 'z0,m10,d,z5,P16', 0x64008000, 'HSD')
+sv('fcmla', 'z0,m10,z5,z16,O13', 0x64000000, 'HSD')
+
+# SVE integer multiply (unpredicated vectors) and the by-element forms. The
+# by-element element size is carried entirely in the index field (set EHSD
+# adds no size bits).
+SVSZ['EHSD'] = 'h:0 s:800000 d:c00000'
+sv('mul', 'z0,z5,z16', 0x04206000, 'BHSD')
+sv('smulh', 'z0,z5,z16', 0x04206800, 'BHSD')
+sv('umulh', 'z0,z5,z16', 0x04206c00, 'BHSD')
+for name, base in (('mla', 0x44200800), ('mls', 0x44200c00), ('mul', 0x4420f800), ('sqdmulh', 0x4420f000),
+                   ('sqrdmulh', 0x4420f400)):
+    sv(name, 'z0,z5,I16', base, 'EHSD')
+for name, base in (('fmla', 0x64200000), ('fmls', 0x64200400), ('fmul', 0x64202000)):
+    sv(name, 'z0,z5,I16', base, 'EHSD')
+# the predicated integer multiply-adds (Zda, Pg/m, Zn, Zm):
+for name, base in (('mla', 0x04004000), ('mls', 0x04006000)):
+    sv(name, 'z0,m10,z5,z16', base, 'BHSD')
+# mad/msb: Zdn, Pg/m, Zm, Za -- the written Zm is at [9:5], Za at [20:16]
+for name, base in (('mad', 0x0400c000), ('msb', 0x0400e000)):
+    sv(name, 'z0,m10,z16,z5', base, 'BHSD')
+
 print('''// =============================================================================
 // asm/a64tab.ax - the table of the AArch64 assembler's instruction forms
 // beyond those asm/a64.ax encodes by hand (asm/a64.ax, "The instruction
@@ -493,5 +730,13 @@ for k, v in ARRS.items():
 print('];')
 print('pub let TABLE: [%d][]u8 = [' % len(L))
 for l in L:
+    print('    "%s",' % l)
+print('];')
+print('pub let SVESZ: [%d][]u8 = [' % len(SVSZ))
+for k, v in SVSZ.items():
+    print('    "%s %s",' % (k, v))
+print('];')
+print('pub let SVETAB: [%d][]u8 = [' % len(SV))
+for l in SV:
     print('    "%s",' % l)
 print('];')

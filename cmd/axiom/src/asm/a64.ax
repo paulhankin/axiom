@@ -44,7 +44,10 @@ const AK_IMM: u8 = 3;
 const AK_MEM: u8 = 4;
 const AK_SHIFT: u8 = 5;  // lsl #n ..., uxtw #n ...
 const AK_EXPR: u8 = 6;   // a label or symbol (or a condition, or a name: barrier options, system registers)
-const AK_LIST: u8 = 7;   // {v0.16b, v1.16b}
+const AK_LIST: u8 = 7;   // {v0.16b, v1.16b}, and of SVE's {z0.s, z1.s}
+const AK_ZREG: u8 = 8;   // an SVE vector register z0-z31 (esize 0 if no element size is written)
+const AK_PREG: u8 = 9;   // an SVE predicate register p0-p15 (esize as for z; pq its /m or /z)
+const AK_FFR: u8 = 10;   // the first-fault register ffr
 
 // shift and extend kinds (AOp.sh)
 const SH_LSL: u8 = 0;
@@ -53,6 +56,7 @@ const SH_ASR: u8 = 2;
 const SH_ROR: u8 = 3;
 const SH_UXTB: u8 = 4;  // 4 + option (uxtb uxth uxtw uxtx sxtb sxth sxtw sxtx)
 const SH_MSL: u8 = 12;  // msl #8 / #16 (the shifting-ones form of movi and mvni)
+const SH_MUL: u8 = 13;  // SVE's `mul #n` (amt n) and `mul vl` (amt -2)
 
 struct AOp {
     kind: u8,
@@ -76,12 +80,16 @@ struct AOp {
     name: []u8,  // AK_EXPR: the text (a condition, option or register name)
     nregs: u32,  // AK_LIST
     text: []u8,  // the operand as written (a label may have a register's name)
+    pq: u8,      // AK_PREG: 'm' or 'z' for p0/m or p0/z, else 0
+    bz: u32,     // AK_MEM: the base is z<base> of these elements (an SVE vector base), else 0
+    rz: u32,     // AK_MEM: the offset is z<rm> of these elements, else 0
+    mvl: bool,   // AK_MEM: `[xn, #imm, mul vl]`
 }
 
 fn none_op() AOp {
     return AOp.{ kind: AK_NONE, reg: -1, x: false, sp: false, view: 0, esize: 0, lanes: 0, index: -1, v: cr.konst(0),
                  fp: false, f: 0.0, base: -1, off: false, rm: -1, rmx: false, sh: 0, amt: -1, pre: false, name: "",
-                 nregs: 0, text: "" };
+                 nregs: 0, text: "", pq: 0, bz: 0, rz: 0, mvl: false };
 }
 
 fn zr(x: bool) AOp {
@@ -121,6 +129,13 @@ fn u8_pick(c: bool, a: u8, b: u8) u8 {
 }
 
 fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn pick_f64(c: bool, a: f64, b: f64) f64 {
     if c {
         return a;
     }
@@ -247,8 +262,61 @@ fn vreg_name(n: []u8, op: *mut AOp) bool {
     return true;
 }
 
+// An SVE register: z0-z31 with an optional element size (.b .h .s .d .q) and
+// index (z0.s[1]), p0-p15 with an optional element size or a /m or /z, ffr.
+fn sve_reg_name(n: []u8, op: *mut AOp) bool {
+    if u.str_eq(n, "ffr") {
+        op.kind = AK_FFR;
+        return true;
+    }
+    if (n.len < 2) or ((n[0] != 'z') and (n[0] != 'p')) {
+        return false;
+    }
+    let mut j: usize = 1;
+    while (j < n.len) and u.is_digit(n[j]) {
+        j += 1;
+    }
+    let k = ai.num(n[1..j]);
+    let lim = pick_i64(n[0] == 'z', 31, 15);
+    if (j == 1) or (k < 0) or (k > lim) {
+        return false;
+    }
+    op.kind = u8_pick(n[0] == 'z', AK_ZREG, AK_PREG);
+    op.reg = @int_cast(i32, k);
+    if j == n.len {
+        return true;
+    }
+    let r = n[j..];
+    if (n[0] == 'p') and (r.len == 2) and (r[0] == '/') and ((r[1] == 'm') or (r[1] == 'z')) {
+        op.pq = r[1];
+        return true;
+    }
+    if (r.len < 2) or (r[0] != '.') {
+        return false;
+    }
+    let e = u.find("bhsdq", r[1]);
+    if e < 0 {
+        return false;
+    }
+    op.esize = @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
+    if r.len == 2 {
+        return true;
+    }
+    // an element index: z0.s[3]
+    if (n[0] != 'z') or (r.len < 5) or (r[2] != '[') or (r[r.len - 1] != ']') {
+        return false;
+    }
+    let iv = ai.num(cr.trim(r[3..r.len - 1]));
+    if iv < 0 {
+        return false;
+    }
+    op.index = @int_cast(i32, iv);
+    return true;
+}
+
 fn shift_kind(n: []u8) i32 {
-    let names = ["lsl", "lsr", "asr", "ror", "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx", "msl"];
+    let names = ["lsl", "lsr", "asr", "ror", "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx", "msl",
+                 "mul"];
     for k in 0..names.len {
         if u.str_eq(n, names[k]) {
             return @int_cast(i32, k);
@@ -497,7 +565,7 @@ fn parse_op1(A: *mut cr.Asm, s0: []u8) AOp {
         return imm_op(A, s);
     }
     let low = cr.lower(s);
-    if gpr_name(low, &mut op) or vreg_name(low, &mut op) {
+    if gpr_name(low, &mut op) or vreg_name(low, &mut op) or sve_reg_name(low, &mut op) {
         return op;
     }
     // a register with writeback (the memory-copy instructions' `xn!`)
@@ -515,6 +583,10 @@ fn parse_op1(A: *mut cr.Asm, s0: []u8) AOp {
         op.kind = AK_SHIFT;
         op.sh = @truncate(u8, @bit_cast(u32, sk));
         let rest = cr.trim(s[k..]);
+        if (op.sh == SH_MUL) and u.str_eq(cr.lower(rest), "vl") {
+            op.amt = -2;
+            return op;
+        }
         if rest.len > 0 {
             let iv = imm_op(A, rest);
             let c = cr.settle(A, iv.v);
@@ -556,6 +628,19 @@ fn mem_op(A: *mut cr.Asm, s: []u8) AOp {
         return op;
     }
     let mut b = none_op();
+    if sve_reg_name(cr.lower(parts[0]), &mut b) and (b.kind == AK_ZREG) and (b.esize >= 32) and (b.index < 0) {
+        // an SVE vector base: [z0.d], [z0.s, #imm]
+        op.base = b.reg;
+        op.bz = b.esize;
+        if parts.len == 2 {
+            let iv = imm_op(A, parts[1]);
+            op.v = iv.v;
+            op.off = true;
+        } else if parts.len > 2 {
+            cr.fail(A, u.f1("'%s' is not a memory operand", s));
+        }
+        return op;
+    }
     if not gpr_name(cr.lower(parts[0]), &mut b) or not b.x or ((b.reg == 31) and not b.sp) {
         cr.fail(A, u.f1("'%s' is not a base register", parts[0]));
         return op;
@@ -564,6 +649,23 @@ fn mem_op(A: *mut cr.Asm, s: []u8) AOp {
     if parts.len >= 2 {
         let p = parts[1];
         let mut r = none_op();
+        if sve_reg_name(cr.lower(p), &mut r) and (r.kind == AK_ZREG) and (r.esize >= 32) and (r.index < 0) {
+            // an SVE vector offset: [xn, z1.d], [xn, z1.d, lsl #3], [xn, z1.s, uxtw #2]
+            op.rm = r.reg;
+            op.rz = r.esize;
+            op.sh = SH_LSL;
+            if parts.len >= 3 {
+                let e = parse_op(A, parts[2]);
+                if (e.kind != AK_SHIFT) or ((e.sh != SH_LSL) and (e.sh != SH_UXTB + 2) and (e.sh != SH_UXTB + 6)) or
+                   ((e.sh == SH_LSL) and (e.amt < 0)) or (parts.len > 3) {
+                    cr.fail(A, u.f1("'%s' is not an SVE vector offset", s));
+                    return op;
+                }
+                op.sh = e.sh;
+                op.amt = e.amt;
+            }
+            return op;
+        }
         if gpr_name(cr.lower(p), &mut r) {
             if r.sp {
                 cr.fail(A, "sp cannot be an offset register");
@@ -589,11 +691,29 @@ fn mem_op(A: *mut cr.Asm, s: []u8) AOp {
         let iv = imm_op(A, p);
         op.v = iv.v;
         op.off = true;
-        if parts.len > 2 {
+        if (parts.len == 3) and is_mul_vl(parts[2]) {
+            op.mvl = true;
+        } else if parts.len > 2 {
             cr.fail(A, u.f1("'%s' is not a memory operand", s));
         }
     }
     return op;
+}
+
+// Whether t is `mul vl` (any spacing).
+fn is_mul_vl(t: []u8) bool {
+    let l = cr.lower(cr.trim(t));
+    return (l.len > 4) and u.str_eq(l[0..3], "mul") and ((l[3] == ' ') or (l[3] == '\t')) and
+           u.str_eq(cr.trim(l[3..]), "vl");
+}
+
+// A list element: a vector register (v) or an SVE one (z).
+fn list_reg(t: []u8, op: *mut AOp) bool {
+    let l = cr.lower(cr.trim(t));
+    if vreg_name(l, op) {
+        return true;
+    }
+    return sve_reg_name(l, op) and (op.kind == AK_ZREG) and (op.index < 0);
 }
 
 fn list_op(A: *mut cr.Asm, s: []u8) AOp {
@@ -613,7 +733,8 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
         let a = cr.trim(t[0..@int_cast(usize, dash)]);
         let b = cr.trim(t[@int_cast(usize, dash) + 1..]);
         let mut x = none_op();
-        if not vreg_name(cr.lower(a), &mut first) or not vreg_name(cr.lower(b), &mut x) {
+        if not list_reg(a, &mut first) or not list_reg(b, &mut x) or (first.kind != x.kind) or
+           (x.esize != first.esize) {
             cr.fail(A, u.f1("'%s' is not a register list", s));
             return op;
         }
@@ -622,7 +743,7 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
         let xs = cr.split_args(t);
         for k in 0..xs.len {
             let mut x = none_op();
-            if not vreg_name(cr.lower(xs[k]), &mut x) {
+            if not list_reg(xs[k], &mut x) or ((k > 0) and (x.kind != first.kind)) {
                 cr.fail(A, u.f1("'%s' is not a register list", s));
                 return op;
             }
@@ -635,7 +756,7 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
         }
         n = @truncate(u32, xs.len);
     }
-    if (n == 0) or (n > 4) or (first.view != 'v') {
+    if (n == 0) or (n > 4) or ((first.view != 'v') and (first.kind != AK_ZREG)) {
         cr.fail(A, u.f1("'%s' is not a register list", s));
         return op;
     }
@@ -643,6 +764,7 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
     op.esize = first.esize;
     op.lanes = first.lanes;
     op.nregs = n;
+    op.view = u8_pick(first.kind == AK_ZREG, 'z', 'v');
     op.index = first.index;
     if after.len > 0 {
         if (after.len < 3) or (after[0] != '[') or (after[after.len - 1] != ']') {
@@ -1103,8 +1225,8 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
             return;
         }
     }
-    if vimm(A, m, ops) or table(A, m, ops) or base_rest(A, m, ops) or integer(A, m, ops) or branch(A, m, ops) or
-       ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or simd(A, m, ops) {
+    if vimm(A, m, ops) or table(A, m, ops) or base_rest(A, m, ops) or sve(A, m, ops) or integer(A, m, ops) or
+       branch(A, m, ops) or ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or simd(A, m, ops) {
         return;
     }
     if not cr.failed(A) {
@@ -5200,6 +5322,1810 @@ fn table(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         return true;
     }
     return false;
+}
+
+// -----------------------------------------------------------------------------
+// SVE and SVE2 (asm/a64tab.ax's SVESZ and SVETAB, generated from the Arm ARM's
+// SVE encoding classes). A line is `mnemonic operands base sizes`, as for the
+// Advanced SIMD table, but the operand kinds are SVE's (SK_* below) and the
+// `sizes` set gives the element-size field (bits [23:22], usually) for each
+// allowed element: for a z or p register `.b .h .s .d .q`, the governing
+// predicate's /m, /z or plain form, scalar general registers, and SVE's
+// immediates. The matcher is try_sform; the arrangement set is an ASet
+// (g_asets) as the Advanced SIMD one, with lanes 0.
+// -----------------------------------------------------------------------------
+const SK_Z: u8 = 1;        // a sized Z register z<n>.T at the field
+const SK_ZU: u8 = 2;       // an unsized Z register z<n> at the field (ldr/str/movprfx/mov)
+const SK_P: u8 = 3;        // a sized P register p<n>.T at the field
+const SK_PU: u8 = 4;       // an unsized P register p<n> or p<n>.b at the field
+const SK_G: u8 = 5;        // a 3-bit governing predicate p<n> (p0-p7), no qualifier
+const SK_GM: u8 = 6;       // ... p<n>/m
+const SK_GZ: u8 = 7;       // ... p<n>/z
+const SK_H: u8 = 8;        // a 4-bit governing predicate p<n> (p0-p15), no qualifier
+const SK_HZ: u8 = 9;       // ... p<n>/z
+const SK_W: u8 = 10;       // a 32-bit general register w<n> at the field
+const SK_X: u8 = 11;       // a 64-bit general register x<n> at the field
+const SK_R: u8 = 12;       // a general register whose width follows T (w, or x for .d) at the field
+const SK_XSP: u8 = 13;     // a 64-bit general register or sp at the field
+const SK_ZSAME: u8 = 14;   // a sized Z register that must equal the destination (encoded nowhere)
+const SK_ZDFIX: u8 = 15;   // a Z register with a fixed .d element (the wide-shift Zm) at the field
+const SK_PAT: u8 = 20;     // a predication pattern (pow2, vl1.., mul3, mul4, all, #imm) at [9:5]
+const SK_SHR: u8 = 21;     // an SVE right-shift amount 1..esize, into the tsz:imm3 field (bit 16, 5)
+const SK_SHL: u8 = 22;     // an SVE left-shift amount 0..esize-1, into tsz:imm3
+const SK_SHRP: u8 = 23;    // a predicated right shift 1..esize, into the 6-bit tszh:tszl:imm3 at 22,5
+const SK_SHLP: u8 = 24;    // a predicated left shift 0..esize-1
+const SK_IMM8: u8 = 25;    // a signed byte -128..127 at bit 5 (dup/cpy immediate, no shift here)
+const SK_IMM8S: u8 = 26;   // ... with an optional `, lsl #8` (bit 13 the shift)
+const SK_UIMM7: u8 = 27;   // an unsigned 0..127 at bit 5 (add/sub/sqadd immediate)
+const SK_UIMM7S: u8 = 28;  // ... with an optional `, lsl #8`
+const SK_FIMM: u8 = 29;    // an SVE 8-bit floating immediate at bit 5 (fmul/fadd... predicated)
+const SK_LIMM: u8 = 30;    // a bitmask immediate (and/orr/eor/bic/dupm/eon of a Z)
+const SK_IDX: u8 = 31;     // an index element z<n>.T[i] for the by-element forms
+const SK_FPZ: u8 = 32;     // the literal #0.0 (fcmeq/fcmlt with zero)
+const SK_VSEL: u8 = 33;    // the FP-two select immediate list (0.5,1.0,2.0 etc.) — set per form
+const SK_CNTM: u8 = 34;    // the `, mul #imm` multiplier 1..16 (cntb/incb etc.), default 1
+const SK_IMMR: u8 = 35;    // a plain decimal immediate range at the field (set by aux lo/hi)
+const SK_FPIMM1: u8 = 36;  // a specific FP immediate from a small set, one bit at the field
+const SK_ROT: u8 = 37;     // a complex rotation #0/#90/#180/#270 (2 bits) at the field
+const SK_ROT1: u8 = 38;    // a complex rotation #90/#270 (1 bit) at the field
+const SK_ZIDX4: u8 = 39;   // z<n>.T[i] for SVE2 narrow by-element (index wider range)
+const SK_CIMM: u8 = 40;    // a signed 5-bit compare immediate -16..15 at bit 16
+const SK_CIMMU: u8 = 41;   // an unsigned 7-bit compare immediate 0..127 at bit 14
+const SK_VSC: u8 = 42;     // a scalar FP register (b/h/s/d) of T's element size at the field
+const SK_VDD: u8 = 43;     // a scalar d register (fixed) at the field (saddv/uaddv)
+const SK_SIMM5: u8 = 44;   // a signed 5-bit immediate -16..15 at the field (index)
+const SK_HM: u8 = 45;      // a 4-bit governing predicate p<n>/m at the field (brka/brkb merging)
+const SK_PSAME: u8 = 46;   // a predicate register that must equal the destination (encoded nowhere)
+
+// A memory operand kind for the SVE loads/stores (handled separately).
+struct SForm {
+    name: []u8,
+    n: usize,
+    kind: [8]u8,
+    pos: [8]u8,
+    aux: [8]i32,  // a per-kind parameter (gpr field width, immediate limits, ...)
+    base: u64,
+    arr: usize,
+}
+
+let mut g_sforms: u.List.[SForm] = u.List.[SForm].{ data: @ptr_from_int(*mut SForm, 0), len: 0, cap: 0 };
+let mut g_snames: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut g_slists: u.List.[u.List.[i32]] = u.List.[u.List.[i32]].{ data: @ptr_from_int(*mut u.List.[i32], 0), len: 0,
+                                                                  cap: 0 };
+let mut g_sbuilt: bool = false;
+
+// A letter-or-pair kind at the start of a SVETAB operand (updates i past it).
+fn skind(o: []u8, i: *mut usize, aux: *mut i32) u8 {
+    aux.* = 0;
+    let c = o[0];
+    i.* = 1;
+    if c == 'z' {
+        return SK_Z;
+    }
+    if c == 'u' {
+        return SK_ZU;
+    }
+    if c == 'p' {
+        return SK_P;
+    }
+    if c == 'q' {
+        return SK_PU;
+    }
+    if c == 'g' {
+        return SK_G;
+    }
+    if c == 'm' {
+        return SK_GM;
+    }
+    if c == 'e' {
+        return SK_GZ;
+    }
+    if c == 'h' {
+        return SK_H;
+    }
+    if c == 'n' {
+        return SK_HZ;
+    }
+    if c == 'w' {
+        return SK_W;
+    }
+    if c == 'x' {
+        return SK_X;
+    }
+    if c == 'r' {
+        return SK_R;
+    }
+    if c == 'y' {
+        return SK_XSP;
+    }
+    if c == 'd' {
+        return SK_ZSAME;
+    }
+    if c == 'c' {
+        return SK_ZDFIX;
+    }
+    // multi-letter immediate kinds introduced by a capital or special letter
+    if c == 'A' {
+        return SK_PAT;
+    }
+    if c == 'R' {
+        return SK_SHR;
+    }
+    if c == 'L' {
+        return SK_SHL;
+    }
+    if c == 'S' {
+        return SK_SHRP;
+    }
+    if c == 'T' {
+        return SK_SHLP;
+    }
+    if c == 'B' {
+        return SK_IMM8;
+    }
+    if c == 'C' {
+        return SK_IMM8S;
+    }
+    if c == 'U' {
+        return SK_UIMM7;
+    }
+    if c == 'V' {
+        return SK_UIMM7S;
+    }
+    if c == 'F' {
+        return SK_FIMM;
+    }
+    if c == 'M' {
+        return SK_LIMM;
+    }
+    if c == 'I' {
+        return SK_IDX;
+    }
+    if c == 'Z' {
+        return SK_FPZ;
+    }
+    if c == 'O' {
+        return SK_ROT;
+    }
+    if c == 'P' {
+        return SK_ROT1;
+    }
+    if c == 'J' {
+        return SK_ZIDX4;
+    }
+    if c == 'K' {
+        return SK_CIMM;
+    }
+    if c == 'G' {
+        return SK_CIMMU;
+    }
+    if c == 'v' {
+        return SK_VSC;
+    }
+    if c == 'a' {
+        return SK_VDD;
+    }
+    if c == 'i' {
+        return SK_SIMM5;
+    }
+    if c == 'j' {
+        return SK_HM;
+    }
+    if c == 'k' {
+        return SK_PSAME;
+    }
+    if c == 'f' {
+        return SK_FPIMM1;
+    }
+    if c == 'D' {
+        // Dlo:hi — a plain immediate range; the limits follow in the token (lo..hi)
+        return SK_IMMR;
+    }
+    u.die(u.f1("asm/a64tab.ax: SVE operand kind '%s'", o));
+    return 0;
+}
+
+fn build_stable() void {
+    g_sforms = u.List.[SForm].empty();
+    g_slists = u.List.[u.List.[i32]].empty();
+    for line in atab.SVESZ {
+        let mut i: usize = 0;
+        let mut st = ASet.{ name: tword(line, &mut i), n: 0, es: [0; 8], ln: [0; 8], bits: [0; 8] };
+        while i < line.len {
+            let w = tword(line, &mut i);
+            if w.len == 0 {
+                break;
+            }
+            let c = u.find(w, ':');
+            let e = u.find("bhsdq", w[0]);
+            if (c < 1) or (e < 0) {
+                u.die(u.f1("asm/a64tab.ax: SVE size '%s'", w));
+            }
+            st.es[st.n] = @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
+            st.ln[st.n] = 0;
+            st.bits[st.n] = hexword(w[@int_cast(usize, c) + 1..]);
+            st.n += 1;
+        }
+        g_asets.push(st);
+    }
+    for line in atab.SVETAB {
+        let mut i: usize = 0;
+        let name = tword(line, &mut i);
+        let ops = tword(line, &mut i);
+        let base = tword(line, &mut i);
+        let arrn = tword(line, &mut i);
+        let mut f = SForm.{ name: u.intern(name), n: 0, kind: [0; 8], pos: [0; 8], aux: [0; 8], base: hexword(base),
+                            arr: 0 };
+        let mut stp: usize = 0;
+        for k in 0..ops.len + 1 {
+            if (k < ops.len) and (ops[k] != ',') {
+                continue;
+            }
+            let o = ops[stp..k];
+            stp = k + 1;
+            if o.len == 0 {
+                continue;
+            }
+            let mut ii: usize = 0;
+            let mut aux: i32 = 0;
+            f.kind[f.n] = skind(o, &mut ii, &mut aux);
+            // the position is the digits after the kind; an SK_IMMR gives lo-hi
+            if f.kind[f.n] == SK_IMMR {
+                let dash = u.find(o[ii..], '-');
+                let lo = ai.num(o[ii..@int_cast(usize, dash) + ii]);
+                f.aux[f.n] = @truncate(i32, (lo << 16) | ai.num(o[@int_cast(usize, dash) + ii + 1..]));
+                f.pos[f.n] = 5;
+            } else {
+                if ii < o.len {
+                    f.pos[f.n] = @truncate(u8, @bit_cast(u64, ai.num(o[ii..])));
+                }
+                f.aux[f.n] = aux;
+            }
+            f.n += 1;
+        }
+        let mut found = false;
+        for k in 0..g_asets.len {
+            if u.str_eq(arrn, g_asets.at(k).name) {
+                f.arr = k;
+                found = true;
+            }
+        }
+        if not found {
+            u.die(u.f1("asm/a64tab.ax: the SVE sizes '%s'", arrn));
+        }
+        g_sforms.push(f);
+        let mut li = g_snames.get(f.name);
+        if li == 0 {
+            g_slists.push(u.List.[i32].empty());
+            li = @int_cast(i32, g_slists.len);
+            g_snames.put(f.name, li);
+        }
+        g_slists.at(@int_cast(usize, li - 1)).push(@int_cast(i32, g_sforms.len - 1));
+    }
+}
+
+// The element bits (size<<22, say) form f's size set gives element `es`, or -1.
+fn sz_bits(f: *SForm, es: u32) i64 {
+    let st = g_asets.at(f.arr);
+    for j in 0..st.n {
+        if st.es[j] == es {
+            return @bit_cast(i64, st.bits[j]);
+        }
+    }
+    return -1;
+}
+
+// The element letter 'bhsdq' of es, for messages (unused value 0 otherwise).
+fn es_of_set(f: *SForm) u32 {
+    let st = g_asets.at(f.arr);
+    if st.n == 1 {
+        return st.es[0];
+    }
+    return 0;
+}
+
+fn sve_gpr_ok(o: *AOp, x: bool, sp: bool) bool {
+    if o.kind != AK_REG {
+        return false;
+    }
+    if (o.reg == 31) and not sp {
+        return false;
+    }
+    if (o.reg == 31) and sp and not o.sp {
+        return false;
+    }
+    return o.x == x;
+}
+
+// The word of SVE form f for ops, or -1 if they are not its operands.
+fn try_sform(A: *mut cr.Asm, f: *SForm, ops: []AOp) i64 {
+    if ops.len != f.n {
+        return -1;
+    }
+    let mut w = f.base;
+    // T: the element size shared by the SK_Z/SK_P operands (and SK_R's width).
+    let mut tes: u32 = es_of_set(f);
+    let mut abits: i64 = -2;
+    let mut dstreg: i32 = -1;
+    for k in 0..f.n {
+        let kd = f.kind[k];
+        if (kd == SK_Z) or (kd == SK_P) {
+            let o = ops[k];
+            let want = u8_pick(kd == SK_Z, AK_ZREG, AK_PREG);
+            if (o.kind != want) or (o.esize == 0) or (o.index >= 0) or (o.pq != 0) {
+                return -1;
+            }
+            let b = sz_bits(f, o.esize);
+            if (b < 0) or ((abits != -2) and (o.esize != tes)) {
+                return -1;
+            }
+            abits = b;
+            tes = o.esize;
+            if dstreg < 0 {
+                dstreg = o.reg;
+            }
+        } else if (dstreg < 0) and (kd == SK_ZU) {
+            dstreg = ops[k].reg;
+        }
+    }
+    for k in 0..f.n {
+        let o = ops[k];
+        let kd = f.kind[k];
+        let p = @as(u64, f.pos[k]);
+        if (kd == SK_Z) or (kd == SK_P) {
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_ZSAME {
+            if (o.kind != AK_ZREG) or (o.esize != tes) or (o.index >= 0) or (o.pq != 0) or (o.reg != dstreg) {
+                return -1;
+            }
+        } else if kd == SK_ZDFIX {
+            if (o.kind != AK_ZREG) or (o.esize != 64) or (o.index >= 0) or (o.pq != 0) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_VSC {
+            if (o.kind != AK_VREG) or (scalar_bits(&o) != tes) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_VDD {
+            if (o.kind != AK_VREG) or (o.view != 'd') {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_ZU {
+            if (o.kind != AK_ZREG) or (o.index >= 0) or (o.pq != 0) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_PU {
+            if (o.kind != AK_PREG) or (o.index >= 0) or (o.pq != 0) or ((o.esize != 0) and (o.esize != 8)) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if (kd == SK_G) or (kd == SK_GM) or (kd == SK_GZ) {
+            let q = u8_pick(kd == SK_G, 0, u8_pick(kd == SK_GM, 'm', 'z'));
+            if (o.kind != AK_PREG) or (o.reg > 7) or (o.pq != q) or (o.esize != 0) or (o.index >= 0) {
+                return -1;
+            }
+            w = w | (@as(u64, @bit_cast(u32, o.reg)) << p);
+        } else if (kd == SK_H) or (kd == SK_HZ) or (kd == SK_HM) {
+            let q = u8_pick(kd == SK_H, 0, u8_pick(kd == SK_HZ, 'z', 'm'));
+            if (o.kind != AK_PREG) or (o.pq != q) or (o.esize != 0) or (o.index >= 0) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_PSAME {
+            if (o.kind != AK_PREG) or (o.reg != dstreg) or (o.index >= 0) or (o.pq != 0) {
+                return -1;
+            }
+        } else if (kd == SK_W) or (kd == SK_X) or (kd == SK_XSP) {
+            if not sve_gpr_ok(&o, kd != SK_W, kd == SK_XSP) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else if kd == SK_R {
+            if not sve_gpr_ok(&o, tes == 64, false) {
+                return -1;
+            }
+            w = w | (r5(o.reg) << p);
+        } else {
+            let r = try_simm(A, f, k, &o, tes, &mut w);
+            if not r {
+                return -1;
+            }
+        }
+    }
+    if abits >= 0 {
+        w = w | @bit_cast(u64, abits);
+    }
+    return @bit_cast(i64, w);
+}
+
+// The SVE predication patterns, in the order of their 5-bit encodings (0-31).
+let SVE_PATS: [16][]u8 = ["pow2", "vl1", "vl2", "vl3", "vl4", "vl5", "vl6", "vl7", "vl8", "vl16", "vl32", "vl64",
+                          "vl128", "vl256", "mul4", "mul3"];
+let SVE_PATV: [16]u64 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 29, 30];
+
+fn pat_val(n: []u8) i64 {
+    if u.str_eq(n, "all") {
+        return 31;
+    }
+    for k in 0..SVE_PATS.len {
+        if u.str_eq(n, SVE_PATS[k]) {
+            return @bit_cast(i64, SVE_PATV[k]);
+        }
+    }
+    return -1;
+}
+
+// An immediate/pattern SVE operand; writes it into w, returns false if it does
+// not match. A sub-function of try_sform (one `else if` chain made a function).
+fn try_simm(A: *mut cr.Asm, f: *SForm, k: usize, o: *AOp, tes: u32, w: *mut u64) bool {
+    let kd = f.kind[k];
+    let p = @as(u64, f.pos[k]);
+    if kd == SK_PAT {
+        let mut pv: i64 = -1;
+        if (o.kind == AK_EXPR) and (o.name.len > 0) {
+            pv = pat_val(o.name);
+        } else if o.kind == AK_IMM {
+            let v = cr.settle(A, o.v);
+            if cr.is_const(v) and (v.k >= 0) and (v.k <= 31) {
+                pv = v.k;
+            }
+        }
+        if pv < 0 {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, pv) << 5);
+        return true;
+    }
+    if kd == SK_FPZ {
+        return imm_is(A, o, 0, true);
+    }
+    if kd == SK_FPIMM1 {
+        // a one-bit floating immediate: the set (in f.pos) gives the two values
+        if o.kind != AK_IMM {
+            return false;
+        }
+        let mut fv: f64 = 0.0;
+        if o.fp {
+            fv = o.f;
+        } else {
+            let v = cr.settle(A, o.v);
+            if not cr.is_const(v) {
+                return false;
+            }
+            fv = @float_from_int(f64, v.k);
+        }
+        // sets: 0 {0.5, 1.0}, 1 {0.5, 2.0}, 2 {0.0, 1.0}
+        let lo = pick_f64(f.pos[k] == 2, 0.0, 0.5);
+        let hi = pick_f64(f.pos[k] == 1, 2.0, 1.0);
+        if fv == lo {
+            return true;
+        }
+        if fv == hi {
+            w.* = w.* | (@as(u64, 1) << 5);
+            return true;
+        }
+        return false;
+    }
+    if (kd == SK_ROT) or (kd == SK_ROT1) {
+        if (o.kind != AK_IMM) or o.fp {
+            return false;
+        }
+        let v = cr.settle(A, o.v);
+        if not cr.is_const(v) {
+            return false;
+        }
+        let mut x: i64 = -1;
+        if kd == SK_ROT {
+            if (v.k >= 0) and (v.k <= 270) and ((v.k % 90) == 0) {
+                x = v.k / 90;
+            }
+        } else if (v.k == 90) or (v.k == 270) {
+            x = pick_i64(v.k == 90, 0, 1);
+        }
+        if x < 0 {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, x) << p);
+        return true;
+    }
+    if (kd == SK_IDX) or (kd == SK_ZIDX4) {
+        // z<n>.T[i]: the index (and some of Zm) go into the by-element fields
+        if (o.kind != AK_ZREG) or (o.esize != tes) or (o.index < 0) {
+            return false;
+        }
+        let i = @as(u64, @bit_cast(u32, o.index));
+        // D: index at [22,20:19:18? ] handled by element size; see the Arm ARM
+        // SVE by-element: B/H size-00/01 use Zm 0-7 index i3h:i3l:i3? Actually:
+        //   H (16): Zm 0-7, i in [22,20:19] (3 bits): tszh? we encode i at 19 and reg
+        //   S (32): Zm 0-7, i in [20:19] (2 bits)
+        //   D (64): Zm 0-15, i in [20] (1 bit)
+        if tes == 16 {
+            if (i > 7) or (o.reg > 7) {
+                return false;
+            }
+            w.* = w.* | (((i & 3) << 19) | ((i >> 2) << 22));
+            w.* = w.* | (@as(u64, @bit_cast(u32, o.reg)) << 16);
+        } else if tes == 32 {
+            if (i > 3) or (o.reg > 7) {
+                return false;
+            }
+            w.* = w.* | ((i << 19) | (@as(u64, @bit_cast(u32, o.reg)) << 16));
+        } else if tes == 64 {
+            if (i > 1) or (o.reg > 15) {
+                return false;
+            }
+            w.* = w.* | ((i << 20) | (@as(u64, @bit_cast(u32, o.reg)) << 16));
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (o.kind != AK_IMM) or o.fp {
+        // the shift/immediate kinds below all need a plain integer immediate
+        if (kd == SK_FIMM) and o.fp {
+            // handled below
+        } else {
+            return simm_fp(A, f, k, o, tes, w);
+        }
+    }
+    let v = cr.settle(A, o.v);
+    if (kd == SK_SHR) or (kd == SK_SHRP) {
+        if not cr.is_const(v) or (v.k < 1) or (v.k > @as(i64, tes)) {
+            return false;
+        }
+        let enc = @bit_cast(u64, (2 * @as(i64, tes)) - v.k);
+        if kd == SK_SHR {
+            // unpredicated: tszh:tszl at [23:22,20:19], imm3 at [18:16]
+            w.* = w.* | shr_tsz(enc, tes);
+        } else {
+            // predicated: tszh at [23:22], tszl:imm3 at [9:5]
+            w.* = w.* | (((enc >> 5) << 22) | ((enc & 0x1f) << 5));
+        }
+        return true;
+    }
+    if (kd == SK_SHL) or (kd == SK_SHLP) {
+        if not cr.is_const(v) or (v.k < 0) or (v.k > @as(i64, tes - 1)) {
+            return false;
+        }
+        let enc = @bit_cast(u64, @as(i64, tes) + v.k);
+        if kd == SK_SHL {
+            w.* = w.* | shr_tsz(enc, tes);
+        } else {
+            w.* = w.* | (((enc >> 5) << 22) | ((enc & 0x1f) << 5));
+        }
+        return true;
+    }
+    if (kd == SK_IMM8) or (kd == SK_IMM8S) or (kd == SK_UIMM7) or (kd == SK_UIMM7S) {
+        if not cr.is_const(v) {
+            return false;
+        }
+        let signed = (kd == SK_IMM8) or (kd == SK_IMM8S);
+        let shiftable = (kd == SK_IMM8S) or (kd == SK_UIMM7S);
+        let mut x = v.k;
+        let mut sh: u64 = 0;
+        let lo = pick_i64(signed, -128, 0);
+        let hi = pick_i64(signed, 127, 255);
+        if (x < lo) or (x > hi) {
+            // a shifted form: a multiple of 256 in [lo*256, hi*256]
+            if not shiftable or ((x % 256) != 0) or ((x / 256) < lo) or ((x / 256) > hi) {
+                return false;
+            }
+            x = x / 256;
+            sh = 1;
+        }
+        w.* = w.* | (((@bit_cast(u64, x) & 0xff) << 5) | (sh << 13));
+        return true;
+    }
+    if kd == SK_IMMR {
+        let lo = @as(i64, f.aux[k] >> 16);
+        let hi = @as(i64, f.aux[k] & 0xffff);
+        if not cr.is_const(v) or (v.k < lo) or (v.k > hi) {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, v.k) << p);
+        return true;
+    }
+    if kd == SK_CIMM {
+        if not cr.is_const(v) or (v.k < -16) or (v.k > 15) {
+            return false;
+        }
+        w.* = w.* | ((@bit_cast(u64, v.k) & 0x1f) << 16);
+        return true;
+    }
+    if kd == SK_CIMMU {
+        if not cr.is_const(v) or (v.k < 0) or (v.k > 127) {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, v.k) << 14);
+        return true;
+    }
+    if kd == SK_SIMM5 {
+        if not cr.is_const(v) or (v.k < -16) or (v.k > 15) {
+            return false;
+        }
+        w.* = w.* | ((@bit_cast(u64, v.k) & 0x1f) << p);
+        return true;
+    }
+    if kd == SK_CNTM {
+        if not cr.is_const(v) or (v.k < 1) or (v.k > 16) {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, v.k - 1) << p);
+        return true;
+    }
+    if kd == SK_LIMM {
+        if not cr.is_const(v) {
+            return false;
+        }
+        let enc = ae.logical_imm(@bit_cast(u64, v.k), 64);
+        if enc < 0 {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, enc) << 5);
+        return true;
+    }
+    return simm_fp(A, f, k, o, tes, w);
+}
+
+// The SVE shift immediate `enc` placed in the tszh:tszl:imm3 field for a
+// z<n>.T unpredicated shift (element size tes).
+fn shr_tsz(enc: u64, tes: u32) u64 {
+    // imm = tsz:imm3 where tsz has 1 in the position of the element size:
+    // b: tsz=0001 imm3=enc[2:0] (enc 1..8 -> value 8..15 stored); but the
+    // architecture lays the 7-bit amount across tszh(23:22):tszl(20:19):imm3(18:16).
+    // enc here is (2*esize - shift) for right, (esize + shift) for left: a value
+    // in [esize .. 2*esize). We store (esize | low bits) per the standard layout.
+    let x = enc;  // in range [tes, 2*tes)
+    // the field is 7 bits wide: high 2 at [23:22], mid 2 at [20:19], low 3 at [18:16]
+    let b = x & 7;
+    let m = (x >> 3) & 3;
+    let h = (x >> 5) & 3;
+    return (h << 22) | (m << 19) | (b << 16);
+}
+
+// The SVE floating immediates (SK_FIMM and SK_FPIMM1 handled as text/const).
+fn simm_fp(A: *mut cr.Asm, f: *SForm, k: usize, o: *AOp, tes: u32, w: *mut u64) bool {
+    let kd = f.kind[k];
+    if kd == SK_FIMM {
+        if o.kind != AK_IMM {
+            return false;
+        }
+        let mut fv: f64 = 0.0;
+        if o.fp {
+            fv = o.f;
+        } else {
+            let v = cr.settle(A, o.v);
+            if not cr.is_const(v) {
+                return false;
+            }
+            fv = @float_from_int(f64, v.k);
+        }
+        let e = fp_imm8(fv);
+        if e < 0 {
+            return false;
+        }
+        w.* = w.* | (@bit_cast(u64, e) << 5);
+        return true;
+    }
+    return false;
+}
+
+// Encodes m with ops by the SVE table.
+fn sve(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if not g_sbuilt {
+        if not g_abuilt {
+            build_atable();
+            g_abuilt = true;
+        }
+        build_stable();
+        g_sbuilt = true;
+    }
+    if sve_special(A, m, ops) {
+        return true;
+    }
+    let li = g_snames.get(u.intern(m));
+    if li != 0 {
+        for fi in g_slists.at(@int_cast(usize, li - 1)).items() {
+            let w = try_sform(A, g_sforms.at(@int_cast(usize, fi)), ops);
+            if w >= 0 {
+                w32(A, @bit_cast(u64, w));
+                return true;
+            }
+        }
+    }
+    // an SVE operand with no matching form: an error naming the instruction
+    if (ops.len > 0) and has_sve_operand(ops) {
+        bad(A, m);
+        return true;
+    }
+    return false;
+}
+
+fn has_sve_operand(ops: []AOp) bool {
+    for o in ops {
+        if (o.kind == AK_ZREG) or (o.kind == AK_PREG) or (o.kind == AK_FFR) {
+            return true;
+        }
+        if (o.kind == AK_LIST) and (o.view == 'z') {
+            return true;
+        }
+        if (o.kind == AK_MEM) and ((o.bz != 0) or (o.rz != 0) or o.mvl) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// SVE forms that are not plain table rows: the loads/stores, mov/cpy/dup
+// aliases, movprfx, the predicate ops with special operands, element counts.
+fn sve_special(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    return sve_cmp_alias(A, m, ops) or sve_ldst(A, m, ops) or sve_count(A, m, ops) or sve_moves(A, m, ops) or
+           sve_perm(A, m, ops) or sve_pred(A, m, ops) or sve_fp(A, m, ops) or sve_imm(A, m, ops);
+}
+
+// The SVE integer immediate instructions (destructive): the add/subtract and
+// min/max/mul with an 8-bit immediate, and the bitwise immediate ops (a 13-bit
+// logical immediate). All are Zdn, Zdn, #imm (dupm is Zd, #imm).
+fn sve_imm(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let addg = ["add", "sub", "subr", "sqadd", "uqadd", "sqsub", "uqsub"];
+    let addop: [7]u64 = [0x0, 0x1, 0x3, 0x4, 0x5, 0x6, 0x7];
+    // the no-shift groups: unsigned 8-bit (umax/umin) and signed 8-bit (smax/smin/mul)
+    let ug = ["umax", "umin"];
+    let uop: [2]u64 = [0x9, 0xb];
+    let sg = ["smax", "smin", "mul"];
+    let sop: [3]u64 = [0x8, 0xa, 0x10];
+    let bw = ["orr", "eor", "and", "bic", "dupm"];
+    let bwbase: [5]u64 = [0x05000000, 0x05400000, 0x05800000, 0x05800000, 0x05c00000];
+    for k in 0..bw.len {
+        if u.str_eq(m, bw[k]) {
+            return sve_imm_bitwise(A, m, ops, bwbase[k], u.str_eq(m, "bic"), u.str_eq(m, "dupm"));
+        }
+    }
+    let mut gi: i64 = -1;
+    let mut signed = false;
+    let mut noshift = false;
+    let mut op: u64 = 0;
+    for k in 0..addg.len {
+        if u.str_eq(m, addg[k]) {
+            gi = @int_cast(i64, k);
+            op = addop[k];
+        }
+    }
+    for k in 0..ug.len {
+        if u.str_eq(m, ug[k]) {
+            gi = 100;
+            noshift = true;
+            op = uop[k];
+        }
+    }
+    for k in 0..sg.len {
+        if u.str_eq(m, sg[k]) {
+            gi = 100;
+            signed = true;
+            noshift = true;
+            op = sop[k];
+        }
+    }
+    if gi < 0 {
+        return false;
+    }
+    if (ops.len < 3) or (ops.len > 4) or (ops[0].kind != AK_ZREG) or (ops[0].esize == 0) or (ops[0].index >= 0) or
+       (ops[1].kind != AK_ZREG) or (ops[1].reg != ops[0].reg) or (ops[1].esize != ops[0].esize) or
+       (ops[2].kind != AK_IMM) or ops[2].fp {
+        return false;
+    }
+    let es = ops[0].esize;
+    let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+    let v = cr.settle(A, ops[2].v);
+    if not cr.is_const(v) {
+        return false;
+    }
+    let x = v.k;
+    let mut byte: u64 = 0;
+    let mut sh: u64 = 0;
+    if noshift {
+        // umax/umin unsigned 8-bit, smax/smin/mul signed 8-bit (no shift)
+        let lo = pick_i64(signed, -128, 0);
+        let hi = pick_i64(signed, 127, 255);
+        if (ops.len != 3) or (x < lo) or (x > hi) {
+            bad(A, m);
+            return true;
+        }
+        byte = @bit_cast(u64, x) & 0xff;
+    } else {
+        // the add/subtract group: the element value must be an 8-bit field, by
+        // itself or shifted left 8.
+        let mut mask: u64 = 0xffffffffffffffff;
+        if es < 64 {
+            mask = (@as(u64, 1) << @as(u64, es)) - 1;
+        }
+        if ops.len == 4 {
+            // an explicit `, lsl #8`: the byte sits in bits [15:8] of the element
+            if (ops[3].kind != AK_SHIFT) or (ops[3].sh != SH_LSL) or (ops[3].amt != 8) or (es == 8) {
+                bad(A, m);
+                return true;
+            }
+            let full = x * 256;
+            if (es < 64) and ((full >> @as(u64, es)) != 0) and ((full >> @as(u64, es)) != -1) {
+                bad(A, m);
+                return true;
+            }
+            let e = @bit_cast(u64, full) & mask;
+            if ((e & 0xff) != 0) or ((e >> 8) > 255) {
+                bad(A, m);
+                return true;
+            }
+            byte = e >> 8;
+            sh = 1;
+        } else {
+            // the value must fit the element (as signed or unsigned)
+            if (es < 64) and ((x >> @as(u64, es)) != 0) and ((x >> @as(u64, es)) != -1) {
+                bad(A, m);
+                return true;
+            }
+            let e = @bit_cast(u64, x) & mask;
+            if e <= 255 {
+                byte = e;
+                sh = 0;
+            } else if ((e & 0xff) == 0) and ((e >> 8) <= 255) {
+                byte = e >> 8;
+                sh = 1;
+            } else {
+                bad(A, m);
+                return true;
+            }
+        }
+    }
+    w32(A, 0x2520c000 | ab | (op << 16) | (sh << 13) | (byte << 5) | r5(ops[0].reg));
+    return true;
+}
+
+// The bitwise immediate ops (and/orr/eor/bic/dupm): a 13-bit logical immediate
+// over the element, at bit 5. bic inverts the immediate; dupm has one register.
+fn sve_imm_bitwise(A: *mut cr.Asm, m: []u8, ops: []AOp, base: u64, bic: bool, dupm: bool) bool {
+    let nreg = pick_us(dupm, 1, 2);
+    if (ops.len != (nreg + 1)) or (ops[0].kind != AK_ZREG) or (ops[0].esize == 0) or (ops[0].index >= 0) {
+        return false;
+    }
+    if not dupm {
+        if (ops[1].kind != AK_ZREG) or (ops[1].reg != ops[0].reg) or (ops[1].esize != ops[0].esize) {
+            return false;
+        }
+    }
+    let io = ops[ops.len - 1];
+    if (io.kind != AK_IMM) or io.fp {
+        return false;
+    }
+    let v = cr.settle(A, io.v);
+    if not cr.is_const(v) {
+        return false;
+    }
+    let es = ops[0].esize;
+    // the value must fit the element width as a signed or unsigned quantity
+    if es < 64 {
+        let hi = v.k >> @as(u64, es);
+        if (hi != 0) and (hi != -1) {
+            bad(A, m);
+            return true;
+        }
+    }
+    let mut val = @bit_cast(u64, v.k);
+    if bic {
+        val = ~val;
+    }
+    let mut mask: u64 = 0xffffffffffffffff;
+    if es < 64 {
+        mask = (@as(u64, 1) << @as(u64, es)) - 1;
+    }
+    val = val & mask;
+    let mut rep = val;
+    let mut w: u32 = es;
+    while w < 64 {
+        rep = rep | (rep << @as(u64, w));
+        w = w * 2;
+    }
+    let enc = ae.logical_imm(rep, 64);
+    if enc < 0 {
+        bad(A, m);
+        return true;
+    }
+    w32(A, base | (@bit_cast(u64, enc) << 5) | r5(ops[0].reg));
+    return true;
+}
+
+// The FP conversions (fcvt, fcvtzs/u, scvtf/ucvtf) whose source and
+// destination element sizes are baked into the opcode, and ftmad.
+fn sve_fp(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "ftmad") {
+        // ftmad Zdn.T, Zdn.T, Zm.T, #imm (imm 0..7 at bit 16), destructive
+        if (ops.len != 4) or (ops[0].kind != AK_ZREG) or (ops[0].esize < 16) or (ops[1].kind != AK_ZREG) or
+           (ops[1].reg != ops[0].reg) or (ops[1].esize != ops[0].esize) or (ops[2].kind != AK_ZREG) or
+           (ops[2].esize != ops[0].esize) or (ops[3].kind != AK_IMM) or ops[3].fp {
+            return false;
+        }
+        let v = cr.settle(A, ops[3].v);
+        if not cr.is_const(v) or (v.k < 0) or (v.k > 7) {
+            bad(A, m);
+            return true;
+        }
+        let ab = @bit_cast(u64, (u.find("bhsd", view_of(ops[0].esize))) << 22);
+        w32(A, 0x65108000 | ab | (@bit_cast(u64, v.k) << 16) | (r5(ops[2].reg) << 5) | r5(ops[0].reg));
+        return true;
+    }
+    let fcvt = u.str_eq(m, "fcvt");
+    let fz = u.str_eq(m, "fcvtzs") or u.str_eq(m, "fcvtzu");
+    let cvtf = u.str_eq(m, "scvtf") or u.str_eq(m, "ucvtf");
+    if not fcvt and not fz and not cvtf {
+        return false;
+    }
+    if (ops.len != 3) or (ops[0].kind != AK_ZREG) or (ops[0].esize == 0) or (ops[1].kind != AK_PREG) or
+       (ops[1].pq != 'm') or (ops[1].reg > 7) or (ops[2].kind != AK_ZREG) or (ops[2].esize == 0) or
+       (ops[0].index >= 0) or (ops[2].index >= 0) {
+        return false;
+    }
+    let dst = ops[0].esize;
+    let src = ops[2].esize;
+    let mut base = conv_base(m, dst, src);
+    if base == 0 {
+        bad(A, m);
+        return true;
+    }
+    let u1 = u64_pick(u.str_eq(m, "fcvtzu") or u.str_eq(m, "ucvtf"), 0x10000, 0);
+    w32(A, base | u1 | (@as(u64, @bit_cast(u32, ops[1].reg)) << 10) | (r5(ops[2].reg) << 5) | r5(ops[0].reg));
+    return true;
+}
+
+// The base word (Zn, Zd, Pg cleared) for a conversion with destination element
+// `dst` bits and source `src` bits, or 0 if the pair is invalid. The signed
+// (fcvtzs/scvtf) bases; the U bit for fcvtzu/ucvtf is added by the caller.
+fn conv_base(m: []u8, dst: u32, src: u32) u64 {
+    // pairs encoded as (dst * 1000 + src) using bit widths
+    let key = (@as(u64, dst) * 1000) + @as(u64, src);
+    if u.str_eq(m, "fcvt") {
+        if key == 16032 {
+            return 0x6588a000;  // s -> h
+        }
+        if key == 32016 {
+            return 0x6589a000;  // h -> s
+        }
+        if key == 32064 {
+            return 0x65caa000;  // d -> s
+        }
+        if key == 64032 {
+            return 0x65cba000;  // s -> d
+        }
+        if key == 16064 {
+            return 0x65c8a000;  // d -> h
+        }
+        if key == 64016 {
+            return 0x65c9a000;  // h -> d
+        }
+        return 0;
+    }
+    if u.str_eq(m, "fcvtzs") or u.str_eq(m, "fcvtzu") {
+        // key = int-dst * 1000 + fp-src
+        if key == 16016 {
+            return 0x655aa000;
+        }
+        if key == 32016 {
+            return 0x655ca000;
+        }
+        if key == 32032 {
+            return 0x659ca000;
+        }
+        if key == 32064 {
+            return 0x65d8a000;
+        }
+        if key == 64016 {
+            return 0x655ea000;
+        }
+        if key == 64032 {
+            return 0x65dca000;
+        }
+        if key == 64064 {
+            return 0x65dea000;
+        }
+        return 0;
+    }
+    // scvtf/ucvtf: key = fp-dst * 1000 + int-src
+    if key == 16016 {
+        return 0x6552a000;
+    }
+    if key == 16032 {
+        return 0x6554a000;
+    }
+    if key == 16064 {
+        return 0x6556a000;
+    }
+    if key == 32032 {
+        return 0x6594a000;
+    }
+    if key == 64032 {
+        return 0x65d0a000;
+    }
+    if key == 32064 {
+        return 0x65d4a000;
+    }
+    if key == 64064 {
+        return 0x65d6a000;
+    }
+    return 0;
+}
+
+// Predicate operations with special operands: setffr, the while comparisons
+// (a general-register pair whose width sets bit 12), and the predicate mov/not
+// aliases of the predicate logical ops.
+fn sve_pred(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "setffr") {
+        if ops.len != 0 {
+            bad(A, m);
+            return true;
+        }
+        w32(A, 0x252c9000);
+        return true;
+    }
+    if u.starts(m, "while") {
+        return sve_while(A, m, ops);
+    }
+    // predicate mov/movs/not: aliases of orr/orrs/eor on predicates (.b)
+    if (u.str_eq(m, "mov") or u.str_eq(m, "movs")) and (ops.len == 2) and (ops[0].kind == AK_PREG) and
+       (ops[1].kind == AK_PREG) and (ops[1].pq == 0) {
+        // mov Pd.B, Pn.B -> orr Pd.B, Pn/z, Pn.B, Pn.B
+        if (ops[0].esize == 8) and (ops[1].esize == 8) {
+            let base = u64_pick(u.str_eq(m, "movs"), 0x25c04000, 0x25804000);
+            let pn = r5(ops[1].reg);
+            w32(A, base | (pn << 16) | (pn << 10) | (pn << 5) | r5(ops[0].reg));
+            return true;
+        }
+        return false;
+    }
+    if (u.str_eq(m, "mov") or u.str_eq(m, "movs")) and (ops.len == 3) and (ops[0].kind == AK_PREG) and
+       (ops[1].kind == AK_PREG) and (ops[1].pq == 'z') and (ops[2].kind == AK_PREG) and (ops[2].pq == 0) {
+        // mov Pd.B, Pg/z, Pn.B -> and Pd.B, Pg/z, Pn.B, Pn.B
+        if (ops[0].esize == 8) and (ops[2].esize == 8) {
+            let base = u64_pick(u.str_eq(m, "movs"), 0x25404000, 0x25004000);
+            let pn = r5(ops[2].reg);
+            w32(A, base | (r5(ops[1].reg) << 10) | (pn << 16) | (pn << 5) | r5(ops[0].reg));
+            return true;
+        }
+        return false;
+    }
+    if (u.str_eq(m, "not") or u.str_eq(m, "nots")) and (ops.len == 3) and (ops[0].kind == AK_PREG) and
+       (ops[1].kind == AK_PREG) and (ops[1].pq == 'z') and (ops[2].kind == AK_PREG) and (ops[2].pq == 0) and
+       (ops[0].esize == 8) and (ops[2].esize == 8) {
+        // not Pd.B, Pg/z, Pn.B -> eor Pd.B, Pg/z, Pn.B, Pg.B
+        let base = u64_pick(u.str_eq(m, "nots"), 0x25404200, 0x25004200);
+        let pg = r5(ops[1].reg);
+        w32(A, base | (pg << 16) | (pg << 10) | (r5(ops[2].reg) << 5) | r5(ops[0].reg));
+        return true;
+    }
+    return false;
+}
+
+// The while comparisons: Pd.T, <Wn|Xn>, <Wm|Xm>, both the same width (bit 12).
+fn sve_while(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let names = ["whilelt", "whilele", "whilelo", "whilels", "whilege", "whilegt", "whilehs", "whilehi", "whilewr",
+                 "whilerw"];
+    let bases: [10]u64 = [0x25200400, 0x25200410, 0x25200c00, 0x25200c10, 0x25200000, 0x25200010, 0x25200800,
+                          0x25200810, 0x25202000, 0x25202010];
+    let mut bi: i64 = -1;
+    for k in 0..names.len {
+        if u.str_eq(m, names[k]) {
+            bi = @int_cast(i64, k);
+        }
+    }
+    if bi < 0 {
+        return false;
+    }
+    if (ops.len != 3) or (ops[0].kind != AK_PREG) or (ops[0].esize == 0) or (ops[1].kind != AK_REG) or
+       (ops[2].kind != AK_REG) {
+        return false;
+    }
+    if (ops[1].x != ops[2].x) or ops[1].sp or ops[2].sp {
+        bad(A, m);
+        return true;
+    }
+    // whilerw/whilewr take only 64-bit registers
+    if (bi >= 8) and not ops[1].x {
+        bad(A, m);
+        return true;
+    }
+    let es = ops[0].esize;
+    let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+    let sf = u64_pick(ops[1].x, @as(u64, 1) << 12, 0);
+    w32(A, @bit_cast(u64, bases[@int_cast(usize,
+                                          bi)]) | ab | sf | (r5(ops[2].reg) << 16) | (r5(ops[1].reg) << 5) |
+        r5(ops[0].reg));
+    return true;
+}
+
+// Permutes and element-extracts with special operands: tbl/tbx (register
+// lists), ext (a split immediate, destructive), and clasta/clastb/lasta/lastb
+// with a general-register or scalar destination.
+fn sve_perm(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "tbl") or u.str_eq(m, "tbx") {
+        return sve_tbl(A, m, ops);
+    }
+    if u.str_eq(m, "ext") {
+        return sve_ext(A, m, ops);
+    }
+    let cla = u.str_eq(m, "clasta") or u.str_eq(m, "clastb");
+    let las = u.str_eq(m, "lasta") or u.str_eq(m, "lastb");
+    if cla or las {
+        return sve_clast(A, m, ops, cla, u.str_eq(m, "clastb") or u.str_eq(m, "lastb"));
+    }
+    return false;
+}
+
+// tbl Zd.T, { Zn.T } | Zn.T, Zm.T  and the SVE2 two-register tbl; tbx (single).
+fn sve_tbl(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let tbx = m[2] == 'x';
+    if ops.len != 3 {
+        return false;
+    }
+    let d = ops[0];
+    let zm = ops[2];
+    if (d.kind != AK_ZREG) or (d.esize == 0) or (d.index >= 0) or (zm.kind != AK_ZREG) or (zm.esize != d.esize) or
+       (zm.index >= 0) {
+        return false;
+    }
+    let ab = @bit_cast(u64, (u.find("bhsd", view_of(d.esize))) << 22);
+    let mut zn = ops[1].reg;
+    let mut two = false;
+    if ops[1].kind == AK_LIST {
+        if (ops[1].view != 'z') or (ops[1].esize != d.esize) or (ops[1].index >= 0) {
+            return false;
+        }
+        zn = ops[1].reg;
+        if ops[1].nregs == 2 {
+            two = true;
+        } else if ops[1].nregs != 1 {
+            bad(A, m);
+            return true;
+        }
+    } else if (ops[1].kind == AK_ZREG) and (ops[1].esize == d.esize) and (ops[1].index < 0) {
+        zn = ops[1].reg;
+    } else {
+        return false;
+    }
+    if two {
+        if tbx {
+            bad(A, m);
+            return true;
+        }
+        w32(A, 0x05202800 | ab | (r5(zm.reg) << 16) | (r5(zn) << 5) | r5(d.reg));
+        return true;
+    }
+    let base = u64_pick(tbx, 0x05202c00, 0x05203000);
+    w32(A, base | ab | (r5(zm.reg) << 16) | (r5(zn) << 5) | r5(d.reg));
+    return true;
+}
+
+// ext Zdn.B, Zdn.B, Zm.B, #imm (and the SVE2 ext Zd.B, { Zn.B, Zn1.B }, #imm).
+fn sve_ext(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if (ops.len != 3) and (ops.len != 4) {
+        return false;
+    }
+    let d = ops[0];
+    let imo = ops[ops.len - 1];
+    if (d.kind != AK_ZREG) or (d.esize != 8) or (d.index >= 0) or (imo.kind != AK_IMM) or imo.fp {
+        return false;
+    }
+    let v = cr.settle(A, imo.v);
+    if not cr.is_const(v) or (v.k < 0) or (v.k > 255) {
+        if cr.is_const(v) {
+            bad(A, m);
+            return true;
+        }
+        return false;
+    }
+    let im = @bit_cast(u64, v.k);
+    let imf = ((im >> 3) << 16) | ((im & 7) << 10);
+    // the two-register (constructive) form: Zd, { Zn, Zn1 }, #imm
+    if (ops.len == 3) and (ops[1].kind == AK_LIST) {
+        if (ops[1].view != 'z') or (ops[1].esize != 8) or (ops[1].nregs != 2) {
+            return false;
+        }
+        w32(A, 0x05600000 | imf | (r5(ops[1].reg) << 5) | r5(d.reg));
+        return true;
+    }
+    // the destructive form: Zdn, Zdn, Zm, #imm
+    if (ops.len != 4) or (ops[1].kind != AK_ZREG) or (ops[1].esize != 8) or (ops[1].reg != d.reg) or
+       (ops[2].kind != AK_ZREG) or (ops[2].esize != 8) {
+        return false;
+    }
+    w32(A, 0x05200000 | imf | (r5(ops[2].reg) << 5) | r5(d.reg));
+    return true;
+}
+
+// clasta/clastb and lasta/lastb with a general-register or scalar destination.
+fn sve_clast(A: *mut cr.Asm, m: []u8, ops: []AOp, cla: bool, b: bool) bool {
+    // the general-register destination: Rdn appears twice for clast, once for last
+    let want = pick_us(cla, 4, 3);
+    if ops.len != want {
+        return false;
+    }
+    let pg = u64_pick(cla, 1, 1);  // Pg is at [12:10] (3-bit) for all these
+    let zn = ops[ops.len - 1];
+    if (zn.kind != AK_ZREG) or (zn.esize == 0) or (zn.index >= 0) {
+        return false;
+    }
+    let es = zn.esize;
+    let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+    let g = ops[1];
+    if (g.kind != AK_PREG) or (g.reg > 7) or (g.pq != 0) {
+        return false;
+    }
+    let bbit = u64_pick(b, 1, 0);
+    let d = ops[0];
+    if d.kind == AK_REG {
+        // clasta Rdn, Pg, Rdn, Zn  /  lasta Rd, Pg, Zn
+        if (d.x != (es == 64)) or d.sp {
+            return false;
+        }
+        if cla and ((ops[2].kind != AK_REG) or (ops[2].reg != d.reg) or (ops[2].x != d.x)) {
+            return false;
+        }
+        let base = u64_pick(cla, 0x05300000, 0x05200000);
+        w32(A, base | ab | (bbit << 16) | 0xa000 | (@as(u64, @bit_cast(u32,
+                                                                       g.reg)) << 10) | (r5(zn.reg) << 5) | r5(d.reg));
+        return true;
+    }
+    if (d.kind == AK_VREG) and (scalar_bits(&d) == es) {
+        // clasta Vdn, Pg, Vdn, Zn  /  lasta Vd, Pg, Zn
+        if cla and ((ops[2].kind != AK_VREG) or (ops[2].reg != d.reg) or (scalar_bits(&ops[2]) != es)) {
+            return false;
+        }
+        let base = u64_pick(cla, 0x05280000, 0x05200000);
+        w32(A, base | ab | (bbit << 16) | 0x28000 | (@as(u64, @bit_cast(u32,
+                                                                        g.reg)) << 10) | (r5(zn.reg) << 5) | r5(d.reg));
+        return true;
+    }
+    return false;
+}
+
+// The same-size compare aliases cmple/cmplt/cmplo/cmpls, which the assembler
+// writes as cmpge/cmpgt/cmphi/cmphs with the two vector operands swapped (the
+// wide forms, whose last operand is .d, are real encodings in the table).
+fn sve_cmp_alias(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let names = ["cmple", "cmplt", "cmplo", "cmpls"];
+    let to = ["cmpge", "cmpgt", "cmphi", "cmphs"];
+    let mut ci: i64 = -1;
+    for k in 0..names.len {
+        if u.str_eq(m, names[k]) {
+            ci = @int_cast(i64, k);
+        }
+    }
+    if ci < 0 {
+        return false;
+    }
+    // only the 4-operand register form with a same-size last operand
+    if (ops.len != 4) or (ops[3].kind != AK_ZREG) or (ops[3].esize == 0) or (ops[2].kind != AK_ZREG) or
+       (ops[2].esize != ops[3].esize) {
+        return false;
+    }
+    let sw = u.newn.[AOp](4);
+    sw[0] = ops[0];
+    sw[1] = ops[1];
+    sw[2] = ops[3];
+    sw[3] = ops[2];
+    let li = g_snames.get(u.intern(to[@int_cast(usize, ci)]));
+    for fi in g_slists.at(@int_cast(usize, li - 1)).items() {
+        let w = try_sform(A, g_sforms.at(@int_cast(usize, fi)), sw[0..4]);
+        if w >= 0 {
+            w32(A, @bit_cast(u64, w));
+            return true;
+        }
+    }
+    return false;
+}
+
+// ldr/str of a z or p register, and the contiguous ld1/st1 single-register
+// loads and stores. (The multi-register, first/non-fault, replicating,
+// gather/scatter and prefetch forms are not yet encoded.)
+fn sve_ldst(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "ldr") or u.str_eq(m, "str") {
+        return sve_ldr_str(A, m, ops);
+    }
+    return sve_ld1(A, m, ops);
+}
+
+// ldr/str Zt|Pt, [Xn{, #imm, mul vl}]  (imm9 signed -256..255).
+fn sve_ldr_str(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if (ops.len != 2) or (ops[1].kind != AK_MEM) {
+        return false;
+    }
+    let t = ops[0];
+    if (t.kind != AK_ZREG) and (t.kind != AK_PREG) {
+        return false;
+    }
+    if (t.esize != 0) or (t.index >= 0) or (t.pq != 0) {
+        return false;
+    }
+    let mem = ops[1];
+    if (mem.rm >= 0) or mem.pre or (mem.bz != 0) {
+        return false;
+    }
+    let mut imm: i64 = 0;
+    if mem.off {
+        if not mem.mvl {
+            bad(A, m);
+            return true;
+        }
+        let v = cr.settle(A, mem.v);
+        if not cr.is_const(v) or (v.k < -256) or (v.k > 255) {
+            bad(A, m);
+            return true;
+        }
+        imm = v.k;
+    }
+    let iw = @bit_cast(u64, imm) & 0x1ff;
+    let hi = (iw >> 3) << 16;
+    let lo = (iw & 7) << 10;
+    let z = t.kind == AK_ZREG;
+    let base = u64_pick(u.str_eq(m, "str"), @as(u64, 0xe5800000), 0x85800000) | u64_pick(z, 0x4000, 0);
+    w32(A, base | hi | lo | (r5(mem.base) << 5) | r5(t.reg));
+    return true;
+}
+
+// The (mnemonic,element) table of contiguous ld1/st1 forms: each gives the
+// scalar+immediate base word and the memory element size (log2 bytes).
+struct Ld1Form {
+    name: []u8,
+    el: u8,
+    base: u64,
+    msz: u64,
+}
+
+let LD1TAB: [26]Ld1Form = [Ld1Form.{ name: "ld1b", el: 'b', base: 0xa400a000, msz: 0 },
+                           Ld1Form.{ name: "ld1b", el: 'h', base: 0xa420a000, msz: 0 },
+                           Ld1Form.{ name: "ld1b", el: 's', base: 0xa440a000, msz: 0 },
+                           Ld1Form.{ name: "ld1b", el: 'd', base: 0xa460a000, msz: 0 },
+                           Ld1Form.{ name: "ld1h", el: 'h', base: 0xa4a0a000, msz: 1 },
+                           Ld1Form.{ name: "ld1h", el: 's', base: 0xa4c0a000, msz: 1 },
+                           Ld1Form.{ name: "ld1h", el: 'd', base: 0xa4e0a000, msz: 1 },
+                           Ld1Form.{ name: "ld1w", el: 's', base: 0xa540a000, msz: 2 },
+                           Ld1Form.{ name: "ld1w", el: 'd', base: 0xa560a000, msz: 2 },
+                           Ld1Form.{ name: "ld1d", el: 'd', base: 0xa5e0a000, msz: 3 },
+                           Ld1Form.{ name: "ld1sb", el: 'h', base: 0xa5c0a000, msz: 0 },
+                           Ld1Form.{ name: "ld1sb", el: 's', base: 0xa5a0a000, msz: 0 },
+                           Ld1Form.{ name: "ld1sb", el: 'd', base: 0xa580a000, msz: 0 },
+                           Ld1Form.{ name: "ld1sh", el: 's', base: 0xa520a000, msz: 1 },
+                           Ld1Form.{ name: "ld1sh", el: 'd', base: 0xa500a000, msz: 1 },
+                           Ld1Form.{ name: "ld1sw", el: 'd', base: 0xa480a000, msz: 2 },
+                           Ld1Form.{ name: "st1b", el: 'b', base: 0xe400e000, msz: 0 },
+                           Ld1Form.{ name: "st1b", el: 'h', base: 0xe420e000, msz: 0 },
+                           Ld1Form.{ name: "st1b", el: 's', base: 0xe440e000, msz: 0 },
+                           Ld1Form.{ name: "st1b", el: 'd', base: 0xe460e000, msz: 0 },
+                           Ld1Form.{ name: "st1h", el: 'h', base: 0xe4a0e000, msz: 1 },
+                           Ld1Form.{ name: "st1h", el: 's', base: 0xe4c0e000, msz: 1 },
+                           Ld1Form.{ name: "st1h", el: 'd', base: 0xe4e0e000, msz: 1 },
+                           Ld1Form.{ name: "st1w", el: 's', base: 0xe540e000, msz: 2 },
+                           Ld1Form.{ name: "st1w", el: 'd', base: 0xe560e000, msz: 2 },
+                           Ld1Form.{ name: "st1d", el: 'd', base: 0xe5e0e000, msz: 3 }];
+
+fn sve_ld1(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if (ops.len != 3) or (ops[0].kind != AK_LIST) or (ops[0].view != 'z') or (ops[0].nregs != 1) or
+       (ops[2].kind != AK_MEM) {
+        return false;
+    }
+    let es = ops[0].esize;
+    let store = m[0] == 's';
+    // find the (mnemonic, element) form
+    let mut fi: i64 = -1;
+    for k in 0..LD1TAB.len {
+        let f = LD1TAB[k];
+        if u.str_eq(m, f.name) and ((@as(u32, 8) << @bit_cast(u64, u.find("bhsd", f.el))) == es) {
+            fi = @int_cast(i64, k);
+        }
+    }
+    if fi < 0 {
+        return false;
+    }
+    let f = LD1TAB[@int_cast(usize, fi)];
+    // the governing predicate: /z for loads, plain for stores (p0-p7)
+    let g = ops[1];
+    if (g.kind != AK_PREG) or (g.reg > 7) or (g.esize != 0) or (g.index >= 0) {
+        return false;
+    }
+    if store and (g.pq != 0) {
+        return false;
+    }
+    if not store and (g.pq != 'z') {
+        return false;
+    }
+    let gf = @as(u64, @bit_cast(u32, g.reg)) << 10;
+    let mem = ops[2];
+    if (mem.bz != 0) or mem.pre {
+        return false;
+    }
+    if mem.rm >= 0 {
+        // scalar + scalar: Rm at [20:16], lsl #msize, Rm must be x and not sp
+        if (mem.rz != 0) or not mem.rmx or (mem.rm == 31) {
+            bad(A, m);
+            return true;
+        }
+        let want = @bit_cast(i32, @truncate(u32, f.msz));
+        let amt = pick_i64(mem.amt < 0, 0, @as(i64, mem.amt));
+        if (mem.sh != SH_LSL) or (amt != @as(i64, want)) {
+            bad(A, m);
+            return true;
+        }
+        let rbase = (f.base & ~@as(u64, 0xe000)) | 0x4000;
+        w32(A, rbase | (r5(mem.rm) << 16) | gf | (r5(mem.base) << 5) | r5(ops[0].reg));
+        return true;
+    }
+    // scalar + immediate: imm4 signed -8..7 at [19:16]
+    let mut imm: i64 = 0;
+    if mem.off {
+        if not mem.mvl {
+            bad(A, m);
+            return true;
+        }
+        let v = cr.settle(A, mem.v);
+        if not cr.is_const(v) or (v.k < -8) or (v.k > 7) {
+            bad(A, m);
+            return true;
+        }
+        imm = v.k;
+    }
+    w32(A, f.base | ((@bit_cast(u64, imm) & 0xf) << 16) | gf | (r5(mem.base) << 5) | r5(ops[0].reg));
+    return true;
+}
+
+// Parses an optional trailing `pattern{, mul #imm}` from ops[k..]; on success
+// returns the pattern (0..31) in *pat and (mul - 1) in *mulm1 (defaults all, 1).
+fn count_tail(A: *mut cr.Asm, m: []u8, ops: []AOp, k: usize, pat: *mut u64, mulm1: *mut u64) bool {
+    pat.* = 31;
+    mulm1.* = 0;
+    if ops.len <= k {
+        return true;
+    }
+    let po = ops[k];
+    let mut pv: i64 = -1;
+    if (po.kind == AK_EXPR) and (po.name.len > 0) {
+        pv = pat_val(po.name);
+    } else if po.kind == AK_IMM {
+        let v = cr.settle(A, po.v);
+        if cr.is_const(v) and (v.k >= 0) and (v.k <= 31) {
+            pv = v.k;
+        }
+    }
+    if pv < 0 {
+        return false;
+    }
+    pat.* = @bit_cast(u64, pv);
+    if ops.len == (k + 1) {
+        return true;
+    }
+    if (ops.len != (k + 2)) or (ops[k + 1].kind != AK_SHIFT) or (ops[k + 1].sh != SH_MUL) or (ops[k + 1].amt < 1) or
+       (ops[k + 1].amt > 16) {
+        return false;
+    }
+    mulm1.* = @bit_cast(u64, @as(i64, ops[k + 1].amt - 1));
+    return true;
+}
+
+// The element-count instructions (cntb/h/w/d, inc*/dec* and their saturating
+// forms, on a scalar or a vector) and addvl/addpl/rdvl.
+fn sve_count(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "addvl") or u.str_eq(m, "addpl") {
+        return sve_addvl(A, m, ops, false);
+    }
+    if u.str_eq(m, "rdvl") {
+        return sve_addvl(A, m, ops, true);
+    }
+    // split the mnemonic into a stem and an element letter (b h w d)
+    let stems = ["cnt", "inc", "dec", "sqinc", "uqinc", "sqdec", "uqdec"];
+    let mut si: i64 = -1;
+    for k in 0..stems.len {
+        if (m.len == (stems[k].len + 1)) and u.str_eq(m[0..stems[k].len], stems[k]) {
+            si = @int_cast(i64, k);
+        }
+    }
+    if si < 0 {
+        return false;
+    }
+    let el = m[m.len - 1];
+    let ei = u.find("bhwd", el);
+    if ei < 0 {
+        return false;
+    }
+    let sz = @bit_cast(u64, ei) << 22;
+    let ebits = @as(u32, 8) << @truncate(u32, @bit_cast(u64, ei));
+    if ops.len == 0 {
+        return false;
+    }
+    let d = ops[0];
+    // the saturating ops (si 3..6): op index 0..3 for sqinc/uqinc/sqdec/uqdec
+    if si >= 3 {
+        let op = @bit_cast(u64, si - 3);
+        if d.kind == AK_ZREG {
+            // vector saturating inc/dec (h/w/d only, no byte)
+            if (ei == 0) or (d.esize != ebits) or (d.index >= 0) {
+                return false;
+            }
+            let mut pat: u64 = 31;
+            let mut mulm1: u64 = 0;
+            if not count_tail(A, m, ops, 1, &mut pat, &mut mulm1) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, 0x0420c000 | sz | (op << 10) | (mulm1 << 16) | (pat << 5) | r5(d.reg));
+            return true;
+        }
+        if d.kind != AK_REG {
+            return false;
+        }
+        // scalar saturating: signed uses Xdn or Xdn,Wdn; unsigned uses Xdn or Wdn
+        let signed = (op == 0) or (op == 2);
+        let mut sf: u64 = 0;
+        let mut tk: usize = 1;  // where the pattern/mul begins
+        if signed {
+            if d.x and ((ops.len < 2) or (ops[1].kind != AK_REG)) {
+                sf = 1;  // sqincb Xdn
+            } else if d.x and (ops[1].kind == AK_REG) and not ops[1].x and (ops[1].reg == d.reg) {
+                sf = 0;  // sqincb Xdn, Wdn
+                tk = 2;
+            } else {
+                return false;
+            }
+        } else {
+            if d.x {
+                sf = 1;
+            } else {
+                sf = 0;
+            }
+        }
+        if d.sp {
+            return false;
+        }
+        let mut pat: u64 = 31;
+        let mut mulm1: u64 = 0;
+        if not count_tail(A, m, ops, tk, &mut pat, &mut mulm1) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, 0x0420f000 | sz | (sf << 20) | (op << 10) | (mulm1 << 16) | (pat << 5) | r5(d.reg));
+        return true;
+    }
+    // cnt/inc/dec
+    if d.kind == AK_ZREG {
+        // the vector inc/dec (not cnt, not byte)
+        if (si == 0) or (ei == 0) or (d.esize != ebits) or (d.index >= 0) {
+            return false;
+        }
+        let dbit = u64_pick(si == 2, @as(u64, 1) << 10, 0);
+        let mut pat: u64 = 31;
+        let mut mulm1: u64 = 0;
+        if not count_tail(A, m, ops, 1, &mut pat, &mut mulm1) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, 0x0430c000 | sz | dbit | (mulm1 << 16) | (pat << 5) | r5(d.reg));
+        return true;
+    }
+    if (d.kind != AK_REG) or not d.x or d.sp {
+        return false;
+    }
+    let mut pat: u64 = 31;
+    let mut mulm1: u64 = 0;
+    if not count_tail(A, m, ops, 1, &mut pat, &mut mulm1) {
+        bad(A, m);
+        return true;
+    }
+    let base = u64_pick(si == 0, @as(u64, 0x0420e000), u64_pick(si == 2, 0x0430e400, 0x0430e000));
+    w32(A, base | sz | (mulm1 << 16) | (pat << 5) | r5(d.reg));
+    return true;
+}
+
+// addvl/addpl Xd|SP, Xn|SP, #imm6  and rdvl Xd, #imm6 (imm6 signed -32..31).
+fn sve_addvl(A: *mut cr.Asm, m: []u8, ops: []AOp, rd: bool) bool {
+    let want = pick_us(rd, 2, 3);
+    if ops.len != want {
+        return false;
+    }
+    let d = ops[0];
+    if (d.kind != AK_REG) or not d.x {
+        return false;
+    }
+    let io = ops[ops.len - 1];
+    if (io.kind != AK_IMM) or io.fp {
+        return false;
+    }
+    let v = cr.settle(A, io.v);
+    if not cr.is_const(v) or (v.k < -32) or (v.k > 31) {
+        if cr.is_const(v) {
+            bad(A, m);
+            return true;
+        }
+        return false;
+    }
+    let imm = (@bit_cast(u64, v.k) & 0x3f) << 5;
+    if rd {
+        // rdvl: Xd not SP
+        if d.sp {
+            return false;
+        }
+        w32(A, 0x04bf5000 | imm | r5(d.reg));
+        return true;
+    }
+    let n = ops[1];
+    if (n.kind != AK_REG) or not n.x {
+        return false;
+    }
+    let base = u64_pick(u.str_eq(m, "addpl"), @as(u64, 0x04605000), 0x04205000);
+    w32(A, base | imm | (r5(n.reg) << 16) | r5(d.reg));
+    return true;
+}
+
+// The DUP element index for z<n>.T[i]: the imm2:tsz field (bits [23:22] and
+// [20:16]) encodes (i << (log2 esize-bytes + 1)) | (1 << log2) — the lowest set
+// bit gives the element size, the index sits above it. Returns the field, or -1.
+fn dup_idx_field(es: u32, i: i64) i64 {
+    let mut k: u32 = 0;  // log2 of the element's bytes
+    let mut b = es / 8;
+    while b > 1 {
+        b = b / 2;
+        k += 1;
+    }
+    let hi = @bit_cast(i64, @as(u64, 127) >> @as(u64, k + 1));
+    if (i < 0) or (i > hi) {
+        return -1;
+    }
+    let val = (@bit_cast(u64, i) << @as(u64, k + 1)) | (@as(u64, 1) << @as(u64, k));
+    // imm2 (val[6:5]) at [23:22], tsz (val[4:0]) at [20:16]
+    return @bit_cast(i64, ((val >> 5) << 22) | ((val & 0x1f) << 16));
+}
+
+// mov/dup/fmov/fdup/insr: the moves that take a scalar, an immediate (perhaps
+// with `, lsl #8`), or an indexed element, and their mov aliases.
+fn sve_moves(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let is_dup = u.str_eq(m, "dup") or u.str_eq(m, "mov");
+    let is_fdup = u.str_eq(m, "fdup") or u.str_eq(m, "fmov");
+    if u.str_eq(m, "mov") {
+        // mov Zd.D, Zn.D  (whole register): the unpredicated orr Zd.D, Zn.D, Zn.D
+        if (ops.len == 2) and (ops[0].kind == AK_ZREG) and (ops[1].kind == AK_ZREG) and (ops[0].esize == 64) and
+           (ops[1].esize == 64) and (ops[0].index < 0) and (ops[1].index < 0) {
+            w32(A, 0x04603000 | (r5(ops[1].reg) << 16) | (r5(ops[1].reg) << 5) | r5(ops[0].reg));
+            return true;
+        }
+        // mov Zd.T, Pg/m, Zn.T  (merging): the sel Zd, Pg, Zn, Zd
+        if (ops.len == 3) and (ops[0].kind == AK_ZREG) and (ops[0].esize > 0) and (ops[0].index < 0) and
+           (ops[1].kind == AK_PREG) and (ops[1].pq == 'm') and (ops[2].kind == AK_ZREG) and
+           (ops[2].esize == ops[0].esize) and (ops[2].index < 0) {
+            let es = ops[0].esize;
+            let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+            w32(A,
+                0x0520c000 | ab | (r5(ops[0].reg) << 16) | (r5(ops[1].reg) << 10) | (r5(ops[2].reg) << 5) |
+                r5(ops[0].reg));
+            return true;
+        }
+    }
+    if u.str_eq(m, "insr") {
+        if (ops.len != 2) or (ops[0].kind != AK_ZREG) or (ops[0].esize == 0) or (ops[0].index >= 0) {
+            return false;
+        }
+        let es = ops[0].esize;
+        let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+        if ops[1].kind == AK_REG {
+            // insr Zdn.T, <W|X>m
+            if ops[1].sp or (ops[1].x != (es == 64)) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, 0x05243800 | ab | (r5(ops[1].reg) << 5) | r5(ops[0].reg));
+            return true;
+        }
+        if (ops[1].kind == AK_VREG) and (scalar_bits(&ops[1]) == es) {
+            w32(A, 0x05343800 | ab | (r5(ops[1].reg) << 5) | r5(ops[0].reg));
+            return true;
+        }
+        return false;
+    }
+    if is_dup and (ops.len >= 2) and (ops[0].kind == AK_ZREG) and (ops[0].esize > 0) and (ops[0].index < 0) {
+        let d = ops[0];
+        let ab = @bit_cast(u64, (u.find("bhsd", view_of(d.esize))) << 22);
+        // dup Zd.T, <W|X>n (or SP)
+        if (ops.len == 2) and (ops[1].kind == AK_REG) {
+            if ops[1].x != (d.esize == 64) {
+                bad(A, m);
+                return true;
+            }
+            let rn = u64_pick(ops[1].sp, 31, r5(ops[1].reg));
+            w32(A, 0x05203800 | ab | (rn << 5) | r5(d.reg));
+            return true;
+        }
+        // dup Zd.T, Zn.T[i]  (an indexed element; any element size incl .q)
+        if (ops.len == 2) and (ops[1].kind == AK_ZREG) and (ops[1].index >= 0) and (ops[1].esize == d.esize) {
+            let fld = dup_idx_field(d.esize, @as(i64, ops[1].index));
+            if fld < 0 {
+                bad(A, m);
+                return true;
+            }
+            w32(A, 0x05202000 | @bit_cast(u64, fld) | (r5(ops[1].reg) << 5) | r5(d.reg));
+            return true;
+        }
+        // dup Zd.T, #imm{, lsl #8}
+        if ((ops.len == 2) or (ops.len == 3)) and (ops[1].kind == AK_IMM) and not ops[1].fp {
+            let r = dup_mov_imm(A, m, d, ops);
+            return r;
+        }
+        return false;
+    }
+    if is_fdup and (ops.len == 2) and (ops[0].kind == AK_ZREG) and (ops[0].esize >= 16) and (ops[0].index < 0) and
+       (ops[1].kind == AK_IMM) {
+        let es = ops[0].esize;
+        let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+        let mut fv: f64 = 0.0;
+        if ops[1].fp {
+            fv = ops[1].f;
+        } else {
+            let v = cr.settle(A, ops[1].v);
+            if not cr.is_const(v) {
+                return false;
+            }
+            fv = @float_from_int(f64, v.k);
+        }
+        if fv == 0.0 {
+            // fmov Zd.T, #0.0 is the integer dup Zd.T, #0
+            w32(A, 0x2538c000 | ab | r5(ops[0].reg));
+            return true;
+        }
+        let e = fp_imm8(fv);
+        if e < 0 {
+            bad(A, m);
+            return true;
+        }
+        w32(A, 0x2539c000 | ab | (@bit_cast(u64, e) << 5) | r5(ops[0].reg));
+        return true;
+    }
+    return false;
+}
+
+// dup Zd.T, #imm with an optional third operand `lsl #8`.
+fn dup_mov_imm(A: *mut cr.Asm, m: []u8, d: AOp, ops: []AOp) bool {
+    let es = d.esize;
+    let ab = @bit_cast(u64, (u.find("bhsd", view_of(es))) << 22);
+    let v = cr.settle(A, ops[1].v);
+    if not cr.is_const(v) {
+        return false;
+    }
+    let mut x = v.k;
+    let mut sh: u64 = 0;
+    // the field is an 8-bit value (the raw byte of x, or of x >> 8 for the lsl #8
+    // form). .b takes any byte -256..255; the shifted byte's range is -256..255
+    // for .h (a 16-bit element) and -128..127 for .s/.d.
+    let shi = pick_i64(es == 16, 255, 127);
+    let slo = pick_i64(es == 16, -256, -128);
+    if ops.len == 3 {
+        if (ops[2].kind != AK_SHIFT) or (ops[2].sh != SH_LSL) or (ops[2].amt != 8) or (es == 8) or (x < slo) or
+           (x > shi) {
+            bad(A, m);
+            return true;
+        }
+        sh = 1;
+    } else if es == 8 {
+        if (x < -256) or (x > 255) {
+            bad(A, m);
+            return true;
+        }
+    } else if (x >= -128) and (x <= 127) {
+        sh = 0;
+    } else if ((x & 0xff) == 0) and ((x / 256) >= slo) and ((x / 256) <= shi) {
+        x = x / 256;
+        sh = 1;
+    } else {
+        bad(A, m);
+        return true;
+    }
+    w32(A, 0x2538c000 | ab | (sh << 13) | ((@bit_cast(u64, x) & 0xff) << 5) | r5(d.reg));
+    return true;
 }
 
 // -----------------------------------------------------------------------------
