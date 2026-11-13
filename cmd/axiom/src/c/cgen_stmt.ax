@@ -108,6 +108,10 @@ fn function_body(s: *mut cast.CSym) void {
         gasm.naked(f.name, f, s.ty, s.def.body);  // (its body is its asm)
         return;
     }
+    // (C's rules for races and loops, ir.Func: c_progress cleared by the
+    // statements that loop otherwise, loop_ends)
+    f.c_races = true;
+    f.c_progress = true;
     let b = u.new.[Body]();
     b.cases = u.SymMap.[*mut ir.Block].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Block](), cap: 0, len: 0 };
     b.is_main = u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL);
@@ -273,10 +277,13 @@ fn stmt(s: *mut cast.Stmt) void {
     } else if k == cast.StmtKind.FOR {
         for_stmt(s);
     } else if (k == cast.StmtKind.GOTO) and u.notnil(s.e) {
+        cg.F.f.c_progress = false;  // (a goto may loop: not an iteration statement)
         computed_goto(s);
     } else if (k == cast.StmtKind.GOTO) and u.notnil(s.sym.owner) and (s.sym.owner != cg.F.sym) {
+        cg.F.f.c_progress = false;
         gnest.goto_(s.sym);  // (to a label of an enclosing function)
     } else if k == cast.StmtKind.GOTO {
+        cg.F.f.c_progress = false;
         gv.release_to(svla.depth(s.sym));
         cg.br(label_block(s.sym));
     } else if k == cast.StmtKind.CONTINUE {
@@ -304,6 +311,7 @@ fn stmt(s: *mut cast.Stmt) void {
         }
         stmt(s.body);
     } else if k == cast.StmtKind.ASM {
+        cg.F.f.c_progress = false;  // (asm goto may loop)
         asm_stmt(s.asm);
     } else {
         // CASE, DEFAULT
@@ -619,7 +627,16 @@ fn loop_hints(h: *mut ir.Block, s: *cast.Stmt) void {
     h.novector = (x & cpg.LH_NOVECTOR) != 0;
 }
 
+// A loop that 6.8.5p6 does not let be taken to end (its controlling
+// expression a constant, or none) clears the function's c_progress.
+fn loop_ends(e: *cast.Expr) void {
+    if u.isnil(e) or e.is_const {
+        cg.F.f.c_progress = false;
+    }
+}
+
 fn while_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
     let head = cg.new_block("while");
     loop_hints(head, s);
     let body = cg.new_block("body");
@@ -636,6 +653,7 @@ fn while_stmt(s: *mut cast.Stmt) void {
 }
 
 fn do_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
     let body = cg.new_block("do");
     loop_hints(body, s);
     let cond = cg.new_block("dotest");
@@ -652,6 +670,7 @@ fn do_stmt(s: *mut cast.Stmt) void {
 }
 
 fn for_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
     let d0 = gv.depth();
     let sc = cdbg.open_for(s.decl);
     let mut rs = ir.rtag;

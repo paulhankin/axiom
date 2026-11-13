@@ -1403,7 +1403,9 @@ fn call_lib(name: []u8, args: []i32) void {
     MF.has_calls = true;
 }
 
-// memcpy / memmove / memset. Copies of a constant size up to 128 bytes are
+// memcpy / memmove / memset. Forward copies and fills of a constant size
+// up to 2 KiB beyond those below are loops of Q-register pairs (pair_loop),
+// the others calls. Copies of a constant size up to 128 bytes are
 // 16-, 8-, 4-, 2- and 1-byte loads and stores: for memcpy, and memmove of
 // operands the same or apart (ir.same_or_apart), each store after its
 // load (a forward copy, which copies the same bytes onto themselves); for
@@ -1469,6 +1471,11 @@ fn gen_memop(v: *mut ir.Value) void {
         }
         return;
     }
+    if is.is_c(v.c) and (is.cval(v.c) > 64) and (is.cval(v.c) <= 2048) and
+       (((o == ir.OP_MEMSET) and is.is_c(v.b)) or ((o != ir.OP_MEMSET) and fwd)) {
+        pair_loop(v, is.cval(v.c));
+        return;
+    }
     let args: [3]i32 = [reg(v.a), reg(v.b), reg(v.c)];
     if o == ir.OP_MEMSET {
         call_lib("memset", args[..]);
@@ -1477,6 +1484,96 @@ fn gen_memop(v: *mut ir.Value) void {
     } else {
         call_lib("memmove", args[..]);
     }
+}
+
+// LDP / STP of two Q registers (Rt in the Rd field, Rt2 in the Ra field, Rn
+// the base): mode 1 post-index (the base moves by imm after the access),
+// 2 signed offset; imm a multiple of 16 in -1024..1008.
+fn pair_q(load: bool, mode: u64, imm: i64) u64 {
+    let mut w: u64 = 0xAC00_0000 | (mode << 23);
+    if load {
+        w = w | (1 << 22);
+    }
+    return w | ((@bit_cast(u64, imm / 16) & 0x7f) << 15);
+}
+
+// A forward copy (memcpy, or memmove of operands the same or apart) of n
+// bytes, 128 < n <= 2048, or a fill of n bytes, 64 < n <= 2048, with a
+// constant byte: a loop of two LDP / STP pairs of Q registers (64 bytes) an
+// iteration, n / 64 times, the pointers moved by the second pair
+// (post-index); then, when n % 64 is not 0, the last 64 bytes from the
+// pointers moved back by 64 - n % 64 (overlapping the loop's last bytes,
+// which then hold what the source has there, and so right for operands
+// that are the same). Destinations are not aligned first: on AArch64
+// processors an unaligned Q store costs about as much as an aligned one
+// (only crossing a cache line costs more), unlike x86-64's copy_loop.
+fn pair_loop(v: *mut ir.Value, n: i64) void {
+    let set = v.op == ir.OP_MEMSET;
+    let pd = vgpr();
+    copy(pd, reg(v.a), GPR);
+    let mut ps: i32 = -1;
+    let mut q: [4]i32 = [-1; 4];
+    if set {
+        // the byte in every lane (movi #0 for zeros)
+        q[0] = vvr();
+        let byte = is.cval(v.b) & 0xff;
+        if byte == 0 {
+            raw1(ae.movi_zero(0), q[0]);
+        } else {
+            let b = vgpr();
+            movi(b, byte, 0);
+            raw2(ae.dup_gen(0, 0, 0), q[0], b);
+        }
+        q[1] = q[0];
+        q[2] = q[0];
+        q[3] = q[0];
+    } else {
+        ps = vgpr();
+        copy(ps, reg(v.b), GPR);
+    }
+    let cnt = vgpr();
+    movi(cnt, n / 64, 1);
+    let lp = new_label();
+    place(lp);
+    pair_step(set, ps, pd, q, 64);
+    add_imm(1, cnt, cnt, -1);
+    // (live across the back edge: the pointers, a fill's pattern)
+    let mut uses: [2]i32 = [pd, ps];
+    if set {
+        uses[1] = q[0];
+    }
+    loop_branch(CBZ, 1, cnt, lp, uses[..]);
+    let r = n % 64;
+    if r != 0 {
+        add_imm(1, pd, pd, r - 64);
+        if not set {
+            add_imm(1, ps, ps, r - 64);
+        }
+        pair_step(set, ps, pd, q, 0);
+    }
+}
+
+// 64 bytes from [ps] to [pd] (a fill: q's registers to [pd]), then the
+// pointers moved by `step` (0 or 64).
+fn pair_step(set: bool, ps: i32, pd: i32, q0: [4]i32, step: i64) void {
+    let mut q = q0;
+    let mut mode: u64 = 1;
+    let mut bs = RW(ps);
+    let mut bd = RW(pd);
+    if step == 0 {
+        mode = 2;
+        bs = R(ps);
+        bd = R(pd);
+    }
+    if not set {
+        for k in @as(usize, 0)..4 {
+            q[k] = vvr();
+        }
+        _ = raw(pair_q(true, 2, 32), W(q[0]), R(ps), NONE(), W(q[1]));
+        _ = raw(pair_q(true, mode, step), W(q[2]), bs, NONE(), W(q[3]));
+    }
+    _ = raw(pair_q(false, 2, 32), R(q[0]), R(pd), NONE(), R(q[1]));
+    _ = raw(pair_q(false, mode, step), R(q[2]), bd, NONE(), R(q[3]));
 }
 
 // -----------------------------------------------------------------------------

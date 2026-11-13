@@ -1126,3 +1126,532 @@ pub fn forward_copies(f: *mut ir.Func) bool {
     }
     return any;
 }
+
+// -----------------------------------------------------------------------------
+// Building a slot's contents where they are copied to (forward_into).
+//
+// A slot T filled and then copied whole into D, `memcpy(D, T, n)` (or a
+// memmove: T is apart from D), as C's `t` built and then `*r = t;` or a
+// result built in a local: T's accesses can be D's, and the copy go, when
+//   1. T's address goes nowhere: it is only loaded from and stored to (not
+//      volatile or atomic accesses), copied from or into, filled, offset;
+//   2. T is fresh at K, the region's entry: the function's entry, or the
+//      entry of a callee inlined there whose local T is (an object of each
+//      call's own, whose contents before the callee writes them are
+//      indeterminate: what D holds is as good). Every path from K reaches
+//      the copy C or ends the program (an unreachable block: a trap), and
+//      none comes back to K;
+//   3. no use of T is on a path from C: T is dead after it;
+//   4. D is defined before K (a parameter, a global, a stack slot, or the
+//      caller's value at the inlined call), and C copies the whole of T;
+//   5. no instruction in S, those on a path from K to C, other than T's
+//      accesses, reads or writes D's object: each other memory access is
+//      to an object known apart from D's (a different global or slot; a
+//      slot of this function and a parameter, which cannot point into it;
+//      the result's memory, ir.EXT_SRET: the caller's fresh slot, and any
+//      other object), and S has no call, no intrinsic but pure ones, no
+//      atomic access and no fence. Then the program reads and writes D only
+//      through T's accesses until C, and from C on as before;
+//   6. other threads: D's bytes now change before C. Another thread that
+//      sees them change without a data race would have to synchronize with
+//      S, which it cannot (5); a racing read may see them, which Axiom
+//      defines (spec §12.8.2: it returns what some store wrote) and C does
+//      not (C11 5.1.2.4p25), and if C is never reached (a loop in S running
+//      forever), there is no race with C's write in the original. So D is
+//      a thread's own (the result's memory, or a slot whose address goes
+//      nowhere), or the code is C's (ir.Func.c_races) and either S has no
+//      loop or every loop in the code ends (ir.Func.c_progress, C11
+//      6.8.5p6: S does no I/O, no volatile or atomic access, no
+//      synchronization).
+// D's accesses then have the alignment that is known of D, if less than
+// T's.
+// -----------------------------------------------------------------------------
+
+fn key(p: *ir.Value) u64 {
+    return @as(u64, @int_from_ptr(p));
+}
+
+fn bkey(b: *ir.Block) u64 {
+    return @as(u64, @int_from_ptr(b));
+}
+
+// The object address p is in (through ptradds): an alloca, a parameter or a
+// global; nil when it is none of these.
+fn root_of(p0: *mut ir.Value) *mut ir.Value {
+    let mut p = ir.resolve(p0);
+    while ir.is_op(p, ir.OP_PTRADD) {
+        p = ir.resolve(p.a);
+    }
+    if u.notnil(p) and (ir.is_op(p, ir.OP_ALLOCA) or (p.kind == ir.V_PARAM) or (p.kind == ir.V_GLOBAL)) {
+        return p;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// Is parameter p the result's memory (the caller's fresh slot)?
+fn sret_param(p: *ir.Value) bool {
+    if p.kind != ir.V_PARAM {
+        return false;
+    }
+    let f = ir.fnp_of(p);
+    let k = @truncate(usize, p.cv);
+    return (k < f.param_ext.len) and ((f.param_ext[k] == ir.EXT_SRET) or (f.param_ext[k] == ir.EXT_X8SRET));
+}
+
+// Are accesses through an address in object r apart from D's object rd (5)?
+fn apart_from(r: *mut ir.Value, rd: *mut ir.Value) bool {
+    if u.isnil(r) or u.isnil(rd) or (r == rd) {
+        return false;
+    }
+    if ir.objects_apart(r, rd) or sret_param(rd) or sret_param(r) {
+        return true;
+    }
+    let ra = ir.is_op(r, ir.OP_ALLOCA);
+    let da = ir.is_op(rd, ir.OP_ALLOCA);
+    return (ra and (rd.kind == ir.V_PARAM)) or (da and (r.kind == ir.V_PARAM));
+}
+
+// Does the address of slot s go nowhere in f (only loads, stores to it,
+// copies, fills and offsets)?
+fn slot_private(f: *mut ir.Func, s: *mut ir.Value) bool {
+    let mut der = u.U64Map.empty();
+    der.put(key(s), 1);
+    let mut ok = true;
+    let mut grew = true;
+    while grew and ok {
+        grew = false;
+        let mut b = f.first;
+        while u.notnil(b) and ok {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let h = access_kind(i, &mut der);
+                if h == 2 {
+                    if der.get(key(i)) == 0 {
+                        der.put(key(i), 1);
+                        grew = true;
+                    }
+                } else if h < 0 {
+                    ok = false;
+                    break;
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
+    der.deinit();
+    return ok;
+}
+
+fn in_set(m: *mut u.U64Map, v: *mut ir.Value) bool {
+    return u.notnil(v) and (m.get(key(ir.resolve(v))) != 0);
+}
+
+// How instruction i uses the addresses in der (the slot and its offsets): 0
+// not at all, 1 an access of the slot (a load, store, copy, fill), 2 an
+// offset of it (i is in the slot too), -1 otherwise (its address escapes, or
+// the access is volatile or atomic).
+fn access_kind(i: *mut ir.Value, der: *mut u.U64Map) i32 {
+    let a = in_set(der, i.a);
+    let b = in_set(der, i.b);
+    let c = in_set(der, i.c);
+    let mut x = false;
+    for k in 0..i.xs.len {
+        if in_set(der, i.xs.get(k)) {
+            x = true;
+        }
+    }
+    if not a and not b and not c and not x {
+        return 0;
+    }
+    if x or c {
+        return -1;
+    }
+    let op = i.op;
+    let plain = i.flags == 0;
+    if (op == ir.OP_LOAD) and plain {
+        return 1;
+    }
+    if (op == ir.OP_STORE) and plain and not a {
+        return 1;
+    }
+    if ((op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE)) and plain {
+        return 1;
+    }
+    if (op == ir.OP_MEMSET) and plain and not b {
+        return 1;
+    }
+    if (op == ir.OP_PTRADD) and not b {
+        return 2;
+    }
+    return -1;
+}
+
+// What forward_into knows of a region: its blocks (all of f's when whole).
+struct Region {
+    f: *mut ir.Func,
+    code: *mut ir.Func,  // whose code the region's is (f's, or the inlined function's)
+    k: *mut ir.Block,
+    whole: bool,
+    blocks: *mut u.U64Map,
+    outs: *u.List.[*mut ir.Value],  // values used outside the region (an inlined function's results)
+}
+
+fn in_region(r: *Region, b: *mut ir.Block) bool {
+    return r.whole or (r.blocks.get(bkey(b)) != 0);
+}
+
+// Builds slot t's contents in its whole copy's destination where 1-6 above
+// hold; true if it did.
+fn forward_slot(r: *Region, t: *mut ir.Value, bl: *u.List.[*mut ir.Block]) bool {
+    let size = ir.aty_of(t).size;
+    // T and its offsets (der), and its one whole copy out (c)
+    let mut der = u.U64Map.empty();
+    der.put(key(t), 1);
+    let mut uses = u.U64Map.empty();
+    let mut c = u.nil.[ir.Value]();
+    let mut ok = true;
+    let mut grew = true;
+    while grew and ok {
+        grew = false;
+        c = u.nil.[ir.Value]();
+        for b in bl.items() {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let h = access_kind(i, &mut der);
+                if h < 0 {
+                    ok = false;
+                    break;
+                }
+                if (h == 2) and (der.get(key(i)) == 0) {
+                    der.put(key(i), 1);
+                    grew = true;
+                }
+                if h == 1 {
+                    uses.put(key(i), 1);
+                    let whole_out = ((i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE)) and (ir.resolve(i.b) == t) and
+                                    not in_set(&mut der, i.a) and ir.is_cint(i.c) and (ir.cint_val(i.c) == size);
+                    if whole_out {
+                        if u.notnil(c) {
+                            ok = false;  // (two: neither is the last use)
+                        }
+                        c = i;
+                    }
+                }
+                i = i.next;
+            }
+            if not ok {
+                break;
+            }
+        }
+    }
+    // (1: T's address goes nowhere outside the region either)
+    for x in r.outs.items() {
+        if in_set(&mut der, x) {
+            ok = false;
+        }
+    }
+    let mut done = false;
+    if ok and u.notnil(c) {
+        done = forward_to(r, t, c, &mut der, &mut uses);
+    }
+    der.deinit();
+    uses.deinit();
+    return done;
+}
+
+fn forward_to(r: *Region, t: *mut ir.Value, c: *mut ir.Value, der: *mut u.U64Map, uses: *mut u.U64Map) bool {
+    let d = ir.resolve(c.a);
+    // 4: D is there at K
+    let mut before = (d.kind == ir.V_PARAM) or (d.kind == ir.V_GLOBAL) or ir.is_op(d, ir.OP_ALLOCA);
+    if not before and not r.whole and (d.kind == ir.V_INST) and u.notnil(d.blk) and not in_region(r, d.blk) {
+        before = true;
+    }
+    if not before {
+        return false;
+    }
+    let rd = root_of(d);
+    if u.isnil(rd) {
+        return false;
+    }
+    let cb = c.blk;
+    // 2 and 5: the blocks on paths from K to C (s), each instruction checked
+    let mut s = u.U64Map.empty();
+    let mut work = u.List.[*mut ir.Block].empty();
+    let mut sl = u.List.[*mut ir.Block].empty();
+    let mut ok = true;
+    work.push(r.k);
+    s.put(bkey(r.k), 1);
+    while (work.len > 0) and ok {
+        let b = work.pop();
+        sl.push(b);
+        let mut i = b.first;
+        while u.notnil(i) and (i != c) {
+            if (uses.get(key(i)) == 0) and not other_ok(i, rd) {
+                ok = false;
+                break;
+            }
+            if (uses.get(key(i)) != 0) and not memop_ok(i, rd, der) {
+                ok = false;  // (a copy between T and D's object: would be within D)
+                break;
+            }
+            i = i.next;
+        }
+        if b == cb {
+            continue;  // (C ends the path)
+        }
+        let tm = ir.terminator(b);
+        if u.isnil(tm) or (tm.op == ir.OP_RET) {
+            ok = false;  // (a way out without C)
+            break;
+        }
+        for k in 0..ir.succ_count(tm) {
+            let n = ir.succ(tm, k);
+            if (n == r.k) or not in_region(r, n) {
+                ok = false;  // (back to K, or out without C)
+                break;
+            }
+            if s.get(bkey(n)) == 0 {
+                s.put(bkey(n), 1);
+                work.push(n);
+            }
+        }
+    }
+    // 3: no use of T on a path from C
+    if ok {
+        ok = dead_after(r, c, uses);
+    }
+    // 6: D another thread may see
+    if ok and not (sret_param(rd) or (ir.is_op(rd, ir.OP_ALLOCA) and slot_private(r.f, rd))) {
+        ok = r.code.c_races and (r.code.c_progress or not has_cycle(&sl, &mut s, cb));
+    }
+    s.deinit();
+    work.deinit();
+    sl.deinit();
+    if not ok {
+        return false;
+    }
+    // T's accesses are D's, with the alignment known of D
+    let mut al: u32 = 1;
+    if rd.kind == ir.V_GLOBAL {
+        al = @int_cast(u32, ir.gv_of(rd).align);
+    } else if ir.is_op(rd, ir.OP_ALLOCA) {
+        al = rd.align;
+    }
+    if rd != d {
+        al = 1;  // (an offset into it)
+    }
+    let mut b = r.f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (uses.get(key(i)) != 0) and ((i.op == ir.OP_LOAD) or (i.op == ir.OP_STORE)) and (i.align > al) {
+                i.align = al;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    ir.remove_inst(c);
+    ir.replace_uses(r.f, t, d);
+    return true;
+}
+
+// May instruction i (not an access of T) be among those between K and C,
+// D's object rd (5)?
+fn other_ok(i: *mut ir.Value, rd: *mut ir.Value) bool {
+    let op = i.op;
+    if op == ir.OP_CALL {
+        // (but a trap, which ends the program: what is seen of its memory
+        // after that is not the program's)
+        let g = ir.direct_callee(i);
+        return u.notnil(g) and u.str_eq(g.name, "axiom.trap");
+    }
+    if (op == ir.OP_FENCE) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) {
+        return false;
+    }
+    if op == ir.OP_INTR {
+        return ir.inst_pure(i);
+    }
+    if op == ir.OP_LOAD {
+        return ((i.flags & ir.F_ATOMIC) == 0) and apart_from(root_of(i.a), rd);
+    }
+    if op == ir.OP_STORE {
+        return ((i.flags & ir.F_ATOMIC) == 0) and apart_from(root_of(i.b), rd);
+    }
+    if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+        return apart_from(root_of(i.a), rd) and apart_from(root_of(i.b), rd);
+    }
+    if op == ir.OP_MEMSET {
+        return apart_from(root_of(i.a), rd);
+    }
+    return not ir.op_accesses_mem(op);
+}
+
+// An access of T (i) whose other operand, a copy's, is in T too or apart from
+// D's object rd (5).
+fn memop_ok(i: *mut ir.Value, rd: *mut ir.Value, der: *mut u.U64Map) bool {
+    if (i.op != ir.OP_MEMCPY) and (i.op != ir.OP_MEMMOVE) {
+        return true;
+    }
+    let a = in_set(der, i.a) or apart_from(root_of(i.a), rd);
+    let b = in_set(der, i.b) or apart_from(root_of(i.b), rd);
+    return a and b;
+}
+
+// Is no use of T (uses) on a path from C (before the region's end)?
+fn dead_after(r: *Region, c: *mut ir.Value, uses: *mut u.U64Map) bool {
+    let mut i = c.next;
+    while u.notnil(i) {
+        if uses.get(key(i)) != 0 {
+            return false;
+        }
+        i = i.next;
+    }
+    let mut seen = u.U64Map.empty();
+    let mut work = u.List.[*mut ir.Block].empty();
+    let mut ok = true;
+    let t0 = ir.terminator(c.blk);
+    for k in 0..ir.succ_count(t0) {
+        work.push(ir.succ(t0, k));
+    }
+    while (work.len > 0) and ok {
+        let b = work.pop();
+        if not in_region(r, b) or (seen.get(bkey(b)) != 0) {
+            continue;
+        }
+        seen.put(bkey(b), 1);
+        if b == r.k {
+            ok = false;
+            break;
+        }
+        let mut j = b.first;
+        while u.notnil(j) {
+            if uses.get(key(j)) != 0 {
+                ok = false;
+                break;
+            }
+            j = j.next;
+        }
+        let tm = ir.terminator(b);
+        for k in 0..ir.succ_count(tm) {
+            work.push(ir.succ(tm, k));
+        }
+    }
+    seen.deinit();
+    work.deinit();
+    return ok;
+}
+
+// Do the blocks of S (sl, in s; C's block cb ends its paths) form a loop?
+fn has_cycle(sl: *u.List.[*mut ir.Block], s: *mut u.U64Map, cb: *mut ir.Block) bool {
+    // (Kahn's algorithm: S is acyclic iff every block can be taken once its
+    // predecessors in S are)
+    let mut indeg = u.U64Map.empty();
+    for b in sl.items() {
+        if b == cb {
+            continue;
+        }
+        let tm = ir.terminator(b);
+        for k in 0..ir.succ_count(tm) {
+            let n = ir.succ(tm, k);
+            if s.get(bkey(n)) != 0 {
+                indeg.put(bkey(n), indeg.get(bkey(n)) + 1);
+            }
+        }
+    }
+    let mut work = u.List.[*mut ir.Block].empty();
+    for b in sl.items() {
+        if indeg.get(bkey(b)) == 0 {
+            work.push(b);
+        }
+    }
+    let mut taken: usize = 0;
+    while work.len > 0 {
+        let b = work.pop();
+        taken += 1;
+        if b == cb {
+            continue;
+        }
+        let tm = ir.terminator(b);
+        for k in 0..ir.succ_count(tm) {
+            let n = ir.succ(tm, k);
+            if s.get(bkey(n)) != 0 {
+                let m = indeg.get(bkey(n)) - 1;
+                indeg.put(bkey(n), m);
+                if m == 0 {
+                    work.push(n);
+                }
+            }
+        }
+    }
+    indeg.deinit();
+    let n = sl.len;
+    work.deinit();
+    return taken != n;
+}
+
+/// forward_into over the slots of g, inlined into f at a call: allocas, the
+/// clones of its allocas; blocks, the clones of its blocks, of which k is
+/// the entry; outs, the values it returns (used outside the blocks). True if any slot's contents were built where they are copied.
+pub fn forward_inlined(f: *mut ir.Func, g: *mut ir.Func, k: *mut ir.Block, blocks: *u.List.[*mut ir.Block],
+                       allocas: *u.List.[*mut ir.Value], outs: *u.List.[*mut ir.Value]) bool {
+    let mut m = u.U64Map.empty();
+    for b in blocks.items() {
+        m.put(bkey(b), 1);
+    }
+    let r = Region.{ f: f, code: g, k: k, whole: false, blocks: &mut m, outs: outs };
+    let mut any = false;
+    for t in allocas.items() {
+        if forward_slot(&r, t, blocks) {
+            any = true;
+        }
+    }
+    m.deinit();
+    return any;
+}
+
+/// forward_into over the slots of f, from its entry. True if any slot's
+/// contents were built where they are copied.
+pub fn forward_into(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    // the candidates: slots copied whole into something else
+    let mut ts = u.List.[*mut ir.Value].empty();
+    let mut bl = u.List.[*mut ir.Block].empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        bl.push(b);
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE)) and whole(i, ir.resolve(i.b)) {
+                let t = ir.resolve(i.b);
+                let mut dup = false;
+                for x in ts.items() {
+                    if x == t {
+                        dup = true;
+                    }
+                }
+                if not dup {
+                    ts.push(t);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut m = u.U64Map.empty();
+    let none = u.List.[*mut ir.Value].empty();
+    let r = Region.{ f: f, code: f, k: f.first, whole: true, blocks: &mut m, outs: &none };
+    let mut any = false;
+    for t in ts.items() {
+        if forward_slot(&r, t, &bl) {
+            any = true;
+        }
+    }
+    m.deinit();
+    ts.deinit();
+    bl.deinit();
+    return any;
+}

@@ -2999,8 +2999,9 @@ fn gen_store(v: *mut ir.Value) void {
 // in vectors (up to 32 bytes wide: ymm needs no AVX-512 frequency licence)
 // and, at the end, one more vector overlapping the last, or below 16 bytes
 // integer moves; fills with a constant byte likewise as vector stores, and
-// up to 2 KiB as a loop of them (four a time); forward copies (memcpy, and
-// memmove of operands the same or apart) up to 2 KiB as a loop. Others are
+// up to 2 KiB as a loop of them (four a time, to cache-line-aligned
+// destinations: copy_loop); forward copies (memcpy, and memmove of operands
+// the same or apart) up to 2 KiB as a loop likewise. Others are
 // rep movsb / stosb (a memmove's backward when the destination is above the
 // source and within its length).
 fn gen_memop(v: *mut ir.Value) void {
@@ -3254,33 +3255,57 @@ fn small_copy(dm: mc.MOp, sm: mc.MOp, n: i64) void {
     regs.deinit();
 }
 
-// A memcpy of 256 to 2048 bytes: a loop of vector loads and stores, then
-// one more overlapping the end.
+// A forward copy (memcpy, or memmove of operands the same or apart) of n
+// bytes, 256 < n <= 2048, in vectors of w bytes (16, or 32 with AVX): the
+// first 64 bytes; then from i = (-d) & 63, the first offset at which the
+// destination is on a cache line's start, four vectors an iteration while
+// i < n - 4w (so that no store splits a line: a split store costs about as
+// much as two, and unaligned destinations made a plain loop twice as slow);
+// then the last 4w bytes. The parts overlap, and each stores bytes the
+// source has there: so any i in 0..64 is right, and so the destination may
+// equal the source (each byte copied onto itself). n > 64 + 4w, so the loop
+// runs at least once and its parts cover 0..n.
 fn copy_loop(v: *mut ir.Value, n: i64) void {
     let w = memop_width();
-    let full = n - (n % w);
     let outer_vl = VL;
     VL = chunk_vl(w);
     let d = reg(v.a);
     let s = reg(v.b);
+    vec_copy4(d, s, 0, 64 / w, w);
     let i = vgpr();
-    _ = e2(xe.MOV_RI, 4, W(i), I(0));
+    _ = e2(xe.MOV_RR, 8, W(i), R(d));
+    let ng = e1(xe.UNARY, 8, RW(i));
+    ng.cc = 3;  // neg
+    _ = alu(xe.ALU_AND, 8, RW(i), I(63));
     let top = new_label();
     place(top);
-    let t = vxmm();
-    _ = sse2(xe.MOVDQU_LD, W(t), mc.mem(s, i, 1, 0));
-    _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(d, i, 1, 0));
-    _ = alu(xe.ALU_ADD, 8, RW(i), I(w));
-    _ = alu(xe.ALU_CMP, 8, R(i), I(full));
+    let mut ts: [4]i32 = [0; 4];
+    for k in @as(usize, 0)..4 {
+        ts[k] = vxmm();
+        _ = sse2(xe.MOVDQU_LD, W(ts[k]), mc.mem(s, i, 1, @int_cast(i64, k) * w));
+    }
+    for k in @as(usize, 0)..4 {
+        _ = sse2(xe.MOVDQU_ST, R(ts[k]), mc.mem(d, i, 1, @int_cast(i64, k) * w));
+    }
+    _ = alu(xe.ALU_ADD, 8, RW(i), I(4 * w));
+    _ = alu(xe.ALU_CMP, 8, R(i), I(n - (4 * w)));
     let ops: [4]mc.MOp = [mc.label(top), R(i), R(d), R(s)];
     let j = emit(xe.JCC, 0, ops[..]);
     j.cc = xe.CC_B;
-    if full != n {
-        let u2 = vxmm();
-        _ = sse2(xe.MOVDQU_LD, W(u2), mc.mem(s, -1, 0, n - w));
-        _ = sse2(xe.MOVDQU_ST, R(u2), mc.mem(d, -1, 0, n - w));
-    }
+    vec_copy4(d, s, n - (4 * w), 4, w);
     VL = outer_vl;
+}
+
+// m vectors of w bytes from s + k to d + k (all loaded, then all stored).
+fn vec_copy4(d: i32, s: i32, k: i64, m: i64, w: i64) void {
+    let mut ts: [4]i32 = [0; 4];
+    for j in @as(usize, 0)..@as(usize, @int_cast(usize, m)) {
+        ts[j] = vxmm();
+        _ = sse2(xe.MOVDQU_LD, W(ts[j]), mc.mem(s, -1, 0, k + (@int_cast(i64, j) * w)));
+    }
+    for j in @as(usize, 0)..@as(usize, @int_cast(usize, m)) {
+        _ = sse2(xe.MOVDQU_ST, R(ts[j]), mc.mem(d, -1, 0, k + (@int_cast(i64, j) * w)));
+    }
 }
 
 fn small_fill(v: *mut ir.Value, n: i64, byte: i64) void {
@@ -3315,38 +3340,31 @@ fn small_fill(v: *mut ir.Value, n: i64, byte: i64) void {
         _ = sse2(xe.MOVDQU_LD, W(t), const16(@bit_cast(u64, pat), @bit_cast(u64, pat)));
     }
     if n > 256 {
-        // a loop over the whole vectors, four a time: [p + i], ... [p + i + 3w]
-        // for i = 0, 4w, ... < n - n % 4w; then the whole vectors left
-        let full = n - (n % wmax);
-        let full4 = n - (n % (4 * wmax));
+        // as copy_loop: the first 64 bytes; four vectors an iteration from
+        // i = (-p) & 63 (p + i on a cache line's start) while i < n - 4w; the
+        // last 4w bytes (n > 64 + 4w: the loop runs, and the parts cover 0..n)
         let p = reg(v.a);
+        for k in @as(i64, 0)..(64 / wmax) {
+            _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, -1, 0, k * wmax));
+        }
         let i = vgpr();
-        _ = e2(xe.MOV_RI, 4, W(i), I(0));
+        _ = e2(xe.MOV_RR, 8, W(i), R(p));
+        let ng = e1(xe.UNARY, 8, RW(i));
+        ng.cc = 3;  // neg
+        _ = alu(xe.ALU_AND, 8, RW(i), I(63));
         let top = new_label();
         place(top);
         for k in @as(i64, 0)..4 {
             _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, i, 1, k * wmax));
         }
         _ = alu(xe.ALU_ADD, 8, RW(i), I(4 * wmax));
-        _ = alu(xe.ALU_CMP, 8, R(i), I(full4));
+        _ = alu(xe.ALU_CMP, 8, R(i), I(n - (4 * wmax)));
         let ops: [4]mc.MOp = [mc.label(top), R(i), R(p), R(t)];
         let j = emit(xe.JCC, 0, ops[..]);
         j.cc = xe.CC_B;
-        let mut k = full4;
-        while k < full {
-            let mut d2 = dm;
-            d2.disp += k;
-            _ = sse2(xe.MOVDQU_ST, R(t), d2);
-            k += wmax;
+        for k in @as(i64, 0)..4 {
+            _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, -1, 0, n - ((4 - k) * wmax)));
         }
-        if full == n {
-            VL = outer_vl;
-            return;
-        }
-        // the rest: one vector overlapping the end
-        let mut d2 = dm;
-        d2.disp += n - wmax;
-        _ = sse2(xe.MOVDQU_ST, R(t), d2);
         VL = outer_vl;
         return;
     }
