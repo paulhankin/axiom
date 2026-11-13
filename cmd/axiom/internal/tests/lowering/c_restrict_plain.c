@@ -6,8 +6,12 @@
    block's restricted pointer from an inner one's (61), is the stored value;
    a copy of the pointer used after its block (31) and an access after the
    block (71) are loaded again. A copy made in the block is based on it (33).
-   A local structure with restrict-qualified members is taken apart (no
-   stack slot left), and loops through a block's restricted pointer,
+   In main, a local structure (of a file-scope type) with restrict-qualified
+   members is taken apart and its members apart (16 + 81: 97, in main and in its copy inlined into the start-up), as a file-scope restricted pointer is (81); in another function
+   the file-scope one is not (101: main's block may not be running). A
+   block's static restricted pointer is its block's (91). A structure
+   assignment (a fill, 111, or a copy, 112) through a plain pointer is apart
+   from a store through a block's restricted pointer. Loops through a block's restricted pointer,
    indexed or incremented, are vectorized without an overlap check. */
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x15,%eax | 1
@@ -17,10 +21,13 @@
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x33,%eax | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3d,%eax | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x47,%eax | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x10,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \(%rsp\) | 0
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x61,%eax | 2
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x5b,%eax | 1
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x65,%eax | 0
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 2
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 0
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x6f,%eax | 1
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x70,%eax | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \bldr\s+w\d+,\s+\[x0\] | 2
 int g;
 int plain_param(int *a, int *b) {
@@ -83,11 +90,31 @@ int after(int *a, int *b) {
     return *a;
 }
 struct pair { int *restrict x; int *restrict y; };
-int mem(int *a, int *b) {
-    struct pair s = { a, b };
+int *ga, *gb;
+int *restrict gr;
+int gobj;
+int main(void) {
+    struct pair s = { ga, gb };
     s.x[0] = 16;
     s.y[0] = 17;
-    return s.x[0];
+    int t = s.x[0];
+    gr = ga;  /* (a file-scope restricted pointer: main's) */
+    *gr = 81;
+    gobj = 3;
+    return t + *gr;
+}
+int stat(int *a) {
+    static int *restrict p;
+    p = a;
+    *p = 91;
+    gobj = 2;
+    return *p;
+}
+int notmain(void) {
+    gr = ga;
+    *gr = 101;
+    gobj = 2;
+    return *gr;
 }
 void vplain(float *y0, const float *x, float a, int n) {
     float *restrict y = y0;
@@ -98,4 +125,17 @@ void incp(float *d0, const float *s, int n) {
     float *restrict d = d0;
     for (int i = 0; i < n; i++)
         *d++ = s[i] * 3.0f;
+}
+struct big { int v[16]; };
+int mset(struct big *a, struct big *b) {
+    struct big *restrict p = a;
+    p->v[0] = 111;
+    *b = (struct big){0};
+    return p->v[0];
+}
+int mcpy(struct big *a, struct big *b, struct big *c) {
+    struct big *restrict p = a;
+    p->v[0] = 112;
+    *b = *c;
+    return p->v[0];
 }

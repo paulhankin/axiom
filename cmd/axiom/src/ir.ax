@@ -678,11 +678,12 @@ pub const IN_OBJSIZE: i32 = 117;
 // scope of its own); its value means nothing. The same intrinsic of type
 // ptr, without operands, stands for a structure object that scalar
 // replacement took apart (sroa.ax), in IN_RESTRICT's s below.
-// Loads, stores and calls executed in such a block (in an instance of the
-// scope: the front end's and the inliner's, the only ones that know) carry
-// the innermost IN_RSCOPE as their operand c, their "tag" (tag_of; nothing
-// else gives those operations a c); in a block it is in an enclosing
-// scope's instance too. An operation without a tag may be anywhere.
+// Loads, stores, calls and memory operations executed in such a block (in
+// an instance of the scope: the front end's and the inliner's, the only
+// ones that know) carry the innermost IN_RSCOPE as their "tag" (tag_of,
+// set_tag: a load's, store's or call's operand c, a memcpy's, memmove's or
+// memset's only xs; nothing else gives those operations one); in a block it
+// is in an enclosing scope's instance too. An operation without a tag may be anywhere.
 // IN_RESTRICT(p, s, k) -> ptr: p, the value of a restricted object.
 // Pure. Either s is an IN_RSCOPE (i32) and k (a constant) numbers the
 // restricted pointer objects of that scope, and every value of the object
@@ -691,7 +692,8 @@ pub const IN_OBJSIZE: i32 = 117;
 // IN_RESTRICTs, through ptradds, phis and selects, unless it went through
 // memory, an integer or a call, which no rule here sees through); or s is
 // the address of a structure object (ptr) and k the offset in it of the
-// restrict-qualified member p was read from, for an access through it only.
+// restrict-qualified member p was read from, for an access through it only,
+// with a fourth operand: the scope of the block the rule holds in.
 // Two accesses, one of them a write, are apart (restrict_apart,
 // restrict_tagged) when:
 //   - both are tagged in instance s, based on IN_RESTRICTs of s with
@@ -705,10 +707,12 @@ pub const IN_OBJSIZE: i32 = 117;
 //     (F_RCYCLE clear: then all its tagged operations are of its one
 //     instance, while a known value from before the scope may meet writes of
 //     another iteration's instance in a loop);
-//   - their addresses are based on IN_RESTRICTs with the same structure
-//     address s and different k (two restrict-qualified members of one
-//     structure object), or one is a member's read whose structure address
-//     s is a stack slot or a global and the other is based on s itself.
+//   - both are tagged in the scope of a member's read IN_RESTRICT(p, s, k,
+//     scope) (main's: c/cgen_restrict.ax), and their addresses are based on
+//     such reads with the same structure address s and different k (two
+//     restrict-qualified members of one structure object), or one is a
+//     member's read whose structure address s is a stack slot or a global
+//     and the other is based on s itself.
 pub const IN_RSCOPE: i32 = 118;
 pub const IN_RESTRICT: i32 = 119;
 
@@ -1296,13 +1300,8 @@ pub fn restrict_apart(ra0: *Value, rb0: *Value) bool {
     }
     let mut ra = ra0;
     let mut rb = rb0;
-    if is_restrict_root(ra) and is_restrict_root(rb) and scoped_apart(ra, rb) {
-        return true;
-    }
-    if in_own_struct(ra, rb) or in_own_struct(rb, ra) {
-        return true;
-    }
-    // (else what the restricted pointers read are based on)
+    // (what the restricted pointers read are based on: their own rules
+    // need the operations' tags, restrict_tagged)
     if is_restrict_root(ra) {
         ra = based_rec(ra.xs.get(0), 1, false);
     }
@@ -1323,11 +1322,10 @@ pub fn restrict_apart(ra0: *Value, rb0: *Value) bool {
     return distinct_root(ra) and distinct_root(rb);
 }
 
-// Are IN_RESTRICTs a and b two restrict-qualified members of one structure
-// object (IN_RESTRICT)? (Two restricted objects of a block scope need the
-// operations' tags: restrict_tagged.)
-fn scoped_apart(a: *Value, b: *Value) bool {
-    if (a.xs.len != 3) or (b.xs.len != 3) {
+// Are IN_RESTRICTs a and b two restrict-qualified members' reads of one
+// structure object (the same address s, different offsets k), in scope sc?
+fn members_apart(a: *Value, b: *Value) bool {
+    if (a.xs.len != 4) or (b.xs.len != 4) {
         return false;
     }
     let sa = resolve(a.xs.get(1));
@@ -1344,7 +1342,7 @@ fn scoped_apart(a: *Value, b: *Value) bool {
 // through r that writes an object another access reaches without it is
 // undefined (6.7.3.1p4), the structure's own bytes too.
 fn in_own_struct(r: *Value, o: *Value) bool {
-    if not is_restrict_root(r) or (r.xs.len != 3) or u.isnil(o) or not ((o.kind == V_GLOBAL) or is_op(o, OP_ALLOCA)) {
+    if not is_restrict_root(r) or (r.xs.len != 4) or u.isnil(o) or not ((o.kind == V_GLOBAL) or is_op(o, OP_ALLOCA)) {
         return false;
     }
     let s = resolve(r.xs.get(1));
@@ -1352,6 +1350,27 @@ fn in_own_struct(r: *Value, o: *Value) bool {
         return false;
     }
     return @int_from_ptr(s) == @int_from_ptr(o);
+}
+
+// The restrict rules of members (IN_RESTRICT of 4 operands, the last the
+// scope of their block, main's): ra and rb the roots of accesses tagged ta
+// and tb, in that scope.
+fn member_rules(ra: *mut Value, ta: *Value, rb: *mut Value, tb: *Value) bool {
+    let mut m = ra;
+    if not is_restrict_root(m) or (m.xs.len != 4) {
+        m = rb;
+    }
+    if not is_restrict_root(m) or (m.xs.len != 4) {
+        return false;
+    }
+    let sc = resolve(m.xs.get(3));
+    if not is_rscope(sc) or not in_rscope(ta, sc) or not in_rscope(tb, sc) {
+        return false;
+    }
+    if is_restrict_root(ra) and is_restrict_root(rb) and members_apart(ra, rb) {
+        return true;
+    }
+    return in_own_struct(ra, rb) or in_own_struct(rb, ra);
 }
 
 /// Is v a block's restrict scope (IN_RSCOPE of type i32; not a structure
@@ -1371,18 +1390,51 @@ pub fn rscope_parent(s: *Value) *mut Value {
     return u.nil.[Value]();
 }
 
-/// Does operation i (a load, store or call) take its operand c as its tag,
-/// the restrict scope it is executed in (see IN_RSCOPE)?
+/// Does operation i take a tag, the restrict scope it is executed in (see
+/// IN_RSCOPE): a load, store or call as its operand c, a memcpy, memmove or
+/// memset as its only xs?
 pub fn has_tag_slot(i: *Value) bool {
-    return (i.kind == V_INST) and ((i.op == OP_LOAD) or (i.op == OP_STORE) or (i.op == OP_CALL));
+    return (i.kind == V_INST) and ((i.op == OP_LOAD) or (i.op == OP_STORE) or (i.op == OP_CALL) or is_memop(i.op));
+}
+
+fn is_memop(op: i32) bool {
+    return (op == OP_MEMCPY) or (op == OP_MEMMOVE) or (op == OP_MEMSET);
+}
+
+/// What operation i (has_tag_slot) holds as its tag (maybe no longer a
+/// scope: a forwarded one), or nil.
+pub fn tag_slot(i: *Value) *mut Value {
+    if is_memop(i.op) {
+        if i.xs.len == 1 {
+            return i.xs.get(0);
+        }
+        return u.nil.[Value]();
+    }
+    return i.c;
+}
+
+/// Tags operation i (has_tag_slot) with restrict scope t (nil: none).
+pub fn set_tag(i: *mut Value, t: *mut Value) void {
+    if is_memop(i.op) {
+        i.xs.clear();
+        if u.notnil(t) {
+            i.xs.push(t);
+        }
+        return;
+    }
+    i.c = t;
 }
 
 /// The restrict scope operation i is tagged with (IN_RSCOPE), or nil.
 pub fn tag_of(i: *Value) *mut Value {
-    if u.isnil(i) or not has_tag_slot(i) or u.isnil(i.c) {
+    if u.isnil(i) or not has_tag_slot(i) {
         return u.nil.[Value]();
     }
-    let t = resolve(i.c);
+    let x = tag_slot(i);
+    if u.isnil(x) {
+        return x;
+    }
+    let t = resolve(x);
     if is_rscope(t) {
         return t;
     }
@@ -1396,7 +1448,7 @@ pub let mut rtag: *mut Value = @ptr_from_int(*mut Value, 0);
 // Tags operation v (just made by bd) with rtag.
 fn tag_new(bd: *Builder, v: *mut Value) void {
     if u.notnil(rtag) and u.notnil(rtag.blk) and (rtag.blk.fnp == bd.blk.fnp) {
-        v.c = rtag;
+        set_tag(v, rtag);
     }
 }
 
@@ -1550,7 +1602,7 @@ pub fn restrict_tagged(pa: *mut Value, ta: *Value, pb: *mut Value, tb: *Value) b
     if u.isnil(ra) or u.isnil(rb) or (ra == rb) {
         return false;
     }
-    return tagged_apart(ra, ta, rb, tb) or tagged_apart(rb, tb, ra, ta);
+    return tagged_apart(ra, ta, rb, tb) or tagged_apart(rb, tb, ra, ta) or member_rules(ra, ta, rb, tb);
 }
 
 /// Are a and b two different objects: globals (not aliases of one another)
@@ -4842,6 +4894,7 @@ pub fn memop(bd: *mut Builder, op: i32, d: *mut Value, s: *mut Value, n: *mut Va
     v.a = d;
     v.b = s;
     v.c = index_isz(bd, n);
+    tag_new(bd, v);
     return v;
 }
 

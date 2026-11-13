@@ -655,7 +655,7 @@ fn c_option(o: *mut Options, a: []u8) bool {
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
        u.str_eq(a, "--c-warn-unknown-pragmas") or u.starts(a, "--c-long-double=") or u.starts(a, "--c-asm-dialect=") or
        u.starts(a, "--c-warn-format=") or u.str_eq(a, "--c-fenv-access") or u.str_eq(a, "--c-keep-null-checks") or
-       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
+       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U') or (a[1] == 'A'))) {
         o.c_args.push(a);
         return true;
     }
@@ -725,6 +725,7 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     }
     c.warn_format = 1;
     let mut defs = u.List.[cop.Define].empty();
+    let mut has_assert = false;
     let mut dirs = u.List.[[]u8].empty();
     let mut sys_dirs = u.List.[[]u8].empty();
     for k in 0..o.inc_flags.len {
@@ -796,15 +797,39 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
                                                     o.target));
                 return false;
             }
+        } else if a[1] == 'A' {
+            // -Apred=answer, -Apred(answer), -A-pred=answer, -A-pred, -A-
+            let mut x = a[2..];
+            let un = (x.len > 0) and (x[0] == '-');
+            if un {
+                x = x[1..];
+            }
+            let mut name = x;
+            let mut ans = "";
+            let eq = u.find(x, '=');
+            let lp = u.find(x, '(');
+            if (eq >= 0) and ((lp < 0) or (eq < lp)) {
+                name = x[0..@int_cast(usize, eq)];
+                ans = x[@int_cast(usize, eq) + 1..];
+            } else if (lp >= 0) and (x.len > 0) and (x[x.len - 1] == ')') {
+                name = x[0..@int_cast(usize, lp)];
+                ans = x[@int_cast(usize, lp) + 1..x.len - 1];
+            }
+            ok = (name.len > 0) or (un and (x.len == 0));
+            if ok and (name.len > 0) {
+                ok = c_ident(name) and (un or (ans.len > 0));
+            }
+            defs.push(cop.Define.{ name: name, body: ans, undef: un, assertion: true });
+            has_assert = true;
         } else if a[1] == 'U' {
-            defs.push(cop.Define.{ name: a[2..], body: "", undef: true });
+            defs.push(cop.Define.{ name: a[2..], body: "", undef: true, assertion: false });
         } else {
             let eq = u.find(a, '=');
             if eq < 0 {
-                defs.push(cop.Define.{ name: a[2..], body: "1", undef: false });
+                defs.push(cop.Define.{ name: a[2..], body: "1", undef: false, assertion: false });
             } else {
                 defs.push(cop.Define.{ name: a[2..@int_cast(usize, eq)], body: a[@int_cast(usize, eq) + 1..],
-                                       undef: false });
+                                       undef: false, assertion: false });
             }
         }
         if not ok {
@@ -816,12 +841,32 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         dg.emit_fatal(o.json, "E9001", "--c-long must be at least --c-int");
         return false;
     }
+    if has_assert and not c.gnu {
+        dg.emit_fatal(o.json, "E9001",
+                      "-A (an assertion) needs a GNU dialect (--c-std=gnuNN): #assert is one of its extensions");
+        return false;
+    }
+    c.declspec = c.gnu or win;
     c.defines = defs.items();
     c.include_dirs = dirs.items();
     c.sys_include = u.cat2(o.std_dir, "/c/include");
     c.hosted = not o.c_freestanding;
     if g_c_lib_system {
         return system_c_lib(o, c, &mut sys_dirs);
+    }
+    return true;
+}
+
+// Is s an identifier (of letters, digits and underscores, not first a digit)?
+fn c_ident(s: []u8) bool {
+    if (s.len == 0) or ((s[0] >= '0') and (s[0] <= '9')) {
+        return false;
+    }
+    for ch in s {
+        if not (((ch >= 'a') and (ch <= 'z')) or ((ch >= 'A') and (ch <= 'Z')) or ((ch >= '0') and (ch <= '9')) or
+                (ch == '_')) {
+            return false;
+        }
     }
     return true;
 }
@@ -1015,8 +1060,9 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
         } else if u.str_eq(a, "-o") and ((i + 1) < argc) {
             i += 1;
             o.out = args[i];
-        } else if (u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I")) and ((i + 1) < argc) {
-            // (-D NAME, -U NAME, -I dir: as -DNAME, -UNAME, -Idir)
+        } else if (u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I") or u.str_eq(a, "-A")) and
+                  ((i + 1) < argc) {
+            // (-D NAME, -U NAME, -A pred=answer, -I dir: as -DNAME, -UNAME, -Apred=answer, -Idir)
             i += 1;
             let joined = u.cat2(a, args[i]);
             if a[1] == 'I' {
@@ -1024,8 +1070,10 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             } else {
                 o.c_args.push(joined);
             }
-        } else if u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I") or u.str_eq(a, "-o") {
-            dg.emit_fatal(o.json, "E9001", u.f1("'%s' needs a value (-DNAME[=value], -UNAME, -Idir, -o <path>)", a));
+        } else if u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I") or u.str_eq(a, "-A") or
+                  u.str_eq(a, "-o") {
+            dg.emit_fatal(o.json, "E9001",
+                          u.f1("'%s' needs a value (-DNAME[=value], -UNAME, -Apred=answer, -Idir, -o <path>)", a));
             return false;
         } else if u.starts(a, "--target=") {
             o.target = a[9..];

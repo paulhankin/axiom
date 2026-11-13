@@ -58,3 +58,17 @@
 - `__declspec(...)` in the GNU dialects, on every target: `align`, `thread`, `selectany`,
   `noinline`, `noreturn`, `naked`, `deprecated`, `restrict`, `allocate` ... as the GNU
   attributes that do the same; `dllexport` and `dllimport` are accepted.
+- `-Apred=answer`, `-Apred(answer)`, `-A-pred=answer` and `-A-`: a GNU dialect's
+  assertions on the command line.
+- `__declspec` under an ISO standard when the target is Windows (whose headers use it),
+  with its modifiers on objects, functions, structure tags and members.
+- `_Complex __bf16` and vectors of `__bf16`, computed as `_Float16`'s are.
+- The format checks take `_Decimal64x` with `%DD` (the library's `printf` and `scanf`
+  read and write it so).
+- `restrict` on block-scope `static` pointers, on file-scope pointers (in `main`, whose
+  block is theirs), and across structure assignments and fills; the rules for
+  restrict-qualified members now hold in `main` only (the block of a file-scope
+  structure type's members is `main`'s, which code outside `main` may not be in).
+- An asm constraint that is not one of the target's, an operand wider than 64 bits in a
+  register and an explicit register variable on WebAssembly are the rule violation
+  `C3096`, no longer `C3901`.

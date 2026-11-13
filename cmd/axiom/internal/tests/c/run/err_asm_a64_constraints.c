@@ -1,7 +1,6 @@
 /* flags: --c-std=gnu17 --target=aarch64 */
 /* native-only */
 /* expect-error: C3096 */
-/* expect-error: C3901 */
 /* AArch64 constraints that do not fit their operands: an object too wide for
    an SVE predicate (32 bytes) or vector (256 bytes) register, more SVE
    operands than registers, a constraint the dialect does not have, and an

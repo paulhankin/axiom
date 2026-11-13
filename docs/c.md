@@ -87,6 +87,7 @@ Axiom in one program").
 | `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
+| `-Apred=answer`, `-Apred(answer)` | A GNU dialect's assertion, as `#assert pred(answer)` before the source ("GNU dialects"); `-A-pred=answer` takes it back (`-A-pred` every answer of pred), `-A-` every assertion before it, the target's `cpu`, `machine` and `system` too. Under an ISO standard, which has no assertions, it is an error. |
 | `--c-asm-dialect=att\|intel` | The syntax of x86-64 inline and file-scope assembly (default `att`; "Inline assembly"). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
 | `--c-keep-null-checks` | The optimizer is not told that a parameter the attribute `nonnull` names, or one declared `[static n]`, and the result of a function with `returns_nonnull`, are not null pointers: tests of them stay ("Optimization"). |
@@ -96,7 +97,7 @@ Axiom in one program").
 | `--c-lib=axiom\|system` | Whose C library the program has: the compiler's (the default), or the system's, whose headers are then the hosted headers ("The system's C library", below). |
 | `--c-system-include=dir` | With `--c-lib=system`: a directory of the system's headers (instead of the system's own, `/usr/include` and its target directory on Linux). |
 
-`-D`, `-U` and `-I` apply in the order given. The C options are errors for an Axiom
+`-D`, `-U`, `-A` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: there are no `-W...`, `-std=`, `-c` or `-f...`
 options; a warning is silenced only by `#pragma GCC diagnostic` ("Pragmas").
 
@@ -926,7 +927,9 @@ results and flags these paths give bit for bit in every direction):
   read as an unsigned integer as `nan` reads it, is its payload when that is canonical)
   are correctly rounded in the decimal rounding direction, with
   the quantum as written (`ERANGE` on overflow and underflow); `fprintf` and `fscanf`
-  take the length modifiers `H`, `D` and `DD` with `a e f g` and their upper case: `%Da`
+  take the length modifiers `H`, `D` and `DD` with `a e f g` and their upper case (and,
+  for `_Decimal64x`, which the standard gives none and which has `_Decimal128`'s format
+  and is passed as it is, `DD` too: the format check takes it there): `%Da`
   writes the coefficient and the quantum exactly (`1.20`, `1.2e+03`: style f when
   -(n + 5) <= q <= 0, else e; a precision rounds the coefficient), `e f g` round the
   value's digits as for `double`, both in the decimal rounding direction
@@ -1476,11 +1479,13 @@ Attributes are checked where the standard says (a `[[nodiscard]]` on an object i
 error). The standard ones, `deprecated`, `fallthrough`, `maybe_unused`, `nodiscard`,
 `noreturn`, `unsequenced` and `reproducible`, are accepted; `deprecated`, `nodiscard`
 and `noreturn` also give warnings (`C4050`, `C4051`, `C4053`). An attribute with a prefix
-(`[[vendor::x]]`) is ignored; one without a prefix that is not a standard attribute is
-ignored with the warning `C4052`.
+(`[[vendor::x]]`) is ignored, as C23 has an attribute an implementation does not
+recognize be; one without a prefix that is not a standard
+attribute is ignored with the warning `C4052`.
 
 `#pragma` lines and `_Pragma` operators are read in every mode ("Pragmas"): those this
-implementation knows act, the others are ignored.
+implementation knows act, the others are ignored (6.10.7p1: a pragma the
+implementation does not recognize is ignored).
 
 ### Predefined macros
 
@@ -1607,7 +1612,7 @@ format than the ABI's cannot pass `long double` values to it.
 | `main` | `int main(void)` and `int main(int, char **)` only (`C3061`). Reaching the end of `main` returns 0, in every mode. |
 | Inline functions | An inline definition (6.7.4p7) is compiled with internal linkage, for the unit's own calls: the external function is another unit's. |
 | `volatile` | Accesses are marked volatile for the optimizer. |
-| `restrict` | Used by the optimizer on pointer parameters, on block-scope pointer objects and on structure members ("Optimization"); on other pointers (file scope, a pointer to a restricted pointer) accepted with no effect. |
+| `restrict` | Used by the optimizer on pointer parameters, on block-scope pointer objects (automatic and static), on file-scope ones and on structure members ("Optimization"). The restricted pointer a pointer to one (`int *restrict *p`) points to is designated by no declaration, which 6.7.3.1p1 needs: no rule follows from it, and it has no effect. |
 
 ### Translation limits
 
@@ -1666,7 +1671,10 @@ freestanding implementation for most of `<string.h>` and some functions of `<std
 compiler does not provide them. The C23 headers also define `__STDC_VERSION_<NAME>_H__`
 as the standard says.
 
-## Not supported
+## Not available
+
+Each of these is what the target, the standard or the chosen dialect leaves out, not
+work left undone:
 
 - Annex F and Annex G on WebAssembly (no floating-point environment: no rounding modes,
   no exception flags), and with `--c-lib=system` or `--c-freestanding`: there
@@ -1674,16 +1682,22 @@ as the standard says.
   `__STDC_IEC_60559_COMPLEX__` are not defined. On x86-64 and AArch64 with the library
   they are (`docs/c-conformance.md`, "Annexes"). Annex H (`__STDC_IEC_60559_TYPES__`)
   is not claimed with `--c-lib=system` or `--c-freestanding`, nor before C23.
-- `setjmp` on WebAssembly without its exception-handling extension (`C3300`).
-- `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
-- Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
+- `setjmp` on WebAssembly without its exception-handling extension (`C3300`): the
+  return to it is a WebAssembly exception, and a module built without the extension
+  has no way to unwind.
+- `#embed` parameters other than the standard's `limit`, `prefix`, `suffix` and
+  `if_empty` (`C1084`): C23 leaves other parameters to the implementation, and this one
+  defines none, so any other is a parameter it does not know (an error).
+- Extensions, under an ISO standard, which they are not part of: they are errors
+  there, as a strict mode makes them (the GNU dialects have them, "GNU dialects"): `__attribute__`, `asm`
   and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
   expressions, `?:` with an omitted middle operand, case ranges, computed `goto` and labels
   as values, `__builtin_*` functions other than those below ("Reserved identifiers"),
-  `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
-  rejects too.
-- Under an ISO standard: `__declspec`, `#import`, `#assert`, `#unassert` and
-  `#if #pred(answer)` (the GNU dialects have them). In a GNU dialect: `__ibm128` (the double-double format of
+  `#include_next`, `#ident`.
+- Under an ISO standard, for the same reason: `#import`, `#assert`, `#unassert`,
+  `#if #pred(answer)` and `-A`, and `__declspec` but when the target is Windows (whose
+  headers use it: there it is a keyword in every mode, a name reserved to the
+  implementation). In a GNU dialect: `__ibm128` (the double-double format of
   a target this compiler does not have).
 
 ## GNU dialects
@@ -1722,7 +1736,7 @@ exactly what works (there is no option that defines `__GNUC__`).
 | `asm`, `__asm__` statements; file-scope `asm("...")` | Inline assembly on x86-64 and AArch64 ("Inline assembly", below). |
 | Nested functions | A function defined in a block: it sees the enclosing functions' objects (in their frames, through a chain of frame records passed to it as a hidden last argument) and may be called through a pointer while its enclosing call runs (a trampoline: one of a pool of 128 compiled thunks per nested function whose address is taken, claimed atomically and released when the enclosing call returns, so no code is written at run time and no stack is executable; more than 128 live at once traps). `auto` declares one ahead of its definition. It sees the enclosing functions' variable length arrays (their addresses stored in the frame record when they are allocated) and variably modified types (typedefs, pointers to variable length arrays, `typeof`, its own parameters' types whose lengths name the enclosing functions' objects: the record holds the addresses of the slots their lengths are kept in). It may be variadic: a direct call passes the chain as a hidden argument after the named ones (so va_start skips it, on every target's variadic convention) to an entry function that starts a `va_list` of the variable arguments and calls the nested function with it, which its `va_start` copies; a trampoline does the same from the platform's C convention. A `goto` in it to a local label (`__label__`) of an enclosing function (it sees no other label of it: C3043) is a non-local goto: the nested function's cleanups are called and its variable length arrays freed, as for a return, its call and those between it and the enclosing function's are left (those of other nested functions of the enclosing one calling their cleanups and giving back their trampolines as the jump passes; those of other functions as a `longjmp` leaves them), and the jump goes on as a `goto` in the enclosing function from the call it is making then, calling the cleanups of the scopes it leaves and freeing their variable length arrays; into the scope of a variable length array or an object with a cleanup that call is not in (6.8.6.1p1), it traps. The enclosing function arms a `jmp_buf` in its frame before each of its calls and is compiled as a function that calls `setjmp` is (not optimized), as is a nested function in it that makes calls with cleanups in scope or trampolines held; on WebAssembly it needs the exception-handling extension (C3300). Every target. |
 | `__declspec(...)` | The Windows spelling of attributes, on every target, among declaration specifiers and after `struct`, `union` or `enum`: modifiers separated by spaces (or commas), each the GNU attribute that does what it says: `align(n)` `aligned(n)`, `allocate("s")` and `code_seg("s")` `section("s")`, `deprecated` and `deprecated("text")`, `naked`, `noinline`, `noreturn`, `nothrow`, `restrict` (of a function) `malloc`, `selectany` `weak`; `thread` is the storage-class specifier `_Thread_local` (elsewhere than among declaration specifiers `C2143`); `dllexport`, `dllimport` and `noalias` change nothing (a DLL exports its definitions of default visibility, an object another module defines is imported whatever its declarations say: "Shared libraries", "Objects and libraries"); another modifier is an unknown attribute (C4052). Under an ISO standard `__declspec` is an identifier. |
-| `__bf16` | bfloat16 (the brain floating format): 1 sign bit, 8 exponent bits as binary32's, 7 fraction bits; a real floating type of 2 bytes aligned to 2, distinct from `_Float16`, on every target. Conversions to it round once from the source's own value (float, double, long double, integers, the decimal types: never through another format), to nearest with ties to even or, under `FENV_ACCESS`, in the dynamic direction with IEEE 754's exceptions (tininess after rounding); conversions from it are exact. Arithmetic (`+ - * /`, comparisons) is float's, the result rounded to `__bf16` after each operation (as `_Float16`'s: `FLT_EVAL_METHOD` 0; float's 24 bits make that the correctly rounded result); constants are folded the same way. An operation with a `_Float16` operand (real or complex) is `C3231`: neither type's values hold the other's. It has no constants of its own (no suffix), no complex or imaginary type (`C3005`) and no vectors (`C3077`); the type-generic macros take it as they take a double. Passed and returned as `_Float16` is (the low 16 bits of an SSE register on x86-64, an `h` register on AArch64, as the platforms' C compilers do); an aggregate with a `__bf16` member is no homogeneous floating-point aggregate on AArch64. `__AXIOM_BF16__` is defined, and `__BFLT16_MANT_DIG__` (8), `__BFLT16_DIG__`, `__BFLT16_DECIMAL_DIG__`, `__BFLT16_MIN_EXP__`, `__BFLT16_MIN_10_EXP__`, `__BFLT16_MAX_EXP__`, `__BFLT16_MAX_10_EXP__`, `__BFLT16_MAX__`, `__BFLT16_NORM_MAX__`, `__BFLT16_MIN__`, `__BFLT16_EPSILON__`, `__BFLT16_DENORM_MIN__` (the floating ones `__bf16` casts of float constants), `__BFLT16_HAS_DENORM__`, `__BFLT16_HAS_INFINITY__`, `__BFLT16_HAS_QUIET_NAN__` (1) and `__BFLT16_IS_IEC_60559__` (0: it is not an IEEE 754 format), with `<float.h>`'s meanings. |
+| `__bf16` | bfloat16 (the brain floating format): 1 sign bit, 8 exponent bits as binary32's, 7 fraction bits; a real floating type of 2 bytes aligned to 2, distinct from `_Float16`, on every target. Conversions to it round once from the source's own value (float, double, long double, integers, the decimal types: never through another format), to nearest with ties to even or, under `FENV_ACCESS`, in the dynamic direction with IEEE 754's exceptions (tininess after rounding); conversions from it are exact. Arithmetic (`+ - * /`, comparisons) is float's, the result rounded to `__bf16` after each operation (as `_Float16`'s: `FLT_EVAL_METHOD` 0; float's 24 bits make that the correctly rounded result); constants are folded the same way. An operation with a `_Float16` operand (real or complex) is `C3231`: neither type's values hold the other's. It has no constants of its own (no suffix). `_Complex __bf16` (and `_Imaginary`) and vectors of it (`vector_size`) are computed as `_Float16`'s are: a complex value's parts in float, rounded to `__bf16` when it is stored, each vector operation's lanes in float and rounded; both are passed and returned as the `_Float16` types are (no other compiler has a calling convention for the complex type). The type-generic macros take it as they take a double. Passed and returned as `_Float16` is (the low 16 bits of an SSE register on x86-64, an `h` register on AArch64, as the platforms' C compilers do); an aggregate with a `__bf16` member is no homogeneous floating-point aggregate on AArch64. `__AXIOM_BF16__` is defined, and `__BFLT16_MANT_DIG__` (8), `__BFLT16_DIG__`, `__BFLT16_DECIMAL_DIG__`, `__BFLT16_MIN_EXP__`, `__BFLT16_MIN_10_EXP__`, `__BFLT16_MAX_EXP__`, `__BFLT16_MAX_10_EXP__`, `__BFLT16_MAX__`, `__BFLT16_NORM_MAX__`, `__BFLT16_MIN__`, `__BFLT16_EPSILON__`, `__BFLT16_DENORM_MIN__` (the floating ones `__bf16` casts of float constants), `__BFLT16_HAS_DENORM__`, `__BFLT16_HAS_INFINITY__`, `__BFLT16_HAS_QUIET_NAN__` (1) and `__BFLT16_IS_IEC_60559__` (0: it is not an IEEE 754 format), with `<float.h>`'s meanings. |
 | `__float128`, constants `1.0q`/`1.0Q`, `2.0i`/`2.0j` | `__float128` is `_Float128`; `q` is its constant suffix; `i` or `j` makes an imaginary constant of the type (C17 Annex G's imaginary types, which every mode has: "Floating types"). |
 | `enum E : __int128` | An enumeration of a 128-bit underlying type (C23's fixed type), with constants of any value of it; without a fixed type (C23) an enumeration whose values `long long` and `unsigned long long` do not hold has the type `__int128` or `unsigned __int128` ("Implementation-defined behavior"). A `switch` on `__int128` takes case ranges. |
 | Vector types | `T __attribute__((vector_size(n)))` (or `mode(V4SI)` ...): n bytes (a power of two times T's size, at most 4096) of lanes of T, an integer or real floating type. The arithmetic, bitwise and shift operators act lane by lane (a scalar operand is converted to the element type, if that keeps its value, and taken for every lane); `==` ... `>=` give the signed integer vector of the same size, -1 where true and 0; `!` is C3020; `v[i]` reads and writes a lane; `?:` with a vector condition selects lane by lane; initializers and compound literals give the lanes in order (missing ones 0; designators are C3072); a cast between vectors, or a vector and an integer, of one size keeps the bytes (another is C3028). `__builtin_shuffle(a, [b,] mask)`, `__builtin_shufflevector(a, b, i...)` and `__builtin_convertvector(v, T)` (below). A vector is aligned to its size, at most 16 bytes on AArch64 and on x86-64 Linux and macOS (32 with AVX, 64 with AVX-512F; on Windows and WebAssembly its size); IR generation uses the target's vector instructions for up to 64 bytes, and lane-by-lane code where there are none (conversions between integer and floating lanes on WebAssembly, a shift by a vector of counts). |
@@ -1778,7 +1792,7 @@ C4052 and is ignored.
 | `naked` | functions | The function is its asm statements (basic, or extended with no operands: else C3096): their text after a label of its name, with no prologue or epilogue ("Inline assembly"). |
 | `const`, `pure` | functions | Given to the optimizer ("Optimization": what a function that promises to write nothing lets it do). |
 | `malloc`, `alloc_size(i)`, `alloc_size(i, j)`, `returns_nonnull` | functions returning a pointer | Given to the optimizer ("Optimization"). `malloc` with a deallocator argument is a pairing and says nothing to it. |
-| `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `alloc_align`, `assume_aligned`, `sentinel`, `may_alias` | | Accepted; no effect (none is needed for correct code). The alignments `alloc_align` and `assume_aligned` promise are recorded in the IR (`ir.Func.align_arg`, `ret_align`) but no pass uses them yet. |
+| `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `alloc_align`, `assume_aligned`, `sentinel`, `may_alias` | | Accepted; no effect (none is needed for correct code). The alignments `alloc_align` and `assume_aligned` promise are recorded in the IR (`ir.Func.align_arg`, `ret_align`); the code generators' accesses do not depend on alignment (unaligned vector loads and stores cost what aligned ones do on the targets), so no pass needs them. |
 | `format(archetype, i, j)`, `format_arg(i)` | functions | The calls' format strings are checked (`--c-warn-format`): archetype `printf`, `scanf` or `strftime` (also `gnu_printf`, ...), the format parameter i, the first argument checked j (0: none, as for `vprintf`). The conversions are C23's (with `b`, `B`, `wN`, `wfN`, and the decimal floating types' `H`, `D` and `DD`) and POSIX's `%n$` positions. A literal format is checked against the arguments' types as this target has them: C4130 (an argument the conversion does not take), C4131 (too few), C4133 (not a conversion specification); at level 2 also C4132 (arguments left over), C4134 (a format that is not a literal) and C4135 (another type of the same size and kind, a flag the conversion ignores, `%n`). A call of a `format_arg` function with a literal is checked as that literal. The C library's declarations (`printf`, `scanf`, `strftime`, their kin) carry the attribute in every mode. |
 | `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121; in the function's definition the optimizer takes them for pointers that are not null ("Optimization"). |
 | `warn_unused_result` | functions | As `[[nodiscard]]` (C4051). |
@@ -3000,11 +3014,20 @@ through a pointer that went through memory, an integer or a call (which may be b
 it) are not taken as apart; nor are any of an object whose address is taken (`&p`). When
 a function with restrict parameters is inlined, its call is such a block for its body,
 with its parameters for those objects, and the code of an inlined function is in the
-blocks its call is in, so what they tell survives inlining. Likewise an access through a
-restrict-qualified member of a structure (not a union) read for it is apart from one
-through another such member of the same structure object, and, when that object is a
-local or static one, from an access to the object itself; a local structure with such
-members is still taken apart into its members' values. "Based on" is the flow of the
+blocks its call is in, so what they tell survives inlining. A block's `static` restricted pointer is one of its block's too (only
+the values the block gives it count; the value it keeps from an earlier execution is
+not taken as based on it there), except in a function with nested functions. Structure
+assignments and fills (`memcpy`, `memset`) are accesses like any others. The block
+of a file-scope restricted pointer, and of a restrict-qualified member of a structure
+type declared at file scope, is `main`'s (6.7.3.1p2): what runs before `main`
+(constructors) or after it (exit handlers, destructors) is outside it, and only `main`'s
+own code (and what is inlined into it) is known to be inside, so only there are they
+taken as apart: accesses through a file-scope restricted pointer from everything not
+based on it, and accesses through two restrict-qualified members of one structure object,
+or through one and to the structure object itself, from each other. A local structure
+with such members is still taken apart into its members' values. The members of a
+structure type declared in a block are not used (the block may run again, each time
+another execution). "Based on" is the flow of the
 pointer's value: an integer added to another pointer, and a comparison, do not make an
 address based on the restricted one. The IR marks these with `IN_RSCOPE`,
 `IN_RESTRICT` and the tags of loads, stores and calls (`ir.ax`; the argument that this
@@ -3065,9 +3088,10 @@ claims less than the standard allows. None is hidden: each is said above or here
   WebAssembly, which has no floating-point environment.
 - Annex G: division uses Smith's method (no overflow forming the divisor's squared
   magnitude); it may differ in the last bit from other implementations' choices.
-  `CX_LIMITED_RANGE` has no effect (the full algorithms are always used).
+  `CX_LIMITED_RANGE` changes nothing: `ON` only permits the simpler formulas (7.3.4p1),
+  and the full algorithms are always used.
 - The decimal floating types: on WebAssembly their exceptions are not recorded (no flags
   there, as for binary).
-- In a GNU dialect: the
-  destructors run when `main` returns and from the library's `exit`, not when the
-  process ends otherwise (`_Exit`, `quick_exit`, a signal).
+- (Not a deviation, but often asked: in a GNU dialect the destructors run as `atexit`'s
+  functions do, when `main` returns and from `exit`, and so not from `_Exit`,
+  `quick_exit` or a signal, which end the process without them.)

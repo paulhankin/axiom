@@ -259,6 +259,41 @@ static int member_loop(int *a, int n) {
     return a[n - 1];
 }
 
+/* a block's static restricted pointer: the value it keeps reaches the
+   object in the next execution, which another pointer wrote in between */
+static int stat_seq(int *a, int k) {
+    static int *restrict p;
+    if (k == 0) {
+        p = a;
+        *p = 5;
+        return 0;
+    }
+    return *p;
+}
+
+/* structure assignments (a fill, a copy) through pointers based on the
+   restricted one, and after its block */
+struct big8 { int v[8]; };
+
+static int mem_based(struct big8 *a, struct big8 *c) {
+    struct big8 *restrict p = a;
+    struct big8 *q = p;
+    p->v[0] = 1;
+    *q = (struct big8){{9}};
+    p->v[1] = 1;
+    *q = *c;
+    return p->v[0] * 10 + p->v[1];
+}
+
+static int mem_after(struct big8 *a, struct big8 *b) {
+    {
+        struct big8 *restrict p = a;
+        p->v[0] = 1;
+    }
+    *b = (struct big8){{4}};
+    return a->v[0];
+}
+
 static void put(int *d, int v) { *d = v; }
 
 static int helper(int *a) {
@@ -300,6 +335,12 @@ int main(void) {
     for (int i = 0; i < 8; i++)
         a[i] = 0;
     print_i64(member_loop(a, 8));
+    print_i64(stat_seq(a, 0));
+    a[0] = 7;
+    print_i64(stat_seq(a, 1));
+    struct big8 b8 = {{0}}, c8 = {{3, 5}};
+    print_i64(mem_based(&b8, &c8));
+    print_i64(mem_after(&b8, &b8));
     print_i64(helper(a));
     return 0;
 }
@@ -324,4 +365,8 @@ int main(void) {
 /* expect: 63 */
 /* expect: 2 */
 /* expect: 7 */
+/* expect: 0 */
+/* expect: 7 */
+/* expect: 35 */
+/* expect: 4 */
 /* expect: 2 */

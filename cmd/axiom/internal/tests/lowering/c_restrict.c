@@ -2,7 +2,7 @@
    of inlined functions (ir.IN_RSCOPE, ir.IN_RESTRICT): a load after a
    store through another restricted pointer of the same block is the stored
    value (11; without restrict it is loaded again: 14), and so after
-   inlining (12) and for two restrict-qualified members (16); a loop
+   inlining (12) and for two restrict-qualified members (1001, in main, and in its copy inlined into the start-up); a loop
    through block-scope restricted pointers, or inlined restrict parameters,
    is vectorized without the overlap check that plain pointers need (two:
    s2's, and inbody's, whose restricted pointers are a block's in the
@@ -11,7 +11,7 @@
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xe,%eax | 0
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xc,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x10,%eax | 1
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3e9,%eax | 2
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 4
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 2
 // lower: --target=aarch64 -O2 --c-freestanding | \bldr\s+w\d+,\s+\[x0\] | 1
@@ -35,9 +35,10 @@ static inline int in(int *restrict p, int *restrict q) {
 }
 int inl(int *a, int *b) { return in(a, b); }
 struct pair { int *restrict x; int *restrict y; };
-int mem(int *a, int *b) {
-    struct pair s = { a, b };
-    s.x[0] = 16;
+int *ga, *gb;
+int main(void) {
+    struct pair s = { ga, gb };  /* (a file-scope structure type: main's) */
+    s.x[0] = 1001;
     s.y[0] = 17;
     return s.x[0];
 }
