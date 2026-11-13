@@ -454,7 +454,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // WebAssembly build). /* units: a.c */ names more
 // translation units, next to the test (c/run/abi/). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
-// only checked (axiom check, with its own --target), not built or run.
+// only checked (axiom check, with its own --target), not built or run; one
+// marked /* expect-trap */ must trap.
 // The larger programs of c/prog/ are built and run the same way ([c-prog]).
 const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
 const cFilesIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(dir, f)) : [];
@@ -509,7 +510,9 @@ const cRunTest = async (f) => {
   for (const w of warnings) if (!wcodes.includes(w)) return `expected warning ${w}, got [${wcodes.join(', ')}]`;
   if (buildOnly) return checkBuilt(out);
   const r = native ? await runNative(out) : await runWasm(out);
-  let problem = r.trapped ? `unexpected trap: ${r.msg}` : null;
+  // (/* expect-trap */: the program must trap)
+  const trap = /\/\* expect-trap \*\//.test(src);
+  let problem = r.trapped ? (trap ? null : `unexpected trap: ${r.msg}`) : (trap ? 'expected a trap, but the program completed' : null);
   // (the C library of Windows writes lines ending in \r\n)
   const want = expect.join('\n'), got = r.out.map((l) => l.replace(/\r$/, '')).join('\n');
   if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;

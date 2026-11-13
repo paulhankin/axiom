@@ -1,10 +1,9 @@
 /* flags: --c-std=gnu17 */
-/* A jump from a nested function to a label of its enclosing function (a
-   nonlocal goto) is not supported (C3901). */
-/* expect-error: C3901 */
+/* expect-error: C3043 */
+/* A nested function sees only the local labels (__label__) of its
+   enclosing function: the others are not its labels. */
 static int apply(int (*f)(int), int x) { return f(x); }
 static int jump(int x) {
-    __label__ out;
     int check(int y) {
         if (y < 0)
             goto out;

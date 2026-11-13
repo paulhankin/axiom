@@ -1,7 +1,6 @@
 /* The decimal floating types with the interchange and extended binary ones
    (C23 6.3.1.5, Annex H): conversions both ways, folded and at run time,
-   correctly rounded (_Float16 through binary128, whose second rounding
-   cannot differ here), and _Float128's and _Float32's own formats (not
+   correctly rounded (_Float16 once, from the decimal value), and _Float128's and _Float32's own formats (not
    long double's or double's). */
 /* flags: --c-std=c23 */
 #include "host.h"

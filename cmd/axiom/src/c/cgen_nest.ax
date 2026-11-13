@@ -35,12 +35,44 @@
 // addresses of one nested function at once (in POOL live calls of its
 // enclosing function) traps. A longjmp out of the enclosing function, which
 // unwinds nothing, keeps its slots.
+//
+// Non-local gotos: a goto in a nested function to a local label
+// (`__label__`) of an enclosing function P (cast.CSym.nonlocal) leaves the
+// nested function's call, and those between it and P's call, and goes on
+// as a goto in P from the call P is making then. P's record has two more
+// slots after the trampolines': the address of a jmp_buf in P's frame,
+// and the jump's number (the label's index in nonlocal, plus 1). P is
+// compiled as a function that calls setjmp (ir.Func.returns_twice), and
+// before each of its calls, setjmp (the linkers' __axc_setjmp; on
+// WebAssembly cgen_sjlj.ax's, with the exception-handling extension) arms
+// the jmp_buf there (arm): the call P makes when a nested function's goto
+// runs is the last one armed. The goto makes its own function's cleanups'
+// calls and frees its variable length arrays, as a return does, gives back
+// the trampolines its call holds, stores the number in P's record and
+// longjmps to the jmp_buf (__axc_longjmp_restore, on WebAssembly longjmp).
+// setjmp then returns 1 at the call, and the code after it (finish) is a
+// goto from there to the label: the cleanups of the scopes it leaves are
+// called and the variable length arrays freed (cgen_vla.ax), or, if the
+// label is in a scope the call is not (a jump into the scope of a variable
+// length array or of an object with a cleanup, 6.8.6.1p1), a trap. A
+// function nested in P that makes a call with cleanups in scope, or with
+// trampolines its call holds, hooks the call into the jumps to P (arm): the
+// slot gets its own jmp_buf for the call, so that a jump passing through
+// calls those cleanups, gives back the trampolines, and goes on to the
+// jmp_buf the slot held (finish). The frames of other functions between
+// are left as a longjmp leaves them.
 // =============================================================================
+import "../diag.ax" as dg;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
+import "cgen_gbuiltin.ax" as ggb;
+import "cgen_sjlj.ax" as sj;
+import "cgen_vla.ax" as gv;
 import "csema_nest.ax" as cnest;
+import "csema_vla.ax" as svla;
 import "ctypes.ax" as cty;
 
 /// The trampolines of each nested function whose address is taken.
@@ -79,10 +111,17 @@ pub fn enter(s: *mut cast.CSym) void {
         F.chain = cg.alloca(cty.pointer_to(cty.t_void), "chain");
         st(F.f.params[@int_cast(usize, F.sig.plan.chain)], F.chain);
     }
+    g_sites.clear();
+    g_hooks.clear();
+    g_pending.clear();
+    g_hook_jb = ir.vnil();
     if not s.has_nested {
         return;
     }
-    let n = 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
+    let mut n = 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
+    if s.nonlocal.len > 0 {
+        n += 2;
+    }
     let r = cg.alloca(cty.array_of(cty.pointer_to(cty.t_void), n, true), "frame.rec");
     F.rec = r;
     if u.notnil(F.chain) {
@@ -97,6 +136,23 @@ pub fn enter(s: *mut cast.CSym) void {
     for k in 0..s.tramps.len {
         st(ir.czero(cg.T_ptr), slot(r, 1 + @as(u64, s.rec.len) + @as(u64, k)));
     }
+    if s.nonlocal.len > 0 {
+        if cg.is_wasm and not tg.has(tg.W_EXCEPTION_HANDLING) {
+            _ = dg.err(s.nonlocal.get(0).span, "C3300",
+                       "a jump from a nested function to its enclosing function needs WebAssembly's exception-handling extension (--features=+exception-handling)");
+        }
+        F.f.returns_twice = true;
+        F.f.noinline = true;
+        let jb = cg.alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.jmpbuf");
+        st(jb, slot(r, jb_field(s)));
+        st(ir.czero(cg.T_ptr), slot(r, jb_field(s) + 1));
+    }
+}
+
+// The index of the jmp_buf's address in the record of function s with
+// non-local labels (then that of the jump's number).
+fn jb_field(s: *cast.CSym) u64 {
+    return 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
 }
 
 /// The address of automatic object x of the function being generated, or
@@ -128,8 +184,13 @@ pub fn is_outer(x: *cast.CSym) bool {
 /// from the function being generated (g's enclosing function, or a function
 /// nested in it).
 pub fn chain_for(g: *cast.CSym) *mut ir.Value {
+    return record_of(g.nest_parent);
+}
+
+// The frame record of the call of function p (the function being generated,
+// or one it is nested in) that the function being generated belongs to.
+fn record_of(p: *mut cast.CSym) *mut ir.Value {
     let F = cg.F;
-    let p = g.nest_parent;
     let cur = F.sym;
     if cur == p {
         return F.rec;
@@ -292,4 +353,257 @@ pub fn define_get(g: *mut cast.CSym) void {
     ir.ret(B(), ld(fa));
     ir.remove_unreachable(f);
     cg.F = u.nil.[cg.FnState]();
+}
+
+// -----------------------------------------------------------------------------
+// Non-local gotos (see the header)
+// -----------------------------------------------------------------------------
+
+// A call of the function being generated, armed: its block that goes on
+// after a non-local goto, and what is in scope there.
+struct Site {
+    blk: *mut ir.Block,
+    vla: *mut void,
+}
+
+let mut g_sites: u.List.[Site] = u.List.[Site].{ data: @ptr_from_int(*mut Site, 0), len: 0, cap: 0 };
+
+// What is in scope at each label of the function being generated that a
+// nested function jumps to.
+let mut g_labels: u.SymMap.[*mut void] = u.SymMap.[*mut void].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                vals: @ptr_from_int(*mut *mut void, 0), cap: 0,
+                                                                len: 0 };
+
+fn nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
+    for k in 0..p.nonlocal.len {
+        if p.nonlocal.get(k) == l {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// A call of the function being generated, hooked into the non-local gotos
+// to enclosing functions (hook): what each of their records' jmp_buf
+// slots held before it.
+struct Hook {
+    blk: *mut ir.Block,
+    vla: *mut void,
+    at: []mut *mut ir.Value,     // the slots
+    saved: []mut *mut ir.Value,  // what they held
+    fns: []mut *mut cast.CSym,   // whose
+}
+
+let mut g_hooks: u.List.[Hook] = u.List.[Hook].{ data: @ptr_from_int(*mut Hook, 0), len: 0, cap: 0 };
+
+// The jmp_buf of the function being generated for its hooks (nil: none yet).
+let mut g_hook_jb: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+// setjmp(jb), the linkers' or (WebAssembly) cgen_sjlj.ax's: nonzero after a
+// longjmp to jb; the function being generated is one that calls setjmp.
+fn setjmp(jb: *mut ir.Value) *mut ir.Value {
+    let F = cg.F;
+    F.f.returns_twice = true;
+    F.f.noinline = true;
+    if cg.is_wasm {
+        return sj.setjmp_call(jb);
+    }
+    let mut ps: [1]*mut ir.Ty = [cg.T_ptr];
+    let f = ggb.extern_fn("__axc_setjmp", cg.T_i32, ps[..]);
+    let mut a: [1]*mut ir.Value = [jb];
+    return ir.call(B(), f.ty, f.val, a[..]);
+}
+
+fn longjmp(jb: *mut ir.Value) void {
+    let mut ps: [2]*mut ir.Ty = [cg.T_ptr, cg.T_i32];
+    let f = ggb.extern_fn(u.pick(cg.is_wasm, "longjmp", "__axc_longjmp_restore"), cg.T_void, ps[..]);
+    let mut a: [2]*mut ir.Value = [jb, ir.cint(cg.T_i32, 1)];
+    _ = ir.call(B(), f.ty, f.val, a[..]);
+    ir.unreachable(B());
+}
+
+// Goes on at a new block if r is 0, else at the block returned.
+fn split(r: *mut ir.Value, name: []u8) *mut ir.Block {
+    let other = cg.new_block(name);
+    let cont = cg.new_block("nonlocal.call");
+    ir.condbr(B(), ir.icmp(B(), ir.IntNE, r, ir.cint(cg.T_i32, 0)), other, cont);
+    cg.at_end(cont);
+    return other;
+}
+
+/// Before a call in the function being generated: if a nested function
+/// jumps to one of its labels, setjmp arms its jmp_buf for the call. And if
+/// it is nested in functions that nested functions jump to, and has
+/// cleanups in scope or trampolines, the call is hooked into those jumps:
+/// their records' jmp_buf slots get its own jmp_buf for the call (unhook
+/// gives back what they held), and a jump through it calls the cleanups,
+/// gives back the trampolines and goes on to what the slots held (finish).
+pub fn arm() void {
+    let F = cg.F;
+    if u.isnil(F) or u.isnil(F.sym) {
+        return;
+    }
+    if cg.terminated() {
+        g_pending.push(NONE);
+        return;
+    }
+    if u.notnil(F.sym.nest_parent) and (gv.has_cleanups() or ((F.sym.tramps.len > 0) and u.notnil(F.rec))) {
+        let mut fns = u.List.[*mut cast.CSym].empty();
+        let mut a = F.sym.nest_parent;
+        while u.notnil(a) {
+            if a.nonlocal.len > 0 {
+                fns.push(a);
+            }
+            a = a.nest_parent;
+        }
+        if fns.len > 0 {
+            if u.isnil(g_hook_jb) {
+                g_hook_jb = cg.alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.hook");
+            }
+            let n = fns.len;
+            let h = Hook.{ blk: u.nil.[ir.Block](), vla: gv.snapshot(), at: u.newn.[*mut ir.Value](n + 1)[0..n],
+                           saved: u.newn.[*mut ir.Value](n + 1)[0..n], fns: fns.items() };
+            for k in 0..n {
+                h.at[k] = slot(record_of(fns.get(k)), jb_field(fns.get(k)));
+                h.saved[k] = ld(h.at[k]);
+                st(g_hook_jb, h.at[k]);
+            }
+            let mut hh = h;
+            hh.blk = split(setjmp(g_hook_jb), "nonlocal.hooked");
+            g_hooks.push(hh);
+            g_pending.push(g_hooks.len - 1);
+        } else {
+            g_pending.push(NONE);
+        }
+    } else {
+        g_pending.push(NONE);
+    }
+    if (F.sym.nonlocal.len == 0) or u.isnil(F.rec) {
+        return;
+    }
+    let jb = ld(slot(F.rec, jb_field(F.sym)));
+    let site = split(setjmp(jb), "nonlocal.site");
+    g_sites.push(Site.{ blk: site, vla: gv.snapshot() });
+}
+
+const NONE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+
+// For each armed call being generated (innermost last), its hook in
+// g_hooks, or NONE.
+let mut g_pending: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+/// After a call that arm armed: the slots it hooked given back.
+pub fn unhook() void {
+    if u.isnil(cg.F) or u.isnil(cg.F.sym) or (g_pending.len == 0) {
+        return;
+    }
+    let k = g_pending.pop();
+    if (k == NONE) or cg.terminated() {
+        return;
+    }
+    let h = g_hooks.get(k);
+    for i in 0..h.at.len {
+        st(h.saved[i], h.at[i]);
+    }
+}
+
+/// Label l of the function being generated begins here.
+pub fn label(l: *mut cast.CSym) void {
+    let F = cg.F;
+    if u.notnil(F) and u.notnil(F.sym) and (nonlocal_index(F.sym, l) >= 0) {
+        g_labels.put(u.addr_key(@int_from_ptr(l)), gv.snapshot());
+    }
+}
+
+/// A goto to label l of an enclosing function (a non-local goto).
+pub fn goto_(l: *mut cast.CSym) void {
+    let F = cg.F;
+    gv.release_to(0);
+    if cg.terminated() {
+        return;
+    }
+    leave(F.sym);
+    let p = l.owner;
+    let r = record_of(p);
+    let k = nonlocal_index(p, l);
+    st(ir.inttoptr(B(), cg.usz(@as(u64, @bit_cast(u32, k)) + 1)), slot(r, jb_field(p) + 1));
+    longjmp(ld(slot(r, jb_field(p))));
+    cg.continue_after();
+}
+
+/// After the body of the function being generated: at each armed call, the
+/// goto that a nested function's non-local goto goes on as (label_block:
+/// a label's block).
+pub fn finish(label_block: fn(*mut cast.CSym) *mut ir.Block) void {
+    let F = cg.F;
+    if u.isnil(F.sym) or ((g_sites.len == 0) and (g_hooks.len == 0)) {
+        return;
+    }
+    let ls = F.sym.nonlocal.items();
+    let saved = gv.snapshot();
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    // (a cleanup's call in one of these is armed too: g_sites and g_hooks grow)
+    while (i < g_sites.len) or (j < g_hooks.len) {
+        if j < g_hooks.len {
+            // a jump to an enclosing function through this call: this
+            // function's cleanups, its trampolines given back, the slots
+            // as they were, and on to the slot of the function jumped to
+            // (whose jump's number is not 0)
+            let h = g_hooks.get(j);
+            j += 1;
+            cg.at_end(h.blk);
+            gv.restore(h.vla);
+            gv.release_to(0);
+            if cg.terminated() {
+                continue;
+            }
+            leave(F.sym);
+            for k in 0..h.at.len {
+                st(h.saved[k], h.at[k]);
+            }
+            for k in 0..h.fns.len {
+                let num = slot(record_of(h.fns[k]), jb_field(h.fns[k]) + 1);
+                let t = ir.ptrtoint(B(), ld(num), cg.T_isz);
+                let yes = cg.new_block("nonlocal.on");
+                let no = cg.new_block("nonlocal.next");
+                ir.condbr(B(), ir.icmp(B(), ir.IntNE, t, cg.usz(0)), yes, no);
+                cg.at_end(yes);
+                longjmp(h.saved[k]);
+                cg.at_end(no);
+            }
+            ir.unreachable(B());
+            continue;
+        }
+        let site = g_sites.get(i);
+        i += 1;
+        cg.at_end(site.blk);
+        let num = slot(F.rec, jb_field(F.sym) + 1);
+        let t = ir.ptrtoint(B(), ld(num), cg.T_isz);
+        st(ir.czero(cg.T_ptr), num);  // (arrived: a hook on the way to another jump tells it from this one)
+        let none = cg.new_block("nonlocal.none");
+        let sw = ir.switch_(B(), t, none);
+        for k in 0..ls.len {
+            let l = ls[k];
+            let b = cg.new_block("nonlocal.goto");
+            ir.add_case(sw, cg.usz(@as(u64, k) + 1), b);
+            cg.at_end(b);
+            let at = g_labels.get(u.addr_key(@int_from_ptr(l)));
+            if not u.isvnil(at) and gv.is_prefix(at, site.vla) {
+                gv.restore(site.vla);
+                gv.release_to(svla.depth(l));
+                if not cg.terminated() {
+                    ir.br(B(), label_block(l));
+                }
+            } else {
+                // (into a scope the call is not in: undefined, 6.8.6.1p1)
+                let no = u.newn.[*mut ir.Value](1);
+                _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, no[0..0]);
+                ir.unreachable(B());
+            }
+        }
+        cg.at_end(none);
+        ir.unreachable(B());
+    }
+    gv.restore(saved);
 }

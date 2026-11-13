@@ -158,8 +158,11 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     }
     for l in b.label_list.items() {
         if not l.defined and outer_label(b, l.name) {
-            cs.not_supported(l.span, u.f1("a jump from a nested function to the label '%s' of its enclosing function",
-                                          l.name));
+            // (only a local label of an enclosing function is seen in a
+            // nested function: its other labels are its own)
+            cs.err(l.span, "C3043",
+                   u.f1("the label '%s' is used but not defined (a nested function jumps only to the labels of its enclosing function that are declared with '__label__')",
+                        l.name));
         } else if not l.defined {
             cs.err(l.span, "C3043", u.f1("the label '%s' is used but not defined", l.name));
         } else if not l.used and not catr.maybe_unused(l) {
@@ -196,6 +199,46 @@ fn label_sym(name: []u8, sp: u.Span) *mut cast.CSym {
         BD.label_list.push(l);
     }
     return l;
+}
+
+// The label a goto in the body names: as label_sym, but in a nested
+// function, if it has no label of the name, a local label (`__label__`) of
+// an enclosing function in scope there: a non-local goto, which jumps out of
+// the nested function's call into its enclosing function's (6.8.6.1 for a
+// goto from there: cgen_nest.ax).
+fn goto_label(name: []u8, sp: u.Span) *mut cast.CSym {
+    let mut k = BD.locals.len;
+    while k > 0 {
+        k -= 1;
+        if u.same(BD.locals.get(k).name, name) {
+            return BD.locals.get(k).sym;
+        }
+    }
+    if u.isnil(BD.labels.get(name)) {
+        let mut p = BD.parent;
+        while u.notnil(p) {
+            let mut j = p.locals.len;
+            while j > 0 {
+                j -= 1;
+                let l = p.locals.get(j).sym;
+                if u.same(l.name, name) {
+                    add_once(&mut p.f.nonlocal, l);
+                    return l;
+                }
+            }
+            p = p.parent;
+        }
+    }
+    return label_sym(name, sp);
+}
+
+fn add_once(l: *mut u.List.[*mut cast.CSym], s: *mut cast.CSym) void {
+    for x in l.items() {
+        if x == s {
+            return;
+        }
+    }
+    l.push(s);
 }
 
 fn stmt(s: *mut cast.Stmt) void {
@@ -281,10 +324,12 @@ fn stmt(s: *mut cast.Stmt) void {
     } else if (k == cast.StmtKind.GOTO) and u.notnil(s.e) {
         computed_goto(s);
     } else if k == cast.StmtKind.GOTO {
-        let l = label_sym(s.label, s.label_span);
+        let l = goto_label(s.label, s.label_span);
         l.used = true;
         s.sym = l;
-        vla.goto_(s);
+        if u.isnil(l.owner) or (l.owner == BD.f) {
+            vla.goto_(s);  // (a non-local goto leaves this function: cgen_nest.ax)
+        }
     } else if k == cast.StmtKind.CONTINUE {
         if BD.loops == 0 {
             cs.err(s.span, "C3042", "'continue' is not in a loop");
@@ -559,6 +604,7 @@ fn local_labels(d: *mut cast.Decl) void {
             }
         }
         let l = cs.new_sym(cast.SK_LABEL, dc.name, dc.name_span, cty.t_void);
+        l.owner = BD.f;  // (a nested function may jump to it: goto_label)
         BD.label_list.push(l);
         BD.locals.push(Local.{ name: dc.name, sym: l });
     }

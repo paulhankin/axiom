@@ -868,10 +868,14 @@ results and flags these paths give bit for bit in every direction):
   with the hardware's.
 - **Conversions**: from an integer of any width (`__int128`, `_BitInt(N)` too) exact or
   rounded, with exponent 0; to an integer truncated toward zero, saturated with
-  "invalid" out of range (undefined, C23 6.3.1.4); to and from `float`, `double` and
-  `long double` (every format: binary64, the x87's, binary128) correctly rounded both
-  ways (to a decimal type in the decimal rounding direction, the exact value's exponent
-  the one nearest 0; to a binary type to nearest), and between the decimal types. A
+  "invalid" out of range (undefined, C23 6.3.1.4); to and from `_Float16`, `float`, `double`
+  and `long double` (every format: binary16, binary32, binary64, the x87's, binary128;
+  `_Float32`, `_Float64`, `_Float128` and the extended types are one of them) correctly
+  rounded both ways, once (to a decimal type in the decimal rounding direction, the
+  exact value's exponent the one nearest 0; to a binary type in the binary direction:
+  to nearest, or under strict floating point the environment's, "The floating-point
+  environment"), with the exceptions of that one rounding, and between the decimal
+  types. A
   decimal operand does not mix with a binary floating (`_FloatN` too), complex or imaginary one in the usual
   arithmetic conversions (`C3230`, C23 6.3.1.8p1); a cast or an assignment converts
   between them (to a complex type: the real part). `_Generic`, `_Atomic` (lock-free for 4
@@ -1563,8 +1567,7 @@ as the standard says.
   `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
   rejects too.
 - In every mode: `__declspec`, `#import`,
-  `#assert`. In a GNU dialect: a jump from a nested function to a label of its enclosing
-  function (C3901), and the decimal and `__bf16`/`__ibm128`
+  `#assert`. In a GNU dialect: the decimal and `__bf16`/`__ibm128`
   types.
 
 ## GNU dialects
@@ -1600,7 +1603,7 @@ exactly what works (there is no option that defines `__GNUC__`).
 | `__FUNCTION__`, `__PRETTY_FUNCTION__` | Other names of `__func__` (`""` outside a function). |
 | `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, but on a `register` one: an explicit register variable ("Inline assembly"). |
 | `asm`, `__asm__` statements; file-scope `asm("...")` | Inline assembly on x86-64 and AArch64 ("Inline assembly", below). |
-| Nested functions | A function defined in a block: it sees the enclosing functions' objects (in their frames, through a chain of frame records passed to it as a hidden last argument) and may be called through a pointer while its enclosing call runs (a trampoline: one of a pool of 128 compiled thunks per nested function whose address is taken, claimed atomically and released when the enclosing call returns, so no code is written at run time and no stack is executable; more than 128 live at once traps). `auto` declares one ahead of its definition. Not variadic (C3901); a `goto` to a label of the enclosing function is C3901. |
+| Nested functions | A function defined in a block: it sees the enclosing functions' objects (in their frames, through a chain of frame records passed to it as a hidden last argument) and may be called through a pointer while its enclosing call runs (a trampoline: one of a pool of 128 compiled thunks per nested function whose address is taken, claimed atomically and released when the enclosing call returns, so no code is written at run time and no stack is executable; more than 128 live at once traps). `auto` declares one ahead of its definition. Not variadic (C3901). A `goto` in it to a local label (`__label__`) of an enclosing function (it sees no other label of it: C3043) is a non-local goto: the nested function's cleanups are called and its variable length arrays freed, as for a return, its call and those between it and the enclosing function's are left (those of other nested functions of the enclosing one calling their cleanups and giving back their trampolines as the jump passes; those of other functions as a `longjmp` leaves them), and the jump goes on as a `goto` in the enclosing function from the call it is making then, calling the cleanups of the scopes it leaves and freeing their variable length arrays; into the scope of a variable length array or an object with a cleanup that call is not in (6.8.6.1p1), it traps. The enclosing function arms a `jmp_buf` in its frame before each of its calls and is compiled as a function that calls `setjmp` is (not optimized), as is a nested function in it that makes calls with cleanups in scope or trampolines held; on WebAssembly it needs the exception-handling extension (C3300). Every target. |
 | `__float128`, constants `1.0q`/`1.0Q`, `2.0i`/`2.0j` | `__float128` is `_Float128`; `q` is its constant suffix; `i` or `j` makes an imaginary constant of the type (C17 Annex G's imaginary types, which every mode has: "Floating types"). |
 | `enum E : __int128` | An enumeration of a 128-bit underlying type (C23's fixed type), with constants of any value of it; without a fixed type (C23) an enumeration whose values `long long` and `unsigned long long` do not hold has the type `__int128` or `unsigned __int128` ("Implementation-defined behavior"). A `switch` on `__int128` takes case ranges. |
 | Vector types | `T __attribute__((vector_size(n)))` (or `mode(V4SI)` ...): n bytes (a power of two times T's size, at most 4096) of lanes of T, an integer or real floating type. The arithmetic, bitwise and shift operators act lane by lane (a scalar operand is converted to the element type, if that keeps its value, and taken for every lane); `==` ... `>=` give the signed integer vector of the same size, -1 where true and 0; `!` is C3020; `v[i]` reads and writes a lane; `?:` with a vector condition selects lane by lane; initializers and compound literals give the lanes in order (missing ones 0; designators are C3072); a cast between vectors, or a vector and an integer, of one size keeps the bytes (another is C3028). `__builtin_shuffle(a, [b,] mask)`, `__builtin_shufflevector(a, b, i...)` and `__builtin_convertvector(v, T)` (below). A vector is aligned to its size, at most 16 bytes on AArch64 and on x86-64 Linux and macOS (32 with AVX, 64 with AVX-512F; on Windows and WebAssembly its size); IR generation uses the target's vector instructions for up to 64 bytes, and lane-by-lane code where there are none (conversions between integer and floating lanes on WebAssembly, a shift by a vector of counts). |

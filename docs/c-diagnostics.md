@@ -221,7 +221,7 @@ names the feature and the standard that has it (or removed it).
 | `C3040` | `case` or `default` outside a `switch` statement. |
 | `C3041` | A duplicate `case` value, or a second `default` label. |
 | `C3042` | `break` outside a loop or `switch`, or `continue` outside a loop. |
-| `C3043` | A label that is used and not defined. |
+| `C3043` | A label that is used and not defined (in a nested function, a label of an enclosing function that is not a local label, `__label__`). |
 | `C3044` | A `return` with a value in a function that returns `void`, or without one in a function that returns a value. |
 | `C3061` | A definition of `main` of a type that is not supported: it must be `int (void)` or `int (int, char **)`. |
 
@@ -245,7 +245,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
 | `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
-| `C3300` | A call of `setjmp` (`<setjmp.h>`, or `__builtin_setjmp`, `__builtin_longjmp`) in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
+| `C3300` | A call of `setjmp` (`<setjmp.h>`, or `__builtin_setjmp`, `__builtin_longjmp`) or a non-local `goto` (from a nested function), in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
 | `C3901` | A feature that this implementation does not support: in a GNU dialect constraints it does not know (on WebAssembly a machine constraint of another target), an explicit register variable on WebAssembly, a variadic nested function, a jump from a nested function to a label of its enclosing function, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
 

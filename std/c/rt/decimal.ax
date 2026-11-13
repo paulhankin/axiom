@@ -2623,11 +2623,13 @@ fn negate_limbs(r: *mut u64, n: usize) void {
 // Conversions with the binary formats
 // -----------------------------------------------------------------------------
 
-/// The binary formats (as ldouble.ax numbers its two, then float and double).
+/// The binary formats (as ldouble.ax numbers its two, then float, double
+/// and binary16).
 pub const B_Q: u32 = 0;    // binary128
 pub const B_X: u32 = 1;    // the x87's 80-bit format
 pub const B_F32: u32 = 2;  // binary32
 pub const B_F64: u32 = 3;  // binary64
+pub const B_F16: u32 = 4;  // binary16 (_Float16)
 
 // A binary value taken apart: (-1)^neg * m * 2^e when finite.
 struct Bin {
@@ -2638,6 +2640,9 @@ struct Bin {
 }
 
 fn bprec(b: u32) i32 {
+    if b == B_F16 {
+        return 11;
+    }
     if b == B_F32 {
         return 24;
     }
@@ -2652,6 +2657,9 @@ fn bprec(b: u32) i32 {
 
 // The exponent of the least normal value (the leading bit's).
 fn bemin(b: u32) i32 {
+    if b == B_F16 {
+        return -14;
+    }
     if b == B_F32 {
         return -126;
     }
@@ -2662,6 +2670,9 @@ fn bemin(b: u32) i32 {
 }
 
 fn bemax(b: u32) i32 {
+    if b == B_F16 {
+        return 15;
+    }
     if b == B_F32 {
         return 127;
     }
@@ -2672,6 +2683,19 @@ fn bemax(b: u32) i32 {
 }
 
 fn bin_unpack(w: ld.W, b: u32) Bin {
+    if b == B_F16 {
+        let x = w.lo & 0xFFFF;
+        let neg = (x >> 15) != 0;
+        let ef = @bit_cast(i32, @truncate(u32, (x >> 10) & 0x1F));
+        let fr = x & 0x3FF;
+        if ef == 0x1F {
+            return bin_special(neg, fr == 0, ((fr >> 9) & 1) == 0);
+        }
+        if ef == 0 {
+            return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr), e: -24 };
+        }
+        return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr | 0x400), e: ef - 25 };
+    }
     if b == B_F32 {
         let x = w.lo & 0xFFFF_FFFF;
         let neg = (x >> 31) != 0;
@@ -2804,6 +2828,9 @@ fn bin_round(neg: bool, r: U2, e: i32, sticky: bool, b: u32, bmode: u32, c: *mut
 }
 
 fn bin_inf(neg: bool, b: u32) ld.W {
+    if b == B_F16 {
+        return ld.W.{ lo: bsign(neg, 15) | 0x7C00, hi: 0 };
+    }
     if b == B_F32 {
         return ld.W.{ lo: bsign(neg, 31) | 0x7F80_0000, hi: 0 };
     }
@@ -2817,6 +2844,9 @@ fn bin_inf(neg: bool, b: u32) ld.W {
 }
 
 fn bin_nan(neg: bool, b: u32) ld.W {
+    if b == B_F16 {
+        return ld.W.{ lo: bsign(neg, 15) | 0x7E00, hi: 0 };
+    }
     if b == B_F32 {
         return ld.W.{ lo: bsign(neg, 31) | 0x7FC0_0000, hi: 0 };
     }
@@ -2838,6 +2868,9 @@ fn bsign(neg: bool, bit: u32) u64 {
 
 fn bin_pack(neg: bool, ef: i32, m: U2, b: u32) ld.W {
     let e = @as(u64, @bit_cast(u32, ef));
+    if b == B_F16 {
+        return ld.W.{ lo: (bsign(neg, 15) | (e << 10)) | (m.l & 0x3FF), hi: 0 };
+    }
     if b == B_F32 {
         return ld.W.{ lo: (bsign(neg, 31) | (e << 23)) | (m.l & 0x7F_FFFF), hi: 0 };
     }
@@ -3560,8 +3593,8 @@ pub fn dec_to_wint(out: *mut u64, n: usize, bits: u32, sg: u32, p: *ld.W, x: u64
     done(&c);
 }
 
-/// A binary value (float or double: its bits in v; the others at bp) in
-/// decimal format f.
+/// A binary value (binary16, float or double: its bits in v; the others at
+/// bp) in decimal format f.
 pub fn dec_from_bin(r: *mut ld.W, bp: *ld.W, v: u64, b: u32, f: u32) u64 {
     let mut c = envc();
     let mut w = nw(v);

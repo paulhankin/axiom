@@ -7,3 +7,10 @@
   constants follow C23's typing rules in the list (the type of their expression, or a
   wider type past the previous one's) and after it (the enumerated type). Such a constant
   was the error `C3212` before.
+- Non-local `goto` in the GNU dialects: a nested function may jump to a local label
+  (`__label__`) of its enclosing function, on every target (WebAssembly with its
+  exception-handling extension). The cleanups and variable length arrays of the scopes
+  the jump leaves, in the nested function and in the enclosing one, are unwound.
+- Conversions between the decimal floating types and `_Float16` round once, directly to
+  binary16, in every binary rounding direction (the environment's under strict floating
+  point) with that rounding's exceptions; they went through binary128 before.

@@ -33,6 +33,7 @@ struct State {
     lens: u.SymMap.[*mut ir.Value],  // a length's slot, by its expression's address
     chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope (nil: a cleanup's place)
     calls: u.List.[*mut cast.Expr],  // for each place in chain, a cleanup's call (nil: an allocation's)
+    cut: i32,  // while the cleanup at this place is called: the places before it (else -1)
 }
 
 /// Generates an expression (cgen_expr.rv; set by cgen_stmt.ax).
@@ -52,6 +53,7 @@ fn key(p: *void) []u8 {
 /// Starts a function's body.
 pub fn begin_function() void {
     VS = u.new.[State]();
+    VS.cut = -1;
     VS.lens = u.SymMap.[*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Value](), cap: 0, len: 0 };
 }
 
@@ -215,7 +217,10 @@ pub fn release_to(d: i32) void {
         k -= 1;
         let c = VS.calls.get(k);
         if u.notnil(c) {
+            let oc = VS.cut;
+            VS.cut = @int_cast(i32, k);  // (its own scope is left: snapshot)
             _ = gen_expr(c);
+            VS.cut = oc;
             if cg.terminated() {
                 return;  // (a cleanup that does not return)
             }
@@ -250,4 +255,53 @@ pub fn has_cleanups() bool {
         }
     }
     return false;
+}
+
+// What is in scope at a point, kept (a non-local goto's: cgen_nest.ax).
+struct Saved {
+    chain: []mut *mut ir.Value,
+    calls: []mut *mut cast.Expr,
+}
+
+/// The places in scope here (inside a cleanup's call, those before it).
+pub fn snapshot() *mut void {
+    let mut n = VS.chain.len;
+    if (VS.cut >= 0) and (@int_cast(usize, VS.cut) < n) {
+        n = @int_cast(usize, VS.cut);
+    }
+    let x = u.new.[Saved]();
+    x.chain = u.newn.[*mut ir.Value](n + 1)[0..n];
+    x.calls = u.newn.[*mut cast.Expr](n + 1)[0..n];
+    for i in 0..n {
+        x.chain[i] = VS.chain.get(i);
+        x.calls[i] = VS.calls.get(i);
+    }
+    return @ptr_cast(*mut void, x);
+}
+
+/// Makes snapshot x what is in scope (to generate a jump from there).
+pub fn restore(x0: *mut void) void {
+    let x = @ptr_cast(*mut Saved, x0);
+    VS.chain.clear();
+    VS.calls.clear();
+    for i in 0..x.chain.len {
+        VS.chain.push(x.chain[i]);
+        VS.calls.push(x.calls[i]);
+    }
+}
+
+/// Is what snapshot a has in scope the first of what snapshot b has: may a
+/// goto jump from b's point to a's without entering a scope (6.8.6.1p1)?
+pub fn is_prefix(a0: *mut void, b0: *mut void) bool {
+    let a = @ptr_cast(*mut Saved, a0);
+    let b = @ptr_cast(*mut Saved, b0);
+    if a.chain.len > b.chain.len {
+        return false;
+    }
+    for i in 0..a.chain.len {
+        if (a.chain[i] != b.chain[i]) or (a.calls[i] != b.calls[i]) {
+            return false;
+        }
+    }
+    return true;
 }
