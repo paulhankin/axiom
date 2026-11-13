@@ -2948,17 +2948,18 @@ itself is in the `.dSYM`).
   the C library's own units, nor `__DATE__` and `__TIME__` (two builds are the
   same). `--debug-macros=off` leaves them out (a program including `<stdio.h>` gets
   about 4 KB of them).
-- **Cost**: `-g` at `-O2` compiles C programs about a quarter slower (processor
-  time), with about a tenth more memory; the compiler itself (a large program, in
-  its parts: "Optimization") with about a third more processor time and a fifth more
-  memory (the most any one process needs). Most of the time is the location analysis
-  (`dloc.ax`: what each register and slot holds at each instruction, for every
-  variable of the function, so large functions with many variables cost most), then
-  the debug information written and the optimizer's records of the variables'
-  assignments; most of the memory those records, which every part of a program
-  compiled in parts starts with. The executable's debug sections are about the size
-  of its code; its frame table's line tables a third of the line tables' DWARF
-  ("Stack traces").
+- **Cost**: `-g` at `-O2` compiles C programs about a sixth slower (processor
+  time), with about an eighth more memory; the compiler itself (a large program, in
+  its parts: "Optimization") with about a seventh more processor time and a sixth
+  more memory (the most any one process needs). The time is the location analysis
+  (`dloc.ax`: what each register and slot holds, and what each variable is, followed
+  through the machine code; its work at an instruction is that of what the
+  instruction changes, and at a join that of what is known there), the debug
+  information written, and the optimizer's records of the variables' assignments;
+  most of the memory those records, which every part of a program compiled in parts
+  starts with (made smaller before the parts start). The executable's debug sections
+  are about the size of its code; its frame table's line tables a third of the line
+  tables' DWARF ("Stack traces").
 Where it goes, per target:
 
 | Target | |

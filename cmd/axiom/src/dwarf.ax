@@ -399,8 +399,10 @@ pub fn add_func(d: *mut Unit, f: *Func) void {
         d.first_src = f.src;
     }
     d.nfuncs += 1;
+    var_pieces_done();
     line_sequence(d, f);
     subprogram(d, f);
+    var_pieces_done();
     if f.cfi.len > 0 {
         fde(d, f);
     }
@@ -1801,18 +1803,62 @@ fn loc_expr(d: *mut Unit, e: *mut bn.Bytes, fx: *mut u.List.[SFix], x: *dloc.VLo
     return true;
 }
 
+/// The function's debug information is written: var_pieces's index of its
+/// location pieces goes.
+pub fn var_pieces_done() void {
+    VL_FOR = 0;
+}
+
+// The location pieces of the function add_func writes, by variable: its
+// instance << 32 | its index -> its first piece's index in f.vlocs + 1, and
+// each piece's next one's (+ 1, 0: none), in order; of the vlocs at VL_FOR.
+let mut VL_FOR: usize = 0;
+let mut VL_LEN: usize = 0;
+let mut VL_BY: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                     len: 0 };
+let mut VL_NEXT: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+/// The location pieces of variable k of instance inst of the function
+/// whose debug information is written (add_func), in order.
+pub fn var_pieces(f: *Func, k: usize, inst: u32) u.List.[dloc.VLoc] {
+    if (VL_FOR != @int_from_ptr(f.vlocs.ptr)) or (VL_LEN != f.vlocs.len) {
+        VL_BY.deinit();
+        VL_NEXT.clear();
+        for _j in 0..f.vlocs.len {
+            VL_NEXT.push(0);
+        }
+        let mut j = f.vlocs.len;
+        while j > 0 {
+            j -= 1;
+            let x = f.vlocs[j];
+            let key = (@as(u64, x.inst) << 32) | @as(u64, x.var);
+            VL_NEXT.set(j, @truncate(u32, VL_BY.get(key)));
+            VL_BY.put(key, @as(u64, j) + 1);
+        }
+        VL_FOR = @int_from_ptr(f.vlocs.ptr);
+        VL_LEN = f.vlocs.len;
+    }
+    let mut xs = u.List.[dloc.VLoc].empty();
+    if (k >> 32) != 0 {
+        return xs;
+    }
+    let mut j = VL_BY.get((@as(u64, inst) << 32) | @as(u64, k));
+    while j != 0 {
+        xs.push(f.vlocs[@truncate(usize, j - 1)]);
+        j = @as(u64, VL_NEXT.get(@truncate(usize, j - 1)));
+    }
+    return xs;
+}
+
 // The stretches of variable k's locations (in f.vlocs), in order: one
 // whole value's, or the pieces' (of a variable of `size` bytes) put
 // together at each address where at least one of them has one.
 fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[Seg] {
     let mut out = u.List.[Seg].empty();
-    let mut xs = u.List.[dloc.VLoc].empty();
+    let mut xs = var_pieces(f, k, inst);
     let mut whole = false;
-    for x in f.vlocs {
-        if (@as(usize, x.var) == k) and (x.inst == inst) {
-            xs.push(x);
-            whole = whole or (x.psize == 0);
-        }
+    for x in xs.items() {
+        whole = whole or (x.psize == 0);
     }
     if whole {
         // (a value of all of it: its pieces, if any, are left aside)
@@ -1867,6 +1913,33 @@ fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[
             }
         }
     }
+    // each piece's place's locations (of xs, in order; one group if whole),
+    // and where the stretches have got to in each (the locations of one
+    // place are one after the other: a stretch is in one of them at most,
+    // the one it has got to)
+    let mut grp = u.List.[usize].empty();
+    let mut gat = u.List.[usize].empty();
+    let ng = @max(pcs.len, 1);
+    for g in 0..ng {
+        gat.push(grp.len);
+        for j in 0..xs.len {
+            let x = xs.get(j);
+            if whole or ((x.poff == pcs.get(g)[0]) and (x.psize == pcs.get(g)[1])) {
+                grp.push(j);
+            }
+        }
+    }
+    gat.push(grp.len);
+    let mut ordered = true;
+    for g in 0..ng {
+        for j in (gat.get(g) + 1)..gat.get(g + 1) {
+            ordered = ordered and (xs.get(grp.get(j)).start >= xs.get(grp.get(j - 1)).end);
+        }
+    }
+    let gcur = u.newn.[usize](ng + 1);
+    for g in 0..ng {
+        gcur[g] = gat.get(g);
+    }
     for c in 0..cut.len {
         if c + 1 >= cut.len {
             break;
@@ -1876,10 +1949,29 @@ fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[
         if hi <= lo {
             continue;
         }
+        // (the location of each group for it: an index in xs, -1: none)
+        let mut some = false;
+        if ordered {
+            for g in 0..ng {
+                while (gcur[g] < gat.get(g + 1)) and (xs.get(grp.get(gcur[g])).end <= lo) {
+                    gcur[g] += 1;
+                }
+                if gcur[g] < gat.get(g + 1) {
+                    let x = xs.get(grp.get(gcur[g]));
+                    some = some or ((x.start <= lo) and (x.end >= hi));
+                }
+            }
+            if not some {
+                continue;  // (none: no stretch)
+            }
+        }
         let mut e = bn.new_bytes();
         let mut fx = u.List.[SFix].empty();
         let mut any = false;
-        if whole {
+        if whole and ordered {
+            let x = xs.get(grp.get(gcur[0]));
+            any = loc_expr(d, &mut e, &mut fx, &x);
+        } else if whole {
             for x in xs.items() {
                 if (x.start <= lo) and (x.end >= hi) {
                     any = loc_expr(d, &mut e, &mut fx, &x);
@@ -1888,20 +1980,36 @@ fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[
             }
         } else {
             let mut at: u64 = 0;
-            for p in pcs.items() {
+            for g in 0..pcs.len {
+                let p = pcs.get(g);
                 if @as(u64, p[0]) > at {
                     e.u8_(OP_PIECE);
                     e.uleb(@as(u64, p[0]) - at);
                 }
-                for x in xs.items() {
-                    if (x.poff == p[0]) and (x.psize == p[1]) and (x.start <= lo) and (x.end >= hi) {
-                        let at0 = e.len();
-                        if loc_expr(d, &mut e, &mut fx, &x) {
-                            any = true;
-                        } else {
-                            e.b.len = at0;
+                let mut hit: i64 = -1;
+                if ordered {
+                    if gcur[g] < gat.get(g + 1) {
+                        let x = xs.get(grp.get(gcur[g]));
+                        if (x.start <= lo) and (x.end >= hi) {
+                            hit = @int_cast(i64, grp.get(gcur[g]));
                         }
-                        break;
+                    }
+                } else {
+                    for j in 0..xs.len {
+                        let x = xs.get(j);
+                        if (x.poff == p[0]) and (x.psize == p[1]) and (x.start <= lo) and (x.end >= hi) {
+                            hit = @int_cast(i64, j);
+                            break;
+                        }
+                    }
+                }
+                if hit >= 0 {
+                    let x = xs.get(@int_cast(usize, hit));
+                    let at0 = e.len();
+                    if loc_expr(d, &mut e, &mut fx, &x) {
+                        any = true;
+                    } else {
+                        e.b.len = at0;
                     }
                 }
                 e.u8_(OP_PIECE);
@@ -1931,6 +2039,8 @@ fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64, inst: u32) u.List.[
     xs.deinit();
     cut.deinit();
     pcs.deinit();
+    grp.deinit();
+    gat.deinit();
     return out;
 }
 

@@ -98,6 +98,7 @@ pub struct Tab {
     pairs: u.U64Map,       // a file's name's offset << 32 | a function's -> its number + 1
     ctxs: u.U64Map,        // a pair's number << 32 | the next record + 1 -> the context's offset + 1
     strs: u.SymMap.[u64],  // a name -> its offset + 1
+    last: [2]u64,          // the string ro_str gave last at each of its two uses: its offset + 1 (0: none)
 }
 
 pub fn off() Tab {
@@ -105,7 +106,7 @@ pub fn off() Tab {
                  rets0: -1, cur_text: -1, others: u.List.[u64].empty(), rel32: 0, abs64: 0, empty: 0, lines: false,
                  ro: -1, ro_sym: 0, rec_of: u.U64Map.empty(), recs: u.U64Map.empty(), pairs: u.U64Map.empty(),
                  ctxs: u.U64Map.empty(), strs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0,
-                                                                len: 0 } };
+                                                                len: 0 }, last: [0, 0] };
 }
 
 // The module's frame table, if it has one (m.frame_tables), and the chains
@@ -339,7 +340,7 @@ fn line_record(t: *mut Tab, src: u32, sc: u32, name: []u8) u64 {
             line = @bit_cast(u64, p.line);
         }
     }
-    let pk = (ro_str(t, fname) << 32) | ro_str(t, scope_func(sc, name));
+    let pk = (ro_str(t, fname, 0) << 32) | ro_str(t, scope_func(sc, name), 1);
     let mut pair = t.pairs.get(pk);
     if pair == 0 {
         pair = @as(u64, t.pairs.len) + 1;
@@ -382,8 +383,24 @@ fn rel(to: u64, from: u64) u64 {
     return (to -% from) & 0xffff_ffff;
 }
 
-// The offset in .rodata.axiom_lines of string s (NUL-terminated), made once per object.
-fn ro_str(t: *mut Tab, s: []u8) u64 {
+// The offset in .rodata.axiom_lines of string s (NUL-terminated), made once
+// per object (the string given last at the same use, `use`, is looked at
+// first: the same file and function, most often).
+fn ro_str(t: *mut Tab, s: []u8, use: usize) u64 {
+    let lo = t.last[use];
+    if lo != 0 {
+        let d = t.obj.secs.get(@int_cast(usize, t.ro)).data.view();
+        let o = @truncate(usize, lo - 1);
+        if ((o + s.len) < d.len) and (d[o + s.len] == 0) and u.str_eq(d[o..o + s.len], s) {
+            return lo - 1;
+        }
+    }
+    let r = ro_str_new(t, s);
+    t.last[use] = r + 1;
+    return r;
+}
+
+fn ro_str_new(t: *mut Tab, s: []u8) u64 {
     let k = u.intern(s);
     let at = t.strs.get(k);
     if at != 0 {

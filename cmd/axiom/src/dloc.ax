@@ -28,6 +28,13 @@
 // yet) and settles at a fixed point, every part of which holds by
 // induction over a run of the code.
 //
+// The work is that of what changes (State): a state keeps what is known
+// (few places and variables at a time) with, for each identity, the places
+// that hold it and the variables that are it; a block's state at its end is
+// kept as what is known in it (SState); a join looks at what its paths
+// know; and the locations are found again (emit_at) only for the variables
+// whose inputs changed since they were found last.
+//
 // What is relied on (the invariant): after register allocation, a machine
 // instruction's register operands written (RD, RUD, RE), its clobbers (a
 // call's) and the copies (is_move), spills and reloads (MInst.spill) say
@@ -227,9 +234,9 @@ let mut by_val: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize
 // an entity's (var << 40 | poff << 20 | psize... as a key) index + 1
 let mut by_ent: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
                                                   cap: 0, len: 0 };
-// the code offset of each machine instruction the encoder visited (its address -> offset + 1), and of each block
-let mut offs: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                cap: 0, len: 0 };
+// the code offset of each machine instruction the encoder visited is in it
+// (MInst.doff, of the pass OFF_GEN: offset_of), and of each block in boffs
+let mut OFF_GEN: u8 = 1;
 let mut boffs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 // the IR block of each machine block
 let mut mb_ir: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
@@ -240,6 +247,12 @@ let mut pend: i32 = 0;
 let mut pend_after: *mut mc.MInst = @ptr_from_int(*mut mc.MInst, 0);
 let mut pend_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut FN: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+// the variables of FN, and of the function whose variables before() looked at last
+let mut OWN_P: *dbi.DVar = @ptr_from_int(*dbi.DVar, 0);
+let mut OWN_N: usize = 0;
+let mut LAST_OWNER: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut LAST_P: *dbi.DVar = @ptr_from_int(*dbi.DVar, 0);
+let mut LAST_N: usize = 0;
 
 /// Are variables followed in the function being compiled?
 pub let mut active: bool = false;
@@ -591,11 +604,9 @@ pub fn begin(f: *mut ir.Func, on: bool) void {
     // (the last function's maps given back)
     drop_map.[i32](&mut by_val);
     drop_map.[i32](&mut by_ent);
-    drop_map.[u64](&mut offs);
     drop_map.[usize](&mut call_ir);
     by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     by_ent = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
-    offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
     call_ir = u.SymMap.[usize].{ keys: u.nil.[usize](), vals: u.nil.[usize](), cap: 0, len: 0 };
     CALLS = u.List.[CallSite].empty();  // (a new one: the last function's went with it: release)
     boffs.clear();
@@ -608,6 +619,10 @@ pub fn begin(f: *mut ir.Func, on: bool) void {
     if not active {
         return;
     }
+    let ov = dbi.vars_of(f.name);
+    OWN_P = ov.ptr;
+    OWN_N = ov.len;
+    LAST_OWNER = u.nil.[ir.Func]();
     // the values the marks name (their makings are found as they are selected)
     let mut b = f.first;
     while u.notnil(b) {
@@ -666,7 +681,7 @@ pub fn before(i: *ir.Value, b: *mut mc.MBlock) void {
     if k < 0 {
         return;
     }
-    let own = dbi.vars_of(FN.name);
+    let own = @slice_from_ptr(OWN_P, OWN_N);
     let mut chain: i32 = 0;
     while k >= 0 {
         let m = ir.dbg_marks.get(@int_cast(usize, k));
@@ -674,7 +689,14 @@ pub fn before(i: *ir.Value, b: *mut mc.MBlock) void {
         k = m.next;
         let mut vs = own;
         if m.inst != 0 {
-            vs = dbi.vars_of(m.owner.name);  // (an inlined function's, of its instance)
+            // (an inlined function's, of its instance)
+            if @int_from_ptr(m.owner) != @int_from_ptr(LAST_OWNER) {
+                LAST_OWNER = m.owner;
+                let lv = dbi.vars_of(m.owner.name);
+                LAST_P = lv.ptr;
+                LAST_N = lv.len;
+            }
+            vs = @slice_from_ptr(LAST_P, LAST_N);
         } else if @int_from_ptr(m.owner) != @int_from_ptr(FN) {
             continue;
         }
@@ -806,7 +828,10 @@ pub fn block_at(bi: usize, off: u64, restart: bool) void {
     }
     if restart {
         boffs.clear();
-        drop_map.[u64](&mut offs);
+        OFF_GEN = OFF_GEN +% 1;  // (the offsets of the pass before: none)
+        if OFF_GEN == 0 {
+            OFF_GEN = 1;
+        }
     }
     while boffs.len <= bi {
         boffs.push(0xffff_ffff_ffff_ffff);
@@ -818,8 +843,18 @@ pub fn block_at(bi: usize, off: u64, restart: bool) void {
 /// the next one given) starts at code offset `off`.
 pub fn inst_at(i: *mc.MInst, off: u64) void {
     if active {
-        offs.put(key(@int_from_ptr(i)), off + 1);
+        let m = @ptr_from_int(*mut mc.MInst, @int_from_ptr(i));
+        m.dgen = OFF_GEN;
+        m.doff = @truncate(u32, off + 1);
     }
+}
+
+// Machine instruction i's code offset + 1 (0: the encoder did not visit it).
+fn offset_of(i: *mc.MInst) u64 {
+    if i.dgen != OFF_GEN {
+        return 0;
+    }
+    return @as(u64, i.doff);
 }
 
 fn bit(r: i32) u64 {
@@ -864,18 +899,15 @@ fn move_regs(mf: *mc.MFunc, i: *mc.MInst) [2]i32 {
 let mut NL: usize = 64;
 let mut SLOTS: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
 const MAX_SLOTS: usize = 448;
+// each frame slot's place + 1 (by the slot's index; 0: none followed)
+let mut SLOT_PL: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
 
 // The place of frame slot k (-1: none followed).
 fn slot_place(k: i32) i32 {
-    if k < 0 {
+    if (k < 0) or (@int_cast(usize, k) >= SLOT_PL.len) {
         return -1;
     }
-    for j in 0..SLOTS.len {
-        if SLOTS.get(j) == k {
-            return 64 + @int_cast(i32, j);
-        }
-    }
-    return -1;
+    return SLOT_PL.get(@int_cast(usize, k)) - 1;
 }
 
 // The slot of place l (>= 64).
@@ -898,13 +930,59 @@ struct Ins {
     imm: i64,
 }
 
-// The state at a point: C, what each place holds (0: nothing known, else
-// an identity); D and A, what each entity is (an identity plus A).
+// The state at a point, as the analysis works on it: C, what each place
+// holds (0: nothing known, else an identity); D and A, what each entity is
+// (an identity plus A); X, per value a bit: made, and none of the values it
+// is computed from (expr_of) made since.
+//
+// Few places and entities are known at a time, and an instruction changes
+// few of them: with the state are kept the places and entities that may be
+// known (tc, td), and for each identity the places that hold it and the
+// entities that are it (lists through pn, en), so that the work at an
+// instruction is that of what it changes, and the work at a join (meet)
+// and at a block's end (snap) that of what is known.
 struct State {
     c: []mut i32,
     d: []mut i32,
     a: []mut i64,
-    x: []mut u64,  // per value, a bit: made, and none of the values it is computed from (expr_of) made since
+    x: []mut u64,
+    tc: u.List.[usize],  // the places that may hold an identity (each once: tcf)
+    tcf: []mut bool,
+    td: u.List.[usize],  // the entities that may be one (each once: tdf)
+    tdf: []mut bool,
+    pn: []mut i32,  // per place: the next and the previous place holding the same identity (-1: none)
+    pp: []mut i32,
+    en: []mut i32,  // per entity: the next and the previous entity being the same identity
+    ep: []mut i32,
+    hp: []mut i32,  // per identity 1 .. lown - 1: the first place holding it, and the first entity being it (-1: none)
+    he: []mut i32,
+    hpm: u.U64Map,  // the same for the other identities (+ 2; 1: none)
+    hem: u.U64Map,
+    lown: usize,
+    trk: bool,  // (ranges) the places and the entities written since the last emission: in pcl, edl (once: pcf, edf)
+    pcl: u.List.[usize],
+    pcf: []mut bool,
+    edl: u.List.[usize],
+    edf: []mut bool,
+}
+
+// A state as kept at a block's end: what is known in it, in order.
+struct SState {
+    c: u.List.[PC],
+    d: u.List.[PD],
+    x: []mut u64,
+    seen: bool,  // (made: the block was run)
+}
+
+struct PC {
+    l: usize,
+    id: i32,
+}
+
+struct PD {
+    e: usize,
+    id: i32,
+    a: i64,
 }
 
 // (the number of values followed: State.x's bits, in NXW words)
@@ -941,8 +1019,80 @@ struct An {
     defi: []mut usize,  // and its index in ins
     tails: bool,
     preds: []mut u.List.[i32],  // each block's predecessors (from the successors)
-    rep: []mut i32,             // meet's tables, made once
-    at: []mut bool,
+    // meet's work tables, made once
+    ps: u.List.[*SState],  // the paths' states
+    pb: u.List.[i32],      // and blocks
+    ul: u.List.[usize],    // the entities some path knows
+    uf: []mut bool,
+    cur: u.List.[usize],   // per path, where in its state
+    tup: u.List.[i32],     // per path, an entity's identity, or a place's
+    reps: u.List.[usize],  // the merges' representatives
+    rt: u.List.[i32],      // and their paths' identities (n each)
+    rnext: u.List.[i32],   // the next representative of the same hash (-1: none)
+    tab: Tab,              // a hash of the paths' identities -> its first representative
+    atl: u.List.[usize],
+    last: i32,        // the block whose state at its end the working state is (-1: none)
+    nd: u.List.[PD],  // (meet's result, before it is the working state's)
+    nc: u.List.[PC],
+    nf: []mut bool,
+    ncf: []mut bool,
+}
+
+// A table of hashes (by 64-bit hash, to an index), emptied by a new generation.
+struct Tab {
+    k: []mut u64,
+    v: []mut i32,
+    g: []mut u32,
+    cap: usize,
+    gen: u32,
+}
+
+fn tab_reset(t: *mut Tab, n: usize) void {
+    let mut cap = t.cap;
+    if cap == 0 {
+        cap = 64;
+    }
+    while cap < (2 * n) + 2 {
+        cap = cap * 2;
+    }
+    if (cap != t.cap) or (t.gen == 0xffff_ffff) {
+        t.k = u.newn.[u64](cap);
+        t.v = u.newn.[i32](cap);
+        t.g = u.newn.[u32](cap);
+        for j in 0..cap {
+            t.g[j] = 0;
+        }
+        t.cap = cap;
+        t.gen = 1;
+        return;
+    }
+    t.gen += 1;
+}
+
+// The slot of hash h (its own, or the empty one where it would go).
+fn tab_slot(t: *Tab, h: u64) usize {
+    let mut j = @truncate(usize, (h *% 0x9e37_79b9_7f4a_7c15) >> 32) & (t.cap - 1);
+    while (t.g[j] == t.gen) and (t.k[j] != h) {
+        j = (j + 1) & (t.cap - 1);
+    }
+    return j;
+}
+
+fn tup_hash(xs: []i32) u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in xs {
+        h = (h ^ @as(u64, @bit_cast(u32, x))) *% 0x100_0000_01b3;
+    }
+    return h ^ (h >> 31);
+}
+
+fn tup_eq(a: []i32, b: []i32) bool {
+    for j in 0..a.len {
+        if a[j] != b[j] {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn id_val(k: i32) i32 {
@@ -982,44 +1132,281 @@ fn is_held(an: *An, c: i32, d: i32) bool {
     return false;
 }
 
-fn st_new(ne: usize) State {
-    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1), x: u.newn.[u64](NXW + 1) };
-}
-
-fn st_copy(to: *mut State, from: *State, ne: usize) void {
-    for l in 0..NL {
-        to.c[l] = from.c[l];
-    }
-    for e in 0..ne {
-        to.d[e] = from.d[e];
-        to.a[e] = from.a[e];
-    }
-    for k in 0..NXW {
-        to.x[k] = from.x[k];
-    }
-}
-
-fn st_clear(s: *mut State, ne: usize) void {
+fn st_new(an: *An) State {
+    let ne = an.ne;
+    let lown = @int_cast(usize, an.syn0);
+    let s = State.{ c: u.newn.[i32](NL + 1), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1), x: u.newn.[u64](NXW + 1),
+                    tc: u.List.[usize].empty(), tcf: u.newn.[bool](NL + 1), td: u.List.[usize].empty(),
+                    tdf: u.newn.[bool](ne + 1), pn: u.newn.[i32](NL + 1), pp: u.newn.[i32](NL + 1),
+                    en: u.newn.[i32](ne + 1), ep: u.newn.[i32](ne + 1), hp: u.newn.[i32](lown + 1),
+                    he: u.newn.[i32](lown + 1), hpm: u.U64Map.empty(), hem: u.U64Map.empty(), lown: lown, trk: false,
+                    pcl: u.List.[usize].empty(), pcf: u.newn.[bool](NL + 1), edl: u.List.[usize].empty(),
+                    edf: u.newn.[bool](ne + 1) };
     for l in 0..NL {
         s.c[l] = 0;
+        s.tcf[l] = false;
+        s.pcf[l] = false;
     }
     for e in 0..ne {
         s.d[e] = 0;
         s.a[e] = 0;
+        s.tdf[e] = false;
+        s.edf[e] = false;
     }
+    for k in 0..NXW {
+        s.x[k] = 0;
+    }
+    for k in 0..lown {
+        s.hp[k] = -1;
+        s.he[k] = -1;
+    }
+    return s;
+}
+
+fn st_free(s: *mut State) void {
+    s.tc.deinit();
+    s.td.deinit();
+    s.hpm.deinit();
+    s.hem.deinit();
+    s.pcl.deinit();
+    s.edl.deinit();
+}
+
+fn id_key(id: i32) u64 {
+    return @as(u64, @bit_cast(u32, id));
+}
+
+// The first place holding identity id (-1: none).
+fn hp_get(s: *mut State, id: i32) i32 {
+    if (id > 0) and (@int_cast(usize, id) < s.lown) {
+        return s.hp[@int_cast(usize, id)];
+    }
+    let v = s.hpm.get(id_key(id));
+    if v < 2 {
+        return -1;
+    }
+    return @bit_cast(i32, @truncate(u32, v)) - 2;
+}
+
+fn hp_set(s: *mut State, id: i32, l: i32) void {
+    if (id > 0) and (@int_cast(usize, id) < s.lown) {
+        s.hp[@int_cast(usize, id)] = l;
+        return;
+    }
+    s.hpm.put(id_key(id), @as(u64, @bit_cast(u32, l + 2)));
+}
+
+// The first entity being identity id (-1: none).
+fn he_get(s: *mut State, id: i32) i32 {
+    if (id > 0) and (@int_cast(usize, id) < s.lown) {
+        return s.he[@int_cast(usize, id)];
+    }
+    let v = s.hem.get(id_key(id));
+    if v < 2 {
+        return -1;
+    }
+    return @bit_cast(i32, @truncate(u32, v)) - 2;
+}
+
+fn he_set(s: *mut State, id: i32, e: i32) void {
+    if (id > 0) and (@int_cast(usize, id) < s.lown) {
+        s.he[@int_cast(usize, id)] = e;
+        return;
+    }
+    s.hem.put(id_key(id), @as(u64, @bit_cast(u32, e + 2)));
+}
+
+// Place l holds identity id from now on.
+fn put_c(s: *mut State, l: usize, id: i32) void {
+    let old = s.c[l];
+    if old == id {
+        return;
+    }
+    if old != 0 {
+        let n = s.pn[l];
+        let p = s.pp[l];
+        if p >= 0 {
+            s.pn[@int_cast(usize, p)] = n;
+        } else {
+            hp_set(s, old, n);
+        }
+        if n >= 0 {
+            s.pp[@int_cast(usize, n)] = p;
+        }
+    }
+    s.c[l] = id;
+    if id != 0 {
+        let h = hp_get(s, id);
+        s.pn[l] = h;
+        s.pp[l] = -1;
+        if h >= 0 {
+            s.pp[@int_cast(usize, h)] = @int_cast(i32, l);
+        }
+        hp_set(s, id, @int_cast(i32, l));
+        if not s.tcf[l] {
+            s.tcf[l] = true;
+            s.tc.push(l);
+        }
+    }
+    if s.trk and not s.pcf[l] {
+        s.pcf[l] = true;
+        s.pcl.push(l);
+    }
+}
+
+// Entity e is identity id plus a from now on.
+fn put_d(s: *mut State, e: usize, id: i32, a: i64) void {
+    let old = s.d[e];
+    if (old == id) and (s.a[e] == a) {
+        return;
+    }
+    if old != id {
+        if old != 0 {
+            let n = s.en[e];
+            let p = s.ep[e];
+            if p >= 0 {
+                s.en[@int_cast(usize, p)] = n;
+            } else {
+                he_set(s, old, n);
+            }
+            if n >= 0 {
+                s.ep[@int_cast(usize, n)] = p;
+            }
+        }
+        if id != 0 {
+            let h = he_get(s, id);
+            s.en[e] = h;
+            s.ep[e] = -1;
+            if h >= 0 {
+                s.ep[@int_cast(usize, h)] = @int_cast(i32, e);
+            }
+            he_set(s, id, @int_cast(i32, e));
+        }
+    }
+    s.d[e] = id;
+    s.a[e] = a;
+    if ((id != 0) or (a != 0)) and not s.tdf[e] {
+        s.tdf[e] = true;
+        s.td.push(e);
+    }
+    if s.trk and not s.edf[e] {
+        s.edf[e] = true;
+        s.edl.push(e);
+    }
+}
+
+// Nothing known.
+fn st_clear(s: *mut State) void {
+    for l in s.tc.items() {
+        put_c(s, l, 0);
+        s.tcf[l] = false;
+    }
+    s.tc.clear();
+    for e in s.td.items() {
+        put_d(s, e, 0, 0);
+        s.tdf[e] = false;
+    }
+    s.td.clear();
     for k in 0..NXW {
         s.x[k] = 0;
     }
 }
 
-fn st_same(x: *State, y: *State, ne: usize) bool {
-    for l in 0..NL {
-        if x.c[l] != y.c[l] {
+fn ss_new() SState {
+    let s = SState.{ c: u.List.[PC].empty(), d: u.List.[PD].empty(), x: u.newn.[u64](NXW + 1), seen: false };
+    for k in 0..NXW {
+        s.x[k] = 0;
+    }
+    return s;
+}
+
+fn ss_free(s: *mut SState) void {
+    s.c.deinit();
+    s.d.deinit();
+}
+
+// What is known in s, into o (and s's lists of what may be, to it).
+fn snap(s: *mut State, o: *mut SState) void {
+    sort_some(s.tc.items());
+    o.c.clear();
+    o.c.room(s.tc.len);
+    let oc = @slice_from_ptr(o.c.data, s.tc.len);
+    let tc = s.tc.items();
+    let mut n: usize = 0;
+    for l in tc {
+        let id = s.c[l];
+        if id != 0 {
+            oc[n] = PC.{ l: l, id: id };
+            tc[n] = l;
+            n += 1;
+        } else {
+            s.tcf[l] = false;
+        }
+    }
+    s.tc.len = n;
+    o.c.len = n;
+    sort_some(s.td.items());
+    o.d.clear();
+    o.d.room(s.td.len);
+    let od = @slice_from_ptr(o.d.data, s.td.len);
+    let td = s.td.items();
+    n = 0;
+    for e in td {
+        let id = s.d[e];
+        if (id != 0) or (s.a[e] != 0) {
+            od[n] = PD.{ e: e, id: id, a: s.a[e] };
+            td[n] = e;
+            n += 1;
+        } else {
+            s.tdf[e] = false;
+        }
+    }
+    s.td.len = n;
+    o.d.len = n;
+    for k in 0..NXW {
+        o.x[k] = s.x[k];
+    }
+}
+
+// Sorts xs (which are often in order already).
+fn sort_some(xs: []mut usize) void {
+    for k in @as(usize, 1)..xs.len {
+        if xs[k - 1] > xs[k] {
+            u.sort_usize(xs);
+            return;
+        }
+    }
+}
+
+// s is what o says.
+fn load(s: *mut State, o: *SState) void {
+    st_clear(s);
+    for q in o.c.items() {
+        put_c(s, q.l, q.id);
+    }
+    for q in o.d.items() {
+        put_d(s, q.e, q.id, q.a);
+    }
+    for k in 0..NXW {
+        s.x[k] = o.x[k];
+    }
+}
+
+fn ss_same(x: *SState, y: *SState) bool {
+    if (x.c.len != y.c.len) or (x.d.len != y.d.len) {
+        return false;
+    }
+    for k in 0..x.c.len {
+        let p = x.c.get(k);
+        let q = y.c.get(k);
+        if (p.l != q.l) or (p.id != q.id) {
             return false;
         }
     }
-    for e in 0..ne {
-        if (x.d[e] != y.d[e]) or (x.a[e] != y.a[e]) {
+    for k in 0..x.d.len {
+        let p = x.d.get(k);
+        let q = y.d.get(k);
+        if (p.e != q.e) or (p.id != q.id) or (p.a != q.a) {
             return false;
         }
     }
@@ -1031,95 +1418,57 @@ fn st_same(x: *State, y: *State, ne: usize) bool {
     return true;
 }
 
-fn holds(s: *State, id: i32) bool {
-    for l in 0..NL {
-        if s.c[l] == id {
-            return true;
+// What place l holds in o.
+fn ss_c(o: *SState, l: usize) i32 {
+    let mut lo: usize = 0;
+    let mut hi = o.c.len;
+    while lo < hi {
+        let m = (lo + hi) / 2;
+        let p = o.c.get(m);
+        if p.l == l {
+            return p.id;
+        }
+        if p.l < l {
+            lo = m + 1;
+        } else {
+            hi = m;
         }
     }
-    return false;
+    return 0;
 }
 
-// The places of a state by what they hold, while emit_at looks at every
-// entity in it (PX_ON): for an identity, the registers that hold it (a
-// mask) and the first spill slot's place that does (-1: none). It answers
-// what where and expr_of would find by looking at every place.
-let mut PX_ON: bool = false;
-let mut PX_CAP: usize = 0;
-let mut PX_K: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
-let mut PX_M: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut PX_S: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
-
-fn px_slot(id: i32) usize {
-    let mut j = @as(usize, @truncate(u32, @bit_cast(u32, id) *% 0x9e37_79b1)) & (PX_CAP - 1);
-    while (PX_K.get(j) != 0) and (PX_K.get(j) != id) {
-        j = (j + 1) & (PX_CAP - 1);
-    }
-    return j;
+fn holds(s: *mut State, id: i32) bool {
+    return hp_get(s, id) >= 0;
 }
 
-fn px_build(s: *State) void {
-    let mut cap: usize = 128;
-    while cap < (2 * NL) + 2 {
-        cap = cap * 2;
-    }
-    PX_CAP = cap;
-    while PX_K.len < cap {
-        PX_K.push(0);
-        PX_M.push(0);
-        PX_S.push(-1);
-    }
-    for j in 0..cap {
-        PX_K.set(j, 0);
-    }
-    for l in 0..NL {
-        let id = s.c[l];
-        if id == 0 {
-            continue;
-        }
-        let j = px_slot(id);
-        if PX_K.get(j) == 0 {
-            PX_K.set(j, id);
-            PX_M.set(j, 0);
-            PX_S.set(j, -1);
-        }
-        if l < 64 {
-            PX_M.set(j, PX_M.get(j) | (@as(u64, 1) << @truncate(u32, l)));
-        } else if PX_S.get(j) < 0 {
-            PX_S.set(j, @int_cast(i32, l));
-        }
-    }
-    PX_ON = true;
-}
-
-// The registers holding id (a mask) and the first place among the slots
-// from which to look for it (NL: none), from the index when it is on.
-fn px_regs(s: *State, id: i32) u64 {
-    if PX_ON {
-        let j = px_slot(id);
-        if PX_K.get(j) == 0 {
-            return 0;
-        }
-        return PX_M.get(j);
-    }
+// The registers holding id (a mask).
+fn regs_of(s: *mut State, id: i32) u64 {
     let mut m: u64 = 0;
-    for p in @as(usize, 0)..64 {
-        if s.c[p] == id {
-            m = m | (@as(u64, 1) << @truncate(u32, p));
+    let mut l = hp_get(s, id);
+    while l >= 0 {
+        if l < 64 {
+            m = m | (@as(u64, 1) << @as(u32, @bit_cast(u32, l)));
         }
+        l = s.pn[@int_cast(usize, l)];
     }
     return m;
 }
 
-fn px_first_slot(id: i32) usize {
-    if PX_ON {
-        let j = px_slot(id);
-        if (PX_K.get(j) == 0) or (PX_S.get(j) < 0) {
-            return NL;
+// The first spill slot's place holding id whose offset from the CFA is
+// known: its offset (NO_LOC: none).
+fn slot_of(an: *An, s: *mut State, id: i32) i64 {
+    let mut best: i32 = -1;
+    let mut l = hp_get(s, id);
+    while l >= 0 {
+        if (l >= 64) and ((best < 0) or (l < best)) and (an.t.slot_off(place_slot(@int_cast(usize, l))) != NO_LOC) {
+            best = l;
         }
-        return @int_cast(usize, PX_S.get(j));
+        l = s.pn[@int_cast(usize, l)];
     }
-    return 64;
+    if best < 0 {
+        return NO_LOC;
+    }
+    return an.t.slot_off(place_slot(@int_cast(usize, best)));
 }
 
 // Does block a dominate block b?
@@ -1169,26 +1518,25 @@ fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
         return;
     }
     let e = @int_cast(usize, mm.ent);
-    s.d[e] = 0;
-    s.a[e] = 0;
     if mm.cst >= 0 {
-        s.d[e] = 2 * an.nv + mm.cst + 1;
+        put_d(s, e, 2 * an.nv + mm.cst + 1, 0);
         return;
     }
     let k = mm.val;
     if k < 0 {
+        put_d(s, e, 0, 0);
         return;
     }
     let x = VALS.get(@int_cast(usize, k));
     if x.obj or (x.gsym.len > 0) or (x.v.kind == ir.V_PARAM) or holds(s, id_val(k)) {
-        s.d[e] = id_val(k);
-        s.a[e] = mm.add;
+        put_d(s, e, id_val(k), mm.add);
         return;
     }
     if x.phi_blk >= 0 {
         if dominates(an, x.phi_blk, b) {
-            s.d[e] = id_val(k);
-            s.a[e] = mm.add;
+            put_d(s, e, id_val(k), mm.add);
+        } else {
+            put_d(s, e, 0, 0);
         }
         return;
     }
@@ -1199,8 +1547,7 @@ fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
     while (bk >= 0) and (n < 8) {
         let y = VALS.get(@int_cast(usize, bk));
         if y.obj or (y.gsym.len > 0) or holds(s, id_val(bk)) or ((y.v.kind == ir.V_PARAM) and (y.stack_off != NO_LOC)) {
-            s.d[e] = id_val(bk);
-            s.a[e] = add;
+            put_d(s, e, id_val(bk), add);
             return;
         }
         add = add +% y.add;
@@ -1208,13 +1555,14 @@ fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
         n += 1;
     }
     if u.notnil(x.def) {
-        s.a[e] = mm.add;
         if made_before(an, k, b, at) {
-            s.d[e] = id_val(k);
+            put_d(s, e, id_val(k), mm.add);
         } else {
-            s.d[e] = an.nv + k + 1;  // (made later on: waits for the making)
+            put_d(s, e, an.nv + k + 1, mm.add);  // (made later on: waits for the making)
         }
+        return;
     }
+    put_d(s, e, 0, 0);
 }
 
 fn apply_marks(an: *An, s: *mut State, chain: i32, b: i32, at: usize) void {
@@ -1227,7 +1575,7 @@ fn apply_marks(an: *An, s: *mut State, chain: i32, b: i32, at: usize) void {
 
 fn set_reg(an: *An, s: *mut State, r: i32, id: i32) void {
     if (r >= 0) and (r < 64) and ((an.t.alloc & bit(r)) != 0) {
-        s.c[@int_cast(usize, r)] = id;
+        put_c(s, @int_cast(usize, r), id);
     }
 }
 
@@ -1241,8 +1589,8 @@ fn get_reg(an: *An, s: *State, r: i32) i32 {
 // The state after instruction x (from s before it, its marks applied).
 fn step(an: *An, s: *mut State, x: *Ins) void {
     if x.kind == 4 {
-        for l in 0..NL {
-            s.c[l] = 0;
+        for l in s.tc.items() {
+            put_c(s, l, 0);
         }
         return;
     }
@@ -1256,26 +1604,27 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
     } else if x.kind == 3 {
         held = get_reg(an, s, x.s);
     }
-    if x.w != 0 {
-        for p in @as(usize, 0)..64 {
-            if (x.w & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
-                s.c[p] = 0;
-            }
-        }
+    let mut w = x.w;
+    while w != 0 {
+        let p = @as(usize, @truncate(u32, @ctz(w)));
+        w = w & (w - 1);
+        put_c(s, p, 0);
     }
     for q in @as(usize, 0)..2 {
         if x.sw[q] >= 0 {
-            s.c[@int_cast(usize, x.sw[q])] = 0;
+            put_c(s, @int_cast(usize, x.sw[q]), 0);
         }
     }
     if x.swall {
-        for l in 64..NL {
-            s.c[l] = 0;
+        for l in s.tc.items() {
+            if l >= 64 {
+                put_c(s, l, 0);
+            }
         }
     }
     if x.kind == 1 {
         if x.s >= 0 {
-            s.c[@int_cast(usize, x.s)] = held;
+            put_c(s, @int_cast(usize, x.s), held);
         }
     } else if (x.kind == 2) or (x.kind == 3) {
         set_reg(an, s, x.d, held);
@@ -1285,24 +1634,34 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
     if x.defv >= 0 {
         // a value made again: its other copies (and what was it) are stale
         let id = id_val(x.defv);
-        let nx = an.nv + x.defv + 1;
-        for l in 0..NL {
-            if s.c[l] == id {
-                s.c[l] = 0;
-            }
-        }
-        for e in 0..an.ne {
-            if s.d[e] == id {
-                s.d[e] = 0;
-                s.a[e] = 0;
-            } else if s.d[e] == nx {
-                s.d[e] = id;
-            }
-        }
+        made(an, s, x.defv);
         set_reg(an, s, x.defr, id);
-        remade(s, x.defv);
         x_put(s, @int_cast(usize, x.defv), true);
     }
+}
+
+// Value k is made (again, or a phi at its block's start): no place holds
+// it, no entity is what it was, and those waiting for it are it.
+fn made(an: *An, s: *mut State, k: i32) void {
+    let id = id_val(k);
+    let nx = an.nv + k + 1;
+    let mut l = hp_get(s, id);
+    while l >= 0 {
+        put_c(s, @int_cast(usize, l), 0);
+        l = hp_get(s, id);
+    }
+    let mut e = he_get(s, id);
+    while e >= 0 {
+        put_d(s, @int_cast(usize, e), 0, 0);
+        e = he_get(s, id);
+    }
+    e = he_get(s, nx);
+    while e >= 0 {
+        let eu = @int_cast(usize, e);
+        put_d(s, eu, id, s.a[eu]);
+        e = he_get(s, nx);
+    }
+    remade(s, k);
 }
 
 // Value k is made (again): the values computed from it are not from this
@@ -1356,6 +1715,44 @@ fn find_deps() void {
     for k in 0..VALS.len {
         add_deps(@int_cast(i32, k), @int_cast(i32, k), 0);
     }
+    // the values each one's expression may read (expr_of: down to depth 4)
+    CLO.clear();
+    CLO_AT.clear();
+    for k in 0..VALS.len {
+        CLO_AT.push(@truncate(u32, CLO.len));
+        if VALS.get(k).xop != 0 {
+            add_clo(@int_cast(usize, CLO_AT.get(k)), @int_cast(i32, k), 0);
+        }
+    }
+    CLO_AT.push(@truncate(u32, CLO.len));
+}
+
+// each value -> the values whose places and State.x its expression
+// (expr_of) depends on, it among them: CLO[CLO_AT[k] .. CLO_AT[k + 1]]
+let mut CLO: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut CLO_AT: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+fn add_clo(from: usize, k: i32, depth: i32) void {
+    let mut have = false;
+    for j in from..CLO.len {
+        have = have or (CLO.get(j) == k);
+    }
+    if not have {
+        CLO.push(k);
+    }
+    if depth >= 4 {
+        return;
+    }
+    let x = VALS.get(@int_cast(usize, k));
+    if x.xop == 0 {
+        return;
+    }
+    if x.xa >= 0 {
+        add_clo(from, x.xa, depth + 1);
+    }
+    if x.xb >= 0 {
+        add_clo(from, x.xb, depth + 1);
+    }
 }
 
 // The synthetic identity of entity e's merge at block b (0: none).
@@ -1372,113 +1769,219 @@ fn in_syn(id: i32, lo: i64, hi: i64) bool {
 }
 
 // The state at the start of block b, from the states at the ends of its
-// predecessors seen so far (outs, seen) and, for the entry, the entry's.
-fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut State) void {
-    let mb = an.mf.blocks.get(b);
-    let mut ps = u.List.[*State].empty();
-    let mut pb = u.List.[i32].empty();
+// predecessors seen so far (outs) and, for the entry, the entry's.
+fn meet(an: *mut An, b: usize, outs: []mut SState, entry: *SState, s: *mut State) void {
+    if (b != 0) and (an.preds[b].len == 1) and (an.preds[b].get(0) == an.last) and (an.last >= 0) and
+       (PHIS.get(b).len == 0) {
+        return;  // (its one predecessor's, which s is: s)
+    }
+    an.last = -1;
+    an.ps.clear();
+    an.pb.clear();
     if b == 0 {
-        ps.push(entry);
-        pb.push(-1);
+        an.ps.push(entry);
+        an.pb.push(-1);
     }
     for p in an.preds[b].items() {
-        if seen[@int_cast(usize, p)] {
-            ps.push(&outs[@int_cast(usize, p)]);
-            pb.push(p);
+        if outs[@int_cast(usize, p)].seen {
+            an.ps.push(&outs[@int_cast(usize, p)]);
+            an.pb.push(p);
         }
     }
-    st_clear(s, an.ne);
-    if ps.len == 0 {
-        ps.deinit();
-        pb.deinit();
+    an.nd.clear();
+    an.nc.clear();
+    if an.ps.len == 0 {
+        st_apply(an, s);
+        for k in 0..NXW {
+            s.x[k] = 0;
+        }
         return;
     }
-    let n = ps.len;
-    let pss = ps.items();
+    let n = an.ps.len;
+    let pss = an.ps.items();
     // (the identities of block b's merges, syn's: [slo, shi))
     let slo = an.syn0 + (@as(i64, @int_cast(i64, b)) * @as(i64, @int_cast(i64, an.ne)));
     let shi = slo + @as(i64, @int_cast(i64, an.ne));
-    // the entities
-    let rep = an.rep;  // a disagreeing entity's representative (-1: none)
-    let mut reps = u.List.[usize].empty();  // (the representatives, in order)
-    for e in 0..an.ne {
-        rep[e] = -1;
-        let d0 = pss[0].d[e];
-        let a0 = pss[0].a[e];
-        let mut same = not in_syn(d0, slo, shi);
-        let mut known = d0 != 0;
-        let mut adds = true;
-        for j in 1..n {
-            let x = pss[j];
-            if (x.d[e] != d0) or in_syn(x.d[e], slo, shi) {
-                same = false;
+    // the entities some path knows, in order (the others are not known on
+    // any: not known)
+    an.ul.clear();
+    if n == 1 {
+        for q in pss[0].d.items() {
+            an.ul.push(q.e);
+        }
+    } else {
+        for j in 0..n {
+            for q in pss[j].d.items() {
+                if not an.uf[q.e] {
+                    an.uf[q.e] = true;
+                    an.ul.push(q.e);
+                }
             }
-            if x.a[e] != a0 {
+        }
+        for e in an.ul.items() {
+            an.uf[e] = false;
+        }
+        u.sort_usize(an.ul.items());
+    }
+    an.cur.clear();
+    an.tup.clear();
+    for _j in 0..n {
+        an.cur.push(0);
+        an.tup.push(0);
+    }
+    let cur = an.cur.items();
+    let tup = an.tup.items();
+    an.reps.clear();
+    an.rt.clear();
+    an.rnext.clear();
+    tab_reset(&mut an.tab, an.ul.len);
+    for e in an.ul.items() {
+        // (each path's identity, tup, and constant)
+        let mut a0: i64 = 0;
+        let mut same = true;
+        let mut known = true;
+        let mut adds = true;
+        for j in 0..n {
+            let ds = pss[j].d.items();
+            while (cur[j] < ds.len) and (ds[cur[j]].e < e) {
+                cur[j] += 1;
+            }
+            let mut dj: i32 = 0;
+            let mut aj: i64 = 0;
+            if (cur[j] < ds.len) and (ds[cur[j]].e == e) {
+                dj = ds[cur[j]].id;
+                aj = ds[cur[j]].a;
+            }
+            tup[j] = dj;
+            if j == 0 {
+                a0 = aj;
+            } else if aj != a0 {
                 same = false;
                 adds = false;
             }
-            known = known and (x.d[e] != 0);
+            if (dj != tup[0]) or in_syn(dj, slo, shi) {
+                same = false;
+            }
+            known = known and (dj != 0);
         }
         if same {
-            s.d[e] = d0;
-            s.a[e] = a0;
+            if (tup[0] != 0) or (a0 != 0) {
+                an.nd.push(PD.{ e: e, id: tup[0], a: a0 });
+            }
             continue;
         }
         if not known or not adds {
             continue;
         }
         // a merge of its own, or of an earlier entity with the same inputs
-        let mut r = e;
-        for f in reps.items() {
-            let mut eq = true;
-            for j in 0..n {
-                if pss[j].d[f] != pss[j].d[e] {
-                    eq = false;
-                }
+        let h = tup_hash(tup);
+        let sl = tab_slot(&an.tab, h);
+        let mut ri: i32 = -1;
+        if an.tab.g[sl] == an.tab.gen {
+            ri = an.tab.v[sl];
+            while (ri >= 0) and not tup_eq(tup, an.rt.items()[(@int_cast(usize, ri) * n)..]) {
+                ri = an.rnext.get(@int_cast(usize, ri));
             }
-            if eq {
-                r = f;
+        }
+        let mut r = e;
+        if ri >= 0 {
+            r = an.reps.get(@int_cast(usize, ri));
+        } else {
+            let mut head: i32 = -1;
+            if an.tab.g[sl] == an.tab.gen {
+                head = an.tab.v[sl];
+            }
+            an.tab.g[sl] = an.tab.gen;
+            an.tab.k[sl] = h;
+            an.tab.v[sl] = @int_cast(i32, an.reps.len);
+            an.rnext.push(head);
+            an.reps.push(e);
+            for j in 0..n {
+                an.rt.push(tup[j]);
+            }
+        }
+        let sid = syn(an, b, r);
+        if (sid != 0) or (a0 != 0) {
+            an.nd.push(PD.{ e: e, id: sid, a: a0 });
+        }
+    }
+    // the places: those that every path knows (a place a path knows nothing
+    // of holds no merge), each what all hold, or a merge whose inputs all do
+    for j in 0..n {
+        cur[j] = 0;
+    }
+    let nr = an.reps.len;
+    for q in pss[0].c.items() {
+        let l = q.l;
+        let c0 = q.id;
+        tup[0] = c0;
+        let mut all = true;
+        let mut same = not in_syn(c0, slo, shi);
+        let mut rc = c0 <= -2;
+        for j in 1..n {
+            let cs = pss[j].c.items();
+            while (cur[j] < cs.len) and (cs[cur[j]].l < l) {
+                cur[j] += 1;
+            }
+            if (cur[j] >= cs.len) or (cs[cur[j]].l != l) {
+                all = false;
                 break;
             }
+            let cj = cs[cur[j]].id;
+            tup[j] = cj;
+            same = same and (cj == c0);
+            rc = rc or (cj <= -2);
         }
-        rep[e] = @int_cast(i32, r);
-        if r == e {
-            reps.push(e);
-        }
-        s.d[e] = syn(an, b, r);
-        s.a[e] = a0;
-    }
-    // the places
-    for l in 0..NL {
-        let c0 = pss[0].c[l];
-        let mut same = (c0 != 0) and not in_syn(c0, slo, shi);
-        for j in 1..n {
-            if pss[j].c[l] != c0 {
-                same = false;
-            }
-        }
-        if same {
-            s.c[l] = c0;
+        if not all {
             continue;
         }
-        for e in reps.items() {
-            if s.d[e] == 0 {
-                continue;
-            }
-            let mut all = true;
-            for j in 0..n {
-                let x = pss[j];
-                if not is_held(an, x.c[l], x.d[e]) {
-                    all = false;
+        if same {
+            an.nc.push(PC.{ l: l, id: c0 });
+            continue;
+        }
+        if nr == 0 {
+            continue;
+        }
+        if rc {
+            // (a constant a machine instruction made: it holds a merge of
+            // constants whose bits it has)
+            let rt = an.rt.items();
+            for k in 0..nr {
+                let sid = syn(an, b, an.reps.get(k));
+                if sid == 0 {
+                    continue;
+                }
+                let mut hit = true;
+                for j in 0..n {
+                    if not is_held(an, tup[j], rt[(k * n) + j]) {
+                        hit = false;
+                        break;
+                    }
+                }
+                if hit {
+                    an.nc.push(PC.{ l: l, id: sid });
                     break;
                 }
             }
-            if all {
-                s.c[l] = s.d[e];
-                break;
+            continue;
+        }
+        // (else only the merge whose inputs are the place's: one at most)
+        let sl = tab_slot(&an.tab, tup_hash(tup));
+        if an.tab.g[sl] != an.tab.gen {
+            continue;
+        }
+        let mut ri = an.tab.v[sl];
+        while (ri >= 0) and not tup_eq(tup, an.rt.items()[(@int_cast(usize, ri) * n)..]) {
+            ri = an.rnext.get(@int_cast(usize, ri));
+        }
+        if ri >= 0 {
+            let sid = syn(an, b, an.reps.get(@int_cast(usize, ri)));
+            if sid != 0 {
+                an.nc.push(PC.{ l: l, id: sid });
             }
         }
     }
+    st_apply(an, s);
     // the values computed from others: so on every path
     for k in 0..NXW {
         let mut all: u64 = 0xffff_ffff_ffff_ffff;
@@ -1493,15 +1996,11 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
         let x = VALS.at(k);
         let id = id_val(@int_cast(i32, k));
         let mut ok = u.notnil(ib) and (b != 0);
-        let at = an.at;
-        for l in 0..NL {
-            at[l] = ok;
-        }
         for j in 0..n {
             if not ok {
                 break;
             }
-            let pi = pb.get(j);
+            let pi = an.pb.get(j);
             let from = mb_ir_of(@int_cast(usize, pi));
             let mut inid: i32 = 0;
             for q in x.phi_ops.items() {
@@ -1515,39 +2014,70 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
                 ok = false;
                 break;
             }
-            let ps_j = pss[j];
-            for l in 0..NL {
-                if not is_held(an, ps_j.c[l], inid) {
-                    at[l] = false;
-                }
-            }
+            tup[j] = inid;
         }
-        for l in 0..NL {
-            if s.c[l] == id {
-                s.c[l] = 0;
-            }
-        }
-        let nx = an.nv + @int_cast(i32, k) + 1;
-        for e in 0..an.ne {
-            if s.d[e] == id {
-                s.d[e] = 0;
-                s.a[e] = 0;
-            } else if s.d[e] == nx {
-                s.d[e] = id;
-            }
-        }
-        remade(s, @int_cast(i32, k));
+        an.atl.clear();
         if ok {
-            for l in 0..NL {
-                if at[l] {
-                    s.c[l] = id;
+            for q in pss[0].c.items() {
+                let mut hit = is_held(an, q.id, tup[0]);
+                for j in 1..n {
+                    if not hit {
+                        break;
+                    }
+                    hit = is_held(an, ss_c(pss[j], q.l), tup[j]);
                 }
+                if hit {
+                    an.atl.push(q.l);
+                }
+            }
+        }
+        made(an, s, @int_cast(i32, k));
+        if ok {
+            for l in an.atl.items() {
+                put_c(s, l, id);
             }
         }
     }
-    ps.deinit();
-    pb.deinit();
-    reps.deinit();
+}
+
+// s is what meet found (an.nd, an.nc, in order): what differs is written.
+fn st_apply(an: *mut An, s: *mut State) void {
+    for q in an.nd.items() {
+        an.nf[q.e] = true;
+    }
+    for e in s.td.items() {
+        if not an.nf[e] {
+            put_d(s, e, 0, 0);
+        }
+        s.tdf[e] = false;
+    }
+    s.td.clear();
+    for q in an.nd.items() {
+        an.nf[q.e] = false;
+        put_d(s, q.e, q.id, q.a);
+        if not s.tdf[q.e] {
+            s.tdf[q.e] = true;
+            s.td.push(q.e);
+        }
+    }
+    for q in an.nc.items() {
+        an.ncf[q.l] = true;
+    }
+    for l in s.tc.items() {
+        if not an.ncf[l] {
+            put_c(s, l, 0);
+        }
+        s.tcf[l] = false;
+    }
+    s.tc.clear();
+    for q in an.nc.items() {
+        an.ncf[q.l] = false;
+        put_c(s, q.l, q.id);
+        if not s.tcf[q.l] {
+            s.tcf[q.l] = true;
+            s.tc.push(q.l);
+        }
+    }
 }
 
 // each machine block's phis (VALS indexes)
@@ -1649,11 +2179,16 @@ fn flatten(an: *mut An) void {
     let t = an.t;
     // the slots the code spills to and reloads from
     SLOTS.clear();
+    SLOT_PL.clear();
     for bi in 0..an.nb {
         let mut i = mf.blocks.get(bi).first;
         while u.notnil(i) {
             if (i.spill != 0) and (i.sslot >= 0) and (slot_place(i.sslot) < 0) and (SLOTS.len < MAX_SLOTS) {
+                while SLOT_PL.len <= @int_cast(usize, i.sslot) {
+                    SLOT_PL.push(0);
+                }
                 SLOTS.push(i.sslot);
+                SLOT_PL.set(@int_cast(usize, i.sslot), 64 + @int_cast(i32, SLOTS.len));
             }
             i = i.next;
         }
@@ -1690,7 +2225,7 @@ fn flatten(an: *mut An) void {
                 x.kind = 3;
                 x.d = ds[0];
                 x.s = ds[1];
-            } else if (t.imm_of(i) != NO_LOC) and (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) {
+            } else if (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) and (t.imm_of(i) != NO_LOC) {
                 x.kind = 5;
                 x.d = mc.phys(mf, i.ops[0].reg);
                 x.imm = t.imm_of(i);
@@ -1732,9 +2267,15 @@ fn flatten(an: *mut An) void {
 // debugging: AXIOM_DEBUG_DLOC=<function> (or *) traces the analysis of a
 // function: its entities, values and, per instruction, the state.
 let mut DBGF: bool = false;
+let mut DBG_ENV: []u8 = "";
+let mut DBG_READ: bool = false;
 pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     let mut out = u.List.[VLoc].empty();
-    DBGF = u.str_eq(u.env("AXIOM_DEBUG_DLOC"), FN.name) or u.str_eq(u.env("AXIOM_DEBUG_DLOC"), "*");
+    if not DBG_READ {
+        DBG_ENV = u.env("AXIOM_DEBUG_DLOC");
+        DBG_READ = true;
+    }
+    DBGF = (DBG_ENV.len > 0) and (u.str_eq(DBG_ENV, FN.name) or u.str_eq(DBG_ENV, "*"));
     if DBGF {
         u.eprint(u.f2("func %s nv %s\n", FN.name, u.idec(@int_cast(i32, VALS.len))));
         for k in 0..VALS.len {
@@ -1788,8 +2329,17 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
                       syn0: (2 * @as(i64, nv)) + @as(i64, @int_cast(i64, CONSTS.len)) + 1, ins: u.List.[Ins].empty(),
                       bfirst: u.newn.[usize](nb + 1), idom: u.newn.[i32](nb + 1), rpo: u.newn.[i32](nb + 1),
                       rpon: u.newn.[i32](nb + 1), defb: u.newn.[i32](VALS.len + 1), defi: u.newn.[usize](VALS.len + 1),
-                      tails: false, preds: u.newn.[u.List.[i32]](nb + 1), rep: u.newn.[i32](ENTS.len + 1),
-                      at: u.nil_slice.[bool]() };
+                      tails: false, preds: u.newn.[u.List.[i32]](nb + 1), ps: u.List.[*SState].empty(),
+                      pb: u.List.[i32].empty(), ul: u.List.[usize].empty(), uf: u.newn.[bool](ne + 1),
+                      cur: u.List.[usize].empty(), tup: u.List.[i32].empty(), reps: u.List.[usize].empty(),
+                      rt: u.List.[i32].empty(), rnext: u.List.[i32].empty(),
+                      tab: Tab.{ k: u.nil_slice.[u64](), v: u.nil_slice.[i32](), g: u.nil_slice.[u32](), cap: 0,
+                                 gen: 0 }, atl: u.List.[usize].empty(), last: -1, nd: u.List.[PD].empty(),
+                      nc: u.List.[PC].empty(), nf: u.newn.[bool](ne + 1), ncf: u.nil_slice.[bool]() };
+    for e in 0..ne {
+        an.uf[e] = false;
+        an.nf[e] = false;
+    }
     for b in 0..nb {
         an.preds[b] = u.List.[i32].empty();
     }
@@ -1802,7 +2352,10 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     }
     dominators(&mut an);
     flatten(&mut an);
-    an.at = u.newn.[bool](NL + 1);  // (NL: flatten's)
+    an.ncf = u.newn.[bool](NL + 1);
+    for l in 0..NL {
+        an.ncf[l] = false;
+    }
     NX = VALS.len;
     NXW = (NX + 63) / 64;
     find_deps();
@@ -1821,30 +2374,28 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     }
     // the state at the entry: the parameters in their registers, and the
     // variables they are
-    let mut entry = st_new(ne);
-    st_clear(&mut entry, ne);
+    let mut cur = st_new(&an);
     for k in 0..VALS.len {
         let x = VALS.get(k);
         if x.entry_reg >= 0 {
-            set_reg(&an, &mut entry, x.entry_reg, id_val(@int_cast(i32, k)));
+            set_reg(&an, &mut cur, x.entry_reg, id_val(@int_cast(i32, k)));
         }
     }
     for pe in PENTS.items() {
-        entry.d[@int_cast(usize, pe[0])] = id_val(pe[1]);
+        put_d(&mut cur, @int_cast(usize, pe[0]), id_val(pe[1]), 0);
     }
+    let mut entry = ss_new();
+    snap(&mut cur, &mut entry);
     // (each block's state at its start is the meet of its predecessors' at
     // their ends: made again where it is needed, not kept; a block none of
     // whose predecessors' changed since it was run gives what it gave)
-    let outs = u.newn.[State](nb + 1);
-    let seen = u.newn.[bool](nb + 1);
+    let outs = u.newn.[SState](nb + 1);
     let dirty = u.newn.[bool](nb + 1);
     for b in 0..nb {
-        outs[b] = st_new(ne);
-        st_clear(&mut outs[b], ne);
-        seen[b] = false;
+        outs[b] = ss_new();
         dirty[b] = true;
     }
-    let mut cur = st_new(ne);
+    let mut tmp = ss_new();
     let mut changed = true;
     let mut rounds: i32 = 0;
     while changed and (rounds < 50) {
@@ -1860,11 +2411,15 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
                 continue;
             }
             dirty[bi] = false;
-            meet(&an, bi, outs, seen, &entry, &mut cur);
+            meet(&mut an, bi, outs, &entry, &mut cur);
             run_block(&an, bi, &mut cur);
-            if not seen[bi] or not st_same(&cur, &outs[bi], ne) {
-                st_copy(&mut outs[bi], &cur, ne);
-                seen[bi] = true;
+            snap(&mut cur, &mut tmp);
+            an.last = b;
+            if not outs[bi].seen or not ss_same(&tmp, &outs[bi]) {
+                let old = outs[bi];
+                outs[bi] = tmp;
+                tmp = old;
+                outs[bi].seen = true;
                 changed = true;
                 for sc in mf.blocks.get(bi).succs.items() {
                     if (sc >= 0) and (@int_cast(usize, sc) < nb) {
@@ -1874,15 +2429,29 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
             }
         }
     }
-    if changed {
-        an.ins.deinit();
-        return out.items();  // (did not settle: nothing said)
+    st_free(&mut cur);
+    if not changed {
+        ranges(&mut an, outs, &entry, size, &mut out);
     }
-    ranges(&an, outs, seen, &entry, size, &mut out);
+    // (did not settle: nothing said)
     an.ins.deinit();
     for b in 0..nb {
         an.preds[b].deinit();
+        ss_free(&mut outs[b]);
     }
+    ss_free(&mut tmp);
+    ss_free(&mut entry);
+    an.ps.deinit();
+    an.pb.deinit();
+    an.ul.deinit();
+    an.cur.deinit();
+    an.tup.deinit();
+    an.reps.deinit();
+    an.rt.deinit();
+    an.rnext.deinit();
+    an.atl.deinit();
+    an.nd.deinit();
+    an.nc.deinit();
     return out.items();
 }
 
@@ -1903,7 +2472,7 @@ fn run_block(an: *An, b: usize, s: *mut State) void {
 
 // Where entity e is in state s, but in registers `minus` (written by the
 // code the location is for): a location (its kind 0xff: none).
-fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
+fn where(an: *An, s: *mut State, e: usize, minus: u64, prefer: i32) VLoc {
     let en = ENTS.get(e);
     let mut r = VLoc.{ var: en.var, poff: en.poff, psize: en.psize, kind: 0xff, start: 0, end: 0, reg: -1, off: 0,
                        add: s.a[e], size: en.size, ind: en.ind, gsym: "", inst: en.inst, expr: "" };
@@ -1959,7 +2528,7 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
     }
     // (the register it was in, if it still is: fewer pieces; else the lowest)
     let mut best: i32 = -1;
-    let rm = px_regs(s, id) & ~minus;
+    let rm = regs_of(s, id) & ~minus;
     if rm != 0 {
         for p in @as(usize, 0)..64 {
             if (rm & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
@@ -1975,15 +2544,11 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
         r.reg = best;
         return r;
     }
-    for p in px_first_slot(id)..NL {
-        if s.c[p] == id {
-            let so = an.t.slot_off(place_slot(p));
-            if so != NO_LOC {
-                r.kind = LK_SLOT;
-                r.off = so;
-                return r;
-            }
-        }
+    let so = slot_of(an, s, id);
+    if so != NO_LOC {
+        r.kind = LK_SLOT;
+        r.off = so;
+        return r;
     }
     if id <= nv {
         let x = VALS.get(@int_cast(usize, id - 1));
@@ -2017,13 +2582,13 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
 
 // Call x (at code offset `at`; the next instructions of its block from
 // index g to hi) in state s, before it: a call site.
-fn call_site(an: *An, s: *State, x: *Ins, at: u64, g: usize, hi: usize) void {
+fn call_site(an: *An, s: *mut State, x: *Ins, at: u64, g: usize, hi: usize) void {
     let tail = an.t.is_tail(x.i);
     let mut ret: u64 = 0;
     if not tail {
         // (the return address: the next instruction's offset)
         for j in g..hi {
-            let o = offs.get(key(@int_from_ptr(an.ins.get(j).i)));
+            let o = offset_of(an.ins.get(j).i);
             if o != 0 {
                 ret = o - 1;
                 break;
@@ -2204,7 +2769,7 @@ fn entry_value(an: *An, x: *Val, out: *mut u.List.[u8]) bool {
 }
 
 // Pushes value k's operand (VALS index o, or the constant c).
-fn put_operand(an: *An, s: *State, o: i32, c: i64, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+fn put_operand(an: *An, s: *mut State, o: i32, c: i64, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
     if o < 0 {
         out.push(OP_CONSTS);
         put_sleb(out, c);
@@ -2217,7 +2782,7 @@ fn put_operand(an: *An, s: *State, o: i32, c: i64, minus: u64, depth: i32, out: 
 // a register or spill slot that holds it, or (a value of expr_ops, none
 // of whose operands was made again since it was: State.x) computed from
 // its operands. False if it cannot be.
-fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+fn expr_of(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
     let id = id_val(k);
     let x = VALS.get(@int_cast(usize, k));
     let ib = int_bits(x.v);
@@ -2225,7 +2790,7 @@ fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
         return false;
     }
     let nbytes = (ib + 7) / 8;
-    let rm = px_regs(s, id) & ~minus;
+    let rm = regs_of(s, id) & ~minus;
     if rm != 0 {
         for p in @as(usize, 0)..64 {
             if (rm & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
@@ -2238,17 +2803,13 @@ fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
             }
         }
     }
-    for p in px_first_slot(id)..NL {
-        if s.c[p] == id {
-            let so = an.t.slot_off(place_slot(p));
-            if so != NO_LOC {
-                out.push(OP_FBREG);
-                put_sleb(out, so);
-                out.push(OP_DEREF_SIZE);
-                out.push(@truncate(u8, nbytes));
-                return true;
-            }
-        }
+    let so = slot_of(an, s, id);
+    if so != NO_LOC {
+        out.push(OP_FBREG);
+        put_sleb(out, so);
+        out.push(OP_DEREF_SIZE);
+        out.push(@truncate(u8, nbytes));
+        return true;
     }
     if x.obj {
         let o = an.t.obj_off(x.v);
@@ -2276,7 +2837,7 @@ fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
 }
 
 // Pushes value k (of expr_ops) computed from its operands.
-fn expr_op(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+fn expr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
     let x = VALS.get(@int_cast(usize, k));
     let op = x.xop;
     if not put_operand(an, s, x.xa, x.ca, minus, depth, out) {
@@ -2348,19 +2909,110 @@ fn same_loc(a: *VLoc, b: *VLoc) bool {
 // or constant changed, a place that held or holds the identity changed
 // since (EM: the emission at which each identity's places last changed),
 // or `minus` names other registers among those holding it.
-fn emit_at(an: *An, em: *mut Em, s: *State, minus: u64, none: bool, at: u64, open: []mut usize,
+//
+// Which entities to look at is found from what changed since the last
+// emission (the state's pcl and edl): those whose identity or constant was
+// written, those being an identity a place of which changed, those being
+// what a register of `minus` holds, and those that had to be looked at
+// again (em.rl: computed or waiting, or held in a register of their
+// minus); all of them where `none` changes and at the first emission. The
+// others' locations are the ones found last.
+fn emit_at(an: *An, em: *mut Em, s: *mut State, minus: u64, none: bool, at: u64, open: []mut usize,
            out: *mut u.List.[VLoc]) void {
     em.n += 1;
-    for l in 0..NL {
-        let c = s.c[l];
-        if c != em.c[l] {
-            em_touch(em, em.c[l]);
-            em_touch(em, c);
-            em.c[l] = c;
+    for k in 0..NXW {
+        let mut dx = s.x[k] ^ em.xl[k];
+        while dx != 0 {
+            let b = @as(usize, @truncate(u32, @ctz(dx)));
+            dx = dx & (dx - 1);
+            em.xst[(k * 64) + b] = em.n;
+        }
+        em.xl[k] = s.x[k];
+    }
+    let full = em.full or (none != em.lnone);
+    em.full = false;
+    em.lnone = none;
+    em.rl2.clear();
+    if full {
+        for l in 0..NL {
+            let c = s.c[l];
+            if c != em.c[l] {
+                em_touch(em, em.c[l]);
+                em_touch(em, c);
+                em.c[l] = c;
+            }
+        }
+        for e in 0..an.ne {
+            emit_one(an, em, s, e, minus, none, at, open, out);
+        }
+    } else {
+        em.tids.clear();
+        em.cl.clear();
+        for l in s.pcl.items() {
+            let c = s.c[l];
+            if c != em.c[l] {
+                em_touch(em, em.c[l]);
+                em_touch(em, c);
+                if em.c[l] != 0 {
+                    em.tids.push(em.c[l]);
+                }
+                if c != 0 {
+                    em.tids.push(c);
+                }
+                em.c[l] = c;
+            }
+        }
+        for e in s.edl.items() {
+            em_cand(em, e);
+        }
+        for e in em.rl.items() {
+            em_cand(em, e);
+        }
+        for id in em.tids.items() {
+            em_cands(em, s, id);
+        }
+        let mut m = minus;
+        while m != 0 {
+            let p = @as(usize, @truncate(u32, @ctz(m)));
+            m = m & (m - 1);
+            if s.c[p] != 0 {
+                em_cands(em, s, s.c[p]);
+            }
+        }
+        u.sort_usize(em.cl.items());
+        for e in em.cl.items() {
+            em.cf[e] = false;
+            emit_one(an, em, s, e, minus, none, at, open, out);
         }
     }
-    emit_each(an, em, s, minus, none, at, open, out);
-    PX_ON = false;
+    for l in s.pcl.items() {
+        s.pcf[l] = false;
+    }
+    s.pcl.clear();
+    for e in s.edl.items() {
+        s.edf[e] = false;
+    }
+    s.edl.clear();
+    let t = em.rl;
+    em.rl = em.rl2;
+    em.rl2 = t;
+}
+
+// Entity e is looked at in this emission.
+fn em_cand(em: *mut Em, e: usize) void {
+    if not em.cf[e] {
+        em.cf[e] = true;
+        em.cl.push(e);
+    }
+}
+
+// And the entities being identity id.
+fn em_cands(em: *mut Em, s: *mut State, id: i32) void {
+    let mut e = he_get(s, id);
+    while e >= 0 {
+        em_cand(em, @int_cast(usize, e));
+        e = s.en[@int_cast(usize, e)];
+    }
 }
 
 // The incremental emission's tables (ranges makes them for a function).
@@ -2376,6 +3028,15 @@ struct Em {
     a: []mut i64,
     minus: []mut u64,
     none: []mut bool,
+    full: bool,           // the next emission looks at every entity
+    lnone: bool,          // (the last emission's none)
+    rl: u.List.[usize],   // the entities to look at again in the next emission
+    rl2: u.List.[usize],  // (and in the one after this)
+    cl: u.List.[usize],   // the entities looked at in this one (once: cf)
+    cf: []mut bool,
+    tids: u.List.[i32],  // the identities whose places changed since the last
+    xl: []mut u64,       // State.x as last seen
+    xst: []mut u64,      // per value: the emission at which its State.x bit last changed
 }
 
 fn em_new(an: *An, ne: usize) Em {
@@ -2383,7 +3044,16 @@ fn em_new(an: *An, ne: usize) Em {
     let n = @int_cast(usize, lown) + 1;
     let mut em = Em.{ n: 0, c: u.newn.[i32](NL + 1), ids: u.U64Map.empty(), low: u.newn.[u64](n), lown: lown,
                       vol: u.newn.[bool](n), at: u.newn.[u64](ne + 1), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1),
-                      minus: u.newn.[u64](ne + 1), none: u.newn.[bool](ne + 1) };
+                      minus: u.newn.[u64](ne + 1), none: u.newn.[bool](ne + 1), full: true, lnone: false,
+                      rl: u.List.[usize].empty(), rl2: u.List.[usize].empty(), cl: u.List.[usize].empty(),
+                      cf: u.newn.[bool](ne + 1), tids: u.List.[i32].empty(), xl: u.newn.[u64](NXW + 1),
+                      xst: u.newn.[u64](NX + 1) };
+    for k in 0..NXW {
+        em.xl[k] = 0;
+    }
+    for k in 0..NX {
+        em.xst[k] = 0;
+    }
     let nv = an.nv;
     for id in 0..n {
         em.low[id] = 0;
@@ -2395,8 +3065,17 @@ fn em_new(an: *An, ne: usize) Em {
     }
     for e in 0..ne {
         em.at[e] = 0;
+        em.cf[e] = false;
     }
     return em;
+}
+
+fn em_free(em: *mut Em) void {
+    em.ids.deinit();
+    em.rl.deinit();
+    em.rl2.deinit();
+    em.cl.deinit();
+    em.tids.deinit();
 }
 
 fn em_touch(em: *mut Em, id: i32) void {
@@ -2428,7 +3107,13 @@ fn em_same(an: *An, em: *mut Em, s: *State, e: usize, minus: u64, none: bool) bo
         return false;
     }
     if (id > 0) and (id <= em.lown) {
-        if em.vol[@int_cast(usize, id)] or (em.low[@int_cast(usize, id)] > em.at[e]) {
+        if em.vol[@int_cast(usize, id)] {
+            // (computed from others: the same if the places of all it is
+            // computed from, and their State.x, are; waiting: looked at)
+            if (id > an.nv) or not clo_same(em, s, id - 1, e, minus) {
+                return false;
+            }
+        } else if em.low[@int_cast(usize, id)] > em.at[e] {
             return false;
         }
     } else if em.ids.get(@as(u64, @bit_cast(u32, id))) > em.at[e] {
@@ -2437,58 +3122,78 @@ fn em_same(an: *An, em: *mut Em, s: *State, e: usize, minus: u64, none: bool) bo
     return held_in(s, minus, id) == held_in(s, em.minus[e], id);
 }
 
-// (emit_at's work)
-fn emit_each(an: *An, em: *mut Em, s: *State, minus: u64, none: bool, at: u64, open: []mut usize,
-             out: *mut u.List.[VLoc]) void {
-    for e in 0..an.ne {
-        if (s.d[e] <= 0) and (open[e] == 0) {
-            em.at[e] = 0;
-            continue;  // (not known, and no piece open: none still)
+// Are the places and State.x of the values value k's expression may read
+// (CLO) what they were at entity e's last where, and `minus` names the same
+// registers among those holding them as it did?
+fn clo_same(em: *mut Em, s: *State, k: i32, e: usize, minus: u64) bool {
+    let ku = @int_cast(usize, k);
+    for j in @as(usize, CLO_AT.get(ku))..@as(usize, CLO_AT.get(ku + 1)) {
+        let c = CLO.get(j);
+        let id = id_val(c);
+        if (em.low[@int_cast(usize, id)] > em.at[e]) or (em.xst[@int_cast(usize, c)] > em.at[e]) or
+           (held_in(s, minus, id) != held_in(s, em.minus[e], id)) {
+            return false;
         }
-        if em_same(an, em, s, e, minus, none) {
-            continue;
-        }
-        em.at[e] = em.n;
-        em.d[e] = s.d[e];
-        em.a[e] = s.a[e];
-        em.minus[e] = minus;
-        em.none[e] = none;
-        if not PX_ON {
-            px_build(s);
-        }
-        let mut prefer: i32 = -1;
-        if (open[e] != 0) and (out.at(open[e] - 1).kind == LK_REG) {
-            prefer = out.at(open[e] - 1).reg;
-        }
-        let mut w = where(an, s, e, minus, prefer);
-        if none {
-            w.kind = 0xff;
-        }
-        let o = open[e];
-        if o != 0 {
-            let p = out.at(o - 1);
-            if (w.kind != 0xff) and same_loc(p, &w) {
-                drop_expr(w.expr);
-                continue;
-            }
-            p.end = at;
-            open[e] = 0;
-        }
-        if w.kind != 0xff {
-            w.start = at;
-            w.end = at;
-            out.push(w);
-            open[e] = out.len;
-        } else {
+    }
+    return true;
+}
+
+// Entity e at an emission (emit_at's work).
+fn emit_one(an: *An, em: *mut Em, s: *mut State, e: usize, minus: u64, none: bool, at: u64, open: []mut usize,
+            out: *mut u.List.[VLoc]) void {
+    if (s.d[e] <= 0) and (open[e] == 0) {
+        em.at[e] = 0;
+        return;  // (not known, and no piece open: none still)
+    }
+    if not em_same(an, em, s, e, minus, none) {
+        emit_where(an, em, s, e, minus, none, at, open, out);
+    }
+    // (looked at again in the next emission: see emit_at)
+    let id = s.d[e];
+    if (id > 0) and (((id <= em.lown) and em.vol[@int_cast(usize, id)]) or (held_in(s, minus, id) != 0)) {
+        em.rl2.push(e);
+    }
+}
+
+fn emit_where(an: *An, em: *mut Em, s: *mut State, e: usize, minus: u64, none: bool, at: u64, open: []mut usize,
+              out: *mut u.List.[VLoc]) void {
+    em.at[e] = em.n;
+    em.d[e] = s.d[e];
+    em.a[e] = s.a[e];
+    em.minus[e] = minus;
+    em.none[e] = none;
+    let mut prefer: i32 = -1;
+    if (open[e] != 0) and (out.at(open[e] - 1).kind == LK_REG) {
+        prefer = out.at(open[e] - 1).reg;
+    }
+    let mut w = where(an, s, e, minus, prefer);
+    if none {
+        w.kind = 0xff;
+    }
+    let o = open[e];
+    if o != 0 {
+        let p = out.at(o - 1);
+        if (w.kind != 0xff) and same_loc(p, &w) {
             drop_expr(w.expr);
+            return;
         }
+        p.end = at;
+        open[e] = 0;
+    }
+    if w.kind != 0xff {
+        w.start = at;
+        w.end = at;
+        out.push(w);
+        open[e] = out.len;
+    } else {
+        drop_expr(w.expr);
     }
 }
 
 // The pieces of the entities' locations over the encoded code: each block's
 // start (the state it is entered with) and each visited instruction's group
 // (the state before it, but what the group writes), in code order.
-fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *mut u.List.[VLoc]) void {
+fn ranges(an: *mut An, outs: []mut SState, entry: *SState, size: u64, out: *mut u.List.[VLoc]) void {
     let nb = an.nb;
     let ne = an.ne;
     let mut em = em_new(an, ne);
@@ -2510,10 +3215,13 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
             j -= 1;
         }
     }
-    let mut s = st_new(ne);
+    let mut s = st_new(an);
+    load(&mut s, entry);
+    s.trk = true;
+    an.last = -1;
     // (the code before the first block's: the prologue, at the entry)
     CUR_B = -1;
-    emit_at(an, &mut em, entry, 0, false, 0, open, out);
+    emit_at(an, &mut em, &mut s, 0, false, 0, open, out);
     let mut last: u64 = 0;
     for k in 0..nb {
         let b = order[k];
@@ -2523,16 +3231,17 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
         }
         let unreached = an.rpon[b] < 0;
         if unreached {
-            st_clear(&mut s, ne);
+            st_clear(&mut s);
+            an.last = -1;
         } else {
-            meet(an, b, outs, seen, entry, &mut s);
+            meet(an, b, outs, entry, &mut s);
         }
         let lo = an.bfirst[b];
         let hi = an.bfirst[b + 1];
         // the first visited instruction's offset
         let mut first: u64 = 0xffff_ffff_ffff_ffff;
         for j in lo..hi {
-            let o = offs.get(key(@int_from_ptr(an.ins.get(j).i)));
+            let o = offset_of(an.ins.get(j).i);
             if o != 0 {
                 first = o - 1;
                 break;
@@ -2541,7 +3250,7 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
         CUR_B = @int_cast(i32, b);
         CUR_J = lo;
         if (bo >= last) and ((first == 0xffff_ffff_ffff_ffff) or (bo < first)) {
-            emit_at(an, &mut em, &s, 0, unreached, bo, open, out);
+            emit_at(an, &mut em, &mut s, 0, unreached, bo, open, out);
             last = bo;
         }
         if DBGF {
@@ -2554,7 +3263,7 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
                 apply_marks(an, &mut s, x.i.mk, @int_cast(i32, b), j);
             }
             if DBGF {
-                let mut t = u.f2("  %s k%s", u.hex16(offs.get(key(@int_from_ptr(x.i)))), u.idec(@as(i32, x.kind)));
+                let mut t = u.f2("  %s k%s", u.hex16(offset_of(x.i)), u.idec(@as(i32, x.kind)));
                 for e in 0..ne {
                     t = u.f3("%s e%s=%s", t, u.idec(@int_cast(i32, e)), u.idec(s.d[e]));
                 }
@@ -2565,13 +3274,13 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
                 }
                 u.eprint(u.f1("%s\n", t));
             }
-            let o = offs.get(key(@int_from_ptr(x.i)));
+            let o = offset_of(x.i);
             if o != 0 {
                 // the group: this instruction and those encoded with it
                 let mut minus = x.w;
                 let mut exit = x.kind == 4;
                 let mut g = j + 1;
-                while (g < hi) and (offs.get(key(@int_from_ptr(an.ins.get(g).i))) == 0) {
+                while (g < hi) and (offset_of(an.ins.get(g).i) == 0) {
                     minus = minus | an.ins.get(g).w;
                     exit = exit or (an.ins.get(g).kind == 4);
                     g += 1;
@@ -2579,25 +3288,35 @@ fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *
                 // (one machine instruction: a debugger stops at its start,
                 // before it writes its registers, and nowhere else in it)
                 if (g == j + 1) and (g < hi) and (x.i.clobber == 0) {
-                    let nx = offs.get(key(@int_from_ptr(an.ins.get(g).i)));
+                    let nx = offset_of(an.ins.get(g).i);
                     if (nx > o) and an.t.single(x.i, nx - o) {
                         minus = 0;
                     }
                 }
                 if o - 1 >= last {
                     CUR_J = j;
-                    emit_at(an, &mut em, &s, minus, exit or unreached, o - 1, open, out);
+                    emit_at(an, &mut em, &mut s, minus, exit or unreached, o - 1, open, out);
                     last = o - 1;
                 }
                 if ((x.i.clobber != 0) or an.t.is_tail(x.i)) and not unreached {
-                    call_site(an, &s, x, o - 1, g, hi);
+                    call_site(an, &mut s, x, o - 1, g, hi);
                 }
             }
             step(an, &mut s, x);
             j += 1;
         }
+        // (its end: the state at it is the one the analysis found, for the
+        // block after it)
+        let mb = an.mf.blocks.get(b);
+        if mb.mk_end != 0 {
+            apply_marks(an, &mut s, mb.mk_end, @int_cast(i32, b), hi);
+        }
+        if not unreached {
+            an.last = @int_cast(i32, b);
+        }
     }
-    em.ids.deinit();
+    em_free(&mut em);
+    st_free(&mut s);
     for e in 0..ne {
         if open[e] != 0 {
             out.at(open[e] - 1).end = size;

@@ -3174,6 +3174,35 @@ fn dbg_key(v: *Value) []u8 {
     return mk_key(@int_from_ptr(v));  // (the address itself: no string is made for it)
 }
 
+// Filters of the addresses that may be keys of dbg_at, mk_inst and mk_end:
+// a bit per 8 bytes of address (modulo the filter's size), set when it
+// becomes one; an address whose bit is not set is none (most instructions
+// have no marks: their lookups take no look into the maps, and those of
+// nearby instructions read nearby bits).
+const FILT_BITS: u32 = 22;
+let mut filt_at: *mut u64 = @ptr_from_int(*mut u64, 0);
+let mut filt_inst: *mut u64 = @ptr_from_int(*mut u64, 0);
+let mut filt_end: *mut u64 = @ptr_from_int(*mut u64, 0);
+
+fn filt_put(f: *mut *mut u64, p: usize) void {
+    let n = @as(usize, 1) << (FILT_BITS - 6);
+    if u.isnil(f.*) {
+        f.* = u.calloc_slice.[u64](n).ptr;
+    }
+    let k = (p >> 3) & ((@as(usize, 1) << FILT_BITS) - 1);
+    let w = @slice_from_ptr(f.*, n);
+    w[k >> 6] = w[k >> 6] | (@as(u64, 1) << @truncate(u32, k & 63));
+}
+
+fn filt_has(f: *mut u64, p: usize) bool {
+    if u.isnil(f) {
+        return false;
+    }
+    let k = (p >> 3) & ((@as(usize, 1) << FILT_BITS) - 1);
+    return (
+        @slice_from_ptr(f, @as(usize, 1) << (FILT_BITS - 6))[k >> 6] & (@as(u64, 1) << @truncate(u32, k & 63))) != 0;
+}
+
 /// Follows value v (an instruction or a constant) for the debug
 /// information: its index in dbg_refs.
 pub fn dbg_track(v: *mut Value) i32 {
@@ -3186,6 +3215,7 @@ pub fn dbg_track(v: *mut Value) i32 {
 fn dbg_link(k: i32, v: *mut Value) void {
     if (v.kind == V_INST) or (v.kind == V_PARAM) {
         let key = dbg_key(v);
+        filt_put(&mut filt_at, @int_from_ptr(v));
         dbg_refs.at(@int_cast(usize, k)).next = dbg_at.get(key) - 1;
         dbg_at.put(key, k + 1);
     }
@@ -3206,7 +3236,7 @@ pub fn dbg_was_merged(a: *Value, id: i32) bool {
 // The entries following v: each one's v and id are v's still (the others,
 // stale, leave the chain).
 fn dbg_chain(v: *Value) i32 {
-    if ((v.kind != V_INST) and (v.kind != V_PARAM)) or (dbg_at.len == 0) {
+    if ((v.kind != V_INST) and (v.kind != V_PARAM)) or (dbg_at.len == 0) or not filt_has(filt_at, @int_from_ptr(v)) {
         return -1;
     }
     return dbg_at.get(dbg_key(v)) - 1;
@@ -3423,7 +3453,7 @@ fn mk_key(p: usize) []u8 {
 
 /// The first mark attached to instruction v (-1: none).
 pub fn dbg_marks_at(v: *Value) i32 {
-    if not dbg_on or (mk_inst.len == 0) {
+    if not dbg_on or (mk_inst.len == 0) or not filt_has(filt_inst, @int_from_ptr(v)) {
         return -1;
     }
     let a = mk_inst.get(mk_key(@int_from_ptr(v)));
@@ -3434,15 +3464,16 @@ pub fn dbg_marks_at(v: *Value) i32 {
 }
 
 fn mk_set(v: *Value, first: i32) void {
-    if (first < 0) and (mk_inst.len == 0) {
-        return;
+    if (first < 0) and ((mk_inst.len == 0) or not filt_has(filt_inst, @int_from_ptr(v))) {
+        return;  // (none there)
     }
+    filt_put(&mut filt_inst, @int_from_ptr(v));
     mk_inst.put(mk_key(@int_from_ptr(v)), MkAt.{ first: first + 1, id: v.id });
 }
 
 /// The first mark at the end of block b (-1: none).
 pub fn dbg_marks_end(b: *Block) i32 {
-    if not dbg_on or (mk_end.len == 0) {
+    if not dbg_on or (mk_end.len == 0) or not filt_has(filt_end, @int_from_ptr(b)) {
         return -1;
     }
     let a = mk_end.get(mk_key(@int_from_ptr(b)));
@@ -3453,7 +3484,7 @@ pub fn dbg_marks_end(b: *Block) i32 {
 }
 
 fn mk_block_take(b: *Block) i32 {
-    if mk_end.len == 0 {
+    if (mk_end.len == 0) or not filt_has(filt_end, @int_from_ptr(b)) {
         return -1;
     }
     let k = mk_key(@int_from_ptr(b));
@@ -3613,7 +3644,9 @@ fn mk_leave(v: *Value) void {
         mk_set(v.next, mk_cat(k, dbg_marks_at(v.next)));
     } else if u.notnil(v.blk) {
         let b = v.blk;
-        mk_end.put(mk_key(@int_from_ptr(b)), MkAt.{ first: mk_cat(k, mk_block_take(b)) + 1, id: b.id });
+        let first = mk_cat(k, mk_block_take(b));
+        filt_put(&mut filt_end, @int_from_ptr(b));
+        mk_end.put(mk_key(@int_from_ptr(b)), MkAt.{ first: first + 1, id: b.id });
     }
 }
 
@@ -3856,7 +3889,9 @@ pub fn dbg_move_end(from: *Block, to: *Block) void {
     }
     let k = mk_block_take(from);
     if k >= 0 {
-        mk_end.put(mk_key(@int_from_ptr(to)), MkAt.{ first: mk_cat(mk_block_take(to), k) + 1, id: to.id });
+        let first = mk_cat(mk_block_take(to), k);
+        filt_put(&mut filt_end, @int_from_ptr(to));
+        mk_end.put(mk_key(@int_from_ptr(to)), MkAt.{ first: first + 1, id: to.id });
     }
 }
 
@@ -5470,6 +5505,50 @@ pub fn merge_same_named(m: *mut Module) void {
             resolve_const(g.init);
         }
     }
+}
+
+/// The tables of the variables' assignments, made smaller for the
+/// processes that make the code from them (backend.ax: the parts, which
+/// fork with all of this process's memory): the places whose marks are
+/// gone (taken, or of an instruction or block no more) and the values no
+/// entry follows any longer leave the maps.
+pub fn dbg_compact() void {
+    if not dbg_on {
+        return;
+    }
+    let mut mi = u.SymMap.[MkAt].{ keys: u.nil.[usize](), vals: u.nil.[MkAt](), cap: 0, len: 0 };
+    let ks = @slice_from_ptr(mk_inst.keys, mk_inst.cap);
+    let vs = @slice_from_ptr(mk_inst.vals, mk_inst.cap);
+    for j in 0..mk_inst.cap {
+        if (ks[j] != 0) and (vs[j].first != 0) and (@ptr_from_int(*Value, ks[j]).id == vs[j].id) {
+            mi.put(mk_key(ks[j]), vs[j]);
+        }
+    }
+    u.free(@ptr_cast(*mut void, mk_inst.keys));
+    u.free(@ptr_cast(*mut void, mk_inst.vals));
+    mk_inst = mi;
+    let mut me = u.SymMap.[MkAt].{ keys: u.nil.[usize](), vals: u.nil.[MkAt](), cap: 0, len: 0 };
+    let eks = @slice_from_ptr(mk_end.keys, mk_end.cap);
+    let evs = @slice_from_ptr(mk_end.vals, mk_end.cap);
+    for j in 0..mk_end.cap {
+        if (eks[j] != 0) and (evs[j].first != 0) and (@ptr_from_int(*Block, eks[j]).id == evs[j].id) {
+            me.put(mk_key(eks[j]), evs[j]);
+        }
+    }
+    u.free(@ptr_cast(*mut void, mk_end.keys));
+    u.free(@ptr_cast(*mut void, mk_end.vals));
+    mk_end = me;
+    let mut da = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let aks = @slice_from_ptr(dbg_at.keys, dbg_at.cap);
+    let avs = @slice_from_ptr(dbg_at.vals, dbg_at.cap);
+    for j in 0..dbg_at.cap {
+        if (aks[j] != 0) and (avs[j] != 0) {
+            da.put(mk_key(aks[j]), avs[j]);
+        }
+    }
+    u.free(@ptr_cast(*mut void, dbg_at.keys));
+    u.free(@ptr_cast(*mut void, dbg_at.vals));
+    dbg_at = da;
 }
 
 /// Gives back the records of the variables' assignments (the marks, the
