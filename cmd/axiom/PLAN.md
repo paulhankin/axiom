@@ -20,7 +20,7 @@ parity check in the test suite can be widened once item 6 lands.
 | 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries (done: see §2) |
 | 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke (done: see §4) |
-| 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags |
+| 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`, `cgctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags (partly done: see §5) |
 | 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` |
 
 ### Recommended order
@@ -664,7 +664,89 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-### Current state
+**5b (module splits and enums): partly done.** Every split moved
+declarations as they were, by a script (a declaration goes with what it
+uses, and a reference becomes `alias.name`), so each commit left the
+compiler's output byte-identical: a fixed corpus (the base compiler's own
+source built for x86-64 -O2, -O0 -g and -O1 with ASan, AArch64 -O2,
+Windows -O1 -g, wasm32 -O2, macOS on both architectures, and as IR; the
+run tests as objects for five target and option sets; a fifth of the C
+run tests for three; the examples) compiled the same, as did the self
+build at its fixed point. Thread-local state stayed thread-local where
+it moved. Done:
+
+- `gvn.ax` (6474 lines) is three: `gvn.ax` (3804: value numbering, its
+  memory model, branch and range facts, loads at joins), `dse.ax` (608:
+  dead stores, `ss_opt`), `loopopt.ax` (2091: `licm` with promotion and
+  loop guards, `loop_idioms`, `split_loops`, `sink`, `reduce_addresses`).
+  The two new ones import `gvn.ax`; what all three use (`loc_of`,
+  `may_alias`, the write summary ...) is `pub` there.
+- `sema.ax` (6667) is three: `modload.ax` (428, imported by `sema.ax`:
+  the `Program`, now `modl.g_prog`, module loading, visibility and cycles,
+  the modules `axiom lsp`'s session keeps), `sema.ax` (5850: registration,
+  resolution, checking, builtins, which recurse into each other) and
+  `semapost.ax` (416, imported by `sema.ax`: object sizes, recursive
+  inline functions, processor extensions: target conditions,
+  `@features`/`@multiversion` versions, `gate_fn`).
+- `codegen.ax` (6329) is four: `cgctx.ax` (808, the leaf: options and the
+  driver's settings, the unit's IR module, builder, types and tables `S`,
+  the function being generated `F`, small IR helpers), `cgrt.ax` (893:
+  traps and their records, the shadow stack and call-site records, stack
+  limit, frame tables), `codegen.ax` (4147: monomorphization, statements,
+  expressions, builtins) and `cgmain.ax` (537, above `codegen.ax`:
+  `codegen_program`, the native entry, the runtime's exports). Item 1's
+  `CodegenCtx` can now be `cgctx.ax`'s globals gathered.
+- `x64caps.ax` (88): what codegen.ax asks the x86-64 selector
+  (`vector_bits`, `perm_ok`, `partial_ok`, `shiftv_ok`, `vnni_ok`,
+  `widen_ok`); `codegen.ax` no longer imports `x64.ax`.
+- Enums: `mach.OpKind` (`K_*`, u8), `nlink.SecClass` (`C_*`, i32, with
+  the Windows and Mach-O linkers' own classes as members and `NONE` for
+  sections not placed), `ast.DeclState` (`Decl.state`), `gvn.ax`'s
+  `EntKind` and `WriteKind`. The old constant names stay, as aliases of
+  the members (as `ast.E_*` are), so the code reads as before; the
+  representation is the old one, so no structure changed size.
+
+Compile time and memory are unchanged: the x86-64 -O2 build of the base
+compiler's source (one job, by compilers built at -O2) took 25.5-25.8 s
+of user time before and 25.2-26.2 s after, 2.23 GB peak both. The
+bootstrap compiler builds the new modules as they are (nothing beyond
+its subset: enums with explicit and negative values, `match` with
+several patterns per arm).
+
+### What remains (5b)
+
+- **`x64.ax` (10,400 lines)**: `x64abi.ax`, `x64simd.ax` and
+  `x64isel.ax` as the target design says. Not a mechanical move: the
+  vector and call lowering use instruction selection's emission helpers
+  (`emit`, `reg`, `vreg`, the value caches) and its private `State`, so
+  those must first go to a leaf (`x64ctx.ax` already has `Obj`/`Func`)
+  before the selection can be cut by phase. A dependency closure of the
+  capability queries (`wide_legal` and the shuffle matchers) reaches
+  1,300 lines of selection helpers.
+- **`codegen.ax`'s builtins** (`@...` lowering, about 1,600 lines) and
+  expressions call each other: `cg_builtin.ax` needs either the
+  expression generator behind a function pointer in `cgctx.ax` or the
+  builtins' leaf helpers (vector shuffles, conversions) moved out first.
+  `sema.ax`'s builtin checking is in the same position.
+- **`ir.CmpPred`** (`IntEQ` ... `RealUNE`, 735 uses): tried and backed
+  out. Predicates are stored in `Value.cv`, computed with
+  (`p - ir.IntEQ` table indices in `x64.ax`/`a64.ax`, `gvn.ax`'s
+  gt/ge/lt/le arithmetic, `ir.IntEQ..ir.IntSLE + 1` loops), and the C
+  front end passes them through the same `op: i32` parameters as its
+  operator codes (`c/cgen_*.ax`), so retyping the parameters by the
+  type errors spread into the operators. Do it by first giving the C
+  front end's predicate paths their own functions, then the backends'
+  tables via `@int_from_enum`.
+- **`ir.IN_*`** (120 intrinsics, in `Value.cv` too) and **`ast.BI_*`**
+  (145 builtins: an index into `ast.ax`'s table, -1 for unknown, ranges
+  such as `BI_X86_AESENC..BI_X86_AESKEYGENASSIST` in `semapost.builtin_need`
+  and `insn_ops`): an `UNKNOWN` member, `@int_from_enum` at the table, and
+  the ranges as `match` arms. The lexer's operator token kinds (the
+  plan's `OP_*`: `Expr.op`) likewise.
+- **`if`/`else` chains into `match`**: none was rewritten; the new enums
+  make it possible (e.g. the backends' dispatch on `MOp.kind`).
+
+### Current state (before 5a and 5b)
 
 Axiom forbids cyclic module imports (`sema.ax:243-246`). When the compiler was
 ported from C (where `.c` files shared header declarations freely) and grew new
