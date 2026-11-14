@@ -29,7 +29,7 @@ pub let mut t_f32: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
 pub let mut t_f64: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
 pub let mut t_v128: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
 
-let mut next_type_id: i32 = 1;
+threadlocal let mut next_type_id: i32 = 1;
 
 // A zeroed type of kind k (the prototype for interning).
 fn blank(k: ast.TyKind) ast.Type {
@@ -140,15 +140,70 @@ fn copy_types(xs: []mut *mut ast.Type) []mut *mut ast.Type {
     return r;
 }
 
+// A worker thread (units.ax) finds the types the front end made in ttab,
+// read only, and keeps those it makes in a table of its own.
+threadlocal let mut ltab: *mut *mut ast.Type = @ptr_from_int(*mut *mut ast.Type, 0);
+threadlocal let mut ltab_cap: usize = 0;
+threadlocal let mut ltab_len: usize = 0;
+
+fn find_type(tab: *mut *mut ast.Type, cap: usize, proto: *ast.Type, h: u64) *mut ast.Type {
+    if cap == 0 {
+        return u.nil.[ast.Type]();
+    }
+    let t = @slice_from_ptr(tab, cap);
+    let mut j = @truncate(usize, h) & (cap - 1);
+    while u.notnil(t[j]) {
+        if type_eq_struct(t[j], proto) {
+            return t[j];
+        }
+        j = (j + 1) & (cap - 1);
+    }
+    return u.nil.[ast.Type]();
+}
+
+/// What a worker thread starts from (units.ax): taken on the main thread,
+/// which first lays out every type (layout is lazy, and the types are
+/// shared).
+pub struct WorkerStart {
+    next_id: i32,
+}
+
+pub fn worker_start() WorkerStart {
+    let tab = @slice_from_ptr(ttab, ttab_cap);
+    for i in 0..ttab_cap {
+        let t = tab[i];
+        if u.notnil(t) and not t.has_params {
+            _ = type_size(t);
+        }
+    }
+    return WorkerStart.{ next_id: next_type_id };
+}
+
+pub fn worker_begin(ws: *WorkerStart) void {
+    next_type_id = ws.next_id;
+}
+
 fn intern_type(proto: *ast.Type) *mut ast.Type {
-    if (ttab_len * 2) >= ttab_cap {
+    if u.is_worker() {
+        let h = type_hash(proto);
+        let found = find_type(ttab, ttab_cap, proto, h);
+        if u.notnil(found) {
+            return found;
+        }
+        return add_type(&mut ltab, &mut ltab_cap, &mut ltab_len, proto);
+    }
+    return add_type(&mut ttab, &mut ttab_cap, &mut ttab_len, proto);
+}
+
+fn add_type(tabp: *mut *mut *mut ast.Type, capp: *mut usize, lenp: *mut usize, proto: *ast.Type) *mut ast.Type {
+    if (lenp.* * 2) >= capp.* {
         let mut ncap: usize = 1024;
-        if ttab_cap != 0 {
-            ncap = ttab_cap * 2;
+        if capp.* != 0 {
+            ncap = capp.* * 2;
         }
         let nt = @slice_from_ptr(@ptr_cast(*mut *mut ast.Type, u.calloc(ncap, 8)), ncap);
-        let old = @slice_from_ptr(ttab, ttab_cap);
-        for i in 0..ttab_cap {
+        let old = @slice_from_ptr(tabp.*, capp.*);
+        for i in 0..capp.* {
             if u.isnil(old[i]) {
                 continue;
             }
@@ -158,18 +213,18 @@ fn intern_type(proto: *ast.Type) *mut ast.Type {
             }
             nt[j] = old[i];
         }
-        u.free(@ptr_cast(*mut void, ttab));
-        ttab = nt.ptr;
-        ttab_cap = ncap;
+        u.free(@ptr_cast(*mut void, tabp.*));
+        tabp.* = nt.ptr;
+        capp.* = ncap;
     }
-    let tab = @slice_from_ptr(ttab, ttab_cap);
+    let tab = @slice_from_ptr(tabp.*, capp.*);
     let h = type_hash(proto);
-    let mut j = @truncate(usize, h) & (ttab_cap - 1);
+    let mut j = @truncate(usize, h) & (capp.* - 1);
     while u.notnil(tab[j]) {
         if type_eq_struct(tab[j], proto) {
             return tab[j];
         }
-        j = (j + 1) & (ttab_cap - 1);
+        j = (j + 1) & (capp.* - 1);
     }
     let t = u.new.[ast.Type]();
     t.* = proto.*;
@@ -200,7 +255,7 @@ fn intern_type(proto: *ast.Type) *mut ast.Type {
     }
     t.has_params = hp;
     tab[j] = t;
-    ttab_len += 1;
+    lenp.* += 1;
     return t;
 }
 

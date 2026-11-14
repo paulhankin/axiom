@@ -57,7 +57,88 @@ parity check in the test suite can be widened once item 6 lands.
 
 ## 1. Decouple Separate Compilation and Parallelism from POSIX `fork()`
 
-### Current state
+### Status
+
+**Separate compilation: done.** `units.build_units` compiles each uncached
+module on a worker thread (`std/thread`), on every host with threads
+(Linux, macOS, Windows, and WebAssembly under node), instead of in a forked
+child. Parts (`backend.compile_parts`) still fork: see "What remains".
+
+How it is done (the design differs from the one below, which threaded a
+context through the code generator):
+
+- **The per-unit state is thread-local.** Every mutable module-level
+  variable of the modules `codegen.ax` imports, but for the front end's
+  (`ast`, `lexer`, `parser`, `sema`, `types`, `package`, `diag`, `util`,
+  `target`, `c/`), is `threadlocal` (5a had gathered most of it into a few
+  structs), and so are `util.ax`'s arenas and output buffer, `diag.ax`'s
+  diagnostics and `target.ax`'s per-function `g_features`. A worker thread
+  starts with every one of them at its initial value, as a new process
+  would; the main thread is unchanged. No resets were needed: a unit gets a
+  thread of its own. The driver's settings (`codegen.ax`, `backend.ax`,
+  `isel.ax`, `jstub.ax`'s `g_*`, set by `main.ax`) stay shared, read only
+  while workers run.
+- **The front end's tables are shared, read only, with a per-worker
+  overlay.** A worker finds interned strings (`u.intern`), types
+  (`types.ax`) and source files (`u.g_files`) in the main thread's tables
+  first, and keeps what it adds in tables of its own (new type ids continue
+  from the main thread's). What the front end computes lazily is computed
+  before the workers start (`u.worker_start`, `ty.worker_start`): the
+  types' layouts and the files' line tables. `codegen.ax`'s caches on
+  `ast.Type` (`backend`, the size check) became per-thread tables by type id
+  (the fields remain in `ast.Type`, unused).
+- **Unit memory.** Everything a worker allocates goes back when it ends
+  (`u.worker_end`): its arenas are its own, and `util.ax`'s heap blocks are
+  on a per-thread list while `tracking` (a 32-byte header instead of 16).
+  The syntax tree stays in the main thread's tree arena, so nothing has to
+  defer `release_tree`. Diagnostics come back as text (`dg.save`, `dg.load`,
+  as from a child process); modules are waited for in order, so they come in
+  the same order whatever the threads do.
+- `AXIOM_JOBS` sets the number of threads (the processors by default); it
+  also bounds the parts compiled at once.
+- Host cleanup: `axiom cache clean` (and a failed git checkout) use
+  `std/os/fs.remove_all`, not `rm -rf`; `util.self_path` searches `PATH`
+  as Windows has it (`;`, `.exe`).
+- `wlink.ax` joins data segments that are (nearly) adjacent: the compiler
+  built for wasm32 had more than V8's 100000 and would not load under node.
+
+Verified: the cached objects (and executables) are byte-identical to the
+forked children's for the compiler itself (x86-64 at -O0, -O1, -O1 -g, -O2,
+--sanitize=address; AArch64 -O0 -g; wasm32; Windows -O1 -g; macOS) and
+several examples, with `AXIOM_JOBS=1` and 3 alike; diagnostics from several
+failing modules come in the same order; the compiler built for wasm32 builds
+with the cache under node, and the compiler built for Windows does under
+Wine (the compiler itself: 188 modules, the same executable as on Linux).
+A module starts as soon as any thread is free (the forked children waited
+for the oldest). On Linux (4 processors, a cold cache), a `--units=module`
+self-build at -O1 went from 6.2-6.8 s to 4.0-4.2 s (user + system time 12.4
+to 9.0 s; on one processor 13.3 to 10.6 s), its peak memory (PSS, all
+processes) from 357-379 to 379-394 MB. The -O2 self-build (parts, still
+forked) is unchanged within noise (about 30 s of CPU time, 2.0 GB peak in
+the main process); an -O2 build of an example executes 0.5% fewer
+instructions (callgrind): thread-local access costs nothing measurable.
+
+### What remains
+
+- **Parts on threads.** `compile_parts` still forks, and so is serial (one
+  piece) where there is no fork. Its children share the post-inline module
+  and every table made before it (the IR's interned types and constants,
+  debug-information tables, free lists, `asm/inline.ax`'s blocks, ...), and
+  each changes the module (`compile_part` turns the other parts' functions
+  into declarations and, but in part 0, drops the data's initializers;
+  `switches.lookup_tables` and `cover.instrument` add globals) and reads the
+  other parts' functions (`tailrec.prepare_sibling`, the backends' symbols).
+  Threads need, per part, a view of the module (its own function and global
+  lists, declarations for the others' functions without changing the shared
+  ones), the main thread's IR tables copied (or overlaid, as the front
+  end's are), and the cross-function reads of `passes.finish_funcs` and the
+  backends confined to what is fixed before the parts start. The IR's
+  tables are what item 3 is reworking (def-use lists): do this after it.
+- Parts' objects still go through files (`<path>.p<k>.o`), not memory.
+- A host without threads (a browser without shared memory) still compiles
+  the whole program as one unit.
+
+### Current state (before this item)
 
 The compiler relies on single-shot process isolation in two places:
 
@@ -420,8 +501,10 @@ Left at module level, deliberately:
   debug-info side tables (`dbg_*`), and `wasm.ax`'s state, which item 3
   (def-use lists) is reworking: group them once it lands.
 
-Other modules with process-lifetime state that item 1 still has to account for:
+Other modules with process-lifetime state that item 1 had to account for:
 `nlink.ax`, `asm/obj.ax`, `codeview.ax`, `dloc.ax`, `mach.ax` and `target.ax`.
+(Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
+run on the main thread: see section 1, "Status".)
 
 ### Current state
 

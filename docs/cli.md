@@ -233,6 +233,7 @@ system's C library either) is a static executable. A WebAssembly program whose
 | `AXIOM_STD` | The standard library's directory, when `--std` is not given. |
 | `AXIOM_CACHE` | The cache directory: compiled modules in `<cache>/obj/`, git dependencies in `<cache>/`. Otherwise `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`. |
 | `AXIOM_UPDATE_URL` | The repository `axiom update` updates from, instead of `https://github.com/paulhankin/axiom`: a mirror whose `releases/download/v<version>/` holds the release archives and `SHA256SUMS`, and which git can fetch from. |
+| `AXIOM_JOBS` | How many modules (`--units=module`), or parts of an optimized program, are compiled at once: the number of processors by default. The output does not depend on it. |
 | `AXIOM_CACHE_LIMIT` | The size the compiled-module cache is kept under after a build: a number of bytes, or one with a `k`, `m` or `g` suffix; `0` for no limit; 2 GiB by default (spec §16.7). |
 
 The variables that switch on debugging output inside the compiler are listed in

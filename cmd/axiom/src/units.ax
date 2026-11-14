@@ -5,15 +5,17 @@
 // <cache>/obj/<key>.o, where the key hashes everything the object depends on:
 // the compiler binary, the code generation options, the module's source and
 // path, and (recursively) the keys of the modules it imports. A build
-// compiles only the modules whose key has no cached object, in parallel
-// worker processes forked after type checking, then generates the small
-// per-program link unit (globals, error codes, runtime state, exports).
+// compiles only the modules whose key has no cached object, in parallel on
+// worker threads after type checking (each as if in a process of its own:
+// util.ax), then generates the small per-program link unit (globals, error
+// codes, runtime state, exports).
 // =============================================================================
 import "ast.ax" as ast;
 import "codegen.ax" as cg;
 import "diag.ax" as dg;
 import "package.ax" as pkg;
 import "sema.ax" as sema;
+import "std/thread" as thread;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
@@ -263,45 +265,52 @@ fn file_ok(p: []u8) bool {
     return u.is_file(p) and (u.file_size(p) > 0);
 }
 
-// The file a child compiling module un (process pid) leaves its
-// diagnostics in when it fails, for the parent to report.
-fn diag_file(un: *Unit, pid: i32) []u8 {
-    return u.f2("%s.diag%s", un.obj, u.idec(pid));
+// A module to compile on a worker thread, and how that went.
+struct Job {
+    base: *cg.CgOptions,
+    un: *mut Unit,
+    us: u.WorkerStart,
+    ts: ty.WorkerStart,
+    features: u64,
+    ok: bool,
+    diags: []u8,  // its diagnostics when it failed (u.keep_dup), or a nil slice
+    done: u32,    // 1 once the rest is set
 }
 
-// Compiles one module in a child process. Its handle (negative if
-// processes cannot be made).
-fn spawn_unit(base: *cg.CgOptions, un: *mut Unit) i32 {
-    u.flush_out();
-    let pid = u.fork();
-    if pid != 0 {
-        return pid;
-    }
+// The jobs of this build that are done (Job.done), for the main thread to
+// wait on.
+let mut jobs_done: u32 = 0;
+
+// On a worker thread: compiles one module to its object, written to a
+// temporary file first.
+fn run_job(j: *mut Job) void {
+    u.worker_begin(&j.us);
+    ty.worker_begin(&j.ts);
+    tg.g_features = j.features;
     let co = u.new.[cg.CgOptions]();
-    co.* = base.*;
+    co.* = j.base.*;
     co.unit = cg.CG_MODULE;
-    co.module = un.m;
-    let tmp = u.f2("%s.tmp%s", un.obj, u.idec(u.getpid()));
+    co.module = j.un.m;
+    let tmp = u.f2("%s.tmp%s", j.un.obj, u.idec(u.getpid()));
     co.out_path = tmp;
-    let from = dg.all().len;
-    let ok = cg.codegen_program(co);
-    if not ok {
-        _ = u.write_file(diag_file(un, u.getpid()), dg.save(from));
+    j.ok = cg.codegen_program(co);
+    if not j.ok {
+        j.diags = u.keep_dup(dg.save(0));
         _ = u.unlink(u.cz(tmp));
-        u._exit(1);
-    }
-    if u.rename(u.cz(tmp), u.cz(un.obj)) != 0 {
+    } else if u.rename(u.cz(tmp), u.cz(j.un.obj)) != 0 {
         _ = u.unlink(u.cz(tmp));
-        u._exit(1);
+        j.ok = false;
     }
-    u._exit(0);
-    return 0;
+    u.worker_end();
+    @atomic_store(&mut j.done, 1);
+    _ = @atomic_add(&mut jobs_done, 1);
+    _ = @atomic_notify(&jobs_done, 0xFFFF_FFFF);
 }
 
 // Compiles every module whose object is not cached, then the link unit into
 // `link_obj`. Appends the module objects to `objs`. 1 on success; 0 on
 // failure (errors already reported); -1, having done nothing, where the
-// host cannot make the processes to compile modules in (WebAssembly).
+// host cannot make the threads to compile modules on.
 pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8], stats: *mut UnitStats) i32 {
     let opts = options_id(base);
     let dir = u.cat2(pkg.cache_dir(), "/obj");
@@ -329,39 +338,50 @@ pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8]
             todo.push(un);
         }
     }
-    // Compile what is missing, a few at a time (waiting for the oldest).
-    let width = @min(@max(u.cpu_count(), 1), 16);
-    let mut running = u.List.[i32].empty();
-    let mut first: usize = 0;  // the oldest still running
-    let mut next: usize = 0;
+    // Compile what is missing, `width` at a time; the results are taken in
+    // the modules' order, so that diagnostics come in that order.
+    let width = @min(u.jobs(), 16);
+    let jobs = u.newn.[Job](todo.len + 1);
+    if todo.len > 0 {
+        let us = u.worker_start();
+        let ts = ty.worker_start();
+        for i in 0..todo.len {
+            jobs[i] = Job.{ base: base, un: todo.get(i), us: us, ts: ts, features: tg.g_features, ok: false,
+                            diags: u.nosym(), done: 0 };
+        }
+    }
+    @atomic_store(&mut jobs_done, 0);
+    let mut running = u.List.[thread.Thread.[*mut Job]].empty();
+    let mut taken: usize = 0;  // the jobs whose results have been taken
     let mut failed = false;
-    while (next < todo.len) or (first < running.len) {
-        while not failed and ((running.len - first) < width) and (next < todo.len) {
-            let p = spawn_unit(base, todo.get(next));
-            if p < 0 {
+    loop {
+        let done = @atomic_load(&jobs_done);
+        while not failed and (running.len < todo.len) and ((running.len - @as(usize, done)) < width) {
+            let t = thread.spawn(run_job, &mut jobs[running.len]) catch {
                 if running.len == 0 {
                     return -1;
                 }
                 failed = true;
                 break;
-            }
-            running.push(p);
-            next += 1;
+            };
+            running.push(t);
         }
-        if first == running.len {
+        while (taken < running.len) and (@atomic_load(&jobs[taken].done) == 1) {
+            running.get(taken).join();
+            let j = &mut jobs[taken];
+            if not j.ok {
+                failed = true;
+                if not u.isnos(j.diags) {
+                    dg.load(j.diags);
+                    u.free_heap(j.diags);
+                }
+            }
+            taken += 1;
+        }
+        if (taken == running.len) and (failed or (taken == todo.len)) {
             break;
         }
-        let status = u.wait_child(running.get(first));
-        if status != 0 {
-            failed = true;
-            let df = diag_file(todo.get(first), running.get(first));
-            let saved = u.read_file(df);
-            if not u.isnos(saved) {
-                dg.load(saved);
-                _ = u.unlink(u.cz(df));
-            }
-        }
-        first += 1;
+        _ = @atomic_wait(&jobs_done, done, -1);
     }
     stats.total = n;
     stats.compiled = todo.len;
