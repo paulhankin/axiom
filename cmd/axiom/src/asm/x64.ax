@@ -40,7 +40,8 @@ const RIP: i32 = 999;
 // multiple of 16 so that the low four bits are the encoding's: vector
 // registers xmm/ymm/zmm 0-31 from 16, mask registers k0-k7 from 48, MMX
 // from 64, x87 st(0)-st(7) from 80, segment registers (es cs ss ds fs gs)
-// from 96, control registers from 112, debug registers from 128.
+// from 96, control registers from 112, debug registers from 128, AMX's tile
+// registers tmm0-tmm7 from 144.
 const R_VEC: i32 = 16;
 const R_K: i32 = 48;
 const R_MM: i32 = 64;
@@ -48,6 +49,7 @@ const R_ST: i32 = 80;
 const R_SEG: i32 = 96;
 const R_CR: i32 = 112;
 const R_DR: i32 = 128;
+const R_TMM: i32 = 144;
 
 struct XOp {
     kind: u8,
@@ -91,9 +93,9 @@ fn xreg(n: []u8, bits: *mut u32) i32 {
             }
         }
     }
-    let one = [["k", "8"], ["mm", "8"], ["cr", "16"], ["dr", "16"], ["db", "16"]];
-    let base: [5]i32 = [R_K, R_MM, R_CR, R_DR, R_DR];
-    for k in @as(usize, 0)..5 {
+    let one = [["k", "8"], ["mm", "8"], ["cr", "16"], ["dr", "16"], ["db", "16"], ["tmm", "8"]];
+    let base: [6]i32 = [R_K, R_MM, R_CR, R_DR, R_DR, R_TMM];
+    for k in @as(usize, 0)..6 {
         let p = one[k][0];
         if u.starts(n, p) and (n.len > p.len) {
             let x = ai.num(n[p.len..]);
@@ -4177,8 +4179,9 @@ const TT_VX: u32 = 0x10_0000;
 const TT_VY: u32 = 0x20_0000;
 const TT_VZ: u32 = 0x40_0000;
 const TT_I: u32 = 0x80_0000;
-const TT_VV: u32 = 0x100_0000;  // memory with a vector index of the form's length (VSIB)
-const TT_VH: u32 = 0x200_0000;  // ... of half of it (at least xmm)
+const TT_VV: u32 = 0x100_0000;   // memory with a vector index of the form's length (VSIB)
+const TT_VH: u32 = 0x200_0000;   // ... of half of it (at least xmm)
+const TT_TMM: u32 = 0x400_0000;  // an AMX tile register
 
 struct TForm {
     name: []u8,
@@ -4205,6 +4208,8 @@ struct TForm {
     fimm: i32,   // a fixed imm8, or -1
     kreq: bool,  // a mask register is required (gathers and scatters)
     pvex: bool,  // a VEX form chosen only under the {vex} pseudo-prefix (where EVEX is the default)
+    sib: bool,   // memory always with a SIB byte (AMX's tile loads and stores: no rip, no VSIB)
+    dist: bool,  // its register operands must all be different (AMX's dot products)
 }
 
 const TU_NONE: u8 = 0;
@@ -4259,9 +4264,10 @@ fn ttype(t: []u8, fix: *mut i32, fixb: *mut u32) u32 {
         let a = t[st..k];
         st = k + 1;
         let names = ["V", "H", "Q", "O", "x", "y", "z", "k", "mm", "st", "st0", "sreg", "cr", "dr", "r8", "r16", "r32",
-                     "r64", "m", "vx", "vy", "vz", "i", "vV", "vH"];
-        let vals: [25]u32 = [TT_V, TT_H, TT_Q, TT_O, TT_X, TT_Y, TT_Z, TT_K, TT_MM, TT_ST, TT_ST0, TT_SREG, TT_CR,
-                             TT_DR, TT_R8, TT_R16, TT_R32, TT_R64, TT_M, TT_VX, TT_VY, TT_VZ, TT_I, TT_VV, TT_VH];
+                     "r64", "m", "vx", "vy", "vz", "i", "vV", "vH", "tmm"];
+        let vals: [26]u32 = [TT_V, TT_H, TT_Q, TT_O, TT_X, TT_Y, TT_Z, TT_K, TT_MM, TT_ST, TT_ST0, TT_SREG, TT_CR,
+                             TT_DR, TT_R8, TT_R16, TT_R32, TT_R64, TT_M, TT_VX, TT_VY, TT_VZ, TT_I, TT_VV, TT_VH,
+                             TT_TMM];
         let mut found = false;
         for j in 0..names.len {
             if u.str_eq(a, names[j]) {
@@ -4298,7 +4304,8 @@ fn build_table() void {
         let enc = tword(line, &mut i);
         let mut f = TForm.{ name: u.intern(name), n: 0, role: [0; 5], ty: [0; 5], fix: [-1; 5], fixb: [0; 5], enc: TE_L,
                             pp: 0, map: 0, w: 0, opc: [0; 4], nopc: 0, digit: -2, lens: 1, tuple: TU_NONE, tn: 0, bc: 0,
-                            kmask: false, kzero: false, er: false, sae: false, fimm: -1, kreq: false, pvex: false };
+                            kmask: false, kzero: false, er: false, sae: false, fimm: -1, kreq: false, pvex: false,
+                            sib: false, dist: false };
         if not u.str_eq(roles, "-0") {
             f.n = roles.len;
             for k in 0..roles.len {
@@ -4429,6 +4436,10 @@ fn build_table() void {
                 f.kreq = true;
             } else if u.str_eq(a, "pvex") {
                 f.pvex = true;
+            } else if u.str_eq(a, "sib") {
+                f.sib = true;
+            } else if u.str_eq(a, "distinct") {
+                f.dist = true;
             } else if u.starts(a, "imm=") {
                 f.fimm = @truncate(i32, u.atol(a[4..]));
             } else {
@@ -4502,7 +4513,10 @@ fn reg_class_bits(o: *XOp) u32 {
     if r < R_DR {
         return TT_CR;
     }
-    return TT_DR;
+    if r < R_TMM {
+        return TT_DR;
+    }
+    return TT_TMM;
 }
 
 // The width a vector type has in a form of length L.
@@ -4811,6 +4825,33 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
     }
     if f.digit >= 0 {
         regf = f.digit;
+    }
+    if f.dist {
+        for i in 0..f.n {
+            for j in i + 1..f.n {
+                if (ops[i].kind == XK_REG) and (ops[j].kind == XK_REG) and (ops[i].reg == ops[j].reg) {
+                    cr.fail(A, u.f1("the registers of '%s' must all be different", f.name));
+                    return;
+                }
+            }
+        }
+    }
+    if f.sib and (rm.kind == XK_MEM) {
+        // (a tile's memory operand: base and index registers, the stride the
+        // index; no index is written as SIB's index 100)
+        if (rm.base == RIP) or rm.vix {
+            cr.fail(A, u.f1("'%s' takes no rip-relative or vector-indexed address", f.name));
+            return;
+        }
+        if rm.index < 0 {
+            rm.index = 4;
+        }
+    }
+    if (rm.kind == XK_NONE) and (f.digit != -2) and (f.enc != TE_L) {
+        // (no r/m operand: ModRM.mod 11 and r/m 000, tilerelease and tilezero)
+        rm.kind = XK_REG;
+        rm.reg = 0;
+        rm.bits = 64;
     }
     if f.fimm >= 0 {
         iv = cr.konst(@as(i64, f.fimm));

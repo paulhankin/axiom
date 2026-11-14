@@ -983,6 +983,21 @@ vtestpd RM x,x/m V.66.0f38.w0 0f /r lx
 vtestpd RM y,y/m V.66.0f38.w0 0f /r ly
 vtestps RM x,x/m V.66.0f38.w0 0e /r lx
 vtestps RM y,y/m V.66.0f38.w0 0e /r ly
+ldtilecfg M m V.np.0f38.w0 49 /0 lx
+sttilecfg M m V.66.0f38.w0 49 /0 lx
+tilerelease -0 - V.np.0f38.w0 49 lx
+tilezero R tmm V.f2.0f38.w0 49 /r lx
+tileloadd RM tmm,m V.f2.0f38.w0 4b /r lx sib
+tileloaddt1 RM tmm,m V.66.0f38.w0 4b /r lx sib
+tilestored MR m,tmm V.f3.0f38.w0 4b /r lx sib
+tcmmimfp16ps RMV tmm,tmm,tmm V.66.0f38.w0 6c /r lx distinct
+tcmmrlfp16ps RMV tmm,tmm,tmm V.np.0f38.w0 6c /r lx distinct
+tdpbf16ps RMV tmm,tmm,tmm V.f3.0f38.w0 5c /r lx distinct
+tdpbssd RMV tmm,tmm,tmm V.f2.0f38.w0 5e /r lx distinct
+tdpbsud RMV tmm,tmm,tmm V.f3.0f38.w0 5e /r lx distinct
+tdpbusd RMV tmm,tmm,tmm V.66.0f38.w0 5e /r lx distinct
+tdpbuud RMV tmm,tmm,tmm V.np.0f38.w0 5e /r lx distinct
+tdpfp16ps RMV tmm,tmm,tmm V.f2.0f38.w0 5c /r lx distinct
 """
 
 LEGACY_FORMS = """

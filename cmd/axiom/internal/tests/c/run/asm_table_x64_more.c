@@ -1,7 +1,7 @@
 /* flags: --c-std=gnu17 */
 /* native-only */
 /* The x86-64 table forms of cmd/internal/tools/gen_x64_table_more.py (the rest of AVX-512 with FP16 and BF16,
-   AVX-VNNI-INT8/INT16, AVX-IFMA, AVX-NE-CONVERT, SHA512, SM3, SM4, CMPccXADD, FMA4 ...), two shapes of each
+   AVX-VNNI-INT8/INT16, AVX-IFMA, AVX-NE-CONVERT, SHA512, SM3, SM4, CMPccXADD, FMA4, AMX ...), two shapes of each
    mnemonic, against a byte table checked against the system assembler in development. */
 #include "host.h"
 
@@ -834,6 +834,22 @@ __asm__(".section .rodata.axiom_asm_table, \"a\"\n"
         "vfmaddps xmm1,xmm2,xmm3,xmm4\n"
         "vpermil2ps xmm1,xmm2,xmm3,xmm4,2\n"
         ".att_syntax\n"
+        "tilerelease\n"
+        "tilezero %tmm3\n"
+        "tileloadd (%rax),%tmm1\n"
+        "tileloadd (%rax,%rcx,2),%tmm1\n"
+        "tilestored %tmm2,(%rax,%rbx,1)\n"
+        "tileloaddt1 8(%rsi,%rdx,4),%tmm7\n"
+        "tdpbf16ps %tmm1,%tmm2,%tmm3\n"
+        "tileloadd 0x10,%tmm1\n"
+        "tileloadd (%rax,%rcx,2),%tmm1\n"
+        "tileloadd (%r13),%tmm1\n"
+        "tileloadd (%rsp),%tmm6\n"
+        "tcmmimfp16ps %tmm1,%tmm2,%tmm3\n"
+        "tdpfp16ps %tmm1,%tmm2,%tmm3\n"
+        "ldtilecfg (%rax)\n"
+        "sttilecfg 0x40(%rbx)\n"
+        "tilestored %tmm0,0x7f(%r12,%r15,8)\n"
         ".globl axiom_asm_table_end\n"
         "axiom_asm_table_end:\n");
 
@@ -1662,7 +1678,24 @@ static const char *const want[] = {
     "62f57cda5a08",  /* vcvtph2pd zmm1{k2}{z},WORD BCST [rax] */
     "c4e3e968cc30",  /* vfmaddps xmm1,xmm2,xmm3,xmm4 */
     "c4e36948cb42",  /* vpermil2ps xmm1,xmm2,xmm3,xmm4,2 */
+    "c4e27849c0",  /* tilerelease */
+    "c4e27b49d8",  /* tilezero %tmm3 */
+    "c4e27b4b0c20",  /* tileloadd (%rax),%tmm1 */
+    "c4e27b4b0c48",  /* tileloadd (%rax,%rcx,2),%tmm1 */
+    "c4e27a4b1418",  /* tilestored %tmm2,(%rax,%rbx,1) */
+    "c4e2794b7c9608",  /* tileloaddt1 8(%rsi,%rdx,4),%tmm7 */
+    "c4e2725cda",  /* tdpbf16ps %tmm1,%tmm2,%tmm3 */
+    "c4e27b4b0c2510000000",  /* tileloadd 0x10,%tmm1 */
+    "c4e27b4b0c48",  /* tileloadd (%rax,%rcx,2),%tmm1 */
+    "c4c27b4b4c2500",  /* tileloadd (%r13),%tmm1 */
+    "c4e27b4b3424",  /* tileloadd (%rsp),%tmm6 */
+    "c4e2716cda",  /* tcmmimfp16ps %tmm1,%tmm2,%tmm3 */
+    "c4e2735cda",  /* tdpfp16ps %tmm1,%tmm2,%tmm3 */
+    "c4e2784900",  /* ldtilecfg (%rax) */
+    "c4e279494340",  /* sttilecfg 0x40(%rbx) */
+    "c4827a4b44fc7f",  /* tilestored %tmm0,0x7f(%r12,%r15,8) */
 };
+
 static int hexval(char c) { return c <= '9' ? c - '0' : c - 'a' + 10; }
 
 int main(void) {
