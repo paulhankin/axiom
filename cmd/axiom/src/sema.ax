@@ -22,7 +22,7 @@ pub struct Program {
     tests: u.List.[*mut ast.Decl],  // test blocks of non-std modules, in source order
 }
 
-pub let mut g_prog: *mut Program = @ptr_from_int(*mut Program, 0);
+pub threadlocal let mut g_prog: *mut Program = @ptr_from_int(*mut Program, 0);
 
 pub struct SemaOptions {
     std_dir: []u8,
@@ -59,16 +59,18 @@ struct FnCtx {
     const_ctx: bool,
 }
 
-let mut C: *mut FnCtx = @ptr_from_int(*mut FnCtx, 0);
+threadlocal let mut C: *mut FnCtx = @ptr_from_int(*mut FnCtx, 0);
 
-let mut mod_by_path: u.SymMap.[*mut ast.Module] = u.SymMap.[*mut ast.Module].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0), cap: 0, len: 0 };
-let mut mod_state: u.SymMap.[i32] = u.SymMap.[i32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+threadlocal let mut mod_by_path: u.SymMap.[*mut ast.Module] =
+    u.SymMap.[*mut ast.Module].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0),
+                                 cap: 0, len: 0 };
+threadlocal let mut mod_state: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                 vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
 // The real paths found so far, by the path asked about (an import is resolved twice, and a module is imported
 // by many).
-let mut real_path_memo: u.SymMap.[[]u8] = u.SymMap.[[]u8].{ keys: @ptr_from_int(*mut usize, 0),
-                                                            vals: @ptr_from_int(*mut []u8, 0), cap: 0, len: 0 };
+threadlocal let mut real_path_memo: u.SymMap.[[]u8] = u.SymMap.[[]u8].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut []u8, 0), cap: 0,
+                                                                        len: 0 };
 
 // u.real_path(p), remembered when p exists.
 fn real_path_of(p: []u8) []u8 {
@@ -86,10 +88,10 @@ fn real_path_of(p: []u8) []u8 {
     return kept;
 }
 
-let mut g_std_dir: []u8 = "";
-let mut g_cwd: []u8 = "";
-let mut std_real: []u8 = "";
-let mut std_real_done: bool = false;
+threadlocal let mut g_std_dir: []u8 = "";
+threadlocal let mut g_cwd: []u8 = "";
+threadlocal let mut std_real: []u8 = "";
+threadlocal let mut std_real_done: bool = false;
 
 fn tnil() *mut ast.Type {
     return u.nil.[ast.Type]();
@@ -245,6 +247,11 @@ fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
         }
         return found;
     }
+    let kept = base_by_path.get(key);
+    if u.notnil(kept) {
+        take_base(kept);
+        return kept;
+    }
     let f = u.load_file(rp, u.dup(display_path(rp)));
     if u.isnil(f) {
         if u.notnil(from) {
@@ -312,6 +319,172 @@ fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
     g_prog.modules.push(m);
     return m;
 }
+
+// ---------------------------------------------------------------------------
+// Modules checked before (axiom lsp's session, lsp.ax). The main thread
+// keeps the modules that a check found clean (sema.clean), and a later run
+// on any thread takes them as they are: the run comes to one where loading
+// it would, takes its imports (kept too) the same way, and checks only the
+// modules it loads. Every program-wide step (error codes, exported names,
+// the globals' total size) still sees them, so that the run reports what a
+// run from nothing would.
+// ---------------------------------------------------------------------------
+let mut base_by_path: u.SymMap.[*mut ast.Module] = u.SymMap.[*mut ast.Module].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0), cap: 0, len: 0 };
+
+// Takes kept module m (and the kept modules it imports) into this run.
+fn take_base(m: *mut ast.Module) void {
+    mod_by_path.put(m.path, m);
+    mod_state.put(m.path, 1);
+    u.note_file(m.file.id);
+    if u.notnil(m.pkg) {
+        _ = pkg.for_file(m.path);  // (its manifest is read again, as loading it would)
+    }
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) and u.isnil(mod_by_path.get(d.imported.path)) {
+            take_base(d.imported);
+        }
+    }
+    mod_state.put(m.path, 2);
+    g_prog.modules.push(m);
+}
+
+/// On the main thread: keeps m, which this run checked, for later runs.
+pub fn admit(m: *mut ast.Module) void {
+    m.base = true;
+    base_by_path.put(m.path, m);
+}
+
+/// On the main thread: no longer takes the module kept for `path` (nor
+/// does any later run).
+pub fn evict(path: []u8) void {
+    if u.notnil(base_by_path.get(path)) {
+        base_by_path.put(path, u.nil.[ast.Module]());
+    }
+}
+
+/// The module kept for `path` (a real path, interned), or nil.
+pub fn kept_module(path: []u8) *mut ast.Module {
+    return base_by_path.get(path);
+}
+
+// Whether error `name` is declared in m or a module it imports.
+fn declares_error(m: *mut ast.Module, name: []u8, seen: *mut u.SymMap.[bool]) bool {
+    if seen.get(m.path) {
+        return false;
+    }
+    seen.put(m.path, true);
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if d.kind == ast.D_ERROR {
+            for j in 0..d.error_names.len {
+                if u.same(d.error_names.get(j), name) {
+                    return true;
+                }
+            }
+        } else if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) and declares_error(d.imported, name, seen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Which modules of this run, checked by it, a later run may take as they
+/// are: those that nothing was reported about, whose imports may be taken
+/// too (or are kept), whose text is the file's (not an editor's unsaved
+/// one), and that name only error names they declare or import (error
+/// names are the program's: in a program without the declaring module
+/// they are errors). Nothing, if something was reported about a file that
+/// is no module's (a package's manifest). In the order of g_prog.modules.
+pub fn clean() u.List.[*mut ast.Module] {
+    let mut out = u.List.[*mut ast.Module].empty();
+    let mut ok = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+    if g_error_use_unknown {
+        return out;
+    }
+    // the files reported about (1), and those of them that are modules' (2)
+    let bad = u.newn.[u8](u.g_files.len + 1);
+    for d in dg.all() {
+        if (d.span.file < 0) or (@int_cast(usize, d.span.file) >= u.g_files.len) {
+            return out;
+        }
+        bad[@int_cast(usize, d.span.file)] = 1;
+    }
+    for mi in 0..g_prog.modules.len {
+        let id = @int_cast(usize, g_prog.modules.get(mi).file.id);
+        if bad[id] != 0 {
+            bad[id] = 2;
+        }
+    }
+    for b in bad {
+        if b == 1 {
+            return out;
+        }
+    }
+    for mi in 0..g_prog.modules.len {
+        let m = g_prog.modules.get(mi);
+        if m.base {
+            ok.put(m.path, true);
+            continue;
+        }
+        if bad[@int_cast(usize, m.file.id)] != 0 {
+            continue;
+        }
+        let ov = u.overlay_text(m.path);
+        if not u.isnos(ov) {
+            if u.overlay_edited(m.path) {
+                continue;
+            }
+            let disk = u.read_file(m.path);
+            if u.isnos(disk) or not u.str_eq(disk, ov) {
+                continue;
+            }
+        }
+        let mut good = true;
+        for i in 0..m.decls.len {
+            let d = m.decls.get(i);
+            if (d.kind == ast.D_IMPORT) and (u.isnil(d.imported) or not ok.get(d.imported.path)) {
+                good = false;
+            }
+        }
+        for i in 0..m.error_uses.len {
+            let n = m.error_uses.get(i);
+            if not good or u.same(n, u.intern("OutOfMemory")) or u.same(n, u.intern("Overflow")) {
+                continue;
+            }
+            let mut seen = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+            good = declares_error(m, n, &mut seen);
+        }
+        if good {
+            ok.put(m.path, true);
+            out.push(m);
+        }
+    }
+    return out;
+}
+
+// error_code_of, for the module being checked (which then depends on the
+// name being declared somewhere: clean).
+fn error_code_here(name: []u8) u32 {
+    let mut m = u.nil.[ast.Module]();
+    if u.notnil(C) {
+        m = C.tc.mod;
+        if u.isnil(m) and u.notnil(C.fnd) {
+            m = C.fnd.module;
+        }
+    }
+    if u.notnil(m) {
+        m.error_uses.push(name);
+    } else {
+        g_error_use_unknown = true;
+    }
+    return error_code_of(name);
+}
+
+// An error name was looked up outside any module's code (then nothing of
+// the run is clean).
+threadlocal let mut g_error_use_unknown: bool = false;
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -787,7 +960,8 @@ struct SizeCheck {
     t: *mut ast.Type,
 }
 
-let mut size_checks: u.List.[SizeCheck] = u.List.[SizeCheck].{ data: @ptr_from_int(*mut SizeCheck, 0), len: 0, cap: 0 };
+threadlocal let mut size_checks: u.List.[SizeCheck] = u.List.[SizeCheck].{
+    data: @ptr_from_int(*mut SizeCheck, 0), len: 0, cap: 0 };
 
 fn check_size(sp: u.Span, t: *mut ast.Type) *mut ast.Type {
     if not t.has_params and (t.kind != ast.TY_INVALID) {
@@ -1374,7 +1548,7 @@ fn expected_set(t: *mut ast.Type) *mut ast.Decl {
 }
 
 // The function E0355 was last reported for.
-let mut g_self_dep: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+threadlocal let mut g_self_dep: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
 
 fn resolve_decl(d: *mut ast.Decl) void {
     if d.state == 2 {
@@ -3802,7 +3976,7 @@ fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         .ARRAY_LIT    => { return check_array_lit(e, expected); }
         .ARRAY_REPEAT => { return check_array_lit(e, expected); }
         .ERROR_VAL => {
-            let code = error_code_of(e.name);
+            let code = error_code_here(e.name);
             if code == 0 {
                 _ = dg.err(ast.name_span_of(e), "E0650",
                            u.f1("'error.%s' is not declared; add it to an 'error { ... }' block", e.name));
@@ -5412,7 +5586,7 @@ fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
             }
             .Error(name) => {
                 if t.kind == ast.TY_ERROR {
-                    let code = error_code_of(name);
+                    let code = error_code_here(name);
                     if code == 0 {
                         _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
                     } else if not set_has(t.decl, name) {
@@ -6170,7 +6344,7 @@ fn insn_check(e: *mut ast.Expr, id: i32) *mut ast.Type {
     return first;
 }
 
-let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+threadlocal let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 
 fn arch_name(a: i32) []u8 {
     let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
@@ -6296,9 +6470,36 @@ pub fn is_std_module(m: *mut ast.Module) bool {
     return (m.path.len > n) and u.starts(m.path, rp) and (m.path[n] == '/');
 }
 
+/// What a worker thread starts from (units.ax): the main thread's program.
+pub struct WorkerStart {
+    prog: *mut Program,
+    std_dir: []u8,
+    cwd: []u8,
+}
+
+pub fn worker_start() WorkerStart {
+    return WorkerStart.{ prog: g_prog, std_dir: g_std_dir, cwd: g_cwd };
+}
+
+/// On a worker thread, after u.worker_begin.
+pub fn worker_begin(ws: *WorkerStart) void {
+    g_prog = ws.prog;
+    g_std_dir = ws.std_dir;
+    g_cwd = ws.cwd;
+}
+
 // Load, parse, resolve and type-check the program rooted at `path`.
 // False if any errors were reported.
 pub fn run(path: []u8, opts: *SemaOptions) bool {
+    // (a thread's second run, as axiom lsp's main thread makes, starts
+    // afresh too)
+    C = u.nil.[FnCtx]();
+    mod_by_path = u.SymMap.[*mut ast.Module].{ keys: u.nil.[usize](), vals: u.nil.[*mut ast.Module](), cap: 0, len: 0 };
+    mod_state = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    size_checks = u.List.[SizeCheck].empty();
+    gate_reported = u.List.[u32].empty();
+    g_self_dep = dnil();
+    g_error_use_unknown = false;
     g_prog = u.new.[Program]();
     g_std_dir = opts.std_dir;
     g_cwd = u.cwd();
@@ -6310,14 +6511,21 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
     for x in opts.extra_files {
         _ = load_module(x, u.nil.[u.Span]());
     }
+    // (the modules taken as checked are not checked again, but count in
+    // every program-wide step)
     for i in 0..g_prog.modules.len {
-        register_module(g_prog.modules.get(i));
+        if not g_prog.modules.get(i).base {
+            register_module(g_prog.modules.get(i));
+        }
     }
     assign_error_codes();
 
     // Resolve all declarations.
     for mi in 0..g_prog.modules.len {
         let m = g_prog.modules.get(mi);
+        if m.base {
+            continue;
+        }
         for i in 0..m.decls.len {
             let d = m.decls.get(i);
             if (d.kind == ast.D_IMPORT) or ((d.kind == ast.D_ERROR) and u.isnos(d.name)) {
@@ -6332,6 +6540,9 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
     // Infinite-size types.
     for mi in 0..g_prog.modules.len {
         let m = g_prog.modules.get(mi);
+        if m.base {
+            continue;
+        }
         for i in 0..m.decls.len {
             let d = m.decls.get(i);
             if ((d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION)) and contains_by_value(d.ty, d, 0) {
@@ -6364,10 +6575,14 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
             let d = m.decls.get(i);
             let k = d.kind;
             if k == ast.D_GLOBAL {
-                check_global(d);
+                if not m.base {
+                    check_global(d);
+                }
                 g_prog.globals.push(d);
             } else if k == ast.D_FN {
-                check_fn_body(d);
+                if not m.base {
+                    check_fn_body(d);
+                }
                 if d.is_test {
                     // Tests run for the root module and, in a package, for the
                     // root package's modules; outside packages, for every
@@ -6390,7 +6605,9 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
                 g_prog.host_fns.push(d);
             } else if (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM) {
                 for j in 0..d.methods.len {
-                    check_fn_body(d.methods.get(j));
+                    if not m.base {
+                        check_fn_body(d.methods.get(j));
+                    }
                     g_prog.fns.push(d.methods.get(j));
                 }
             }
@@ -6406,6 +6623,9 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
 fn inline_reaches(from: *mut ast.Decl, to: *mut ast.Decl, mark: i32) bool {
     if from == to {
         return true;
+    }
+    if from.module.base {
+        return false;  // (calls nothing of this run's)
     }
     if from.inline_mark == mark {
         return false;
@@ -6425,6 +6645,9 @@ fn check_inline_cycles() void {
     let mut mark: i32 = 0;
     for i in 0..g_prog.fns.len {
         let g = g_prog.fns.get(i);
+        if g.module.base {
+            continue;  // (checked)
+        }
         for k in 0..g.inline_callees.len {
             let f = g.inline_callees.get(k);
             mark += 1;

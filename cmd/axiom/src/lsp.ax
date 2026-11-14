@@ -5,33 +5,47 @@
 //   axiom lsp [--target=<t>] [--std=<dir>]
 //
 // The server keeps the text of the editor's open documents and answers each
-// request by running this compiler again as `axiom ide` (ide.ax), with those
-// texts on its standard input: one short process per question. Nothing
-// carries over from one check to the next, so the compiler stays the one-shot
-// program it is (an arena that is never freed, tables in globals). The options
-// given to `axiom lsp` are passed on to every `axiom ide`.
+// request in this process, as `axiom ide` (ide.ax) would with those texts on
+// its standard input.
+//
+// It does not check the whole program for each request. A check runs on a
+// thread of its own, which gives back all it allocated when it ends, and
+// finds what the main thread has checked before (sema.ax's kept modules) as
+// it does the main thread's strings, types and files (util.ax's worker
+// threads): it checks only the modules it does not find there, so usually
+// the documents being edited. The main thread keeps the modules that a
+// check found clean, once no message is waiting: it checks them once more
+// and keeps them for the session, so that std/ and the files not being
+// edited are checked once. A kept module is dropped (with what imports it)
+// when its file changes on disk or its open document's text is no longer the
+// file's, and one being edited in the editor is never kept.
 //
 // Diagnostics are published for a document after it changes, once every
 // message that has already arrived has been handled, so a burst of edits
 // costs one check. Saving a document checks every open one again, since
 // they may import it.
 // =============================================================================
+import "ast.ax" as ast;
 import "diag.ax" as dg;
+import "ide.ax" as ide;
+import "sema.ax" as sema;
 import "std/encoding/json" as json;
-import "std/mem" as smem;
-import "std/os/process" as sproc;
+import "std/thread" as thread;
+import "target.ax" as tg;
+import "types.ax" as ty;
 import "util.ax" as u;
 
 struct Doc {
     uri: []mut u8,  // as the client sent it
     path: []mut u8,
+    real: []mut u8,  // its real path (or path, for a file not on disk)
     text: []mut u8,
-    dirty: bool,  // diagnostics to publish
+    dirty: bool,   // diagnostics to publish
+    edited: bool,  // changed since it was opened (then its module is not kept)
 }
 
 let mut docs: u.List.[*mut Doc] = u.List.[*mut Doc].{ data: @ptr_from_int(*mut *mut Doc, 0), len: 0, cap: 0 };
-let mut self_exe: []u8 = "";
-let mut ide_args: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut g_std: []u8 = "";
 let mut shutting_down: bool = false;
 
 // -----------------------------------------------------------------------------
@@ -266,6 +280,9 @@ fn find_doc(uri: []u8) *mut Doc {
 }
 
 fn set_text(d: *mut Doc, text: []u8) void {
+    if not u.str_eq(d.text, text) {
+        d.edited = true;
+    }
     drop(d.text);
     d.text = keep(text);
     d.dirty = true;
@@ -280,6 +297,8 @@ fn open_doc(uri: []u8, text: []u8) void {
     let d = @ptr_cast(*mut Doc, u.calloc(1, @size_of(Doc)));
     d.uri = keep(uri);
     d.path = keep(path_of(uri));
+    let r = u.real_path(d.path);
+    d.real = keep(u.pick(u.isnos(r), d.path, r));
     d.text = keep(text);
     d.dirty = true;
     docs.push(d);
@@ -294,6 +313,7 @@ fn close_doc(uri: []u8) void {
         }
         drop(d.uri);
         drop(d.path);
+        drop(d.real);
         drop(d.text);
         u.free(@ptr_cast(*mut void, d));
         for j in i + 1..xs.len {
@@ -305,46 +325,175 @@ fn close_doc(uri: []u8) void {
 }
 
 // -----------------------------------------------------------------------------
-// Asking the compiler
+// The modules kept checked
 // -----------------------------------------------------------------------------
-// Runs `axiom ide <path> --query=<query> <more>... <ide_args>...` with the open
-// documents on its standard input; its answer (JSON), or a nil slice.
-fn ask(query: []u8, path: []u8, more: [][]u8) []u8 {
-    let mut cmd = sproc.Command.init(self_exe);
-    defer cmd.deinit();
-    let qa = u.cat2("--query=", query);
-    cmd.arg("ide") catch return u.nosym();
-    cmd.arg(path) catch return u.nosym();
-    cmd.arg(qa) catch return u.nosym();
-    cmd.args(more) catch return u.nosym();
-    cmd.args(ide_args.items()) catch return u.nosym();
-    cmd.stdin(sproc.Stdio.PIPE);
-    cmd.stdout(sproc.Stdio.PIPE);
-    let mut child = cmd.spawn() catch |e| {
-        log(u.f2("axiom lsp: cannot run %s: %s", self_exe, @error_name(e)));
-        return u.nosym();
-    };
-    let mut b = u.Buf.init();
+struct Kept {
+    m: *mut ast.Module,
+    stamp: [2]i64,  // its file's size and time when it was kept
+}
+
+let mut kept: u.List.[Kept] = u.List.[Kept].{ data: @ptr_from_int(*mut Kept, 0), len: 0, cap: 0 };
+// The modules checks found clean, to check and keep (real paths, heap); and
+// those that were to be kept but were not, not tried again.
+let mut to_keep: u.List.[[]mut u8] = u.List.[[]mut u8].{ data: @ptr_from_int(*mut []mut u8, 0), len: 0, cap: 0 };
+let mut not_kept: u.List.[[]mut u8] = u.List.[[]mut u8].{ data: @ptr_from_int(*mut []mut u8, 0), len: 0, cap: 0 };
+
+fn listed(xs: *u.List.[[]mut u8], p: []u8) bool {
+    for i in 0..xs.len {
+        if u.str_eq(xs.get(i), p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Brings the overlays (the open documents) up to date, and drops the kept
+// modules that are no longer what their files hold, with every kept module
+// that imports one of them.
+fn sync() void {
+    u.g_overlays.len = 0;
     for i in 0..docs.len {
         let d = docs.get(i);
-        b.s(d.path);
-        b.c('\n');
-        b.s(u.zdec(d.text.len));
-        b.c('\n');
-        b.s(d.text);
+        u.g_overlays.push(u.Overlay.{ path: d.real, text: d.text, edited: d.edited });
     }
-    child.stdin.write_all(b.view()) catch {};
-    child.stdin.close();
-    let out = child.stdout.read_all() catch u.nil_slice.[u8]();
-    let st = child.wait() catch sproc.Status.{ code: -1, signal: 0 };
-    let r = u.dup(out);
-    if out.len > 0 {
-        smem.free(out);
+    let ks = kept.items();
+    let mut n: usize = 0;
+    for i in 0..ks.len {
+        let k = ks[i];
+        let m = k.m;
+        let st = u.file_stamp(m.path);
+        let mut good = (st[0] == k.stamp[0]) and (st[1] == k.stamp[1]);
+        let ov = u.overlay_text(m.path);
+        if not u.isnos(ov) and not u.str_eq(ov, m.file.text) {
+            good = false;
+        }
+        for j in 0..m.decls.len {
+            let d = m.decls.get(j);
+            if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) and (sema.kept_module(d.imported.path) != d.imported) {
+                good = false;  // (kept before m: dropped above)
+            }
+        }
+        if not good {
+            sema.evict(m.path);
+            continue;
+        }
+        ks[n] = k;
+        n += 1;
     }
-    if not st.success() {
-        log(u.f3("axiom lsp: axiom ide --query=%s %s failed (exit status %s)", query, path, u.idec(st.code)));
+    kept.len = n;
+}
+
+// On the main thread, between messages: checks the modules to keep (each
+// for good, which is why only clean ones are) and keeps those still clean.
+fn keep_checked() void {
+    if to_keep.len == 0 {
+        return;
+    }
+    sync();
+    let mut paths = u.List.[[]u8].empty();
+    for i in 0..to_keep.len {
+        let p = to_keep.get(i);
+        if u.isnil(sema.kept_module(u.intern(p))) {
+            paths.push(p);
+        }
+    }
+    if paths.len > 0 {
+        dg.clear();
+        let so = sema.SemaOptions.{ std_dir: g_std, extra_files: paths.items()[1..] };
+        _ = sema.run(paths.get(0), &so);
+        let cs = sema.clean();
+        for i in 0..cs.len {
+            let m = cs.get(i);
+            sema.admit(m);
+            kept.push(Kept.{ m: m, stamp: u.file_stamp(m.path) });
+        }
+        dg.clear();
+        for i in 0..paths.len {
+            let p = paths.get(i);
+            if u.isnil(sema.kept_module(u.intern(p))) and not listed(&not_kept, p) {
+                not_kept.push(keep(p));
+            }
+        }
+    }
+    for i in 0..to_keep.len {
+        drop(to_keep.get(i));
+    }
+    to_keep.len = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Asking the compiler
+// -----------------------------------------------------------------------------
+// A question, answered on a thread of its own.
+struct Query {
+    path: []u8,
+    args: [][]u8,  // axiom ide's options (ide.option)
+    us: u.WorkerStart,
+    ts: ty.WorkerStart,
+    features: u64,
+    out: []u8,    // the answer (u.keep_dup), or a nil slice
+    clean: []u8,  // the modules found clean, a path per line (u.keep_dup), or a nil slice
+}
+
+fn answer(q: *mut Query) void {
+    u.worker_begin(&q.us);
+    ty.worker_begin(&q.ts);
+    tg.g_features = q.features;
+    for a in q.args {
+        _ = ide.option(a);
+    }
+    let out = ide.answer(q.path, g_std);
+    if not u.isnos(out) {
+        q.out = u.keep_dup(out);
+    }
+    if u.notnil(sema.g_prog) {
+        let cs = sema.clean();
+        let mut b = u.Buf.init();
+        for i in 0..cs.len {
+            b.s(cs.get(i).path);
+            b.c('\n');
+        }
+        if b.len() > 0 {
+            q.clean = u.keep_dup(b.done());
+        }
+    }
+    u.worker_end();
+}
+
+// The answer to `--query=<query> <more>...` about the document at `path`
+// (JSON), or a nil slice.
+fn ask(query: []u8, path: []u8, more: [][]u8) []u8 {
+    sync();
+    let mut args = u.List.[[]u8].empty();
+    args.push(u.cat2("--query=", query));
+    for a in more {
+        args.push(a);
+    }
+    let mut q = Query.{ path: path, args: args.items(), us: u.worker_start(), ts: ty.worker_start(),
+                        features: tg.g_features, out: u.nosym(), clean: u.nosym() };
+    let t = thread.spawn(answer, &mut q) catch |e| {
+        log(u.f1("axiom lsp: cannot start a thread: %s", @error_name(e)));
+        return u.nosym();
+    };
+    t.join();
+    if not u.isnos(q.clean) {
+        let mut rest = q.clean;
+        while rest.len > 0 {
+            let nl = u.find(rest, '\n');
+            let p = rest[0..@int_cast(usize, nl)];
+            rest = rest[@int_cast(usize, nl) + 1..];
+            if not listed(&to_keep, p) and not listed(&not_kept, p) {
+                to_keep.push(keep(p));
+            }
+        }
+        u.free_heap(q.clean);
+    }
+    if u.isnos(q.out) {
+        log(u.f2("axiom lsp: no answer to %s about %s", query, path));
         return u.nosym();
     }
+    let r = u.dup(q.out);
+    u.free_heap(q.out);
     if r.len == 0 {
         return u.nosym();
     }
@@ -482,14 +631,13 @@ fn handle(body: []u8) bool {
     return true;  // a notification we do not need
 }
 
-// Serves the client on standard input and output until it says to exit.
-pub fn run(args: [][]u8, exe: []u8) i32 {
-    self_exe = exe;
-    for a in args {
-        ide_args.push(a);
-    }
+// Serves the client on standard input and output until it says to exit
+// (the target set, with the standard library in `std_dir`).
+pub fn run(std_dir: []u8) i32 {
+    g_std = std_dir;
     loop {
-        // between bursts of messages: diagnostics for what changed
+        // between bursts of messages: diagnostics for what changed, then
+        // what to keep
         if not have_message() {
             for i in 0..docs.len {
                 let d = docs.get(i);
@@ -499,6 +647,9 @@ pub fn run(args: [][]u8, exe: []u8) i32 {
                     u.scratch_end();
                 }
             }
+        }
+        if not have_message() {
+            keep_checked();
         }
         let body = next_message();
         if u.isnos(body) {

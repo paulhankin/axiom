@@ -169,13 +169,22 @@ pub struct WorkerStart {
 }
 
 pub fn worker_start() WorkerStart {
-    let tab = @slice_from_ptr(ttab, ttab_cap);
-    for i in 0..ttab_cap {
-        let t = tab[i];
-        if u.notnil(t) and not t.has_params {
-            _ = type_size(t);
+    // (laying out a type can make types, its fields' (even in a scratch
+    // scope, the memory is for good), and so grow the table: until no more)
+    let depth = u.scratch_suspend();
+    let mut n: usize = 0;
+    while n != ttab_len {
+        n = ttab_len;
+        let mut i: usize = 0;
+        while i < ttab_cap {
+            let t = @slice_from_ptr(ttab, ttab_cap)[i];
+            if u.notnil(t) and not t.has_params and not t.layout_done {
+                _ = type_size(t);
+            }
+            i += 1;
         }
     }
+    u.scratch_resume(depth);
     return WorkerStart.{ next_id: next_type_id };
 }
 
@@ -516,13 +525,16 @@ pub fn type_prim(p: i32) *mut ast.Type {
     return t_invalid;
 }
 
-// Anonymous struct decls are interned by (field names, field types).
+// Anonymous struct decls are interned by (field names, field types): a
+// worker thread finds the main thread's, and keeps those it makes.
 let mut anon_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0),
                                                                       len: 0, cap: 0 };
+threadlocal let mut local_anon_decls: u.List.[*mut ast.Decl] =
+    u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0, cap: 0 };
 
-pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Span) *mut ast.Decl {
-    for i in 0..anon_decls.len {
-        let d = anon_decls.get(i);
+fn find_anon(ds: *u.List.[*mut ast.Decl], fields: *u.List.[ast.Field]) *mut ast.Decl {
+    for i in 0..ds.len {
+        let d = ds.get(i);
         if d.fields.len != fields.len {
             continue;
         }
@@ -541,6 +553,18 @@ pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Sp
             return d;
         }
     }
+    return u.nil.[ast.Decl]();
+}
+
+pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Span) *mut ast.Decl {
+    let found = find_anon(&anon_decls, &fields);
+    if u.notnil(found) {
+        return found;
+    }
+    let mine = find_anon(&local_anon_decls, &fields);
+    if u.notnil(mine) {
+        return mine;
+    }
     let d = u.new.[ast.Decl]();
     d.kind = ast.D_STRUCT;
     d.anon = true;
@@ -550,7 +574,11 @@ pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Sp
     d.fields = fields;
     d.state = 2;
     d.ty = type_named(d, no_types());
-    anon_decls.push(d);
+    if u.is_worker() {
+        local_anon_decls.push(d);
+    } else {
+        anon_decls.push(d);
+    }
     return d;
 }
 
