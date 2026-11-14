@@ -59,6 +59,8 @@ struct Macro {
     builtin: i32,
     disabled: bool,
     protected: bool,  // may not be defined or undefined (C 6.10.8)
+    ours: bool,       // defined by one of the compiler's headers with the system's library
+    sys: bool,        // defined by one of the system's headers (--c-lib=system)
     span: u.Span,     // where it is defined
 }
 
@@ -673,6 +675,7 @@ fn operand(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, i: usize, next
         let mut c = t.*;
         c.span = inv.span;
         c.exp = true;
+        c.sys = m.sys;
         l.push(c);
     }
     return frozen(&mut l);
@@ -744,6 +747,7 @@ fn substitute(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, lo: usize, 
         let mut c = t.*;
         c.span = inv.span;
         c.exp = true;
+        c.sys = m.sys;
         out.push(c);
         i += 1;
     }
@@ -1078,8 +1082,10 @@ fn define_params(P: *mut PP, m: *mut Macro, line: []lx.PTok, i0: usize, params: 
         }
         params.push(p.name);
         i += 1;
-        if (i < line.len) and lx.is_punct(&line[i], ct.P_ELLIPSIS) and P.o.gnu {
-            // `name...` (a GNU dialect): the variable arguments, named
+        if (i < line.len) and lx.is_punct(&line[i], ct.P_ELLIPSIS) and (P.o.gnu or in_system_header(P)) {
+            // `name...` (a GNU dialect, and the system's headers, which use
+            // it in every standard: --c-lib=system): the variable
+            // arguments, named
             m.variadic = true;
             i += 1;
             ok = (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN);
@@ -1206,7 +1212,25 @@ fn poisoned(sp: u.Span, name: []u8) void {
     _ = dg.err(sp, "C1086", u.f1("'%s' is poisoned (#pragma GCC poison)", name));
 }
 
-fn do_define(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
+// With the system's C library: the comparison macros of <math.h> (C17
+// 7.12.14), which the system's header defines for a compiler that is not
+// its own with GNU statement expressions, are the compiler's built-ins (as
+// its own <math.h> defines them), in every standard.
+fn system_math_macro(P: *mut PP, line: []lx.PTok) []lx.PTok {
+    let names = ["isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered"];
+    for n in names {
+        if u.str_eq(n, line[0].name) and in_system_header(P) {
+            return lx.lex_all(u.f2("%s(x, y) __builtin_axiom_%s(x, y)", n, n), P.o.std, line[0].span);
+        }
+    }
+    return line;
+}
+
+fn do_define(P: *mut PP, line0: []lx.PTok, sp: u.Span) void {
+    let mut line = line0;
+    if (line.len > 0) and (line[0].kind == lx.PK_IDENT) and P.o.system_lib {
+        line = system_math_macro(P, line);
+    }
     if line.len == 0 {
         _ = dg.err(sp, "C1052", "macro names must be identifiers, after #define");
         return;
@@ -1221,6 +1245,14 @@ fn do_define(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
     }
     let nt = &line[0];
     if not definable(P, nt, "define") {
+        return;
+    }
+    if P.o.gnu and (nt.kind == lx.PK_IDENT) and in_system_header(P) and (ct.keyword_id(nt.name, P.o.std) == 0) and
+       (ct.keyword_id_in(nt.name, P.o.std, true) != 0) {
+        // the system's headers' definitions of the GNU keywords, for a
+        // compiler that is not their own (`__attribute__(x)` as nothing,
+        // `__extension__`, ...): in a GNU dialect they are this one's
+        // keywords, which stay (the program's attributes too)
         return;
     }
     let m = u.new.[Macro]();
@@ -1244,12 +1276,21 @@ fn do_define(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
     }
     let old = lookup(P, m.name);
     if u.notnil(old) {
+        if old.ours and in_system_header(P) {
+            // the system's headers define what the compiler's own headers
+            // (--c-lib=system: <float.h>'s INFINITY and NAN in C23, ...)
+            // define: they are the implementation's, and the compiler's
+            // definition stays
+            return;
+        }
         if not same_def(old, m) {
             let d = dg.err(nt.span, "C1060", u.f1("macro '%s' redefined differently", m.name));
             dg.note(d, old.span, "the previous definition");
         }
         return;
     }
+    m.ours = in_compiler_header(P);
+    m.sys = in_system_header(P);
     P.macros.put(m.name, m);
     if P.mac {
         record_macro(P, 1, nt.span, line[line.len - 1].span.end, m.name);
@@ -1751,13 +1792,30 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
     return u.nosym();
 }
 
+// The file `name` in the system's header directories (--c-lib=system): the
+// #include_next of a compiler's header that wraps the system's (<limits.h>),
+// or nil. P.found_index is where it was found.
+fn find_system_file(P: *mut PP, name: []u8) []u8 {
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    for k in 0..P.o.system_dirs.len {
+        let p = join(P.o.system_dirs[k], name);
+        if u.is_file(p) {
+            P.found_index = n + @int_cast(i32, k);
+            return p;
+        }
+    }
+    P.found_index = -1;
+    return u.nosym();
+}
+
 // With the system's C library (--c-lib=system): is `name` one of the
 // headers that are the compiler's still (those of the language itself that
 // the system's library does not provide: its <limits.h> and <stdint.h>,
 // which have its POSIX limits and use its types, are its own)?
 fn system_own_header(name: []u8) bool {
     let names = ["float.h", "iso646.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h", "stddef.h",
-                 "stdnoreturn.h", "stdatomic.h", "complex.h", "tgmath.h", "axc/types.h", "axc/wchar_limits.h"];
+                 "stdnoreturn.h", "stdatomic.h", "complex.h", "tgmath.h", "limits.h", "axc/types.h",
+                 "axc/wchar_limits.h"];
     for x in names {
         if u.str_eq(x, name) {
             return true;
@@ -1771,6 +1829,13 @@ fn in_system_header(P: *mut PP) bool {
     let d = cur_src(P).dir_index;
     let n = @int_cast(i32, P.o.include_dirs.len);
     return P.o.system_lib and (d >= n) and (d < (n + @int_cast(i32, P.o.system_dirs.len)));
+}
+
+// With the system's C library (--c-lib=system), is the file being read one
+// of the compiler's own headers (system_own_header)?
+fn in_compiler_header(P: *mut PP) bool {
+    let n = @int_cast(i32, P.o.include_dirs.len + P.o.system_dirs.len);
+    return P.o.system_lib and (cur_src(P).dir_index == n);
 }
 
 // Is `name` one of the compiler's headers that a freestanding program has
@@ -1907,7 +1972,9 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
     extra(line, k, u.pick(next, "include_next", "include"));
     let name = hn[1..hn.len - 1];
     let mut path = u.nosym();
-    if next {
+    if next and in_compiler_header(P) {
+        path = find_system_file(P, name);
+    } else if next {
         path = find_file_from(P, name, next_index(P));
     } else {
         path = find_file(P, name, hn[0] == '"');
@@ -2845,7 +2912,7 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         do_undef(P, ts, sp);
     } else if u.str_eq(name, "include") {
         do_include(P, ts, sp, false);
-    } else if u.str_eq(name, "include_next") and P.o.gnu {
+    } else if u.str_eq(name, "include_next") and (P.o.gnu or in_compiler_header(P)) {
         do_include(P, ts, sp, true);
     } else if u.str_eq(name, "import") and P.o.gnu {
         // (a GNU dialect's: #include of a file not read again after it, as

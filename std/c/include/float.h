@@ -104,6 +104,12 @@
 #define FLT_IS_IEC_60559 1
 #define DBL_IS_IEC_60559 1
 #define LDBL_IS_IEC_60559 1
+#ifdef __AXIOM_SYSTEM_C_LIB__
+/* (the system's <math.h>, included before, defines them too: these are the
+   implementation's) */
+#undef INFINITY
+#undef NAN
+#endif
 #define INFINITY __builtin_inff()
 #define NAN __builtin_nanf("")
 /* (signaling NaNs, C23 5.2.4.2.2, F.2.1: constants that stay signaling in

@@ -395,7 +395,9 @@ error and their order, `wasm-flags:` for a WebAssembly build's extensions and
 threads). `c/lib/prog/` holds larger hosted programs (a text processor with wide
 I/O, a calculator that recovers from errors with `longjmp`, sorting and searching of
 200000 records, date reports, a work queue of `<threads.h>` and atomics, numeric
-programs in `long double`), whose output was compared with the system's compiler and
+programs in `long double`, complex arithmetic and `<tgmath.h>`, the bit operations of
+`_BitInt`, `__int128`, `<stdbit.h>` and `<stdckdint.h>`, every conversion of `printf` and
+`scanf` with a logger's `va_list` passed down), whose output was compared with the system's compiler and
 library at -O0 and -O2 (the differences, which are implementation-defined, are said in
 each); `tools/gen_c_programs.py --hosted` writes random hosted programs for that
 comparison, which print with `printf` and pass every value through the library's

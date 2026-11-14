@@ -3,6 +3,26 @@
 #ifndef __AXIOM_LIMITS_H
 #define __AXIOM_LIMITS_H
 
+#ifdef __AXIOM_SYSTEM_C_LIB__
+/* With the system's C library (--c-lib=system) its <limits.h>, with its POSIX
+   limits, and what C23 adds to it that it leaves to the compiler. */
+#include_next <limits.h>
+#if __STDC_VERSION__ >= 202311L
+#ifndef __STDC_VERSION_LIMITS_H__
+#define __STDC_VERSION_LIMITS_H__ 202311L
+#endif
+#ifndef BOOL_MAX
+#define BOOL_MAX 1
+#endif
+#ifndef BOOL_WIDTH
+#define BOOL_WIDTH 1
+#endif
+#ifndef BITINT_MAXWIDTH
+#define BITINT_MAXWIDTH 65535
+#endif
+#endif
+#else
+
 #if __STDC_VERSION__ >= 202311L
 #define __STDC_VERSION_LIMITS_H__ 202311L
 #endif
@@ -76,5 +96,7 @@
 #define ULLONG_WIDTH 64
 #define BITINT_MAXWIDTH 65535
 #endif
+
+#endif /* __AXIOM_SYSTEM_C_LIB__ */
 
 #endif

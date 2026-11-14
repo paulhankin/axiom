@@ -504,13 +504,27 @@ the language itself, which are the compiler's whatever the order (`<float.h>`,
 `<stdarg.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`,
 `<iso646.h>`, `<stdatomic.h>`, `<stdbit.h>`, `<stdckdint.h>`, `<complex.h>`,
 `<tgmath.h>`; the system's `<limits.h>` and `<stdint.h>` are its, with their POSIX
-limits). Those headers are compiled as the system's: the macros of the platform they
+limits, the compiler's `<limits.h>` including the system's and adding what C23 gives
+it that the system's leaves to the compiler: `BITINT_MAXWIDTH`, `BOOL_MAX`,
+`BOOL_WIDTH` and `__STDC_VERSION_LIMITS_H__`, where it has not defined them).
+Those headers are compiled as the system's: the macros of the platform they
 test are defined (`__x86_64__` or `__aarch64__`, `__linux__`, `__unix__`, `__ELF__`,
 `__LP64__`, `__SIZEOF_<T>__`, `__BYTE_ORDER__`, `__CHAR_BIT__`, and
 `__AXIOM_SYSTEM_C_LIB__`), the definitions they make of the implementation's own macros
-(`__STDC_ISO_10646__`, ...) keep the compiler's, their warnings and the errors that say a
+(`__STDC_ISO_10646__`, ...) keep the compiler's, as do those they make of the macros of
+the compiler's headers (C23's `INFINITY` and `NAN`, which `<float.h>` and their
+`<math.h>` both define), their `<math.h>`'s comparison macros (`isgreater` ...,
+statement expressions for a compiler that is not theirs) are the compiler's built-ins,
+the floating constants beyond their types' range in their macros (`HUGE_VAL` is
+`1e10000` there) are the infinities they mean, their warnings and the errors that say a
 feature is a later standard's (or an empty declaration) are not shown, and in a GNU
-dialect `_FloatN` and `__float128` are not keywords there (they define them as types).
+dialect `_FloatN` and `__float128` are not keywords there (they define them as types),
+while the definitions they make of the dialect's keywords (`__attribute__(x)` as nothing,
+`__extension__`, ...) are not made: those stay keywords, in the program's code too.
+Under an ISO standard their own text may still use the GNU dialects' spellings of types
+and named variadic macro parameters (`name...`), which they take their compiler to have
+(AArch64 Linux's `<signal.h>` reaches kernel headers with `__signed__` and
+`__uint128_t`): in them, and in their macros' expansions, those are accepted.
 `__GNUC__` is not defined, so they use what they have for other compilers. The standard
 must be C99 or later, the C options the platform's ABI's (`--c-int`, `--c-long`), and
 `--c-freestanding` is not given. `setjmp` and the other functions POSIX says return twice
@@ -1713,7 +1727,7 @@ exactly what works (there is no option that defines `__GNUC__`).
 
 | Extension | |
 |---|---|
-| Keywords | `__extension__` (ignored), `__inline`, `__inline__`, `__const`, `__const__`, `__volatile`, `__volatile__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__alignof`, `__alignof__` (also of an expression: `__alignof__ x`, a member's own alignment), `__typeof`, `__typeof__` and `typeof` in every dialect, `__thread`, `asm`, `__asm`, `__asm__`; `inline` in gnu89. |
+| Keywords | `__extension__` (ignored), `__inline`, `__inline__`, `__const`, `__const__`, `__volatile`, `__volatile__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__alignof`, `__alignof__` (also of an expression: `__alignof__ x`, a member's own alignment), `__typeof`, `__typeof__` and `typeof` in every dialect, `__thread`, `__int128_t` and `__uint128_t` (`__int128` and `unsigned __int128`, as built-in type names), `asm`, `__asm`, `__asm__`; `inline` in gnu89. |
 | C99 and C11 in older dialects | From gnu89: `//` comments, `long long`, mixed declarations and code, designated initializers, compound literals, a trailing comma in an enumerator list, variable length arrays, flexible array members, variadic macros and empty macro arguments, hexadecimal floating constants, `_Pragma`, `__func__`, initializers of aggregates that are not constants; from gnu89 and gnu99: anonymous structures and unions; in every dialect: attributes `[[...]]` and `{}`. |
 | `__auto_type x = e;` | x has e's type (as C23's `auto`). |
 | `_Decimal32`, `_Decimal64`, `_Decimal128` before C23 | The decimal floating types and their constants (`1.5dd`), as in C23 ("Decimal floating types"); `__STDC_IEC_60559_DFP__` is defined in C23 modes only. |
