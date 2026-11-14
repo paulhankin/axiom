@@ -19,7 +19,7 @@ parity check in the test suite can be widened once item 6 lands.
 | 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` |
 | 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries |
 | 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
-| 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke |
+| 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke (done: see §4) |
 | 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags |
 | 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` |
 
@@ -389,7 +389,72 @@ went down about 3.5% (29.8 s to 28.7 s); the peak memory went up by 130 MB
 
 ## 4. Two-Tier Arena Incremental Session for `axiom lsp`
 
-### Current state
+### Status
+
+**Done**, on item 1's thread-local state and worker overlays rather than
+new arenas. `axiom lsp` answers every request in its own process, on a
+thread of its own per request (`lsp.ask`), and no longer runs `axiom ide`
+(which stays, as the same code: `ide.answer`).
+
+- **The two tiers are threads.** The long-lived tier is the main thread's
+  state: the modules it checked and keeps (`sema.ax`'s `base_by_path`,
+  `sema.admit`), with their syntax trees, types, interned strings and files
+  in the main thread's tables. A request's check is a worker thread
+  (`u.worker_begin`): it finds those tables first, read only, and keeps what
+  it makes in its own (item 1's overlays); when it ends, all it allocated
+  goes back (`u.worker_end`), so a long session's memory does not grow with
+  edits. The front end's per-run state (`sema.ax`, `package.ax`, `ide.ax`,
+  `u.g_overlays`, `types.ax`'s anonymous structs) became thread-local, so
+  a request starts as a new process would; the main thread's own second run
+  resets sema's (`sema.run`).
+- **A run takes kept modules as they are.** `sema.load_module` comes to a
+  kept module where it would load it, takes it and its imports in the same
+  order (`take_base`: `g_prog.modules` and the files' order, `u.file_rank`,
+  are those of a run from nothing), and every phase but the program-wide
+  ones (error codes, exported names, the globals' total size) skips it.
+- **What is kept.** After a request, the main thread checks again (once no
+  message waits) the modules the request found clean (`sema.clean`) and
+  keeps those still clean: nothing reported about them, their imports kept,
+  their text the file's and not an edited document's, and every error name
+  their code names declared in them or what they import (error names are
+  the program's: `ast.Module.error_uses`). So the answers are those of a
+  check from nothing. Kept modules are dropped (with what imports them) when
+  their file's size or time changes or an open document's text differs
+  (`lsp.sync`, each request); a document edited in the editor is never kept.
+- Instead of interface-hash invalidation, the edited documents themselves
+  are always checked (in a millisecond or two); what imports them is not
+  kept while they are edited.
+- Found on the way, and fixed (they affected item 1's workers too): reading
+  an empty `u.SymMap` (`get`, `has`) allocated its table, so a worker could
+  write the main thread's maps (a decl's `method_map`, say) with memory it
+  then freed; and `ty.worker_start` read its table while laying out types
+  grew it (laying out a struct instance makes its fields' types), and made
+  those types in a scratch scope when called in one.
+- `AXIOM_POISON` also fills a worker's memory when it ends.
+
+Measured (x86-64, 4 processors): a file importing 20 large `std/` modules
+(json, yaml, toml, xml, pdf, svg, chart, http, tls, http2, zstd, xz, brotli,
+x509, rsa, ...): 400-430 ms per request before (a process each), 2.6-3.5 ms
+after, for hover, definition, completion, signature help and diagnostics
+after an edit (the first check of a program costs what it did, and keeping
+its modules about as much again, between messages); references and rename
+(which walk every module) 90 ms. The compiler's own `main.ax`: 760 ms to
+10 ms. 500 edits (bodies and signatures alternately, each with a publish
+and a hover): the server's memory stays at 142.3 MB (after the first 50).
+A differential test (`axiom lsp`'s answers against `axiom ide`'s, for
+sampled positions of several examples, a std module, compiler sources,
+before and after edits) found no difference in some 9000 answers; the
+suite's `axiom lsp` case does that for a small package, through edits in
+the editor and on disk.
+
+What remains: references and rename walk every module of the program on
+each request (the kept modules' names could be indexed once); a module
+kept and later dropped stays in the main thread's memory (each change on
+disk of a kept file, or each close of an edited document that is then kept,
+costs one copy of that module); a host without threads gets no answers (it
+had none before: no process could be spawned there either).
+
+### Current state (before this item)
 
 `lsp.ax` (`cmd/axiom/src/lsp.ax:354-460`) speaks JSON-RPC over stdio and keeps
 open editor buffers in memory, but delegates every semantic action (`check`,

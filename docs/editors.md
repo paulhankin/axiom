@@ -7,9 +7,11 @@ signature help, document symbols and formatting (`axiom fmt`). It needs the comp
 on the `PATH` (or a path to it) and treats `.ax` files; it checks a file as part of its
 package when there is an `axiom.toml` above it.
 
-`axiom lsp` accepts `--target=<t>` (the target the checks assume; `native` is a good
-default on a development machine, `wasm32` is the compiler's own default) and
-`--std=<dir>` (spec §16.1), which the snippets below pass as arguments.
+`axiom lsp` checks the standard library and the files not being edited once per
+session, so that its answers take milliseconds. It accepts `--target=<t>` (the target
+the checks assume; `native` is a good default on a development machine, `wasm32` is
+the compiler's own default) and `--std=<dir>` (spec §16.1), which the snippets below
+pass as arguments.
 
 ## Visual Studio Code
 

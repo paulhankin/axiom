@@ -4105,6 +4105,125 @@ if (!skipPlatform && !native) {
   });
 }
 
+// axiom lsp answers in-process, keeping what it checked for the session
+// (lsp.ax, sema.ax's kept modules): every answer must be what `axiom ide`
+// (which checks everything afresh, one process per question) gives for the
+// same buffers, through edits in the editor and on disk.
+await section('axiom lsp', {
+  'answers as axiom ide does, through edits': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'axiom lsp is the compiler\'s' };
+    const dir = path.join(tmp, 'lsp');
+    fs.rmSync(dir, { recursive: true, force: true });
+    const put = (n, t) => { fs.mkdirSync(path.dirname(path.join(dir, n)), { recursive: true }); fs.writeFileSync(path.join(dir, n), t); };
+    put('axiom.toml', '[package]\nname = "lspcase"\nversion = "0.1.0"\n');
+    put('src/lib.ax', 'import "std/str" as str;\n\n/// A pair.\npub struct Pair {\n    a: i32,  // the first\n    b: i32,\n}\n\npub fn sum(p: Pair) i32 {\n    return p.a + p.b;\n}\n\npub fn trimmed(s: []u8) []u8 {\n    return str.trim(s);\n}\n');
+    // (names an error it does not declare: kept, it would be wrong for a program without main.ax)
+    put('src/far.ax', 'pub fn fail() !void {\n    return error.Elsewhere;\n}\n');
+    put('src/other.ax', 'import "far.ax" as far;\n\npub fn g() void {\n    far.fail() catch {};\n}\n');
+    const mainText = 'import "lib.ax" as lib;\nimport "far.ax" as far;\nimport "std/encoding/json" as json;\n\nerror { Elsewhere }\n\nfn twice(x: i32) i32 {\n    let p = lib.Pair.{ a: x, b: x };\n    return lib.sum(p);\n}\n\npub fn main() void {\n    let t = lib.trimmed("  x ");\n    _ = t;\n    _ = twice(21);\n    far.fail() catch {};\n    let v = json.Value.Null;\n    _ = v;\n}\n';
+    put('src/main.ax', mainText);
+    const main = path.join(dir, 'src/main.ax'), lib = path.join(dir, 'src/lib.ax'), other = path.join(dir, 'src/other.ax');
+    const opts = ['--target=x86_64'];
+    const p = spawn(compiler, ['lsp', ...opts], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
+    let buf = Buffer.alloc(0), err = '', id = 0;
+    const waits = new Map(), diags = new Map();
+    let diagWait = null;
+    p.stderr.on('data', (d) => { err += d; });
+    p.stdin.on('error', () => {});
+    p.stdout.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      for (;;) {
+        const h = buf.indexOf('\r\n\r\n');
+        if (h < 0) return;
+        const n = +/Content-Length: (\d+)/i.exec(buf.subarray(0, h).toString())[1];
+        if (buf.length < h + 4 + n) return;
+        const m = JSON.parse(buf.subarray(h + 4, h + 4 + n).toString());
+        buf = buf.subarray(h + 4 + n);
+        if (m.id !== undefined && waits.has(m.id)) { waits.get(m.id)(m); waits.delete(m.id); }
+        if (m.method === 'textDocument/publishDiagnostics') {
+          diags.set(m.params.uri, m.params.diagnostics);
+          if (diagWait && diagWait.uri === m.params.uri) { const w = diagWait; diagWait = null; w.done(); }
+        }
+      }
+    });
+    const send = (o) => { const b = Buffer.from(JSON.stringify(o)); p.stdin.write(`Content-Length: ${b.length}\r\n\r\n`); p.stdin.write(b); };
+    const request = (method, params) => new Promise((res) => { waits.set(++id, res); send({ jsonrpc: '2.0', id, method, params }); });
+    const timeout = (pr, what) => Promise.race([pr, new Promise((_, rej) => setTimeout(() => rej(new Error(`no ${what}: ${err}`)), 60000))]);
+    const published = (f) => timeout(new Promise((done) => { diagWait = { uri: 'file://' + f, done }; }), `diagnostics for ${f}`);
+    const docs = new Map();
+    const ide = (f, q, more) => {
+      const parts = [];
+      for (const [d, t] of docs) { const b = Buffer.from(t); parts.push(Buffer.from(`${d}\n${b.length}\n`), b); }
+      const r = spawnSync(compiler, ['ide', f, `--query=${q}`, ...more, ...opts], { cwd: dir, input: Buffer.concat(parts), encoding: 'utf8' });
+      return r.status === 0 && r.stdout.length ? JSON.parse(r.stdout) : null;
+    };
+    let version = 1;
+    const open = async (f) => { const t = fs.readFileSync(f, 'utf8'); docs.set(f, t); const w = published(f); send({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: { textDocument: { uri: 'file://' + f, languageId: 'axiom', version: 1, text: t } } }); await w; };
+    const edit = async (f, t) => { docs.set(f, t); const w = published(f); send({ jsonrpc: '2.0', method: 'textDocument/didChange', params: { textDocument: { uri: 'file://' + f, version: ++version }, contentChanges: [{ text: t }] } }); await w; };
+    const save = async (f) => { const w = published(f); send({ jsonrpc: '2.0', method: 'textDocument/didSave', params: { textDocument: { uri: 'file://' + f } } }); await w; };
+    const problems = [];
+    const same = (what, got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`${what}:\n  lsp: ${JSON.stringify(got)}\n  ide: ${JSON.stringify(want)}`); };
+    const checkDiags = (f, what) => same(`${what}: diagnostics of ${path.basename(f)}`, diags.get('file://' + f), ide(f, 'diagnostics', []));
+    const ask = async (f, q, pos, what) => {
+      const params = { textDocument: { uri: 'file://' + f } }, more = [];
+      if (pos) { params.position = pos; more.push(`--pos=${pos.line}:${pos.character}`); }
+      if (q === 'rename') { params.newName = 'renamed'; more.push('--new-name=renamed'); }
+      if (q === 'references') params.context = { includeDeclaration: true };
+      const r = await timeout(request('textDocument/' + q, params), q);
+      const want = ide(f, q, more);
+      same(`${what}: ${q} at ${pos ? `${pos.line}:${pos.character}` : ''} in ${path.basename(f)}`, q === 'rename' && want === null && r.error ? null : r.result, want);
+    };
+    // every name and every '.' and '(' of a document
+    const everywhere = async (f, what, every = 1) => {
+      const lines = docs.get(f).split('\n');
+      let k = 0;
+      await ask(f, 'documentSymbol', null, what);
+      for (let i = 0; i < lines.length; i++) {
+        for (const m of lines[i].matchAll(/[A-Za-z_]\w*|[.(]/g)) {
+          if (k++ % every) continue;
+          const pos = { line: i, character: m.index + (m[0].length > 1 ? 1 : 1) };
+          for (const q of ['hover', 'definition', 'typeDefinition', 'documentHighlight', 'completion', 'signatureHelp']) await ask(f, q, pos, what);
+          if (m[0].length > 1) { await ask(f, 'references', pos, what); await ask(f, 'rename', pos, what); }
+        }
+      }
+    };
+    try {
+      await timeout(request('initialize', {}), 'initialize');
+      await open(main);
+      checkDiags(main, 'opened');
+      await everywhere(main, 'opened', 2);
+      // (by now the session keeps std/ and the files not open)
+      await everywhere(main, 'again', 4);
+      await edit(main, mainText.replace('    return lib.sum(p);', '    let q = p.a * 2;\n    return lib.sum(p) + q;'));
+      checkDiags(main, 'a body edited');
+      await everywhere(main, 'a body edited', 3);
+      await edit(main, mainText.replace('fn twice(x: i32) i32', 'fn twice(x: i64) bool'));
+      checkDiags(main, 'a signature edited');
+      // a kept module changed on disk, then one changed in the editor
+      put('src/lib.ax', fs.readFileSync(lib, 'utf8').replace('pub fn sum(p: Pair) i32', 'pub fn sum(p: *Pair) i32'));
+      await save(main);
+      checkDiags(main, 'lib.ax changed on disk');
+      await open(lib);
+      await edit(lib, docs.get(lib).replace('pub fn sum(p: *Pair) i32', 'pub fn sum(p: Pair) i32'));
+      await edit(main, mainText);
+      checkDiags(main, 'lib.ax changed in the editor');
+      await everywhere(main, 'lib.ax changed in the editor', 3);
+      // far.ax checked with main.ax (which declares its error) is not kept
+      await open(other);
+      checkDiags(other, 'other.ax, without the declaration of far.ax\'s error');
+      await everywhere(other, 'other.ax', 2);
+      await timeout(request('shutdown', null), 'shutdown');
+      send({ jsonrpc: '2.0', method: 'exit', params: null });
+      const code = await timeout(new Promise((r) => p.on('close', r)), 'exit');
+      if (code !== 0) problems.push(`exit status ${code}: ${err}`);
+    } catch (e) {
+      p.kill();
+      return String(e);
+    }
+    return problems.length ? problems.slice(0, 5).join('\n') + (problems.length > 5 ? `\n(${problems.length} in all)` : '') : null;
+  },
+});
+
 // The node host itself (std/internal/runtime/host.mjs), driven without a program.
 if (!native) {
   await section('host', {

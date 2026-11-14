@@ -4,12 +4,14 @@
 //   axiom ide <file.ax> --query=<q> [--pos=<line>:<character>] [--new-name=<n>]
 //             [--target=...] [--std=<dir>]
 //
-// The language server (lsp.ax) runs this once per question, with the text of
-// the editor's open buffers on standard input (each one as its path, a
-// newline, its length in bytes, a newline and the bytes), so that unsaved
-// edits are what gets checked. It loads, parses and checks the program the
-// way `axiom check` does, then prints the answer as the JSON `result` of the
-// matching Language Server Protocol request: positions are LSP positions
+// It takes the text of the editor's open buffers on standard input (each
+// one as its path, a newline, its length in bytes, a newline and the
+// bytes), so that unsaved edits are what gets checked; the language server
+// (lsp.ax) asks the same questions in its own process (answer). It loads,
+// parses and checks the program the way `axiom check` does (but for the
+// modules the language server keeps checked: sema.ax), then gives the answer
+// as the JSON `result` of the matching Language Server Protocol request:
+// positions are LSP positions
 // (lines from 0, characters in UTF-16 code units), files are file:// URIs.
 //
 // Queries: diagnostics, hover, definition, typeDefinition, references,
@@ -824,7 +826,7 @@ fn cmp_u32(a: u32, b: u32) i32 {
 
 fn ref_cmp(a: Ref, b: Ref) i32 {
     if a.span.file != b.span.file {
-        if a.span.file < b.span.file {
+        if u.file_rank(a.span.file) < u.file_rank(b.span.file) {
             return -1;
         }
         return 1;
@@ -2227,18 +2229,32 @@ fn add_neighbours(path: []u8, out: *mut u.List.[[]u8]) void {
     }
 }
 
-// Answers q_query about the program rooted at `input`.
+// axiom ide: answers q_query about the program rooted at `input`, with the
+// editor's buffers on standard input.
 pub fn run(input: []u8, std_dir: []u8) i32 {
-    g_std = std_dir;
     read_overlays();
+    let out = answer(input, std_dir);
+    if u.isnos(out) {
+        u.eprint(u.f1("axiom ide: unknown query '%s'\n", q_query));
+        return 2;
+    }
+    u.print(out);
+    return 0;
+}
+
+/// The answer to q_query (the options taken by `option`) about the program
+/// rooted at `input`, as the JSON result of the request, or a nil slice
+/// for an unknown query. (axiom lsp asks on a thread of its own, each
+/// time: ide.ax's state is thread-local.)
+pub fn answer(input: []u8, std_dir: []u8) []u8 {
+    g_std = std_dir;
     let q = q_query;
     let mut path = u.real_path(input);
     if u.isnos(path) {
         path = input;
     }
     if u.str_eq(q, "formatting") {
-        u.print(q_format(path));
-        return 0;
+        return q_format(path);
     }
     let whole = u.str_eq(q, "references") or u.str_eq(q, "rename");
     let mut extras = u.List.[[]u8].empty();
@@ -2248,24 +2264,20 @@ pub fn run(input: []u8, std_dir: []u8) i32 {
     if u.str_eq(q, "completion") {
         prepare_completion(path);
         if c_mode == C_BUILTIN {
-            u.print(builtin_items());
-            return 0;
+            return builtin_items();
         }
         if c_mode == C_NONE {
-            u.print("[]");
-            return 0;
+            return "[]";
         }
     }
     let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: extras.items() };
     _ = sema.run(input, &so);
     root_mod = sema.g_prog.root;
     if u.isnil(root_mod) {
-        u.print(u.pick(u.str_eq(q, "diagnostics") or u.str_eq(q, "completion"), "[]", "null"));
-        return 0;
+        return u.pick(u.str_eq(q, "diagnostics") or u.str_eq(q, "completion"), "[]", "null");
     }
     if u.str_eq(q, "diagnostics") {
-        u.print(q_diagnostics());
-        return 0;
+        return q_diagnostics();
     }
     find_file = root_mod.file.id;
     if u.str_eq(q, "completion") {
@@ -2303,9 +2315,7 @@ pub fn run(input: []u8, std_dir: []u8) i32 {
     } else if u.str_eq(q, "signatureHelp") {
         out = q_signature();
     } else {
-        u.eprint(u.f1("axiom ide: unknown query '%s'\n", q));
-        return 2;
+        return u.nosym();
     }
-    u.print(out);
-    return 0;
+    return out;
 }
