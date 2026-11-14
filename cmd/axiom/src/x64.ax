@@ -1978,6 +1978,100 @@ fn cond_code(c: *mut ir.Value) i32 {
     return xe.CC_NE;
 }
 
+// Does select v (in block IB) read in v.b, for the last time, the value of
+// a phi p, or of a select of IB built from p, while v is p's new value along
+// the edge from IB; and in v.c a value made in IB for v alone (f(p))? Then
+// gen_select builds v in v.b's register. (A guess where it fails: a wrong
+// one costs a copy.)
+fn acc_select(v: *mut ir.Value) bool {
+    let x = v.c;
+    if (x.kind != ir.V_INST) or (x.blk != IB) or (x.op == ir.OP_PHI) or (x.uses != 1) {
+        return false;
+    }
+    let y = v.b;
+    let p = root_phi(y, 0);
+    if u.isnil(p) or (ir.incoming(p, IB) != v) {
+        return false;
+    }
+    if y == p {
+        // p dies at v: IB leads only to p's block (which defines it anew),
+        // no phi there reads p from IB, and nothing after v in IB reads it
+        let t = ir.terminator(IB);
+        if u.isnil(t) {
+            return false;
+        }
+        for k in 0..ir.succ_count(t) {
+            if ir.succ(t, k) != p.blk {
+                return false;
+            }
+        }
+        let mut q = p.blk.first;
+        while u.notnil(q) and (q.op == ir.OP_PHI) {
+            if ir.incoming(q, IB) == p {
+                return false;
+            }
+            q = q.next;
+        }
+        let mut i = v.next;
+        while u.notnil(i) {
+            if reads_of(i, p) > 0 {
+                return false;
+            }
+            i = i.next;
+        }
+        return true;
+    }
+    // y (made in IB) dies at v: its uses are all from it to v
+    let mut n: usize = 0;
+    let mut i = y.next;
+    let mut k: i32 = 0;
+    while u.notnil(i) and (i != v) and (k < 400) {
+        n += reads_of(i, y);
+        i = i.next;
+        k += 1;
+    }
+    if i != v {
+        return false;
+    }
+    return (n + reads_of(v, y)) == @int_cast(usize, y.uses);
+}
+
+// The phi that q is, or that a select of IB that q is was built from
+// (through at most three selects); nil if none.
+fn root_phi(q: *mut ir.Value, depth: i32) *mut ir.Value {
+    if ir.is_op(q, ir.OP_PHI) {
+        return q;
+    }
+    if not ir.is_op(q, ir.OP_SELECT) or (q.blk != IB) or (depth >= 3) {
+        return u.nil.[ir.Value]();
+    }
+    let r = root_phi(q.c, depth + 1);
+    if u.notnil(r) {
+        return r;
+    }
+    return root_phi(q.b, depth + 1);
+}
+
+// How many of i's operands are x.
+fn reads_of(i: *ir.Value, x: *mut ir.Value) usize {
+    let mut n: usize = 0;
+    if i.a == x {
+        n += 1;
+    }
+    if i.b == x {
+        n += 1;
+    }
+    if i.c == x {
+        n += 1;
+    }
+    for k in 0..i.xs.len {
+        if i.xs.get(k) == x {
+            n += 1;
+        }
+    }
+    return n;
+}
+
 // Is this (an instruction's only use) the last use of v?
 fn last_use(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and (v.uses == 1);
@@ -2036,6 +2130,16 @@ fn gen_select(v: *mut ir.Value) void {
             rt = rf;
             rf = t;
             cc = is.invert(cc);
+        } else if (cc >= 0) and acc_select(v) {
+            // an accumulator (p' = c ? p : f(p), the new value of a phi p
+            // that dies here): the result starts as a copy of p, which
+            // coalesces with it and so with p', and f(p) is moved in; the
+            // other way round, f(p)'s register would hold p', copied into
+            // p's at the edge
+            let t = rt;
+            rt = rf;
+            rf = t;
+            cc = is.invert(cc);
         }
         copy(d, rf, GPR);
         if cc >= 0 {
@@ -2060,8 +2164,7 @@ fn gen_select(v: *mut ir.Value) void {
     }
     if (v.ty.kind == ir.T_FLOAT) and avx512_for(16) {
         // AVX-512: the condition into k1 and a masked blend, not a branch
-        // (which mispredicts when the condition follows the data; LLVM
-        // selects floats with k masks too)
+        // (which mispredicts when the condition follows the data)
         let rt = reg(v.b);
         let rf = reg(v.c);
         let c = v.a;
@@ -9034,7 +9137,53 @@ fn sink_to_use(f: *mut ir.Func) void {
             }
             i = pv;
         }
+        if cnt <= 1000 {
+            sink_phi_inputs(b);
+        }
         b = b.next;
+    }
+}
+
+// The new value of a phi along the edge from b (b's terminator leads to the
+// phi's block), computed in b for the phi alone, moves to after the last
+// use in b of the phi's old value: the two then do not overlap and can
+// share a register, with no copy at the edge (a flag computed before the
+// old one's last use, `prev = f` at the end of a loop body). Valid as for
+// sink_to_use: the moved instruction is pure, its operands are defined
+// before it, and it is used only at the end of b.
+fn sink_phi_inputs(b: *mut ir.Block) void {
+    let t = ir.terminator(b);
+    if u.isnil(t) {
+        return;
+    }
+    for k in 0..ir.succ_count(t) {
+        let s = ir.succ(t, k);
+        let mut p = s.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            let x = ir.incoming(p, b);
+            if u.notnil(x) and (x.kind == ir.V_INST) and (x.blk == b) and (x.uses == 1) and (x != t) and sinkable2(x) {
+                // the last instruction of b reading p (not a phi: those read at
+                // the end of a block before)
+                let mut lu = u.nil.[ir.Value]();
+                let mut i = b.last;
+                while u.notnil(i) and (i.op != ir.OP_PHI) {
+                    if reads_of(i, p) > 0 {
+                        lu = i;
+                        break;
+                    }
+                    i = i.prev;
+                }
+                if u.notnil(lu) and (lu != t) and (lu.pos > x.pos) {
+                    let np = lu.pos + ((lu.next.pos - lu.pos) / 2);
+                    if np > lu.pos {
+                        unlink_inst(x);
+                        ir.insert_before(lu.next, x);
+                        x.pos = np;
+                    }
+                }
+            }
+            p = p.next;
+        }
     }
 }
 
@@ -9664,7 +9813,7 @@ fn hoist_source_reads(f: *mut mc.MFunc) void {
             let nx = m.next;
             let mut s: i32 = -1;
             if m.is_move and (m.op == xe.MOV_RR) and u.notnil(nx) and mc.writes_reg(nx, m.ops[0].reg) and
-               inst_reads(nx, m.ops[0].reg) {
+               inst_reads(nx, m.ops[0].reg) and not lea_pair(m, nx) {
                 s = m.ops[1].reg;
                 if (s >= mc.VREG0) and (home[@int_cast(usize, s - mc.VREG0)] != @int_cast(i32, bi)) {
                     s = -1;  // (s lives on past the block)
@@ -9681,6 +9830,25 @@ fn hoist_source_reads(f: *mut mc.MFunc) void {
             m = m.next;  // (m stays; what moved went in front of it)
         }
     }
+}
+
+// Does `mov d, s` followed by nx become one lea after allocation when it is
+// not coalesced (x64emit.ax three_address: an add of a register or a
+// constant, a subtraction of one, a shift left by 1 to 3)? Then nothing is
+// gained by moving s's later readers first, and a later copy of s (often a
+// phi's) is the one better coalesced with it.
+fn lea_pair(m: *mc.MInst, nx: *mc.MInst) bool {
+    if ((nx.sz != 4) and (nx.sz != 8)) or ((m.sz != 8) and (nx.sz == 8)) or (nx.ops.len < 2) {
+        return false;
+    }
+    let o = nx.ops[1];
+    if nx.op == xe.ALU {
+        return ((nx.cc == xe.ALU_ADD) and
+                (((o.kind == mc.K_REG) and (o.reg != m.ops[0].reg)) or ((o.kind == mc.K_IMM) and is.fits32(o.disp)))) or
+               ((nx.cc == xe.ALU_SUB) and (o.kind == mc.K_IMM) and is.fits32(o.disp));
+    }
+    return (nx.op == xe.SHIFT) and (nx.cc == 4) and (nx.ops.len > 2) and (nx.ops[2].kind == mc.K_IMM) and
+           (nx.ops[2].disp >= 1) and (nx.ops[2].disp <= 3);
 }
 
 // Moves the later readers of s in m's block in front of m, if they all can.

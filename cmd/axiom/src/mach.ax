@@ -141,10 +141,11 @@ pub struct MFunc {
     used_regs: u64,     // physical registers used (for callee-saved saves)
     ninst: i32,
     has_calls: bool,
-    level: u.List.[u8],   // how far each vreg has been split (see split)
-    vslot: u.List.[i32],  // its spill slot, shared by the pieces of a split vreg (-1: none yet)
-    vbytes: u.List.[u8],  // the bytes its value takes when fewer than its class's (0: all; set_bytes)
-    noframe_regs: u64,    // registers the noframe blocks must not use (shrink_wrap)
+    level: u.List.[u8],     // how far each vreg has been split (see split)
+    vslot: u.List.[i32],    // its spill slot, shared by the pieces of a split vreg (-1: none yet)
+    vbytes: u.List.[u8],    // the bytes its value takes when fewer than its class's (0: all; set_bytes)
+    noframe_regs: u64,      // registers the noframe blocks must not use (shrink_wrap)
+    nosave: u.List.[bool],  // split instead of given a callee-saved register once, in vain (see save_dearer)
 }
 
 pub fn new_func() *mut MFunc {
@@ -167,6 +168,7 @@ pub fn free_func(f: *mut MFunc) void {
     f.level.deinit();
     f.vslot.deinit();
     f.vbytes.deinit();
+    f.nosave.deinit();
 }
 
 pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
@@ -177,6 +179,7 @@ pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
     f.level.push(0);
     f.vslot.push(-1);
     f.vbytes.push(0);
+    f.nosave.push(false);
     return VREG0 + @int_cast(i32, f.vclass.len - 1);
 }
 
@@ -1126,7 +1129,10 @@ struct Interval {
     e: i32,  // last position
     reg: i32,
     spilled: bool,
+    nosave: bool,            // spilled by save_dearer: split at its calls, or else left as it is
     uses: f64,               // uses and definitions, weighted by 10^loop depth
+    reloads: f64,            // reloads into it from its slot, likewise
+    reads: f64,              // instructions reading it, other than stores into its slot
     ranges: u.List.[Range],  // the positions it is live at: sorted, disjoint, inclusive
     size: i32,               // positions covered
 }
@@ -1180,8 +1186,8 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     let nv = nvregs(f);
     let iv = u.newn.[Interval](nv + 1);
     for k in 0..nv {
-        iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false, uses: 0.0,
-                           ranges: u.List.[Range].empty(), size: 0 };
+        iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false, nosave: false,
+                           uses: 0.0, reloads: 0.0, reads: 0.0, ranges: u.List.[Range].empty(), size: 0 };
     }
     let w = words(nv);
     let live = u.newn.[u64](w + 1);
@@ -1205,6 +1211,9 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
         let mut i = b.last;
         while u.notnil(i) {
             let p = i.pos;
+            if (i.spill == 1) and is_vreg(i.sreg) and (i.sslot >= 0) {
+                iv[@int_cast(usize, i.sreg - VREG0)].reloads += dw;
+            }
             // definitions end the value's life above them
             for k in 0..i.ops.len {
                 let o = i.ops[k];
@@ -1227,6 +1236,9 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
                     add_range(&mut iv[x], b.start, 2 * p);
                     bset(live, x);
                     iv[x].uses += dw;
+                    if i.spill != 2 {
+                        iv[x].reads += dw;
+                    }
                 } else if o.kind == K_MEM {
                     let regs: [2]i32 = [o.base, o.index];
                     for r in regs {
@@ -1235,6 +1247,7 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
                             add_range(&mut iv[x], b.start, 2 * p);
                             bset(live, x);
                             iv[x].uses += dw;
+                            iv[x].reads += dw;
                         }
                     }
                 }
@@ -1409,8 +1422,121 @@ fn unassign_reg(segs: []mut u.List.[Seg], x: *mut Interval) void {
     x.reg = -1;
 }
 
+// The calls of a function (instructions clobbering registers), by position,
+// with their blocks' frequencies; and its blocks' starts and frequencies.
+struct CallSites {
+    at: u.List.[*mut MInst],
+    fq: u.List.[f64],
+    deep: u.List.[bool],  // in a loop
+    bstart: u.List.[i32],
+    bfq: u.List.[f64],
+
+    fn of(f: *MFunc) CallSites {
+        let mut cs = CallSites.{ at: u.List.[*mut MInst].empty(), fq: u.List.[f64].empty(), deep: u.List.[bool].empty(),
+                                 bstart: u.List.[i32].empty(), bfq: u.List.[f64].empty() };
+        for bi in 0..f.blocks.len {
+            let b = f.blocks.get(bi);
+            cs.bstart.push(b.start);
+            cs.bfq.push(b.freq);
+            let mut i = b.first;
+            while u.notnil(i) {
+                if i.clobber != 0 {
+                    cs.at.push(i);
+                    cs.fq.push(b.freq);
+                    cs.deep.push(b.loop_depth > 0);
+                }
+                i = i.next;
+            }
+        }
+        return cs;
+    }
+
+    fn deinit(self: *CallSites) void {
+        self.at.deinit();
+        self.fq.deinit();
+        self.deep.deinit();
+        self.bstart.deinit();
+        self.bfq.deinit();
+    }
+}
+
+// Should interval x (class c) be split at the calls it is live across (in
+// memory across each: a store before, a reload after) rather than take a
+// callee-saved register nothing uses yet (saved by the prologue, restored by
+// the epilogues)? The calls' spill code is counted at their blocks'
+// frequencies, two instructions each; the save and restore at the frequency
+// of the hottest block x is live in, at most the entry's (shrink_wrap may
+// move them there). A call in a loop runs as often as the loop iterates,
+// which the static estimate does not know: x then keeps the register. So a
+// value live across one call on a seldom-taken path (a fallback, an
+// allocation on a tree's insertion path) is kept in a caller-saved register
+// everywhere else, while one live across a call in a loop, or across
+// several, keeps its callee-saved register.
+fn save_dearer(f: *MFunc, t: *Target, cs: *CallSites, x: *Interval, c: u8) bool {
+    let entry = f.blocks.get(0).freq;
+    // the hottest block x is live in
+    let mut hot: f64 = 0.0;
+    let nb = cs.bstart.len;
+    for j in 0..x.ranges.len {
+        let rg = x.ranges.get(j);
+        // the last block starting at or before rg.s
+        let mut lo: usize = 0;
+        let mut hi = nb;
+        while (lo + 1) < hi {
+            let mid = (lo + hi) / 2;
+            if cs.bstart.get(mid) <= rg.s {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut k = lo;
+        while (k < nb) and (cs.bstart.get(k) <= rg.e) {
+            if cs.bfq.get(k) > hot {
+                hot = cs.bfq.get(k);
+            }
+            k += 1;
+        }
+    }
+    let save = 2.0 * @min(hot, entry);
+    // the calls it is live across (into and out of: 2p and 2p + 1)
+    let mut cost: f64 = 0.0;
+    let mut ncut: usize = 0;
+    let n = cs.at.len;
+    for j in 0..x.ranges.len {
+        let rg = x.ranges.get(j);
+        let mut lo: usize = 0;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if (2 * cs.at.get(mid).pos) < rg.s {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut k = lo;
+        while (k < n) and (((2 * cs.at.get(k).pos) + 1) <= rg.e) {
+            if call_cut(t, c, cs.at.get(k)) {
+                if cs.deep.get(k) {
+                    return false;  // (in a loop: run as often as it iterates, which is not known)
+                }
+                cost += 2.0 * cs.fq.get(k);
+                ncut += 1;
+                if cost >= save {
+                    return false;
+                }
+            }
+            k += 1;
+        }
+    }
+    return ncut > 0;
+}
+
 fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
     let n = iv.len;
+    let cs = CallSites.of(f);
+    defer cs.deinit();
     let key = u.newn.[f64](n + 1);
     let wt = u.newn.[f64](n + 1);
     let mut heap = u.List.[i32].empty();
@@ -1455,6 +1581,45 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
                     pick = r;
                     break;
                 }
+            }
+        }
+        let cv = @int_cast(usize, cur.v);
+        if (pick >= 0) and (f.level.get(cv) == 1) and (f.vslot.get(cv) >= 0) and not f.nospill.get(cv) and
+           (cur.reloads > cur.reads) {
+            // a piece of a split vreg reloaded (after calls, say) more often
+            // than it is read: it is read from its slot instead (its stores
+            // into the slot are made either way)
+            if debug_ra {
+                u.eprint(u.f1("  v%s spilled (reloaded more often than read)\n", u.idec(ci)));
+            }
+            cur.spilled = true;
+            nspill += 1;
+            continue;
+        }
+        if (pick >= 0) and ((t.caller_saved & (@as(u64, 1) << @int_cast(u32, pick))) == 0) and
+           (segs[@int_cast(usize, pick)].len == 0) {
+            // a callee-saved register nothing has yet: one that something
+            // has is free of charge, if one is free; else, if x is live
+            // across calls only where they seldom run, it is split there
+            // (see save_dearer) rather than make the function save one
+            for r in order {
+                if ((t.caller_saved & (@as(u64, 1) << @int_cast(u32, r))) == 0) and
+                   (segs[@int_cast(usize, r)].len > 0) and reg_free(&segs[@int_cast(usize, r)], cur) and
+                   not fixed_hits(r, cur) {
+                    pick = r;
+                    break;
+                }
+            }
+            let xv = @int_cast(usize, cur.v);
+            if (segs[@int_cast(usize, pick)].len == 0) and (f.level.get(xv) == 0) and not f.nosave.get(xv) and
+               not f.nospill.get(xv) and save_dearer(f, t, &cs, cur, class) {
+                if debug_ra {
+                    u.eprint(u.f1("  v%s split at its calls (cheaper than a callee-saved register)\n", u.idec(ci)));
+                }
+                cur.spilled = true;
+                cur.nosave = true;
+                nspill += 1;
+                continue;
             }
         }
         if pick >= 0 {
@@ -2230,14 +2395,42 @@ fn regions(f: *MFunc, g: *Cfg, ms: *mut Split) Regions {
         }
         if any {
             let r = @int_cast(usize, sg.root(ms.tail[pj]));
-            if g.simple[pi] {
-                rg.exit[r] += pb.freq;
-            } else {
-                rg.exit[r] = 1.0e300;  // (no place for a store there: after each definition)
-            }
+            rg.exit[r] += exit_store_cost(f, g, ms, pi);
         }
     }
     return rg;
+}
+
+// Where the region at the end of block pi is stored when it leaves along
+// split edges: at the end of pi (if its jumps all come last), at a cost of
+// its frequency; or at the start of each successor it leaves into, if pi is
+// their only predecessor, at theirs (a cold exit out of a hot block: there).
+// Returns the cheaper cost, 1.0e300 if neither place is possible (then it is
+// stored after each definition); at_start says which.
+fn exit_store_at(f: *MFunc, g: *Cfg, ms: *Split, pi: usize, at_start: *mut bool) f64 {
+    let pb = f.blocks.get(pi);
+    let mut end: f64 = 1.0e300;
+    if g.simple[pi] {
+        end = pb.freq;
+    }
+    let mut st: f64 = 0.0;
+    for k in 0..pb.succs.len {
+        let si = @int_cast(usize, pb.succs.get(k));
+        if bget(f.blocks.get(si).live_in, ms.x) and edge_cut(f, g, ms, pi, si) {
+            if g.npred[si] != 1 {
+                st = 1.0e300;
+            } else {
+                st += f.blocks.get(si).freq;
+            }
+        }
+    }
+    at_start.* = st < end;
+    return @min(st, end);
+}
+
+fn exit_store_cost(f: *MFunc, g: *Cfg, ms: *Split, pi: usize) f64 {
+    let mut at_start = false;
+    return exit_store_at(f, g, ms, pi, &mut at_start);
 }
 
 // Gives each region that uses the vreg a piece of its own (rg.w), and
@@ -2448,6 +2641,10 @@ fn rewrite_edges(f: *mut MFunc, t: *Target, g: *Cfg, ms: *mut Split, rg: *Region
         let pb = f.blocks.get(pi);
         let r = @int_cast(usize, ms.sg.root(ms.tail[pj]));
         let mut stored = false;
+        let mut at_start = false;
+        if rg.at_exit[r] {
+            _ = exit_store_at(f, g, ms, pi, &mut at_start);  // (where regions counted it)
+        }
         for k in 0..pb.succs.len {
             let si = @int_cast(usize, pb.succs.get(k));
             let sb = f.blocks.get(si);
@@ -2455,7 +2652,9 @@ fn rewrite_edges(f: *mut MFunc, t: *Target, g: *Cfg, ms: *mut Split, rg: *Region
                 continue;
             }
             let sj = @int_cast(usize, g.cidx[si]);
-            if rg.at_exit[r] and not stored {
+            if rg.at_exit[r] and at_start {
+                insert_start(sb, ms.store_from(f, t, rg.w[r]));  // (pb is sb's only predecessor)
+            } else if rg.at_exit[r] and not stored {
                 insert_end(pb, ms.store_from(f, t, rg.w[r]));  // (pb is simple: see regions)
                 stored = true;
             }
@@ -2989,6 +3188,17 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             g.cidx[@int_cast(usize, nl[j])] = @int_cast(i32, j);
         }
         let lv = f.level.get(k);
+        if iv[k].nosave {
+            // (save_dearer: split at its calls, or if it cannot be, left to
+            // take its callee-saved register next round)
+            if not split(f, t, &g, k, SPLIT_LOOPS, 1, nl, nm) {
+                f.nosave.set(k, true);
+            }
+            for j in 0..nl.len {
+                g.near[@int_cast(usize, nl[j])] = false;
+            }
+            continue;
+        }
         if u.notnil(f.remat.get(k)) {
             // split around calls and loops, then between the stretches of
             // code that use it; then built again in each block reading it
@@ -3449,7 +3659,9 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
                     u.eprint(u.f6("v%s c%s l%s s%s w%s [%s", u.zdec(k), u.idec(@as(i32, f.vclass.get(k))),
                                   u.idec(@as(i32, f.level.get(k))), u.idec(x.size),
                                   u.dec(@int_from_float(i64, weight(f, x) * 1000000.0)), u.idec(x.s)));
-                    u.eprint(u.f2(",%s] h%s\n", u.idec(x.e), u.idec(f.hint.get(k))));
+                    u.eprint(u.f4(",%s] h%s reloads %s reads %s\n", u.idec(x.e), u.idec(f.hint.get(k)),
+                                  u.dec(@int_from_float(i64, x.reloads * 1000.0)),
+                                  u.dec(@int_from_float(i64, x.reads * 1000.0))));
                 }
             }
         }
