@@ -424,7 +424,17 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   signal frame where no FDE covers them. So the system's unwinder walks through this
   compiler's frames: a backtrace, another language's exceptions (`c/link/eh_frame_hdr`,
   `c/link/eh_frame_sections`, and `dwarf.mjs` checks every function's FDE against its
-  `.debug_frame` one in the debug tests). Indirect functions
+  `.debug_frame` one in the debug tests), and out of a signal handler through the signal
+  frame of the compiler's C library to the interrupted code (`c/link/eh_frame_signal`).
+  The FDEs of other compilers' objects keep their language-specific data areas (in an
+  ordinary read-only section, or one of the function's own) and their CIEs' personality
+  routines (reached through a pointer in a COMDAT group of its own) with the function
+  they describe, under `--gc-sections` too; the routines and the rest of the language's
+  run time come from its libraries. So C++ code throws through this compiler's C
+  functions, at `-O0` and `-O2` and with variable length arrays, and catches above them
+  (`c/link/cxx_throw`, x86-64 and AArch64). Such a program's C library is the system's
+  (`--c-lib=system`, "One C library": the C++ run-time library is built against it).
+  Indirect functions
   (`STT_GNU_IFUNC`, global and local, of x86-64 and AArch64; the C attribute `ifunc`): a
   PLT stub is the function's address wherever it is taken (calls, the GOT, data), and
   jumps through a GOT slot that an `R_*_IRELATIVE` relocation gives the resolver's result:
@@ -495,8 +505,13 @@ selection; what the objects refer to and do not define comes from the libraries:
   `__thread_data`, `__thread_bss`: the executable gets the sections and dyld makes the
   blocks); `__compact_unwind` and `__eh_frame` go into the executable's unwind tables
   (a function's FDE found by the address it covers, which the platform's assembler
-  leaves without a relocation; personality functions and LSDAs, C++'s exceptions, are
-  not carried: the table has none). A universal object is not read (give the slice).
+  leaves without a relocation), with their personality routines and LSDAs (C++'s
+  exceptions, C's cleanups under `-fexceptions`): a compact entry's routine is one of
+  the `__unwind_info` table's personalities (at most three, the GOT slots of their
+  addresses) and its LSDA an entry of the table's LSDA index, and an FDE's CIE points
+  at its routine's GOT slot (`ARM64_RELOC_POINTER_TO_GOT`, `X86_64_RELOC_GOT`)
+  (`c/objfmt/unwind_personality`, checked by `macho.mjs`; built only). A universal
+  object is not read (give the slice).
 - **Dynamic libraries**: a `.dylib` given (or found by `-l` in the `-L` directories; of a
   universal file, the target's slice) is read for its install name and exports, and the
   program is bound to it by its ordinal (two-level namespace). A library named with `-l`
@@ -540,7 +555,15 @@ which fail through `__chk_fail` as they must); `__isoc99_scanf` and its kin, and
 `__stack_chk_guard` (on x86-64 the guard is at `%fs:0x28`, which the runtime's thread
 control blocks keep zero); `_setjmp` and `__sigsetjmp` (this library's `setjmp`: its
 `jmp_buf` is smaller than the system's), `__longjmp_chk`; `_IO_putc`, `_IO_getc`;
-`__getauxval`. The limit is what such code took from the system library's headers that
+`__getauxval`; `dl_iterate_phdr` (the LSB's) and `_dl_find_object` (the dynamic
+linker's, as its manual gives it), through which the platform's unwinder finds the
+program's call frame tables: they walk the executable's program headers, which the
+auxiliary vector names, and in a dynamically linked program those of the shared objects
+in the dynamic linker's list (`DT_DEBUG`'s `r_debug`), so that the unwinder links with
+this library, statically or not. A weak reference of such code to a name that this
+library rejects below (the unwinder's to the system library's `__pthread_key_create`, by
+which it tells whether the program has threads) is left null rather than bound to the
+system's library. The limit is what such code took from the system library's headers that
 this library does not share: a reference to another of that library's own names (those
 reserved to the implementation: `__overflow`, `__uflow`, ...) or to one of POSIX's
 functions of streams (`fileno`, `fdopen`, `popen`, `getline`, ...: they take or give the
@@ -550,7 +573,13 @@ system library's `FILE`) is an error (`E9004`, after `link error: x.o refers to
 would give the program two C libraries, and so is a call of a function whose objects the
 system's headers lay out smaller than this library does (`fgetpos` and `fsetpos`, whose
 `fpos_t` is 16 bytes there and 40 here; the restartable multibyte functions, `mbrtowc`
-and its kin, whose `mbstate_t` is 8 bytes there and 24 here). Macros the code expanded
+and its kin, whose `mbstate_t` is 8 bytes there and 24 here). A shared library of the
+platform's that refers to such names was built against the system's library, and linking
+it is an error too (`link error: <library> is built against the system's C library (it
+refers to ...)`): a program linked with a language's run-time library, as C++ code is with
+the shared C++ run-time library, has the system's C library (`--c-lib=system`), whose
+streams, locales and multibyte state that library shares, and to which its references
+to the standard's functions bind as well. Macros the code expanded
 (`BUFSIZ`, `EOF`, the `errno` codes, which are Linux's here too) are its values, and a
 structure it reads that this library fills must be laid out alike: this library's
 `struct tm` has the standard's members, at the system's offsets, without the system's
@@ -748,7 +777,10 @@ sections of `SHF_GNU_RETAIN`, and everything that is not code or data; then what
 relocation in a kept section refers to, the sections that go with a kept one
 (`SHF_LINK_ORDER`), and the other sections of a kept one's COMDAT group. The unwind
 tables (`.eh_frame`, `.pdata`, `.xdata`) of other compilers' objects are kept whole, but
-keep nothing themselves. A program's own C units and Axiom modules are compiled as one
+keep nothing themselves, except that an FDE of `.eh_frame` keeps, with the function it
+describes, its LSDA and its CIE's personality routine (by the pointer the CIE has). In
+COFF, whose `.xdata` names its handlers (the C runtime's, imports of its DLL), a handler
+is kept only if something else keeps it. A program's own C units and Axiom modules are compiled as one
 unit, whose unreferenced functions are not made at all: `--gc-sections` matters for the
 objects and archives a program links.
 

@@ -35,13 +35,16 @@
 // __TEXT,__unwind_info, the table the system's unwinder reads (the format of
 // <mach-o/compact_unwind_encoding.h>):
 //   a header: version 1, then the section offsets and counts of the common
-//   encodings (none here), the personalities (none) and the first-level
-//   index;
+//   encodings (none here), the personalities and the first-level index;
+//   the personalities (at most 3, which an encoding's bits 28-29 number from
+//   1): the image offsets of the GOT slots that hold the routines'
+//   addresses (the platform's objects' compact entries name them);
 //   the first-level index: an entry per second-level page (the offset from
 //   the image's start of the page's first function, the page's offset, the
 //   offset of its part of the LSDA index), then a sentinel (the end of the
-//   last function, no page);
-//   the LSDA index (empty);
+//   last function, no page, the LSDA index's end);
+//   the LSDA index: (function offset, LSDA offset) for each function whose
+//   encoding has UNWIND_HAS_LSDA (bit 30), in address order;
 //   second-level pages of the regular kind (2): a header (kind, the offset
 //   of the entries, their count) and entries of (function offset, encoding)
 //   in address order, at most 511 a page so that each fits 4 KiB.
@@ -642,6 +645,7 @@ pub struct Ent {
     off: u64,
     len: u64,
     enc: u32,
+    lsda: u64,  // its LSDA's image offset (with UNWIND_HAS_LSDA in enc), or 0
 }
 
 const PAGE_ENTS: usize = 511;
@@ -688,39 +692,61 @@ pub fn covers(ents: []Ent, off: u64) bool {
     return (off >= e.off) and ((off < (e.off + e.len)) or (off == e.off));
 }
 
-/// The size of the __unwind_info of n entries (sorted's).
-pub fn info_size(n: usize) u64 {
-    let pages = (n + PAGE_ENTS - 1) / PAGE_ENTS;
-    return @as(u64, 28 + (12 * (pages + 1)) + (8 * pages) + (8 * n));
+/// An encoding's flag: the function has an LSDA (the LSDA index's entry).
+pub const HAS_LSDA: u32 = 0x4000_0000;
+/// An encoding's personality index (1..3; 0: none), in bits 28-29.
+pub const PERSONALITY_SHIFT: u32 = 28;
+
+// The LSDA index's entries before entry k of ents.
+fn lsdas_before(ents: []Ent, k: usize) u64 {
+    let mut c: u64 = 0;
+    for e in ents[0..k] {
+        if (e.enc & HAS_LSDA) != 0 {
+            c += 1;
+        }
+    }
+    return c;
 }
 
-/// __unwind_info for the entries `ents` (sorted's, at least one).
-pub fn info(ents: []Ent) bn.Bytes {
+/// __unwind_info for the entries `ents` (sorted's, at least one) and the
+/// personality routines' GOT slots `pers` (image offsets, at most 3).
+pub fn info(ents: []Ent, pers: []u64) bn.Bytes {
     let n = ents.len;
     let pages = (n + PAGE_ENTS - 1) / PAGE_ENTS;
     let mut b = bn.new_bytes();
-    let index_at: u64 = 28;
+    let pers_at: u64 = 28;
+    let index_at = pers_at + (4 * @as(u64, pers.len));
     let lsda_at = index_at + (12 * @as(u64, pages + 1));
+    let nlsda = lsdas_before(ents, n);
     b.u32_(1);   // version
     b.u32_(28);  // common encodings: none
     b.u32_(0);
-    b.u32_(28);  // personalities: none
-    b.u32_(0);
+    b.u32_(pers_at);  // the personalities
+    b.u32_(@as(u64, pers.len));
     b.u32_(index_at);  // the first-level index
     b.u32_(@as(u64, pages + 1));
-    let mut page_at = lsda_at;  // (the LSDA index is empty)
+    for x in pers {
+        b.u32_(x);
+    }
+    let mut page_at = lsda_at + (8 * nlsda);
     for p in 0..pages {
         let first = p * PAGE_ENTS;
         let cnt = @min(PAGE_ENTS, n - first);
         b.u32_(ents[first].off);
         b.u32_(page_at);
-        b.u32_(lsda_at);
+        b.u32_(lsda_at + (8 * lsdas_before(ents, first)));
         page_at += 8 + (8 * @as(u64, cnt));
     }
     let last = ents[n - 1];
     b.u32_(last.off + last.len);
     b.u32_(0);
-    b.u32_(lsda_at);
+    b.u32_(lsda_at + (8 * nlsda));
+    for e in ents {
+        if (e.enc & HAS_LSDA) != 0 {
+            b.u32_(e.off);
+            b.u32_(e.lsda);
+        }
+    }
     for p in 0..pages {
         let first = p * PAGE_ENTS;
         let cnt = @min(PAGE_ENTS, n - first);

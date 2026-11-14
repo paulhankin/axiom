@@ -620,7 +620,10 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // test, natively on Linux (x86-64, or AArch64 with AXIOM_NATIVE_TARGET=
 // aarch64) where the system's C compiler for the target is installed. Its
 // files: main.c or main.ax, built by the compiler with the others; sys_*.c
-// (and sys_*.cpp: the system's C++ compiler, -fno-exceptions -fno-rtti),
+// (and sys_*.cpp: the system's C++ compiler, -fno-exceptions -fno-rtti, or
+// with cxx-exceptions -fexceptions -frtti and the program linked with the
+// shared C++ runtime library; for another processor than the machine's,
+// a C++ compiler that targets it),
 // compiled by the system's compiler into objects given to the build;
 // arch_*.c into the archive libarch.a, so_*.c into the shared library
 // libso.so (-fPIC -shared), both named with -L and -l (the program runs
@@ -638,7 +641,9 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // (--link=x paths are the directory's), cc-variants: flags | flags | ...
 // (the sys_, arch_ and so_ files are compiled with each, the test run
 // once per variant; -x86_64 and -aarch64 suffixes on the directive give a
-// target's own), needs: c++, cc-flags: (for cc_main.c's link), x86-64-only.
+// target's own), flag-variants: flags | flags | ... (the main file built
+// with each, for every cc-variant), needs: c++, cxx-exceptions, cc-flags: (for cc_main.c's
+// link), x86-64-only.
 const cLinkDir = path.join(root, 'cmd/axiom/internal/tests/c/link');
 const cLinkDirs = fs.existsSync(cLinkDir) ? fs.readdirSync(cLinkDir).filter((n) => fs.statSync(path.join(cLinkDir, n)).isDirectory()).sort().map((n) => path.join(cLinkDir, n)) : [];
 const linkArch = (process.env.AXIOM_NATIVE_TARGET || process.arch === 'arm64' && 'aarch64' || 'x86_64').replace(/^native$/, process.arch === 'arm64' ? 'aarch64' : 'x86_64');
@@ -646,6 +651,22 @@ const hostArch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
 const sysTool = (cxx) => {
   const names = linkArch === hostArch ? (cxx ? ['g++', 'c++', 'clang++'] : ['cc', 'gcc', 'clang']) : [`${linkArch}-linux-gnu-${cxx ? 'g++' : 'gcc'}`];
   for (const n of names) if (spawnSync('sh', ['-c', `command -v ${n}`]).status === 0) return n;
+  // (for another processor, a C++ compiler that targets it)
+  if (cxx && linkArch !== hostArch && spawnSync('sh', ['-c', 'command -v clang++']).status === 0) return `clang++ --target=${linkArch}-linux-gnu`;
+  return null;
+};
+// The shared C++ runtime library for the target (cxx-exceptions), as the
+// C++ compiler finds it, else the target's library directory's; or null.
+const cxxRuntime = (cxx) => {
+  for (const n of ['libstdc++.so', 'libstdc++.so.6']) {
+    const [cmd, ...pre] = cxx.split(' ');
+    const r = spawnSync(cmd, [...pre, `-print-file-name=${n}`], { encoding: 'utf8' });
+    const p = (r.stdout || '').trim();
+    if (r.status === 0 && path.isAbsolute(p) && fs.existsSync(p)) return fs.realpathSync(p);
+  }
+  for (const d of [`/usr/${linkArch}-linux-gnu/lib`, `/usr/lib/${linkArch}-linux-gnu`]) {
+    if (fs.existsSync(path.join(d, 'libstdc++.so.6'))) return path.join(d, 'libstdc++.so.6');
+  }
   return null;
 };
 const cLinkTest = async (dir) => {
@@ -663,9 +684,15 @@ const cLinkTest = async (dir) => {
   const needsCxx = dv('needs').some((x) => /c\+\+/.test(x));
   const cxx = needsCxx ? sysTool(true) : null;
   if (needsCxx && !cxx) return { skip: true, reason: 'no system C++ compiler' };
+  const cxxExceptions = /(?:\/\/ |\/\* )cxx-exceptions\b/m.test(src);
+  const cxxLib = cxxExceptions ? cxxRuntime(cxx) : null;
+  if (cxxExceptions && !cxxLib) return { skip: true, reason: 'no C++ runtime library for the target' };
   const variantsOf = (d) => dv(d).flatMap((x) => x.split('|')).map((x) => x.trim());
   let variants = [...variantsOf('cc-variants'), ...variantsOf(`cc-variants-${linkArch}`)];
   if (!variants.length) variants = ['-O2'];
+  // flag-variants: the build of the main file once with each (with every cc-variant)
+  const flagVariants = variantsOf('flag-variants');
+  if (flagVariants.length) variants = variants.flatMap((v) => flagVariants.map((f) => `${v} :: ${f}`));
   const errors = dv('expect-error'), want = dv('expect').join('\n');
   const status = dv('expect-status').length ? Number(dv('expect-status')[0]) : 0;
   const work = path.join(tmp, `link-${path.basename(dir)}`);
@@ -695,12 +722,15 @@ const cLinkTest = async (dir) => {
     if (p) return p;
   }
   for (const v of variants) {
-    const vf = v.split(/\s+/).filter((x) => x);
+    const [ccPart, flagPart = ''] = v.split(' :: ');
+    const vf = ccPart.split(/\s+/).filter((x) => x);
     const objs = [];
     for (const f of pick(/^sys_.*\.(c|cpp)$/)) {
       const o = path.join(work, path.basename(f).replace(/\.\w+$/, '.o'));
       const isCxx = f.endsWith('.cpp');
-      const p = await run(isCxx ? cxx : cc, ['-c', ...vf, ...(isCxx ? ['-fno-exceptions', '-fno-rtti'] : []), f, '-o', o], `${isCxx ? cxx : cc} ${v} ${path.basename(f)}`);
+      const [tool, ...pre] = (isCxx ? cxx : cc).split(' ');
+      const cxxFlags = isCxx ? (cxxExceptions ? ['-fexceptions', '-frtti'] : ['-fno-exceptions', '-fno-rtti']) : [];
+      const p = await run(tool, [...pre, '-c', ...vf, ...cxxFlags, f, '-o', o], `${isCxx ? cxx : cc} ${v} ${path.basename(f)}`);
       if (p) return p;
       objs.push(o);
     }
@@ -725,9 +755,10 @@ const cLinkTest = async (dir) => {
       if (p) return p;
       libFlags.push('-lso');
     }
+    if (cxxLib) libFlags.push(cxxLib);
     if (ourlib.length) libFlags.push('-lours');
     if (oursso.length) libFlags.push('-loursso');
-    const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/)).filter((x) => x).map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x);
+    const flags = [...dv('flags'), flagPart].flatMap((x) => x.trim().split(/\s+/)).filter((x) => x).map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x);
     const others = names.filter((n) => n !== path.basename(main) && /\.c$/.test(n) && !/^(sys|arch|so|ours|ourlib|oursso|cc)_/.test(n)).map((n) => path.join(dir, n));
     const out = path.join(work, 'prog');
     const args = ['build', main, ...others, ...objs, ...ours, `-L${work}`, ...libFlags, '--format=agent-json', '-o', out, target, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
@@ -3758,6 +3789,8 @@ if (!skipPlatform) {
 // against nothing, symbols looked up when loaded), and for x86_64-windows
 // run, printing the cc-expect: lines. Directives (// comments of main.c):
 // expect:, expect-status:, targets:, flags:, ours-flags:, cc-imports:,
+// sys-flags: (more of clang's flags for the sys_ files, of which sys_*.cpp
+// are C++),
 // (flags' --link=x paths are the directory's),
 // dlltool: <dll> <names> (an import library of that DLL, given to the
 // build), wine-dlls: <names> (-l of those DLLs, found in Wine's own
@@ -3792,14 +3825,14 @@ if (!skipPlatform && !native) {
       return r.status === 0 ? null : `${what} failed:\n${r.stdout}${r.stderr}`;
     };
     const target = `--target=${t}`, triple = `--target=${triples[t]}`, ext = win ? '.obj' : '.o';
-    const ccObj = async (f) => {
-      const o = path.join(work, path.basename(f, '.c') + ext);
-      const p = await run(clang, [triple, '-O2', '-c', f, '-o', o], `clang ${path.basename(f)}`);
+    const ccObj = async (f, more = []) => {
+      const o = path.join(work, path.basename(f).replace(/\.\w+$/, '') + ext);
+      const p = await run(clang, [triple, '-O2', ...more, '-c', f, '-o', o], `clang ${path.basename(f)}`);
       return p ? { p } : { o };
     };
     const inputs = [];
-    for (const f of pick(/^sys_.*\.c$/)) {
-      const r = await ccObj(f);
+    for (const f of pick(/^sys_.*\.(c|cpp)$/)) {
+      const r = await ccObj(f, words('sys-flags'));
       if (r.p) return r.p;
       inputs.push(r.o);
     }

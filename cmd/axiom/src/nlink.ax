@@ -839,6 +839,22 @@ fn collect_garbage() void {
             }
         }
     }
+    // what the call frame information of each function refers to besides
+    // its code: its language-specific data area and its CIE's personality
+    // routine (lists by the function's section, fhead, of object << 32 |
+    // symbol)
+    let mut fents = u.List.[u64].empty();
+    let mut fnext = u.List.[u32].empty();
+    let mut fhead = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if u.str_eq(s.name, ".eh_frame") and (s.kind != elf.S_DISCARD) {
+                fde_deps(oi, s, &mut fents, &mut fnext, &mut fhead);
+            }
+        }
+    }
     // the closure
     while g.work.len > 0 {
         let x = g.work.pop();
@@ -859,6 +875,12 @@ fn collect_garbage() void {
             let e = ents.get(@as(usize, d - 1));
             gc_mark(&mut g, @truncate(usize, e >> 32), @truncate(i32, @bit_cast(i64, e & 0xffff_ffff)));
             d = next.get(@as(usize, d - 1));
+        }
+        let mut f = fhead.get(key);
+        while f != 0 {
+            let e = fents.get(@as(usize, f - 1));
+            gc_mark_sym(&mut g, @truncate(usize, e >> 32), @truncate(u32, e & 0xffff_ffff));
+            f = fnext.get(@as(usize, f - 1));
         }
         let gk = gof.get(key);
         if gk.len > 0 {
@@ -885,7 +907,134 @@ fn collect_garbage() void {
     }
     ents.deinit();
     next.deinit();
+    fents.deinit();
+    fnext.deinit();
     g.work.deinit();
+}
+
+// The references of the .eh_frame section s of object oi (its entries: a
+// length, 0xffffffff and a 64-bit one for the extended form, then a CIE's
+// id 0 or an FDE's offset back to its CIE, then an FDE's initial location:
+// the LSB's format) other than an FDE's initial location, by the section of
+// that location (the function's): the FDE's own (its augmentation data's
+// LSDA) and its CIE's (the personality routine), so that a kept function
+// keeps them (into fents, fnext, fhead: collect_garbage).
+fn fde_deps(oi: usize, s: *elf.Sec, fents: *mut u.List.[u64], fnext: *mut u.List.[u32],
+            fhead: *mut u.SymMap.[u32]) void {
+    let o = objs.get(oi);
+    let d = s.data.view();
+    // the entries: their start, end and CIE (an FDE's: the index of its
+    // CIE's entry; -1 for a CIE)
+    let mut starts = u.List.[u64].empty();
+    let mut ends = u.List.[u64].empty();
+    let mut cies = u.List.[i64].empty();
+    let mut off: u64 = 0;
+    while off + 8 <= @as(u64, d.len) {
+        let mut len = rd32(d, off);
+        let mut hdr: u64 = 4;
+        if len == 0 {
+            break;  // (the terminator)
+        }
+        if len == 0xffff_ffff {
+            if off + 16 > @as(u64, d.len) {
+                break;
+            }
+            len = bn.rd64(d, @truncate(usize, off + 4));
+            hdr = 12;
+        }
+        let end = off + hdr + len;
+        if (end > @as(u64, d.len)) or (end < off) {
+            break;
+        }
+        let id = rd32(d, off + hdr);
+        let mut cie: i64 = -1;
+        if id != 0 {
+            cie = -2;  // (an FDE whose CIE is not found: keeps nothing)
+            if id <= off + hdr {
+                let at = off + hdr - id;  // (the CIE's start)
+                let j = entry_of(starts.items(), ends.items(), at);
+                if (j >= 0) and (starts.get(@truncate(usize, @bit_cast(u64, j))) == at) {
+                    cie = j;
+                }
+            }
+        }
+        starts.push(off);
+        ends.push(end);
+        cies.push(cie);
+        off = end;
+    }
+    // each entry's function section (by its initial location's
+    // relocation), and the other relocations' symbols, by entry
+    let n = starts.len;
+    let fsec = u.newn.[i32](n + 1);
+    for j in 0..n {
+        fsec[j] = -1;
+    }
+    // the symbols of the other relocations, a list per entry (ohead: its
+    // first + 1; onext)
+    let ohead = u.newn.[u32](n + 1);
+    let mut osym = u.List.[u32].empty();
+    let mut onext = u.List.[u32].empty();
+    for r in s.relocs.items() {
+        let j = entry_of(starts.items(), ends.items(), r.off);
+        if j < 0 {
+            continue;
+        }
+        let ju = @truncate(usize, @bit_cast(u64, j));
+        let mut hdr: u64 = 4;
+        if rd32(d, starts.get(ju)) == 0xffff_ffff {
+            hdr = 12;
+        }
+        if (cies.get(ju) != -1) and (r.off == starts.get(ju) + hdr + 4) {
+            if @as(usize, r.sym) < o.syms.len {
+                fsec[ju] = o.syms.get(@as(usize, r.sym)).sec;
+            }
+        } else {
+            osym.push(r.sym);
+            onext.push(ohead[ju]);
+            ohead[ju] = @int_cast(u32, osym.len);
+        }
+    }
+    for j in 0..n {
+        let c = cies.get(j);
+        if (c < 0) or (fsec[j] < 0) {
+            continue;  // (a CIE, or an FDE of no function here)
+        }
+        let key = sec_key(oi, @as(usize, @bit_cast(u32, fsec[j])));
+        for e in [j, @truncate(usize, @bit_cast(u64, c))] {
+            let mut x = ohead[e];
+            while x != 0 {
+                fents.push((@as(u64, oi) << 32) | @as(u64, osym.get(@as(usize, x - 1))));
+                fnext.push(fhead.get(key));
+                fhead.put(key, @int_cast(u32, fents.len));
+                x = onext.get(@as(usize, x - 1));
+            }
+        }
+    }
+    starts.deinit();
+    ends.deinit();
+    cies.deinit();
+    osym.deinit();
+    onext.deinit();
+}
+
+// The index of the entry (by starts and ends, in order) that holds offset
+// off, or -1.
+fn entry_of(starts: []u64, ends: []u64, off: u64) i64 {
+    let mut lo: usize = 0;
+    let mut hi = starts.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ends[mid] <= off {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < starts.len) and (starts[lo] <= off) {
+        return @as(i64, @bit_cast(i64, @as(u64, lo)));
+    }
+    return -1;
 }
 
 // A name for section k of object oi (interned).
@@ -1310,7 +1459,7 @@ pub fn is_got_reloc(x64: bool, ty: u32) bool {
         return (ty == elf.R_X86_64_GOTPCREL) or (ty == elf.R_X86_64_GOTPCRELX) or (ty == elf.R_X86_64_REX_GOTPCRELX);
     }
     return (ty == elf.R_AARCH64_ADR_GOT_PAGE) or (ty == elf.R_AARCH64_LD64_GOT_LO12_NC) or
-           (ty == elf.R_AARCH64_GOT_LD_PREL19);
+           (ty == elf.R_AARCH64_GOT_LD_PREL19) or (ty == elf.R_AARCH64_GOTPCREL32);
 }
 
 pub fn is_call_reloc(x64: bool, ty: u32) bool {
@@ -1357,9 +1506,17 @@ fn rd32(b: []u8, off: u64) u64 {
     return bn.rd32(b, @truncate(usize, off));
 }
 
-// An AArch64 load of GOT slot address ga at p (file offset fo).
-pub fn a64_got(b: []mut u8, fo: u64, p: u64, ty: u32, ga: u64) void {
-    if ty == elf.R_AARCH64_ADR_GOT_PAGE {
+// An AArch64 load of GOT slot address ga at p (file offset fo), or the
+// slot's 32-bit place-relative offset plus addend (R_AARCH64_GOTPCREL32: a
+// call frame pointer of the DW_EH_PE_indirect kind, a personality routine's).
+pub fn a64_got(b: []mut u8, fo: u64, p: u64, ty: u32, ga: u64, addend: i64) void {
+    if ty == elf.R_AARCH64_GOTPCREL32 {
+        let v = @bit_cast(i64, ga +% @bit_cast(u64, addend)) -% @bit_cast(i64, p);
+        if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
+            err("relocation out of range (a 32-bit offset of a GOT slot)");
+        }
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xffff_ffff);
+    } else if ty == elf.R_AARCH64_ADR_GOT_PAGE {
         a64_adrp(b, fo, p, ga);
     } else if ty == elf.R_AARCH64_GOT_LD_PREL19 {
         a64_imm19(b, fo, p, ga, "a GOT literal");

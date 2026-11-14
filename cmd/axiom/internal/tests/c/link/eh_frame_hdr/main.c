@@ -4,8 +4,11 @@
 // system's compiler through this compiler's frames (these at the suite's
 // optimization level, ours_walk.c's and oursso_walk.c's at -O0, one with a
 // variable length array, whose frame the CFA follows from the frame
-// pointer), the system's in between, up to main.
-// flags: --c-lib=system
+// pointer), the system's in between, up to main. With the system's C
+// library and with the compiler's (whose dl_iterate_phdr and
+// _dl_find_object the unwinder then uses, and whose program leaves the
+// unwinder's weak references to the system library's threads null).
+// flag-variants: --c-lib=system | --c-lib=axiom
 // ours-flags: -O0
 // cc-variants: -O2 | -O0 -fasynchronous-unwind-tables
 // expect: 3 1

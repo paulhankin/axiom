@@ -471,8 +471,18 @@ fn scan_relocs() void {
         let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
-            if (nl.sec_cls.get(oi)[k] == nl.C_DEBUG) or (nl.sec_cls.get(oi)[k] == C_CU) {
-                continue;  // (nl.debug_sections; unwind_entries)
+            if nl.sec_cls.get(oi)[k] == C_CU {
+                // a compact entry's personality routine: the unwind table
+                // names the GOT slot of its address (unwind_info)
+                for r in s.relocs.items() {
+                    if (r.off % 32) == 16 {
+                        _ = nl.got_slot(oi, r.sym);
+                    }
+                }
+                continue;
+            }
+            if nl.sec_cls.get(oi)[k] == nl.C_DEBUG {
+                continue;  // (nl.debug_sections)
             }
             for r in s.relocs.items() {
                 if is_tlvp(r.ty) {
@@ -574,7 +584,7 @@ fn apply_relocs(b: []mut u8) void {
                 if nl.is_got_reloc(X64, t) {
                     let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8);
                     if not X64 {
-                        nl.a64_got(b, fo, p, t, ga);
+                        nl.a64_got(b, fo, p, t, ga, r.addend);
                     } else if not imp and nl.x64_relax(b, fo, t) {
                         rel32(b, fo, p, sv +% @bit_cast(u64, r.addend));  // (lea of our own symbol)
                     } else {
@@ -1283,6 +1293,10 @@ fn reloc_at(s: *elf.Sec, off: u64) *elf.Rel {
     return u.nil.[elf.Rel]();
 }
 
+// The personality routines' GOT slots (image offsets) that unwind_info
+// names, in the order of their numbers.
+let mut unwind_pers: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
 // __unwind_info for the code placed so far, __eh_frame (C_EH) being at
 // eh_addr: an entry per function of the objects' compact entries (C_CU),
 // those of the DWARF mode with the offset of their function's FDE in
@@ -1290,6 +1304,7 @@ fn reloc_at(s: *elf.Sec, off: u64) *elf.Rel {
 // the DWARF mode too), up to code_end (the stubs, which have none).
 fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
     let x64 = X64;
+    unwind_pers = u.List.[u64].empty();
     // the FDEs: their functions' addresses and offsets in __eh_frame
     let mut fde_fn = u.List.[u64].empty();
     let mut fde_off = u.List.[u64].empty();
@@ -1348,8 +1363,11 @@ fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
                     continue;
                 }
                 let addr = nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend);
-                // (no personality function or LSDA: the table has none)
+                // the personality routine (by its GOT slot, numbered in the
+                // table's list from 1) and the LSDA, for an encoding that is
+                // not the DWARF mode's (whose FDE has them)
                 let mut enc = @truncate(u32, bn.rd32(d, at + 12)) & ~@as(u32, 0x7000_0000);
+                let mut lsda: u64 = 0;
                 if mu.is_dwarf(enc, x64) {
                     enc = 0;
                     for j in 0..fde_fn.len {
@@ -1358,8 +1376,29 @@ fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
                             break;
                         }
                     }
+                } else {
+                    let rp = reloc_at(s, @as(u64, at + 16));
+                    if u.notnil(rp) {
+                        let slot = (got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, rp.sym))) * 8)) - image_base;
+                        let mut pi: usize = 0;
+                        while (pi < unwind_pers.len) and (unwind_pers.get(pi) != slot) {
+                            pi += 1;
+                        }
+                        if pi == unwind_pers.len {
+                            unwind_pers.push(slot);
+                        }
+                        if pi >= 3 {
+                            nl.err("the objects' functions have more than the 3 personality routines that the unwind table can name");
+                        }
+                        enc |= @truncate(u32, (@as(u64, pi + 1) & 3) << @as(u64, mu.PERSONALITY_SHIFT));
+                    }
+                    let rl = reloc_at(s, @as(u64, at + 24));
+                    if u.notnil(rl) and not nl.sym_dropped(oi, rl.sym) {
+                        lsda = (nl.sym_addr(oi, rl.sym) +% @bit_cast(u64, rl.addend)) - image_base;
+                        enc |= mu.HAS_LSDA;
+                    }
                 }
-                ents.push(mu.Ent.{ off: addr - image_base, len: bn.rd32(d, at + 8), enc: enc });
+                ents.push(mu.Ent.{ off: addr - image_base, len: bn.rd32(d, at + 8), enc: enc, lsda: lsda });
                 covered.put(u.intern(u.hex16(addr)), 1);
                 at += 32;
             }
@@ -1370,8 +1409,8 @@ fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
         if covered.get(u.intern(u.hex16(a))) == 0 {
             ents.push(
                 mu.Ent.{
-                    off: a - image_base, len: fde_len.get(j),
-                    enc: mu.dwarf_mode(x64) | @truncate(u32, fde_off.get(j)) });
+                    off: a - image_base, len: fde_len.get(j), enc: mu.dwarf_mode(x64) | @truncate(u32, fde_off.get(j)),
+                    lsda: 0 });
         }
     }
     if (fde_off.len > 0) and (fde_off.last() >= 0x100_0000) {
@@ -1391,7 +1430,7 @@ fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
             }
             let off = nl.sym_addr(oi, @truncate(u32, si)) - image_base;
             if not mu.covers(all.items(), off) {
-                more.push(mu.Ent.{ off: off, len: y.size, enc: 0 });
+                more.push(mu.Ent.{ off: off, len: y.size, enc: 0, lsda: 0 });
             }
         }
     }
@@ -1400,13 +1439,17 @@ fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
             more.push(e);
         }
         if more.len == 0 {
-            more.push(mu.Ent.{ off: text_addr - image_base, len: code_end - text_addr, enc: 0 });
+            more.push(mu.Ent.{ off: text_addr - image_base, len: code_end - text_addr, enc: 0, lsda: 0 });
         }
         all.deinit();
         all = mu.sorted(more.items());
     }
     more.deinit();
-    let b = mu.info(all.items());
+    let mut np = unwind_pers.len;
+    if np > 3 {
+        np = 3;  // (an error: above)
+    }
+    let b = mu.info(all.items(), unwind_pers.items()[0..np]);
     ents.deinit();
     all.deinit();
     fde_fn.deinit();
@@ -1482,6 +1525,12 @@ fn lay_out() Layout {
     data_addr = image_base + text_size;
     data_off = text_size;
     got_addr = data_addr;
+    if unwind_pers.len > 0 {
+        // (again, with the personalities' GOT slots where they are now: the
+        // size is the same)
+        unwind.free();
+        unwind = unwind_info(eh_addr, stub_addr);
+    }
     let data_start = nl.align_up(got_addr + (ngot * 8), 16);
     let mut data_end = nl.place(nl.C_DATA, data_start);
     tls_align = @max(nl.class_align(nl.C_TDATA), nl.class_align(nl.C_TBSS));

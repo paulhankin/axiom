@@ -57,11 +57,12 @@ const PAGE: u64 = 0x10000;
 // A shared library: its SONAME and defined dynamic symbols.
 struct Lib {
     soname: []u8,
-    syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object, 3 thread-local
-    sizes: u.SymMap.[u64],  // name -> its size (data objects, for copy relocations)
-    vers: u.SymMap.[[]u8],  // name -> its default version (if versioned)
-    prot: u.SymMap.[u8],    // name -> 1: protected (STV_PROTECTED)
-    undefs: u.SymMap.[u8],  // name -> 1: what it refers to and does not define
+    syms: u.SymMap.[u8],         // name -> 1 function/other, 2 data object, 3 thread-local
+    sizes: u.SymMap.[u64],       // name -> its size (data objects, for copy relocations)
+    vers: u.SymMap.[[]u8],       // name -> its default version (if versioned)
+    prot: u.SymMap.[u8],         // name -> 1: protected (STV_PROTECTED)
+    undefs: u.SymMap.[u8],       // name -> 1: what it refers to and does not define
+    undef_names: u.List.[[]u8],  // (the same names, in the order read)
     used: bool,
     known: bool,  // its symbols were read
 }
@@ -269,7 +270,11 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             if (shndx == 0) and (bind != elf.B_LOCAL) {
                 let un = elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e)));
                 if un.len > 0 {
-                    l.undefs.put(u.intern(un), 1);
+                    let k = u.intern(un);
+                    if not l.undefs.has(k) {
+                        l.undefs.put(k, 1);
+                        l.undef_names.push(k);
+                    }
                 }
                 continue;
             }
@@ -362,6 +367,9 @@ fn collect_symbols() void {
         for i in 0..libs.len {
             let l = libs.get(i);
             let k = l.syms.get(ln);
+            if (k != 0) and g.weak and g_c_lib_axiom and is_system_c(l.soname) and system_own(g.name) {
+                break;  // (stays null: a weak reference to the system C library's own)
+            }
             if k != 0 {
                 l.used = true;
                 found = true;
@@ -1238,7 +1246,7 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
                         check32(v, "GOT");
                         bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
                     } else {
-                        nl.a64_got(b, fo, p, t, ga);
+                        nl.a64_got(b, fo, p, t, ga, a);
                     }
                     continue;
                 }
@@ -1884,8 +1892,7 @@ fn check_foreign_refs() void {
                 continue;
             }
             let n = g.name;
-            let reserved = u.starts(n, "__") or ((n.len > 1) and (n[0] == '_') and (n[1] >= 'A') and (n[1] <= 'Z'));
-            if reserved and not in_list(n, SYSTEM_OK[..]) {
+            if is_reserved(n) and not in_list(n, SYSTEM_OK[..]) {
                 nl.err(u.f2("%s refers to '%s', a name of the system's C library's own implementation (from its headers): with the compiler's C library (--c-lib=axiom) the program would have two; build with --c-lib=system, or compile that code without the header feature that uses it",
                             o.name, n));
             } else if in_list(n, SYSTEM_STREAMS[..]) {
@@ -1894,6 +1901,65 @@ fn check_foreign_refs() void {
             }
         }
     }
+    // the platform's shared libraries (a language's run-time library, built
+    // against the system's C library): the same names, by what they refer
+    // to (a reference to a name the program defines binds to the
+    // program's, which is exported; the others to the system's library):
+    // one error for each such library, with the first names
+    for li in 0..libs.len {
+        let l = libs.get(li);
+        if is_c_runtime(l.soname) or not l.known {
+            continue;
+        }
+        let mut bad = u.List.[[]u8].empty();
+        for n in l.undef_names.items() {
+            let gi = nl.gmap.get(n);
+            let ours = (gi != 0) and (nl.gsyms.at(@as(usize, gi - 1)).obj >= 0);
+            if (in_list(n, SYSTEM_LAYOUTS[..]) and ours) or in_list(n, SYSTEM_STREAMS[..]) or
+               (is_reserved(n) and not ours and not in_list(n, SYSTEM_OK[..]) and system_defines(n)) {
+                bad.push(u.f1("'%s'", n));
+            }
+        }
+        if bad.len > 0 {
+            let mut names = bad.get(0);
+            let mut k: usize = 1;
+            while (k < bad.len) and (k < 3) {
+                names = u.f2("%s, %s", names, bad.get(k));
+                k += 1;
+            }
+            if bad.len > 3 {
+                names = u.cat2(names, ", ...");
+            }
+            nl.err(u.f2("%s is built against the system's C library (it refers to %s, its own or its streams' names, or to a function whose fpos_t or mbstate_t the program's C library lays out otherwise): with the compiler's C library (--c-lib=axiom) the program would have two; build with --c-lib=system",
+                        l.soname, names));
+        }
+    }
+}
+
+// Does a library of the system's C library define n?
+fn system_defines(n: []u8) bool {
+    for i in 0..libs.len {
+        let l = libs.get(i);
+        if is_system_c(l.soname) and (l.syms.get(n) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A name reserved to the implementation (C17 7.1.3): two underscores, or an
+// underscore and a capital letter.
+fn is_reserved(n: []u8) bool {
+    return u.starts(n, "__") or ((n.len > 1) and (n[0] == '_') and (n[1] >= 'A') and (n[1] <= 'Z'));
+}
+
+// --c-lib=axiom: a name that check_foreign_refs rejects when it binds to the
+// system's C library. A weak reference to one (the platform's unwinder's to
+// the threads of that library: __pthread_key_create, by whose presence it
+// tells whether the program has threads) is left unbound, null, rather than
+// bound to it, so that such code takes the program to be without them.
+fn system_own(n: []u8) bool {
+    return (is_reserved(n) and not in_list(n, SYSTEM_OK[..])) or in_list(n, SYSTEM_STREAMS[..]);
 }
 
 fn is_system_c(soname: []u8) bool {

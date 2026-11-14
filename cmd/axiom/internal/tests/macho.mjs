@@ -220,7 +220,9 @@ function checkLinks(d, { x64, E, tsect, text, bound, defined, starts }) {
 // code), each second-level page (regular or compressed: in bounds, its
 // entries in order and within its range) and each encoding (a mode of the
 // architecture with well-formed fields; the DWARF mode's offset an FDE of
-// __eh_frame that starts at the function and covers it); __eh_frame's
+// __eh_frame that starts at the function and covers it; the personality
+// numbered and the LSDA flagged as the personalities, slots of __got, and
+// the LSDA index, in order, have them); __eh_frame's
 // entries (lengths, each FDE's CIE, augmentations); and every function (a
 // symbol in __text before the stubs) has an entry with an encoding.
 function checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs }) {
@@ -269,6 +271,26 @@ function checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs }) {
   const [ceo, cen, peo, pen, io, icount] = [4, 8, 12, 16, 20, 24].map((k) => u32(uo + k));
   if (!inUi(ceo, 4 * cen) || !inUi(peo, 4 * pen) || !inUi(io, 12 * icount) || icount < 2) { E('__unwind_info header is out of bounds'); return {}; }
   const common = Array.from({ length: cen }, (_, k) => u32(uo + ceo + 4 * k));
+  // the personalities: GOT slots (the image offsets of __got's words)
+  const got = sects.find((s) => s.sn === '__got');
+  for (let k = 0; k < pen; k++) {
+    const a = base + u32(uo + peo + 4 * k);
+    if (!got || a < got.addr || a + 8 > got.addr + got.ssize || (a - got.addr) % 8) E(`personality ${k + 1} (0x${a.toString(16)}) is not a slot of __got`);
+  }
+  // the LSDA index: from the first-level index's first entry to its
+  // sentinel's, in function order, each LSDA in a section of the image
+  const lsdaLo = icount ? u32(uo + io + 8) : 0, lsdaHi = icount ? u32(uo + io + 12 * (icount - 1) + 8) : 0;
+  const lsdas = new Map();
+  if (lsdaHi < lsdaLo || !inUi(lsdaLo, lsdaHi - lsdaLo) || (lsdaHi - lsdaLo) % 8) E('the LSDA index is out of bounds');
+  else {
+    for (let o = lsdaLo, last = -1; o < lsdaHi; o += 8) {
+      const f = u32(uo + o), l = u32(uo + o + 4);
+      if (f <= last) E(`the LSDA index's entry for 0x${f.toString(16)} is out of order`);
+      last = f;
+      if (!sects.some((s) => base + l >= s.addr && base + l < s.addr + s.ssize)) E(`the LSDA of the function at 0x${f.toString(16)} (0x${l.toString(16)}) is in no section`);
+      lsdas.set(f, l);
+    }
+  }
   const ents = [];
   const tlo = tsect.addr - base, thi = tsect.addr + tsect.ssize - base;
   let prev = -1;
@@ -304,6 +326,9 @@ function checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs }) {
     if (e.off < e.first || e.off >= e.next) E(`unwind entry 0x${e.off.toString(16)} is outside its page's range`);
     const mode = e.enc & 0x0f000000, x = e.enc & 0x00ffffff;
     if (e.enc === 0) { none++; continue; }
+    // (a personality's number, and the LSDA flag with the index's entry)
+    if (((e.enc >>> 28) & 3) > pen) E(`unwind entry 0x${e.off.toString(16)} names personality ${(e.enc >>> 28) & 3} of ${pen}`);
+    if (((e.enc >>> 30) & 1) !== (lsdas.has(e.off) ? 1 : 0)) E(`unwind entry 0x${e.off.toString(16)}: its LSDA flag and the LSDA index disagree`);
     const fend = j + 1 < ents.length ? ents[j + 1].off : end;
     if ((x64 && mode === 0x04000000) || (!x64 && mode === 0x03000000)) {
       dwarf++;
