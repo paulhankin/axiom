@@ -3576,6 +3576,8 @@ standard it claims, "Known deviations".
 - No Microsoft extensions but `__declspec` ("GNU dialects", Language).
 - No `_Complex __int128`, and no `++` or `--` of a complex value (`C3901`, `C3020`: "GNU
   dialects", Language: integer complex types).
+- No variably modified members of structures and unions, which the GNU dialects
+  would accept in a function (issue #62).
 - At most 128 trampolines of one nested function live at once; one more traps ("GNU
   dialects", Language: nested functions).
 - No option sets the stack of the threads `thrd_create` starts (8 MiB natively, 1 MiB on
@@ -3597,7 +3599,7 @@ standard it claims, "Known deviations".
 - Mutexes are neither fair nor robust ("Threads").
 - On macOS under `--macos-tls=fast` a thread that the runtime did not start (the system's
   `pthread_create`) has no thread-locals ("Atomics and threads").
-- Intrinsics not provided: AVX-512's, AMX's, Key Locker's, the system instructions'
+- Intrinsics not provided: AVX-512's (issue #61), AMX's, Key Locker's, the system instructions'
   (`_xsave` ...), `<arm_sve.h>`, FCMA, FRINTTS, JSCVT, RNG, MTE and TME, `__arm_rsr` and
   `__arm_wsr`; RDRAND and RDSEED intrinsics are not checked against `--features`; the
   non-temporal hints are dropped ("Intrinsics").
