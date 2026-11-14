@@ -1558,13 +1558,13 @@ pub fn tag_slot(i: *Value) *mut Value {
 /// Tags operation i (has_tag_slot) with restrict scope t (nil: none).
 pub fn set_tag(i: *mut Value, t: *mut Value) void {
     if is_memop(i.op) {
-        i.xs.clear();
+        clear_x(i);
         if u.notnil(t) {
-            i.xs.push(t);
+            push_x(i, t);
         }
         return;
     }
-    i.c = t;
+    set_c(i, t);
 }
 
 /// The restrict scope operation i is tagged with (IN_RSCOPE), or nil.
@@ -1894,6 +1894,33 @@ pub fn same_or_apart(v: *Value) bool {
     return (v.op == OP_MEMMOVE) and (v.cv == MEMMOVE_SAME_OR_APART);
 }
 
+// Def-use lists. Each instruction in a block of its function is on the
+// lists of uses of the instructions it reads (it is registered): its
+// operands a, b and c through the places ua, ub and uc in it, the operands
+// in xs through those in xu. A value's list (first_use, then Use.next) has
+// a place for each operand that reads it, nuses of them, in no particular
+// order; values other than instructions (constants, parameters, globals)
+// have none. An instruction is registered when it goes into a block that is
+// in its function's list (insert_before, append_inst) and taken off when it
+// leaves (remove_inst, remove_block), so the uses are those that walking
+// the function would count. Operands of a registered instruction change
+// only through set_a, set_b, set_c, set_x, push_x, ... (which keep the
+// lists); those of one out of a block may be set directly, until it goes in.
+pub struct Use {
+    next: *mut Use,
+    // the address of what points here (the value's first_use or the previous
+    // place's next), with which operand this is in its low two bits: 0 a,
+    // 1 b, 2 c (a place in the user itself), 3 one of xs (an XUse); 0 when
+    // the place is on no list
+    back: usize,
+}
+
+// The place of one of an instruction's xs on a list of uses.
+pub struct XUse {
+    u: Use,
+    user: *mut Value,
+}
+
 pub struct Value {
     // the fields every walk over the IR reads come first (two cache lines)
     kind: ValueKind,
@@ -1907,9 +1934,16 @@ pub struct Value {
     prev: *mut Value,
     blk: *mut Block,
     fwd: *mut Value,   // replacement (passes forward uses through resolve())
-    user: *mut Value,  // the only user (when uses == 1)
-    uses: i32,
+    user: *mut Value,  // backends: the only user (when uses == 1), with
+    uses: i32,         // the number of uses when they began (isel.count_uses, wasm.count_uses)
     flags: u32,
+    first_use: *mut Use,  // its uses (instructions only: see Use)
+    ua: Use,              // the places of a, b and c on their lists of uses (registered instructions)
+    ub: Use,
+    uc: Use,
+    xu: *mut XUse,  // those of xs (xucap & XU_CAP of them)
+    nuses: i32,     // the number of its uses (first_use's list)
+    xucap: u32,     // and XU_REG: registered, on the lists of uses of what it reads
     cv: u64,
     id: i32,
     align: u32,
@@ -2473,6 +2507,7 @@ pub struct Block {
     grave: u32,  // 1 + its index in the graveyard (0: not there)
     loop_depth: i32,
     split: bool,    // a loop header whose range was split (gvn.split_loops)
+    gone: bool,     // taken out of its function (remove_block): its instructions are not registered
     guarded: bool,  // a loop that idioms.loop_copies keeps for the case its memmove cannot take
     cold: bool,     // seldom run, a front end says (C's __builtin_expect, the attribute cold): laid out apart
     // a loop header: what the program asks of the loop (C's #pragma GCC
@@ -2737,6 +2772,9 @@ fn bury_value(v: *mut Value) void {
         dbg_buried(v);
         _ = dbg_take(v);
     }
+    unregister(v);
+    drop_uses(v);
+    free_xu(v);
     v.xs.deinit();
     release_more(v);
     if u.poisoning() {
@@ -2753,14 +2791,43 @@ pub fn release_lists(f: *mut Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
+            // (off the lists, which go: see forget_uses)
+            i.xucap = i.xucap & XU_CAP;
+            i.first_use = u.nil.[Use]();
+            i.nuses = 0;
+            free_xu(i);
             i.xs.deinit();
-            i.xs = u.List.[*mut Value].empty();
+            set_xs(i, u.List.[*mut Value].empty());
             i = i.next;
         }
         b.preds.deinit();
         b.preds = u.List.[*mut Block].empty();
         b.dom_kids.deinit();
         b.dom_kids = u.List.[*mut Block].empty();
+        b = b.next;
+    }
+}
+
+fn free_xu(v: *mut Value) void {
+    if @int_from_ptr(v.xu) != 0 {
+        u.free(@ptr_cast(*mut void, v.xu));
+        v.xu = @ptr_from_int(*mut XUse, 0);
+        v.xucap = v.xucap & XU_REG;
+    }
+}
+
+// f's instructions are done with: off the lists, which go (together: none
+// is taken off another's).
+fn forget_uses(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.xucap = i.xucap & XU_CAP;
+            i.first_use = u.nil.[Use]();
+            i.nuses = 0;
+            i = i.next;
+        }
         b = b.next;
     }
 }
@@ -3130,7 +3197,7 @@ pub fn cagg(t: *mut Ty, xs: []mut *mut Value) *mut Value {
     let c = new_val(V_CAGG, t);
     c.xs.reserve(xs.len);
     for x in xs {
-        c.xs.push(x);
+        push_x(c, x);
     }
     return c;
 }
@@ -3334,7 +3401,7 @@ pub fn new_param(f: *mut Func, t: *mut Ty, idx: usize) *mut Value {
 }
 
 // The value `v` stands for after replacements.
-pub fn resolve(v: *mut Value) *mut Value {
+pub inline fn resolve(v: *mut Value) *mut Value {
     let mut x = v;
     while u.notnil(x) and u.notnil(x.fwd) {
         x = x.fwd;
@@ -3342,17 +3409,489 @@ pub fn resolve(v: *mut Value) *mut Value {
     return x;
 }
 
-// Bumped whenever a value is forwarded: a function that apply_forwarding
-// has rewritten since then has no operand to rewrite.
+// Bumped whenever a value other than an instruction is forwarded: a
+// function that apply_forwarding has rewritten since then has no operand to
+// rewrite.
 let mut fwd_epoch: u64 = 1;
 
-// Forwards v's uses to r (or, with r nil, stops forwarding them).
+// Forwards v's uses to r (or, with r nil, stops forwarding them). The uses
+// of an instruction move to r at once (replace_all: its operands are
+// rewritten, and v reads as r through resolve() to whoever kept it); those
+// of other values (parameters, globals, functions), which have no lists,
+// when apply_forwarding next rewrites a function.
 pub fn forward(v: *mut Value, r: *mut Value) void {
     v.fwd = r;
-    fwd_epoch += 1;
     if dbg_on and u.notnil(r) {
         dbg_replace(v, r);  // (nil: forwarding stops, v is v again)
     }
+    if (v.kind == V_INST) and u.notnil(r) {
+        replace_all(v, resolve(r));
+    } else {
+        fwd_epoch += 1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Def-use lists (see Use)
+// -----------------------------------------------------------------------------
+const USE_TAG: usize = 3;
+const XU_REG: u32 = 0x8000_0000;
+const XU_CAP: u32 = 0x7fff_ffff;
+
+// Whether i is registered (see Use).
+pub inline fn is_reg(i: *Value) bool {
+    return (i.xucap & XU_REG) != 0;
+}
+
+// Whether x has a list of uses.
+inline fn tracked(x: *Value) bool {
+    return u.notnil(x) and (x.kind == V_INST);
+}
+
+inline fn use_ptr(a: usize) *mut *mut Use {
+    return @ptr_from_int(*mut *mut Use, a & ~USE_TAG);
+}
+
+// Puts place p (with its tag) first on x's list.
+inline fn use_link(p: *mut Use, x: *mut Value, tag: usize) void {
+    let h = x.first_use;
+    p.next = h;
+    if u.notnil(h) {
+        h.back = @int_from_ptr(&mut p.next) | (h.back & USE_TAG);
+    }
+    p.back = @int_from_ptr(&mut x.first_use) | tag;
+    x.first_use = p;
+    x.nuses += 1;
+}
+
+// Takes place p off the list of x, the value its operand reads (if it is on one).
+inline fn use_unlink(p: *mut Use, x: *mut Value) void {
+    if p.back == 0 {
+        return;
+    }
+    use_ptr(p.back).* = p.next;
+    if u.notnil(p.next) {
+        p.next.back = (p.back & ~USE_TAG) | (p.next.back & USE_TAG);
+    }
+    p.back = 0;
+    p.next = u.nil.[Use]();
+    x.nuses -= 1;
+}
+
+// The instruction whose operand place p is.
+pub fn use_user(p: *Use) *mut Value {
+    let tag = p.back & USE_TAG;
+    if tag == USE_TAG {
+        return @ptr_cast(*XUse, p).user;
+    }
+    return @ptr_from_int(*mut Value, (@int_from_ptr(p) - @offset_of(Value, ua)) - (tag * @size_of(Use)));
+}
+
+// Which operand of its user place p is: 0 a, 1 b, 2 c, 3 + k xs[k].
+pub fn use_slot(p: *Use) usize {
+    let tag = p.back & USE_TAG;
+    if tag == USE_TAG {
+        let x = @ptr_cast(*XUse, p);
+        return 3 + ((@int_from_ptr(p) - @int_from_ptr(x.user.xu)) / @size_of(XUse));
+    }
+    return tag;
+}
+
+// v's only user when it has one use (else nil).
+pub fn single_user(v: *Value) *mut Value {
+    if v.nuses != 1 {
+        return vnil();
+    }
+    return use_user(v.first_use);
+}
+
+// Whether all of v's uses (at least one) are in one instruction (`x + x`).
+pub fn one_user(v: *Value) bool {
+    let p = v.first_use;
+    if u.isnil(p) {
+        return false;
+    }
+    let w = use_user(p);
+    let mut q = p.next;
+    while u.notnil(q) {
+        if use_user(q) != w {
+            return false;
+        }
+        q = q.next;
+    }
+    return true;
+}
+
+// Operand k of i: a, b, c, then xs.
+pub fn operand(i: *Value, k: usize) *mut Value {
+    if k == 0 {
+        return i.a;
+    }
+    if k == 1 {
+        return i.b;
+    }
+    if k == 2 {
+        return i.c;
+    }
+    return i.xs.get(k - 3);
+}
+
+// Sets operand k of i (as set_a ... set_x do).
+pub fn set_operand(i: *mut Value, k: usize, x: *mut Value) void {
+    if k == 0 {
+        set_a(i, x);
+    } else if k == 1 {
+        set_b(i, x);
+    } else if k == 2 {
+        set_c(i, x);
+    } else {
+        set_x(i, k - 3, x);
+    }
+}
+
+// What a registered instruction's operand reads: x after replacements.
+inline fn live_op(x: *mut Value) *mut Value {
+    if u.notnil(x) and u.notnil(x.fwd) {
+        return resolve(x);
+    }
+    return x;
+}
+
+inline fn set_slot(i: *mut Value, p: *mut Use, old: *mut Value, x: *mut Value, tag: usize) void {
+    use_unlink(p, old);
+    if tracked(x) {
+        use_link(p, x, tag);
+    }
+}
+
+pub inline fn set_a(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.a) or not is_reg(i) {
+        i.a = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.ua, i.a, x, 0);
+    i.a = x;
+}
+
+pub inline fn set_b(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.b) or not is_reg(i) {
+        i.b = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.ub, i.b, x, 1);
+    i.b = x;
+}
+
+pub inline fn set_c(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.c) or not is_reg(i) {
+        i.c = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.uc, i.c, x, 2);
+    i.c = x;
+}
+
+fn xuse(i: *Value, k: usize) *mut Use {
+    return @ptr_cast(*mut Use, @ptr_from_int(*mut XUse, @int_from_ptr(i.xu) + (k * @size_of(XUse))));
+}
+
+// Room for n places of xs in xu (moving the first `live`, which may be on
+// lists, with their neighbours' links).
+fn xu_room(i: *mut Value, n: usize, live: usize) void {
+    if n <= @as(usize, i.xucap & XU_CAP) {
+        return;
+    }
+    let mut cap = @as(usize, i.xucap & XU_CAP) * 2;
+    if cap < n {
+        cap = n;
+    }
+    if cap < 4 {
+        cap = 4;
+    }
+    let nx = @ptr_cast(*mut XUse, u.malloc(cap * @size_of(XUse)));
+    let old = i.xu;
+    i.xu = nx;
+    for k in 0..live {
+        let o = @ptr_from_int(*mut XUse, @int_from_ptr(old) + (k * @size_of(XUse)));
+        let p = @ptr_from_int(*mut XUse, @int_from_ptr(nx) + (k * @size_of(XUse)));
+        p.* = o.*;
+        if p.u.back != 0 {
+            use_ptr(p.u.back).* = &mut p.u;
+            if u.notnil(p.u.next) {
+                p.u.next.back = @int_from_ptr(&mut p.u.next) | (p.u.next.back & USE_TAG);
+            }
+        }
+    }
+    if @int_from_ptr(old) != 0 {
+        u.free(@ptr_cast(*mut void, old));
+    }
+    i.xucap = (i.xucap & XU_REG) | @truncate(u32, cap);
+}
+
+fn xs_link(i: *mut Value, k: usize, x: *mut Value) void {
+    let p = xuse(i, k);
+    @ptr_cast(*mut XUse, p).user = i;
+    p.back = 0;
+    p.next = u.nil.[Use]();
+    if tracked(x) {
+        use_link(p, x, USE_TAG);
+    }
+}
+
+// Sets xs[k] of i.
+pub inline fn set_x(i: *mut Value, k: usize, x0: *mut Value) void {
+    if not is_reg(i) {
+        i.xs.set(k, x0);
+        return;
+    }
+    let x = live_op(x0);
+    if x == i.xs.get(k) {
+        return;
+    }
+    use_unlink(xuse(i, k), i.xs.get(k));
+    if tracked(x) {
+        use_link(xuse(i, k), x, USE_TAG);
+    }
+    i.xs.set(k, x);
+}
+
+// Appends x to i's xs.
+pub fn push_x(i: *mut Value, x0: *mut Value) void {
+    if not is_reg(i) {
+        i.xs.push(x0);
+        return;
+    }
+    let x = live_op(x0);
+    xu_room(i, i.xs.len + 1, i.xs.len);
+    i.xs.push(x);
+    xs_link(i, i.xs.len - 1, x);
+}
+
+// Keeps the first n of i's xs.
+pub fn trunc_x(i: *mut Value, n: usize) void {
+    if is_reg(i) {
+        for k in n..i.xs.len {
+            use_unlink(xuse(i, k), i.xs.get(k));
+        }
+    }
+    i.xs.len = n;
+}
+
+pub fn clear_x(i: *mut Value) void {
+    trunc_x(i, 0);
+}
+
+// Gives i the operands xs (a list it takes).
+pub fn set_xs(i: *mut Value, xs: u.List.[*mut Value]) void {
+    if not is_reg(i) {
+        i.xs = xs;
+        return;
+    }
+    trunc_x(i, 0);
+    i.xs.deinit();
+    i.xs = xs;
+    xu_room(i, xs.len, 0);
+    for k in 0..i.xs.len {
+        let x = live_op(i.xs.get(k));
+        i.xs.set(k, x);
+        xs_link(i, k, x);
+    }
+}
+
+// Puts i on the lists of what it reads (its operands through resolve(),
+// which those of an instruction out of a block may need).
+fn register(i: *mut Value) void {
+    i.xucap = i.xucap | XU_REG;
+    i.a = live_op(i.a);
+    i.ua.back = 0;
+    if tracked(i.a) {
+        use_link(&mut i.ua, i.a, 0);
+    }
+    i.b = live_op(i.b);
+    i.ub.back = 0;
+    if tracked(i.b) {
+        use_link(&mut i.ub, i.b, 1);
+    }
+    i.c = live_op(i.c);
+    i.uc.back = 0;
+    if tracked(i.c) {
+        use_link(&mut i.uc, i.c, 2);
+    }
+    let n = i.xs.len;
+    if n > 0 {
+        xu_room(i, n, 0);
+        for k in 0..n {
+            let x = live_op(i.xs.get(k));
+            i.xs.set(k, x);
+            xs_link(i, k, x);
+        }
+    }
+}
+
+// Takes i off the lists of what it reads.
+fn unregister(i: *mut Value) void {
+    if not is_reg(i) {
+        return;
+    }
+    i.xucap = i.xucap & XU_CAP;
+    use_unlink(&mut i.ua, i.a);
+    use_unlink(&mut i.ub, i.b);
+    use_unlink(&mut i.uc, i.c);
+    for k in 0..i.xs.len {
+        use_unlink(xuse(i, k), i.xs.get(k));
+    }
+}
+
+// i goes into block b: registered if b is in its function.
+inline fn placed(i: *mut Value, b: *Block) void {
+    if b.gone {
+        unregister(i);
+    } else if not is_reg(i) {
+        register(i);
+    }
+}
+
+// Every use of instruction `old` reads `new` instead, at a cost of one
+// step per use.
+pub fn replace_all(old: *mut Value, new: *mut Value) void {
+    let h = old.first_use;
+    if (old == new) or u.isnil(h) {
+        return;
+    }
+    let mut p = h;
+    let mut last = h;
+    while u.notnil(p) {
+        let i = use_user(p);
+        let k = use_slot(p);
+        if k == 0 {
+            i.a = new;
+        } else if k == 1 {
+            i.b = new;
+        } else if k == 2 {
+            i.c = new;
+        } else {
+            i.xs.set(k - 3, new);
+        }
+        last = p;
+        p = p.next;
+    }
+    let n = old.nuses;
+    old.first_use = u.nil.[Use]();
+    old.nuses = 0;
+    if not tracked(new) {
+        p = h;
+        while u.notnil(p) {
+            let nx = p.next;
+            p.back = 0;
+            p.next = u.nil.[Use]();
+            p = nx;
+        }
+        return;
+    }
+    // (old's list goes before new's)
+    let nh = new.first_use;
+    last.next = nh;
+    if u.notnil(nh) {
+        nh.back = @int_from_ptr(&mut last.next) | (nh.back & USE_TAG);
+    }
+    h.back = @int_from_ptr(&mut new.first_use) | (h.back & USE_TAG);
+    new.first_use = h;
+    new.nuses += n;
+}
+
+// The places on v's list come off it (v is gone; its users, which should
+// have none, keep reading it).
+fn drop_uses(v: *mut Value) void {
+    let mut p = v.first_use;
+    while u.notnil(p) {
+        let nx = p.next;
+        p.back = 0;
+        p.next = u.nil.[Use]();
+        p = nx;
+    }
+    v.first_use = u.nil.[Use]();
+    v.nuses = 0;
+}
+
+let mut checking: i32 = -1;  // AXIOM_CHECK_IR: unknown, no, yes
+
+// Debugging (AXIOM_CHECK_IR): check_uses(f) between passes.
+pub fn check_point(f: *Func) void {
+    if checking < 0 {
+        checking = 0;
+        if not u.isnos(u.env("AXIOM_CHECK_IR")) {
+            checking = 1;
+        }
+    }
+    if checking == 1 {
+        check_uses(f);
+    }
+}
+
+// Debugging (AXIOM_CHECK_IR): the lists of uses of f's instructions are
+// those of its blocks' operands.
+pub fn check_uses(f: *Func) void {
+    let mut seen = u.U64Map.empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            seen.put(@as(u64, @int_from_ptr(i)), 1);
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        if b.gone {
+            u.die(u.f2("%s: block %s is gone but in the function", f.name, b.name));
+        }
+        let mut i = b.first;
+        while u.notnil(i) {
+            if not is_reg(i) {
+                u.die(u.f2("%s: %s is not registered", f.name, inst_str(i)));
+            }
+            let n = 3 + i.xs.len;
+            for k in 0..n {
+                let x = operand(i, k);
+                let mut p = xuse(i, k - 3);
+                if k == 0 {
+                    p = &mut i.ua;
+                } else if k == 1 {
+                    p = &mut i.ub;
+                } else if k == 2 {
+                    p = &mut i.uc;
+                }
+                if tracked(x) != (p.back != 0) {
+                    u.die(
+                        u.f3(
+                            "%s: %s: operand %s is not on its list of uses", f.name, inst_str(i), u.udec(@as(u64, k))));
+                }
+                if u.notnil(x) and u.notnil(x.fwd) {
+                    u.die(u.f3("%s: %s: operand %s was replaced", f.name, inst_str(i), u.udec(@as(u64, k))));
+                }
+            }
+            let mut c: i32 = 0;
+            let mut p = i.first_use;
+            while u.notnil(p) {
+                let w = use_user(p);
+                if (seen.get(@as(u64, @int_from_ptr(w))) == 0) or not is_reg(w) or (operand(w, use_slot(p)) != i) {
+                    u.die(u.f3("%s: %s: a use by %s that is not one", f.name, inst_str(i), inst_str(w)));
+                }
+                c += 1;
+                p = p.next;
+            }
+            if c != i.nuses {
+                u.die(u.f3("%s: %s: %s uses counted", f.name, inst_str(i), u.idec(i.nuses)));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    seen.deinit();
 }
 
 // -----------------------------------------------------------------------------
@@ -3983,16 +4522,16 @@ pub fn apply_forwarding(f: *mut Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if u.notnil(i.a) {
-                i.a = resolve(i.a);
+                set_a(i, resolve(i.a));
             }
             if u.notnil(i.b) {
-                i.b = resolve(i.b);
+                set_b(i, resolve(i.b));
             }
             if u.notnil(i.c) {
-                i.c = resolve(i.c);
+                set_c(i, resolve(i.c));
             }
             for k in 0..i.xs.len {
-                i.xs.set(k, resolve(i.xs.get(k)));
+                set_x(i, k, resolve(i.xs.get(k)));
             }
             i = i.next;
         }
@@ -4057,6 +4596,7 @@ pub fn append_block(f: *mut Func, name: []u8) *mut Block {
 // for reuse: f is left a declaration. For a function nothing refers to.
 pub fn drop_body(f: *mut Func) void {
     recycle(f);
+    forget_uses(f);
     // last first, so that they are reused in the order they lie in memory
     let mut b = f.last;
     while u.notnil(b) {
@@ -4083,6 +4623,17 @@ pub fn remove_block(b: *mut Block) void {
         mk_block_gone(b);
     }
     unlink_block(b);
+    gone_block(b);
+}
+
+// b is out of its function: its instructions read nothing.
+fn gone_block(b: *mut Block) void {
+    b.gone = true;
+    let mut i = b.first;
+    while u.notnil(i) {
+        unregister(i);
+        i = i.next;
+    }
 }
 
 // Removes block b, which no path reaches: what its marks say never takes
@@ -4097,6 +4648,7 @@ fn remove_unreached_block(b: *mut Block) void {
         _ = mk_block_take(b);
     }
     unlink_block(b);
+    gone_block(b);
 }
 
 /// Block `from`'s marks at its end (after its last instruction) go to the
@@ -4145,6 +4697,15 @@ pub fn move_block_after(b: *mut Block, after: *mut Block) void {
         f.last = b;
     }
     after.next = b;
+    if b.gone {
+        // (back in)
+        b.gone = false;
+        let mut i = b.first;
+        while u.notnil(i) {
+            register(i);
+            i = i.next;
+        }
+    }
 }
 
 pub fn terminator(b: *Block) *mut Value {
@@ -4209,6 +4770,7 @@ pub fn insert_before(pos: *mut Value, v: *mut Value) void {
         b.first = v;
     }
     pos.prev = v;
+    placed(v, b);
 }
 
 pub fn append_inst(b: *mut Block, v: *mut Value) void {
@@ -4227,6 +4789,7 @@ pub fn append_inst(b: *mut Block, v: *mut Value) void {
         b.first = v;
     }
     b.last = v;
+    placed(v, b);
 }
 
 /// Moves the instructions after v in its block, in order, to the end of the
@@ -4246,6 +4809,7 @@ pub fn move_rest(v: *mut Value, to: *mut Block) void {
         }
         to_grave(i, b.fnp);
         i.blk = to;
+        placed(i, to);
         i = i.next;
     }
     first.prev = vnil();
@@ -4275,6 +4839,7 @@ pub fn remove_inst(v: *mut Value) void {
     v.prev = vnil();
     v.next = vnil();
     v.blk = bnil();
+    unregister(v);
 }
 
 // Operands of an instruction, in order: a, b, c, then xs.
@@ -4297,6 +4862,10 @@ pub fn replace_uses(f: *mut Func, old: *mut Value, new: *mut Value) void {
     if dbg_on {
         dbg_replace(old, new);
     }
+    if tracked(old) {
+        replace_all(old, live_op(new));
+        return;
+    }
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -4310,17 +4879,17 @@ pub fn replace_uses(f: *mut Func, old: *mut Value, new: *mut Value) void {
 
 pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
     if i.a == old {
-        i.a = new;
+        set_a(i, new);
     }
     if i.b == old {
-        i.b = new;
+        set_b(i, new);
     }
     if i.c == old {
-        i.c = new;
+        set_c(i, new);
     }
     for k in 0..i.xs.len {
         if i.xs.get(k) == old {
-            i.xs.set(k, new);
+            set_x(i, k, new);
         }
     }
 }
@@ -4483,40 +5052,6 @@ pub fn ptr_base(p: *mut Value) *mut Value {
     return q;
 }
 
-// Number of uses of each instruction (uses; user: the last user).
-pub fn count_uses(f: *mut Func) void {
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            i.uses = 0;
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            use1(i.a, i);
-            use1(i.b, i);
-            use1(i.c, i);
-            for k in 0..i.xs.len {
-                use1(i.xs.get(k), i);
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-}
-
-fn use1(o: *mut Value, i: *mut Value) void {
-    if u.notnil(o) and (o.kind == V_INST) {
-        o.uses += 1;
-        o.user = i;
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Phi inputs and edges
 // -----------------------------------------------------------------------------
@@ -4534,9 +5069,9 @@ pub fn incoming(p: *Value, from: *mut Block) *mut Value {
 // Removes input k of phi p (the last input takes its place).
 pub fn remove_incoming(p: *mut Value, k: usize) void {
     bs_of(p).set(k, bs_of(p).get(bs_of(p).len - 1));
-    p.xs.set(k, p.xs.get(p.xs.len - 1));
+    set_x(p, k, p.xs.get(p.xs.len - 1));
     bs_mut(p).len -= 1;
-    p.xs.len -= 1;
+    trunc_x(p, p.xs.len - 1);
 }
 
 // Removes phi p's inputs from block `from`.
@@ -4693,13 +5228,13 @@ pub fn copy_inst(f: *mut Func, v: *Value) *mut Value {
     }
     y.align = v.align;
     copy_more(y, v);  // (with a block list of its own, filled below)
-    y.a = v.a;
-    y.b = v.b;
-    y.c = v.c;
+    set_a(y, v.a);
+    set_b(y, v.b);
+    set_c(y, v.c);
     y.t1 = v.t1;
     y.t2 = v.t2;
     for j in 0..v.xs.len {
-        y.xs.push(v.xs.get(j));
+        push_x(y, v.xs.get(j));
     }
     for j in 0..bs_of(v).len {
         bs_mut(y).push(bs_of(v).get(j));
@@ -4775,8 +5310,8 @@ pub fn binop(bd: *mut Builder, op: i32, x: *mut Value, y: *mut Value) *mut Value
         }
     }
     let v = emit(bd, op, t);
-    v.a = x;
-    v.b = y;
+    set_a(v, x);
+    set_b(v, y);
     return v;
 }
 
@@ -4817,7 +5352,7 @@ pub fn fneg(bd: *mut Builder, x: *mut Value) *mut Value {
         return cfp(x.ty, -fv_of(x));
     }
     let v = emit(bd, OP_FNEG, x.ty);
-    v.a = x;
+    set_a(v, x);
     return v;
 }
 
@@ -4882,16 +5417,16 @@ pub fn icmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
     }
     let v = emit(bd, OP_ICMP, cmp_ty(x.ty));
     v.cv = @as(u64, @bit_cast(u32, p));
-    v.a = x;
-    v.b = y;
+    set_a(v, x);
+    set_b(v, y);
     return v;
 }
 
 pub fn fcmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
     let v = emit(bd, OP_FCMP, cmp_ty(x.ty));
     v.cv = @as(u64, @bit_cast(u32, p));
-    v.a = x;
-    v.b = y;
+    set_a(v, x);
+    set_b(v, y);
     return v;
 }
 
@@ -4910,9 +5445,9 @@ pub fn select(bd: *mut Builder, c: *mut Value, x: *mut Value, y: *mut Value) *mu
         return x;
     }
     let v = emit(bd, OP_SELECT, x.ty);
-    v.a = c;
-    v.b = x;
-    v.c = y;
+    set_a(v, c);
+    set_b(v, x);
+    set_c(v, y);
     return v;
 }
 
@@ -4950,7 +5485,7 @@ pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
         return k;
     }
     let v = emit(bd, op, t);
-    v.a = x;
+    set_a(v, x);
     return v;
 }
 
@@ -5002,7 +5537,7 @@ pub fn alloca(bd: *mut Builder, t: *mut Ty, name: []u8) *mut Value {
 
 pub fn load(bd: *mut Builder, t: *mut Ty, p: *mut Value) *mut Value {
     let v = emit(bd, OP_LOAD, t);
-    v.a = p;
+    set_a(v, p);
     v.align = @int_cast(u32, t.align);
     tag_new(bd, v);
     return v;
@@ -5010,8 +5545,8 @@ pub fn load(bd: *mut Builder, t: *mut Ty, p: *mut Value) *mut Value {
 
 pub fn store(bd: *mut Builder, x: *mut Value, p: *mut Value) *mut Value {
     let v = emit(bd, OP_STORE, t_void());
-    v.a = x;
-    v.b = p;
+    set_a(v, x);
+    set_b(v, p);
     v.align = @int_cast(u32, x.ty.align);
     tag_new(bd, v);
     return v;
@@ -5030,8 +5565,8 @@ pub fn ptradd(bd: *mut Builder, p: *mut Value, off: *mut Value) *mut Value {
         return ptradd(bd, p.a, cint(isz(), cint_val(p.b) +% cint_val(off)));
     }
     let v = emit(bd, OP_PTRADD, t_ptr());
-    v.a = p;
-    v.b = off;
+    set_a(v, p);
+    set_b(v, off);
     return v;
 }
 
@@ -5083,9 +5618,9 @@ pub fn struct_gep(bd: *mut Builder, t: *mut Ty, p: *mut Value, i: u32) *mut Valu
 
 pub fn memop(bd: *mut Builder, op: i32, d: *mut Value, s: *mut Value, n: *mut Value) *mut Value {
     let v = emit(bd, op, t_void());
-    v.a = d;
-    v.b = s;
-    v.c = index_isz(bd, n);
+    set_a(v, d);
+    set_b(v, s);
+    set_c(v, index_isz(bd, n));
     tag_new(bd, v);
     return v;
 }
@@ -5093,8 +5628,8 @@ pub fn memop(bd: *mut Builder, op: i32, d: *mut Value, s: *mut Value, n: *mut Va
 pub fn rmw(bd: *mut Builder, op: i32, p: *mut Value, x: *mut Value) *mut Value {
     let v = emit(bd, OP_RMW, x.ty);
     v.cv = @as(u64, @bit_cast(u32, op));
-    v.a = p;
-    v.b = x;
+    set_a(v, p);
+    set_b(v, x);
     v.align = @int_cast(u32, x.ty.size);
     v.flags = F_ATOMIC;
     return v;
@@ -5102,9 +5637,9 @@ pub fn rmw(bd: *mut Builder, op: i32, p: *mut Value, x: *mut Value) *mut Value {
 
 pub fn cmpxchg(bd: *mut Builder, p: *mut Value, e: *mut Value, n: *mut Value) *mut Value {
     let v = emit(bd, OP_CMPXCHG, e.ty);
-    v.a = p;
-    v.b = e;
-    v.c = n;
+    set_a(v, p);
+    set_b(v, e);
+    set_c(v, n);
     v.align = @int_cast(u32, e.ty.size);
     v.flags = F_ATOMIC;
     return v;
@@ -5130,7 +5665,7 @@ pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
         return agg.b;
     }
     let v = emit(bd, OP_EXTRACTVALUE, ft);
-    v.a = agg;
+    set_a(v, agg);
     v.cv = @as(u64, i);
     return v;
 }
@@ -5158,30 +5693,30 @@ pub fn insert(bd: *mut Builder, agg: *mut Value, x: *mut Value, i: u32) *mut Val
         return cagg(agg.ty, xs[0..n]);
     }
     let v = emit(bd, OP_INSERTVALUE, agg.ty);
-    v.a = agg;
-    v.b = x;
+    set_a(v, agg);
+    set_b(v, x);
     v.cv = @as(u64, i);
     return v;
 }
 
 pub fn extract_elem(bd: *mut Builder, vec: *mut Value, i: u64) *mut Value {
     let v = emit(bd, OP_EXTRACTELEM, vec.ty.elem);
-    v.a = vec;
+    set_a(v, vec);
     v.cv = i;
     return v;
 }
 
 pub fn insert_elem(bd: *mut Builder, vec: *mut Value, x: *mut Value, i: u64) *mut Value {
     let v = emit(bd, OP_INSERTELEM, vec.ty);
-    v.a = vec;
-    v.b = x;
+    set_a(v, vec);
+    set_b(v, x);
     v.cv = i;
     return v;
 }
 
 pub fn splat(bd: *mut Builder, vt: *mut Ty, x: *mut Value) *mut Value {
     let v = emit(bd, OP_SPLAT, vt);
-    v.a = x;
+    set_a(v, x);
     return v;
 }
 
@@ -5189,8 +5724,8 @@ pub fn splat(bd: *mut Builder, vt: *mut Ty, x: *mut Value) *mut Value {
 pub fn shuffle(bd: *mut Builder, x: *mut Value, y: *mut Value, mask: []i32) *mut Value {
     let n = mask.len;
     let v = emit(bd, OP_SHUFFLE, t_vec(x.ty.elem, @int_cast(u32, n)));
-    v.a = x;
-    v.b = y;
+    set_a(v, x);
+    set_b(v, y);
     set_mask(v, u.perm_newn.[i32](n + 1)[0..n]);
     for i in 0..n {
         mask_of(v)[i] = mask[i];
@@ -5201,10 +5736,10 @@ pub fn shuffle(bd: *mut Builder, x: *mut Value, y: *mut Value, mask: []i32) *mut
 pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut Value) *mut Value {
     let v = emit(bd, OP_CALL, fty.ret);
     set_fty(v, fty);
-    v.a = callee;
+    set_a(v, callee);
     v.xs.reserve(args.len);
     for x in args {
-        v.xs.push(x);
+        push_x(v, x);
     }
     set_ext(v, u.perm_newn.[u8](args.len + 1)[0..args.len + 1]);
     tag_new(bd, v);
@@ -5291,7 +5826,7 @@ pub fn intr(bd: *mut Builder, id: i32, t: *mut Ty, args: []mut *mut Value) *mut 
     let v = emit(bd, OP_INTR, t);
     v.cv = @as(u64, @bit_cast(u32, id));
     for x in args {
-        v.xs.push(x);
+        push_x(v, x);
     }
     return v;
 }
@@ -5311,7 +5846,7 @@ pub fn phi(bd: *mut Builder, t: *mut Ty) *mut Value {
 }
 
 pub fn add_incoming(p: *mut Value, x: *mut Value, b: *mut Block) void {
-    p.xs.push(x);
+    push_x(p, x);
     bs_mut(p).push(b);
 }
 
@@ -5330,33 +5865,33 @@ pub fn condbr(bd: *mut Builder, c: *mut Value, t: *mut Block, e: *mut Block) voi
         return;
     }
     let v = emit(bd, OP_CONDBR, t_void());
-    v.a = c;
+    set_a(v, c);
     v.t1 = t;
     v.t2 = e;
 }
 
 pub fn switch_(bd: *mut Builder, x: *mut Value, dflt: *mut Block) *mut Value {
     let v = emit(bd, OP_SWITCH, t_void());
-    v.a = x;
+    set_a(v, x);
     v.t1 = dflt;
     return v;
 }
 
 pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
-    sw.xs.push(c);
+    push_x(sw, c);
     bs_mut(sw).push(b);
 }
 
 pub fn ret(bd: *mut Builder, x: *mut Value) void {
     let v = emit(bd, OP_RET, t_void());
-    v.a = x;
+    set_a(v, x);
 }
 
 // A return of a result in registers (EXT_REGS): their values xs.
 pub fn ret_regs(bd: *mut Builder, xs: []*mut Value) void {
     let v = emit(bd, OP_RET, t_void());
     for y in xs {
-        v.xs.push(y);
+        push_x(v, y);
     }
 }
 
@@ -5689,7 +6224,7 @@ fn resolve_const(c: *mut Value) void {
     }
     for k in 0..c.xs.len {
         let x = resolve(c.xs.get(k));
-        c.xs.set(k, x);
+        set_x(c, k, x);
         resolve_const(x);
     }
 }
