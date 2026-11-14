@@ -71,7 +71,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C1040` | An `#error` directive; the message is its text. |
 | `C1041` | An invalid preprocessing directive: an unknown name, or one of a later standard (`#elifdef`, `#elifndef`, `#warning`, `#embed` before C23) or of a GNU dialect (`#include_next`, `#ident`, `#warning` before C23) under an ISO standard. |
 | `C1043` | A preprocessing directive inside the arguments of a macro invocation. |
-| `C1044` | `defined` made by macro replacement in an `#if` expression. |
+| `C1044` | `defined` made by macro replacement in an `#if` expression (a GNU dialect evaluates it, its operand the tokens after it, not replaced). |
 | `C1045` | `defined` with no identifier, or with no closing `)`. |
 | `C1046` | `__has_include`, `__has_embed` or `__has_c_attribute` with no `(` or no `)`. |
 | `C1048` | `__has_c_attribute` or `__has_attribute` with no attribute name, or `__has_builtin` with no builtin's. |
@@ -113,7 +113,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C2001` | A syntax error: the message says what was expected and what was found. |
 | `C2002` | Nested too deeply: more than 1000 levels of expressions, declarators and statements. |
 | `C2003` | A `//` comment before C99. |
-| `C2004` | An empty declaration (`;`) outside a function. |
+| `C2004` | An empty declaration (`;`) outside a function (a GNU dialect accepts it, without a diagnostic). |
 | `C2005` | An attribute where none can appear. |
 | `C2011` | A declaration where only a statement can be (the body of `if`, `while`, ...). |
 | `C2015` | A function definition inside a function. |
@@ -202,7 +202,7 @@ names the feature and the standard that has it (or removed it).
 |---|---|
 | `C3020` | Invalid operands to an operator (or a type name used as a value). (In a GNU dialect `?:` of a void and a non-void operand is the warning `C4142`.) |
 | `C3021` | An assignment, `++` or `--` on something that is not a modifiable lvalue: an array, a `const` object, a structure with a `const` member. |
-| `C3022` | Incompatible types in an assignment, initialization, argument or `return`, or one that discards qualifiers. (In a GNU dialect a function pointer to or from `void *` is the warning `C4140`, and qualifiers other than `_Atomic` discarded the warning `C4141`.) |
+| `C3022` | Incompatible types in an assignment, initialization, argument or `return`, or one that discards qualifiers. (In a GNU dialect a function pointer to or from `void *` is the warning `C4140`, qualifiers other than `_Atomic` discarded the warning `C4141`, and pointers to incompatible object types the warning `C4146`.) |
 | `C3023` | The wrong number of arguments in a call. |
 | `C3024` | A call of something that is not a function or a pointer to one. |
 | `C3025` | A member access on something without that member, or on a type that is no structure or union (also `offsetof`). |
@@ -227,7 +227,7 @@ names the feature and the standard that has it (or removed it).
 | `C3042` | `break` outside a loop or `switch`, or `continue` outside a loop. |
 | `C3043` | A label that is used and not defined (in a nested function, a label of an enclosing function that is not a local label, `__label__`). |
 | `C3044` | A `return` with a value in a function that returns `void`, or without one in a function that returns a value. |
-| `C3061` | A definition of `main` of a type that is not supported: it must be `int (void)` or `int (int, char **)`. |
+| `C3061` | A definition of `main` of a type that is not supported: it must be `int (void)` or `int (int, char **)` (in a GNU dialect also `int (int)`: the warning `C4147`). |
 
 ### Builtins, variable length arrays and linking
 
@@ -303,6 +303,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4143` | A GNU dialect: a cast of a structure or union to its own type (under an ISO standard `C3028`). It is the operand's value. |
 | `C4144` | A GNU dialect: an enumeration named before its list (a forward declaration `enum e;`, or a use of `enum e`; under an ISO standard `C3011`). It is an incomplete type until its list completes it. |
 | `C4145` | A GNU dialect: a keyword of a later standard spelled in the reserved namespace (`_Bool`, `_Complex`, `_Static_assert`, `_Alignas`, `_Alignof`, `_Atomic`, `_Generic`, `_Noreturn`, `_Thread_local`, `_BitInt`; under an ISO standard `C2100`). It is that keyword. |
+| `C4146` | A GNU dialect: an assignment, initialization, argument or `return` that converts a pointer to an object type to a pointer to an incompatible object type (`int *` to `long *`, `struct a *` to `struct b *`, `double (*)[3]` to `double (*)[4]`; under an ISO standard, and where either pointed-to type is `_Atomic` or a function, `C3022`). The conversion is made, as a cast makes it. |
+| `C4147` | A GNU dialect: `main` defined as `int main(int argc)` (5.1.2.2.1's "other implementation-defined manner"; under an ISO standard `C3061`). It receives argc. |
 
 `#pragma GCC diagnostic` can hide a warning, or make it an error (with its code)
 ([`docs/c.md`](c.md), "Pragmas").

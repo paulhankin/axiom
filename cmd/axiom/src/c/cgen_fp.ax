@@ -50,6 +50,9 @@ pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         return ir.vnil();
     }
     let t = e.args.get(0).ty;
+    if id == fp.BI_ISFPCLASS {
+        return fpclass(e.args.get(1).cval, t, vs[0], it);
+    }
     if cty.is_decimal(t) {
         // (decimal.ax's: the class from the encoding; quiet comparisons)
         if id >= fp.BI_ISGREATER {
@@ -213,6 +216,52 @@ fn classify_wide(id: i32, p: *mut ir.Value, it: *mut ir.Ty, x87: bool) *mut ir.V
 }
 
 // x's class from its bits: b = |x|'s bits, then the thresholds of its format.
+// The classification id (fp.BI_FPCLASSIFY ... BI_ISSIGNALING) of x, of
+// floating type t, an int (it) 0 or 1 but for fpclassify.
+fn class_of(id: i32, t: *cty.CType, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
+    if cty.is_decimal(t) {
+        return ir.zext(B(), gdec.classify(id - fp.BI_FPCLASSIFY, t, x), it);
+    }
+    if cty.is_wide(t) {
+        return classify_wide(id, x, it, cty.ffmt(t) == 80);
+    }
+    return classify(id, x, it);
+}
+
+// __builtin_isfpclass(x, mask) (csema_fp.ax: the bits of mask): the OR of
+// the classes mask names, each the AND of classification results.
+fn fpclass(mask: u64, t: *cty.CType, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
+    let one = ir.cint(it, 1);
+    let sig = class_of(fp.BI_ISSIGNALING, t, x, it);
+    let nan = class_of(fp.BI_ISNAN, t, x, it);
+    let neg = class_of(fp.BI_SIGNBIT, t, x, it);
+    let pos = ir.binop(B(), ir.OP_XOR, neg, one);
+    let mut r = ir.cint(it, 0);
+    if (mask & 1) != 0 {
+        r = ir.binop(B(), ir.OP_OR, r, sig);
+    }
+    if (mask & 2) != 0 {
+        r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, nan, ir.binop(B(), ir.OP_XOR, sig, one)));
+    }
+    // (the other classes in pairs: negative at bit k, positive at bit 9 - k)
+    let ids: [4]i32 = [fp.BI_ISINF, fp.BI_ISNORMAL, fp.BI_ISSUBNORMAL, fp.BI_ISZERO];
+    for k in @as(usize, 0)..4 {
+        let nb = @as(u64, 4) << @truncate(u32, k);
+        let pb = @as(u64, 0x200) >> @truncate(u32, k);
+        if (mask & (nb | pb)) == 0 {
+            continue;
+        }
+        let c = class_of(ids[k], t, x, it);
+        if (mask & nb) != 0 {
+            r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, c, neg));
+        }
+        if (mask & pb) != 0 {
+            r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, c, pos));
+        }
+    }
+    return r;
+}
+
 fn classify(id: i32, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
     let w = x.ty.bits;
     let bt = ir.t_int(w);

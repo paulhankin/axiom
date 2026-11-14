@@ -23,6 +23,10 @@
 #endif
 
 #ifndef NULL
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 #endif
 

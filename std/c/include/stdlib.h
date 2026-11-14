@@ -54,6 +54,10 @@
 #define __AXIOM_WANT_WCHAR_T
 #include <axc/types.h>
 
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 
 #define EXIT_FAILURE 1
@@ -165,6 +169,12 @@ void srand(unsigned int __seed);
 /* memory management (7.24.3) */
 #if __STDC_VERSION__ >= 201112L
 void *aligned_alloc(size_t __alignment, size_t __size);
+#endif
+#ifdef __AXIOM_GNU__
+/* (POSIX's, in a GNU dialect: std/c/lib/core/posix_memalign.c; and alloca,
+   as the systems' libraries' default modes give it) */
+int posix_memalign(void **__memptr, size_t __alignment, size_t __size);
+#include <alloca.h>
 #endif
 void *calloc(size_t __nmemb, size_t __size);
 void free(void *__ptr);

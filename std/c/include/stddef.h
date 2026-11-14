@@ -40,6 +40,10 @@ typedef typeof(nullptr) nullptr_t;
 #define unreachable() __builtin_unreachable()
 #endif
 
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 #define offsetof(type, member) __builtin_offsetof(type, member)
 

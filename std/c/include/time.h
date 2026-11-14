@@ -17,6 +17,10 @@
 #define __AXIOM_WANT_SIZE_T
 #include <axc/types.h>
 
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 
 /* (time_t and clock_t: the 64-bit type of int64_t) */
