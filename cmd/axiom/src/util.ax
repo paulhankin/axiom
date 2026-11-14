@@ -56,48 +56,124 @@ fn out_of_memory() void {
     ax_exit(70);
 }
 
+// In a worker thread (worker_begin), every block is also on the thread's
+// list, so that worker_end gives back what the thread did not: its header is
+// 32 bytes, (previous, next, size, 1), not 16, (size, 0).
+threadlocal let mut tracking: bool = false;
+threadlocal let mut tracked_head: usize = 0;  // the newest block's start, 0 if none
+
+fn word(a: usize) *mut usize {
+    return @ptr_from_int(*mut usize, a);
+}
+
+// (b: the block's start; the words are 8 bytes apart whatever the
+// pointer size)
+fn track(b: usize, n: usize) *mut void {
+    word(b).* = 0;
+    word(b + 8).* = tracked_head;
+    word(b + 16).* = n;
+    word(b + 24).* = 1;
+    if tracked_head != 0 {
+        word(tracked_head).* = b;
+    }
+    tracked_head = b;
+    return @ptr_from_int(*mut void, b + 32);
+}
+
+fn untrack(b: usize) void {
+    let prev = word(b).*;
+    let next = word(b + 8).*;
+    if prev != 0 {
+        word(prev + 8).* = next;
+    } else {
+        tracked_head = next;
+    }
+    if next != 0 {
+        word(next).* = prev;
+    }
+}
+
+fn plain(b: usize, n: usize) *mut void {
+    word(b).* = n;
+    word(b + 8).* = 0;
+    return @ptr_from_int(*mut void, b + 16);
+}
+
+fn is_tracked(p: *mut void) bool {
+    return word(@int_from_ptr(p) - 8).* != 0;
+}
+
+fn block_size(p: *mut void) usize {
+    return @ptr_from_int(*mut usize, @int_from_ptr(p) - 16).*;
+}
+
 pub fn malloc(n: usize) *mut void {
+    if tracking {
+        let b = smem.alloc_bytes(n + 32);
+        if b == 0 {
+            out_of_memory();
+        }
+        return track(b, n);
+    }
     let b = smem.alloc_bytes(n + 16);
     if b == 0 {
         out_of_memory();
     }
-    @ptr_from_int(*mut usize, b).* = n;
-    return @ptr_from_int(*mut void, b + 16);
+    return plain(b, n);
 }
 
 // (std/mem clears only what is not fresh from the system, so the arenas'
 // chunks cost nothing until they are used)
 pub fn calloc(n: usize, size: usize) *mut void {
     let t = n * size;
-    let s = smem.alloc_zeroed.[u8](t + 16) catch {
+    let mut hdr: usize = 16;
+    if tracking {
+        hdr = 32;
+    }
+    let s = smem.alloc_zeroed.[u8](t + hdr) catch {
         out_of_memory();
         return vnil();
     };
     let b = @int_from_ptr(s.ptr);
-    @ptr_from_int(*mut usize, b).* = t;
-    return @ptr_from_int(*mut void, b + 16);
+    if tracking {
+        return track(b, t);
+    }
+    return plain(b, t);
 }
 
 pub fn realloc(p: *mut void, n: usize) *mut void {
     if isvnil(p) {
         return malloc(n);
     }
-    let b = @int_from_ptr(p) - 16;
-    let old = @ptr_from_int(*mut usize, b).*;
-    let nb = smem.realloc_bytes(b, old + 16, n + 16);
+    let old = block_size(p);
+    if is_tracked(p) {
+        let b = @int_from_ptr(p) - 32;
+        untrack(b);
+        let nb = smem.realloc_bytes(b, old + 32, n + 32);
+        if nb == 0 {
+            out_of_memory();
+        }
+        return track(nb, n);
+    }
+    let nb = smem.realloc_bytes(@int_from_ptr(p) - 16, old + 16, n + 16);
     if nb == 0 {
         out_of_memory();
     }
-    @ptr_from_int(*mut usize, nb).* = n;
-    return @ptr_from_int(*mut void, nb + 16);
+    return plain(nb, n);
 }
 
 pub fn free(p: *mut void) void {
     if isvnil(p) {
         return;
     }
-    let b = @int_from_ptr(p) - 16;
-    smem.free_bytes(b, @ptr_from_int(*mut usize, b).* + 16);
+    let size = block_size(p);
+    if is_tracked(p) {
+        let b = @int_from_ptr(p) - 32;
+        untrack(b);
+        smem.free_bytes(b, size + 32);
+        return;
+    }
+    smem.free_bytes(@int_from_ptr(p) - 16, size + 16);
 }
 
 pub fn strlen(s: *u8) usize {
@@ -270,8 +346,8 @@ pub fn isvnil(p: *void) bool {
 // Debugging (AXIOM_TIMES): the time each phase of a build takes, on
 // standard error. phase(name) ends the phase called `name`, which began when
 // the previous one ended (or the program started).
-let mut times_on: i32 = -1;  // unknown, no, yes
-let mut times_last: i64 = 0;
+threadlocal let mut times_on: i32 = -1;  // unknown, no, yes
+threadlocal let mut times_last: i64 = 0;
 
 pub fn phase(name: []u8) void {
     if times_on < 0 {
@@ -335,16 +411,16 @@ struct Arena {
     slack: usize,  // bytes left unused in the chunks passed over
 }
 
-let mut main_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
-                                    taken: 0, slack: 0 };
-let mut scratch_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
-                                       taken: 0, slack: 0 };
+threadlocal let mut main_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0,
+                                                cap: 0, at: 0, taken: 0, slack: 0 };
+threadlocal let mut scratch_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0,
+                                                   cap: 0, at: 0, taken: 0, slack: 0 };
 // The syntax tree's (tree_new), given back once the IR is made from it
 // (release_tree): the optimizer's IR reuses the memory.
-let mut tree_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
-                                    taken: 0, slack: 0 };
-let mut scratch_depth: i32 = 0;
-let mut poison: i32 = -1;  // unknown, no, yes
+threadlocal let mut tree_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0,
+                                                cap: 0, at: 0, taken: 0, slack: 0 };
+threadlocal let mut scratch_depth: i32 = 0;
+threadlocal let mut poison: i32 = -1;  // unknown, no, yes
 
 const CHUNK: usize = 1048576;
 
@@ -418,7 +494,7 @@ fn arena_alloc(a: *mut Arena, size0: usize, keep: bool) *mut u8 {
 // While the IR is made (tree_default), what is allocated but not for the
 // IR (which ir.ax allocates with perm_alloc) is given back with the syntax
 // tree (release_tree): the code generator's own tables, names and lists.
-pub let mut tree_default: bool = false;
+pub threadlocal let mut tree_default: bool = false;
 
 pub fn alloc(size0: usize) *mut u8 {
     if scratch_depth > 0 {
@@ -1270,6 +1346,14 @@ pub fn hash_fnv(s: []u8) u64 {
 }
 
 pub fn intern(s: []u8) []u8 {
+    if in_worker {
+        let h = hash_fnv(s);
+        let found = intern_find(itab, itab_cap, h, s);
+        if not isnos(found) {
+            return found;
+        }
+        return intern_local(s, h);
+    }
     if (itab_len * 2) >= itab_cap {
         let mut ncap: usize = 4096;
         if itab_cap != 0 {
@@ -1303,6 +1387,120 @@ pub fn intern(s: []u8) []u8 {
     t[j] = InternEntry.{ s: perm_dup(s), hash: h };
     itab_len += 1;
     return t[j].s;
+}
+
+fn intern_find(tab: *mut InternEntry, cap: usize, h: u64, s: []u8) []u8 {
+    if cap == 0 {
+        return nosym();
+    }
+    let t = @slice_from_ptr(tab, cap);
+    let mut j = @truncate(usize, h) & (cap - 1);
+    while not isnos(t[j].s) {
+        if (t[j].hash == h) and @mem_eq(t[j].s, s) {
+            return t[j].s;
+        }
+        j = (j + 1) & (cap - 1);
+    }
+    return nosym();
+}
+
+// A worker thread's strings that the process's table does not have.
+threadlocal let mut ltab: *mut InternEntry = @ptr_from_int(*mut InternEntry, 0);
+threadlocal let mut ltab_cap: usize = 0;
+threadlocal let mut ltab_len: usize = 0;
+
+fn intern_local(s: []u8, h: u64) []u8 {
+    if (ltab_len * 2) >= ltab_cap {
+        let mut ncap: usize = 1024;
+        if ltab_cap != 0 {
+            ncap = ltab_cap * 2;
+        }
+        let nt = @slice_from_ptr(@ptr_cast(*mut InternEntry, calloc(ncap, @size_of(InternEntry))), ncap);
+        let old = @slice_from_ptr(ltab, ltab_cap);
+        for i in 0..ltab_cap {
+            if isnos(old[i].s) {
+                continue;
+            }
+            let mut j = @truncate(usize, old[i].hash) & (ncap - 1);
+            while not isnos(nt[j].s) {
+                j = (j + 1) & (ncap - 1);
+            }
+            nt[j] = old[i];
+        }
+        free(@ptr_cast(*mut void, ltab));
+        ltab = nt.ptr;
+        ltab_cap = ncap;
+    }
+    let t = @slice_from_ptr(ltab, ltab_cap);
+    let mut j = @truncate(usize, h) & (ltab_cap - 1);
+    while not isnos(t[j].s) {
+        if (t[j].hash == h) and @mem_eq(t[j].s, s) {
+            return t[j].s;
+        }
+        j = (j + 1) & (ltab_cap - 1);
+    }
+    t[j] = InternEntry.{ s: perm_dup(s), hash: h };
+    ltab_len += 1;
+    return t[j].s;
+}
+
+// -----------------------------------------------------------------------------
+// Worker threads (units.ax): a module compiled on a thread of its own, as
+// if in a process of its own. The compiler's state for compiling a unit is
+// thread-local, and starts out as it is in a new process; what the front
+// end made (the syntax tree, types, interned strings, the source files) is
+// shared, read only: what a worker adds to those tables is its own
+// (intern, types.ax, g_files). Everything a worker allocates, it gives back
+// when it ends (worker_end), but for what it copies out with keep_dup.
+// The process's own thread does nothing else while workers run.
+// -----------------------------------------------------------------------------
+threadlocal let mut in_worker: bool = false;
+
+/// What a worker starts from: the main thread's state it reads.
+pub struct WorkerStart {
+    files: List.[*mut SourceFile],
+}
+
+/// On the main thread, before starting workers.
+pub fn worker_start() WorkerStart {
+    flush_out();
+    _ = poisoning();
+    return WorkerStart.{ files: g_files };
+}
+
+/// On a worker thread, first.
+pub fn worker_begin(ws: *WorkerStart) void {
+    in_worker = true;
+    tracking = true;
+    for i in 0..ws.files.len {
+        g_files.push(ws.files.get(i));
+    }
+}
+
+pub fn is_worker() bool {
+    return in_worker;
+}
+
+/// A copy of s that outlives the worker thread (for the main thread to
+/// read, then free_heap).
+pub fn keep_dup(s: []u8) []u8 {
+    let was = tracking;
+    tracking = false;
+    let d = heap_dup(s);
+    tracking = was;
+    return d;
+}
+
+/// On a worker thread, last: gives back all it allocated.
+pub fn worker_end() void {
+    flush_out();
+    while tracked_head != 0 {
+        let b = tracked_head;
+        untrack(b);
+        smem.free_bytes(b, word(b + 16).* + 32);
+    }
+    tracking = false;
+    in_worker = false;
 }
 
 // Interned strings compare by pointer.
@@ -1896,7 +2094,7 @@ fn udivmod(a: I128, b: I128) DivMod {
 // -----------------------------------------------------------------------------
 // Output. stdout is buffered (flushed by flush_out and quit); stderr is not.
 // -----------------------------------------------------------------------------
-let mut out_buf: List.[u8] = List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
+threadlocal let mut out_buf: List.[u8] = List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
 
 pub fn print(s: []u8) void {
     for c in s {
@@ -2480,7 +2678,7 @@ pub struct MacroEv {
 
 pub let mut g_macros: List.[MacroEv] = List.[MacroEv].{ data: @ptr_from_int(*mut MacroEv, 0), len: 0, cap: 0 };
 
-pub let mut g_files: List.[*mut SourceFile] = List.[*mut SourceFile].{
+pub threadlocal let mut g_files: List.[*mut SourceFile] = List.[*mut SourceFile].{
     data: @ptr_from_int(*mut *mut SourceFile, 0),
     len: 0,
     cap: 0,
