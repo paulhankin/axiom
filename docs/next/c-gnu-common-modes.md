@@ -18,3 +18,6 @@
   `__builtin_fpclassify` and their kin took the x87 format's invalid encodings
   (pseudo-infinities, pseudo-NaNs, unnormals) for infinities or numbers; they are NaNs,
   as for `<math.h>`'s macros.
+- Fixed: the compiler trapped on a function returning a structure without members (a GNU
+  dialect's) on AArch64; its result is in the memory x8 points to, of which no byte is
+  stored.
