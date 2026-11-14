@@ -44,6 +44,9 @@ pub struct Sec {
     data: u.List.[u8],
     size: u64,  // a section without data (bss): its size
     align: u64,
+    group: []u8,    // its COMDAT group's signature (ELF "G" ..., comdat; COFF's selection "discard"), or empty
+    link_to: []u8,  // ELF "o": the section it goes with (SHF_LINK_ORDER), or empty
+    retain: bool,   // ELF "R" (SHF_GNU_RETAIN): a link's garbage collection keeps it
 }
 
 pub struct Reloc {
@@ -1161,7 +1164,8 @@ pub const RM_GOTPAGE: u8 = 9;
 pub const RM_GOTPAGEOFF: u8 = 10;
 pub const RM_TLVPPAGE: u8 = 11;
 pub const RM_TLVPPAGEOFF: u8 = 12;
-pub const RM_TLVP: u8 = 13;  // x86-64's sym@TLVP (Mach-O): a thread-local's descriptor, rip-relative in a movq
+pub const RM_TLVP: u8 = 13;    // x86-64's sym@TLVP (Mach-O): a thread-local's descriptor, rip-relative in a movq
+pub const RM_IMGREL: u8 = 14;  // COFF's sym@IMGREL: the address less the image's (data: .rva)
 
 /// An expression's value: k, plus a symbol's address (sym: a Def index, or
 /// -1), minus another's (neg, same section: then a constant once both are
@@ -1702,6 +1706,8 @@ fn ex_primary(E: *mut Ex) Val {
                 rm = RM_GOTPCREL;
             } else if (E.A.arch == tg.ARCH_X64) and u.str_eq(m, "tlvp") {
                 rm = RM_TLVP;
+            } else if tg.is_windows() and u.str_eq(m, "imgrel") {
+                rm = RM_IMGREL;
             } else if (E.A.arch == tg.ARCH_A64) and
                       (u.str_eq(m, "page") or u.str_eq(m, "pageoff") or u.str_eq(m, "gotpage") or
                        u.str_eq(m, "gotpageoff") or u.str_eq(m, "tlvppage") or u.str_eq(m, "tlvppageoff")) {
@@ -1872,7 +1878,8 @@ pub fn section(A: *mut Asm, name: []u8, kind: i32) i32 {
             return @int_cast(i32, k);
         }
     }
-    A.secs.push(Sec.{ name: u.dup(name), kind: kind, data: u.List.[u8].empty(), size: 0, align: 1 });
+    A.secs.push(Sec.{ name: u.dup(name), kind: kind, data: u.List.[u8].empty(), size: 0, align: 1, group: "",
+                      link_to: "", retain: false });
     return @int_cast(i32, A.secs.len - 1);
 }
 
@@ -1961,7 +1968,7 @@ pub struct Arch {
     insn: fn(*mut Asm, *mut Stmt) void,
     directive: fn(*mut Asm, *mut Stmt) bool,
     nop: u8,                    // the byte that pads code (x86-64 0x90), or 0: words (AArch64's nop)
-    align_pow2: bool,           // .align n is 2^n (AArch64), else n bytes (x86-64)
+    align_pow2: bool,           // .align n is 2^n (AArch64: not in COFF; Mach-O's for both), else n bytes
     word: u32,                  // .word's size: 2 (x86-64) or 4 (AArch64)
     finish: fn(*mut Asm) void,  // after each pass's statements (AArch64: the literal pools)
 }
@@ -2190,7 +2197,9 @@ fn is_digit_core(c: u8) bool {
 }
 
 // The alignment padding to a multiple of n (a power of two).
-fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u64) void {
+// (width: the fill's size in bytes, 2 for .balignw and .p2alignw, 4 for
+// .balignl and .p2alignl, whose padding must be whole units of it)
+fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u64, width: u64) void {
     if (n == 0) or ((n & (n - 1)) != 0) {
         fail(A, u.f1("an alignment of %s, which is not a power of two", u.udec(n)));
         return;
@@ -2223,6 +2232,17 @@ fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u6
         }
         return;
     }
+    if (width > 1) and has_fill {
+        if (pad % width) != 0 {
+            fail(A, u.f2("an alignment's padding of %s bytes, which is not a multiple of the fill's %s", u.udec(pad),
+                         u.udec(width)));
+            return;
+        }
+        for k in @as(u64, 0)..pad {
+            emit8(A, @bit_cast(u64, fill) >> @truncate(u32, (k % width) * 8));
+        }
+        return;
+    }
     for _k in @as(u64, 0)..pad {
         emit8(A, @bit_cast(u64, fill));
     }
@@ -2234,6 +2254,12 @@ fn data(A: *mut Asm, args: []u8, n: u32) void {
         let v = settle(A, eval(A, a));
         if not v.ok {
             return;
+        }
+        if (v.rm != RM_NONE) and (v.sym >= 0) {
+            if not data_rm(A, v, n) {
+                return;
+            }
+            continue;
         }
         if is_const(v) {
             let x = @bit_cast(u64, v.k);
@@ -2280,6 +2306,61 @@ fn data(A: *mut Asm, args: []u8, n: u32) void {
         reloc(A, here(A), ty, v, v.k);
         emit_zero(A, n);
     }
+}
+
+// Data of a symbol with a relocation modifier (data's): sym@PLT - . (4
+// bytes; ELF x86-64: R_X86_64_PLT32), sym@GOTPCREL (4 bytes: the offset of
+// the symbol's GOT slot from the place, plus the constant; x86-64 ELF,
+// Mach-O and COFF, AArch64 ELF and Mach-O), sym@IMGREL (4 bytes, COFF: the
+// image-relative address). Another is an error. False after an error.
+fn data_rm(A: *mut Asm, v: Val, n: u32) bool {
+    let x64 = A.arch == tg.ARCH_X64;
+    if v.neg >= 0 {
+        let d = A.defs.get(@int_cast(usize, v.neg));
+        if (v.rm == RM_PLT) and (n == 4) and x64 and not tg.is_windows() and not tg.is_darwin() {
+            if (A.pass == 0) and (def_sec(A, d) < 0) {
+                emit_zero(A, n);
+                return true;
+            }
+            if def_sec(A, d) == A.cur {
+                let off = here(A);
+                let delta = @bit_cast(i64, off) - @bit_cast(i64, def_off(A, d));
+                reloc(A, off, elf.R_X86_64_PLT32, v, v.k + delta);
+                emit_zero(A, n);
+                return true;
+            }
+        }
+        fail(A, "a difference with a relocation modifier other than sym@PLT - . (x86-64 ELF, 4 bytes)");
+        return false;
+    }
+    if (v.rm == RM_GOTPCREL) and (n == 4) {
+        if not x64 and tg.is_darwin() and (v.k != 0) {
+            fail(A, "sym@GOTPCREL with a constant in Mach-O for arm64 (ARM64_RELOC_POINTER_TO_GOT has none)");
+            return false;
+        }
+        reloc(A, here(A), u32_pick(x64, elf.R_X86_64_GOTPCREL, elf.R_AARCH64_GOTPCREL32), v, v.k);
+        emit_zero(A, n);
+        return true;
+    }
+    if (v.rm == RM_IMGREL) and (n == 4) {
+        reloc(A, here(A), u32_pick(x64, elf.R_X86_64_RVA32, elf.R_AARCH64_RVA32), v, v.k);
+        emit_zero(A, n);
+        return true;
+    }
+    if v.rm == RM_PLT {
+        fail(A, "sym@PLT in data is pc-relative: write sym@PLT - . (4 bytes)");
+        return false;
+    }
+    fail(A,
+         u.f1("a relocation modifier in %s-byte data that the object format does not take there", u.udec(@as(u64, n))));
+    return false;
+}
+
+fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn emit_zero(A: *mut Asm, n: u32) void {
@@ -2360,6 +2441,312 @@ pub fn string(A: *mut Asm, s0: []u8) []u8 {
         i += 1;
     }
     return b.done();
+}
+
+// A .section directive's name, kind and what goes with them.
+struct SecParse {
+    name: []u8,
+    kind: i32,
+    group: []u8,
+    link_to: []u8,
+    retain: bool,
+}
+
+fn has_char(s: []u8, c: u8) bool {
+    for x in s {
+        if x == c {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn char_str(c: u8) []u8 {
+    let mut b = u.Buf.init();
+    b.c(c);
+    return b.done();
+}
+
+fn unquote(s0: []u8) []u8 {
+    let s = trim(s0);
+    if (s.len >= 2) and (s[0] == '"') and (s[s.len - 1] == '"') {
+        return s[1..s.len - 1];
+    }
+    return s;
+}
+
+// The operands of .section (xs) in the object format's syntax:
+//   ELF     name[, "flags"[, @type[, entsize][, group[, comdat]][, linked]]]:
+//           flags a w x M S G T o R (e, the processor's, is not taken), types
+//           @progbits @nobits @note @init_array @fini_array @preinit_array
+//           (or %type); M takes the entry size, G the group (comdat: the
+//           only kind), o the section it goes with
+//   COFF    name[, "flags"[, @type][, selection, symbol]]: flags b d n r s
+//           w x y i D (n and D: a section the link removes) and ELF's a,
+//           ELF's types @progbits, @nobits, @init_array and @fini_array
+//           (for sections so named: coff.ax's .CRT$XC*), the COMDAT selection
+//           discard (the group of that symbol); the others are errors
+//   Mach-O  segment,section[, type[, attributes[, stub size]]]: the types
+//           regular, zerofill, cstring_literals, literal4/8/16,
+//           mod_init_funcs, mod_term_funcs, thread_local_*, the attributes
+//           pure_instructions, no_dead_strip, ... (joined by +)
+// False after an error (reported).
+fn parse_section(A: *mut Asm, xs: [][]u8, sp: *mut SecParse) bool {
+    // (on Mach-O also an ELF name, as .rodata, or one with ELF's flags: the
+    // object places it as the C units' sections, .rodata in __TEXT,__const
+    // and so on; segment,section is Mach-O's syntax)
+    if tg.is_darwin() and not u.starts(unquote(xs[0]), ".") and (xs.len >= 2) and not u.starts(trim(xs[1]), "\"") {
+        return parse_macho_section(A, xs, sp);
+    }
+    sp.name = unquote(xs[0]);
+    let mut flags = "";
+    if xs.len > 1 {
+        flags = unquote(xs[1]);
+    }
+    if tg.is_windows() {
+        let mut fl = "";
+        // (ELF's a, alloc, is taken too, ELF's w and x being COFF's: "a",
+        // "aw" and "ax" mean what they do in ELF; and ELF's type @progbits
+        // or @nobits, the latter as b)
+        let mut sel_at: usize = 2;
+        if (xs.len > 2) and ((trim(xs[2]).len > 0) and ((trim(xs[2])[0] == '@') or (trim(xs[2])[0] == '%'))) {
+            let ety = trim(xs[2])[1..];
+            let arr = (u.str_eq(ety, "init_array") and u.starts(sp.name, ".init_array")) or
+                      (u.str_eq(ety, "fini_array") and u.starts(sp.name, ".fini_array"));
+            if u.str_eq(ety, "nobits") {
+                flags = u.cat2(flags, "b");
+            } else if not u.str_eq(ety, "progbits") and not arr {
+                fail(A,
+                     u.f1("the section type '%s' in COFF (@progbits, @nobits, and @init_array and @fini_array for .init_array[.N] and .fini_array[.N], are taken)",
+                          ety));
+                return false;
+            }
+            sel_at = 3;
+        }
+        for c in flags {
+            if not has_char("abdnrswxyiD", c) {
+                fail(A, u.f1("the section flag '%s' (COFF's are b, d, n, r, s, w, x, y, i, D, and ELF's a)",
+                             char_str(c)));
+                return false;
+            }
+        }
+        // (as ELF's: x code, w data (and d without r: data is writable
+        // unless read-only), b zeros, n and D removed by the link)
+        let writable = u.contains(flags, "w") or (u.contains(flags, "d") and not u.contains(flags, "r"));
+        if u.contains(flags, "x") and u.contains(flags, "w") {
+            fail(A, "a section both writable and executable");
+            return false;
+        }
+        if u.contains(flags, "x") {
+            fl = "ax";
+        } else if u.contains(flags, "b") {
+            fl = "aw";
+        } else if writable {
+            fl = "aw";
+        } else if u.contains(flags, "n") or u.contains(flags, "D") or u.contains(flags, "i") {
+            fl = "";
+        } else {
+            fl = "a";
+        }
+        let mut ty = "@progbits";
+        if u.contains(flags, "b") {
+            ty = "@nobits";
+        } else if fl.len == 0 {
+            ty = "@note";
+        }
+        sp.kind = kind_of_section(sp.name, fl, ty);
+        if xs.len > sel_at {
+            let sel = trim(xs[sel_at]);
+            if not u.str_eq(sel, "discard") {
+                fail(A, u.f1("the COMDAT selection '%s' (only discard is taken: one copy kept)", sel));
+                return false;
+            }
+            if (xs.len < sel_at + 2) or (trim(xs[sel_at + 1]).len == 0) {
+                fail(A, "a COMDAT section needs its symbol");
+                return false;
+            }
+            sp.group = trim(xs[sel_at + 1]);
+        }
+        if xs.len > sel_at + 2 {
+            fail(A, "too many operands of .section");
+            return false;
+        }
+        return true;
+    }
+    for c in flags {
+        if not has_char("awxMSGToR", c) {
+            fail(A, u.f1("the section flag '%s' (ELF's are a, w, x, M, S, G, T, o, R)", char_str(c)));
+            return false;
+        }
+    }
+    let mut ty = "";
+    let mut k: usize = 2;
+    if xs.len > 2 {
+        ty = trim(xs[2]);
+        if (ty.len > 0) and ((ty[0] == '@') or (ty[0] == '%')) {
+            ty = ty[1..];
+        }
+        let types = ["progbits", "nobits", "note", "init_array", "fini_array", "preinit_array"];
+        let mut known = false;
+        for t in types {
+            if u.str_eq(t, ty) {
+                known = true;
+            }
+        }
+        if not known {
+            fail(A, u.f1("the section type '%s'", ty));
+            return false;
+        }
+        if (u.ends(ty, "init_array") or u.str_eq(ty, "fini_array")) and
+           not (u.starts(sp.name, ".init_array") or u.starts(sp.name, ".fini_array") or
+                u.starts(sp.name, ".preinit_array")) {
+            fail(A,
+                 u.f1("a section of the type %s that is not named for it (.init_array[.N], .fini_array[.N], .preinit_array: their names are what the links run)",
+                      ty));
+            return false;
+        }
+        k = 3;
+    }
+    if u.contains(flags, "M") {
+        if k >= xs.len {
+            fail(A, "the flag M needs the entry size");
+            return false;
+        }
+        _ = eval_const(A, xs[k], "the entry size");  // (the entries are not merged)
+        k += 1;
+    }
+    if u.contains(flags, "G") {
+        if (k >= xs.len) or (trim(xs[k]).len == 0) {
+            fail(A, "the flag G needs the group's name");
+            return false;
+        }
+        sp.group = trim(xs[k]);
+        k += 1;
+        if (k < xs.len) and u.str_eq(trim(xs[k]), "comdat") {
+            k += 1;
+        }
+    }
+    if u.contains(flags, "o") {
+        if (k >= xs.len) or (trim(xs[k]).len == 0) {
+            fail(A, "the flag o needs the section it goes with");
+            return false;
+        }
+        sp.link_to = unquote(xs[k]);
+        k += 1;
+    }
+    if (k < xs.len) and u.str_eq(trim(xs[k]), "unique") {
+        fail(A, "unique sections (,unique,N) are not taken: name each section");
+        return false;
+    }
+    if k < xs.len {
+        fail(A, u.f1("an operand of .section too many: '%s'", trim(xs[k])));
+        return false;
+    }
+    if u.contains(flags, "x") and u.contains(flags, "w") {
+        fail(A, "a section both writable and executable");
+        return false;
+    }
+    sp.retain = u.contains(flags, "R");
+    sp.kind = kind_of_section(sp.name, flags, ty);
+    return true;
+}
+
+// Mach-O: segment,section[, type[, attributes[, stub size]]] (SecParse's
+// name is "segment,section", as macho.ax places it).
+fn parse_macho_section(A: *mut Asm, xs: [][]u8, sp: *mut SecParse) bool {
+    if (xs.len < 2) or (trim(xs[0]).len == 0) or (trim(xs[1]).len == 0) {
+        fail(A, "a Mach-O section is named segment,section");
+        return false;
+    }
+    let seg = trim(xs[0]);
+    let sect = trim(xs[1]);
+    if (seg.len > 16) or (sect.len > 16) {
+        fail(A, "a Mach-O segment or section name longer than 16 characters");
+        return false;
+    }
+    sp.name = u.f2("%s,%s", seg, sect);
+    let mut ty = "regular";
+    if xs.len > 2 {
+        ty = trim(xs[2]);
+    }
+    let types = ["regular", "zerofill", "cstring_literals", "literal4", "literal8", "literal16", "mod_init_funcs",
+                 "mod_term_funcs", "thread_local_regular", "thread_local_zerofill", "thread_local_variables",
+                 "4byte_literals", "8byte_literals", "16byte_literals"];
+    let mut known = false;
+    for t in types {
+        if u.str_eq(t, ty) {
+            known = true;
+        }
+    }
+    if not known {
+        fail(A, u.f1("the Mach-O section type '%s'", ty));
+        return false;
+    }
+    let mut code = false;
+    if xs.len > 3 {
+        let attrs = trim(xs[3]);
+        let mut i: usize = 0;
+        while i < attrs.len {
+            let mut j = i;
+            while (j < attrs.len) and (attrs[j] != '+') {
+                j += 1;
+            }
+            let a = trim(attrs[i..j]);
+            let ok_attrs = ["pure_instructions", "some_instructions", "no_dead_strip", "live_support", "no_toc",
+                            "strip_static_syms", "self_modifying_code", "debug"];
+            let mut ok = false;
+            for x in ok_attrs {
+                if u.str_eq(x, a) {
+                    ok = true;
+                }
+            }
+            if not ok {
+                fail(A, u.f1("the Mach-O section attribute '%s'", a));
+                return false;
+            }
+            if u.str_eq(a, "pure_instructions") or u.str_eq(a, "some_instructions") {
+                code = true;
+            }
+            if u.str_eq(a, "no_dead_strip") {
+                sp.retain = true;
+            }
+            i = j + 1;
+        }
+    }
+    if xs.len > 5 {
+        fail(A, "too many operands of .section");
+        return false;
+    }
+    if (u.str_eq(ty, "mod_init_funcs") and not u.str_eq(sect, "__mod_init_func")) or
+       (u.str_eq(ty, "mod_term_funcs") and not u.str_eq(sect, "__mod_term_func")) {
+        fail(A,
+             u.f1("a section of the type %s that is not named for it (__mod_init_func, __mod_term_func: their names are what the links run)",
+                  ty));
+        return false;
+    }
+    // (the literal types are written as regular sections: their literals
+    // are not coalesced)
+    if u.str_eq(ty, "mod_init_funcs") or u.str_eq(ty, "mod_term_funcs") {
+        // (as the C units' initializers: macho.ax writes .init_array and
+        // .fini_array with the types S_MOD_INIT_FUNC_POINTERS and
+        // S_MOD_TERM_FUNC_POINTERS, which are what the loader runs)
+        sp.name = u.pick(u.str_eq(ty, "mod_init_funcs"), ".init_array", ".fini_array");
+        sp.kind = elf.S_DATA;
+    } else if u.str_eq(ty, "zerofill") {
+        sp.kind = elf.S_BSS;
+    } else if u.starts(ty, "thread_local") {
+        fail(A, "a Mach-O thread-local section in assembly (C's _Thread_local makes them)");
+        return false;
+    } else if code or (u.str_eq(seg, "__TEXT") and u.str_eq(sect, "__text")) {
+        sp.kind = elf.S_TEXT;
+    } else if u.str_eq(seg, "__TEXT") {
+        sp.kind = elf.S_RODATA;
+    } else if u.str_eq(seg, "__DWARF") {
+        sp.kind = elf.S_DEBUG;
+    } else {
+        sp.kind = elf.S_DATA;
+    }
+    return true;
 }
 
 fn kind_of_section(name: []u8, flags0: []u8, ty: []u8) i32 {
@@ -2723,6 +3110,29 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         }
         return;
     }
+    if u.str_eq(op, ".rva") or (u.str_eq(op, ".secrel32") and (A.arch == tg.ARCH_X64)) {
+        // COFF: image-relative addresses (sym@IMGREL), offsets in their
+        // sections (x64's SECREL: the thread-local template's)
+        if not tg.is_windows() {
+            fail(A, u.f1("%s is COFF's", op));
+            return;
+        }
+        for s in split_args(args) {
+            let v = settle(A, eval(A, s));
+            if not v.ok {
+                return;
+            }
+            if (v.sym < 0) or (v.neg >= 0) or (v.rm != RM_NONE) {
+                fail(A, u.f1("%s of a value that is not a symbol plus a constant", op));
+                return;
+            }
+            let ty = u32_pick(u.str_eq(op, ".rva"), u32_pick(A.arch == tg.ARCH_X64, elf.R_X86_64_RVA32,
+                                                             elf.R_AARCH64_RVA32), elf.R_X86_64_TPOFF32);
+            reloc(A, here(A), ty, v, v.k);
+            emit_zero(A, 4);
+        }
+        return;
+    }
     if u.str_eq(op, ".uleb128") or u.str_eq(op, ".sleb128") {
         let signed = op[1] == 's';
         for s in split_args(args) {
@@ -2761,6 +3171,53 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
             return;
         }
         for _k in @as(i64, 0)..n {
+            emit8(A, @bit_cast(u64, fill));
+        }
+        return;
+    }
+    if u.str_eq(op, ".org") {
+        // .org place[, fill]: on to an offset of the current section (a
+        // constant, or a label of this section plus one), filling the
+        // bytes between; backward is an error
+        if A.inline_ {
+            fail(A,
+                 ".org in inline assembly, whose place in its section is the compiler's (an assembly source, or file-scope assembly, may set it)");
+            return;
+        }
+        let xs = split_args(args);
+        if (xs.len == 0) or (xs.len > 2) or (trim(xs[0]).len == 0) {
+            fail(A, ".org takes a place and a fill");
+            return;
+        }
+        let v = settle(A, eval(A, xs[0]));
+        if not v.ok {
+            return;
+        }
+        let mut to: i64 = v.k;
+        if not is_const(v) {
+            let d = A.defs.get(@int_cast(usize, v.sym));
+            if (v.neg >= 0) or (v.rm != RM_NONE) or (def_sec(A, d) != A.cur) {
+                if (A.pass == 0) and (def_sec(A, d) < 0) {
+                    return;  // (a label further on: the next pass knows where)
+                }
+                fail(A, ".org to a place that is not in the current section");
+                return;
+            }
+            to = @bit_cast(i64, def_off(A, d)) + v.k;
+        }
+        let mut fill: i64 = 0;
+        if xs.len > 1 {
+            fill = eval_const(A, xs[1], "the fill");
+        }
+        let at = @bit_cast(i64, here(A));
+        if failed(A) {
+            return;
+        }
+        if (to < at) or ((to - at) > 0x1000_0000) {
+            fail(A, u.f2(".org to %s, before the current place %s or too far after it", u.dec(to), u.dec(at)));
+            return;
+        }
+        for _k in at..to {
             emit8(A, @bit_cast(u64, fill));
         }
         return;
@@ -2818,7 +3275,11 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
             return;
         }
         let mut n = eval_const(A, xs[0], "the alignment");
-        let pow = u.starts(op, ".p2align") or (u.str_eq(op, ".align") and arch.align_pow2);
+        // (.align n: 2^n bytes on AArch64 but in COFF, and in Mach-O for
+        // both processors; n bytes otherwise, as the platforms'
+        // assemblers have it)
+        let align_pow = (arch.align_pow2 and not tg.is_windows()) or tg.is_darwin();
+        let pow = u.starts(op, ".p2align") or (u.str_eq(op, ".align") and align_pow);
         if pow {
             if (n < 0) or (n > 30) {
                 fail(A, "an alignment out of range");
@@ -2840,40 +3301,46 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
             fail(A, u.f1("%s takes an alignment, a fill and a maximum", op));
             return;
         }
+        let mut width: u64 = 1;
+        if u.ends(op, "w") {
+            width = 2;
+        } else if u.ends(op, "l") {
+            width = 4;
+        }
         if failed(A) {
             return;
         }
-        align_to(A, @bit_cast(u64, n), fill, has_fill, arch, @bit_cast(u64, max));
+        align_to(A, @bit_cast(u64, n), fill, has_fill, arch, @bit_cast(u64, max), width);
         return;
     }
     if u.str_eq(op, ".text") or u.str_eq(op, ".data") or u.str_eq(op, ".bss") or u.str_eq(op, ".rodata") or
        u.str_eq(op, ".section") or u.str_eq(op, ".pushsection") {
-        let mut name = op;
-        let mut flags = "";
-        let mut ty = "";
+        let mut sp = SecParse.{ name: op, kind: 0, group: "", link_to: "", retain: false };
         if u.str_eq(op, ".section") or u.str_eq(op, ".pushsection") {
             let xs = split_args(args);
-            if xs.len == 0 {
+            if (xs.len == 0) or (trim(xs[0]).len == 0) {
                 fail(A, u.f1("%s needs a name", op));
                 return;
             }
-            name = xs[0];
-            if (name.len >= 2) and (name[0] == '"') {
-                name = name[1..name.len - 1];
+            if not parse_section(A, xs, &mut sp) {
+                return;
             }
-            if xs.len > 1 {
-                flags = xs[1];
-            }
-            if xs.len > 2 {
-                ty = xs[2];
-            }
+        } else {
+            sp.kind = kind_of_section(op, "", "");
         }
-        let kind = kind_of_section(name, flags, ty);
         if u.str_eq(op, ".pushsection") {
             A.stack.push(A.cur);
         }
         A.prev = A.cur;
-        A.cur = section(A, name, kind);
+        A.cur = section(A, sp.name, sp.kind);
+        let s = A.secs.at(@int_cast(usize, A.cur));
+        if sp.group.len > 0 {
+            s.group = u.dup(sp.group);
+        }
+        if sp.link_to.len > 0 {
+            s.link_to = u.dup(sp.link_to);
+        }
+        s.retain = s.retain or sp.retain;
         return;
     }
     if u.str_eq(op, ".popsection") {
@@ -2935,7 +3402,7 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         }
         let save = A.cur;
         A.cur = section(A, ".bss", elf.S_BSS);
-        align_to(A, @bit_cast(u64, al), 0, true, arch, 0);
+        align_to(A, @bit_cast(u64, al), 0, true, arch, 0, 1);
         let d = A.defs.at(@int_cast(usize, sym(A, trim(xs[0]))));
         if d.defined and (d.sec >= 0) {
             fail(A, u.f1("the symbol '%s' is defined twice", d.name));

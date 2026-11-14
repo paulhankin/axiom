@@ -2376,26 +2376,56 @@ no other tool is needed:
   parameters are the locals 0 up, and it returns what it leaves on the stack.
 - Directives: `.byte`, `.short`/`.hword`/`.2byte`, `.word` (2 bytes on x86-64, 4 on
   AArch64), `.long`/`.int`, `.quad`/`.xword`, `.octa`, `.ascii`, `.asciz`/`.string`,
-  `.float`, `.double`, `.uleb128`, `.sleb128`, `.zero`/`.skip`/`.space` (a size and a
-  fill), `.fill` (a count, a size up to 8 and a value: units of the value's low 4 bytes,
-  then zeros; an empty size is an error),
-  `.balign`, `.p2align`, `.align` (code padding uses the multi-byte NOPs), `.set`/`.equ`,
+  `.float`, `.double`, `.uleb128`, `.sleb128`, `.zero`/`.skip`/`.space` (a size and
+  a fill), `.fill` (a count, a size up to 8 and a value: units of the value's low 4
+  bytes, then zeros; an empty size is an error), `.balign`, `.p2align`, `.align` (an
+  alignment, a fill, a maximum; `.align n` is `2^n` bytes on AArch64 Linux and in
+  Mach-O, `n` bytes on x86-64 Linux and in COFF, as the platforms' assemblers have it),
+  `.balignw`/`.p2alignw` and `.balignl`/`.p2alignl` (a fill of 2 and 4 bytes, the
+  padding whole units of it; code padding uses the multi-byte NOPs), `.org` (in
+  file-scope asm and assembly sources: on to a constant offset of the section, or to a
+  label of it plus one, with a fill; in file-scope asm the offset is from where the
+  assembly's part of the section starts; backward is an error, and so is `.org` in a
+  function's template, whose place the compiler chooses), `.set`/`.equ`,
   `.equiv` and `=`, `.inst` (AArch64); the assembler language `.macro`/`.endm` (arguments,
   defaults, `:req`, `:vararg`, `\@`), `.rept`, `.irp`, `.irpc`, `.if`/`.ifdef`/`.ifc`/
   `.else`/`.elseif`/`.endif`; in file-scope asm also `.text`, `.data`, `.bss`,
-  `.section` (with flags and types), `.pushsection`, `.popsection`, `.previous`,
+  `.section` in the object format's syntax (ELF: `name, "flags", @type` with the flags
+  `a w x M S G T o R`, the types `@progbits @nobits @note @init_array @fini_array
+  @preinit_array` or `%type`, `M`'s entry size (the entries are not merged), `G`'s
+  group and `comdat` (a COMDAT group, whose signature is a local symbol at the section's
+  start when the assembly defines none), `o`'s section (`SHF_LINK_ORDER`), `R`
+  (`SHF_GNU_RETAIN`); Mach-O: `segment,section[,type[,attributes]]` with the types
+  `regular`, `zerofill`, `cstring_literals`, the literals' (written as regular ones),
+  `mod_init_funcs` and `mod_term_funcs` (named `__mod_init_func` and `__mod_term_func`,
+  joined to the C units' initializers and terminators), and the
+  attributes `pure_instructions`, `no_dead_strip` (`S_ATTR_NO_DEAD_STRIP`), ..., or an
+  ELF name (`.rodata`, ..., or a name with ELF's flags, placed as the C units' sections
+  are); COFF: `name, "flags"` of `b d n r s w x y i D` (`d` without `r` writable) and
+  ELF's `a`, ELF's `@progbits` or `@nobits`, and the COMDAT selection `discard` with
+  its symbol, which must be defined in the section (sections keep their names, but
+  ELF's `.text*` goes in `.text`, `.rodata*` in `.rdata`, `.data*` in `.data`, `.bss*`
+  in `.bss`, and a C identifier's section is `name$m`, as the C units' are).
+  Errors: another flag, type or
+  selection, a section both writable and executable, an initialization array not
+  named for one, `,unique,N`, a thread-local Mach-O section),
+  `.pushsection`, `.popsection`, `.previous`,
   `.subsection`, `.globl`, `.weak`, `.local`, `.hidden`, `.protected`, `.internal`
   (visibility: ELF's `STV_HIDDEN` for `.hidden` and `.internal`, `STV_PROTECTED`;
   Mach-O's private extern for the hidden ones, Mach-O having no protected visibility,
   its image's references to its own definitions binding within it; nothing in COFF,
   where only a DLL's exports leave the image), `.type`, `.size`,
-  `.comm`, `.lcomm`, `.incbin` (within the include directories). Labels: `name:` and
-  numeric local labels (`1:`, `1b`, `1f`).
+  `.comm`, `.lcomm`, `.incbin` (within the include directories), COFF's `.rva` and
+  (x64) `.secrel32`. Labels: `name:` and numeric local labels (`1:`, `1b`, `1f`).
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
   (`@GOTPCREL`), on macOS `sym@TLVP(%rip)` in a `movq` (a thread-local's descriptor,
   which the linker makes a `leaq` for the image's own), absolute 32- and 64-bit
   addresses; AArch64's operators above,
-  `.quad` and `.word` of addresses. `.ident`, `.arch` and the like are accepted and do
+  `.quad` and `.word` of addresses; in 4-byte data `sym@GOTPCREL` (the offset of the
+  symbol's GOT slot from the place, plus a constant; COFF's `.refptr` pointer;
+  ELF, Mach-O and x64 COFF), `sym@PLT - .` (x86-64 ELF), `sym@IMGREL` (COFF). Other
+  modifiers in data (`@TPOFF`, `@DTPOFF`, `@GOTOFF`, `@SIZE`, ...) are errors, as is
+  `sym@PLT` without `- .`. `.ident`, `.arch` and the like are accepted and do
   nothing; `.file` and `.loc` give the line information under `-g` ("Assembly sources"). An instruction, operand form or directive that is not
   supported is C3097, naming it, at the statement.
 - Call frame information: in file-scope asm `.cfi_startproc [simple]` ... `.cfi_endproc`

@@ -41,6 +41,13 @@ export function checkMachO(d, opts = {}) {
         if (addr < vmaddr || addr + ssize > vmaddr + vmsize) E(`section ${sn} lies outside its segment`);
         if (!zerofill && ssize && (soff < fileoff || soff + ssize > fileoff + filesize || soff - fileoff !== addr - vmaddr)) E(`section ${sn} file offset disagrees with its address`);
         if (addr % 2 ** salign) E(`section ${sn} is misaligned`);
+        // the type and attributes (assembly's .section gives them): a known
+        // type; instructions only in __TEXT; zero-fill not in __TEXT
+        const ty = u32(so + 64) & 0xff, at = u32(so + 64) >>> 8;
+        if (ty > 0x16) E(`section ${sn} has the type ${ty}`);
+        if ((at & 0x800004) && name !== '__TEXT') E(`section ${sn} of instructions is in ${name}`);
+        if (zerofill && name === '__TEXT') E(`section ${sn} of zeros is in __TEXT`);
+        if ((ty === 9 || ty === 0xa) && (ssize % 8)) E(`section ${sn} of initializers is not of pointers`);
       }
       if (name !== '__PAGEZERO' && (vmaddr % 0x4000 || fileoff % 0x4000 || vmsize % 0x4000)) E(`segment ${name} is not 16K aligned`);
     }

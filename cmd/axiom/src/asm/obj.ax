@@ -6,6 +6,7 @@
 // =============================================================================
 import "../elf.ax" as elf;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "core.ax" as cr;
 
@@ -166,6 +167,17 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
         secmap[k] = ns;
         base[k] = 0;
     }
+    // what goes with the sections: COMDAT groups, SHF_LINK_ORDER, retention
+    for k in 0..A.secs.len {
+        let s = A.secs.at(k);
+        if secmap[k] == text {
+            if (s.group.len > 0) or (s.link_to.len > 0) or s.retain {
+                add_error = "a COMDAT group, a linked section or retention for .text (name a section of its own)";
+            }
+            continue;
+        }
+        sec_extras(obj, obj.secs.get(@int_cast(usize, secmap[k])), s);
+    }
     // labels: the global ones, the local ones but .L and numeric labels,
     // and those relocations refer to
     let syms = u.newn.[i64](A.defs.len + 1);
@@ -235,6 +247,7 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
         let os = obj.secs.get(@int_cast(usize, secmap[si]));
         os.relocs.push(elf.Rel.{ off: base[si] + r.off, ty: r.ty, sym: sym, addend: r.addend });
     }
+    group_signatures(obj);
     if file_id >= 0 {
         file_lines(obj, text, A, secmap, base, syms, file_id);
     }
@@ -345,6 +358,46 @@ pub fn inline_pass(obj: *mut elf.Obj) void {
     next_off.clear();
 }
 
+// The COMDAT group, linked section (by name: a section of the object) and
+// retention that the assembly gave section s, onto the object's os.
+fn sec_extras(obj: *mut elf.Obj, os: *mut elf.Sec, s: *cr.Sec) void {
+    os.retain = os.retain or s.retain;
+    if s.group.len > 0 {
+        os.group = u.perm_dup(s.group);
+    }
+    if s.link_to.len > 0 {
+        let mut found = false;
+        for j in 0..obj.secs.len {
+            if u.str_eq(obj.secs.get(j).name, s.link_to) {
+                os.link1 = @int_cast(i32, j) + 1;
+                found = true;
+            }
+        }
+        if not found {
+            add_error = u.f1("the section '%s' that a section goes with (the flag o) is not in the object", s.link_to);
+        }
+    }
+}
+
+// A COMDAT group's signature is a symbol of the object (ELF: a local one
+// at its first section's start, made when the assembly defines none; COFF:
+// the symbol must be the section's own).
+pub fn group_signatures(obj: *mut elf.Obj) void {
+    for k in 0..obj.secs.len {
+        let g = obj.secs.get(k).group;
+        if (g.len == 0) or (obj.symmap.get(u.intern(g)) != 0) {
+            continue;
+        }
+        if tg.is_windows() {
+            add_error = u.f1("the COMDAT section's symbol '%s' is not defined in it", g);
+            continue;
+        }
+        let si = elf.add_sym(obj, elf.Sym.{ name: g, sec: @int_cast(i32, k), value: 0, size: 0, bind: elf.B_LOCAL,
+                                            ty: elf.T_NOTYPE, hidden: false, protected: false });
+        obj.symmap.put(u.intern(g), si + 1);  // (the writer finds the signature by name)
+    }
+}
+
 fn sec_sym(obj: *mut elf.Obj, sec: i32) u32 {
     let k = @int_cast(usize, sec);
     while sec_syms.len <= k {
@@ -376,6 +429,7 @@ fn side_place(obj: *mut elf.Obj, s: *cr.Sec, at: *mut u64) i32 {
         idx = @int_cast(i32, obj.secs.len - 1);
     }
     let os = obj.secs.get(@int_cast(usize, idx));
+    sec_extras(obj, os, s);
     if s.align > os.align {
         os.align = s.align;
     }
@@ -525,6 +579,7 @@ pub fn inline_place(obj: *mut elf.Obj, text: i32, fbase: u64) void {
             obj.syms.at(@as(usize, s)).size = DUP_SIZE;
         }
     }
+    group_signatures(obj);
     inline_pass(obj);
 }
 

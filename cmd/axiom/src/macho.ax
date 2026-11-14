@@ -267,6 +267,9 @@ fn place_of(s: *elf.Sec, x64: bool) Place {
         } else if k == elf.S_BSS {
             fl = S_ZEROFILL;
         }
+        if s.retain {
+            fl |= 0x1000_0000;  // S_ATTR_NO_DEAD_STRIP (assembly's no_dead_strip, C's retain)
+        }
         return Place.{ seg: n[0..c], sect: n[c + 1..], flags: fl };
     }
     if k == elf.S_TEXT {
@@ -561,12 +564,15 @@ fn convert(w: *mut W, o: *elf.Obj, k: usize, os: i32, r: elf.Rel) void {
             rel(w, os, at, g.sym, true, 2, true, u32_pick(br, X86_64_RELOC_BRANCH, X86_64_RELOC_SIGNED));
         } else if (t == elf.R_X86_64_GOTPCREL) or (t == elf.R_X86_64_GOTPCRELX) or (t == elf.R_X86_64_REX_GOTPCRELX) {
             let g = target(w, o, r.sym, r.addend, 4);
-            if g.add != -4 {
-                fail(w, "a GOT reference with an addend, which Mach-O cannot hold");
-            }
-            put32(w, os, at, 0);
             let d = sec.data.view();
             let load = (at >= 2) and (d[@truncate(usize, at - 2)] == 0x8b);
+            if g.add == -4 {
+                put32(w, os, at, 0);  // (an instruction's: from the end of the field)
+            } else if (g.add == 0) and (o.secs.get(k).kind != elf.S_TEXT) {
+                put32(w, os, at, 4);  // (data's: from the field itself, as call frame pointers are)
+            } else {
+                fail(w, "a GOT reference with an addend, which Mach-O cannot hold");
+            }
             rel(w, os, at, g.sym, true, 2, true, u32_pick(load, X86_64_RELOC_GOT_LOAD, X86_64_RELOC_GOT));
         } else if t == elf.R_X86_64_PC64 {
             sub_pair(w, o, os, at, r, 3, X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED);
@@ -585,6 +591,13 @@ fn convert(w: *mut W, o: *elf.Obj, k: usize, os: i32, r: elf.Rel) void {
         } else {
             fail(w, u.f1("an x86-64 relocation of type %s, which Mach-O has none for", u.udec(@as(u64, t))));
         }
+        return;
+    }
+    if (t == elf.R_AARCH64_GOTPCREL32) and (r.addend == 0) {
+        // (assembly's sym@GOTPCREL: the slot's offset from the place)
+        let g = target(w, o, r.sym, 0, 0);
+        put32(w, os, at, 0);
+        rel(w, os, at, g.sym, true, 2, true, ARM64_RELOC_POINTER_TO_GOT);
         return;
     }
     if (t == elf.R_AARCH64_ABS64) or (t == elf.R_AARCH64_ABS32) {
