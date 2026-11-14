@@ -1479,8 +1479,8 @@ fail): so Annexes F and G are not claimed there.
 honoured. A function with floating operations in its scope (anywhere in its body) has
 strict floating point (the IR function's `strict_fp`, which the passes consult): its
 floating operations (arithmetic, comparisons, conversions, sqrt and fma) are not folded
-(`opt.ax`, `combine.ax`), merged (`gvn.ax`), moved out of loops (its LICM), sunk to their
-uses or fused into a later branch across a call (`gvn.ax`, `x64.ax`, `a64.ax`), packed
+(`opt.ax`, `combine.ax`), merged (`gvn.ax`), moved out of loops (`loopopt.ax`), sunk to
+their uses or fused into a later branch across a call (`loopopt.ax`, `x64.ax`, `a64.ax`), packed
 into vectors (`slp.ax`), interleaved with other iterations (`unroll.ax`'s jamming) or
 removed when their results are unused (`ir.has_effects`, and the AArch64 backend's own
 dead code removal); a function inlined into another makes that one strict, and outlined
