@@ -239,7 +239,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, traps, stack traces: each call's site record, or the shadow stack, each instruction's source line) |
+| `codegen.ax` | The checked program to IR (monomorphization, statements, expressions, builtins, each instruction's source line), over `cgctx.ax` (its options, the unit's IR module, builder and tables, small IR helpers); `cgrt.ax`: traps, stack traces (each call's site record, or the shadow stack), the stack limit, frame tables; `cgmain.ax`: a run (`codegen_program`), the native entry and the runtime's exports |
 | `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
@@ -436,7 +436,7 @@ types share a module.
 | `modload.ax` | `sema_decl.c` | module loading (import paths, `internal/` and package visibility, cycles), the modules `axiom lsp`'s session keeps, the `Program` |
 | `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | name resolution, type checking |
 | `semapost.ax` | `sema_decl.c`, `sema_target.c` | the checks after type checking: object sizes, recursive inline functions, processor extensions (target conditions, `@features`/`@multiversion`, builtins that need an extension) |
-| `codegen.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
+| `codegen.ax`, `cgctx.ax`, `cgrt.ax`, `cgmain.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
 | `units.ax` | `units.c` | separate compilation and the object cache: each module compiled on a worker thread, whose compiler state is thread-local (`util.ax`, worker threads) |
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |

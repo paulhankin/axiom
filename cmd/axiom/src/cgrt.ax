@@ -1,0 +1,893 @@
+// =============================================================================
+// cgrt.ax - what the code generator adds for the runtime: trap sites and
+// their records (spec Appendix B), the shadow stack and its call-site
+// records for stack traces and profiles (spec §16.4), the stack limit, the
+// frame tables, and the global and function declarations they need.
+// =============================================================================
+import "ast.ax" as ast;
+import "axdebug.ax" as axd;
+import "c/cc.ax" as cfront;
+import "cgctx.ax" as cx;
+import "ir.ax" as ir;
+import "modload.ax" as modl;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Traps (spec Appendix B).
+//
+// Every trap site has a constant record {code, file id, span, line, column,
+// file name, source text}. Before trapping, the helper stores the record's
+// address (and, for @expect_eq, the compared values) in axiom.trap_info,
+// which hosts read after the trap (wasm export axiom_trap_info; native
+// weak hook ax_on_trap). Going through one cold helper also keeps LLVM's fast
+// instruction selector usable at -O0; -O1+ inlines it.
+// ---------------------------------------------------------------------------
+pub const T_TRAP: i32 = 0;
+pub const T_BOUNDS: i32 = 1;
+pub const T_OVERFLOW: i32 = 2;
+pub const T_DIVZERO: i32 = 3;
+pub const T_INTCAST: i32 = 4;
+pub const T_LENGTH: i32 = 6;
+pub const T_UNIONTAG: i32 = 7;
+const T_STACK: i32 = 8;
+pub const T_ATOMIC_ALIGN: i32 = 10;
+pub const T_EXPECT: i32 = 11;
+pub const T_MEMORY: i32 = 12;
+pub const T_CPU: i32 = 13;
+const SITE_ERR_RETURN: i32 = 254;
+const SITE_CALL: i32 = 255;  // not traps: shadow stack records
+
+// The span of the code being generated: trap sites name it, and the
+// instructions made for it carry its line (ir.cur_src, debug information).
+pub fn set_span(sp: u.Span) void {
+    cx.S.cur_span = sp;
+    let mut src: u32 = 0;
+    if (sp.file >= 0) and (@int_cast(usize, sp.file) < u.g_files.len) {
+        src = ir.src_loc(sp.file, u.span_linecol(sp).sl);
+    }
+    ir.cur_src = src;
+}
+
+fn site_hash(code: i32, sp: u.Span, fname: []u8, callee: []u8) u64 {
+    let mut h = u.hash_fnv(fname) ^ (u.hash_fnv(callee) *% 0x9E3779B97F4A7C15);
+    h = (h ^ @as(u64, @bit_cast(u32, code))) *% 0x100000001b3;
+    h = (h ^ @as(u64, @bit_cast(u32, sp.file))) *% 0x100000001b3;
+    h = (h ^ @as(u64, sp.start)) *% 0x100000001b3;
+    return (h ^ @as(u64, sp.end)) *% 0x100000001b3;
+}
+
+// The slot of the site record for these, which is free (g nil) if there is
+// none yet: the caller then fills it.
+fn site_slot(code: i32, sp: u.Span, fname: []u8, callee: []u8) *mut cx.SiteKey {
+    if (cx.S.site_count + 1) * 2 > cx.S.site_tab.len {
+        let old = cx.S.site_tab;
+        let mut n: usize = 4096;
+        if old.len > 0 {
+            n = old.len * 2;
+        }
+        cx.S.site_tab = u.List.[cx.SiteKey].empty();
+        cx.S.site_tab.reserve(n);
+        cx.S.site_tab.len = n;
+        let t = cx.S.site_tab.items();
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, t.ptr), n * @size_of(cx.SiteKey)), 0);
+        for k in old.items() {
+            if u.notnil(k.g) {
+                let mut j = @truncate(usize, site_hash(k.code, u.mkspan(k.file, k.start, k.end), k.fname,
+                                                       k.callee)) & (n - 1);
+                while u.notnil(t[j].g) {
+                    j = (j + 1) & (n - 1);
+                }
+                t[j] = k;
+            }
+        }
+        let mut o = old;
+        o.deinit();
+    }
+    let n = cx.S.site_tab.len;
+    let t = cx.S.site_tab.items();
+    let mut j = @truncate(usize, site_hash(code, sp, fname, callee)) & (n - 1);
+    loop {
+        let k = &mut t[j];
+        if u.isnil(k.g) {
+            return k;
+        }
+        if (k.code == code) and (k.file == sp.file) and (k.start == sp.start) and (k.end == sp.end) and
+           u.str_eq(k.fname, fname) and u.str_eq(k.callee, callee) {
+            return k;
+        }
+        j = (j + 1) & (n - 1);
+    }
+}
+
+// axiom.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
+pub fn trap_info_global() *mut ir.Value {
+    if u.isnil(cx.S.trap_info) {
+        let t = ir.t_array(cx.T_i64, 6);
+        cx.S.trap_info = shared_global(t, "axiom.trap_info", ir.czero(t), 0);
+        set_align(cx.S.trap_info, 8);
+    }
+    return cx.S.trap_info;
+}
+
+pub fn trap_info_slot(i: u64) *mut ir.Value {
+    return cx.gep2(ir.t_array(cx.T_i64, 6), trap_info_global(), cx.ci32(0), cx.ci32(i));
+}
+
+// Stable identity of a source file in site records (hash of its display path).
+pub fn file_key(file_id: i32) u32 {
+    if (file_id < 0) or (@int_cast(usize, file_id) >= u.g_files.len) {
+        return 0xFFFF_FFFF;
+    }
+    let mut h: u32 = 2166136261;
+    for c in u.file_of(file_id).display {
+        h = (h ^ @as(u32, c)) *% 16777619;
+    }
+    if h == 0xFFFF_FFFF {
+        return 0;
+    }
+    return h;
+}
+
+// The file whose key (as the runtime prints it) is `text`, or -1.
+pub fn file_from_key(text: []u8) i32 {
+    let r = u.c_strtoll(text);
+    if (r.end == 0) or (r.v < 0) or (r.v >= 0xFFFF_FFFF) {
+        return -1;
+    }
+    for i in 0..u.g_files.len {
+        if @as(i64, file_key(@int_cast(i32, i))) == r.v {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+// Exported symbol names of the whole program (for the linker), and libraries
+// named by extern "C" blocks: computed from the checked program.
+pub fn collect_link_names(o: *cx.CgOptions) void {
+    cx.S.sanitize_main = o.sanitize_address;
+    cx.S.c_program = cfront.pending();
+    let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let P = modl.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if not d.is_export or lazy_export(d) {
+            continue;
+        }
+        let s = u.intern(export_symbol(d));
+        if seen.get(s) == 0 {
+            cx.g_export_names.push(s);
+        }
+        seen.put(s, 1);
+    }
+    for i in 0..P.host_fns.len {
+        let d = P.host_fns.get(i);
+        if not d.extern_c or u.isnos(d.link_lib) {
+            continue;
+        }
+        let s = u.intern(d.link_lib);
+        if seen.get(s) == 0 {
+            cx.g_link_libs.push(s);
+        }
+        seen.put(s, 1);
+    }
+}
+
+fn cur_fn_display() []u8 {
+    if u.notnil(cx.F) and u.notnil(cx.F.inst) {
+        return cx.F.inst.display;
+    }
+    return "";
+}
+
+// s's offset in the unit's site strings.
+fn site_str(s: []u8) u32 {
+    if u.isnil(cx.S.site_strs_g) {
+        // (its type and contents are set when the unit is done)
+        cx.S.site_strs_g = ir.add_global(cx.M, ir.t_array(cx.T_i8, 1), ".site_strs").val;
+        set_linkage(cx.S.site_strs_g, ir.LINK_INTERNAL);
+        ir.gv_of(cx.S.site_strs_g).is_const = true;
+        set_align(cx.S.site_strs_g, 1);
+        cx.S.site_strs = u.Buf.init();
+        cx.S.site_strs.c(0);
+        cx.S.site_str_offs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    }
+    if s.len == 0 {
+        return 0;
+    }
+    let k = u.intern(s);
+    let at = cx.S.site_str_offs.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let off = @truncate(u32, cx.S.site_strs.len());
+    cx.S.site_strs.s(s);
+    cx.S.site_strs.c(0);
+    cx.S.site_str_offs.put(k, off + 1);
+    return off;
+}
+
+// The unit's site strings, now that all its site records are made.
+pub fn end_site_strs() void {
+    if u.isnil(cx.S.site_strs_g) {
+        return;
+    }
+    let bytes = cx.S.site_strs.view();
+    let g = ir.gv_of(cx.S.site_strs_g);
+    g.ty = ir.t_array(cx.T_i8, @as(u64, bytes.len));
+    set_init(cx.S.site_strs_g, ir.cstring(bytes[0..bytes.len - 1]));  // (cstring adds the last NUL)
+    cx.S.site_strs_g = u.nil.[ir.Value]();
+}
+
+// A constant site record {code, file id, start, end, line, col, file, text,
+// fn, callee, strs}: the strings at those offsets in strs, the unit's site
+// strings (spec §16.4; std/internal/runtime/trap_format.ax: Site). `fn` is
+// the enclosing function; `callee` is set for call sites. Codes: a trap code,
+// SITE_CALL for a call, SITE_ERR_RETURN for an error return.
+fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
+    return site_record_in(code, sp, cur_fn_display(), callee0);
+}
+
+// A call made by C code (c/cgen_expr.ax): its call-site record, for native
+// stack traces as Axiom's calls have them (frame_tables), or nil.
+pub fn c_call_site(sp: u.Span, fname: []u8, callee: []u8) *mut ir.Value {
+    if not frame_tables() and not (ty.g_target.is_wasm and program_traces()) {
+        return cx.vnil();
+    }
+    return site_record_in(SITE_CALL, sp, fname, callee);
+}
+
+// A call made by C code on WebAssembly (c/cgen_va.ax), with C's builder b:
+// its record `site` pushed on the shadow stack, as ss_push pushes Axiom's;
+// the record and the depth ss_pop puts back after the call.
+pub fn c_ss_push(b: *mut ir.Builder, site: *mut ir.Value) [2]*mut ir.Value {
+    let saved = cx.B;
+    cx.B = b;
+    let ss = ss_ptr();
+    let depth = ir.load(cx.B, cx.T_i32, ss_field(ss, 0));
+    ss_store(site, ss_slot(ss, 2, cx.b_and(depth, cx.ci32(SS_CAP - 1))));
+    ss_store(cx.b_add(depth, cx.ci32(1)), ss_field(ss, 0));
+    cx.B = saved;
+    return [ss, depth];
+}
+
+// The shadow stack and its depth, for C's setjmp on WebAssembly (nil when
+// calls make no records).
+pub fn c_ss_depth(b: *mut ir.Builder) [2]*mut ir.Value {
+    if not ty.g_target.is_wasm or not program_traces() {
+        return [cx.vnil(), cx.vnil()];
+    }
+    let saved = cx.B;
+    cx.B = b;
+    let ss = ss_ptr();
+    let depth = ir.load(cx.B, cx.T_i32, ss_field(ss, 0));
+    cx.B = saved;
+    return [ss, depth];
+}
+
+pub fn c_ss_pop(b: *mut ir.Builder, ss: *mut ir.Value, depth: *mut ir.Value) void {
+    let saved = cx.B;
+    cx.B = b;
+    ss_store(depth, ss_field(ss, 0));
+    cx.B = saved;
+}
+
+fn site_record_in(code: i32, sp: u.Span, fname: []u8, callee0: []u8) *mut ir.Value {
+    let mut callee = callee0;
+    if u.isnos(callee) {
+        callee = "";
+    }
+    let slot = site_slot(code, sp, fname, callee);
+    if u.notnil(slot.g) {
+        return slot.g;
+    }
+    if u.isnil(cx.S.site_ty) {
+        let mut el: [11]*mut ir.Ty = [cx.T_i32, cx.T_i32, cx.T_i32, cx.T_i32, cx.T_i32, cx.T_i32, cx.T_i32, cx.T_i32,
+                                      cx.T_i32, cx.T_i32, cx.T_ptr];
+        cx.S.site_ty = ir.t_struct(el[..]);
+    }
+    let mut lc = u.LineCol.{ sl: 0, sc: 0, el: 0, ec: 0 };
+    let mut file: []u8 = "";
+    let mut text: []u8 = "";
+    if (sp.file >= 0) and (@int_cast(usize, sp.file) < u.g_files.len) and (sp.end >= sp.start) {
+        lc = u.span_linecol(sp);
+        let f = u.file_of(sp.file);
+        file = f.display;
+        let mut n = sp.end - sp.start;
+        let mut max: u32 = 200;
+        if code >= SITE_ERR_RETURN {
+            max = 80;
+        }
+        if n > max {
+            n = max;
+        }
+        // one line of text only
+        for i in 0..n {
+            if f.text[@as(usize, sp.start + i)] == '\n' {
+                n = i;
+                break;
+            }
+        }
+        text = f.text[@as(usize, sp.start)..@as(usize, sp.start + n)];
+    }
+    let mut vals: [11]*mut ir.Value = [
+        cx.ci32(@as(u64, @bit_cast(u32, code))),
+        cx.ci32(@as(u64, file_key(sp.file))),
+        cx.ci32(@as(u64, sp.start)),
+        cx.ci32(@as(u64, sp.end)),
+        cx.ci32(@as(u64, @bit_cast(u32, lc.sl))),
+        cx.ci32(@as(u64, @bit_cast(u32, lc.sc))),
+        cx.ci32(@as(u64, site_str(cstr_prefix(file)))),
+        cx.ci32(@as(u64, site_str(cstr_prefix(text)))),
+        cx.ci32(@as(u64, site_str(cstr_prefix(fname)))),
+        cx.ci32(@as(u64, site_str(cstr_prefix(callee)))),
+        cx.S.site_strs_g,
+    ];
+    let g = ir.add_global(cx.M, cx.S.site_ty, ".site").val;
+    // (the struct type of these values is site_ty, which cstruct would look up again by name)
+    if vals[10].ty == cx.T_ptr {
+        set_init(g, ir.cagg(cx.S.site_ty, vals[..]));
+    } else {
+        set_init(g, ir.cstruct(vals[..]));
+    }
+    set_linkage(g, ir.LINK_INTERNAL);
+    ir.gv_of(g).is_const = true;
+    set_align(g, 8);
+    slot.code = code;
+    slot.file = sp.file;
+    slot.start = sp.start;
+    slot.end = sp.end;
+    slot.fname = u.intern(fname);  // (kept: the callers' may not be)
+    slot.callee = u.intern(callee);
+    slot.g = g;
+    cx.S.site_count += 1;
+    return g;
+}
+
+// The bytes up to the first NUL (C strings in the C implementation).
+pub fn cstr_prefix(s: []u8) []u8 {
+    let z = u.find(s, 0);
+    if z >= 0 {
+        return s[0..@int_cast(usize, z)];
+    }
+    return s;
+}
+
+pub fn site_record(code: i32, sp: u.Span) *mut ir.Value {
+    return site_record_ex(code, sp, u.nosym());
+}
+
+// ---------------------------------------------------------------------------
+// Shadow stack (spec §16.4): each thread has
+//     {u32 depth, u32 errors, [SS_CAP]*Site calls, [ET_CAP]*Site error_returns}
+// Every call stores its call-site record at calls[depth % SS_CAP] and bumps
+// depth for the duration of the call, so after a trap or crash the host can
+// print the innermost SS_CAP frames with exact source locations. Error
+// returns are appended to a ring the same way; `catch` clears it. On wasm the
+// record's address lives in a per-instance (so per-thread) wasm global; on
+// native targets the record is thread-local.
+// ---------------------------------------------------------------------------
+const SS_CAP: u64 = 256;
+const ET_CAP: u64 = 32;
+
+fn stack_traces_on() bool {
+    return u.notnil(cx.O) and cx.O.stack_traces and not (u.notnil(cx.F) and cx.F.no_trace);
+}
+
+// Stack traces in the program (shared helpers, globals and exports).
+pub fn program_traces() bool {
+    return u.notnil(cx.O) and cx.O.stack_traces;
+}
+
+// Native code keeps stack traces without the shadow stack's call records
+// (as in the bootstrap compiler): every function that makes a
+// call keeps a frame pointer, and each call is followed by an entry in the
+// object's frame table (section axiom_rets, written by the backend) that
+// maps its return address to its chain of call-site records: its own and
+// those of the calls inlined around it (ir.Chain; inline.ax extends the
+// chains of the code it inlines). A trap or crash walks the frames and
+// fills the thread's shadow stack as the stores would have (runtime:
+// trap_format.ax, walk_frames). Profile builds, which sample the stack while
+// the program runs, and --sanitize=address, which records allocation sites,
+// keep the shadow stack, as does WebAssembly, whose stack cannot be walked.
+// Error-return traces use the shadow stack's ring in every mode.
+pub fn frame_tables() bool {
+    return program_traces() and not ty.g_target.is_wasm and not cx.O.profile and not cx.O.sanitize_address;
+}
+
+// The native runtime (std/internal/runtime/*.ax) reports stack traces; it is not part of
+// them.
+pub fn is_runtime_module(m: *ast.Module) bool {
+    if u.isnil(m) {
+        return false;
+    }
+    let names = ["/runtime/native.ax", "/runtime/darwin.ax", "/runtime/windows.ax", "/runtime/trap_format.ax",
+                 "/runtime/test_main.ax", "/runtime/test_main_darwin.ax", "/runtime/test_main_windows.ax",
+                 "/runtime/test_report.ax", "/runtime/profile.ax", "/runtime/profile_darwin.ax",
+                 "/runtime/profile_windows.ax", "/runtime/profile_out.ax", "/runtime/rt.ax"];
+    for n in names {
+        if u.ends(m.path, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn ss_type() *mut ir.Ty {
+    if u.isnil(cx.S.ss_ty) {
+        let mut el: [4]*mut ir.Ty = [cx.T_i32, cx.T_i32, ir.t_array(cx.T_ptr, SS_CAP), ir.t_array(cx.T_ptr, ET_CAP)];
+        cx.S.ss_ty = ir.t_struct(el[..]);
+    }
+    return cx.S.ss_ty;
+}
+
+// WebAssembly stacks live in linear memory, where running past the end goes
+// unnoticed: each function with a frame there checks it against this
+// per-thread limit (a wasm global) first. The main thread's stack is the
+// first MiB of memory; its lowest KiB stays unused.
+const WASM_MAIN_STACK_LIMIT: u64 = 1024;
+
+pub fn stack_limit() *mut ir.Value {
+    if u.isnil(cx.S.stack_limit_global) {
+        cx.S.stack_limit_global = shared_global(cx.T_isz, "axiom.stack_limit", ir.cint(cx.T_isz, WASM_MAIN_STACK_LIMIT),
+                                                1);
+    }
+    return cx.S.stack_limit_global;
+}
+
+// The end of a wasm function's entry block (where its allocas are): trap
+// with T0008 if its frame, now reserved, reaches below the thread's limit
+// (or below address 0).
+pub fn check_stack(d: *mut ast.Decl, entry: *mut ir.Block, start: *mut ir.Block) void {
+    let mut has_frame = false;
+    let mut i = entry.first;
+    while u.notnil(i) {
+        if i.op == ir.OP_ALLOCA {
+            has_frame = true;
+        }
+        i = i.next;
+    }
+    if not has_frame {
+        cx.br(start);
+        return;
+    }
+    // (the operand: only compared, ir.IN_GET_SP)
+    let mut mark: [1]*mut ir.Value = [ir.cint(cx.T_i32, 1)];
+    let sp = ir.intr(cx.B, ir.IN_GET_SP, cx.T_ptr, mark[..]);
+    let spi = ir.cast(cx.B, ir.OP_PTRTOINT, sp, cx.T_isz);
+    let saved = cx.S.cur_span;
+    set_span(d.name_span);
+    // signed: a frame reserved below address 0 wraps around. The difference
+    // itself cannot wrap: the stack pointer was at or above the limit before
+    // the frame, which is less than 2 GiB (ty.MAX_FRAME, E0473, and the
+    // backend's own check), and so are the stacks
+    let room = ir.binop(cx.B, ir.OP_SUB, spi, cx.ld(cx.T_isz, stack_limit()));
+    cx.condbr(cx.icmp(ir.IntSLT, room, ir.cint(cx.T_isz, 0)), trap_block(T_STACK), start);
+    set_span(saved);
+}
+
+pub fn ss_globals() void {
+    let t = ss_type();
+    if u.isnil(cx.S.ss_global) {
+        if ty.g_target.is_wasm {
+            cx.S.ss_main = shared_global(t, "axiom.ss.main", ir.czero(t), 0);
+            set_align(cx.S.ss_main, 8);
+            ir.gv_of(cx.S.ss_main).noalias = true;
+            // null means the main thread's record (wasm-ld does not relocate
+            // wasm global initializers); thread starts set their own.
+            cx.S.ss_global = shared_global(cx.T_ptr, "axiom.ss", ir.czero(cx.T_ptr), 1);
+        } else {
+            cx.S.ss_global = shared_global(t, "axiom.ss", ir.czero(t), 0);
+            ir.gv_of(cx.S.ss_global).tls = true;
+            set_align(cx.S.ss_global, 8);
+        }
+        ir.gv_of(cx.S.ss_global).noalias = true;
+    }
+}
+
+pub fn ss_ptr() *mut ir.Value {
+    ss_globals();
+    if ty.g_target.is_wasm {
+        let p = cx.ld(cx.T_ptr, cx.S.ss_global);
+        return ir.select(cx.B, ir.is_null(cx.B, p), cx.S.ss_main, p);
+    }
+    return cx.S.ss_global;
+}
+
+fn ss_field(ss: *mut ir.Value, i: u32) *mut ir.Value {
+    return cx.sgep(ss_type(), ss, i);
+}
+
+fn ss_slot(ss: *mut ir.Value, field: u64, idx: *mut ir.Value) *mut ir.Value {
+    let mut ix: [3]*mut ir.Value = [cx.ci32(0), cx.ci32(field), idx];
+    return ir.gep(cx.B, ss_type(), ss, ix[..]);
+}
+
+struct SsFrame {
+    ss: *mut ir.Value,
+    depth: *mut ir.Value,
+    site: *mut ir.Value,  // frame tables: the call's record (its chain)
+}
+
+// In profiling builds another thread (or a signal handler) reads the stack at
+// any moment, so the stores must happen even where nothing in this thread
+// reads them (after inlining, an increment followed by the restore is
+// otherwise a dead store).
+fn ss_store(v: *mut ir.Value, p: *mut ir.Value) void {
+    let s = cx.st(v, p);
+    if cx.O.profile {
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+}
+
+pub fn ss_push(callee: []u8) SsFrame {
+    let mut f = SsFrame.{ ss: cx.vnil(), depth: cx.vnil(), site: cx.vnil() };
+    if not stack_traces_on() or u.isnil(cx.F) {
+        return f;
+    }
+    if frame_tables() {
+        f.site = site_record_ex(SITE_CALL, cx.S.cur_span, callee);
+        return f;
+    }
+    if u.isnil(cx.F.ss_depth) {
+        let cur = ir.insert_block(cx.B);
+        let first = cx.F.entry.first;
+        if u.notnil(first) {
+            ir.at_before(cx.B, first);
+        } else {
+            cx.at_end(cx.F.entry);
+        }
+        cx.F.ss_rec = ss_ptr();
+        cx.F.ss_depth = ir.load(cx.B, cx.T_i32, ss_field(cx.F.ss_rec, 0));
+        cx.F.ss_slot = ss_slot(cx.F.ss_rec, 2, cx.b_and(cx.F.ss_depth, cx.ci32(SS_CAP - 1)));
+        cx.F.ss_next = cx.b_add(cx.F.ss_depth, cx.ci32(1));
+        cx.at_end(cur);
+    }
+    f.ss = cx.F.ss_rec;
+    f.depth = cx.F.ss_depth;
+    ss_store(site_record_ex(SITE_CALL, cx.S.cur_span, callee), cx.F.ss_slot);
+    ss_store(cx.F.ss_next, ss_field(f.ss, 0));
+    return f;
+}
+
+// After the call `c`.
+pub fn ss_pop(f: SsFrame, c: *mut ir.Value) void {
+    if u.notnil(f.site) {
+        ir.set_chain(c, ir.chain1(f.site));
+    }
+    if u.notnil(f.ss) {
+        ss_store(f.depth, ss_field(f.ss, 0));
+    }
+}
+
+// Appends an error-return record when `code` (an error code, i16) is nonzero.
+pub fn etrace_push(code: *mut ir.Value) void {
+    if not stack_traces_on() or u.isnil(cx.F) {
+        return;
+    }
+    if cx.is_const_int(code) and (code.cv == 0) {
+        return;
+    }
+    let mut cont = cx.bbnil();
+    if not cx.is_const_int(code) {
+        let rec = cx.new_bb("etrace".ptr);
+        cont = cx.new_bb("etrace.done".ptr);
+        cx.condbr(cx.icmp(ir.IntNE, code, ir.czero(code.ty)), rec, cont);
+        cx.at_end(rec);
+    }
+    let ss = ss_ptr();
+    let np = ss_field(ss, 1);
+    let n = cx.ld(cx.T_i32, np);
+    let idx = cx.b_and(n, cx.ci32(ET_CAP - 1));
+    _ = cx.st(site_record(SITE_ERR_RETURN, cx.S.cur_span), ss_slot(ss, 3, idx));
+    _ = cx.st(cx.b_add(n, cx.ci32(1)), np);
+    if u.notnil(cont) {
+        cx.br(cont);
+        cx.at_end(cont);
+    }
+}
+
+pub fn etrace_clear() void {
+    if not stack_traces_on() or u.isnil(cx.F) {
+        return;
+    }
+    _ = cx.st(cx.ci32(0), ss_field(ss_ptr(), 1));
+}
+
+fn add_fn_attr(f: *mut ir.Value, name: []u8) void {
+    if u.str_eq(name, "noreturn") {
+        ir.fnp_of(f).noreturn = true;
+    } else if u.str_eq(name, "cold") {
+        ir.fnp_of(f).cold = true;
+    } else if u.str_eq(name, "noinline") {
+        ir.fnp_of(f).noinline = true;
+    }
+}
+
+pub fn add_str_attr(f: *mut ir.Value, k: []u8, v: []u8) void {
+    if u.str_eq(k, "wasm-export-name") {
+        ir.fnp_of(f).export_name = v;
+    } else if u.str_eq(k, "wasm-import-module") {
+        ir.fnp_of(f).import_module = v;
+    } else if u.str_eq(k, "wasm-import-name") {
+        ir.fnp_of(f).import_name = v;
+    }
+}
+
+// Global and function attributes
+pub fn set_align(v: *mut ir.Value, a: u32) void {
+    if v.kind == ir.V_GLOBAL {
+        ir.gv_of(v).align = @as(u64, a);
+    } else {
+        v.align = a;
+    }
+}
+
+pub fn set_linkage(v: *mut ir.Value, l: i32) void {
+    if v.kind == ir.V_GLOBAL {
+        ir.gv_of(v).linkage = l;
+    } else {
+        ir.fnp_of(v).linkage = l;
+    }
+}
+
+pub fn set_init(g: *mut ir.Value, c: *mut ir.Value) void {
+    ir.gv_of(g).init = c;
+}
+
+pub fn named_fn(name: []u8) *mut ir.Value {
+    let f = ir.get_function(cx.M, name);
+    if u.isnil(f) {
+        return cx.vnil();
+    }
+    return f.val;
+}
+
+pub fn named_global(name: []u8) *mut ir.Value {
+    let g = ir.get_global(cx.M, name);
+    if u.isnil(g) {
+        return cx.vnil();
+    }
+    return g.val;
+}
+
+pub fn param(f: *mut ir.Value, k: u32) *mut ir.Value {
+    return ir.fnp_of(f).params[@as(usize, k)];
+}
+
+pub fn ext_elem(v: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    return ir.extract_elem(cx.B, v, idx.cv);
+}
+
+pub fn ins_elem(v: *mut ir.Value, x: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    return ir.insert_elem(cx.B, v, x, idx.cv);
+}
+
+pub fn call_trap_site(site: *mut ir.Value) void {
+    if u.isnil(cx.S.trap_fn) {
+        let mut ps: [1]*mut ir.Ty = [cx.T_ptr];
+        cx.S.trap_fnty = ir.t_fn(cx.T_void, ps[..], false);
+        cx.S.trap_fn = ir.add_function(cx.M, "axiom.trap", cx.S.trap_fnty).val;
+        set_linkage(cx.S.trap_fn, ir.LINK_INTERNAL);
+        add_fn_attr(cx.S.trap_fn, "noreturn");
+        add_fn_attr(cx.S.trap_fn, "cold");
+        add_fn_attr(cx.S.trap_fn, "nounwind");
+        add_fn_attr(cx.S.trap_fn, "noinline");
+        let cur = ir.insert_block(cx.B);
+        let f = cx.S.trap_fn;
+        cx.at_end(ir.append_block(ir.fnp_of(f), "entry"));
+        let sp = param(f, 0);
+        _ = cx.st(cx.zext(cx.ptrtoint(sp, cx.T_isz), cx.T_i64), trap_info_slot(0));
+        if not ty.g_target.is_wasm {
+            // Optional host hook (std/internal/runtime/native_host.c, std/internal/runtime/test_main.c).
+            let mut hps: [3]*mut ir.Ty = [cx.T_ptr, cx.T_ptr, cx.T_ptr];
+            let hty = ir.t_fn(cx.T_void, hps[..], false);
+            cx.S.trap_hook = ir.add_function(cx.M, "ax_on_trap", hty).val;
+            set_linkage(cx.S.trap_hook, ir.LINK_EXTWEAK);
+            let call_bb = ir.append_block(ir.fnp_of(f), "hook");
+            let done_bb = ir.append_block(ir.fnp_of(f), "trap");
+            let has = cx.icmp(ir.IntNE, cx.S.trap_hook, ir.czero(cx.T_ptr));
+            cx.condbr(has, call_bb, done_bb);
+            cx.at_end(call_bb);
+            let mut ssv = ir.czero(cx.T_ptr);
+            if program_traces() {
+                ssv = ss_ptr();
+            }
+            if frame_tables() {
+                // the frames, from this function's own (its return address
+                // is the trap's): std/internal/runtime/trap_format.ax
+                let mut wps: [1]*mut ir.Ty = [cx.T_ptr];
+                let wty = ir.t_fn(cx.T_void, wps[..], false);
+                let walk = ir.add_function(cx.M, "ax_stack_walk", wty).val;
+                set_linkage(walk, ir.LINK_EXTWEAK);
+                let walk_bb = ir.append_block(ir.fnp_of(f), "walk");
+                let hook_bb = ir.append_block(ir.fnp_of(f), "hook.call");
+                cx.condbr(cx.icmp(ir.IntNE, walk, ir.czero(cx.T_ptr)), walk_bb, hook_bb);
+                cx.at_end(walk_bb);
+                let mut none: [1]*mut ir.Value = [cx.vnil()];
+                let mut wargs: [1]*mut ir.Value = [ir.intr(cx.B, ir.IN_FRAME_ADDR, cx.T_ptr, none[0..0])];
+                _ = cx.call(wty, walk, wargs[..]);
+                cx.br(hook_bb);
+                cx.at_end(hook_bb);
+            }
+            let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
+            _ = cx.call(hty, cx.S.trap_hook, args[..]);
+            cx.br(done_bb);
+            cx.at_end(done_bb);
+        }
+        _ = cx.intrinsic("llvm.trap", cx.no_tys(), cx.no_vals());
+        ir.unreachable(cx.B);
+        cx.at_end(cur);
+    }
+    let mut a: [1]*mut ir.Value = [site];
+    _ = cx.call(cx.S.trap_fnty, cx.S.trap_fn, a[..]);
+}
+
+// A block that traps with `code` at the current source span.
+pub fn trap_block(code: i32) *mut ir.Block {
+    let cur = ir.insert_block(cx.B);
+    let bb = cx.new_bb("trap".ptr);
+    cx.at_end(bb);
+    call_trap_site(site_record(code, cx.S.cur_span));
+    ir.unreachable(cx.B);
+    cx.at_end(cur);
+    return bb;
+}
+
+// v (an add, sub or mul) marked as one that does not overflow as a signed
+// (F_NSW) or an unsigned (F_NUW) operation, where the language's rules make
+// that impossible (ir.F_NSW says what the passes may then do).
+pub fn no_wrap(v: *mut ir.Value, is_signed: bool) *mut ir.Value {
+    if (v.kind == ir.V_INST) and ((v.op == ir.OP_ADD) or (v.op == ir.OP_SUB) or (v.op == ir.OP_MUL)) {
+        if is_signed {
+            v.flags = v.flags | ir.F_NSW;
+        } else {
+            v.flags = v.flags | ir.F_NUW;
+        }
+    }
+    return v;
+}
+
+// Continue only if `ok` holds; otherwise trap with `code`.
+pub fn check_or_trap(ok: *mut ir.Value, code: i32) void {
+    if cx.is_const_int(ok) and (ok.cv == 1) {
+        return;
+    }
+    let cont = cx.new_bb("ok".ptr);
+    cx.condbr(ok, cont, trap_block(code));
+    cx.at_end(cont);
+}
+
+pub fn emit_trap(code: i32) void {
+    call_trap_site(site_record(code, cx.S.cur_span));
+    ir.unreachable(cx.B);
+    cx.dead_block();
+}
+
+pub fn alloca_in_entry(t: *mut ir.Ty, name: *u8) *mut ir.Value {
+    let cur = ir.insert_block(cx.B);
+    let term = ir.terminator(cx.F.entry);
+    if u.notnil(term) {
+        ir.at_before(cx.B, term);
+    } else {
+        cx.at_end(cx.F.entry);
+    }
+    let a = ir.alloca(cx.B, t, u.from_c(name));
+    cx.at_end(cur);
+    return a;
+}
+
+// Counts an object of type t into the function's frame, which must not pass
+// ty.MAX_FRAME (checked at the end of the function: E0473).
+fn add_frame(t: *mut ast.Type) void {
+    let n = ty.type_size(t);
+    if cx.F.frame >= (ty.SIZE_CAP - n) {
+        cx.F.frame = ty.SIZE_CAP;
+    } else {
+        cx.F.frame += n;
+    }
+}
+
+pub fn temp_alloca(t: *mut ast.Type) *mut ir.Value {
+    add_frame(t);
+    let a = alloca_in_entry(cx.lty(t), "tmp".ptr);
+    set_align(a, @int_cast(u32, ty.type_align(t)));
+    return a;
+}
+
+pub fn to_mem(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
+    if t.kind == ast.TY_BOOL {
+        return cx.zext(v, cx.T_i8);
+    }
+    return v;
+}
+
+pub fn from_mem(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
+    if t.kind == ast.TY_BOOL {
+        return cx.icmp(ir.IntNE, v, ir.cint(cx.T_i8, 0));
+    }
+    return v;
+}
+
+// unaligned: the storage may be misaligned (reached through pointers)
+pub fn load(t: *mut ast.Type, p: *mut ir.Value, unaligned: bool) *mut ir.Value {
+    let v = cx.ld(cx.lty(t), p);
+    if unaligned {
+        set_align(v, 1);
+    }
+    return from_mem(t, v);
+}
+
+pub fn store(t: *mut ast.Type, v: *mut ir.Value, p: *mut ir.Value, unaligned: bool) void {
+    let s = cx.st(to_mem(t, v), p);
+    if unaligned {
+        set_align(s, 1);
+    }
+}
+
+pub fn spill(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
+    let a = temp_alloca(t);
+    store(t, v, a, false);
+    return a;
+}
+
+pub fn local_ptr(l: *mut ast.Local) *mut ir.Value {
+    let i = @int_cast(usize, l.index);
+    if u.isnil(cx.F.locals[i]) {
+        let t = cx.ct(l.ty);
+        add_frame(t);
+        let a = alloca_in_entry(cx.lty(t), u.cz(l.name));
+        set_align(a, @int_cast(u32, ty.type_align(t)));
+        cx.F.locals[i] = a;
+        axd.note_local(ir.fnp_of(cx.F.fnv), l, debug_type(l.ty), a, false);
+    }
+    return cx.F.locals[i];
+}
+
+// Type t in the function being generated, for the debug information: as
+// ct gives it, but an enumeration's own.
+pub fn debug_type(t: *mut ast.Type) *mut ast.Type {
+    if u.isnil(t) or u.isnil(cx.F) or not t.has_params {
+        return t;
+    }
+    return ty.subst(t, cx.F.from, cx.F.to);
+}
+// The symbol of an exported function. On wasm (and in test binaries, which
+// have their own main) `main` is renamed; the export name is an attribute.
+pub fn export_symbol(d: *mut ast.Decl) []u8 {
+    if d.is_export and u.str_eq(d.name, "main") {
+        if cx.S.sanitize_main and not cx.g_test_mode {
+            return "axiom.asan.main";  // wrapped: see emit_asan_main
+        }
+        return "axiom.export.main";
+    }
+    return d.name;
+}
+// Program-wide state shared by all units: defined (internal) in a whole
+// program, declared by module units, defined (external) by the link unit.
+pub fn shared_global(t: *mut ir.Ty, name: []u8, init: *mut ir.Value, addrspace: u32) *mut ir.Value {
+    let mut g = cx.vnil();
+    if addrspace != 0 {
+        g = ir.add_global(cx.M, t, name).val;
+        ir.gv_of(g).wasm_global = true;
+    } else {
+        g = ir.add_global(cx.M, t, name).val;
+    }
+    if cx.O.unit == cx.CG_MODULE {
+        return g;
+    }
+    set_init(g, init);
+    if cx.O.unit == cx.CG_WHOLE {
+        set_linkage(g, cx.program_linkage());
+    }
+    return g;
+}
+// Is d an `export fn` of a library's module (g_lib_prefix), generated only
+// when referred to, in a program with C units?
+pub fn lazy_export(d: *ast.Decl) bool {
+    if not d.is_export or (cx.g_lib_prefix.len == 0) or not cx.S.c_program or u.isnil(d.module) {
+        return false;
+    }
+    return u.starts(d.module.path, cx.g_lib_prefix);
+}
