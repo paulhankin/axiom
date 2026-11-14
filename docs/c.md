@@ -1786,6 +1786,7 @@ without the C library, are the compiler's headers:
 | `<x86intrin.h>` | The same as `<immintrin.h>`. |
 | `<cpuid.h>` | `__cpuid(leaf, a, b, c, d)` and `__cpuid_count`, `__get_cpuid_max`, `__get_cpuid`, `__get_cpuid_count`, and the feature bits `bit_SSE3` ... of leaves 1, 7 and 0x80000001. |
 | `<arm_neon.h>` | AArch64's Advanced SIMD, complete: the types `int8x8_t` ... `float64x2_t`, `poly8x8_t` ... `poly64x2_t`, `float16x4_t`, `bfloat16x4_t` ..., the structures `int8x8x2_t` ... `x4`, and `poly128_t`; every intrinsic of the arithmetic, saturating, halving and rounding forms, widening and narrowing, multiply-accumulate (by vectors, scalars and lanes), compares, shifts by vectors and immediates, the bit operations and `vbsl`, counts and reversals, min and max with the NaN-aware forms, pairwise operations and reductions (`vaddv`, `vmaxnmv` ...), conversions with each rounding mode and to and from fixed point, the estimates and steps (`vrecpe`, `vrsqrts` ...), `vld1` ... `vld4` and `vst1` ... `vst4` with their lane, duplicating and `_x2` ... `_x4` forms, lane get, set, copy and duplicate, `vcombine`, `vget_low`/`high`, `vext`, `vzip`/`vuzp`/`vtrn` and their halves, `vtbl`, `vtbx`, `vqtbl`, `vqtbx`, every `vreinterpret`; and of the extensions: FP16's vector and scalar arithmetic, BF16's (`vbfdot`, `vbfmmla`, `vbfmlalb` ..., conversions), FHM's `vfmlal_low_f16` ..., RDM's `vqrdmlah`, the dot products (`vdot`, and `vusdot`, `vsudot`, `vmmla` of i8mm), AES, SHA-1, SHA-256, SHA-512, SHA-3 (`veor3q`, `vbcaxq`, `vrax1q`, `vxarq`), SM3, SM4 and `vmull_p64`. |
+| `<wasm_simd128.h>` | WebAssembly's vector instructions (simd128) and relaxed-simd: `v128_t`, and `wasm_v128_load` ... (with the splatting, zero-extending, widening and lane forms), `wasm_v128_store` and its lane forms, `wasm_i8x16_make`, `_const`, `_const_splat`, `_splat`, `_extract_lane`, `_replace_lane` of every shape, the shuffles and `wasm_i8x16_swizzle`, the bit operations, `wasm_v128_bitselect` and `wasm_v128_any_true`, every shape's arithmetic (saturating, `wasm_u8x16_avgr`, `wasm_i16x8_q15mulr_sat`, the extended multiplies, the pairwise sums, `wasm_i32x4_dot_i16x8`), compares, `_all_true`, `_bitmask`, shifts, `wasm_i8x16_popcnt`, narrowing and extension, the floating ones (`min`, `max`, `pmin`, `pmax`, `sqrt`, the roundings), the conversions with their saturating truncations, demotion and promotion; and relaxed-simd's `wasm_i8x16_relaxed_swizzle`, `_relaxed_trunc`, `_relaxed_madd`, `_relaxed_nmadd`, `_relaxed_laneselect`, `_relaxed_min`, `_relaxed_max`, `wasm_i16x8_relaxed_q15mulr` and the relaxed dot products. The unsigned names (`wasm_u32x4_add` ...) of the operations that do not depend on the sign are there too. |
 | `<arm_fp16.h>`, `<arm_bf16.h>` | `float16_t` and the scalar FP16 intrinsics (`vaddh_f16`, `vcvth_s32_f16` ...); `bfloat16_t` and its scalar conversions. `<arm_neon.h>` includes both. |
 | `<arm_acle.h>` | `__crc32b` ... `__crc32cd` (CRC), `__clz`, `__cls`, `__rev`, `__rev16`, `__revsh`, `__rbit`, `__ror` and their `l` and `ll` forms, `__dmb`, `__dsb`, `__isb`, `__nop`, `__yield`, `__wfe`, `__wfi`, `__sev`, `__sevl`, `__pld`, `__pli`, `__pldx`, `__plix`, `__sqrt`, `__sqrtf`, `__fma`, `__fmaf`, `__rintn`, `__rintnf`. |
 
@@ -1856,9 +1857,19 @@ and `_mm_comineq_ss` raise invalid for a signaling NaN only (C's `==`). RDRAND a
 RDSEED are not among the extensions of `--features`: their intrinsics are not checked
 (test `bit_RDRND` and `bit_RDSEED` of `<cpuid.h>` first). Not provided: the
 AVX-512 intrinsics, AMX, KL, the system instructions' (`_xsave`, `_fxsave` ...),
-`<arm_sve.h>` and `<wasm_simd128.h>` (until then, a program that includes one when
-`__ARM_FEATURE_SVE` or `__wasm_simd128__` is defined needs its portable path chosen with
-`-U`).
+and `<arm_sve.h>` (until then, a program that includes it when `__ARM_FEATURE_SVE` is
+defined needs its portable path chosen with `-U`).
+
+`<wasm_simd128.h>` (made by `cmd/internal/tools/gen_wasm_intrin.py`) needs simd128,
+which every WebAssembly build has unless `--features=-simd128` (then it is an `#error`).
+Its operations are plain C or the IR's where they say it (add, mul, the bit operations,
+compares, shifts, with WebAssembly's count modulo the lane width, saturating add, min,
+max, abs, sqrt, rounding, the lanes, loads and stores, shuffles, `convert`), else the
+instruction, an asm statement in the text format. A shuffle's indices and a lane must be
+constants in range (`C3241`, or `C3070` from the range's check). The relaxed-simd
+intrinsics need `+relaxed-simd` (`C3240` otherwise); on WebAssembly an attribute
+`target("relaxed-simd")` asserts that the engine has it, the features being the
+module's. The `_const` macros accept any value, constant or not.
 
 ## Not available
 

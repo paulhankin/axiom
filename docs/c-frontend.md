@@ -76,7 +76,8 @@ lists the diagnostics.
 - **Intrinsics** (docs/c.md, "Intrinsics"): csema_simd.ax (the design, in its header
   comment; `__builtin_axiom_simd`, typed from its table csimd_tab.ax, which
   `cmd/internal/tools/gen_x86_intrin.py` writes with the x86-64 headers and their
-  tests, and `cmd/internal/tools/gen_neon_intrin.py` with the AArch64 ones; the rule that an always-inline function with the attribute `target` is called
+  tests, `cmd/internal/tools/gen_neon_intrin.py` with the AArch64 ones and
+  `cmd/internal/tools/gen_wasm_intrin.py` with `<wasm_simd128.h>`; the rule that an always-inline function with the attribute `target` is called
   only from code compiled for its extensions, C3240, is csema_gnu.ax's `call_check`),
   cgen_simd.ax (generic operations as the IR's, machine ones as pure asm statements,
   asm/inline.ax, with the VEX form as `Blob.alt1`).
