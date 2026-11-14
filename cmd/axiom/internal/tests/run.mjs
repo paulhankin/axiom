@@ -462,7 +462,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // macOS c/host_c.c's, a second translation unit over the platform's C library
 // (tests marked /* linux-only */ need the former; /* not-windows */ ones are
 // skipped for a Windows target, /* macos-only */ ones run only for a macOS
-// one; /* wasm-flags: */ are more flags for a WebAssembly build). /* units: a.c */ names more
+// one, /* x86-64-only */ ones run only natively for x86-64; /* wasm-flags: */ are more flags for
+// a WebAssembly build). /* units: a.c */ names more
 // translation units, next to the test (c/run/abi/). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
 // only checked (axiom check, with its own --target), not built or run; one
@@ -486,6 +487,8 @@ const cRunTest = async (f) => {
   if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   // (/* not-windows */: a rule of the other ABIs, whose Windows counterpart is another test)
   if (native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || '') && /\/\* not-windows \*\//.test(src)) return { skip: true, reason: 'not for Windows' };
+  // (/* x86-64-only */: natively for an x86-64 target only: the processor's intrinsics)
+  if (/\/\* x86-64-only \*\//.test(src) && !(native && (/x86_64/.test(process.env.AXIOM_NATIVE_TARGET || '') || (!process.env.AXIOM_NATIVE_TARGET && process.arch === 'x64')))) return { skip: true, reason: 'x86-64 only' };
   // (/* windows-only */: natively for Windows targets only)
   if (/\/\* windows-only \*\//.test(src) && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
   // (/* macos-only */: natively for macOS targets only, as the platform's own forms)

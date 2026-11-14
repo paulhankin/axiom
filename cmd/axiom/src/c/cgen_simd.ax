@@ -1,0 +1,614 @@
+// =============================================================================
+// cgen_simd.ax - IR generation for __builtin_axiom_simd (csema_simd.ax, whose
+// header gives the design): a generic operation is the IR's vector
+// operation or intrinsic; a machine operation is an asm statement (IN_ASM,
+// asm/inline.ax) made here from its table entry, its operands in registers.
+//
+// The operands' values: a vector is memory (cgen_vec.ax), loaded as the IR
+// vector of its size; a scalar is its value. A vector result is stored in a
+// temporary object, whose address is the call's value.
+//
+// Machine forms (Op.form): with M the mnemonic, the operands written
+// %0 (the result) and %1, %2 ... (the call's operands, in order) in the
+// Intel syntax, and on x86-64 the legacy form's destination tied to %1:
+//   2   M %0, %2           (VEX: vM %0, %1, %2)
+//   2i  M %0, %2, %3       (VEX: vM %0, %1, %2, %3)
+//   1   M %0, %1           (VEX: vM %0, %1)
+//   1i  M %0, %1, %2       (VEX: vM %0, %1, %2)
+//   l2, l2i, l3  the legacy form only (SHA): M %0, %2 [, %3]
+//   v1, v1i, v2, v2i, v3, v3i  a VEX (or AArch64, WebAssembly) form only:
+//       M %0, %1 [, %2 [, %3 [, %4]]]
+//   t3, t3i  VEX only, the destination tied to %1: M %0, %2, %3 [, %4]
+//   c   custom: Op.mn the template, Op.cons the constraints (the outputs
+//       first), each with "@@" and the VEX form after it (x86-64)
+// A vector operand of 32 bytes is written as a ymm register, of 64 a zmm.
+// The constraints of the automatic forms: a vector or floating operand
+// "x" (AArch64 and WebAssembly: "w", "r"), an integer "r", a constant "i".
+// =============================================================================
+import "../asm/check.ax" as ack;
+import "../asm/inline.ax" as ai;
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "csema_simd.ax" as csd;
+import "ctypes.ax" as cty;
+
+fn B() *mut ir.Builder {
+    return cg.B;
+}
+
+// The IR type of a C vector type's value (one chunk of its size).
+fn vty(t: *mut cty.CType) *mut ir.Ty {
+    return cg.vec_chunk(cty.unqual(t));
+}
+
+// The value of operand k (from 1) of call e: a vector loaded, else vs[k].
+fn arg(e: *cast.Expr, vs: []mut *mut ir.Value, k: usize) *mut ir.Value {
+    let t = e.args.get(k).ty;
+    if cty.is_vector(t) {
+        let v = ir.load(B(), vty(t), vs[k]);
+        v.align = 1;
+        return v;
+    }
+    return vs[k];
+}
+
+// The call's value from the IR value r: a vector stored in a temporary.
+fn result(e: *cast.Expr, r: *mut ir.Value) *mut ir.Value {
+    if cty.is_vector(e.ty) {
+        let tmp = cg.temp_object(cty.unqual(e.ty), "simd");
+        let st = ir.store(B(), as_ty(r, vty(e.ty)), tmp);
+        st.align = 1;
+        return tmp;
+    }
+    return r;
+}
+
+// v as type t of the same size (bits reinterpreted), or v.
+fn as_ty(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if v.ty == t {
+        return v;
+    }
+    return ir.bitcast(B(), v, t);
+}
+
+// An integer vector type of the shape of v's (lanes of the same width).
+fn int_vec(t: *mut ir.Ty) *mut ir.Ty {
+    if t.elem.kind == ir.T_INT {
+        return t;
+    }
+    return ir.t_vec(ir.t_int(t.elem.bits), @as(u32, @bit_cast(u32, t.lanes)));
+}
+
+fn intr(id: i32, t: *mut ir.Ty, xs: []*mut ir.Value) *mut ir.Value {
+    let a = u.newn.[*mut ir.Value](xs.len + 1);
+    for k in 0..xs.len {
+        a[k] = xs[k];
+    }
+    return ir.intr(B(), id, t, a[0..xs.len]);
+}
+
+fn signed_elem(e: *cast.Expr) bool {
+    let t = cty.unqual(e.args.get(1).ty);
+    return cty.is_signed_int(t.unq.elem);
+}
+
+/// The value of call e of __builtin_axiom_simd with argument values vs (vs[0]: the name's).
+pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    let o = csd.op_of(e);
+    if u.str_eq(o.form, "G") {
+        return result(e, generic(e, o.name, vs));
+    }
+    return machine(e, o, vs);
+}
+
+// -----------------------------------------------------------------------------
+// Generic operations
+// -----------------------------------------------------------------------------
+
+fn generic(e: *cast.Expr, n: []u8, vs: []mut *mut ir.Value) *mut ir.Value {
+    let a = arg(e, vs, 1);
+    let t = a.ty;
+    if u.str_eq(n, "adds") or u.str_eq(n, "addus") or u.str_eq(n, "subs") or u.str_eq(n, "subus") {
+        let b = as_ty(arg(e, vs, 2), t);
+        let mut id = ir.IN_SADD_SAT;
+        if u.str_eq(n, "addus") {
+            id = ir.IN_UADD_SAT;
+        } else if u.str_eq(n, "subs") {
+            id = ir.IN_SSUB_SAT;
+        } else if u.str_eq(n, "subus") {
+            id = ir.IN_USUB_SAT;
+        }
+        let xs: [2]*mut ir.Value = [a, b];
+        return intr(id, t, xs[..]);
+    }
+    if u.str_eq(n, "min") or u.str_eq(n, "max") {
+        let b = as_ty(arg(e, vs, 2), t);
+        let sg = signed_elem(e);
+        let mut id = ir.IN_UMIN;
+        if u.str_eq(n, "min") and sg {
+            id = ir.IN_SMIN;
+        } else if u.str_eq(n, "max") {
+            id = ir.IN_UMAX;
+            if sg {
+                id = ir.IN_SMAX;
+            }
+        }
+        let xs: [2]*mut ir.Value = [a, b];
+        return intr(id, t, xs[..]);
+    }
+    if u.str_eq(n, "minx") or u.str_eq(n, "maxx") {
+        // (x86-64's minps and maxps: the second operand unless the first is
+        // less, or greater: so a NaN of either, or two zeros, give the second)
+        let b = as_ty(arg(e, vs, 2), t);
+        let mut p = ir.RealOLT;
+        if u.str_eq(n, "maxx") {
+            p = ir.RealOGT;
+        }
+        return ir.select(B(), ir.fcmp(B(), p, a, b), a, b);
+    }
+    if u.str_eq(n, "abs") or u.str_eq(n, "sqrt") or u.str_eq(n, "floor") or u.str_eq(n, "ceil") or
+       u.str_eq(n, "trunc") or u.str_eq(n, "nearest") or u.str_eq(n, "popcnt") or u.str_eq(n, "lzcnt") or
+       u.str_eq(n, "tzcnt") {
+        let ids: [9]i32 = [ir.IN_ABS, ir.IN_SQRT, ir.IN_FLOOR, ir.IN_CEIL, ir.IN_FTRUNC, ir.IN_NEAREST, ir.IN_CTPOP,
+                           ir.IN_CTLZ, ir.IN_CTTZ];
+        let ns: [9][]u8 = ["abs", "sqrt", "floor", "ceil", "trunc", "nearest", "popcnt", "lzcnt", "tzcnt"];
+        let mut id: i32 = 0;
+        for k in @as(usize, 0)..9 {
+            if u.str_eq(n, ns[k]) {
+                id = ids[k];
+            }
+        }
+        let xs: [1]*mut ir.Value = [a];
+        return intr(id, t, xs[..]);
+    }
+    if u.str_eq(n, "fma") {
+        let xs: [3]*mut ir.Value = [a, as_ty(arg(e, vs, 2), t), as_ty(arg(e, vs, 3), t)];
+        return intr(ir.IN_FMA, t, xs[..]);
+    }
+    if u.str_eq(n, "bitmask") {
+        let xs: [1]*mut ir.Value = [as_ty(a, int_vec(t))];
+        return intr(ir.IN_BITMASK, ir.t_int(32), xs[..]);
+    }
+    if u.str_eq(n, "madd16") {
+        // (pmaddwd: <n x i16> by <n x i16> -> <n/2 x i32>)
+        let b = as_ty(arg(e, vs, 2), t);
+        let xs: [2]*mut ir.Value = [a, b];
+        return intr(ir.IN_DOT_I16, ir.t_vec(ir.t_int(32), @as(u32, @bit_cast(u32, t.lanes / 2))), xs[..]);
+    }
+    if u.str_eq(n, "widen_lo") or u.str_eq(n, "widen_hi") {
+        let hi = u.str_eq(n, "widen_hi");
+        let mut id = ir.IN_UWIDEN_LO;
+        if signed_elem(e) {
+            id = ir.IN_SWIDEN_LO;
+        }
+        if hi {
+            id += 1;
+        }
+        let wt = ir.t_vec(ir.t_int(t.elem.bits * 2), @as(u32, @bit_cast(u32, t.lanes / 2)));
+        let xs: [1]*mut ir.Value = [a];
+        return intr(id, wt, xs[..]);
+    }
+    if u.str_eq(n, "shli") or u.str_eq(n, "srli") or u.str_eq(n, "srai") {
+        return shift_imm(n, a, vs[2], e.args.get(2));
+    }
+    if u.str_eq(n, "shlv") or u.str_eq(n, "srlv") or u.str_eq(n, "srav") {
+        let mut id = ir.IN_SHLV;
+        if u.str_eq(n, "srlv") {
+            id = ir.IN_LSHRV;
+        } else if u.str_eq(n, "srav") {
+            id = ir.IN_ASHRV;
+        }
+        let xs: [2]*mut ir.Value = [a, as_ty(arg(e, vs, 2), t)];
+        return intr(id, t, xs[..]);
+    }
+    if u.str_eq(n, "umulh") {
+        // (the high half of the unsigned 128-bit product: the native targets'
+        // instruction, WebAssembly's 128-bit arithmetic)
+        let b = resize(arg(e, vs, 2), t, false);
+        if tg.is_wasm() {
+            let w = ir.t_int(t.bits * 2);
+            let p = ir.binop(B(), ir.OP_MUL, resize(a, w, false), resize(b, w, false));
+            return ir.trunc(B(), ir.binop(B(), ir.OP_LSHR, p, ir.cint(w, @as(u64, @bit_cast(u32, t.bits)))), t);
+        }
+        let xs: [2]*mut ir.Value = [a, b];
+        return intr(ir.IN_UMULH, t, xs[..]);
+    }
+    if u.str_eq(n, "cpuid") {
+        let xs: [2]*mut ir.Value = [resize(a, ir.t_int(32), false), resize(arg(e, vs, 2), ir.t_int(32), false)];
+        return intr(ir.IN_CPUID, ir.t_vec(ir.t_int(32), 4), xs[..]);
+    }
+    if u.str_eq(n, "xgetbv") {
+        let xs: [1]*mut ir.Value = [resize(a, ir.t_int(32), false)];
+        return intr(ir.IN_XGETBV, ir.t_int(64), xs[..]);
+    }
+    if u.str_eq(n, "splat") {
+        return ir.splat(B(), t, lane_value(vs[2], e.args.get(2).ty, t.elem));
+    }
+    u.die(u.cat2("cgen_simd: no generic operation ", n));
+    return a;
+}
+
+// Scalar x (of C type ct) as a lane of type lt.
+fn lane_value(x: *mut ir.Value, ct: *cty.CType, lt: *mut ir.Ty) *mut ir.Value {
+    if x.ty == lt {
+        return x;
+    }
+    if lt.kind == ir.T_FLOAT {
+        if x.ty.kind == ir.T_FLOAT {
+            return ir.bitcast(B(), x, lt);  // (not reached: the header converts)
+        }
+        return ir.bitcast(B(), resize(x, ir.t_int(lt.bits), cty.is_signed_int(ct)), lt);
+    }
+    if x.ty.kind == ir.T_FLOAT {
+        return resize(ir.bitcast(B(), x, ir.t_int(x.ty.bits)), lt, false);
+    }
+    return resize(x, lt, cty.is_signed_int(ct));
+}
+
+fn resize(v: *mut ir.Value, t: *mut ir.Ty, sg: bool) *mut ir.Value {
+    if v.ty.bits == t.bits {
+        return v;
+    }
+    if v.ty.bits > t.bits {
+        return ir.trunc(B(), v, t);
+    }
+    if sg {
+        return ir.sext(B(), v, t);
+    }
+    return ir.zext(B(), v, t);
+}
+
+// x86-64's shift by an 8-bit count (pslld $n ...): a count of the lane's
+// width or more gives 0 (srai: each lane's sign). A constant is one shift
+// (or zero); another count is IN_SHLV ... by its splat.
+fn shift_imm(n: []u8, a: *mut ir.Value, c: *mut ir.Value, ce: *cast.Expr) *mut ir.Value {
+    let t = a.ty;
+    let w = @as(u64, @bit_cast(u32, t.elem.bits));
+    let sra = u.str_eq(n, "srai");
+    let mut op = ir.OP_SHL;
+    let mut id = ir.IN_SHLV;
+    if u.str_eq(n, "srli") {
+        op = ir.OP_LSHR;
+        id = ir.IN_LSHRV;
+    } else if sra {
+        op = ir.OP_ASHR;
+        id = ir.IN_ASHRV;
+    }
+    if ce.is_const {
+        let mut k = ce.cval & 0xff;
+        if k >= w {
+            if not sra {
+                return ir.czero(t);
+            }
+            k = w - 1;
+        }
+        return ir.binop(B(), op, a, ir.splat(B(), t, ir.cint(t.elem, k)));
+    }
+    // (a count of the width or more: 0 for shli and srli, the shift by
+    // width - 1 for srai)
+    _ = id;
+    let t32 = ir.t_int(32);
+    let k8 = ir.binop(B(), ir.OP_AND, resize(c, t32, false), ir.ci32(0xff));
+    let big = ir.icmp(B(), ir.IntUGE, k8, ir.ci32(w));
+    let k = ir.select(B(), big, ir.ci32(u64_pick(sra, w - 1, 0)), k8);
+    let r = ir.binop(B(), op, a, ir.splat(B(), t, resize(k, t.elem, false)));
+    if sra {
+        return r;
+    }
+    return ir.select(B(), big, ir.czero(t), r);
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// Machine operations
+// -----------------------------------------------------------------------------
+
+// The pure asm statements made so far, by template and constraints: index + 1.
+let mut keys: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                cap: 0, len: 0 };
+
+// The automatic forms' template and constraints (form f, mnemonic mn, n
+// operands, vex: the VEX form), or false for a form that has none of that kind.
+struct Form {
+    text: []u8,
+    cons: []u8,
+}
+
+fn auto_form(f: []u8, mn: []u8, n: usize, vex: bool) Form {
+    let mut t = u.Buf.init();
+    let mut c = u.Buf.init();
+    let x86 = tg.g_arch == tg.ARCH_X64;
+    let legacy_only = (f.len > 0) and (f[0] == 'l');
+    let vex_only = (f.len > 0) and ((f[0] == 'v') or (f[0] == 't'));
+    let use_vex = vex or vex_only;
+    let tied = (f.len > 0) and (f[0] == 't');
+    if x86 and use_vex and not vex_only {
+        if legacy_only {
+            return Form.{ text: "", cons: "" };
+        }
+        t.s("v");
+    }
+    t.s(mn);
+    // (the legacy two-operand forms: the destination is operand 1)
+    let destructive = x86 and not use_vex and (f[0] != '1');
+    c.s("=");
+    for k in @as(usize, 0)..(n + 1) {
+        if k > 0 {
+            c.s(";");
+            if (destructive or tied) and (k == 1) {
+                c.s("0");
+                continue;
+            }
+        }
+        c.s("?");  // (the operand's own: a register of its kind, or a constant)
+    }
+    let mut first = true;
+    for k in @as(usize, 0)..(n + 1) {
+        if (destructive or tied) and (k == 1) {
+            continue;
+        }
+        t.s(u.pick(first, " ", ", "));
+        first = false;
+        t.s("%");
+        t.s(u.zdec(k));
+    }
+    return Form.{ text: t.done(), cons: c.done() };
+}
+
+// Has call e (n operands) a vector result or operand of 32 or 64 bytes?
+fn wide_call(e: *cast.Expr, n: usize) bool {
+    if cty.is_vector(e.ty) and (cty.size_of(e.ty) > 16) {
+        return true;
+    }
+    for j in 0..n {
+        if cty.is_vector(e.args.get(j + 1).ty) and (cty.size_of(e.args.get(j + 1).ty) > 16) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn machine(e: *mut cast.Expr, o: *csd.Op, vs: []mut *mut ir.Value) *mut ir.Value {
+    let n = e.args.len - 1;
+    let custom = u.str_eq(o.form, "c");
+    let x86 = tg.g_arch == tg.ARCH_X64;
+    let mut f1 = Form.{ text: o.mn, cons: o.cons };
+    let mut f2 = Form.{ text: "", cons: "" };
+    if custom {
+        let ti = find2(o.mn, "@@");
+        if ti >= 0 {
+            let ci = find2(o.cons, "@@");
+            f1 = Form.{ text: o.mn[0..@int_cast(usize, ti)], cons: o.cons[0..@int_cast(usize, ci)] };
+            f2 = Form.{ text: o.mn[@int_cast(usize, ti) + 2..], cons: o.cons[@int_cast(usize, ci) + 2..] };
+        }
+    } else {
+        // (an operand of 32 or 64 bytes: only the VEX or EVEX form has it)
+        let wide = wide_call(e, n);
+        let vex_only = (o.form[0] == 'v') or (o.form[0] == 't') or (x86 and wide);
+        f1 = auto_form(o.form, o.mn, n, vex_only);
+        if x86 and not vex_only {
+            f2 = auto_form(o.form, o.mn, n, true);
+        }
+    }
+    if custom and x86 and (f2.text.len > 0) and wide_call(e, n) {
+        f1 = f2;  // (ymm or zmm operands: the VEX form only)
+        f2 = Form.{ text: "", cons: "" };
+    }
+    let void_ = e.ty.kind == cty.TK_VOID;
+    let b1 = blob(e, o, f1, void_);
+    let mut index = b1;
+    if f2.text.len > 0 {
+        let b2 = blob(e, o, f2, void_);
+        ai.blob(@as(i64, b1)).alt1 = b2 + 1;
+    }
+    let vol = u.find(o.flags, 'V') >= 0;
+    let mem = u.find(o.flags, 'M') >= 0;
+    let mut flags: u32 = 0;
+    if not vol and not mem and not void_ {
+        flags = ir.ASM_PURE;
+        // (one index for equal operations: value numbering merges them)
+        let mut kb = u.Buf.init();
+        kb.s(f1.text);
+        kb.c(1);
+        kb.s(f1.cons);
+        kb.c(1);
+        kb.s(f2.text);
+        for j in 0..n {
+            kb.c(2);
+            kb.s(u.zdec(@int_cast(usize, cty.size_of(e.args.get(j + 1).ty))));
+        }
+        kb.c(3);
+        kb.s(u.zdec(@int_cast(usize, cty.size_of(e.ty))));
+        let key = u.intern(kb.done());
+        let prev = keys.get(key);
+        if prev != 0 {
+            index = prev - 1;
+        } else {
+            keys.put(key, index + 1);
+        }
+    } else if not mem {
+        flags = ir.ASM_HINT;
+    }
+    ir.note_asm(@as(i64, index), flags);
+    let b = ai.blob(@as(i64, index));
+    let mut xs = u.List.[*mut ir.Value].empty();
+    xs.push(ir.ci32(@as(u64, @bit_cast(u32, index))));
+    let mut j: usize = 0;
+    for k in 0..b.ops.len {
+        let op = b.ops[k];
+        if op.out {
+            xs.push(ir.ci32(0));  // (its register: the asm's result k)
+            continue;
+        }
+        j += 1;
+        let v = arg(e, vs, j);
+        if (op.kind == ai.OK_IMM) or (op.kind == ai.OK_MEM) {
+            xs.push(v);
+        } else if (op.cls == ai.CL_GPR) and (v.ty.kind == ir.T_PTR) {
+            xs.push(ir.ptrtoint(B(), v, ir.t_int(64)));
+        } else {
+            xs.push(v);
+        }
+    }
+    let r = ir.intr(B(), ir.IN_ASM, cg.T_void, xs.items());
+    if void_ {
+        return ir.vnil();
+    }
+    // (the result: output 0)
+    let op = b.ops[0];
+    let mut rt = vty(e.ty);
+    if cty.is_floating(e.ty) {
+        rt = ir.t_float(@as(i32, @bit_cast(i32, op.bits)));
+    } else if not cty.is_vector(e.ty) {
+        rt = ir.t_int(@as(i32, @bit_cast(i32, op.bits)));
+    }
+    let mut args: [2]*mut ir.Value = [r, ir.ci32(0)];
+    let v = ir.intr(B(), ir.IN_CALL_RESULT, rt, args[..]);
+    if cty.is_vector(e.ty) {
+        return result(e, v);
+    }
+    let want = cg.lty(cty.unqual(e.ty));
+    if want == v.ty {
+        return v;
+    }
+    return resize(v, want, false);
+}
+
+// Bits and register class of a C type's value.
+fn bits_of(t: *cty.CType) u32 {
+    let n = cty.size_of(t);
+    if n == 0 {
+        return 32;
+    }
+    return @truncate(u32, n * 8);
+}
+
+// The asm statement of form f for call e (void_: without a result): its index.
+fn blob(e: *cast.Expr, o: *csd.Op, f: Form, void_: bool) i32 {
+    let b = u.perm_new.[ai.Blob]();
+    b.arch = tg.g_arch;
+    b.file_id = -1;
+    b.cc = true;
+    b.intel = tg.g_arch == tg.ARCH_X64;
+    b.volatile_ = (u.find(o.flags, 'V') >= 0) or (u.find(o.flags, 'M') >= 0) or void_;
+    b.memory = u.find(o.flags, 'M') >= 0;
+    let lc = u.span_linecol(e.span);
+    b.loc = u.perm_dup(u.f2("%s:%s", u.file_of(e.span.file).display, u.idec(lc.sl)));
+    let mut cs = u.split(f.cons, ';', 64);
+    if f.cons.len == 0 {
+        cs.clear();
+    }
+    let ops = u.perm_newn.[ai.Op](cs.len + 1);
+    let mut j: usize = 0;  // (the call's operand of an input)
+    for k in 0..cs.len {
+        let s = cs.get(k);
+        let out = (s.len > 0) and (s[0] == '=');
+        let mut t: *mut cty.CType = e.ty;
+        if not out {
+            j += 1;
+            t = e.args.get(j).ty;
+        }
+        let mut cstr = s;
+        if (s.len > 0) and (s[s.len - 1] == '?') {
+            // (an automatic form's operand: by its type)
+            let mut l = "r";
+            if cty.is_vector(t) or cty.is_floating(t) {
+                l = pick_vec();
+            }
+            if not out and (o.sig[j - 1] == 'i') {
+                l = "i";
+            }
+            cstr = u.cat2(s[0..s.len - 1], l);
+        }
+        let c = ai.constraint(tg.g_arch, cstr, out);
+        let mut op = ai.Op.{ kind: ai.OK_REG, cls: c.cls, reg: -1, subset: c.subset, out: out, early: c.early,
+                             tie: c.tie, bits: bits_of(t), fp: cty.is_floating(t), name: "", q: false, sym: false,
+                             via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1, hi: false, zero: false,
+                             wfunc: false, wparams: "", wresults: "" };
+        if c.imm and not c.reg {
+            op.kind = ai.OK_IMM;
+        } else if c.mem and not c.reg {
+            op.kind = ai.OK_MEM;
+            op.mbits = 0;
+        } else if c.fixed >= 0 {
+            op.kind = ai.OK_FIXED;
+            op.reg = c.fixed;
+        }
+        if c.tie >= 0 {
+            op.cls = ops[@int_cast(usize, c.tie)].cls;
+        }
+        if cty.is_pointer(t) {
+            op.bits = 64;
+        }
+        ops[k] = op;
+    }
+    b.ops = ops[0..cs.len];
+    // (the clobbers)
+    if o.clob.len > 0 {
+        for r in u.split(o.clob, ';', 64).items() {
+            if u.str_eq(r, "memory") {
+                b.memory = true;
+                continue;
+            }
+            let rn = ai.reg_named(tg.g_arch, r);
+            b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, rn.reg));
+        }
+    }
+    let mut err = "";
+    let ps = ai.parse_template(tg.g_arch, f.text, b.intel, &mut err);
+    // (vectors of 32 and 64 bytes: ymm and zmm registers)
+    let wide = u.perm_newn.[ai.Piece](ps.len + 1);
+    for k in 0..ps.len {
+        let mut p = ps[k];
+        if (p.kind == ai.PK_OP) and (p.mod == 0) and (p.op >= 0) and (@int_cast(usize, p.op) < b.ops.len) {
+            let op = b.ops[@int_cast(usize, p.op)];
+            if (op.cls == ai.CL_VEC) and (op.bits == 256) {
+                p.mod = 't';
+            } else if (op.cls == ai.CL_VEC) and (op.bits == 512) {
+                p.mod = 'g';
+            }
+        }
+        p.text = u.perm_dup(p.text);
+        wide[k] = p;
+    }
+    b.pieces = wide[0..ps.len];
+    b.text = u.perm_dup(f.text);
+    if err.len == 0 {
+        err = ack.check(b);
+    }
+    if err.len > 0 {
+        u.die(u.f3("cgen_simd: the operation '%s' (%s): %s", o.name, f.text, err));
+    }
+    return ai.add(b);
+}
+
+// Where the two bytes p are in s, or -1.
+fn find2(s: []u8, p: []u8) i64 {
+    let mut i: usize = 0;
+    while (i + 1) < s.len {
+        if (s[i] == p[0]) and (s[i + 1] == p[1]) {
+            return @as(i64, @int_cast(i64, i));
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn pick_vec() []u8 {
+    if tg.g_arch == tg.ARCH_X64 {
+        return "x";
+    }
+    if tg.g_arch == tg.ARCH_A64 {
+        return "w";
+    }
+    return "r";
+}

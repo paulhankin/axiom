@@ -248,6 +248,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
 | `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
+| `C3240` | An intrinsic function (`<immintrin.h>` ...) called, or the operation of `__builtin_axiom_simd` used, in a function compiled without the processor extension it needs (the build's `--cpu`, `--features` and the function's attribute `target`); one of another architecture's. |
+| `C3241` | An operand of `__builtin_axiom_simd` it does not take: an intrinsic's immediate operand that is not a constant, a vector of another size, an unknown operation. |
 | `C3300` | A call of `setjmp` (`<setjmp.h>`, or `__builtin_setjmp`, `__builtin_longjmp`) or a non-local `goto` (from a nested function), in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
 | `C3901` | A type this implementation does not have: in a GNU dialect `__ibm128` (the double-double format of a target this compiler does not have). |

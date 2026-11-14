@@ -1594,11 +1594,8 @@ definition replacing the target's; `c/pp/predef_target_*.c` show them for each t
 | `__OPTIMIZE__`, `__NO_INLINE__` | `-O1` and above, else `-O0`. |
 | `__PIC__`, `__pic__` (2) | Position-independent code: `--pic` and `--emit=shared` on Linux, always on macOS; `__PIE__`, `__pie__` (2) on macOS for an executable, which is position-independent. Not on Windows or WebAssembly. |
 
-The feature macros say what the target's processor has, not that a header of
-intrinsic functions exists: the compiler has none (`<immintrin.h>`, `<arm_neon.h>`,
-`<wasm_simd128.h>` ... are not found), so a program that includes one when such a macro
-is defined needs its portable path chosen with `-U` (`-U__SSE2__`, `-U__ARM_NEON`).
-No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`, `__VERSION__` are not
+The feature macros say what the target's processor has; the headers of its intrinsic
+functions are in "Intrinsics" below. No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`, `__VERSION__` are not
 defined; a GNU dialect's `__ATOMIC_*` and `__BFLT16_*` are feature macros): programs
 test features, and the compiler's own macros are the `__AXIOM_` ones above.
 
@@ -1745,6 +1742,72 @@ freestanding implementation for most of `<string.h>` and some functions of `<std
 (and `<fenv.h>` and `<math.h>` if it claims Annex F). These are a library's, and the
 compiler does not provide them. The C23 headers also define `__STDC_VERSION_<NAME>_H__`
 as the standard says.
+
+## Intrinsics
+
+The processors' intrinsic functions, in every mode (ISO standards too) and with or
+without the C library, are the compiler's headers:
+
+| Header | What |
+|---|---|
+| `<mmintrin.h>` | MMX's `__m64` functions (`_mm_add_pi8`, `_m_paddb` ...), computed in the low half of an SSE register (the MMX registers are never used, and `_mm_empty` does nothing), and the types of the others. |
+| `<xmmintrin.h>`, `<emmintrin.h>` | SSE and SSE2, complete, with `_MM_SHUFFLE`, `_MM_TRANSPOSE4_PS`, the MXCSR macros (`_MM_SET_ROUNDING_MODE` ...), `_mm_prefetch` and its hints, `_mm_malloc` and `_mm_free` (`<mm_malloc.h>`, in a hosted program). |
+| `<pmmintrin.h>`, `<tmmintrin.h>`, `<smmintrin.h>`, `<nmmintrin.h>` | SSE3, SSSE3, SSE4.1 (with `_MM_FROUND_*`), SSE4.2 (the string compares, `_SIDD_*`, CRC32) and POPCNT. |
+| `<wmmintrin.h>` | AES and PCLMULQDQ. |
+| `<immintrin.h>` | All of the above, and AVX, AVX2 (with the gathers), FMA, F16C, BMI1, BMI2, LZCNT, POPCNT, ADX (and the carry chains `_addcarry_u32` ... of any processor), SHA, RDRAND, RDSEED, `_xgetbv`, `_rdtsc`/`__rdtsc`, `__rdtscp`, `_mm_pause`, the bit operations `_bswap`, `_bit_scan_forward`, `_rotl` ... and `_castf32_u32` .... |
+| `<x86intrin.h>` | The same as `<immintrin.h>`. |
+| `<cpuid.h>` | `__cpuid(leaf, a, b, c, d)` and `__cpuid_count`, `__get_cpuid_max`, `__get_cpuid`, `__get_cpuid_count`, and the feature bits `bit_SSE3` ... of leaves 1, 7 and 0x80000001. |
+
+On another target each is an `#error`. The types are `__m64`, `__m128`, `__m128d`,
+`__m128i`, `__m256`, `__m256d`, `__m256i` (vectors of `vector_size`, which may alias any
+object: no type-based aliasing is assumed anyway) and their unaligned forms `__m128_u`
+... `__m256i_u` (aligned to 1: the `loadu`/`storeu` intrinsics are accesses through
+them). An intrinsic is a static function, always inlined, or a macro where an operand
+must be a constant (an immediate: one that is not is `C3241`); each compiles to its
+instruction:
+
+- what C's vector operators say (add, sub, mul, the bit operations, compares, lane
+  access, `set`, loads and stores, casts) is plain C on the vector types, and the
+  instruction selector picks the instruction (`paddd`, `cmpltps`, `movdqu` ...);
+- what the IR has an operation for (saturating arithmetic, integer min and max, abs,
+  sqrt, floor and ceil, fma, the widening conversions of SSE4.1, shuffles, blends,
+  unpacks, shifts by an immediate with the processor's rule that a count of the lane's
+  width or more gives 0, the lanes' top bits of `movemask`, `pmaddwd`) is that
+  operation (`__builtin_axiom_simd`, `__builtin_axiom_shufflevector`,
+  `__builtin_axiom_convertvector`): the optimizer sees through it, and it is selected as
+  the instruction (`paddusb`, `pmaddwd`, `pmovmskb` ...);
+- everything else is the instruction itself (`pshufb`, `psadbw`, `packsswb`, the
+  horizontal adds, `cvtps2dq` and `cvttps2dq` with their out-of-range result
+  0x80000000, `minps` and `maxps` with their rule for NaNs and zeros, `roundps`,
+  `dpps`, `pclmulqdq`, `aesenc`, the SHA instructions, `crc32`, `pcmpistri` ...,
+  `vpermd`, the gathers, `pdep`, `rdtsc` ...): a pure asm statement made from a
+  table of the instructions' forms (`cmd/axiom/src/c/csimd_tab.ax`), which the
+  assembler checks and encodes, and the optimizer still removes when unused, merges
+  and moves. In code compiled with AVX the VEX form of each SSE instruction is used.
+
+An intrinsic needs its extension: called from a function compiled without it (the
+build's `--cpu` and `--features`, and the function's attribute `target`, which in an
+ISO mode is spelled `__axiom_attribute__((__target__("avx2")))`) it is `C3240`, at the
+call, never an instruction the processor may lack. A program built for the baseline
+can call intrinsics of more extensions from functions with `target`, after checking the
+processor (`<cpuid.h>`, or `__builtin_cpu_supports` in a GNU dialect). The 256-bit
+intrinsics that are instructions of their own (`_mm256_hadd_ps`, `_mm256_round_ps`,
+`_mm256_cvtps_epi32` ...) need AVX2 as well as AVX or FMA: the code generator computes
+256-bit vectors in one register only with AVX2, and in pieces of 128 bits with AVX
+alone, which an instruction of its own cannot be (the plain ones, `_mm256_add_ps` ...,
+need AVX only).
+
+Deviations, all of them of what no program can see but a debugger or a timer:
+`_mm_stream_*` and `_mm_stream_load_*` are ordinary loads and stores (no non-temporal
+hint), `_mm_maskmoveu_si128` and `_mm_maskmove_si64` store the selected bytes one by
+one, `_mm_load_*` of an aligned type does not check the alignment, and `_mm_comieq_ss`
+and `_mm_comineq_ss` raise invalid for a signaling NaN only (C's `==`). RDRAND and
+RDSEED are not among the extensions of `--features`: their intrinsics are not checked
+(test `bit_RDRND` and `bit_RDSEED` of `<cpuid.h>` first). Not provided: the
+AVX-512 intrinsics, AMX, KL, the system instructions' (`_xsave`, `_fxsave` ...),
+`<arm_neon.h>`, `<arm_acle.h>`, `<arm_sve.h>` and `<wasm_simd128.h>` (until then, a program
+that includes one when `__ARM_NEON` or `__wasm_simd128__` is defined needs its portable
+path chosen with `-U`).
 
 ## Not available
 
@@ -2507,7 +2570,8 @@ Programs should not use them.
 | `__axiom_int64` | A keyword for a 64-bit integer type (`unsigned __axiom_int64` too) in every mode, for `size_t` in headers before C99 and for programs that need one in C89. |
 | `__axiom_decimal32`, `__axiom_decimal64`, `__axiom_decimal128` | Keywords for the decimal floating types in every mode (the C library's sources, which are C17). |
 | `__builtin_axiom_dec(w, hi, lo)` | A constant of the decimal floating type of w bits with that encoding (BID): `<math.h>`'s and `<float.h>`'s infinities and NaNs. |
-| `__AXIOM_...`, `__axiom_...` | Macros and members of the headers. |
+| `__builtin_axiom_simd("op", ...)`, `__builtin_axiom_shufflevector`, `__builtin_axiom_convertvector` | The intrinsics' operations ("Intrinsics"): an operation of the compiler's table, and the dialects' `__builtin_shufflevector` and `__builtin_convertvector`, in every mode. |
+| `__AXIOM_...`, `__axiom_...` | Macros and members of the headers, and the intrinsics headers' own vector types (`__axiom_i32x4` ...) and functions. |
 | `__axc_...`, `__AXC_...` | The C library's internal names (`__axc_setjmp`, `__axc_errno`, ...), and its private headers `axc/*.h`. |
 
 ## Programs

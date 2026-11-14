@@ -73,6 +73,13 @@ lists the diagnostics.
 - **GNU vector types**: ctypes.ax `vector_of` (TK_VECTOR), csema_vec.ax (the operand
   rules), cgen_vec.ax (IR vectors in chunks of at most 64 bytes, lane-by-lane code where
   the target has no instruction), cgen_abi.ax (the platforms' classes).
+- **Intrinsics** (docs/c.md, "Intrinsics"): csema_simd.ax (the design, in its header
+  comment; `__builtin_axiom_simd`, typed from its table csimd_tab.ax, which
+  `cmd/internal/tools/gen_x86_intrin.py` writes with the x86-64 headers and their
+  tests; the rule that an always-inline function with the attribute `target` is called
+  only from code compiled for its extensions, C3240, is csema_gnu.ax's `call_check`),
+  cgen_simd.ax (generic operations as the IR's, machine ones as pure asm statements,
+  asm/inline.ax, with the VEX form as `Blob.alt1`).
 - **Nested functions** (GNU): csema_nest.ax marks the enclosing objects a nested
   function uses; cgen_nest.ax builds the frame record they are reached through (a chain
   argument, `abi.add_chain`) and the trampoline pools, and the non-local gotos to its
@@ -364,6 +371,7 @@ comments, so that they are valid in every standard:
 /* check-only */            only checked (axiom check, with the flags' --target)
 /* units: abi/x.c */        more translation units, relative to the test
 /* linux-only */            natively, only where host_native.c is linked
+/* x86-64-only */           natively, only for an x86-64 target (the intrinsics' tests)
 /* macos-only */            natively, only for a macOS target (AXIOM_NATIVE_TARGET=...-macos)
 /* wasm-flags: --features=+tail-call */  more flags for a WebAssembly build
 ```

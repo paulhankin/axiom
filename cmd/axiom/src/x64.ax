@@ -3837,8 +3837,10 @@ fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
     let mut r: i32 = 0;
     if c == XMM {
         r = vxmm();
-    } else {
+    } else if c == GPR {
         r = vgpr();
+    } else {
+        r = mc.new_vreg(em.MF, c);
     }
     call_results.push(CallResult.{ call: v, k: k, r: r });
     return r;
@@ -4476,6 +4478,11 @@ pub fn vector_bits() u64 {
 pub fn wide_legal(v: *mut ir.Value) bool {
     let w = inst_vl(v);
     let o = v.op;
+    if (o == ir.OP_INTR) and
+       ((@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CALL_RESULT) or
+        (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_ASM)) {
+        return true;  // (an intrinsic's ymm or zmm operands: c/cgen_simd.ax, made only where the extension is)
+    }
     if own_vec_op(v) {
         return true;
     }
@@ -4584,6 +4591,11 @@ pub fn wide_legal(v: *mut ir.Value) bool {
 // Can the instruction selector handle this vector instruction directly?
 // (Everything else is split into lanes by lower.scalarize.)
 pub fn legal(v: *mut ir.Value) bool {
+    if (v.op == ir.OP_INTR) and
+       ((@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CALL_RESULT) or
+        (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_ASM)) {
+        return true;  // (an asm statement and its registers)
+    }
     if inst_vl(v) > 16 {
         return wide_legal(v);
     }
@@ -5039,7 +5051,10 @@ fn asm_pick(b: *ai.Blob, subset: u64, cls: u8, taken: u64) i32 {
 // outputs are copied into them first; operands in specific registers are
 // copied into and out of them.
 fn gen_asm(v: *mut ir.Value) void {
-    let bi = is.cval(v.xs.get(0));
+    let mut bi = is.cval(v.xs.get(0));
+    if (ai.blob(bi).alt1 > 0) and tg.has(tg.X_AVX) {
+        bi = @as(i64, ai.blob(bi).alt1 - 1);  // (an intrinsic's VEX form: c/cgen_simd.ax)
+    }
     let b = ai.blob(bi);
     let n = b.ops.len;
     let ops = u.newn.[mc.MOp](n + 34);
@@ -5078,7 +5093,7 @@ fn gen_asm(v: *mut ir.Value) void {
             ops[k] = asm_imm(x);
             continue;
         }
-        let cls = u8_of(op.cls == ai.CL_VEC, XMM, GPR);
+        let cls = asm_class(op);
         if op.tie >= 0 {
             // (in its output's register, which the output's operand reads too)
             let t = regs[@int_cast(usize, op.tie)];
@@ -5121,11 +5136,11 @@ fn gen_asm(v: *mut ir.Value) void {
         if op.out or ((op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED)) {
             continue;
         }
-        let cls = u8_of(op.cls == ai.CL_VEC, XMM, GPR);
+        let cls = asm_class(op);
         if (op.tie >= 0) or not mc.is_vreg(regs[k]) {
             if op.tie >= 0 {
                 let to = b.ops[@int_cast(usize, op.tie)];
-                copy(regs[k], vals[k], u8_of(to.cls == ai.CL_VEC, XMM, GPR));
+                copy(regs[k], vals[k], asm_class(to));
             } else {
                 copy(regs[k], vals[k], cls);
             }
@@ -5154,15 +5169,30 @@ fn gen_asm(v: *mut ir.Value) void {
             continue;
         }
         let mut r = regs[k];
-        let vec = op.cls == ai.CL_VEC;
+        let cl = asm_class(op);
         if not mc.is_vreg(r) {
-            let t = mc.new_vreg(em.MF, u8_of(vec, XMM, GPR));
-            copy(t, r, u8_of(vec, XMM, GPR));
+            let t = mc.new_vreg(em.MF, cl);
+            copy(t, r, cl);
             r = t;
         }
         // (the asm's result k: IN_CALL_RESULT(asm, k) reads it)
-        copy(call_result_vreg(v, k, u8_of(vec, XMM, GPR)), r, u8_of(vec, XMM, GPR));
+        copy(call_result_vreg(v, k, cl), r, cl);
     }
+}
+
+// The register class of an asm operand: a general register, or a vector
+// register of its width (the intrinsics' ymm and zmm values: c/cgen_simd.ax).
+fn asm_class(op: ai.Op) u8 {
+    if op.cls != ai.CL_VEC {
+        return GPR;
+    }
+    if op.bits == 256 {
+        return YMM;
+    }
+    if op.bits == 512 {
+        return ZMM;
+    }
+    return XMM;
 }
 
 fn u8_of(c: bool, a: u8, b: u8) u8 {

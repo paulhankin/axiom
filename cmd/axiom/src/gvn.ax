@@ -1239,6 +1239,59 @@ fn narrowed_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
     return vnil();
 }
 
+// A scalar of 4 or 8 bytes loaded from within a vector of 16, 32 or 64 bytes
+// stored before (C's vectors passed in memory, piece by piece, to an inlined
+// function: the intrinsics' __m256i without AVX's calling convention): that
+// lane of the vector, of any lanes of the scalar's size, bitcast; or nil.
+fn lane_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let size = @bit_cast(i64, i.ty.size);
+    if ((i.ty.kind != ir.T_INT) and (i.ty.kind != ir.T_FLOAT)) or ((size != 4) and (size != 8)) or
+       (@as(i64, i.ty.bits) != (size * 8)) {
+        return vnil();
+    }
+    let mut w: i64 = 16;
+    while w <= 64 {
+        let mut d: i64 = 0;
+        while (d + size) <= w {
+            let wl = Loc.{ base: l.base, obj: l.obj, off: l.off - d, size: w, rok: l.rok, lmin: lmin_add(l.lmin, 0 - d),
+                           rlo: l.rlo - d, rhi: l.rhi - d, tag: l.tag };
+            for k in @as(usize, 0)..2 {
+                let mut lane = ir.t_int(@truncate(i32, size * 8));
+                if k == 1 {
+                    lane = ir.t_float(@truncate(i32, size * 8));
+                }
+                let t = ir.t_vec(lane, @truncate(u32, @bit_cast(u64, w / size)));
+                let mut x = find_mem(&wl, t);
+                if u.isnil(x) and (size == 4) {
+                    // (a vector of 8-byte lanes, read as 4-byte ones)
+                    x = find_mem(&wl, ir.t_vec(ir.t_int(64), @truncate(u32, @bit_cast(u64, w / 8))));
+                    if u.notnil(x) {
+                        if u.isnil(B) {
+                            B = ir.new_builder();
+                        }
+                        ir.at_before(B, i);
+                        x = ir.bitcast(B, x, t);
+                    }
+                }
+                if u.notnil(x) {
+                    if u.isnil(B) {
+                        B = ir.new_builder();
+                    }
+                    ir.at_before(B, i);
+                    let e = ir.extract_elem(B, x, @bit_cast(u64, d / size));
+                    if e.ty == i.ty {
+                        return e;
+                    }
+                    return ir.bitcast(B, e, i.ty);
+                }
+            }
+            d += size;
+        }
+        w = w * 2;
+    }
+    return vnil();
+}
+
 fn punned_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
     let size = i.ty.size;
     if i.ty.kind != ir.T_VEC {
@@ -3224,6 +3277,9 @@ fn visit_block(b: *mut ir.Block) void {
                 }
                 if u.isnil(r) {
                     r = narrowed_load(i, &l);
+                }
+                if u.isnil(r) {
+                    r = lane_load(i, &l);
                 }
                 if u.notnil(r) {
                     replace(i, r);
