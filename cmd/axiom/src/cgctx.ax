@@ -1,0 +1,808 @@
+// =============================================================================
+// cgctx.ax - the code generator's context: its options and the driver's
+// settings, the unit being generated (the IR module and builder, the IR
+// types, the per-unit tables, the function being generated), and the small
+// helpers over them that codegen.ax and cgrt.ax share: instructions,
+// blocks, constants, the IR types of Axiom types.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "ir.ax" as ir;
+import "sema.ax" as sema;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// What one codegen run produces (spec §16.8):
+//   CG_WHOLE   the whole program in one object (-O2 and above by default)
+//   CG_MODULE  one module's non-generic functions, plus the generic instances
+//              it uses (link-once); everything else is referenced by name
+//   CG_LINK    the per-program pieces: globals, error codes and names,
+//              runtime state, test and host exports
+pub const CG_WHOLE: i32 = 0;
+pub const CG_MODULE: i32 = 1;
+pub const CG_LINK: i32 = 2;
+
+pub const EMIT_OBJ: i32 = 0;
+pub const EMIT_IR: i32 = 1;
+pub const EMIT_ASM: i32 = 2;
+
+// Integer overflow of + - * unary - and MIN / -1 (spec §7.6): wraps (the
+// default), traps with T0002, or saturates.
+pub const OVF_WRAP: i32 = 0;
+pub const OVF_TRAP: i32 = 1;
+pub const OVF_SATURATE: i32 = 2;
+
+pub struct CgOptions {
+    opt_level: i32,  // 0..3
+    overflow: i32,   // --overflow=wrap|trap|saturate: OVF_WRAP (default), OVF_TRAP, OVF_SATURATE
+    cpu: []u8,       // nil = generic
+    emit: i32,
+    out_path: []u8,          // file to write
+    stack_traces: bool,      // shadow stack for traces and profiles (--stack-traces=on, default)
+    profile: bool,           // axiom profile: the shadow stack is sampled concurrently
+    sanitize_address: bool,  // --sanitize=address: heap accesses are checked (spec §16.8)
+    coverage: bool,          // --coverage=afl: coverage counters in every block (cover.ax)
+    unit: i32,
+    module: *mut ast.Module,  // CG_MODULE
+}
+
+// Names of exported functions (for the linker).
+pub let mut g_export_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+// Libraries named by extern "C" "lib" blocks (for the linker).
+pub let mut g_link_libs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// C units in the program (docs/c.md, "C and Axiom in one program"):
+// g_lib_prefix is the directory (its real path and a '/') of the Axiom
+// modules that are a library's, whose `export fn`s are generated only when
+// something refers to them, and give way to a C unit's definition of the
+// same name (lazy_export); with g_strip, what the C units define and
+// nothing reaches is left out (main.ax sets it for executables that our
+// own linkers link: c/cstrip.ax).
+pub let mut g_lib_prefix: []u8 = "";
+pub let mut g_strip: bool = false;
+
+/// The output is an object for other links (--emit=obj, --emit=lib), not
+/// an executable's: whatever several such objects may each have, they
+/// share. The program's state (its modules' mutable globals, the runtime's
+/// shadow stack and tables) is link-once (weak global symbols) named after
+/// the declarations
+/// (one object's copy is the program's: two objects that both use the
+/// standard library's allocator use one heap), and the runtime's functions
+/// and the stubs are weak, so that the objects link with each other and
+/// with a program, which then has one runtime (link-once: every copy is the
+/// same definition, so the optimizer treats them as it did). A module's
+/// functions stay
+/// the object's own (internal: their copies may differ in what they
+/// inlined); the program's `export fn`s other than the runtime's are its
+/// strong definitions.
+pub let mut g_object_output: bool = false;
+
+// The linkage of a global the whole program shares (internal in an
+// executable's object, weak in one for other links: g_object_output).
+pub fn program_linkage() i32 {
+    if g_object_output {
+        return ir.LINK_LINKONCE;
+    }
+    return ir.LINK_INTERNAL;
+}
+
+// Build a test binary (axiom test): tests become roots and are exported.
+pub let mut g_test_mode: bool = false;
+// Set before codegen: the program spawns threads (wasm: shared memory and a
+// thread entry export).
+pub let mut g_threads: bool = false;
+// Set by codegen: the output calls into std/internal/runtime/native_host.c.
+pub threadlocal let mut g_needs_native_runtime: bool = false;
+
+pub threadlocal let mut O: *mut CgOptions = @ptr_from_int(*mut CgOptions, 0);
+pub threadlocal let mut M: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+pub threadlocal let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+pub threadlocal let mut T_i1: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_i8: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_i16: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_i32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_i64: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_isz: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_ptr: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_void: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_f32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_f64: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub threadlocal let mut T_v128: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+
+// The rest of the unit's lowering state: the instances to generate, the
+// runtime's globals (traps, call sites, the shadow stack, thread-locals) and
+// the IR values of strings and globals. With the unit's handles above (O, M,
+// B, the IR types) and the function's (F, FnState), this is all of the
+// lowering's mutable state, apart from the driver's settings and results (g_*).
+struct State {
+    // Has the program C units (cfront.pending when code generation starts)?
+    c_program: bool,
+    inst_map: u.SymMap.[*mut FnInst],  // the function instances, by key
+    build_features: u64,               // the build's extensions (--cpu, --features)
+    pending_head: *mut FnInst,         // the instances still to generate, in order (next)
+    pending_tail: *mut FnInst,
+    // The sites check_inst_sizes has reported (one error each, as sema's).
+    size_sites: u.List.[u.Span],
+    cur_span: u.Span,  // the source of the code being lowered
+    // traps: the runtime's trap function, its info block and hook
+    trap_fn: *mut ir.Value,
+    trap_info: *mut ir.Value,
+    trap_hook: *mut ir.Value,
+    trap_fnty: *mut ir.Ty,
+    // call-site records (stack traces, profiles)
+    site_ty: *mut ir.Ty,
+    site_tab: u.List.[SiteKey],
+    site_count: usize,
+    // The unit's site strings: each string of its site records once, NUL
+    // terminated, in one global (.site_strs: offset 0 is ""), made when the unit
+    // is done (end_site_strs).
+    site_strs_g: *mut ir.Value,
+    site_strs: u.Buf,
+    site_str_offs: u.SymMap.[u32],
+    // the shadow stack: its record's type, and its globals
+    ss_ty: *mut ir.Ty,
+    ss_global: *mut ir.Value,
+    ss_main: *mut ir.Value,
+    stack_limit_global: *mut ir.Value,         // WebAssembly: the thread's stack limit
+    string_globals: u.SymMap.[*mut ir.Value],  // the string literals' globals, by contents
+    global_vals: u.SymMap.[*mut ir.Value],     // the IR values of the program's globals, by declaration
+    // --sanitize=address: main is wrapped (emit_asan_main)
+    sanitize_main: bool,
+    // Thread-locals on wasm, which has no TLS: the program's thread-locals,
+    // in declaration order (the same in every unit, since all units come from
+    // one checked program), make one block. The main thread's is the global
+    // axiom.tls.main; every other thread copies the initial values
+    // (axiom.tls.init) to the top of its stack when it starts and keeps the
+    // address in axiom.tls, a wasm global, so per instance (per thread), null
+    // in the main thread.
+    tls_ty: *mut ir.Ty,
+    tls_main: *mut ir.Value,
+    tls_init: *mut ir.Value,
+    tls_ptr: *mut ir.Value,
+    tls_decls: u.List.[*mut ast.Decl],
+    errtab: *mut ir.Value,  // the error-name table
+    // The exports whose C functions are wrappers (get_inst).
+    cabi_exports: u.List.[*mut FnInst],
+    // The library modules' exports to generate when referred to (lazy_export),
+    // by name: those whose names no C unit defines.
+    lazy_fns: u.SymMap.[*mut ast.Decl],
+}
+
+pub threadlocal let mut S: State = State.{ c_program: false,
+                                           inst_map: u.SymMap.[*mut FnInst].{
+                                               keys: @ptr_from_int(*mut usize, 0),
+                                               vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0, len: 0 },
+                                           build_features: 0, pending_head: @ptr_from_int(*mut FnInst, 0),
+                                           pending_tail: @ptr_from_int(*mut FnInst, 0),
+                                           size_sites: u.List.[u.Span].{
+                                               data: @ptr_from_int(*mut u.Span, 0), len: 0, cap: 0 },
+                                           cur_span: u.Span.{ file: 0, start: 0, end: 0 },
+                                           trap_fn: @ptr_from_int(*mut ir.Value, 0),
+                                           trap_info: @ptr_from_int(*mut ir.Value, 0),
+                                           trap_hook: @ptr_from_int(*mut ir.Value, 0),
+                                           trap_fnty: @ptr_from_int(*mut ir.Ty, 0),
+                                           site_ty: @ptr_from_int(*mut ir.Ty, 0),
+                                           site_tab: u.List.[SiteKey].{ data: @ptr_from_int(*mut SiteKey, 0), len: 0,
+                                                                        cap: 0 }, site_count: 0,
+                                           site_strs_g: @ptr_from_int(*mut ir.Value, 0),
+                                           site_strs: u.Buf.{
+                                               b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                                           site_str_offs: u.SymMap.[u32].{
+                                               keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                               cap: 0, len: 0 }, ss_ty: @ptr_from_int(*mut ir.Ty, 0),
+                                           ss_global: @ptr_from_int(*mut ir.Value, 0),
+                                           ss_main: @ptr_from_int(*mut ir.Value, 0),
+                                           stack_limit_global: @ptr_from_int(*mut ir.Value, 0),
+                                           string_globals: u.SymMap.[*mut ir.Value].{
+                                               keys: @ptr_from_int(*mut usize, 0),
+                                               vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 },
+                                           global_vals: u.SymMap.[*mut ir.Value].{
+                                               keys: @ptr_from_int(*mut usize, 0),
+                                               vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 },
+                                           sanitize_main: false, tls_ty: @ptr_from_int(*mut ir.Ty, 0),
+                                           tls_main: @ptr_from_int(*mut ir.Value, 0),
+                                           tls_init: @ptr_from_int(*mut ir.Value, 0),
+                                           tls_ptr: @ptr_from_int(*mut ir.Value, 0),
+                                           tls_decls: u.List.[*mut ast.Decl].{
+                                               data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0, cap: 0 },
+                                           errtab: @ptr_from_int(*mut ir.Value, 0),
+                                           cabi_exports: u.List.[*mut FnInst].{
+                                               data: @ptr_from_int(*mut *mut FnInst, 0), len: 0, cap: 0 },
+                                           lazy_fns: u.SymMap.[*mut ast.Decl].{
+                                               keys: @ptr_from_int(*mut usize, 0),
+                                               vals: @ptr_from_int(*mut *mut ast.Decl, 0), cap: 0, len: 0 } };
+
+// ---------------------------------------------------------------------------
+// Function instances
+// ---------------------------------------------------------------------------
+pub struct FnInst {
+    decl: *mut ast.Decl,
+    gargs: []mut *mut ast.Type,
+    fnty: *mut ast.Type,  // concrete TY_FN
+    fnv: *mut ir.Value,
+    llty: *mut ir.Ty,
+    sret: bool,
+    display: []u8,  // user-facing name, for stack traces and profiles
+    next: *mut FnInst,
+    feats: u64,      // the processor extensions its code may use
+    dispatch: bool,  // @features / @multiversion: chooses a version (vers) and calls it
+    vers: []mut *mut FnInst,
+    key: []u8,
+    depth: i32,    // instantiation nesting: one more than the instance whose body asked for it
+    site: u.Span,  // where the non-generic code it was instantiated from asked for it (inst_site)
+}
+
+pub struct LoopCtx {
+    brk: *mut ir.Block,
+    cont: *mut ir.Block,
+    defer_height: usize,
+}
+
+pub struct FnState {
+    no_trace: bool,  // runtime code: not on the shadow stack
+    inst: *mut FnInst,
+    decl: *mut ast.Decl,
+    from: []mut *mut ast.Type,
+    to: []mut *mut ast.Type,
+    fnv: *mut ir.Value,
+    locals: []mut *mut ir.Value,
+    sret_ptr: *mut ir.Value,
+    ret: *mut ast.Type,  // concrete
+    defers: u.List.[*mut ast.Stmt],
+    loops: u.List.[LoopCtx],
+    entry: *mut ir.Block,
+    // The shadow stack record and its depth, read once at the function's
+    // entry: every call restores the depth, so it is the same at every call.
+    ss_rec: *mut ir.Value,
+    ss_depth: *mut ir.Value,
+    ss_slot: *mut ir.Value,  // where this function's calls record their site
+    ss_next: *mut ir.Value,  // the depth during its calls
+    frame: i64,              // the bytes of its locals and temporaries (saturating)
+}
+
+pub threadlocal let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
+
+// ---------------------------------------------------------------------------
+// Small wrappers (unnamed instructions)
+// ---------------------------------------------------------------------------
+pub fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+pub fn tnil() *mut ast.Type {
+    return u.nil.[ast.Type]();
+}
+
+pub fn bbnil() *mut ir.Block {
+    return u.nil.[ir.Block]();
+}
+
+pub fn ci32(v: u64) *mut ir.Value {
+    return ir.cint(T_i32, v);
+}
+
+pub fn b_add(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.add(B, a, b);
+}
+
+pub fn b_sub(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.sub(B, a, b);
+}
+
+pub fn b_mul(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.mul(B, a, b);
+}
+
+pub fn b_and(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.and_(B, a, b);
+}
+
+pub fn b_or(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.or_(B, a, b);
+}
+
+pub fn b_xor(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.xor(B, a, b);
+}
+
+pub fn b_not(a: *mut ir.Value) *mut ir.Value {
+    return ir.not_(B, a);
+}
+
+pub fn icmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.icmp(B, p, a, b);
+}
+
+pub fn fcmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(B, p, a, b);
+}
+
+pub fn sel(c: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.select(B, c, a, b);
+}
+
+pub fn zext(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.zext(B, v, t);
+}
+
+pub fn sext(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.sext(B, v, t);
+}
+
+pub fn trunc(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.trunc(B, v, t);
+}
+
+pub fn bitcast(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.bitcast(B, v, t);
+}
+
+pub fn ptrtoint(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.ptrtoint(B, v, t);
+}
+
+pub fn inttoptr(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.inttoptr(B, v);
+}
+
+pub fn extract(v: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.extract(B, v, i);
+}
+
+pub fn insert(agg: *mut ir.Value, v: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.insert(B, agg, v, i);
+}
+
+pub fn ld(t: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
+    return ir.load(B, t, p);
+}
+
+pub fn st(v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    return ir.store(B, v, p);
+}
+
+pub fn br(bb: *mut ir.Block) void {
+    ir.br(B, bb);
+}
+
+pub fn condbr(c: *mut ir.Value, t: *mut ir.Block, e: *mut ir.Block) void {
+    ir.condbr(B, c, t, e);
+}
+
+pub fn at_end(bb: *mut ir.Block) void {
+    ir.at_end(B, bb);
+}
+
+pub fn gep1(t: *mut ir.Ty, p: *mut ir.Value, i: *mut ir.Value) *mut ir.Value {
+    return ir.gep1(B, t, p, i);
+}
+
+pub fn gep2(t: *mut ir.Ty, p: *mut ir.Value, i: *mut ir.Value, j: *mut ir.Value) *mut ir.Value {
+    let mut ix: [2]*mut ir.Value = [i, j];
+    return ir.gep(B, t, p, ix[..]);
+}
+
+pub fn sgep(t: *mut ir.Ty, p: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.struct_gep(B, t, p, i);
+}
+
+pub fn call(fty: *mut ir.Ty, f: *mut ir.Value, args: []mut *mut ir.Value) *mut ir.Value {
+    return ir.call(B, fty, f, args);
+}
+
+pub fn is_const_int(v: *mut ir.Value) bool {
+    return v.kind == ir.V_CINT;
+}
+
+// The concrete type of t in the function being generated. An enum is its
+// representation from here on: code generation never needs to tell them apart.
+// A variable left `undefined` (§8.1) no larger than this (bytes) is zeroed: SROA may split
+// slots up to this size and promote their parts to SSA values (sroa.MAX_SIZE). (So is
+// any larger one that is not plain data: plain_data.)
+pub const UNDEF_ZEROED: u64 = 256;
+
+pub fn ct(t: *mut ast.Type) *mut ast.Type {
+    if u.notnil(t) and (t.kind == ast.TY_ENUM) {
+        return t.elem;
+    }
+    if u.isnil(t) or u.isnil(F) or not t.has_params {
+        return t;
+    }
+    let r = ty.subst(t, F.from, F.to);
+    check_inst_sizes(r, inst_site(S.cur_span));
+    return r;
+}
+
+// Object sizes (spec §5.5): sema checks every type written in the program;
+// the types that instantiating generic code makes of them are checked here,
+// each once, at the instantiation site (E0473, once per site). Only the
+// innermost types too large are reported (not `!G` too when G is).
+pub fn check_inst_sizes(t: *mut ast.Type, sp: u.Span) void {
+    if u.isnil(t) or t.has_params or check_once(t) {
+        return;
+    }
+    let k = t.kind;
+    let mut inner = false;
+    if (k == ast.TY_PTR) or (k == ast.TY_SLICE) or (k == ast.TY_ARRAY) or (k == ast.TY_ERRUNION) {
+        check_inst_sizes(t.elem, sp);
+        inner = too_large(t.elem);
+    } else if k == ast.TY_FN {
+        for i in 0..t.params.len {
+            check_inst_sizes(t.params[i], sp);
+        }
+        check_inst_sizes(t.ret, sp);
+    } else if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        for i in 0..t.args.len {
+            check_inst_sizes(t.args[i], sp);
+            if too_large(t.args[i]) {
+                inner = true;
+            }
+        }
+    }
+    if too_large(t) and not inner {
+        for i in 0..S.size_sites.len {
+            let r = S.size_sites.get(i);
+            if (r.file == sp.file) and (r.start == sp.start) and (r.end == sp.end) {
+                return;
+            }
+        }
+        S.size_sites.push(sp);
+        _ = dg.err(sp, "E0473", ty.size_problem(t));
+    }
+}
+
+fn too_large(t: *mut ast.Type) bool {
+    let k = t.kind;
+    if (k != ast.TY_ARRAY) and (k != ast.TY_ERRUNION) and (k != ast.TY_STRUCT) and (k != ast.TY_UNION) {
+        return false;
+    }
+    return not t.has_params and (ty.size_problem(t).len != 0);
+}
+
+// Where the code being generated asks for an instance or makes a type, for
+// diagnostics: in a generic instance, where that instance was asked for (so
+// the non-generic code it all comes from); otherwise the code itself, or
+// `other` outside functions.
+pub fn inst_site(other: u.Span) u.Span {
+    if u.isnil(F) or u.isnil(F.inst) {
+        return other;
+    }
+    if F.inst.gargs.len != 0 {
+        return F.inst.site;
+    }
+    return S.cur_span;
+}
+
+pub fn internal_error(msg: []u8) void {
+    u.eprint(u.f1("axiom: internal compiler error: %s\n", msg));
+    u.quit(2);
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+fn align_unit(a: i64) *mut ir.Ty {
+    if a == 1 {
+        return T_i8;
+    }
+    if a == 2 {
+        return T_i16;
+    }
+    if a == 4 {
+        return T_i32;
+    }
+    if a == 8 {
+        return T_i64;
+    }
+    if a >= 32 {
+        return ir.t_vec(T_i32, @int_cast(u32, a / 4));
+    }
+    return T_v128;
+}
+
+// The IR types of the program's types (lty), and which of them have been
+// checked against the largest object (check_inst_sizes), by type id: this
+// unit's (the types are shared by the units: units.ax).
+threadlocal let mut lty_cache: u.List.[*mut ir.Ty] = u.List.[*mut ir.Ty].{
+    data: @ptr_from_int(*mut *mut ir.Ty, 0), len: 0, cap: 0 };
+threadlocal let mut size_checked: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+
+fn cached_lty(t: *ast.Type) *mut ir.Ty {
+    let i = @int_cast(usize, t.id);
+    if i < lty_cache.len {
+        return lty_cache.get(i);
+    }
+    return u.nil.[ir.Ty]();
+}
+
+fn cache_lty(t: *ast.Type, r: *mut ir.Ty) void {
+    let i = @int_cast(usize, t.id);
+    while lty_cache.len <= i {
+        lty_cache.push(u.nil.[ir.Ty]());
+    }
+    lty_cache.items()[i] = r;
+}
+
+// Whether t had been checked (check_inst_sizes); it has now.
+fn check_once(t: *ast.Type) bool {
+    let i = @int_cast(usize, t.id);
+    while size_checked.len <= i {
+        size_checked.push(false);
+    }
+    let was = size_checked.get(i);
+    size_checked.items()[i] = true;
+    return was;
+}
+
+pub fn lty(t: *mut ast.Type) *mut ir.Ty {
+    if t.has_params {
+        internal_error(u.f1("unsubstituted generic type %s", ty.type_str(t)));
+    }
+    let known = cached_lty(t);
+    if u.notnil(known) {
+        return known;
+    }
+    let mut r = u.nil.[ir.Ty]();
+    let k = t.kind;
+    if k == ast.TY_VOID {
+        r = T_void;
+    } else if k == ast.TY_BOOL {
+        r = T_i8;
+    } else if k == ast.TY_INT {
+        r = ir.t_int(t.bits);
+    } else if k == ast.TY_ENUM {
+        r = lty(t.elem);
+    } else if k == ast.TY_FLOAT {
+        r = T_f64;
+        if t.bits == 32 {
+            r = T_f32;
+        }
+    } else if k == ast.TY_VEC {
+        let mut lane = ir.t_int(t.elem.bits);
+        if t.elem.kind == ast.TY_FLOAT {
+            lane = T_f64;
+            if t.elem.bits == 32 {
+                lane = T_f32;
+            }
+        }
+        r = ir.t_vec(lane, @int_cast(u32, t.lanes));
+    } else if k == ast.TY_V128 {
+        r = ir.t_vec(T_i32, @int_cast(u32, t.bits / 32));
+    } else if (k == ast.TY_PTR) or (k == ast.TY_FN) {
+        r = T_ptr;
+    } else if k == ast.TY_ERROR {
+        r = T_i16;
+    } else if k == ast.TY_SLICE {
+        let mut el: [2]*mut ir.Ty = [T_ptr, T_isz];
+        r = ir.t_struct(el[..]);
+    } else if k == ast.TY_ARRAY {
+        r = ir.t_array(lty(t.elem), @bit_cast(u64, t.len));
+    } else if k == ast.TY_ERRUNION {
+        if t.elem.kind == ast.TY_VOID {
+            let mut el: [1]*mut ir.Ty = [T_i16];
+            r = ir.t_struct(el[..]);
+        } else {
+            let mut el: [2]*mut ir.Ty = [T_i16, lty(t.elem)];
+            r = ir.t_struct(el[..]);
+        }
+    } else if k == ast.TY_STRUCT {
+        r = ir.t_named_struct(ty.type_str(t));
+        cache_lty(t, r);
+        let n = t.decl.fields.len;
+        let el = u.newn.[*mut ir.Ty](n + 1);
+        for i in 0..n {
+            el[i] = lty(ty.type_field(t, i));
+        }
+        ir.struct_set_body(r, el[0..n]);
+    } else if k == ast.TY_UNION {
+        r = ir.t_named_struct(ty.type_str(t));
+        cache_lty(t, r);
+        let tag = lty(ty.union_tag_type(t));
+        let psize = ty.union_payload_size(t);
+        let palign = ty.union_payload_align(t);
+        if psize == 0 {
+            let mut el: [1]*mut ir.Ty = [tag];
+            ir.struct_set_body(r, el[..]);
+        } else {
+            let arr = ir.t_array(align_unit(palign), @bit_cast(u64, ((psize + palign) - 1) / palign));
+            let mut el: [2]*mut ir.Ty = [tag, arr];
+            ir.struct_set_body(r, el[..]);
+        }
+    } else {
+        internal_error(u.f1("no LLVM type for %s", ty.type_str(t)));
+    }
+    cache_lty(t, r);
+    return r;
+}
+
+// SSA representation: bool is i1; everything else as in memory.
+pub fn vty(t: *mut ast.Type) *mut ir.Ty {
+    if t.kind == ast.TY_BOOL {
+        return T_i1;
+    }
+    return lty(t);
+}
+
+// Passed by pointer to a copy the callee only reads (results: through a
+// pointer to the caller's memory): aggregates larger than 32 bytes, and
+// 256- and 512-bit vectors, so that functions compiled for different
+// processor extensions (spec §13.4) agree on how they arrive.
+pub fn by_ptr(t: *mut ast.Type) bool {
+    if ty.is_simd(t) {
+        return ty.type_size(t) > 16;
+    }
+    return ty.is_aggregate(t) and (ty.type_size(t) > 32);
+}
+
+struct FnLty {
+    t: *mut ir.Ty,
+    sret: bool,
+}
+
+pub fn fn_lty(fnty: *mut ast.Type) FnLty {
+    return fn_lty_c(fnty, false);
+}
+
+// The wrappers of C functions that take or return structures by value
+// (spec §14.5.3; ast.Decl's cabi): every structure by pointer, a structure
+// result through a pointer first parameter, the rest as Axiom passes them.
+// The wrapper, a C function (cabi_source in header.ax), passes them as the
+// target's C ABI says.
+pub fn cabi_struct(t: *mut ast.Type, cabi: bool) bool {
+    return by_ptr(t) or (cabi and (t.kind == ast.TY_STRUCT));
+}
+
+pub fn fn_lty_c(fnty: *mut ast.Type, cabi: bool) FnLty {
+    let ret = fnty.ret;
+    let sret = cabi_struct(ret, cabi);
+    let mut n = fnty.params.len;
+    if sret {
+        n += 1;
+    }
+    let ps = u.newn.[*mut ir.Ty](n + 1);
+    let mut k: usize = 0;
+    if sret {
+        ps[k] = T_ptr;
+        k += 1;
+    }
+    for i in 0..fnty.params.len {
+        if cabi_struct(fnty.params[i], cabi) {
+            ps[k] = T_ptr;
+        } else {
+            ps[k] = vty(fnty.params[i]);
+        }
+        k += 1;
+    }
+    let mut rt = T_void;
+    if not sret and (ret.kind != ast.TY_VOID) {
+        rt = vty(ret);
+    }
+    return FnLty.{ t: ir.t_fn(rt, ps[0..n], false), sret: sret };
+}
+
+// ---------------------------------------------------------------------------
+// Small IR helpers
+// ---------------------------------------------------------------------------
+pub fn cint(t: *mut ir.Ty, v: u.I128) *mut ir.Value {
+    return ir.cint(t, v.lo);
+}
+
+// The constant float expression e of float type t (an f32 rounded once,
+// even when e is a literal of a type parameter).
+pub fn cfloat(t: *mut ast.Type, e: *mut ast.Expr) *mut ir.Value {
+    if (t.kind == ast.TY_FLOAT) and (t.bits == 32) {
+        return ir.cfp(lty(t), @as(f64, sema.const_f32(e)));
+    }
+    return ir.cfp(lty(t), ast.fval_of(e));
+}
+
+pub fn usz(v: i64) *mut ir.Value {
+    return ir.cint(T_isz, @bit_cast(u64, v));
+}
+
+// The elements of `size` bytes that a slice needs to hold `bytes` (@load and
+// @store: s.len * size >= bytes, as a count of elements, which cannot wrap).
+pub fn elems_for(bytes: i64, size: i64) i64 {
+    if size <= 0 {
+        return bytes;
+    }
+    return (bytes + (size - 1)) / size;
+}
+
+pub fn terminated() bool {
+    let bb = ir.insert_block(B);
+    return u.notnil(ir.terminator(bb));
+}
+
+pub fn new_bb(name: *u8) *mut ir.Block {
+    return ir.append_block(ir.fnp_of(F.fnv), u.from_c(name));
+}
+
+// After a diverging instruction: continue in a fresh (unreachable) block.
+pub fn dead_block() void {
+    at_end(new_bb("dead".ptr));
+}
+
+// The LLVM intrinsics codegen uses, as IR intrinsics (IN_*) or instructions.
+pub fn intrinsic(name: []u8, tys: []mut *mut ir.Ty, args: []mut *mut ir.Value) *mut ir.Value {
+    if u.str_eq(name, "llvm.fptosi.sat") {
+        return ir.cast(B, ir.OP_FPTOSI_SAT, args[0], tys[0]);
+    }
+    if u.str_eq(name, "llvm.fptoui.sat") {
+        return ir.cast(B, ir.OP_FPTOUI_SAT, args[0], tys[0]);
+    }
+    if u.str_eq(name, "llvm.trap") {
+        return ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+    }
+    if u.str_eq(name, "llvm.wasm.memory.size") {
+        return ir.intr(B, ir.IN_MEMSIZE, T_isz, no_vals());
+    }
+    if u.str_eq(name, "llvm.wasm.memory.grow") {
+        return ir.intr(B, ir.IN_MEMGROW, T_isz, args[1..2]);
+    }
+    if u.str_eq(name, "llvm.wasm.memory.atomic.wait32") {
+        return ir.intr(B, ir.IN_WAIT32, T_i32, args);
+    }
+    if u.str_eq(name, "llvm.wasm.memory.atomic.notify") {
+        return ir.intr(B, ir.IN_NOTIFY, T_i32, args);
+    }
+    if u.str_eq(name, "llvm.stackrestore") {
+        return ir.intr(B, ir.IN_SET_SP, T_void, args);
+    }
+    let names = ["llvm.ctlz", "llvm.cttz", "llvm.ctpop", "llvm.fshl", "llvm.fshr", "llvm.sadd.sat", "llvm.uadd.sat",
+                 "llvm.ssub.sat", "llvm.usub.sat", "llvm.smin", "llvm.smax", "llvm.umin", "llvm.umax", "llvm.minimum",
+                 "llvm.maximum", "llvm.fabs", "llvm.sqrt", "llvm.floor", "llvm.ceil", "llvm.trunc", "llvm.roundeven",
+                 "llvm.fma", "llvm.copysign", "llvm.abs"];
+    let ids = [ir.IN_CTLZ, ir.IN_CTTZ, ir.IN_CTPOP, ir.IN_ROTL, ir.IN_ROTR, ir.IN_SADD_SAT, ir.IN_UADD_SAT,
+               ir.IN_SSUB_SAT, ir.IN_USUB_SAT, ir.IN_SMIN, ir.IN_SMAX, ir.IN_UMIN, ir.IN_UMAX, ir.IN_FMIN, ir.IN_FMAX,
+               ir.IN_FABS, ir.IN_SQRT, ir.IN_FLOOR, ir.IN_CEIL, ir.IN_FTRUNC, ir.IN_NEAREST, ir.IN_FMA, ir.IN_COPYSIGN,
+               ir.IN_ABS];
+    for i in 0..names.len {
+        if u.str_eq(name, names[i]) {
+            let id = ids[i];
+            let mut n = args.len;
+            if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_ABS) {
+                n = 1;  // drop LLVM's is_zero_poison flag
+            }
+            if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
+                let mut rargs: [2]*mut ir.Value = [args[0], args[2]];
+                return ir.intr(B, id, args[0].ty, rargs[..]);
+            }
+            return ir.intr(B, id, args[0].ty, args[0..n]);
+        }
+    }
+    internal_error(u.f1("unknown intrinsic %s", name));
+    return vnil();
+}
+
+pub fn no_tys() []mut *mut ir.Ty {
+    return @slice_from_ptr(u.nil.[*mut ir.Ty](), 0);
+}
+
+pub fn no_vals() []mut *mut ir.Value {
+    return @slice_from_ptr(u.nil.[*mut ir.Value](), 0);
+}
+
+pub fn intr1(name: []u8, a: *mut ir.Value) *mut ir.Value {
+    let mut t: [1]*mut ir.Ty = [a.ty];
+    let mut args: [1]*mut ir.Value = [a];
+    return intrinsic(name, t[..], args[..]);
+}
+
+pub fn intr2(name: []u8, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let mut t: [1]*mut ir.Ty = [a.ty];
+    let mut args: [2]*mut ir.Value = [a, b];
+    return intrinsic(name, t[..], args[..]);
+}
+
+// The site records made, by what makes them the same (site_slot): a hash
+// table (open addressing), which a lookup does not allocate in.
+pub struct SiteKey {
+    fname: []u8,
+    callee: []u8,
+    g: *mut ir.Value,  // nil: a free slot
+    code: i32,
+    file: i32,
+    start: u32,
+    end: u32,
+}

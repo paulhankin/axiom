@@ -1,0 +1,416 @@
+// =============================================================================
+// semapost.ax - the checks sema.ax makes once the program's declarations
+// and bodies are checked: object sizes (once every type is complete),
+// inline functions that reach themselves, and processor extensions (the
+// target conditions, @features / @multiversion versions, and builtins
+// that need an extension the function is not compiled with).
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "modload.ax" as modl;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// Object sizes (spec §5.5): every array, error union, struct and union type
+// written in the program, and every instance of a generic one, must fit the
+// target's largest object (E0473). The check waits until the end of
+// analysis, when every type it reaches is complete (a struct may name an
+// array of itself behind a pointer while its own fields are resolved).
+pub struct SizeCheck {
+    span: u.Span,
+    t: *mut ast.Type,
+}
+
+pub threadlocal let mut size_checks: u.List.[SizeCheck] = u.List.[SizeCheck].{
+    data: @ptr_from_int(*mut SizeCheck, 0), len: 0, cap: 0 };
+
+pub fn check_size(sp: u.Span, t: *mut ast.Type) *mut ast.Type {
+    if not t.has_params and (t.kind != ast.TY_INVALID) {
+        size_checks.push(SizeCheck.{ span: sp, t: t });
+    }
+    return t;
+}
+
+pub fn check_sizes() void {
+    let max = ty.max_object_size();
+    let mut reported = u.List.[u.Span].empty();
+    for i in 0..size_checks.len {
+        let c = size_checks.get(i);
+        let msg = ty.size_problem(c.t);
+        if msg.len == 0 {
+            continue;
+        }
+        let mut seen = false;
+        for j in 0..reported.len {
+            let r = reported.get(j);
+            if (r.file == c.span.file) and (r.start == c.span.start) and (r.end == c.span.end) {
+                seen = true;
+            }
+        }
+        if not seen {
+            reported.push(c.span);
+            _ = dg.err(c.span, "E0473", msg);
+        }
+    }
+    reported.deinit();
+    // The globals together, laid out one after another, must fit too: on
+    // wasm32 they share one 4 GiB memory with the stack and the heap.
+    let mut total: i64 = 0;
+    for i in 0..modl.g_prog.globals.len {
+        let d = modl.g_prog.globals.get(i);
+        let t = d.ty;
+        if u.isnil(t) or t.has_params or (t.kind == ast.TY_INVALID) or (ty.type_size(t) > max) {
+            continue;
+        }
+        let a = ty.type_align(t);
+        total = ((total + a) - 1) / a * a + ty.type_size(t);
+        if total > max {
+            _ = dg.err(d.name_span, "E0473",
+                       u.f2("with '%s', the globals need more than %s bytes, the most they can have together", d.name,
+                            u.dec(max)));
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Processor extensions (spec §13.4): target conditions, @features and
+// @multiversion, and builtins that need an extension.
+// ---------------------------------------------------------------------------
+pub const NO_VERSION: u64 = 0xFFFF_FFFF_FFFF_FFFF;  // a version naming another architecture's extension
+
+// The value a target name stands for: an architecture (@target_arch) or an
+// operating system (@target_os). -1 for an unknown name.
+pub fn target_name_value(id: i32, name: []u8) i32 {
+    if id == ast.BI_TARGET_ARCH {
+        let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+        for i in 0..t.len {
+            if u.str_eq(t[i], name) {
+                return @int_cast(i32, i) + tg.ARCH_WASM32;
+            }
+        }
+        return -1;
+    }
+    let t = ["linux", "macos", "windows", "none"];
+    for i in 0..t.len {
+        if u.str_eq(t[i], name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+// The operating system as @target_os numbers it (none: WebAssembly).
+fn target_os_value() i32 {
+    if tg.is_wasm() {
+        return 3;
+    }
+    if tg.g_os == tg.OS_DARWIN {
+        return 1;
+    }
+    if tg.g_os == tg.OS_WINDOWS {
+        return 2;
+    }
+    return 0;
+}
+
+fn tri(c: bool) i32 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+// The value of a target condition in code compiled with extensions
+// `feats`: 1 true, 0 false, -1 not a target condition. Target conditions
+// are @target_has, @target_arch, @target_os, @cpu_has of an extension the
+// code may use (true), true and false, combined with not, and, or.
+pub fn target_cond(e: *ast.Expr, feats: u64) i32 {
+    if e.kind == ast.E_BOOL {
+        return tri(e.bval);
+    }
+    if e.kind == ast.E_BUILTIN {
+        let id = ast.builtin_of(e);
+        if (ast.more(e).bargs.len != 1) or u.isnil(ast.more(e).bargs.at(0).e) or
+           (ast.more(e).bargs.at(0).e.kind != ast.E_STRING) {
+            return -1;
+        }
+        let name = ast.more(ast.more(e).bargs.at(0).e).str;
+        if (id == ast.BI_TARGET_HAS) or (id == ast.BI_CPU_HAS) {
+            let b = tg.feature_bit(name);
+            let on = (b != 0) and ((feats & b) == b);
+            if (id == ast.BI_CPU_HAS) and not on {
+                return -1;
+            }
+            return tri(on);
+        }
+        if id == ast.BI_TARGET_ARCH {
+            return tri(target_name_value(id, name) == tg.g_arch);
+        }
+        if id == ast.BI_TARGET_OS {
+            return tri(target_name_value(id, name) == target_os_value());
+        }
+        return -1;
+    }
+    if (e.kind == ast.E_UNARY) and (ast.op_of(e) == lx.KW_NOT) {
+        let a = target_cond(e.a, feats);
+        if a < 0 {
+            return -1;
+        }
+        return 1 - a;
+    }
+    if (e.kind == ast.E_BINARY) and ((ast.op_of(e) == lx.KW_AND) or (ast.op_of(e) == lx.KW_OR)) {
+        let a = target_cond(e.a, feats);
+        let b = target_cond(ast.b_of(e), feats);
+        if ast.op_of(e) == lx.KW_AND {
+            if (a == 0) or (b == 0) {
+                return 0;
+            }
+            if (a == 1) and (b == 1) {
+                return 1;
+            }
+            return -1;
+        }
+        if (a == 1) or (b == 1) {
+            return 1;
+        }
+        if (a == 0) and (b == 0) {
+            return 0;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+// Is this function's code exempt from --cpu (compiled for the bare
+// architecture)? std/os/cpu.ax's detection and start-up check, which must
+// run on any processor of the architecture.
+pub fn baseline_fn(d: *ast.Decl) bool {
+    return u.notnil(d.module) and u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax");
+}
+
+// The extension sets the function's versions are compiled with: the
+// @multiversion fallback first (the target's own), then one per listed set
+// this architecture has.
+pub fn fn_versions(f: *ast.Decl) []mut u64 {
+    let base = tg.func_features(0, baseline_fn(f));
+    if f.attr == ast.ATTR_NONE {
+        let r = u.newn.[u64](1);
+        r[0] = base;
+        return r[0..1];
+    }
+    let r = u.newn.[u64](f.feat_sets.len + 2);
+    let mut n: usize = 0;
+    if f.attr == ast.ATTR_MULTIVERSION {
+        r[n] = base;
+        n += 1;
+    }
+    for x in f.feat_sets {
+        if x != NO_VERSION {
+            r[n] = base | x;
+            n += 1;
+        }
+    }
+    return r[0..n];
+}
+
+// What a builtin needs: an architecture (0: any) and extensions.
+pub struct Need {
+    arch: i32,
+    feats: u64,
+}
+
+pub fn builtin_need(id: i32) Need {
+    if (id == ast.BI_X86_CPUID) or (id == ast.BI_X86_XGETBV) {
+        return Need.{ arch: tg.ARCH_X64, feats: 0 };
+    }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_X86_AESKEYGENASSIST) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_AES };
+    }
+    if id == ast.BI_X86_CLMUL {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_PCLMUL };
+    }
+    if (id >= ast.BI_X86_SHA1RNDS4) and (id <= ast.BI_X86_SHA256MSG2) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SHA };
+    }
+    if id == ast.BI_X86_CRC32C {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SSE42 };
+    }
+    if (id >= ast.BI_ARM_AESE) and (id <= ast.BI_ARM_PMULL2) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_AES };
+    }
+    if (id >= ast.BI_ARM_SHA1C) and (id <= ast.BI_ARM_SHA256SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA2 };
+    }
+    if (id >= ast.BI_ARM_SHA512H) and (id <= ast.BI_ARM_SHA512SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA512 };
+    }
+    if (id >= ast.BI_ARM_EOR3) and (id <= ast.BI_ARM_XAR) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA3 };
+    }
+    if (id == ast.BI_ARM_CRC32) or (id == ast.BI_ARM_CRC32C) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_CRC };
+    }
+    return Need.{ arch: 0, feats: 0 };
+}
+
+pub threadlocal let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+fn arch_name(a: i32) []u8 {
+    let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+    return t[@int_cast(usize, a - tg.ARCH_WASM32)];
+}
+
+fn need_text(nd: Need, feats: u64) []u8 {
+    if nd.arch != tg.g_arch {
+        let saved = tg.g_arch;
+        tg.g_arch = nd.arch;
+        let mut t = u.f1("the %s architecture", arch_name(nd.arch));
+        if nd.feats != 0 {
+            t = u.f2("%s with %s", t, tg.features_string(nd.feats));
+        }
+        tg.g_arch = saved;
+        return t;
+    }
+    return u.f1("the extensions %s", tg.features_string(nd.feats & ~feats));
+}
+
+fn gate_expr(e: *ast.Expr, feats: u64) void {
+    if u.isnil(e) {
+        return;
+    }
+    if e.kind == ast.E_BUILTIN {
+        let nd = builtin_need(ast.builtin_of(e));
+        if ((nd.arch != 0) and (nd.arch != tg.g_arch)) or ((feats & nd.feats) != nd.feats) {
+            let mut seen = false;
+            for i in 0..gate_reported.len {
+                if gate_reported.get(i) == e.span.start {
+                    seen = true;
+                }
+            }
+            if not seen {
+                gate_reported.push(e.span.start);
+                let d = dg.err(e.span, "E0828", u.f2("@%s needs %s, which this code is not compiled for", e.name,
+                                                     need_text(nd, feats)));
+                dg.note(d, e.span,
+                        "use it under `if @target_has(...)` or `if @target_arch(...)`, or in a function declared with @features or @multiversion");
+            }
+        }
+        for i in 0..ast.more(e).bargs.len {
+            gate_expr(ast.more(e).bargs.at(i).e, feats);
+        }
+        return;
+    }
+    gate_expr(e.a, feats);
+    // A method callee keeps its receiver in b as well as in a, and the call (or
+    // generic application) over it copies that b; walking those again would visit
+    // a receiver chain exponentially often.
+    let b = ast.b_of(e);
+    if (b != e.a) and (u.isnil(e.a) or (b != ast.b_of(e.a))) {
+        gate_expr(b, feats);
+    }
+    gate_expr(ast.c_of(e), feats);
+    for i in 0..ast.args_of(e).len {
+        gate_expr(ast.args_of(e).get(i), feats);
+    }
+    for i in 0..ast.more(e).inits.len {
+        gate_expr(ast.more(e).inits.at(i).value, feats);
+    }
+    if e.kind == ast.E_CATCH {
+        gate_expr(ast.handler_expr(e), feats);
+        gate_stmt(ast.handler_block(e), feats);
+    }
+}
+
+fn gate_stmt(s: *ast.Stmt, feats: u64) void {
+    if u.isnil(s) {
+        return;
+    }
+    if s.kind == ast.S_IF {
+        let c = target_cond(s.e, feats);
+        if c == 1 {
+            gate_stmt(s.body, feats);
+            return;
+        }
+        if c == 0 {
+            gate_stmt(s.els, feats);
+            return;
+        }
+    }
+    gate_expr(s.e, feats);
+    gate_expr(s.e2, feats);
+    gate_expr(ast.stmt_more(s).e3, feats);
+    gate_stmt(s.body, feats);
+    gate_stmt(s.els, feats);
+    for i in 0..s.stmts.len {
+        gate_stmt(s.stmts.get(i), feats);
+    }
+    for i in 0..ast.stmt_more(s).arms.len {
+        if ast.stmt_more(s).arms.at(i).alt {
+            continue;
+        }
+        gate_stmt(ast.stmt_more(s).arms.at(i).body, feats);
+    }
+}
+
+// Each version of a function may use only the builtins its extensions
+// allow (in the code it compiles: a branch a target condition rules out
+// is not compiled).
+pub fn gate_fn(f: *ast.Decl) void {
+    if u.isnil(f.body) {
+        return;
+    }
+    for v in fn_versions(f) {
+        gate_stmt(f.body, v);
+    }
+}
+
+// Whether inline function `from` reaches `to` through calls between inline
+// functions.
+fn inline_reaches(from: *mut ast.Decl, to: *mut ast.Decl, mark: i32) bool {
+    if from == to {
+        return true;
+    }
+    if from.module.base {
+        return false;  // (calls nothing of this run's)
+    }
+    if from.inline_mark == mark {
+        return false;
+    }
+    from.inline_mark = mark;
+    for i in 0..from.inline_callees.len {
+        if inline_reaches(from.inline_callees.get(i), to, mark) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An inline function cannot be recursive, directly or through other inline
+// functions (spec §9.5): every call on such a cycle is reported.
+pub fn check_inline_cycles() void {
+    let mut mark: i32 = 0;
+    for i in 0..modl.g_prog.fns.len {
+        let g = modl.g_prog.fns.get(i);
+        if g.module.base {
+            continue;  // (checked)
+        }
+        for k in 0..g.inline_callees.len {
+            let f = g.inline_callees.get(k);
+            mark += 1;
+            if not inline_reaches(f, g, mark) {
+                continue;
+            }
+            if f == g {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f1("inline function '%s' calls itself (an inline function cannot be recursive)", g.name));
+            } else {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f2("this call to inline function '%s' leads back to '%s' (inline functions cannot be recursive)",
+                                f.name, g.name));
+            }
+        }
+    }
+}

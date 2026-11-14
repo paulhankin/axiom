@@ -4144,7 +4144,7 @@ if (!skipPlatform && !native) {
 }
 
 // axiom lsp answers in-process, keeping what it checked for the session
-// (lsp.ax, sema.ax's kept modules): every answer must be what `axiom ide`
+// (lsp.ax, modload.ax's kept modules): every answer must be what `axiom ide`
 // (which checks everything afresh, one process per question) gives for the
 // same buffers, through edits in the editor and on disk.
 await section('axiom lsp', {

@@ -114,7 +114,7 @@ choice never changes what a program computes:
   `@load_partial`/`@store_partial` masked moves, per-lane shift counts `vpsllv*`/`vpsrlv*`/
   `vpsrav*`, vector `@clz`/`@popcount` `vplzcnt`/`vpopcnt`, and `@select` of
   other masks one `vpternlogd`: `codegen.ax` makes intrinsics (`ir.IN_PERM` ...) or vector casts for the
-  builtins where `x64.ax` says it selects them (`perm_ok` and the like), and lowers them
+  builtins where `x64caps.ax` says `x64.ax` selects them (`perm_ok` and the like), and lowers them
   generically elsewhere. Operations without a single instruction at that width are split
   into halves first (`vsplit.ax`), so the choice never changes a result.
 - **AArch64**: the FP and Advanced SIMD (NEON) baseline covers everything; LSE replaces
@@ -239,7 +239,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, traps, stack traces: each call's site record, or the shadow stack, each instruction's source line) |
+| `codegen.ax` | The checked program to IR (monomorphization, statements, expressions, builtins, each instruction's source line), over `cgctx.ax` (its options, the unit's IR module, builder and tables, small IR helpers); `cgrt.ax`: traps, stack traces (each call's site record, or the shadow stack), the stack limit, frame tables; `cgmain.ax`: a run (`codegen_program`), the native entry and the runtime's exports |
 | `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
@@ -249,7 +249,9 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | `tailrec.ax` | A function's calls of itself in tail position (`return f(...)`, or `return x + f(...)` with an associative and commutative integer operation, gathered in an accumulator) as a loop |
 | `slots.ax` | Stack-slot liveness, once the other passes are done: per slot over the CFG, from where some write of it may have run to the last read before it is overwritten whole, and everywhere after its address goes where it cannot be followed (a call parameter that keeps no pointer, found over the module, is not such a place). Slots copied into each other at the same offset whose contents are never needed at the same time become one and the copy goes; then slots that never interfere share their bytes (stack colouring), the largest first |
 | `sroa.ax` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
-| `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions, bounds between values and upper bounds of values (bit counts, masks, minimums, constant tables, loop phis by induction), which decide bounds and overflow checks and shift guards, dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
+| `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions, bounds between values and upper bounds of values (bit counts, masks, minimums, constant tables, loop phis by induction), which decide bounds and overflow checks and shift guards; loads at joins (partial redundancy) |
+| `dse.ax` | Dead stores (over `gvn.ax`'s locations and alias queries), shadow stack pushes and pops (and their records moved to the paths that read them) |
+| `loopopt.ax` | Loop passes over `gvn.ax`'s memory model: loop-invariant code motion, locations promoted to registers across loops, loop guards, memset idioms, loop ranges split at bounds checks, code sinking, strength reduction of addresses |
 | `thread.ax` | Jump threading (also over comparisons of one value that branches above decide, with SSA repair of the values used beyond; a block that branches on a phi of conditions copied into the predecessors computing them; a phi of constants that a dominating branch decides replaced by its condition) and if-conversion (selects; stores in both arms merged; a load from a constant global speculated through a select of its address; nested tests of one value merged into one range check) |
 | `slp.ax` | Straight-line code as vector operations (x86-64): a mask of comparisons of neighbouring array elements with one constant (`a[k] == c` in bit k, or-ed together) is one vector compare of the elements loaded together (a masked load with AVX-512, else scalar loads put in a vector) and `@bitmask`; a sum of neighbouring bytes (`s += a[k]` unrolled, zero-extended or wrapping at 8 bits) is vector loads of them summed by `psadbw` |
 | `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), partial unrolling (up to four times, the leftover iterations peeled) of larger ones, and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
@@ -260,7 +262,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
 | `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies (with the layout's prediction), copy coalescing and greedy register allocation (largest intervals first, evicting cheaper ones) with live-range splitting (around calls, at loop and block boundaries; reloads placed where the value is next used) and spilling (values rebuilt rather than stored, such as stack arguments and hoisted constants, split the same way, built again where a piece starts; their uses weighed by what a register saves), redundant reloads and spill stores removed (`AXIOM_DEBUG_RA=<function name suffix>` prints the allocator's decisions for x86-64) |
 | `isel.ax` | Instruction-selection helpers both native backends use: constants and operand tests, use counts and address folding before selection, phi copies as parallel moves, the layout of globals in the object |
-| `x64.ax`, `x64emit.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands) and register allocation (`x64.ax`); peepholes on the allocated code, frame layout, unwind information and code placement (`x64emit.ax`; knobs for measuring placement, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64emit.ax` and the table below); the encoding of machine instructions (`x64enc.ax`) |
+| `x64.ax`, `x64caps.ax`, `x64emit.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands) and register allocation (`x64.ax`); what it selects as one instruction with the function's extensions, which `codegen.ax` asks (`x64caps.ax`); peepholes on the allocated code, frame layout, unwind information and code placement (`x64emit.ax`; knobs for measuring placement, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64emit.ax` and the table below); the encoding of machine instructions (`x64enc.ax`) |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `nlink.ax` | What the native linkers share: the input objects' symbols and sections, the GOT, placing sections by class, and AArch64 and x86-64 relocations |
@@ -431,8 +433,10 @@ types share a module.
 | `parser.ax` | `parser.c` | LL(1) parser, operator partial order |
 | `types.ax` | `types.c` | hash-consed types, substitution, printing, layout, constraints |
 | `package.ax` | `package.c` | `axiom.toml`, `pkg:` imports, git dependencies |
-| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | module loading, name resolution, type checking |
-| `codegen.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
+| `modload.ax` | `sema_decl.c` | module loading (import paths, `internal/` and package visibility, cycles), the modules `axiom lsp`'s session keeps, the `Program` |
+| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | name resolution, type checking |
+| `semapost.ax` | `sema_decl.c`, `sema_target.c` | the checks after type checking: object sizes, recursive inline functions, processor extensions (target conditions, `@features`/`@multiversion`, builtins that need an extension) |
+| `codegen.ax`, `cgctx.ax`, `cgrt.ax`, `cgmain.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
 | `units.ax` | `units.c` | separate compilation and the object cache: each module compiled on a worker thread, whose compiler state is thread-local (`util.ax`, worker threads) |
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |

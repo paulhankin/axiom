@@ -1,0 +1,608 @@
+// =============================================================================
+// dse.ax - dead store elimination within blocks (dse), and the shadow
+// stack's pushes and pops across blocks (ss_opt), over gvn.ax's locations
+// and alias queries.
+// =============================================================================
+import "gvn.ax" as gvn;
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Dead store elimination (within blocks): a store to memory that is written
+// again later in the block, with nothing in between that may read it, is
+// deleted; so is a store to a private alloca that nothing reads before the
+// function returns.
+// -----------------------------------------------------------------------------
+
+// Is a covered by b (both exact)?
+fn covers(b: *gvn.Loc, a: *gvn.Loc) bool {
+    return (a.base == b.base) and (a.size >= 0) and (b.size >= 0) and (a.off >= b.off) and
+           ((a.off + a.size) <= (b.off + b.size));
+}
+
+// Removes the killed locations that the read of r may observe.
+fn read_loc(killed: *mut u.List.[gvn.Loc], r: *gvn.Loc) void {
+    let w = gvn.loc_write(r);
+    let mut k: usize = 0;
+    while k < killed.len {
+        if gvn.may_alias(killed.at(k), &w) {
+            killed.set(k, killed.get(killed.len - 1));
+            killed.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+}
+
+// Keeps only the locations in private allocas (a call or return reads the rest).
+fn read_nonprivate(killed: *mut u.List.[gvn.Loc]) void {
+    let mut k: usize = 0;
+    while k < killed.len {
+        if not gvn.private_obj(killed.get(k).obj) {
+            killed.set(k, killed.get(killed.len - 1));
+            killed.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+}
+
+threadlocal let mut restored: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+threadlocal let mut ss_dead: bool = false;
+
+fn ss_reads() void {
+    ss_dead = false;
+    restored.clear();
+}
+
+// Is one of xs an operand of v (transitively)?
+fn uses_any(v: *mut ir.Value, xs: *u.List.[*mut ir.Value], depth: i32) bool {
+    if u.isnil(v) or (depth > 8) {
+        return false;
+    }
+    for k in 0..xs.len {
+        if xs.get(k) == v {
+            return true;
+        }
+    }
+    if v.kind != ir.V_INST {
+        return false;
+    }
+    return uses_any(v.a, xs, depth + 1) or uses_any(v.b, xs, depth + 1);
+}
+
+fn has_obj(xs: *u.List.[*mut ir.Value], o: *mut ir.Value) bool {
+    for k in 0..xs.len {
+        if xs.get(k) == o {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn dse_block(b: *mut ir.Block, killed: *mut u.List.[gvn.Loc], read_objs: *mut u.List.[*mut ir.Value]) bool {
+    killed.clear();
+    read_objs.clear();
+    let mut any = false;
+    let t = ir.terminator(b);
+    // at a return, private allocas are dead unless read later in the block
+    let mut at_ret = u.notnil(t) and (t.op == ir.OP_RET);
+    // Shadow stack call site slots at or above the depth are never read. A
+    // push stores the site at slots[D] for the depth D it loaded, and the
+    // pop stores D back; a slot store followed by the store of the depth its
+    // index was computed from (or by the return), with no call, trap or
+    // load of the slots in between, is dead.
+    ss_dead = at_ret;
+    restored.clear();
+    let mut i = b.last;
+    while u.notnil(i) {
+        let prev = i.prev;
+        let op = i.op;
+        if op == ir.OP_STORE {
+            if i.flags != 0 {
+                killed.clear();
+                at_ret = false;
+                ss_reads();
+            } else {
+                let l = gvn.loc_at(i, i.b, @bit_cast(i64, i.a.ty.size));
+                let sf = gvn.ss_field(&l);
+                let mut dead = at_ret and gvn.private_obj(l.obj) and not has_obj(read_objs, l.obj);
+                if (sf == 2) and (ss_dead or uses_any(i.b, &restored, 0)) {
+                    dead = true;
+                }
+                if sf == 0 {
+                    restored.push(i.a);
+                }
+                for k in 0..killed.len {
+                    if covers(killed.at(k), &l) {
+                        dead = true;
+                    }
+                }
+                if dead {
+                    ir.remove_inst(i);
+                    any = true;
+                } else if (killed.len < 32) and (l.size >= 0) {
+                    killed.push(l);
+                }
+            }
+        } else if op == ir.OP_LOAD {
+            if i.flags != 0 {
+                killed.clear();
+                at_ret = false;
+                ss_reads();
+            } else {
+                let l = gvn.loc_at(i, i.a, @bit_cast(i64, i.ty.size));
+                read_loc(killed, &l);
+                if gvn.noalias_global(l.obj) and (gvn.ss_field(&l) != 0) {
+                    ss_reads();
+                }
+                if u.notnil(l.obj) {
+                    read_objs.push(l.obj);
+                }
+            }
+        } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+            // (the source is read before the destination is written: what
+            // the destination covers stays live where the source may read it)
+            let d = gvn.loc_at(i, i.a, gvn.size_of(i.c));
+            if (killed.len < 32) and (d.size >= 0) {
+                killed.push(d);
+            }
+            let s = gvn.loc_at(i, i.b, gvn.size_of(i.c));
+            read_loc(killed, &s);
+            if u.notnil(s.obj) {
+                read_objs.push(s.obj);
+            }
+            if gvn.noalias_global(s.obj) {
+                ss_reads();
+            }
+        } else if op == ir.OP_MEMSET {
+            let d = gvn.loc_at(i, i.a, gvn.size_of(i.c));
+            if (killed.len < 32) and (d.size >= 0) {
+                killed.push(d);
+            }
+        } else if (op == ir.OP_CALL) or (op == ir.OP_RET) {
+            read_nonprivate(killed);
+            if op == ir.OP_CALL {
+                ss_reads();
+            }
+        } else if (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+            killed.clear();
+            at_ret = false;
+            ss_reads();
+        } else if ir.intr_id(i) == ir.IN_LOAD_PARTIAL {
+            let l = gvn.partial_loc(i);
+            read_loc(killed, &l);
+            if gvn.noalias_global(l.obj) and (gvn.ss_field(&l) != 0) {
+                ss_reads();
+            }
+            if u.notnil(l.obj) {
+                read_objs.push(l.obj);
+            }
+        } else if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
+            // (writes part of its location: nothing it makes dead, nothing it
+            // reads; a prefetch neither reads nor writes)
+        } else if gvn.exact_asm(i) {
+            // (reads its input memory operands; what it writes it need not
+            // write all of, so it makes nothing dead)
+            for m in ir.asm_mem_of(i) {
+                if m.rd {
+                    let l = gvn.asm_loc(i, m);
+                    read_loc(killed, &l);
+                    if u.notnil(l.obj) {
+                        read_objs.push(l.obj);
+                    }
+                }
+            }
+            ss_reads();
+        } else if ir.inst_opaque(i) {
+            killed.clear();
+            at_ret = false;
+            ss_reads();
+        }
+        i = prev;
+    }
+    return any;
+}
+
+pub fn dse(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    gvn.escapes(f);
+    _ = opt.rscope_cycles(f);  // (C's restrict: ir.restrict_tagged)
+    let mut killed = u.List.[gvn.Loc].empty();
+    let mut read_objs = u.List.[*mut ir.Value].empty();
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        if dse_block(b, &mut killed, &mut read_objs) {
+            any = true;
+        }
+        b = b.next;
+    }
+    killed.deinit();
+    read_objs.deinit();
+    return any;
+}
+
+// -----------------------------------------------------------------------------
+// Shadow stack pushes and pops across blocks. Every call leaves the depth as
+// it found it (it restores what it pushed), and slots at or above the depth
+// are never read. So:
+//   - a push (a call-site slot store, or a depth store) is dead when every
+//     path from it overwrites what it wrote (a slot: the depth its index came
+//     from is stored back, or another store to the slot; the depth: another
+//     depth store) before a call, a trap or a load of the shadow stack (for
+//     the depth also a return);
+//   - storing V to the depth is redundant when on every path back to it the
+//     last depth store stored V too, or V is the value the depth was loaded
+//     as, with only calls in between.
+// (Profiling builds make these stores volatile: they are left alone.)
+// -----------------------------------------------------------------------------
+fn ss_store_field(i: *ir.Value) i32 {
+    if (i.op != ir.OP_STORE) or (i.flags != 0) {
+        return -1;
+    }
+    let l = gvn.loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+    return gvn.ss_field(&l);
+}
+
+// Does i read the shadow stack (for the depth: returns too)?
+fn ss_reader(i: *mut ir.Value, depth: bool) bool {
+    let op = i.op;
+    if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+        return true;
+    }
+    if ir.intr_id(i) == ir.IN_LOAD_PARTIAL {
+        let l = gvn.partial_loc(i);
+        return gvn.noalias_global(l.obj);
+    }
+    if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
+        return false;
+    }
+    if ir.inst_opaque(i) {
+        return true;
+    }
+    if (op == ir.OP_RET) and depth {
+        return true;
+    }
+    if (op == ir.OP_STORE) and (i.flags != 0) {
+        return true;
+    }
+    if op == ir.OP_LOAD {
+        if i.flags != 0 {
+            return true;
+        }
+        let l = gvn.loc_of(i.a, @bit_cast(i64, i.ty.size));
+        return gvn.noalias_global(l.obj);
+    }
+    if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+        let l = gvn.loc_of(i.b, gvn.size_of(i.c));
+        return gvn.noalias_global(l.obj);
+    }
+    return false;
+}
+
+threadlocal let mut ss_work: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+threadlocal let mut ss_one: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+threadlocal let mut ss_mark: i64 = 0;
+
+// Is the push store s dead (see above)? Forward over the paths from s.
+fn push_dead(s: *mut ir.Value, slot: bool) bool {
+    return dead_from(s.next, s, slot);
+}
+
+// Does instruction i overwrite what the push s wrote (see above)? (Another
+// store to a slot: the next call site of the same frame, whose sites all
+// use the frame's one slot, also after inlining.)
+fn ss_overwrites(i: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
+    let sf = ss_store_field(i);
+    if sf == 0 {
+        if not slot {
+            return true;
+        }
+        ss_one.clear();
+        ss_one.push(i.a);
+        return uses_any(s.b, &ss_one, 0);
+    }
+    if (sf == 2) and slot and (i != s) {
+        let l = gvn.loc_of(s.b, @bit_cast(i64, s.a.ty.size));
+        let w = gvn.loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+        return covers(&w, &l);
+    }
+    return false;
+}
+
+// ... over the paths from instruction `from` on.
+fn dead_from(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(from);  // where to scan from
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        loop {
+            if ss_overwrites(i, s, slot) {
+                break;
+            } else if ss_reader(i, not slot) {
+                return false;
+            } else if i.op == ir.OP_RET {
+                break;  // slots end with the function
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if u.isnil(sb.first) or (blocks > 64) {
+                            return false;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Is storing s.a to the depth redundant (see above)? Backward over the paths
+// to s: every path must reach a depth store of the same value, or the load
+// that produced it, with no other depth store on the way.
+fn restore_redundant(s: *mut ir.Value) bool {
+    let v = s.a;
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(s);  // scan backwards from before it
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let from = ss_work.pop();
+        let mut i = from.prev;
+        let b = from.blk;
+        let mut found = false;
+        while u.notnil(i) and not found {
+            if i == v {
+                // the load v (of the depth, when it is one) is the start
+                if (v.op == ir.OP_LOAD) and (v.flags == 0) {
+                    let l = gvn.loc_of(v.a, 4);
+                    if gvn.ss_field(&l) == 0 {
+                        found = true;
+                        continue;
+                    }
+                }
+                return false;
+            }
+            if ss_store_field(i) == 0 {
+                if i.a != v {
+                    return false;
+                }
+                found = true;
+                continue;
+            }
+            if (i.op == ir.OP_STORE) and (i.flags != 0) {
+                return false;  // profiling
+            }
+            i = i.prev;
+        }
+        if found {
+            continue;
+        }
+        // the start of b: every predecessor's end
+        if b.preds.len == 0 {
+            return false;  // the function's entry
+        }
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if p.mark != ss_mark {
+                p.mark = ss_mark;
+                blocks += 1;
+                if blocks > 64 {
+                    return false;
+                }
+                let t = ir.terminator(p);
+                if u.isnil(t) {
+                    return false;
+                }
+                ss_work.push(t);
+            }
+        }
+    }
+    return true;
+}
+
+// A store of the shadow stack read only on uncommon paths (the calls and
+// traps of an inlined function's slow path and checks) moves to just before
+// each instruction that reads it, off the common path. The readers are found
+// forward from the store up to what overwrites it (see push_dead); each must
+// be in a block the store's block dominates, no deeper in loops, and not
+// reachable from an overwrite without passing the store's block again.
+threadlocal let mut rd_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+threadlocal let mut ow_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+
+// The readers of s forward from `from` (false: too far, or a return).
+fn readers_of(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
+    rd_found.clear();
+    ow_found.clear();
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(from);
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        loop {
+            if ss_overwrites(i, s, slot) {
+                ow_found.push(i);
+                break;
+            } else if i.op == ir.OP_RET {
+                if not slot {
+                    return false;  // (the depth must be restored before)
+                }
+                break;
+            } else if ss_reader(i, not slot) {
+                rd_found.push(i);
+                break;  // (a copy goes before it; beyond, the path has it)
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if u.isnil(sb.first) or (blocks > 64) or (sb.rpo < 0) {
+                            return false;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Can an overwrite reach one of the readers without passing through b?
+fn overwrite_reaches(b: *mut ir.Block) bool {
+    ss_mark += 1;
+    b.mark = ss_mark;
+    ss_work.clear();
+    for k in 0..ow_found.len {
+        ss_work.push(ow_found.get(k).next);
+    }
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        while u.notnil(i) {
+            for k in 0..rd_found.len {
+                if rd_found.get(k) == i {
+                    return true;
+                }
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if blocks > 128 {
+                            return true;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
+fn sink_ss_store(s: *mut ir.Value, sf: i32) bool {
+    let slot = sf != 0;
+    let b = s.blk;
+    if not readers_of(s.next, s, slot) or (rd_found.len == 0) {
+        return false;
+    }
+    for k in 0..rd_found.len {
+        let q = rd_found.get(k).blk;
+        if (q == b) or not opt.dominates(b, q) or (q.loop_depth > b.loop_depth) {
+            return false;
+        }
+    }
+    if overwrite_reaches(b) {
+        return false;
+    }
+    for k in 0..rd_found.len {
+        let r = rd_found.get(k);
+        let c = ir.new_inst(b.fnp, ir.OP_STORE, s.ty);
+        ir.set_a(c, s.a);
+        ir.set_b(c, s.b);
+        c.align = s.align;
+        c.flags = s.flags;
+        ir.insert_before(r, c);
+    }
+    ir.remove_inst(s);
+    return true;
+}
+
+// True if anything changed.
+pub fn ss_opt(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    let mut any = false;
+    let mut rounds: i32 = 0;
+    loop {
+        opt.compute_preds(f);
+        let mut moved = false;
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                let sf = ss_store_field(i);
+                if (sf == 2) and push_dead(i, true) {
+                    ir.remove_inst(i);
+                    moved = true;
+                } else if (sf == 0) and push_dead(i, false) {
+                    ir.remove_inst(i);
+                    moved = true;
+                }
+                i = next;
+            }
+            b = b.next;
+        }
+        b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                if (ss_store_field(i) == 0) and restore_redundant(i) {
+                    ir.remove_inst(i);
+                    moved = true;
+                }
+                i = next;
+            }
+            b = b.next;
+        }
+        // stores read on some paths only: to their readers
+        rounds += 1;
+        if rounds <= 2 {
+            let order = opt.dominators(f);
+            opt.loop_depths(f, &order);
+            order.deinit();
+            b = f.first;
+            while u.notnil(b) {
+                let mut i = b.last;
+                while u.notnil(i) {
+                    let prev = i.prev;
+                    let sf = ss_store_field(i);
+                    if ((sf == 0) or (sf == 2)) and sink_ss_store(i, sf) {
+                        moved = true;
+                    }
+                    i = prev;
+                }
+                b = b.next;
+            }
+        }
+        if not moved {
+            break;
+        }
+        any = true;
+        if rounds > 8 {
+            break;
+        }
+    }
+    return any;
+}

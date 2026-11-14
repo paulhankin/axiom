@@ -1,0 +1,428 @@
+// =============================================================================
+// modload.ax - the program's modules: loading them from the root's imports
+// (paths, visibility of internal/ and package modules, cycles), the modules
+// that axiom lsp's session keeps from one check to the next, and the
+// Program that sema.ax fills in.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "package.ax" as pkg;
+import "parser.ax" as parser;
+import "util.ax" as u;
+
+pub struct Program {
+    modules: u.List.[*mut ast.Module],
+    root: *mut ast.Module,
+    error_names: u.List.[[]u8],  // code = index + 1
+    error_codes: u.SymMap.[i32],
+    fns: u.List.[*mut ast.Decl],  // every fn decl (including methods), for codegen
+    globals: u.List.[*mut ast.Decl],
+    host_fns: u.List.[*mut ast.Decl],
+    tests: u.List.[*mut ast.Decl],  // test blocks of non-std modules, in source order
+}
+
+pub threadlocal let mut g_prog: *mut Program = @ptr_from_int(*mut Program, 0);
+
+pub threadlocal let mut mod_by_path: u.SymMap.[*mut ast.Module] =
+    u.SymMap.[*mut ast.Module].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0),
+                                 cap: 0, len: 0 };
+pub threadlocal let mut mod_state: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                     vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+// The real paths found so far, by the path asked about (an import is resolved twice, and a module is imported
+// by many).
+threadlocal let mut real_path_memo: u.SymMap.[[]u8] = u.SymMap.[[]u8].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut []u8, 0), cap: 0,
+                                                                        len: 0 };
+
+// u.real_path(p), remembered when p exists.
+fn real_path_of(p: []u8) []u8 {
+    let k = u.intern(p);
+    let known = real_path_memo.get(k);
+    if not u.isnos(known) {
+        return known;
+    }
+    let r = u.real_path(p);
+    if u.isnos(r) {
+        return r;
+    }
+    let kept = u.perm_dup(r);
+    real_path_memo.put(k, kept);
+    return kept;
+}
+
+pub threadlocal let mut g_std_dir: []u8 = "";
+pub threadlocal let mut g_cwd: []u8 = "";
+threadlocal let mut std_real: []u8 = "";
+threadlocal let mut std_real_done: bool = false;
+// ---------------------------------------------------------------------------
+// Module loading
+// ---------------------------------------------------------------------------
+fn has_ext(p: []u8) bool {
+    let slash = u.rfind(p, '/');
+    let dot = u.rfind(p, '.');
+    return (dot >= 0) and ((slash < 0) or (dot > slash));
+}
+
+fn display_path(real: []u8) []u8 {
+    // Standard library modules (the runtime among them, in std/internal/runtime)
+    // show as std/<path> wherever the library lives, so that symbol names
+    // (prefixed with the display path) are the same from any directory
+    if not std_real_done {
+        std_real_done = true;
+        if g_std_dir.len > 0 {
+            let r = u.real_path(g_std_dir);
+            if not u.isnos(r) {
+                std_real = r;
+            }
+        }
+    }
+    let m = std_real.len;
+    if (m > 0) and (real.len > m) and u.starts(real, std_real) and (real[m] == '/') {
+        return u.f1("std/%s", real[m + 1..]);
+    }
+    let n = g_cwd.len;
+    if (n > 0) and (real.len > n) and u.starts(real, g_cwd) and (real[n] == '/') {
+        let rel = real[n + 1..];
+        // std/ names the library's own modules (and prefixes their symbols):
+        // another copy in the working directory must not pass for them
+        if u.starts(rel, "std/") {
+            return u.cat2("./", rel);
+        }
+        return u.dup(rel);
+    }
+    return real;
+}
+
+// Whether an import path is relative and uses only '/' between its parts
+// (not "/a", "C:/a" or "a\b"), so that it means the same on every host.
+// A directory as display_path shows the files in it: "." for the working
+// directory, "std" for the library's.
+fn display_dir(real: []u8) []u8 {
+    let shown = display_path(u.cat2(real, "/"));
+    if shown.len <= 1 {
+        return ".";
+    }
+    return shown[..shown.len - 1];
+}
+
+fn relative_import(ip: []u8) bool {
+    if (ip.len == 0) or (ip[0] == '/') or ((ip.len >= 2) and (ip[1] == ':')) {
+        return false;
+    }
+    return u.find(ip, '\\') < 0;
+}
+
+// Whether the part of an import path after "std/" or "pkg:name/" is relative,
+// uses only '/' between its parts and has no ".." part, so that it stays in
+// the library or package.
+fn library_import(sub: []u8) bool {
+    if not relative_import(sub) {
+        return false;
+    }
+    let mut start: usize = 0;
+    for i in 0..sub.len + 1 {
+        if (i == sub.len) or (sub[i] == '/') {
+            if u.str_eq(sub[start..i], "..") {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    return true;
+}
+
+// A module under a directory named `internal` may be imported only from the
+// tree rooted at that directory's parent (as in Go): std/internal/... only
+// from std. Returns the length of the parent's path in `target` when
+// `importer` is outside it, else 0.
+fn internal_violation(importer: []u8, target: []u8) usize {
+    let pat = "/internal/";
+    let mut k: usize = 0;
+    let mut found = false;
+    let mut i: usize = 0;
+    while i + pat.len <= target.len {
+        if u.str_eq(target[i..i + pat.len], pat) {
+            k = i;
+            found = true;
+        }
+        i += 1;
+    }
+    if not found {
+        return 0;
+    }
+    if (importer.len > k) and u.str_eq(importer[..k], target[..k]) and (importer[k] == '/') {
+        return 0;
+    }
+    return k;
+}
+
+pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
+    let rp = real_path_of(fs_path);
+    if u.isnos(rp) {
+        if u.notnil(from) {
+            _ = dg.err(from.*, "E0211", u.f1("cannot find module '%s'", fs_path));
+        }
+        return u.nil.[ast.Module]();
+    }
+    let key = u.intern(rp);
+    let found = mod_by_path.get(key);
+    if u.notnil(found) {
+        if (mod_state.get(key) == 1) and u.notnil(from) {
+            _ = dg.err(from.*, "E0210", u.f1("import cycle: '%s' is already being imported", display_path(rp)));
+        }
+        return found;
+    }
+    let kept = base_by_path.get(key);
+    if u.notnil(kept) {
+        take_base(kept);
+        return kept;
+    }
+    let f = u.load_file(rp, u.dup(display_path(rp)));
+    if u.isnil(f) {
+        if u.notnil(from) {
+            _ = dg.err(from.*, "E0211", u.f1("cannot read module '%s'", fs_path));
+        }
+        return u.nil.[ast.Module]();
+    }
+    let m = parser.parse_module(f);
+    m.path = key;
+    m.pkg = pkg.for_file(rp);
+    mod_by_path.put(key, m);
+    mod_state.put(key, 1);
+    let mut dir = rp;
+    let slash = u.rfind(rp, '/');
+    if slash >= 0 {
+        dir = u.dup(rp[0..@int_cast(usize, slash)]);
+    }
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind != ast.D_IMPORT) or u.isnos(d.import_path) {
+            continue;
+        }
+        let ip = d.import_path;
+        let ext = u.pick(has_ext(ip), "", ".ax");
+        let mut path = u.nosym();
+        if u.starts(ip, "pkg:") {
+            let ps = u.find(ip[4..], '/');
+            if (ps >= 0) and not library_import(ip[4 + @int_cast(usize, ps) + 1..]) {
+                _ = dg.err(d.import_path_span, "E0218",
+                           u.f2("import path '%s' must name a module in package '%s', with '/' between its parts", ip,
+                                ip[4..4 + @int_cast(usize, ps)]));
+                continue;
+            }
+            path = pkg.resolve_import(m.pkg, ip, d.import_path_span);
+            if u.isnos(path) {
+                continue;
+            }
+        } else if u.starts(ip, "std/") {
+            if not library_import(ip[4..]) {
+                _ = dg.err(d.import_path_span, "E0218",
+                           u.f1("import path '%s' must name a module in the standard library, with '/' between its parts",
+                                ip));
+                continue;
+            }
+            path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
+        } else if not relative_import(ip) {
+            _ = dg.err(d.import_path_span, "E0218",
+                       u.f1("import path '%s' must be relative, with '/' between its parts", ip));
+            continue;
+        } else {
+            path = u.f3("%s/%s%s", dir, ip, ext);
+        }
+        let tp = real_path_of(path);
+        if not u.isnos(tp) {
+            let k = internal_violation(rp, tp);
+            if k > 0 {
+                _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under '%s' may import it",
+                                                             display_path(tp), display_dir(tp[..k])));
+                continue;
+            }
+        }
+        d.imported = load_module(path, &d.import_path_span);
+    }
+    mod_state.put(key, 2);
+    g_prog.modules.push(m);
+    return m;
+}
+
+// ---------------------------------------------------------------------------
+// Modules checked before (axiom lsp's session, lsp.ax). The main thread
+// keeps the modules that a check found clean (modl.clean), and a later run
+// on any thread takes them as they are: the run comes to one where loading
+// it would, takes its imports (kept too) the same way, and checks only the
+// modules it loads. Every program-wide step (error codes, exported names,
+// the globals' total size) still sees them, so that the run reports what a
+// run from nothing would.
+// ---------------------------------------------------------------------------
+let mut base_by_path: u.SymMap.[*mut ast.Module] = u.SymMap.[*mut ast.Module].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0), cap: 0, len: 0 };
+
+// Takes kept module m (and the kept modules it imports) into this run.
+fn take_base(m: *mut ast.Module) void {
+    mod_by_path.put(m.path, m);
+    mod_state.put(m.path, 1);
+    u.note_file(m.file.id);
+    if u.notnil(m.pkg) {
+        _ = pkg.for_file(m.path);  // (its manifest is read again, as loading it would)
+    }
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) and u.isnil(mod_by_path.get(d.imported.path)) {
+            take_base(d.imported);
+        }
+    }
+    mod_state.put(m.path, 2);
+    g_prog.modules.push(m);
+}
+
+/// On the main thread: keeps m, which this run checked, for later runs.
+pub fn admit(m: *mut ast.Module) void {
+    m.base = true;
+    base_by_path.put(m.path, m);
+}
+
+/// On the main thread: no longer takes the module kept for `path` (nor
+/// does any later run).
+pub fn evict(path: []u8) void {
+    if u.notnil(base_by_path.get(path)) {
+        base_by_path.put(path, u.nil.[ast.Module]());
+    }
+}
+
+/// The module kept for `path` (a real path, interned), or nil.
+pub fn kept_module(path: []u8) *mut ast.Module {
+    return base_by_path.get(path);
+}
+
+// Whether error `name` is declared in m or a module it imports.
+fn declares_error(m: *mut ast.Module, name: []u8, seen: *mut u.SymMap.[bool]) bool {
+    if seen.get(m.path) {
+        return false;
+    }
+    seen.put(m.path, true);
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if d.kind == ast.D_ERROR {
+            for j in 0..d.error_names.len {
+                if u.same(d.error_names.get(j), name) {
+                    return true;
+                }
+            }
+        } else if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) and declares_error(d.imported, name, seen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Which modules of this run, checked by it, a later run may take as they
+/// are: those that nothing was reported about, whose imports may be taken
+/// too (or are kept), whose text is the file's (not an editor's unsaved
+/// one), and that name only error names they declare or import (error
+/// names are the program's: in a program without the declaring module
+/// they are errors). Nothing, if something was reported about a file that
+/// is no module's (a package's manifest). In the order of g_prog.modules.
+pub fn clean() u.List.[*mut ast.Module] {
+    let mut out = u.List.[*mut ast.Module].empty();
+    let mut ok = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+    if g_error_use_unknown {
+        return out;
+    }
+    // the files reported about (1), and those of them that are modules' (2)
+    let bad = u.newn.[u8](u.g_files.len + 1);
+    for d in dg.all() {
+        if (d.span.file < 0) or (@int_cast(usize, d.span.file) >= u.g_files.len) {
+            return out;
+        }
+        bad[@int_cast(usize, d.span.file)] = 1;
+    }
+    for mi in 0..g_prog.modules.len {
+        let id = @int_cast(usize, g_prog.modules.get(mi).file.id);
+        if bad[id] != 0 {
+            bad[id] = 2;
+        }
+    }
+    for b in bad {
+        if b == 1 {
+            return out;
+        }
+    }
+    for mi in 0..g_prog.modules.len {
+        let m = g_prog.modules.get(mi);
+        if m.base {
+            ok.put(m.path, true);
+            continue;
+        }
+        if bad[@int_cast(usize, m.file.id)] != 0 {
+            continue;
+        }
+        let ov = u.overlay_text(m.path);
+        if not u.isnos(ov) {
+            if u.overlay_edited(m.path) {
+                continue;
+            }
+            let disk = u.read_file(m.path);
+            if u.isnos(disk) or not u.str_eq(disk, ov) {
+                continue;
+            }
+        }
+        let mut good = true;
+        for i in 0..m.decls.len {
+            let d = m.decls.get(i);
+            if (d.kind == ast.D_IMPORT) and (u.isnil(d.imported) or not ok.get(d.imported.path)) {
+                good = false;
+            }
+        }
+        for i in 0..m.error_uses.len {
+            let n = m.error_uses.get(i);
+            if not good or u.same(n, u.intern("OutOfMemory")) or u.same(n, u.intern("Overflow")) {
+                continue;
+            }
+            let mut seen = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+            good = declares_error(m, n, &mut seen);
+        }
+        if good {
+            ok.put(m.path, true);
+            out.push(m);
+        }
+    }
+    return out;
+}
+
+// error_code_of, for the module being checked (which then depends on the
+// name being declared somewhere: clean).
+
+// An error name was looked up outside any module's code (then nothing of
+// the run is clean).
+pub threadlocal let mut g_error_use_unknown: bool = false;
+pub fn is_std_module(m: *mut ast.Module) bool {
+    if g_std_dir.len == 0 {
+        return false;
+    }
+    let rp = u.real_path(g_std_dir);
+    if u.isnos(rp) {
+        return false;
+    }
+    let n = rp.len;
+    return (m.path.len > n) and u.starts(m.path, rp) and (m.path[n] == '/');
+}
+
+/// What a worker thread starts from (units.ax): the main thread's program.
+pub struct WorkerStart {
+    prog: *mut Program,
+    std_dir: []u8,
+    cwd: []u8,
+}
+
+pub fn worker_start() WorkerStart {
+    return WorkerStart.{ prog: g_prog, std_dir: g_std_dir, cwd: g_cwd };
+}
+
+/// On a worker thread, after u.worker_begin.
+pub fn worker_begin(ws: *WorkerStart) void {
+    g_prog = ws.prog;
+    g_std_dir = ws.std_dir;
+    g_cwd = ws.cwd;
+}
+
+// Load, parse, resolve and type-check the program rooted at `path`.

@@ -50,7 +50,9 @@ import "c/cc.ax" as cfront;
 import "c/cgen_atomic.ax" as cga;
 import "c/copts.ax" as cop;
 import "c/cstrip.ax" as cstrip;
-import "codegen.ax" as cg;
+import "cgctx.ax" as cx;
+import "cgmain.ax" as cgm;
+import "cgrt.ax" as cgrt;
 import "coff.ax" as coff;
 import "diag.ax" as dg;
 import "elf.ax" as elf;
@@ -65,6 +67,7 @@ import "lsp.ax" as lsp;
 import "lstub.ax" as lstub;
 import "macho.ax" as mo;
 import "mlink.ax" as ml;
+import "modload.ax" as modl;
 import "nlink.ax" as nl;
 import "package.ax" as pkg;
 import "plink.ax" as pl;
@@ -223,8 +226,8 @@ fn link_native(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
         os.push(linkin.g_objs.get(k));
     }
     let mut names = u.List.[[]u8].empty();
-    for k in 0..cg.g_link_libs.len {
-        names.push(cg.g_link_libs.get(k));
+    for k in 0..cx.g_link_libs.len {
+        names.push(cx.g_link_libs.get(k));
     }
     for k in 0..linkin.g_names.len {
         names.push(linkin.g_names.get(k));
@@ -267,8 +270,8 @@ fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
     for k in 0..ms.len {
         us.push(ms.get(k));
     }
-    let o = wl.Options.{ stack_size: wasm_stack_size(), shared_memory: cg.g_threads, max_pages: 16384,
-                         exports: cg.g_export_names.items() };
+    let o = wl.Options.{ stack_size: wasm_stack_size(), shared_memory: cx.g_threads, max_pages: 16384,
+                         exports: cx.g_export_names.items() };
     let bytes = wl.link(us.items(), &o);
     if u.isnos(bytes) {
         return 1;
@@ -351,7 +354,7 @@ struct Options {
     target: []u8,
     emit: []u8,
     json: bool,
-    co: *mut cg.CgOptions,
+    co: *mut cx.CgOptions,
     link_inputs: u.List.[[]u8],
     ax_links: u.List.[[]u8],  // --link=<file.ax>
     feature_args: u.List.[[]u8],
@@ -375,7 +378,7 @@ struct Options {
 fn new_options(cmd: []u8) Options {
     let testing = u.str_eq(cmd, "test");
     let profiling = u.str_eq(cmd, "profile");
-    let co = u.new.[cg.CgOptions]();
+    let co = u.new.[cx.CgOptions]();
     co.stack_traces = true;
     co.cpu = u.nosym();
     let build = u.str_eq(cmd, "build") or testing or profiling;
@@ -603,7 +606,7 @@ fn clang_compile(o: *Options, p: []u8, k: usize) []u8 {
               "-mmutable-globals"] {
         av.push(c);
     }
-    if cg.g_threads {
+    if cx.g_threads {
         av.push("-matomics");
     }
     for j in 0..o.inc_flags.len {
@@ -1004,7 +1007,7 @@ fn check_c_options(o: *Options) bool {
     // first input is C) takes none of them.
     let ax_root = not is_c_source(o.input);
     let mut bad = u.nosym();
-    if (o.co.overflow != cg.OVF_WRAP) and not ax_root {
+    if (o.co.overflow != cx.OVF_WRAP) and not ax_root {
         bad = "--overflow";  // (C's signed overflow is undefined; unsigned wraps)
     } else if o.co.sanitize_address {
         bad = "--sanitize=address";
@@ -1070,11 +1073,11 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
         } else if u.str_eq(a, "--release") {
             // once --overflow=saturate: no build mode changes semantics
         } else if u.str_eq(a, "--overflow=wrap") {
-            co.overflow = cg.OVF_WRAP;
+            co.overflow = cx.OVF_WRAP;
         } else if u.str_eq(a, "--overflow=trap") {
-            co.overflow = cg.OVF_TRAP;
+            co.overflow = cx.OVF_TRAP;
         } else if u.str_eq(a, "--overflow=saturate") {
-            co.overflow = cg.OVF_SATURATE;
+            co.overflow = cx.OVF_SATURATE;
         } else if u.starts(a, "--emit=") {
             o.emit = a[7..];
         } else if u.str_eq(a, "--stack-traces=on") {
@@ -1489,7 +1492,7 @@ fn run_lsp(args: [][]u8) i32 {
 fn compile(args: [][]u8) i32 {
     defer remove_cabi_unit();
     let mut o = new_options(args[1]);
-    cg.g_test_mode = o.testing;
+    cx.g_test_mode = o.testing;
     if not o.build and not u.str_eq(o.cmd, "check") and not o.ide_mode {
         usage();
         return 2;
@@ -1555,7 +1558,7 @@ fn compile(args: [][]u8) i32 {
         all_rt_modules(rt, threads_named(&o), &mut pkg_files);
         if pkg_files.len > start {
             let r = u.real_path(rt);
-            cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
+            cx.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
         }
     }
     if has_c(&o) and not has_rt(&pkg_files, "ldouble.ax") {
@@ -1643,7 +1646,7 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     }
     let object = (not exe and not cfront.has_main()) or shared;
     g_c_object = object;
-    cg.g_bare_object = object and (o.ax_links.len == 0);
+    cgm.g_bare_object = object and (o.ax_links.len == 0);
     let start = u.f2("%s/internal/runtime/%s", o.std_dir, u.pick(object, "c_object.ax", "c_start.ax"));
     if not u.file_exists(start) {
         return fatal(o.json, "E9003", u.f1("cannot find the C start-up module (%s)", start));
@@ -1720,7 +1723,7 @@ fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
     }
     if modules.len > start {
         let r = u.real_path(rt);
-        cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
+        cx.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
     }
     return ok;
 }
@@ -1991,17 +1994,17 @@ let mut g_rt_needed: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []
 // (sema has run), or of the modules beside a C program (--link=file.ax,
 // read as text: `fn name(` in an extern "C" block).
 fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
-    if u.notnil(sema.g_prog) {
+    if u.notnil(modl.g_prog) {
         // (the declarations of extern blocks are the program's host_fns)
-        for i in 0..sema.g_prog.host_fns.len {
-            let d = sema.g_prog.host_fns.get(i);
-            if d.extern_c and not sema.is_std_module(d.module) {
+        for i in 0..modl.g_prog.host_fns.len {
+            let d = modl.g_prog.host_fns.get(i);
+            if d.extern_c and not modl.is_std_module(d.module) {
                 out.push(d.name);
             }
         }
-        for i in 0..sema.g_prog.fns.len {
-            let d = sema.g_prog.fns.get(i);
-            if d.extern_c and not sema.is_std_module(d.module) {
+        for i in 0..modl.g_prog.fns.len {
+            let d = modl.g_prog.fns.get(i);
+            if d.extern_c and not modl.is_std_module(d.module) {
                 out.push(d.name);
             }
         }
@@ -2038,13 +2041,13 @@ fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
 // or -l libraries, whose code could refer to anything) is stripped of what
 // the units define and nothing reaches (c/cstrip.ax).
 fn set_strip(o: *Options) void {
-    cg.g_strip = u.str_eq(o.emit, "exe") and (((o.link_inputs.len == 0) and (o.link_flags.len == 0)) or g_own_inputs);
+    cx.g_strip = u.str_eq(o.emit, "exe") and (((o.link_inputs.len == 0) and (o.link_flags.len == 0)) or g_own_inputs);
     // (code the platform's compilers made may be linked with the program's,
     // by the system's linker or by ours (g_own_inputs): the C atomics that
     // are not lock-free use the standard out-of-line interface, whose
     // definitions here such code then shares, c/cgen_atomic.ax; ours keeps
     // them as what the objects refer to, c/cstrip.ax)
-    cga.g_outline = not cg.g_strip or g_own_inputs;
+    cga.g_outline = not cx.g_strip or g_own_inputs;
     cga.g_outline_exe = u.str_eq(o.emit, "exe") and cga.g_outline;
 }
 
@@ -2068,9 +2071,9 @@ fn check_c_units(o: *Options, c: *cop.COptions, lib_modules: bool) bool {
     _ = lib_modules;
     set_strip(o);
     let mut ax_main = false;
-    for i in 0..sema.g_prog.fns.len {
-        let d = sema.g_prog.fns.get(i);
-        if d.is_export and u.str_eq(d.name, "main") and (d.module == sema.g_prog.root) {
+    for i in 0..modl.g_prog.fns.len {
+        let d = modl.g_prog.fns.get(i);
+        if d.is_export and u.str_eq(d.name, "main") and (d.module == modl.g_prog.root) {
             ax_main = true;
         }
     }
@@ -2083,9 +2086,9 @@ fn check_c_units(o: *Options, c: *cop.COptions, lib_modules: bool) bool {
 fn axiom_names(o: *Options) u.List.[cfront.AxName] {
     _ = o;
     let mut xs = u.List.[cfront.AxName].empty();
-    for i in 0..sema.g_prog.fns.len {
-        let d = sema.g_prog.fns.get(i);
-        if d.is_export and not d.cabi and not u.str_eq(d.name, "main") and not sema.is_std_module(d.module) {
+    for i in 0..modl.g_prog.fns.len {
+        let d = modl.g_prog.fns.get(i);
+        if d.is_export and not d.cabi and not u.str_eq(d.name, "main") and not modl.is_std_module(d.module) {
             // (an export with structures by value: its C function is the
             // wrappers' unit's, header.ax: cabi_source)
             xs.push(cfront.AxName.{ name: d.name, span: d.name_span });
@@ -2108,19 +2111,19 @@ fn set_emit(o: *Options, final_link: bool) bool {
         // (macOS: an object or library is the platform toolchain's to link,
         // whose thread-locals are its descriptors: target.ax)
         tg.g_macos_tls_platform = true;
-        co.emit = cg.EMIT_OBJ;
-        cg.g_object_output = true;
+        co.emit = cx.EMIT_OBJ;
+        cx.g_object_output = true;
         isel.g_comdat = true;  // (link-once definitions in COMDAT groups)
         cfront.set_object_output(true);
         be.g_native_format = true;
         be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX) and not g_c_object;
     } else if u.str_eq(o.emit, "ir") {
-        co.emit = cg.EMIT_IR;
+        co.emit = cx.EMIT_IR;
     } else if u.str_eq(o.emit, "asm") {
         dg.emit_fatal(o.json, "E9001", "--emit=asm is not supported: use --emit=obj and a disassembler, or --emit=ir");
         return false;
     } else if final_link {
-        co.emit = cg.EMIT_OBJ;
+        co.emit = cx.EMIT_OBJ;
     } else {
         dg.emit_fatal(o.json, "E9001", u.f1("unknown --emit kind '%s'", o.emit));
         return false;
@@ -2181,9 +2184,9 @@ fn build_program(o: *mut Options) i32 {
     }
     if u.isnos(o.out) {
         let mut ext: []u8 = "";
-        if co.emit == cg.EMIT_IR {
+        if co.emit == cx.EMIT_IR {
             ext = ".ir";
-        } else if co.emit == cg.EMIT_ASM {
+        } else if co.emit == cx.EMIT_ASM {
             ext = ".s";
         } else if u.str_eq(o.emit, "lib") {
             ext = u.pick(tg.is_windows(), ".lib", ".a");
@@ -2199,18 +2202,18 @@ fn build_program(o: *mut Options) i32 {
             o.out = u.cat2("lib", o.out);
         }
     }
-    let host_fns = sema.g_prog.host_fns;
+    let host_fns = modl.g_prog.host_fns;
     for k in 0..host_fns.len {
         if u.str_eq(host_fns.get(k).name, "ax_thread_spawn") {
-            cg.g_threads = true;
+            cx.g_threads = true;
         }
     }
     // The wasm profiler reads the shadow stack from another thread, so the
     // program runs on a shared memory.
     if o.profiling and ty.g_target.is_wasm {
-        cg.g_threads = true;
+        cx.g_threads = true;
     }
-    if cg.g_threads and ty.g_target.is_wasm and not tg.has(tg.W_ATOMICS) {
+    if cx.g_threads and ty.g_target.is_wasm and not tg.has(tg.W_ATOMICS) {
         return fatal(o.json, "E9002", "threads on WebAssembly need the atomics extension (--features=+atomics)");
     }
     let mut objpath = o.out;
@@ -2222,7 +2225,7 @@ fn build_program(o: *mut Options) i32 {
     } else {
         co.out_path = o.out;
     }
-    cg.collect_link_names(co);
+    cgrt.collect_link_names(co);
     let n_user_inputs = o.link_inputs.len;
     let mut unit_objs = u.List.[[]u8].empty();
     if final_link and ty.g_target.is_wasm {
@@ -2458,7 +2461,7 @@ fn generate(o: *mut Options, objpath: []u8, final_link: bool, unit_objs: *mut u.
     // (C code and libraries are linked by the system's linker, which would
     // see the internal symbols of the parts' objects as global)
     be.g_parts = final_link and not separate and (((n_user_inputs == 0) and (o.link_flags.len == 0)) or g_own_inputs);
-    if not separate and not cg.codegen_program(co) {
+    if not separate and not cgm.codegen_program(co) {
         dg.emit(o.json, o.json);
         if final_link {
             _ = u.unlink(u.cz(objpath));
@@ -2477,7 +2480,7 @@ fn generate(o: *mut Options, objpath: []u8, final_link: bool, unit_objs: *mut u.
 fn link(o: *mut Options, objpath: []u8, n_user_inputs: usize, unit_objs: [][]u8) i32 {
     let mut rc: i32 = 0;
     let no_c = (n_user_inputs == 0) and (o.link_flags.len == 0);
-    let own_link = no_c and (cg.g_link_libs.len == 0);
+    let own_link = no_c and (cx.g_link_libs.len == 0);
     let mut native_own = false;
     if g_own_inputs and ty.g_target.is_wasm {
         // our own linker, with the WebAssembly objects and archives read
@@ -2555,8 +2558,8 @@ fn push_libs(o: *Options, av: *mut u.List.[[]u8]) void {
     for k in 0..o.link_flags.len {
         av.push(o.link_flags.get(k));
     }
-    for k in 0..cg.g_link_libs.len {
-        av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
+    for k in 0..cx.g_link_libs.len {
+        av.push(u.f1("-l%s", cx.g_link_libs.get(k)));
     }
     av.push("-o");
     av.push(o.out);
@@ -2586,14 +2589,14 @@ fn link_wasm_ld(o: *mut Options, objpath: []u8, rc: *mut i32) i32 {
     av.push("-z");
     av.push(u.f1("stack-size=%s", u.dec(@bit_cast(i64, wasm_stack_size()))));
     av.push("--export-memory");
-    if cg.g_threads {
+    if cx.g_threads {
         // Threads are instances sharing one memory, which the host creates.
         av.push("--shared-memory");
         av.push("--import-memory");
         av.push("--max-memory=1073741824");
     }
-    for k in 0..cg.g_export_names.len {
-        av.push(u.f1("--export=%s", cg.g_export_names.get(k)));
+    for k in 0..cx.g_export_names.len {
+        av.push(u.f1("--export=%s", cx.g_export_names.get(k)));
     }
     av.push(objpath);
     // C sources are compiled for wasm and linked into the same module
