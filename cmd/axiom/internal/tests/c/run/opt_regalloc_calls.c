@@ -13,20 +13,20 @@
 typedef struct node {
     struct node *l, *r;
     unsigned key;
-    long v;
+    long long v;
 } node;
 
 static node pool[512];
 static int used;
 static int grabs;
 
-__attribute__((noinline)) static void *grab(unsigned long n) {
+__attribute__((noinline)) static void *grab(unsigned long long n) {
     (void)n;
     grabs++;
     return &pool[used++];
 }
 
-static node *ins(node *t, unsigned key, long v) {
+static node *ins(node *t, unsigned key, long long v) {
     if (!t) {
         node *n = grab(sizeof *n);
         n->l = n->r = 0;
@@ -40,32 +40,32 @@ static node *ins(node *t, unsigned key, long v) {
     return t;
 }
 
-static long fold(const node *t, long h) {
+static long long fold(const node *t, long long h) {
     if (!t) return h;
     h = fold(t->l, h);
-    h = h * 31 + (long)t->key * 7 + t->v;
+    h = h * 31 + (long long)t->key * 7 + t->v;
     return fold(t->r, h);
 }
 
-static long calls;
-__attribute__((noinline)) static long tally(long x) {
+static long long calls;
+__attribute__((noinline)) static long long tally(long long x) {
     calls++;
     return x ^ (x >> 3);
 }
 
-static long loop_calls(long n, long k) {
-    long s = 0;
-    for (long i = 0; i < n; i++) s += tally(i * k);
+static long long loop_calls(long long n, long long k) {
+    long long s = 0;
+    for (long long i = 0; i < n; i++) s += tally(i * k);
     return s;
 }
 
 /* bad: words differing from the next, and two even words in a row; the
    even words are counted into *nfree */
-__attribute__((noinline)) static unsigned long walk(const unsigned long *a, unsigned long n, int *nfree) {
+__attribute__((noinline)) static unsigned long long walk(const unsigned long long *a, unsigned long long n, int *nfree) {
     int bad = 0, nf = 0;
     _Bool prev = 0;
-    for (unsigned long i = 0; i < n; i++) {
-        unsigned long w = a[i];
+    for (unsigned long long i = 0; i < n; i++) {
+        unsigned long long w = a[i];
         if (w != a[i + 1]) bad++;
         _Bool f = !(w & 1);
         if (f && prev) bad++;
@@ -76,13 +76,13 @@ __attribute__((noinline)) static unsigned long walk(const unsigned long *a, unsi
     return bad;
 }
 
-__attribute__((noinline)) static long op_a(long x) { return x * 3 + 1; }
-__attribute__((noinline)) static long op_b(long x, long y) { return x - y * 2; }
-__attribute__((noinline)) static void op_c(long *p) { *p += 100; }
+__attribute__((noinline)) static long long op_a(long long x) { return x * 3 + 1; }
+__attribute__((noinline)) static long long op_b(long long x, long long y) { return x - y * 2; }
+__attribute__((noinline)) static void op_c(long long *p) { *p += 100; }
 
-static long mix(const unsigned char *code, long n) {
-    long a = 0, b = 1, c = 2, d = 3, e = 4, f = 5, g = 6, h = 7, cnt = 0;
-    for (long i = 0; i < n; i++) {
+static long long mix(const unsigned char *code, long long n) {
+    long long a = 0, b = 1, c = 2, d = 3, e = 4, f = 5, g = 6, h = 7, cnt = 0;
+    for (long long i = 0; i < n; i++) {
         switch (code[i] & 7) {
         case 0: a = op_a(a + i); break;
         case 1: b = op_b(b, i); cnt++; break;
@@ -100,9 +100,9 @@ static long mix(const unsigned char *code, long n) {
 /* a stack machine: sp and pc live across the calls of some arms, and the
    loop is left from its middle (stores of a split value at the start of
    the blocks an exit edge leads to) */
-__attribute__((noinline)) static long vm_bin(int op, long a, long b) { return op ? a - b : a + b; }
-static long vm(const unsigned char *code, int n) {
-    long stack[64];
+__attribute__((noinline)) static long long vm_bin(int op, long long a, long long b) { return op ? a - b : a + b; }
+static long long vm(const unsigned char *code, int n) {
+    long long stack[64];
     int sp = 0, pc = 0;
     for (;;) {
         if (pc >= n) return sp > 0 ? stack[sp - 1] : -1;
@@ -124,10 +124,10 @@ static long vm(const unsigned char *code, int n) {
 /* x and y, live across the call only on the arm that seldom runs, are
    stored at that arm's start (not at the end of the block branching to it)
    and reloaded after the call */
-__attribute__((noinline)) static long cold_arm(long x, long y) {
+__attribute__((noinline)) static long long cold_arm(long long x, long long y) {
     x = x * 3 + y;
     if ((x & 1023) == 7) {
-        long t = tally(y);
+        long long t = tally(y);
         calls += t;
         return x * 2 + y;
     }
@@ -139,7 +139,7 @@ int main(void) {
     unsigned x = 12345;
     for (int i = 0; i < 400; i++) {
         x = x * 1103515245u + 12345u;
-        t = ins(t, (x >> 16) % 300, (long)i - 200);
+        t = ins(t, (x >> 16) % 300, (long long)i - 200);
     }
     t = ins(t, 0, -9223372036854775807L - 1);
     t = ins(t, 4294967295u, 9223372036854775807L);
@@ -153,13 +153,13 @@ int main(void) {
     print_i64(loop_calls(1000, -7));
     print_i64(calls);
 
-    static unsigned long w[40];
-    for (int i = 0; i < 40; i++) w[i] = (unsigned long)(i * i / 3) | (i % 5 == 0);
+    static unsigned long long w[40];
+    for (int i = 0; i < 40; i++) w[i] = (unsigned long long)(i * i / 3) | (i % 5 == 0);
     w[39] = ~0ul;
     int nf = -1;
     print_u64(walk(w, 0, &nf));
     print_i64(nf);
-    for (unsigned long n = 1; n <= 5; n++) {
+    for (unsigned long long n = 1; n <= 5; n++) {
         print_u64(walk(w, n, &nf));
         print_i64(nf);
     }
