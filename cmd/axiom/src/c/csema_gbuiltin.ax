@@ -224,7 +224,7 @@ let MATH_N: [9]usize = [1, 1, 1, 1, 1, 1, 1, 2, 3];
 let CLASS: [7][]u8 = ["isnan", "isinf", "isfinite", "signbit", "isnormal", "isinf_sign", "fpclassify"];
 let CMPS: [6][]u8 = ["isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered"];
 
-let OTHERS: [33][]u8 = ["__builtin_cpu_supports", "__builtin_cpu_is", "__builtin_cpu_init", "__builtin_setjmp",
+let OTHERS: [43][]u8 = ["__builtin_cpu_supports", "__builtin_cpu_is", "__builtin_cpu_init", "__builtin_setjmp",
                         "__builtin_longjmp", "__builtin_ia32_pause", "__builtin_ia32_mfence", "__builtin_ia32_lfence",
                         "__builtin_ia32_sfence", "__builtin_expect", "__builtin_expect_with_probability",
                         "__builtin_trap", "__builtin_constant_p", "__builtin_choose_expr",
@@ -233,7 +233,9 @@ let OTHERS: [33][]u8 = ["__builtin_cpu_supports", "__builtin_cpu_is", "__builtin
                         "__builtin_sub_overflow", "__builtin_mul_overflow", "__builtin_add_overflow_p",
                         "__builtin_sub_overflow_p", "__builtin_mul_overflow_p", "__builtin_alloca",
                         "__builtin_alloca_with_align", "__builtin_frame_address", "__builtin_return_address",
-                        "__builtin_prefetch", "__builtin_assume_aligned", "__builtin_abs"];
+                        "__builtin_prefetch", "__builtin_assume_aligned", "__builtin_abs", "__builtin_classify_type",
+                        "__builtin_conj", "__builtin_conjf", "__builtin_conjl", "__builtin_creal", "__builtin_crealf",
+                        "__builtin_creall", "__builtin_cimag", "__builtin_cimagf", "__builtin_cimagl"];
 
 let CONSTS: [12][]u8 = ["__builtin_inf", "__builtin_inff", "__builtin_infl", "__builtin_huge_val",
                         "__builtin_huge_valf", "__builtin_huge_vall", "__builtin_nan", "__builtin_nanf",
@@ -590,6 +592,67 @@ pub fn call(e: *mut cast.Expr) bool {
             e.soft = true;
             e.args.set(0, x);
         }
+        return true;
+    }
+    let cpart = complex_part(rest);
+    if cpart.op != 0 {
+        // __builtin_conj, creal, cimag (with f and l): <complex.h>'s
+        // functions as the GNU dialects' operators ~, __real__ and
+        // __imag__ on the argument converted to the complex type
+        if not arity(e, 1, 1) or is_err(arg(e, 0)) or not cty.is_arith(e.args.get(0).ty) {
+            if (e.args.len == 1) and not is_err(e.args.get(0)) {
+                cs.err(e.span, "C3082", u.f1("the argument of __builtin_%s must have an arithmetic type", rest));
+            }
+            _ = bad(e);
+            return true;
+        }
+        let x = cx.convert(e.args.get(0), cpart.ty);
+        e.kind = cast.ExprKind.UNARY;
+        e.op = cpart.op;
+        e.a = x;
+        e.args.clear();
+        e.ty = u.nil.[cty.CType]();
+        _ = cx.check(e);
+        return true;
+    }
+    if u.str_eq(rest, "classify_type") {
+        // the class of the argument's type (after the conversions of an
+        // argument; not evaluated), as the GNU dialects number them: void
+        // 0, integer 1, _Bool 4, pointer 5, floating 8, complex 9,
+        // structure 12, union 13, bit-precise 18, another -1
+        if not arity(e, 1, 1) {
+            _ = bad(e);
+            return true;
+        }
+        cs.unevaluated(1);
+        let x = cx.rv(e.args.get(0));
+        cs.unevaluated(-1);
+        if is_err(x) {
+            _ = bad(e);
+            return true;
+        }
+        let t = x.ty.unq;
+        let mut v: i64 = -1;
+        if t.kind == cty.TK_VOID {
+            v = 0;
+        } else if t.kind == cty.TK_BOOL {
+            v = 4;
+        } else if t.kind == cty.TK_BITINT {
+            v = 18;
+        } else if cty.is_integer(t) {
+            v = 1;
+        } else if cty.is_pointer(t) {
+            v = 5;
+        } else if cty.is_complex(t) {
+            v = 9;
+        } else if cty.is_floating(t) {
+            v = 8;
+        } else if t.kind == cty.TK_STRUCT {
+            v = 12;
+        } else if t.kind == cty.TK_UNION {
+            v = 13;
+        }
+        fold_int(e, cty.t_int, @bit_cast(u64, v));
         return true;
     }
     if u.str_eq(rest, "choose_expr") {
@@ -1235,6 +1298,34 @@ fn no_effects(e: *cast.Expr) bool {
         }
     }
     return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+}
+
+struct CPart {
+    op: i32,
+    ty: *mut cty.CType,
+}
+
+// __builtin_conj, creal, cimag and their f and l forms: the operator and
+// the complex type; op 0 for another name.
+fn complex_part(rest: []u8) CPart {
+    let names = ["conj", "creal", "cimag"];
+    let ops = [ct.P_TILDE, ct.P_REAL, ct.P_IMAG];
+    for k in @as(usize, 0)..3 {
+        let n = names[k];
+        if u.starts(rest, n) {
+            let sfx = rest[n.len..];
+            if sfx.len == 0 {
+                return CPart.{ op: ops[k], ty: cty.t_cdouble };
+            }
+            if u.str_eq(sfx, "f") {
+                return CPart.{ op: ops[k], ty: cty.t_cfloat };
+            }
+            if u.str_eq(sfx, "l") {
+                return CPart.{ op: ops[k], ty: cty.t_cldouble };
+            }
+        }
+    }
+    return CPart.{ op: 0, ty: cty.t_cdouble };
 }
 
 // May the code compute x, the operand of a __builtin_constant_p that is not
