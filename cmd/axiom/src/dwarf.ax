@@ -142,6 +142,10 @@ pub struct Unit {
     // func_section): each one's start symbol << 32 | its size; the unit
     // then has DW_AT_ranges, and .debug_aranges an entry for each
     ranges: u.List.[u64],
+    // base types of typed operations in .debug_loclists (dloc.LK_TEXPR):
+    // their operands' offsets in the part, sym the dloc.TY_*, which finish
+    // makes the offsets of those types' entries
+    lrefs: u.List.[Fix],
 }
 
 // An entry of the name index: its name (interned), tag, and offset in the
@@ -164,7 +168,7 @@ pub fn none() Unit {
                   voffs: u.List.[u64].empty(), tls_rel: 0, cies: [0; 4], size_fix: false, sums: u.List.[[16]u8].empty(),
                   nosum: false, names: u.List.[Named].empty(), abs_fns: u.List.[[]u8].empty(),
                   abs_map: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
-                  arefs: u.List.[Fix].empty(), ranges: u.List.[u64].empty() };
+                  arefs: u.List.[Fix].empty(), ranges: u.List.[u64].empty(), lrefs: u.List.[Fix].empty() };
 }
 
 fn new_part() Part {
@@ -1691,11 +1695,30 @@ fn same_fixes(a: *u.List.[SFix], b: *u.List.[SFix]) bool {
     return true;
 }
 
-// A datum's address in an expression of a stretch: at `off` in it.
+// A datum's address in an expression of a stretch: at `off` in it (or,
+// sym SFIX_TYPE + a dloc.TY_*, a typed operation's base type there).
 struct SFix {
     off: u64,
     sym: u32,
     add: i64,
+}
+
+const SFIX_TYPE: u32 = 0xffff_ff00;
+// DWARF expression operations (DWARF 5, 7.7.1) of dloc's expressions
+const OP_REGVAL_TYPE: u8 = 0xa5;
+const OP_DEREF_TYPE: u8 = 0xa6;
+const OP_CONST_TYPE: u8 = 0xa4;
+const OP_CONVERT: u8 = 0xa8;
+const OP_REINTERPRET: u8 = 0xa9;
+const OP_CONSTU: u8 = 0x10;
+const OP_CONST1U: u8 = 0x08;
+const OP_ENTRY_VALUE: u8 = 0xa3;
+
+// An operation without operands that dloc's expressions use: the
+// arithmetic, logical and stack operations.
+fn dloc_plain_op(o: u8) bool {
+    return (o == 0x14) or (o == 0x16) or (o == 0x17) or (o == 0x1a) or (o == 0x1b) or (o == 0x1c) or (o == 0x1e) or
+           (o == 0x1f) or (o == 0x21) or (o == 0x22) or (o == 0x24) or (o == 0x25) or (o == 0x26) or (o == 0x27);
 }
 
 // The expression of location x (one piece of it: no DW_OP_piece), with
@@ -1761,6 +1784,64 @@ fn loc_expr(d: *mut Unit, e: *mut bn.Bytes, fx: *mut u.List.[SFix], x: *dloc.VLo
         e.u8_(OP_WASM_LOCATION);
         e.u8_(0);
         e.uleb(@as(u64, @bit_cast(u32, x.reg)));
+        return true;
+    }
+    if kind == dloc.LK_TEXPR {
+        // (computed with typed operations: the base types' operands, which
+        // loc_entry and finish make their entries' offsets)
+        let at = @as(u64, e.len());
+        let mut rd = bn.reader(x.expr);
+        while not rd.at_end() {
+            let o = rd.u8_();
+            let mut ty: usize = 0;    // (the operand's offset in the expression + 1)
+            let mut tend: usize = 0;  // (and its end)
+            if (o == OP_REGVAL_TYPE) or (o == OP_DEREF_TYPE) {
+                if o == OP_REGVAL_TYPE {
+                    _ = rd.uleb();
+                } else {
+                    _ = rd.u8_();
+                }
+                ty = rd.pos + 1;
+                _ = rd.uleb();
+                tend = rd.pos;
+            } else if o == OP_CONST_TYPE {
+                ty = rd.pos + 1;
+                _ = rd.uleb();
+                tend = rd.pos;
+                let n = @as(usize, rd.u8_());
+                rd.pos += n;
+            } else if (o == OP_CONVERT) or (o == OP_REINTERPRET) {
+                ty = rd.pos + 1;
+                _ = rd.uleb();
+                tend = rd.pos;
+            } else if (o == OP_CONSTU) or (o == OP_BREGX) {
+                _ = rd.uleb();
+                if o == OP_BREGX {
+                    _ = rd.sleb();
+                }
+            } else if (o == OP_CONSTS) or (o == OP_FBREG) or ((o >= OP_BREG0) and (o < OP_BREG0 + 32)) {
+                _ = rd.sleb();
+            } else if (o == OP_CONST1U) or (o == OP_DEREF_SIZE) {
+                _ = rd.u8_();
+            } else if o == OP_ENTRY_VALUE {
+                let n = rd.uleb();
+                rd.pos += @truncate(usize, n);
+            } else if not dloc_plain_op(o) {
+                return false;  // (an operation not of dloc's)
+            }
+            if rd.bad or (rd.pos > x.expr.len) {
+                return false;
+            }
+            if (ty > 0) and (tend == ty - 1 + dloc.TY_PAD) and (x.expr[ty - 1] != 0) {
+                fx.push(SFix.{ off: at + @as(u64, ty - 1), sym: SFIX_TYPE + @as(u32, x.expr[ty - 1] & 0x7f), add: 0 });
+            } else if (ty > 0) and (x.expr[ty - 1] != 0) {
+                return false;  // (a base type operand dloc did not make)
+            }
+        }
+        for b in x.expr {
+            e.u8_(b);
+        }
+        e.u8_(OP_STACK_VALUE);
         return true;
     }
     if kind == dloc.LK_EXPR {
@@ -2080,6 +2161,10 @@ fn loc_entry(d: *mut Unit, f: *Func, sg: *Seg, start: u64, end: u64) void {
     let at = @as(u64, p.b.len());
     p.b.put(ex);
     for x in sg.fx.items() {
+        if x.sym >= SFIX_TYPE {
+            d.lrefs.push(Fix.{ off: at + x.off, kind: FX_SEC, sym: x.sym - SFIX_TYPE, addend: 0 });
+            continue;
+        }
         p.fx.push(Fix.{ off: at + x.off, kind: FX_ADDR, sym: x.sym, addend: x.add });
     }
 }
@@ -3007,6 +3092,7 @@ fn finish(d: *mut Unit, text_size: u64) void {
         info.b.set_u32(@truncate(usize, x.off + hn), @bit_cast(u64, x.addend) + hn);
     }
     d.drefs.deinit();
+    typed_bases(d, toff, hn);
     for sec in [D_RNGLISTS, D_LOCLISTS] {
         let lb = &mut d.parts[sec].b;
         if lb.len() > 0 {
@@ -3116,6 +3202,45 @@ fn size_ref(d: *mut Unit, p: *mut Part, n: u64, text_size: u64) void {
 }
 
 // Puts `h` (bytes and fixups) before `p`'s.
+// The base types the typed operations of the unit's locations name
+// (lrefs: dloc.TY_*): their operands become the offsets of the unit's own
+// base types of that encoding and size (toff, after a header of hn bytes),
+// or of entries made for them at the end of the unit.
+fn typed_bases(d: *mut Unit, toff: []u64, hn: u64) void {
+    if d.lrefs.len == 0 {
+        return;
+    }
+    let encs: [7]u8 = [0, 4, 4, 5, 5, 7, 7];  // DW_ATE_float, DW_ATE_signed, DW_ATE_unsigned
+    let sizes: [7]u64 = [0, 4, 8, 4, 8, 4, 8];
+    let cnames: [7][]u8 = ["", "float", "double", "int", "long", "unsigned int", "unsigned long"];
+    let anames: [7][]u8 = ["", "f32", "f64", "i32", "i64", "u32", "u64"];
+    let mut at: [7]u64 = [0; 7];
+    for x in d.lrefs.items() {
+        let k = @as(usize, x.sym);
+        if (k == 0) or (k >= 7) {
+            continue;
+        }
+        if at[k] == 0 {
+            for t in 0..@min(dbi.types.len, toff.len) {
+                let y = dbi.types.at(t);
+                if (y.kind == dbi.DK_BASE) and (y.bits == 0) and (y.enc == encs[k]) and (y.size == sizes[k]) {
+                    at[k] = toff[t] + hn;
+                    break;
+                }
+            }
+        }
+        if at[k] == 0 {
+            at[k] = @as(u64, ib(d).len());
+            ib(d).uleb(AB_BASE);
+            strp(d, u.pick(dbi.c_version >= 0, cnames[k], anames[k]));
+            ib(d).uleb(sizes[k]);
+            ib(d).u8_(encs[k]);
+        }
+        d.parts[D_LOCLISTS].b.set_uleb_n(@truncate(usize, x.off), at[k], dloc.TY_PAD);
+    }
+    d.lrefs.deinit();
+}
+
 fn prepend(p: *mut Part, h: *mut Part) void {
     let n = @as(u64, h.b.len());
     for k in 0..p.fx.len {

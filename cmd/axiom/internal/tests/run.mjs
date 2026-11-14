@@ -42,7 +42,7 @@ import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed } from './dwarf.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -2970,7 +2970,11 @@ if (!skipPlatform) {
       fs.writeFileSync(src, 'volatile long sink;\n__attribute__((noinline)) void g(long v) { sink = v; }\n' +
         '__attribute__((noinline)) long f(long x, long y, int i) {\n    long p = x * y;\n    g(p);\n' +
         '    long q = (long)(i << 3) + x;\n    g(q);\n    g(0);\n    g(1);\n    return x + y + i;\n}\n' +
-        'int main(void) { return (int)f(sink, sink + 3, (int)sink); }\n');
+        'volatile double dsink;\n__attribute__((noinline)) void gd(double v) { dsink = v; }\n' +
+        '__attribute__((noinline)) double fd(double x, double y, long n) {\n    double fprod = x * y;\n' +
+        '    double fu = fprod + 1.25;\n    double fhalf = (double)n * 0.5;\n    double fv = fhalf - 3.0;\n' +
+        '    gd(x);\n    gd(y);\n    gd(fu);\n    gd(fv);\n    return x;\n}\n' +
+        'int main(void) { return (int)f(sink, sink + 3, (int)sink) + (int)fd(dsink, dsink, sink); }\n');
       const o = path.join(tmp, `debug-computed-${t}`, 'prog');
       fs.mkdirSync(path.dirname(o), { recursive: true });
       const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
@@ -2978,14 +2982,37 @@ if (!skipPlatform) {
         { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
       if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
       const dw = readDwarf(loadImage(fs.readFileSync(o)));
-      const locs = new Map();
-      const walk = (d) => {
-        if (d.tag === 0x34 && typeof d.attrs.get(0x02) === 'number') locs.set(d.attrs.get(0x03), locList(dw, d.attrs.get(0x02)));
-        d.children.forEach(walk);
-      };
-      for (const u of dw.units) walk(u.die);
+      const locs = new Map(), lunit = new Map();
       let seed = 12345n;
       const rnd = () => { seed = (seed * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n); return BigInt.asIntN(64, seed); };
+      const walk = (d, u) => {
+        if (d.tag === 0x34 && typeof d.attrs.get(0x02) === 'number') { locs.set(d.attrs.get(0x03), locList(dw, d.attrs.get(0x02))); lunit.set(d.attrs.get(0x03), u); }
+        d.children.forEach((c) => walk(c, u));
+      };
+      for (const u of dw.units) walk(u.die, u);
+      // floating-point values (fd's fprod, fhalf): computed by typed operations
+      // where the system's debugger evaluates them (x86-64), from base
+      // types of the unit; elsewhere none
+      const typed = (l) => [0xa4, 0xa5, 0xa6, 0xa8, 0xa9].some((op) => l.expr.includes(op));
+      for (const [name, want] of [['fprod', (fr, rg, e) => fr[e[1]] * fr[e[3 + 4 + 1]]], ['fhalf', (fr, rg, e) => Number(rg[e[0] - 0x70]) * 0.5]]) {
+        const ls = (locs.get(name) || []).filter(typed), un = lunit.get(name);
+        const base = (t) => { const d = un.dies.get(un.off + t); return d && d.tag === 0x24 ? { enc: d.attrs.get(0x3e), size: d.attrs.get(0x0b) } : null; };
+        if (t !== 'x86_64') { if (ls.length) return `${name}: typed operations on ${t}`; continue; }
+        // (fprod: DW_OP_regval_type xmmA, DW_OP_regval_type xmmB, DW_OP_mul; fhalf:
+        // DW_OP_bregN 0, DW_OP_convert to a signed type of 64 bits, to the
+        // double's, DW_OP_const_type 0.5, DW_OP_mul)
+        const sh = name === 'fprod' ? (e) => e[0] === 0xa5 && e[7] === 0xa5 && e[14] === 0x1e
+          : (e) => e[0] >= 0x70 && e[0] <= 0x8f && e[1] === 0 && e[2] === 0xa8;
+        const ok = ls.filter((l) => sh(l.expr));
+        if (!ok.length) return `${name}: never computed by typed operations (${(locs.get(name) || []).map((l) => Buffer.from(l.expr).toString('hex')).join(' ')})`;
+        for (const l of ok) {
+          for (let k = 0; k < 50; k++) {
+            const regs = Array.from({ length: 32 }, rnd), fr = Array.from({ length: 33 }, () => Number(rnd()) / 2 ** 40);
+            const v = evalTyped(l.expr, regs, fr, base);
+            if (v === null || v !== want(fr, regs, l.expr)) return `${name}: ${Buffer.from(l.expr).toString('hex')} gives ${v}, not ${want(fr, regs, l.expr)}`;
+          }
+        }
+      }
       for (const [name, rot] of [['p', true], ['q', false]]) {
         const ls = (locs.get(name) || []).filter((l) => l.expr.includes(0x9f) && l.expr[0] >= 0x70 && l.expr[0] <= 0x8f);
         if (!ls.length) return `${name}: never computed`;

@@ -85,7 +85,28 @@ pub const LK_SLOT: u8 = 2;
 pub const LK_ADDR: u8 = 3;
 pub const LK_GADDR: u8 = 4;  // the address of datum gsym, plus off
 pub const LK_EXPR: u8 = 5;
+pub const LK_TEXPR: u8 = 7;   // as LK_EXPR, with typed operations (DWARF 5, 2.5.1.6: base types, TY_*)
 pub const LK_WLOCAL: u8 = 6;  // WebAssembly: in local `reg` (DW_OP_WASM_location 0)   // computed from other values (expr): a value made from them that no place holds
+
+// The base types typed operations of an LK_TEXPR expression name
+// (DW_OP_regval_type, DW_OP_deref_type, DW_OP_const_type, DW_OP_convert,
+// DW_OP_reinterpret): each one's operand, the offset of a base type's entry
+// in the unit, is TY_PAD bytes of ULEB128 holding TY_* (padded with
+// continuation bits), which dwarf.ax replaces with the entry's offset
+// when it writes the location (the unit is laid out after the locations
+// are found).
+pub const TY_F32: u8 = 1;
+pub const TY_F64: u8 = 2;
+pub const TY_I32: u8 = 3;
+pub const TY_I64: u8 = 4;
+pub const TY_U32: u8 = 5;
+pub const TY_U64: u8 = 6;
+pub const TY_PAD: usize = 5;
+
+/// Floating-point values computed with DWARF's typed operations (LK_TEXPR):
+/// on for the targets whose system debugger evaluates them (x86-64 Linux:
+/// measured with hand-written expressions; the AArch64 one evaluates none).
+pub let mut g_typed: bool = false;
 
 /// What the target tells of its machine code.
 pub struct Tgt {
@@ -190,9 +211,10 @@ struct Val {
     add: i64,
     phi_blk: i32,  // a phi: its machine block (-1: not a phi, or none)
     phi_ops: u.List.[PhiIn],
-    // an integer operation of one or two operands (see expr_of): the IR
-    // operation (0: none), its operands (VALS indexes, -1: the constant ca,
-    // cb), its width and its first operand's in bits
+    // an integer or floating-point operation of one or two operands (see
+    // expr_of, fexpr_ops): the IR operation (0: none), its operands (VALS
+    // indexes, -1: the constant ca, cb), its width and its first operand's
+    // in bits
     xop: i32,
     xa: i32,
     xb: i32,
@@ -200,6 +222,7 @@ struct Val {
     cb: i64,
     bits: u32,
     abits: u32,
+    dep: i32,  // the least depth it was reached at (val_of: followed as far as from there)
 }
 
 // A phi's input: from IR block `from`, the value (VALS index, -1: none) or
@@ -397,7 +420,15 @@ fn cst_of(v: *ir.Value) i32 {
 fn val_of(v: *mut ir.Value, depth: i32) i32 {
     let k = by_val.get(key(@int_from_ptr(v)));
     if k > 0 {
-        return k - 1;
+        // (reached again nearer: followed again from there, as if first
+        // reached there, whichever path reached it first)
+        let me = k - 1;
+        let x = VALS.at(@int_cast(usize, me));
+        if (depth < x.dep) and (v.kind == ir.V_INST) {
+            x.dep = depth;
+            follow(v, me, depth);
+        }
+        return me;
     }
     let vk = v.kind;
     if vk == ir.V_PARAM {
@@ -422,7 +453,7 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
     }
     VALS.push(Val.{ v: v, def: u.nil.[mc.MInst](), def_op: 0, entry_reg: -1, stack_off: NO_LOC, obj: false, gsym: "",
                     base: -1, add: 0, phi_blk: -1, phi_ops: u.List.[PhiIn].empty(), xop: 0, xa: -1, xb: -1, ca: 0,
-                    cb: 0, bits: 0, abits: 0 });
+                    cb: 0, bits: 0, abits: 0, dep: depth });
     let me = @int_cast(i32, VALS.len - 1);
     by_val.put(key(@int_from_ptr(v)), me + 1);
     if vk == ir.V_GLOBAL {
@@ -432,6 +463,13 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
     if vk != ir.V_INST {
         return me;
     }
+    follow(v, me, depth);
+    return me;
+}
+
+// Follows instruction v (VALS index me), reached at `depth`, to the values
+// it is made from (val_of): its operation's operands, base, phi inputs.
+fn follow(v: *mut ir.Value, me: i32, depth: i32) void {
     let op = v.op;
     if depth < XDEPTH {
         expr_ops(v, me, depth);
@@ -477,9 +515,10 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
             }
             ins.push(PhiIn.{ from: bs.get(j), val: vi, cst: ci });
         }
-        VALS.at(@int_cast(usize, me)).phi_ops = ins;
+        let x = VALS.at(@int_cast(usize, me));
+        x.phi_ops.deinit();  // (followed before, from further)
+        x.phi_ops = ins;
     }
-    return me;
 }
 
 // How deep an expression (expr_of) computes a value from others: the
@@ -499,6 +538,46 @@ fn int_bits(v: *ir.Value) u32 {
         return @as(u32, @int_cast(u32, t.bits));
     }
     return 0;
+}
+
+// A floating-point value of 32 or 64 bits (its width, 0: not one), when
+// expressions compute them (g_typed).
+fn float_bits(v: *ir.Value) u32 {
+    let t = v.ty;
+    if g_typed and (t.kind == ir.T_FLOAT) and ((t.bits == 32) or (t.bits == 64)) {
+        return @as(u32, @int_cast(u32, t.bits));
+    }
+    return 0;
+}
+
+// A floating-point operand of an expression (float_bits): its VALS index
+// (-1: a constant, its bits in *c; -2: neither).
+fn fexpr_operand(o0: *mut ir.Value, depth: i32, c: *mut i64) i32 {
+    let o = ir.resolve(o0);
+    if u.isnil(o) or (float_bits(o) == 0) {
+        return -2;
+    }
+    if o.kind == ir.V_CFP {
+        let fv = ir.fv_of(o);
+        if o.ty.size == 4 {
+            c.* = @as(i64, ir.f32_bits(fv));
+        } else {
+            c.* = @bit_cast(i64, fv);
+        }
+        return -1;
+    }
+    if o.kind == ir.V_ZERO {
+        c.* = 0;
+        return -1;
+    }
+    if (o.kind != ir.V_INST) and (o.kind != ir.V_PARAM) {
+        return -2;
+    }
+    let k = val_of(o, depth + 1);
+    if k < 0 {
+        return -2;
+    }
+    return k;
 }
 
 // An operand of an expression: its VALS index (-1: a constant, in *c; -2:
@@ -539,7 +618,14 @@ fn expr_operand(o0: *mut ir.Value, depth: i32, c: *mut i64) i32 {
 fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
     let op = v.op;
     let bits = int_bits(v);
-    if (bits == 0) or u.isnil(v.a) {
+    if u.isnil(v.a) {
+        return;
+    }
+    if (float_bits(v) > 0) or ((op == ir.OP_BITCAST) and (bits > 0)) {
+        fexpr_ops(v, me, depth);
+        return;
+    }
+    if bits == 0 {
         return;
     }
     // (the system's debugger computes the stack machine's multiplications
@@ -584,6 +670,75 @@ fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
     x.cb = cb;
     x.bits = bits;
     x.abits = int_bits(ir.resolve(v.a));
+}
+
+// Value v (VALS index me) of a floating-point operation the typed stack
+// machine computes as the program does (DWARF 5, 2.5.1.4 and 2.5.1.6: on
+// values of a floating-point base type, in its format): an addition,
+// subtraction, multiplication, division or negation, a conversion between
+// the formats or from an integer (DW_OP_convert: to the integer's type,
+// then the format's), and a bit cast between a float and an integer of its
+// width (DW_OP_reinterpret). Not a conversion to an integer (the program's
+// saturates), a remainder or a comparison.
+fn fexpr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
+    let op = v.op;
+    let fb = float_bits(v);
+    let a = ir.resolve(v.a);
+    if u.isnil(a) {
+        return;
+    }
+    let mut ca: i64 = 0;
+    let mut cb: i64 = 0;
+    let mut xa: i32 = -2;
+    let mut xb: i32 = -1;
+    let mut abits: u32 = 0;
+    if (op == ir.OP_FADD) or (op == ir.OP_FSUB) or (op == ir.OP_FMUL) or (op == ir.OP_FDIV) {
+        if (fb == 0) or u.isnil(v.b) {
+            return;
+        }
+        xa = fexpr_operand(v.a, depth, &mut ca);
+        xb = fexpr_operand(v.b, depth, &mut cb);
+        if (xb == -2) or ((xa == -1) and (xb == -1)) {
+            return;
+        }
+        abits = fb;
+    } else if (op == ir.OP_FNEG) or (op == ir.OP_FPEXT) or (op == ir.OP_FPTRUNC) {
+        abits = float_bits(a);
+        if (fb == 0) or (abits == 0) {
+            return;
+        }
+        xa = fexpr_operand(v.a, depth, &mut ca);
+    } else if (op == ir.OP_SITOFP) or (op == ir.OP_UITOFP) {
+        abits = int_bits(a);
+        if (fb == 0) or (abits == 0) or (a.ty.kind != ir.T_INT) {
+            return;
+        }
+        xa = expr_operand(v.a, depth, &mut ca);
+    } else if op == ir.OP_BITCAST {
+        let ib = int_bits(v);
+        if (fb > 0) and (a.ty.kind == ir.T_INT) and (int_bits(a) == fb) {
+            abits = fb;
+            xa = expr_operand(v.a, depth, &mut ca);
+        } else if (ib > 0) and (v.ty.kind == ir.T_INT) and (float_bits(a) == ib) {
+            abits = ib;
+            xa = fexpr_operand(v.a, depth, &mut ca);
+        } else {
+            return;
+        }
+    } else {
+        return;
+    }
+    if (xa == -2) or ((xa == -1) and (xb < 0)) {
+        return;  // (an operand not followed, or none computed: folded)
+    }
+    let x = VALS.at(@int_cast(usize, me));
+    x.xop = op;
+    x.xa = xa;
+    x.xb = xb;
+    x.ca = ca;
+    x.cb = cb;
+    x.bits = @max(fb, int_bits(v));
+    x.abits = abits;
 }
 
 // Gives back a map's memory.
@@ -2555,9 +2710,9 @@ fn where(an: *An, s: *mut State, e: usize, minus: u64, prefer: i32) VLoc {
         let k = id - nv - 1;
         if (VALS.get(@int_cast(usize, k)).xop != 0) and not en.ind and pending_ok(an, k) {
             let mut ex = u.List.[u8].empty();
+            TYPED = false;
             if expr_op(an, s, k, minus, 0, &mut ex) {
-                r.kind = LK_EXPR;
-                r.expr = ex.items();
+                computed(&mut r, ex);
             } else {
                 ex.deinit();
             }
@@ -2626,15 +2781,31 @@ fn where(an: *An, s: *mut State, e: usize, minus: u64, prefer: i32) VLoc {
         }
         if (x.xop != 0) and x_has(s, @int_cast(usize, id - 1)) and not en.ind {
             let mut ex = u.List.[u8].empty();
+            TYPED = false;
             if expr_of(an, s, id - 1, minus, 0, &mut ex) {
-                r.kind = LK_EXPR;
-                r.expr = ex.items();
+                computed(&mut r, ex);
             } else {
                 ex.deinit();
             }
         }
     }
     return r;
+}
+
+// Location r is the value expression ex computes (expr_of, TYPED since it
+// was cleared): LK_EXPR, or LK_TEXPR with typed operations (a value of a
+// base type, to which no constant is added).
+fn computed(r: *mut VLoc, ex: u.List.[u8]) void {
+    if TYPED and (r.add != 0) {
+        let mut e = ex;
+        e.deinit();
+        return;
+    }
+    r.kind = LK_EXPR;
+    if TYPED {
+        r.kind = LK_TEXPR;
+    }
+    r.expr = ex.items();
 }
 
 // Call x (at code offset `at`; the next instructions of its block from
@@ -2709,7 +2880,8 @@ fn call_site(an: *An, s: *mut State, x: *Ins, at: u64, g: usize, hi: usize) void
                 put_uleb(&mut ex, c.bits);
                 ok = true;
             } else if (id > 0) and (id <= an.nv) {
-                ok = expr_of(an, s, id - 1, ~keep, 0, &mut ex);
+                TYPED = false;
+                ok = expr_of(an, s, id - 1, ~keep, 0, &mut ex) and not TYPED;  // (dwarf.ax: untyped)
             }
             if ok {
                 ps.push(CallParam.{ reg: dr, expr: ex.items() });
@@ -2856,6 +3028,9 @@ fn expr_of(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
     let x = VALS.get(@int_cast(usize, k));
     let ib = int_bits(x.v);
     if ib == 0 {
+        if float_bits(x.v) > 0 {
+            return fexpr_of(an, s, k, minus, depth, out);
+        }
         return false;
     }
     let nbytes = (ib + 7) / 8;
@@ -2913,10 +3088,174 @@ fn expr_of(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
     return expr_op(an, s, k, minus, depth, out);
 }
 
+// Pushes a typed operation's base type operand (TY_*: dwarf.ax makes it
+// the base type's offset in the unit).
+fn put_ty(o: *mut u.List.[u8], ty: u8) void {
+    TYPED = true;
+    o.push(0x80 | ty);
+    for _j in 2..TY_PAD {
+        o.push(0x80);
+    }
+    o.push(0);
+}
+
+// The base type of floating-point values of `bits` bits.
+fn fty(bits: u32) u8 {
+    if bits == 32 {
+        return TY_F32;
+    }
+    return TY_F64;
+}
+
+// An expression made since TYPED was last cleared has typed operations.
+let mut TYPED: bool = false;
+
+const OP_REGVAL_TYPE: u8 = 0xa5;
+const OP_DEREF_TYPE: u8 = 0xa6;
+const OP_CONST_TYPE: u8 = 0xa4;
+const OP_CONVERT: u8 = 0xa8;
+const OP_REINTERPRET: u8 = 0xa9;
+
+// Pushes floating-point value k (float_bits), a value of its base type: as
+// expr_of.
+fn fexpr_of(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    let id = id_val(k);
+    let x = VALS.get(@int_cast(usize, k));
+    let fb = float_bits(x.v);
+    let rm = regs_of(s, id) & ~minus;
+    if rm != 0 {
+        for p in @as(usize, 0)..64 {
+            if (rm & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                let dr = an.t.dw_reg(@int_cast(i32, p));
+                if dr >= 0 {
+                    // (the register's low bytes, of the format: DWARF 5, 2.5.1.6)
+                    out.push(OP_REGVAL_TYPE);
+                    put_uleb(out, @as(u64, @bit_cast(u32, dr)));
+                    put_ty(out, fty(fb));
+                    return true;
+                }
+            }
+        }
+    }
+    let mut so = slot_of(an, s, id);
+    if (so == NO_LOC) and (x.v.kind == ir.V_PARAM) and (x.stack_off != NO_LOC) and not an.tails {
+        so = x.stack_off;
+    }
+    if so != NO_LOC {
+        out.push(OP_FBREG);
+        put_sleb(out, so);
+        out.push(OP_DEREF_TYPE);
+        out.push(@truncate(u8, fb / 8));
+        put_ty(out, fty(fb));
+        return true;
+    }
+    if (x.v.kind == ir.V_PARAM) or (x.xop == 0) or (depth >= XDEPTH) or (out.len > XBYTES) or
+       ((depth == 0) and not x_has(s, @int_cast(usize, k))) {
+        return false;  // (as expr_of; no entry values: call sites give integer registers' only)
+    }
+    return expr_op(an, s, k, minus, depth, out);
+}
+
+// Pushes floating-point operand o (a VALS index, or the constant of bits c)
+// of `bits` bits, of its base type.
+fn put_foperand(an: *An, s: *mut State, o: i32, c: i64, bits: u32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    if o < 0 {
+        out.push(OP_CONST_TYPE);
+        put_ty(out, fty(bits));
+        out.push(@truncate(u8, bits / 8));
+        for j in @as(u32, 0)..(bits / 8) {
+            out.push(@truncate(u8, @bit_cast(u64, c) >> (8 * j)));
+        }
+        return true;
+    }
+    return expr_of(an, s, o, minus, depth + 1, out);
+}
+
+// Pushes value k of fexpr_ops computed from its operands.
+fn fexpr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    let x = VALS.get(@int_cast(usize, k));
+    let op = x.xop;
+    let fb = float_bits(x.v);
+    if (op == ir.OP_SITOFP) or (op == ir.OP_UITOFP) {
+        // (the integer, extended to 64 bits as the operation reads it, then
+        // converted to the format: rounded as the machine's conversion)
+        if not put_operand(an, s, x.xa, x.ca, minus, depth, out) {
+            return false;
+        }
+        let signed = op == ir.OP_SITOFP;
+        put_ext(out, x.abits, signed);
+        out.push(OP_CONVERT);
+        if signed {
+            put_ty(out, TY_I64);
+        } else {
+            put_ty(out, TY_U64);
+        }
+        out.push(OP_CONVERT);
+        put_ty(out, fty(fb));
+        return true;
+    }
+    if op == ir.OP_BITCAST {
+        if fb > 0 {
+            // (an integer's bits as a float: of the integer's width first)
+            if not put_operand(an, s, x.xa, x.ca, minus, depth, out) {
+                return false;
+            }
+            if fb == 32 {
+                out.push(OP_CONVERT);
+                put_ty(out, TY_U32);
+            }
+            out.push(OP_REINTERPRET);
+            put_ty(out, fty(fb));
+            return true;
+        }
+        // (a float's bits as an integer, then of the generic type)
+        if not put_foperand(an, s, x.xa, x.ca, x.abits, minus, depth, out) {
+            return false;
+        }
+        out.push(OP_REINTERPRET);
+        if x.abits == 32 {
+            put_ty(out, TY_U32);
+        } else {
+            put_ty(out, TY_U64);
+        }
+        out.push(OP_CONVERT);
+        out.push(0);
+        return true;
+    }
+    if not put_foperand(an, s, x.xa, x.ca, x.abits, minus, depth, out) {
+        return false;
+    }
+    if op == ir.OP_FNEG {
+        out.push(0x1f);  // DW_OP_neg
+        return true;
+    }
+    if (op == ir.OP_FPEXT) or (op == ir.OP_FPTRUNC) {
+        out.push(OP_CONVERT);
+        put_ty(out, fty(fb));
+        return true;
+    }
+    if not put_foperand(an, s, x.xb, x.cb, fb, minus, depth, out) {
+        return false;
+    }
+    let mut code: u8 = 0x1b;  // DW_OP_div
+    if op == ir.OP_FADD {
+        code = 0x22;
+    } else if op == ir.OP_FSUB {
+        code = 0x1c;
+    } else if op == ir.OP_FMUL {
+        code = OP_MUL;
+    }
+    out.push(code);
+    return true;
+}
+
 // Pushes value k (of expr_ops) computed from its operands.
 fn expr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
     let x = VALS.get(@int_cast(usize, k));
     let op = x.xop;
+    if (float_bits(x.v) > 0) or (op == ir.OP_BITCAST) {
+        return fexpr_op(an, s, k, minus, depth, out);
+    }
     if not put_operand(an, s, x.xa, x.ca, minus, depth, out) {
         return false;
     }

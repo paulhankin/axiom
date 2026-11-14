@@ -657,7 +657,9 @@ export function locList(dw, off) {
 // DW_OP_stack_value, the address of the variable (one held by reference: a
 // variable length array). A piece with a location of its own is followed
 // by DW_OP_piece.
-export function knownLocation(expr) {
+// (bases: is a typed operation's base type operand, the offset of an entry
+// in the unit, of a base type; not checked without it)
+export function knownLocation(expr, bases = null) {
   const r = new Rd(expr);
   const op = r.u8();
   if (op === 0x91 && expr.length > 1) {
@@ -697,10 +699,20 @@ export function knownLocation(expr) {
       else if (o === 0x14) { if (depth < 2) return false; depth++; }
       else if (o === 0x16) { if (depth < 2) return false; }
       else if (o === 0x17) { if (depth < 3) return false; }
+      // typed operations (DWARF 5, 2.5.1.6: floating-point values):
+      // DW_OP_regval_type, DW_OP_const_type, DW_OP_deref_type,
+      // DW_OP_convert (0: to the generic type), DW_OP_reinterpret
+      else if (o === 0xa5) { r.uleb(); if (!base(r.uleb())) return false; depth++; }
+      else if (o === 0xa4) { if (!base(r.uleb())) return false; r.p += r.u8(); depth++; }
+      else if (o === 0xa6) { r.u8(); if (!base(r.uleb()) || depth < 1) return false; }
+      else if (o === 0xa8 || o === 0xa9) { const t = r.uleb(); if ((t !== 0 || o === 0xa9) && !base(t)) return false; if (depth < 1) return false; }
+      else if (o === 0x1f) { if (depth < 1) return false; }
+      else if (o === 0x1b) { if (depth < 2) return false; depth--; }
       else return false;
     }
     return false;
   };
+  const base = (t) => !bases || bases(t);
   // one piece's location (or none); false if not of the forms
   const one = () => {
     const o = r.d[r.p];
@@ -781,8 +793,17 @@ export function exprRegs(expr) {
     else if (o === 0x9e) { const n = r.uleb(); r.p += n; }
     else if (o === 0x03) r.p += 8;
     else if (o === 0x0e) r.u64();
+    else if (o === 0xa5) { out.push(r.uleb()); r.uleb(); }
+    else if (o === 0xa4) { r.uleb(); r.p += r.u8(); }
+    else if (o === 0xa6) { r.u8(); r.uleb(); }
+    else if (o === 0xa8 || o === 0xa9) r.uleb();
   }
   return out;
+}
+
+// Unit un's base types: an offset in the unit -> is it a base type's entry?
+export function baseTypes(un) {
+  return (t) => { const d = un.dies.get(un.off + t); return !!d && d.tag === 0x24; };
 }
 
 // The lexical blocks and variables of the subprograms: each block's ranges
@@ -832,9 +853,9 @@ export function checkScopes(dw, machine) {
             for (const r of exprRegs(x.expr)) if (machine && !allocatable(machine, r)) E(`${fname}.${name}: in register ${r}, which holds no values`);
             if (!(x.hi > x.lo)) E(`${fname}.${name}: an empty location range`);
             if (!inside([[x.lo, x.hi]], rs)) E(`${fname}.${name}: a location at [0x${x.lo.toString(16)}, 0x${x.hi.toString(16)}) outside its block`);
-            if (!knownLocation(x.expr)) E(`${fname}.${name}: location ${x.expr.toString('hex')}`);
+            if (!knownLocation(x.expr, baseTypes(un))) E(`${fname}.${name}: location ${x.expr.toString('hex')}`);
           }
-        } else if (!knownLocation(loc)) E(`${fname}.${name}: location ${loc.toString('hex')}`);
+        } else if (!knownLocation(loc, baseTypes(un))) E(`${fname}.${name}: location ${loc.toString('hex')}`);
       }
     }
   };
@@ -1187,6 +1208,59 @@ export function checkAxVars(dw, opts = {}) {
 // is false if a multiplication or left shift had a result below -2^63,
 // which a debugger that computes them exactly and keeps the low bits of a
 // negative result's magnitude gets wrong; null if not of those forms.
+// The value of a location expression of typed operations (knownLocation's
+// forms, of registers: DW_OP_bregN of the integer registers regs, of 64
+// bits, DW_OP_regval_type of the floating-point ones, fregs (DWARF number
+// -> a number), constants, conversions, arithmetic), as the system's
+// debugger computes it; base(t): the base type entry at offset t of the
+// unit ({ enc, size }). null if not of those forms.
+export function evalTyped(expr, regs, fregs, base) {
+  const r = new Rd(expr, 0), st = [];
+  const f32 = (x) => Math.fround(x);
+  const asType = (v, t) => {
+    // (a value converted to base type t: DW_ATE_float 4, DW_ATE_signed 5, DW_ATE_unsigned 7)
+    const b = t === 0 ? { enc: 0, size: 8 } : base(t);
+    if (!b) return null;
+    if (b.enc === 4) {
+      const x = typeof v.v === 'bigint' ? Number(v.v) : v.v;
+      return { t, v: b.size === 4 ? f32(x) : x };
+    }
+    const x = typeof v.v === 'bigint' ? v.v : BigInt(Math.trunc(v.v));
+    return { t, v: b.enc === 7 ? BigInt.asUintN(8 * b.size, x) : BigInt.asIntN(8 * b.size, x) };
+  };
+  while (r.p < expr.length) {
+    const o = r.u8();
+    if (o === 0x9f) return st.length === 1 ? st[0].v : null;
+    if (o >= 0x70 && o <= 0x8f) { st.push({ t: 0, v: BigInt.asIntN(64, (regs[o - 0x70] ?? 0n) + BigInt(r.sleb())) }); continue; }
+    if (o === 0x11) { st.push({ t: 0, v: BigInt(r.sleb()) }); continue; }
+    if (o === 0xa5) {
+      const reg = r.uleb(), t = r.uleb(), b = base(t);
+      if (!b || b.enc !== 4 || fregs[reg] === undefined) return null;
+      st.push({ t, v: b.size === 4 ? f32(fregs[reg]) : fregs[reg] });
+      continue;
+    }
+    if (o === 0xa4) {
+      const t = r.uleb(), n = r.u8(), b = base(t), bytes = Buffer.from(expr.slice(r.p, r.p + n));
+      r.p += n;
+      if (!b || b.enc !== 4 || b.size !== n) return null;
+      st.push({ t, v: n === 4 ? bytes.readFloatLE(0) : bytes.readDoubleLE(0) });
+      continue;
+    }
+    if (o === 0xa8) { const v = asType(st.pop(), r.uleb()); if (!v) return null; st.push(v); continue; }
+    if (o === 0x1f) { const a = st.pop(); st.push({ t: a.t, v: -a.v }); continue; }
+    const b = st.pop(), a = st.pop();
+    if (a === undefined || a.t !== b.t || typeof a.v !== 'number') return null;
+    let x;
+    if (o === 0x22) x = a.v + b.v;
+    else if (o === 0x1c) x = a.v - b.v;
+    else if (o === 0x1e) x = a.v * b.v;
+    else if (o === 0x1b) x = a.v / b.v;
+    else return null;
+    st.push({ t: a.t, v: base(a.t).size === 4 ? f32(x) : x });
+  }
+  return null;
+}
+
 export function evalComputed(expr, regs) {
   const r = new Rd(expr, 0), st = [], w = (x) => BigInt.asIntN(64, x);
   let exact = true;

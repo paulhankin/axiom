@@ -3037,8 +3037,19 @@ itself is in the `.dSYM`).
     from, and one no instruction makes (folded into the instructions of those
     computed from it, or a copy that took its operand's register) from the
     assignment on; through up to eight operations, a multiplication of 64 bits
-    too (from its operands' 32-bit halves); not divisions or floating-point
-    arithmetic. The system's debugger computes `DW_OP_mul` and `DW_OP_shl`
+    too (from its operands' 32-bit halves); not divisions. On x86-64 Linux a
+    floating-point value (`float`, `double`) is computed so too, with DWARF 5's
+    typed operations, whose operands name base types of the unit (the unit's own
+    of that encoding and size, else one added for them): from the registers that
+    hold its operands (`DW_OP_regval_type`), their spill slots
+    (`DW_OP_deref_type`) and constants (`DW_OP_const_type`), by an addition,
+    subtraction, multiplication, division or negation (in the value's format,
+    as the program computes it), a conversion between the formats or from an
+    integer (`DW_OP_convert`) or a bit cast to or from an integer of its width
+    (`DW_OP_reinterpret`); not a conversion to an integer (the program's
+    saturates), nor from an entry value. Not on AArch64, whose system debugger
+    evaluates none of the typed operations, nor in macOS's debug information
+    or the PDB. The system's debugger computes `DW_OP_mul` and `DW_OP_shl`
     exactly and keeps the low bits of a negative result's magnitude when it is
     below -2^63, so the expressions multiply and shift left only values they
     made not negative (masked to the bits that matter); a shift's count is
@@ -3081,13 +3092,14 @@ itself is in the `.dSYM`).
   Of the instructions stepped in such programs at `-O2` where a variable has been
   assigned (in its lifetime: a variable of a loop's body from the round's start; an
   inlined function's in the instance it was assigned in), the debugger shows a value
-  at 91.5% on x86-64 and 90.5% on AArch64 for C, and at 92.2% and 93.2% for Axiom
+  at 92.9% on x86-64 and 91.0% on AArch64 for C, and at 92.0% and 92.2% for Axiom
   programs of the same shapes, counting the copies inlined. The rest are values
   nothing holds any more: merges and phis of values whose registers were reused
-  (the largest part), floating-point values (DWARF's stack machine computes integers
-  only, as this compiler writes it), values computed through more operations than
+  (the largest part), floating-point values on AArch64 and those computed from
+  values nothing holds either, values computed through more operations than
   the expressions follow, and parameters whose entry value the caller's call site
-  does not give. AArch64 trails because its calls clobber the floating-point
+  does not give. (A value reached first through a longer chain of the values it is
+  computed from is followed again from where it is reached more directly.) AArch64 trails because its calls clobber the floating-point
   registers that pass a logged value (a structure's `double` member is lost once it
   is passed) and its scheduler moves more of the code it computes ahead of where it
   is assigned.
