@@ -664,7 +664,8 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-**5b (module splits and enums): partly done.** Every split moved
+**5b (module splits and enums): done, but for the builtins (below).**
+Every split moved
 declarations as they were, by a script (a declaration goes with what it
 uses, and a reference becomes `alias.name`), so each commit left the
 compiler's output byte-identical: a fixed corpus (the base compiler's own
@@ -699,12 +700,56 @@ it moved. Done:
 - `x64caps.ax` (88): what codegen.ax asks the x86-64 selector
   (`vector_bits`, `perm_ok`, `partial_ok`, `shiftv_ok`, `vnni_ok`,
   `widen_ok`); `codegen.ax` no longer imports `x64.ax`.
+- `x64.ax` (10,344 lines) is five, by phase, over a new leaf:
+  `x64sel.ax` (1,193: the selector's `State` `S`, which was private to
+  `x64.ax`, the emission helpers `emit`/`e2`/`reg`/`vreg` ..., symbols and
+  constants, the values' registers and the block's caches, and the small
+  queries the phases share), `x64isel.ax` (2,617: integer operations,
+  conversions, loads and stores, atomics, integer intrinsics, carry chains
+  and runs of stores), `x64simd.ax` (3,215: SSE scalar and packed floating
+  point and the float intrinsics, which handle vectors too, and the vector
+  selection: lanes, splats, shuffles, permutes, masks, masked memory
+  operations; `backend.ax` takes `wide_legal` from it), `x64abi.ax` (416:
+  argument and result registers, stack arguments, results in registers,
+  sibling calls) and `x64.ax` (2,982: inline assembly, each instruction's
+  dispatch, the marks made before selection, `compile_func` and the
+  register allocator's side). Imports run `x64sel` <- `x64simd` <-
+  `x64isel` <- `x64abi` <- `x64.ax` (the scalar selection hands vector
+  types to `x64simd.ax`; the float intrinsics went with it because they
+  select vector forms as well). `x64emit.ax`, `x64enc.ax`, `x64ctx.ax` and
+  `x64caps.ax` are as they were. Prologue and frame sizing stayed where
+  they are (`compile_func`, `x64emit.ax`): moving them was not a move by
+  phase.
 - Enums: `mach.OpKind` (`K_*`, u8), `nlink.SecClass` (`C_*`, i32, with
   the Windows and Mach-O linkers' own classes as members and `NONE` for
   sections not placed), `ast.DeclState` (`Decl.state`), `gvn.ax`'s
   `EntKind` and `WriteKind`. The old constant names stay, as aliases of
   the members (as `ast.E_*` are), so the code reads as before; the
   representation is the old one, so no structure changed size.
+- More enums, in the same way: `ir.CmpPred` (an ICMP's or FCMP's
+  predicate: `IntEQ` ... `RealUNE`), `ir.Intrinsic` (`IN_*`, with `NONE`
+  for what `intr_id` gives for an instruction that calls none),
+  `ast.BuiltinId` (`BI_*`, `Expr.builtin`, with `UNKNOWN` = -1) and
+  `lexer.TokKind` (`TK_*` and `KW_*`: `Token.kind`, and the operator of an
+  expression or assignment, `Expr.op`, with `NONE` = -1, which `fmt.ax`
+  uses for its comments). Each keeps its values, so `Value.cv` and the
+  structures are encoded as before. Arithmetic on the values became
+  helpers that say what it meant (`ir.swap_pred`/`inv_pred`/
+  `unsigned_pred`/`is_signed_pred` as matches, `ir.widen_low`/
+  `widen_high`), ranges `ir.intr_between`, `ast.builtin_between` and
+  `lx.tok_between`, and the tables in an enum's order convert where they
+  are indexed (`ast.builtin_index`; the condition-code tables of both
+  backends). Reads of `cv` by hand became `ir.pred_of` / `ir.intr_id`
+  (and `ir.pred_cv` / `ir.intr_cv` write it); `pred_of` had been used for
+  intrinsics in four places, which now use `intr_id`. The C front end's
+  operator codes stayed `i32`: its predicate paths were already separate
+  (`int_pred`, `cgen_wint.ax`'s chooser), so only those changed type.
+- `if`/`else if` chains of three or more tests of one value against one
+  enum's members (38: the predicates' opcodes in `wasm.ax` and the
+  backends, the parser's postfix and statement dispatch on the token,
+  sema's and codegen's operators and builtins, the emitter's operand
+  kinds) are matches, by a script that keeps the arms' order and adds
+  `else => {}` where the chain had no `else`.
 
 Compile time and memory are unchanged: the x86-64 -O2 build of the base
 compiler's source (one job, by compilers built at -O2) took 25.5-25.8 s
@@ -712,39 +757,30 @@ of user time before and 25.2-26.2 s after, 2.23 GB peak both. The
 bootstrap compiler builds the new modules as they are (nothing beyond
 its subset: enums with explicit and negative values, `match` with
 several patterns per arm).
+The x86-64 split and the enums after it did not change them either: the
+same build took 25.9 and 27.4 s of user time by the base compiler and
+25.9 and 26.6 s by the new one (2.23 GB peak both), and the outputs
+were identical.
 
 ### What remains (5b)
 
-- **`x64.ax` (10,400 lines)**: `x64abi.ax`, `x64simd.ax` and
-  `x64isel.ax` as the target design says. Not a mechanical move: the
-  vector and call lowering use instruction selection's emission helpers
-  (`emit`, `reg`, `vreg`, the value caches) and its private `State`, so
-  those must first go to a leaf (`x64ctx.ax` already has `Obj`/`Func`)
-  before the selection can be cut by phase. A dependency closure of the
-  capability queries (`wide_legal` and the shuffle matchers) reaches
-  1,300 lines of selection helpers.
-- **`codegen.ax`'s builtins** (`@...` lowering, about 1,600 lines) and
-  expressions call each other: `cg_builtin.ax` needs either the
-  expression generator behind a function pointer in `cgctx.ax` or the
-  builtins' leaf helpers (vector shuffles, conversions) moved out first.
-  `sema.ax`'s builtin checking is in the same position.
-- **`ir.CmpPred`** (`IntEQ` ... `RealUNE`, 735 uses): tried and backed
-  out. Predicates are stored in `Value.cv`, computed with
-  (`p - ir.IntEQ` table indices in `x64.ax`/`a64.ax`, `gvn.ax`'s
-  gt/ge/lt/le arithmetic, `ir.IntEQ..ir.IntSLE + 1` loops), and the C
-  front end passes them through the same `op: i32` parameters as its
-  operator codes (`c/cgen_*.ax`), so retyping the parameters by the
-  type errors spread into the operators. Do it by first giving the C
-  front end's predicate paths their own functions, then the backends'
-  tables via `@int_from_enum`.
-- **`ir.IN_*`** (120 intrinsics, in `Value.cv` too) and **`ast.BI_*`**
-  (145 builtins: an index into `ast.ax`'s table, -1 for unknown, ranges
-  such as `BI_X86_AESENC..BI_X86_AESKEYGENASSIST` in `semapost.builtin_need`
-  and `insn_ops`): an `UNKNOWN` member, `@int_from_enum` at the table, and
-  the ranges as `match` arms. The lexer's operator token kinds (the
-  plan's `OP_*`: `Expr.op`) likewise.
-- **`if`/`else` chains into `match`**: none was rewritten; the new enums
-  make it possible (e.g. the backends' dispatch on `MOp.kind`).
+- **`codegen.ax`'s builtins** (the "Builtins" section, about 1,600 lines:
+  `gen_builtin` and the conversion, memory, math, vector and system
+  builtins, with the ASan and coverage helpers kept there) and `sema.ax`'s
+  builtin checking. A layering exists: the builtins reach the rest of
+  `codegen.ax` only through `gen` (16 calls) and 38 helpers (about 1,100
+  lines: `get_inst` and the mangling, `global_addr`, `string_ptr`,
+  `const_slice`, `errcode_value`, `int_min`/`int_max`, `gen_binop`,
+  `op_with_overflow` ...), none of which calls back up. So `cgbuiltin.ax`
+  can sit below `codegen.ax` once those helpers are a module of their own
+  (between `cgctx.ax` and it) and `gen` is reached through a function
+  pointer that `codegen.ax` sets (in `cgctx.ax`, thread-local or set
+  before item 1's workers start). That changes calls rather than moving
+  declarations, so it was left for a step of its own. `sema.ax`'s
+  `check_builtin` is in the same position with `check_expr`.
+- Other candidates for `match`: chains of separate `if v == X { return
+  ... }` (the backends' intrinsic dispatch) mean the same only when every
+  arm returns; they were not rewritten by the script.
 
 ### Current state (before 5a and 5b)
 
