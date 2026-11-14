@@ -4,7 +4,7 @@
 // branches tidied, three-address forms), shrink-wrapping's frame tests, the
 // prologue and epilogue, Windows unwind information (line tables: winlines.ax), code
 // placement, and the encoding (x64enc.ax) of each function into the object.
-// The state of the function being compiled, which x64.ax sets, lives here.
+// The state of the object and the function being compiled is in x64ctx.ax.
 // =============================================================================
 import "asm/core.ax" as acr;
 import "asm/inline.ax" as ai;
@@ -22,80 +22,82 @@ import "mach.ax" as mc;
 import "macunwind.ax" as mu;
 import "util.ax" as u;
 import "winlines.ax" as wlines;
+import "x64ctx.ax" as xc;
 import "x64enc.ax" as xe;
 
-// The object being written, and the function being compiled
-pub let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
-pub let mut TEXT: i32 = 0;
-pub let mut LINES: i32 = -1;  // Windows: line tables (.axiom.lines, for plink.ax's PDB)
-pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0,
-                                     parts: [
-                                         dw.Part.{
-                                             b: bn.Bytes.{
-                                                 b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
-                                             fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                                   cap: 0 } }; 11],
-                                     strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                            vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     files: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
-                                     fmap: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                            vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     by_id: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
-                                     nfuncs: 0, first_src: 0, text_sym: 0,
-                                     trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                     gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     toff: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
-                                     drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                     gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
-                                     voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
-                                     tls_rel: 0, cies: [0; 4], size_fix: false,
-                                     sums: u.List.[[16]u8].{ data: @ptr_from_int(*mut [16]u8, 0), len: 0, cap: 0 },
-                                     nosum: false,
-                                     names: u.List.[dw.Named].{ data: @ptr_from_int(*mut dw.Named, 0), len: 0, cap: 0 },
-                                     abs_fns: u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 },
-                                     abs_map: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                               vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                     ranges: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
-                                     lrefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 } };  // -g: DWARF (dwarf.ax; not on Windows)
-pub let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
-pub let mut PDATA: i32 = -1;
-pub let mut XDATA_SYM: u32 = 0;
-pub let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                                  chains_sym: 0, text0: -1, rets0: -1, cur_text: -1,
-                                  others: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, rel32: 0,
-                                  abs64: 0, empty: 0, lines: false, ro: -1, ro_sym: 0,
-                                  rec_of: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                     cap: 0, len: 0 }, recs: u.U64Map.{
-                                                         keys: @ptr_from_int(*mut u64, 0),
-                                                         vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 },
-                                  pairs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                    cap: 0, len: 0 }, ctxs: u.U64Map.{
-                                                        keys: @ptr_from_int(*mut u64, 0),
-                                                        vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 },
-                                  strs: u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0),
-                                                         vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 }, last: [
-                                                             0, 0] };  // frame tables (ftab.ax)
-pub let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-pub let mut errors: bool = false;
-pub let mut AVX: bool = false;
-pub let mut UPPER: bool = false;    // the function uses ymm or zmm registers (vzeroupper before calls and returns)
-pub let mut WIDE_IN: bool = false;  // it takes a ymm or zmm argument (the upper halves in use on entry)
-let mut DIRTY: bool = true;         // ... and may have written one since it was entered or last made a call
-pub let mut WIN: bool = false;      // Windows x64: its calling convention, and thread-locals through the TEB
-pub let mut MACOS: bool = false;    // macOS: thread-locals in a block a TSD slot (gs-relative) holds
-// macOS: the unwind tables (macunwind.ax), from the call frame states
-// (recorded for every function there, with or without -g), and the ends of
-// the function's sibling calls' jumps
-pub let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: true, elf: false, cu: -1, eh: -1,
-                                  cies: [0; 4] };
-let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-pub let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
-pub let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
-pub let mut out_area: u64 = 0;  // outgoing stack-argument bytes
+// The emitter's own state: the function being encoded
+struct State {
+    // the function may have written a ymm or zmm register (FN.upper) since it
+    // was entered or last made a call
+    dirty: bool,
+    tail_ends: u.List.[u64],  // macOS: the ends of the function's sibling calls' jumps
+    fbase: u64,               // where the function will start (code placement, below)
+    e: xe.Enc,                // its code
+    nsaved: i64,
+    saved: [7]i32,
+    nxsaved: i64,  // Windows: xmm6-xmm15 in use, saved below the pushed registers
+    xsaved: [10]i32,
+    local_off: u.List.[u64],
+    // Branch relaxation (encode_func): the jumps, in the order they are encoded,
+    // that take a rel8 displacement (jshort); in the first pass, which encodes
+    // them all with rel32, where each starts and where it goes.
+    jshort: u.List.[bool],
+    jstart: u.List.[u64],
+    jlabel: u.List.[i32],
+    jnext: usize,
+    // the rel8 jumps of a pass: jump number << 32 | its fixup
+    jfix: u.List.[u64],
+    // A leaf with nothing on the stack needs no frame.
+    frameless: bool,
+    in_noframe: bool,
+    // The call frame states as the function is encoded (dwarf.cfi_state; none
+    // unless DBG or MU is on: -g, an unwind table), and the registers the frame saves (dwarf.saved_reg):
+    // rbp at CFA - 16, then the pushed callee-saved registers below it.
+    cfis: u.List.[u64],
+    cfi_regs: [20]u64,
+    xcfis: u.List.[dw.XCfi],
+    // Windows: the sibling calls' jumps of the function being encoded, as
+    // (start << 32) | end offsets (emit_unwind).
+    tail_jumps: u.List.[u64],
+    uw: [24]UnwindStep,
+    nuw: usize,
+    prologue_end: u64,
+    // Jump tables (x64.ax gen_jump_table): the jumps of the pass being encoded,
+    // whose tables are filled in once the function's place is known
+    // (fill_jump_tables), and a local symbol at the start of the function's
+    // section for their entries (elf.sec_sym).
+    jtabs: u.List.[*mut mc.MInst],
+    jt_text: u32,
+    asm_inst: *mc.MInst,
+    asm_err: []u8,
+    // Blocks whose flags are live at their end: dup_exit_tests dropped the test
+    // the block they fall into starts with, which now reads them.
+    flags_out: u.List.[*mut mc.MBlock],
+}
+
+let mut S: State = State.{ dirty: true, tail_ends: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                           fbase: 0,
+                           e: xe.Enc.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
+                                                                      cap: 0 } },
+                                       relocs: u.List.[xe.Reloc].{ data: @ptr_from_int(*mut xe.Reloc, 0), len: 0,
+                                                                   cap: 0 },
+                                       fixups: u.List.[xe.Fixup].{ data: @ptr_from_int(*mut xe.Fixup, 0), len: 0,
+                                                                   cap: 0 }, avx: false }, nsaved: 0, saved: [0; 7],
+                           nxsaved: 0, xsaved: [0; 10],
+                           local_off: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                           jshort: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
+                           jstart: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                           jlabel: u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 }, jnext: 0,
+                           jfix: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, frameless: false,
+                           in_noframe: false, cfis: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                           cfi_regs: [0; 20], xcfis: u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0,
+                                                                        cap: 0 },
+                           tail_jumps: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                           uw: [UnwindStep.{ off: 0, op: 0, reg: 0, val: 0 }; 24], nuw: 0, prologue_end: 0,
+                           jtabs: u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0, cap: 0 },
+                           jt_text: 0, asm_inst: @ptr_from_int(*mc.MInst, 0), asm_err: "",
+                           flags_out: u.List.[*mut mc.MBlock].{ data: @ptr_from_int(*mut *mut mc.MBlock, 0), len: 0,
+                                                                cap: 0 } };
 
 // Code placement (encode_func), with knobs for measuring it,
 // read from the environment and part of the object cache's key:
@@ -117,7 +119,7 @@ pub let mut out_area: u64 = 0;  // outgoing stack-argument bytes
 //                       cores; nops move it to the boundary
 //
 // .text is aligned to 64 bytes, so where each instruction will sit relative
-// to 32- and 64-byte boundaries is known while encoding (FBASE: where the
+// to 32- and 64-byte boundaries is known while encoding (S.fbase: where the
 // function being encoded will start). Measured on SIMD kernels (Cascade
 // Lake, 0095), neither aligned loops nor the JCC padding made the code faster
 // (the padding made it slower), so none is on by default.
@@ -127,14 +129,13 @@ let mut LALIGN: u64 = 0;
 let mut LMAX: u64 = 15;
 let mut LMODE: i32 = 1;
 let mut JCC: bool = false;
-let mut FBASE: u64 = 0;
 
 // Where the function being compiled starts: at a multiple of FALIGN, or of
 // its own alignment (C's attribute aligned), which its section then has.
 fn func_align(text: *mut elf.Sec) u64 {
     let mut a = FALIGN;
-    if F.align > a {
-        a = F.align;
+    if xc.FN.f.align > a {
+        a = xc.FN.f.align;
     }
     if a > text.align {
         text.align = a;
@@ -143,39 +144,28 @@ fn func_align(text: *mut elf.Sec) u64 {
 }
 
 pub fn fail(msg: []u8) void {
-    if u.isnil(F) {
+    if u.isnil(xc.FN.f) {
         // (outside a function: file-scope asm, the object's own tables)
         u.eprint(u.f1("axiom: x86-64 code generation: %s\n", msg));
     } else {
-        u.eprint(u.f2("axiom: x86-64 code generation: %s (in %s)\n", msg, F.name));
+        u.eprint(u.f2("axiom: x86-64 code generation: %s (in %s)\n", msg, xc.FN.f.name));
     }
-    errors = true;
+    xc.O.errors = true;
 }
 
 // -----------------------------------------------------------------------------
 // Encoding
 // -----------------------------------------------------------------------------
-let mut E: xe.Enc = xe.Enc.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
-                             relocs: u.List.[xe.Reloc].{ data: @ptr_from_int(*mut xe.Reloc, 0), len: 0, cap: 0 },
-                             fixups: u.List.[xe.Fixup].{ data: @ptr_from_int(*mut xe.Fixup, 0), len: 0, cap: 0 },
-                             avx: false };
-let mut nsaved: i64 = 0;
-let mut saved: [7]i32 = [0; 7];
-let mut nxsaved: i64 = 0;  // Windows: xmm6-xmm15 in use, saved below the pushed registers
-let mut xsaved: [10]i32 = [0; 10];
-let mut local_off: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 pub fn P(r: i32) i32 {
-    if PRE_RA {
+    if xc.FN.pre_ra {
         return r;
     }
-    return mc.phys(MF, r);
+    return mc.phys(xc.FN.mf, r);
 }
 
-pub let mut PRE_RA: bool = false;  // (P names virtual registers: before allocation)
-
 fn b8(x: u64) void {
-    E.b.u8_(@truncate(u8, x));
+    S.e.b.u8_(@truncate(u8, x));
 }
 
 fn to_mem(o: mc.MOp) xe.Mem {
@@ -188,7 +178,7 @@ fn to_mem(o: mc.MOp) xe.Mem {
     }
     if o.slot >= 0 {
         m.base = xe.RBP;
-        m.disp += MF.slots.get(@int_cast(usize, o.slot)).offset;
+        m.disp += xc.FN.mf.slots.get(@int_cast(usize, o.slot)).offset;
         m.sym = -1;
     } else if (o.slot == -2) or (o.slot == -3) {
         m.tpoff = true;
@@ -201,7 +191,7 @@ fn to_mem(o: mc.MOp) xe.Mem {
 // ModRM for a memory operand, with TLS offsets relative to a base register.
 fn enc_mem(rf: i32, o: mc.MOp, imm_after: i64) void {
     let m = to_mem(o);
-    xe.modrm_mem(&mut E, @as(u64, @bit_cast(u32, rf)), &m, imm_after);
+    xe.modrm_mem(&mut S.e, @as(u64, @bit_cast(u32, rf)), &m, imm_after);
 }
 
 fn rex_for_mem(w: u64, rf: i32, o: mc.MOp, force: bool) void {
@@ -244,7 +234,7 @@ fn enc_op2(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i
             b8(0x40 | v);
         }
         opcode(nop, op0, op1);
-        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, rf)), @as(u64, @bit_cast(u32, rr)));
+        xe.modrm_rr(&mut S.e, @as(u64, @bit_cast(u32, rf)), @as(u64, @bit_cast(u32, rr)));
         return;
     }
     rex_for_mem(w, rf, rm, byte_rf and byte_reg_force(rf));
@@ -253,9 +243,9 @@ fn enc_op2(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i
 }
 
 fn opcode(n: i32, a: u8, b: u8) void {
-    E.b.u8_(a);
+    S.e.b.u8_(a);
     if n == 2 {
-        E.b.u8_(b);
+        S.e.b.u8_(b);
     }
 }
 
@@ -283,7 +273,7 @@ fn imm_len(sz: u8) i64 {
 }
 
 fn enc_imm(x: i64, n: i64) void {
-    xe.imm_n(&mut E, x, @truncate(u8, @bit_cast(u64, n)));
+    xe.imm_n(&mut S.e, x, @truncate(u8, @bit_cast(u64, n)));
 }
 
 // After code with ymm or zmm registers, before code that may use the
@@ -299,18 +289,18 @@ fn writes_wide(i: *mc.MInst) bool {
 // clear (but with a ymm or zmm argument: WIDE_IN), and a call returns with
 // them clear (but one with a ymm or zmm result: wide_cr).
 fn upper_dirty() []mut bool {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let din = u.newn.[bool](nb + 1);
     let dout = u.newn.[bool](nb + 1);
-    if not UPPER {
+    if not xc.FN.upper {
         return din;
     }
-    din[0] = WIDE_IN;
+    din[0] = xc.FN.wide_in;
     let mut changed = true;
     while changed {
         changed = false;
         for bi in 0..nb {
-            let b = MF.blocks.get(bi);
+            let b = xc.FN.mf.blocks.get(bi);
             let mut d = din[bi];
             let mut i = b.first;
             while u.notnil(i) {
@@ -349,36 +339,26 @@ fn vzeroupper() void {
 }
 
 fn label_ref(l: i32) void {
-    xe.rel32_fixup(&mut E, l);
+    xe.rel32_fixup(&mut S.e, l);
 }
-
-// Branch relaxation (encode_func): the jumps, in the order they are encoded,
-// that take a rel8 displacement (jshort); in the first pass, which encodes
-// them all with rel32, where each starts and where it goes.
-let mut jshort: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
-let mut jstart: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut jlabel: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
-let mut jnext: usize = 0;
-// the rel8 jumps of a pass: jump number << 32 | its fixup
-let mut jfix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 // A jump (jmp: 0xe9 / 0xeb; jcc: 0x0f 0x80+cc / 0x70+cc) to label l.
 fn enc_jump(l: i32, cond: bool, cc: i32) void {
-    let k = jnext;
-    jnext += 1;
-    if k >= jshort.len {
-        jshort.push(false);
-        jstart.push(@as(u64, E.b.len()));
-        jlabel.push(l);
+    let k = S.jnext;
+    S.jnext += 1;
+    if k >= S.jshort.len {
+        S.jshort.push(false);
+        S.jstart.push(@as(u64, S.e.b.len()));
+        S.jlabel.push(l);
     }
-    if jshort.get(k) {
+    if S.jshort.get(k) {
         if cond {
             b8(0x70 + @as(u64, @bit_cast(u32, cc)));
         } else {
             b8(0xeb);
         }
-        jfix.push((@as(u64, k) << 32) | @as(u64, E.fixups.len));
-        xe.rel8_fixup(&mut E, l);
+        S.jfix.push((@as(u64, k) << 32) | @as(u64, S.e.fixups.len));
+        xe.rel8_fixup(&mut S.e, l);
         return;
     }
     if cond {
@@ -394,21 +374,21 @@ fn enc_jump(l: i32, cond: bool, cc: i32) void {
 // once the others chosen so are short too (distances only shrink as more
 // are: repeated until none changes). True if any is.
 fn relax_jumps(boff: []u64) bool {
-    let n = jshort.len;
+    let n = S.jshort.len;
     if n == 0 {
         return false;
     }
     let tgt = u.newn.[u64](n + 1);
     let longl = u.newn.[i64](n + 1);
     for k in 0..n {
-        let l = jlabel.get(k);
+        let l = S.jlabel.get(k);
         if l >= xe.LOCAL_BASE {
-            tgt[k] = local_off.get(@int_cast(usize, l - xe.LOCAL_BASE));
+            tgt[k] = S.local_off.get(@int_cast(usize, l - xe.LOCAL_BASE));
         } else {
             tgt[k] = boff[@int_cast(usize, l)];
         }
         longl[k] = 5;
-        if E.b.view()[@truncate(usize, jstart.get(k))] == 0x0f {
+        if S.e.b.view()[@truncate(usize, S.jstart.get(k))] == 0x0f {
             longl[k] = 6;
         }
     }
@@ -421,13 +401,13 @@ fn relax_jumps(boff: []u64) bool {
         let mut acc: i64 = 0;
         for k in 0..n {
             before[k] = acc;
-            if jshort.get(k) {
+            if S.jshort.get(k) {
                 acc += longl[k] - 2;
             }
         }
         before[n] = acc;
         for k in 0..n {
-            if jshort.get(k) {
+            if S.jshort.get(k) {
                 continue;
             }
             // the target, moved up by the savings before it: those of the
@@ -437,20 +417,20 @@ fn relax_jumps(boff: []u64) bool {
             let mut hi: usize = n;
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                if jstart.get(mid) < t {
+                if S.jstart.get(mid) < t {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
             }
             let nt = @bit_cast(i64, t) - before[lo];
-            let ns = @bit_cast(i64, jstart.get(k)) - before[k];
+            let ns = @bit_cast(i64, S.jstart.get(k)) - before[k];
             let mut rel = nt - (ns + 2);
-            if t > jstart.get(k) {
+            if t > S.jstart.get(k) {
                 rel -= longl[k] - 2;  // (this jump's own saving is among those before t)
             }
             if (rel >= -128) and (rel <= 127) {
-                jshort.set(k, true);
+                S.jshort.set(k, true);
                 changed = true;
                 any = true;
             }
@@ -464,18 +444,18 @@ fn relax_jumps(boff: []u64) bool {
 // shrink) take a rel32 from now on. True if any does: encode again.
 fn unrelax_jumps(boff: []u64) bool {
     let mut any = false;
-    for n in 0..jfix.len {
-        let x = jfix.get(n);
-        let f = E.fixups.get(@truncate(usize, x & 0xffff_ffff));
+    for n in 0..S.jfix.len {
+        let x = S.jfix.get(n);
+        let f = S.e.fixups.get(@truncate(usize, x & 0xffff_ffff));
         let mut target: u64 = 0;
         if f.label >= xe.LOCAL_BASE {
-            target = local_off.get(@int_cast(usize, f.label - xe.LOCAL_BASE));
+            target = S.local_off.get(@int_cast(usize, f.label - xe.LOCAL_BASE));
         } else {
             target = boff[@int_cast(usize, f.label)];
         }
         let rel = @bit_cast(i64, target) - @bit_cast(i64, f.off + 1);
         if (rel < -128) or (rel > 127) {
-            jshort.set(@truncate(usize, x >> 32), false);
+            S.jshort.set(@truncate(usize, x >> 32), false);
             any = true;
         }
     }
@@ -494,7 +474,7 @@ fn emit_nops(n0: u64) void {
     while n > 0 {
         let k = @min(n, 10);
         let at = @truncate(usize, (k * (k - 1)) / 2);
-        E.b.put(NOPS[at..at + @truncate(usize, k)]);
+        S.e.b.put(NOPS[at..at + @truncate(usize, k)]);
         n -= k;
     }
 }
@@ -511,19 +491,19 @@ struct EncMark {
 }
 
 fn enc_mark() EncMark {
-    return EncMark.{ b: E.b.len(), relocs: E.relocs.len, fixups: E.fixups.len, jnext: jnext, jlen: jshort.len,
-                     jfix: jfix.len };
+    return EncMark.{ b: S.e.b.len(), relocs: S.e.relocs.len, fixups: S.e.fixups.len, jnext: S.jnext, jlen: S.jshort.len,
+                     jfix: S.jfix.len };
 }
 
 fn enc_rewind(m: EncMark) void {
-    E.b.b.len = m.b;
-    E.relocs.len = m.relocs;
-    E.fixups.len = m.fixups;
-    jnext = m.jnext;
-    jshort.len = m.jlen;
-    jstart.len = m.jlen;
-    jlabel.len = m.jlen;
-    jfix.len = m.jfix;
+    S.e.b.b.len = m.b;
+    S.e.relocs.len = m.relocs;
+    S.e.fixups.len = m.fixups;
+    S.jnext = m.jnext;
+    S.jshort.len = m.jlen;
+    S.jstart.len = m.jlen;
+    S.jlabel.len = m.jlen;
+    S.jfix.len = m.jfix;
 }
 
 // Encodes nothing (a no-op move, a local label).
@@ -562,19 +542,19 @@ fn enc_unit(i: *mut mc.MInst, last: *mut mc.MInst, extra: u64) void {
     }
     if i.op == xe.RET {
         // (only the ret itself, the epilogue's last byte)
-        let e = FBASE + @as(u64, E.b.len());
+        let e = S.fbase + @as(u64, S.e.b.len());
         if (e % 32) == 0 {
-            let n = E.b.len();
-            if E.b.view()[n - 1] != 0xc3 {
+            let n = S.e.b.len();
+            if S.e.b.view()[n - 1] != 0xc3 {
                 fail("internal compiler error: an epilogue that does not end in ret");
             }
-            E.b.b.len = n - 1;
+            S.e.b.b.len = n - 1;
             emit_nops(1);
             b8(0xc3);
         }
         return;
     }
-    let s = FBASE + @as(u64, m.b);
+    let s = S.fbase + @as(u64, m.b);
     let mut pad: u64 = 0;
     if i.op == xe.REP {
         // memmove's own jumps: a fused cmp + jae at 9, a jmp at 28 (see enc_rep)
@@ -582,7 +562,7 @@ fn enc_unit(i: *mut mc.MInst, last: *mut mc.MInst, extra: u64) void {
             pad += 1;
         }
     } else {
-        let len = @as(u64, E.b.len()) - @as(u64, m.b) + extra;
+        let len = @as(u64, S.e.b.len()) - @as(u64, m.b) + extra;
         if crosses32(s, len) and (len < 32) {
             pad = 32 - (s % 32);
         }
@@ -606,20 +586,20 @@ fn enc_unit(i: *mut mc.MInst, last: *mut mc.MInst, extra: u64) void {
 // into it with nothing between (no padding, no prologue); else 0.
 fn jcc_next_block(bi: usize, skip: []bool, lal: []bool, sw: i32) u64 {
     let mut n = bi + 1;
-    while (n < MF.blocks.len) and skip[n] and not lal[n] and (@as(i32, @int_cast(i32, n)) != sw) {
+    while (n < xc.FN.mf.blocks.len) and skip[n] and not lal[n] and (@as(i32, @int_cast(i32, n)) != sw) {
         n += 1;
     }
-    if (n >= MF.blocks.len) or lal[n] or (@as(i32, @int_cast(i32, n)) == sw) {
+    if (n >= xc.FN.mf.blocks.len) or lal[n] or (@as(i32, @int_cast(i32, n)) == sw) {
         return 0;
     }
-    let mut j = MF.blocks.get(n).first;
+    let mut j = xc.FN.mf.blocks.get(n).first;
     while u.notnil(j) and enc_nothing(j) {
         j = j.next;
     }
     if u.isnil(j) or (j.op != xe.JCC) {
         return 0;
     }
-    if (jnext < jshort.len) and jshort.get(jnext) {
+    if (S.jnext < S.jshort.len) and S.jshort.get(S.jnext) {
         return 2;
     }
     return 6;
@@ -630,7 +610,7 @@ fn jcc_next_block(bi: usize, skip: []bool, lal: []bool, sw: i32) u64 {
 // block in a loop, run at least a fifth as often as a loop header, that
 // its layout predecessor does not fall into as often as a fifth of its runs).
 fn loop_aligned(skip: []bool) []mut bool {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let al = u.newn.[bool](nb + 1);
     for bi in 0..nb {
         al[bi] = false;
@@ -646,7 +626,7 @@ fn loop_aligned(skip: []bool) []mut bool {
         if skip[bi] {
             continue;
         }
-        let mut i = MF.blocks.get(bi).first;
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) and
                (@as(usize, @int_cast(usize, i.ops[0].label)) <= bi) {
@@ -656,7 +636,7 @@ fn loop_aligned(skip: []bool) []mut bool {
         }
     }
     for bi in 1..nb {
-        let b = MF.blocks.get(bi);
+        let b = xc.FN.mf.blocks.get(bi);
         if skip[bi] or (b.loop_depth == 0) or b.cold {
             continue;
         }
@@ -672,7 +652,7 @@ fn loop_aligned(skip: []bool) []mut bool {
         while (p > 0) and skip[p] {
             p -= 1;
         }
-        let pb = MF.blocks.get(p);
+        let pb = xc.FN.mf.blocks.get(p);
         let mut fall: f64 = 0.0;
         if not ends_flow(pb) {
             fall = pb.freq;
@@ -688,14 +668,6 @@ fn loop_aligned(skip: []bool) []mut bool {
     return al;
 }
 
-// A leaf with nothing on the stack needs no frame.
-let mut frameless: bool = false;
-
-// Shrink-wrapping (mc.shrink_wrap; not on Windows, whose unwind tables
-// describe a prologue at the start): blocks before SW run without the frame,
-// which block SW sets up; in_noframe while they are encoded.
-pub let mut SW: i32 = -1;
-let mut in_noframe: bool = false;
 pub const CALLEE_SAVED: u64 = (
     ((@as(u64, 1) << 3) | (@as(u64, 1) << 12)) | ((@as(u64, 1) << 13) | (@as(u64, 1) << 14))) | (@as(u64, 1) << 15);  // rbx r12-r15
 
@@ -749,11 +721,11 @@ pub fn is_tail(i: *mc.MInst) bool {
 }
 
 fn needs_frame() bool {
-    if (nsaved > 0) or (nxsaved > 0) or (MF.slots.len > 0) or (out_area != 0) {
+    if (S.nsaved > 0) or (S.nxsaved > 0) or (xc.FN.mf.slots.len > 0) or (xc.FN.out_area != 0) {
         return true;
     }
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..xc.FN.mf.blocks.len {
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if (i.clobber != 0) or asm_uses_stack(i) {
                 return true;  // a call that returns (a noreturn one only needs the stack aligned)
@@ -788,11 +760,11 @@ fn xmm_rbp(x: i32, disp: i64, store: bool) void {
         b8(0x10);
     }
     b8(0x85 | (@as(u64, @bit_cast(u32, r & 7)) << 3));
-    E.b.u32_(@bit_cast(u64, disp));
+    S.e.b.u32_(@bit_cast(u64, disp));
 }
 
 fn xmm_save_off(k: i64) i64 {
-    return -((8 * nsaved) + (16 * (k + 1)));
+    return -((8 * S.nsaved) + (16 * (k + 1)));
 }
 
 fn epilogue() void {
@@ -805,9 +777,9 @@ fn epilogue() void {
 // pushed callee-saved registers below it.
 fn save_list(regs: *mut [8]u64) void {
     regs[0] = dw.saved_reg(dw.X64_RBP, -16);
-    for k in 0..@int_cast(usize, nsaved) {
+    for k in 0..@int_cast(usize, S.nsaved) {
         regs[k + 1] = dw.saved_reg(
-            DW_GPR[@as(usize, @bit_cast(u32, saved[k] & 15))], -24 - (8 * @as(i64, @int_cast(i64, k))));
+            DW_GPR[@as(usize, @bit_cast(u32, S.saved[k] & 15))], -24 - (8 * @as(i64, @int_cast(i64, k))));
     }
 }
 
@@ -817,33 +789,33 @@ fn save_list(regs: *mut [8]u64) void {
 // a sibling call's jump is not the function's end, or the encoding cannot
 // describe the saves.
 fn mac_unwind(fs: u32, size: u64, early: bool) void {
-    if frameless {
-        mu.add(&mut MU, fs, 0, size, mu.x64_frameless(), u.nil_slice.[u8](), false, false);
+    if S.frameless {
+        mu.add(&mut xc.O.mu, fs, 0, size, mu.x64_frameless(), u.nil_slice.[u8](), false, false);
         return;
     }
     let mut regs: [8]u64 = [0; 8];
     save_list(&mut regs);
-    let n = @int_cast(usize, nsaved) + 1;
+    let n = @int_cast(usize, S.nsaved) + 1;
     let mut enc = mu.x64_frame(regs[0..n]);
-    if early or dyn_stack() or (nxsaved > 0) {
+    if early or dyn_stack() or (S.nxsaved > 0) {
         enc = 0;
     }
-    for e in tail_ends.items() {
+    for e in S.tail_ends.items() {
         if e != size {
             enc = 0;
         }
     }
     if enc != 0 {
-        mu.add(&mut MU, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
+        mu.add(&mut xc.O.mu, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
         return;
     }
-    let df = dw.Func.{ xcfi: xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
-                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+    let df = dw.Func.{ xcfi: S.xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: S.cfis.items(), regs: regs[0..n],
                        irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
                        frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, false, &df);
-    mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
+    mu.add(&mut xc.O.mu, fs, 0, size, 0, prog.view(), false, false);
     prog.free();
 }
 
@@ -853,38 +825,32 @@ fn mac_unwind(fs: u32, size: u64, early: bool) void {
 fn elf_unwind(base: u64, size: u64) void {
     let mut regs: [8]u64 = [0; 8];
     save_list(&mut regs);
-    let n = @int_cast(usize, nsaved) + 1;
-    let df = dw.Func.{ xcfi: xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
-                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+    let n = @int_cast(usize, S.nsaved) + 1;
+    let df = dw.Func.{ xcfi: S.xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: S.cfis.items(), regs: regs[0..n],
                        irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
                        frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, false, &df);
-    mu.add(&mut MU, elf.sec_sym(OBJ, TEXT), base, size, 0, prog.view(), false, false);
+    mu.add(&mut xc.O.mu, elf.sec_sym(xc.O.obj, xc.O.text), base, size, 0, prog.view(), false, false);
     prog.free();
 }
 
-// The call frame states as the function is encoded (dwarf.cfi_state; none
-// unless DBG or MU is on: -g, an unwind table), and the registers the frame saves (dwarf.saved_reg):
-// rbp at CFA - 16, then the pushed callee-saved registers below it.
-let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut cfi_regs: [20]u64 = [0; 20];
-let mut xcfis: u.List.[dw.XCfi] = u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 };
 // our register numbers -> DWARF's (rax rcx rdx rbx rsp rbp rsi rdi -> 0 2 1 3 7 6 4 5)
 let DW_GPR: [16]u32 = [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(reg: u32, k: u64, mask: u64) void {
-    if not DBG.on and not MU.on {
+    if not xc.O.dbg.on and not xc.O.mu.on {
         return;
     }
-    let at = @as(u64, E.b.len());
+    let at = @as(u64, S.e.b.len());
     let st = dw.cfi_state(at, reg, k, mask);
-    if (cfis.len > 0) and ((cfis.last() & 0xffff_ffff) == at) {
-        cfis.set(cfis.len - 1, st);
+    if (S.cfis.len > 0) and ((S.cfis.last() & 0xffff_ffff) == at) {
+        S.cfis.set(S.cfis.len - 1, st);
         return;
     }
-    cfis.push(st);
+    S.cfis.push(st);
 }
 
 // The state at a function's entry (and in blocks run without the frame).
@@ -895,38 +861,38 @@ fn cfi_entry() void {
 // The state in the function's body: CFA = rbp + 16, rbp and the callee-saved
 // registers saved (or, without a frame, the entry's).
 fn cfi_body() void {
-    if frameless or in_noframe {
+    if S.frameless or S.in_noframe {
         cfi_entry();
         return;
     }
-    cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, nsaved + 1)) - 1);
+    cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, S.nsaved + 1)) - 1);
 }
 
 // The epilogue but its ret: the callee-saved registers and the caller's
 // frame back.
 fn unframe() void {
-    if frameless or in_noframe {
+    if S.frameless or S.in_noframe {
         return;
     }
-    for k in 0..nxsaved {
-        xmm_rbp(xsaved[@int_cast(usize, k)], xmm_save_off(k), false);
+    for k in 0..S.nxsaved {
+        xmm_rbp(S.xsaved[@int_cast(usize, k)], xmm_save_off(k), false);
     }
-    if nsaved > 0 {
+    if S.nsaved > 0 {
         // lea rsp, [rbp - 8*nsaved]
         b8(0x48);
         b8(0x8d);
-        let d = -8 * nsaved;
+        let d = -8 * S.nsaved;
         if d >= -128 {
             b8(0x65);
             b8(@bit_cast(u64, d));
         } else {
             b8(0xa5);
-            E.b.u32_(@bit_cast(u64, d));
+            S.e.b.u32_(@bit_cast(u64, d));
         }
-        let mut k = nsaved;
+        let mut k = S.nsaved;
         while k > 0 {
             k -= 1;
-            let r = saved[@int_cast(usize, k)];
+            let r = S.saved[@int_cast(usize, k)];
             if r >= 8 {
                 b8(0x41);
             }
@@ -952,11 +918,11 @@ fn unframe() void {
 // the unwinder takes a jump out of the function for the end of an epilogue
 // (the specification's does, not every implementation).
 fn enc_tail(i: *mut mc.MInst) void {
-    if UPPER and DIRTY {
+    if xc.FN.upper and S.dirty {
         vzeroupper();
     }
     let mut sh: i64 = 0;
-    if WIN {
+    if xc.O.win {
         sh = 32;
     }
     let mut k: i64 = 0;
@@ -966,32 +932,28 @@ fn enc_tail(i: *mut mc.MInst) void {
         k += 8;
     }
     unframe();
-    let jmp_at = @as(u64, E.b.len());
+    let jmp_at = @as(u64, S.e.b.len());
     let t = i.ops[0];
     if t.kind == mc.K_SYM {
         b8(0xe9);
-        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
-        E.b.u32_(0);
+        S.e.relocs.push(xe.Reloc.{ off: @as(u64, S.e.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
+        S.e.b.u32_(0);
     } else {
         enc_op(8, 1, 0xff, 0, 4, t, 0, false);
     }
-    if WIN and not frameless {
-        tail_jumps.push((jmp_at << 32) | @as(u64, E.b.len()));
+    if xc.O.win and not S.frameless {
+        S.tail_jumps.push((jmp_at << 32) | @as(u64, S.e.b.len()));
     }
-    if MACOS {
-        tail_ends.push(@as(u64, E.b.len()));
+    if xc.O.macos {
+        S.tail_ends.push(@as(u64, S.e.b.len()));
     }
     cfi_body();
 }
 
-// Windows: the sibling calls' jumps of the function being encoded, as
-// (start << 32) | end offsets (emit_unwind).
-let mut tail_jumps: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-
 // Does MF make a sibling call?
 fn has_tail() bool {
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..xc.FN.mf.blocks.len {
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if is_tail(i) {
                 return true;
@@ -1016,19 +978,15 @@ struct UnwindStep {
     val: u64,
 }
 
-let mut uw: [24]UnwindStep = [UnwindStep.{ off: 0, op: 0, reg: 0, val: 0 }; 24];
-let mut nuw: usize = 0;
-let mut prologue_end: u64 = 0;
-
 fn uw_step(op: u32, r: i32, val: u64) void {
-    uw[nuw] = UnwindStep.{ off: @as(u64, E.b.len()), op: op, reg: @bit_cast(u32, r), val: val };
-    nuw += 1;
+    S.uw[S.nuw] = UnwindStep.{ off: @as(u64, S.e.b.len()), op: op, reg: @bit_cast(u32, r), val: val };
+    S.nuw += 1;
 }
 
 fn prologue(sub: i64) void {
-    nuw = 0;
-    prologue_end = 0;
-    if frameless {
+    S.nuw = 0;
+    S.prologue_end = 0;
+    if S.frameless {
         return;
     }
     b8(0x55);  // push rbp
@@ -1038,11 +996,11 @@ fn prologue(sub: i64) void {
     b8(0x89);
     b8(0xe5);  // mov rbp, rsp
     cfi(dw.X64_RBP, 2, 1);
-    if WIN and (dyn_stack() or has_tail()) {
+    if xc.O.win and (dyn_stack() or has_tail()) {
         uw_step(UW_SETFP, xe.RBP, 0);
     }
-    for k in 0..@int_cast(usize, nsaved) {
-        let r = saved[k];
+    for k in 0..@int_cast(usize, S.nsaved) {
+        let r = S.saved[k];
         if r >= 8 {
             b8(0x41);
         }
@@ -1050,7 +1008,7 @@ fn prologue(sub: i64) void {
         uw_step(UW_PUSH, r, 0);
         cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, k + 2)) - 1);
     }
-    if (sub > 4096) and WIN {
+    if (sub > 4096) and xc.O.win {
         // Windows: touch each page of a large frame in order (the stack's
         // guard page) without moving rsp, so that the unwind information's
         // single allocation code is right throughout (an exception, a stack
@@ -1060,16 +1018,16 @@ fn prologue(sub: i64) void {
         //   cmp r11, -4096 * (pages + 1); jne L
         // (r11 is free at the entry: Windows has no shrink-wrapping)
         let pages = (sub - 1) / 4096;
-        E.b.put("\x49\xc7\xc3\x00\xf0\xff\xff");
-        E.b.put("\x4a\x83\x0c\x1c\x00");
-        E.b.put("\x49\x81\xeb\x00\x10\x00\x00");
-        E.b.put("\x49\x81\xfb");
-        E.b.u32_(@bit_cast(u64, -4096 * (pages + 1)));
-        E.b.put("\x75\xeb");
+        S.e.b.put("\x49\xc7\xc3\x00\xf0\xff\xff");
+        S.e.b.put("\x4a\x83\x0c\x1c\x00");
+        S.e.b.put("\x49\x81\xeb\x00\x10\x00\x00");
+        S.e.b.put("\x49\x81\xfb");
+        S.e.b.u32_(@bit_cast(u64, -4096 * (pages + 1)));
+        S.e.b.put("\x75\xeb");
         b8(0x48);
         b8(0x81);
         b8(0xec);
-        E.b.u32_(@bit_cast(u64, sub));
+        S.e.b.u32_(@bit_cast(u64, sub));
         uw_step(UW_ALLOC, 0, @bit_cast(u64, sub));
     } else if sub > 0 {
         // touch each page of a large frame in order (stack guard)
@@ -1078,7 +1036,7 @@ fn prologue(sub: i64) void {
             b8(0x48);
             b8(0x81);
             b8(0xec);
-            E.b.u32_(4096);
+            S.e.b.u32_(4096);
             // or qword [rsp], 0
             b8(0x48);
             b8(0x83);
@@ -1090,15 +1048,16 @@ fn prologue(sub: i64) void {
         b8(0x48);
         b8(0x81);
         b8(0xec);
-        E.b.u32_(@bit_cast(u64, rem));
+        S.e.b.u32_(@bit_cast(u64, rem));
         uw_step(UW_ALLOC, 0, @bit_cast(u64, sub));
     }
-    for k in 0..nxsaved {
-        xmm_rbp(xsaved[@int_cast(usize, k)], xmm_save_off(k), true);
+    for k in 0..S.nxsaved {
+        xmm_rbp(S.xsaved[@int_cast(usize, k)], xmm_save_off(k), true);
         // rbp - 8*nsaved - sub is rsp, so the save is at rsp + sub + its offset
-        uw_step(UW_XMM, xsaved[@int_cast(usize, k)] - xe.XMM0, @bit_cast(u64, sub + xmm_save_off(k) + (8 * nsaved)));
+        uw_step(
+            UW_XMM, S.xsaved[@int_cast(usize, k)] - xe.XMM0, @bit_cast(u64, sub + xmm_save_off(k) + (8 * S.nsaved)));
     }
-    prologue_end = @as(u64, E.b.len());
+    S.prologue_end = @as(u64, S.e.b.len());
 }
 
 // Does MF move the stack pointer after the prologue (xe.DYNSTACK)?
@@ -1111,8 +1070,8 @@ fn asm_uses_stack(i: *mc.MInst) bool {
 }
 
 fn dyn_stack() bool {
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..xc.FN.mf.blocks.len {
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if (i.op == xe.DYNSTACK) or asm_uses_stack(i) {
                 return true;
@@ -1134,17 +1093,17 @@ fn dyn_stack() bool {
 // clamped. A function whose stack pointer moves after the prologue
 // (DYNSTACK) has rbp as its frame register: see dyn_unwind_codes.
 fn unwind_info() bn.Bytes {
-    for k0 in 0..nuw {
-        if uw[k0].op == UW_SETFP {
+    for k0 in 0..S.nuw {
+        if S.uw[k0].op == UW_SETFP {
             return dyn_unwind_info();
         }
     }
     let mut codes = bn.new_bytes();
     let mut n: u64 = 0;
-    let mut k = nuw;
+    let mut k = S.nuw;
     while k > 0 {
         k -= 1;
-        let s = uw[k];
+        let s = S.uw[k];
         let off = @min(s.off, 255);
         if s.op == UW_PUSH {
             codes.u8_(@truncate(u8, off));
@@ -1182,11 +1141,11 @@ fn unwind_info() bn.Bytes {
     }
     let mut b = bn.new_bytes();
     b.u8_(1);
-    b.u8_(@truncate(u8, @min(prologue_end, 255)));
+    b.u8_(@truncate(u8, @min(S.prologue_end, 255)));
     b.u8_(@truncate(u8, n));
     let mut fr: u64 = 0;
-    for k2 in 0..nuw {
-        if uw[k2].op == UW_SETFP {
+    for k2 in 0..S.nuw {
+        if S.uw[k2].op == UW_SETFP {
             fr = 5;  // (rbp, at offset 0)
         }
     }
@@ -1217,27 +1176,27 @@ fn unwind_info() bn.Bytes {
 fn dyn_unwind_info() bn.Bytes {
     let mut setfp_off: u64 = 0;
     let mut push_off: u64 = 0;
-    for k in 0..nuw {
-        if uw[k].op == UW_SETFP {
-            setfp_off = uw[k].off;
-        } else if (uw[k].op == UW_PUSH) and (uw[k].reg == @bit_cast(u32, xe.RBP)) {
-            push_off = uw[k].off;
+    for k in 0..S.nuw {
+        if S.uw[k].op == UW_SETFP {
+            setfp_off = S.uw[k].off;
+        } else if (S.uw[k].op == UW_PUSH) and (S.uw[k].reg == @bit_cast(u32, xe.RBP)) {
+            push_off = S.uw[k].off;
         }
     }
-    let below = (8 * @bit_cast(u64, nsaved)) + (16 * @bit_cast(u64, nxsaved));
+    let below = (8 * @bit_cast(u64, S.nsaved)) + (16 * @bit_cast(u64, S.nxsaved));
     let fo = (below + 15) / 16;
     let mut codes = bn.new_bytes();
     let mut n: u64 = 0;
-    let mut k = nuw;
+    let mut k = S.nuw;
     while k > 0 {
         k -= 1;
-        let s = uw[k];
+        let s = S.uw[k];
         let off = @min(s.off, 255);
         if (s.op == UW_PUSH) and (s.reg != @bit_cast(u32, xe.RBP)) {
             // the k-th push after rbp's: at rbp - 8 * (its place + 1)
             let mut place: u64 = 0;
             for j in 0..k {
-                if (uw[j].op == UW_PUSH) and (uw[j].reg != @bit_cast(u32, xe.RBP)) {
+                if (S.uw[j].op == UW_PUSH) and (S.uw[j].reg != @bit_cast(u32, xe.RBP)) {
                     place += 1;
                 }
             }
@@ -1249,7 +1208,7 @@ fn dyn_unwind_info() bn.Bytes {
             // at rsp + val after the prologue, rsp = rbp - 8 * nsaved - sub:
             // rbp - (8 * nsaved + sub - val)
             let sub = alloc_of();
-            let depth = ((8 * @bit_cast(u64, nsaved)) + sub) - s.val;
+            let depth = ((8 * @bit_cast(u64, S.nsaved)) + sub) - s.val;
             codes.u8_(@truncate(u8, off));
             codes.u8_(@truncate(u8, 9 | (@as(u64, s.reg) << 4)));  // UWOP_SAVE_XMM128_FAR
             codes.u32_((16 * fo) - depth);
@@ -1280,7 +1239,7 @@ fn dyn_unwind_info() bn.Bytes {
     }
     let mut b = bn.new_bytes();
     b.u8_(1);
-    b.u8_(@truncate(u8, @min(prologue_end, 255)));
+    b.u8_(@truncate(u8, @min(S.prologue_end, 255)));
     b.u8_(@truncate(u8, n));
     b.u8_(@truncate(u8, 5 | (fo << 4)));  // rbp, at the offset fo
     b.put(codes.view());
@@ -1290,9 +1249,9 @@ fn dyn_unwind_info() bn.Bytes {
 
 // The prologue's allocation (UW_ALLOC's bytes), or 0.
 fn alloc_of() u64 {
-    for k in 0..nuw {
-        if uw[k].op == UW_ALLOC {
-            return uw[k].val;
+    for k in 0..S.nuw {
+        if S.uw[k].op == UW_ALLOC {
+            return S.uw[k].val;
         }
     }
     return 0;
@@ -1309,26 +1268,26 @@ fn alloc_of() u64 {
 // them as the first's body).
 fn emit_unwind(fs: u32, base: u64, size: u64) void {
     _ = base;
-    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    let x = xc.O.obj.secs.get(@int_cast(usize, xc.O.xdata));
     x.data.align(4);
     let xoff = @as(u64, x.data.len());
     let mut info = unwind_info();
     let freg = info.view()[3];
     x.data.put(info.view());
     info.free();
-    if tail_jumps.len == 0 {
+    if S.tail_jumps.len == 0 {
         _ = pdata_entry(fs, 0, size, xoff);
         return;
     }
-    let first_end = tail_jumps.get(0) >> 32;
+    let first_end = S.tail_jumps.get(0) >> 32;
     let poff = pdata_entry(fs, 0, first_end, xoff);
     // the jumps' information: no codes
     x.data.align(4);
     let leaf = @as(u64, x.data.len());
     x.data.u32_(1);
     let mut at = first_end;
-    for k in 0..tail_jumps.len {
-        let j = tail_jumps.get(k);
+    for k in 0..S.tail_jumps.len {
+        let j = S.tail_jumps.get(k);
         let js = j >> 32;
         let je = j & 0xffff_ffff;
         if js > at {
@@ -1345,19 +1304,19 @@ fn emit_unwind(fs: u32, base: u64, size: u64) void {
 // A .pdata entry for fs + [from, to) with the unwind information at xoff in
 // .xdata; its offset in .pdata.
 fn pdata_entry(fs: u32, from: u64, to: u64, xoff: u64) u64 {
-    let p = OBJ.secs.get(@int_cast(usize, PDATA));
+    let p = xc.O.obj.secs.get(@int_cast(usize, xc.O.pdata));
     let poff = @as(u64, p.data.len());
     p.data.zeros(12);
     p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, from) });
     p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, to) });
-    p.relocs.push(elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
+    p.relocs.push(elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: xc.O.xdata_sym, addend: @bit_cast(i64, xoff) });
     return poff;
 }
 
 // An entry for fs + [from, to) whose unwind information is chained to the
 // function's first entry (at primary in .pdata; frame register byte freg).
 fn chained_entry(fs: u32, from: u64, to: u64, freg: u8, primary: u64) void {
-    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    let x = xc.O.obj.secs.get(@int_cast(usize, xc.O.xdata));
     x.data.align(4);
     let xoff = @as(u64, x.data.len());
     x.data.u8_(1 | (4 << 3));  // version 1, UNW_FLAG_CHAININFO
@@ -1365,8 +1324,8 @@ fn chained_entry(fs: u32, from: u64, to: u64, freg: u8, primary: u64) void {
     x.data.u8_(0);
     x.data.u8_(freg);
     // the first entry, copied (begin, end, unwind information)
-    let p = OBJ.secs.get(@int_cast(usize, PDATA));
-    let first_end = tail_jumps.get(0) >> 32;
+    let p = xc.O.obj.secs.get(@int_cast(usize, xc.O.pdata));
+    let first_end = S.tail_jumps.get(0) >> 32;
     let at = @as(u64, x.data.len());
     x.data.zeros(12);
     x.relocs.push(elf.Rel.{ off: at, ty: elf.R_X86_64_RVA32, sym: fs, addend: 0 });
@@ -1403,11 +1362,11 @@ fn enc_sse(i: *mut mc.MInst) void {
     }
     if o1.kind == mc.K_REG {
         let m = xe.Mem.{ base: -1, index: -1, scale: 0, disp: 0, sym: -1, tpoff: false, gottpoff: false };
-        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl,
+        xe.sse(&mut S.e, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl,
                (@bit_cast(u64, i.aux) & 15) | (@bit_cast(u64, i.aux) & 32));
     } else {
         let mut m = to_mem(o1);
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 63);
+        xe.sse(&mut S.e, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 63);
     }
 }
 
@@ -1419,18 +1378,18 @@ fn enc_mov_ri(sz: u8, d: i32, x: i64) void {
         if is.fits32(x) {
             b8(0xc7);
             b8(0xc0 | @as(u64, @bit_cast(u32, d & 7)));
-            E.b.u32_(@bit_cast(u64, x));
+            S.e.b.u32_(@bit_cast(u64, x));
             return;
         }
         b8(0xb8 + @as(u64, @bit_cast(u32, d & 7)));
-        E.b.u64_(@bit_cast(u64, x));
+        S.e.b.u64_(@bit_cast(u64, x));
         return;
     }
     if d >= 8 {
         b8(0x41);
     }
     b8(0xb8 + @as(u64, @bit_cast(u32, d & 7)));
-    E.b.u32_(@bit_cast(u64, x));
+    S.e.b.u32_(@bit_cast(u64, x));
 }
 
 // A load into a register: a narrow one zero-extended (cc 1) or
@@ -1444,8 +1403,9 @@ fn enc_load(i: *mut mc.MInst) void {
         b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
         b8(0x8b);
         b8(0x05 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
-        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_REX_GOTPCRELX, sym: m.sym, addend: -4 });
-        E.b.u32_(0);
+        S.e.relocs.push(xe.Reloc.{ off: @as(u64, S.e.b.len()), ty: elf.R_X86_64_REX_GOTPCRELX, sym: m.sym,
+                                   addend: -4 });
+        S.e.b.u32_(0);
         return;
     }
     let k = i.cc;
@@ -1505,7 +1465,7 @@ fn enc_vex_0f38(sz: u8, pp: u64, opc: u64, r: i32, vvvv: i32, rm: i32) void {
             (((~@as(u64, @bit_cast(u32, rm >> 3))) & 1) << 5) | 2));
     b8(((w << 7) | (((~@as(u64, @bit_cast(u32, vvvv))) & 15) << 3)) | pp);
     b8(opc);
-    xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, r)), @as(u64, @bit_cast(u32, rm)));
+    xe.modrm_rr(&mut S.e, @as(u64, @bit_cast(u32, r)), @as(u64, @bit_cast(u32, rm)));
 }
 
 // bswap r: [REX] 0F C8+r
@@ -1523,25 +1483,25 @@ fn enc_bswap(sz: u8, r: i32) void {
 
 // A call of symbol or register (or memory) t.
 fn enc_call(t: mc.MOp) void {
-    if UPPER and DIRTY {
+    if xc.FN.upper and S.dirty {
         vzeroupper();
     }
-    DIRTY = false;  // (the callee returns with the upper halves clear)
-    let nf = frameless or in_noframe;
-    if nf and WIN {
+    S.dirty = false;  // (the callee returns with the upper halves clear)
+    let nf = S.frameless or S.in_noframe;
+    if nf and xc.O.win {
         // (every call on Windows has its shadow space, which gives the function
         // a frame: one without has no unwind information for this)
         fail("internal compiler error: a call in a function without a frame (Windows)");
     }
     if nf {
         // sub rsp, 8: the call (which does not return) needs rsp aligned
-        E.b.put("\x48\x83\xec\x08");
+        S.e.b.put("\x48\x83\xec\x08");
         cfi(dw.X64_RSP, 2, 0);
     }
     if t.kind == mc.K_SYM {
         b8(0xe8);
-        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
-        E.b.u32_(0);
+        S.e.relocs.push(xe.Reloc.{ off: @as(u64, S.e.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
+        S.e.b.u32_(0);
     } else {
         enc_op(4, 1, 0xff, 0, 2, t, 0, false);
     }
@@ -1583,22 +1543,22 @@ fn enc_crc32(sz: u8, r: i32, m: i32) void {
 // to rdi.
 fn enc_rep(cc: i32) void {
     if cc == 0 {
-        E.b.put("\xf3\xa4");
+        S.e.b.put("\xf3\xa4");
     } else if cc == 1 {
-        E.b.put("\xf3\xaa");
+        S.e.b.put("\xf3\xaa");
     } else {
         // memmove: backwards when the destination is above the source, by
         // at most the length (it overlaps the source's end); forwards when
         // it is the source itself (copied onto itself) or below, or apart
         // mov rax, rdi; sub rax, rsi; dec rax; cmp rax, rcx; jae fwd
         let seq: [12]u8 = [0x48, 0x89, 0xf8, 0x48, 0x29, 0xf0, 0x48, 0xff, 0xc8, 0x48, 0x39, 0xc8];
-        E.b.put(seq[..]);
+        S.e.b.put(seq[..]);
         b8(0x73);
         b8(0x10);  // jae +16 (over the backward copy)
         // lea rsi, [rsi+rcx-1]; lea rdi, [rdi+rcx-1]; std; rep movsb; cld; jmp done
         let back: [17]u8 = [0x48, 0x8d, 0x74, 0x0e, 0xff, 0x48, 0x8d, 0x7c, 0x0f, 0xff, 0xfd, 0xf3, 0xa4, 0xfc, 0xeb,
                             0x02, 0x90];
-        E.b.put(back[0..16]);
+        S.e.b.put(back[0..16]);
         // fwd: rep movsb
         b8(0xf3);
         b8(0xa4);
@@ -1642,13 +1602,13 @@ fn enc_dynstack(i: *mut mc.MInst) void {
     rex_wrb(0, t);
     b8(0x81);
     b8(0xf8 | tl);
-    E.b.u32_(4096);  // cmp t, 4096
+    S.e.b.u32_(4096);  // cmp t, 4096
     b8(0x76);
     b8(21);  // jbe (past the loop)
     b8(0x48);
     b8(0x81);
     b8(0xec);
-    E.b.u32_(4096);  // sub rsp, 4096
+    S.e.b.u32_(4096);  // sub rsp, 4096
     b8(0x48);
     b8(0x83);
     b8(0x0c);
@@ -1657,7 +1617,7 @@ fn enc_dynstack(i: *mut mc.MInst) void {
     rex_wrb(0, t);
     b8(0x81);
     b8(0xe8 | tl);
-    E.b.u32_(4096);  // sub t, 4096
+    S.e.b.u32_(4096);  // sub t, 4096
     b8(0xeb);
     b8(0xe2);  // jmp (back to the cmp: -30)
     rex_wrb(t, 0);
@@ -1668,16 +1628,8 @@ fn enc_dynstack(i: *mut mc.MInst) void {
     b8(0x8d);
     b8(0x84 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
     b8(0x24);
-    E.b.u32_(out_area);
+    S.e.b.u32_(xc.FN.out_area);
 }
-
-// Jump tables (x64.ax gen_jump_table): the jumps of the pass being encoded,
-// whose tables are filled in once the function's place is known
-// (fill_jump_tables), and a local symbol at the start of the function's
-// section for their entries (elf.sec_sym).
-let mut jtabs: u.List.[*mut mc.MInst] = u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0,
-                                                                 cap: 0 };
-let mut JT_TEXT: u32 = 0;
 
 // lea t, [rip + table]; movsxd u, dword [t + index*4]; add t, u; jmp t
 fn enc_jtab(i: *mut mc.MInst) void {
@@ -1688,7 +1640,7 @@ fn enc_jtab(i: *mut mc.MInst) void {
     enc_op(8, 1, 0x63, 0, v, mc.mem(t, ix, 4, 0), 0, false);
     enc_op(8, 1, 0x01, 0, v, mc.reg(t, mc.RUD), 0, false);
     enc_op(4, 1, 0xff, 0, 4, mc.reg(t, mc.RU), 0, false);
-    jtabs.push(i);
+    S.jtabs.push(i);
 }
 
 // The entries of the tables of the function's jumps through one (encoded
@@ -1696,34 +1648,32 @@ fn enc_jtab(i: *mut mc.MInst) void {
 // target from the table's start, a PC-relative relocation against .text
 // with the entry's own offset added back (S + A - P, P the entry's address).
 fn fill_jump_tables(base: u64, boff: []u64) void {
-    if jtabs.len == 0 {
+    if S.jtabs.len == 0 {
         return;
     }
-    JT_TEXT = elf.sec_sym(OBJ, TEXT);  // (the code's section: the function's)
-    for j in jtabs.items() {
-        let ts = OBJ.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
-        let sec = OBJ.secs.get(@int_cast(usize, ts.sec));
+    S.jt_text = elf.sec_sym(xc.O.obj, xc.O.text);  // (the code's section: the function's)
+    for j in S.jtabs.items() {
+        let ts = xc.O.obj.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
+        let sec = xc.O.obj.secs.get(@int_cast(usize, ts.sec));
         for k in 3..j.ops.len {
             let eo = 4 * @as(u64, k - 3);
             let target = base + boff[@int_cast(usize, j.ops[k].label)];
             sec.relocs.push(
                 elf.Rel.{
-                    off: ts.value + eo, ty: elf.R_X86_64_PC32, sym: JT_TEXT, addend: @bit_cast(i64, target + eo) });
+                    off: ts.value + eo, ty: elf.R_X86_64_PC32, sym: S.jt_text, addend: @bit_cast(i64, target + eo) });
         }
     }
-    jtabs.clear();
+    S.jtabs.clear();
 }
 
 // -----------------------------------------------------------------------------
 // Inline assembly (xe.ASM): the template with the operands where they were
 // allocated, assembled (asm/x64.ax) into the function's code
 // -----------------------------------------------------------------------------
-let mut asm_inst: *mc.MInst = @ptr_from_int(*mc.MInst, 0);
-let mut asm_err: []u8 = "";
 
 // Operand k of the statement being encoded, as asm/x64.ax renders it.
 fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
-    let o = asm_inst.ops[k];
+    let o = S.asm_inst.ops[k];
     let op = b.ops[k];
     let mut r = ai.rop_reg(0, op.bits, op.fp);
     if o.kind == mc.K_REG {
@@ -1738,7 +1688,7 @@ fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
         if (m.base < 0) and (m.sym >= 0) {
             r.name = u.cat2("__axiom_sym_", u.idec(m.sym));
         } else if m.base < 0 {
-            asm_err = "a memory operand without a base register";
+            S.asm_err = "a memory operand without a base register";
         }
     } else if o.kind == mc.K_SYM {
         r.kind = ai.OK_IMM;
@@ -1752,8 +1702,8 @@ fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
     let mut err = "";
     r.mbits = op.mbits;
     let t = ax.render(&r, mod, b.intel, &mut err);
-    if (err.len > 0) and (asm_err.len == 0) {
-        asm_err = u.f2("operand %s: %s", u.zdec(k), err);
+    if (err.len > 0) and (S.asm_err.len == 0) {
+        S.asm_err = u.f2("operand %s: %s", u.zdec(k), err);
     }
     return t;
 }
@@ -1766,55 +1716,55 @@ fn asm_symbol(name: []u8) u32 {
     if u.starts(name, "__axiom_sym_") {
         return @truncate(u32, @bit_cast(u64, u.atol(name[12..])));
     }
-    let al = aob.alias_sym(OBJ, ai.blob(asm_inst.aux).aliases, name);
+    let al = aob.alias_sym(xc.O.obj, ai.blob(S.asm_inst.aux).aliases, name);
     if al >= 0 {
         return @truncate(u32, @bit_cast(u64, al));
     }
-    return elf.ext_sym(OBJ, u.perm_dup(name), false);
+    return elf.ext_sym(xc.O.obj, u.perm_dup(name), false);
 }
 
 fn enc_asm(i: *mut mc.MInst) void {
     let b = ai.blob(i.aux);
-    asm_inst = i;
-    asm_err = "";
+    S.asm_inst = i;
+    S.asm_err = "";
     let mut text = ai.expand(b, asm_operand, ax.label_text, @as(u64, @bit_cast(u32, i.cc)));
     if b.goto_ {
         text = u.cat2(text, ax.goto_tail(b.nlabels, P(i.ops[i.ops.len - 1].reg)));
     }
-    if asm_err.len > 0 {
-        fail(u.f2("inline assembly at %s: %s", b.loc, asm_err));
+    if S.asm_err.len > 0 {
+        fail(u.f2("inline assembly at %s: %s", b.loc, S.asm_err));
         return;
     }
-    let start = @as(u64, E.b.len());
-    let A = ax.assemble_inline(text, FBASE + start, b.intel);
+    let start = @as(u64, S.e.b.len());
+    let A = ax.assemble_inline(text, S.fbase + start, b.intel);
     if acr.failed(A) {
         fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
         return;
     }
     let s = A.secs.at(0);
-    E.b.put(s.data.items());
-    let rels = aob.inline_asm(OBJ, A, fsym.get(@int_cast(usize, F.id)), start, asm_symbol);
+    S.e.b.put(s.data.items());
+    let rels = aob.inline_asm(xc.O.obj, A, xc.O.fsym.get(@int_cast(usize, xc.FN.f.id)), start, asm_symbol);
     if acr.failed(A) {
         fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
         return;
     }
     for r in rels {
-        E.relocs.push(xe.Reloc.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
+        S.e.relocs.push(xe.Reloc.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
     }
-    if DBG.on and (A.icfi.len > 0) {
+    if xc.O.dbg.on and (A.icfi.len > 0) {
         // (the registers the template saves: rules from rsp; the frame's saved
         // registers: rbp at CFA - 16, the pushed ones below it)
-        let regs = u.newn.[u32](@int_cast(usize, nsaved) + 1);
-        let offs = u.newn.[i64](@int_cast(usize, nsaved) + 1);
+        let regs = u.newn.[u32](@int_cast(usize, S.nsaved) + 1);
+        let offs = u.newn.[i64](@int_cast(usize, S.nsaved) + 1);
         regs[0] = dw.X64_RBP;
         offs[0] = -16;
-        for k in 0..@int_cast(usize, nsaved) {
-            regs[k + 1] = DW_GPR[@as(usize, @bit_cast(u32, saved[k] & 15))];
+        for k in 0..@int_cast(usize, S.nsaved) {
+            regs[k + 1] = DW_GPR[@as(usize, @bit_cast(u32, S.saved[k] & 15))];
             offs[k + 1] = -24 - (8 * @as(i64, @int_cast(i64, k)));
         }
         for c in acr.inline_cfi(
-            A, dw.X64_RSP, regs[0..@int_cast(usize, nsaved) + 1], offs[0..@int_cast(usize, nsaved) + 1]) {
-            xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
+            A, dw.X64_RSP, regs[0..@int_cast(usize, S.nsaved) + 1], offs[0..@int_cast(usize, S.nsaved) + 1]) {
+            S.xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
         }
     }
 }
@@ -2005,10 +1955,10 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.LABEL {
         let l = @truncate(i32, i.aux) - xe.LOCAL_BASE;
-        while local_off.len <= @int_cast(usize, l) {
-            local_off.push(0);
+        while S.local_off.len <= @int_cast(usize, l) {
+            S.local_off.push(0);
         }
-        local_off.set(@int_cast(usize, l), @as(u64, E.b.len()));
+        S.local_off.set(@int_cast(usize, l), @as(u64, S.e.b.len()));
         return;
     }
     if is_tail(i) {
@@ -2017,23 +1967,23 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.CALL {
         if wide_cr(i) {
-            DIRTY = false;  // (no vzeroupper before it: enc_call)
+            S.dirty = false;  // (no vzeroupper before it: enc_call)
             enc_call(i.ops[0]);
-            DIRTY = true;
+            S.dirty = true;
             return;
         }
         enc_call(i.ops[0]);
         return;
     }
     if op == xe.RET {
-        if UPPER and DIRTY and not wide_cr(i) {
+        if xc.FN.upper and S.dirty and not wide_cr(i) {
             vzeroupper();
         }
         epilogue();
         return;
     }
     if op == xe.UD2 {
-        E.b.put("\x0f\x0b");
+        S.e.b.put("\x0f\x0b");
         return;
     }
     if op == xe.XCHG {
@@ -2054,7 +2004,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.MFENCE {
-        E.b.put("\x0f\xae\xf0");
+        S.e.b.put("\x0f\xae\xf0");
         return;
     }
     if op == xe.CMPXCHG16B {
@@ -2080,7 +2030,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.CPUID {
-        E.b.put("\x0f\xa2");
+        S.e.b.put("\x0f\xa2");
         return;
     }
     if op == xe.BT {
@@ -2094,7 +2044,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.XGETBV {
-        E.b.put("\x0f\x01\xd0");
+        S.e.b.put("\x0f\x01\xd0");
         return;
     }
     if (op == xe.TLSBASE) and (i.ops.len > 1) and (i.ops[1].kind == mc.K_MEM) {
@@ -2109,21 +2059,22 @@ fn enc_inst(i: *mut mc.MInst) void {
         // mov rdi, [rip + sym@TLVP]; call [rdi]; then d = rax, and rdi,
         // rax and the flags restored; lea rsp, [rsp + 136]
         let d = P(i.ops[0].reg);
-        E.b.put("\x48\x8d\xa4\x24\x78\xff\xff\xff\x9c\x50\x57\x48\x8b\x3d");
-        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_AXIOM_TLV, sym: i.ops[1].sym, addend: -4 });
-        E.b.u32_(0);
-        E.b.put("\xff\x17");
+        S.e.b.put("\x48\x8d\xa4\x24\x78\xff\xff\xff\x9c\x50\x57\x48\x8b\x3d");
+        S.e.relocs.push(xe.Reloc.{ off: @as(u64, S.e.b.len()), ty: elf.R_X86_64_AXIOM_TLV, sym: i.ops[1].sym,
+                                   addend: -4 });
+        S.e.b.u32_(0);
+        S.e.b.put("\xff\x17");
         if d == 0 {
-            E.b.put("\x5f\x48\x8d\x64\x24\x08\x9d");  // pop rdi; lea rsp, [rsp + 8]; popfq
+            S.e.b.put("\x5f\x48\x8d\x64\x24\x08\x9d");  // pop rdi; lea rsp, [rsp + 8]; popfq
         } else if d == 7 {
-            E.b.put("\x48\x89\xc7\x48\x8d\x64\x24\x08\x58\x9d");  // mov rdi, rax; lea rsp, [rsp + 8]; pop rax; popfq
+            S.e.b.put("\x48\x89\xc7\x48\x8d\x64\x24\x08\x58\x9d");  // mov rdi, rax; lea rsp, [rsp + 8]; pop rax; popfq
         } else {
             b8(0x48 | @as(u64, @bit_cast(u32, (d >> 3) & 1)));  // mov d, rax
             b8(0x89);
             b8(0xc0 | @as(u64, @bit_cast(u32, d & 7)));
-            E.b.put("\x5f\x58\x9d");  // pop rdi; pop rax; popfq
+            S.e.b.put("\x5f\x58\x9d");  // pop rdi; pop rax; popfq
         }
-        E.b.put("\x48\x8d\xa4\x24\x88\x00\x00\x00");
+        S.e.b.put("\x48\x8d\xa4\x24\x88\x00\x00\x00");
         return;
     }
     if (op == xe.TLSBASE) and (i.ops.len > 1) {
@@ -2137,15 +2088,15 @@ fn enc_inst(i: *mut mc.MInst) void {
         let d = P(i.ops[0].reg);
         // mov d, fs:[0] (the thread pointer), on Windows gs:[0x58] (the
         // thread's TLS array)
-        E.b.u8_(u.pick(WIN, "\x65", "\x64")[0]);
+        S.e.b.u8_(u.pick(xc.O.win, "\x65", "\x64")[0]);
         b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
         b8(0x8b);
         b8(0x04 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
         b8(0x25);
-        if WIN {
-            E.b.u32_(0x58);
+        if xc.O.win {
+            S.e.b.u32_(0x58);
         } else {
-            E.b.u32_(0);
+            S.e.b.u32_(0);
         }
         return;
     }
@@ -2195,14 +2146,14 @@ fn ends_flow(b: *mc.MBlock) bool {
 // Does the code after block bi start with block t (with nothing encoded
 // between)?
 fn falls_to(skip: []bool, bi: usize, t: i32) bool {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let mut k = bi + 1;
     while k < nb {
         if @int_cast(usize, t) == k {
             return true;
         }
         if not skip[k] {
-            let mut i = MF.blocks.get(k).first;
+            let mut i = xc.FN.mf.blocks.get(k).first;
             while u.notnil(i) {
                 if not noop_move(i) and (i.op != xe.LABEL) {
                     return false;
@@ -2608,7 +2559,7 @@ fn three_address(b: *mut mc.MBlock, i: *mut mc.MInst) bool {
 }
 
 fn tidy_branches() []mut bool {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let skip = u.newn.[bool](nb + 1);
     let fin = u.newn.[i32](nb + 1);
     for bi in 0..nb {
@@ -2616,22 +2567,22 @@ fn tidy_branches() []mut bool {
     }
     // where a jump to each block ends up
     for bi in 1..nb {
-        if @as(i32, @int_cast(i32, bi)) == SW {
+        if @as(i32, @int_cast(i32, bi)) == xc.FN.sw {
             continue;  // (where the frame is set up: jumps there stay)
         }
-        let mut t = jump_target(MF.blocks.get(bi));
+        let mut t = jump_target(xc.FN.mf.blocks.get(bi));
         let mut steps: usize = 0;
         while (t >= 0) and (steps < nb) {
             fin[bi] = t;
-            if t == SW {
+            if t == xc.FN.sw {
                 break;
             }
-            t = jump_target(MF.blocks.get(@int_cast(usize, t)));
+            t = jump_target(xc.FN.mf.blocks.get(@int_cast(usize, t)));
             steps += 1;
         }
     }
     for bi in 0..nb {
-        let mut i = MF.blocks.get(bi).first;
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) {
                 i.ops[0].label = fin[@int_cast(usize, i.ops[0].label)];
@@ -2648,7 +2599,7 @@ fn tidy_branches() []mut bool {
         if fin[bi] == @int_cast(i32, bi) {
             continue;
         }
-        let prev = MF.blocks.get(bi - 1);
+        let prev = xc.FN.mf.blocks.get(bi - 1);
         if not ends_flow(prev) {
             let ops: [1]mc.MOp = [mc.label(fin[bi])];
             mc.append(prev, mc.new_inst(xe.JMP, 0, ops[..]));
@@ -2664,11 +2615,11 @@ fn tidy_branches() []mut bool {
         if skip[bi] {
             continue;
         }
-        drop_local_jumps(MF.blocks.get(bi));
-        reuse_flags(MF.blocks.get(bi));
-        reuse_k1(MF.blocks.get(bi));
-        peephole(MF.blocks.get(bi));
-        let b = MF.blocks.get(bi);
+        drop_local_jumps(xc.FN.mf.blocks.get(bi));
+        reuse_flags(xc.FN.mf.blocks.get(bi));
+        reuse_k1(xc.FN.mf.blocks.get(bi));
+        peephole(xc.FN.mf.blocks.get(bi));
+        let b = xc.FN.mf.blocks.get(bi);
         let l = b.last;
         if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
             continue;
@@ -2693,17 +2644,17 @@ fn tidy_branches() []mut bool {
 // x, 2; jle L` ... `L: cmp x, 2; jge M`, the two tests of an if-else
 // chain on one value).
 fn reuse_flags_across(skip: []bool) void {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     // the compare each block starts with, if any
     let first = u.calloc_slice.[*mut mc.MInst](nb + 1);
     let bad = u.calloc_slice.[bool](nb + 1);
     let npred = u.calloc_slice.[i32](nb + 1);
     let mut any = false;
     for bi in 1..nb {
-        if skip[bi] or (@as(i32, @int_cast(i32, bi)) == SW) {
+        if skip[bi] or (@as(i32, @int_cast(i32, bi)) == xc.FN.sw) {
             continue;  // (SW starts with the prologue, which sets the flags)
         }
-        let mut c = MF.blocks.get(bi).first;
+        let mut c = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(c) and noop_move(c) {
             c = c.next;
         }
@@ -2717,7 +2668,7 @@ fn reuse_flags_across(skip: []bool) void {
             if skip[pj] {
                 continue;
             }
-            let p = MF.blocks.get(pj);
+            let p = xc.FN.mf.blocks.get(pj);
             let mut j = p.first;
             while u.notnil(j) {
                 if j.op == xe.JTAB {
@@ -2749,7 +2700,7 @@ fn reuse_flags_across(skip: []bool) void {
             while (pj > 0) and skip[pj] {
                 pj -= 1;
             }
-            let p = MF.blocks.get(pj);
+            let p = xc.FN.mf.blocks.get(pj);
             if not skip[pj] and not ends_flow(p) {
                 if u.isnil(p.last) or not falls_to(skip, pj, @int_cast(i32, bi)) or not flags_hold_after(p.last, c) {
                     continue;
@@ -2757,7 +2708,7 @@ fn reuse_flags_across(skip: []bool) void {
                 npred[bi] += 1;
             }
             if npred[bi] > 0 {
-                mc.remove(MF.blocks.get(bi), c);
+                mc.remove(xc.FN.mf.blocks.get(bi), c);
             }
         }
     }
@@ -2820,7 +2771,7 @@ fn few_insts(b: *mc.MBlock, n: usize) []mut *mut mc.MInst {
 // The next block after bi that is not skipped (nb at the end).
 fn next_kept(skip: []bool, bi: usize) usize {
     let mut k = bi + 1;
-    while (k < MF.blocks.len) and skip[k] {
+    while (k < xc.FN.mf.blocks.len) and skip[k] {
         k += 1;
     }
     return k;
@@ -2838,14 +2789,10 @@ fn plain_compare(i: *mc.MInst) bool {
 // compares and branches itself, so that the test block is entered only by
 // the body falling into it; a test of a register the body's last operation
 // set the flags from is then dropped (blsr, and, sub ... before the test).
-// Blocks whose flags are live at their end: dup_exit_tests dropped the test
-// the block they fall into starts with, which now reads them.
-let mut flags_out: u.List.[*mut mc.MBlock] = u.List.[*mut mc.MBlock].{ data: @ptr_from_int(*mut *mut mc.MBlock, 0),
-                                                                       len: 0, cap: 0 };
 
 fn flags_live_out(b: *mut mc.MBlock) bool {
-    for k in 0..flags_out.len {
-        if flags_out.get(k) == b {
+    for k in 0..S.flags_out.len {
+        if S.flags_out.get(k) == b {
             return true;
         }
     }
@@ -2882,7 +2829,7 @@ fn movable_to_fall(x: *mc.MInst, cmp: *mc.MInst, skip: []bool, other: i32) bool 
     if names_phys(cmp, d) {
         return false;
     }
-    let seen = u.calloc_slice.[bool](MF.blocks.len + 1);
+    let seen = u.calloc_slice.[bool](xc.FN.mf.blocks.len + 1);
     let mut budget: i32 = 48;
     let dead = dead_at(@int_cast(usize, other), d, skip, seen, &mut budget);
     u.free_slice(seen);
@@ -2895,10 +2842,10 @@ fn movable_to_fall(x: *mc.MInst, cmp: *mc.MInst, skip: []bool, other: i32) bool 
 // is found the first time.)
 fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) bool {
     let mut b = b0;
-    while (b < MF.blocks.len) and skip[b] {
+    while (b < xc.FN.mf.blocks.len) and skip[b] {
         b += 1;
     }
-    if b >= MF.blocks.len {
+    if b >= xc.FN.mf.blocks.len {
         return false;
     }
     if seen[b] {
@@ -2909,7 +2856,7 @@ fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) 
     if budget.* < 0 {
         return false;
     }
-    let mut i = MF.blocks.get(b).first;
+    let mut i = xc.FN.mf.blocks.get(b).first;
     while u.notnil(i) {
         let op = i.op;
         if (op == xe.JMP) or (op == xe.JCC) {
@@ -2989,8 +2936,8 @@ fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) 
 }
 
 fn dup_exit_tests(skip: []bool) void {
-    flags_out.clear();
-    for bi in 0..MF.blocks.len {
+    S.flags_out.clear();
+    for bi in 0..xc.FN.mf.blocks.len {
         if not skip[bi] {
             dup_exit_test(skip, bi);
         }
@@ -3001,17 +2948,17 @@ fn dup_exit_tests(skip: []bool) void {
 // dup_exit_tests for block bi: if it jumps to a block that only compares
 // and branches, it compares and branches itself.
 fn dup_exit_test(skip: []bool, bi: usize) void {
-    let nb = MF.blocks.len;
-    let p = MF.blocks.get(bi);
+    let nb = xc.FN.mf.blocks.len;
+    let p = xc.FN.mf.blocks.get(bi);
     let l = p.last;
     if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
         return;
     }
     let t = @int_cast(usize, l.ops[0].label);
-    if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == SW) {
+    if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == xc.FN.sw) {
         return;
     }
-    let ins = few_insts(MF.blocks.get(t), 3);
+    let ins = few_insts(xc.FN.mf.blocks.get(t), 3);
     if (ins.len < 2) or not plain_compare(ins[0]) or (ins[1].op != xe.JCC) or (ins[1].ops[0].label >= xe.LOCAL_BASE) {
         return;
     }
@@ -3090,13 +3037,13 @@ fn dup_exit_test(skip: []bool, bi: usize) void {
 // by falling from the one before is dropped where the flags already hold
 // it, the operation that set them perhaps moved to that block's end.
 fn drop_fall_tests(skip: []bool) void {
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let refs = u.newn.[i32](nb + 1);
     for bi in 0..nb {
         if skip[bi] {
             continue;
         }
-        let mut i = MF.blocks.get(bi).first;
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) {
                 refs[@int_cast(usize, i.ops[0].label)] += 1;
@@ -3115,10 +3062,11 @@ fn drop_fall_tests(skip: []bool) void {
         }
         let pb = prev;
         prev = bi;
-        if (pb == nb) or (refs[bi] != 0) or ends_flow(MF.blocks.get(pb)) or (@as(i32, @int_cast(i32, bi)) == SW) {
+        if (pb == nb) or (refs[bi] != 0) or ends_flow(xc.FN.mf.blocks.get(pb)) or
+           (@as(i32, @int_cast(i32, bi)) == xc.FN.sw) {
             continue;
         }
-        let tb = MF.blocks.get(bi);
+        let tb = xc.FN.mf.blocks.get(bi);
         let mut ti = tb.first;
         while u.notnil(ti) and noop_move(ti) {
             ti = ti.next;
@@ -3130,7 +3078,7 @@ fn drop_fall_tests(skip: []bool) void {
         // before: its flags are the test's if nothing after it sets them, or
         // when it can move to the end of the block
         let r = P(ti.ops[0].reg);
-        let pbb = MF.blocks.get(pb);
+        let pbb = xc.FN.mf.blocks.get(pb);
         let mut w = pbb.last;
         while u.notnil(w) and not writes_phys(w, r) {
             w = w.prev;
@@ -3174,12 +3122,12 @@ fn drop_fall_tests(skip: []bool) void {
         }
         if intact {
             mc.remove(tb, ti);
-            flags_out.push(pbb);
+            S.flags_out.push(pbb);
         } else if movable {
             mc.remove(pbb, w);
             mc.append(pbb, w);
             mc.remove(tb, ti);
-            flags_out.push(pbb);
+            S.flags_out.push(pbb);
         }
     }
 }
@@ -3238,38 +3186,38 @@ fn touches_any(i: *mc.MInst, w: *mc.MInst) bool {
 // The callee-saved registers MF uses (saved, and Windows' xsaved), counting
 // those instructions name themselves.
 fn find_saved() void {
-    nsaved = 0;
-    nxsaved = 0;
+    S.nsaved = 0;
+    S.nxsaved = 0;
     let cs: [5]i32 = [xe.RBX, xe.R12, xe.R13, xe.R14, xe.R15];
     let wcs: [7]i32 = [xe.RBX, xe.RSI, xe.RDI, xe.R12, xe.R13, xe.R14, xe.R15];
     let mut callee = cs[..];
     // registers instructions name themselves (rsi and rdi of the string
     // instructions, rbx of cpuid) are used too
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..xc.FN.mf.blocks.len {
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
                 if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) {
-                    MF.used_regs = MF.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
+                    xc.FN.mf.used_regs = xc.FN.mf.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
                 }
             }
             i = i.next;
         }
     }
-    if WIN {
+    if xc.O.win {
         callee = wcs[..];
         for k in @as(i32, 6)..16 {
-            if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, xe.XMM0 + k))) != 0 {
-                xsaved[@int_cast(usize, nxsaved)] = xe.XMM0 + k;
-                nxsaved += 1;
+            if (xc.FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, xe.XMM0 + k))) != 0 {
+                S.xsaved[@int_cast(usize, S.nxsaved)] = xe.XMM0 + k;
+                S.nxsaved += 1;
             }
         }
     }
     for r in callee {
-        if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-            saved[@int_cast(usize, nsaved)] = r;
-            nsaved += 1;
+        if (xc.FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            S.saved[@int_cast(usize, S.nsaved)] = r;
+            S.nsaved += 1;
         }
     }
 }
@@ -3277,14 +3225,14 @@ fn find_saved() void {
 // Lays out MF's frame, its slots below the saved registers, and returns
 // its size.
 fn frame_layout() i64 {
-    let mut cur: i64 = (8 * nsaved) + (16 * nxsaved);
-    for k in 0..MF.slots.len {
-        let s = MF.slots.at(k);
+    let mut cur: i64 = (8 * S.nsaved) + (16 * S.nxsaved);
+    for k in 0..xc.FN.mf.slots.len {
+        let s = xc.FN.mf.slots.at(k);
         let a = @bit_cast(i64, s.align);
         cur = (cur + @bit_cast(i64, s.size) + a - 1) & ~(a - 1);
         s.offset = -cur;
     }
-    let total = (cur + @bit_cast(i64, out_area) + 15) & ~@as(i64, 15);
+    let total = (cur + @bit_cast(i64, xc.FN.out_area) + 15) & ~@as(i64, 15);
     if total > 0x7000_0000 {
         // frame offsets are 32-bit displacements (code generation keeps a
         // function's locals to 1 GiB, E0473, and inlining keeps to that too)
@@ -3296,14 +3244,14 @@ fn frame_layout() i64 {
 // The block that sets up the frame when shrink-wrapping (SW), or -1: the
 // entry does, or there is no frame.
 fn wrap_block() i32 {
-    if frameless or WIN or (SW < 0) {
+    if S.frameless or xc.O.win or (xc.FN.sw < 0) {
         return -1;
     }
-    for bi in 0..MF.blocks.len {
-        if not MF.blocks.get(bi).noframe {
+    for bi in 0..xc.FN.mf.blocks.len {
+        if not xc.FN.mf.blocks.get(bi).noframe {
             continue;
         }
-        let mut i = MF.blocks.get(bi).first;
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if not sw_frame_free(i) {
                 return -1;  // (spilled there after all)
@@ -3311,7 +3259,7 @@ fn wrap_block() i32 {
             i = i.next;
         }
     }
-    return SW;
+    return xc.FN.sw;
 }
 
 // Encodes i, in block bi as encode_func lays it out (skip, lal and sw as
@@ -3350,11 +3298,11 @@ fn enc_at(i: *mut mc.MInst, bi: usize, skip: []bool, lal: []bool, sw: i32) *mut 
 // Fills in the displacements of the branches to blocks (at boff) and local
 // labels.
 fn resolve_branches(boff: []u64) void {
-    for k in 0..E.fixups.len {
-        let x = E.fixups.get(k);
+    for k in 0..S.e.fixups.len {
+        let x = S.e.fixups.get(k);
         let mut target: u64 = 0;
         if x.label >= xe.LOCAL_BASE {
-            target = local_off.get(@int_cast(usize, x.label - xe.LOCAL_BASE));
+            target = S.local_off.get(@int_cast(usize, x.label - xe.LOCAL_BASE));
         } else {
             target = boff[@int_cast(usize, x.label)];
         }
@@ -3363,21 +3311,21 @@ fn resolve_branches(boff: []u64) void {
             if (rel < -128) or (rel > 127) {
                 fail("internal compiler error: a short jump out of range");
             }
-            E.b.view()[@truncate(usize, x.off)] = @truncate(u8, @bit_cast(u64, rel));
+            S.e.b.view()[@truncate(usize, x.off)] = @truncate(u8, @bit_cast(u64, rel));
             continue;
         }
         let rel = @bit_cast(i64, target) - @bit_cast(i64, x.off + 4);
-        E.b.set_u32(@truncate(usize, x.off), @bit_cast(u64, rel));
+        S.e.b.set_u32(@truncate(usize, x.off), @bit_cast(u64, rel));
     }
 }
 
 // The offset from rbp of the frame slot of alloca a (dwarf.var_locs).
 fn var_slot_off(a: *ir.Value) i64 {
     let k = @int_cast(usize, a.aux);
-    if (a.aux < 0) or (k >= MF.slots.len) {
+    if (a.aux < 0) or (k >= xc.FN.mf.slots.len) {
         return dw.NO_LOC;
     }
-    return MF.slots.at(k).offset;
+    return xc.FN.mf.slots.at(k).offset;
 }
 
 // What dloc.ax needs of x86-64's machine code (variables' locations).
@@ -3443,7 +3391,7 @@ fn imm_of(i: *mc.MInst) i64 {
 
 // The frame slot of alloca a: its offset from the CFA (rbp + 16).
 fn obj_cfa_off(a: *ir.Value) i64 {
-    if frameless {
+    if S.frameless {
         return dloc.NO_LOC;
     }
     let o = var_slot_off(a);
@@ -3467,16 +3415,16 @@ fn dw_reg(r: i32) i32 {
 
 // A frame slot's offset from the CFA (rbp + 16).
 fn slot_cfa_off(k: i32) i64 {
-    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= MF.slots.len) or frameless {
+    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= xc.FN.mf.slots.len) or S.frameless {
         return dloc.NO_LOC;
     }
-    return MF.slots.at(@as(usize, @bit_cast(u32, k))).offset - 16;
+    return xc.FN.mf.slots.at(@as(usize, @bit_cast(u32, k))).offset - 16;
 }
 
 // The location of f's first instruction that has one (or f's own).
 fn first_src(f: *ir.Func) u32 {
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..xc.FN.mf.blocks.len {
+        let mut i = xc.FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if i.src != 0 {
                 return i.src;
@@ -3495,13 +3443,13 @@ fn dbg_name(f: *ir.Func, sym: []u8) []u8 {
 pub fn encode_func(f: *mut ir.Func) void {
     // callee-saved registers in use
     find_saved();
-    let sub = frame_layout() - (8 * nsaved);
-    frameless = not needs_frame();
+    let sub = frame_layout() - (8 * S.nsaved);
+    S.frameless = not needs_frame();
     let sw = wrap_block();
-    SW = sw;
+    xc.FN.sw = sw;
     // (shrink-wrapped: where each run of frameless blocks starts and ends)
     let mut noframe = u.List.[u64].empty();
-    let nb = MF.blocks.len;
+    let nb = xc.FN.mf.blocks.len;
     let skip = tidy_branches();
     reuse_flags_across(skip);
     let boff = u.newn.[u64](nb + 1);
@@ -3511,39 +3459,39 @@ pub fn encode_func(f: *mut ir.Func) void {
     let mut scopes = u.List.[u64].empty();
     // frame tables: (offset after each call, its chain)
     let mut calls = u.List.[u64].empty();
-    jshort.clear();
-    jstart.clear();
-    jlabel.clear();
+    S.jshort.clear();
+    S.jstart.clear();
+    S.jlabel.clear();
     // where the function will start (see FALIGN)
-    let text = OBJ.secs.get(@int_cast(usize, TEXT));
+    let text = xc.O.obj.secs.get(@int_cast(usize, xc.O.text));
     let falign = func_align(text);
-    FBASE = (@as(u64, text.data.len()) + @as(u64, FPAD) + falign - 1) & ~(falign - 1);
+    S.fbase = (@as(u64, text.data.len()) + @as(u64, FPAD) + falign - 1) & ~(falign - 1);
     let lal = loop_aligned(skip);
     let dirty_in = upper_dirty();
     // again if relax_jumps finds jumps that take a rel8, and after that while
     // unrelax_jumps finds that padding left some of them out of reach
     let mut pass: i32 = 0;
     loop {
-        E = xe.Enc.{ b: bn.new_bytes(), relocs: u.List.[xe.Reloc].empty(), fixups: u.List.[xe.Fixup].empty(),
-                     avx: AVX };
-        local_off.clear();
-        jnext = 0;
-        jfix.clear();
-        jtabs.clear();
+        S.e = xe.Enc.{ b: bn.new_bytes(), relocs: u.List.[xe.Reloc].empty(), fixups: u.List.[xe.Fixup].empty(),
+                       avx: xc.FN.avx };
+        S.local_off.clear();
+        S.jnext = 0;
+        S.jfix.clear();
+        S.jtabs.clear();
         rows.clear();
         scopes.clear();
         calls.clear();
         noframe.clear();
-        cfis.clear();
-        xcfis.clear();
-        aob.inline_pass(OBJ);
-        tail_jumps.clear();
-        tail_ends.clear();
-        in_noframe = false;
+        S.cfis.clear();
+        S.xcfis.clear();
+        aob.inline_pass(xc.O.obj);
+        S.tail_jumps.clear();
+        S.tail_ends.clear();
+        S.in_noframe = false;
         if sw < 0 {
             prologue(sub);
         }
-        let lines = WIN or DBG.on;
+        let lines = xc.O.win or xc.O.dbg.on;
         let mut last_src = f.src;
         let mut last_scope: u32 = 0;
         if lines and (f.src != 0) {
@@ -3553,9 +3501,9 @@ pub fn encode_func(f: *mut ir.Func) void {
         // function stops) at the first instruction of another line than the
         // function's own (past the parameters' stores); until then, the
         // first instruction's line
-        let mut pe_done = not DBG.on;
-        if DBG.on {
-            let mut at = @as(u64, E.b.len());
+        let mut pe_done = not xc.O.dbg.on;
+        if xc.O.dbg.on {
+            let mut at = @as(u64, S.e.b.len());
             if sw >= 0 {
                 at = 0;
             }
@@ -3563,54 +3511,54 @@ pub fn encode_func(f: *mut ir.Func) void {
             last_src = first_src(f);
         }
         for bi in 0..nb {
-            let b = MF.blocks.get(bi);
+            let b = xc.FN.mf.blocks.get(bi);
             if lal[bi] {
-                let at = (FBASE + @as(u64, E.b.len())) % LALIGN;
+                let at = (S.fbase + @as(u64, S.e.b.len())) % LALIGN;
                 if (at != 0) and (LALIGN - at <= LMAX) {
                     emit_nops(LALIGN - at);
                 }
             }
-            boff[bi] = @as(u64, E.b.len());
+            boff[bi] = @as(u64, S.e.b.len());
             dloc.block_at(bi, boff[bi], bi == 0);
             if @as(i32, @int_cast(i32, bi)) == sw {
-                in_noframe = true;
+                S.in_noframe = true;
                 cfi_entry();
-                in_noframe = false;
+                S.in_noframe = false;
                 prologue(sub);  // (jumps into the block go here)
             }
             if skip[bi] {
                 continue;
             }
-            if (sw >= 0) and (b.noframe != in_noframe) {
-                noframe.push(@as(u64, E.b.len()));
-                in_noframe = b.noframe;
+            if (sw >= 0) and (b.noframe != S.in_noframe) {
+                noframe.push(@as(u64, S.e.b.len()));
+                S.in_noframe = b.noframe;
             }
             if @as(i32, @int_cast(i32, bi)) != sw {
                 cfi_body();
             }
-            DIRTY = dirty_in[bi];
+            S.dirty = dirty_in[bi];
             let mut i = b.first;
             while u.notnil(i) {
                 if writes_wide(i) {
-                    DIRTY = true;  // (no call or return writes a vector register)
+                    S.dirty = true;  // (no call or return writes a vector register)
                 }
                 if not pe_done and (i.src != 0) and (i.src != f.src) {
-                    rows.push(((@as(u64, E.b.len()) << 32) | dw.ROW_PE) | @as(u64, i.src));
+                    rows.push(((@as(u64, S.e.b.len()) << 32) | dw.ROW_PE) | @as(u64, i.src));
                     last_src = i.src;
                     pe_done = true;
                 } else if lines and (i.src != 0) and (i.src != last_src) {
-                    rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
+                    rows.push((@as(u64, S.e.b.len()) << 32) | @as(u64, i.src));
                     last_src = i.src;
                 }
-                if DBG.on and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
-                    scopes.push((@as(u64, E.b.len()) << 32) | @as(u64, i.scope));
+                if xc.O.dbg.on and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
+                    scopes.push((@as(u64, S.e.b.len()) << 32) | @as(u64, i.scope));
                     last_scope = i.scope;
                 }
-                dloc.inst_at(i, @as(u64, E.b.len()));
+                dloc.inst_at(i, @as(u64, S.e.b.len()));
                 let last = enc_at(i, bi, skip, lal, sw);
-                if FT.on and (i.op == xe.CALL) and not is_tail(i) {
-                    let mut at = @as(u64, E.b.len());
-                    if in_noframe {
+                if xc.O.ft.on and (i.op == xe.CALL) and not is_tail(i) {
+                    let mut at = @as(u64, S.e.b.len());
+                    if S.in_noframe {
                         at = at | ft.CALL_FRAMELESS;  // (a call that does not return, before the frame is set up)
                     }
                     calls.push(at);
@@ -3627,78 +3575,78 @@ pub fn encode_func(f: *mut ir.Func) void {
             break;
         }
         pass += 1;
-        E.b.free();
-        E.relocs.deinit();
-        E.fixups.deinit();
+        S.e.b.free();
+        S.e.relocs.deinit();
+        S.e.fixups.deinit();
     }
-    if in_noframe {
-        noframe.push(@as(u64, E.b.len()));
-        in_noframe = false;
+    if S.in_noframe {
+        noframe.push(@as(u64, S.e.b.len()));
+        S.in_noframe = false;
     }
     resolve_branches(boff);
     // into .text
     text.data.zeros(FPAD);
     text.data.align(@truncate(usize, falign));
     let base = @as(u64, text.data.len());
-    if base != FBASE {
+    if base != S.fbase {
         fail("internal compiler error: a function placed elsewhere than expected");
     }
-    text.data.put(E.b.view());
+    text.data.put(S.e.b.view());
     fill_jump_tables(base, boff);
-    for k in 0..E.relocs.len {
-        let r = E.relocs.get(k);
+    for k in 0..S.e.relocs.len {
+        let r = S.e.relocs.get(k);
         text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
     }
-    let mut s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+    let mut s = xc.O.obj.syms.at(@as(usize, xc.O.fsym.get(@int_cast(usize, f.id))));
     s.value = base;
-    aob.inline_place(OBJ, TEXT, base);
-    s.size = @as(u64, E.b.len());
-    ft.func(&mut FT, TEXT, base, s.size, frameless, noframe.items(), calls.items(), rows.items(), scopes.items(),
-            dw.func_name(f, elf.display_name(s.name)));
-    if MACOS {
-        mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size, noframe.len > 0);
-    } else if MU.on {
+    aob.inline_place(xc.O.obj, xc.O.text, base);
+    s.size = @as(u64, S.e.b.len());
+    ft.func(&mut xc.O.ft, xc.O.text, base, s.size, S.frameless, noframe.items(), calls.items(), rows.items(),
+            scopes.items(), dw.func_name(f, elf.display_name(s.name)));
+    if xc.O.macos {
+        mac_unwind(xc.O.fsym.get(@int_cast(usize, f.id)), s.size, noframe.len > 0);
+    } else if xc.O.mu.on {
         elf_unwind(base, s.size);
     }
     noframe.deinit();
-    if WIN and not frameless {
+    if xc.O.win and not S.frameless {
         // (code in a COMDAT group: its group's own unwind sections)
-        let sx = XDATA;
-        let sp = PDATA;
-        let ss = XDATA_SYM;
-        XDATA = is.group_unwind(OBJ, TEXT, ".xdata", XDATA);
-        PDATA = is.group_unwind(OBJ, TEXT, ".pdata", PDATA);
-        if XDATA != sx {
-            XDATA_SYM = elf.sec_sym(OBJ, XDATA);
+        let sx = xc.O.xdata;
+        let sp = xc.O.pdata;
+        let ss = xc.O.xdata_sym;
+        xc.O.xdata = is.group_unwind(xc.O.obj, xc.O.text, ".xdata", xc.O.xdata);
+        xc.O.pdata = is.group_unwind(xc.O.obj, xc.O.text, ".pdata", xc.O.pdata);
+        if xc.O.xdata != sx {
+            xc.O.xdata_sym = elf.sec_sym(xc.O.obj, xc.O.xdata);
         }
-        emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
-        XDATA = sx;
-        PDATA = sp;
-        XDATA_SYM = ss;
+        emit_unwind(xc.O.fsym.get(@int_cast(usize, f.id)), base, @as(u64, S.e.b.len()));
+        xc.O.xdata = sx;
+        xc.O.pdata = sp;
+        xc.O.xdata_sym = ss;
     }
     // (the symbol again: a section symbol made since may have moved the list)
-    s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
-    if WIN and (rows.len > 0) {
-        wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
+    s = xc.O.obj.syms.at(@as(usize, xc.O.fsym.get(@int_cast(usize, f.id))));
+    if xc.O.win and (rows.len > 0) {
+        wlines.emit(xc.O.obj, xc.O.lines, codeview.func_key(s.name, s.value), rows.items());
     }
-    if DBG.on {
+    if xc.O.dbg.on {
         let mut regs: [8]u64 = [0; 8];
         save_list(&mut regs);
-        let df = dw.Func.{ xcfi: xcfis.items(), sym: fsym.get(@int_cast(usize, f.id)), name: dbg_name(f, s.name),
+        let df = dw.Func.{ xcfi: S.xcfis.items(), sym: xc.O.fsym.get(@int_cast(usize, f.id)), name: dbg_name(f, s.name),
                            external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
-                           scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1],
-                           irf: f, vars: dw.var_locs(f, var_slot_off, 16), vlocs: dloc.compute(MF, &DLOC, s.size),
+                           scopes: scopes.items(), cfi: S.cfis.items(), regs: regs[0..@int_cast(usize, S.nsaved) + 1],
+                           irf: f, vars: dw.var_locs(f, var_slot_off, 16), vlocs: dloc.compute(xc.FN.mf, &DLOC, s.size),
                            frame_local: -1, calls: dloc.calls() };
-        if WIN {
+        if xc.O.win {
             codeview.add_func(&df, s);
         } else {
-            dw.add_func(&mut DBG, &df);
+            dw.add_func(&mut xc.O.dbg, &df);
         }
         dloc.release(df.vlocs, df.calls);
     }
-    E.b.free();
-    E.relocs.deinit();
-    E.fixups.deinit();
+    S.e.b.free();
+    S.e.relocs.deinit();
+    S.e.fixups.deinit();
     rows.deinit();
     scopes.deinit();
     calls.deinit();
