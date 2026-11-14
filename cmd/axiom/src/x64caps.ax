@@ -1,0 +1,88 @@
+// =============================================================================
+// x64caps.ax - what the x86-64 instruction selection (x64.ax) does in one
+// instruction with the function's extensions (target.ax): the vector width,
+// whole-width permutes, masked loads and stores, per-lane shifts, dot
+// products, widening. codegen.ax asks these before it makes the intrinsics.
+// =============================================================================
+import "ir.ax" as ir;
+import "target.ax" as tg;
+
+pub fn has41() bool {
+    return tg.has(tg.X_SSE41);
+}
+// The widest vectors the function's extensions compute in one register:
+// 512 bits with AVX-512 (F and BW; DQ for some operations, see wide_legal),
+// 256 with AVX2, else 128.
+pub fn vector_bits() u64 {
+    if tg.has(tg.X_AVX512F | tg.X_AVX512BW) {
+        return 512;
+    }
+    if tg.has(tg.X_AVX2) {
+        return 256;
+    }
+    return 128;
+}
+// AVX-512 (F and BW, and VL below 512 bits) for vectors of `bytes` bytes.
+pub fn avx512_for(bytes: u64) bool {
+    if not tg.has(tg.X_AVX512F | tg.X_AVX512BW) {
+        return false;
+    }
+    return (bytes == 64) or (((bytes == 16) or (bytes == 32)) and tg.has(tg.X_AVX512VL));
+}
+pub fn vbytes(bits: i32, lanes: i32) u64 {
+    return (@as(u64, @bit_cast(u32, bits)) * @as(u64, @bit_cast(u32, lanes))) / 8;
+}
+
+// @swizzle (two: @swizzle2) of `lanes` lanes of `bits` as one permute:
+// vpermd / vpermps (AVX2, 256 bits), vperm[bwdq] and vpermt2* (AVX-512;
+// bytes need VBMI).
+pub fn perm_ok(bits: i32, lanes: i32, two: bool) bool {
+    let n = vbytes(bits, lanes);
+    if (bits == 8) and not tg.has(tg.X_AVX512VBMI) {
+        return false;
+    }
+    if not two and (n == 32) and (bits == 32) and tg.has(tg.X_AVX2) {
+        return true;
+    }
+    if not two and (n == 16) {
+        return false;  // (the one-table permutes have no 128-bit form; pshufb does it)
+    }
+    return avx512_for(n);
+}
+
+// @load_partial / @store_partial as masked moves (AVX-512).
+pub fn partial_ok(bits: i32, lanes: i32) bool {
+    return avx512_for(vbytes(bits, lanes));
+}
+
+// A shift of each lane by its own count: vpsllv[dq], vpsrlv[dq], vpsravd
+// (AVX2; 512 bits in two halves, which vsplit.ax makes), vpsravq and the
+// 16-bit ones (AVX-512).
+pub fn shiftv_ok(id: i32, bits: i32, lanes: i32) bool {
+    let n = vbytes(bits, lanes);
+    if (n != 16) and (n != 32) and (n != 64) {
+        return false;
+    }
+    if ((bits == 16) or (bits == 32) or (bits == 64)) and avx512_for(n) {
+        return true;
+    }
+    return ((bits == 32) or ((bits == 64) and (id != ir.IN_ASHRV))) and tg.has(tg.X_AVX2);
+}
+// Whether @dot of `lanes` u8 by i8 lanes is vpdpbusd (IN_DOT_U8I8): 512 bits with AVX-512
+// VNNI (EVEX), else in 256-bit pieces with AVX-VNNI (VEX; AVX-512 VNNI alone has no VEX form).
+pub fn vnni_ok(lanes: u64) bool {
+    if (lanes % 16) != 0 {
+        return false;
+    }
+    if tg.has(tg.X_AVXVNNI) {
+        return (lanes <= 32) or not tg.has(tg.X_AVX512F) or tg.has(tg.X_AVX512VNNI);
+    }
+    return (lanes == 64) and tg.has(tg.X_AVX512VNNI) and tg.has(tg.X_AVX512BW);
+}
+
+// Whether @widen_low and @widen_high of a vector of `bits` bits are pmovsx or pmovzx
+// (IN_SWIDEN_LO ... IN_UWIDEN_HI; legal and wide_legal admit them at each width, vsplit.ax
+// splits wider ones): SSE4.1.
+pub fn widen_ok(bits: u64) bool {
+    return ((bits == 128) or (bits == 256) or (bits == 512)) and has41();
+}

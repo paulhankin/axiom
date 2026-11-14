@@ -114,7 +114,7 @@ choice never changes what a program computes:
   `@load_partial`/`@store_partial` masked moves, per-lane shift counts `vpsllv*`/`vpsrlv*`/
   `vpsrav*`, vector `@clz`/`@popcount` `vplzcnt`/`vpopcnt`, and `@select` of
   other masks one `vpternlogd`: `codegen.ax` makes intrinsics (`ir.IN_PERM` ...) or vector casts for the
-  builtins where `x64.ax` says it selects them (`perm_ok` and the like), and lowers them
+  builtins where `x64caps.ax` says `x64.ax` selects them (`perm_ok` and the like), and lowers them
   generically elsewhere. Operations without a single instruction at that width are split
   into halves first (`vsplit.ax`), so the choice never changes a result.
 - **AArch64**: the FP and Advanced SIMD (NEON) baseline covers everything; LSE replaces
@@ -262,7 +262,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
 | `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies (with the layout's prediction), copy coalescing and greedy register allocation (largest intervals first, evicting cheaper ones) with live-range splitting (around calls, at loop and block boundaries; reloads placed where the value is next used) and spilling (values rebuilt rather than stored, such as stack arguments and hoisted constants, split the same way, built again where a piece starts; their uses weighed by what a register saves), redundant reloads and spill stores removed (`AXIOM_DEBUG_RA=<function name suffix>` prints the allocator's decisions for x86-64) |
 | `isel.ax` | Instruction-selection helpers both native backends use: constants and operand tests, use counts and address folding before selection, phi copies as parallel moves, the layout of globals in the object |
-| `x64.ax`, `x64emit.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands) and register allocation (`x64.ax`); peepholes on the allocated code, frame layout, unwind information and code placement (`x64emit.ax`; knobs for measuring placement, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64emit.ax` and the table below); the encoding of machine instructions (`x64enc.ax`) |
+| `x64.ax`, `x64caps.ax`, `x64emit.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands) and register allocation (`x64.ax`); what it selects as one instruction with the function's extensions, which `codegen.ax` asks (`x64caps.ax`); peepholes on the allocated code, frame layout, unwind information and code placement (`x64emit.ax`; knobs for measuring placement, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64emit.ax` and the table below); the encoding of machine instructions (`x64enc.ax`) |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `nlink.ax` | What the native linkers share: the input objects' symbols and sections, the GOT, placing sections by class, and AArch64 and x86-64 relocations |
