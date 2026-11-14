@@ -424,7 +424,7 @@ types share a module.
 
 | Module | C source | What |
 |---|---|---|
-| `util.ax` | `util.c` | the system (host ABI and std: memory, files, processes, tools in PATH), arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
+| `util.ax` | `util.c` | the system (host ABI and std: memory, files, processes, tools in PATH), arenas (permanent, and per-function scratch the backends release; per thread), worker threads (shared front-end tables, per-thread overlays, memory given back), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
 | `diag.ax` | `diag.c` | diagnostics, human and agent-json output |
 | `lexer.ax` | `lexer.c` | tokens |
 | `ast.ax` | `ast.h`, `types.h`, `builtins.h` | syntax tree, semantic types, builtin table |
@@ -434,7 +434,7 @@ types share a module.
 | `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | module loading, name resolution, type checking |
 | `codegen.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
-| `units.ax` | `units.c` | separate compilation and the object cache |
+| `units.ax` | `units.c` | separate compilation and the object cache: each module compiled on a worker thread, whose compiler state is thread-local (`util.ax`, worker threads) |
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |
 | `bin.ax` | | byte buffers for object files (little-endian integers, LEB128) and a reader for them |
 | `pdb.ax` | | the program database (`<out>.pdb`) of a Windows executable: symbols and line tables for debuggers |
