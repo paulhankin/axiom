@@ -2667,7 +2667,7 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
 | `__builtin_memcpy`, `memmove`, `memset` | The IR's operations; their value is the destination. |
 | `__builtin_abs`, `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, `copysign`, `fma` (with `f` and `l`; `fabs` and `copysign` also with `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | The IR's operations (`sqrt` of a negative number is a NaN; errno is not set; `fma` on WebAssembly calls the library's). Where `long double` is wider than `double`, the `l` forms but `fabsl` and `copysignl` (which change the sign bit) call the library's function of that name. |
-| `__builtin_memcmp`, `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `memchr`, `printf`, `sprintf`, `snprintf`, `puts`, `putchar`, `malloc`, `calloc`, `realloc`, `free`, `abort`, `exit`, `labs`, `llabs`, and the math functions (`sin`, `cos`, `tan`, `exp`, `log`, `pow`, `round`, `fmin`, `fmax`, `fmod`, `hypot`, `ldexp`, `frexp`, `modf`, `lround` ... with `f` and `l` where the library has them) | Calls of the C library's function of that name. |
+| `__builtin_memcmp`, `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `memchr`, `printf`, `sprintf`, `snprintf`, `puts`, `putchar`, `malloc`, `calloc`, `realloc`, `free`, `abort`, `exit`, `labs`, `llabs`, `imaxabs`, `fprintf`, `fputs`, `fputc`, `putc`, `fwrite`, `scanf`, `sscanf`, `fscanf`, `strcspn`, `strspn`, `strpbrk`, and the math functions (`sin`, `cos`, `tan`, `exp`, `log`, `pow`, `round`, `fmin`, `fmax`, `fmod`, `hypot`, `ldexp`, `frexp`, `modf`, `lround` ... with `f` and `l` where the library has them) | Calls of the C library's function of that name. |
 | `__builtin_alloca(n)`, `__builtin_alloca_with_align(n, bits)` | n bytes of the function's frame, until it returns. |
 | `__builtin_frame_address(n)`, `__builtin_return_address(n)` | The frame record n links up the chain of frame records and its return address (natively: the compiler's functions keep frame records; a caller compiled without them gives what its frame holds, as with other compilers); on WebAssembly the stack pointer for level 0, else a null pointer. A level above 65535 is C3090. |
 | `__builtin_setjmp(buf)`, `__builtin_longjmp(buf, 1)` | `<setjmp.h>`'s setjmp and longjmp with a `jmp_buf` in the calling function's frame, whose address `buf[0]` holds (buf is at least one pointer; five, as other compilers take, is fine): 0, then 1 after the jump; the jump is valid while that function runs. The second argument must be 1 (C3082). Not on WebAssembly (C3300; `__has_builtin` is 0 there). |
@@ -3483,7 +3483,8 @@ it volatile or atomic, not thread-local, not weak and not placed by the attribut
 offsets are its values, which then fold (a conversion of a floating value to an integer
 of such a constant too). Comparisons that a dominating comparison of the same two values
 decides fold (`x < y` makes `x > y` false below it, `x == y` decides every order; an
-order of one signedness says nothing of the other's).
+order of one signedness says nothing of the other's). A comparison with a NaN constant folds (an ordered one is false, `!=` true), as
+do `x > +inf` and `x < -inf` (false).
 
 A path that ends in `unreachable()` (C23's `<stddef.h>`) or `__builtin_unreachable()`
 is one the program never takes. What the condition that leads to it says holds below
@@ -3529,7 +3530,11 @@ claims less than the standard allows. None is hidden: each is said above or here
 - Annexes F and G are claimed on x86-64 and AArch64 (with the library), not on
   WebAssembly, which has no floating-point environment.
 - Annex G: division uses Smith's method (no overflow forming the divisor's squared
-  magnitude); it may differ in the last bit from other implementations' choices.
+  magnitude), for `float _Complex` in `double` (so that no intermediate underflows or
+  overflows before the result does); for `double` and `long double` divisors and
+  dividends whose parts lie near the ends of the format's range (one subnormal) its
+  intermediate quotients may underflow and lose bits of the result, which a scaled
+  method would keep; it may differ in the last bit from other implementations' choices.
   `CX_LIMITED_RANGE` changes nothing: `ON` only permits the simpler formulas (7.3.4p1),
   and the full algorithms are always used.
 - The decimal floating types: on WebAssembly their exceptions are not recorded (no flags

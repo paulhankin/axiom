@@ -1814,17 +1814,42 @@ fn from_bytes(c: *mut ir.Value, off: u64, t: *mut ir.Ty) *mut ir.Value {
         return ir.cint(t, x);
     }
     if t.bits == 64 {
-        let d = @bit_cast(f64, x);
-        if d != d {
-            return vnil();  // (a NaN: its payload is not carried)
-        }
-        return ir.cfp(t, d);
+        return ir.cfp(t, @bit_cast(f64, x));  // (a NaN too: the constant holds its bits)
     }
     let f = @bit_cast(f32, @truncate(u32, x));
-    if f != f {
-        return vnil();
+    if (f != f) and ((x & 0x0040_0000) == 0) {
+        return vnil();  // (a signaling NaN: through double it would come back quiet)
     }
     return ir.cfp(t, @float_cast(f64, f));
+}
+
+// A comparison of floating values that one constant operand decides: an
+// ordered one with a NaN is false, and != true; nothing is above +inf or
+// below -inf.
+fn simplify_fcmp(i: *mut ir.Value) *mut ir.Value {
+    let p = ir.pred_of(i);
+    let a = i.a;
+    let b = i.b;
+    let an = (a.kind == ir.V_CFP) and (ir.fv_of(a) != ir.fv_of(a));
+    let bn = (b.kind == ir.V_CFP) and (ir.fv_of(b) != ir.fv_of(b));
+    if an or bn {
+        if p == ir.RealUNE {
+            return ir.kbool(true);
+        }
+        if (p >= ir.RealOEQ) and (p <= ir.RealOLE) {
+            return ir.kbool(false);
+        }
+        return vnil();
+    }
+    let inf: f64 = 1.0 / 0.0;
+    let bpinf = (b.kind == ir.V_CFP) and (ir.fv_of(b) == inf);
+    let bninf = (b.kind == ir.V_CFP) and (ir.fv_of(b) == -inf);
+    let apinf = (a.kind == ir.V_CFP) and (ir.fv_of(a) == inf);
+    let aninf = (a.kind == ir.V_CFP) and (ir.fv_of(a) == -inf);
+    if ((p == ir.RealOGT) and (bpinf or aninf)) or ((p == ir.RealOLT) and (bninf or apinf)) {
+        return ir.kbool(false);
+    }
+    return vnil();
 }
 
 // A load from read-only data at a constant offset: the constant.
@@ -1986,6 +2011,9 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     }
     if op == ir.OP_SELECT {
         return simplify_select(B, i);
+    }
+    if (op == ir.OP_FCMP) and (i.ty.kind == ir.T_INT) and not ir.fp_pinned(i) {
+        return simplify_fcmp(i);
     }
     if (op >= ir.OP_ZEXT) and (op <= ir.OP_INTTOPTR) {
         return simplify_cast(B, i);

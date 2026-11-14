@@ -4,11 +4,13 @@
    makes x > y, y < x and x == y false, and x != y and x <= y true; x == y
    decides every order); loads from an object defined with a const type
    (6.7.3p6: it cannot change), through the conversion of a floating value
-   to an integer; __builtin_constant_p of a value the optimizer made a
+   to an integer; comparisons with a NaN (an ordered one false, != true) and
+   beyond an infinity; __builtin_constant_p of a value the optimizer made a
    constant. The calls of kept() stay: an order of the other signedness, a
-   const volatile object, a const object defined weak. 3 calls in all. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bcall\b | 3
-// lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu17 | \bbl\b | 3
+   const volatile object, a const object defined weak, x >= +inf (x may be
+   +inf). 4 calls in all. */
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bcall\b | 4
+// lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu17 | \bbl\b | 4
 void gone(void);
 void kept(void);
 volatile int sink;  /* (stored last: no call is a tail call) */
@@ -58,6 +60,24 @@ void loads(void) {
     if (cv != 1)
         kept();
     if (wk != 1)
+        kept();
+    sink = 0;
+}
+
+const double qnan = __builtin_nan("");
+
+void floats(double x) {
+    if (qnan == qnan)
+        gone();
+    if ((x < qnan) || (qnan >= x))
+        gone();
+    if (qnan != x) {
+    } else {
+        gone();
+    }
+    if ((x > __builtin_inf()) || (-__builtin_inf() > x))
+        gone();
+    if (x >= __builtin_inf())
         kept();
     sink = 0;
 }
