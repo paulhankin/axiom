@@ -1091,6 +1091,9 @@ fn simplify_shift(B: *mut ir.Builder, i: *mut ir.Value, a: *mut ir.Value, b: *mu
     if is_kv(a, 0) {
         return a;
     }
+    if (op == ir.OP_ASHR) and small_int(t) and is_kv(a, 0xffff_ffff_ffff_ffff) {
+        return a;  // (-1 shifted right arithmetically by any amount)
+    }
     // (x << c1) << c2 while the total stays below the width
     if bk and ir.is_op(a, op) and ir.is_cint(a.b) and (k < @as(u64, @bit_cast(u32, bits))) {
         let tot = k + ir.cint_val(a.b);
@@ -1750,6 +1753,10 @@ fn simplify_mul_ov(B: *mut ir.Builder, i: *mut ir.Value, signed: bool) *mut ir.V
 // The scalar of type t at byte offset off in constant c, or nil.
 fn const_at(c: *mut ir.Value, off: u64, t: *mut ir.Ty) *mut ir.Value {
     let ct = c.ty;
+    if ir.is_cagg(c) and (ct.kind == ir.T_ARRAY) and (ct.elem.kind == ir.T_INT) and (ct.elem.bits == 8) and
+       (t.size > 1) and ((off + t.size) <= ct.size) {
+        return from_bytes(c, off, t);
+    }
     if ir.is_cagg(c) and ir.is_agg(ct) {
         for k in 0..ir.agg_len(c) {
             let fo = ir.field_off(ct, k);
@@ -1776,11 +1783,48 @@ fn const_at(c: *mut ir.Value, off: u64, t: *mut ir.Ty) *mut ir.Value {
         return vnil();
     }
     if ct == t {
-        if (c.kind == ir.V_CINT) or (c.kind == ir.V_CFP) or (c.kind == ir.V_GLOBAL) or (c.kind == ir.V_FUNC) {
+        // (not an address at an offset from a global, ir.cgaddr: data's
+        // alone, which code computes with a ptradd)
+        if (c.kind == ir.V_CINT) or (c.kind == ir.V_CFP) or ((c.kind == ir.V_GLOBAL) and (c.cv == 0)) or
+           (c.kind == ir.V_FUNC) {
             return c;
         }
     }
     return vnil();
+}
+
+// The integer (of at most 64 bits) or floating-point value of type t at
+// offset off of byte array c (a constant: the image C's objects have), in
+// the targets' little-endian order, or nil.
+fn from_bytes(c: *mut ir.Value, off: u64, t: *mut ir.Ty) *mut ir.Value {
+    let int = (t.kind == ir.T_INT) and (t.bits <= 64) and ((t.bits % 8) == 0);
+    let fp = (t.kind == ir.T_FLOAT) and ((t.bits == 32) or (t.bits == 64));
+    if not int and not fp {
+        return vnil();
+    }
+    let mut x: u64 = 0;
+    for k in 0..t.size {
+        let b = ir.agg_elem(c, @truncate(usize, off + k));
+        if not ir.is_cint(b) {
+            return vnil();
+        }
+        x = x | ((ir.cint_val(b) & 0xff) << @truncate(u32, k * 8));
+    }
+    if int {
+        return ir.cint(t, x);
+    }
+    if t.bits == 64 {
+        let d = @bit_cast(f64, x);
+        if d != d {
+            return vnil();  // (a NaN: its payload is not carried)
+        }
+        return ir.cfp(t, d);
+    }
+    let f = @bit_cast(f32, @truncate(u32, x));
+    if f != f {
+        return vnil();
+    }
+    return ir.cfp(t, @float_cast(f64, f));
 }
 
 // A load from read-only data at a constant offset: the constant.

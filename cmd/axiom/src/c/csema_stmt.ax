@@ -629,15 +629,44 @@ fn label_addr(e: *mut cast.Expr) *mut cast.Expr {
         e.ty = cty.t_error;
         return e;
     }
-    let l = label_sym(e.name, e.name_span);
+    // (in a nested function, a local label (`__label__`) of an enclosing
+    // function in scope there, if it has no label of the name: that
+    // function's label, whose address its own `goto *` may jump to)
+    let mut owner = BD.f;
+    let mut l = u.nil.[cast.CSym]();
+    let mut k = BD.locals.len;
+    while (k > 0) and u.isnil(l) {
+        k -= 1;
+        if u.same(BD.locals.get(k).name, e.name) {
+            l = BD.locals.get(k).sym;
+        }
+    }
+    if u.isnil(l) and u.isnil(BD.labels.get(e.name)) {
+        let mut p = BD.parent;
+        while u.notnil(p) and u.isnil(l) {
+            let mut j = p.locals.len;
+            while j > 0 {
+                j -= 1;
+                if u.same(p.locals.get(j).name, e.name) {
+                    l = p.locals.get(j).sym;
+                    owner = p.f;
+                    break;
+                }
+            }
+            p = p.parent;
+        }
+    }
+    if u.isnil(l) {
+        l = label_sym(e.name, e.name_span);
+    }
     l.used = true;
     if not l.label_addr {
         // (its index among the function's labels whose addresses are taken)
         l.label_addr = true;
-        l.owner = BD.f;
-        l.value = BD.f.value;
-        BD.f.value += 1;
-        addr_label_list(BD.f).push(l);
+        l.owner = owner;
+        l.value = owner.value;
+        owner.value += 1;
+        addr_label_list(owner).push(l);
     }
     e.sym = l;
     e.ty = cty.pointer_to(cty.t_void);
@@ -714,9 +743,19 @@ fn return_stmt(s: *mut cast.Stmt) void {
     let e = cx.rv(s.e);
     s.e = e;
     if cty.is_void(rt) {
-        if u.notnil(e.ty) and not cty.is_error(e.ty) {
-            cs.err(e.span, "C3044", u.f1("'return' with a value in '%s', which returns void", BD.f.name));
+        if u.isnil(e.ty) or cty.is_error(e.ty) {
+            return;
         }
+        if cs.opts().gnu and cty.is_void(e.ty) {
+            return;  // (a GNU dialect: an expression of type void, evaluated)
+        }
+        if cs.opts().gnu and (cs.std() < co.C99) {
+            // (gnu89: the value is evaluated and discarded, with a warning)
+            cs.warn(e.span, "C4146", u.f1("'return' with a value in '%s', which returns void: the value is discarded",
+                                          BD.f.name));
+            return;
+        }
+        cs.err(e.span, "C3044", u.f1("'return' with a value in '%s', which returns void", BD.f.name));
         return;
     }
     s.e = cx.assign_convert(e, cty.unqual(rt), "return");

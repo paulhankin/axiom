@@ -1164,6 +1164,42 @@ fn define_object(s: *mut cast.CSym) void {
     g.ty = init.ty;
     g.init = init;
     g.align = object_align(s);
+    // an object defined with a const-qualified type, nothing in it volatile
+    // or atomic: read-only, its value never changes (6.7.3p6: modifying it is
+    // undefined), so the optimizer may read it where it is loaded
+    if read_only_type(s.ty) and not g.tls and (g.section.len == 0) {
+        g.is_const = true;
+    }
+}
+
+// Is t a const-qualified type (an array of such elements) with no volatile
+// or atomic part?
+fn read_only_type(t0: *mut cty.CType) bool {
+    let mut t = t0;
+    let mut c = (t.quals & cty.Q_CONST) != 0;
+    while t.kind == cty.TK_ARRAY {
+        t = t.elem;
+        c = c or ((t.quals & cty.Q_CONST) != 0);
+    }
+    return c and not volatile_part(t0, 0);
+}
+
+// Has t a volatile or atomic part (itself, an element, a member)?
+fn volatile_part(t: *mut cty.CType, depth: i32) bool {
+    if ((t.quals & (cty.Q_VOLATILE | cty.Q_ATOMIC)) != 0) or (depth > 32) {
+        return true;
+    }
+    if t.kind == cty.TK_ARRAY {
+        return volatile_part(t.elem, depth + 1);
+    }
+    if ((t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION)) and u.notnil(t.tag) {
+        for m in t.tag.members.items() {
+            if volatile_part(m.ty, depth + 1) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -1315,13 +1351,21 @@ pub fn label_table(f: *mut cast.CSym) *mut ir.Value {
     return g.val;
 }
 
-/// The address of label l (`&&l`): a constant.
+/// The address of label l (`&&l`): a constant (for data: an address at an
+/// offset from a global, ir.cgaddr, is data's alone).
 pub fn label_address(l: *mut cast.CSym) *mut ir.Value {
     let t = label_table(l.owner);
     if l.value == 0 {
         return t;
     }
     return ir.cgaddr(ir.gv_of(t), l.value);
+}
+
+/// The address of label l (`&&l`) computed by code: its place in its
+/// function's table.
+pub fn label_address_code(l: *mut cast.CSym) *mut ir.Value {
+    let t = label_table(l.owner);
+    return ir.ptradd(B, t, ir.cint(T_isz, l.value));
 }
 
 // The constructors and destructors of the program's units (the attributes

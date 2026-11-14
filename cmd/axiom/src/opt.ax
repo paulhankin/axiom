@@ -1143,6 +1143,16 @@ pub fn loop_restricts(f: *mut ir.Func) void {
     _ = rscope_cycles(f);
 }
 
+// The value of C's __builtin_constant_p i (ir.IN_CONSTANT_P): 1 if its
+// operand is a constant now, else 0.
+fn constant_p(i: *mut ir.Value) *mut ir.Value {
+    let mut v: u64 = 0;
+    if ir.is_known_const(ir.resolve(i.xs.get(0))) {
+        v = 1;
+    }
+    return ir.cint(i.ty, v);
+}
+
 /// The object size intrinsics left in f: their values (objsize's last).
 pub fn finish_objsizes(f: *mut ir.Func) void {
     // (and C's restrict scopes, ir.IN_RSCOPE and IN_RESTRICT, removed)
@@ -1159,6 +1169,10 @@ pub fn finish_objsizes(f: *mut ir.Func) void {
                 ir.at_before(bd, i);
                 let r = objsize(bd, i, true);
                 ir.forward(i, r);
+                ir.remove_inst(i);
+            } else if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_CONSTANT_P) {
+                // (C's __builtin_constant_p: 0 unless the passes made it a constant)
+                ir.forward(i, constant_p(i));
                 ir.remove_inst(i);
             } else if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_RESTRICT) {
                 // (C's restrict: what the passes knew from it is used)
@@ -1211,6 +1225,13 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_OBJSIZE) {
         return objsize(B, i, false);
     }
+    if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_CONSTANT_P) {
+        // (a constant operand now: 1; else not yet decided)
+        if ir.is_known_const(i.xs.get(0)) {
+            return ir.cint(i.ty, 1);
+        }
+        return vnil();
+    }
     if ir.is_int_binop(op) or (op == ir.OP_ICMP) {
         if (i.ty.kind == ir.T_VEC) and u.notnil(i.a) and u.notnil(i.b) {
             return fold_vec(i);
@@ -1246,6 +1267,10 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     if ((op == ir.OP_SITOFP) or (op == ir.OP_UITOFP)) and is_ci(i.a) and (i.a.ty.bits <= 64) and
        (i.ty.kind == ir.T_FLOAT) {
         return fold_int_to_float(op == ir.OP_SITOFP, i.a, i.ty);
+    }
+    if ((op == ir.OP_FPTOSI_SAT) or (op == ir.OP_FPTOUI_SAT)) and (i.a.kind == ir.V_CFP) and (i.ty.kind == ir.T_INT) and
+       (i.ty.bits <= 64) {
+        return fold_float_to_int(op == ir.OP_FPTOSI_SAT, i.a, i.ty);
     }
     if op == ir.OP_INSERTELEM {
         return fold_insert(i);
@@ -1306,6 +1331,25 @@ fn fold_int_to_float(signed: bool, x: *mut ir.Value, t: *mut ir.Ty) *mut ir.Valu
         return ir.cfp(t, @float_from_int(f64, ir.sval(x)));
     }
     return ir.cfp(t, @float_from_int(f64, ir.cint_val(x)));
+}
+
+// The saturating conversion of floating-point constant x to integer type t
+// (of at most 64 bits), as the conversion at run time is: toward zero, the
+// type's bounds for what is beyond them, 0 for a NaN.
+fn fold_float_to_int(signed: bool, x: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    let d = ir.fv_of(x);
+    let m = ir.mask_bits(t.bits);
+    if signed {
+        let mut v = @int_from_float(i64, d);
+        let hi = @bit_cast(i64, m >> 1);
+        if v > hi {
+            v = hi;
+        } else if v < (-1 - hi) {
+            v = -1 - hi;
+        }
+        return ir.cint(t, @bit_cast(u64, v) & m);
+    }
+    return ir.cint(t, @min(@int_from_float(u64, d), m));
 }
 
 let mut FB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);

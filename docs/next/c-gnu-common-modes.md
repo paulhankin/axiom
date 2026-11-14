@@ -2,9 +2,9 @@
 
 - The GNU dialects accept more of what the common compilers' default modes accept: pointers
   to incompatible object types converted in an assignment, initialization, argument or
-  `return` (the warning `C4146`), a cast to a union type of a value of a member's type,
-  empty declarations at file scope, `int main(int argc)` (the warning `C4147`), `__complex`
-  and `__complex__`, and `defined` made by macro replacement in `#if`.
+  `return` (the warning `C4147`), a cast to a union type of a value of a member's type,
+  `int main(int argc)` (the warning `C4148`), and `defined` made by macro replacement in
+  `#if`.
 - New in the GNU dialects: `__builtin_isfpclass`, `__builtin_issignaling`,
   `__builtin_issubnormal` and `__builtin_iszero`; `<alloca.h>`; `strdup`, `strndup`,
   `posix_memalign` and `alloca` declared by `<string.h>` and `<stdlib.h>` in every
