@@ -433,7 +433,9 @@ types share a module.
 | `parser.ax` | `parser.c` | LL(1) parser, operator partial order |
 | `types.ax` | `types.c` | hash-consed types, substitution, printing, layout, constraints |
 | `package.ax` | `package.c` | `axiom.toml`, `pkg:` imports, git dependencies |
-| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | module loading, name resolution, type checking |
+| `modload.ax` | `sema_decl.c` | module loading (import paths, `internal/` and package visibility, cycles), the modules `axiom lsp`'s session keeps, the `Program` |
+| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | name resolution, type checking |
+| `semapost.ax` | `sema_decl.c`, `sema_target.c` | the checks after type checking: object sizes, recursive inline functions, processor extensions (target conditions, `@features`/`@multiversion`, builtins that need an extension) |
 | `codegen.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
 | `units.ax` | `units.c` | separate compilation and the object cache: each module compiled on a worker thread, whose compiler state is thread-local (`util.ax`, worker threads) |
