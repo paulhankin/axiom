@@ -1925,17 +1925,16 @@ pub struct Value {
     prev: *mut Value,
     blk: *mut Block,
     fwd: *mut Value,   // replacement (passes forward uses through resolve())
-    user: *mut Value,  // the only user (when uses == 1)
-    uses: i32,
+    user: *mut Value,  // backends: the only user (when uses == 1), with
+    uses: i32,         // the number of uses when they began (isel.count_uses, wasm.count_uses)
     flags: u32,
     first_use: *mut Use,  // its uses (instructions only: see Use)
     ua: Use,              // the places of a, b and c on their lists of uses (registered instructions)
     ub: Use,
     uc: Use,
-    xu: *mut XUse,  // those of xs (xucap of them)
+    xu: *mut XUse,  // those of xs (xucap & XU_CAP of them)
     nuses: i32,     // the number of its uses (first_use's list)
-    xucap: u32,
-    reg: bool,  // registered: on the lists of uses of what it reads
+    xucap: u32,     // and XU_REG: registered, on the lists of uses of what it reads
     cv: u64,
     id: i32,
     align: u32,
@@ -2779,11 +2778,14 @@ fn bury_value(v: *mut Value) void {
 // Gives back the lists of f's instructions and blocks, once its code is made
 // and the function is not read again.
 pub fn release_lists(f: *mut Func) void {
-    forget_uses(f);
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
+            // (off the lists, which go: see forget_uses)
+            i.xucap = i.xucap & XU_CAP;
+            i.first_use = u.nil.[Use]();
+            i.nuses = 0;
             free_xu(i);
             i.xs.deinit();
             set_xs(i, u.List.[*mut Value].empty());
@@ -2801,7 +2803,7 @@ fn free_xu(v: *mut Value) void {
     if @int_from_ptr(v.xu) != 0 {
         u.free(@ptr_cast(*mut void, v.xu));
         v.xu = @ptr_from_int(*mut XUse, 0);
-        v.xucap = 0;
+        v.xucap = v.xucap & XU_REG;
     }
 }
 
@@ -2812,7 +2814,7 @@ fn forget_uses(f: *mut Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            i.reg = false;
+            i.xucap = i.xucap & XU_CAP;
             i.first_use = u.nil.[Use]();
             i.nuses = 0;
             i = i.next;
@@ -3390,7 +3392,7 @@ pub fn new_param(f: *mut Func, t: *mut Ty, idx: usize) *mut Value {
 }
 
 // The value `v` stands for after replacements.
-pub fn resolve(v: *mut Value) *mut Value {
+pub inline fn resolve(v: *mut Value) *mut Value {
     let mut x = v;
     while u.notnil(x) and u.notnil(x.fwd) {
         x = x.fwd;
@@ -3424,18 +3426,25 @@ pub fn forward(v: *mut Value, r: *mut Value) void {
 // Def-use lists (see Use)
 // -----------------------------------------------------------------------------
 const USE_TAG: usize = 3;
+const XU_REG: u32 = 0x8000_0000;
+const XU_CAP: u32 = 0x7fff_ffff;
+
+// Whether i is registered (see Use).
+pub inline fn is_reg(i: *Value) bool {
+    return (i.xucap & XU_REG) != 0;
+}
 
 // Whether x has a list of uses.
-fn tracked(x: *Value) bool {
+inline fn tracked(x: *Value) bool {
     return u.notnil(x) and (x.kind == V_INST);
 }
 
-fn use_ptr(a: usize) *mut *mut Use {
+inline fn use_ptr(a: usize) *mut *mut Use {
     return @ptr_from_int(*mut *mut Use, a & ~USE_TAG);
 }
 
 // Puts place p (with its tag) first on x's list.
-fn use_link(p: *mut Use, x: *mut Value, tag: usize) void {
+inline fn use_link(p: *mut Use, x: *mut Value, tag: usize) void {
     let h = x.first_use;
     p.next = h;
     if u.notnil(h) {
@@ -3447,7 +3456,7 @@ fn use_link(p: *mut Use, x: *mut Value, tag: usize) void {
 }
 
 // Takes place p off the list of x, the value its operand reads (if it is on one).
-fn use_unlink(p: *mut Use, x: *mut Value) void {
+inline fn use_unlink(p: *mut Use, x: *mut Value) void {
     if p.back == 0 {
         return;
     }
@@ -3532,22 +3541,22 @@ pub fn set_operand(i: *mut Value, k: usize, x: *mut Value) void {
 }
 
 // What a registered instruction's operand reads: x after replacements.
-fn live_op(x: *mut Value) *mut Value {
+inline fn live_op(x: *mut Value) *mut Value {
     if u.notnil(x) and u.notnil(x.fwd) {
         return resolve(x);
     }
     return x;
 }
 
-fn set_slot(i: *mut Value, p: *mut Use, old: *mut Value, x: *mut Value, tag: usize) void {
+inline fn set_slot(i: *mut Value, p: *mut Use, old: *mut Value, x: *mut Value, tag: usize) void {
     use_unlink(p, old);
     if tracked(x) {
         use_link(p, x, tag);
     }
 }
 
-pub fn set_a(i: *mut Value, x0: *mut Value) void {
-    if not i.reg {
+pub inline fn set_a(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.a) or not is_reg(i) {
         i.a = x0;
         return;
     }
@@ -3556,8 +3565,8 @@ pub fn set_a(i: *mut Value, x0: *mut Value) void {
     i.a = x;
 }
 
-pub fn set_b(i: *mut Value, x0: *mut Value) void {
-    if not i.reg {
+pub inline fn set_b(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.b) or not is_reg(i) {
         i.b = x0;
         return;
     }
@@ -3566,8 +3575,8 @@ pub fn set_b(i: *mut Value, x0: *mut Value) void {
     i.b = x;
 }
 
-pub fn set_c(i: *mut Value, x0: *mut Value) void {
-    if not i.reg {
+pub inline fn set_c(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.c) or not is_reg(i) {
         i.c = x0;
         return;
     }
@@ -3583,10 +3592,10 @@ fn xuse(i: *Value, k: usize) *mut Use {
 // Room for n places of xs in xu (moving the first `live`, which may be on
 // lists, with their neighbours' links).
 fn xu_room(i: *mut Value, n: usize, live: usize) void {
-    if n <= @as(usize, i.xucap) {
+    if n <= @as(usize, i.xucap & XU_CAP) {
         return;
     }
-    let mut cap = @as(usize, i.xucap) * 2;
+    let mut cap = @as(usize, i.xucap & XU_CAP) * 2;
     if cap < n {
         cap = n;
     }
@@ -3610,7 +3619,7 @@ fn xu_room(i: *mut Value, n: usize, live: usize) void {
     if @int_from_ptr(old) != 0 {
         u.free(@ptr_cast(*mut void, old));
     }
-    i.xucap = @truncate(u32, cap);
+    i.xucap = (i.xucap & XU_REG) | @truncate(u32, cap);
 }
 
 fn xs_link(i: *mut Value, k: usize, x: *mut Value) void {
@@ -3624,12 +3633,15 @@ fn xs_link(i: *mut Value, k: usize, x: *mut Value) void {
 }
 
 // Sets xs[k] of i.
-pub fn set_x(i: *mut Value, k: usize, x0: *mut Value) void {
-    if not i.reg {
+pub inline fn set_x(i: *mut Value, k: usize, x0: *mut Value) void {
+    if not is_reg(i) {
         i.xs.set(k, x0);
         return;
     }
     let x = live_op(x0);
+    if x == i.xs.get(k) {
+        return;
+    }
     use_unlink(xuse(i, k), i.xs.get(k));
     if tracked(x) {
         use_link(xuse(i, k), x, USE_TAG);
@@ -3639,7 +3651,7 @@ pub fn set_x(i: *mut Value, k: usize, x0: *mut Value) void {
 
 // Appends x to i's xs.
 pub fn push_x(i: *mut Value, x0: *mut Value) void {
-    if not i.reg {
+    if not is_reg(i) {
         i.xs.push(x0);
         return;
     }
@@ -3651,7 +3663,7 @@ pub fn push_x(i: *mut Value, x0: *mut Value) void {
 
 // Keeps the first n of i's xs.
 pub fn trunc_x(i: *mut Value, n: usize) void {
-    if i.reg {
+    if is_reg(i) {
         for k in n..i.xs.len {
             use_unlink(xuse(i, k), i.xs.get(k));
         }
@@ -3665,7 +3677,7 @@ pub fn clear_x(i: *mut Value) void {
 
 // Gives i the operands xs (a list it takes).
 pub fn set_xs(i: *mut Value, xs: u.List.[*mut Value]) void {
-    if not i.reg {
+    if not is_reg(i) {
         i.xs = xs;
         return;
     }
@@ -3683,7 +3695,7 @@ pub fn set_xs(i: *mut Value, xs: u.List.[*mut Value]) void {
 // Puts i on the lists of what it reads (its operands through resolve(),
 // which those of an instruction out of a block may need).
 fn register(i: *mut Value) void {
-    i.reg = true;
+    i.xucap = i.xucap | XU_REG;
     i.a = live_op(i.a);
     i.ua.back = 0;
     if tracked(i.a) {
@@ -3712,10 +3724,10 @@ fn register(i: *mut Value) void {
 
 // Takes i off the lists of what it reads.
 fn unregister(i: *mut Value) void {
-    if not i.reg {
+    if not is_reg(i) {
         return;
     }
-    i.reg = false;
+    i.xucap = i.xucap & XU_CAP;
     use_unlink(&mut i.ua, i.a);
     use_unlink(&mut i.ub, i.b);
     use_unlink(&mut i.uc, i.c);
@@ -3725,10 +3737,10 @@ fn unregister(i: *mut Value) void {
 }
 
 // i goes into block b: registered if b is in its function.
-fn placed(i: *mut Value, b: *Block) void {
+inline fn placed(i: *mut Value, b: *Block) void {
     if b.gone {
         unregister(i);
-    } else if not i.reg {
+    } else if not is_reg(i) {
         register(i);
     }
 }
@@ -3830,7 +3842,7 @@ pub fn check_uses(f: *Func) void {
         }
         let mut i = b.first;
         while u.notnil(i) {
-            if not i.reg {
+            if not is_reg(i) {
                 u.die(u.f2("%s: %s is not registered", f.name, inst_str(i)));
             }
             let n = 3 + i.xs.len;
@@ -3857,7 +3869,7 @@ pub fn check_uses(f: *Func) void {
             let mut p = i.first_use;
             while u.notnil(p) {
                 let w = use_user(p);
-                if (seen.get(@as(u64, @int_from_ptr(w))) == 0) or not w.reg or (operand(w, use_slot(p)) != i) {
+                if (seen.get(@as(u64, @int_from_ptr(w))) == 0) or not is_reg(w) or (operand(w, use_slot(p)) != i) {
                     u.die(u.f3("%s: %s: a use by %s that is not one", f.name, inst_str(i), inst_str(w)));
                 }
                 c += 1;
@@ -5029,40 +5041,6 @@ pub fn ptr_base(p: *mut Value) *mut Value {
         q = q.a;
     }
     return q;
-}
-
-// Number of uses of each instruction (uses; user: the last user).
-pub fn count_uses(f: *mut Func) void {
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            i.uses = 0;
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            use1(i.a, i);
-            use1(i.b, i);
-            use1(i.c, i);
-            for k in 0..i.xs.len {
-                use1(i.xs.get(k), i);
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-}
-
-fn use1(o: *mut Value, i: *mut Value) void {
-    if u.notnil(o) and (o.kind == V_INST) {
-        o.uses += 1;
-        o.user = i;
-    }
 }
 
 // -----------------------------------------------------------------------------

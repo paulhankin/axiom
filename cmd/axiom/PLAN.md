@@ -18,7 +18,7 @@ parity check in the test suite can be widened once item 6 lands.
 |---|---|---|---|
 | 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` |
 | 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries |
-| 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks |
+| 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke |
 | 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags |
 | 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` |
@@ -221,91 +221,87 @@ The native linker (`nlink.ax`) does not:
 
 ## 3. Intrusive SSA Def-Use Lists in `ir.ax`
 
-### Current state
+**Status: done, but for the worklist rewrite of `fold_combine` and the
+removal of `Value.fwd` (see "What remains").**
 
-`ir.Value` (`ir.ax:860-891`) stores operands directly (`a`, `b`, `c: *mut Value`
-plus `xs: List[*mut Value]` for calls and phis) and tracks consumers with only:
+### What was there
 
-- `uses: i32` — a reference count, and
-- `user: *mut Value` — valid **only** when `uses == 1`,
-- `fwd: *mut Value` — a forwarding pointer set by `ir.forward(old, new)`.
+`ir.Value` held its operands (`a`, `b`, `c`, `xs`) and only a count of
+its uses and a user (`uses`, `user`), set by whole-function walks. Replacing
+a value set `fwd` (`ir.forward`), and `ir.apply_forwarding` rewrote every
+operand of the function through `ir.resolve` later (skipped when nothing had
+been forwarded since: `fwd_epoch`). `ir.count_uses` was called by
+`combine.ax` (`uses_of`, recounting once per `fold_combine` round, with
+`uses_stale`; `sink_phi_ops` recounting after each rewrite), `slp.ax` (six
+recounts), `vectorize.ax` and `idioms.ax`; `lower.ax` had a walk of its own.
+`isel.count_uses` and `wasm.count_uses` count the same references as
+`ir.count_uses` did (not distinct users), and set the backends' scratch
+fields in the same walk.
 
-Because a value with two or more uses does not know where those uses live,
-replacing a value across a function requires setting `old.fwd = new` and later
-walking every instruction and operand of the entire function in
-`ir.apply_forwarding(f)` (`ir.ax:2089-2133`), often paired with a second full
-walk in `ir.count_uses(f)` (`ir.ax:2510-2548`).
+### What was done
 
-Consequences across the middle-end and backends:
+1. **Lists of uses** (`ir.Use`, `ir.XUse`): each operand has a place on
+   the list of the instruction it reads: `ua`, `ub`, `uc` inside the value
+   (16 bytes each: the next place, and the address of what points here with
+   the operand's slot in its low two bits, from which the user follows) and
+   an array `xu` for `xs` (each place also names its user). Lists exist for
+   instructions only (constants, globals and parameters are shared or have
+   no use for them); `nuses` is the count. An instruction is *registered*
+   (on its operands' lists) while it is in a block that is in its function:
+   `insert_before`/`append_inst` register it, `remove_inst`/`remove_block`
+   take it off (and `move_block_after` puts a removed block's instructions
+   back), so the counts are what a walk of the function would count.
+   Operands of a registered instruction change only through `ir.set_a`,
+   `set_b`, `set_c`, `set_x`, `push_x`, `trunc_x`, `clear_x`, `set_xs` and
+   `set_operand`; every pass and the C front end use them (an instruction out
+   of a block may be written directly, and is read through `resolve()` when
+   it goes in).
+2. **`O(uses)` replacement**: `ir.replace_all(old, new)` rewrites each use
+   and splices the list onto `new`'s; `ir.forward(v, r)` of an instruction
+   does it at once (and sets `fwd` for the passes that kept `v` in their own
+   tables); `ir.replace_uses` uses it too. `ir.single_user` and
+   `ir.one_user` read the list. `apply_forwarding` is left only for values
+   without lists (the inliner's constant parameters, `merge_same_named`'s
+   globals and functions); the passes' 40 calls of it are gone.
+3. **Counts**: `ir.count_uses`, `combine.uses_stale` and the recounts in
+   `combine.ax`, `slp.ax`, `vectorize.ax` and `idioms.ax` are gone (they read
+   `nuses`); `lower.ax` takes a copy of the counts as they were before it
+   began (its in-place construction of aggregates needs the count before its
+   own removals). `Value.uses`/`user` are now only the backends' (set by
+   `isel.count_uses` and `wasm.count_uses`, which also initialize their
+   scratch: they were left as they are, because item 5a moves that state).
+4. **Checks**: with `AXIOM_CHECK_IR=1`, `ir.check_uses` checks after every
+   cleanup sub-pass, at the end of `optimize_func` and before the backends
+   that each registered instruction's operands are on their lists, that every
+   place on a list is an operand of a registered instruction of the function
+   that reads that value, the counts, and that no operand reads a replaced
+   value.
 
-1. **Four subtly different `count_uses` walks** exist:
-   - `ir.count_uses` (`ir.ax:2510`): counts references (an instruction `add x, x`
-     adds 2 to `x.uses`) and tracks `user` when `uses == 1`.
-   - `lower.count_uses` (`lower.ax:282`): resets and recounts `uses` without
-     maintaining `user`.
-   - `isel.count_uses` (`isel.ax:334`): counts **distinct user instructions** per
-     value (using `mark`) so `x + x` counts as 1 user for address-mode/load
-     folding!
-   - `wasm.count_uses` (`wasm.ax:2319`): counts references plus implicit trap/ret
-     users for WebAssembly expression-tree stackification.
-2. **Stale-count hazards (`uses_stale`)**: `combine.ax` maintains a manual
-   `uses_stale` flag whenever a transform mutates operands without running a
-   full recount, disabling single-use combines until the next sweep.
-3. **Repeated whole-function sweeps inside local transforms**: passes such as
-   `sink_phi_ops` (`combine.ax:2451-2485`) and straight-line vectorization
-   (`slp.ax:295-309, 1320, 1703`) call `apply_forwarding(f)` + `count_uses(f)`
-   after local rewrites, turning local pattern matches into `O(|F|)` scans per
-   firing.
+The output changed where passes read operands they had not resolved after
+replacing values in the same walk: `thread.merge_phis` merges phis whose
+inputs were merged before, and `fold_combine`'s single-use rewrites see the
+uses already moved (and counts kept current within a round). `divconst.ax`,
+whose rewrites read the divisions before theirs as they were, makes its
+replacements at the end of its walk, so its output is unchanged.
 
-### Target design
+Compile time (the compiler building itself at -O2, one process, user+sys)
+went down about 3.5% (29.8 s to 28.7 s); the peak memory went up by 130 MB
+(2502 to 2631 MB, 5%: a value is 72 bytes larger).
 
-1. **Explicit `ir.Use` edges**:
-   ```axiom
-   pub struct Use {
-       val: *mut Value,      // the operand value being read
-       user: *mut Value,     // the instruction (or synthetic Terminator/Ret node) reading it
-       prev: *mut Use,       // doubly-linked ring/list on `val.first_use`
-       next: *mut Use,
-       slot: u32,            // operand index in `user` (0=a, 1=b, 2=c, 3+k = xs[k])
-   }
-   ```
-   - Embed `in_uses: [3]Use` inline inside `ir.Value` for the fixed `a`, `b`, `c`
-     slots (zero extra allocations for 95%+ of IR instructions, which have <= 3
-     operands), and allocate `Use` arrays alongside `xs` only for `Call` and
-     `Phi` nodes.
-   - Represent block branch conditions (`Block.cond`) and `Block.ret` either as
-     explicit terminator `Value`s (`VK_BR`, `VK_RET`, `VK_SWITCH`) at the tail
-     of `Block`, or give `Block` two inline `Use` slots (`cond_use`, `ret_use`)
-     tagged so `Use.user` covers block-level uses uniformly without special
-     cases in every walk.
-2. **`O(1)` operand mutation and `O(uses)` RAUW**:
-   - Provide `ir.set_op(inst, slot, new_val)` and `ir.rauw(old_val, new_val)`:
-     `rauw` walks `old_val.first_use`, rewrites each consumer slot in `O(1)`,
-     splices the `Use` list onto `new_val.first_use`, and updates `old_val.uses`
-     and `new_val.uses` in place.
-   - Provide `ir.has_one_use(v)` (`v.uses == 1`), `ir.single_user(v)`
-     (`v.first_use.user`), and `ir.has_single_user_inst(v)` (true even for
-     `add x, x`, which checks whether all `Use` nodes on `v.first_use` point to
-     the same `user` — replacing `isel.count_uses`'s custom walk in `O(1)` for
-     1–2 uses!).
-   - Remove `Value.fwd`, `fwd_epoch`, `ir.forward`, `ir.resolve`,
-     `ir.apply_forwarding`, and `uses_stale`.
-3. **Worklist-driven `combine.ax`**:
-   - When `rauw(old, new)` splices uses onto `new`, push `new`'s users onto
-     `combine`'s instruction worklist directly instead of re-sweeping all blocks
-     of `f` up to 4 iterations.
-4. **Debug verification**:
-   - Extend `AXIOM_CHECK_IR=1` to verify after every pass that every `Value`'s
-     `first_use` list length equals `v.uses` and every `Use` points back to a
-     live instruction in `f` whose operand slot equals `v` (catching dangling
-     operands immediately, especially combined with `AXIOM_POISON=1`).
+### What remains
 
-### Invariants & verification
-
-- `AXIOM_CHECK_IR=1`, `AXIOM_CHECK_CINTS=1`, and `AXIOM_POISON=1` pass across
-  `std_opt.mjs`, `run.mjs`, and `fuzz/run.sh`.
-- Generated machine code on `cmd/axiom/bench/` is at least as good as before
-  (and compile time at `-O2` on functions with thousands of blocks drops).
+- **Worklist `fold_combine`**: it still sweeps the function in rounds; the
+  lists make a worklist of the users of each rewritten value possible (it
+  changes the order of rewrites, so the output).
+- **`Value.fwd` and the passes' `resolve()` calls**: operands no longer
+  need `resolve()` (the check above holds), but about 400 calls remain, many
+  on values the passes keep in their own tables (gvn's, thread's, unroll's,
+  slp's), for which `fwd` is the replacement. Each table could be kept by the
+  lists instead (and `thread.outside_uses`, `gvn.sink_uses` built from them),
+  then `fwd` removed.
+- **The backends' counts**: `isel.count_uses`/`wasm.count_uses` could read
+  `nuses` and `single_user` once the backends do not change the IR after
+  counting (and `Value.user` and `uses` would go, 16 bytes).
 
 ---
 

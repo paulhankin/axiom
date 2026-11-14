@@ -92,7 +92,7 @@ fn writing_intr(i: *ir.Value) bool {
 
 // The leaves of the `or` tree at root (or-s of one use in its block).
 fn leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
-    if ir.is_op(v, ir.OP_OR) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 64) {
+    if ir.is_op(v, ir.OP_OR) and ((v == root) or ((v.nuses == 1) and (v.blk == root.blk))) and (out.len < 64) {
         leaves(v.a, root, out);
         leaves(v.b, root, out);
         return;
@@ -295,7 +295,6 @@ fn each_tree_root(f: *mut ir.Func, op: i32, min_bits: i32,
     let feats = tg.fn_features(f);
     let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
     let avx512 = (feats & need) == need;
-    ir.count_uses(f);
     let B = ir.new_builder();
     let mut any = false;
     let mut b = f.first;
@@ -304,10 +303,10 @@ fn each_tree_root(f: *mut ir.Func, op: i32, min_bits: i32,
         while u.notnil(i) {
             let prev = i.prev;
             if ir.is_op(i, op) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= min_bits) and (i.ty.bits <= 64) and
-               (i.uses > 0) and not ((i.uses == 1) and ir.is_op(i.user, op) and (i.user.blk == b)) {
+               (i.nuses > 0) and
+               not ((i.nuses == 1) and ir.is_op(ir.single_user(i), op) and (ir.single_user(i).blk == b)) {
                 if vectorize(B, f, i, avx512) {
                     any = true;
-                    ir.count_uses(f);
                 }
             }
             i = prev;
@@ -354,7 +353,7 @@ fn new_lanes(n: usize) []mut *mut ir.Value {
 // scalar code keeps)?
 fn all_shared(xs: []mut *mut ir.Value) bool {
     for k in 0..xs.len {
-        if (xs[k].kind != ir.V_INST) or (xs[k].uses < 2) {
+        if (xs[k].kind != ir.V_INST) or (xs[k].nuses < 2) {
             return false;
         }
     }
@@ -1042,7 +1041,7 @@ fn dead_cost(s: *mut Slp, sts: []mut *mut ir.Value) i32 {
                     refs += 1;
                 }
             }
-            if refs < i.uses {
+            if refs < i.nuses {
                 i.aux2 = 0;
                 changed = true;
             }
@@ -1320,7 +1319,6 @@ fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
                 }
                 if store_chunk(f, chunk, cb) {
                     changed = true;
-                    ir.count_uses(f);
                 }
                 u.free_slice(chunk);
                 c += cn;
@@ -1355,7 +1353,6 @@ pub fn store_groups(f: *mut ir.Func) bool {
     if (feats & tg.X_AVX2) != 0 {
         vbytes = 32;
     }
-    ir.count_uses(f);
     let mut any = false;
     let mut b = f.first;
     while u.notnil(b) {
@@ -1392,7 +1389,7 @@ fn splat_users(b: *mut ir.Block, v: *mut ir.Value, out: *mut u.List.[*mut ir.Val
         }
         i = i.next;
     }
-    return (out.len > 0) and (@as(i32, @int_cast(i32, out.len)) == v.uses);
+    return (out.len > 0) and (@as(i32, @int_cast(i32, out.len)) == v.nuses);
 }
 
 // The load v's lane computation starts from (following first operands), and
@@ -1454,10 +1451,10 @@ fn dead_cost_roots(s: *mut Slp, roots: []mut *mut ir.Value) i32 {
             }
             for j in 0..roots.len {
                 if roots[j] == i {
-                    refs = i.uses;
+                    refs = i.nuses;
                 }
             }
-            if refs < i.uses {
+            if refs < i.nuses {
                 i.aux2 = 0;
                 changed = true;
             }
@@ -1608,7 +1605,6 @@ pub fn splat_groups(f: *mut ir.Func) bool {
         vbytes = 32;
     }
     let mut any = false;
-    ir.count_uses(f);
     let mut users = u.List.[*mut ir.Value].empty();
     let mut cands = u.List.[*mut ir.Value].empty();
     let mut offs = u.List.[i64].empty();
@@ -1638,8 +1634,8 @@ pub fn splat_groups(f: *mut ir.Func) bool {
         i = b.first;
         while u.notnil(i) and (cands.len < 64) {
             let t = i.ty;
-            if ((t.kind == ir.T_FLOAT) or ((t.kind == ir.T_INT) and (t.bits >= 8))) and (i.uses > 0) and
-               (i.aux2 == (SPLAT_TAG + @as(i64, i.uses))) and
+            if ((t.kind == ir.T_FLOAT) or ((t.kind == ir.T_INT) and (t.bits >= 8))) and (i.nuses > 0) and
+               (i.aux2 == (SPLAT_TAG + @as(i64, i.nuses))) and
                ((i.op != ir.OP_PHI) or ((b.preds.len == 2) and (i.xs.len == 2))) {
                 let mut x = i;
                 if i.op == ir.OP_PHI {
@@ -1709,7 +1705,6 @@ pub fn splat_groups(f: *mut ir.Func) bool {
                         }
                     }
                 }
-                ir.count_uses(f);
             }
             u.free_slice(group);
         }
@@ -1771,7 +1766,7 @@ fn byte_term(v: *mut ir.Value, t: *ir.Ty, x: *mut ByteTerm) bool {
 
 // The leaves of the `add` tree at root (adds of one use in its block).
 fn add_leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
-    if ir.is_op(v, ir.OP_ADD) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 256) {
+    if ir.is_op(v, ir.OP_ADD) and ((v == root) or ((v.nuses == 1) and (v.blk == root.blk))) and (out.len < 256) {
         add_leaves(v.a, root, out);
         add_leaves(v.b, root, out);
         return;
