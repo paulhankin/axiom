@@ -177,7 +177,7 @@ __asm__(".section .rodata.axiom_asm_table, \"a\"\n"
         "casal x25, x7, [x4]\n"
         "casa x1, x0, [x11]\n"
         "ldxr x19, [x20]\n"
-        "stxr w23, x23, [x3]\n"
+        "stxr w22, x23, [x3]\n"
         "ldar x9, [x10]\n"
         "stlr x15, [x0]\n"
         "ldapr x9, [x14]\n"
@@ -622,7 +622,7 @@ static const char *const want[] = {
     "87fcf9c8",  /* casal x25, x7, [x4] */
     "607de1c8",  /* casa x1, x0, [x11] */
     "937e5fc8",  /* ldxr x19, [x20] */
-    "777c17c8",  /* stxr w23, x23, [x3] */
+    "777c16c8",  /* stxr w22, x23, [x3] */
     "49fddfc8",  /* ldar x9, [x10] */
     "0ffc9fc8",  /* stlr x15, [x0] */
     "c9c1bff8",  /* ldapr x9, [x14] */

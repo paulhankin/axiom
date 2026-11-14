@@ -327,6 +327,42 @@ for name, base in (('fmlal', 0x0f800000), ('fmlal2', 0x2f808000), ('fmlsl', 0x0f
 ln('bfmlalb', 'p0,v5,x16', 0x0fc0f000, 'M8H')
 ln('bfmlalt', 'p0,v5,x16', 0x4fc0f000, 'M8H')
 
+# FEAT_FAMINMAX (famax, famin) and FP8's fscale: three same, half precision
+# (FH) and single/double (F3) in encodings of their own
+for name, hbase, base in (('famax', 0x0ec01c00, 0x0ea0dc00), ('famin', 0x2ec01c00, 0x2ea0dc00),
+                          ('fscale', 0x2ec03c00, 0x2ea0fc00)):
+    ln(name, 'v0,v5,v16', hbase, 'FH')
+    ln(name, 'v0,v5,v16', base, 'F3')
+# FEAT_FP8: the conversions from FP8 (Vd.8h from the low or, `2`, high
+# eight bytes), and fcvtn to FP8 from half (Vd.8b/16b, Vn and Vm .4h/.8h: `p`)
+# or single (Vd.8b, or 16b for fcvtn2, from two .4s: `Y`)
+for name, base in (('f1cvtl', 0x2e217800), ('f2cvtl', 0x2e617800), ('bf1cvtl', 0x2ea17800),
+                   ('bf2cvtl', 0x2ee17800)):
+    ln(name, 'w0,v5', base, 'Xb')
+    ln(name + '2', 'w0,v5', base, 'X2b')
+ln('fcvtn', 'v0,p5,p16', 0x0e40f400, 'DOT')
+ln('fcvtn', 'v0,Y5,Y16', 0x0e00f400, 'Xb')
+ln('fcvtn2', 'v0,Y5,Y16', 0x0e00f400, 'X2b')
+# FEAT_FP8DOT2 and FP8DOT4: fdot to half (Vd.4h/8h: `p`; by element Vm.2b[i]:
+# `b`, Rm v0-v15) and to single (Vd.2s/4s: `q`; by element Vm.4b[i]: `g`)
+ln('fdot', 'p0,v5,v16', 0x0e40fc00, 'DOT')
+ln('fdot', 'q0,v5,v16', 0x0e00fc00, 'DOT')
+ln('fdot', 'p0,v5,b16', 0x0f400000, 'DOT')
+ln('fdot', 'q0,v5,g16', 0x0f000000, 'DOT')
+# FEAT_FP8FMA: fmlalb/fmlalt (Vd.8h) and fmlallbb ... fmlalltt (Vd.4s) of
+# Vn.16b, by Vm.16b or by element Vm.b[i] (`x`: index 0-15, Rm v0-v7)
+for name, vbase, ebase, vd in (('fmlalb', 0x0ec0fc00, 0x0fc00000, 'p'), ('fmlalt', 0x4ec0fc00, 0x4fc00000, 'p'),
+                               ('fmlallbb', 0x0e00c400, 0x2f008000, 'q'), ('fmlallbt', 0x0e40c400, 0x2f408000, 'q'),
+                               ('fmlalltb', 0x4e00c400, 0x6f008000, 'q'), ('fmlalltt', 0x4e40c400, 0x6f408000, 'q')):
+    ln(name, vd + '0,v5,v16', vbase, 'M16')
+    ln(name, vd + '0,v5,x16', ebase, 'M16')
+# FEAT_LUT: luti2/luti4 Vd.T, {Vn.T} (luti4 of halves: two registers), Vm[i]
+# (`L<n><pos>` the list, `I<bits><index position><pos>` the unsized element)
+ln('luti2', 'v0,L15,I21316', 0x4e801000, 'M16')
+ln('luti2', 'v0,L15,I31216', 0x4ec00000, 'M8H')
+ln('luti4', 'v0,L15,I11416', 0x4e402000, 'M16')
+ln('luti4', 'v0,L25,I21316', 0x4e401000, 'M8H')
+
 # floating-point across lanes: 4s (single) and 4h/8h (FEAT_FP16); the result a scalar
 for name, base, hbase in (('fmaxnmv', 0x6e30c800, 0x0e30c800), ('fmaxv', 0x6e30f800, 0x0e30f800),
                           ('fminnmv', 0x6eb0c800, 0x0eb0c800), ('fminv', 0x6eb0f800, 0x0eb0f800)):

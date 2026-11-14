@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates cmd/axiom/src/asm/a64sysop.ax, the AArch64 assembler's table of
-the operations of the SYS aliases (AT, DC, IC, TLBI and TLBIP, and the
-prediction-restriction and trace aliases), from the lists below, written
+the operations of the SYS aliases (AT, DC, IC, TLBI and TLBIP, the
+prediction-restriction and trace aliases, and BRB), from the lists below, written
 from the Arm Architecture Reference Manual's "A64 System instructions"
 encoding tables (each operation's op1, CRn, CRm, op2):
 
@@ -82,20 +82,28 @@ TLBI['paall'] = (6, 7, 4, NONE)
 TLBI['paallos'] = (6, 1, 4, NONE)
 TLBI['rpaos'] = (6, 4, 3, REG)
 TLBI['rpalos'] = (6, 4, 7, REG)
+# the stage-2 invalidations without the stage-1 entries (FEAT_TLBIW), in the
+# range forms' CRm (no range of their own)
+for suffix, crm in (('is', 2), ('os', 5), ('', 6)):
+    TLBI['vmallws2e1' + suffix] = (4, crm, 2, NONE)
+# each has its nXS form (FEAT_XS: CRn 9)
 for name, (op1, crm, op2, how) in TLBI.items():
     op('tlbi', name, op1, 8, crm, op2, how)
-    if not name.startswith('rpa') and not name.startswith('paall'):
-        op('tlbi', name + 'nxs', op1, 9, crm, op2, how)
+    op('tlbi', name + 'nxs', op1, 9, crm, op2, how)
 
 # the prediction restriction instructions (FEAT_SPECRES): cfp, dvp, cosp,
 # cpp rctx, Xt (SYS #3, C7, C3, #4..7), and trcit Xt (FEAT_ITE)
 for name, op2 in (('cfp', 4), ('dvp', 5), ('cosp', 6), ('cpp', 7)):
     op(name, 'rctx', 3, 7, 3, op2, REG)
 
+# the branch record buffer's (FEAT_BRBE): brb iall, brb inj (SYS #1, C7, C2, #4 and #5)
+op('brb', 'iall', 1, 7, 2, 4, NONE)
+op('brb', 'inj', 1, 7, 2, 5, NONE)
+
 names = sorted(OPS)
 print('''// =============================================================================
 // asm/a64sysop.ax - the operations of the AArch64 assembler's SYS aliases (at,
-// dc, ic, tlbi, tlbip, cfp, dvp, cosp, cpp) as `alias.operation`, with the
+// dc, ic, tlbi, tlbip, cfp, dvp, cosp, cpp, brb) as `alias.operation`, with the
 // value op1:CRn:CRm:op2 << 3 | how the register operand is used (0 none, 1
 // required; bit 2: tlbip takes it too). Generated from the Arm Architecture
 // Reference Manual's System instruction encoding tables by

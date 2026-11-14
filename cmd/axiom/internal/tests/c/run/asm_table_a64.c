@@ -421,7 +421,7 @@ __asm__(".section .rodata.axiom_asm_table, \"a\"\n"
         "stnp x22, x7, [x13]\n"
         "ldp w4, w8, [sp, #-200]\n"
         "ldp w17, w26, [x19, #164]!\n"
-        "ldp w8, w8, [sp], #16\n"
+        "ldp w8, w9, [sp], #16\n"
         "stp w15, w6, [sp, #224]\n"
         "stp w7, w10, [x5, #204]!\n"
         "stp w17, w4, [sp], #-120\n"
@@ -1310,7 +1310,7 @@ __asm__(".section .rodata.axiom_asm_table, \"a\"\n"
         "ldar w24, [x25]\n"
         "stlr w13, [x28]\n"
         "stxr w30, w17, [x18]\n"
-        "stlxr w0, w0, [x11]\n"
+        "stlxr w1, w0, [x11]\n"
         "ldxp w21, w20, [sp]\n"
         "ldaxp w13, w30, [sp]\n"
         "stxp w3, w26, w0, [x2]\n"
@@ -2840,7 +2840,7 @@ static const char *const want[] = {
     "b61d00a8",  /* stnp x22, x7, [x13] */
     "e4236729",  /* ldp w4, w8, [sp, #-200] */
     "71ead429",  /* ldp w17, w26, [x19, #164]! */
-    "e823c228",  /* ldp w8, w8, [sp], #16 */
+    "e827c228",  /* ldp w8, w9, [sp], #16 */
     "ef1b1c29",  /* stp w15, w6, [sp, #224] */
     "a7a89929",  /* stp w7, w10, [x5, #204]! */
     "f113b128",  /* stp w17, w4, [sp], #-120 */
@@ -3729,7 +3729,7 @@ static const char *const want[] = {
     "38ffdf88",  /* ldar w24, [x25] */
     "8dff9f88",  /* stlr w13, [x28] */
     "517e1e88",  /* stxr w30, w17, [x18] */
-    "60fd0088",  /* stlxr w0, w0, [x11] */
+    "60fd0188",  /* stlxr w1, w0, [x11] */
     "f5537f88",  /* ldxp w21, w20, [sp] */
     "edfb7f88",  /* ldaxp w13, w30, [sp] */
     "5a002388",  /* stxp w3, w26, w0, [x2] */
