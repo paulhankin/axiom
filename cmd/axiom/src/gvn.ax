@@ -1478,7 +1478,7 @@ threadlocal let mut synth: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
     data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
 threadlocal let mut n_synth: usize = 0;
 
-fn synth_icmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+fn synth_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     if n_synth == synth.len {
         synth.push(u.new.[ir.Value]());
     }
@@ -1487,7 +1487,7 @@ fn synth_icmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     v.kind = ir.V_INST;
     v.op = ir.OP_ICMP;
     v.ty = ir.t_int(1);
-    v.cv = @as(u64, @bit_cast(u32, p));
+    v.cv = ir.pred_cv(p);
     ir.set_a(v, a);
     ir.set_b(v, b);
     return v;
@@ -1560,14 +1560,14 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
 
 // The outcomes of a comparison (less, equal, greater) for which predicate p
 // holds.
-fn outcomes(p: i32) u32 {
+fn outcomes(p: ir.CmpPred) u32 {
     if p == ir.IntEQ {
         return 2;
     }
     if p == ir.IntNE {
         return 5;
     }
-    let q = (p - ir.IntUGT) % 4;  // (gt, ge, lt, le, unsigned then signed)
+    let q = (@int_from_enum(p) - @int_from_enum(ir.IntUGT)) % 4;  // (gt, ge, lt, le, unsigned then signed)
     if q == 0 {
         return 4;
     }
@@ -1584,14 +1584,16 @@ fn outcomes(p: i32) u32 {
 // tp and its inverse): x < y makes x > y and x == y false and x != y and
 // x <= y true, in both operand orders; x == y decides every order; an
 // order of one signedness says nothing of the other's.
-fn assume_order(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
+fn assume_order(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
     let s = outcomes(tp);
     let signed = ir.is_signed_pred(tp);
-    for q in ir.IntEQ..(ir.IntSLE + 1) {
+    for qi in @int_from_enum(ir.IntEQ)..(@int_from_enum(ir.IntSLE) + 1) {
+        let q = @enum_from_int(ir.CmpPred, qi);
         if (q == tp) or (q == ir.inv_pred(tp)) {
             continue;
         }
-        if (tp > ir.IntNE) and (q > ir.IntNE) and (ir.is_signed_pred(q) != signed) {
+        if (@int_from_enum(tp) > @int_from_enum(ir.IntNE)) and (qi > @int_from_enum(ir.IntNE)) and
+           (ir.is_signed_pred(q) != signed) {
             continue;
         }
         let o = outcomes(q);
@@ -1608,7 +1610,7 @@ fn assume_order(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
 // The fact x tp k as the same comparison with the neighbouring constant:
 // x > k as x >= k + 1, x >= k as x > k - 1, x < k as x <= k - 1, x <= k as
 // x < k + 1 (signed or unsigned), where k +- 1 does not wrap.
-fn assume_adjacent(tp: i32, x: *mut ir.Value, k: *mut ir.Value) void {
+fn assume_adjacent(tp: ir.CmpPred, x: *mut ir.Value, k: *mut ir.Value) void {
     let t = k.ty;
     let bits = t.bits;
     if (t.kind != ir.T_INT) or (bits > 64) {
@@ -1621,24 +1623,25 @@ fn assume_adjacent(tp: i32, x: *mut ir.Value, k: *mut ir.Value) void {
     let mut np: i32 = -1;
     let mut nk: u64 = 0;
     if ((tp == ir.IntSGT) and (kc != smax)) or ((tp == ir.IntUGT) and (kc != all)) {
-        np = tp + 1;  // ge
+        np = @int_from_enum(tp) + 1;  // ge
         nk = (kc + 1) & all;
     } else if ((tp == ir.IntSGE) and (kc != smin)) or ((tp == ir.IntUGE) and (kc != 0)) {
-        np = tp - 1;  // gt
+        np = @int_from_enum(tp) - 1;  // gt
         nk = (kc -% 1) & all;
     } else if ((tp == ir.IntSLT) and (kc != smin)) or ((tp == ir.IntULT) and (kc != 0)) {
-        np = tp + 1;  // le
+        np = @int_from_enum(tp) + 1;  // le
         nk = (kc -% 1) & all;
     } else if ((tp == ir.IntSLE) and (kc != smax)) or ((tp == ir.IntULE) and (kc != all)) {
-        np = tp - 1;  // lt
+        np = @int_from_enum(tp) - 1;  // lt
         nk = (kc + 1) & all;
     }
     if np < 0 {
         return;
     }
+    let q = @enum_from_int(ir.CmpPred, np);
     let c = ir.cint(t, nk);
-    add_expr(synth_icmp(np, x, c), ir.kbool(true));
-    add_expr(synth_icmp(ir.inv_pred(np), x, c), ir.kbool(false));
+    add_expr(synth_icmp(q, x, c), ir.kbool(true));
+    add_expr(synth_icmp(ir.inv_pred(q), x, c), ir.kbool(false));
 }
 
 const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
@@ -1821,7 +1824,7 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
 }
 
 // Unsigned comparison facts: tp holds for (a, b).
-fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
+fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
         return;
     }
@@ -1860,7 +1863,7 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
             add_le(a, b, 0);
             add_le(b, a, 0);
         }
-    } else if (tp >= ir.IntSGT) and (tp <= ir.IntSLE) and ir.is_cint(a) and not ir.is_const(b) {
+    } else if ir.is_signed_pred(tp) and ir.is_cint(a) and not ir.is_const(b) {
         assume_bounds(ir.swap_pred(tp), b, a);
     } else if ((tp == ir.IntSGT) or (tp == ir.IntSGE)) and ir.is_cint(b) and not ir.is_const(a) {
         // a >= lo >= 0 (signed): a is not negative, and at least lo
@@ -3033,8 +3036,8 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
     prove_budget = 64;
     if small_k(b) {
         let m = ub(a, 0);
-        if (m >= 0) and (p >= ir.IntSGT) and (p <= ir.IntSLE) and (kv(b) <= smax_of(a.ty)) and (m <= smax_of(a.ty)) {
-            p = p - (ir.IntSGT - ir.IntUGT);  // both not negative: the unsigned comparison
+        if (m >= 0) and ir.is_signed_pred(p) and (kv(b) <= smax_of(a.ty)) and (m <= smax_of(a.ty)) {
+            p = ir.unsigned_pred(p);  // both not negative: the unsigned comparison
         }
         if (kv(b) == 0) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
             return ir.kbool(p == ir.IntUGE);
@@ -3071,8 +3074,8 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
     }
     // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
     // x - d >= k exactly when x >= d + k
-    if small_k(b) and ir.is_op(a, ir.OP_ADD) and ir.is_cint(a.b) and not ir.is_const(a.a) and (p >= ir.IntSGT) and
-       (p <= ir.IntSLE) and (a.ty.bits > 1) {
+    if small_k(b) and ir.is_op(a, ir.OP_ADD) and ir.is_cint(a.b) and not ir.is_const(a.a) and ir.is_signed_pred(p) and
+       (a.ty.bits > 1) {
         let d = 0 - ir.sval(a.b);
         let m = ub(a.a, 0);
         let mut need = d + kv(b);

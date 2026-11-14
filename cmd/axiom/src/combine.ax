@@ -47,7 +47,7 @@ pub fn log2(x: u64) i32 {
 }
 
 // (wasm.ax; the passes use ir.inv_pred)
-pub fn inv_pred(p: i32) i32 {
+pub fn inv_pred(p: ir.CmpPred) ir.CmpPred {
     return ir.inv_pred(p);
 }
 
@@ -72,7 +72,7 @@ fn kfalse() *mut ir.Value {
 }
 
 // A new comparison before i.
-fn mk_icmp(B: *mut ir.Builder, p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+fn mk_icmp(B: *mut ir.Builder, p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     return ir.icmp(B, p, a, b);
 }
 
@@ -93,7 +93,7 @@ fn negate_bool(B: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
 
 // Is the comparison `x p k` (k a constant of x's width) always true or false?
 // 1: true, 0: false, -1: unknown.
-fn cmp_const_range(p: i32, bits: i32, k: u64) i32 {
+fn cmp_const_range(p: ir.CmpPred, bits: i32, k: u64) i32 {
     let max = ir.mask_bits(bits);
     let sk = k;
     if (p == ir.IntULT) and (k == 0) {
@@ -256,13 +256,6 @@ fn sink_const_insert(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return r;
 }
 
-fn pick_pred(c: bool, a: i32, b: i32) i32 {
-    if c {
-        return a;
-    }
-    return b;
-}
-
 fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let mut p = ir.pred_of(i);
     let mut a = i.a;
@@ -292,7 +285,7 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     if ir.is_cint(a) and not ir.is_cint(b) {
         ir.set_a(i, b);
         ir.set_b(i, a);
-        i.cv = @as(u64, @bit_cast(u32, ir.swap_pred(p)));
+        i.cv = ir.pred_cv(ir.swap_pred(p));
         p = ir.pred_of(i);
         a = i.a;
         b = i.b;
@@ -332,16 +325,16 @@ fn simplify_vec_icmp(i: *mut ir.Value) void {
     if vzero(a) and not vzero(b) {
         ir.set_a(i, b);
         ir.set_b(i, a);
-        i.cv = @as(u64, @bit_cast(u32, ir.swap_pred(p)));
+        i.cv = ir.pred_cv(ir.swap_pred(p));
         p = ir.pred_of(i);
     }
     if vzero(i.b) and ((p == ir.IntUGT) or (p == ir.IntULE)) {
-        i.cv = @as(u64, @bit_cast(u32, pick_pred(p == ir.IntUGT, ir.IntNE, ir.IntEQ)));
+        i.cv = ir.pred_cv(ir.pick_pred(p == ir.IntUGT, ir.IntNE, ir.IntEQ));
     }
 }
 
 // i, `a p b` for a constant b and a of integer type at, simplified (or nil).
-fn icmp_const(B: *mut ir.Builder, i: *mut ir.Value, p: i32, a: *mut ir.Value, b: *mut ir.Value,
+fn icmp_const(B: *mut ir.Builder, i: *mut ir.Value, p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value,
               at: *mut ir.Ty) *mut ir.Value {
     let bits = at.bits;
     let k = ir.cint_val(b);
@@ -498,7 +491,7 @@ fn widening_mul_overflow(B: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value,
 
 // Overflow checks: (x + c) <u x and (x + c) <=u x are x >u MAX - c (for
 // c != 0); (x + c) >=u x and (x + c) >u x are x <=u MAX - c. Or nil.
-fn icmp_overflow(B: *mut ir.Builder, p: i32, a: *mut ir.Value, b: *mut ir.Value, at: *mut ir.Ty) *mut ir.Value {
+fn icmp_overflow(B: *mut ir.Builder, p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, at: *mut ir.Ty) *mut ir.Value {
     let bits = at.bits;
     let mut sum = vnil();
     let mut q = p;
@@ -1454,7 +1447,7 @@ fn fits_unsigned(v: *mut ir.Value, bits: i32) bool {
     }
     if ir.is_op(v, ir.OP_INTR) {
         // a count of bits is at most the width (which needs 7 bits)
-        let id = ir.pred_of(v);
+        let id = ir.intr_id(v);
         if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_CTPOP) {
             return (bits >= 8) or (v.ty.bits < (@as(i32, 1) << @as(u32, @bit_cast(u32, bits))));
         }
@@ -1835,8 +1828,9 @@ fn simplify_fcmp(i: *mut ir.Value) *mut ir.Value {
         if p == ir.RealUNE {
             return ir.kbool(true);
         }
-        if (p >= ir.RealOEQ) and (p <= ir.RealOLE) {
-            return ir.kbool(false);
+        match p {
+            .OEQ, .OGT, .OGE, .OLT, .OLE => { return ir.kbool(false); }
+            else => {}
         }
         return vnil();
     }
@@ -2024,7 +2018,7 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return simplify_load(i);
     }
     if op == ir.OP_INTR {
-        let id = ir.pred_of(i);
+        let id = ir.intr_id(i);
         if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
             return simplify_mul_ov(B, i, id == ir.IN_SMUL_OV);
         }
@@ -2086,7 +2080,7 @@ fn zero_count_default(v: *ir.Value, x: *ir.Value, k: *ir.Value) bool {
        (@int_from_ptr(z.ty) != @int_from_ptr(v.ty)) {
         return false;
     }
-    let id = ir.pred_of(z);
+    let id = ir.intr_id(z);
     if (id != ir.IN_CTLZ) and (id != ir.IN_CTTZ) {
         return false;
     }
@@ -2192,7 +2186,7 @@ fn swap_stage(v: *ir.Value, s: u64, m: u64) *mut ir.Value {
 // neighbouring bits, pairs and nibbles, then a byte swap; or nil.
 pub fn bit_reversed(v: *ir.Value) *mut ir.Value {
     let t = v.ty;
-    if not ir.is_op(v, ir.OP_INTR) or (ir.pred_of(v) != ir.IN_BSWAP) or (v.xs.len != 1) or (t.kind != ir.T_INT) or
+    if not ir.is_op(v, ir.OP_INTR) or (ir.intr_id(v) != ir.IN_BSWAP) or (v.xs.len != 1) or (t.kind != ir.T_INT) or
        ((t.bits != 32) and (t.bits != 64)) {
         return vnil();
     }
