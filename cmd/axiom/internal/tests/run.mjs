@@ -2889,6 +2889,27 @@ if (!skipPlatform) {
       return null;
     };
   }
+  // ... and on Windows, in the program database's line tables
+  for (const t of ['x86_64-windows', 'aarch64-windows']) {
+    dcases[`assembly sources' lines ${t}`] = async () => {
+      const dir = path.join(tmp, `debug-asm-lines-${t}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const loc = path.join(dir, 'loc.s'), main = path.join(dir, 'main.c'), exe = path.join(dir, 'prog.exe');
+      fs.writeFileSync(loc, '    .file 1 "virtual.c"\n    .text\n    .globl asm_loc\nasm_loc:\n    .loc 1 42\n    nop\n' +
+        '    .loc 1 43\n    ret\n');
+      fs.writeFileSync(main, 'void asm_loc(void);\nint main(void) { asm_loc(); return 0; }\n');
+      const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+      const r = await spawnAsync(compiler, ['build', main, loc, `--target=${t}`, '-g', '-o', exe],
+        { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+      if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+      const pdb = fs.readFileSync(path.join(dir, 'prog.pdb'));
+      const c = checkPDB(pdb);
+      if (c.errs.length) return c.errs.slice(0, 20).join('\n');
+      if (!pdb.includes('virtual.c')) return 'no file virtual.c (.file) in the program database';
+      for (const n of [42, 43]) if (!c.lines.includes(n)) return `no line ${n} (.loc) in the program database`;
+      return null;
+    };
+  }
   // two builds at different times are the same (the predefined macros'
   // <built-in>, whose MD5 the line table has, holds no __DATE__ or __TIME__)
   dcases['the same at another time'] = async () => {

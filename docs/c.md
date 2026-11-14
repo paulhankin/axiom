@@ -214,14 +214,16 @@ tag (`(global $id t)`, `(tag $id (param ...))`); another module's import is the 
   functions it calls are linked for it (its references are
   the library's roots as a C unit's are). On macOS the leading underscore is added to
   every name, as for C. A name it defines keeps the C library's definition of that name
-  out.
+  out, as does a global symbol that a C unit's file-scope asm defines: the program's
+  definition wins, as a C unit's does.
 - Nothing of an assembly source is stripped: its sections are the object's whatever
   refers to them (dead-code removal does not look into assembly), and the functions and
   objects it names are kept.
 - Under `-g` its code has line information: each instruction's line in the source (a
   `.S` source's lines are its own, a line of an included file or of a macro's
   expansion being the line it is used on), or the place the last `.loc file line`
-  gave (`.file N "name"` names the files), for debuggers and in the PDB on Windows;
+  gave (`.file N "name"` names the files), on every object format: in the DWARF line
+  table on Linux and macOS and in the PDB's (CodeView) on Windows;
   its parts from one label symbol to the next are subprograms of that name.
   `.cfi_*` and `.seh_*` procedures describe its frames ("Inline assembly").
 
@@ -2190,8 +2192,8 @@ no other tool is needed:
   (`@GOTPCREL`), on macOS `sym@TLVP(%rip)` in a `movq` (a thread-local's descriptor,
   which the linker makes a `leaq` for the image's own), absolute 32- and 64-bit
   addresses; AArch64's operators above,
-  `.quad` and `.word` of addresses. `.file`, `.loc`, `.ident`, `.arch` and the like are
-  accepted and do nothing. An instruction, operand form or directive that is not
+  `.quad` and `.word` of addresses. `.ident`, `.arch` and the like are accepted and do
+  nothing; `.file` and `.loc` give the line information under `-g` ("Assembly sources"). An instruction, operand form or directive that is not
   supported is C3097, naming it, at the statement.
 - Call frame information: in file-scope asm `.cfi_startproc [simple]` ... `.cfi_endproc`
   make a procedure whose `.cfi_def_cfa`, `.cfi_def_cfa_register`, `.cfi_def_cfa_offset`,

@@ -184,7 +184,8 @@ const kindName = (k) => '0x' + k.toString(16);
 export function checkPDB(p, opts = {}) {
   const errs = [];
   // (procs: every procedure, { name, off, size, sec, module, locals: [{ name, kind }] })
-  const out = { errs, streams: [], types: [], ids: [], modules: [], publics: [], globals: [], procs: [] };
+  // (lines: every line number of the modules' line tables)
+  const out = { errs, streams: [], types: [], ids: [], modules: [], publics: [], globals: [], procs: [], lines: [] };
   if (p.length < BS || p.toString('latin1', 0, 32) !== 'Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0') {
     errs.push('not an MSF file');
     return out;
@@ -489,6 +490,7 @@ export function checkPDB(p, opts = {}) {
             const lo = sub.readUInt32LE(o + 12 + 8 * k);
             if (lo < prev || lo >= size) errs.push(`${where}: a line at +${lo.toString(16)} of the function at ${off.toString(16)} (size ${size})`);
             prev = lo;
+            out.lines.push(sub.readUInt32LE(o + 16 + 8 * k) & 0xffffff);
           }
           o += bl;
         }
