@@ -13,6 +13,7 @@ pub const I64: u8 = 0x7e;
 pub const F32: u8 = 0x7d;
 pub const F64: u8 = 0x7c;
 pub const V128: u8 = 0x7b;
+pub const EXNREF: u8 = 0x69;
 
 // Symbol kinds and flags
 pub const SYM_FUNC: u8 = 0;
@@ -45,6 +46,12 @@ pub const R_MEMORY_ADDR_I64: u8 = 16;
 pub const R_TABLE_INDEX_SLEB64: u8 = 18;
 pub const R_TABLE_INDEX_I64: u8 = 19;
 pub const R_TABLE_NUMBER_LEB: u8 = 20;
+// Our own (not the tool conventions', which have no such relocations: our
+// linker's alone): the index of a passive data segment, its symbol's
+// (memory.init, data.drop), and of an element segment, sym its index in the
+// unit (table.init, elem.drop).
+pub const R_AXIOM_DATA_INDEX_LEB: u8 = 64;
+pub const R_AXIOM_ELEM_INDEX_LEB: u8 = 65;
 
 pub fn reloc_has_addend(t: u8) bool {
     return (t == R_MEMORY_ADDR_LEB) or (t == R_MEMORY_ADDR_SLEB) or (t == R_MEMORY_ADDR_I32) or
@@ -97,10 +104,71 @@ pub struct Func {
     frame_local: i64,
 }
 
+// A defined global; its initial value (ik): the constant init (and hi:
+// a v128's high half; a float's bits), `ref.null exn`, or `global.get` of
+// global import number init.
+pub const GI_CONST: u8 = 0;
+pub const GI_GET: u8 = 1;
+pub const GI_NULL: u8 = 2;
+
 pub struct Global {
     vt: u8,
     mutable: bool,
     init: i64,
+    ik: u8,
+    hi: i64,
+}
+
+/// The initial value of global g, as a constant expression.
+pub fn put_init(c: *mut bn.Bytes, g: *Global) void {
+    if g.ik == GI_GET {
+        c.u8_(0x23);
+        c.uleb(@bit_cast(u64, g.init));
+    } else if g.ik == GI_NULL {
+        c.u8_(0xd0);
+        c.u8_(0x69);
+    } else if g.vt == I64 {
+        c.u8_(0x42);
+        c.sleb(g.init);
+    } else if g.vt == F32 {
+        c.u8_(0x43);
+        c.u32_(@bit_cast(u64, g.init) & 0xffff_ffff);
+    } else if g.vt == F64 {
+        c.u8_(0x44);
+        c.u64_(@bit_cast(u64, g.init));
+    } else if g.vt == V128 {
+        c.u8_(0xfd);
+        c.uleb(12);
+        c.u64_(@bit_cast(u64, g.init));
+        c.u64_(@bit_cast(u64, g.hi));
+    } else {
+        c.u8_(0x41);
+        c.sleb(g.init);
+    }
+    c.u8_(0x0b);
+}
+
+// Reads a constant expression (put_init's) into g.
+fn read_init(r: *mut bn.Reader, g: *mut Global) void {
+    let op = r.u8_();
+    if op == 0x23 {
+        g.ik = GI_GET;
+        g.init = @bit_cast(i64, r.uleb());
+    } else if op == 0xd0 {
+        g.ik = GI_NULL;
+        _ = r.u8_();
+    } else if op == 0x43 {
+        g.init = @bit_cast(i64, r.u32_());
+    } else if op == 0x44 {
+        g.init = @bit_cast(i64, r.u64_());
+    } else if op == 0xfd {
+        _ = r.uleb();
+        g.init = @bit_cast(i64, r.u64_());
+        g.hi = @bit_cast(i64, r.u64_());
+    } else {
+        g.init = r.sleb();
+    }
+    _ = r.u8_();
 }
 
 pub struct Seg {
@@ -109,11 +177,24 @@ pub struct Seg {
     data: bn.Bytes,
     relocs: u.List.[Reloc],
     tls: bool,
+    passive: bool,  // for memory.init (file-scope asm's): not in the memory's image
 }
+
+// Export kinds (the binary format's)
+pub const EX_FUNC: u8 = 0;
+pub const EX_GLOBAL: u8 = 3;
+pub const EX_TAG: u8 = 4;
 
 pub struct Export {
     name: []u8,
-    func: u32,  // function index
+    func: u32,  // the function's index, or the global's or tag's (kind)
+    kind: u8,
+}
+
+/// A passive (or declarative) element segment: its functions' symbols.
+pub struct Elem {
+    funcs: u.List.[u32],
+    declare: bool,
 }
 
 // -g (DEBUG_FULL): the unit's own DWARF (dwarf.finish_parts: wasm.ax), its
@@ -144,6 +225,9 @@ pub struct Unit {
     fimports: u.List.[Import],  // function imports: function indices 0..n-1
     gimports: u.List.[Import],  // global imports
     timports: u.List.[Import],  // tag imports (ty: the tag's function type index)
+    tags: u.List.[u32],         // defined tags (after the imports): their types
+    elems: u.List.[*mut Elem],
+    start: u32,  // the start function's symbol + 1 (0: none)
     funcs: u.List.[*mut Func],
     globals: u.List.[Global],
     segs: u.List.[*mut Seg],
@@ -261,6 +345,16 @@ pub fn write_object(un: *mut Unit) []u8 {
         c.uleb(@as(u64, un.funcs.get(i).ty));
     }
     add_section(&mut w, 3, &mut c);
+    // tag
+    if un.tags.len > 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, un.tags.len));
+        for t in un.tags.items() {
+            c.u8_(0);
+            c.uleb(@as(u64, t));
+        }
+        add_section(&mut w, 13, &mut c);
+    }
     // global
     if un.globals.len > 0 {
         c = bn.new_bytes();
@@ -269,13 +363,7 @@ pub fn write_object(un: *mut Unit) []u8 {
             let g = un.globals.get(i);
             c.u8_(g.vt);
             c.u8_(u.pick(g.mutable, "\x01", "\x00")[0]);
-            if g.vt == I64 {
-                c.u8_(0x42);
-            } else {
-                c.u8_(0x41);
-            }
-            c.sleb(g.init);
-            c.u8_(0x0b);
+            put_init(&mut c, &g);
         }
         add_section(&mut w, 6, &mut c);
     }
@@ -286,10 +374,30 @@ pub fn write_object(un: *mut Unit) []u8 {
         for i in 0..un.exports.len {
             let e = un.exports.get(i);
             c.name(e.name);
-            c.u8_(0);
+            c.u8_(e.kind);
             c.uleb(@as(u64, e.func));
         }
         add_section(&mut w, 7, &mut c);
+    }
+    // start (file-scope asm's)
+    if un.start != 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, un.syms.get(@as(usize, un.start - 1)).index));
+        add_section(&mut w, 8, &mut c);
+    }
+    // elem: the passive and declarative segments, of function indices
+    if un.elems.len > 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, un.elems.len));
+        for e in un.elems.items() {
+            c.u8_(u.pick(e.declare, "\x03", "\x01")[0]);
+            c.u8_(0);
+            c.uleb(@as(u64, e.funcs.len));
+            for s in e.funcs.items() {
+                c.uleb(@as(u64, un.syms.get(@as(usize, s)).index));
+            }
+        }
+        add_section(&mut w, 9, &mut c);
     }
     // datacount
     c = bn.new_bytes();
@@ -311,7 +419,7 @@ pub fn write_object(un: *mut Unit) []u8 {
     // target features, so wasm-ld accepts the features we use
     c = bn.new_bytes();
     let feats = ["bulk-memory", "mutable-globals", "nontrapping-fptoint", "sign-ext", "simd128"];
-    let eh = un.timports.len > 0;
+    let eh = (un.timports.len > 0) or (un.tags.len > 0);
     c.uleb(@as(u64, feats.len) + @as(u64, eh));
     for f in feats {
         c.u8_('+');
@@ -570,6 +678,13 @@ fn data_section(un: *Unit, relocs: *mut u.List.[Reloc]) bn.Bytes {
     c.uleb(@as(u64, un.segs.len));
     for i in 0..un.segs.len {
         let sg = un.segs.get(i);
+        if sg.passive {
+            c.u8_(1);
+            c.uleb(@as(u64, sg.data.len()));
+            add_relocs(relocs, &sg.relocs, @int_cast(u32, c.len()));
+            c.put(sg.data.view());
+            continue;
+        }
         c.u8_(0);  // active, memory 0
         if un.wasm64 {
             c.u8_(0x42);
@@ -696,6 +811,8 @@ struct Reading {
     seg_names: u.List.[[]u8],
     seg_aligns: u.List.[u32],
     seg_tls: u.List.[bool],
+    start_fn: i64,           // the start section's function, -1: none
+    elem_fns: u.List.[u64],  // element segment << 32 | function index
 }
 
 // Returns nil if the bytes are not an object this compiler wrote.
@@ -711,7 +828,8 @@ pub fn read_object(d: []u8) *mut Unit {
     let mut rd = Reading.{ code_relocs: u.List.[Reloc].empty(), data_relocs: u.List.[Reloc].empty(),
                            ftypes: u.List.[u32].empty(), body_offs: u.List.[usize].empty(),
                            seg_offs: u.List.[usize].empty(), seg_names: u.List.[[]u8].empty(),
-                           seg_aligns: u.List.[u32].empty(), seg_tls: u.List.[bool].empty() };
+                           seg_aligns: u.List.[u32].empty(), seg_tls: u.List.[bool].empty(), start_fn: -1,
+                           elem_fns: u.List.[u64].empty() };
     while not r.at_end() and not r.bad {
         let id = r.u8_();
         let size = @truncate(usize, r.uleb());
@@ -738,20 +856,37 @@ pub fn read_object(d: []u8) *mut Unit {
         } else if id == 6 {
             let n = r.uleb();
             for i in @as(u64, 0)..n {
-                let vt = r.u8_();
-                let mu = r.u8_() != 0;
-                _ = r.u8_();
-                let init = r.sleb();
-                _ = r.u8_();
-                un.globals.push(Global.{ vt: vt, mutable: mu, init: init });
+                let mut g = Global.{ vt: r.u8_(), mutable: r.u8_() != 0, init: 0, ik: GI_CONST, hi: 0 };
+                read_init(&mut r, &mut g);
+                un.globals.push(g);
             }
         } else if id == 7 {
             let n = r.uleb();
             for i in @as(u64, 0)..n {
                 let nm = r.name();
-                _ = r.u8_();
+                let k = r.u8_();
                 let fi = @truncate(u32, r.uleb());
-                un.exports.push(Export.{ name: nm, func: fi });
+                un.exports.push(Export.{ name: nm, func: fi, kind: k });
+            }
+        } else if id == 13 {
+            let n = r.uleb();
+            for i in @as(u64, 0)..n {
+                _ = r.u8_();
+                un.tags.push(@truncate(u32, r.uleb()));
+            }
+        } else if id == 8 {
+            rd.start_fn = @bit_cast(i64, r.uleb());
+        } else if id == 9 {
+            let n = r.uleb();
+            for i in @as(u64, 0)..n {
+                let e = u.new.[Elem]();
+                e.declare = r.u8_() == 3;
+                _ = r.u8_();
+                let nf = r.uleb();
+                for j in @as(u64, 0)..nf {
+                    rd.elem_fns.push((@as(u64, un.elems.len) << 32) | (r.uleb() & 0xffff_ffff));
+                }
+                un.elems.push(e);
             }
         } else if id == 10 {
             let n = r.uleb();
@@ -766,13 +901,16 @@ pub fn read_object(d: []u8) *mut Unit {
         } else if id == 11 {
             let n = r.uleb();
             for i in @as(u64, 0)..n {
-                _ = r.u8_();
-                _ = r.u8_();
-                _ = r.sleb();
-                _ = r.u8_();
+                let passive = r.u8_() == 1;
+                if not passive {
+                    _ = r.u8_();
+                    _ = r.sleb();
+                    _ = r.u8_();
+                }
                 let sz = @truncate(usize, r.uleb());
                 rd.seg_offs.push(r.pos - start);
                 let sg = u.new.[Seg]();
+                sg.passive = passive;
                 sg.data.put(r.bytes(sz));
                 un.segs.push(sg);
             }
@@ -828,6 +966,14 @@ pub fn read_object(d: []u8) *mut Unit {
             sg.tls = rd.seg_tls.get(i);
         }
     }
+    // the start function's and the element segments' symbols (of their
+    // function indices: the first symbol of each)
+    for x in rd.elem_fns.items() {
+        un.elems.get(@truncate(usize, x >> 32)).funcs.push(func_sym(un, @truncate(u32, x)));
+    }
+    if rd.start_fn >= 0 {
+        un.start = func_sym(un, @truncate(u32, @bit_cast(u64, rd.start_fn))) + 1;
+    }
     // function names and symbols
     for i in 0..un.syms.len {
         let s = un.syms.get(i);
@@ -840,6 +986,17 @@ pub fn read_object(d: []u8) *mut Unit {
         }
     }
     return un;
+}
+
+// The symbol of function index fi (the first, 0 if none).
+fn func_sym(un: *Unit, fi: u32) u32 {
+    for i in 0..un.syms.len {
+        let s = un.syms.at(i);
+        if (s.kind == SYM_FUNC) and (s.index == fi) {
+            return @int_cast(u32, i);
+        }
+    }
+    return 0;
 }
 
 // The import section: function and global imports (the memory's says

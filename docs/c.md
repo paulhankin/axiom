@@ -201,11 +201,12 @@ directives done and its macros replaced, its other text as written; a line whose
 does not begin a directive is a comment (as is `#` first on a line on AArch64, `//`
 anywhere there, `#` anywhere on x86-64, and `;;` and `(; ;)` on WebAssembly). A `.s`
 source is not preprocessed. On WebAssembly (`__AXIOM_ASM_WASM__`) the source is module
-fields in the specification's text format, `(func ...)` and `(import ...)`, optionally
-inside `(module ...)`, as file-scope asm is there ("Inline assembly"); it sees no C
-declarations, so it imports what it calls: `(import "env" "name" (func $id ...))` is the
-program's function `name` (another unit's, the C library's), another module's import the
-host's function.
+fields in the specification's text format (functions, imports, globals, tags, passive
+data and element segments, exports, a start function, types), optionally inside
+`(module ...)`, as file-scope asm is there ("Inline assembly"); it sees no C
+declarations, so it imports what it uses: `(import "env" "name" (func $id ...))` is the
+program's function `name` (another unit's, the C library's), and so for a global or a
+tag (`(global $id t)`, `(tag $id (param ...))`); another module's import is the host's.
 
 - Its global symbols (`.globl`, `.weak`) are external names of the program: C and
   Axiom (`extern "C"`) call its functions and read its data; a name it defines that a
@@ -2083,21 +2084,28 @@ no other tool is needed:
   access's size, an atomic access's its size), lane indices, `v128.const` of every shape,
   `i8x16.shuffle`, `;;` and `(; ;)` comments. Instructions: the numeric, conversion,
   memory, `memory.size`/`memory.grow`, `select` (and `select (result t)`), `drop`,
-  `nop`, `unreachable`, `call`, `call_indirect (param ...) (result ...)` (of the
-  program's function table; the index is an `i32`, also on wasm64), `local.get`/`set`/
-  `tee`, `global.get`/`global.set $__stack_pointer`; and of the extensions `--features`
+  `nop`, `unreachable`, `call`, `call_indirect (param ...) (result ...)` or `(type $t)`
+  (of the program's function table; the index is an `i32`, also on wasm64), `local.get`/
+  `set`/`tee`, `global.get`/`global.set` of `$__stack_pointer` and of file-scope asm's
+  globals (`global.set` of an immutable one is C3097); and of the extensions `--features`
   enables (another's instruction is C3097, naming the flag): sign-ext, nontrapping-fptoint,
-  bulk-memory's `memory.copy` and `memory.fill`, simd128 (all of it), relaxed-simd,
-  atomics (`memory.atomic.notify`, `wait32`/`wait64`, `atomic.fence`, the atomic loads,
-  stores and read-modify-writes), tail-call (`return_call`, `return_call_indirect`) and
-  exception-handling (`try_table` with `catch_all` and `catch_all_ref`, `throw_ref`, the
-  `exnref` type, `ref.null exn` and `ref.is_null`; and the extension's legacy form, which
-  engines still take: `try bt ... catch_all ... end`, `try bt ... delegate l`, `rethrow l`
-  of a catch_all, flat and folded as `(try bt (do ...) (catch_all ...))` and `(try bt (do
-  ...) (delegate l))`). A table of them is generated from the specification's opcode tables by
-  `cmd/internal/tools/gen_wasm_table.py`. Not: what names what C has none of (`throw`
-  and `catch` of a tag, `memory.init` and `data.drop` of a data segment, the reference
-  types' table and `ref.*` instructions, which no extension of the target has). Every
+  mutable-globals (a mutable global imported from the host or exported), bulk-memory
+  (`memory.copy`, `memory.fill`, `memory.init` and `data.drop` of a passive data segment,
+  `table.init` and `elem.drop` of an element segment, `table.copy`), simd128 (all of it),
+  relaxed-simd, atomics (`memory.atomic.notify`, `wait32`/`wait64`, `atomic.fence`, the
+  atomic loads, stores and read-modify-writes), multivalue (block types and functions of
+  several results), tail-call (`return_call`, `return_call_indirect`) and
+  exception-handling (`throw $tag`, `try_table` with `catch $tag l`, `catch_ref $tag l`,
+  `catch_all` and `catch_all_ref`, whose labels must take the tag's parameters (and the
+  `exnref`), `throw_ref`, the `exnref` type, `ref.null exn` and `ref.is_null`; and the
+  extension's legacy form, which engines still take: `try bt ... catch $tag ... catch_all
+  ... end`, `try bt ... delegate l`, `rethrow l` of a catch, flat and folded as `(try bt
+  (do ...) (catch $tag ...) (catch_all ...))` and `(try bt (do ...) (delegate l))`). So
+  every instruction that the ten extensions of `--features` can enable assembles and is
+  validated. A table of them is generated from the specification's opcode tables by
+  `cmd/internal/tools/gen_wasm_table.py`. Not, by rule: the reference types' instructions
+  (`table.get`, `table.set`, `table.size`, `table.grow`, `table.fill`, `ref.func`, `ref.null
+  func` and `funcref` values), an extension that `--features` has no flag for. Every
   template is validated as the specification's validation algorithm says, its operands'
   types known: an operand of the wrong type, a stack left with values, a block not
   ended, a label that is not there are C3097, so that the module is always valid. The
@@ -2128,12 +2136,43 @@ no other tool is needed:
     that C label;
   - a template that calls a function (`call`, `call_indirect`) is as one that calls on
     the other targets (its function makes no sibling calls).
-  File-scope asm is module fields: `(func $name (export "n")? (param $p? t)* (result
-  t)* (local $l? t)* instructions)`, a function of the program named `name` (C declares
-  it to call it; `(export "n")` exports it from the module too), whose body may also
-  `return`, and `(import "module" "name" (func $id (param ...) (result ...)))` (as in an
-  assembly source: above); data is defined in C. A function of file-scope asm is never
-  stripped, and one that C or Axiom code defines too is an error. A naked function
+  File-scope asm is module fields (asm statements see the names they declare, which are
+  the unit's: each kind its own namespace, by name only, since the index spaces are the
+  program's):
+  - `(func $name (export "n")? (type $t)? (param $p? t)* (result t)* (local $l? t)*
+    instructions)`, a function of the program named `name` (C declares it to call it;
+    `(export "n")` exports it from the module too), whose body may also `return`;
+  - `(import "module" "name" (func|global|tag $id ...))` (as in an assembly source:
+    above): module `env` names the program's function, global or tag of that name
+    (another unit's; a global `__stack_pointer` is the stack pointer), another module the
+    host's, imported by the module;
+  - `(global $g (export "n")? t|(mut t) init)`, a global of the program named `g`, whose
+    initial value is one constant of its type (`i32.const` ... `v128.const`, `ref.null
+    exn` of an `exnref` one) or `global.get` of an immutable imported global (the linker
+    takes an `env` one's constant value: one defined by an immutable global with a
+    constant); another unit imports it from `env` with its type and mutability, else a
+    link error;
+  - `(tag $e (export "n")? (type $t)? (param t*))`, a tag of the program named `e`;
+  - `(data $d "bytes"*)`, a passive data segment (`memory.init`, `data.drop`), and `(elem
+    $e declare? func $f*)`, a passive or declarative element segment, whose functions get
+    slots of the function table as pointers to them would (`table.init` writes the
+    program's table, which has as many slots as the program's function pointers and does
+    not grow). An active segment, `(data (i32.const N) ...)` or `(elem (i32.const N)
+    ...)`, is C3097 by rule: the memory's and the table's layouts are the program's (the
+    stack, the objects and the functions' slots the linker places); objects are defined in
+    C;
+  - `(export "n" (func|global|tag $x))` of the text's own definitions (the linker exports
+    the memory as `memory`), `(start $f)` (of type `[] -> []`, one in a unit: the module's
+    start function calls it when the module is instantiated, before the program's entry:
+    in a program with threads, in each thread's instance too), `(type $t (func ...))`;
+  - `(memory i32|i64? n m? shared?)` and `(table $t? n m? funcref)` only declare the
+    program's memory (of the target's index type) and function table again (`$t` then
+    names table 0); another is C3097.
+  The objects of such units have what the tool conventions give (tags, globals, exports
+  of each kind, the start section, passive segments) and, for `memory.init`/`data.drop`
+  and `table.init`/`elem.drop`, relocations of our own linker's (the conventions have
+  none). A function of file-scope asm is never stripped, and one that C or Axiom code
+  defines too is an error. A naked function
   (`__attribute__((naked))`) has its asm statements, without operands, as its code: its
   parameters are the locals 0 up, and it returns what it leaves on the stack.
 - Directives: `.byte`, `.short`/`.hword`/`.2byte`, `.word` (2 bytes on x86-64, 4 on

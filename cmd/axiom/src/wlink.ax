@@ -5,8 +5,11 @@
 // symbols stay within their unit). Only what the exports reach is kept.
 // Memory: the stack comes first (so overflowing it traps: the stack pointer
 // wraps below 0), then the data segments. Function pointers index table 0,
-// whose slot 0 stays empty. Undefined functions with an explicit import
-// module (`import host`) become imports; other undefined symbols are errors.
+// whose slot 0 stays empty. Undefined functions, globals and tags with an
+// explicit import module (`import host`, file-scope asm's imports) become
+// imports; other undefined symbols are errors. Globals come after the
+// host's and the stack pointer; tags after the host's; file-scope asm's
+// passive data and element segments before the module's own.
 // =============================================================================
 import "bin.ax" as bn;
 import "dloc.ax" as dloc;
@@ -46,7 +49,11 @@ struct UnitMap {
     flive: []mut bool,  // defined functions (by definition number)
     slive: []mut bool,
     saddr: []mut u64,
-    gidx: []mut i64,  // unit global index -> final global index
+    gidx: []mut i64,    // unit global index -> final global index
+    tlive: []mut bool,  // defined tags (by definition number)
+    tidx: []mut i64,    // unit tag index -> final tag index (-1 unknown)
+    pidx: []mut i64,    // passive data segment -> its final index
+    eidx: []mut i64,    // element segment -> its final index
 }
 
 let mut maps_p: *mut UnitMap = @ptr_from_int(*mut UnitMap, 0);
@@ -130,6 +137,9 @@ fn mark(ui: usize, si: u32) void {
             mp.flive[di] = true;
             work.push(Ref.{ un: r.un, sym: @int_cast(u32, di) });
         }
+    } else if s.kind == wo.SYM_TAG {
+        let di = @as(usize, s.index) - un.timports.len;
+        mp.tlive[di] = true;
     } else if s.kind == wo.SYM_DATA {
         let sg = @as(usize, s.seg);
         if not mp.slive[sg] {
@@ -142,7 +152,7 @@ fn mark(ui: usize, si: u32) void {
 fn mark_relocs(ui: usize, rs: *u.List.[wo.Reloc]) void {
     for i in 0..rs.len {
         let r = rs.get(i);
-        if r.ty != wo.R_TYPE_INDEX_LEB {
+        if (r.ty != wo.R_TYPE_INDEX_LEB) and (r.ty != wo.R_AXIOM_ELEM_INDEX_LEB) {
             mark(ui, r.sym);
         }
     }
@@ -166,6 +176,15 @@ fn liveness(o: *Options) void {
         }
         for x in un.inits.items() {
             mark(ui, @truncate(u32, x & 0xffff_ffff));  // (constructors: called by __wasm_call_ctors)
+        }
+        // (file-scope asm's element segments and start function)
+        for e in un.elems.items() {
+            for f in e.funcs.items() {
+                mark(ui, f);
+            }
+        }
+        if un.start != 0 {
+            mark(ui, un.start - 1);
         }
     }
     while work.len > 0 {
@@ -220,22 +239,98 @@ fn table_index(fi: i64) u32 {
     return slot;
 }
 
-// The exception tag of setjmp and longjmp (the exception-handling
-// extension: wasm.ax, "setjmp and longjmp"): one, __axc_longjmp_tag,
-// defined by the module, carrying a jmp_buf's address. Its type index.
-let mut tag_used: bool = false;
-let mut tag_type: u32 = 0;
+// Tags (the exception-handling extension): the units' definitions that are
+// live, after the imports of the host's (undefined tags of an explicit
+// module); longjmp's, __axc_longjmp_tag, is longjmp_unit's. A tag's final
+// index.
+struct TagImp {
+    module: []u8,
+    name: []u8,
+    ty: u32,
+}
+let mut tag_imps: u.List.[TagImp] = u.List.[TagImp].{ data: @ptr_from_int(*mut TagImp, 0), len: 0, cap: 0 };
+let mut tag_types: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // defined: final types
 
-fn tag_index(ui: usize, si: u32, w64: bool) u64 {
+fn tag_index(ui: usize, si: u32) u64 {
     let s = U()[ui].syms.at(@as(usize, si));
-    if not u.str_eq(s.name, "__axc_longjmp_tag") {
-        err(u.f1("undefined tag '%s'", s.name));
+    let r = resolve(ui, si);
+    if r.un >= 0 {
+        let un = U()[@int_cast(usize, r.un)];
+        let x = MP()[@int_cast(usize, r.un)].tidx[@as(usize, un.syms.at(@as(usize, r.sym)).index)];
+        if x >= 0 {
+            return @bit_cast(u64, x);
+        }
+    } else {
+        let x = MP()[ui].tidx[@as(usize, s.index)];
+        if x >= 0 {
+            return @bit_cast(u64, x);
+        }
     }
-    if not tag_used {
-        tag_used = true;
-        tag_type = final_type_enc(u.pick(w64, "\x60\x01\x7e\x00", "\x60\x01\x7f\x00"));
-    }
+    err(u.f1("undefined tag '%s'", s.name));
     return 0;
+}
+
+// The tags' final indices: the host's imports, then the live definitions;
+// a reference's type must be its definition's.
+fn add_tags() void {
+    tag_imps.clear();
+    tag_types.clear();
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for si in 0..un.syms.len {
+            let s = un.syms.at(si);
+            if (s.kind != wo.SYM_TAG) or defined(s) or (resolve(ui, @int_cast(u32, si)).un >= 0) or
+               ((s.flags & wo.F_EXPLICIT_NAME) == 0) {
+                continue;
+            }
+            let im = un.timports.get(@as(usize, s.index));
+            let ty = final_type(ui, im.ty);
+            let mut found: i64 = -1;
+            for k in 0..tag_imps.len {
+                let x = tag_imps.get(k);
+                if u.str_eq(x.module, im.module) and u.str_eq(x.name, im.name) {
+                    found = @int_cast(i64, k);
+                    if x.ty != ty {
+                        err(u.f1("the host's tag '%s' is imported with two types", im.name));
+                    }
+                }
+            }
+            if found < 0 {
+                tag_imps.push(TagImp.{ module: im.module, name: im.name, ty: ty });
+                found = @int_cast(i64, tag_imps.len - 1);
+            }
+            MP()[ui].tidx[@as(usize, s.index)] = found;
+        }
+    }
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for di in 0..un.tags.len {
+            if MP()[ui].tlive[di] {
+                MP()[ui].tidx[un.timports.len + di] = @int_cast(i64, tag_imps.len + tag_types.len);
+                tag_types.push(final_type(ui, un.tags.get(di)));
+            }
+        }
+    }
+    // (an import of a tag another unit defines: the same type)
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for si in 0..un.syms.len {
+            let s = un.syms.at(si);
+            if (s.kind != wo.SYM_TAG) or defined(s) {
+                continue;
+            }
+            let r = resolve(ui, @int_cast(u32, si));
+            if r.un < 0 {
+                continue;
+            }
+            let du = U()[@int_cast(usize, r.un)];
+            let ds = du.syms.at(@as(usize, r.sym));
+            let dt = final_type(@int_cast(usize, r.un), du.tags.get(@as(usize, ds.index) - du.timports.len));
+            if final_type(ui, un.timports.get(@as(usize, s.index)).ty) != dt {
+                err(u.f1("tag '%s' is declared with another type than its definition's", s.name));
+            }
+        }
+    }
 }
 
 /// longjmp for WebAssembly with the exception-handling extension (a unit of
@@ -248,10 +343,10 @@ fn tag_index(ui: usize, si: u32, w64: bool) u64 {
 pub fn longjmp_unit(w64: bool) *mut wo.Unit {
     let un = wo.new_unit(w64);
     let pt = u.pick(w64, "\x7e", "\x7f");
-    un.timports.push(wo.Import.{ module: "env", name: "__axc_longjmp_tag", ty: wo.type_index(un, pt, ""),
-                                 mutable: false });
-    let tag = wo.add_sym(un, wo.Sym.{ kind: wo.SYM_TAG, flags: wo.F_UNDEFINED, name: "__axc_longjmp_tag", index: 0,
-                                      seg: 0, off: 0, size: 0 });
+    // (the tag, defined here: kept if something throws or catches it)
+    un.tags.push(wo.type_index(un, pt, ""));
+    let tag = wo.add_sym(un, wo.Sym.{ kind: wo.SYM_TAG, flags: wo.F_HIDDEN, name: "__axc_longjmp_tag", index: 0, seg: 0,
+                                      off: 0, size: 0 });
     jump_func(un, "longjmp", wo.type_index(un, u.cat2(pt, "\x7f"), ""), false, tag);
     jump_func(un, "__axc_longjmp_restore", wo.type_index(un, u.cat2(pt, "\x7e"), ""), true, tag);
     return un;
@@ -307,15 +402,22 @@ fn data_addr(ui: usize, si: u32) u64 {
     return MP()[@int_cast(usize, r.un)].saddr[@as(usize, s.seg)] + s.off;
 }
 
+// (the number of the host's globals, before the stack pointer's)
+let mut gbase: i64 = 0;
+
 fn global_index(ui: usize, si: u32) i64 {
     let s = U()[ui].syms.at(@as(usize, si));
     if u.str_eq(s.name, "__stack_pointer") {
-        return 0;
+        return gbase;
     }
     let r = resolve(ui, si);
     if r.un < 0 {
-        err(u.f1("undefined global '%s'", s.name));
-        return 0;
+        let x = MP()[ui].gidx[@as(usize, s.index)];
+        if (x < 0) or ((s.flags & wo.F_EXPLICIT_NAME) == 0) {
+            err(u.f1("undefined global '%s'", s.name));
+            return 0;
+        }
+        return x;  // (the host's)
     }
     let un = U()[@int_cast(usize, r.un)];
     return MP()[@int_cast(usize, r.un)].gidx[@as(usize, un.syms.at(@as(usize, r.sym)).index)];
@@ -379,7 +481,15 @@ fn apply(ui: usize, d: *mut bn.Bytes, rs: *u.List.[wo.Reloc], w64: bool) void {
         } else if t == wo.R_TABLE_NUMBER_LEB {
             d.set_uleb_n(off, 0, 5);
         } else if t == wo.R_TAG_INDEX_LEB {
-            d.set_uleb_n(off, tag_index(ui, r.sym, w64), 5);
+            d.set_uleb_n(off, tag_index(ui, r.sym), 5);
+        } else if t == wo.R_AXIOM_DATA_INDEX_LEB {
+            let x = resolve(ui, r.sym);
+            let un = U()[@int_cast(usize, x.un)];
+            d.set_uleb_n(off,
+                         @bit_cast(
+                             u64, MP()[@int_cast(usize, x.un)].pidx[@as(usize, un.syms.at(@as(usize, x.sym)).seg)]), 5);
+        } else if t == wo.R_AXIOM_ELEM_INDEX_LEB {
+            d.set_uleb_n(off, @bit_cast(u64, MP()[ui].eidx[@as(usize, r.sym)]), 5);
         } else {
             err(u.f1("unsupported relocation type %s", u.idec(@as(i32, t))));
         }
@@ -404,12 +514,16 @@ struct Mod {
     stack_top: u64,
     flag_addr: u64,  // shared memories: the data's initialization flag
     pages: u64,
-    gtypes: u.List.[u8],  // globals: value type, initial value
-    ginits: u.List.[i64],
-    segs: u.List.[bn.Bytes],  // the data segments (not all zero)
+    globals: u.List.[wo.Global],  // the defined globals: the stack pointer's (its value stack_top), the units'
+    gimps: u.List.[Imp],          // the host's globals (ty: value type | mutable << 8), before them
+    psegs: u.List.[bn.Bytes],     // the passive data segments (file-scope asm's), first
+    segs: u.List.[bn.Bytes],      // the data segments (not all zero)
     seg_addr: u.List.[u64],
-    ex_names: u.List.[[]u8],  // exported functions
+    elems: u.List.[*mut Elem],  // the element segments (file-scope asm's), first
+    starts: u.List.[i64],       // the units' start functions
+    ex_names: u.List.[[]u8],    // exports: functions, globals, tags
     ex_funcs: u.List.[i64],
+    ex_kinds: u.List.[u8],
     start: i64,  // the start function, -1: none
     init_body: bn.Bytes,
 }
@@ -419,7 +533,6 @@ pub fn link(us0: []mut *mut wo.Unit, o: *Options) []u8 {
     units_p = us.ptr;
     nunits = us.len;
     failed = false;
-    tag_used = false;
     new_maps();
     collect_defs();
     liveness(o);
@@ -429,9 +542,11 @@ pub fn link(us0: []mut *mut wo.Unit, o: *Options) []u8 {
     let w64 = (us.len > 0) and us[0].wasm64;
     let mut m = Mod.{ w64: w64, nimp: 0, fbody: u.List.[Ref].empty(), ftys: u.List.[u32].empty(),
                       bodies: u.List.[bn.Bytes].empty(), nfunc: 0, stack_top: 0, flag_addr: 0, pages: 0,
-                      gtypes: u.List.[u8].empty(), ginits: u.List.[i64].empty(), segs: u.List.[bn.Bytes].empty(),
-                      seg_addr: u.List.[u64].empty(), ex_names: u.List.[[]u8].empty(), ex_funcs: u.List.[i64].empty(),
-                      start: -1, init_body: bn.new_bytes() };
+                      globals: u.List.[wo.Global].empty(), gimps: u.List.[Imp].empty(),
+                      psegs: u.List.[bn.Bytes].empty(), segs: u.List.[bn.Bytes].empty(), seg_addr: u.List.[u64].empty(),
+                      elems: u.List.[*mut Elem].empty(), starts: u.List.[i64].empty(), ex_names: u.List.[[]u8].empty(),
+                      ex_funcs: u.List.[i64].empty(), ex_kinds: u.List.[u8].empty(), start: -1,
+                      init_body: bn.new_bytes() };
     add_imports();
     m.nimp = imports.len;
     number_funcs(&mut m);
@@ -440,13 +555,15 @@ pub fn link(us0: []mut *mut wo.Unit, o: *Options) []u8 {
         return u.nosym();
     }
     add_globals(&mut m);
+    add_tags();
+    add_elems(&mut m);
     relocate(&mut m);
     add_exports(&mut m);
     if failed {
         return u.nosym();
     }
-    if o.shared_memory and (m.segs.len > 0) {
-        init_function(&mut m);
+    if (o.shared_memory and (m.segs.len > 0)) or (m.starts.len > 0) {
+        init_function(&mut m, o.shared_memory and (m.segs.len > 0));
     }
     let res = emit(&mut m, o);
     if failed {
@@ -557,6 +674,13 @@ fn new_maps() void {
         mp.slive = u.newn.[bool](un.segs.len + 1);
         mp.saddr = u.newn.[u64](un.segs.len + 1);
         mp.gidx = u.newn.[i64](un.gimports.len + un.globals.len + 1);
+        mp.tlive = u.newn.[bool](un.tags.len + 1);
+        mp.tidx = u.newn.[i64](un.timports.len + un.tags.len + 1);
+        for i in 0..mp.tidx.len {
+            mp.tidx[i] = -1;
+        }
+        mp.pidx = u.newn.[i64](un.segs.len + 1);
+        mp.eidx = u.newn.[i64](un.elems.len + 1);
     }
 }
 
@@ -615,6 +739,7 @@ fn number_funcs(m: *mut Mod) void {
 fn lay_out_memory(m: *mut Mod, o: *Options) bool {
     let mut addr: u64 = (o.stack_size + 15) & ~@as(u64, 15);
     m.stack_top = addr;
+    let mut np: i64 = 0;
     for ui in 0..nunits {
         let un = U()[ui];
         for si in 0..un.segs.len {
@@ -622,6 +747,12 @@ fn lay_out_memory(m: *mut Mod, o: *Options) bool {
                 continue;
             }
             let sg = un.segs.get(si);
+            if sg.passive {
+                // (not in the image: memory.init writes it where the code says)
+                MP()[ui].pidx[si] = np;
+                np += 1;
+                continue;
+            }
             let a = @as(u64, 1) << sg.align;
             addr = (addr + a - 1) & ~(a - 1);
             MP()[ui].saddr[si] = addr;
@@ -647,16 +778,135 @@ fn lay_out_memory(m: *mut Mod, o: *Options) bool {
     return true;
 }
 
-// Globals: __stack_pointer, then the units' globals.
+// Globals: the host's (undefined globals of an explicit module), then
+// __stack_pointer, then the units' definitions. A global's declaration must
+// have its definition's type and mutability; an initial value of
+// global.get is the host's global, or an immutable constant global's value.
 fn add_globals(m: *mut Mod) void {
-    m.gtypes.push(u.pick(m.w64, "\x7e", "\x7f")[0]);
-    m.ginits.push(0);
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for si in 0..un.syms.len {
+            let s = un.syms.at(si);
+            if (s.kind != wo.SYM_GLOBAL) or defined(s) or ((s.flags & wo.F_EXPLICIT_NAME) == 0) or
+               (resolve(ui, @int_cast(u32, si)).un >= 0) {
+                continue;
+            }
+            let im = un.gimports.get(@as(usize, s.index));
+            let ty = im.ty | (@as(u32, im.mutable) << 8);
+            let mut found: i64 = -1;
+            for k in 0..m.gimps.len {
+                let x = m.gimps.get(k);
+                if u.str_eq(x.module, im.module) and u.str_eq(x.name, im.name) {
+                    found = @int_cast(i64, k);
+                    if x.ty != ty {
+                        err(u.f1("the host's global '%s' is imported with two types", im.name));
+                    }
+                }
+            }
+            if found < 0 {
+                m.gimps.push(Imp.{ module: im.module, name: im.name, ty: ty });
+                found = @int_cast(i64, m.gimps.len - 1);
+            }
+            MP()[ui].gidx[@as(usize, s.index)] = found;
+        }
+    }
+    gbase = @int_cast(i64, m.gimps.len);
+    m.globals.push(wo.Global.{ vt: u.pick(m.w64, "\x7e", "\x7f")[0], mutable: true, init: 0, ik: wo.GI_CONST, hi: 0 });
     for ui in 0..nunits {
         let un = U()[ui];
         for gi in 0..un.globals.len {
-            MP()[ui].gidx[un.gimports.len + gi] = @int_cast(i64, m.gtypes.len);
-            m.gtypes.push(un.globals.get(gi).vt);
-            m.ginits.push(un.globals.get(gi).init);
+            MP()[ui].gidx[un.gimports.len + gi] = gbase + @int_cast(i64, m.globals.len);
+            m.globals.push(un.globals.get(gi));
+        }
+    }
+    // (declarations against definitions)
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for si in 0..un.syms.len {
+            let s = un.syms.at(si);
+            if (s.kind != wo.SYM_GLOBAL) or defined(s) or u.str_eq(s.name, "__stack_pointer") {
+                continue;
+            }
+            let r = resolve(ui, @int_cast(u32, si));
+            if r.un < 0 {
+                continue;
+            }
+            let im = un.gimports.get(@as(usize, s.index));
+            let gi = global_index(ui, @int_cast(u32, si)) - gbase;
+            let d = m.globals.get(@int_cast(usize, gi));
+            if (@as(u32, d.vt) != im.ty) or (d.mutable != im.mutable) {
+                err(u.f1("global '%s' is declared with another type or mutability than its definition's", s.name));
+            }
+        }
+    }
+    // (initial values of global.get: the unit's import number init)
+    let mut k: usize = 1;
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for gi in 0..un.globals.len {
+            let g = m.globals.at(k);
+            k += 1;
+            if g.ik != wo.GI_GET {
+                continue;
+            }
+            let mut si: i64 = -1;
+            for j in 0..un.syms.len {
+                let s = un.syms.at(j);
+                if (s.kind == wo.SYM_GLOBAL) and not defined(s) and (@as(i64, s.index) == g.init) {
+                    si = @int_cast(i64, j);
+                }
+            }
+            if si < 0 {
+                err("a global's initial value names a global the unit does not import");
+                continue;
+            }
+            let x = global_index(ui, @truncate(u32, @bit_cast(u64, si)));
+            if x < gbase {
+                g.init = x;
+                continue;
+            }
+            let d = m.globals.get(@int_cast(usize, x - gbase));
+            if d.mutable or (d.ik == wo.GI_GET) or (x == gbase) {
+                err(u.f1("a global's initial value is global '%s', which is not an immutable constant",
+                         un.syms.at(@truncate(usize, @bit_cast(u64, si))).name));
+                continue;
+            }
+            g.ik = d.ik;
+            g.init = d.init;
+            g.hi = d.hi;
+        }
+    }
+}
+
+// The element segments of the units (file-scope asm's), first among the
+// module's: their functions, each given a slot of the function table (as
+// a pointer to it would be); and the units' start functions.
+struct Elem {
+    funcs: u.List.[i64],
+    declare: bool,
+}
+
+fn add_elems(m: *mut Mod) void {
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for ei in 0..un.elems.len {
+            let e = un.elems.get(ei);
+            let x = u.new.[Elem]();
+            x.declare = e.declare;
+            for f in e.funcs.items() {
+                let fi = func_index(ui, f);
+                if fi < 0 {
+                    err(u.f1("undefined function '%s'", un.syms.at(@as(usize, f)).name));
+                    continue;
+                }
+                _ = table_index(fi);
+                x.funcs.push(fi);
+            }
+            MP()[ui].eidx[ei] = @int_cast(i64, m.elems.len);
+            m.elems.push(x);
+        }
+        if un.start != 0 {
+            m.starts.push(func_index(ui, un.start - 1));
         }
     }
 }
@@ -689,6 +939,10 @@ fn relocate(m: *mut Mod) void {
             let mut b = bn.new_bytes();
             b.put(sg.data.view());
             apply(ui, &mut b, &sg.relocs, m.w64);
+            if sg.passive {
+                m.psegs.push(b);
+                continue;
+            }
             let mut zero = true;
             for c in b.view() {
                 if c != 0 {
@@ -706,7 +960,8 @@ fn relocate(m: *mut Mod) void {
     }
 }
 
-// The units' exports (the first of each name, of live functions).
+// The units' exports (the first of each name): of live functions, of
+// globals, of live tags.
 fn add_exports(m: *mut Mod) void {
     for ui in 0..nunits {
         let un = U()[ui];
@@ -718,24 +973,46 @@ fn add_exports(m: *mut Mod) void {
                     dup = true;
                 }
             }
-            let fi = MP()[ui].fidx[@as(usize, e.func)];
+            let mut fi = MP()[ui].fidx[@as(usize, e.func)];
+            if e.kind == wo.EX_GLOBAL {
+                fi = MP()[ui].gidx[@as(usize, e.func)];
+            } else if e.kind == wo.EX_TAG {
+                fi = MP()[ui].tidx[@as(usize, e.func)];
+            }
             if dup or (fi < 0) {
                 continue;
             }
             m.ex_names.push(e.name);
             m.ex_funcs.push(fi);
+            m.ex_kinds.push(e.kind);
         }
     }
 }
 
-// The start function for shared memories: initializes the data once.
-fn init_function(m: *mut Mod) void {
+// The start function: for shared memories (shared) it initializes the data
+// once; then it calls the units' start functions (file-scope asm's), when
+// the module is instantiated (in a program with threads, in each thread's
+// instance, as the specification's start function runs).
+fn init_function(m: *mut Mod, shared: bool) void {
     _ = final_type_enc("\x60\x00\x00");
     m.start = m.nfunc;
     m.nfunc += 1;
     let b = &mut m.init_body;
-    let w64 = m.w64;
     b.uleb(0);
+    if shared {
+        init_data(m);
+    }
+    for f in m.starts.items() {
+        b.u8_(0x10);
+        b.uleb(@bit_cast(u64, f));
+    }
+    b.u8_(0x0b);
+}
+
+fn init_data(m: *mut Mod) void {
+    let b = &mut m.init_body;
+    let w64 = m.w64;
+    let np = @as(u64, m.psegs.len);  // (the passive segments of file-scope asm come first)
     // if (cmpxchg(flag, 0, 1) == 0) { memory.init...; flag = 2 }
     pconst_b(b, w64, m.flag_addr);
     b.u8_(0x41);
@@ -757,7 +1034,7 @@ fn init_function(m: *mut Mod) void {
         b.sleb(@bit_cast(i64, @as(u64, m.segs.at(k).len())));
         b.u8_(0xfc);
         b.uleb(8);
-        b.uleb(@as(u64, k));
+        b.uleb(np + @as(u64, k));
         b.u8_(0);
     }
     pconst_b(b, w64, m.flag_addr);
@@ -771,9 +1048,8 @@ fn init_function(m: *mut Mod) void {
     for k in 0..m.segs.len {
         b.u8_(0xfc);
         b.uleb(9);
-        b.uleb(@as(u64, k));
+        b.uleb(np + @as(u64, k));
     }
-    b.u8_(0x0b);
 }
 
 // The module's encoding.
@@ -825,30 +1101,29 @@ fn emit(m: *mut Mod, o: *Options) []u8 {
         c.uleb(m.pages);
         section(&mut out, 5, &mut c);
     }
-    // tag (longjmp's)
-    if tag_used {
+    // tag
+    if tag_types.len > 0 {
         c = bn.new_bytes();
-        c.uleb(1);
-        c.u8_(0);
-        c.uleb(@as(u64, tag_type));
+        c.uleb(@as(u64, tag_types.len));
+        for t in tag_types.items() {
+            c.u8_(0);
+            c.uleb(@as(u64, t));
+        }
         section(&mut out, 13, &mut c);
     }
     // global
     c = bn.new_bytes();
-    c.uleb(@as(u64, m.gtypes.len));
-    for i in 0..m.gtypes.len {
-        c.u8_(m.gtypes.get(i));
-        c.u8_(1);
+    c.uleb(@as(u64, m.globals.len));
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        c.u8_(g.vt);
+        c.u8_(@as(u8, g.mutable));
         if i == 0 {
             pconst_b(&mut c, w64, m.stack_top);
-        } else if m.gtypes.get(i) == 0x7e {
-            c.u8_(0x42);
-            c.sleb(m.ginits.get(i));
+            c.u8_(0x0b);
         } else {
-            c.u8_(0x41);
-            c.sleb(m.ginits.get(i));
+            wo.put_init(&mut c, &g);
         }
-        c.u8_(0x0b);
     }
     section(&mut out, 6, &mut c);
     // export
@@ -865,7 +1140,7 @@ fn emit(m: *mut Mod, o: *Options) []u8 {
     }
     for i in 0..m.ex_names.len {
         c.name(m.ex_names.get(i));
-        c.u8_(0);
+        c.u8_(m.ex_kinds.get(i));
         c.uleb(@bit_cast(u64, m.ex_funcs.get(i)));
     }
     section(&mut out, 7, &mut c);
@@ -875,24 +1150,35 @@ fn emit(m: *mut Mod, o: *Options) []u8 {
         c.uleb(@bit_cast(u64, m.start));
         section(&mut out, 8, &mut c);
     }
-    // elem: table slots 1..n
-    if table.len > 0 {
+    // elem: file-scope asm's segments, then the table's slots 1..n
+    let ne = m.elems.len + @as(usize, table.len > 0);
+    if ne > 0 {
         c = bn.new_bytes();
-        c.uleb(1);
-        c.uleb(0);
-        c.u8_(0x41);
-        c.sleb(1);
-        c.u8_(0x0b);
-        c.uleb(@as(u64, table.len));
-        for i in 0..table.len {
-            c.uleb(@as(u64, table.get(i)));
+        c.uleb(@as(u64, ne));
+        for e in m.elems.items() {
+            c.u8_(u.pick(e.declare, "\x03", "\x01")[0]);
+            c.u8_(0);
+            c.uleb(@as(u64, e.funcs.len));
+            for f in e.funcs.items() {
+                c.uleb(@bit_cast(u64, f));
+            }
+        }
+        if table.len > 0 {
+            c.uleb(0);
+            c.u8_(0x41);
+            c.sleb(1);
+            c.u8_(0x0b);
+            c.uleb(@as(u64, table.len));
+            for i in 0..table.len {
+                c.uleb(@as(u64, table.get(i)));
+            }
         }
         section(&mut out, 9, &mut c);
     }
     // datacount (for memory.init / data.drop)
-    if m.start >= 0 {
+    if (m.start >= 0) or (m.psegs.len > 0) {
         c = bn.new_bytes();
-        c.uleb(@as(u64, m.segs.len));
+        c.uleb(@as(u64, m.psegs.len + m.segs.len));
         section(&mut out, 12, &mut c);
     }
     c = code_section(m, ndef);
@@ -911,7 +1197,7 @@ fn emit(m: *mut Mod, o: *Options) []u8 {
 // The function imports, and a shared memory's.
 fn import_section(m: *Mod, o: *Options) bn.Bytes {
     let mut c = bn.new_bytes();
-    let mut nimports = imports.len;
+    let mut nimports = imports.len + m.gimps.len + tag_imps.len;
     if o.shared_memory {
         nimports += 1;
     }
@@ -920,6 +1206,20 @@ fn import_section(m: *Mod, o: *Options) bn.Bytes {
         let x = imports.get(i);
         c.name(x.module);
         c.name(x.name);
+        c.u8_(0);
+        c.uleb(@as(u64, x.ty));
+    }
+    for x in m.gimps.items() {
+        c.name(x.module);
+        c.name(x.name);
+        c.u8_(3);
+        c.u8_(@truncate(u8, x.ty));
+        c.u8_(@truncate(u8, x.ty >> 8));
+    }
+    for x in tag_imps.items() {
+        c.name(x.module);
+        c.name(x.name);
+        c.u8_(4);
         c.u8_(0);
         c.uleb(@as(u64, x.ty));
     }
@@ -969,7 +1269,14 @@ fn code_section(m: *mut Mod, ndef: usize) bn.Bytes {
 // function initializes them), else active at their addresses.
 fn data_section(m: *mut Mod, o: *Options) bn.Bytes {
     let mut c = bn.new_bytes();
-    c.uleb(@as(u64, m.segs.len));
+    c.uleb(@as(u64, m.psegs.len + m.segs.len));
+    for k in 0..m.psegs.len {
+        let b = m.psegs.at(k);
+        c.u8_(1);  // passive
+        c.uleb(@as(u64, b.len()));
+        c.put(b.view());
+        b.free();
+    }
     for k in 0..m.segs.len {
         let b = m.segs.at(k);
         if o.shared_memory {

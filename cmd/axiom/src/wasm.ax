@@ -84,7 +84,12 @@ fn is_header(b: *ir.Block) bool {
 }
 
 fn fail(msg: []u8) void {
-    u.eprint(u.f2("axiom: wasm code generation: %s (in %s)\n", msg, F.name));
+    if u.isnil(F) {
+        // (outside a function: file-scope asm's)
+        u.eprint(u.f1("axiom: wasm code generation: %s\n", msg));
+    } else {
+        u.eprint(u.f2("axiom: wasm code generation: %s (in %s)\n", msg, F.name));
+    }
     errors = true;
 }
 
@@ -2658,6 +2663,50 @@ let mut top_syms: u.SymMap.[u32] = u.SymMap.[u32].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 let mut top_heads: u.List.[*mut aw.AFunc] = u.List.[*mut aw.AFunc].{ data: @ptr_from_int(*mut *mut aw.AFunc, 0), len: 0,
                                                                      cap: 0 };
+// (each text's headers: its other fields, which asm statements see too)
+let mut top_hdrs: u.List.[*mut aw.Asm] = u.List.[*mut aw.Asm].{ data: @ptr_from_int(*mut *mut aw.Asm, 0), len: 0,
+                                                                cap: 0 };
+
+// The key of top_syms for a field of kind k (aw.FK_*) named n: each kind
+// has its own namespace in the text.
+fn fkey(k: u8, n: []u8) []u8 {
+    let pre = ["", "\x01g", "\x01t", "\x01d", "\x01e", "\x01y"];
+    return u.intern(u.cat2(pre[@as(usize, k)], n));
+}
+
+// The key of field n of kind k of the unit's text number j (cur_text):
+// each text's names are its own; fkey's are the unit's, the first text's
+// that declares the name, which asm statements see.
+fn tkey(j: i64, k: u8, n: []u8) []u8 {
+    return u.intern(u.cat3(u.idec(@truncate(i32, j)), "\x01", fkey(k, n)));
+}
+
+let mut cur_text: i64 = -1;  // (the text whose fields' names are being resolved, -1: an asm statement's)
+
+fn put_field(k: u8, n: []u8, sym1: u32) void {
+    top_syms.put(tkey(cur_text, k, n), sym1);
+    if top_syms.get(fkey(k, n)) == 0 {
+        top_syms.put(fkey(k, n), sym1);
+    }
+}
+
+fn get_field(k: u8, n: []u8) u32 {
+    if cur_text >= 0 {
+        return top_syms.get(tkey(cur_text, k, n));
+    }
+    return top_syms.get(fkey(k, n));
+}
+
+// A field of the unit's file-scope asm (asm/wasm.ax's g_field).
+fn asm_field(k: u8, n: []u8) aw.FieldRef {
+    for H in top_hdrs.items() {
+        let r = aw.field_of(H, k, n);
+        if r.kind != aw.FK_NONE {
+            return r;
+        }
+    }
+    return aw.FieldRef.{ kind: aw.FK_NONE, params: "", results: "", mutable: false, imported: false };
+}
 
 // The symbol name `n` of asm text stands for (an internal name's).
 fn asm_name(n: []u8) []u8 {
@@ -2780,6 +2829,27 @@ fn asm_relocs(code: *mut bn.Bytes, base: u32, fx: []aw.Fix, v: *mut ir.Value, rl
             rl.push(wo.Reloc.{ ty: wo.R_GLOBAL_INDEX_LEB, off: off, sym: sp_sym, addend: 0 });
             continue;
         }
+        if (k == aw.FX_GLOBAL) or (k == aw.FX_TAG) or (k == aw.FX_DATA_SEG) or (k == aw.FX_ELEM_SEG) {
+            // (a field of file-scope asm: its symbol, or an element segment's index)
+            let fk = u8_pick(k == aw.FX_GLOBAL, aw.FK_GLOBAL, u8_pick(k == aw.FX_TAG, aw.FK_TAG,
+                                                                      u8_pick(
+                                                                          k == aw.FX_DATA_SEG, aw.FK_DATA,
+                                                                          aw.FK_ELEM)));
+            let t = get_field(fk, f.name);
+            if t == 0 {
+                fail(u.f1("asm names $%s, which the unit's file-scope asm does not declare", f.name));
+                continue;
+            }
+            let ty = u8_pick(k == aw.FX_GLOBAL, wo.R_GLOBAL_INDEX_LEB,
+                             u8_pick(
+                                 k == aw.FX_TAG, wo.R_TAG_INDEX_LEB,
+                                 u8_pick(k == aw.FX_DATA_SEG, wo.R_AXIOM_DATA_INDEX_LEB, wo.R_AXIOM_ELEM_INDEX_LEB)));
+            if k == aw.FX_ELEM_SEG {
+                UN.uses_table = true;
+            }
+            rl.push(wo.Reloc.{ ty: ty, off: off, sym: t - 1, addend: 0 });
+            continue;
+        }
         let mut at = SymAt.{ sym: -1, addend: 0, func: k != aw.FX_DATA };
         if f.op >= 0 {
             at = sym_at(v.xs.get(@int_cast(usize, f.op) + 1));
@@ -2855,6 +2925,7 @@ fn gen_asm(v: *mut ir.Value) void {
     }
     asm_blob = b;
     aw.g_lookup = asm_lookup;
+    aw.g_field = asm_field;
     asm_count += 1;
     let A = aw.assemble_inline(ack.wasm_text(b, consts[0..n], asm_count), &env.env, W64);
     if aw.failed(A) {
@@ -2865,7 +2936,7 @@ fn gen_asm(v: *mut ir.Value) void {
     let base = @int_cast(u32, C.len());
     C.put(A.code.view());
     asm_relocs(&mut C, base, A.fixes.items(), v, &mut RL);
-    if A.table {
+    if A.uses_table {
         UN.uses_table = true;
     }
     asm_vals.push(v);
@@ -2902,11 +2973,14 @@ fn top_assemble(m: *mut ir.Module) bool {
     MOD = m;
     top_syms = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
     top_heads.clear();
+    top_hdrs.clear();
+    cur_text = -1;
     top_asms.clear();
     top_blobs.clear();
     asm_vals.clear();
     asm_locs.clear();
     // (the headers first: a text may call another's functions)
+    aw.g_field = aw.no_field;
     for b in ai.toplevel.items() {
         let H = aw.assemble_headers(b.text, W64);
         if aw.failed(H) {
@@ -2922,8 +2996,10 @@ fn top_assemble(m: *mut ir.Module) bool {
             }
             top_heads.push(f);
         }
+        top_hdrs.push(H);
     }
     aw.g_lookup = asm_lookup;
+    aw.g_field = asm_field;
     for b in ai.toplevel.items() {
         asm_blob = b;
         let A = aw.assemble_file(b.text, W64);
@@ -2979,6 +3055,164 @@ fn top_imports() void {
     }
 }
 
+// The globals and tags file-scope asm imports: undefined symbols of the
+// program's (module "env": the stack pointer's for __stack_pointer, the
+// longjmp tag's for __axc_longjmp_tag) or the host's. The unit's defined
+// globals' indices, after the imports, move up past them.
+fn top_field_imports() void {
+    let n0 = UN.gimports.len;
+    for j in 0..top_asms.len {
+        let A = top_asms.get(j);
+        cur_text = @int_cast(i64, j);
+        for g in A.globals.items() {
+            if g.module.len == 0 {
+                continue;
+            }
+            let env = u.str_eq(g.module, "env");
+            if env and u.str_eq(g.iname, "__stack_pointer") {
+                if (g.vt != ptr_vt()) or not g.mutable {
+                    fail(u.f1("file-scope asm imports __stack_pointer as other than (mut %s)", aw.vt_name(ptr_vt())));
+                }
+                put_field(aw.FK_GLOBAL, g.name, sp_sym + 1);
+                continue;
+            }
+            let gi = @int_cast(u32, UN.gimports.len);
+            UN.gimports.push(wo.Import.{ module: g.module, name: g.iname, ty: @as(u32, g.vt), mutable: g.mutable });
+            let fl = wo.F_UNDEFINED | explicit_unless(env);
+            let sy = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: fl, name: g.iname, index: gi, seg: 0, off: 0,
+                                             size: 0 });
+            put_field(aw.FK_GLOBAL, g.name, sy + 1);
+        }
+        for t in A.tags.items() {
+            if t.module.len == 0 {
+                continue;
+            }
+            let env = u.str_eq(t.module, "env");
+            if env and u.str_eq(t.iname, "__axc_longjmp_tag") and (UN.timports.len > 0) {
+                put_field(aw.FK_TAG, t.name, tag_sym + 1);
+                continue;
+            }
+            let ti = @int_cast(u32, UN.timports.len);
+            UN.timports.push(wo.Import.{ module: t.module, name: t.iname, ty: wo.type_index(UN, t.params, ""),
+                                         mutable: false });
+            let fl = wo.F_UNDEFINED | explicit_unless(env);
+            let sy = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_TAG, flags: fl, name: t.iname, index: ti, seg: 0, off: 0,
+                                             size: 0 });
+            put_field(aw.FK_TAG, t.name, sy + 1);
+        }
+    }
+    let moved = @int_cast(u32, UN.gimports.len - n0);
+    if moved > 0 {
+        for j in 0..UN.syms.len {
+            let sy = UN.syms.at(j);
+            if (sy.kind == wo.SYM_GLOBAL) and ((sy.flags & wo.F_UNDEFINED) == 0) {
+                sy.index += moved;
+            }
+        }
+    }
+}
+
+fn explicit_unless(env: bool) u32 {
+    if env {
+        return 0;
+    }
+    return wo.F_EXPLICIT_NAME;
+}
+
+// The fields file-scope asm defines, after its functions: globals, tags,
+// passive data segments (local symbols), element segments (of the
+// functions' symbols), the start function, the exports. Its globals and
+// tags are external names, as its functions are.
+fn top_fields() void {
+    for j in 0..top_asms.len {
+        let A = top_asms.get(j);
+        cur_text = @int_cast(i64, j);
+        for g in A.globals.items() {
+            if g.module.len > 0 {
+                continue;
+            }
+            let mut wg = wo.Global.{ vt: g.vt, mutable: g.mutable, init: @bit_cast(i64, g.lo), ik: wo.GI_CONST,
+                                     hi: @bit_cast(i64, g.hi) };
+            if g.ik == aw.GI_NULL {
+                wg.ik = wo.GI_NULL;
+            } else if g.ik == aw.GI_GET {
+                // (global.get of an import: its import's index)
+                let t = get_field(aw.FK_GLOBAL, g.gname);
+                wg.ik = wo.GI_GET;
+                wg.init = @as(i64, UN.syms.get(@as(usize, t - 1)).index);
+            }
+            let gi = @int_cast(u32, UN.gimports.len + UN.globals.len);
+            UN.globals.push(wg);
+            let mut fl = wo.F_HIDDEN | wo.F_NO_STRIP;
+            if g.exp.len > 0 {
+                fl = (fl | wo.F_EXPORTED) & ~wo.F_HIDDEN;
+                UN.exports.push(wo.Export.{ name: g.exp, func: gi, kind: wo.EX_GLOBAL });
+            }
+            let sy = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: fl, name: g.name, index: gi, seg: 0, off: 0,
+                                             size: 0 });
+            put_field(aw.FK_GLOBAL, g.name, sy + 1);
+        }
+        for t in A.tags.items() {
+            if t.module.len > 0 {
+                continue;
+            }
+            let ti = @int_cast(u32, UN.timports.len + UN.tags.len);
+            UN.tags.push(wo.type_index(UN, t.params, ""));
+            let mut fl = wo.F_HIDDEN | wo.F_NO_STRIP;
+            if t.exp.len > 0 {
+                fl = (fl | wo.F_EXPORTED) & ~wo.F_HIDDEN;
+                UN.exports.push(wo.Export.{ name: t.exp, func: ti, kind: wo.EX_TAG });
+            }
+            let sy = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_TAG, flags: fl, name: t.name, index: ti, seg: 0, off: 0,
+                                             size: 0 });
+            put_field(aw.FK_TAG, t.name, sy + 1);
+        }
+        for d in A.datas.items() {
+            let seg = u.new.[wo.Seg]();
+            seg.name = u.cat2(".data.passive.", d.name);
+            seg.passive = true;
+            seg.data.put(d.bytes);
+            UN.segs.push(seg);
+            let sy = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: wo.F_LOCAL, name: d.name, index: 0,
+                                             seg: @int_cast(u32, UN.segs.len - 1), off: 0,
+                                             size: @as(u64, d.bytes.len) });
+            put_field(aw.FK_DATA, d.name, sy + 1);
+        }
+    }
+}
+
+// The element segments and the start function of file-scope asm (once
+// every function has its symbol).
+fn top_elems() void {
+    for j in 0..top_asms.len {
+        let A = top_asms.get(j);
+        asm_blob = top_blobs.get(j);
+        cur_text = @int_cast(i64, j);
+        for e in A.elems.items() {
+            let we = u.new.[wo.Elem]();
+            we.declare = e.declare;
+            for f in e.funcs {
+                let sy = asm_sym(f, true);
+                if sy >= 0 {
+                    we.funcs.push(@truncate(u32, @bit_cast(u64, sy)));
+                }
+            }
+            UN.elems.push(we);
+            put_field(aw.FK_ELEM, e.name, @int_cast(u32, UN.elems.len));
+        }
+        if A.start.len > 0 {
+            if UN.start != 0 {
+                fail("the unit's file-scope asm has two start functions");
+                return;
+            }
+            let sy = asm_sym(A.start, true);
+            if sy >= 0 {
+                UN.start = @truncate(u32, @bit_cast(u64, sy)) + 1;
+            }
+        }
+    }
+}
+
 // The functions of file-scope asm, after the IR's definitions: their
 // symbols (external, never stripped: nothing looks into asm), and the IR's
 // declarations of them.
@@ -2993,7 +3227,7 @@ fn top_functions() void {
             let mut fl = sym_flags_for(ir.LINK_EXTERNAL, true) | wo.F_NO_STRIP;
             if f.exp.len > 0 {
                 fl = (fl | wo.F_EXPORTED) & ~wo.F_HIDDEN;
-                UN.exports.push(wo.Export.{ name: f.exp, func: fi });
+                UN.exports.push(wo.Export.{ name: f.exp, func: fi, kind: wo.EX_FUNC });
             }
             wf.sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: f.name, index: fi, seg: 0, off: 0,
                                              size: 0 });
@@ -3043,6 +3277,7 @@ fn top_code() void {
     for j in 0..top_asms.len {
         let A = top_asms.get(j);
         asm_blob = top_blobs.get(j);
+        cur_text = @int_cast(i64, j);
         for f in A.funcs.items() {
             let wf = UN.funcs.get(k);
             k += 1;
@@ -3052,7 +3287,7 @@ fn top_code() void {
             for r in rl.items() {
                 wf.relocs.push(r);
             }
-            if A.table {
+            if A.uses_table {
                 UN.uses_table = true;
             }
         }
@@ -4669,6 +4904,7 @@ fn emit_data(g: *mut ir.Global, seg: *mut wo.Seg, x: *mut ir.Value, off: u64) vo
 pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
     W64 = wasm64;
     errors = false;
+    F = u.nil.[ir.Func]();
     UN = wo.new_unit(wasm64);
     fsyms.clear();
     gsyms.clear();
@@ -4715,7 +4951,7 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
             if g.init.kind == ir.V_CINT {
                 init = ir.sval(g.init);
             }
-            UN.globals.push(wo.Global.{ vt: vt(g.ty), mutable: true, init: init });
+            UN.globals.push(wo.Global.{ vt: vt(g.ty), mutable: true, init: init, ik: wo.GI_CONST, hi: 0 });
             gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: sym_flags_for(g.linkage, true),
                                                  name: g.name, index: gi, seg: 0, off: 0, size: 0 }));
         } else if not g.wasm_global and (init_priority(g) >= 0) {
@@ -4767,6 +5003,7 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
                                              size: 0 }));
     }
     top_imports();
+    top_field_imports();
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if ir.is_decl(f) {
@@ -4779,7 +5016,7 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
         let mut fl = sym_flags_for(f.linkage, true);
         if f.export_name.len > 0 {
             fl = (fl | wo.F_EXPORTED | wo.F_NO_STRIP) & ~wo.F_HIDDEN;
-            UN.exports.push(wo.Export.{ name: f.export_name, func: fi });
+            UN.exports.push(wo.Export.{ name: f.export_name, func: fi, kind: wo.EX_FUNC });
         }
         wf.sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: f.name, index: fi, seg: 0, off: 0,
                                          size: 0 });
@@ -4787,7 +5024,10 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
         UN.funcs.push(wf);
     }
     top_functions();
+    top_fields();
+    top_elems();
     top_code();
+    cur_text = -1;
     // a C unit's constructors in an object (an entry of .init_array.N, a
     // pointer: cgen.ax put_in_arrays), as the linking section's INIT_FUNCS:
     // their priorities and symbols, which a linker calls in that order

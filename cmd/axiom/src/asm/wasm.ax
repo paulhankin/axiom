@@ -6,7 +6,9 @@
 // "Validation Algorithm") does and encoded in the binary format, for asm
 // statements (an instruction sequence whose operands are locals, constants
 // and symbols: c/csema_asm.ax, wasm.ax) and for file-scope asm and assembly
-// sources (module fields: functions and their imports).
+// sources (module fields: functions, imports, globals, tags, passive data and
+// element segments, exports, the start function, types; the memory and the
+// function table are the program's).
 //
 // The text is the specification's: plain and folded instructions, symbolic
 // labels (`block $l ... br $l`) and numeric depths, `;;` and `(; ;)`
@@ -85,13 +87,49 @@ fn no_lookup(n: []u8) Ref {
 /// program's IR (wasm.ax). Unknown names are errors.
 pub let mut g_lookup: fn([]u8) Ref = no_lookup;
 
+/// The module fields other than functions that a name of the text may
+/// refer to (FieldRef.kind): a global (`global.get $g`), a tag (`throw $e`),
+/// a data segment (`memory.init $d`), an element segment (`table.init $e`),
+/// a function type (`(type $t)`). Each kind has a namespace of its own, as
+/// in a module.
+pub const FK_NONE: u8 = 0;
+pub const FK_GLOBAL: u8 = 1;
+pub const FK_TAG: u8 = 2;
+pub const FK_DATA: u8 = 3;
+pub const FK_ELEM: u8 = 4;
+pub const FK_TYPE: u8 = 5;
+
+pub struct FieldRef {
+    kind: u8,
+    params: []u8,    // a global's value type (one); a tag's or a type's parameters
+    results: []u8,   // a type's results
+    mutable: bool,   // a global's
+    imported: bool,  // a global or tag imported (a global's init may get only such a one)
+}
+
+/// No fields beyond the text's own (an assembly source's).
+pub fn no_field(kind: u8, n: []u8) FieldRef {
+    _ = kind;
+    _ = n;
+    return FieldRef.{ kind: FK_NONE, params: "", results: "", mutable: false, imported: false };
+}
+
+/// How names of the other module fields are resolved beyond the text's own:
+/// the file-scope asm of the unit (csema_asm.ax, wasm.ax: field_of on each
+/// text's headers), so that asm statements see the names it declares.
+pub let mut g_field: fn(u8, []u8) FieldRef = no_field;
+
 // Fixups (Fix.kind): each a 5-byte LEB128 in the code (10 bytes for a
 // 64-bit address or table index: wide).
-pub const FX_FUNC: u8 = 1;   // a function's index (call)
-pub const FX_TABLE: u8 = 2;  // a function's table index (i32.const $f): a signed LEB
-pub const FX_DATA: u8 = 3;   // an object's address plus addend: a signed LEB
-pub const FX_TYPE: u8 = 4;   // the index of the function type params -> results (call_indirect, block types)
-pub const FX_SP: u8 = 5;     // the stack pointer global's index
+pub const FX_FUNC: u8 = 1;      // a function's index (call)
+pub const FX_TABLE: u8 = 2;     // a function's table index (i32.const $f): a signed LEB
+pub const FX_DATA: u8 = 3;      // an object's address plus addend: a signed LEB
+pub const FX_TYPE: u8 = 4;      // the index of the function type params -> results (call_indirect, block types)
+pub const FX_SP: u8 = 5;        // the stack pointer global's index
+pub const FX_GLOBAL: u8 = 6;    // a global's index (name: the global's, or an import's id)
+pub const FX_TAG: u8 = 7;       // a tag's index
+pub const FX_DATA_SEG: u8 = 8;  // a data segment's index
+pub const FX_ELEM_SEG: u8 = 9;  // an element segment's index
 
 pub struct Fix {
     kind: u8,
@@ -128,6 +166,63 @@ pub struct AImport {
     results: []u8,
 }
 
+/// A global of file-scope asm: `(global $g (export "n")? (mut? t) init)`, or
+/// imported: `(import "module" "name" (global $g (mut? t)))` (module "env":
+/// a global of the program, another unit's; another module, the host's).
+/// Its initial value (init) is a constant (lo, and hi for v128), `ref.null
+/// exn`, or `global.get` of an imported global (gname).
+pub const GI_CONST: u8 = 0;
+pub const GI_GET: u8 = 1;
+pub const GI_NULL: u8 = 2;
+
+pub struct AGlobal {
+    name: []u8,
+    exp: []u8,
+    module: []u8,  // an import's (else "")
+    iname: []u8,
+    vt: u8,
+    mutable: bool,
+    ik: u8,
+    lo: u64,
+    hi: u64,
+    gname: []u8,
+    line: i32,
+}
+
+/// A tag (the exception-handling extension): `(tag $e (param t*))`, or
+/// imported as globals are.
+pub struct ATag {
+    name: []u8,
+    exp: []u8,
+    module: []u8,
+    iname: []u8,
+    params: []u8,
+    line: i32,
+}
+
+/// A passive data segment: `(data $d "bytes"*)` (memory.init, data.drop).
+pub struct AData {
+    name: []u8,
+    bytes: []u8,
+    line: i32,
+}
+
+/// A passive or declarative element segment: `(elem $e declare? func $f*)`
+/// (table.init, elem.drop).
+pub struct AElem {
+    name: []u8,
+    funcs: [][]u8,
+    declare: bool,
+    line: i32,
+}
+
+/// A function type: `(type $t (func (param t*) (result t*)))`.
+pub struct AType {
+    name: []u8,
+    params: []u8,
+    results: []u8,
+}
+
 /// The result of assembling.
 pub struct Asm {
     err: []u8,
@@ -136,9 +231,16 @@ pub struct Asm {
     fixes: u.List.[Fix],
     funcs: u.List.[*mut AFunc],
     imports: u.List.[AImport],
-    sp: bool,     // the text names the stack pointer
-    calls: bool,  // it calls a function
-    table: bool,  // it uses the function table (call_indirect, a table index)
+    types: u.List.[AType],
+    globals: u.List.[AGlobal],
+    tags: u.List.[ATag],
+    datas: u.List.[AData],
+    elems: u.List.[AElem],
+    start: []u8,       // `(start $f)`: f's name (or ""): run when the module is instantiated
+    table: []u8,       // the name `(table $t ...)` gives the program's function table
+    sp: bool,          // the text names the stack pointer
+    calls: bool,       // it calls a function
+    uses_table: bool,  // it uses the function table (call_indirect, a table index, table.init)
 }
 
 /// Did assembling fail?
@@ -427,9 +529,10 @@ const CF_IF: u8 = 2;
 const CF_ELSE: u8 = 3;
 const CF_TRY: u8 = 4;
 const CF_FUNC: u8 = 5;
-const CF_OUTER: u8 = 6;   // asm goto: a label of the statement (a block around the template)
-const CF_LTRY: u8 = 7;    // the legacy exception handling's try (before its catch_all or delegate)
-const CF_LCATCH: u8 = 8;  // ... its catch_all (where rethrow may name it)
+const CF_OUTER: u8 = 6;    // asm goto: a label of the statement (a block around the template)
+const CF_LTRY: u8 = 7;     // the legacy exception handling's try (before its catch_all or delegate)
+const CF_LCATCH: u8 = 8;   // ... its catch_all (where rethrow may name it)
+const CF_LCATCHT: u8 = 9;  // ... a catch of a tag (rethrow may name it too)
 
 struct Frame {
     kind: u8,
@@ -574,6 +677,9 @@ fn feat_ok(f: u8, what: []u8) bool {
     } else if f == 'm' {
         bit = tg.W_MULTIVALUE;
         name = "multivalue";
+    } else if f == 'g' {
+        bit = tg.W_MUTABLE_GLOBALS;
+        name = "mutable-globals";
     } else {
         return true;
     }
@@ -1052,9 +1158,29 @@ struct Sig {
 fn typeuse(names: *mut u.List.[[]u8], what: []u8) Sig {
     let mut ps = u.List.[u8].empty();
     let mut rs = u.List.[u8].empty();
+    let mut ty = Sig.{ params: "", results: "" };
+    let mut has_ty = false;
     if at_group("type") {
-        err(u.f1("'%s': write the type as (param ...) (result ...): this text has no type section", what));
-        return Sig.{ params: "", results: "" };
+        // (type $t): a type of the text (or of the unit's file-scope asm);
+        // (param ...) (result ...) after it, if any, must be the same
+        _ = next();
+        _ = next();
+        let t = next();
+        let fr = field(FK_TYPE, t, what);
+        expect_rp();
+        if bad() {
+            return ty;
+        }
+        ty = Sig.{ params: fr.params, results: fr.results };
+        has_ty = true;
+        if not at_group("param") and not at_group("result") {
+            if not u.isnil(names) {
+                for _k in 0..ty.params.len {
+                    names.push("");
+                }
+            }
+            return ty;
+        }
     }
     while at_group("param") and not bad() {
         _ = next();
@@ -1085,7 +1211,75 @@ fn typeuse(names: *mut u.List.[[]u8], what: []u8) Sig {
         }
         expect_rp();
     }
-    return Sig.{ params: perm(ps.items()), results: perm(rs.items()) };
+    let sg = Sig.{ params: perm(ps.items()), results: perm(rs.items()) };
+    if has_ty and not (types_eq(sg.params, ty.params) and types_eq(sg.results, ty.results)) {
+        err(u.f3("'%s': (param ...) (result ...) differ from the type's, %s -> %s", what, types_text(ty.params),
+                 types_text(ty.results)));
+    }
+    return sg;
+}
+
+// The field of kind k a token names ($name): the text's own (file-scope
+// asm), else the unit's file-scope asm's (g_field); an error if none.
+fn field(k: u8, t: Tok, what: []u8) FieldRef {
+    let none = FieldRef.{ kind: FK_NONE, params: "", results: "", mutable: false, imported: false };
+    let kinds = ["", "global", "tag", "data segment", "element segment", "type"];
+    if t.kind != TK_ID {
+        err_at(t.line, u.f2("'%s' needs the %s's name ($name): the index spaces are the program's", what,
+                            kinds[@as(usize, k)]));
+        return none;
+    }
+    if not INLINE {
+        let r = field_of(A, k, t.text);
+        if r.kind != FK_NONE {
+            return r;
+        }
+    }
+    let r = g_field(k, t.text);
+    if r.kind == k {
+        return r;
+    }
+    err_at(t.line, u.f3("'%s': $%s is no %s declared here", what, t.text, kinds[@as(usize, k)]));
+    return none;
+}
+
+/// The field of kind k named n in text x (its headers: assemble_headers),
+/// or kind FK_NONE.
+pub fn field_of(x: *Asm, k: u8, n: []u8) FieldRef {
+    let mut r = FieldRef.{ kind: FK_NONE, params: "", results: "", mutable: false, imported: false };
+    if k == FK_GLOBAL {
+        for g in x.globals.items() {
+            if u.str_eq(g.name, n) {
+                r = FieldRef.{ kind: k, params: one(g.vt), results: "", mutable: g.mutable,
+                               imported: g.module.len > 0 };
+            }
+        }
+    } else if k == FK_TAG {
+        for g in x.tags.items() {
+            if u.str_eq(g.name, n) {
+                r = FieldRef.{ kind: k, params: g.params, results: "", mutable: false, imported: g.module.len > 0 };
+            }
+        }
+    } else if k == FK_DATA {
+        for g in x.datas.items() {
+            if u.str_eq(g.name, n) {
+                r.kind = k;
+            }
+        }
+    } else if k == FK_ELEM {
+        for g in x.elems.items() {
+            if u.str_eq(g.name, n) {
+                r.kind = k;
+            }
+        }
+    } else if k == FK_TYPE {
+        for g in x.types.items() {
+            if u.str_eq(g.name, n) {
+                r = FieldRef.{ kind: k, params: g.params, results: g.results, mutable: false, imported: false };
+            }
+        }
+    }
+    return r;
 }
 
 fn perm(s: []u8) []u8 {
@@ -1249,6 +1443,21 @@ fn sym_ref(t: Tok, what: []u8, want_func: bool) FuncRef {
     return r;
 }
 
+// Is t a table's index or name (table.copy, table.init)?
+fn is_table_ref(t: Tok) bool {
+    return (t.kind == TK_ID) or is_kw(t, "0");
+}
+
+// The table a token names: the program's function table, 0 or the name
+// `(table $t ...)` gave it.
+fn table_ref(t: Tok, what: []u8) void {
+    if is_kw(t, "0") or ((t.kind == TK_ID) and not INLINE and (A.table.len > 0) and u.str_eq(t.text, A.table)) {
+        return;
+    }
+    err_at(t.line, u.f2("'%s': '%s' is not the program's function table (table 0, or the name (table $t ...) gives it)",
+                        what, tok_text(t)));
+}
+
 // A memarg: [offset=N] [align=N], of natural alignment n bytes (exact for
 // atomic accesses).
 fn memarg(n: u32, what: []u8, atomic: bool) void {
@@ -1307,6 +1516,7 @@ const PD_SELECT: u8 = 6;  // untyped: two values of one numeric or vector type
 const PD_TAIL: u8 = 7;    // return_call: pops, then the function's results must be the callee's
 const PD_THROW_REF: u8 = 8;
 const PD_DROP: u8 = 9;
+const PD_THROW: u8 = 10;  // pops the tag's parameters
 
 fn types_eq(a: []u8, b: []u8) bool {
     return u.str_eq(a, b);
@@ -1483,7 +1693,7 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
         fix(FX_TYPE, -1, "", false, s.params, s.results);
         O.u8_(0);  // (table 0: the program's function table)
         A.calls = true;
-        A.table = true;
+        A.uses_table = true;
         // (the function's table index: an i32, also on memory64)
         let ps = u.perm_newn.[u8](s.params.len + 1);
         for k in 0..s.params.len {
@@ -1514,8 +1724,9 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
         if k < 0 {
             return;
         }
-        if CTRL.get(@int_cast(usize, k)).kind != CF_LCATCH {
-            err_at(w.line, "'rethrow': the label must be a try's catch_all");
+        let ck = CTRL.get(@int_cast(usize, k)).kind;
+        if (ck != CF_LCATCH) and (ck != CF_LCATCHT) {
+            err_at(w.line, "'rethrow': the label must be a try's catch or catch_all");
             return;
         }
         op_byte(0x09);
@@ -1546,8 +1757,18 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
         return;
     }
     if u.str_eq(name, "throw") {
-        err_at(w.line,
-               "'throw' names a tag, which C has none of (throw_ref rethrows an exception caught by try_table)");
+        if not feat_ok('e', name) {
+            return;
+        }
+        let t = next();
+        let fr = field(FK_TAG, t, name);
+        if bad() {
+            return;
+        }
+        op_byte(0x08);
+        fix(FX_TAG, -1, t.text, false, "", "");
+        pd.pops = fr.params;
+        pd.kind = PD_THROW;
         return;
     }
     if u.str_eq(name, "local.get") or u.str_eq(name, "local.set") or u.str_eq(name, "local.tee") {
@@ -1573,7 +1794,23 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
     if u.str_eq(name, "global.get") or u.str_eq(name, "global.set") {
         let t = next();
         if (t.kind != TK_ID) or not u.str_eq(t.text, "__stack_pointer") {
-            err_at(t.line, u.f1("'%s': the only global the program has is $__stack_pointer", name));
+            // (a global of file-scope asm, defined or imported)
+            let fr = field(FK_GLOBAL, t, name);
+            if bad() {
+                return;
+            }
+            if u.str_eq(name, "global.get") {
+                op_byte(0x23);
+                pd.pushes = fr.params;
+            } else {
+                if not fr.mutable {
+                    err_at(t.line, u.f1("'global.set $%s': the global is immutable (declare it (mut t))", t.text));
+                    return;
+                }
+                op_byte(0x24);
+                pd.pops = fr.params;
+            }
+            fix(FX_GLOBAL, -1, t.text, false, "", "");
             return;
         }
         A.sp = true;
@@ -1588,7 +1825,74 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
         return;
     }
     if u.str_eq(name, "memory.init") or u.str_eq(name, "data.drop") {
-        err_at(w.line, u.f1("'%s' names a data segment, which C has none of", name));
+        // (of a passive data segment of file-scope asm: bulk-memory)
+        if not feat_ok('b', name) {
+            return;
+        }
+        let init = u.str_eq(name, "memory.init");
+        if init and (peek().kind == TK_KW) and u.str_eq(peek().text, "0") {
+            _ = next();  // (the memory: the program's only one)
+        }
+        let t = next();
+        _ = field(FK_DATA, t, name);
+        if bad() {
+            return;
+        }
+        op_byte(0xfc);
+        O.uleb(@as(u64, u8_pick(init, 8, 9)));
+        fix(FX_DATA_SEG, -1, t.text, false, "", "");
+        if init {
+            O.u8_(0);
+            let ps = u.perm_newn.[u8](3);
+            ps[0] = ptr_vt();
+            ps[1] = I32;
+            ps[2] = I32;
+            pd.pops = ps[0..3];
+        }
+        return;
+    }
+    if u.str_eq(name, "table.init") or u.str_eq(name, "elem.drop") or u.str_eq(name, "table.copy") {
+        // (of the program's function table and the passive element segments
+        // of file-scope asm: bulk-memory; the table's index type is i32)
+        if not feat_ok('b', name) {
+            return;
+        }
+        let i3 = u.perm_newn.[u8](3);
+        i3[0] = I32;
+        i3[1] = I32;
+        i3[2] = I32;
+        if u.str_eq(name, "table.copy") {
+            for _k in @as(usize, 0)..2 {
+                if is_table_ref(peek()) {
+                    table_ref(next(), name);
+                }
+            }
+            op_byte(0xfc);
+            O.uleb(14);
+            O.u8_(0);
+            O.u8_(0);
+            A.uses_table = true;
+            pd.pops = i3[0..3];
+            return;
+        }
+        let init = u.str_eq(name, "table.init");
+        if init and
+           (is_kw(peek(), "0") or ((peek().kind == TK_ID) and ((peek2().kind == TK_ID) or is_kw(peek2(), "0")))) {
+            table_ref(next(), name);  // (table.init $t $e: the table first)
+        }
+        let t = next();
+        _ = field(FK_ELEM, t, name);
+        if bad() {
+            return;
+        }
+        op_byte(0xfc);
+        O.uleb(@as(u64, u8_pick(init, 12, 13)));
+        fix(FX_ELEM_SEG, -1, t.text, false, "", "");
+        if init {
+            O.u8_(0);
+            A.uses_table = true;
+            pd.pops = i3[0..3];
+        }
         return;
     }
     if u.starts(name, "table.") or u.str_eq(name, "elem.drop") or u.starts(name, "ref.") {
@@ -1663,7 +1967,7 @@ fn const_imm(t: u8, name: []u8) void {
         if r.data {
             fix(FX_DATA, r.op, r.name, W64, "", "");
         } else {
-            A.table = true;
+            A.uses_table = true;
             fix(FX_TABLE, r.op, r.name, W64, "", "");
         }
         return;
@@ -1784,6 +2088,9 @@ fn emit(pd: *mut Pending) void {
                      types_text(CTRL.get(0).results)));
         }
         set_unreachable();
+    } else if k == PD_THROW {
+        pop_vals(pd.pops, what);
+        set_unreachable();
     } else if k == PD_THROW_REF {
         _ = pop_val(EXNREF, what);
         set_unreachable();
@@ -1795,36 +2102,56 @@ fn new_pending() Pending {
                      frames: u.List.[i64].empty(), what: "" };
 }
 
-// try_table's catch clauses: (catch_all l) (catch_all_ref l); a clause with a
-// tag names one, which C has none of.
+// try_table's catch clauses: (catch $e l) (catch_ref $e l) (catch_all l)
+// (catch_all_ref l). The label receives the tag's parameters (catch), and
+// the exnref after them (_ref).
 fn catches() void {
     let mut cs = u.List.[u8].empty();
     let mut ls = u.List.[u64].empty();
+    let mut tg_name = u.List.[[]u8].empty();
     while (peek().kind == TK_LP) and not bad() {
         let w = peek2();
-        if is_kw(w, "catch") or is_kw(w, "catch_ref") {
-            err_at(w.line, u.f1("'%s' names a tag, which C has none of (catch_all and catch_all_ref catch any)",
-                                w.text));
-            return;
-        }
-        if not is_kw(w, "catch_all") and not is_kw(w, "catch_all_ref") {
+        let tagged = is_kw(w, "catch") or is_kw(w, "catch_ref");
+        if not tagged and not is_kw(w, "catch_all") and not is_kw(w, "catch_all_ref") {
             break;
         }
         _ = next();
         _ = next();
-        let rf = u.str_eq(w.text, "catch_all_ref");
+        let rf = u.ends(w.text, "_ref");
+        let mut ps: []u8 = "";
+        let mut tname: []u8 = "";
+        if tagged {
+            let t = next();
+            let fr = field(FK_TAG, t, w.text);
+            if bad() {
+                return;
+            }
+            ps = fr.params;
+            tname = t.text;
+        }
         let k = label_of(next(), w.text);
         if k < 0 {
             return;
         }
-        // (the label receives nothing, or the exnref: its types must be those)
+        // (the label's block must take what the clause gives it)
+        let mut want = u.List.[u8].empty();
+        for x in ps {
+            want.push(x);
+        }
+        if rf {
+            want.push(EXNREF);
+        }
         let lt = label_types(CTRL.get(@int_cast(usize, k)));
-        let ok = (not rf and (lt.len == 0)) or (rf and (lt.len == 1) and (lt[0] == EXNREF));
-        if not ok {
-            err_at(w.line, u.f2("'%s': the label's block must take %s", w.text, u.pick(rf, "[exnref]", "[]")));
+        if not types_eq(lt, want.items()) {
+            err_at(w.line, u.f2("'%s': the label's block must take %s", w.text, types_text(want.items())));
             return;
         }
-        cs.push(u8_pick(rf, 3, 2));
+        if tagged {
+            cs.push(u8_pick(rf, 1, 0));
+        } else {
+            cs.push(u8_pick(rf, 3, 2));
+        }
+        tg_name.push(tname);
         // (a depth outside the try_table, whose own label is not yet there)
         ls.push(depth_of(k));
         expect_rp();
@@ -1832,6 +2159,9 @@ fn catches() void {
     O.uleb(@as(u64, cs.len));
     for j in 0..cs.len {
         O.u8_(cs.get(j));
+        if cs.get(j) < 2 {
+            fix(FX_TAG, -1, tg_name.get(j), false, "", "");
+        }
         O.uleb(ls.get(j));
     }
 }
@@ -1912,19 +2242,41 @@ fn do_else(line: i32) void {
 }
 
 // The legacy exception handling (the extension's first form, which engines
-// still take beside try_table): `try bt instrs (catch_all instrs)? end` and
-// `try bt instrs delegate l`. catch_all starts from an empty stack and must
-// give the try's results; delegate ends the try, its label counted from
-// outside it. A catch of a tag names one, which C has none of.
+// still take beside try_table): `try bt instrs (catch $e instrs)*
+// (catch_all instrs)? end` and `try bt instrs delegate l`. catch_all starts
+// from an empty stack (a catch from the tag's parameters) and must give the
+// try's results; delegate ends the try, its label counted from outside it.
 fn do_catch_all(line: i32) void {
     let f = CTRL.get(CTRL.len - 1);
-    if f.kind != CF_LTRY {
+    if (f.kind != CF_LTRY) and (f.kind != CF_LCATCHT) {
         err_at(line, "'catch_all' outside a try");
         return;
     }
     _ = pop_ctrl("catch_all");
     op_byte(0x19);
     push_ctrl(CF_LCATCH, "", f.results, f.label, f.folded);
+}
+
+// `catch $e` of the legacy form: after the try's instructions or another
+// catch; it starts with the tag's parameters on the stack.
+fn do_catch(line: i32, t: Tok) void {
+    let f = CTRL.get(CTRL.len - 1);
+    if (f.kind != CF_LTRY) and (f.kind != CF_LCATCHT) {
+        err_at(line, "'catch' outside a try (or after its catch_all)");
+        return;
+    }
+    let fr = field(FK_TAG, t, "catch");
+    if bad() {
+        return;
+    }
+    _ = pop_ctrl("catch");
+    if bad() {
+        return;
+    }
+    op_byte(0x07);
+    fix(FX_TAG, -1, t.text, false, "", "");
+    push_ctrl(CF_LCATCHT, "", f.results, f.label, f.folded);
+    push_vals(fr.params);
 }
 
 fn do_delegate(line: i32) void {
@@ -1978,17 +2330,18 @@ fn flat_instr() void {
         open_block(w, false);
         return;
     }
-    if u.str_eq(n, "catch") {
-        err_at(w.line, "'catch' names a tag, which C has none of (catch_all catches any)");
-        return;
-    }
-    if u.str_eq(n, "catch_all") or u.str_eq(n, "delegate") {
+    if u.str_eq(n, "catch") or u.str_eq(n, "catch_all") or u.str_eq(n, "delegate") {
         let f = CTRL.get(CTRL.len - 1);
         if f.folded {
             err_at(w.line, u.f1("'%s' inside a folded try (its (catch_all ...) or (delegate l) is a group)", n));
             return;
         }
-        if u.str_eq(n, "catch_all") {
+        if u.str_eq(n, "catch") {
+            if not feat_ok('e', n) {
+                return;
+            }
+            do_catch(w.line, next());
+        } else if u.str_eq(n, "catch_all") {
             do_catch_all(w.line);
         } else {
             do_delegate(w.line);
@@ -2070,9 +2423,19 @@ fn folded_instr() void {
             expect_rp();
             return;
         }
-        if at_group("catch") {
-            err_at(w.line, "'catch' names a tag, which C has none of (catch_all catches any)");
-            return;
+        while at_group("catch") and not bad() {
+            _ = next();
+            _ = next();
+            do_catch(w.line, next());
+            instrs(true);
+            expect_rp();
+            if bad() {
+                return;
+            }
+            if CTRL.len != depth {
+                err_at(w.line, "a block in the folded try is not ended");
+                return;
+            }
         }
         if at_group("catch_all") {
             _ = next();
@@ -2128,7 +2491,7 @@ fn folded_instr() void {
         do_end(w.line);
         return;
     }
-    if u.str_eq(n, "else") or u.str_eq(n, "end") or u.str_eq(n, "then") or u.str_eq(n, "do") or
+    if u.str_eq(n, "else") or u.str_eq(n, "end") or u.str_eq(n, "then") or u.str_eq(n, "do") or u.str_eq(n, "catch") or
        u.str_eq(n, "catch_all") or u.str_eq(n, "delegate") {
         err_at(w.line, u.f1("'(%s' is not a folded instruction", n));
         return;
@@ -2174,6 +2537,11 @@ fn reset(text: []u8, wasm64: bool) void {
     A.fixes = u.List.[Fix].empty();
     A.funcs = u.List.[*mut AFunc].empty();
     A.imports = u.List.[AImport].empty();
+    A.types = u.List.[AType].empty();
+    A.globals = u.List.[AGlobal].empty();
+    A.tags = u.List.[ATag].empty();
+    A.datas = u.List.[AData].empty();
+    A.elems = u.List.[AElem].empty();
     W64 = wasm64;
     VALS.clear();
     CTRL.clear();
@@ -2350,8 +2718,27 @@ fn header_import(line: i32) void {
         err_at(line, "(import \"module\" \"name\" (func $id ...)) needs the module and the name as strings");
         return;
     }
+    if at_group("global") or at_group("tag") {
+        _ = next();
+        let w = next();
+        let id = next();
+        if id.kind != TK_ID {
+            err_at(id.line, u.f1("an imported %s needs a name: ($id ...)", w.text));
+            return;
+        }
+        if is_kw(w, "global") {
+            _ = global_type_into(id, m.text, n.text, w.line);
+        } else {
+            tag_into(id, m.text, n.text, w.line);
+        }
+        expect_rp();
+        expect_rp();
+        return;
+    }
     if not at_group("func") {
-        err_at(line, "file-scope asm imports functions only: (import \"module\" \"name\" (func $id ...))");
+        err_at(line,
+               u.cat2("file-scope asm imports functions, globals and tags: (import \"module\" \"name\" (func $id ...)); ",
+                      "the memory and the function table are the program's"));
         return;
     }
     _ = next();
@@ -2365,6 +2752,450 @@ fn header_import(line: i32) void {
     expect_rp();
     expect_rp();
     A.imports.push(AImport.{ module: m.text, name: n.text, id: id.text, params: s.params, results: s.results });
+}
+
+// Is name n of kind k (FK_*, or 0: a function) declared in the text already?
+fn declared(k: u8, n: []u8) bool {
+    if k == 0 {
+        for f in A.funcs.items() {
+            if u.str_eq(f.name, n) {
+                return true;
+            }
+        }
+        for im in A.imports.items() {
+            if u.str_eq(im.id, n) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return field_of(A, k, n).kind != FK_NONE;
+}
+
+fn not_twice(k: u8, id: Tok) bool {
+    if declared(k, id.text) {
+        err_at(id.line, u.f1("$%s is declared twice", id.text));
+        return false;
+    }
+    return true;
+}
+
+// `(export "name")` of a field, if there.
+fn inline_export() []u8 {
+    let mut e: []u8 = "";
+    while at_group("export") and not bad() {
+        _ = next();
+        _ = next();
+        let s = next();
+        if s.kind != TK_STR {
+            err_at(s.line, "(export \"name\") needs the name as a string");
+            return "";
+        }
+        if e.len > 0 {
+            err_at(s.line, "a field of file-scope asm has one export name");
+            return "";
+        }
+        e = s.text;
+        expect_rp();
+    }
+    return e;
+}
+
+// `(import "module" "name")` of a field (abbreviated), if there: module, name.
+fn inline_import(out: *mut [2][]u8) void {
+    if not at_group("import") {
+        return;
+    }
+    _ = next();
+    _ = next();
+    let m = next();
+    let n = next();
+    if (m.kind != TK_STR) or (n.kind != TK_STR) {
+        err_at(m.line, "(import \"module\" \"name\") needs the module and the name as strings");
+        return;
+    }
+    out[0] = m.text;
+    out[1] = n.text;
+    expect_rp();
+}
+
+// A global's type, `t` or `(mut t)`, into a new global named id (imported
+// from module m if m is not "").
+fn global_type_into(id: Tok, m: []u8, nm: []u8, line: i32) *mut AGlobal {
+    let g = u.new.[AGlobal]();
+    g.name = id.text;
+    g.module = m;
+    g.iname = nm;
+    g.line = line;
+    if not not_twice(FK_GLOBAL, id) {
+        return g;
+    }
+    if at_group("mut") {
+        _ = next();
+        _ = next();
+        g.mutable = true;
+        g.vt = valtype(next());
+        expect_rp();
+    } else {
+        g.vt = valtype(next());
+    }
+    // (a mutable global shared with the host: mutable-globals)
+    if g.mutable and (m.len > 0) and not u.str_eq(m, "env") and not feat_ok('g', "a mutable global imported") {
+        return g;
+    }
+    A.globals.push(g.*);
+    return g;
+}
+
+// A tag's type, `(type $t)` and/or `(param t*)`, into a new tag named id.
+fn tag_into(id: Tok, m: []u8, nm: []u8, line: i32) void {
+    if not feat_ok('e', "a tag") or not not_twice(FK_TAG, id) {
+        return;
+    }
+    let s = typeuse(u.nil.[u.List.[[]u8]](), "tag");
+    if bad() {
+        return;
+    }
+    if s.results.len > 0 {
+        err_at(line, "a tag's type has no results");
+        return;
+    }
+    A.tags.push(ATag.{ name: id.text, exp: "", module: m, iname: nm, params: s.params, line: line });
+}
+
+fn header_global(line: i32) void {
+    let id = next();
+    if id.kind != TK_ID {
+        err_at(id.line, "a global of file-scope asm needs a name: (global $g ...), its symbol");
+        return;
+    }
+    let exp = inline_export();
+    let mut im: [2][]u8 = ["", ""];
+    inline_import(&mut im);
+    if bad() {
+        return;
+    }
+    let g = global_type_into(id, im[0], im[1], line);
+    if bad() {
+        return;
+    }
+    let gp = A.globals.at(A.globals.len - 1);
+    gp.exp = exp;
+    if (exp.len > 0) and gp.mutable and not feat_ok('g', "a mutable global exported") {
+        return;
+    }
+    if im[0].len > 0 {
+        if exp.len > 0 {
+            err_at(line, "export the program's own globals: an imported one is another's");
+        }
+        expect_rp();
+        return;
+    }
+    // the initial value: one constant instruction of the global's type, or
+    // global.get of an imported global (resolved after the headers)
+    let folded = peek().kind == TK_LP;
+    if folded {
+        _ = next();
+    }
+    let w = next();
+    let t = g.vt;
+    if is_kw(w, "global.get") {
+        let x = next();
+        if x.kind != TK_ID {
+            err_at(x.line, "'global.get' of an initial value needs the imported global's name ($g)");
+            return;
+        }
+        gp.ik = GI_GET;
+        gp.gname = x.text;
+    } else if is_kw(w, "ref.null") {
+        let x = next();
+        if (t != EXNREF) or not is_kw(x, "exn") {
+            err_at(w.line, u.f1("'ref.null' is the initial value of an exnref global, not of a %s one", vt_name(t)));
+            return;
+        }
+        gp.ik = GI_NULL;
+    } else if (t != EXNREF) and (w.kind == TK_KW) and u.str_eq(w.text, u.cat2(vt_name(t), ".const")) {
+        if t == V128 {
+            let mut b = bn.new_bytes();
+            let saveO = O;
+            O = &mut b;
+            v128_const();
+            O = saveO;
+            if bad() {
+                return;
+            }
+            let v = b.view();
+            for k in @as(usize, 0)..8 {
+                gp.lo = gp.lo | (@as(u64, v[k]) << @truncate(u32, k * 8));
+                gp.hi = gp.hi | (@as(u64, v[k + 8]) << @truncate(u32, k * 8));
+            }
+        } else if (t == I32) or (t == I64) {
+            gp.lo = int_lit(next(), u32_pick(t == I32, 32, 64));
+        } else {
+            gp.lo = float_lit(next(), t == F64);
+        }
+    } else {
+        err_at(w.line,
+               u.f2("the initial value of a global of type %s is %s.const (or global.get of an imported global)",
+                    vt_name(t), vt_name(t)));
+        return;
+    }
+    if folded {
+        expect_rp();
+    }
+    expect_rp();
+}
+
+fn header_tag(line: i32) void {
+    let id = next();
+    if id.kind != TK_ID {
+        err_at(id.line, "a tag of file-scope asm needs a name: (tag $e ...), its symbol");
+        return;
+    }
+    let exp = inline_export();
+    let mut im: [2][]u8 = ["", ""];
+    inline_import(&mut im);
+    if bad() {
+        return;
+    }
+    tag_into(id, im[0], im[1], line);
+    if bad() {
+        return;
+    }
+    if exp.len > 0 {
+        if im[0].len > 0 {
+            err_at(line, "export the program's own tags: an imported one is another's");
+            return;
+        }
+        A.tags.at(A.tags.len - 1).exp = exp;
+    }
+    expect_rp();
+}
+
+fn header_type(line: i32) void {
+    let mut name: []u8 = "";
+    if peek().kind == TK_ID {
+        let id = next();
+        if not not_twice(FK_TYPE, id) {
+            return;
+        }
+        name = id.text;
+    }
+    if not at_group("func") {
+        err_at(line, "a type of file-scope asm is a function type: (type $t (func (param ...) (result ...)))");
+        return;
+    }
+    _ = next();
+    _ = next();
+    let mut names = u.List.[[]u8].empty();
+    let s = typeuse(&mut names, "type");
+    expect_rp();
+    expect_rp();
+    if name.len == 0 {
+        err_at(line, "a type of file-scope asm needs a name, (type $t ...): the index spaces are the program's");
+        return;
+    }
+    A.types.push(AType.{ name: name, params: s.params, results: s.results });
+}
+
+// `(data $d "bytes"*)`: a passive segment. An active one would write the
+// program's memory at a fixed address, which the program's own layout
+// (the stack, then the objects the linker places) already uses.
+fn header_data(line: i32) void {
+    if (peek().kind != TK_ID) and (peek().kind != TK_LP) {
+        err_at(line, "a data segment of file-scope asm needs a name, (data $d ...), for memory.init and data.drop");
+        return;
+    }
+    let id = peek();
+    if id.kind == TK_ID {
+        _ = next();
+        if not not_twice(FK_DATA, id) {
+            return;
+        }
+    }
+    if peek().kind == TK_LP {
+        err_at(line, u.cat2("a data segment of file-scope asm is passive, (data $d \"bytes\"), for memory.init: the ",
+                            "memory's layout is the program's (define objects in C)"));
+        return;
+    }
+    let mut b = u.Buf.init();
+    while (peek().kind == TK_STR) and not bad() {
+        b.s(next().text);
+    }
+    A.datas.push(AData.{ name: id.text, bytes: b.done(), line: line });
+    expect_rp();
+}
+
+// `(elem $e declare? func $f*)`: a passive (or declarative) segment of
+// functions, for table.init. An active one would fill slots of the
+// function table, whose layout is the linker's.
+fn header_elem(line: i32) void {
+    if (peek().kind != TK_ID) and (peek().kind != TK_LP) {
+        err_at(line, "an element segment of file-scope asm needs a name, (elem $e ...), for table.init and elem.drop");
+        return;
+    }
+    let id = peek();
+    if id.kind == TK_ID {
+        _ = next();
+        if not not_twice(FK_ELEM, id) {
+            return;
+        }
+    }
+    let mut dec = false;
+    if is_kw(peek(), "declare") {
+        _ = next();
+        dec = true;
+    }
+    if peek().kind == TK_LP {
+        err_at(line,
+               u.cat2("an element segment of file-scope asm is passive or declarative, (elem $e func $f ...): the ",
+                      "function table's layout is the program's"));
+        return;
+    }
+    if not is_kw(peek(), "func") {
+        err_at(line, "an element segment of file-scope asm lists functions: (elem $e func $f ...)");
+        return;
+    }
+    _ = next();
+    let mut fs = u.List.[[]u8].empty();
+    while (peek().kind == TK_ID) and not bad() {
+        fs.push(next().text);
+    }
+    let fp = u.perm_newn.[[]u8](fs.len + 1);
+    for k in 0..fs.len {
+        fp[k] = fs.get(k);
+    }
+    A.elems.push(AElem.{ name: id.text, funcs: fp[0..fs.len], declare: dec, line: line });
+    expect_rp();
+}
+
+// `(export "name" (func|global|tag $x))`: of the text's own definitions.
+fn header_export(line: i32) void {
+    let s = next();
+    if s.kind != TK_STR {
+        err_at(s.line, "(export \"name\" ...) needs the name as a string");
+        return;
+    }
+    if (peek().kind != TK_LP) or
+       not ((peek2().kind == TK_KW) and (is_kw(peek2(), "func") or is_kw(peek2(), "global") or is_kw(peek2(), "tag"))) {
+        err_at(line, "file-scope asm exports its functions, globals and tags (the linker exports the memory)");
+        return;
+    }
+    _ = next();
+    let w = next();
+    let x = next();
+    expect_rp();
+    expect_rp();
+    if bad() {
+        return;
+    }
+    let mut ok = false;
+    if is_kw(w, "func") {
+        for f in A.funcs.items() {
+            if (x.kind == TK_ID) and u.str_eq(f.name, x.text) {
+                ok = f.exp.len == 0;
+                f.exp = s.text;
+            }
+        }
+    } else if is_kw(w, "global") {
+        for k in 0..A.globals.len {
+            let g = A.globals.at(k);
+            if (x.kind == TK_ID) and u.str_eq(g.name, x.text) and (g.module.len == 0) {
+                ok = g.exp.len == 0;
+                g.exp = s.text;
+                if g.mutable and not feat_ok('g', "a mutable global exported") {
+                    return;
+                }
+            }
+        }
+    } else {
+        for k in 0..A.tags.len {
+            let g = A.tags.at(k);
+            if (x.kind == TK_ID) and u.str_eq(g.name, x.text) and (g.module.len == 0) {
+                ok = g.exp.len == 0;
+                g.exp = s.text;
+            }
+        }
+    }
+    if not ok {
+        err_at(line, u.f3("(export (%s %s)): name a %s the text defines, exported once", w.text, tok_text(x), w.text));
+    }
+}
+
+// `(memory ...)` and `(table ...)`: the program's own, declared again.
+fn header_memory(line: i32) void {
+    let mut ok = true;
+    if peek().kind == TK_ID {
+        _ = next();
+    }
+    if is_kw(peek(), "i64") or is_kw(peek(), "i32") {
+        ok = is_kw(next(), u.pick(W64, "i64", "i32"));
+    } else {
+        ok = not W64;
+    }
+    while (peek().kind == TK_KW) and not bad() {
+        let t = next();
+        if not u.str_eq(t.text, "shared") and not u.is_digit(t.text[0]) {
+            ok = false;
+        }
+    }
+    if not ok or (peek().kind != TK_RP) {
+        err_at(line, u.f1("the memory is the program's (%s): a (memory ...) field may only declare it again",
+                          u.pick(W64, "i64, of memory64", "i32")));
+        return;
+    }
+    expect_rp();
+}
+
+fn header_table(line: i32) void {
+    if peek().kind == TK_ID {
+        A.table = next().text;
+    }
+    while (peek().kind == TK_KW) and u.is_digit(peek().text[0]) {
+        _ = next();
+    }
+    if not is_kw(next(), "funcref") or (peek().kind != TK_RP) {
+        err_at(line, "the function table is the program's: a (table $t? n m? funcref) field may only declare it again");
+        return;
+    }
+    expect_rp();
+}
+
+fn header_start(line: i32) void {
+    let t = next();
+    if (t.kind != TK_ID) or (A.start.len > 0) {
+        err_at(line, "(start $f) names a function, once");
+        return;
+    }
+    A.start = t.text;
+    expect_rp();
+}
+
+// After the headers: what they name is resolved (the start function, the
+// element segments' functions, the globals' initial values).
+fn resolve_fields() void {
+    if A.start.len > 0 {
+        let r = sym_ref(Tok.{ kind: TK_ID, text: A.start, line: 0 }, "start", true);
+        if r.ok and ((r.params.len > 0) or (r.results.len > 0)) {
+            err(u.f1("(start $%s): a start function takes and returns nothing", A.start));
+        }
+    }
+    for e in A.elems.items() {
+        for f in e.funcs {
+            if not bad() {
+                _ = sym_ref(Tok.{ kind: TK_ID, text: f, line: e.line }, "elem", true);
+            }
+        }
+    }
+    for g in A.globals.items() {
+        if not bad() and (g.ik == GI_GET) {
+            let r = field_of(A, FK_GLOBAL, g.gname);
+            if (r.kind == FK_NONE) or not r.imported or r.mutable or (r.params[0] != g.vt) {
+                err_at(g.line, u.f2("$%s's initial value: global.get of an immutable imported global of type %s",
+                                    g.name, vt_name(g.vt)));
+            }
+        }
+    }
 }
 
 fn body_func(f: *mut AFunc) void {
@@ -2438,9 +3269,42 @@ fn file(text: []u8, wasm64: bool, bodies: bool) *mut Asm {
         return A;
     }
     INLINE = false;
-    // the functions' headers and the imports first (a function may call
-    // one defined after it)
+    // the headers first (a function may call one defined after it), the
+    // types before the rest (any field may use one)
+    for pass in @as(usize, 0)..2 {
+        P = 0;
+        fields(pass == 0);
+        if bad() {
+            return A;
+        }
+    }
+    if bodies {
+        resolve_fields();
+    }
+    for f in A.funcs.items() {
+        if bad() or not bodies {
+            break;
+        }
+        body_func(f);
+    }
+    return A;
+}
+
+// Is w the keyword of a module field?
+fn field_kw(w: Tok) bool {
+    let ks = ["func", "import", "global", "tag", "data", "elem", "export", "memory", "table", "start", "type"];
+    for k in ks {
+        if is_kw(w, k) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// One pass over the module fields: the types (types), or the others.
+fn fields(types: bool) void {
     let mut in_module = false;
+    let mut nfields: i32 = 0;
     while not bad() {
         let t = next();
         if t.kind == TK_EOF {
@@ -2457,29 +3321,48 @@ fn file(text: []u8, wasm64: bool, bodies: bool) *mut Asm {
             continue;
         }
         if t.kind != TK_LP {
-            err_at(t.line, u.f1("expected a module field, (func ...) or (import ...), not '%s'", tok_text(t)));
+            err_at(t.line, u.f1("expected a module field, (func ...), (import ...) ..., not '%s'", tok_text(t)));
             break;
         }
         let w = next();
-        if is_kw(w, "module") and not in_module and (A.funcs.len == 0) and (A.imports.len == 0) {
+        if is_kw(w, "module") and not in_module and (nfields == 0) {
             in_module = true;
             _ = opt_label();
+            continue;
+        }
+        nfields += 1;
+        if field_kw(w) and (is_kw(w, "type") != types) {
+            skip_group();
+            continue;
+        }
+        if is_kw(w, "type") {
+            header_type(w.line);
         } else if is_kw(w, "func") {
             header_func(w.line);
         } else if is_kw(w, "import") {
             header_import(w.line);
+        } else if is_kw(w, "global") {
+            header_global(w.line);
+        } else if is_kw(w, "tag") {
+            header_tag(w.line);
+        } else if is_kw(w, "data") {
+            header_data(w.line);
+        } else if is_kw(w, "elem") {
+            header_elem(w.line);
+        } else if is_kw(w, "export") {
+            header_export(w.line);
+        } else if is_kw(w, "memory") {
+            header_memory(w.line);
+        } else if is_kw(w, "table") {
+            header_table(w.line);
+        } else if is_kw(w, "start") {
+            header_start(w.line);
         } else {
-            err_at(w.line, u.f1("'%s' is not a module field of file-scope asm (func, import; define data in C)",
-                                tok_text(w)));
+            err_at(w.line,
+                   u.f1("'%s' is not a module field (func, import, global, tag, data, elem, export, start, type)",
+                        tok_text(w)));
         }
     }
-    for f in A.funcs.items() {
-        if bad() or not bodies {
-            break;
-        }
-        body_func(f);
-    }
-    return A;
 }
 
 /// The message of a failed assembly, with its line when the text has
