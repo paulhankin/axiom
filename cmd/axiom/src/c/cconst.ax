@@ -166,8 +166,15 @@ fn set_from(e: *mut cast.Expr, x: *cast.Expr) void {
     e.cval = x.cval;
     e.fcval = x.fcval;
     e.fcimag = x.fcimag;
+    e.cimag = x.cimag;
     e.xv = x.xv;
     e.xvim = x.xvim;
+}
+
+/// Is t a complex type of an integer type (a GNU dialect's)? Its constants'
+/// parts are in cval and cimag, as the integer type's values.
+pub fn is_icx(t: *cty.CType) bool {
+    return cty.is_complex(t) and cty.is_integer(t.unq.elem);
 }
 
 /// The format of a wide long double (cty.is_wide).
@@ -239,6 +246,9 @@ pub fn truth(x: *cast.Expr) bool {
     }
     if cty.is_complex(x.ty) and cty.is_wide(x.ty.elem) {
         return cl.nonzero(x.xv, fmt_t(x.ty)) or cl.nonzero(x.xvim, fmt_t(x.ty));
+    }
+    if is_icx(x.ty) {
+        return (x.cval != 0) or (x.cimag != 0);
     }
     if cty.is_complex(x.ty) {
         return (x.fcval != 0.0) or (x.fcimag != 0.0);
@@ -312,6 +322,7 @@ fn imag_part(x: *cast.Expr) *mut cast.Expr {
     if cty.is_complex(x.ty) {
         r.fcval = x.fcimag;
         r.xv = x.xvim;
+        r.cval = x.cimag;
         return r;
     }
     return zero_of(r, rt);
@@ -359,6 +370,8 @@ fn set_parts(e: *mut cast.Expr, re: *cast.Expr, im: *cast.Expr) void {
         e.xv = re.xv;
         e.fcimag = im.fcval;
         e.xvim = im.xv;
+        e.cval = re.cval;
+        e.cimag = im.cval;
         return;
     }
     e.cval = re.cval;
@@ -486,6 +499,56 @@ fn imag_binary(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
     }
 }
 
+// e (a conversion to or from an integer complex type) of constant x: the
+// parts converted as the real types are (a real value's imaginary part 0;
+// to a real type, the real part; to _Bool, the truth).
+fn convert_icx(e: *mut cast.Expr, x: *cast.Expr) void {
+    let to = e.ty;
+    if to.kind == cty.TK_BOOL {
+        set_int(e, selu(truth(x), 1, 0));
+        return;
+    }
+    let rt = cty.real_of(to);
+    let re = real_to(real_part(x), rt);
+    if not cty.is_complex(to) {
+        set_parts(e, re, re);
+        return;
+    }
+    set_parts(e, re, real_to(imag_part(x), rt));
+}
+
+// e = a op b (+ - * /) in integer complex type e.ty, its operands of e.ty or
+// of its real type: each part in the real type's arithmetic, a real
+// operand's imaginary part 0, as cgen_complex.ax computes them. A quotient
+// by a complex value is ((ac + bd) + i(bc - ad)) / (cc + dd).
+fn icx_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    let t = cty.real_of(e.ty);
+    let x = real_part(a);
+    let xi = imag_part(a);
+    let y = real_part(b);
+    let yi = imag_part(b);
+    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+        set_parts(e, real_op(op, t, x, y), real_op(op, t, xi, yi));
+        return;
+    }
+    if op == ct.P_STAR {
+        let re = real_op(ct.P_MINUS, t, real_op(op, t, x, y), real_op(op, t, xi, yi));
+        let im = real_op(ct.P_PLUS, t, real_op(op, t, x, yi), real_op(op, t, xi, y));
+        set_parts(e, re, im);
+        return;
+    }
+    if not cty.is_complex(b.ty) {
+        set_parts(e, real_op(op, t, x, y), real_op(op, t, xi, y));
+        return;
+    }
+    let d = real_op(ct.P_PLUS, t, real_op(ct.P_STAR, t, y, y), real_op(ct.P_STAR, t, yi, yi));
+    let nr = real_op(ct.P_PLUS, t, real_op(ct.P_STAR, t, x, y), real_op(ct.P_STAR, t, xi, yi));
+    let ni = real_op(ct.P_MINUS, t, real_op(ct.P_STAR, t, xi, y), real_op(ct.P_STAR, t, x, yi));
+    let all = d.is_const and nr.is_const and ni.is_const;
+    set_parts(e, real_op(op, t, nr, d), real_op(op, t, ni, d));
+    e.is_const = e.is_const and all;
+}
+
 /// e (a conversion to an arithmetic type) of constant x: 6.3.1.
 fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     let to = e.ty;
@@ -496,6 +559,10 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     }
     if cty.is_imaginary(to) or cty.is_imaginary(from) {
         convert_imag(e, x);
+        return;
+    }
+    if is_icx(to) or is_icx(from) {
+        convert_icx(e, x);
         return;
     }
     if cty.is_wint(to) {
@@ -685,6 +752,17 @@ fn unary(e: *mut cast.Expr) void {
         }
         return;
     }
+    if is_icx(e.ty) {
+        let t = cty.real_of(e.ty);
+        if op == ct.P_MINUS {
+            set_parts(e, real_neg(t, real_part(x)), real_neg(t, imag_part(x)));
+        } else if op == ct.P_PLUS {
+            set_parts(e, real_part(x), imag_part(x));
+        } else if op == ct.P_TILDE {
+            set_parts(e, real_part(x), real_neg(t, imag_part(x)));  // (the conjugate: an extension)
+        }
+        return;
+    }
     if is_cwide(e.ty) {
         let f = fmt_t(e.ty);
         if op == ct.P_MINUS {
@@ -784,6 +862,10 @@ fn binary(e: *mut cast.Expr) void {
     }
     if cty.is_imaginary(a.ty) or cty.is_imaginary(b.ty) {
         imag_binary(e, op, a, b);
+        return;
+    }
+    if is_icx(e.ty) {
+        icx_op(e, op, a, b);
         return;
     }
     if cty.is_complex(e.ty) {
@@ -895,6 +977,10 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
         let f = fmt_t(t);
         let same = (cl.cmp(wide_value_in(a, f), wide_value_in(b, f), f) == 0) and
                    (cl.cmp(wide_imag(a, f), wide_imag(b, f), f) == 0);
+        return same == (op == ct.P_EQ);
+    }
+    if is_icx(t) {
+        let same = (a.cval == b.cval) and (a.cimag == b.cimag);
         return same == (op == ct.P_EQ);
     }
     if cty.is_complex(t) {

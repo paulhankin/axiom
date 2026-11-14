@@ -21,6 +21,12 @@
 // the same algorithms for constant folding; the two must stay alike, one
 // operation for one.
 //
+// A GNU dialect's integer complex type (_Complex int ...) is laid out the
+// same; its parts are integers, its arithmetic the integer type's (wrapping,
+// the integer division's quotients): (a + ib)(c + id) is (ac - bd) +
+// i(ad + bc), (a + ib)/(c + id) is ((ac + bd) + i(bc - ad)) / (cc + dd),
+// as cconst.ax folds them (icx_op).
+//
 // Where long double is wider than double (cty.is_wide), a long double
 // _Complex's parts are values as cgen_ld.ax has them: each the address of
 // its 16 bytes (a Pair of pointers), its arithmetic cgen_ld.ax's, and its
@@ -79,6 +85,11 @@ fn wide(v: Pair) bool {
     return v.re.ty.kind == ir.T_PTR;
 }
 
+// Are v's parts integers (an integer complex type's)?
+fn ints(v: Pair) bool {
+    return v.re.ty.kind == ir.T_INT;
+}
+
 /// The parts of the complex value of type t at p (volatile: as t says).
 pub fn parts(t: *cty.CType, p: *mut ir.Value) Pair {
     let el = t.unq.elem;
@@ -132,6 +143,12 @@ pub fn constant_wide(t: *mut cty.CType, re: ld.W, im: ld.W) *mut ir.Value {
     return make(t, Pair.{ re: gld.constant(re), im: gld.constant(im) });
 }
 
+/// The constant re + i im of integer complex type t (each part's bits).
+pub fn constant_int(t: *mut cty.CType, re: u64, im: u64) *mut ir.Value {
+    let rt = cg.lty(t.unq.elem);
+    return make(t, Pair.{ re: ir.cint(rt, re), im: ir.cint(rt, im) });
+}
+
 /// The constant re + i im of complex type t.
 pub fn constant(t: *mut cty.CType, re: f64, im: f64) *mut ir.Value {
     let rt = cg.lty(compute_type(t.unq).elem);
@@ -150,6 +167,10 @@ pub fn truth(t: *cty.CType, v: Pair) *mut ir.Value {
         let el = t.unq.elem;
         return ir.or_(cg.B, gld.truth(v.re, el), gld.truth(v.im, el));
     }
+    if ints(v) {
+        let zi = ir.cint(v.re.ty, 0);
+        return ir.or_(cg.B, ir.icmp(cg.B, ir.IntNE, v.re, zi), ir.icmp(cg.B, ir.IntNE, v.im, zi));
+    }
     let z = ir.cfp(v.re.ty, 0.0);
     return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, v.re, z), ir.fcmp(cg.B, ir.RealUNE, v.im, z));
 }
@@ -163,6 +184,12 @@ pub fn equal(t: *cty.CType, x: Pair, y: Pair, ne: bool) *mut ir.Value {
         }
         return ir.and_(cg.B, gld.compare(ct.P_EQ, x.re, y.re, el), gld.compare(ct.P_EQ, x.im, y.im, el));
     }
+    if ints(x) {
+        if ne {
+            return ir.or_(cg.B, ir.icmp(cg.B, ir.IntNE, x.re, y.re), ir.icmp(cg.B, ir.IntNE, x.im, y.im));
+        }
+        return ir.and_(cg.B, ir.icmp(cg.B, ir.IntEQ, x.re, y.re), ir.icmp(cg.B, ir.IntEQ, x.im, y.im));
+    }
     if ne {
         return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, x.re, y.re), ir.fcmp(cg.B, ir.RealUNE, x.im, y.im));
     }
@@ -175,6 +202,9 @@ pub fn negate(t: *cty.CType, v: Pair) Pair {
         let el = t.unq.elem;
         return Pair.{ re: gld.negate(v.re, el), im: gld.negate(v.im, el) };
     }
+    if ints(v) {
+        return Pair.{ re: ir.neg(cg.B, v.re), im: ir.neg(cg.B, v.im) };
+    }
     return Pair.{ re: ir.fneg(cg.B, v.re), im: ir.fneg(cg.B, v.im) };
 }
 
@@ -182,6 +212,9 @@ pub fn negate(t: *cty.CType, v: Pair) Pair {
 pub fn conj(t: *cty.CType, v: Pair) Pair {
     if wide(v) {
         return Pair.{ re: v.re, im: gld.negate(v.im, t.unq.elem) };
+    }
+    if ints(v) {
+        return Pair.{ re: v.re, im: ir.neg(cg.B, v.im) };
     }
     return Pair.{ re: v.re, im: ir.fneg(cg.B, v.im) };
 }
@@ -202,6 +235,9 @@ pub fn arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
     let t = compute_type(t0);
     if wide(x) {
         return arith_wide(op, x, y, t.unq.elem);
+    }
+    if ints(x) {
+        return arith_int(op, t.unq.elem.is_signed, x, y);
     }
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
@@ -240,6 +276,44 @@ pub fn arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
         xi = ir.cfp(x.re.ty, 0.0);  // (x / (u + iv) as (x + i0) / (u + iv))
     }
     return call_helper(t, false, x.re, xi, y.re, y.im);
+}
+
+// arith where the parts are integers (an integer complex type's, signed or
+// not): a real operand's imaginary part is 0.
+fn arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
+    let a = x.re;
+    let c = y.re;
+    let z = ir.cint(a.ty, 0);
+    let mut b = x.im;
+    if u.isnil(b) {
+        b = z;
+    }
+    let mut d = y.im;
+    if u.isnil(d) {
+        d = z;
+    }
+    if op == OP_ADD {
+        return Pair.{ re: bin(ir.OP_ADD, a, c), im: bin(ir.OP_ADD, b, d) };
+    }
+    if op == OP_SUB {
+        return Pair.{ re: bin(ir.OP_SUB, a, c), im: bin(ir.OP_SUB, b, d) };
+    }
+    if op == OP_MUL {
+        let re = bin(ir.OP_SUB, bin(ir.OP_MUL, a, c), bin(ir.OP_MUL, b, d));
+        let im = bin(ir.OP_ADD, bin(ir.OP_MUL, a, d), bin(ir.OP_MUL, b, c));
+        return Pair.{ re: re, im: im };
+    }
+    let mut div = ir.OP_UDIV;
+    if signed {
+        div = ir.OP_SDIV;
+    }
+    if u.isnil(y.im) {
+        return Pair.{ re: bin(div, a, c), im: bin(div, b, c) };
+    }
+    let n = bin(ir.OP_ADD, bin(ir.OP_MUL, c, c), bin(ir.OP_MUL, d, d));
+    let re = bin(ir.OP_ADD, bin(ir.OP_MUL, a, c), bin(ir.OP_MUL, b, d));
+    let im = bin(ir.OP_SUB, bin(ir.OP_MUL, b, c), bin(ir.OP_MUL, a, d));
+    return Pair.{ re: bin(div, re, n), im: bin(div, im, n) };
 }
 
 // arith where the parts are wide long doubles: the same operations, in
