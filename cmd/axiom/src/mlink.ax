@@ -158,22 +158,22 @@ fn is_tlvp(ty: u32) bool {
            (ty == elf.R_X86_64_AXIOM_TLV);
 }
 
-// The class of the section that defines symbol si of object oi (-1: none, an import).
-fn def_class(oi: usize, si: u32) i32 {
+// The class of the section that defines symbol si of object oi (NONE: none, an import).
+fn def_class(oi: usize, si: u32) nl.SecClass {
     let gi = nl.global_of(oi, si);
     let mut o = oi;
     let mut k = si;
     if gi >= 0 {
         let g = nl.gsyms.at(@int_cast(usize, gi));
         if g.obj < 0 {
-            return -1;
+            return nl.SecClass.NONE;
         }
         o = @as(usize, @bit_cast(u32, g.obj));
         k = g.sym;
     }
     let sy = nl.objs.get(o).syms.get(@as(usize, k));
     if sy.sec < 0 {
-        return -1;
+        return nl.SecClass.NONE;
     }
     return nl.sec_cls.get(o)[@as(usize, @bit_cast(u32, sy.sec))];
 }
@@ -216,30 +216,38 @@ fn tls_scheme_check(oi: usize, si: u32, tlvp: bool) bool {
 // then __thread_bss), which dyld copies for each thread. The code calls a
 // descriptor's function to find a variable (TLVP relocations: through a
 // GOT slot holding the descriptor's address).
-const C_TLV: i32 = 10;
+const C_TLV: nl.SecClass = nl.SecClass.TLV;
 // a dynamic library's initializer and terminator pointers (__mod_init_func,
 // __mod_term_func: dyld calls them); an executable's start-up runs them
-const C_INIT: i32 = 13;
-const C_FINI: i32 = 14;
-const C_TLV_DATA: i32 = 11;
-const C_TLV_BSS: i32 = 12;
+const C_INIT: nl.SecClass = nl.SecClass.INIT;
+const C_FINI: nl.SecClass = nl.SecClass.FINI;
+const C_TLV_DATA: nl.SecClass = nl.SecClass.TLV_DATA;
+const C_TLV_BSS: nl.SecClass = nl.SecClass.TLV_BSS;
 // the unwind tables (macunwind.ax): the objects' FDEs, placed together in
 // __eh_frame, and their compact entries, which make __unwind_info
-const C_EH: i32 = 15;
-const C_CU: i32 = 16;
+const C_EH: nl.SecClass = nl.SecClass.EH;
+const C_CU: nl.SecClass = nl.SecClass.CU;
 // the debugger's descriptors of thread-locals (-g: dwarf.ax finish_elf), in
 // the platform's form (a function, the key, the offset): the key is the
 // runtime's, written there at start-up, the offset in our block the
 // linker's (macOS's debugger reads a thread-local's address as the TSD value
 // of the key plus the offset)
-const C_TLVD: i32 = 17;
+const C_TLVD: nl.SecClass = nl.SecClass.TLVD;
+
+// Is c one of this linker's own classes (above)?
+fn macho_class(c: nl.SecClass) bool {
+    match c {
+        .TLV, .TLV_DATA, .TLV_BSS, .INIT, .FINI, .EH, .CU, .TLVD => { return true; }
+        else                                                     => { return false; }
+    }
+}
 let mut unwind: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
 let mut has_tlv: bool = false;
 let mut tlv_start: u64 = 0;  // the template's
 
 // A section's place: read-only data that holds addresses goes in __DATA,
 // since dyld rebases (or binds) them.
-fn class_of(s: *elf.Sec) i32 {
+fn class_of(s: *elf.Sec) nl.SecClass {
     if u.str_eq(s.name, ".eh_frame") {
         return C_EH;
     }
@@ -1083,7 +1091,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     has_tlv = false;
     for oi in 0..nl.objs.len {
         for c in nl.sec_cls.get(oi) {
-            if (c >= C_TLV) and (c <= C_TLV_BSS) {
+            if (c == C_TLV) or (c == C_TLV_DATA) or (c == C_TLV_BSS) {
                 has_tlv = true;
             }
         }
@@ -1723,7 +1731,8 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
                 continue;
             }
             let cls = nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, s.sec))];
-            if (cls == nl.C_TDATA) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls >= C_TLV) or (cls < 0) {
+            if (cls == nl.C_TDATA) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or macho_class(cls) or
+               (cls == nl.SecClass.NONE) {
                 continue;
             }
             if (s.bind != elf.B_LOCAL) and (nl.global_of(oi, @int_cast(u32, si)) >= 0) {

@@ -27,13 +27,35 @@ import "elf.ax" as elf;
 import "util.ax" as u;
 
 // Section classes (each linker's class_of says which sections go where).
-pub const C_TEXT: i32 = 0;
-pub const C_CONST: i32 = 1;  // read-only data, then the frame tables (elf.rets_rank)
-pub const C_DATA: i32 = 2;
-pub const C_TDATA: i32 = 3;
-pub const C_TBSS: i32 = 4;
-pub const C_BSS: i32 = 5;
-pub const C_DEBUG: i32 = 6;  // debug information (dwarf.ax): not loaded, merged by debug_sections
+pub enum SecClass: i32 {
+    NONE = -1,  // a discarded section: not placed, not copied, not relocated
+    TEXT,
+    CONST,  // read-only data, then the frame tables (elf.rets_rank)
+    DATA,
+    TDATA,
+    TBSS,
+    BSS,
+    DEBUG,  // debug information (dwarf.ax): not loaded, merged by debug_sections
+    // the Windows linker's (plink.ax)
+    PDATA,
+    // the Mach-O linker's (mlink.ax)
+    TLV = 10,
+    TLV_DATA,
+    TLV_BSS,
+    INIT,
+    FINI,
+    EH,
+    CU,
+    TLVD,
+}
+
+pub const C_TEXT: SecClass = SecClass.TEXT;
+pub const C_CONST: SecClass = SecClass.CONST;
+pub const C_DATA: SecClass = SecClass.DATA;
+pub const C_TDATA: SecClass = SecClass.TDATA;
+pub const C_TBSS: SecClass = SecClass.TBSS;
+pub const C_BSS: SecClass = SecClass.BSS;
+pub const C_DEBUG: SecClass = SecClass.DEBUG;
 
 // A global (non-local) symbol of the link.
 pub struct GSym {
@@ -74,7 +96,8 @@ pub let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym
 pub let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 // per object: each section's class and address, each local symbol's GOT slot + 1
-pub let mut sec_cls: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
+pub let mut sec_cls: u.List.[[]mut SecClass] = u.List.[[]mut SecClass].{
+    data: @ptr_from_int(*mut []mut SecClass, 0), len: 0, cap: 0 };
 pub let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0,
                                                                 cap: 0 };
 pub let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0,
@@ -118,7 +141,7 @@ pub fn begin(inputs: []*mut elf.Obj) void {
     lnk.name = "(the linker)";
     gsyms = u.List.[GSym].empty();
     gmap = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    sec_cls = u.List.[[]mut i32].empty();
+    sec_cls = u.List.[[]mut SecClass].empty();
     sec_addr = u.List.[[]mut u64].empty();
     local_got = u.List.[[]mut i32].empty();
     got_obj = u.List.[u32].empty();
@@ -683,16 +706,16 @@ pub fn got_slot(oi: usize, si: u32) i32 {
 // Each object's section classes (by class_of), and room for the section
 // addresses and local GOT slots. With --gc-sections, the sections nothing
 // kept refers to are left out first (collect_garbage).
-pub fn classify(class_of: fn(*elf.Sec) i32) void {
+pub fn classify(class_of: fn(*elf.Sec) SecClass) void {
     if g_gc_sections {
         collect_garbage();
     }
     for oi in 0..objs.len {
         let o = objs.get(oi);
-        let cls = u.newn.[i32](o.secs.len + 1);
+        let cls = u.newn.[SecClass](o.secs.len + 1);
         for k in 0..o.secs.len {
             if o.secs.get(k).kind == elf.S_DISCARD {
-                cls[k] = -1;  // (not placed, not copied, not relocated)
+                cls[k] = SecClass.NONE;
             } else {
                 cls[k] = class_of(o.secs.get(k));
             }
@@ -1308,7 +1331,7 @@ fn const_pass(s: *elf.Sec) i32 {
 // last, together: elf.rets_rank; then .eh_frame: eh_together), then the initialization and termination
 // arrays (array_rank, setting their bounds' symbols), then the sections
 // with __start_ and __stop_ symbols, by name (setting those).
-pub fn place(cls: i32, at: u64) u64 {
+pub fn place(cls: SecClass, at: u64) u64 {
     let mut cur = at;
     let mut passes: i32 = 1;
     if cls == C_CONST {
@@ -1446,7 +1469,7 @@ fn sort_u64(a: []mut u64) void {
     }
 }
 
-pub fn class_align(cls: i32) u64 {
+pub fn class_align(cls: SecClass) u64 {
     let mut a: u64 = 1;
     for oi in 0..objs.len {
         let o = objs.get(oi);
@@ -1461,7 +1484,7 @@ pub fn class_align(cls: i32) u64 {
 
 // Copies the sections of class `cls` into the file b (file_of: an address's
 // offset in it).
-pub fn copy_class(b: []mut u8, cls: i32, file_of: fn(u64) u64) void {
+pub fn copy_class(b: []mut u8, cls: SecClass, file_of: fn(u64) u64) void {
     for oi in 0..objs.len {
         let o = objs.get(oi);
         for k in 0..o.secs.len {
