@@ -11,9 +11,7 @@
   optimization level, so an unused library costs nothing.
 - When a C program defines `exit` (a unit or an Axiom module), returning from `main`
   calls it with `main`'s value. The order of start-up and exit is documented.
-- `std/c/lib/` (C sources) and `std/c/rt/` (Axiom modules) are linked into hosted C
-  programs when present, the place of the coming C library; `--c-freestanding` leaves
-  them out.
+
 - Windows: an object that C declares and no unit defines is imported from its DLL
   (`extern int _fmode;`), and its address in a static initializer is `C3067`; the
   unwind information of a function with a variable length array no longer reads the

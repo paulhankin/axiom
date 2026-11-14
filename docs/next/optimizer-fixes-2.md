@@ -18,4 +18,4 @@
   position (`return f(n - 1) + 1`): at -O1 and up the recursion became a loop, and a trap
   inside it showed one frame where -O0 showed them all. Such calls are now left as calls
   while stack traces are on, as they already were for WebAssembly; `--stack-traces=off`
-  still makes the loop. The bootstrap compiler marks them so that LLVM leaves them too.
+  still makes the loop. The bootstrap compiler marks them so that its code generator leaves them too.

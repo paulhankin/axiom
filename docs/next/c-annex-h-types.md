@@ -1,4 +1,4 @@
-## C: Annex H claimed
+## C
 
 - C23 mode defines `__STDC_IEC_60559_TYPES__` (`202311L`) with the library (hosted, not
   `--c-lib=system`), on every target.

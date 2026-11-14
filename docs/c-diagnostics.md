@@ -15,7 +15,8 @@ C's terms, and can differ between uses of one code. The ranges:
 | `C4xxx` | Warnings. A warning does not fail a build. |
 
 Other codes can appear with C sources too: `E9001` and `E0211` for a bad command line
-or an unreadable file, `E9004` when the system's linker fails. They are the driver's,
+or an unreadable file, `E9004` when a link fails (an undefined symbol, objects that would
+mix two C libraries, a C source given with `--link=` that does not compile). They are the driver's,
 and are not listed here.
 
 An error stops the build after the unit has been analyzed: the front end goes on after

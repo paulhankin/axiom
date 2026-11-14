@@ -46,4 +46,4 @@
   frame slots, from the frame's local (`DW_OP_WASM_location`); Axiom locals stay in
   memory at `-O0` there too, as natively. A stack overflow in such a frame is now caught
   by the frame's own stack check, which reports the function's line. Optimized code's
-  variables have no location on WebAssembly yet.
+  variables are in the function's locals (`DW_OP_WASM_location`).

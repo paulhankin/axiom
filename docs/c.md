@@ -3,8 +3,9 @@
 `axiom build file.c` compiles C. The C front end reads C translation units and hands them
 to the same optimizer, code generators and linkers that Axiom programs use, so a C program
 is built for every target of the compiler (WebAssembly, x86-64 and AArch64 Linux, x86-64
-Windows, AArch64 macOS) with no C compiler and no external linker: the compiler's own
-linkers link the platform's C library too, and on Linux the objects, archives and shared
+Windows, AArch64 macOS, and x86-64 macOS and Windows on ARM64, whose output has never
+been run: "Calling conventions and interoperability") with no C compiler and no external
+linker: the compiler's own linkers link the platform's C library too, and on Linux the objects, archives and shared
 libraries of the platform's toolchain ("Objects and libraries").
 
 It is a hosted implementation, in C's terms: a C program links the compiler's own C
@@ -85,7 +86,7 @@ Axiom in one program").
 | `--c-char=signed\|unsigned` | Whether plain `char` is signed (default: the target's C ABI). |
 | `--c-int=16\|32\|64` | The width of `int` (default 32). |
 | `--c-long=32\|64` | The width of `long` (default: the target's C ABI; at least `--c-int`). |
-| `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
+| `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for x86-64 Linux and macOS only; `128` for those, `aarch64` Linux and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`); the target's ("Predefined macros") can, and `-D` replaces one. |
 | `-Apred=answer`, `-Apred(answer)` | A GNU dialect's assertion, as `#assert pred(answer)` before the source ("GNU dialects"); `-A-pred=answer` takes it back (`-A-pred` every answer of pred), `-A-` every assertion before it, the target's `cpu`, `machine` and `system` too. Under an ISO standard, which has no assertions, it is an error. |
@@ -107,10 +108,11 @@ options; a warning is silenced only by `#pragma GCC diagnostic` ("Pragmas").
 `--target`, `--cpu`, `--features`, `-O0`..`-O3` (see "Optimization"), `--stack-traces`
 (see "Stack traces"), `--format=agent-json`, `--std=<dir>` (the standard library's
 directory, where the compiler finds the C headers in `c/include/`), `-o`, `--emit`,
-`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, `--function-sections`,
-`--data-sections`, `--gc-sections` (see "Code in sections"), `--unwind-tables` (see
-"Objects and libraries"), and `-g` /
-`--debug-info=` (see "Debugging"). The default
+`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, `--stack-size`, `--pic`,
+`--function-sections`, `--data-sections`, `--gc-sections` (see "Code in sections"),
+`--unwind-tables` (see "Objects and libraries"), `--macos-tls` (see "Atomics and
+threads"), and `-g` / `--debug-info=`, `--debug-macros`, `--debug-language` (see
+"Debugging"); [`docs/cli.md`](cli.md) describes each. The default
 target is `wasm32`. `--link=file.c` links a further C source, compiled to an object by
 the system's C compiler for Linux, by this compiler for macOS and Windows, by `clang` for
 WebAssembly; `--link=` with an object, an archive or a shared library, or such a file among
@@ -143,7 +145,8 @@ errors before anything is compiled.
 | `c-ast` | The syntax tree, as text. No semantic analysis is done. |
 
 `c-pp`, `c-tokens` and `c-ast` take one source, and print to standard output without
-`-o`. `--emit=asm` is not supported. Without `-o`, the output is named after the first
+`-o`. `--emit=asm` is not supported (there is no assembly output: `--emit=obj` and a
+disassembler, or `--emit=ir`). Without `-o`, the output is named after the first
 source with `.c` removed: `prog`, `prog.wasm`, `prog.o` or `prog.ir`.
 
 An object or IR of translation units that do not define `main` holds their code alone:
@@ -470,8 +473,7 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   `-D`, `-U`, the `-I` directories, ...), `--cpu` and `--features`.
 
 When objects of the platform's toolchain are linked, so are its C compiler's run-time
-archives (`libgcc.a` and `libgcc_eh.a` of its newest version, under `/usr/lib/gcc` or
-`/usr/lib/gcc-cross`), from which a member is linked only where nothing else defines
+support archives (of its newest version installed, the native or the cross one), from which a member is linked only where nothing else defines
 what an object needs (complex arithmetic, 128-bit division and conversions, AArch64's
 atomics called out of line), as the system's linker links them.
 
@@ -480,19 +482,20 @@ library") supplies it, its units and run-time modules compiled with the program 
 the program's own references, and what the inputs refer to is kept ("What is linked").
 
 On WebAssembly the compiler's linker takes relocatable objects of the tool conventions'
-format (this compiler's, and `clang`'s for the same target) and archives of them, found
+format (this compiler's, and the system's C compiler's for the same target) and archives of them, found
 with `-L` and `-l` (`libname.a`), with the same member selection; a C source given with
 `--link=` is compiled by `clang` first. A weak reference that nothing linked defines (and
 that no import names explicitly) is null: a function's table index is 0 and its calls
 reach a stub of its type that traps (`unreachable`), an object's address is 0; this
 compiler's objects leave such a function's import without a name of their own, so that
-`wasm-ld` makes it so too. The constructors of such objects (their
+the system's WebAssembly linker makes it so too. The constructors of such objects (their
 linking sections' `INIT_FUNCS`) are run before `main`, by priority (of one priority in
 the order of the objects), by `__wasm_call_ctors`, which the linker makes when an
 object has some (the tool conventions' name: the C start-up calls it). This compiler's
 WebAssembly objects list their C units' constructors so, and their destructors as
 constructors of their priorities that register them with `atexit` (which runs them in
-the reverse order: after `main`, by `exit`), so that `wasm-ld` runs them too. On macOS (`mlink.ax`) and Windows (`plink.ax`) the compiler's linkers take the objects and
+the reverse order: after `main`, by `exit`), so that the programs the system's
+WebAssembly linker links run them too. On macOS (`mlink.ax`) and Windows (`plink.ax`) the compiler's linkers take the objects and
 static archives of the platform's toolchain and of this compiler, in the platform's
 format, for both processors (`macho.ax`, `coff.ax` read them), with the same member
 selection; what the objects refer to and do not define comes from the libraries:
@@ -502,8 +505,8 @@ selection; what the objects refer to and do not define comes from the libraries:
   section, section-relative ones), common symbols, weak definitions and references,
   `__mod_init_func` and `__mod_term_func` (run by the start-up as the initialization
   arrays are), and the platform's thread-local variables (`__thread_vars`,
-  `__thread_data`, `__thread_bss`: the executable gets the sections and dyld makes the
-  blocks); `__compact_unwind` and `__eh_frame` go into the executable's unwind tables
+  `__thread_data`, `__thread_bss`: the executable gets the sections and the platform's
+  dynamic linker makes the blocks); `__compact_unwind` and `__eh_frame` go into the executable's unwind tables
   (a function's FDE found by the address it covers, which the platform's assembler
   leaves without a relocation), with their personality routines and LSDAs (C++'s
   exceptions, C's cleanups under `-fexceptions`): a compact entry's routine is one of
@@ -515,8 +518,8 @@ selection; what the objects refer to and do not define comes from the libraries:
 - **Dynamic libraries**: a `.dylib` given (or found by `-l` in the `-L` directories; of a
   universal file, the target's slice) is read for its install name and exports, and the
   program is bound to it by its ordinal (two-level namespace). A library named with `-l`
-  that is not a file here (`-lz`, the SDK's `.tbd` stubs, which are not read) is loaded by
-  name (`/usr/lib/libz.dylib`, a framework's path, ...), and what no library is known to
+  that is not a file here (`-lfoo`, the SDK's `.tbd` stubs, which are not read) is loaded by
+name (`/usr/lib/libfoo.dylib`, a framework's path, ...), and what no library is known to
   export is then looked up in every library loaded (flat lookup); without such libraries
   it is `libSystem`'s.
 - **COFF objects** (x64, ARM64; the big format too): every relocation type of both
@@ -685,8 +688,8 @@ The objects are in the target's format (`--emit=obj`, `--emit=lib`):
   `.refptr.<name>` (a pointer in `.rdata$.refptr.<name>`, selected once). Functions carry
   their sizes (function definition records). No `.drectve` is written.
 
-The system's linkers read these (`ld64.lld`, `lld-link`, the platforms' own: the
-suite's `c/objfmt` tests link them). An object of C units alone has no runtime: linked
+The system's linkers for those platforms read these (the suite's `c/objfmt` tests link
+them with such linkers where they are installed). An object of C units alone has no runtime: linked
 by the system's toolchain into a C program (whose C library is the system's), it may use
 only the standard's functions and objects; one that uses this library's private names
 (the macros of `<stdio.h>` for `stdin`, `stdout`, `stderr`, `getc` and `putc`, `errno`'s,
@@ -727,9 +730,9 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
   library is written), and `LoadLibrary` and `GetProcAddress` find its functions.
 - **Mach-O** (`libprog.dylib`; `mlink.ax`): `MH_DYLIB`, its install name
   `@rpath/libprog.dylib`, an export trie of its definitions of default visibility,
-  `__mod_init_func` and `__mod_term_func` (dyld runs them), rebase and bind information as
+  `__mod_init_func` and `__mod_term_func` (the platform's dynamic linker runs them), rebase and bind information as
   for an executable, ad-hoc signed; its thread-locals are the platform's (`--emit=shared`
-  implies `--macos-tls=platform`; dyld makes their blocks), and those it exports are its
+  implies `--macos-tls=platform`; the platform's dynamic linker makes their blocks), and those it exports are its
   descriptors. Built and checked only: nothing
   here runs macOS.
 
@@ -1003,7 +1006,7 @@ results and flags these paths give bit for bit in every direction):
   rounded; the elementary ones (`exp`, `log`, `pow`, `sin`, `atan2`, `erf`, `tgamma`, ...)
   compute in decimal arithmetic of the format's precision and 12 more digits (and as
   many as cancellation needs; trigonometric arguments reduced exactly, up to 10^6145)
-  and round once: within 1 ulp (measured against mpmath, a few hundred arguments of
+  and round once: within 1 ulp (measured against an arbitrary-precision reference, a few hundred arguments of
   every magnitude per function and format: the largest error 0.500 ulp). For
   `_Decimal32` and `_Decimal64` they first take a binary path (`std/c/rt/dfp_fast.ax`):
   the argument converted to binary128 (within 2^-111, by a table of the powers of ten,
@@ -1012,7 +1015,7 @@ results and flags these paths give bit for bit in every direction):
   function's condition number at the argument; where the test cannot decide, or the
   result may be exact (it then needs its preferred quantum), or the argument or the
   result is out of the ranges that path takes, the decimal computation does. So these
-  results are correctly rounded in every direction (checked against mpmath on 760,000
+  results are correctly rounded in every direction (checked against an arbitrary-precision reference on 760,000
   results, 38 functions, both formats, the five directions: the only differences from
   the decimal computation were 270 results of tiny arguments in directed modes that it
   rounded wrong, which this path rounds correctly), and the flags are those of the
@@ -1049,8 +1052,8 @@ results and flags these paths give bit for bit in every direction):
 - **Speed** (x86-64, `-O2`): an operation is a call of the software, about 100 ns for a
   `_Decimal64` multiplication, addition or division, 75 to 200 ns for `_Decimal128`'s
   (were 350 to 630); an elementary function of `_Decimal32` or `_Decimal64` about 0.5 to
-  1 us (were 40 to 140 us), of `_Decimal128` 2 to 15 us (`expd128` 2.3, `logd128` 4.3,
-  `sind128` 5.5, `powd128` 30; were 25 to 180: most of the time is in the calls the
+  1 us (were 40 to 140 us), of `_Decimal128` 2 to 15 us and `powd128` 30 (`expd128` 2.3,
+  `logd128` 4.3, `sind128` 5.5; were 25 to 180: most of the time is in the calls the
   rounding test sends to the decimal computation), `lgammad128` and `tgammad128` 0.3 to
   0.8 ms (were 1.7), a trigonometric one
   of an argument beyond 10^17 milliseconds (the exact reduction).
@@ -1375,8 +1378,9 @@ functions are C (`std/c/lib/math/`).
   without the extension). Against the former, less accurate functions (`-O2`, x86-64,
   best of seven): `cexp` and `clog` 1.1 times their time, `csqrt` 1.35, `csinh`,
   `ccosh`, `ctanh` 1.4 to 1.5, `catanh` 1.7, `cpow` 1.75, `casin` and `cacos` 2.1.
-- **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
-  the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128
+- **`long double`** where it is `double` (Windows, macOS on Apple silicon; and with
+  `--c-long-double=64`) has the double functions. Where it is wider (the 80-bit x87 format
+  on x86-64 Linux and macOS, binary128
   on AArch64 Linux and WebAssembly), the exact `l` functions (`fabsl`, `copysignl`, the
   rounding functions, `fmodl`, `remainderl`, `remquol`, `frexpl`, `ldexpl`, `scalbnl`,
   `ilogbl`, `logbl`, `modfl`, `nextafterl`, `nexttowardl`, `nextupl`, `nextdownl`, `fmaxl`,
@@ -1774,7 +1778,7 @@ library's are `C1081`.
 
 | Header | Modes | Notes |
 |---|---|---|
-| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. In C23 the `DEC32_`, `DEC64_` and `DEC128_` macros (`_SNAN` too: decimal signaling NaNs stay signaling) and `DEC_EVAL_METHOD` (0). |
+| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). In C23 `FLT_SNAN`, `DBL_SNAN` and `LDBL_SNAN` (signaling NaNs that stay signaling in the objects they initialize), and the `DEC32_`, `DEC64_` and `DEC128_` macros (`_SNAN` too: decimal signaling NaNs stay signaling) and `DEC_EVAL_METHOD` (0). |
 | `<limits.h>` | all | `LLONG_` from C99; `*_WIDTH`, `BOOL_MAX` and `BITINT_MAXWIDTH` (65535) in C23. |
 | `<stdarg.h>` | all | `va_list`, `va_start`, `va_arg`, `va_copy`, `va_end`. In C23 `va_start` needs no second argument. |
 | `<stddef.h>` | all | `size_t`, `ptrdiff_t`, `wchar_t`, `NULL`, `offsetof`; `max_align_t` from C11; `nullptr_t` and `unreachable` in C23. |
@@ -2452,8 +2456,9 @@ no other tool is needed:
   - Mach-O (macOS): the procedure's entry in `__compact_unwind` and its FDE in
     `__eh_frame` (`.cfi_sections` without `.eh_frame` leaves them out), and under `-g`
     in the debug bundle's `.debug_frame`; a personality
-    routine, an LSDA, a return address column and `B`/`G` are C3097 there (the
-    executable's unwind table carries no personalities), as on Windows.
+    routine, an LSDA, a return address column and `B`/`G` are C3097 there (the assembler
+    writes a personality and an LSDA only into ELF's `.eh_frame`; the linker takes those
+    of the platform's compilers' objects: "Objects and libraries"), as on Windows.
   - PE (Windows): `.cfi_*` are checked and put nowhere (the debug information is the
     PDB's, which takes no call frame information from them): the unwind information is
     `.seh_*`'s (below).
@@ -2857,14 +2862,14 @@ threads and the runtime's each get their copies. On Windows they are in the imag
 directory, so every thread has them. On macOS there are two schemes, chosen with
 `--macos-tls=fast|platform`:
 
-- `fast`, the default (and what has run on Macs): the runtime's thread-local block, an
+- `fast`, the default (and what Axiom programs have run with on Macs): the runtime's thread-local block, an
   offset in a block whose address is in the TSD slot of the runtime's pthread key (arm64:
   `mrs` of `TPIDRRO_EL0`; x86-64: `gs`), about five instructions an access. The main
   thread and the runtime's threads have it: every thread of `thrd_create` is one of the
   runtime's (a thread something else creates, such as the system's C code with
   `pthread_create`, has none).
 - `platform`: the platform's thread-local variables (descriptors in `__thread_vars`,
-  whose thunk, dyld's, makes a thread's block when the thread first uses one: every
+  whose thunk, the platform's dynamic linker's, makes a thread's block when the thread first uses one: every
   thread has them, those of `pthread_create` too, and they interoperate with the
   platform's objects and libraries both ways). Code finds one by calling the thunk
   (arm64: `adrp`/`ldr` of the descriptor's address, which the linker makes an `add` for
@@ -3105,8 +3110,10 @@ random structure and union shapes (`cmd/axiom/internal/tests/tools/gen_c_abi.py`
 arrays, bit-fields, floating and integer members, `long double` and `long double
 _Complex` ones (`--ld`), over-aligned members, 1 to about 64 bytes) passed and returned by value, through pointers and as variadic arguments read with
 `va_arg`, `va_copy` and a `va_list` passed on; the layouts of bit-fields on every target
-against the platforms' C compilers. The suite runs a subset (`c/run/abi_gen_*.c`). Windows
-and macOS output is built but not run here.
+against the platforms' C compilers. The suite runs a subset (`c/run/abi_gen_*.c`).
+Windows x64 programs are run under a Windows compatibility layer where one is installed
+(the suite's cross-target runs and its `c/objfmt` tests; otherwise they are built and
+checked only); macOS output and Windows ARM64 output are built and checked, never run.
 
 `x86_64-macos` and `aarch64-windows` have never been run on their systems. For
 `x86_64-macos`, objects of random shapes built for it interoperate with the system's C
@@ -3506,6 +3513,135 @@ claims less than the standard allows. None is hidden: each is said above or here
   and the full algorithms are always used.
 - The decimal floating types: on WebAssembly their exceptions are not recorded (no flags
   there, as for binary).
+- `FLT_ROUNDS` is always 1: it does not follow `fesetround` (C17 5.2.4.2.2p8 asks it to
+  give the current rounding mode; "Implementation-defined behavior", floating types).
 - (Not a deviation, but often asked: in a GNU dialect the destructors run as `atexit`'s
   functions do, when `main` returns and from `exit`, and so not from `_Exit`,
   `quick_exit` or a signal, which end the process without them.)
+
+## Known gaps
+
+Everything this implementation does not do yet, or does only in part, in one place: one
+line each, with the section that says more. What a target, the standard or a dialect
+leaves out by design is in "Not available"; where the implementation departs from a
+standard it claims, "Known deviations".
+
+**Language and front end**
+
+- No assembly output: `--emit=asm` is an error ("`--emit`").
+- No Microsoft extensions but `__declspec` ("GNU dialects", Language).
+- At most 128 trampolines of one nested function live at once; one more traps ("GNU
+  dialects", Language: nested functions).
+- No option sets the stack of the threads `thrd_create` starts (8 MiB natively, 1 MiB on
+  WebAssembly: "Threads", Stacks).
+- Annex L (analyzability) is not claimed (`docs/c-conformance.md`, "Annexes").
+
+**Library**
+
+- Locales: the `"C"` conventions only, collation by code values, Unicode 15.1's classes
+  ([`docs/c-text.md`](c-text.md), "Not provided, or limits").
+- Every hosted program's build analyzes the time zone module (`std/c/rt/text_time.ax`,
+  `std/time/tz`) whether it uses it or not (`docs/c-text.md`).
+- POSIX's streams (`fmemopen`, `fileno`, `popen`, ...) are not provided ("Standard
+  input/output", Exit).
+- With the compiler's C library, objects built against the system's headers may not use
+  the system library's own names, its POSIX stream functions, `fgetpos`/`fsetpos` or the
+  restartable multibyte functions, and shared libraries built against it cannot be linked
+  (`E9004`: "One C library").
+- Mutexes are neither fair nor robust ("Threads").
+- On macOS under `--macos-tls=fast` a thread that the runtime did not start (the system's
+  `pthread_create`) has no thread-locals ("Atomics and threads").
+- Intrinsics not provided: AVX-512's, AMX's, Key Locker's, the system instructions'
+  (`_xsave` ...), `<arm_sve.h>`, FCMA, FRINTTS, JSCVT, RNG, MTE and TME, `__arm_rsr` and
+  `__arm_wsr`; RDRAND and RDSEED intrinsics are not checked against `--features`; the
+  non-temporal hints are dropped ("Intrinsics").
+
+**Mathematics**
+
+- WebAssembly has no floating-point environment: rounding to nearest only, no exception
+  flags (binary or decimal), so no Annexes F and G there ("The floating-point
+  environment", "Known deviations").
+- `FLT_ROUNDS` does not follow `fesetround` ("Known deviations").
+- `cpow` beyond its bounds (`B` above 2^90 for double, 2^120 for float, 2^70 for the
+  x87 format, 2^26 for binary128) loses accuracy as `B 2^-150`: wider kernels are not written (the
+  complex functions, "`<math.h>` ...").
+- A complex result's part that is subnormal is within up to 1.4 ulps (rounded twice)
+  (the complex functions).
+- The decimal elementary functions of trigonometric arguments beyond 10^17 take
+  milliseconds (exact reduction: "Decimal floating types", Speed).
+- Speed against the system's library: `log2` 1.5 times its time, `pow`, `powf`, `acosh`,
+  `atanh` 1.4 to 1.5; the x87 format's `long double` functions up to 2.2 times
+  ("`<math.h>` ...", Speed, `long double`).
+
+**Assembler**
+
+- x86-64: APX, AMD's XOP and some legacy and system instructions (`lar`, `lsl`, Key
+  Locker, ENQCMD, MOVDIRI, RAO-INT, VMX, ...) are C3097 ("Inline assembly", x86-64).
+- Call frame directives not written: data-, text- and function-relative encodings,
+  2-byte pointers, `.cfi_val_encoded_addr`, `.cfi_inline_lsda`; `.seh_handler`;
+  `.cfi_personality` and `.cfi_lsda` on macOS and Windows; in asm statements the
+  `.cfi_*` that change the frame and every `.seh_*` (so on Windows a register a template
+  saves is not described) ("Inline assembly", call frame information).
+- AArch64 on macOS and Windows: an absolute address in a move-wide group other than the
+  complete sequence, or in `.word`/`.hword`, is C3097 ("Inline assembly", AArch64).
+- WebAssembly: active data and element segments, and memories or tables other than the
+  program's, are C3097 by rule ("Inline assembly", WebAssembly).
+
+**Linking**
+
+- A universal (multi-architecture) Mach-O object is not read, nor are the SDK's `.tbd`
+  stubs (such a library is bound by name) ("Objects and libraries").
+- A long-format Windows import library is an error ("Objects and libraries").
+- `--emit=shared` takes no Axiom modules and not the compiler's C library: `--c-lib=system`
+  or `--c-freestanding` ("Shared libraries").
+- A C source given with `--link=` needs the system's C compiler on Linux, and `clang` on
+  WebAssembly ("Objects and libraries").
+- macOS: nothing here has run an unwinder over the executables' unwind tables, nor
+  thrown through the platform objects' personality routines (`c/objfmt/unwind_personality`
+  is built only: "Objects and libraries", "Debugging").
+
+**Debug information**
+
+- Columns are not recorded in the line tables ("Debugging", Lines).
+- Optimized code: at about 7% (x86-64) to 9% (AArch64) of the instructions where a C
+  variable has been assigned, the debugger shows it "optimized out": merges whose registers were reused, values
+  computed through more operations than the expressions follow, missing entry values
+  ("Debugging", locations at `-O1` and above).
+- Floating-point values computed from their operands only on x86-64 Linux: not on
+  AArch64, not in macOS's debug information or the PDB ("Debugging").
+- WebAssembly: optimized code's variables are not computed from other values, have no
+  entry values or call sites; thread-locals have no location ("Debugging", table).
+- The PDB does not describe structures taken apart into registers, values computed from
+  a register, values at an address held in a frame slot (variable length arrays,
+  parameters passed by reference), variable length arrays' bounds, or enumerators wider
+  than 64 bits ("Debugging", table).
+- macOS: the thread-locals' descriptors in the debug information (both schemes) have not
+  been tried in the platform's debugger ("Debugging", Types and variables).
+- The C library's own units have no macros in `.debug_macro` ("Debugging", Macros).
+
+**Code generation and run time**
+
+- At `-O2` and `-O3` a C function whose last act is a call is missing from stack traces,
+  and without line tables a crash in code inlined into a function that makes no call
+  can show no frames at all ("Stack traces").
+- The optimizer treats every atomic operation as sequentially consistent (it forgoes
+  what weaker orders would allow) ("Atomics and threads", Memory orders).
+- A function that calls `setjmp` (and one whose nested functions may jump to its local
+  labels) is not optimized ("setjmp and longjmp", "GNU dialects").
+- `--unwind-tables=off` stops the system's unwinder at this compiler's frames ("Objects
+  and libraries").
+- `--macos-tls=platform`: a function without a frame that reaches a thread-local cannot
+  be unwound past while the thunk runs ("Atomics and threads").
+
+**Targets and output never executed**
+
+- `x86_64-macos` and `aarch64-windows`: built and checked structurally, never run
+  ("Calling conventions and interoperability").
+- Windows on ARM64's `longjmp` unwinding and fault delivery to signal handlers: never
+  run ("Signals").
+- macOS output of the C front end (programs, objects, `.dylib`s, unwind tables): built
+  and checked only ("Shared libraries", "Debugging").
+- `--macos-tls=platform`, and so every macOS object, static library and dynamic library
+  (which imply it): never executed ("Atomics and threads").
+- Windows x64 programs are run only under a compatibility layer where one is installed;
+  otherwise built and checked only ("Calling conventions and interoperability").

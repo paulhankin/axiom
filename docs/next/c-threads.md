@@ -5,13 +5,18 @@
   condition variables with `TIME_UTC` deadlines, thread-specific storage with its
   destructors, and `call_once` (also in C23's `<stdlib.h>`), on every target, on the
   Axiom runtime's threads. `__STDC_NO_THREADS__` is no longer defined. `thrd_exit` on
-  the main thread lets the other threads finish, then ends the program with status 0;
-  `exit` from any thread runs the `atexit` functions once. On WebAssembly without the
-  atomics extension `thrd_create` returns `thrd_error`.
+  the main thread lets the other threads finish (those Axiom code started too), then
+  ends the program with status 0; `exit` from any thread runs the `atexit` functions
+  once. On WebAssembly without the atomics extension `thrd_create` returns
+  `thrd_error`.
+- `thrd_sleep` returns -1 with the time left in `*remaining` when a signal handler ends
+  it early (Linux, macOS); `tss_get` of a deleted key is null and `tss_set` of one
+  `thrd_error`. A `thrd_create` and `thrd_join` take about the system threads' processor
+  time (stacks are reused, and threads wake one another only when one waits).
 - The test-only functions `__axiom_c_thread_start` and `__axiom_c_thread_join` (and the
   start-up `std/internal/runtime/c_threads.ax`) are gone: use `<threads.h>`.
 - The C library is safe to use from threads where the standard asks: `atexit`,
-  `at_quick_exit` and `getenv` now may be called from several threads at once.
+  `at_quick_exit` and `getenv` may be called from several threads at once.
 
 ## Standard library
 

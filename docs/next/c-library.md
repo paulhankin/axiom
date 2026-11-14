@@ -5,7 +5,7 @@
   freestanding implementation, with only the freestanding headers. The library has
   every header of C17 and C23:
   - its core: `<assert.h>`, `<ctype.h>`, `<errno.h>` (`errno` is each thread's),
-    `<setjmp.h>` (not on WebAssembly), `<signal.h>`, `<stdlib.h>` (correctly rounded
+    `<setjmp.h>` (on WebAssembly with the exception-handling extension), `<signal.h>`, `<stdlib.h>` (correctly rounded
     `strtod`, `strtof` and `strtold` in every `long double` format, decimal and
     hexadecimal; an introspective `qsort`; `malloc` on the Axiom allocator, or the system
     C library's heap where the program has it; `atexit`, `quick_exit`, `getenv`,

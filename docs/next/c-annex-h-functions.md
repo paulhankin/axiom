@@ -1,4 +1,4 @@
-## C library: Annex H's functions
+## C library
 
 - `<math.h>` declares every function of C23 Annex H.11.2 for `_Float16`, `_Float32`,
   `_Float64`, `_Float128`, `_Float32x` and `_Float64x` (with

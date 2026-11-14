@@ -8,7 +8,4 @@
   as the compiler's headers have them), the byte order, the processor extensions of `--cpu`
   and `--features` (`__SSE2__`, `__AVX2__`, `__ARM_NEON`, `__ARM_FEATURE_*`,
   `__wasm_simd128__` ...), `__OPTIMIZE__` and `__PIC__`. A program that defined some of them
-  with `-D` gets the same values; `-U` and `-D` still change them. Programs that include
-  intrinsics headers (`<immintrin.h>`, `<arm_neon.h>`) when such a macro is defined do not
-  build, the compiler having none: `-U__SSE2__` (or the macro they test) chooses their
-  portable code. No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`).
+  with `-D` gets the same values; `-U` and `-D` still change them. No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`).

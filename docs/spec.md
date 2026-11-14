@@ -44,7 +44,8 @@
 - An **unspecified value** is some bit pattern of the correct type, chosen by the
   implementation and possibly different between runs. Reading one is **not** undefined
   behavior, and a compiler MUST NOT assume it never happens. (This is the difference from
-  C's "indeterminate value" and LLVM's `poison`.)
+  C's "indeterminate value" and the poison values of compilers' intermediate
+  representations.)
 - **Implementation-defined** behavior is documented by each implementation and fixed
   for a given target (for example, the width of `usize`).
 - There is **no undefined behavior**. Every well-formed program has one meaning for each
@@ -2182,10 +2183,10 @@ std/hash/crc, with the portable code where they are absent.
 | `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB) with no access, so that reserving it costs no memory; its 64 KiB pages are committed (made read-write) as it grows, and `@memory_grow` fails when the system cannot commit them. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
-| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; not the bootstrap compiler. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
+| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; not the bootstrap compiler. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. C code, objects and `-l` libraries are linked by the compiler's own Mach-O linker (docs/c.md, "Objects and libraries"; its C output built and checked, not yet run on a Mac). Not yet supported: `axiom test` and `axiom profile` for this target |
 | `x86_64-macos` (also `x86_64-apple-darwin`) | 64 | An Intel Mac, macOS 11 or later; not the bootstrap compiler. As `aarch64-macos`, with the x86-64 System V calling convention. Builds; not yet run on a real system |
 | `aarch64-windows` (also `aarch64-pc-windows-msvc`) | 64 | Windows on ARM64; not the bootstrap compiler. As `x86_64-windows`, with the Windows ARM64 calling convention (AAPCS64, but every argument of a variadic function in `x0`-`x7` and then the stack, floating-point ones as their bits). `axiom test` and `axiom profile` run only on Windows on ARM64. Builds; not yet run on a real system |
-| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; not the bootstrap compiler. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Debug symbols (function names and line tables; with `-g` also types and variables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. Not yet supported: linking C code or `-l` libraries |
+| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; not the bootstrap compiler. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), on other systems under a Windows compatibility layer when one is installed. Debug symbols (function names and line tables; with `-g` also types and variables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. C code, objects and `-l` libraries are linked by the compiler's own PE linker (docs/c.md, "Objects and libraries") |
 
 Linux is the native operating system. `--target=native` on a Mac means
 `aarch64-macos` (or on an Intel Mac `x86_64-macos`), and on Windows `x86_64-windows`
@@ -2193,7 +2194,9 @@ Linux is the native operating system. `--target=native` on a Mac means
 so a Linux host can build Mac and Windows executables. On macOS for Apple silicon,
 variadic C arguments are passed on the stack (Apple's arm64 ABI); on an Intel Mac the
 calling convention is x86-64 System V's; on both a thread-local global (§12.8.6)
-lives in a per-thread block whose address is kept in a pthread key. On Windows,
+lives in a per-thread block whose address is kept in a pthread key (the default,
+`--macos-tls=fast`; `--macos-tls=platform`, which objects and libraries imply, uses the
+platform's thread-local variables instead, and has not yet been run: docs/cli.md). On Windows,
 every function uses the Windows x64 calling convention (four register arguments,
 shadow space, `rsi`, `rdi` and `xmm6`-`xmm15` preserved), or on ARM64 the Windows ARM64
 one, and thread-locals are the image's TLS directory. An `extern "C" "name"` block (§14.5.1) names the DLL its
@@ -2266,8 +2269,9 @@ extern "C" "m" {          // optional second string: a library to link (-lm)
   directly (§15.2).
 - On **WebAssembly** they link against C compiled for the same wasm target. C code
   and Axiom code share the linear memory, the stack and the function table, so
-  pointers mean the same thing on both sides. Freestanding wasm has no libc unless one
-  is linked, for example wasi-libc.
+  pointers mean the same thing on both sides. Freestanding wasm has no system C
+  library: C units built with the program have the compiler's own (docs/c.md, "The C
+  library").
 - `...` declares a **variadic** function. It is allowed only in `extern "C"`
   (`E0307`), and only after at least one fixed parameter. The variadic arguments
   undergo C's default argument promotions, and Axiom requires them to already have
@@ -2462,8 +2466,11 @@ The Axiom runtime uses no C library. It reaches the kernel through system calls
 (`std/internal/runtime/linux.ax`), starts threads with `clone` and sets up their thread-local
 storage itself, starts processes with `fork` and `execve` (searching `PATH` itself), and resolves host names from `/etc/hosts` and by DNS queries to the
 servers in `/etc/resolv.conf`. So a native program built by the toolchain
-is a static executable with no dynamic loader, unless it links C code or libraries,
-in which case it is linked against the C library as before.
+is a static executable with no dynamic loader, C code and the compiler's own C library
+included, unless it uses a shared library (the system's C library among them: a C
+function that neither the program nor the compiler's C library defines), in which case
+the compiler's linker links it dynamically against those (docs/c.md, "Objects and
+libraries").
 
 ---
 
@@ -2796,8 +2803,8 @@ compiler, build the same records without a shadow stack, and calls cost nothing:
   `axiom_rets`) that maps the return address of each call to its call-site record,
   followed by the records of the calls inlined around it: calls to `inline` functions
   and the ones the optimizer inlined. The compiler keeps them with each call as it
-  inlines; the bootstrap compiler takes them from the inlining information LLVM
-  keeps in its debug locations, and drops the debug information afterwards unless
+  inlines; the bootstrap compiler takes them from the inlining information its code
+  generator keeps in its debug locations, and drops the debug information afterwards unless
   `-g` asks for it. (Its x86-64 code gives a leaf function, whose only calls are traps,
   no frame: the table marks such functions, and the walk finds their return
   addresses on the stack.)

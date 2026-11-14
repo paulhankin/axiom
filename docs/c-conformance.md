@@ -87,7 +87,7 @@ Four checks cover whole clauses at once and are named below by these names:
 | 5.1.2.2.2 program execution | yes | `lib/*` |
 | 5.1.2.2.3 program termination (`main`'s return is `exit`'s) | yes | `lib/core/exit_reenter`, `lib/stdio/exit_flush` |
 | 5.1.2.3 program execution, side effects, sequence points | yes | `run/control`, `run/err_constexpr_volatile` |
-| 5.1.2.4 multi-threaded executions and data races | yes: sequentially consistent atomics, threads | `run/atomic_*`, `mix/stdio_threads`, `lib/threads/*` |
+| 5.1.2.4 multi-threaded executions and data races | yes: atomics with their memory orders, threads | `run/atomic_*`, `mix/stdio_threads`, `lib/threads/*` |
 | 5.2.1 character sets | yes: UTF-8 source and execution sets | `pp/*utf8*`, `run/char_wide_multi` |
 | 5.2.1.1 trigraph sequences (removed in C23) | yes | `pp/lex_trigraph_*` |
 | 5.2.1.2 multibyte characters | yes | `lib/text/mb_strings`, `lib/text/utf8_invalid` |
@@ -130,7 +130,7 @@ Every Constraints paragraph of this clause is in **constraints**, besides the te
 | 6.7 declarations | yes | `run/err_conflict_*`, `run/err_redef_*` |
 | 6.7.1 storage-class specifiers (C23 `constexpr`, `auto`) | yes | `run/err_storage_repeat`, `run/err_two_storage` |
 | 6.7.2 type specifiers (structures, enumerations, atomic, C23 fixed underlying types, `typeof`) | yes | `run/bitfields*`, `run/enum_c23*`, `run/atomic_*` |
-| 6.7.3 type qualifiers | yes; `restrict` accepted, not used by the code generator | `run/err_qual_*`, `run/array_quals_c23` |
+| 6.7.3 type qualifiers | yes; `restrict` used by the optimizer (`c.md`, "Optimization") | `run/err_qual_*`, `run/array_quals_c23` |
 | 6.7.4 function specifiers | yes | `run/err_inline_*`, `run/err_noreturn_main` |
 | 6.7.5 alignment specifier | yes (up to 4096) | `run/err_alignas_*` |
 | 6.7.6 declarators (arrays, VLAs, functions, K&R until C23) | yes | `run/err_vla_*`, `run/err_kr_*` |
@@ -150,7 +150,7 @@ Every Constraints paragraph of this clause is in **constraints**, besides the te
 | 6.10.3 (C23 6.10.5) macro replacement, `#`, `##`, `__VA_ARGS__`, `__VA_OPT__` | yes | `pp/macro*`, `pp/err_paste*`, `pp/err_va_*` |
 | 6.10.4 line control | yes | `pp/err_line_*`, `run/err_line_presumed` |
 | 6.10.5 error, C23 `#warning` | yes | `pp/err_error`, `pp/err_warning_c17` |
-| 6.10.6 pragma directive (`STDC` pragmas) | yes; `FENV_ACCESS ON` not honoured: deviation | `pp/pragma*` |
+| 6.10.6 pragma directive (`STDC` pragmas) | yes: `FP_CONTRACT`, `FENV_ACCESS`, `CX_LIMITED_RANGE`, C23's `FENV_ROUND` and `FENV_DEC_ROUND` | `pp/pragma*` |
 | 6.10.7 null directive | yes | `pp/*` |
 | 6.10.8 predefined macro names (with `__STDC_LIB_EXT1__`, `__STDC_HOSTED__`) | yes | `pp/err_define_predef`, `lib/ext1/c99`, **constraints** |
 | 6.10.9 pragma operator | yes | `pp/err_pragma_op*` |
@@ -169,17 +169,17 @@ Every header is in **names**; each row's tests are `cmd/axiom/internal/tests/c/l
 | 7.4 character handling `<ctype.h>` | yes | `core/ctype` |
 | 7.5 errors `<errno.h>` | yes (thread-local `errno`) | `core/errno`, `core/strerror_all` |
 | 7.6 floating-point environment `<fenv.h>` | yes on x86-64 and AArch64; WebAssembly has none | `math/math_fenv_*` |
-| 7.7 characteristics of floating types `<float.h>` | yes; `*_SNAN` not defined | **names** |
+| 7.7 characteristics of floating types `<float.h>` | yes (C23's `*_SNAN` too) | **names** |
 | 7.8 format conversion of integer types `<inttypes.h>` | yes | `text/inttypes` |
 | 7.9 alternative spellings `<iso646.h>` | yes | `pp/err_header_iso646_c89` |
 | 7.10 sizes of integer types `<limits.h>` | yes | **names** |
 | 7.11 localization `<locale.h>` | yes: "C", "POSIX", UTF-8 names, "" | `text/locale`, `text/collation` |
-| 7.12 mathematics `<math.h>` | yes but C23's `exp2m1` family, `iseqsig`, narrowing functions (the mathematics part's list in `c.md`) | `math/*` |
+| 7.12 mathematics `<math.h>` | yes, C23's functions included (`c.md`, "`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions") | `math/*` |
 | 7.13 nonlocal jumps `<setjmp.h>` | yes natively; WebAssembly `C3300` | `core/setjmp*` |
 | 7.14 signal handling `<signal.h>` | yes | `core/signal*` |
 | 7.15 alignment `<stdalign.h>` | yes | `run/alignas` |
 | 7.16 variable arguments `<stdarg.h>` (C23 one-argument `va_start`) | yes | `run/err_va_*`, `run/variadic*` |
-| 7.17 atomics `<stdatomic.h>` | yes (all orders sequentially consistent) | `run/atomic_*`, `run/err_stdatomic_*` |
+| 7.17 atomics `<stdatomic.h>` | yes, with the memory orders (`c.md`, "Atomics and threads") | `run/atomic_*`, `run/err_stdatomic_*` |
 | C23 7.18 bit and byte utilities `<stdbit.h>` | yes | `run/bi_stdbit` |
 | 7.18 (C23 7.19) boolean type `<stdbool.h>` | yes | `run/err_hdr_stdbool_c89` |
 | C23 7.20 checked integer arithmetic `<stdckdint.h>` | yes | `run/bi_ckdint` |

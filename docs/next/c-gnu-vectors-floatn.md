@@ -1,4 +1,4 @@
-## C front end
+## C
 
 - Vector types (`__attribute__((vector_size(n)))` and the vector modes) in the GNU
   dialects: the operators lane by lane, comparisons giving -1 and 0, a scalar with a
@@ -6,7 +6,11 @@
   condition, `__builtin_shuffle`, `__builtin_shufflevector` and
   `__builtin_convertvector`, from 2 to 4096 bytes of any integer or real floating
   lanes; generated with the target's vector instructions, and passed as each platform's
-  ABI says (but 32- and 64-byte vectors go in memory on x86-64 System V).
+  ABI says: on x86-64 System V, vectors of 32 bytes in `ymm` registers when AVX is
+  enabled (`--cpu=x86-64-v3`, `--features=+avx`) and of 64 bytes in `zmm` registers with
+  AVX-512F (else in memory), as the psABI has it, so that libraries taking `__m256` or
+  `__m512` values by value can be called (checked against the system's C compiler both
+  ways).
 - The interchange and extended floating types of C23 Annex H, in every mode:
   `_Float16`, `_Float32`, `_Float64`, `_Float128`, `_Float32x`, `_Float64x` (and
   `__float128` with the `q` suffix in a GNU dialect), their constants, conversions and

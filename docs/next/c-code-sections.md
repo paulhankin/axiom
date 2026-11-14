@@ -1,4 +1,4 @@
-## Objects and linking
+## Linking
 
 - A function's attribute `section` places its code in that section (ELF, Mach-O,
   COFF), with its frame table, debug information and Windows unwind information

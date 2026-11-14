@@ -66,7 +66,7 @@ its standard input is the profiler's.
 | Flag | |
 |---|---|
 | `--rate=<hz>` | Samples per second (default 999). |
-| `--folded=<path>` | Write folded stacks for `flamegraph.pl`, inferno or speedscope. |
+| `--folded=<path>` | Write folded stacks (one line per stack and its count), the format flame graph tools read. |
 
 ### `axiom fmt`
 
@@ -139,7 +139,9 @@ that lacks the extensions it was built with.
 | `--stack-traces=on\|off` | Record call sites for crash traces and profiles (default on; spec §16.4). |
 | `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). |
 | `--coverage=afl\|none` | Native Linux targets: edge coverage counters for a coverage-guided fuzzer, and its fork server (spec §16.9; default `none`). |
-| `-g`, `--debug-info=full\|lines\|none` | DWARF 5 debug information for debuggers and other tools (`-g` is `full`; default `none` at every optimization level: stack traces need none, and without it nothing is added). `lines`: a compile unit per object with a subprogram per function, line tables (C's `#line` followed; code inlined keeps its own lines), call frame information (`.debug_frame`) for every instruction; `full` adds the types, each function's result, parameters and locals in their lexical blocks, and the static objects and globals, for C and Axiom (locations at `-O0`, where every variable stays in its frame slot; at `-O1` and above, location lists for the variables assigned once and the parameters never assigned, and frame slots for the variables left in memory: never a wrong one, the others are "optimized out"). Axiom's types: integers, floats, bool, pointers, arrays, slices (a structure of `ptr` and `len`), structures, enumerations, unions (a tag and a DWARF variant part), error unions (`error`, `value`), function types; functions named `module.function` (an exported one by its own name), the units' language C11's (0x1d: debuggers evaluate Axiom's names, structures, slices and arithmetic under it, and one that knows no other code shows no variables otherwise; the producer, `axiom <version>`, names Axiom), or with `--debug-language=axiom` Axiom's own code of DWARF's user range (0x8a78). The instructions are the same with and without it: an object's code and relocations are identical, while in an executable the frame table's line rows (for crash traces) move the data after them, and with it the addresses instructions hold. ELF targets: in the executable or object; macOS: in `<out>.dSYM`; WebAssembly: `.debug_*` custom sections (code-section offsets); Windows: the PDB (`--pdb`) has the line tables either way, and with `full` the types and variables in CodeView form. See [debugging](c.md#debugging). (The bootstrap compiler's LLVM backend writes line tables for `-g`.) |
+| `-g`, `--debug-info=full\|lines\|none` | DWARF 5 debug information for debuggers and other tools (`-g` is `full`; default `none` at every optimization level: stack traces need none, and without it nothing is added). `lines`: a compile unit per object with a subprogram per function, line tables (C's `#line` followed; code inlined keeps its own lines), call frame information (`.debug_frame`) for every instruction; `full` adds the types, each function's result, parameters and locals in their lexical blocks, and the static objects and globals, for C and Axiom (locations at `-O0`, where every variable stays in its frame slot; at `-O1` and above, location lists that follow each variable through its assignments, and frame slots for the variables left in memory: never a wrong one, the others are "optimized out"). Axiom's types: integers, floats, bool, pointers, arrays, slices (a structure of `ptr` and `len`), structures, enumerations, unions (a tag and a DWARF variant part), error unions (`error`, `value`), function types; functions named `module.function` (an exported one by its own name), the units' language C11's (0x1d: debuggers evaluate Axiom's names, structures, slices and arithmetic under it, and one that knows no other code shows no variables otherwise; the producer, `axiom <version>`, names Axiom), or with `--debug-language=axiom` Axiom's own code of DWARF's user range (0x8a78). The instructions are the same with and without it: an object's code and relocations are identical, while in an executable the frame table's line rows (for crash traces) move the data after them, and with it the addresses instructions hold. ELF targets: in the executable or object; macOS: in `<out>.dSYM`; WebAssembly: `.debug_*` custom sections (code-section offsets); Windows: the PDB (`--pdb`) has the line tables either way, and with `full` the types and variables in CodeView form. See [debugging](c.md#debugging). (The bootstrap compiler writes line tables for `-g`.) |
+| `--debug-macros=on\|off` | With `-g`: C's macros in the debug information (`.debug_macro`; default `on`). |
+| `--debug-language=c\|axiom` | With `-g`: an Axiom program's units marked as C11 (`c`, the default), which debuggers read, or with Axiom's own language code (`axiom`). |
 | `--release` | Accepted for compatibility; changes nothing. |
 | `--units=module\|program` | Compile modules separately and cache them, or the program as one unit (default: `module` at `-O0`/`-O1`, `program` at `-O2`/`-O3`). |
 | `--verbose` | Report the modules compiled and taken from the cache, and evictions. |
@@ -149,27 +151,40 @@ that lacks the extensions it was built with.
 | Option | |
 |---|---|
 | `-o <out>` | The output file. |
-| `--emit=exe\|obj\|lib\|shared\|ir\|asm` | An executable (or `.wasm` module), one object file (ELF, Mach-O or COFF: the target's format), a static library of it (and of the objects among the inputs), a shared library of C units (an ELF `.so`, a Mach-O `.dylib` or a DLL: [`docs/c.md`](c.md), "Shared libraries"), the compiler's IR as text, or assembly. |
+| `--emit=exe\|obj\|lib\|shared\|ir` | An executable (or `.wasm` module), one object file (ELF, Mach-O or COFF: the target's format), a static library of it (and of the objects among the inputs), a shared library of C units (an ELF `.so`, a Mach-O `.dylib` or a DLL: [`docs/c.md`](c.md), "Shared libraries"), or the compiler's IR as text. `--emit=asm` is an error: there is no assembly output (use `--emit=obj` and a disassembler, or `--emit=ir`). |
 | `--pic` | Code for a shared library made by another linker: on Linux, thread-locals use the initial-exec model (`--emit=shared` implies it; the rest of the code is position-independent already). |
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 
 ### C sources
 
-Options for `axiom build` and `axiom check` with `.c` inputs, which are compiled by the
-compiler's own C front end ([`docs/c.md`](c.md)). They are errors with Axiom inputs.
+Options for `axiom build` and `axiom check` with C sources (`.c`, and assembly sources
+`.s` and `.S`), which are compiled by the compiler's own C front end
+([`docs/c.md`](c.md), "C options"). They are errors with Axiom inputs.
 
 | Option | |
 |---|---|
-| `--c-std=<std>` | `c89` (`c90`), `c95`, `c99`, `c11`, `c17` (`c18`) or `c23`; default `c17`. |
+| `--c-std=<std>` | `c89` (`c90`), `c95`, `c99`, `c11`, `c17` (`c18`) or `c23`, the `iso9899:` names of those, or a GNU dialect `gnu89` (`gnu90`), `gnu99`, `gnu11`, `gnu17` (`gnu18`), `gnu23`; default `c17`. |
 | `--c-char=signed\|unsigned` | Whether plain `char` is signed (default: the target's C ABI). |
 | `--c-int=16\|32\|64` | The width of `int` (default 32). |
-| `--c-long=32\|64` | The width of `long` (default: the target's C ABI). |
-| `-D<name>[=<value>]`, `-U<name>` | Define or undefine a macro. |
-| `-I<dir>` | An include directory. |
+| `--c-long=32\|64` | The width of `long` (default: the target's C ABI; at least `--c-int`). |
+| `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI): `80` on x86-64 Linux and macOS only, `128` there, on AArch64 Linux and WebAssembly. |
+| `-D<name>[=<value>]`, `-U<name>` | Define or undefine a macro (`-D name` and `-U name` too). |
+| `-A<pred>=<answer>`, `-A<pred>(<answer>)`, `-A-<pred>[=<answer>]`, `-A-` | A GNU dialect's assertion (`#assert`), or its removal; an error under an ISO standard. |
+| `-I<dir>` | An include directory (`-I dir` too). `-D`, `-U`, `-A` and `-I` apply in the order given. |
+| `--c-asm-dialect=att\|intel` | The syntax of x86-64 asm statements, file-scope asm and assembly sources (default `att`). |
+| `--c-fenv-access` | Every function as under `#pragma STDC FENV_ACCESS ON`. |
+| `--c-keep-null-checks` | Keep the tests against null of pointers that `nonnull`, `returns_nonnull` or `[static n]` say are not null. |
+| `--c-warn-format=0\|1\|2` | The checks of format strings: none, the clear errors (the default), or also what is suspect. |
+| `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111`. |
+| `--c-freestanding` | A freestanding program: no C library is linked, and only the freestanding headers are found. |
+| `--c-lib=axiom\|system` | The program's C library: the compiler's (the default) or the system's, whose headers are then the hosted headers (native targets). |
+| `--c-system-include=<dir>` | With `--c-lib=system`: a directory of the system's headers (required for macOS and Windows targets). |
 | `--emit=c-pp\|c-tokens\|c-ast` | The preprocessed text, the tokens, or the syntax tree, of one source. |
 
-| `--c-freestanding` | Link no C library into the program. |
+The summary `axiom` prints with no arguments lists most of these; `--c-freestanding`,
+`--c-lib`, `--c-system-include`, `--c-warn-format`, `--c-warn-unknown-pragmas` and `-A`
+are accepted though it does not show them.
 
 With C sources, `--emit=obj` and `--emit=ir` of units that define no `main` give their
 code alone. `--overflow`, `--sanitize`, `--coverage`, `--units` and `--emit-header` are
@@ -183,23 +198,27 @@ its C sources with `c-sources = "dir"`.
 
 | Option | |
 |---|---|
-| `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). C sources are compiled with `cc`. The compiler's own linkers link them, on every target ([`docs/c.md`](c.md), "Objects and libraries"). |
+| `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). A C source is compiled first: for Linux by the system's C compiler (`cc`, or the cross compiler for the target), for macOS and Windows by this compiler, for WebAssembly by `clang`. The compiler's own linkers link the objects and libraries, on every target ([`docs/c.md`](c.md), "Objects and libraries"). |
 | `-l<lib>`, `-L<dir>` | A library to link and a directory to search before the system's: on Linux `lib<lib>.so`, else `lib<lib>.a`; on macOS `lib<lib>.a`, else `lib<lib>.dylib`, else bound by name; on Windows `<lib>.lib`, `lib<lib>.a`, `lib<lib>.dll.a` or `<lib>.dll` in the `-L` directories. |
 | `-I<dir>` | An include directory, for C sources given with `--link` and for the C front end's inputs. |
+| `--function-sections`, `--data-sections` | Native targets: each function, each datum in a section of its own ([`docs/c.md`](c.md), "Code in sections"). |
+| `--gc-sections`, `--no-gc-sections` | Native targets: the compiler's linkers leave out the sections of the linked objects and archives that nothing refers to (default: they keep them). |
 
-Programs for native targets that link no C code are linked by the compiler's own
-linkers and are static executables; with C code or `-l` the system's `cc` links them.
+Programs for native targets are linked by the compiler's own linkers, with the objects
+and libraries they are given; one that uses no shared library (on Linux, none of the
+system's C library either) is a static executable. A WebAssembly program whose
+`extern "C"` blocks name libraries is linked by `wasm-ld`.
 
-### Windows
+### Platforms
 
 | Option | |
 |---|---|
-| `--subsystem=console\|windows` | A console program (default) or a GUI one, for `--target=x86_64-windows`. |
-| `--pdb=on\|off` | Debug symbols in `<out>.pdb` (default on). |
-| `--icon=<file.ico>` | The program's icon. |
-| `--macos-tls=fast\|platform` | macOS thread-locals: `fast` (the default) is the runtime's per-thread block, found through a TSD slot, about five instructions an access, as has run on Macs; `platform` is the platform's thread-local variables (descriptors in `__thread_vars` whose thunk dyld provides), which interoperate with the platform's objects and libraries and which every thread has, but which have **never been executed** (built and checked only), assume what the thunk preserves (arm64: all but x0, x16, x17, lr and the flags; x86-64: all but rax, rdi and the flags), cost about 14 instructions and a call an access, and cannot be unwound past a frameless function while the thunk runs. `--emit=obj`, `lib` and `shared` imply `platform`; code of one scheme reaching the other's variable is a link error. The default may change once `platform` has run on a Mac ([`docs/c.md`](c.md), "Atomics and threads"). |
-| `--unwind-tables=on\|off` | Linux: call frame information (`.eh_frame`) for every function the compiler makes and for the linker's stubs, which the platform's unwinder walks by (default `on`). With `off` there is none (and no `.eh_frame_hdr`, unless objects of other compilers bring FDEs): the program is smaller (about 9% for one that prints a line, 2% for the compiler), and its own stack traces are the same (they walk the frame pointers and the frame tables), but the system's unwinder cannot pass through this compiler's frames: a backtrace of the system's library stops at them, and another language's exceptions cannot be thrown through them. `-g`'s `.debug_frame` is there either way ([`docs/c.md`](c.md), "Objects and libraries"). |
-| `--stack-size=<n>[K\|M\|G]` | The main thread's stack, in bytes (any target): on Windows the image's stack reserve (default 8 MiB; 64 KiB committed at first), which the program's threads get too; on macOS `LC_MAIN`'s stack size (default: the system's 8 MiB); on WebAssembly the stack in linear memory (default 1 MiB). On Linux the main thread's stack is the system's limit (`ulimit -s`) and the option has no effect. |
+| `--subsystem=console\|windows` | Windows: a console program (default) or a GUI one. |
+| `--pdb=on\|off` | Windows: debug symbols in `<out>.pdb` (default on). |
+| `--icon=<file.ico>` | Windows: the program's icon. |
+| `--macos-tls=fast\|platform` | macOS thread-locals: `fast` (the default) is the runtime's per-thread block, found through a TSD slot, about five instructions an access, as Axiom programs have run on Macs; `platform` is the platform's thread-local variables (descriptors in `__thread_vars` whose thunk the platform's dynamic linker provides), which interoperate with the platform's objects and libraries and which every thread has, but which have **never been executed** (built and checked only), assume what the thunk preserves (arm64: all but x0, x16, x17, lr and the flags; x86-64: all but rax, rdi and the flags), cost about 14 instructions and a call an access, and cannot be unwound past a frameless function while the thunk runs. `--emit=obj`, `lib` and `shared` imply `platform`; code of one scheme reaching the other's variable is a link error. The default may change once `platform` has run on a Mac ([`docs/c.md`](c.md), "Atomics and threads"). |
+| `--unwind-tables=on\|off` | Linux: call frame information (`.eh_frame`) for every function the compiler makes and for the linker's stubs, which the platform's unwinder walks by (default `on`). With `off` there is none (and no `.eh_frame_hdr`, unless objects of the platform's compilers bring FDEs): the program is smaller (about 9% for one that prints a line, 2% for the compiler), and its own stack traces are the same (they walk the frame pointers and the frame tables), but the system's unwinder cannot pass through this compiler's frames: a backtrace of the system's library stops at them, and another language's exceptions cannot be thrown through them. `-g`'s `.debug_frame` is there either way ([`docs/c.md`](c.md), "Objects and libraries"). |
+| `--stack-size=<n>[K\|M\|G]` | The main thread's stack, in bytes (any target): on Windows the image's stack reserve (default 8 MiB; 64 KiB committed at first; the threads of `std/thread` and `thrd_create` have 8 MiB whatever it says); on macOS `LC_MAIN`'s stack size (default: the system's 8 MiB); on WebAssembly the stack in linear memory (default 1 MiB). On Linux the main thread's stack is the system's limit (`ulimit -s`) and the option has no effect. |
 
 ### The standard library
 

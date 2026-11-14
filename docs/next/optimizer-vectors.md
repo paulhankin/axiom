@@ -1,4 +1,4 @@
-## Optimizer
+## Compiler
 
 - Loops that copy or fill consecutive elements become `memmove`, `memcpy` (C's
   `restrict`, or two distinct objects) and `memset` at `-O1` and above; on x86-64 such

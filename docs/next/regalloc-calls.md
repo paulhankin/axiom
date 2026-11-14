@@ -1,4 +1,4 @@
-## Code generation
+## Compiler
 
 - Register allocation around calls: a value live across a call only on a
   seldom-taken path is kept in memory across that call instead of taking a
