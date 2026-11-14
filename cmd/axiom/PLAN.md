@@ -21,7 +21,7 @@ parity check in the test suite can be widened once item 6 lands.
 | 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke (done: see §4) |
 | 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags |
-| 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` |
+| 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` (done: see §6) |
 
 ### Recommended order
 
@@ -741,6 +741,30 @@ Apply the **leaf context + pure pass** pattern (the same pattern `ast.ax`,
 ---
 
 ## 6. DWARF `.debug_line` (and `.eh_frame`) on ELF and Mach-O
+
+### Status
+
+Done before this plan's items were started; the "Current state" below describes an
+older compiler. `dwarf.ax` writes DWARF 5 for every native target with `-g`:
+`.debug_info` (compilation units, subprograms, lexical blocks, variables with
+location expressions and lists), `.debug_line` and `.debug_line_str`,
+`.debug_rnglists`, `.debug_loclists`, `.debug_str`, `.debug_aranges`, `.debug_names` and
+`.debug_frame`. Each function has an FDE in `.eh_frame` on ELF (and the linker
+makes `.eh_frame_hdr`, `--unwind-tables=on|off`); macOS gets a `.dSYM` bundle next to
+the executable. Both backends record source lines (`MInst.src`), and item 2's
+`--gc-sections` gives the entries of dropped code the tombstone value.
+
+Checked against this plan's invariants:
+
+- Without `-g`, executables have no debug sections; with it, two builds of the same
+  source give the same bytes (x86-64 and AArch64 Linux, -O0 and -O2).
+- Addresses in a program's functions map to their `.ax` file and line through the
+  line table (by a system line-table reader on x86-64 and the line program's
+  dump on AArch64); the suite's own reader, `cmd/axiom/internal/tests/dwarf.mjs`,
+  checks every unit, subprogram, line sequence, FDE and call return address of the
+  `-g` tests (`tests/debug/`) on each target, without any system tool.
+
+Nothing of this item remains.
 
 ### Current state
 
