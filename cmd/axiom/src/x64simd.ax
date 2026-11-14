@@ -1,0 +1,3230 @@
+// =============================================================================
+// x64simd.ax - x86-64 instruction selection for floating point and vectors:
+// SSE scalar and packed arithmetic, the float intrinsics, and SSE2 to
+// AVX-512 vector operations, masks (k registers), lane insertion and
+// extraction, splats and shuffles (constant shuffles that are one
+// instruction, whole-width permutes), conversions, masked loads and stores.
+// The queries codegen.ax makes of these are x64caps.ax's.
+// =============================================================================
+import "bin.ax" as bn;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "mach.ax" as mc;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "vsplit.ax" as vs;
+import "x64caps.ax" as x64c;
+import "x64ctx.ax" as xc;
+import "x64emit.ax" as em;
+import "x64enc.ax" as xe;
+import "x64sel.ax" as xsl;
+
+// -----------------------------------------------------------------------------
+// Floating point
+// -----------------------------------------------------------------------------
+// Unary SSE op d = op(s) (scalar forms merge into d's upper lanes, which we
+// do not care about).
+// With AVX the merge source (VEX.vvvv) is s itself when s is a register;
+// otherwise a zero register (the block's, shared), so that the result does
+// not depend on whatever d held before.
+pub fn sse_unary(id: i32, d: i32, s: mc.MOp) void {
+    if xc.FN.avx {
+        let mut vv: i32 = 0;
+        if s.kind == mc.K_REG {
+            vv = s.reg;
+        } else {
+            vv = scalar_zero();
+        }
+        _ = xsl.sse4(id, 0, xsl.W(d), s, xsl.R(vv), xsl.NONE());
+        return;
+    }
+    // (which merges into d's upper lanes: d is s's copy, or zeroed, rather
+    // than waiting for d's previous value)
+    if s.kind == mc.K_REG {
+        xsl.copy(d, s.reg, xsl.XMM);
+        _ = xsl.sse2(id, xsl.RW(d), xsl.R(d));
+        return;
+    }
+    xsl.vzero(d);
+    _ = xsl.sse2(id, xsl.RW(d), s);
+}
+
+// d = r converted to floating point (signed, or with AVX-512 unsigned). The
+// instruction merges into d's upper lanes: with AVX the merge source is a
+// zero register (the block's, shared by its conversions), without it d
+// itself, zeroed first; either breaks the dependency on d's previous value.
+pub fn cvt_si2f(d: i32, r: i32, is64int: bool, single: bool) void {
+    cvt_i2f(d, r, is64int, single, false);
+}
+
+pub fn cvt_i2f(d: i32, r: i32, is64int: bool, single: bool, unsigned: bool) void {
+    let mut id = xe.CVTSI2SD;
+    if single {
+        id = xe.CVTSI2SS;
+    }
+    if unsigned {
+        id = xe.VCVTUSI2SD;
+        if single {
+            id = xe.VCVTUSI2SS;
+        }
+    }
+    let mut z: i32 = -1;
+    if xc.FN.avx {
+        z = scalar_zero();
+    } else {
+        xsl.vzero(d);
+    }
+    let i = xsl.sse2(id, xsl.W(d), xsl.R(r));
+    if is64int {
+        i.sz = 8;
+    }
+    if xc.FN.avx {
+        i.ops[2] = xsl.R(z);
+    } else {
+        i.ops[0] = xsl.RW(d);
+    }
+}
+
+// A zero xmm register for the merge source of a scalar operation (the
+// block's cached one).
+fn scalar_zero() i32 {
+    let wl = xsl.S.vl;
+    xsl.S.vl = 0;
+    let z = xsl.const_zero();
+    xsl.S.vl = wl;
+    return z;
+}
+
+pub fn pow2f(k: u32) f64 {
+    return @bit_cast(f64, @as(u64, 1023 + k) << 52);
+}
+
+pub fn fconst_reg(x: f64, single: bool) i32 {
+    let r = xsl.vxmm();
+    if single {
+        _ = xsl.sse2(xe.MOVSS_LD, xsl.W(r), xsl.const16(@as(u64, ir.f32_bits(x)), 0));
+    } else {
+        _ = xsl.sse2(xe.MOVSD_LD, xsl.W(r), xsl.const16(@bit_cast(u64, x), 0));
+    }
+    return r;
+}
+
+pub fn gen_fbin(v: *mut ir.Value) void {
+    let d = xsl.vreg(v);
+    let mut a: i32 = 0;
+    let b = xsl.vsrc_of(v, &mut a);
+    xsl.sse3(xsl.fop(v.op, is.is_f32(v.ty), v.ty.kind == ir.T_VEC), d, a, b);
+}
+
+// sign-bit masks
+fn sign_mask(single: bool) mc.MOp {
+    if single {
+        return xsl.const16(0x8000_0000_8000_0000, 0x8000_0000_8000_0000);
+    }
+    return xsl.const16(0x8000_0000_0000_0000, 0x8000_0000_0000_0000);
+}
+
+fn abs_mask(single: bool) mc.MOp {
+    if single {
+        return xsl.const16(0x7fff_ffff_7fff_ffff, 0x7fff_ffff_7fff_ffff);
+    }
+    return xsl.const16(0x7fff_ffff_ffff_ffff, 0x7fff_ffff_ffff_ffff);
+}
+
+pub fn gen_fneg(v: *mut ir.Value) void {
+    let d = xsl.vreg(v);
+    let a = xsl.reg(v.a);
+    let single = is.is_f32(v.ty);
+    let mut op = xe.XORPD;
+    if single {
+        op = xe.XORPS;
+    }
+    xsl.sse3(op, d, a, sign_mask(single));
+}
+
+// IEEE minimum / maximum: or / and of both operand orders gives the right
+// signed zero; NaN inputs are forced through with an unordered mask.
+fn gen_fminmax(d: i32, a: i32, b: i32, is_min: bool, single: bool, vec: bool) void {
+    let k = u.pick(single, "\x00", "\x01")[0];
+    let mut kk: i32 = @as(i32, k);
+    if vec {
+        kk += 2;
+    }
+    let mut mn = xe.MINSS + kk;
+    if not is_min {
+        mn = xe.MAXSS + kk;
+    }
+    let m1 = xsl.vxmm();
+    let m2 = xsl.vxmm();
+    xsl.sse3(mn, m1, a, xsl.R(b));
+    xsl.sse3(mn, m2, b, xsl.R(a));
+    let mut orp = xe.ORPD;
+    let mut andp = xe.ANDPD;
+    let mut cmp = xe.CMPSD;
+    let mut add = xe.ADDSD;
+    if single {
+        orp = xe.ORPS;
+        andp = xe.ANDPS;
+    }
+    if vec and single {
+        cmp = xe.CMPPS;
+        add = xe.ADDPS;
+    } else if vec {
+        cmp = xe.CMPPD;
+        add = xe.ADDPD;
+    } else if single {
+        cmp = xe.CMPSS;
+        add = xe.ADDSS;
+    }
+    if is_min {
+        xsl.sse3(orp, d, m1, xsl.R(m2));
+        return;
+    }
+    let r = xsl.vxmm();
+    xsl.sse3(andp, r, m1, xsl.R(m2));
+    let un = xsl.vxmm();
+    vcmp_i(cmp, un, a, xsl.R(b), 3, 2 + @as(i32, k));  // unordered
+    let s = xsl.vxmm();
+    xsl.sse3(add, s, a, xsl.R(b));
+    let n = xsl.vxmm();
+    xsl.sse3(andp, n, un, xsl.R(s));
+    xsl.sse3(orp, d, r, xsl.R(n));
+}
+
+// Rounding without SSE4.1: values of magnitude 2^52 (2^23) and above, and
+// NaNs, are already integers; smaller ones go through an integer conversion
+// (truncation, then adjusted for floor / ceil) or, for ties-to-even, the
+// addition and subtraction of 2^52. The sign is copied back (-0.5 -> -0).
+fn round_sse2(d: i32, a: i32, id: i32, single: bool) void {
+    let mut andp = xe.ANDPD;
+    let mut orp = xe.ORPD;
+    let mut cmp = xe.UCOMISD;
+    let mut add = xe.ADDSD;
+    let mut sub = xe.SUBSD;
+    let mut cvt = xe.CVTTSD2SI;
+    let mut big = pow2f(52);
+    if single {
+        andp = xe.ANDPS;
+        orp = xe.ORPS;
+        cmp = xe.UCOMISS;
+        add = xe.ADDSS;
+        sub = xe.SUBSS;
+        cvt = xe.CVTTSS2SI;
+        big = pow2f(23);
+    }
+    let done = xsl.new_label();
+    xsl.copy(d, a, xsl.XMM);
+    let ab = xsl.vxmm();
+    xsl.sse3(andp, ab, a, abs_mask(single));
+    let lim = fconst_reg(big, single);
+    _ = xsl.sse2(cmp, xsl.R(ab), xsl.R(lim));
+    xsl.jcc(xe.CC_AE, done);  // large, or unordered (CF set)
+    xsl.jcc(xe.CC_P, done);
+    let r = xsl.vxmm();
+    if id == ir.IN_NEAREST {
+        let t = xsl.vxmm();
+        xsl.sse3(add, t, ab, xsl.R(lim));
+        xsl.sse3(sub, r, t, xsl.R(lim));
+    } else {
+        let i = xsl.vgpr();
+        let c = xsl.sse2(cvt, xsl.W(i), xsl.R(a));
+        c.sz = 8;
+        cvt_si2f(r, i, true, single);
+        if (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) {
+            // floor: r > a -> r - 1; ceil: r < a -> r + 1
+            let one = fconst_reg(1.0, single);
+            let skip = xsl.new_label();
+            if id == ir.IN_FLOOR {
+                _ = xsl.sse2(cmp, xsl.R(r), xsl.R(a));
+                xsl.jcc(xe.CC_BE, skip);
+                xsl.sse3(sub, r, r, xsl.R(one));
+            } else {
+                _ = xsl.sse2(cmp, xsl.R(a), xsl.R(r));
+                xsl.jcc(xe.CC_BE, skip);
+                xsl.sse3(add, r, r, xsl.R(one));
+            }
+            xsl.place(skip);
+        }
+        let ra = xsl.vxmm();
+        xsl.sse3(andp, ra, r, abs_mask(single));
+        xsl.copy(r, ra, xsl.XMM);
+    }
+    // the magnitude of r with the sign of a
+    let sg = xsl.vxmm();
+    xsl.sse3(andp, sg, a, sign_mask(single));
+    let res = xsl.vxmm();
+    xsl.sse3(orp, res, r, xsl.R(sg));
+    let m = xsl.sse2(xe.MOVAPS, xsl.RW(d), xsl.R(res));
+    _ = m;
+    xsl.place(done);
+}
+
+fn round_imm(id: i32) i64 {
+    if id == ir.IN_FLOOR {
+        return 9;
+    }
+    if id == ir.IN_CEIL {
+        return 10;
+    }
+    if id == ir.IN_FTRUNC {
+        return 11;
+    }
+    return 8;
+}
+
+pub fn gen_float_intr(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let vec = t.kind == ir.T_VEC;
+    let single = is.is_f32(t);
+    let d = xsl.vreg(v);
+    let mut a: i32 = -1;
+    if not xsl.bcast_splat(v.xs.get(0)) {
+        a = xsl.reg(v.xs.get(0));
+    }
+    let mut kk: i32 = 1;
+    if vec and single {
+        kk = 2;
+    } else if vec {
+        kk = 3;
+    } else if single {
+        kk = 0;
+    }
+    if id == ir.IN_FABS {
+        let mut op = xe.ANDPD;
+        if single {
+            op = xe.ANDPS;
+        }
+        xsl.sse3(op, d, a, abs_mask(single));
+        return;
+    }
+    if id == ir.IN_SQRT {
+        if vec {
+            xsl.sse_unary_packed(xe.SQRTSS + kk, d, xsl.R(a));
+        } else {
+            sse_unary(xe.SQRTSS + kk, d, xsl.R(a));
+        }
+        return;
+    }
+    if (id == ir.IN_FMIN) or (id == ir.IN_FMAX) {
+        gen_fminmax(d, a, xsl.reg(v.xs.get(1)), id == ir.IN_FMIN, single, vec);
+        return;
+    }
+    if id == ir.IN_COPYSIGN {
+        let b = xsl.reg(v.xs.get(1));
+        let mut andp = xe.ANDPD;
+        let mut orp = xe.ORPD;
+        if single {
+            andp = xe.ANDPS;
+            orp = xe.ORPS;
+        }
+        let x = xsl.vxmm();
+        let y = xsl.vxmm();
+        xsl.sse3(andp, x, a, abs_mask(single));
+        xsl.sse3(andp, y, b, sign_mask(single));
+        xsl.sse3(orp, d, x, xsl.R(y));
+        return;
+    }
+    if ((id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST)) and
+       not x64c.has41() and not vec {
+        round_sse2(d, a, id, single);
+        return;
+    }
+    if (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST) {
+        let mut op = xe.ROUNDSD;
+        if vec and single {
+            op = xe.ROUNDPS;
+        } else if vec {
+            op = xe.ROUNDPD;
+        } else if single {
+            op = xe.ROUNDSS;
+        }
+        if xsl.S.vl == 64 {
+            let mut rs = xe.VRNDSCALEPD;
+            if single {
+                rs = xe.VRNDSCALEPS;
+            }
+            _ = xsl.sse_i(rs, xsl.W(d), xsl.R(a), round_imm(id));
+        } else if xc.FN.avx and not vec {
+            // (the scalar form merges vvvv's upper lanes; the packed one
+            // reads no vvvv, which must then be 1111)
+            _ = xsl.sse4(op, 0, xsl.W(d), xsl.R(a), xsl.R(a), xsl.I(round_imm(id)));
+        } else {
+            _ = xsl.sse_i(op, xsl.W(d), xsl.R(a), round_imm(id));
+        }
+        return;
+    }
+    if id == ir.IN_FMA {
+        // d = a * b + c: vfmadd231 d(=c) += a * b (a splat of a load as
+        // b, an embedded broadcast)
+        let mut b = xsl.R(0);
+        let mut bc = false;
+        let mut x0 = v.xs.get(0);
+        let mut x1 = v.xs.get(1);
+        let mut x2 = v.xs.get(2);
+        let mut neg_c = false;
+        let mut neg_p = false;
+        if xsl.fm_neg(x2) {
+            x2 = x2.a;  // a * b - c: vfmsub231
+            neg_c = true;
+        } else if xsl.fm_neg(x0) {
+            x0 = x0.a;  // c - a * b: vfnmadd231
+            neg_p = true;
+        } else if xsl.fm_neg(x1) {
+            x1 = x1.a;
+            neg_p = true;
+        }
+        if neg_c or neg_p {
+            a = xsl.reg(x0);
+        }
+        if xsl.bcast_splat(x0) or xsl.bcast_splat(x1) {
+            let s = pick_val(xsl.bcast_splat(x0), x0, x1);
+            a = xsl.reg(pick_val(xsl.bcast_splat(x0), x1, x0));
+            b = xsl.addr(s.a.a);
+            bc = true;
+        } else if ir.is_op(x0, ir.OP_LOAD) and ((x0.flag & 8) != 0) {
+            a = xsl.reg(x1);
+            b = xsl.vsrc(x0);
+        } else {
+            b = xsl.vsrc(x1);
+        }
+        let c = xsl.reg(x2);
+        xsl.copy(d, c, xsl.vclass());
+        let mut op = xe.VFMADD231SD;
+        if vec and single {
+            op = xe.VFMADD231PS;
+        } else if vec {
+            op = xe.VFMADD231PD;
+        } else if single {
+            op = xe.VFMADD231SS;
+        }
+        if neg_c {
+            op = xe.VFMSUB231SD;
+            if single {
+                op = xe.VFMSUB231SS;
+            }
+        } else if neg_p {
+            op = xe.VFNMADD231SD;
+            if single {
+                op = xe.VFNMADD231SS;
+            }
+        }
+        let i = xsl.vlz(xsl.sse4(op, 0, xsl.RW(d), b, xsl.R(a), xsl.NONE()));
+        if bc {
+            i.aux = i.aux | 16;
+        }
+        return;
+    }
+    em.fail(u.f1("float intrinsic %s", u.idec(id)));
+}
+
+// -----------------------------------------------------------------------------
+// Vectors
+// -----------------------------------------------------------------------------
+// AES rounds, carry-less multiply, SHA-1/SHA-256 steps, CRC-32C.
+pub fn gen_insn(v: *mut ir.Value, id: i32) void {
+    let d = xsl.vreg(v);
+    let a = xsl.reg(v.xs.get(0));
+    if id == ir.IN_CRC32C {
+        let x = v.xs.get(1);
+        xsl.copy(d, a, xsl.GPR);
+        let i = xsl.e2(xe.CRC32, @truncate(u8, x.ty.size), xsl.RW(d), xsl.R(xsl.reg(x)));
+        _ = i;
+        return;
+    }
+    if (id >= ir.IN_AESENC) and (id <= ir.IN_AESDECLAST) {
+        xsl.sse3(xe.AESENC + (id - ir.IN_AESENC), d, a, xsl.R(xsl.reg(v.xs.get(1))));
+        return;
+    }
+    if id == ir.IN_AESIMC {
+        xsl.sse_unary_packed(xe.AESIMC, d, xsl.R(a));
+        return;
+    }
+    if id == ir.IN_AESKEYGEN {
+        _ = xsl.sse_i(xe.AESKEYGEN, xsl.W(d), xsl.R(a), is.cval(v.xs.get(1)));
+        return;
+    }
+    if id == ir.IN_CLMUL {
+        xsl.sse3_i(xe.PCLMULQDQ, d, a, xsl.R(xsl.reg(v.xs.get(1))), is.cval(v.xs.get(2)));
+        return;
+    }
+    // SHA-NI: two-operand, destructive (no VEX form)
+    let b = xsl.reg(v.xs.get(1));
+    let mut t = xsl.vxmm();
+    if b == d {
+        t = xsl.vxmm();
+    }
+    xsl.copy(t, a, xsl.XMM);
+    if id == ir.IN_SHA256RNDS2 {
+        let k = xsl.reg(v.xs.get(2));
+        xsl.copy(xe.XMM0, k, xsl.XMM);
+        _ = xsl.sse4(xe.SHA256RNDS2, 0, xsl.RW(t), xsl.R(b), xsl.R(xe.XMM0), xsl.NONE());  // (xmm0 read implicitly)
+    } else if id == ir.IN_SHA1RNDS4 {
+        _ = xsl.sse4(xe.SHA1RNDS4, 0, xsl.RW(t), xsl.R(b), xsl.NONE(), xsl.I(is.cval(v.xs.get(2))));
+    } else {
+        let ids: [5]i32 = [xe.SHA1NEXTE, xe.SHA1MSG1, xe.SHA1MSG2, xe.SHA256MSG1, xe.SHA256MSG2];
+        let ins: [5]i32 = [ir.IN_SHA1NEXTE, ir.IN_SHA1MSG1, ir.IN_SHA1MSG2, ir.IN_SHA256MSG1, ir.IN_SHA256MSG2];
+        let mut op: i32 = 0;
+        for k in @as(usize, 0)..5 {
+            if ins[k] == id {
+                op = ids[k];
+            }
+        }
+        _ = xsl.sse4(op, 0, xsl.RW(t), xsl.R(b), xsl.NONE(), xsl.NONE());
+    }
+    xsl.copy(d, t, xsl.XMM);
+}
+
+// Which 256- and 512-bit instructions the selector does itself (vsplit.ax
+// splits the others into narrower ones).
+pub fn wide_legal(v: *mut ir.Value) bool {
+    let w = xsl.inst_vl(v);
+    let o = v.op;
+    if (o == ir.OP_INTR) and
+       ((@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CALL_RESULT) or
+        (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_ASM)) {
+        return true;  // (an intrinsic's ymm or zmm operands: c/cgen_simd.ax, made only where the extension is)
+    }
+    if own_vec_op(v) {
+        return true;
+    }
+    if (o == ir.OP_LOAD) or (o == ir.OP_STORE) or (o == ir.OP_PHI) or (o == ir.OP_SELECT) or (o == ir.OP_COPY) or
+       (o == ir.OP_SPLAT) or (o == ir.OP_EXTRACTELEM) or (o == ir.OP_INSERTELEM) {
+        return true;
+    }
+    if (o == ir.OP_CALL) or (o == ir.OP_RET) {
+        return true;  // (a C function's ymm or zmm argument or result: arg_reg)
+    }
+    if o == ir.OP_SHUFFLE {
+        return vs.plumbing(v) or perm_shuffle_ok(v);
+    }
+    if ir.is_cast(o) {
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT) or cvt_ok(o, v.a.ty, v.ty);
+    }
+    let mut t = v.ty;
+    if (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
+        t = v.a.ty;
+    } else if (o == ir.OP_INTR) and (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
+        t = v.xs.get(0).ty;
+    }
+    if t.kind != ir.T_VEC {
+        return false;
+    }
+    let b = is.lane_bits(t);
+    // (at 512 bits: masks of 32- and 64-bit lanes, and the float bit
+    // operations, need AVX512DQ)
+    let dq = (w < 64) or tg.has(tg.X_AVX512DQ);
+    if (o == ir.OP_FNEG) or (o == ir.OP_FCMP) or ((o == ir.OP_ICMP) and (b >= 32)) {
+        if not dq {
+            return false;
+        }
+    }
+    if o == ir.OP_ICMP {
+        return true;
+    }
+    if o == ir.OP_FCMP {
+        let p = @truncate(i32, @bit_cast(i64, v.cv));
+        return (p == ir.RealOEQ) or (p == ir.RealUNE) or (p == ir.RealOLT) or (p == ir.RealOLE) or (p == ir.RealOGT) or
+               (p == ir.RealOGE);
+    }
+    if (o == ir.OP_FADD) or (o == ir.OP_FSUB) or (o == ir.OP_FMUL) or (o == ir.OP_FDIV) {
+        return true;
+    }
+    if (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_AND) or (o == ir.OP_OR) or (o == ir.OP_XOR) {
+        return true;
+    }
+    if o == ir.OP_MUL {
+        return (b == 16) or (b == 32);
+    }
+    if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+        if (b == 8) or ((o == ir.OP_ASHR) and (b == 64)) {
+            return false;
+        }
+        return ir.is_op(v.b, ir.OP_SPLAT) or (v.b.kind == ir.V_CAGG) or (v.b.kind == ir.V_ZERO);
+    }
+    if o != ir.OP_INTR {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_DOT_I16) {
+        return true;
+    }
+    if id == ir.IN_DOT_U8I8 {
+        return (w < 64) or tg.has(tg.X_AVX512VNNI);
+    }
+    if ir.is_widen(id) {
+        return (w < 64) or (b > 8) or tg.has(tg.X_AVX512BW);
+    }
+    if (id >= ir.IN_AESENC) and (id <= ir.IN_AESDECLAST) {
+        return tg.has(tg.X_VAES);
+    }
+    if id == ir.IN_CLMUL {
+        return tg.has(tg.X_VPCLMULQDQ);
+    }
+    if id == ir.IN_BITMASK {
+        if w == 64 {
+            return (b <= 16) or dq;
+        }
+        return b != 16;  // (16-bit lanes pack within halves on AVX2)
+    }
+    if is.lane_float(t) and not dq {
+        return false;
+    }
+    if is.lane_float(t) {
+        if id == ir.IN_FMA {
+            return tg.has(tg.X_FMA);
+        }
+        return (id == ir.IN_FABS) or (id == ir.IN_SQRT) or (id == ir.IN_FMIN) or (id == ir.IN_FMAX) or
+               (id == ir.IN_COPYSIGN) or (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or
+               (id == ir.IN_NEAREST);
+    }
+    if id == ir.IN_ABS {
+        return b <= 32;
+    }
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        return b <= 32;
+    }
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        return b <= 16;
+    }
+    return false;
+}
+
+// Can the instruction selector handle this vector instruction directly?
+// (Everything else is split into lanes by lower.scalarize.)
+pub fn legal(v: *mut ir.Value) bool {
+    if (v.op == ir.OP_INTR) and
+       ((@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CALL_RESULT) or
+        (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_ASM)) {
+        return true;  // (an asm statement and its registers)
+    }
+    if xsl.inst_vl(v) > 16 {
+        return wide_legal(v);
+    }
+    if own_vec_op(v) {
+        return true;
+    }
+    if (v.op == ir.OP_INTR) and is.is_insn(@truncate(i32, @bit_cast(i64, v.cv))) {
+        return true;  // (sema allowed it only where the extension is there)
+    }
+    let t = v.ty;
+    let o = v.op;
+    if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CPUID) {
+        return true;
+    }
+    if o == ir.OP_ICMP {
+        let at = v.a.ty;
+        if at.kind != ir.T_VEC {
+            return true;
+        }
+        let p = @truncate(i32, @bit_cast(i64, v.cv));
+        if is.lane_bits(at) == 64 {
+            if (p == ir.IntEQ) or (p == ir.IntNE) {
+                return x64c.has41();
+            }
+            return tg.has(tg.X_SSE42);
+        }
+        return true;
+    }
+    if (o == ir.OP_INTR) and (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
+        let id = @truncate(i32, @bit_cast(i64, v.cv));
+        let at = v.xs.get(0).ty;
+        if (id == ir.IN_ANYTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_DOT_I16) or (id == ir.IN_DOT_U8I8) {
+            return true;
+        }
+        if id == ir.IN_ALLTRUE {
+            return true;
+        }
+        if ir.is_widen(id) {
+            return x64c.has41();  // (pmovsx, pmovzx)
+        }
+        if id == ir.IN_SWIZZLE {
+            return true;
+        }
+        if is.lane_float(at) {
+            if (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST) {
+                return x64c.has41();
+            }
+            if id == ir.IN_FMA {
+                return tg.has(tg.X_FMA);
+            }
+            return (id == ir.IN_FABS) or (id == ir.IN_SQRT) or (id == ir.IN_FMIN) or (id == ir.IN_FMAX) or
+                   (id == ir.IN_COPYSIGN);
+        }
+        let b = is.lane_bits(at);
+        if id == ir.IN_ABS {
+            return (b <= 32) and tg.has(tg.X_SSSE3);
+        }
+        if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) {
+            if b == 16 {
+                return true;
+            }
+            return ((b == 8) or (b == 32)) and x64c.has41();
+        }
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            if b == 8 {
+                return true;
+            }
+            return ((b == 16) or (b == 32)) and x64c.has41();
+        }
+        if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+            return b <= 16;
+        }
+        return false;
+    }
+    if t.kind != ir.T_VEC {
+        return true;
+    }
+    if o == ir.OP_MUL {
+        let b = is.lane_bits(t);
+        if b == 16 {
+            return true;
+        }
+        return (b == 32) and x64c.has41();
+    }
+    if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+        let b = is.lane_bits(t);
+        if b == 8 {
+            return false;
+        }
+        if (o == ir.OP_ASHR) and (b == 64) {
+            return false;
+        }
+        return ir.is_op(v.b, ir.OP_SPLAT) or (v.b.kind == ir.V_CAGG) or (v.b.kind == ir.V_ZERO);
+    }
+    if (o == ir.OP_UDIV) or (o == ir.OP_SDIV) or (o == ir.OP_UREM) or (o == ir.OP_SREM) or (o == ir.OP_FREM) {
+        return false;
+    }
+    if ir.is_cast(o) {
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT) or cvt_ok(o, v.a.ty, v.ty);
+    }
+    return true;
+}
+
+// The vector instructions of the whole-width section below: the
+// intrinsics codegen.ax makes only where they are selected, and lane-wise
+// bit counts where the extensions have them.
+fn own_vec_op(v: *mut ir.Value) bool {
+    if v.op != ir.OP_INTR {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if ((id >= ir.IN_PERM) and (id <= ir.IN_STORE_PARTIAL)) or (id == ir.IN_SAD_U8) {
+        return true;
+    }
+    if (id >= ir.IN_SHLV) and (id <= ir.IN_ASHRV) {
+        return x64c.shiftv_ok(id, is.lane_bits(v.ty), v.ty.lanes);
+    }
+    if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (v.ty.kind == ir.T_VEC) {
+        return bitcount_ok(id, is.lane_bits(v.ty), v.ty.lanes);
+    }
+    return false;
+}
+
+pub fn vec_binop(v: *mut ir.Value) void {
+    let t = v.ty;
+    let o = v.op;
+    let d = xsl.vreg(v);
+    if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+        vec_shift(v, d, xsl.reg(v.a));
+        return;
+    }
+    if o == ir.OP_AND {
+        // ~n & x: pandn (the not marked F_ANDN by prepare)
+        let sa = (v.a.kind == ir.V_INST) and ((v.a.flag & xsl.F_ANDN) != 0);
+        let sb = (v.b.kind == ir.V_INST) and ((v.b.flag & xsl.F_ANDN) != 0);
+        if sa or sb {
+            let mut n = v.b;
+            let mut x = v.a;
+            if sa {
+                n = v.a;
+                x = v.b;
+            }
+            xsl.sse3(xe.PANDN, d, xsl.reg(xsl.vnot_of(n)), xsl.vsrc(x));
+            return;
+        }
+    }
+    let mut ra: i32 = 0;
+    let b = xsl.vsrc_of(v, &mut ra);
+    let k = xsl.lk(t);
+    let mut id: i32 = 0;
+    if o == ir.OP_ADD {
+        id = xe.PADDB + k;
+    } else if o == ir.OP_SUB {
+        id = xe.PSUBB + k;
+    } else if o == ir.OP_AND {
+        id = xe.PAND;
+    } else if o == ir.OP_OR {
+        id = xe.POR;
+    } else if o == ir.OP_XOR {
+        id = xe.PXOR;
+    } else if o == ir.OP_MUL {
+        id = xe.PMULLW;
+        if k == 2 {
+            id = xe.PMULLD;
+        }
+    } else {
+        em.fail(u.f1("vector op %s", u.idec(o)));
+        return;
+    }
+    xsl.sse3(id, d, ra, b);
+}
+
+fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
+    let t = v.ty;
+    let o = v.op;
+    let k = xsl.lk(t);  // 1, 2, 3
+    let c = v.b;
+    // by an immediate?
+    if (c.kind == ir.V_CAGG) or (c.kind == ir.V_ZERO) or (ir.is_op(c, ir.OP_SPLAT) and is.is_c(c.a)) {
+        let mut n: i64 = 0;
+        if c.kind == ir.V_CAGG {
+            n = is.cval(c.xs.get(0));
+        } else if ir.is_op(c, ir.OP_SPLAT) {
+            n = is.cval(c.a);
+        }
+        let mut id = xe.PSLLW_I + (k - 1) * 3;
+        if o == ir.OP_LSHR {
+            id = xe.PSRLW_I + (k - 1) * 3;
+        } else if o == ir.OP_ASHR {
+            id = xe.PSRAW_I + (k - 1) * 3;
+        }
+        // immediate forms: legacy encodes the destination in r/m
+        if xc.FN.avx {
+            _ = xsl.vlz(xsl.sse4(id, 0, xsl.NONE(), xsl.R(a), xsl.W(d), xsl.I(n)));
+        } else {
+            xsl.copy(d, a, xsl.XMM);
+            _ = xsl.sse4(id, 0, xsl.NONE(), xsl.RW(d), xsl.NONE(), xsl.I(n));
+        }
+        return;
+    }
+    let cnt = mc.new_vreg(xc.FN.mf, xsl.XMM);  // (the count: 64 bits, whatever the width)
+    let z = xsl.vgpr();
+    if xsl.folded_load(c.a) {
+        // the splat is a broadcast from memory, and the count has no
+        // register of its own: lane 0 of the splat (zero-extended)
+        let wl = xsl.S.vl;
+        xsl.S.vl = 0;
+        extract_lane(c, z, xsl.reg(c), c.ty, 0);
+        xsl.S.vl = wl;
+    } else {
+        let e = xsl.e2(xe.EXT, 4, xsl.W(z), xsl.R(xsl.reg(c.a)));
+        e.cc = xsl.ext_kind(c.a.ty.bits, false);
+        if c.a.ty.bits >= 32 {
+            e.cc = 6;
+            if c.a.ty.bits == 64 {
+                e.op = xe.MOV_RR;
+                e.sz = 8;
+            }
+        }
+    }
+    _ = xsl.sse2(xe.MOVQ_XR, xsl.W(cnt), xsl.R(z));
+    let mut id = xe.PSLLW + (k - 1);
+    if o == ir.OP_LSHR {
+        id = xe.PSRLW + (k - 1);
+    } else if o == ir.OP_ASHR {
+        id = xe.PSRAW + (k - 1);
+    }
+    xsl.sse3(id, d, a, xsl.R(cnt));
+}
+
+// Flips the sign bit of each lane (unsigned compares through signed ones).
+fn flip_signs(r: i32, t: *ir.Ty) i32 {
+    let b = is.lane_bits(t);
+    let mut m: u64 = 0x8080_8080_8080_8080;
+    if b == 16 {
+        m = 0x8000_8000_8000_8000;
+    } else if b == 32 {
+        m = 0x8000_0000_8000_0000;
+    } else if b == 64 {
+        m = 0x8000_0000_0000_0000;
+    }
+    let d = xsl.vxmm();
+    xsl.sse3(xe.PXOR, d, r, xsl.const16(m, m));
+    return d;
+}
+
+// The bytes of a constant vector (or a splat of a constant), if v is one.
+fn const_vec_bytes(v: *mut ir.Value, out: *mut bn.Bytes) bool {
+    if ir.is_op(v, ir.OP_COPY) {
+        return const_vec_bytes(v.a, out);
+    }
+    if (v.kind == ir.V_ZERO) or (v.kind == ir.V_CAGG) {
+        is.const_le(v, out, 0);
+        return true;
+    }
+    if ir.is_op(v, ir.OP_SPLAT) and ((v.a.kind == ir.V_CINT) or (v.a.kind == ir.V_ZERO)) {
+        let mut one = bn.new_bytes();
+        is.const_le(v.a, &mut one, 0);
+        let lb = @truncate(usize, v.ty.elem.size);
+        for _k in 0..@as(usize, @bit_cast(u32, v.ty.lanes)) {
+            for j in 0..lb {
+                out.u8_(one.view()[j]);
+            }
+        }
+        one.free();
+        return true;
+    }
+    return false;
+}
+
+fn vnot(d: i32, r: i32) void {
+    xsl.sse3(xe.PXOR, d, r, xsl.const16(0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff));
+}
+
+pub fn vec_icmp(v: *mut ir.Value) void {
+    let t = v.a.ty;
+    let p = @truncate(i32, @bit_cast(i64, v.cv));
+    let d = xsl.vreg(v);
+    if xsl.S.vl == 64 {
+        // AVX-512: any predicate into a mask register, expanded to lanes
+        cmp_to_k1(v);
+        expand_k1(d, xsl.lk(t));
+        return;
+    }
+    let mut a = xsl.reg(v.a);
+    let mut b = xsl.reg(v.b);
+    let k = xsl.lk(t);
+    let mut eq = xe.PCMPEQB + k;
+    if k == 3 {
+        eq = xe.PCMPEQQ;
+    }
+    let mut gt = xe.PCMPGTB + k;
+    if k == 3 {
+        gt = xe.PCMPGTQ;
+    }
+    if (p == ir.IntEQ) or (p == ir.IntNE) {
+        if p == ir.IntEQ {
+            vcmp(eq, d, a, xsl.R(b), k);
+        } else {
+            let x = xsl.vxmm();
+            vcmp(eq, x, a, xsl.R(b), k);
+            vnot(d, x);
+        }
+        return;
+    }
+    let uns = (p == ir.IntULT) or (p == ir.IntULE) or (p == ir.IntUGT) or (p == ir.IntUGE);
+    if uns {
+        a = flip_signs(a, t);
+        let mut cb = bn.new_bytes();
+        if const_vec_bytes(v.b, &mut cb) and (@as(u64, cb.len()) == t.size) {
+            // a constant flipped at compile time
+            let lb = @as(usize, @bit_cast(u32, is.lane_bits(t) / 8));
+            let mut fb = bn.new_bytes();
+            let n = @as(usize, xsl.vbytes_now());
+            for j in 0..n {
+                let mut x = cb.view()[j % cb.len()];
+                if (j % lb) == (lb - 1) {
+                    x = x ^ 0x80;
+                }
+                fb.u8_(x);
+            }
+            b = xsl.const_vreg(xe.MOVDQU_LD, xsl.const_bytes(&fb, n), 0, 0);
+            fb.free();
+        } else {
+            b = flip_signs(b, t);
+        }
+        cb.free();
+    }
+    if (p == ir.IntSGT) or (p == ir.IntUGT) {
+        vcmp(gt, d, a, xsl.R(b), k);
+    } else if (p == ir.IntSLT) or (p == ir.IntULT) {
+        vcmp(gt, d, b, xsl.R(a), k);
+    } else if (p == ir.IntSGE) or (p == ir.IntUGE) {
+        let x = xsl.vxmm();
+        vcmp(gt, x, b, xsl.R(a), k);
+        vnot(d, x);
+    } else {
+        let x = xsl.vxmm();
+        vcmp(gt, x, a, xsl.R(b), k);
+        vnot(d, x);
+    }
+}
+
+pub fn vec_fcmp(v: *mut ir.Value) void {
+    let t = v.a.ty;
+    let p = @truncate(i32, @bit_cast(i64, v.cv));
+    let d = xsl.vreg(v);
+    let a = xsl.reg(v.a);
+    let b = xsl.reg(v.b);
+    let mut op = xe.CMPPD;
+    if is.lane_float(t) and (is.lane_bits(t) == 32) {
+        op = xe.CMPPS;
+    }
+    let k = xsl.lk(t);
+    if p == ir.RealOEQ {
+        vcmp_i(op, d, a, xsl.R(b), 0, k);
+    } else if p == ir.RealUNE {
+        vcmp_i(op, d, a, xsl.R(b), 4, k);
+    } else if p == ir.RealOLT {
+        vcmp_i(op, d, a, xsl.R(b), 1, k);
+    } else if p == ir.RealOLE {
+        vcmp_i(op, d, a, xsl.R(b), 2, k);
+    } else if p == ir.RealOGT {
+        vcmp_i(op, d, b, xsl.R(a), 1, k);
+    } else {
+        vcmp_i(op, d, b, xsl.R(a), 2, k);
+    }
+}
+
+// d = a cmp b as lane masks. AVX-512 compares write a mask register: k1,
+// then expanded into lanes (k: 0..3 for 8- to 64-bit lanes).
+fn vcmp(id: i32, d: i32, a: i32, b: mc.MOp, k: i32) void {
+    if xsl.S.vl == 64 {
+        _ = xsl.sse4(id, 64, xsl.W(xe.K1), b, xsl.R(a), xsl.NONE());
+        expand_k1(d, k);
+        return;
+    }
+    xsl.sse3(id, d, a, b);
+}
+
+fn vcmp_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64, k: i32) void {
+    if xsl.S.vl == 64 {
+        _ = xsl.sse4(id, 64, xsl.W(xe.K1), b, xsl.R(a), xsl.I(x));
+        expand_k1(d, k);
+        return;
+    }
+    xsl.sse3_i(id, d, a, b, x);
+}
+
+// d <- k1 expanded into lanes (k: 0..3 for 8- to 64-bit lanes). vpmovm2*
+// waits for d's previous value (a false dependency, on Sapphire Rapids at
+// least), which in a loop chains each iteration to the last: d is zeroed
+// first, an idiom the processor does without waiting or executing.
+fn expand_k1(d: i32, k: i32) void {
+    _ = xsl.sse4(xe.PXOR, 64, xsl.W(d), mc.reg(d, 0), mc.reg(d, 0), xsl.NONE());
+    _ = xsl.sse4(xe.VPMOVM2B + k, 64, xsl.W(d), xsl.R(xe.K1), xsl.NONE(), xsl.NONE());
+}
+
+// Lanes through a 16-byte stack slot.
+fn vec_slot() i32 {
+    return mc.new_slot(xc.FN.mf, 16, 16);
+}
+
+// cpuid: eax, ebx, ecx and edx as the lanes of a u32x4 (through memory).
+pub fn gen_cpuid(v: *mut ir.Value) void {
+    let a = xsl.reg(v.xs.get(0));
+    let c = xsl.reg(v.xs.get(1));
+    _ = xsl.e2(xe.MOV_RR, 4, xsl.W(xe.RAX), xsl.R(a));
+    _ = xsl.e2(xe.MOV_RR, 4, xsl.W(xe.RCX), xsl.R(c));
+    _ = xsl.e4(xe.CPUID, 0, xsl.RW(xe.RAX), xsl.W(xe.RBX), xsl.RW(xe.RCX), xsl.W(xe.RDX));
+    let s = vec_slot();
+    let rs: [4]i32 = [xe.RAX, xe.RBX, xe.RCX, xe.RDX];
+    for k in @as(usize, 0)..4 {
+        _ = xsl.e2(xe.STORE, 4, mc.mem_slot(s, @int_cast(i64, k) * 4), xsl.R(rs[k]));
+    }
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(xsl.vreg(v)), mc.mem_slot(s, 0));
+}
+
+// Part k (16 bytes) of wide vector register a (of VL bytes), in an xmm
+// register (the register itself for part 0).
+// (The low part is the register itself: extract_lane's instructions take
+// xmm16-31 too, with EVEX. A part taken out is reused in the block.)
+fn part128(a: i32, k: i64) i32 {
+    if k == 0 {
+        return a;
+    }
+    for j in 0..xsl.S.pcache.len {
+        let c = xsl.S.pcache.get(j);
+        if (c.sym == a) and (c.disp == k) {
+            return c.r;
+        }
+    }
+    let wl = xsl.S.vl;
+    xsl.S.vl = 0;
+    let p = xsl.vxmm();
+    xsl.S.vl = wl;
+    _ = xsl.sse4(xe.VEXTRACTI128, xsl.S.vl, xsl.R(a), xsl.W(p), xsl.NONE(), xsl.I(k));
+    xsl.S.pcache.push(xsl.CEnt.{ sym: a, disp: k, op: 0, sz: 0, r: p });
+    return p;
+}
+
+pub fn gen_extract(v: *mut ir.Value) void {
+    if xsl.S.vl > 0 {
+        // the lane of the 128-bit part holding it
+        let t = v.a.ty;
+        let per = @as(i64, 16 / (is.lane_bits(t) / 8));
+        let lane = @bit_cast(i64, v.cv);
+        let p = part128(xsl.reg(v.a), lane / per);
+        xsl.S.vl = 0;
+        extract_lane(v, xsl.vreg(v), p, ir.t_vec(t.elem, @truncate(u32, @bit_cast(u64, per))), lane % per);
+        return;
+    }
+    extract_lane(v, xsl.vreg(v), xsl.reg(v.a), v.a.ty, @bit_cast(i64, v.cv));
+}
+
+fn extract_lane(v: *mut ir.Value, d: i32, a: i32, t: *ir.Ty, lane: i64) void {
+    let b = is.lane_bits(t);
+    if is.lane_float(t) {
+        if lane == 0 {
+            xsl.copy(d, a, xsl.XMM);
+            return;
+        }
+        if b == 32 {
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(a), lane);
+        } else {
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(a), 0xee);
+        }
+        return;
+    }
+    if b == 16 {
+        _ = xsl.sse_i(xe.PEXTRW, xsl.W(d), xsl.R(a), lane);
+        return;
+    }
+    if (lane == 0) and (b >= 32) {
+        _ = xsl.sse2(xsl.pki(b == 32, xe.MOVD_RX, xe.MOVQ_RX), xsl.R(a), xsl.W(d));
+        return;
+    }
+    if x64c.has41() {
+        let mut id = xe.PEXTRB;
+        if b == 32 {
+            id = xe.PEXTRD;
+        } else if b == 64 {
+            id = xe.PEXTRQ;
+        }
+        _ = xsl.sse_i(id, xsl.R(a), xsl.W(d), lane);
+        return;
+    }
+    if b == 32 {
+        let x = xsl.vxmm();
+        _ = xsl.sse_i(xe.PSHUFD, xsl.W(x), xsl.R(a), lane);
+        _ = xsl.sse2(xe.MOVD_RX, xsl.R(x), xsl.W(d));
+        return;
+    }
+    if b == 64 {
+        if lane == 0 {
+            _ = xsl.sse2(xe.MOVQ_RX, xsl.R(a), xsl.W(d));
+        } else {
+            let x = xsl.vxmm();
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(x), xsl.R(a), 0xee);
+            _ = xsl.sse2(xe.MOVQ_RX, xsl.R(x), xsl.W(d));
+        }
+        return;
+    }
+    // byte: through a 16-bit lane
+    _ = xsl.sse_i(xe.PEXTRW, xsl.W(d), xsl.R(a), lane / 2);
+    if (lane & 1) != 0 {
+        let s = xsl.e3(xe.SHIFT, 4, xsl.RW(d), xsl.NONE(), xsl.I(8));
+        s.cc = 5;
+    }
+}
+
+pub fn gen_insert(v: *mut ir.Value) void {
+    if (v.ty.size == 16) and (v.cv == 0) and is.lane_float(v.ty) and (is.lane_bits(v.ty) == 64) and
+       ((v.a.kind == ir.V_UNDEF) or
+        (is_vzero(v.a) and (v.uses == 1) and ir.is_op(v.user, ir.OP_INSERTELEM) and (v.user.a == v) and
+         (v.user.cv == 1))) {
+        // a double into lane 0 of a pair whose lane 1 is undefined or about
+        // to be replaced: the scalar's register as it is (then one shufpd
+        // builds the pair)
+        xsl.copy(xsl.vreg(v), xsl.reg(v.b), xsl.XMM);
+        return;
+    }
+    if (v.ty.size == 16) and (v.cv == 0) and is_vzero(v.a) and not is.lane_float(v.ty) and
+       ((is.lane_bits(v.ty) == 32) or (is.lane_bits(v.ty) == 64)) {
+        // an integer into lane 0 of zeros: movd / movq, which zero the rest
+        // (not a zero vector stored, the lane stored over it and the whole
+        // loaded back, a load that waits for both stores)
+        let wl = xsl.S.vl;
+        xsl.S.vl = 0;
+        _ = xsl.sse2(xsl.pki(is.lane_bits(v.ty) == 32, xe.MOVD_XR, xe.MOVQ_XR), xsl.W(xsl.vreg(v)),
+                     xsl.R(xsl.reg(v.b)));
+        xsl.S.vl = wl;
+        return;
+    }
+    if xc.FN.avx and x64c.has41() and is.lane_float(v.ty) and (is.lane_bits(v.ty) == 32) and (v.cv < 4) and
+       upper_zero(v.a, 8) {
+        // into the low 128 bits of a vector zero above them: insertps,
+        // which zeroes the register above (VEX and EVEX)
+        let d = xsl.vreg(v);
+        let a = xsl.reg(v.a);
+        let x = xsl.reg(v.b);
+        let wl = xsl.S.vl;
+        xsl.S.vl = 0;
+        xsl.sse3_i(xe.INSERTPS, d, a, xsl.R(x), @bit_cast(i64, v.cv << 4));
+        xsl.S.vl = wl;
+        return;
+    }
+    if xsl.zmm16() and (xsl.S.vl > 0) {
+        // the scalar broadcast to the lane alone (vpbroadcastd zmm{k1}),
+        // merged into a copy of the vector: no part extracted and put back
+        let t = v.ty;
+        let d = xsl.vreg(v);
+        let lane = @bit_cast(u64, v.cv);
+        let wl = xsl.S.vl;
+        xsl.S.vl = 0;
+        let mut x = xsl.reg(v.b);
+        if not is.lane_float(t) {
+            x = xsl.vxmm();
+            if is.lane_bits(t) == 64 {
+                _ = xsl.sse2(xe.MOVQ_XR, xsl.W(x), xsl.R(xsl.reg(v.b)));
+            } else {
+                _ = xsl.sse2(xe.MOVD_XR, xsl.W(x), xsl.R(xsl.reg(v.b)));
+            }
+        }
+        xsl.S.vl = wl;
+        let m = xsl.vgpr();
+        _ = xsl.e2(xe.MOV_RI, 8, xsl.W(m), xsl.I(@bit_cast(i64, @as(u64, 1) << @truncate(u32, lane))));
+        _ = xsl.sse4(xe.KMOVQ_KR, 8, xsl.W(xe.K1), xsl.R(m), xsl.NONE(), xsl.NONE());
+        xsl.copy(d, xsl.reg(v.a), xsl.class_of(t));
+        let i = xsl.sse4(xe.VPBROADCASTB + xsl.lk(t), xsl.S.vl, xsl.RW(d), xsl.R(x), xsl.NONE(), xsl.NONE());
+        i.aux = 1;
+        return;
+    }
+    if xsl.S.vl > 0 {
+        // into the 128-bit part holding the lane, which goes back in
+        let t = v.ty;
+        let per = @as(i64, 16 / (is.lane_bits(t) / 8));
+        let lane = @bit_cast(i64, v.cv);
+        let k = lane / per;
+        let a = xsl.reg(v.a);
+        let wl = xsl.S.vl;
+        let mut p = part128(a, k);
+        xsl.S.vl = 0;
+        if (k == 0) and (wl == 64) and xsl.zmm16() {
+            // (pinsr* is encoded with VEX, which cannot name xmm16-31: the low
+            // part copied out)
+            p = xsl.vxmm();
+            xsl.copy(p, a, xsl.XMM);
+        }
+        let q = xsl.vxmm();
+        insert_lane(q, p, xsl.reg(v.b), ir.t_vec(t.elem, @truncate(u32, @bit_cast(u64, per))), lane % per);
+        xsl.S.vl = wl;
+        _ = xsl.sse4(xe.VINSERTI128, xsl.S.vl, xsl.W(xsl.vreg(v)), xsl.R(q), xsl.R(a), xsl.I(k));
+        return;
+    }
+    insert_lane(xsl.vreg(v), xsl.reg(v.a), xsl.reg(v.b), v.ty, @bit_cast(i64, v.cv));
+}
+
+// Is vector x zero above its low 128 bits (zero, or lanes inserted there
+// into such a vector)?
+fn upper_zero(x: *ir.Value, depth: i32) bool {
+    if is_vzero(x) {
+        return true;
+    }
+    if (depth <= 0) or not ir.is_op(x, ir.OP_INSERTELEM) {
+        return false;
+    }
+    return ((x.cv * @as(u64, @bit_cast(u32, is.lane_bits(x.ty)))) < 128) and upper_zero(x.a, depth - 1);
+}
+
+fn insert_lane(d: i32, a: i32, x: i32, t: *ir.Ty, lane: i64) void {
+    let b = is.lane_bits(t);
+    if (b == 16) or (x64c.has41() and not is.lane_float(t)) {
+        let mut id = xe.PINSRW;
+        if b == 8 {
+            id = xe.PINSRB;
+        } else if b == 32 {
+            id = xe.PINSRD;
+        } else if b == 64 {
+            id = xe.PINSRQ;
+        }
+        xsl.sse3_i(id, d, a, xsl.R(x), lane);
+        return;
+    }
+    if is.lane_float(t) and (b == 32) and (lane < 4) {
+        if x64c.has41() {
+            // (lane 0 of x into the lane)
+            xsl.sse3_i(xe.INSERTPS, d, a, xsl.R(x), lane << 4);
+            return;
+        }
+        // two shufps (not through memory, where the vector load would wait
+        // for the stores before it): t = [x, x, a_j, a_j], then the lanes
+        // of a with x in its place
+        let ti: [4]i64 = [0x50, 0x00, 0xf0, 0xa0];
+        let di: [4]i64 = [0xe8, 0xe2, 0x84, 0x24];
+        let tm = xsl.vxmm();
+        xsl.sse3_i(xe.SHUFPS, tm, x, xsl.R(a), ti[@int_cast(usize, lane)]);
+        if lane < 2 {
+            xsl.sse3_i(xe.SHUFPS, d, tm, xsl.R(a), di[@int_cast(usize, lane)]);
+        } else {
+            xsl.sse3_i(xe.SHUFPS, d, a, xsl.R(tm), di[@int_cast(usize, lane)]);
+        }
+        return;
+    }
+    if is.lane_float(t) and (b == 64) and (lane < 2) {
+        // shufpd: [x0, a1] or [a0, x0] (not through memory)
+        if lane == 0 {
+            xsl.sse3_i(xe.SHUFPD, d, x, xsl.R(a), 2);
+        } else {
+            xsl.sse3_i(xe.SHUFPD, d, a, xsl.R(x), 0);
+        }
+        return;
+    }
+    if not is.lane_float(t) and ((b == 64) or ((b == 32) and (lane < 4))) {
+        // the integer into an xmm register (movd / movq), then into its lane
+        // as a float lane would be (shuffles of bits: no arithmetic)
+        let xm = xsl.vxmm();
+        _ = xsl.sse2(xsl.pki(b == 32, xe.MOVD_XR, xe.MOVQ_XR), xsl.W(xm), xsl.R(x));
+        if b == 64 {
+            if lane == 0 {
+                xsl.sse3_i(xe.SHUFPD, d, xm, xsl.R(a), 2);  // [x, a1]
+            } else {
+                xsl.sse3(xe.PUNPCKLQDQ, d, a, xsl.R(xm));  // [a0, x]
+            }
+            return;
+        }
+        let ti: [4]i64 = [0x50, 0x00, 0xf0, 0xa0];
+        let di: [4]i64 = [0xe8, 0xe2, 0x84, 0x24];
+        let tm = xsl.vxmm();
+        xsl.sse3_i(xe.SHUFPS, tm, xm, xsl.R(a), ti[@int_cast(usize, lane)]);
+        if lane < 2 {
+            xsl.sse3_i(xe.SHUFPS, d, tm, xsl.R(a), di[@int_cast(usize, lane)]);
+        } else {
+            xsl.sse3_i(xe.SHUFPS, d, a, xsl.R(tm), di[@int_cast(usize, lane)]);
+        }
+        return;
+    }
+    // through memory
+    let s = vec_slot();
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(a), mc.mem_slot(s, 0));
+    let off = lane * @as(i64, b / 8);
+    if is.lane_float(t) {
+        if b == 32 {
+            _ = xsl.sse2(xe.MOVSS_ST, xsl.R(x), mc.mem_slot(s, off));
+        } else {
+            _ = xsl.sse2(xe.MOVSD_ST, xsl.R(x), mc.mem_slot(s, off));
+        }
+    } else {
+        _ = xsl.e2(xe.STORE, @truncate(u8, @bit_cast(u32, b / 8)), mc.mem_slot(s, off), xsl.R(x));
+    }
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(d), mc.mem_slot(s, 0));
+}
+
+pub fn gen_splat(v: *mut ir.Value) void {
+    let t = v.ty;
+    let d = xsl.vreg(v);
+    if xsl.folded_load(v.a) {
+        _ = xsl.sse2(xe.VPBROADCASTB + xsl.lk(t), xsl.W(d), xsl.addr(v.a.a));
+        return;
+    }
+    let x = xsl.reg(v.a);
+    let b = is.lane_bits(t);
+    if not is.lane_float(t) and x64c.avx512_for(t.size) {
+        // from the general register (EVEX)
+        _ = xsl.sse2(xe.VPBROADCASTB_R + xsl.lk(t), xsl.W(d), xsl.R(x));
+        return;
+    }
+    if xsl.S.vl > 0 {
+        // the scalar into lane 0 of an xmm register, then broadcast
+        let wl = xsl.S.vl;
+        xsl.S.vl = 0;
+        let mut s = x;
+        if not is.lane_float(t) {
+            s = xsl.vxmm();
+            if b == 64 {
+                _ = xsl.sse2(xe.MOVQ_XR, xsl.W(s), xsl.R(x));
+            } else {
+                _ = xsl.sse2(xe.MOVD_XR, xsl.W(s), xsl.R(x));
+            }
+        }
+        xsl.S.vl = wl;
+        _ = xsl.sse2(xe.VPBROADCASTB + xsl.lk(t), xsl.W(d), xsl.R(s));
+        return;
+    }
+    if is.lane_float(t) {
+        if b == 32 {
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(x), 0);
+        } else {
+            xsl.sse3(xe.PUNPCKLQDQ, d, x, xsl.R(x));
+        }
+        return;
+    }
+    let m = xsl.vxmm();
+    if b == 64 {
+        _ = xsl.sse2(xe.MOVQ_XR, xsl.W(m), xsl.R(x));
+        xsl.sse3(xe.PUNPCKLQDQ, d, m, xsl.R(m));
+        return;
+    }
+    _ = xsl.sse2(xe.MOVD_XR, xsl.W(m), xsl.R(x));
+    if (b < 32) and xc.FN.avx and tg.has(tg.X_AVX2) {
+        // vpbroadcastb / w (not the shuffles below)
+        _ = xsl.sse2(xe.VPBROADCASTB + xsl.lk(t), xsl.W(d), xsl.R(m));
+        return;
+    }
+    if b == 32 {
+        _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(m), 0);
+        return;
+    }
+    let mut w = m;
+    if b == 8 {
+        w = xsl.vxmm();
+        xsl.sse3(xe.PUNPCKLBW, w, m, xsl.R(m));
+    }
+    let l = xsl.vxmm();
+    _ = xsl.sse_i(xe.PSHUFLW, xsl.W(l), xsl.R(w), 0);
+    _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(l), 0);
+}
+
+pub fn gen_shuffle(v: *mut ir.Value) void {
+    if xsl.S.vl > 0 {
+        wide_shuffle(v);
+        return;
+    }
+    if shuffle_insn(v) or pack_shuffle(v) {
+        return;
+    }
+    let t = v.ty;
+    let d = xsl.vreg(v);
+    let a = xsl.reg(v.a);
+    let b = xsl.reg(v.b);
+    let lb = @int_cast(u64, is.lane_bits(t) / 8);
+    let n = @as(u64, ir.mask_of(v).len);
+    if tg.has(tg.X_SSSE3) {
+        // bytes from a and from b (0x80: zero), or'ed
+        let mut ma: [16]u8 = [0x80; 16];
+        let mut mb: [16]u8 = [0x80; 16];
+        for i in 0..ir.mask_of(v).len {
+            let m = @as(u64, @bit_cast(u32, ir.mask_of(v)[i]));
+            for k in @as(u64, 0)..lb {
+                let dst = (@as(u64, i) * lb) + k;
+                if m < n {
+                    ma[@truncate(usize, dst)] = @truncate(u8, (m * lb) + k);
+                } else {
+                    mb[@truncate(usize, dst)] = @truncate(u8, ((m - n) * lb) + k);
+                }
+            }
+        }
+        let xa = xsl.vxmm();
+        let xb = xsl.vxmm();
+        xsl.sse3(xe.PSHUFB, xa, a, xsl.const16(is.le8(ma[0..8]), is.le8(ma[8..16])));
+        xsl.sse3(xe.PSHUFB, xb, b, xsl.const16(is.le8(mb[0..8]), is.le8(mb[8..16])));
+        xsl.sse3(xe.POR, d, xa, xsl.R(xb));
+        return;
+    }
+    // through memory: a and b in a 32-byte area, lanes copied one by one
+    let s = mc.new_slot(xc.FN.mf, 32, 16);
+    let r = vec_slot();
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(a), mc.mem_slot(s, 0));
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(b), mc.mem_slot(s, 16));
+    let tmp = xsl.vgpr();
+    let sz = @truncate(u8, lb);
+    for i in 0..ir.mask_of(v).len {
+        let m = @as(i64, ir.mask_of(v)[i]);
+        let li = xsl.e2(xe.LOAD, sz, xsl.W(tmp), mc.mem_slot(s, m * @bit_cast(i64, lb)));
+        if sz < 4 {
+            li.cc = 1;
+        }
+        _ = xsl.e2(xe.STORE, sz, mc.mem_slot(r, @int_cast(i64, i) * @bit_cast(i64, lb)), xsl.R(tmp));
+    }
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(d), mc.mem_slot(r, 0));
+}
+
+// The even (or odd) 8- or 16-bit lanes of a then b (a narrowing truncation,
+// or the high halves): each source with its other halves cleared (or shifted
+// down), then a pack, which does not saturate those. Without SSSE3 the
+// alternative is the bytes one by one through memory.
+fn pack_shuffle(v: *mut ir.Value) bool {
+    let t = v.ty;
+    let bits = is.lane_bits(t);
+    if (xsl.S.vl != 0) or (t.size != 16) or (v.a.ty.size != 16) or (ir.mask_of(v).len != @int_cast(usize, t.lanes)) or
+       ((bits != 8) and (bits != 16)) {
+        return false;
+    }
+    let n = @int_cast(i32, t.lanes);
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let mut parity: i32 = -1;
+    for p in @as(i32, 0)..2 {
+        let mut ok = true;
+        for i in @as(i32, 0)..n {
+            ok = ok and lane_is(ir.mask_of(v)[@int_cast(usize, i)], (2 * i) + p, n, same);
+        }
+        if ok {
+            parity = p;
+            break;
+        }
+    }
+    if parity < 0 {
+        return false;
+    }
+    let srcs: [2]*mut ir.Value = [v.a, v.b];
+    let mut r: [2]i32 = [0, 0];
+    let mut ns: usize = 2;
+    if same {
+        ns = 1;
+    }
+    let mut id = xe.PACKUSWB;
+    for k in @as(usize, 0)..ns {
+        let x = srcs[k];
+        let a = xsl.reg(x);
+        if bits == 8 {
+            if parity == 1 {
+                r[k] = xsl.vxmm();
+                vshift_imm(xe.PSRLW_I, r[k], a, 8);
+            } else if halves_zero(x, 2) {
+                r[k] = a;
+            } else {
+                r[k] = xsl.vxmm();
+                xsl.sse3(xe.PAND, r[k], a, xsl.splat_const(0x00ff, 2, 16));
+            }
+        } else if parity == 1 {
+            // (the high halves sign-extended: the signed pack keeps them)
+            id = xe.PACKSSDW;
+            r[k] = xsl.vxmm();
+            vshift_imm(xe.PSRAD_I, r[k], a, 16);
+        } else if x64c.has41() {
+            id = xe.PACKUSDW;
+            if halves_zero(x, 4) {
+                r[k] = a;
+            } else {
+                r[k] = xsl.vxmm();
+                xsl.sse3(xe.PAND, r[k], a, xsl.splat_const(0xffff, 4, 16));
+            }
+        } else {
+            id = xe.PACKSSDW;
+            let l = xsl.vxmm();
+            vshift_imm(xe.PSLLD_I, l, a, 16);
+            r[k] = xsl.vxmm();
+            vshift_imm(xe.PSRAD_I, r[k], l, 16);
+        }
+    }
+    if same {
+        r[1] = r[0];
+    }
+    xsl.sse3(id, xsl.vreg(v), r[0], xsl.R(r[1]));
+    return true;
+}
+
+// d = a shifted by an immediate (id one of the PS*_I forms), 128 bits.
+fn vshift_imm(id: i32, d: i32, a: i32, n: i64) void {
+    // (immediate forms: legacy encodes the destination in r/m)
+    if xc.FN.avx {
+        _ = xsl.sse4(id, 0, xsl.NONE(), xsl.R(a), xsl.W(d), xsl.I(n));
+        return;
+    }
+    xsl.copy(d, a, xsl.XMM);
+    _ = xsl.sse4(id, 0, xsl.NONE(), xsl.RW(d), xsl.NONE(), xsl.I(n));
+}
+
+// Are the upper halves of x's groups of g bytes known to be zero (x is a
+// constant, or an and with one, that has them zero)?
+fn halves_zero(x0: *mut ir.Value, g: usize) bool {
+    let mut x = x0;
+    while ir.is_op(x, ir.OP_COPY) or ir.is_op(x, ir.OP_BITCAST) {
+        x = x.a;
+    }
+    let mut b = bn.new_bytes();
+    let mut ok = vconst_bytes(x, &mut b);
+    if not ok and ir.is_op(x, ir.OP_AND) {
+        ok = vconst_bytes(x.b, &mut b) or vconst_bytes(x.a, &mut b);
+    }
+    if ok {
+        let bv = b.view();
+        for i in 0..bv.len {
+            if ((i % g) >= (g / 2)) and (bv[i] != 0) {
+                ok = false;
+            }
+        }
+    }
+    b.free();
+    return ok;
+}
+
+// The bytes of a constant vector (an aggregate, zero, or a splat of a
+// constant, through copies and bit casts) into out, which is empty.
+fn vconst_bytes(x0: *mut ir.Value, out: *mut bn.Bytes) bool {
+    let mut x = x0;
+    while ir.is_op(x, ir.OP_COPY) or ir.is_op(x, ir.OP_BITCAST) {
+        x = x.a;
+    }
+    if x.ty.kind != ir.T_VEC {
+        return false;
+    }
+    if (x.kind == ir.V_CAGG) or (x.kind == ir.V_ZERO) {
+        is.const_le(x, out, 0);
+        return true;
+    }
+    if ir.is_op(x, ir.OP_SPLAT) and ((x.a.kind == ir.V_CINT) or (x.a.kind == ir.V_CFP) or is.is_c(x.a)) {
+        let lb = @truncate(usize, x.a.ty.size);
+        for k in @as(usize, 0)..@int_cast(usize, x.ty.lanes) {
+            is.const_le(x.a, out, k * lb);
+        }
+        return true;
+    }
+    return false;
+}
+
+// The shuffles vsplit.ax makes: two halves joined, or a part of a vector;
+// other wide ones as permutes (perm_shuffle_ok).
+fn wide_shuffle(v: *mut ir.Value) void {
+    if not vs.plumbing(v) {
+        if shuffle_insn(v) {
+            return;
+        }
+        perm_shuffle(v);
+        return;
+    }
+    if low_alias(v) {
+        v.loc = xsl.reg(v.a);  // (the low part: read from the register itself)
+        return;
+    }
+    let d = xsl.vreg(v);
+    let a = xsl.reg(v.a);
+    let st = v.a.ty;
+    let n = @int_cast(i64, ir.mask_of(v).len);
+    let ln = @as(i64, st.lanes);
+    if n == (2 * ln) {
+        // join: a below, b above
+        let b = xsl.reg(v.b);
+        let mut id = xe.VINSERTI128;
+        if st.size == 32 {
+            id = xe.VINSERTI64X4;
+        }
+        _ = xsl.sse4(id, xsl.S.vl, xsl.W(d), xsl.R(b), xsl.R(a), xsl.I(1));
+        return;
+    }
+    // part k of a (16 or 32 bytes)
+    let k = @as(i64, ir.mask_of(v)[0]) / n;
+    let pb = v.ty.size;
+    if k == 0 {
+        let c = xsl.sse2(xe.MOVAPS, xsl.W(d), xsl.R(a));  // (the low part: the register itself, upper half cleared)
+        c.sz = xsl.class_bytes(xsl.class_of(v.ty));
+        return;
+    }
+    let mut id = xe.VEXTRACTI128;
+    if pb == 32 {
+        id = xe.VEXTRACTI64X4;
+    }
+    _ = xsl.sse4(id, xsl.S.vl, xsl.R(a), xsl.W(d), xsl.NONE(), xsl.I(k));
+}
+
+// Is v the low part of a wider vector that its only user, an add of its
+// type (a reduction's first step), can read from the wider register itself?
+// (Lanes above v's are never read; an add of a 512-bit vector's register
+// in xmm16-31 is EVEX, x64enc.high_ok.)
+fn low_alias(v: *mut ir.Value) bool {
+    if (v.loc >= 0) or (v.a.kind != ir.V_INST) or (v.uses != 1) or u.isnil(v.user) or not vs.plumbing(v) {
+        return false;
+    }
+    let n = ir.mask_of(v).len;
+    if (n >= @int_cast(usize, v.a.ty.lanes)) or (ir.mask_of(v)[0] != 0) {
+        return false;
+    }
+    let us = v.user;
+    return ((us.op == ir.OP_FADD) or (us.op == ir.OP_ADD)) and (us.ty == v.ty) and (us.a != us.b);
+}
+
+// -----------------------------------------------------------------------------
+// Constant shuffles that are one instruction: zero extensions (vpmovzx*),
+// interleaves within 128-bit groups (punpck*), 128-bit groups (vshufi64x2)
+// and permutes of 32-bit lanes within each group (pshufd). Lane indices
+// below n are a's, the rest b's; negative ones are any lane.
+// -----------------------------------------------------------------------------
+
+// The mask on lanes twice as wide, when lanes go in aligned pairs.
+fn widen_mask(m: []i32) []mut i32 {
+    let h = m.len / 2;
+    let r = u.newn.[i32](h + 1);
+    for i in 0..h {
+        let mut x = m[2 * i];
+        let mut y = m[(2 * i) + 1];
+        if (x < 0) and (y < 0) {
+            r[i] = -1;
+            continue;
+        }
+        if x < 0 {
+            x = y - 1;
+        }
+        if y < 0 {
+            y = x + 1;
+        }
+        if ((x & 1) != 0) or (y != (x + 1)) {
+            return r[0..0];
+        }
+        r[i] = x / 2;
+    }
+    return r[0..h];
+}
+
+// The mask on lanes half as wide.
+fn narrow_mask(m: []i32) []mut i32 {
+    let r = u.newn.[i32]((2 * m.len) + 1);
+    for i in 0..m.len {
+        if m[i] < 0 {
+            r[2 * i] = -1;
+            r[(2 * i) + 1] = -1;
+        } else {
+            r[2 * i] = 2 * m[i];
+            r[(2 * i) + 1] = (2 * m[i]) + 1;
+        }
+    }
+    return r[0..(2 * m.len)];
+}
+
+// Does lane index x (of n per source) name lane e (an index of the same
+// form)? Either source when they are the same value.
+fn lane_is(x: i32, e: i32, n: i32, same: bool) bool {
+    if x < 0 {
+        return true;
+    }
+    if same {
+        return (x % n) == (e % n);
+    }
+    return x == e;
+}
+
+// punpckl* (hi false) / punpckh* of x and y (0: a, 1: b) on lanes of
+// 128 / (lanes per group) bits. zy: y is the zero vector, any of whose
+// lanes will do.
+fn unpack_match(m: []i32, hi: bool, x: i32, y: i32, same: bool, zy: bool) bool {
+    let n = @int_cast(i32, m.len);
+    let g = @int_cast(i32, (16 * m.len) / @as(usize, VLbytes()));  // lanes per 128-bit group
+    let mut off: i32 = 0;
+    if hi {
+        off = g / 2;
+    }
+    for i in @as(i32, 0)..n {
+        let base = (i / g) * g;
+        let j = i % g;
+        let mut e = (base + off) + (j / 2);
+        if (j & 1) == 0 {
+            e += x * n;
+        } else {
+            e += y * n;
+            if zy and ((m[@int_cast(usize, i)] / n) == y) {
+                continue;
+            }
+        }
+        if not lane_is(m[@int_cast(usize, i)], e, n, same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn VLbytes() u8 {
+    if xsl.S.vl == 0 {
+        return 16;
+    }
+    return xsl.S.vl;
+}
+
+// The pshufd immediate when every 128-bit group permutes its own four
+// 32-bit lanes the same way (one source: src), else -1.
+fn pshufd_imm(m: []i32, n: i32, same: bool, src: i32) i64 {
+    let mut p: [4]i32 = [-1; 4];
+    for i in 0..m.len {
+        let x = m[i];
+        if x < 0 {
+            continue;
+        }
+        let ii = @int_cast(i32, i);
+        let base = (ii / 4) * 4;
+        let mut l = x;
+        if same {
+            l = x % n;
+        } else if (x / n) != src {
+            return -1;
+        } else {
+            l = x % n;
+        }
+        if (l < base) or (l >= (base + 4)) {
+            return -1;
+        }
+        let k = @int_cast(usize, ii % 4);
+        if (p[k] >= 0) and (p[k] != (l - base)) {
+            return -1;
+        }
+        p[k] = l - base;
+    }
+    let mut imm: i64 = 0;
+    for k in @as(usize, 0)..4 {
+        let mut q = p[k];
+        if q < 0 {
+            q = @int_cast(i32, k);
+        }
+        imm = imm | (@as(i64, q) << @int_cast(u32, 2 * k));
+    }
+    return imm;
+}
+
+// vshufi64x2 (512 bits): the four 128-bit groups, the low two from x, the
+// high two from y; its immediate, or -1.
+fn groups_imm(m: []i32, x: i32, y: i32, same: bool) i64 {
+    let n = @int_cast(i32, m.len);
+    let g = n / 4;
+    let mut imm: i64 = 0;
+    for q in @as(i32, 0)..4 {
+        let mut src = x;
+        if q >= 2 {
+            src = y;
+        }
+        let mut sel: i32 = -1;
+        for j in @as(i32, 0)..g {
+            let l = m[@int_cast(usize, (q * g) + j)];
+            if l < 0 {
+                continue;
+            }
+            let mut k = l;
+            if same {
+                k = l % n;
+            } else if (l / n) != src {
+                return -1;
+            } else {
+                k = l % n;
+            }
+            if ((k % g) != j) or ((sel >= 0) and (sel != (k / g))) {
+                return -1;
+            }
+            sel = k / g;
+        }
+        if sel < 0 {
+            sel = 0;
+        }
+        imm = imm | (@as(i64, sel) << @int_cast(u32, 2 * q));
+    }
+    return imm;
+}
+
+// Is v one instruction (shuffle_insn)? (For vsplit, which then keeps it.)
+fn shuffle_insn_ok(v: *mut ir.Value) bool {
+    let outer = xsl.S.vl;
+    xsl.S.vl = xsl.vl_of(v.ty);
+    let ok = shuffle_match(v, false);
+    xsl.S.vl = outer;
+    return ok;
+}
+
+fn shuffle_insn(v: *mut ir.Value) bool {
+    return shuffle_match(v, true);
+}
+
+fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
+    let t = v.ty;
+    let at = v.a.ty;
+    if (t.kind != ir.T_VEC) or (t.lanes != at.lanes) or (is.lane_bits(t) != is.lane_bits(at)) or (t.size != at.size) or
+       ((xsl.S.vl > 0) and not tg.has(tg.X_AVX)) {
+        return false;
+    }
+    let n = @int_cast(i32, t.lanes);
+    let bits = is.lane_bits(t);
+    let m = ir.mask_of(v)[0..ir.mask_of(v).len];
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let srcs: [2]*mut ir.Value = [v.a, v.b];
+    // zero extension of the low half's lanes: x's lanes, then zero lanes
+    // (without SSE4.1, an interleave with the zero vector below)
+    if (bits <= 32) and ((xsl.S.vl < 64) or (bits > 8) or tg.has(tg.X_AVX512BW)) and
+       ((xsl.S.vl == 0) or tg.has(tg.X_AVX2)) and ((xsl.S.vl > 0) or x64c.has41()) {
+        for zi in @as(i32, 0)..2 {
+            if not is_vzero(srcs[@int_cast(usize, zi)]) or same {
+                continue;
+            }
+            let x = 1 - zi;
+            let mut ok = true;
+            for i in @as(i32, 0)..n {
+                let l = m[@int_cast(usize, i)];
+                if l < 0 {
+                    continue;
+                }
+                if (i & 1) == 0 {
+                    ok = ok and (l == ((x * n) + (i / 2)));
+                } else {
+                    ok = ok and ((l / n) == zi);
+                }
+            }
+            if ok and not gen {
+                return true;
+            }
+            if ok {
+                let d = xsl.vreg(v);
+                let a = xsl.reg(srcs[@int_cast(usize, x)]);
+                let mut id = xe.VPMOVZXBW;
+                if bits == 16 {
+                    id = xe.VPMOVZXWD;
+                } else if bits == 32 {
+                    id = xe.VPMOVZXDQ;
+                }
+                _ = xsl.sse2(id, xsl.W(d), xsl.R(a));
+                return true;
+            }
+        }
+    }
+    // interleaves, on lanes as wide as they go in pairs
+    let mut w = m;
+    let mut wb = bits;
+    while (wb <= 64) and (w.len >= 2) {
+        let ids: [4]i32 = [xe.PUNPCKLBW, xe.PUNPCKLWD, xe.PUNPCKLDQ, xe.PUNPCKLQDQ];
+        let hids: [4]i32 = [xe.PUNPCKHBW, xe.PUNPCKHWD, xe.PUNPCKHDQ, xe.PUNPCKHQDQ];
+        let k = xsl.pki(wb == 8, 0, xsl.pki(wb == 16, 1, xsl.pki(wb == 32, 2, 3)));
+        for hi in @as(i32, 0)..2 {
+            for x in @as(i32, 0)..2 {
+                if unpack_match(w, hi == 1, x, 1 - x, same, not same and is_vzero(srcs[@int_cast(usize, 1 - x)])) {
+                    if not gen {
+                        return true;
+                    }
+                    let d = xsl.vreg(v);
+                    let ra = xsl.reg(srcs[@int_cast(usize, x)]);
+                    let rb = xsl.reg(srcs[@int_cast(usize, 1 - x)]);
+                    xsl.sse3(xsl.pki(hi == 1, hids[@int_cast(usize, k)], ids[@int_cast(usize, k)]), d, ra, xsl.R(rb));
+                    return true;
+                }
+            }
+        }
+        if wb == 64 {
+            break;
+        }
+        w = widen_mask(w);
+        wb = wb * 2;
+    }
+    // one source's lanes moved down or up by whole bytes, zeros shifted in
+    // (the other source zero): psrldq, pslldq
+    if t.size == 16 {
+        for zi in @as(i32, 0)..2 {
+            if same or not is_vzero(srcs[@int_cast(usize, zi)]) {
+                continue;
+            }
+            let x = 1 - zi;
+            for left in @as(i32, 0)..2 {
+                for s in @as(i32, 1)..n {
+                    let mut ok = true;
+                    for i in @as(i32, 0)..n {
+                        let l = m[@int_cast(usize, i)];
+                        if l < 0 {
+                            continue;
+                        }
+                        let mut from = i + s;
+                        if left == 1 {
+                            from = i - s;
+                        }
+                        if (from >= 0) and (from < n) {
+                            ok = ok and (l == ((x * n) + from));
+                        } else {
+                            ok = ok and ((l / n) == zi);
+                        }
+                    }
+                    if ok and not gen {
+                        return true;
+                    }
+                    if ok {
+                        let d = xsl.vreg(v);
+                        let a = xsl.reg(srcs[@int_cast(usize, x)]);
+                        vshift_imm(xsl.pki(left == 1, xe.PSLLDQ_I, xe.PSRLDQ_I), d, a, @as(i64, s * (bits / 8)));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // 32-bit lanes permuted within each group (one source)
+    let mut m32 = m;
+    if bits == 64 {
+        m32 = narrow_mask(m);
+    } else if bits == 16 {
+        m32 = widen_mask(m);
+    } else if bits == 8 {
+        m32 = widen_mask(m);
+        if m32.len > 0 {
+            m32 = widen_mask(m32);
+        }
+    }
+    if m32.len > 0 {
+        let n32 = @int_cast(i32, m32.len);
+        for src in @as(i32, 0)..2 {
+            let imm = pshufd_imm(m32, n32, same, src);
+            if (imm >= 0) and not gen {
+                return true;
+            }
+            if imm >= 0 {
+                let d = xsl.vreg(v);
+                let a = xsl.reg(srcs[@int_cast(usize, src)]);
+                _ = xsl.sse_i(xe.PSHUFD, xsl.W(d), xsl.R(a), imm);
+                return true;
+            }
+        }
+    }
+    // 128-bit groups
+    if (xsl.S.vl == 64) and tg.has(tg.X_AVX512F) {
+        for x in @as(i32, 0)..2 {
+            for y in @as(i32, 0)..2 {
+                let imm = groups_imm(m, x, y, same);
+                if (imm >= 0) and not gen {
+                    return true;
+                }
+                if imm >= 0 {
+                    let d = xsl.vreg(v);
+                    let ra = xsl.reg(srcs[@int_cast(usize, x)]);
+                    let rb = xsl.reg(srcs[@int_cast(usize, y)]);
+                    _ = xsl.sse4(xe.VSHUFI64X2, xsl.S.vl, xsl.W(d), xsl.R(rb), xsl.R(ra), xsl.I(imm));
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+pub fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
+    let a0 = v.xs.get(0);
+    let at = a0.ty;
+    if (id == ir.IN_BITMASK) and ((a0.flag & 32) != 0) {
+        // the compare into the mask register
+        cmp_to_k1(a0);
+        let r = xsl.vgpr();
+        _ = xsl.sse4(xe.KMOVQ_RK, 8, xsl.W(r), xsl.R(xe.K1), xsl.NONE(), xsl.NONE());
+        xsl.copy(xsl.vreg(v), r, xsl.GPR);
+        return;
+    }
+    if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK) {
+        gen_lane_test(v, id);
+        return;
+    }
+    let d = xsl.vreg(v);
+    if id == ir.IN_SWIZZLE {
+        gen_swizzle(v, d);
+        return;
+    }
+    if id == ir.IN_DOT_I16 {
+        let mut a: i32 = 0;
+        let b = intr_src(v, &mut a);
+        xsl.sse3(xe.PMADDWD, d, a, b);
+        return;
+    }
+    if id == ir.IN_DOT_U8I8 {
+        // vpdpbusd d (zeroed) += four products of a's unsigned and b's signed bytes a lane
+        let a = xsl.reg(a0);
+        let b = xsl.vsrc(v.xs.get(1));
+        xsl.vzero(d);
+        _ = xsl.vlz(xsl.sse4(xe.VPDPBUSD, 0, xsl.RW(d), b, xsl.R(a), xsl.NONE()));
+        return;
+    }
+    if ir.is_widen(id) {
+        gen_widen(id, d, xsl.reg(a0), at);
+        return;
+    }
+    if id == ir.IN_SAD_U8 {
+        let z = xsl.vxmm();
+        xsl.vzero(z);
+        xsl.sse3(xe.PSADBW, d, xsl.reg(a0), xsl.R(z));
+        return;
+    }
+    if is.lane_float(at) {
+        gen_float_intr(v, id);
+        return;
+    }
+    let k = xsl.lk(at);
+    if id == ir.IN_ABS {
+        xsl.sse_unary_packed(xe.PABSB + k, d, xsl.R(xsl.reg(a0)));
+        return;
+    }
+    let mut a: i32 = 0;
+    let b = intr_src(v, &mut a);
+    let mut op: i32 = 0;
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        op = vec_minmax_op(id, k);
+    } else if id == ir.IN_SADD_SAT {
+        op = xe.PADDSB + k;
+    } else if id == ir.IN_UADD_SAT {
+        op = xe.PADDUSB + k;
+    } else if id == ir.IN_SSUB_SAT {
+        op = xe.PSUBSB + k;
+    } else if id == ir.IN_USUB_SAT {
+        op = xe.PSUBUSB + k;
+    } else {
+        em.fail(u.f1("vector intrinsic %s", u.idec(id)));
+        return;
+    }
+    xsl.sse3(op, d, a, b);
+}
+
+// any_true, all_true or bitmask (id) of a vector's lanes.
+fn gen_lane_test(v: *mut ir.Value, id: i32) void {
+    let a0 = v.xs.get(0);
+    let at = a0.ty;
+    let d = xsl.vreg(v);
+    let a = xsl.reg(a0);
+    let k = xsl.lk(at);
+    if xsl.S.vl == 64 {
+        // AVX-512: through a mask register
+        if id != ir.IN_BITMASK {
+            // the lanes not zero (any) or zero (all) into k1; kortest
+            xsl.materialize_cc(d, xsl.ptest_cc(v));
+            return;
+        }
+        _ = xsl.sse4(xe.VPMOVB2M + k, 64, xsl.W(xe.K1), xsl.R(a), xsl.NONE(), xsl.NONE());
+        let r = xsl.vgpr();
+        _ = xsl.sse4(xe.KMOVQ_RK, 8, xsl.W(r), xsl.R(xe.K1), xsl.NONE(), xsl.NONE());
+        xsl.copy(d, r, xsl.GPR);
+        return;
+    }
+    if id == ir.IN_BITMASK {
+        if is.lane_float(at) or (k >= 2) {
+            if k == 2 {
+                _ = xsl.sse2(xe.MOVMSKPS, xsl.W(d), xsl.R(a));
+            } else {
+                _ = xsl.sse2(xe.MOVMSKPD, xsl.W(d), xsl.R(a));
+            }
+            return;
+        }
+        let mut x = a;
+        if k == 1 {
+            x = xsl.vxmm();
+            xsl.sse3(xe.PACKSSWB, x, a, xsl.R(a));
+        }
+        _ = xsl.sse2(xe.PMOVMSKB, xsl.W(d), xsl.R(x));
+        if k == 1 {
+            _ = xsl.alu(xe.ALU_AND, 4, xsl.RW(d), xsl.I(0xff));
+        }
+        return;
+    }
+    if xsl.ptest_cond(v) {
+        xsl.materialize_cc(d, xsl.ptest_cc(v));
+        return;
+    }
+    let z = xsl.vxmm();
+    xsl.vzero(z);
+    if id == ir.IN_ANYTRUE {
+        // some byte nonzero: not all bytes equal to zero
+        let e = xsl.vxmm();
+        xsl.sse3(xe.PCMPEQB, e, a, xsl.R(z));
+        let m = xsl.vgpr();
+        _ = xsl.sse2(xe.PMOVMSKB, xsl.W(m), xsl.R(e));
+        let mut all: i64 = 0xffff;
+        if xsl.S.vl == 32 {
+            all = -1;  // (32 bytes: 32 bits, the immediate sign-extended)
+        }
+        _ = xsl.alu(xe.ALU_CMP, 4, xsl.R(m), xsl.I(all));
+        xsl.materialize_cc(d, xe.CC_NE);
+        return;
+    }
+    // all lanes nonzero: no lane equal to zero
+    let e = xsl.vxmm();
+    if k == 3 {
+        if x64c.has41() {
+            xsl.sse3(xe.PCMPEQQ, e, a, xsl.R(z));
+        } else {
+            let e1_ = xsl.vxmm();
+            xsl.sse3(xe.PCMPEQD, e1_, a, xsl.R(z));
+            let sw = xsl.vxmm();
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(sw), xsl.R(e1_), 0xb1);
+            xsl.sse3(xe.PAND, e, e1_, xsl.R(sw));
+        }
+    } else {
+        xsl.sse3(xe.PCMPEQB + k, e, a, xsl.R(z));
+    }
+    let m = xsl.vgpr();
+    _ = xsl.sse2(xe.PMOVMSKB, xsl.W(m), xsl.R(e));
+    _ = xsl.e2(xe.TEST, 4, xsl.R(m), xsl.R(m));
+    xsl.materialize_cc(d, xe.CC_E);
+}
+
+// d = a lane-by-lane table lookup (swizzle) of v's first argument by its
+// second, a lane index out of range giving 0.
+fn gen_swizzle(v: *mut ir.Value, d: i32) void {
+    let a = xsl.reg(v.xs.get(0));
+    let idx = xsl.reg(v.xs.get(1));
+    if not tg.has(tg.X_SSSE3) {
+        // byte by byte through memory
+        let sx = vec_slot();
+        let si = vec_slot();
+        let sr = vec_slot();
+        _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(a), mc.mem_slot(sx, 0));
+        _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(idx), mc.mem_slot(si, 0));
+        for lane in @as(i64, 0)..16 {
+            let t = xsl.vgpr();
+            let b = xsl.vgpr();
+            let li = xsl.e2(xe.LOAD, 1, xsl.W(t), mc.mem_slot(si, lane));
+            li.cc = 1;
+            _ = xsl.e2(xe.MOV_RI, 4, xsl.W(b), xsl.I(0));
+            _ = xsl.alu(xe.ALU_CMP, 4, xsl.R(t), xsl.I(16));
+            let skip = xsl.new_label();
+            xsl.jcc(xe.CC_AE, skip);
+            let mut m = mc.mem_slot(sx, 0);
+            m.index = t;
+            m.scale = 1;
+            let lb = xsl.e2(xe.LOAD, 1, xsl.W(b), m);
+            lb.cc = 1;
+            xsl.place(skip);
+            _ = xsl.e2(xe.STORE, 1, mc.mem_slot(sr, lane), xsl.R(b));
+        }
+        _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(d), mc.mem_slot(sr, 0));
+        return;
+    }
+    let adj = xsl.vxmm();
+    xsl.sse3(xe.PADDUSB, adj, idx, xsl.const16(0x7070_7070_7070_7070, 0x7070_7070_7070_7070));
+    xsl.sse3(xe.PSHUFB, d, a, xsl.R(adj));
+}
+
+// The packed minimum or maximum (id) of lanes of 8, 16 or 32 bits (k 0, 1,
+// 2 and up).
+fn vec_minmax_op(id: i32, k: i32) i32 {
+    let ops: [12]i32 = [xe.PMINSB, xe.PMINSW, xe.PMINSD, xe.PMAXSB, xe.PMAXSW, xe.PMAXSD, xe.PMINUB, xe.PMINUW,
+                        xe.PMINUD, xe.PMAXUB, xe.PMAXUW, xe.PMAXUD];
+    let mut row: i32 = 0;
+    if id == ir.IN_SMAX {
+        row = 1;
+    } else if id == ir.IN_UMIN {
+        row = 2;
+    } else if id == ir.IN_UMAX {
+        row = 3;
+    }
+    let mut col = k;
+    if col > 2 {
+        col = 2;
+    }
+    return ops[@int_cast(usize, (row * 3) + col)];
+}
+
+// -----------------------------------------------------------------------------
+// AVX2 and AVX-512: whole-width permutes, conversions, masked loads and
+// stores, per-lane shifts and bit counts. codegen.ax makes the IN_PERM ...
+// intrinsics only where these (x64caps.ax) say the selector does them.
+// -----------------------------------------------------------------------------
+
+// Leading-zero counts, population counts and trailing-zero counts of each
+// lane (vplzcnt[dq] with AVX512CD, vpopcnt[dq] with VPOPCNTDQ, vpopcnt[bw]
+// with BITALG).
+pub fn bitcount_ok(id: i32, bits: i32, lanes: i32) bool {
+    let n = x64c.vbytes(bits, lanes);
+    if not x64c.avx512_for(n) {
+        return false;
+    }
+    if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) {
+        return ((bits == 32) or (bits == 64)) and tg.has(tg.X_AVX512CD);
+    }
+    if id == ir.IN_CTPOP {
+        if (bits == 32) or (bits == 64) {
+            return tg.has(tg.X_AVX512VPOPCNTDQ);
+        }
+        return tg.has(tg.X_AVX512BITALG);
+    }
+    return false;
+}
+
+// A conversion between vectors of 32-bit (or 64-bit) lanes: cvtdq2ps and
+// cvttps2dq (SSE2 and AVX), the unsigned ones and the 64-bit ones with
+// AVX-512 (DQ).
+pub fn cvt_ok(o: i32, from: *ir.Ty, to: *ir.Ty) bool {
+    if (from.kind != ir.T_VEC) or (to.kind != ir.T_VEC) or (is.lane_bits(from) != is.lane_bits(to)) {
+        return false;
+    }
+    let b = is.lane_bits(to);
+    let n = @as(u64, to.size);
+    if b == 64 {
+        return tg.has(tg.X_AVX512DQ) and x64c.avx512_for(n);
+    }
+    if b != 32 {
+        return false;
+    }
+    if (o == ir.OP_SITOFP) or (o == ir.OP_FPTOSI_SAT) {
+        return (n == 16) or ((n == 32) and tg.has(tg.X_AVX2)) or ((n == 64) and x64c.avx512_for(n));
+    }
+    return ((o == ir.OP_UITOFP) or (o == ir.OP_FPTOUI_SAT)) and x64c.avx512_for(n);
+}
+
+// A constant vector (of the width being selected) of 32- or 64-bit lanes x.
+fn splat_mem(x: u64, bits: i32) mc.MOp {
+    let mut q = x;
+    if bits == 32 {
+        q = (x & 0xffff_ffff) | (x << 32);
+    } else if bits == 16 {
+        q = x & 0xffff;
+        q = q | (q << 16);
+        q = q | (q << 32);
+    } else if bits == 8 {
+        q = x & 0xff;
+        q = q | (q << 8);
+        q = q | (q << 16);
+        q = q | (q << 32);
+    }
+    return xsl.const16(q, q);
+}
+
+// Vector conversions (cvt_ok): saturating like the scalar ones.
+pub fn vec_cvt(v: *mut ir.Value) void {
+    let o = v.op;
+    let d = xsl.vreg(v);
+    let x = xsl.reg(v.a);
+    let b = is.lane_bits(v.ty);
+    if o == ir.OP_SITOFP {
+        xsl.sse_unary_packed(xsl.pki(b == 32, xe.CVTDQ2PS, xe.VCVTQQ2PD), d, xsl.R(x));
+        return;
+    }
+    if o == ir.OP_UITOFP {
+        xsl.sse_unary_packed(xsl.pki(b == 32, xe.VCVTUDQ2PS, xe.VCVTUQQ2PD), d, xsl.R(x));
+        return;
+    }
+    let z = xsl.vxmm();
+    xsl.vzero(z);
+    if o == ir.OP_FPTOUI_SAT {
+        // max(x, 0) is 0 for NaN (its second operand) and negative lanes;
+        // the conversion gives all ones above the range
+        let t = xsl.vxmm();
+        xsl.sse3(xsl.pki(b == 32, xe.MAXPS, xe.MAXPD), t, x, xsl.R(z));
+        xsl.sse_unary_packed(xsl.pki(b == 32, xe.VCVTTPS2UDQ, xe.VCVTTPD2UQQ), d, xsl.R(t));
+        return;
+    }
+    // the conversion gives the sign bit alone for NaN and out-of-range lanes:
+    // flipped to the largest value where x >= 2^(b-1), cleared where x is NaN
+    let t = xsl.vxmm();
+    xsl.sse_unary_packed(xsl.pki(b == 32, xe.CVTTPS2DQ, xe.VCVTTPD2QQ), t, xsl.R(x));
+    let lim = xsl.vxmm();
+    let mut cmp = xe.CMPPS;
+    if b == 32 {
+        _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(lim), splat_mem(0x4f00_0000, 32));  // 2^31
+    } else {
+        cmp = xe.CMPPD;
+        _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(lim), splat_mem(0x43e0_0000_0000_0000, 64));  // 2^63
+    }
+    let k = xsl.lk(v.ty);
+    let hi = xsl.vxmm();
+    vcmp_i(cmp, hi, lim, xsl.R(x), 2, k);  // 2^(b-1) <= x (ordered)
+    let f = xsl.vxmm();
+    xsl.sse3(xe.PXOR, f, t, xsl.R(hi));
+    let ord = xsl.vxmm();
+    vcmp_i(cmp, ord, x, xsl.R(x), 7, k);  // not NaN
+    xsl.sse3(xe.PAND, d, f, xsl.R(ord));
+}
+
+// Are the lanes of index vector x all below n (unsigned), as constants or
+// masked by one?
+fn known_below(x0: *ir.Value, n: u64) bool {
+    let mut x = x0;
+    while ir.is_op(x, ir.OP_COPY) {
+        x = x.a;  // (a constant hoisted out of a loop)
+    }
+    if x.kind == ir.V_ZERO {
+        return true;
+    }
+    if x.kind == ir.V_CAGG {
+        for k in 0..x.xs.len {
+            let c = x.xs.get(k);
+            if (c.kind == ir.V_CINT) and (ir.cint_val(c) >= n) {
+                return false;
+            }
+            if (c.kind != ir.V_CINT) and (c.kind != ir.V_ZERO) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if ir.is_op(x, ir.OP_SPLAT) {
+        return (x.a.kind == ir.V_ZERO) or ((x.a.kind == ir.V_CINT) and (ir.cint_val(x.a) < n));
+    }
+    if ir.is_op(x, ir.OP_AND) {
+        return known_below(x.a, n) or known_below(x.b, n);
+    }
+    return false;
+}
+
+// k1 <- the lanes of idx below n (unsigned), for a zeroing permute: 9 (k1,
+// zeroing) as the permute's mask, or 0 when every index is a lane.
+fn in_range_mask(idx_v: *mut ir.Value, idx: i32, n: u64) i64 {
+    if known_below(idx_v, n) {
+        return 0;
+    }
+    let b = is.lane_bits(idx_v.ty);
+    let mut id = xe.VPCMPUD;
+    if b == 8 {
+        id = xe.VPCMPUB;
+    } else if b == 16 {
+        id = xe.VPCMPUW;
+    } else if b == 64 {
+        id = xe.VPCMPUQ;
+    }
+    _ = xsl.sse4(id, xsl.S.vl, xsl.W(xe.K1), splat_mem(n, b), xsl.R(idx), xsl.I(1));  // idx < n
+    return 9;
+}
+
+// A wide shuffle whose result has its operands' type, as one permute by
+// constant indices: of one operand (vpermd with AVX2, or AVX-512's), or of
+// both (vpermt2*).
+fn perm_shuffle_ok(v: *mut ir.Value) bool {
+    let t = v.ty;
+    let at = v.a.ty;
+    if (t.lanes != at.lanes) or (is.lane_bits(t) != is.lane_bits(at)) {
+        return false;
+    }
+    return x64c.perm_ok(is.lane_bits(t), t.lanes, not one_source(v)) or x64c.perm_ok(is.lane_bits(t), t.lanes, true) or
+           shuffle_insn_ok(v);
+}
+
+// Does the shuffle read one operand only?
+fn one_source(v: *mut ir.Value) bool {
+    let n = v.a.ty.lanes;
+    let mut lo = false;
+    let mut hi = false;
+    for i in 0..ir.mask_of(v).len {
+        if ir.mask_of(v)[i] >= n {
+            hi = true;
+        } else if ir.mask_of(v)[i] >= 0 {
+            lo = true;
+        }
+    }
+    return not (lo and hi) or (ir.resolve(v.a) == ir.resolve(v.b));
+}
+
+// The permute by indices of lanes of b bits (floating-point if fl): of one
+// source (VPERM*), or of two (VPERMT2*, the first source in the destination).
+fn vperm_op(b: i32, fl: bool, two: bool) i32 {
+    if b == 8 {
+        return xsl.pki(two, xe.VPERMT2B, xe.VPERMB);
+    }
+    if b == 16 {
+        return xsl.pki(two, xe.VPERMT2W, xe.VPERMW);
+    }
+    if b == 64 {
+        if fl {
+            return xsl.pki(two, xe.VPERMT2PD, xe.VPERMPDV);
+        }
+        return xsl.pki(two, xe.VPERMT2Q, xe.VPERMQV);
+    }
+    if fl {
+        return xsl.pki(two, xe.VPERMT2PS, xe.VPERMPS);
+    }
+    return xsl.pki(two, xe.VPERMT2D, xe.VPERMD);
+}
+
+fn perm_shuffle(v: *mut ir.Value) void {
+    let t = v.ty;
+    let n = t.lanes;
+    let b = is.lane_bits(t);
+    let fl = is.lane_float(t);
+    let d = xsl.vreg(v);
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let mut uses_b = false;
+    for i in 0..ir.mask_of(v).len {
+        if (ir.mask_of(v)[i] >= n) and not same {
+            uses_b = true;
+        }
+    }
+    let two = not one_source(v);
+    // the indices, as a constant of the lanes' width
+    let mut bs = bn.new_bytes();
+    for i in 0..ir.mask_of(v).len {
+        let mut m = ir.mask_of(v)[i];
+        if m < 0 {
+            m = 0;
+        } else if not two and (m >= n) {
+            m = m - n;  // (of b alone, or of a, which b is)
+        }
+        let x = @as(u64, @bit_cast(u32, m));
+        for k in 0..@as(usize, @bit_cast(u32, b / 8)) {
+            bs.u8_(@truncate(u8, x >> @int_cast(u32, k * 8)));
+        }
+    }
+    let idx = xsl.const_vreg(xe.MOVDQU_LD, xsl.const_bytes(&bs, @as(usize, xsl.S.vl)), 0, 0);
+    bs.free();
+    if not two {
+        let mut src = xsl.reg(v.a);
+        if uses_b {
+            src = xsl.reg(v.b);
+        }
+        xsl.sse3(vperm_op(b, fl, false), d, idx, xsl.R(src));
+        return;
+    }
+    xsl.copy(d, xsl.reg(v.a), xsl.class_of(t));
+    _ = xsl.sse4(vperm_op(b, fl, true), xsl.S.vl, xsl.RW(d), xsl.R(xsl.reg(v.b)), xsl.R(idx), xsl.NONE());
+}
+
+// k1 <- vector compare c (AVX-512), lane by lane.
+fn cmp_to_k1(c: *mut ir.Value) void {
+    cmp_to_k(c, false);
+}
+
+// k1 <- c, or its negation (inv, which an and of masks has not: kinv_ok).
+// An and of compares is the first into k1, then each other masked by k1.
+fn cmp_to_k(c: *mut ir.Value, inv: bool) void {
+    cmp_into_k(c, inv, false);
+}
+
+fn kinv_ok(c: *ir.Value) bool {
+    return not ir.is_op(c, ir.OP_AND);
+}
+
+// A vector of zeros (a constant or a splat of one).
+fn is_vzero(v: *ir.Value) bool {
+    if ir.is_op(v, ir.OP_COPY) {
+        return is_vzero(v.a);
+    }
+    return ir.is_zero(v) or (ir.is_op(v, ir.OP_SPLAT) and ir.is_zero(v.a));
+}
+
+// A compare of lanes against zero for (in)equality: vptestm / vptestnm.
+fn ptest_cmp(c: *ir.Value) bool {
+    if not ir.is_op(c, ir.OP_ICMP) or not is_vzero(c.b) {
+        return false;
+    }
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    return (p == ir.IntNE) or (p == ir.IntEQ) or (p == ir.IntUGT) or (p == ir.IntULE);
+}
+
+// k1 <- compare c lane by lane, or its negation (inv); and k1 already
+// (masked). EVEX at every width (aux 32: the narrower compares have a VEX
+// form too, which writes a vector).
+fn cmp_into_k(c: *mut ir.Value, inv: bool, masked: bool) void {
+    let mut kz: i64 = 32;
+    if masked {
+        kz = 32 | 1;
+    }
+    if ir.is_op(c, ir.OP_AND) {
+        cmp_into_k(c.a, false, masked);
+        cmp_into_k(c.b, false, true);
+        return;
+    }
+    let t = c.a.ty;
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    if ptest_cmp(c) {
+        // (x & y) != 0 lane by lane, or x != 0
+        let ne = ((p == ir.IntNE) or (p == ir.IntUGT)) != inv;
+        let mut x = c.a;
+        let mut y = c.a;
+        if ir.is_op(c.a, ir.OP_AND) and ((c.a.flag & 16) != 0) {
+            x = c.a.a;
+            y = c.a.b;
+        }
+        let rx = xsl.reg(x);
+        let ry = xsl.reg(y);
+        let i = xsl.sse4(xsl.pki(ne, xe.VPTESTMB, xe.VPTESTNMB) + xsl.lk(t), xsl.S.vl, xsl.W(xe.K1), xsl.R(ry),
+                         xsl.R(rx), xsl.NONE());
+        i.aux = kz;
+        return;
+    }
+    let mut xa = c.a;
+    let mut xb = c.b;
+    let mut imm: i64 = 0;
+    let mut op: i32 = 0;
+    if c.op == ir.OP_FCMP {
+        op = xsl.pki(is.lane_bits(t) == 32, xe.CMPPS, xe.CMPPD);
+        if p == ir.RealUNE {
+            imm = 4;
+        } else if (p == ir.RealOLT) or (p == ir.RealOGT) {
+            imm = 1;
+        } else if (p == ir.RealOLE) or (p == ir.RealOGE) {
+            imm = 2;
+        }
+        if (p == ir.RealOGT) or (p == ir.RealOGE) {
+            xa = c.b;
+            xb = c.a;
+        }
+    } else {
+        // vpcmp[u]: 0 eq, 1 lt, 2 le, 4 ne, 5 nlt, 6 nle
+        let k = xsl.lk(t);
+        op = xe.VPCMPUB + k;
+        if (p == ir.IntSLT) or (p == ir.IntSLE) or (p == ir.IntSGT) or (p == ir.IntSGE) {
+            op = xe.VPCMPB + k;
+        }
+        if p == ir.IntNE {
+            imm = 4;
+        } else if (p == ir.IntULT) or (p == ir.IntSLT) {
+            imm = 1;
+        } else if (p == ir.IntULE) or (p == ir.IntSLE) {
+            imm = 2;
+        } else if (p == ir.IntUGE) or (p == ir.IntSGE) {
+            imm = 5;
+        } else if (p == ir.IntUGT) or (p == ir.IntSGT) {
+            imm = 6;
+        }
+    }
+    if constish(xa) and not constish(xb) {
+        // the constant as the r/m operand (memory when read once): b cmp' a
+        let x = xa;
+        xa = xb;
+        xb = x;
+        if c.op == ir.OP_FCMP {
+            if imm == 1 {
+                imm = 0x0e;  // gt
+            } else if imm == 2 {
+                imm = 0x0d;  // ge
+            }
+        } else if (imm == 1) or (imm == 6) {
+            imm = 7 - imm;  // lt / nle
+        } else if (imm == 2) or (imm == 5) {
+            imm = 7 - imm;  // le / nlt
+        }
+    }
+    if inv {
+        imm = imm ^ 4;  // (each predicate's negation: eq / ne, lt / nlt, le / nle, unordered too)
+    }
+    let a = xsl.reg(xa);
+    let b = xsl.reg(xb);
+    let i = xsl.sse4(op, xsl.S.vl, xsl.W(xe.K1), xsl.R(b), xsl.R(a), xsl.I(imm));  // a cmp b
+    i.aux = kz;
+}
+
+// A constant operand (a register that is rematerialized).
+fn constish(v: *ir.Value) bool {
+    if ir.is_op(v, ir.OP_COPY) or ir.is_op(v, ir.OP_BITCAST) {
+        return constish(v.a);
+    }
+    return (v.kind == ir.V_CAGG) or (v.kind == ir.V_ZERO) or xsl.remat(v);
+}
+
+// A compare selects and ands can read as a mask register (AVX-512 at its
+// width).
+fn kcmp(c: *ir.Value) bool {
+    if ir.is_op(c, ir.OP_AND) and (c.ty.kind == ir.T_VEC) {
+        return kcmp(c.a) and kcmp(c.b) and (c.a.ty.lanes == c.b.ty.lanes);
+    }
+    return (ir.is_op(c, ir.OP_ICMP) or ir.is_op(c, ir.OP_FCMP)) and (c.ty.kind == ir.T_VEC) and
+           x64c.avx512_for(@as(u64, c.a.ty.size));
+}
+
+fn strip_bitcast(v: *mut ir.Value) *mut ir.Value {
+    if ir.is_op(v, ir.OP_BITCAST) and (v.a.ty.kind == ir.T_VEC) and (v.a.ty.size == v.ty.size) {
+        return v.a;
+    }
+    return v;
+}
+
+// The operation a masked instruction can compute itself (x, through a
+// bitcast, only used there): its result is merged into another value, or
+// zeroed, where the mask is clear.
+fn maskable_op(x: *mut ir.Value, lanes: i32) *mut ir.Value {
+    let o = strip_bitcast(x);
+    if (o.kind != ir.V_INST) or (o.ty.kind != ir.T_VEC) or (o.uses != 1) or (o.ty.lanes != lanes) or
+       ((o.flag & ~@as(i32, 256)) != 0) {
+        return ir.vnil();
+    }
+    if (o != x) and ((x.uses != 1) or ((x.flag & ~@as(i32, 256)) != 0)) {
+        return ir.vnil();
+    }
+    let k = o.op;
+    if ((k >= ir.OP_FADD) and (k <= ir.OP_FDIV)) or (k == ir.OP_ADD) or (k == ir.OP_SUB) {
+        return o;
+    }
+    if ((k == ir.OP_AND) or (k == ir.OP_OR) or (k == ir.OP_XOR)) and (is.lane_bits(o.ty) == 32) {
+        return o;
+    }
+    if (minmax_op(o) != 0) and (o.xs.get(0) != o.xs.get(1)) {
+        return o;  // (vpmaxsd zmm{k1}: select(m, max(x, y), x))
+    }
+    return ir.vnil();
+}
+
+// The instruction of an integer vector min or max of 8-, 16- or 32-bit
+// lanes, else 0.
+fn minmax_op(o: *ir.Value) i32 {
+    if (o.op != ir.OP_INTR) or (o.ty.kind != ir.T_VEC) or is.lane_float(o.ty) or (o.xs.len != 2) {
+        return 0;
+    }
+    let id = @truncate(i32, @bit_cast(i64, o.cv));
+    let k = xsl.lk(o.ty);
+    if k > 2 {
+        return 0;
+    }
+    if id == ir.IN_SMIN {
+        return xsl.pki(k == 0, xe.PMINSB, xsl.pki(k == 1, xe.PMINSW, xe.PMINSD));
+    }
+    if id == ir.IN_SMAX {
+        return xsl.pki(k == 0, xe.PMAXSB, xsl.pki(k == 1, xe.PMAXSW, xe.PMAXSD));
+    }
+    if id == ir.IN_UMIN {
+        return xsl.pki(k == 0, xe.PMINUB, xsl.pki(k == 1, xe.PMINUW, xe.PMINUD));
+    }
+    if id == ir.IN_UMAX {
+        return xsl.pki(k == 0, xe.PMAXUB, xsl.pki(k == 1, xe.PMAXUW, xe.PMAXUD));
+    }
+    return 0;
+}
+
+// The operation computing x when a masked instruction does (flag 256).
+fn fused_op(x: *mut ir.Value) *mut ir.Value {
+    let o = strip_bitcast(x);
+    if (o.flag & 256) != 0 {
+        return o;
+    }
+    return ir.vnil();
+}
+
+// o (maskable_op) into d where k1 has its bit, d's own lanes (merge) or
+// zeros elsewhere.
+fn masked_op(o: *mut ir.Value, d: i32, zero: bool, src: *mut ir.Value) void {
+    // (an operand that is the value merged into, d's lanes already: d)
+    let mut oa = o.a;
+    let mut ob = o.b;
+    if o.op == ir.OP_INTR {
+        oa = o.xs.get(0);
+        ob = o.xs.get(1);
+    }
+    let mut a = d;
+    if oa != src {
+        a = xsl.reg(oa);
+    }
+    let mut b = xsl.R(d);
+    if ob != src {
+        b = xsl.R(xsl.reg(ob));
+    }
+    let k = o.op;
+    let mut id: i32 = 0;
+    if k == ir.OP_INTR {
+        id = minmax_op(o);
+    } else if (k >= ir.OP_FADD) and (k <= ir.OP_FDIV) {
+        id = xsl.fop(k, is.is_f32(o.ty), true);
+    } else if k == ir.OP_ADD {
+        id = xe.PADDB + xsl.lk(o.ty);
+    } else if k == ir.OP_SUB {
+        id = xe.PSUBB + xsl.lk(o.ty);
+    } else if k == ir.OP_AND {
+        id = xe.PAND;
+    } else if k == ir.OP_OR {
+        id = xe.POR;
+    } else {
+        id = xe.PXOR;
+    }
+    let mut dop = xsl.RW(d);
+    let mut kz: i64 = 1;
+    if zero {
+        dop = xsl.W(d);
+        kz = 1 | 8;
+    }
+    let i = xsl.sse4(id, xsl.S.vl, dop, b, xsl.R(a), xsl.NONE());
+    i.aux = kz;
+}
+
+// d <- x where k1 has its bit, else zero.
+fn masked_move(d: i32, x: i32, t: *ir.Ty) void {
+    let i = xsl.sse4(masked_mov(is.lane_bits(t), false), xsl.S.vl, xsl.W(d), xsl.R(x), xsl.NONE(), xsl.NONE());
+    i.aux = 1 | 8;
+}
+
+// A select (sel_parts): m ? x : y. A compare's mask in k1 picks lanes
+// (vpblendm*), or makes the instruction computing x (or y) merge into the
+// other, or zero the rest; a select between a float compare's operands is
+// a minimum or maximum. Other masks: one vpternlogd, bit by bit (0xca).
+pub fn gen_blend(v: *mut ir.Value) void {
+    let s = is.sel_parts(v);
+    let d = xsl.vreg(v);
+    let m = s.m;
+    if ir.is_op(m, ir.OP_FCMP) {
+        // m ? x : y for m = a < b (or a > b) and {x, y} = {a, b}: minps and maxps
+        // return their second operand unless the first is less (greater),
+        // NaN and signed zeros included
+        let p = @truncate(i32, @bit_cast(i64, m.cv));
+        let x = strip_bitcast(s.x);
+        let y = strip_bitcast(s.y);
+        if ((p == ir.RealOLT) or (p == ir.RealOGT)) and (((x == m.a) and (y == m.b)) or ((x == m.b) and (y == m.a))) {
+            let min = (p == ir.RealOLT) == (x == m.a);
+            let single = is.lane_bits(m.a.ty) == 32;
+            let mut id = xsl.pki(single, xe.MAXPS, xe.MAXPD);
+            if min {
+                id = xsl.pki(single, xe.MINPS, xe.MINPD);
+            }
+            let rx = xsl.reg(x);
+            xsl.sse3(id, d, rx, xsl.R(xsl.reg(y)));
+            return;
+        }
+    }
+    if kcmp(m) {
+        let ox = fused_op(s.x);
+        let oy = fused_op(s.y);
+        if u.notnil(ox) {
+            xsl.copy(d, xsl.reg(s.y), xsl.class_of(v.ty));
+            cmp_to_k(m, false);
+            masked_op(ox, d, false, strip_bitcast(s.y));
+            return;
+        }
+        if u.notnil(oy) and kinv_ok(m) {
+            xsl.copy(d, xsl.reg(s.x), xsl.class_of(v.ty));
+            cmp_to_k(m, true);
+            masked_op(oy, d, false, strip_bitcast(s.x));
+            return;
+        }
+        if is_vzero(s.y) {
+            let rx = xsl.reg(s.x);
+            cmp_to_k(m, false);
+            masked_move(d, rx, v.ty);
+            return;
+        }
+        if is_vzero(s.x) and kinv_ok(m) {
+            let ry = xsl.reg(s.y);
+            cmp_to_k(m, true);
+            masked_move(d, ry, v.ty);
+            return;
+        }
+        let rx = xsl.reg(s.x);
+        let ry = xsl.reg(s.y);
+        cmp_to_k(m, false);
+        let i = xsl.sse4(xe.VPBLENDMB + xsl.lk(v.ty), xsl.S.vl, xsl.W(d), xsl.R(rx), xsl.R(ry), xsl.NONE());
+        i.aux = 1;
+        return;
+    }
+    let x = xsl.reg(s.x);
+    let y = xsl.reg(s.y);
+    xsl.copy(d, xsl.reg(s.m), xsl.class_of(v.ty));
+    _ = xsl.sse4(xe.VPTERNLOGD, xsl.S.vl, xsl.RW(d), xsl.R(y), xsl.R(x), xsl.I(0xca));
+}
+
+// An and of a compare and x (flag 128): x where the compare holds, else
+// zero (a zero-masked move, or the instruction computing x zero-masked).
+pub fn gen_kand(v: *mut ir.Value) void {
+    let d = xsl.vreg(v);
+    let mut c = v.a;
+    let mut x = v.b;
+    if not kcmp(c) {
+        c = v.b;
+        x = v.a;
+    }
+    let o = fused_op(x);
+    if u.notnil(o) {
+        cmp_to_k(c, false);
+        masked_op(o, d, true, ir.vnil());
+        return;
+    }
+    let rx = xsl.reg(x);
+    cmp_to_k(c, false);
+    masked_move(d, rx, v.ty);
+}
+
+// Marks the vector instructions others do. A select's and, and and xor
+// (flag 16, when they have no other use) are its own; an and of a compare
+// is a masked one (flag 128); the instruction computing a select's or an
+// and's value, when the masked instruction computes it instead (flag 256);
+// a compare read only as a mask register (flag 32: each reader compares
+// again, into k1); and an and only tested against zero (flag 16, vptestm).
+pub fn mark_fused_vectors(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux2 = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let s = is.sel_parts(i);
+            // (only when the two `and`s are its alone: they are then not
+            // emitted, and the blend reads their operands; one that another
+            // instruction reads too is emitted, and may fold its operand, a
+            // load, into its own memory operand, leaving it in no register)
+            if u.notnil(s.x) and x64c.avx512_for(i.ty.size) and (s.p.uses == 1) and (s.q.uses == 1) {
+                i.flag = i.flag | 64;
+                s.p.flag = s.p.flag | 16;
+                s.q.flag = s.q.flag | 16;
+                if kcmp(s.m) {
+                    s.m.aux2 += 1;  // (p reads it)
+                }
+                if s.n.uses == 1 {
+                    s.n.flag = s.n.flag | 16;
+                    if kcmp(s.m) {
+                        s.m.aux2 += 1;
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ir.is_op(i, ir.OP_AND) and (i.ty.kind == ir.T_VEC) and ((i.flag & 16) == 0) and
+               (kcmp(i.a) != kcmp(i.b)) {
+                i.flag = i.flag | 128;
+                if kcmp(i.a) {
+                    i.a.aux2 += 1;
+                } else {
+                    i.b.aux2 += 1;
+                }
+            }
+            if (i.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, i.cv)) == ir.IN_BITMASK) and kcmp(i.xs.get(0)) {
+                i.xs.get(0).aux2 += 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // values the masked instructions compute; compares only in k1
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.flag & 64) != 0 {
+                let s = is.sel_parts(i);
+                if kcmp(s.m) and ((s.p.flag & 16) != 0) {
+                    fuse_masked(s.x, i);
+                    if u.isnil(fused_op(s.x)) and kinv_ok(s.m) {
+                        fuse_masked(s.y, i);
+                    }
+                }
+            } else if (i.flag & 128) != 0 {
+                fuse_masked(pick_val(kcmp(i.a), i.b, i.a), i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // (last to first: an and of masks read only as a mask leaves its
+    // compares read only as masks)
+    b = f.last;
+    while u.notnil(b) {
+        let mut i = b.last;
+        while u.notnil(i) {
+            if kcmp(i) and (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+                i.flag = i.flag | 32;
+                if ir.is_op(i, ir.OP_AND) {
+                    i.a.aux2 += 1;
+                    i.b.aux2 += 1;
+                }
+            }
+            i = i.prev;
+        }
+        b = b.prev;
+    }
+    // ands only tested against zero
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ptest_cmp(i) and ((xsl.inst_vl(i) == 64) or ((i.flag & 32) != 0)) and ir.is_op(i.a, ir.OP_AND) and
+               (i.a.uses == 1) and (i.a.flag == 0) and (i.a.blk == b) and kcmp(i) {
+                i.a.flag = i.a.flag | 16;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // vector loads that are the memory operand of their only user (vsrc)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if xc.FN.avx and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
+               not xsl.remat(i) and u.notnil(i.user) and (i.user.blk == b) and
+               ((i.user.flag & (((16 | 32) | 64) | (128 | 256))) == 0) and reads_as_rm(i.user, i) and
+               xsl.quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+            }
+            // a scalar float load that is the r/m operand of its only user,
+            // an arithmetic operation (addsd xmm, [m])
+            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_FLOAT) and
+               ((i.ty.bits == 32) or (i.ty.bits == 64)) and u.notnil(i.user) and (i.user.blk == b) and
+               (i.user.ty == i.ty) and (i.user.op >= ir.OP_FADD) and (i.user.op <= ir.OP_FDIV) and
+               (i.user.flag == 0) and scalar_rm(i.user, i) and xsl.quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+            }
+            // a scalar load only splatted: a broadcast from memory
+            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and
+               ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
+               u.notnil(i.user) and ir.is_op(i.user, ir.OP_SPLAT) and (i.user.blk == b) and tg.has(tg.X_AVX2) and
+               xsl.quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+                if bcast_fma(i.user) {
+                    i.user.flag = i.user.flag | xsl.F_BCST;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Can splat s (of a load folded into it), a multiplicand of its only user, a
+// 512-bit @fma, be that instruction's memory operand, broadcast from one
+// element ({1to16}, {1to8})? The load then happens at the user: nothing
+// between may write memory.
+fn bcast_fma(s: *mut ir.Value) bool {
+    let us = s.user;
+    if (s.uses != 1) or u.isnil(us) or (us.blk != s.blk) or (s.ty.size != 64) or not tg.has(tg.X_AVX512F) or
+       not ir.is_op(us, ir.OP_INTR) or (@truncate(i32, @bit_cast(i64, us.cv)) != ir.IN_FMA) or (us.ty.size != 64) or
+       ((us.flag & (((16 | 32) | 64) | (128 | 256))) != 0) or (is.lane_bits(s.ty) < 32) {
+        return false;
+    }
+    let x0 = us.xs.get(0);
+    let x1 = us.xs.get(1);
+    if (us.xs.get(2) == s) or ((x0 == s) == (x1 == s)) {
+        return false;
+    }
+    if xsl.folded_load(x0) or xsl.folded_load(x1) or xsl.bcast_splat(x0) or xsl.bcast_splat(x1) {
+        return false;  // (one memory operand)
+    }
+    return xsl.quiet_between(s.a, us);
+}
+
+fn pick_val(c: bool, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// x (maskable_op), read by masked instruction us in its block: computed by us.
+fn fuse_masked(x: *mut ir.Value, us: *mut ir.Value) void {
+    let o = maskable_op(x, us.ty.lanes);
+    if u.isnil(o) or (o.blk != us.blk) {
+        return;
+    }
+    o.flag = o.flag | 256;
+    x.flag = x.flag | 256;
+}
+
+// Does scalar float operation us read x (only) as its r/m operand, through
+// vsrc_of (one memory operand)?
+fn scalar_rm(us: *ir.Value, x: *mut ir.Value) bool {
+    if us.a == us.b {
+        return false;
+    }
+    if us.b == x {
+        return not xsl.folded_load(us.a);
+    }
+    return xsl.commutes(us.op) and (us.a == x) and not xsl.folded_load(us.b) and not ir.is_op(us.b, ir.OP_LOAD);
+}
+
+// Does vector instruction us read x (only) as its r/m operand, through vsrc?
+fn reads_as_rm(us: *ir.Value, x: *mut ir.Value) bool {
+    let o = us.op;
+    if us.ty.kind != ir.T_VEC {
+        return false;
+    }
+    if ((o >= ir.OP_FADD) and (o <= ir.OP_FDIV)) or (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_AND) or
+       (o == ir.OP_OR) or (o == ir.OP_XOR) or (o == ir.OP_MUL) {
+        if xsl.commutes(o) and (us.a == x) and (us.b != x) and not ir.is_op(us.b, ir.OP_LOAD) {
+            return true;  // (the operands swapped: vsrc_of; one memory operand)
+        }
+        return (us.b == x) and (us.a != x);
+    }
+    if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, us.cv)) == ir.IN_FMA) {
+        let x0 = us.xs.get(0);
+        let x1 = us.xs.get(1);
+        if (x0 == x) and (x1 != x) and (us.xs.get(2) != x) and not xsl.bcast_splat(x1) and
+           not ir.is_op(x1, ir.OP_LOAD) {
+            return true;  // (the multiplicands swapped: gen_float_intr; one memory operand)
+        }
+        return (x1 == x) and (x0 != x) and (us.xs.get(2) != x) and not xsl.bcast_splat(x0);
+    }
+    if (o == ir.OP_INTR) and int_rm_intr(us) {
+        let x0 = us.xs.get(0);
+        let x1 = us.xs.get(1);
+        if intr_commutes(us) and (x0 == x) and (x1 != x) and not ir.is_op(x1, ir.OP_LOAD) {
+            return true;  // (the operands swapped: intr_src; one memory operand)
+        }
+        return (x1 == x) and (x0 != x);
+    }
+    return false;
+}
+
+// An integer vector intrinsic of two operands whose second the instruction
+// can read from memory (gen_vec_intr): pmaddwd, saturating adds and
+// subtractions, integer minimum and maximum.
+fn int_rm_intr(v: *ir.Value) bool {
+    if (v.xs.len != 2) or (v.xs.get(0).ty.kind != ir.T_VEC) or is.lane_float(v.xs.get(0).ty) {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    let k = xsl.lk(v.xs.get(0).ty);
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        return k <= 1;
+    }
+    return (id == ir.IN_DOT_I16) or (minmax_op(v) != 0);
+}
+
+fn intr_commutes(v: *ir.Value) bool {
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    return (id != ir.IN_SSUB_SAT) and (id != ir.IN_USUB_SAT);
+}
+
+// The operands of a two-operand intrinsic (int_rm_intr) as its instruction
+// reads them: the first a register, the second its r/m operand (a load folded
+// into it goes there).
+fn intr_src(v: *mut ir.Value, a: *mut i32) mc.MOp {
+    let x0 = v.xs.get(0);
+    let x1 = v.xs.get(1);
+    if intr_commutes(v) and ir.is_op(x0, ir.OP_LOAD) and ((x0.flag & 8) != 0) {
+        a.* = xsl.reg(x1);
+        return xsl.vsrc(x0);
+    }
+    a.* = xsl.reg(x0);
+    return xsl.vsrc(x1);
+}
+
+// IN_SWIDEN_LO ... IN_UWIDEN_HI: vpmovsx or vpmovzx (bw, wd or dq by a's lanes) of a's low
+// half, or of its high half moved down first (pshufd; vextracti128; vextracti64x4).
+fn gen_widen(id: i32, d: i32, a: i32, at: *ir.Ty) void {
+    let k = xsl.lk(at);
+    let mut op = xe.VPMOVSXBW + k;
+    if (id == ir.IN_UWIDEN_LO) or (id == ir.IN_UWIDEN_HI) {
+        op = xe.VPMOVZXBW + k;
+    }
+    let mut src = a;
+    if (id == ir.IN_SWIDEN_HI) or (id == ir.IN_UWIDEN_HI) {
+        if xsl.S.vl == 0 {
+            src = xsl.vxmm();
+            _ = xsl.sse_i(xe.PSHUFD, xsl.W(src), xsl.R(a), 0xee);
+        } else if xsl.S.vl == 32 {
+            src = part128(a, 1);
+        } else {
+            xsl.S.vl = 32;
+            src = xsl.vxmm();
+            xsl.S.vl = 64;
+            _ = xsl.sse4(xe.VEXTRACTI64X4, xsl.S.vl, xsl.R(a), xsl.W(src), xsl.NONE(), xsl.I(1));
+        }
+    }
+    _ = xsl.sse2(op, xsl.W(d), xsl.R(src));
+}
+
+// IN_PERM and IN_PERM2 (perm_ok).
+pub fn gen_perm(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let n = @as(u64, @bit_cast(u32, t.lanes));
+    let d = xsl.vreg(v);
+    let fl = is.lane_float(t);
+    let b = is.lane_bits(t);
+    if id == ir.IN_PERM {
+        let tab = xsl.reg(v.xs.get(0));
+        let iv = v.xs.get(1);
+        let idx = xsl.reg(iv);
+        if not tg.has(tg.X_AVX512F) or not x64c.avx512_for(@as(u64, t.size)) {
+            // AVX2 vpermd: the indices modulo 8; the others zeroed
+            let r = xsl.vxmm();
+            xsl.sse3(xsl.pki(fl, xe.VPERMPS, xe.VPERMD), r, idx, xsl.R(tab));
+            if known_below(iv, n) {
+                xsl.copy(d, r, xsl.class_of(t));
+                return;
+            }
+            let lo = xsl.vxmm();
+            xsl.sse3(xe.PMINUD, lo, idx, splat_mem(n - 1, 32));
+            let ok = xsl.vxmm();
+            xsl.sse3(xe.PCMPEQD, ok, lo, xsl.R(idx));
+            xsl.sse3(xe.PAND, d, r, xsl.R(ok));
+            return;
+        }
+        let kz = in_range_mask(iv, idx, n);
+        let i = xsl.sse4(vperm_op(b, fl, false), xsl.S.vl, xsl.W(d), xsl.R(tab), xsl.R(idx), xsl.NONE());
+        i.aux = kz;
+        return;
+    }
+    let a = xsl.reg(v.xs.get(0));
+    let c = xsl.reg(v.xs.get(1));
+    let iv = v.xs.get(2);
+    let idx = xsl.reg(iv);
+    let kz = in_range_mask(iv, idx, 2 * n);
+    xsl.copy(d, a, xsl.class_of(t));
+    let i = xsl.sse4(vperm_op(b, fl, true), xsl.S.vl, xsl.RW(d), xsl.R(c), xsl.R(idx), xsl.NONE());
+    i.aux = kz;
+}
+
+fn masked_mov(bits: i32, store: bool) i32 {
+    let mut k: i32 = 2;
+    if bits == 8 {
+        k = 0;
+    } else if bits == 16 {
+        k = 1;
+    } else if bits == 64 {
+        k = 3;
+    }
+    if store {
+        return xe.VMOVDQU8_ST + k;
+    }
+    return xe.VMOVDQU8_LD + k;
+}
+
+// IN_LOAD_PARTIAL and IN_STORE_PARTIAL (partial_ok): the mask into k1, then
+// a masked move.
+pub fn gen_partial(v: *mut ir.Value, id: i32) void {
+    if id == ir.IN_LOAD_PARTIAL {
+        let w = low_lanes_bytes(v.xs.get(1), v.ty);
+        if (w == 16) or (w == 32) or (w == @bit_cast(i64, v.ty.size)) {
+            // the low 16, 32 or all bytes: a plain load of them (VEX and EVEX
+            // zero the register above)
+            let d = xsl.vreg(v);
+            let i = xsl.sse4(xe.MOVDQU_LD, 0, xsl.W(d), xsl.addr(v.xs.get(0)), xsl.NONE(), xsl.NONE());
+            if w > 16 {
+                i.sz = @truncate(u8, @bit_cast(u64, w));
+            }
+            return;
+        }
+        let m = xsl.reg(v.xs.get(1));
+        let p = xsl.addr(v.xs.get(0));
+        let d = xsl.vreg(v);
+        _ = xsl.sse4(xe.KMOVQ_KR, 8, xsl.W(xe.K1), xsl.R(m), xsl.NONE(), xsl.NONE());
+        let i = xsl.sse4(masked_mov(is.lane_bits(v.ty), false), xsl.S.vl, xsl.W(d), p, xsl.NONE(), xsl.NONE());
+        i.aux = 9;
+        return;
+    }
+    let x = xsl.reg(v.xs.get(0));
+    let m = xsl.reg(v.xs.get(2));
+    let p = xsl.addr(v.xs.get(1));
+    _ = xsl.sse4(xe.KMOVQ_KR, 8, xsl.W(xe.K1), xsl.R(m), xsl.NONE(), xsl.NONE());
+    let i = xsl.sse4(masked_mov(is.lane_bits(v.xs.get(0).ty), true), xsl.S.vl, xsl.R(x), p, xsl.NONE(), xsl.NONE());
+    i.aux = 1;
+}
+
+// Is argument k of i the address of a partial load or store (gen_partial),
+// or of a prefetch: a memory operand?
+pub fn partial_addr(i: *ir.Value, k: usize) bool {
+    if i.op != ir.OP_INTR {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, i.cv));
+    return ((id == ir.IN_LOAD_PARTIAL) and (k == 0)) or ((id == ir.IN_STORE_PARTIAL) and (k == 1)) or
+           (ir.is_prefetch(id) and (k == 0));
+}
+
+// The bytes of a load_partial of type t whose constant mask m selects
+// lanes 0 to n - 1 (n > 0), else 0.
+fn low_lanes_bytes(m: *ir.Value, t: *ir.Ty) i64 {
+    if not is.is_c(m) {
+        return 0;
+    }
+    let lanes = @as(u64, @bit_cast(u32, t.lanes));
+    let mut x = @bit_cast(u64, is.cval(m));
+    if lanes < 64 {
+        x = x & ((@as(u64, 1) << @truncate(u32, lanes)) - 1);
+    }
+    if (x == 0) or ((x & (x +% 1)) != 0) {
+        return 0;
+    }
+    let mut n: i64 = 0;
+    while x != 0 {
+        n += 1;
+        x = x >> 1;
+    }
+    return n * @as(i64, is.lane_bits(t) / 8);
+}
+
+// IN_SHLV, IN_LSHRV, IN_ASHRV (shiftv_ok): the hardware's shifts give 0
+// (the sign) for counts beyond the lane, as these do.
+pub fn gen_shiftv(v: *mut ir.Value, id: i32) void {
+    let d = xsl.vreg(v);
+    let x = xsl.reg(v.xs.get(0));
+    let c = xsl.reg(v.xs.get(1));
+    let b = is.lane_bits(v.ty);
+    let mut k: i32 = 1;
+    if b == 16 {
+        k = 0;
+    } else if b == 64 {
+        k = 2;
+    }
+    let mut op = xe.VPSLLVW + k;
+    if id == ir.IN_LSHRV {
+        op = xe.VPSRLVW + k;
+    } else if id == ir.IN_ASHRV {
+        op = xe.VPSRAVW + k;
+    }
+    xsl.sse3(op, d, x, xsl.R(c));
+}
+
+// Vector IN_CTLZ, IN_CTPOP, IN_CTTZ (bitcount_ok); trailing zeros are
+// bits - lzcnt(~x & (x - 1)).
+pub fn gen_bitcount(v: *mut ir.Value, id: i32) void {
+    let d = xsl.vreg(v);
+    let x = xsl.reg(v.xs.get(0));
+    let b = is.lane_bits(v.ty);
+    let q = xsl.pki(b == 64, 1, 0);
+    if id == ir.IN_CTPOP {
+        let mut op = xe.VPOPCNTD + q;
+        if b == 8 {
+            op = xe.VPOPCNTB;
+        } else if b == 16 {
+            op = xe.VPOPCNTW;
+        }
+        xsl.sse_unary_packed(op, d, xsl.R(x));
+        return;
+    }
+    if id == ir.IN_CTLZ {
+        xsl.sse_unary_packed(xe.VPLZCNTD + q, d, xsl.R(x));
+        return;
+    }
+    let m1 = xsl.vxmm();
+    xsl.sse3(xsl.pki(b == 64, xe.PADDQ, xe.PADDD), m1, x, splat_mem(0xffff_ffff_ffff_ffff, b));  // x - 1
+    let low = xsl.vxmm();
+    xsl.sse3(xe.PANDN, low, x, xsl.R(m1));  // ~x & (x - 1)
+    let lz = xsl.vxmm();
+    xsl.sse_unary_packed(xe.VPLZCNTD + q, lz, xsl.R(low));
+    let w = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(w), splat_mem(@as(u64, @bit_cast(u32, b)), b));
+    xsl.sse3(xsl.pki(b == 64, xe.PSUBQ, xe.PSUBD), d, w, xsl.R(lz));
+}
