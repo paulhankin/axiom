@@ -1104,7 +1104,7 @@ export function checkVars(dw, opts) {
 // The types and variables of debug/vars.ax (run.mjs): at -O0, main's
 // variables with their types (a structure, an enumeration, a union's
 // variant part, a slice's structure), the block of `inner`, the global
-// COUNT; the units' language Axiom's (0x8a78).
+// COUNT; the units' language C11's (0x1d; opts.lang: that code instead).
 // Optimized debug/vars.c on WebAssembly: again's parameter a and its
 // variable r are in locals of the function (DW_OP_WASM_location 0) at
 // some address, and every such location names a local.
@@ -1148,7 +1148,7 @@ export function checkAxWide(dw) {
   return found ? [] : [seen ? 'wide: w is never in two 16-byte pieces' : 'wide: w has no location list'];
 }
 
-export function checkAxVars(dw) {
+export function checkAxVars(dw, opts = {}) {
   const errs = [];
   const E = (m) => errs.push(m);
   let un = null, sub = null;
@@ -1158,7 +1158,8 @@ export function checkAxVars(dw) {
     }
   }
   if (!sub) return ['no subprogram main with variables'];
-  if (un.die.attrs.get(0x13) !== 0x8a78) E(`the unit's language is ${un.die.attrs.get(0x13)}`);
+  const lang = opts.lang ?? 0x1d;
+  for (const u of dw.units) if (u.die.attrs.get(0x13) !== lang) E(`a unit's language is ${u.die.attrs.get(0x13)}, not ${lang}`);
   const ty = (die) => un.dies.get(die.attrs.get(0x49));
   const v = (name, d = sub) => d.children.find((c) => c.tag === 0x34 && c.attrs.get(AT_NAME) === name);
   const want = [['p', 0x13, 'Point'], ['c', 0x04, 'Color'], ['sh', 0x13, 'Shape'], ['sl', 0x13, '[]i32'], ['arr', 0x01, undefined]];

@@ -2664,6 +2664,15 @@ if (!skipPlatform) {
               }
               if (lvl !== '-O0') return null;
               const errs = checkAxVars(r.dw);
+              if (t === 'x86_64' && !obj) {
+                // (--debug-language=axiom: the units of Axiom's own code, 0x8a78)
+                const o = `${base}-g1/vendor`;
+                const rv = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, '-g', '--debug-language=axiom', '-o', o],
+                  { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+                if (rv.status !== 0) return `build failed:\n${rv.stdout}${rv.stderr}`;
+                const rd = checkDebug(loadImage(fs.readFileSync(o)), { cfi: true });
+                errs.push(...rd.errs, ...checkAxVars(rd.dw, { lang: 0x8a78 }));
+              }
               return errs.length ? errs.join('\n') : null;
             }
             const lines = lang === 'c' ? ['add-sum', 'many-loop', 'vla-decl', 'tail-call'] : ['many-loop', 'tail-call'];

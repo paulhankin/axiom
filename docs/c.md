@@ -3081,8 +3081,17 @@ Where it goes, per target:
 
 The objects of `--emit=obj` carry the same sections (ELF targets), with relocations,
 for the system's linker. Axiom functions in the same program are described in the same
-compilation unit, whose language is C's (an Axiom program's own units have Axiom's:
-`docs/cli.md`, `-g`).
+compilation unit, whose language is C's. An Axiom program's own units are marked as
+C11 too (`DW_AT_language` 0x1d; the producer, `axiom <version>`, says which compiler
+wrote them), not with a code of DWARF's user range: a debugger with no type system for
+a code it does not know shows none of their variables, and under C's both of the
+system debuggers tried show Axiom's variables, structures, slices (`ptr`, `len`),
+enumerations and error unions, set breakpoints on functions by their `module.name`
+(one reads a global by its name quoted, `'m.g'`; the other finds none by such a name), and
+evaluate arithmetic on them; one shows a tagged union's variant part (the payload of
+the variant the tag names), the other only its tag. `--debug-language=axiom` gives the
+units Axiom's own code, 0x8a78 (`docs/cli.md`, `-g`), for tools that tell them apart
+by it. The PDB's compile records (`S_COMPILE3`) say C (`CV_CFL_C`) for every module.
 
 The line of a crash's faulting instruction is in the stack trace when the program has
 line tables (above).
