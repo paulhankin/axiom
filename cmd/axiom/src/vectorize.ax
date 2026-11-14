@@ -72,10 +72,10 @@ threadlocal let mut tag_base: i64 = 0x3800_0000_0000;
 struct Red {
     phi: *mut ir.Value,
     start: *mut ir.Value,
-    next: *mut ir.Value,  // acc op x (or the select of min / max)
-    op: i32,              // ir.OP_ADD ... or for min / max an IN_ intrinsic, as `kind`
-    minmax: i32,          // 0, or the IN_SMIN ... intrinsic of a select
-    x: *mut ir.Value,     // the element operand
+    next: *mut ir.Value,   // acc op x (or the select of min / max)
+    op: i32,               // ir.OP_ADD ... or for min / max an IN_ intrinsic, as `kind`
+    minmax: ir.Intrinsic,  // IN_NONE, or the IN_SMIN ... intrinsic of a select
+    x: *mut ir.Value,      // the element operand
 }
 
 // The vector width for lanes of type t, in bits (0: none).
@@ -114,10 +114,10 @@ fn plain(i: *ir.Value) bool {
     return idm.pure(i);
 }
 
-fn vec_ok(op: i32, intr: i32, t: *ir.Ty) bool {
+fn vec_ok(op: i32, intr: ir.Intrinsic, t: *ir.Ty) bool {
     let fl = t.kind == ir.T_FLOAT;
     let b = t.bits;
-    if intr != 0 {
+    if intr != ir.IN_NONE {
         if fl or (b == 64) {
             return false;
         }
@@ -190,11 +190,11 @@ fn reduction(lp: *mut Lp, p: *mut ir.Value, start: *mut ir.Value, next: *mut ir.
         if u.isnil(x) or (x == p) {
             return false;
         }
-        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: 0, x: x });
+        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: ir.IN_NONE, x: x });
         return true;
     }
     if (op == ir.OP_SUB) and (next.a == p) and (next.b != p) {
-        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: 0, x: next.b });
+        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: ir.IN_NONE, x: next.b });
         return true;
     }
     // min / max: select (x <cmp> acc, x, acc) or with the operands the other way
@@ -223,7 +223,7 @@ fn reduction(lp: *mut Lp, p: *mut ir.Value, start: *mut ir.Value, next: *mut ir.
         if not take_x {
             pr = ir.inv_pred(pr);
         }
-        let mut k: i32 = 0;
+        let mut k = ir.IN_NONE;
         if (pr == ir.IntSGT) or (pr == ir.IntSGE) {
             k = ir.IN_SMAX;
         } else if (pr == ir.IntSLT) or (pr == ir.IntSLE) {
@@ -381,10 +381,10 @@ fn analyze(f: *mut ir.Func, lp: *mut Lp, members: *u.List.[*mut ir.Block]) bool 
         if r.phi.ty != t {
             return false;  // (a widening reduction: not made)
         }
-        if (r.minmax != 0) and not vec_ok(0, r.minmax, t) {
+        if (r.minmax != ir.IN_NONE) and not vec_ok(0, r.minmax, t) {
             return false;
         }
-        if (r.minmax == 0) and not vec_ok(r.op, 0, t) {
+        if (r.minmax == ir.IN_NONE) and not vec_ok(r.op, ir.IN_NONE, t) {
             return false;
         }
     }
@@ -456,7 +456,7 @@ fn analyze(f: *mut ir.Func, lp: *mut Lp, members: *u.List.[*mut ir.Block]) bool 
 fn lane_op(lp: *mut Lp, z: *mut ir.Value) bool {
     let t = lp.t;
     for r in lp.reds.items() {
-        if (z == r.next) or ((r.minmax != 0) and (z == r.next.a)) {
+        if (z == r.next) or ((r.minmax != ir.IN_NONE) and (z == r.next.a)) {
             return true;
         }
     }
@@ -480,7 +480,7 @@ fn lane_op(lp: *mut Lp, z: *mut ir.Value) bool {
                 return false;
             }
         }
-        return vec_ok(z.op, 0, t);
+        return vec_ok(z.op, ir.IN_NONE, t);
     }
     return false;
 }
@@ -519,7 +519,7 @@ fn lane_users(f: *mut ir.Func, lp: *Lp, v: *mut ir.Value) bool {
 
 fn red_use(lp: *Lp, i: *mut ir.Value) bool {
     for r in lp.reds.items() {
-        if (i == r.next) or ((r.minmax != 0) and (i == r.next.a)) {
+        if (i == r.next) or ((r.minmax != ir.IN_NONE) and (i == r.next.a)) {
             return true;
         }
     }
@@ -556,7 +556,7 @@ fn used_once_in(p: *mut ir.Value, by: *mut ir.Value, tag: i64) bool {
 
 // The identity of reduction r's operation, as a scalar of type t.
 fn identity(r: Red, t: *mut ir.Ty) *mut ir.Value {
-    if r.minmax != 0 {
+    if r.minmax != ir.IN_NONE {
         return r.start;  // (min and max: the start itself, idempotent)
     }
     if r.op == ir.OP_MUL {
@@ -690,7 +690,7 @@ fn transform(f: *mut ir.Func, lp: *mut Lp) bool {
             let x = lookup(r.x, &map_from, &map_to);
             let a = vacc.get((ri * @truncate(usize, ic)) + @truncate(usize, c));
             let mut nx = vnil();
-            if r.minmax != 0 {
+            if r.minmax != ir.IN_NONE {
                 let mut args: [2]*mut ir.Value = [a, x];
                 nx = ir.intr(bld, r.minmax, vt, args[..]);
             } else {
@@ -730,7 +730,7 @@ fn transform(f: *mut ir.Func, lp: *mut Lp) bool {
                 if r.op == ir.OP_SUB {
                     // (start - x0 - x1 ...: start + the lanes, which hold 0 - their x's)
                     acc = ir.add(bld, acc, e);
-                } else if r.minmax != 0 {
+                } else if r.minmax != ir.IN_NONE {
                     let mut args: [2]*mut ir.Value = [acc, e];
                     acc = ir.intr(bld, r.minmax, t, args[..]);
                 } else {
