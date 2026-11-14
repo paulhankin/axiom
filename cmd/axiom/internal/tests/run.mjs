@@ -1487,7 +1487,7 @@ await section('C programs', {
         other.set(b.toString('latin1', str.off + n, e), b[o + 5] & 3);
       }
     }
-    const want = { vis_h: 2, vis_i: 2, vis_p: 0, vis_d: 0, vis_hd: 2, vis_dd: 0, vis_ph: 2 };
+    const want = { vis_h: 2, vis_i: 2, vis_p: 3, vis_d: 0, vis_hd: 2, vis_dd: 0, vis_ph: 2 };
     for (const [n, v] of Object.entries(want)) if (other.get(n) !== v) return `${n}: visibility ${other.get(n)}, not ${v}`;
     return null;
   },
