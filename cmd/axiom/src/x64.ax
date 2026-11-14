@@ -9836,8 +9836,18 @@ fn hoist_source_reads(f: *mut mc.MFunc) void {
             i = i.next;
         }
     }
+    // the last instruction of the block naming each vreg it names (nil:
+    // not known): hoist_reads_of looks no further, so that a long block of
+    // straight-line code costs its length, not its length squared
+    let last = u.calloc_slice.[*mut mc.MInst](nv + 1);
+    defer u.free_slice.[*mut mc.MInst](last);
     for bi in 0..f.blocks.len {
         let b = f.blocks.get(bi);
+        let mut i = b.first;
+        while u.notnil(i) {
+            each_vreg_named(i, last, i);
+            i = i.next;
+        }
         let mut m = b.first;
         while u.notnil(m) {
             let nx = m.next;
@@ -9855,7 +9865,7 @@ fn hoist_source_reads(f: *mut mc.MFunc) void {
                 s = m.ops[1].base;
             }
             if s >= mc.VREG0 {
-                hoist_reads_of(b, m, s);
+                hoist_reads_of(b, m, s, last);
             }
             m = m.next;  // (m stays; what moved went in front of it)
         }
@@ -9881,12 +9891,55 @@ fn lea_pair(m: *mc.MInst, nx: *mc.MInst) bool {
            (nx.ops[2].disp >= 1) and (nx.ops[2].disp <= 3);
 }
 
+// Sets last[x] to l for each vreg x that i names (an operand, or the base
+// or index of a memory operand).
+fn each_vreg_named(i: *mc.MInst, last: []mut *mut mc.MInst, l: *mut mc.MInst) void {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        let mut rs: [3]i32 = [-1, -1, -1];
+        if o.kind == mc.K_REG {
+            rs[0] = o.reg;
+        } else if o.kind == mc.K_MEM {
+            rs[1] = o.base;
+            rs[2] = o.index;
+        }
+        for j in @as(usize, 0)..3 {
+            if rs[j] >= mc.VREG0 {
+                last[@int_cast(usize, rs[j] - mc.VREG0)] = l;
+            }
+        }
+    }
+}
+
+// The vregs whose last (see hoist_reads_of) is i, which moves, forget it.
+fn forget_last(i: *mut mc.MInst, last: []mut *mut mc.MInst) void {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        let rs: [3]i32 = [o.reg, o.base, o.index];
+        for j in @as(usize, 0)..3 {
+            let ok = ((j == 0) and (o.kind == mc.K_REG)) or ((j > 0) and (o.kind == mc.K_MEM));
+            if ok and (rs[j] >= mc.VREG0) and (last[@int_cast(usize, rs[j] - mc.VREG0)] == i) {
+                last[@int_cast(usize, rs[j] - mc.VREG0)] = u.nil.[mc.MInst]();
+            }
+        }
+    }
+}
+
 // Moves the later readers of s in m's block in front of m, if they all can.
-fn hoist_reads_of(b: *mut mc.MBlock, m: *mut mc.MInst, s: i32) void {
+// last[s], when known, is the last instruction of the block naming s:
+// nothing after it reads or writes s, so the walk ends there as it would
+// at the block's end. (Every mention of a vreg stays at or before its
+// last's place while that does not move: an instruction moved here moves
+// up. A vreg whose last moves forgets it.)
+fn hoist_reads_of(b: *mut mc.MBlock, m: *mut mc.MInst, s: i32, last: []mut *mut mc.MInst) void {
     let mut cand = u.List.[*mut mc.MInst].empty();
     let mut ok = true;
     let mut j = m.next;
     let mut n: i32 = 0;
+    let lst = last[@int_cast(usize, s - mc.VREG0)];
+    if lst == m {
+        j = u.nil.[mc.MInst]();
+    }
     while u.notnil(j) {
         n += 1;
         if mc.writes_reg(j, s) and not inst_reads(j, s) {
@@ -9932,11 +9985,15 @@ fn hoist_reads_of(b: *mut mc.MBlock, m: *mut mc.MInst, s: i32) void {
             }
             cand.push(j);
         }
+        if j == lst {
+            break;
+        }
         j = j.next;
     }
     if ok and (cand.len > 0) {
         for k in 0..cand.len {
             let c = cand.get(k);
+            forget_last(c, last);
             mc.remove(b, c);
             mc.insert_before(b, m, c);
         }

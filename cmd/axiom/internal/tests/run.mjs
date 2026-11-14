@@ -1422,6 +1422,35 @@ await section('C programs', {
     if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
     return fs.statSync(obj).size > 0 ? null : 'an empty object';
   },
+  // Compile time of one long function (the bodies of the intrinsics' compile
+  // test in one block: constants shared across it, results whose addresses
+  // are taken): eight times as long costs well under the square of that at
+  // -O2 (it was about forty times: the register allocator's splitting, the
+  // stack slots' colouring and the end of restrict scopes walked the whole
+  // function for each value, slot or scope). Best of two of each.
+  'compile time of a long function': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const src = fs.readFileSync(path.join(cRunDir, 'intrin_x86_compile.c'), 'utf8');
+    const bodies = [...src.matchAll(/\nvoid __t\d+\(void\) \{\n([\s\S]*?)\n\}/g)].map((m) => m[1]);
+    const head = src.slice(0, src.indexOf('\nvoid __t0(void)'));
+    const flags = (src.match(/\/\* flags: (.*?) \*\//) || ['', ''])[1].split(/\s+/).filter((x) => x);
+    const time = async (n) => {
+      const f = path.join(tmp, `c-long-${n}.c`);
+      const body = Array.from({ length: n }, (_, k) => `{\n${bodies[(k * 7) % bodies.length]}\n}\n`).join('');
+      fs.writeFileSync(f, `${head}\nvoid big(void) {\n${body}}\n`);
+      let best = Infinity;
+      for (let k = 0; k < 2; k++) {
+        const t0 = process.hrtime.bigint();
+        const c = await spawnAsync(compiler, ['build', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '--emit=obj',
+          '--target=x86_64', '-O2', ...flags, '-o', f.replace(/\.c$/, '.o')], { encoding: 'utf8', timeout: compileTimeout });
+        if (c.status !== 0) throw new Error(`build failed:\n${c.stdout}${c.stderr}`.slice(0, 2000));
+        best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6);
+      }
+      return best;
+    };
+    const t1 = await time(300), t8 = await time(2400);
+    return t8 < 25 * t1 ? null : `300 blocks: ${t1.toFixed(0)} ms, 2400: ${t8.toFixed(0)} ms`;
+  },
   // (C's attribute visibility in the ELF object's symbols: hidden and
   // internal are STV_HIDDEN, protected and default STV_DEFAULT)
   // Sections (docs/c.md, "Code in sections"): --gc-sections leaves out
