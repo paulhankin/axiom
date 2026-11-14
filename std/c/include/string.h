@@ -18,6 +18,10 @@
 #include <axc/types.h>
 
 /* (as <stddef.h> has it: the same definition again is no redefinition) */
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 
 #if __STDC_VERSION__ >= 199901L

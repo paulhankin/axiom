@@ -13,7 +13,8 @@
 int strcoll(const char *__s1, const char *__s2);
 size_t strxfrm(char *__AXC_RESTRICT __s1, const char *__AXC_RESTRICT __s2, size_t __n);
 char *strerror(int __errnum);
-#if __STDC_VERSION__ >= 202311L
+#if __STDC_VERSION__ >= 202311L || defined(__AXIOM_GNU__)
+/* (C23's; in a GNU dialect in every standard, as POSIX has them) */
 char *strdup(const char *__s);
 char *strndup(const char *__s, size_t __n);
 #endif

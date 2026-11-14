@@ -457,6 +457,12 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     if u.isnil(sig.ty) {
         sig = sig0;
     }
+    if u.isnil(sig.ty) {
+        // (the address of a function without a prototype that this unit
+        // neither defines nor has called yet: a declaration of no
+        // parameters; a call converts, as through any function pointer)
+        sig = Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), plan: u.nil.[abi.Plan]() };
+    }
     let name = symbol_name(s);
     let mut f = ir.get_function(M, name);
     if u.notnil(f) and not ir.is_decl(f) and (c_functions.get(u.intern(name)) == 0) {
@@ -925,8 +931,7 @@ fn addr_value(a: cc.Addr) *mut ir.Value {
     }
     if u.notnil(a.sym) {
         if a.sym.kind == cast.SK_FUNC {
-            base = func_of(a.sym, Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false),
-                                        plan: u.nil.[abi.Plan]() }).val;
+            base = func_of(a.sym, func_sig(a.sym)).val;
         } else {
             base = object_addr(a.sym);
         }
@@ -1126,7 +1131,13 @@ fn initial_value(s: *mut cast.CSym) *mut ir.Value {
     }
     let mut parts = u.List.[*mut ir.Value].empty();
     let mut at: u64 = 0;
+    let mut packed = false;
     for r in rs {
+        if (r.off % cty.ptr_bytes) != 0 {
+            // (an address a packed structure, or #pragma pack, puts at an
+            // offset that does not align it: the parts without padding)
+            packed = true;
+        }
         if r.off > at {
             parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, r.off)]));
         }
@@ -1135,6 +1146,9 @@ fn initial_value(s: *mut cast.CSym) *mut ir.Value {
     }
     if at < size {
         parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, size)]));
+    }
+    if packed {
+        return ir.cstruct_packed(parts.items());
     }
     return ir.cstruct(parts.items());
 }
@@ -1462,8 +1476,12 @@ fn start(cu: *mut cs.CUnit) void {
     let mt = cu.main.ty;
     let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
     let mut n: usize = 0;
-    if cu.main.params.len == 2 {
+    if cu.main.params.len >= 1 {
+        // (main(int argc) in a GNU dialect: argc alone)
         av[0] = conv_i32(f.params[0], cty.t_int);
+        n = 1;
+    }
+    if cu.main.params.len == 2 {
         av[1] = f.params[1];
         n = 2;
     }

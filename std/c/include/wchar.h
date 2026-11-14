@@ -24,6 +24,10 @@
 #include <axc/types.h>
 #include <axc/wchar_limits.h>
 
+#ifdef __AXIOM_GNU__
+/* (a GNU dialect: a definition the program made before is replaced) */
+#undef NULL
+#endif
 #define NULL ((void *)0)
 #define WEOF ((wint_t)-1)
 

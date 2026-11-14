@@ -76,6 +76,7 @@ pub const BI_ISLESS: i32 = 412;
 pub const BI_ISLESSEQUAL: i32 = 413;
 pub const BI_ISLESSGREATER: i32 = 414;
 pub const BI_ISUNORDERED: i32 = 415;
+pub const BI_ISFPCLASS: i32 = 416;  // a GNU dialect's __builtin_isfpclass(x, mask)
 pub const BI_FENV_KIND: i32 = 420;
 pub const BI_FENV_GET: i32 = 421;
 pub const BI_FENV_SET: i32 = 422;
@@ -141,6 +142,9 @@ pub fn call(e: *mut cast.Expr, id: i32) bool {
     }
     if id >= BI_FENV_KIND {
         return fenv_call(e, id);
+    }
+    if id == BI_ISFPCLASS {
+        return fpclass_call(e);
     }
     if id >= BI_ISGREATER {
         return compare_call(e, id);
@@ -234,6 +238,45 @@ fn class_call(e: *mut cast.Expr, id: i32) bool {
         e.is_const = true;
         e.cval = r;
     }
+    return true;
+}
+
+// __builtin_isfpclass(x, mask) (a GNU dialect): 1 if x is in one of the
+// classes of mask, an integer constant expression of these bits, else 0:
+// 0x1 a signaling NaN, 0x2 a quiet NaN, 0x4 -infinity, 0x8 a negative
+// normal number, 0x10 a negative subnormal one, 0x20 -0, 0x40 +0, 0x80 a
+// positive subnormal number, 0x100 a positive normal one, 0x200 +infinity.
+// x as for the classification macros (evaluated once, no exception);
+// cgen_fp.ax computes it from them.
+fn fpclass_call(e: *mut cast.Expr) bool {
+    if not arity(e, 2, 2) {
+        return bad(e);
+    }
+    let m = cx.rv(e.args.get(1));
+    if is_err(m) {
+        return bad(e);
+    }
+    if not cty.is_integer(m.ty) or not m.is_const {
+        cs.err(m.span, "C3082", u.f1("the mask of %s must be an integer constant expression", e.a.name));
+        return bad(e);
+    }
+    e.args.set(1, m);
+    let mut x = cx.rv(e.args.get(0));
+    if is_err(x) {
+        return bad(e);
+    }
+    if cty.is_integer(x.ty) {
+        x = cx.convert(x, cty.t_double);
+    }
+    if not cty.is_floating(x.ty) {
+        cs.err(x.span, "C3082", u.f2("the operand of %s has type %s, not a real floating type", e.a.name, cs.tq(x.ty)));
+        return bad(e);
+    }
+    if cty.is_decimal(x.ty) {
+        cty.note_dec();
+    }
+    e.args.set(0, x);
+    e.ty = cty.t_int;
     return true;
 }
 
@@ -336,6 +379,20 @@ fn dec_call(e: *mut cast.Expr) bool {
 /// ir.f32_bits), binary16's, and the wide formats'.
 pub const SNAN_F64: u64 = 0x7FF4_0000_0000_0000;
 
+/// Makes e the constant signaling NaN of binary floating type t (positive).
+pub fn snan_const(e: *mut cast.Expr, t: *mut cty.CType) void {
+    e.ty = t;
+    e.is_const = true;
+    e.fcval = @bit_cast(f64, SNAN_F64);
+    if cty.is_wide(t) {
+        if cc.fmt_t(t) == ld.FMT_X {
+            e.xv = ld.W.{ lo: 0xA000_0000_0000_0000, hi: 0x7FFF };
+        } else {
+            e.xv = ld.W.{ lo: 0, hi: 0x7FFF_4000_0000_0000 };
+        }
+    }
+}
+
 fn fenv_call(e: *mut cast.Expr, id: i32) bool {
     if id == BI_SNAN {
         // (<float.h>'s FLT_SNAN ...: C23 5.2.4.2.2, F.2.1)
@@ -351,16 +408,7 @@ fn fenv_call(e: *mut cast.Expr, id: i32) bool {
                                          cs.tq(x.ty)));
             return bad(e);
         }
-        e.ty = cty.unqual(x.ty);
-        e.is_const = true;
-        e.fcval = @bit_cast(f64, SNAN_F64);
-        if cty.is_wide(e.ty) {
-            if cc.fmt_t(e.ty) == ld.FMT_X {
-                e.xv = ld.W.{ lo: 0xA000_0000_0000_0000, hi: 0x7FFF };
-            } else {
-                e.xv = ld.W.{ lo: 0, hi: 0x7FFF_4000_0000_0000 };
-            }
-        }
+        snan_const(e, cty.unqual(x.ty));
         return true;
     }
     if id == BI_FENV_KIND {
