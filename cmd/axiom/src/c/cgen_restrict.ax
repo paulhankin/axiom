@@ -2,7 +2,8 @@
 // cgen_restrict.ax - IR generation for C's restrict (6.7.3.1) on block-scope
 // pointer objects and on structure members: ir.IN_RSCOPE, ir.IN_RESTRICT and
 // the tags of loads, stores and calls (see ir.ax for what they mean to the
-// optimizer). Parameters are marked ir.F_NOALIAS (cgen_stmt.ax), which holds
+// optimizer). The same scopes give automatic objects their lifetimes (see
+// lives below). Parameters are marked ir.F_NOALIAS (cgen_stmt.ax), which holds
 // while the function's own body runs, and which inlining makes a scope
 // (inline.ax).
 //
@@ -75,6 +76,7 @@
 // =============================================================================
 import "../ir.ax" as ir;
 import "../opt.ax" as opt;
+import "../tailrec.ax" as tre;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
@@ -130,6 +132,13 @@ pub fn unit(objs: []*mut cast.CSym) void {
     }
 }
 
+// The scopes of the function being generated, numbered from 1 (ir.scope_num).
+let mut g_scopes: u32 = 0;
+// Its scopes that are there for lives only (see lives), and its body's of them.
+let mut g_lscopes: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                     cap: 0 };
+let mut g_body: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
 // A new scope here, in the current one, its objects numbered from 0.
 fn open(syms: []*mut cast.CSym) void {
     if cg.terminated() {
@@ -142,6 +151,8 @@ fn open(syms: []*mut cast.CSym) void {
         n = 1;
     }
     let t = ir.intr(cg.B, ir.IN_RSCOPE, ir.t_int(32), ps[0..n]);
+    g_scopes += 1;
+    ir.set_scope_num(t, g_scopes);
     cg.F.f.rscopes = true;
     let mut k: u64 = 0;
     for s in syms {
@@ -150,16 +161,90 @@ fn open(syms: []*mut cast.CSym) void {
         g_objs.push(s);
         k += 1;
     }
+    if syms.len == 0 {
+        g_lscopes.push(t);
+    }
     ir.rtag = t;  // (what the block does is tagged with it)
+}
+
+// Lifetimes. A block that declares automatic objects is a scope too (with
+// no restricted objects, if it declares none), under the same condition (no
+// label in it: a jump into it would bypass the IN_RSCOPE; a function's body
+// may have them, since nothing jumps into it), and its objects' allocas
+// hold its number (ir.life_of): 6.2.4p6, an automatic object lives from
+// entry into its block until the block's execution ends in any way, so no
+// operation outside the block's code, which is all tagged with its scope or
+// scopes inside it, runs while it is alive. An object declared in a block
+// without a scope takes the scope it is in (whose code holds its block's),
+// a compound literal its block's (6.5.2.5p5). Not in a function with
+// nested functions, or in a nested one, whose objects are reached from
+// another function's code.
+fn lives() bool {
+    return u.notnil(cg.F.sym) and not cg.F.sym.has_nested and u.isnil(cg.F.sym.nest_parent);
+}
+
+// Does declaration d declare an automatic object?
+fn auto_decl(d: *cast.Decl) bool {
+    if u.isnil(d) or (d.kind != cast.DeclKind.DECL) {
+        return false;
+    }
+    for x in d.decls.items() {
+        let s = x.sym;
+        if u.notnil(s) and (s.kind == cast.SK_OBJECT) and (s.duration == cast.SD_AUTO) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Do items declare automatic objects (directly)?
+fn auto_items(items: []*mut cast.Stmt) bool {
+    for x in items {
+        if u.notnil(x) and (x.kind == cast.StmtKind.DECL) and auto_decl(x.decl) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Does s declare automatic objects in a block inside it (or itself)?
+fn autos_in(s: *cast.Stmt, depth: i32) bool {
+    if u.isnil(s) or (depth > 64) {
+        return false;
+    }
+    if (s.kind == cast.StmtKind.DECL) and auto_decl(s.decl) {
+        return true;
+    }
+    if (s.kind == cast.StmtKind.FOR) and auto_decl(s.decl) {
+        return true;
+    }
+    for x in s.items.items() {
+        if autos_in(x, depth + 1) {
+            return true;
+        }
+    }
+    return autos_in(s.body, depth + 1) or autos_in(s.els, depth + 1);
+}
+
+/// Alloca a holds an automatic object of the block being generated (or a
+/// compound literal of it): its life is the current scope (see lives).
+pub fn lifetime(a: *mut ir.Value) void {
+    if lives() and u.notnil(ir.rtag) and (ir.rtag.blk.fnp == cg.F.f) and ir.is_op(a, ir.OP_ALLOCA) {
+        ir.set_life(a, ir.scope_num(ir.rtag));
+    }
 }
 
 /// The start of a function's body: a scope for the restricted objects its
 /// outermost block declares (its restrict parameters are ir.F_NOALIAS,
-/// which inlining makes a scope: inline.ax).
+/// which inlining makes a scope: inline.ax), and for its automatic objects'
+/// lives (see lives).
 pub fn function(body: []*mut cast.Stmt, is_main: bool) void {
     g_objs.clear();
     g_addr = false;
     g_main = vnil();
+    g_scopes = 0;
+    g_lscopes.clear();
+    g_body = vnil();
     ir.rtag = vnil();
     let mut syms = u.List.[*mut cast.CSym].empty();
     defer syms.deinit();
@@ -171,45 +256,132 @@ pub fn function(body: []*mut cast.Stmt, is_main: bool) void {
         }
         open(syms.items());
         g_main = ir.rtag;
+        g_lscopes.clear();  // (main's scope is not one for lives only)
         syms.clear();
-        declared(body, &mut syms);
-        if syms.len > 0 {
-            for x in body {
-                if has_label(x, false) {
-                    return;
-                }
-            }
-            open(syms.items());
-        }
-        return;
     }
     declared(body, &mut syms);
-    if syms.len == 0 {
-        return;
-    }
+    let mut labels = false;
     for x in body {
         if has_label(x, false) {
+            labels = true;
+        }
+    }
+    if (syms.len > 0) and not labels {
+        open(syms.items());
+        return;
+    }
+    if is_main or not lives() {
+        return;  // (main's scope is its body's)
+    }
+    for x in body {
+        if autos_in(x, 0) {
+            open(syms.items()[0..0]);
+            if g_lscopes.len > 0 {
+                g_body = g_lscopes.get(g_lscopes.len - 1);
+            }
             return;
         }
     }
-    open(syms.items());
+}
+
+// Once the function is made: the scopes there for lives only go where no
+// object of theirs has its address let out (tailrec.escaping_lives), their
+// operations then tagged with the scope around them, as their inner
+// scopes are in it (the body's goes where no object's does), since every
+// scope is a barrier the passes keep where it is. If none is left, f has
+// none.
+fn drop_lives(f: *mut ir.Func) void {
+    if g_lscopes.len == 0 {
+        return;
+    }
+    let mut keep = u.List.[u32].empty();
+    defer keep.deinit();
+    tre.escaping_lives(f, &mut keep);
+    let mut gone = u.SymMap.[bool].{ keys: u.nil.[usize](), vals: u.nil.[bool](), cap: 0, len: 0 };
+    for t in g_lscopes.items() {
+        if u.isnil(t.blk) or (t.blk.fnp != f) {
+            continue;
+        }
+        let mut kept = (t == g_body) and (keep.len > 0);
+        for n in keep.items() {
+            if n == ir.scope_num(t) {
+                kept = true;
+            }
+        }
+        if not kept {
+            gone.put(key_v(t), true);
+        }
+    }
+    if gone.len == 0 {
+        return;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ir.has_tag_slot(i) and u.notnil(ir.tag_slot(i)) and gone.get(key_v(ir.tag_slot(i))) {
+                ir.set_tag(i, kept_around(ir.tag_slot(i), &mut gone));
+            } else if ir.is_rscope(i) and not gone.get(key_v(i)) and (i.xs.len == 1) and gone.get(key_v(i.xs.get(0))) {
+                let p = kept_around(i.xs.get(0), &mut gone);
+                i.xs.clear();
+                if u.notnil(p) {
+                    i.xs.push(p);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut left = g_scopes;
+    for t in g_lscopes.items() {
+        if gone.get(key_v(t)) {
+            ir.forget_lives(f, ir.scope_num(t));  // (objects whose address goes nowhere)
+            ir.forward(t, ir.cint(t.ty, 0));
+            ir.remove_inst(t);
+            left -= 1;
+        }
+    }
+    ir.apply_forwarding(f);
+    if (left == 0) and (g_objs.len == 0) and u.isnil(g_main) {
+        f.rscopes = false;
+    }
+}
+
+fn key_v(v: *ir.Value) []u8 {
+    return u.addr_key(@int_from_ptr(v));
+}
+
+// Scope s if it stays (drop_lives), else the nearest scope around it that
+// does, or nil.
+fn kept_around(s0: *mut ir.Value, gone: *mut u.SymMap.[bool]) *mut ir.Value {
+    let mut s = s0;
+    let mut n: i32 = 0;
+    while u.notnil(s) and gone.get(key_v(s)) and (n < 64) {
+        s = ir.rscope_parent(s);
+        n += 1;
+    }
+    if n >= 64 {
+        return vnil();
+    }
+    return s;
 }
 
 /// The start of a block of items `items` (a compound statement), or of a
 /// for statement s with a declaration: a scope if it declares restricted
-/// objects and has no label in it. Returns what to pass to close at its end.
+/// objects, or automatic objects (lives), and has no label in it. Returns
+/// what to pass to close at its end.
 pub fn block(items: []*mut cast.Stmt, s: *cast.Stmt) *mut ir.Value {
     let prev = ir.rtag;
     let mut syms = u.List.[*mut cast.CSym].empty();
     defer syms.deinit();
     if u.notnil(s) {
         decl_syms(s.decl, &mut syms);
-        if (syms.len == 0) or has_label(s.body, false) {
+        if ((syms.len == 0) and not (lives() and auto_decl(s.decl))) or has_label(s.body, false) {
             return prev;
         }
     } else {
         declared(items, &mut syms);
-        if syms.len == 0 {
+        if (syms.len == 0) and not (lives() and auto_items(items)) {
             return prev;
         }
         for x in items {
@@ -302,6 +474,7 @@ fn check_tags(f: *mut ir.Func) void {
                 let p = ir.rscope_parent(i);
                 if (i.xs.len > 0) and (u.isnil(p) or not before(p, i, &mut seen)) {
                     i.xs.clear();
+                    ir.forget_lives(f, 0);  // (the scopes around it are no longer known there)
                 }
                 seen.put(u.addr_key(@int_from_ptr(i)), true);
             }
@@ -397,6 +570,11 @@ pub fn finish(f: *mut ir.Func) void {
     ir.rtag = vnil();
     g_addr = false;
     g_main = vnil();
+    if not f.rscopes {
+        g_objs.clear();
+        return;
+    }
+    drop_lives(f);
     if not f.rscopes {
         g_objs.clear();
         return;

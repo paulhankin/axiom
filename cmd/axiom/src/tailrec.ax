@@ -234,7 +234,9 @@ fn rewrite(f: *mut ir.Func, sites: []*mut ir.Value, accs: []*mut ir.Value, rets:
 //   stored, cast to an integer or otherwise used than as the address of a
 //   load or store) on any path that reaches the call, the call's own
 //   arguments included (an aggregate passed by value is the address of the
-//   caller's copy). The function allocates nothing dynamically
+//   caller's copy), unless C's lifetimes say that no such object is alive
+//   during the call (ir.F_FRAME_DEAD: mark_frame_dead), when only the
+//   call's own arguments count. The function allocates nothing dynamically
 //   (ir.uses_dyn_stack: its frame is addressed from the frame pointer, and
 //   the allocations would be the callee's), and does not take its frame
 //   address (IN_FRAME_ADDR: a C variadic function's va_list points into its
@@ -470,9 +472,10 @@ fn split_return(b: *mut ir.Block, t: *mut ir.Value, c: *mut ir.Value, r: *mut ir
     }
 }
 
-// Marks (aux = 1) the values derived from f's allocas, the allocas
-// themselves included: the pointer arithmetic, phis, selects and copies of
-// them.
+// Marks the values derived from f's allocas, the allocas themselves
+// included: the pointer arithmetic, phis, selects and copies of them. Each
+// value's aux is the union of the bits of the allocas it may be derived
+// from: an alloca's own (aux, set before) or 1.
 fn mark_derived(f: *mut ir.Func) bool {
     let mut any = false;
     let mut changed = true;
@@ -482,24 +485,26 @@ fn mark_derived(f: *mut ir.Func) bool {
         while u.notnil(b) {
             let mut i = b.first;
             while u.notnil(i) {
-                if i.aux == 0 {
-                    let mut d = i.op == ir.OP_ALLOCA;
-                    if ((i.op == ir.OP_PTRADD) or (i.op == ir.OP_COPY) or (i.op == ir.OP_BITCAST)) and derived(i.a) {
-                        d = true;
-                    } else if (i.op == ir.OP_SELECT) and (derived(i.b) or derived(i.c)) {
-                        d = true;
-                    } else if i.op == ir.OP_PHI {
-                        for k in 0..i.xs.len {
-                            if derived(i.xs.get(k)) {
-                                d = true;
-                            }
-                        }
+                let mut m: u64 = 0;
+                if i.op == ir.OP_ALLOCA {
+                    m = 1;
+                    any = true;
+                } else if (i.op == ir.OP_PTRADD) or (i.op == ir.OP_COPY) or (i.op == ir.OP_BITCAST) {
+                    m = mask(i.a);
+                } else if i.op == ir.OP_SELECT {
+                    m = mask(i.b) | mask(i.c);
+                } else if i.op == ir.OP_PHI {
+                    for k in 0..i.xs.len {
+                        m = m | mask(i.xs.get(k));
                     }
-                    if d {
-                        i.aux = 1;
-                        changed = true;
-                        any = true;
-                    }
+                }
+                let old = @bit_cast(u64, i.aux);
+                if (i.op == ir.OP_ALLOCA) and (old != 0) {
+                    m = 0;  // (its own bit)
+                }
+                if (old | m) != old {
+                    i.aux = @bit_cast(i64, old | m);
+                    changed = true;
                 }
                 i = i.next;
             }
@@ -509,40 +514,198 @@ fn mark_derived(f: *mut ir.Func) bool {
     return any;
 }
 
-fn derived(x: *ir.Value) bool {
-    return u.notnil(x) and (x.kind == ir.V_INST) and (x.aux == 1);
+// The allocas (bits) value x may be derived from (mark_derived).
+fn mask(x: *ir.Value) u64 {
+    if u.notnil(x) and (x.kind == ir.V_INST) {
+        return @bit_cast(u64, x.aux);
+    }
+    return 0;
 }
 
-// Does instruction i let the address of an alloca out (mark_derived): use
-// a derived value other than as the address a load, store, copy or fill
-// accesses, or the input of further derived values and comparisons?
+fn derived(x: *ir.Value) bool {
+    return mask(x) != 0;
+}
+
+// Does instruction i let the address of an alloca out (mark_derived)?
 fn escapes(i: *ir.Value) bool {
+    return escape_mask(i) != 0;
+}
+
+// The allocas (bits) whose address instruction i lets out: those of a
+// derived value it uses other than as the address a load, store, copy or
+// fill accesses, or the input of further derived values and comparisons.
+fn escape_mask(i: *ir.Value) u64 {
     let op = i.op;
     if (op == ir.OP_PTRADD) or (op == ir.OP_COPY) or (op == ir.OP_BITCAST) or (op == ir.OP_PHI) or (op == ir.OP_ICMP) or
        (op == ir.OP_LOAD) {
-        return derived(i.b) and (op == ir.OP_PTRADD);  // (an offset that is an address: as an integer)
+        if op == ir.OP_PTRADD {
+            return mask(i.b);  // (an offset that is an address: as an integer)
+        }
+        return 0;
     }
     if op == ir.OP_SELECT {
-        return derived(i.a);
+        return mask(i.a);
     }
     if op == ir.OP_STORE {
-        return derived(i.a);
+        return mask(i.a);
     }
     if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
-        return false;  // (lengths and bytes are integers)
+        return 0;  // (lengths and bytes are integers)
     }
     if (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) {
-        return derived(i.b) or derived(i.c);
+        return mask(i.b) | mask(i.c);
     }
-    if derived(i.a) or derived(i.b) or derived(i.c) {
-        return true;
-    }
+    let mut m = mask(i.a) | mask(i.b) | mask(i.c);
     for k in 0..i.xs.len {
-        if derived(i.xs.get(k)) {
-            return true;
+        m = m | mask(i.xs.get(k));
+    }
+    return m;
+}
+
+/// Marks f's calls (ir.F_FRAME_DEAD) during which, by C's lifetimes, no
+/// object of f's frame whose address escaped is alive: every alloca whose
+/// address an instruction lets out (escape_mask) holds an object of a block
+/// (ir.life_of) that is neither the call's scope (ir.tag_of) nor a scope
+/// around it (the rule at ir.IN_RSCOPE). Then the callee can reach no object
+/// of f that is alive (an access through such an address is undefined,
+/// 6.2.4p2) but through the call's own arguments, which mark_sibling_calls
+/// still looks at. Before the scopes go (passes.finish_funcs), at the
+/// levels that make sibling calls; the flag goes with the call where later
+/// passes copy it: each copy runs where the call ran.
+pub fn mark_frame_dead(f: *mut ir.Func) void {
+    if not f.rscopes or u.isnil(f.first) or not sibling_ok(f) {
+        return;
+    }
+    // (the allocas, a bit each; past 63 one bit for all the others)
+    let mut allocas = u.List.[*mut ir.Value].empty();
+    defer allocas.deinit();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            if i.op == ir.OP_ALLOCA {
+                i.aux = @bit_cast(i64, @as(u64, 1) << @truncate(u32, @min(allocas.len, 63)));
+                allocas.push(i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if allocas.len == 0 {
+        return;
+    }
+    _ = mark_derived(f);
+    let mut esc: u64 = 0;
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            esc = esc | escape_mask(i);
+            i = i.next;
+        }
+        b = b.next;
+    }
+    clear_marks(f);
+    // (the lives of the allocas that escape: each must be known)
+    let mut lives = u.List.[u32].empty();
+    defer lives.deinit();
+    for k in 0..allocas.len {
+        let bit = @as(u64, 1) << @truncate(u32, @min(k, 63));
+        if (esc & bit) != 0 {
+            let n = ir.life_of(allocas.get(k));
+            if (n == 0) or (k >= 63) {
+                return;
+            }
+            lives.push(n);
         }
     }
-    return false;
+    if lives.len == 0 {
+        return;  // (nothing escapes: mark_sibling_calls needs no flags)
+    }
+    let mut around = u.List.[u32].empty();  // (the numbers of a call's scopes)
+    defer around.deinit();
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_CALL) and scopes_of(i, &mut around) and none_in(lives.items(), around.items()) {
+                i.flags = i.flags | ir.F_FRAME_DEAD;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+/// The lives (ir.life_of) of f's allocas whose address an instruction lets
+/// out (escape_mask), in `out` (a life of more than 62 such allocas: all of
+/// theirs): for the C front end, which keeps the scopes of those lives only.
+pub fn escaping_lives(f: *mut ir.Func, out: *mut u.List.[u32]) void {
+    out.clear();
+    // (bit 0: the allocas without a life; then one each, the last shared)
+    let mut allocas = u.List.[*mut ir.Value].empty();
+    defer allocas.deinit();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            if (i.op == ir.OP_ALLOCA) and (ir.life_of(i) != 0) {
+                i.aux = @bit_cast(i64, @as(u64, 1) << @truncate(u32, @min(allocas.len + 1, 63)));
+                allocas.push(i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if allocas.len == 0 {
+        return;
+    }
+    _ = mark_derived(f);
+    let mut esc: u64 = 0;
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            esc = esc | escape_mask(i);
+            i = i.next;
+        }
+        b = b.next;
+    }
+    clear_marks(f);
+    for k in 0..allocas.len {
+        if (esc & (@as(u64, 1) << @truncate(u32, @min(k + 1, 63)))) != 0 {
+            out.push(ir.life_of(allocas.get(k)));
+        }
+    }
+}
+
+// The numbers of call c's scope and those around it, in `out`; false if
+// it has none (or too many to look at).
+fn scopes_of(c: *ir.Value, out: *mut u.List.[u32]) bool {
+    out.clear();
+    let mut t = ir.tag_of(c);
+    while u.notnil(t) {
+        if out.len >= 64 {
+            return false;
+        }
+        out.push(ir.scope_num(t));
+        t = ir.rscope_parent(t);
+    }
+    return out.len > 0;
+}
+
+// Is none of xs in ys?
+fn none_in(xs: []u32, ys: []u32) bool {
+    for x in xs {
+        for y in ys {
+            if x == y {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Marks the blocks (aux = 1) from which an escaped alloca address can reach
@@ -581,6 +744,9 @@ fn mark_escaped(f: *mut ir.Func) void {
 // Can the callee of call c, in a block mark_escaped has seen, reach an
 // alloca of the caller?
 fn sees_frame(c: *mut ir.Value) bool {
+    if (c.flags & ir.F_FRAME_DEAD) != 0 {
+        return escapes(c);  // (its own arguments)
+    }
     let b = c.blk;
     if b.aux == 1 {
         return true;

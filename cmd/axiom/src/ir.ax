@@ -713,8 +713,58 @@ pub const IN_OBJSIZE: i32 = 117;
 //     restrict-qualified members of one structure object), or one is a
 //     member's read whose structure address s is a stack slot or a global
 //     and the other is based on s itself.
+// The same scopes say where C's automatic objects live (6.2.4p6: from entry
+// into their block until its execution ends): the C front end also begins a
+// scope for each block that declares automatic objects (and has no label in
+// it), and numbers the scopes of a function (scope_num, in cv's high half;
+// copies keep the number, numbers of an inlined function's scopes may equal
+// the caller's). An alloca of such an object holds its block's number
+// (life_of; 0: the object may be alive anywhere in the function). The rule:
+// an object is alive during an operation only if its number is that of the
+// operation's tag or of a scope around it; for an untagged operation it may
+// be. Kept true by: the inliner (the copy's outermost scopes in the call's
+// tag; for an untagged call, every life of the function forgotten), the
+// passes that drop scopes (opt.loop_restricts: the lives of its objects
+// forgotten), copies.ax (a slot that takes another's place keeps a life only
+// if both had it). tailrec.mark_frame_dead uses it before the scopes go.
 pub const IN_RSCOPE: i32 = 118;
 pub const IN_RESTRICT: i32 = 119;
+
+/// The number of restrict scope s (IN_RSCOPE; see above), 0 if it has none.
+pub fn scope_num(s: *Value) u32 {
+    return @truncate(u32, s.cv >> 32);
+}
+
+/// Numbers restrict scope s (IN_RSCOPE) n.
+pub fn set_scope_num(s: *mut Value, n: u32) void {
+    s.cv = (s.cv & 0xffff_ffff) | (@as(u64, n) << 32);
+}
+
+/// The number of the scope whose execution the object of alloca a lives in
+/// (see IN_RSCOPE), 0 if not known.
+pub fn life_of(a: *Value) u32 {
+    return @truncate(u32, a.cv);
+}
+
+/// Sets alloca a's life (life_of) to n.
+pub fn set_life(a: *mut Value, n: u32) void {
+    a.cv = @as(u64, n);
+}
+
+/// Forgets the lives (life_of) of f's allocas that are n (all of them if n
+/// is 0).
+pub fn forget_lives(f: *mut Func, n: u32) void {
+    if u.isnil(f.first) {
+        return;
+    }
+    let mut i = f.first.first;  // (all allocas are in the entry block)
+    while u.notnil(i) {
+        if (i.op == OP_ALLOCA) and (i.cv != 0) and ((n == 0) or (life_of(i) == n)) {
+            i.cv = 0;
+        }
+        i = i.next;
+    }
+}
 
 pub fn is_widen(id: i32) bool {
     return (id >= IN_SWIDEN_LO) and (id <= IN_UWIDEN_HI);
@@ -1668,6 +1718,10 @@ pub fn ord_join(s: u32, f: u32) u32 {
 }
 // Call flags
 pub const F_TAIL: u32 = 4;  // a sibling call: the backend may jump to the callee (tailrec.ax: mark_sibling_calls)
+// No object of the caller's frame whose address escaped is alive during the
+// call, other than through its own arguments (C's lifetimes, by the block
+// scopes: tailrec.mark_frame_dead)
+pub const F_FRAME_DEAD: u32 = 0x80000;
 // Flags of add, sub, mul and shl (integers): the operation does not overflow
 // as a signed (F_NSW) or as an unsigned (F_NUW) operation, as integers of any
 // width (for shl: the bits shifted out are copies of the result's sign bit,
