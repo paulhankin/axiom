@@ -92,8 +92,7 @@ fn program_linkage() i32 {
     }
     return ir.LINK_INTERNAL;
 }
-// Has the program C units (cfront.pending when code generation starts)?
-let mut g_c_program: bool = false;
+
 // Build a test binary (axiom test): tests become roots and are exported.
 pub let mut g_test_mode: bool = false;
 // Set before codegen: the program spawns threads (wasm: shared memory and a
@@ -117,6 +116,98 @@ let mut T_f32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 let mut T_f64: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 let mut T_v128: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 
+// The rest of the unit's lowering state: the instances to generate, the
+// runtime's globals (traps, call sites, the shadow stack, thread-locals) and
+// the IR values of strings and globals. With the unit's handles above (O, M,
+// B, the IR types) and the function's (F, FnState), this is all of the
+// lowering's mutable state, apart from the driver's settings and results (g_*).
+struct State {
+    // Has the program C units (cfront.pending when code generation starts)?
+    c_program: bool,
+    inst_map: u.SymMap.[*mut FnInst],  // the function instances, by key
+    build_features: u64,               // the build's extensions (--cpu, --features)
+    pending_head: *mut FnInst,         // the instances still to generate, in order (next)
+    pending_tail: *mut FnInst,
+    // The sites check_inst_sizes has reported (one error each, as sema's).
+    size_sites: u.List.[u.Span],
+    cur_span: u.Span,  // the source of the code being lowered
+    // traps: the runtime's trap function, its info block and hook
+    trap_fn: *mut ir.Value,
+    trap_info: *mut ir.Value,
+    trap_hook: *mut ir.Value,
+    trap_fnty: *mut ir.Ty,
+    // call-site records (stack traces, profiles)
+    site_ty: *mut ir.Ty,
+    site_tab: u.List.[SiteKey],
+    site_count: usize,
+    // The unit's site strings: each string of its site records once, NUL
+    // terminated, in one global (.site_strs: offset 0 is ""), made when the unit
+    // is done (end_site_strs).
+    site_strs_g: *mut ir.Value,
+    site_strs: u.Buf,
+    site_str_offs: u.SymMap.[u32],
+    // the shadow stack: its record's type, and its globals
+    ss_ty: *mut ir.Ty,
+    ss_global: *mut ir.Value,
+    ss_main: *mut ir.Value,
+    stack_limit_global: *mut ir.Value,         // WebAssembly: the thread's stack limit
+    string_globals: u.SymMap.[*mut ir.Value],  // the string literals' globals, by contents
+    global_vals: u.SymMap.[*mut ir.Value],     // the IR values of the program's globals, by declaration
+    // --sanitize=address: main is wrapped (emit_asan_main)
+    sanitize_main: bool,
+    // Thread-locals on wasm, which has no TLS: the program's thread-locals,
+    // in declaration order (the same in every unit, since all units come from
+    // one checked program), make one block. The main thread's is the global
+    // axiom.tls.main; every other thread copies the initial values
+    // (axiom.tls.init) to the top of its stack when it starts and keeps the
+    // address in axiom.tls, a wasm global, so per instance (per thread), null
+    // in the main thread.
+    tls_ty: *mut ir.Ty,
+    tls_main: *mut ir.Value,
+    tls_init: *mut ir.Value,
+    tls_ptr: *mut ir.Value,
+    tls_decls: u.List.[*mut ast.Decl],
+    errtab: *mut ir.Value,  // the error-name table
+    // The exports whose C functions are wrappers (get_inst).
+    cabi_exports: u.List.[*mut FnInst],
+    // The library modules' exports to generate when referred to (lazy_export),
+    // by name: those whose names no C unit defines.
+    lazy_fns: u.SymMap.[*mut ast.Decl],
+}
+
+let mut S: State = State.{ c_program: false,
+                           inst_map: u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
+                                                              vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0,
+                                                              len: 0 }, build_features: 0,
+                           pending_head: @ptr_from_int(*mut FnInst, 0), pending_tail: @ptr_from_int(*mut FnInst, 0),
+                           size_sites: u.List.[u.Span].{ data: @ptr_from_int(*mut u.Span, 0), len: 0, cap: 0 },
+                           cur_span: u.Span.{ file: 0, start: 0, end: 0 }, trap_fn: @ptr_from_int(*mut ir.Value, 0),
+                           trap_info: @ptr_from_int(*mut ir.Value, 0), trap_hook: @ptr_from_int(*mut ir.Value, 0),
+                           trap_fnty: @ptr_from_int(*mut ir.Ty, 0), site_ty: @ptr_from_int(*mut ir.Ty, 0),
+                           site_tab: u.List.[SiteKey].{ data: @ptr_from_int(*mut SiteKey, 0), len: 0, cap: 0 },
+                           site_count: 0, site_strs_g: @ptr_from_int(*mut ir.Value, 0),
+                           site_strs: u.Buf.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                           site_str_offs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                           vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                           ss_ty: @ptr_from_int(*mut ir.Ty, 0), ss_global: @ptr_from_int(*mut ir.Value, 0),
+                           ss_main: @ptr_from_int(*mut ir.Value, 0),
+                           stack_limit_global: @ptr_from_int(*mut ir.Value, 0),
+                           string_globals: u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                      vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                      cap: 0, len: 0 },
+                           global_vals: u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                   vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0,
+                                                                   len: 0 }, sanitize_main: false,
+                           tls_ty: @ptr_from_int(*mut ir.Ty, 0), tls_main: @ptr_from_int(*mut ir.Value, 0),
+                           tls_init: @ptr_from_int(*mut ir.Value, 0), tls_ptr: @ptr_from_int(*mut ir.Value, 0),
+                           tls_decls: u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0,
+                                                               cap: 0 }, errtab: @ptr_from_int(*mut ir.Value, 0),
+                           cabi_exports: u.List.[*mut FnInst].{ data: @ptr_from_int(*mut *mut FnInst, 0), len: 0,
+                                                                cap: 0 },
+                           lazy_fns: u.SymMap.[*mut ast.Decl].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                vals: @ptr_from_int(*mut *mut ast.Decl, 0), cap: 0,
+                                                                len: 0 } };
+
 // ---------------------------------------------------------------------------
 // Function instances
 // ---------------------------------------------------------------------------
@@ -136,13 +227,6 @@ struct FnInst {
     depth: i32,    // instantiation nesting: one more than the instance whose body asked for it
     site: u.Span,  // where the non-generic code it was instantiated from asked for it (inst_site)
 }
-
-let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                    vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0,
-                                                                    len: 0 };
-let mut g_build_features: u64 = 0;  // the build's extensions (--cpu, --features)
-let mut pending_head: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
-let mut pending_tail: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 
 struct LoopCtx {
     brk: *mut ir.Block,
@@ -321,7 +405,7 @@ fn ct(t: *mut ast.Type) *mut ast.Type {
         return t;
     }
     let r = ty.subst(t, F.from, F.to);
-    check_inst_sizes(r, inst_site(g_cur_span));
+    check_inst_sizes(r, inst_site(S.cur_span));
     return r;
 }
 
@@ -353,19 +437,16 @@ fn check_inst_sizes(t: *mut ast.Type, sp: u.Span) void {
         }
     }
     if too_large(t) and not inner {
-        for i in 0..size_sites.len {
-            let r = size_sites.get(i);
+        for i in 0..S.size_sites.len {
+            let r = S.size_sites.get(i);
             if (r.file == sp.file) and (r.start == sp.start) and (r.end == sp.end) {
                 return;
             }
         }
-        size_sites.push(sp);
+        S.size_sites.push(sp);
         _ = dg.err(sp, "E0473", ty.size_problem(t));
     }
 }
-
-// The sites check_inst_sizes has reported (one error each, as sema's).
-let mut size_sites: u.List.[u.Span] = u.List.[u.Span].{ data: @ptr_from_int(*mut u.Span, 0), len: 0, cap: 0 };
 
 fn too_large(t: *mut ast.Type) bool {
     let k = t.kind;
@@ -386,7 +467,7 @@ fn inst_site(other: u.Span) u.Span {
     if F.inst.gargs.len != 0 {
         return F.inst.site;
     }
-    return g_cur_span;
+    return S.cur_span;
 }
 
 fn internal_error(msg: []u8) void {
@@ -701,23 +782,16 @@ const T_CPU: i32 = 13;
 const SITE_ERR_RETURN: i32 = 254;
 const SITE_CALL: i32 = 255;  // not traps: shadow stack records
 
-let mut g_cur_span: u.Span = u.Span.{ file: 0, start: 0, end: 0 };
-
 // The span of the code being generated: trap sites name it, and the
 // instructions made for it carry its line (ir.cur_src, debug information).
 fn set_span(sp: u.Span) void {
-    g_cur_span = sp;
+    S.cur_span = sp;
     let mut src: u32 = 0;
     if (sp.file >= 0) and (@int_cast(usize, sp.file) < u.g_files.len) {
         src = ir.src_loc(sp.file, u.span_linecol(sp).sl);
     }
     ir.cur_src = src;
 }
-let mut trap_fn: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut trap_info: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut trap_hook: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut trap_fnty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
-let mut site_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 // The site records made, by what makes them the same (site_slot): a hash
 // table (open addressing), which a lookup does not allocate in.
 struct SiteKey {
@@ -730,9 +804,6 @@ struct SiteKey {
     end: u32,
 }
 
-let mut site_tab: u.List.[SiteKey] = u.List.[SiteKey].{ data: @ptr_from_int(*mut SiteKey, 0), len: 0, cap: 0 };
-let mut site_count: usize = 0;
-
 fn site_hash(code: i32, sp: u.Span, fname: []u8, callee: []u8) u64 {
     let mut h = u.hash_fnv(fname) ^ (u.hash_fnv(callee) *% 0x9E3779B97F4A7C15);
     h = (h ^ @as(u64, @bit_cast(u32, code))) *% 0x100000001b3;
@@ -744,16 +815,16 @@ fn site_hash(code: i32, sp: u.Span, fname: []u8, callee: []u8) u64 {
 // The slot of the site record for these, which is free (g nil) if there is
 // none yet: the caller then fills it.
 fn site_slot(code: i32, sp: u.Span, fname: []u8, callee: []u8) *mut SiteKey {
-    if (site_count + 1) * 2 > site_tab.len {
-        let old = site_tab;
+    if (S.site_count + 1) * 2 > S.site_tab.len {
+        let old = S.site_tab;
         let mut n: usize = 4096;
         if old.len > 0 {
             n = old.len * 2;
         }
-        site_tab = u.List.[SiteKey].empty();
-        site_tab.reserve(n);
-        site_tab.len = n;
-        let t = site_tab.items();
+        S.site_tab = u.List.[SiteKey].empty();
+        S.site_tab.reserve(n);
+        S.site_tab.len = n;
+        let t = S.site_tab.items();
         @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, t.ptr), n * @size_of(SiteKey)), 0);
         for k in old.items() {
             if u.notnil(k.g) {
@@ -768,8 +839,8 @@ fn site_slot(code: i32, sp: u.Span, fname: []u8, callee: []u8) *mut SiteKey {
         let mut o = old;
         o.deinit();
     }
-    let n = site_tab.len;
-    let t = site_tab.items();
+    let n = S.site_tab.len;
+    let t = S.site_tab.items();
     let mut j = @truncate(usize, site_hash(code, sp, fname, callee)) & (n - 1);
     loop {
         let k = &mut t[j];
@@ -786,12 +857,12 @@ fn site_slot(code: i32, sp: u.Span, fname: []u8, callee: []u8) *mut SiteKey {
 
 // axiom.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
 fn trap_info_global() *mut ir.Value {
-    if u.isnil(trap_info) {
+    if u.isnil(S.trap_info) {
         let t = ir.t_array(T_i64, 6);
-        trap_info = shared_global(t, "axiom.trap_info", ir.czero(t), 0);
-        set_align(trap_info, 8);
+        S.trap_info = shared_global(t, "axiom.trap_info", ir.czero(t), 0);
+        set_align(S.trap_info, 8);
     }
-    return trap_info;
+    return S.trap_info;
 }
 
 fn trap_info_slot(i: u64) *mut ir.Value {
@@ -830,8 +901,8 @@ pub fn file_from_key(text: []u8) i32 {
 // Exported symbol names of the whole program (for the linker), and libraries
 // named by extern "C" blocks: computed from the checked program.
 pub fn collect_link_names(o: *CgOptions) void {
-    g_sanitize_main = o.sanitize_address;
-    g_c_program = cfront.pending();
+    S.sanitize_main = o.sanitize_address;
+    S.c_program = cfront.pending();
     let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     let P = sema.g_prog;
     for i in 0..P.fns.len {
@@ -865,51 +936,43 @@ fn cur_fn_display() []u8 {
     return "";
 }
 
-// The unit's site strings: each string of its site records once, NUL
-// terminated, in one global (.site_strs: offset 0 is ""), made when the unit
-// is done (end_site_strs).
-let mut site_strs_g: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut site_strs: u.Buf = u.Buf.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
-let mut site_str_offs: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
-
 // s's offset in the unit's site strings.
 fn site_str(s: []u8) u32 {
-    if u.isnil(site_strs_g) {
+    if u.isnil(S.site_strs_g) {
         // (its type and contents are set when the unit is done)
-        site_strs_g = ir.add_global(M, ir.t_array(T_i8, 1), ".site_strs").val;
-        set_linkage(site_strs_g, ir.LINK_INTERNAL);
-        ir.gv_of(site_strs_g).is_const = true;
-        set_align(site_strs_g, 1);
-        site_strs = u.Buf.init();
-        site_strs.c(0);
-        site_str_offs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+        S.site_strs_g = ir.add_global(M, ir.t_array(T_i8, 1), ".site_strs").val;
+        set_linkage(S.site_strs_g, ir.LINK_INTERNAL);
+        ir.gv_of(S.site_strs_g).is_const = true;
+        set_align(S.site_strs_g, 1);
+        S.site_strs = u.Buf.init();
+        S.site_strs.c(0);
+        S.site_str_offs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     }
     if s.len == 0 {
         return 0;
     }
     let k = u.intern(s);
-    let at = site_str_offs.get(k);
+    let at = S.site_str_offs.get(k);
     if at != 0 {
         return at - 1;
     }
-    let off = @truncate(u32, site_strs.len());
-    site_strs.s(s);
-    site_strs.c(0);
-    site_str_offs.put(k, off + 1);
+    let off = @truncate(u32, S.site_strs.len());
+    S.site_strs.s(s);
+    S.site_strs.c(0);
+    S.site_str_offs.put(k, off + 1);
     return off;
 }
 
 // The unit's site strings, now that all its site records are made.
 fn end_site_strs() void {
-    if u.isnil(site_strs_g) {
+    if u.isnil(S.site_strs_g) {
         return;
     }
-    let bytes = site_strs.view();
-    let g = ir.gv_of(site_strs_g);
+    let bytes = S.site_strs.view();
+    let g = ir.gv_of(S.site_strs_g);
     g.ty = ir.t_array(T_i8, @as(u64, bytes.len));
-    set_init(site_strs_g, ir.cstring(bytes[0..bytes.len - 1]));  // (cstring adds the last NUL)
-    site_strs_g = u.nil.[ir.Value]();
+    set_init(S.site_strs_g, ir.cstring(bytes[0..bytes.len - 1]));  // (cstring adds the last NUL)
+    S.site_strs_g = u.nil.[ir.Value]();
 }
 
 // A constant site record {code, file id, start, end, line, col, file, text,
@@ -974,9 +1037,9 @@ fn site_record_in(code: i32, sp: u.Span, fname: []u8, callee0: []u8) *mut ir.Val
     if u.notnil(slot.g) {
         return slot.g;
     }
-    if u.isnil(site_ty) {
+    if u.isnil(S.site_ty) {
         let mut el: [11]*mut ir.Ty = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr];
-        site_ty = ir.t_struct(el[..]);
+        S.site_ty = ir.t_struct(el[..]);
     }
     let mut lc = u.LineCol.{ sl: 0, sc: 0, el: 0, ec: 0 };
     let mut file: []u8 = "";
@@ -1013,12 +1076,12 @@ fn site_record_in(code: i32, sp: u.Span, fname: []u8, callee0: []u8) *mut ir.Val
         ci32(@as(u64, site_str(cstr_prefix(text)))),
         ci32(@as(u64, site_str(cstr_prefix(fname)))),
         ci32(@as(u64, site_str(cstr_prefix(callee)))),
-        site_strs_g,
+        S.site_strs_g,
     ];
-    let g = ir.add_global(M, site_ty, ".site").val;
+    let g = ir.add_global(M, S.site_ty, ".site").val;
     // (the struct type of these values is site_ty, which cstruct would look up again by name)
     if vals[10].ty == T_ptr {
-        set_init(g, ir.cagg(site_ty, vals[..]));
+        set_init(g, ir.cagg(S.site_ty, vals[..]));
     } else {
         set_init(g, ir.cstruct(vals[..]));
     }
@@ -1032,7 +1095,7 @@ fn site_record_in(code: i32, sp: u.Span, fname: []u8, callee0: []u8) *mut ir.Val
     slot.fname = u.intern(fname);  // (kept: the callers' may not be)
     slot.callee = u.intern(callee);
     slot.g = g;
-    site_count += 1;
+    S.site_count += 1;
     return g;
 }
 
@@ -1061,9 +1124,6 @@ fn site_record(code: i32, sp: u.Span) *mut ir.Value {
 // ---------------------------------------------------------------------------
 const SS_CAP: u64 = 256;
 const ET_CAP: u64 = 32;
-let mut ss_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
-let mut ss_global: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut ss_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
 fn stack_traces_on() bool {
     return u.notnil(O) and O.stack_traces and not (u.notnil(F) and F.no_trace);
@@ -1109,11 +1169,11 @@ fn is_runtime_module(m: *ast.Module) bool {
 }
 
 fn ss_type() *mut ir.Ty {
-    if u.isnil(ss_ty) {
+    if u.isnil(S.ss_ty) {
         let mut el: [4]*mut ir.Ty = [T_i32, T_i32, ir.t_array(T_ptr, SS_CAP), ir.t_array(T_ptr, ET_CAP)];
-        ss_ty = ir.t_struct(el[..]);
+        S.ss_ty = ir.t_struct(el[..]);
     }
-    return ss_ty;
+    return S.ss_ty;
 }
 
 // WebAssembly stacks live in linear memory, where running past the end goes
@@ -1121,13 +1181,12 @@ fn ss_type() *mut ir.Ty {
 // per-thread limit (a wasm global) first. The main thread's stack is the
 // first MiB of memory; its lowest KiB stays unused.
 const WASM_MAIN_STACK_LIMIT: u64 = 1024;
-let mut stack_limit_global: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
 fn stack_limit() *mut ir.Value {
-    if u.isnil(stack_limit_global) {
-        stack_limit_global = shared_global(T_isz, "axiom.stack_limit", ir.cint(T_isz, WASM_MAIN_STACK_LIMIT), 1);
+    if u.isnil(S.stack_limit_global) {
+        S.stack_limit_global = shared_global(T_isz, "axiom.stack_limit", ir.cint(T_isz, WASM_MAIN_STACK_LIMIT), 1);
     }
-    return stack_limit_global;
+    return S.stack_limit_global;
 }
 
 // The end of a wasm function's entry block (where its allocas are): trap
@@ -1150,7 +1209,7 @@ fn check_stack(d: *mut ast.Decl, entry: *mut ir.Block, start: *mut ir.Block) voi
     let mut mark: [1]*mut ir.Value = [ir.cint(T_i32, 1)];
     let sp = ir.intr(B, ir.IN_GET_SP, T_ptr, mark[..]);
     let spi = ir.cast(B, ir.OP_PTRTOINT, sp, T_isz);
-    let saved = g_cur_span;
+    let saved = S.cur_span;
     set_span(d.name_span);
     // signed: a frame reserved below address 0 wraps around. The difference
     // itself cannot wrap: the stack pointer was at or above the limit before
@@ -1163,30 +1222,30 @@ fn check_stack(d: *mut ast.Decl, entry: *mut ir.Block, start: *mut ir.Block) voi
 
 fn ss_globals() void {
     let t = ss_type();
-    if u.isnil(ss_global) {
+    if u.isnil(S.ss_global) {
         if ty.g_target.is_wasm {
-            ss_main = shared_global(t, "axiom.ss.main", ir.czero(t), 0);
-            set_align(ss_main, 8);
-            ir.gv_of(ss_main).noalias = true;
+            S.ss_main = shared_global(t, "axiom.ss.main", ir.czero(t), 0);
+            set_align(S.ss_main, 8);
+            ir.gv_of(S.ss_main).noalias = true;
             // null means the main thread's record (wasm-ld does not relocate
             // wasm global initializers); thread starts set their own.
-            ss_global = shared_global(T_ptr, "axiom.ss", ir.czero(T_ptr), 1);
+            S.ss_global = shared_global(T_ptr, "axiom.ss", ir.czero(T_ptr), 1);
         } else {
-            ss_global = shared_global(t, "axiom.ss", ir.czero(t), 0);
-            ir.gv_of(ss_global).tls = true;
-            set_align(ss_global, 8);
+            S.ss_global = shared_global(t, "axiom.ss", ir.czero(t), 0);
+            ir.gv_of(S.ss_global).tls = true;
+            set_align(S.ss_global, 8);
         }
-        ir.gv_of(ss_global).noalias = true;
+        ir.gv_of(S.ss_global).noalias = true;
     }
 }
 
 fn ss_ptr() *mut ir.Value {
     ss_globals();
     if ty.g_target.is_wasm {
-        let p = ld(T_ptr, ss_global);
-        return ir.select(B, ir.is_null(B, p), ss_main, p);
+        let p = ld(T_ptr, S.ss_global);
+        return ir.select(B, ir.is_null(B, p), S.ss_main, p);
     }
-    return ss_global;
+    return S.ss_global;
 }
 
 fn ss_field(ss: *mut ir.Value, i: u32) *mut ir.Value {
@@ -1221,7 +1280,7 @@ fn ss_push(callee: []u8) SsFrame {
         return f;
     }
     if frame_tables() {
-        f.site = site_record_ex(SITE_CALL, g_cur_span, callee);
+        f.site = site_record_ex(SITE_CALL, S.cur_span, callee);
         return f;
     }
     if u.isnil(F.ss_depth) {
@@ -1240,7 +1299,7 @@ fn ss_push(callee: []u8) SsFrame {
     }
     f.ss = F.ss_rec;
     f.depth = F.ss_depth;
-    ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), F.ss_slot);
+    ss_store(site_record_ex(SITE_CALL, S.cur_span, callee), F.ss_slot);
     ss_store(F.ss_next, ss_field(f.ss, 0));
     return f;
 }
@@ -1274,7 +1333,7 @@ fn etrace_push(code: *mut ir.Value) void {
     let np = ss_field(ss, 1);
     let n = ld(T_i32, np);
     let idx = b_and(n, ci32(ET_CAP - 1));
-    _ = st(site_record(SITE_ERR_RETURN, g_cur_span), ss_slot(ss, 3, idx));
+    _ = st(site_record(SITE_ERR_RETURN, S.cur_span), ss_slot(ss, 3, idx));
     _ = st(b_add(n, ci32(1)), np);
     if u.notnil(cont) {
         br(cont);
@@ -1359,17 +1418,17 @@ fn ins_elem(v: *mut ir.Value, x: *mut ir.Value, idx: *mut ir.Value) *mut ir.Valu
 }
 
 fn call_trap_site(site: *mut ir.Value) void {
-    if u.isnil(trap_fn) {
+    if u.isnil(S.trap_fn) {
         let mut ps: [1]*mut ir.Ty = [T_ptr];
-        trap_fnty = ir.t_fn(T_void, ps[..], false);
-        trap_fn = ir.add_function(M, "axiom.trap", trap_fnty).val;
-        set_linkage(trap_fn, ir.LINK_INTERNAL);
-        add_fn_attr(trap_fn, "noreturn");
-        add_fn_attr(trap_fn, "cold");
-        add_fn_attr(trap_fn, "nounwind");
-        add_fn_attr(trap_fn, "noinline");
+        S.trap_fnty = ir.t_fn(T_void, ps[..], false);
+        S.trap_fn = ir.add_function(M, "axiom.trap", S.trap_fnty).val;
+        set_linkage(S.trap_fn, ir.LINK_INTERNAL);
+        add_fn_attr(S.trap_fn, "noreturn");
+        add_fn_attr(S.trap_fn, "cold");
+        add_fn_attr(S.trap_fn, "nounwind");
+        add_fn_attr(S.trap_fn, "noinline");
         let cur = ir.insert_block(B);
-        let f = trap_fn;
+        let f = S.trap_fn;
         at_end(ir.append_block(ir.fnp_of(f), "entry"));
         let sp = param(f, 0);
         _ = st(zext(ptrtoint(sp, T_isz), T_i64), trap_info_slot(0));
@@ -1377,11 +1436,11 @@ fn call_trap_site(site: *mut ir.Value) void {
             // Optional host hook (std/internal/runtime/native_host.c, std/internal/runtime/test_main.c).
             let mut hps: [3]*mut ir.Ty = [T_ptr, T_ptr, T_ptr];
             let hty = ir.t_fn(T_void, hps[..], false);
-            trap_hook = ir.add_function(M, "ax_on_trap", hty).val;
-            set_linkage(trap_hook, ir.LINK_EXTWEAK);
+            S.trap_hook = ir.add_function(M, "ax_on_trap", hty).val;
+            set_linkage(S.trap_hook, ir.LINK_EXTWEAK);
             let call_bb = ir.append_block(ir.fnp_of(f), "hook");
             let done_bb = ir.append_block(ir.fnp_of(f), "trap");
-            let has = icmp(ir.IntNE, trap_hook, ir.czero(T_ptr));
+            let has = icmp(ir.IntNE, S.trap_hook, ir.czero(T_ptr));
             condbr(has, call_bb, done_bb);
             at_end(call_bb);
             let mut ssv = ir.czero(T_ptr);
@@ -1406,7 +1465,7 @@ fn call_trap_site(site: *mut ir.Value) void {
                 at_end(hook_bb);
             }
             let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
-            _ = call(hty, trap_hook, args[..]);
+            _ = call(hty, S.trap_hook, args[..]);
             br(done_bb);
             at_end(done_bb);
         }
@@ -1415,7 +1474,7 @@ fn call_trap_site(site: *mut ir.Value) void {
         at_end(cur);
     }
     let mut a: [1]*mut ir.Value = [site];
-    _ = call(trap_fnty, trap_fn, a[..]);
+    _ = call(S.trap_fnty, S.trap_fn, a[..]);
 }
 
 // A block that traps with `code` at the current source span.
@@ -1423,7 +1482,7 @@ fn trap_block(code: i32) *mut ir.Block {
     let cur = ir.insert_block(B);
     let bb = new_bb("trap".ptr);
     at_end(bb);
-    call_trap_site(site_record(code, g_cur_span));
+    call_trap_site(site_record(code, S.cur_span));
     ir.unreachable(B);
     at_end(cur);
     return bb;
@@ -1454,7 +1513,7 @@ fn check_or_trap(ok: *mut ir.Value, code: i32) void {
 }
 
 fn emit_trap(code: i32) void {
-    call_trap_site(site_record(code, g_cur_span));
+    call_trap_site(site_record(code, S.cur_span));
     ir.unreachable(B);
     dead_block();
 }
@@ -1563,12 +1622,9 @@ fn dll_import(fname: []u8, lib: []u8) void {
     set_align(g, 1);
 }
 
-let mut string_globals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
-
 fn string_ptr(bytes: []u8) *mut ir.Value {
     let key = u.intern(bytes);
-    let mut g = string_globals.get(key);
+    let mut g = S.string_globals.get(key);
     if u.isnil(g) {
         // A NUL follows every literal (not part of the slice), so that
         // "text".ptr is a valid C string (spec §2.5).
@@ -1578,7 +1634,7 @@ fn string_ptr(bytes: []u8) *mut ir.Value {
         set_linkage(g, ir.LINK_INTERNAL);
         ir.gv_of(g).is_const = true;
         set_align(g, 1);
-        string_globals.put(key, g);
+        S.string_globals.put(key, g);
     }
     return g;
 }
@@ -1587,9 +1643,6 @@ fn const_slice(ptr: *mut ir.Value, len: i64) *mut ir.Value {
     let mut el: [2]*mut ir.Value = [ptr, usz(len)];
     return ir.cstruct(el[..]);
 }
-
-let mut global_vals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
 fn const_struct2(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     let mut el: [2]*mut ir.Value = [a, b];
@@ -1848,7 +1901,7 @@ fn fn_display(d: *mut ast.Decl, gargs: []mut *mut ast.Type) []u8 {
 // have their own main) `main` is renamed; the export name is an attribute.
 fn export_symbol(d: *mut ast.Decl) []u8 {
     if d.is_export and u.str_eq(d.name, "main") {
-        if g_sanitize_main and not g_test_mode {
+        if S.sanitize_main and not g_test_mode {
             return "axiom.asan.main";  // wrapped: see emit_asan_main
         }
         return "axiom.export.main";
@@ -1856,14 +1909,11 @@ fn export_symbol(d: *mut ast.Decl) []u8 {
     return d.name;
 }
 
-// --sanitize=address: main is wrapped (emit_asan_main)
-let mut g_sanitize_main: bool = false;
-
 // Globals live in the link unit when units are compiled separately (their
 // initializers may contain error codes, which only the link unit knows).
 fn global_ref(d: *mut ast.Decl) *mut ir.Value {
     let k = u.addr_key(@int_from_ptr(d));
-    let found = global_vals.get(k);
+    let found = S.global_vals.get(k);
     if u.notnil(found) {
         return found;
     }
@@ -1880,12 +1930,12 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
             ex = ir.add_global(M, lty(t), gname);
             ex.align = @max(ex.align, @bit_cast(u64, ty.type_align(t)));
         }
-        global_vals.put(k, ex.val);
+        S.global_vals.put(k, ex.val);
         return ex.val;
     }
     let g = ir.add_global(M, lty(t), gname).val;
     set_align(g, @int_cast(u32, ty.type_align(t)));
-    global_vals.put(k, g);
+    S.global_vals.put(k, g);
     // (on wasm a thread-local lives in the thread's block instead: tls_addr)
     ir.gv_of(g).tls = d.is_tls;
     if O.unit == CG_MODULE {
@@ -1921,71 +1971,57 @@ fn global_addr(d: *mut ast.Decl) *mut ir.Value {
     return global_ref(d);
 }
 
-// Thread-locals on wasm, which has no TLS: the program's thread-locals,
-// in declaration order (the same in every unit, since all units come from
-// one checked program), make one block. The main thread's is the global
-// axiom.tls.main; every other thread copies the initial values
-// (axiom.tls.init) to the top of its stack when it starts and keeps the
-// address in axiom.tls, a wasm global, so per instance (per thread), null
-// in the main thread.
-let mut tls_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
-let mut tls_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut tls_init: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut tls_ptr: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut tls_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0,
-                                                                     cap: 0 };
-
 // Whether the program has thread-locals; on wasm, makes their block's globals.
 fn tls_globals() bool {
-    if u.notnil(tls_ty) {
+    if u.notnil(S.tls_ty) {
         return true;
     }
     let P = sema.g_prog;
-    tls_decls.clear();
+    S.tls_decls.clear();
     for i in 0..P.globals.len {
         let d = P.globals.get(i);
         if d.is_tls {
-            tls_decls.push(d);
+            S.tls_decls.push(d);
         }
     }
-    if tls_decls.len == 0 {
+    if S.tls_decls.len == 0 {
         return false;
     }
-    let n = tls_decls.len;
+    let n = S.tls_decls.len;
     let fs = u.newn.[*mut ir.Ty](n + 1);
     for k in 0..n {
-        fs[k] = lty(tls_decls.get(k).ty);
+        fs[k] = lty(S.tls_decls.get(k).ty);
     }
-    tls_ty = ir.t_struct(fs[0..n]);
+    S.tls_ty = ir.t_struct(fs[0..n]);
     let mut init = vnil();
     if O.unit != CG_MODULE {
         let vs = u.newn.[*mut ir.Value](n + 1);
         for k in 0..n {
-            let d = tls_decls.get(k);
+            let d = S.tls_decls.get(k);
             vs[k] = gen_const(d.init, d.ty);
         }
         init = ir.cstruct(vs[0..n]);
     }
-    tls_main = shared_global(tls_ty, "axiom.tls.main", init, 0);
-    set_align(tls_main, @int_cast(u32, @max(tls_ty.align, 8)));
-    tls_init = shared_global(tls_ty, "axiom.tls.init", init, 0);
-    set_align(tls_init, @int_cast(u32, @max(tls_ty.align, 8)));
-    ir.gv_of(tls_init).is_const = true;
-    tls_ptr = shared_global(T_ptr, "axiom.tls", ir.czero(T_ptr), 1);
+    S.tls_main = shared_global(S.tls_ty, "axiom.tls.main", init, 0);
+    set_align(S.tls_main, @int_cast(u32, @max(S.tls_ty.align, 8)));
+    S.tls_init = shared_global(S.tls_ty, "axiom.tls.init", init, 0);
+    set_align(S.tls_init, @int_cast(u32, @max(S.tls_ty.align, 8)));
+    ir.gv_of(S.tls_init).is_const = true;
+    S.tls_ptr = shared_global(T_ptr, "axiom.tls", ir.czero(T_ptr), 1);
     return true;
 }
 
 fn tls_addr(d: *mut ast.Decl) *mut ir.Value {
     _ = tls_globals();
     let mut field: u32 = 0;
-    for k in 0..tls_decls.len {
-        if tls_decls.get(k) == d {
+    for k in 0..S.tls_decls.len {
+        if S.tls_decls.get(k) == d {
             field = @truncate(u32, k);
         }
     }
-    let p = ld(T_ptr, tls_ptr);
-    let base = ir.select(B, ir.is_null(B, p), tls_main, p);
-    return sgep(tls_ty, base, field);
+    let p = ld(T_ptr, S.tls_ptr);
+    let base = ir.select(B, ir.is_null(B, p), S.tls_main, p);
+    return sgep(S.tls_ty, base, field);
 }
 
 // Program-wide state shared by all units: defined (internal) in a whole
@@ -2055,7 +2091,7 @@ fn base_features(d: *mut ast.Decl) u64 {
     if sema.baseline_fn(d) {
         return 0;
     }
-    return g_build_features;
+    return S.build_features;
 }
 
 fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
@@ -2109,7 +2145,7 @@ fn inst_symbol(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64, own_fea
         nb.s("]");
     }
     if own_feats {
-        let sfx = tg.features_string(feats & ~g_build_features);
+        let sfx = tg.features_string(feats & ~S.build_features);
         nb.s(".");
         if sfx.len == 0 {
             nb.s("base");
@@ -2135,7 +2171,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         kb.s(u.udec(feats));
     }
     let k = u.intern(kb.done());
-    let found = inst_map.get(k);
+    let found = S.inst_map.get(k);
     if u.notnil(found) {
         return found;
     }
@@ -2192,7 +2228,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         fi.llty = ir.t_fn(fi.llty.ret, fi.llty.params, true);
     }
     let mut existing = vnil();
-    if (d.kind == ast.D_HOST_FN) or (d.is_export and g_c_program) {
+    if (d.kind == ast.D_HOST_FN) or (d.is_export and S.c_program) {
         // (an export: C code, or an extern "C" block, may have declared it)
         existing = named_fn(name);
     }
@@ -2240,7 +2276,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
             define = false;  // a library's: a C unit defines the name, and that is the definition
         }
         if d.cabi and define {
-            g_cabi_exports.push(fi);
+            S.cabi_exports.push(fi);
         }
         if ((O.unit == CG_WHOLE) and (not d.is_export or d.cabi)) or own_feats {
             set_linkage(fi.fnv, ir.LINK_INTERNAL);
@@ -2251,20 +2287,20 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
             // definition, so the optimizer may inline it as before)
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
         }
-        let asan_main = g_sanitize_main and not g_test_mode and u.str_eq(d.name, "main");
+        let asan_main = S.sanitize_main and not g_test_mode and u.str_eq(d.name, "main");
         if define and d.is_export and ty.g_target.is_wasm and not asan_main and not lazy_export(d) and not d.cabi {
             add_str_attr(fi.fnv, "wasm-export-name", d.name);
         }
         if define {
-            if u.notnil(pending_tail) {
-                pending_tail.next = fi;
+            if u.notnil(S.pending_tail) {
+                S.pending_tail.next = fi;
             } else {
-                pending_head = fi;
+                S.pending_head = fi;
             }
-            pending_tail = fi;
+            S.pending_tail = fi;
         }
     }
-    inst_map.put(k, fi);
+    S.inst_map.put(k, fi);
     return fi;
 }
 
@@ -2273,7 +2309,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
 // with a suffix, and shown under the function's own name in traces.
 fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
     let key = u.intern(u.f2("%s#v%s", fi.key, u.zdec(k)));
-    let found = inst_map.get(key);
+    let found = S.inst_map.get(key);
     if u.notnil(found) {
         return found;
     }
@@ -2286,7 +2322,7 @@ fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
     v.sret = fi.sret;
     v.display = fi.display;
     v.feats = feats;
-    let mut suffix = tg.features_string(feats & ~g_build_features);
+    let mut suffix = tg.features_string(feats & ~S.build_features);
     if suffix.len == 0 {
         suffix = "base";
     }
@@ -2295,13 +2331,13 @@ fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
     ir.fnp_of(v.fnv).has_features = true;
     set_linkage(v.fnv, ir.LINK_INTERNAL);
     add_ext_attrs(v.fnv, v.fnty, v.sret, false);
-    if u.notnil(pending_tail) {
-        pending_tail.next = v;
+    if u.notnil(S.pending_tail) {
+        S.pending_tail.next = v;
     } else {
-        pending_head = v;
+        S.pending_head = v;
     }
-    pending_tail = v;
-    inst_map.put(key, v);
+    S.pending_tail = v;
+    S.inst_map.put(key, v);
     return v;
 }
 
@@ -4726,11 +4762,11 @@ fn emit_thread_start() void {
     _ = st(ld(T_isz, top), stack_limit());
     if tls_globals() {
         // the thread's own copy of the thread-locals, at the top of its stack
-        let size = (tls_ty.size + 15) & ~@as(u64, 15);
+        let size = (S.tls_ty.size + 15) & ~@as(u64, 15);
         let neg = ir.cint(T_isz, 0 -% size);
         let base = gep1(T_i8, top, neg);
-        _ = ir.memop(B, ir.OP_MEMCPY, base, tls_init, usz(@bit_cast(i64, tls_ty.size)));
-        _ = st(base, tls_ptr);
+        _ = ir.memop(B, ir.OP_MEMCPY, base, S.tls_init, usz(@bit_cast(i64, S.tls_ty.size)));
+        _ = st(base, S.tls_ptr);
         top = base;
     }
     if program_traces() {
@@ -4741,7 +4777,7 @@ fn emit_thread_start() void {
         let base = gep1(T_i8, top, neg);
         _ = ir.memop(B, ir.OP_MEMSET, base, ir.cint(T_i8, 0), usz(@bit_cast(i64, size)));
         ss_globals();
-        _ = st(base, ss_global);
+        _ = st(base, S.ss_global);
         top = base;
     }
     let mut tys: [1]*mut ir.Ty = [T_ptr];
@@ -4770,11 +4806,9 @@ fn emit_thread_start() void {
     }
 }
 
-let mut g_errtab: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-
 fn error_name_table() *mut ir.Value {
-    if u.notnil(g_errtab) {
-        return g_errtab;
+    if u.notnil(S.errtab) {
+        return S.errtab;
     }
     let names = sema.g_prog.error_names;
     let n = names.len;
@@ -4785,11 +4819,11 @@ fn error_name_table() *mut ir.Value {
         vs[i + 1] = const_slice(string_ptr(s), @int_cast(i64, s.len));
     }
     let stt = lty(ty.type_slice(ty.t_u8, false));
-    g_errtab = ir.add_global(M, ir.t_array(stt, @as(u64, n) + 1), "axiom.error_names").val;
-    set_init(g_errtab, ir.carray(stt, vs[0..n + 1]));
-    set_linkage(g_errtab, ir.LINK_INTERNAL);
-    ir.gv_of(g_errtab).is_const = true;
-    return g_errtab;
+    S.errtab = ir.add_global(M, ir.t_array(stt, @as(u64, n) + 1), "axiom.error_names").val;
+    set_init(S.errtab, ir.carray(stt, vs[0..n + 1]));
+    set_linkage(S.errtab, ir.LINK_INTERNAL);
+    ir.gv_of(S.errtab).is_const = true;
+    return S.errtab;
 }
 
 fn error_name_fty() *mut ir.Ty {
@@ -5550,7 +5584,7 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
 // Wrappers that track the source span of the code being generated, for
 // trap sites.
 fn gen(e: *mut ast.Expr) *mut ir.Value {
-    let saved = g_cur_span;
+    let saved = S.cur_span;
     set_span(e.span);
     let v = gen_inner(e);
     set_span(saved);
@@ -5558,7 +5592,7 @@ fn gen(e: *mut ast.Expr) *mut ir.Value {
 }
 
 fn gen_addr(e: *mut ast.Expr) *mut ir.Value {
-    let saved = g_cur_span;
+    let saved = S.cur_span;
     set_span(e.span);
     let v = gen_addr_inner(e);
     set_span(saved);
@@ -5566,7 +5600,7 @@ fn gen_addr(e: *mut ast.Expr) *mut ir.Value {
 }
 
 fn gen_stmt(s: *mut ast.Stmt) void {
-    let saved = g_cur_span;
+    let saved = S.cur_span;
     set_span(s.span);
     gen_stmt_inner(s);
     set_span(saved);
@@ -5675,14 +5709,10 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
 pub let CABI_PREFIX: []u8 = "__axiom_cabi_";
 pub let CABI_IMPL: []u8 = "__axiom_cabi_impl_";
 
-// The exports whose C functions are wrappers (get_inst).
-let mut g_cabi_exports: u.List.[*mut FnInst] = u.List.[*mut FnInst].{ data: @ptr_from_int(*mut *mut FnInst, 0), len: 0,
-                                                                      cap: 0 };
-
 // For each such export, CABI_IMPL + its name: the export's function with
 // its structures by pointer (fn_lty_c), for its C wrapper to call.
 fn emit_cabi_thunks() void {
-    for fi in g_cabi_exports.items() {
+    for fi in S.cabi_exports.items() {
         let d = fi.decl;
         let cl = fn_lty_c(fi.fnty, true);
         let f = ir.add_function(M, u.cat2(CABI_IMPL, d.name), cl.t).val;
@@ -5725,7 +5755,7 @@ fn emit_cabi_thunks() void {
             ir.ret(B, r);
         }
     }
-    g_cabi_exports.clear();
+    S.cabi_exports.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -5967,11 +5997,11 @@ fn emit_native_entry() void {
 
 // Generates the bodies of the functions instantiated and not yet generated.
 fn gen_pending() void {
-    while u.notnil(pending_head) {
-        let fi = pending_head;
-        pending_head = fi.next;
-        if u.isnil(pending_head) {
-            pending_tail = u.nil.[FnInst]();
+    while u.notnil(S.pending_head) {
+        let fi = S.pending_head;
+        S.pending_head = fi.next;
+        if u.isnil(S.pending_head) {
+            S.pending_tail = u.nil.[FnInst]();
         }
         gen_fn_body(fi);
     }
@@ -6004,24 +6034,18 @@ fn exports_exit() bool {
 // Is d an `export fn` of a library's module (g_lib_prefix), generated only
 // when referred to, in a program with C units?
 fn lazy_export(d: *ast.Decl) bool {
-    if not d.is_export or (g_lib_prefix.len == 0) or not g_c_program or u.isnil(d.module) {
+    if not d.is_export or (g_lib_prefix.len == 0) or not S.c_program or u.isnil(d.module) {
         return false;
     }
     return u.starts(d.module.path, g_lib_prefix);
 }
-
-// The library modules' exports to generate when referred to (lazy_export),
-// by name: those whose names no C unit defines.
-let mut lazy_fns: u.SymMap.[*mut ast.Decl] = u.SymMap.[*mut ast.Decl].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                        vals: @ptr_from_int(*mut *mut ast.Decl, 0),
-                                                                        cap: 0, len: 0 };
 
 fn find_lazy_exports() void {
     let P = sema.g_prog;
     for i in 0..P.fns.len {
         let d = P.fns.get(i);
         if lazy_export(d) and not cfront.defines(d.name) {
-            lazy_fns.put(u.intern(d.name), d);
+            S.lazy_fns.put(u.intern(d.name), d);
         }
     }
 }
@@ -6030,10 +6054,10 @@ fn find_lazy_exports() void {
 // and what it refers to; true if so (cstrip.ax calls it for what it
 // reaches).
 fn define_lazy(f: *mut ir.Func) bool {
-    if lazy_fns.len == 0 {
+    if S.lazy_fns.len == 0 {
         return false;
     }
-    let d = lazy_fns.get(f.name);
+    let d = S.lazy_fns.get(f.name);
     if u.isnil(d) {
         return false;
     }
@@ -6047,7 +6071,7 @@ fn define_lazy(f: *mut ir.Func) bool {
 // what they refer to, until no more are (as an archive's members are
 // linked).
 fn link_lazy_exports() void {
-    if lazy_fns.len == 0 {
+    if S.lazy_fns.len == 0 {
         return;
     }
     let mut done: usize = 0;
@@ -6076,7 +6100,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         u.tree_default = false;
     }
     O = o;
-    g_build_features = tg.g_features;
+    S.build_features = tg.g_features;
     let P = sema.g_prog;
     ir.init_types(@int_cast(u64, ty.g_target.ptr_bits / 8));
     M = ir.new_module(u.file_of(P.root.file.id).display);
@@ -6099,7 +6123,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         M.cov_prev = cov_global("prev");
     }
     let program_parts = O.unit != CG_MODULE;
-    g_c_program = cfront.pending();
+    S.c_program = cfront.pending();
     if program_parts and ty.g_target.is_wasm and g_threads {
         emit_thread_start();
     }
@@ -6220,7 +6244,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         // the library exports that the objects linked with the program refer
         // to (cstrip.g_roots)
         for n in cstrip.g_root_list.items() {
-            let d = lazy_fns.get(n);
+            let d = S.lazy_fns.get(n);
             if u.notnil(d) {
                 _ = get_inst(d, ty.no_types());
             }
