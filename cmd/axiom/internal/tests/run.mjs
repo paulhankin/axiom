@@ -62,6 +62,17 @@ const noC = /windows|macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '');
 const buildOnly = native && process.env.AXIOM_NATIVE_EXEC === 'none';
 const buildNote = buildOnly ? 'built and checked, not run' : '';
 const execWrap = (buildOnly ? '' : process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
+// Under Wine, the prefix's server and its service processes (services.exe,
+// explorer.exe, winedevice.exe, rpcss.exe ...) inherit the standard streams
+// of the program that starts them, and keep them: a message of theirs (one
+// crashing as the server shuts down, under load) would land in that test's
+// output file. Started first here, with no streams, they are no test's
+// (the server stays two minutes after its last program).
+if (execWrap.length && /^wine/.test(path.basename(execWrap[0]))) {
+  const server = path.join(path.dirname(execWrap[0]), 'wineserver');
+  if (fs.existsSync(server)) spawnSync(server, ['-p120'], { stdio: 'ignore', timeout: 60000 });
+  spawnSync(execWrap[0], ['wineboot'], { stdio: 'ignore', timeout: 120000 });
+}
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const listOnly = argv.includes('--list');
