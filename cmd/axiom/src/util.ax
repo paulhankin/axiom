@@ -594,6 +594,18 @@ pub fn poisoning() bool {
     return poison == 1;
 }
 
+/// Leaves the scratch scopes for a while (what is allocated until
+/// scratch_resume is for good); for scratch_resume.
+pub fn scratch_suspend() i32 {
+    let d = scratch_depth;
+    scratch_depth = 0;
+    return d;
+}
+
+pub fn scratch_resume(depth: i32) void {
+    scratch_depth = depth;
+}
+
 pub fn scratch_begin() void {
     scratch_depth += 1;
 }
@@ -1536,10 +1548,15 @@ pub fn keep_dup(s: []u8) []u8 {
 /// On a worker thread, last: gives back all it allocated.
 pub fn worker_end() void {
     flush_out();
+    let fill = poisoning();  // (AXIOM_POISON: what still points into it shows)
     while tracked_head != 0 {
         let b = tracked_head;
         untrack(b);
-        smem.free_bytes(b, word(b + 16).* + 32);
+        let n = word(b + 16).* + 32;
+        if fill {
+            @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, b), n), 0xA5);
+        }
+        smem.free_bytes(b, n);
     }
     tracking = false;
     in_worker = false;
@@ -1560,6 +1577,9 @@ fn ptr_hash(p: usize) usize {
     x = x ^ (x >> 33);
     return @truncate(usize, x);
 }
+
+// A missing key's value (zeroes), for a map without a table.
+let NO_VALUE: [64]u64 = [0; 64];
 
 pub struct SymMap[V] {
     keys: *mut usize,
@@ -1607,13 +1627,21 @@ pub struct SymMap[V] {
         return j;
     }
 
+    // (reading a map never writes it, even one without a table yet: worker
+    // threads read the main thread's)
     pub fn get(self: *mut Self, k: []u8) V {
+        if (self.cap == 0) and (@size_of(V) <= @size_of([64]u64)) {
+            return @ptr_cast(*V, &NO_VALUE[0]).*;
+        }
         let j = self.slot(k);
         let vs = @slice_from_ptr(self.vals, self.cap);
         return vs[j];
     }
 
     pub fn has(self: *mut Self, k: []u8) bool {
+        if self.cap == 0 {
+            return false;
+        }
         let j = self.slot(k);
         let ks = @slice_from_ptr(self.keys, self.cap);
         return ks[j] != 0;
@@ -2290,6 +2318,16 @@ pub fn file_size(p: []u8) i64 {
 }
 
 // p's modification time (nanoseconds since 1970), or -1 if there is nothing at p.
+/// p's size and modification time ([-1, -1] if there is nothing at p): to
+/// see whether it changed.
+pub fn file_stamp(p: []u8) [2]i64 {
+    let st = stat(p);
+    if st[0] < 0 {
+        return [-1, -1];
+    }
+    return [st[1], st[2]];
+}
+
 pub fn file_mtime(p: []u8) i64 {
     let st = stat(p);
     if st[0] < 0 {
@@ -2757,6 +2795,7 @@ pub fn mkspan(file: i32, a: u32, b: u32) Span {
 pub struct Overlay {
     path: []u8,
     text: []u8,
+    edited: bool,  // changed in the editor (axiom lsp): not to be kept (sema.clean) even when it is the file's text
 }
 
 pub threadlocal let mut g_overlays: List.[Overlay] = List.[Overlay].{ data: @ptr_from_int(*mut Overlay, 0), len: 0,
@@ -2799,7 +2838,18 @@ pub fn add_overlay(path: []u8, text: []u8) void {
     }
     let t = alloc(text.len + 1);
     @mem_copy(@slice_from_ptr(t, text.len), text);
-    g_overlays.push(Overlay.{ path: p, text: @slice_from_ptr(t, text.len) });
+    g_overlays.push(Overlay.{ path: p, text: @slice_from_ptr(t, text.len), edited: false });
+}
+
+/// Whether the editor's buffer for `path` was changed (Overlay.edited).
+pub fn overlay_edited(path: []u8) bool {
+    for i in 0..g_overlays.len {
+        let o = g_overlays.at(i);
+        if same_path(o.path, path) {
+            return o.edited;
+        }
+    }
+    return false;
 }
 
 pub fn overlay_text(path: []u8) []u8 {
@@ -2830,7 +2880,34 @@ pub fn load_file(path: []u8, display: []u8) *mut SourceFile {
     sf.text = text;
     sf.id = @int_cast(i32, g_files.len);
     g_files.push(sf);
+    note_file(sf.id);
     return sf;
+}
+
+// The order this run came to the files in (ranks by g_files index, -1 for
+// none): the order of their ids, but for the files of modules a run takes
+// as checked before (sema.ax, axiom lsp), which have older ids.
+threadlocal let mut file_ranks: List.[i64] = List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+threadlocal let mut next_rank: i64 = 0;
+
+/// This run comes to file `id` now.
+pub fn note_file(id: i32) void {
+    let i = @int_cast(usize, id);
+    while file_ranks.len <= i {
+        file_ranks.push(-1);
+    }
+    file_ranks.items()[i] = next_rank;
+    next_rank += 1;
+}
+
+/// Where file `id` comes in the order of note_file (files it did not
+/// come to, after the others, by id).
+pub fn file_rank(id: i32) i64 {
+    let i = @int_cast(usize, id);
+    if (i < file_ranks.len) and (file_ranks.get(i) >= 0) {
+        return file_ranks.get(i);
+    }
+    return (@as(i64, 1) << 40) + @as(i64, id);
 }
 
 struct LC {
