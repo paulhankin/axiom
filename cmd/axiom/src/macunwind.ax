@@ -77,6 +77,7 @@
 // stack pointer moves after the prologue, and assembly procedures with
 // .cfi_ directives.
 // =============================================================================
+import "asm/core.ax" as acr;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "util.ax" as u;
@@ -376,6 +377,189 @@ pub fn add_proc(o: *mut Out, sym: u32, size: u64, prog: []u8, simple: bool, sign
         return;
     }
     add(o, sym, 0, size, 0, prog, simple, signal);
+}
+
+// An assembly procedure's CIE beyond the kinds `cie` makes (asm/core.ax
+// ProcX: a personality routine, an LSDA, a return address column, AArch64's
+// B and G), each kind once per object: its key, its offset.
+struct XCie {
+    obj: *mut elf.Obj,
+    key: []u8,
+    off: u64,
+}
+
+let mut xcies: u.List.[XCie] = u.List.[XCie].{ data: @ptr_from_int(*mut XCie, 0), len: 0, cap: 0 };
+
+fn sel(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The relocation of a pointer of encoding e (asm/core.ax eh_enc_ok's).
+fn enc_rel(o: *Out, e: u8) u32 {
+    let pc = (e & 0x70) == 0x10;
+    let wide = enc_size(e) == 8;
+    if o.x64 {
+        if wide {
+            return sel(pc, elf.R_X86_64_PC64, elf.R_X86_64_64);
+        }
+        if pc {
+            return elf.R_X86_64_PC32;
+        }
+        return sel((e & 0x0f) == 0xb, elf.R_X86_64_32S, elf.R_X86_64_32);
+    }
+    if wide {
+        return sel(pc, elf.R_AARCH64_PREL64, elf.R_AARCH64_ABS64);
+    }
+    return sel(pc, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS32);
+}
+
+// A pointer of encoding e to symbol sym + add at the end of section s's data.
+fn put_ptr(o: *Out, s: *mut elf.Sec, e: u8, sym: u32, addend: i64) void {
+    s.relocs.push(elf.Rel.{ off: @as(u64, s.data.len()), ty: enc_rel(o, e), sym: sym, addend: addend });
+    if enc_size(e) == 8 {
+        s.data.u64_(0);
+    } else {
+        s.data.u32_(0);
+    }
+}
+
+/// Adds an ELF object's FDE for an assembly procedure at `sym` of `size`
+/// bytes whose description has more than add_proc's kinds (x: its
+/// personality routine at symbol `psym`, its LSDA at `lsym`, ...): a CIE of
+/// that kind (version 1, or 3 for a return address column above 255;
+/// augmentation "z", then "P" with the routine's encoding and pointer, "L"
+/// with the LSDA's encoding, "R" (pc-relative 4-byte FDE pointers), "S" for
+/// a signal frame, "B" and "G"), and the FDE, whose augmentation data is
+/// the LSDA's pointer.
+pub fn add_proc_x(o: *mut Out, sym: u32, size: u64, prog: []u8, simple: bool, signal: bool, x: acr.ProcX, psym: u32,
+                  lsym: u32) void {
+    if not o.on or not o.elf {
+        return;
+    }
+    let mut ra: u64 = 30;
+    if o.x64 {
+        ra = 16;
+    }
+    if x.ra > 0 {
+        ra = @bit_cast(u64, x.ra - 1);
+    }
+    let mut kb = u.Buf.init();
+    kb.s(u.pick(simple, "s", "-"));
+    kb.s(u.pick(signal, "S", "-"));
+    kb.s(u.pick(x.bkey, "B", "-"));
+    kb.s(u.pick(x.mte, "G", "-"));
+    kb.s(u.dec(@bit_cast(i64, ra)));
+    if x.has_p {
+        kb.s(u.f3("|%s|%s|%s", u.dec(@as(i64, x.penc)), u.dec(@as(i64, psym)), u.dec(x.padd)));
+    }
+    if x.has_l {
+        kb.s(u.f1("|L%s", u.dec(@as(i64, x.lenc))));
+    }
+    let key = kb.done();
+    let s = o.obj.secs.get(@int_cast(usize, o.eh));
+    let mut c: u64 = 0xffff_ffff_ffff_ffff;
+    for e in xcies.items() {
+        if (e.obj == o.obj) and u.str_eq(e.key, key) {
+            c = e.off;
+        }
+    }
+    if c == 0xffff_ffff_ffff_ffff {
+        let b = &mut s.data;
+        let at = b.len();
+        b.u32_(0);
+        b.u32_(0);  // (a CIE)
+        if ra > 255 {
+            b.u8_(3);
+        } else {
+            b.u8_(1);
+        }
+        b.u8_('z');
+        if x.has_p {
+            b.u8_('P');
+        }
+        if x.has_l {
+            b.u8_('L');
+        }
+        b.u8_('R');
+        if signal {
+            b.u8_('S');
+        }
+        if x.bkey {
+            b.u8_('B');
+        }
+        if x.mte {
+            b.u8_('G');
+        }
+        b.u8_(0);
+        if o.x64 {
+            b.uleb(1);
+        } else {
+            b.uleb(4);
+        }
+        b.sleb(-8);
+        if ra > 255 {
+            b.uleb(ra);
+        } else {
+            b.u8_(@truncate(u8, ra));
+        }
+        let mut alen: u64 = 1;
+        if x.has_p {
+            alen += 1 + @as(u64, enc_size(x.penc));
+        }
+        if x.has_l {
+            alen += 1;
+        }
+        b.uleb(alen);
+        if x.has_p {
+            b.u8_(x.penc);
+            put_ptr(o, s, x.penc, psym, x.padd);
+        }
+        let b2 = &mut s.data;
+        if x.has_l {
+            b2.u8_(x.lenc);
+        }
+        b2.u8_(0x1b);
+        if not simple {
+            if o.x64 {
+                b2.u8_(CFA_DEF_CFA);
+                b2.uleb(7);
+                b2.uleb(8);
+                b2.u8_(CFA_OFFSET | 16);
+                b2.uleb(1);
+            } else {
+                b2.u8_(CFA_DEF_CFA);
+                b2.uleb(31);
+                b2.uleb(0);
+            }
+        }
+        pad_entry(b2, at, align(o));
+        c = @as(u64, at);
+        xcies.push(XCie.{ obj: o.obj, key: key, off: c });
+    }
+    let b = &mut s.data;
+    let at = b.len();
+    b.u32_(0);
+    b.u32_(@as(u64, at + 4) - c);
+    s.relocs.push(elf.Rel.{ off: @as(u64, b.len()), ty: prel32(o.x64), sym: sym, addend: 0 });
+    b.u32_(0);
+    b.u32_(size);
+    if x.has_l {
+        b.uleb(@as(u64, enc_size(x.lenc)));
+        put_ptr(o, s, x.lenc, lsym, x.ladd);
+    } else {
+        b.uleb(0);
+    }
+    let b3 = &mut s.data;
+    b3.put(prog);
+    pad_entry(b3, at, align(o));
+}
+
+/// Does the procedure's description need add_proc_x (more than its kind)?
+pub fn needs_x(x: acr.ProcX) bool {
+    return x.has_p or x.has_l or (x.ra > 0) or x.bkey or x.mte;
 }
 
 // -----------------------------------------------------------------------------

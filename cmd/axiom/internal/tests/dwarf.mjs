@@ -488,7 +488,9 @@ function run(cie, prog, state, fde, low, initial) {
     else if (op === 0x11) { const g = r.uleb(); state.regs.set(g, ['off', r.sleb() * cie.daf]); }
     else if (op === 0x12) state.cfa = [r.uleb(), r.sleb() * cie.daf];
     else if (op === 0x13) state.cfa = [state.cfa[0], r.sleb() * cie.daf];
-    else if (op === 0x2d) state.regs.set('ra_sign', ['negate']);
+    else if (op === 0x2d || op === 0x2c) state.regs.set('ra_sign', ['negate']);
+    else if (op === 0x14) { const g = r.uleb(); state.regs.set(g, ['val', r.uleb() * cie.daf]); }
+    else if (op === 0x15) { const g = r.uleb(); state.regs.set(g, ['val', r.sleb() * cie.daf]); }
     else throw new Error(`call frame instruction 0x${op.toString(16)}`);
     if (fde && (hi === 0x40 || op === 2 || op === 3 || op === 4)) continue;
     if (fde) row();

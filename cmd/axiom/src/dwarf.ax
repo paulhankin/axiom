@@ -2729,7 +2729,7 @@ fn frame_cie(d: *mut Unit) void {
 // the initial instructions (.cfi_startproc simple), and with the
 // augmentation "S" for a signal frame (.cfi_signal_frame: the return
 // address is that of the instruction to run, not after a call); its offset.
-fn asm_cie(d: *mut Unit, simple: bool, signal: bool) u64 {
+fn asm_cie(d: *mut Unit, simple: bool, signal: bool, ra: i64) u64 {
     let mut k: usize = 0;
     if simple {
         k = 1;
@@ -2737,10 +2737,10 @@ fn asm_cie(d: *mut Unit, simple: bool, signal: bool) u64 {
     if signal {
         k += 2;
     }
-    if k == 0 {
+    if (k == 0) and (ra == 0) {
         return 0;
     }
-    if d.cies[k] != 0 {
+    if (ra == 0) and (d.cies[k] != 0) {
         return d.cies[k] - 1;
     }
     let b = &mut d.parts[D_FRAME].b;
@@ -2756,15 +2756,20 @@ fn asm_cie(d: *mut Unit, simple: bool, signal: bool) u64 {
     b.u8_(0);
     b.uleb(code_align(d));
     b.sleb(DATA_ALIGN);
-    if d.arch == ARCH_A64 {
+    if ra > 0 {
+        b.uleb(@bit_cast(u64, ra - 1));  // (.cfi_return_column: its column; the initial state the target's)
+    } else if d.arch == ARCH_A64 {
         b.uleb(@as(u64, A64_LR));
+    } else {
+        b.uleb(@as(u64, X64_RA));
+    }
+    if d.arch == ARCH_A64 {
         if not simple {
             b.u8_(CFA_DEF_CFA);
             b.uleb(@as(u64, A64_SP));
             b.uleb(0);
         }
     } else {
-        b.uleb(@as(u64, X64_RA));
         if not simple {
             b.u8_(CFA_DEF_CFA);
             b.uleb(@as(u64, X64_RSP));
@@ -2774,18 +2779,21 @@ fn asm_cie(d: *mut Unit, simple: bool, signal: bool) u64 {
         }
     }
     pad_entry(b, at);
-    d.cies[k] = @as(u64, at) + 1;
+    if ra == 0 {
+        d.cies[k] = @as(u64, at) + 1;
+    }
     return @as(u64, at);
 }
 
 /// An FDE for a procedure of file-scope asm (asm/core.ax Proc): at symbol
 /// `sym` + `add`, `size` bytes, its call frame instructions `prog` (what
-/// its .cfi_* directives say), after the CIE of its kind.
-pub fn add_asm_fde(d: *mut Unit, sym: u32, add: u64, size: u64, prog: []u8, simple: bool, signal: bool) void {
+/// its .cfi_* directives say), after the CIE of its kind (and of its return
+/// address column `ra` + 1, 0: the target's).
+pub fn add_asm_fde(d: *mut Unit, sym: u32, add: u64, size: u64, prog: []u8, simple: bool, signal: bool, ra: i64) void {
     if not d.on or (d.arch == ARCH_WASM) {
         return;
     }
-    let cie = asm_cie(d, simple, signal);
+    let cie = asm_cie(d, simple, signal, ra);
     let p = &mut d.parts[D_FRAME];
     let at = p.b.len();
     p.b.u32_(0);

@@ -42,7 +42,7 @@ import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, checkEhFrame, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
+import { loadImage, checkDebug, checkEhFrame, readEhFrame, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -1259,6 +1259,37 @@ function cDriverCases() {
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
       return /at deref\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+    },
+    // --unwind-tables=off: no call frame information for the compiler's
+    // functions or the linker's stubs (no .eh_frame, no PT_GNU_EH_FRAME in
+    // a program of the compiler's code only, none in an object), and the
+    // program's own traces as before (they walk the frame pointers).
+    'C: native stack traces with --unwind-tables=off': async () => {
+      if (skip()) return skip();
+      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      write({ 'crash3.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
+        'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
+      const out = path.join(dir, 'crash3');
+      for (const o of ['-O0', '-O2']) {
+        const c = await ax(['build', 'crash3.c', o, nativeTarget, '--unwind-tables=off', '-o', out]);
+        if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
+        const d = fs.readFileSync(out);
+        if (loadImage(d).sections.has('.eh_frame')) return `${o}: an .eh_frame`;
+        const phoff = Number(d.readBigUInt64LE(32)), phnum = d.readUInt16LE(56);
+        for (let k = 0; k < phnum; k++) if (d.readUInt32LE(phoff + 56 * k) === 0x6474e550) return `${o}: a PT_GNU_EH_FRAME`;
+        const r = spawnSync(out, [], { encoding: 'utf8' });
+        if (o === '-O0' && !/at deref\n\s+at middle \(crash3\.c:5:12\)\n\s+at main \(crash3\.c:9:12\)/.test(r.stderr)) return `the trace:\n${r.stderr}`;
+        // (-O2: the trace of the build with the tables)
+        const on = await ax(['build', 'crash3.c', o, nativeTarget, '-o', `${out}-on`]);
+        if (on.status !== 0) return `build: ${on.stdout}${on.stderr}`;
+        const ron = spawnSync(`${out}-on`, [], { encoding: 'utf8' });
+        if (!/crash:/.test(r.stderr) || r.stderr !== ron.stderr) return `${o}: the trace:\n${r.stderr}\nwith the tables:\n${ron.stderr}`;
+      }
+      const obj = path.join(dir, 'crash3.o');
+      const c = await ax(['build', 'crash3.c', '-O2', nativeTarget, '--unwind-tables=off', '--emit=obj', '-o', obj]);
+      if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
+      if (loadImage(fs.readFileSync(obj)).sections.has('.eh_frame')) return 'the object has an .eh_frame';
+      return null;
     },
     // At -O2 the frames that exist are all there, with the calls inlined
     // into them (their call-site records carry the inlining, and say which
@@ -2922,6 +2953,24 @@ if (!skipPlatform) {
           return `inl: the saved register's rules: ${exprs.map(show).join('; ')}`;
         const after = fi.rows[fi.rows.indexOf(exprs[exprs.length - 1]) + 1];
         if (!after || (after.regs.has(reg) && after.regs.get(reg)[0] === 'expr')) return 'inl: the register is not given back';
+        if (mac) return null;
+        // Linux: .eh_frame has asmf's rows; the other directives (asmsig,
+        // asmdbg, asmeh: asm_cfi.c)
+        const eh = readEhFrame(img), ehOf = (f) => eh.find((d) => d.low === f.addr);
+        const same = (a, b) => JSON.stringify(a.rows.map(show)) === JSON.stringify(b.rows.map(show));
+        if (!ehOf(asmf) || !same(ehOf(asmf), fa)) return 'asmf: its .eh_frame FDE is not its .debug_frame one';
+        const sig = fn('asmsig'), dbg = fn('asmdbg'), ehf = fn('asmeh');
+        if (!sig || !dbg || !ehf) return 'no symbol asmsig, asmdbg or asmeh';
+        const es = ehOf(sig);
+        if (!es || !es.cie.signal || es.cie.ra !== 5) return `asmsig: ${es ? `augmentation ${es.cie.aug}, return column ${es.cie.ra}` : 'no FDE'}`;
+        if (!x64 && !/B/.test(es.cie.aug + '') ) return `asmsig: augmentation ${es.cie.aug}`;
+        if (!x64 && !/G/.test(es.cie.aug)) return `asmsig: augmentation ${es.cie.aug}`;
+        const last = es.rows[es.rows.length - 1];
+        if (String(last.regs.get(reg)) !== 'val,8') return `asmsig: ${show(last)}`;
+        const ds = fdeOf(sig);
+        if (!ds || !same(ds, es)) return 'asmsig: its .debug_frame FDE differs';
+        if (ehOf(dbg) || !fdeOf(dbg)) return 'asmdbg: not in .debug_frame only';
+        if (!ehOf(ehf) || fdeOf(ehf)) return 'asmeh: not in .eh_frame only';
         return null;
       };
     }

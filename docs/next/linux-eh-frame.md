@@ -8,4 +8,6 @@
   together, ends it, and names it and `.eh_frame_hdr` in the executable's section
   headers; its stub functions have FDEs too. Executables grow by about 9% for a
   program that prints a line (its runtime's small functions), 2% for a large one.
+  `--unwind-tables=off` leaves the tables out (the program's own stack traces are the
+  same; the system's unwinder then stops at Axiom and C frames).
   The call frame programs are shorter in `.debug_frame` and macOS's `__eh_frame` too.

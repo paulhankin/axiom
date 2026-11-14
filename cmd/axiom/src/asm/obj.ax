@@ -35,6 +35,9 @@ pub struct FileProc {
     prog: []u8,
     simple: bool,
     signal: bool,
+    x: cr.ProcX,  // (its personality's and LSDA's symbols: psym_i, lsym_i)
+    psym_i: u32,
+    lsym_i: u32,
 }
 
 /// The procedures of the file-scope asm added to the object being written
@@ -107,6 +110,32 @@ pub let mut funcs: u.List.[FileFunc] = u.List.[FileFunc].{ data: @ptr_from_int(*
 /// Adds assembled file-scope asm A to obj, whose code section is `text`;
 /// `aliases`: its blob's (the names of internal linkage in it); `file_id`:
 /// the assembly source's file, whose lines its code's line information
+// The object's symbol for name `nm` of text A (a relocation's, a
+// procedure's personality's or LSDA's): its label's (syms: each Def's
+// symbol, or -1), an alias's, or an undefined one.
+fn name_sym(obj: *mut elf.Obj, A: *mut cr.Asm, syms: []i64, aliases: [][]u8, nm: []u8) u32 {
+    let d = A.names.get(u.intern(nm));
+    if (d != 0) and (syms[@int_cast(usize, d - 1)] >= 0) {
+        return @truncate(u32, @bit_cast(u64, syms[@int_cast(usize, d - 1)]));
+    }
+    let mut sym: u32 = 0;
+    let mut found = false;
+    for k in 0..A.defs.len {
+        if (syms[k] >= 0) and u.str_eq(A.defs.get(k).name, nm) {
+            sym = @truncate(u32, @bit_cast(u64, syms[k]));
+            found = true;
+        }
+    }
+    if found {
+        return sym;
+    }
+    let al = alias_sym(obj, aliases, nm);
+    if al >= 0 {
+        return @truncate(u32, @bit_cast(u64, al));
+    }
+    return elf.ext_sym(obj, u.perm_dup(nm), false);
+}
+
 /// gives (.loc's where it says), or -1.
 pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, file_id: i32) void {
     // sections: where each of A's starts in obj's
@@ -152,6 +181,15 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
             }
         }
     }
+    // (and those a procedure's personality and LSDA name)
+    for p in A.procs.items() {
+        for k in 0..A.defs.len {
+            let n = A.defs.get(k).name;
+            if (p.x.has_p and u.str_eq(n, p.x.psym)) or (p.x.has_l and u.str_eq(n, p.x.lsym)) {
+                wanted[k] = true;
+            }
+        }
+    }
     for k in 0..A.defs.len {
         syms[k] = -1;
         let d = A.defs.get(k);
@@ -192,25 +230,7 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
     // relocations
     for r in A.relocs.items() {
         let si = @int_cast(usize, r.sec);
-        let mut sym: u32 = 0;
-        let d = A.names.get(u.intern(r.name));
-        if (d != 0) and (syms[@int_cast(usize, d - 1)] >= 0) {
-            sym = @truncate(u32, @bit_cast(u64, syms[@int_cast(usize, d - 1)]));
-        } else {
-            let mut found = false;
-            for k in 0..A.defs.len {
-                if (syms[k] >= 0) and u.str_eq(A.defs.get(k).name, r.name) {
-                    sym = @truncate(u32, @bit_cast(u64, syms[k]));
-                    found = true;
-                }
-            }
-            let al = alias_sym(obj, aliases, r.name);
-            if not found and (al >= 0) {
-                sym = @truncate(u32, @bit_cast(u64, al));
-            } else if not found {
-                sym = elf.ext_sym(obj, u.perm_dup(r.name), false);
-            }
-        }
+        let sym = name_sym(obj, A, syms, aliases, r.name);
         let os = obj.secs.get(@int_cast(usize, secmap[si]));
         os.relocs.push(elf.Rel.{ off: base[si] + r.off, ty: r.ty, sym: sym, addend: r.addend });
     }
@@ -222,8 +242,16 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
         let si = @int_cast(usize, p.sec);
         let s = elf.add_sym(obj, elf.Sym.{ name: "", sec: secmap[si], value: base[si] + p.start, size: 0,
                                            bind: elf.B_LOCAL, ty: elf.T_NOTYPE, hidden: false, protected: false });
+        let mut ps: u32 = 0;
+        let mut ls: u32 = 0;
+        if p.x.has_p {
+            ps = name_sym(obj, A, syms, aliases, p.x.psym);
+        }
+        if p.x.has_l {
+            ls = name_sym(obj, A, syms, aliases, p.x.lsym);
+        }
         procs.push(FileProc.{ sym: s, size: p.end - p.start, prog: u.perm_dup(p.prog), simple: p.simple,
-                              signal: p.signal });
+                              signal: p.signal, x: p.x, psym_i: ps, lsym_i: ls });
     }
     for p in A.sehs.items() {
         let si = @int_cast(usize, p.sec);

@@ -51,6 +51,31 @@ void inl(void (*f0)(void)) {
 }
 #endif
 
+#ifdef __linux__
+/* The other directives (run.mjs checks the objects' .eh_frame and
+   .debug_frame): a signal frame with its own return address column and a
+   register's value rule (asmsig; on AArch64 also the B key and MTE
+   augmentations), and .cfi_sections: asmdbg in .debug_frame only, asmeh in
+   .eh_frame only. */
+#ifdef __AXIOM_ASM_X86_64__
+#define VAL_REG "%rbx"
+#define EXTRA ""
+#else
+#define VAL_REG "x19"
+#define EXTRA ".cfi_b_key_frame\n.cfi_mte_tagged_frame\n"
+#endif
+__asm__(".text\n.p2align 2\n.globl asmsig\n.type asmsig, %function\nasmsig:\n.cfi_startproc\n.cfi_signal_frame\n"
+        ".cfi_return_column 5\n" EXTRA "  nop\n.cfi_val_offset " VAL_REG ", 8\n  nop\n.cfi_endproc\n"
+        ".size asmsig, .-asmsig\n"
+        ".cfi_sections .debug_frame\n"
+        ".globl asmdbg\n.type asmdbg, %function\nasmdbg:\n.cfi_startproc\n  nop\n  nop\n.cfi_endproc\n"
+        ".size asmdbg, .-asmdbg\n"
+        ".cfi_sections .eh_frame\n"
+        ".globl asmeh\n.type asmeh, %function\nasmeh:\n.cfi_startproc\n  nop\n  nop\n.cfi_endproc\n"
+        ".size asmeh, .-asmeh\n"
+        ".cfi_sections .eh_frame, .debug_frame\n");
+#endif
+
 void asmf(void (*)(void));
 
 int main(void) {

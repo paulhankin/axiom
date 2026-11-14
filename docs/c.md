@@ -108,7 +108,8 @@ options; a warning is silenced only by `#pragma GCC diagnostic` ("Pragmas").
 (see "Stack traces"), `--format=agent-json`, `--std=<dir>` (the standard library's
 directory, where the compiler finds the C headers in `c/include/`), `-o`, `--emit`,
 `--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, `--function-sections`,
-`--data-sections`, `--gc-sections` (see "Code in sections"), and `-g` /
+`--data-sections`, `--gc-sections` (see "Code in sections"), `--unwind-tables` (see
+"Objects and libraries"), and `-g` /
 `--debug-info=` (see "Debugging"). The default
 target is `wasm32`. `--link=file.c` links a further C source, compiled to an object by
 the system's C compiler for Linux, by this compiler for macOS and Windows, by `clang` for
@@ -410,7 +411,12 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   are short: an epilogue remembers the body's state (`DW_CFA_remember_state`) and the
   code after it restores it, a register given back is `DW_CFA_restore`, entries are
   4-aligned (the growth: about 9% for a program that prints a line, mostly its
-  runtime's many small functions; 2% for the compiler itself). The linker's own
+  runtime's many small functions; 2% for the compiler itself). `--unwind-tables=off`
+  leaves the FDEs out (of the compiled code, the linker's stubs and assembly
+  procedures; `.eh_frame_hdr` too, unless objects of other compilers bring FDEs): the
+  program's own stack traces are the same, but the system's unwinder cannot pass
+  through this compiler's frames (a backtrace stops at them, another language's
+  exceptions cannot be thrown through them). The linker's own
   functions (the system call stubs, `setjmp`) are leaves with FDEs, but for the thread
   entry (whose child's frame is the thread's first), `longjmp` (which leaves its frame
   before its end) and the signal return `ax_sigreturn`, whose instructions (`mov rax,
@@ -2356,13 +2362,37 @@ no other tool is needed:
   supported is C3097, naming it, at the statement.
 - Call frame information: in file-scope asm `.cfi_startproc [simple]` ... `.cfi_endproc`
   make a procedure whose `.cfi_def_cfa`, `.cfi_def_cfa_register`, `.cfi_def_cfa_offset`,
-  `.cfi_adjust_cfa_offset`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`,
-  `.cfi_undefined`, `.cfi_same_value`, `.cfi_register`, `.cfi_remember_state`,
-  `.cfi_restore_state`, `.cfi_escape`, `.cfi_signal_frame` (a CIE with the augmentation
-  `S`) and on AArch64 `.cfi_negate_ra_state` are its FDE in `.debug_frame` under `-g`
-  and, on Linux, in `.eh_frame` always (and on macOS in `__eh_frame`, "Debugging")
-  (registers by name or DWARF number); `.cfi_personality` and `.cfi_lsda` only with
-  the encoding 255 (none), `.cfi_sections` changes nothing. On Windows, `.seh_proc` ... `.seh_endproc` make the procedure's unwind
+  `.cfi_adjust_cfa_offset`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_val_offset`,
+  `.cfi_restore`, `.cfi_undefined`, `.cfi_same_value`, `.cfi_register`,
+  `.cfi_remember_state`, `.cfi_restore_state`, `.cfi_escape` and on AArch64
+  `.cfi_negate_ra_state` (`.cfi_window_save`) and `.cfi_negate_ra_state_with_pc` are its
+  FDE's program (registers by name or DWARF number); `.cfi_signal_frame` gives it a CIE
+  with the augmentation `S`, and `.cfi_label name` defines a label at its place. What
+  each object format gets:
+  - ELF (Linux): an FDE in `.eh_frame` always (unless `--unwind-tables=off`) and in
+    `.debug_frame` under `-g`; `.cfi_sections .eh_frame, .debug_frame` (either or both)
+    chooses for the procedures that follow. `.cfi_personality enc, sym[+n]` and
+    `.cfi_lsda enc, sym[+n]` give the procedure a CIE with the augmentations `P` (the
+    personality routine's pointer) and `L`, and its FDE the LSDA's pointer, in the
+    encoding given: absolute or pc-relative (`DW_EH_PE_absptr`, `udata4`, `sdata4`,
+    `udata8`, `sdata8`, with `pcrel`), optionally `indirect` (0x80: the address of a word
+    that holds the pointer, as compilers' `DW.ref.` words are), relocated as the
+    platform's assemblers do; 255 is none. `.cfi_return_column reg` (version 3 when it is
+    above 255) and on AArch64 `.cfi_b_key_frame` (`B`) and `.cfi_mte_tagged_frame` (`G`)
+    are the CIE's too. The platform's unwinder calls such a routine with its LSDA and
+    lands in the handler it chooses (`c/link/asm_personality`).
+  - Mach-O (macOS): the procedure's entry in `__compact_unwind` and its FDE in
+    `__eh_frame` (`.cfi_sections` without `.eh_frame` leaves them out), and under `-g`
+    in the debug bundle's `.debug_frame`; a personality
+    routine, an LSDA, a return address column and `B`/`G` are C3097 there (the
+    executable's unwind table carries no personalities), as on Windows.
+  - PE (Windows): `.cfi_*` are checked and put nowhere (the debug information is the
+    PDB's, which takes no call frame information from them): the unwind information is
+    `.seh_*`'s (below).
+  Not written, C3097: the encodings relative to data, text or the function, 2-byte
+  pointers, `.cfi_val_encoded_addr` and `.cfi_inline_lsda` (no compiler of these targets
+  writes them) and directives of other processors.
+  On Windows, `.seh_proc` ... `.seh_endproc` make the procedure's unwind
   record in `.xdata` and its `.pdata` entry: x86-64 `.seh_pushreg`, `.seh_stackalloc`,
   `.seh_setframe`, `.seh_savereg`, `.seh_savexmm`, `.seh_pushframe`,
   `.seh_endprologue`; ARM64 `.seh_stackalloc`, `.seh_save_fplr`, `.seh_save_fplr_x`,

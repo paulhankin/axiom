@@ -130,6 +130,9 @@ pub struct Asm {
     cfi_reg: u64,  // the CFA's register (DWARF) and offset (inline: the stack pointer's move)
     cfi_off: i64,
     cfi_stack: u.List.[i64],  // .cfi_remember_state's
+    cfi_x: ProcX,             // the procedure's personality, LSDA, ... (.cfi_personality, ...)
+    cfi_no_eh: bool,          // .cfi_sections without .eh_frame (from there on)
+    cfi_no_debug: bool,       // ... without .debug_frame
     // Windows unwind information (.seh_*: seh_directive)
     sehs: u.List.[SehProc],
     in_seh: bool,
@@ -3039,6 +3042,58 @@ pub struct Proc {
     prog: []u8,    // the FDE's call frame instructions
     simple: bool,  // .cfi_startproc simple: no initial instructions (the CIE's)
     signal: bool,  // .cfi_signal_frame
+    x: ProcX,
+}
+
+/// What a procedure's frame description has beyond its program: where it
+/// goes (.cfi_sections), and its CIE's personality routine (.cfi_personality:
+/// the pointer's encoding, DW_EH_PE_*, and symbol + addend), its FDE's
+/// language-specific data area (.cfi_lsda), its return address column
+/// (.cfi_return_column) and AArch64's augmentations B (.cfi_b_key_frame:
+/// return addresses signed with the B key) and G (.cfi_mte_tagged_frame).
+/// A personality and an LSDA are ELF's (.eh_frame) only.
+pub struct ProcX {
+    no_eh: bool,
+    no_debug: bool,
+    ra: i64,  // the column + 1 (0: the target's)
+    has_p: bool,
+    penc: u8,
+    psym: []u8,
+    padd: i64,
+    has_l: bool,
+    lenc: u8,
+    lsym: []u8,
+    ladd: i64,
+    bkey: bool,
+    mte: bool,
+}
+
+/// Is e a pointer encoding (DW_EH_PE_*) of .eh_frame's that this writes:
+/// absolute or pc-relative (and indirect: the address of a word holding
+/// it), of 4 or 8 bytes (signed or not)?
+pub fn eh_enc_ok(e: i64) bool {
+    if (e < 0) or (e > 255) {
+        return false;
+    }
+    let app = e & 0x70;
+    let f = e & 0x0f;
+    return ((app == 0) or (app == 0x10)) and ((f == 0) or (f == 3) or (f == 4) or (f == 0xb) or (f == 0xc));
+}
+
+// `sym`, `sym + n` or `sym - n`: the symbol and its addend.
+fn sym_plus(A: *mut Asm, s0: []u8, name: *mut []u8, add: *mut i64) void {
+    let s = trim(s0);
+    let mut k = s.len;
+    while k > 1 {
+        k -= 1;
+        if (s[k] == '+') or (s[k] == '-') {
+            name.* = trim(s[0..k]);
+            add.* = eval_const(A, s[k..], "the addend");
+            return;
+        }
+    }
+    name.* = s;
+    add.* = 0;
 }
 
 pub const IC_ADJUST: u8 = 1;   // the stack pointer moves down by val (from the template's start, in total)
@@ -3075,6 +3130,9 @@ const DW_OFFSET_EXTENDED_SF: u8 = 0x11;
 const DW_DEF_CFA_SF: u8 = 0x12;
 const DW_DEF_CFA_OFFSET_SF: u8 = 0x13;
 const DW_NEGATE_RA_STATE: u8 = 0x2d;
+const DW_NEGATE_RA_STATE_WITH_PC: u8 = 0x2c;
+const DW_VAL_OFFSET: u8 = 0x14;
+const DW_VAL_OFFSET_SF: u8 = 0x15;
 
 pub fn uleb_to(b: *mut u.Buf, x0: u64) void {
     let mut x = x0;
@@ -3247,7 +3305,21 @@ fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
         return false;
     }
     if u.str_eq(op, ".cfi_sections") {
-        return true;  // (the frame description goes in .debug_frame whatever it says)
+        // (the sections of the procedures from here on: .eh_frame, which
+        // ELF objects have on Linux, and .debug_frame, with -g)
+        A.cfi_no_eh = true;
+        A.cfi_no_debug = true;
+        for x in split_args(args) {
+            let n = trim(x);
+            if u.str_eq(n, ".eh_frame") {
+                A.cfi_no_eh = false;
+            } else if u.str_eq(n, ".debug_frame") {
+                A.cfi_no_debug = false;
+            } else {
+                fail(A, u.f1(".cfi_sections of '%s' (.eh_frame and .debug_frame are the sections)", n));
+            }
+        }
+        return true;
     }
     if A.inline_ {
         cfi_inline(A, op, args);
@@ -3271,6 +3343,8 @@ fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
         A.cfi_loc = A.cfi_start;
         A.cfi_prog = u.Buf.init();
         A.cfi_stack.clear();
+        A.cfi_x = ProcX.{ no_eh: A.cfi_no_eh, no_debug: A.cfi_no_debug, ra: 0, has_p: false, penc: 0xff, psym: "",
+                          padd: 0, has_l: false, lenc: 0xff, lsym: "", ladd: 0, bkey: false, mte: false };
         // (the CIE's state: x86-64 CFA = rsp + 8, AArch64 CFA = sp)
         A.cfi_reg = 7;
         A.cfi_off = 8;
@@ -3291,7 +3365,7 @@ fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
     if u.str_eq(op, ".cfi_endproc") {
         A.in_proc = false;
         A.procs.push(Proc.{ sec: A.cfi_sec, start: A.cfi_start, end: here(A), prog: A.cfi_prog.done(),
-                            simple: A.cfi_simple, signal: A.cfi_signal });
+                            simple: A.cfi_simple, signal: A.cfi_signal, x: A.cfi_x });
         return true;
     }
     if u.str_eq(op, ".cfi_signal_frame") {
@@ -3299,12 +3373,79 @@ fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
         return true;
     }
     if u.str_eq(op, ".cfi_personality") or u.str_eq(op, ".cfi_lsda") {
-        // (only the encoding 0xff, "none", is accepted: there are no personality routines here)
+        // (encoding, symbol: the encoding 0xff, "none", takes no symbol)
         let xs = split_args(args);
-        if (xs.len >= 1) and (eval_const(A, xs[0], "the encoding") == 255) {
+        if xs.len < 1 {
+            fail(A, u.f1("%s takes an encoding and a symbol", op));
             return true;
         }
-        fail(A, u.f1("%s with a routine is not supported", op));
+        let e = eval_const(A, xs[0], "the encoding");
+        let pers = u.str_eq(op, ".cfi_personality");
+        if e == 255 {
+            if pers {
+                A.cfi_x.has_p = false;
+            } else {
+                A.cfi_x.has_l = false;
+            }
+            return true;
+        }
+        if xs.len != 2 {
+            fail(A, u.f1("%s takes an encoding and a symbol", op));
+            return true;
+        }
+        if not eh_enc_ok(e) {
+            fail(A,
+                 u.f2("%s with the pointer encoding %s (absolute or pc-relative 4 or 8 bytes are written, optionally indirect)",
+                      op, u.dec(e)));
+            return true;
+        }
+        if tg.g_os != tg.OS_LINUX {
+            fail(A, u.f1("%s with a routine (ELF's .eh_frame, on Linux only)", op));
+            return true;
+        }
+        let mut name: []u8 = "";
+        let mut add: i64 = 0;
+        sym_plus(A, xs[1], &mut name, &mut add);
+        if pers {
+            A.cfi_x.has_p = true;
+            A.cfi_x.penc = @truncate(u8, @bit_cast(u64, e));
+            A.cfi_x.psym = u.perm_dup(name);
+            A.cfi_x.padd = add;
+        } else {
+            A.cfi_x.has_l = true;
+            A.cfi_x.lenc = @truncate(u8, @bit_cast(u64, e));
+            A.cfi_x.lsym = u.perm_dup(name);
+            A.cfi_x.ladd = add;
+        }
+        return true;
+    }
+    if (u.str_eq(op, ".cfi_return_column") or u.str_eq(op, ".cfi_b_key_frame") or
+        u.str_eq(op, ".cfi_mte_tagged_frame")) and (tg.g_os != tg.OS_LINUX) {
+        fail(A, u.f1("%s (a CIE of its own: ELF's .eh_frame, on Linux only)", op));
+        return true;
+    }
+    if u.str_eq(op, ".cfi_return_column") {
+        A.cfi_x.ra = @bit_cast(i64, cfi_reg(A, args)) + 1;
+        return true;
+    }
+    if (u.str_eq(op, ".cfi_b_key_frame") or u.str_eq(op, ".cfi_mte_tagged_frame")) and (A.arch == tg.ARCH_A64) {
+        if u.str_eq(op, ".cfi_b_key_frame") {
+            A.cfi_x.bkey = true;
+        } else {
+            A.cfi_x.mte = true;
+        }
+        return true;
+    }
+    if u.str_eq(op, ".cfi_label") {
+        // (a label at this place, as `name:` would be)
+        let d = A.defs.at(@int_cast(usize, sym(A, trim(args))));
+        if d.defined or d.abs {
+            fail(A, u.f1("the label '%s' is defined twice", d.name));
+            return true;
+        }
+        d.defined = true;
+        d.sec = A.cur;
+        d.off = here(A);
         return true;
     }
     cfi_advance(A);
@@ -3412,6 +3553,33 @@ fn cfi_directive(A: *mut Asm, op: []u8, args: []u8) bool {
     }
     if (u.str_eq(op, ".cfi_negate_ra_state") or u.str_eq(op, ".cfi_window_save")) and (A.arch == tg.ARCH_A64) {
         A.cfi_prog.c(DW_NEGATE_RA_STATE);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_negate_ra_state_with_pc") and (A.arch == tg.ARCH_A64) {
+        A.cfi_prog.c(DW_NEGATE_RA_STATE_WITH_PC);
+        return true;
+    }
+    if u.str_eq(op, ".cfi_val_offset") {
+        // (the register's value is CFA + off: DW_CFA_val_offset(_sf))
+        let xs = cfi_two(A, args, op);
+        if failed(A) {
+            return true;
+        }
+        let r = cfi_reg(A, xs[0]);
+        let off = eval_const(A, xs[1], "the offset");
+        if (off % 8) != 0 {
+            fail(A, u.f1("a register's offset from the CFA (%s) that is not a multiple of 8", u.dec(off)));
+            return true;
+        }
+        if off <= 0 {
+            A.cfi_prog.c(DW_VAL_OFFSET);
+            uleb_to(&mut A.cfi_prog, r);
+            uleb_to(&mut A.cfi_prog, @bit_cast(u64, off / -8));
+        } else {
+            A.cfi_prog.c(DW_VAL_OFFSET_SF);
+            uleb_to(&mut A.cfi_prog, r);
+            sleb_to(&mut A.cfi_prog, off / -8);
+        }
         return true;
     }
     fail(A, u.f1("the directive '%s' is not supported", op));
