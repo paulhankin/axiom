@@ -2376,13 +2376,19 @@ no other tool is needed:
   parameters are the locals 0 up, and it returns what it leaves on the stack.
 - Directives: `.byte`, `.short`/`.hword`/`.2byte`, `.word` (2 bytes on x86-64, 4 on
   AArch64), `.long`/`.int`, `.quad`/`.xword`, `.octa`, `.ascii`, `.asciz`/`.string`,
-  `.float`, `.double`, `.uleb128`, `.sleb128`, `.zero`/`.skip`/`.space`, `.fill`,
+  `.float`, `.double`, `.uleb128`, `.sleb128`, `.zero`/`.skip`/`.space` (a size and a
+  fill), `.fill` (a count, a size up to 8 and a value: units of the value's low 4 bytes,
+  then zeros; an empty size is an error),
   `.balign`, `.p2align`, `.align` (code padding uses the multi-byte NOPs), `.set`/`.equ`,
   `.equiv` and `=`, `.inst` (AArch64); the assembler language `.macro`/`.endm` (arguments,
   defaults, `:req`, `:vararg`, `\@`), `.rept`, `.irp`, `.irpc`, `.if`/`.ifdef`/`.ifc`/
   `.else`/`.elseif`/`.endif`; in file-scope asm also `.text`, `.data`, `.bss`,
   `.section` (with flags and types), `.pushsection`, `.popsection`, `.previous`,
-  `.subsection`, `.globl`, `.weak`, `.local`, `.hidden`, `.protected`, `.type`, `.size`,
+  `.subsection`, `.globl`, `.weak`, `.local`, `.hidden`, `.protected`, `.internal`
+  (visibility: ELF's `STV_HIDDEN` for `.hidden` and `.internal`, `STV_PROTECTED`;
+  Mach-O's private extern for the hidden ones, Mach-O having no protected visibility,
+  its image's references to its own definitions binding within it; nothing in COFF,
+  where only a DLL's exports leave the image), `.type`, `.size`,
   `.comm`, `.lcomm`, `.incbin` (within the include directories). Labels: `name:` and
   numeric local labels (`1:`, `1b`, `1f`).
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`

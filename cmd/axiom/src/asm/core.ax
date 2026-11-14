@@ -55,6 +55,11 @@ pub struct Reloc {
 }
 
 // A label or symbol of the text.
+/// Def.vis: the default visibility, hidden, protected.
+pub const VIS_DEFAULT: u8 = 0;
+pub const VIS_HIDDEN: u8 = 1;
+pub const VIS_PROTECTED: u8 = 2;
+
 pub struct Def {
     name: []u8,
     sec: i32,  // -1: not defined (yet)
@@ -64,6 +69,14 @@ pub struct Def {
     defined: bool,  // in this pass
     global: bool,
     weak: bool,
+    // its visibility (.hidden, .internal: VIS_HIDDEN; .protected:
+    // VIS_PROTECTED): ELF's STV_HIDDEN (for .internal too: STV_INTERNAL's
+    // processor-specific part asks nothing more of a linker) and
+    // STV_PROTECTED, Mach-O's private extern for hidden ones (it has no
+    // protected visibility: an image's references to its own definitions
+    // bind within it anyway), nothing in COFF (where only a DLL's exports
+    // leave the image)
+    vis: u8,
     ty: u8,  // elf.T_*
     size: i64,
     has_size: bool,
@@ -1092,8 +1105,8 @@ fn label_def(A: *mut Asm, name: []u8, line: i32) i32 {
 
 fn new_def(A: *mut Asm, name: []u8) i32 {
     A.defs.push(Def.{ name: name, sec: -1, off: 0, prev_sec: -1, prev_off: 0, defined: false, global: false,
-                      weak: false, ty: elf.T_NOTYPE, size: 0, has_size: false, numeric: false, abs: false, tmp: false,
-                      intext: false, set_si: 0 });
+                      weak: false, vis: VIS_DEFAULT, ty: elf.T_NOTYPE, size: 0, has_size: false, numeric: false,
+                      abs: false, tmp: false, intext: false, set_si: 0 });
     return @int_cast(i32, A.defs.len - 1);
 }
 
@@ -2731,10 +2744,17 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
             fail(A, u.f1("%s needs a size", op));
             return;
         }
+        if xs.len > 2 {
+            fail(A, u.f1("%s takes a size and a fill", op));
+            return;
+        }
         let n = eval_const(A, xs[0], "the size");
         let mut fill: i64 = 0;
         if xs.len > 1 {
             fill = eval_const(A, xs[1], "the fill");
+        }
+        if failed(A) {
+            return;
         }
         if (n < 0) or (n > 0x1000_0000) {
             fail(A, u.f1("a size of %s", u.dec(n)));
@@ -2746,15 +2766,34 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         return;
     }
     if u.str_eq(op, ".fill") {
+        // .fill count[, size[, value]]: count units of size bytes (1 when
+        // omitted), each the value's low 4 bytes in the target's order,
+        // then zeros (the conventional assembler's rule; an empty size,
+        // which that assembler takes for 0, is an error here)
         let xs = split_args(args);
+        if (xs.len == 0) or (trim(xs[0]).len == 0) {
+            fail(A, ".fill needs a count");
+            return;
+        }
+        if xs.len > 3 {
+            fail(A, ".fill takes a count, a size and a value");
+            return;
+        }
         let n = eval_const(A, xs[0], "the count");
         let mut size: i64 = 1;
         let mut val: i64 = 0;
         if xs.len > 1 {
+            if trim(xs[1]).len == 0 {
+                fail(A, ".fill with an empty size");
+                return;
+            }
             size = eval_const(A, xs[1], "the size");
         }
-        if xs.len > 2 {
+        if (xs.len > 2) and (trim(xs[2]).len > 0) {
             val = eval_const(A, xs[2], "the value");
+        }
+        if failed(A) {
+            return;
         }
         if (n < 0) or (n > 0x100_0000) or (size < 0) or (size > 8) {
             fail(A, ".fill of an unsupported count or size");
@@ -2796,6 +2835,13 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         let mut max: i64 = 0;
         if xs.len > 2 {
             max = eval_const(A, xs[2], "the maximum");
+        }
+        if xs.len > 3 {
+            fail(A, u.f1("%s takes an alignment, a fill and a maximum", op));
+            return;
+        }
+        if failed(A) {
+            return;
         }
         align_to(A, @bit_cast(u64, n), fill, has_fill, arch, @bit_cast(u64, max));
         return;
@@ -2856,6 +2902,10 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
                 d.global = true;
             } else if u.str_eq(op, ".local") {
                 d.global = false;
+            } else if u.str_eq(op, ".protected") {
+                d.vis = VIS_PROTECTED;
+            } else {
+                d.vis = VIS_HIDDEN;  // (.hidden, .internal)
             }
         }
         return;
