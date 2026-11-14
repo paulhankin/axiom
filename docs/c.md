@@ -2066,7 +2066,10 @@ no other tool is needed:
   atomics (`memory.atomic.notify`, `wait32`/`wait64`, `atomic.fence`, the atomic loads,
   stores and read-modify-writes), tail-call (`return_call`, `return_call_indirect`) and
   exception-handling (`try_table` with `catch_all` and `catch_all_ref`, `throw_ref`, the
-  `exnref` type). A table of them is generated from the specification's opcode tables by
+  `exnref` type, `ref.null exn` and `ref.is_null`; and the extension's legacy form, which
+  engines still take: `try bt ... catch_all ... end`, `try bt ... delegate l`, `rethrow l`
+  of a catch_all, flat and folded as `(try bt (do ...) (catch_all ...))` and `(try bt (do
+  ...) (delegate l))`). A table of them is generated from the specification's opcode tables by
   `cmd/internal/tools/gen_wasm_table.py`. Not: what names what C has none of (`throw`
   and `catch` of a tag, `memory.init` and `data.drop` of a data segment, the reference
   types' table and `ref.*` instructions, which no extension of the target has). Every

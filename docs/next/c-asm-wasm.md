@@ -12,3 +12,6 @@
   template is validated (operand types, stack effect, blocks, labels, alignments):
   what is invalid is C3097, and the module is never invalid. See docs/c.md, "Inline
   assembly".
+- With `--features=+exception-handling` the WebAssembly assembler also takes the
+  extension's legacy form (`try`, `catch_all`, `delegate`, `rethrow`, flat and folded)
+  and `ref.null exn`/`ref.is_null`, validated as the rest is.

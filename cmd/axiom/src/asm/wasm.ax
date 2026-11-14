@@ -427,7 +427,9 @@ const CF_IF: u8 = 2;
 const CF_ELSE: u8 = 3;
 const CF_TRY: u8 = 4;
 const CF_FUNC: u8 = 5;
-const CF_OUTER: u8 = 6;  // asm goto: a label of the statement (a block around the template)
+const CF_OUTER: u8 = 6;   // asm goto: a label of the statement (a block around the template)
+const CF_LTRY: u8 = 7;    // the legacy exception handling's try (before its catch_all or delegate)
+const CF_LCATCH: u8 = 8;  // ... its catch_all (where rethrow may name it)
 
 struct Frame {
     kind: u8,
@@ -1503,6 +1505,46 @@ fn parse_plain_in(w: Tok, pd: *mut Pending) void {
         pd.kind = PD_THROW_REF;
         return;
     }
+    if u.str_eq(name, "rethrow") {
+        // (of the legacy form: its label a try's catch_all)
+        if not feat_ok('e', name) {
+            return;
+        }
+        let k = label_of(next(), name);
+        if k < 0 {
+            return;
+        }
+        if CTRL.get(@int_cast(usize, k)).kind != CF_LCATCH {
+            err_at(w.line, "'rethrow': the label must be a try's catch_all");
+            return;
+        }
+        op_byte(0x09);
+        O.uleb(depth_of(k));
+        pd.kind = PD_UNREACH;
+        return;
+    }
+    if u.str_eq(name, "ref.null") or u.str_eq(name, "ref.is_null") {
+        // (of exnref, the one reference type the extensions --features names have)
+        if not feat_ok('e', name) {
+            return;
+        }
+        if u.str_eq(name, "ref.null") {
+            let t = next();
+            if not is_kw(t, "exn") {
+                err_at(w.line, u.f1("'ref.null %s': the heap type is exn (exnref is the one reference type here)",
+                                    tok_text(t)));
+                return;
+            }
+            op_byte(0xd0);
+            op_byte(0x69);
+            pd.pushes = one(EXNREF);
+            return;
+        }
+        op_byte(0xd1);
+        pd.pops = one(EXNREF);
+        pd.pushes = one(I32);
+        return;
+    }
     if u.str_eq(name, "throw") {
         err_at(w.line,
                "'throw' names a tag, which C has none of (throw_ref rethrows an exception caught by try_table)");
@@ -1814,6 +1856,12 @@ fn open_block(w: Tok, folded: bool) void {
         }
         kind = CF_TRY;
         code = 0x1f;
+    } else if u.str_eq(name, "try") {
+        if not feat_ok('e', name) {
+            return;
+        }
+        kind = CF_LTRY;
+        code = 0x06;
     }
     // (the block type is parsed into a buffer: in the folded if, the
     // condition comes between it and the opcode)
@@ -1863,6 +1911,41 @@ fn do_else(line: i32) void {
     push_ctrl(CF_ELSE, f.params, f.results, f.label, f.folded);
 }
 
+// The legacy exception handling (the extension's first form, which engines
+// still take beside try_table): `try bt instrs (catch_all instrs)? end` and
+// `try bt instrs delegate l`. catch_all starts from an empty stack and must
+// give the try's results; delegate ends the try, its label counted from
+// outside it. A catch of a tag names one, which C has none of.
+fn do_catch_all(line: i32) void {
+    let f = CTRL.get(CTRL.len - 1);
+    if f.kind != CF_LTRY {
+        err_at(line, "'catch_all' outside a try");
+        return;
+    }
+    _ = pop_ctrl("catch_all");
+    op_byte(0x19);
+    push_ctrl(CF_LCATCH, "", f.results, f.label, f.folded);
+}
+
+fn do_delegate(line: i32) void {
+    let f = CTRL.get(CTRL.len - 1);
+    if f.kind != CF_LTRY {
+        err_at(line, "'delegate' outside a try (or after its catch_all)");
+        return;
+    }
+    _ = pop_ctrl("delegate");
+    if bad() {
+        return;
+    }
+    let k = label_of(next(), "delegate");
+    if k < 0 {
+        return;
+    }
+    op_byte(0x18);
+    O.uleb(depth_of(k));
+    push_vals(f.results);
+}
+
 fn do_end(line: i32) void {
     let f = CTRL.get(CTRL.len - 1);
     if (f.kind == CF_FUNC) or (f.kind == CF_OUTER) {
@@ -1890,8 +1973,26 @@ fn flat_instr() void {
         return;
     }
     let n = w.text;
-    if u.str_eq(n, "block") or u.str_eq(n, "loop") or u.str_eq(n, "if") or u.str_eq(n, "try_table") {
+    if u.str_eq(n, "block") or u.str_eq(n, "loop") or u.str_eq(n, "if") or u.str_eq(n, "try_table") or
+       u.str_eq(n, "try") {
         open_block(w, false);
+        return;
+    }
+    if u.str_eq(n, "catch") {
+        err_at(w.line, "'catch' names a tag, which C has none of (catch_all catches any)");
+        return;
+    }
+    if u.str_eq(n, "catch_all") or u.str_eq(n, "delegate") {
+        let f = CTRL.get(CTRL.len - 1);
+        if f.folded {
+            err_at(w.line, u.f1("'%s' inside a folded try (its (catch_all ...) or (delegate l) is a group)", n));
+            return;
+        }
+        if u.str_eq(n, "catch_all") {
+            do_catch_all(w.line);
+        } else {
+            do_delegate(w.line);
+        }
         return;
     }
     if u.str_eq(n, "else") or u.str_eq(n, "end") {
@@ -1939,6 +2040,58 @@ fn folded_instr() void {
         do_end(w.line);
         return;
     }
+    if u.str_eq(n, "try") {
+        // (try bt (do instrs) (catch_all instrs)?) and (try bt (do instrs) (delegate l))
+        open_block(w, true);
+        if bad() {
+            return;
+        }
+        let depth = CTRL.len;
+        if not at_group("do") {
+            err_at(w.line, "a folded try needs (do ...)");
+            return;
+        }
+        _ = next();
+        _ = next();
+        instrs(true);
+        expect_rp();
+        if bad() {
+            return;
+        }
+        if CTRL.len != depth {
+            err_at(w.line, "a block in the folded try is not ended");
+            return;
+        }
+        if at_group("delegate") {
+            _ = next();
+            _ = next();
+            do_delegate(w.line);
+            expect_rp();
+            expect_rp();
+            return;
+        }
+        if at_group("catch") {
+            err_at(w.line, "'catch' names a tag, which C has none of (catch_all catches any)");
+            return;
+        }
+        if at_group("catch_all") {
+            _ = next();
+            _ = next();
+            do_catch_all(w.line);
+            instrs(true);
+            expect_rp();
+            if bad() {
+                return;
+            }
+            if CTRL.len != depth {
+                err_at(w.line, "a block in the folded try is not ended");
+                return;
+            }
+        }
+        expect_rp();
+        do_end(w.line);
+        return;
+    }
     if u.str_eq(n, "if") {
         open_block(w, true);
         if bad() {
@@ -1975,7 +2128,8 @@ fn folded_instr() void {
         do_end(w.line);
         return;
     }
-    if u.str_eq(n, "else") or u.str_eq(n, "end") or u.str_eq(n, "then") {
+    if u.str_eq(n, "else") or u.str_eq(n, "end") or u.str_eq(n, "then") or u.str_eq(n, "do") or
+       u.str_eq(n, "catch_all") or u.str_eq(n, "delegate") {
         err_at(w.line, u.f1("'(%s' is not a folded instruction", n));
         return;
     }
