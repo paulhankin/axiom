@@ -201,8 +201,8 @@ its C sources with `c-sources = "dir"`.
 | `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). A C source is compiled first: for Linux by the system's C compiler (`cc`, or the cross compiler for the target), for macOS and Windows by this compiler, for WebAssembly by `clang`. The compiler's own linkers link the objects and libraries, on every target ([`docs/c.md`](c.md), "Objects and libraries"). |
 | `-l<lib>`, `-L<dir>` | A library to link and a directory to search before the system's: on Linux `lib<lib>.so`, else `lib<lib>.a`; on macOS `lib<lib>.a`, else `lib<lib>.dylib`, else bound by name; on Windows `<lib>.lib`, `lib<lib>.a`, `lib<lib>.dll.a` or `<lib>.dll` in the `-L` directories. |
 | `-I<dir>` | An include directory, for C sources given with `--link` and for the C front end's inputs. |
-| `--function-sections`, `--data-sections` | Native targets: each function, each datum in a section of its own ([`docs/c.md`](c.md), "Code in sections"). |
-| `--gc-sections`, `--no-gc-sections` | Native targets: the compiler's linkers leave out the sections of the linked objects and archives that nothing refers to (default: they keep them). |
+| `--function-sections`, `--data-sections` | Native targets: each function, each datum in a section of its own ([`docs/c.md`](c.md), "Code in sections"); always so for the modules of `--units=module`. |
+| `--gc-sections`, `--no-gc-sections` | Native targets: the compiler's linkers leave out the sections of the linked objects and archives that nothing refers to (default: with `--units=module` they leave them out, the code of modules the program does not use and the copies of generic functions that another module's copy won over; otherwise they keep them). |
 
 Programs for native targets are linked by the compiler's own linkers, with the objects
 and libraries they are given; one that uses no shared library (on Linux, none of the

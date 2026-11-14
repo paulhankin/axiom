@@ -17,7 +17,7 @@ parity check in the test suite can be widened once item 6 lands.
 | # | Area | Primary modules | Core payoff |
 |---|---|---|---|
 | 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` |
-| 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries |
+| 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries (done: see §2) |
 | 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke |
 | 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags |
@@ -226,7 +226,100 @@ Two architectural issues follow from this:
 
 ## 2. Dead-Symbol and Section Garbage Collection in `nlink.ax`
 
-### Current state
+### Status
+
+**Done.** `--units=module` builds (the default at `-O0`/`-O1`, and `axiom
+test`) put each function and datum of a module's object in a section of its
+own and link with `--gc-sections` (`--no-gc-sections` turns it off);
+whole-program builds (`-O2`, `--units=program`) are byte-for-byte unchanged
+(checked: the compiler at `-O2`, examples on x86-64, AArch64, Windows and
+macOS).
+
+What the code already had when this item started (added for C's
+`-ffunction-sections`-style linking): `--function-sections`,
+`--data-sections` (`isel.ax`: `func_section`, `data_section`), COMDAT groups
+for `--emit=obj`, an `axiom_rets` section per code section with
+`SHF_LINK_ORDER` (`ftab.ax`), per-section `.pdata`/`.xdata` (`group_unwind`),
+and the mark pass in `nlink.collect_garbage` (roots: the linker's objects,
+`ROOT_NAMES`, init/fini arrays, C-identifier sections, `SHF_GNU_RETAIN`,
+non-code sections; `SHF_LINK_ORDER` dependents, COMDAT group members, and
+the LSDA/personality references of `.eh_frame`). It was off by default and,
+for Axiom code, kept almost everything:
+
+- **`axiom_rets` kept all code.** Its name is a C identifier, which made
+  every frame table a root, and its relocations kept its code. A
+  `SHF_LINK_ORDER` section is now collectable whatever its name.
+- **Every weak copy was kept.** `gc_mark_sym` marked both the chosen
+  definition and the referring object's own copy. It now marks only the
+  chosen one; `elink` applies a relocation against a dropped copy's symbol
+  to the kept one (`nlink.ref_dropped`; it skipped them, which COMDAT
+  copies never needed because `drop_group` unbinds their symbols first).
+- **Dead FDEs stayed in `.eh_frame`** (left out of `.eh_frame_hdr` only).
+  `nlink.prune_fdes` now removes the FDEs of dropped code from each
+  `.eh_frame` after the mark (CIE offsets rewritten, relocations moved; a
+  section with symbols referring into it, an unknown layout or the 64-bit
+  form is left alone).
+- **Debug information of dropped code** (with `-g`) pointed at address 0
+  and overlapped the program's own. `nlink.debug_sections` now writes the
+  tombstone -1 for a relocation against dropped code (1 in `.debug_ranges`
+  and `.debug_loc`), as WebAssembly's DWARF has it; the suite's DWARF
+  checks (`dwarf.mjs`) pass over tombstoned subprograms and sequences on
+  every target. (Leaving the DIEs out altogether needs rewriting
+  `.debug_info`; not done.)
+- **Chains and call-site records were per object.** `ftab.ax` put every
+  call's chain into the object's one `.data.rel.ro`, which every
+  `axiom_rets` section referred to, so all call-site records (most of
+  `.data` in a `-O0` program) stayed. With `--function-sections` each code
+  section's calls now have their own `.data.rel.ro.chains` section
+  (`ftab.chain_at`, built as entries are written; `ir.Chain.off` is then a
+  chain number).
+- **One section per datum was too many.** `--data-sections` made a
+  section for each of the ~200k call-site records of the compiler (object
+  sizes +75%). The compiler's own internal data (names starting with `.`:
+  call-site records, constants, strings) now goes into one section per
+  function that first refers to it, its calls' chains included
+  (`isel.data_owners`, `owned_section`); what only data refers to keeps a
+  section of its own. Output sizes were the same as one per datum.
+- **The unit cache's key did not include the section flags**
+  (`units.options_id`): `--units=module --function-sections` reused objects
+  built without. It does now.
+- `elf.write` shares section names in `.shstrtab` (each once; a section
+  with relocations named by the end of its `.rela` section's name), which
+  matters with tens of thousands of sections per object. Executables are
+  unchanged; `--emit=obj` objects are smaller.
+
+Measured (x86-64 Linux, this machine):
+
+| build | before | after |
+|---|---|---|
+| the compiler, `-O1 --units=module`: executable | 16.15 MB | 14.46 MB (text 3.79 MB -> 3.42, data 7.04 -> 6.06, `.eh_frame` 817 KB -> 668) |
+| the same: cold build / relink with everything cached | 5.0 s / 1.1 s | 4.6-5.5 s / 1.2 s |
+| the same: object cache | 33.6 MB | 44.6 MB |
+| `examples/` at `-O0`: wordcount, md2pdf, texmath, http_server, pi, swarm, charts | 0.45, 7.98, 6.12, 2.83, 6.29, 2.52, 6.88 MB | 0.19, 4.76, 2.10, 1.46, 2.85, 1.44, 2.95 MB |
+| the compiler building itself at `-O2` | 30-32 s, 2.23 GB | the same (output identical) |
+
+Link times of the examples' cached rebuilds are unchanged (within noise).
+A test in the suite (`sections: --units=module leaves out what the program
+does not use`) checks that an unused function goes, `--no-gc-sections`
+keeps it, the program runs, and no FDE describes left-out code.
+
+### What remains
+
+- The objects of `--units=module` are ~33% larger (section headers and
+  `.rela` sections: ~140k sections for the compiler). The plan's compact
+  atom table inside `elf.Obj` would avoid that; not needed so far.
+- Each module's site-string blob (`.site_strs`, in `codegen.ax`) is one
+  datum, kept whole if any of its records is: about a third of a small
+  program's `.rodata`. Splitting it per function was tried; it saved 3-5%
+  on small programs and cost as much on large ones, so it is not done.
+- DWARF DIEs and line sequences of dropped code stay (tombstoned), as with
+  the system linkers; item 6's emitters could leave them out.
+- Mach-O `__compact_unwind` and Windows `.pdata` already go with their code
+  (link-order sections); the PDB lists only kept functions (`plink.ax`
+  `pdb_input`: kept code sections only).
+
+### Original analysis (before this item)
+
 
 The WebAssembly linker (`wlink.ax`, lines 113–140) builds a reachability graph
 from exported functions and globals (`flive`, `slive`), dropping unreferenced

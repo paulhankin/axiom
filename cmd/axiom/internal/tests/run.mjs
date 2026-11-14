@@ -1456,6 +1456,44 @@ await section('C programs', {
   // Sections (docs/c.md, "Code in sections"): --gc-sections leaves out
   // what nothing refers to; a COFF COMDAT section's selection is honoured
   // ("no duplicates": a second copy is an error, "any": one is kept).
+  // Separately compiled modules (--units=module): each function in a
+  // section of its own and the link's garbage collection on by default,
+  // which leaves out what the program does not use (--no-gc-sections keeps
+  // it) and the .eh_frame entries of what it leaves out.
+  'sections: --units=module leaves out what the program does not use': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the compiler\'s own linkers' };
+    const d = path.join(tmp, 'units-gc');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'gcu_a.ax'), 'pub fn twice[T: Int](x: T) T {\n    return x + x;\n}\n\npub fn used(x: i32) i32 {\n' +
+      '    return twice(x) + 1;\n}\n\npub fn gcu_unused(x: i32) i32 {\n    return x * 7;\n}\n');
+    fs.writeFileSync(path.join(d, 'main.ax'), 'import "std/fmt" as fmt;\nimport "gcu_a.ax" as a;\n\nexport fn main() i32 {\n' +
+      '    let n = a.used(20) + a.twice(@as(i32, 1));\n    fmt.print("{}\\n", [fmt.int(n)]) catch return 1;\n    return 0;\n}\n');
+    const env = { ...process.env, AXIOM_CACHE: path.join(d, 'cache') };
+    const sizes = [];
+    for (const gc of [true, false]) {
+      const exe = path.join(d, gc ? 'gc' : 'nogc');
+      const c = await spawnAsync(compiler, ['build', path.join(d, 'main.ax'), '--target=x86_64', '-O0', '--units=module',
+        ...(gc ? [] : ['--no-gc-sections']), '-o', exe], { encoding: 'utf8', env });
+      if (c.status !== 0) return `the build failed:\n${c.stdout}${c.stderr}`;
+      const img = loadImage(fs.readFileSync(exe));
+      const has = (n) => img.funcs.some((f) => f.name.endsWith(n));
+      if (has('gcu_a.gcu_unused') === gc) return `gcu_unused ${gc ? 'kept' : 'left out with --no-gc-sections'}`;
+      if (!has('gcu_a.used')) return 'no gcu_a.used';
+      const e = checkEhFrame(img, null);
+      if (e.errs.length) return `.eh_frame: ${e.errs.join('\n')}`;
+      // (an FDE of code left out would describe the place of its own
+      // unrelocated field: outside the code)
+      const lo = Math.min(...img.funcs.map((f) => f.addr)), hi = Math.max(...img.funcs.map((f) => f.addr + f.size));
+      const stray = readEhFrame(img).filter((f) => f.low < lo || f.low >= hi);
+      if (gc && stray.length) return `${stray.length} FDEs of code left out (the first at 0x${stray[0].low.toString(16)})`;
+      sizes.push(fs.statSync(exe).size);
+      if (native && process.arch === 'x64') {
+        const r = spawnSync(exe, [], { encoding: 'utf8' });
+        if (r.stdout !== '43\n') return `the program printed ${JSON.stringify(r.stdout)}`;
+      }
+    }
+    return sizes[0] * 1.5 < sizes[1] ? null : `${sizes[0]} bytes with the garbage collection, ${sizes[1]} without`;
+  },
   'sections: --function-sections, --gc-sections and COMDAT selections': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     // (an object's: what a program's own units do not reach is never compiled)
