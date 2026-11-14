@@ -693,6 +693,10 @@ export function knownLocation(expr) {
       else if (o === 0x94) { r.u8(); if (depth < 1) return false; }
       else if (o === 0x23) { r.uleb(); if (depth < 1) return false; }
       else if ([0x22, 0x1c, 0x1e, 0x1a, 0x21, 0x27, 0x24, 0x25, 0x26].includes(o)) { if (depth < 2) return false; depth--; }
+      // (DW_OP_over, DW_OP_swap, DW_OP_rot: a product of 64 bits from its halves)
+      else if (o === 0x14) { if (depth < 2) return false; depth++; }
+      else if (o === 0x16) { if (depth < 2) return false; }
+      else if (o === 0x17) { if (depth < 3) return false; }
       else return false;
     }
     return false;
@@ -1174,4 +1178,42 @@ export function checkAxVars(dw) {
   if (!blk) E('main: inner is not in a lexical block');
   if (!dw.units.some((u) => u.die.children.some((c) => c.tag === 0x34 && String(c.attrs.get(AT_NAME)).endsWith('.COUNT') && c.attrs.get(0x02)))) E('no global COUNT');
   return errs;
+}
+
+// Evaluates a computed location (DW_OP_bregN ... DW_OP_stack_value, of the
+// integer operations the compiler writes) with registers `regs` (BigInts
+// by DWARF number) on a 64-bit stack machine: { value, exact } where exact
+// is false if a multiplication or left shift had a result below -2^63,
+// which a debugger that computes them exactly and keeps the low bits of a
+// negative result's magnitude gets wrong; null if not of those forms.
+export function evalComputed(expr, regs) {
+  const r = new Rd(expr, 0), st = [], w = (x) => BigInt.asIntN(64, x);
+  let exact = true;
+  while (r.p < expr.length) {
+    const o = r.u8();
+    if (o === 0x9f) return st.length === 1 ? { value: st[0], exact } : null;
+    if (o >= 0x70 && o <= 0x8f) { const off = BigInt(r.sleb()); st.push(w((regs[o - 0x70] ?? 0n) + off)); continue; }
+    if (o === 0x10) { st.push(w(BigInt(r.uleb()))); continue; }
+    if (o === 0x11) { st.push(w(BigInt(r.sleb()))); continue; }
+    if (o === 0x08) { st.push(BigInt(r.u8())); continue; }
+    if (o === 0x14) { st.push(st[st.length - 2]); continue; }
+    if (o === 0x16) { const b = st.pop(), a = st.pop(); st.push(b, a); continue; }
+    if (o === 0x17) { const c = st.pop(), b = st.pop(), a = st.pop(); st.push(c, a, b); continue; }
+    const b = st.pop(), a = st.pop();
+    if (a === undefined) return null;
+    let x;
+    if (o === 0x22) x = a + b;
+    else if (o === 0x1c) x = a - b;
+    else if (o === 0x1a) x = a & b;
+    else if (o === 0x21) x = a | b;
+    else if (o === 0x27) x = a ^ b;
+    else if (o === 0x1e) x = a * b;
+    else if (o === 0x24) x = a << BigInt.asUintN(64, b);
+    else if (o === 0x25) x = BigInt.asUintN(64, a) >> BigInt.asUintN(64, b);
+    else if (o === 0x26) x = a >> BigInt.asUintN(64, b);
+    else return null;
+    if ((o === 0x1e || o === 0x24) && x < -(1n << 63n)) exact = false;
+    st.push(w(x));
+  }
+  return null;
 }

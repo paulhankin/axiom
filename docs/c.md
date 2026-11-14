@@ -2896,8 +2896,9 @@ itself is in the `.dSYM`).
 - **Types and variables** (`full`): the program's types (base types, `_BitInt` with its
   width in bits, pointers, qualifiers, arrays, structures and unions with their
   bit-fields, enumerations and their constants with their exact values, also those a
-  signed 64-bit integer does not hold: an unsigned one in `DW_FORM_udata`, a 128-bit one
-  in `DW_FORM_data16`, as in memory; function types, typedefs); each
+  signed 64-bit integer does not hold: an unsigned one in `DW_FORM_udata`, a wider one
+  in `DW_FORM_block1`, as in memory (not `DW_FORM_data16`, which makes a debugger
+  that does not read that form in `.debug_info` drop the whole unit); function types, typedefs); each
   function's result type, parameters and local variables; objects of static storage
   duration, thread-local ones included (by their offset in the thread's TLS block; on
   macOS through a descriptor of the platform's form for `DW_OP_form_tls_address`, which
@@ -2964,10 +2965,15 @@ itself is in the `.dSYM`).
     (`DW_OP_bregN`, `DW_OP_fbreg`, `DW_OP_entry_value` and the stack machine's
     operations, `DW_OP_stack_value`), as long as none of them was made again since;
     so is a value not made yet in its block whose operands are those it will be made
-    from; a multiplication of values of at most 32 bits too (its operands
-    sign-extended from the value's width: the system's debugger computes `DW_OP_mul`
-    right only where the product is a signed 64-bit integer, and gives a product past
-    it the wrong sign), not a wider one, divisions or floating-point arithmetic;
+    from, and one no instruction makes (folded into the instructions of those
+    computed from it, or a copy that took its operand's register) from the
+    assignment on; through up to eight operations, a multiplication of 64 bits
+    too (from its operands' 32-bit halves); not divisions or floating-point
+    arithmetic. The system's debugger computes `DW_OP_mul` and `DW_OP_shl`
+    exactly and keeps the low bits of a negative result's magnitude when it is
+    below -2^63, so the expressions multiply and shift left only values they
+    made not negative (masked to the bits that matter); a shift's count is
+    taken modulo the width the machine's shift reads;
   - a register or spill slot holds a value until something writes it: an instruction
     that only reads a slot (a reload folded into an arithmetic instruction, a
     comparison with it) leaves it, and every slot the code spills to is followed;
@@ -3004,11 +3010,18 @@ itself is in the `.dSYM`).
   of its assignments, showed no difference (x86-64; AArch64 under emulation), and the
   same comparison catches a deliberately wrong rule for the registers a call changes.
   Of the instructions stepped in such programs at `-O2` where a variable has been
-  assigned (in its lifetime: a variable of a loop's body from the round's start),
-  the debugger shows a value at 87.6% on x86-64 (up from 58.1%) and 83.5% on AArch64
-  (up from 75.9%), counting the copies inlined; the rest are values nothing holds
-  any more (a value whose register was reused, a merge of two values neither of
-  which is kept, a floating-point value).
+  assigned (in its lifetime: a variable of a loop's body from the round's start; an
+  inlined function's in the instance it was assigned in), the debugger shows a value
+  at 91.5% on x86-64 and 90.5% on AArch64 for C, and at 92.2% and 93.2% for Axiom
+  programs of the same shapes, counting the copies inlined. The rest are values
+  nothing holds any more: merges and phis of values whose registers were reused
+  (the largest part), floating-point values (DWARF's stack machine computes integers
+  only, as this compiler writes it), values computed through more operations than
+  the expressions follow, and parameters whose entry value the caller's call site
+  does not give. AArch64 trails because its calls clobber the floating-point
+  registers that pass a logged value (a structure's `double` member is lost once it
+  is passed) and its scheduler moves more of the code it computes ahead of where it
+  is assigned.
 - **Macros** (`full`, C): `.debug_macro` (DWARF 5) has each unit's definitions and
   undefinitions in order with their lines (predefined ones and `-D`/`-U` at line 0,
   before the unit's own file), and each file as it is included (from its

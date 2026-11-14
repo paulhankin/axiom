@@ -433,7 +433,7 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
         return me;
     }
     let op = v.op;
-    if depth < 4 {
+    if depth < XDEPTH {
         expr_ops(v, me, depth);
     }
     if op == ir.OP_ALLOCA {
@@ -481,6 +481,13 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
     }
     return me;
 }
+
+// How deep an expression (expr_of) computes a value from others: the
+// operations' operands are followed (val_of, expr_ops) as far, and DEPS
+// further; and no further than XBYTES bytes of DWARF (the operations
+// that reach an operand by several paths compute it for each).
+const XDEPTH: i32 = 8;
+const XBYTES: usize = 192;
 
 // An integer or pointer value of at most 64 bits (its width, 0: not one).
 fn int_bits(v: *ir.Value) u32 {
@@ -535,16 +542,19 @@ fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
     if (bits == 0) or u.isnil(v.a) {
         return;
     }
-    // (a multiplication of values of at most 32 bits only: a debugger's
-    // DW_OP_mul is right where the product of its operands is a signed
-    // 64-bit integer, and no further (a product past it comes out with the
-    // wrong sign; measured: randomly generated functions stepped in the
-    // system's debugger). expr_op sign-extends both operands from the
-    // value's width, which keeps the product within 2^62 and its low bits
-    // the machine's.)
+    // (the system's debugger computes the stack machine's multiplications
+    // and left shifts exactly, and keeps the low 64 bits of the result
+    // only where it is not below -2^63: a negative one past it comes out
+    // as its magnitude's low bits (measured: randomly generated functions
+    // stepped in it). So expr_op multiplies and shifts left values it made
+    // not negative: a multiplication of values of at most 32 bits from its
+    // operands sign-extended (within 2^62), a wider one from their 32-bit
+    // halves (mul64); a left shift of a value of at most 32 bits, or by a
+    // constant, from the bits of it that the shift keeps.)
+    let cnt = u.notnil(v.b) and (ir.resolve(v.b).kind == ir.V_CINT);
     let two = (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) or
-              (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_PTRADD) or
-              ((op == ir.OP_MUL) and (bits <= 32));
+              ((op == ir.OP_SHL) and ((bits <= 32) or cnt)) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or
+              (op == ir.OP_PTRADD) or (op == ir.OP_MUL);
     let one = (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) or (op == ir.OP_PTRTOINT) or
               (op == ir.OP_INTTOPTR);
     if not two and not one {
@@ -1512,6 +1522,25 @@ fn made_before(an: *An, k: i32, b: i32, at: usize) bool {
     return dominates(an, db, b);
 }
 
+// Are the operands of value k (of expr_ops) made where every path to
+// instruction `at` of block b has made them last, or (made by no
+// instruction) made so here (State.x)?
+fn operands_made(an: *An, s: *State, k: i32, b: i32, at: usize) bool {
+    let x = VALS.get(@int_cast(usize, k));
+    let os: [2]i32 = [x.xa, x.xb];
+    for q in @as(usize, 0)..2 {
+        let o = os[q];
+        if o >= 0 {
+            let y = VALS.get(@int_cast(usize, o));
+            let here = (an.defb[@int_cast(usize, o)] < 0) and x_has(s, @int_cast(usize, o));
+            if not (here or y.obj or (y.gsym.len > 0) or made_before(an, o, b, at)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Mark mm takes effect in state s, before instruction `at` of block b.
 fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
     if mm.ent < 0 {
@@ -1553,6 +1582,14 @@ fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
         add = add +% y.add;
         bk = y.base;
         n += 1;
+    }
+    if (an.defb[@int_cast(usize, k)] < 0) and (x.xop != 0) and operands_made(an, s, k, b, at) {
+        // (a value no instruction of the code makes, an operation on
+        // others that are made, here as they were when it was: made here,
+        // computed from them while none is made again, State.x)
+        put_d(s, e, id_val(k), mm.add);
+        x_put(s, @int_cast(usize, k), true);
+        return;
     }
     if u.notnil(x.def) {
         if made_before(an, k, b, at) {
@@ -1680,7 +1717,7 @@ let mut DEPS: u.List.[u.List.[i32]] = u.List.[u.List.[i32]].{ data: @ptr_from_in
                                                               cap: 0 };
 
 fn add_deps(k: i32, of: i32, depth: i32) void {
-    if (of < 0) or (depth > 6) {
+    if (of < 0) or (depth > XDEPTH + 2) {
         return;
     }
     let x = VALS.get(@int_cast(usize, of));
@@ -1715,7 +1752,7 @@ fn find_deps() void {
     for k in 0..VALS.len {
         add_deps(@int_cast(i32, k), @int_cast(i32, k), 0);
     }
-    // the values each one's expression may read (expr_of: down to depth 4)
+    // the values each one's expression may read (expr_of: down to depth XDEPTH)
     CLO.clear();
     CLO_AT.clear();
     for k in 0..VALS.len {
@@ -1740,7 +1777,7 @@ fn add_clo(from: usize, k: i32, depth: i32) void {
     if not have {
         CLO.push(k);
     }
-    if depth >= 4 {
+    if depth >= XDEPTH {
         return;
     }
     let x = VALS.get(@int_cast(usize, k));
@@ -2272,12 +2309,15 @@ let mut DBG_READ: bool = false;
 pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     let mut out = u.List.[VLoc].empty();
     if not DBG_READ {
-        DBG_ENV = u.env("AXIOM_DEBUG_DLOC");
+        DBG_ENV = u.perm_dup(u.env("AXIOM_DEBUG_DLOC"));  // (compute runs in a scratch scope)
         DBG_READ = true;
     }
     DBGF = (DBG_ENV.len > 0) and (u.str_eq(DBG_ENV, FN.name) or u.str_eq(DBG_ENV, "*"));
     if DBGF {
-        u.eprint(u.f2("func %s nv %s\n", FN.name, u.idec(@int_cast(i32, VALS.len))));
+        u.eprint(
+            u.f3(
+                "func %s nv %s nc %s\n", FN.name, u.idec(@int_cast(i32, VALS.len)),
+                u.idec(@int_cast(i32, CONSTS.len))));
         for k in 0..VALS.len {
             let x = VALS.get(k);
             let mut op: i32 = -1;
@@ -2290,7 +2330,17 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
                 u.f3(
                     "v%s op=%s ty=%s", u.idec(@int_cast(i32, k) + 1), u.idec(op),
                     u.idec(@int_cast(i32, @int_from_enum(x.v.ty.kind)))));
-            u.eprint(u.f3(" xop=%s xa=%s xb=%s\n", u.idec(x.xop), u.idec(x.xa + 1), u.idec(x.xb + 1)));
+            u.eprint(u.f3(" xop=%s xa=%s xb=%s", u.idec(x.xop), u.idec(x.xa + 1), u.idec(x.xb + 1)));
+            let mut dof: u64 = 0;
+            if u.notnil(x.def) {
+                dof = offset_of(x.def);
+            }
+            u.eprint(u.f2(" def=%s at=%s", u.idec(@as(i32, u.notnil(x.def))), u.hex16(dof)));
+            if u.notnil(x.def) {
+                let ds = move_regs(mf, x.def);
+                u.eprint(u.f3(" mv=%s %s,%s", u.idec(@as(i32, x.def.is_move)), u.idec(ds[0]), u.idec(ds[1])));
+            }
+            u.eprint("\n");
         }
     }
     if DBGF {
@@ -2299,6 +2349,13 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
             let vs = dbi.vars_of(FN.name);
             if (en.inst == 0) and (@as(usize, en.var) < vs.len) {
                 u.eprint(u.f2("e%s = %s\n", u.idec(@int_cast(i32, e)), vs[@as(usize, en.var)].name));
+            } else if (en.inst != 0) and (@as(usize, en.inst) < dbi.scopes.len) {
+                // (a variable of a function inlined: its function's, of instance inst)
+                let fv = dbi.vars_of(dbi.scopes.get(@as(usize, en.inst)).func);
+                if @as(usize, en.var) < fv.len {
+                    u.eprint(u.f3("e%s = %s@%s\n", u.idec(@int_cast(i32, e)), fv[@as(usize, en.var)].name,
+                                  u.idec(@bit_cast(i32, en.inst))));
+                }
             }
         }
     }
@@ -2701,6 +2758,10 @@ const OP_BREGX: u8 = 0x92;
 const OP_SHL: u8 = 0x24;
 const OP_SHR: u8 = 0x25;
 const OP_SHRA: u8 = 0x26;
+const OP_MUL: u8 = 0x1e;
+const OP_OVER: u8 = 0x14;
+const OP_SWAP: u8 = 0x16;
+const OP_ROT: u8 = 0x17;
 const OP_AND: u8 = 0x1a;
 const OP_CONST1U: u8 = 0x08;
 const OP_ENTRY_VALUE: u8 = 0xa3;
@@ -2736,7 +2797,9 @@ fn put_ext(o: *mut u.List.[u8], bits: u32, signed: bool) void {
     if bits >= 64 {
         return;
     }
+    put_mask(o, bits);
     if signed {
+        // (shifted left once not negative: see expr_ops)
         let sh = @as(u8, @truncate(u8, 64 - bits));
         o.push(OP_CONST1U);
         o.push(sh);
@@ -2744,6 +2807,12 @@ fn put_ext(o: *mut u.List.[u8], bits: u32, signed: bool) void {
         o.push(OP_CONST1U);
         o.push(sh);
         o.push(OP_SHRA);
+    }
+}
+
+// The low `bits` bits of the value on top of the stack (all of it: 64).
+fn put_mask(o: *mut u.List.[u8], bits: u32) void {
+    if bits >= 64 {
         return;
     }
     o.push(OP_CONSTU);
@@ -2830,7 +2899,15 @@ fn expr_of(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
         }
         return entry_value(an, &x, out);
     }
-    if (x.xop == 0) or (depth >= 4) or not x_has(s, @int_cast(usize, k)) {
+    // (an operand is computed from its operands as they are now, whether
+    // or not anything made it since they were (State.x): the value at
+    // depth 0 was made, none of what it is computed from made again since
+    // (State.x; DEPS: through every depth expr_op reaches), or it is about
+    // to be made from what is there now (pending_ok); and an operand's
+    // making dominates its use, so no path from its last making to that
+    // value's makes its own operands again (SSA): it was made from them as
+    // they are)
+    if (x.xop == 0) or (depth >= XDEPTH) or (out.len > XBYTES) or ((depth == 0) and not x_has(s, @int_cast(usize, k))) {
         return false;
     }
     return expr_op(an, s, k, minus, depth, out);
@@ -2854,19 +2931,41 @@ fn expr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
     if (op == ir.OP_TRUNC) or (op == ir.OP_PTRTOINT) or (op == ir.OP_INTTOPTR) {
         return true;  // (the low bits: the debugger reads the variable's bytes)
     }
+    let wide_mul = (op == ir.OP_MUL) and (x.bits > 32);
     if op == ir.OP_LSHR {
         put_ext(out, x.bits, false);
-    } else if (op == ir.OP_ASHR) or (op == ir.OP_MUL) {
+    } else if (op == ir.OP_ASHR) or ((op == ir.OP_MUL) and not wide_mul) {
         put_ext(out, x.bits, true);
+    } else if op == ir.OP_SHL {
+        // (the bits the shift keeps, of a value not negative: see expr_ops)
+        let mut keep = x.bits;
+        if x.xb < 0 {
+            let c = @as(u32, @truncate(u32, @bit_cast(u64, x.cb) & 63));
+            if c == 0 {
+                return true;
+            }
+            keep = @min(keep, 64 - c);
+        }
+        put_mask(out, keep);
     }
     if not put_operand(an, s, x.xb, x.cb, minus, depth, out) {
         return false;
+    }
+    if wide_mul {
+        mul64(out);
+        return true;
     }
     if op == ir.OP_MUL {
         put_ext(out, x.bits, true);  // (both operands within 32 bits: see expr_ops)
     }
     if (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_SHL) {
-        put_ext(out, x.bits, false);  // (the count: what the instruction read of it)
+        // (the count, as the machine's shift reads it: modulo 32 for a
+        // value of at most 32 bits, else 64)
+        if x.bits <= 32 {
+            put_mask(out, 5);
+        } else {
+            put_mask(out, 6);
+        }
     }
     let mut code: u8 = OP_SHRA;
     if (op == ir.OP_ADD) or (op == ir.OP_PTRADD) {
@@ -2874,7 +2973,7 @@ fn expr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
     } else if op == ir.OP_SUB {
         code = 0x1c;
     } else if op == ir.OP_MUL {
-        code = 0x1e;
+        code = OP_MUL;
     } else if op == ir.OP_AND {
         code = OP_AND;
     } else if op == ir.OP_OR {
@@ -2888,6 +2987,42 @@ fn expr_op(an: *An, s: *mut State, k: i32, minus: u64, depth: i32, out: *mut u.L
     }
     out.push(code);
     return true;
+}
+
+// The low 64 bits of the product of the two values on top of the stack,
+// in their place, from products and shifts of values not negative (see
+// expr_ops): with a = ah 2^32 + al, b = bh 2^32 + bl (halves of 32 bits),
+// a b = al bl + ((ah bl + al bh) mod 2^32) 2^32 (mod 2^64).
+fn mul64(o: *mut u.List.[u8]) void {
+    // [a b]
+    o.push(OP_OVER);
+    o.push(OP_OVER);
+    put_mask(o, 32);
+    o.push(OP_SWAP);
+    put_mask(o, 32);
+    o.push(OP_MUL);  // [a b al.bl]
+    o.push(OP_ROT);  // [al.bl a b]
+    o.push(OP_OVER);
+    o.push(OP_OVER);
+    put_mask(o, 32);
+    o.push(OP_SWAP);
+    o.push(OP_CONST1U);
+    o.push(32);
+    o.push(OP_SHR);
+    o.push(OP_MUL);  // [al.bl a b ah.bl]
+    o.push(OP_ROT);  // [al.bl ah.bl a b]
+    o.push(OP_CONST1U);
+    o.push(32);
+    o.push(OP_SHR);
+    o.push(OP_SWAP);
+    put_mask(o, 32);
+    o.push(OP_MUL);  // [al.bl ah.bl al.bh]
+    o.push(0x22);    // DW_OP_plus
+    put_mask(o, 32);
+    o.push(OP_CONST1U);
+    o.push(32);
+    o.push(OP_SHL);
+    o.push(0x22);
 }
 
 fn same_loc(a: *VLoc, b: *VLoc) bool {
@@ -3270,6 +3405,11 @@ fn ranges(an: *mut An, outs: []mut SState, entry: *SState, size: u64, out: *mut 
                 for l in 0..NL {
                     if s.c[l] != 0 {
                         t = u.f3("%s p%s:%s", t, u.idec(@int_cast(i32, l)), u.idec(s.c[l]));
+                    }
+                }
+                for xk in 0..VALS.len {
+                    if x_has(&s, xk) {
+                        t = u.f2("%s x%s", t, u.idec(@int_cast(i32, xk) + 1));
                     }
                 }
                 u.eprint(u.f1("%s\n", t));

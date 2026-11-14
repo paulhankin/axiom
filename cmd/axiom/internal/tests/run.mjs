@@ -42,7 +42,7 @@ import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt } from './dwarf.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -2897,7 +2897,7 @@ if (!skipPlatform) {
     return outs[0].equals(outs[1]) ? null : 'the objects differ';
   };
   // enumerators of values a signed 64-bit one does not hold: unsigned
-  // 64-bit (DW_FORM_udata), 128-bit (DW_FORM_data16, the value in memory)
+  // 64-bit (DW_FORM_udata), wider (DW_FORM_block1, the value in memory)
   for (const t of ['x86_64', 'aarch64', 'wasm32']) {
     dcases[`enumerators wider than 64 bits ${t}`] = async () => {
       const src = path.join(tmp, 'debug-enum-wide.c');
@@ -2925,6 +2925,59 @@ if (!skipPlatform) {
         // (a udata or sdata is read as a Number: compared as one)
         const g = got.get(n), ok = Buffer.isBuffer(g) ? val(g) === v : g === Number(v);
         if (!ok) return `${n} is ${Buffer.isBuffer(g) ? val(g) : g}, not ${v}`;
+      }
+      return null;
+    };
+  }
+  // a variable computed from values held where nothing holds it any more
+  // (dloc.ax, expr_of): a product of 64 bits from the halves of its
+  // operands, a value sign-extended and shifted from its bits; for random
+  // operands the expression gives the program's value (BigInt arithmetic of
+  // 64 bits) and multiplies and shifts left no negative value past -2^63
+  for (const t of ['x86_64', 'aarch64']) {
+    dcases[`computed values ${t}`] = async () => {
+      const src = path.join(tmp, `debug-computed-${t}.c`);
+      fs.writeFileSync(src, 'volatile long sink;\n__attribute__((noinline)) void g(long v) { sink = v; }\n' +
+        '__attribute__((noinline)) long f(long x, long y, int i) {\n    long p = x * y;\n    g(p);\n' +
+        '    long q = (long)(i << 3) + x;\n    g(q);\n    g(0);\n    g(1);\n    return x + y + i;\n}\n' +
+        'int main(void) { return (int)f(sink, sink + 3, (int)sink); }\n');
+      const o = path.join(tmp, `debug-computed-${t}`, 'prog');
+      fs.mkdirSync(path.dirname(o), { recursive: true });
+      const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+      const r = await spawnAsync(compiler, ['build', src, '--c-std=gnu17', `--target=${t}`, '-O2', '-g', '-o', o],
+        { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+      if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+      const dw = readDwarf(loadImage(fs.readFileSync(o)));
+      const locs = new Map();
+      const walk = (d) => {
+        if (d.tag === 0x34 && typeof d.attrs.get(0x02) === 'number') locs.set(d.attrs.get(0x03), locList(dw, d.attrs.get(0x02)));
+        d.children.forEach(walk);
+      };
+      for (const u of dw.units) walk(u.die);
+      let seed = 12345n;
+      const rnd = () => { seed = (seed * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n); return BigInt.asIntN(64, seed); };
+      for (const [name, rot] of [['p', true], ['q', false]]) {
+        const ls = (locs.get(name) || []).filter((l) => l.expr.includes(0x9f) && l.expr[0] >= 0x70 && l.expr[0] <= 0x8f);
+        if (!ls.length) return `${name}: never computed`;
+        if (rot && !ls.some((l) => l.expr.includes(0x17))) return `${name}: no product from halves`;
+        let done = 0;
+        for (const l of ls) {
+          // (of registers and the integer operations only)
+          if (!evalComputed(l.expr, [])) continue;
+          done++;
+          for (let k = 0; k < 200; k++) {
+            const regs = Array.from({ length: 32 }, rnd);
+            const v = evalComputed(l.expr, regs);
+            if (!v.exact) return `${name}: a multiplication or shift past -2^63`;
+            // (the product of two registers: DW_OP_bregA 0 DW_OP_bregB 0 DW_OP_over ...)
+            const e = l.expr, isb = (b) => b >= 0x70 && b <= 0x8f;
+            if (rot && isb(e[0]) && e[1] === 0 && isb(e[2]) && e[3] === 0 && e[4] === 0x14 &&
+                v.value !== BigInt.asIntN(64, regs[e[0] - 0x70] * regs[e[2] - 0x70])) {
+              return `${name}: ${v.value}, not the product`;
+            }
+          }
+        }
+        if (!done) return `${name}: never computed from registers`;
       }
       return null;
     };
