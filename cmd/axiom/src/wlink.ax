@@ -7,7 +7,9 @@
 // wraps below 0), then the data segments. Function pointers index table 0,
 // whose slot 0 stays empty. Undefined functions, globals and tags with an
 // explicit import module (`import host`, file-scope asm's imports) become
-// imports; other undefined symbols are errors. Globals come after the
+// imports; other undefined symbols are errors, but weak ones: a weak
+// function nothing defines is null (table slot 0), its calls a trapping
+// stub's (null_stubs), weak data nothing defines is at address 0. Globals come after the
 // host's and the stack pointer; tags after the host's; file-scope asm's
 // passive data and element segments before the module's own.
 // =============================================================================
@@ -442,11 +444,11 @@ fn apply(ui: usize, d: *mut bn.Bytes, rs: *u.List.[wo.Reloc], w64: bool) void {
             // a weak reference to a function nothing defines is null, even
             // where it is imported for the calls of it (which the code makes
             // only when its address is not null)
-            let weak_null = (resolve(ui, r.sym).un < 0) and
-                            ((U()[ui].syms.at(@as(usize, r.sym)).flags & wo.F_WEAK) != 0);
+            let fl = U()[ui].syms.at(@as(usize, r.sym)).flags;
+            let weak_null = ((fl & F_NULL_STUB) != 0) or ((resolve(ui, r.sym).un < 0) and ((fl & wo.F_WEAK) != 0));
             if (fi >= 0) and not weak_null {
                 slot = @as(u64, table_index(fi));
-            } else if (U()[ui].syms.at(@as(usize, r.sym)).flags & wo.F_WEAK) == 0 {
+            } else if not weak_null and ((fl & wo.F_WEAK) == 0) {
                 err(u.f1("undefined function '%s'", U()[ui].syms.at(@as(usize, r.sym)).name));
             }
             if t == wo.R_TABLE_INDEX_SLEB {
@@ -533,8 +535,9 @@ pub fn link(us0: []mut *mut wo.Unit, o: *Options) []u8 {
     units_p = us.ptr;
     nunits = us.len;
     failed = false;
-    new_maps();
     collect_defs();
+    null_stubs();
+    new_maps();
     liveness(o);
     if failed {
         return u.nosym();
@@ -658,6 +661,39 @@ fn cmp_u64(a: u64, b: u64) i32 {
         return 1;
     }
     return 0;
+}
+
+// A symbol made a weak function's null stub (null_stubs): the format's flags
+// leave this bit unused, and the linker's units are not written again.
+const F_NULL_STUB: u32 = 0x4000_0000;
+
+// The weak references to functions that nothing defines and no import
+// names explicitly: the C rule for a weak undefined symbol is that its
+// address is null (its table index, 0), and a call of it is undefined;
+// such a call reaches a function of its own type, local to the unit, that
+// traps (`unreachable`), as the tool conventions' linkers make one. (Weak
+// data nothing defines is at address 0: data_addr.)
+fn null_stubs() void {
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for si in 0..un.syms.len {
+            let s = un.syms.at(si);
+            if (s.kind != wo.SYM_FUNC) or defined(s) or ((s.flags & wo.F_WEAK) == 0) or
+               ((s.flags & wo.F_EXPLICIT_NAME) != 0) or (resolve(ui, @int_cast(u32, si)).un >= 0) {
+                continue;
+            }
+            let f = u.new.[wo.Func]();
+            f.ty = un.fimports.get(@as(usize, s.index)).ty;
+            f.name = s.name;
+            f.sym = @int_cast(u32, si);
+            let mut b = bn.new_bytes();
+            b.put("\x00\x00\x0b");  // no locals; unreachable; end
+            f.body = b;
+            s.index = @int_cast(u32, un.fimports.len + un.funcs.len);
+            s.flags = wo.F_LOCAL | F_NULL_STUB;
+            un.funcs.push(f);
+        }
+    }
 }
 
 // Each unit's maps, empty.

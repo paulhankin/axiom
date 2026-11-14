@@ -1464,6 +1464,42 @@ await section('C programs', {
     if (got !== '150 200 65535 -1') return `wasm-ld's program ran its constructors as ${got}`;
     return null;
   },
+  // WebAssembly: weak references to a function and an object nothing
+  // defines, in an object: null (no import of the host's), the call a
+  // trap, linked by the compiler's linker and by wasm-ld.
+  'WebAssembly: weak undefined references in objects': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    if (native) return { skip: true, reason: 'WebAssembly' };
+    const d = path.join(tmp, 'wasm-weak');
+    fs.mkdirSync(d, { recursive: true });
+    const w = (n, t) => { fs.writeFileSync(path.join(d, n), t); return path.join(d, n); };
+    const src = w('wk.c', 'int maybe(int) __attribute__((weak));\nextern int wd __attribute__((weak));\n' +
+      'int get(void) { return (maybe == 0) * 10 + (&wd == 0); }\nint call(void) { return maybe(1); }\n');
+    const o = path.join(d, 'wk.o');
+    let r = await spawnAsync(compiler, ['build', src, '--c-std=gnu17', '--c-freestanding', '--emit=obj', '-o', o], { encoding: 'utf8' });
+    if (r.status !== 0) return `--emit=obj failed:\n${r.stdout}${r.stderr}`;
+    const m = w('m.c', '#include <stdio.h>\nint get(void);\nint main(void) { printf("%d\\n", get()); return 0; }\n');
+    const exe = path.join(d, 'm.wasm');
+    r = await spawnAsync(compiler, ['build', m, o, '--c-std=gnu17', '-o', exe], { encoding: 'utf8' });
+    if (r.status !== 0) return `the build failed:\n${r.stdout}${r.stderr}`;
+    const env = WebAssembly.Module.imports(new WebAssembly.Module(fs.readFileSync(exe))).filter((x) => x.module === 'env');
+    if (env.length) return `the program imports ${env.map((x) => x.name).join(', ')} from env`;
+    const run = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), exe], { encoding: 'utf8' });
+    if (run.stdout !== '11\n') return `the program printed\n${run.stdout}${run.stderr}`;
+    const wasmLd = ['wasm-ld', 'wasm-ld-18'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+    if (!wasmLd) return { skip: true, reason: 'no wasm-ld (the compiler\'s own link passed)' };
+    r = await spawnAsync(wasmLd, ['--no-entry', '--export=get', '--export=call', o, '-o', path.join(d, 'wk.wasm')], { encoding: 'utf8' });
+    if (r.status !== 0) return `wasm-ld failed:\n${r.stdout}${r.stderr}`;
+    const inst = await WebAssembly.instantiate(fs.readFileSync(path.join(d, 'wk.wasm')), {});
+    if (inst.instance.exports.get() !== 11) return `wasm-ld's module: get() is ${inst.instance.exports.get()}`;
+    try {
+      inst.instance.exports.call();
+      return 'wasm-ld\'s module: the call of the weak function did not trap';
+    } catch (e) {
+      if (!(e instanceof WebAssembly.RuntimeError)) throw e;
+    }
+    return null;
+  },
   'visibility in --emit=obj': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const f = path.join(tmp, 'c-vis.c'), obj = path.join(tmp, 'c-vis.o');

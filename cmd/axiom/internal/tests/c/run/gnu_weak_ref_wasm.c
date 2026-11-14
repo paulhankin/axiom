@@ -1,8 +1,9 @@
 /* flags: --c-std=gnu99 */
 /* wasm-only */
 /* On WebAssembly too a weak reference to a function no unit defines is a
-   null pointer (a call of it, made only when it is not null, is still an
-   import of env), and one to an object a null address. */
+   null pointer (table slot 0; not an import of the host's), and one to an
+   object a null address; a call of the function traps
+   (gnu_weak_ref_call.c). */
 #include "host.h"
 
 extern int maybe_absent(void) __attribute__((weak));

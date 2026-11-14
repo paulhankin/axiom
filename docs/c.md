@@ -48,7 +48,8 @@ below.
     other name is an undefined symbol at link time: nothing comes from the system's C
     library (`msvcrt.dll`), unless the program's C library is the system's
     (`--c-lib=system`, "Objects and libraries"), whose names are then `msvcrt.dll`'s.
-  - On WebAssembly, it is an import of the module `env`, with the name of the function.
+  - On WebAssembly, it is an import of the module `env`, with the name of the function
+    (but for a weak reference, which is null when nothing linked defines it).
     A host supplies it. The module also imports the runtime's host functions from the
     module `axiom` (`ax_write`, ...), which `std/internal/runtime/host.mjs` provides:
     `node std/internal/runtime/host.mjs prog.wasm` runs a program, with no `env`
@@ -437,7 +438,11 @@ the program's own references, and what the inputs refer to is kept ("What is lin
 On WebAssembly the compiler's linker takes relocatable objects of the tool conventions'
 format (this compiler's, and `clang`'s for the same target) and archives of them, found
 with `-L` and `-l` (`libname.a`), with the same member selection; a C source given with
-`--link=` is compiled by `clang` first. The constructors of such objects (their
+`--link=` is compiled by `clang` first. A weak reference that nothing linked defines (and
+that no import names explicitly) is null: a function's table index is 0 and its calls
+reach a stub of its type that traps (`unreachable`), an object's address is 0; this
+compiler's objects leave such a function's import without a name of their own, so that
+`wasm-ld` makes it so too. The constructors of such objects (their
 linking sections' `INIT_FUNCS`) are run before `main`, by priority (of one priority in
 the order of the objects), by `__wasm_call_ctors`, which the linker makes when an
 object has some (the tool conventions' name: the C start-up calls it). This compiler's
@@ -717,11 +722,6 @@ Of a COFF object's COMDAT sections a link keeps one copy by its selection: "any"
 first object's, "largest" the largest, "same size" and "exact match" the first, the
 others then having to be of its size or its bytes, and a second copy of one of "no
 duplicates" is an error (`duplicate symbol`).
-
-### Not done yet
-
-- On WebAssembly a weak reference to a function nothing defines, while null, is still an
-  import of `env` for its calls.
 
 ## The C library
 
@@ -1856,7 +1856,7 @@ C4052 and is ignored.
 | `section("s")` | objects with static storage duration, functions | The object or the function's code goes in section s ("Code in sections": Mach-O's `"segment,section"`, COFF's `s$m`); the linkers define `__start_s` and `__stop_s` for a C identifier's. Not on WebAssembly (accepted with no effect). |
 | `used` | objects, functions | Kept though nothing refers to it. |
 | `unused` | any declaration, labels | As `[[maybe_unused]]`. |
-| `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if no unit defines it; on WebAssembly the host's import). `#pragma weak` too. |
+| `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if nothing linked defines it: on WebAssembly too, table slot 0 and no import of the host's, a call of it reaching a stub of the linker's that traps; weak data there is at address 0). `#pragma weak` too. |
 | `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): a symbol of its own (with `weak`, a weak one) at target's place in every object format, which other objects refer to; the program's other units' references to the name are to target (unless a weak alias's name is defined otherwise, which then wins). An object for other links keeps target for it. |
 | `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to objects and shared libraries (ELF: `STV_HIDDEN` for hidden and internal, `STV_PROTECTED`, `STV_DEFAULT`; Mach-O: hidden as a private extern; COFF and Mach-O have no protected symbols: default there). With `--pic` (and `--emit=shared`) on ELF a definition of default visibility is preemptible, its address taken from the GOT and its calls through the PLT; hidden and protected ones are reached directly ("Shared libraries"). No effect on an executable's own code. |
 | `ifunc("resolver")` | function declarations of external linkage | An indirect function (ELF's `STT_GNU_IFUNC`; Linux targets only, else C3090, and `__has_attribute(ifunc)` is 0): the symbol of its name is at resolver, a function the unit defines (else C3090), taking no arguments (on AArch64 it may take the hardware capabilities: "Objects and libraries") and returning the function's address, which the program's start-up (a static program's, before anything else runs) or the dynamic linker calls once; the function's calls and its address are its name's, one address wherever it is taken. A definition of it with a body is a redefinition (C3002); it is not also an alias. |
