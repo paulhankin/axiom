@@ -908,6 +908,67 @@ fn data_section(obj: *mut elf.Obj, g: *ir.Global, sec: i32, nm: []u8) i32 {
     return own_section(obj, u.f2("%s.%s", base.name, nm), base.kind, 1, grp);
 }
 
+// --data-sections: the function that first refers to each of the
+// compiler's own data (an internal global whose name starts with '.': a
+// call-site record, a constant, a string), by Global.id: its index in
+// m.funcs + 1, or 0 (none: what only other data refers to; a call's
+// chain of records counts as its code's). Such data is
+// in a section of its function's (owned_section) rather than one of its
+// own: what a link keeps of it is much the same (data of the compiler's
+// own is seldom shared by functions), for far fewer sections.
+fn data_owners(m: *ir.Module) []mut u32 {
+    let own = u.newn.[u32](m.globals.len + 1);
+    for fi in 0..m.funcs.len {
+        let f = m.funcs.get(fi);
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                for k in 0..(3 + i.xs.len) {
+                    let v = ir.operand(i, k);
+                    if u.notnil(v) and (v.kind == ir.V_GLOBAL) {
+                        own_data(m, own, ir.gv_of(v), fi);
+                    }
+                }
+                if i.op == ir.OP_CALL {
+                    // (and the records of a call's chain: ftab.ax)
+                    let mut c = ir.chain_of(i);
+                    while u.notnil(c) {
+                        own_data(m, own, ir.gv_of(c.site), fi);
+                        c = c.next;
+                    }
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
+    return own;
+}
+
+fn own_data(m: *ir.Module, own: []mut u32, g: *ir.Global, fi: usize) void {
+    let id = @as(usize, @bit_cast(u32, g.id));
+    if (id < m.globals.len) and (own[id] == 0) and (g.linkage == ir.LINK_INTERNAL) and (g.name.len > 0) and
+       (g.name[0] == '.') {
+        own[id] = @int_cast(u32, fi) + 1;
+    }
+}
+
+// The section for data of the function whose symbol is fs that would be in
+// section `sec` (data_owners): <sec's name>.<the function's>, made once
+// (in `made`: sec << 32 | the function's symbol -> the section + 1).
+fn owned_section(obj: *mut elf.Obj, sec: i32, fs: u32, made: *mut u.U64Map) i32 {
+    let key = (@as(u64, @bit_cast(u32, sec)) << 32) | @as(u64, fs);
+    let k = made.get(key);
+    if k != 0 {
+        return @truncate(i32, @bit_cast(i64, k - 1));
+    }
+    let base = obj.secs.get(@int_cast(usize, sec));
+    let n = own_section(obj, u.f2("%s.%s", base.name, obj.syms.get(@as(usize, fs)).name), base.kind, 1, "");
+    made.put(key, @as(u64, @bit_cast(u32, n)) + 1);
+    return n;
+}
+
 /// The read-only data section for what only the code of section `text`
 /// refers to (a jump table, whose entries refer to that code): `rodata`,
 /// or for code in a COMDAT group, a section of the group (a link that drops
@@ -1069,6 +1130,11 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
                                                  protected: f.visibility == ir.VIS_PROTECTED }));
         }
     }
+    let mut owners = u.newn.[u32](1);
+    let mut made = u.U64Map.empty();
+    if g_data_sections {
+        owners = data_owners(m);
+    }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
         if u.isnil(g.init) {
@@ -1095,6 +1161,8 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         let gname = sym_name(g.name, g.linkage, "g", i);
         if (g.section.len > 0) and not g.tls {
             sec = named_section(obj, g.section, sec == rodata);
+        } else if (i < owners.len) and (owners[i] != 0) and not g.tls {
+            sec = owned_section(obj, sec, fsym.get(@as(usize, owners[i] - 1)), &mut made);
         } else {
             sec = data_section(obj, g, sec, gname);
         }
@@ -1125,6 +1193,7 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
                                              hidden: hidden_vis(g.visibility),
                                              protected: g.visibility == ir.VIS_PROTECTED }));
     }
+    made.deinit();
     add_aliases(obj, m, fsym, gsym);
     for i in 0..m.globals.len {
         let g = m.globals.get(i);

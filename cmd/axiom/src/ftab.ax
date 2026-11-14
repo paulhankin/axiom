@@ -99,6 +99,15 @@ pub struct Tab {
     ctxs: u.U64Map,        // a pair's number << 32 | the next record + 1 -> the context's offset + 1
     strs: u.SymMap.[u64],  // a name -> its offset + 1
     last: [2]u64,          // the string ro_str gave last at each of its two uses: its offset + 1 (0: none)
+    split: *mut Split,     // a section of chains per section of code (see begin), else nil
+}
+
+// The chains of an object with a section of them per section of code (see begin).
+pub struct Split {
+    gsym: *mut u.List.[u32],       // the module's globals' symbols
+    distinct: u.List.[*ir.Chain],  // each distinct chain (a call's MInst.aux: its number + 1)
+    tchains: u.U64Map,             // a section of code -> its section of chains + 1
+    placed: u.U64Map,              // a section of chains << 32 | a chain's number + 1 -> its place + 1
 }
 
 pub fn off() Tab {
@@ -106,12 +115,19 @@ pub fn off() Tab {
                  rets0: -1, cur_text: -1, others: u.List.[u64].empty(), rel32: 0, abs64: 0, empty: 0, lines: false,
                  ro: -1, ro_sym: 0, rec_of: u.U64Map.empty(), recs: u.U64Map.empty(), pairs: u.U64Map.empty(),
                  ctxs: u.U64Map.empty(), strs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0,
-                                                                len: 0 }, last: [0, 0] };
+                                                                len: 0 }, last: [0, 0], split: u.nil.[Split]() };
 }
 
 // The module's frame table, if it has one (m.frame_tables), and the chains
 // of its calls (ir.Chain.off, then the call's place in `chains` + 1).
-// `gsym` maps the module's globals to their symbols.
+// `gsym` maps the module's globals to their symbols. With each function in
+// a section of its own (--function-sections, which a link with
+// --gc-sections may leave out), the chains of each section's calls are in
+// a section of their own that its entries refer to (.data.rel.ro.chains,
+// made as the entries are: chain_at), so that what a link leaves out of
+// the code takes its chains and their call-site records with it; a call's
+// ir.Chain.off is then the chain's number + 1 (in `distinct`), and only
+// the empty chain is in `chains`.
 pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut u.List.[u32], rel32: u32,
              abs64: u32) Tab {
     let mut t = off();
@@ -136,6 +152,11 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
     }
     t.rel32 = rel32;
     t.abs64 = abs64;
+    if is.g_function_sections {
+        t.split = u.perm_new.[Split]();
+        t.split.* = Split.{ gsym: gsym, distinct: u.List.[*ir.Chain].empty(), tchains: u.U64Map.empty(),
+                            placed: u.U64Map.empty() };
+    }
     let cs = o.secs.get(@int_cast(usize, chains));
     if cs.align < 8 {
         cs.align = 8;
@@ -161,23 +182,12 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
                     }
                     let k = u.intern(key.done());
                     let mut at = seen.get(k);
-                    if at == 0 {
-                        at = @as(u64, cs.data.len()) + 1;
-                        c = ir.chain_of(i);
-                        while u.notnil(c) {
-                            // (a call inlined into the next one's function: marked)
-                            let mut inl: i64 = 0;
-                            if u.notnil(c.next) {
-                                inl = 1;
-                            }
-                            cs.relocs.push(
-                                elf.Rel.{
-                                    off: @as(u64, cs.data.len()), ty: abs64, sym: is.gsym_at(o, gsym, ir.gv_of(c.site)),
-                                    addend: inl });
-                            cs.data.zeros(8);
-                            c = c.next;
-                        }
-                        cs.data.zeros(8);
+                    if (at == 0) and u.notnil(t.split) {
+                        t.split.distinct.push(ir.chain_of(i));
+                        at = @as(u64, t.split.distinct.len);
+                        seen.put(k, at);
+                    } else if at == 0 {
+                        at = put_chain(&t, gsym, cs, ir.chain_of(i)) + 1;
                         seen.put(k, at);
                     }
                     ir.chain_of(i).off = @bit_cast(i64, at);
@@ -188,6 +198,49 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
         }
     }
     return t;
+}
+
+// Chain c into section cs: its place there.
+fn put_chain(t: *Tab, gsym: *mut u.List.[u32], cs: *mut elf.Sec, chain: *ir.Chain) u64 {
+    let at = @as(u64, cs.data.len());
+    let mut c = chain;
+    while u.notnil(c) {
+        // (a call inlined into the next one's function: marked)
+        let mut inl: i64 = 0;
+        if u.notnil(c.next) {
+            inl = 1;
+        }
+        cs.relocs.push(
+            elf.Rel.{ off: @as(u64, cs.data.len()), ty: t.abs64, sym: is.gsym_at(t.obj, gsym, ir.gv_of(c.site)),
+                      addend: inl });
+        cs.data.zeros(8);
+        c = c.next;
+    }
+    cs.data.zeros(8);
+    return at;
+}
+
+// (split) The section of chains of the code of the section being done
+// (made once, in its code's COMDAT group if it is in one), and chain number
+// n's place there (put there once): section << 32 | place.
+fn chain_at(t: *mut Tab, n: u64) u64 {
+    let tk = @as(u64, @bit_cast(u32, t.cur_text));
+    let sp = t.split;
+    let mut k = sp.tchains.get(tk);
+    if k == 0 {
+        let c = elf.add_sec(t.obj, ".data.rel.ro.chains", elf.S_DATA, 8);
+        t.obj.secs.get(@int_cast(usize, c)).group = t.obj.secs.get(@int_cast(usize, t.cur_text)).group;
+        k = @as(u64, @bit_cast(u32, c)) + 1;
+        sp.tchains.put(tk, k);
+    }
+    let key = ((k - 1) << 32) | n;
+    let mut at = sp.placed.get(key);
+    if at == 0 {
+        let cs = t.obj.secs.get(@truncate(usize, k - 1));
+        at = put_chain(t, sp.gsym, cs, sp.distinct.get(@truncate(usize, n - 1))) + 1;
+        sp.placed.put(key, at);
+    }
+    return ((k - 1) << 32) | (at - 1);
 }
 
 // What a call's machine instruction keeps (MInst.aux): its chain's place + 1,
@@ -504,7 +557,10 @@ pub fn func(t: *mut Tab, text: i32, base: u64, size: u64, frameless: bool, nofra
         if (calls[k] & CALL_FRAMELESS) != 0 {
             cf = F_FRAMELESS;
         }
-        if (aux != 0) or (cf != 0) {
+        if (aux != 0) and u.notnil(t.split) {
+            let x = chain_at(t, aux);
+            entry_to(t, base + at, elf.sec_sym(t.obj, @truncate(i32, @bit_cast(i64, x >> 32))), x & 0xffff_ffff, cf);
+        } else if (aux != 0) or (cf != 0) {
             entry(t, base + at, chain, cf);
         }
         k += 2;
