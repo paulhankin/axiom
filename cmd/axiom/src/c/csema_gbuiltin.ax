@@ -73,6 +73,7 @@ pub const GB_LONGJMP: i32 = 158;      // (buf, 1)
 pub const GB_PAUSE: i32 = 159;        // a spin-wait hint: nothing
 pub const GB_FENCE: i32 = 167;        // a full memory fence
 pub const GB_OBJECT_SIZE: i32 = 182;  // __builtin_(dynamic_)object_size(p, kind) the expression does not decide (ir.IN_OBJSIZE)
+pub const GB_CONSTANT_P: i32 = 183;   // __builtin_constant_p(x) of no constant x without side effects: soft 0 (ir.IN_CONSTANT_P)
 pub const GB_ISNAN: i32 = 160;
 pub const GB_ISINF: i32 = 161;
 pub const GB_ISFINITE: i32 = 162;
@@ -567,11 +568,28 @@ pub fn call(e: *mut cast.Expr) bool {
         cs.unevaluated(1);
         let x = cx.rv(e.args.get(0));
         cs.unevaluated(-1);
+        // (an arithmetic constant, a null or integer pointer constant, or
+        // the address of a string literal; that of an object or function
+        // is not known before the program is linked)
         let mut v: u64 = 0;
-        if not is_err(x) and ((x.is_const and cty.is_arith(x.ty)) or (cty.is_pointer(x.ty) and cc.address(x).ok)) {
+        if not is_err(x) and x.is_const and cty.is_arith(x.ty) {
             v = 1;
+        } else if not is_err(x) and cty.is_pointer(x.ty) {
+            let ad = cc.address(x);
+            if ad.ok and u.isnil(ad.sym) {
+                v = 1;
+            }
         }
         fold_int(e, cty.t_int, v);
+        if (v == 0) and not is_err(x) and soft_operand(x) {
+            // (0 in a constant expression, as the GNU dialects have it in
+            // static initializers; in code the optimizer may find x a
+            // constant: ir.IN_CONSTANT_P. Its argument is not evaluated:
+            // having no side effects, computing it changes nothing.)
+            e.op = GB_CONSTANT_P;
+            e.soft = true;
+            e.args.set(0, x);
+        }
         return true;
     }
     if u.str_eq(rest, "choose_expr") {
@@ -1217,6 +1235,41 @@ fn no_effects(e: *cast.Expr) bool {
         }
     }
     return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+}
+
+// May the code compute x, the operand of a __builtin_constant_p that is not
+// a constant, for the optimizer to see whether it becomes one? An integer
+// of at most 64 bits, a binary floating value or a pointer, from an
+// expression with no side effects (no call, assignment, increment,
+// statement expression, compound literal, va_arg, volatile access, nor a
+// size of a variably modified type).
+fn soft_operand(x: *cast.Expr) bool {
+    let t = x.ty;
+    let ok = (cty.is_integer(t) and (cty.size_of(t) <= 8)) or (cty.is_real_floating(t) and not cty.is_decimal(t)) or
+             cty.is_pointer(t);
+    return ok and pure_operand(x);
+}
+
+fn pure_operand(e: *cast.Expr) bool {
+    if u.isnil(e) or (e.is_const and not e.soft) {
+        return true;
+    }
+    if u.isnil(e.ty) or ((e.ty.quals & cty.Q_VOLATILE) != 0) {
+        return false;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.CALL) or (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.POSTFIX) or
+       (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.VA_ARG) or
+       (k == cast.ExprKind.SIZEOF_TYPE) or (k == cast.ExprKind.SIZEOF_EXPR) or (k == cast.ExprKind.ALIGNOF) or
+       (k == cast.ExprKind.GENERIC) or ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
+        return false;
+    }
+    for a in e.args.items() {
+        if not pure_operand(a) {
+            return false;
+        }
+    }
+    return pure_operand(e.a) and pure_operand(e.b) and pure_operand(e.c);
 }
 
 // __builtin_choose_expr(c, a, b): the one c chooses takes e's place, unconverted.

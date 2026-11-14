@@ -149,6 +149,9 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     // (the operands in the rdx:rax pair: each low half's temporary or value
     // address, which its high half, 8 bytes on, reads too)
     let pairv = u.newn.[*mut ir.Value](b.ops.len + 1);
+    // (each output's lvalue address: the input '+' adds reads the value
+    // there, the lvalue evaluated once: `"+r"(*f())` calls f once)
+    let oaddr = u.newn.[*mut ir.Value](b.ops.len + 1)[0..b.ops.len];
     // (AArch64's outputs in z, p or q registers through memory: each one's
     // buffer and lvalue's address, copied after the asm)
     let mut vouts = u.List.[usize].empty();
@@ -157,6 +160,7 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     for k in 0..b.ops.len {
         let op = b.ops[k];
         let e = a.exprs.get(k);
+        let reuse = plus_input(a, b, k, oaddr);
         if op.hi {
             if op.out {
                 xs.push(ir.ci32(0));
@@ -171,11 +175,15 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
                 let t = cty.unqual(e.ty);
                 pouts.push(k);
                 pes.push(e);
-                paddrs.push(gx.lv(e));
+                oaddr[k] = gx.lv(e);
+                paddrs.push(oaddr[k]);
                 ptmps.push(cg.alloca(t, "asm.out"));
                 xs.push(ir.ci32(0));
             } else {
-                let p = gx.rv(e);  // (a 128-bit value: its address)
+                let mut p = reuse;
+                if u.isnil(p) {
+                    p = gx.rv(e);  // (a 128-bit value: its address)
+                }
                 pairv[k] = p;
                 xs.push(ir.load(cg.B, ir.t_int(64), p));
             }
@@ -188,12 +196,15 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             let t = cty.unqual(e.ty);
             if op.out {
                 let at = gx.lv(e);
+                oaddr[k] = at;
                 if op.inout {
                     gx.copy(t, buf, at);
                 }
                 vouts.push(k);
                 vbufs.push(buf);
                 vaddrs.push(at);
+            } else if not u.isnil(reuse) {
+                gx.copy(t, buf, reuse);
             } else if e.lvalue {
                 gx.copy(t, buf, gx.lv(e));
             } else if cty.is_wide(t) or not cty.is_scalar(t) {
@@ -211,7 +222,8 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             }
             outk.push(k);
             outs.push(e);
-            addrs.push(gx.lv(e));
+            oaddr[k] = gx.lv(e);
+            addrs.push(oaddr[k]);
             xs.push(ir.ci32(0));  // (its register: the asm's result k)
             continue;
         }
@@ -239,7 +251,12 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             xs.push(ir.load(cg.B, cg.lty(cty.unqual(e.ty)), gx.rv(e)));
             continue;
         }
-        let v = gx.rv(e);
+        let mut v = ir.vnil();
+        if not u.isnil(reuse) {
+            v = gx.load_lv(e.a, reuse);
+        } else {
+            v = gx.rv(e);
+        }
         if op.kind == ai.OK_IMM {
             xs.push(v);
             continue;
@@ -317,6 +334,23 @@ fn mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
 }
 
 // Is op an AArch64 operand in a z, p or q register through memory (a buffer)?
+// The address of the output that operand k, an input '+' added (the value
+// of that output's lvalue, read before the asm), reads: oaddr's, the
+// output's lvalue evaluated once; or nil.
+fn plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) *mut ir.Value {
+    let op = b.ops[k];
+    if op.out or op.hi or (op.tie < 0) {
+        return ir.vnil();
+    }
+    let t = @int_cast(usize, op.tie);
+    let e = a.exprs.get(k);
+    if (t >= k) or not b.ops[t].inout or (e.kind != cast.ExprKind.CAST) or (e.op != cast.CV_LOAD) or
+       (e.a != a.exprs.get(t)) {
+        return ir.vnil();
+    }
+    return oaddr[t];
+}
+
 fn is_vbuf(op: ai.Op) bool {
     return (op.via == ai.VIA_V) or (op.via == ai.VIA_P);
 }
