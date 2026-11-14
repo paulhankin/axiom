@@ -107,8 +107,16 @@ forked children's for the compiler itself (x86-64 at -O0, -O1, -O1 -g, -O2,
 --sanitize=address; AArch64 -O0 -g; wasm32; Windows -O1 -g; macOS) and
 several examples, with `AXIOM_JOBS=1` and 3 alike; diagnostics from several
 failing modules come in the same order; the compiler built for wasm32 builds
-with the cache under node. On Linux a `--units=module` self-build takes a
-little less wall and CPU time than with fork, and the same memory (PSS).
+with the cache under node, and the compiler built for Windows does under
+Wine (the compiler itself: 188 modules, the same executable as on Linux).
+A module starts as soon as any thread is free (the forked children waited
+for the oldest). On Linux (4 processors, a cold cache), a `--units=module`
+self-build at -O1 went from 6.2-6.8 s to 4.0-4.2 s (user + system time 12.4
+to 9.0 s; on one processor 13.3 to 10.6 s), its peak memory (PSS, all
+processes) from 357-379 to 379-394 MB. The -O2 self-build (parts, still
+forked) is unchanged within noise (about 30 s of CPU time, 2.0 GB peak in
+the main process); an -O2 build of an example executes 0.5% fewer
+instructions (callgrind): thread-local access costs nothing measurable.
 
 ### What remains
 
