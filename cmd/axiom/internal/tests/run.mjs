@@ -42,7 +42,7 @@ import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
+import { loadImage, checkDebug, checkEhFrame, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -2677,6 +2677,14 @@ if (!skipPlatform) {
             const img = loadImage(a);
             const r = checkDebug(img, { cfi: !t.startsWith('wasm') });
             if (r.errs.length) return r.errs.join('\n');
+            // (Linux: .eh_frame, with or without -g, an FDE per function with -g's rows)
+            if (t === 'x86_64' || t === 'aarch64') {
+              for (const [what, im, fdes] of [['-g', img, r.dw.fdes], ['without -g', loadImage(n), null]]) {
+                const e = checkEhFrame(im, fdes);
+                if (e.errs.length) return `.eh_frame (${what}): ${e.errs.join('\n')}`;
+                if (!e.nchecked) return `.eh_frame (${what}): no function checked`;
+              }
+            }
             // the line tables' MD5 checksums: each a file's on disk (none in a
             // unit with a name of C's #line, frames.c's)
             let summed = 0;

@@ -2679,7 +2679,10 @@ const CFA_ADVANCE_LOC1: u8 = 0x02;
 const CFA_ADVANCE_LOC2: u8 = 0x03;
 const CFA_ADVANCE_LOC4: u8 = 0x04;
 const CFA_OFFSET_EXTENDED: u8 = 0x05;
-const CFA_SAME_VALUE: u8 = 0x08;
+const CFA_RESTORE: u8 = 0xc0;
+const CFA_RESTORE_EXTENDED: u8 = 0x06;
+const CFA_REMEMBER_STATE: u8 = 0x0a;
+const CFA_RESTORE_STATE: u8 = 0x0b;
 const CFA_DEF_CFA: u8 = 0x0c;
 const CFA_DEF_CFA_REGISTER: u8 = 0x0d;
 const CFA_DEF_CFA_OFFSET: u8 = 0x0e;
@@ -2828,15 +2831,32 @@ fn fde(d: *mut Unit, f: *Func) void {
 /// and instructions of its own) after a CIE's initial ones (the state at
 /// the entry: x86-64 CFA = rsp + 8, the return address at CFA - 8;
 /// AArch64 CFA = sp): for each change of state the advance to it and what
-/// changed (the CFA rule, registers saved and given back). Also the
-/// programs of macOS's __eh_frame (macunwind.ax).
+/// changed (the CFA rule, registers saved and given back: DW_CFA_restore,
+/// the CIE's rule, which for a callee-saved register is its own value). A
+/// change out of the function's body state (the frame pointer's CFA with
+/// the most registers saved: an epilogue's start) remembers that state
+/// (DW_CFA_remember_state) and the next change back to it restores it
+/// (DW_CFA_restore_state), which is shorter than saying it again. Also the
+/// programs of the .eh_frame of ELF objects and macOS's __eh_frame
+/// (macunwind.ax).
 pub fn cfa_program(b: *mut bn.Bytes, a64: bool, f: *Func) void {
     let mut ca: u64 = 1;
     let mut cur = cfi_state(0, X64_RSP, 1, 0);
+    let mut fp = @as(u64, X64_RBP);
     if a64 {
         ca = 4;
         cur = cfi_state(0, A64_SP, 0, 0);
+        fp = @as(u64, A64_FP);
     }
+    // the body state (0: none), and whether it is remembered now
+    let mut body: u64 = 0;
+    for s in f.cfi {
+        let st = s & ~@as(u64, 0xffff_ffff);
+        if (((st >> 56) & 31) == fp) and ((body == 0) or (((st >> 32) & 0xff_ffff) > ((body >> 32) & 0xff_ffff))) {
+            body = st;
+        }
+    }
+    let mut kept = false;
     let mut loc: u64 = 0;
     let mut xi: usize = 0;
     for s in f.cfi {
@@ -2857,6 +2877,16 @@ pub fn cfa_program(b: *mut bn.Bytes, a64: bool, f: *Func) void {
             continue;
         }
         advance(b, &mut loc, off, ca);
+        if kept and (st == body) {
+            b.u8_(CFA_RESTORE_STATE);
+            kept = false;
+            cur = s;
+            continue;
+        }
+        if (body != 0) and ((cur & ~@as(u64, 0xffff_ffff)) == body) {
+            b.u8_(CFA_REMEMBER_STATE);
+            kept = true;
+        }
         let creg = (st >> 56) & 31;
         let ck = (st >> 61) * 8;
         let oreg = (cur >> 56) & 31;
@@ -2890,8 +2920,10 @@ pub fn cfa_program(b: *mut bn.Bytes, a64: bool, f: *Func) void {
                     b.uleb(rg);
                 }
                 b.uleb(fo);
+            } else if rg < 64 {
+                b.u8_(CFA_RESTORE | @truncate(u8, rg));
             } else {
-                b.u8_(CFA_SAME_VALUE);
+                b.u8_(CFA_RESTORE_EXTENDED);
                 b.uleb(rg);
             }
         }

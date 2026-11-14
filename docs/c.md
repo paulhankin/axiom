@@ -390,7 +390,35 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   table of every FDE's function by its address, sorted for a binary search (the Linux
   Standard Base's format: the FDEs of code the link left out are not in it), which
   `PT_GNU_EH_FRAME` names in executables and shared libraries, as the platform's unwinder
-  (its runtime's backtraces, C++'s exceptions) finds it. Indirect functions
+  (its runtime's backtraces, C++'s exceptions) finds it. The objects' read-only
+  `.eh_frame` sections are placed together, ended by a zero terminator, and the
+  executable's section headers name `.eh_frame` and `.eh_frame_hdr` (for the tools that
+  find them so). This compiler's own objects have an FDE in `.eh_frame` for every
+  function, with or without `-g` (`cmd/axiom/src/macunwind.ax`), from the call frame
+  states the code generators record: right at every instruction (prologues and
+  epilogues, the pushes and stack adjustments, a shrink-wrapped function's code before
+  its frame, frameless functions, the epilogues of sibling calls before a function's
+  end, the outlined cold parts, which are functions of their own, and a frame whose
+  stack pointer moves, by a variable length array, `alloca` or a large frame's stack
+  probe, described from the frame pointer), the same rules as `-g`'s `.debug_frame`. An
+  object has one `.eh_frame`, a CIE (augmentation `zR`, pc-relative 4-byte pointers)
+  and an FDE per function that refers to its code by the code section's symbol and the
+  function's offset, so that a function in a section of its own (`--function-sections`,
+  a link-once function's COMDAT group) whose section a link leaves out
+  (`--gc-sections`, a dropped COMDAT copy) leaves an FDE that describes nothing, which
+  this linker leaves out of `.eh_frame_hdr` and the system's linkers drop. The programs
+  are short: an epilogue remembers the body's state (`DW_CFA_remember_state`) and the
+  code after it restores it, a register given back is `DW_CFA_restore`, entries are
+  4-aligned (the growth: about 9% for a program that prints a line, mostly its
+  runtime's many small functions; 2% for the compiler itself). The linker's own
+  functions (the system call stubs, `setjmp`) are leaves with FDEs, but for the thread
+  entry (whose child's frame is the thread's first), `longjmp` (which leaves its frame
+  before its end) and the signal return `ax_sigreturn`, whose instructions (`mov rax,
+  15; syscall`, AArch64 `mov x8, 139; svc 0`) the platform's unwinder takes for a
+  signal frame where no FDE covers them. So the system's unwinder walks through this
+  compiler's frames: a backtrace, another language's exceptions (`c/link/eh_frame_hdr`,
+  `c/link/eh_frame_sections`, and `dwarf.mjs` checks every function's FDE against its
+  `.debug_frame` one in the debug tests). Indirect functions
   (`STT_GNU_IFUNC`, global and local, of x86-64 and AArch64; the C attribute `ifunc`): a
   PLT stub is the function's address wherever it is taken (calls, the GOT, data), and
   jumps through a GOT slot that an `R_*_IRELATIVE` relocation gives the resolver's result:
@@ -2298,11 +2326,9 @@ no other tool is needed:
   `.cfi_undefined`, `.cfi_same_value`, `.cfi_register`, `.cfi_remember_state`,
   `.cfi_restore_state`, `.cfi_escape`, `.cfi_signal_frame` (a CIE with the augmentation
   `S`) and on AArch64 `.cfi_negate_ra_state` are its FDE in `.debug_frame` under `-g`
+  and, on Linux, in `.eh_frame` always (and on macOS in `__eh_frame`, "Debugging")
   (registers by name or DWARF number); `.cfi_personality` and `.cfi_lsda` only with
-  the encoding 255 (none: there are no personality routines), `.cfi_sections` changes
-  nothing. Without `-g` there is no call frame information for any function (the
-  stack traces walk frame pointers), and none is in `.eh_frame`: nothing in a program
-  unwinds by it. On Windows, `.seh_proc` ... `.seh_endproc` make the procedure's unwind
+  the encoding 255 (none), `.cfi_sections` changes nothing. On Windows, `.seh_proc` ... `.seh_endproc` make the procedure's unwind
   record in `.xdata` and its `.pdata` entry: x86-64 `.seh_pushreg`, `.seh_stackalloc`,
   `.seh_setframe`, `.seh_savereg`, `.seh_savexmm`, `.seh_pushframe`,
   `.seh_endprologue`; ARM64 `.seh_stackalloc`, `.seh_save_fplr`, `.seh_save_fplr_x`,
@@ -3059,7 +3085,8 @@ itself is in the `.dSYM`).
   recorded.
 - **Frames**: call frame information for every instruction of every function
   (prologues, epilogues, sibling calls, code run before the frame is set up), so that
-  a debugger can unwind the stack wherever it stops.
+  a debugger can unwind the stack wherever it stops (in `.debug_frame`; the same rules
+  are in `.eh_frame` with or without `-g`: "Objects and libraries").
 - **Types and variables** (`full`): the program's types (base types, `_BitInt` with its
   width in bits, pointers, qualifiers, arrays, structures and unions with their
   bit-fields, enumerations and their constants with their exact values, also those a
@@ -3224,7 +3251,7 @@ Where it goes, per target:
 
 | Target | |
 |---|---|
-| `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, `.debug_names` (an index of the unit's subprograms, static variables, named types and enumerators), and when needed `.debug_rnglists` and `.debug_loclists`. |
+| `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, `.debug_names` (an index of the unit's subprograms, static variables, named types and enumerators), and when needed `.debug_rnglists` and `.debug_loclists`. With or without `-g`, every function's call frame information is in `.eh_frame` too ("Objects and libraries"). |
 | `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's instructions are those without `-g`, but for the addresses of the data its frame table's line rows move. The DWARF of each object given to the link (this compiler's, or the platform's compilers' with DWARF 2 to 5) is carried in at its place: Mach-O objects refer from one debug section into another by offsets without relocations, which the linker moves by where each object's sections land (`cmd/axiom/src/dwrebase.ax`). The executable has unwind tables, with or without `-g` (`cmd/axiom/src/macunwind.ax`): `__unwind_info` gives every function a compact encoding (arm64: no frame, or the frame record with the callee-saved pairs below it, which the code lays out as the encoding has them; x86-64: no frame, or rbp's frame with up to five pushed registers), or one that names its entry in `__eh_frame` (DWARF's call frame information, exact at every instruction) where the encoding cannot say the frame (vector registers saved whole), where the stack pointer moves after the prologue, where a sibling call's jump is before the function's end, where code runs before the frame is set up, and for assembly procedures with `.cfi_` rules. Mach-O objects carry `__compact_unwind` and `__eh_frame` in the form the platform's assembler writes, and the linker merges those of the platform's compilers' objects too (a function an object gives no entry has an entry without information). `macho.mjs` decodes the tables of every macOS executable the suite builds; nothing here has run an unwinder over them. |
 | `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`, a module per object, every function's procedure and public symbol. With `-g` also, in CodeView form (`codeview.ax`, from the same description of the program as DWARF), the types (TPI, with its hash stream: a forward reference to a structure is found by its name), ids (IPI: the functions' ids, where each structure is defined), each function's type, frame, lexical blocks (a block in several pieces of code is a block per piece) and variables, and the static objects (`S_GDATA32`, `S_LDATA32`, thread-locals as `S_GTHREAD32` at their offset in the template, which starts `.data`) and typedefs and tags (`S_UDT`) at file and block scope. At `-O0` a local is at its offset from the frame pointer (`S_REGREL32`), a parameter an `S_LOCAL` located from the call frame's register at each instruction; in optimized code a variable is an `S_LOCAL` with the ranges where it is all in a register, in a frame slot or in memory at an address held in a register, or an `S_CONSTANT` where it is one constant throughout. Not described ("optimized out" there, never a wrong value): a structure taken apart into registers (the system's symbol handler reads CodeView's subfield ranges as the whole variable), a value computed from a register (a register plus a constant, an address of a frame object or a datum), the value at an address held in a frame slot (at `-O0`: a variable length array, a parameter passed by reference); a variable length array's bound. Typedefs are `S_UDT` names (what is declared with one has the type it names); an enumerator's value that a signed 64-bit integer does not hold is `LF_UQUADWORD` when it is an unsigned 64-bit one, and a wider one is left out of its enumeration's field list (CodeView's 128-bit leaves, `LF_OCTWORD` and `LF_UOCTWORD`, make the tools that read the type records take them for corrupt); `_Atomic T` is `T`; a base type CodeView has no primitive for (decimal floating types, a bit-precise integer narrower than its storage) is a structure of its name and size holding its bytes; an Axiom union a structure of its tag and each payload at its offset. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
 | `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |

@@ -66,6 +66,16 @@ function loadElf(d) {
   const data = (s) => Buffer.from(d.subarray(s.off, s.off + (s.type === 8 ? 0 : s.size)));
   const sections = new Map();
   for (const s of secs) if (s.name.startsWith('.debug_')) sections.set(s.name, data(s));
+  // (.eh_frame's address: its pc-relative pointers are from there; an
+  // object's at 0, its .eh_frame sections, one per unit, one after the other)
+  const ehSec = secs.find((s) => s.name === '.eh_frame');
+  const ehBase = new Map();
+  if (ehSec) {
+    const parts = type === 1 ? secs.filter((s) => s.name === '.eh_frame') : [ehSec];
+    let at = 0;
+    for (const s of parts) { ehBase.set(secs.indexOf(s), at); at += s.size; }
+    sections.set('.eh_frame', Buffer.concat(parts.map(data)));
+  }
   // symbols
   const syms = [];
   const st = secs.find((s) => s.type === 2);
@@ -82,13 +92,14 @@ function loadElf(d) {
   const symBase = (sy) => (type === 1 && sy.shndx > 0 && sy.shndx < secs.length ? secs[sy.shndx].base : 0);
   const funcs = syms.filter((s) => (s.info & 15) === 2 && code(s.shndx) && s.size > 0)
     .map((s) => ({ name: s.name, addr: s.value + symBase(s), size: s.size }));
-  const img = { kind: type === 1 ? 'elf-rel' : 'elf-exec', machine, sections, funcs, rets: [] };
+  const img = { kind: type === 1 ? 'elf-rel' : 'elf-exec', machine, sections, funcs, rets: [], ehAddr: type === 1 || !ehSec ? 0 : ehSec.addr };
   if (type !== 1) return img;
   // an object: its sections of code one after the other (above), the debug
   // sections' relocations applied
   const symVal = (i) => syms[i].value + symBase(syms[i]);
   for (const r of secs.filter((s) => s.type === 4)) {
     const target = secs[r.info];
+    const isEh = target.name === '.eh_frame', eb = isEh ? ehBase.get(r.info) : 0;
     const buf = sections.get(target.name);
     const isRets = target.name === 'axiom_rets';  // (one per section of code: all together)
     if (!buf && !isRets) continue;
@@ -109,7 +120,13 @@ function loadElf(d) {
     }
     for (const x of rel) {
       const v = symVal(x.sym) + x.add;
-      if (x.ty === 1 || x.ty === 257 || x.ty === 17 || x.ty === 1028) buf.writeBigUInt64LE(BigInt(v), x.off);
+      // (.eh_frame's pc-relative pointers: R_X86_64_PC32, R_AARCH64_PREL32, from the field at its offset)
+      if (isEh) {
+        if (x.ty === 2 || x.ty === 261) buf.writeInt32LE((v - (eb + x.off)) | 0, eb + x.off);
+        else if (x.ty === 1 || x.ty === 257) buf.writeBigUInt64LE(BigInt(v), eb + x.off);
+        else throw new Error(`relocation type ${x.ty} in .eh_frame`);
+      } else if (x.ty === 1 || x.ty === 257 || x.ty === 17 || x.ty === 1028) buf.writeBigUInt64LE(BigInt(v), x.off);
+      else if (x.ty === 1 || x.ty === 257 || x.ty === 17 || x.ty === 1028) buf.writeBigUInt64LE(BigInt(v), x.off);
       else if (x.ty === 10 || x.ty === 258) buf.writeUInt32LE(v >>> 0, x.off);
       else throw new Error(`relocation type ${x.ty} in ${target.name}`);
     }
@@ -340,6 +357,103 @@ export function readFrames(S) {
     off = end;
   }
   return fdes;
+}
+
+// The FDEs of an ELF image's .eh_frame (the call frame information the
+// platform's unwinder reads), as readFrames gives .debug_frame's: CIEs of
+// version 1 or 3 with the augmentations z, R (the FDEs' pointer encoding:
+// absolute or pc-relative, 4 or 8 bytes), P, L and S; each FDE's
+// augmentation data skipped (its LSDA). A terminator (length 0) ends it.
+export function readEhFrame(img) {
+  const d = img.sections.get('.eh_frame') || Buffer.alloc(0), cies = new Map(), fdes = [];
+  const ptr = (r, enc) => {
+    const at = img.ehAddr + r.p, f = enc & 0x0f;
+    let v = f === 0 || f === 4 || f === 0xc ? r.u64() : f === 3 ? r.u32() : f === 0xb ? d.readInt32LE((r.p += 4) - 4) : null;
+    if (v === null) throw new Error(`.eh_frame: pointer encoding 0x${enc.toString(16)}`);
+    if ((enc & 0x70) === 0x10) v += at;
+    else if (enc & 0x70) throw new Error(`.eh_frame: pointer encoding 0x${enc.toString(16)}`);
+    return v;
+  };
+  let off = 0;
+  while (off + 4 <= d.length) {
+    const r = new Rd(d, off);
+    const len = r.u32();
+    if (len === 0) break;
+    const end = off + 4 + len, idAt = r.p, id = r.u32();
+    if (end > d.length) throw new Error(`.eh_frame: the entry at 0x${off.toString(16)} is longer than the section`);
+    if (id === 0) {
+      const version = r.u8(), aug = r.str();
+      if (version !== 1 && version !== 3) throw new Error(`.eh_frame: CIE version ${version}`);
+      const caf = r.uleb(), daf = r.sleb(), ra = version === 1 ? r.u8() : r.uleb();
+      let enc = 0, lsda = null, signal = false, personality = null;
+      if (aug.startsWith('z')) {
+        const n = r.uleb(), dend = r.p + n;
+        for (const c of aug.slice(1)) {
+          if (c === 'R') enc = r.u8();
+          else if (c === 'L') lsda = r.u8();
+          else if (c === 'P') { const e = r.u8(); personality = ptr(r, e & 0x7f); }
+          else if (c === 'S') signal = true;
+          else if (c !== 'B' && c !== 'G') throw new Error(`.eh_frame: augmentation "${aug}"`);
+        }
+        r.p = dend;
+      } else if (aug !== '') throw new Error(`.eh_frame: augmentation "${aug}"`);
+      cies.set(off, { version, aug, caf, daf, ra, enc, lsda, signal, personality, init: d.subarray(r.p, end) });
+    } else {
+      const cie = cies.get(idAt - id);
+      if (!cie) throw new Error(`.eh_frame: the FDE at 0x${off.toString(16)} refers to no CIE`);
+      const low = ptr(r, cie.enc), size = ptr(r, cie.enc & 0x0f);
+      if (cie.aug.startsWith('z')) r.p += r.uleb();
+      const fde = { low, high: low + size, rows: [], cie };
+      const state = { cfa: [0, 0], regs: new Map() };
+      run(cie, cie.init, state, null, 0);
+      const initial = { cfa: [...state.cfa], regs: new Map(state.regs) };
+      fde.rows.push({ loc: low, cfa: [...state.cfa], regs: new Map(state.regs) });
+      run(cie, d.subarray(r.p, end), state, fde, low, initial);
+      fdes.push(fde);
+    }
+    off = end;
+  }
+  return fdes;
+}
+
+// The checks of an ELF image's .eh_frame (the compiler's code: every
+// function has its FDE): each function of the image (its symbols') has an
+// FDE over exactly its code, whose CFA rules are those of the frames the
+// code generators make (as checkDebug's of .debug_frame), and, given the
+// FDEs of .debug_frame (-g: debugFdes), the same rows as the function's
+// FDE there. The functions of `skip` (names) are not checked.
+export function checkEhFrame(img, debugFdes = null, skip = new Set()) {
+  const errs = [];
+  const E = (m) => { if (errs.length < 40) errs.push(m); };
+  let fdes;
+  try { fdes = readEhFrame(img); } catch (e) { return { errs: [e.message], nfdes: 0 }; }
+  const x64 = img.machine === 'x64';
+  const SP = x64 ? 7 : 31, FP = x64 ? 6 : 29;
+  const byLow = new Map(fdes.map((f) => [f.low, f]));
+  const dbg = debugFdes ? new Map(debugFdes.map((f) => [f.low, f])) : null;
+  const rule = (x) => (x ? x.join(' ') : 'same');
+  const sameRow = (a, b) => a.loc === b.loc && a.cfa[0] === b.cfa[0] && a.cfa[1] === b.cfa[1] &&
+    [...new Set([...a.regs.keys(), ...b.regs.keys()])].every((k) => rule(a.regs.get(k)) === rule(b.regs.get(k)));
+  let n = 0;
+  for (const fn of img.funcs) {
+    if (skip.has(fn.name)) continue;
+    const f = byLow.get(fn.addr);
+    if (!f) { E(`${fn.name}: no FDE in .eh_frame`); continue; }
+    n++;
+    if (f.high !== fn.addr + fn.size) E(`${fn.name}: its FDE's range is 0x${(f.high - f.low).toString(16)} bytes, the function 0x${fn.size.toString(16)}`);
+    for (const r of f.rows) {
+      const [reg, off] = r.cfa;
+      const ok = reg === FP ? off === 16 : reg === SP && (x64 ? off === 8 || off === 16 : off === 0 || off === 16);
+      if (!ok) E(`${fn.name}+0x${(r.loc - f.low).toString(16)}: CFA = r${reg} + ${off}`);
+      if (r.loc < f.low || r.loc >= f.high) E(`${fn.name}: a row outside its range`);
+      if (reg === FP && !(r.regs.get(FP) && r.regs.get(FP)[0] === 'off' && r.regs.get(FP)[1] === -16)) E(`${fn.name}+0x${(r.loc - f.low).toString(16)}: the CFA is the frame pointer's but the caller's is not saved`);
+    }
+    const g = dbg && dbg.get(fn.addr);
+    if (dbg && g) {
+      if (g.rows.length !== f.rows.length || !g.rows.every((x, k) => sameRow(x, f.rows[k]))) E(`${fn.name}: its .eh_frame rows differ from its .debug_frame rows`);
+    }
+  }
+  return { errs, nfdes: fdes.length, nchecked: n };
 }
 
 function run(cie, prog, state, fde, low, initial) {

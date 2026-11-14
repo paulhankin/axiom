@@ -1,6 +1,20 @@
 // =============================================================================
-// macunwind.ax - macOS unwind tables, from the call frame states the native
-// code generators record (dwarf.ax cfi_state) for every function.
+// macunwind.ax - unwind tables, from the call frame states the native code
+// generators record (dwarf.ax cfi_state) for every function: macOS's compact
+// entries and __eh_frame, and the .eh_frame of an ELF object (Linux: an FDE
+// for every function, with or without -g, so that the platform's unwinder,
+// which finds them through the linked program's .eh_frame_hdr, walks through
+// this compiler's frames: a backtrace, another language's exceptions).
+//
+// An ELF object has one .eh_frame: CIEs as below, then an FDE per function
+// (per procedure of assembly with .cfi_ directives), each exact at every
+// instruction (the code generators' states: the prologue and epilogue, a
+// shrink-wrapped function's blocks before its frame, the epilogues of sibling
+// calls before the end, a frame whose stack pointer moves, which is then
+// described from the frame pointer). An FDE refers to its code by the
+// section's symbol and the function's offset in it, so that a link that
+// leaves the section out (a dropped COMDAT copy, --gc-sections) leaves the
+// FDE describing nothing, which linkers drop, rather than another copy.
 //
 // An object (macho.ax writes its sections as the platform's) has:
 //   __LD,__compact_unwind   an entry per function, 32 bytes: its address
@@ -185,7 +199,8 @@ pub struct Out {
     on: bool,
     obj: *mut elf.Obj,
     x64: bool,
-    cu: i32,       // .compact_unwind
+    elf: bool,     // an ELF object's: .eh_frame only, an FDE for every function
+    cu: i32,       // .compact_unwind (-1: none)
     eh: i32,       // .eh_frame
     cies: [4]u64,  // per CIE kind (bit 0 simple, bit 1 a signal frame): its offset + 1
 }
@@ -195,11 +210,26 @@ pub struct Out {
 /// (a macOS target).
 pub fn begin(on: bool, obj: *mut elf.Obj, x64: bool) Out {
     if not on {
-        return Out.{ on: false, obj: obj, x64: x64, cu: -1, eh: -1, cies: [0; 4] };
+        return Out.{ on: false, obj: obj, x64: x64, elf: false, cu: -1, eh: -1, cies: [0; 4] };
     }
     let cu = elf.add_sec(obj, ".compact_unwind", elf.S_DATA, 8);
     let eh = elf.add_sec(obj, ".eh_frame", elf.S_RODATA, 8);
-    return Out.{ on: true, obj: obj, x64: x64, cu: cu, eh: eh, cies: [0; 4] };
+    return Out.{ on: true, obj: obj, x64: x64, elf: false, cu: cu, eh: eh, cies: [0; 4] };
+}
+
+/// The .eh_frame of ELF object `obj` (made now, as begin's), if `on` (a
+/// Linux target), whose functions all get FDEs (add_elf).
+pub fn begin_elf(on: bool, obj: *mut elf.Obj, x64: bool) Out {
+    if not on {
+        return Out.{ on: false, obj: obj, x64: x64, elf: true, cu: -1, eh: -1, cies: [0; 4] };
+    }
+    let eh = elf.add_sec(obj, ".eh_frame", elf.S_RODATA, 4);
+    return Out.{ on: true, obj: obj, x64: x64, elf: true, cu: -1, eh: eh, cies: [0; 4] };
+}
+
+/// Does o describe every function by an FDE (an ELF object's, on)?
+pub fn all_fdes(o: *Out) bool {
+    return o.on and o.elf;
 }
 
 // DWARF's register numbers and call frame instructions used here
@@ -207,12 +237,21 @@ const CFA_DEF_CFA: u8 = 0x0c;
 const CFA_OFFSET: u8 = 0x80;
 const CFA_NOP: u8 = 0;
 
-// Pads the entry at `at` of b to a multiple of 8 with nops and sets its length.
-fn pad_entry(b: *mut bn.Bytes, at: usize) void {
-    while ((b.len() - at) % 8) != 0 {
+// Pads the entry at `at` of b to a multiple of `al` with nops and sets its
+// length: 8 on macOS, 4 in an ELF object (entries whose pointers are 4
+// bytes, as the platform's assemblers align them).
+fn pad_entry(b: *mut bn.Bytes, at: usize, al: usize) void {
+    while ((b.len() - at) % al) != 0 {
         b.u8_(CFA_NOP);
     }
     b.set_u32(at, @as(u64, b.len() - at - 4));
+}
+
+fn align(o: *Out) usize {
+    if o.elf {
+        return 4;
+    }
+    return 8;
 }
 
 // The CIE of a kind (its offset in .eh_frame): version 1, augmentation
@@ -269,7 +308,7 @@ fn cie(o: *mut Out, simple: bool, signal: bool) u64 {
             b.uleb(0);
         }
     }
-    pad_entry(b, at);
+    pad_entry(b, at, align(o));
     o.cies[k] = @as(u64, at) + 1;
     return @as(u64, at);
 }
@@ -291,13 +330,13 @@ fn abs64(x64: bool) u32 {
 /// Adds the unwind entry of the function at symbol `sym` + `add` (of
 /// `size` bytes): compact encoding `enc`, or, if `prog` is not empty, an
 /// FDE of those call frame instructions (after the CIE's of its kind) and
-/// the DWARF mode.
+/// the DWARF mode; in an ELF object always the FDE (`enc` unused).
 pub fn add(o: *mut Out, sym: u32, addend: u64, size: u64, enc0: u32, prog: []u8, simple: bool, signal: bool) void {
     if not o.on {
         return;
     }
     let mut enc = enc0;
-    if prog.len > 0 {
+    if (prog.len > 0) or o.elf {
         let c = cie(o, simple, signal);
         let s = o.obj.secs.get(@int_cast(usize, o.eh));
         let b = &mut s.data;
@@ -309,8 +348,11 @@ pub fn add(o: *mut Out, sym: u32, addend: u64, size: u64, enc0: u32, prog: []u8,
         b.u32_(size);
         b.uleb(0);  // (no augmentation data)
         b.put(prog);
-        pad_entry(b, at);
+        pad_entry(b, at, align(o));
         enc = dwarf_mode(o.x64);
+    }
+    if o.cu < 0 {
+        return;  // (ELF: no compact entries)
     }
     let s = o.obj.secs.get(@int_cast(usize, o.cu));
     s.relocs.push(elf.Rel.{ off: @as(u64, s.data.len()), ty: abs64(o.x64), sym: sym, addend: @bit_cast(i64, addend) });
@@ -325,7 +367,7 @@ pub fn add(o: *mut Out, sym: u32, addend: u64, size: u64, enc0: u32, prog: []u8,
 /// asm/core.ax Proc) of call frame instructions `prog`: an FDE, or, when it
 /// has none and starts from the entry's state, no frame.
 pub fn add_proc(o: *mut Out, sym: u32, size: u64, prog: []u8, simple: bool, signal: bool) void {
-    if (prog.len == 0) and not simple and not signal {
+    if (prog.len == 0) and not simple and not signal and not o.elf {
         let mut enc = A64_FRAMELESS;
         if o.x64 {
             enc = x64_frameless();

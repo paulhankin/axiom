@@ -28,6 +28,7 @@
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
+import "macunwind.ax" as mu;
 import "util.ax" as u;
 
 // The C library's heap, which the hosted C library's malloc uses when the
@@ -148,8 +149,11 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
         bytes(o, text, "\xbf\x00\x0f\x2d\x00\xb8\x38\x00\x00\x00\x0f\x05\x48\x85\xc0\x75\x17");
         bytes(o, text,
               "\x31\xed\x48\x8b\x04\x24\x48\x8b\x7c\x24\x08\xff\xd0\x31\xff\xb8\x3c\x00\x00\x00\x0f\x05\xf4\xc3");
+        // mov rax, 15 (rt_sigreturn); syscall: in that encoding, which the
+        // platform's unwinder takes for a signal frame's return (it finds no
+        // FDE for it, nor for the function before it: leaf_fdes)
         _ = func(o, text, "ax_sigreturn");
-        bytes(o, text, "\xb8\x0f\x00\x00\x00\x0f\x05\xf4");
+        bytes(o, text, "\x48\xc7\xc0\x0f\x00\x00\x00\x0f\x05\xf4");
         let a = func(o, text, "ax_start_sp");
         bytes(o, text, "\x48\x8b\x05\x00\x00\x00\x00\xc3");  // mov rax, [rip + start_sp]
         reloc(o, text, a + 3, elf.R_X86_64_PC32, sp_sym, -4);
@@ -174,6 +178,7 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
         }
         jstub.add(o, text, machine, false);  // (no longjmp with jstub.g_system_jmp)
         jmp_aliases(o, false);
+        leaf_fdes(o, text, true);
         return o;
     }
     // AArch64: x8 = n; x0..x5 = a..f
@@ -220,7 +225,68 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
     }
     jstub.add(o, text, machine, false);  // (no longjmp with jstub.g_system_jmp)
     jmp_aliases(o, true);
+    leaf_fdes(o, text, false);
     return o;
+}
+
+// The functions without an FDE (leaf_fdes): the child of ax_thread_create
+// starts the thread's stack (its frame is the first: an unwinder stops
+// there), ax_sigreturn is the return of a signal frame (the platform's
+// unwinder knows its instructions when no FDE covers them), and longjmp
+// leaves its frame for setjmp's caller before its last instruction.
+let NO_FDE: [5][]u8 = ["ax_thread_create", "ax_sigreturn", "longjmp", "__axc_longjmp_restore", "_longjmp"];
+
+fn cmp_u64(a: u64, b: u64) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+// The stub functions' call frame information (.eh_frame: macunwind.ax), for
+// the platform's unwinder: each function in section `text` but NO_FDE's is
+// a leaf without a frame (its return address at the stack pointer, or in
+// the link register, throughout), from its start to the next one's.
+fn leaf_fdes(o: *mut elf.Obj, text: i32, x64: bool) void {
+    let mut starts = u.List.[u64].empty();  // (start << 1 | 1 when it has no FDE)
+    for y in o.syms.items() {
+        if (y.sec != text) or ((y.ty != elf.T_FUNC) and not u.str_eq(y.name, "__axc_longjmp_restore")) {
+            continue;
+        }
+        let mut no: u64 = 0;
+        for n in NO_FDE {
+            if u.str_eq(y.name, n) {
+                no = 1;
+            }
+        }
+        starts.push((y.value << 1) | no);
+    }
+    u.sort.[u64](starts.items(), cmp_u64);
+    let mut out = mu.begin_elf(true, o, x64);
+    let ts = elf.sec_sym(o, text);
+    let end = @as(u64, o.secs.get(@as(usize, @bit_cast(u32, text))).data.len());
+    let mut k: usize = 0;
+    while k < starts.len {
+        let at = starts.get(k) >> 1;
+        let mut no = false;
+        let mut j = k;
+        while (j < starts.len) and ((starts.get(j) >> 1) == at) {
+            no = no or ((starts.get(j) & 1) != 0);  // (any of its names)
+            j += 1;
+        }
+        let mut next = end;
+        if j < starts.len {
+            next = starts.get(j) >> 1;
+        }
+        if not no and (next > at) {
+            mu.add(&mut out, ts, at, next - at, 0, u.nil_slice.[u8](), false, false);
+        }
+        k = j;
+    }
+    starts.deinit();
 }
 
 // The names under which an object compiled against the system C library's

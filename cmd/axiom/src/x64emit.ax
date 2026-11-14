@@ -90,7 +90,7 @@ pub let mut MACOS: bool = false;    // macOS: thread-locals in a block a TSD slo
 // macOS: the unwind tables (macunwind.ax), from the call frame states
 // (recorded for every function there, with or without -g), and the ends of
 // the function's sibling calls' jumps
-pub let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: true, cu: -1, eh: -1,
+pub let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: true, elf: false, cu: -1, eh: -1,
                                   cies: [0; 4] };
 let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 pub let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
@@ -834,8 +834,25 @@ fn mac_unwind(fs: u32, size: u64, early: bool) void {
     prog.free();
 }
 
-// -g: the call frame states as the function is encoded (dwarf.cfi_state;
-// none unless DBG is on), and the registers the frame saves (dwarf.saved_reg):
+// Linux: the function's FDE in .eh_frame (macunwind.ax), its code at `base`
+// of section TEXT (by the section's symbol: see there), from the same call
+// frame states as its .debug_frame FDE.
+fn elf_unwind(base: u64, size: u64) void {
+    let mut regs: [8]u64 = [0; 8];
+    save_list(&mut regs);
+    let n = @int_cast(usize, nsaved) + 1;
+    let df = dw.Func.{ xcfi: xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, false, &df);
+    mu.add(&mut MU, elf.sec_sym(OBJ, TEXT), base, size, 0, prog.view(), false, false);
+    prog.free();
+}
+
+// The call frame states as the function is encoded (dwarf.cfi_state; none
+// unless DBG or MU is on: -g, an unwind table), and the registers the frame saves (dwarf.saved_reg):
 // rbp at CFA - 16, then the pushed callee-saved registers below it.
 let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut cfi_regs: [20]u64 = [0; 20];
@@ -845,7 +862,7 @@ let DW_GPR: [16]u32 = [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(reg: u32, k: u64, mask: u64) void {
-    if not DBG.on and not MACOS {
+    if not DBG.on and not MU.on {
         return;
     }
     let at = @as(u64, E.b.len());
@@ -3626,6 +3643,8 @@ pub fn encode_func(f: *mut ir.Func) void {
             dw.func_name(f, elf.display_name(s.name)));
     if MACOS {
         mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size, noframe.len > 0);
+    } else if MU.on {
+        elf_unwind(base, s.size);
     }
     noframe.deinit();
     if WIN and not frameless {

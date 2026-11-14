@@ -980,22 +980,44 @@ fn text_rank(s: *elf.Sec) i32 {
     return 1;
 }
 
+/// ELF (elink.ax sets it): the read-only call frame information (.eh_frame)
+/// is placed together after the rest of C_CONST's ordinary sections, ended
+/// by a terminator (a zero length: an unwinder that reads the table through
+/// to its end stops there), at [eh_lo, eh_hi) without the terminator (eh_lo
+/// == eh_hi: none), which the executable's section header names.
+pub let mut eh_together: bool = false;
+pub let mut eh_lo: u64 = 0;
+pub let mut eh_hi: u64 = 0;
+
+// A section's pass among C_CONST's: the frame tables after the others
+// (elf.rets_rank: 0 to 2, here 1 to 3), then .eh_frame (4) when eh_together.
+fn const_pass(s: *elf.Sec) i32 {
+    if eh_together and u.str_eq(s.name, ".eh_frame") {
+        return 4;
+    }
+    return elf.rets_rank(s) + 1;
+}
+
 // Places the sections of class `cls` from address `at`; returns the end.
 // First the class's ordinary sections (of read-only data, the frame tables
-// last, together: elf.rets_rank), then the initialization and termination
+// last, together: elf.rets_rank; then .eh_frame: eh_together), then the initialization and termination
 // arrays (array_rank, setting their bounds' symbols), then the sections
 // with __start_ and __stop_ symbols, by name (setting those).
 pub fn place(cls: i32, at: u64) u64 {
     let mut cur = at;
     let mut passes: i32 = 1;
     if cls == C_CONST {
-        passes = 4;
+        passes = 5;
     } else if cls == C_TEXT {
         passes = 3;  // (hot, the rest, cold: text_rank)
     }
     let mut arrays = u.List.[u64].empty();  // rank << 40 | object << 20 | section
     let mut named = u.List.[u64].empty();   // object << 20 | section
     for pass in 0..passes {
+        if (cls == C_CONST) and (pass == 4) and eh_together {
+            cur = align_up(cur, 8);
+            eh_lo = cur;
+        }
         for oi in 0..objs.len {
             let o = objs.get(oi);
             for k in 0..o.secs.len {
@@ -1003,7 +1025,7 @@ pub fn place(cls: i32, at: u64) u64 {
                     continue;
                 }
                 let s = o.secs.get(k);
-                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
+                if (cls == C_CONST) and (const_pass(s) != pass) {
                     continue;
                 }
                 if (cls == C_TEXT) and (text_rank(s) != pass) {
@@ -1020,7 +1042,21 @@ pub fn place(cls: i32, at: u64) u64 {
                         continue;
                     }
                 }
+                if (pass == 4) and (s.align > 4) {
+                    // (4: no gap between them, which a reader of the
+                    // whole table would take for its terminator; every
+                    // entry is 4-aligned and their fields 4 bytes)
+                    s.align = 4;
+                }
                 cur = put_sec(oi, k, cur);
+            }
+        }
+        if (cls == C_CONST) and (pass == 4) and eh_together {
+            eh_hi = cur;
+            if eh_hi > eh_lo {
+                cur += 4;  // (the terminator: the output is zeros where nothing is placed)
+            } else {
+                eh_lo = eh_hi;
             }
         }
     }

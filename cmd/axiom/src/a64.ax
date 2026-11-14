@@ -134,7 +134,7 @@ let mut out_area: u64 = 0;  // outgoing stack-argument bytes
 // call frame states (recorded for every function there, with or without
 // -g), and the ends of the function's sibling calls' jumps
 let mut MACOS_: bool = false;
-let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: false, cu: -1, eh: -1,
+let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: false, elf: false, cu: -1, eh: -1,
                               cies: [0; 4] };
 let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut dyn_frame: bool = false;  // sp moves after the prologue (DYNSTACK): the slots are addressed from x29
@@ -4983,7 +4983,7 @@ pub const CFI_NONE: u64 = 7;
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
-    if not DBG.on and not MACOS_ {
+    if not DBG.on and not MU.on {
         return;
     }
     let pc = here();
@@ -5781,6 +5781,9 @@ fn encode_func(f: *mut ir.Func) void {
     s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     if MACOS_ {
         mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size);
+    } else if MU.on {
+        elf_unwind(base, s.size);
+        s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     }
     if WIN_ and (rows.len > 0) {
         wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
@@ -5887,6 +5890,22 @@ fn mac_unwind(fs: u32, size: u64) void {
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, true, &df);
     mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
+    prog.free();
+}
+
+// Linux: the function's FDE in .eh_frame (macunwind.ax), its code at `base`
+// of section TEXT (by the section's symbol: see there), from the same call
+// frame states as its .debug_frame FDE.
+fn elf_unwind(base: u64, size: u64) void {
+    let mut regs: [20]u64 = [0; 20];
+    let n = save_list(&mut regs);
+    let df = dw.Func.{ xcfi: xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, true, &df);
+    mu.add(&mut MU, elf.sec_sym(OBJ, TEXT), base, size, 0, prog.view(), false, false);
     prog.free();
 }
 
@@ -6012,6 +6031,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
                                                ty: elf.T_NOTYPE, hidden: false, protected: false });
     }
     MU = mu.begin(MACOS_, OBJ, false);
+    if tg.g_os == tg.OS_LINUX {
+        MU = mu.begin_elf(true, OBJ, false);
+    }
     let relro = is.add_symbols(OBJ, m, TEXT, RODATA, elf.R_AARCH64_ABS64, &mut fsym, &mut gsym);
     // file-scope asm (the C front end's GNU dialects): its sections and symbols
     for b in ai.toplevel.items() {

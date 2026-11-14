@@ -2258,6 +2258,7 @@ fn lay_out(ds: *DynStr) Layout {
     if ehh_max > 0 {
         ehh_addr = nl.align_up(image_base + rela_off + rela_size, 4);
     }
+    nl.eh_together = true;
     let ro_end = nl.place(nl.C_CONST, nl.align_up(image_base + rela_off + rela_size, 4) + ehh_size);
     segs[0].filesz = ro_end - image_base;
     segs[0].memsz = segs[0].filesz;
@@ -2779,6 +2780,24 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
     tail.put(st.syms.view());
     let str_off = @as(u64, tail.len());
     tail.put(st.strs.view());
+    // (the call frame information and its index, for the tools that find
+    // them by their section headers: debuggers, profilers)
+    let mut ehs: [2][10]u64 = [[0; 10], [0; 10]];
+    let mut neh: usize = 0;
+    if ly.ehh_addr != 0 {
+        ehs[neh] = [@as(u64, shs.len()), 1, 2, ly.ehh_addr, file_of(ly.ehh_addr), 12 + (ly.ehh_max * 8), 0, 0, 4, 0];
+        neh += 1;
+        shs.put(".eh_frame_hdr\x00");
+    }
+    if nl.eh_hi > nl.eh_lo {
+        let mut ty: u64 = 1;
+        if M == elf.EM_X86_64 {
+            ty = 0x7000_0001;  // SHT_X86_64_UNWIND (the x86-64 psABI's type for it)
+        }
+        ehs[neh] = [@as(u64, shs.len()), ty, 2, nl.eh_lo, file_of(nl.eh_lo), (nl.eh_hi - nl.eh_lo) + 4, 0, 0, 8, 0];
+        neh += 1;
+        shs.put(".eh_frame\x00");
+    }
     let shs_off = @as(u64, tail.len());
     tail.put(shs.view());
     let sh_off = nl.align_up(@as(u64, tail.len()), 8);
@@ -2800,9 +2819,14 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
         [61, 11, 2, image_base + ly.dynsym_off, ly.dynsym_off, ly.nsyms * 24, 10, 1, 8, 24],
         [69, 3, 2, image_base + ly.dynstr_off, ly.dynstr_off, ly.dynstr_size, 0, 0, 1, 0],
     ];
-    let nsh = 11 + @as(u64, dbg.len);
-    for k in @as(usize, 0)..11 {
-        let x = shdr[k];
+    let nsh = 11 + @as(u64, neh) + @as(u64, dbg.len);
+    for k in @as(usize, 0)..(11 + neh) {
+        let mut x = ehs[0];
+        if k < 11 {
+            x = shdr[k];
+        } else {
+            x = ehs[k - 11];
+        }
         tail.u32_(x[0]);
         tail.u32_(x[1]);
         tail.u64_(x[2]);
