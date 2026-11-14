@@ -274,7 +274,12 @@ struct Job {
     features: u64,
     ok: bool,
     diags: []u8,  // its diagnostics when it failed (u.keep_dup), or a nil slice
+    done: u32,    // 1 once the rest is set
 }
+
+// The jobs of this build that are done (Job.done), for the main thread to
+// wait on.
+let mut jobs_done: u32 = 0;
 
 // On a worker thread: compiles one module to its object, written to a
 // temporary file first.
@@ -297,6 +302,9 @@ fn run_job(j: *mut Job) void {
         j.ok = false;
     }
     u.worker_end();
+    @atomic_store(&mut j.done, 1);
+    _ = @atomic_add(&mut jobs_done, 1);
+    _ = @atomic_notify(&jobs_done, 0xFFFF_FFFF);
 }
 
 // Compiles every module whose object is not cached, then the link unit into
@@ -330,8 +338,8 @@ pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8]
             todo.push(un);
         }
     }
-    // Compile what is missing, a few at a time (waiting for the oldest,
-    // so that diagnostics come in the modules' order).
+    // Compile what is missing, `width` at a time; the results are taken in
+    // the modules' order, so that diagnostics come in that order.
     let width = @min(u.jobs(), 16);
     let jobs = u.newn.[Job](todo.len + 1);
     if todo.len > 0 {
@@ -339,14 +347,16 @@ pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8]
         let ts = ty.worker_start();
         for i in 0..todo.len {
             jobs[i] = Job.{ base: base, un: todo.get(i), us: us, ts: ts, features: tg.g_features, ok: false,
-                            diags: u.nosym() };
+                            diags: u.nosym(), done: 0 };
         }
     }
+    @atomic_store(&mut jobs_done, 0);
     let mut running = u.List.[thread.Thread.[*mut Job]].empty();
-    let mut first: usize = 0;  // the oldest still running
+    let mut taken: usize = 0;  // the jobs whose results have been taken
     let mut failed = false;
-    while (running.len < todo.len) or (first < running.len) {
-        while not failed and ((running.len - first) < width) and (running.len < todo.len) {
+    loop {
+        let done = @atomic_load(&jobs_done);
+        while not failed and (running.len < todo.len) and ((running.len - @as(usize, done)) < width) {
             let t = thread.spawn(run_job, &mut jobs[running.len]) catch {
                 if running.len == 0 {
                     return -1;
@@ -356,19 +366,22 @@ pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8]
             };
             running.push(t);
         }
-        if first == running.len {
+        while (taken < running.len) and (@atomic_load(&jobs[taken].done) == 1) {
+            running.get(taken).join();
+            let j = &mut jobs[taken];
+            if not j.ok {
+                failed = true;
+                if not u.isnos(j.diags) {
+                    dg.load(j.diags);
+                    u.free_heap(j.diags);
+                }
+            }
+            taken += 1;
+        }
+        if (taken == running.len) and (failed or (taken == todo.len)) {
             break;
         }
-        running.get(first).join();
-        let j = &mut jobs[first];
-        if not j.ok {
-            failed = true;
-            if not u.isnos(j.diags) {
-                dg.load(j.diags);
-                u.free_heap(j.diags);
-            }
-        }
-        first += 1;
+        _ = @atomic_wait(&jobs_done, done, -1);
     }
     stats.total = n;
     stats.compiled = todo.len;
