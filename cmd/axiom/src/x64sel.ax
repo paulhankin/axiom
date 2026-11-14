@@ -1,0 +1,1193 @@
+// =============================================================================
+// x64sel.ax - x86-64 instruction selection's state and emission helpers:
+// the selector's per-function State (S), adding machine instructions to the
+// current block, symbols and constants, and the values' registers (reg,
+// vreg, the block's address, constant and rematerialization caches). The
+// phases of the selection (x64isel.ax, x64simd.ax, x64abi.ax) and its
+// driver (x64.ax) build on these.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "mach.ax" as mc;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "x64caps.ax" as x64c;
+import "x64ctx.ax" as xc;
+import "x64enc.ax" as xe;
+
+pub const GPR: u8 = 0;
+pub const XMM: u8 = 1;
+pub const YMM: u8 = 2;  // 256-bit vectors (the same registers as XMM)
+pub const ZMM: u8 = 3;  // 512-bit vectors
+
+// Instruction selection's own state
+struct State {
+    vl: u8,  // the vector width of the instruction being selected: 0 (128 bits), 32 or 64 bytes
+    cb: *mut mc.MBlock,
+    ib: *mut ir.Block,  // the IR block being selected
+    nlocal: i32,
+    addr_regs: u.List.[AddrReg],  // addresses in registers in the block addr_block
+    addr_block: *mut mc.MBlock,
+    imm_regs: u.List.[ImmReg],  // constants in registers in the block
+    rinfo: u.List.[Remat],      // rematerializable values (def.aux >> 32 indexes them)
+    ccache: u.List.[CEnt],      // loads from the constant pool the block can reuse
+    call_results: u.List.[CallResult],
+    tail_jumped: bool,      // (gen_term: the block's return was the jump)
+    asm_count: i32,         // numbers the inline asm statements (MInst.cc)
+    pcache: u.List.[CEnt],  // halves of vectors extracted in the block
+}
+
+pub threadlocal let mut S: State = State.{ vl: 0, cb: @ptr_from_int(*mut mc.MBlock, 0),
+                                           ib: @ptr_from_int(*mut ir.Block, 0), nlocal: 0,
+                                           addr_regs: u.List.[AddrReg].{
+                                               data: @ptr_from_int(*mut AddrReg, 0), len: 0, cap: 0 },
+                                           addr_block: @ptr_from_int(*mut mc.MBlock, 0),
+                                           imm_regs: u.List.[ImmReg].{ data: @ptr_from_int(*mut ImmReg, 0), len: 0,
+                                                                       cap: 0 },
+                                           rinfo: u.List.[Remat].{ data: @ptr_from_int(*mut Remat, 0), len: 0, cap: 0 },
+                                           ccache: u.List.[CEnt].{ data: @ptr_from_int(*mut CEnt, 0), len: 0, cap: 0 },
+                                           call_results: u.List.[CallResult].{
+                                               data: @ptr_from_int(*mut CallResult, 0), len: 0, cap: 0 },
+                                           tail_jumped: false, asm_count: 0,
+                                           pcache: u.List.[CEnt].{ data: @ptr_from_int(*mut CEnt, 0), len: 0,
+                                                                   cap: 0 } };
+
+// -----------------------------------------------------------------------------
+// Emission helpers
+// -----------------------------------------------------------------------------
+pub fn emit(op: i32, sz: u8, ops: []mc.MOp) *mut mc.MInst {
+    let i = mc.new_inst(op, sz, ops);
+    mc.append(S.cb, i);
+    return i;
+}
+
+pub fn e0(op: i32, sz: u8) *mut mc.MInst {
+    return emit(op, sz, @slice_from_ptr(u.nil.[mc.MOp](), 0));
+}
+
+pub fn e1(op: i32, sz: u8, a: mc.MOp) *mut mc.MInst {
+    let ops: [1]mc.MOp = [a];
+    return emit(op, sz, ops[..]);
+}
+
+pub fn e2(op: i32, sz: u8, a: mc.MOp, b: mc.MOp) *mut mc.MInst {
+    let ops: [2]mc.MOp = [a, b];
+    return emit(op, sz, ops[..]);
+}
+
+pub fn e3(op: i32, sz: u8, a: mc.MOp, b: mc.MOp, c: mc.MOp) *mut mc.MInst {
+    let ops: [3]mc.MOp = [a, b, c];
+    return emit(op, sz, ops[..]);
+}
+
+pub fn e4(op: i32, sz: u8, a: mc.MOp, b: mc.MOp, c: mc.MOp, d: mc.MOp) *mut mc.MInst {
+    let ops: [4]mc.MOp = [a, b, c, d];
+    return emit(op, sz, ops[..]);
+}
+
+pub fn R(r: i32) mc.MOp {
+    return mc.reg(r, mc.RU);
+}
+
+pub fn W(r: i32) mc.MOp {
+    return mc.reg(r, mc.RD);
+}
+
+pub fn RW(r: i32) mc.MOp {
+    return mc.reg(r, mc.RUD);
+}
+
+pub fn I(x: i64) mc.MOp {
+    return mc.imm(x);
+}
+
+pub fn NONE() mc.MOp {
+    return mc.none();
+}
+
+pub fn vgpr() i32 {
+    return mc.new_vreg(xc.FN.mf, GPR);
+}
+
+// A vector register for a value of the width being selected.
+pub fn vxmm() i32 {
+    return mc.new_vreg(xc.FN.mf, vclass());
+}
+
+pub fn vclass() u8 {
+    if S.vl == 32 {
+        return YMM;
+    }
+    if S.vl == 64 {
+        return ZMM;
+    }
+    return XMM;
+}
+
+pub fn class_of(t: *ir.Ty) u8 {
+    if t.kind == ir.T_VEC {
+        if t.size == 32 {
+            return YMM;
+        }
+        if t.size == 64 {
+            return ZMM;
+        }
+        return XMM;
+    }
+    if t.kind == ir.T_FLOAT {
+        return XMM;
+    }
+    return GPR;
+}
+
+// The vector width (VL) of a type: 0 up to 128 bits, else its bytes.
+pub fn vl_of(t: *ir.Ty) u8 {
+    if (t.kind == ir.T_VEC) and (t.size > 16) {
+        return @truncate(u8, t.size);
+    }
+    return 0;
+}
+
+pub fn class_bytes(c: u8) u8 {
+    if c == YMM {
+        return 32;
+    }
+    if c == ZMM {
+        return 64;
+    }
+    return 0;
+}
+
+// A vector instruction at the current width (VEX.L or EVEX for wide ones).
+pub fn vlz(i: *mut mc.MInst) *mut mc.MInst {
+    if (S.vl > 0) and xe.desc(i.cc).vl_ok {
+        i.sz = S.vl;
+    }
+    return i;
+}
+
+pub fn isz(t: *ir.Ty) u8 {
+    if (t.kind == ir.T_PTR) or ((t.kind == ir.T_INT) and (t.bits > 32)) {
+        return 8;
+    }
+    return 4;
+}
+
+pub fn copy(d: i32, s: i32, class: u8) void {
+    if d == s {
+        return;
+    }
+    if class == GPR {
+        let i = e2(xe.MOV_RR, 8, W(d), R(s));
+        i.is_move = true;
+    } else {
+        let i = sse2(xe.MOVAPS, W(d), R(s));
+        i.sz = class_bytes(class);
+        i.is_move = true;
+    }
+    mc.hint(xc.FN.mf, d, s);
+    mc.hint(xc.FN.mf, s, d);
+}
+
+// a op= b, an ALU operation (xe.ALU_ADD ...): sz 1, 2, 4 or 8 bytes.
+pub fn alu(op: i32, sz: u8, a: mc.MOp, b: mc.MOp) *mut mc.MInst {
+    let i = e2(xe.ALU, sz, a, b);
+    i.cc = op;
+    return i;
+}
+
+// An SSE instruction (descriptor id) at width sz: operands as xe.SSE.
+pub fn sse4(id: i32, sz: u8, a: mc.MOp, b: mc.MOp, c: mc.MOp, d: mc.MOp) *mut mc.MInst {
+    let i = e4(xe.SSE, sz, a, b, c, d);
+    i.cc = id;
+    return i;
+}
+
+pub fn sse2(id: i32, a: mc.MOp, b: mc.MOp) *mut mc.MInst {
+    return vlz(sse4(id, 0, a, b, NONE(), NONE()));
+}
+
+pub fn sse_i(id: i32, a: mc.MOp, b: mc.MOp, x: i64) *mut mc.MInst {
+    return vlz(sse4(id, 0, a, b, NONE(), I(x)));
+}
+
+// d = a op b for a two-operand SSE instruction: VEX 3-operand with AVX,
+// otherwise a copy of a into d first.
+pub fn sse3(id: i32, d: i32, a: i32, b: mc.MOp) void {
+    if xc.FN.avx {
+        _ = vlz(sse4(id, 0, W(d), b, R(a), NONE()));
+        return;
+    }
+    // d = a; d op= b  (b must not be d: use a temporary if it is)
+    if (b.kind == mc.K_REG) and (b.reg == d) and (a != d) {
+        let t = vxmm();
+        copy(t, a, XMM);
+        _ = sse4(id, 0, RW(t), b, NONE(), NONE());
+        copy(d, t, XMM);
+        return;
+    }
+    copy(d, a, XMM);
+    _ = sse4(id, 0, RW(d), b, NONE(), NONE());
+}
+
+// d <- 0: pxor d, d, which does not read d (its operands besides the
+// destination have no role, so d is not live before it).
+pub fn vzero(d: i32) void {
+    let i = e4(xe.SSE, 0, W(d), mc.reg(d, 0), NONE(), NONE());
+    if xc.FN.avx {
+        i.ops[2] = mc.reg(d, 0);
+    }
+    i.cc = xe.PXOR;
+    _ = vlz(i);
+}
+
+pub fn sse3_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64) void {
+    if xc.FN.avx {
+        _ = vlz(sse4(id, 0, W(d), b, R(a), I(x)));
+        return;
+    }
+    copy(d, a, XMM);
+    _ = sse4(id, 0, RW(d), b, NONE(), I(x));
+}
+
+// A local label within the current block.
+pub fn new_label() i32 {
+    S.nlocal += 1;
+    return xe.LOCAL_BASE + S.nlocal;
+}
+
+pub fn place(l: i32) void {
+    S.addr_regs.clear();
+    S.imm_regs.clear();
+    S.ccache.clear();  // (reached by jumps: what the block built so far may not have been)
+    S.pcache.clear();
+    let i = e0(xe.LABEL, 0);
+    i.aux = @as(i64, l);
+}
+
+pub fn jcc(cc: i32, l: i32) void {
+    let i = e1(xe.JCC, 0, mc.label(l));
+    i.cc = cc;
+}
+
+pub fn jmp(l: i32) void {
+    _ = e1(xe.JMP, 0, mc.label(l));
+}
+
+// -----------------------------------------------------------------------------
+// Symbols and constants
+// -----------------------------------------------------------------------------
+pub fn func_sym(f: *ir.Func) i32 {
+    return @as(i32, @bit_cast(i32, is.fsym_at(xc.O.obj, &mut xc.O.fsym, f)));
+}
+
+pub fn global_sym(g: *ir.Global) i32 {
+    return @as(i32, @bit_cast(i32, is.gsym_at(xc.O.obj, &mut xc.O.gsym, g)));
+}
+
+// A 16-byte constant in the constant pool (rodata), as a memory operand.
+// (As wide as the instruction being selected: the 16 bytes repeated.)
+pub fn const16(lo: u64, hi: u64) mc.MOp {
+    let mut n: u64 = 16;
+    if S.vl > 16 {
+        n = @as(u64, S.vl);
+    }
+    let key = u.intern(u.f3("%s:%s:%s", u.hex16(lo), u.hex16(hi), u.udec(n)));
+    let found = xc.O.consts.get(key);
+    if found != 0 {
+        return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
+    }
+    let s = xc.O.obj.secs.get(@int_cast(usize, xc.O.rodata));
+    s.data.align(@truncate(usize, n));
+    let off = @as(u64, s.data.len());
+    for _k in @as(u64, 0)..(n / 16) {
+        s.data.u64_(lo);
+        s.data.u64_(hi);
+    }
+    if n > s.align {
+        s.align = n;
+    }
+    let sym = elf.add_sym(xc.O.obj, elf.Sym.{ name: ".LC", sec: xc.O.rodata, value: off, size: n, bind: elf.B_LOCAL,
+                                              ty: elf.T_OBJECT, hidden: false, protected: false });
+    xc.O.consts.put(key, sym + 1);
+    return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
+}
+
+// A constant of `bytes` bytes (16, 32 or 64) from the pool.
+pub fn const_bytes(b: *bn.Bytes, n: usize) mc.MOp {
+    let mut kb = u.Buf.init();
+    for k in 0..(n / 8) {
+        kb.s(u.hex16(b.get_u64(k * 8)));
+    }
+    let key = u.intern(kb.done());
+    let found = xc.O.consts.get(key);
+    if found != 0 {
+        return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
+    }
+    let s = xc.O.obj.secs.get(@int_cast(usize, xc.O.rodata));
+    s.data.align(n);
+    let off = @as(u64, s.data.len());
+    for k in 0..(n / 8) {
+        s.data.u64_(b.get_u64(k * 8));
+    }
+    if @as(u64, n) > s.align {
+        s.align = @as(u64, n);
+    }
+    let sym = elf.add_sym(xc.O.obj, elf.Sym.{ name: ".LC", sec: xc.O.rodata, value: off, size: @as(u64, n),
+                                              bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false, protected: false });
+    xc.O.consts.put(key, sym + 1);
+    return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
+}
+
+// -----------------------------------------------------------------------------
+// Values
+// -----------------------------------------------------------------------------
+// The value as a 32-bit immediate, when it is an integer constant that fits.
+pub fn imm_ok(v: *ir.Value) bool {
+    return is.is_c(v) and is.fits32(is.cval(v));
+}
+
+pub fn vreg(v: *mut ir.Value) i32 {
+    if v.loc < 0 {
+        v.loc = mc.new_vreg(xc.FN.mf, class_of(v.ty));
+        if v.ty.kind == ir.T_FLOAT {
+            // (a scalar: spilled as 8 bytes, spill_store; a 4-byte one too)
+            mc.set_bytes(xc.FN.mf, v.loc, @truncate(u8, @max(v.ty.size, 8)));
+        }
+    }
+    return v.loc;
+}
+
+// A register holding v (materializing constants and addresses here).
+pub fn reg(v: *mut ir.Value) i32 {
+    let k = v.kind;
+    if (k == ir.V_INST) and ((v.op == ir.OP_ALLOCA) or ((v.flag & 1) != 0)) {
+        // folded into memory operands where it is used; recomputed here
+        let r = vgpr();
+        let mut m = addr(v);
+        if m.slot == -3 {
+            // lea ignores segments: the thread pointer is the base
+            m.base = tls_base();
+            m.slot = -2;
+        }
+        _ = e2(xe.LEA, 8, W(r), m);
+        return r;
+    }
+    if (k == ir.V_INST) or (k == ir.V_PARAM) {
+        return vreg(v);
+    }
+    let t = v.ty;
+    if (k == ir.V_GLOBAL) {
+        let r = vgpr();
+        let g = ir.gv_of(v);
+        if g.tls and tg.g_pic and not xc.O.win and not xc.O.macos {
+            return ie_addr(global_sym(g));
+        }
+        if g.tls and tg.platform_tls() {
+            _ = e2(xe.TLSBASE, 8, W(r), mc.mem_sym(global_sym(g), 0));  // (from its descriptor)
+            return r;
+        }
+        if g.tls {
+            let tb = tls_base();
+            let mut m = mc.mem(tb, -1, 0, 0);
+            m.sym = global_sym(g);
+            m.slot = -2;  // marks a TLS offset
+            _ = e2(xe.LEA, 8, W(r), m);
+            return r;
+        }
+        let cached = cached_addr(@ptr_cast(*void, g));
+        if cached >= 0 {
+            return cached;
+        }
+        if is.extern_global(g) {
+            // possibly in a shared library: its address comes from the GOT
+            // (the linker turns this into a lea when it is not)
+            let mut m = mc.mem_sym(global_sym(g), 0);
+            m.scale = 99;
+            _ = e2(xe.LOAD, 8, W(r), m);
+        } else {
+            _ = e2(xe.LEA, 8, W(r), mc.mem_sym(global_sym(g), 0));
+        }
+        cache_addr(@ptr_cast(*void, g), r);
+        return r;
+    }
+    if k == ir.V_FUNC {
+        let r = vgpr();
+        let f = ir.fnp_of(v);
+        if ir.is_decl(f) or is.preemptible(f.linkage, f.visibility) {
+            // external or preemptible (is.preemptible): its address comes from the GOT
+            let mut m = mc.mem_sym(func_sym(f), 0);
+            m.scale = 99;  // GOT marker
+            _ = e2(xe.LOAD, 8, W(r), m);
+            return r;
+        }
+        _ = e2(xe.LEA, 8, W(r), mc.mem_sym(func_sym(f), 0));
+        return r;
+    }
+    if (t.kind == ir.T_VEC) or (class_of(t) == XMM) {
+        let outer_vl = S.vl;
+        S.vl = vl_of(t);  // (a constant as wide as its type, whatever the instruction using it)
+        let mut r: i32 = 0;
+        if ir.is_zero(v) or (k == ir.V_UNDEF) {
+            r = const_zero();
+        } else {
+            let mut b = bn.new_bytes();
+            is.const_le(v, &mut b, 0);
+            let mut n = @as(usize, S.vl);
+            if n == 0 {
+                n = 16;
+            }
+            while b.len() < n {
+                b.u8_(0);
+            }
+            if t.kind == ir.T_VEC {
+                r = const_vreg(xe.MOVDQU_LD, const_bytes(&b, n), 0, 0);
+            } else if t.bits == 32 {
+                r = const_vreg(xe.MOVSS_LD, const16(b.get_u64(0), 0), 0, 0);
+            } else {
+                r = const_vreg(xe.MOVSD_LD, const16(b.get_u64(0), 0), 0, 0);
+            }
+            b.free();
+        }
+        S.vl = outer_vl;
+        return r;
+    }
+    // integer / pointer constant
+    let r = vgpr();
+    let x = is.cval(v);
+    if (k == ir.V_UNDEF) or (k == ir.V_ZERO) {
+        _ = e2(xe.MOV_RI, 4, W(r), I(0));
+    } else if (x >= 0) and (x <= 0xffff_ffff) {
+        _ = e2(xe.MOV_RI, 4, W(r), I(x));
+    } else {
+        _ = e2(xe.MOV_RI, 8, W(r), I(x));
+    }
+    return r;
+}
+
+// The addresses of globals computed so far in the current machine block,
+// since its last label (which code after a conditional jump may reach
+// without them): later uses in the block take the same register.
+struct AddrReg {
+    key: *void,
+    r: i32,
+}
+
+// (And so are integer constants a cmov reads, which has no immediate form.)
+struct ImmReg {
+    x: i64,
+    r: i32,
+}
+
+fn same_block() void {
+    if S.addr_block != S.cb {
+        S.addr_regs.clear();
+        S.imm_regs.clear();
+        S.addr_block = S.cb;
+    }
+}
+
+fn cached_addr(key: *void) i32 {
+    same_block();
+    for k in 0..S.addr_regs.len {
+        let x = S.addr_regs.get(k);
+        if x.key == key {
+            return x.r;
+        }
+    }
+    return -1;
+}
+
+fn cache_addr(key: *void, r: i32) void {
+    S.addr_regs.push(AddrReg.{ key: key, r: r });
+}
+
+// A register holding integer constant v (reg), shared in the block.
+pub fn imm_reg(v: *mut ir.Value) i32 {
+    if v.kind != ir.V_CINT {
+        return reg(v);
+    }
+    same_block();
+    let x = is.cval(v);
+    for k in 0..S.imm_regs.len {
+        let c = S.imm_regs.get(k);
+        if c.x == x {
+            return c.r;
+        }
+    }
+    let r = reg(v);
+    S.imm_regs.push(ImmReg.{ x: x, r: r });
+    return r;
+}
+
+// A vector the selector computes again at each use instead of keeping it in
+// a register: a splat of a constant, or a load from a constant global (one
+// instruction each, from memory). The optimizer hoists those out of loops,
+// and a 512-bit function using many would otherwise hold them all through
+// its loops.
+pub fn remat(v: *ir.Value) bool {
+    if (v.kind != ir.V_INST) or (v.ty.kind != ir.T_VEC) {
+        return false;
+    }
+    if v.op == ir.OP_SPLAT {
+        let x = v.a;
+        return (x.kind == ir.V_CINT) or (x.kind == ir.V_CFP) or (x.kind == ir.V_ZERO);
+    }
+    if (v.op != ir.OP_LOAD) or (v.flags != 0) {
+        return false;
+    }
+    let mut p = v.a;
+    if ir.is_op(p, ir.OP_PTRADD) and imm_ok(p.b) {
+        p = p.a;
+    }
+    return (p.kind == ir.V_GLOBAL) and ir.gv_of(p).is_const and not ir.gv_of(p).tls and
+           not is.extern_global(ir.gv_of(p));
+}
+
+// Rematerialized values (mc.set_remat): what each one is, for the
+// instructions that read it from memory instead of a register.
+struct Remat {
+    full: mc.MOp,  // the value in memory (K_NONE: built without memory, or a splat's lane)
+    lane: u64,     // a splat: its lane's bits
+    lb: u8,        // and the lane's bytes (0: not a splat)
+    bytes: u8,     // the value's bytes (16, 32, 64; 4 or 8 for a float scalar)
+}
+
+// Constants built in the current block, up to a local label: (sym, op,
+// width, vreg), reused while their definition is on every path.
+pub struct CEnt {
+    sym: i32,
+    disp: i64,
+    op: i32,
+    sz: u8,
+    r: i32,
+}
+
+// (The definition's aux holds the entry's index + 1 above bit 32, and so do
+// the copies the allocator makes of it.)
+fn note_remat(r: i32, def: *mut mc.MInst, full: mc.MOp, lane: u64, lb: u8, bytes: u8) void {
+    mc.set_remat(xc.FN.mf, r, def);
+    S.rinfo.push(Remat.{ full: full, lane: lane, lb: lb, bytes: bytes });
+    def.aux = def.aux | (@as(i64, @int_cast(i64, S.rinfo.len)) << 32);
+}
+
+pub fn vbytes_now() u8 {
+    if S.vl == 0 {
+        return 16;
+    }
+    return S.vl;
+}
+
+fn const_cached(sym: i32, disp: i64, op: i32) i32 {
+    for k in 0..S.ccache.len {
+        let c = S.ccache.get(k);
+        if (c.sym == sym) and (c.disp == disp) and (c.op == op) and (c.sz == S.vl) {
+            return c.r;
+        }
+    }
+    return -1;
+}
+
+// A register holding the constant at m (loaded by op, at the current width).
+pub fn const_vreg(op: i32, m: mc.MOp, lane: u64, lb: u8) i32 {
+    let c = const_cached(m.sym, m.disp, op);
+    if c >= 0 {
+        return c;
+    }
+    return const_into(vxmm(), op, m, lane, lb);
+}
+
+fn const_into(r: i32, op: i32, m: mc.MOp, lane: u64, lb: u8) i32 {
+    let i = sse2(op, W(r), m);
+    let mut full = m;
+    let mut bytes = vbytes_now();
+    if (op == xe.MOVSS_LD) or (op == xe.MOVSD_LD) {
+        bytes = pick8(op == xe.MOVSS_LD, 4, 8);
+    }
+    if lb != 0 {
+        full = NONE();
+    }
+    note_remat(r, i, full, lane, lb, bytes);
+    S.ccache.push(CEnt.{ sym: m.sym, disp: m.disp, op: op, sz: S.vl, r: r });
+    return r;
+}
+
+fn pick8(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// Zero, or all ones, at the current width: built without memory.
+pub fn const_zero() i32 {
+    let c = const_cached(-1, 0, xe.PXOR);
+    if c >= 0 {
+        return c;
+    }
+    return zero_into(vxmm());
+}
+
+fn zero_into(r: i32) i32 {
+    vzero(r);
+    note_remat(r, S.cb.last, NONE(), 0, 0, vbytes_now());
+    S.ccache.push(CEnt.{ sym: -1, disp: 0, op: xe.PXOR, sz: S.vl, r: r });
+    return r;
+}
+
+fn ones_into(r: i32) i32 {
+    if S.vl == 64 {
+        let i = sse4(xe.VPTERNLOGD, 64, W(r), mc.reg(r, 0), mc.reg(r, 0), I(0xff));
+        note_remat(r, i, NONE(), 0, 0, 64);
+    } else {
+        let i = e4(xe.SSE, 0, W(r), mc.reg(r, 0), NONE(), NONE());
+        if xc.FN.avx {
+            i.ops[2] = mc.reg(r, 0);
+        }
+        i.cc = xe.PCMPEQD;
+        note_remat(r, vlz(i), NONE(), 0, 0, vbytes_now());
+    }
+    S.ccache.push(CEnt.{ sym: -1, disp: 0, op: xe.PCMPEQD, sz: S.vl, r: r });
+    return r;
+}
+
+// A constant of n (4 or 8) bytes in the pool.
+pub fn const_small(x: u64, n: usize) mc.MOp {
+    let key = u.intern(u.f2("%s:%s", u.hex16(x), u.udec(@as(u64, n))));
+    let found = xc.O.consts.get(key);
+    if found != 0 {
+        return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
+    }
+    let s = xc.O.obj.secs.get(@int_cast(usize, xc.O.rodata));
+    s.data.align(n);
+    let off = @as(u64, s.data.len());
+    if n == 4 {
+        s.data.u32_(x & 0xffff_ffff);
+    } else {
+        s.data.u64_(x);
+    }
+    if @as(u64, n) > s.align {
+        s.align = @as(u64, n);
+    }
+    let sym = elf.add_sym(xc.O.obj, elf.Sym.{ name: ".LC", sec: xc.O.rodata, value: off, size: @as(u64, n),
+                                              bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false, protected: false });
+    xc.O.consts.put(key, sym + 1);
+    return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
+}
+
+// lane (of lb bytes) repeated to n bytes, as a pool constant.
+pub fn splat_const(lane: u64, lb: u8, n: usize) mc.MOp {
+    let mut b = bn.new_bytes();
+    while b.len() < n {
+        for j in @as(usize, 0)..@as(usize, lb) {
+            b.u8_(@truncate(u8, lane >> @int_cast(u32, j * 8)));
+        }
+    }
+    let m = const_bytes(&b, n);
+    b.free();
+    return m;
+}
+
+// A rematerialized value (remat), at its definition: a register built
+// from memory, which the allocator builds again where it would spill it.
+pub fn gen_remat(v: *mut ir.Value) void {
+    if v.op == ir.OP_LOAD {
+        let d = vreg(v);
+        let m = addr(v.a);
+        let i = sse2(xe.MOVDQU_LD, W(d), m);
+        note_remat(d, i, m, 0, 0, vbytes_now());
+        return;
+    }
+    let lb = @truncate(u8, v.ty.elem.size);
+    let mut one = bn.new_bytes();
+    is.const_le(v.a, &mut one, 0);
+    let lv = one.view();
+    let mut lane: u64 = 0;
+    for j in @as(usize, 0)..@as(usize, lb) {
+        lane = lane | (@as(u64, lv[j]) << @int_cast(u32, j * 8));
+    }
+    one.free();
+    let mut op = xe.MOVDQU_LD;
+    let mut m = NONE();
+    if lane == 0 {
+        op = xe.PXOR;
+    } else if ((lb < 8) and (lane == ((@as(u64, 1) << @int_cast(u32, lb * 8)) - 1))) or
+              (lane == 0xffff_ffff_ffff_ffff) {
+        op = xe.PCMPEQD;
+    } else if ((lb == 4) or (lb == 8)) and tg.has(tg.X_AVX2) {
+        op = pki(lb == 4, xe.VPBROADCASTD, xe.VPBROADCASTQ);
+        m = const_small(lane, @as(usize, lb));
+    } else {
+        m = splat_const(lane, lb, @as(usize, vbytes_now()));
+    }
+    let c = const_cached(m.sym, m.disp, op);
+    if (c >= 0) and (v.loc < 0) {
+        v.loc = c;  // (the same constant built earlier in the block)
+        return;
+    }
+    if c >= 0 {
+        copy(v.loc, c, vclass());
+        return;
+    }
+    let d = vreg(v);
+    if op == xe.PXOR {
+        _ = zero_into(d);
+    } else if op == xe.PCMPEQD {
+        _ = ones_into(d);
+    } else {
+        _ = const_into(d, op, m, lane, lb);
+    }
+}
+
+// The second source of a vector instruction (its r/m operand): memory for
+// a load folded into its only user (flag 8, with VEX or EVEX, which take
+// unaligned memory), else a register (constants: fold_remats).
+pub fn vsrc(x: *mut ir.Value) mc.MOp {
+    if xc.FN.avx and (x.ty.kind == ir.T_VEC) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
+        return addr(x.a);
+    }
+    // (a scalar's memory operand takes any alignment, with or without VEX)
+    if (x.ty.kind == ir.T_FLOAT) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
+        return addr(x.a);
+    }
+    return R(reg(x));
+}
+
+// A memory operand for address p.
+pub fn addr(p: *mut ir.Value) mc.MOp {
+    if ir.is_op(p, ir.OP_ALLOCA) {
+        return mc.mem_slot(@truncate(i32, p.aux), 0);
+    }
+    if ir.is_op(p, ir.OP_PTRADD) {
+        let off = p.b;
+        if imm_ok(off) {
+            let mut m = addr(p.a);
+            let nd = m.disp + is.cval(off);
+            if is.fits32(nd) and (m.scale != 99) and (m.slot != -2) {
+                m.disp = nd;
+                return m;
+            }
+        }
+        // base + index * scale
+        if ((p.flag & 1) != 0) and tls_global(p.a) {
+            let mut m = tls_mem(p.a);
+            if ir.is_op(off, ir.OP_MUL) and is.is_c(off.b) {
+                let s = is.cval(off.b);
+                if (s == 1) or (s == 2) or (s == 4) or (s == 8) {
+                    m.index = reg(off.a);
+                    m.scale = @truncate(u8, @bit_cast(u64, s));
+                    return m;
+                }
+            }
+            m.index = reg(off);
+            m.scale = 1;
+            return m;
+        }
+        if (p.flag & 1) != 0 {
+            return index_mem(p);
+        }
+    }
+    if (p.kind == ir.V_GLOBAL) and not ir.gv_of(p).tls and not is.extern_global(ir.gv_of(p)) {
+        return mc.mem_sym(global_sym(ir.gv_of(p)), 0);
+    }
+    if tls_global(p) {
+        return tls_mem(p);
+    }
+    return mc.mem(reg(p), -1, 0, 0);
+}
+
+// [base + disp + index*scale] for ptradd p with a variable offset: a
+// constant offset of the base, or of the index, goes into the displacement.
+pub fn index_mem(p: *mut ir.Value) mc.MOp {
+    let mut off = p.b;
+    let mut m = base_mem(p.a);
+    // a constant added last (combine puts constants outermost): into the
+    // displacement, then the scale of what is left
+    if ir.is_op(off, ir.OP_ADD) and imm_ok(off.b) and (off.ty.bits == 64) and not folded_load(off.a) and
+       (is.cval(off.b) > -0x1000_0000) and (is.cval(off.b) < 0x1000_0000) and is.fits32(m.disp + is.cval(off.b)) {
+        m.disp = m.disp + is.cval(off.b);
+        off = off.a;
+    }
+    let mut x = off;
+    let mut s: i64 = 1;
+    if ir.is_op(off, ir.OP_MUL) and is.is_c(off.b) {
+        let k = is.cval(off.b);
+        if (k == 1) or (k == 2) or (k == 4) or (k == 8) {
+            x = off.a;
+            s = k;
+        }
+    } else if ir.is_op(off, ir.OP_SHL) and is.is_c(off.b) and (is.cval(off.b) >= 0) and (is.cval(off.b) <= 3) {
+        x = off.a;
+        s = @as(i64, 1) << @int_cast(u32, is.cval(off.b));
+    }
+    if ir.is_op(x, ir.OP_ADD) and imm_ok(x.b) and (x.ty.bits == 64) and not folded_load(x.a) {
+        let nd = m.disp + (is.cval(x.b) * s);
+        if is.fits32(nd) and (is.cval(x.b) > -0x1000_0000) and (is.cval(x.b) < 0x1000_0000) {
+            m.disp = nd;
+            x = x.a;
+        }
+    }
+    m.index = reg(x);
+    m.scale = @truncate(u8, @bit_cast(u64, s));
+    return m;
+}
+
+// The base of an indexed memory operand: a register, a stack slot or a
+// register plus a constant (folded address arithmetic), with no index.
+fn base_mem(q: *mut ir.Value) mc.MOp {
+    if ir.is_op(q, ir.OP_ALLOCA) {
+        return mc.mem_slot(@truncate(i32, q.aux), 0);
+    }
+    if ir.is_op(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and imm_ok(q.b) {
+        let mut m = base_mem(q.a);
+        let nd = m.disp + is.cval(q.b);
+        if is.fits32(nd) {
+            m.disp = nd;
+            return m;
+        }
+    }
+    if tls_global(q) and not xc.O.win and not xc.O.macos {
+        // (fs-relative, with no base register: the thread pointer is not
+        // loaded for each access)
+        return tls_mem(q);
+    }
+    return mc.mem(reg(q), -1, 0, 0);
+}
+
+pub fn tls_global(p: *ir.Value) bool {
+    return (p.kind == ir.V_GLOBAL) and ir.gv_of(p).tls;
+}
+
+// %fs:[sym@tpoff] (local-exec: the executable holds all thread-local data).
+// On Windows and macOS, [block + sym@tpoff], where the linker makes tpoff
+// the offset in the thread's block (mlink.ax, plink.ax).
+fn tls_mem(p: *ir.Value) mc.MOp {
+    if tg.g_pic and not xc.O.win and not xc.O.macos {
+        return mc.mem(ie_addr(global_sym(ir.gv_of(p))), -1, 0, 0);
+    }
+    if tg.platform_tls() {
+        // (macOS, --macos-tls=platform: the address from the variable's
+        // descriptor, x64emit.ax TLSBASE)
+        let r = vgpr();
+        _ = e2(xe.TLSBASE, 8, W(r), mc.mem_sym(global_sym(ir.gv_of(p)), 0));
+        return mc.mem(r, -1, 0, 0);
+    }
+    if xc.O.win or xc.O.macos {
+        let mut m = mc.mem(tls_base(), -1, 0, 0);
+        m.sym = global_sym(ir.gv_of(p));
+        m.slot = -2;
+        return m;
+    }
+    let mut m = mc.mem(-1, -1, 0, 0);
+    m.sym = global_sym(ir.gv_of(p));
+    m.slot = -3;
+    return m;
+}
+
+// A register holding thread-local sym's address in the initial-exec model
+// (tg.g_pic): the thread pointer plus the offset that sym's GOT slot holds
+// (R_X86_64_GOTTPOFF).
+fn ie_addr(sym: i32) i32 {
+    let off = vgpr();
+    let mut m = mc.mem_sym(sym, 0);
+    m.slot = -4;
+    _ = e2(xe.LOAD, 8, W(off), m);
+    let r = vgpr();
+    _ = e1(xe.TLSBASE, 8, W(r));
+    _ = e2(xe.LEA, 8, W(r), mc.mem(r, off, 1, 0));
+    return r;
+}
+
+// A register holding the thread-local base: the thread pointer (fs:0), or
+// on Windows this thread's block for the image, which is
+// TEB.ThreadLocalStoragePointer[_tls_index] (gs:[0x58]; the linker supplies
+// the index variable as axiom.tls_index), or on macOS the block whose
+// address is in the TSD slot of the runtime's pthread key (gs addresses the
+// slots; axiom.tls_key, which the runtime sets, holds the slot's byte
+// offset: std/internal/runtime/darwin.ax).
+pub fn tls_base() i32 {
+    let r = vgpr();
+    if xc.O.macos {
+        if xc.O.tls_key_si < 0 {
+            xc.O.tls_key_si = @bit_cast(i32, elf.ext_sym(xc.O.obj, "axiom.tls_key", false));
+        }
+        let k = vgpr();
+        _ = e2(xe.LOAD, 8, W(k), mc.mem_sym(xc.O.tls_key_si, 0));
+        _ = e2(xe.TLSBASE, 8, W(r), R(k));
+        return r;
+    }
+    if not xc.O.win {
+        _ = e1(xe.TLSBASE, 8, W(r));
+        return r;
+    }
+    if xc.O.tls_index_si < 0 {
+        xc.O.tls_index_si = @bit_cast(i32, elf.ext_sym(xc.O.obj, "axiom.tls_index", false));
+    }
+    let idx = vgpr();
+    _ = e2(xe.LOAD, 4, W(idx), mc.mem_sym(xc.O.tls_index_si, 0));
+    let arr = vgpr();
+    _ = e1(xe.TLSBASE, 8, W(arr));
+    _ = e2(xe.LOAD, 8, W(r), mc.mem(arr, idx, 8, 0));
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Helpers that the phases share
+// -----------------------------------------------------------------------------
+pub fn ext_kind(bits: i32, sign: bool) i32 {
+    if bits == 8 {
+        if sign {
+            return 3;
+        }
+        return 1;
+    }
+    if bits == 16 {
+        if sign {
+            return 4;
+        }
+        return 2;
+    }
+    if bits == 32 {
+        if sign {
+            return 5;
+        }
+        return 6;
+    }
+    return 0;
+}
+
+// A load computed by the instruction that uses it (a memory operand).
+pub fn folded_load(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_LOAD) and ((v.flag & 8) != 0);
+}
+
+pub fn setcc(d: i32, cc: i32) void {
+    let i = e1(xe.SETCC, 1, W(d));
+    i.cc = cc;
+}
+
+// d (32-bit, 0/1) = condition
+pub fn materialize_cc(d: i32, cc: i32) void {
+    if cc >= 0 {
+        setcc(d, cc);
+    } else if cc == -1 {
+        let t = vgpr();
+        setcc(d, xe.CC_E);
+        setcc(t, xe.CC_NP);
+        _ = alu(xe.ALU_AND, 1, RW(d), R(t));
+    } else {
+        let t = vgpr();
+        setcc(d, xe.CC_NE);
+        setcc(t, xe.CC_P);
+        _ = alu(xe.ALU_OR, 1, RW(d), R(t));
+    }
+    let z = e2(xe.EXT, 4, W(d), R(d));
+    z.cc = 1;
+}
+
+pub const F_ANDN: i32 = 131072;      // a `not` that its only user, an `and`, computes as andn (BMI1) or pandn
+pub const F_BCST: i32 = 524288;      // a splat of a load that its only user, an @fma, reads as an embedded broadcast
+pub const F_FMNEG: i32 = 134217728;  // a negation that its only user, a scalar @fma, computes (vfmsub, vfnmadd)
+// Is v an @any / @all of a vector of 16 or 32 bytes, which ptest decides
+// (SSE4.1): then a branch or select on it can jump on ptest's flags.
+pub fn ptest_cond(v: *ir.Value) bool {
+    if (v.kind != ir.V_INST) or (v.op != ir.OP_INTR) or (v.xs.len != 1) or not x64c.has41() {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (id != ir.IN_ANYTRUE) and (id != ir.IN_ALLTRUE) {
+        return false;
+    }
+    let at = v.xs.get(0).ty;
+    if at.kind != ir.T_VEC {
+        return false;
+    }
+    return (at.size == 16) or ((at.size == 32) and xc.FN.avx) or ((at.size == 64) and x64c.avx512_for(64));
+}
+
+// ptest for ptest_cond(v): the condition code that is true when v is.
+pub fn ptest_cc(v: *mut ir.Value) i32 {
+    let a0 = v.xs.get(0);
+    let at = a0.ty;
+    let outer_vl = S.vl;
+    S.vl = vl_of(at);
+    let a = reg(a0);
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    let mut cc = xe.CC_NE;  // some bit set
+    let mut x = a;
+    if at.size == 64 {
+        // AVX-512: the lanes not zero (or zero) into k1, then kortest
+        let k = lk(at);
+        let mut op = xe.VPTESTMQ;
+        if id == ir.IN_ALLTRUE {
+            op = xe.VPTESTNMB + k;
+            cc = xe.CC_E;  // no lane zero
+        }
+        _ = sse4(op, 64, W(xe.K1), R(a), R(a), NONE());
+        _ = sse4(xe.KORTESTQ, 8, R(xe.K1), R(xe.K1), NONE(), NONE());
+        S.vl = outer_vl;
+        return cc;
+    }
+    if id == ir.IN_ALLTRUE {
+        // no lane equal to zero
+        let k = lk(at);
+        let z = vxmm();
+        vzero(z);
+        x = vxmm();
+        if k == 3 {
+            sse3(xe.PCMPEQQ, x, a, R(z));
+        } else {
+            sse3(xe.PCMPEQB + k, x, a, R(z));
+        }
+        cc = xe.CC_E;
+    }
+    let t = sse2(xe.PTEST, R(x), R(x));
+    t.sz = S.vl;
+    S.vl = outer_vl;
+    return cc;
+}
+
+pub fn bcast_splat(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_SPLAT) and ((v.flag & F_BCST) != 0);
+}
+
+// The value a vector `not` (an xor with all ones) negates.
+pub fn vnot_of(n: *mut ir.Value) *mut ir.Value {
+    if is.all_ones(n.b) {
+        return n.a;
+    }
+    return n.b;
+}
+
+// Unary packed op d = op(s): no merge, so VEX.vvvv is unused (1111, as an
+// instruction that does not read it requires).
+pub fn sse_unary_packed(id: i32, d: i32, s: mc.MOp) void {
+    _ = sse2(id, W(d), s);
+}
+
+pub fn fop(o: i32, single: bool, vec: bool) i32 {
+    // ADDSS, ADDSD, ADDPS, ADDPD families: +0 ss, +1 sd, +2 ps, +3 pd
+    let mut k: i32 = 1;
+    if vec and single {
+        k = 2;
+    } else if vec {
+        k = 3;
+    } else if single {
+        k = 0;
+    }
+    let mut base = xe.ADDSS;
+    if o == ir.OP_FMUL {
+        base = xe.MULSS;
+    } else if o == ir.OP_FSUB {
+        base = xe.SUBSS;
+    } else if o == ir.OP_FDIV {
+        base = xe.DIVSS;
+    }
+    return base + k;
+}
+
+// Is v the only use of x, in x's block (so that x's life ends at v)?
+pub fn last_use_here(x: *ir.Value, v: *ir.Value) bool {
+    return (x.kind == ir.V_INST) and (x.uses == 1) and (x.blk == v.blk) and (x.flag == 0);
+}
+
+// Operations whose operands may be swapped.
+pub fn commutes(o: i32) bool {
+    return (o == ir.OP_FADD) or (o == ir.OP_FMUL) or (o == ir.OP_ADD) or (o == ir.OP_AND) or (o == ir.OP_OR) or
+           (o == ir.OP_XOR) or (o == ir.OP_MUL);
+}
+
+// v's operands as a vector instruction reads them: the first a register,
+// the second its r/m operand (a load folded into it goes there).
+pub fn vsrc_of(v: *mut ir.Value, a: *mut i32) mc.MOp {
+    if commutes(v.op) and ((v.ty.kind == ir.T_VEC) or (v.ty.kind == ir.T_FLOAT)) and ir.is_op(v.a, ir.OP_LOAD) and
+       ((v.a.flag & 8) != 0) {
+        a.* = reg(v.b);
+        return vsrc(v.a);
+    }
+    a.* = reg(v.a);
+    return vsrc(v.b);
+}
+
+// The virtual registers that hold register k of the results of calls in
+// registers (IN_CALL_RESULT), made when the call or the intrinsic is
+// selected, whichever comes first.
+pub struct CallResult {
+    call: *ir.Value,
+    k: usize,
+    r: i32,
+}
+
+// index 0..3 for 8/16/32/64-bit lanes
+pub fn lk(t: *ir.Ty) i32 {
+    let b = is.lane_bits(t);
+    if b == 8 {
+        return 0;
+    }
+    if b == 16 {
+        return 1;
+    }
+    if b == 32 {
+        return 2;
+    }
+    return 3;
+}
+
+pub fn pki(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The widest vector an instruction computes or reads, as VL.
+pub fn inst_vl(v: *ir.Value) u8 {
+    let mut w = vl_of(v.ty);
+    let xs: [3]*mut ir.Value = [v.a, v.b, v.c];
+    for x in xs {
+        if u.notnil(x) and (vl_of(x.ty) > w) {
+            w = vl_of(x.ty);
+        }
+    }
+    for k in 0..v.xs.len {
+        let x = v.xs.get(k);
+        if vl_of(x.ty) > w {
+            w = vl_of(x.ty);
+        }
+    }
+    return w;
+}
+
+// Is v a negation its scalar @fma computes (mark_fma_neg)?
+pub fn fm_neg(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and ((v.flag & F_FMNEG) != 0);
+}
+
+// Does nothing after `from` and before `to` (in its block) write memory?
+pub fn quiet_between(from: *mut ir.Value, to: *mut ir.Value) bool {
+    let mut x = from.next;
+    while u.notnil(x) and (x != to) {
+        let op = x.op;
+        if (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+           (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
+           ((op == ir.OP_INTR) and intr_writes(x)) or ((op == ir.OP_LOAD) and (x.flags != 0)) {
+            return false;
+        }
+        x = x.next;
+    }
+    return u.notnil(x);
+}
+
+// An intrinsic that writes memory, or orders memory accesses around it (the
+// others, such as @fma or a permutation, leave a load movable past them).
+fn intr_writes(x: *ir.Value) bool {
+    let id = @truncate(i32, @bit_cast(i64, x.cv));
+    return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
+           (id == ir.IN_SET_SP) or (id == ir.IN_STORE_PARTIAL) or ((id == ir.IN_ASM) and ir.inst_opaque(x));
+}
+
+pub fn zmm16() bool {
+    return tg.has((tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL);
+}
