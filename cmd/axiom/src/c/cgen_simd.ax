@@ -24,6 +24,17 @@
 // A vector operand of 32 bytes is written as a ymm register, of 64 a zmm.
 // The constraints of the automatic forms: a vector or floating operand
 // "x" (AArch64 and WebAssembly: "w", "r"), an integer "r", a constant "i".
+//
+// AArch64 (<arm_neon.h>, whose forms are all custom): a vector of 8 bytes,
+// which the IR has no vector type of, is a double (a D register's bits:
+// only loads, stores and these operations touch it); an operand in a
+// vector register is written %v0.4s (the register as lanes: the modifier
+// v), %s0 (a scalar view) or %v1.h[%2] (a lane); an integer operand in a
+// vector register ("w") is passed as a float of its width, as asm
+// statements pass it; a custom constraint "V16" ("=V16") puts an operand in
+// v16 itself (the lists of consecutive registers of ld2 ... st4 and tbl);
+// the outputs after the first are stored through the call's operands of
+// kind o (csema_simd.sig_ok), in order (the structures of ld2 ...).
 // =============================================================================
 import "../asm/check.ax" as ack;
 import "../asm/inline.ax" as ai;
@@ -39,9 +50,16 @@ fn B() *mut ir.Builder {
     return cg.B;
 }
 
-// The IR type of a C vector type's value (one chunk of its size).
+// The IR type of a C vector type's value (one chunk of its size); on
+// AArch64 a vector of 8 bytes (int8x8_t ...), which the IR has no vector type
+// of, is a double: a D register's bits, which only loads, stores and the
+// machine operations touch.
 fn vty(t: *mut cty.CType) *mut ir.Ty {
-    return cg.vec_chunk(cty.unqual(t));
+    let ut = cty.unqual(t);
+    if (tg.g_arch == tg.ARCH_A64) and (cty.size_of(ut) == 8) {
+        return ir.t_float(64);
+    }
+    return cg.vec_chunk(ut);
 }
 
 // The value of operand k (from 1) of call e: a vector loaded, else vs[k].
@@ -449,30 +467,53 @@ fn machine(e: *mut cast.Expr, o: *csd.Op, vs: []mut *mut ir.Value) *mut ir.Value
             xs.push(ir.ci32(0));  // (its register: the asm's result k)
             continue;
         }
-        j += 1;
+        j = next_input(o, j);
         let v = arg(e, vs, j);
         if (op.kind == ai.OK_IMM) or (op.kind == ai.OK_MEM) {
             xs.push(v);
         } else if (op.cls == ai.CL_GPR) and (v.ty.kind == ir.T_PTR) {
             xs.push(ir.ptrtoint(B(), v, ir.t_int(64)));
+        } else if (op.cls == ai.CL_VEC) and (v.ty.kind == ir.T_INT) and not x86 and not tg.is_wasm() {
+            // (an integer in an AArch64 vector register: as a float of its
+            // width, the register class's type, as asm statements pass it)
+            xs.push(ir.bitcast(B(), resize(v, ir.t_int(@max(v.ty.bits, 32)), false), ir.t_float(@max(v.ty.bits, 32))));
         } else {
             xs.push(v);
         }
     }
     let r = ir.intr(B(), ir.IN_ASM, cg.T_void, xs.items());
+    // (the outputs after the first: stored through the operands of kind o, in order)
+    let mut po: usize = 0;
+    for k in 1..b.ops.len {
+        if not b.ops[k].out {
+            continue;
+        }
+        po = next_out_ptr(o, po);
+        let pt = cty.unqual(e.args.get(po).ty.unq.elem);
+        let mut a2: [2]*mut ir.Value = [r, ir.ci32(@as(u64, k))];
+        let v2 = ir.intr(B(), ir.IN_CALL_RESULT, vty(pt), a2[..]);
+        let st = ir.store(B(), v2, vs[po]);
+        st.align = 1;
+    }
     if void_ {
         return ir.vnil();
     }
     // (the result: output 0)
     let op = b.ops[0];
     let mut rt = vty(e.ty);
-    if cty.is_floating(e.ty) {
+    let in_vreg = (op.cls == ai.CL_VEC) and not x86 and not tg.is_wasm() and not cty.is_vector(e.ty) and
+                  not cty.is_floating(e.ty);
+    if cty.is_floating(e.ty) or in_vreg {
         rt = ir.t_float(@as(i32, @bit_cast(i32, op.bits)));
     } else if not cty.is_vector(e.ty) {
         rt = ir.t_int(@as(i32, @bit_cast(i32, op.bits)));
     }
     let mut args: [2]*mut ir.Value = [r, ir.ci32(0)];
-    let v = ir.intr(B(), ir.IN_CALL_RESULT, rt, args[..]);
+    let mut v = ir.intr(B(), ir.IN_CALL_RESULT, rt, args[..]);
+    if in_vreg {
+        // (an integer result in an AArch64 vector register)
+        v = ir.bitcast(B(), v, ir.t_int(@as(i32, @bit_cast(i32, op.bits))));
+    }
     if cty.is_vector(e.ty) {
         return result(e, v);
     }
@@ -508,14 +549,18 @@ fn blob(e: *cast.Expr, o: *csd.Op, f: Form, void_: bool) i32 {
         cs.clear();
     }
     let ops = u.perm_newn.[ai.Op](cs.len + 1);
-    let mut j: usize = 0;  // (the call's operand of an input)
+    let mut j: usize = 0;   // (the call's operand of an input)
+    let mut po: usize = 0;  // (the operand of kind o of an output after the first)
     for k in 0..cs.len {
         let s = cs.get(k);
         let out = (s.len > 0) and (s[0] == '=');
         let mut t: *mut cty.CType = e.ty;
         if not out {
-            j += 1;
+            j = next_input(o, j);
             t = e.args.get(j).ty;
+        } else if k > 0 {
+            po = next_out_ptr(o, po);
+            t = cty.unqual(e.args.get(po).ty.unq.elem);
         }
         let mut cstr = s;
         if (s.len > 0) and (s[s.len - 1] == '?') {
@@ -528,6 +573,10 @@ fn blob(e: *cast.Expr, o: *csd.Op, f: Form, void_: bool) i32 {
                 l = "i";
             }
             cstr = u.cat2(s[0..s.len - 1], l);
+        }
+        let vfix = fixed_vreg(cstr);
+        if vfix >= 0 {
+            cstr = u.pick(out, "=w", "w");
         }
         let c = ai.constraint(tg.g_arch, cstr, out);
         let mut op = ai.Op.{ kind: ai.OK_REG, cls: c.cls, reg: -1, subset: c.subset, out: out, early: c.early,
@@ -545,6 +594,10 @@ fn blob(e: *cast.Expr, o: *csd.Op, f: Form, void_: bool) i32 {
         }
         if c.tie >= 0 {
             op.cls = ops[@int_cast(usize, c.tie)].cls;
+        }
+        if vfix >= 0 {
+            op.kind = ai.OK_FIXED;
+            op.reg = 32 + vfix;
         }
         if cty.is_pointer(t) {
             op.bits = 64;
@@ -589,6 +642,46 @@ fn blob(e: *cast.Expr, o: *csd.Op, f: Form, void_: bool) i32 {
         u.die(u.f3("cgen_simd: the operation '%s' (%s): %s", o.name, f.text, err));
     }
     return ai.add(b);
+}
+
+// The operand (from 1) of the input after operand j of an operation: the
+// next that is not of kind o (an output's pointer).
+fn next_input(o: *csd.Op, j: usize) usize {
+    let mut k = j + 1;
+    while (k <= o.sig.len) and (o.sig[k - 1] == 'o') {
+        k += 1;
+    }
+    return k;
+}
+
+// The operand (from 1) of kind o after operand j.
+fn next_out_ptr(o: *csd.Op, j: usize) usize {
+    let mut k = j + 1;
+    while (k <= o.sig.len) and (o.sig[k - 1] != 'o') {
+        k += 1;
+    }
+    return k;
+}
+
+// A custom form's constraint of a given AArch64 vector register, "V16" or
+// "=V16" (a list of consecutive registers, as ld2 and tbl take, is of given
+// ones): the register's number, or -1.
+fn fixed_vreg(c: []u8) i32 {
+    let mut s = c;
+    if (s.len > 0) and (s[0] == '=') {
+        s = s[1..];
+    }
+    if (tg.g_arch != tg.ARCH_A64) or (s.len < 2) or (s[0] != 'V') {
+        return -1;
+    }
+    let mut n: i32 = 0;
+    for ch in s[1..] {
+        if (ch < '0') or (ch > '9') {
+            return -1;
+        }
+        n = n * 10 + @as(i32, ch - '0');
+    }
+    return n;
 }
 
 // Where the two bytes p are in s, or -1.

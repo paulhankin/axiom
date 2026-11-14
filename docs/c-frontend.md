@@ -76,7 +76,7 @@ lists the diagnostics.
 - **Intrinsics** (docs/c.md, "Intrinsics"): csema_simd.ax (the design, in its header
   comment; `__builtin_axiom_simd`, typed from its table csimd_tab.ax, which
   `cmd/internal/tools/gen_x86_intrin.py` writes with the x86-64 headers and their
-  tests; the rule that an always-inline function with the attribute `target` is called
+  tests, and `cmd/internal/tools/gen_neon_intrin.py` with the AArch64 ones; the rule that an always-inline function with the attribute `target` is called
   only from code compiled for its extensions, C3240, is csema_gnu.ax's `call_check`),
   cgen_simd.ax (generic operations as the IR's, machine ones as pure asm statements,
   asm/inline.ax, with the VEX form as `Blob.alt1`).
@@ -372,6 +372,7 @@ comments, so that they are valid in every standard:
 /* units: abi/x.c */        more translation units, relative to the test
 /* linux-only */            natively, only where host_native.c is linked
 /* x86-64-only */           natively, only for an x86-64 target (the intrinsics' tests)
+/* aarch64-only */          natively, only for an AArch64 target (AXIOM_NATIVE_TARGET=aarch64...)
 /* macos-only */            natively, only for a macOS target (AXIOM_NATIVE_TARGET=...-macos)
 /* wasm-flags: --features=+tail-call */  more flags for a WebAssembly build
 ```

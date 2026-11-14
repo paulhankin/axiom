@@ -2861,7 +2861,7 @@ def table_text():
            '// =============================================================================\n',
            'pub let TABLE: [%d][]u8 = [\n' % len(lines)]
     for l in lines:
-        out.append('    "%s",\n' % l.replace('\\', '\\\\').replace('"', '\\"'))
+        out.append('    "%s",\n' % l.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n'))
     out.append('];\n')
     return ''.join(out)
 
@@ -2876,7 +2876,9 @@ def keep_other_arches():
     for l in open(TAB).read().split('\n'):
         m = re.match(r'    "([^|]*)\|([aw])\|(.*)",$', l)
         if m:
-            EXTRA_TABLE.append(m.group(1) + '|' + m.group(2) + '|' + m.group(3))
+            # (the text of the string literal: its escapes undone)
+            t = m.group(1) + '|' + m.group(2) + '|' + m.group(3)
+            EXTRA_TABLE.append(re.sub(r'\\(.)', lambda e: '\n' if e.group(1) == 'n' else e.group(1), t))
 
 
 def main():

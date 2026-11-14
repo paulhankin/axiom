@@ -75,6 +75,7 @@ pub struct Op {
     cons: []u8,   // a custom form's constraints, ';'-separated ("@@" then the VEX form's)
     clob: []u8,   // a custom form's clobbered registers, ';'-separated
     flags: []u8,  // V: volatile (kept where it is), M: reads or writes memory
+    imm: []u8,    // the ranges of its immediates, in order: "lo:hi,lo:hi" (empty: any value)
 }
 
 let mut ops: u.List.[Op] = u.List.[Op].{ data: @ptr_from_int(*mut Op, 0), len: 0, cap: 0 };
@@ -93,10 +94,10 @@ fn load() void {
         return;
     }
     for line in tab.TABLE {
-        let fs = u.split(line, '|', 10);
+        let fs = u.split(line, '|', 11);
         let mut o = Op.{ name: u.intern(field(&fs, 0)), arch: 0, ext: field(&fs, 2), sig: field(&fs, 3), res: 'a',
                          form: field(&fs, 5), mn: field(&fs, 6), cons: field(&fs, 7), clob: field(&fs, 8),
-                         flags: field(&fs, 9) };
+                         flags: field(&fs, 9), imm: field(&fs, 10) };
         let a = field(&fs, 1);
         o.arch = u8_at(a, 0);
         let r = field(&fs, 4);
@@ -104,6 +105,13 @@ fn load() void {
         ops.push(o);
         by_name.put(o.name, @int_cast(i32, ops.len));
     }
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn u8_at(s: []u8, k: usize) u8 {
@@ -239,6 +247,25 @@ pub fn call(e: *mut cast.Expr) bool {
     if not ok {
         return bad(e);
     }
+    // (an immediate out of its range: a lane, a shift count, ...)
+    let mut ni: usize = 0;
+    for j in 0..o.sig.len {
+        if o.sig[j] != 'i' {
+            continue;
+        }
+        let r = imm_range(o.imm, ni);
+        ni += 1;
+        if r.any {
+            continue;
+        }
+        let x = e.args.get(j + 1);
+        let v = @bit_cast(i64, x.cval);
+        if (v < r.lo) or (v > r.hi) {
+            cs.err(x.span, "C3241", u.f3("operand %s of the operation '%s' must be from %s", u.zdec(j + 1), s,
+                                         u.f2("%s to %s", u.dec(r.lo), u.dec(r.hi))));
+            return bad(e);
+        }
+    }
     let mut need = ext_bits(o.ext);
     let mut what = o.ext;
     if (o.arch == 'x') and not u.str_eq(o.form, "G") and wide_operand(e) and ((need & tg.X_AVX2) == 0) {
@@ -258,6 +285,25 @@ pub fn call(e: *mut cast.Expr) bool {
     return true;
 }
 
+struct Range {
+    any: bool,
+    lo: i64,
+    hi: i64,
+}
+
+// The range k (from 0) of an operation's immediates' ranges "lo:hi,lo:hi".
+fn imm_range(spec: []u8, k: usize) Range {
+    if spec.len == 0 {
+        return Range.{ any: true, lo: 0, hi: 0 };
+    }
+    let rs = u.split(spec, ',', 16);
+    if k >= rs.len {
+        return Range.{ any: true, lo: 0, hi: 0 };
+    }
+    let lh = u.split(rs.get(k), ':', 2);
+    return Range.{ any: false, lo: u.atol(lh.get(0)), hi: u.atol(field(&lh, 1)) };
+}
+
 // Has call e a vector operand (after the name) or result of 32 or more bytes?
 fn wide_operand(e: *cast.Expr) bool {
     for k in 1..e.args.len {
@@ -274,8 +320,17 @@ fn wide_operand(e: *cast.Expr) bool {
 //   s  an integer           f  a real floating value
 //   i  an integer constant  n  an integer (a constant or not)
 //   p  a pointer            x  an integer or a real floating value
+//   o  a pointer to an object of a vector type, to which one of
+//      the outputs after the first is stored (in order; c/cgen_simd.ax)
 fn sig_ok(c: u8, x: *cast.Expr, first: *cast.Expr) bool {
     let t = x.ty;
+    if c == 'o' {
+        if not cty.is_pointer(t) {
+            return false;
+        }
+        let pt = cty.unqual(t.unq.elem);
+        return cty.is_vector(pt);
+    }
     if c == 'v' {
         return cty.is_vector(t);
     }
@@ -303,8 +358,13 @@ fn sig_ok(c: u8, x: *cast.Expr, first: *cast.Expr) bool {
 // The type of the result r: a the first operand's (a vector: the result
 // has its size, its lanes being the operation's), b the second's, 2 and h a vector of its
 // element type of twice and half its size, q four unsigned ints, v void, i int, u
-// unsigned int, l long long, L unsigned long long, f float, d double.
+// unsigned int, l long long, L unsigned long long, f float, d double, D and
+// Q a vector of 8 and 16 unsigned chars (AArch64's D and Q registers: the
+// header casts it to the intrinsic's type).
 fn result_type(r: u8, e: *cast.Expr) *mut cty.CType {
+    if (r == 'D') or (r == 'Q') {
+        return cty.vector_of(cty.t_uchar, @as(u64, u8_pick(r == 'D', 8, 16)));
+    }
     if r == 'v' {
         return cty.t_void;
     }

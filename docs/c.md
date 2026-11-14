@@ -1785,8 +1785,11 @@ without the C library, are the compiler's headers:
 | `<immintrin.h>` | All of the above, and AVX, AVX2 (with the gathers), FMA, F16C, BMI1, BMI2, LZCNT, POPCNT, ADX (and the carry chains `_addcarry_u32` ... of any processor), SHA, RDRAND, RDSEED, `_xgetbv`, `_rdtsc`/`__rdtsc`, `__rdtscp`, `_mm_pause`, the bit operations `_bswap`, `_bit_scan_forward`, `_rotl` ... and `_castf32_u32` .... |
 | `<x86intrin.h>` | The same as `<immintrin.h>`. |
 | `<cpuid.h>` | `__cpuid(leaf, a, b, c, d)` and `__cpuid_count`, `__get_cpuid_max`, `__get_cpuid`, `__get_cpuid_count`, and the feature bits `bit_SSE3` ... of leaves 1, 7 and 0x80000001. |
+| `<arm_neon.h>` | AArch64's Advanced SIMD, complete: the types `int8x8_t` ... `float64x2_t`, `poly8x8_t` ... `poly64x2_t`, `float16x4_t`, `bfloat16x4_t` ..., the structures `int8x8x2_t` ... `x4`, and `poly128_t`; every intrinsic of the arithmetic, saturating, halving and rounding forms, widening and narrowing, multiply-accumulate (by vectors, scalars and lanes), compares, shifts by vectors and immediates, the bit operations and `vbsl`, counts and reversals, min and max with the NaN-aware forms, pairwise operations and reductions (`vaddv`, `vmaxnmv` ...), conversions with each rounding mode and to and from fixed point, the estimates and steps (`vrecpe`, `vrsqrts` ...), `vld1` ... `vld4` and `vst1` ... `vst4` with their lane, duplicating and `_x2` ... `_x4` forms, lane get, set, copy and duplicate, `vcombine`, `vget_low`/`high`, `vext`, `vzip`/`vuzp`/`vtrn` and their halves, `vtbl`, `vtbx`, `vqtbl`, `vqtbx`, every `vreinterpret`; and of the extensions: FP16's vector and scalar arithmetic, BF16's (`vbfdot`, `vbfmmla`, `vbfmlalb` ..., conversions), FHM's `vfmlal_low_f16` ..., RDM's `vqrdmlah`, the dot products (`vdot`, and `vusdot`, `vsudot`, `vmmla` of i8mm), AES, SHA-1, SHA-256, SHA-512, SHA-3 (`veor3q`, `vbcaxq`, `vrax1q`, `vxarq`), SM3, SM4 and `vmull_p64`. |
+| `<arm_fp16.h>`, `<arm_bf16.h>` | `float16_t` and the scalar FP16 intrinsics (`vaddh_f16`, `vcvth_s32_f16` ...); `bfloat16_t` and its scalar conversions. `<arm_neon.h>` includes both. |
+| `<arm_acle.h>` | `__crc32b` ... `__crc32cd` (CRC), `__clz`, `__cls`, `__rev`, `__rev16`, `__revsh`, `__rbit`, `__ror` and their `l` and `ll` forms, `__dmb`, `__dsb`, `__isb`, `__nop`, `__yield`, `__wfe`, `__wfi`, `__sev`, `__sevl`, `__pld`, `__pli`, `__pldx`, `__plix`, `__sqrt`, `__sqrtf`, `__fma`, `__fmaf`, `__rintn`, `__rintnf`. |
 
-On another target each is an `#error`. The types are `__m64`, `__m128`, `__m128d`,
+On another target each is an `#error`. The x86-64 types are `__m64`, `__m128`, `__m128d`,
 `__m128i`, `__m256`, `__m256d`, `__m256i` (vectors of `vector_size`, which may alias any
 object: no type-based aliasing is assumed anyway) and their unaligned forms `__m128_u`
 ... `__m256i_u` (aligned to 1: the `loadu`/`storeu` intrinsics are accesses through
@@ -1825,6 +1828,26 @@ intrinsics that are instructions of their own (`_mm256_hadd_ps`, `_mm256_round_p
 alone, which an instruction of its own cannot be (the plain ones, `_mm256_add_ps` ...,
 need AVX only).
 
+The AArch64 headers are made the same way (`cmd/internal/tools/gen_neon_intrin.py`
+writes them, the table's AArch64 part and their tests). On 128-bit vectors what C's
+operators and the IR's operations say is plain C (`vaddq_s32` is `add`, `vqaddq_u8`
+`uqadd`, `vmlaq_s32` `mla`, `vfmaq_f32` `fmla`, `vcgeq_f32` `fcmge`, `vshrq_n_s32` `sshr`,
+`vmovl_high_s8` `sxtl2`, `vzip1q_s8` `zip1`, `vld1q_u8` and `vst1q_u8` `ldr` and `str`
+...), selected by the instruction selector and seen through by the optimizer;
+everything else, and every operation of 64-bit vectors (`int8x8_t` ..., which the IR
+has no vector type of: it holds one as a D register's bits), is its instruction, a pure
+asm statement (`ld2` ... `st4` and their lane forms, which read or write memory, are
+volatile ones). The extensions are `--features`' (`dotprod`, `i8mm`, `rdm`, `fp16`,
+`fhm`, `bf16`, `aes`, `sha2`, `sha3`, `sha512`, `sm4`, `crc`) and the attribute
+`target`'s, with the same rule: an intrinsic of one the calling function is not compiled
+for is `C3240`. A lane or a shift count must be a constant in its range (`C3241`). The
+`vmla` and `vmls` of floating vectors round the product (they are not fused; `vfma` is).
+Not provided, for want of the extension among `--features`: the complex arithmetic of
+FCMA (`vcaddq_rot90_f32`, `vcmlaq_f32` ...), FRINTTS's `vrnd32x` ..., JSCVT's `__jcvt`,
+RNG's `__rndr`, MTE's and TME's intrinsics; and `__arm_rsr` and `__arm_wsr` (whose
+system register is named by a string). Plain C on 64-bit vectors (`a + b` of two
+`int8x8_t`) is computed lane by lane: the intrinsics are the vector instructions.
+
 Deviations, all of them of what no program can see but a debugger or a timer:
 `_mm_stream_*` and `_mm_stream_load_*` are ordinary loads and stores (no non-temporal
 hint), `_mm_maskmoveu_si128` and `_mm_maskmove_si64` store the selected bytes one by
@@ -1833,9 +1856,9 @@ and `_mm_comineq_ss` raise invalid for a signaling NaN only (C's `==`). RDRAND a
 RDSEED are not among the extensions of `--features`: their intrinsics are not checked
 (test `bit_RDRND` and `bit_RDSEED` of `<cpuid.h>` first). Not provided: the
 AVX-512 intrinsics, AMX, KL, the system instructions' (`_xsave`, `_fxsave` ...),
-`<arm_neon.h>`, `<arm_acle.h>`, `<arm_sve.h>` and `<wasm_simd128.h>` (until then, a program
-that includes one when `__ARM_NEON` or `__wasm_simd128__` is defined needs its portable
-path chosen with `-U`).
+`<arm_sve.h>` and `<wasm_simd128.h>` (until then, a program that includes one when
+`__ARM_FEATURE_SVE` or `__wasm_simd128__` is defined needs its portable path chosen with
+`-U`).
 
 ## Not available
 
