@@ -79,7 +79,8 @@ Two architectural issues follow from this:
   (`g_prog`), `codegen.ax` (`M`, `inst_map`, `fn_map`, `vtables`, ...),
   `ir.ax` (`CINTS`, `derived`, `fn_arena`), `x64emit.ax` (`OBJ`, `MF`, `F`,
   `FT`, `fsym`), `a64.ax` (`OBJ`, `MF`, `F`, `consts`), and `nlink.ax` (`objs`,
-  `gsyms`).
+  `gsyms`). (Since 5a the backends' are a few structs: `x64ctx.ax`'s `O` and
+  `FN`, `a64.ax`'s `O` and `FN`, and each module's `S`; see section 5.)
 - **Non-POSIX hosts silently lose separate compilation and parallelism.** On
   Windows (`std/internal/runtime/windows.ax:1189`, `ax_fork` returns `AX_ERR`)
   and WebAssembly (`host.mjs`), `u.fork()` returns `-1`. Whenever `todo.len > 0`
@@ -379,6 +380,52 @@ while eliminating both subprocess spawning and redundant `std/` checking.
 ---
 
 ## 5. Decompose Acyclic-Import "God Modules" and C-Port Tag Constants
+
+### Status
+
+**5a (state structs): done.** The backends' and the lowering's mutable
+module-level state is now in a few structs, one global each, so item 1 can
+own them per unit (or make each one `threadlocal`) instead of finding and
+resetting dozens of globals:
+
+- `x64ctx.ax` (new, a leaf): `Obj` (`xc.O`: the object, its sections, DWARF,
+  frame tables, unwind tables, Windows/macOS flags, symbol lists, the constant
+  pool) and `Func` (`xc.FN`: `ir.Func`, `MFunc`, AVX/upper-half state,
+  outgoing area, shrink-wrapping), shared by `x64.ax` and `x64emit.ax`. Each
+  of those keeps the rest of its state in a private `State` (`S`): instruction
+  selection's block caches, the emitter's encoder, frame, branch relaxation,
+  call-frame and jump-table state.
+- `a64.ax`: `Obj` (`O`) and `Func` (`FN`), private (nothing outside reads them).
+- `ir.ax`: the interned types are one `TypeTab` (`TT`). `CINTS` was already one
+  struct.
+- `codegen.ax`: the per-unit tables (instances to generate, the runtime's trap,
+  call-site, shadow-stack and thread-local globals, string and global values,
+  ...) are one `State` (`S`).
+
+The resets stay where they were (e.g. `x64.compile` sets each `xc.O` field);
+replacing them with one assignment of a fresh value is item 1's, which has to
+decide what outlives a unit and where each list's storage comes from
+(functions are compiled in scratch scopes). Every step was
+checked to leave the compiler's output byte-identical (objects for nine target
+and option sets, and the compiler itself on x86-64 and AArch64), with no change
+in self-build time or memory.
+
+Left at module level, deliberately:
+
+- read-only tables, and process-wide settings read from the environment once
+  (`x64emit.ax`'s placement knobs, `AXIOM_DEBUG_RA`, `ir.ptr_bytes`), plus
+  `x64enc.ax`'s lazily built SSE table: for threads, initialize these before
+  starting workers;
+- `codegen.ax`'s unit handles (`O`, `M`, `B`, the `T_*` IR types, `F`) and the
+  driver's settings and results (`g_*`, read and set by `main.ax`/`units.ax`),
+  left as they are to keep this step's edits there small; item 1 moves them
+  into its `CodegenCtx` along with `S`;
+- `ir.ax`'s value and block free lists, graveyard, `fwd_epoch` and the
+  debug-info side tables (`dbg_*`), and `wasm.ax`'s state, which item 3
+  (def-use lists) is reworking: group them once it lands.
+
+Other modules with process-lifetime state that item 1 still has to account for:
+`nlink.ax`, `asm/obj.ax`, `codeview.ax`, `dloc.ax`, `mach.ax` and `target.ax`.
 
 ### Current state
 
