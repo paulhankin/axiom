@@ -100,48 +100,203 @@ const LT: i32 = 11;
 const GT: i32 = 12;
 const LE: i32 = 13;
 
-let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
-let mut TEXT: i32 = 0;   // the section of the code being made
-let mut TEXT0: i32 = 0;  // .text
-let mut RODATA: i32 = 0;
-let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut galign: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
-                                                  cap: 0, len: 0 };
-let mut libsyms: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
-                                                   cap: 0, len: 0 };
-let mut errors: bool = false;
-let mut LSE_: bool = false;
-// Windows on ARM64: its variadic convention, thread-locals through the TEB
-// (x18), the prologue and epilogue its unwind information describes
-// (win_prologue), and line tables for the PDB
-let mut WIN_: bool = false;
-let mut XDATA: i32 = -1;
-let mut PDATA: i32 = -1;
-let mut LINES: i32 = -1;
-let mut XDATA_SYM: u32 = 0;
+// The object being written (compile)
+struct Obj {
+    obj: *mut elf.Obj,
+    text: i32,   // the section of the code being made
+    text0: i32,  // .text
+    rodata: i32,
+    fsym: u.List.[u32],
+    gsym: u.List.[u32],
+    galign: u.List.[u64],
+    consts: u.SymMap.[u32],
+    libsyms: u.SymMap.[u32],
+    errors: bool,
+    lse: bool,  // the target has the LSE atomics
+    // Windows on ARM64: its variadic convention, thread-locals through the TEB
+    // (x18), the prologue and epilogue its unwind information describes
+    // (win_prologue), and line tables for the PDB
+    win: bool,
+    xdata: i32,
+    pdata: i32,
+    lines: i32,
+    xdata_sym: u32,
+    // macOS: the unwind tables (macunwind.ax), whose entries come from the
+    // call frame states (recorded for every function there, with or without
+    // -g)
+    macos: bool,
+    mu: mu.Out,
+    ft: ft.Tab,    // frame tables (ftab.ax)
+    dbg: dw.Unit,  // -g: the debug information of the object (dwarf.ax)
+    // The symbol of the slot offset that the Darwin runtime sets (axiom.tls_key,
+    // defined by the linker).
+    tls_key_si: i32,
+    // The symbol of the image's TLS index on Windows (axiom.tls_index, defined
+    // by plink.ax; the loader sets it).
+    tls_index_si: i32,
+    asm_count: i32,  // numbers the inline asm statements (MInst.cc)
+}
 
-let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
-let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
-// The function's floating point is strict (ir.Func's strict_fp): its
-// floating-point instructions raise exceptions, effects that mc.dce keeps.
-let mut strict_fp: bool = false;
-let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
-let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;  // outgoing stack-argument bytes
-// macOS: the unwind tables (macunwind.ax), whose entries come from the
-// call frame states (recorded for every function there, with or without
-// -g), and the ends of the function's sibling calls' jumps
-let mut MACOS_: bool = false;
-let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: false, elf: false, cu: -1, eh: -1,
-                              cies: [0; 4] };
-let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut dyn_frame: bool = false;  // sp moves after the prologue (DYNSTACK): the slots are addressed from x29
+let mut O: Obj = Obj.{ obj: @ptr_from_int(*mut elf.Obj, 0), text: 0, text0: 0, rodata: 0,
+                       fsym: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                       gsym: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                       galign: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                       consts: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                cap: 0, len: 0 },
+                       libsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                 cap: 0, len: 0 }, errors: false, lse: false, win: false, xdata: -1,
+                       pdata: -1, lines: -1, xdata_sym: 0, macos: false,
+                       mu: mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: false, elf: false, cu: -1,
+                                    eh: -1, cies: [0; 4] }, ft: ft.Tab.{
+                                        on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1,
+                                        text_sym: 0, chains_sym: 0, text0: -1, rets0: -1, cur_text: -1,
+                                        others: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                        rel32: 0, abs64: 0, empty: 0, lines: false, ro: -1, ro_sym: 0,
+                                        rec_of: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0),
+                                                           vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 },
+                                        recs: u.U64Map.{
+                                            keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                            len: 0 }, pairs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0),
+                                                                        vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                                                        len: 0 },
+                                        ctxs: u.U64Map.{
+                                            keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                            len: 0 }, strs: u.SymMap.[u64].{
+                                                keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                cap: 0, len: 0 }, last: [0, 0] }, dbg: dw.Unit.{
+                                                    on: false, arch: 0, addr_size: 8, full: false, lang: 0,
+                                                    parts: [dw.Part.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8,
+                                                                                                                         0),
+                                                                                                     len: 0, cap: 0 } },
+                                                                      fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix,
+                                                                                                                0),
+                                                                                            len: 0, cap: 0 } }; 11],
+                                                    strs: u.SymMap.[u32].{
+                                                        keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                                    lstrs: u.SymMap.[u32].{
+                                                        keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                                    files: u.List.[u32].{
+                                                        data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                                                    fmap: u.SymMap.[u32].{
+                                                        keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                                    by_id: u.List.[u32].{
+                                                        data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 }, nfuncs: 0,
+                                                    first_src: 0, text_sym: 0,
+                                                    trefs: u.List.[dw.Fix].{
+                                                        data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                                    gsyms: u.SymMap.[u32].{
+                                                        keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                                    toff: u.List.[u64].{
+                                                        data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                                    drefs: u.List.[dw.Fix].{
+                                                        data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                                    gdone: u.List.[bool].{
+                                                        data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
+                                                    voffs: u.List.[u64].{
+                                                        data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, tls_rel: 0,
+                                                    cies: [0; 4], size_fix: false,
+                                                    sums: u.List.[[16]u8].{
+                                                        data: @ptr_from_int(*mut [16]u8, 0), len: 0, cap: 0 },
+                                                    nosum: false,
+                                                    names: u.List.[dw.Named].{
+                                                        data: @ptr_from_int(*mut dw.Named, 0), len: 0, cap: 0 },
+                                                    abs_fns: u.List.[[]u8].{
+                                                        data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 },
+                                                    abs_map: u.SymMap.[u32].{
+                                                        keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                                    arefs: u.List.[dw.Fix].{
+                                                        data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                                    ranges: u.List.[u64].{
+                                                        data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                                    lrefs: u.List.[dw.Fix].{
+                                                        data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 } },
+                       tls_key_si: -1, tls_index_si: -1, asm_count: 0 };
+
+// The function being compiled (compile_func)
+struct Func {
+    f: *mut ir.Func,
+    mf: *mut mc.MFunc,
+    // The function's floating point is strict (ir.Func's strict_fp): its
+    // floating-point instructions raise exceptions, effects that mc.dce keeps.
+    strict_fp: bool,
+    cb: *mut mc.MBlock,
+    nlocal: i32,
+    out_area: u64,            // outgoing stack-argument bytes
+    tail_ends: u.List.[u64],  // macOS: the ends of the function's sibling calls' jumps
+    dyn_frame: bool,          // sp moves after the prologue (DYNSTACK): the slots are addressed from x29
+    vcs: u.List.[VConst],     // the vector constants loaded in the block vc_blk
+    vc_blk: *mut mc.MBlock,
+    gaddr: u.List.[GAddr],  // the addresses of globals in registers in the block gaddr_blk
+    gaddr_blk: *mut mc.MBlock,
+    cas_oks: u.List.[CasOk],  // weak compare-exchanges' success flags (IN_CMPXCHG_OK)
+    call_results: u.List.[CallResult],
+    tail_jumped: bool,  // (gen_term: the block's return was the jump)
+    asm_inst: *mc.MInst,
+    asm_err: []u8,
+    // the encoding: its code, relocations and branch fixups
+    code: bn.Bytes,
+    rls: u.List.[Rl],
+    fxs: u.List.[Fx],
+    local_off: u.List.[u64],
+    saved: [18]i32,
+    nsaved: usize,
+    save_off: [18]i64,
+    frame: i64,
+    // A leaf with nothing on the stack needs no frame (a call that does not
+    // return may still clobber the link register; with frame tables, where the
+    // walk needs the caller's return address, it does not).
+    frameless: bool,
+    // the call frame states as the function is encoded (dwarf.cfi_state): its
+    // save list is x29 at CFA - 16, x30 at CFA - 8, then the callee-saved
+    // registers in their slots
+    cfis: u.List.[u64],
+    xcfis: u.List.[dw.XCfi],
+    // Windows: the unwind codes of the prologue and the epilogue (win_prologue)
+    uw_pro: uw.Codes,
+    uw_epi: uw.Codes,
+    uw_epis: u.List.[u64],
+    // Jump tables: the jumps through one encoded so far, whose tables are
+    // filled in once the function's place is known (fill_jump_tables), and a
+    // local symbol at the start of the function's section for their entries.
+    jtabs: u.List.[*mut mc.MInst],
+    jt_text: u32,
+}
+
+let mut FN: Func = Func.{ f: @ptr_from_int(*mut ir.Func, 0), mf: @ptr_from_int(*mut mc.MFunc, 0), strict_fp: false,
+                          cb: @ptr_from_int(*mut mc.MBlock, 0), nlocal: 0, out_area: 0,
+                          tail_ends: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                          dyn_frame: false, vcs: u.List.[VConst].{ data: @ptr_from_int(*mut VConst, 0), len: 0,
+                                                                   cap: 0 }, vc_blk: @ptr_from_int(*mut mc.MBlock, 0),
+                          gaddr: u.List.[GAddr].{ data: @ptr_from_int(*mut GAddr, 0), len: 0, cap: 0 },
+                          gaddr_blk: @ptr_from_int(*mut mc.MBlock, 0),
+                          cas_oks: u.List.[CasOk].{ data: @ptr_from_int(*mut CasOk, 0), len: 0, cap: 0 },
+                          call_results: u.List.[CallResult].{ data: @ptr_from_int(*mut CallResult, 0), len: 0, cap: 0 },
+                          tail_jumped: false, asm_inst: @ptr_from_int(*mc.MInst, 0), asm_err: "",
+                          code: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                          rls: u.List.[Rl].{ data: @ptr_from_int(*mut Rl, 0), len: 0, cap: 0 },
+                          fxs: u.List.[Fx].{ data: @ptr_from_int(*mut Fx, 0), len: 0, cap: 0 },
+                          local_off: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, saved: [0; 18],
+                          nsaved: 0, save_off: [0; 18], frame: 0, frameless: false,
+                          cfis: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                          xcfis: u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 },
+                          uw_pro: uw.Codes.{
+                              b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                              at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } },
+                          uw_epi: uw.Codes.{
+                              b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                              at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } },
+                          uw_epis: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                          jtabs: u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0, cap: 0 },
+                          jt_text: 0 };
 
 fn fail(msg: []u8) void {
-    u.eprint(u.f2("axiom: AArch64 code generation: %s (in %s)\n", msg, F.name));
-    errors = true;
+    u.eprint(u.f2("axiom: AArch64 code generation: %s (in %s)\n", msg, FN.f.name));
+    O.errors = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -149,7 +304,7 @@ fn fail(msg: []u8) void {
 // -----------------------------------------------------------------------------
 fn emit(op: i32, sz: u8, ops: []mc.MOp) *mut mc.MInst {
     let i = mc.new_inst(op, sz, ops);
-    mc.append(CB, i);
+    mc.append(FN.cb, i);
     return i;
 }
 
@@ -213,11 +368,11 @@ fn raw1(w: u64, d: i32) void {
 }
 
 fn vgpr() i32 {
-    return mc.new_vreg(MF, GPR);
+    return mc.new_vreg(FN.mf, GPR);
 }
 
 fn vvr() i32 {
-    return mc.new_vreg(MF, VR);
+    return mc.new_vreg(FN.mf, VR);
 }
 
 fn class_of(t: *ir.Ty) u8 {
@@ -249,8 +404,8 @@ fn copy(d: i32, s: i32, class: u8) void {
         let i = e2(FMOV, 16, W(d), R(s));
         i.is_move = true;
     }
-    mc.hint(MF, d, s);
-    mc.hint(MF, s, d);
+    mc.hint(FN.mf, d, s);
+    mc.hint(FN.mf, s, d);
 }
 
 fn movi(d: i32, x: i64, sf: u64) void {
@@ -262,8 +417,8 @@ fn movi(d: i32, x: i64, sf: u64) void {
 }
 
 fn new_label() i32 {
-    nlocal += 1;
-    return LOCAL_BASE + nlocal;
+    FN.nlocal += 1;
+    return LOCAL_BASE + FN.nlocal;
 }
 
 fn place(l: i32) void {
@@ -284,22 +439,22 @@ fn jmp(l: i32) void {
 // Symbols and constants
 // -----------------------------------------------------------------------------
 fn func_sym(f: *ir.Func) i32 {
-    return @bit_cast(i32, is.fsym_at(OBJ, &mut fsym, f));
+    return @bit_cast(i32, is.fsym_at(O.obj, &mut O.fsym, f));
 }
 
 fn global_sym(g: *ir.Global) i32 {
-    return @bit_cast(i32, is.gsym_at(OBJ, &mut gsym, g));
+    return @bit_cast(i32, is.gsym_at(O.obj, &mut O.gsym, g));
 }
 
 // A C library function (memcpy, ...).
 fn lib_sym(name: []u8) i32 {
     let k = u.intern(name);
-    let found = libsyms.get(k);
+    let found = O.libsyms.get(k);
     if found != 0 {
         return @bit_cast(i32, found - 1);
     }
-    let s = elf.ext_sym(OBJ, name, false);
-    libsyms.put(k, s + 1);
+    let s = elf.ext_sym(O.obj, name, false);
+    O.libsyms.put(k, s + 1);
     return @bit_cast(i32, s);
 }
 
@@ -313,35 +468,35 @@ fn mem_sym(sym: i32, disp: i64, align: u64) mc.MOp {
 // A 16-byte constant in the constant pool (rodata).
 fn const16(lo: u64, hi: u64) mc.MOp {
     let key = u.intern(u.f2("%s:%s", u.hex16(lo), u.hex16(hi)));
-    let found = consts.get(key);
+    let found = O.consts.get(key);
     if found != 0 {
         return mem_sym(@bit_cast(i32, found - 1), 0, 16);
     }
-    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    let s = O.obj.secs.get(@int_cast(usize, O.rodata));
     s.data.align(16);
     let off = @as(u64, s.data.len());
     s.data.u64_(lo);
     s.data.u64_(hi);
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: 16, bind: elf.B_LOCAL,
-                                         ty: elf.T_OBJECT, hidden: false, protected: false });
-    consts.put(key, sym + 1);
+    let sym = elf.add_sym(O.obj, elf.Sym.{ name: ".LC", sec: O.rodata, value: off, size: 16, bind: elf.B_LOCAL,
+                                           ty: elf.T_OBJECT, hidden: false, protected: false });
+    O.consts.put(key, sym + 1);
     return mem_sym(@bit_cast(i32, sym), 0, 16);
 }
 
 fn vconst(lo: u64, hi: u64) i32 {
-    if vc_blk != CB {
-        vcs.clear();
-        vc_blk = CB;
+    if FN.vc_blk != FN.cb {
+        FN.vcs.clear();
+        FN.vc_blk = FN.cb;
     }
-    for q in 0..vcs.len {
-        let c = vcs.get(q);
+    for q in 0..FN.vcs.len {
+        let c = FN.vcs.get(q);
         if (c.lo == lo) and (c.hi == hi) {
             return c.r;  // (loaded earlier in the block)
         }
     }
     let r = vvr();
     _ = e2(FLDR, 16, W(r), const16(lo, hi));
-    vcs.push(VConst.{ lo: lo, hi: hi, r: r });
+    FN.vcs.push(VConst.{ lo: lo, hi: hi, r: r });
     return r;
 }
 
@@ -352,18 +507,15 @@ struct VConst {
     r: i32,
 }
 
-let mut vcs: u.List.[VConst] = u.List.[VConst].{ data: @ptr_from_int(*mut VConst, 0), len: 0, cap: 0 };
-let mut vc_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
-
 // -----------------------------------------------------------------------------
 // Values
 // -----------------------------------------------------------------------------
 fn vreg(v: *mut ir.Value) i32 {
     if v.loc < 0 {
-        v.loc = mc.new_vreg(MF, class_of(v.ty));
+        v.loc = mc.new_vreg(FN.mf, class_of(v.ty));
         if v.ty.kind == ir.T_FLOAT {
             // (a scalar: spilled as 8 bytes, spill_store)
-            mc.set_bytes(MF, v.loc, @truncate(u8, @max(v.ty.size, 8)));
+            mc.set_bytes(FN.mf, v.loc, @truncate(u8, @max(v.ty.size, 8)));
         }
     }
     return v.loc;
@@ -374,9 +526,6 @@ struct GAddr {
     g: *mut ir.Value,
     r: i32,
 }
-
-let mut gaddr: u.List.[GAddr] = u.List.[GAddr].{ data: @ptr_from_int(*mut GAddr, 0), len: 0, cap: 0 };
-let mut gaddr_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 
 // A register holding v (materializing constants and addresses here).
 fn reg(v: *mut ir.Value) i32 {
@@ -390,10 +539,10 @@ fn reg(v: *mut ir.Value) i32 {
         return vreg(v);
     }
     let t = v.ty;
-    if (k == ir.V_GLOBAL) and not ir.gv_of(v).tls and (gaddr_blk == CB) {
-        for q in 0..gaddr.len {
-            if gaddr.get(q).g == v {
-                return gaddr.get(q).r;  // (built earlier in the block)
+    if (k == ir.V_GLOBAL) and not ir.gv_of(v).tls and (FN.gaddr_blk == FN.cb) {
+        for q in 0..FN.gaddr.len {
+            if FN.gaddr.get(q).g == v {
+                return FN.gaddr.get(q).r;  // (built earlier in the block)
             }
         }
     }
@@ -401,11 +550,11 @@ fn reg(v: *mut ir.Value) i32 {
         let r = vgpr();
         let g = ir.gv_of(v);
         if not g.tls {
-            if gaddr_blk != CB {
-                gaddr.clear();
-                gaddr_blk = CB;
+            if FN.gaddr_blk != FN.cb {
+                FN.gaddr.clear();
+                FN.gaddr_blk = FN.cb;
             }
-            gaddr.push(GAddr.{ g: v, r: r });
+            FN.gaddr.push(GAddr.{ g: v, r: r });
         }
         if g.tls {
             _ = e2(TLS, 8, W(r), mc.symop(global_sym(g), 0));
@@ -540,7 +689,7 @@ fn addr(p: *mut ir.Value) mc.MOp {
         }
     }
     if (p.kind == ir.V_GLOBAL) and not ir.gv_of(p).tls and not is.extern_global(ir.gv_of(p)) {
-        return mem_sym(global_sym(ir.gv_of(p)), 0, galign.get(@int_cast(usize, ir.gv_of(p).id)));
+        return mem_sym(global_sym(ir.gv_of(p)), 0, O.galign.get(@int_cast(usize, ir.gv_of(p).id)));
     }
     return mc.mem(reg(p), -1, 0, 0);
 }
@@ -1400,7 +1549,7 @@ fn call_lib(name: []u8, args: []i32) void {
     }
     let ci = emit(CALL, 0, ops.items());
     ci.clobber = caller_saved();
-    MF.has_calls = true;
+    FN.mf.has_calls = true;
 }
 
 // memcpy / memmove / memset. Forward copies and fills of a constant size
@@ -1607,7 +1756,7 @@ fn gen_rmw(v: *mut ir.Value) void {
     // exclusive load and store of the loop)
     let acq = ir.ord_acquires(ir.order(v));
     let rel = ir.ord_releases(ir.order(v));
-    if LSE_ {
+    if O.lse {
         if o == ir.RMW_XCHG {
             _ = raw(ae.swp(sc, acq, rel, 0, 0, 0), W(d), R(a), R(x), NONE());
             return;
@@ -1695,7 +1844,7 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
     let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
     let acq = ir.ord_acquires(ord);
     let rel = ir.ord_releases(ord);
-    if LSE_ {
+    if O.lse {
         copy(d, e, GPR);
         _ = raw(ae.cas(sc, acq, rel, 0, 0, 0), R(n), R(a), RW(d), NONE());
         return;
@@ -1745,7 +1894,7 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
 // operands after the fourth are not encoded); e is written only when the
 // old bytes differ.
 fn gen_cas16(v: *mut ir.Value) void {
-    if LSE_ {
+    if O.lse {
         gen_casp(v);
         return;
     }
@@ -1837,16 +1986,14 @@ struct CasOk {
     r: i32,
 }
 
-let mut cas_oks: u.List.[CasOk] = u.List.[CasOk].{ data: @ptr_from_int(*mut CasOk, 0), len: 0, cap: 0 };
-
 fn cas_ok_vreg(v: *ir.Value) i32 {
-    for x in cas_oks.items() {
+    for x in FN.cas_oks.items() {
         if x.cas == v {
             return x.r;
         }
     }
     let r = vgpr();
-    cas_oks.push(CasOk.{ cas: v, r: r });
+    FN.cas_oks.push(CasOk.{ cas: v, r: r });
     return r;
 }
 
@@ -1862,7 +2009,7 @@ fn one_reg() i32 {
 // which does not fail spuriously) whether the old value is the expected one.
 fn gen_cas_ok(v: *mut ir.Value) void {
     let c = ir.resolve(v.xs.get(0));
-    if ((c.flags & ir.F_WEAK) != 0) and not LSE_ {
+    if ((c.flags & ir.F_WEAK) != 0) and not O.lse {
         copy(vreg(v), cas_ok_vreg(c), GPR);
         return;
     }
@@ -1920,7 +2067,7 @@ fn gen_call(v: *mut ir.Value) void {
     }
     // Windows passes every argument of a variadic function in x0-x7 and
     // then 8-byte stack slots, floating-point ones as their bits
-    let win_va = WIN_ and fty_.vararg;
+    let win_va = O.win and fty_.vararg;
     for i in 0..n {
         let x = v.xs.get(i);
         let mut c = class_of(x.ty);
@@ -1974,8 +2121,8 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     off = (off + 15) & ~@as(u64, 15);
-    if off > out_area {
-        out_area = off;
+    if off > FN.out_area {
+        FN.out_area = off;
     }
     for i in 0..n {
         if dest[i] >= 0 {
@@ -1986,7 +2133,7 @@ fn gen_call(v: *mut ir.Value) void {
                 let m = e2(MOV, 8, W(dest[i]), R(regs[i]));
                 m.is_move = true;
             }
-            mc.hint(MF, regs[i], dest[i]);
+            mc.hint(FN.mf, regs[i], dest[i]);
             uses.push(R(dest[i]));
         }
     }
@@ -2008,7 +2155,7 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     let ci = emit(CALL, 0, ops.items());
-    is.finish_call(MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
+    is.finish_call(FN.mf, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
     if rcode != 0 {
         // the registers, for the IN_CALL_RESULTs
         for k in 0..c_result_count(rcode) {
@@ -2055,11 +2202,8 @@ struct CallResult {
     r: i32,
 }
 
-let mut call_results: u.List.[CallResult] = u.List.[CallResult].{ data: @ptr_from_int(*mut CallResult, 0), len: 0,
-                                                                  cap: 0 };
-
 fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
-    for x in call_results.items() {
+    for x in FN.call_results.items() {
         if (x.call == v) and (x.k == k) {
             return x.r;
         }
@@ -2070,14 +2214,14 @@ fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
     } else {
         r = vgpr();
     }
-    call_results.push(CallResult.{ call: v, k: k, r: r });
+    FN.call_results.push(CallResult.{ call: v, k: k, r: r });
     return r;
 }
 
 // IN_CALL_RESULT(call, k): the copy the call made of register k.
 fn gen_call_result(v: *mut ir.Value) void {
     let c = ir.resolve(v.xs.get(0));
-    if tail_jumped and ((c.flags & ir.F_TAIL) != 0) {
+    if FN.tail_jumped and ((c.flags & ir.F_TAIL) != 0) {
         return;  // (the call left the function: its registers are the callee's result, gen_tail_call)
     }
     let k = @truncate(usize, ir.cint_val(v.xs.get(1)));
@@ -2088,7 +2232,7 @@ fn gen_call_result(v: *mut ir.Value) void {
 // The return of a function whose result is in registers (ir.EXT_REGS):
 // t's xs in them.
 fn ret_c_result(t: *mut ir.Value) void {
-    let rc = F.ret_ext;
+    let rc = FN.f.ret_ext;
     let n = c_result_count(rc);
     let mut ops = u.List.[mc.MOp].empty();
     for k in 0..n {
@@ -2123,9 +2267,8 @@ fn ret_c_result(t: *mut ir.Value) void {
 // registers (ir.EXT_REGS) that the caller returns as it is stays in the
 // callee's registers (neither gen_call_result nor the return is selected).
 // -----------------------------------------------------------------------------
-const TAIL: i32 = 1;                // (a CALL's cc: the jump; aux: the bytes of stack arguments it copies)
-const X9: i32 = 9;                  // (a scratch register for the copy: no argument, nothing live past the jump)
-let mut tail_jumped: bool = false;  // (gen_term: the block's return was the jump)
+const TAIL: i32 = 1;  // (a CALL's cc: the jump; aux: the bytes of stack arguments it copies)
+const X9: i32 = 9;    // (a scratch register for the copy: no argument, nothing live past the jump)
 
 fn is_tail(i: *mc.MInst) bool {
     return (i.op == CALL) and (i.cc == TAIL);
@@ -2182,11 +2325,11 @@ fn stack_bytes(f: *ir.Func, v: *ir.Value) u64 {
 
 // Call v as a jump to its callee, if its stack arguments fit (see above).
 fn gen_tail_call(v: *mut ir.Value) bool {
-    if WIN_ and (F.va_home or ir.fty_of(v).vararg) {
+    if O.win and (FN.f.va_home or ir.fty_of(v).vararg) {
         return false;  // (the home area above the frame record; arguments as gen_call places them)
     }
-    let need = stack_bytes(F, v);
-    if need > stack_bytes(F, u.nil.[ir.Value]()) {
+    let need = stack_bytes(FN.f, v);
+    if need > stack_bytes(FN.f, u.nil.[ir.Value]()) {
         return false;  // (the callee needs more of the stack than the caller was given)
     }
     let fty_ = ir.fty_of(v);
@@ -2242,8 +2385,8 @@ fn gen_tail_call(v: *mut ir.Value) bool {
         }
     }
     off = (off + 15) & ~@as(u64, 15);
-    if off > out_area {
-        out_area = off;
+    if off > FN.out_area {
+        FN.out_area = off;
     }
     for i in 0..n {
         if dest[i] >= 0 {
@@ -2254,7 +2397,7 @@ fn gen_tail_call(v: *mut ir.Value) bool {
                 let m = e2(MOV, 8, W(dest[i]), R(regs[i]));
                 m.is_move = true;
             }
-            mc.hint(MF, regs[i], dest[i]);
+            mc.hint(FN.mf, regs[i], dest[i]);
             uses.push(R(dest[i]));
         }
     }
@@ -2271,7 +2414,7 @@ fn gen_tail_call(v: *mut ir.Value) bool {
     ci.cc = TAIL;
     ci.aux = @bit_cast(i64, need);
     ci.clobber = 0;  // (nothing of the function runs after it)
-    tail_jumped = true;
+    FN.tail_jumped = true;
     uses.deinit();
     ops.deinit();
     return true;
@@ -2295,8 +2438,8 @@ fn enc_tail(i: *mut mc.MInst) void {
     } else {
         w32(0xD61F_0000 | (ae.r5(P(t.reg)) << 5));  // br
     }
-    if MACOS_ {
-        tail_ends.push(here());
+    if O.macos {
+        FN.tail_ends.push(here());
     }
     cfi_body();
 }
@@ -3563,13 +3706,13 @@ fn gen_inst(v: *mut ir.Value) void {
             // with a dynamic allocation, so that CFA = x29 + 16 stays exact,
             // and on Windows the unwind information's set_fp)
             if ai.blob(is.cval(v.xs.get(0))).sp {
-                dyn_frame = true;
+                FN.dyn_frame = true;
             }
             gen_asm(v);
             return;
         }
         if ir.is_dyn_stack(id) {
-            dyn_frame = true;
+            FN.dyn_frame = true;
             if id == ir.IN_STACK_ALLOC {
                 let n = vgpr();
                 copy(n, reg(v.xs.get(0)), GPR);
@@ -3615,7 +3758,7 @@ fn gen_term(b: *mut ir.Block) void {
     let t = ir.terminator(b);
     let o = t.op;
     if o == ir.OP_BR {
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(FN.mf, b, reg, vreg, class_of, copy);
         if not is.next_block_is(b, t.t1) {
             jmp(is.blk(t.t1));
         }
@@ -3623,7 +3766,7 @@ fn gen_term(b: *mut ir.Block) void {
     }
     if o == ir.OP_CONDBR {
         let cc = cond_code(t.a);
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(FN.mf, b, reg, vreg, class_of, copy);
         let tt = t.t1;
         let ff = t.t2;
         if is.next_block_is(b, tt) {
@@ -3649,7 +3792,7 @@ fn gen_term(b: *mut ir.Block) void {
             tr = vgpr();
             copy(tr, r, GPR);  // (the phi copies may overwrite a phi's register)
         }
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(FN.mf, b, reg, vreg, class_of, copy);
         for k in 0..t.xs.len {
             let c = t.xs.get(k);
             let mut cv = is.cval(c);  // (a bool's case: 1, not -1)
@@ -3668,29 +3811,29 @@ fn gen_term(b: *mut ir.Block) void {
         }
         return;
     }
-    if (o == ir.OP_RET) and tail_jumped {
-        tail_jumped = false;  // (the call before it left the function: gen_tail_call)
+    if (o == ir.OP_RET) and FN.tail_jumped {
+        FN.tail_jumped = false;  // (the call before it left the function: gen_tail_call)
         return;
     }
     if o == ir.OP_RET {
-        if F.ret_ext >= ir.EXT_REGS {
+        if FN.f.ret_ext >= ir.EXT_REGS {
             ret_c_result(t);
             return;
         }
         if u.notnil(t.a) {
             let x = t.a;
             let mut r: i32 = -1;
-            if (F.ret_ext != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
+            if (FN.f.ret_ext != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
                 // the result extended to 32 bits, as the ABI's mark says:
                 // a constant built so, a load that extends (zero), or the
                 // value extended
                 if is.is_c(x) and (x.kind != ir.V_UNDEF) {
                     r = vgpr();
-                    movi(r, ext_const(x, F.ret_ext == 2), 0);
-                } else if (F.ret_ext == 1) and ir.is_op(x, ir.OP_LOAD) and (x.flags == 0) and (x.ty.bits >= 8) {
+                    movi(r, ext_const(x, FN.f.ret_ext == 2), 0);
+                } else if (FN.f.ret_ext == 1) and ir.is_op(x, ir.OP_LOAD) and (x.flags == 0) and (x.ty.bits >= 8) {
                     r = reg(x);
                 } else {
-                    r = ext_reg(reg(x), x.ty.bits, F.ret_ext == 2, false);
+                    r = ext_reg(reg(x), x.ty.bits, FN.f.ret_ext == 2, false);
                 }
             } else {
                 r = reg(x);
@@ -3733,15 +3876,15 @@ fn gen_jump_table(b: *mut ir.Block, t: *mut ir.Value) void {
         ix = vgpr();
         copy(ix, r, GPR);  // (the phi copies may overwrite a phi's register)
     }
-    is.phi_copies(MF, b, reg, vreg, class_of, copy);
+    is.phi_copies(FN.mf, b, reg, vreg, class_of, copy);
     let n = t.xs.len;
-    let jsec = is.group_rodata(OBJ, TEXT, RODATA);  // (with the code, in its COMDAT group if it is in one)
-    let s = OBJ.secs.get(@int_cast(usize, jsec));
+    let jsec = is.group_rodata(O.obj, O.text, O.rodata);  // (with the code, in its COMDAT group if it is in one)
+    let s = O.obj.secs.get(@int_cast(usize, jsec));
     s.data.align(4);
     let off = @as(u64, s.data.len());
     s.data.zeros(4 * n);
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LJT", sec: jsec, value: off, size: @as(u64, 4 * n), bind: elf.B_LOCAL,
-                                         ty: elf.T_OBJECT, hidden: false, protected: false });
+    let sym = elf.add_sym(O.obj, elf.Sym.{ name: ".LJT", sec: jsec, value: off, size: @as(u64, 4 * n),
+                                           bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false, protected: false });
     let ops = u.newn.[mc.MOp](n + 3);
     ops[0] = R(ix);
     ops[1] = mc.reg(vgpr(), mc.RD | mc.RE);
@@ -3984,7 +4127,7 @@ fn gen_carry(v: *mut ir.Value) void {
     let d = vreg(v);
     // (p = q + r or p - q just made by a plain add or sub of these registers:
     // that instruction sets the flags instead, adds or subs)
-    let last = CB.last;
+    let last = FN.cb.last;
     let mut fresh = false;
     if u.notnil(last) and (last.op == RAW) and (last.ops.len >= 3) and (last.ops[1].kind == mc.K_REG) and
        (last.ops[2].kind == mc.K_REG) and (last.ops[0].kind == mc.K_REG) {
@@ -4024,7 +4167,6 @@ let vr_order: [32]i32 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
 // -----------------------------------------------------------------------------
 // Inline assembly (ir.IN_ASM; asm/inline.ax says what its operands are)
 // -----------------------------------------------------------------------------
-let mut asm_count: i32 = 0;
 
 fn u8_of(c: bool, a: u8, b: u8) u8 {
     if c {
@@ -4116,7 +4258,7 @@ fn gen_asm(v: *mut ir.Value) void {
             r = asm_pick(op.subset, op.cls, taken);
             taken = taken | (@as(u64, 1) << @int_cast(u32, r));
         } else {
-            r = mc.new_vreg(MF, cls);
+            r = mc.new_vreg(FN.mf, cls);
         }
         regs[k] = r;
         if op.out {
@@ -4166,8 +4308,8 @@ fn gen_asm(v: *mut ir.Value) void {
     }
     let i = emit(ASM, 0, ops[0..no]);
     i.aux = bi;
-    asm_count += 1;
-    i.cc = asm_count;
+    O.asm_count += 1;
+    i.cc = O.asm_count;
     i.keep = true;
     for k in 0..n {
         let op = b.ops[k];
@@ -4177,7 +4319,7 @@ fn gen_asm(v: *mut ir.Value) void {
         let vec = op.cls == ai.CL_VEC;
         let mut r = regs[k];
         if not mc.is_vreg(r) {
-            let t = mc.new_vreg(MF, u8_of(vec, VR, GPR));
+            let t = mc.new_vreg(FN.mf, u8_of(vec, VR, GPR));
             copy(t, r, u8_of(vec, VR, GPR));
             r = t;
         }
@@ -4211,14 +4353,14 @@ fn asm_imm(x: *mut ir.Value) mc.MOp {
 // The callee-saved registers asm statements name (clobbers, pinned
 // operands) are saved as those allocation chose are.
 fn asm_used_regs() void {
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if i.op == ASM {
                 for k in 0..i.ops.len {
                     let o = i.ops[k];
                     if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) and (o.reg < 64) {
-                        MF.used_regs = MF.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
+                        FN.mf.used_regs = FN.mf.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
                     }
                 }
             }
@@ -4227,11 +4369,8 @@ fn asm_used_regs() void {
     }
 }
 
-let mut asm_inst: *mc.MInst = @ptr_from_int(*mc.MInst, 0);
-let mut asm_err: []u8 = "";
-
 fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
-    let o = asm_inst.ops[k];
+    let o = FN.asm_inst.ops[k];
     let op = b.ops[k];
     let mut r = ai.rop_reg(0, op.bits, op.fp);
     if o.kind == mc.K_REG {
@@ -4250,8 +4389,8 @@ fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
     }
     let mut err = "";
     let t = aa.render(&r, mod, &mut err);
-    if (err.len > 0) and (asm_err.len == 0) {
-        asm_err = u.f2("operand %s: %s", u.zdec(k), err);
+    if (err.len > 0) and (FN.asm_err.len == 0) {
+        FN.asm_err = u.f2("operand %s: %s", u.zdec(k), err);
     }
     return t;
 }
@@ -4266,25 +4405,25 @@ fn asm_symbol_u(name: []u8) u32 {
     if u.starts(name, "__axiom_sym_") {
         return @truncate(u32, @bit_cast(u64, u.atol(name[12..])));
     }
-    let al = aob.alias_sym(OBJ, ai.blob(asm_inst.aux).aliases, name);
+    let al = aob.alias_sym(O.obj, ai.blob(FN.asm_inst.aux).aliases, name);
     if al >= 0 {
         return @truncate(u32, @bit_cast(u64, al));
     }
-    return elf.ext_sym(OBJ, u.perm_dup(name), false);
+    return elf.ext_sym(O.obj, u.perm_dup(name), false);
 }
 
 // The template with the operands where they were allocated, assembled
 // (asm/a64.ax) into the function's code.
 fn enc_asm(i: *mut mc.MInst) void {
     let b = ai.blob(i.aux);
-    asm_inst = i;
-    asm_err = "";
+    FN.asm_inst = i;
+    FN.asm_err = "";
     let mut text = ai.expand(b, asm_operand, aa.label_text, @as(u64, @bit_cast(u32, i.cc)));
     if b.goto_ {
         text = u.cat2(text, aa.goto_tail(b.nlabels, P(i.ops[i.ops.len - 1].reg)));
     }
-    if asm_err.len > 0 {
-        fail(u.f2("inline assembly at %s: %s", b.loc, asm_err));
+    if FN.asm_err.len > 0 {
+        fail(u.f2("inline assembly at %s: %s", b.loc, FN.asm_err));
         return;
     }
     let start = here();
@@ -4293,36 +4432,36 @@ fn enc_asm(i: *mut mc.MInst) void {
         fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
         return;
     }
-    code.put(A.secs.at(0).data.items());
-    let rels = aob.inline_asm(OBJ, A, fsym.get(@int_cast(usize, F.id)), start, asm_symbol_u);
+    FN.code.put(A.secs.at(0).data.items());
+    let rels = aob.inline_asm(O.obj, A, O.fsym.get(@int_cast(usize, FN.f.id)), start, asm_symbol_u);
     if acr.failed(A) {
         fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
         return;
     }
     for r in rels {
-        rls.push(Rl.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
+        FN.rls.push(Rl.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
     }
-    if DBG.on and (A.icfi.len > 0) {
+    if O.dbg.on and (A.icfi.len > 0) {
         // (the registers the template saves: rules from sp; the frame's: x29
         // and x30 at CFA - 16 and - 8, the callee-saved ones in their slots)
-        let n = @int_cast(usize, nsaved) + 2;
+        let n = @int_cast(usize, FN.nsaved) + 2;
         let regs = u.newn.[u32](n);
         let offs = u.newn.[i64](n);
         regs[0] = dw.A64_FP;
         offs[0] = -16;
         regs[1] = dw.A64_LR;
         offs[1] = -8;
-        for k in 0..@int_cast(usize, nsaved) {
-            let r = saved[k];
+        for k in 0..@int_cast(usize, FN.nsaved) {
+            let r = FN.saved[k];
             let mut dr = @bit_cast(u32, r);
             if r >= V0 {
                 dr = 64 + @bit_cast(u32, r - V0);
             }
             regs[k + 2] = dr;
-            offs[k + 2] = -16 - frame + save_off[k];
+            offs[k + 2] = -16 - FN.frame + FN.save_off[k];
         }
         for c in acr.inline_cfi(A, dw.A64_SP, regs[0..n], offs[0..n]) {
-            xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
+            FN.xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
         }
     }
 }
@@ -4364,7 +4503,7 @@ fn pure_word(w: u64) bool {
         }
         return (k == 4) or (k == 6) or (k >= 8);  // csel, 1-/2-source, 3-source (not ccmp)
     }
-    if ((op0 & 7) == 7) and strict_fp {
+    if ((op0 & 7) == 7) and FN.strict_fp {
         return false;  // (strict floating point: the exceptions are effects)
     }
     if (op0 & 7) == 7 {
@@ -4439,14 +4578,14 @@ fn debug_ra_suffix() []u8 {
 }
 
 fn compile_func(f: *mut ir.Func) void {
-    F = f;
-    gaddr.clear();
-    gaddr_blk = @ptr_from_int(*mut mc.MBlock, 0);
-    vcs.clear();
-    vc_blk = @ptr_from_int(*mut mc.MBlock, 0);
-    nlocal = 0;
-    out_area = 0;
-    dyn_frame = false;
+    FN.f = f;
+    FN.gaddr.clear();
+    FN.gaddr_blk = @ptr_from_int(*mut mc.MBlock, 0);
+    FN.vcs.clear();
+    FN.vc_blk = @ptr_from_int(*mut mc.MBlock, 0);
+    FN.nlocal = 0;
+    FN.out_area = 0;
+    FN.dyn_frame = false;
     swl.lower(f);  // (jump tables, bit tests, a search: switches.ax)
     opt.split_critical_edges(f);
     lower.scalarize(f, legal);
@@ -4457,20 +4596,20 @@ fn compile_func(f: *mut ir.Func) void {
     opt.hoist_to_entry(f, is_tls_global);
     opt.layout(&mut order);
     prepare(f);
-    MF = is.new_mfunc(f, &order);
-    dloc.begin(f, DBG.full);
+    FN.mf = is.new_mfunc(f, &order);
+    dloc.begin(f, O.dbg.full);
     // parameters
     mc.cur_src = f.src;
     mc.cur_scope = 0;
-    CB = MF.blocks.get(0);
+    FN.cb = FN.mf.blocks.get(0);
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
     let mut soff: i64 = 16;
     if f.va_home {
         soff += 64;  // (Windows: x0-x7's home area, win_prologue)
     }
-    call_results.clear();
-    cas_oks.clear();
+    FN.call_results.clear();
+    FN.cas_oks.clear();
     for pi in 0..f.params.len {
         let p = f.params[pi];
         let c = class_of(p.ty);
@@ -4504,8 +4643,8 @@ fn compile_func(f: *mut ir.Func) void {
     }
     for bi in 0..order.len {
         let ib = order.get(bi);
-        CB = MF.blocks.get(bi);
-        dloc.enter_block(ib, CB);
+        FN.cb = FN.mf.blocks.get(bi);
+        dloc.enter_block(ib, FN.cb);
         let mut i = ib.first;
         while u.notnil(i) {
             if i.src != 0 {
@@ -4513,24 +4652,24 @@ fn compile_func(f: *mut ir.Func) void {
                 mc.cur_scope = i.scope;
             }
             if dloc.active {
-                dloc.before(i, CB);  // (-g: the variables' assignments before it)
+                dloc.before(i, FN.cb);  // (-g: the variables' assignments before it)
             }
             if not ir.is_term(i.op) {
                 gen_inst(i);
                 if dloc.active {
-                    dloc.selected(i, CB, i.loc);
+                    dloc.selected(i, FN.cb, i.loc);
                 }
             }
             i = i.next;
         }
         gen_term(ib);
-        dloc.end_block(CB);
-        is.push_succs(CB, ir.terminator(ib));
+        dloc.end_block(FN.cb);
+        is.push_succs(FN.cb, ir.terminator(ib));
     }
     mc.cur_src = 0;
     mc.cur_scope = 0;
     order.deinit();
-    if errors {
+    if O.errors {
         return;
     }
     let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], vr_order[..], vr_order[..], vr_order[..]],
@@ -4538,12 +4677,12 @@ fn compile_func(f: *mut ir.Func) void {
                           spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
     let dn = debug_ra_suffix();
     mc.debug_ra = (dn.len > 0) and (dn.len <= f.name.len) and u.str_eq(f.name[(f.name.len - dn.len)..f.name.len], dn);
-    strict_fp = f.strict_fp;
-    mc.dce(MF, pure_inst);
-    mc.allocate(MF, &tgt);
-    mc.drop_reloads(MF, is_label, no_copy);
+    FN.strict_fp = f.strict_fp;
+    mc.dce(FN.mf, pure_inst);
+    mc.allocate(FN.mf, &tgt);
+    mc.drop_reloads(FN.mf, is_label, no_copy);
     encode_func(f);
-    mc.free_func(MF);
+    mc.free_func(FN.mf);
 }
 
 // -----------------------------------------------------------------------------
@@ -4562,51 +4701,34 @@ struct Fx {
     kind: i32,  // 0: imm26, 1: imm19
 }
 
-let mut code: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
-let mut rls: u.List.[Rl] = u.List.[Rl].{ data: @ptr_from_int(*mut Rl, 0), len: 0, cap: 0 };
-let mut fxs: u.List.[Fx] = u.List.[Fx].{ data: @ptr_from_int(*mut Fx, 0), len: 0, cap: 0 };
-let mut local_off: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut saved: [18]i32 = [0; 18];
-let mut nsaved: usize = 0;
-let mut save_off: [18]i64 = [0; 18];
-let mut frame: i64 = 0;
-
 fn P(r: i32) i32 {
-    return mc.phys(MF, r);
+    return mc.phys(FN.mf, r);
 }
 
 fn w32(x: u64) void {
-    code.u32_(x & 0xFFFF_FFFF);
+    FN.code.u32_(x & 0xFFFF_FFFF);
 }
 
 fn here() u64 {
-    return @as(u64, code.len());
+    return @as(u64, FN.code.len());
 }
-
-// The symbol of the slot offset that the Darwin runtime sets (axiom.tls_key,
-// defined by the linker).
-let mut tls_key_si: i32 = -1;
 
 fn tls_key_sym() i32 {
-    if tls_key_si < 0 {
-        tls_key_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_key", false));
+    if O.tls_key_si < 0 {
+        O.tls_key_si = @bit_cast(i32, elf.ext_sym(O.obj, "axiom.tls_key", false));
     }
-    return tls_key_si;
+    return O.tls_key_si;
 }
 
-// The symbol of the image's TLS index on Windows (axiom.tls_index, defined
-// by plink.ax; the loader sets it).
-let mut tls_index_si: i32 = -1;
-
 fn tls_index_sym() i32 {
-    if tls_index_si < 0 {
-        tls_index_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_index", false));
+    if O.tls_index_si < 0 {
+        O.tls_index_si = @bit_cast(i32, elf.ext_sym(O.obj, "axiom.tls_index", false));
     }
-    return tls_index_si;
+    return O.tls_index_si;
 }
 
 fn reloc(ty: u32, sym: i32, addend: i64) void {
-    rls.push(Rl.{ off: here(), ty: ty, sym: sym, addend: addend });
+    FN.rls.push(Rl.{ off: here(), ty: ty, sym: sym, addend: addend });
 }
 
 // rd = x (movz / movn / movk, or orr with a logical immediate)
@@ -4730,11 +4852,11 @@ fn resolve(o: mc.MOp) Loc {
     let mut l = Loc.{ base: -1, index: -1, scale: @as(u64, o.scale), disp: o.disp, sym: -1, align: 0 };
     if o.slot >= 0 {
         l.base = SP;
-        l.disp += MF.slots.get(@int_cast(usize, o.slot)).offset;
-        if dyn_frame {
+        l.disp += FN.mf.slots.get(@int_cast(usize, o.slot)).offset;
+        if FN.dyn_frame {
             // (x29 is the stack pointer after the prologue plus the frame)
             l.base = FP;
-            l.disp -= frame;
+            l.disp -= FN.frame;
         }
         return l;
     }
@@ -4847,20 +4969,20 @@ fn fldst_size(sz: u8) u64 {
 }
 
 fn label_ref(l: i32, kind: i32) void {
-    fxs.push(Fx.{ off: here(), label: l, kind: kind });
+    FN.fxs.push(Fx.{ off: here(), label: l, kind: kind });
 }
 
 fn save_restore(load: bool) void {
     let mut k: usize = 0;
-    while k < nsaved {
-        let r = saved[k];
+    while k < FN.nsaved {
+        let r = FN.saved[k];
         // neighbours of a class in neighbouring slots: one STP / LDP
         let mut size: i64 = 8;
         if r >= V0 {
             size = 16;
         }
-        if ((k + 1) < nsaved) and ((saved[k + 1] >= V0) == (r >= V0)) and (save_off[k + 1] == (save_off[k] + size)) and
-           ((save_off[k] / size) <= 63) {
+        if ((k + 1) < FN.nsaved) and ((FN.saved[k + 1] >= V0) == (r >= V0)) and
+           (FN.save_off[k + 1] == (FN.save_off[k] + size)) and ((FN.save_off[k] / size) <= 63) {
             let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
             if r >= V0 {
                 w = 0xAD00_0000;  // stp q
@@ -4868,12 +4990,12 @@ fn save_restore(load: bool) void {
             if load {
                 w = w | (1 << 22);
             }
-            let imm7 = @bit_cast(u64, save_off[k] / size) & 0x7f;
-            w32(((w | (imm7 << 15)) | (ae.r5(saved[k + 1]) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
+            let imm7 = @bit_cast(u64, FN.save_off[k] / size) & 0x7f;
+            w32(((w | (imm7 << 15)) | (ae.r5(FN.saved[k + 1]) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
             k += 2;
             continue;
         }
-        let m = mc.mem(SP, -1, 0, save_off[k]);
+        let m = mc.mem(SP, -1, 0, FN.save_off[k]);
         if r >= V0 {
             let mut opc: u64 = 2;
             if load {
@@ -4891,33 +5013,14 @@ fn save_restore(load: bool) void {
     }
 }
 
-// A leaf with nothing on the stack needs no frame (a call that does not
-// return may still clobber the link register; with frame tables, where the
-// walk needs the caller's return address, it does not).
-let mut frameless: bool = false;
-let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                              chains_sym: 0, text0: -1, rets0: -1, cur_text: -1,
-                              others: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, rel32: 0,
-                              abs64: 0, empty: 0, lines: false, ro: -1, ro_sym: 0,
-                              rec_of: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                 cap: 0, len: 0 }, recs: u.U64Map.{
-                                                     keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                     cap: 0, len: 0 }, pairs: u.U64Map.{
-                                                         keys: @ptr_from_int(*mut u64, 0),
-                                                         vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 },
-                              ctxs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
-                                               cap: 0, len: 0 }, strs: u.SymMap.[u64].{
-                                                   keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
-                                                   cap: 0, len: 0 }, last: [0, 0] };  // frame tables (ftab.ax)
-
 fn needs_frame() bool {
-    if (frame != 0) or (nsaved > 0) or dyn_frame {
+    if (FN.frame != 0) or (FN.nsaved > 0) or FN.dyn_frame {
         return true;
     }
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
-            if (i.clobber != 0) or ((FT.on or WIN_) and (i.op == CALL) and not is_tail(i)) {
+            if (i.clobber != 0) or ((O.ft.on or O.win) and (i.op == CALL) and not is_tail(i)) {
                 return true;
             }
             for k in 0..i.ops.len {
@@ -4937,45 +5040,6 @@ fn needs_frame() bool {
     return false;
 }
 
-// -g: the debug information of the object (dwarf.ax), and the call frame
-// states as the function is encoded (dwarf.cfi_state): its save list is x29
-// at CFA - 16, x30 at CFA - 8, then the callee-saved registers in their slots.
-let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0,
-                                 parts: [
-                                     dw.Part.{
-                                         b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
-                                                                        cap: 0 } },
-                                         fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                               cap: 0 } }; 11],
-                                 strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 files: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
-                                 fmap: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 by_id: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 }, nfuncs: 0,
-                                 first_src: 0, text_sym: 0,
-                                 trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                 gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 toff: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
-                                 drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                 gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
-                                 voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, tls_rel: 0,
-                                 cies: [0; 4], size_fix: false,
-                                 sums: u.List.[[16]u8].{ data: @ptr_from_int(*mut [16]u8, 0), len: 0, cap: 0 },
-                                 nosum: false,
-                                 names: u.List.[dw.Named].{ data: @ptr_from_int(*mut dw.Named, 0), len: 0, cap: 0 },
-                                 abs_fns: u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 },
-                                 abs_map: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                           vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
-                                 ranges: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
-                                 lrefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 } };
-let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut xcfis: u.List.[dw.XCfi] = u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 };
-
 /// A call frame state of sp + 8 * CFI_NONE: no rule (Windows: in a function
 /// with a register save area, where sp is above the frame record's top by
 /// more than a state can say; codeview.ax describes nothing there).
@@ -4983,40 +5047,40 @@ pub const CFI_NONE: u64 = 7;
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
-    if not DBG.on and not MU.on {
+    if not O.dbg.on and not O.mu.on {
         return;
     }
     let pc = here();
     let st = dw.cfi_state(pc, cfa_reg, k, mask);
-    if (cfis.len > 0) and ((cfis.last() & 0xffff_ffff) == pc) {
-        cfis.set(cfis.len - 1, st);
+    if (FN.cfis.len > 0) and ((FN.cfis.last() & 0xffff_ffff) == pc) {
+        FN.cfis.set(FN.cfis.len - 1, st);
         return;
     }
-    cfis.push(st);
+    FN.cfis.push(st);
 }
 
 // The state in the function's body: CFA = x29 + 16, everything saved.
 fn cfi_body() void {
-    if frameless {
+    if FN.frameless {
         cfi(dw.A64_SP, 0, 0);
         return;
     }
-    cfi(dw.A64_FP, 2, (@as(u64, 1) << @int_cast(u32, nsaved + 2)) - 1);
+    cfi(dw.A64_FP, 2, (@as(u64, 1) << @int_cast(u32, FN.nsaved + 2)) - 1);
 }
 
 fn prologue() void {
-    if WIN_ {
+    if O.win {
         win_prologue();
         return;
     }
-    if frameless {
+    if FN.frameless {
         return;
     }
     w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
     cfi(dw.A64_SP, 2, 3);
     w32(0x9100_03FD);  // mov x29, sp
     cfi(dw.A64_FP, 2, 3);
-    let mut rem = frame;
+    let mut rem = FN.frame;
     while rem > 4096 {
         w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));  // sub sp, sp, #4096
         w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));            // str xzr, [sp] (touch the page)
@@ -5039,15 +5103,15 @@ fn epilogue() void {
 
 // The epilogue but its ret: the callee-saved registers, x29, x30 and sp back.
 fn unframe() void {
-    if WIN_ {
+    if O.win {
         win_unframe();
         return;
     }
-    if frameless {
+    if FN.frameless {
         return;
     }
-    if dyn_frame {
-        add_disp(SP, FP, -frame);  // (the saved registers are where the prologue put them)
+    if FN.dyn_frame {
+        add_disp(SP, FP, -FN.frame);  // (the saved registers are where the prologue put them)
     }
     save_restore(true);
     cfi(dw.A64_FP, 2, 3);  // (the callee-saved registers restored)
@@ -5087,57 +5151,50 @@ fn unframe() void {
 //   [add sp, sp, #64]           alloc_s
 //   ret (or a sibling call's b) end
 // -----------------------------------------------------------------------------
-let mut uw_pro: uw.Codes = uw.Codes.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
-                                                                     cap: 0 } },
-                                      at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } };
-let mut uw_epi: uw.Codes = uw.Codes.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
-                                                                     cap: 0 } },
-                                      at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } };
-let mut uw_epis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 // D: the bytes of the frame's top part, the saved registers' (from the
 // 16-byte boundary at or below the lowest save to the frame's top).
 fn win_top() i64 {
-    if nsaved == 0 {
+    if FN.nsaved == 0 {
         return 0;
     }
-    return frame - (save_off[0] & ~@as(i64, 15));
+    return FN.frame - (FN.save_off[0] & ~@as(i64, 15));
 }
 
 fn win_prologue() void {
-    uw.clear(&mut uw_pro);
-    uw.clear(&mut uw_epi);
-    uw_epis.clear();
-    if frameless {
+    uw.clear(&mut FN.uw_pro);
+    uw.clear(&mut FN.uw_epi);
+    FN.uw_epis.clear();
+    if FN.frameless {
         return;
     }
     // (the call frame's states, codeview.ax: the frame record's top, x29 +
     // 16, stands for the CFA, which is 64 bytes above it in a function that
     // keeps its register arguments in a save area above the record; where
     // sp is that far above it, the state is CFI_NONE)
-    if F.va_home {
+    if FN.f.va_home {
         cfi(dw.A64_SP, CFI_NONE, 0);
         w32(ae.addsub_imm(1, true, false, SP, SP, 64, false));  // sub sp, sp, #64
-        _ = uw.alloc(&mut uw_pro, 64);
+        _ = uw.alloc(&mut FN.uw_pro, 64);
         cfi(dw.A64_SP, 0, 0);
     }
     w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
-    uw.save_fplr_x(&mut uw_pro, 16);
+    uw.save_fplr_x(&mut FN.uw_pro, 16);
     cfi(dw.A64_SP, 2, 3);
     w32(0x9100_03FD);  // mov x29, sp
-    uw.op1(&mut uw_pro, uw.SET_FP);
+    uw.op1(&mut FN.uw_pro, uw.SET_FP);
     cfi(dw.A64_FP, 2, 3);
     let top = win_top();
     if top > 0 {
         w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, top), false));
-        _ = uw.alloc(&mut uw_pro, @bit_cast(u64, top));
+        _ = uw.alloc(&mut FN.uw_pro, @bit_cast(u64, top));
     }
-    win_saves(false, &mut uw_pro);
-    if dyn_frame {
+    win_saves(false, &mut FN.uw_pro);
+    if FN.dyn_frame {
         w32(ae.addsub_imm(1, false, false, FP, SP, @bit_cast(u64, top), false));  // add x29, sp, #D
-        uw.add_fp(&mut uw_pro, @bit_cast(u64, top));
+        uw.add_fp(&mut FN.uw_pro, @bit_cast(u64, top));
     }
-    let rest = @bit_cast(u64, frame - top);
+    let rest = @bit_cast(u64, FN.frame - top);
     if rest == 0 {
         cfi_body();
         return;
@@ -5148,7 +5205,7 @@ fn win_prologue() void {
         } else {
             w32(ae.addsub_imm(1, true, false, SP, SP, rest, false));
         }
-        _ = uw.alloc(&mut uw_pro, rest);
+        _ = uw.alloc(&mut FN.uw_pro, rest);
         cfi_body();
         return;
     }
@@ -5163,10 +5220,10 @@ fn win_prologue() void {
     w32(ae.bcond(cc64(NE)) | ((@bit_cast(u64, @as(i64, -3)) & 0x7_ffff) << 5));  // b.ne (back to the sub)
     enc_movi(X16, @bit_cast(i64, rest), 1);
     for _k in 0..(here() - n0) / 4 {
-        uw.op1(&mut uw_pro, uw.NOP);
+        uw.op1(&mut FN.uw_pro, uw.NOP);
     }
     w32(ae.addsub_ext(1, true, false, SP, SP, X16, 0));  // sub sp, sp, x16
-    if not uw.alloc(&mut uw_pro, rest) {
+    if not uw.alloc(&mut FN.uw_pro, rest) {
         fail("the stack frame is too large for Windows unwind information (256 MiB)");
     }
     cfi_body();
@@ -5175,13 +5232,14 @@ fn win_prologue() void {
 // The saves (or with load the restores) of the callee-saved registers at
 // their offsets from sp below the frame's top part, each with its code in c.
 fn win_saves(load: bool, c: *mut uw.Codes) void {
-    let delta = frame - win_top();
+    let delta = FN.frame - win_top();
     let mut k: usize = 0;
-    while k < nsaved {
-        let r = saved[k];
-        let off = save_off[k] - delta;
+    while k < FN.nsaved {
+        let r = FN.saved[k];
+        let off = FN.save_off[k] - delta;
         let uoff = @bit_cast(u64, off);
-        if (r < V0) and ((k + 1) < nsaved) and (saved[k + 1] == (r + 1)) and (save_off[k + 1] == (save_off[k] + 8)) {
+        if (r < V0) and ((k + 1) < FN.nsaved) and (FN.saved[k + 1] == (r + 1)) and
+           (FN.save_off[k + 1] == (FN.save_off[k] + 8)) {
             let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
             if load {
                 w = w | (1 << 22);
@@ -5208,13 +5266,13 @@ fn win_saves(load: bool, c: *mut uw.Codes) void {
 }
 
 fn win_unframe() void {
-    if frameless {
+    if FN.frameless {
         return;
     }
-    let first = uw_epis.len == 0;
-    uw_epis.push(here());
+    let first = FN.uw_epis.len == 0;
+    FN.uw_epis.push(here());
     let mut sink = uw.new_codes();
-    let mut c = &mut uw_epi;
+    let mut c = &mut FN.uw_epi;
     if not first {
         c = &mut sink;  // (every epilogue is the same: its codes once)
     }
@@ -5230,7 +5288,7 @@ fn win_unframe() void {
     w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
     uw.save_fplr_x(c, 16);
     cfi(dw.A64_SP, 0, 0);
-    if F.va_home {
+    if FN.f.va_home {
         w32(ae.addsub_imm(1, false, false, SP, SP, 64, false));
         _ = uw.alloc(c, 64);
         cfi(dw.A64_SP, CFI_NONE, 0);
@@ -5243,21 +5301,21 @@ fn win_unframe() void {
 // information in .xdata and its entry in .pdata (its start, and its
 // record's: addresses relative to the image, which plink.ax resolves).
 fn win_unwind(fs: u32, base: u64, size: u64) void {
-    let mut info = uw.xdata(size, &uw_pro, &uw_epi, uw_epis.items());
+    let mut info = uw.xdata(size, &FN.uw_pro, &FN.uw_epi, FN.uw_epis.items());
     if info.len() == 0 {
         fail("the function is too large for Windows unwind information (1 MiB of code, or too many epilogues)");
         return;
     }
-    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    let x = O.obj.secs.get(@int_cast(usize, O.xdata));
     x.data.align(4);
     let xoff = @as(u64, x.data.len());
     x.data.put(info.view());
     info.free();
-    let p = OBJ.secs.get(@int_cast(usize, PDATA));
+    let p = O.obj.secs.get(@int_cast(usize, O.pdata));
     let poff = @as(u64, p.data.len());
     p.data.zeros(8);
     p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: fs, addend: 0 });
-    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
+    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: O.xdata_sym, addend: @bit_cast(i64, xoff) });
 }
 
 // DYNSTACK: the stack pointer moved, for dynamic allocation.
@@ -5284,15 +5342,8 @@ fn enc_dynstack(i: *mut mc.MInst) void {
     w32(ae.B | (@bit_cast(u64, @as(i64, -5)) & 0x3ff_ffff));  // b (back to the cmp)
     w32(ae.addsub_ext(1, true, false, SP, SP, t, 0));         // sub sp, sp, t
     // d = sp + the outgoing arguments' area (below the allocation)
-    add_disp(d, SP, @bit_cast(i64, (out_area + 15) & ~@as(u64, 15)));
+    add_disp(d, SP, @bit_cast(i64, (FN.out_area + 15) & ~@as(u64, 15)));
 }
-
-// Jump tables: the jumps through one encoded so far, whose tables are
-// filled in once the function's place is known (fill_jump_tables), and a
-// local symbol at the start of the function's section for their entries.
-let mut jtabs: u.List.[*mut mc.MInst] = u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0,
-                                                                 cap: 0 };
-let mut JT_TEXT: u32 = 0;
 
 fn enc_jtab(i: *mut mc.MInst) void {
     let ix = ae.r5(P(i.ops[0].reg));
@@ -5311,7 +5362,7 @@ fn enc_jtab(i: *mut mc.MInst) void {
     w32(0xb8a0_1800 | (ix << 16) | (option << 13) | (tr << 5) | v);  // ldrsw v, [t, ix, <option> #2]
     w32(0x8b00_0000 | (v << 16) | (tr << 5) | tr);                   // add t, t, v
     w32(0xd61f_0000 | (tr << 5));                                    // br t
-    jtabs.push(i);
+    FN.jtabs.push(i);
 }
 
 // The entries of the tables of the function's jumps through one (encoded
@@ -5319,22 +5370,21 @@ fn enc_jtab(i: *mut mc.MInst) void {
 // target from the table's start, a PC-relative relocation against .text
 // with the entry's own offset added back (S + A - P, P the entry's address).
 fn fill_jump_tables(base: u64, boff: []u64) void {
-    if jtabs.len == 0 {
+    if FN.jtabs.len == 0 {
         return;
     }
-    JT_TEXT = elf.sec_sym(OBJ, TEXT);  // (the code's section: the function's)
-    for j in jtabs.items() {
-        let ts = OBJ.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
-        let sec = OBJ.secs.get(@int_cast(usize, ts.sec));
+    FN.jt_text = elf.sec_sym(O.obj, O.text);  // (the code's section: the function's)
+    for j in FN.jtabs.items() {
+        let ts = O.obj.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
+        let sec = O.obj.secs.get(@int_cast(usize, ts.sec));
         for k in 3..j.ops.len {
             let eo = 4 * @as(u64, k - 3);
             let target = base + boff[@int_cast(usize, j.ops[k].label)];
-            sec.relocs.push(
-                elf.Rel.{
-                    off: ts.value + eo, ty: elf.R_AARCH64_PREL32, sym: JT_TEXT, addend: @bit_cast(i64, target + eo) });
+            sec.relocs.push(elf.Rel.{ off: ts.value + eo, ty: elf.R_AARCH64_PREL32, sym: FN.jt_text,
+                                      addend: @bit_cast(i64, target + eo) });
         }
     }
-    jtabs.clear();
+    FN.jtabs.clear();
 }
 
 fn enc_inst(i: *mut mc.MInst) void {
@@ -5497,7 +5547,7 @@ fn enc_inst(i: *mut mc.MInst) void {
             reloc(elf.R_AARCH64_LDST64_ABS_LO12_NC, k, 0);
             w32(ae.ldst_uimm(3, false, 1, X16, X16, 0));
             w32(ae.ldst_reg(3, false, 1, d, d, X16, false));
-        } else if WIN_ {
+        } else if O.win {
             // Windows: the image's block of this thread is
             // TEB.ThreadLocalStoragePointer[_tls_index] (x18 holds the TEB;
             // the linker supplies the index as axiom.tls_index, and makes
@@ -5559,10 +5609,10 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == LABEL {
         let l = @truncate(i32, i.aux) - LOCAL_BASE;
-        while local_off.len <= @int_cast(usize, l) {
-            local_off.push(0);
+        while FN.local_off.len <= @int_cast(usize, l) {
+            FN.local_off.push(0);
         }
-        local_off.set(@int_cast(usize, l), here());
+        FN.local_off.set(@int_cast(usize, l), here());
         return;
     }
     if is_tail(i) {
@@ -5589,9 +5639,9 @@ fn enc_inst(i: *mut mc.MInst) void {
 // A block's closing jump to a later block that only empty blocks separate
 // from it falls through instead.
 fn drop_jumps_to_next() void {
-    let nb = MF.blocks.len;
+    let nb = FN.mf.blocks.len;
     for bi in 0..nb {
-        let b = MF.blocks.get(bi);
+        let b = FN.mf.blocks.get(bi);
         let j = b.last;
         if u.isnil(j) or (j.op != B) or (j.ops[0].kind != mc.K_LABEL) or (j.ops[0].label >= LOCAL_BASE) {
             continue;
@@ -5602,7 +5652,7 @@ fn drop_jumps_to_next() void {
         }
         let mut empty = true;
         for k in (bi + 1)..t {
-            if u.notnil(MF.blocks.get(k).first) {
+            if u.notnil(FN.mf.blocks.get(k).first) {
                 empty = false;
                 break;
             }
@@ -5616,63 +5666,63 @@ fn drop_jumps_to_next() void {
 fn encode_func(f: *mut ir.Func) void {
     asm_used_regs();
     // callee-saved registers in use
-    nsaved = 0;
+    FN.nsaved = 0;
     for r in @as(usize, 19)..29 {
-        if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-            saved[nsaved] = @int_cast(i32, r);
-            nsaved += 1;
+        if (FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            FN.saved[FN.nsaved] = @int_cast(i32, r);
+            FN.nsaved += 1;
         }
     }
     for r in @as(usize, 40)..48 {
-        if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-            saved[nsaved] = @int_cast(i32, r);
-            nsaved += 1;
+        if (FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            FN.saved[FN.nsaved] = @int_cast(i32, r);
+            FN.nsaved += 1;
         }
     }
-    if MACOS_ {
+    if O.macos {
         mac_save_order();
     }
     // frame layout from sp: outgoing arguments, slots, saved registers
-    let mut cur = @bit_cast(i64, (out_area + 15) & ~@as(u64, 15));
-    for k in 0..MF.slots.len {
-        let s = MF.slots.at(k);
+    let mut cur = @bit_cast(i64, (FN.out_area + 15) & ~@as(u64, 15));
+    for k in 0..FN.mf.slots.len {
+        let s = FN.mf.slots.at(k);
         let a = @bit_cast(i64, s.align);
         cur = (cur + a - 1) & ~(a - 1);
         s.offset = cur;
         cur += @bit_cast(i64, s.size);
     }
-    if MACOS_ {
+    if O.macos {
         cur = (cur + 15) & ~@as(i64, 15);  // (the saves end at the frame's top: mac_save_order)
     }
-    for k in 0..nsaved {
-        if saved[k] >= V0 {
+    for k in 0..FN.nsaved {
+        if FN.saved[k] >= V0 {
             cur = (cur + 15) & ~@as(i64, 15);
-            save_off[k] = cur;
+            FN.save_off[k] = cur;
             cur += 16;
         } else {
             cur = (cur + 7) & ~@as(i64, 7);
-            save_off[k] = cur;
+            FN.save_off[k] = cur;
             cur += 8;
         }
     }
-    frame = (cur + 15) & ~@as(i64, 15);
-    if frame > 0x7000_0000 {
+    FN.frame = (cur + 15) & ~@as(i64, 15);
+    if FN.frame > 0x7000_0000 {
         // (code generation keeps a function's locals to 1 GiB, E0473, and inlining keeps to that too)
         fail("the stack frame is too large");
     }
     drop_jumps_to_next();
-    code = bn.new_bytes();
-    rls.clear();
-    fxs.clear();
-    jtabs.clear();
-    local_off.clear();
-    frameless = not needs_frame();
-    cfis.clear();
-    xcfis.clear();
-    tail_ends.clear();
-    aob.inline_pass(OBJ);
+    FN.code = bn.new_bytes();
+    FN.rls.clear();
+    FN.fxs.clear();
+    FN.jtabs.clear();
+    FN.local_off.clear();
+    FN.frameless = not needs_frame();
+    FN.cfis.clear();
+    FN.xcfis.clear();
+    FN.tail_ends.clear();
+    aob.inline_pass(O.obj);
     prologue();
-    let nb = MF.blocks.len;
+    let nb = FN.mf.blocks.len;
     let boff = u.newn.[u64](nb + 1);
     // frame tables: (offset after each call, its chain)
     let mut calls = u.List.[u64].empty();
@@ -5680,11 +5730,11 @@ fn encode_func(f: *mut ir.Func) void {
     let mut rows = u.List.[u64].empty();
     let mut last_src: u32 = 0;
     let mut pe_done = false;
-    let lines = DBG.on or WIN_;  // (Windows: for the PDB, winlines.ax)
+    let lines = O.dbg.on or O.win;  // (Windows: for the PDB, winlines.ax)
     // -g (full): (code offset, lexical block) where the block changes
     let mut scopes = u.List.[u64].empty();
     let mut last_scope: u32 = 0;
-    if DBG.on {
+    if O.dbg.on {
         if f.src != 0 {
             rows.push(@as(u64, f.src));
         }
@@ -5695,14 +5745,14 @@ fn encode_func(f: *mut ir.Func) void {
         last_src = f.src;
     }
     for bi in 0..nb {
-        let b = MF.blocks.get(bi);
+        let b = FN.mf.blocks.get(bi);
         boff[bi] = here();
         dloc.block_at(bi, boff[bi], bi == 0);
         let mut i = b.first;
         while u.notnil(i) {
             // (the prologue ends, for a debugger, at the first instruction of
             // another line than the function's: past the parameters' stores)
-            if DBG.on and not pe_done and (i.src != 0) and (i.src != f.src) {
+            if O.dbg.on and not pe_done and (i.src != 0) and (i.src != f.src) {
                 rows.push(((here() << 32) | dw.ROW_PE) | @as(u64, i.src));
                 last_src = i.src;
                 pe_done = true;
@@ -5710,13 +5760,13 @@ fn encode_func(f: *mut ir.Func) void {
                 rows.push((here() << 32) | @as(u64, i.src));
                 last_src = i.src;
             }
-            if DBG.on and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
+            if O.dbg.on and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
                 scopes.push((here() << 32) | @as(u64, i.scope));
                 last_scope = i.scope;
             }
             dloc.inst_at(i, here());
             enc_inst(i);
-            if FT.on and (i.op == CALL) and not is_tail(i) {
+            if O.ft.on and (i.op == CALL) and not is_tail(i) {
                 calls.push(here());
                 calls.push(@bit_cast(u64, i.aux));
             }
@@ -5724,12 +5774,12 @@ fn encode_func(f: *mut ir.Func) void {
         }
     }
     // branch targets
-    let cv = code.view();
-    for k in 0..fxs.len {
-        let x = fxs.get(k);
+    let cv = FN.code.view();
+    for k in 0..FN.fxs.len {
+        let x = FN.fxs.get(k);
         let mut target: u64 = 0;
         if x.label >= LOCAL_BASE {
-            target = local_off.get(@int_cast(usize, x.label - LOCAL_BASE));
+            target = FN.local_off.get(@int_cast(usize, x.label - LOCAL_BASE));
         } else {
             target = boff[@int_cast(usize, x.label)];
         }
@@ -5745,9 +5795,9 @@ fn encode_func(f: *mut ir.Func) void {
             }
             w = w | ((@bit_cast(u64, rel) & 0x7_ffff) << 5);
         }
-        code.set_u32(o, w);
+        FN.code.set_u32(o, w);
     }
-    let text = OBJ.secs.get(@int_cast(usize, TEXT));
+    let text = O.obj.secs.get(@int_cast(usize, O.text));
     // (16 bytes, or the function's own alignment: C's attribute aligned)
     let mut falign: u64 = 16;
     if f.align > falign {
@@ -5758,62 +5808,62 @@ fn encode_func(f: *mut ir.Func) void {
     }
     text.data.align(@truncate(usize, falign));
     let base = @as(u64, text.data.len());
-    text.data.put(code.view());
+    text.data.put(FN.code.view());
     fill_jump_tables(base, boff);
-    for k in 0..rls.len {
-        let r = rls.get(k);
+    for k in 0..FN.rls.len {
+        let r = FN.rls.get(k);
         text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
     }
-    let mut s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+    let mut s = O.obj.syms.at(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
     s.value = base;
-    s.size = @as(u64, code.len());
-    aob.inline_place(OBJ, TEXT, base);
-    ft.func(&mut FT, TEXT, base, s.size, frameless, calls.items()[0..0], calls.items(), rows.items(), scopes.items(),
-            dw.func_name(f, elf.display_name(s.name)));
-    if WIN_ and not frameless {
+    s.size = @as(u64, FN.code.len());
+    aob.inline_place(O.obj, O.text, base);
+    ft.func(&mut O.ft, O.text, base, s.size, FN.frameless, calls.items()[0..0], calls.items(), rows.items(),
+            scopes.items(), dw.func_name(f, elf.display_name(s.name)));
+    if O.win and not FN.frameless {
         // (code in a COMDAT group: its group's own unwind sections)
-        let sx = XDATA;
-        let sp = PDATA;
-        let ss = XDATA_SYM;
-        XDATA = is.group_unwind(OBJ, TEXT, ".xdata", XDATA);
-        PDATA = is.group_unwind(OBJ, TEXT, ".pdata", PDATA);
-        if XDATA != sx {
-            XDATA_SYM = elf.sec_sym(OBJ, XDATA);
+        let sx = O.xdata;
+        let sp = O.pdata;
+        let ss = O.xdata_sym;
+        O.xdata = is.group_unwind(O.obj, O.text, ".xdata", O.xdata);
+        O.pdata = is.group_unwind(O.obj, O.text, ".pdata", O.pdata);
+        if O.xdata != sx {
+            O.xdata_sym = elf.sec_sym(O.obj, O.xdata);
         }
-        win_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, code.len()));
-        XDATA = sx;
-        PDATA = sp;
-        XDATA_SYM = ss;
+        win_unwind(O.fsym.get(@int_cast(usize, f.id)), base, @as(u64, FN.code.len()));
+        O.xdata = sx;
+        O.pdata = sp;
+        O.xdata_sym = ss;
     }
     // (the symbol again: a section symbol made since may have moved the list)
-    s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
-    if MACOS_ {
-        mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size);
-    } else if MU.on {
+    s = O.obj.syms.at(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
+    if O.macos {
+        mac_unwind(O.fsym.get(@int_cast(usize, f.id)), s.size);
+    } else if O.mu.on {
         elf_unwind(base, s.size);
-        s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+        s = O.obj.syms.at(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
     }
-    if WIN_ and (rows.len > 0) {
-        wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
+    if O.win and (rows.len > 0) {
+        wlines.emit(O.obj, O.lines, codeview.func_key(s.name, s.value), rows.items());
     }
-    if DBG.on {
+    if O.dbg.on {
         let mut regs: [20]u64 = [0; 20];
         _ = save_list(&mut regs);
-        let df = dw.Func.{ xcfi: xcfis.items(), sym: fsym.get(@int_cast(usize, f.id)),
+        let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: O.fsym.get(@int_cast(usize, f.id)),
                            name: dw.func_name(f, elf.display_name(s.name)), external: s.bind != elf.B_LOCAL,
-                           size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: cfis.items(),
-                           regs: regs[0..nsaved + 2], irf: f, vars: dw.var_locs(f, var_slot_off, 16 + frame),
-                           vlocs: dloc.compute(MF, &DLOC, s.size), frame_local: -1, calls: dloc.calls() };
-        if WIN_ {
+                           size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: FN.cfis.items(),
+                           regs: regs[0..FN.nsaved + 2], irf: f, vars: dw.var_locs(f, var_slot_off, 16 + FN.frame),
+                           vlocs: dloc.compute(FN.mf, &DLOC, s.size), frame_local: -1, calls: dloc.calls() };
+        if O.win {
             codeview.add_func(&df, s);
         } else {
-            dw.add_func(&mut DBG, &df);
+            dw.add_func(&mut O.dbg, &df);
         }
         dloc.release(df.vlocs, df.calls);
     }
     rows.deinit();
     scopes.deinit();
-    code.free();
+    FN.code.free();
     calls.deinit();
 }
 
@@ -5826,26 +5876,26 @@ fn encode_func(f: *mut ir.Func) void {
 fn mac_save_order() void {
     let mut xs: u64 = 0;
     let mut vs = u.List.[i32].empty();
-    for k in 0..nsaved {
-        if saved[k] >= V0 {
-            vs.push(saved[k]);
+    for k in 0..FN.nsaved {
+        if FN.saved[k] >= V0 {
+            vs.push(FN.saved[k]);
         } else {
-            xs = xs | (@as(u64, 1) << @int_cast(u32, saved[k]));
+            xs = xs | (@as(u64, 1) << @int_cast(u32, FN.saved[k]));
         }
     }
-    nsaved = 0;
+    FN.nsaved = 0;
     for v in vs.items() {
-        saved[nsaved] = v;
-        nsaved += 1;
+        FN.saved[FN.nsaved] = v;
+        FN.nsaved += 1;
     }
     vs.deinit();
     let mut p: i32 = 27;
     while p >= 19 {
         let pair = (@as(u64, 3) << @int_cast(u32, p));
         if (xs & pair) != 0 {
-            saved[nsaved] = p + 1;
-            saved[nsaved + 1] = p;
-            nsaved += 2;
+            FN.saved[FN.nsaved] = p + 1;
+            FN.saved[FN.nsaved + 1] = p;
+            FN.nsaved += 2;
         }
         p -= 2;
     }
@@ -5856,15 +5906,15 @@ fn mac_save_order() void {
 fn save_list(regs: *mut [20]u64) usize {
     regs[0] = dw.saved_reg(dw.A64_FP, -16);
     regs[1] = dw.saved_reg(dw.A64_LR, -8);
-    for k in 0..nsaved {
-        let r = saved[k];
+    for k in 0..FN.nsaved {
+        let r = FN.saved[k];
         let mut dr = @bit_cast(u32, r);
         if r >= V0 {
             dr = 64 + @bit_cast(u32, r - V0);  // (v8..v15: their low halves are the callee-saved d8..d15)
         }
-        regs[k + 2] = dw.saved_reg(dr, -16 - frame + save_off[k]);
+        regs[k + 2] = dw.saved_reg(dr, -16 - FN.frame + FN.save_off[k]);
     }
-    return nsaved + 2;
+    return FN.nsaved + 2;
 }
 
 // macOS: the function's unwind entry (macunwind.ax): FRAMELESS, FRAME, or
@@ -5872,32 +5922,32 @@ fn save_list(regs: *mut [20]u64) usize {
 // moves after the prologue (DYNSTACK) or a sibling call's jump is not the
 // function's end.
 fn mac_unwind(fs: u32, size: u64) void {
-    if frameless {
-        mu.add(&mut MU, fs, 0, size, mu.A64_FRAMELESS, u.nil_slice.[u8](), false, false);
+    if FN.frameless {
+        mu.add(&mut O.mu, fs, 0, size, mu.A64_FRAMELESS, u.nil_slice.[u8](), false, false);
         return;
     }
     let mut regs: [20]u64 = [0; 20];
     let n = save_list(&mut regs);
     let mut enc = mu.a64_frame(regs[0..n]);
-    if dyn_frame {
+    if FN.dyn_frame {
         enc = 0;
     }
-    for e in tail_ends.items() {
+    for e in FN.tail_ends.items() {
         if e != size {
             enc = 0;
         }
     }
     if enc != 0 {
-        mu.add(&mut MU, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
+        mu.add(&mut O.mu, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
         return;
     }
-    let df = dw.Func.{ xcfi: xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
-                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+    let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: FN.cfis.items(), regs: regs[0..n],
                        irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
                        frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, true, &df);
-    mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
+    mu.add(&mut O.mu, fs, 0, size, 0, prog.view(), false, false);
     prog.free();
 }
 
@@ -5907,13 +5957,13 @@ fn mac_unwind(fs: u32, size: u64) void {
 fn elf_unwind(base: u64, size: u64) void {
     let mut regs: [20]u64 = [0; 20];
     let n = save_list(&mut regs);
-    let df = dw.Func.{ xcfi: xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
-                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+    let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: FN.cfis.items(), regs: regs[0..n],
                        irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
                        frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, true, &df);
-    mu.add(&mut MU, elf.sec_sym(OBJ, TEXT), base, size, 0, prog.view(), false, false);
+    mu.add(&mut O.mu, elf.sec_sym(O.obj, O.text), base, size, 0, prog.view(), false, false);
     prog.free();
 }
 
@@ -5952,14 +6002,14 @@ fn imm_of(i: *mc.MInst) i64 {
 // The frame slot of alloca a: its offset from the CFA (the frame's bottom
 // is 16 + frame below it).
 fn obj_cfa_off(a: *ir.Value) i64 {
-    if frameless {
+    if FN.frameless {
         return dloc.NO_LOC;
     }
     let o = var_slot_off(a);
     if o == dw.NO_LOC {
         return dloc.NO_LOC;
     }
-    return o - (16 + frame);
+    return o - (16 + FN.frame);
 }
 
 // A physical register's DWARF number (DWARF for the Arm 64-bit
@@ -5980,26 +6030,26 @@ fn is_exit(i: *mc.MInst) bool {
 
 // A frame slot's offset from the CFA (the frame's bottom is 16 + frame below it).
 fn slot_cfa_off(k: i32) i64 {
-    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= MF.slots.len) or frameless {
+    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= FN.mf.slots.len) or FN.frameless {
         return dloc.NO_LOC;
     }
-    return MF.slots.at(@as(usize, @bit_cast(u32, k))).offset - (16 + frame);
+    return FN.mf.slots.at(@as(usize, @bit_cast(u32, k))).offset - (16 + FN.frame);
 }
 
 // The offset from the frame's bottom (the stack pointer after the
 // prologue) of the frame slot of alloca a (dwarf.var_locs).
 fn var_slot_off(a: *ir.Value) i64 {
     let k = @int_cast(usize, a.aux);
-    if (a.aux < 0) or (k >= MF.slots.len) {
+    if (a.aux < 0) or (k >= FN.mf.slots.len) {
         return dw.NO_LOC;
     }
-    return MF.slots.at(k).offset;
+    return FN.mf.slots.at(k).offset;
 }
 
 // The location of f's first instruction that has one (or f's own).
 fn first_src(f: *ir.Func) u32 {
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
         while u.notnil(i) {
             if i.src != 0 {
                 return i.src;
@@ -6014,35 +6064,35 @@ fn first_src(f: *ir.Func) u32 {
 // Module
 // -----------------------------------------------------------------------------
 pub fn compile(m: *mut ir.Module) *mut elf.Obj {
-    errors = false;
-    LSE_ = tg.has(tg.A_LSE);
-    WIN_ = tg.is_windows();
-    MACOS_ = tg.is_darwin();
-    OBJ = elf.new_obj(elf.EM_AARCH64);
-    tls_key_si = -1;
-    tls_index_si = -1;
-    consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);
-    TEXT0 = TEXT;
-    RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
-    XDATA = -1;
-    PDATA = -1;
-    LINES = -1;
-    if WIN_ {
+    O.errors = false;
+    O.lse = tg.has(tg.A_LSE);
+    O.win = tg.is_windows();
+    O.macos = tg.is_darwin();
+    O.obj = elf.new_obj(elf.EM_AARCH64);
+    O.tls_key_si = -1;
+    O.tls_index_si = -1;
+    O.consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    O.libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    O.text = elf.add_sec(O.obj, ".text", elf.S_TEXT, 16);
+    O.text0 = O.text;
+    O.rodata = elf.add_sec(O.obj, ".rodata", elf.S_RODATA, 16);
+    O.xdata = -1;
+    O.pdata = -1;
+    O.lines = -1;
+    if O.win {
         // (here, not when the first function needs them: functions are
         // compiled in scratch scopes, and the sections must outlive them)
-        LINES = wlines.begin(OBJ);
-        XDATA = elf.add_sec(OBJ, ".xdata", elf.S_RODATA, 4);
-        PDATA = elf.add_sec(OBJ, ".pdata", elf.S_RODATA, 4);
-        XDATA_SYM = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
-                                               ty: elf.T_NOTYPE, hidden: false, protected: false });
+        O.lines = wlines.begin(O.obj);
+        O.xdata = elf.add_sec(O.obj, ".xdata", elf.S_RODATA, 4);
+        O.pdata = elf.add_sec(O.obj, ".pdata", elf.S_RODATA, 4);
+        O.xdata_sym = elf.add_sym(O.obj, elf.Sym.{ name: "", sec: O.xdata, value: 0, size: 0, bind: elf.B_LOCAL,
+                                                   ty: elf.T_NOTYPE, hidden: false, protected: false });
     }
-    MU = mu.begin(MACOS_, OBJ, false);
+    O.mu = mu.begin(O.macos, O.obj, false);
     if (tg.g_os == tg.OS_LINUX) and tg.g_unwind_tables {
-        MU = mu.begin_elf(true, OBJ, false);
+        O.mu = mu.begin_elf(true, O.obj, false);
     }
-    let relro = is.add_symbols(OBJ, m, TEXT, RODATA, elf.R_AARCH64_ABS64, &mut fsym, &mut gsym);
+    let relro = is.add_symbols(O.obj, m, O.text, O.rodata, elf.R_AARCH64_ABS64, &mut O.fsym, &mut O.gsym);
     // file-scope asm (the C front end's GNU dialects): its sections and symbols
     for b in ai.toplevel.items() {
         let A = aa.assemble_file(b.text);
@@ -6050,7 +6100,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             u.eprint(u.f2("axiom: AArch64 code generation: file-scope asm at %s: %s\n", b.loc, acr.message(A)));
             return u.nil.[elf.Obj]();
         }
-        aob.add_file(OBJ, TEXT, A, b.aliases, b.file_id);
+        aob.add_file(O.obj, O.text, A, b.aliases, b.file_id);
         if aob.add_error.len > 0 {
             u.eprint(u.f2("axiom: AArch64 code generation: asm at %s: %s\n", b.loc, aob.add_error));
             aob.add_error = "";
@@ -6059,51 +6109,51 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     // (its procedures' Windows unwind records: .xdata, and their .pdata entries)
     for p in aob.sehs.items() {
-        if WIN_ {
-            let x = OBJ.secs.get(@int_cast(usize, XDATA));
+        if O.win {
+            let x = O.obj.secs.get(@int_cast(usize, O.xdata));
             x.data.align(4);
             let xoff = @as(u64, x.data.len());
             x.data.put(p.xdata);
-            let pd = OBJ.secs.get(@int_cast(usize, PDATA));
+            let pd = O.obj.secs.get(@int_cast(usize, O.pdata));
             let poff = @as(u64, pd.data.len());
             pd.data.zeros(8);
             pd.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: p.sym, addend: 0 });
             pd.relocs.push(
-                elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
+                elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: O.xdata_sym, addend: @bit_cast(i64, xoff) });
         }
     }
     aob.sehs.clear();
     // each global's known alignment (mem_sym)
-    galign.clear();
+    O.galign.clear();
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
         let mut al = g.align;
         if al == 0 {
             al = 1;
         }
-        galign.push(al);
+        O.galign.push(al);
     }
-    FT = ft.begin(OBJ, m, TEXT, relro, &mut gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
+    O.ft = ft.begin(O.obj, m, O.text, relro, &mut O.gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
     // (Windows: the same records feed CodeView for the PDB, codeview.ax,
     // and the lines are .axiom.lines)
-    DBG = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
-    if WIN_ and DBG.on {
-        codeview.begin(OBJ, true, DBG.full);
+    O.dbg = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
+    if O.win and O.dbg.on {
+        codeview.begin(O.obj, true, O.dbg.full);
     }
     for p in aob.procs.items() {
         // (in the sections .cfi_sections names: .debug_frame with -g, and the
         // unwind table, whose kinds with a personality routine, an LSDA, ...
         // are ELF's: macunwind.ax add_proc_x)
         if not p.x.no_debug {
-            dw.add_asm_fde(&mut DBG, p.sym, 0, p.size, p.prog, p.simple, p.signal, p.x.ra);
+            dw.add_asm_fde(&mut O.dbg, p.sym, 0, p.size, p.prog, p.simple, p.signal, p.x.ra);
         }
         if p.x.no_eh {
             continue;
         }
-        if mu.needs_x(p.x) and MU.elf {
-            mu.add_proc_x(&mut MU, p.sym, p.size, p.prog, p.simple, p.signal, p.x, p.psym_i, p.lsym_i);
+        if mu.needs_x(p.x) and O.mu.elf {
+            mu.add_proc_x(&mut O.mu, p.sym, p.size, p.prog, p.simple, p.signal, p.x, p.psym_i, p.lsym_i);
         } else {
-            mu.add_proc(&mut MU, p.sym, p.size, p.prog, p.simple, p.signal);
+            mu.add_proc(&mut O.mu, p.sym, p.size, p.prog, p.simple, p.signal);
         }
     }
     aob.procs.clear();
@@ -6114,27 +6164,27 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
                            regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
                            vlocs: u.nil_slice.[dloc.VLoc](), frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
         if p.rows.len > 0 {
-            dw.add_func(&mut DBG, &df);
-            if WIN_ and (LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
-                let ps = OBJ.syms.at(@as(usize, p.sym));
-                wlines.emit(OBJ, LINES, codeview.func_key(ps.name, ps.value), p.rows);
+            dw.add_func(&mut O.dbg, &df);
+            if O.win and (O.lines >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
+                let ps = O.obj.syms.at(@as(usize, p.sym));
+                wlines.emit(O.obj, O.lines, codeview.func_key(ps.name, ps.value), p.rows);
             }
         }
     }
     aob.funcs.clear();
-    DBG.lang = dw.module_lang(m);
+    O.dbg.lang = dw.module_lang(m);
     dloc.g_typed = false;  // (the system's AArch64 debugger evaluates no typed operations)
     if tg.is_darwin() {
-        DBG.tls_rel = dw.TLS_DESC;
+        O.dbg.tls_rel = dw.TLS_DESC;
         if tg.platform_tls() {
-            DBG.tls_rel = dw.TLS_PDESC;
+            O.dbg.tls_rel = dw.TLS_PDESC;
         }
     } else {
-        DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
+        O.dbg.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
     }
     for i in 0..m.globals.len {
-        dw.add_data_sym(&mut DBG, m.globals.get(i).name, gsym.get(i));
-        codeview.add_data_sym(m.globals.get(i).name, gsym.get(i));
+        dw.add_data_sym(&mut O.dbg, m.globals.get(i).name, O.gsym.get(i));
+        codeview.add_data_sym(m.globals.get(i).name, O.gsym.get(i));
     }
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
@@ -6142,31 +6192,31 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             // the function's machine code is all that outlives it
             u.scratch_begin();
             let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
-            LSE_ = tg.has(tg.A_LSE);
-            TEXT = OBJ.syms.get(@as(usize, fsym.get(@int_cast(usize, f.id)))).sec;  // (its section: isel.ax)
+            O.lse = tg.has(tg.A_LSE);
+            O.text = O.obj.syms.get(@as(usize, O.fsym.get(@int_cast(usize, f.id)))).sec;  // (its section: isel.ax)
             compile_func(f);
-            TEXT = TEXT0;
+            O.text = O.text0;
             tg.end_fn(outer);
             u.scratch_end();
             ir.release_lists(f);
-            if errors {
+            if O.errors {
                 return u.nil.[elf.Obj]();
             }
         }
     }
-    is.finish_aliases(OBJ);
-    let mut msg = aob.resolve(OBJ);
+    is.finish_aliases(O.obj);
+    let mut msg = aob.resolve(O.obj);
     if (msg.len == 0) and (tg.is_darwin() or tg.is_windows()) {
-        msg = aob.relax_abs_movw(OBJ);
+        msg = aob.relax_abs_movw(O.obj);
     }
     if msg.len > 0 {
         u.eprint(u.f1("axiom: AArch64 code generation: %s\n", msg));
         return u.nil.[elf.Obj]();
     }
-    if WIN_ {
+    if O.win {
         codeview.finish();
     } else {
-        dw.finish_elf(&mut DBG, OBJ, TEXT, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
+        dw.finish_elf(&mut O.dbg, O.obj, O.text, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
     }
-    return OBJ;
+    return O.obj;
 }
