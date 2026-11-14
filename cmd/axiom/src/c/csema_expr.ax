@@ -404,6 +404,24 @@ fn pointee_quals(t: *mut cty.CType) i32 {
     return x.quals;
 }
 
+// Is vector rvalue e a comparison's lanes of all ones or zeros (or '~', '-',
+// '+' of one, or '&', '|', '^' of two)? It converts to an integer vector of
+// its shape of either signedness, as the common compilers' comparisons give
+// a vector that converts to any vector of its size.
+fn vector_mask(e: *cast.Expr) bool {
+    if e.kind == cast.ExprKind.UNARY {
+        return (e.op != ct.P_INC) and (e.op != ct.P_DEC) and cty.is_vector(e.ty) and vector_mask(e.a);
+    }
+    if (e.kind != cast.ExprKind.BINARY) or not cty.is_vector(e.ty) {
+        return false;
+    }
+    if cc.is_compare(e.op) {
+        return true;
+    }
+    return ((e.op == ct.P_AMP) or (e.op == ct.P_PIPE) or (e.op == ct.P_CARET)) and vector_mask(e.a) and
+           vector_mask(e.b);
+}
+
 /// Rvalue e converted to type t as if by assignment; `what` says where
 /// ("assignment", "initialization", "argument 2 of 'f'", "return").
 pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cast.Expr {
@@ -422,7 +440,7 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
         }
         if cty.is_vector(t) and cty.is_vector(s) and (cty.size_of(t) == cty.size_of(s)) and
            cty.is_integer(t.unq.elem) and cty.is_integer(s.unq.elem) and (t.unq.len == s.unq.len) and
-           (t.unq.elem.is_signed == s.unq.elem.is_signed) {
+           ((t.unq.elem.is_signed == s.unq.elem.is_signed) or vector_mask(e)) {
             return conv(e, cast.CV_VBITS, cty.unqual(t));
         }
     } else if cty.is_record(t) {
@@ -1310,6 +1328,20 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
                  (eq and
                   ((cty.is_void(ta.elem) and not cty.is_func(tb.elem)) or
                    (cty.is_void(tb.elem) and not cty.is_func(ta.elem)) or is_npc(e.a) or is_npc(e.b)));
+        if not ok and eq and cs.opts().gnu and
+           ((cty.is_void(ta.elem) and cty.is_func(tb.elem)) or (cty.is_void(tb.elem) and cty.is_func(ta.elem))) {
+            // (a GNU dialect: a pointer to void compared with a pointer to a
+            // function, which 6.5.9p2 does not allow; the function pointer
+            // converted to the void pointer's type, with a warning)
+            cs.warn(e.span, "C4149", u.f3("comparison with '%s' of a function pointer and 'void *' (%s and %s)",
+                                          cast.punct_text(op), cs.tq(ta), cs.tq(tb)));
+            if cty.is_void(ta.elem) {
+                e.b = convert(e.b, ta);
+            } else {
+                e.a = convert(e.a, tb);
+            }
+            return e;
+        }
         if not ok {
             cs.err(e.span, "C3020", u.f3("comparison with '%s' of pointers to incompatible types (%s and %s)",
                                          cast.punct_text(op), cs.tq(ta), cs.tq(tb)));
@@ -1935,7 +1967,15 @@ fn size_align(e: *mut cast.Expr) *mut cast.Expr {
             return e;
         }
         if (k == cast.ExprKind.ALIGNOF) and (a.kind == cast.ExprKind.IDENT) and u.notnil(a.sym) and
-           (a.sym.align > cty.align_of(t)) {
+           (a.sym.kind == cast.SK_FUNC) and (a.sym.align > 1) and cs.opts().gnu {
+            // (a GNU dialect: __alignof__ of a function declared aligned(n): n)
+            e.ty = cty.t_size;
+            e.is_const = true;
+            e.cval = a.sym.align;
+            return e;
+        }
+        if (k == cast.ExprKind.ALIGNOF) and (a.kind == cast.ExprKind.IDENT) and u.notnil(a.sym) and
+           (a.sym.kind != cast.SK_FUNC) and (a.sym.align > cty.align_of(t)) {
             if not cty.is_complete(t) {
                 cs.err(e.span, "C3029", u.f2("the operand of %s has incomplete type %s", what, cs.tq(t)));
                 return bad(e);

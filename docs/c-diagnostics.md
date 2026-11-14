@@ -166,7 +166,7 @@ names the feature and the standard that has it (or removed it).
 | `C3005` | An invalid combination of type specifiers (`_Complex` too: only `float`, `double` and `long double _Complex`, in any order). |
 | `C3006` | An invalid storage-class or function specifier, or type qualifier: repeated where that is not allowed, or on a type that cannot take it. |
 | `C3007` | An incomplete type where a complete one is needed. |
-| `C3008` | An invalid declarator or member: arrays of functions, functions returning arrays, a flexible array member that is not last, a member of function type, and so on. |
+| `C3008` | An invalid declarator or member: arrays of functions, functions returning arrays, a flexible array member that is not last, a member of function type, and so on (in a GNU dialect a union's flexible array member is the warning `C4151`). |
 | `C3009` | An invalid array size: not an integer, not positive, or too large (more than 2^47 bytes). |
 | `C3010` | A declaration that declares nothing, a member declaration that declares no member, or a name where none can be. |
 | `C3011` | The wrong kind of tag (`union S` for a structure), or an enumeration that is not defined (in a GNU dialect, the warning `C4144` and an incomplete type). |
@@ -200,7 +200,7 @@ names the feature and the standard that has it (or removed it).
 
 | Code | Meaning |
 |---|---|
-| `C3020` | Invalid operands to an operator (or a type name used as a value). (In a GNU dialect `?:` of a void and a non-void operand is the warning `C4142`.) |
+| `C3020` | Invalid operands to an operator (or a type name used as a value). (In a GNU dialect `?:` of a void and a non-void operand is the warning `C4142`, and `void *` compared with a function pointer `C4149`.) |
 | `C3021` | An assignment, `++` or `--` on something that is not a modifiable lvalue: an array, a `const` object, a structure with a `const` member. |
 | `C3022` | Incompatible types in an assignment, initialization, argument or `return`, or one that discards qualifiers. (In a GNU dialect a function pointer to or from `void *` is the warning `C4140`, qualifiers other than `_Atomic` discarded the warning `C4141`, and pointers to incompatible object types the warning `C4147`.) |
 | `C3023` | The wrong number of arguments in a call. |
@@ -211,7 +211,7 @@ names the feature and the standard that has it (or removed it).
 | `C3029` | An invalid operand of `sizeof` or `_Alignof`: a function type or an incomplete type. |
 | `C3030` | A void value used, or a controlling expression or operand that must be a scalar or integer and is not. |
 | `C3031` | An initializer of an object with static storage duration that is not constant. |
-| `C3032` | Excess elements in an initializer, or a string too long for its array. |
+| `C3032` | Excess elements in an initializer, or a string too long for its array (in a GNU dialect that string is the warning `C4150`). |
 | `C3034` | An integer constant too large for any integer type. |
 | `C3035` | A constant expression is needed and the expression is not an integer constant expression. |
 | `C3036` | A constant expression whose evaluation overflows (a signed integer operation, 6.6p4). |
@@ -306,6 +306,9 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4146` | gnu89: a `return` with a value in a function returning `void` (from gnu99 on, and under an ISO standard, `C3044`). The value is evaluated and discarded. |
 | `C4147` | A GNU dialect: an assignment, initialization, argument or `return` that converts a pointer to an object type to a pointer to an incompatible object type (`int *` to `long *`, `struct a *` to `struct b *`, `double (*)[3]` to `double (*)[4]`; under an ISO standard, and where either pointed-to type is `_Atomic` or a function, `C3022`). The conversion is made, as a cast makes it. |
 | `C4148` | A GNU dialect: `main` defined as `int main(int argc)` (5.1.2.2.1's "other implementation-defined manner"; under an ISO standard `C3061`). It receives argc. |
+| `C4149` | A GNU dialect: a `void *` compared by `==` or `!=` with a pointer to a function (under an ISO standard `C3020`, 6.5.9p2). The function pointer is converted to `void *`, as a cast converts it. |
+| `C4150` | A GNU dialect: a string literal longer than the character array it initializes (under an ISO standard `C3032`, 6.7.9p2). The array gets the first characters; the rest are dropped. |
+| `C4151` | A GNU dialect: a flexible array member that is a member of a union (under an ISO standard `C3008`, 6.7.2.1p3). It is at the union's start and adds nothing to its size. |
 
 `#pragma GCC diagnostic` can hide a warning, or make it an error (with its code)
 ([`docs/c.md`](c.md), "Pragmas").
