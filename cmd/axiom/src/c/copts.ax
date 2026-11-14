@@ -72,7 +72,13 @@ pub struct COptions {
     // headers are the hosted headers (docs/c.md, "The system's C library")
     system_lib: bool,
     system_dirs: [][]u8,  // its headers' directories (after -I; the compiler's freestanding headers first)
-    target_macros: []u8,  // the platform's predefined macros its headers need (#define lines)
+    // what the predefined macros of the build say (ctarget.ax): the
+    // optimizer's level (-O0 .. -O3), whether the code is
+    // position-independent (--pic, --emit=shared; macOS) and whether the
+    // executable is (macOS)
+    opt_level: i32,
+    pic: bool,
+    pie: bool,
 }
 
 /// The value of __STDC_VERSION__ for a standard (0: not defined, C89).
@@ -368,4 +374,229 @@ pub fn type_macros_text(o: *COptions) []u8 {
 /// Does a --c-std= value name a GNU dialect (gnu89 ... gnu23)?
 pub fn is_gnu(s: []u8) bool {
     return (s.len == 5) and (s[0] == 'g') and (s[1] == 'n') and (s[2] == 'u') and (std_named(s) >= 0);
+}
+
+// -----------------------------------------------------------------------------
+// The conventional predefined macros of the types
+// -----------------------------------------------------------------------------
+
+/// The rank code of the type of exactly 32 bits (int, or long when int is
+/// not), or 0: none (int is 16 bits and long 64, or int 64).
+pub fn int32_rank(o: *COptions) i32 {
+    if o.int_bits == 32 {
+        return R_INT;
+    }
+    if o.long_bits == 32 {
+        return R_LONG;
+    }
+    return 0;
+}
+
+/// The rank code of wchar_t's type (as ctypes.ax and the headers choose
+/// it): short when 16 bits, else int, or long when int is 16 bits and long
+/// is 32.
+pub fn wchar_rank(o: *COptions) i32 {
+    if o.wchar_bits == 16 {
+        return R_SHORT;
+    }
+    if (o.int_bits == 32) or ((o.long_bits != 32) and (o.int_bits >= 32)) {
+        return R_INT;
+    }
+    return R_LONG;
+}
+
+// The largest value of the type of rank code r (unsigned: its unsigned
+// type) as a constant of the type after the integer promotions (C17
+// 7.20.2p2: the limits' types), and its smallest (signed: -max - 1; else 0).
+fn max_of(o: *COptions, r: i32, unsigned: bool) []u8 {
+    let w = width_of(o, r);
+    if unsigned {
+        return u.cat2(max_digits(w, false), suffix_in(r, true, (r < R_INT) and (w >= o.int_bits)));
+    }
+    return u.cat2(max_digits(w, true), suffix(r, false));
+}
+
+fn min_of(o: *COptions, r: i32, unsigned: bool) []u8 {
+    if unsigned {
+        return u.cat2("0", suffix_in(r, true, (r < R_INT) and (width_of(o, r) >= o.int_bits)));
+    }
+    return u.f1("(-%s - 1)", max_of(o, r, false));
+}
+
+// __NAME_TYPE__ and __UNAME_TYPE__, __NAME_MAX__ and __UNAME_MAX__ (and
+// __NAME_WIDTH__ if `width`) of the type of rank code r and its unsigned
+// type.
+fn conv_pair(b: *mut u.Buf, o: *COptions, name: []u8, uname: []u8, r: i32, width: bool) void {
+    b.s(u.f2("#define __%s_TYPE__ %s\n", name, spelling(r, false, o.std)));
+    b.s(u.f2("#define __%s_TYPE__ %s\n", uname, spelling(r, true, o.std)));
+    b.s(u.f2("#define __%s_MAX__ %s\n", name, max_of(o, r, false)));
+    b.s(u.f2("#define __%s_MAX__ %s\n", uname, max_of(o, r, true)));
+    if width {
+        b.s(u.f2("#define __%s_WIDTH__ %s\n", name, u.idec(width_of(o, r))));
+    }
+}
+
+// __NAME_C(c) and __UNAME_C(c), the constant macros of the type of rank
+// code r (as <stdint.h>'s INTN_C and UINTN_C).
+fn conv_c(b: *mut u.Buf, o: *COptions, name: []u8, uname: []u8, r: i32) void {
+    let s = suffix(r, false);
+    let us = suffix_in(r, true, (r < R_INT) and (width_of(o, r) >= o.int_bits));
+    b.s(u.f3("#define __%s_C(c) c%s%s\n", name, u.pick(s.len > 0, "##", ""), s));
+    b.s(u.f3("#define __%s_C(c) c%s%s\n", uname, u.pick(us.len > 0, "##", ""), us));
+}
+
+/// The conventional predefined macros that describe the types (names in
+/// the implementation's namespace, C17 7.1.3, that programs test): their
+/// sizes (__SIZEOF_INT__ ...), limits (__INT_MAX__ ...), widths, the types
+/// of the typedefs of <stddef.h>, <stdint.h>, <wchar.h> and <uchar.h>
+/// (__SIZE_TYPE__, __INT64_TYPE__ ...) with their limits and constant
+/// macros, the characteristics of the floating types (__FLT_MAX__ ...: as
+/// <float.h>), the byte order and the largest alignment. Each says what the
+/// compiler's own headers say (the test c/run/predef_types.c checks them
+/// against sizeof, <limits.h>, <stdint.h> and <float.h>).
+pub fn conventional_type_macros_text(o: *COptions) []u8 {
+    let mut b = u.Buf.init();
+    let sz = size_type(o);
+    let wr = wchar_rank(o);
+    let wint = at_least(o, o.wint_pref, o.wchar_bits);
+    let i32r = int32_rank(o);
+    b.s("#define __CHAR_BIT__ 8\n");
+    // sizes in bytes
+    b.s(u.f2("#define __SIZEOF_SHORT__ 2\n#define __SIZEOF_INT__ %s\n#define __SIZEOF_LONG__ %s\n",
+             u.idec(o.int_bits / 8), u.idec(o.long_bits / 8)));
+    b.s("#define __SIZEOF_LONG_LONG__ 8\n#define __SIZEOF_FLOAT__ 4\n#define __SIZEOF_DOUBLE__ 8\n");
+    // (long double: binary64's 8 bytes, else 16: the x87 format padded, or binary128)
+    b.s(u.f1("#define __SIZEOF_LONG_DOUBLE__ %s\n", u.pick(o.ld_bits == 64, "8", "16")));
+    b.s(u.f1("#define __SIZEOF_POINTER__ %s\n", u.idec(o.ptr_bits / 8)));
+    b.s(u.f2("#define __SIZEOF_SIZE_T__ %s\n#define __SIZEOF_PTRDIFF_T__ %s\n", u.idec(width_of(o, sz) / 8),
+             u.idec(width_of(o, sz) / 8)));
+    b.s(u.f2("#define __SIZEOF_WCHAR_T__ %s\n#define __SIZEOF_WINT_T__ %s\n", u.idec(width_of(o, wr) / 8),
+             u.idec(width_of(o, wint) / 8)));
+    if o.gnu {
+        // (__int128 and __float128 are types of the GNU dialects only)
+        b.s("#define __SIZEOF_INT128__ 16\n#define __SIZEOF_FLOAT128__ 16\n");
+    }
+    // the standard integer types' limits and widths (<limits.h>)
+    b.s("#define __SCHAR_MAX__ 127\n#define __SHRT_MAX__ 32767\n");
+    b.s(u.f1("#define __INT_MAX__ %s\n", max_of(o, R_INT, false)));
+    b.s(u.f1("#define __LONG_MAX__ %s\n", max_of(o, R_LONG, false)));
+    b.s(u.f1("#define __LONG_LONG_MAX__ %s\n", max_of(o, R_LLONG, false)));
+    b.s("#define __SCHAR_WIDTH__ 8\n#define __SHRT_WIDTH__ 16\n");
+    b.s(u.f2("#define __INT_WIDTH__ %s\n#define __LONG_WIDTH__ %s\n#define __LONG_LONG_WIDTH__ 64\n",
+             u.idec(o.int_bits), u.idec(o.long_bits)));
+    // the typedefs' types
+    b.s(u.f1("#define __SIZE_TYPE__ %s\n", spelling(sz, true, o.std)));
+    b.s(u.f1("#define __PTRDIFF_TYPE__ %s\n", spelling(sz, false, o.std)));
+    b.s(u.f2("#define __SIZE_MAX__ %s\n#define __PTRDIFF_MAX__ %s\n", max_of(o, sz, true), max_of(o, sz, false)));
+    b.s(
+        u.f2(
+            "#define __SIZE_WIDTH__ %s\n#define __PTRDIFF_WIDTH__ %s\n", u.idec(width_of(o, sz)),
+            u.idec(width_of(o, sz))));
+    let wu = not o.wchar_signed;
+    b.s(u.f1("#define __WCHAR_TYPE__ %s\n", spelling(wr, wu, o.std)));
+    b.s(u.f2("#define __WCHAR_MAX__ %s\n#define __WCHAR_MIN__ %s\n", max_of(o, wr, wu), min_of(o, wr, wu)));
+    b.s(u.f1("#define __WCHAR_WIDTH__ %s\n", u.idec(width_of(o, wr))));
+    if wu {
+        b.s("#define __WCHAR_UNSIGNED__ 1\n");
+    }
+    let iu = not o.wint_signed;
+    b.s(u.f1("#define __WINT_TYPE__ %s\n", spelling(wint, iu, o.std)));
+    b.s(u.f2("#define __WINT_MAX__ %s\n#define __WINT_MIN__ %s\n", max_of(o, wint, iu), min_of(o, wint, iu)));
+    b.s(u.f1("#define __WINT_WIDTH__ %s\n", u.idec(width_of(o, wint))));
+    // (char16_t and char32_t: uint_least16_t's and uint_least32_t's, <uchar.h>)
+    let mut c32 = i32r;
+    if c32 == 0 {
+        c32 = R_LONG;
+        if o.int_bits >= 32 {
+            c32 = R_INT;
+        }
+    }
+    b.s(u.f1("#define __CHAR16_TYPE__ unsigned short\n#define __CHAR32_TYPE__ %s\n", spelling(c32, true, o.std)));
+    // (sig_atomic_t is int: <signal.h>)
+    b.s("#define __SIG_ATOMIC_TYPE__ int\n");
+    b.s(
+        u.f2(
+            "#define __SIG_ATOMIC_MAX__ %s\n#define __SIG_ATOMIC_MIN__ %s\n", max_of(o, R_INT, false),
+            min_of(o, R_INT, false)));
+    b.s(u.f1("#define __SIG_ATOMIC_WIDTH__ %s\n", u.idec(o.int_bits)));
+    // <stdint.h>'s types: exact, least and fast widths, pointers, the widest
+    let i64r = int64_type(o);
+    conv_pair(&mut b, o, "INT8", "UINT8", R_CHAR, false);
+    conv_pair(&mut b, o, "INT16", "UINT16", R_SHORT, false);
+    if i32r != 0 {
+        conv_pair(&mut b, o, "INT32", "UINT32", i32r, false);
+    }
+    conv_pair(&mut b, o, "INT64", "UINT64", i64r, false);
+    let mut l32 = i32r;
+    if l32 == 0 {
+        l32 = R_LONG;
+        if o.int_bits == 64 {
+            l32 = R_INT;
+        }
+    }
+    conv_pair(&mut b, o, "INT_LEAST8", "UINT_LEAST8", R_CHAR, true);
+    conv_pair(&mut b, o, "INT_LEAST16", "UINT_LEAST16", R_SHORT, true);
+    conv_pair(&mut b, o, "INT_LEAST32", "UINT_LEAST32", l32, true);
+    conv_pair(&mut b, o, "INT_LEAST64", "UINT_LEAST64", i64r, true);
+    conv_pair(&mut b, o, "INT_FAST8", "UINT_FAST8", R_CHAR, true);
+    conv_pair(&mut b, o, "INT_FAST16", "UINT_FAST16", at_least(o, o.fast16_pref, 16), true);
+    conv_pair(&mut b, o, "INT_FAST32", "UINT_FAST32", at_least(o, o.fast32_pref, 32), true);
+    conv_pair(&mut b, o, "INT_FAST64", "UINT_FAST64", i64r, true);
+    conv_pair(&mut b, o, "INTPTR", "UINTPTR", sz, true);
+    conv_pair(&mut b, o, "INTMAX", "UINTMAX", intmax_type(o), true);
+    conv_c(&mut b, o, "INT8", "UINT8", R_CHAR);
+    conv_c(&mut b, o, "INT16", "UINT16", R_SHORT);
+    if i32r != 0 {
+        conv_c(&mut b, o, "INT32", "UINT32", i32r);
+    }
+    conv_c(&mut b, o, "INT64", "UINT64", i64r);
+    conv_c(&mut b, o, "INTMAX", "UINTMAX", intmax_type(o));
+    // the floating types (<float.h>'s values: binary32, binary64, and long
+    // double's format; FLT_EVAL_METHOD 0)
+    b.s("#define __FLT_RADIX__ 2\n#define __FLT_EVAL_METHOD__ 0\n");
+    float_macros(&mut b, "FLT", "24", "6", "9", "(-125)", "(-37)", "128", "38", "3.40282347e+38F", "1.19209290e-7F",
+                 "1.17549435e-38F", "1.40129846e-45F");
+    float_macros(&mut b, "DBL", "53", "15", "17", "(-1021)", "(-307)", "1024", "308", "1.7976931348623157e+308",
+                 "2.2204460492503131e-16", "2.2250738585072014e-308", "4.9406564584124654e-324");
+    if o.ld_bits == 80 {
+        float_macros(&mut b, "LDBL", "64", "18", "21", "(-16381)", "(-4931)", "16384", "4932",
+                     "1.18973149535723176502e+4932L", "1.08420217248550443401e-19L", "3.36210314311209350626e-4932L",
+                     "3.64519953188247460253e-4951L");
+        b.s("#define __DECIMAL_DIG__ 21\n");
+    } else if o.ld_bits == 128 {
+        float_macros(&mut b, "LDBL", "113", "33", "36", "(-16381)", "(-4931)", "16384", "4932",
+                     "1.18973149535723176508575932662800702e+4932L", "1.92592994438723585305597794258492732e-34L",
+                     "3.36210314311209350626267781732175260e-4932L", "6.47517511943802511092443895822764655e-4966L");
+        b.s("#define __DECIMAL_DIG__ 36\n");
+    } else {
+        float_macros(&mut b, "LDBL", "53", "15", "17", "(-1021)", "(-307)", "1024", "308", "1.7976931348623157e+308L",
+                     "2.2204460492503131e-16L", "2.2250738585072014e-308L", "4.9406564584124654e-324L");
+        b.s("#define __DECIMAL_DIG__ 17\n");
+    }
+    // the byte order (every target is little-endian), and the largest
+    // alignment of a type: 16 (long double, __int128, max_align_t), or the
+    // vector registers' width on x86-64 with AVX or AVX-512F
+    b.s("#define __ORDER_LITTLE_ENDIAN__ 1234\n#define __ORDER_BIG_ENDIAN__ 4321\n#define __ORDER_PDP_ENDIAN__ 3412\n");
+    b.s("#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__\n#define __FLOAT_WORD_ORDER__ __ORDER_LITTLE_ENDIAN__\n");
+    b.s("#define __LITTLE_ENDIAN__ 1\n");
+    let mut big = o.vec_reg;
+    if big < 16 {
+        big = 16;
+    }
+    b.s(u.f1("#define __BIGGEST_ALIGNMENT__ %s\n", u.idec(big)));
+    return b.done();
+}
+
+// The __<T>_*__ macros of a floating type (<float.h>'s <T>_* values).
+fn float_macros(b: *mut u.Buf, t: []u8, mant: []u8, dig: []u8, ddig: []u8, minexp: []u8, min10: []u8, maxexp: []u8,
+                max10: []u8, max: []u8, eps: []u8, min: []u8, tmin: []u8) void {
+    b.s(u.f3("#define __%s_MANT_DIG__ %s\n#define __%s_DIG__ ", t, mant, t));
+    b.s(u.f3("%s\n#define __%s_DECIMAL_DIG__ %s\n", dig, t, ddig));
+    b.s(u.f4("#define __%s_MIN_EXP__ %s\n#define __%s_MIN_10_EXP__ %s\n", t, minexp, t, min10));
+    b.s(u.f4("#define __%s_MAX_EXP__ %s\n#define __%s_MAX_10_EXP__ %s\n", t, maxexp, t, max10));
+    b.s(u.f4("#define __%s_MAX__ %s\n#define __%s_NORM_MAX__ %s\n", t, max, t, max));
+    b.s(u.f4("#define __%s_EPSILON__ %s\n#define __%s_MIN__ %s\n", t, eps, t, min));
+    b.s(u.f2("#define __%s_DENORM_MIN__ %s\n", t, tmin));
+    b.s(u.f3("#define __%s_HAS_DENORM__ 1\n#define __%s_HAS_INFINITY__ 1\n#define __%s_HAS_QUIET_NAN__ 1\n", t, t, t));
+    b.s(u.f1("#define __%s_IS_IEC_60559__ 1\n", t));
 }

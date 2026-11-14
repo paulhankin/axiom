@@ -144,6 +144,7 @@ cmd/axiom/src/c/cpragma.ax  what pragmas say after preprocessing (pack, weak, GC
 cmd/axiom/src/c/cfeat.ax    the GNU attributes and builtins implemented (__has_attribute, __has_builtin)
 cmd/axiom/src/c/ctok.ax     the tokens the preprocessor hands the parser
 cmd/axiom/src/c/cpp.ax      preprocessor and lexer (phases 1-6)            (+ cpp_*.ax)
+cmd/axiom/src/c/ctarget.ax  the target's conventional predefined macros (__x86_64__, __SIZE_TYPE__ ...)
 cmd/axiom/src/c/cast.ax     the syntax tree                          (+ cast_dump.ax)
 cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions

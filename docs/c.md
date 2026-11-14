@@ -86,7 +86,7 @@ Axiom in one program").
 | `--c-long=32\|64` | The width of `long` (default: the target's C ABI; at least `--c-int`). |
 | `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
-| `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
+| `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`); the target's ("Predefined macros") can, and `-D` replaces one. |
 | `-Apred=answer`, `-Apred(answer)` | A GNU dialect's assertion, as `#assert pred(answer)` before the source ("GNU dialects"); `-A-pred=answer` takes it back (`-A-pred` every answer of pred), `-A-` every assertion before it, the target's `cpu`, `machine` and `system` too. Under an ISO standard, which has no assertions, it is an error. |
 | `--c-asm-dialect=att\|intel` | The syntax of x86-64 inline and file-scope assembly (default `att`; "Inline assembly"). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
@@ -196,7 +196,7 @@ Axiom program (`axiom build main.ax x.s`), or alone (`--emit=obj`). Its text is 
 as file-scope asm is ("Inline assembly"): AT&T syntax, or Intel under
 `--c-asm-dialect=intel` and after `.intel_syntax`. A `.S` source is first preprocessed
 by the C preprocessor with `__ASSEMBLER__` defined as 1, `-D`, `-U` and `-I`, the
-predefined macros (`__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` or `__AXIOM_ASM_WASM__` in any mode), its
+predefined macros (the target's, "Predefined macros", and `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` or `__AXIOM_ASM_WASM__` in any mode), its
 directives done and its macros replaced, its other text as written; a line whose `#`
 does not begin a directive is a comment (as is `#` first on a line on AArch64, `//`
 anywhere there, `#` anywhere on x86-64, and `;;` and `(; ;)` on WebAssembly). A `.s`
@@ -533,9 +533,9 @@ limits, the compiler's `<limits.h>` including the system's and adding what C23 g
 it that the system's leaves to the compiler: `BITINT_MAXWIDTH`, `BOOL_MAX`,
 `BOOL_WIDTH` and `__STDC_VERSION_LIMITS_H__`, where it has not defined them).
 Those headers are compiled as the system's: the macros of the platform they
-test are defined (`__x86_64__` or `__aarch64__`, `__linux__`, `__unix__`, `__ELF__`,
-`__LP64__`, `__SIZEOF_<T>__`, `__BYTE_ORDER__`, `__CHAR_BIT__`, and
-`__AXIOM_SYSTEM_C_LIB__`), the definitions they make of the implementation's own macros
+test are the target's, as in every mode ("Predefined macros": `__x86_64__` or
+`__aarch64__`, `__linux__`, `__unix__`, `__ELF__`, `__LP64__`, `__SIZEOF_<T>__`,
+`__BYTE_ORDER__`, `__CHAR_BIT__` ...), and `__AXIOM_SYSTEM_C_LIB__` is defined; the definitions they make of the implementation's own macros
 (`__STDC_ISO_10646__`, ...) keep the compiler's, as do those they make of the macros of
 the compiler's headers (C23's `INFINITY` and `NAN`, which `<float.h>` and their
 `<math.h>` both define), their `<math.h>`'s comparison macros (`isgreater` ...,
@@ -1565,8 +1565,42 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
 | `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__`, `__AXIOM_ASM_WASM__` | 1, defined only in a GNU dialect on x86-64, AArch64 or WebAssembly targets: the language of inline assembly's templates ("Inline assembly"). |
 
-No macro names the target (`__linux__`, `_WIN32`, `__x86_64__` and the like are not
-defined): pass `-D` for what a program needs to know.
+The target's conventional macros are defined in every standard and dialect, with the
+compiler's C library and with `--c-lib=system` alike (`c/ctarget.ax`, one table). They
+are not the standard's, so `-U` and `-D` (and `#undef`, `#define`) change them, a
+definition replacing the target's; `c/pp/predef_target_*.c` show them for each target.
+
+| Macros | Defined |
+|---|---|
+| `__x86_64__`, `__x86_64`, `__amd64__`, `__amd64` | x86-64 targets; on Windows also `_M_X64` and `_M_AMD64` (100). |
+| `__aarch64__`, `__AARCH64EL__` | AArch64 targets; on macOS also `__arm64__` and `__arm64`, on Windows `_M_ARM64`. |
+| `__wasm`, `__wasm__`, and `__wasm32`, `__wasm32__` or `__wasm64`, `__wasm64__` | WebAssembly. No system's macros: a module's only system is its host's imports. |
+| `__linux__`, `__linux`, `__unix__`, `__unix`, `__ELF__` | Linux; in a GNU dialect also `unix` and `linux`. Not `__gnu_linux__`: the C library is not that system's. |
+| `__APPLE__`, `__MACH__`, `__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__`, `__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__` | macOS; the last two are 110000, the oldest system the executables run on (macOS 11.0), which the system's headers read. |
+| `_WIN32`, `_WIN64` | Windows (the platform's own spellings: no `__WIN32__`, `WIN32` or the like). |
+| `__LP64__`, `_LP64` | 32-bit `int`, 64-bit `long` and pointers (Linux, macOS, wasm64). |
+| `__ILP32__`, `_ILP32` | 32-bit `int`, `long` and pointers (wasm32). |
+| `__CHAR_UNSIGNED__`, `__WCHAR_UNSIGNED__` | Plain `char` (AArch64 Linux, `--c-char=unsigned`), `wchar_t` (AArch64 Linux, Windows) is unsigned. |
+| `__CHAR_BIT__`; `__SIZEOF_SHORT__`, `__SIZEOF_INT__`, `__SIZEOF_LONG__`, `__SIZEOF_LONG_LONG__`, `__SIZEOF_FLOAT__`, `__SIZEOF_DOUBLE__`, `__SIZEOF_LONG_DOUBLE__`, `__SIZEOF_POINTER__`, `__SIZEOF_SIZE_T__`, `__SIZEOF_PTRDIFF_T__`, `__SIZEOF_WCHAR_T__`, `__SIZEOF_WINT_T__` | The sizes in bytes, after `--c-int`, `--c-long` and `--c-long-double`. In a GNU dialect also `__SIZEOF_INT128__` and `__SIZEOF_FLOAT128__` (16), whose types only those dialects have. |
+| `__SCHAR_MAX__`, `__SHRT_MAX__`, `__INT_MAX__`, `__LONG_MAX__`, `__LONG_LONG_MAX__`, `__<T>_WIDTH__` | `<limits.h>`'s values (`__SCHAR_WIDTH__` ... `__LONG_LONG_WIDTH__`). |
+| `__SIZE_TYPE__`, `__PTRDIFF_TYPE__`, `__WCHAR_TYPE__`, `__WINT_TYPE__`, `__CHAR16_TYPE__`, `__CHAR32_TYPE__`, `__SIG_ATOMIC_TYPE__`, `__INTMAX_TYPE__`, `__UINTMAX_TYPE__`, `__INTPTR_TYPE__`, `__UINTPTR_TYPE__`, `__INT<N>_TYPE__`, `__UINT<N>_TYPE__`, `__INT_LEAST<N>_TYPE__`, `__INT_FAST<N>_TYPE__` (and unsigned) | The types the headers give those typedefs (`<stddef.h>`, `<stdint.h>`, `<wchar.h>`, `<uchar.h>`, `<signal.h>`), with N 8, 16, 32 (only when a type has 32 bits) and 64; each with `__<T>_MAX__` (and `__WCHAR_MIN__`, `__WINT_MIN__`, `__SIG_ATOMIC_MIN__`) and `__<T>_WIDTH__` for the least, fast, pointer and widest types, `__SIZE_WIDTH__` ..., of the type of the header's limit; `__INT<N>_C(c)`, `__UINT<N>_C(c)`, `__INTMAX_C(c)`, `__UINTMAX_C(c)` as `INT<N>_C` ... |
+| `__FLT_<X>__`, `__DBL_<X>__`, `__LDBL_<X>__`; `__FLT_RADIX__`, `__FLT_EVAL_METHOD__`, `__DECIMAL_DIG__` | `<float.h>`'s values: `MANT_DIG`, `DIG`, `DECIMAL_DIG`, `MIN_EXP`, `MIN_10_EXP`, `MAX_EXP`, `MAX_10_EXP`, `MAX`, `NORM_MAX`, `MIN`, `EPSILON`, `DENORM_MIN` (`TRUE_MIN`), `HAS_DENORM`, `HAS_INFINITY`, `HAS_QUIET_NAN`, `IS_IEC_60559`. |
+| `__ORDER_LITTLE_ENDIAN__` (1234), `__ORDER_BIG_ENDIAN__` (4321), `__ORDER_PDP_ENDIAN__` (3412), `__BYTE_ORDER__`, `__FLOAT_WORD_ORDER__`, `__LITTLE_ENDIAN__` | Every target is little-endian. |
+| `__BIGGEST_ALIGNMENT__` | The largest alignment of a type: 16, or on x86-64 32 with AVX and 64 with AVX-512F (the vector types'). |
+| `__USER_LABEL_PREFIX__`, `__REGISTER_PREFIX__` | The prefix of a C name's symbol in assembly (`_` on macOS, else empty), of a register's (empty). |
+| `__MMX__`, `__SSE__`, `__SSE2__`, `__FXSR__`, `__SSE_MATH__`, `__SSE2_MATH__` | x86-64 (its baseline); with `--cpu`/`--features` also `__SSE3__`, `__SSSE3__`, `__SSE4_1__`, `__SSE4_2__`, `__POPCNT__`, `__LZCNT__`, `__BMI__`, `__BMI2__`, `__AVX__`, `__AVX2__`, `__FMA__`, `__AES__`, `__PCLMUL__`, `__SHA__`, `__F16C__`, `__MOVBE__`, `__ADX__`, `__AVX512F__`, `__AVX512CD__`, `__AVX512BW__`, `__AVX512DQ__`, `__AVX512VL__`, `__AVX512IFMA__`, `__AVX512VBMI__`, `__AVX512VBMI2__`, `__AVX512VNNI__`, `__AVX512BITALG__`, `__AVX512VPOPCNTDQ__`, `__AVX512BF16__`, `__AVX512FP16__`, `__GFNI__`, `__VAES__`, `__VPCLMULQDQ__`, `__AVXVNNI__`, `__SHA512__`, `__SM3__`, `__SM4__`, `__AVX10_1__`, `__PRFCHW__` for the extensions enabled. |
+| `__ARM_ARCH` (8), `__ARM_ARCH_ISA_A64`, `__ARM_ARCH_PROFILE` (`'A'`), `__ARM_64BIT_STATE`, `__ARM_PCS_AAPCS64`, `__ARM_NEON`, `__ARM_FP` (0xE), `__ARM_FEATURE_FMA`, `_CLZ`, `_IDIV`, `_UNALIGNED`, `_NUMERIC_MAXMIN`, `_DIRECTED_ROUNDING`, `__ARM_SIZEOF_WCHAR_T`, `__ARM_SIZEOF_MINIMAL_ENUM` | AArch64 (the Arm C Language Extensions' macros of what every A64 processor has); for the extensions enabled `__ARM_FEATURE_ATOMICS` (lse), `_RCPC`, `_DOTPROD`, `_AES`, `_SHA2`, `_CRYPTO` (both), `_SHA3`, `_SHA512`, `_SM3` and `_SM4` (sm4), `_CRC32`, `_QRDMX` (rdm), `_FP16_SCALAR_ARITHMETIC` and `_FP16_VECTOR_ARITHMETIC` (fp16), `_FP16_FML` (fhm), `_BF16`, `_MATMUL_INT8` (i8mm), `_SVE`, `_SVE2`, `_SVE2p1`, `_SME`, `_SME2`, `_SME2p1`, `_SME_F64F64`, `_SME_I16I64`, `_SME_F16F16`, `_SVE_B16B16`. |
+| `__wasm_simd128__`, `__wasm_bulk_memory__`, `__wasm_nontrapping_fptoint__`, `__wasm_sign_ext__`, `__wasm_mutable_globals__`, `__wasm_atomics__`, `__wasm_multivalue__`, `__wasm_relaxed_simd__`, `__wasm_tail_call__`, `__wasm_exception_handling__` | WebAssembly, for the proposals enabled. |
+| `__OPTIMIZE__`, `__NO_INLINE__` | `-O1` and above, else `-O0`. |
+| `__PIC__`, `__pic__` (2) | Position-independent code: `--pic` and `--emit=shared` on Linux, always on macOS; `__PIE__`, `__pie__` (2) on macOS for an executable, which is position-independent. Not on Windows or WebAssembly. |
+
+The feature macros say what the target's processor has, not that a header of
+intrinsic functions exists: the compiler has none (`<immintrin.h>`, `<arm_neon.h>`,
+`<wasm_simd128.h>` ... are not found), so a program that includes one when such a macro
+is defined needs its portable path chosen with `-U` (`-U__SSE2__`, `-U__ARM_NEON`).
+No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`, `__VERSION__` are not
+defined; a GNU dialect's `__ATOMIC_*` and `__BFLT16_*` are feature macros): programs
+test features, and the compiler's own macros are the `__AXIOM_` ones above.
 
 ### Include path
 

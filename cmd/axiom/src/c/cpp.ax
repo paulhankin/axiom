@@ -20,6 +20,7 @@ import "cpp_expr.ax" as ce;
 import "cpp_lex.ax" as lx;
 import "cpp_out.ax" as cout;
 import "cpragma.ax" as cp;
+import "ctarget.ax" as ctg;
 import "ctok.ax" as ct;
 
 // Macros the preprocessor itself replaces.
@@ -1283,11 +1284,17 @@ fn do_define(P: *mut PP, line0: []lx.PTok, sp: u.Span) void {
             // definition stays
             return;
         }
-        if not same_def(old, m) {
+        let target = (old.span.file == g_builtin_file) and (old.span.start >= g_target_from) and (old.builtin == 0);
+        if not same_def(old, m) and not target {
             let d = dg.err(nt.span, "C1060", u.f1("macro '%s' redefined differently", m.name));
             dg.note(d, old.span, "the previous definition");
+            return;
         }
-        return;
+        if not target or same_def(old, m) {
+            return;
+        }
+        // (a macro of the target's, ctarget.ax, is replaced: -D__x86_64__=2,
+        // as an #undef and a #define would)
     }
     m.ours = in_compiler_header(P);
     m.sys = in_system_header(P);
@@ -3034,7 +3041,9 @@ fn predefined_text(P: *PP) []u8 {
     let std = o.std;
     let mut b = u.Buf.init();
     b.s("#define __STDC__ 1\n");
-    b.s(o.target_macros);  // (--c-lib=system: the system's headers need them)
+    if o.system_lib {
+        b.s("#define __AXIOM_SYSTEM_C_LIB__ 1\n");
+    }
     if std >= co.C95 {
         b.s(u.f1("#define __STDC_VERSION__ %sL\n", u.dec(co.stdc_version(std))));
     }
@@ -3127,9 +3136,6 @@ fn predefined_text(P: *PP) []u8 {
     } else if P.asm_ and (tg.g_arch == tg.ARCH_A64) {
         b.s("#define __AXIOM_ASM_AARCH64__ 1\n");
     }
-    if not o.char_signed {
-        b.s("#define __CHAR_UNSIGNED__ 1\n");
-    }
     b.s(u.f1("#define __AXIOM_INT_WIDTH__ %s\n", u.idec(o.int_bits)));
     b.s(u.f1("#define __AXIOM_LONG_WIDTH__ %s\n", u.idec(o.long_bits)));
     b.s(u.f1("#define __AXIOM_LDBL_WIDTH__ %s\n", u.idec(o.ld_bits)));
@@ -3149,8 +3155,17 @@ fn predefined_text(P: *PP) []u8 {
         }
     }
     b.s(co.type_macros_text(o));
+    // (last: the target's conventional macros, which -D, -U, #define and
+    // #undef may change: protect_all)
+    g_target_from = @truncate(u32, b.len());
+    b.s(ctg.target_macros_text(o));
     return b.done();
 }
+
+// Where in the text of the predefined macros the target's begin
+// (predefined_text), and that text's file.
+let mut g_target_from: u32 = 0;
+let mut g_builtin_file: i32 = -1;
 
 // -D and -U, as directives.
 fn options_text(P: *PP) []u8 {
@@ -3236,14 +3251,17 @@ fn run_file(P: *mut PP) void {
 }
 
 // The predefined macros (all defined so far) may not be defined again or
-// undefined, but for the compiler's own.
+// undefined, but for the compiler's own and the target's (ctarget.ax: not
+// the standard's, C17 6.10.8p2, and conventionally changed with -D and -U).
 fn protect_all(P: *mut PP) void {
     let ks = @slice_from_ptr(P.macros.keys, P.macros.cap);
     let vs = @slice_from_ptr(P.macros.vals, P.macros.cap);
     for k in 0..P.macros.cap {
-        if (ks[k] != 0) and u.notnil(vs[k]) and not u.starts(vs[k].name, "__AXIOM") and
-           not u.str_eq(vs[k].name, "__CHAR_UNSIGNED__") {
-            vs[k].protected = true;
+        if (ks[k] != 0) and u.notnil(vs[k]) and not u.starts(vs[k].name, "__AXIOM") {
+            let sp = vs[k].span;
+            if (vs[k].builtin != 0) or (sp.file != g_builtin_file) or (sp.start < g_target_from) {
+                vs[k].protected = true;
+            }
         }
     }
 }
@@ -3377,7 +3395,9 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     add_builtin(P, "__DATE__", B_DATE);
     add_builtin(P, "__TIME__", B_TIME);
     // the predefined macros, then -D and -U
-    push_file(P, text_file("<built-in>", predefined_text(P)), "<built-in>");
+    let bf = text_file("<built-in>", predefined_text(P));
+    g_builtin_file = bf.id;
+    push_file(P, bf, "<built-in>");
     run_file(P);
     _ = P.files.pop();
     protect_all(P);
