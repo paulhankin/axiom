@@ -76,8 +76,8 @@ fn func_bound(o: *mut elf.Obj, text: i32, name: []u8, bind: u8) u64 {
     let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
     s.data.align(16);
     let at = @as(u64, s.data.len());
-    _ = elf.add_sym(o, elf.Sym.{ name: name, sec: text, value: at, size: 0, bind: bind, ty: elf.T_FUNC,
-                                 hidden: false });
+    _ = elf.add_sym(o, elf.Sym.{ name: name, sec: text, value: at, size: 0, bind: bind, ty: elf.T_FUNC, hidden: false,
+                                 protected: false });
     return at;
 }
 
@@ -93,7 +93,7 @@ pub fn add_mem_a64(o: *mut elf.Obj, text: i32) void {
     // memcpy: 16 bytes at a time, then bytes (memmove falls into it: no padding)
     let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
     _ = elf.add_sym(o, elf.Sym.{ name: "memcpy", sec: text, value: @as(u64, s.data.len()), size: 0, bind: elf.B_WEAK,
-                                 ty: elf.T_FUNC, hidden: false });
+                                 ty: elf.T_FUNC, hidden: false, protected: false });
     let mc: [13]u64 = [0xAA0003E3, 0xF100405F, 0x540000A3, 0xA8C11424, 0xA8811464, 0xD1004042, 0x17FFFFFB, 0xB40000A2,
                        0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC, 0xD65F03C0];
     words(o, text, mc[..]);
@@ -129,9 +129,9 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
     let data = elf.add_sec(o, ".data.axiom", elf.S_DATA, 16);
     o.secs.get(@as(usize, @bit_cast(u32, data))).data.zeros(48);
     let sp_sym = elf.add_sym(o, elf.Sym.{ name: "axiom.start_sp", sec: data, value: 0, size: 8, bind: elf.B_GLOBAL,
-                                          ty: elf.T_OBJECT, hidden: false });
+                                          ty: elf.T_OBJECT, hidden: false, protected: false });
     let tls_sym = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_info", sec: data, value: 16, size: 32, bind: elf.B_GLOBAL,
-                                           ty: elf.T_OBJECT, hidden: false });
+                                           ty: elf.T_OBJECT, hidden: false, protected: false });
     let mut linked: u64 = 1;
     if static {
         linked = 0;
@@ -239,37 +239,61 @@ fn jmp_aliases(o: *mut elf.Obj, a64: bool) void {
     let s = o.syms.get(@as(usize, sj - 1));
     for n in ["_setjmp", "__sigsetjmp"] {
         _ = elf.add_sym(o, elf.Sym.{ name: n, sec: s.sec, value: s.value, size: 0, bind: elf.B_WEAK, ty: elf.T_FUNC,
-                                     hidden: false });
+                                     hidden: false, protected: false });
     }
 }
 
 // The static program's entry: saves the stack pointer, sets the thread
-// pointer (arch_prctl / tpidr_el0), calls main(argc, argv), exits with its
-// result. `code` receives the bytes; addresses are absolute.
-pub fn write_start(b: []mut u8, fo: u64, start: u64, sp_word: u64, tp: u64, main_addr: u64, machine: u32) void {
+// pointer (arch_prctl / tpidr_el0), applies the R_*_IRELATIVE relocations
+// of [irel, irel_end) (Elf64_Rela entries: the word at r_offset becomes
+// the result of calling the resolver at r_addend, the indirect functions'
+// slots, which nothing has called before; on AArch64 the resolver gets
+// AT_HWCAP | _IFUNC_ARG_HWCAP and a pointer to {24, AT_HWCAP, AT_HWCAP2}
+// from the auxiliary vector, as the psABI's ifunc convention has it, on
+// x86-64 nothing), calls main(argc, argv), exits with its result. `code`
+// receives the bytes; addresses are absolute.
+pub fn write_start(b: []mut u8, fo: u64, start: u64, sp_word: u64, tp: u64, main_addr: u64, irel: u64, irel_end: u64,
+                   machine: u32) void {
     if machine == elf.EM_X86_64 {
+        // (then: lea rbx, irel; lea r12, irel_end; 1: cmp rbx, r12; jae 2f;
+        // call [rbx + 16]; mov rcx, [rbx]; mov [rcx], rax; add rbx, 24;
+        // jmp 1b; 2:)
         let code =
-            "\x31\xed\x48\x89\xe0\x48\x89\x05\x00\x00\x00\x00\x48\x8d\x35\x00\x00\x00\x00\x48\x89\x36\xbf\x02\x10\x00\x00\xb8\x9e\x00\x00\x00\x0f\x05\x48\x8b\x3c\x24\x48\x8d\x74\x24\x08\x48\x83\xe4\xf0\xe8\x00\x00\x00\x00\x89\xc7\xb8\xe7\x00\x00\x00\x0f\x05\xf4";
+            "\x31\xed\x48\x89\xe0\x48\x89\x05\x00\x00\x00\x00\x48\x8d\x35\x00\x00\x00\x00\x48\x89\x36\xbf\x02\x10\x00\x00\xb8\x9e\x00\x00\x00\x0f\x05\x48\x8d\x1d\x00\x00\x00\x00\x4c\x8d\x25\x00\x00\x00\x00\x4c\x39\xe3\x73\x0f\xff\x53\x10\x48\x8b\x0b\x48\x89\x01\x48\x83\xc3\x18\xeb\xec\x48\x8b\x3c\x24\x48\x8d\x74\x24\x08\x48\x83\xe4\xf0\xe8\x00\x00\x00\x00\x89\xc7\xb8\xe7\x00\x00\x00\x0f\x05\xf4";
         let base = @truncate(usize, fo);
         for i in 0..code.len {
             b[base + i] = code[i];
         }
         bn.w32(b, fo + 8, (sp_word -% (start + 12)) & 0xFFFF_FFFF);
         bn.w32(b, fo + 15, (tp -% (start + 19)) & 0xFFFF_FFFF);
-        bn.w32(b, fo + 48, (main_addr -% (start + 52)) & 0xFFFF_FFFF);
+        bn.w32(b, fo + 37, (irel -% (start + 41)) & 0xFFFF_FFFF);
+        bn.w32(b, fo + 44, (irel_end -% (start + 48)) & 0xFFFF_FFFF);
+        bn.w32(b, fo + 82, (main_addr -% (start + 86)) & 0xFFFF_FFFF);
         return;
     }
-    let ws: [14]u64 = [0xAA1F03FD, 0xAA1F03FE, 0x910003E0, 0x90000001, 0xF9000020, 0x90000001, 0x91000021, 0xD51BD041,
-                       0xF94003E0, 0x910023E1, 0x94000000, 0xD2800BC8, 0xD4000001, 0xD4200000];
-    for i in @as(usize, 0)..14 {
+    // mov x29, xzr; mov x30, xzr; mov x0, sp; (sp_word) = x0; tpidr_el0 =
+    // tp; then the auxiliary vector's AT_HWCAP (x19) and AT_HWCAP2 (x20),
+    // past argv and envp; the resolvers' argument on the stack; x21, x22:
+    // the relocations; then main(argc, argv) and exit_group
+    let ws: [47]u64 = [0xAA1F03FD, 0xAA1F03FE, 0x910003E0, 0x90000001, 0xF9000020, 0x90000001, 0x91000021, 0xD51BD041,
+                       0xF94003E9, 0x910043EA, 0x8B090D4A, 0xF840854B, 0xB5FFFFEB, 0xAA1F03F3, 0xAA1F03F4, 0xA8C1314B,
+                       0xB40000CB, 0xF100417F, 0x9A930193, 0xF100697F, 0x9A940194, 0x17FFFFFA, 0xD10083FF, 0xD2800309,
+                       0xA9004FE9, 0xF9000BF4, 0x90000015, 0x910002B5, 0x90000016, 0x910002D6, 0xEB1602BF, 0x54000122,
+                       0xF9400AA9, 0xB2420260, 0x910003E1, 0xD63F0120, 0xF94002A9, 0xF9000120, 0x910062B5, 0x17FFFFF7,
+                       0x910083FF, 0xF94003E0, 0x910023E1, 0x94000000, 0xD2800BC8, 0xD4000001, 0xD4200000];
+    for i in @as(usize, 0)..47 {
         bn.w32(b, fo + (@as(u64, i) * 4), ws[i]);
     }
     adrp(b, fo + 12, start + 12, sp_word);
     or32(b, fo + 16, ((sp_word & 0xfff) >> 3) << 10);  // str x0, [x1, lo12]
     adrp(b, fo + 20, start + 20, tp);
     or32(b, fo + 24, (tp & 0xfff) << 10);  // add x1, x1, lo12
-    let d = @bit_cast(i64, main_addr -% (start + 40)) >> 2;
-    or32(b, fo + 40, @bit_cast(u64, d) & 0x3FF_FFFF);
+    adrp(b, fo + 104, start + 104, irel);
+    or32(b, fo + 108, (irel & 0xfff) << 10);
+    adrp(b, fo + 112, start + 112, irel_end);
+    or32(b, fo + 116, (irel_end & 0xfff) << 10);
+    let d = @bit_cast(i64, main_addr -% (start + 172)) >> 2;
+    or32(b, fo + 172, @bit_cast(u64, d) & 0x3FF_FFFF);
 }
 
 fn or32(b: []mut u8, off: u64, x: u64) void {
@@ -283,4 +307,4 @@ fn adrp(b: []mut u8, off: u64, p: u64, target: u64) void {
 }
 
 // The size of the static _start.
-pub const START_SIZE: u64 = 64;
+pub const START_SIZE: u64 = 192;

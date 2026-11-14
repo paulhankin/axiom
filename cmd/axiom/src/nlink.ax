@@ -52,6 +52,14 @@ pub struct GSym {
     lib: i32,       // the library defining it
     ver: []u8,      // its version there ("": unversioned)
     vidx: u32,      // .gnu.version index (1: unversioned)
+    prot: bool,     // protected (STV_PROTECTED) in its library: its references there are not preempted
+    // its PLT stub is its address (elink.ax): a function of a shared library
+    // whose address an executable's position-dependent code takes (the
+    // stub is then its .dynsym value, which every module's references
+    // bind to), or an indirect function (STT_GNU_IFUNC) of the link
+    canon: bool,
+    ifunc: bool,  // an indirect function defined in the link (its value: the resolver)
+    pltgot: i32,  // the GOT slot its PLT stub jumps through when not `got` (canon, ifunc), -1: none
 }
 
 /// The main thread's stack, in bytes (--stack-size=); 0: the platform's
@@ -165,7 +173,7 @@ pub fn lnk_sym(name: []u8) u32 {
         return prev - 1;
     }
     return elf.add_sym(lnk, elf.Sym.{ name: k, sec: elf.SEC_ABS, value: 0, size: 0, bind: elf.B_WEAK, ty: elf.T_NOTYPE,
-                                      hidden: true });
+                                      hidden: true, protected: false });
 }
 
 fn set_lnk(name: []u8, value: u64) void {
@@ -367,7 +375,8 @@ pub fn gsym_index(name: []u8) u32 {
         return prev - 1;
     }
     gsyms.push(GSym.{ name: k, obj: -1, sym: 0, weak: true, got: -1, stub: -1, dynamic: false, dynidx: 0,
-                      is_data: false, is_tls: false, copy: false, lib: -1, ver: "", vidx: 1 });
+                      is_data: false, is_tls: false, copy: false, lib: -1, ver: "", vidx: 1, prot: false, canon: false,
+                      ifunc: false, pltgot: -1 });
     gmap.put(k, @int_cast(u32, gsyms.len));
     return @int_cast(u32, gsyms.len - 1);
 }
@@ -389,10 +398,6 @@ pub fn define_globals() void {
             }
             if s.sec == -1 {
                 continue;
-            }
-            if s.ty == elf.T_IFUNC {
-                err(u.f2("'%s' (%s) is an indirect function (STT_GNU_IFUNC), which the linker does not support", s.name,
-                         obj_name(oi)));
             }
             if g.obj < 0 {
                 g.obj = @int_cast(i32, oi);
@@ -618,6 +623,14 @@ pub fn got_slot_tls(oi: usize, si: u32, dynidx: u32) i32 {
     tls_got.set(@int_cast(usize, slot), true);
     tls_slots.put(k, @bit_cast(u32, slot) + 1);
     return slot;
+}
+
+/// A GOT slot of its own for symbol si of object oi (dynidx as for
+/// got_slot_tls): the one a PLT stub jumps through when the symbol's GOT
+/// slot holds the stub's address (elink.ax: canonical stubs, indirect
+/// functions).
+pub fn new_slot(oi: usize, si: u32, dynidx: u32) i32 {
+    return new_got(oi, si, dynidx);
 }
 
 // The GOT slot of global gi (symbol si of object oi), allocated on first use.

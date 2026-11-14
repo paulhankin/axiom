@@ -49,6 +49,10 @@ pub struct Note {
     section: []u8,
     alias: []u8,  // alias("target"): the entity is another name for target
     alias_span: u.Span,
+    // ifunc("resolver"): the function is an indirect function (ELF's
+    // STT_GNU_IFUNC), whose address the resolver, a function the unit
+    // defines, returns when the program starts (cgen.ax, note_alias)
+    ifunc: []u8,
     weak: bool,
     used: bool,
     visibility: i32,  // cpragma.VIS_
@@ -273,6 +277,9 @@ pub fn check(a: *mut cast.Attr, what: i32) void {
     } else if u.str_eq(n, "packed") {
         ok = (what == dsp.AP_TAG) or (what == dsp.AP_MEMBER);
         where = "applies only to structures, unions, enumerations and members";
+    } else if u.str_eq(n, "ifunc") {
+        ok = func;
+        where = "applies only to functions";
     } else if u.str_eq(n, "section") or u.str_eq(n, "used") or u.str_eq(n, "weak") or u.str_eq(n, "alias") or
               u.str_eq(n, "visibility") {
         ok = obj or func;
@@ -304,7 +311,7 @@ pub fn check(a: *mut cast.Attr, what: i32) void {
 }
 
 fn check_args(a: *mut cast.Attr, n: []u8) void {
-    let strs = ["section", "alias", "visibility", "error", "warning"];
+    let strs = ["section", "alias", "ifunc", "visibility", "error", "warning"];
     if one_of(n, strs[..]) {
         let s = string_arg(a);
         if u.isnos(s) {
@@ -667,7 +674,7 @@ fn int_of_bits(bits: i32, sg: bool) *mut cty.CType {
 // Records what GNU attribute a says of the entity at p (kind: what it is).
 fn record(p: usize, a: *mut cast.Attr, what: i32) void {
     let n = cf.plain(a.name);
-    let rec = ["section", "alias", "weak", "used", "visibility", "noinline", "always_inline", "cold", "hot",
+    let rec = ["section", "alias", "ifunc", "weak", "used", "visibility", "noinline", "always_inline", "cold", "hot",
                "constructor", "destructor", "cleanup", "nonnull", "error", "warning", "packed", "aligned",
                "transparent_union", "format", "naked", "format_arg", "const", "pure", "returns_nonnull", "malloc",
                "alloc_size", "alloc_align", "assume_aligned", "optimize", "target"];
@@ -679,6 +686,9 @@ fn record(p: usize, a: *mut cast.Attr, what: i32) void {
         x.section = string_arg(a);
     } else if u.str_eq(n, "alias") {
         x.alias = u.intern(string_arg(a));
+        x.alias_span = a.span;
+    } else if u.str_eq(n, "ifunc") {
+        x.ifunc = u.intern(string_arg(a));
         x.alias_span = a.span;
     } else if u.str_eq(n, "weak") {
         x.weak = true;
@@ -934,6 +944,26 @@ pub fn entity(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
         cs.err(dcl.name_span, "C3090", u.f1("'%s' has no linkage: it cannot be weak or an alias", s.name));
         n.weak = false;
         n.alias = "";
+    }
+    if (n.ifunc.len > 0) and (s.kind == cast.SK_FUNC) {
+        // an indirect function: a symbol of the object (STT_GNU_IFUNC),
+        // which only ELF has, defined here, of external linkage, not also
+        // an alias, without a body of its own
+        let mut why = "";
+        if tg.is_windows() or tg.is_darwin() or tg.is_wasm() {
+            why = "indirect functions (ifunc) are ELF's: the target has none";
+        } else if s.linkage != cast.LK_EXTERNAL {
+            why = "an indirect function (ifunc) has external linkage";
+        } else if n.alias.len > 0 {
+            why = "a function cannot be both an alias and an indirect function";
+        }
+        if why.len > 0 {
+            cs.err(dcl.name_span, "C3090", u.f2("'%s': %s", s.name, why));
+            n.ifunc = "";
+        } else {
+            s.defined = true;
+            cs.add_alias(s);  // (its symbol: cgen.ax, note_alias)
+        }
     }
     if n.weak {
         s.weak = true;  // (a definition gives way to one that is not weak: cc.ax, link_check)

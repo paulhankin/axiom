@@ -28,13 +28,17 @@
 // relocatable objects of an executable is applied; the general- and
 // local-dynamic and descriptor TLS models are relaxed to local-exec (the
 // executable has all of its TLS), the initial-exec one reads a GOT slot. A
-// non-PIC reference to data of a shared library gets a copy relocation.
+// non-PIC reference to data of a shared library gets a copy relocation, and
+// to a function its canonical PLT stub. Indirect functions (STT_GNU_IFUNC)
+// are reached through PLT stubs and IRELATIVE slots; .eh_frame_hdr indexes
+// the objects' FDEs (PT_GNU_EH_FRAME).
 // =============================================================================
 import "ar.ax" as ar;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
 import "lstub.ax" as lstub;
+import "macunwind.ax" as mu;
 import "nlink.ax" as nl;
 import "util.ax" as u;
 
@@ -44,9 +48,9 @@ const EXEC_BASE: u64 = 0x400000;
 let mut image_base: u64 = 0x400000;
 // Linking a shared library (link_shared) rather than an executable.
 let mut shared: bool = false;
-// Of dyn_syms, the first n_imports are the libraries' (undefined here);
-// a shared library's own definitions follow, exported (bound to its own
-// definitions within it: references inside the library are not preempted).
+// Of dyn_syms, the first n_imports are the libraries' (undefined here); the
+// link's own exported definitions follow (a shared library's: export_symbols;
+// an executable's that its libraries refer to: export_referenced).
 let mut n_imports: usize = 0;
 const PAGE: u64 = 0x10000;
 
@@ -56,6 +60,8 @@ struct Lib {
     syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object, 3 thread-local
     sizes: u.SymMap.[u64],  // name -> its size (data objects, for copy relocations)
     vers: u.SymMap.[[]u8],  // name -> its default version (if versioned)
+    prot: u.SymMap.[u8],    // name -> 1: protected (STV_PROTECTED)
+    undefs: u.SymMap.[u8],  // name -> 1: what it refers to and does not define
     used: bool,
     known: bool,  // its symbols were read
 }
@@ -90,6 +96,38 @@ pub let mut g_c_lib_axiom: bool = true;
 
 // The copy relocations: per copied symbol its global, in .bss.
 let mut copies: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+// What GOT slots hold beyond an address (by slot: SLOT_*; the list may be
+// shorter than the GOT): the slot a canonical PLT stub jumps through
+// (bound by an R_*_JUMP_SLOT, which the dynamic linker binds past the
+// executable's own .dynsym value, the stub), and an indirect function's
+// slot (R_*_IRELATIVE: its resolver's result, which the dynamic linker
+// computes, or a static program's start-up: lstub.write_start).
+const SLOT_ADDR: u8 = 0;
+const SLOT_JUMP: u8 = 1;
+const SLOT_IREL: u8 = 2;
+let mut slot_kind: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
+// The local indirect functions (STT_GNU_IFUNC of binding STB_LOCAL): the
+// global made for each, by "object:symbol".
+let mut local_ifuncs: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+// The dynamic relocations at the end of .rela.dyn that DT_JMPREL names (the
+// JUMP_SLOT ones, then the IRELATIVE ones, which run last).
+let mut n_tail_rels: u64 = 0;
+
+fn set_kind(slot: i32, k: u8) void {
+    while slot_kind.len <= @as(usize, @bit_cast(u32, slot)) {
+        slot_kind.push(SLOT_ADDR);
+    }
+    slot_kind.set(@as(usize, @bit_cast(u32, slot)), k);
+}
+
+fn kind_of(slot: usize) u8 {
+    if slot < slot_kind.len {
+        return slot_kind.get(slot);
+    }
+    return SLOT_ADDR;
+}
 
 fn is_x64() bool {
     return M == elf.EM_X86_64;
@@ -228,6 +266,13 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             let e = off + (j * 24);
             let shndx = bn.rd16(d, e + 6);
             let bind = d[e + 4] >> 4;
+            if (shndx == 0) and (bind != elf.B_LOCAL) {
+                let un = elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e)));
+                if un.len > 0 {
+                    l.undefs.put(u.intern(un), 1);
+                }
+                continue;
+            }
             if (shndx == 0) or (bind == elf.B_LOCAL) {
                 continue;
             }
@@ -250,6 +295,9 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
                 continue;  // (a strong definition of the name is there too)
             }
             l.syms.put(name, kind);
+            if (d[e + 5] & 3) == 3 {
+                l.prot.put(name, 1);
+            }
             let vi = @truncate(usize, vs & 0x7fff);
             if (vi >= 2) and (vi < vnames.len) and not u.isnos(vnames[vi]) {
                 l.vers.put(name, vnames[vi]);
@@ -321,6 +369,7 @@ fn collect_symbols() void {
                 g.is_tls = k == 3;
                 g.lib = @int_cast(i32, i);
                 g.ver = l.vers.get(ln);
+                g.prot = l.prot.get(ln) != 0;
                 break;
             }
         }
@@ -334,6 +383,68 @@ fn collect_symbols() void {
             g.dynidx = @int_cast(u32, dyn_syms.len);
         }
     }
+}
+
+// Marks the link's indirect functions (STT_GNU_IFUNC: the symbol's value is
+// its resolver, which returns the function's address). Those a shared
+// library exports for others to bind to (preemptible ones) are the dynamic
+// linker's to resolve.
+fn mark_ifuncs() void {
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
+        if (g.obj < 0) or g.dynamic {
+            continue;
+        }
+        if nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym)).ty == elf.T_IFUNC {
+            g.ifunc = true;
+        }
+    }
+}
+
+// The global of an indirect function symbol si of object oi refers to that
+// the link resolves (made for a local one), or -1. Its address, wherever
+// it is taken, is its PLT stub's (one address for every reference: the
+// stub jumps through a slot that the resolver's result fills).
+fn ifunc_of(oi: usize, si: u32) i32 {
+    let gi = nl.global_of(oi, si);
+    if gi >= 0 {
+        if nl.gsyms.at(@int_cast(usize, gi)).ifunc {
+            return gi;
+        }
+        return -1;
+    }
+    let s = nl.objs.get(oi).syms.get(@as(usize, si));
+    if (s.ty != elf.T_IFUNC) or (s.sec < 0) {
+        return -1;
+    }
+    let key = u.intern(u.f2("axiom.ifunc.%s.%s", u.zdec(oi), u.udec(@as(u64, si))));
+    let prev = local_ifuncs.get(key);
+    if prev != 0 {
+        return @bit_cast(i32, prev - 1);
+    }
+    let ng = nl.gsym_index(key);
+    let g = nl.gsyms.at(@as(usize, ng));
+    g.obj = @int_cast(i32, oi);
+    g.sym = si;
+    g.weak = false;
+    g.ifunc = true;
+    local_ifuncs.put(key, ng + 1);
+    return @bit_cast(i32, ng);
+}
+
+// An indirect function's PLT stub and the slot it jumps through.
+fn need_ifunc(gi: u32, oi: usize, si: u32) void {
+    let g = nl.gsyms.at(@as(usize, gi));
+    if g.pltgot < 0 {
+        g.pltgot = nl.new_slot(oi, si, 0);
+        set_kind(g.pltgot, SLOT_IREL);
+    }
+    _ = plt_stub(gi);
+}
+
+// The address of global gi's PLT stub.
+fn stub_addr(gi: u32) u64 {
+    return plt_addr + (@as(u64, @bit_cast(u32, nl.gsyms.at(@as(usize, gi)).stub)) * 16);
 }
 
 fn is_dynamic(oi: usize, si: u32) bool {
@@ -497,7 +608,8 @@ fn copy_object(gi: u32) void {
     }
     cs.size = nl.align_up(cs.size, al);
     let si = elf.add_sym(nl.lnk, elf.Sym.{ name: u.cat2("axiom.copy.", g.name), sec: nl.copy_sec, value: cs.size,
-                                           size: size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: true });
+                                           size: size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: true,
+                                           protected: false });
     cs.size += size;
     g.copy = true;
     g.obj = @int_cast(i32, nl.lnk_index());
@@ -520,11 +632,26 @@ fn scan_relocs() void {
                 if is_none(r.ty) or nl.sym_dropped(oi, r.sym) {
                     continue;
                 }
-                let dynamic = is_dynamic(oi, r.sym);
-                let gi = nl.global_of(oi, r.sym);
                 if is_tls_aux(r.ty) {
                     continue;  // (the rest of a TLS sequence: rewritten in place)
                 }
+                let ig = ifunc_of(oi, r.sym);
+                if ig >= 0 {
+                    need_ifunc(@bit_cast(u32, ig), oi, r.sym);
+                    if nl.is_got_reloc(is_x64(), r.ty) {
+                        _ = nl.got_slot(oi, r.sym);  // (which holds the stub's address)
+                    } else if shared and is_abs64(r.ty) {
+                        if (cls == nl.C_DATA) or (cls == nl.C_TDATA) {
+                            n_abs_dyn += 1;
+                        } else {
+                            nl.err(u.f2("an absolute address in code or read-only data of a shared library (%s, to '%s')",
+                                        nl.obj_name(oi), o.syms.get(@as(usize, r.sym)).name));
+                        }
+                    }
+                    continue;
+                }
+                let dynamic = is_dynamic(oi, r.sym);
+                let gi = nl.global_of(oi, r.sym);
                 if shared and not dynamic and is_abs64(r.ty) {
                     // an address the dynamic linker relocates (R_*_RELATIVE):
                     // in writable data only
@@ -555,22 +682,39 @@ fn scan_relocs() void {
                 } else if dynamic {
                     let ug = @bit_cast(u32, gi);
                     let g = nl.gsyms.at(@as(usize, ug));
-                    if nl.is_call_reloc(is_x64(), r.ty) and not g.is_data {
-                        // a GOT slot for the stub to jump through
+                    if nl.is_call_reloc(is_x64(), r.ty) and not (is_x64() and (r.ty == elf.R_X86_64_PC32)) and
+                       not g.is_data {
+                        // a GOT slot for the stub to jump through (an x86-64
+                        // PC32 may be a call or an address: as an address)
                         _ = nl.got_slot(oi, r.sym);
                         _ = plt_stub(ug);
-                    } else if is_abs64(r.ty) and (cls == nl.C_DATA) {
+                    } else if is_abs64(r.ty) and ((cls == nl.C_DATA) or (cls == nl.C_TDATA)) {
                         n_abs_dyn += 1;
-                    } else if g.is_data and needs_copy(r.ty) and shared {
-                        nl.err(u.f2("%s refers to '%s', a shared library's object, without the GOT: compile it as position-independent code",
+                    } else if needs_copy(r.ty) and shared {
+                        // (a library's own symbol of default visibility is
+                        // preemptible: only the GOT and the PLT reach it)
+                        nl.err(u.f2("%s refers to '%s', which another module may define (it is not hidden or protected), without the GOT: compile it as position-independent code",
                                     nl.obj_name(oi), g.name));
+                    } else if g.is_data and needs_copy(r.ty) and g.prot {
+                        nl.err(u.f3("%s refers to '%s' without the GOT, which needs a copy of it in the program, but it is protected in %s (whose own references bind to its own): compile it as position-independent code (-fPIC)",
+                                    nl.obj_name(oi), g.name, libs.get(@int_cast(usize, g.lib)).soname));
                     } else if g.is_data and needs_copy(r.ty) {
                         copy_object(ug);
+                    } else if not g.is_data and needs_copy(r.ty) and g.prot {
+                        nl.err(u.f3("%s takes the address of '%s' without the GOT, which makes the program's PLT stub the function's address, but it is protected in %s (whose own references see its own address): compile it as position-independent code (-fPIC)",
+                                    nl.obj_name(oi), g.name, libs.get(@int_cast(usize, g.lib)).soname));
                     } else if not g.is_data and needs_copy(r.ty) {
-                        // a function's address in position-dependent code: its
-                        // PLT stub (the address the program sees)
-                        _ = nl.got_slot(oi, r.sym);
+                        // a function's address in position-dependent code:
+                        // its PLT stub, the canonical address (.dynsym's value,
+                        // which the libraries' references bind to too: the
+                        // gABI's rule for function addresses); the stub jumps
+                        // through a slot of its own
                         _ = plt_stub(ug);
+                        if not g.canon {
+                            g.canon = true;
+                            g.pltgot = nl.new_slot(oi, r.sym, g.dynidx);
+                            set_kind(g.pltgot, SLOT_JUMP);
+                        }
                     } else if is_abs64(r.ty) {
                         nl.err(u.f2("absolute reference to '%s' in read-only data (%s)", g.name, nl.obj_name(oi)));
                     } else {
@@ -1062,12 +1206,16 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
                 }
                 let p = base + r.off;
                 let fo = file_of(p);
-                let dynamic = is_dynamic(oi, r.sym);
+                let mut dynamic = is_dynamic(oi, r.sym);
                 let mut sv = nl.sym_addr(oi, r.sym);
                 let gi = nl.global_of(oi, r.sym);
-                if dynamic and (nl.gsyms.at(@int_cast(usize, gi)).stub >= 0) and
-                   (nl.is_call_reloc(is_x64(), r.ty) or needs_copy(r.ty)) {
-                    sv = plt_addr + (@as(u64, @bit_cast(u32, nl.gsyms.at(@int_cast(usize, gi)).stub)) * 16);
+                let ig = ifunc_of(oi, r.sym);
+                if ig >= 0 {
+                    sv = stub_addr(@bit_cast(u32, ig));  // (an indirect function's address: its stub's)
+                    dynamic = false;
+                } else if dynamic and (nl.gsyms.at(@int_cast(usize, gi)).stub >= 0) and
+                          (nl.is_call_reloc(is_x64(), r.ty) or needs_copy(r.ty)) {
+                    sv = stub_addr(@bit_cast(u32, gi));
                 }
                 let a = r.addend;
                 let t = r.ty;
@@ -1123,6 +1271,167 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
 }
 
 // -----------------------------------------------------------------------------
+// .eh_frame_hdr
+// -----------------------------------------------------------------------------
+// The objects' call frame information (.eh_frame) is found by the unwinder
+// of the platform's runtime (C++'s exceptions, a backtrace through code of
+// other compilers) through PT_GNU_EH_FRAME: the segment .eh_frame_hdr,
+// which the linker makes (the Linux Standard Base's format): version 1,
+// the encodings of the three fields that follow (eh_frame_ptr pcrel|sdata4,
+// fde_count udata4, the table datarel|sdata4: offsets from the header's
+// start), then the table, each FDE's initial location and address, sorted
+// by location for a binary search.
+
+// Is section k of object oi call frame information the link keeps?
+fn is_eh_frame(oi: usize, k: usize) bool {
+    let s = nl.objs.get(oi).secs.get(k);
+    let cls = nl.sec_cls.get(oi)[k];
+    return u.str_eq(s.name, ".eh_frame") and ((cls == nl.C_CONST) or (cls == nl.C_DATA)) and (s.data.len() > 0);
+}
+
+// How many FDEs the objects' .eh_frame sections have at most (some may cover
+// code the link left out: the table leaves those out).
+fn count_fdes() u64 {
+    let mut n: u64 = 0;
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for k in 0..o.secs.len {
+            if not is_eh_frame(oi, k) {
+                continue;
+            }
+            let d = o.secs.get(k).data.view();
+            let mut at: usize = 0;
+            while (at + 8) <= d.len {
+                let len = @truncate(usize, bn.rd32(d, at));
+                if (len == 0) or (len == 0xffff_ffff) {
+                    break;  // (a terminator; the 64-bit format, which the objects of these targets do not use)
+                }
+                if bn.rd32(d, at + 4) != 0 {
+                    n += 1;
+                }
+                at += 4 + len;
+            }
+        }
+    }
+    return n;
+}
+
+struct EhEnt {
+    pc: u64,
+    fde: u64,
+}
+
+fn eh_cmp(a: EhEnt, b: EhEnt) i32 {
+    if a.pc < b.pc {
+        return -1;
+    }
+    if a.pc > b.pc {
+        return 1;
+    }
+    return 0;
+}
+
+// The pointer of encoding enc (DW_EH_PE_*) at address a, file offset fo; ok
+// false for one this does not read.
+fn read_enc(b: []u8, a: u64, fo: u64, enc: u8, ok: *mut bool) u64 {
+    let f = @truncate(usize, fo);
+    let mut v: u64 = 0;
+    let form = enc & 0x0f;
+    if (form == 0) or (form == 4) or (form == 0xc) {
+        v = bn.rd64(b, f);
+    } else if form == 3 {
+        v = bn.rd32(b, f);
+    } else if form == 0xb {
+        v = bn.rd32(b, f);
+        if (v & 0x8000_0000) != 0 {
+            v |= 0xffff_ffff_0000_0000;
+        }
+    } else {
+        ok.* = false;
+        return 0;
+    }
+    let app = enc & 0x70;
+    if app == 0x10 {
+        v = v +% a;  // DW_EH_PE_pcrel
+    } else if app != 0 {
+        ok.* = false;
+    }
+    return v;
+}
+
+// Writes .eh_frame_hdr at hdr (room for n_max entries) from the relocated
+// .eh_frame sections in b.
+fn write_eh_frame_hdr(b: []mut u8, hdr: u64, n_max: u64) void {
+    let mut ents = u.List.[EhEnt].empty();
+    let mut first: u64 = 0;
+    let text_lo = segs[1].vaddr;
+    let text_hi = segs[1].vaddr + segs[1].memsz;
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for k in 0..o.secs.len {
+            if not is_eh_frame(oi, k) {
+                continue;
+            }
+            let base = nl.sec_addr.get(oi)[k];
+            let size = @as(u64, o.secs.get(k).data.len());
+            if (first == 0) or (base < first) {
+                first = base;
+            }
+            let bfo = file_of(base);
+            let mut at: u64 = 0;
+            while (at + 8) <= size {
+                let len = bn.rd32(b, @truncate(usize, bfo + at));
+                if (len == 0) or (len == 0xffff_ffff) {
+                    break;
+                }
+                let id = bn.rd32(b, @truncate(usize, bfo + at + 4));
+                if id != 0 {
+                    // an FDE: its CIE is id bytes before the id's field
+                    let cie = (at + 4) -% id;
+                    let mut ok = cie < size;
+                    let mut enc: u8 = 0xff;
+                    if ok {
+                        enc = mu.fde_encoding(
+                            b[@truncate(usize, bfo)..@truncate(usize, bfo + size)], @truncate(usize, cie));
+                    }
+                    ok = ok and (enc != 0xff);
+                    let mut pc: u64 = 0;
+                    if ok {
+                        pc = read_enc(b, base + at + 8, bfo + at + 8, enc, &mut ok);
+                    }
+                    if ok and (pc >= text_lo) and (pc < text_hi) {
+                        ents.push(EhEnt.{ pc: pc, fde: base + at });
+                    }
+                }
+                at += 4 + len;
+            }
+        }
+    }
+    u.sort.[EhEnt](ents.items(), eh_cmp);
+    if @as(u64, ents.len) > n_max {
+        nl.err("internal: .eh_frame_hdr's table is larger than its room");
+        return;
+    }
+    let fo = file_of(hdr);
+    b[@truncate(usize, fo)] = 1;
+    b[@truncate(usize, fo) + 1] = 0x1b;  // eh_frame_ptr: DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    b[@truncate(usize, fo) + 2] = 0x03;  // fde_count: DW_EH_PE_udata4
+    b[@truncate(usize, fo) + 3] = 0x3b;  // the table: DW_EH_PE_datarel | DW_EH_PE_sdata4
+    bn.w32(b, fo + 4, (first -% (hdr + 4)) & 0xFFFF_FFFF);
+    bn.w32(b, fo + 8, @as(u64, ents.len));
+    for i in 0..ents.len {
+        let e = ents.get(i);
+        let at = fo + 12 + (@as(u64, i) * 8);
+        let d1 = @bit_cast(i64, e.pc -% hdr);
+        let d2 = @bit_cast(i64, e.fde -% hdr);
+        check32(d1, ".eh_frame_hdr");
+        check32(d2, ".eh_frame_hdr");
+        bn.w32(b, at, @bit_cast(u64, d1) & 0xFFFF_FFFF);
+        bn.w32(b, at + 4, @bit_cast(u64, d2) & 0xFFFF_FFFF);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Layout and the executable
 // -----------------------------------------------------------------------------
 struct Seg {
@@ -1163,7 +1472,9 @@ fn phdr(h: *mut bn.Bytes, ty: u64, flags: u64, off: u64, vaddr: u64, filesz: u64
     h.u64_(al);
 }
 
-const START_SIZE: u64 = 80;
+// _start's room: a static program's (lstub.START_SIZE: with the
+// IRELATIVE relocations) or the dynamic one's (80 bytes)
+const START_SIZE: u64 = lstub.START_SIZE;
 
 fn write_start(b: []mut u8, start: u64, main_addr: u64, lsm_got: u64, sp_word: u64) void {
     let fo = file_of(start);
@@ -1198,7 +1509,11 @@ fn write_plt(b: []mut u8) void {
     for i in 0..plt_syms.len {
         let g = nl.gsyms.at(@as(usize, plt_syms.get(i)));
         let stub = plt_addr + (@as(u64, i) * 16);
-        let ga = got_addr + (@as(u64, @bit_cast(u32, g.got)) * 8);
+        let mut slot = g.got;
+        if g.pltgot >= 0 {
+            slot = g.pltgot;  // (canonical stubs, indirect functions)
+        }
+        let ga = got_addr + (@as(u64, @bit_cast(u32, slot)) * 8);
         let fo = file_of(stub);
         if is_x64() {
             // jmp [rip + GOT]; ud2 padding
@@ -1596,9 +1911,10 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
 
 /// Links `inputs` into a shared library (an ELF ET_DYN: --emit=shared) at
 /// out, dynamically linked against `lib_names` (and the shared libraries
-/// given): its defined symbols of default visibility are exported (in
-/// .dynsym, found by the hash table), its own references bound to its own
-/// definitions; every address it holds is relocated where it is loaded
+/// given): its defined symbols of default and protected visibility are
+/// exported (in .dynsym, found by the hash table), the default ones
+/// preemptible (its references to them bound by the dynamic linker), the
+/// others bound to its own definitions; every address it holds is relocated where
 /// (R_*_RELATIVE), the thread-locals of the initial-exec model get their
 /// offsets from the dynamic linker (R_*_TPOFF64 of the module), and its
 /// initialization and termination arrays are the dynamic section's
@@ -1624,6 +1940,9 @@ fn link_image(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8
     plt_syms = u.List.[u32].empty();
     n_abs_dyn = 0;
     copies = u.List.[u32].empty();
+    slot_kind = u.List.[u8].empty();
+    local_ifuncs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    n_tail_rels = 0;
     let all = with_members(inputs);
     for o in all.items() {
         prepare_tls(o);
@@ -1661,7 +1980,10 @@ fn link_image(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8
     n_imports = dyn_syms.len;
     if shared {
         export_symbols();
+    } else {
+        export_referenced();
     }
+    mark_ifuncs();
     nl.classify(class_of);
     scan_relocs();
     if nl.errors != 0 {
@@ -1703,7 +2025,69 @@ fn export_symbols() void {
         }
         dyn_syms.push(@int_cast(u32, gi));
         g.dynidx = @int_cast(u32, dyn_syms.len);
+        if not s.protected {
+            // preemptible (the gABI's symbol preemption: a module loaded
+            // before the library, the program among them, may define it):
+            // the library's references reach it through the GOT and the
+            // PLT, bound by the dynamic linker (R_*_GLOB_DAT, JUMP_SLOT,
+            // R_*_64 against the symbol), as a library's import is
+            let mut k = elf.S_DATA;
+            if s.sec >= 0 {
+                k = nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).secs.get(@as(usize, @bit_cast(u32, s.sec))).kind;
+            }
+            g.dynamic = true;
+            g.is_tls = s.ty == elf.T_TLS;
+            g.is_data = (k != elf.S_TEXT) and not g.is_tls;
+        }
     }
+}
+
+// An executable's exports: its definitions that a library it uses refers
+// to or defines too, so that the library's references bind to them (the program's
+// definition preempts the library's own, if it has one: the gABI's lookup
+// order, the executable first). Not for the system C library's own
+// libraries, whose references (to malloc and its kin, say) stay theirs: a
+// program with the compiler's C library has two, each its own (and a
+// program with the system's defines what it means that library to use
+// through the interfaces the library gives for that).
+fn export_referenced() void {
+    let mut any = false;
+    for i in 0..libs.len {
+        if libs.get(i).used and not is_c_runtime(libs.get(i).soname) {
+            any = true;
+        }
+    }
+    if not any {
+        return;
+    }
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
+        if (g.obj < 0) or g.copy or g.dynamic or (g.obj == @int_cast(i32, nl.lnk_index())) {
+            continue;
+        }
+        let s = nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
+        if s.hidden or (s.bind == elf.B_LOCAL) or elf.is_part_name(s.name) or u.starts(s.name, "axiom.") {
+            continue;
+        }
+        let mut wanted = false;
+        for i in 0..libs.len {
+            let l = libs.get(i);
+            if l.used and not is_c_runtime(l.soname) and (l.undefs.has(g.name) or (l.syms.get(g.name) != 0)) {
+                wanted = true;
+                break;
+            }
+        }
+        if wanted {
+            dyn_syms.push(@int_cast(u32, gi));
+            g.dynidx = @int_cast(u32, dyn_syms.len);
+        }
+    }
+}
+
+// The system C library's own shared objects (and its dynamic linker's).
+fn is_c_runtime(soname: []u8) bool {
+    return is_system_c(soname) or u.starts(soname, "ld-linux") or u.starts(soname, "libpthread.so") or
+           u.starts(soname, "libdl.so") or u.starts(soname, "librt.so");
 }
 
 // -----------------------------------------------------------------------------
@@ -1823,6 +2207,8 @@ struct Layout {
     tdata_end: u64,
     main_tls: u64,  // a static program's main thread: its TLS block
     main_tp: u64,   // and thread pointer
+    ehh_addr: u64,  // .eh_frame_hdr (0: none: no .eh_frame)
+    ehh_max: u64,   // the most FDEs its table may have
 }
 
 // Places everything: the segments (segs), the tables in them, the sections.
@@ -1842,11 +2228,17 @@ fn lay_out(ds: *DynStr) Layout {
     if has_tls {
         phnum += 1;
     }
+    let ehh_max = count_fdes();
+    let mut ehh_size: u64 = 0;
+    if ehh_max > 0 {
+        phnum += 1;  // PT_GNU_EH_FRAME
+        ehh_size = 12 + (ehh_max * 8);
+    }
     let nsyms = @as(u64, dyn_syms.len) + 1;
     let n_rela = @as(u64, n_abs_dyn) + @as(u64, copies.len);
     let mut n_got_dyn: u64 = 0;
     for i in 0..nl.got_dyn.len {
-        if (nl.got_dyn.get(i) != 0) or shared {
+        if (nl.got_dyn.get(i) != 0) or shared or (kind_of(i) == SLOT_IREL) {
             n_got_dyn += 1;
         }
     }
@@ -1862,7 +2254,11 @@ fn lay_out(ds: *DynStr) Layout {
     let rela_off = nl.align_up(verneed_off + verneed_size, 8);
     let rela_size = (n_rela + n_got_dyn) * 24;
     segs[0] = Seg.{ vaddr: image_base, off: 0, filesz: 0, memsz: 0 };
-    let ro_end = nl.place(nl.C_CONST, image_base + rela_off + rela_size);
+    let mut ehh_addr: u64 = 0;
+    if ehh_max > 0 {
+        ehh_addr = nl.align_up(image_base + rela_off + rela_size, 4);
+    }
+    let ro_end = nl.place(nl.C_CONST, nl.align_up(image_base + rela_off + rela_size, 4) + ehh_size);
     segs[0].filesz = ro_end - image_base;
     segs[0].memsz = segs[0].filesz;
 
@@ -1880,7 +2276,7 @@ fn lay_out(ds: *DynStr) Layout {
     // Segment 3 (RW): .dynamic, .got, .data, .tdata; .bss after the file.
     segs[2] = next_seg(&segs[1], segs[1].off + segs[1].filesz);
     let dyn_addr = segs[2].vaddr;
-    let mut n_dyn = @as(u64, ds.needed.len) + 16;
+    let mut n_dyn = @as(u64, ds.needed.len) + 19;  // (DT_JMPREL, DT_PLTRELSZ, DT_PLTREL among them)
     if shared {
         n_dyn += 5;  // DT_SONAME, DT_INIT_ARRAY(SZ), DT_FINI_ARRAY(SZ)
     }
@@ -1924,7 +2320,7 @@ fn lay_out(ds: *DynStr) Layout {
                     dynsym_off: dynsym_off, dynstr_off: dynstr_off, dynstr_size: @as(u64, ds.b.len()),
                     hash_off: hash_off, versym_off: versym_off, verneed_off: verneed_off, rela_off: rela_off,
                     start: start, dyn_addr: dyn_addr, dyn_off: file_of(dyn_addr), n_dyn: n_dyn, tdata_end: tdata_end,
-                    main_tls: main_tls, main_tp: main_tp };
+                    main_tls: main_tls, main_tp: main_tp, ehh_addr: ehh_addr, ehh_max: ehh_max };
 }
 
 // The sections, _start, the PLT, the GOT and what the runtime needs, all
@@ -1939,7 +2335,16 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
     if shared {
         // (no start-up and no runtime: the program that loads it has them)
     } else if static_link {
-        lstub.write_start(b, file_of(ly.start), ly.start, nl.global_addr("axiom.start_sp"), ly.main_tp, main_addr, M);
+        // (its IRELATIVE relocations: .rela.dyn's, the only ones it has)
+        let mut n_irel: u64 = 0;
+        for i in 0..slot_kind.len {
+            if slot_kind.get(i) == SLOT_IREL {
+                n_irel += 1;
+            }
+        }
+        let irel = image_base + ly.rela_off;
+        lstub.write_start(b, file_of(ly.start), ly.start, nl.global_addr("axiom.start_sp"), ly.main_tp, main_addr, irel,
+                          irel + (n_irel * 24), M);
     } else {
         write_start(b, ly.start, main_addr, lsm_got, nl.global_addr("axiom.start_sp"));
     }
@@ -1955,6 +2360,9 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
     let mut rels = u.List.[DynRel].empty();
     apply_relocs(b, &mut rels);
     nl.sort_rets(b, file_of);
+    if ly.ehh_addr != 0 {
+        write_eh_frame_hdr(b, ly.ehh_addr, ly.ehh_max);
+    }
     if static_link {
         // the main thread's TLS block starts as the template, relocated (a
         // C thread-local's initial value may hold an address)
@@ -1966,15 +2374,50 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
     let mut glob_dat = @as(u64, elf.R_AARCH64_GLOB_DAT);
     let mut tpoff = @as(u64, elf.R_AARCH64_TLS_TPREL64);
     let mut copy = @as(u64, elf.R_AARCH64_COPY);
+    let mut jump_slot = @as(u64, elf.R_AARCH64_JUMP_SLOT);
+    let mut irelative = @as(u64, elf.R_AARCH64_IRELATIVE);
     if is_x64() {
         glob_dat = @as(u64, elf.R_X86_64_GLOB_DAT);
         tpoff = @as(u64, elf.R_X86_64_TPOFF64);
         copy = @as(u64, elf.R_X86_64_COPY);
+        jump_slot = @as(u64, elf.R_X86_64_JUMP_SLOT);
+        irelative = @as(u64, elf.R_X86_64_IRELATIVE);
     }
+    let mut jrels = u.List.[DynRel].empty();  // (DT_JMPREL's: JUMP_SLOT, then IRELATIVE)
+    let mut irels = u.List.[DynRel].empty();
     for i in 0..nl.got_dyn.len {
         let at = got_addr + (@as(u64, i) * 8);
         let d = nl.got_dyn.get(i);
-        let addr = nl.sym_addr(@as(usize, nl.got_obj.get(i)), nl.got_sym.get(i));
+        let oi = @as(usize, nl.got_obj.get(i));
+        let mut addr = nl.sym_addr(oi, nl.got_sym.get(i));
+        let k = kind_of(i);
+        if k == SLOT_JUMP {
+            jrels.push(DynRel.{ off: at, info: (@as(u64, d) << 32) | jump_slot, addend: 0 });
+            continue;
+        }
+        if k == SLOT_IREL {
+            // the resolver's address (a shared library's: its offset, to
+            // which the dynamic linker adds the base)
+            irels.push(DynRel.{ off: at, info: irelative, addend: @bit_cast(i64, addr) });
+            continue;
+        }
+        // an indirect function's address, and a canonical stub's, is the
+        // stub's (an executable's: fixed)
+        let ig = ifunc_of(oi, nl.got_sym.get(i));
+        let gi = nl.global_of(oi, nl.got_sym.get(i));
+        let canon = (gi >= 0) and nl.gsyms.at(@int_cast(usize, gi)).canon and not shared;
+        if (ig >= 0) or canon {
+            let mut sg = gi;
+            if ig >= 0 {
+                sg = ig;
+            }
+            addr = stub_addr(@bit_cast(u32, sg));
+            if shared {
+                rels.push(DynRel.{ off: at, info: relative_type(), addend: @bit_cast(i64, addr) });
+            }
+            bn.w64(b, file_of(at), addr);
+            continue;
+        }
         if nl.tls_got.get(i) {
             // the variable's offset from the thread pointer (a shared
             // library's own: the dynamic linker's, from its offset in the
@@ -1999,6 +2442,13 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
         let g = nl.gsyms.at(@as(usize, gi));
         let at = nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
         rels.push(DynRel.{ off: at, info: (@as(u64, g.dynidx) << 32) | copy, addend: 0 });
+    }
+    n_tail_rels = @as(u64, jrels.len + irels.len);
+    for r in jrels.items() {
+        rels.push(r);
+    }
+    for r in irels.items() {
+        rels.push(r);
     }
     return rels;
 }
@@ -2028,17 +2478,26 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
             let addr = nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
             let mut ty = elf.T_OBJECT;
             let mut v = addr;
-            if sy.ty == elf.T_FUNC {
-                ty = elf.T_FUNC;
+            if (sy.ty == elf.T_FUNC) or (sy.ty == elf.T_IFUNC) {
+                ty = sy.ty;  // (an indirect function's value: its resolver)
             } else if sy.ty == elf.T_TLS {
                 ty = elf.T_TLS;
                 v = addr - tls_addr;  // (its offset in the module's block)
             }
             b[@truncate(usize, e) + 4] = (bind << 4) | ty;
+            if sy.protected {
+                b[@truncate(usize, e) + 5] = 3;  // STV_PROTECTED: the library's references bind to it
+            }
             bn.w16(b, e + 6, section_of(addr));
             bn.w64(b, e + 8, v);
             bn.w64(b, e + 16, sy.size);
             continue;
+        }
+        if g.canon {
+            // undefined, its value the canonical stub: the address every
+            // module's references to the function bind to (not the stub's
+            // own JUMP_SLOT, which the dynamic linker binds past it)
+            bn.w64(b, e + 8, stub_addr(dyn_syms.get(i)));
         }
         if g.copy {
             // defined here (in .bss: write_file's section 4), so that the
@@ -2076,12 +2535,21 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
         dy.u64_(1);  // DT_NEEDED
         dy.u64_(ds.needed.get(i));
     }
+    let n_head = @as(u64, rels.len) - n_tail_rels;
     let tags: [9]u64 = [4, 5, 6, 10, 11, 7, 8, 9, 30];
     let vals: [9]u64 = [image_base + ly.hash_off, image_base + ly.dynstr_off, image_base + ly.dynsym_off,
-                        @as(u64, ds.b.len()), 24, image_base + ly.rela_off, @as(u64, rels.len) * 24, 24, 8];  // DF_BIND_NOW
+                        @as(u64, ds.b.len()), 24, image_base + ly.rela_off, n_head * 24, 24, 8];  // DF_BIND_NOW
     for i in @as(usize, 0)..9 {
         dy.u64_(tags[i]);
         dy.u64_(vals[i]);
+    }
+    if n_tail_rels > 0 {
+        dy.u64_(23);  // DT_JMPREL: the JUMP_SLOT and IRELATIVE relocations, after the others
+        dy.u64_(image_base + ly.rela_off + (n_head * 24));
+        dy.u64_(2);  // DT_PLTRELSZ
+        dy.u64_(n_tail_rels * 24);
+        dy.u64_(20);  // DT_PLTREL: DT_RELA
+        dy.u64_(7);
     }
     if ds.n_vlibs > 0 {
         dy.u64_(0x6fff_fff0);  // DT_VERSYM
@@ -2200,6 +2668,10 @@ fn write_headers(b: []mut u8, ly: *Layout) void {
     if ly.has_tls {
         phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, ly.tdata_end - tls_addr, tls_memsz,
              tls_align);
+    }
+    if ly.ehh_addr != 0 {
+        let n = 12 + (ly.ehh_max * 8);
+        phdr(&mut h, 0x6474_e550, 4, file_of(ly.ehh_addr), ly.ehh_addr, n, n, 4);  // PT_GNU_EH_FRAME
     }
     phdr(&mut h, 0x6474_e551, 6, 0, 0, 0, 0, 16);  // PT_GNU_STACK
     bn.put_at(b, 0, h.view());

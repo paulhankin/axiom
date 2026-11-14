@@ -373,12 +373,29 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   executable's own thread-locals and to initial-exec for a shared library's. Of COMDAT
   groups with one signature the first object's is kept. Common symbols are weak
   definitions in `.bss`. A shared library's data that position-dependent code refers to
-  directly gets a copy relocation. Sections whose names are C identifiers are placed
+  directly gets a copy relocation, and a function whose address it takes so gets the
+  program's PLT stub as its address in every module (the `.dynsym` entry's value; the stub
+  itself is bound by an `R_*_JUMP_SLOT`, which the dynamic linker binds past it): unless
+  the library's definition is protected (`STV_PROTECTED`: its own references bind to it,
+  which would see another object or address), which is then an error that asks for
+  position-independent code. Sections whose names are C identifiers are placed
   together, between `__start_<name>` and `__stop_<name>` when something refers to those;
   `.preinit_array`, `.init_array[.N]` and `.fini_array[.N]` are placed by priority between
   the symbols `__init_array_start` ... `__fini_array_end` and run by the start-up ("Start-up
-  and exit"). `.eh_frame` is kept, relocated (there is no `.eh_frame_hdr`: C++ exceptions
-  thrown through such code are not supported). `STT_GNU_IFUNC` symbols are an error.
+  and exit"). `.eh_frame` is kept, relocated, and the linker makes `.eh_frame_hdr`, the
+  table of every FDE's function by its address, sorted for a binary search (the Linux
+  Standard Base's format: the FDEs of code the link left out are not in it), which
+  `PT_GNU_EH_FRAME` names in executables and shared libraries, as the platform's unwinder
+  (its runtime's backtraces, C++'s exceptions) finds it. Indirect functions
+  (`STT_GNU_IFUNC`, global and local, of x86-64 and AArch64; the C attribute `ifunc`): a
+  PLT stub is the function's address wherever it is taken (calls, the GOT, data), and
+  jumps through a GOT slot that an `R_*_IRELATIVE` relocation gives the resolver's result:
+  in a static program the start-up applies them first (calling the resolvers with nothing
+  on x86-64 and on AArch64 with `AT_HWCAP | _IFUNC_ARG_HWCAP` and a pointer to
+  `{24, AT_HWCAP, AT_HWCAP2}`, from the auxiliary vector), otherwise the dynamic linker
+  (they come last, after `DT_JMPREL`'s `JUMP_SLOT` relocations). A shared library's
+  definition of default visibility is preemptible ("Shared libraries"); such an indirect
+  function is exported as one, the dynamic linker's to resolve.
 - **Static archives** (the `ar` format of System V and GNU, of BSD and of PE/COFF, and
   thin ones): a member is linked when it defines a name that is undefined so far (a strong
   reference: a weak one takes no member), and what it needs is looked for in turn, in every
@@ -389,7 +406,12 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   system's `libc.so` is one) is read for its `INPUT` and `GROUP`, `AS_NEEDED` included;
   another command is an error. The program is linked dynamically against the libraries
   it uses (`DT_NEEDED`), with the symbol versions they define, eagerly bound; the dynamic
-  linker's own symbols (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too.
+  linker's own symbols (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too. The
+  program's definitions that such a library refers to or defines too are exported
+  (`.dynsym`), so that the library's references bind to them (the program's definition
+  preempts a library's): not for the system C library's own (`libc.so.6`, `libm.so.6`,
+  the dynamic linker, ...), whose references, to `malloc` and its kin among them, stay its
+  own.
 - **C sources** given with `--link=` are compiled, after `--emit-header`'s header is
   written (which they may include), for Linux by the system's C compiler (`cc`, or the
   cross compiler for the target: `aarch64-linux-gnu-gcc`) with `-O2` and the `-I`
@@ -610,9 +632,16 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
 - **ELF** (`libprog.so`; `elink.ax`): position-independent (`--pic`, which
   `--emit=shared` implies: thread-locals in the initial-exec model, their offsets in GOT
   slots that the dynamic linker fills; the rest of the code generators' code is
-  position-independent always), its definitions of default visibility exported (`.dynsym`,
-  a hash table), its own references bound to its own definitions (as protected symbols
-  are: within the library nothing is preempted), every address it holds relocated where
+  position-independent always), its definitions of default and protected visibility
+  exported (`.dynsym`, a hash table; `STV_PROTECTED` kept). Those of default visibility
+  are preemptible, the generic ABI's rule: a module loaded before the library (the program,
+  which may define the name too, or have a copy of the object: a copy relocation) may
+  define them, so the library's own references reach them through its GOT and PLT, bound
+  by the dynamic linker (`R_*_GLOB_DAT`, `R_*_64` and `R_*_TPOFF64` against the symbol),
+  and a reference that cannot (one not through the GOT in code that is not
+  position-independent) is an error. The compiler takes the definition it compiles to be
+  the one that runs when it optimizes (it may inline the function). Protected and hidden
+  definitions bind within the library. Every address it holds is relocated where
   it is loaded (`R_*_RELATIVE`), `DT_SONAME` its file name, `DT_INIT_ARRAY` and
   `DT_FINI_ARRAY` its constructors and destructors, and `DT_NEEDED` the libraries it uses.
   Code that is not position-independent (an absolute address in code or read-only data,
@@ -690,11 +719,6 @@ duplicates" is an error (`duplicate symbol`).
 
 - On WebAssembly a weak reference to a function nothing defines, while null, is still an
   import of `env` for its calls.
-- `visibility` is written to ELF objects
-  as `hidden` (hidden, internal) or default (protected, default: a shared library binds
-  its references to its own definitions, as protected ones are), to Mach-O objects as
-  private externs, and a hidden symbol is not a DLL's or a shared library's export.
-- `.eh_frame` is kept without `.eh_frame_hdr` and `PT_GNU_EH_FRAME`.
 
 ## The C library
 
@@ -1797,7 +1821,8 @@ C4052 and is ignored.
 | `unused` | any declaration, labels | As `[[maybe_unused]]`. |
 | `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if no unit defines it; on WebAssembly the host's import). `#pragma weak` too. |
 | `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): a symbol of its own (with `weak`, a weak one) at target's place in every object format, which other objects refer to; the program's other units' references to the name are to target (unless a weak alias's name is defined otherwise, which then wins). An object for other links keeps target for it. |
-| `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to `--emit=obj` and `--emit=lib` objects (ELF: `STV_HIDDEN` for hidden and internal, `STV_DEFAULT` for the others), where another link sees it; no effect on an executable's own code. |
+| `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to objects and shared libraries (ELF: `STV_HIDDEN` for hidden and internal, `STV_PROTECTED`, `STV_DEFAULT`; Mach-O: hidden as a private extern; COFF and Mach-O have no protected symbols: default there). With `--pic` (and `--emit=shared`) on ELF a definition of default visibility is preemptible, its address taken from the GOT and its calls through the PLT; hidden and protected ones are reached directly ("Shared libraries"). No effect on an executable's own code. |
+| `ifunc("resolver")` | function declarations of external linkage | An indirect function (ELF's `STT_GNU_IFUNC`; Linux targets only, else C3090, and `__has_attribute(ifunc)` is 0): the symbol of its name is at resolver, a function the unit defines (else C3090), taking no arguments (on AArch64 it may take the hardware capabilities: "Objects and libraries") and returning the function's address, which the program's start-up (a static program's, before anything else runs) or the dynamic linker calls once; the function's calls and its address are its name's, one address wherever it is taken. A definition of it with a body is a redefinition (C3002); it is not also an alias. |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
 | `noinline`, `always_inline` | functions | Given to the optimizer. |
 | `cold`, `hot` | functions | Given to the optimizer and the code generator: a block that calls a cold function (and the branch `__builtin_expect` says is unlikely) is laid out apart, as cold code, and a call in it is inlined only when that makes the code smaller; the calls in a hot function, and those of one, are inlined up to twice the usual size. |

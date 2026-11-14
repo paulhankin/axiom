@@ -45,6 +45,7 @@ pub const R_X86_64_PC32: u32 = 2;
 pub const R_X86_64_PLT32: u32 = 4;
 pub const R_X86_64_COPY: u32 = 5;
 pub const R_X86_64_GLOB_DAT: u32 = 6;
+pub const R_X86_64_JUMP_SLOT: u32 = 7;
 pub const R_X86_64_RELATIVE: u32 = 8;
 pub const R_X86_64_GOTPCREL: u32 = 9;
 pub const R_X86_64_32: u32 = 10;
@@ -155,7 +156,9 @@ pub const R_AARCH64_TLSDESC_ADD: u32 = 568;
 pub const R_AARCH64_TLSLD_LDST128_DTPREL_LO12: u32 = 572;
 pub const R_AARCH64_TLSLD_LDST128_DTPREL_LO12_NC: u32 = 573;
 pub const R_AARCH64_GLOB_DAT: u32 = 1025;
+pub const R_AARCH64_JUMP_SLOT: u32 = 1026;
 pub const R_AARCH64_RELATIVE: u32 = 1027;
+pub const R_AARCH64_IRELATIVE: u32 = 1032;
 // Not an ELF type: our own, for objects only plink.ax links. A 32-bit address
 // relative to the image's base (a PE RVA: .pdata's function table).
 pub const R_AARCH64_RVA32: u32 = 1251;
@@ -202,6 +205,9 @@ pub struct Sym {
     bind: u8,
     ty: u8,
     hidden: bool,
+    // STV_PROTECTED (C's visibility "protected"): exported by a shared
+    // library, but the library's own references bind to this definition
+    protected: bool,
 }
 
 // A COMDAT group of a read object (SHT_GROUP with GRP_COMDAT): its
@@ -269,8 +275,8 @@ pub fn add_sec(o: *mut Obj, name: []u8, kind: i32, align: u64) i32 {
 pub fn sec_sym(o: *mut Obj, sec: i32) u32 {
     let s = o.secs.get(@int_cast(usize, sec));
     if s.sym1 == 0 {
-        s.sym1 = add_sym(o, Sym.{ name: "", sec: sec, value: 0, size: 0, bind: B_LOCAL, ty: T_NOTYPE,
-                                  hidden: false }) + 1;
+        s.sym1 = add_sym(o, Sym.{ name: "", sec: sec, value: 0, size: 0, bind: B_LOCAL, ty: T_NOTYPE, hidden: false,
+                                  protected: false }) + 1;
     }
     return s.sym1 - 1;
 }
@@ -336,9 +342,9 @@ pub fn rets_bounds(machine: u32) *mut Obj {
     let a = add_sec(o, "axiom_rets.start", S_RODATA, 8);
     let b = add_sec(o, "axiom_rets.stop", S_RODATA, 8);
     _ = add_sym(o, Sym.{ name: "__start_axiom_rets", sec: a, value: 0, size: 0, bind: B_GLOBAL, ty: T_NOTYPE,
-                         hidden: true });
+                         hidden: true, protected: false });
     _ = add_sym(o, Sym.{ name: "__stop_axiom_rets", sec: b, value: 0, size: 0, bind: B_GLOBAL, ty: T_NOTYPE,
-                         hidden: true });
+                         hidden: true, protected: false });
     return o;
 }
 
@@ -402,7 +408,8 @@ pub fn ext_sym(o: *mut Obj, name: []u8, weak: bool) u32 {
     if weak {
         b = B_WEAK;
     }
-    return add_sym(o, Sym.{ name: name, sec: -1, value: 0, size: 0, bind: b, ty: T_NOTYPE, hidden: false });
+    return add_sym(o, Sym.{ name: name, sec: -1, value: 0, size: 0, bind: b, ty: T_NOTYPE, hidden: false,
+                            protected: false });
 }
 
 fn sec_flags(k: i32) u64 {
@@ -484,8 +491,8 @@ pub fn write(o: *mut Obj) []u8 {
             gsigs.push(g);
             if o.symmap.get(u.intern(g)) == 0 {
                 let first = @int_cast(i32, i);
-                _ = add_sym(o, Sym.{ name: g, sec: first, value: 0, size: 0, bind: B_GLOBAL, ty: T_NOTYPE,
-                                     hidden: true });
+                _ = add_sym(o, Sym.{ name: g, sec: first, value: 0, size: 0, bind: B_GLOBAL, ty: T_NOTYPE, hidden: true,
+                                     protected: false });
             }
         }
     }
@@ -633,6 +640,8 @@ fn symbol_table(o: *Obj, symtab: *mut bn.Bytes, strtab: *mut bn.Bytes, map: []mu
             symtab.u8_((s.bind << 4) | st_type);
             if s.hidden {
                 symtab.u8_(2);
+            } else if s.protected {
+                symtab.u8_(3);
             } else {
                 symtab.u8_(0);
             }
@@ -856,7 +865,7 @@ pub fn read(d: []u8) *mut Obj {
             }
             let vis = other & 3;  // STV_INTERNAL and STV_HIDDEN: not seen outside the module
             let s = Sym.{ name: u.dup(name), sec: sec, value: value, size: size_v, bind: bind, ty: info & 15,
-                          hidden: (vis == 1) or (vis == 2) };
+                          hidden: (vis == 1) or (vis == 2), protected: vis == 3 };
             o.syms.push(s);
             let idx = @int_cast(u32, o.syms.len - 1);
             if (s.bind != B_LOCAL) and (s.name.len > 0) {

@@ -685,8 +685,23 @@ pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
     return n;
 }
 
+/// Is a global's address taken from the GOT: a declaration (possibly in a
+/// shared library), or a preemptible definition (preemptible)?
 pub fn extern_global(g: *ir.Global) bool {
-    return u.isnil(g.init);
+    return u.isnil(g.init) or (not g.tls and preemptible(g.linkage, g.visibility));
+}
+
+/// Is a definition of this linkage and visibility (ir.VIS_) preemptible:
+/// code for a shared library (--pic: target.ax g_pic; ELF), whose symbols
+/// of default visibility a module loaded before it may define, as the ELF
+/// gABI's symbol preemption has it (an executable's copy of the library's
+/// object, the program's own definition of a function)? Then its address
+/// comes from the GOT and its calls go through the PLT, as a declaration's
+/// do, and the linker binds them (elink.ax). Hidden and protected symbols
+/// bind within the module.
+pub fn preemptible(linkage: i32, vis: u8) bool {
+    return tg.g_pic and not tg.is_windows() and not tg.is_darwin() and not tg.is_wasm() and
+           ((linkage == ir.LINK_EXTERNAL) or (linkage == ir.LINK_WEAK)) and (vis == ir.VIS_DEFAULT);
 }
 
 pub fn has_addresses(x: *ir.Value) bool {
@@ -781,8 +796,21 @@ fn add_aliases(obj: *mut elf.Obj, m: *mut ir.Module, fsym: *mut u.List.[u32], gs
             continue;  // (its target is not this object's: another part's)
         }
         let ts = obj.syms.get(@as(usize, t));
+        let mut ty = ts.ty;
+        if a.ifunc {
+            ty = elf.T_IFUNC;
+        }
         let s = elf.add_sym(obj, elf.Sym.{ name: a.name, sec: ts.sec, value: ts.value, size: ts.size, bind: bind,
-                                           ty: ts.ty, hidden: hidden_vis(a.visibility) });
+                                           ty: ty, hidden: hidden_vis(a.visibility),
+                                           protected: a.visibility == ir.VIS_PROTECTED });
+        if a.ifunc {
+            // the name's declaration is the symbol: references bind to it
+            let d = m.fmap.get(a.name);
+            if u.notnil(d) and ir.is_decl(d) and (d.id >= 0) and (@int_cast(usize, d.id) < m.funcs.len) and
+               (m.funcs.get(@int_cast(usize, d.id)) == d) {
+                fsym.set(@int_cast(usize, d.id), s);
+            }
+        }
         if u.notnil(af) {
             alias_fix.push((@as(u64, s) << 32) | @as(u64, t));
         }
@@ -936,8 +964,8 @@ fn named_section(obj: *mut elf.Obj, name: []u8, ro: bool) i32 {
 // Is a symbol of visibility vis (C's attribute visibility: ir.VIS_) hidden
 // in the object (STV_HIDDEN)? Internal is written as hidden, which it
 // implies (the ELF gABI's STV_INTERNAL adds only a processor's meaning);
-// protected as default: an executable's symbols are not preempted, and no
-// shared object is made from these objects.
+// protected is STV_PROTECTED (elf.Sym.protected; Mach-O and COFF have no
+// such visibility: there it is default).
 fn hidden_vis(vis: u8) bool {
     return (vis == ir.VIS_HIDDEN) or (vis == ir.VIS_INTERNAL);
 }
@@ -977,7 +1005,8 @@ fn platform_tlv(obj: *mut elf.Obj, g: *ir.Global, i: usize) u32 {
         ds.data.zeros(@truncate(usize, g.ty.size));
     }
     let init = elf.add_sym(obj, elf.Sym.{ name: u.perm_dup(u.cat2(gname, "$tlv$init")), sec: dsec, value: off,
-                                          size: g.ty.size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false });
+                                          size: g.ty.size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false,
+                                          protected: false });
     let vs = obj.secs.get(@int_cast(usize, vsec));
     vs.data.align(8);
     let at = @as(u64, vs.data.len());
@@ -986,7 +1015,8 @@ fn platform_tlv(obj: *mut elf.Obj, g: *ir.Global, i: usize) u32 {
     vs.relocs.push(elf.Rel.{ off: at, ty: tlv_abs64(obj), sym: boot, addend: 0 });
     vs.relocs.push(elf.Rel.{ off: at + 16, ty: tlv_abs64(obj), sym: init, addend: 0 });
     return elf.add_sym(obj, elf.Sym.{ name: gname, sec: vsec, value: at, size: 24, bind: sym_bind(g.linkage, "g", i),
-                                      ty: elf.T_OBJECT, hidden: hidden_vis(g.visibility) });
+                                      ty: elf.T_OBJECT, hidden: hidden_vis(g.visibility),
+                                      protected: g.visibility == ir.VIS_PROTECTED });
 }
 
 // The section `name` of the platform's thread-locals (made once).
@@ -1035,7 +1065,8 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
             let nm = sym_name(f.name, f.linkage, "f", i);
             fsym.push(elf.add_sym(obj, elf.Sym.{ name: nm, sec: func_section(obj, f, text, nm), value: 0, size: 0,
                                                  bind: sym_bind(f.linkage, "f", i), ty: elf.T_FUNC,
-                                                 hidden: hidden_vis(f.visibility) }));
+                                                 hidden: hidden_vis(f.visibility),
+                                                 protected: f.visibility == ir.VIS_PROTECTED }));
         }
     }
     for i in 0..m.globals.len {
@@ -1091,7 +1122,8 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         }
         gsym.push(elf.add_sym(obj, elf.Sym.{ name: gname, sec: sec, value: off, size: g.ty.size,
                                              bind: sym_bind(g.linkage, "g", i), ty: ty,
-                                             hidden: hidden_vis(g.visibility) }));
+                                             hidden: hidden_vis(g.visibility),
+                                             protected: g.visibility == ir.VIS_PROTECTED }));
     }
     add_aliases(obj, m, fsym, gsym);
     for i in 0..m.globals.len {
