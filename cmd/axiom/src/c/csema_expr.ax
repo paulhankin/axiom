@@ -445,6 +445,15 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
             let robj = r.kind != cty.TK_FUNCTION;
             let ok = pointee_compatible(l, r) or ((l.kind == cty.TK_VOID) and robj) or
                      ((r.kind == cty.TK_VOID) and lobj);
+            if not ok and cs.opts().gnu and
+               (((l.kind == cty.TK_VOID) and not robj) or ((r.kind == cty.TK_VOID) and not lobj)) {
+                // (a GNU dialect: a pointer to a function converted to or from
+                // void * without a cast, which 6.5.16.1p1 does not allow; the
+                // cast's conversion, with a warning)
+                cs.warn(e.span, "C4140", u.f3("%s converts between a function pointer and 'void *': %s to %s", what,
+                                              cs.tq(s), cs.tq(t)));
+                return convert(e, t);
+            }
             if not ok {
                 cs.err(e.span, "C3022", u.f3("incompatible pointer types in %s: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
@@ -455,6 +464,11 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
                 // too, on the void; a warning, so that such pointers can be
                 // given to functions that take void *)
                 cs.warn(e.span, "C4091", u.f3("%s discards the _Atomic qualifier: %s to %s", what, cs.tq(s), cs.tq(t)));
+            } else if (dropped != 0) and cs.opts().gnu and ((dropped & cty.Q_ATOMIC) == 0) {
+                // (a GNU dialect: the qualifiers of the pointed-to type dropped,
+                // which 6.5.16.1p1 does not allow, with a warning; an _Atomic
+                // one stays an error: its accesses are not the plain type's)
+                cs.warn(e.span, "C4141", u.f3("%s discards qualifiers: %s to %s", what, cs.tq(s), cs.tq(t)));
             } else if dropped != 0 {
                 cs.err(e.span, "C3022", u.f3("%s discards qualifiers: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
@@ -1477,6 +1491,17 @@ fn conditional_types(e: *mut cast.Expr) *mut cast.Expr {
         e.ty = cty.t_void;
         return e;
     }
+    if cs.opts().gnu and (cty.is_void(tb) or cty.is_void(tc)) {
+        // (a GNU dialect: one operand void and the other not, which 6.5.15p3
+        // does not allow: the result is void, the other operand's value discarded)
+        cs.warn(e.span, "C4142",
+                u.f2("the operands of '?:' are of void and non-void types (%s and %s): the result is void", cs.tq(tb),
+                     cs.tq(tc)));
+        e.b = convert(b, cty.t_void);
+        e.c = convert(c, cty.t_void);
+        e.ty = cty.t_void;
+        return e;
+    }
     // (C23 6.5.16p3: two nullptr_t operands, or one and a pointer)
     if cty.is_nullptr(tb) and cty.is_nullptr(tc) {
         e.ty = cty.t_nullptr;
@@ -1817,6 +1842,12 @@ fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
         }
         cc.fold(e);
         return e;
+    }
+    if cs.opts().gnu and cty.is_record(t) and cty.compatible_unq(t, s) {
+        // (a GNU dialect: a structure or union cast to its own type, which
+        // 6.5.4p2 does not allow: the operand's value, with a warning)
+        cs.warn(e.span, "C4143", u.f1("a cast of a value of type %s to its own type", cs.tq(s)));
+        return a;
     }
     if not cty.is_scalar(t) or not cty.is_scalar(s) {
         cs.err(e.span, "C3028", u.f2("a cast from %s to %s (casts are between scalar types, or to void)", cs.tq(s),

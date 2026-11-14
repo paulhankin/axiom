@@ -131,7 +131,7 @@ names the feature and the standard that has it (or removed it).
 
 | Code | Meaning |
 |---|---|
-| `C2100` | A keyword of a later standard (`_Bool`, `inline`, `restrict`, `_Generic`, `typeof`, `constexpr`, ...). |
+| `C2100` | A keyword of a later standard (`_Bool`, `inline`, `restrict`, `_Generic`, `typeof`, `constexpr`, ...). In a GNU dialect one spelled in the reserved namespace (`_Bool`, `_Static_assert`, ...) is the warning `C4145` instead. |
 | `C2101` | `long long` (C99). |
 | `C2106` | Declarations mixed with code (C99). |
 | `C2107` | A declaration in the first clause of `for` (C99). |
@@ -169,7 +169,7 @@ names the feature and the standard that has it (or removed it).
 | `C3008` | An invalid declarator or member: arrays of functions, functions returning arrays, a flexible array member that is not last, a member of function type, and so on. |
 | `C3009` | An invalid array size: not an integer, not positive, or too large (more than 2^47 bytes). |
 | `C3010` | A declaration that declares nothing, a member declaration that declares no member, or a name where none can be. |
-| `C3011` | The wrong kind of tag (`union S` for a structure), or an enumeration that is not defined. |
+| `C3011` | The wrong kind of tag (`union S` for a structure), or an enumeration that is not defined (in a GNU dialect, the warning `C4144` and an incomplete type). |
 | `C3013` | An enumeration constant out of range (of `int`, before C23; of the fixed underlying type), or values that no integer type an enumeration may have holds. |
 | `C3033` | An invalid initializer: of a typedef, a function or a parameter, an `extern` object in a block, or too many braces around a scalar. |
 | `C3045` | A function with internal linkage that is used and not defined (6.9p3). |
@@ -200,9 +200,9 @@ names the feature and the standard that has it (or removed it).
 
 | Code | Meaning |
 |---|---|
-| `C3020` | Invalid operands to an operator (or a type name used as a value). |
+| `C3020` | Invalid operands to an operator (or a type name used as a value). (In a GNU dialect `?:` of a void and a non-void operand is the warning `C4142`.) |
 | `C3021` | An assignment, `++` or `--` on something that is not a modifiable lvalue: an array, a `const` object, a structure with a `const` member. |
-| `C3022` | Incompatible types in an assignment, initialization, argument or `return`, or one that discards qualifiers. |
+| `C3022` | Incompatible types in an assignment, initialization, argument or `return`, or one that discards qualifiers. (In a GNU dialect a function pointer to or from `void *` is the warning `C4140`, and qualifiers other than `_Atomic` discarded the warning `C4141`.) |
 | `C3023` | The wrong number of arguments in a call. |
 | `C3024` | A call of something that is not a function or a pointer to one. |
 | `C3025` | A member access on something without that member, or on a type that is no structure or union (also `offsetof`). |
@@ -297,6 +297,12 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4133` | A format string with a conversion specification that is not one: an unknown conversion, a length modifier or flag the conversion does not take, `%n$` positions mixed with plain conversions or with one missing (level 1). |
 | `C4134` | A call whose format is not a string literal, nor a `format_arg` function's call with one (level 2). |
 | `C4135` | A format conversion that is defined but suspect: an argument of the right size and kind but another type (another signedness; `int` for `%ld` where both have 32 bits), a flag the conversion ignores, `%n` (level 2). |
+| `C4140` | A GNU dialect: a pointer to a function converted to `void *`, or `void *` to a pointer to a function, without a cast (an assignment, initialization, argument or `return`; under an ISO standard `C3022`). The conversion is made. |
+| `C4141` | A GNU dialect: an assignment, initialization, argument or `return` that discards qualifiers (`const`, `volatile`, `restrict`) of the pointed-to type (under an ISO standard, and for `_Atomic`, `C3022`). The conversion is made. |
+| `C4142` | A GNU dialect: a conditional expression with one operand of type `void` and the other not (under an ISO standard `C3020`). The result is `void`. |
+| `C4143` | A GNU dialect: a cast of a structure or union to its own type (under an ISO standard `C3028`). It is the operand's value. |
+| `C4144` | A GNU dialect: an enumeration named before its list (a forward declaration `enum e;`, or a use of `enum e`; under an ISO standard `C3011`). It is an incomplete type until its list completes it. |
+| `C4145` | A GNU dialect: a keyword of a later standard spelled in the reserved namespace (`_Bool`, `_Complex`, `_Static_assert`, `_Alignas`, `_Alignof`, `_Atomic`, `_Generic`, `_Noreturn`, `_Thread_local`, `_BitInt`; under an ISO standard `C2100`). It is that keyword. |
 
 `#pragma GCC diagnostic` can hide a warning, or make it an error (with its code)
 ([`docs/c.md`](c.md), "Pragmas").

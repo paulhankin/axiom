@@ -26,7 +26,7 @@
 //   C2025  an unknown type name (an undeclared identifier where a declaration begins)
 //   C2026  an empty translation unit
 //   C2027  a cast as the operand of prefix '++' or '--'
-//   C2100  a keyword of a later standard ('_Bool' is a C99 feature)
+//   C2100  a keyword of a later standard ('_Bool' is a C99 feature; a GNU dialect's reserved spelling: warning C4145)
 //   C2101  'long long' (C99)
 //   C2106  mixed declarations and code (C99)
 //   C2107  declarations in 'for' (C99)
@@ -468,7 +468,14 @@ fn take_kw(P: *mut Parser) *ct.Token {
     let t = advance(P);
     if t.kind == ct.T_IDENT {
         let s = kw_since(t.text);
-        if s > P.std {
+        if (s > P.std) and P.gnu and reserved_spelling(t.text) {
+            // (a GNU dialect: a later standard's keyword spelled in the
+            // namespace reserved to the implementation, which no program
+            // may use for its own names, is that keyword, with a warning)
+            if not g_quiet {
+                _ = dg.warning(t.span, "C4145", u.f2("'%s' is a %s feature", t.text, std_name(s)));
+            }
+        } else if s > P.std {
             error_at(t.span, "C2100", u.f2("'%s' is a %s feature", t.text, std_name(s)));
         }
     }
@@ -518,13 +525,43 @@ fn starts_specs(P: *mut Parser, k0: usize) bool {
     return is_typedef_tok(P, peek(P, k));
 }
 
-// The token at offset k begins a type name.
+// The token at offset k begins a type name (in a GNU dialect it may begin
+// with attributes, which begin no expression).
 fn starts_type_name(P: *mut Parser, k: usize) bool {
     let id = kw_at(P, k);
     if id != 0 {
-        return is_typename_kw(id);
+        return is_typename_kw(id) or (id == ct.K_ATTRIBUTE);
     }
     return is_typedef_tok(P, peek(P, k));
+}
+
+// The number of tokens of the GNU attribute specifiers (`__attribute__((...))`,
+// `__declspec(...)`) at offset k: each keyword and its parenthesized group.
+fn gnu_attrs_ahead(P: *mut Parser, k0: usize) usize {
+    let mut k = k0;
+    while kw_at(P, k) == ct.K_ATTRIBUTE {
+        k += 1;
+        if not is_p(peek(P, k), ct.P_LPAREN) {
+            return k - k0;
+        }
+        let mut depth: i32 = 0;
+        loop {
+            let t = peek(P, k);
+            if t.kind == ct.T_EOF {
+                return k - k0;
+            }
+            k += 1;
+            if is_p(t, ct.P_LPAREN) {
+                depth += 1;
+            } else if is_p(t, ct.P_RPAREN) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    return k - k0;
 }
 
 // The token at offset k begins a declaration (not an attribute
@@ -1444,15 +1481,21 @@ fn parse_quals(P: *mut Parser, d: *mut cast.Deriv, in_array: bool) void {
 // Whether '(' at the current token, in a declarator that may be abstract,
 // begins a parameter list rather than a parenthesized declarator: in a
 // parameter, `(T)` with T a typedef name is a function taking a T.
+// In a GNU dialect attributes may begin either (`(__attribute__((a)) *)`,
+// `(__attribute__((a)) int)`): what follows them decides.
 fn paren_is_params(P: *mut Parser) bool {
-    let nx = peek(P, 1);
+    let mut k: usize = 1;
+    if P.gnu {
+        k += gnu_attrs_ahead(P, 1);
+    }
+    let nx = peek(P, k);
     if is_p(nx, ct.P_RPAREN) or is_p(nx, ct.P_ELLIPSIS) {
+        return k == 1;
+    }
+    if is_p(nx, ct.P_LBRACKET) and is_p(peek(P, k + 1), ct.P_LBRACKET) {
         return true;
     }
-    if is_p(nx, ct.P_LBRACKET) and is_p(peek(P, 2), ct.P_LBRACKET) {
-        return true;
-    }
-    return starts_specs(P, 1);
+    return starts_specs(P, k);
 }
 
 fn new_deriv(k: cast.DerivKind, sp: u.Span) cast.Deriv {

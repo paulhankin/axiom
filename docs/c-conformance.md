@@ -73,7 +73,7 @@ Four checks cover whole clauses at once and are named below by these names:
 | 4p5 strictly conforming programs | yes: every mode accepts its standard's language and diagnoses extensions (but `#pragma`s) | `run/c89`, `run/c99_features`, `run/c23`, `run/err_*_c89` ... |
 | 4p6 hosted and freestanding implementations | yes: hosted by default, `--c-freestanding` (the freestanding headers, C23 4p7's `<string.h>`) | `lib/core/hosted`, `lib/core/freestanding`, `lib/ext1/freestanding` |
 | 4p8 implementation-defined behavior documented | yes: J.3 below | |
-| 4p9 extensions only if no strictly conforming program changes | yes: GNU extensions only in `gnuNN` modes | `run/err_gnu_*_c17` |
+| 4p9 extensions only if no strictly conforming program changes | yes: GNU extensions only in `gnuNN` modes, which also accept a few constraint violations with a warning, the diagnostic 5.1.1.3 asks for (`C4140` ... `C4145`: docs/c.md, "GNU dialects") | `run/err_gnu_*_c17` |
 
 ## Clause 5: environment
 

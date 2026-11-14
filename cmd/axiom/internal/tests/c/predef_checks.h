@@ -60,6 +60,9 @@ static_assert(__BIGGEST_ALIGNMENT__ >= alignof(max_align_t) && __BIGGEST_ALIGNME
 #if defined(__ILP32__) != (__SIZEOF_INT__ == 4 && __SIZEOF_LONG__ == 4 && __SIZEOF_POINTER__ == 4)
 #error "__ILP32__"
 #endif
+#if defined(__LLP64__) != (__SIZEOF_INT__ == 4 && __SIZEOF_LONG__ == 4 && __SIZEOF_POINTER__ == 8)
+#error "__LLP64__"
+#endif
 #if defined(__CHAR_UNSIGNED__) != (CHAR_MIN == 0)
 #error "__CHAR_UNSIGNED__"
 #endif

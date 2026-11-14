@@ -1650,6 +1650,7 @@ definition replacing the target's; `c/pp/predef_target_*.c` show them for each t
 | `_WIN32`, `_WIN64` | Windows (the platform's own spellings: no `__WIN32__`, `WIN32` or the like). |
 | `__LP64__`, `_LP64` | 32-bit `int`, 64-bit `long` and pointers (Linux, macOS, wasm64). |
 | `__ILP32__`, `_ILP32` | 32-bit `int`, `long` and pointers (wasm32). |
+| `__LLP64__` | 32-bit `int` and `long`, 64-bit pointers (Windows). |
 | `__CHAR_UNSIGNED__`, `__WCHAR_UNSIGNED__` | Plain `char` (AArch64 Linux, `--c-char=unsigned`), `wchar_t` (AArch64 Linux, Windows) is unsigned. |
 | `__CHAR_BIT__`; `__SIZEOF_SHORT__`, `__SIZEOF_INT__`, `__SIZEOF_LONG__`, `__SIZEOF_LONG_LONG__`, `__SIZEOF_FLOAT__`, `__SIZEOF_DOUBLE__`, `__SIZEOF_LONG_DOUBLE__`, `__SIZEOF_POINTER__`, `__SIZEOF_SIZE_T__`, `__SIZEOF_PTRDIFF_T__`, `__SIZEOF_WCHAR_T__`, `__SIZEOF_WINT_T__` | The sizes in bytes, after `--c-int`, `--c-long` and `--c-long-double`. In a GNU dialect also `__SIZEOF_INT128__` and `__SIZEOF_FLOAT128__` (16), whose types only those dialects have. |
 | `__SCHAR_MAX__`, `__SHRT_MAX__`, `__INT_MAX__`, `__LONG_MAX__`, `__LONG_LONG_MAX__`, `__<T>_WIDTH__` | `<limits.h>`'s values (`__SCHAR_WIDTH__` ... `__LONG_LONG_WIDTH__`). |
@@ -1956,7 +1957,7 @@ exactly what works (there is no option that defines `__GNUC__`).
 | Extension | |
 |---|---|
 | Keywords | `__extension__` (ignored), `__inline`, `__inline__`, `__const`, `__const__`, `__volatile`, `__volatile__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__alignof`, `__alignof__` (also of an expression: `__alignof__ x`, a member's own alignment), `__typeof`, `__typeof__` and `typeof` in every dialect, `__thread`, `__int128_t` and `__uint128_t` (`__int128` and `unsigned __int128`, as built-in type names), `asm`, `__asm`, `__asm__`; `inline` in gnu89. |
-| C99 and C11 in older dialects | From gnu89: `//` comments, `long long`, mixed declarations and code, designated initializers, compound literals, a trailing comma in an enumerator list, variable length arrays, flexible array members, variadic macros and empty macro arguments, hexadecimal floating constants, `_Pragma`, `__func__`, initializers of aggregates that are not constants; from gnu89 and gnu99: anonymous structures and unions; in every dialect: attributes `[[...]]` and `{}`. |
+| C99 and C11 in older dialects | From gnu89: `//` comments, `long long`, mixed declarations and code, designated initializers, compound literals, a trailing comma in an enumerator list, variable length arrays, flexible array members, variadic macros and empty macro arguments, hexadecimal floating constants, `_Pragma`, `__func__`, initializers of aggregates that are not constants; from gnu89 and gnu99: anonymous structures and unions; in every dialect: attributes `[[...]]` and `{}`. The keywords of later standards spelled in the reserved namespace (`_Bool`, `_Complex`, `_Static_assert`, `_Alignas`, `_Alignof`, `_Atomic`, `_Generic`, `_Noreturn`, `_Thread_local`, `_BitInt`) are those keywords in every dialect, with the warning `C4145` in one older than their standard (under an ISO standard `C2100`); those with ordinary spellings (`inline` but in gnu89, `restrict`, `bool`, `typeof` but as `__typeof__`, ...) stay errors where they are used as keywords. |
 | `__auto_type x = e;` | x has e's type (as C23's `auto`). |
 | `_Decimal32`, `_Decimal64`, `_Decimal128` before C23 | The decimal floating types and their constants (`1.5dd`), as in C23 ("Decimal floating types"); `__STDC_IEC_60559_DFP__` is defined in C23 modes only. |
 | `__label__ a, b;` | Labels local to the block (a statement expression in a macro can have its own). |
@@ -1972,6 +1973,10 @@ exactly what works (there is no option that defines `__GNUC__`).
 | Structures and unions without members | Of size 0. |
 | Compound literals of constants | May initialize an object with static storage duration as their lists would (`static struct p v = (struct p){ 1, 2 };`). |
 | `void *` and function pointers | Arithmetic on them as on `char *`; `sizeof` and `__alignof__` of `void` and of a function type are 1. |
+| Implicit conversions of pointers | A pointer to a function converts to `void *`, and `void *` to a pointer to a function, without a cast (in an assignment, an initialization, an argument and a `return`: the warning `C4140`); one that discards the qualifiers `const`, `volatile` or `restrict` of the pointed-to type does too (`C4141`; `_Atomic` stays the error `C3022`). Under an ISO standard both are `C3022` (6.5.16.1p1). |
+| `?:` of a void and a non-void operand | The result is `void`, the other operand's value discarded (the warning `C4142`; under an ISO standard `C3020`, 6.5.15p3). |
+| A structure or union cast to its own type | `(struct s)x` is x's value, not an lvalue (the warning `C4143`; under an ISO standard `C3028`, 6.5.4p2). Another structure type stays `C3028`. |
+| Enumerations named before their lists | `enum e;` and a use of `enum e` before its list (a pointer to it, a parameter, a function's return type) declare the tag as a structure's would be: an incomplete type, which its list later completes (the warning `C4144`; under an ISO standard `C3011`, 6.7.2.3p3). The declarations before the list and after it are of one type and compatible; until the list, `sizeof` of it (`C3029`) and an object of it (`C3007`) are errors. |
 | Constants | Binary constants (`0b101`) and the escape `\e` (27) in every dialect. |
 | `__FUNCTION__`, `__PRETTY_FUNCTION__` | Other names of `__func__` (`""` outside a function). |
 | `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, but on a `register` one: an explicit register variable ("Inline assembly"). |
@@ -2010,7 +2015,12 @@ values in C23) and `__has_builtin` (1 for the builtins that work in the mode).
 specifiers and after a declarator (they appertain to the declared entities, every one of
 a declaration's), after `struct`, `union` or `enum` and after the closing brace of its list
 (to the type), on members and bit-fields, parameters, enumerators, labels (`l:
-__attribute__((unused));`) and statements (`__attribute__((fallthrough));`), after `*`.
+__attribute__((unused));`) and statements (`__attribute__((fallthrough));`), after `*`;
+and in type names (casts, `sizeof`, compound literals, `_Generic`'s associations): at their
+start, after their specifiers, after the `(` of a parenthesized abstract declarator (before
+its `*`: `(int (__attribute__((a)) *)(void))p`), among a pointer's qualifiers and on the
+parameters of a function declarator, where they appertain to the type named (one that
+cannot, such as `noinline`, is C4052).
 `[[gnu::name]]` and `[[__gnu__::name]]` are the same in a GNU dialect (under an ISO
 standard they are a vendor's: ignored). Each name may be written `__name__`. Arguments are
 checked (C3077, C3071). An unknown attribute, or one where it cannot appertain, is warning
