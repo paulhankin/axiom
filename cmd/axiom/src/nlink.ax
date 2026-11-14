@@ -263,6 +263,23 @@ pub fn sym_dropped(oi: usize, si: u32) bool {
     return (s.sec >= 0) and (o.secs.get(@int_cast(usize, s.sec)).kind == elf.S_DISCARD);
 }
 
+/// Is a reference to symbol si of object oi to code or data the link left
+/// out (sym_dropped, and for a global, the definition the link chose too:
+/// a reference to a copy of a weak definition --gc-sections left out, the
+/// copy another object's won over, is to that one)? A relocation of it is
+/// not applied.
+pub fn ref_dropped(oi: usize, si: u32) bool {
+    if not sym_dropped(oi, si) {
+        return false;
+    }
+    let gi = global_of(oi, si);
+    if gi < 0 {
+        return true;
+    }
+    let g = gsyms.at(@int_cast(usize, gi));
+    return (g.obj < 0) or sym_dropped(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
 // A section's place among the initialization and termination arrays: 0 for
 // any other section, else the kind (1 .preinit_array, 2 .init_array, 3
 // .fini_array) times 0x20000 plus its priority (.init_array.N: N; the plain
@@ -704,8 +721,12 @@ pub fn classify(class_of: fn(*elf.Sec) i32) void {
 // may go, its relocations to that are not applied: sym_dropped). The
 // unwind tables (.eh_frame, .pdata, .xdata) and exception tables are kept
 // but keep nothing themselves (an entry for left-out code describes code
-// that is not there, and is not relocated). What is left out is as a
-// dropped COMDAT copy is (S_DISCARD).
+// that is not there, and is not relocated; .eh_frame's are taken out:
+// prune_fdes). What is left out is as a dropped COMDAT copy is
+// (S_DISCARD); a reference to a weak definition left out (a copy another
+// object's won over) is to the one kept (ref_dropped). The frame tables
+// (axiom_rets, of code in a section of its own) go with their code
+// whatever their name.
 // -----------------------------------------------------------------------------
 let ROOT_NAMES: [14][]u8 = ["main", "_start", "axiom.start_sp", "axiom.tls_info", "axiom.tls_key", "axiom.tls_index",
                             "axiom.entry", "axiom.dll_entry", "DllMain", "ax_unavailable", "__libc_start_main",
@@ -714,11 +735,14 @@ let ROOT_NAMES: [14][]u8 = ["main", "_start", "axiom.start_sp", "axiom.tls_info"
 // May the section be left out (when nothing refers to it)?
 fn collectable(oi: usize, s: *elf.Sec) bool {
     let k = s.kind;
-    if (oi >= n_inputs) or s.retain or (array_rank(s) != 0) or c_ident(s.name) {
+    if (oi >= n_inputs) or s.retain or (array_rank(s) != 0) {
         return false;
     }
     if s.link1 > 0 {
-        return true;  // (kept with the section it goes with)
+        return true;  // (kept with the section it goes with, whatever its name: a frame table's axiom_rets)
+    }
+    if c_ident(s.name) {
+        return false;
     }
     if (k != elf.S_TEXT) and (k != elf.S_RODATA) and (k != elf.S_DATA) and (k != elf.S_BSS) and (k != elf.S_TDATA) and
        (k != elf.S_TBSS) {
@@ -757,7 +781,8 @@ fn gc_mark(g: *mut Gc, oi: usize, k: i32) void {
 }
 
 // The section the symbol si of object oi refers to is in: its own, or for
-// a global its definition's (as resolved); marked.
+// a global its definition's (as resolved: not the object's own copy of a
+// weak definition another object's won over); marked.
 fn gc_mark_sym(g: *mut Gc, oi: usize, si: u32) void {
     let o = objs.get(oi);
     let s = o.syms.at(@as(usize, si));
@@ -768,6 +793,7 @@ fn gc_mark_sym(g: *mut Gc, oi: usize, si: u32) void {
             if d.obj >= 0 {
                 let du = @as(usize, @bit_cast(u32, d.obj));
                 gc_mark(g, du, objs.get(du).syms.get(@as(usize, d.sym)).sec);
+                return;
             }
         }
     }
@@ -910,6 +936,136 @@ fn collect_garbage() void {
     fents.deinit();
     fnext.deinit();
     g.work.deinit();
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if u.str_eq(s.name, ".eh_frame") and (s.kind != elf.S_DISCARD) and not referred_into(oi, k) {
+                prune_fdes(oi, s);
+            }
+        }
+    }
+}
+
+// Does a relocation of object oi refer into section k (to a symbol defined
+// there, which a change of the section's layout would move)?
+fn referred_into(oi: usize, k: usize) bool {
+    let o = objs.get(oi);
+    for s in o.secs.items() {
+        if s.kind == elf.S_DISCARD {
+            continue;
+        }
+        for r in s.relocs.items() {
+            if (@as(usize, r.sym) < o.syms.len) and (o.syms.get(@as(usize, r.sym)).sec == @int_cast(i32, k)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Leaves out of the .eh_frame section s of object oi (its entries as for
+// fde_deps) the FDEs of code the link left out (whose initial location's
+// relocation is to a symbol of a section left out), as the system linkers
+// do: the CIEs and the other FDEs move up (an FDE's offset back to its CIE
+// is made again), with their relocations. A section whose layout this does
+// not know (an FDE whose CIE is not found, or the 64-bit form) is left as
+// it is.
+fn prune_fdes(oi: usize, s: *mut elf.Sec) void {
+    let o = objs.get(oi);
+    let d = s.data.view();
+    let mut starts = u.List.[u64].empty();
+    let mut ends = u.List.[u64].empty();
+    let mut cies = u.List.[i64].empty();
+    let mut off: u64 = 0;
+    let mut ok = true;
+    while off + 8 <= @as(u64, d.len) {
+        let len = rd32(d, off);
+        if len == 0 {
+            break;  // (the terminator: kept, after the entries)
+        }
+        let end = off + 4 + len;
+        if (len == 0xffff_ffff) or (end > @as(u64, d.len)) {
+            ok = false;
+            break;
+        }
+        let id = rd32(d, off + 4);
+        let mut cie: i64 = -1;
+        if id != 0 {
+            cie = -2;
+            if id <= off + 4 {
+                let j = entry_of(starts.items(), ends.items(), off + 4 - id);
+                if (j >= 0) and (starts.get(@truncate(usize, @bit_cast(u64, j))) == off + 4 - id) and
+                   (cies.get(@truncate(usize, @bit_cast(u64, j))) == -1) {
+                    cie = j;
+                }
+            }
+            if cie == -2 {
+                ok = false;
+                break;
+            }
+        }
+        starts.push(off);
+        ends.push(end);
+        cies.push(cie);
+        off = end;
+    }
+    let n = starts.len;
+    let dead = u.newn.[bool](n + 1);
+    let mut any = false;
+    if ok {
+        for r in s.relocs.items() {
+            let j = entry_of(starts.items(), ends.items(), r.off);
+            if j < 0 {
+                continue;
+            }
+            let ju = @truncate(usize, @bit_cast(u64, j));
+            if (cies.get(ju) >= 0) and (r.off == starts.get(ju) + 8) and (@as(usize, r.sym) < o.syms.len) and
+               sym_dropped(oi, r.sym) {
+                dead[ju] = true;
+                any = true;
+            }
+        }
+    }
+    if any {
+        // each entry's new place, then the bytes and relocations
+        let at = u.newn.[u64](n + 1);
+        let mut b = bn.new_bytes();
+        for j in 0..n {
+            if dead[j] {
+                continue;
+            }
+            at[j] = @as(u64, b.len());
+            b.put(d[@truncate(usize, starts.get(j))..@truncate(usize, ends.get(j))]);
+            let c = cies.get(j);
+            if c >= 0 {
+                b.set_u32(@truncate(usize, at[j] + 4), at[j] + 4 - at[@truncate(usize, @bit_cast(u64, c))]);
+            }
+        }
+        let tail = @as(u64, b.len());
+        b.put(d[@truncate(usize, off)..]);
+        let mut rs = u.List.[elf.Rel].empty();
+        for r in s.relocs.items() {
+            let mut x = r;
+            let j = entry_of(starts.items(), ends.items(), r.off);
+            if j >= 0 {
+                let ju = @truncate(usize, @bit_cast(u64, j));
+                if dead[ju] {
+                    continue;
+                }
+                x.off = r.off - starts.get(ju) + at[ju];
+            } else if r.off >= off {
+                x.off = r.off - off + tail;
+            }
+            rs.push(x);
+        }
+        s.relocs.deinit();
+        s.relocs = rs;
+        s.data = b;
+    }
+    starts.deinit();
+    ends.deinit();
+    cies.deinit();
 }
 
 // The references of the .eh_frame section s of object oi (its entries: a
@@ -1337,8 +1493,12 @@ pub struct DebugSec {
 /// applied: a piece's offset in the whole is its section's address
 /// (sec_addr), so offsets into another debug section and addresses of
 /// code both are the symbol's address plus the addend. A symbol is the
-/// object's own (a function's copy that the link did not keep still has its
-/// code, which its debug information describes). Empty without -g. The
+/// object's own; one in a section the link left out (a COMDAT copy, what
+/// --gc-sections leaves out) is at the tombstone address, -1 (as the
+/// system linkers have it, and WebAssembly's tool conventions: debuggers
+/// pass over what is there), but 1 in .debug_ranges and .debug_loc, where
+/// -1 begins a base address selection and 0 ends a list (each end of the
+/// entry 1: an empty range). Empty without -g. The
 /// objects' debug sections are given back as they are taken (their
 /// contents and relocations: the link's largest part with -g).
 /// Where the executable's TLS template starts (its PT_TLS segment: the
@@ -1393,15 +1553,27 @@ pub fn debug_sections() u.List.[DebugSec] {
             }
             let b = out.at(at).data.view();
             let base = sec_addr.get(oi)[k];
+            let mut tomb: u64 = 0xffff_ffff_ffff_ffff;
+            if u.str_eq(s.name, ".debug_ranges") or u.str_eq(s.name, ".debug_loc") {
+                tomb = 1;
+            }
             for r in s.relocs.items() {
-                let v = sym_addr_in(oi, r.sym) + @bit_cast(u64, r.addend);
+                let mut v = sym_addr_in(oi, r.sym) + @bit_cast(u64, r.addend);
+                let dead = (@as(usize, r.sym) < o.syms.len) and sym_dropped(oi, r.sym);
+                if dead {
+                    v = tomb;
+                }
                 let p = @truncate(usize, base + r.off);
                 if (r.ty == elf.R_X86_64_64) or (r.ty == elf.R_AARCH64_ABS64) {
                     bn.w64(b, @as(u64, p), v);
                 } else if (r.ty == elf.R_X86_64_32) or (r.ty == elf.R_AARCH64_ABS32) {
                     bn.w32(b, @as(u64, p), v & 0xffff_ffff);
                 } else if (r.ty == elf.R_X86_64_DTPOFF64) or (r.ty == elf.R_AARCH64_TLS_DTPREL64) {
-                    bn.w64(b, @as(u64, p), v -% tls_start);
+                    if dead {
+                        bn.w64(b, @as(u64, p), v);
+                    } else {
+                        bn.w64(b, @as(u64, p), v -% tls_start);
+                    }
                 }
                 // (other types come only from other compilers' objects: their
                 // debug information is kept as it is)

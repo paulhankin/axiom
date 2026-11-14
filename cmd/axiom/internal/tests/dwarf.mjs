@@ -612,9 +612,9 @@ export function checkDebug(img, opts = {}) {
         continue;
       }
       const name = c.attrs.get(AT_NAME), low = c.attrs.get(AT_LOW), high = low + c.attrs.get(AT_HIGH);
-      // (WebAssembly: a function the linker did not keep is at the tombstone
-      // address, -1, as the tool conventions' DWARF has it)
-      if (img.kind === 'wasm' && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
+      // (a function the linker did not keep is at the tombstone address,
+      // -1, as WebAssembly's tool conventions and the system linkers have it)
+      if (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16) continue;
       if (!name) E(`a subprogram without a name at 0x${c.off.toString(16)}`);
       if (!(high > low)) E(`${name}: empty range`);
       if (!cur.some(([lo, hi]) => low >= lo && high <= hi)) E(`${name}: [0x${low.toString(16)}, 0x${high.toString(16)}) outside its unit`);
@@ -640,7 +640,7 @@ export function checkDebug(img, opts = {}) {
   }
   // line table: one sequence per subprogram, covering it, increasing
   const seqByLow = new Map();
-  const tomb = (a) => img.kind === 'wasm' && (a === 0xffffffff || a >= 2 ** 64 - 2 ** 16);
+  const tomb = (a) => a === 0xffffffff || a >= 2 ** 64 - 2 ** 16;
   for (const sq of dw.seqs) {
     const rows = sq.rows;
     if (rows.length && tomb(rows[0].addr)) continue;  // (a function the linker did not keep: above)
@@ -978,9 +978,9 @@ export function checkScopes(dw, machine) {
   for (const un of dw.units) {
     for (const c of un.die.children) {
       if (c.tag !== TAG_SUBPROGRAM || c.attrs.has(AT_INLINE)) continue;
-      // (WebAssembly, machine null: a function the linker did not keep is at -1)
+      // (a function the linker did not keep is at -1)
       const low = c.attrs.get(AT_LOW);
-      if (machine === null && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
+      if (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16) continue;
       walk(c, dieRanges(dw, c), c.attrs.get(AT_NAME), un, null);
     }
   }
