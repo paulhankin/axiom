@@ -150,10 +150,13 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     let gn = cgn.note_of(f);
     // (on WebAssembly a naked function's asm is its code, checked as a whole: csema_asm.ax)
     csa.g_naked_wasm = tg.is_wasm() and u.notnil(gn) and gn.naked;
+    let follow = g_follow_case;
     for i in 0..xs.len {
+        g_follow_case = follows_case(xs, i, false);
         stmt(xs[i]);
-        fallthrough(xs, i);
+        fallthrough(xs, i, false);
     }
+    g_follow_case = follow;
     csa.g_naked_wasm = false;
     cs.pop_scope();
     if u.notnil(gn) and gn.naked {
@@ -258,13 +261,16 @@ fn stmt(s: *mut cast.Stmt) void {
         let m = vla.mark();
         let nl = BD.locals.len;
         let xs = s.items.items();
+        let outer = g_follow_case;
         for i in 0..xs.len {
             if u.notnil(xs[i]) {
                 cs.fp_dir(xs[i].fp);  // (each item's floating-point pragmas)
             }
+            g_follow_case = follows_case(xs, i, outer);
             stmt(xs[i]);
-            fallthrough(xs, i);
+            fallthrough(xs, i, outer);
         }
+        g_follow_case = outer;
         cs.fp_dir(s.fp);
         BD.locals.len = nl;
         vla.leave(m);
@@ -386,15 +392,31 @@ fn is_fallthrough(s0: *cast.Stmt) bool {
     return false;
 }
 
+// Is the statement being checked, once it completes, followed by a case or
+// default label of the innermost switch statement: the next block item, or
+// for the last item of a block the label that follows the block (and so on
+// outwards, through selection and labeled statements, not out of a loop's
+// or a switch's body)?
+let mut g_follow_case: bool = false;
+
+// Is block item xs[i] followed so (`outer`: whether the block is)?
+fn follows_case(xs: []*mut cast.Stmt, i: usize, outer: bool) bool {
+    if (i + 1) == xs.len {
+        return outer;
+    }
+    let k = xs[i + 1].kind;
+    return (k == cast.StmtKind.CASE) or (k == cast.StmtKind.DEFAULT);
+}
+
 // Block item xs[i], if a fallthrough declaration, is in a switch statement and
-// followed by a case or default label (C23 6.7.13.5p2).
-fn fallthrough(xs: []*mut cast.Stmt, i: usize) void {
+// the next block item that would be encountered after it is a case or default
+// label (C23 6.7.13.5p2): the next item of its block, or the label after the
+// block when it is the block's last (`outer`: whether the block is followed so).
+fn fallthrough(xs: []*mut cast.Stmt, i: usize, outer: bool) void {
     if not is_fallthrough(xs[i]) {
         return;
     }
-    let next_case = ((i + 1) < xs.len) and
-                    ((xs[i + 1].kind == cast.StmtKind.CASE) or (xs[i + 1].kind == cast.StmtKind.DEFAULT));
-    if (BD.switches.len == 0) or not next_case {
+    if (BD.switches.len == 0) or not follows_case(xs, i, outer) {
         cs.err(xs[i].span, "C3077",
                "'[[fallthrough]]' is not followed by a case or default label of a switch statement");
     }
@@ -419,7 +441,10 @@ fn sub(s: *mut cast.Stmt) void {
 fn loop_body(s: *mut cast.Stmt) void {
     BD.loops += 1;
     BD.breakable += 1;
+    let follow = g_follow_case;
+    g_follow_case = false;  // (its end goes back to the loop's test)
     sub(s);
+    g_follow_case = follow;
     BD.loops -= 1;
     BD.breakable -= 1;
 }
@@ -442,7 +467,10 @@ fn switch_stmt(s: *mut cast.Stmt) void {
     sw.scope = vla.mark();
     BD.switches.push(sw);
     BD.breakable += 1;
+    let follow = g_follow_case;
+    g_follow_case = false;  // (its end leaves the switch)
     sub(s.body);
+    g_follow_case = follow;
     BD.breakable -= 1;
     _ = BD.switches.pop();
 }
@@ -702,15 +730,18 @@ fn stmt_expr(e: *mut cast.Expr) *mut cast.Expr {
     let nl = BD.locals.len;
     let xs = s.items.items();
     e.ty = cty.t_void;
+    let follow = g_follow_case;
     for i in 0..xs.len {
         let x = xs[i];
+        g_follow_case = follows_case(xs, i, false);
         stmt(x);
-        fallthrough(xs, i);
+        fallthrough(xs, i, false);
         let v = value_stmt(x);
         if (i + 1 == xs.len) and u.notnil(v) and u.notnil(v.e.ty) {
             e.ty = cty.unqual(v.e.ty);
         }
     }
+    g_follow_case = follow;
     BD.locals.len = nl;
     vla.leave(m);
     cs.pop_scope();
