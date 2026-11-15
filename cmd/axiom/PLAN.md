@@ -694,7 +694,7 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-**5b (module splits and enums): done, but for the builtins (below).**
+**5b (module splits and enums): done, but for codegen's builtins (below).**
 Every split moved
 declarations as they were, by a script (a declaration goes with what it
 uses, and a reference becomes `alias.name`), so each commit left the
@@ -727,6 +727,23 @@ it moved. Done:
   expressions, builtins) and `cgmain.ax` (537, above `codegen.ax`:
   `codegen_program`, the native entry, the runtime's exports). Item 1's
   `CodegenCtx` can now be `cgctx.ax`'s globals gathered.
+- `semabuiltin.ax` (1,293 lines, below `sema.ax`, which is now 4,633):
+  the checking of the builtins (`builtin_check` and the conversion,
+  memory, math, vector, atomic and system builtins), with the small
+  helpers both use that call nothing back (`earg`, `find_field`,
+  `finalize_untyped`, now `pub` there; `tnil`, `tstr` and `set_ty`, one
+  line each, are in both). What the builtins call back in `sema.ax`
+  (`check_expr`, `check_expr_to`, `coerce`, `insn_check`, and the
+  resolution of a builtin's type argument in the context being checked,
+  `resolve_arg`, the one use of the context `C`) are function pointers
+  in `semabuiltin.ax`, thread-local like the rest of sema's per-run
+  state, which `sema.run` sets when it starts (on every thread that
+  checks: `axiom lsp`'s requests, the main thread; nothing else reaches
+  them, and until they are set they stop the compiler with a message).
+  The compiler's output, its diagnostics on every `.ax` file of the
+  repository (agent-json) and the self build at -O2 are unchanged (25.7 s
+  of user time and 2.24 GB peak, as before: 26.3-26.5 s by the base
+  compiler).
 - `x64caps.ax` (88): what codegen.ax asks the x86-64 selector
   (`vector_bits`, `perm_ok`, `partial_ok`, `shiftv_ok`, `vnni_ok`,
   `widen_ok`); `codegen.ax` no longer imports `x64.ax`.
@@ -796,8 +813,8 @@ were identical.
 
 - **`codegen.ax`'s builtins** (the "Builtins" section, about 1,600 lines:
   `gen_builtin` and the conversion, memory, math, vector and system
-  builtins, with the ASan and coverage helpers kept there) and `sema.ax`'s
-  builtin checking. A layering exists: the builtins reach the rest of
+  builtins, with the ASan and coverage helpers kept there). A layering
+  exists: the builtins reach the rest of
   `codegen.ax` only through `gen` (16 calls) and 38 helpers (about 1,100
   lines: `get_inst` and the mangling, `global_addr`, `string_ptr`,
   `const_slice`, `errcode_value`, `int_min`/`int_max`, `gen_binop`,
@@ -806,8 +823,8 @@ were identical.
   (between `cgctx.ax` and it) and `gen` is reached through a function
   pointer that `codegen.ax` sets (in `cgctx.ax`, thread-local or set
   before item 1's workers start). That changes calls rather than moving
-  declarations, so it was left for a step of its own. `sema.ax`'s
-  `check_builtin` is in the same position with `check_expr`.
+  declarations, so it was left for a step of its own. (`sema.ax`'s
+  builtins were split this way: `semabuiltin.ax`, above.)
 - Other candidates for `match`: chains of separate `if v == X { return
   ... }` (the backends' intrinsic dispatch) mean the same only when every
   arm returns; they were not rewritten by the script.
