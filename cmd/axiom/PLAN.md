@@ -749,7 +749,7 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-**5b (module splits and enums): done, but for codegen's builtins (below).**
+**5b (module splits and enums): done.**
 Every split moved
 declarations as they were, by a script (a declaration goes with what it
 uses, and a reference becomes `alias.name`), so each commit left the
@@ -782,6 +782,30 @@ it moved. Done:
   expressions, builtins) and `cgmain.ax` (537, above `codegen.ax`:
   `codegen_program`, the native entry, the runtime's exports). Item 1's
   `CodegenCtx` can now be `cgctx.ax`'s globals gathered.
+- `codegen.ax`'s builtins: `codegen.ax` (4,149 lines) is three more:
+  `cgbase.ax` (1,181, above `cgctx.ax` and `cgrt.ax`: the 42 helpers the
+  builtins share with the rest, none of which generates an expression:
+  function instances and their mangling (`get_inst`), globals, strings
+  and constants (`global_addr`, `string_ptr`, `const_slice`, `gen_const`),
+  error codes, the processor's extensions (`cpu_has_bits`, `cpu_fn`), the
+  arithmetic (`gen_binop`, `op_with_overflow`, `gen_shift`, `int_min`/
+  `int_max`), `via_pointer`, `on_x64`/`on_a64`, the coverage runtime's
+  globals and `CABI_PREFIX`), `cgbuiltin.ax` (1,635, above `cgbase.ax`:
+  the "Builtins" section as it was, with the ASan and coverage helpers
+  that `codegen.ax` calls too) and `codegen.ax` (1,404: instances,
+  defers, places, calls, `catch`/`try`, expressions, statements, bodies).
+  The builtins reach `codegen.ax` only through `gen` (97 calls), which is
+  a function pointer in `cgbuiltin.ax` (`bi.gen`), thread-local like the
+  rest of the unit's state, which `codegen.set_hooks` sets when
+  `cgmain.codegen_program` starts: on every thread that generates code
+  (the main thread, `units.ax`'s module threads). The threads of a
+  program's parts (`backend.compile_parts`) run no code generation from
+  the syntax tree, so nothing there reaches it; until it is set it stops
+  the compiler with a message, as `semabuiltin.ax`'s do. The compiler's
+  output on the fixed corpus (above, with -O2 -g and `--units=module`
+  self builds added) and the self build at its fixed point are unchanged
+  (the -O2 self build: 23.7 s user, 2.53 GB peak by the base compiler,
+  24.2 s and 2.51 GB after; two jobs, within noise).
 - `semabuiltin.ax` (1,293 lines, below `sema.ax`, which is now 4,633):
   the checking of the builtins (`builtin_check` and the conversion,
   memory, math, vector, atomic and system builtins), with the small
@@ -866,20 +890,6 @@ were identical.
 
 ### What remains (5b)
 
-- **`codegen.ax`'s builtins** (the "Builtins" section, about 1,600 lines:
-  `gen_builtin` and the conversion, memory, math, vector and system
-  builtins, with the ASan and coverage helpers kept there). A layering
-  exists: the builtins reach the rest of
-  `codegen.ax` only through `gen` (16 calls) and 38 helpers (about 1,100
-  lines: `get_inst` and the mangling, `global_addr`, `string_ptr`,
-  `const_slice`, `errcode_value`, `int_min`/`int_max`, `gen_binop`,
-  `op_with_overflow` ...), none of which calls back up. So `cgbuiltin.ax`
-  can sit below `codegen.ax` once those helpers are a module of their own
-  (between `cgctx.ax` and it) and `gen` is reached through a function
-  pointer that `codegen.ax` sets (in `cgctx.ax`, thread-local or set
-  before item 1's workers start). That changes calls rather than moving
-  declarations, so it was left for a step of its own. (`sema.ax`'s
-  builtins were split this way: `semabuiltin.ax`, above.)
 - Other candidates for `match`: chains of separate `if v == X { return
   ... }` (the backends' intrinsic dispatch) mean the same only when every
   arm returns; they were not rewritten by the script.

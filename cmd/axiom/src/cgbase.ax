@@ -1,0 +1,1181 @@
+// =============================================================================
+// cgbase.ax - what codegen.ax and its builtins (cgbuiltin.ax) share, below
+// both: the instances of functions and their symbols (mangling), globals,
+// strings and constants, error codes, the processor's extensions, and
+// arithmetic (overflow checks, shifts, binary operators).
+//
+// None of it generates expressions (codegen.gen).
+// =============================================================================
+import "ast.ax" as ast;
+import "axdebug.ax" as axd;
+import "c/cc.ax" as cfront;
+import "cgctx.ax" as cx;
+import "cgrt.ax" as cgrt;
+import "diag.ax" as dg;
+import "ir.ax" as ir;
+import "lexer.ax" as lx;
+import "modload.ax" as modl;
+import "semapost.ax" as spost;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+import "x64caps.ax" as x64c;
+
+// ---------------------------------------------------------------------------
+// Strings and globals
+// ---------------------------------------------------------------------------
+fn dll_import(fname: []u8, lib: []u8) void {
+    let gname = u.cat2("axiom.import.", fname);
+    if u.notnil(cgrt.named_global(gname)) {
+        return;
+    }
+    let g = ir.add_global(cx.M, ir.t_array(cx.T_i8, @as(u64, lib.len) + 1), gname).val;
+    cgrt.set_init(g, ir.cstring(lib));
+    cgrt.set_linkage(g, ir.LINK_LINKONCE);
+    ir.gv_of(g).is_const = true;
+    cgrt.set_align(g, 1);
+}
+
+pub fn string_ptr(bytes: []u8) *mut ir.Value {
+    let key = u.intern(bytes);
+    let mut g = cx.S.string_globals.get(key);
+    if u.isnil(g) {
+        // A NUL follows every literal (not part of the slice), so that
+        // "text".ptr is a valid C string (spec §2.5).
+        let init = ir.cstring(bytes);
+        g = ir.add_global(cx.M, ir.t_array(cx.T_i8, @as(u64, bytes.len) + 1), ".str").val;
+        cgrt.set_init(g, init);
+        cgrt.set_linkage(g, ir.LINK_INTERNAL);
+        ir.gv_of(g).is_const = true;
+        cgrt.set_align(g, 1);
+        cx.S.string_globals.put(key, g);
+    }
+    return g;
+}
+
+pub fn const_slice(ptr: *mut ir.Value, len: i64) *mut ir.Value {
+    let mut el: [2]*mut ir.Value = [ptr, cx.usz(len)];
+    return ir.cstruct(el[..]);
+}
+
+fn const_struct2(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let mut el: [2]*mut ir.Value = [a, b];
+    return ir.cstruct(el[..]);
+}
+
+fn const_struct1(a: *mut ir.Value) *mut ir.Value {
+    let mut el: [1]*mut ir.Value = [a];
+    return ir.cstruct(el[..]);
+}
+
+// Constant for a global initializer (spec: constant expressions only).
+pub fn gen_const(e: *mut ast.Expr, t0: *mut ast.Type) *mut ir.Value {
+    let t = cx.ct(t0);
+    if e.kind == ast.E_CONV {
+        if ast.conv_of(e) == ast.CONV_NOOP {
+            return gen_const(e.a, t);
+        }
+        if ast.conv_of(e) == ast.CONV_WRAP_OK {
+            if t.elem.kind == ast.TY_VOID {
+                return const_struct1(ir.cint(cx.T_i16, 0));
+            }
+            return const_struct2(ir.cint(cx.T_i16, 0), gen_const(e.a, t.elem));
+        }
+        if ast.conv_of(e) == ast.CONV_WRAP_ERR {
+            let code = gen_const(e.a, ty.t_error);
+            if t.elem.kind == ast.TY_VOID {
+                return const_struct1(code);
+            }
+            return const_struct2(code, ir.czero(cx.lty(t.elem)));
+        }
+    }
+    if e.is_const and (t.kind == ast.TY_INT) {
+        return cx.cint(cx.lty(t), ast.cval_of(e));
+    }
+    if e.is_const and (t.kind == ast.TY_FLOAT) {
+        return cx.cfloat(t, e);
+    }
+    if (t.kind == ast.TY_BOOL) and ((e.kind == ast.E_BOOL) or e.is_const) {
+        let mut bv: u64 = 0;
+        if e.bval {
+            bv = 1;
+        }
+        return ir.cint(cx.T_i8, bv);
+    }
+    let k = e.kind;
+    if k == ast.E_FLOAT {
+        return cx.cfloat(t, e);
+    }
+    if k == ast.E_STRING {
+        return const_slice(string_ptr(ast.more(e).str), @int_cast(i64, ast.more(e).str.len));
+    }
+    if k == ast.E_ERROR_VAL {
+        return ir.cint(cx.T_i16, ast.cval_of(e).lo);
+    }
+    if k == ast.E_ARRAY_LIT {
+        let n = ast.args_of(e).len;
+        let vs = u.newn.[*mut ir.Value](n + 1);
+        for i in 0..n {
+            vs[i] = gen_const(ast.args_of(e).get(i), t.elem);
+        }
+        return ir.carray(cx.lty(t.elem), vs[0..n]);
+    }
+    if k == ast.E_ARRAY_REPEAT {
+        let v = gen_const(e.a, t.elem);
+        if ir.is_zero(v) {
+            return ir.czero(cx.lty(t));
+        }
+        let n = @int_cast(usize, t.len);
+        let vs = u.newn.[*mut ir.Value](n + 1);
+        for i in 0..n {
+            vs[i] = v;
+        }
+        return ir.carray(cx.lty(t.elem), vs[0..n]);
+    }
+    if k == ast.E_STRUCT_LIT {
+        let n = t.decl.fields.len;
+        let vs = u.newn.[*mut ir.Value](n + 1);
+        for i in 0..n {
+            vs[i] = gen_const(ast.more(e).inits.at(i).value, ty.type_field(t, i));
+        }
+        return ir.cagg(cx.lty(t), vs[0..n]);
+    }
+    if k == ast.E_FIELD {
+        if ast.field_kind_of(e) == ast.FK_VARIANT_UNIT {
+            let ut = cx.lty(t);
+            let tag = ir.cint(cx.lty(ty.union_tag_type(t)), @int_cast(u64, ast.index_of(e)));
+            if ir.field_count(ut) == 1 {
+                let mut one: [1]*mut ir.Value = [tag];
+                return ir.cagg(ut, one[..]);
+            }
+            let mut el: [2]*mut ir.Value = [tag, ir.czero(ut.fields[1])];
+            return ir.cagg(ut, el[..]);
+        }
+        if (ast.field_kind_of(e) == ast.FK_DECL) and u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_FN) {
+            return get_inst(ast.decl_of(e), ty.no_types()).fnv;
+        }
+    } else if k == ast.E_IDENT {
+        if u.notnil(ast.decl_of(e)) and ((ast.decl_of(e).kind == ast.D_FN) or (ast.decl_of(e).kind == ast.D_HOST_FN)) {
+            return get_inst(ast.decl_of(e), ty.no_types()).fnv;
+        }
+    } else if k == ast.E_BUILTIN {
+        if ast.builtin_of(e) == ast.BI_PTR_FROM_INT {
+            return ir.cinttoptr(gen_const(ast.more(e).bargs.at(1).e, ty.t_usize));
+        }
+    } else if k == ast.E_UNARY {
+        if (ast.op_of(e) == lx.TK_MINUS) and (t.kind == ast.TY_FLOAT) {
+            if t.bits == 32 {
+                return cx.cfloat(t, e);
+            }
+            return ir.cfp(cx.lty(t), -ast.fval_of(e.a));
+        }
+    } else if k == ast.E_CALL {
+        if ast.call_kind_of(e) == ast.CALLK_VARIANT {
+            _ = dg.err(e.span, "E0353", "union constants with a payload are not supported by this compiler yet");
+            return ir.czero(cx.lty(t));
+        }
+    }
+    _ = dg.err(e.span, "E0350", "global initializer must be a constant expression");
+    return ir.czero(cx.lty(t));
+}
+
+// Symbols are prefixed with the module's path (without .ax), which is unique
+// within a build, so modules compiled separately never clash.
+fn mangle_prefix(d: *mut ast.Decl) []u8 {
+    let mut base: []u8 = "";
+    if u.notnil(d.module) {
+        base = u.file_of(d.module.file.id).display;
+    }
+    if (base.len > 3) and u.ends(base, ".ax") {
+        return u.dup(base[0..base.len - 3]);
+    }
+    return u.dup(base);
+}
+
+// A type in a symbol name: like type_str, but struct and union names are
+// qualified by their module, so instances are named the same in every unit.
+fn mangle_type_into(b: *mut u.Buf, t: *mut ast.Type) void {
+    let k = t.kind;
+    if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        if t.decl.anon {  // anonymous structs are the same type everywhere
+            b.s("struct{");
+            for i in 0..t.decl.fields.len {
+                if i != 0 {
+                    b.s(",");
+                }
+                b.s(t.decl.fields.at(i).name);
+                b.s(":");
+                mangle_type_into(b, ty.type_field(t, i));
+            }
+            b.s("}");
+            return;
+        }
+        b.s(mangle_prefix(t.decl));
+        b.s(".");
+        b.s(t.decl.name);
+        if t.args.len != 0 {
+            b.s("[");
+            for i in 0..t.args.len {
+                if i != 0 {
+                    b.s(",");
+                }
+                mangle_type_into(b, t.args[i]);
+            }
+            b.s("]");
+        }
+    } else if k == ast.TY_PTR {
+        b.s(u.pick(t.is_mut, "*mut ", "*"));
+        mangle_type_into(b, t.elem);
+    } else if k == ast.TY_SLICE {
+        b.s(u.pick(t.is_mut, "[]mut ", "[]"));
+        mangle_type_into(b, t.elem);
+    } else if k == ast.TY_ARRAY {
+        b.s("[");
+        b.s(u.dec(t.len));
+        b.s("]");
+        mangle_type_into(b, t.elem);
+    } else if k == ast.TY_ERRUNION {
+        if u.notnil(t.decl) {
+            b.s(mangle_prefix(t.decl));
+            b.s(".");
+            b.s(t.decl.name);
+        }
+        b.s("!");
+        mangle_type_into(b, t.elem);
+    } else if (k == ast.TY_ERROR) and u.notnil(t.decl) {
+        b.s(mangle_prefix(t.decl));
+        b.s(".");
+        b.s(t.decl.name);
+    } else if k == ast.TY_FN {
+        b.s("fn(");
+        for i in 0..t.params.len {
+            if i != 0 {
+                b.s(",");
+            }
+            mangle_type_into(b, t.params[i]);
+        }
+        b.s(")");
+        mangle_type_into(b, t.ret);
+    } else {
+        b.s(ty.type_str(t));
+    }
+}
+
+fn mangle_type(t: *mut ast.Type) []u8 {
+    let mut b = u.Buf.init();
+    mangle_type_into(&mut b, t);
+    return b.done();
+}
+
+// Owner.[A].name.[B], or test "name".
+fn fn_display(d: *mut ast.Decl, gargs: []mut *mut ast.Type) []u8 {
+    if d.is_test {
+        return u.f1("test \"%s\"", d.test_name);
+    }
+    let n = gargs.len;
+    let mut b = u.Buf.init();
+    let mut nowner: usize = 0;
+    if u.notnil(d.owner) {
+        nowner = d.owner.gparams.len;
+        b.s(d.owner.name);
+        if nowner != 0 {
+            b.s(".[");
+            for i in 0..nowner {
+                if i >= n {
+                    break;
+                }
+                if i != 0 {
+                    b.s(", ");
+                }
+                b.s(ty.type_str(gargs[i]));
+            }
+            b.s("]");
+        }
+        b.s(".");
+    }
+    b.s(d.name);
+    let mut nown = d.gparams.len;
+    if d.kind == ast.D_HOST_FN {
+        nown = 0;
+    }
+    if nown != 0 {
+        b.s(".[");
+        for i in n - nown..n {
+            if i > (n - nown) {
+                b.s(", ");
+            }
+            b.s(ty.type_str(gargs[i]));
+        }
+        b.s("]");
+    }
+    return b.done();
+}
+
+// Globals live in the link unit when units are compiled separately (their
+// initializers may contain error codes, which only the link unit knows).
+pub fn global_ref(d: *mut ast.Decl) *mut ir.Value {
+    let k = u.addr_key(@int_from_ptr(d));
+    let found = cx.S.global_vals.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    let t = d.ty;
+    let mut gname = u.f2("%s.%s", mangle_prefix(d), d.name);
+    if d.extern_c or d.is_export {
+        gname = d.name;  // (C's object, or one for C: spec §14.5.6)
+    }
+    if d.extern_c {
+        // an object C defines: a declaration (C code may have declared or
+        // defined it in the module already)
+        let mut ex = ir.get_global(cx.M, gname);
+        if u.isnil(ex) {
+            ex = ir.add_global(cx.M, cx.lty(t), gname);
+            ex.align = @max(ex.align, @bit_cast(u64, ty.type_align(t)));
+        }
+        cx.S.global_vals.put(k, ex.val);
+        return ex.val;
+    }
+    let g = ir.add_global(cx.M, cx.lty(t), gname).val;
+    cgrt.set_align(g, @int_cast(u32, ty.type_align(t)));
+    cx.S.global_vals.put(k, g);
+    // (on wasm a thread-local lives in the thread's block instead: tls_addr)
+    ir.gv_of(g).tls = d.is_tls;
+    if cx.O.unit == cx.CG_MODULE {
+        return g;  // defined by the link unit
+    }
+    axd.note_global(d, gname, t, ir.gv_of(g));
+    if d.is_export {
+        // (C's: external, the program's one definition)
+    } else if cx.O.unit == cx.CG_WHOLE {
+        // (a constant one has no state to share: the object's own, whose
+        // value the optimizer may use)
+        if d.is_mut {
+            cgrt.set_linkage(g, cx.program_linkage());
+        } else {
+            cgrt.set_linkage(g, ir.LINK_INTERNAL);
+        }
+    }
+    cgrt.set_init(g, gen_const(d.init, t));
+    if cx.O.coverage and is_cov_decl(d, "area") {
+        cgrt.set_init(g, cov_global("dummy"));  // (no constant expression says this)
+    }
+    if not d.is_mut {
+        ir.gv_of(g).is_const = true;
+    }
+    return g;
+}
+
+// A global's address in the function being generated.
+pub fn global_addr(d: *mut ast.Decl) *mut ir.Value {
+    if d.is_tls and ty.g_target.is_wasm {
+        return tls_addr(d);
+    }
+    return global_ref(d);
+}
+
+// Whether the program has thread-locals; on wasm, makes their block's globals.
+pub fn tls_globals() bool {
+    if u.notnil(cx.S.tls_ty) {
+        return true;
+    }
+    let P = modl.g_prog;
+    cx.S.tls_decls.clear();
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if d.is_tls {
+            cx.S.tls_decls.push(d);
+        }
+    }
+    if cx.S.tls_decls.len == 0 {
+        return false;
+    }
+    let n = cx.S.tls_decls.len;
+    let fs = u.newn.[*mut ir.Ty](n + 1);
+    for k in 0..n {
+        fs[k] = cx.lty(cx.S.tls_decls.get(k).ty);
+    }
+    cx.S.tls_ty = ir.t_struct(fs[0..n]);
+    let mut init = cx.vnil();
+    if cx.O.unit != cx.CG_MODULE {
+        let vs = u.newn.[*mut ir.Value](n + 1);
+        for k in 0..n {
+            let d = cx.S.tls_decls.get(k);
+            vs[k] = gen_const(d.init, d.ty);
+        }
+        init = ir.cstruct(vs[0..n]);
+    }
+    cx.S.tls_main = cgrt.shared_global(cx.S.tls_ty, "axiom.tls.main", init, 0);
+    cgrt.set_align(cx.S.tls_main, @int_cast(u32, @max(cx.S.tls_ty.align, 8)));
+    cx.S.tls_init = cgrt.shared_global(cx.S.tls_ty, "axiom.tls.init", init, 0);
+    cgrt.set_align(cx.S.tls_init, @int_cast(u32, @max(cx.S.tls_ty.align, 8)));
+    ir.gv_of(cx.S.tls_init).is_const = true;
+    cx.S.tls_ptr = cgrt.shared_global(cx.T_ptr, "axiom.tls", ir.czero(cx.T_ptr), 1);
+    return true;
+}
+
+fn tls_addr(d: *mut ast.Decl) *mut ir.Value {
+    _ = tls_globals();
+    let mut field: u32 = 0;
+    for k in 0..cx.S.tls_decls.len {
+        if cx.S.tls_decls.get(k) == d {
+            field = @truncate(u32, k);
+        }
+    }
+    let p = cx.ld(cx.T_ptr, cx.S.tls_ptr);
+    let base = ir.select(cx.B, ir.is_null(cx.B, p), cx.S.tls_main, p);
+    return cx.sgep(cx.S.tls_ty, base, field);
+}
+
+// An error code: a constant, except in module units, where the codes are
+// only known at link time (spec §11.1) and are loaded from the link unit.
+pub fn errcode_value(code: u32) *mut ir.Value {
+    if (cx.O.unit != cx.CG_MODULE) or (code == 0) or (@as(usize, code) > modl.g_prog.error_names.len) {
+        return ir.cint(cx.T_i16, @as(u64, code));
+    }
+    let name = u.cz(u.f1("axiom.errcode.%s", modl.g_prog.error_names.get(@as(usize, code) - 1)));
+    let mut g = cgrt.named_global(u.from_c(name));
+    if u.isnil(g) {
+        g = ir.add_global(cx.M, cx.T_i16, u.from_c(name)).val;
+        ir.gv_of(g).is_const = true;
+    }
+    return cx.ld(cx.T_i16, g);
+}
+
+// ---------------------------------------------------------------------------
+// Function instances
+// ---------------------------------------------------------------------------
+// The extensions a function's code may use, without an attribute: the
+// build's (not tg.g_features, which is the current function's while a body
+// is generated).
+fn base_features(d: *mut ast.Decl) u64 {
+    if spost.baseline_fn(d) {
+        return 0;
+    }
+    return cx.S.build_features;
+}
+
+pub fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut cx.FnInst {
+    return get_inst_feats(d, gargs, base_features(d));
+}
+
+// The symbol of an instance of the function d (not exported, not a host
+// function): its module's prefix, owner and name, generic arguments and,
+// compiled for its caller's extensions (own_feats), those extensions.
+fn inst_symbol(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64, own_feats: bool) []u8 {
+    let n = gargs.len;
+    let mut nb = u.Buf.init();
+    nb.s(mangle_prefix(d));
+    nb.s(".");
+    if u.notnil(d.owner) {
+        nb.s(d.owner.name);
+        nb.s(".");
+    }
+    nb.s(d.name);
+    let nown = d.gparams.len;
+    if nown != 0 {
+        nb.s(".[");
+        for i in n - nown..n {
+            if i > (n - nown) {
+                nb.s(", ");
+            }
+            nb.s(mangle_type(gargs[i]));
+        }
+        nb.s("]");
+    }
+    if u.notnil(d.owner) and (d.owner.gparams.len != 0) {
+        nb.s("@[");
+        for i in 0..d.owner.gparams.len {
+            if i != 0 {
+                nb.s(",");
+            }
+            nb.s(mangle_type(gargs[i]));
+        }
+        nb.s("]");
+    }
+    if own_feats {
+        let sfx = tg.features_string(feats & ~cx.S.build_features);
+        nb.s(".");
+        if sfx.len == 0 {
+            nb.s("base");
+        } else {
+            nb.s(sfx);
+        }
+    }
+    return nb.done();
+}
+
+pub fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut cx.FnInst {
+    let n = gargs.len;
+    let mut kb = u.Buf.init();
+    kb.s(u.udec(@as(u64, @int_from_ptr(d))));
+    for i in 0..n {
+        kb.s(",");
+        kb.s(u.idec(gargs[i].id));
+    }
+    // (an inline function compiled for its caller's extensions)
+    let own_feats = feats != base_features(d);
+    if own_feats {
+        kb.s("#f");
+        kb.s(u.udec(feats));
+    }
+    let k = u.intern(kb.done());
+    let found = cx.S.inst_map.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    let fi = u.new.[cx.FnInst]();
+    fi.decl = d;
+    fi.gargs = gargs;
+    fi.key = k;
+    fi.feats = feats;
+    fi.dispatch = (d.kind == ast.D_FN) and (d.attr != ast.ATTR_NONE);
+    if u.notnil(cx.F) {
+        fi.depth = cx.F.inst.depth + 1;
+    }
+    if fi.depth > 64 {
+        // (an instance that instantiates its function again with a larger type never ends)
+        _ = dg.err(d.name_span, "E0465",
+                   u.f1("generic instantiation nested deeper than 64 levels: an instance of '%s' instantiates it again",
+                        d.name));
+    }
+    for i in 0..n {
+        if gargs[i].has_params {
+            cx.internal_error("generic instance with unsubstituted arguments");
+        }
+    }
+    fi.site = cx.inst_site(d.name_span);
+    fi.fnty = d.ty;
+    if n != 0 {
+        fi.fnty = ty.subst(d.ty, d.all_gparams, gargs);
+        cx.check_inst_sizes(fi.fnty, fi.site);
+    }
+    let host_cabi = d.cabi and (d.kind == ast.D_HOST_FN);
+    let fl = cx.fn_lty_c(fi.fnty, host_cabi);
+    fi.llty = fl.t;
+    fi.sret = fl.sret;
+    fi.display = fn_display(d, gargs);
+    let mut name = d.name;
+    if host_cabi {
+        name = u.cat2(CABI_PREFIX, d.name);  // (its wrapper: header.ax, cabi_source)
+    } else if d.kind == ast.D_HOST_FN {
+        name = d.name;
+    } else if d.cabi {
+        // an export whose C function is a wrapper (cabi_source) that calls
+        // this through emit_cabi_thunks' function
+        name = inst_symbol(d, gargs, feats, own_feats);
+    } else if d.is_export {
+        // On wasm the symbol gets a private name and the export name comes
+        // from the wasm-export-name attribute: LLVM treats a symbol called
+        // `main` specially on wasm (it would add a second `main` export).
+        // Test binaries bring their own `main` (the test driver).
+        name = cgrt.export_symbol(d);
+    } else {
+        name = inst_symbol(d, gargs, feats, own_feats);
+    }
+    if d.variadic {
+        fi.llty = ir.t_fn(fi.llty.ret, fi.llty.params, true);
+    }
+    let mut existing = cx.vnil();
+    if (d.kind == ast.D_HOST_FN) or (d.is_export and cx.S.c_program) {
+        // (an export: C code, or an extern "C" block, may have declared it)
+        existing = cgrt.named_fn(name);
+    }
+    if u.notnil(existing) {
+        fi.fnv = existing;
+        if d.is_export and ir.is_decl(ir.fnp_of(existing)) {
+            ir.retype_decl(ir.fnp_of(existing), fi.llty);  // (C's declaration)
+        }
+    } else {
+        fi.fnv = ir.add_function(cx.M, name, fi.llty).val;
+    }
+    ir.fnp_of(fi.fnv).features = fi.feats;
+    ir.fnp_of(fi.fnv).has_features = true;
+    ir.fnp_of(fi.fnv).always_inline = (d.kind == ast.D_FN) and d.is_inline;
+    // (as LLVM knows malloc: what it returns is a new object, which no
+    // pointer the program had before it points into)
+    ir.fnp_of(fi.fnv).allocator = (d.kind == ast.D_FN) and u.str_eq(ir.fnp_of(fi.fnv).name, "std/mem.alloc_bytes");
+    add_ext_attrs(fi.fnv, fi.fnty, fi.sret, false);
+    if d.kind == ast.D_HOST_FN {
+        if d.extern_c {
+            // libraries: see collect_link_names; on Windows the library is
+            // the function's DLL, and on macOS its dylib or framework, which
+            // the linker reads from a constant axiom.import.<name> holding
+            // its name (cmd/axiom/src/plink.ax, cmd/axiom/src/mlink.ax); on
+            // Linux it tells another system's functions (elink.ax)
+            if not u.isnos(d.link_lib) {
+                dll_import(d.name, d.link_lib);
+            }
+        } else if ty.g_target.is_wasm {
+            cgrt.add_str_attr(fi.fnv, "wasm-import-module", d.host_module);
+            cgrt.add_str_attr(fi.fnv, "wasm-import-name", d.name);
+        }
+    } else {
+        // Whole program: everything but exports is internal. Separate units:
+        // a non-generic function is defined (externally visible) by its own
+        // module's unit and only declared elsewhere; generic instances are
+        // defined link-once by every unit that uses them.
+        let mut define = fi.depth <= 64;
+        if cx.O.unit == cx.CG_LINK {
+            define = false;
+        } else if (cx.O.unit == cx.CG_MODULE) and (n == 0) {
+            define = (d.module == cx.O.module) or own_feats;
+        }
+        if cgrt.lazy_export(d) and cfront.defines(d.name) {
+            define = false;  // a library's: a C unit defines the name, and that is the definition
+        }
+        if d.cabi and define {
+            cx.S.cabi_exports.push(fi);
+        }
+        if ((cx.O.unit == cx.CG_WHOLE) and (not d.is_export or d.cabi)) or own_feats {
+            cgrt.set_linkage(fi.fnv, ir.LINK_INTERNAL);
+        } else if define and (n > 0) {
+            cgrt.set_linkage(fi.fnv, ir.LINK_LINKONCE);
+        } else if cx.g_object_output and d.is_export and modl.is_std_module(d.module) {
+            // (the runtime's: one per program, every object's copy the same
+            // definition, so the optimizer may inline it as before)
+            cgrt.set_linkage(fi.fnv, ir.LINK_LINKONCE);
+        }
+        let asan_main = cx.S.sanitize_main and not cx.g_test_mode and u.str_eq(d.name, "main");
+        if define and d.is_export and ty.g_target.is_wasm and not asan_main and not cgrt.lazy_export(d) and not d.cabi {
+            cgrt.add_str_attr(fi.fnv, "wasm-export-name", d.name);
+        }
+        if define {
+            if u.notnil(cx.S.pending_tail) {
+                cx.S.pending_tail.next = fi;
+            } else {
+                cx.S.pending_head = fi;
+            }
+            cx.S.pending_tail = fi;
+        }
+    }
+    cx.S.inst_map.put(k, fi);
+    return fi;
+}
+
+// std/os/cpu.ax, which every build includes (the start-up check, @cpu_has).
+pub fn cpu_fn(name: []u8) *mut cx.FnInst {
+    let P = modl.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax") {
+            return get_inst(d, ty.no_types());
+        }
+    }
+    cx.internal_error(u.f1("std/os/cpu.ax has no %s (is --std right?)", name));
+    return u.nil.[cx.FnInst]();
+}
+
+// Does the running processor have every extension in `bits`? (i1)
+pub fn cpu_has_bits(bits: u64) *mut ir.Value {
+    let fi = cpu_fn("features");
+    let have = cx.call(fi.llty, fi.fnv, cx.no_vals());
+    let m = ir.cint(cx.T_i64, bits);
+    return cx.icmp(ir.IntEQ, cx.b_and(have, m), m);
+}
+
+// C ABI detail: integers narrower than 32 bits and bool are passed and
+// returned sign- or zero-extended. Marking every function (and indirect call)
+// this way makes any Axiom function with a scalar signature callable from
+// C, and C function pointers callable from Axiom (spec §14.5).
+fn ext_attr(v: *mut ir.Value, idx: u32, t0: *mut ast.Type, is_call: bool) void {
+    let t = cx.ct(t0);
+    let mut kind = u.nosym();
+    if t.kind == ast.TY_BOOL {
+        kind = "zeroext";
+    } else if (t.kind == ast.TY_INT) and (t.bits < 32) {
+        kind = u.pick(t.is_signed, "signext", "zeroext");
+    }
+    if u.isnos(kind) {
+        return;
+    }
+    let mut e: u8 = 1;
+    if u.str_eq(kind, "signext") {
+        e = 2;
+    }
+    if is_call {
+        ir.ext_of(v)[@as(usize, idx)] = e;
+    } else if idx == 0 {
+        ir.fnp_of(v).ret_ext = e;
+    } else {
+        ir.fnp_of(v).param_ext[@as(usize, idx - 1)] = e;
+    }
+}
+
+pub fn add_ext_attrs(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: bool) void {
+    add_ext_attrs_c(v, fnty, sret, is_call, false);
+}
+
+pub fn add_ext_attrs_c(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: bool, cabi: bool) void {
+    if not sret and (fnty.ret.kind != ast.TY_VOID) {
+        ext_attr(v, 0, fnty.ret, is_call);
+    }
+    let mut first: u32 = 1;
+    if sret {
+        first = 2;
+        if is_call {
+            ir.ext_of(v)[1] = ir.EXT_SRET;  // (the result's memory: the call writes it)
+        } else {
+            ir.fnp_of(v).param_ext[0] = ir.EXT_SRET;
+        }
+    }
+    for i in 0..fnty.params.len {
+        if not cx.cabi_struct(fnty.params[i], cabi) {
+            ext_attr(v, first + @int_cast(u32, i), fnty.params[i], is_call);
+        } else if is_call {
+            // an aggregate passed by value, by address: the callee only reads it
+            ir.ext_of(v)[@as(usize, first) + i] = ir.EXT_BYVAL;
+        } else {
+            ir.fnp_of(v).param_ext[@as(usize, first) + i - 1] = ir.EXT_BYVAL;
+        }
+    }
+}
+
+pub fn errunion_value(eu: *mut ast.Type, code: *mut ir.Value, payload: *mut ir.Value) *mut ir.Value {
+    let t = cx.lty(eu);
+    let mut v = ir.undef(t);
+    v = cx.insert(v, code, 0);
+    if eu.elem.kind != ast.TY_VOID {
+        if u.notnil(payload) {
+            v = cx.insert(v, cgrt.to_mem(eu.elem, payload), 1);
+        } else {
+            v = cx.insert(v, ir.czero(cx.lty(eu.elem)), 1);
+        }
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic
+// ---------------------------------------------------------------------------
+pub fn int_min(t: *mut ir.Ty) *mut ir.Value {
+    let bits = ir.int_width(t);
+    return cx.cint(t, u.I128.pow2(bits - 1).neg());
+}
+
+pub fn int_max(t: *mut ir.Ty, is_signed: bool) *mut ir.Value {
+    let bits = ir.int_width(t);
+    if is_signed {
+        return cx.cint(t, u.I128.pow2(bits - 1).sub(u.I128.of(1)));
+    }
+    return cx.cint(t, u.I128.pow2(bits).sub(u.I128.of(1)));
+}
+
+struct Ovf {
+    val: *mut ir.Value,
+    ovf: *mut ir.Value,
+}
+
+// Overflow-checked arithmetic, expressed with plain instructions only.
+// (The llvm.*.with.overflow intrinsics would force LLVM's slow SelectionDAG
+// path at -O0 on wasm; at -O1+ LLVM re-forms the intrinsics from these
+// patterns anyway.)
+fn mul_wide_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    let bits = ir.int_width(t);
+    let w = ir.t_int(@int_cast(i32, bits * 2));
+    let mut lw = cx.vnil();
+    let mut rw = cx.vnil();
+    if is_signed {
+        lw = cx.sext(l, w);
+        rw = cx.sext(r, w);
+    } else {
+        lw = cx.zext(l, w);
+        rw = cx.zext(r, w);
+    }
+    let p = cx.b_mul(lw, rw);
+    let val = cx.trunc(p, t);
+    let mut back = cx.vnil();
+    if is_signed {
+        back = cx.sext(val, w);
+    } else {
+        back = cx.zext(val, w);
+    }
+    return Ovf.{ val: val, ovf: cx.icmp(ir.IntNE, back, p) };
+}
+
+// 64-bit multiply: the overflow is an intrinsic the native backends compute
+// from the machine's multiply (and wasm by dividing back, lower.ax). Wider
+// types: no 128-bit multiply needed (freestanding wasm has no compiler-rt);
+// overflow is detected by dividing back.
+fn mul64_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    if ir.int_width(t) == 64 {
+        let prod = cx.b_mul(l, r);
+        let mut xs: [2]*mut ir.Value = [l, r];
+        let mut id = ir.IN_UMUL_OV;
+        if is_signed {
+            id = ir.IN_SMUL_OV;
+        }
+        return Ovf.{ val: prod, ovf: ir.intr(cx.B, id, cx.T_i1, xs[..]) };
+    }
+    let zero = ir.czero(t);
+    let one = ir.cint(t, 1);
+    let prod = cx.b_mul(l, r);
+    let lz = cx.icmp(ir.IntEQ, l, zero);
+    if not is_signed {
+        let div = cx.sel(lz, one, l);
+        let back = ir.binop(cx.B, ir.OP_UDIV, prod, div);
+        let ne = cx.icmp(ir.IntNE, back, r);  // (right to left, as in the C implementation)
+        let ovf = cx.b_and(cx.b_not(lz), ne);
+        return Ovf.{ val: prod, ovf: ovf };
+    }
+    let lm1 = cx.icmp(ir.IntEQ, l, ir.cones(t));
+    let safe = cx.b_or(lz, lm1);
+    let div = cx.sel(safe, one, l);
+    let back = ir.binop(cx.B, ir.OP_SDIV, prod, div);
+    let ne = cx.icmp(ir.IntNE, back, r);  // (right to left, as in the C implementation)
+    let general = cx.b_and(cx.b_not(safe), ne);
+    let m1case = cx.b_and(lm1, cx.icmp(ir.IntEQ, r, int_min(t)));
+    return Ovf.{ val: prod, ovf: cx.b_or(general, m1case) };
+}
+
+// base: 0 add, 1 sub, 2 mul
+pub fn op_with_overflow(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    let zero = ir.czero(t);
+    if base == 0 {
+        let val = cx.b_add(l, r);
+        if is_signed {
+            let xr = cx.b_xor(r, val);  // (right to left, as in the C implementation)
+            let x = cx.b_and(cx.b_xor(l, val), xr);
+            return Ovf.{ val: val, ovf: cx.icmp(ir.IntSLT, x, zero) };
+        }
+        return Ovf.{ val: val, ovf: cx.icmp(ir.IntULT, val, l) };
+    }
+    if base == 1 {
+        let val = cx.b_sub(l, r);
+        if is_signed {
+            let xv = cx.b_xor(l, val);  // (right to left, as in the C implementation)
+            let x = cx.b_and(cx.b_xor(l, r), xv);
+            return Ovf.{ val: val, ovf: cx.icmp(ir.IntSLT, x, zero) };
+        }
+        return Ovf.{ val: val, ovf: cx.icmp(ir.IntULT, l, r) };
+    }
+    if ir.int_width(t) <= 32 {
+        return mul_wide_overflow(is_signed, l, r);
+    }
+    return mul64_overflow(is_signed, l, r);
+}
+
+fn saturated(t: *mut ir.Ty, neg_direction: *mut ir.Value) *mut ir.Value {
+    return cx.sel(neg_direction, int_min(t), int_max(t, true));
+}
+
+pub fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    if cx.O.overflow == cx.OVF_WRAP {
+        if base == 0 {
+            return cx.b_add(l, r);
+        }
+        if base == 1 {
+            return cx.b_sub(l, r);
+        }
+        return cx.b_mul(l, r);
+    }
+    let t = l.ty;
+    let o = op_with_overflow(base, is_signed, l, r);
+    if cx.O.overflow == cx.OVF_TRAP {
+        cgrt.check_or_trap(cx.b_not(o.ovf), cgrt.T_OVERFLOW);
+        // (what uses the result comes after the check, where it did not
+        // overflow; the check itself reads the operation's own bits, which
+        // the flag does not change: ir.F_NSW)
+        return cgrt.no_wrap(o.val, is_signed);
+    }
+    let zero = ir.czero(t);
+    let mut s = cx.vnil();
+    if base == 2 {
+        if is_signed {
+            s = saturated(t, cx.icmp(ir.IntSLT, cx.b_xor(l, r), zero));
+        } else {
+            s = int_max(t, false);
+        }
+    } else if base == 0 {
+        if is_signed {
+            s = saturated(t, cx.icmp(ir.IntSLT, l, zero));
+        } else {
+            s = int_max(t, false);
+        }
+    } else {
+        if is_signed {
+            s = saturated(t, cx.icmp(ir.IntSLT, l, zero));
+        } else {
+            s = zero;
+        }
+    }
+    return cx.sel(o.ovf, s, o.val);
+}
+
+// Shift with mathematical semantics for every count (spec §7.6).
+fn gen_shift(op: lx.TokKind, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut ir.Value {
+    let mut lane = t;
+    if t.kind == ast.TY_VEC {
+        lane = t.elem;
+    }
+    if (k.ty.kind == ir.T_VEC) and on_x64() and (k.ty.elem.bits == x.ty.elem.bits) {
+        // a count per lane, where x86-64 shifts each lane by its own (and
+        // counts beyond the lane give 0, or the sign, as here)
+        let mut sid = ir.IN_SHLV;
+        if op != lx.TK_SHL {
+            sid = ir.IN_LSHRV;
+            if lane.is_signed {
+                sid = ir.IN_ASHRV;
+            }
+        }
+        if x64c.shiftv_ok(sid, x.ty.elem.bits, x.ty.lanes) {
+            let mut sargs: [2]*mut ir.Value = [x, k];
+            return ir.intr(cx.B, sid, x.ty, sargs[..]);
+        }
+    }
+    if (k.ty.kind == ir.T_VEC) and on_a64() and (k.ty.elem.bits == x.ty.elem.bits) and
+       ((@as(u64, @bit_cast(u32, x.ty.lanes * x.ty.elem.bits)) % 128) == 0) {
+        // a count per lane, clamped to the lane's bits: USHL / SSHL by it, or by
+        // its negation to the right (a64.ax), whose counts of the bits or more
+        // give 0, or the sign, as here
+        let mut sid = ir.IN_SHLV;
+        if op != lx.TK_SHL {
+            sid = ir.IN_LSHRV;
+            if lane.is_signed {
+                sid = ir.IN_ASHRV;
+            }
+        }
+        let bits = ir.splat(cx.B, k.ty, ir.cint(k.ty.elem, @as(u64, @bit_cast(u32, x.ty.elem.bits))));
+        let mut margs: [2]*mut ir.Value = [k, bits];
+        let kc = ir.intr(cx.B, ir.IN_UMIN, k.ty, margs[..]);
+        let mut sargs: [2]*mut ir.Value = [x, kc];
+        return ir.intr(cx.B, sid, x.ty, sargs[..]);
+    }
+    if k.ty.kind == ir.T_VEC {
+        // a count per lane: lane by lane
+        let mut r = ir.undef(x.ty);
+        for i in @as(u64, 0)..@as(u64, @bit_cast(u32, t.lanes)) {
+            let y = gen_shift(op, lane, ir.extract_elem(cx.B, x, i), ir.extract_elem(cx.B, k, i));
+            r = ir.insert_elem(cx.B, r, y, i);
+        }
+        return r;
+    }
+    let n = @int_cast(u32, lane.bits);
+    let kty = k.ty;
+    let ge = cx.icmp(ir.IntUGE, k, ir.cint(kty, @as(u64, n)));
+    let lane_ty = ir.t_int(@int_cast(i32, n));
+    let arith = (op == lx.TK_SHR) and lane.is_signed;
+    let mut fill: u64 = 0;
+    if arith {
+        fill = @as(u64, n - 1);
+    }
+    // Only an arithmetic shift needs its count clamped (to fill with the
+    // sign); a shift left or a logical shift right by an out-of-range count
+    // computes some value (each backend masks the count) that the select
+    // below replaces with 0. The optimizer removes the selects when the
+    // count's range is below the width.
+    let mut kc = k;
+    if arith or ir.is_cint(k) {
+        kc = cx.sel(ge, ir.cint(kty, fill), k);
+    }
+    let kb = ir.int_width(kty);
+    if kb > n {
+        kc = cx.trunc(kc, lane_ty);
+    } else if kb < n {
+        kc = cx.zext(kc, lane_ty);
+    }
+    if t.kind == ast.TY_VEC {
+        let vt = x.ty;
+        kc = ir.splat(cx.B, vt, kc);
+    }
+    let mut r = cx.vnil();
+    if op == lx.TK_SHL {
+        r = ir.binop(cx.B, ir.OP_SHL, x, kc);
+    } else if arith {
+        return ir.binop(cx.B, ir.OP_ASHR, x, kc);
+    } else {
+        r = ir.binop(cx.B, ir.OP_LSHR, x, kc);
+    }
+    return cx.sel(ge, ir.czero(x.ty), r);
+}
+
+pub fn gen_binop(op: lx.TokKind, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    let is_float = (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t);
+    let mut sgn = false;
+    if t.kind == ast.TY_INT {
+        sgn = t.is_signed;
+    } else if t.kind == ast.TY_VEC {
+        sgn = t.elem.is_signed;
+    }
+    let is_vec = t.kind == ast.TY_VEC;  // integer vectors wrap in every mode
+    if op == lx.TK_PLUS {
+        if is_float {
+            return ir.binop(cx.B, ir.OP_FADD, l, r);
+        }
+        if is_vec {
+            return cx.b_add(l, r);
+        }
+        return overflow_op(0, sgn, l, r);
+    }
+    if op == lx.TK_MINUS {
+        if is_float {
+            return ir.binop(cx.B, ir.OP_FSUB, l, r);
+        }
+        if is_vec {
+            return cx.b_sub(l, r);
+        }
+        return overflow_op(1, sgn, l, r);
+    }
+    if op == lx.TK_STAR {
+        if is_float {
+            return ir.binop(cx.B, ir.OP_FMUL, l, r);
+        }
+        if is_vec {
+            return cx.b_mul(l, r);
+        }
+        return overflow_op(2, sgn, l, r);
+    }
+    if op == lx.TK_SLASH {
+        if is_float {
+            return ir.binop(cx.B, ir.OP_FDIV, l, r);
+        }
+        let tt = l.ty;
+        cgrt.check_or_trap(cx.icmp(ir.IntNE, r, ir.czero(tt)), cgrt.T_DIVZERO);
+        if not sgn {
+            return ir.binop(cx.B, ir.OP_UDIV, l, r);
+        }
+        if cx.O.overflow == cx.OVF_WRAP {
+            // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
+            let m1 = cx.icmp(ir.IntEQ, r, ir.cones(tt));
+            let q = ir.binop(cx.B, ir.OP_SDIV, l, cx.sel(m1, ir.cint(tt, 1), r));
+            return cx.sel(m1, ir.neg(cx.B, l), q);
+        }
+        let rm1 = cx.icmp(ir.IntEQ, r, ir.cones(tt));  // (right to left, as in the C implementation)
+        let ovf = cx.b_and(cx.icmp(ir.IntEQ, l, int_min(tt)), rm1);
+        if cx.O.overflow == cx.OVF_TRAP {
+            cgrt.check_or_trap(cx.b_not(ovf), cgrt.T_OVERFLOW);
+            return ir.binop(cx.B, ir.OP_SDIV, l, r);
+        }
+        let r2 = cx.sel(ovf, ir.cint(tt, 1), r);
+        let q = ir.binop(cx.B, ir.OP_SDIV, l, r2);
+        return cx.sel(ovf, int_max(tt, true), q);
+    }
+    if op == lx.TK_PERCENT {
+        let tt = l.ty;
+        cgrt.check_or_trap(cx.icmp(ir.IntNE, r, ir.czero(tt)), cgrt.T_DIVZERO);
+        if not sgn {
+            return ir.binop(cx.B, ir.OP_UREM, l, r);
+        }
+        let m1 = cx.icmp(ir.IntEQ, r, ir.cones(tt));
+        let r2 = cx.sel(m1, ir.cint(tt, 1), r);
+        return ir.binop(cx.B, ir.OP_SREM, l, r2);
+    }
+    if op == lx.TK_PLUS_PCT {
+        return cx.b_add(l, r);
+    }
+    if op == lx.TK_MINUS_PCT {
+        return cx.b_sub(l, r);
+    }
+    if op == lx.TK_STAR_PCT {
+        return cx.b_mul(l, r);
+    }
+    if op == lx.TK_AMP {
+        return cx.b_and(l, r);
+    }
+    if op == lx.TK_PIPE {
+        return cx.b_or(l, r);
+    }
+    if op == lx.TK_CARET {
+        return cx.b_xor(l, r);
+    }
+    if (op == lx.TK_SHL) or (op == lx.TK_SHR) {
+        return gen_shift(op, t, l, r);
+    }
+    // comparisons
+    if is_float {
+        let mut p = ir.RealOGE;
+        match op {
+            .EQEQ => { p = ir.RealOEQ; }
+            .NE   => { p = ir.RealUNE; }
+            .LT   => { p = ir.RealOLT; }
+            .LE   => { p = ir.RealOLE; }
+            .GT   => { p = ir.RealOGT; }
+            else => {}
+        }
+        return cx.fcmp(p, l, r);
+    }
+    let mut p = ir.IntUGE;
+    if sgn {
+        p = ir.IntSGE;
+    }
+    match op {
+        .EQEQ => { p = ir.IntEQ; }
+        .NE   => { p = ir.IntNE; }
+        .LT => {
+            p = ir.IntULT;
+            if sgn {
+                p = ir.IntSLT;
+            }
+        }
+        .LE => {
+            p = ir.IntULE;
+            if sgn {
+                p = ir.IntSLE;
+            }
+        }
+        .GT => {
+            p = ir.IntUGT;
+            if sgn {
+                p = ir.IntSGT;
+            }
+        }
+        else => {}
+    }
+    return cx.icmp(p, l, r);
+}
+
+// ---------------------------------------------------------------------------
+// Places, targets, coverage
+// ---------------------------------------------------------------------------
+// Is e a place whose storage may be misaligned (reached through a pointer)?
+pub fn via_pointer(e: *mut ast.Expr) bool {
+    let k = e.kind;
+    if k == ast.E_DEREF {
+        return true;
+    }
+    if k == ast.E_FIELD {
+        return (ast.self_mode_of(e) == ast.SELF_DEREF) or
+               ((ast.field_kind_of(e) == ast.FK_STRUCT) and via_pointer(e.a));
+    }
+    if k == ast.E_INDEX {
+        return (ast.index_kind_of(e) != ast.IDX_ARRAY) or via_pointer(e.a);
+    }
+    return false;
+}
+
+// x86-64 code generation, which selects some vector builtins whole (where
+// the function's extensions have them: x64c.perm_ok and the like).
+pub fn on_x64() bool {
+    return tg.g_arch == tg.ARCH_X64;
+}
+
+pub fn on_a64() bool {
+    return tg.g_arch == tg.ARCH_A64;
+}
+
+fn is_cov_decl(d: *ast.Decl, name: []u8) bool {
+    return u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "std/internal/runtime/coverage.ax");
+}
+
+// A global of the coverage runtime (std/internal/runtime/coverage.ax).
+pub fn cov_global(name: []u8) *mut ir.Value {
+    let P = modl.g_prog;
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if is_cov_decl(d, name) {
+            return global_addr(d);
+        }
+    }
+    cx.internal_error(u.f1("std/internal/runtime/coverage.ax has no %s (is --std right?)", name));
+    return u.nil.[ir.Value]();
+}
+
+/// The prefix of the symbols of the C wrappers: CABI_PREFIX + name is the
+/// wrapper of extern "C" function name, CABI_IMPL + name the function an
+/// export's C function calls (header.ax: cabi_source).
+pub let CABI_PREFIX: []u8 = "__axiom_cabi_";
+pub let CABI_IMPL: []u8 = "__axiom_cabi_impl_";
