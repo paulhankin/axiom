@@ -586,7 +586,7 @@ x509, rsa, ...): 400-430 ms per request before (a process each), 2.6-3.5 ms
 after, for hover, definition, completion, signature help and diagnostics
 after an edit (the first check of a program costs what it did, and keeping
 its modules about as much again, between messages); references and rename
-(which walk every module) 90 ms. The compiler's own `main.ax`: 760 ms to
+(which then walked every module) 90 ms (below: now 3-7 ms). The compiler's own `main.ax`: 760 ms to
 10 ms. 500 edits (bodies and signatures alternately, each with a publish
 and a hover): the server's memory stays at 142.3 MB (after the first 50).
 A differential test (`axiom lsp`'s answers against `axiom ide`'s, for
@@ -595,12 +595,42 @@ before and after edits) found no difference in some 9000 answers; the
 suite's `axiom lsp` case does that for a small package, through edits in
 the editor and on disk.
 
-What remains: references and rename walk every module of the program on
-each request (the kept modules' names could be indexed once); a module
-kept and later dropped stays in the main thread's memory (each change on
-disk of a kept file, or each close of an edited document that is then kept,
-costs one copy of that module); a host without threads gets no answers (it
-had none before: no process could be spawned there either).
+- **References and rename** no longer walk every module per request: the
+  names of a kept module are found once, when it is kept (`ide.index_kept`,
+  on the main thread, into the heap; `ide.drop_index` when it is dropped),
+  sorted, and a request walks only the modules it checked itself
+  (`ide.names_by_module`). A module's walk finds names only in its own file
+  (checked: where one does not, every module is walked as before), and the
+  names are sorted by a stable sort by file and then position, so each
+  module's sorted names, in the order of their files, are what sorting them
+  all gives: the answers are the same. On the file importing 20 large
+  modules, references and rename went from 72 ms (median) to 3-7 ms; on
+  `lsp.ax` (whose program is most of the compiler, with the files of its
+  directory) from 190-206 ms to 5-20 ms. The index costs memory for as
+  long as its modules are kept: 140.3 MB to 148.7 MB on that file, with no
+  growth over 500 edits (and 175 MB to 149 MB at the peak of a session
+  that asks for references, since the requests no longer hold every
+  module's names).
+- Found by the differential test, and fixed: completion after a `.` with
+  no name typed yet puts a name into the document's text for that run
+  (`ide.prepare_completion`), but a document opened in the editor and not
+  edited is kept, and the run took the kept module, without the name, so
+  the answer was empty. A run now takes a kept module only if the text it
+  reads for its file is the kept one (`modload.reads_as_kept`). The suite's
+  `axiom lsp` case opens such a module now.
+
+What remains: a module kept and later dropped stays in the main thread's
+memory (each change on disk of a kept file, or each close of an edited
+document that is then kept, costs one copy of that module). Freeing it is
+not a local change: the main thread's runs allocate into its arenas, and a
+kept module's memory is interleaved with the strings, types and files the
+run made, which later runs and kept modules share (interned strings,
+hash-consed types), so a module's memory cannot be told apart and given
+back alone. It would take the main thread's own runs allocating per run
+(as workers do) with what the shared tables keep copied out, or a reset of
+the whole session's state (tables, files, kept modules) once enough memory
+has been dropped. A host without threads gets no answers (it had none
+before: no process could be spawned there either).
 
 ### Current state (before this item)
 
@@ -719,7 +749,7 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-**5b (module splits and enums): done, but for the builtins (below).**
+**5b (module splits and enums): done, but for codegen's builtins (below).**
 Every split moved
 declarations as they were, by a script (a declaration goes with what it
 uses, and a reference becomes `alias.name`), so each commit left the
@@ -752,6 +782,23 @@ it moved. Done:
   expressions, builtins) and `cgmain.ax` (537, above `codegen.ax`:
   `codegen_program`, the native entry, the runtime's exports). Item 1's
   `CodegenCtx` can now be `cgctx.ax`'s globals gathered.
+- `semabuiltin.ax` (1,293 lines, below `sema.ax`, which is now 4,633):
+  the checking of the builtins (`builtin_check` and the conversion,
+  memory, math, vector, atomic and system builtins), with the small
+  helpers both use that call nothing back (`earg`, `find_field`,
+  `finalize_untyped`, now `pub` there; `tnil`, `tstr` and `set_ty`, one
+  line each, are in both). What the builtins call back in `sema.ax`
+  (`check_expr`, `check_expr_to`, `coerce`, `insn_check`, and the
+  resolution of a builtin's type argument in the context being checked,
+  `resolve_arg`, the one use of the context `C`) are function pointers
+  in `semabuiltin.ax`, thread-local like the rest of sema's per-run
+  state, which `sema.run` sets when it starts (on every thread that
+  checks: `axiom lsp`'s requests, the main thread; nothing else reaches
+  them, and until they are set they stop the compiler with a message).
+  The compiler's output, its diagnostics on every `.ax` file of the
+  repository (agent-json) and the self build at -O2 are unchanged (25.7 s
+  of user time and 2.24 GB peak, as before: 26.3-26.5 s by the base
+  compiler).
 - `x64caps.ax` (88): what codegen.ax asks the x86-64 selector
   (`vector_bits`, `perm_ok`, `partial_ok`, `shiftv_ok`, `vnni_ok`,
   `widen_ok`); `codegen.ax` no longer imports `x64.ax`.
@@ -821,8 +868,8 @@ were identical.
 
 - **`codegen.ax`'s builtins** (the "Builtins" section, about 1,600 lines:
   `gen_builtin` and the conversion, memory, math, vector and system
-  builtins, with the ASan and coverage helpers kept there) and `sema.ax`'s
-  builtin checking. A layering exists: the builtins reach the rest of
+  builtins, with the ASan and coverage helpers kept there). A layering
+  exists: the builtins reach the rest of
   `codegen.ax` only through `gen` (16 calls) and 38 helpers (about 1,100
   lines: `get_inst` and the mangling, `global_addr`, `string_ptr`,
   `const_slice`, `errcode_value`, `int_min`/`int_max`, `gen_binop`,
@@ -831,8 +878,8 @@ were identical.
   (between `cgctx.ax` and it) and `gen` is reached through a function
   pointer that `codegen.ax` sets (in `cgctx.ax`, thread-local or set
   before item 1's workers start). That changes calls rather than moving
-  declarations, so it was left for a step of its own. `sema.ax`'s
-  `check_builtin` is in the same position with `check_expr`.
+  declarations, so it was left for a step of its own. (`sema.ax`'s
+  builtins were split this way: `semabuiltin.ax`, above.)
 - Other candidates for `match`: chains of separate `if v == X { return
   ... }` (the backends' intrinsic dispatch) mean the same only when every
   arm returns; they were not rewritten by the script.

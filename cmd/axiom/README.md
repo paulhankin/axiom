@@ -434,7 +434,8 @@ types share a module.
 | `types.ax` | `types.c` | hash-consed types, substitution, printing, layout, constraints |
 | `package.ax` | `package.c` | `axiom.toml`, `pkg:` imports, git dependencies |
 | `modload.ax` | `sema_decl.c` | module loading (import paths, `internal/` and package visibility, cycles), the modules `axiom lsp`'s session keeps, the `Program` |
-| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | name resolution, type checking |
+| `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_stmt.c` | name resolution, type checking |
+| `semabuiltin.ax` | `sema_builtins.c` | checking the builtins (below `sema.ax`, which it calls back through functions `sema.run` sets) |
 | `semapost.ax` | `sema_decl.c`, `sema_target.c` | the checks after type checking: object sizes, recursive inline functions, processor extensions (target conditions, `@features`/`@multiversion`, builtins that need an extension) |
 | `codegen.ax`, `cgctx.ax`, `cgrt.ax`, `cgmain.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
