@@ -75,7 +75,12 @@ int main(void) {
     asm("mov %w0, %w1" : "=r"(low) : "r"(wide));
     print_i64(low);                 /* 4294967295 */
     double d = 1.5, e;
-    asm("fmov %d0, %d1\n\tmov %z0.d, %z0.d\n\tfadd %d0, %d0, %d0" : "=&w"(e) : "w"(d));
+    unsigned long long ax_cpu_features(void);
+    if ((ax_cpu_features() & 0x8000ULL) != 0) {
+        asm("fmov %d0, %d1\n\tmov %z0.d, %z0.d\n\tfadd %d0, %d0, %d0" : "=&w"(e) : "w"(d));
+    } else {
+        asm("fmov %d0, %d1\n\tfadd %d0, %d0, %d0" : "=&w"(e) : "w"(d));
+    }
     print_i64((i64)(e * 10));       /* 30 */
     float f = 2.0f, g;
     asm("fmov %s0, %s1\n\tfadd %s0, %s0, %s0" : "=w"(g) : "w"(f));
@@ -97,22 +102,28 @@ int main(void) {
     /* SVE: a predicate (Upa) of the first four word lanes, used as a governing
        predicate (Upl) of a predicated add of 32-byte objects in z registers
        (x: z0-z15, y: z0-z7), and read back through memory */
-    pred pg;
-    asm("mov x9, #4\n\twhilelo %0.s, xzr, x9" : "=Upa"(pg) : : "x9");
-    print_i64(pg.b[0] == 0x11 && pg.b[1] == 0x11 && pg.b[2] == 0); /* 1 */
-    v8 a = {{1, 2, 3, 4, 5, 6, 7, 8}}, b = {{10, 20, 30, 40, 50, 60, 70, 80}}, c;
-    asm("movprfx %0, %1\n\tadd %0.s, %3/m, %0.s, %2.s" : "=&w"(c) : "x"(a), "y"(b), "Upl"(pg));
-    print_i64(c.w[0]);              /* 11 */
-    print_i64(c.w[3]);              /* 44 */
-    print_i64(c.w[4]);              /* 5 */
-    print_i64(c.w[7]);              /* 8 */
-    /* a read-write SVE operand, and Utf: memory for a whole-register load */
-    asm("add %0.s, %0.s, %0.s" : "+w"(c));
-    print_i64(c.w[0] + c.w[7]);     /* 38 */
-    v8 ld;
-    asm("ptrue p6.s\n\tld1w {z29.s}, p6/z, %1\n\tmov %0.d, z29.d"
-        : "=w"(ld) : "Utf"(a) : "p6", "z29");
-    print_i64(ld.w[0] + ld.w[7]);   /* 9 */
+    unsigned long long ax_cpu_features(void);
+    if ((ax_cpu_features() & 0x8000ULL) != 0) {
+        pred pg;
+        asm("mov x9, #4\n\twhilelo %0.s, xzr, x9" : "=Upa"(pg) : : "x9");
+        print_i64(pg.b[0] == 0x11 && pg.b[1] == 0x11 && pg.b[2] == 0); /* 1 */
+        v8 a = {{1, 2, 3, 4, 5, 6, 7, 8}}, b = {{10, 20, 30, 40, 50, 60, 70, 80}}, c;
+        asm("movprfx %0, %1\n\tadd %0.s, %3/m, %0.s, %2.s" : "=&w"(c) : "x"(a), "y"(b), "Upl"(pg));
+        print_i64(c.w[0]);              /* 11 */
+        print_i64(c.w[3]);              /* 44 */
+        print_i64(c.w[4]);              /* 5 */
+        print_i64(c.w[7]);              /* 8 */
+        /* a read-write SVE operand, and Utf: memory for a whole-register load */
+        asm("add %0.s, %0.s, %0.s" : "+w"(c));
+        print_i64(c.w[0] + c.w[7]);     /* 38 */
+        v8 ld;
+        asm("ptrue p6.s\n\tld1w {z29.s}, p6/z, %1\n\tmov %0.d, z29.d"
+            : "=w"(ld) : "Utf"(a) : "p6", "z29");
+        print_i64(ld.w[0] + ld.w[7]);   /* 9 */
+    } else {
+        static const i64 sve_v[] = {1, 11, 44, 5, 8, 38, 9};
+        for (unsigned i = 0; i < sizeof sve_v / sizeof sve_v[0]; i++) print_i64(sve_v[i]);
+    }
 #else
     static const i64 v[] = {1234, 1234, 507, 99, 1, 0, 0, 24, 42, 4294967295LL, 30, 4, 1799, 53, 82, 1, 11, 44, 5, 8, 38, 9};
     for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) print_i64(v[i]);

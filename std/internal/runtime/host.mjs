@@ -628,24 +628,26 @@ function rootFs(root) {
 }
 
 // File positions shared by the threads: a table in shared memory for the
-// first POS_FDS descriptors (stored as position + 2; 0 means untracked, 1
-// means append), a plain map beyond (those are not shared).
+// first POS_FDS descriptors (0 untracked, 1 write-only append, pos + 2
+// positioned, -(pos + 1) read+append 'a+'), a plain map beyond.
 const POS_FDS = 4096;
 class SharedPositions {
   constructor(buf) {
     this.table = new Float64Array(buf);
     this.more = new Map();
   }
-  has(fd) { return fd >= 0 && fd < POS_FDS ? this.table[fd] !== 0 : this.more.has(fd); }
-  get(fd) { return fd >= 0 && fd < POS_FDS ? this.table[fd] - 2 : this.more.get(fd); }
-  set(fd, v) {
-    if (fd >= 0 && fd < POS_FDS) this.table[fd] = v + 2;
-    else this.more.set(fd, v);
+  raw(fd) { return fd >= 0 && fd < POS_FDS ? this.table[fd] : (this.more.get(fd) || 0); }
+  put(fd, r) {
+    if (fd >= 0 && fd < POS_FDS) this.table[fd] = r;
+    else if (r === 0) this.more.delete(fd);
+    else this.more.set(fd, r);
   }
-  delete(fd) {
-    if (fd >= 0 && fd < POS_FDS) this.table[fd] = 0;
-    else this.more.delete(fd);
-  }
+  has(fd) { return this.raw(fd) !== 0; }
+  isAppend(fd) { const r = this.raw(fd); return r === 1 || r < 0; }
+  get(fd) { const r = this.raw(fd); return r < 0 ? -1 - r : r - 2; }
+  open(fd, v, append = false) { this.put(fd, v < 0 ? 1 : append ? -(v + 1) : v + 2); }
+  set(fd, v) { const r = this.raw(fd); this.put(fd, v < 0 ? 1 : r < 0 ? -(v + 1) : v + 2); }
+  delete(fd) { this.put(fd, 0); }
 }
 
 // An address record (see std/internal/runtime/native.ax) as node's host and port.
@@ -705,6 +707,12 @@ export function createHost(opts = {}) {
   // (fs), node's under a root directory (rootFs), or in memory (RemoteFS,
   // on the net worker, where every thread reaches the same files).
   const F = shared.files === 'memory' ? new RemoteFS(net) : shared.root ? rootFs(shared.root) : fs;
+  // On macOS, process.env.TMPDIR points into /var/folders/... on the host OS,
+  // which does not exist inside --files=memory or --root=dir (where /tmp does).
+  let hideTmpdir = shared.hideTmpdir ?? (F !== fs && process.env.TMPDIR !== undefined
+    ? (() => { try { return !F.statSync(process.env.TMPDIR).isDirectory(); } catch { return true; } })()
+    : false);
+  shared.hideTmpdir = hideTmpdir;
   // ax_stat's out[0..4]: kind, size, modification time, permission bits
   const statOut = (st, out) => {
     const kind = st.isFile() ? 1n : st.isDirectory() ? 2n : st.isSymbolicLink() ? 3n : 4n;
@@ -781,9 +789,9 @@ export function createHost(opts = {}) {
     ax_write(fd, p, n) {
       try {
         if (!pos.has(fd)) return writeFd(fd, bytes(p, n).slice());
-        const at = pos.get(fd);
-        const w = F.writeSync(fd, bytes(p, n).slice(), 0, n >>> 0, at < 0 ? null : at);
-        if (at >= 0) pos.set(fd, at + w);
+        const at = pos.get(fd), app = pos.isAppend(fd);
+        const w = F.writeSync(fd, bytes(p, n).slice(), 0, n >>> 0, app || at < 0 ? null : at);
+        if (at >= 0) pos.set(fd, app ? Number(F.fstatSync(fd).size) : at + w);
         return w;
       } catch { return -1; }
     },
@@ -802,11 +810,12 @@ export function createHost(opts = {}) {
     ax_open(p, n, flags) {
       try {
         // (flags 4 and 5: w+ and a+; flag 8: the file must not exist)
-        const excl = (flags & 8) && [1, 4].includes(flags & 7);
-        const mode = excl ? ((flags & 7) === 1 ? 'wx' : 'wx+') : (['r', 'w', 'a', 'r+', 'w+', 'a+'][flags & 7] || 'r');
+        const m = flags & 7;
+        const excl = (flags & 8) && [1, 4].includes(m);
+        const mode = excl ? (m === 1 ? 'wx' : 'wx+') : (['r', 'w', 'a', 'r+', 'w+', 'a+'][m] || 'r');
         // (flag 16: a file created can be read and written by its owner alone)
         const fd = F.openSync(str(p, n), mode, (flags & 16) ? 0o600 : 0o644);
-        pos.set(fd, (flags & 7) === 2 ? -1 : 0);  // appends go to the end
+        pos.open(fd, m === 2 ? -1 : 0, m === 2 || m === 5);  // appends go to the end
         return fd;
       } catch (e) {
         return fsErr(e);
@@ -815,7 +824,7 @@ export function createHost(opts = {}) {
     ax_create(p, n, mode) {
       try {
         const fd = F.openSync(str(p, n), 'w', mode & 0o777);
-        pos.set(fd, 0);
+        pos.open(fd, 0, false);
         return fd;
       } catch (e) {
         return fsErr(e);
@@ -937,7 +946,9 @@ export function createHost(opts = {}) {
       return give(Buffer.from(programArgs[i], 'utf8'), p, cap);
     },
     ax_getenv(p, n, out, cap) {
-      const v = process.env[str(p, n)];
+      const name = str(p, n);
+      if (hideTmpdir && name === 'TMPDIR') return -2;
+      const v = process.env[name];
       if (v === undefined) return -2;
       return give(Buffer.from(v, 'utf8'), out, cap);
     },
@@ -981,17 +992,20 @@ export function createHost(opts = {}) {
     ax_setenv(k, kn, v, vn) {
       const name = str(k, kn), value = str(v, vn);
       if (!name || name.includes('=') || name.includes('\0') || value.includes('\0')) return -1;
+      if (name === 'TMPDIR') hideTmpdir = false;
       process.env[name] = value;
       return 0;
     },
     ax_unsetenv(k, kn) {
       const name = str(k, kn);
       if (!name || name.includes('=') || name.includes('\0')) return -1;
+      if (name === 'TMPDIR') hideTmpdir = false;
       delete process.env[name];
       return 0;
     },
     ax_environ(p, cap) {
-      const b = Buffer.from(Object.entries(process.env).map(([k, v]) => `${k}=${v}\0`).join(''));
+      const entries = Object.entries(process.env).filter(([k]) => !(hideTmpdir && k === 'TMPDIR'));
+      const b = Buffer.from(entries.map(([k, v]) => `${k}=${v}\0`).join(''));
       if (b.length <= cap >>> 0) bytes(p, b.length).set(b);
       return b.length;
     },

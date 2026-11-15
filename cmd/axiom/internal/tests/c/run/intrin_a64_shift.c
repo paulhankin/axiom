@@ -3,7 +3,7 @@
    writes this file: do not edit): compares and shifts. A mismatch prints the intrinsic
    and the result's bytes. */
 /* aarch64-only */
-/* flags: --c-std=c17 --features=+aes,+sha2,+sha3,+sha512,+sm4,+crc,+rdm,+dotprod,+i8mm,+fp16,+fhm,+bf16 */
+/* flags: --c-std=c17 --features=+fp16 */
 /* expect: intrin_a64_shift 648 */
 #include <arm_neon.h>
 #include <arm_acle.h>

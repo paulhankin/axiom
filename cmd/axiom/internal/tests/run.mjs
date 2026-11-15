@@ -53,7 +53,8 @@ const nativeTarget = `--target=${process.env.AXIOM_NATIVE_TARGET || 'native'}`;
 // Windows (AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64) and
 // macOS link no C code: cmd/axiom/internal/tests/native_rt.ax replaces cmd/axiom/internal/tests/native_rt.c, and
 // tests that call C are skipped.
-const noC = /windows|macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '');
+const defaultNativeTarget = process.env.AXIOM_NATIVE_TARGET || (process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : '');
+const noC = /windows|macos|darwin/.test(defaultNativeTarget);
 // Build-only (AXIOM_NATIVE_EXEC=none, for a target nothing here can run:
 // AXIOM_NATIVE_TARGET=x86_64-macos, aarch64-windows, ...): the sections that
 // build programs (option buildOnly) build them and check each executable's
@@ -300,7 +301,7 @@ async function runNative(exe) {
   if (r.error && r.error.code === 'ETIMEDOUT') return { out: [], trapped: true, msg: `timed out after ${runTimeout / 1000} s` };
   const out = r.stdout.split('\n');
   if (out[out.length - 1] === '') out.pop();
-  return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}` };
+  return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}`, status: r.status, stderr: r.stderr || '' };
 }
 
 console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${extraFlags.length ? `, ${extraFlags.join(' ')}` : ''}, ${jobs} jobs`);
@@ -528,6 +529,9 @@ const cRunTest = async (f) => {
   for (const w of warnings) if (!wcodes.includes(w)) return `expected warning ${w}, got [${wcodes.join(', ')}]`;
   if (buildOnly) return checkBuilt(out);
   const r = native ? await runNative(out) : await runWasm(out);
+  if (native && r.status === 1 && /^axiom: this program was built for processors with extensions this one lacks\b/m.test(r.stderr || '')) {
+    return { skip: true, reason: 'CPU lacks required extensions' };
+  }
   // (/* expect-trap */: the program must trap)
   const trap = /\/\* expect-trap \*\//.test(src);
   let problem = r.trapped ? (trap ? null : `unexpected trap: ${r.msg}`) : (trap ? 'expected a trap, but the program completed' : null);
@@ -570,7 +574,7 @@ const cMixTest = async (dir) => {
   if (has('windows-only') && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
   // (the node host's CLI does not run std/io programs for wasm64)
   if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return { skip: true, reason: 'wasm32 only' };
-  if (has('x86-64-only') && native && /aarch64/.test(process.env.AXIOM_NATIVE_TARGET || '')) return { skip: true, reason: 'x86-64 only' };
+  if (has('x86-64-only') && native && (/aarch64/.test(process.env.AXIOM_NATIVE_TARGET || '') || (!process.env.AXIOM_NATIVE_TARGET && process.arch !== 'x64'))) return { skip: true, reason: 'x86-64 only' };
   const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || n.endsWith('.s') || n.endsWith('.S') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
   const uses = dv('uses').flatMap((x) => x.trim().split(/\s+/)).map((x) => path.resolve(dir, x));
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
@@ -846,7 +850,7 @@ const cLibTest = async (f) => {
   if (has('linux-only') && (!native || /windows|macos|darwin/.test(nt) || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
   if (has('posix-only') && (!native || /windows/.test(nt))) return { skip: true, reason: 'Linux and macOS only' };
   if (has('windows-only') && !(native && /windows/.test(nt))) return { skip: true, reason: 'Windows only' };
-  if (has('x86-64-only') && native && /aarch64/.test(nt)) return { skip: true, reason: 'x86-64 only' };
+  if (has('x86-64-only') && native && (/aarch64/.test(nt) || (!nt && process.arch !== 'x64'))) return { skip: true, reason: 'x86-64 only' };
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
   if (!native) flags.push(...dv('wasm-flags').flatMap((x) => x.trim().split(/\s+/)));
   const errors = dv('expect-error');
@@ -1282,7 +1286,7 @@ function cDriverCases() {
     },
     'C: native stack traces through C functions': async () => {
       if (skip()) return skip();
-      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
       const out = path.join(dir, 'crash');
@@ -1297,7 +1301,7 @@ function cDriverCases() {
     // program's own traces as before (they walk the frame pointers).
     'C: native stack traces with --unwind-tables=off': async () => {
       if (skip()) return skip();
-      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
       write({ 'crash3.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
       const out = path.join(dir, 'crash3');
@@ -1330,7 +1334,7 @@ function cDriverCases() {
     // inlined into the runtime's.)
     'C: native stack traces through C functions at -O2': async () => {
       if (skip()) return skip();
-      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash2.c': 'static int *volatile gp;\nstatic volatile int sink;\nint leafcrash(int x) {\n    return *gp + x;\n}\n' +
         'static int (*volatile leafp)(int) = leafcrash;\nint early(int *p, int x) {\n    if (!p) {\n        return leafp(x) + 1;\n' +
         '    }\n    return *p;\n}\nint tailer(int x) {\n    sink = x;\n    return early(0, x + 1);\n}\n' +
@@ -1347,7 +1351,7 @@ function cDriverCases() {
     // in a trap's trace at -O0 and -O2.
     'C: WebAssembly stack traces through C functions': async () => {
       if (skip()) return skip();
-      if (noC) return { skip: true, reason: 'no C' };
+      if (native && process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'cross native run' };
       write({ 'crash3.c': 'static volatile int zero = 0;\nstatic int divide(int *p) {\n    return *p / zero;\n}\n' +
         'static int middle(int k) {\n    int x = k;\n    return divide(&x) + 1;\n}\nint main(void) {\n    return middle(3) + 2;\n}\n' });
       for (const o of ['-O0', '-O2']) {
@@ -1381,7 +1385,7 @@ function cDriverCases() {
     // as frames of their own; the code is the same.
     'C: native stack traces with the faulting line (-g)': async () => {
       if (skip()) return skip();
-      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n',
         'crash2.c': 'static int *volatile gp;\nstatic volatile int sink;\nint leafcrash(int x) {\n    return *gp + x;\n}\n' +
@@ -3936,9 +3940,14 @@ if (!skipPlatform) {
 if (!skipPlatform && !native) {
   const objfmtDir = path.join(root, 'cmd/axiom/internal/tests/c/objfmt');
   const objfmtDirs = fs.existsSync(objfmtDir) ? fs.readdirSync(objfmtDir).filter((n) => fs.statSync(path.join(objfmtDir, n)).isDirectory()).sort().map((n) => path.join(objfmtDir, n)) : [];
-  const llvmTool = (n) => [n, `${n}-18`, `/usr/lib/llvm-18/bin/${n}`].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+  const llvmTool = (n) => [n, `${n}-18`, `/usr/lib/llvm-18/bin/${n}`, `/opt/homebrew/opt/llvm@18/bin/${n}`,
+    `/opt/homebrew/opt/llvm/bin/${n}`, `/usr/local/opt/llvm@18/bin/${n}`, `/usr/local/opt/llvm/bin/${n}`]
+    .find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
   const clang = llvmTool('clang'), ld64 = llvmTool('ld64.lld'), lldLink = llvmTool('lld-link'), llvmAr = llvmTool('llvm-ar');
   const readobj = llvmTool('llvm-readobj'), dlltool = llvmTool('llvm-dlltool');
+  const macSdk = process.platform === 'darwin' ? [process.env.SDKROOT, '/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk',
+    '/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk']
+    .find((d) => d && fs.existsSync(path.join(d, 'usr/lib/libSystem.tbd'))) : null;
   const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
   const wineDlls = ['/usr/lib/x86_64-linux-gnu/wine/x86_64-windows', '/usr/lib/wine/x86_64-windows', '/usr/lib64/wine/x86_64-windows'].find((d) => fs.existsSync(path.join(d, 'kernel32.dll')));
   const triples = { 'x86_64-windows': 'x86_64-pc-windows-msvc', 'aarch64-windows': 'aarch64-pc-windows-msvc', 'x86_64-macos': 'x86_64-apple-macos11', 'aarch64-macos': 'arm64-apple-macos11' };
@@ -4000,6 +4009,7 @@ if (!skipPlatform && !native) {
       const p = await run(ld64, ['-arch', t.startsWith('x86_64') ? 'x86_64' : 'arm64', '-platform_version', 'macos', '11.0', '11.0', '-dylib',
         '-install_name', '@rpath/libdy.dylib', '-undefined', 'dynamic_lookup', '-o', path.join(work, 'libdy.dylib'), ...dos], 'ld64.lld -dylib');
       if (p) return p;
+      if (process.platform === 'darwin') spawnSync('codesign', ['-s', '-', '-f', path.join(work, 'libdy.dylib')]);
       libFlags.push('-ldy');
     }
     if (win) {
@@ -4065,12 +4075,15 @@ if (!skipPlatform && !native) {
       if (!fs.readFileSync(out).includes(Buffer.from(n.trim() + '\0'))) return `the program does not load ${n.trim()}`;
     }
     const wenv = { ...process.env, WINEDEBUG: process.env.WINEDEBUG || '-all' };
+    const menv = { ...process.env, DYLD_LIBRARY_PATH: work };
     const runs = t === 'x86_64-windows' && wine && !buildOnly;
-    if (runs) {
-      const r = await spawnAsync(wine, [out], { encoding: 'utf8', timeout: runTimeout, env: wenv, cwd: work });
+    const runsMac = process.platform === 'darwin' && !buildOnly && ((t === 'aarch64-macos' && process.arch === 'arm64') || (t === 'x86_64-macos' && process.arch === 'x64'));
+    if (runs || runsMac) {
+      const r = runs ? await spawnAsync(wine, [out], { encoding: 'utf8', timeout: runTimeout, env: wenv, cwd: work })
+        : await spawnAsync(out, [], { encoding: 'utf8', timeout: runTimeout, env: menv, cwd: work });
       const got = r.stdout.split('\n').map((l) => l.replace(/\r$/, ''));
       if (got[got.length - 1] === '') got.pop();
-      if (r.status !== status) return { problem: `exit status ${r.status}, expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
+      if (r.status !== status) return { problem: `exit status ${r.status} (${r.signal || 'no signal'}), expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
       if (want !== got.join('\n')) return { problem: `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
     }
     // this compiler's objects, linked by the system's linker
@@ -4094,9 +4107,18 @@ if (!skipPlatform && !native) {
           if (x.status !== 0 || want2 !== got.join('\n')) return { problem: `the system linker's program: exit status ${x.status}\n--- expected\n${want2}\n--- got\n${got.join('\n')}`, stderr: x.stderr };
         }
       } else {
-        const p = await run(ld64, ['-arch', t.startsWith('x86_64') ? 'x86_64' : 'arm64', '-platform_version', 'macos', '11.0', '11.0', '-undefined', 'dynamic_lookup',
+        const sysLibs = macSdk ? ['-syslibroot', macSdk, '-lSystem'] : ['-undefined', 'dynamic_lookup'];
+        const p = await run(ld64, ['-arch', t.startsWith('x86_64') ? 'x86_64' : 'arm64', '-platform_version', 'macos', '11.0', '11.0', ...sysLibs,
           '-o', out2, r.o, ...ours, ...(ourlib.length ? [ourlibPath] : [])], 'ld64.lld');
         if (p) return p;
+        if (runsMac) {
+          spawnSync('codesign', ['-s', '-', '-f', out2]);
+          const x = await spawnAsync(out2, [], { encoding: 'utf8', timeout: runTimeout, env: menv, cwd: work });
+          const got = x.stdout.split('\n').map((l) => l.replace(/\r$/, ''));
+          if (got[got.length - 1] === '') got.pop();
+          const want2 = dv('cc-expect').join('\n');
+          if (x.status !== 0 || want2 !== got.join('\n')) return { problem: `the system linker's program: exit status ${x.status} (${x.signal || 'no signal'})\n--- expected\n${want2}\n--- got\n${got.join('\n')}`, stderr: x.stderr };
+        }
       }
     }
     return null;

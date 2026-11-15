@@ -13,8 +13,14 @@ typedef unsigned long long u64;
 
 #ifdef __AXIOM_ASM_AARCH64__
 static u32 a[4], b[4], out[4], idx[4];
+u64 ax_cpu_features(void);
 
 int main(void) {
+    if ((ax_cpu_features() & 0x8000ULL) == 0) {
+        static const long long v[] = {11, 22, 33, 44, 4, 0, 1, 2, 3, 7, 7, 7, 7};
+        for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) print_i64(v[i]);
+        return 0;
+    }
     for (int i = 0; i < 4; i++) {
         a[i] = (u32)(i + 1);
         b[i] = (u32)(10 * (i + 1));

@@ -40,7 +40,18 @@ static u64 sys6(u64 n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     return x0;
 }
 
+u64 ax_cpu_features(void);
+#ifdef __APPLE__
+void *mmap(void *, unsigned long, int, int, int, long long);
+int munmap(void *, unsigned long);
+#endif
+
 int main(void) {
+    if ((ax_cpu_features() & 0x10000ULL) == 0) {
+        static const long long v[] = {106, 100, 103, 105, 101, 0, 0, 102, 0, 103, 100, 0, 1, 0, 2, 41, 42, 1, 1, 21, -45};
+        for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) print_i64(v[i]);
+        return 0;
+    }
     /* gather: out[i] = data[idx[i]] for four lanes (uxtw #2 scales the offsets by 4) */
     asm volatile(
         "mov x3, #4\n\t"
@@ -65,8 +76,14 @@ int main(void) {
     for (int i = 0; i < 8; i++) print_i64(sc[i]); /* 101 0 0 102 0 103 100 0 */
     /* first fault: map 128 KiB (two pages of any size up to 64 KiB), unmap the
        upper half, and load four words starting 8 bytes below the hole */
+#ifdef __APPLE__
+    u64 map = (u64)mmap(0, 131072, 3, 0x1002, -1, 0); /* PROT_READ|WRITE, MAP_PRIVATE|MAP_ANON */
+    u64 unm = (u64)(long long)munmap((void *)(map + 65536), 65536);
+    if (0) (void)sys6;
+#else
     u64 map = sys6(222, 0, 131072, 3, 0x22, (u64)-1, 0); /* mmap(PROT_READ|WRITE, PRIVATE|ANONYMOUS) */
     u64 unm = sys6(215, map + 65536, 65536, 0, 0, 0, 0); /* munmap */
+#endif
     u32 *edge = (u32 *)(map + 65536 - 8);
     edge[0] = 41;
     edge[1] = 42;

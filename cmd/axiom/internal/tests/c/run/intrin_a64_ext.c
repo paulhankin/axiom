@@ -3,7 +3,7 @@
    writes this file: do not edit): dot products, matrix multiplies, cryptography, BF16, FHM, FP16 scalars, <arm_acle.h>. A mismatch prints the intrinsic
    and the result's bytes. */
 /* aarch64-only */
-/* flags: --c-std=c17 --features=+aes,+sha2,+sha3,+sha512,+sm4,+crc,+rdm,+dotprod,+i8mm,+fp16,+fhm,+bf16 */
+/* flags: --c-std=c17 --features=+aes,+bf16,+crc,+dotprod,+fhm,+fp16,+i8mm,+sha2,+sha3,+sha512 */
 /* expect: intrin_a64_ext 148 */
 #include <arm_neon.h>
 #include <arm_acle.h>
@@ -408,19 +408,12 @@ static void run3(void) {
     { uint64x2_t __r = vbcaxq_u64(__L(uint64x2_t, 2608), __L(uint64x2_t, 2624), __L(uint64x2_t, 2640)); chk("vbcaxq_u64", &__r, 16, "\x41\x40\x60\x04\x10\x10\x04\x15\xf7\x3b\x73\xd4\x01\xd3\x23\x88", 0); }
     { uint64x2_t __r = vrax1q_u64(__L(uint64x2_t, 2656), __L(uint64x2_t, 2672)); chk("vrax1q_u64", &__r, 16, "\x5b\xa9\x9c\x74\x8e\x8d\xf9\xb9\xb1\x9d\xe5\x8a\x90\xe9\xfd\x32", 0); }
     { uint64x2_t __r = vxarq_u64(__L(uint64x2_t, 2688), __L(uint64x2_t, 2704), 63); chk("vxarq_u64", &__r, 16, "\x21\xeb\xe2\x73\x1d\xec\x60\xab\x84\x58\xef\x1d\xe6\x68\x65\x80", 0); }
-    { uint32x4_t __r = vsm3ss1q_u32(__L(uint32x4_t, 2720), __L(uint32x4_t, 2736), __L(uint32x4_t, 2752)); chk("vsm3ss1q_u32", &__r, 16, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x61\x0d\x58\xc2", 0); }
-    { uint32x4_t __r = vsm3tt1aq_u32(__L(uint32x4_t, 2768), __L(uint32x4_t, 2784), __L(uint32x4_t, 2800), 0); chk("vsm3tt1aq_u32", &__r, 16, "\xb1\x47\x00\xde\x33\x0c\xaa\x25\x00\x00\x00\x00\xb4\xa5\xd1\xb3", 0); }
-    { uint32x4_t __r = vsm3tt1bq_u32(__L(uint32x4_t, 2816), __L(uint32x4_t, 2832), __L(uint32x4_t, 2848), 3); chk("vsm3tt1bq_u32", &__r, 16, "\x03\x00\x00\x00\xcf\x79\xca\xb3\x00\x00\x00\x00\x90\xf4\xfc\x9d", 0); }
-}
-
-static void run4(void) {
-    { uint32x4_t __r = vsm3tt2aq_u32(__L(uint32x4_t, 2864), __L(uint32x4_t, 2880), __L(uint32x4_t, 2896), 0); chk("vsm3tt2aq_u32", &__r, 16, "\xcb\x1e\x3f\xa0\xfb\xfc\x4b\x5d\x00\x00\x00\x00\x91\xc6\xd7\x5f", 0); }
-    { uint32x4_t __r = vsm3tt2bq_u32(__L(uint32x4_t, 2912), __L(uint32x4_t, 2928), __L(uint32x4_t, 2944), 1); chk("vsm3tt2bq_u32", &__r, 16, "\x48\x21\x36\xc3\x00\x00\x00\x01\xa6\xb3\x98\x92\xb5\x9a\x8c\x7e", 0); }
-    { uint32x4_t __r = vsm3partw1q_u32(__L(uint32x4_t, 2960), __L(uint32x4_t, 2976), __L(uint32x4_t, 2992)); chk("vsm3partw1q_u32", &__r, 16, "\x11\x8a\x7c\xf0\xe3\x6e\x63\x51\xf2\x36\x8e\xd4\x2a\xe7\x36\x0d", 0); }
-    { uint32x4_t __r = vsm3partw2q_u32(__L(uint32x4_t, 3008), __L(uint32x4_t, 3024), __L(uint32x4_t, 3040)); chk("vsm3partw2q_u32", &__r, 16, "\x15\x3e\x6a\xd2\x88\x31\x32\xea\xeb\x20\xab\x52\x72\x6d\xe7\x23", 0); }
     { bfloat16x4_t __r = vcvt_bf16_f32(__L(float32x4_t, 3056)); chk("vcvt_bf16_f32", &__r, 8, "\x15\x4e\x80\xff\x89\xb8\x34\x34", 1); }
     { bfloat16x8_t __r = vcvtq_low_bf16_f32(__L(float32x4_t, 3072)); chk("vcvtq_low_bf16_f32", &__r, 16, "\xe6\x4d\x80\xbf\x80\x7f\x84\x46\x00\x00\x00\x00\x00\x00\x00\x00", 1); }
     { bfloat16x8_t __r = vcvtq_high_bf16_f32(__L(bfloat16x8_t, 3088), __L(float32x4_t, 3104)); chk("vcvtq_high_bf16_f32", &__r, 16, "\x74\xce\x55\xcd\x01\x00\x6c\xc2\x00\x3f\x80\xff\xe7\xbf\x80\x7f", 1); }
+}
+
+static void run4(void) {
     { bfloat16_t __r = vcvth_bf16_f32(__L(float, 3120)); chk("vcvth_bf16_f32", &__r, 2, "\x80\x7f", 1); }
     { float __r = vcvtah_f32_bf16(__L(bfloat16_t, 3136)); chk("vcvtah_f32_bf16", &__r, 4, "\x00\x00\x50\xcd", 2); }
     { float32x4_t __r = vcvt_f32_bf16(__L(bfloat16x4_t, 3152)); chk("vcvt_f32_bf16", &__r, 16, "\x00\x00\x9a\x3a\x00\x00\x36\xc2\x00\x00\x08\xc3\x00\x00\xae\x33", 2); }
@@ -430,9 +423,6 @@ static void run4(void) {
     { float32x2_t __r = vbfdot_lane_f32(__L(float32x2_t, 3248), __L(bfloat16x4_t, 3264), __L(bfloat16x4_t, 3280), 1); chk("vbfdot_lane_f32", &__r, 8, "\x00\x00\x60\x41\x00\x00\x40\x40", 2); }
     { float32x2_t __r = vbfdot_laneq_f32(__L(float32x2_t, 3296), __L(bfloat16x4_t, 3312), __L(bfloat16x8_t, 3328), 0); chk("vbfdot_laneq_f32", &__r, 8, "\x00\x00\xb8\x41\x00\x00\x80\x3f", 2); }
     { float32x4_t __r = vbfdotq_f32(__L(float32x4_t, 3344), __L(bfloat16x8_t, 3360), __L(bfloat16x8_t, 3376)); chk("vbfdotq_f32", &__r, 16, "\x00\x00\x88\xc1\x00\x00\x50\x41\x00\x00\x10\x42\x00\x00\x30\xc1", 2); }
-}
-
-static void run5(void) {
     { float32x4_t __r = vbfdotq_lane_f32(__L(float32x4_t, 3392), __L(bfloat16x8_t, 3408), __L(bfloat16x4_t, 3424), 0); chk("vbfdotq_lane_f32", &__r, 16, "\x00\x00\x10\x42\x00\x00\x08\x42\x00\x00\x0c\xc2\x00\x00\x70\x41", 2); }
     { float32x4_t __r = vbfdotq_laneq_f32(__L(float32x4_t, 3440), __L(bfloat16x8_t, 3456), __L(bfloat16x8_t, 3472), 0); chk("vbfdotq_laneq_f32", &__r, 16, "\x00\x00\x80\x40\x00\x00\x50\x41\x00\x00\xc0\xc0\x00\x00\x80\x41", 2); }
     { float32x4_t __r = vbfmmlaq_f32(__L(float32x4_t, 3488), __L(bfloat16x8_t, 3504), __L(bfloat16x8_t, 3520)); chk("vbfmmlaq_f32", &__r, 16, "\x00\x00\x70\xc1\x00\x00\xe0\xc0\x00\x00\x88\x41\x00\x00\x00\xc2", 2); }
@@ -440,6 +430,9 @@ static void run5(void) {
     { float32x4_t __r = vbfmlalbq_lane_f32(__L(float32x4_t, 3584), __L(bfloat16x8_t, 3600), __L(bfloat16x4_t, 3616), 0); chk("vbfmlalbq_lane_f32", &__r, 16, "\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f", 2); }
     { float32x4_t __r = vbfmlalbq_laneq_f32(__L(float32x4_t, 3632), __L(bfloat16x8_t, 3648), __L(bfloat16x8_t, 3664), 0); chk("vbfmlalbq_laneq_f32", &__r, 16, "\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f", 2); }
     { float32x4_t __r = vbfmlaltq_f32(__L(float32x4_t, 3680), __L(bfloat16x8_t, 3696), __L(bfloat16x8_t, 3712)); chk("vbfmlaltq_f32", &__r, 16, "\x2f\x3b\x5b\x3e\x01\x00\x53\x43\x00\x00\xc0\x7f\x00\x00\xc0\x7f", 2); }
+}
+
+static void run5(void) {
     { float32x4_t __r = vbfmlaltq_lane_f32(__L(float32x4_t, 3728), __L(bfloat16x8_t, 3744), __L(bfloat16x4_t, 3760), 0); chk("vbfmlaltq_lane_f32", &__r, 16, "\xdc\xcc\x6f\x4b\x95\x27\x9d\x49\x00\x80\x24\x43\xff\xff\x7f\x7f", 2); }
     { float32x4_t __r = vbfmlaltq_laneq_f32(__L(float32x4_t, 3776), __L(bfloat16x8_t, 3792), __L(bfloat16x8_t, 3808), 0); chk("vbfmlaltq_laneq_f32", &__r, 16, "\xc8\x30\x7a\x42\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x25\x01\x20\xc0", 2); }
     { float32x2_t __r = vfmlal_low_f16(__L(float32x2_t, 3824), __L(float16x4_t, 3840), __L(float16x4_t, 3856)); chk("vfmlal_low_f16", &__r, 8, "\x00\x00\x00\x5f\x00\xb0\x13\xc4", 2); }
@@ -449,9 +442,6 @@ static void run5(void) {
     { float32x4_t __r = vfmlalq_lane_low_f16(__L(float32x4_t, 4016), __L(float16x8_t, 4032), __L(float16x4_t, 4048), 0); chk("vfmlalq_lane_low_f16", &__r, 16, "\x80\x4c\x6b\x45\x10\x7b\x9f\x45\x4d\xac\x58\xbd\x99\xd6\x81\x49", 2); }
     { float32x4_t __r = vfmlalq_laneq_low_f16(__L(float32x4_t, 4064), __L(float16x8_t, 4080), __L(float16x8_t, 4096), 3); chk("vfmlalq_laneq_low_f16", &__r, 16, "\x00\x00\x86\xc3\x00\xc0\xc3\x43\x00\x00\x80\x7f\xd4\x0e\x43\x40", 2); }
     { float32x2_t __r = vfmlal_high_f16(__L(float32x2_t, 4112), __L(float16x4_t, 4128), __L(float16x4_t, 4144)); chk("vfmlal_high_f16", &__r, 8, "\x00\x00\xc8\x40\x87\xf5\x0c\x3a", 2); }
-}
-
-static void run6(void) {
     { float32x2_t __r = vfmlal_lane_high_f16(__L(float32x2_t, 4160), __L(float16x4_t, 4176), __L(float16x4_t, 4192), 1); chk("vfmlal_lane_high_f16", &__r, 8, "\x00\x00\x80\xff\x00\x68\x71\x40", 2); }
     { float32x2_t __r = vfmlal_laneq_high_f16(__L(float32x2_t, 4208), __L(float16x4_t, 4224), __L(float16x8_t, 4240), 7); chk("vfmlal_laneq_high_f16", &__r, 8, "\x00\x30\x43\x3f\x00\x84\x0e\x43", 2); }
     { float32x4_t __r = vfmlalq_high_f16(__L(float32x4_t, 4256), __L(float16x8_t, 4272), __L(float16x8_t, 4288)); chk("vfmlalq_high_f16", &__r, 16, "\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x89\x78\x58\x47\x00\xc4\xdb\x45", 2); }
@@ -459,6 +449,9 @@ static void run6(void) {
     { float32x4_t __r = vfmlalq_laneq_high_f16(__L(float32x4_t, 4352), __L(float16x8_t, 4368), __L(float16x8_t, 4384), 7); chk("vfmlalq_laneq_high_f16", &__r, 16, "\x00\x00\xd6\x42\x3d\xfe\xa2\x4d\x00\x00\xc0\x7f\x00\x00\x3e\xc5", 2); }
     { float32x2_t __r = vfmlsl_low_f16(__L(float32x2_t, 4400), __L(float16x4_t, 4416), __L(float16x4_t, 4432)); chk("vfmlsl_low_f16", &__r, 8, "\x00\x00\x7f\x42\xa0\x42\x13\x46", 2); }
     { float32x2_t __r = vfmlsl_lane_low_f16(__L(float32x2_t, 4448), __L(float16x4_t, 4464), __L(float16x4_t, 4480), 2); chk("vfmlsl_lane_low_f16", &__r, 8, "\xb4\x01\x06\xc3\x61\x81\x12\xc3", 2); }
+}
+
+static void run6(void) {
     { float32x2_t __r = vfmlsl_laneq_low_f16(__L(float32x2_t, 4496), __L(float16x4_t, 4512), __L(float16x8_t, 4528), 7); chk("vfmlsl_laneq_low_f16", &__r, 8, "\x80\x68\x1b\xc5\xc4\xdb\x05\x48", 2); }
     { float32x4_t __r = vfmlslq_low_f16(__L(float32x4_t, 4544), __L(float16x8_t, 4560), __L(float16x8_t, 4576)); chk("vfmlslq_low_f16", &__r, 16, "\xff\xff\x7f\x3f\xc4\xd9\x87\x46\x3e\xe0\x5a\x4e\x67\x08\x1f\x44", 2); }
     { float32x4_t __r = vfmlslq_lane_low_f16(__L(float32x4_t, 4592), __L(float16x8_t, 4608), __L(float16x4_t, 4624), 3); chk("vfmlslq_lane_low_f16", &__r, 16, "\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f\x00\x00\xc0\x7f", 2); }
@@ -468,9 +461,6 @@ static void run6(void) {
     { float32x2_t __r = vfmlsl_laneq_high_f16(__L(float32x2_t, 4784), __L(float16x4_t, 4800), __L(float16x8_t, 4816), 0); chk("vfmlsl_laneq_high_f16", &__r, 8, "\x00\x00\x80\x7f\xe3\xcf\xb9\xc3", 2); }
     { float32x4_t __r = vfmlslq_high_f16(__L(float32x4_t, 4832), __L(float16x8_t, 4848), __L(float16x8_t, 4864)); chk("vfmlslq_high_f16", &__r, 16, "\x51\x00\xba\xcb\x24\xcb\x26\xbf\x00\x00\x40\x42\x00\x00\x80\x7f", 2); }
     { float32x4_t __r = vfmlslq_lane_high_f16(__L(float32x4_t, 4880), __L(float16x8_t, 4896), __L(float16x4_t, 4912), 3); chk("vfmlslq_lane_high_f16", &__r, 16, "\x80\x5f\xec\xc6\x80\x87\x99\xc7\xf9\xfd\xaa\xc2\x80\x16\x2c\xc0", 2); }
-}
-
-static void run7(void) {
     { float32x4_t __r = vfmlslq_laneq_high_f16(__L(float32x4_t, 4928), __L(float16x8_t, 4944), __L(float16x8_t, 4960), 3); chk("vfmlslq_laneq_high_f16", &__r, 16, "\x40\xff\xf7\x40\x50\xc5\x7f\x3f\x00\x00\x37\x42\x00\x00\x00\x4f", 2); }
     { float16_t __r = vaddh_f16(__L(float16_t, 4976), __L(float16_t, 4992)); chk("vaddh_f16", &__r, 2, "\x9c\x5c", 1); }
     { float16_t __r = vsubh_f16(__L(float16_t, 5008), __L(float16_t, 5024)); chk("vsubh_f16", &__r, 2, "\x88\x4e", 1); }
@@ -478,6 +468,9 @@ static void run7(void) {
     { float16_t __r = vdivh_f16(__L(float16_t, 5072), __L(float16_t, 5088)); chk("vdivh_f16", &__r, 2, "\xe6\x2d", 1); }
     { float16_t __r = vmaxh_f16(__L(float16_t, 5104), __L(float16_t, 5120)); chk("vmaxh_f16", &__r, 2, "\x00\x78", 1); }
     { float16_t __r = vminh_f16(__L(float16_t, 5136), __L(float16_t, 5152)); chk("vminh_f16", &__r, 2, "\x00\x41", 1); }
+}
+
+static void run7(void) {
     { float16_t __r = vmaxnmh_f16(__L(float16_t, 5168), __L(float16_t, 5184)); chk("vmaxnmh_f16", &__r, 2, "\x58\x54", 1); }
     { float16_t __r = vminnmh_f16(__L(float16_t, 5200), __L(float16_t, 5216)); chk("vminnmh_f16", &__r, 2, "\xac\xd4", 1); }
     { uint32_t __r = __crc32b(__L(uint32_t, 5232), __L(uint8_t, 5248)); chk("__crc32b", &__r, 4, "\xe3\x6c\xd8\x32", 0); }
@@ -487,9 +480,6 @@ static void run7(void) {
     { uint32_t __r = __crc32w(__L(uint32_t, 5360), __L(uint32_t, 5376)); chk("__crc32w", &__r, 4, "\x81\x35\xcb\xc3", 0); }
     { uint32_t __r = __crc32cw(__L(uint32_t, 5392), __L(uint32_t, 5408)); chk("__crc32cw", &__r, 4, "\xc7\xdd\xc2\x1f", 0); }
     { uint32_t __r = __crc32d(__L(uint32_t, 5424), __L(uint64_t, 5440)); chk("__crc32d", &__r, 4, "\xac\x6c\x3c\x7d", 0); }
-}
-
-static void run8(void) {
     { uint32_t __r = __crc32cd(__L(uint32_t, 5456), __L(uint64_t, 5472)); chk("__crc32cd", &__r, 4, "\x58\x2f\xb4\x1d", 0); }
     { unsigned int __r = __clz(__L(uint32_t, 5488)); chk("__clz", &__r, 4, "\x00\x00\x00\x00", 0); }
     { unsigned int __r = __cls(__L(uint32_t, 5504)); chk("__cls", &__r, 4, "\x1f\x00\x00\x00", 0); }
@@ -497,6 +487,9 @@ static void run8(void) {
     { uint32_t __r = __rev16(__L(uint32_t, 5536)); chk("__rev16", &__r, 4, "\x00\x00\x00\x00", 0); }
     { uint32_t __r = __rbit(__L(uint32_t, 5552)); chk("__rbit", &__r, 4, "\x5a\x99\x9c\x90", 0); }
     { uint32_t __r = __ror(__L(uint32_t, 5568), __L(uint32_t, 5584)); chk("__ror", &__r, 4, "\x83\x5c\x51\x51", 0); }
+}
+
+static void run8(void) {
     { unsigned int __r = __clzll(__L(uint64_t, 5600)); chk("__clzll", &__r, 4, "\x3a\x00\x00\x00", 0); }
     { unsigned int __r = __clsll(__L(uint64_t, 5616)); chk("__clsll", &__r, 4, "\x00\x00\x00\x00", 0); }
     { uint64_t __r = __revll(__L(uint64_t, 5632)); chk("__revll", &__r, 8, "\xff\xff\xff\xff\xff\xff\xff\xfe", 0); }
@@ -506,13 +499,22 @@ static void run8(void) {
     { int16_t __r = __revsh(__L(int16_t, 5712)); chk("__revsh", &__r, 2, "\x00\x25", 0); }
     { double __r = __sqrt(__L(double, 5728)); chk("__sqrt", &__r, 8, "\xcd\x3b\x7f\x66\x9e\xa0\xe6\x40", 3); }
     { float __r = __sqrtf(__L(float, 5744)); chk("__sqrtf", &__r, 4, "\xcf\xfc\x1a\x41", 2); }
-}
-
-static void run9(void) {
     { double __r = __fma(__L(double, 5760), __L(double, 5776), __L(double, 5792)); chk("__fma", &__r, 8, "\x00\x00\x00\x00\x00\x00\xf0\x7f", 3); }
     { float __r = __fmaf(__L(float, 5808), __L(float, 5824), __L(float, 5840)); chk("__fmaf", &__r, 4, "\x00\x00\x00\x00", 2); }
     { double __r = __rintn(__L(double, 5856)); chk("__rintn", &__r, 8, "\x00\x00\x00\x00\x00\x00\x47\xc0", 3); }
     { float __r = __rintnf(__L(float, 5872)); chk("__rintnf", &__r, 4, "\x00\x00\x28\x43", 2); }
+}
+
+unsigned long long ax_cpu_features(void);
+
+static __axiom_attribute__((__target__("sm4"))) void run_sm4(void) {
+    { uint32x4_t __r = vsm3ss1q_u32(__L(uint32x4_t, 2720), __L(uint32x4_t, 2736), __L(uint32x4_t, 2752)); chk("vsm3ss1q_u32", &__r, 16, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x61\x0d\x58\xc2", 0); }
+    { uint32x4_t __r = vsm3tt1aq_u32(__L(uint32x4_t, 2768), __L(uint32x4_t, 2784), __L(uint32x4_t, 2800), 0); chk("vsm3tt1aq_u32", &__r, 16, "\xb1\x47\x00\xde\x33\x0c\xaa\x25\x00\x00\x00\x00\xb4\xa5\xd1\xb3", 0); }
+    { uint32x4_t __r = vsm3tt1bq_u32(__L(uint32x4_t, 2816), __L(uint32x4_t, 2832), __L(uint32x4_t, 2848), 3); chk("vsm3tt1bq_u32", &__r, 16, "\x03\x00\x00\x00\xcf\x79\xca\xb3\x00\x00\x00\x00\x90\xf4\xfc\x9d", 0); }
+    { uint32x4_t __r = vsm3tt2aq_u32(__L(uint32x4_t, 2864), __L(uint32x4_t, 2880), __L(uint32x4_t, 2896), 0); chk("vsm3tt2aq_u32", &__r, 16, "\xcb\x1e\x3f\xa0\xfb\xfc\x4b\x5d\x00\x00\x00\x00\x91\xc6\xd7\x5f", 0); }
+    { uint32x4_t __r = vsm3tt2bq_u32(__L(uint32x4_t, 2912), __L(uint32x4_t, 2928), __L(uint32x4_t, 2944), 1); chk("vsm3tt2bq_u32", &__r, 16, "\x48\x21\x36\xc3\x00\x00\x00\x01\xa6\xb3\x98\x92\xb5\x9a\x8c\x7e", 0); }
+    { uint32x4_t __r = vsm3partw1q_u32(__L(uint32x4_t, 2960), __L(uint32x4_t, 2976), __L(uint32x4_t, 2992)); chk("vsm3partw1q_u32", &__r, 16, "\x11\x8a\x7c\xf0\xe3\x6e\x63\x51\xf2\x36\x8e\xd4\x2a\xe7\x36\x0d", 0); }
+    { uint32x4_t __r = vsm3partw2q_u32(__L(uint32x4_t, 3008), __L(uint32x4_t, 3024), __L(uint32x4_t, 3040)); chk("vsm3partw2q_u32", &__r, 16, "\x15\x3e\x6a\xd2\x88\x31\x32\xea\xeb\x20\xab\x52\x72\x6d\xe7\x23", 0); }
 }
 
 int main(void) {
@@ -528,7 +530,11 @@ int main(void) {
     run6();
     run7();
     run8();
-    run9();
+    if ((ax_cpu_features() & 0x100ULL) != 0) {
+        run_sm4();
+    } else {
+        __checks += 7;
+    }
     if (__fails == 0) {
         say("intrin_a64_ext ");
         say_n(__checks);

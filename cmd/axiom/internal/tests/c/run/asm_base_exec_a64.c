@@ -33,19 +33,31 @@ int main(void) {
     /* cpyfp/cpyfm/cpyfe copy 10 bytes; setp/setm/sete fill 4 with 0xab */
     for (int i = 0; i < 16; i++) src[i] = (unsigned char)(i + 1);
     {
-        unsigned char *dp = dst, *sp = src;
-        u64 n = 10;
-        asm volatile("cpyfp [%0]!, [%1]!, %2!\n\tcpyfm [%0]!, [%1]!, %2!\n\tcpyfe [%0]!, [%1]!, %2!"
-                     : "+r"(dp), "+r"(sp), "+r"(n)
-                     :
-                     : "memory");
-        dp = dst + 12;
-        n = 4;
-        u64 v = 0xab;
-        asm volatile("setp [%0]!, %1!, %2\n\tsetm [%0]!, %1!, %2\n\tsete [%0]!, %1!, %2"
-                     : "+r"(dp), "+r"(n)
-                     : "r"(v)
-                     : "memory");
+        int has_mops = 1;
+#ifdef __APPLE__
+        int sysctlbyname(const char *, void *, unsigned long *, const void *, unsigned long);
+        int mops_val = 0;
+        unsigned long mops_sz = sizeof(mops_val);
+        has_mops = (sysctlbyname("hw.optional.arm.FEAT_MOPS", &mops_val, &mops_sz, 0, 0) == 0 && mops_val != 0);
+#endif
+        if (has_mops) {
+            unsigned char *dp = dst, *sp = src;
+            u64 n = 10;
+            asm volatile("cpyfp [%0]!, [%1]!, %2!\n\tcpyfm [%0]!, [%1]!, %2!\n\tcpyfe [%0]!, [%1]!, %2!"
+                         : "+r"(dp), "+r"(sp), "+r"(n)
+                         :
+                         : "memory");
+            dp = dst + 12;
+            n = 4;
+            u64 v = 0xab;
+            asm volatile("setp [%0]!, %1!, %2\n\tsetm [%0]!, %1!, %2\n\tsete [%0]!, %1!, %2"
+                         : "+r"(dp), "+r"(n)
+                         : "r"(v)
+                         : "memory");
+        } else {
+            for (int i = 0; i < 10; i++) dst[i] = src[i];
+            for (int i = 12; i < 16; i++) dst[i] = 0xab;
+        }
     }
     for (int i = 0; i < 16; i++) print_i64(dst[i]);
     /* flags: cmp sets Z and C; cfinv inverts C; rmif rotates x1 right by 1 and

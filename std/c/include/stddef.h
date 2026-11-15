@@ -1,5 +1,36 @@
 /* stddef.h - common definitions (C89 7.1.6, C99 7.17, C11 7.19, C23 7.21),
    for the Axiom compiler's C front end. */
+#if defined(__need_ptrdiff_t) || defined(__need_size_t) || defined(__need_wchar_t) || defined(__need_NULL) || defined(__need_wint_t)
+#ifdef __need_ptrdiff_t
+#undef __need_ptrdiff_t
+#ifndef __AXIOM_PTRDIFF_T_DEFINED
+#define __AXIOM_PTRDIFF_T_DEFINED
+typedef __AXIOM_PTRDIFF_TYPE__ ptrdiff_t;
+#endif
+#endif
+#ifdef __need_size_t
+#undef __need_size_t
+#define __AXIOM_WANT_SIZE_T
+#include <axc/types.h>
+#endif
+#ifdef __need_wchar_t
+#undef __need_wchar_t
+#define __AXIOM_WANT_WCHAR_T
+#include <axc/types.h>
+#endif
+#ifdef __need_wint_t
+#undef __need_wint_t
+#define __AXIOM_WANT_WINT_T
+#include <axc/types.h>
+#endif
+#ifdef __need_NULL
+#undef __need_NULL
+#ifdef __AXIOM_GNU__
+#undef NULL
+#endif
+#define NULL ((void *)0)
+#endif
+#else
 /* (Annex K: whether its names are asked for, K.3.1.1) */
 #include <axc/ext1.h>
 #ifndef __AXIOM_STDDEF_H
@@ -14,7 +45,10 @@
 #define __AXIOM_WANT_SIZE_T
 #define __AXIOM_WANT_WCHAR_T
 #include <axc/types.h>
+#ifndef __AXIOM_PTRDIFF_T_DEFINED
+#define __AXIOM_PTRDIFF_T_DEFINED
 typedef __AXIOM_PTRDIFF_TYPE__ ptrdiff_t;
+#endif
 #if __AXC_EXT1
 /* rsize_t (K.3.3) */
 #define __AXIOM_WANT_SIZE_T
@@ -47,4 +81,5 @@ typedef typeof(nullptr) nullptr_t;
 #define NULL ((void *)0)
 #define offsetof(type, member) __builtin_offsetof(type, member)
 
+#endif
 #endif

@@ -380,6 +380,19 @@ pub fn mark_func(f: *mut ir.Func, p: *abi.Plan) void {
 // Symbols
 // -----------------------------------------------------------------------------
 
+let DARWIN_INODE64: [16][]u8 = ["stat", "lstat", "fstat", "fstatat", "statfs", "fstatfs", "getfsstat", "opendir",
+                                "fdopendir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir", "scandir",
+                                "alphasort"];
+
+fn is_darwin_inode64(n: []u8) bool {
+    for f in DARWIN_INODE64 {
+        if u.str_eq(f, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The symbol name of an entity: its own with external linkage (main's is
 // MAIN_SYMBOL), else made unique.
 pub fn symbol_name(s: *cast.CSym) []u8 {
@@ -388,6 +401,24 @@ pub fn symbol_name(s: *cast.CSym) []u8 {
             return MAIN_SYMBOL;
         }
         if s.asm_name.len > 0 {
+            if tg.is_darwin() {
+                // On Darwin __USER_LABEL_PREFIX__ is "_", so system headers
+                // write asm("_fopen") or asm("_fopen$DARWIN_EXTSN"). Strip a
+                // plain leading '_' so it matches unsuffixed C declarations,
+                // mark suffixed "_foo$..." names with '\x01' so macho.ax and
+                // mlink.ax emit them verbatim, and leave unprefixed names to
+                // normal Mach-O '_' mangling.
+                if s.asm_name[0] == 1 {
+                    return s.asm_name;
+                }
+                if (s.asm_name.len > 1) and (s.asm_name[0] == '_') {
+                    if (u.find(s.asm_name, '$') < 0) and
+                       not ((tg.g_arch == tg.ARCH_X64) and is_darwin_inode64(s.asm_name[1..])) {
+                        return s.asm_name[1..];
+                    }
+                    return u.cat2("\x01", s.asm_name);
+                }
+            }
             return s.asm_name;  // (a GNU dialect's asm label)
         }
         return s.name;
@@ -595,6 +626,11 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
         }
         if n.section.len > 0 {
             g.section = u.perm_dup(n.section);  // (the syntax tree is given back before code generation)
+            if u.starts(n.section, ".init_array") or u.starts(n.section, ".fini_array") or
+               u.starts(n.section, ".preinit_array") or u.contains(n.section, "__mod_init_func") or
+               u.contains(n.section, "__mod_term_func") {
+                g_init_arrays = true;
+            }
         }
         g.visibility = @truncate(u8, @bit_cast(u32, n.visibility));  // (for the object writers)
         if n.used and s.defined {

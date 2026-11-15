@@ -7,6 +7,7 @@
 // targets: x86_64-macos aarch64-macos
 // sys-flags: -fexceptions
 // flags: -lc++
+// expect: 0 2 10
 #include <stdio.h>
 
 int sys_cleanup(int *);

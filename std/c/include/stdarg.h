@@ -1,5 +1,12 @@
 /* stdarg.h - variable arguments (C89 7.8, C99 7.15, C11 7.16, C23 7.16),
    for the Axiom compiler's C front end. */
+#ifdef __need_va_list
+#undef __need_va_list
+#ifndef __AXIOM_VA_LIST_DEFINED
+#define __AXIOM_VA_LIST_DEFINED
+typedef __builtin_va_list va_list;
+#endif
+#else
 #ifndef __AXIOM_STDARG_H
 #define __AXIOM_STDARG_H
 
@@ -7,7 +14,10 @@
 #define __STDC_VERSION_STDARG_H__ 202311L
 #endif
 
+#ifndef __AXIOM_VA_LIST_DEFINED
+#define __AXIOM_VA_LIST_DEFINED
 typedef __builtin_va_list va_list;
+#endif
 #ifdef __AXIOM_SYSTEM_C_LIB__
 /* (--c-lib=system: the system C library's headers name the type so when
    they include this header for it) */
@@ -26,4 +36,5 @@ typedef __builtin_va_list __gnuc_va_list;
 #define va_copy(dest, src) __builtin_va_copy(dest, src)
 #endif
 
+#endif
 #endif

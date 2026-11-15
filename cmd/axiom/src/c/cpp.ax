@@ -46,6 +46,7 @@ const B_TIMESTAMP: i32 = 13;        // __TIMESTAMP__: the time the current file 
 // the same in every build
 const B_DATE: i32 = 14;
 const B_TIME: i32 = 15;
+const B_HAS_FEATURE: i32 = 16;  // __has_feature, __has_extension
 
 const MAX_INCLUDE_DEPTH: usize = 200;
 const MAX_ARG_DEPTH: i32 = 400;        // macro invocations nested in arguments
@@ -690,7 +691,7 @@ fn substitute(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, lo: usize, 
     let mut i = lo;
     while i < hi {
         let t = &body[i];
-        if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) and P.o.gnu and m.variadic and
+        if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) and (P.o.gnu or m.sys) and m.variadic and
            (body[i + 1].kind == lx.PK_PARAM) and (@int_cast(usize, body[i + 1].id) == (m.params.len - 1)) and
            lx.is_punct(out.at(out.len - 1), ct.P_COMMA) {
             // (a GNU dialect: `, ## __VA_ARGS__` is the comma and the
@@ -759,9 +760,9 @@ fn substitute(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, lo: usize, 
 fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
     let name = t.name;
     if u.str_eq(name, "defined") {
-        if t.exp and not P.o.gnu {
-            // (undefined, 6.10.1p4; a GNU dialect evaluates it, as the common
-            // compilers do: its operand is the tokens after it, not replaced)
+        if t.exp and not P.o.gnu and not t.sys and not in_system_header(P) {
+            // (undefined, 6.10.1p4; a GNU dialect or system header evaluates it,
+            // as the common compilers do: its operand is the tokens after it, not replaced)
             _ = dg.err(t.span, "C1044", "'defined' made by macro replacement in a #if expression");
         }
         let mut n = raw_next(P);
@@ -789,7 +790,8 @@ fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
     let m = lookup(P, name);
     if u.isnil(m) or
        ((m.builtin != B_HAS_INCLUDE) and (m.builtin != B_HAS_EMBED) and (m.builtin != B_HAS_ATTR) and
-        (m.builtin != B_HAS_GNU_ATTR) and (m.builtin != B_HAS_BUILTIN) and (m.builtin != B_HAS_INCLUDE_NEXT)) {
+        (m.builtin != B_HAS_GNU_ATTR) and (m.builtin != B_HAS_BUILTIN) and (m.builtin != B_HAS_FEATURE) and
+        (m.builtin != B_HAS_INCLUDE_NEXT)) {
         return false;
     }
     let sp = t.span;
@@ -831,6 +833,11 @@ fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
             _ = dg.err(sp, "C1048", "'__has_builtin' requires the name of a builtin");
         } else {
             v = @as(i64, cf.has_builtin(bs[0].name, P.o.gnu));
+        }
+    } else if m.builtin == B_HAS_FEATURE {
+        let bs = expand_list(P, items);
+        if (bs.len != 1) or (bs[0].kind != lx.PK_IDENT) {
+            _ = dg.err(sp, "C1048", u.f1("'%s' requires a feature name", name));
         }
     } else {
         // the resource, and (for __has_embed) the parameters
@@ -1220,10 +1227,30 @@ fn poisoned(sp: u.Span, name: []u8) void {
 // its own with GNU statement expressions, are the compiler's built-ins (as
 // its own <math.h> defines them), in every standard.
 fn system_math_macro(P: *mut PP, line: []lx.PTok) []lx.PTok {
+    if not in_system_header(P) {
+        return line;
+    }
+    let mname = line[0].name;
     let names = ["isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered"];
     for n in names {
-        if u.str_eq(n, line[0].name) and in_system_header(P) {
+        if u.str_eq(n, mname) {
             return lx.lex_all(u.f2("%s(x, y) __builtin_axiom_%s(x, y)", n, n), P.o.std, line[0].span);
+        }
+    }
+    if tg.is_darwin() {
+        // Darwin's <arm/_types.h>, <i386/_types.h> and <sys/_types/_*.h> fall back to
+        // `typedef void * __darwin_va_list;` without __GNUC__ unless USE_CLANG_* is 1;
+        // and <libkern/_OSByteOrder.h> omits _OSSwapInt* on arm64 without __GNUC__.
+        if u.str_eq(mname, "USE_CLANG_TYPES") or u.str_eq(mname, "USE_CLANG_STDDEF") or
+           u.str_eq(mname, "USE_CLANG_STDARG") or u.str_eq(mname, "TARGET_RT_64_BIT") {
+            return lx.lex_all(u.f1("%s 1", mname), P.o.std, line[0].span);
+        }
+        let swaps = ["__DARWIN_OSSwapInt16", "__DARWIN_OSSwapInt32", "__DARWIN_OSSwapInt64"];
+        let bits = ["16", "32", "64"];
+        for k in 0..swaps.len {
+            if u.str_eq(mname, swaps[k]) {
+                return lx.lex_all(u.f2("%s(x) __builtin_axiom_bswap%s(x)", mname, bits[k]), P.o.std, line[0].span);
+            }
         }
     }
     return line;
@@ -1232,6 +1259,12 @@ fn system_math_macro(P: *mut PP, line: []lx.PTok) []lx.PTok {
 fn do_define(P: *mut PP, line0: []lx.PTok, sp: u.Span) void {
     let mut line = line0;
     if (line.len > 0) and (line[0].kind == lx.PK_IDENT) and P.o.system_lib {
+        if tg.is_darwin() and in_system_header(P) and u.str_eq(line[0].name, "__TARGETCONDITIONALS__") {
+            do_define(P, lx.lex_all("TARGET_OS_MAC 1", P.o.std, sp), sp);
+            do_define(P, lx.lex_all("TARGET_OS_OSX 1", P.o.std, sp), sp);
+            let cpu = u.pick(tg.g_arch == tg.ARCH_A64, "TARGET_CPU_ARM64 1", "TARGET_CPU_X86_64 1");
+            do_define(P, lx.lex_all(cpu, P.o.std, sp), sp);
+        }
         line = system_math_macro(P, line);
     }
     if line.len == 0 {
@@ -2956,7 +2989,7 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         do_undef(P, ts, sp);
     } else if u.str_eq(name, "include") {
         do_include(P, ts, sp, false);
-    } else if u.str_eq(name, "include_next") and (P.o.gnu or in_compiler_header(P)) {
+    } else if u.str_eq(name, "include_next") and (P.o.gnu or in_compiler_header(P) or in_system_header(P)) {
         do_include(P, ts, sp, true);
     } else if u.str_eq(name, "import") and P.o.gnu {
         // (a GNU dialect's: #include of a file not read again after it, as
@@ -2968,7 +3001,7 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         do_line(P, ts, sp);
     } else if u.str_eq(name, "error") {
         _ = dg.err(sp, "C1040", u.cat2("#error ", spelling(ts)));
-    } else if u.str_eq(name, "warning") and ((std >= co.C23) or P.o.gnu) {
+    } else if u.str_eq(name, "warning") and ((std >= co.C23) or P.o.gnu or in_system_header(P)) {
         _ = dg.warning(sp, "C4103", u.cat2("#warning ", spelling(ts)));
     } else if u.str_eq(name, "assert") and P.o.gnu {
         do_assert(P, ts, sp);
@@ -3400,7 +3433,7 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     P.eof_tok.bol = true;
     P.inject = u.nil_slice.[lx.PTok]();
     lx.gnu = o.gnu;
-    ct.g_no_ext_float = o.system_lib;
+    ct.g_no_ext_float = o.system_lib and not tg.is_darwin();
     ct.g_declspec = o.declspec;
     P.asserts = u.SymMap.[*mut u.List.[[]u8]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[[]u8]](), cap: 0,
                                                 len: 0 };
@@ -3416,6 +3449,8 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     add_builtin(P, "__has_include", B_HAS_INCLUDE);
     add_builtin(P, "__has_attribute", B_HAS_GNU_ATTR);
     add_builtin(P, "__has_builtin", B_HAS_BUILTIN);
+    add_builtin(P, "__has_feature", B_HAS_FEATURE);
+    add_builtin(P, "__has_extension", B_HAS_FEATURE);
     if o.std >= co.C23 {
         add_builtin(P, "__has_embed", B_HAS_EMBED);
     }

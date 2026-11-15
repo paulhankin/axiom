@@ -4,6 +4,7 @@
 // flags: -lz
 // expect-dylib: @rpath/libdy.dylib
 // expect-dylib: /usr/lib/libz.dylib
+// expect: 6 41 1 5
 #include <stdio.h>
 
 int dy_twice(int x);

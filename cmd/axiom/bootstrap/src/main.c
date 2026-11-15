@@ -1005,7 +1005,9 @@ int main(int argc, char **argv) {
     if (final_link) {
         int rc;
         if (g_target.wasm) {
-            const char *names[] = {"wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld", NULL};
+            const char *names[] = {"wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld",
+                                   "/opt/homebrew/opt/llvm@18/bin/wasm-ld", "/usr/local/opt/llvm@18/bin/wasm-ld",
+                                   "rust-lld", NULL};
             const char *ld = find_tool(names);
             if (!ld) {
                 unlink(objpath);
@@ -1039,7 +1041,9 @@ int main(int argc, char **argv) {
                 const char *in = link_inputs.data[i];
                 size_t n = strlen(in);
                 if (n > 2 && !strcmp(in + n - 2, ".c")) {
-                    const char *cc_names[] = {"clang", "clang-18", "/usr/lib/llvm-18/bin/clang", NULL};
+                    const char *cc_names[] = {"clang", "clang-18", "/usr/lib/llvm-18/bin/clang",
+                                              "/opt/homebrew/opt/llvm@18/bin/clang",
+                                              "/usr/local/opt/llvm@18/bin/clang", NULL};
                     const char *clang = find_tool(cc_names);
                     if (!clang) {
                         unlink(objpath);

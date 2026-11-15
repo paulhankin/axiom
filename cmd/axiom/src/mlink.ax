@@ -76,6 +76,7 @@ struct Import {
     seg_off: u64,  // offset in __DATA
     name: []u8,
     addend: i64,
+    weak: bool,
 }
 
 let mut stubs: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };    // gsym per stub
@@ -399,6 +400,35 @@ fn ordinal_of(name: []u8) u32 {
     return k;
 }
 
+// Is every undefined global symbol bound as bname weak?
+fn is_weak_bound(bname: []u8) bool {
+    let mut seen = false;
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
+        if (g.obj < 0) and u.str_eq(bound_name(g.name), bname) {
+            if not g.weak {
+                return false;
+            }
+            seen = true;
+        }
+    }
+    return seen;
+}
+
+// The ordinal of the library that exports bname (a weak undefined symbol
+// with no library named is looked up dynamically so dyld binds it to 0 if
+// absent rather than demanding it from libSystem).
+fn bind_ordinal(bname: []u8, weak: bool) u32 {
+    let k = import_ord.get(u.intern(unbound_name(bname)));
+    if k != 0 {
+        return k;
+    }
+    if flat or weak {
+        return FLAT_LOOKUP;
+    }
+    return 1;
+}
+
 // An LC_LOAD_DYLIB's size for an install name.
 fn dylib_cmd_size(path: []u8) u64 {
     return nl.align_up(24 + @as(u64, path.len) + 1, 8);
@@ -603,7 +633,9 @@ fn apply_relocs(b: []mut u8) void {
                 let sa = sv +% @bit_cast(u64, r.addend);
                 if is_abs64(t) {
                     if imp {
-                        binds.push(Import.{ seg_off: p - data_addr, name: import_name(oi, r.sym), addend: r.addend });
+                        let iname = import_name(oi, r.sym);
+                        binds.push(Import.{ seg_off: p - data_addr, name: iname, addend: r.addend,
+                                            weak: is_weak_bound(iname) });
                         bn.w64(b, fo, 0);
                     } else {
                         rebase_at(p);
@@ -1039,7 +1071,7 @@ fn bind_info() []u8 {
     b.u8_(0x51);  // BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER
     let mut ord: u32 = 0;
     for x in binds.items() {
-        let o = ordinal_of(unbound_name(x.name));
+        let o = bind_ordinal(x.name, x.weak);
         if o != ord {
             ord = o;
             if o == FLAT_LOOKUP {
@@ -1051,7 +1083,11 @@ fn bind_info() []u8 {
                 b.uleb(@as(u64, o));
             }
         }
-        b.u8_(0x40);  // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+        if x.weak {
+            b.u8_(0x41);  // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | BIND_SYMBOL_FLAGS_WEAK_IMPORT
+        } else {
+            b.u8_(0x40);  // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+        }
         b.put(x.name);
         b.u8_(0);
         b.u8_(0x60);  // BIND_OPCODE_SET_ADDEND_SLEB
@@ -1626,7 +1662,8 @@ fn write_contents(b: []mut u8, ly: *Layout) void {
         let si = nl.got_sym.get(k);
         let at = got_addr + (@as(u64, k) * 8);
         if is_import(oi, si) {
-            binds.push(Import.{ seg_off: at - data_addr, name: import_name(oi, si), addend: 0 });
+            let iname = import_name(oi, si);
+            binds.push(Import.{ seg_off: at - data_addr, name: iname, addend: 0, weak: is_weak_bound(iname) });
         } else {
             bn.w64(b, file_of(at), nl.sym_addr(oi, si));
             rebase_at(at);
@@ -1788,7 +1825,8 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
             continue;
         }
         prev = nm;
-        let desc = @as(u64, ordinal_of(unbound_name(nm))) << 8;  // SET_LIBRARY_ORDINAL
+        let wk = is_weak_bound(nm);
+        let desc = (@as(u64, bind_ordinal(nm, wk)) << 8) | u64_pick(wk, 0x40, 0);  // SET_LIBRARY_ORDINAL, N_WEAK_REF
         syms.push(NSym.{ name: nm, ty: 0x01, sect: 0, desc: desc, value: 0 });
     }
     return syms;
