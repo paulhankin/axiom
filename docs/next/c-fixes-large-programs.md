@@ -12,3 +12,11 @@
   supplied `CHAR_MAX`), instead of the error `C1060`; and `atexit`, `at_quick_exit` and
   `pthread_atfork`, which the system's C library keeps in its static part
   (`libc_nonshared.a`) rather than in its shared object, link.
+- A C program links from objects and libraries alone (`axiom build main.o util.o libx.a`,
+  outside a package): the C start-up and the C library (`--c-lib`) are added as when a
+  C source is given (issue #63).
+- `main` may be an object's or an archive member's when no translation unit defines one
+  (`axiom build util.c main.o`), with the start-up a unit's `main` has (arguments,
+  constructors, `exit` with its value); `C3063` is reported only when neither the sources
+  nor the objects and archives linked define `main`, and a source's `main` beside an
+  object's is `C3064` (issue #64).

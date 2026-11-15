@@ -397,6 +397,9 @@ fn is_darwin_inode64(n: []u8) bool {
 // MAIN_SYMBOL), else made unique.
 pub fn symbol_name(s: *cast.CSym) []u8 {
     if (s.linkage == cast.LK_EXTERNAL) and not ((s.kind == cast.SK_FUNC) and csm.is_inline_def(s)) {
+        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") and (g_obj_main.len > 0) and not g_obj_main_start {
+            return g_obj_main;  // (an object's main: cc.ax, set_object_main)
+        }
         if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") {
             return MAIN_SYMBOL;
         }
@@ -1481,10 +1484,18 @@ fn unreferenced_inline(s: *cast.CSym) bool {
     return n.always_inline and not n.used and not n.ctor and not n.dtor and (n.alias.len == 0);
 }
 
+/// The program's main is an object's (cc.ax: set_object_main): the name
+/// the start-up calls, with g_obj_main_args arguments; g_obj_main_start: it
+/// is this compiler's object's call of its main, (argc, argv) to an i32.
+pub let mut g_obj_main: []u8 = "";
+pub let mut g_obj_main_args: i32 = 2;
+pub let mut g_obj_main_start: bool = false;
+
 /// Generates START_SYMBOL(argc, argv) into module m, after the units: it
-/// calls main (the function main of the unit that defines it: cu) and returns
-/// its value as an i32; `exit`: the program defines exit (a unit, or an
-/// Axiom module), which the start-up calls with main's value.
+/// calls main (the function main of the unit that defines it: cu; or with
+/// cu nil an object's, g_obj_main) and returns its value as an i32;
+/// `exit`: the program defines exit (a unit, or an Axiom module), which the
+/// start-up calls with main's value.
 pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool, exit: bool) bool {
     M = m;
     program_exit = exit;
@@ -1517,16 +1528,44 @@ fn start(cu: *mut cs.CUnit) void {
     F = st;
     st.entry = new_block("entry");
     at_end(st.entry);
-    let mf = func_of(cu.main, func_sig(cu.main));
-    let mt = cu.main.ty;
     let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
     let mut n: usize = 0;
-    if cu.main.params.len >= 1 {
+    let mut np: usize = 0;
+    let mut sig = Sig.{ ty: fty, plan: u.nil.[abi.Plan]() };
+    let mut mf = u.nil.[ir.Func]();
+    let mut ib = cty.t_int.bits;
+    if u.notnil(cu) {
+        sig = func_sig(cu.main);
+        mf = func_of(cu.main, sig);
+        sig.ty = mf.ty;  // (the call's type: the function's)
+        np = cu.main.params.len;
+    } else {
+        // an object's main (linkin.ax: take_main): int main(int, char **),
+        // or int main(void) (a WebAssembly function of no parameters); or
+        // this compiler's object's start-up, which has START_SYMBOL's type
+        np = @int_cast(usize, g_obj_main_args);
+        if g_obj_main_start {
+            ib = 32;
+        } else if np == 2 {
+            let mut ps: [2]*mut cty.CType = [cty.t_int, cty.pointer_to(cty.pointer_to(cty.t_char))];
+            sig = sig_of(cty.t_int, ps[..], 2, false, false);
+        } else {
+            sig = sig_of(cty.t_int, u.nil_slice.[*mut cty.CType](), 0, false, false);
+        }
+        mf = ir.get_function(M, g_obj_main);
+        if u.isnil(mf) {
+            mf = ir.add_function(M, g_obj_main, sig.ty);
+        }
+    }
+    if np >= 1 {
         // (main(int argc) in a GNU dialect: argc alone)
-        av[0] = conv_i32(f.params[0], cty.t_int);
+        av[0] = f.params[0];
+        if not g_obj_main_start {
+            av[0] = conv_i32(f.params[0], cty.t_int);
+        }
         n = 1;
     }
-    if cu.main.params.len == 2 {
+    if np == 2 {
         av[1] = f.params[1];
         n = 2;
     }
@@ -1534,15 +1573,15 @@ fn start(cu: *mut cs.CUnit) void {
     if runners {
         call_runner(CTORS_FN);
     }
-    let r = ir.call(B, mf.ty, mf.val, av[0..n]);
-    mark_call(r, func_sig(cu.main).plan);
+    let r = ir.call(B, sig.ty, mf.val, av[0..n]);
+    if u.notnil(sig.plan) {
+        mark_call(r, sig.plan);
+    }
     if runners and not program_exit {
         // (a program without exit: the destructors when main returns; else
         // exit runs them, through __axc_at_exit_dtors)
         call_runner(DTORS_FN);
     }
-    _ = mt;
-    let ib = cty.t_int.bits;
     let mut status = r;
     if ib > 32 {
         status = ir.trunc(B, r, T_i32);

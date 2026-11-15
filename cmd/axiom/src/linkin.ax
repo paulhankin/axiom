@@ -513,3 +513,223 @@ pub fn wasm_members(us: []*mut wo.Unit) u.List.[*mut wo.Unit] {
     }
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// A C program's main in its objects (main.ax: object_main): when no
+// translation unit of the program defines main, the objects and archive
+// members read (load) may. The start-up calls it as it calls a unit's
+// (cgen.ax: start), under another name, since the program's own `main` is
+// the runtime's entry point (codegen: emit_native_entry), which the system's
+// start-up calls.
+
+/// No object or member defines main.
+pub const MAIN_NONE: i32 = 0;
+/// One defines a C function main (the platform toolchain's object, or
+/// another compiler's): renamed OBJ_MAIN.
+pub const MAIN_C: i32 = 1;
+/// One is this compiler's object of C units that define main (--emit=obj):
+/// it has the start-up's call of main (START_NAME), renamed OBJ_START, and
+/// the runtime's entry point (`main`), which gives way to the program's.
+pub const MAIN_START: i32 = 2;
+
+pub let OBJ_MAIN: []u8 = "__axiom_c_obj_main";
+pub let OBJ_START: []u8 = "__axiom_c_obj_start";
+let START_NAME: []u8 = "__axiom_c_main";
+
+/// What find_main found: the kind (MAIN_*), the object (or member) that
+/// defines it, the number of main's parameters (MAIN_C on WebAssembly,
+/// where a call takes the function's type: 0 or 2; else 2, which a main
+/// without parameters ignores, as the platforms' start-up code calls it),
+/// whether it is an archive member's, whether its definition is strong,
+/// and the name of a second object (not a member) that defines main
+/// strongly, if one does.
+pub struct MainDef {
+    kind: i32,
+    obj: []u8,
+    nargs: i32,
+    member: bool,
+    strong: bool,
+    second: []u8,
+}
+
+// The kind of main that object o defines (MAIN_*), and whether strongly.
+fn obj_main(o: *elf.Obj, strong: *mut bool) i32 {
+    let mut kind = MAIN_NONE;
+    for si in 0..o.syms.len {
+        let sy = o.syms.get(si);
+        if (sy.bind == elf.B_LOCAL) or (sy.sec == -1) {
+            continue;
+        }
+        if u.str_eq(sy.name, START_NAME) {
+            kind = MAIN_START;
+            strong.* = true;
+        } else if u.str_eq(sy.name, "main") and (kind == MAIN_NONE) and (sy.ty != elf.T_OBJECT) {
+            kind = MAIN_C;
+            strong.* = sy.bind == elf.B_GLOBAL;
+        }
+    }
+    return kind;
+}
+
+// The kind of main that WebAssembly unit w defines (MAIN_*), whether
+// strongly, and (MAIN_C) its number of parameters. A C main is `main`, or
+// `__main_argc_argv` (the tool conventions' name of main(argc, argv)).
+fn unit_main(w: *wo.Unit, strong: *mut bool, nargs: *mut i32) i32 {
+    let mut kind = MAIN_NONE;
+    for i in 0..w.syms.len {
+        let s = w.syms.get(i);
+        if ((s.flags & (wo.F_LOCAL | wo.F_UNDEFINED)) != 0) or (s.kind != wo.SYM_FUNC) {
+            continue;
+        }
+        if u.str_eq(s.name, START_NAME) {
+            kind = MAIN_START;
+            strong.* = true;
+        } else if (u.str_eq(s.name, "main") or u.str_eq(s.name, "__main_argc_argv")) and (kind == MAIN_NONE) {
+            kind = MAIN_C;
+            strong.* = (s.flags & wo.F_WEAK) == 0;
+            nargs.* = 2;
+            let fi = @as(usize, s.index);
+            if (fi >= w.fimports.len) and ((fi - w.fimports.len) < w.funcs.len) {
+                let t = w.types.get(@as(usize, w.funcs.get(fi - w.fimports.len).ty));
+                if (t.len > 1) and (t[1] == 0) {
+                    nargs.* = 0;
+                }
+            }
+        }
+    }
+    return kind;
+}
+
+/// The main the objects and archive members read (load) define: the first
+/// object's, else the first member's (which the start-up's reference then
+/// takes).
+pub fn find_main() MainDef {
+    let mut m = MainDef.{ kind: MAIN_NONE, obj: "", nargs: 2, member: false, strong: false, second: "" };
+    let mut strong_seen = false;
+    for pass in @as(usize, 0)..2 {
+        let mut n = g_objs.len + g_wunits.len;
+        if pass == 1 {
+            n = g_members.len + g_wmembers.len;
+        }
+        for i in 0..n {
+            let mut strong = false;
+            let mut nargs: i32 = 2;
+            let mut kind = MAIN_NONE;
+            let mut name: []u8 = "";
+            if (pass == 0) and (i < g_objs.len) {
+                kind = obj_main(g_objs.get(i), &mut strong);
+                name = g_objs.get(i).name;
+            } else if pass == 0 {
+                kind = unit_main(g_wunits.get(i - g_objs.len), &mut strong, &mut nargs);
+                name = u.f1("object %s", u.zdec(i - g_objs.len + 1));
+            } else if i < g_members.len {
+                kind = obj_main(g_members.get(i), &mut strong);
+                name = g_members.get(i).name;
+            } else {
+                kind = unit_main(g_wmembers.get(i - g_members.len), &mut strong, &mut nargs);
+                name = u.f1("archive member %s", u.zdec(i - g_members.len + 1));
+            }
+            if kind == MAIN_NONE {
+                continue;
+            }
+            if (pass == 0) and strong and strong_seen and (m.second.len == 0) {
+                m.second = name;
+            }
+            if (pass == 0) and strong {
+                strong_seen = true;
+            }
+            if m.kind == MAIN_NONE {
+                m = MainDef.{ kind: kind, obj: name, nargs: nargs, member: pass == 1, strong: strong,
+                              second: m.second };
+            }
+        }
+        if m.kind != MAIN_NONE {
+            break;
+        }
+    }
+    return m;
+}
+
+// Renames symbol `from` of object o (a definition or a reference) to `to`.
+fn rename_sym(o: *mut elf.Obj, from: []u8, to: []u8) void {
+    for si in 0..o.syms.len {
+        let sy = o.syms.at(si);
+        if (sy.bind != elf.B_LOCAL) and u.str_eq(sy.name, from) {
+            sy.name = to;
+            let k = o.symmap.get(u.intern(from));
+            if k != 0 {
+                o.symmap.put(u.intern(from), 0);
+                o.symmap.put(u.intern(to), k);
+            }
+        }
+    }
+}
+
+// The same for WebAssembly unit w.
+fn rename_wsym(w: *mut wo.Unit, from: []u8, to: []u8) void {
+    for i in 0..w.syms.len {
+        let s = w.syms.at(i);
+        if ((s.flags & wo.F_LOCAL) == 0) and u.str_eq(s.name, from) {
+            s.name = to;
+            let k = w.symmap.get(u.intern(from));
+            if k != 0 {
+                w.symmap.put(u.intern(from), 0);
+                w.symmap.put(u.intern(to), k);
+            }
+        }
+    }
+}
+
+// Object o defines START_NAME: its `main` (the runtime's entry point, as
+// the program's) is weak, so that the program's is linked.
+fn yield_entry(o: *mut elf.Obj) void {
+    let mut strong = false;
+    if obj_main(o, &mut strong) != MAIN_START {
+        return;
+    }
+    for si in 0..o.syms.len {
+        let sy = o.syms.at(si);
+        if (sy.bind == elf.B_GLOBAL) and (sy.sec != -1) and u.str_eq(sy.name, "main") {
+            sy.bind = elf.B_WEAK;
+        }
+    }
+}
+
+/// Makes the main that find_main found (m) the one the program's start-up
+/// calls, in every object and member: MAIN_C, its `main` (and the
+/// references to it) renamed OBJ_MAIN (on WebAssembly `__main_argc_argv`
+/// too); MAIN_START, START_NAME renamed OBJ_START, the objects' entry
+/// points weak. The name the start-up calls.
+pub fn take_main(m: MainDef) []u8 {
+    let mut from: []u8 = START_NAME;
+    let mut to: []u8 = OBJ_START;
+    if m.kind == MAIN_C {
+        from = "main";
+        to = OBJ_MAIN;
+    }
+    for k in 0..g_objs.len + g_members.len {
+        let mut o = u.nil.[elf.Obj]();
+        if k < g_objs.len {
+            o = g_objs.get(k);
+        } else {
+            o = g_members.get(k - g_objs.len);
+        }
+        if m.kind == MAIN_START {
+            yield_entry(o);
+        }
+        rename_sym(o, from, to);
+    }
+    for k in 0..g_wunits.len + g_wmembers.len {
+        let mut w = u.nil.[wo.Unit]();
+        if k < g_wunits.len {
+            w = g_wunits.get(k);
+        } else {
+            w = g_wmembers.get(k - g_wunits.len);
+        }
+        rename_wsym(w, from, to);
+        if m.kind == MAIN_C {
+            rename_wsym(w, "__main_argc_argv", to);
+        }
+    }
+    return to;
+}

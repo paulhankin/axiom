@@ -647,7 +647,10 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // once per variant; -x86_64 and -aarch64 suffixes on the directive give a
 // target's own), flag-variants: flags | flags | ... (the main file built
 // with each, for every cc-variant), needs: c++, cxx-exceptions, cc-flags: (for cc_main.c's
-// link), x86-64-only.
+// link), x86-64-only, main-object: ours | cc (main.c is compiled into an object, by this
+// compiler with --emit=obj and the build's flags, or by the system's C compiler with the
+// cc-variant's, which the build is given in its place: a C program whose main is an
+// object's, or of objects alone).
 const cLinkDir = path.join(root, 'cmd/axiom/internal/tests/c/link');
 const cLinkDirs = fs.existsSync(cLinkDir) ? fs.readdirSync(cLinkDir).filter((n) => fs.statSync(path.join(cLinkDir, n)).isDirectory()).sort().map((n) => path.join(cLinkDir, n)) : [];
 const linkArch = (process.env.AXIOM_NATIVE_TARGET || process.arch === 'arm64' && 'aarch64' || 'x86_64').replace(/^native$/, process.arch === 'arm64' ? 'aarch64' : 'x86_64');
@@ -765,7 +768,18 @@ const cLinkTest = async (dir) => {
     const flags = [...dv('flags'), flagPart].flatMap((x) => x.trim().split(/\s+/)).filter((x) => x).map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x);
     const others = names.filter((n) => n !== path.basename(main) && /\.c$/.test(n) && !/^(sys|arch|so|ours|ourlib|oursso|cc)_/.test(n)).map((n) => path.join(dir, n));
     const out = path.join(work, 'prog');
-    const args = ['build', main, ...others, ...objs, ...ours, `-L${work}`, ...libFlags, '--format=agent-json', '-o', out, target, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+    let mainInput = main;
+    const mainObject = dv('main-object').map((x) => x.trim())[0];
+    if (mainObject) {
+      // main.c as an object (this compiler's or the system's), given in its place
+      mainInput = path.join(work, 'main_obj.o');
+      const p = mainObject === 'cc'
+        ? await run(cc, ['-c', ...vf, main, '-o', mainInput], `${cc} ${v} main.c`)
+        : await run(compiler, ['build', main, '--emit=obj', target, ...flags, '-o', mainInput], 'compiling main.c (--emit=obj)');
+      if (p) return p;
+    }
+    const inputs = mainObject ? [...others, mainInput] : [main, ...others];
+    const args = ['build', ...inputs, ...objs, ...ours, `-L${work}`, ...libFlags, '--format=agent-json', '-o', out, target, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
     const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
     if (errors.length) {
       let codes = [];

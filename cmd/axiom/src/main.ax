@@ -173,6 +173,14 @@ fn strip_ph(base: []u8) []u8 {
     if (base.len > 2) and u.ends(base, ".c") {
         return base[0..base.len - 2];
     }
+    if g_c_objects and is_link_input(base) {
+        // (a C program of objects: named after the first, x.o or libx.a)
+        let mut i = base.len;
+        while (i > 1) and (base[i - 1] != '.') {
+            i -= 1;
+        }
+        return base[0..i - 1];
+    }
     return base;
 }
 
@@ -448,6 +456,39 @@ let mut g_c_lib_system: bool = false;
 // Objects compiled from --link=<file.c> (cc_compile, own_cc_compile; removed
 // after the link).
 let mut g_cc_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// A C program of objects and libraries alone (objects_program): o.input
+// is the first of them (which names the output), and there is no source.
+let mut g_c_objects: bool = false;
+
+// The name the C start-up calls for main when an object defines it
+// (object_main), for the archive members to take (link_refs).
+let mut g_obj_main: []u8 = "";
+
+// Is the build a C program of objects and libraries alone (docs/c.md, "The
+// command line")? `axiom build` given no source (and no --link=<file.ax>)
+// outside a package (no axiom.toml in the current directory, which would
+// make it a package's build, linked with them), and an object, archive or
+// shared library among its inputs: linked as a C program with no
+// translation unit of its own, with the C start-up and library. The first
+// of them, or nosym.
+fn objects_program(o: *Options) []u8 {
+    if not u.isnos(o.input) or not u.str_eq(o.cmd, "build") or (o.ax_links.len > 0) or u.file_exists("axiom.toml") {
+        return u.nosym();
+    }
+    for k in 0..o.link_inputs.len {
+        if is_link_input(o.link_inputs.get(k)) {
+            return o.link_inputs.get(k);
+        }
+    }
+    return u.nosym();
+}
+
+// Is the program a C program (its first input a C source, or objects
+// alone)?
+fn c_program(o: *Options) bool {
+    return is_c_source(o.input) or g_c_objects;
+}
 
 // Does the program have C, in its units or in objects it is linked with
 // (which then have the C library as C units would)?
@@ -1026,7 +1067,7 @@ fn is_ax_source(path: []u8) bool {
 // Axiom header or source is of Axiom code): false after reporting one.
 // Without C sources, the C front end's options are errors.
 fn check_c_options(o: *Options) bool {
-    let c_input = is_c_source(o.input) or (o.c_inputs.len > 0);
+    let c_input = c_program(o) or (o.c_inputs.len > 0);
     if not c_input {
         if o.c_args.len > 0 {
             dg.emit_fatal(o.json, "E9001", u.f1("'%s' is an option for C sources, and the input is not one (*.c)",
@@ -1038,7 +1079,7 @@ fn check_c_options(o: *Options) bool {
     // An Axiom program with C units (its root is the .ax input) takes the
     // options of Axiom code that change only its own code; a C program (the
     // first input is C) takes none of them.
-    let ax_root = not is_c_source(o.input);
+    let ax_root = not c_program(o);
     let mut bad = u.nosym();
     if (o.co.overflow != cx.OVF_WRAP) and not ax_root {
         bad = "--overflow";  // (C's signed overflow is undefined; unsigned wraps)
@@ -1067,6 +1108,12 @@ fn check_c_options(o: *Options) bool {
     }
     if cfront.text_emit(o.emit) and (o.c_inputs.len > 0) {
         dg.emit_fatal(o.json, "E9001", u.f1("--emit=%s takes one C source", o.emit));
+        return false;
+    }
+    if g_c_objects and not u.str_eq(o.emit, "exe") and not u.str_eq(o.emit, "lib") and not u.str_eq(o.emit, "shared") {
+        dg.emit_fatal(o.json, "E9001",
+                      u.f1("--emit=%s takes a source: objects and libraries alone link into an executable, a static library (--emit=lib) or a shared library (--emit=shared)",
+                           o.emit));
         return false;
     }
     return true;
@@ -1533,6 +1580,11 @@ fn compile(args: [][]u8) i32 {
     if not parse_options(&mut o, args) {
         return 2;
     }
+    let first_obj = objects_program(&o);
+    if not u.isnos(first_obj) {
+        g_c_objects = true;
+        o.input = first_obj;
+    }
     let mut pkg_files = u.List.[[]u8].empty();
     let rc = package_input(&mut o, &mut pkg_files);
     if rc != CONTINUE {
@@ -1560,8 +1612,8 @@ fn compile(args: [][]u8) i32 {
         // (axiom lsp asks only about Axiom sources; nothing to answer here)
         return fatal(o.json, "E9001", u.f1("axiom ide answers about Axiom sources, and '%s' is a C source", o.input));
     }
-    if is_c_source(o.input) {
-        // a C translation unit (docs/c.md)
+    if c_program(&o) {
+        // a C translation unit (docs/c.md), or objects of C alone
         let mut c = u.new.[cop.COptions]();
         if not c_options(&o, c) {
             return 2;
@@ -1650,17 +1702,27 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     if o.testing or o.profiling or o.ide_mode {
         return fatal(o.json, "E9001", u.f1("axiom %s does not take a C source", o.cmd));
     }
-    let mut ok = check_unit(o.input, c);
+    let mut ok = true;
+    if not g_c_objects {
+        ok = check_unit(o.input, c);
+    }
     for k in 0..o.c_inputs.len {
         ok = check_unit(o.c_inputs.get(k), c) and ok;
     }
     let exe = u.str_eq(o.emit, "exe");
+    if ok and exe and o.build and not object_main(o, c) {
+        return 1;
+    }
     let mut lib_modules = u.List.[[]u8].empty();
     if ok and exe {
         ok = c_library(o, c, &mut lib_modules);
     }
     if ok {
-        ok = cfront.link_check(o.build and exe);
+        ok = cfront.link_check(o.build and exe and not g_c_objects);
+    }
+    if ok and g_c_objects and o.build and exe and not cfront.has_main() {
+        dg.emit_fatal(o.json, "C3063", "the program has no function main (no object or library given defines one)");
+        return 1;
     }
     if not ok or (not o.build and (o.ax_links.len == 0)) {
         dg.emit(o.json, o.json);
@@ -1724,6 +1786,47 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     return build_program(o);
 }
 
+// An executable C program whose units do not define main takes the main
+// of the objects and archive members it is linked with (linkin.find_main:
+// the first object's, else the first member's), which its start-up calls
+// as a unit's (with the arguments, the constructors, and exit with main's
+// value). A unit's main and an object's, or two objects', are C3064. False
+// after an error (reported).
+fn object_main(o: *Options, c: *cop.COptions) bool {
+    if not g_own_inputs {
+        return true;
+    }
+    let m = linkin.find_main();
+    if m.kind == linkin.MAIN_NONE {
+        return true;
+    }
+    if cfront.has_main() {
+        // (a unit's and an object's: the program's entry point twice)
+        if m.member or not m.strong or cfront.second_main(m.obj) {
+            return true;
+        }
+        dg.emit(o.json, o.json);
+        return false;
+    }
+    if (m.kind == linkin.MAIN_START) and tg.is_windows() {
+        // (its runtime's definitions are COMDAT sections, which the program's
+        // own, not COMDAT, do not replace: docs/c.md, "The command line")
+        dg.emit_fatal(o.json, "E9004",
+                      u.f2("'%s' is this compiler's object of C units that define main, which has the start-up and the runtime; for %s a program cannot link it yet (give those units as sources instead)",
+                           m.obj, tg.os_target_name()));
+        return false;
+    }
+    if m.second.len > 0 {
+        dg.emit_fatal(o.json, "C3064",
+                      u.f2("'main' is defined in '%s' and in '%s' (an external name has one definition)", m.obj,
+                           m.second));
+        return false;
+    }
+    g_obj_main = linkin.take_main(m);
+    cfront.set_object_main(g_obj_main, m.nargs, m.kind == linkin.MAIN_START, c);
+    return true;
+}
+
 // Is std/c/rt/<name> among the modules ps (the C library's run-time
 // layer)?
 fn has_rt(ps: *u.List.[[]u8], name: []u8) bool {
@@ -1768,6 +1871,9 @@ fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
 fn link_refs(o: *Options, ext: *mut u.List.[[]u8]) void {
     let mut roots = u.List.[[]u8].empty();
     cfront.all_refs(&mut roots);
+    if g_obj_main.len > 0 {
+        roots.push(g_obj_main);  // (the start-up's call: an archive member's main)
+    }
     extern_c_names(o, &mut roots);
     linkin.refs(roots.items(), ext);
 }
@@ -2133,7 +2239,7 @@ fn axiom_names(o: *Options) u.List.[cfront.AxName] {
 // Sets the output kind from --emit; false on an error (reported).
 fn set_emit(o: *Options, final_link: bool) bool {
     let co = o.co;
-    if u.str_eq(o.emit, "shared") and not is_c_source(o.input) {
+    if u.str_eq(o.emit, "shared") and not c_program(o) {
         dg.emit_fatal(o.json, "E9001", "--emit=shared takes C sources (the Axiom runtime is an executable's)");
         return false;
     }
@@ -2379,7 +2485,9 @@ fn write_library(o: *Options, objpath: []u8) i32 {
     let mut members = u.List.[ar.Member].empty();
     let mut syms = u.List.[[][]u8].empty();
     let mut paths = u.List.[[]u8].empty();
-    paths.push(objpath);
+    if not g_c_objects {
+        paths.push(objpath);  // (objects alone: theirs, and nothing of the build's)
+    }
     for k in 0..o.link_inputs.len {
         let p = o.link_inputs.get(k);
         if u.ends(p, ".o") or u.ends(p, ".obj") {
@@ -2394,7 +2502,7 @@ fn write_library(o: *Options, objpath: []u8) i32 {
             return fatal(o.json, "E9004", u.f1("cannot read %s", paths.get(k)));
         }
         let mut name = u.basename(paths.get(k));
-        if k == 0 {
+        if (k == 0) and not g_c_objects {
             name = u.cat2(strip_ph(u.basename(o.input)), u.pick(tg.is_windows(), ".obj", ".o"));
         }
         members.push(ar.Member.{ name: name, data: d });

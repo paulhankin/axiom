@@ -70,6 +70,7 @@ axiom build file.c... [options] [-o out]
 axiom check file.c...  [options]
 axiom build main.ax file.c... [options]       an Axiom program and C units
 axiom build main.c... file.ax... [options]    a C program and Axiom modules
+axiom build main.o util.o libx.a [options]    a C program of objects and libraries
 ```
 
 An input is a C source if its name ends in `.c`. Options take the forms `--name=value`
@@ -77,6 +78,35 @@ and `-DNAME`; they may come before or after the inputs. `-D NAME`, `-U NAME` and
 `-I dir` (with a space) are accepted too. The first input decides what the program is:
 a C program if it is a C source, an Axiom program if it is an Axiom source ("C and
 Axiom in one program").
+
+Objects and libraries alone ("Objects and libraries": `.o`, `.a`, `.so` ... among the
+inputs or with `--link=`, and `-l` and `-L` beside them) are a C program when no source is
+given and the current directory is not a package's (an `axiom.toml` there makes the build
+the package's, linked with them). It is built as a C program whose translation units are
+none: the C start-up and the C library that `--c-lib` names are added (with
+`--c-lib=axiom`, what the objects use of it), and the C options apply to the C library's
+units as to a program's. Without `-o` the output is named after the first of them, its
+extension removed (`main.o`: `main`). `--emit=lib` makes an archive of the objects, and
+`--emit=shared` (with `--c-lib=system` or `--c-freestanding`) a shared library of them;
+`--emit=obj`, `--emit=ir` and the text outputs need a source. An object or library must be
+among the inputs: `-l` alone is not a program.
+
+**`main` in an object.** When no translation unit defines `main`, an executable's `main` is
+the first object's among the inputs that defines one, else the first archive member's (whose
+member the start-up's call of it then takes, as the platform's start-up does):
+`axiom build util.c main.o`, `axiom build util.o -L. -lmain`. The start-up calls it as it
+calls a unit's ("Start-up and exit"): with `argc` and `argv`, after the constructors and
+the objects' initialization arrays, and its value is the argument of `exit` (which runs
+the `atexit` functions and flushes the streams) and the exit status. An object carries no
+type for `main`, so it is not checked: it is called as `int main(int, char **)`, which a
+`main` without parameters ignores (on WebAssembly, where a call has the function's type,
+its type in the object decides; `__main_argc_argv`, the tool conventions' name of
+`main(int, char **)`, is `main` too). An object of this compiler of C units that define
+`main` (`--emit=obj`) has their start-up and the runtime: the program's start-up calls its
+call of `main`, and its entry point gives way to the program's. For Windows targets such an
+object cannot be linked into a program yet (`E9004`; give those units as sources instead).
+A unit's `main` and an object's, or two objects', are `C3064`; a program whose units,
+objects and archives define no `main` is `C3063`.
 
 ### C options
 
@@ -181,7 +211,8 @@ with its own macros, types and internal names. Then the units are linked:
 
 - An external name is defined in at most one unit. A second definition, a tentative one
   included, is `C3064`, with a note at the first.
-- An executable's units define `main` once (`C3063` if not).
+- An executable's units define `main` once (`C3063` if neither they nor the objects and
+  archives linked define one: "`main` in an object", above).
 - A call or reference in one unit to another's definition is to that definition. Types
   are not compared between units: declare a function the same way in both, as a header
   does.
@@ -3646,6 +3677,8 @@ standard it claims, "Known deviations".
 - A universal (multi-architecture) Mach-O object is not read, nor are the SDK's `.tbd`
   stubs (such a library is bound by name) ("Objects and libraries").
 - A long-format Windows import library is an error ("Objects and libraries").
+- For Windows targets a program cannot link this compiler's object of C units that define
+  `main` (`E9004`: "The command line", `main` in an object).
 - `--emit=shared` takes no Axiom modules and not the compiler's C library: `--c-lib=system`
   or `--c-freestanding` ("Shared libraries").
 - A C source given with `--link=` needs the system's C compiler on Linux, and `clang` on
