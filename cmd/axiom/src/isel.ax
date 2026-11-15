@@ -414,16 +414,17 @@ pub fn sibling_call(v: *ir.Value) bool {
 // -----------------------------------------------------------------------------
 // Uses
 // -----------------------------------------------------------------------------
-// Clears the selection state of f's values (loc, flag, uses, user, aux2),
-// then counts each instruction's uses (user: the last) and marks with flag
-// 1 the pointer arithmetic used only as addresses, folded into memory
+// Clears the selection state of f's values (loc, flag, aux2) and marks with
+// flag 1 the pointer arithmetic used only as addresses, folded into memory
 // operands: that of loads, stores, atomics and further pointer arithmetic,
 // and the arguments of intrinsics for which mem_arg says so. Without
 // [base + index + disp] addressing (index_disp false), a register offset
 // under further pointer arithmetic is added once, into a register its users
 // share (and so is a constant offset under a register one, which needs its
-// base in a register: built once rather than at every use).
-pub fn count_uses(f: *mut ir.Func, index_disp: bool, mem_arg: fn(*ir.Value, usize) bool) void {
+// base in a register: built once rather than at every use). The selection
+// reads the counts of uses (nuses) and the only user (ir.single_user) from
+// the lists of uses: it does not change the IR from here on.
+pub fn init_values(f: *mut ir.Func, index_disp: bool, mem_arg: fn(*ir.Value, usize) bool) void {
     for p in f.params {
         p.loc = -1;
         p.flag = 0;
@@ -434,53 +435,38 @@ pub fn count_uses(f: *mut ir.Func, index_disp: bool, mem_arg: fn(*ir.Value, usiz
         while u.notnil(i) {
             i.loc = -1;
             i.flag = 0;
-            i.uses = 0;
             i.aux2 = 0;
-            i.user = ir.vnil();
             if i.op == ir.OP_PTRADD {
-                i.flag = 1;
+                i.flag = address_only(i, index_disp, mem_arg);
             }
             i = i.next;
         }
         b = b.next;
     }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
-            for k in @as(usize, 0)..3 {
-                let o = ops[k];
-                if u.isnil(o) or (o.kind != ir.V_INST) {
-                    continue;
-                }
-                o.uses += 1;
-                o.user = i;
-                if o.op == ir.OP_PTRADD {
-                    let is_addr = ((i.op == ir.OP_LOAD) and (k == 0)) or ((i.op == ir.OP_STORE) and (k == 1)) or
-                                  ((i.op == ir.OP_PTRADD) and (k == 0)) or
-                                  (((i.op == ir.OP_RMW) or (i.op == ir.OP_CMPXCHG)) and (k == 0));
-                    let indexed_base = not index_disp and (i.op == ir.OP_PTRADD) and (k == 0) and
-                                       (not is_c(o.b) or not is_c(i.b));
-                    if not is_addr or indexed_base {
-                        o.flag = o.flag & ~1;
-                    }
-                }
+}
+
+// 1 if every use of pointer arithmetic o is an address folded into its
+// user (init_values), else 0.
+fn address_only(o: *mut ir.Value, index_disp: bool, mem_arg: fn(*ir.Value, usize) bool) i32 {
+    let mut p = o.first_use;
+    while u.notnil(p) {
+        let i = ir.use_user(p);
+        let k = ir.use_slot(p);
+        if k < 3 {
+            let is_addr = ((i.op == ir.OP_LOAD) and (k == 0)) or ((i.op == ir.OP_STORE) and (k == 1)) or
+                          ((i.op == ir.OP_PTRADD) and (k == 0)) or
+                          (((i.op == ir.OP_RMW) or (i.op == ir.OP_CMPXCHG)) and (k == 0));
+            let indexed_base = not index_disp and (i.op == ir.OP_PTRADD) and (k == 0) and
+                               (not is_c(o.b) or not is_c(i.b));
+            if not is_addr or indexed_base {
+                return 0;
             }
-            for k in 0..i.xs.len {
-                let o = i.xs.get(k);
-                if o.kind == ir.V_INST {
-                    o.uses += 1;
-                    o.user = i;
-                    if (o.op == ir.OP_PTRADD) and not mem_arg(i, k) {
-                        o.flag = o.flag & ~1;
-                    }
-                }
-            }
-            i = i.next;
+        } else if not mem_arg(i, k - 3) {
+            return 0;
         }
-        b = b.next;
+        p = p.next;
     }
+    return 1;
 }
 
 // -----------------------------------------------------------------------------

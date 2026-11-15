@@ -787,7 +787,7 @@ fn gen_jump_table(b: *mut ir.Block, t: *mut ir.Value) void {
 // Per-function driver
 // -----------------------------------------------------------------------------
 fn prepare(f: *mut ir.Func) void {
-    is.count_uses(f, true, xsd.partial_addr);
+    is.init_values(f, true, xsd.partial_addr);
     each_inst(f, localize_ptradd);
     // the and / or / not of comparisons a branch tests (branch_tree)
     let mut b = f.first;
@@ -845,7 +845,8 @@ fn localize_ptradd(i: *mut ir.Value) void {
     if (i.op == ir.OP_PTRADD) and not xsl.imm_ok(i.b) and ir.is_op(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and
        not xsl.imm_ok(q.b) {
         let mut away = i.blk != q.blk;
-        if ((i.flag & 1) != 0) and ((i.uses != 1) or u.isnil(i.user) or (i.user.blk != q.blk)) {
+        let us = ir.single_user(i);
+        if ((i.flag & 1) != 0) and (u.isnil(us) or (us.blk != q.blk)) {
             away = true;
         }
         if away {
@@ -888,14 +889,14 @@ fn mark_fused_cmp(i: *mut ir.Value) void {
     if ir.fp_pinned(i) {
         return;  // (strict floating point: compared where it is, once)
     }
-    if (xis.is_scalar_cmp(i) or xsl.ptest_cond(i)) and (i.uses >= 1) and ((i.flag & xis.F_VALUE) == 0) {
+    if (xis.is_scalar_cmp(i) or xsl.ptest_cond(i)) and (i.nuses >= 1) and ((i.flag & xis.F_VALUE) == 0) {
         i.flag = i.flag | 2;
     }
-    if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
+    if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.nuses == 1) {
         // (x & y) cmp 0: test x, y
         let x = i.a;
         if (i.op == ir.OP_ICMP) and is.is_c(i.b) and (is.cval(i.b) == 0) and (x.kind == ir.V_INST) and
-           (x.op == ir.OP_AND) and (x.uses == 1) and (x.blk == b) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) {
+           (x.op == ir.OP_AND) and (x.nuses == 1) and (x.blk == b) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) {
             x.flag = x.flag | 4;
             // (x & (1 << k)) ==/!= 0: bt x, k
             let pr = ir.pred_of(i);
@@ -906,7 +907,7 @@ fn mark_fused_cmp(i: *mut ir.Value) void {
                 } else if xis.one_shl(x.a, b) {
                     x.a.flag = x.a.flag | xis.F_BT;
                 } else if is.is_c(x.b) and (is.cval(x.b) == 1) and ir.is_op(x.a, ir.OP_LSHR) and not is.is_c(x.a.b) and
-                          (x.a.uses == 1) and (x.a.blk == b) and (x.a.flag == 0) {
+                          (x.a.nuses == 1) and (x.a.blk == b) and (x.a.flag == 0) {
                     // ((y >> k) & 1) ==/!= 0: bt y, k
                     x.a.flag = x.a.flag | xis.F_BTR;
                 }
@@ -919,19 +920,19 @@ fn mark_fused_cmp(i: *mut ir.Value) void {
 // sub, and, or, xor, mul) when nothing between writes memory: flag 8.
 fn mark_folded_load(i: *mut ir.Value) void {
     let b = i.blk;
-    if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and u.notnil(i.user) and
-       (i.user.blk == b) and ((i.flag & xis.F_RMW) == 0) {
-        let us = i.user;
+    let us = ir.single_user(i);
+    if (i.op == ir.OP_LOAD) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and u.notnil(us) and (us.blk == b) and
+       ((i.flag & xis.F_RMW) == 0) {
         let bits = i.ty.bits;
         let mut ok = false;
         let mut end = us;
-        if (us.op == ir.OP_ICMP) and (us.uses == 1) and ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
+        if (us.op == ir.OP_ICMP) and (us.nuses == 1) and ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
             ok = ((us.a == i) and (us.b != i) and xsl.imm_ok(us.b)) or ((us.b == i) and (us.a != i));
             if is.fused(us) {
                 // (compared at its branch or select, or a branch tree's branch)
-                end = us.user;
+                end = ir.single_user(us);
                 while (end.flag & xis.F_BRANCH) != 0 {
-                    end = end.user;
+                    end = ir.single_user(end);
                 }
             }
         } else if (us.op == ir.OP_SEXT) and (us.ty.kind == ir.T_INT) and (us.ty.bits <= 64) and (us.ty.bits > bits) and
@@ -970,7 +971,7 @@ fn int_reg_op(i: *mut ir.Value) bool {
 // Is x a negation that scalar @fma i can compute itself (F_FMNEG): used
 // only there, in its block, and computed by nothing else?
 fn fma_neg(x: *mut ir.Value, i: *ir.Value) bool {
-    return ir.is_op(x, ir.OP_FNEG) and (x.uses == 1) and (x.blk == i.blk) and (x.flag == 0) and (x.ty == i.ty);
+    return ir.is_op(x, ir.OP_FNEG) and (x.nuses == 1) and (x.blk == i.blk) and (x.flag == 0) and (x.ty == i.ty);
 }
 
 // @fma(a, b, -c) as vfmsub, @fma(-a, b, c) and @fma(a, -b, c) as vfnmadd
@@ -1060,11 +1061,11 @@ fn mark_lea(i: *mut ir.Value) void {
 // (sbb's) operands. The idiom of a sum's carry is lo = a + b, lo <u a (of a
 // difference's borrow, a <u b): cgen_wint.ax makes it.
 fn carry_part(z: *mut ir.Value, i: *ir.Value) bool {
-    if not ir.is_op(z, ir.OP_ZEXT) or (z.uses != 1) or (z.blk != i.blk) or (z.ty != i.ty) or (z.flag != 0) {
+    if not ir.is_op(z, ir.OP_ZEXT) or (z.nuses != 1) or (z.blk != i.blk) or (z.ty != i.ty) or (z.flag != 0) {
         return false;
     }
     let c = z.a;
-    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.cv != ir.pred_cv(ir.IntULT)) or (c.uses != 1) or
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.cv != ir.pred_cv(ir.IntULT)) or (c.nuses != 1) or
        (c.blk != i.blk) {
         return false;
     }
@@ -1095,7 +1096,7 @@ fn mark_carry(i: *mut ir.Value) void {
     z.flag = z.flag | xis.F_CSKIP;
     z.a.flag = z.a.flag | xis.F_CSKIP;
     i.flag = i.flag | xis.F_ADC;
-    if (x.kind == ir.V_INST) and (x.op == i.op) and (x.uses == 1) and (x.blk == i.blk) and (x.flag == 0) and
+    if (x.kind == ir.V_INST) and (x.op == i.op) and (x.nuses == 1) and (x.blk == i.blk) and (x.flag == 0) and
        (x.ty == i.ty) and plain_operand(x.a) and plain_operand(x.b) {
         x.flag = x.flag | xis.F_CSKIP;
     }
@@ -1135,7 +1136,7 @@ fn bsr_count(i: *mut ir.Value) void {
 
 fn bsr_mark(i: *mut ir.Value) void {
     if xis.full_clz(i) {
-        if (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+        if (i.nuses > 0) and (@as(i64, i.nuses) == i.aux2) {
             i.flag = i.flag | xis.F_BSR;
         }
         i.aux2 = 0;
@@ -1150,7 +1151,7 @@ fn mark_rmw(st: *mut ir.Value) void {
     }
     let y = st.a;
     let t = y.ty;
-    if (y.kind != ir.V_INST) or (t.kind != ir.T_INT) or (t.bits < 8) or (t.bits > 64) or (y.uses != 1) or
+    if (y.kind != ir.V_INST) or (t.kind != ir.T_INT) or (t.bits < 8) or (t.bits > 64) or (y.nuses != 1) or
        (y.blk != st.blk) or (y.flag != 0) {
         return;
     }
@@ -1177,7 +1178,7 @@ fn mark_rmw(st: *mut ir.Value) void {
 
 // Is ld a plain load, used once, of what store st writes (the same address)?
 fn rmw_load(ld: *mut ir.Value, st: *mut ir.Value) bool {
-    return (ld.kind == ir.V_INST) and (ld.op == ir.OP_LOAD) and (ld.uses == 1) and (ld.flags == 0) and
+    return (ld.kind == ir.V_INST) and (ld.op == ir.OP_LOAD) and (ld.nuses == 1) and (ld.flags == 0) and
            (ld.blk == st.blk) and (ld.flag == 0) and (ld.ty == st.a.ty) and same_addr(ld.a, st.b, 4);
 }
 
@@ -1696,7 +1697,7 @@ fn sink_to_use(f: *mut ir.Func) void {
             let id = @int_cast(usize, i.id);
             let mut e = i;
             let mut epos = i.pos;
-            let all = (seen[id] > 0) and (seen[id] == i.uses);
+            let all = (seen[id] > 0) and (seen[id] == i.nuses);
             if all and
                (xsl.folded_load(i) or xsl.bcast_splat(i) or (ir.is_op(i, ir.OP_PTRADD) and ((i.flag & 1) != 0))) {
                 e = minst[id];  // (computed in its users)
@@ -1749,7 +1750,7 @@ fn sink_phi_inputs(b: *mut ir.Block) void {
         let mut p = s.first;
         while u.notnil(p) and (p.op == ir.OP_PHI) {
             let x = ir.incoming(p, b);
-            if u.notnil(x) and (x.kind == ir.V_INST) and (x.blk == b) and (x.uses == 1) and (x != t) and sinkable2(x) {
+            if u.notnil(x) and (x.kind == ir.V_INST) and (x.blk == b) and (x.nuses == 1) and (x != t) and sinkable2(x) {
                 // the last instruction of b reading p (not a phi: those read at
                 // the end of a block before)
                 let mut lu = u.nil.[ir.Value]();
@@ -1823,7 +1824,7 @@ fn live_through(b: *mut ir.Block, i: *mut ir.Value, o: *mut ir.Value, t: *mut ir
         return o.blk.loop_depth < b.loop_depth;
     }
     let id = @int_cast(usize, o.id);
-    return (inblk[id] < o.uses) or ((last[id] > i.pos) and (last[id] >= t.pos));
+    return (inblk[id] < o.nuses) or ((last[id] > i.pos) and (last[id] >= t.pos));
 }
 
 // An integer operation of two values (an address's index: k*n + i), which
@@ -1832,7 +1833,7 @@ fn live_through(b: *mut ir.Block, i: *mut ir.Value, o: *mut ir.Value, t: *mut ir
 // are, as for an index into one of several rows, computed for each row's
 // load).
 fn sinkable2(i: *mut ir.Value) bool {
-    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.uses < 1) or xsl.remat(i) or (i.ty.kind != ir.T_INT) or
+    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.nuses < 1) or xsl.remat(i) or (i.ty.kind != ir.T_INT) or
        (i.ty.bits > 64) {
         return false;
     }
@@ -1842,7 +1843,7 @@ fn sinkable2(i: *mut ir.Value) bool {
 }
 
 fn sinkable(i: *mut ir.Value) bool {
-    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.uses < 1) or xsl.remat(i) or ir.fp_pinned(i) {
+    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.nuses < 1) or xsl.remat(i) or ir.fp_pinned(i) {
         return false;
     }
     if i.op == ir.OP_PTRADD {

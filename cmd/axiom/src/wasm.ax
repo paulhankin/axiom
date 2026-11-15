@@ -3303,40 +3303,19 @@ fn pure_op(v: *ir.Value) bool {
     return false;
 }
 
-fn count_uses(f: *mut ir.Func) void {
+// Clears the selection state of f's instructions (pos, loc, flag). The
+// counts of uses (nuses) and the only users (ir.single_user) come from the
+// lists of uses: nothing changes the IR from here on.
+fn init_values(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         let mut pos: i32 = 0;
         while u.notnil(i) {
-            i.uses = 0;
-            i.user = ir.vnil();
             i.pos = pos;
             i.loc = -1;
             i.flag = FL_LOCAL;
             pos += 1;
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
-            for o in ops {
-                if u.notnil(o) and (o.kind == ir.V_INST) {
-                    o.uses += 1;
-                    o.user = i;
-                }
-            }
-            for k in 0..i.xs.len {
-                let o = i.xs.get(k);
-                if o.kind == ir.V_INST {
-                    o.uses += 1;
-                    o.user = i;
-                }
-            }
             i = i.next;
         }
         b = b.next;
@@ -3428,32 +3407,32 @@ fn classify(f: *mut ir.Func) void {
 
 fn classify_one(b: *mut ir.Block, i: *mut ir.Value) void {
     let o = i.op;
+    let us = ir.single_user(i);  // (nil unless it has one use)
     if (o == ir.OP_INTR) and (ir.intr_id(i) == ir.IN_ASM) {
         return;  // (where it is: its outputs, IN_CALL_RESULT, are read after it)
     }
     if o == ir.OP_ALLOCA {
         i.flag = FL_REMAT;
-    } else if (o == ir.OP_PTRADD) and (i.b.kind == ir.V_CINT) and (i.uses > 1) and
+    } else if (o == ir.OP_PTRADD) and (i.b.kind == ir.V_CINT) and (i.nuses > 1) and
               ((i.a.kind != ir.V_INST) or (i.a.flag == FL_LOCAL) or (i.a.flag == FL_REMAT)) {
         i.flag = FL_REMAT;
-    } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
-              phi_from(i.user, i) == b {
+    } else if u.notnil(us) and (o != ir.OP_PHI) and pure_op(i) and (us.op == ir.OP_PHI) and (phi_from(us, i) == b) {
         // computed where the phi copy at the end of this block pushes it;
         // that is on one edge only unless the block ends in a plain branch
         if not inlines_effects(i) or ((ir.terminator(b).op == ir.OP_BR) and no_effects_between(i, ir.vnil())) {
             i.flag = FL_INLINE;
         }
-    } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
-              (i.user.op != ir.OP_PHI) and (i.user.pos > i.pos) {
+    } else if u.notnil(us) and (o != ir.OP_PHI) and not ir.is_term(o) and (us.blk == b) and (us.op != ir.OP_PHI) and
+              (us.pos > i.pos) {
         if pure_op(i) {
             // a load inside it moves to the user too
-            if not inlines_effects(i) or no_effects_between(i, i.user) {
+            if not inlines_effects(i) or no_effects_between(i, us) {
                 i.flag = FL_INLINE;
             }
         } else if (o == ir.OP_LOAD) or (o == ir.OP_CALL) or (o == ir.OP_INTR) or (o == ir.OP_RMW) or
                   (o == ir.OP_CMPXCHG) {
             // only if nothing with effects happens in between
-            if no_effects_between(i, i.user) {
+            if no_effects_between(i, us) {
                 i.flag = FL_INLINE;
             }
         }
@@ -3634,7 +3613,7 @@ fn alloc_locals(f: *mut ir.Func, order: u.List.[*mut ir.Block]) void {
     for bi in 0..nb {
         let mut i = order.get(bi).first;
         while u.notnil(i) {
-            if (i.ty.kind != ir.T_VOID) and (i.flag == FL_LOCAL) and ((i.uses > 0) or (i.op == ir.OP_PHI)) {
+            if (i.ty.kind != ir.T_VOID) and (i.flag == FL_LOCAL) and ((i.nuses > 0) or (i.op == ir.OP_PHI)) {
                 i.loc = @int_cast(i32, lvals.len);
                 lvals.push(i);
             }
@@ -3997,7 +3976,7 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
         scope_row(i.scope);
         expr(i);
         if i.ty.kind != ir.T_VOID {
-            if i.uses > 0 {
+            if i.nuses > 0 {
                 local_set(@int_cast(u32, i.loc));
                 wev(2, i.loc, i);
             } else {
@@ -4733,7 +4712,7 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     header_p = header.ptr;
     nblocks = nb;
     mark_joins(&order, merge, header);
-    count_uses(f);
+    init_values(f);
     classify(f);
     if not lay_out_frame(f) {
         return;

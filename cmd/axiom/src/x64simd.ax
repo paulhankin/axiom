@@ -1102,10 +1102,10 @@ fn extract_lane(v: *mut ir.Value, d: i32, a: i32, t: *ir.Ty, lane: i64) void {
 }
 
 pub fn gen_insert(v: *mut ir.Value) void {
+    let us = ir.single_user(v);
     if (v.ty.size == 16) and (v.cv == 0) and is.lane_float(v.ty) and (is.lane_bits(v.ty) == 64) and
        ((v.a.kind == ir.V_UNDEF) or
-        (is_vzero(v.a) and (v.uses == 1) and ir.is_op(v.user, ir.OP_INSERTELEM) and (v.user.a == v) and
-         (v.user.cv == 1))) {
+        (is_vzero(v.a) and ir.is_op(us, ir.OP_INSERTELEM) and (us.a == v) and (us.cv == 1))) {
         // a double into lane 0 of a pair whose lane 1 is undefined or about
         // to be replaced: the scalar's register as it is (then one shufpd
         // builds the pair)
@@ -1585,14 +1585,14 @@ fn wide_shuffle(v: *mut ir.Value) void {
 // (Lanes above v's are never read; an add of a 512-bit vector's register
 // in xmm16-31 is EVEX, x64enc.high_ok.)
 fn low_alias(v: *mut ir.Value) bool {
-    if (v.loc >= 0) or (v.a.kind != ir.V_INST) or (v.uses != 1) or u.isnil(v.user) or not vs.plumbing(v) {
+    if (v.loc >= 0) or (v.a.kind != ir.V_INST) or u.isnil(ir.single_user(v)) or not vs.plumbing(v) {
         return false;
     }
     let n = ir.mask_of(v).len;
     if (n >= @int_cast(usize, v.a.ty.lanes)) or (ir.mask_of(v)[0] != 0) {
         return false;
     }
-    let us = v.user;
+    let us = ir.single_user(v);
     return ((us.op == ir.OP_FADD) or (us.op == ir.OP_ADD)) and (us.ty == v.ty) and (us.a != us.b);
 }
 
@@ -2555,11 +2555,11 @@ fn strip_bitcast(v: *mut ir.Value) *mut ir.Value {
 // zeroed, where the mask is clear.
 fn maskable_op(x: *mut ir.Value, lanes: i32) *mut ir.Value {
     let o = strip_bitcast(x);
-    if (o.kind != ir.V_INST) or (o.ty.kind != ir.T_VEC) or (o.uses != 1) or (o.ty.lanes != lanes) or
+    if (o.kind != ir.V_INST) or (o.ty.kind != ir.T_VEC) or (o.nuses != 1) or (o.ty.lanes != lanes) or
        ((o.flag & ~@as(i32, 256)) != 0) {
         return ir.vnil();
     }
-    if (o != x) and ((x.uses != 1) or ((x.flag & ~@as(i32, 256)) != 0)) {
+    if (o != x) and ((x.nuses != 1) or ((x.flag & ~@as(i32, 256)) != 0)) {
         return ir.vnil();
     }
     let k = o.op;
@@ -2774,14 +2774,14 @@ pub fn mark_fused_vectors(f: *mut ir.Func) void {
             // emitted, and the blend reads their operands; one that another
             // instruction reads too is emitted, and may fold its operand, a
             // load, into its own memory operand, leaving it in no register)
-            if u.notnil(s.x) and x64c.avx512_for(i.ty.size) and (s.p.uses == 1) and (s.q.uses == 1) {
+            if u.notnil(s.x) and x64c.avx512_for(i.ty.size) and (s.p.nuses == 1) and (s.q.nuses == 1) {
                 i.flag = i.flag | 64;
                 s.p.flag = s.p.flag | 16;
                 s.q.flag = s.q.flag | 16;
                 if kcmp(s.m) {
                     s.m.aux2 += 1;  // (p reads it)
                 }
-                if s.n.uses == 1 {
+                if s.n.nuses == 1 {
                     s.n.flag = s.n.flag | 16;
                     if kcmp(s.m) {
                         s.m.aux2 += 1;
@@ -2838,7 +2838,7 @@ pub fn mark_fused_vectors(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.last;
         while u.notnil(i) {
-            if kcmp(i) and (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+            if kcmp(i) and (i.nuses > 0) and (@as(i64, i.nuses) == i.aux2) {
                 i.flag = i.flag | 32;
                 if ir.is_op(i, ir.OP_AND) {
                     i.a.aux2 += 1;
@@ -2855,7 +2855,7 @@ pub fn mark_fused_vectors(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if ptest_cmp(i) and ((xsl.inst_vl(i) == 64) or ((i.flag & 32) != 0)) and ir.is_op(i.a, ir.OP_AND) and
-               (i.a.uses == 1) and (i.a.flag == 0) and (i.a.blk == b) and kcmp(i) {
+               (i.a.nuses == 1) and (i.a.flag == 0) and (i.a.blk == b) and kcmp(i) {
                 i.a.flag = i.a.flag | 16;
             }
             i = i.next;
@@ -2867,28 +2867,27 @@ pub fn mark_fused_vectors(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if xc.FN.avx and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
-               not xsl.remat(i) and u.notnil(i.user) and (i.user.blk == b) and
-               ((i.user.flag & (((16 | 32) | 64) | (128 | 256))) == 0) and reads_as_rm(i.user, i) and
-               xsl.quiet_between(i, i.user) {
+            let us = ir.single_user(i);
+            if xc.FN.avx and (i.op == ir.OP_LOAD) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
+               not xsl.remat(i) and u.notnil(us) and (us.blk == b) and
+               ((us.flag & (((16 | 32) | 64) | (128 | 256))) == 0) and reads_as_rm(us, i) and xsl.quiet_between(i, us) {
                 i.flag = i.flag | 8;
             }
             // a scalar float load that is the r/m operand of its only user,
             // an arithmetic operation (addsd xmm, [m])
-            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_FLOAT) and
-               ((i.ty.bits == 32) or (i.ty.bits == 64)) and u.notnil(i.user) and (i.user.blk == b) and
-               (i.user.ty == i.ty) and (i.user.op >= ir.OP_FADD) and (i.user.op <= ir.OP_FDIV) and
-               (i.user.flag == 0) and scalar_rm(i.user, i) and xsl.quiet_between(i, i.user) {
+            if (i.op == ir.OP_LOAD) and (i.flags == 0) and (i.ty.kind == ir.T_FLOAT) and
+               ((i.ty.bits == 32) or (i.ty.bits == 64)) and u.notnil(us) and (us.blk == b) and (us.ty == i.ty) and
+               (us.op >= ir.OP_FADD) and (us.op <= ir.OP_FDIV) and (us.flag == 0) and scalar_rm(us, i) and
+               xsl.quiet_between(i, us) {
                 i.flag = i.flag | 8;
             }
             // a scalar load only splatted: a broadcast from memory
-            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and
-               ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
-               u.notnil(i.user) and ir.is_op(i.user, ir.OP_SPLAT) and (i.user.blk == b) and tg.has(tg.X_AVX2) and
-               xsl.quiet_between(i, i.user) {
+            if (i.op == ir.OP_LOAD) and (i.flags == 0) and ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and
+               (i.ty.bits >= 8) and (i.ty.bits <= 64) and ir.is_op(us, ir.OP_SPLAT) and (us.blk == b) and
+               tg.has(tg.X_AVX2) and xsl.quiet_between(i, us) {
                 i.flag = i.flag | 8;
-                if bcast_fma(i.user) {
-                    i.user.flag = i.user.flag | xsl.F_BCST;
+                if bcast_fma(us) {
+                    us.flag = us.flag | xsl.F_BCST;
                 }
             }
             i = i.next;
@@ -2902,8 +2901,8 @@ pub fn mark_fused_vectors(f: *mut ir.Func) void {
 // element ({1to16}, {1to8})? The load then happens at the user: nothing
 // between may write memory.
 fn bcast_fma(s: *mut ir.Value) bool {
-    let us = s.user;
-    if (s.uses != 1) or u.isnil(us) or (us.blk != s.blk) or (s.ty.size != 64) or not tg.has(tg.X_AVX512F) or
+    let us = ir.single_user(s);
+    if (s.nuses != 1) or u.isnil(us) or (us.blk != s.blk) or (s.ty.size != 64) or not tg.has(tg.X_AVX512F) or
        not ir.is_op(us, ir.OP_INTR) or (ir.intr_id(us) != ir.IN_FMA) or (us.ty.size != 64) or
        ((us.flag & (((16 | 32) | 64) | (128 | 256))) != 0) or (is.lane_bits(s.ty) < 32) {
         return false;

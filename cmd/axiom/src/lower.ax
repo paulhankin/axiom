@@ -30,6 +30,10 @@ threadlocal let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 threadlocal let mut sret_calls: u.List.[*mut ir.Value] =
     u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
 
+// The aggregates with one use before lowering began (one_use_before).
+threadlocal let mut one_use: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                   cap: 0, len: 0 };
+
 threadlocal let mut const_globals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
@@ -317,18 +321,27 @@ fn field_const(c: *mut ir.Value, i: usize) *mut ir.Value {
     return ir.undef(ft);
 }
 
-// The uses of f's instructions as they are before lowering (lowering
-// takes some out as it goes: lower_body asks how many there were).
-fn count_uses(f: *mut ir.Func) void {
+// Notes the aggregates of f with one use as they are before lowering
+// (lowering takes some uses out as it goes: lower_body asks how many there
+// were).
+fn note_one_use(f: *mut ir.Func) void {
+    one_use.deinit();
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            i.uses = i.nuses;
+            if (i.nuses == 1) and ir.is_agg(i.ty) {
+                one_use.put(@as(u64, @int_from_ptr(i)), 1);
+            }
             i = i.next;
         }
         b = b.next;
     }
+}
+
+// Whether instruction v had one use before lowering began (note_one_use).
+fn one_use_before(v: *mut ir.Value) bool {
+    return one_use.get(@as(u64, @int_from_ptr(v))) != 0;
 }
 
 fn lower_call(v: *mut ir.Value) void {
@@ -404,7 +417,7 @@ fn lower_call(v: *mut ir.Value) void {
 
 fn lower_body(f: *mut ir.Func) void {
     F = f;
-    count_uses(f);
+    note_one_use(f);
     // aggregate parameters passed as leaves: stored into a slot on entry
     let mut lp = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
     for i in 0..f.split.len {
@@ -459,7 +472,7 @@ fn lower_body(f: *mut ir.Func) void {
                 let mut s = vnil();
                 if base.kind == ir.V_UNDEF {
                     s = entry_alloca(i.ty);
-                } else if (base.kind == ir.V_INST) and (base.uses == 1) and (base.aux2 == 1) {
+                } else if (base.kind == ir.V_INST) and one_use_before(base) and (base.aux2 == 1) {
                     s = slot(base);  // the only use: build in place
                 } else if ir.is_const(base) {
                     s = entry_alloca(i.ty);
