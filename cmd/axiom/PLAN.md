@@ -186,7 +186,15 @@ pages they wrote cost more than the parts' copies of the tables.
 - A host without threads (a browser without shared memory) still compiles
   the whole program as one unit.
 - The parts' copies of the debug tables (-O2 -g) could hold only the
-  entries of each part's functions.
+  entries of each part's functions. Measured, and not worth it: for the
+  compiler's -O2 -g self build each part copies about 52 MB (`dbg_refs`
+  405k entries, 13 MB; `dbg_marks` 589k, 24 MB; `mk_inst` 8 MB; the rest
+  under 4 MB each), and with no copy of the marks at all (an experiment:
+  the debug information wrong) the build's peak memory did not change
+  (3.17-3.23 GB against 3.24-3.27 GB, four threads: noise is larger),
+  as the peak is not in the parts' copies. `dbg_refs` could not be cut
+  anyway without renumbering it: `dbginfo.DVar.stores` (shared by the
+  parts) holds its indexes.
 - (Done.) Asm that names a C program's internal functions and data
   (`tests/c/run/asm_symbols.c`) did not link when the program was compiled
   in parts (`AXIOM_PARTS=3`; forked parts alike): the parts' symbols for
