@@ -186,12 +186,32 @@ pages they wrote cost more than the parts' copies of the tables.
 - A host without threads (a browser without shared memory) still compiles
   the whole program as one unit.
 - The parts' copies of the debug tables (-O2 -g) could hold only the
-  entries of each part's functions.
-- File-scope asm that refers to a C program's internal functions and data
-  (`tests/c/run/asm_symbols.c`) does not link when the program is compiled
-  in parts (`AXIOM_PARTS=3`; forked parts alike): the first part's asm
-  names them, the parts' symbols for them have names made unique
-  (`isel.sym_name`).
+  entries of each part's functions. Measured, and not worth it: for the
+  compiler's -O2 -g self build each part copies about 52 MB (`dbg_refs`
+  405k entries, 13 MB; `dbg_marks` 589k, 24 MB; `mk_inst` 8 MB; the rest
+  under 4 MB each), and with no copy of the marks at all (an experiment:
+  the debug information wrong) the build's peak memory did not change
+  (3.17-3.23 GB against 3.24-3.27 GB, four threads: noise is larger),
+  as the peak is not in the parts' copies. `dbg_refs` could not be cut
+  anyway without renumbering it: `dbginfo.DVar.stores` (shared by the
+  parts) holds its indexes.
+- (Done.) Asm that names a C program's internal functions and data
+  (`tests/c/run/asm_symbols.c`) did not link when the program was compiled
+  in parts (`AXIOM_PARTS=3`; forked parts alike): the parts' symbols for
+  them have names made unique (`isel.sym_name`), which the asm's names
+  (`Blob.aliases`) did not find, in the part that defines them or in the
+  others. Now a name the object does not define under the asm's name is
+  the part's symbol for it (`asm/obj.ax` `part_sym`, which the backends
+  set to `isel.part_sym`: defined, or another part's under its unique
+  name). Asm that defines local symbols (named labels, not global) that C
+  and other asm refer to by name (`asm/obj.ax` `resolve`, which finds them
+  in one object) keeps the module in one unit (`Blob.locals`,
+  `backend.compile_parts`): such a reference may be in any part. Programs
+  without such asm, and every program not compiled in parts, are
+  unchanged; a test (`flags: C asm naming static functions and data,
+  compiled in parts`) builds both kinds in three parts (x86-64, AArch64,
+  Windows), and the asm tests pass with `AXIOM_PARTS=3` at -O2 (x86-64,
+  AArch64).
 
 ### Current state (before this item)
 
@@ -360,9 +380,27 @@ keeps it, the program runs, and no FDE describes left-out code.
 
 ### What remains
 
-- The objects of `--units=module` are ~33% larger (section headers and
-  `.rela` sections: ~140k sections for the compiler). The plan's compact
-  atom table inside `elf.Obj` would avoid that; not needed so far.
+- (Done.) The objects of `--units=module` were ~33% larger (section
+  headers and `.rela` sections: ~147k sections for the compiler). Rather
+  than an atom table inside `elf.Obj` (whose objects the linkers would
+  then read differently), the unit cache's objects are packed
+  (`elfpack.ax`): the section headers, the relocations and the symbol
+  table, fixed-size records of small fields close to the record before's,
+  are LEB128 differences, the rest of the bytes as they are. A packed
+  object unpacks to the very bytes it was packed from (`pack` checks it,
+  and keeps the object as it is otherwise), which `elf.read` reads as it
+  reads any object, so the links are unchanged by construction (checked:
+  the compiler at `-O1 --units=module` for x86-64, also `-O0 -g`,
+  AArch64, Windows and macOS at `-O1 -g`, byte-identical executables).
+  Only the module threads pack (`backend.g_pack`, set by `units.ax`); a
+  link by the system's tools (`main.link_cc`, when our linker falls back)
+  is given the unpacked objects in temporary files. The compiler's object
+  cache: 45.3 MB to 23.2 MB at `-O1` (33.6 MB before the sections per
+  function), 65.1 to 37.4 MB at `-O0 -g`, 78.9 to 43.2 MB for AArch64
+  `-O1 -g`. A cold `-O1` build takes as long (4.9-5.8 s against
+  5.8-6.0 s, 11.0-11.2 s of user time both, two jobs); a relink with
+  everything cached 1.11-1.15 s against 1.07-1.10 s (the unpacking,
+  about 40 ms).
 - Each module's site-string blob (`.site_strs`, in `codegen.ax`) is one
   datum, kept whole if any of its records is: about a third of a small
   program's `.rodata`. Splitting it per function was tried; it saved 3-5%
@@ -788,7 +826,7 @@ Other modules with process-lifetime state that item 1 had to account for:
 (Item 1 made all of this thread-local, but the linkers' (`nlink.ax`), which
 run on the main thread: see section 1, "Status".)
 
-**5b (module splits and enums): done, but for codegen's builtins (below).**
+**5b (module splits and enums): done.**
 Every split moved
 declarations as they were, by a script (a declaration goes with what it
 uses, and a reference becomes `alias.name`), so each commit left the
@@ -821,6 +859,30 @@ it moved. Done:
   expressions, builtins) and `cgmain.ax` (537, above `codegen.ax`:
   `codegen_program`, the native entry, the runtime's exports). Item 1's
   `CodegenCtx` can now be `cgctx.ax`'s globals gathered.
+- `codegen.ax`'s builtins: `codegen.ax` (4,149 lines) is three more:
+  `cgbase.ax` (1,181, above `cgctx.ax` and `cgrt.ax`: the 42 helpers the
+  builtins share with the rest, none of which generates an expression:
+  function instances and their mangling (`get_inst`), globals, strings
+  and constants (`global_addr`, `string_ptr`, `const_slice`, `gen_const`),
+  error codes, the processor's extensions (`cpu_has_bits`, `cpu_fn`), the
+  arithmetic (`gen_binop`, `op_with_overflow`, `gen_shift`, `int_min`/
+  `int_max`), `via_pointer`, `on_x64`/`on_a64`, the coverage runtime's
+  globals and `CABI_PREFIX`), `cgbuiltin.ax` (1,635, above `cgbase.ax`:
+  the "Builtins" section as it was, with the ASan and coverage helpers
+  that `codegen.ax` calls too) and `codegen.ax` (1,404: instances,
+  defers, places, calls, `catch`/`try`, expressions, statements, bodies).
+  The builtins reach `codegen.ax` only through `gen` (97 calls), which is
+  a function pointer in `cgbuiltin.ax` (`bi.gen`), thread-local like the
+  rest of the unit's state, which `codegen.set_hooks` sets when
+  `cgmain.codegen_program` starts: on every thread that generates code
+  (the main thread, `units.ax`'s module threads). The threads of a
+  program's parts (`backend.compile_parts`) run no code generation from
+  the syntax tree, so nothing there reaches it; until it is set it stops
+  the compiler with a message, as `semabuiltin.ax`'s do. The compiler's
+  output on the fixed corpus (above, with -O2 -g and `--units=module`
+  self builds added) and the self build at its fixed point are unchanged
+  (the -O2 self build: 23.7 s user, 2.53 GB peak by the base compiler,
+  24.2 s and 2.51 GB after; two jobs, within noise).
 - `semabuiltin.ax` (1,293 lines, below `sema.ax`, which is now 4,633):
   the checking of the builtins (`builtin_check` and the conversion,
   memory, math, vector, atomic and system builtins), with the small
@@ -905,20 +967,6 @@ were identical.
 
 ### What remains (5b)
 
-- **`codegen.ax`'s builtins** (the "Builtins" section, about 1,600 lines:
-  `gen_builtin` and the conversion, memory, math, vector and system
-  builtins, with the ASan and coverage helpers kept there). A layering
-  exists: the builtins reach the rest of
-  `codegen.ax` only through `gen` (16 calls) and 38 helpers (about 1,100
-  lines: `get_inst` and the mangling, `global_addr`, `string_ptr`,
-  `const_slice`, `errcode_value`, `int_min`/`int_max`, `gen_binop`,
-  `op_with_overflow` ...), none of which calls back up. So `cgbuiltin.ax`
-  can sit below `codegen.ax` once those helpers are a module of their own
-  (between `cgctx.ax` and it) and `gen` is reached through a function
-  pointer that `codegen.ax` sets (in `cgctx.ax`, thread-local or set
-  before item 1's workers start). That changes calls rather than moving
-  declarations, so it was left for a step of its own. (`sema.ax`'s
-  builtins were split this way: `semabuiltin.ax`, above.)
 - Other candidates for `match`: chains of separate `if v == X { return
   ... }` (the backends' intrinsic dispatch) mean the same only when every
   arm returns; they were not rewritten by the script.

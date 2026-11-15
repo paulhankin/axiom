@@ -239,7 +239,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, statements, expressions, builtins, each instruction's source line), over `cgctx.ax` (its options, the unit's IR module, builder and tables, small IR helpers); `cgrt.ax`: traps, stack traces (each call's site record, or the shadow stack), the stack limit, frame tables; `cgmain.ax`: a run (`codegen_program`), the native entry and the runtime's exports |
+| `codegen.ax` | The checked program to IR (monomorphization, statements, expressions, each instruction's source line), over `cgbuiltin.ax` (the builtins, which reach `codegen.ax`'s expressions through a function it sets), `cgbase.ax` (what both use: function instances and their symbols, globals, strings and constants, the processor's extensions, arithmetic) and `cgctx.ax` (its options, the unit's IR module, builder and tables, small IR helpers); `cgrt.ax`: traps, stack traces (each call's site record, or the shadow stack), the stack limit, frame tables; `cgmain.ax`: a run (`codegen_program`), the native entry and the runtime's exports |
 | `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
@@ -264,7 +264,7 @@ $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_E
 | `isel.ax` | Instruction-selection helpers both native backends use: constants and operand tests, use counts and address folding before selection, phi copies as parallel moves, the layout of globals in the object |
 | `x64.ax`, `x64caps.ax`, `x64emit.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands) and register allocation (`x64.ax`); what it selects as one instruction with the function's extensions, which `codegen.ax` asks (`x64caps.ax`); peepholes on the allocated code, frame layout, unwind information and code placement (`x64emit.ax`; knobs for measuring placement, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64emit.ax` and the table below); the encoding of machine instructions (`x64enc.ax`) |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
-| `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
+| `elf.ax`, `elfpack.ax` | ELF relocatable objects: writing, and reading them back for the linker; the compact form of the unit cache's objects (`elfpack.ax`), which unpacks to the same bytes |
 | `nlink.ax` | What the native linkers share: the input objects' symbols and sections, the GOT, placing sections by class, and AArch64 and x86-64 relocations |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
 | `mlink.ax` | The Mach-O linker for `aarch64-macos` and `x86_64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes (libSystem, frameworks and dylibs by ordinal), rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
@@ -437,7 +437,7 @@ types share a module.
 | `sema.ax` | `sema_decl.c`, `sema_expr.c`, `sema_stmt.c` | name resolution, type checking |
 | `semabuiltin.ax` | `sema_builtins.c` | checking the builtins (below `sema.ax`, which it calls back through functions `sema.run` sets) |
 | `semapost.ax` | `sema_decl.c`, `sema_target.c` | the checks after type checking: object sizes, recursive inline functions, processor extensions (target conditions, `@features`/`@multiversion`, builtins that need an extension) |
-| `codegen.ax`, `cgctx.ax`, `cgrt.ax`, `cgmain.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
+| `codegen.ax`, `cgbuiltin.ax`, `cgbase.ax`, `cgctx.ax`, `cgrt.ax`, `cgmain.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
 | `units.ax` | `units.c` | separate compilation and the object cache: each module compiled on a worker thread, whose compiler state is thread-local (`util.ax`, worker threads) |
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |

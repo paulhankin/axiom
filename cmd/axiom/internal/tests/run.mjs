@@ -1460,7 +1460,7 @@ await section('C programs', {
   // section of its own and the link's garbage collection on by default,
   // which leaves out what the program does not use (--no-gc-sections keeps
   // it) and the .eh_frame entries of what it leaves out.
-  'sections: --units=module leaves out what the program does not use': async () => {
+  'sections: --units=module leaves out what the program does not use (its cached objects packed)': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the compiler\'s own linkers' };
     const d = path.join(tmp, 'units-gc');
     fs.mkdirSync(d, { recursive: true });
@@ -1492,6 +1492,10 @@ await section('C programs', {
         if (r.stdout !== '43\n') return `the program printed ${JSON.stringify(r.stdout)}`;
       }
     }
+    // (the cached objects are packed: elfpack.ax)
+    const objs = fs.readdirSync(path.join(d, 'cache', 'obj')).filter((n) => n.endsWith('.o'));
+    const raw = objs.filter((n) => !fs.readFileSync(path.join(d, 'cache', 'obj', n)).subarray(0, 8).equals(Buffer.from('\x7fAXPACK1', 'latin1')));
+    if (!objs.length || raw.length) return `cached objects not packed: ${raw.join(', ') || 'none cached'}`;
     return sizes[0] * 1.5 < sizes[1] ? null : `${sizes[0]} bytes with the garbage collection, ${sizes[1]} without`;
   },
   'sections: --function-sections, --gc-sections and COMDAT selections': async () => {
@@ -2167,6 +2171,73 @@ await section('spec §16.3', {
       return r.status !== 0 && /parts ok/.test(r.stdout) && /at deep/.test(r.stderr) && /at main/.test(r.stderr)
         ? null : `status ${r.status}:\n${r.stdout}${r.stderr}`;
     },
+    'C asm naming static functions and data, compiled in parts (AXIOM_PARTS=3)': () => {
+      if (!native || isBootstrap()) return { skip: true, reason: 'the compiler, native' };
+      if (/macos/.test(process.env.AXIOM_NATIVE_TARGET || '') || (!process.env.AXIOM_NATIVE_TARGET && process.platform === 'darwin')) {
+        return { skip: true, reason: 'not Mach-O (symbol names)' };
+      }
+      prepare();
+      // asm naming statics (the parts' objects name them uniquely: each
+      // part's asm finds them), and asm defining a local symbol that other
+      // asm names (which keeps the program in one unit)
+      const prog = (labels) => [
+        '#include <stdio.h>',
+        'static int counter = 5;',
+        'static int twice(int x) { return 2 * x; }',
+        'static int calls;',
+        'static void helper(void) { calls++; }',
+        'void tmpl_fn(void);',
+        'static int use_static(void) {',
+        '    int r;',
+        '#if defined(__AXIOM_ASM_X86_64__) && __AXIOM_BITFIELD_LAYOUT__ == 2',
+        '    __asm__ volatile("movl counter(%%rip), %%ecx\\n\\tsub $40, %%rsp\\n\\tcall twice\\n\\tadd $40, %%rsp\\n\\tmovl %%eax, %0"',
+        '                     : "=r"(r) : : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");',
+        '#elif defined(__AXIOM_ASM_X86_64__)',
+        '    __asm__ volatile("movl counter(%%rip), %%edi\\n\\tcall twice\\n\\tmovl %%eax, %0"',
+        '                     : "=r"(r) : : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory");',
+        '#else',
+        '    __asm__ volatile("adrp x9, counter\\n\\tldr w0, [x9, :lo12:counter]\\n\\tbl twice\\n\\tmov %w0, w0"',
+        '                     : "=r"(r) : : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",',
+        '                       "x13", "x14", "x15", "x16", "x17", "x30", "memory");',
+        '#endif',
+        '    return r;',
+        '}',
+        '#if defined(__AXIOM_ASM_X86_64__) && __AXIOM_BITFIELD_LAYOUT__ == 2',
+        '__asm__(".text\\n.globl tmpl_fn\\ntmpl_fn:\\n  sub $40, %rsp\\n  call helper\\n  add $40, %rsp\\n  ret\\n");',
+        '#elif defined(__AXIOM_ASM_X86_64__)',
+        '__asm__(".text\\n.globl tmpl_fn\\ntmpl_fn:\\n  push %rax\\n  call helper\\n  pop %rax\\n  ret\\n");',
+        '#else',
+        '__asm__(".text\\n.p2align 2\\n.globl tmpl_fn\\ntmpl_fn:\\n  stp x29, x30, [sp, #-16]!\\n  bl helper\\n  ldp x29, x30, [sp], #16\\n  ret\\n");',
+        '#endif',
+        ...(labels ? [
+          'static void def(void) { __asm__ volatile(".pushsection .rodata.parts_tab, \\"a\\"\\n.p2align 3\\nparts_tab: .quad 42\\n.popsection"); }',
+          'static unsigned long long use(void) {',
+          '    const unsigned long long *p;',
+          '#ifdef __AXIOM_ASM_X86_64__',
+          '    __asm__("lea parts_tab(%%rip), %0" : "=r"(p));',
+          '#else',
+          '    __asm__("adrp %0, parts_tab\\n\\tadd %0, %0, :lo12:parts_tab" : "=r"(p));',
+          '#endif',
+          '    return *p;',
+          '}'] : []),
+        'int main(void) {',
+        '    tmpl_fn();',
+        '    tmpl_fn();',
+        labels ? '    def();\n    printf("%d %d %llu\\n", use_static(), calls, use());' : '    printf("%d %d\\n", use_static(), calls);',
+        '    return 0;',
+        '}', ''].join('\n');
+      const env = { ...process.env, AXIOM_PARTS: '3' };
+      for (const [labels, want] of [[false, '10 2\n'], [true, '10 2 42\n']]) {
+        const f = path.join(dir, `parts_asm${labels ? '2' : ''}.c`);
+        fs.writeFileSync(f, prog(labels));
+        const o = path.join(dir, `parts_asm${labels ? '2' : ''}`);
+        const c = spawnSync(compiler, ['build', f, '--c-std=gnu17', '-O2', '-o', o, nativeTarget], { encoding: 'utf8', env });
+        if (c.status) return c.stderr;
+        const r = hostRun(o);
+        if (r.status !== 0 || r.stdout.replace(/\r\n/g, '\n') !== want) return `status ${r.status}:\n${r.stdout}${r.stderr}`;
+      }
+      return null;
+    },
     '--emit=ir': () => {
       if (isBootstrap()) return { skip: true, reason: 'the bootstrap compiler has --emit=llvm instead' };
       prepare();
@@ -2208,7 +2279,7 @@ await section('spec §16.3', {
       if (c.status) return c.stderr;
       for (const [arg, want] of [['ab', 'ab'], ['xxxx', 'many']]) {
         const r = spawnSync(o, [arg], { encoding: 'utf8' });
-        if (r.status !== 0 || r.stdout !== want) return `${arg}: status ${r.status}: ${r.stdout}${r.stderr}`;
+        if (r.status !== 0 || r.stdout.replace(/\r\n/g, '\n') !== want) return `${arg}: status ${r.status}: ${r.stdout}${r.stderr}`;
       }
       if (spawnSync('afl-showmap', ['-h']).error) return { skip: true, reason: 'ran; no afl-showmap to check the coverage' };
       const edges = [];
