@@ -187,11 +187,23 @@ pages they wrote cost more than the parts' copies of the tables.
   the whole program as one unit.
 - The parts' copies of the debug tables (-O2 -g) could hold only the
   entries of each part's functions.
-- File-scope asm that refers to a C program's internal functions and data
-  (`tests/c/run/asm_symbols.c`) does not link when the program is compiled
-  in parts (`AXIOM_PARTS=3`; forked parts alike): the first part's asm
-  names them, the parts' symbols for them have names made unique
-  (`isel.sym_name`).
+- (Done.) Asm that names a C program's internal functions and data
+  (`tests/c/run/asm_symbols.c`) did not link when the program was compiled
+  in parts (`AXIOM_PARTS=3`; forked parts alike): the parts' symbols for
+  them have names made unique (`isel.sym_name`), which the asm's names
+  (`Blob.aliases`) did not find, in the part that defines them or in the
+  others. Now a name the object does not define under the asm's name is
+  the part's symbol for it (`asm/obj.ax` `part_sym`, which the backends
+  set to `isel.part_sym`: defined, or another part's under its unique
+  name). Asm that defines local symbols (named labels, not global) that C
+  and other asm refer to by name (`asm/obj.ax` `resolve`, which finds them
+  in one object) keeps the module in one unit (`Blob.locals`,
+  `backend.compile_parts`): such a reference may be in any part. Programs
+  without such asm, and every program not compiled in parts, are
+  unchanged; a test (`flags: C asm naming static functions and data,
+  compiled in parts`) builds both kinds in three parts (x86-64, AArch64,
+  Windows), and the asm tests pass with `AXIOM_PARTS=3` at -O2 (x86-64,
+  AArch64).
 
 ### Current state (before this item)
 
