@@ -1460,7 +1460,7 @@ await section('C programs', {
   // section of its own and the link's garbage collection on by default,
   // which leaves out what the program does not use (--no-gc-sections keeps
   // it) and the .eh_frame entries of what it leaves out.
-  'sections: --units=module leaves out what the program does not use': async () => {
+  'sections: --units=module leaves out what the program does not use (its cached objects packed)': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the compiler\'s own linkers' };
     const d = path.join(tmp, 'units-gc');
     fs.mkdirSync(d, { recursive: true });
@@ -1492,6 +1492,10 @@ await section('C programs', {
         if (r.stdout !== '43\n') return `the program printed ${JSON.stringify(r.stdout)}`;
       }
     }
+    // (the cached objects are packed: elfpack.ax)
+    const objs = fs.readdirSync(path.join(d, 'cache', 'obj')).filter((n) => n.endsWith('.o'));
+    const raw = objs.filter((n) => !fs.readFileSync(path.join(d, 'cache', 'obj', n)).subarray(0, 8).equals(Buffer.from('\x7fAXPACK1', 'latin1')));
+    if (!objs.length || raw.length) return `cached objects not packed: ${raw.join(', ') || 'none cached'}`;
     return sizes[0] * 1.5 < sizes[1] ? null : `${sizes[0]} bytes with the garbage collection, ${sizes[1]} without`;
   },
   'sections: --function-sections, --gc-sections and COMDAT selections': async () => {

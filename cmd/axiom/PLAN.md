@@ -380,9 +380,27 @@ keeps it, the program runs, and no FDE describes left-out code.
 
 ### What remains
 
-- The objects of `--units=module` are ~33% larger (section headers and
-  `.rela` sections: ~140k sections for the compiler). The plan's compact
-  atom table inside `elf.Obj` would avoid that; not needed so far.
+- (Done.) The objects of `--units=module` were ~33% larger (section
+  headers and `.rela` sections: ~147k sections for the compiler). Rather
+  than an atom table inside `elf.Obj` (whose objects the linkers would
+  then read differently), the unit cache's objects are packed
+  (`elfpack.ax`): the section headers, the relocations and the symbol
+  table, fixed-size records of small fields close to the record before's,
+  are LEB128 differences, the rest of the bytes as they are. A packed
+  object unpacks to the very bytes it was packed from (`pack` checks it,
+  and keeps the object as it is otherwise), which `elf.read` reads as it
+  reads any object, so the links are unchanged by construction (checked:
+  the compiler at `-O1 --units=module` for x86-64, also `-O0 -g`,
+  AArch64, Windows and macOS at `-O1 -g`, byte-identical executables).
+  Only the module threads pack (`backend.g_pack`, set by `units.ax`); a
+  link by the system's tools (`main.link_cc`, when our linker falls back)
+  is given the unpacked objects in temporary files. The compiler's object
+  cache: 45.3 MB to 23.2 MB at `-O1` (33.6 MB before the sections per
+  function), 65.1 to 37.4 MB at `-O0 -g`, 78.9 to 43.2 MB for AArch64
+  `-O1 -g`. A cold `-O1` build takes as long (4.9-5.8 s against
+  5.8-6.0 s, 11.0-11.2 s of user time both, two jobs); a relink with
+  everything cached 1.11-1.15 s against 1.07-1.10 s (the unpacking,
+  about 40 ms).
 - Each module's site-string blob (`.site_strs`, in `codegen.ax`) is one
   datum, kept whole if any of its records is: about a third of a small
   program's `.rodata`. Splitting it per function was tried; it saved 3-5%

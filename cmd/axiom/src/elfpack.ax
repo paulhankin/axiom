@@ -1,0 +1,330 @@
+// =============================================================================
+// elfpack.ax - a compact form of the relocatable objects elf.ax writes, for
+// the unit cache (units.ax). A module's object, with a section of its own
+// for each function and datum, is mostly section headers, relocation
+// sections and the symbol table, in fixed-size records whose fields are
+// small or close to the record before's: packed, each field is LEB128,
+// as the difference from the record before where that is smaller. The
+// rest of the bytes (the sections' contents, the string tables) are kept as
+// they are. A packed object unpacks to the bytes it was packed from (pack
+// checks that), which elf.read then reads as it reads any object, so a link
+// of packed objects is that of the objects.
+// =============================================================================
+import "bin.ax" as bn;
+import "util.ax" as u;
+
+let MAGIC: []u8 = "\x7fAXPACK1";
+
+/// Is d a packed object?
+pub fn is_packed(d: []u8) bool {
+    return (d.len >= MAGIC.len) and u.str_eq(d[0..MAGIC.len], MAGIC);
+}
+
+// A section header's fields.
+struct Hdr {
+    name: u64,
+    ty: u64,
+    flags: u64,
+    addr: u64,
+    off: u64,
+    size: u64,
+    link: u64,
+    info: u64,
+    align: u64,
+    entsize: u64,
+}
+
+fn hdr_at(d: []u8, at: usize) Hdr {
+    return Hdr.{ name: bn.rd32(d, at), ty: bn.rd32(d, at + 4), flags: bn.rd64(d, at + 8), addr: bn.rd64(d, at + 16),
+                 off: bn.rd64(d, at + 24), size: bn.rd64(d, at + 32), link: bn.rd32(d, at + 40),
+                 info: bn.rd32(d, at + 44), align: bn.rd64(d, at + 48), entsize: bn.rd64(d, at + 56) };
+}
+
+fn put_hdr(d: []mut u8, at: usize, h: *Hdr) void {
+    bn.w32(d, @as(u64, at), h.name);
+    bn.w32(d, @as(u64, at) + 4, h.ty);
+    bn.w64(d, @as(u64, at) + 8, h.flags);
+    bn.w64(d, @as(u64, at) + 16, h.addr);
+    bn.w64(d, @as(u64, at) + 24, h.off);
+    bn.w64(d, @as(u64, at) + 32, h.size);
+    bn.w32(d, @as(u64, at) + 40, h.link);
+    bn.w32(d, @as(u64, at) + 44, h.info);
+    bn.w64(d, @as(u64, at) + 48, h.align);
+    bn.w64(d, @as(u64, at) + 56, h.entsize);
+}
+
+// x - y as a signed difference (modulo 2^64).
+fn diff(x: u64, y: u64) i64 {
+    return @bit_cast(i64, x - y);
+}
+
+fn plus(y: u64, d: i64) u64 {
+    return y + @bit_cast(u64, d);
+}
+
+// Whether the section of header h, in an object whose section headers are
+// at shoff, is packed record by record: a relocation table (SHT_RELA) or
+// the symbol table (SHT_SYMTAB), within the bytes before the headers.
+fn packed_sec(h: *Hdr, shoff: u64) bool {
+    return ((h.ty == 4) or (h.ty == 2)) and (h.entsize == 24) and ((h.size % 24) == 0) and (h.off >= 64) and
+           (h.size <= shoff) and (h.off <= (shoff - h.size));
+}
+
+/// The packed form of object d (on the heap: u.free_heap), or a nil slice
+/// if d is not an object this packs (not a relocatable ELF64 object with
+/// its section headers at the end, its packed tables in order).
+pub fn pack(d: []u8) []u8 {
+    if (d.len < 64) or not u.str_eq(d[0..4], "\x7fELF") or (d[4] != 2) or (d[5] != 1) or (bn.rd16(d, 16) != 1) or
+       (bn.rd16(d, 58) != 64) {
+        return u.nosym();
+    }
+    let shoff = bn.rd64(d, 40);
+    let shnum = bn.rd16(d, 60);
+    if (shoff < 64) or (shoff > @as(u64, d.len)) or ((@as(u64, d.len) - shoff) != (shnum * 64)) {
+        return u.nosym();
+    }
+    let n = @truncate(usize, shnum);
+    let hs = u.calloc_slice.[Hdr](n + 1);
+    for i in 0..n {
+        hs[i] = hdr_at(d, @truncate(usize, shoff) + (i * 64));
+    }
+    // the tables packed record by record: in order, apart
+    let mut end: u64 = 64;
+    for i in 0..n {
+        if packed_sec(&hs[i], shoff) {
+            if hs[i].off < end {
+                u.free_slice(hs);
+                return u.nosym();
+            }
+            end = hs[i].off + hs[i].size;
+        }
+    }
+    let mut b = bn.new_bytes();
+    b.put(MAGIC);
+    b.uleb(@as(u64, d.len));
+    b.put(d[0..64]);
+    let mut p = Hdr.{ name: 0, ty: 0, flags: 0, addr: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 };
+    for i in 0..n {
+        let h = &hs[i];
+        b.sleb(diff(h.name, p.name));
+        b.uleb(h.ty);
+        b.uleb(h.flags);
+        b.uleb(h.addr);
+        let mut pend = p.off;
+        if p.ty != 8 {
+            pend = p.off + p.size;  // (SHT_NOBITS takes no bytes of the file)
+        }
+        b.sleb(diff(h.off, pend));
+        b.uleb(h.size);
+        b.sleb(diff(h.link, p.link));
+        b.sleb(diff(h.info, p.info));
+        b.uleb(h.align);
+        b.uleb(h.entsize);
+        p = h.*;
+    }
+    // the other bytes before the headers, as they are
+    let mut at: usize = 64;
+    let mut rest = bn.new_bytes();
+    for i in 0..n {
+        if packed_sec(&hs[i], shoff) {
+            rest.put(d[at..@truncate(usize, hs[i].off)]);
+            at = @truncate(usize, hs[i].off + hs[i].size);
+        }
+    }
+    rest.put(d[at..@truncate(usize, shoff)]);
+    b.uleb(@as(u64, rest.len()));
+    b.put(rest.view());
+    rest.free();
+    // the tables
+    for i in 0..n {
+        let h = &hs[i];
+        if not packed_sec(h, shoff) {
+            continue;
+        }
+        let base = @truncate(usize, h.off);
+        let count = @truncate(usize, h.size / 24);
+        if h.ty == 4 {
+            // relocations: offset, symbol, type, addend
+            let mut poff: u64 = 0;
+            let mut psym: u64 = 0;
+            for k in 0..count {
+                let e = base + (k * 24);
+                let off = bn.rd64(d, e);
+                let info = bn.rd64(d, e + 8);
+                b.sleb(diff(off, poff));
+                b.sleb(diff(info >> 32, psym));
+                b.uleb(info & 0xffff_ffff);
+                b.sleb(@bit_cast(i64, bn.rd64(d, e + 16)));
+                poff = off;
+                psym = info >> 32;
+            }
+        } else {
+            // symbols: name, info, other, section, value, size
+            let mut pname: u64 = 0;
+            let mut pshndx: u64 = 0;
+            for k in 0..count {
+                let e = base + (k * 24);
+                let name = bn.rd32(d, e);
+                let shndx = bn.rd16(d, e + 6);
+                b.sleb(diff(name, pname));
+                b.u8_(d[e + 4]);
+                b.u8_(d[e + 5]);
+                b.sleb(diff(shndx, pshndx));
+                b.uleb(bn.rd64(d, e + 8));
+                b.uleb(bn.rd64(d, e + 16));
+                pname = name;
+                pshndx = shndx;
+            }
+        }
+    }
+    u.free_slice(hs);
+    let r = u.heap_dup(b.view());
+    b.free();
+    // (what is unpacked must be d, byte for byte)
+    let back = unpack(r);
+    let same = not u.isnos(back) and u.str_eq(back, d);
+    if not u.isnos(back) {
+        u.free_heap(back);
+    }
+    if not same {
+        u.free_heap(r);
+        return u.nosym();
+    }
+    return r;
+}
+
+/// The object packed d is (on the heap: u.free_heap), or a nil slice if d
+/// is malformed.
+pub fn unpack(d: []u8) []u8 {
+    if not is_packed(d) {
+        return u.nosym();
+    }
+    let mut r = bn.reader(d[MAGIC.len..]);
+    let total = r.uleb();
+    if r.bad or (total < 64) or (total > (@as(u64, d.len) * 32)) {
+        return u.nosym();  // (packed, an object is not 32 times smaller)
+    }
+    let head = r.bytes(64);
+    if r.bad {
+        return u.nosym();
+    }
+    let out = u.calloc_slice.[u8](@truncate(usize, total) + 1)[0..@truncate(usize, total)];
+    @mem_copy(out[0..64], head);
+    let shoff = bn.rd64(out, 40);
+    let shnum = bn.rd16(out, 60);
+    if r.bad or (shoff < 64) or (shoff > total) or ((total - shoff) != (shnum * 64)) {
+        u.free_heap(out);
+        return u.nosym();
+    }
+    let n = @truncate(usize, shnum);
+    let hs = u.calloc_slice.[Hdr](n + 1);
+    let mut p = Hdr.{ name: 0, ty: 0, flags: 0, addr: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 };
+    for i in 0..n {
+        let mut h = Hdr.{ name: 0, ty: 0, flags: 0, addr: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 };
+        h.name = plus(p.name, r.sleb());
+        h.ty = r.uleb();
+        h.flags = r.uleb();
+        h.addr = r.uleb();
+        let mut pend = p.off;
+        if p.ty != 8 {
+            pend = p.off + p.size;
+        }
+        h.off = plus(pend, r.sleb());
+        h.size = r.uleb();
+        h.link = plus(p.link, r.sleb());
+        h.info = plus(p.info, r.sleb());
+        h.align = r.uleb();
+        h.entsize = r.uleb();
+        hs[i] = h;
+        put_hdr(out, @truncate(usize, shoff) + (i * 64), &h);
+        p = h;
+    }
+    let mut end: u64 = 64;
+    for i in 0..n {
+        if packed_sec(&hs[i], shoff) {
+            if hs[i].off < end {
+                u.free_heap(out);
+                u.free_slice(hs);
+                return u.nosym();
+            }
+            end = hs[i].off + hs[i].size;
+        }
+    }
+    let nrest = @truncate(usize, r.uleb());
+    let rest = r.bytes(nrest);
+    if r.bad {
+        u.free_heap(out);
+        u.free_slice(hs);
+        return u.nosym();
+    }
+    let mut at: usize = 64;
+    let mut from: usize = 0;
+    let mut ok = true;
+    for i in 0..n {
+        if packed_sec(&hs[i], shoff) {
+            let to = @truncate(usize, hs[i].off);
+            ok = ok and ((from + (to - at)) <= rest.len);
+            if ok {
+                @mem_copy(out[at..to], rest[from..from + (to - at)]);
+            }
+            from += to - at;
+            at = to + @truncate(usize, hs[i].size);
+        }
+    }
+    let to = @truncate(usize, shoff);
+    ok = ok and ((from + (to - at)) == rest.len);
+    if not ok {
+        u.free_heap(out);
+        u.free_slice(hs);
+        return u.nosym();
+    }
+    @mem_copy(out[at..to], rest[from..]);
+    for i in 0..n {
+        let h = &hs[i];
+        if not packed_sec(h, shoff) {
+            continue;
+        }
+        let base = @truncate(usize, h.off);
+        let count = @truncate(usize, h.size / 24);
+        if h.ty == 4 {
+            let mut poff: u64 = 0;
+            let mut psym: u64 = 0;
+            for k in 0..count {
+                let e = @as(u64, base + (k * 24));
+                let off = plus(poff, r.sleb());
+                let sym = plus(psym, r.sleb());
+                let ty = r.uleb();
+                bn.w64(out, e, off);
+                bn.w64(out, e + 8, (sym << 32) | (ty & 0xffff_ffff));
+                bn.w64(out, e + 16, @bit_cast(u64, r.sleb()));
+                poff = off;
+                psym = sym;
+            }
+        } else {
+            let mut pname: u64 = 0;
+            let mut pshndx: u64 = 0;
+            for k in 0..count {
+                let e = @as(u64, base + (k * 24));
+                let name = plus(pname, r.sleb());
+                bn.w32(out, e, name);
+                out[@truncate(usize, e) + 4] = r.u8_();
+                out[@truncate(usize, e) + 5] = r.u8_();
+                let shndx = plus(pshndx, r.sleb());
+                bn.w16(out, e + 6, shndx);
+                bn.w64(out, e + 8, r.uleb());
+                bn.w64(out, e + 16, r.uleb());
+                pname = name;
+                pshndx = shndx;
+            }
+        }
+        if r.bad {
+            break;
+        }
+    }
+    u.free_slice(hs);
+    if r.bad or not r.at_end() {
+        u.free_heap(out);
+        return u.nosym();
+    }
+    return out;
+}
