@@ -18,7 +18,7 @@ parity check in the test suite can be widened once item 6 lands.
 |---|---|---|---|
 | 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` (done: see §1) |
 | 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries (done: see §2) |
-| 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
+| 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke (done: see §4) |
 | 5 | Decomposing large modules & C-era `i32` tags | `x64*.ax`, `sema.ax`, `codegen.ax`, `gvn.ax`, `ast.ax`, `ir.ax`, `mach.ax` | Leaf context modules (`x64ctx.ax`, `cgctx.ax`), smaller pass files under acyclic imports, and exhaustive `enum` tags (partly done: see §5) |
 | 6 | DWARF `.debug_line` (and `.eh_frame`) on ELF & Mach-O | `main.ax`, `x64emit.ax`, `a64.ax`, `elink.ax`, `mlink.ax` | `-g` produces source-level line tables (and optional unwind info) on Linux and macOS, matching Windows `.pdb` (done: see §6) |
@@ -451,8 +451,8 @@ The native linker (`nlink.ax`) does not:
 
 ## 3. Intrusive SSA Def-Use Lists in `ir.ax`
 
-**Status: done, but for the worklist rewrite of `fold_combine` and the
-removal of `Value.fwd` (see "What remains").**
+**Status: done. The worklist rewrite of `fold_combine` was measured and left
+out (see "What remains").**
 
 ### What was there
 
@@ -488,8 +488,8 @@ fields in the same walk.
    it goes in).
 2. **`O(uses)` replacement**: `ir.replace_all(old, new)` rewrites each use
    and splices the list onto `new`'s; `ir.forward(v, r)` of an instruction
-   does it at once (and sets `fwd` for the passes that kept `v` in their own
-   tables); `ir.replace_uses` uses it too. `ir.single_user` and
+   does it at once (and notes the replacement for the passes that kept `v`
+   in their own tables: see 6); `ir.replace_uses` uses it too. `ir.single_user` and
    `ir.one_user` read the list. `apply_forwarding` is left only for values
    without lists (the inliner's constant parameters, `merge_same_named`'s
    globals and functions); the passes' 40 calls of it are gone.
@@ -497,9 +497,7 @@ fields in the same walk.
    `combine.ax`, `slp.ax`, `vectorize.ax` and `idioms.ax` are gone (they read
    `nuses`); `lower.ax` takes a copy of the counts as they were before it
    began (its in-place construction of aggregates needs the count before its
-   own removals). `Value.uses`/`user` are now only the backends' (set by
-   `isel.count_uses` and `wasm.count_uses`, which also initialize their
-   scratch: they were left as they are, because item 5a moves that state).
+   own removals). `Value.uses`/`user` were then only the backends' (see 5).
 4. **Checks**: with `AXIOM_CHECK_IR=1`, `ir.check_uses` checks after every
    cleanup sub-pass, at the end of `optimize_func` and before the backends
    that each registered instruction's operands are on their lists, that every
@@ -518,20 +516,61 @@ Compile time (the compiler building itself at -O2, one process, user+sys)
 went down about 3.5% (29.8 s to 28.7 s); the peak memory went up by 130 MB
 (2502 to 2631 MB, 5%: a value is 72 bytes larger).
 
+Then, the leftovers:
+
+5. **The backends' counts**: `isel.count_uses` and `wasm.count_uses` are
+   `init_values`: the selection reads `nuses` and `ir.single_user` (the
+   only user, nil unless there is one use) from the lists, since nothing
+   changes the IR once a backend has begun to select (`x64.sink_to_use`
+   only moves instructions, which keeps them registered); the address-only
+   marks of pointer arithmetic walk each `ptradd`'s own uses. `lower.ax`
+   notes its aggregates with one use before it begins in a table of its own.
+   `Value.uses` and `Value.user` are gone.
+6. **`Value.fwd` and `resolve()`**: 386 calls of `resolve()` on operands
+   are gone (a build of the compiler with every call numbered saw only
+   one of them, besides `apply_forwarding`'s own, return another value
+   over the suites, the compiler building itself for each target at -O1 to
+   -O3, and 80 random C programs: unroll's latch inputs through its copy
+   map, kept). About 65 remain, on values the passes keep in their own
+   tables or receive as arguments (unroll's copies, the bases
+   `ir.based_rec` follows, gvn's, thread's and slp's). The replacement of a
+   forwarded value is in a table (`ir.REPL`, by address) rather than a field
+   of every value: `Value.replaced` (in the padding after `kind`) says
+   whether to look, so `resolve()` of a value never replaced reads one byte;
+   `new_val` takes out the entry of a value it makes again (`U64Map.del`),
+   and each part starts from a copy of the table. Non-instructions
+   (parameters, globals, functions) are still forwarded by
+   `apply_forwarding`.
+7. **Vector types**: `ir.t_vec` formatted and interned a string key for
+   each call, and `gvn.lane_load` asks for up to 56 vector types per scalar
+   load it tries (9.7% of a -O2 build of an example program, by the
+   profiler; the interned keys are never freed). The vector types are in a
+   table by lane type and count (`TypeTab.vecs`), copied for each part and
+   watched by `AXIOM_CHECK_PARTS`.
+
+A value is 256 bytes (272 before 5 and 6). The output of 5, 6 and 7 is
+byte-identical (the self-build, and a few programs for x86-64, AArch64 and
+WebAssembly at -O1 to -O3); the self-build passes `AXIOM_CHECK_IR=1` (x86-64
+and AArch64) and `AXIOM_CHECK_PARTS=1`.
+
+The compiler building itself at -O2 (user+sys, peak memory), before 5-7 and
+after: one thread 25.3 s, 2.30 GB to 22.2 s, 1.09 GB; two threads 25.8 s,
+2.53 GB to 22.6 s, 1.18 GB (wall 20.3 s to 17.5 s). Nearly all of it is 7
+(the interned keys were half of the peak memory); 5 and 6 are each about
+1-2% of the time, within the noise of a run.
+
 ### What remains
 
-- **Worklist `fold_combine`**: it still sweeps the function in rounds; the
-  lists make a worklist of the users of each rewritten value possible (it
-  changes the order of rewrites, so the output).
-- **`Value.fwd` and the passes' `resolve()` calls**: operands no longer
-  need `resolve()` (the check above holds), but about 400 calls remain, many
-  on values the passes keep in their own tables (gvn's, thread's, unroll's,
-  slp's), for which `fwd` is the replacement. Each table could be kept by the
-  lists instead (and `thread.outside_uses`, `gvn.sink_uses` built from them),
-  then `fwd` removed.
-- **The backends' counts**: `isel.count_uses`/`wasm.count_uses` could read
-  `nuses` and `single_user` once the backends do not change the IR after
-  counting (and `Value.user` and `uses` would go, 16 bytes).
+- **Worklist `fold_combine`**: not done, because it would not be a
+  measurable speedup. Counted over the compiler building itself at -O2:
+  105,459 calls, of which 25,459 change anything; 133,355 rounds, visiting
+  28.5 M instructions in their first round and 9.8 M in the later ones; of
+  its 1.64 s (7.6% of the build's time), the first rounds take 0.83 s, the
+  later ones 0.25 s and the rest (`narrow_bool_phis`, `sink_phi_ops`,
+  `compute_preds`, `rpo`) 0.56 s. A worklist would save at most the later
+  rounds' 0.25 s (about 1%), less its own work, and would change the order
+  of rewrites (the output). The preamble, which runs on every call although
+  three in four calls change nothing, is the larger part to look at.
 
 ---
 
