@@ -187,6 +187,11 @@ pages they wrote cost more than the parts' copies of the tables.
   the whole program as one unit.
 - The parts' copies of the debug tables (-O2 -g) could hold only the
   entries of each part's functions.
+- File-scope asm that refers to a C program's internal functions and data
+  (`tests/c/run/asm_symbols.c`) does not link when the program is compiled
+  in parts (`AXIOM_PARTS=3`; forked parts alike): the first part's asm
+  names them, the parts' symbols for them have names made unique
+  (`isel.sym_name`).
 
 ### Current state (before this item)
 
