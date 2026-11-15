@@ -16,7 +16,7 @@ parity check in the test suite can be widened once item 6 lands.
 
 | # | Area | Primary modules | Core payoff |
 |---|---|---|---|
-| 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` |
+| 1 | Process-free separate compilation & threaded codegen | `util.ax`, `units.ax`, `codegen.ax`, `ir.ax`, `backend.ax`, `x64*.ax`, `a64.ax`, `wasm.ax`, `nlink.ax` | Object cache and parallel builds work natively on Windows and WebAssembly, without `fork()` (done: see §1) |
 | 2 | Native linker dead-symbol garbage collection | `elf.ax`, `ftab.ax`, `x64emit.ax`, `a64.ax`, `nlink.ax`, `elink.ax`, `mlink.ax`, `plink.ax` | `--units=module` and `axiom test` strip unused `std/` code, duplicate weak generics, and dead frame-table entries (done: see §2) |
 | 3 | Intrusive SSA def-use lists & worklist rewrites | `ir.ax`, `opt.ax`, `combine.ax`, `slp.ax`, `lower.ax`, `isel.ax`, `wasm.ax` | `O(uses)` value replacement; eliminates `fwd` chains, `uses_stale`, and four divergent `count_uses` walks (done: see §3 for what remains) |
 | 4 | Two-tier arena incremental session in `axiom lsp` | `util.ax`, `ast.ax`, `types.ax`, `sema.ax`, `units.ax`, `ide.ax`, `lsp.ax` | Millisecond editor queries without spawning `axiom ide` or re-checking `std/` on every keystroke (done: see §4) |
@@ -59,10 +59,13 @@ parity check in the test suite can be widened once item 6 lands.
 
 ### Status
 
-**Separate compilation: done.** `units.build_units` compiles each uncached
-module on a worker thread (`std/thread`), on every host with threads
-(Linux, macOS, Windows, and WebAssembly under node), instead of in a forked
-child. Parts (`backend.compile_parts`) still fork: see "What remains".
+**Done** (but for a host without threads: see "What remains").
+`units.build_units` compiles each uncached module on a worker thread
+(`std/thread`), on every host with threads (Linux, macOS, Windows, and
+WebAssembly under node), instead of in a forked child; so does
+`backend.compile_parts` each part of a whole program compiled in parts
+(-O2, big programs), and the parts' objects go to the linker in memory.
+The compiler no longer forks (`u.fork` is gone).
 
 How it is done (the design differs from the one below, which threaded a
 context through the code generator):
@@ -118,25 +121,72 @@ forked) is unchanged within noise (about 30 s of CPU time, 2.0 GB peak in
 the main process); an -O2 build of an example executes 0.5% fewer
 instructions (callgrind): thread-local access costs nothing measurable.
 
+**Parts on threads** (`backend.compile_parts`). A forked child had the
+post-inline module and every table made before it to itself; the threads
+of the parts share them, so:
+
+- **Each part owns its functions' IR**, and nothing else of the module
+  changes while the parts run. A part works on a module of its own
+  (`ir.part_module`: copies of the lists and maps of functions, globals
+  and aliases, which its passes add switch tables and coverage counters to)
+  and sees the rest through a view (`ir.part_begin`, a thread-local
+  visibility per function id): the other parts' functions are defined to
+  the passes, as they were when the parts began, and declared to the code
+  generator (`ir.part_declare_others`, where the child cleared their
+  blocks); in all but the first part the shared data is declared
+  (`ir.init_of`, which the passes and `isel.ax` read instead of
+  `Global.init`, where the child cleared it). `ftab.ax` and
+  `isel.data_owners` skip declared functions (the child's had no blocks).
+  `tailrec.prepare_sibling` runs once before the parts (each child ran it
+  on the same IR).
+- **The IR's tables are copied** for each part (`ir.PartStart`): the
+  interned types (new ids go on from the main thread's) and integer
+  constants, and the records of the variables' assignments (-g); a type
+  made before the parts has its undef made by each part (`ir.undef`,
+  which wrote `Ty.undef_v`). The passes' counters and marks (thread.ax's
+  region budget, loop tags, ...), `slots.ax`'s kept parameters and
+  `tailrec.ax`'s findings are copied too (`<module>.part_state`/
+  `part_begin`); `dbginfo.ax`'s tables, `asm/inline.ax`'s statements and
+  the C front end's asm tables are read only. Free lists and the passes'
+  scratch start empty (the graveyard must be empty when the parts begin).
+- **Shared scratch**: `slp.splat_groups` no longer counts in the `aux2` of
+  constants, and a call's chain's place in the frame table is in a map of
+  `ftab.ax`'s (`chain_offs`), not in `ir.Chain` (chains are shared by
+  copies of calls): both were written by several parts at once.
+- **Objects in memory**: a part's object stays in memory
+  (`be.g_mem_objects`), and `main.link_native` reads it from there; it is
+  written to its path only for a link by the system's tools.
+- **Debugging**: `AXIOM_CHECK_PARTS=1` (2: last part first) runs the parts
+  one at a time and reports what each changed of what they share
+  (`ir.watch_module`, `watch_check`: the other functions' IR, constants,
+  types, globals, call chains, `dbginfo.ax`'s tables), with the scratch of
+  constants poisoned.
+
+Found on the way: `x64emit.encode_func` read the function's size through
+a pointer into the symbol list that the frame table's symbols may have
+moved; with --function-sections, a big function got an FDE of no code in
+a module compiled in parts (forked too), fixed separately.
+
+Verified: the executables are byte-identical to the forked build's, for
+`AXIOM_JOBS=1` to 4, for the compiler itself (x86-64 -O2, -O2 -g, AArch64
+-O2 -g, Windows -O2 -g, macOS -O2 -g), ten examples at -O2 and -O2 -g in 3
+and 4 parts (`AXIOM_PARTS`), AArch64 and Windows examples,
+--coverage=afl, --sanitize=address, --pic, --function-sections
+--data-sections, and 72 C programs (`tests/c/prog`, `tests/c/run/asm_*`)
+at -O2 and -O2 -g; `AXIOM_CHECK_PARTS` reports nothing for all but the
+compilers. The self-build's fixed point holds. On Linux (4 processors,
+shared with other work), the -O2 self-build takes as long as forked (user
++ system 44-46 s against 47 s; 35-38 s against 37 s wall) and its peak
+memory (PSS, all processes) went from 4.8 GB to 2.9 GB (-O2 -g: 5.1 to
+3.3 GB; one thread: 2.7 to 2.2 GB): the forked children's copies of the
+pages they wrote cost more than the parts' copies of the tables.
+
 ### What remains
 
-- **Parts on threads.** `compile_parts` still forks, and so is serial (one
-  piece) where there is no fork. Its children share the post-inline module
-  and every table made before it (the IR's interned types and constants,
-  debug-information tables, free lists, `asm/inline.ax`'s blocks, ...), and
-  each changes the module (`compile_part` turns the other parts' functions
-  into declarations and, but in part 0, drops the data's initializers;
-  `switches.lookup_tables` and `cover.instrument` add globals) and reads the
-  other parts' functions (`tailrec.prepare_sibling`, the backends' symbols).
-  Threads need, per part, a view of the module (its own function and global
-  lists, declarations for the others' functions without changing the shared
-  ones), the main thread's IR tables copied (or overlaid, as the front
-  end's are), and the cross-function reads of `passes.finish_funcs` and the
-  backends confined to what is fixed before the parts start. The IR's
-  tables are what item 3 is reworking (def-use lists): do this after it.
-- Parts' objects still go through files (`<path>.p<k>.o`), not memory.
 - A host without threads (a browser without shared memory) still compiles
   the whole program as one unit.
+- The parts' copies of the debug tables (-O2 -g) could hold only the
+  entries of each part's functions.
 
 ### Current state (before this item)
 

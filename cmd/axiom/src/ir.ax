@@ -2460,7 +2460,6 @@ pub fn set_bytes(v: *mut Value, x: []u8) void {
 pub struct Chain {
     site: *mut Value,  // a site record (a constant global)
     next: *mut Chain,
-    off: i64,      // backend scratch: the chain's place in the object
     c_code: bool,  // the record of a call in C code (whose traces may lose frames at -O2: docs/c.md)
 }
 
@@ -2714,7 +2713,7 @@ fn alias_overridden(m: *mut Module, a: *Alias) bool {
         return true;
     }
     let g = m.gmap.get(a.name);
-    return u.notnil(g) and u.notnil(g.init);
+    return u.notnil(g) and u.notnil(init_of(g));
 }
 
 pub fn vnil() *mut Value {
@@ -3094,29 +3093,33 @@ pub fn check_cints() void {
 // stops at the first that does not.
 pub fn check_order(m: *mut Module) void {
     for fi in 0..m.funcs.len {
-        let f = m.funcs.get(fi);
-        let mut b = f.first;
-        while u.notnil(b) {
-            let mut i = b.first;
-            while u.notnil(i) {
-                i.pos = 1;  // (not reached yet)
-                i = i.next;
-            }
-            i = b.first;
-            while u.notnil(i) {
-                if i.op != OP_PHI {
-                    check_operand(f, i, i.a);
-                    check_operand(f, i, i.b);
-                    check_operand(f, i, i.c);
-                    for k in 0..i.xs.len {
-                        check_operand(f, i, i.xs.get(k));
-                    }
-                }
-                i.pos = 0;
-                i = i.next;
-            }
-            b = b.next;
+        check_order_of(m.funcs.get(fi));
+    }
+}
+
+/// check_order, of one function.
+pub fn check_order_of(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.pos = 1;  // (not reached yet)
+            i = i.next;
         }
+        i = b.first;
+        while u.notnil(i) {
+            if i.op != OP_PHI {
+                check_operand(f, i, i.a);
+                check_operand(f, i, i.b);
+                check_operand(f, i, i.c);
+                for k in 0..i.xs.len {
+                    check_operand(f, i, i.xs.get(k));
+                }
+            }
+            i.pos = 0;
+            i = i.next;
+        }
+        b = b.next;
     }
 }
 
@@ -3190,6 +3193,20 @@ pub fn cones(t: *mut Ty) *mut Value {
 
 // One undef per type, shared as integer constants are.
 pub fn undef(t: *mut Ty) *mut Value {
+    if u.isnil(t.undef_v) and (t.id <= pv_tys) {
+        // (a type the parts share, which the thread of each part does not
+        // change: its undef is the part's)
+        let k = @as(u64, @bit_cast(u32, t.id));
+        let have = pv_undefs.get(k);
+        if have != 0 {
+            return @ptr_from_int(*mut Value, @truncate(usize, have));
+        }
+        let v = u.perm_new.[Value]();
+        v.kind = V_UNDEF;
+        v.ty = t;
+        pv_undefs.put(k, @as(u64, @int_from_ptr(v)));
+        return v;
+    }
     if u.isnil(t.undef_v) {
         let v = u.perm_new.[Value]();
         v.kind = V_UNDEF;
@@ -4573,7 +4590,22 @@ pub fn get_global(m: *mut Module, name: []u8) *mut Global {
 }
 
 pub fn is_decl(f: *Func) bool {
+    if (pv_n > 0) and (f.id >= 0) and (@as(usize, @bit_cast(u32, f.id)) < pv_n) {
+        let s = pv_vis.get(@as(usize, @bit_cast(u32, f.id)));
+        if s != PV_OWN {
+            return s == PV_DECL;
+        }
+    }
     return u.isnil(f.first);
+}
+
+/// A global's initial value (nil: a declaration). A part of a module
+/// compiled in parts (but the first) declares the data the parts share.
+pub fn init_of(g: *Global) *mut Value {
+    if not pv_inits and (g.id >= 0) and (@as(usize, @bit_cast(u32, g.id)) < pv_globals) {
+        return u.nil.[Value]();
+    }
+    return g.init;
 }
 
 fn new_block() *mut Block {
@@ -6299,9 +6331,190 @@ pub fn merge_same_named(m: *mut Module) void {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Parts (backend.ax: compile_parts). After inlining, the functions of a
+// module may be finished and compiled in parts, each on a thread of its
+// own, all from the one module: a part's thread changes its own functions
+// (and what it adds to the module: part_module), and reads the rest of the
+// module as it was when the parts began (the other functions, the globals,
+// constants and types: nothing changes them while the parts run). The
+// other parts' functions are defined to the passes (as they were) and
+// declared to the code generator (part_declare_others); in all but the
+// first part, the data the parts share is declared too (init_of). The
+// IR's tables (the types, the integer constants, the records of the
+// variables' assignments) each part starts from a copy of, as a process
+// forked when the parts began would; a type made before has its undef made
+// by each part (undef).
+// -----------------------------------------------------------------------------
+const PV_OWN: u8 = 0;  // its own function (or one made after the parts began)
+const PV_DECL: u8 = 1;
+const PV_DEF: u8 = 2;
+
+threadlocal let mut pv_n: usize = 0;  // the functions the parts share (0: not a part)
+threadlocal let mut pv_vis: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };  // by Func.id: PV_
+threadlocal let mut pv_globals: usize = 0;  // the globals the parts share
+threadlocal let mut pv_inits: bool = true;  // their initial values are this part's
+threadlocal let mut pv_tys: i32 = 0;        // the types made before the parts began
+threadlocal let mut pv_undefs: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                     cap: 0, len: 0 };
+
+/// What the thread of each part starts from: the module's functions and
+/// globals as the parts began, and this thread's tables (part_start).
+pub struct PartStart {
+    nfuncs: usize,
+    nglobals: usize,
+    decl: []mut bool,  // by function: declared when the parts began
+    ptr_bytes: u64,
+    tt: TypeTab,
+    cints: CintTable,
+    fwd_epoch: u64,
+    asm_flags: u.List.[u32],
+    asm_mems: u.List.[[]AsmMem],
+    dbg_on: bool,
+    dbg_scopes: bool,
+    dbg_refs: u.List.[DbgRef],
+    dbg_at: u.SymMap.[i32],
+    dbg_merged: u.SymMap.[i32],
+    filt_at: *mut u64,
+    filt_inst: *mut u64,
+    filt_end: *mut u64,
+    dbg_marks: u.List.[DbgMark],
+    mk_inst: u.SymMap.[MkAt],
+    mk_end: u.SymMap.[MkAt],
+    dbg_slots: u.List.[DbgSlot],
+    dbg_slot_at: u.SymMap.[i32],
+    cur_src: u32,
+    cur_scope: u32,
+}
+
+/// On the thread that made m, as the parts begin: what their threads start
+/// from (nil if m cannot be cut: a function's or a global's id is not its
+/// index; the graveyard is not empty).
+pub fn part_start(m: *mut Module) *mut PartStart {
+    if grave_v.len + grave_b.len > 0 {
+        return u.nil.[PartStart]();
+    }
+    let decl = u.newn.[bool](m.funcs.len + 1);
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if f.id != @int_cast(i32, i) {
+            return u.nil.[PartStart]();
+        }
+        decl[i] = is_decl(f);
+    }
+    for i in 0..m.globals.len {
+        if m.globals.get(i).id != @int_cast(i32, i) {
+            return u.nil.[PartStart]();
+        }
+    }
+    let ps = u.new.[PartStart]();
+    ps.* = PartStart.{ nfuncs: m.funcs.len, nglobals: m.globals.len, decl: decl[0..m.funcs.len], ptr_bytes: ptr_bytes,
+                       tt: TT, cints: CINTS, fwd_epoch: fwd_epoch, asm_flags: asm_flags, asm_mems: asm_mems,
+                       dbg_on: dbg_on, dbg_scopes: dbg_scopes, dbg_refs: dbg_refs, dbg_at: dbg_at,
+                       dbg_merged: dbg_merged, filt_at: filt_at, filt_inst: filt_inst, filt_end: filt_end,
+                       dbg_marks: dbg_marks, mk_inst: mk_inst, mk_end: mk_end, dbg_slots: dbg_slots,
+                       dbg_slot_at: dbg_slot_at, cur_src: cur_src, cur_scope: cur_scope };
+    return ps;
+}
+
+fn copy_filter(f: *mut u64) *mut u64 {
+    if u.isnil(f) {
+        return f;
+    }
+    let n = @as(usize, 1) << (FILT_BITS - 6);
+    let c = u.calloc_slice.[u64](n);
+    @mem_copy(c, @slice_from_ptr(f, n));
+    return c.ptr;
+}
+
+/// On the thread of a part, first: its view of the module (the functions
+/// with mine, its own), and copies of the tables. The functions of the
+/// other parts are defined, as they were when the parts began; the shared
+/// data's initial values are the first part's (first).
+pub fn part_begin(ps: *PartStart, mine: []bool, first: bool) void {
+    pv_n = ps.nfuncs;
+    pv_vis = u.List.[u8].empty();
+    for i in 0..ps.nfuncs {
+        if mine[i] {
+            pv_vis.push(PV_OWN);
+        } else if ps.decl[i] {
+            pv_vis.push(PV_DECL);
+        } else {
+            pv_vis.push(PV_DEF);
+        }
+    }
+    pv_globals = ps.nglobals;
+    pv_inits = true;
+    pv_first = first;
+    pv_tys = ps.tt.ty_count;
+    ptr_bytes = ps.ptr_bytes;
+    TT = ps.tt;
+    TT.derived = ps.tt.derived.copy();
+    CINTS = ps.cints;
+    if ps.cints.cap > 0 {
+        let n = ps.cints.cap;
+        let tys = u.calloc_slice.[usize](n);
+        let vals = u.calloc_slice.[u64](n);
+        let cs = u.calloc_slice.[*mut Value](n);
+        @mem_copy(tys, @slice_from_ptr(ps.cints.tys, n));
+        @mem_copy(vals, @slice_from_ptr(ps.cints.vals, n));
+        @mem_copy(cs, @slice_from_ptr(ps.cints.cs, n));
+        CINTS.tys = tys.ptr;
+        CINTS.vals = vals.ptr;
+        CINTS.cs = cs.ptr;
+    }
+    fwd_epoch = ps.fwd_epoch;
+    // (read only: the C front end's)
+    asm_flags = ps.asm_flags;
+    asm_mems = ps.asm_mems;
+    dbg_on = ps.dbg_on;
+    dbg_scopes = ps.dbg_scopes;
+    dbg_refs = ps.dbg_refs.copy();
+    dbg_at = ps.dbg_at.copy();
+    dbg_merged = ps.dbg_merged.copy();
+    filt_at = copy_filter(ps.filt_at);
+    filt_inst = copy_filter(ps.filt_inst);
+    filt_end = copy_filter(ps.filt_end);
+    dbg_marks = ps.dbg_marks.copy();
+    mk_inst = ps.mk_inst.copy();
+    mk_end = ps.mk_end.copy();
+    dbg_slots = ps.dbg_slots.copy();
+    dbg_slot_at = ps.dbg_slot_at.copy();
+    cur_src = ps.cur_src;
+    cur_scope = ps.cur_scope;
+}
+
+threadlocal let mut pv_first: bool = true;
+
+/// On the thread of a part, once its functions are finished: the other
+/// parts' functions are declared, and (but in the first part) the data the
+/// parts share.
+pub fn part_declare_others() void {
+    for i in 0..pv_n {
+        if pv_vis.get(i) != PV_OWN {
+            pv_vis.set(i, PV_DECL);
+        }
+    }
+    pv_inits = pv_first;
+}
+
+/// The module a part's thread works on: m's lists of functions and globals
+/// (and names) copied, which the passes and code generator of the part add
+/// to (switch tables, coverage counters), and the rest of m.
+pub fn part_module(m: *Module) *mut Module {
+    let pm = u.new.[Module]();
+    pm.* = m.*;
+    pm.funcs = m.funcs.copy();
+    pm.globals = m.globals.copy();
+    pm.fmap = m.fmap.copy();
+    pm.gmap = m.gmap.copy();
+    pm.aliases = m.aliases.copy();
+    return pm;
+}
+
 /// The tables of the variables' assignments, made smaller for the
-/// processes that make the code from them (backend.ax: the parts, which
-/// fork with all of this process's memory): the places whose marks are
+/// parts that make the code from them (backend.ax, which each start from
+/// a copy of them: part_begin): the places whose marks are
 /// gone (taken, or of an instruction or block no more) and the values no
 /// entry follows any longer leave the maps.
 pub fn dbg_compact() void {
@@ -6376,4 +6589,196 @@ pub fn dbg_release() void {
         mp.cap = 0;
         mp.len = 0;
     }
+}
+
+// -----------------------------------------------------------------------------
+// Debugging (AXIOM_CHECK_PARTS: backend.ax runs the parts one at a time):
+// that a part changes nothing of the module but its own functions, nor the
+// constants and types the parts share. The memory of each is copied when
+// the parts begin (watch_module), and compared after each part
+// (watch_check).
+// -----------------------------------------------------------------------------
+struct WatchRegion {
+    addr: usize,
+    len: usize,
+    owner: i32,  // the function it is part of (-1: none: shared by all)
+    what: []u8,
+    copy: usize,  // its offset in the copy
+}
+
+pub struct Watch {
+    regions: u.List.[WatchRegion],
+    copy: u.List.[u8],
+    seen: u.U64Map,
+}
+
+fn watch(w: *mut Watch, p: usize, len: usize, owner: i32, what: []u8) void {
+    if (p == 0) or (len == 0) {
+        return;
+    }
+    if w.seen.get(@as(u64, p)) != 0 {
+        return;
+    }
+    w.seen.put(@as(u64, p), 1);
+    let at = w.copy.len;
+    let dst = w.copy.extend(len);
+    @mem_copy(dst, @slice_from_ptr(@ptr_from_int(*u8, p), len));
+    w.regions.push(WatchRegion.{ addr: p, len: len, owner: owner, what: what, copy: at });
+}
+
+fn watch_ty(w: *mut Watch, t: *mut Ty) void {
+    if u.isnil(t) or (w.seen.get(@as(u64, @int_from_ptr(t))) != 0) {
+        return;
+    }
+    watch(w, @int_from_ptr(t), @size_of(Ty), -1, "type");
+    watch_ty(w, t.elem);
+    watch_ty(w, t.ret);
+    for x in t.fields {
+        watch_ty(w, x);
+    }
+    for x in t.params {
+        watch_ty(w, x);
+    }
+    watch(w, @int_from_ptr(t.fields.ptr), t.fields.len * @size_of(*mut Ty), -1, "type fields");
+    watch(w, @int_from_ptr(t.params.ptr), t.params.len * @size_of(*mut Ty), -1, "type params");
+    watch(w, @int_from_ptr(t.offs.ptr), t.offs.len * 8, -1, "type offsets");
+}
+
+fn watch_val(w: *mut Watch, v: *mut Value, owner: i32) void {
+    if u.isnil(v) or (w.seen.get(@as(u64, @int_from_ptr(v))) != 0) {
+        return;
+    }
+    let mut o = owner;
+    if v.kind != V_INST {
+        o = -1;  // (constants, globals' and functions' values: shared)
+        if v.kind == V_PARAM {
+            o = owner;
+        }
+    }
+    if o < 0 {
+        // (the scratch of what is shared, poisoned: a part that sets it and
+        // then clears it is seen; its uses stay, which some read: 0)
+        v.aux = 0x5A5A5A5A5A5A5A5A;
+        v.aux2 = 0x5A5A5A5A5A5A5A5A;
+        v.pos = 0x5A5A5A5A;
+        v.loc = 0x5A5A5A5A;
+        v.flag = 0x5A5A5A5A;
+    }
+    let mut what = "constant";
+    if v.kind == V_INST {
+        what = "instruction";
+    } else if v.kind == V_PARAM {
+        what = "parameter";
+    }
+    watch(w, @int_from_ptr(v), @size_of(Value), o, what);
+    watch_ty(w, v.ty);
+    if v.more != 0 {
+        watch(w, v.more, more_size(more_group(v)), o, "value record");
+    }
+    watch(w, @int_from_ptr(v.xs.data), v.xs.len * @size_of(*mut Value), o, "operands");
+    if (v.kind == V_INST) and (v.op == OP_CALL) {
+        // (the records of calls, which functions share: inlining, copies)
+        let mut c = chain_of(v);
+        while u.notnil(c) {
+            watch(w, @int_from_ptr(c), @size_of(Chain), -1, "call's chain");
+            watch_val(w, c.site, -1);
+            c = c.next;
+        }
+    }
+    if v.kind != V_INST {
+        for k in 0..v.xs.len {
+            watch_val(w, v.xs.get(k), o);
+        }
+    }
+}
+
+/// The copy of m's memory, and the shared constants' and types'.
+pub fn watch_module(m: *mut Module) *mut Watch {
+    let w = u.new.[Watch]();
+    w.* = Watch.{ regions: u.List.[WatchRegion].empty(), copy: u.List.[u8].empty(), seen: u.U64Map.empty() };
+    watch(w, @int_from_ptr(m), @size_of(Module), -1, "module");
+    watch(w, @int_from_ptr(m.funcs.data), m.funcs.len * 8, -1, "the module's functions");
+    watch(w, @int_from_ptr(m.globals.data), m.globals.len * 8, -1, "the module's globals");
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        watch(w, @int_from_ptr(g), @size_of(Global), -1, "global");
+        watch_val(w, g.val, -1);
+        watch_val(w, g.init, -1);
+        watch_ty(w, g.ty);
+    }
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        let o = @int_cast(i32, i);
+        watch(w, @int_from_ptr(f), @size_of(Func), o, "function");
+        watch_val(w, f.val, -1);
+        watch_ty(w, f.ty);
+        for p in f.params {
+            watch_val(w, p, o);
+        }
+        let mut b = f.first;
+        while u.notnil(b) {
+            watch(w, @int_from_ptr(b), @size_of(Block), o, "block");
+            let mut x = b.first;
+            while u.notnil(x) {
+                watch_val(w, x, o);
+                for k in 0..(3 + x.xs.len) {
+                    let y = operand(x, k);
+                    if u.notnil(y) and (y.kind != V_INST) {
+                        watch_val(w, y, o);
+                    }
+                }
+                x = x.next;
+            }
+            b = b.next;
+        }
+    }
+    for i in @as(usize, 0)..129 {
+        watch_ty(w, TT.int_tys[i]);
+    }
+    let dv = @slice_from_ptr(TT.derived.vals, TT.derived.cap);
+    for i in 0..TT.derived.cap {
+        watch_ty(w, dv[i]);
+    }
+    watch(w, @int_from_ptr(asm_flags.data), asm_flags.len * 4, -1, "asm flags");
+    watch(w, @int_from_ptr(asm_mems.data), asm_mems.len * @size_of([]AsmMem), -1, "asm memory operands");
+    return w;
+}
+
+/// Adds the memory [p, p + len) to w (what is outside the IR: backend.ax).
+pub fn watch_more(w: *mut Watch, p: usize, len: usize, what: []u8) void {
+    watch(w, p, len, -1, what);
+}
+
+/// After a part whose functions are mine: reports what changed of the rest
+/// (at most a few places); the number of regions changed.
+pub fn watch_check(w: *mut Watch, k: usize, mine: []bool) usize {
+    let mut bad: usize = 0;
+    let mut kept = u.List.[WatchRegion].empty();
+    for r in w.regions.items() {
+        if (r.owner >= 0) and mine[@as(usize, @bit_cast(u32, r.owner))] {
+            continue;  // (its own: what is left of it may be reused by the next part)
+        }
+        kept.push(r);
+        let now = @slice_from_ptr(@ptr_from_int(*mut u8, r.addr), r.len);
+        let was = w.copy.items()[r.copy..(r.copy + r.len)];
+        if @mem_eq(now, was) {
+            continue;
+        }
+        bad += 1;
+        if bad <= 20 {
+            let mut off: usize = 0;
+            while now[off] == was[off] {
+                off += 1;
+            }
+            let mut who = "";
+            if r.owner >= 0 {
+                who = u.f1(" of function %s", u.zdec(@as(usize, @bit_cast(u32, r.owner))));
+            }
+            u.eprint(u.f4("axiom: part %s changed a %s%s at byte %s", u.zdec(k), r.what, who, u.zdec(off)));
+            u.eprint(u.f2(" (kind %s, at %s)\n", u.zdec(@as(usize, now[0])), u.zdec(r.addr)));
+        }
+        @mem_copy(now, was);  // (for the next part, as a process of its own would see it)
+    }
+    w.regions = kept;
+    return bad;
 }
