@@ -8,14 +8,26 @@ import "bin.ax" as bn;
 import "coff.ax" as coff;
 import "dbginfo.ax" as dbi;
 import "elf.ax" as elf;
+import "gvn.ax" as gvn;
+import "idioms.ax" as idioms;
 import "ir.ax" as ir;
 import "isel.ax" as is;
+import "loopopt.ax" as lopt;
+import "loops.ax" as loops;
 import "lower.ax" as lower;
 import "lstub.ax" as lstub;
 import "macho.ax" as mo;
+import "opt.ax" as opt;
+import "outline.ax" as outl;
 import "passes.ax" as passes;
+import "slots.ax" as slots;
+import "std/thread" as thread;
+import "tailrec.ax" as tre;
 import "target.ax" as tg;
+import "thread.ax" as thr;
+import "unroll.ax" as unr;
 import "util.ax" as u;
+import "vectorize.ax" as vec;
 import "vsplit.ax" as vsplit;
 import "wasm.ax" as wa;
 import "wobj.ax" as wo;
@@ -49,6 +61,47 @@ pub let mut g_keep_path: []u8 = "";
 pub let mut g_native_format: bool = false;
 pub let mut g_kept_unit: *mut wo.Unit = @ptr_from_int(*mut wo.Unit, 0);
 pub let mut g_part_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+/// The objects of the parts (the first part's at the object's own path),
+/// which are not written: the link reads them from here (object_bytes).
+pub struct MemObject {
+    path: []u8,
+    bytes: []u8,
+}
+
+pub let mut g_mem_objects: u.List.[MemObject] = u.List.[MemObject].{ data: @ptr_from_int(*mut MemObject, 0), len: 0,
+                                                                     cap: 0 };
+
+/// The bytes of the object at path that a part made, or a nil slice (it is
+/// in the file).
+pub fn object_bytes(path: []u8) []u8 {
+    for x in g_mem_objects.items() {
+        if u.str_eq(x.path, path) {
+            return x.bytes;
+        }
+    }
+    return u.nosym();
+}
+
+/// Writes the objects of the parts to their paths (for a link by other
+/// tools); false if one cannot be.
+pub fn write_objects() bool {
+    for x in g_mem_objects.items() {
+        if not u.write_file(x.path, x.bytes) {
+            u.eprint(u.f1("axiom: cannot write %s\n", x.path));
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Gives back the objects of the parts, once linked.
+pub fn release_objects() void {
+    for x in g_mem_objects.items() {
+        u.free_heap(x.bytes);
+    }
+    g_mem_objects.clear();
+}
 
 fn no_wide(v: *mut ir.Value) bool {
     return false;
@@ -186,6 +239,23 @@ fn split_vectors(m: *mut ir.Module) void {
 
 // The machine code of m's functions, as an object at path.
 fn native_obj(m: *mut ir.Module, path: []u8) bool {
+    let bytes = native_bytes(m, path);
+    if u.isnos(bytes) {
+        return false;
+    }
+    let wrote = u.write_file(path, bytes);
+    u.free_heap(bytes);
+    if not wrote {
+        u.eprint(u.f1("axiom: cannot write %s\n", path));
+        return false;
+    }
+    return true;
+}
+
+// The machine code of m's functions, the bytes of the object for path
+// (u.free_heap), or a nil slice if they cannot be made (and why is
+// reported).
+fn native_bytes(m: *mut ir.Module, path: []u8) []u8 {
     let mut o = u.nil.[elf.Obj]();
     if tg.g_arch == tg.ARCH_X64 {
         o = x64.compile(m);
@@ -194,7 +264,7 @@ fn native_obj(m: *mut ir.Module, path: []u8) bool {
     }
     u.scratch_release();
     if u.isnil(o) {
-        return false;
+        return u.nosym();
     }
     if g_stubs {
         // (weak: several objects may each have them, and a program one set)
@@ -212,25 +282,19 @@ fn native_obj(m: *mut ir.Module, path: []u8) bool {
         bytes = mo.write(o);
         if bytes.len == 0 {
             u.eprint(u.f2("axiom: cannot write %s as a Mach-O object: %s\n", path, mo.g_error));
-            return false;
+            return u.nosym();
         }
     } else if g_native_format and tg.is_windows() {
         bytes = coff.write(o);
         if bytes.len == 0 {
             u.eprint(u.f2("axiom: cannot write %s as a COFF object: %s\n", path, coff.g_error));
-            return false;
+            return u.nosym();
         }
     } else {
         bytes = elf.write(o);
     }
-    let wrote = u.write_file(path, bytes);
-    u.free_heap(bytes);
     elf.release(o);
-    if not wrote {
-        u.eprint(u.f1("axiom: cannot write %s\n", path));
-        return false;
-    }
-    return true;
+    return bytes;
 }
 
 // -----------------------------------------------------------------------------
@@ -239,21 +303,78 @@ fn native_obj(m: *mut ir.Module, path: []u8) bool {
 // After inlining, the functions are dealt out to parts of about PART_SIZE
 // work each (part_weight; at most MAX_PARTS of them), each finished (the
 // passes that see one function at a time: passes.finish_funcs) and compiled
-// in a process of its own, forked, to an object: the first part's at path, with
-// all of the data, the others' at <path>.p<k>.o, with the functions of the
+// on a thread of its own to an object: the first part's at path, with all
+// of the data, the others' at <path>.p<k>.o, with the functions of the
 // other parts and the data as external symbols. So that they can refer to
 // each other, the module's internal functions and data become global
 // symbols, under names made unique (isel.add_symbols: two modules may each
 // have a function of the same name, and string constants share theirs).
-// How the functions are cut depends only on the program, not on the
-// machine's processors, so the executable is the same wherever it is built.
+// The parts share the module: each changes its own functions, and sees the
+// rest as it was when the parts began (ir.part_begin: the other parts'
+// functions defined to the passes, declared to the code generator), and
+// starts from what the passes' tables held then (part_state), as a process
+// forked then would. How the functions are cut depends only on the
+// program, not on the machine's processors, so the executable is the same
+// wherever it is built, whatever the number of threads.
 // -----------------------------------------------------------------------------
 const PART_SIZE: i64 = 200000;
 const MAX_PARTS: i64 = 4;
 const SLICES: i64 = 8;
 
+// What every part's thread starts from (the thread that made the module
+// does nothing else while they run).
+struct PartsStart {
+    us: u.WorkerStart,
+    ir: *mut ir.PartStart,
+    features: u64,
+    nfuncs: usize,
+    nglobals: usize,
+    blobs: ai.Blobs,
+    toplevel: ai.Blobs,
+    dbi: dbi.PartState,
+    thr: thr.PartState,
+    opt: opt.PartState,
+    lopt: lopt.PartState,
+    gvn: i32,
+    loops: i64,
+    unr: i64,
+    idioms: i64,
+    vec: i64,
+    outl: i64,
+    ret01: u.List.[bool],
+    kept: u.List.[u64],
+}
+
+fn parts_start(ps: *mut ir.PartStart, m: *ir.Module) *mut PartsStart {
+    let s = u.new.[PartsStart]();
+    s.* = PartsStart.{ us: u.worker_start(), ir: ps, features: tg.g_features, nfuncs: m.funcs.len,
+                       nglobals: m.globals.len, blobs: ai.blobs, toplevel: ai.toplevel, dbi: dbi.part_state(),
+                       thr: thr.part_state(), opt: opt.part_state(), lopt: lopt.part_state(), gvn: gvn.part_state(),
+                       loops: loops.part_state(), unr: unr.part_state(), idioms: idioms.part_state(),
+                       vec: vec.part_state(), outl: outl.part_state(), ret01: tre.part_state(),
+                       kept: slots.part_state() };
+    return s;
+}
+
+// A part, and how it went.
+struct Part {
+    m: *mut ir.Module,
+    level: i32,
+    k: usize,
+    mine: []mut bool,  // by function: its own
+    path: []u8,
+    st: *PartsStart,
+    ok: bool,
+    obj: []u8,  // its object (outside the thread's memory: u.keep_dup)
+    done: u32,  // 1 once ok and obj are set
+}
+
+// The parts of this build that are done (Part.done), for the thread that
+// started them to wait on.
+let mut parts_done: u32 = 0;
+
 // 1 if the parts compiled, 0 if one failed (and reported why), -1 if the
-// module is too small to cut or processes cannot be made: then nothing was
+// module is too small to cut or threads cannot be made: then nothing was
 // done.
 fn compile_parts(m: *mut ir.Module, level: i32, path: []u8) i32 {
     let mut total: i64 = 0;
@@ -272,66 +393,131 @@ fn compile_parts(m: *mut ir.Module, level: i32, path: []u8) i32 {
     // (so that a few big functions together do not make one part slow).
     let n = @int_cast(usize, np);
     let runs = np * SLICES;
-    let owner = u.newn.[usize](m.funcs.len + 1);
+    let parts = u.newn.[Part](n);
+    for k in 0..n {
+        parts[k] = Part.{ m: m, level: level, k: k, mine: u.newn.[bool](m.funcs.len + 1)[0..m.funcs.len],
+                          path: part_path(path, k), st: u.nil.[PartsStart](), ok: false, obj: u.nosym(), done: 0 };
+    }
     let mut acc: i64 = 0;
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         let r = @min((acc * runs) / total, runs - 1);
-        owner[i] = @int_cast(usize, r % np);
+        parts[@int_cast(usize, r % np)].mine[i] = true;
         if not ir.is_decl(f) {
             acc += part_weight(f);
         }
     }
-    is.g_shared_funcs = m.funcs.len;
-    is.g_shared_globals = m.globals.len;
     ir.dbg_compact();
+    let ps = ir.part_start(m);
+    if u.isnil(ps) {
+        if u.env_num("AXIOM_CHECK_PARTS", 0) > 0 {
+            u.eprint("axiom: the module cannot be cut into parts\n");
+        }
+        return -1;
+    }
+    if level >= 2 {
+        tre.prepare_sibling(m);  // (from the IR as it is now: every part finds the same)
+    }
+    let st = parts_start(ps, m);
+    for k in 0..n {
+        parts[k].st = st;
+    }
+    let check = u.env_num("AXIOM_CHECK_PARTS", 0);
+    if check > 0 {
+        return check_parts(m, parts, check == 2);
+    }
+    // `width` at a time, the results taken in order
     let width = @min(u.jobs(), n);
-    let mut pids = u.List.[i32].empty();
-    let mut first: usize = 0;  // the oldest still running
+    @atomic_store(&mut parts_done, 0);
+    let mut running = u.List.[thread.Thread.[*mut Part]].empty();
+    let mut taken: usize = 0;
     let mut ok = true;
-    while (pids.len < n) or (first < pids.len) {
-        while ok and ((pids.len - first) < width) and (pids.len < n) {
-            let k = pids.len;
-            u.flush_out();
-            let pid = u.fork();
-            if pid == 0 {
-                u._exit(compile_part(m, level, k, owner, part_path(path, k)));
-            }
-            if pid < 0 {
-                if k == 0 {
-                    // (in one piece after all: its symbols as usual)
-                    is.g_shared_funcs = 0;
-                    is.g_shared_globals = 0;
-                    return -1;
+    loop {
+        let done = @atomic_load(&parts_done);
+        while ok and (running.len < n) and ((running.len - @as(usize, done)) < width) {
+            let t = thread.spawn(run_part, &mut parts[running.len]) catch {
+                if running.len == 0 {
+                    return -1;  // (in one piece after all)
                 }
                 ok = false;
                 break;
-            }
-            pids.push(pid);
+            };
+            running.push(t);
         }
-        if first == pids.len {
+        while (taken < running.len) and (@atomic_load(&parts[taken].done) == 1) {
+            running.get(taken).join();
+            if not parts[taken].ok {
+                ok = false;
+            }
+            taken += 1;
+        }
+        if (taken == running.len) and (not ok or (taken == n)) {
             break;
         }
-        if u.wait_child(pids.get(first)) != 0 {
-            ok = false;
-        }
-        first += 1;
+        _ = @atomic_wait(&parts_done, done, -1);
     }
+    running.deinit();
     u.phase("parts: finish, split vectors, machine code");
+    return parts_done_with(parts[0..taken], ok);
+}
+
+// The objects of the parts, which have all compiled if ok: kept for the
+// link (g_mem_objects, g_part_objs); 1 if ok, else 0.
+fn parts_done_with(parts: []mut Part, ok: bool) i32 {
     g_part_objs.clear();
-    for k in 1..n {
-        g_part_objs.push(part_path(path, k));
-    }
-    if not ok {
-        for k in 0..n {
-            _ = u.unlink(u.cz(part_path(path, k)));
+    for k in 0..parts.len {
+        let p = &mut parts[k];
+        if ok {
+            g_mem_objects.push(MemObject.{ path: p.path, bytes: p.obj });
+            if k > 0 {
+                g_part_objs.push(p.path);
+            }
+        } else if not u.isnos(p.obj) {
+            u.free_heap(p.obj);
         }
-        g_part_objs.clear();
     }
     if ok {
         return 1;
     }
     return 0;
+}
+
+// Debugging (AXIOM_CHECK_PARTS=1, or 2 for the last part first): the parts
+// one at a time, and after each what it changed of the module but its own
+// functions (ir.watch_check), which the threads of the others would see.
+fn check_parts(m: *mut ir.Module, parts: []mut Part, backwards: bool) i32 {
+    let w = ir.watch_module(m);
+    let d = &parts[0].st.dbi;
+    ir.watch_more(w, @int_from_ptr(d.scopes.data), d.scopes.len * @size_of(dbi.DScope), "debug scopes");
+    ir.watch_more(w, @int_from_ptr(d.types.data), d.types.len * @size_of(dbi.DType), "debug types");
+    ir.watch_more(w, @int_from_ptr(d.globals.data), d.globals.len * @size_of(dbi.DVar), "debug globals");
+    let vs = @slice_from_ptr(d.vars.vals, d.vars.cap);
+    for j in 0..d.vars.cap {
+        if u.notnil(vs[j]) {
+            ir.watch_more(w, @int_from_ptr(vs[j].data), vs[j].len * @size_of(dbi.DVar), "debug variables");
+        }
+    }
+    let bl = parts[0].st.blobs;
+    ir.watch_more(w, @int_from_ptr(bl.data), bl.len * 8, "asm statements");
+    let mut bad: usize = 0;
+    for j in 0..parts.len {
+        let mut k = j;
+        if backwards {
+            k = parts.len - 1 - j;
+        }
+        let t = thread.spawn(run_part, &mut parts[k]) catch {
+            return -1;
+        };
+        t.join();
+        bad += ir.watch_check(w, k, parts[k].mine);
+        if not parts[k].ok {
+            return parts_done_with(parts, false);
+        }
+    }
+    if bad > 0 {
+        u.eprint(u.f1("axiom: the parts changed %s places of what they share\n", u.zdec(bad)));
+    }
+    return parts_done_with(parts, true);
 }
 
 // The work f's part takes for it, roughly: more than in proportion to its
@@ -348,34 +534,63 @@ fn part_path(path: []u8, k: usize) []u8 {
     return u.f2("%s.p%s.o", path, u.zdec(k));
 }
 
-// In the process of part k: the functions whose owner is k. Its exit status.
-fn compile_part(m: *mut ir.Module, level: i32, k: usize, owner: []usize, path: []u8) i32 {
-    let mine = u.newn.[bool](m.funcs.len);
-    for i in 0..m.funcs.len {
-        mine[i] = owner[i] == k;
+// On the thread of part p.
+fn run_part(p: *mut Part) void {
+    u.worker_begin(&p.st.us);
+    let s = p.st;
+    tg.g_features = s.features;
+    is.g_shared_funcs = s.nfuncs;
+    is.g_shared_globals = s.nglobals;
+    ai.blobs = s.blobs;
+    if p.k == 0 {
+        ai.toplevel = s.toplevel;  // (file-scope asm: the first part's)
     }
-    u.phase(u.f1("part %s: start", u.zdec(k)));
+    dbi.part_begin(&s.dbi);
+    thr.part_begin(&s.thr);
+    opt.part_begin(&s.opt);
+    lopt.part_begin(&s.lopt);
+    gvn.part_begin(s.gvn);
+    loops.part_begin(s.loops);
+    unr.part_begin(s.unr);
+    idioms.part_begin(s.idioms);
+    vec.part_begin(s.vec);
+    outl.part_begin(s.outl);
+    tre.part_begin(&s.ret01);
+    slots.part_begin(&s.kept);
+    ir.part_begin(s.ir, p.mine, p.k == 0);
+    let m = ir.part_module(p.m);
+    let obj = compile_part(m, p.level, p.mine, p.path);
+    p.ok = not u.isnos(obj);
+    if p.ok {
+        p.obj = u.keep_dup(obj);
+    }
+    u.worker_end();
+    @atomic_store(&mut p.done, 1);
+    _ = @atomic_add(&mut parts_done, 1);
+    _ = @atomic_notify(&parts_done, 0xFFFF_FFFF);
+}
+
+// In a part: its own functions (mine), finished and compiled: the object's
+// bytes (for path), or a nil slice if it failed.
+fn compile_part(m: *mut ir.Module, level: i32, mine: []bool, path: []u8) []u8 {
     passes.finish_funcs(m, level, mine);
-    check_ir(m);
-    // the other parts' functions, and (but in the first part) the data the
-    // parts share, are only declared here
-    for i in 0..is.g_shared_funcs {
-        if not mine[i] {
-            let f = m.funcs.get(i);
-            f.first = u.nil.[ir.Block]();
-            f.last = u.nil.[ir.Block]();
-        }
-    }
-    if k > 0 {
-        for i in 0..is.g_shared_globals {
-            m.globals.get(i).init = u.nil.[ir.Value]();
-        }
-        ai.toplevel.clear();  // (file-scope asm: the first part's)
-    }
+    check_part(m, mine);
+    ir.part_declare_others();
     split_vectors(m);
-    if not native_obj(m, path) {
-        return 1;
+    return native_bytes(m, path);
+}
+
+// check_ir, of a part's own functions.
+fn check_part(m: *mut ir.Module, mine: []bool) void {
+    if not u.isnos(u.env("AXIOM_CHECK_CINTS")) {
+        ir.check_cints();
     }
-    u.phase(u.f1("part %s: machine code", u.zdec(k)));
-    return 0;
+    if not u.isnos(u.env("AXIOM_CHECK_IR")) {
+        for i in 0..m.funcs.len {
+            if (i >= mine.len) or mine[i] {
+                ir.check_order_of(m.funcs.get(i));
+                ir.check_uses(m.funcs.get(i));
+            }
+        }
+    }
 }
