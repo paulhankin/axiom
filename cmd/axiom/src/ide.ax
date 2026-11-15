@@ -869,10 +869,10 @@ fn same_target(a: *Ref, b: *Ref) bool {
     return (a.decl == b.decl) and (a.index == b.index);
 }
 
-// Sorts the names by position and drops repeats (sema shares some subtrees).
-fn sort_refs() void {
-    u.sort.[Ref](refs.items(), ref_cmp);
-    let xs = refs.items();
+// Sorts names by position and drops repeats (sema shares some subtrees);
+// how many are left, at the start of xs.
+fn sort_names(xs: []mut Ref) usize {
+    u.sort.[Ref](xs, ref_cmp);
     let mut n: usize = 0;
     for i in 0..xs.len {
         if n > 0 {
@@ -886,29 +886,157 @@ fn sort_refs() void {
         xs[n] = xs[i];
         n += 1;
     }
-    refs.len = n;
+    return n;
 }
 
-// The name at `off` in `file`: an index into refs, or -1. A name the
-// cursor is inside beats one it is just after.
-fn ref_at(file: i32, off: u32) i64 {
-    let mut best: i64 = -1;
+// The names found, sorted: runs of refs, or of the kept modules' indexes,
+// in order (one, refs, but for references and renames: names_by_module).
+threadlocal let mut name_runs: u.List.[[]mut Ref] = u.List.[[]mut Ref].{
+    data: @ptr_from_int(*mut []mut Ref, 0), len: 0, cap: 0 };
+
+// Sorts refs (as sort_names) as the names found.
+fn sort_refs() void {
+    refs.len = sort_names(refs.items());
+    name_runs.len = 0;
+    name_runs.push(refs.items());
+}
+
+// The name at `off` in `file`, or nil. A name the cursor is inside beats
+// one it is just after.
+fn ref_at(file: i32, off: u32) *Ref {
+    let mut best: *Ref = u.nil.[Ref]();
     let mut best_len: u32 = 0;
     let mut best_inside = false;
-    for i in 0..refs.len {
-        let r = refs.at(i);
-        if (r.span.file != file) or not contains(r.span, off) {
-            continue;
+    for k in 0..name_runs.len {
+        let xs = name_runs.get(k);
+        if (name_runs.len > 1) and ((xs.len == 0) or (xs[0].span.file != file)) {
+            continue;  // (each a module's, in its file)
         }
-        let inside = off < r.span.end;
-        let len = r.span.end - r.span.start;
-        if (best < 0) or (inside and not best_inside) or ((inside == best_inside) and (len < best_len)) {
-            best = @int_cast(i64, i);
-            best_len = len;
-            best_inside = inside;
+        for i in 0..xs.len {
+            let r = &xs[i];
+            if (r.span.file != file) or not contains(r.span, off) {
+                continue;
+            }
+            let inside = off < r.span.end;
+            let len = r.span.end - r.span.start;
+            if u.isnil(best) or (inside and not best_inside) or ((inside == best_inside) and (len < best_len)) {
+                best = r;
+                best_len = len;
+                best_inside = inside;
+            }
         }
     }
     return best;
+}
+
+// -----------------------------------------------------------------------------
+// The names of the modules axiom lsp keeps
+// -----------------------------------------------------------------------------
+// References and renames look at every module of the program. The names
+// of a module the language server keeps (modload.ax) are found once, when
+// it is kept (index_kept, on the main thread, which workers read). Every
+// name a module's walk finds is in the module's own file (where one is not,
+// the module is walked again), so the program's names, sorted, are each
+// module's sorted, in the order of their files: the same, then, as when
+// every module is walked.
+struct Index {
+    m: *mut ast.Module,
+    refs: []mut Ref,  // sorted (sort_names), on the heap
+}
+
+let mut kept_names: u.SymMap.[*mut Index] = u.SymMap.[*mut Index].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                    vals: @ptr_from_int(*mut *mut Index, 0), cap: 0,
+                                                                    len: 0 };
+
+// Walks m into refs; false if a name it found is not in m's file.
+fn walk_own(m: *mut ast.Module) bool {
+    let from = refs.len;
+    walk_module(m);
+    for i in from..refs.len {
+        if refs.at(i).span.file != m.file.id {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// On the main thread: finds the names of m, which axiom lsp now keeps.
+pub fn index_kept(m: *mut ast.Module) void {
+    drop_index(m.path);
+    refs.len = 0;
+    if walk_own(m) {
+        let n = sort_names(refs.items());
+        let xs = @slice_from_ptr(@ptr_cast(*mut Ref, u.malloc((n + 1) * @size_of(Ref))), n);
+        for i in 0..n {
+            xs[i] = refs.get(i);
+        }
+        let ix = @ptr_cast(*mut Index, u.malloc(@size_of(Index)));
+        ix.* = Index.{ m: m, refs: xs };
+        kept_names.put(m.path, ix);
+    }
+    refs.len = 0;
+}
+
+/// On the main thread: forgets the names of the module kept for `path`.
+pub fn drop_index(path: []u8) void {
+    let ix = kept_names.get(path);
+    if u.notnil(ix) {
+        u.free(@ptr_cast(*mut void, ix.refs.ptr));
+        u.free(@ptr_cast(*mut void, ix));
+        kept_names.put(path, u.nil.[Index]());
+    }
+}
+
+struct Run {
+    rank: i64,
+    from: usize,  // in refs, if kept is nil
+    to: usize,
+    kept: *mut Index,
+}
+
+fn run_cmp(a: Run, b: Run) i32 {
+    if a.rank < b.rank {
+        return -1;
+    }
+    if a.rank > b.rank {
+        return 1;
+    }
+    return 0;
+}
+
+// The names of every module of the program, as sort_refs leaves them
+// after walking them all: false if a module's are not all in its file.
+fn names_by_module() bool {
+    refs.len = 0;
+    let mut runs = u.List.[Run].empty();
+    let ms = &modl.g_prog.modules;
+    for i in 0..ms.len {
+        let m = ms.get(i);
+        let rank = u.file_rank(m.file.id);
+        let ix = kept_names.get(m.path);
+        if m.base and u.notnil(ix) and (ix.m == m) {
+            runs.push(Run.{ rank: rank, from: 0, to: 0, kept: ix });
+            continue;
+        }
+        let from = refs.len;
+        if not walk_own(m) {
+            return false;
+        }
+        let n = sort_names(refs.items()[from..]);
+        refs.len = from + n;
+        runs.push(Run.{ rank: rank, from: from, to: refs.len, kept: u.nil.[Index]() });
+    }
+    u.sort.[Run](runs.items(), run_cmp);
+    name_runs.len = 0;
+    for i in 0..runs.len {
+        let r = runs.get(i);
+        if u.notnil(r.kept) {
+            name_runs.push(r.kept.refs);
+        } else {
+            name_runs.push(refs.items()[r.from..r.to]);
+        }
+    }
+    return true;
 }
 
 // The name of what a name refers to.
@@ -1235,16 +1363,15 @@ fn cursor() u32 {
     return offset_in(root_mod.file.text, q_line, q_char);
 }
 
-fn cursor_ref() i64 {
+fn cursor_ref() *Ref {
     return ref_at(root_mod.file.id, cursor());
 }
 
 fn q_hover() []u8 {
-    let i = cursor_ref();
-    if i < 0 {
+    let r = cursor_ref();
+    if u.isnil(r) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let mut b = u.Buf.init();
     b.s("{\"contents\":{\"kind\":\"markdown\",\"value\":");
     jstr(&mut b, describe(r));
@@ -1255,11 +1382,10 @@ fn q_hover() []u8 {
 }
 
 fn q_definition() []u8 {
-    let i = cursor_ref();
-    if i < 0 {
+    let r = cursor_ref();
+    if u.isnil(r) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let mut b = u.Buf.init();
     if r.kind == R_ERROR {
         let ds = error_defs(r.name);
@@ -1286,11 +1412,10 @@ fn is_type_decl(d: *mut ast.Decl) bool {
 }
 
 fn q_type_definition() []u8 {
-    let i = cursor_ref();
-    if i < 0 {
+    let r = cursor_ref();
+    if u.isnil(r) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let k = r.kind;
     let mut t = r.ty;
     if k == R_LOCAL {
@@ -1321,50 +1446,54 @@ fn q_type_definition() []u8 {
 }
 
 fn q_references() []u8 {
-    let i = cursor_ref();
-    if i < 0 {
+    let r = cursor_ref();
+    if u.isnil(r) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let mut b = u.Buf.init();
     b.c('[');
     let mut first = true;
-    for j in 0..refs.len {
-        let x = refs.at(j);
-        if not same_use(r, x) or (x.def and not q_include_decl) {
-            continue;
+    for k in 0..name_runs.len {
+        let xs = name_runs.get(k);
+        for j in 0..xs.len {
+            let x = &xs[j];
+            if not same_use(r, x) or (x.def and not q_include_decl) {
+                continue;
+            }
+            if not first {
+                b.c(',');
+            }
+            first = false;
+            jlocation(&mut b, x.span);
         }
-        if not first {
-            b.c(',');
-        }
-        first = false;
-        jlocation(&mut b, x.span);
     }
     b.c(']');
     return b.done();
 }
 
 fn q_highlight() []u8 {
-    let i = cursor_ref();
-    if i < 0 {
+    let r = cursor_ref();
+    if u.isnil(r) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let mut b = u.Buf.init();
     b.c('[');
     let mut first = true;
-    for j in 0..refs.len {
-        let x = refs.at(j);
-        if (x.span.file != root_mod.file.id) or not same_use(r, x) {
-            continue;
+    for k in 0..name_runs.len {
+        let xs = name_runs.get(k);
+        for j in 0..xs.len {
+            let x = &xs[j];
+            if (x.span.file != root_mod.file.id) or not same_use(r, x) {
+                continue;
+            }
+            if not first {
+                b.c(',');
+            }
+            first = false;
+            b.s("{\"range\":");
+            jrange(&mut b, x.span);
+            b.s(u.pick(x.def, ",\"kind\":3}", ",\"kind\":2}"));
         }
-        if not first {
-            b.c(',');
-        }
-        first = false;
-        b.s("{\"range\":");
-        jrange(&mut b, x.span);
-        b.s(u.pick(x.def, ",\"kind\":3}", ",\"kind\":2}"));
     }
     b.c(']');
     return b.done();
@@ -1392,11 +1521,10 @@ fn in_std(file: i32) bool {
 }
 
 fn q_rename() []u8 {
-    let i = cursor_ref();
-    if (i < 0) or not valid_name(q_new_name) {
+    let r = cursor_ref();
+    if u.isnil(r) or not valid_name(q_new_name) {
         return "null";
     }
-    let r = refs.at(@int_cast(usize, i));
     let w = def_of(r);
     if (r.kind == R_BUILTIN) or not w.ok or in_std(w.span.file) or not u.str_eq(text_of(r.span), target_name(r)) {
         return "null";
@@ -1404,26 +1532,29 @@ fn q_rename() []u8 {
     let mut b = u.Buf.init();
     b.s("{\"changes\":{");
     let mut cur_file: i32 = -1;
-    for j in 0..refs.len {
-        let x = refs.at(j);
-        if not same_use(r, x) {
-            continue;
-        }
-        if x.span.file != cur_file {
-            if cur_file >= 0 {
-                b.s("],");
+    for k in 0..name_runs.len {
+        let xs = name_runs.get(k);
+        for j in 0..xs.len {
+            let x = &xs[j];
+            if not same_use(r, x) {
+                continue;
             }
-            cur_file = x.span.file;
-            jstr(&mut b, uri_of(u.file_of(cur_file).path));
-            b.s(":[");
-        } else {
-            b.c(',');
+            if x.span.file != cur_file {
+                if cur_file >= 0 {
+                    b.s("],");
+                }
+                cur_file = x.span.file;
+                jstr(&mut b, uri_of(u.file_of(cur_file).path));
+                b.s(":[");
+            } else {
+                b.c(',');
+            }
+            b.s("{\"range\":");
+            jrange(&mut b, x.span);
+            b.s(",\"newText\":");
+            jstr(&mut b, q_new_name);
+            b.c('}');
         }
-        b.s("{\"range\":");
-        jrange(&mut b, x.span);
-        b.s(",\"newText\":");
-        jstr(&mut b, q_new_name);
-        b.c('}');
     }
     if cur_file >= 0 {
         b.c(']');
@@ -2288,15 +2419,17 @@ pub fn answer(input: []u8, std_dir: []u8) []u8 {
     if u.str_eq(q, "signatureHelp") {
         call_off = open_paren(root_mod.file.text, cursor());
     }
-    if whole {
+    if not whole {
+        walk_module(root_mod);
+        sort_refs();
+    } else if not names_by_module() {
+        refs.len = 0;
         let ms = &modl.g_prog.modules;
         for i in 0..ms.len {
             walk_module(ms.get(i));
         }
-    } else {
-        walk_module(root_mod);
+        sort_refs();
     }
-    sort_refs();
     let mut out: []u8 = "null";
     if u.str_eq(q, "hover") {
         out = q_hover();

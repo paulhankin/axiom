@@ -4158,9 +4158,11 @@ await section('axiom lsp', {
     // (names an error it does not declare: kept, it would be wrong for a program without main.ax)
     put('src/far.ax', 'pub fn fail() !void {\n    return error.Elsewhere;\n}\n');
     put('src/other.ax', 'import "far.ax" as far;\n\npub fn g() void {\n    far.fail() catch {};\n}\n');
-    const mainText = 'import "lib.ax" as lib;\nimport "far.ax" as far;\nimport "std/encoding/json" as json;\n\nerror { Elsewhere }\n\nfn twice(x: i32) i32 {\n    let p = lib.Pair.{ a: x, b: x };\n    return lib.sum(p);\n}\n\npub fn main() void {\n    let t = lib.trimmed("  x ");\n    _ = t;\n    _ = twice(21);\n    far.fail() catch {};\n    let v = json.Value.Null;\n    _ = v;\n}\n';
+    put('src/half.ax', 'import "lib.ax" as lib;\n\npub fn half(p: *lib.Pair) i32 {\n    let q = p.*;\n    return lib.sum(q) / 2;\n}\n');
+    const mainText = 'import "lib.ax" as lib;\nimport "half.ax" as half;\nimport "far.ax" as far;\nimport "std/encoding/json" as json;\n\nerror { Elsewhere }\n\nfn twice(x: i32) i32 {\n    let p = lib.Pair.{ a: x, b: x };\n    return lib.sum(p);\n}\n\npub fn main() void {\n    let t = lib.trimmed("  x ");\n    _ = t;\n    _ = twice(21);\n    let hp = lib.Pair.{ a: 1, b: 2 };\n    _ = half.half(&hp);\n    far.fail() catch {};\n    let v = json.Value.Null;\n    _ = v;\n}\n';
     put('src/main.ax', mainText);
     const main = path.join(dir, 'src/main.ax'), lib = path.join(dir, 'src/lib.ax'), other = path.join(dir, 'src/other.ax');
+    const halfAx = path.join(dir, 'src/half.ax');
     const opts = ['--target=x86_64'];
     const p = spawn(compiler, ['lsp', ...opts], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
     let buf = Buffer.alloc(0), err = '', id = 0;
@@ -4232,6 +4234,10 @@ await section('axiom lsp', {
       await everywhere(main, 'opened', 2);
       // (by now the session keeps std/ and the files not open)
       await everywhere(main, 'again', 4);
+      // a kept module opened (and not edited) stays kept: completion after
+      // '.' puts a name into its text, so that run does not take it
+      await open(halfAx);
+      await everywhere(halfAx, 'a kept module opened');
       await edit(main, mainText.replace('    return lib.sum(p);', '    let q = p.a * 2;\n    return lib.sum(p) + q;'));
       checkDiags(main, 'a body edited');
       await everywhere(main, 'a body edited', 3);

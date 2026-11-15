@@ -531,7 +531,7 @@ x509, rsa, ...): 400-430 ms per request before (a process each), 2.6-3.5 ms
 after, for hover, definition, completion, signature help and diagnostics
 after an edit (the first check of a program costs what it did, and keeping
 its modules about as much again, between messages); references and rename
-(which walk every module) 90 ms. The compiler's own `main.ax`: 760 ms to
+(which then walked every module) 90 ms (below: now 3-7 ms). The compiler's own `main.ax`: 760 ms to
 10 ms. 500 edits (bodies and signatures alternately, each with a publish
 and a hover): the server's memory stays at 142.3 MB (after the first 50).
 A differential test (`axiom lsp`'s answers against `axiom ide`'s, for
@@ -540,12 +540,42 @@ before and after edits) found no difference in some 9000 answers; the
 suite's `axiom lsp` case does that for a small package, through edits in
 the editor and on disk.
 
-What remains: references and rename walk every module of the program on
-each request (the kept modules' names could be indexed once); a module
-kept and later dropped stays in the main thread's memory (each change on
-disk of a kept file, or each close of an edited document that is then kept,
-costs one copy of that module); a host without threads gets no answers (it
-had none before: no process could be spawned there either).
+- **References and rename** no longer walk every module per request: the
+  names of a kept module are found once, when it is kept (`ide.index_kept`,
+  on the main thread, into the heap; `ide.drop_index` when it is dropped),
+  sorted, and a request walks only the modules it checked itself
+  (`ide.names_by_module`). A module's walk finds names only in its own file
+  (checked: where one does not, every module is walked as before), and the
+  names are sorted by a stable sort by file and then position, so each
+  module's sorted names, in the order of their files, are what sorting them
+  all gives: the answers are the same. On the file importing 20 large
+  modules, references and rename went from 72 ms (median) to 3-7 ms; on
+  `lsp.ax` (whose program is most of the compiler, with the files of its
+  directory) from 190-206 ms to 5-20 ms. The index costs memory for as
+  long as its modules are kept: 140.3 MB to 148.7 MB on that file, with no
+  growth over 500 edits (and 175 MB to 149 MB at the peak of a session
+  that asks for references, since the requests no longer hold every
+  module's names).
+- Found by the differential test, and fixed: completion after a `.` with
+  no name typed yet puts a name into the document's text for that run
+  (`ide.prepare_completion`), but a document opened in the editor and not
+  edited is kept, and the run took the kept module, without the name, so
+  the answer was empty. A run now takes a kept module only if the text it
+  reads for its file is the kept one (`modload.reads_as_kept`). The suite's
+  `axiom lsp` case opens such a module now.
+
+What remains: a module kept and later dropped stays in the main thread's
+memory (each change on disk of a kept file, or each close of an edited
+document that is then kept, costs one copy of that module). Freeing it is
+not a local change: the main thread's runs allocate into its arenas, and a
+kept module's memory is interleaved with the strings, types and files the
+run made, which later runs and kept modules share (interned strings,
+hash-consed types), so a module's memory cannot be told apart and given
+back alone. It would take the main thread's own runs allocating per run
+(as workers do) with what the shared tables keep copied out, or a reset of
+the whole session's state (tables, files, kept modules) once enough memory
+has been dropped. A host without threads gets no answers (it had none
+before: no process could be spawned there either).
 
 ### Current state (before this item)
 
