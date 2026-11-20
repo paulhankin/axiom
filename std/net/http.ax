@@ -1085,7 +1085,9 @@ pub struct Options {
     threads: u32,
     /// The most a request line and headers may take (more: 431).
     max_head_bytes: usize,
-    /// The most a request body may take (more: 413).
+    /// The most a request body may take (more: 413). No more than
+    /// max_buffered_bytes - max_head_bytes is taken whatever this says, so
+    /// that one request alone always fits the budget.
     max_body_bytes: usize,
     /// How long a connection may wait for its next request (bytes that
     /// are not part of one, such as blank lines, do not extend it); and how
@@ -1119,9 +1121,13 @@ pub struct Options {
     /// more are closed as they are accepted. 0: no limit.
     max_connections_per_addr: u32,
     /// The bytes that connections may hold at once for requests still
-    /// arriving (heads and bodies). Past it, the connections holding the
-    /// most are answered 503 (HTTP/2: GOAWAY) and closed until they hold
-    /// less.
+    /// arriving (heads and the body bytes received). Past it, waiting
+    /// connections are answered 503 (HTTP/2: GOAWAY) and closed until they
+    /// hold less: first those whose bodies came slowly in the last second
+    /// (under twice min_body_rate, or 8 KiB), from the client (address,
+    /// IPv6 /64) holding the most, the one holding the most; a connection
+    /// being read at full speed is not chosen. Also bounds the bodies
+    /// taken (max_body_bytes).
     max_buffered_bytes: usize,
 
     pub fn default() Options {
@@ -1312,8 +1318,11 @@ struct Slot {
     req_start: i64,   // when the request being received began (0: none, between requests)
     served: bool,     // a request has been answered
     in_body: bool,    // the head is in, the body is coming (HTTP/2: a request is)
-    win_start: i64,   // the window min_body_rate is measured in, and the body's length then
-    win_len: usize,
+    win_start: i64,   // the window min_body_rate is measured in, and the body bytes received by then
+    win_mark: u64,
+    rx_bucket: i64,  // body bytes taken in recently: in the RX_BUCKET from rx_bucket, and the one before
+    rx_cur: u64,
+    rx_prev: u64,
     head_off: usize,
     head_len: usize,
     chunked: bool,
@@ -1362,23 +1371,6 @@ fn ms_ns(ms: u32) i64 {
 
 fn now_ns() i64 {
     return time.Instant.now().ns;
-}
-
-// Whether two peers count as one client: the same IPv4 address, or IPv6
-// /64 (an IPv4-mapped address whole).
-fn same_client(a: net.Addr, b: net.Addr) bool {
-    if a.family != b.family {
-        return false;
-    }
-    let mut n: usize = 4;
-    if a.family == net.Family.V6 {
-        let mapped: [12]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF];
-        n = 8;
-        if @mem_eq(a.ip[..12], mapped[..]) {
-            n = 16;
-        }
-    }
-    return @mem_eq(a.ip[..n], b.ip[..n]);
 }
 
 // Closes a connection and frees what it holds but the Slot. polite: with
@@ -1437,7 +1429,7 @@ fn held_by(sl: *Slot) usize {
     if sl.closed {
         return 0;
     }
-    let mut n = sl.body.capacity();
+    let mut n = sl.body.len;
     if sl.has_c {
         n += sl.c.buf.len;
     }
@@ -1463,10 +1455,100 @@ fn eviction_class(sl: *Slot) u8 {
     return 1;
 }
 
+/// One client (an IPv4 address, or an IPv6 /64) and what its connections
+/// hold, for choosing among connections.
+struct ClientStat {
+    used: bool,
+    family: net.Family,
+    ip: [16]u8,  // (the part that counts; the rest zero)
+    count: usize,
+    held: usize,
+}
+
+/// The clients of a set of connections, by address (open addressing).
+struct Clients {
+    stats: []mut ClientStat,
+
+    fn of(all: *vec.Vec.[*mut Slot]) HttpError!Clients {
+        let mut cap: usize = 16;
+        while cap < (2 * all.len) {
+            cap *= 2;
+        }
+        let mut t = Clients.{ stats: mem.alloc_zeroed.[ClientStat](cap)! };
+        for x in all.items() {
+            let st = t.find(x.peer);
+            st.count += 1;
+            st.held += @atomic_load(&x.held);
+        }
+        return t;
+    }
+
+    fn deinit(self: *mut Clients) void {
+        mem.free(self.stats);
+    }
+
+    /// The client's entry (a new one if it has none).
+    fn find(self: *mut Clients, a: net.Addr) *mut ClientStat {
+        let mut ip: [16]u8 = [0; 16];
+        let n = client_bytes(a);
+        @mem_copy(ip[..n], a.ip[..n]);
+        let mut h: u64 = 14695981039346656037 ^ @as(u64, @int_from_enum(a.family));
+        for b in ip {
+            h = (h ^ @as(u64, b)) *% 1099511628211;
+        }
+        let mask = self.stats.len - 1;
+        let mut i = @truncate(usize, h) & mask;
+        loop {
+            let st = &mut self.stats[i];
+            if not st.used {
+                st.used = true;
+                st.family = a.family;
+                st.ip = ip;
+                return st;
+            }
+            if (st.family == a.family) and @mem_eq(st.ip[..], ip[..]) {
+                return st;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+// How many bytes of an address say which client it is: an IPv4 address,
+// an IPv6 /64 (an IPv4-mapped one whole).
+fn client_bytes(a: net.Addr) usize {
+    if a.family != net.Family.V6 {
+        return 4;
+    }
+    let mapped: [12]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF];
+    if @mem_eq(a.ip[..12], mapped[..]) {
+        return 16;
+    }
+    return 8;
+}
+
+// Whether two peers count as one client.
+fn same_client(a: net.Addr, b: net.Addr) bool {
+    if a.family != b.family {
+        return false;
+    }
+    let n = client_bytes(a);
+    return @mem_eq(a.ip[..n], b.ip[..n]);
+}
+
 // The waiting connection to close to make room (waiting.len: none): see
 // Options.max_connections.
 fn pick_victim(all: *vec.Vec.[*mut Slot], waiting: *vec.Vec.[*mut Slot]) usize {
     let ws = waiting.items();
+    // (out of memory: by class and age alone)
+    let none = Clients.{ stats: @slice_from_ptr(@ptr_from_int(*mut ClientStat, 8), 0) };
+    let mut clients = Clients.of(all) catch none;
+    let have = clients.stats.len > 0;
+    defer {
+        if have {
+            clients.deinit();
+        }
+    }
     let mut best: usize = ws.len;
     let mut best_class: u8 = 3;
     let mut best_count: usize = 0;
@@ -1476,10 +1558,8 @@ fn pick_victim(all: *vec.Vec.[*mut Slot], waiting: *vec.Vec.[*mut Slot]) usize {
             continue;
         }
         let mut count: usize = 0;
-        for x in all.items() {
-            if same_client(x.peer, ws[k].peer) {
-                count += 1;
-            }
+        if have {
+            count = clients.find(ws[k].peer).count;
         }
         if (class < best_class) or (count > best_count) or ((count == best_count) and (ws[k].since < ws[best].since)) {
             best = k;
@@ -1512,25 +1592,58 @@ fn expire[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], sl: *mut Slot, s
     }
 }
 
-// Keeps the bytes held by connections within max_buffered_bytes: those
-// waiting that hold the most give theirs back.
+/// A body that took in fewer bytes than this over the last half second
+/// (or second) is the first to give its memory back when the server holds
+/// too much: twice min_body_rate's second's worth, so well above what a
+/// client could aim for just to stay, and at least 8 KiB.
+fn slow_rx(o: Options) u64 {
+    return @max(@as(u64, o.min_body_rate) * 2, 8192);
+}
+
+// Keeps the bytes held by connections within max_buffered_bytes. Those
+// that give theirs back (503) are chosen among the connections waiting
+// (not those that have more already arrived: a worker took a turn's worth
+// and gives them another at once), slow ones first (slow_rx), from the
+// client holding the most, the one holding the most.
 fn enforce_budget[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) void {
     let mut total: usize = 0;
     for x in all.items() {
         total += @atomic_load(&x.held);
     }
+    if total <= s.opts.max_buffered_bytes {
+        return;
+    }
+    let mut clients = Clients.of(all) catch return;
+    defer clients.deinit();
+    let now = now_ns();
+    let slow = slow_rx(s.opts);
     while total > s.opts.max_buffered_bytes {
         let ws = waiting.items();
         let mut best: usize = ws.len;
+        let mut best_fast = true;
+        let mut best_client: usize = 0;
         for k in @as(usize, 0)..ws.len {
-            if (ws[k].held > 0) and ((best == ws.len) or (ws[k].held > ws[best].held)) {
+            let x = ws[k];
+            if (x.held == 0) or x.ready {
+                continue;
+            }
+            let fast = recent_rx(x, now) >= slow;
+            let by_client = clients.find(x.peer).held;
+            let better = (best == ws.len) or (best_fast and not fast) or
+                         ((fast == best_fast) and
+                          ((by_client > best_client) or ((by_client == best_client) and (x.held > ws[best].held))));
+            if better {
                 best = k;
+                best_fast = fast;
+                best_client = by_client;
             }
         }
         if best == ws.len {
-            return;  // (what is left is with the workers)
+            return;  // (what is left is with the workers, or being read)
         }
         let sl = waiting.swap_remove(best);
+        let st = clients.find(sl.peer);
+        st.held -= @min(st.held, sl.held);
         total -= @min(total, sl.held);
         expire(s, all, sl, 503);
     }
@@ -1635,13 +1748,16 @@ fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) 
             }
         }
         if listening and ((p.ready(base - 1) & net.READABLE) != 0) {
-            if admit(s, &mut all, &mut waiting) {
+            let r = admit(s, &mut all, &mut waiting);
+            if r == ADMITTED {
                 accept_failures = 0;
             } else {
                 // the listener stays readable: look again a little later,
-                // and if it keeps failing, free a descriptor
+                // and if it keeps failing for want of descriptors, free one
                 paused_until = now_ns() + 10000000;
-                accept_failures += 1;
+                if r == ADMIT_NO_ROOM {
+                    accept_failures += 1;
+                }
                 if accept_failures >= 2 {
                     let v = pick_victim(&all, &waiting);
                     if (v < waiting.len) and (eviction_class(waiting.get(v)) <= 1) {
@@ -1668,13 +1784,25 @@ fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) 
     }
 }
 
-// Takes a new connection, within the limits; false if accept failed.
-fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) bool {
-    let conn = s.listener.accept() catch return false;
+const ADMITTED: u8 = 0;       // (or refused, or gone before it was taken)
+const ADMIT_NO_ROOM: u8 = 1;  // accept failed: out of descriptors or memory
+const ADMIT_FAILED: u8 = 2;   // accept failed otherwise
+
+// Takes a new connection, within the limits.
+fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) u8 {
+    let conn = s.listener.accept() catch |e| {
+        if e == error.Empty {
+            return ADMITTED;  // (reset by its client before it was taken)
+        }
+        if e == error.OutOfMemory {
+            return ADMIT_NO_ROOM;
+        }
+        return ADMIT_FAILED;
+    };
     let o = s.opts;
     let peer = conn.peer_addr() catch {
         conn.close();
-        return true;
+        return ADMITTED;
     };
     if o.max_connections_per_addr > 0 {
         let mut same: u32 = 0;
@@ -1685,24 +1813,24 @@ fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec
         }
         if same >= o.max_connections_per_addr {
             conn.close();
-            return true;
+            return ADMITTED;
         }
     }
     if all.len >= @as(usize, @max(o.max_connections, 1)) {
         let v = pick_victim(all, waiting);
         if v == waiting.len {
             conn.close();
-            return true;
+            return ADMITTED;
         }
         drop_waiting(all, waiting, v);
     }
     conn.set_timeout(o.idle_timeout_ms) catch {
         conn.close();
-        return true;
+        return ADMITTED;
     };
     let sl = mem.new_zeroed.[Slot]() catch {
         conn.close();
-        return true;
+        return ADMITTED;
     };
     let now = now_ns();
     sl.fd = conn.handle;
@@ -1718,7 +1846,7 @@ fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec
             conn.close();
             sl.body.deinit();
             mem.destroy(sl);
-            return true;
+            return ADMITTED;
         };
         sl.tc.nonblocking = true;
         sl.tc.deadline = now + ms_ns(o.handshake_timeout_ms);
@@ -1731,13 +1859,13 @@ fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec
     all.push(sl) catch {
         close_slot(sl, false);
         mem.destroy(sl);
-        return true;
+        return ADMITTED;
     };
     waiting.push(sl) catch {
         close_slot(sl, false);
         forget(all, sl);
     };
-    return true;
+    return ADMITTED;
 }
 
 // A worker: serves connections with bytes to read, and hands each back
@@ -1746,8 +1874,17 @@ fn work_loop[C](s: *mut Server.[C]) void {
     loop {
         let sl = s.work.recv() catch return;  // (closed: stopping)
         let mut more = false;
+        let before = received_by(sl);
         if @atomic_load(&s.stopping) == 0 {
             more = advance(s, sl);
+        }
+        if more {
+            let after = received_by(sl);
+            if after >= before {
+                note_rx(sl, after - before, now_ns());
+            } else {
+                note_rx(sl, after, now_ns());  // (a new request)
+            }
         }
         if not more or (@atomic_load(&s.stopping) != 0) {
             close_slot(sl, true);
@@ -1827,7 +1964,7 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
             return HTTP1_CLOSE;
         }
         // a body may still be on time: its window had ended
-        if not (sl.in_body and on_time(o, sl, sl.body.len, sl.body_left, now_ns())) {
+        if not (sl.in_body and on_time(o, sl, @as(u64, sl.body.len), sl.body_left, now_ns())) {
             _ = reject(c.stream, 408);
             return HTTP1_CLOSE;
         }
@@ -1877,7 +2014,7 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
             c.start += head_len;
             c.pin = c.start;
             let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
-            let h = check_head(c.buf[sl.head_off..sl.head_off + head_len], hs[..], o.max_body_bytes);
+            let h = check_head(c.buf[sl.head_off..sl.head_off + head_len], hs[..], body_limit(o));
             if h.h2 {
                 return HTTP1_TO_H2;
             }
@@ -1893,11 +2030,11 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
             sl.body_left = h.fr.length;
             sl.chunk = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
             sl.win_start = now;
-            sl.win_len = 0;
+            sl.win_mark = 0;
         }
-        let whole = read_body(c, sl, o.max_body_bytes) catch |e| {
+        let whole = read_body(c, sl, body_limit(o)) catch |e| {
             if e == error.WouldBlock {
-                if not on_time(o, sl, sl.body.len, sl.body_left, now_ns()) {
+                if not on_time(o, sl, @as(u64, sl.body.len), sl.body_left, now_ns()) {
                     _ = reject(c.stream, 408);  // too slow
                     return HTTP1_CLOSE;
                 }
@@ -1960,31 +2097,75 @@ fn read_body(c: *mut Conn, sl: *mut Slot, max: usize) !bool {
 }
 
 // Whether a request still arriving is on time: within request_timeout_ms,
-// and min_body_rate met in each window of head_timeout_ms (len: the body
-// so far; left: what it still lacks, 0 if not known). Starts the next
-// window when one has ended.
-fn on_time(o: Options, sl: *mut Slot, len: usize, left: usize, now: i64) bool {
+// and min_body_rate met in each window of head_timeout_ms (received: the
+// body bytes taken in so far; left: what the body still lacks, 0 if not
+// known). Starts the next window when one has ended.
+fn on_time(o: Options, sl: *mut Slot, received: u64, left: usize, now: i64) bool {
     if now > (sl.req_start + ms_ns(o.request_timeout_ms)) {
         return false;
     }
-    if o.min_body_rate == 0 {
+    let w = @max(o.head_timeout_ms, 1);
+    let elapsed = now - sl.win_start;
+    if elapsed < ms_ns(w) {
         return true;
     }
-    let w = @max(o.head_timeout_ms, 1);
-    if now < (sl.win_start + ms_ns(w)) {
+    let got = received - @min(received, sl.win_mark);
+    sl.win_start = now;
+    sl.win_mark = received;
+    if o.min_body_rate == 0 {
         return true;
     }
     let mut need = (@as(u64, o.min_body_rate) * @as(u64, w)) / 1000;
     if left > 0 {
         need = @min(need, @as(u64, left));
     }
-    let got = @as(u64, len - @min(len, sl.win_len));
-    if got < need {
-        return false;
+    return got >= need;
+}
+
+// The body bytes a connection has taken in for the request arriving.
+fn received_by(sl: *Slot) u64 {
+    if sl.speaks == SPEAKS_HTTP2 {
+        return sl.h2.h.received;
     }
-    sl.win_start = now;
-    sl.win_len = len;
-    return true;
+    return @as(u64, sl.body.len);
+}
+
+const RX_BUCKET: i64 = 500000000;
+
+// Counts n body bytes taken in at `now`.
+fn note_rx(sl: *mut Slot, n: u64, now: i64) void {
+    let age = now - sl.rx_bucket;
+    if age >= (2 * RX_BUCKET) {
+        sl.rx_prev = 0;
+        sl.rx_cur = 0;
+        sl.rx_bucket = now;
+    } else if age >= RX_BUCKET {
+        sl.rx_prev = sl.rx_cur;
+        sl.rx_cur = 0;
+        sl.rx_bucket += RX_BUCKET;
+    }
+    sl.rx_cur += n;
+}
+
+// The body bytes a connection took in over the last half second to a
+// second.
+fn recent_rx(sl: *Slot, now: i64) u64 {
+    let age = now - sl.rx_bucket;
+    if age >= (2 * RX_BUCKET) {
+        return 0;
+    }
+    if age >= RX_BUCKET {
+        return sl.rx_cur;
+    }
+    return sl.rx_prev + sl.rx_cur;
+}
+
+// The largest body the server takes: max_body_bytes, and no more than
+// max_buffered_bytes leaves room for beside a head (so that one request
+// alone is never over it).
+fn body_limit(o: Options) usize {
+    let room = o.max_buffered_bytes - @min(o.max_buffered_bytes, o.max_head_bytes);
+    return @min(o.max_body_bytes, room);
 }
 
 // When waiting for a body ends: the request's deadline, or the end of its
@@ -2130,7 +2311,7 @@ fn status_for(e: error) u16 {
 fn dispatch[C](s: *mut Server.[C], sl: *mut Slot) bool {
     let c = &mut sl.c;
     let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
-    let h = check_head(c.buf[sl.head_off..sl.head_off + sl.head_len], hs[..], s.opts.max_body_bytes);
+    let h = check_head(c.buf[sl.head_off..sl.head_off + sl.head_len], hs[..], body_limit(s.opts));
     let target = h.target;
     let q = strs.index_of_byte(target, '?') catch target.len;
     let mut query: []u8 = "";
@@ -2236,7 +2417,7 @@ fn start_h2[C](s: *mut Server.[C], sl: *mut Slot, prefill: []u8) bool {
         mem.destroy(x);
         return false;
     };
-    x.h.max_body = s.opts.max_body_bytes;
+    x.h.max_body = body_limit(s.opts);
     // (the preface and the first request's headers: as a head)
     x.h.deadline = now_ns() + ms_ns(@min(s.opts.head_timeout_ms, s.opts.request_timeout_ms));
     x.hs = vec.Vec.[Header].init();
@@ -2258,14 +2439,14 @@ fn h2_wait(o: Options, sl: *mut Slot, h: *mut http2.Conn) bool {
         sl.in_body = true;
         sl.req_start = now;
         sl.win_start = now;
-        sl.win_len = h.buffered;
+        sl.win_mark = h.received;
         if not sl.served {
             h.deadline = now + ms_ns(o.request_timeout_ms);
         }
     }
     sl.deadline = h.deadline;
     if sl.in_body {
-        if not on_time(o, sl, h.buffered, 0, now) {
+        if not on_time(o, sl, h.received, 0, now) {
             return false;
         }
         sl.deadline = @min(sl.deadline, body_deadline(o, sl));
@@ -2286,7 +2467,7 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
         sl.expired = false;
         // (a body may still be on time: its window had ended)
         let ok = (sl.evict_status == 0) and sl.in_body and (now_ns() < h.deadline) and
-                 on_time(o, sl, h.buffered, 0, now_ns());
+                 on_time(o, sl, h.received, 0, now_ns());
         if not ok {
             h.goaway(http2.NO_ERROR) catch {};
             return false;
@@ -2304,6 +2485,7 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
     }
     let t = x.t;
     let mut answered: u32 = 0;
+    let turn_start = h.received;
     loop {
         if @atomic_load(&s.stopping) != 0 {
             h.goaway(http2.NO_ERROR) catch {};
@@ -2329,6 +2511,11 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
             // the client said goodbye, and nothing is left to answer
             if h.got_goaway and (h.streams.len == 0) {
                 return false;
+            }
+            if (h.received - turn_start) >= @as(u64, TURN_BYTES) {
+                sl.ready = true;  // (a turn's worth of bodies read: others' turn)
+                sl.deadline = h.deadline;
+                return true;
             }
             continue;
         }
@@ -4438,7 +4625,7 @@ test "memory held by requests still arriving is bounded" {
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
     let th = thread.spawn(t_run, &mut srv)!;
-    // bodies of 1 MiB of a promised 4 MiB, then nothing: more than the
+    // bodies of 1 MiB of a promised 2 MiB, then nothing: more than the
     // budget together
     let part = mem.alloc.[u8](1048576)!;
     defer mem.free(part);
@@ -4447,7 +4634,7 @@ test "memory held by requests still arriving is bounded" {
     for k in @as(usize, 0)..6 {
         cs[k] = dial(port)!;
         // (the server may refuse one while it is being sent)
-        cs[k].write_all("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4194304\r\n\r\n") catch {};
+        cs[k].write_all("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2097152\r\n\r\n") catch {};
         cs[k].write_all(part) catch {};
     }
     // some are answered 503 and closed; not all of them
@@ -4647,6 +4834,220 @@ test "many pipelined requests on one connection" {
         rest = rest[at + 15..];
     }
     @expect_eq(n, 51);
+    c.close();
+    srv.stop();
+    th.join();
+}
+
+fn t_size(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    fmt.write(res.writer(), "{}", [fmt.int(req.body.len)])!;
+}
+
+/// A server for the tests below: t_size at /size, t_hello at /hello.
+fn sized_server(r: *mut Router.[TestApp], opts: Options) !Server.[Router.[TestApp]] {
+    r.post("/size", t_size)!;
+    r.get("/hello", t_hello)!;
+    return server("127.0.0.1", 0, Router.[TestApp].handle, r, opts);
+}
+
+/// Sends a POST of n bytes to /size on a new connection; its response.
+fn post_size(port: u16, n: usize, buf: []mut u8) ![]u8 {
+    let c = dial(port)!;
+    defer c.close();
+    let mut hb: [128]u8 = [0; 128];
+    c.write_all(fmt.bufprint(hb[..], "POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", [fmt.int(n)])!)!;
+    let part: [4096]u8 = [0x61; 4096];
+    let mut left = n;
+    while left > 0 {
+        let m = @min(left, part.len);
+        c.write_all(part[..m]) catch break;  // (refused early)
+        left -= m;
+    }
+    return read_reply(c, buf);
+}
+
+test "bodies the server could never hold are refused at once" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    let mut opts = Options.default();
+    opts.threads = 1;
+    opts.max_body_bytes = 33554432;
+    opts.max_buffered_bytes = 1048576;
+    let mut srv = sized_server(&mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut buf: [1024]u8 = [0; 1024];
+    // just under the room the budget leaves: served, on an idle server
+    let n: usize = 1048576 - 65536;
+    @expect(strs.ends_with(post_size(port, n, buf[..])!, "\r\n\r\n983040"));
+    // more: 413, before the body is sent (so only heads are sent here: a
+    // close with a body unread could reset the connection, answer and all)
+    let heads: [2][]u8 = ["POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 983041\r\n\r\n",
+                          "POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 16777216\r\n\r\n"];
+    for hd in heads {
+        let c = dial(port)!;
+        c.write_all(hd)!;
+        @expect(strs.starts_with(read_reply(c, buf[..])!, "HTTP/1.1 413 "));
+        c.close();
+    }
+    srv.stop();
+    th.join();
+}
+
+/// Stalled uploads, from several threads' worth of sockets.
+struct Stall {
+    port: u16,
+    socks: [40]net.TcpStream,
+    n: usize,
+}
+
+fn stall_run(st: *mut Stall) void {
+    let part: [65536]u8 = [0x61; 65536];
+    for k in @as(usize, 0)..st.n {
+        st.socks[k] = dial(st.port) catch {
+            st.n = k;
+            return;
+        };
+        _ = st.socks[k].write("POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n") catch 0;
+        for i in @as(usize, 0)..3 {
+            st.socks[k].write_all(part[..]) catch break;
+            _ = i;
+        }
+    }
+}
+
+test "a fast upload is not the one that gives its memory back" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    let mut opts = Options.default();
+    opts.threads = 2;
+    opts.max_body_bytes = 33554432;
+    opts.max_buffered_bytes = 4194304;
+    opts.max_connections_per_addr = 0;
+    opts.head_timeout_ms = 20000;
+    opts.min_body_rate = 0;
+    let mut srv = sized_server(&mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    // 30 uploads of 192 KiB each that then stall: more than the budget
+    let mut st = mem.new.[Stall]()!;
+    defer mem.destroy(st);
+    st.port = port;
+    st.n = 30;
+    stall_run(st);
+    thread.sleep_ms(1200);  // (long enough to count as stalled)
+    // a 2 MiB upload sent at full speed still gets through
+    let mut buf: [1024]u8 = [0; 1024];
+    for k in @as(usize, 0)..3 {
+        @expect(strs.ends_with(post_size(port, 2097152, buf[..])!, "\r\n\r\n2097152"));
+        _ = k;
+    }
+    for k in @as(usize, 0)..st.n {
+        st.socks[k].close();
+    }
+    srv.stop();
+    th.join();
+}
+
+/// Appends an HTTP/2 frame to out.
+fn h2_frame(out: *mut strs.String, ty: u8, flags: u8, id: u32, payload: []u8) !void {
+    let hdr: [9]u8 = [@truncate(u8, payload.len >> 16), @truncate(u8, payload.len >> 8), @truncate(u8, payload.len), ty,
+                      flags, @truncate(u8, id >> 24), @truncate(u8, id >> 16), @truncate(u8, id >> 8),
+                      @truncate(u8, id)];
+    out.push_str(hdr[..])!;
+    out.push_str(payload)!;
+}
+
+/// A POST /size request's header block (literals, not indexed).
+fn h2_post_block(out: *mut strs.String) !void {
+    let fields: [8][]u8 = [":method", "POST", ":scheme", "http", ":path", "/size", ":authority", "x"];
+    let mut k: usize = 0;
+    while k < fields.len {
+        let lens: [1]u8 = [0];
+        out.push_str(lens[..])!;
+        let nl: [1]u8 = [@truncate(u8, fields[k].len)];
+        out.push_str(nl[..])!;
+        out.push_str(fields[k])!;
+        let vl: [1]u8 = [@truncate(u8, fields[k + 1].len)];
+        out.push_str(vl[..])!;
+        out.push_str(fields[k + 1])!;
+        k += 2;
+    }
+}
+
+test "HTTP/2: a reset stream does not count against the others' rate" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    let mut opts = Options.default();
+    opts.threads = 1;
+    opts.head_timeout_ms = 300;
+    opts.min_body_rate = 1000;
+    let mut srv = sized_server(&mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let c = dial(port)!;
+    let mut block = strs.String.init();
+    defer block.deinit();
+    h2_post_block(&mut block)!;
+    let mut out = strs.String.init();
+    defer out.deinit();
+    out.push_str("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")!;
+    h2_frame(&mut out, http2.SETTINGS, 0, 0, "")!;
+    // stream 1: a body, reset once the server waits for more; stream 3: a
+    // body at a steady 4000 bytes per second, well over the rate
+    h2_frame(&mut out, http2.HEADERS, 4, 1, block.bytes())!;  // END_HEADERS
+    let big: [16000]u8 = [0x61; 16000];
+    h2_frame(&mut out, http2.DATA, 0, 1, big[..])!;
+    h2_frame(&mut out, http2.HEADERS, 4, 3, block.bytes())!;
+    c.write_all(out.bytes())!;
+    thread.sleep_ms(100);  // (the server waits: its window starts)
+    out.clear();
+    let cancel: [4]u8 = [0, 0, 0, 8];
+    h2_frame(&mut out, http2.RST_STREAM, 0, 1, cancel[..])!;
+    c.write_all(out.bytes())!;
+    let piece: [200]u8 = [0x62; 200];
+    for k in @as(usize, 0)..20 {
+        thread.sleep_ms(50);
+        out.clear();
+        h2_frame(&mut out, http2.DATA, 0, 3, piece[..])!;
+        c.write_all(out.bytes())!;
+        _ = k;
+    }
+    out.clear();
+    h2_frame(&mut out, http2.DATA, 1, 3, piece[..])!;  // END_STREAM
+    c.write_all(out.bytes())!;
+    // the answer to stream 3 (HEADERS), not a GOAWAY
+    let mut buf = mem.alloc.[u8](65536)!;
+    defer mem.free(buf);
+    let mut n: usize = 0;
+    let mut answered = false;
+    let mut goaway = false;
+    while not answered and not goaway {
+        let got = c.read(buf[n..]) catch break;
+        if got == 0 {
+            break;
+        }
+        n += got;
+        let mut at: usize = 0;
+        while (n - at) >= 9 {
+            let len = ((@as(usize, buf[at]) << 16) | (@as(usize, buf[at + 1]) << 8)) | @as(usize, buf[at + 2]);
+            if (n - at) < (9 + len) {
+                break;
+            }
+            let id = @as(u32, buf[at + 8]) | (@as(u32, buf[at + 7]) << 8);
+            if (buf[at + 3] == http2.HEADERS) and (id == 3) {
+                answered = true;
+            }
+            if buf[at + 3] == http2.GOAWAY {
+                goaway = true;
+            }
+            at += 9 + len;
+        }
+    }
+    @expect(answered and not goaway);
     c.close();
     srv.stop();
     th.join();

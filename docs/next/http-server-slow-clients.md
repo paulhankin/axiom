@@ -25,12 +25,18 @@
   - `max_connections_per_addr` (64; IPv6 addresses counted by /64, 0 for no limit):
     more connections from one address are closed as they are accepted;
   - `max_buffered_bytes` (64 MiB): the memory connections may hold for requests still
-    arriving; past it, those holding the most are answered 503 and closed.
+    arriving; past it, waiting connections are answered 503 and closed, those whose
+    bodies arrive slowly first, from the client holding the most (an upload read at
+    full speed is spared). A body larger than `max_buffered_bytes - max_head_bytes` is
+    refused (413) whatever `max_body_bytes` says.
 
-  `idle_timeout_ms` now runs from the last answer: bytes that are not part of a request
+  `net.TcpListener.accept` now fails with `Empty` when the connection was reset before
+  it could be taken, and with `OutOfMemory` when the process is out of file descriptors
+  or memory (it failed with `NetError` for both); the server pauses accepting only for
+  the latter. `idle_timeout_ms` now runs from the last answer: bytes that are not part of a request
   (blank lines) no longer extend it, and an idle connection's buffers are freed. When
-  `accept` fails (out of file descriptors, say), the server stops accepting for 10 ms
-  and, if it keeps failing, closes an idle connection. `run()`'s thread no longer serves
+  `accept` fails, the server stops accepting for 10 ms and, if it keeps failing for want
+  of file descriptors, closes an idle connection. `run()`'s thread no longer serves
   connections itself: there are `threads` workers besides it. A program that builds
   `Options` with a struct literal must add the new fields; one that starts from
   `Options.default()` gets them. `std/net/tls` can run a server handshake in steps

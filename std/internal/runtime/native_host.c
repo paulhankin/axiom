@@ -27,7 +27,8 @@
 #include "trap_format.h"
 
 // Error codes shared with std/internal/runtime/host.mjs and std/net.ax.
-enum { AX_ERR = -1, AX_REFUSED = -2, AX_ADDR_IN_USE = -3, AX_BAD_ADDRESS = -4, AX_TIMED_OUT = -5 };
+enum { AX_ERR = -1, AX_REFUSED = -2, AX_ADDR_IN_USE = -3, AX_BAD_ADDRESS = -4, AX_TIMED_OUT = -5,
+       AX_ACCEPT_GONE = -6, AX_ACCEPT_NO_ROOM = -7 };
 
 intptr_t ax_write(int32_t fd, const uint8_t *p, size_t n) {
     ssize_t r;
@@ -846,6 +847,9 @@ int32_t ax_tcp_accept(int32_t listener) {
     int fd;
     do fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
     while (fd < 0 && errno == EINTR);
+    /* (not retried: the listener blocks, and the next connection may be a long time coming) */
+    if (fd < 0 && (errno == ECONNABORTED || errno == EPROTO)) return AX_ACCEPT_GONE;
+    if (fd < 0 && (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM)) return AX_ACCEPT_NO_ROOM;
     return fd < 0 ? AX_ERR : fd;
 }
 
