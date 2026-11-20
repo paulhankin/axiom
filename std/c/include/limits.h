@@ -7,6 +7,63 @@
 /* With the system's C library (--c-lib=system) its <limits.h>, with its POSIX
    limits, and what C23 adds to it that it leaves to the compiler. */
 #include_next <limits.h>
+/* (what it leaves to the compiler's own <limits.h>, as it does under a GNU
+   compiler's macros: --c-gnu-compat) */
+#ifndef CHAR_BIT
+#define CHAR_BIT 8
+#endif
+#ifndef SCHAR_MIN
+#define SCHAR_MIN (-127 - 1)
+#endif
+#ifndef SCHAR_MAX
+#define SCHAR_MAX 127
+#endif
+#ifndef UCHAR_MAX
+#define UCHAR_MAX 255
+#endif
+#ifndef CHAR_MIN
+#ifdef __CHAR_UNSIGNED__
+#define CHAR_MIN 0
+#define CHAR_MAX UCHAR_MAX
+#else
+#define CHAR_MIN SCHAR_MIN
+#define CHAR_MAX SCHAR_MAX
+#endif
+#endif
+#ifndef SHRT_MIN
+#define SHRT_MIN (-32767 - 1)
+#endif
+#ifndef SHRT_MAX
+#define SHRT_MAX 32767
+#endif
+#ifndef USHRT_MAX
+#define USHRT_MAX 65535
+#endif
+#ifndef INT_MIN
+#define INT_MIN (-2147483647 - 1)
+#endif
+#ifndef INT_MAX
+#define INT_MAX 2147483647
+#endif
+#ifndef UINT_MAX
+#define UINT_MAX 4294967295U
+#endif
+#ifndef LONG_MAX
+#if __AXIOM_LONG_WIDTH__ == 32
+#define LONG_MIN (-2147483647L - 1)
+#define LONG_MAX 2147483647L
+#define ULONG_MAX 4294967295UL
+#else
+#define LONG_MIN (-9223372036854775807L - 1)
+#define LONG_MAX 9223372036854775807L
+#define ULONG_MAX 18446744073709551615UL
+#endif
+#endif
+#ifndef LLONG_MAX
+#define LLONG_MIN (-9223372036854775807LL - 1)
+#define LLONG_MAX 9223372036854775807LL
+#define ULLONG_MAX 18446744073709551615ULL
+#endif
 #if __STDC_VERSION__ >= 202311L
 #ifndef __STDC_VERSION_LIMITS_H__
 #define __STDC_VERSION_LIMITS_H__ 202311L

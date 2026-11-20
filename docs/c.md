@@ -136,6 +136,7 @@ objects and archives define no `main` is `C3063`.
 | `--c-line-markers` | `--emit=c-pp` writes line markers, which keep each token on its presumed file and line: `# 12 "file"` in a GNU dialect, which reads them back as `#line` (flags after the name are ignored), and `#line 12 "file"` under an ISO standard. |
 | `--c-source=path` | `path` is a C source whatever its name (`x.i`, `x.inc`). |
 | `--c-idirafter=dir` | A directory of headers searched after the system's and the compiler's (a system header's directory for `--c-deps-no-system`). |
+| `--c-gnu-compat` | With a GNU dialect: the GNU compilers' predefined macros, `__GNUC__` 4.2.1, `__VERSION__` and their companions, so that the system's headers and programs take their GNU paths ("GNU compatibility"). `axiom cc` gives it. |
 | `--c-iso-names` | With a GNU dialect: the names an ISO program may use are its own: the dialect's keywords outside the reserved namespace (`asm`, `typeof` before C23, gnu89's `inline`) are identifiers, `unix` and `linux` are not defined, and `__STRICT_ANSI__` is 1; the extensions (`__attribute__`, `__asm__`, `__typeof__`, statement expressions, ...) stay. It is a conventional cc's `-std=cNN`. |
 
 `-D`, `-U`, `-A` and `-I` apply in the order given. The C options are errors for an Axiom
@@ -300,18 +301,15 @@ be honoured: ignoring them would make another program than the one asked for.
 with `-c` the other sources are still compiled).
 
 **Predefined macros.** Those of the target, the standard and the GNU dialect, as for
-`axiom build` ("Predefined macros"), and `_REENTRANT` with `-pthread`. No macro names another
-compiler: `__GNUC__`, `__clang__` and `__VERSION__` are not defined (a GNU dialect has
-`__AXIOM_GNU__`, and `__has_attribute`, `__has_builtin`, `__has_include`, `__has_feature`
-say what works), so a configure script finds a compiler that is not the GNU one ("whether
-the compiler supports GNU C... no") and takes its generic paths: a probe of a feature
-(`__STDC_VERSION__`, a header, a type's size, a function in `-lm`) answers as for any cc.
-Code that uses `__attribute__` only under `#ifdef __GNUC__` leaves its attributes out,
-and many of them change what the program is: `packed` and `aligned` a structure's
-layout, `constructor`, `cleanup`, `weak`, `section`, `visibility` what runs and what is
-linked. Such code should test `__has_attribute(packed)` (or `__AXIOM_GNU__`) instead;
-`__attribute__` itself is a keyword in every mode `axiom cc`'s `-std=` gives (but strict
-C95's), so a program's attributes outside such tests are not dropped.
+`axiom build` ("Predefined macros"), `_REENTRANT` with `-pthread`, and, as a GNU-compatible
+cc's, the GNU compilers' (`--c-gnu-compat`, "GNU compatibility", in every mode but strict
+C95's): `__GNUC__` is 4, `__GNUC_MINOR__` 2 and `__GNUC_PATCHLEVEL__` 1, and `__VERSION__`
+is `"4.2.1 Compatible Axiom <version>"`. A configure script finds a GNU compiler ("whether
+the compiler supports GNU C... yes"), the system's headers take their GNU paths (functions
+renamed by asm labels, `_FORTIFY_SOURCE`'s wrappers), and a program its `#ifdef __GNUC__`
+code: attributes, builtins, inline assembly. `__has_attribute`, `__has_builtin`,
+`__has_include` and `__has_feature` say exactly what works; `__clang__` and `_MSC_VER` are
+not defined.
 
 **Known differences.** `-fvisibility=hidden` is accepted and does nothing (a shared
 library exports its definitions of default visibility; a version script, or the attribute
@@ -782,7 +780,8 @@ Under an ISO standard their own text may still use the GNU dialects' spellings o
 and named variadic macro parameters (`name...`), which they take their compiler to have
 (AArch64 Linux's `<signal.h>` reaches kernel headers with `__signed__` and
 `__uint128_t`): in them, and in their macros' expansions, those are accepted.
-`__GNUC__` is not defined, so they use what they have for other compilers. The standard
+Without `--c-gnu-compat` `__GNUC__` is not defined, so they use what they have for other
+compilers; with it (`axiom cc`) their GNU paths ("GNU compatibility"). The standard
 must be C99 or later, the C options the platform's ABI's (`--c-int`, `--c-long`), and
 `--c-freestanding` is not given. `setjmp` and the other functions POSIX says return twice
 (`_setjmp`, `sigsetjmp`, `vfork`, `getcontext`) make their callers return twice. The
@@ -1828,7 +1827,7 @@ definition replacing the target's; `c/pp/predef_target_*.c` show them for each t
 
 The feature macros say what the target's processor has; the headers of its intrinsic
 functions are in "Intrinsics" below. No macro names a compiler (`__GNUC__`, `__clang__`, `_MSC_VER`, `__VERSION__` are not
-defined; a GNU dialect's `__ATOMIC_*` and `__BFLT16_*` are feature macros): programs
+defined, but with `--c-gnu-compat`: "GNU compatibility"; a GNU dialect's `__ATOMIC_*` and `__BFLT16_*` are feature macros): programs
 test features, and the compiler's own macros are the `__AXIOM_` ones above.
 
 ### Include path
@@ -2111,10 +2110,33 @@ work left undone:
 
 `--c-std=gnu89`, `gnu90`, `gnu99`, `gnu11`, `gnu17`, `gnu18` and `gnu23` are the standard
 of their number with the extensions below, each checked as the rest of the language is
-(constraint violations are errors). `__GNUC__` is not defined: it claims every extension of
-another compiler and its version's builtins, which programs then rely on; a program tests
-`__AXIOM_GNU__`, `__has_attribute`, `__has_builtin` and `__has_include` instead, which say
-exactly what works (there is no option that defines `__GNUC__`).
+(constraint violations are errors). `__GNUC__` is not defined unless `--c-gnu-compat` asks
+for it (below): it claims another compiler's extensions and its version's builtins, which
+programs then rely on; a program can test `__AXIOM_GNU__`, `__has_attribute`,
+`__has_builtin` and `__has_include` instead, which say exactly what works.
+
+### GNU compatibility
+
+`--c-gnu-compat` (with a GNU dialect; `axiom cc` gives it) defines the GNU compilers'
+predefined macros, so that the system's headers and the programs written for those
+compilers take their GNU paths:
+
+| Macro | |
+|---|---|
+| `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` | 4, 2, 1. Version 4.2.1 is the one other GNU-compatible compilers claim: the extensions its tests ask for are this dialect's, while the tests for later versions' (`__GNUC_PREREQ (4, 3)` and above in the system's headers: `__builtin_va_arg_pack`, `_Float128` as a GNU type, the attribute `access` ...) leave them out. A program that needs a later version's feature tests `__has_builtin` or `__has_attribute`. |
+| `__VERSION__` | `"4.2.1 Compatible Axiom <version>"`. |
+| `__GNUC_STDC_INLINE__`, `__GNUC_GNU_INLINE__` | C99's inline semantics (1 from C99 on), GNU89's (1 in gnu89 and gnu90). |
+| `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1` ... `_8`, `__GCC_ATOMIC_BOOL_LOCK_FREE` ... `__GCC_ATOMIC_POINTER_LOCK_FREE`, `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL` | The `__sync` builtins' sizes, the atomic types that are always lock-free (2), `__atomic_test_and_set`'s true value. |
+| `__GCC_IEC_559`, `__GCC_IEC_559_COMPLEX` | 2 (IEC 60559 arithmetic, its rounding modes and exceptions), not on WebAssembly; `__FINITE_MATH_ONLY__` 0. |
+
+The system's headers (`--c-lib=system`) then rename functions by asm labels (`__REDIRECT`:
+with `_FILE_OFFSET_BITS=64` `scandir` is `scandir64`, for the program's own `struct dirent`),
+leave the integer limits to the compiler's `<limits.h>`, and with `_FORTIFY_SOURCE` at `-O1`
+and above define `extern inline` wrappers of the string and `printf` functions, which call
+the object-size-checking builtins (`__builtin___memcpy_chk` ...); they declare `size_t` and
+`va_list` again, which the GNU dialects take in every standard. Without the option, in
+`axiom build`, the macros are not defined, as before: a dialect's extensions do not claim
+another compiler's.
 
 ### Language
 

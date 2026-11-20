@@ -1,0 +1,1 @@
+4 __GNUC_STDC_INLINE__ 1
