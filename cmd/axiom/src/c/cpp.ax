@@ -1996,6 +1996,205 @@ fn load(P: *mut PP, path: []u8) *mut u.SourceFile {
     return g;
 }
 
+// -----------------------------------------------------------------------------
+// Dependencies (--c-deps): the make rule of the files a unit reads
+// -----------------------------------------------------------------------------
+
+/// --c-deps=<file>: the next program unit's dependencies are written there
+/// ("-": to standard output) as a make rule, once it is preprocessed: its
+/// targets (--c-deps-target, as given: quoted for make already), the
+/// source, then each file it includes, once, in the order first read;
+/// with g_deps_phony (--c-deps-phony) a rule with no prerequisites for each
+/// header too, and with g_deps_no_system (--c-deps-no-system) without the
+/// system's headers (the compiler's, those of the system's C library and
+/// those found in --c-isystem directories).
+pub let mut g_deps_out: []u8 = "";
+pub let mut g_deps_targets: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+pub let mut g_deps_phony: bool = false;
+pub let mut g_deps_no_system: bool = false;
+// (the unit's files so far, and those seen: interned paths)
+let mut g_deps: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut g_deps_seen: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+// (recording: the unit is the program's, and dependencies are asked for)
+let mut g_deps_on: bool = false;
+
+// Is the file at `path` one of the system's headers (the compiler's own,
+// the system C library's, or one in a --c-isystem directory)? By where it
+// is: a file included by "..." from one of them is in its directory too.
+fn system_path(P: *PP, path: []u8) bool {
+    let mut dirs = u.List.[[]u8].empty();
+    dirs.push(P.o.sys_include);
+    for d in P.o.system_dirs {
+        dirs.push(d);
+    }
+    let n = P.o.include_dirs.len;
+    let ni = @int_cast(usize, P.o.n_isystem);
+    for k in n - @min(n, ni)..n {
+        dirs.push(P.o.include_dirs[k]);
+    }
+    for d in dirs.items() {
+        if (d.len > 0) and (path.len > d.len) and u.starts(path, d) and
+           ((path[d.len] == '/') or (d[d.len - 1] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Records file `path`, which the unit reads, among its dependencies.
+fn note_dep(P: *PP, path: []u8, source: bool) void {
+    if not g_deps_on {
+        return;
+    }
+    let mut p = path;
+    while (p.len > 2) and (p[0] == '.') and (p[1] == '/') {
+        p = p[2..];
+    }
+    if not source and g_deps_no_system and system_path(P, path) {
+        return;
+    }
+    let key = u.intern(p);
+    if g_deps_seen.get(key) != 0 {
+        return;
+    }
+    g_deps_seen.put(key, 1);
+    g_deps.push(key);
+}
+
+// A name in a make rule: a space or tab after a backslash, '#' as "\#",
+// '$' as "$$".
+fn make_quote(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    for c in s {
+        if (c == ' ') or (c == '\t') or (c == '#') {
+            b.c('\\');
+        } else if c == '$' {
+            b.c('$');
+        }
+        b.c(c);
+    }
+    return b.done();
+}
+
+// Writes the rule of the dependencies recorded (g_deps) to g_deps_out.
+fn write_deps() void {
+    let mut b = u.Buf.init();
+    let mut col: usize = 0;
+    for k in 0..g_deps_targets.len {
+        if k > 0 {
+            b.c(' ');
+            col += 1;
+        }
+        b.s(g_deps_targets.get(k));
+        col += g_deps_targets.get(k).len;
+    }
+    b.c(':');
+    col += 1;
+    for d in g_deps.items() {
+        let q = make_quote(d);
+        if (col > 1) and ((col + 1 + q.len) > 78) {
+            b.s(" \\\n ");
+            col = 1;
+        } else {
+            b.c(' ');
+            col += 1;
+        }
+        b.s(q);
+        col += q.len;
+    }
+    b.c('\n');
+    if g_deps_phony {
+        for k in 1..@max(g_deps.len, 1) {
+            b.s(u.f1("\n%s:\n", make_quote(g_deps.get(k))));
+        }
+    }
+    let text = b.done();
+    if u.str_eq(g_deps_out, "-") {
+        u.print(text);
+    } else if not u.write_file(g_deps_out, text) {
+        dg.emit_fatal(false, "E9001", u.f1("cannot write the dependencies to %s", g_deps_out));
+    }
+}
+
+// The unit's dependencies are recorded from here (the program's unit, if
+// they are asked for: g_deps_out).
+fn begin_deps() void {
+    g_deps_on = (g_deps_out.len > 0) and not g_lib_unit;
+    g_deps.clear();
+    g_deps_seen = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0,
+                                   len: 0 };
+}
+
+// The unit is read: its dependencies are written (once: the next units,
+// the C library's among them, are not recorded).
+fn end_deps() void {
+    if g_deps_on {
+        write_deps();
+        g_deps_on = false;
+        g_deps_out = "";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The macros defined at the end of a unit (--emit=c-macros)
+// -----------------------------------------------------------------------------
+
+// The preprocessor of the last unit preprocessed (for macros_text).
+let mut g_last: *mut PP = @ptr_from_int(*mut PP, 0);
+
+/// The macros defined at the end of the unit preprocessed last, one
+/// `#define` line each, sorted by name: the predefined ones and the
+/// unit's (not those the preprocessor itself replaces, __LINE__ ...).
+pub fn macros_text() []u8 {
+    let mut lines = u.List.[[]u8].empty();
+    if u.isnil(g_last) {
+        return "";
+    }
+    let P = g_last;
+    let ks = @slice_from_ptr(P.macros.keys, P.macros.cap);
+    let vs = @slice_from_ptr(P.macros.vals, P.macros.cap);
+    for k in 0..P.macros.cap {
+        if (ks[k] == 0) or u.isnil(vs[k]) or (vs[k].builtin != 0) {
+            continue;
+        }
+        let m = vs[k];
+        let mut b = u.Buf.init();
+        b.s("#define ");
+        b.s(m.name);
+        if m.funclike {
+            b.c('(');
+            for j in 0..m.params.len {
+                if j > 0 {
+                    b.s(", ");
+                }
+                let last = (j + 1) == m.params.len;
+                if last and m.variadic and u.str_eq(m.params[j], "__VA_ARGS__") {
+                    b.s("...");
+                } else {
+                    b.s(m.params[j]);
+                    if last and m.variadic {
+                        b.s("...");
+                    }
+                }
+            }
+            b.c(')');
+        }
+        if m.body.len > 0 {
+            b.c(' ');
+            b.s(spelling(m.body));
+        }
+        lines.push(b.done());
+    }
+    u.sort(lines.items(), u.str_cmp);
+    let mut out = u.Buf.init();
+    for l in lines.items() {
+        out.s(l);
+        out.c('\n');
+    }
+    return out.done();
+}
+
 /// Is the unit preprocessed next a library's (cc.check)? Its macros are
 /// not described (-g).
 pub let mut g_lib_unit: bool = false;
@@ -2080,6 +2279,7 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
     INC_LINE = u.span_line(sp);
     push_file(P, sf, path);
     cur_src(P).dir_index = found;
+    note_dep(P, path, false);
     if in_system_header(P) {
         cp.system_file(sf.id);
     }
@@ -2974,6 +3174,22 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         lx.skip_line(L);  // (assembly: a comment, as the assembler reads `#` at a line's start)
         return;
     }
+    if (nt.kind == lx.PK_NUMBER) and P.o.gnu and all_digits(nt.text) and not P.asm_ {
+        // a GNU dialect's line marker, `# 12 "file" 1 3` (preprocessed
+        // text's, --emit=c-pp --c-line-markers): #line 12 "file", its flags
+        // ignored; line 0 (before the first line of a file) changes nothing
+        let rest = line_tokens(P);
+        let mut ts = tok_list();
+        ts.push(nt);
+        if (rest.len > 0) and (rest.get(0).kind == lx.PK_STRING) {
+            ts.push(rest.get(0));
+        }
+        let zero = (nt.text.len == 1) and (nt.text[0] == '0');
+        if not zero {
+            do_line(P, ts.items(), u.span_join(hash.span, nt.span));
+        }
+        return;
+    }
     if nt.kind != lx.PK_IDENT {
         _ = dg.err(nt.span, "C1041", u.f1("invalid preprocessing directive '#%s'", nt.text));
         lx.skip_line(L);
@@ -3428,6 +3644,8 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     let mut toks = u.List.[ct.Token].empty();
     let P = u.new.[PP]();
     P.o = o;
+    g_last = P;
+    begin_deps();
     P.asm_ = g_asm;
     // (-g: the program's own units' macros, not the C library's)
     P.mac = (tg.g_debug == tg.DEBUG_FULL) and tg.g_debug_macros and not g_asm and not g_lib_unit;
@@ -3492,7 +3710,32 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
         return toks;
     }
     push_file(P, sf, path);
+    note_dep(P, path, true);
+    // (--c-include: each file as if included before the source's first
+    // line, the first given read first; looked for in the current
+    // directory first, then on the include path)
+    let mut k = o.includes.len;
+    while k > 0 {
+        k -= 1;
+        let name = o.includes[k];
+        let mut ip = u.nosym();
+        if u.is_file(name) {
+            ip = name;
+        } else {
+            ip = find_file_from(P, name, 0);
+        }
+        let isf = load(P, u.pick(u.isnos(ip), name, ip));
+        if u.isnos(ip) or u.isnil(isf) {
+            _ = dg.err(u.mkspan(sf.id, 0, 0), "C1081",
+                       u.f1("cannot find the file \"%s\" to include before the source (--c-include)", name));
+            continue;
+        }
+        push_file(P, isf, ip);
+        cur_src(P).dir_index = P.found_index;
+        note_dep(P, ip, false);
+    }
     run_file(P);
+    end_deps();
     if P.mac {
         u.g_macros.push(u.MacroEv.{ kind: 4, at: -1, line: 0, file: -1, text: "" });
     }

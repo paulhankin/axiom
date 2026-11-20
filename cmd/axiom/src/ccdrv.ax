@@ -1,0 +1,1309 @@
+// =============================================================================
+// ccdrv.ax - `axiom cc` (and the program named `axcc`): the conventional Unix
+// cc command line, which makefiles and configure scripts use (CC="axiom cc"),
+// read and done with `axiom build` (docs/c.md, "The cc command").
+//
+// The options are read into St, then the work is a list of jobs, each an
+// `axiom build` (or `axiom check`) of this compiler run as a process of its
+// own (u.self_path): -c compiles each source to its object, -E preprocesses
+// (--emit=c-pp with line markers), -M and -MM write the make rule alone
+// (--emit=c-deps), and without them the sources, objects and libraries are
+// linked into an executable (or -shared a shared library) in one build. The
+// defaults are a cc's: the host for the target, gnu17, the system's C library
+// where the target has one, a.out, objects named after their sources in the
+// current directory.
+// =============================================================================
+import "target.ax" as tg;
+import "util.ax" as u;
+import "version.ax" as ver;
+
+// What the command does (St.mode).
+const M_LINK: i32 = 0;   // compile and link (the default)
+const M_OBJ: i32 = 1;    // -c
+const M_PP: i32 = 2;     // -E
+const M_ASM: i32 = 3;    // -S
+const M_CHECK: i32 = 4;  // -fsyntax-only
+const M_DEPS: i32 = 5;   // -M, -MM without -MD: the rule alone
+
+// The languages of the inputs (In.lang).
+const L_C: i32 = 1;     // C (.c; .i, -x c: --c-source)
+const L_ASM: i32 = 2;   // assembly (.s, .S)
+const L_LINK: i32 = 3;  // an object, an archive or a shared library (anything else)
+const L_FLAG: i32 = 4;  // -l or -L, among the inputs in their order
+
+struct In {
+    path: []u8,
+    lang: i32,
+    named: bool,  // a C source whatever its name (-x c, .i): --c-source=
+    stdin: bool,  // standard input's text (-), in a temporary file
+}
+
+struct St {
+    prog: []u8,  // the name in messages ("axiom cc", "axcc")
+    mode: i32,
+    out: []u8,                // -o (empty: none)
+    ins: u.List.[In],         // the inputs, -l and -L, in order
+    xlang: i32,               // -x: the language of the inputs after it (0: by their names)
+    defs: u.List.[[]u8],      // -D, -U, -A, in order
+    incs: u.List.[[]u8],      // -I and -iquote, in order (as -I<dir>)
+    quotes: u.List.[[]u8],    // -iquote (before the -I directories)
+    isys: u.List.[[]u8],      // -isystem, -idirafter (--c-isystem)
+    pre: u.List.[[]u8],       // -include
+    pass: u.List.[[]u8],      // `axiom build` options given as they are (--cpu=, --c-..., ...)
+    lflags: u.List.[[]u8],    // -Wl, and -Xlinker's arguments, in order
+    target: []u8,             // --target= (empty: the host)
+    std: []u8,                // -std=, -ansi, --c-std= (empty: gnu17)
+    clib: []u8,               // --c-lib= (empty: by the target)
+    opt: []u8,                // -O... as -O0..-O3 (empty: none given)
+    debug: []u8,              // -g...: the option of axiom build (empty: none given)
+    char_sign: []u8,          // -funsigned-char ...: "signed", "unsigned" (empty: the target's)
+    cpu: []u8,                // -march=, -mcpu= (empty: the target's baseline)
+    features: u.List.[[]u8],  // -m<extension>, -mno-<extension>: +name, -name
+    warn_off: bool,           // -w
+    werror: bool,             // -Werror
+    warn_pragmas: bool,       // -Wall, -Wunknown-pragmas
+    warn_format: []u8,        // -Wformat=N (empty: the default)
+    nopic: bool,              // -fno-PIC ... (the code is position-independent by default on Linux)
+    wrapv: bool,              // -fwrapv
+    freestanding: bool,       // -ffreestanding
+    fsections: bool,          // -ffunction-sections
+    dsections: bool,          // -fdata-sections
+    shared: bool,             // -shared
+    static_: bool,            // -static
+    pthread: bool,            // -pthread
+    rdynamic: bool,           // -rdynamic, -Wl,-E
+    zdefs: bool,              // -Wl,-z,defs, -Wl,--no-undefined: a shared library's references must be defined
+    emit: []u8,               // --emit= (an axiom build output: lib, ...)
+    deps: i32,                // -M 1, -MM 2
+    mdeps: i32,               // -MD 1, -MMD 2
+    mf: []u8,                 // -MF
+    mts: u.List.[[]u8],       // -MT, -MQ (quoted)
+    mp: bool,                 // -MP
+    no_markers: bool,         // -P
+    dump_macros: bool,        // -dM
+    verbose: bool,            // -v
+    dry: bool,                // -###
+    asked: bool,              // an option that is a question (--version, -dumpmachine ...) was answered
+    tmp: []u8,                // a private directory for temporary files (empty: none yet)
+    tmps: u.List.[[]u8],      // the files in it
+}
+
+let mut S: *mut St = @ptr_from_int(*mut St, 0);
+
+fn pick_n(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn err(msg: []u8) i32 {
+    u.eprint(u.f2("%s: error: %s\n", S.prog, msg));
+    return 1;
+}
+
+fn warn(msg: []u8) void {
+    u.eprint(u.f2("%s: warning: %s\n", S.prog, msg));
+}
+
+/// Is `argv0` the name of a program that is `axiom cc` (the compiler
+/// installed, or linked to, as `axcc`)?
+pub fn is_cc_name(argv0: []u8) bool {
+    let b = u.basename(argv0);
+    return u.str_eq(b, "axcc") or u.str_eq(b, "axcc.exe");
+}
+
+fn usage() void {
+    u.print("usage: axiom cc [options] file...   (or the program named axcc)\n");
+    u.print("  A C compiler with the conventional Unix cc command line, for makefiles and configure\n");
+    u.print("  scripts (CC=\"axiom cc\"); each build is axiom build's (docs/c.md, \"The cc command\").\n");
+    u.print("  -c  -o <file>  -E  -P  -dM  -fsyntax-only  -S (no assembly output: an error)\n");
+    u.print("  -I<dir>  -iquote <dir>  -isystem <dir>  -idirafter <dir>  -include <file>  -D<name>[=<v>]  -U<name>\n");
+    u.print("  -std=<c89 ... c23 | gnu89 ... gnu23>  -ansi       (default gnu17)\n");
+    u.print("  -O0 -O1 -O2 -O3 -Os -Oz -Og -Ofast  -g -g1 -g0  (default -O0, no debug information)\n");
+    u.print("  -w  -Werror  -Wall  -Wformat=2  (other -W... accepted)  -f... (-fPIC, -funsigned-char,\n");
+    u.print("      -fwrapv, -ffreestanding, -ffunction-sections ...; unknown ones accepted)\n");
+    u.print("  -M -MM -MD -MMD -MF <file> -MT <target> -MQ <target> -MP   make rules of the headers read\n");
+    u.print("  -l<lib>  -L<dir>  -Wl,<options>  -Xlinker <option>  -shared  -pthread  -march=  -m<extension>\n");
+    u.print("  -x c|assembler|assembler-with-cpp|none   - (standard input as the source)\n");
+    u.print("  -v  -###  --version  -dumpversion  -dumpmachine  -print-file-name=<f>  -print-prog-name=<p>\n");
+    u.print("  Defaults: the host for --target, --c-std=gnu17, --c-lib=system where the target has a\n");
+    u.print("  system C library (Linux, macOS), else --c-lib=axiom; options of axiom build (--target=,\n");
+    u.print("  --c-lib=, --cpu=, --c-..., ...) are accepted too.\n");
+}
+
+// The host's target name, as --target= takes it.
+fn host_target() []u8 {
+    let arch = u.pick(tg.host_arch() == tg.ARCH_A64, "aarch64", "x86_64");
+    if tg.host_os() == tg.OS_DARWIN {
+        return u.cat2(arch, "-macos");
+    }
+    if tg.host_os() == tg.OS_WINDOWS {
+        return u.cat2(arch, "-windows");
+    }
+    return arch;
+}
+
+// The target named (St.target, or the host), as the conventional triple
+// (-dumpmachine).
+fn triple() []u8 {
+    let t = target();
+    if u.starts(t, "wasm64") {
+        return "wasm64-unknown-unknown";
+    }
+    if u.starts(t, "wasm") {
+        return "wasm32-unknown-unknown";
+    }
+    let arch = u.pick(u.starts(t, "aarch64"), "aarch64", "x86_64");
+    if u.contains(t, "macos") or u.contains(t, "darwin") {
+        return u.cat2(arch, "-apple-darwin");
+    }
+    if u.contains(t, "windows") {
+        return u.cat2(arch, "-pc-windows-msvc");
+    }
+    return u.cat2(arch, "-linux-gnu");
+}
+
+fn target() []u8 {
+    if (S.target.len == 0) or u.str_eq(S.target, "native") {
+        return host_target();
+    }
+    if u.str_eq(S.target, "macos") {
+        return "aarch64-macos";
+    }
+    if u.str_eq(S.target, "windows") {
+        return "x86_64-windows";
+    }
+    return S.target;
+}
+
+// Does the target have a system C library that is the default (Linux and
+// macOS; not WebAssembly, whose modules have none, nor Windows)?
+fn system_lib_default() bool {
+    let t = target();
+    return not u.starts(t, "wasm") and not u.contains(t, "windows");
+}
+
+// Is the target Linux (ELF, whose shared libraries take only
+// position-independent code)?
+fn linux_target() bool {
+    let t = target();
+    return not u.starts(t, "wasm") and not u.contains(t, "windows") and not u.contains(t, "macos") and
+           not u.contains(t, "darwin");
+}
+
+// The C standard of -std=NAME as --c-std= takes it, or nosym.
+fn std_of(name: []u8) []u8 {
+    let tab = ["c89", "c89", "c90", "c89", "iso9899:1990", "c89", "iso9899:199409", "c95", "c99", "c99", "c9x", "c99",
+               "iso9899:1999", "c99", "iso9899:199x", "c99", "c11", "c11", "c1x", "c11", "iso9899:2011", "c11", "c17",
+               "c17", "c18", "c17", "iso9899:2017", "c17", "iso9899:2018", "c17", "c2x", "c23", "c23", "c23",
+               "iso9899:2024", "c23", "gnu89", "gnu89", "gnu90", "gnu89", "gnu99", "gnu99", "gnu9x", "gnu99", "gnu11",
+               "gnu11", "gnu1x", "gnu11", "gnu17", "gnu17", "gnu18", "gnu17", "gnu2x", "gnu23", "gnu23", "gnu23"];
+    let mut k: usize = 0;
+    while k < tab.len {
+        if u.str_eq(tab[k], name) {
+            return tab[k + 1];
+        }
+        k += 2;
+    }
+    return u.nosym();
+}
+
+// A name for make: as -MQ quotes it ('$' as "$$", a space or '#' after a
+// backslash).
+fn make_quote(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    for c in s {
+        if (c == ' ') or (c == '\t') or (c == '#') {
+            b.c('\\');
+        } else if c == '$' {
+            b.c('$');
+        }
+        b.c(c);
+    }
+    return b.done();
+}
+
+// `path` without its directory and its last extension (".c").
+fn stem(path: []u8) []u8 {
+    let b = u.basename(path);
+    let dot = u.rfind(b, '.');
+    if dot > 0 {
+        return b[0..@int_cast(usize, dot)];
+    }
+    return b;
+}
+
+// `path` with its last extension replaced by `ext` (a file name of its own:
+// its directory kept).
+fn with_ext(path: []u8, ext: []u8) []u8 {
+    let slash = u.rfind(path, '/');
+    let dot = u.rfind(path, '.');
+    if dot > (slash + 1) {
+        return u.cat2(path[0..@int_cast(usize, dot)], ext);
+    }
+    return u.cat2(path, ext);
+}
+
+// The language of an input by its name (-x none), or -1 for one of another
+// language this compiler does not compile, 0 for a header.
+fn lang_of(path: []u8) i32 {
+    if u.str_eq(path, "-") {
+        return L_C;
+    }
+    let b = u.basename(path);
+    let dot = u.rfind(b, '.');
+    if dot <= 0 {
+        return L_LINK;
+    }
+    let ext = b[@int_cast(usize, dot)..];
+    if u.str_eq(ext, ".c") or u.str_eq(ext, ".i") {
+        return L_C;
+    }
+    if u.str_eq(ext, ".s") or u.str_eq(ext, ".S") or u.str_eq(ext, ".sx") {
+        return L_ASM;
+    }
+    if u.str_eq(ext, ".h") {
+        return 0;
+    }
+    for e in [".cc", ".cp", ".cxx", ".cpp", ".CPP", ".c++", ".C", ".ii", ".m", ".mi", ".mm", ".M", ".hh", ".hpp", ".f",
+              ".f90", ".f95", ".for", ".F", ".go", ".d", ".ads", ".adb", ".rs"] {
+        if u.str_eq(ext, e) {
+            return -1;
+        }
+    }
+    return L_LINK;
+}
+
+// Adds input `path` (by -x, else by its name). Nonzero (an exit status)
+// after an error (reported).
+fn add_input(path: []u8) i32 {
+    let mut lang = S.xlang;
+    let mut named = false;
+    if lang == 0 {
+        lang = lang_of(path);
+        if lang == 0 {
+            return err(u.f1("'%s' is a header: precompiled headers are not made (to compile it as C: -x c)", path));
+        }
+        if lang < 0 {
+            return err(u.f1("'%s' is not C: this compiler compiles C and assembly", path));
+        }
+        named = (lang == L_C) and not u.ends(path, ".c");
+    } else if lang == L_C {
+        named = not u.ends(path, ".c") or u.str_eq(path, "-");
+    } else if (lang == L_ASM) and not (u.ends(path, ".s") or u.ends(path, ".S")) {
+        return err(u.f1("'%s': an assembly source is named *.s (or *.S, preprocessed)", path));
+    }
+    S.ins.push(In.{ path: path, lang: lang, named: named, stdin: false });
+    return 0;
+}
+
+// -x <language>: nonzero after an error.
+fn set_lang(l: []u8) i32 {
+    if u.str_eq(l, "c") or u.str_eq(l, "cpp-output") {
+        S.xlang = L_C;
+    } else if u.str_eq(l, "assembler") or u.str_eq(l, "assembler-with-cpp") {
+        S.xlang = L_ASM;
+    } else if u.str_eq(l, "none") {
+        S.xlang = 0;
+    } else if u.str_eq(l, "c-header") {
+        return err("-x c-header: precompiled headers are not made");
+    } else {
+        return err(u.f1("-x %s: this compiler compiles C and assembly (-x c, assembler, assembler-with-cpp)", l));
+    }
+    return 0;
+}
+
+// An include directory (-I and the like): kept if it is one (a cc ignores
+// one that does not exist).
+fn dir_ok(d: []u8) bool {
+    return (d.len > 0) and u.is_dir(d);
+}
+
+// -O<x>: the level of axiom build it is.
+fn opt_of(x: []u8) []u8 {
+    if (x.len == 0) or u.str_eq(x, "1") or u.str_eq(x, "g") {
+        return "-O1";
+    }
+    if u.str_eq(x, "0") {
+        return "-O0";
+    }
+    if u.str_eq(x, "2") or u.str_eq(x, "s") or u.str_eq(x, "z") {
+        return "-O2";
+    }
+    if u.str_eq(x, "fast") or (u.is_digit(x[0]) and (u.atol(x) >= 3)) {
+        return "-O3";
+    }
+    return u.nosym();
+}
+
+// -g<x>: debug information (empty: as -g).
+fn debug_of(x: []u8) []u8 {
+    if u.str_eq(x, "0") or u.str_eq(x, "no-codeview") {
+        return "--debug-info=none";
+    }
+    if u.str_eq(x, "1") or u.str_eq(x, "line-tables-only") or u.str_eq(x, "mlt") {
+        return "--debug-info=lines";
+    }
+    if (x.len == 0) or u.str_eq(x, "2") or u.str_eq(x, "3") or u.starts(x, "gdb") or u.starts(x, "dwarf") or
+       u.str_eq(x, "full") {
+        return "-g";
+    }
+    return u.nosym();  // (-gsplit-dwarf, -gz, -gcolumn-info ...: accepted, nothing changes)
+}
+
+// A -f option. Nonzero after an error.
+fn f_option(a: []u8) i32 {
+    let f = a[2..];
+    if u.str_eq(f, "PIC") or u.str_eq(f, "pic") or u.str_eq(f, "PIE") or u.str_eq(f, "pie") {
+        S.nopic = false;
+    } else if u.str_eq(f, "no-PIC") or u.str_eq(f, "no-pic") or u.str_eq(f, "no-PIE") or u.str_eq(f, "no-pie") {
+        S.nopic = true;
+    } else if u.str_eq(f, "unsigned-char") or u.str_eq(f, "no-signed-char") {
+        S.char_sign = "unsigned";
+    } else if u.str_eq(f, "signed-char") or u.str_eq(f, "no-unsigned-char") {
+        S.char_sign = "signed";
+    } else if u.str_eq(f, "freestanding") or u.str_eq(f, "no-hosted") {
+        S.freestanding = true;
+    } else if u.str_eq(f, "hosted") {
+        S.freestanding = false;
+    } else if u.str_eq(f, "wrapv") or u.str_eq(f, "no-strict-overflow") {
+        S.wrapv = true;
+    } else if u.str_eq(f, "no-wrapv") or u.str_eq(f, "strict-overflow") {
+        S.wrapv = false;
+    } else if u.str_eq(f, "function-sections") {
+        S.fsections = true;
+    } else if u.str_eq(f, "data-sections") {
+        S.dsections = true;
+    } else if u.str_eq(f, "no-function-sections") {
+        S.fsections = false;
+    } else if u.str_eq(f, "no-data-sections") {
+        S.dsections = false;
+    } else if u.str_eq(f, "syntax-only") {
+        S.mode = M_CHECK;
+    } else if u.str_eq(f, "openmp") or u.str_eq(f, "openacc") or u.starts(f, "openmp=") {
+        return err(u.f1("'%s': OpenMP is not supported", a));
+    } else if u.starts(f, "sanitize=") or u.str_eq(f, "profile-arcs") or u.str_eq(f, "test-coverage") or
+              u.starts(f, "profile-generate") or u.starts(f, "profile-instr-generate") or
+              u.starts(f, "coverage-mapping") {
+        return err(u.f1("'%s' is not supported for C (there is no instrumentation of C code)", a));
+    } else if u.str_eq(f, "short-enums") or u.str_eq(f, "short-wchar") or u.starts(f, "pack-struct") or
+              u.str_eq(f, "unsigned-bitfields") or u.str_eq(f, "pcc-struct-return") or
+              u.str_eq(f, "reg-struct-return") {
+        return err(u.f1("'%s' changes the C ABI, and is not supported (the target's ABI is the only one)", a));
+    } else if (u.starts(f, "exec-charset=") and not utf8_name(f[13..])) or
+              (u.starts(f, "input-charset=") and not utf8_name(f[14..])) {
+        return err(u.f1("'%s': sources and strings are UTF-8", a));
+    } else if u.starts(f, "wide-exec-charset=") and not u.starts(f[18..], "UTF-32") and
+              not u.starts(f[18..], "utf-32") {
+        return err(u.f1("'%s': wide strings are UTF-32 (UTF-16 on Windows)", a));
+    }
+    // (any other -f option: accepted, nothing changes: -fno-common,
+    // -fvisibility=, -fno-builtin, -fstack-protector, -fno-strict-aliasing
+    // (type-based aliasing is never assumed), -fomit-frame-pointer ...)
+    return 0;
+}
+
+fn utf8_name(s: []u8) bool {
+    return u.str_eq(s, "UTF-8") or u.str_eq(s, "utf-8") or u.str_eq(s, "UTF8") or u.str_eq(s, "utf8");
+}
+
+// A -m option. Nonzero after an error.
+fn m_option(a: []u8) i32 {
+    let m = a[2..];
+    if u.str_eq(m, "64") or u.str_eq(m, "little-endian") or u.starts(m, "tune=") or u.starts(m, "fpmath=") or
+       u.str_eq(m, "stackrealign") or u.str_eq(m, "ieee-fp") or u.str_eq(m, "cmodel=small") or
+       u.str_eq(m, "no-omit-leaf-frame-pointer") or u.str_eq(m, "omit-leaf-frame-pointer") or u.str_eq(m, "sse") or
+       u.str_eq(m, "sse2") or u.str_eq(m, "mmx") or u.str_eq(m, "fxsr") or u.str_eq(m, "80387") or
+       u.str_eq(m, "hard-float") or u.starts(m, "branch-protection=") {
+        return 0;
+    }
+    if u.str_eq(m, "32") or u.str_eq(m, "x32") or u.str_eq(m, "16") or u.str_eq(m, "big-endian") or
+       u.starts(m, "long-double-") or u.starts(m, "abi=") or u.str_eq(m, "soft-float") {
+        return err(u.f1("'%s' is another ABI than the target's, and is not supported", a));
+    }
+    if u.starts(m, "arch=") or u.starts(m, "cpu=") {
+        let v = m[@int_cast(usize, pick_n(u.starts(m, "arch="), 5, 4))..];
+        S.cpu = u.pick(u.str_eq(v, "x86-64") or u.str_eq(v, "armv8-a"), "", v);
+        return 0;
+    }
+    let mut name = m;
+    let mut on = true;
+    if u.starts(m, "no-") {
+        name = m[3..];
+        on = false;
+    }
+    if tg.feature_known(name) {
+        S.features.push(u.cat2(u.pick(on, "+", "-"), name));
+        return 0;
+    }
+    warn(u.f1("'%s' is ignored", a));
+    return 0;
+}
+
+// A -W option that is not -Wl, -Wp or -Wa: the warnings' options that the
+// front end has a counterpart of; the others are accepted.
+fn w_option(a: []u8) void {
+    let w = a[2..];
+    if u.str_eq(w, "error") {
+        S.werror = true;
+    } else if u.str_eq(w, "no-error") {
+        S.werror = false;
+    } else if u.str_eq(w, "all") or u.str_eq(w, "unknown-pragmas") or u.str_eq(w, "pragmas") {
+        S.warn_pragmas = true;
+    } else if u.str_eq(w, "no-unknown-pragmas") or u.str_eq(w, "no-pragmas") {
+        S.warn_pragmas = false;
+    } else if u.str_eq(w, "format=2") or u.str_eq(w, "format-security") or u.str_eq(w, "format-nonliteral") {
+        S.warn_format = "2";
+    } else if u.str_eq(w, "format") or u.str_eq(w, "format=1") {
+        if not u.str_eq(S.warn_format, "2") {
+            S.warn_format = "1";
+        }
+    } else if u.str_eq(w, "no-format") or u.str_eq(w, "format=0") {
+        S.warn_format = "0";
+    }
+}
+
+// The options of the linker (-Wl, -Xlinker), as axiom build's or the
+// inputs'. Nonzero after an error.
+fn linker_options() i32 {
+    let ls = S.lflags.items();
+    let mut i: usize = 0;
+    while i < ls.len {
+        let a = ls[i];
+        let has_next = (i + 1) < ls.len;
+        let mut next = "";
+        if has_next {
+            next = ls[i + 1];
+        }
+        if (u.str_eq(a, "-soname") or u.str_eq(a, "--soname") or u.str_eq(a, "-h")) and has_next {
+            S.pass.push(u.cat2("--soname=", next));
+            i += 1;
+        } else if u.starts(a, "-soname=") or u.starts(a, "--soname=") {
+            S.pass.push(u.cat2("--soname=", a[@int_cast(usize, pick_n(u.starts(a, "-soname="), 8, 9))..]));
+        } else if (u.str_eq(a, "-rpath") or u.str_eq(a, "--rpath") or u.str_eq(a, "-R")) and has_next {
+            S.pass.push(u.cat2("--rpath=", next));
+            i += 1;
+        } else if u.starts(a, "-rpath=") or u.starts(a, "--rpath=") {
+            S.pass.push(u.cat2("--rpath=", a[@int_cast(usize, pick_n(u.starts(a, "-rpath="), 7, 8))..]));
+        } else if (u.str_eq(a, "-z") and u.str_eq(next, "defs")) or u.str_eq(a, "--no-undefined") or
+                  u.str_eq(a, "-zdefs") {
+            S.zdefs = true;
+            if u.str_eq(a, "-z") {
+                i += 1;
+            }
+        } else if (u.str_eq(a, "-z") or u.str_eq(a, "-Map") or u.str_eq(a, "--exclude-libs") or
+                   u.str_eq(a, "--version-script") or u.str_eq(a, "-version-script") or u.str_eq(a, "-O")) and
+                  has_next {
+            if u.ends(a, "-version-script") {
+                S.pass.push(u.cat2("--version-script=", next));
+            }
+            i += 1;  // (-z relro, -z now, -z noexecstack, -z defs ...: what the linker does anyway, or nothing)
+        } else if u.starts(a, "--version-script=") {
+            S.pass.push(a);
+        } else if u.str_eq(a, "-E") or u.str_eq(a, "--export-dynamic") {
+            S.rdynamic = true;
+        } else if u.str_eq(a, "--gc-sections") or u.str_eq(a, "--no-gc-sections") {
+            S.pass.push(a);
+        } else if (u.str_eq(a, "-L") or u.str_eq(a, "-l")) and has_next {
+            S.ins.push(In.{ path: u.cat2(a, next), lang: L_FLAG, named: false, stdin: false });
+            i += 1;
+        } else if (a.len > 2) and (u.starts(a, "-L") or u.starts(a, "-l")) {
+            S.ins.push(In.{ path: a, lang: L_FLAG, named: false, stdin: false });
+        } else if u.str_eq(a, "--as-needed") or u.str_eq(a, "--no-as-needed") or u.starts(a, "-O") or
+                  u.str_eq(a, "--sort-common") or u.starts(a, "--hash-style=") or u.starts(a, "--build-id") or
+                  u.str_eq(a, "-z") or u.starts(a, "-z,") or u.str_eq(a, "-s") or u.str_eq(a, "--strip-all") or
+                  u.str_eq(a, "-S") or u.str_eq(a, "--strip-debug") or u.str_eq(a, "--warn-common") or
+                  u.str_eq(a, "--fatal-warnings") or u.starts(a, "-Bsymbolic") or u.str_eq(a, "--eh-frame-hdr") or
+                  u.str_eq(a, "--start-group") or u.str_eq(a, "--end-group") or u.str_eq(a, "-(") or
+                  u.str_eq(a, "-)") or u.starts(a, "--icf=") or u.str_eq(a, "--relax") or
+                  u.starts(a, "--color-diagnostics") or u.str_eq(a, "--enable-new-dtags") or
+                  u.str_eq(a, "--disable-new-dtags") or u.starts(a, "-Map=") or u.starts(a, "--Map=") or
+                  u.str_eq(a, "-Bstatic") or u.str_eq(a, "-Bdynamic") or u.str_eq(a, "--no-copy-dt-needed-entries") or
+                  u.str_eq(a, "--allow-shlib-undefined") or u.str_eq(a, "--no-allow-shlib-undefined") or
+                  u.starts(a, "--exclude-libs=") or u.str_eq(a, "--push-state") or u.str_eq(a, "--pop-state") or
+                  u.str_eq(a, "--warn-shared-textrel") or u.str_eq(a, "--no-warn-mismatch") or
+                  u.str_eq(a, "--default-symver") or u.str_eq(a, "--export-dynamic-symbol") or
+                  u.str_eq(a, "-znoexecstack") or u.starts(a, "-zrelro") or u.starts(a, "-znow") {
+            // what the compiler's linker does anyway, or nothing that changes the program
+        } else if (a.len > 0) and (a[0] == '-') {
+            return err(u.f1("the linker's option '%s' is not supported", a));
+        } else {
+            S.ins.push(In.{ path: a, lang: L_LINK, named: false, stdin: false });  // (an input: -Wl,x.o)
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Reads the options; nonzero (an exit status, the message written) after
+// an error, -1 to go on.
+fn parse(args: [][]u8) i32 {
+    let mut i: usize = 0;
+    while i < args.len {
+        let a = args[i];
+        let has_next = (i + 1) < args.len;
+        let mut next = "";
+        if has_next {
+            next = args[i + 1];
+        }
+        // the options that take the next argument when not joined to it
+        let joinable = ["-o", "-I", "-D", "-U", "-A", "-L", "-l", "-x", "-MF", "-MT", "-MQ", "-include", "-isystem",
+                        "-idirafter", "-iquote", "-imacros", "-Xlinker", "-Xpreprocessor", "-Xassembler", "-B", "-u",
+                        "-T", "-z", "--param", "-iprefix", "-iwithprefix", "-isysroot", "--sysroot", "-e", "-soname",
+                        "-rpath", "-version-script"];
+        let mut takes = false;
+        for j in joinable {
+            if u.str_eq(a, j) {
+                takes = true;
+            }
+        }
+        if takes and not has_next {
+            return err(u.f1("missing argument to '%s'", a));
+        }
+        if (a.len == 0) or ((a[0] != '-') or u.str_eq(a, "-")) {
+            let rc = add_input(a);
+            if rc != 0 {
+                return rc;
+            }
+        } else if takes {
+            i += 1;
+            let rc = joined(a, next);
+            if rc != 0 {
+                return rc;
+            }
+        } else {
+            let rc = option(a);
+            if rc != 0 {
+                return rc;
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// An option given as two arguments (a, v); nonzero after an error.
+fn joined(a: []u8, v: []u8) i32 {
+    if u.str_eq(a, "-o") {
+        S.out = v;
+    } else if u.str_eq(a, "-x") {
+        return set_lang(v);
+    } else if u.str_eq(a, "-Xlinker") {
+        S.lflags.push(v);
+    } else if u.str_eq(a, "-z") or u.str_eq(a, "-soname") or u.str_eq(a, "-rpath") or u.str_eq(a, "-version-script") {
+        // (the linker's: shared-library build scripts pass -soname and
+        // -rpath so to a cc they do not know)
+        S.lflags.push(a);
+        S.lflags.push(v);
+    } else if u.str_eq(a, "-Xpreprocessor") {
+        return option(v);
+    } else if u.str_eq(a, "-Xassembler") or u.str_eq(a, "-B") or u.str_eq(a, "--param") {
+        // (nothing to do: there is no external assembler, nor other programs)
+    } else if u.str_eq(a, "-u") or u.str_eq(a, "-T") or u.str_eq(a, "-e") {
+        return err(u.f2("'%s %s': the linker's option is not supported", a, v));
+    } else if u.str_eq(a, "-imacros") or u.str_eq(a, "-iprefix") or u.str_eq(a, "-iwithprefix") or
+              u.str_eq(a, "-isysroot") or u.str_eq(a, "--sysroot") {
+        return err(u.f1("'%s' is not supported", a));
+    } else {
+        // -I dir, -D name ...: as joined
+        return option(u.cat2(a, v));
+    }
+    return 0;
+}
+
+// The linker's options that shared-library build scripts give a cc they
+// do not know as they are (without -Wl,): they go to the linker (linker_options).
+fn bare_linker_option(a: []u8) bool {
+    for x in ["--default-symver", "-Bsymbolic", "-Bsymbolic-functions", "--no-undefined", "--as-needed",
+              "--no-as-needed", "--export-dynamic", "--enable-new-dtags", "--disable-new-dtags", "--start-group",
+              "--end-group", "--allow-shlib-undefined", "--no-allow-shlib-undefined", "--whole-archive",
+              "--no-whole-archive", "--eh-frame-hdr"] {
+        if u.str_eq(a, x) {
+            return true;
+        }
+    }
+    return u.starts(a, "--version-script=") or u.starts(a, "--hash-style=") or u.starts(a, "--build-id") or
+           u.starts(a, "--soname=") or u.starts(a, "-soname=") or u.starts(a, "--rpath=") or u.starts(a, "-rpath=");
+}
+
+// One option (with its value joined); nonzero after an error.
+fn option(a: []u8) i32 {
+    if bare_linker_option(a) {
+        S.lflags.push(a);
+    } else if u.starts(a, "-o") {
+        S.out = a[2..];
+    } else if u.str_eq(a, "-c") {
+        S.mode = M_OBJ;
+    } else if u.str_eq(a, "-E") {
+        S.mode = M_PP;
+    } else if u.str_eq(a, "-S") {
+        S.mode = M_ASM;
+    } else if u.starts(a, "-I") {
+        let d = a[2..];
+        if u.str_eq(d, "-") {
+            return err("'-I-' is not supported (-iquote <dir> names directories for \"...\" only)");
+        }
+        if dir_ok(d) {
+            S.incs.push(a);
+        }
+    } else if u.starts(a, "-iquote") {
+        if dir_ok(a[7..]) {
+            S.quotes.push(u.cat2("-I", a[7..]));
+        }
+    } else if u.starts(a, "-isystem") {
+        if dir_ok(a[8..]) {
+            S.isys.push(a[8..]);
+        }
+    } else if u.starts(a, "-idirafter") {
+        if dir_ok(a[10..]) {
+            S.isys.push(a[10..]);
+        }
+    } else if u.starts(a, "-include") {
+        S.pre.push(a[8..]);
+    } else if u.starts(a, "-D") or u.starts(a, "-U") or u.starts(a, "-A") {
+        S.defs.push(a);
+    } else if u.starts(a, "-std=") {
+        let s = std_of(a[5..]);
+        if u.isnos(s) {
+            if u.contains(a, "++") {
+                return err(u.f1("'%s' is a C++ standard: this compiler compiles C", a));
+            }
+            return err(u.f1("unknown C standard in '%s' (c89, c99, c11, c17, c23, gnu89 ... gnu23, iso9899:...)", a));
+        }
+        S.std = s;
+    } else if u.str_eq(a, "-ansi") {
+        S.std = "c89";
+    } else if u.starts(a, "-O") {
+        let o = opt_of(a[2..]);
+        if u.isnos(o) {
+            return err(u.f1("unknown optimization level '%s'", a));
+        }
+        S.opt = o;
+    } else if u.starts(a, "-g") {
+        let d = debug_of(a[2..]);
+        if not u.isnos(d) {
+            S.debug = d;
+        }
+    } else if u.str_eq(a, "-w") {
+        S.warn_off = true;
+    } else if u.starts(a, "-Wl,") {
+        for x in u.split(a[4..], ',', 1000).items() {
+            if x.len > 0 {
+                S.lflags.push(x);
+            }
+        }
+    } else if u.starts(a, "-Wp,") {
+        // (the preprocessor's options: as given to cc)
+        let xs = u.split(a[4..], ',', 1000);
+        let mut k: usize = 0;
+        while k < xs.len {
+            let x = xs.get(k);
+            let pair = u.str_eq(x, "-MF") or u.str_eq(x, "-MT") or u.str_eq(x, "-MQ") or u.str_eq(x, "-D") or
+                       u.str_eq(x, "-U") or u.str_eq(x, "-I") or u.str_eq(x, "-include");
+            let mut rc: i32 = 0;
+            if pair and ((k + 1) < xs.len) {
+                rc = joined(x, xs.get(k + 1));
+                k += 1;
+            } else if (u.str_eq(x, "-MD") or u.str_eq(x, "-MMD")) and ((k + 1) < xs.len) {
+                // (-Wp,-MD,file: the rule into file)
+                rc = option(x);
+                S.mf = xs.get(k + 1);
+                k += 1;
+            } else if x.len > 0 {
+                rc = option(x);
+            }
+            if rc != 0 {
+                return rc;
+            }
+            k += 1;
+        }
+    } else if u.starts(a, "-Wa,") {
+        // (the assembler's options: there is no external assembler)
+    } else if u.starts(a, "-W") {
+        w_option(a);
+    } else if u.starts(a, "-pedantic") or u.str_eq(a, "-pipe") or u.str_eq(a, "-time") or u.str_eq(a, "-Q") or
+              u.starts(a, "-save-temps") or u.str_eq(a, "-static-libgcc") or u.str_eq(a, "-static-libstdc++") or
+              u.str_eq(a, "-pie") or u.str_eq(a, "-no-pie") or u.str_eq(a, "-s") or u.str_eq(a, "-C") or
+              u.str_eq(a, "-CC") or u.str_eq(a, "-MG") or u.str_eq(a, "-symbolic") or u.starts(a, "-B") or
+              u.str_eq(a, "-m64") or u.str_eq(a, "-no-integrated-cpp") or u.str_eq(a, "-integrated-as") {
+        // accepted: nothing changes
+    } else if u.starts(a, "-f") {
+        return f_option(a);
+    } else if u.starts(a, "-m") {
+        return m_option(a);
+    } else if u.starts(a, "-x") {
+        return set_lang(a[2..]);
+    } else if (a.len > 2) and (u.starts(a, "-l") or u.starts(a, "-L")) {
+        if u.starts(a, "-l") or dir_ok(a[2..]) {
+            S.ins.push(In.{ path: a, lang: L_FLAG, named: false, stdin: false });
+        }
+    } else if u.str_eq(a, "-M") {
+        S.deps = 1;
+    } else if u.str_eq(a, "-MM") {
+        S.deps = 2;
+    } else if u.str_eq(a, "-MD") {
+        S.mdeps = 1;
+    } else if u.str_eq(a, "-MMD") {
+        S.mdeps = 2;
+    } else if u.str_eq(a, "-MP") {
+        S.mp = true;
+    } else if u.starts(a, "-MF") {
+        S.mf = a[3..];
+    } else if u.starts(a, "-MT") {
+        S.mts.push(a[3..]);
+    } else if u.starts(a, "-MQ") {
+        S.mts.push(make_quote(a[3..]));
+    } else if u.str_eq(a, "-P") {
+        S.no_markers = true;
+    } else if u.str_eq(a, "-dM") {
+        S.dump_macros = true;
+    } else if u.str_eq(a, "-shared") {
+        S.shared = true;
+    } else if u.str_eq(a, "-static") {
+        S.static_ = true;
+    } else if u.str_eq(a, "-pthread") or u.str_eq(a, "-pthreads") {
+        S.pthread = true;
+    } else if u.str_eq(a, "-rdynamic") {
+        S.rdynamic = true;
+    } else if u.str_eq(a, "-v") {
+        S.verbose = true;
+    } else if u.str_eq(a, "-###") {
+        S.verbose = true;
+        S.dry = true;
+    } else if u.str_eq(a, "--version") {
+        u.print(u.f2("axiom cc (axiom) %s\nTarget: %s\n", ver.VERSION, triple()));
+        S.asked = true;
+    } else if u.str_eq(a, "--help") or u.str_eq(a, "-help") {
+        usage();
+        S.asked = true;
+    } else if u.str_eq(a, "-dumpversion") or u.str_eq(a, "-dumpfullversion") {
+        u.print(u.cat2(ver.VERSION, "\n"));
+        S.asked = true;
+    } else if u.str_eq(a, "-dumpmachine") or u.str_eq(a, "-print-multiarch") {
+        u.print(u.cat2(triple(), "\n"));
+        S.asked = true;
+    } else if u.str_eq(a, "-print-multi-directory") or u.str_eq(a, "-print-multi-os-directory") {
+        u.print(".\n");
+        S.asked = true;
+    } else if u.str_eq(a, "-print-multi-lib") {
+        u.print(".;\n");
+        S.asked = true;
+    } else if u.str_eq(a, "-print-sysroot") {
+        u.print("\n");
+        S.asked = true;
+    } else if u.starts(a, "-print-prog-name=") {
+        u.print(u.cat2(a[17..], "\n"));  // (a cc prints the name when it has no program of its own)
+        S.asked = true;
+    } else if u.starts(a, "-print-file-name=") {
+        u.print(u.cat2(find_lib_file(a[17..]), "\n"));
+        S.asked = true;
+    } else if u.str_eq(a, "-print-search-dirs") {
+        u.print(u.f2("install: %s\nprograms: \nlibraries: =%s\n", u.self_path(), lib_path()));
+        S.asked = true;
+    } else if u.str_eq(a, "-print-libgcc-file-name") {
+        u.print("libgcc.a\n");
+        S.asked = true;
+    } else if u.str_eq(a, "-nostdlib") or u.str_eq(a, "-nostartfiles") or u.str_eq(a, "-nodefaultlibs") or
+              u.str_eq(a, "-nolibc") {
+        return err(u.f1("'%s' is not supported: the start-up and the C library are the compiler's to link (a shared library: -shared)",
+                        a));
+    } else if u.str_eq(a, "-nostdinc") or u.str_eq(a, "-undef") or u.str_eq(a, "-H") or u.str_eq(a, "-dD") or
+              u.str_eq(a, "-dN") or u.str_eq(a, "-dI") or u.str_eq(a, "-dU") or u.starts(a, "-traditional") or
+              u.str_eq(a, "-static-pie") or u.str_eq(a, "-r") or u.str_eq(a, "-dumpspecs") or u.starts(a, "-specs") or
+              u.starts(a, "--sysroot=") {
+        return err(u.f1("'%s' is not supported", a));
+    } else if u.str_eq(a, "-trigraphs") {
+        warn("-trigraphs is ignored: the ISO standards' modes (-std=c89 ... c17) read trigraphs");
+    } else if u.starts(a, "--emit=") {
+        S.emit = a[7..];
+    } else if u.starts(a, "--target=") {
+        S.target = a[9..];
+    } else if u.starts(a, "--c-std=") {
+        S.std = a[8..];
+    } else if u.starts(a, "--c-lib=") {
+        S.clib = a;
+    } else if u.str_eq(a, "--c-freestanding") {
+        S.freestanding = true;
+    } else if u.starts(a, "--param=") {
+        // (the optimizer's tuning: nothing)
+    } else if u.starts(a, "--") {
+        S.pass.push(a);  // an option of axiom build (its build checks it)
+    } else {
+        return err(u.f1("unknown option '%s'", a));
+    }
+    return 0;
+}
+
+// The library directories (-print-search-dirs): -L's, then the system's.
+fn lib_dirs() u.List.[[]u8] {
+    let mut ds = u.List.[[]u8].empty();
+    for x in S.ins.items() {
+        if (x.lang == L_FLAG) and u.starts(x.path, "-L") {
+            ds.push(x.path[2..]);
+        }
+    }
+    let triple_dir = u.pick(u.starts(triple(), "aarch64"), "aarch64-linux-gnu", "x86_64-linux-gnu");
+    for d in [u.cat2("/lib/", triple_dir), u.cat2("/usr/lib/", triple_dir), "/lib64", "/usr/lib64", "/lib",
+              "/usr/lib"] {
+        if u.is_dir(d) {
+            ds.push(d);
+        }
+    }
+    return ds;
+}
+
+fn lib_path() []u8 {
+    let mut b = u.Buf.init();
+    for d in lib_dirs().items() {
+        if b.len() > 0 {
+            b.c(':');
+        }
+        b.s(d);
+    }
+    return b.done();
+}
+
+// -print-file-name=name: its path in the library directories, else the
+// name itself.
+fn find_lib_file(name: []u8) []u8 {
+    for d in lib_dirs().items() {
+        let p = u.f2("%s/%s", d, name);
+        if u.file_exists(p) {
+            return p;
+        }
+    }
+    return name;
+}
+
+// A temporary file in the driver's private directory (removed at the end).
+fn tmp_file(name: []u8) []u8 {
+    if S.tmp.len == 0 {
+        S.tmp = u.private_tmp_dir("axiom-cc-");
+        if u.isnos(S.tmp) {
+            S.tmp = "";
+            return u.nosym();
+        }
+    }
+    let p = u.f3("%s/%s%s", S.tmp, u.zdec(S.tmps.len), name);
+    S.tmps.push(p);
+    return p;
+}
+
+fn clean() void {
+    for p in S.tmps.items() {
+        _ = u.unlink(u.cz(p));
+    }
+    if S.tmp.len > 0 {
+        _ = u.rmdir(S.tmp);
+    }
+}
+
+// Standard input, as a C source (-): its text in a temporary file; nosym
+// after an error (reported).
+fn stdin_source() []u8 {
+    let mut b = u.Buf.init();
+    let mut chunk: [8192]u8 = [0; 8192];
+    loop {
+        let n = u.read(0, &mut chunk[0], 8192);
+        if n <= 0 {
+            break;
+        }
+        b.s(chunk[0..@int_cast(usize, n)]);
+    }
+    let p = tmp_file("stdin.c");
+    if u.isnos(p) or not u.write_file(p, b.done()) {
+        _ = err("cannot write standard input's text to a temporary file");
+        return u.nosym();
+    }
+    return p;
+}
+
+// The options every build of a source has: the target, the C library, the
+// standard, the preprocessor's and the code's options.
+fn source_options(av: *mut u.List.[[]u8]) void {
+    av.push(u.cat2("--target=", target()));
+    if S.freestanding {
+        av.push("--c-freestanding");
+    } else if S.clib.len > 0 {
+        av.push(S.clib);
+    } else if system_lib_default() {
+        av.push("--c-lib=system");
+    }
+    av.push(u.cat2("--c-std=", u.pick(S.std.len > 0, S.std, "gnu17")));
+    if S.opt.len > 0 {
+        av.push(S.opt);
+    }
+    if S.debug.len > 0 {
+        av.push(S.debug);
+    }
+    if S.char_sign.len > 0 {
+        av.push(u.cat2("--c-char=", S.char_sign));
+    }
+    if S.cpu.len > 0 {
+        av.push(u.cat2("--cpu=", S.cpu));
+    }
+    for f in S.features.items() {
+        av.push(u.cat2("--features=", f));
+    }
+    if S.warn_off {
+        av.push("--c-warnings=off");
+    } else if S.werror {
+        av.push("--c-warnings=error");
+    }
+    if S.warn_pragmas {
+        av.push("--c-warn-unknown-pragmas");
+    }
+    if S.warn_format.len > 0 {
+        av.push(u.cat2("--c-warn-format=", S.warn_format));
+    }
+    if S.shared or (not S.nopic and linux_target()) {
+        av.push("--pic");  // (objects that a shared library can take, built without -fPIC)
+    }
+    if S.wrapv {
+        av.push("--c-wrapv");
+    }
+    if S.fsections {
+        av.push("--function-sections");
+    }
+    if S.dsections {
+        av.push("--data-sections");
+    }
+    if S.pthread {
+        av.push("-D_REENTRANT");
+    }
+    for d in S.defs.items() {
+        av.push(d);
+    }
+    for d in S.quotes.items() {
+        av.push(d);
+    }
+    for d in S.incs.items() {
+        av.push(d);
+    }
+    for d in S.isys.items() {
+        av.push(u.cat2("--c-isystem=", d));
+    }
+    for f in S.pre.items() {
+        av.push(u.cat2("--c-include=", f));
+    }
+    for p in S.pass.items() {
+        av.push(p);
+    }
+}
+
+// Pushes source x (its path: p) as an input of a build.
+fn push_source(av: *mut u.List.[[]u8], x: In, p: []u8) void {
+    if x.named {
+        av.push(u.cat2("--c-source=", p));
+    } else {
+        av.push(p);
+    }
+}
+
+// Runs one build (av: its arguments, after the program); its exit status.
+fn run_job(av: *u.List.[[]u8]) i32 {
+    let mut full = u.List.[[]u8].empty();
+    full.push(u.self_path());
+    for a in av.items() {
+        full.push(a);
+    }
+    if S.verbose {
+        let mut b = u.Buf.init();
+        b.s(" ");
+        for a in full.items() {
+            b.s(" ");
+            b.s(a);
+        }
+        b.c('\n');
+        u.eprint(b.done());
+    }
+    if S.dry {
+        return 0;
+    }
+    let st = u.run_status(full.items(), u.OUT_INHERIT);
+    return pick_n(st == 0, 0, 1);
+}
+
+// The dependency options of a build of source x (the rule into `file`),
+// whose object is `obj`.
+fn deps_options(av: *mut u.List.[[]u8], file: []u8, obj: []u8, user_only: bool) void {
+    av.push(u.cat2("--c-deps=", file));
+    if S.mts.len > 0 {
+        for t in S.mts.items() {
+            av.push(u.cat2("--c-deps-target=", t));
+        }
+    } else {
+        av.push(u.cat2("--c-deps-target=", make_quote(obj)));
+    }
+    if S.mp {
+        av.push("--c-deps-phony");
+    }
+    if user_only {
+        av.push("--c-deps-no-system");
+    }
+}
+
+// The sources among the inputs (C and assembly), with their paths (stdin's
+// text in a temporary file). Nonzero after an error.
+fn sources(xs: *mut u.List.[In]) i32 {
+    for x in S.ins.items() {
+        if (x.lang == L_C) or (x.lang == L_ASM) {
+            let mut y = x;
+            if u.str_eq(x.path, "-") {
+                y.path = stdin_source();
+                if u.isnos(y.path) {
+                    return 1;
+                }
+                y.named = false;  // (a .c file now)
+                y.stdin = true;
+                if dir_ok(".") {
+                    S.incs.push("-I.");  // ("..." from standard input: the current directory)
+                }
+            } else if not u.file_exists(x.path) {
+                return err(u.f1("%s: no such file", x.path));
+            }
+            xs.push(y);
+        }
+    }
+    return 0;
+}
+
+// -E, -M, -MM: preprocessing alone, each source in turn.
+fn preprocess(srcs: []In) i32 {
+    if (srcs.len > 1) and (S.out.len > 0) and (S.deps == 0) {
+        return err("-o with -E and more than one source (each is preprocessed to standard output without -o)");
+    }
+    let mut rc: i32 = 0;
+    for x in srcs {
+        let mut av = u.List.[[]u8].empty();
+        av.push("build");
+        push_source(&mut av, x, x.path);
+        source_options(&mut av);
+        let obj = u.cat2(stem(orig_name(x)), ".o");
+        if S.deps > 0 {
+            // -M, -MM: the rule alone, to -MF, else -o, else standard output
+            av.push("--emit=c-deps");
+            let mut f = S.mf;
+            if f.len == 0 {
+                f = S.out;
+            }
+            if f.len > 0 {
+                av.push("-o");
+                av.push(f);
+            }
+            deps_options(&mut av, u.pick(f.len > 0, f, "-"), obj, S.deps == 2);
+        } else {
+            av.push(u.pick(S.dump_macros, "--emit=c-macros", "--emit=c-pp"));
+            if not S.no_markers and not S.dump_macros {
+                av.push("--c-line-markers");
+            }
+            if S.mdeps > 0 {
+                // (-MD with -E: -o names the rule's file)
+                let f = u.pick(S.mf.len > 0, S.mf, u.pick(S.out.len > 0, S.out, u.cat2(stem(orig_name(x)), ".d")));
+                deps_options(&mut av, f, obj, S.mdeps == 2);
+            } else if (S.out.len > 0) and not u.str_eq(S.out, "-") {
+                av.push("-o");
+                av.push(S.out);
+            }
+        }
+        if run_job(&av) != 0 {
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+// The name a source was given (standard input: "-", whose object is -.o).
+fn orig_name(x: In) []u8 {
+    if x.stdin {
+        return "-";
+    }
+    return x.path;
+}
+
+// -c: each source to its object (-o, or named after it in the current
+// directory). The objects' paths go to *objs.
+fn compile(srcs: []In, objs: *mut u.List.[[]u8], temp: bool) i32 {
+    if not temp and (srcs.len > 1) and (S.out.len > 0) {
+        return err("-o with -c and more than one source (each object is named after its source without -o)");
+    }
+    let mut rc: i32 = 0;
+    for x in srcs {
+        let mut obj = u.cat2(stem(orig_name(x)), ".o");
+        if temp {
+            obj = tmp_file(u.cat2(stem(orig_name(x)), ".o"));
+        } else if S.out.len > 0 {
+            obj = S.out;
+        }
+        let mut av = u.List.[[]u8].empty();
+        av.push(u.pick(S.mode == M_CHECK, "check", "build"));
+        push_source(&mut av, x, x.path);
+        source_options(&mut av);
+        if S.mode != M_CHECK {
+            av.push("--emit=obj");
+            av.push("-o");
+            av.push(obj);
+        }
+        if (S.mdeps > 0) and not (x.lang == L_ASM and u.ends(x.path, ".s")) {
+            let mut f = S.mf;
+            if f.len == 0 {
+                if temp {
+                    // (a program's: <output>-<source>.d, or <output>.d of one source)
+                    let o = u.pick(S.out.len > 0, S.out, "a.out");
+                    f = u.pick(srcs.len == 1, with_ext(o, ".d"), u.f2("%s-%s.d", with_ext(o, ""), stem(orig_name(x))));
+                } else {
+                    f = with_ext(obj, ".d");
+                }
+            }
+            deps_options(&mut av, f, u.pick(temp, u.cat2(stem(orig_name(x)), ".o"), obj), S.mdeps == 2);
+        }
+        if run_job(&av) != 0 {
+            rc = 1;
+        }
+        objs.push(obj);
+    }
+    return rc;
+}
+
+// Compiles and links: the sources, objects, libraries, -l and -L, into
+// the executable (or -shared the shared library) -o names (a.out).
+fn link(srcs: []In) i32 {
+    let mut av = u.List.[[]u8].empty();
+    av.push("build");
+    let mut objs = u.List.[[]u8].empty();
+    let separate = (S.mdeps > 0) and (srcs.len > 0);
+    if separate {
+        // (each source's rule: compiled to an object of its own first)
+        let saved = S.mode;
+        S.mode = M_OBJ;
+        let rc = compile(srcs, &mut objs, true);
+        S.mode = saved;
+        if rc != 0 {
+            return rc;
+        }
+    }
+    let mut k: usize = 0;
+    let mut have_input = false;
+    for x in S.ins.items() {
+        if (x.lang == L_C) or (x.lang == L_ASM) {
+            if separate {
+                av.push(objs.get(k));
+            } else {
+                push_source(&mut av, srcs[k], srcs[k].path);
+            }
+            k += 1;
+            have_input = true;
+        } else if x.lang == L_LINK {
+            if not u.file_exists(x.path) {
+                return err(u.f1("%s: no such file", x.path));
+            }
+            if is_object_name(x.path) {
+                av.push(x.path);
+            } else {
+                av.push(u.cat2("--link=", x.path));  // (an object by its contents: x.lo, x.so.1 ...)
+            }
+            have_input = true;
+        } else {
+            av.push(x.path);
+        }
+    }
+    if not have_input {
+        return err("no input files");
+    }
+    source_options(&mut av);
+    if S.static_ and not S.freestanding and (S.clib.len == 0 or u.str_eq(S.clib, "--c-lib=system")) and
+       system_lib_default() {
+        return err("-static: the system's C library is linked dynamically (--c-lib=axiom links a program that needs no shared library)");
+    }
+    if S.rdynamic and (S.freestanding or u.str_eq(S.clib, "--c-lib=axiom") or not system_lib_default()) {
+        warn("-rdynamic is ignored: with the compiler's C library an executable's definitions are not exported to the libraries it loads");
+    } else if S.rdynamic and linux_target() {
+        av.push("--export-dynamic");
+    }
+    if S.emit.len > 0 {
+        av.push(u.cat2("--emit=", S.emit));
+    } else if S.shared {
+        av.push("--emit=shared");
+        if not S.zdefs {
+            av.push("--allow-undefined");  // (as a cc's linker: bound when the library is loaded)
+        }
+    }
+    av.push("-o");
+    av.push(u.pick(S.out.len > 0, S.out, "a.out"));
+    return run_job(&av);
+}
+
+// An object, archive or shared library by its name (as axiom build tells
+// its inputs).
+fn is_object_name(p: []u8) bool {
+    for e in [".o", ".obj", ".a", ".lib", ".so", ".dylib", ".dll", ".tbd"] {
+        if (p.len > e.len) and u.ends(p, e) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `axiom cc args...` (args after "cc"; prog: the name for messages). The
+/// exit status: 0, or 1 after an error, as a cc's.
+pub fn run(args: [][]u8, prog: []u8) i32 {
+    S = u.new.[St]();
+    S.prog = prog;
+    let prc = parse(args);
+    if prc >= 0 {
+        return prc;
+    }
+    let lrc = linker_options();
+    if lrc != 0 {
+        return lrc;
+    }
+    if S.verbose {
+        u.eprint(u.f2("axiom cc (axiom) %s\nTarget: %s\n", ver.VERSION, triple()));
+    }
+    let mut n_inputs: usize = 0;
+    for x in S.ins.items() {
+        if x.lang != L_FLAG {
+            n_inputs += 1;
+        }
+    }
+    if n_inputs == 0 {
+        if S.asked or S.verbose {
+            return 0;
+        }
+        return err("no input files");
+    }
+    if S.mode == M_ASM {
+        return err("-S: there is no assembly output (-c writes an object; axiom build --emit=ir writes the compiler's IR)");
+    }
+    if (S.deps > 0) and (S.mode != M_PP) {
+        S.mode = M_DEPS;  // (-M and -MM: -E's preprocessing, with the rule as the output)
+    }
+    if S.dump_macros and (S.mode != M_PP) {
+        return err("-dM goes with -E");
+    }
+    let mut srcs = u.List.[In].empty();
+    let src = sources(&mut srcs);
+    if src != 0 {
+        clean();
+        return src;
+    }
+    let mut rc: i32 = 0;
+    if (S.mode == M_PP) or (S.mode == M_DEPS) {
+        rc = preprocess(srcs.items());
+    } else if (S.mode == M_OBJ) or (S.mode == M_CHECK) {
+        if srcs.len == 0 {
+            clean();
+            return err("no source among the inputs (with -c, objects and libraries are not linked)");
+        }
+        if srcs.len < n_inputs {
+            warn("the objects and libraries among the inputs are not linked (-c)");
+        }
+        let mut objs = u.List.[[]u8].empty();
+        rc = compile(srcs.items(), &mut objs, false);
+    } else {
+        rc = link(srcs.items());
+    }
+    clean();
+    return rc;
+}
