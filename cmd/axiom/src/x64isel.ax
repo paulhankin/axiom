@@ -1601,10 +1601,10 @@ pub fn gen_store(v: *mut ir.Value) void {
 // integer moves; fills with a constant byte likewise as vector stores, and
 // up to 2 KiB as a loop of them (four a time, to cache-line-aligned
 // destinations: copy_loop); forward copies (memcpy, and memmove of operands
-// the same or apart) up to 2 KiB as a loop likewise. Others are
-// rep movsb / stosb, but forward copies of at most 256 bytes (fwd_mid) and a
-// memmove's backward copy (when the destination is above the source and
-// within its length: back_copy) are loops of vectors.
+// the same or apart) up to 2 KiB as a loop likewise. Others are rep movsb /
+// stosb, but forward copies and fills of at most 256 bytes (fwd_mid,
+// fill_mid) and a memmove's backward copy (when the destination is above
+// the source and within its length: back_copy) are loops of vectors.
 pub fn gen_memop(v: *mut ir.Value) void {
     let o = v.op;
     // (a forward copy: of operands apart, or the same bytes, which a
@@ -1637,8 +1637,12 @@ pub fn gen_memop(v: *mut ir.Value) void {
     if back {
         back_copy(dst, src, n, done);
     }
-    if (o != ir.OP_MEMSET) and not is.is_c(v.c) {
-        fwd_mid(dst, src, n, done);
+    if not is.is_c(v.c) {
+        if o == ir.OP_MEMSET {
+            fill_mid(dst, src, n, done);
+        } else {
+            fwd_mid(dst, src, n, done);
+        }
     }
     _ = xsl.e2(xe.MOV_RR, 8, xsl.W(xe.RDI), xsl.R(dst));
     if o == ir.OP_MEMSET {
@@ -1694,6 +1698,43 @@ fn fwd_mid(d: i32, s: i32, n: i32, done: i32) void {
     let j = xsl.emit(xe.JCC, 0, ops[..]);
     j.cc = xe.CC_B;
     _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(tail), mc.mem(d, n, 1, -w));
+    xsl.S.vl = outer_vl;
+    xsl.jmp(done);
+    xsl.place(rest);
+}
+
+// A memset of 32 < n bytes at d to byte c (registers) of at most 256 bytes:
+// 16 bytes of c a store, from i = 0 while i < n - 16, then the last 16, and
+// on to `done`; longer ones go on (to rep stosb).
+fn fill_mid(d: i32, c: i32, n: i32, done: i32) void {
+    let rest = xsl.new_label();
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(n), xsl.I(256));
+    xsl.jcc(xe.CC_A, rest);
+    let outer_vl = xsl.S.vl;
+    xsl.S.vl = chunk_vl(16);
+    let b = xsl.vgpr();
+    let z = xsl.e2(xe.EXT, 4, xsl.W(b), xsl.R(c));
+    z.cc = 1;  // movzx8
+    let pat = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RI, 8, xsl.W(pat), xsl.I(0x0101_0101_0101_0101));
+    _ = xsl.e2(xe.IMUL, 8, xsl.RW(pat), xsl.R(b));
+    let x = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVQ_XR, xsl.W(x), xsl.R(pat));
+    xsl.sse3(xe.PUNPCKLQDQ, x, x, xsl.R(x));
+    let lim = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RR, 8, xsl.W(lim), xsl.R(n));
+    _ = xsl.alu(xe.ALU_SUB, 8, xsl.RW(lim), xsl.I(16));
+    let i = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RI, 8, xsl.W(i), xsl.I(0));
+    let top = xsl.new_label();
+    xsl.place(top);
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(x), mc.mem(d, i, 1, 0));
+    _ = xsl.alu(xe.ALU_ADD, 8, xsl.RW(i), xsl.I(16));
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(i), xsl.R(lim));
+    let ops: [6]mc.MOp = [mc.label(top), xsl.R(i), xsl.R(d), xsl.R(lim), xsl.R(x), xsl.R(n)];
+    let j = xsl.emit(xe.JCC, 0, ops[..]);
+    j.cc = xe.CC_B;
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(x), mc.mem(d, n, 1, -16));
     xsl.S.vl = outer_vl;
     xsl.jmp(done);
     xsl.place(rest);
