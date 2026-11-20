@@ -24,11 +24,11 @@
 //
 // Also (renamable): a whole slot S copied into a slot D that is not used
 // before, S not used after: D is S. And (split_copies, after scalar
-// replacement): a copy or vector load out of a slot filled piece by piece
-// is split at the pieces, each part taken from where it was written (a
-// stored value, a fill, a copy's unchanged source), since a processor cannot
-// forward several narrow stores to one wide load; then the writes of bytes
-// nothing reads go (unread_writes).
+// replacement): a copy, or a vector or integer load, out of a slot filled
+// piece by piece is split at the pieces, each part taken from where it was
+// written (a stored value, a fill, a copy's unchanged source), since a
+// processor cannot forward several narrow stores to one wide load; then the
+// writes of bytes nothing reads go (unread_writes).
 // =============================================================================
 import "ir.ax" as ir;
 import "opt.ax" as opt;
@@ -757,6 +757,84 @@ fn split_load(l: *mut ir.Value, B: *mut ir.Builder) bool {
     return true;
 }
 
+// An integer load from a slot filled in narrower pieces before it in its
+// block (a struct's 4-byte field and its padding, copied as 8 bytes): the
+// processor cannot forward the narrow store to the wide load, which waits
+// for the store to complete. The load becomes its pieces put together,
+// each taken from the store that wrote it (or loaded by itself; bytes
+// nothing writes are zero), when the pieces are 1, 2, 4 or 8 bytes wide.
+fn split_int_load(l: *mut ir.Value, B: *mut ir.Builder) bool {
+    if (l.op != ir.OP_LOAD) or (l.flags != 0) or (l.ty.kind != ir.T_INT) or (l.ty.bits < 16) or (l.ty.bits > 64) {
+        return false;
+    }
+    let r = root(l.a);
+    if u.isnil(r) or (r.kind != ir.V_INST) or (r.op != ir.OP_ALLOCA) or (r.flag == 78) {
+        return false;
+    }
+    let o = obj_of(r);
+    let mut base: i64 = 0;
+    if o.escaped or not const_off(l.a, &mut base) {
+        return false;
+    }
+    let n = @bit_cast(i64, l.ty.size);
+    let mut cuts = u.List.[i64].empty();
+    let mut ok = cuts_of(o, base, n, &mut cuts) and (cuts.len > 2);
+    // (worth it when a store in the block wrote a piece: what would stall)
+    let mut stored = false;
+    if ok {
+        for j in 0..(cuts.len - 1) {
+            let w = cuts.get(j + 1) - cuts.get(j);
+            ok = ok and (w <= 8) and ((w & (w - 1)) == 0);
+            if ok {
+                let x = exact_writer(o, cuts.get(j), cuts.get(j + 1), l);
+                stored = stored or (u.notnil(x) and (x.op == ir.OP_STORE));
+            }
+        }
+    }
+    if not ok or not stored {
+        cuts.deinit();
+        return false;
+    }
+    ir.at_before(B, l);
+    let lt = l.ty;
+    let mut v = ir.cint(lt, 0);
+    for j in 0..(cuts.len - 1) {
+        let lo = cuts.get(j);
+        let w = cuts.get(j + 1) - lo;
+        let pt = ir.t_int(@truncate(i32, w * 8));
+        let x = exact_writer(o, lo, lo + w, l);
+        let mut e = u.nil.[ir.Value]();
+        if u.isnil(x) and unwritten(o, lo, lo + w) {
+            continue;  // (bytes nothing writes: zero will do)
+        }
+        if u.notnil(x) and (x.op == ir.OP_STORE) {
+            e = x.a;
+            if e.ty.kind == ir.T_PTR {
+                e = ir.ptrtoint(B, e, pt);
+            } else if (e.ty.kind == ir.T_INT) and (e.ty.bits < pt.bits) {
+                e = ir.zext(B, e, pt);  // (a bool: a byte holding 0 or 1)
+            } else if e.ty != pt {
+                e = ir.bitcast(B, e, pt);
+            }
+        } else {
+            let q = ir.load(B, pt, ir.ptradd(B, l.a, ir.cint(ir.isz(), @bit_cast(u64, lo - base))));
+            q.align = 1;
+            e = q;
+        }
+        if pt != lt {
+            e = ir.zext(B, e, lt);
+        }
+        if lo != base {
+            e = ir.binop(B, ir.OP_SHL, e, ir.cint(lt, @bit_cast(u64, (lo - base) * 8)));
+        }
+        v = ir.or_(B, v, e);
+    }
+    ir.forward(l, v);
+    ir.remove_inst(l);
+    cuts.deinit();
+    return true;
+}
+
 threadlocal let mut SB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 threadlocal let mut marked_split: u.List.[*mut ir.Value] =
     u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
@@ -786,7 +864,7 @@ pub fn split_copies(f: *mut ir.Func) bool {
         let mut changed = false;
         for c in cs.items() {
             if c.op == ir.OP_LOAD {
-                if split_load(c, SB) {
+                if split_load(c, SB) or split_int_load(c, SB) {
                     changed = true;
                 }
             } else if split_copy(c, SB) {
