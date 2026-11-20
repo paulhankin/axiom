@@ -309,6 +309,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4149` | A GNU dialect: a `void *` compared by `==` or `!=` with a pointer to a function (under an ISO standard `C3020`, 6.5.9p2). The function pointer is converted to `void *`, as a cast converts it. |
 | `C4150` | A GNU dialect: a string literal longer than the character array it initializes (under an ISO standard `C3032`, 6.7.9p2). The array gets the first characters; the rest are dropped. |
 | `C4151` | A GNU dialect: a flexible array member that is a member of a union (under an ISO standard `C3008`, 6.7.2.1p3). It is at the union's start and adds nothing to its size. |
+| `C4152` | Under an ISO standard with `--c-lib=system`: the program uses a macro of the system's headers that defines one of the GNU dialects' keywords in the reserved namespace away (`#define __attribute__(x)`, for a compiler they take for a strict one), so what it is given is dropped (an attribute, an asm label). Once for each name. A GNU dialect, or `--c-std=gnuNN --c-iso-names` (`axiom cc -std=cNN`), has it as a keyword. |
 
 `#pragma GCC diagnostic` can hide a warning, or make it an error (with its code)
 ([`docs/c.md`](c.md), "Pragmas").

@@ -48,11 +48,14 @@ import "cast.ax" as cast;
 import "cast_dump.ax" as cdump;
 import "cgen.ax" as cg;
 import "cgen_atomic.ax" as cga;
+import "cgen_expr.ax" as cge;
 import "cgen_stmt.ax" as cgs;
 import "cgen_tls.ax" as cgt;
 import "copts.ax" as co;
 import "cparse.ax" as cparse;
 import "cpp.ax" as cpp;
+import "cpp_out.ax" as cout;
+import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
 import "csema_gbuiltin.ax" as cgbi;
 import "csema_marks.ax" as csm;
@@ -80,7 +83,8 @@ let mut g_defs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @p
 
 /// Is `emit` one of the C front end's text outputs (run makes them)?
 pub fn text_emit(emit: []u8) bool {
-    return u.str_eq(emit, "c-pp") or u.str_eq(emit, "c-tokens") or u.str_eq(emit, "c-ast");
+    return u.str_eq(emit, "c-pp") or u.str_eq(emit, "c-tokens") or u.str_eq(emit, "c-ast") or
+           u.str_eq(emit, "c-deps") or u.str_eq(emit, "c-macros");
 }
 
 /// Preprocesses, parses and analyzes the C source at `path`; true if it
@@ -211,6 +215,9 @@ pub fn lib_options(o: *co.COptions) *co.COptions {
     lo.warn_format = 1;  // (its own calls checked for what is wrong, not the level-2 matters)
     lo.defines = u.nil_slice.[co.Define]();
     lo.include_dirs = u.nil_slice.[[]u8]();
+    lo.n_isystem = 0;
+    lo.after_dirs = u.nil_slice.[[]u8]();
+    lo.includes = u.nil_slice.[[]u8]();
     lo.hosted = true;  // (its headers are all found)
     return lo;
 }
@@ -700,6 +707,45 @@ pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut i
     return ok;
 }
 
+/// --c-deps=<out> (and --c-deps-target, --c-deps-phony,
+/// --c-deps-no-system): the program unit's make rule of the files it reads
+/// is written to `out` ("-": standard output) when it is preprocessed
+/// (cpp.ax: g_deps_out).
+pub fn set_deps(out: []u8, targets: [][]u8, phony: bool, no_system: bool) void {
+    cpp.g_deps_out = out;
+    cpp.g_deps_targets.clear();
+    for t in targets {
+        cpp.g_deps_targets.push(t);
+    }
+    cpp.g_deps_phony = phony;
+    cpp.g_deps_no_system = no_system;
+}
+
+/// --c-line-markers: --emit=c-pp writes line markers (cpp_out.ax).
+pub fn set_line_markers(on: bool) void {
+    cout.g_line_markers = on;
+}
+
+/// --c-warnings=on|off|error (cpragma.ax: g_warnings).
+pub fn set_warnings(mode: []u8) bool {
+    if u.str_eq(mode, "on") {
+        cpg.g_warnings = cpg.W_SHOWN;
+    } else if u.str_eq(mode, "off") {
+        cpg.g_warnings = cpg.W_NONE;
+    } else if u.str_eq(mode, "error") {
+        cpg.g_warnings = cpg.W_ERRORS;
+    } else {
+        return false;
+    }
+    cpg.install_filter();
+    return true;
+}
+
+/// --c-wrapv: the signed integers' + - * wrap (cgen_expr.ax: g_wrapv).
+pub fn set_wrapv(on: bool) void {
+    cge.g_wrapv = on;
+}
+
 /// Is the program linked with initialization and termination arrays
 /// (cgen.ax: g_init_arrays)?
 pub fn set_init_arrays(on: bool) void {
@@ -748,6 +794,10 @@ pub fn run(path: []u8, o: *co.COptions, emit: []u8, out: []u8, json: bool) i32 {
     let mut text = u.nosym();
     if u.str_eq(emit, "c-pp") {
         text = cpp.text_of(toks.items());
+    } else if u.str_eq(emit, "c-deps") {
+        text = "";  // (written as it was preprocessed: set_deps)
+    } else if u.str_eq(emit, "c-macros") {
+        text = cpp.macros_text();
     } else if u.str_eq(emit, "c-tokens") {
         text = cpp.tokens_text(toks.items());
     } else if u.str_eq(emit, "c-ast") {
@@ -761,7 +811,9 @@ pub fn run(path: []u8, o: *co.COptions, emit: []u8, out: []u8, json: bool) i32 {
     if dg.error_count() > 0 {
         return 1;
     }
-    if out.len == 0 {
+    if u.str_eq(emit, "c-deps") {
+        // (nothing more)
+    } else if out.len == 0 {
         u.print(text);
     } else if not u.write_file(out, text) {
         dg.emit_fatal(json, "E9001", u.f1("cannot write %s", out));

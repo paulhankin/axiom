@@ -829,6 +829,27 @@ const cLinkTest = async (dir) => {
 };
 await section('', byFile(cLinkDirs, '[c-link]', cLinkTest), { parallel: true, buildOnly: true, note: buildNote });
 
+// The cc command (docs/c.md, "The cc command"): each directory of
+// cmd/axiom/internal/tests/c/cc/ is a test, natively on Linux: its test.sh
+// runs (sh, in a copy of the directory, with CC set to the compiler's
+// `cc` command, which it uses as a makefile or configure script would, OPT
+// to the suite's -O level, and CC_LIB to c/cc/lib.sh, the scripts' helpers)
+// and passes if it exits with status 0; what it prints is the report of a
+// failure. The scripts run no other C compiler.
+const cCcDir = path.join(root, 'cmd/axiom/internal/tests/c/cc');
+const cCcDirs = fs.existsSync(cCcDir) ? fs.readdirSync(cCcDir).filter((n) => fs.statSync(path.join(cCcDir, n)).isDirectory()).sort().map((n) => path.join(cCcDir, n)) : [];
+const cCcTest = async (dir) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  if (!native || noC || buildOnly || process.platform !== 'linux' || process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'Linux natively' };
+  const work = path.join(tmp, `cc-${path.basename(dir)}`);
+  fs.cpSync(dir, work, { recursive: true });
+  const env = { ...process.env, CC: `${compiler} cc`, AXIOM: compiler, CC_LIB: path.join(cCcDir, 'lib.sh'), OPT: extraFlags.find((a) => /^-O/.test(a)) || '-O0' };
+  const r = await spawnAsync('sh', ['test.sh'], { encoding: 'utf8', timeout: compileTimeout, cwd: work, env });
+  if (r.error && r.error.code === 'ETIMEDOUT') return `timed out after ${compileTimeout / 1000} s`;
+  return r.status === 0 ? null : `test.sh: exit status ${r.status}:\n${r.stdout}${r.stderr}`;
+};
+await section('', byFile(cCcDirs, '[c-cc]', cCcTest), { parallel: true });
+
 // The hosted C library (docs/c.md, "The C library"): each
 // cmd/axiom/internal/tests/c/lib/<part>/*.c is a hosted C program, built
 // with the library (and c/mix/print.ax, which print.h declares, and the

@@ -50,6 +50,7 @@ import "c/cc.ax" as cfront;
 import "c/cgen_atomic.ax" as cga;
 import "c/copts.ax" as cop;
 import "c/cstrip.ax" as cstrip;
+import "ccdrv.ax" as ccd;
 import "cgctx.ax" as cx;
 import "cgmain.ax" as cgm;
 import "cgrt.ax" as cgrt;
@@ -89,6 +90,7 @@ fn usage() void {
     u.eprint("       axiom <build|check> <file.c>... [options]   a C program (its translation units)\n");
     u.eprint("       axiom <build|check> <file.ax> <file.c>...   an Axiom program and C units, one program\n");
     u.eprint("       axiom <build|check> <file.c>... <file.ax>...   a C program and Axiom modules, one program\n");
+    u.eprint("       axiom cc [cc options] <file>...   the conventional Unix cc command line (axiom cc --help)\n");
     u.eprint("       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n");
     u.eprint("       axiom fmt <file.ax | dir>... [--check] [--stdout]   canonical layout, tidy imports\n");
     u.eprint("       axiom new <name>      create a package skeleton\n");
@@ -453,6 +455,15 @@ let mut g_own_inputs: bool = false;
 let mut g_gc_choice: i32 = -1;
 // --c-lib=system: the system's C library is the program's (docs/c.md).
 let mut g_c_lib_system: bool = false;
+// --no-package: objects and libraries alone are a C program even in a
+// package's directory (objects_program; axiom cc's links).
+let mut g_no_package: bool = false;
+// --soname=<name>: an ELF shared library's DT_SONAME (default: its file's
+// name).
+let mut g_soname: []u8 = "";
+// --c-source=<path>: the inputs that are C sources whatever their names
+// (is_c_source).
+let mut g_c_named: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 // Objects compiled from --link=<file.c> (cc_compile, own_cc_compile; removed
 // after the link).
 let mut g_cc_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
@@ -473,12 +484,16 @@ let mut g_obj_main: []u8 = "";
 // translation unit of its own, with the C start-up and library. The first
 // of them, or nosym.
 fn objects_program(o: *Options) []u8 {
-    if not u.isnos(o.input) or not u.str_eq(o.cmd, "build") or (o.ax_links.len > 0) or u.file_exists("axiom.toml") {
+    if not u.isnos(o.input) or not u.str_eq(o.cmd, "build") or (o.ax_links.len > 0) or
+       (u.file_exists("axiom.toml") and not g_no_package) {
         return u.nosym();
     }
     for k in 0..o.link_inputs.len {
-        if is_link_input(o.link_inputs.get(k)) {
-            return o.link_inputs.get(k);
+        // (by its name, or any input given with --link= that is no source:
+        // an object or library whatever its name, x.lo)
+        let p = o.link_inputs.get(k);
+        if is_link_input(p) or not (is_c_source(p) or is_ax_source(p)) {
+            return p;
         }
     }
     return u.nosym();
@@ -716,6 +731,13 @@ fn c_option(o: *mut Options, a: []u8) bool {
         o.c_args.push(a);
         return true;
     }
+    if u.starts(a, "--c-deps=") or u.starts(a, "--c-deps-target=") or u.str_eq(a, "--c-deps-phony") or
+       u.str_eq(a, "--c-deps-no-system") or u.str_eq(a, "--c-line-markers") or u.starts(a, "--c-warnings=") or
+       u.str_eq(a, "--c-wrapv") or u.starts(a, "--c-include=") or u.starts(a, "--c-isystem=") or
+       u.str_eq(a, "--c-iso-names") or u.starts(a, "--c-idirafter=") {
+        o.c_args.push(a);
+        return true;
+    }
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
        u.str_eq(a, "--c-warn-unknown-pragmas") or u.starts(a, "--c-long-double=") or u.starts(a, "--c-asm-dialect=") or
        u.starts(a, "--c-warn-format=") or u.str_eq(a, "--c-fenv-access") or u.str_eq(a, "--c-keep-null-checks") or
@@ -801,10 +823,52 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         }
         dirs.push(d);
     }
+    let mut isys = u.List.[[]u8].empty();
+    let mut after = u.List.[[]u8].empty();
+    let mut pre = u.List.[[]u8].empty();
+    let mut deps_out = "";
+    let mut deps_targets = u.List.[[]u8].empty();
+    let mut deps_phony = false;
+    let mut deps_no_system = false;
     for k in 0..o.c_args.len {
         let a = o.c_args.get(k);
         let mut ok = true;
-        if u.str_eq(a, "--c-freestanding") {
+        if u.starts(a, "--c-deps=") {
+            deps_out = a[9..];
+            ok = deps_out.len > 0;
+        } else if u.starts(a, "--c-deps-target=") {
+            deps_targets.push(a[16..]);
+        } else if u.str_eq(a, "--c-deps-phony") {
+            deps_phony = true;
+        } else if u.str_eq(a, "--c-deps-no-system") {
+            deps_no_system = true;
+        } else if u.str_eq(a, "--c-line-markers") {
+            cfront.set_line_markers(true);
+        } else if u.starts(a, "--c-warnings=") {
+            ok = cfront.set_warnings(a[13..]);
+        } else if u.str_eq(a, "--c-wrapv") {
+            cfront.set_wrapv(true);
+        } else if u.str_eq(a, "--c-iso-names") {
+            c.iso_names = true;
+        } else if u.starts(a, "--c-include=") {
+            pre.push(a[12..]);
+            ok = a.len > 12;
+        } else if u.starts(a, "--c-isystem=") {
+            let d = a[12..];
+            if not u.is_dir(d) {
+                let what = u.pick(u.file_exists(d), "is not a directory", "does not exist");
+                dg.emit_fatal(o.json, "E9001", u.f2("the include directory '%s' (--c-isystem) %s", d, what));
+                return false;
+            }
+            isys.push(d);
+        } else if u.starts(a, "--c-idirafter=") {
+            let d = a[14..];
+            if not u.is_dir(d) {
+                dg.emit_fatal(o.json, "E9001", u.f1("the include directory '%s' (--c-idirafter) does not exist", d));
+                return false;
+            }
+            after.push(d);
+        } else if u.str_eq(a, "--c-freestanding") {
             // (main.ax's: c_library)
         } else if u.str_eq(a, "--c-lib=axiom") or u.str_eq(a, "--c-lib=system") {
             // (system_lib below)
@@ -905,6 +969,10 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         dg.emit_fatal(o.json, "E9001", "--c-long must be at least --c-int");
         return false;
     }
+    if c.iso_names and not c.gnu {
+        dg.emit_fatal(o.json, "E9001", "--c-iso-names takes a GNU dialect (--c-std=gnuNN)");
+        return false;
+    }
     if has_assert and not c.gnu {
         dg.emit_fatal(o.json, "E9001",
                       "-A (an assertion) needs a GNU dialect (--c-std=gnuNN): #assert is one of its extensions");
@@ -912,6 +980,33 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     }
     c.declspec = c.gnu or win;
     c.defines = defs.items();
+    for d in isys.items() {
+        dirs.push(d);  // (after the -I directories)
+    }
+    c.n_isystem = @int_cast(i32, isys.len);
+    c.includes = pre.items();
+    c.after_dirs = after.items();
+    if u.str_eq(o.emit, "c-deps") {
+        // (the rule alone: to -o, else to standard output)
+        deps_out = u.pick(u.isnos(o.out), "-", o.out);
+    }
+    if deps_out.len > 0 {
+        if o.c_inputs.len > 0 {
+            dg.emit_fatal(o.json, "E9001", "--c-deps= takes one C source (each source's rule is its own)");
+            return false;
+        }
+        if deps_targets.len == 0 {
+            // (the object the source compiles to)
+            let base = u.basename(o.input);
+            let dot = u.rfind(base, '.');
+            let mut t = u.cat2(u.pick(dot > 0, base[0..@int_cast(usize, @max(dot, 0))], base), ".o");
+            if u.str_eq(o.emit, "obj") and not u.isnos(o.out) {
+                t = o.out;
+            }
+            deps_targets.push(t);
+        }
+        cfront.set_deps(deps_out, deps_targets.items(), deps_phony, deps_no_system);
+    }
     c.include_dirs = dirs.items();
     c.sys_include = u.cat2(o.std_dir, "/c/include");
     c.hosted = not o.c_freestanding;
@@ -1035,6 +1130,11 @@ fn system_c_lib(o: *Options, c: *mut cop.COptions, dirs: *mut u.List.[[]u8]) boo
 // Is `path` a C source (its name ends in .c), or an assembly source (.s,
 // .S: a translation unit of a C program too, cfront.check_asm)?
 fn is_c_source(path: []u8) bool {
+    for p in g_c_named.items() {
+        if u.str_eq(p, path) {
+            return true;
+        }
+    }
     return ((path.len > 2) and u.ends(path, ".c")) or cfront.is_asm_source(path);
 }
 
@@ -1243,6 +1343,27 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             o.ax_links.push(a[7..]);  // Axiom source: part of the program
         } else if u.starts(a, "--link=") {
             o.link_inputs.push(a[7..]);
+        } else if u.starts(a, "--soname=") and (a.len > 9) {
+            g_soname = a[9..];
+        } else if u.starts(a, "--version-script=") and (a.len > 17) {
+            el.g_version_script = a[17..];
+        } else if u.str_eq(a, "--no-package") {
+            g_no_package = true;  // (axiom cc: objects alone are a C program, axiom.toml or not)
+        } else if u.str_eq(a, "--allow-undefined") {
+            el.g_allow_undefined = true;
+        } else if u.str_eq(a, "--export-dynamic") {
+            el.g_export_dynamic = true;
+        } else if u.starts(a, "--rpath=") and (a.len > 8) {
+            el.add_runpath(a[8..]);
+        } else if u.starts(a, "--c-source=") and (a.len > 11) {
+            // (an input that is a C source whatever its name)
+            let p = a[11..];
+            g_c_named.push(p);
+            if u.isnos(o.input) {
+                o.input = p;
+            } else {
+                o.c_inputs.push(p);
+            }
         } else if u.starts(a, "--emit-header=") {
             o.header_path = a[14..];
         } else if o.testing and u.starts(a, "--filter=") {
@@ -2181,6 +2302,9 @@ fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
 // the units define and nothing reaches (c/cstrip.ax).
 fn set_strip(o: *Options) void {
     cx.g_strip = u.str_eq(o.emit, "exe") and (((o.link_inputs.len == 0) and (o.link_flags.len == 0)) or g_own_inputs);
+    if el.g_export_dynamic and g_c_lib_system {
+        cx.g_strip = false;  // (--export-dynamic: every definition, for the libraries the program loads)
+    }
     // (code the platform's compilers made may be linked with the program's,
     // by the system's linker or by ours (g_own_inputs): the C atomics that
     // are not lock-free use the standard out-of-line interface, whose
@@ -2469,7 +2593,7 @@ fn link_shared(o: *Options, objpath: []u8) i32 {
     el.g_shlibs = linkin.g_shlibs;
     el.g_search_dirs = linkin.g_dirs;
     el.g_c_lib_axiom = false;
-    el.g_soname = u.basename(o.out);
+    el.g_soname = u.pick(g_soname.len > 0, g_soname, u.basename(o.out));
     if el.link_shared(os.items(), ob.machine, names.items(), o.out) != 0 {
         return fatal(o.json, "E9004", "linking failed");
     }
@@ -2883,6 +3007,12 @@ fn link_cc(o: *mut Options, objpath: []u8, rc: *mut i32) i32 {
 
 fn driver(args: [][]u8) i32 {
     u.phase("start");
+    if (args.len >= 1) and ccd.is_cc_name(args[0]) {
+        return ccd.run(args[1..], "axcc");  // (the compiler installed as axcc: axiom cc)
+    }
+    if (args.len >= 2) and u.str_eq(args[1], "cc") {
+        return ccd.run(args[2..], "axiom cc");
+    }
     if args.len < 2 {
         usage();
         return 2;

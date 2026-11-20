@@ -112,6 +112,28 @@ pub fn needs_space(a: []u8, akind: i32, b: []u8) bool {
     return false;
 }
 
+/// --c-line-markers: the preprocessed text has line markers (`# 12
+/// "file"`), which keep the tokens on their presumed lines and files: read
+/// again (in a GNU dialect), its diagnostics name the original lines.
+pub let mut g_line_markers: bool = false;
+/// Under an ISO standard, which has no line markers, they are written as
+/// `#line 12 "file"` (the preprocessor sets it).
+pub let mut g_line_directive: bool = false;
+
+// A file name in a line marker: a string literal's characters.
+fn marker_name(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    b.c('"');
+    for c in s {
+        if (c == '"') or (c == '\\') {
+            b.c('\\');
+        }
+        b.c(c);
+    }
+    b.c('"');
+    return b.done();
+}
+
 /// The text of the tokens, one source line to a line; the pragmas'
 /// lines (#pragma, then the text) before the tokens at their positions.
 pub fn text(toks: []ct.Token, pragmas: []cpg.Line) []u8 {
@@ -120,24 +142,47 @@ pub fn text(toks: []ct.Token, pragmas: []cpg.Line) []u8 {
     let mut pk: i32 = 0;
     let mut ptext = "";
     let mut np: usize = 0;
+    // (with line markers: the presumed file and line being written)
+    let mut cur_file = "";
+    let mut out_line: i64 = 0;
     for k in 0..toks.len {
         let t = &toks[k];
         let mut bol = t.bol;
         while (np < pragmas.len) and (pragmas[np].pos <= k) {
             if have {
                 b.c('\n');
+                out_line += 1;
             }
             b.s(u.cat2("#pragma ", pragmas[np].text));
             have = true;
             bol = true;
             np += 1;
+            cur_file = "";  // (the next token on a line of its own, after a line marker)
         }
         if (t.kind == ct.T_EOF) or (t.text.len == 0) {
             continue;
         }
-        if have {
+        if g_line_markers and (bol or not have) {
+            let pr = u.presumed(t.span);
+            if not have or not u.str_eq(pr.name, cur_file) or (pr.line < out_line) or (pr.line > (out_line + 8)) {
+                if have {
+                    b.c('\n');
+                }
+                b.s(u.f3("#%s %s %s\n", u.pick(g_line_directive, "line", ""), u.dec(pr.line), marker_name(pr.name)));
+                cur_file = pr.name;
+                out_line = pr.line;
+            } else if pr.line == out_line {
+                b.c(' ');  // (another line's tokens from one line: a macro's invocation)
+            } else {
+                while out_line < pr.line {
+                    b.c('\n');
+                    out_line += 1;
+                }
+            }
+        } else if have {
             if bol {
                 b.c('\n');
+                out_line += 1;
             } else if t.space or needs_space(ptext, pk, t.text) {
                 b.c(' ');
             }
