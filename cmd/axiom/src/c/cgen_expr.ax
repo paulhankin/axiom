@@ -2013,6 +2013,12 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     for i in 0..n {
         vs[i] = rv(e.args.get(i));
     }
+    if (n == 3) and not tg.is_wasm() and lib_func(fe, "memcmp") and ir.is_cint(vs[2]) {
+        let k = ir.cint_val(vs[2]);
+        if (k == 1) or (k == 2) or (k == 4) or (k == 8) {
+            return small_memcmp(vs[0], vs[1], k, cg.lty(e.ty));
+        }
+    }
     let lm = lib_memop(fe, n);
     if lm != 0 {
         if lm == ir.OP_MEMSET {
@@ -2130,6 +2136,52 @@ fn lib_memop(fe: *cast.Expr, n: usize) i32 {
         }
     }
     return op;
+}
+
+// Is fe (a call's callee) the C library's function `name` in a hosted
+// program, declared as the library does (a prototype, not defined in the
+// unit, not in the library's own definition of it)?
+fn lib_func(fe: *cast.Expr, name: []u8) bool {
+    if not cs.opts().hosted or (fe.kind != cast.ExprKind.CAST) or (fe.op != cast.CV_FDECAY) or
+       (fe.a.kind != cast.ExprKind.IDENT) or u.isnil(fe.a.sym) {
+        return false;
+    }
+    let s = fe.a.sym;
+    if (s.kind != cast.SK_FUNC) or (s.linkage != cast.LK_EXTERNAL) or (s.asm_name.len != 0) or s.defined or
+       u.notnil(s.nest_parent) or not u.str_eq(s.name, name) or not fe.ty.elem.proto {
+        return false;
+    }
+    return u.isnil(cg.F) or u.isnil(cg.F.sym) or not u.str_eq(cg.F.sym.name, name);
+}
+
+// memcmp(a, b, k) of a constant k of 1, 2, 4 or 8 bytes (the C library's,
+// lib_func; natively: WebAssembly has no byte swap): the bytes loaded as one integer each, in big-endian order (the
+// first byte the most significant), and compared: the difference of the
+// bytes for one, else -1, 0 or 1 (memcmp's sign is all C says of it), of
+// type rt (int).
+fn small_memcmp(a: *mut ir.Value, b: *mut ir.Value, k: u64, rt: *mut ir.Ty) *mut ir.Value {
+    let t = ir.t_int(@truncate(i32, @bit_cast(i64, k * 8)));
+    let x = ir.load(cg.B, t, a);
+    x.align = 1;
+    let y = ir.load(cg.B, t, b);
+    y.align = 1;
+    if k == 1 {
+        return ir.sub(cg.B, ir.zext(cg.B, x, rt), ir.zext(cg.B, y, rt));
+    }
+    // (two bytes: swapped as 32-bit integers, the low half zero in both)
+    let mut st = t;
+    let mut xs: [1]*mut ir.Value = [x];
+    let mut ys: [1]*mut ir.Value = [y];
+    if k == 2 {
+        st = ir.t_int(32);
+        xs[0] = ir.zext(cg.B, x, st);
+        ys[0] = ir.zext(cg.B, y, st);
+    }
+    let bx = ir.intr(cg.B, ir.IN_BSWAP, st, xs[..]);
+    let by = ir.intr(cg.B, ir.IN_BSWAP, st, ys[..]);
+    let gt = ir.zext(cg.B, ir.icmp(cg.B, ir.IntUGT, bx, by), rt);
+    let lt = ir.zext(cg.B, ir.icmp(cg.B, ir.IntULT, bx, by), rt);
+    return ir.sub(cg.B, gt, lt);
 }
 
 // A <complex.h> builtin (csema_builtin.ax) of the argument values vs.
