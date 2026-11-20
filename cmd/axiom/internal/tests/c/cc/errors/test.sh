@@ -26,6 +26,12 @@ fails $CC -nostdlib good.c
 fails $CC -fsanitize=address good.c
 fails $CC -fshort-enums -c good.c
 fails $CC -m32 -c good.c
+for m in -mno-red-zone -mgeneral-regs-only -mno-sse -mno-sse2 -mcmodel=kernel; do
+    fails $CC $m -c good.c
+    has fails.out "$m"
+done
+fails $CC -Wl,-T,script.ld good.c
+has fails.out "-T script.ld"
 fails $CC -Wl,--wrap=malloc good.c
 has fails.out "--wrap=malloc"
 fails $CC -E good.c bad.c -o both.i

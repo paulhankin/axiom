@@ -133,8 +133,10 @@ objects and archives define no `main` is `C3063`.
 | `--c-warnings=on\|off\|error` | What becomes of the front end's warnings that the pragmas leave: shown (the default), none shown, or errors. |
 | `--c-wrapv` | Signed `+`, `-` and `*` wrap in two's complement: the optimizer is not told they do not overflow. |
 | `--c-deps=file` | The source's make rule of the files it reads (the source, then each header once, in the order first read) is written to file (`-`: standard output) as it is preprocessed; one source. `--c-deps-target=t` names the rule's target (repeatable, written as given; default the object, `x.o` or `-o`'s with `--emit=obj`), `--c-deps-phony` adds a rule without prerequisites for each header, `--c-deps-no-system` leaves out the system's headers (the compiler's, the system C library's, `--c-isystem`'s). |
-| `--c-line-markers` | `--emit=c-pp` writes line markers (`# 12 "file"`), which keep each token on its presumed file and line; a GNU dialect reads them as `#line` (flags after the name are ignored). |
+| `--c-line-markers` | `--emit=c-pp` writes line markers, which keep each token on its presumed file and line: `# 12 "file"` in a GNU dialect, which reads them back as `#line` (flags after the name are ignored), and `#line 12 "file"` under an ISO standard. |
 | `--c-source=path` | `path` is a C source whatever its name (`x.i`, `x.inc`). |
+| `--c-idirafter=dir` | A directory of headers searched after the system's and the compiler's (a system header's directory for `--c-deps-no-system`). |
+| `--c-iso-names` | With a GNU dialect: the names an ISO program may use are its own: the dialect's keywords outside the reserved namespace (`asm`, `typeof` before C23, gnu89's `inline`) are identifiers, `unix` and `linux` are not defined, and `__STRICT_ANSI__` is 1; the extensions (`__attribute__`, `__asm__`, `__typeof__`, statement expressions, ...) stay. It is a conventional cc's `-std=cNN`. |
 
 `-D`, `-U`, `-A` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: `axiom build` has no `-W...`, `-std=`, `-c` or
@@ -265,23 +267,25 @@ to every build as it is, and changes a default.
 
 | Options | |
 |---|---|
-| `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; `-v` writes the version and each build's command to standard error, `-###` the commands without running them. |
-| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` and `-idirafter` as `--c-isystem`, `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
-| `-std=`, `-ansi` | `--c-std=` (`c89`, `c90`, `iso9899:1990`, `iso9899:199409`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `gnu89` ... `gnu2x`, `gnu23`); `-ansi` is `c89`. With the system's C library the standard must be C99 or later. |
+| `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version and each build's command to standard error, `-###` the commands without running them. |
+| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
+| `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later. |
 | `-O0` ... `-O3`, `-O`, `-Os`, `-Oz`, `-Og`, `-Ofast` | `-O` and `-Og` are `-O1`, `-Os` and `-Oz` `-O2`, `-Ofast` and above 3 `-O3` (no fast-math: the arithmetic stays IEEE 754's). |
 | `-g`, `-g2`, `-g3`, `-ggdb`, `-gdwarf-N`; `-g1`; `-g0` | `-g` (full); `--debug-info=lines`; none. Other `-g...` are accepted. |
 | `-w`, `-Werror`, `-Wno-error`, `-Wall`, `-Wunknown-pragmas`, `-Wformat=2`, `-Wno-format` | `--c-warnings=off`, `=error`, `=on`; `--c-warn-unknown-pragmas` (as `-Wall` has it); `--c-warn-format=2`, `=0`. Every other `-W...` is accepted (`-Werror=x` too): the front end's warnings have no groups of those names. |
 | `-fPIC`, `-fpic`, `-fPIE`, `-fpie`; `-fno-pic` ... | `--pic` (the default on Linux); not. |
 | `-funsigned-char`, `-fsigned-char` | `--c-char=`. |
 | `-fwrapv`, `-fno-strict-overflow` | `--c-wrapv`. |
+| `-fno-delete-null-pointer-checks` | `--c-keep-null-checks`. |
+| `-frounding-math` | `--c-fenv-access`. |
 | `-ffreestanding` | `--c-freestanding` (then no C library). |
 | `-ffunction-sections`, `-fdata-sections` | The options of the same names. |
 | `-fopenmp`, `-fsanitize=...`, `-fprofile-arcs`, `-ftest-coverage`, `-fshort-enums`, `-fshort-wchar`, `-fpack-struct`, `-funsigned-bitfields`, a character set other than UTF-8 | Errors: the program would not be what they ask. Every other `-f...` is accepted, and changes nothing (`-fno-common`, `-fvisibility=`, `-fno-builtin`, `-fno-strict-aliasing`, which the optimizer never assumes, `-fstack-protector`, `-fomit-frame-pointer` ...). |
-| `-march=cpu`, `-mcpu=cpu`, `-m<ext>`, `-mno-<ext>` | `--cpu=` (`native`, or one of `--cpu`'s names; `x86-64` and `armv8-a` are the baseline); `--features=+ext`, `-ext` for an extension of `--features`' names (`-msse4.2`, `-mavx2`). `-m64`, `-mtune=` and the like are accepted; `-m32`, `-mx32`, `-mabi=`, `-mlong-double-...` (another ABI) are errors; another `-m...` is ignored with a warning. |
+| `-march=cpu`, `-mcpu=cpu`, `-m<ext>`, `-mno-<ext>` | `--cpu=` (`native`, or one of `--cpu`'s names; `x86-64` and `armv8-a` are the baseline); `--features=+ext`, `-ext` for an extension of `--features`' names (`-msse4.2`, `-mavx2`). `-m64`, `-mtune=` and the like are accepted; `-m32`, `-mx32`, `-mabi=`, `-mlong-double-...` (another ABI), and the options that ask for code this compiler does not make (`-mno-red-zone`, `-mgeneral-regs-only`, `-mno-sse`, `-mno-sse2`, `-mno-mmx`, `-mno-80387`, `-mcmodel=` other than `small`, `-mregparm`, `-mretpoline`, `-mstrict-align` ...) are errors; another `-m...` is ignored with a warning. |
 | `-pthread` | `-D_REENTRANT` (the threads are in the C library). |
 | `-l`, `-L`, `-shared`, `-static`, `-rdynamic` | As `axiom build`'s (`-L` of a directory that does not exist is skipped); `-shared` is `--emit=shared` (and `--pic`); `-static` is an error with the system's C library, which is linked dynamically (with `--c-lib=axiom` a program that needs no shared library is a static executable anyway); `-rdynamic` is `--export-dynamic` (with the system's C library). |
-| `-Wl,a,b`, `-Xlinker a`, and the GNU linker's options the shared-library build scripts give a cc they do not know (`-soname x`, `-rpath d`, `-version-script f`, `--no-undefined` ...) | `-soname`, `-h`: `--soname=`; `-rpath`, `-R`: `--rpath=`; `--version-script`: `--version-script=`; `-E`, `--export-dynamic`: as `-rdynamic`; `--gc-sections`; `-L`, `-l` and inputs; `-z defs` and `--no-undefined`: a shared library's undefined references are errors (by default they are left to the dynamic linker: `--allow-undefined`, as a cc's linker leaves them). Options that change nothing here are accepted (`--as-needed`, `-O1`, `-z relro`, `-z now`, `--hash-style=`, `--build-id`, `-Bsymbolic`, `--start-group` ...); the others are errors (`--wrap=`, `--whole-archive`, `-T`, ...). |
-| `-M`, `-MM`, `-MD`, `-MMD`, `-MF file`, `-MT target`, `-MQ target`, `-MP`, `-MG` | The make rules of the headers read (`--c-deps`): `-M` and `-MM` (without the system's headers) write the rule alone, to `-MF`'s file, else `-o`'s, else standard output; `-MD` and `-MMD` with the compilation, to `-MF`'s file, else the object's name with `.d` (`-c x.c -o obj/x.o`: `obj/x.d`; a program `prog` of one source: `prog.d`, of several: `prog-x.d` for each). The target is the object (`x.o`, `-o`'s), or `-MT`'s (as given) and `-MQ`'s (quoted for make: `$` as `$$`); `-MP` adds a rule for each header. `-MG` is accepted (a header not found stays an error). |
+| `-Wl,a,b`, `-Xlinker a`, and the GNU linker's options the shared-library build scripts give a cc they do not know (`-soname x`, `-rpath d`, `-version-script f`, `--no-undefined` ...) | `-soname`, `-h`: `--soname=`; `-rpath`, `-R`: `--rpath=`; `--version-script`: `--version-script=`; `-E`, `--export-dynamic`: as `-rdynamic`; `--export-dynamic-symbol s` and `--dynamic-list f`: as `-rdynamic` (every definition exported, theirs among them); `--gc-sections`; `-L`, `-l` and inputs; `-z defs` and `--no-undefined`: a shared library's undefined references are errors (by default they are left to the dynamic linker: `--allow-undefined`, as a cc's linker leaves them). Options that change nothing here are accepted (`--as-needed`, `-O1`, `-z relro`, `-z now`, `--hash-style=`, `--build-id`, `-Bsymbolic`, `--start-group` ...); the others are errors (`--wrap=`, `--whole-archive`, `-T`, ...). |
+| `-M`, `-MM`, `-MD`, `-MMD`, `-MF file`, `-MT target`, `-MQ target`, `-MP`, `-MG` | The make rules of the headers read (`--c-deps`): `-M` and `-MM` (without the system's headers) write the rule alone, to `-MF`'s file, else `-o`'s, else standard output; `-MD` and `-MMD` with the compilation, to `-MF`'s file, else the object's name with `.d` (`-c x.c -o obj/x.o`: `obj/x.d`; a program `-o prog` of one source: `prog.d`, of several: `prog-x.d` for each; without `-o`, `x.d` for each source; with `-E`, `-o`'s name with `.d`, the text going to `-o`). The files `#embed` reads are among the headers. The target is the object (`x.o`, `-o`'s), or `-MT`'s (as given) and `-MQ`'s (quoted for make: `$` as `$$`); `-MP` adds a rule for each header. `-MG` is accepted (a header not found stays an error). |
 | `--version`, `-dumpversion`, `-dumpmachine`, `-print-prog-name=p`, `-print-file-name=f`, `-print-search-dirs`, `-print-multiarch`, `-print-multi-os-directory` | The questions configure scripts ask: the compiler's version; the target's triple (`x86_64-linux-gnu`); `p` itself (there are no programs of the compiler's own); `f`'s path in the library directories, else `f`; ... |
 | `-pipe`, `-pedantic`, `-save-temps`, `-C`, `-B...`, `-Wa,...`, `-static-libgcc`, `-pie`, `-no-pie`, `-s` | Accepted; nothing changes. |
 | `-nostdlib`, `-nostartfiles`, `-nodefaultlibs`, `-nostdinc`, `-undef`, `-imacros`, `-traditional`, `-H`, `-dD`, `--sysroot`, `-u`, `-T` | Errors: not supported. |
@@ -301,15 +305,22 @@ compiler: `__GNUC__`, `__clang__` and `__VERSION__` are not defined (a GNU diale
 say what works), so a configure script finds a compiler that is not the GNU one ("whether
 the compiler supports GNU C... no") and takes its generic paths: a probe of a feature
 (`__STDC_VERSION__`, a header, a type's size, a function in `-lm`) answers as for any cc.
-Code that uses `__attribute__` only under `#ifdef __GNUC__` leaves its attributes out:
-most change no program's meaning, but a `packed` or `aligned` left out so changes a
-structure's layout (test `__has_attribute(packed)` instead).
+Code that uses `__attribute__` only under `#ifdef __GNUC__` leaves its attributes out,
+and many of them change what the program is: `packed` and `aligned` a structure's
+layout, `constructor`, `cleanup`, `weak`, `section`, `visibility` what runs and what is
+linked. Such code should test `__has_attribute(packed)` (or `__AXIOM_GNU__`) instead;
+`__attribute__` itself is a keyword in every mode `axiom cc`'s `-std=` gives (but strict
+C95's), so a program's attributes outside such tests are not dropped.
 
 **Known differences.** `-fvisibility=hidden` is accepted and does nothing (a shared
 library exports its definitions of default visibility; a version script, or the attribute
-`visibility`, limits them). `-iquote` directories are searched for `<...>` too. With
+`visibility`, limits them). A shared library's own calls and references to its
+definitions may be bound to them when it is compiled (its functions inlined or called
+directly, as with `-Bsymbolic`), so a program's definition of the same name does not
+interpose them everywhere. `-iquote` directories are searched for `<...>` too. With
 `--c-lib=axiom`, `-rdynamic` does nothing (a warning). C89 and gnu89 need
-`--c-lib=axiom` (the system's headers need C99).
+`--c-lib=axiom` (the system's headers need C99), and `-std=c89`, a GNU dialect then,
+accepts `//` comments.
 
 ## Several source files
 
@@ -2084,7 +2095,10 @@ work left undone:
   and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
   expressions, `?:` with an omitted middle operand, case ranges, computed `goto` and labels
   as values, `__builtin_*` functions other than those below ("Reserved identifiers"),
-  `#include_next`, `#ident`.
+  `#include_next`, `#ident`. With `--c-lib=system`, whose headers define
+  `__attribute__` and the like away for a compiler they take for a strict one, a use of
+  such a macro in the program is the warning `C4152` (the attribute would be dropped);
+  `--c-std=gnuNN --c-iso-names` (`axiom cc -std=cNN`) keeps them.
 - Under an ISO standard, for the same reason: `#import`, `#assert`, `#unassert`,
   `#if #pred(answer)` and `-A`, and `__declspec` but when the target is Windows (whose
   headers use it: there it is a keyword in every mode, a name reserved to the

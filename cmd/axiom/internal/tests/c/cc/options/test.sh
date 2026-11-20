@@ -31,6 +31,23 @@ has fails.out "error"
 run $CC -w -Werror -c warn.c -o w.o 2> err
 [ -s err ] && fail "-w: $(cat err)"
 run $CC -Werror -Wno-error -c warn.c -o w.o 2> err
+# -std=cNN keeps __attribute__ and the other reserved extensions (as -std=gnuNN)
+for s in -std=c99 -std=c11 -std=c17 -std=iso9899:2018; do
+    run $CC $OPT $s attrs.c -o attrs
+    ./attrs > got
+    same got "5 64 1 3"
+done
+# axiom build's ISO standard with the system's library: the headers' macro
+# that drops the attribute is a warning where the program uses it
+"$AXIOM" build attrs.c --target=native --c-lib=system --c-std=c11 --emit=obj -o attrs.o 2> err
+has err "warning[C4152]: '__attribute__'"
+# -fno-delete-null-pointer-checks, -frounding-math
+run $CC -O2 -fno-delete-null-pointer-checks nonnull.c -o nonnull
+./nonnull > got
+same got "-1"
+run $CC -O2 -frounding-math round.c -o round -lm
+./round > got
+same got "1"
 # the questions
 run $CC --version > got
 has got "axiom"

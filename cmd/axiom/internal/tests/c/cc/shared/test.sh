@@ -16,6 +16,25 @@ same got "50
 run $CC $OPT main.c -Llib -ldemo -ldl -Wl,-rpath,"$PWD/lib" -o prog2
 ./prog2 > got || fail "prog2: $(cat got)"
 same got "50"
+# version scripts: words split at ':' too, a name itself decides before a
+# pattern, malformed ones are errors
+exports() {
+    run $CC -shared vs.c -Wl,--version-script=v.map -o v.so
+    readelf --dyn-syms v.so | awk '$7 != "UND" && $8 != "" && NR > 3 { print $8 }' | sort | tr '\n' ' ' > got
+    [ "$(cat got)" = "$1 " ] || fail "$(cat v.map): exports '$(cat got)', expected '$1'"
+}
+if command -v readelf > /dev/null; then
+    printf '{ global:g; local: *; };\n' > v.map; exports "g"
+    printf '{global:g;h;local:*;};\n' > v.map; exports "g h"
+    printf 'V1 { global: f*; local: fp; *; };\n' > v.map; exports "fq"
+    run $CC $OPT ex.c -Wl,--export-dynamic-symbol,exported_one -o ex
+    readelf --dyn-syms ex | grep -q exported_one || fail "--export-dynamic-symbol: not exported"
+fi
+for bad in '{ global: g' '{ global: g; ' 'V1 { g; } ' '{ extern "C++" { x; }; };' 'g;'; do
+    printf '%s\n' "$bad" > v.map
+    fails $CC -shared vs.c -Wl,--version-script=v.map -o v.so
+    has fails.out "version script"
+done
 # -Wl,-z,defs: the library's undefined reference is an error then
 fails $CC -shared -Wl,-z,defs lib.o -o lib/strict.so
 exit 0

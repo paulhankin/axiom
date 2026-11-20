@@ -104,16 +104,10 @@ let mut vs_read: bool = false;
 let mut vs_global: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 let mut vs_local: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 
-// Reads the version script's patterns (vs_global, vs_local); false if it
-// cannot be read.
-fn read_version_script() bool {
-    vs_read = true;
-    let text = u.read_file(g_version_script);
-    if u.isnos(text) {
-        nl.err(u.f1("cannot read the version script %s", g_version_script));
-        return false;
-    }
-    let mut local = false;
+// The words of a version script: `{`, `}`, `;` and `:` each one, the others
+// runs of other characters (comments, /* */ and #, are none).
+fn vs_words(text: []u8) u.List.[[]u8] {
+    let mut ws = u.List.[[]u8].empty();
     let mut i: usize = 0;
     while i < text.len {
         let c = text[i];
@@ -131,38 +125,116 @@ fn read_version_script() bool {
             }
             continue;
         }
-        if (c == '{') or (c == '}') {
-            local = false;  // (a node's lists start global)
+        if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') {
             i += 1;
             continue;
         }
-        if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') or (c == ';') {
+        if (c == '{') or (c == '}') or (c == ';') or (c == ':') {
+            ws.push(text[i..i + 1]);
             i += 1;
             continue;
         }
         let start = i;
         while (i < text.len) and
               not ((text[i] == ' ') or (text[i] == '\t') or (text[i] == '\n') or (text[i] == '\r') or
-                   (text[i] == ';') or (text[i] == '{') or (text[i] == '}')) {
+                   (text[i] == ';') or (text[i] == '{') or (text[i] == '}') or (text[i] == ':') or (text[i] == '#')) {
             i += 1;
         }
-        let w = text[start..i];
-        if u.str_eq(w, "global:") {
-            local = false;
-        } else if u.str_eq(w, "local:") {
-            local = true;
-        } else if (i < text.len) and (text[i] == '{') {
-            // (a version node's name)
-        } else if local {
-            vs_local.push(w);
-        } else {
-            vs_global.push(w);
+        ws.push(text[start..i]);
+    }
+    return ws;
+}
+
+// Reads the version script's patterns (vs_global, vs_local); false (with
+// the link's error) if it cannot be read or is not one: nodes `name { ... }
+// [deps] ;` (the name may be left out for one node), whose lists are
+// `global:` and `local:` and patterns each ended by `;`.
+fn read_version_script() bool {
+    vs_read = true;
+    let text = u.read_file(g_version_script);
+    if u.isnos(text) {
+        nl.err(u.f1("cannot read the version script %s", g_version_script));
+        return false;
+    }
+    let ws = vs_words(text).items();
+    let bad = u.f1("the version script %s is malformed: ", g_version_script);
+    let mut i: usize = 0;
+    while i < ws.len {
+        // a node: [name] { ... } [deps] ;
+        if not u.str_eq(ws[i], "{") {
+            if u.str_eq(ws[i], ";") or u.str_eq(ws[i], "}") or u.str_eq(ws[i], ":") or ((i + 1) >= ws.len) or
+               not u.str_eq(ws[i + 1], "{") {
+                nl.err(u.cat3(bad, "expected a version node ('name {' or '{'), found ", ws[i]));
+                return false;
+            }
+            i += 1;
         }
+        i += 1;  // ({)
+        let mut local = false;
+        let mut closed = false;
+        while i < ws.len {
+            let w = ws[i];
+            if u.str_eq(w, "}") {
+                closed = true;
+                i += 1;
+                break;
+            }
+            if (u.str_eq(w, "global") or u.str_eq(w, "local")) and ((i + 1) < ws.len) and u.str_eq(ws[i + 1], ":") {
+                local = u.str_eq(w, "local");
+                i += 2;
+                continue;
+            }
+            if u.str_eq(w, "extern") {
+                nl.err(u.cat2(bad, "extern blocks (of another language's names) are not supported"));
+                return false;
+            }
+            if u.str_eq(w, "{") or u.str_eq(w, ";") or u.str_eq(w, ":") {
+                nl.err(u.cat3(bad, "expected a symbol pattern, found ", w));
+                return false;
+            }
+            if ((i + 1) >= ws.len) or not u.str_eq(ws[i + 1], ";") {
+                nl.err(u.f2("%sthe pattern %s is not followed by ';'", bad, w));
+                return false;
+            }
+            if local {
+                vs_local.push(w);
+            } else {
+                vs_global.push(w);
+            }
+            i += 2;
+        }
+        if not closed {
+            nl.err(u.cat2(bad, "a version node has no closing '}'"));
+            return false;
+        }
+        // (the versions it depends on), then ;
+        while (i < ws.len) and not u.str_eq(ws[i], ";") {
+            if u.str_eq(ws[i], "{") or u.str_eq(ws[i], "}") or u.str_eq(ws[i], ":") {
+                nl.err(u.cat3(bad, "expected ';' after a version node, found ", ws[i]));
+                return false;
+            }
+            i += 1;
+        }
+        if i >= ws.len {
+            nl.err(u.cat2(bad, "a version node is not followed by ';'"));
+            return false;
+        }
+        i += 1;
     }
     return true;
 }
 
-// Does name match glob pattern p (* and ?)?
+// Is pattern p a glob (with *, ? or [)?
+fn is_glob(p: []u8) bool {
+    for c in p {
+        if (c == '*') or (c == '?') or (c == '[') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Does name match glob pattern p (* and ?, [set] and [a-z]; [!set])?
 fn glob_match(p: []u8, name: []u8) bool {
     if p.len == 0 {
         return name.len == 0;
@@ -178,14 +250,41 @@ fn glob_match(p: []u8, name: []u8) bool {
     if name.len == 0 {
         return false;
     }
+    if p[0] == '[' {
+        let mut j: usize = 1;
+        let neg = (j < p.len) and (p[j] == '!');
+        if neg {
+            j += 1;
+        }
+        let mut hit = false;
+        let first = j;
+        while (j < p.len) and ((p[j] != ']') or (j == first)) {
+            if ((j + 2) < p.len) and (p[j + 1] == '-') and (p[j + 2] != ']') {
+                if (name[0] >= p[j]) and (name[0] <= p[j + 2]) {
+                    hit = true;
+                }
+                j += 3;
+            } else {
+                if name[0] == p[j] {
+                    hit = true;
+                }
+                j += 1;
+            }
+        }
+        if j >= p.len {
+            return (p[0] == name[0]) and glob_match(p[1..], name[1..]);  // (no ']': a '[' of its own)
+        }
+        return (hit != neg) and glob_match(p[j + 1..], name[1..]);
+    }
     if (p[0] == '?') or (p[0] == name[0]) {
         return glob_match(p[1..], name[1..]);
     }
     return false;
 }
 
-// Does the version script let a shared library export `name` (a global
-// pattern matches it, or no local one does)?
+// Does the version script let a shared library export `name`? A pattern
+// that is the name itself decides first (global: exported, local: not),
+// then a glob that matches it (global first), else it is exported.
 fn script_exports(name: []u8) bool {
     if g_version_script.len == 0 {
         return true;
@@ -194,12 +293,22 @@ fn script_exports(name: []u8) bool {
         return true;
     }
     for p in vs_global.items() {
-        if glob_match(p, name) {
+        if not is_glob(p) and u.str_eq(p, name) {
             return true;
         }
     }
     for p in vs_local.items() {
-        if glob_match(p, name) {
+        if not is_glob(p) and u.str_eq(p, name) {
+            return false;
+        }
+    }
+    for p in vs_global.items() {
+        if is_glob(p) and glob_match(p, name) {
+            return true;
+        }
+    }
+    for p in vs_local.items() {
+        if is_glob(p) and glob_match(p, name) {
             return false;
         }
     }

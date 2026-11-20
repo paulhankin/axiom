@@ -414,10 +414,35 @@ fn next_replaced(P: *mut PP) lx.PTok {
             t.noexpand = true;
             return t;
         }
+        if m.sys and not P.o.gnu and not t.sys and not cp.is_system_file(t.span.file) {
+            keyword_away(P, m, t.span);
+        }
         if not replace(P, m, &t) {
             return t;
         }
     }
+}
+
+// The names whose macro of the system's headers the program has used
+// (keyword_away: one warning each).
+let mut g_away: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+
+// Under an ISO standard with the system's C library, whose headers define
+// the GNU dialects' keywords away for a compiler that is not their own
+// (`#define __attribute__(x)`, as nothing): the program's use of such a
+// macro at sp (macro m) is the warning C4152, once for each name, since
+// what it says (an attribute, an asm label) is then dropped.
+fn keyword_away(P: *PP, m: *Macro, sp: u.Span) void {
+    let n = m.name;
+    if (n.len < 3) or (n[0] != '_') or (n[1] != '_') or (ct.keyword_id(n, P.o.std) != 0) or
+       (ct.keyword_id_in(n, P.o.std, true) == 0) or (g_away.get(u.intern(n)) != 0) {
+        return;
+    }
+    g_away.put(u.intern(n), 1);
+    _ = dg.warning(sp, "C4152",
+                   u.f1("'%s' is a macro of the system's headers that drops what it is given under an ISO standard: a GNU dialect (--c-std=gnuNN) has it as a keyword",
+                        n));
 }
 
 // Replaces the macro m, whose name is `inv`: true if it was (the
@@ -1835,6 +1860,16 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
         }
         k += 1;
     }
+    // (--c-idirafter: after the system's and the compiler's)
+    let na = @int_cast(i32, P.o.after_dirs.len);
+    while k <= (n + ns + na) {
+        let p = join(P.o.after_dirs[@int_cast(usize, k - (n + ns + 1))], name);
+        if u.is_file(p) {
+            P.found_index = k;
+            return p;
+        }
+        k += 1;
+    }
     return u.nosym();
 }
 
@@ -2032,6 +2067,9 @@ fn system_path(P: *PP, path: []u8) bool {
     let ni = @int_cast(usize, P.o.n_isystem);
     for k in n - @min(n, ni)..n {
         dirs.push(P.o.include_dirs[k]);
+    }
+    for d in P.o.after_dirs {
+        dirs.push(d);
     }
     for d in dirs.items() {
         if (d.len > 0) and (path.len > d.len) and u.starts(path, d) and
@@ -2421,6 +2459,9 @@ fn do_embed(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
         return;
     }
     let data = u.read_file(path);
+    if not u.isnos(data) {
+        note_dep(P, path, false);  // (an #embed's file is one the unit reads)
+    }
     if u.isnos(data) {
         _ = dg.err(sp, "C1081", u.f1("cannot read embedded resource %s", hn));
         P.fatal = true;
@@ -3393,6 +3434,10 @@ fn predefined_text(P: *PP) []u8 {
         // (a GNU dialect: its extensions, but no __GNUC__, which would claim
         // every extension of another compiler: docs/c.md)
         b.s("#define __AXIOM_GNU__ 1\n");
+        if o.iso_names {
+            // (--c-iso-names: as a cc's -std=cNN, which keeps the extensions)
+            b.s("#define __STRICT_ANSI__ 1\n");
+        }
         // (__int128 and unsigned __int128: ctypes.ax)
         b.s("#define __AXIOM_INT128__ 1\n");
         // (__bf16, bfloat16, and the characteristics of its format, in
@@ -3646,6 +3691,7 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     P.o = o;
     g_last = P;
     begin_deps();
+    g_away = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
     P.asm_ = g_asm;
     // (-g: the program's own units' macros, not the C library's)
     P.mac = (tg.g_debug == tg.DEBUG_FULL) and tg.g_debug_macros and not g_asm and not g_lib_unit;
@@ -3657,6 +3703,8 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     lx.gnu = o.gnu;
     ct.g_no_ext_float = o.system_lib and not tg.is_darwin();
     ct.g_declspec = o.declspec;
+    ct.g_iso_names = o.iso_names;
+    cout.g_line_directive = not o.gnu;
     P.asserts = u.SymMap.[*mut u.List.[[]u8]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[[]u8]](), cap: 0,
                                                 len: 0 };
     if o.gnu {

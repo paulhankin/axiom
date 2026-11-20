@@ -23,6 +23,32 @@ has lines.i '# 100 "elsewhere.c"'
 cp lines.i again.c
 $CC -c again.c -o again.o 2> err.txt && fail "again.c compiled"
 has err.txt "elsewhere.c:101"
+# under an ISO standard too (line markers as #line there)
+run $CC -std=c11 -E -Iinc -include pre.h pp.c -o iso.i
+run $CC -std=c11 -c iso.i -o iso.o
+run "$AXIOM" build lines.c --target=native --c-std=c11 --emit=c-pp --c-line-markers -o iso2.i
+has iso2.i '#line 100 "elsewhere.c"'
+# a pragma's line is its own: what follows it is on the next
+run $CC -E pragmas.c -o pragmas.i
+has pragmas.i '#pragma pack(1)'
+grep -q 'pragma.*struct' pragmas.i && fail "a token after the pragma on its line: $(cat pragmas.i)"
+run $CC -c pragmas.i -o pragmas.o
+run $CC pragmas.c -o pragmas
+./pragmas; [ $? -eq 5 ] || fail "the packed structure's size"
+# -E with -MD: the text to -o, the rule to -MF, else -o's name with .d
+run $CC -E -MD -Iinc -include pre.h pp.c -o e.i
+has e.i "int a = 5;"
+has e.d "pp.o: pp.c"
+run $CC -E -MD -MF x.d -Iinc -include pre.h pp.c -o e2.i
+has e2.i "int a = 5;"
+has x.d "pp.o: pp.c pre.h inc/conf.h"
+# the earliest stage wins: -E -c preprocesses (to standard output)
+run $CC -E -c -P -Iinc -include pre.h pp.c > ec.out
+has ec.out "int a = 5;"
+[ -f pp.o ] && fail "-E -c made an object"
+# -idirafter: after the system's directories (-isystem: before them)
+run $CC -idirafter compat -c after.c -o after.o
+fails $CC -isystem compat -c after.c -o after.o
 # -dM: the macros at the end
 printf '#define MINE (1 + 2)\n' | $CC -dM -E - > macros || fail "-dM -E -"
 has macros "#define MINE (1 + 2)"

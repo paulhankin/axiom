@@ -32,6 +32,12 @@ cp util.o util.lo
 run $CC main.o util.lo three.o -lm -o p5
 ./p5 > got
 same got "40 3 7"
+# objects alone, linked in a package's directory: a C program all the same
+mkdir -p pkg
+printf '[package]\nname = "x"\n' > pkg/axiom.toml
+(cd pkg && $CC ../main.o ../util.o ../three.o -lm -o p6) || fail "a link next to axiom.toml"
+./pkg/p6 > got
+same got "40 3 7"
 # one build of the three sources
 run $CC $OPT -o p4 main.c util.c sub/three.c -lm
 ./p4 > got

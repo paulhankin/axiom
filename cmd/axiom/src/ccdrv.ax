@@ -47,7 +47,9 @@ struct St {
     defs: u.List.[[]u8],      // -D, -U, -A, in order
     incs: u.List.[[]u8],      // -I and -iquote, in order (as -I<dir>)
     quotes: u.List.[[]u8],    // -iquote (before the -I directories)
-    isys: u.List.[[]u8],      // -isystem, -idirafter (--c-isystem)
+    isys: u.List.[[]u8],      // -isystem (--c-isystem)
+    after: u.List.[[]u8],     // -idirafter (--c-idirafter: after the system's directories)
+    iso: bool,                // -std=cNN, -ansi: an ISO standard, as a cc's (with the reserved extensions)
     pre: u.List.[[]u8],       // -include
     pass: u.List.[[]u8],      // `axiom build` options given as they are (--cpu=, --c-..., ...)
     lflags: u.List.[[]u8],    // -Wl, and -Xlinker's arguments, in order
@@ -352,6 +354,26 @@ fn debug_of(x: []u8) []u8 {
     return u.nosym();  // (-gsplit-dwarf, -gz, -gcolumn-info ...: accepted, nothing changes)
 }
 
+// How early stage m stops (set_mode): -E and -fsyntax-only, then -S, then
+// -c, then the link.
+fn stage_rank(m: i32) i32 {
+    if (m == M_PP) or (m == M_CHECK) {
+        return 0;
+    }
+    if m == M_ASM {
+        return 1;
+    }
+    return pick_n(m == M_OBJ, 2, 3);
+}
+
+// -E, -fsyntax-only, -S, -c: the earliest stage asked for wins, whatever the
+// order (`-E -c` preprocesses).
+fn set_mode(m: i32) void {
+    if stage_rank(m) < stage_rank(S.mode) {
+        S.mode = m;
+    }
+}
+
 // A -f option. Nonzero after an error.
 fn f_option(a: []u8) i32 {
     let f = a[2..];
@@ -380,7 +402,11 @@ fn f_option(a: []u8) i32 {
     } else if u.str_eq(f, "no-data-sections") {
         S.dsections = false;
     } else if u.str_eq(f, "syntax-only") {
-        S.mode = M_CHECK;
+        set_mode(M_CHECK);
+    } else if u.str_eq(f, "no-delete-null-pointer-checks") {
+        S.pass.push("--c-keep-null-checks");
+    } else if u.str_eq(f, "rounding-math") {
+        S.pass.push("--c-fenv-access");
     } else if u.str_eq(f, "openmp") or u.str_eq(f, "openacc") or u.starts(f, "openmp=") {
         return err(u.f1("'%s': OpenMP is not supported", a));
     } else if u.starts(f, "sanitize=") or u.str_eq(f, "profile-arcs") or u.str_eq(f, "test-coverage") or
@@ -421,6 +447,15 @@ fn m_option(a: []u8) i32 {
     if u.str_eq(m, "32") or u.str_eq(m, "x32") or u.str_eq(m, "16") or u.str_eq(m, "big-endian") or
        u.starts(m, "long-double-") or u.starts(m, "abi=") or u.str_eq(m, "soft-float") {
         return err(u.f1("'%s' is another ABI than the target's, and is not supported", a));
+    }
+    if u.str_eq(m, "no-red-zone") or u.str_eq(m, "general-regs-only") or u.str_eq(m, "no-sse") or
+       u.str_eq(m, "no-sse2") or u.str_eq(m, "no-mmx") or u.str_eq(m, "no-80387") or u.str_eq(m, "no-fp-ret-in-387") or
+       u.str_eq(m, "kernel") or u.starts(m, "regparm") or u.str_eq(m, "rtd") or
+       (u.starts(m, "cmodel=") and not u.str_eq(m, "cmodel=small")) or u.str_eq(m, "no-implicit-float") or
+       u.starts(m, "stack-protector-guard") or u.str_eq(m, "retpoline") or u.starts(m, "indirect-branch") or
+       u.starts(m, "function-return") or u.str_eq(m, "no-fp-regs") or u.str_eq(m, "strict-align") {
+        return err(u.f1("'%s' asks for code that this compiler does not make (registers, stack or code model), and is not supported",
+                        a));
     }
     if u.starts(m, "arch=") or u.starts(m, "cpu=") {
         let v = m[@int_cast(usize, pick_n(u.starts(m, "arch="), 5, 4))..];
@@ -503,6 +538,22 @@ fn linker_options() i32 {
             S.pass.push(a);
         } else if u.str_eq(a, "-E") or u.str_eq(a, "--export-dynamic") {
             S.rdynamic = true;
+        } else if (u.str_eq(a, "--export-dynamic-symbol") or u.str_eq(a, "--dynamic-list")) and has_next {
+            S.rdynamic = true;  // (the symbol, or the list's: every definition, which has them)
+            i += 1;
+        } else if u.starts(a, "--export-dynamic-symbol=") or u.starts(a, "--dynamic-list=") {
+            S.rdynamic = true;
+        } else if (u.str_eq(a, "-T") or u.str_eq(a, "--script") or u.str_eq(a, "-e") or u.str_eq(a, "--entry") or
+                   u.str_eq(a, "-u") or u.str_eq(a, "--undefined") or u.str_eq(a, "--defsym") or
+                   u.str_eq(a, "--wrap") or u.str_eq(a, "-y") or u.str_eq(a, "--trace-symbol") or
+                   u.str_eq(a, "--dynamic-linker") or u.str_eq(a, "-I") or u.str_eq(a, "--sysroot") or
+                   u.str_eq(a, "-Y") or u.str_eq(a, "-m") or u.str_eq(a, "-plugin") or u.str_eq(a, "-plugin-opt") or
+                   u.str_eq(a, "-f") or u.str_eq(a, "-F") or u.str_eq(a, "--filter") or u.str_eq(a, "--auxiliary") or
+                   u.str_eq(a, "-Ttext") or u.str_eq(a, "-Tdata") or u.str_eq(a, "-Tbss") or
+                   u.str_eq(a, "--section-start")) and has_next {
+            return err(u.f2("the linker's option '%s %s' is not supported", a, next));
+        } else if u.str_eq(a, "--sort-section") and has_next {
+            i += 1;
         } else if u.str_eq(a, "--gc-sections") or u.str_eq(a, "--no-gc-sections") {
             S.pass.push(a);
         } else if (u.str_eq(a, "-L") or u.str_eq(a, "-l")) and has_next {
@@ -523,8 +574,10 @@ fn linker_options() i32 {
                   u.str_eq(a, "--allow-shlib-undefined") or u.str_eq(a, "--no-allow-shlib-undefined") or
                   u.starts(a, "--exclude-libs=") or u.str_eq(a, "--push-state") or u.str_eq(a, "--pop-state") or
                   u.str_eq(a, "--warn-shared-textrel") or u.str_eq(a, "--no-warn-mismatch") or
-                  u.str_eq(a, "--default-symver") or u.str_eq(a, "--export-dynamic-symbol") or
-                  u.str_eq(a, "-znoexecstack") or u.starts(a, "-zrelro") or u.starts(a, "-znow") {
+                  u.str_eq(a, "--default-symver") or u.starts(a, "--compress-debug-sections") or
+                  u.starts(a, "--threads") or u.str_eq(a, "--no-threads") or u.starts(a, "--sort-section=") or
+                  u.str_eq(a, "--export-dynamic-symbol") or u.str_eq(a, "-znoexecstack") or u.starts(a, "-zrelro") or
+                  u.starts(a, "-znow") {
             // what the compiler's linker does anyway, or nothing that changes the program
         } else if (a.len > 0) and (a[0] == '-') {
             return err(u.f1("the linker's option '%s' is not supported", a));
@@ -634,11 +687,11 @@ fn option(a: []u8) i32 {
     } else if u.starts(a, "-o") {
         S.out = a[2..];
     } else if u.str_eq(a, "-c") {
-        S.mode = M_OBJ;
+        set_mode(M_OBJ);
     } else if u.str_eq(a, "-E") {
-        S.mode = M_PP;
+        set_mode(M_PP);
     } else if u.str_eq(a, "-S") {
-        S.mode = M_ASM;
+        set_mode(M_ASM);
     } else if u.starts(a, "-I") {
         let d = a[2..];
         if u.str_eq(d, "-") {
@@ -657,7 +710,7 @@ fn option(a: []u8) i32 {
         }
     } else if u.starts(a, "-idirafter") {
         if dir_ok(a[10..]) {
-            S.isys.push(a[10..]);
+            S.after.push(a[10..]);
         }
     } else if u.starts(a, "-include") {
         S.pre.push(a[8..]);
@@ -672,8 +725,10 @@ fn option(a: []u8) i32 {
             return err(u.f1("unknown C standard in '%s' (c89, c99, c11, c17, c23, gnu89 ... gnu23, iso9899:...)", a));
         }
         S.std = s;
+        S.iso = not u.starts(s, "gnu");
     } else if u.str_eq(a, "-ansi") {
         S.std = "c89";
+        S.iso = true;
     } else if u.starts(a, "-O") {
         let o = opt_of(a[2..]);
         if u.isnos(o) {
@@ -821,6 +876,7 @@ fn option(a: []u8) i32 {
         S.target = a[9..];
     } else if u.starts(a, "--c-std=") {
         S.std = a[8..];
+        S.iso = false;  // (axiom build's standard, as it is)
     } else if u.starts(a, "--c-lib=") {
         S.clib = a;
     } else if u.str_eq(a, "--c-freestanding") {
@@ -930,7 +986,15 @@ fn source_options(av: *mut u.List.[[]u8]) void {
     } else if system_lib_default() {
         av.push("--c-lib=system");
     }
-    av.push(u.cat2("--c-std=", u.pick(S.std.len > 0, S.std, "gnu17")));
+    if S.iso and not u.str_eq(S.std, "c95") {
+        // (-std=cNN: the GNU dialect of the standard with the names an ISO
+        // program may use its own, as a cc's -std=cNN keeps __attribute__,
+        // __asm__ and the other extensions in the reserved namespace)
+        av.push(u.cat2("--c-std=gnu", S.std[1..]));
+        av.push("--c-iso-names");
+    } else {
+        av.push(u.cat2("--c-std=", u.pick(S.std.len > 0, S.std, "gnu17")));
+    }
     if S.opt.len > 0 {
         av.push(S.opt);
     }
@@ -983,6 +1047,9 @@ fn source_options(av: *mut u.List.[[]u8]) void {
     }
     for d in S.isys.items() {
         av.push(u.cat2("--c-isystem=", d));
+    }
+    for d in S.after.items() {
+        av.push(u.cat2("--c-idirafter=", d));
     }
     for f in S.pre.items() {
         av.push(u.cat2("--c-include=", f));
@@ -1099,10 +1166,16 @@ fn preprocess(srcs: []In) i32 {
                 av.push("--c-line-markers");
             }
             if S.mdeps > 0 {
-                // (-MD with -E: -o names the rule's file)
-                let f = u.pick(S.mf.len > 0, S.mf, u.pick(S.out.len > 0, S.out, u.cat2(stem(orig_name(x)), ".d")));
+                // (-MD with -E: the rule to -MF's file, else -o's name with
+                // .d, else the source's with .d)
+                let mut f = S.mf;
+                if f.len == 0 {
+                    f = u.pick((S.out.len > 0) and
+                               not u.str_eq(S.out, "-"), with_ext(S.out, ".d"), u.cat2(stem(orig_name(x)), ".d"));
+                }
                 deps_options(&mut av, f, obj, S.mdeps == 2);
-            } else if (S.out.len > 0) and not u.str_eq(S.out, "-") {
+            }
+            if (S.out.len > 0) and not u.str_eq(S.out, "-") {
                 av.push("-o");
                 av.push(S.out);
             }
@@ -1149,9 +1222,15 @@ fn compile(srcs: []In, objs: *mut u.List.[[]u8], temp: bool) i32 {
             let mut f = S.mf;
             if f.len == 0 {
                 if temp {
-                    // (a program's: <output>-<source>.d, or <output>.d of one source)
-                    let o = u.pick(S.out.len > 0, S.out, "a.out");
-                    f = u.pick(srcs.len == 1, with_ext(o, ".d"), u.f2("%s-%s.d", with_ext(o, ""), stem(orig_name(x))));
+                    // (a program's: <output>-<source>.d, or <output>.d of one
+                    // source; without -o, each source's <source>.d)
+                    if S.out.len == 0 {
+                        f = u.cat2(stem(orig_name(x)), ".d");
+                    } else if srcs.len == 1 {
+                        f = with_ext(S.out, ".d");
+                    } else {
+                        f = u.f2("%s-%s.d", with_ext(S.out, ""), stem(orig_name(x)));
+                    }
                 } else {
                     f = with_ext(obj, ".d");
                 }
@@ -1229,6 +1308,7 @@ fn link(srcs: []In) i32 {
             av.push("--allow-undefined");  // (as a cc's linker: bound when the library is loaded)
         }
     }
+    av.push("--no-package");  // (a cc's link of objects, wherever it runs)
     av.push("-o");
     av.push(u.pick(S.out.len > 0, S.out, "a.out"));
     return run_job(&av);

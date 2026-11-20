@@ -20,3 +20,9 @@
 - An executable keeps the definitions that a shared library it links with refers to (a
   callback the library calls), and a program of objects alone takes an object whatever its
   name (`x.lo`).
+- `axiom cc -std=cNN` is `--c-std=gnuNN --c-iso-names`: a conventional cc's strict
+  standard, whose programs keep `__attribute__`, `__asm__` and the other extensions in the
+  reserved namespace (`--c-iso-names` makes `asm` and `typeof` identifiers, defines
+  `__STRICT_ANSI__` and not `unix` or `linux`). Under an ISO standard with
+  `--c-lib=system`, a use of the system headers' macro that defines `__attribute__` (or
+  another such keyword) away is the warning `C4152`, not silent.
