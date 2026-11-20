@@ -2233,7 +2233,9 @@ cannot, such as `noinline`, is C4052).
 `[[gnu::name]]` and `[[__gnu__::name]]` are the same in a GNU dialect (under an ISO
 standard they are a vendor's: ignored). Each name may be written `__name__`. Arguments are
 checked (C3077, C3071). An unknown attribute, or one where it cannot appertain, is warning
-C4052 and is ignored.
+C4052 and is ignored. Those of functions are taken (and do nothing) on an object, a member
+or a typedef whose declarator has a function type in it (a pointer to a function), as the
+GNU compilers apply them to that type: `format` on a table of `printf`-like functions.
 
 | Attribute | Of | What it does |
 |---|---|---|
