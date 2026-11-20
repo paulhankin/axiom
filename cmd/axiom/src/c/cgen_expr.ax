@@ -35,6 +35,7 @@ import "cgen_vla.ax" as gv;
 import "cgen_wint.ax" as cgw;
 import "cldbl.ax" as cl;
 import "cpragma.ax" as cpg;
+import "csema.ax" as cs;
 import "csema_atomic.ax" as catm;
 import "csema_attr.ax" as catr;
 import "csema_builtin.ax" as csb;
@@ -2012,6 +2013,15 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     for i in 0..n {
         vs[i] = rv(e.args.get(i));
     }
+    let lm = lib_memop(fe, n);
+    if lm != 0 {
+        if lm == ir.OP_MEMSET {
+            _ = ir.memop(cg.B, lm, vs[0], ir.trunc(cg.B, vs[1], cg.T_i8), vs[2]);
+        } else {
+            _ = ir.memop(cg.B, lm, vs[0], vs[1], vs[2]);
+        }
+        return vs[0];
+    }
     if tg.is_wasm() and tg.has(tg.W_EXCEPTION_HANDLING) and (n == 1) and u.str_eq(callee_name, SETJMP) and
        u.notnil(cg.F) {
         return sj.setjmp_call(vs[0]);  // (cgen_sjlj.ax)
@@ -2069,6 +2079,57 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         cg.continue_after();
     }
     return r;
+}
+
+// A hosted program's call of the C library's memcpy, memmove or memset
+// (callee fe, of n arguments) is the IR's memory operation (as the GNU
+// dialects' __builtin_memcpy ...): its op, else 0. A constant size is then
+// copied in registers, and the others without a call where the target
+// allows (x64isel.ax: gen_memop). Not where the unit defines the function
+// itself (a program's own, as freestanding ones have), nor in those
+// functions (the library's definitions, std/c/lib/string), whose loops
+// would call them where memory operations are calls (AArch64).
+fn lib_memop(fe: *cast.Expr, n: usize) i32 {
+    if (n != 3) or not cs.opts().hosted or (fe.kind != cast.ExprKind.CAST) or (fe.op != cast.CV_FDECAY) or
+       (fe.a.kind != cast.ExprKind.IDENT) or u.isnil(fe.a.sym) {
+        return 0;
+    }
+    let s = fe.a.sym;
+    if (s.kind != cast.SK_FUNC) or (s.linkage != cast.LK_EXTERNAL) or (s.asm_name.len != 0) or s.defined or
+       u.notnil(s.nest_parent) {
+        return 0;
+    }
+    let mut op: i32 = 0;
+    if u.str_eq(s.name, "memcpy") {
+        op = ir.OP_MEMCPY;
+    } else if u.str_eq(s.name, "memmove") {
+        op = ir.OP_MEMMOVE;
+    } else if u.str_eq(s.name, "memset") {
+        op = ir.OP_MEMSET;
+    } else {
+        return 0;
+    }
+    // (the library's declaration: void *(void *, const void * or int, size_t))
+    let ft = fe.ty.elem;
+    if not ft.proto or ft.variadic or (ft.params.len != 3) or (cty.unqual(ft.ret).kind != cty.TK_POINTER) or
+       (cty.unqual(ft.params[0]).kind != cty.TK_POINTER) or not cty.is_integer(cty.unqual(ft.params[2])) or
+       (cty.size_of(cty.unqual(ft.params[2])) != cty.size_of(cty.t_size)) {
+        return 0;
+    }
+    let p1 = cty.unqual(ft.params[1]);
+    if (op == ir.OP_MEMSET) != (p1.kind != cty.TK_POINTER) {
+        return 0;
+    }
+    if (op == ir.OP_MEMSET) and not cty.is_integer(p1) {
+        return 0;
+    }
+    if u.notnil(cg.F) and u.notnil(cg.F.sym) {
+        let f = cg.F.sym.name;
+        if u.str_eq(f, "memcpy") or u.str_eq(f, "memmove") or u.str_eq(f, "memset") or u.str_eq(f, "memset_explicit") {
+            return 0;
+        }
+    }
+    return op;
 }
 
 // A <complex.h> builtin (csema_builtin.ax) of the argument values vs.
