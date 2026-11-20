@@ -12,6 +12,14 @@ fails $CC -c missing.c
 has fails.out "missing.c"
 fails $CC
 has fails.out "no input files"
+# an input that does not exist, also where it would not be linked (the probe
+# of an option of another compiler's, "/W4", must fail)
+fails $CC -c good.c /W4 -o good.o
+has fails.out "/W4: no such file"
+fails $CC -fsyntax-only good.c missing.o
+has fails.out "missing.o: no such file"
+fails $CC -E good.c missing.o
+has fails.out "missing.o: no such file"
 fails $CC -S good.c
 has fails.out "no assembly output"
 fails $CC --no-such-option-of-axiom good.c

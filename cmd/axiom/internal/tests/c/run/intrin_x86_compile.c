@@ -3156,15 +3156,15 @@ void __t797(void) {
     __sink = *(volatile unsigned char *)(void *)&__r;
 }
 void __t798(void) {
-    __m256i __r = _mm256_set_epi64((__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1);
+    __m256i __r = _mm256_set_epi64x((__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1);
     __sink = *(volatile unsigned char *)(void *)&__r;
 }
 void __t799(void) {
-    __m256i __r = _mm256_setr_epi64((__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1);
+    __m256i __r = _mm256_setr_epi64x((__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1, (__axiom_int64)1);
     __sink = *(volatile unsigned char *)(void *)&__r;
 }
 void __t800(void) {
-    __m256i __r = _mm256_set1_epi64((__axiom_int64)1);
+    __m256i __r = _mm256_set1_epi64x((__axiom_int64)1);
     __sink = *(volatile unsigned char *)(void *)&__r;
 }
 void __t801(void) {

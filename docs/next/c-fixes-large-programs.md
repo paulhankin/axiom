@@ -20,3 +20,20 @@
   constructors, `exit` with its value); `C3063` is reported only when neither the sources
   nor the objects and archives linked define `main`, and a source's `main` beside an
   object's is `C3064` (issue #64).
+- The GNU dialects give an enumeration whose constants do not all fit `int` C23's types
+  before C23 too (the first of `unsigned int`, `long`, ... that holds them, and the
+  constants that type), as the system's `<sys/epoll.h>` needs (`EPOLLET = 1u << 31`);
+  under an ISO standard before C23 such a constant stays `C3013`.
+- `<stddef.h>` replaces a definition of `offsetof` the program made before including it
+  in a GNU dialect, as it replaces an earlier `NULL`; and with `--c-lib=system` a system
+  header's definition of a macro the program defined first (a disabled `assert` of its
+  own, then `<assert.h>`) replaces the program's instead of `C1060`.
+- main's argument strings are one block, one after another (as the system's start-up
+  gives them), so a program that retitles its process by writing over the space from
+  `argv[0]` to the end of the last argument no longer overwrites the allocator's memory.
+- `_mm_malloc`'s memory is `posix_memalign`'s outside Windows and `_mm_free` is `free`,
+  as with other compilers' headers: a program may free either's memory with the other.
+- `<immintrin.h>` has `_mm256_set_epi64x`, `_mm256_setr_epi64x` and `_mm256_set1_epi64x`
+  (it had them without the `x`, which are not Intel's names), and the x86-64 assembler
+  takes `movd` between an `xmm` register and a 64-bit general register (the GNU
+  assembler's spelling of `movq`).

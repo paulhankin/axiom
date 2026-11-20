@@ -217,9 +217,9 @@ __AXIOM_FN("avx") __m256i _mm256_set1_epi16(short __a) { return ((__m256i)(__bui
 __AXIOM_FN("avx") __m256i _mm256_set_epi32(int __e7, int __e6, int __e5, int __e4, int __e3, int __e2, int __e1, int __e0) { __axiom_i32x8 __r = {0, 0, 0, 0, 0, 0, 0, 0}; __r[0] = __e0; __r[1] = __e1; __r[2] = __e2; __r[3] = __e3; __r[4] = __e4; __r[5] = __e5; __r[6] = __e6; __r[7] = __e7; return ((__m256i)(__r)); }
 __AXIOM_FN("avx") __m256i _mm256_setr_epi32(int __e7, int __e6, int __e5, int __e4, int __e3, int __e2, int __e1, int __e0) { return _mm256_set_epi32(__e0, __e1, __e2, __e3, __e4, __e5, __e6, __e7); }
 __AXIOM_FN("avx") __m256i _mm256_set1_epi32(int __a) { return ((__m256i)(__builtin_axiom_simd("splat", ((__axiom_i32x8)(_mm256_setzero_si256())), __a))); }
-__AXIOM_FN("avx") __m256i _mm256_set_epi64(__axiom_int64 __e3, __axiom_int64 __e2, __axiom_int64 __e1, __axiom_int64 __e0) { __axiom_i64x4 __r = {0, 0, 0, 0}; __r[0] = __e0; __r[1] = __e1; __r[2] = __e2; __r[3] = __e3; return ((__m256i)(__r)); }
-__AXIOM_FN("avx") __m256i _mm256_setr_epi64(__axiom_int64 __e3, __axiom_int64 __e2, __axiom_int64 __e1, __axiom_int64 __e0) { return _mm256_set_epi64(__e0, __e1, __e2, __e3); }
-__AXIOM_FN("avx") __m256i _mm256_set1_epi64(__axiom_int64 __a) { return ((__m256i)(__builtin_axiom_simd("splat", ((__axiom_i64x4)(_mm256_setzero_si256())), __a))); }
+__AXIOM_FN("avx") __m256i _mm256_set_epi64x(__axiom_int64 __e3, __axiom_int64 __e2, __axiom_int64 __e1, __axiom_int64 __e0) { __axiom_i64x4 __r = {0, 0, 0, 0}; __r[0] = __e0; __r[1] = __e1; __r[2] = __e2; __r[3] = __e3; return ((__m256i)(__r)); }
+__AXIOM_FN("avx") __m256i _mm256_setr_epi64x(__axiom_int64 __e3, __axiom_int64 __e2, __axiom_int64 __e1, __axiom_int64 __e0) { return _mm256_set_epi64x(__e0, __e1, __e2, __e3); }
+__AXIOM_FN("avx") __m256i _mm256_set1_epi64x(__axiom_int64 __a) { return ((__m256i)(__builtin_axiom_simd("splat", ((__axiom_i64x4)(_mm256_setzero_si256())), __a))); }
 __AXIOM_FN("avx") __m256 _mm256_load_ps(const float * __p) { return *(const __m256 *)__p; }
 __AXIOM_FN("avx") __m256 _mm256_loadu_ps(const float * __p) { return *(const __m256_u *)__p; }
 __AXIOM_FN("avx") __m256d _mm256_load_pd(const double * __p) { return *(const __m256d *)__p; }

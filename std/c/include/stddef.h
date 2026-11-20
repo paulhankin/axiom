@@ -77,6 +77,7 @@ typedef typeof(nullptr) nullptr_t;
 #ifdef __AXIOM_GNU__
 /* (a GNU dialect: a definition the program made before is replaced) */
 #undef NULL
+#undef offsetof
 #endif
 #define NULL ((void *)0)
 #define offsetof(type, member) __builtin_offsetof(type, member)

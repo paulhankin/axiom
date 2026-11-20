@@ -1,5 +1,5 @@
-/* flags: --c-std=gnu17 */
+/* flags: --c-std=c17 */
 /* expect-error: C3013 */
-/* Before C23 an enumeration constant is an int. */
-enum E { WIDE = (__int128)1 << 64 };
+/* Before C23, under an ISO standard, an enumeration constant is an int. */
+enum E { WIDE = (long long)1 << 40 };
 int main(void) { return 0; }
