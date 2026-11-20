@@ -1602,8 +1602,9 @@ pub fn gen_store(v: *mut ir.Value) void {
 // up to 2 KiB as a loop of them (four a time, to cache-line-aligned
 // destinations: copy_loop); forward copies (memcpy, and memmove of operands
 // the same or apart) up to 2 KiB as a loop likewise. Others are
-// rep movsb / stosb (a memmove's backward when the destination is above the
-// source and within its length).
+// rep movsb / stosb, but forward copies of at most 256 bytes (fwd_mid) and a
+// memmove's backward copy (when the destination is above the source and
+// within its length: back_copy) are loops of vectors.
 pub fn gen_memop(v: *mut ir.Value) void {
     let o = v.op;
     // (a forward copy: of operands apart, or the same bytes, which a
@@ -1632,6 +1633,13 @@ pub fn gen_memop(v: *mut ir.Value) void {
         small_var(o, dst, src, n, big, done);
     }
     xsl.place(big);
+    let back = (o == ir.OP_MEMMOVE) and not fwd;
+    if back {
+        back_copy(dst, src, n, done);
+    }
+    if (o != ir.OP_MEMSET) and not is.is_c(v.c) {
+        fwd_mid(dst, src, n, done);
+    }
     _ = xsl.e2(xe.MOV_RR, 8, xsl.W(xe.RDI), xsl.R(dst));
     if o == ir.OP_MEMSET {
         _ = xsl.e2(xe.MOV_RR, 8, xsl.W(xe.RAX), xsl.R(src));
@@ -1642,7 +1650,7 @@ pub fn gen_memop(v: *mut ir.Value) void {
     if o == ir.OP_MEMSET {
         let i = xsl.e3(xe.REP, 0, xsl.RW(xe.RDI), xsl.R(xe.RAX), xsl.RW(xe.RCX));
         i.cc = 1;
-    } else if fwd {
+    } else if fwd or back {
         let i = xsl.e3(xe.REP, 0, xsl.RW(xe.RDI), xsl.RW(xe.RSI), xsl.RW(xe.RCX));
         i.cc = 0;
     } else {
@@ -1651,6 +1659,86 @@ pub fn gen_memop(v: *mut ir.Value) void {
         i.cc = 2;
     }
     xsl.place(done);
+}
+
+// A forward copy of 32 < n bytes from s to d (registers; d below s, or
+// apart: a memmove's backward copy is back_copy's) of at most 256 bytes, in
+// vectors of w bytes (16, or 32 with AVX), then on to `done`; longer ones go
+// on (to rep movsb, whose start takes longer than such a loop). The last w
+// bytes of the source are loaded first; then from i = 0 while i < n - w,
+// each vector is loaded and stored (overwriting, when d is below s, only
+// source bytes below the next vector's: already copied); then those last
+// w bytes at d + n - w.
+fn fwd_mid(d: i32, s: i32, n: i32, done: i32) void {
+    let rest = xsl.new_label();
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(n), xsl.I(256));
+    xsl.jcc(xe.CC_A, rest);
+    let w = memop_width();
+    let outer_vl = xsl.S.vl;
+    xsl.S.vl = chunk_vl(w);
+    let tail = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(tail), mc.mem(s, n, 1, -w));
+    let lim = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RR, 8, xsl.W(lim), xsl.R(n));
+    _ = xsl.alu(xe.ALU_SUB, 8, xsl.RW(lim), xsl.I(w));
+    let i = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RI, 8, xsl.W(i), xsl.I(0));
+    let top = xsl.new_label();
+    xsl.place(top);
+    let v = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(v), mc.mem(s, i, 1, 0));
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(v), mc.mem(d, i, 1, 0));
+    _ = xsl.alu(xe.ALU_ADD, 8, xsl.RW(i), xsl.I(w));
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(i), xsl.R(lim));
+    let ops: [7]mc.MOp = [mc.label(top), xsl.R(i), xsl.R(d), xsl.R(s), xsl.R(lim), xsl.R(tail), xsl.R(n)];
+    let j = xsl.emit(xe.JCC, 0, ops[..]);
+    j.cc = xe.CC_B;
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(tail), mc.mem(d, n, 1, -w));
+    xsl.S.vl = outer_vl;
+    xsl.jmp(done);
+    xsl.place(rest);
+}
+
+// A memmove of n > 32 bytes from s to d (registers): when d is above s and
+// within n of it (d - s < n, unsigned), backwards in 16-byte vectors, and
+// then on to `done`; otherwise it goes on, to a forward copy. (The
+// processor's backward string copy, with the direction flag set, goes a
+// byte at a time: ten times slower at 100 bytes.) The first 16 bytes of
+// the source are loaded first; then from i = n - 16 down, while i > 16
+// (i is above 16 at first: one iteration at least), each vector is loaded
+// and stored, which overwrites only source bytes above it, already copied;
+// then the vector at the i left (0 < i <= 16) and the first 16 at d.
+fn back_copy(d: i32, s: i32, n: i32, done: i32) void {
+    let fwd = xsl.new_label();
+    let t = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RR, 8, xsl.W(t), xsl.R(d));
+    _ = xsl.alu(xe.ALU_SUB, 8, xsl.RW(t), xsl.R(s));
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(t), xsl.R(n));
+    xsl.jcc(xe.CC_AE, fwd);
+    let outer_vl = xsl.S.vl;
+    xsl.S.vl = chunk_vl(16);
+    let head = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(head), mc.mem(s, -1, 0, 0));
+    let i = xsl.vgpr();
+    _ = xsl.e2(xe.MOV_RR, 8, xsl.W(i), xsl.R(n));
+    _ = xsl.alu(xe.ALU_SUB, 8, xsl.RW(i), xsl.I(16));
+    let top = xsl.new_label();
+    xsl.place(top);
+    let v = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(v), mc.mem(s, i, 1, 0));
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(v), mc.mem(d, i, 1, 0));
+    _ = xsl.alu(xe.ALU_SUB, 8, xsl.RW(i), xsl.I(16));
+    _ = xsl.alu(xe.ALU_CMP, 8, xsl.R(i), xsl.I(16));
+    let ops: [5]mc.MOp = [mc.label(top), xsl.R(i), xsl.R(d), xsl.R(s), xsl.R(head)];
+    let j = xsl.emit(xe.JCC, 0, ops[..]);
+    j.cc = xe.CC_A;
+    let w = xsl.vxmm();
+    _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(w), mc.mem(s, i, 1, 0));
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(w), mc.mem(d, i, 1, 0));
+    _ = xsl.sse2(xe.MOVDQU_ST, xsl.R(head), mc.mem(d, -1, 0, 0));
+    xsl.S.vl = outer_vl;
+    xsl.jmp(done);
+    xsl.place(fwd);
 }
 
 // A memory operation of n bytes (a register: not a constant), d the
