@@ -8,6 +8,8 @@
   bytes is two loads and a compare (natively), and the library's `memcmp` compares
   words at any alignment (8 times faster on 1000 bytes aligned differently). A
   memcpy/memset-heavy benchmark runs in a fifth of the time.
+  A program that defines these functions itself in another unit keeps its calls of
+  them with `--c-no-builtin` (`axiom cc -fno-builtin`).
 - On x86-64, copies and fills of a size known only at run time of 33 to 256 bytes are
   loops of vectors (up to 2.7 times faster than the `rep movsb`/`stosb` they were),
   and a `memmove` whose destination overlaps the end of its source copies backwards
