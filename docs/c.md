@@ -2239,8 +2239,11 @@ C4052 and is ignored.
 | `mode(m)` | objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, TI (`__int128`), `byte`, `word`, `pointer` (also `__QI__` ...); of a floating type: HF (`_Float16`), SF, DF, XF (the x87 format's `long double` or `_Float64x`), TF (binary128: `long double` where that is its format, else `_Float128`), and SC, DC, TC ... their complex types; a vector mode (V4SI, V2DF, ...): the vector of those lanes. |
 | `vector_size(n)` | objects, members, typedefs, type names | The vector type of n bytes of the declared type, or of a type name's (a compound literal's, a cast's: `(__attribute__((vector_size(16))) float){ 1, 2, 3, 4 }`) ("Language": vector types). |
 
-In gnu89 and gnu90 `inline` has GNU89's meaning: `inline` alone defines the external
-function, `extern inline` is an inline definition (C99's `inline`).
+In gnu89 and gnu90 (and for a function with the attribute `gnu_inline`) `inline` has
+GNU89's meaning: `inline` alone defines the external function, `extern inline` is an
+inline definition (C99's `inline`), even where the unit also declares the function
+without `inline` (as the system's headers declare a library function and then define an
+`extern inline` wrapper of it): another unit's definition is the external function.
 
 ### Inline assembly
 
