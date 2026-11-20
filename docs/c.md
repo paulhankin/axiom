@@ -245,7 +245,8 @@ assembly output. An input is a C source if it ends in `.c` or `.i` (or after `-x
 none` goes back to the names), assembly if in `.s` or `.S`; `-` is the source read from
 standard input (its `"..."` includes found in the current directory too); `.h` and the
 sources of other languages are errors; any other file is an object or a library, by its
-contents (`x.lo`, `libx.so.1`). The archives that `ar` makes of the objects link
+contents (`x.lo`, `libx.so.1`); an input that does not exist is an error, with `-c`, `-E` and
+`-fsyntax-only` too. The archives that `ar` makes of the objects link
 (`ar rcs libx.a a.o b.o`), as do the objects and libraries of the system's toolchain ("Objects
 and libraries"); `axiom build --emit=lib` makes an archive too.
 
