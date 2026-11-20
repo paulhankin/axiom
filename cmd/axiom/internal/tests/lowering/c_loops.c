@@ -1,10 +1,11 @@
 /* The loop transformations' instructions: a copy loop is a memory
-   operation (rep movsb for long ones, after the inline paths for up to 32
-   bytes), a fill with zeros rep stosb, an element-wise float loop vector
-   multiplies and adds (mulps, addps; AArch64 fmul, fadd of .4s), an
-   integer sum vector adds, a byte search vector compares (pcmpeqb; cmeq),
-   a sign extension of a load one movslq from memory. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | rep movsb | 2
+   operation (rep movsb for long ones forwards, after the inline paths for
+   up to 32 bytes; a loop of vectors backwards), a fill with zeros rep
+   stosb, an element-wise float loop vector multiplies and adds (mulps,
+   addps; AArch64 fmul, fadd of .4s), an integer sum vector adds, a byte
+   search vector compares (pcmpeqb; cmeq), a sign extension of a load one
+   movslq from memory. */
+// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | rep movsb | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | rep stos | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 1
 // lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \baddps\b | 1

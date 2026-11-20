@@ -37,6 +37,11 @@
 //
 // A switch with at most LEAF cases is left as it is (a compare chain).
 //
+// The search also starts from the values the operand can have, where they
+// are known (value_range: phis and selects of constants, as a state
+// machine's state, a zero-extended byte): a table spanning them needs no
+// range check.
+//
 // What `unreachable` says (C's __builtin_unreachable and unreachable(), a
 // path the program never takes): a switch whose default is a block of
 // nothing but `unreachable`, or whose value the conditional branches above
@@ -208,6 +213,88 @@ fn known_interval(f: *mut ir.Func, b0: *mut ir.Block, x: *mut ir.Value, lo: *mut
         b = p;
     }
     return any;
+}
+
+threadlocal let mut VIS: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+
+// The values x can have, lo..hi (signed, of its type), when known: a
+// constant; a narrower integer zero-extended; an `and` with a constant at
+// least 0; a select or a phi of such values (looking through `depth` levels; a phi
+// already being looked at, around a loop, adds nothing: lo > hi then).
+fn value_range(x: *mut ir.Value, lo: *mut i64, hi: *mut i64, depth: i32) bool {
+    if ir.is_cint(x) {
+        lo.* = ir.sval(x);
+        hi.* = lo.*;
+        return true;
+    }
+    if (depth == 0) or (x.kind != ir.V_INST) or (x.ty.kind != ir.T_INT) or (x.ty.bits > 64) {
+        return false;
+    }
+    if (x.op == ir.OP_ZEXT) and (x.a.ty.kind == ir.T_INT) and (x.a.ty.bits < x.ty.bits) and (x.a.ty.bits < 63) {
+        lo.* = 0;
+        hi.* = @bit_cast(i64, (@as(u64, 1) << @int_cast(u32, x.a.ty.bits)) - 1);
+        return true;
+    }
+    if (x.op == ir.OP_AND) and ir.is_cint(x.b) and (ir.sval(x.b) >= 0) {
+        lo.* = 0;
+        hi.* = ir.sval(x.b);
+        return true;
+    }
+    if x.op == ir.OP_SELECT {
+        let mut a: i64 = 0;
+        let mut b: i64 = -1;
+        let mut c: i64 = 0;
+        let mut d: i64 = -1;
+        if not value_range(x.b, &mut a, &mut b, depth - 1) or not value_range(x.c, &mut c, &mut d, depth - 1) {
+            return false;
+        }
+        if a > b {
+            a = c;
+            b = d;
+        } else if c <= d {
+            a = @min(a, c);
+            b = @max(b, d);
+        }
+        lo.* = a;
+        hi.* = b;
+        return true;
+    }
+    if x.op != ir.OP_PHI {
+        return false;
+    }
+    for v in VIS.items() {
+        if v == x {
+            lo.* = 0;
+            hi.* = -1;  // (around a loop: no value of its own)
+            return true;
+        }
+    }
+    VIS.push(x);
+    let mut l: i64 = 0;
+    let mut h: i64 = -1;
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let mut a: i64 = 0;
+        let mut b: i64 = -1;
+        if not value_range(x.xs.get(k), &mut a, &mut b, depth - 1) {
+            ok = false;
+            break;
+        }
+        if a <= b {
+            if l > h {
+                l = a;
+                h = b;
+            } else {
+                l = @min(l, a);
+                h = @max(h, b);
+            }
+        }
+    }
+    VIS.len -= 1;
+    lo.* = l;
+    hi.* = h;
+    return ok;
 }
 
 // Narrows lo..hi by `x pred k` being `truth` (x of `bits` bits, k read as
@@ -433,6 +520,15 @@ fn lower_one(b: *mut ir.Block) void {
     let mut klo: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
     let mut khi: i64 = 0x7fff_ffff_ffff_ffff;
     let dead = dead_default(F, b, t, &mut klo, &mut khi);
+    // (and the values the operand can have: a phi of constants, a
+    // zero-extended narrower integer, a masked one)
+    let mut rlo: i64 = 0;
+    let mut rhi: i64 = -1;
+    VIS.clear();
+    if value_range(X, &mut rlo, &mut rhi, 6) and (rlo <= rhi) {
+        klo = @max(klo, rlo);
+        khi = @min(khi, rhi);
+    }
     ir.cur_src = t.src;
     ir.cur_scope = t.scope;
     // the cases, sorted, without those going to the default and (keeping

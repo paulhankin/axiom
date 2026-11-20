@@ -20,6 +20,7 @@ import "ir.ax" as ir;
 import "isel.ax" as is;
 import "mach.ax" as mc;
 import "macunwind.ax" as mu;
+import "target.ax" as tg;
 import "util.ax" as u;
 import "winlines.ax" as wlines;
 import "x64ctx.ax" as xc;
@@ -2133,13 +2134,19 @@ fn noop_move(i: *mc.MInst) bool {
     return (i.op == xe.MOV_RR) and (P(i.ops[0].reg) == P(i.ops[1].reg));
 }
 
-fn jump_target(b: *mc.MBlock) i32 {
+// Where a block that only jumps goes: the jump's target, or the next block
+// for one that encodes nothing (and falls into it); -1 for the others.
+fn jump_target(b: *mc.MBlock, bi: usize) i32 {
     let mut i = b.first;
     while u.notnil(i) and (noop_move(i) or (i.op == xe.LABEL)) {
         i = i.next;
     }
-    if u.notnil(i) and (i.op == xe.JMP) and u.isnil(i.next) and (i.ops[0].label < xe.LOCAL_BASE) {
+    if u.notnil(i) and (i.op == xe.JMP) and u.isnil(i.next) and (i.ops[0].kind == mc.K_LABEL) and
+       (i.ops[0].label < xe.LOCAL_BASE) {
         return i.ops[0].label;
+    }
+    if u.isnil(i) and (bi + 1 < xc.FN.mf.blocks.len) {
+        return @int_cast(i32, bi + 1);
     }
     return -1;
 }
@@ -2577,14 +2584,14 @@ fn tidy_branches() []mut bool {
         if @as(i32, @int_cast(i32, bi)) == xc.FN.sw {
             continue;  // (where the frame is set up: jumps there stay)
         }
-        let mut t = jump_target(xc.FN.mf.blocks.get(bi));
+        let mut t = jump_target(xc.FN.mf.blocks.get(bi), bi);
         let mut steps: usize = 0;
         while (t >= 0) and (steps < nb) {
             fin[bi] = t;
             if t == xc.FN.sw {
                 break;
             }
-            t = jump_target(xc.FN.mf.blocks.get(@int_cast(usize, t)));
+            t = jump_target(xc.FN.mf.blocks.get(@int_cast(usize, t)), @int_cast(usize, t));
             steps += 1;
         }
     }
@@ -2626,6 +2633,9 @@ fn tidy_branches() []mut bool {
         reuse_flags(xc.FN.mf.blocks.get(bi));
         reuse_k1(xc.FN.mf.blocks.get(bi));
         peephole(xc.FN.mf.blocks.get(bi));
+        // (again: the adds that peephole made leas no longer set the
+        // flags between two compares of the same, as `cmp; cmov; lea; cmp`)
+        reuse_flags(xc.FN.mf.blocks.get(bi));
         let b = xc.FN.mf.blocks.get(bi);
         let l = b.last;
         if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
@@ -2947,6 +2957,7 @@ fn dup_exit_tests(skip: []bool) void {
     for bi in 0..xc.FN.mf.blocks.len {
         if not skip[bi] {
             dup_exit_test(skip, bi);
+            dup_tail(skip, bi);
         }
     }
     drop_fall_tests(skip);
@@ -3038,6 +3049,141 @@ fn dup_exit_test(skip: []bool, bi: usize) void {
     tail.deinit();
     let ops: [1]mc.MOp = [mc.label(to)];
     mc.append(p, mc.new_inst(xe.JMP, 0, ops[..]));
+}
+
+// An instruction dup_tail copies: one of plain registers and memory.
+fn dup_ok(i: *mc.MInst) bool {
+    let op = i.op;
+    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or (op == xe.STORE_I) or
+           (op == xe.LEA) or (op == xe.ALU) or (op == xe.TEST) or (op == xe.IMUL) or (op == xe.IMUL_I) or
+           (op == xe.SHIFT) or (op == xe.UNARY) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or
+           (op == xe.CMP_M);
+}
+
+fn copy_inst(i: *mc.MInst) *mut mc.MInst {
+    let c = mc.new_inst(i.op, i.sz, i.ops);
+    c.cc = i.cc;
+    c.aux = i.aux;
+    c.clobber = i.clobber;
+    c.is_move = i.is_move;
+    c.spill = i.spill;
+    c.sreg = i.sreg;
+    c.sslot = i.sslot;
+    c.src = i.src;
+    c.scope = i.scope;
+    c.mk = i.mk;  // (-g: the variables' assignments before it, there too)
+    return c;
+}
+
+// dup_exit_tests for block bi, after dup_exit_test: if it jumps to a short
+// block in a loop (a few operations, then a branch, or a jump: a loop's
+// latch, where the cases of a switch meet) that it does not fall into, and
+// is not on a cold path, it does that
+// block's work itself and branches from there, a jump fewer on the way (a
+// switch's cases each branch back to its loop's head). Not at -O0.
+fn dup_tail(skip: []bool, bi: usize) void {
+    let f = xc.FN.f;
+    let mut level = tg.g_opt_level;
+    if f.opt_override > 0 {
+        level = @as(i32, f.opt_override) - 1;
+    }
+    if level == 0 {
+        return;
+    }
+    let nb = xc.FN.mf.blocks.len;
+    let p = xc.FN.mf.blocks.get(bi);
+    let l = p.last;
+    if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].kind != mc.K_LABEL) or (l.ops[0].label >= xe.LOCAL_BASE) {
+        return;
+    }
+    let t = @int_cast(usize, l.ops[0].label);
+    if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == xc.FN.sw) {
+        return;
+    }
+    let tb = xc.FN.mf.blocks.get(t);
+    if (tb.noframe != p.noframe) or (tb.loop_depth == 0) or p.cold {
+        return;
+    }
+    // its instructions, and those of the blocks it falls into, up to the
+    // branches at the end: a conditional one (falling to the next block, or
+    // followed by a jump), or a jump
+    let mut ins = u.List.[*mut mc.MInst].empty();
+    let mut after: i32 = -1;
+    let mut cur = t;
+    let mut ok = false;
+    loop {
+        let cb = xc.FN.mf.blocks.get(cur);
+        if (cb.noframe != p.noframe) or (@as(i32, @int_cast(i32, cur)) == xc.FN.sw) or (cur == bi) {
+            break;
+        }
+        let mut i = cb.first;
+        let mut bad = false;
+        let mut ended = false;
+        while u.notnil(i) {
+            if i.op == xe.LABEL {
+                bad = true;  // (a local label: the block's own jumps)
+                break;
+            }
+            if not noop_move(i) {
+                if ended or (ins.len >= 6) {
+                    bad = true;
+                    break;
+                }
+                if (i.op == xe.JCC) or (i.op == xe.JMP) {
+                    if (i.ops[0].kind != mc.K_LABEL) or (i.ops[0].label >= xe.LOCAL_BASE) {
+                        bad = true;
+                        break;
+                    }
+                    if i.op == xe.JMP {
+                        ended = true;
+                    }
+                } else if not dup_ok(i) or ((ins.len > 0) and (ins.get(ins.len - 1).op == xe.JCC)) {
+                    bad = true;
+                    break;
+                }
+                ins.push(i);
+            }
+            i = i.next;
+        }
+        if bad {
+            break;
+        }
+        if ended {
+            ok = true;
+            break;
+        }
+        let nx = next_kept(skip, cur);
+        if nx >= nb {
+            break;
+        }
+        if (ins.len > 0) and (ins.get(ins.len - 1).op == xe.JCC) {
+            after = @int_cast(i32, nx);
+            ok = true;
+            break;
+        }
+        cur = nx;
+    }
+    let n = ins.len;
+    let mut body: usize = 0;
+    for k in 0..n {
+        let o = ins.get(k).op;
+        if (o != xe.JCC) and (o != xe.JMP) {
+            body += 1;
+        }
+    }
+    if not ok or (body == 0) or (body > 4) {
+        ins.deinit();
+        return;
+    }
+    mc.remove(p, l);
+    for k in 0..n {
+        mc.append(p, copy_inst(ins.get(k)));
+    }
+    ins.deinit();
+    if after >= 0 {
+        let ops: [1]mc.MOp = [mc.label(after)];
+        mc.append(p, mc.new_inst(xe.JMP, 0, ops[..]));
+    }
 }
 
 // dup_exit_tests' second part: a test at the start of a block entered only
