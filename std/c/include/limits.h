@@ -21,12 +21,18 @@
 #ifndef UCHAR_MAX
 #define UCHAR_MAX 255
 #endif
-#ifndef CHAR_MIN
 #ifdef __CHAR_UNSIGNED__
+#ifndef CHAR_MIN
 #define CHAR_MIN 0
+#endif
+#ifndef CHAR_MAX
 #define CHAR_MAX UCHAR_MAX
+#endif
 #else
+#ifndef CHAR_MIN
 #define CHAR_MIN SCHAR_MIN
+#endif
+#ifndef CHAR_MAX
 #define CHAR_MAX SCHAR_MAX
 #endif
 #endif

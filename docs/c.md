@@ -747,7 +747,7 @@ objects (`libc.so.6`, `libm.so.6`), and its static part that its linker script n
 after them (`libc_nonshared.a`: `atexit`, `at_quick_exit`, `pthread_atfork`, which
 register with the shared object's own lists), whose members are linked as an archive's
 are. The hosted headers are the system's: `#include <x>`
-looks in the `-I` directories, then in the system's (the `--c-system-include`
+looks in the `-I` directories (but those of the system's, which a `-I` leaves where they are, as a cc does), then in the system's (the `--c-system-include`
 directories, else `/usr/include/<target>` and `/usr/include`, or for another processor
 than the machine's `/usr/<target>/include`), then in the compiler's for the headers of
 the language itself, which are the compiler's whatever the order (`<float.h>`,
