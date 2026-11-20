@@ -10,7 +10,9 @@
 #     floating point, the allocator: alloc_*, some with threads) built by the
 #     bootstrap compiler (LLVM) and by stage 2, -O2.
 # Needs cmd/axiom/bootstrap.sh, and a Linux x86-64 or AArch64 machine (the
-# bootstrap compiler builds native code there only).
+# bootstrap compiler builds native code there only). cmd/axiom/bench/layouts.py
+# instead compares the code of two builds of this compiler, on these programs
+# and the C ones in cmd/axiom/bench/c/, over several code layouts.
 #
 #   cmd/axiom/bench.sh [runs]      (default 3; the best run counts)
 set -eu
