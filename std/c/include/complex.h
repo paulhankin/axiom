@@ -108,7 +108,7 @@ long double _Complex conjl(long double _Complex __z);
 long double _Complex cprojl(long double _Complex __z);
 long double creall(long double _Complex __z);
 
-#if defined(__STDC_WANT_IEC_60559_TYPES_EXT__)
+#if defined(__STDC_WANT_IEC_60559_TYPES_EXT__) && !defined(__AXIOM_SYSTEM_C_LIB__)
 /* C23 Annex H.11 (ISO/IEC TS 18661-3): the complex functions of the
    interchange and extended types: _Float16's and _Float128's are the
    library's (std/c/lib/math/complexf16.c, complexf128.c); those of

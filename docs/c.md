@@ -136,7 +136,7 @@ objects and archives define no `main` is `C3063`.
 | `--c-line-markers` | `--emit=c-pp` writes line markers, which keep each token on its presumed file and line: `# 12 "file"` in a GNU dialect, which reads them back as `#line` (flags after the name are ignored), and `#line 12 "file"` under an ISO standard. |
 | `--c-source=path` | `path` is a C source whatever its name (`x.i`, `x.inc`). |
 | `--c-idirafter=dir` | A directory of headers searched after the system's and the compiler's (a system header's directory for `--c-deps-no-system`). |
-| `--c-gnu-compat` | With a GNU dialect: the GNU compilers' predefined macros, `__GNUC__` 4.2.1, `__VERSION__` and their companions, so that the system's headers and programs take their GNU paths ("GNU compatibility"). `axiom cc` gives it. |
+| `--c-gnu-compat` | With a GNU dialect: the GNU compilers' predefined macros, `__GNUC__` 9.4.0, `__VERSION__` and their companions, so that the system's headers and programs take their GNU paths ("GNU compatibility"). `axiom cc` gives it. |
 | `--c-iso-names` | With a GNU dialect: the names an ISO program may use are its own: the dialect's keywords outside the reserved namespace (`asm`, `typeof` before C23, gnu89's `inline`) are identifiers, `unix` and `linux` are not defined, and `__STRICT_ANSI__` is 1; the extensions (`__attribute__`, `__asm__`, `__typeof__`, statement expressions, ...) stay. It is a conventional cc's `-std=cNN`. |
 
 `-D`, `-U`, `-A` and `-I` apply in the order given. The C options are errors for an Axiom
@@ -269,7 +269,7 @@ to every build as it is, and changes a default.
 
 | Options | |
 |---|---|
-| `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version (and `gcc version 4.2.1 compatible`, the GNU version the macros claim, which configure scripts read) and each build's command to standard error, `-###` the commands without running them. |
+| `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version (and `gcc version 9.4.0 compatible`, the GNU version the macros claim, which configure scripts read) and each build's command to standard error, `-###` the commands without running them. |
 | `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
 | `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later, or a GNU dialect (gnu89 too, as `-std=gnu89`, `-std=c89` and `-ansi` give). |
 | `-O0` ... `-O3`, `-O`, `-Os`, `-Oz`, `-Og`, `-Ofast` | `-O` and `-Og` are `-O1`, `-Os` and `-Oz` `-O2`, `-Ofast` and above 3 `-O3` (no fast-math: the arithmetic stays IEEE 754's). |
@@ -303,8 +303,8 @@ with `-c` the other sources are still compiled).
 **Predefined macros.** Those of the target, the standard and the GNU dialect, as for
 `axiom build` ("Predefined macros"), `_REENTRANT` with `-pthread`, and, as a GNU-compatible
 cc's, the GNU compilers' (`--c-gnu-compat`, "GNU compatibility", in every mode but strict
-C95's): `__GNUC__` is 4, `__GNUC_MINOR__` 2 and `__GNUC_PATCHLEVEL__` 1, and `__VERSION__`
-is `"4.2.1 Compatible Axiom <version>"`. A configure script finds a GNU compiler ("whether
+C95's): `__GNUC__` is 9, `__GNUC_MINOR__` 4 and `__GNUC_PATCHLEVEL__` 0, and `__VERSION__`
+is `"9.4.0 Compatible Axiom <version>"`. A configure script finds a GNU compiler ("whether
 the compiler supports GNU C... yes"), the system's headers take their GNU paths (functions
 renamed by asm labels, `_FORTIFY_SOURCE`'s wrappers), and a program its `#ifdef __GNUC__`
 code: attributes, builtins, inline assembly. `__has_attribute`, `__has_builtin`,
@@ -2122,18 +2122,26 @@ compilers take their GNU paths:
 
 | Macro | |
 |---|---|
-| `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` | 4, 2, 1. Version 4.2.1 is the one other GNU-compatible compilers claim: the extensions its tests ask for are this dialect's, while the tests for later versions' (`__GNUC_PREREQ (4, 3)` and above in the system's headers: `__builtin_va_arg_pack`, `_Float128` as a GNU type, the attribute `access` ...) leave them out. A program that needs a later version's feature tests `__has_builtin` or `__has_attribute`. |
-| `__VERSION__` | `"4.2.1 Compatible Axiom <version>"`. |
+| `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` | 9, 4, 0. Build systems choose their options by the version: CMake gives a GNU compiler the options of C11 from 4.7, of C17 from 8.1 and of C23 from 9.1, and fails a target that asks for a standard it has none for; and the C extensions that programs and the system's headers test version 9 for are this dialect's (`_FloatN` as types, `__builtin_va_arg_pack`, `asm inline`, `__builtin_expect_with_probability`, the attributes `nonstring` and `fallthrough` ...). Later versions' features are found with `__has_builtin`, `__has_attribute` and `__has_include`, which say exactly what works. |
+| `__VERSION__` | `"9.4.0 Compatible Axiom <version>"`. |
 | `__GNUC_STDC_INLINE__`, `__GNUC_GNU_INLINE__` | C99's inline semantics (1 from C99 on), GNU89's (1 in gnu89 and gnu90). |
 | `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1` ... `_8`, `__GCC_ATOMIC_BOOL_LOCK_FREE` ... `__GCC_ATOMIC_POINTER_LOCK_FREE`, `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL` | The `__sync` builtins' sizes, the atomic types that are always lock-free (2), `__atomic_test_and_set`'s true value. |
 | `__GCC_IEC_559`, `__GCC_IEC_559_COMPLEX` | 2 (IEC 60559 arithmetic, its rounding modes and exceptions), not on WebAssembly; `__FINITE_MATH_ONLY__` 0. |
 
 The system's headers (`--c-lib=system`) then rename functions by asm labels (`__REDIRECT`:
 with `_FILE_OFFSET_BITS=64` `scandir` is `scandir64`, for the program's own `struct dirent`),
-leave the integer limits to the compiler's `<limits.h>`, and with `_FORTIFY_SOURCE` at `-O1`
-and above define `extern inline` wrappers of the string and `printf` functions, which call
-the object-size-checking builtins (`__builtin___memcpy_chk` ...); they declare `size_t` and
-`va_list` again, which the GNU dialects take in every standard. Without the option, in
+leave the integer limits to the compiler's `<limits.h>`, take `_Float16` ... `_Float128` and
+`__float128` for the dialect's types (which they are with `--c-gnu-compat`, the system's
+library's functions of them declared), and with `_FORTIFY_SOURCE` at `-O1` and above define
+`extern inline` wrappers of the string and `printf` functions, which call the
+object-size-checking builtins (`__builtin___memcpy_chk` ...); they declare `size_t` and
+`va_list` again, which the GNU dialects take in every standard. A wrapper that forwards its
+caller's variable arguments (`__builtin_va_arg_pack`: `printf`'s and `open`'s under
+`_FORTIFY_SOURCE`, `error`'s when optimizing) is not used: the GNU compilers give it those
+arguments by inlining each call, and here the call is the library's function itself, as
+without the wrapper (so those calls are not checked). The calls in such wrappers of
+functions with the attribute `error` or `warning` (the headers' checks of the arguments,
+in code that inlining removes) are not reported. Without the option, in
 `axiom build`, the macros are not defined, as before: a dialect's extensions do not claim
 another compiler's.
 
@@ -2868,6 +2876,7 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_offsetof(T, m)` | As `offsetof`. |
 | `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The bytes from p to the end of the object (t 0, 2) or of the closest member (t 1, 3; a member array at the end of its structure counts to the object's end), when the expression shows the object: a declared object of a complete non-VLA type, a string literal or a compound literal, its address, its array decayed, an element at a constant index, a member, or such a pointer converted or offset by a constant (0 past the end). Otherwise, when the argument has no side effects, the optimizer looks for the object after it has propagated the values (inlined, folded): a stack object, a global no other unit's definition can replace, a variable length array, the result of a call of a function with `alloc_size` (the argument, or the product of the two), with p at a constant offset from its start; for t 3 (the closest member's lower bound) it does not. A size known only when the program runs (a variable length array's, `alloc_size` of arguments that are not constants) is the answer of `__builtin_dynamic_object_size` only, computed there. Else unknown: `(size_t)-1` for t 0 and 1, 0 for 2 and 3 (an object whose type has a flexible array member is unknown; so is everything at `-O0` but what the expression shows and the variable length arrays). |
 | `__builtin___memcpy_chk`, `__builtin___memmove_chk`, `__builtin___mempcpy_chk`, `__builtin___memset_chk`, `__builtin___strcpy_chk`, `__builtin___stpcpy_chk`, `__builtin___strncpy_chk`, `__builtin___stpncpy_chk`, `__builtin___strcat_chk`, `__builtin___strncat_chk`, `__builtin___sprintf_chk`, `__builtin___snprintf_chk`, `__builtin___vsprintf_chk`, `__builtin___vsnprintf_chk`, `__builtin___printf_chk`, `__builtin___fprintf_chk` | The object-size-checked functions the system's headers call for `_FORTIFY_SOURCE` (with the destination's size, `__builtin_object_size`'s, as the last fixed argument): calls of the C library's `__memcpy_chk` ... (the system's, or this library's, which end the program with `*** buffer overflow detected ***` and `abort` when the object is too small); with a size of `(size_t)-1` (not known), and for `memcpy`, `memmove`, `memset` and `strncpy` with a constant length at most a constant size, the plain function (`strcpy` ...), as the GNU compilers fold them. |
+| `__builtin_va_arg_pack()`, `__builtin_va_arg_pack_len()` | In the inline definition of a function with variable arguments: its caller's variable arguments (as the last arguments of a call), and how many. Such a definition is not used ("GNU compatibility"): its calls are the external function's. Elsewhere `C3090`. |
 | `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb`, with `l` and `ll` | Of `unsigned int` (ffs, clrsb: `int`) ... `unsigned long long`; clz and ctz of 0 give the type's width. |
 | `__builtin_bswap16`, `bswap32`, `bswap64` | |
 | `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
