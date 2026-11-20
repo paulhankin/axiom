@@ -2183,7 +2183,7 @@ compiler's in every program, freestanding and with the system's C library too; u
 ISO standard it declares nothing), and `<stdlib.h>` includes it; `<string.h>`
 declares `strdup` and `strndup` in every standard and `<stdlib.h>` `posix_memalign`
 ("The C library"); a definition of `NULL` the program made before including a header that
-defines `NULL` is replaced by the header's (as other compilers' headers replace it; 7.1.3p2
+defines `NULL`, or of `offsetof` before `<stddef.h>`, is replaced by the header's (as other compilers' headers replace it; 7.1.3p2
 leaves it undefined, and under an ISO standard it is `C1060`). The other POSIX headers
 (`<unistd.h>`, `<sys/time.h>`, ...) are the system's: `--c-lib=system`.
 
