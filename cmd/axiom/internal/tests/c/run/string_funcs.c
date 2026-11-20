@@ -1,7 +1,8 @@
 /* <string.h>: each function C23 asks of a freestanding implementation
    (std/c/lib/string/), with the cases at its edges: empty strings, the
    null byte, bytes above 0x7f, and every length and alignment up to a few
-   words (the word-at-a-time paths) against byte-by-byte references. */
+   words (the word-at-a-time paths), and longer, against byte-by-byte
+   references. */
 #include "host.h"
 #include <string.h>
 
@@ -60,7 +61,8 @@ int main(void) {
     /* every length and alignment against references */
     int bad = 0;
     for (int k = 0; k < 2000; k++) {
-        size_t n = rnd() % 70, i = rnd() % 16, j = rnd() % 16;
+        /* (up to 69 bytes, and every other time up to 269: the vector loops) */
+        size_t n = rnd() % ((k & 1) ? 270 : 70), i = rnd() % 16, j = rnd() % 16;
         for (size_t q = 0; q < 300; q++) {
             a[q] = (unsigned char)rnd();
             b[q] = (unsigned char)rnd();
