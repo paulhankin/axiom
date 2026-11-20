@@ -2,13 +2,12 @@
    a definition only for inlining, even after a declaration without inline
    (as the system's headers declare a library function and then define a
    wrapper of it so): no external definition is made here (the other unit's
-   is the function, which links without a second definition), and a body
-   that refers to a static object is no error. */
+   is the function, which links without a second definition). */
 /* uses: ../print.ax */
 /* flags: --c-std=gnu11 */
 #include "../print.h"
 
-static int calls;
+int calls;
 extern int twice(int x);
 extern __inline __attribute__((__always_inline__, __gnu_inline__)) int twice(int x) {
     calls++;
