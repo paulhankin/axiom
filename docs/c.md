@@ -771,9 +771,10 @@ statement expressions for a compiler that is not theirs) are the compiler's buil
 the floating constants beyond their types' range in their macros (`HUGE_VAL` is
 `1e10000` there) are the infinities they mean, their warnings and the errors that say a
 feature is a later standard's (or an empty declaration) are not shown, a definition
-they make of a macro that another of them defined differently replaces it (as the
-system's `<limits.h>` defines `CHAR_MAX` after a library's header supplied its own:
-the program's own redefinition stays `C1060`), and in a GNU
+they make of a macro that another of them, or the program, defined differently replaces
+it (as the system's `<limits.h>` defines `CHAR_MAX` after a library's header supplied its
+own, and `<assert.h>` `assert` after a program's fallback definition: the program's own
+redefinition of a macro stays `C1060`), and in a GNU
 dialect `_FloatN` and `__float128` are not keywords there (they define them as types),
 while the definitions they make of the dialect's keywords (`__attribute__(x)` as nothing,
 `__extension__`, ...) are not made: those stay keywords, in the program's code too.
