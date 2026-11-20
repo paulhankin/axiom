@@ -134,6 +134,13 @@ const ops = {
     if (!st || st.kind !== 'sock' || st.failed) return reply(req, ERR);
     st.sock.write(payload, (err) => reply(req, err ? ERR : payload.length));
   },
+  // the end (FIN) is sent; reading goes on
+  shutdown(req, { h }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'sock' || st.failed) return reply(req, ERR);
+    st.sock.end();
+    reply(req, 0);
+  },
   timeout(req, { h, ms }) {
     const st = handles.get(h);
     if (!st || (st.kind !== 'sock' && st.kind !== 'udp')) return reply(req, ERR);
@@ -158,6 +165,10 @@ const ops = {
     } else if (st && st.kind === 'sock') {
       if (st.readOnly) st.sock.destroy();
       else st.sock.end();
+      // (what still arrives is dropped, not kept for a handle that is gone)
+      st.chunks = [];
+      st.sock.removeAllListeners('data');
+      st.sock.on('data', () => {});
     }
     reply(req, 0);
   },

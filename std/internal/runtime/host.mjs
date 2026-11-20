@@ -970,6 +970,7 @@ export function createHost(opts = {}) {
     },
     ax_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ax_sock_close: (h) => { net().call('close', { h }); },
+    ax_sock_shutdown: (h) => net().call('shutdown', { h }),
     ax_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
     // Processes and the environment. The program's threads share the
     // environment (workers are started with SHARE_ENV) and the directory,

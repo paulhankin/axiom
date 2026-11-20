@@ -1072,6 +1072,11 @@ fn response_write(ctx: *mut void, bytes: []u8) !usize {
 // connection back after 16 requests (or 256 KiB of a body) even when more
 // have arrived, so that one client cannot keep it.
 //
+// A connection closed after an error answer (or GOAWAY) while its client
+// may still be sending sends the end of the stream and is drained by
+// run()'s thread (DRAIN_MS, DRAIN_BYTES) before it is closed, so that the
+// client gets the answer rather than a reset.
+//
 // Connections are limited in number (max_connections, with the least
 // useful closed to make room: max_connections_per_addr), in time
 // (handshake_timeout_ms, head_timeout_ms, min_body_rate,
@@ -1298,6 +1303,7 @@ pub fn serve[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Re
 const SPEAKS_TLS_HANDSHAKE: u8 = 0;
 const SPEAKS_HTTP1: u8 = 1;
 const SPEAKS_HTTP2: u8 = 2;
+const SPEAKS_NOTHING: u8 = 3;  // answered for the last time: what still comes is drained (drain)
 
 /// A connection of a server's: waiting in run()'s Poller, or with a worker
 /// (one thread at a time has it).
@@ -1332,6 +1338,8 @@ struct Slot {
     ready: bool,        // handed back with more to do: straight to a worker again
     expired: bool,      // its time ran out: a worker answers (408, GOAWAY) and closes it
     evict_status: u16,  // (expired) made to give back its memory: 503
+    linger: bool,       // (closing) the client may still be sending: drain first
+    drain_left: usize,  // (draining) bytes more it may send before it is closed
     closed: bool,
 }
 
@@ -1439,20 +1447,24 @@ fn held_by(sl: *Slot) usize {
     return n;
 }
 
-// How readily a waiting connection is closed to make room: 0 one that has
-// not been answered yet (nor is sending a body), 1 one idle between
-// requests, 2 one in the middle of a request.
+// How readily a waiting connection is closed to make room: 0 one being
+// drained after its last answer, 1 one that has not been answered yet (nor
+// is sending a body), 2 one idle between requests, 3 one in the middle of
+// a request.
 fn eviction_class(sl: *Slot) u8 {
-    if sl.in_body {
-        return 2;
-    }
-    if not sl.served {
+    if sl.speaks == SPEAKS_NOTHING {
         return 0;
     }
-    if (sl.speaks == SPEAKS_HTTP1) and (sl.req_start != 0) {
-        return 2;
+    if sl.in_body {
+        return 3;
     }
-    return 1;
+    if not sl.served {
+        return 1;
+    }
+    if (sl.speaks == SPEAKS_HTTP1) and (sl.req_start != 0) {
+        return 3;
+    }
+    return 2;
 }
 
 /// One client (an IPv4 address, or an IPv6 /64) and what its connections
@@ -1550,7 +1562,7 @@ fn pick_victim(all: *vec.Vec.[*mut Slot], waiting: *vec.Vec.[*mut Slot]) usize {
         }
     }
     let mut best: usize = ws.len;
-    let mut best_class: u8 = 3;
+    let mut best_class: u8 = 4;
     let mut best_count: usize = 0;
     for k in @as(usize, 0)..ws.len {
         let class = eviction_class(ws[k]);
@@ -1737,7 +1749,17 @@ fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) 
             k -= 1;
             if p.ready(base + k) != 0 {
                 let sl = waiting.swap_remove(k);
-                s.work.send(sl) catch {};
+                if sl.speaks != SPEAKS_NOTHING {
+                    s.work.send(sl) catch {};
+                } else if not drain(sl) {
+                    close_slot(sl, false);
+                    forget(&mut all, sl);
+                } else {
+                    waiting.push(sl) catch {
+                        close_slot(sl, false);
+                        forget(&mut all, sl);
+                    };
+                }
             }
         }
         if s.has_wake and (p.ready(0) != 0) {
@@ -1760,7 +1782,7 @@ fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) 
                 }
                 if accept_failures >= 2 {
                     let v = pick_victim(&all, &waiting);
-                    if (v < waiting.len) and (eviction_class(waiting.get(v)) <= 1) {
+                    if (v < waiting.len) and (eviction_class(waiting.get(v)) <= 2) {
                         drop_waiting(&mut all, &mut waiting, v);
                     }
                 }
@@ -1868,6 +1890,78 @@ fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec
     return ADMITTED;
 }
 
+/// How long, and for how many bytes, a connection answered for the last
+/// time is drained of what its client still sends before it is closed
+/// (closing with bytes unread may reset the connection, and the client
+/// lose the answer).
+const DRAIN_MS: u32 = 2000;
+const DRAIN_BYTES: usize = 1048576;
+
+// Answers status (an error) and has the connection closed once drained.
+fn refuse(sl: *mut Slot, status: u16) u8 {
+    _ = reject(sl.c.stream, status);
+    sl.linger = true;
+    return HTTP1_CLOSE;
+}
+
+// Says GOAWAY, and has the connection closed once drained.
+fn h2_goaway(sl: *mut Slot, h: *mut http2.Conn) bool {
+    h.goaway(http2.NO_ERROR) catch {};
+    sl.linger = true;
+    return false;
+}
+
+// After a last answer: sends the end of the stream (TLS: close_notify
+// first), frees what the connection held, and leaves it to run()'s thread
+// to drain (drain) for at most DRAIN_MS and DRAIN_BYTES. False if it is
+// to be closed at once.
+fn begin_drain(sl: *mut Slot) bool {
+    if (sl.speaks != SPEAKS_HTTP1) and (sl.speaks != SPEAKS_HTTP2) {
+        return false;
+    }
+    if sl.t.secure {
+        sl.t.tls.close_write();
+    }
+    sl.t.tcp.shutdown_write() catch return false;
+    if sl.speaks == SPEAKS_HTTP2 {
+        sl.h2.h.deinit();
+        sl.h2.hs.deinit();
+        mem.destroy(sl.h2);
+    }
+    if sl.has_c {
+        sl.c.deinit();
+        sl.has_c = false;
+    }
+    sl.body.deinit();
+    sl.body = strs.String.init();
+    sl.speaks = SPEAKS_NOTHING;
+    sl.in_body = false;
+    sl.req_start = 0;
+    sl.ready = false;
+    sl.expired = false;
+    sl.drain_left = DRAIN_BYTES;
+    sl.deadline = now_ns() + ms_ns(DRAIN_MS);
+    return true;
+}
+
+// (run()'s thread) Reads and drops what a draining connection's client
+// sent; false once it should be closed (the client closed, or it is past
+// DRAIN_BYTES).
+fn drain(sl: *mut Slot) bool {
+    let mut junk: [16384]u8 = [0; 16384];
+    while sl.drain_left > 0 {
+        if (net.poll_one(sl.fd, net.READABLE, 0) catch 0) == 0 {
+            return true;
+        }
+        let n = sl.t.tcp.read(junk[..@min(junk.len, sl.drain_left)]) catch return false;
+        if n == 0 {
+            return false;
+        }
+        sl.drain_left -= n;
+    }
+    return false;
+}
+
 // A worker: serves connections with bytes to read, and hands each back
 // (to wait for more, or closed).
 fn work_loop[C](s: *mut Server.[C]) void {
@@ -1885,6 +1979,9 @@ fn work_loop[C](s: *mut Server.[C]) void {
             } else {
                 note_rx(sl, after, now_ns());  // (a new request)
             }
+        }
+        if not more and sl.linger and (@atomic_load(&s.stopping) == 0) {
+            more = begin_drain(sl);  // (closed, without losing the answer, once drained)
         }
         if not more or (@atomic_load(&s.stopping) != 0) {
             close_slot(sl, true);
@@ -1960,13 +2057,11 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
     if sl.expired {
         sl.expired = false;
         if sl.evict_status != 0 {
-            _ = reject(c.stream, sl.evict_status);
-            return HTTP1_CLOSE;
+            return refuse(sl, sl.evict_status);
         }
         // a body may still be on time: its window had ended
         if not (sl.in_body and on_time(o, sl, @as(u64, sl.body.len), sl.body_left, now_ns())) {
-            _ = reject(c.stream, 408);
-            return HTTP1_CLOSE;
+            return refuse(sl, 408);
         }
     }
     let mut answered: u32 = 0;
@@ -1998,8 +2093,7 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
                 if (e == error.TimedOut) and (c.end == c.start) {
                     return HTTP1_CLOSE;
                 }
-                _ = reject(c.stream, status_for(e));
-                return HTTP1_CLOSE;
+                return refuse(sl, status_for(e));
             };
             if head_len == 0 {
                 return HTTP1_CLOSE;
@@ -2019,8 +2113,7 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
                 return HTTP1_TO_H2;
             }
             if h.refuse != 0 {
-                _ = reject(c.stream, h.refuse);
-                return HTTP1_CLOSE;
+                return refuse(sl, h.refuse);
             }
             if h.expects_continue {
                 c.stream.write_all("HTTP/1.1 100 Continue\r\n\r\n") catch return HTTP1_CLOSE;
@@ -2035,14 +2128,13 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
         let whole = read_body(c, sl, body_limit(o)) catch |e| {
             if e == error.WouldBlock {
                 if not on_time(o, sl, @as(u64, sl.body.len), sl.body_left, now_ns()) {
-                    _ = reject(c.stream, 408);  // too slow
-                    return HTTP1_CLOSE;
+                    return refuse(sl, 408);  // too slow
                 }
                 sl.deadline = body_deadline(o, sl);
                 return HTTP1_WAIT;
             }
             if sl.chunked or (e == error.TimedOut) {
-                _ = reject(c.stream, status_for(e));
+                return refuse(sl, status_for(e));
             }
             return HTTP1_CLOSE;
         };
@@ -2055,6 +2147,9 @@ fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
         let keep = dispatch(s, sl);
         sl.scratch.clear();
         if (not keep) or (@atomic_load(&s.stopping) != 0) {
+            // (with more of the client's bytes in: close without losing
+            // the answer)
+            sl.linger = (not keep) and (c.end > c.start);
             return HTTP1_CLOSE;
         }
         c.set_nonblocking(true);
@@ -2469,8 +2564,7 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
         let ok = (sl.evict_status == 0) and sl.in_body and (now_ns() < h.deadline) and
                  on_time(o, sl, h.received, 0, now_ns());
         if not ok {
-            h.goaway(http2.NO_ERROR) catch {};
-            return false;
+            return h2_goaway(sl, h);
         }
     }
     if not x.started {
@@ -2488,8 +2582,7 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
     let turn_start = h.received;
     loop {
         if @atomic_load(&s.stopping) != 0 {
-            h.goaway(http2.NO_ERROR) catch {};
-            return false;
+            return h2_goaway(sl, h);
         }
         let mut id = h.take_done();
         if id == 0 {
@@ -2498,11 +2591,10 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
                     if h2_wait(o, sl, h) {
                         return true;
                     }
-                    h.goaway(http2.NO_ERROR) catch {};
-                    return false;
+                    return h2_goaway(sl, h);
                 }
                 if e == error.TimedOut {
-                    h.goaway(http2.NO_ERROR) catch {};
+                    return h2_goaway(sl, h);
                 }
                 return false;
             };
@@ -4644,8 +4736,7 @@ test "memory held by requests still arriving is bounded" {
         cs[k].set_timeout(800)!;
         @mem_set(buf[..], 0);
         if closed_by_server(cs[k], buf[..]) {
-            // (unless the close reset the connection before it was read)
-            @expect((buf[0] == 0) or strs.starts_with(buf[..], "HTTP/1.1 503 "));
+            @expect(strs.starts_with(buf[..], "HTTP/1.1 503 "));
             refused += 1;
         }
     }
@@ -4881,16 +4972,17 @@ test "bodies the server could never hold are refused at once" {
     // just under the room the budget leaves: served, on an idle server
     let n: usize = 1048576 - 65536;
     @expect(strs.ends_with(post_size(port, n, buf[..])!, "\r\n\r\n983040"));
-    // more: 413, before the body is sent (so only heads are sent here: a
-    // close with a body unread could reset the connection, answer and all)
-    let heads: [2][]u8 = ["POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 983041\r\n\r\n",
-                          "POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 16777216\r\n\r\n"];
-    for hd in heads {
-        let c = dial(port)!;
-        c.write_all(hd)!;
-        @expect(strs.starts_with(read_reply(c, buf[..])!, "HTTP/1.1 413 "));
-        c.close();
+    // more: 413 at the head, which the client gets though it sends the
+    // body anyway (the server drains it before closing: a close with bytes
+    // unread could reset the connection, answer and all)
+    for k in @as(usize, 0)..3 {
+        @expect(strs.starts_with(post_size(port, n + 1, buf[..])!, "HTTP/1.1 413 "));
+        _ = k;
     }
+    let c = dial(port)!;
+    c.write_all("POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: 16777216\r\n\r\n")!;
+    @expect(strs.starts_with(read_reply(c, buf[..])!, "HTTP/1.1 413 "));
+    c.close();
     srv.stop();
     th.join();
 }

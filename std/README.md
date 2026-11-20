@@ -375,6 +375,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_tcp_connect(name, len, port) i32`, `ax_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ax_tcp_accept(h) i32`, `ax_tcp_local_port(h) i32` | |
 | `ax_sock_read(h, p, n) isize`, `ax_sock_write(h, p, n) isize`, `ax_sock_close(h)` | |
+| `ax_sock_shutdown(h) i32` | sends the end of the stream; reading goes on |
 | `ax_sock_timeout(h, ms) i32` | later reads and writes on `h` fail with `-5` after `ms` milliseconds (`0`: never) |
 | `ax_thread_spawn(entry, arg, stack_top, exited) i32`, `ax_thread_stack_size() usize`, `ax_thread_exit()` | threads (spec §12.8.5) |
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns)` | |

@@ -886,6 +886,11 @@ int32_t ax_sock_timeout(int32_t h, uint32_t ms) {
     return 0;
 }
 
+// Sends the end (FIN): the peer reads what was sent, then end of file; reading goes on.
+int32_t ax_sock_shutdown(int32_t h) {
+    return shutdown(h, SHUT_WR) != 0 ? AX_ERR : 0;
+}
+
 // Shutting the socket down first wakes a thread blocked in accept on it.
 void ax_sock_close(int32_t h) {
     shutdown(h, SHUT_RDWR);

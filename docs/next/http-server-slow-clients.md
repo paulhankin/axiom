@@ -30,6 +30,13 @@
     full speed is spared). A body larger than `max_buffered_bytes - max_head_bytes` is
     refused (413) whatever `max_body_bytes` says.
 
+  A connection closed after an error answer (413, 408, 503, 400, ...) while its client
+  may still be sending, or after GOAWAY, now has the end of the stream sent and is drained
+  of what still comes, for up to 2 s and 1 MiB, by `run()`'s thread before it is closed:
+  closing a socket with bytes unread resets the connection, and the client could lose the
+  answer. Draining connections count toward `max_connections` and are the first closed
+  to make room. `net.TcpStream.shutdown_write` (new) sends the end of a stream and goes
+  on reading; `tls.Conn.close_write` sends close_notify alone.
   `net.TcpListener.accept` now fails with `Empty` when the connection was reset before
   it could be taken, and with `OutOfMemory` when the process is out of file descriptors
   or memory (it failed with `NetError` for both); the server pauses accepting only for
