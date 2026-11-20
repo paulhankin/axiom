@@ -1727,6 +1727,7 @@ fn sink_to_use(f: *mut ir.Func) void {
             i = pv;
         }
         if cnt <= 1000 {
+            sink_past_reads(b);
             sink_phi_inputs(b);
         }
         b = b.next;
@@ -1774,6 +1775,72 @@ fn sink_phi_inputs(b: *mut ir.Block) void {
             p = p.next;
         }
     }
+}
+
+// An integer operation of a value and a constant (`pc + 1`) before the
+// value's last read in the block, whose own result is read only after that
+// read (or not in the block: a phi's input on the way out), moves to after
+// it: the two then do not overlap and can share a register, with no copy
+// where the loop goes round again. Valid as for sink_to_use: the moved
+// instruction is pure, and its operand is defined before it.
+fn sink_past_reads(b: *mut ir.Block) void {
+    let t = ir.terminator(b);
+    if u.isnil(t) {
+        return;
+    }
+    let mut x = b.first;
+    while u.notnil(x) and (x != t) {
+        let nx = x.next;
+        let v = x.a;
+        if (x.op != ir.OP_PHI) and sinkable2(x) and is.is_c(x.b) and u.notnil(v) and not is.is_c(v) and
+           ((v.kind == ir.V_INST) or (v.kind == ir.V_PARAM)) {
+            // the last read of v before the first of x (not the terminator)
+            let mut lu = u.nil.[ir.Value]();
+            let mut i = x.next;
+            while u.notnil(i) and (i != t) and not reads_through(i, x, 3) {
+                if reads_through(i, v, 3) {
+                    lu = i;
+                }
+                i = i.next;
+            }
+            if u.notnil(lu) and u.notnil(lu.next) {
+                let np = lu.pos + ((lu.next.pos - lu.pos) / 2);
+                if np > lu.pos {
+                    unlink_inst(x);
+                    ir.insert_before(lu.next, x);
+                    x.pos = np;
+                }
+            }
+        }
+        x = nx;
+    }
+}
+
+// Does i read x, itself or through an operand computed in it (a folded
+// load, an address: those stay where they were, before x perhaps, and are
+// made where they are used)?
+fn reads_through(i: *ir.Value, x: *mut ir.Value, depth: i32) bool {
+    if xis.reads_of(i, x) > 0 {
+        return true;
+    }
+    if depth == 0 {
+        return true;  // (not known)
+    }
+    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+    for o in ops {
+        if u.notnil(o) and (o.kind == ir.V_INST) and ((o.flag != 0) or xsl.folded_load(o) or xsl.bcast_splat(o)) and
+           reads_through(o, x, depth - 1) {
+            return true;
+        }
+    }
+    for k in 0..i.xs.len {
+        let o = i.xs.get(k);
+        if (o.kind == ir.V_INST) and ((o.flag != 0) or xsl.folded_load(o) or xsl.bcast_splat(o)) and
+           reads_through(o, x, depth - 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Operand o (of an instruction computed at e) is used at position epos.
