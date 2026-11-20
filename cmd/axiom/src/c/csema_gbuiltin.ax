@@ -272,6 +272,30 @@ let LIB_TYPES: [108][]u8 = ["iPPz", "zC", "iCC", "iCCz", "ccC", "ccCz", "ccC", "
                             "ffI", "ddG", "ffF", "ld", "qd", "ld", "qd", "ff", "ff", "ff", "ff", "ff", "ff", "ff",
                             "ipC.", "iCp", "iip", "iip", "zPzzp", "zCC", "zCC", "cCC", "qq", "iC.", "iCC.", "ipC."];
 
+// The object-size-checking builtins (__builtin___memcpy_chk ...), which the
+// system's headers call with _FORTIFY_SOURCE: calls of the C library's
+// functions of their names (__memcpy_chk ...), in the codes of LIB_TYPES (V
+// va_list); with an object size of (size_t)-1 (not known), or one a
+// constant length fits, the plain function's (CHK_PLAIN, "" if none), as
+// the GNU compilers fold them.
+let CHK_NAMES: [16][]u8 = ["__memcpy_chk", "__memmove_chk", "__mempcpy_chk", "__memset_chk", "__strcpy_chk",
+                           "__stpcpy_chk", "__strncpy_chk", "__stpncpy_chk", "__strcat_chk", "__strncat_chk",
+                           "__sprintf_chk", "__snprintf_chk", "__vsprintf_chk", "__vsnprintf_chk", "__printf_chk",
+                           "__fprintf_chk"];
+let CHK_TYPES: [16][]u8 = ["ppPzz", "ppPzz", "ppPzz", "ppizz", "ccCz", "ccCz", "ccCzz", "ccCzz", "ccCz", "ccCzz",
+                           "icizC.", "iczizC.", "icizCV", "iczizCV", "iiC.", "ipiC."];
+let CHK_PLAIN: [16][]u8 = ["memcpy", "memmove", "", "memset", "strcpy", "", "strncpy", "", "strcat", "strncat", "",
+                           "", "", "", "", ""];
+
+fn chk_index(name: []u8) i32 {
+    for k in 0..CHK_NAMES.len {
+        if u.str_eq(CHK_NAMES[k], name) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
 let ATOMIC_OPS: [6][]u8 = ["add", "sub", "or", "and", "xor", "nand"];
 
 fn atomic_op(name: []u8) u64 {
@@ -454,7 +478,7 @@ pub fn known(name: []u8) bool {
     }
     if (math_index(rest, &mut sfx) >= 0) or (bits_index(rest, &mut longs) >= 0) or in_list(rest, CLASS[..]) or
        in_list(rest, TCLASS[..]) or in_list(rest, CMPS[..]) or (lib_index(rest) >= 0) or u.str_eq(rest, "memcpy") or
-       u.str_eq(rest, "memmove") or u.str_eq(rest, "memset") {
+       u.str_eq(rest, "memmove") or u.str_eq(rest, "memset") or (chk_index(rest) >= 0) {
         return true;
     }
     let typed = ["sadd", "saddl", "saddll", "uadd", "uaddl", "uaddll", "ssub", "ssubl", "ssubll", "usub", "usubl",
@@ -920,6 +944,10 @@ pub fn call(e: *mut cast.Expr) bool {
         e.op = GB_ASSUME_ALIGNED;
         e.ty = cty.pointer_to(cty.t_void);
         return true;
+    }
+    let ck = chk_index(rest);
+    if ck >= 0 {
+        return chk_call(e, @int_cast(usize, ck));
     }
     let lk = lib_index(rest);
     if lk >= 0 {
@@ -1620,8 +1648,47 @@ fn lib_type(c: u8) *mut cty.CType {
         'I'  => { return cty.pointer_to(cty.t_int); }
         'F'  => { return cty.pointer_to(cty.t_float); }
         'G'  => { return cty.pointer_to(cty.t_double); }
+        'V'  => {
+            // (va_list as a parameter: adjusted, an array to a pointer)
+            let t = csb.va_list_type();
+            if t.kind == cty.TK_ARRAY {
+                return cty.pointer_to(t.elem);
+            }
+            return t;
+        }
         else => { return cty.pointer_to(cty.t_ldouble); }
     }
+}
+
+// __builtin___X_chk(..., size): the plain function's call, its arguments
+// but the object size, when that size is (size_t)-1 or (the memory
+// functions, the string copies of a length) a constant length is at most a
+// constant size; else a call of the library's __X_chk. The result as
+// call's: true when typed here.
+fn chk_call(e: *mut cast.Expr, k: usize) bool {
+    let plain = CHK_PLAIN[k];
+    let code = CHK_TYPES[k];
+    let nfixed = code.len - 1;
+    if (plain.len > 0) and (e.args.len == nfixed) {
+        let mut size: i64 = 0;
+        let sized = const_int(arg(e, nfixed - 1), &mut size);
+        let mut fits = sized and (size == -1);
+        if not fits and sized and (size >= 0) and (((k <= 3) and (k != 2)) or (k == 6)) {
+            // (memcpy (d, s, n, size), memmove, memset, strncpy: they write
+            // n bytes, at most size)
+            let mut n: i64 = 0;
+            fits = const_int(arg(e, 2), &mut n) and (n >= 0) and (n <= size);
+        }
+        if fits {
+            _ = e.args.pop();
+            let f = cast.new_expr(cast.ExprKind.IDENT, e.a.span);
+            f.name = u.intern(u.cat2("__builtin_", plain));
+            e.a = f;
+            return call(e);
+        }
+    }
+    library(e, CHK_NAMES[k], code);
+    return false;
 }
 
 // __builtin_name(...) of a library function: a call of `name` (the
