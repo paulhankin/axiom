@@ -70,5 +70,8 @@ run ./axcc $OPT chars.c -o viaaxcc
 run $CC -march=native -c chars.c -o o.o
 if [ "$(uname -m)" = x86_64 ]; then
     run $CC -msse4.2 -mno-avx -c chars.c -o o.o
+    # (the extensions every x86-64 program here has: taken, no warning)
+    run $CC -mrdrnd -mrdseed -mxsave -msse2 -c chars.c -o o.o 2> m.err
+    [ -s m.err ] && fail "-mrdrnd ...: $(cat m.err)"
 fi
 exit 0
