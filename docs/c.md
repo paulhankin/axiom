@@ -271,7 +271,7 @@ to every build as it is, and changes a default.
 |---|---|
 | `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version and each build's command to standard error, `-###` the commands without running them. |
 | `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
-| `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later. |
+| `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later, or a GNU dialect (gnu89 too, as `-std=gnu89`, `-std=c89` and `-ansi` give). |
 | `-O0` ... `-O3`, `-O`, `-Os`, `-Oz`, `-Og`, `-Ofast` | `-O` and `-Og` are `-O1`, `-Os` and `-Oz` `-O2`, `-Ofast` and above 3 `-O3` (no fast-math: the arithmetic stays IEEE 754's). |
 | `-g`, `-g2`, `-g3`, `-ggdb`, `-gdwarf-N`; `-g1`; `-g0` | `-g` (full); `--debug-info=lines`; none. Other `-g...` are accepted. |
 | `-w`, `-Werror`, `-Wno-error`, `-Wall`, `-Wunknown-pragmas`, `-Wformat=2`, `-Wno-format` | `--c-warnings=off`, `=error`, `=on`; `--c-warn-unknown-pragmas` (as `-Wall` has it); `--c-warn-format=2`, `=0`. Every other `-W...` is accepted (`-Werror=x` too): the front end's warnings have no groups of those names. |
@@ -317,9 +317,8 @@ library exports its definitions of default visibility; a version script, or the 
 definitions may be bound to them when it is compiled (its functions inlined or called
 directly, as with `-Bsymbolic`), so a program's definition of the same name does not
 interpose them everywhere. `-iquote` directories are searched for `<...>` too. With
-`--c-lib=axiom`, `-rdynamic` does nothing (a warning). C89 and gnu89 need
-`--c-lib=axiom` (the system's headers need C99), and `-std=c89`, a GNU dialect then,
-accepts `//` comments.
+`--c-lib=axiom`, `-rdynamic` does nothing (a warning). `-std=c89`, a GNU dialect (gnu89,
+which takes the system's headers' `long long`), accepts `//` comments.
 
 ## Several source files
 
@@ -782,7 +781,7 @@ and named variadic macro parameters (`name...`), which they take their compiler 
 `__uint128_t`): in them, and in their macros' expansions, those are accepted.
 Without `--c-gnu-compat` `__GNUC__` is not defined, so they use what they have for other
 compilers; with it (`axiom cc`) their GNU paths ("GNU compatibility"). The standard
-must be C99 or later, the C options the platform's ABI's (`--c-int`, `--c-long`), and
+must be C99 or later or a GNU dialect (gnu89 and gnu90 take the headers' `long long`), the C options the platform's ABI's (`--c-int`, `--c-long`), and
 `--c-freestanding` is not given. `setjmp` and the other functions POSIX says return twice
 (`_setjmp`, `sigsetjmp`, `vfork`, `getcontext`) make their callers return twice. The
 program's constructors and destructors run as they do with this library; returning from
