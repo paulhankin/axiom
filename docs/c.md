@@ -1983,7 +1983,7 @@ without the C library, are the compiler's headers:
 | Header | What |
 |---|---|
 | `<mmintrin.h>` | MMX's `__m64` functions (`_mm_add_pi8`, `_m_paddb` ...), computed in the low half of an SSE register (the MMX registers are never used, and `_mm_empty` does nothing), and the types of the others. |
-| `<xmmintrin.h>`, `<emmintrin.h>` | SSE and SSE2, complete, with `_MM_SHUFFLE`, `_MM_TRANSPOSE4_PS`, the MXCSR macros (`_MM_SET_ROUNDING_MODE` ...), `_mm_prefetch` and its hints, `_mm_malloc` and `_mm_free` (`<mm_malloc.h>`, in a hosted program). |
+| `<xmmintrin.h>`, `<emmintrin.h>` | SSE and SSE2, complete, with `_MM_SHUFFLE`, `_MM_TRANSPOSE4_PS`, the MXCSR macros (`_MM_SET_ROUNDING_MODE` ...), `_mm_prefetch` and its hints, `_mm_malloc` and `_mm_free` (`<mm_malloc.h>`, in a hosted program; outside Windows the memory is `posix_memalign`'s, so that `free` frees it and `_mm_free` is `free`, as with other compilers' headers). |
 | `<pmmintrin.h>`, `<tmmintrin.h>`, `<smmintrin.h>`, `<nmmintrin.h>` | SSE3, SSSE3, SSE4.1 (with `_MM_FROUND_*`), SSE4.2 (the string compares, `_SIDD_*`, CRC32) and POPCNT. |
 | `<wmmintrin.h>` | AES and PCLMULQDQ. |
 | `<immintrin.h>` | All of the above, and AVX, AVX2 (with the gathers), FMA, F16C, BMI1, BMI2, LZCNT, POPCNT, ADX (and the carry chains `_addcarry_u32` ... of any processor), SHA, RDRAND, RDSEED, `_xgetbv`, `_rdtsc`/`__rdtsc`, `__rdtscp`, `_mm_pause`, the bit operations `_bswap`, `_bit_scan_forward`, `_rotl` ... and `_castf32_u32` .... |
