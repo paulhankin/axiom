@@ -1950,7 +1950,7 @@ library's are `C1081`.
 | `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
 | `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64`, `d64x` and `d128` functions (C23 7.27p3, H.13p3); the narrowing macros `d32add` ... (7.27p11; Annex H's `f32add` ... `d64xsqrt`, H.13p5) and the quantum macros (7.27p12) are there; arguments of the interchange and extended types (Annex H.11) their common real type's own functions (`sqrtf16` ... `sqrtf64x`, `cexpf32` ..., declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16` and the standard function of the format for `_Float32` ... `_Float64x`). |
 | `<stdalign.h>` | C11 and later | |
-| `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"), with memory orders. `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
+| `<stdatomic.h>` | C11 and later (and the GNU dialects before it, whose `_Atomic` is an extension) | All of 7.17 (see "Atomics and threads"), with memory orders. `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |

@@ -22,8 +22,14 @@
 #ifndef __AXIOM_STDATOMIC_H
 #define __AXIOM_STDATOMIC_H
 
-#if __STDC_VERSION__ < 201112L
+#if __STDC_VERSION__ < 201112L && !defined(__AXIOM_GNU__)
 #error "<stdatomic.h> is a header of C11 and later"
+#endif
+#if __STDC_VERSION__ < 201112L
+/* (the GNU dialects have _Atomic, _Bool and _Generic before C11 too, with
+   a warning their programs do not see in this header) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "C4145"
 #endif
 
 #if __STDC_VERSION__ >= 202311L
@@ -199,4 +205,7 @@ static inline void atomic_flag_clear_explicit(volatile atomic_flag *__axiom_f, m
     (__builtin_atomic_exchange(&(f)->__axiom_set, 1, (order)) != 0)
 #define atomic_flag_clear_explicit(f, order) __builtin_atomic_store(&(f)->__axiom_set, 0, (order))
 
+#if __STDC_VERSION__ < 201112L
+#pragma GCC diagnostic pop
+#endif
 #endif
