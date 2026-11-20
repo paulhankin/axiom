@@ -37,3 +37,23 @@
   (it had them without the `x`, which are not Intel's names), and the x86-64 assembler
   takes `movd` between an `xmm` register and a 64-bit general register (the GNU
   assembler's spelling of `movq`).
+- `--c-gnu-compat` (which `axiom cc` gives in its GNU dialects) defines the GNU compilers'
+  macros, `__GNUC__` 9.4.0 and its companions (`__VERSION__`, `__GNUC_STDC_INLINE__`,
+  `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_N`, `__GCC_ATOMIC_*_LOCK_FREE`, `__GCC_IEC_559` ...), so
+  configure scripts, CMake and the system's headers take their GNU paths; `axiom cc -v`
+  says `gcc version 9.4.0 compatible`. What those paths use is there: asm-label renaming
+  (`_FILE_OFFSET_BITS=64`), `_FORTIFY_SOURCE`'s wrappers with the object-size-checking
+  builtins (`__builtin___memcpy_chk` ...; `__builtin_va_arg_pack` in a wrapper leaves the
+  call to the library's function), `_FloatN` as types, the compiler's `<limits.h>` giving
+  the limits the system's leaves to it, and the system's library in gnu89 and gnu90.
+- GNU89's `extern inline` stays a definition only for inlining after a declaration without
+  `inline`; a transparent union parameter is compatible with a member's type; the GNU
+  dialects take a typedef declared again before C11, `static` and qualifiers in array
+  parameters and `<stdatomic.h>` before C11; the attributes of functions are taken on
+  pointers to functions, and the hints `access`, `nonstring`, `no_sanitize`, `tls_model`
+  ... anywhere; `target("sse2,rdrnd")` and `-mrdrnd` name what every x86-64 program has.
+- An `-I` of one of the system's directories (`-I/usr/include`) leaves their headers the
+  system's.
+- The linkers no longer change the permissions of an output that is a device or a FIFO
+  (`-o /dev/null`, which build systems probe with: as root, `/dev/null` became 0755), and
+  the Mach-O linker writes such an output in place instead of replacing it.
