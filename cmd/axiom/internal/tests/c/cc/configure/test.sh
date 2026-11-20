@@ -14,6 +14,8 @@ run make check > check.out 2>&1
 echo __GNUC__ __GNUC_MINOR__ __VERSION__ > v.c
 run $CC -E -P v.c -o v.i
 has v.i "4 2 \"4.2.1 Compatible Axiom "
+$CC -v -E -P v.c -o v.i 2> v.err || fail "-v: $(cat v.err)"
+has v.err "gcc version 4.2.1 compatible"
 run $CC -std=iso9899:199409 --c-lib=axiom -E -P v.c -o v95.i
 has v95.i "__GNUC__ __GNUC_MINOR__ __VERSION__"
 exit 0
