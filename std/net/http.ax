@@ -17,10 +17,13 @@
 //     r.serve("0.0.0.0", 8080, http.Options.default())!;
 //
 // or, without a router, http.serve(hostname, port, handler, ctx, options).
-// Handlers run on a pool of threads (Options.threads), each serving one
-// connection at a time; the context pointer is shared by all of them, so
+// Handlers run on a pool of threads (Options.threads), each answering one
+// request at a time; the context pointer is shared by all of them, so
 // synchronize what it points at (std/sync). A Request and everything it
-// points at lives until the handler returns.
+// points at lives until the handler returns. A connection holds a thread
+// only while one of its requests is answered: run()'s thread waits on the
+// others (idle, or with a request or TLS handshake still arriving), so slow
+// or idle clients cannot take the threads.
 //
 // The response body is buffered and sent with a Content-Length, unless it
 // grows past 64 KiB or the handler calls flush(), when it is streamed
@@ -29,7 +32,13 @@
 //
 // The server speaks HTTP/1.0 and 1.1 with keep-alive and pipelining,
 // chunked request bodies and `Expect: 100-continue`, and limits the size of
-// request heads and bodies (431, 413) and how long a connection may idle.
+// request heads and bodies (431, 413), how long they and TLS handshakes
+// may take (408), how long a connection may idle, and how many may be
+// open, in all and from one address (see Options). Before exposing it to
+// the internet at large, consider a reverse proxy all the same: it can
+// limit what one client may do across connections and addresses, and
+// handle clients that read responses slowly (a worker writing a response
+// waits up to idle_timeout_ms for each write).
 //
 // A client:
 //
@@ -50,8 +59,9 @@
 //     let mut resp = http.request("GET", url, http.no_headers(), "", opts)!; A server serves HTTPS when made with
 // server_tls (or Router.serve_tls) and a tls.ServerConfig.
 //
-// The server and the client are threads and blocking sockets over std/net,
-// so they run natively and on WebAssembly under node alike.
+// The server and the client are threads and sockets over std/net (the
+// server waits on its connections with a net.Poller), so they run natively
+// and on WebAssembly under node alike.
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
@@ -83,7 +93,7 @@ pub error HttpError { InvalidArgument, BadRequest, BadResponse, BadUrl, TooLarge
                       InvalidLength, InvalidPem, MessageTooLong, WeakKey, UnsupportedAlgorithm, DivisionByZero,
                       UnknownAuthority, Expired, NotYetValid, Negative, HostnameMismatch, NotInvertible, BadSignature,
                       NoSpaceLeft, NotCA, IncompatibleUsage, NameConstraint, UnhandledCriticalExtension, Distrusted,
-                      PathTooLong, Corrupt, InvalidBase64, UnexpectedTag }
+                      PathTooLong, Corrupt, InvalidBase64, UnexpectedTag, WouldBlock }
 
 pub struct Header {
     name: []u8,
@@ -235,14 +245,26 @@ struct Conn {
     buf: []mut u8,
     start: usize,  // unread data is buf[start..end]
     end: usize,
-    pin: usize,     // buf[..pin] holds the current head: never moved
-    limit: usize,   // the most buf may grow to
-    deadline: i64,  // monotonic ns by which the current message must arrive (0: none)
-    h2: bool,       // the client sent HTTP/2's preface
+    pin: usize,         // buf[..pin] holds the current head: never moved
+    limit: usize,       // the most buf may grow to
+    deadline: i64,      // monotonic ns by which the current message must arrive (0: none)
+    scanned: usize,     // how much of a head read_head has searched for its end
+    nonblocking: bool,  // reads fail with WouldBlock rather than wait (set_nonblocking)
 
     fn init(stream: Transport, limit: usize) HttpError!Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
-        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, h2: false };
+        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, scanned: 0,
+                      nonblocking: false };
+    }
+
+    /// Whether reads fail with WouldBlock when nothing has arrived, rather
+    /// than wait (TLS included). The read methods may be called again after
+    /// WouldBlock: they go on where they stopped.
+    fn set_nonblocking(self: *mut Conn, on: bool) void {
+        self.nonblocking = on;
+        if self.stream.secure {
+            self.stream.tls.nonblocking = on;
+        }
     }
 
     fn deinit(self: *mut Conn) void {
@@ -269,6 +291,10 @@ struct Conn {
         if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
             return error.TimedOut;
         }
+        if self.nonblocking and not self.stream.secure and
+           (net.poll_one(self.stream.tcp.handle, net.READABLE, 0)! == 0) {
+            return error.WouldBlock;
+        }
         let n = self.stream.read(self.buf[self.end..])!;
         self.end += n;
         return n;
@@ -283,33 +309,37 @@ struct Conn {
         self.start = 0;
         self.end = n;
         self.pin = 0;
+        self.scanned = 0;
     }
 
     /// Waits for a whole head (up to and including the blank line) and
     /// returns its length from `start`; 0 if the peer closed the connection
     /// before sending anything.
     fn read_head(self: *mut Conn) !usize {
-        let mut scanned: usize = 0;
         loop {
             // blank lines before a message are ignored (RFC 9112 section 2.2)
-            while (scanned == 0) and (self.start < self.end) and
+            while (self.scanned == 0) and (self.start < self.end) and
                   ((self.buf[self.start] == '\r') or (self.buf[self.start] == '\n')) {
                 self.start += 1;
             }
             let data = self.buf[self.start..self.end];
-            let mut i = scanned;
+            let mut i = self.scanned;
             while i < data.len {
                 if data[i] == '\n' {
                     if ((i + 1) < data.len) and (data[i + 1] == '\n') {
+                        self.scanned = 0;
                         return i + 2;
                     }
                     if ((i + 2) < data.len) and (data[i + 1] == '\r') and (data[i + 2] == '\n') {
+                        self.scanned = 0;
                         return i + 3;
                     }
                 }
                 i += 1;
             }
-            scanned = @max(data.len, 2) - 2;
+            // (kept across WouldBlock: a head dripped a byte at a time is
+            // searched once, not once per byte)
+            self.scanned = @max(data.len, 2) - 2;
             let n = self.fill()!;
             if n == 0 {
                 if self.end == self.start {
@@ -397,51 +427,89 @@ struct Conn {
     /// A chunked body (RFC 9112 section 7.1), appended to out; trailers are
     /// checked as headers are, then dropped. Lines must end in CRLF.
     fn read_chunked(self: *mut Conn, out: *mut strs.String, max: usize) !void {
+        let mut st = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+        return self.read_chunked_from(out, max, &mut st);
+    }
+
+    /// read_chunked from where st says it stopped (after WouldBlock).
+    fn read_chunked_from(self: *mut Conn, out: *mut strs.String, max: usize, st: *mut ChunkState) !void {
         loop {
-            let line = self.read_line()!;
-            let semi = strs.index_of_byte(line, ';') catch line.len;
-            if not valid_chunk_ext(line[semi..]) {
-                return error.BadRequest;
-            }
-            // chunk-size = 1*HEXDIG, then optional whitespace before extensions
-            let size_text = trim_trailing_blanks(line[..semi]);
-            if (size_text.len == 0) or (size_text.len > ((2 * @size_of(usize)) - 1)) {
-                return error.BadRequest;
-            }
-            let mut size: usize = 0;
-            for c in size_text {
-                let d = hex_value(c);
-                if d > 15 {
+            if st.phase == CHUNK_SIZE {
+                let line = self.read_line()!;
+                let semi = strs.index_of_byte(line, ';') catch line.len;
+                if not valid_chunk_ext(line[semi..]) {
                     return error.BadRequest;
                 }
-                size = (size * 16) + @as(usize, d);
-            }
-            if size == 0 {
-                // trailers until a blank line (a bounded number)
-                for _k in @as(usize, 0)..MAX_TRAILERS {
-                    let t = self.read_line()!;
-                    if t.len == 0 {
-                        return;
-                    }
-                    let mut one: [1]Header = [Header.{ name: "", value: "" }];
-                    if parse_headers(t, one[..])! != 1 {
+                // chunk-size = 1*HEXDIG, then optional whitespace before extensions
+                let size_text = trim_trailing_blanks(line[..semi]);
+                if (size_text.len == 0) or (size_text.len > ((2 * @size_of(usize)) - 1)) {
+                    return error.BadRequest;
+                }
+                let mut size: usize = 0;
+                for c in size_text {
+                    let d = hex_value(c);
+                    if d > 15 {
                         return error.BadRequest;
                     }
+                    size = (size * 16) + @as(usize, d);
                 }
-                return error.HeadTooLarge;
-            }
-            if (out.len + size) > max {
-                return error.TooLarge;
-            }
-            self.read_into(out, size)!;
-            let mut crlf: [2]u8 = [0; 2];
-            self.read_exact(crlf[..])!;
-            if not @mem_eq(crlf[..], "\r\n") {
-                return error.BadRequest;
+                if size == 0 {
+                    st.phase = CHUNK_TRAILERS;  // (left counts them)
+                    st.left = 0;
+                } else {
+                    if (out.len + size) > max {
+                        return error.TooLarge;
+                    }
+                    st.phase = CHUNK_DATA;
+                    st.left = size;
+                }
+            } else if st.phase == CHUNK_DATA {
+                while st.left > 0 {
+                    let part = self.take(@min(st.left, 65536))!;
+                    out.push_str(part)!;
+                    st.left -= part.len;
+                }
+                st.phase = CHUNK_CRLF;
+            } else if st.phase == CHUNK_CRLF {
+                while (self.end - self.start) < 2 {
+                    if self.fill()! == 0 {
+                        return error.Closed;
+                    }
+                }
+                if not @mem_eq(self.buf[self.start..self.start + 2], "\r\n") {
+                    return error.BadRequest;
+                }
+                self.start += 2;
+                st.phase = CHUNK_SIZE;
+            } else {
+                // trailers until a blank line (a bounded number)
+                if st.left == MAX_TRAILERS {
+                    return error.HeadTooLarge;
+                }
+                let t = self.read_line()!;
+                if t.len == 0 {
+                    return;
+                }
+                let mut one: [1]Header = [Header.{ name: "", value: "" }];
+                if parse_headers(t, one[..])! != 1 {
+                    return error.BadRequest;
+                }
+                st.left += 1;
             }
         }
     }
 }
+
+/// Where a chunked body's reading stopped.
+struct ChunkState {
+    phase: u8,
+    left: usize,  // of the chunk's data; or trailers read
+}
+
+const CHUNK_SIZE: u8 = 0;      // the size line
+const CHUNK_DATA: u8 = 1;      // the data
+const CHUNK_CRLF: u8 = 2;      // the CRLF after it
+const CHUNK_TRAILERS: u8 = 3;  // the trailers
 
 // Chunk extensions: *( BWS ";" BWS name [ BWS "=" BWS ( token /
 // quoted-string ) ] ), with no control bytes.
@@ -986,14 +1054,53 @@ fn response_write(ctx: *mut void, bytes: []u8) !usize {
 
 // -----------------------------------------------------------------------------
 // The server
+//
+// run()'s thread waits on every connection at once (a net.Poller): for new
+// connections, and for bytes on each open connection that no worker is
+// serving. A connection goes to one of the Options.threads worker threads
+// only when bytes have arrived, and the worker reads without waiting: a
+// TLS handshake, a request head and a request body each get as far as the
+// bytes received allow, and the connection goes back to run()'s thread to
+// wait for more. So a worker is held only while a handler runs and its
+// response is sent: an idle keep-alive connection, or a client sending its
+// request slowly, costs a connection, not a thread. Connections are
+// limited in number (max_connections, max_connections_per_addr) and in
+// time (handshake_timeout_ms, head_timeout_ms, min_body_rate,
+// request_timeout_ms, and idle_timeout_ms between requests).
 // -----------------------------------------------------------------------------
 
 pub struct Options {
-    threads: u32,           // connections served at once, one per thread
-    max_head_bytes: usize,  // request line and headers
+    /// Worker threads: how many requests are handled at once (run()'s own
+    /// thread waits for connections).
+    threads: u32,
+    /// The most a request line and headers may take (more: 431).
+    max_head_bytes: usize,
+    /// The most a request body may take (more: 413).
     max_body_bytes: usize,
-    idle_timeout_ms: u32,     // how long any one read may wait
-    request_timeout_ms: u32,  // how long a whole request may take to arrive
+    /// How long a connection may wait for its next request; and how long
+    /// a worker waits on any one write (or read, for HTTP/2's flow control
+    /// and upgraded connections).
+    idle_timeout_ms: u32,
+    /// How long a whole request may take to arrive, from its first byte
+    /// (HTTP/2: each request, from the last answer).
+    request_timeout_ms: u32,
+    /// How long a request head may take to arrive, from its first byte (a
+    /// new connection's, from when it was accepted or its TLS handshake
+    /// done); then 408 and the connection is closed. Also the time a body
+    /// has before min_body_rate applies.
+    head_timeout_ms: u32,
+    /// How long a TLS handshake may take, from the connection's accept.
+    handshake_timeout_ms: u32,
+    /// The bytes per second a request body must average, after the first
+    /// head_timeout_ms (0: no minimum); a slower one gets 408.
+    min_body_rate: u32,
+    /// Connections open at once. When a new one would exceed it, the one
+    /// waiting longest (idle between requests first) is closed; when every
+    /// connection is in a worker, new ones wait in the listen backlog.
+    max_connections: u32,
+    /// Connections open at once from one client address (IPv6: one /64);
+    /// more are closed as they are accepted. 0: no limit.
+    max_connections_per_addr: u32,
 
     pub fn default() Options {
         return Options.{
@@ -1002,6 +1109,11 @@ pub struct Options {
             max_body_bytes: 8388608,
             idle_timeout_ms: 30000,
             request_timeout_ms: 60000,
+            head_timeout_ms: 5000,
+            handshake_timeout_ms: 5000,
+            min_body_rate: 500,
+            max_connections: 512,
+            max_connections_per_addr: 64,
         };
     }
 }
@@ -1015,38 +1127,103 @@ pub struct Server[C] {
     stopping: u32,
     tls_config: *tls.ServerConfig,
     secure: bool,
+    work: *mut sync.Channel.[*mut Slot],  // connections with bytes to read, for the workers
+    back: *mut sync.Channel.[*mut Slot],  // from the workers: to wait on again, or closed
+    wake: net.UdpSocket,                  // a datagram to it ends run()'s wait
+    wake_addr: net.Addr,
+    has_wake: bool,
+    state: u32,        // RUN_NOT_YET, RUN_RUNNING, RUN_OVER (under lock)
+    lock: sync.Mutex,  // (state and wake, between run() and stop())
 
     /// The port it listens on (useful after listening on port 0).
     pub fn port(self: *Self) u16 {
         return self.listener.port();
     }
 
-    /// Serves connections on Options.threads threads (this one included)
-    /// until stop() is called.
+    /// Serves until stop() is called: handlers run on Options.threads
+    /// worker threads, and this thread waits for connections.
     pub fn run(self: *mut Self) HttpError!void {
-        let extra = @as(usize, @max(self.opts.threads, 1)) - 1;
-        let ts = mem.alloc.[thread.Thread.[*mut Self]](@max(extra, 1))!;
+        let cap = @as(usize, @max(self.opts.max_connections, 1));
+        let work = mem.create(sync.Channel.[*mut Slot].init(cap)!)!;
+        defer mem.destroy(work);
+        defer work.deinit();
+        let back = mem.create(sync.Channel.[*mut Slot].init(cap)!)!;
+        defer mem.destroy(back);
+        defer back.deinit();
+        let n = @as(usize, @max(self.opts.threads, 1));
+        let ts = mem.alloc.[thread.Thread.[*mut Self]](n)!;
         defer mem.free(ts);
+        self.lock.lock();
+        if self.state != RUN_NOT_YET {
+            self.lock.unlock();
+            return;  // (stopped already)
+        }
+        self.state = RUN_RUNNING;
+        self.work = work;
+        self.back = back;
+        // (without it, run() looks for returned connections every few ms)
+        self.wake = net.UdpSocket.bind(net.Addr.loopback(net.Family.V4, 0)) catch net.UdpSocket.{ handle: -1 };
+        if self.wake.handle >= 0 {
+            let none = net.Addr.loopback(net.Family.V4, 0);
+            self.wake_addr = self.wake.local_addr() catch none;
+            if self.wake_addr.port == 0 {
+                self.wake.close();
+                self.wake.handle = -1;
+            }
+        }
+        self.has_wake = self.wake.handle >= 0;
+        self.lock.unlock();
         let mut started: usize = 0;
-        for i in 0..extra {
-            ts[i] = thread.spawn(accept_loop.[C], self) catch break;
+        for i in 0..n {
+            ts[i] = thread.spawn(work_loop.[C], self) catch break;
             started += 1;
         }
-        accept_loop(self);
-        for i in 0..started {
-            ts[i].join();
+        let no_workers = started == 0;
+        if no_workers {
+            _ = @atomic_xchg(&mut self.stopping, 1);
+        }
+        wait_loop(self, ts[..started]);
+        self.lock.lock();
+        self.state = RUN_OVER;
+        if self.has_wake {
+            self.wake.close();
+            self.has_wake = false;
+        }
+        self.lock.unlock();
+        self.listener.close();
+        if no_workers {
+            return error.OutOfMemory;
         }
     }
 
     /// Stops accepting connections; run() returns once the connections in
-    /// progress have finished their current request. May be called from a
-    /// handler or any other thread.
+    /// progress have finished their current request (connections waiting
+    /// for one are closed). May be called from a handler or any other
+    /// thread.
     pub fn stop(self: *mut Self) void {
         if @atomic_xchg(&mut self.stopping, 1) == 0 {
-            self.listener.close();
+            self.lock.lock();
+            if self.state == RUN_NOT_YET {
+                self.state = RUN_OVER;
+                self.listener.close();
+            } else if self.state == RUN_RUNNING {
+                self.wake_up();
+            }
+            self.lock.unlock();
+        }
+    }
+
+    // Ends run()'s wait.
+    fn wake_up(self: *mut Self) void {
+        if self.has_wake {
+            self.wake.send_to("w", self.wake_addr) catch {};
         }
     }
 }
+
+const RUN_NOT_YET: u32 = 0;
+const RUN_RUNNING: u32 = 1;
+const RUN_OVER: u32 = 2;
 
 /// Listens on hostname:port (hostname "" or "0.0.0.0" for every address; port 0
 /// for any free port). Call run() to serve.
@@ -1061,6 +1238,13 @@ pub fn server[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut R
         stopping: 0,
         tls_config: @ptr_from_int(*tls.ServerConfig, 8),
         secure: false,
+        work: @ptr_from_int(*mut sync.Channel.[*mut Slot], 8),
+        back: @ptr_from_int(*mut sync.Channel.[*mut Slot], 8),
+        wake: net.UdpSocket.{ handle: -1 },
+        wake_addr: net.Addr.loopback(net.Family.V4, 0),
+        has_wake: false,
+        state: RUN_NOT_YET,
+        lock: sync.Mutex.init(),
     };
 }
 
@@ -1081,35 +1265,638 @@ pub fn serve[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Re
     s.run()!;
 }
 
-fn accept_loop[C](s: *mut Server.[C]) void {
+// What a connection is speaking.
+const SPEAKS_TLS_HANDSHAKE: u8 = 0;
+const SPEAKS_HTTP1: u8 = 1;
+const SPEAKS_HTTP2: u8 = 2;
+
+/// A connection of a server's: waiting in run()'s Poller, or with a worker
+/// (one thread at a time has it).
+struct Slot {
+    fd: i32,
+    peer: net.Addr,
+    speaks: u8,
+    t: Transport,       // (once any TLS handshake is done)
+    tc: *mut tls.Conn,  // (during the handshake)
+    c: Conn,            // (HTTP/1, has_c)
+    has_c: bool,
+    h2: *mut H2Conn,  // (HTTP/2)
+    body: strs.String,
+    scratch: Scratch,
+    deadline: i64,   // monotonic ns at which waiting for it ends
+    since: i64,      // when it began waiting
+    req_start: i64,  // when the request being received began (0: none, between requests)
+    body_start: i64,
+    in_body: bool,  // the head is in, the body is coming
+    head_off: usize,
+    head_len: usize,
+    chunked: bool,
+    body_left: usize,  // (Content-Length)
+    chunk: ChunkState,
+    expired: bool,  // its time ran out: a worker answers (408, GOAWAY) and closes it
+    closed: bool,
+}
+
+/// An HTTP/2 connection, with the transport its reads come through.
+struct H2Conn {
+    t: Transport,
+    nonblocking: bool,
+    started: bool,  // the preface and settings exchanged
+    h: http2.Conn,
+    hs: vec.Vec.[Header],
+
+    fn set_nonblocking(self: *mut H2Conn, on: bool) void {
+        self.nonblocking = on;
+        if self.t.secure {
+            self.t.tls.nonblocking = on;
+        }
+    }
+}
+
+fn h2_read(ctx: *mut void, buf: []mut u8) !usize {
+    let x = @ptr_cast(*mut H2Conn, ctx);
+    if x.nonblocking and not x.t.secure and (net.poll_one(x.t.tcp.handle, net.READABLE, 0)! == 0) {
+        return error.WouldBlock;
+    }
+    return x.t.read(buf)!;
+}
+
+fn h2_write(ctx: *mut void, bytes: []u8) !usize {
+    let x = @ptr_cast(*mut H2Conn, ctx);
+    x.t.write_all(bytes)!;
+    return bytes.len;
+}
+
+fn ms_ns(ms: u32) i64 {
+    return @as(i64, ms) * 1000000;
+}
+
+fn now_ns() i64 {
+    return time.Instant.now().ns;
+}
+
+// Whether two peers count as one client: the same IPv4 address, or IPv6
+// /64 (an IPv4-mapped address whole).
+fn same_client(a: net.Addr, b: net.Addr) bool {
+    if a.family != b.family {
+        return false;
+    }
+    let mut n: usize = 4;
+    if a.family == net.Family.V6 {
+        let mapped: [12]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF];
+        n = 8;
+        if @mem_eq(a.ip[..12], mapped[..]) {
+            n = 16;
+        }
+    }
+    return @mem_eq(a.ip[..n], b.ip[..n]);
+}
+
+// Closes a connection and frees what it holds but the Slot. polite: with
+// TLS's close_notify (a write: workers only).
+fn close_slot(sl: *mut Slot, polite: bool) void {
+    if sl.closed {
+        return;
+    }
+    if sl.speaks == SPEAKS_TLS_HANDSHAKE {
+        sl.tc.closed_write = true;  // (no alert)
+        sl.tc.close();
+    } else {
+        if sl.speaks == SPEAKS_HTTP2 {
+            sl.h2.h.deinit();
+            sl.h2.hs.deinit();
+            mem.destroy(sl.h2);
+        }
+        if sl.t.secure and not polite {
+            sl.t.tls.closed_write = true;
+        }
+        sl.t.close();
+    }
+    if sl.has_c {
+        sl.c.deinit();
+        sl.has_c = false;
+    }
+    sl.body.deinit();
+    sl.scratch.clear();
+    sl.scratch.blocks.deinit();
+    sl.closed = true;
+}
+
+// Whether a connection whose time ran out is owed an answer: one with part
+// of a request (408), or HTTP/2 (GOAWAY).
+fn owed_answer(sl: *Slot) bool {
+    if sl.speaks == SPEAKS_HTTP2 {
+        return true;
+    }
+    return (sl.speaks == SPEAKS_HTTP1) and sl.has_c and (sl.in_body or (sl.c.end > sl.c.start));
+}
+
+// Drops a closed connection from the list of open ones and frees it.
+fn forget(all: *mut vec.Vec.[*mut Slot], sl: *mut Slot) void {
+    let xs = all.items();
+    for k in @as(usize, 0)..xs.len {
+        if xs[k] == sl {
+            _ = all.swap_remove(k);
+            break;
+        }
+    }
+    mem.destroy(sl);
+}
+
+// run()'s thread: waits for new connections, for bytes on connections
+// that are waiting, and for connections the workers hand back; then, once
+// stopping, closes them all and waits for the workers.
+fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) void {
+    let mut all = vec.Vec.[*mut Slot].init();  // every open connection
+    defer all.deinit();
+    let mut waiting = vec.Vec.[*mut Slot].init();  // those waiting here, not with a worker
+    defer waiting.deinit();
+    let mut p = net.Poller.init();
+    defer p.deinit();
     loop {
-        let conn = s.listener.accept() catch {
-            if @atomic_load(&s.stopping) != 0 {
-                return;
+        if @atomic_load(&s.stopping) != 0 {
+            break;
+        }
+        let now = now_ns();
+        // those the workers are done with
+        loop {
+            let sl = s.back.try_recv() catch break;
+            if sl.closed {
+                forget(&mut all, sl);
+            } else {
+                sl.since = now;
+                waiting.push(sl) catch {
+                    close_slot(sl, false);
+                    forget(&mut all, sl);
+                };
             }
-            thread.sleep_ms(10);  // e.g. out of file descriptors
+        }
+        // those whose time is up
+        let mut next = now + 1000000000;
+        let mut i: usize = 0;
+        while i < waiting.len {
+            let sl = waiting.get(i);
+            if sl.deadline > now {
+                next = @min(next, sl.deadline);
+                i += 1;
+                continue;
+            }
+            _ = waiting.swap_remove(i);
+            if owed_answer(sl) {
+                sl.expired = true;
+                s.work.send(sl) catch {};
+            } else {
+                close_slot(sl, false);
+                forget(&mut all, sl);
+            }
+        }
+        let mut timeout = @int_cast(i32, ((next - now) / 1000000) + 1);
+        if not s.has_wake {
+            timeout = @min(timeout, 5);
+        }
+        // (at the limit with nothing to close, new connections wait in the
+        // listen backlog)
+        let max = @as(usize, @max(s.opts.max_connections, 1));
+        let listening = (all.len < max) or (waiting.len > 0);
+        p.clear();
+        let mut base: usize = 0;
+        if s.has_wake {
+            _ = p.add(s.wake.handle, net.READABLE) catch 0;
+            base += 1;
+        }
+        if listening {
+            _ = p.add(s.listener.handle, net.READABLE) catch 0;
+            base += 1;
+        }
+        let mut polled: usize = 0;
+        for sl in waiting.items() {
+            _ = p.add(sl.fd, net.READABLE) catch break;
+            polled += 1;
+        }
+        let n = p.wait(timeout) catch {
+            thread.sleep_ms(5);
             continue;
         };
-        if @atomic_load(&s.stopping) != 0 {
+        if (n == 0) or (@atomic_load(&s.stopping) != 0) {
+            continue;
+        }
+        // connections with something to read: to the workers (from the
+        // end, as swap_remove takes the last one)
+        let mut k = polled;
+        while k > 0 {
+            k -= 1;
+            if p.ready(base + k) != 0 {
+                let sl = waiting.swap_remove(k);
+                s.work.send(sl) catch {};
+            }
+        }
+        if s.has_wake and (p.ready(0) != 0) {
+            let mut b: [16]u8 = [0; 16];
+            let mut from = net.Addr.loopback(net.Family.V4, 0);
+            while (net.poll_one(s.wake.handle, net.READABLE, 0) catch 0) != 0 {
+                _ = s.wake.recv_from(b[..], &mut from) catch break;
+            }
+        }
+        if listening and ((p.ready(base - 1) & net.READABLE) != 0) {
+            admit(s, &mut all, &mut waiting);
+        }
+    }
+    // stopping: close those waiting; the workers finish what they have
+    for sl in waiting.items() {
+        close_slot(sl, false);
+    }
+    s.work.close();
+    for w in workers {
+        w.join();
+    }
+    for sl in all.items() {
+        close_slot(sl, false);
+        mem.destroy(sl);
+    }
+    loop {
+        _ = s.back.try_recv() catch break;  // (all freed above)
+    }
+}
+
+// Takes a new connection, within the limits.
+fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) void {
+    let conn = s.listener.accept() catch return;  // (e.g. out of file descriptors)
+    let o = s.opts;
+    let peer = conn.peer_addr() catch {
+        conn.close();
+        return;
+    };
+    if o.max_connections_per_addr > 0 {
+        let mut same: u32 = 0;
+        for x in all.items() {
+            if same_client(x.peer, peer) {
+                same += 1;
+            }
+        }
+        if same >= o.max_connections_per_addr {
             conn.close();
             return;
         }
-        conn.set_timeout(s.opts.idle_timeout_ms) catch {
-            conn.close();
-            continue;
-        };
-        let mut t = Transport.plain(conn);
-        if s.secure {
-            // the handshake closes the socket if it fails
-            t = Transport.over_tls(tls.server(conn, s.tls_config) catch continue);
-        }
-        if s.secure and strs.eq(t.tls.protocol(), "h2") {
-            serve_h2(s, t, "");
-        } else {
-            serve_connection(s, t);
-        }
-        t.close();
     }
+    if all.len >= @as(usize, @max(o.max_connections, 1)) {
+        // make room: close the connection waiting longest, idle ones first
+        let ws = waiting.items();
+        let mut best: usize = ws.len;
+        for k in @as(usize, 0)..ws.len {
+            if best == ws.len {
+                best = k;
+                continue;
+            }
+            let idle_k = (ws[k].speaks == SPEAKS_HTTP1) and (ws[k].req_start == 0);
+            let idle_b = (ws[best].speaks == SPEAKS_HTTP1) and (ws[best].req_start == 0);
+            if (idle_k and not idle_b) or ((idle_k == idle_b) and (ws[k].since < ws[best].since)) {
+                best = k;
+            }
+        }
+        if best == ws.len {
+            conn.close();
+            return;
+        }
+        let old = waiting.swap_remove(best);
+        close_slot(old, false);
+        forget(all, old);
+    }
+    conn.set_timeout(o.idle_timeout_ms) catch {
+        conn.close();
+        return;
+    };
+    let sl = mem.new_zeroed.[Slot]() catch {
+        conn.close();
+        return;
+    };
+    let now = now_ns();
+    sl.fd = conn.handle;
+    sl.peer = peer;
+    sl.t = Transport.plain(conn);
+    sl.body = strs.String.init();
+    sl.scratch = new_scratch();
+    sl.since = now;
+    sl.chunk = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+    if s.secure {
+        sl.speaks = SPEAKS_TLS_HANDSHAKE;
+        sl.tc = tls.server_start(conn, s.tls_config) catch {
+            conn.close();
+            sl.body.deinit();
+            mem.destroy(sl);
+            return;
+        };
+        sl.tc.nonblocking = true;
+        sl.tc.deadline = now + ms_ns(o.handshake_timeout_ms);
+        sl.deadline = sl.tc.deadline;
+    } else {
+        sl.speaks = SPEAKS_HTTP1;
+        sl.req_start = now;
+        sl.deadline = now + ms_ns(@min(o.head_timeout_ms, o.request_timeout_ms));
+    }
+    all.push(sl) catch {
+        close_slot(sl, false);
+        mem.destroy(sl);
+        return;
+    };
+    waiting.push(sl) catch {
+        close_slot(sl, false);
+        forget(all, sl);
+    };
+}
+
+// A worker: serves connections with bytes to read, and hands each back
+// (to wait for more, or closed).
+fn work_loop[C](s: *mut Server.[C]) void {
+    loop {
+        let sl = s.work.recv() catch return;  // (closed: stopping)
+        let mut more = false;
+        if @atomic_load(&s.stopping) == 0 {
+            more = advance(s, sl);
+        }
+        if not more or (@atomic_load(&s.stopping) != 0) {
+            close_slot(sl, true);
+        }
+        s.back.send(sl) catch {};  // (never full: it holds every connection)
+        s.wake_up();
+    }
+}
+
+// Serves what has arrived on a connection; true to wait for more, false to
+// close it.
+fn advance[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    if sl.speaks == SPEAKS_TLS_HANDSHAKE {
+        if sl.expired {
+            return false;
+        }
+        _ = sl.tc.handshake_step() catch |e| {
+            if e == error.WouldBlock {
+                sl.deadline = sl.tc.deadline;
+                return true;
+            }
+            return false;
+        };
+        sl.t = Transport.over_tls(sl.tc);
+        if strs.eq(sl.tc.protocol(), "h2") {
+            if not start_h2(s, sl, "") {
+                return false;
+            }
+        } else {
+            sl.speaks = SPEAKS_HTTP1;
+            sl.req_start = now_ns();
+        }
+    }
+    if sl.speaks == SPEAKS_HTTP1 {
+        let r = advance_http1(s, sl);
+        if r != HTTP1_TO_H2 {
+            return r == HTTP1_WAIT;
+        }
+        // the preface was read as a request head: give HTTP/2 all of it
+        let mut pre = strs.String.init();
+        defer pre.deinit();
+        pre.push_str("PRI * HTTP/2.0\r\n\r\n") catch return false;
+        pre.push_str(sl.c.buf[sl.c.start..sl.c.end]) catch return false;
+        sl.c.deinit();
+        sl.has_c = false;
+        if not start_h2(s, sl, pre.bytes()) {
+            return false;
+        }
+    }
+    return advance_h2(s, sl);
+}
+
+const HTTP1_CLOSE: u8 = 0;
+const HTTP1_WAIT: u8 = 1;
+const HTTP1_TO_H2: u8 = 2;
+
+// HTTP/1: reads what has arrived, and serves each request once all of it
+// has.
+fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
+    let o = s.opts;
+    if not sl.has_c {
+        sl.c = Conn.init(sl.t, o.max_head_bytes) catch return HTTP1_CLOSE;
+        sl.has_c = true;
+    }
+    let c = &mut sl.c;
+    c.set_nonblocking(true);
+    if sl.expired {
+        _ = reject(c.stream, 408);
+        return HTTP1_CLOSE;
+    }
+    loop {
+        if not sl.in_body {
+            c.deadline = 0;
+            if sl.req_start != 0 {
+                c.deadline = sl.req_start + ms_ns(o.request_timeout_ms);
+            }
+            let head_len = c.read_head() catch |e| {
+                if e == error.WouldBlock {
+                    let now = now_ns();
+                    if sl.req_start == 0 {
+                        if c.end == c.start {
+                            sl.deadline = now + ms_ns(o.idle_timeout_ms);
+                            return HTTP1_WAIT;
+                        }
+                        sl.req_start = now;
+                    }
+                    sl.deadline = sl.req_start + ms_ns(@min(o.head_timeout_ms, o.request_timeout_ms));
+                    return HTTP1_WAIT;
+                }
+                if (e == error.Closed) or (e == error.NetError) {
+                    return HTTP1_CLOSE;
+                }
+                if (e == error.TimedOut) and (c.end == c.start) {
+                    return HTTP1_CLOSE;
+                }
+                _ = reject(c.stream, status_for(e));
+                return HTTP1_CLOSE;
+            };
+            if head_len == 0 {
+                return HTTP1_CLOSE;
+            }
+            let now = now_ns();
+            if sl.req_start == 0 {
+                sl.req_start = now;
+                c.deadline = now + ms_ns(o.request_timeout_ms);
+            }
+            sl.head_off = c.start;
+            sl.head_len = head_len;
+            c.start += head_len;
+            c.pin = c.start;
+            let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
+            let h = check_head(c.buf[sl.head_off..sl.head_off + head_len], hs[..], o.max_body_bytes);
+            if h.h2 {
+                return HTTP1_TO_H2;
+            }
+            if h.refuse != 0 {
+                _ = reject(c.stream, h.refuse);
+                return HTTP1_CLOSE;
+            }
+            if h.expects_continue {
+                c.stream.write_all("HTTP/1.1 100 Continue\r\n\r\n") catch return HTTP1_CLOSE;
+            }
+            sl.in_body = true;
+            sl.chunked = h.fr.chunked;
+            sl.body_left = h.fr.length;
+            sl.chunk = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+            sl.body_start = now;
+        }
+        read_body(c, sl, o.max_body_bytes) catch |e| {
+            if e == error.WouldBlock {
+                sl.deadline = body_deadline(o, sl);
+                if now_ns() < sl.deadline {
+                    return HTTP1_WAIT;
+                }
+                _ = reject(c.stream, 408);  // too slow
+                return HTTP1_CLOSE;
+            }
+            if sl.chunked or (e == error.TimedOut) {
+                _ = reject(c.stream, status_for(e));
+            }
+            return HTTP1_CLOSE;
+        };
+        // the whole request: answer it (waiting, as a handler may)
+        c.set_nonblocking(false);
+        let keep = dispatch(s, sl);
+        sl.scratch.clear();
+        if (not keep) or (@atomic_load(&s.stopping) != 0) {
+            return HTTP1_CLOSE;
+        }
+        c.set_nonblocking(true);
+        sl.in_body = false;
+        sl.req_start = 0;
+        c.reset();
+        if sl.body.capacity() > 1048576 {
+            sl.body.deinit();
+        }
+        sl.body.clear();
+    }
+}
+
+fn read_body(c: *mut Conn, sl: *mut Slot, max: usize) !void {
+    if sl.chunked {
+        return c.read_chunked_from(&mut sl.body, max, &mut sl.chunk);
+    }
+    while sl.body_left > 0 {
+        let part = c.take(@min(sl.body_left, 65536))!;
+        sl.body.push_str(part)!;
+        sl.body_left -= part.len;
+    }
+}
+
+// When a body still arriving has taken too long: the request's deadline,
+// or the time by which its next byte keeps it at min_body_rate (after the
+// first head_timeout_ms).
+fn body_deadline(o: Options, sl: *Slot) i64 {
+    let mut d = sl.req_start + ms_ns(o.request_timeout_ms);
+    if o.min_body_rate > 0 {
+        let need = @int_cast(i64, sl.body.len + 1);
+        let t = (sl.body_start + ms_ns(o.head_timeout_ms)) + ((need * 1000000000) / @as(i64, o.min_body_rate));
+        d = @min(d, t);
+    }
+    return d;
+}
+
+/// What a request head says, once checked.
+struct Head {
+    refuse: u16,  // the status to refuse it with (0: none)
+    h2: bool,     // HTTP/2's preface
+    method: []u8,
+    target: []u8,
+    version: Version,
+    nh: usize,  // headers, in the array check_head was given
+    fr: Framing,
+    keep: bool,
+    expects_continue: bool,
+}
+
+/// Parses and checks a request head (up to and including its blank line).
+fn check_head(head: []u8, hs: []mut Header, max_body: usize) Head {
+    let mut h = Head.{ refuse: 400, h2: false, method: "", target: "", version: Version.HTTP_1_1, nh: 0,
+                       fr: Framing.{ chunked: false, length: 0, has_length: false }, keep: false,
+                       expects_continue: false };
+    // the request line
+    let line_end = strs.index_of_byte(head, '\n') catch return h;
+    let mut rl = head[..line_end];
+    if (rl.len > 0) and (rl[rl.len - 1] == '\r') {
+        rl = rl[..rl.len - 1];
+    }
+    let sp1 = strs.index_of_byte(rl, ' ') catch return h;
+    let rest = rl[sp1 + 1..];
+    let sp2 = strs.index_of_byte(rest, ' ') catch return h;
+    let method = rl[..sp1];
+    let target = rest[..sp2];
+    let proto = rest[sp2 + 1..];
+    if (method.len == 0) or (target.len == 0) {
+        return h;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return h;
+        }
+    }
+    for ch in target {
+        if (ch <= 0x20) or (ch == 0x7F) {
+            return h;
+        }
+    }
+    if @mem_eq(method, "PRI") and @mem_eq(target, "*") and @mem_eq(proto, "HTTP/2.0") {
+        h.h2 = true;
+        h.refuse = 0;
+        return h;
+    }
+    let mut version = Version.HTTP_1_1;
+    if @mem_eq(proto, "HTTP/1.0") {
+        version = Version.HTTP_1_0;
+    } else if not @mem_eq(proto, "HTTP/1.1") {
+        if strs.starts_with(proto, "HTTP/") {
+            h.refuse = 505;
+        }
+        return h;
+    }
+    let nh = parse_headers(head[line_end + 1..], hs) catch |e| {
+        h.refuse = status_for(e);
+        return h;
+    };
+    let headers = hs[..nh];
+    // exactly one Host (RFC 9112 3.2)
+    let mut hosts: usize = 0;
+    for x in headers {
+        if strs.eq_ignore_case(x.name, "Host") {
+            hosts += 1;
+        }
+    }
+    if (hosts > 1) or ((version == Version.HTTP_1_1) and (hosts == 0)) {
+        return h;
+    }
+    let fr = framing(headers) catch |e| {
+        h.refuse = status_for(e);
+        return h;
+    };
+    if fr.chunked and (version == Version.HTTP_1_0) {
+        return h;  // (HTTP/1.0 has no transfer codings: faulty framing)
+    }
+    if fr.has_length and (fr.length > max_body) {
+        h.refuse = 413;
+        return h;
+    }
+    // keep-alive
+    let conn_hdr = find_header(headers, "Connection") catch "";
+    let mut keep = version == Version.HTTP_1_1;
+    if has_token(conn_hdr, "close") {
+        keep = false;
+    } else if (version == Version.HTTP_1_0) and has_token(conn_hdr, "keep-alive") {
+        keep = true;
+    }
+    h.refuse = 0;
+    h.method = method;
+    h.target = target;
+    h.version = version;
+    h.nh = nh;
+    h.fr = fr;
+    h.keep = keep;
+    h.expects_continue = (fr.chunked or (fr.length > 0)) and
+                         has_token(find_header(headers, "Expect") catch "", "100-continue");
+    return h;
 }
 
 /// Sends a short error response and returns false (close the connection).
@@ -1137,34 +1924,61 @@ fn status_for(e: error) u16 {
     }
 }
 
-fn serve_connection[C](s: *mut Server.[C], stream: Transport) void {
-    let mut c = Conn.init(stream, s.opts.max_head_bytes) catch return;
-    defer c.deinit();
-    let mut body = strs.String.init();
-    defer body.deinit();
-    let mut scratch = new_scratch();
-    defer scratch.blocks.deinit();
-    loop {
-        let keep = serve_request(s, &mut c, &mut body, &mut scratch) catch false;
-        scratch.clear();
-        if c.h2 {
-            // the preface was read as a request head: give HTTP/2 all of it
-            let mut pre = strs.String.init();
-            defer pre.deinit();
-            pre.push_str("PRI * HTTP/2.0\r\n\r\n") catch return;
-            pre.push_str(c.buf[c.start..c.end]) catch return;
-            serve_h2(s, c.stream, pre.bytes());
-            return;
-        }
-        if (not keep) or (@atomic_load(&s.stopping) != 0) {
-            return;
-        }
-        c.reset();
-        if body.capacity() > 1048576 {
-            body.deinit();
-        }
-        body.clear();
+// Runs the handler on a request that has arrived whole; false if the
+// connection should close.
+fn dispatch[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    let c = &mut sl.c;
+    let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
+    let h = check_head(c.buf[sl.head_off..sl.head_off + sl.head_len], hs[..], s.opts.max_body_bytes);
+    let target = h.target;
+    let q = strs.index_of_byte(target, '?') catch target.len;
+    let mut query: []u8 = "";
+    if q < target.len {
+        query = target[q + 1..];
     }
+    let req = Request.{
+        method: h.method,
+        target: target,
+        path: target[..q],
+        query: query,
+        version: h.version,
+        headers: hs[..h.nh],
+        body: sl.body.bytes(),
+        scratch: &mut sl.scratch,
+    };
+    let mut res = Response.{
+        stream: c.stream,
+        status: 200,
+        head: strs.String.init(),
+        body: strs.String.init(),
+        version: h.version,
+        head_only: @mem_eq(h.method, "HEAD"),
+        keep_alive: h.keep,
+        started: false,
+        chunked: false,
+        has_type: false,
+        upgraded: false,
+        h2: @ptr_from_int(*mut http2.Conn, 8),
+        h2_id: 0,
+        is_h2: false,
+    };
+    defer res.head.deinit();
+    defer res.body.deinit();
+    s.handler(s.ctx, &req, &mut res) catch {
+        if res.started {
+            return false;  // too late to report it: drop the connection
+        }
+        res.status = 500;
+        res.head.clear();
+        res.body.clear();
+        res.has_type = false;
+        res.write("Internal Server Error\n") catch return false;
+    };
+    if res.upgraded {
+        return false;  // the handler has had the connection
+    }
+    res.finish() catch return false;
+    return res.keep_alive;
 }
 
 fn transport_read(ctx: *mut void, buf: []mut u8) !usize {
@@ -1211,42 +2025,69 @@ fn h2_malformed(st: *mut http2.Stream) bool {
     return false;
 }
 
-// HTTP/2: the requests of a connection, one at a time (the others wait,
-// their frames handled meanwhile). Like an HTTP/1 request, each must
-// arrive within request_timeout_ms of the last answer (or the start), and
-// its answer be sent within that long.
-fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
-    let mut t = stream;
-    let r = io.Reader.{ ctx: @ptr_cast(*mut void, &mut t), read_fn: transport_read };
-    let w = io.Writer.{ ctx: @ptr_cast(*mut void, &mut t), write_fn: transport_write };
-    let mut h = http2.Conn.init(r, w, true, prefill) catch return;
-    defer h.deinit();
-    h.max_body = s.opts.max_body_bytes;
-    let timeout = @as(i64, s.opts.request_timeout_ms) * 1000000;
-    h.deadline = time.Instant.now().ns + timeout;
-    h.handshake() catch return;
-    let mut scratch = new_scratch();
-    defer scratch.blocks.deinit();
-    let mut hs = vec.Vec.[Header].init();
-    defer hs.deinit();
+// Makes a connection HTTP/2's (prefill: what was read of it already).
+fn start_h2[C](s: *mut Server.[C], sl: *mut Slot, prefill: []u8) bool {
+    let x = mem.new_zeroed.[H2Conn]() catch return false;
+    x.t = sl.t;
+    let r = io.Reader.{ ctx: @ptr_cast(*mut void, x), read_fn: h2_read };
+    let w = io.Writer.{ ctx: @ptr_cast(*mut void, x), write_fn: h2_write };
+    x.h = http2.Conn.init(r, w, true, prefill) catch {
+        mem.destroy(x);
+        return false;
+    };
+    x.h.max_body = s.opts.max_body_bytes;
+    x.h.deadline = now_ns() + ms_ns(s.opts.request_timeout_ms);
+    x.hs = vec.Vec.[Header].init();
+    sl.h2 = x;
+    sl.speaks = SPEAKS_HTTP2;
+    return true;
+}
+
+// HTTP/2: reads the frames that have arrived, and answers each request
+// once all of it has. Requests must arrive within request_timeout_ms of
+// the last answer (or the start), and are answered one at a time.
+fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    let x = sl.h2;
+    let h = &mut x.h;
+    let timeout = ms_ns(s.opts.request_timeout_ms);
+    x.set_nonblocking(true);
+    if sl.expired {
+        h.goaway(http2.NO_ERROR) catch {};
+        return false;
+    }
+    if not x.started {
+        h.handshake() catch |e| {
+            if e == error.WouldBlock {
+                sl.deadline = h.deadline;
+                return true;
+            }
+            return false;
+        };
+        x.started = true;
+    }
+    let t = x.t;
     loop {
         if @atomic_load(&s.stopping) != 0 {
             h.goaway(http2.NO_ERROR) catch {};
-            return;
+            return false;
         }
         let mut id = h.take_done();
         if id == 0 {
             id = h.step() catch |e| {
+                if e == error.WouldBlock {
+                    sl.deadline = h.deadline;
+                    return true;
+                }
                 if e == error.TimedOut {
                     h.goaway(http2.NO_ERROR) catch {};
                 }
-                return;
+                return false;
             };
         }
         if id == 0 {
             // the client said goodbye, and nothing is left to answer
             if h.got_goaway and (h.streams.len == 0) {
-                return;
+                return false;
             }
             continue;
         }
@@ -1256,21 +2097,21 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
             continue;
         }
         if h2_malformed(st) {
-            h.reset_stream(id, http2.PROTOCOL_ERROR) catch return;
+            h.reset_stream(id, http2.PROTOCOL_ERROR) catch return false;
             h.drop_stream(id);
             continue;
         }
         let method = st.header(":method");
         let target = st.header(":path");
         // the headers as HTTP/1's (with Host from :authority)
-        hs.clear();
+        x.hs.clear();
         let authority = st.header(":authority");
         if authority.len > 0 {
-            hs.push(Header.{ name: "host", value: authority }) catch return;
+            x.hs.push(Header.{ name: "host", value: authority }) catch return false;
         }
-        for x in st.headers() {
-            if (x.name.len > 0) and (x.name[0] != ':') and not ((authority.len > 0) and strs.eq(x.name, "host")) {
-                hs.push(Header.{ name: x.name, value: x.value }) catch return;
+        for hd in st.headers() {
+            if (hd.name.len > 0) and (hd.name[0] != ':') and not ((authority.len > 0) and strs.eq(hd.name, "host")) {
+                x.hs.push(Header.{ name: hd.name, value: hd.value }) catch return false;
             }
         }
         let q = strs.index_of_byte(target, '?') catch target.len;
@@ -1279,12 +2120,14 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
             query = target[q + 1..];
         }
         let req = Request.{ method: method, target: target, path: target[..q], query: query, version: Version.HTTP_1_1,
-                            headers: hs.items(), body: st.body.bytes(), scratch: &mut scratch };
+                            headers: x.hs.items(), body: st.body.bytes(), scratch: &mut sl.scratch };
         let mut res = Response.{ stream: t, status: 200, head: strs.String.init(), body: strs.String.init(),
                                  version: Version.HTTP_1_1, head_only: @mem_eq(method, "HEAD"), keep_alive: true,
-                                 started: false, chunked: false, has_type: false, upgraded: false, h2: &mut h,
-                                 h2_id: id, is_h2: true };
-        h.deadline = time.Instant.now().ns + timeout;
+                                 started: false, chunked: false, has_type: false, upgraded: false, h2: h, h2_id: id,
+                                 is_h2: true };
+        // (the handler and the response wait, as for flow control)
+        x.set_nonblocking(false);
+        h.deadline = now_ns() + timeout;
         s.handler(s.ctx, &req, &mut res) catch {
             if not res.started {
                 res.status = 500;
@@ -1297,164 +2140,16 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
         let ok = res.finish();
         res.head.deinit();
         res.body.deinit();
-        scratch.clear();
+        sl.scratch.clear();
         h.drop_stream(id);
         ok catch |e| {
             if e != error.StreamReset {
-                return;
+                return false;
             }
         };
-        h.deadline = time.Instant.now().ns + timeout;
+        x.set_nonblocking(true);
+        h.deadline = now_ns() + timeout;
     }
-}
-
-/// Serves one request; false if the connection should close.
-fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, scratch: *mut Scratch) HttpError!bool {
-    c.deadline = time.Instant.now().ns + (@as(i64, s.opts.request_timeout_ms) * 1000000);
-    let head_len = c.read_head() catch |e| {
-        if (e == error.Closed) or (e == error.NetError) {
-            return false;
-        }
-        if (e == error.TimedOut) and (c.end == c.start) {
-            return false;  // an idle keep-alive connection
-        }
-        return reject(c.stream, status_for(e));
-    };
-    if head_len == 0 {
-        return false;
-    }
-    let head = c.buf[c.start..c.start + head_len];
-    c.start += head_len;
-    c.pin = c.start;
-    // the request line
-    let line_end = strs.index_of_byte(head, '\n')!;
-    let mut rl = head[..line_end];
-    if (rl.len > 0) and (rl[rl.len - 1] == '\r') {
-        rl = rl[..rl.len - 1];
-    }
-    let sp1 = strs.index_of_byte(rl, ' ') catch return reject(c.stream, 400);
-    let rest = rl[sp1 + 1..];
-    let sp2 = strs.index_of_byte(rest, ' ') catch return reject(c.stream, 400);
-    let method = rl[..sp1];
-    let target = rest[..sp2];
-    let proto = rest[sp2 + 1..];
-    if (method.len == 0) or (target.len == 0) {
-        return reject(c.stream, 400);
-    }
-    for ch in method {
-        if not is_token_char(ch) {
-            return reject(c.stream, 400);
-        }
-    }
-    for ch in target {
-        if (ch <= 0x20) or (ch == 0x7F) {
-            return reject(c.stream, 400);
-        }
-    }
-    if @mem_eq(method, "PRI") and @mem_eq(target, "*") and @mem_eq(proto, "HTTP/2.0") {
-        c.h2 = true;  // (serve_connection continues in HTTP/2)
-        return false;
-    }
-    let mut version = Version.HTTP_1_1;
-    if @mem_eq(proto, "HTTP/1.0") {
-        version = Version.HTTP_1_0;
-    } else if not @mem_eq(proto, "HTTP/1.1") {
-        if strs.starts_with(proto, "HTTP/") {
-            return reject(c.stream, 505);
-        }
-        return reject(c.stream, 400);
-    }
-    let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
-    let nh = parse_headers(head[line_end + 1..], hs[..]) catch |e| {
-        return reject(c.stream, status_for(e));
-    };
-    let headers = hs[..nh];
-    // exactly one Host (RFC 9112 3.2)
-    let mut hosts: usize = 0;
-    for h in headers {
-        if strs.eq_ignore_case(h.name, "Host") {
-            hosts += 1;
-        }
-    }
-    if (hosts > 1) or ((version == Version.HTTP_1_1) and (hosts == 0)) {
-        return reject(c.stream, 400);
-    }
-    let fr = framing(headers) catch |e| {
-        return reject(c.stream, status_for(e));
-    };
-    if fr.chunked and (version == Version.HTTP_1_0) {
-        return reject(c.stream, 400);  // (HTTP/1.0 has no transfer codings: faulty framing)
-    }
-    // the body
-    if fr.has_length and (fr.length > s.opts.max_body_bytes) {
-        return reject(c.stream, 413);
-    }
-    if (fr.chunked or (fr.length > 0)) and has_token(find_header(headers, "Expect") catch "", "100-continue") {
-        c.stream.write_all("HTTP/1.1 100 Continue\r\n\r\n") catch return false;
-    }
-    if fr.chunked {
-        c.read_chunked(body, s.opts.max_body_bytes) catch |e| {
-            return reject(c.stream, status_for(e));
-        };
-    } else if fr.length > 0 {
-        c.read_into(body, fr.length) catch return false;
-    }
-    // keep-alive
-    let conn_hdr = find_header(headers, "Connection") catch "";
-    let mut keep = version == Version.HTTP_1_1;
-    if has_token(conn_hdr, "close") {
-        keep = false;
-    } else if (version == Version.HTTP_1_0) and has_token(conn_hdr, "keep-alive") {
-        keep = true;
-    }
-    let q = strs.index_of_byte(target, '?') catch target.len;
-    let mut query: []u8 = "";
-    if q < target.len {
-        query = target[q + 1..];
-    }
-    let req = Request.{
-        method: method,
-        target: target,
-        path: target[..q],
-        query: query,
-        version: version,
-        headers: headers,
-        body: body.bytes(),
-        scratch: scratch,
-    };
-    let mut res = Response.{
-        stream: c.stream,
-        status: 200,
-        head: strs.String.init(),
-        body: strs.String.init(),
-        version: version,
-        head_only: @mem_eq(method, "HEAD"),
-        keep_alive: keep,
-        started: false,
-        chunked: false,
-        has_type: false,
-        upgraded: false,
-        h2: @ptr_from_int(*mut http2.Conn, 8),
-        h2_id: 0,
-        is_h2: false,
-    };
-    defer res.head.deinit();
-    defer res.body.deinit();
-    s.handler(s.ctx, &req, &mut res) catch {
-        if res.started {
-            return false;  // too late to report it: drop the connection
-        }
-        res.status = 500;
-        res.head.clear();
-        res.body.clear();
-        res.has_type = false;
-        res.write("Internal Server Error\n") catch return false;
-    };
-    if res.upgraded {
-        return false;  // the handler has had the connection
-    }
-    res.finish() catch return false;
-    return res.keep_alive;
 }
 
 fn new_scratch() Scratch {
@@ -3122,4 +3817,358 @@ test "proxies" {
     @expect(strs.starts_with(fp2.head[..fp2.head_len],
                              "CONNECT tunnelled.test:443 HTTP/1.1\r\nHost: tunnelled.test:443\r\n"));
     t.deinit();
+}
+
+// --- slow and idle clients -------------------------------------------------
+
+/// Sockets that a thread drips a request head into, a byte at a time, never
+/// finishing it (or a body, after a whole head).
+struct Drip {
+    socks: [16]net.TcpStream,
+    n: usize,
+    stop: u32,
+    sent: u32,  // bytes dripped, all sockets together
+}
+
+fn drip_run(d: *mut Drip) void {
+    while @atomic_load(&d.stop) == 0 {
+        for k in @as(usize, 0)..d.n {
+            _ = d.socks[k].write("x") catch 0;
+            _ = @atomic_add(&mut d.sent, 1);
+        }
+        thread.sleep_ms(10);
+    }
+}
+
+/// A connection to the test server, its reads bounded (a test must not
+/// hang on a server that never answers).
+fn dial(port: u16) !net.TcpStream {
+    let st = net.connect("127.0.0.1", port)!;
+    st.set_timeout(10000)!;
+    return st;
+}
+
+/// Reads one response with a Content-Length body into buf; returns it.
+fn read_reply(st: net.TcpStream, buf: []mut u8) ![]u8 {
+    let mut n: usize = 0;
+    loop {
+        let got = st.read(buf[n..])!;
+        if got == 0 {
+            return error.Closed;
+        }
+        n += got;
+        let end = strs.index_of(buf[..n], "\r\n\r\n") catch continue;
+        let at = strs.index_of(buf[..end], "Content-Length: ") catch return error.BadResponse;
+        let digits = buf[at + 16..];
+        let nl = strs.index_of_byte(digits, '\r')!;
+        let len = fmt.parse_int.[usize](digits[..nl])!;
+        if n >= (end + 4 + len) {
+            return buf[..end + 4 + len];
+        }
+    }
+}
+
+/// Reads until what was read ends with `suffix`; returns it.
+fn read_until(st: net.TcpStream, buf: []mut u8, suffix: []u8) ![]u8 {
+    let mut n: usize = 0;
+    while not strs.ends_with(buf[..n], suffix) {
+        let got = st.read(buf[n..])!;
+        if got == 0 {
+            return error.Closed;
+        }
+        n += got;
+    }
+    return buf[..n];
+}
+
+/// Whether the server closes the connection (rather than answer) within
+/// the socket's timeout; what it sent before closing goes to buf.
+fn closed_by_server(st: net.TcpStream, buf: []mut u8) bool {
+    let mut n: usize = 0;
+    loop {
+        let got = st.read(buf[n..]) catch |e| {
+            return e != error.TimedOut;  // (reset)
+        };
+        if got == 0 {
+            return true;
+        }
+        n = @min(n + got, buf.len - 1);
+    }
+}
+
+fn ms_since(t: time.Instant) i64 {
+    return t.elapsed().ns / 1000000;
+}
+
+test "idle and slow clients do not hold the workers" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    r.post("/echo", t_echo)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    opts.head_timeout_ms = 20000;  // (the slow ones must last the test)
+    opts.min_body_rate = 1;
+    let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    // 4 idle connections, 4 dripping a head, 4 dripping a body: each
+    // group more than there are workers
+    let mut idle: [4]net.TcpStream = [net.TcpStream.{ handle: -1 }; 4];
+    for k in @as(usize, 0)..4 {
+        idle[k] = dial(port)!;
+    }
+    let mut d = Drip.{ socks: [net.TcpStream.{ handle: -1 }; 16], n: 8, stop: 0, sent: 0 };
+    for k in @as(usize, 0)..8 {
+        d.socks[k] = dial(port)!;
+        if k < 4 {
+            d.socks[k].write_all("GET /hello HTTP/1.1\r\nHost: x\r\nX-Slow: ")!;
+        } else {
+            d.socks[k].write_all("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")!;
+        }
+    }
+    let dt = thread.spawn(drip_run, &mut d)!;
+    while @atomic_load(&d.sent) < 40 {
+        thread.sleep_ms(5);
+    }
+    // a client like any other is answered at once, several times over
+    let mut url: [128]u8 = [0; 128];
+    let u = fmt.bufprint(url[..], "http://127.0.0.1:{}/hello?name=you", [fmt.int(port)])!;
+    let mut slowest: i64 = 0;
+    for k in @as(usize, 0)..5 {
+        let t0 = time.Instant.now();
+        let mut a = get(u)!;
+        slowest = @max(slowest, ms_since(t0));
+        @expect_eq(a.status, 200);
+        @expect_eq(a.body, "hello, you");
+        a.deinit();
+        _ = k;
+    }
+    @expect(slowest < 1000);
+    // and one on a connection that idled first
+    let mut buf: [1024]u8 = [0; 1024];
+    let t0 = time.Instant.now();
+    idle[0].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+    @expect(strs.ends_with(read_reply(idle[0], buf[..])!, "hello, world"));
+    @expect(ms_since(t0) < 1000);
+    @atomic_store(&mut d.stop, 1);
+    dt.join();
+    for k in @as(usize, 0)..8 {
+        d.socks[k].close();
+    }
+    for k in @as(usize, 0)..4 {
+        idle[k].close();
+    }
+    srv.stop();
+    th.join();
+}
+
+test "idle and slow TLS clients do not hold the workers" {
+    let cert = tls.test_certificate_pem()!;
+    defer mem.free(cert);
+    let key = tls.test_key_pem()!;
+    defer mem.free(key);
+    let mut scfg = tls.ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    opts.handshake_timeout_ms = 20000;
+    let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    // 4 that never start a handshake, 4 dripping a ClientHello
+    let mut idle: [4]net.TcpStream = [net.TcpStream.{ handle: -1 }; 4];
+    for k in @as(usize, 0)..4 {
+        idle[k] = dial(port)!;
+    }
+    let mut d = Drip.{ socks: [net.TcpStream.{ handle: -1 }; 16], n: 4, stop: 0, sent: 0 };
+    for k in @as(usize, 0)..4 {
+        d.socks[k] = dial(port)!;
+        let hdr: [5]u8 = [22, 3, 1, 0x40, 0];  // a handshake record of 16 KiB
+        d.socks[k].write_all(hdr[..])!;
+    }
+    let dt = thread.spawn(drip_run, &mut d)!;
+    while @atomic_load(&d.sent) < 20 {
+        thread.sleep_ms(5);
+    }
+    let mut ccfg = tls.ClientConfig.with_roots_pem(cert)!;
+    defer ccfg.deinit();
+    let copts = ClientOptions.default().with_tls(&ccfg);
+    let mut url: [128]u8 = [0; 128];
+    let u = fmt.bufprint(url[..], "https://localhost:{}/hello?name=tls", [fmt.int(port)])!;
+    let mut slowest: i64 = 0;
+    for k in @as(usize, 0)..3 {
+        let t0 = time.Instant.now();
+        let mut a = request("GET", u, no_headers(), "", copts)!;
+        slowest = @max(slowest, ms_since(t0));
+        @expect_eq(a.body, "hello, tls");
+        a.deinit();
+        _ = k;
+    }
+    @expect(slowest < 1000);
+    @atomic_store(&mut d.stop, 1);
+    dt.join();
+    for k in @as(usize, 0)..4 {
+        d.socks[k].close();
+        idle[k].close();
+    }
+    srv.stop();
+    th.join();
+}
+
+test "deadlines for heads, bodies, handshakes and idle connections" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    r.post("/echo", t_echo)!;
+    let mut opts = Options.default();
+    opts.threads = 1;
+    opts.head_timeout_ms = 200;
+    opts.idle_timeout_ms = 700;
+    opts.min_body_rate = 1000;
+    let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut buf: [1024]u8 = [0; 1024];
+    // a head that stalls: 408, then closed
+    let a = dial(port)!;
+    a.write_all("GET /hello HTTP/1.1\r\nHost: x\r\n")!;
+    let t0 = time.Instant.now();
+    @expect(closed_by_server(a, buf[..]));
+    @expect(strs.starts_with(buf[..], "HTTP/1.1 408 "));
+    @expect(ms_since(t0) < 5000);
+    a.close();
+    // a new connection that sends nothing: closed after the head's time
+    let b = dial(port)!;
+    @expect(closed_by_server(b, buf[..]));
+    b.close();
+    // a body far slower than min_body_rate: 408
+    let c = dial(port)!;
+    c.write_all("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\nsome")!;
+    @mem_set(buf[..], 0);
+    @expect(closed_by_server(c, buf[..]));
+    @expect(strs.starts_with(buf[..], "HTTP/1.1 408 "));
+    c.close();
+    // keep-alive: requests one after another, waiting longer than a head
+    // may take between them, then pipelined; idle too long, it is closed
+    let k = dial(port)!;
+    for i in @as(usize, 0)..2 {
+        k.write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+        @expect(strs.ends_with(read_reply(k, buf[..])!, "hello, world"));
+        thread.sleep_ms(300);
+        _ = i;
+    }
+    k.write_all("GET /hello?name=1 HTTP/1.1\r\nHost: x\r\n\r\nGET /hello?name=2 HTTP/1.1\r\nHost: x\r\n\r\n")!;
+    let both = read_until(k, buf[..], "hello, 2")!;
+    let first = strs.index_of(both, "hello, 1")!;
+    @expect(strs.starts_with(both[first + 8..], "HTTP/1.1 200 OK\r\n"));
+    // a body sent in pieces, fast enough
+    k.write_all("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc")!;
+    thread.sleep_ms(10);
+    k.write_all("\r\n4\r\ndefg\r")!;
+    thread.sleep_ms(10);
+    k.write_all("\n0\r\n\r\n")!;
+    @expect(strs.ends_with(read_reply(k, buf[..])!, "\r\n\r\nabcdefg"));
+    let t1 = time.Instant.now();
+    @expect(closed_by_server(k, buf[..]));
+    @expect(ms_since(t1) >= 500);
+    k.close();
+    srv.stop();
+    th.join();
+    // a TLS handshake that never starts
+    let cert = tls.test_certificate_pem()!;
+    defer mem.free(cert);
+    let key = tls.test_key_pem()!;
+    defer mem.free(key);
+    let mut scfg = tls.ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    opts.handshake_timeout_ms = 200;
+    let mut srv2 = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
+    let port2 = srv2.port();
+    let th2 = thread.spawn(t_run, &mut srv2)!;
+    let h = dial(port2)!;
+    let t2 = time.Instant.now();
+    @expect(closed_by_server(h, buf[..]));
+    @expect(ms_since(t2) < 5000);
+    h.close();
+    srv2.stop();
+    th2.join();
+}
+
+test "connection limits" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    let mut opts = Options.default();
+    opts.threads = 1;
+    opts.max_connections_per_addr = 3;
+    let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut buf: [1024]u8 = [0; 1024];
+    // three from one address are served; a fourth is closed unanswered
+    let mut cs: [5]net.TcpStream = [net.TcpStream.{ handle: -1 }; 5];
+    for k in @as(usize, 0)..3 {
+        cs[k] = dial(port)!;
+        cs[k].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+        @expect(strs.ends_with(read_reply(cs[k], buf[..])!, "hello, world"));
+    }
+    let extra = dial(port)!;
+    _ = extra.write("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n") catch 0;
+    @mem_set(buf[..], 0);
+    @expect(closed_by_server(extra, buf[..]));
+    @expect(buf[0] == 0);
+    extra.close();
+    // one closed, room for another (once the server has seen it close)
+    cs[0].close();
+    let mut served = false;
+    for tries in @as(usize, 0)..100 {
+        thread.sleep_ms(20);
+        cs[0] = dial(port)!;
+        _ = cs[0].write("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n") catch 0;
+        let got = read_reply(cs[0], buf[..]) catch {
+            cs[0].close();
+            continue;
+        };
+        served = strs.ends_with(got, "hello, world");
+        _ = tries;
+        break;
+    }
+    @expect(served);
+    for k in @as(usize, 0)..3 {
+        cs[k].close();
+    }
+    srv.stop();
+    th.join();
+
+    // at max_connections, the connection idle longest makes room
+    opts.max_connections_per_addr = 0;
+    opts.max_connections = 4;
+    let mut srv2 = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port2 = srv2.port();
+    let th2 = thread.spawn(t_run, &mut srv2)!;
+    for k in @as(usize, 0)..4 {
+        cs[k] = dial(port2)!;
+        cs[k].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+        @expect(strs.ends_with(read_reply(cs[k], buf[..])!, "hello, world"));
+        thread.sleep_ms(50);
+    }
+    cs[4] = dial(port2)!;
+    cs[4].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+    @expect(strs.ends_with(read_reply(cs[4], buf[..])!, "hello, world"));
+    @expect(closed_by_server(cs[0], buf[..]));
+    cs[1].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
+    @expect(strs.ends_with(read_reply(cs[1], buf[..])!, "hello, world"));
+    for k in @as(usize, 0)..5 {
+        cs[k].close();
+    }
+    srv2.stop();
+    th2.join();
 }
