@@ -769,7 +769,7 @@ def set_int(w, ext):
         ps = ', '.join('%s %s' % (ct, x) for x in names)
         zero = ', '.join(['0'] * n)
         body = '{ %s r = {%s}; %s return %s(r); }' % (t, zero, ' '.join('r[%d] = __%s;' % (j, 'e%d' % j) for j in range(n)), I)
-        sx = isfx(k) + ('x' if k == 'i64' and w == 128 else '')
+        sx = isfx(k) + ('x' if k == 'i64' else '')
         INTRIN.append((HDR, ext, P + 'set_' + sx, I, ps, body))
         if not (k == 'i64' and w == 128):
             INTRIN.append((HDR, ext, P + 'setr_' + sx, I, ps, '%sset_%s(%s)' % (P, sx, ', '.join('__' + x for x in reversed(names)))))
