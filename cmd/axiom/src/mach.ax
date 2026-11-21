@@ -577,7 +577,11 @@ fn liveness(f: *mut MFunc) void {
 // of the function). Branches split evenly, except that blocks leading only to
 // a trap (cold) are rarely taken, loops are rarely left, and a successor the
 // layout predicts not taken (MBlock.unlikely) is taken a third of the time;
-// a loop runs its body LOOP_SCALE times per entry. Loops are found on the machine CFG (back
+// a loop runs its body LOOP_SCALE times per entry, except that one entered
+// only on a path the hints say is seldom taken (an unlikely or cold successor
+// dominating it) runs no more often than the branch's likely way on (a loop
+// in a vector's grow path must not look hotter than the push it grows for:
+// the allocator would give it the registers). Loops are found on the machine CFG (back
 // edges of a depth-first search, natural loop bodies) and handled innermost
 // first: each one's iteration (header 1) is computed with the loops inside it
 // collapsed to their headers, whose exits it reaches in proportion.
@@ -592,7 +596,8 @@ struct Loop {
     blocks: []mut u64,  // bitset
     size: i32,
     parent: i32,
-    fin: f64,  // entries per call of the function
+    fin: f64,    // entries per call of the function
+    scale: f64,  // iterations per entry
 }
 
 fn in_loop(l: *Loop, b: i32) bool {
@@ -657,8 +662,10 @@ pub fn block_freqs(f: *mut MFunc) void {
     let mut srcs = u.List.[i32].empty();
     dfs_order(f, color, &mut post, &mut heads, &mut srcs);
     mark_cold(f, cold, &post);
+    let ps = preds_of(f);
+    let idom = dominators(&post, &ps, nb);
     let mut loops = u.List.[Loop].empty();
-    natural_loops(f, color, &heads, &srcs, &mut loops);
+    natural_loops(f, color, &ps, &heads, &srcs, &mut loops);
     nest_loops(&mut loops, inner[0..nb]);
     let mut order = loop_order(&loops);
     // per loop: the mass of each of its blocks per iteration, and where it exits
@@ -681,12 +688,15 @@ pub fn block_freqs(f: *mut MFunc) void {
         if li < 0 {
             continue;
         }
+        let sc = loop_scale(f, &fs, &ps, idom, li);
         let l = fs.loops.at_mut(@int_cast(usize, li));
         let h = @int_cast(usize, l.head);
+        l.scale = sc;
         if l.parent < 0 {
             l.fin = fs.rel[h];
         } else {
-            l.fin = fs.loops.at(@int_cast(usize, l.parent)).fin * LOOP_SCALE * fs.rel[h];
+            let pl = fs.loops.at(@int_cast(usize, l.parent));
+            l.fin = pl.fin * pl.scale * fs.rel[h];
         }
     }
     for bi in 0..nb {
@@ -698,9 +708,9 @@ pub fn block_freqs(f: *mut MFunc) void {
         if li >= 0 {
             let l = fs.loops.at(@int_cast(usize, li));
             if l.head == @int_cast(i32, bi) {
-                fq = l.fin * LOOP_SCALE;
+                fq = l.fin * l.scale;
             } else {
-                fq = l.fin * LOOP_SCALE * fs.rel[bi];
+                fq = l.fin * l.scale * fs.rel[bi];
             }
         }
         if fq < 1.0e-6 {
@@ -786,19 +796,10 @@ fn mark_cold(f: *MFunc, cold: []mut bool, post: *u.List.[i32]) void {
 }
 
 // The natural loops of the back edges, one per header.
-fn natural_loops(f: *MFunc, color: []u8, heads: *u.List.[i32], srcs: *u.List.[i32], loops: *mut u.List.[Loop]) void {
+fn natural_loops(f: *MFunc, color: []u8, preds: *Preds, heads: *u.List.[i32], srcs: *u.List.[i32],
+                 loops: *mut u.List.[Loop]) void {
     let nb = f.blocks.len;
     let w = words(nb);
-    let preds = u.newn.[u.List.[i32]](nb + 1);
-    for bi in 0..nb {
-        preds[bi] = u.List.[i32].empty();
-    }
-    for bi in 0..nb {
-        let blk = f.blocks.get(bi);
-        for k in 0..blk.succs.len {
-            preds[@int_cast(usize, blk.succs.get(k))].push(@int_cast(i32, bi));
-        }
-    }
     let mut work = u.List.[i32].empty();
     for e in 0..heads.len {
         let h = heads.get(e);
@@ -814,7 +815,7 @@ fn natural_loops(f: *MFunc, color: []u8, heads: *u.List.[i32], srcs: *u.List.[i3
                 bs[j] = 0;
             }
             bset(bs, @int_cast(usize, h));
-            loops.push(Loop.{ head: h, blocks: bs, size: 1, parent: -1, fin: 0.0 });
+            loops.push(Loop.{ head: h, blocks: bs, size: 1, parent: -1, fin: 0.0, scale: LOOP_SCALE });
         }
         let l = loops.at_mut(li);
         work.clear();
@@ -826,16 +827,131 @@ fn natural_loops(f: *MFunc, color: []u8, heads: *u.List.[i32], srcs: *u.List.[i3
             }
             bset(l.blocks, @int_cast(usize, x));
             l.size += 1;
-            let ps = &preds[@int_cast(usize, x)];
-            for j in 0..ps.len {
-                work.push(ps.get(j));
+            for p in preds.of(@int_cast(usize, x)) {
+                work.push(p);
             }
         }
     }
-    for bi in 0..nb {
-        u.free(@ptr_cast(*mut void, preds[bi].data));
-    }
     work.deinit();
+}
+
+// The immediate dominator of each block reachable from the entry (the
+// entry's: itself; -1: unreachable), from the blocks in postorder.
+fn dominators(post: *u.List.[i32], ps: *Preds, nb: usize) []mut i32 {
+    let idom = u.newn.[i32](nb + 1);
+    let num = u.newn.[i32](nb + 1);  // postorder number
+    for bi in 0..nb {
+        idom[bi] = -1;
+        num[bi] = -1;
+    }
+    for k in 0..post.len {
+        num[@int_cast(usize, post.get(k))] = @int_cast(i32, k);
+    }
+    idom[0] = 0;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut k = post.len;
+        while k > 0 {
+            k -= 1;
+            let b = @int_cast(usize, post.get(k));
+            if b == 0 {
+                continue;
+            }
+            let mut d: i32 = -1;
+            for p in ps.of(b) {
+                if idom[@int_cast(usize, p)] < 0 {
+                    continue;
+                }
+                if d < 0 {
+                    d = p;
+                    continue;
+                }
+                let mut x = p;
+                while x != d {
+                    while num[@int_cast(usize, x)] < num[@int_cast(usize, d)] {
+                        x = idom[@int_cast(usize, x)];
+                    }
+                    while num[@int_cast(usize, d)] < num[@int_cast(usize, x)] {
+                        d = idom[@int_cast(usize, d)];
+                    }
+                }
+            }
+            if idom[b] != d {
+                idom[b] = d;
+                changed = true;
+            }
+        }
+    }
+    return idom;
+}
+
+// Iterations per entry of loop li: LOOP_SCALE, but when its header is
+// dominated (within its parent loop) by a successor the hints say is seldom
+// taken (an unlikely or a cold one, entered only from its branch), no more
+// than makes the header run as often as the branch's other successors, from
+// the outermost such branch (at least once).
+fn loop_scale(f: *MFunc, fs: *Freqs, ps: *Preds, idom: []i32, li: i32) f64 {
+    let l = fs.loops.at(@int_cast(usize, li));
+    let par = l.parent;
+    let mut ptop: i32 = 0;  // the head of the parent (the entry: the function body)
+    if par >= 0 {
+        ptop = fs.loops.at(@int_cast(usize, par)).head;
+    }
+    let mut br: i32 = -1;  // the outermost such branch
+    let mut hx: i32 = -1;
+    let mut x = l.head;
+    while x != ptop {
+        let p = idom[@int_cast(usize, x)];
+        if (p < 0) or (p == x) {
+            break;
+        }
+        let pb = f.blocks.get(@int_cast(usize, p));
+        let xi = @int_cast(usize, x);
+        let mut nin: i32 = 0;  // the ways into x (into the header: from outside the loop)
+        for q in ps.of(xi) {
+            if (x != l.head) or not in_loop(l, q) {
+                nin += 1;
+            }
+        }
+        if (nin == 1) and (pb.succs.len >= 2) and
+           ((pb.unlikely == x + 1) or (fs.cold[xi] and not fs.cold[@int_cast(usize, p)])) and
+           ((p == ptop) or in_frame(fs, p, par)) {
+            br = p;
+            hx = x;
+        }
+        x = p;
+    }
+    if br < 0 {
+        return LOOP_SCALE;
+    }
+    // per iteration of the parent: the header's mass, and that of the
+    // branch's other ways on
+    let rh = fs.rel[@int_cast(usize, l.head)];
+    let mut mb: f64 = 1.0;
+    if br != ptop {
+        mb = fs.rel[@int_cast(usize, br)];
+    }
+    let rest = mb - fs.rel[@int_cast(usize, hx)];
+    if (rh <= 0.0) or (rest <= 0.0) or (rh * LOOP_SCALE <= rest) {
+        return LOOP_SCALE;
+    }
+    let mut sc = rest / rh;
+    if sc < 1.0 {
+        sc = 1.0;
+    }
+    return sc;
+}
+
+// Is block b's mass (fs.rel) per iteration of loop li (-1: per call): a block
+// directly in it, or the header of a loop directly inside it?
+fn in_frame(fs: *Freqs, b: i32, li: i32) bool {
+    let c = fs.inner[@int_cast(usize, b)];
+    if c == li {
+        return true;
+    }
+    return (c >= 0) and (fs.loops.at(@int_cast(usize, c)).head == b) and
+           (fs.loops.at(@int_cast(usize, c)).parent == li);
 }
 
 // Nesting: the smallest loop containing each block (inner), and each loop's
