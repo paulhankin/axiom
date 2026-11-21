@@ -38,18 +38,25 @@ import "../mem.ax" as mem;
 pub error BigintError { DivisionByZero, InvalidNumber, Overflow, Negative, NotInvertible, NoSpaceLeft, OutOfMemory,
                         IoError }
 
-const KARATSUBA: usize = 40;  // limbs; below this, schoolbook multiplication
+const KARATSUBA: usize = 40;                       // limbs; below this, schoolbook multiplication
+const TEN_E19: u64 = 10_000_000_000_000_000_000;   // 10^19, largest power of 10 in u64
+const INV_1E19: u64 = 15_581_492_618_384_294_730;  // floor((2^128 - 1) / 10^19) - 2^64
 
-fn empty_limbs() []mut u32 {
-    return @slice_from_ptr(@ptr_from_int(*mut u32, 4), 0);
+struct MulPair {
+    lo: u64,
+    hi: u64,
+}
+
+fn empty_limbs() []mut u64 {
+    return @slice_from_ptr(@ptr_from_int(*mut u64, 8), 0);
 }
 
 // -----------------------------------------------------------------------------
-// Natural numbers as little-endian slices of 32-bit limbs
+// Natural numbers as little-endian slices of 64-bit limbs
 // -----------------------------------------------------------------------------
 
 /// The length of x without its leading (most significant) zero limbs.
-fn norm(x: []u32) usize {
+fn norm(x: []u64) usize {
     let mut n = x.len;
     while (n > 0) and (x[n - 1] == 0) {
         n -= 1;
@@ -57,7 +64,7 @@ fn norm(x: []u32) usize {
     return n;
 }
 
-fn nat_cmp(x: []u32, y: []u32) i32 {
+fn nat_cmp(x: []u64, y: []u64) i32 {
     if x.len != y.len {
         if x.len < y.len {
             return -1;
@@ -77,68 +84,76 @@ fn nat_cmp(x: []u32, y: []u32) i32 {
     return 0;
 }
 
-/// z = x + y for x.len >= y.len, z.len >= x.len; returns the carry.
-fn nat_add(z: []mut u32, x: []u32, y: []u32) u32 {
-    let mut c: u64 = 0;
-    for i in 0..y.len {
-        let s = (@as(u64, x[i]) +% @as(u64, y[i])) +% c;
-        z[i] = @truncate(u32, s);
-        c = s >> 32;
-    }
-    for i in y.len..x.len {
-        let s = @as(u64, x[i]) +% c;
-        z[i] = @truncate(u32, s);
-        c = s >> 32;
-    }
-    return @truncate(u32, c);
+/// Computes (a * b + sum_in + carry_in) as (lo, hi) in 64-bit limbs.
+/// Maximum value is (2^64 - 1)^2 + 2*(2^64 - 1) = 2^128 - 1, so hi <= 2^64 - 1.
+inline fn mul_add_limb(a: u64, b: u64, sum_in: u64, carry_in: u64) MulPair {
+    let p = @mul_wide(a, b);
+    let s1 = @add_carry(sum_in, carry_in, 0);
+    let s2 = @add_carry(p.lo, s1.value, 0);
+    return MulPair.{ lo: s2.value, hi: (p.hi + @as(u64, s1.carry)) + @as(u64, s2.carry) };
 }
 
-/// z = x - y for x >= y (as numbers), x.len >= y.len; returns the borrow.
-fn nat_sub(z: []mut u32, x: []u32, y: []u32) u32 {
-    let mut b: u64 = 0;
+/// z = x + y for x.len >= y.len, z.len >= x.len; returns the carry (0 or 1).
+fn nat_add(z: []mut u64, x: []u64, y: []u64) u64 {
+    let mut c: u8 = 0;
     for i in 0..y.len {
-        let d = (@as(u64, x[i]) -% @as(u64, y[i])) -% b;
-        z[i] = @truncate(u32, d);
-        b = (d >> 32) & 1;
+        let s = @add_carry(x[i], y[i], c);
+        z[i] = s.value;
+        c = s.carry;
     }
     for i in y.len..x.len {
-        let d = @as(u64, x[i]) -% b;
-        z[i] = @truncate(u32, d);
-        b = (d >> 32) & 1;
+        let s = @add_carry(x[i], 0, c);
+        z[i] = s.value;
+        c = s.carry;
     }
-    return @truncate(u32, b);
+    return @as(u64, c);
+}
+
+/// z = x - y for x >= y (as numbers), x.len >= y.len; returns the borrow (0 or 1).
+fn nat_sub(z: []mut u64, x: []u64, y: []u64) u64 {
+    let mut b: u8 = 0;
+    for i in 0..y.len {
+        let d = @sub_borrow(x[i], y[i], b);
+        z[i] = d.value;
+        b = d.borrow;
+    }
+    for i in y.len..x.len {
+        let d = @sub_borrow(x[i], 0, b);
+        z[i] = d.value;
+        b = d.borrow;
+    }
+    return @as(u64, b);
 }
 
 /// z[0..x.len] += x * m; returns the carry out of the top.
-fn nat_mul_add_small(z: []mut u32, x: []u32, m: u32) u32 {
+fn nat_mul_add_small(z: []mut u64, x: []u64, m: u64) u64 {
     let mut c: u64 = 0;
-    let mm = @as(u64, m);
     let zz = z[..x.len];  // one bounds check, so the loop needs none
     let n = x.len;
     let mut i: usize = 0;
     while (i + 4) <= n {
-        let t0 = ((@as(u64, x[i]) *% mm) +% @as(u64, zz[i])) +% c;
-        zz[i] = @truncate(u32, t0);
-        let t1 = ((@as(u64, x[i + 1]) *% mm) +% @as(u64, zz[i + 1])) +% (t0 >> 32);
-        zz[i + 1] = @truncate(u32, t1);
-        let t2 = ((@as(u64, x[i + 2]) *% mm) +% @as(u64, zz[i + 2])) +% (t1 >> 32);
-        zz[i + 2] = @truncate(u32, t2);
-        let t3 = ((@as(u64, x[i + 3]) *% mm) +% @as(u64, zz[i + 3])) +% (t2 >> 32);
-        zz[i + 3] = @truncate(u32, t3);
-        c = t3 >> 32;
+        let r0 = mul_add_limb(x[i], m, zz[i], c);
+        zz[i] = r0.lo;
+        let r1 = mul_add_limb(x[i + 1], m, zz[i + 1], r0.hi);
+        zz[i + 1] = r1.lo;
+        let r2 = mul_add_limb(x[i + 2], m, zz[i + 2], r1.hi);
+        zz[i + 2] = r2.lo;
+        let r3 = mul_add_limb(x[i + 3], m, zz[i + 3], r2.hi);
+        zz[i + 3] = r3.lo;
+        c = r3.hi;
         i += 4;
     }
     while i < n {
-        let t = ((@as(u64, x[i]) *% mm) +% @as(u64, zz[i])) +% c;
-        zz[i] = @truncate(u32, t);
-        c = t >> 32;
+        let r = mul_add_limb(x[i], m, zz[i], c);
+        zz[i] = r.lo;
+        c = r.hi;
         i += 1;
     }
-    return @truncate(u32, c);
+    return c;
 }
 
 /// z = x * y (schoolbook); z.len == x.len + y.len, z is overwritten.
-fn nat_mul_basic(z: []mut u32, x: []u32, y: []u32) void {
+fn nat_mul_basic(z: []mut u64, x: []u64, y: []u64) void {
     @mem_set(z, 0);
     for j in 0..y.len {
         if y[j] != 0 {
@@ -147,48 +162,48 @@ fn nat_mul_basic(z: []mut u32, x: []u32, y: []u32) void {
     }
 }
 
-/// z += x (z.len >= x.len); returns the carry.
-fn nat_add_into(z: []mut u32, x: []u32) u32 {
-    let mut c: u64 = 0;
+/// z += x (z.len >= x.len); returns the carry (0 or 1).
+fn nat_add_into(z: []mut u64, x: []u64) u64 {
+    let mut c: u8 = 0;
     for i in 0..x.len {
-        let s = (@as(u64, z[i]) +% @as(u64, x[i])) +% c;
-        z[i] = @truncate(u32, s);
-        c = s >> 32;
+        let s = @add_carry(z[i], x[i], c);
+        z[i] = s.value;
+        c = s.carry;
     }
     let mut i = x.len;
     while (c != 0) and (i < z.len) {
-        let s = @as(u64, z[i]) +% c;
-        z[i] = @truncate(u32, s);
-        c = s >> 32;
+        let s = @add_carry(z[i], 0, c);
+        z[i] = s.value;
+        c = s.carry;
         i += 1;
     }
-    return @truncate(u32, c);
+    return @as(u64, c);
 }
 
 /// z -= x (z >= x as numbers).
-fn nat_sub_from(z: []mut u32, x: []u32) void {
-    let mut b: u64 = 0;
+fn nat_sub_from(z: []mut u64, x: []u64) void {
+    let mut b: u8 = 0;
     for i in 0..x.len {
-        let d = (@as(u64, z[i]) -% @as(u64, x[i])) -% b;
-        z[i] = @truncate(u32, d);
-        b = (d >> 32) & 1;
+        let d = @sub_borrow(z[i], x[i], b);
+        z[i] = d.value;
+        b = d.borrow;
     }
     let mut i = x.len;
     while (b != 0) and (i < z.len) {
-        let d = @as(u64, z[i]) -% b;
-        z[i] = @truncate(u32, d);
-        b = (d >> 32) & 1;
+        let d = @sub_borrow(z[i], 0, b);
+        z[i] = d.value;
+        b = d.borrow;
         i += 1;
     }
 }
 
 /// z = x * y; z.len == x.len + y.len.
-fn nat_mul(z: []mut u32, x: []u32, y: []u32) BigintError!void {
+fn nat_mul(z: []mut u64, x: []u64, y: []u64) BigintError!void {
     if (x.len < KARATSUBA) or (y.len < KARATSUBA) {
         nat_mul_basic(z, x, y);
         return;
     }
-    // Karatsuba: x = x1*B + x0, y = y1*B + y0 with B = 2^(32h);
+    // Karatsuba: x = x1*B + x0, y = y1*B + y0 with B = 2^(64h);
     // x*y = z2*B^2 + (z1 - z2 - z0)*B + z0 with z1 = (x0+x1)(y0+y1).
     let h = @min(x.len, y.len) / 2;
     let x0 = x[..h];
@@ -196,19 +211,19 @@ fn nat_mul(z: []mut u32, x: []u32, y: []u32) BigintError!void {
     let y0 = y[..h];
     let y1 = y[h..];
     @mem_set(z, 0);
-    let z0 = mem.alloc.[u32](2 * h)!;
+    let z0 = mem.alloc.[u64](2 * h)!;
     defer mem.free(z0);
     nat_mul(z0, x0, y0)!;
-    let z2 = mem.alloc.[u32](x1.len + y1.len)!;
+    let z2 = mem.alloc.[u64](x1.len + y1.len)!;
     defer mem.free(z2);
     nat_mul(z2, x1, y1)!;
-    let sx = mem.alloc.[u32](x1.len + 1)!;
+    let sx = mem.alloc.[u64](x1.len + 1)!;
     defer mem.free(sx);
     sx[x1.len] = nat_add(sx[..x1.len], x1, x0);
-    let sy = mem.alloc.[u32](y1.len + 1)!;
+    let sy = mem.alloc.[u64](y1.len + 1)!;
     defer mem.free(sy);
     sy[y1.len] = nat_add(sy[..y1.len], y1, y0);
-    let z1 = mem.alloc.[u32](sx.len + sy.len)!;
+    let z1 = mem.alloc.[u64](sx.len + sy.len)!;
     defer mem.free(z1);
     nat_mul(z1, sx, sy)!;
     nat_sub_from(z1, z0);
@@ -219,118 +234,152 @@ fn nat_mul(z: []mut u32, x: []u32, y: []u32) BigintError!void {
 }
 
 /// q = x / d, returning x % d (d != 0); q.len == x.len.
-fn nat_div_small(q: []mut u32, x: []u32, d: u32) u32 {
-    let dd = @as(u64, d);
+fn nat_div_small(q: []mut u64, x: []u64, d: u64) u64 {
     let mut r: u64 = 0;
     let mut i = x.len;
     while i > 0 {
         i -= 1;
-        let cur = (r << 32) | @as(u64, x[i]);
-        q[i] = @truncate(u32, cur / dd);
-        r = cur % dd;
+        let qr = @div_wide(r, x[i], d);
+        q[i] = qr.quo;
+        r = qr.rem;
     }
-    return @truncate(u32, r);
+    return r;
 }
 
-/// q = x / 10^9, returning x % 10^9: the constant divisor compiles to a
-/// multiplication.
-fn nat_div_1e9(q: []mut u32, x: []u32) u32 {
+/// q = x / 10^19, returning x % 10^19, using Moller-Granlund Algorithm 4 with
+/// the precomputed 64-bit reciprocal of normalized divisor 10^19 (>= 2^63).
+fn nat_div_1e19(q: []mut u64, x: []u64) u64 {
     let mut r: u64 = 0;
     let mut i = x.len;
     while i > 0 {
         i -= 1;
-        let cur = (r << 32) | @as(u64, x[i]);
-        let qq = cur / 1_000_000_000;
-        q[i] = @truncate(u32, qq);
-        r = cur - (qq * 1_000_000_000);
+        let u1 = r;
+        let u0 = x[i];
+        let p = @mul_wide(u1, INV_1E19);
+        let s0 = @add_carry(p.lo, u0, 0);
+        let q0 = s0.value;
+        // Since u1 < 10^19 < 2^64 and INV_1E19 + rem(2^128-1, 10^19) > 2^64,
+        // floor(((INV_1E19 + 2^64)*u1 + u0) / 2^64) <= 2^64 - 2, so +1 never wraps.
+        let mut q1 = ((p.hi + u1) + @as(u64, s0.carry)) + 1;
+        let mut rem = u0 -% (q1 *% TEN_E19);
+        if rem > q0 {
+            q1 -= 1;
+            rem +%= TEN_E19;
+        }
+        if rem >= TEN_E19 {
+            q1 += 1;
+            rem -= TEN_E19;
+        }
+        q[i] = q1;
+        r = rem;
     }
-    return @truncate(u32, r);
+    return r;
 }
 
 /// Knuth's algorithm D: q = u / v and r = u % v for normalized u, v with
 /// v.len >= 2 and u >= v. q.len == u.len - v.len + 1, r.len == v.len.
-fn nat_div(q: []mut u32, r: []mut u32, u: []u32, v: []u32) BigintError!void {
+fn nat_div(q: []mut u64, r: []mut u64, u: []u64, v: []u64) BigintError!void {
     let n = v.len;
     let m = u.len - n;
-    let s = @clz(v[n - 1]);
+    let s = @truncate(u32, @clz(v[n - 1]));
     // shift so that the top limb of v has its top bit set
-    let vn = mem.alloc.[u32](n)!;
+    let vn = mem.alloc.[u64](n)!;
     defer mem.free(vn);
-    let un = mem.alloc.[u32](u.len + 1)!;
+    let un = mem.alloc.[u64](u.len + 1)!;
     defer mem.free(un);
     _ = shl_limbs(vn, v, s);
     un[u.len] = shl_limbs(un[..u.len], u, s);
-    let vtop = @as(u64, vn[n - 1]);
-    let vnext = @as(u64, vn[n - 2]);
+    let vtop = vn[n - 1];
+    let vnext = vn[n - 2];
     let mut j = m + 1;
     while j > 0 {
         j -= 1;
-        // estimate q from the top two limbs of the remainder
-        let top = (@as(u64, un[j + n]) << 32) | @as(u64, un[j + n - 1]);
-        let mut qhat = top / vtop;
-        let mut rhat = top % vtop;
-        while (qhat > 0xFFFFFFFF) or ((qhat * vnext) > ((rhat << 32) | @as(u64, un[j + n - 2]))) {
-            qhat -= 1;
-            rhat += vtop;
-            if rhat > 0xFFFFFFFF {
+        // estimate qhat from the top two limbs of the remainder; clamp at
+        // 2^64 - 1 when un[j + n] >= vtop so @div_wide never traps
+        let u2 = un[j + n];
+        let u1 = un[j + n - 1];
+        let u0 = un[j + n - 2];
+        let mut qhat: u64 = 0;
+        let mut rhat: u64 = 0;
+        let mut r_ovf = false;
+        if u2 >= vtop {
+            qhat = 0xFFFF_FFFF_FFFF_FFFF;
+            let rs = @add_carry(u1, vtop, 0);
+            rhat = rs.value;
+            r_ovf = rs.carry != 0;
+        } else {
+            let qr = @div_wide(u2, u1, vtop);
+            qhat = qr.quo;
+            rhat = qr.rem;
+        }
+        while not r_ovf {
+            let pv = @mul_wide(qhat, vnext);
+            if (pv.hi < rhat) or ((pv.hi == rhat) and (pv.lo <= u0)) {
                 break;
             }
+            qhat -= 1;
+            let rs = @add_carry(rhat, vtop, 0);
+            rhat = rs.value;
+            r_ovf = rs.carry != 0;
         }
-        // multiply and subtract
-        let mut borrow: i64 = 0;
+        // multiply and subtract: un[j..j+n+1] -= qhat * vn[0..n]
         let mut carry: u64 = 0;
+        let mut borrow: u8 = 0;
         for i in 0..n {
-            let p = (qhat * @as(u64, vn[i])) + carry;
-            carry = p >> 32;
-            let t = (@as(i64, un[i + j]) - @as(i64, @truncate(u32, p))) + borrow;
-            un[i + j] = @truncate(u32, @bit_cast(u64, t));
-            borrow = t >> 32;
+            let p = @mul_wide(qhat, vn[i]);
+            let ps = @add_carry(p.lo, carry, 0);
+            carry = p.hi + @as(u64, ps.carry);
+            let ds = @sub_borrow(un[i + j], ps.value, borrow);
+            un[i + j] = ds.value;
+            borrow = ds.borrow;
         }
-        let t = (@as(i64, un[j + n]) - @bit_cast(i64, carry)) + borrow;
-        un[j + n] = @truncate(u32, @bit_cast(u64, t));
-        q[j] = @truncate(u32, qhat);
-        if t < 0 {
+        let ds = @sub_borrow(un[j + n], carry, borrow);
+        un[j + n] = ds.value;
+        q[j] = qhat;
+        if ds.borrow != 0 {
             // qhat was one too big: add v back
             q[j] -= 1;
-            let mut c: u64 = 0;
+            let mut c: u8 = 0;
             for i in 0..n {
-                let s2 = (@as(u64, un[i + j]) + @as(u64, vn[i])) + c;
-                un[i + j] = @truncate(u32, s2);
-                c = s2 >> 32;
+                let s2 = @add_carry(un[i + j], vn[i], c);
+                un[i + j] = s2.value;
+                c = s2.carry;
             }
-            un[j + n] +%= @truncate(u32, c);
+            un[j + n] +%= @as(u64, c);
         }
     }
     shr_limbs(r, un[..n], s, un[n]);
 }
 
-/// out = x << s (s < 32); returns the bits shifted out of the top.
-fn shl_limbs(out: []mut u32, x: []u32, s: u32) u32 {
+/// out = x << s (s < 64); returns the bits shifted out of the top.
+fn shl_limbs(out: []mut u64, x: []u64, s: u32) u64 {
     if s == 0 {
         @mem_copy(out[..x.len], x);
         return 0;
     }
-    let mut carry: u32 = 0;
+    let mut carry: u64 = 0;
+    let rs = 64 - s;
     for i in 0..x.len {
         let v = x[i];
         out[i] = (v << s) | carry;
-        carry = v >> (32 - s);
+        carry = v >> rs;
     }
     return carry;
 }
 
-/// out = (x, with `above` as the next limb up) >> s (s < 32).
-fn shr_limbs(out: []mut u32, x: []u32, s: u32, above: u32) void {
+/// out = (x, with `above` as the next limb up) >> s (s < 64).
+fn shr_limbs(out: []mut u64, x: []u64, s: u32, above: u64) void {
     if s == 0 {
         @mem_copy(out[..x.len], x);
         return;
     }
+    let ls = 64 - s;
     for i in 0..x.len {
         let mut hi = above;
         if (i + 1) < x.len {
             hi = x[i + 1];
         }
-        out[i] = (x[i] >> s) | (hi << (32 - s));
+        out[i] = (x[i] >> s) | (hi << ls);
     }
 }
 
@@ -339,7 +388,7 @@ fn shr_limbs(out: []mut u32, x: []u32, s: u32, above: u32) void {
 // -----------------------------------------------------------------------------
 
 pub struct BigInt {
-    d: []mut u32,  // capacity: the value's limbs are d[..n]
+    d: []mut u64,  // capacity: the value's limbs are d[..n]
     n: usize,
     neg: bool,  // never set for zero
 
@@ -372,13 +421,13 @@ pub struct BigInt {
         return z;
     }
 
-    fn limbs(self: *BigInt) []u32 {
+    fn limbs(self: *BigInt) []u64 {
         return self.d[..self.n];
     }
 
     fn reserve(self: *mut BigInt, n: usize) BigintError!void {
         if self.d.len < n {
-            let fresh = mem.alloc.[u32](@max(n, 4))!;
+            let fresh = mem.alloc.[u64](@max(n, 4))!;
             @mem_copy(fresh[..self.n], self.d[..self.n]);
             mem.free(self.d);
             self.d = fresh;
@@ -386,7 +435,7 @@ pub struct BigInt {
     }
 
     /// Takes ownership of limbs (which the BigInt frees) as its magnitude.
-    fn adopt(self: *mut BigInt, limbs: []mut u32, neg: bool) void {
+    fn adopt(self: *mut BigInt, limbs: []mut u64, neg: bool) void {
         mem.free(self.d);
         self.d = limbs;
         self.n = norm(limbs);
@@ -404,10 +453,14 @@ pub struct BigInt {
     }
 
     pub fn set_u64(self: *mut BigInt, v: u64) BigintError!void {
-        self.reserve(2)!;
-        self.d[0] = @truncate(u32, v);
-        self.d[1] = @truncate(u32, v >> 32);
-        self.n = norm(self.d[..2]);
+        if v == 0 {
+            self.n = 0;
+            self.neg = false;
+            return;
+        }
+        self.reserve(1)!;
+        self.d[0] = v;
+        self.n = 1;
         self.neg = false;
     }
 
@@ -462,13 +515,12 @@ pub struct BigInt {
     }
 
     pub fn cmp_i64(self: *BigInt, v: i64) i32 {
-        let mut t: [2]u32 = [0; 2];
+        let mut t: [1]u64 = [0; 1];
         let mut m = @bit_cast(u64, v);
         if v < 0 {
             m = 0 -% m;
         }
-        t[0] = @truncate(u32, m);
-        t[1] = @truncate(u32, m >> 32);
+        t[0] = m;
         let tv = BigInt.{ d: t[..], n: norm(t[..]), neg: v < 0 };
         return self.cmp(&tv);
     }
@@ -478,52 +530,45 @@ pub struct BigInt {
         if self.n == 0 {
             return 0;
         }
-        return (32 * self.n) - @as(usize, @clz(self.d[self.n - 1]));
+        return (64 * self.n) - @truncate(usize, @clz(self.d[self.n - 1]));
     }
 
     /// Bit i of the absolute value.
     pub fn bit(self: *BigInt, i: usize) u32 {
-        let k = i / 32;
+        let k = i / 64;
         if k >= self.n {
             return 0;
         }
-        return (self.d[k] >> @truncate(u32, i % 32)) & 1;
+        return @truncate(u32, (self.d[k] >> @truncate(u32, i % 64)) & 1);
     }
 
     /// The number of trailing zero bits of the absolute value (0 for zero).
     pub fn trailing_zeros(self: *BigInt) usize {
         for i in 0..self.n {
             if self.d[i] != 0 {
-                return (32 * i) + @as(usize, @ctz(self.d[i]));
+                return (64 * i) + @truncate(usize, @ctz(self.d[i]));
             }
         }
         return 0;
     }
 
     pub fn to_u64(self: *BigInt) BigintError!u64 {
-        if self.neg or (self.n > 2) {
+        if self.neg or (self.n > 1) {
             return error.Overflow;
         }
-        let mut v: u64 = 0;
-        if self.n > 0 {
-            v = @as(u64, self.d[0]);
+        if self.n == 0 {
+            return 0;
         }
-        if self.n > 1 {
-            v = v | (@as(u64, self.d[1]) << 32);
-        }
-        return v;
+        return self.d[0];
     }
 
     pub fn to_i64(self: *BigInt) BigintError!i64 {
-        if self.n > 2 {
+        if self.n > 1 {
             return error.Overflow;
         }
         let mut m: u64 = 0;
         if self.n > 0 {
-            m = @as(u64, self.d[0]);
-        }
-        if self.n > 1 {
-            m = m | (@as(u64, self.d[1]) << 32);
+            m = self.d[0];
         }
         if self.neg {
             if m > 9223372036854775808 {
@@ -543,16 +588,17 @@ pub struct BigInt {
         let mut v: f64 = 0.0;
         if bl <= 64 {
             let mut m: u64 = 0;
-            for i in 0..self.n {
-                m = m | (@as(u64, self.d[i]) << @truncate(u32, 32 * i));
+            if self.n > 0 {
+                m = self.d[0];
             }
             v = @float_from_int(f64, m);
         } else {
             // the top 64 bits, scaled
             let shift = bl - 64;
-            let mut m: u64 = 0;
-            for k in @as(usize, 0)..64 {
-                m = (m << 1) | @as(u64, self.bit((bl - 1) - k));
+            let top = 64 - @truncate(u32, @clz(self.d[self.n - 1]));
+            let mut m = self.d[self.n - 1];
+            if top < 64 {
+                m = (m << (64 - top)) | (self.d[self.n - 2] >> top);
             }
             v = @float_from_int(f64, m);
             let mut s = shift;
@@ -599,7 +645,7 @@ pub struct BigInt {
                 a = ys;
                 b = xs;
             }
-            let out = mem.alloc.[u32](a.len + 1)!;
+            let out = mem.alloc.[u64](a.len + 1)!;
             out[a.len] = nat_add(out[..a.len], a, b);
             self.adopt(out, xneg);
             return;
@@ -611,11 +657,11 @@ pub struct BigInt {
             return;
         }
         if c > 0 {
-            let out = mem.alloc.[u32](xs.len)!;
+            let out = mem.alloc.[u64](xs.len)!;
             _ = nat_sub(out, xs, ys);
             self.adopt(out, xneg);
         } else {
-            let out = mem.alloc.[u32](ys.len)!;
+            let out = mem.alloc.[u64](ys.len)!;
             _ = nat_sub(out, ys, xs);
             self.adopt(out, yneg);
         }
@@ -646,7 +692,7 @@ pub struct BigInt {
             self.neg = false;
             return;
         }
-        let out = mem.alloc.[u32](x.n + y.n)!;
+        let out = mem.alloc.[u64](x.n + y.n)!;
         nat_mul(out, x.limbs(), y.limbs()) catch |e| {
             mem.free(out);
             return e;
@@ -695,8 +741,8 @@ pub struct BigInt {
             q.neg = false;
             return;
         }
-        let qd = mem.alloc.[u32](x.n)!;
-        let rd = mem.alloc.[u32](y.n) catch |e| {
+        let qd = mem.alloc.[u64](x.n)!;
+        let rd = mem.alloc.[u64](y.n) catch |e| {
             mem.free(qd);
             return e;
         };
@@ -763,9 +809,9 @@ pub struct BigInt {
             self.neg = false;
             return;
         }
-        let limbs = s / 32;
-        let bits = @truncate(u32, s % 32);
-        let out = mem.alloc.[u32]((x.n + limbs) + 1)!;
+        let limbs = s / 64;
+        let bits = @truncate(u32, s % 64);
+        let out = mem.alloc.[u64]((x.n + limbs) + 1)!;
         @mem_set(out[..limbs], 0);
         out[x.n + limbs] = shl_limbs(out[limbs..limbs + x.n], x.limbs(), bits);
         self.adopt(out, x.neg);
@@ -773,8 +819,8 @@ pub struct BigInt {
 
     /// self = floor(x / 2^s).
     pub fn shr(self: *mut BigInt, x: *BigInt, s: usize) BigintError!void {
-        let limbs = s / 32;
-        let bits = @truncate(u32, s % 32);
+        let limbs = s / 64;
+        let bits = @truncate(u32, s % 64);
         if limbs >= x.n {
             if x.neg {
                 self.set_i64(-1)!;
@@ -792,12 +838,12 @@ pub struct BigInt {
                     lost = true;
                 }
             }
-            if (bits > 0) and ((x.d[limbs] & ((@as(u32, 1) << bits) - 1)) != 0) {
+            if (bits > 0) and ((x.d[limbs] & ((@as(u64, 1) << bits) - 1)) != 0) {
                 lost = true;
             }
         }
         let n = x.n - limbs;
-        let out = mem.alloc.[u32](n)!;
+        let out = mem.alloc.[u64](n)!;
         shr_limbs(out, x.d[limbs..x.n], bits, 0);
         let neg = x.neg;
         self.adopt(out, neg);
@@ -811,10 +857,10 @@ pub struct BigInt {
             return error.Negative;
         }
         let n = @max(x.n, y.n);
-        let out = mem.alloc.[u32](@max(n, 1))!;
+        let out = mem.alloc.[u64](@max(n, 1))!;
         for i in 0..n {
-            let mut a: u32 = 0;
-            let mut b: u32 = 0;
+            let mut a: u64 = 0;
+            let mut b: u64 = 0;
             if i < x.n {
                 a = x.d[i];
             }
@@ -852,7 +898,7 @@ pub struct BigInt {
 
     /// Sets bit i of the absolute value to b.
     pub fn set_bit(self: *mut BigInt, i: usize, b: u32) BigintError!void {
-        let k = i / 32;
+        let k = i / 64;
         if k >= self.n {
             if b == 0 {
                 return;
@@ -861,7 +907,7 @@ pub struct BigInt {
             @mem_set(self.d[self.n..k + 1], 0);
             self.n = k + 1;
         }
-        let mask = @as(u32, 1) << @truncate(u32, i % 32);
+        let mask = @as(u64, 1) << @truncate(u32, i % 64);
         if b == 0 {
             self.d[k] = self.d[k] & ~mask;
         } else {
@@ -892,7 +938,7 @@ pub struct BigInt {
         }
         let mut t = BigInt.init();
         defer t.deinit();
-        while b.n > 2 {
+        while b.n > 1 {
             lehmer_step(&mut a, &mut b, &mut t)!;
         }
         if b.n > 0 {
@@ -1067,16 +1113,17 @@ pub struct BigInt {
     }
 
     /// self = self * m + a (self >= 0).
-    fn mul_add_small(self: *mut BigInt, m: u32, a: u32) BigintError!void {
+    fn mul_add_small(self: *mut BigInt, m: u64, a: u64) BigintError!void {
         self.reserve(self.n + 1)!;
-        let mut c = @as(u64, a);
+        let mut c = a;
         for i in 0..self.n {
-            let t = (@as(u64, self.d[i]) * @as(u64, m)) + c;
-            self.d[i] = @truncate(u32, t);
-            c = t >> 32;
+            let p = @mul_wide(self.d[i], m);
+            let s = @add_carry(p.lo, c, 0);
+            self.d[i] = s.value;
+            c = p.hi + @as(u64, s.carry);
         }
         if c != 0 {
-            self.d[self.n] = @truncate(u32, c);
+            self.d[self.n] = c;
             self.n += 1;
         }
     }
@@ -1124,7 +1171,7 @@ pub struct BigInt {
 
     /// The digits in `base` in new memory (free it with mem.free).
     pub fn to_string(self: *BigInt, base: u32) ![]mut u8 {
-        let mut b = io.BufferWriter.init(mem.alloc.[u8](((self.n * 32) + 8))!);
+        let mut b = io.BufferWriter.init(mem.alloc.[u8](((self.n * 64) + 8))!);
         let w = b.writer();
         self.format(w, base) catch |e| {
             mem.free(b.buf);
@@ -1139,12 +1186,12 @@ pub struct BigInt {
     /// The absolute value from big-endian bytes.
     pub fn from_bytes(be: []u8) BigintError!BigInt {
         let mut z = BigInt.init();
-        let n = (be.len + 3) / 4;
+        let n = (be.len + 7) / 8;
         z.reserve(@max(n, 1))!;
         @mem_set(z.d[..n], 0);
         for i in 0..be.len {
             let b = be[(be.len - 1) - i];
-            z.d[i / 4] = z.d[i / 4] | (@as(u32, b) << @truncate(u32, 8 * (i % 4)));
+            z.d[i / 8] = z.d[i / 8] | (@as(u64, b) << @truncate(u32, 8 * (i % 8)));
         }
         z.n = norm(z.d[..n]);
         return z;
@@ -1162,10 +1209,10 @@ pub struct BigInt {
             return error.NoSpaceLeft;
         }
         for i in 0..out.len {
-            let k = i / 4;
+            let k = i / 8;
             let mut b: u8 = 0;
             if k < self.n {
-                b = @truncate(u8, self.d[k] >> @truncate(u32, 8 * (i % 4)));
+                b = @truncate(u8, self.d[k] >> @truncate(u32, 8 * (i % 8)));
             }
             out[(out.len - 1) - i] = b;
         }
@@ -1178,18 +1225,19 @@ pub struct BigInt {
 
 // The 64 bits of x (with n limbs or fewer) below the top h bits of an
 // n-limb number (n >= 2).
-fn top64(x: []u32, n: usize, h: u32) u64 {
-    let mut l: [3]u64 = [0; 3];
-    for k in @as(usize, 0)..3 {
-        if ((k + 1) <= n) and ((n - (k + 1)) < x.len) {
-            l[k] = @as(u64, x[n - (k + 1)]);
-        }
+fn top64(x: []u64, n: usize, h: u32) u64 {
+    let mut hi: u64 = 0;
+    let mut lo: u64 = 0;
+    if (n - 1) < x.len {
+        hi = x[n - 1];
     }
-    let hi = (l[0] << 32) | l[1];
+    if (n - 2) < x.len {
+        lo = x[n - 2];
+    }
     if h == 0 {
         return hi;
     }
-    return (hi << h) | (l[2] >> (32 - h));
+    return (hi << h) | (lo >> (64 - h));
 }
 
 // z = v, negated if neg.
@@ -1205,7 +1253,7 @@ fn set_signed(z: *mut BigInt, v: u64, neg: bool) BigintError!void {
 // none, one ordinary step.
 fn lehmer_step(a: *mut BigInt, b: *mut BigInt, t: *mut BigInt) BigintError!void {
     let n = a.n;
-    let h = @clz(a.d[n - 1]);
+    let h = @truncate(u32, @clz(a.d[n - 1]));
     let mut a1 = top64(a.limbs(), n, h);
     let mut a2 = top64(b.limbs(), n, h);
     let mut u0: u64 = 0;
@@ -1267,23 +1315,25 @@ fn lehmer_step(a: *mut BigInt, b: *mut BigInt, t: *mut BigInt) BigintError!void 
 // the whole number.
 const CONVERT_SPLIT: usize = 48;
 
-// The largest power of base that fits a limb, and its exponent.
-fn chunk_of(base: u32, per: *mut usize) u32 {
-    let mut chunk: u32 = 1;
+// The largest power of base that fits a 64-bit limb, and its exponent.
+fn chunk_of(base: u32, per: *mut usize) u64 {
+    let b = @as(u64, base);
+    let limit = 0xFFFF_FFFF_FFFF_FFFF / b;
+    let mut chunk: u64 = 1;
     per.* = 0;
-    while (@as(u64, chunk) * @as(u64, base)) <= 0xFFFFFFFF {
-        chunk *= base;
+    while chunk <= limit {
+        chunk *= b;
         per.* += 1;
     }
     return chunk;
 }
 
 // pows[k] = chunk^(2^k) for k < n, and zero above.
-fn chunk_powers(chunk: u32, pows: []mut BigInt, n: usize) BigintError!void {
+fn chunk_powers(chunk: u64, pows: []mut BigInt, n: usize) BigintError!void {
     for k in 0..pows.len {
         pows[k] = BigInt.init();
     }
-    pows[0].set_u64(@as(u64, chunk))!;
+    pows[0].set_u64(chunk)!;
     for k in 1..n {
         pows[k].mul(&pows[k - 1], &pows[k - 1])!;
     }
@@ -1301,7 +1351,7 @@ fn from_digits(dv: []u8, b: u32) BigintError!BigInt {
     let mut per: usize = 0;
     let chunk = chunk_of(b, &mut per);
     let mut levels: usize = 1;
-    while (per << levels) < dv.len {
+    while (@as(u64, per) << @truncate(u32, levels)) < @as(u64, dv.len) {
         levels += 1;
     }
     if dv.len <= (CONVERT_SPLIT * per) {
@@ -1327,13 +1377,14 @@ fn digits_to(z: *mut BigInt, dv: []u8, b: u32, per: usize, pows: []BigInt) Bigin
     if dv.len <= (CONVERT_SPLIT * per) {
         z.n = 0;
         z.neg = false;
-        z.reserve(((dv.len * 6) / 32) + 2)!;
-        let mut acc: u32 = 0;
-        let mut mult: u32 = 1;
+        z.reserve(((dv.len * 6) / 64) + 2)!;
+        let mut acc: u64 = 0;
+        let mut mult: u64 = 1;
         let mut count: usize = 0;
+        let bb = @as(u64, b);
         for d in dv {
-            acc = (acc * b) + @as(u32, d);
-            mult *= b;
+            acc = (acc * bb) + @as(u64, d);
+            mult *= bb;
             count += 1;
             if count == per {
                 z.mul_add_small(mult, acc)!;
@@ -1368,9 +1419,10 @@ fn digits_to(z: *mut BigInt, dv: []u8, b: u32, per: usize, pows: []BigInt) Bigin
 fn to_digits(x: *BigInt, base: u32) ![]mut u8 {
     let mut per: usize = 0;
     let chunk = chunk_of(base, &mut per);
-    // chunk^(2^levels) > x (chunk >= 2^26)
+    // chunk^(2^levels) > x (chunk >= 2^59 for every base in 2..36)
+    let total_bits = @as(u64, x.n) * 64;
     let mut levels: usize = 1;
-    while (@as(usize, 26) << levels) < (32 * x.n) {
+    while (@as(u64, 59) << @truncate(u32, levels)) < total_bits {
         levels += 1;
     }
     let mut used = levels;
@@ -1393,18 +1445,19 @@ fn to_digits(x: *BigInt, base: u32) ![]mut u8 {
 
 // Writes x (< base^out.len, out.len a multiple of per) into out with
 // leading zeros.
-fn write_digits(x: *BigInt, out: []mut u8, base: u32, chunk: u32, per: usize, pows: []BigInt) !void {
+fn write_digits(x: *BigInt, out: []mut u8, base: u32, chunk: u64, per: usize, pows: []BigInt) !void {
     let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
     if (x.n <= CONVERT_SPLIT) or (out.len <= per) {
-        let work = mem.alloc.[u32](x.n)!;
+        let work = mem.alloc.[u64](x.n)!;
         defer mem.free(work);
         @mem_copy(work, x.limbs());
         let mut wn = x.n;
         let mut at = out.len;
+        let bb = @as(u64, base);
         while (wn > 0) and (at > 0) {
-            let mut r: u32 = 0;
-            if chunk == 1_000_000_000 {
-                r = nat_div_1e9(work[..wn], work[..wn]);
+            let mut r: u64 = 0;
+            if chunk == TEN_E19 {
+                r = nat_div_1e19(work[..wn], work[..wn]);
             } else {
                 r = nat_div_small(work[..wn], work[..wn], chunk);
             }
@@ -1415,8 +1468,8 @@ fn write_digits(x: *BigInt, out: []mut u8, base: u32, chunk: u32, per: usize, po
                     break;
                 }
                 at -= 1;
-                out[at] = digits[@as(usize, r % base)];
-                r = r / base;
+                out[at] = digits[@truncate(usize, r % bb)];
+                r = r / bb;
             }
         }
         @mem_set(out[..at], '0');
@@ -1452,22 +1505,21 @@ fn digit_value(c: u8) u32 {
 // Modular exponentiation
 // -----------------------------------------------------------------------------
 
-/// -m^-1 mod 2^32 for odd m0 (Newton's iteration).
-fn mont_inv(m0: u32) u32 {
-    let mut x: u32 = 1;
-    for i in @as(u32, 0)..5 {
+/// -m^-1 mod 2^64 for odd m0 (Newton's iteration: 6 steps reach 64 bits).
+fn mont_inv(m0: u64) u64 {
+    let mut x: u64 = 1;
+    for i in @as(u32, 0)..6 {
+        _ = i;
         x = x *% (2 -% (m0 *% x));
     }
     return 0 -% x;
 }
 
-/// z = a * b * R^-1 mod m (CIOS). a, b < m; z, t scratch of m.len and
-/// m.len + 2 limbs. The final subtraction is done with masks, so the time
-/// does not depend on the values.
-fn mont_mul(z: []mut u32, a0: []u32, b: []u32, m0: []u32, minv: u32, t0: []mut u32) void {
+/// z = a * b * R^-1 mod m (CIOS, R = 2^(64*m.len)). a, b < m; z, t scratch
+/// of m.len and m.len + 2 limbs. The final subtraction is done with masks, so
+/// the time does not depend on the values.
+fn mont_mul(z: []mut u64, a0: []u64, b: []u64, m0: []u64, minv: u64, t0: []mut u64) void {
     let n = m0.len;
-    // (the same lengths throughout, so the loops need no bounds checks;
-    // no sum below can pass 2^64 - 1, so they wrap without checks)
     let a = a0[..n];
     let m = m0[..n];
     let t = t0[..n + 2];
@@ -1475,38 +1527,38 @@ fn mont_mul(z: []mut u32, a0: []u32, b: []u32, m0: []u32, minv: u32, t0: []mut u
     for i in 0..n {
         // t += a * b[i]
         let mut c: u64 = 0;
-        let bi = @as(u64, b[i]);
+        let bi = b[i];
         for j in 0..n {
-            let s = ((@as(u64, a[j]) *% bi) +% @as(u64, t[j])) +% c;
-            t[j] = @truncate(u32, s);
-            c = s >> 32;
+            let r = mul_add_limb(a[j], bi, t[j], c);
+            t[j] = r.lo;
+            c = r.hi;
         }
-        let s1 = @as(u64, t[n]) +% c;
-        t[n] = @truncate(u32, s1);
-        t[n + 1] = @truncate(u32, s1 >> 32);
-        // t = (t + u * m) / 2^32 with u making the low limb zero
-        let u = @as(u64, t[0] *% minv);
-        let s2 = (u *% @as(u64, m[0])) +% @as(u64, t[0]);
-        c = s2 >> 32;
+        let s1 = @add_carry(t[n], c, 0);
+        t[n] = s1.value;
+        t[n + 1] = @as(u64, s1.carry);
+        // t = (t + u * m) / 2^64 with u making the low limb zero
+        let u = t[0] *% minv;
+        // (u * m[0] + t[0]) mod 2^64 == 0, so the carry out of limb 0 is 1 iff t[0] != 0
+        c = @mul_high(u, m[0]) + ((t[0] | (0 -% t[0])) >> 63);
         for j in 1..n {
-            let s = ((u *% @as(u64, m[j])) +% @as(u64, t[j])) +% c;
-            t[j - 1] = @truncate(u32, s);
-            c = s >> 32;
+            let r = mul_add_limb(u, m[j], t[j], c);
+            t[j - 1] = r.lo;
+            c = r.hi;
         }
-        let s3 = @as(u64, t[n]) +% c;
-        t[n - 1] = @truncate(u32, s3);
-        t[n] = t[n + 1] +% @truncate(u32, s3 >> 32);
+        let s3 = @add_carry(t[n], c, 0);
+        t[n - 1] = s3.value;
+        t[n] = t[n + 1] + @as(u64, s3.carry);
     }
     // z = t - m if t >= m, else t, without branching on the values
-    let mut borrow: u64 = 0;
+    let mut borrow: u8 = 0;
     for j in 0..n {
-        let d = (@as(u64, t[j]) -% @as(u64, m[j])) -% borrow;
-        z[j] = @truncate(u32, d);
-        borrow = (d >> 32) & 1;
+        let d = @sub_borrow(t[j], m[j], borrow);
+        z[j] = d.value;
+        borrow = d.borrow;
     }
     // keep t when it was smaller: t[n] == 0 and a borrow happened
-    let keep_t = (@as(u64, borrow) & (@as(u64, (@as(u64, t[n]) -% 1) >> 63) & 1)) & 1;
-    let mask = 0 -% @truncate(u32, keep_t);
+    let keep_t = @sub_borrow(t[n], 0, borrow).borrow;
+    let mask = 0 -% @as(u64, keep_t);
     for j in 0..n {
         z[j] = (t[j] & mask) | (z[j] & ~mask);
     }
@@ -1545,12 +1597,12 @@ fn mod_pow_impl(z: *mut BigInt, x: *BigInt, e: *BigInt, m: *BigInt, secret: bool
     let n = m.n;
     let mm = m.limbs();
     let minv = mont_inv(mm[0]);
-    // R^2 mod m, to move numbers into Montgomery form
+    // R^2 mod m (R = 2^(64*n)), to move numbers into Montgomery form
     let mut r2 = BigInt.from_u64(1)!;
     defer r2.deinit();
-    r2.shl(&r2, 64 * n)!;
+    r2.shl(&r2, 128 * n)!;
     r2.mod(&r2, m)!;
-    let scratch = mem.alloc.[u32]((20 * n) + 2)!;
+    let scratch = mem.alloc.[u64]((20 * n) + 2)!;
     defer mem.free(scratch);
     @mem_set(scratch, 0);
     let t = scratch[0..n + 2];
@@ -1559,17 +1611,17 @@ fn mod_pow_impl(z: *mut BigInt, x: *BigInt, e: *BigInt, m: *BigInt, secret: bool
     let bm = scratch[(3 * n) + 2..(4 * n) + 2];
     // table[k] = b^k in Montgomery form for k < 16
     let table = scratch[(4 * n) + 2..(20 * n) + 2];
-    let mut padded_b = mem.alloc.[u32](n)!;
+    let mut padded_b = mem.alloc.[u64](n)!;
     defer mem.free(padded_b);
     @mem_set(padded_b, 0);
     @mem_copy(padded_b[..b.n], b.limbs());
-    let mut padded_r2 = mem.alloc.[u32](n)!;
+    let mut padded_r2 = mem.alloc.[u64](n)!;
     defer mem.free(padded_r2);
     @mem_set(padded_r2, 0);
     @mem_copy(padded_r2[..r2.n], r2.limbs());
     mont_mul(bm, padded_b, padded_r2, mm, minv, t);
     // one in Montgomery form: R mod m = mont_mul(1, R^2)
-    let mut one = mem.alloc.[u32](n)!;
+    let mut one = mem.alloc.[u64](n)!;
     defer mem.free(one);
     @mem_set(one, 0);
     one[0] = 1;
@@ -1584,7 +1636,7 @@ fn mod_pow_impl(z: *mut BigInt, x: *BigInt, e: *BigInt, m: *BigInt, secret: bool
     // four squarings and one multiplication by an entry read with masks
     let mut bits = e.bit_len();
     if secret {
-        bits = 32 * e.n;
+        bits = 64 * e.n;
     }
     let windows = (bits + 3) / 4;
     let mut wi = windows;
@@ -1602,7 +1654,7 @@ fn mod_pow_impl(z: *mut BigInt, x: *BigInt, e: *BigInt, m: *BigInt, secret: bool
             // read table[k] touching every entry
             @mem_set(bm, 0);
             for j in @as(u32, 0)..16 {
-                let mask = 0 -% @truncate(u32, (@as(u64, j ^ k) -% 1) >> 63);
+                let mask = 0 -% ((@as(u64, j ^ k) -% 1) >> 63);
                 let row = table[@as(usize, j) * n..(@as(usize, j) + 1) * n];
                 for q in 0..n {
                     bm[q] = bm[q] | (row[q] & mask);
@@ -1617,7 +1669,7 @@ fn mod_pow_impl(z: *mut BigInt, x: *BigInt, e: *BigInt, m: *BigInt, secret: bool
     }
     // out of Montgomery form: mont_mul(acc, 1)
     mont_mul(tmp, acc, one, mm, minv, t);
-    let out = mem.alloc.[u32](n)!;
+    let out = mem.alloc.[u64](n)!;
     @mem_copy(out, tmp);
     z.adopt(out, false);
 }
@@ -1914,4 +1966,153 @@ test "gcd of large numbers" {
     @expect_eq(g.cmp(&y), 0);
     g.gcd(&x, &x)!;
     @expect(g.is_zero());
+}
+
+fn check_div_hex(u_hex: []u8, v_hex: []u8, q_hex: []u8, r_hex: []u8) void {
+    let mut u = BigInt.parse(u_hex, 16) catch @trap();
+    defer u.deinit();
+    let mut v = BigInt.parse(v_hex, 16) catch @trap();
+    defer v.deinit();
+    let mut q = BigInt.init();
+    defer q.deinit();
+    let mut r = BigInt.init();
+    defer r.deinit();
+    BigInt.quo_rem(&mut q, &mut r, &u, &v) catch @trap();
+    eq_str(&q, 16, q_hex);
+    eq_str(&r, 16, r_hex);
+    // round-trip: q * v + r == u
+    let mut chk = BigInt.init();
+    defer chk.deinit();
+    chk.mul(&q, &v) catch @trap();
+    chk.add(&chk, &r) catch @trap();
+    @expect_eq(chk.cmp(&u), 0);
+}
+
+test "64-bit limb edge cases" {
+    // Knuth Algorithm D edge cases on 64-bit limbs:
+    // 1) u2 >= vtop with rhat overflow
+    check_div_hex("10000000000000001fffffffffffffffdffffffffffffffff", "8000000000000000ffffffffffffffff",
+                  "1ffffffffffffffff", "8000000000000000fffffffffffffffe");
+    // 2) u2 >= vtop without initial rhat overflow
+    check_div_hex("10000000000000000ffffffffffffffff0000000000000000", "8000000000000000ffffffffffffffff",
+                  "1fffffffffffffffe", "2fffffffffffffffe");
+    // 3) shifted divisor (s > 0) hitting u2 >= vtop
+    check_div_hex("2468acf135782468acf13579bddffedcba9876543210", "123456789abc123456789abcdef0", "1ffffffffffffffff",
+                  "123456789abc1111111111111100");
+    // 4) qhat overestimated by 2
+    check_div_hex("7fffffffffffffff80000000000000000000000000000000", "8000000000000000ffffffffffffffff",
+                  "fffffffffffffffd", "3fffffffffffffffd");
+    // 5) rare add-back step (qhat * vn > un after 2-limb check)
+    check_div_hex("80000000000000007fffffffffffffff00000000000000000000000000000000",
+                  "80000000000000010000000000000000ffffffffffffffff", "fffffffffffffffe",
+                  "80000000000000000000000000000002fffffffffffffffe");
+
+    // 10^19 chunk boundaries for decimal parse / to_string
+    let decs: [5][2][]u8 = [
+        ["9999999999999999999", "8ac7230489e7ffff"],
+        ["10000000000000000000", "8ac7230489e80000"],
+        ["99999999999999999999999999999999999999", "4b3b4ca85a86c47a098a223fffffffff"],
+        ["100000000000000000000000000000000000000", "4b3b4ca85a86c47a098a224000000000"],
+        ["1000000000000000000700000000000000000011234567890123456789",
+         "28c87cb5c89a2573fa9ce3eefffa39da28b023b907d18115"],
+    ];
+    for pair in decs {
+        let mut d = BigInt.parse(pair[0], 10)!;
+        defer d.deinit();
+        eq_str(&d, 16, pair[1]);
+        eq_str(&d, 10, pair[0]);
+    }
+
+    // Multiplication carry saturation and asymmetric Karatsuba (x.n >= 40, y.n > x.n)
+    let mut all_ones = BigInt.parse("ffffffffffffffffffffffffffffffff", 16)!;
+    defer all_ones.deinit();
+    let mut sq = BigInt.init();
+    defer sq.deinit();
+    sq.mul(&all_ones, &all_ones)!;
+    eq_str(&sq, 16, "fffffffffffffffffffffffffffffffe00000000000000000000000000000001");
+    let bs = str_of(&sq, 2);
+    defer mem.free(bs);
+    @expect_eq(bs.len, 256);
+
+    let mut one = BigInt.from_u64(1)!;
+    defer one.deinit();
+    let mut k1 = BigInt.init();
+    defer k1.deinit();
+    k1.shl(&one, 2600)!;
+    k1.sub(&k1, &one)!;
+    let mut k2 = BigInt.init();
+    defer k2.deinit();
+    k2.shl(&one, 5000)!;
+    k2.sub(&k2, &one)!;
+    let mut prod = BigInt.init();
+    defer prod.deinit();
+    prod.mul(&k1, &k2)!;
+    let mut expected = BigInt.init();
+    defer expected.deinit();
+    expected.shl(&one, 7600)!;
+    let mut t5000 = BigInt.init();
+    defer t5000.deinit();
+    t5000.shl(&one, 5000)!;
+    let mut t2600 = BigInt.init();
+    defer t2600.deinit();
+    t2600.shl(&one, 2600)!;
+    expected.sub(&expected, &t5000)!;
+    expected.sub(&expected, &t2600)!;
+    expected.add(&expected, &one)!;
+    @expect_eq(prod.cmp(&expected), 0);
+
+    // Montgomery mod_pow and mod_pow_secret across 1-limb and 256-bit odd moduli
+    let mut m1 = BigInt.from_u64(0xFFFF_FFFF_FFFF_FFC5)!;  // 2^64 - 59 (prime)
+    defer m1.deinit();
+    let mut x1 = BigInt.from_u64(0xFFFF_FFFF_FFFF_FFFE)!;
+    defer x1.deinit();
+    let mut e1 = BigInt.from_u64(0xFFFF_FFFF_FFFF_FFC4)!;
+    defer e1.deinit();
+    let mut r1 = BigInt.init();
+    defer r1.deinit();
+    r1.mod_pow(&x1, &e1, &m1)!;
+    @expect_eq(r1.to_u64()!, 1);
+    r1.mod_pow_secret(&x1, &e1, &m1)!;
+    @expect_eq(r1.to_u64()!, 1);
+
+    let mut mx = BigInt.parse("deadbeefcafebabe123456789abcdef00123456789abcdef00123456789abcdef", 16)!;
+    defer mx.deinit();
+    let mut me = BigInt.parse("80000000000000000000000000000001ffffffffffffffff0000000000000005", 16)!;
+    defer me.deinit();
+    let mut mm = BigInt.parse("fffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffff", 16)!;
+    defer mm.deinit();
+    let mut mr = BigInt.init();
+    defer mr.deinit();
+    mr.mod_pow(&mx, &me, &mm)!;
+    eq_str(&mr, 16, "87c45a2b8096973cde9485aa65a76206bc0db3550e8dab74520558995faad026");
+    mr.mod_pow_secret(&mx, &me, &mm)!;
+    eq_str(&mr, 16, "87c45a2b8096973cde9485aa65a76206bc0db3550e8dab74520558995faad026");
+    let mut zero = BigInt.init();
+    mr.mod_pow_secret(&mx, &zero, &mm)!;
+    @expect_eq(mr.to_u64()!, 1);
+    mr.mod_pow_secret(&zero, &me, &mm)!;
+    @expect(mr.is_zero());
+
+    // Bit / byte / conversion boundaries at 63, 64, 65, 128 bits
+    let mut b = BigInt.init();
+    defer b.deinit();
+    b.set_bit(64, 1)!;
+    @expect_eq(b.bit_len(), 65);
+    @expect_eq(b.trailing_zeros(), 64);
+    @expect_eq(b.bit(64), 1);
+    @expect_eq(b.bit(63), 0);
+    @expect_eq(b.byte_len(), 9);
+    let mut bytes9: [9]u8 = [0; 9];
+    b.to_bytes(bytes9[..])!;
+    @expect_eq(bytes9[0], 1);
+    @expect_eq(bytes9[8], 0);
+    let mut b2 = BigInt.from_bytes(bytes9[..])!;
+    defer b2.deinit();
+    @expect_eq(b2.cmp(&b), 0);
+    b.set_bit(63, 1)!;
+    @expect_eq(b.trailing_zeros(), 63);
+    @expect_eq(b.to_f64(), 27670116110564327424.0);  // 2^64 + 2^63
+    b.set_bit(64, 0)!;
+    @expect_eq(b.bit_len(), 64);
+    @expect_eq(b.to_u64()!, 0x8000_0000_0000_0000);
 }

@@ -11,7 +11,7 @@
 // and likewise ec.P384 and ec.verify_p384 (97, 48 and 96 bytes).
 //
 // Arithmetic modulo the field prime and the group order is Montgomery
-// multiplication on 32-bit limbs with masked final subtractions, and points
+// multiplication on 64-bit limbs with masked final subtractions, and points
 // are added with the complete formulas of Renes, Costello and Batina
 // (2016), so the scalar multiplication (a Montgomery ladder with masked
 // swaps) runs in time independent of the scalar. Both curves share the
@@ -25,12 +25,12 @@ import "subtle.ax" as subtle;
 pub error EcError { InvalidPoint, InvalidLength, InvalidKey, RandomFailed }
 
 // -----------------------------------------------------------------------------
-// Montgomery arithmetic modulo an odd number of N 32-bit limbs
+// Montgomery arithmetic modulo an odd number of N 64-bit limbs
 // -----------------------------------------------------------------------------
 
-/// N little-endian 32-bit limbs.
+/// N little-endian 64-bit limbs.
 struct U[const N: usize] {
-    w: [N]u32,
+    w: [N]u64,
 }
 
 fn u_zero[const N: usize]() U.[N] {
@@ -40,47 +40,58 @@ fn u_zero[const N: usize]() U.[N] {
 fn u_from_be[const N: usize](b: []u8) U.[N] {
     let mut r = u_zero.[N]();
     for i in @as(usize, 0)..N {
-        let o = ((4 * N) - 4) - (4 * i);
-        r.w[i] = (((@as(u32, b[o]) << 24) | (@as(u32, b[o + 1]) << 16)) | (@as(u32, b[o + 2]) << 8)) | @as(
-            u32, b[o + 3]);
+        let o = ((8 * N) - 8) - (8 * i);
+        r.w[i] = (
+            ((((((@as(u64, b[o]) << 56) | (@as(u64, b[o + 1]) << 48)) | (@as(u64, b[o + 2]) << 40)) | (@as(u64,
+                                                                                                           b[o + 3]) <<
+                                                                                                       32)) | (
+                                                                                                           @as(u64,
+                                                                                                               b[o +
+                                                                                                                 4]) <<
+                                                                                                           24)) |
+             (@as(u64, b[o + 5]) << 16)) | (@as(u64, b[o + 6]) << 8)) | @as(u64, b[o + 7]);
     }
     return r;
 }
 
 fn u_to_be[const N: usize](a: *U.[N], out: []mut u8) void {
     for i in @as(usize, 0)..N {
-        let o = ((4 * N) - 4) - (4 * i);
+        let o = ((8 * N) - 8) - (8 * i);
         let v = a.w[i];
-        out[o] = @truncate(u8, v >> 24);
-        out[o + 1] = @truncate(u8, v >> 16);
-        out[o + 2] = @truncate(u8, v >> 8);
-        out[o + 3] = @truncate(u8, v);
+        out[o] = @truncate(u8, v >> 56);
+        out[o + 1] = @truncate(u8, v >> 48);
+        out[o + 2] = @truncate(u8, v >> 40);
+        out[o + 3] = @truncate(u8, v >> 32);
+        out[o + 4] = @truncate(u8, v >> 24);
+        out[o + 5] = @truncate(u8, v >> 16);
+        out[o + 6] = @truncate(u8, v >> 8);
+        out[o + 7] = @truncate(u8, v);
     }
 }
 
 /// a - b and the borrow (1 if a < b).
-fn u_sub[const N: usize](a: *U.[N], b: *U.[N], out: *mut U.[N]) u32 {
-    let mut borrow: u64 = 0;
+fn u_sub[const N: usize](a: *U.[N], b: *U.[N], out: *mut U.[N]) u64 {
+    let mut borrow: u8 = 0;
     for i in @as(usize, 0)..N {
-        let d = (@as(u64, a.w[i]) -% @as(u64, b.w[i])) -% borrow;
-        out.w[i] = @truncate(u32, d);
-        borrow = (d >> 32) & 1;
+        let d = @sub_borrow(a.w[i], b.w[i], borrow);
+        out.w[i] = d.value;
+        borrow = d.borrow;
     }
-    return @truncate(u32, borrow);
+    return @as(u64, borrow);
 }
 
-fn u_add[const N: usize](a: *U.[N], b: *U.[N], out: *mut U.[N]) u32 {
-    let mut c: u64 = 0;
+fn u_add[const N: usize](a: *U.[N], b: *U.[N], out: *mut U.[N]) u64 {
+    let mut c: u8 = 0;
     for i in @as(usize, 0)..N {
-        let s = (@as(u64, a.w[i]) + @as(u64, b.w[i])) + c;
-        out.w[i] = @truncate(u32, s);
-        c = s >> 32;
+        let s = @add_carry(a.w[i], b.w[i], c);
+        out.w[i] = s.value;
+        c = s.carry;
     }
-    return @truncate(u32, c);
+    return @as(u64, c);
 }
 
 /// a if mask is all ones, else b.
-fn u_select[const N: usize](mask: u32, a: *U.[N], b: *U.[N]) U.[N] {
+fn u_select[const N: usize](mask: u64, a: *U.[N], b: *U.[N]) U.[N] {
     let mut r = u_zero.[N]();
     for i in @as(usize, 0)..N {
         r.w[i] = (a.w[i] & mask) | (b.w[i] & ~mask);
@@ -89,17 +100,30 @@ fn u_select[const N: usize](mask: u32, a: *U.[N], b: *U.[N]) U.[N] {
 }
 
 fn u_is_zero[const N: usize](a: *U.[N]) bool {
-    let mut x: u32 = 0;
+    let mut x: u64 = 0;
     for v in a.w {
         x = x | v;
     }
     return x == 0;
 }
 
-/// Arithmetic modulo m in Montgomery form (R = 2^(32N)).
+fn u_bit[const N: usize](a: *U.[N], i: usize) u64 {
+    return (a.w[i / 64] >> @as(u64, i % 64)) & 1;
+}
+
+/// Low 64 bits of x * y + acc + carry.*, storing the high 64 bits in carry.*.
+fn mul_add(x: u64, y: u64, acc: u64, carry: *mut u64) u64 {
+    let p = @mul_wide(x, y);
+    let s1 = @add_carry(p.lo, acc, 0);
+    let s2 = @add_carry(s1.value, carry.*, 0);
+    carry.* = (p.hi + @as(u64, s1.carry)) + @as(u64, s2.carry);
+    return s2.value;
+}
+
+/// Arithmetic modulo m in Montgomery form (R = 2^(64N)).
 struct Mod[const N: usize] {
     m: U.[N],
-    minv: u32,   // -m^-1 mod 2^32
+    minv: u64,   // -m^-1 mod 2^64
     r2: U.[N],   // R^2 mod m
     one: U.[N],  // R mod m: 1 in Montgomery form
 
@@ -125,29 +149,25 @@ struct Mod[const N: usize] {
 
     /// a * b * R^-1 mod m (CIOS), in constant time.
     fn mul(self: *Self, a: *U.[N], b: *U.[N]) U.[N] {
-        let mut t: [14]u32 = [0; 14];  // N + 2 limbs used
+        let mut t: [8]u64 = [0; 8];  // N + 2 limbs used
         for i in @as(usize, 0)..N {
             let mut c: u64 = 0;
-            let bi = @as(u64, b.w[i]);
+            let bi = b.w[i];
             for j in @as(usize, 0)..N {
-                let s = ((@as(u64, a.w[j]) * bi) + @as(u64, t[j])) + c;
-                t[j] = @truncate(u32, s);
-                c = s >> 32;
+                t[j] = mul_add(a.w[j], bi, t[j], &mut c);
             }
-            let s1 = @as(u64, t[N]) + c;
-            t[N] = @truncate(u32, s1);
-            t[N + 1] = @truncate(u32, s1 >> 32);
-            let u = @as(u64, t[0] *% self.minv);
-            let s2 = (u * @as(u64, self.m.w[0])) + @as(u64, t[0]);
-            c = s2 >> 32;
+            let top1 = @add_carry(t[N], c, 0);
+            t[N] = top1.value;
+            t[N + 1] = @as(u64, top1.carry);
+            let u = t[0] *% self.minv;
+            c = 0;
+            _ = mul_add(u, self.m.w[0], t[0], &mut c);
             for j in @as(usize, 1)..N {
-                let s = ((u * @as(u64, self.m.w[j])) + @as(u64, t[j])) + c;
-                t[j - 1] = @truncate(u32, s);
-                c = s >> 32;
+                t[j - 1] = mul_add(u, self.m.w[j], t[j], &mut c);
             }
-            let s3 = @as(u64, t[N]) + c;
-            t[N - 1] = @truncate(u32, s3);
-            t[N] = t[N + 1] + @truncate(u32, s3 >> 32);
+            let top2 = @add_carry(t[N], c, 0);
+            t[N - 1] = top2.value;
+            t[N] = t[N + 1] + @as(u64, top2.carry);
         }
         let mut r = u_zero.[N]();
         for j in @as(usize, 0)..N {
@@ -156,7 +176,7 @@ struct Mod[const N: usize] {
         let mut d = u_zero.[N]();
         let borrow = u_sub(&r, &self.m, &mut d);
         // r < m exactly when the subtraction borrowed and t[N] is zero
-        let keep = borrow & @truncate(u32, ((@as(u64, t[N]) -% 1) >> 63) & 1);
+        let keep = borrow & ((~t[N] & (t[N] -% 1)) >> 63);
         return u_select(0 -% keep, &r, &d);
     }
 
@@ -178,19 +198,19 @@ struct Mod[const N: usize] {
         two.w[0] = 2;
         _ = u_sub(&self.m, &two, &mut e);
         let mut r = self.one;
-        let mut i: usize = 32 * N;
+        let mut i: usize = 64 * N;
         while i > 0 {
             i -= 1;
             r = self.mul(&r, &r);
-            let bit = (e.w[i / 32] >> @truncate(u32, i % 32)) & 1;
+            let bit = u_bit(&e, i);
             let t = self.mul(&r, a);
             r = u_select(0 -% bit, &t, &r);
         }
         return r;
     }
 
-    /// Reduces a value below 2^(32N) into [0, m) (one conditional
-    /// subtraction suffices for the NIST moduli, all above 2^(32N - 1)).
+    /// Reduces a value below 2^(64N) into [0, m) (one conditional
+    /// subtraction suffices for the NIST moduli, all above 2^(64N - 1)).
     fn reduce(self: *Self, a: *U.[N]) U.[N] {
         let mut d = u_zero.[N]();
         let borrow = u_sub(a, &self.m, &mut d);
@@ -199,17 +219,17 @@ struct Mod[const N: usize] {
 }
 
 fn mod_init[const N: usize](m: U.[N]) Mod.[N] {
-    let mut x: u32 = 1;
-    for i in @as(u32, 0)..5 {
+    let mut x: u64 = 1;
+    for i in @as(u32, 0)..6 {
         x = x *% (2 -% (m.w[0] *% x));
     }
     let mut md = Mod.[N].{ m: m, minv: 0 -% x, r2: u_zero.[N](), one: u_zero.[N]() };
     // R mod m and R^2 mod m by doubling 1 (the modulus is public)
     let mut v = u_zero.[N]();
     v.w[0] = 1;
-    for i in @as(usize, 0)..(64 * N) {
+    for i in @as(usize, 0)..(128 * N) {
         v = md.add(&v, &v);
-        if i == ((32 * N) - 1) {
+        if i == ((64 * N) - 1) {
             md.one = v;
         }
     }
@@ -669,35 +689,35 @@ fn make_curve[const N: usize](p: []u8, n: []u8, b: []u8, gx: []u8, gy: []u8) Cur
 }
 
 // The curves, computed on first use (racing threads store the same values).
-let mut CURVE256: Curve.[8] = Curve.[8].{
-    fp: Mod.[8].{ m: U.[8].{ w: [0; 8] }, minv: 0, r2: U.[8].{ w: [0; 8] }, one: U.[8].{ w: [0; 8] } },
-    fn_: Mod.[8].{ m: U.[8].{ w: [0; 8] }, minv: 0, r2: U.[8].{ w: [0; 8] }, one: U.[8].{ w: [0; 8] } },
-    b: U.[8].{ w: [0; 8] },
-    g: Point.[8].{ x: U.[8].{ w: [0; 8] }, y: U.[8].{ w: [0; 8] }, z: U.[8].{ w: [0; 8] } },
+let mut CURVE256: Curve.[4] = Curve.[4].{
+    fp: Mod.[4].{ m: U.[4].{ w: [0; 4] }, minv: 0, r2: U.[4].{ w: [0; 4] }, one: U.[4].{ w: [0; 4] } },
+    fn_: Mod.[4].{ m: U.[4].{ w: [0; 4] }, minv: 0, r2: U.[4].{ w: [0; 4] }, one: U.[4].{ w: [0; 4] } },
+    b: U.[4].{ w: [0; 4] },
+    g: Point.[4].{ x: U.[4].{ w: [0; 4] }, y: U.[4].{ w: [0; 4] }, z: U.[4].{ w: [0; 4] } },
 };
-let mut CURVE384: Curve.[12] = Curve.[12].{
-    fp: Mod.[12].{ m: U.[12].{ w: [0; 12] }, minv: 0, r2: U.[12].{ w: [0; 12] }, one: U.[12].{ w: [0; 12] } },
-    fn_: Mod.[12].{ m: U.[12].{ w: [0; 12] }, minv: 0, r2: U.[12].{ w: [0; 12] }, one: U.[12].{ w: [0; 12] } },
-    b: U.[12].{ w: [0; 12] },
-    g: Point.[12].{ x: U.[12].{ w: [0; 12] }, y: U.[12].{ w: [0; 12] }, z: U.[12].{ w: [0; 12] } },
+let mut CURVE384: Curve.[6] = Curve.[6].{
+    fp: Mod.[6].{ m: U.[6].{ w: [0; 6] }, minv: 0, r2: U.[6].{ w: [0; 6] }, one: U.[6].{ w: [0; 6] } },
+    fn_: Mod.[6].{ m: U.[6].{ w: [0; 6] }, minv: 0, r2: U.[6].{ w: [0; 6] }, one: U.[6].{ w: [0; 6] } },
+    b: U.[6].{ w: [0; 6] },
+    g: Point.[6].{ x: U.[6].{ w: [0; 6] }, y: U.[6].{ w: [0; 6] }, z: U.[6].{ w: [0; 6] } },
 };
 let mut ONCE256: sync.Once = sync.Once.{ state: 0 };
 let mut ONCE384: sync.Once = sync.Once.{ state: 0 };
 
 fn build256(_u: u8) void {
-    CURVE256 = make_curve.[8](P256_P[..], P256_N[..], P256_B[..], P256_GX[..], P256_GY[..]);
+    CURVE256 = make_curve.[4](P256_P[..], P256_N[..], P256_B[..], P256_GX[..], P256_GY[..]);
 }
 
 fn build384(_u: u8) void {
-    CURVE384 = make_curve.[12](P384_P[..], P384_N[..], P384_B[..], P384_GX[..], P384_GY[..]);
+    CURVE384 = make_curve.[6](P384_P[..], P384_N[..], P384_B[..], P384_GX[..], P384_GY[..]);
 }
 
-fn p256() *Curve.[8] {
+fn p256() *Curve.[4] {
     ONCE256.call(build256, @as(u8, 0));
     return &CURVE256;
 }
 
-fn p384() *Curve.[12] {
+fn p384() *Curve.[6] {
     ONCE384.call(build384, @as(u8, 0));
     return &CURVE384;
 }
@@ -756,7 +776,7 @@ fn point_add[const N: usize](c: *Curve.[N], p: *Point.[N], q: *Point.[N]) Point.
     return Point.[N].{ x: x3, y: y3, z: z3 };
 }
 
-fn point_cswap[const N: usize](a: *mut Point.[N], b: *mut Point.[N], bit: u32) void {
+fn point_cswap[const N: usize](a: *mut Point.[N], b: *mut Point.[N], bit: u64) void {
     let mask = 0 -% bit;
     let na = Point.[N].{ x: u_select(mask, &b.x, &a.x), y: u_select(mask, &b.y, &a.y), z: u_select(mask, &b.z, &a.z) };
     let nb = Point.[N].{ x: u_select(mask, &a.x, &b.x), y: u_select(mask, &a.y, &b.y), z: u_select(mask, &a.z, &b.z) };
@@ -768,10 +788,10 @@ fn point_cswap[const N: usize](a: *mut Point.[N], b: *mut Point.[N], bit: u32) v
 fn scalar_mul[const N: usize](c: *Curve.[N], k: *U.[N], p: *Point.[N]) Point.[N] {
     let mut r0 = infinity(c);
     let mut r1 = p.*;
-    let mut i: usize = 32 * N;
+    let mut i: usize = 64 * N;
     while i > 0 {
         i -= 1;
-        let bit = (k.w[i / 32] >> @truncate(u32, i % 32)) & 1;
+        let bit = u_bit(k, i);
         point_cswap(&mut r0, &mut r1, bit);
         r1 = point_add(c, &r0, &r1);
         r0 = point_add(c, &r0, &r0);
@@ -794,11 +814,11 @@ fn to_affine[const N: usize](c: *Curve.[N], p: *Point.[N], x: *mut U.[N], y: *mu
 
 /// Parses an uncompressed point (04 || X || Y) and checks it is on the curve.
 fn decode_point[const N: usize](c: *Curve.[N], b: []u8) EcError!Point.[N] {
-    if (b.len != (1 + (8 * N))) or (b[0] != 4) {
+    if (b.len != (1 + (16 * N))) or (b[0] != 4) {
         return error.InvalidPoint;
     }
-    let x = u_from_be.[N](b[1..1 + (4 * N)]);
-    let y = u_from_be.[N](b[1 + (4 * N)..1 + (8 * N)]);
+    let x = u_from_be.[N](b[1..1 + (8 * N)]);
+    let y = u_from_be.[N](b[1 + (8 * N)..1 + (16 * N)]);
     let mut t = u_zero.[N]();
     if (u_sub(&x, &c.fp.m, &mut t) == 0) or (u_sub(&y, &c.fp.m, &mut t) == 0) {
         return error.InvalidPoint;  // not below p
@@ -827,8 +847,8 @@ fn encode_point[const N: usize](c: *Curve.[N], p: *Point.[N], out: []mut u8) EcE
     let mut y = u_zero.[N]();
     to_affine(c, p, &mut x, &mut y)!;
     out[0] = 4;
-    u_to_be(&x, out[1..1 + (4 * N)]);
-    u_to_be(&y, out[1 + (4 * N)..1 + (8 * N)]);
+    u_to_be(&x, out[1..1 + (8 * N)]);
+    u_to_be(&y, out[1 + (8 * N)..1 + (16 * N)]);
 }
 
 // -----------------------------------------------------------------------------
@@ -845,8 +865,8 @@ fn scalar_ok[const N: usize](c: *Curve.[N], k: *U.[N]) bool {
 fn random_scalar[const N: usize](c: *Curve.[N]) EcError!U.[N] {
     loop {
         let mut b: [48]u8 = [0; 48];
-        random.fill(b[..4 * N]) catch return error.RandomFailed;
-        let k = u_from_be.[N](b[..4 * N]);
+        random.fill(b[..8 * N]) catch return error.RandomFailed;
+        let k = u_from_be.[N](b[..8 * N]);
         if scalar_ok(c, &k) {
             return k;
         }
@@ -854,7 +874,7 @@ fn random_scalar[const N: usize](c: *Curve.[N]) EcError!U.[N] {
 }
 
 fn scalar_from_bytes[const N: usize](c: *Curve.[N], b: []u8) EcError!U.[N] {
-    if b.len != (4 * N) {
+    if b.len != (8 * N) {
         return error.InvalidLength;
     }
     let d = u_from_be.[N](b);
@@ -866,7 +886,7 @@ fn scalar_from_bytes[const N: usize](c: *Curve.[N], b: []u8) EcError!U.[N] {
 
 fn public_of[const N: usize](c: *Curve.[N], d: *U.[N], out: []mut u8) void {
     let q = scalar_mul(c, d, &c.g);
-    encode_point(c, &q, out[..1 + (8 * N)]) catch @trap();
+    encode_point(c, &q, out[..1 + (16 * N)]) catch @trap();
 }
 
 fn ecdh_of[const N: usize](c: *Curve.[N], d: *U.[N], public: []u8, out: []mut u8) EcError!void {
@@ -875,13 +895,13 @@ fn ecdh_of[const N: usize](c: *Curve.[N], d: *U.[N], public: []u8, out: []mut u8
     let mut x = u_zero.[N]();
     let mut y = u_zero.[N]();
     to_affine(c, &s, &mut x, &mut y)!;
-    u_to_be(&x, out[..4 * N]);
+    u_to_be(&x, out[..8 * N]);
 }
 
-/// The digest as a scalar: its leftmost 32N bits, reduced mod n.
+/// The digest as a scalar: its leftmost 64N bits, reduced mod n.
 fn digest_scalar[const N: usize](c: *Curve.[N], digest: []u8) U.[N] {
     let mut b: [48]u8 = [0; 48];
-    let len = 4 * N;
+    let len = 8 * N;
     if digest.len >= len {
         @mem_copy(b[..len], digest[..len]);
     } else {
@@ -917,19 +937,19 @@ fn sign_with[const N: usize](c: *Curve.[N], d: *U.[N], digest: []u8, sig: []mut 
         if u_is_zero(&s) {
             continue;
         }
-        u_to_be(&r, sig[0..4 * N]);
-        u_to_be(&s, sig[4 * N..8 * N]);
+        u_to_be(&r, sig[0..8 * N]);
+        u_to_be(&s, sig[8 * N..16 * N]);
         return;
     }
 }
 
 fn verify_with[const N: usize](c: *Curve.[N], public: []u8, digest: []u8, sig: []u8) bool {
-    if sig.len != (8 * N) {
+    if sig.len != (16 * N) {
         return false;
     }
     let q = decode_point(c, public) catch return false;
-    let r = u_from_be.[N](sig[0..4 * N]);
-    let s = u_from_be.[N](sig[4 * N..8 * N]);
+    let r = u_from_be.[N](sig[0..8 * N]);
+    let s = u_from_be.[N](sig[8 * N..16 * N]);
     if (not scalar_ok(c, &r)) or not scalar_ok(c, &s) {
         return false;
     }
@@ -952,9 +972,9 @@ fn verify_with[const N: usize](c: *Curve.[N], public: []u8, digest: []u8, sig: [
     let xr = n.reduce(&x);
     let mut rb: [48]u8 = [0; 48];
     let mut xb: [48]u8 = [0; 48];
-    u_to_be(&r, rb[..4 * N]);
-    u_to_be(&xr, xb[..4 * N]);
-    return subtle.equal(rb[..4 * N], xb[..4 * N]);
+    u_to_be(&r, rb[..8 * N]);
+    u_to_be(&xr, xb[..8 * N]);
+    return subtle.equal(rb[..8 * N], xb[..8 * N]);
 }
 
 // -----------------------------------------------------------------------------
@@ -964,7 +984,7 @@ fn verify_with[const N: usize](c: *Curve.[N], public: []u8, digest: []u8, sig: [
 /// A P-256 private key. Public keys are uncompressed points (65 bytes:
 /// 04 || X || Y), shared secrets 32 bytes, signatures r || s (64 bytes).
 pub struct P256 {
-    d: U.[8],
+    d: U.[4],
 
     /// The key with this 32-byte big-endian scalar (1 <= d < n).
     pub fn from_bytes(b: []u8) EcError!P256 {
@@ -997,7 +1017,7 @@ pub struct P256 {
 /// A P-384 private key: public keys are 97 bytes, shared secrets 48 bytes,
 /// signatures 96 bytes.
 pub struct P384 {
-    d: U.[12],
+    d: U.[6],
 
     pub fn from_bytes(b: []u8) EcError!P384 {
         return P384.{ d: scalar_from_bytes(p384(), b)! };
@@ -1103,4 +1123,157 @@ test "ecdsa" {
     @expect(verify_p256(q, d, s));
     s[10] ^= 1;
     @expect(not verify_p256(q, d, s));
+}
+
+test "p384 public key and ecdh (RFC 5903 8.2)" {
+    let mut b: [97]u8 = [0; 97];
+    let mut w: [97]u8 = [0; 97];
+    let i_bytes =
+        unhex("099f3c7034d4a2c699884d73a375a67f7624ef7c6b3c0f160647b67414dce655e35b538041e649ee3faef896783ab194",
+              b[..]);
+    let i = P384.from_bytes(i_bytes)!;
+    let mut rt: [48]u8 = [0; 48];
+    i.to_bytes(rt[..]);
+    @expect_eq(rt[..], i_bytes);
+    let mut gi: [97]u8 = [0; 97];
+    i.public_key(gi[..]);
+    @expect_eq(gi[..],
+               unhex("04667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6de3ac808acb4bdb4c88732aee95f41aa9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38eeb9fcff3c2c947dae69b4c634573a81c",
+                     w[..]));
+    let r =
+        P384.from_bytes(unhex("41cb0779b4bdb85d47846725fbec3c9430fab46cc8dc5060855cc9bda0aa2942e0308312916b8ed2960e4bd55a7448fc",
+                              b[..]))!;
+    let mut gr: [97]u8 = [0; 97];
+    r.public_key(gr[..]);
+    @expect_eq(gr[..],
+               unhex("04e558dbef53eecde3d3fccfc1aea08a89a987475d12fd950d83cfa41732bc509d0d1ac43a0336def96fda41d0774a3571dcfbec7aacf3196472169e838430367f66eebe3c6e70c416dd5f0c68759dd1fff83fa40142209dff5eaad96db9e6386c",
+                     w[..]));
+    let mut s1: [48]u8 = [0; 48];
+    let mut s2: [48]u8 = [0; 48];
+    i.ecdh(gr[..], s1[..])!;
+    r.ecdh(gi[..], s2[..])!;
+    @expect_eq(s1[..],
+               unhex("11187331c279962d93d604243fd592cb9d0a926f422e47187521287e7156c5c4d603135569b9e9d09cf5d4a270f59746",
+                     w[..]));
+    @expect_eq(s2[..], s1[..]);
+    gr[50] ^= 1;
+    i.ecdh(gr[..], s1[..]) catch |e| {
+        @expect_eq(e, error.InvalidPoint);
+        return;
+    };
+    @trap();
+}
+
+fn expect_p384_err(b: []u8, want: EcError) void {
+    _ = P384.from_bytes(b) catch |e| {
+        @expect_eq(e, want);
+        return;
+    };
+    @trap();
+}
+
+fn u_eq[const N: usize](a: *U.[N], b: *U.[N]) bool {
+    for i in @as(usize, 0)..N {
+        if a.w[i] != b.w[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "p384 ecdsa and key validation" {
+    let k = P384.generate()!;
+    let mut pubk: [97]u8 = [0; 97];
+    k.public_key(pubk[..]);
+    let digest: [48]u8 = [0x42; 48];
+    let mut sig: [96]u8 = [0; 96];
+    k.sign(digest[..], sig[..])!;
+    @expect(verify_p384(pubk[..], digest[..], sig[..]));
+    let other: [48]u8 = [0x43; 48];
+    @expect(not verify_p384(pubk[..], other[..], sig[..]));
+    // Fixed P-384 public key and signature verification
+    let mut pb: [97]u8 = [0; 97];
+    let mut db: [48]u8 = [0; 48];
+    let mut sb: [96]u8 = [0; 96];
+    let q =
+        unhex("04667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6de3ac808acb4bdb4c88732aee95f41aa9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38eeb9fcff3c2c947dae69b4c634573a81c",
+              pb[..]);
+    let d = unhex("9a9083505bc92276aec4be312696ef7bf3bf603f4bbd381196a029f340585312313bca4a9b5b890efee42c77b1ee25fe",
+                  db[..]);
+    let s =
+        unhex("5c86a47f40f6edcd68ca1e3d112522dc8ac91ce4c10b743ad3e8e2538f30be488d50037a01b940ddc6df8d7465ae16265be8b67f6245ae5f0941bdeeca74ffa1788dda0ceeb08ea5e253db8587c743412c391fa1f2d76e3da001bbf2f32b252e",
+              sb[..]);
+    @expect(verify_p384(q, d, s));
+    s[20] ^= 1;
+    @expect(not verify_p384(q, d, s));
+    @expect(not verify_p384(q, d, s[..95]));
+    // Scalar bounds: zero and group order n are rejected; wrong length is rejected
+    let zero: [48]u8 = [0; 48];
+    expect_p384_err(zero[..], error.InvalidKey);
+    expect_p384_err(P384_N[..], error.InvalidKey);
+    expect_p384_err(zero[..47], error.InvalidLength);
+}
+
+test "u64 limb and montgomery arithmetic" {
+    // Full-limb carry and borrow propagation
+    let max4 = U.[4].{ w: [0xFFFF_FFFF_FFFF_FFFF; 4] };
+    let mut one4 = u_zero.[4]();
+    one4.w[0] = 1;
+    let mut sum4 = u_zero.[4]();
+    @expect_eq(u_add(&max4, &one4, &mut sum4), 1);
+    @expect(u_is_zero(&sum4));
+    let mut diff4 = u_zero.[4]();
+    @expect_eq(u_sub(&sum4, &one4, &mut diff4), 1);
+    @expect(u_eq(&diff4, &max4));
+    @expect_eq(u_sub(&max4, &max4, &mut diff4), 0);
+    @expect(u_is_zero(&diff4));
+
+    // P-256 Montgomery CIOS edge cases (including t[4] == 1 final subtraction)
+    let fp256 = &p256().fp;
+    let mut ba: [32]u8 = [0; 32];
+    let mut bb: [32]u8 = [0; 32];
+    let mut be: [32]u8 = [0; 32];
+    let a256 = u_from_be.[4](unhex("ffffffff00000001000000000000000000000000fffffffffffffffffffffffd", ba[..]));
+    let b256 = u_from_be.[4](unhex("ffffffff00000001000000000000000000000000fffffffffffffffffffffff7", bb[..]));
+    let exp256 = u_from_be.[4](unhex("ffffffef00000030ffffffd00000002000000010ffffffe0000000300000000f", be[..]));
+    let got256 = fp256.mul(&a256, &b256);
+    @expect(u_eq(&got256, &exp256));
+
+    // (m - 1) + (m - 1) mod m == m - 2, (0 - 1) mod m == m - 1, (m - 1)^2 == 1 in Mont
+    let pm1_256 = fp256.sub(&u_zero.[4](), &one4);
+    let m1m = fp256.to_mont(&pm1_256);
+    let sq256 = fp256.from_mont(&fp256.mul(&m1m, &m1m));
+    @expect(u_eq(&sq256, &one4));
+    let two_m256 = fp256.add(&pm1_256, &pm1_256);
+    let mut two4 = u_zero.[4]();
+    two4.w[0] = 2;
+    let want_two256 = fp256.sub(&u_zero.[4](), &two4);
+    @expect(u_eq(&two_m256, &want_two256));
+    let red256 = fp256.reduce(&max4);
+    let mut want_red256 = u_zero.[4]();
+    _ = u_sub(&max4, &fp256.m, &mut want_red256);
+    @expect(u_eq(&red256, &want_red256));
+
+    // P-384 Montgomery CIOS edge cases (including t[6] == 1 final subtraction) and inv
+    let fp384 = &p384().fp;
+    let mut one6 = u_zero.[6]();
+    one6.w[0] = 1;
+    let pm1_384 = fp384.sub(&u_zero.[6](), &one6);
+    let mut be6: [48]u8 = [0; 48];
+    let exp384 =
+        u_from_be.[6](unhex("00000014000000140000000c00000002fffffffcfffffffafffffffbfffffffdffffffebffffffd8ffffffe100000006",
+                            be6[..]));
+    let got384 = fp384.mul(&pm1_384, &pm1_384);
+    @expect(u_eq(&got384, &exp384));
+    let m1m_384 = fp384.to_mont(&pm1_384);
+    let sq384 = fp384.from_mont(&fp384.mul(&m1m_384, &m1m_384));
+    @expect(u_eq(&sq384, &one6));
+    let mut sample6 = u_zero.[6]();
+    sample6.w[0] = 0x1234_5678_9abc_def0;
+    sample6.w[5] = 0x0fed_cba9_8765_4321;
+    let sm6 = fp384.to_mont(&sample6);
+    let inv6 = fp384.inv(&sm6);
+    let prod384 = fp384.from_mont(&fp384.mul(&sm6, &inv6));
+    @expect(u_eq(&prod384, &one6));
+    @expect(u_is_zero(&fp384.inv(&u_zero.[6]())));
 }
