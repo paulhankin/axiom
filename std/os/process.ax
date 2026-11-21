@@ -70,15 +70,15 @@ pub struct Status {
 }
 
 /// One end of a pipe to a child.
-pub struct Pipe {
+pub nocopy struct Pipe {
     h: i32,  // -1: none
 
-    pub fn is_open(self: Pipe) bool {
+    pub fn is_open(self: *Pipe) bool {
         return self.h >= 0;
     }
 
     /// Reads some bytes; 0 at the end.
-    pub fn read(self: Pipe, buf: []mut u8) ProcessError!usize {
+    pub fn read(self: *Pipe, buf: []mut u8) ProcessError!usize {
         if self.h < 0 {
             return error.Closed;
         }
@@ -90,7 +90,7 @@ pub struct Pipe {
     }
 
     /// Writes some of the bytes; Closed if the child no longer reads.
-    pub fn write(self: Pipe, bytes: []u8) ProcessError!usize {
+    pub fn write(self: *Pipe, bytes: []u8) ProcessError!usize {
         if self.h < 0 {
             return error.Closed;
         }
@@ -101,7 +101,7 @@ pub struct Pipe {
         return @bit_cast(usize, n);
     }
 
-    pub fn write_all(self: Pipe, bytes: []u8) ProcessError!void {
+    pub fn write_all(self: *Pipe, bytes: []u8) ProcessError!void {
         let mut rest = bytes;
         while rest.len > 0 {
             let n = self.write(rest)!;
@@ -110,7 +110,7 @@ pub struct Pipe {
     }
 
     /// Everything until the end (free it with mem.free).
-    pub fn read_all(self: Pipe) ProcessError![]mut u8 {
+    pub fn read_all(self: *Pipe) ProcessError![]mut u8 {
         let mut s = strs.String.init();
         let mut buf: [16384]u8 = [0; 16384];
         loop {
@@ -137,11 +137,11 @@ pub struct Pipe {
     }
 
     /// An io.Reader of the pipe (it carries the handle, so the Pipe may move).
-    pub fn reader(self: Pipe) io.Reader {
+    pub fn reader(self: *Pipe) io.Reader {
         return io.Reader.{ ctx: handle_ctx(self.h), read_fn: pipe_read };
     }
 
-    pub fn writer(self: Pipe) io.Writer {
+    pub fn writer(self: *Pipe) io.Writer {
         return io.Writer.{ ctx: handle_ctx(self.h), write_fn: pipe_write };
     }
 }
@@ -155,15 +155,17 @@ fn ctx_pipe(ctx: *mut void) Pipe {
 }
 
 fn pipe_read(ctx: *mut void, buf: []mut u8) ProcessError!usize {
-    return ctx_pipe(ctx).read(buf)!;
+    let p = ctx_pipe(ctx);
+    return p.read(buf)!;
 }
 
 fn pipe_write(ctx: *mut void, bytes: []u8) ProcessError!usize {
-    return ctx_pipe(ctx).write(bytes)!;
+    let p = ctx_pipe(ctx);
+    return p.write(bytes)!;
 }
 
 /// A running child.
-pub struct Child {
+pub nocopy struct Child {
     h: i32,
     pub stdin: Pipe,
     pub stdout: Pipe,
@@ -228,7 +230,7 @@ pub struct Child {
 }
 
 /// A child's status and what it wrote.
-pub struct Output {
+pub nocopy struct Output {
     pub status: Status,
     pub stdout: []mut u8,
     pub stderr: []mut u8,
@@ -240,7 +242,7 @@ pub struct Output {
 }
 
 /// What to run, and how.
-pub struct Command {
+pub nocopy struct Command {
     argv: vec.Vec.[[]u8],  // borrowed: they must outlive spawn
     sets: vec.Vec.[[]u8],  // name, value, name, value, ...
     removes: vec.Vec.[[]u8],
@@ -339,12 +341,14 @@ pub struct Command {
         let saved = self.modes;
         self.modes[1] = Stdio.PIPE;
         self.modes[2] = Stdio.PIPE;
-        let r = self.spawn();
+        let mut child = self.spawn() catch |e| {
+            self.modes = saved;
+            return e;
+        };
         self.modes = saved;
-        let mut child = r!;
         // read stderr on another thread, so that neither pipe can fill up
         // while the other is read
-        let mut side = Drain.{ pipe: child.stderr, data: mem.alloc.[u8](0)!, failed: false };
+        let mut side = Drain.{ pipe: &mut child.stderr, data: mem.alloc.[u8](0)!, failed: false };
         let mut t = thread.spawn(drain, &mut side) catch |e| {
             child.kill(os.SIGKILL) catch {};
             _ = child.wait() catch Status.{ code: -1, signal: 0 };
@@ -463,8 +467,8 @@ pub struct Command {
     }
 }
 
-struct Drain {
-    pipe: Pipe,
+nocopy struct Drain {
+    pipe: *mut Pipe,
     data: []mut u8,
     failed: bool,
 }
@@ -582,11 +586,11 @@ test "environment, directory and failures" {
     defer e.deinit();
     @expect_eq(strs.trim(e.stdout), "0");
     let nothing: [1][]u8 = ["/surely/no/such/program"];
-    @expect(fails(run(nothing[..]), error.NotFound));
+    @expect(fails(nothing[..], error.NotFound));
     let unnamed: [1][]u8 = ["surely-no-such-program-anywhere"];
-    @expect(fails(run(unnamed[..]), error.NotFound));
+    @expect(fails(unnamed[..], error.NotFound));
     let bad: [2][]u8 = ["sh", "a\x00b"];
-    @expect(fails(run(bad[..]), error.InvalidArgument));
+    @expect(fails(bad[..], error.InvalidArgument));
     // a killed child
     let mut k = Command.init("sleep");
     defer k.deinit();
@@ -669,16 +673,16 @@ fn environment_windows() ProcessError!void {
     want.push_str(":\\\r\n")!;
     @expect_eq(o.stdout, want.bytes());
     let nothing: [1][]u8 = ["/surely/no/such/program"];
-    @expect(fails(run(nothing[..]), error.NotFound));
+    @expect(fails(nothing[..], error.NotFound));
     let unnamed: [1][]u8 = ["surely-no-such-program-anywhere"];
-    @expect(fails(run(unnamed[..]), error.NotFound));
+    @expect(fails(unnamed[..], error.NotFound));
     let bad: [2][]u8 = ["cmd", "a\x00b"];
-    @expect(fails(run(bad[..]), error.InvalidArgument));
+    @expect(fails(bad[..], error.InvalidArgument));
     // a batch file, whose arguments cmd.exe would run
     let bat: [2][]u8 = ["build.bat", "x&calc"];
-    @expect(fails(run(bat[..]), error.InvalidArgument));
+    @expect(fails(bat[..], error.InvalidArgument));
     let cmd_file: [2][]u8 = ["C:\\tools\\Build.CMD. ", "x"];
-    @expect(fails(run(cmd_file[..]), error.InvalidArgument));
+    @expect(fails(cmd_file[..], error.InvalidArgument));
     // a killed child (waiting for a line that never comes)
     let mut k = Command.init("cmd");
     defer k.deinit();
@@ -700,8 +704,8 @@ test "environment names" {
     @expect(not same_env_name("AX_A", "AX_AB", true));
 }
 
-fn fails(r: !Output, want: error) bool {
-    let mut o = r catch |e| return e == want;
+fn fails(argv: [][]u8, want: error) bool {
+    let mut o = run(argv) catch |e| return e == want;
     o.deinit();
     return false;
 }

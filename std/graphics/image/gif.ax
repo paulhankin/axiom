@@ -33,21 +33,20 @@ pub fn is_gif(data: []u8) bool {
     return (data.len >= 6) and (strs.eq(data[..6], "GIF87a") or strs.eq(data[..6], "GIF89a"));
 }
 
-pub struct Frame {
+pub nocopy struct Frame {
     image: image.Image,  // the whole canvas, RGBA
     delay_ms: u32,
 }
 
-pub struct Animation {
+pub nocopy struct Animation {
     width: usize,
     height: usize,
     loops: i32,  // 0: for ever; -1: play once (no loop count given)
     frames: vec.Vec.[Frame],
 
     pub fn deinit(self: *mut Animation) void {
-        for f in self.frames.items() {
-            let mut img = f.image;
-            img.deinit();
+        for &mut f in self.frames.items_mut() {
+            f.image.deinit();
         }
         self.frames.deinit();
     }
@@ -62,10 +61,10 @@ pub fn decode(data: []u8) GifError!image.Image {
 /// The first frame, of a canvas of at most opts.max_pixels (else TooLarge).
 pub fn decode_with(data: []u8, opts: image.DecodeOptions) GifError!image.Image {
     let mut a = decode_frames(data, true, opts)!;
-    let f = a.frames.get(0);
-    a.frames.clear();
-    a.deinit();
-    return f.image;
+    defer a.deinit();
+    let mut img = image.Image.{ width: 0, height: 0, channels: 4, depth: image.Depth.U8, data: [] };
+    @swap(&mut img, &mut a.frames.items_mut()[0].image);
+    return img;
 }
 
 /// Every frame, of at most image.DEFAULT_MAX_PIXELS together (else TooLarge).
@@ -296,15 +295,16 @@ fn decode_frames(b: []u8, first_only: bool, opts: image.DecodeOptions) GifError!
         let got = lzw_decode(lzw.bytes(), min_code, idx[..n]) catch 0;
         paint(&mut canvas, idx[..@min(got, n)], [fx, fy, fw, fh], (fflags & 0x40) != 0, ct, gc.transparent);
         mem.free(idx);
+        anim.frames.reserve(1) catch |e| {
+            anim.deinit();
+            return e;
+        };
         let copy = canvas.clone() catch |e| {
             anim.deinit();
             return e;
         };
-        anim.frames.push(Frame.{ image: copy, delay_ms: gc.delay }) catch |e| {
-            let mut c2 = copy;
-            c2.deinit();
-            anim.deinit();
-            return e;
+        anim.frames.push(Frame.{ image: copy, delay_ms: gc.delay }) catch {
+            @trap();
         };
         prev_disposal = gc.disposal;
         prev = [fx, fy, fw, fh];
@@ -918,8 +918,8 @@ test "files made by Pillow" {
             defer mem.free(want_bytes);
             let mut want = png.decode(want_bytes)!;
             defer want.deinit();
-            let mut f = a.frames.get(k).image;
-            if not same(&f, &want) {
+            let f = &a.frames.items()[k].image;
+            if not same(f, &want) {
                 @expect_eq(p.bytes(), "");
             }
         }
@@ -977,12 +977,12 @@ test "round trips" {
     defer mem.free(movie);
     let mut a = decode_all(movie)!;
     defer a.deinit();
-    @expect((a.frames.len() == 2) and (a.loops == 0) and (a.frames.get(1).delay_ms == 250));
-    let mut g1 = a.frames.get(1).image;
-    @expect(same(&g1, &f2));
+    let f1 = &a.frames.items()[1];
+    @expect((a.frames.len() == 2) and (a.loops == 0) and (f1.delay_ms == 250));
+    @expect(same(&f1.image, &f2));
     // hostile: truncated, and a huge canvas
-    @expect(invalid(decode(movie[..20])));
-    @expect(invalid(decode("GIF89a\xff\xff\xff\xff\x00\x00\x00;")));
+    @expect(invalid(movie[..20]));
+    @expect(invalid("GIF89a\xff\xff\xff\xff\x00\x00\x00;"));
 }
 
 test "many frames" {
@@ -1010,14 +1010,14 @@ test "pixel limits" {
     // a 1x1 frame on an 11 x 10 canvas
     let small =
         "GIF89a\x0b\x00\x0a\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
-    @expect(too_large(decode_with(small, image.DecodeOptions.{ max_pixels: 100 })));
+    @expect(too_large(small, image.DecodeOptions.{ max_pixels: 100 }));
     let mut img = decode(small)!;
     defer img.deinit();
     @expect_eq(img.width, 11);
     // a canvas of 8193 x 8192, past the default limit
     let big =
         "GIF89a\x01\x20\x00\x20\x80\x00\x00\x00\x00\x00\xff\xff\xff\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
-    @expect(too_large(decode(big)));
+    @expect(too_large(big, image.DecodeOptions.default()));
     let mut a = decode_all(big) catch |e| {
         @expect_eq(e, error.TooLarge);
         return;
@@ -1026,14 +1026,14 @@ test "pixel limits" {
     @trap();
 }
 
-fn too_large(r: GifError!image.Image) bool {
-    let mut img = r catch |e| return e == error.TooLarge;
+fn too_large(data: []u8, opts: image.DecodeOptions) bool {
+    let mut img = decode_with(data, opts) catch |e| return e == error.TooLarge;
     img.deinit();
     return false;
 }
 
-fn invalid(r: !image.Image) bool {
-    let mut x = r catch return true;
+fn invalid(data: []u8) bool {
+    let mut x = decode(data) catch return true;
     x.deinit();
     return false;
 }

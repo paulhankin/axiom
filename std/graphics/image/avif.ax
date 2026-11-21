@@ -113,7 +113,7 @@ struct Prop {
     body: []u8,
 }
 
-struct File {
+nocopy struct File {
     data: []u8,
     primary: u32,
     items: vec.Vec.[Item],
@@ -754,7 +754,7 @@ fn tiles(f: *File, id: u32, out: *mut vec.Vec.[u32]) AvifError!void {
 }
 
 // an item's planes and colour description
-struct Pic {
+nocopy struct Pic {
     frame: av1.Frame,
     col: Colour,
 }
@@ -981,7 +981,11 @@ pub fn decode_with(data: []u8, opts: image.DecodeOptions) AvifError!image.Image 
         put_planes(&mut img, &ap.frame, ap.col, 0, 0, true);
         ap.frame.deinit();
     }
-    return transform(&f, &prim, img);
+    transform(&f, &prim, &mut img) catch |e| {
+        img.deinit();
+        return e;
+    };
+    return img;
 }
 
 fn min_len(a: usize, b: usize) usize {
@@ -990,8 +994,7 @@ fn min_len(a: usize, b: usize) usize {
 
 // applies the clean aperture, rotation and mirroring properties in order
 // (the first of each: an item has one at most)
-fn transform(f: *File, it: *Item, img0: image.Image) AvifError!image.Image {
-    let mut img = img0;
+fn transform(f: *File, it: *Item, img: *mut image.Image) AvifError!void {
     let ps = f.props.items();
     let mut seen: [3]bool = [false, false, false];
     for k in @as(usize, 0)..it.n_props {
@@ -1018,21 +1021,20 @@ fn transform(f: *File, it: *Item, img0: image.Image) AvifError!image.Image {
         if @mem_eq(p.typ[..], "irot") and (p.body.len >= 1) {
             let n = p.body[0] & 3;
             for _r in @as(u8, 0)..n {
-                let r = rotate_ccw(&img)!;
-                img.deinit();
-                img = r;
+                let mut r = rotate_ccw(img)!;
+                @swap(img, &mut r);
+                r.deinit();
             }
         } else if @mem_eq(p.typ[..], "imir") and (p.body.len >= 1) {
             // axis 0 exchanges top and bottom, 1 left and right
             // (ISO/IEC 23008-12:2022)
-            mirror(&mut img, (p.body[0] & 1) == 0);
+            mirror(img, (p.body[0] & 1) == 0);
         } else if @mem_eq(p.typ[..], "clap") and (p.body.len >= 32) {
-            let r = clap(&img, p.body) catch continue;
-            img.deinit();
-            img = r;
+            let mut r = clap(img, p.body) catch continue;
+            @swap(img, &mut r);
+            r.deinit();
         }
     }
-    return img;
 }
 
 fn rotate_ccw(img: *image.Image) AvifError!image.Image {
@@ -1439,8 +1441,8 @@ test "small files claiming big images, extents and items" {
     @expect(false);
 }
 
-fn too_large(r: AvifError!image.Image) bool {
-    let mut img = r catch |e| return e == error.TooLarge;
+fn too_large(data: []u8, opts: image.DecodeOptions) bool {
+    let mut img = decode_with(data, opts) catch |e| return e == error.TooLarge;
     img.deinit();
     return false;
 }
@@ -1457,7 +1459,7 @@ test "pixel limits" {
     let one: [1]TItem = [TItem.{ id: 1, typ: "av01", props: props[..], ext: whole[..] }];
     let ok = make_file(one[..], ipco.bytes(), "", tile.bytes())!;
     defer mem.free(ok);
-    @expect(too_large(decode_with(ok, image.DecodeOptions.{ max_pixels: 3000 })));  // a frame of 64 x 48
+    @expect(too_large(ok, image.DecodeOptions.{ max_pixels: 3000 }));  // a frame of 64 x 48
     let mut img = decode_with(ok, image.DecodeOptions.{ max_pixels: 3072 })!;
     img.deinit();
     // grids: of 120 x 48 (each tile within the limit), and of 8193 x 8192
@@ -1465,10 +1467,10 @@ test "pixel limits" {
     let two: [2]u16 = [2, 3];
     let g1 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 120, 48, two[..])!;
     defer mem.free(g1);
-    @expect(too_large(decode_with(g1, image.DecodeOptions.{ max_pixels: 5000 })));
+    @expect(too_large(g1, image.DecodeOptions.{ max_pixels: 5000 }));
     let g2 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 8193, 8192, two[..])!;
     defer mem.free(g2);
-    @expect(too_large(decode(g2)));
+    @expect(too_large(g2, image.DecodeOptions.default()));
     let mut img2 = decode_with(g2, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS }) catch |e| {
         @expect_eq(e, error.Corrupt);
         return;

@@ -102,7 +102,7 @@ pub struct Entry {
 }
 
 /// A zip archive in memory (the bytes must outlive it).
-pub struct Archive {
+pub nocopy struct Archive {
     data: []u8,
     pub entries: []Entry,
     comment: []u8,
@@ -647,7 +647,7 @@ pub struct Options {
     }
 }
 
-struct Written {
+nocopy struct Written {
     name: []mut u8,  // owned
     method: u16,
     crc: u32,
@@ -664,7 +664,7 @@ struct Written {
 
 /// Writes a zip archive to a stream: add entries, then finish(), then
 /// deinit().
-pub struct Writer {
+pub nocopy struct Writer {
     out: io.Writer,
     offset: u64,
     written: vec.Vec.[Written],
@@ -734,15 +734,29 @@ pub struct Writer {
         if method == AES {
             flags |= 1;
         }
-        let mut w = Written.{ name: strs.dup(name)!, method: method, crc: crc, csize: @as(u64, body.len), size: size,
-                              offset: self.offset, dtime: 0, ddate: 0, mode: mode, mtime: mtime, aes_method: aes_method,
-                              flags: flags };
-        to_dos(mtime, &mut w.dtime, &mut w.ddate);
-        self.written.push(w) catch |e| {
-            mem.free(w.name);
+        let dup_name = strs.dup(name)!;
+        let mut dtime: u16 = 0;
+        let mut ddate: u16 = 0;
+        to_dos(mtime, &mut dtime, &mut ddate);
+        let csize = @as(u64, body.len);
+        self.written.push(Written.{
+            name: dup_name,
+            method: method,
+            crc: crc,
+            csize: csize,
+            size: size,
+            offset: self.offset,
+            dtime: dtime,
+            ddate: ddate,
+            mode: mode,
+            mtime: mtime,
+            aes_method: aes_method,
+            flags: flags,
+        }) catch |e| {
+            mem.free(dup_name);
             return e;
         };
-        let big = (size >= 0xffffffff) or (w.csize >= 0xffffffff);
+        let big = (size >= 0xffffffff) or (csize >= 0xffffffff);
         let mut h = Buf.{ b: [0; 64], n: 0 };
         h.put32(SIG_LOCAL);
         if big {
@@ -752,14 +766,14 @@ pub struct Writer {
         }
         h.put16(flags);
         h.put16(method);
-        h.put16(w.dtime);
-        h.put16(w.ddate);
+        h.put16(dtime);
+        h.put16(ddate);
         h.put32(crc);
         if big {
             h.put32(0xffffffff);
             h.put32(0xffffffff);
         } else {
-            h.put32(@truncate(u32, w.csize));
+            h.put32(@truncate(u32, csize));
             h.put32(@truncate(u32, size));
         }
         h.put16(@truncate(u16, name.len));
@@ -768,7 +782,7 @@ pub struct Writer {
             x.put16(0x0001);
             x.put16(16);
             x.put64(size);
-            x.put64(w.csize);
+            x.put64(csize);
         }
         if method == AES {
             aes_extra(&mut x, aes_method);
@@ -783,7 +797,7 @@ pub struct Writer {
     /// Writes the central directory. The Writer can then be dropped.
     pub fn finish(self: *mut Writer) !void {
         let cd_start = self.offset;
-        for w in self.written.items() {
+        for &w in self.written.items() {
             let need_size = (w.size >= 0xffffffff) or (w.csize >= 0xffffffff);
             let need_off = w.offset >= 0xffffffff;
             let mut x = Buf.{ b: [0; 64], n: 0 };
@@ -887,7 +901,7 @@ pub struct Writer {
 
     /// Frees the Writer's records (after finish, or to give up).
     pub fn deinit(self: *mut Writer) void {
-        for w in self.written.items() {
+        for &mut w in self.written.items_mut() {
             mem.free(w.name);
         }
         self.written.deinit();

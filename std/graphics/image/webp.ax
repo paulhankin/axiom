@@ -36,21 +36,20 @@ pub fn is_webp(data: []u8) bool {
     return (data.len >= 16) and strs.eq(data[..4], "RIFF") and strs.eq(data[8..12], "WEBP");
 }
 
-pub struct Frame {
+pub nocopy struct Frame {
     image: image.Image,  // the whole canvas, RGBA
     delay_ms: u32,
 }
 
-pub struct Animation {
+pub nocopy struct Animation {
     width: usize,
     height: usize,
     loops: i32,  // 0: for ever; -1: a still image
     frames: vec.Vec.[Frame],
 
     pub fn deinit(self: *mut Animation) void {
-        for f in self.frames.items() {
-            let mut img = f.image;
-            img.deinit();
+        for &mut f in self.frames.items_mut() {
+            f.image.deinit();
         }
         self.frames.deinit();
     }
@@ -107,7 +106,7 @@ struct Tree {
     fast: usize,  // offset of the 256-entry table: symbol << 4 | length, or 0
 }
 
-struct Codes {
+nocopy struct Codes {
     trees: vec.Vec.[Tree],
     syms: vec.Vec.[u16],
     fast: vec.Vec.[u32],
@@ -482,7 +481,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u
     return px;
 }
 
-struct Transform {
+nocopy struct Transform {
     kind: u32,
     bits: u32,
     width: usize,     // the image's width before it
@@ -491,7 +490,12 @@ struct Transform {
 
 // an image with its transforms (level0: the main image, which may have them)
 fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u32 {
-    let mut ts: [4]Transform = [Transform.{ kind: 0, bits: 0, width: 0, data: [] }; 4];
+    let mut ts: [4]Transform = [
+        Transform.{ kind: 0, bits: 0, width: 0, data: [] },
+        Transform.{ kind: 0, bits: 0, width: 0, data: [] },
+        Transform.{ kind: 0, bits: 0, width: 0, data: [] },
+        Transform.{ kind: 0, bits: 0, width: 0, data: [] },
+    ];
     let mut nt: usize = 0;
     let mut seen: u32 = 0;
     let mut cw = w;
@@ -507,7 +511,11 @@ fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u3
                 return error.Corrupt;
             }
             seen |= @as(u32, 1) << kind;
-            let mut tr = Transform.{ kind: kind, bits: 0, width: cw, data: [] };
+            let tr = &mut ts[nt];
+            tr.kind = kind;
+            tr.bits = 0;
+            tr.width = cw;
+            tr.data = [];
             if (kind == 0) or (kind == 1) {
                 tr.bits = b.read(3) + 2;
                 tr.data = read_image(b, tiles(cw, tr.bits), tiles(h, tr.bits), false)!;
@@ -534,7 +542,6 @@ fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u3
             } else {
                 tr.data = mem.alloc.[u32](1)!;
             }
-            ts[nt] = tr;
             nt += 1;
         }
     }
@@ -543,7 +550,7 @@ fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u3
     let mut k = nt;
     while k > 0 {
         k -= 1;
-        let tr = ts[k];
+        let tr = &ts[k];
         if tr.kind == 0 {
             unpredict(px, tr.width, h, tr.bits, tr.data);
         } else if tr.kind == 1 {
@@ -736,7 +743,7 @@ fn decode_vp8l(data: []u8, w: *mut usize, h: *mut usize, alpha: *mut bool,
 // Frames: VP8 or VP8L, with ALPH
 // -----------------------------------------------------------------------------
 
-struct Pic {
+nocopy struct Pic {
     width: usize,
     height: usize,
     rgba: []mut u8,
@@ -867,10 +874,10 @@ pub fn decode(data: []u8) WebpError!image.Image {
 /// The first frame, of a canvas of at most opts.max_pixels (else TooLarge).
 pub fn decode_with(data: []u8, opts: image.DecodeOptions) WebpError!image.Image {
     let mut a = decode_frames(data, true, opts)!;
-    let f = a.frames.get(0);
-    a.frames.clear();
-    a.deinit();
-    return f.image;
+    defer a.deinit();
+    let mut img = image.Image.{ width: 0, height: 0, channels: 4, depth: image.Depth.U8, data: [] };
+    @swap(&mut img, &mut a.frames.items_mut()[0].image);
+    return img;
 }
 
 /// Every frame, composited onto the canvas: of at most
@@ -1080,15 +1087,17 @@ fn decode_frames(data: []u8, first_only: bool, opts: image.DecodeOptions) WebpEr
                 }
             }
         }
+        anim.frames.reserve(1) catch |e| {
+            anim.deinit();
+            return e;
+        };
         let mut img = image.Image.init(cw, chh, 4, image.Depth.U8) catch |e| {
             anim.deinit();
             return e;
         };
         @mem_copy(img.data[..n], canvas);
-        anim.frames.push(Frame.{ image: img, delay_ms: delay }) catch |e| {
-            img.deinit();
-            anim.deinit();
-            return e;
+        anim.frames.push(Frame.{ image: img, delay_ms: delay }) catch {
+            @trap();
         };
         count += 1;
         if first_only {
@@ -1940,8 +1949,8 @@ test "files made by libwebp" {
             defer mem.free(want_bytes);
             let mut want = png.decode(want_bytes)!;
             defer want.deinit();
-            let mut f = a.frames.get(k).image;
-            if not same(&f, &want) {
+            let f = &a.frames.items()[k].image;
+            if not same(f, &want) {
                 @expect_eq(path.bytes(), "");
             }
         }
@@ -1999,10 +2008,9 @@ test "animation" {
     defer back.deinit();
     @expect_eq(back.frames.len(), 2);
     @expect_eq(back.loops, 0);
-    @expect_eq(back.frames.get(1).delay_ms, 70);
-    let mut f0 = back.frames.get(0).image;
-    let mut f1 = back.frames.get(1).image;
-    @expect(same(&f0, &a) and same(&f1, &b));
+    let items = back.frames.items();
+    @expect_eq(items[1].delay_ms, 70);
+    @expect(same(&items[0].image, &a) and same(&items[1].image, &b));
 }
 
 test "many frames" {
@@ -2049,7 +2057,7 @@ test "pixel limits" {
     let enc = encode(&img)!;  // VP8L
     defer mem.free(enc);
     let small = image.DecodeOptions.{ max_pixels: 100 };
-    @expect(too_large(decode_with(enc, small)));
+    @expect(too_large(enc, small));
     let mut back = decode(enc)!;
     defer back.deinit();
     @expect_eq(back.width, 11);
@@ -2068,13 +2076,13 @@ test "pixel limits" {
 test "pictures past the default limit" {
     // a VP8L picture of 8193 x 8192, and a VP8X canvas of 8193 x 8192
     let vp8l = "RIFF\x16\x00\x00\x00WEBPVP8L\x09\x00\x00\x00\x2f\x00\xe0\xff\x07\x00\x00\x00\x00\x00";
-    @expect(too_large(decode(vp8l)));
+    @expect(too_large(vp8l, image.DecodeOptions.default()));
     let vp8x = "RIFF\x1a\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x20\x00\xff\x1f\x00";
-    @expect(too_large(decode(vp8x)));
+    @expect(too_large(vp8x, image.DecodeOptions.default()));
 }
 
-fn too_large(r: WebpError!image.Image) bool {
-    let mut img = r catch |e| return e == error.TooLarge;
+fn too_large(data: []u8, opts: image.DecodeOptions) bool {
+    let mut img = decode_with(data, opts) catch |e| return e == error.TooLarge;
     img.deinit();
     return false;
 }

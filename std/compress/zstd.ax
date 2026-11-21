@@ -37,7 +37,7 @@ const MAGIC: u32 = 0xfd2fb528;
 const BLOCK_MAX: usize = 128 << 10;
 const MAX_WINDOW: u64 = 1 << 31;
 
-fn le24(b: []u8, i: usize) u32 {
+fn le24(noalias b: []u8, i: usize) u32 {
     return @as(u32, binary.u16_le(b[i..])) | (@as(u32, b[i + 2]) << 16);
 }
 
@@ -54,7 +54,7 @@ struct Back {
     s: []u8,
     pos: i64,  // bits left above the start (negative: read past it)
 
-    fn init(s: []u8) ZstdError!Back {
+    fn init(noalias s: []u8) ZstdError!Back {
         if (s.len == 0) or (s[s.len - 1] == 0) {
             return error.Corrupt;
         }
@@ -62,7 +62,7 @@ struct Back {
         return Back.{ s: s, pos: (@as(i64, @truncate(u32, s.len)) * 8) - 8 + @as(i64, top) };
     }
 
-    fn read(self: *mut Back, n: u32) u64 {
+    fn read(noalias self: *mut Back, n: u32) u64 {
         if n == 0 {
             return 0;
         }
@@ -97,7 +97,7 @@ struct Fwd {
     s: []u8,
     pos: usize,  // in bits
 
-    fn read(self: *mut Fwd, n: u32) ZstdError!u32 {
+    fn read(noalias self: *mut Fwd, n: u32) ZstdError!u32 {
         let mut v: u32 = 0;
         for k in @as(u32, 0)..n {
             let p = self.pos + @as(usize, k);
@@ -110,7 +110,7 @@ struct Fwd {
         return v;
     }
 
-    fn peek(self: *Fwd, n: u32) u32 {
+    fn peek(noalias self: *Fwd, n: u32) u32 {
         let mut v: u32 = 0;
         for k in @as(usize, 0)..@as(usize, n) {
             let p = self.pos + k;
@@ -142,7 +142,7 @@ fn empty_fse() Fse {
 }
 
 // Builds a decoding table from normalized counts (-1: "less than one").
-fn fse_build(f: *mut Fse, counts: []i32, log: u32) ZstdError!void {
+fn fse_build(noalias f: *mut Fse, noalias counts: []i32, log: u32) ZstdError!void {
     let size = @as(usize, 1) << @truncate(u32, log);
     let mut next: [256]u32 = [0; 256];
     let mut high = size - 1;
@@ -199,8 +199,8 @@ fn fse_build(f: *mut Fse, counts: []i32, log: u32) ZstdError!void {
 
 // Reads a table description (normalized counts): returns its length in
 // bytes.
-fn read_ncount(src: []u8, counts: []mut i32, max_symbol: usize, max_log: u32, log_out: *mut u32,
-               nsym: *mut usize) ZstdError!usize {
+fn read_ncount(noalias src: []u8, noalias counts: []mut i32, max_symbol: usize, max_log: u32, noalias log_out: *mut u32,
+               noalias nsym: *mut usize) ZstdError!usize {
     let mut r = Fwd.{ s: src, pos: 0 };
     let log = r.read(4)! + 5;
     if log > max_log {
@@ -272,7 +272,7 @@ struct Huff {
     max_bits: u32,
     table: [2048]u16,  // symbol << 8 | length, for every max_bits-bit prefix
 
-    fn decode(self: *Huff, b: *mut Back) u8 {
+    fn decode(noalias self: *Huff, noalias b: *mut Back) u8 {
         // peek max_bits (bits past the start read as zeros)
         let saved = b.pos;
         let v = @truncate(usize, b.read(self.max_bits));
@@ -283,7 +283,7 @@ struct Huff {
 }
 
 // Builds a decoding table from weights (the last symbol's is implied).
-fn huff_build(h: *mut Huff, weights: []u8) ZstdError!void {
+fn huff_build(noalias h: *mut Huff, noalias weights: []u8) ZstdError!void {
     if (weights.len == 0) or (weights.len > 255) {
         return error.Corrupt;
     }
@@ -336,7 +336,7 @@ fn huff_build(h: *mut Huff, weights: []u8) ZstdError!void {
 }
 
 // Reads a Huffman tree description: returns its length.
-fn read_huff(src: []u8, h: *mut Huff) ZstdError!usize {
+fn read_huff(noalias src: []u8, noalias h: *mut Huff) ZstdError!usize {
     if src.len == 0 {
         return error.Corrupt;
     }
@@ -405,7 +405,7 @@ fn read_huff(src: []u8, h: *mut Huff) ZstdError!usize {
     return 1 + hb;
 }
 
-fn huff_stream(h: *Huff, src: []u8, out: []mut u8) ZstdError!void {
+fn huff_stream(noalias h: *Huff, noalias src: []u8, noalias out: []mut u8) ZstdError!void {
     let mut b = Back.init(src)!;
     for k in @as(usize, 0)..out.len {
         out[k] = h.decode(&mut b);
@@ -436,7 +436,7 @@ let ML_DEFAULT: [53]i32 = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 let OF_DEFAULT: [29]i32 = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1];
 
 // The per-frame decoding state that blocks share.
-struct Frame {
+nocopy struct Frame {
     huff: Huff,
     have_huff: bool,
     ll: Fse,
@@ -453,8 +453,8 @@ fn new_frame() Frame {
 }
 
 // Reads a sequence table in one of the four modes: returns its length.
-fn read_table(src: []u8, mode: u32, f: *mut Fse, have: *mut bool, max_symbol: usize, max_log: u32, deflt: []i32,
-              deflt_log: u32) ZstdError!usize {
+fn read_table(noalias src: []u8, mode: u32, noalias f: *mut Fse, noalias have: *mut bool, max_symbol: usize,
+              max_log: u32, noalias deflt: []i32, deflt_log: u32) ZstdError!usize {
     if mode == 0 {
         fse_build(f, deflt, deflt_log)!;
         have.* = true;
@@ -490,7 +490,7 @@ fn read_table(src: []u8, mode: u32, f: *mut Fse, have: *mut bool, max_symbol: us
 
 // Decodes a compressed block onto out (frame_start: where the frame's
 // output began, for checking offsets).
-fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_start: usize,
+fn compressed_block(noalias src: []u8, noalias fr: *mut Frame, noalias out: *mut strs.String, frame_start: usize,
                     max_size: usize) ZstdError!void {
     if src.len == 0 {
         return error.Corrupt;
@@ -735,7 +735,7 @@ fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_star
 
 /// Decompresses Zstandard frames (skipping skippable ones); the caller frees
 /// the result.
-pub fn decompress(data: []u8, max_size: usize) ZstdError![]mut u8 {
+pub fn decompress(noalias data: []u8, max_size: usize) ZstdError![]mut u8 {
     let mut out = strs.String.init();
     decode_frames(data, &mut out, max_size) catch |e| {
         out.deinit();
@@ -744,7 +744,7 @@ pub fn decompress(data: []u8, max_size: usize) ZstdError![]mut u8 {
     return out.take();
 }
 
-fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) ZstdError!void {
+fn decode_frames(noalias d: []u8, noalias out: *mut strs.String, max_size: usize) ZstdError!void {
     let mut i: usize = 0;
     if d.len == 0 {
         return error.Corrupt;
@@ -774,7 +774,8 @@ fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) ZstdError!void
     }
 }
 
-fn frame(d: []u8, at: usize, fr: *mut Frame, out: *mut strs.String, max_size: usize) ZstdError!usize {
+fn frame(noalias d: []u8, at: usize, noalias fr: *mut Frame, noalias out: *mut strs.String,
+         max_size: usize) ZstdError!usize {
     let mut i = at;
     if i >= d.len {
         return error.Corrupt;
@@ -919,7 +920,7 @@ struct BitW {
     acc: u64,
     n: u32,
 
-    fn add(self: *mut BitW, v: u64, k: u32) ZstdError!void {
+    fn add(noalias self: *mut BitW, v: u64, k: u32) ZstdError!void {
         if k == 0 {
             return;
         }
@@ -933,7 +934,7 @@ struct BitW {
     }
 
     // The end marker, and the last partial byte.
-    fn close(self: *mut BitW) ZstdError!void {
+    fn close(noalias self: *mut BitW) ZstdError!void {
         self.add(1, 1)!;
         if self.n > 0 {
             self.out.push(@truncate(u8, self.acc))!;
@@ -955,7 +956,7 @@ fn empty_ctable() CTable {
 }
 
 // The encoding table for normalized counts (the same spread as fse_build).
-fn ctable_build(t: *mut CTable, norm: []i32, log: u32) void {
+fn ctable_build(noalias t: *mut CTable, noalias norm: []i32, log: u32) void {
     let size = @as(usize, 1) << @truncate(u32, log);
     let mut symbols: [512]u8 = [0; 512];
     let mut cumul: [65]u32 = [0; 65];
@@ -1008,14 +1009,14 @@ fn ctable_build(t: *mut CTable, norm: []i32, log: u32) void {
 }
 
 // A table for a single symbol (RLE mode).
-fn ctable_rle(t: *mut CTable, sym: usize) void {
+fn ctable_rle(noalias t: *mut CTable, sym: usize) void {
     t.log = 0;
     t.states[0] = 0;
     t.delta_bits[sym] = 0;
     t.delta_state[sym] = 0;
 }
 
-fn fse_init(t: *CTable, sym: usize) u32 {
+fn fse_init(noalias t: *CTable, sym: usize) u32 {
     let db = t.delta_bits[sym];
     let nb = @bit_cast(u32, (db + (1 << 15)) >> 16);
     let value = @bit_cast(i32, nb << 16) - db;
@@ -1023,7 +1024,7 @@ fn fse_init(t: *CTable, sym: usize) u32 {
     return @as(u32, t.states[@as(usize, @bit_cast(u32, idx))]);
 }
 
-fn fse_encode(w: *mut BitW, t: *CTable, state: *mut u32, sym: usize) ZstdError!void {
+fn fse_encode(noalias w: *mut BitW, noalias t: *CTable, noalias state: *mut u32, sym: usize) ZstdError!void {
     let nb = @bit_cast(u32, (@bit_cast(i32, state.*) + t.delta_bits[sym]) >> 16);
     w.add(@as(u64, state.*), nb)!;
     let idx = @bit_cast(i32, state.* >> nb) + t.delta_state[sym];
@@ -1031,7 +1032,7 @@ fn fse_encode(w: *mut BitW, t: *CTable, state: *mut u32, sym: usize) ZstdError!v
 }
 
 // Normalizes counts to sum to 1 << log (each present symbol at least 1).
-fn normalize(counts: []u32, total: u32, log: u32, norm: []mut i32) void {
+fn normalize(noalias counts: []u32, total: u32, log: u32, noalias norm: []mut i32) void {
     let size = @as(i64, 1) << @truncate(u32, log);
     let mut sum: i64 = 0;
     let mut biggest: usize = 0;
@@ -1069,7 +1070,7 @@ fn normalize(counts: []u32, total: u32, log: u32, norm: []mut i32) void {
 }
 
 // Writes a table description (normalized counts).
-fn write_ncount(w: *mut BitW, norm: []i32, log: u32) ZstdError!void {
+fn write_ncount(noalias w: *mut BitW, noalias norm: []i32, log: u32) ZstdError!void {
     let size = @as(i32, 1) << @truncate(u32, log);
     w.add(@as(u64, log - 5), 4)!;
     let mut remaining = size + 1;
@@ -1119,7 +1120,7 @@ fn write_ncount(w: *mut BitW, norm: []i32, log: u32) ZstdError!void {
 }
 
 // Code lengths of at most max_len bits (Huffman, flattened until it fits).
-fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) ZstdError!void {
+fn code_lengths(noalias freq: []u32, noalias lens: []mut u8, max_len: u32) ZstdError!void {
     let n = freq.len;
     let mut shift: u32 = 0;
     loop {
@@ -1188,7 +1189,7 @@ fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) ZstdError!void {
 
 // Huffman-codes literals: the literals section (header included), or
 // nothing (returns false) if raw literals would be as small.
-fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
+fn huff_literals(noalias lits: []u8, noalias out: *mut strs.String) ZstdError!bool {
     let mut freq: [256]u32 = [0; 256];
     for c in lits {
         freq[@as(usize, c)] += 1;
@@ -1275,7 +1276,7 @@ fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
 
 // The FSE-compressed tree description of a Huffman code's weights (all but the last
 // symbol's), appended to tree; false (and nothing appended) if it would not fit.
-fn huff_weights_fse(weights: []u8, tree: *mut strs.String) ZstdError!bool {
+fn huff_weights_fse(noalias weights: []u8, noalias tree: *mut strs.String) ZstdError!bool {
     let nw = weights.len;
     let mut wf: [13]u32 = [0; 13];
     for k in @as(usize, 0)..nw {
@@ -1337,7 +1338,7 @@ fn huff_weights_fse(weights: []u8, tree: *mut strs.String) ZstdError!bool {
 
 // The direct tree description of a Huffman code's weights (all but the last
 // symbol's, at most 128 of them): two to a byte.
-fn huff_weights_direct(weights: []u8, tree: *mut strs.String) ZstdError!void {
+fn huff_weights_direct(noalias weights: []u8, noalias tree: *mut strs.String) ZstdError!void {
     let nw = weights.len;
     tree.push(@truncate(u8, 127 + nw))!;
     let mut k: usize = 0;
@@ -1354,7 +1355,8 @@ fn huff_weights_direct(weights: []u8, tree: *mut strs.String) ZstdError!void {
 
 // Huffman-codes literals as four streams, with the jump table before them; false
 // if a stream is too long for the table.
-fn huff_four_streams(lits: []u8, lens: []u8, codes: []u32, streams: *mut strs.String) ZstdError!bool {
+fn huff_four_streams(noalias lits: []u8, noalias lens: []u8, noalias codes: []u32,
+                     noalias streams: *mut strs.String) ZstdError!bool {
     let seg = (lits.len + 3) / 4;
     let mut parts: [4]strs.String = [strs.String.init(), strs.String.init(), strs.String.init(), strs.String.init()];
     defer {
@@ -1386,7 +1388,7 @@ fn huff_four_streams(lits: []u8, lens: []u8, codes: []u32, streams: *mut strs.St
 
 // The header of a Huffman-coded literals section: type 2, the size format, and the
 // two sizes; false (and nothing written) if the sizes do not fit.
-fn literals_header(nlits: usize, csize: usize, four: bool, out: *mut strs.String) ZstdError!bool {
+fn literals_header(nlits: usize, csize: usize, four: bool, noalias out: *mut strs.String) ZstdError!bool {
     let regen = @as(u64, nlits);
     let c = @as(u64, csize);
     let mut sf: u64 = 0;
@@ -1414,7 +1416,8 @@ fn literals_header(nlits: usize, csize: usize, four: bool, out: *mut strs.String
     return true;
 }
 
-fn huff_stream_encode(lits: []u8, lens: []u8, codes: []u32, out: *mut strs.String) ZstdError!void {
+fn huff_stream_encode(noalias lits: []u8, noalias lens: []u8, noalias codes: []u32,
+                      noalias out: *mut strs.String) ZstdError!void {
     let mut w = BitW.{ out: out, acc: 0, n: 0 };
     let mut k = lits.len;
     while k > 0 {
@@ -1439,20 +1442,20 @@ const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 131074;
 const ZHASH: usize = 1 << 17;
 
-struct Matcher {
+nocopy struct Matcher {
     data: []u8,
     head: []mut u32,
     chain: []mut u32,
     depth: u32,
     window: usize,
 
-    fn hash(self: *Matcher, i: usize) usize {
+    fn hash(noalias self: *Matcher, i: usize) usize {
         let d = self.data;
         let v = (@as(u32, d[i]) << 16) | (@as(u32, d[i + 1]) << 8) | @as(u32, d[i + 2]);
         return @as(usize, (v *% 2654435761) >> 15) & (ZHASH - 1);
     }
 
-    fn insert(self: *mut Matcher, i: usize) void {
+    fn insert(noalias self: *mut Matcher, i: usize) void {
         if (i + MIN_MATCH) > self.data.len {
             return;
         }
@@ -1461,7 +1464,7 @@ struct Matcher {
         self.head[h] = @truncate(u32, i);
     }
 
-    fn len_at(self: *Matcher, i: usize, back: usize, limit: usize) usize {
+    fn len_at(noalias self: *Matcher, i: usize, back: usize, limit: usize) usize {
         let d = self.data;
         let mut l: usize = 0;
         while (l < limit) and (d[i + l] == d[i + l - back]) {
@@ -1472,7 +1475,7 @@ struct Matcher {
 
     // The longest match at i (from positions >= lo) that ends by end: its
     // distance, and its length in len.
-    fn find(self: *Matcher, i: usize, end: usize, lo: usize, len: *mut usize) usize {
+    fn find(noalias self: *Matcher, i: usize, end: usize, lo: usize, noalias len: *mut usize) usize {
         len.* = 0;
         if (i + MIN_MATCH) > end {
             return 0;
@@ -1526,7 +1529,7 @@ fn ml_code(v: u32) usize {
 
 // The offset value for a match at distance d after ll literals, updating
 // the repeat offsets as the decoder will.
-fn offset_value(d: u64, ll: u32, reps: *mut [3]u64) u32 {
+fn offset_value(d: u64, ll: u32, noalias reps: *mut [3]u64) u32 {
     let r = reps.*;
     let mut v: u32 = 0;
     if ll > 0 {
@@ -1562,8 +1565,8 @@ fn offset_value(d: u64, ll: u32, reps: *mut [3]u64) u32 {
 
 // Chooses the sequences of a block (data[start..end]) with hash chains and
 // one step of lazy matching.
-fn find_sequences(m: *mut Matcher, start: usize, end: usize, reps: *mut [3]u64, seqs: *mut vec.Vec.[Seq],
-                  lits: *mut vec.Vec.[u8], lazy: bool) ZstdError!void {
+fn find_sequences(noalias m: *mut Matcher, start: usize, end: usize, noalias reps: *mut [3]u64,
+                  noalias seqs: *mut vec.Vec.[Seq], noalias lits: *mut vec.Vec.[u8], lazy: bool) ZstdError!void {
     let mut i = start;
     let mut anchor = start;
     let limit = end;
@@ -1621,8 +1624,8 @@ fn find_sequences(m: *mut Matcher, start: usize, end: usize, reps: *mut [3]u64, 
 
 // Chooses a table for one kind of code: returns its mode, and writes its
 // description.
-fn choose_table(codes: []u8, max_symbol: usize, max_log: u32, deflt: []i32, deflt_log: u32, t: *mut CTable,
-                desc: *mut strs.String) ZstdError!u32 {
+fn choose_table(noalias codes: []u8, max_symbol: usize, max_log: u32, noalias deflt: []i32, deflt_log: u32,
+                noalias t: *mut CTable, noalias desc: *mut strs.String) ZstdError!u32 {
     let mut counts: [64]u32 = [0; 64];
     let mut top: usize = 0;
     let mut distinct: usize = 0;
@@ -1661,7 +1664,8 @@ fn choose_table(codes: []u8, max_symbol: usize, max_log: u32, deflt: []i32, defl
 }
 
 // A compressed block's body, or nothing (false) if it would not be smaller.
-fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) ZstdError!bool {
+fn compress_block(noalias block: []u8, noalias seqs: []Seq, noalias lits: []u8,
+                  noalias out: *mut strs.String) ZstdError!bool {
     // literals
     if not huff_literals(lits, out)! {
         let n = lits.len;
@@ -1758,7 +1762,7 @@ fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) Z
     return out.len() < block.len;
 }
 
-fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) ZstdError!void {
+fn seq_bits(noalias w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) ZstdError!void {
     w.add(@as(u64, q.ll - LL_BASE[@as(usize, lc)]), @as(u32, LL_BITS[@as(usize, lc)]))!;
     w.add(@as(u64, q.ml - ML_BASE[@as(usize, mc)]), @as(u32, ML_BITS[@as(usize, mc)]))!;
     w.add(@as(u64, q.ofv - (@as(u32, 1) << @as(u32, oc))), @as(u32, oc))!;
@@ -1766,7 +1770,7 @@ fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) ZstdError!void {
 
 /// Compresses data as one Zstandard frame (with its size and checksum);
 /// level 1 (fastest) to 19 (smallest). The caller frees the result.
-pub fn compress(data: []u8, level: u32) ![]mut u8 {
+pub fn compress(noalias data: []u8, level: u32) ![]mut u8 {
     let mut out = strs.String.init();
     compress_to(out.writer(), data, level) catch |e| {
         out.deinit();
@@ -1777,7 +1781,7 @@ pub fn compress(data: []u8, level: u32) ![]mut u8 {
 
 /// Compresses data as one Zstandard frame (see compress) and writes it to
 /// w a block (at most 128 KB) at a time, as each is compressed.
-pub fn compress_to(w: io.Writer, data: []u8, level: u32) !void {
+pub fn compress_to(w: io.Writer, noalias data: []u8, level: u32) !void {
     // what goes out next: the frame header, then each block with its header
     // (and, after the last, the checksum)
     let mut ob = strs.String.init();
@@ -1873,7 +1877,7 @@ pub fn compress_to(w: io.Writer, data: []u8, level: u32) !void {
     w.write_all(out.bytes())!;
 }
 
-fn put24(out: *mut strs.String, v: u32) ZstdError!void {
+fn put24(noalias out: *mut strs.String, v: u32) ZstdError!void {
     out.push(@truncate(u8, v))!;
     out.push(@truncate(u8, v >> 8))!;
     out.push(@truncate(u8, v >> 16))!;

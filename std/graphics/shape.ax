@@ -1334,7 +1334,7 @@ pub fn shape(f: *font.Font, text: []u8, opts: Options) ShapeError![]mut Glyph {
     return shape_with(&mut p, text, opts.features, &mut sp, spent);
 }
 
-struct Cached {
+nocopy struct Cached {
     font: usize,
     data: usize,
     script: u32,
@@ -1346,7 +1346,7 @@ struct Cached {
 }
 
 /// The lookup digests of a font, for all its plans.
-struct FontDigests {
+nocopy struct FontDigests {
     font: usize,
     data: usize,
     digests: layout.Digests,
@@ -1364,7 +1364,7 @@ const MAX_FONTS: usize = 8;
 /// and glyphs a run may take, so many short runs cost no more than their
 /// text; making a plan is charged to the run's work, and a run without the
 /// work left for its plan is shaped without the font's features.
-pub struct Shaper {
+pub nocopy struct Shaper {
     plans: vec.Vec.[Cached],
     fonts: vec.Vec.[FontDigests],
     clock: u64,
@@ -1405,9 +1405,6 @@ pub struct Shaper {
         }
         spent.* += @bit_cast(i64, @as(u64, fd.len));
         let face = font_face(f);
-        let mut ds = layout.Digests.init(&face)!;
-        let entry = FontDigests.{ font: @int_from_ptr(f), data: @int_from_ptr(f.data.ptr), digests: ds,
-                                  used: self.clock };
         if fd.len >= MAX_FONTS {
             // replace the least recently used
             let mut old: usize = 0;
@@ -1416,13 +1413,19 @@ pub struct Shaper {
                     old = k;
                 }
             }
-            fd[old].digests.deinit();
-            fd[old] = entry;
+            let mut ds = layout.Digests.init(&face)!;
+            @swap(&mut fd[old].digests, &mut ds);
+            ds.deinit();
+            fd[old].font = @int_from_ptr(f);
+            fd[old].data = @int_from_ptr(f.data.ptr);
+            fd[old].used = self.clock;
             return &mut fd[old].digests;
         }
-        self.fonts.push(entry) catch |e| {
-            ds.deinit();
-            return e;
+        self.fonts.reserve(1)!;
+        let ds = layout.Digests.init(&face)!;
+        self.fonts.push(FontDigests.{ font: @int_from_ptr(f), data: @int_from_ptr(f.data.ptr), digests: ds,
+                                      used: self.clock }) catch {
+            @trap();
         };
         return &mut self.fonts.items_mut()[self.fonts.len() - 1].digests;
     }
@@ -2138,11 +2141,17 @@ test "lookup counts past the data" {
     put_words(&mut gsub, "1 0 0 0 10 65535")!;
     let mut data = test_font("GSUB", gsub.items(), "")!;
     defer data.deinit();
-    let mut faces: [10]font.Font = [font.Font.init(data.items())!; 10];
+    let mut faces = vec.Vec.[font.Font].init();
+    defer faces.deinit();
+    faces.reserve(10)!;
+    for _k in @as(usize, 0)..10 {
+        faces.push(font.Font.init(data.items())!)!;
+    }
+    let fl = faces.items();
     let mut s = Shaper.init();
     defer s.deinit();
-    for k in @as(usize, 0)..faces.len {
-        let gs = s.shape(&faces[k], "ab", options())!;
+    for k in @as(usize, 0)..fl.len {
+        let gs = s.shape(&fl[k], "ab", options())!;
         defer mem.free(gs);
         @expect_eq(gs[1].id, 2);
         // the digests are for the lookups the data has room for
@@ -2152,6 +2161,6 @@ test "lookup counts past the data" {
     @expect_eq(s.fonts.len(), MAX_FONTS);
     let fd = s.fonts.items();
     for k in @as(usize, 0)..fd.len {
-        @expect(fd[k].font != @int_from_ptr(&faces[0]));
+        @expect(fd[k].font != @int_from_ptr(&fl[0]));
     }
 }

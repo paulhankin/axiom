@@ -113,10 +113,15 @@ const MONO: usize = 4;
 const MATH: usize = 5;
 const MISSING: usize = 255;
 
+fn push_face(faces: *mut vec.Vec.[font.Font], f: *mut font.Font) { OutOfMemory }!void {
+    faces.push(font.Font.empty())!;
+    @swap(faces.get_ptr(faces.len() - 1), f);
+}
+
 /// A family of system fonts, loaded: regular, bold, italic, bold italic, a
 /// monospaced face, and a math font (one with an OpenType MATH table) if
 /// the system has one. Missing faces fall back to the regular one.
-pub struct FontSet {
+pub nocopy struct FontSet {
     faces: vec.Vec.[font.Font],
     index: [6]usize,  // into faces, or MISSING
 
@@ -181,10 +186,9 @@ pub struct FontSet {
         }
         let mut set = FontSet.{ faces: vec.Vec.[font.Font].init(), index: [MISSING; 6] };
         for k in @as(usize, 0)..5 {
-            let f = font.Font.load(paths[(best * 5) + k]) catch continue;
-            set.faces.push(f) catch |e| {
-                let mut g = f;
-                g.deinit();
+            let mut f = font.Font.load(paths[(best * 5) + k]) catch continue;
+            push_face(&mut set.faces, &mut f) catch |e| {
+                f.deinit();
                 set.deinit();
                 return e;
             };
@@ -197,10 +201,9 @@ pub struct FontSet {
         if set.index[MONO] == MISSING {
             // any family's monospaced face
             for fam in @as(usize, 0)..nfam {
-                let f = font.Font.load(paths[(fam * 5) + 4]) catch continue;
-                set.faces.push(f) catch |e| {
-                    let mut g = f;
-                    g.deinit();
+                let mut f = font.Font.load(paths[(fam * 5) + 4]) catch continue;
+                push_face(&mut set.faces, &mut f) catch |e| {
+                    f.deinit();
                     set.deinit();
                     return e;
                 };
@@ -208,14 +211,15 @@ pub struct FontSet {
                 break;
             }
         }
-        let mf = find_math_font() catch |e| {
+        let mut mf = find_math_font() catch |e| {
             if e == error.FontNotFound {
                 return set;
             }
             set.deinit();
             return e;
         };
-        set.set_math(mf) catch |e| {
+        set.set_math(&mut mf) catch |e| {
+            mf.deinit();
             set.deinit();
             return e;
         };
@@ -227,19 +231,17 @@ pub struct FontSet {
         return self.index[MATH] != MISSING;
     }
 
-    /// Makes f (which the set now owns) its math font. Call fonts() after
-    /// this: it may move the faces.
-    pub fn set_math(self: *mut FontSet, f: font.Font) MarkdownPdfError!void {
+    /// Makes f (which the set now owns via @swap, leaving f empty) its math
+    /// font. Call fonts() after this: it may move the faces.
+    pub fn set_math(self: *mut FontSet, f: *mut font.Font) MarkdownPdfError!void {
         if self.index[MATH] != MISSING {
-            self.faces.get_ptr(self.index[MATH]).deinit();
-            self.faces.set(self.index[MATH], f);
+            let slot = self.faces.get_ptr(self.index[MATH]);
+            slot.deinit();
+            slot.* = font.Font.empty();
+            @swap(slot, f);
             return;
         }
-        self.faces.push(f) catch |e| {
-            let mut g = f;
-            g.deinit();
-            return e;
-        };
+        push_face(&mut self.faces, f)!;
         self.index[MATH] = self.faces.len() - 1;
     }
 
@@ -1908,7 +1910,10 @@ test "math fonts are fonts with a MATH table" {
         return e;
     };
     stix.owned = d;
-    set.set_math(stix)!;
+    set.set_math(&mut stix) catch |e| {
+        stix.deinit();
+        return e;
+    };
     @expect(set.has_math());
     let fonts = set.fonts();
     @expect(fonts.math.table("MATH").len > 0);
