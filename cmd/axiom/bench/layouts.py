@@ -3,7 +3,7 @@
 (hot loops of different shapes: an interpreter's dispatch, a state machine, hash
 probing, string scanning, sorting, matrix multiplies, bit manipulation, linked
 structures, recursion, memory operations, struct copies, record coding, a
-register machine) and the single-threaded Axiom ones beside it, measured so that
+register machine, a probe loop comparing keys through a function pointer) and the single-threaded Axiom ones beside it, measured so that
 code placement does not decide the result: each program is built in several layouts
 (AXIOM_X64_FPAD: every function shifted by that many bytes of padding, which moves
 hot loops across cache line and decoder window boundaries; a kernel's time can
