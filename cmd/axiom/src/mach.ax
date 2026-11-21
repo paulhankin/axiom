@@ -155,6 +155,8 @@ pub struct MFunc {
     vbytes: u.List.[u8],    // the bytes its value takes when fewer than its class's (0: all; set_bytes)
     noframe_regs: u64,      // registers the noframe blocks must not use (shrink_wrap)
     nosave: u.List.[bool],  // split instead of given a callee-saved register once, in vain (see save_dearer)
+    loops: u.List.[Loop],   // the natural loops of the blocks (block_freqs)
+    binner: []mut i32,      // ... the smallest containing each block (-1: none)
 }
 
 pub fn new_func() *mut MFunc {
@@ -178,6 +180,7 @@ pub fn free_func(f: *mut MFunc) void {
     f.vslot.deinit();
     f.vbytes.deinit();
     f.nosave.deinit();
+    f.loops.deinit();
 }
 
 pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
@@ -715,7 +718,9 @@ pub fn block_freqs(f: *mut MFunc) void {
     fs.post.deinit();
     heads.deinit();
     srcs.deinit();
-    fs.loops.deinit();
+    f.loops.deinit();
+    f.loops = fs.loops;  // (kept for split)
+    f.binner = inner[0..nb];
     order.deinit();
     fs.pr.deinit();
 }
@@ -2189,7 +2194,8 @@ struct Split {
     men: []*mut MInst,
     men_ev: []i32,
     mbeg: []i32,
-    skip: []mut bool,  // the vreg is dead before its first mention in the block
+    skip: []mut bool,   // the vreg is dead before its first mention in the block
+    quiet: []mut bool,  // per loop (MFunc.loops): see quiet_loops
 
     // A reload of the vreg into piece w.
     fn reload_into(self: *Split, f: *mut MFunc, t: *Target, w: i32) *mut MInst {
@@ -2205,7 +2211,7 @@ struct Split {
 // there is a place for the spill code)?
 fn wants_cut(f: *MFunc, g: *Cfg, ms: *Split, p: usize, s: usize) bool {
     let pj = @int_cast(usize, g.cidx[p]);
-    if (ms.mode == SPLIT_ALL) or ms.memtail[pj] {
+    if (ms.mode == SPLIT_ALL) or ms.memtail[pj] or crosses_quiet(f, ms, p, s) {
         return true;
     }
     // into or out of a loop, where the side outside it uses the vreg (a
@@ -2223,6 +2229,73 @@ fn wants_cut(f: *MFunc, g: *Cfg, ms: *Split, p: usize, s: usize) bool {
         }
     }
     return (ms.mode == SPLIT_GAPS) and (ms.cl[pj] != ms.cl[@int_cast(usize, g.cidx[s])]);
+}
+
+// The loops the vreg is live through without being named in, across a call
+// in one of their blocks (a loop around a call that needs other values: a
+// probe loop's comparisons through a function pointer): it stays in memory
+// all through them, stored before they are entered and reloaded where they
+// are left, rather than reloaded after the call each time around.
+fn quiet_loops(f: *MFunc, t: *Target, g: *Cfg, ms: *mut Split) void {
+    let nl = f.loops.len;
+    let named = u.newn.[bool](nl + 1);
+    for li in 0..nl {
+        named[li] = false;
+        ms.quiet[li] = false;
+    }
+    for bj in 0..ms.nl.len {
+        let bi = @int_cast(usize, ms.nl[bj]);
+        if bi >= f.binner.len {
+            continue;
+        }
+        let mut cut = false;
+        let b = f.blocks.get(bi);
+        if not ms.nm[bj] and bget(b.live_in, ms.x) and bget(b.live_out, ms.x) {
+            for j in g.ev[bi].items() {
+                if call_cut(t, ms.c, j) {
+                    cut = true;
+                }
+            }
+        }
+        let mut li = f.binner[bi];
+        while li >= 0 {
+            let l = @int_cast(usize, li);
+            if ms.nm[bj] {
+                named[l] = true;
+            }
+            if cut {
+                ms.quiet[l] = true;
+            }
+            li = f.loops.at(l).parent;
+        }
+    }
+    for li in 0..nl {
+        if named[li] {
+            ms.quiet[li] = false;
+        }
+    }
+}
+
+// Does the edge from block p to block s enter or leave a loop of ms.quiet?
+fn crosses_quiet(f: *MFunc, ms: *Split, p: usize, s: usize) bool {
+    if (ms.quiet.len == 0) or (p >= f.binner.len) or (s >= f.binner.len) {
+        return false;
+    }
+    let ends: [2][2]usize = [[p, s], [s, p]];
+    for e in ends {
+        let mut li = f.binner[e[0]];
+        while li >= 0 {
+            let l = f.loops.at(@int_cast(usize, li));
+            if in_loop(l, @int_cast(i32, e[1])) {
+                break;
+            }
+            if ms.quiet[@int_cast(usize, li)] {
+                return true;
+            }
+            li = l.parent;
+        }
+    }
+    return false;
 }
 
 // Is the edge from block p to block s (where the vreg is live) a split point?
@@ -2968,8 +3041,10 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl:
                          head: u.newn.[i32](m + 1), tail: u.newn.[i32](m + 1), memtail: u.newn.[bool](m + 1),
                          cl: cl[0..m], allin: u.newn.[bool](m + 1), selfld: u.newn.[bool](m + 1),
                          sload: u.newn.[i32](m + 1), sg: Segs.empty(), men: men, men_ev: men_ev, mbeg: mbeg,
-                         skip: u.newn.[bool](m + 1) };
+                         skip: u.newn.[bool](m + 1), quiet: u.newn.[bool](f.loops.len + 1) };
     defer ms.sg.deinit();
+    ms.quiet = ms.quiet[0..f.loops.len];
+    quiet_loops(f, t, g, &mut ms);
     if mode == SPLIT_GAPS {
         use_clusters(f, g, &ms, cl[0..m]);
     }
@@ -3582,6 +3657,87 @@ fn drop_dead_reloads(f: *mut MFunc) void {
     }
 }
 
+// Reloads that nothing after them in their block reads, of values read on
+// only one way out of it, into a block entered only from it, are moved there
+// (along such chains as far as they go): a piece entered from memory where
+// a loop is left (see quiet_loops) is reloaded only on the way that reads
+// it, not where the loop is left for a return. Keeps the liveness up to
+// date.
+fn sink_reloads(f: *mut MFunc) void {
+    let nb = f.blocks.len;
+    let npred = u.newn.[i32](nb + 1);
+    for bi in 0..nb {
+        npred[bi] = 0;
+    }
+    for bi in 0..nb {
+        let b = f.blocks.get(bi);
+        for k in 0..b.succs.len {
+            npred[@int_cast(usize, b.succs.get(k))] += 1;
+        }
+    }
+    let mut changed = true;
+    let mut rounds: i32 = 0;
+    while changed and (rounds < 8) {
+        changed = false;
+        rounds += 1;
+        for bi in 0..nb {
+            let b = f.blocks.get(bi);
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                if (i.spill == 1) and (i.sslot >= 0) and is_vreg(i.sreg) and (i.mk == 0) {
+                    let s = sink_target(f, b, i, npred[0..nb]);
+                    if s >= 0 {
+                        let x = @int_cast(usize, i.sreg - VREG0);
+                        let sb = f.blocks.get(@int_cast(usize, s));
+                        remove(b, i);
+                        insert_start(sb, i);
+                        bclr(b.live_out, x);
+                        bclr(sb.live_in, x);
+                        changed = true;
+                    }
+                }
+                i = next;
+            }
+        }
+    }
+}
+
+// Where reload i (of block b) can go instead (see sink_reloads), or -1.
+fn sink_target(f: *MFunc, b: *MBlock, i: *MInst, npred: []i32) i32 {
+    let v = i.sreg;
+    let x = @int_cast(usize, v - VREG0);
+    if not bget(b.live_out, x) {
+        return -1;
+    }
+    let mut j = i.next;
+    while u.notnil(j) {
+        if mentions(j, v) or ((j.spill == 2) and (j.sslot == i.sslot)) {
+            return -1;
+        }
+        for k in 0..j.ops.len {
+            if (j.ops[k].kind == K_MEM) and (j.ops[k].slot == i.sslot) {
+                return -1;
+            }
+        }
+        j = j.next;
+    }
+    let mut to: i32 = -1;
+    for k in 0..b.succs.len {
+        let s = b.succs.get(k);
+        if bget(f.blocks.get(@int_cast(usize, s)).live_in, x) {
+            if (to >= 0) and (to != s) {
+                return -1;
+            }
+            to = s;
+        }
+    }
+    if (to < 0) or (f.blocks.get(@int_cast(usize, to)).id == b.id) or (npred[@int_cast(usize, to)] != 1) {
+        return -1;
+    }
+    return to;
+}
+
 // -----------------------------------------------------------------------------
 // Coalescing (before allocation): the two sides of a copy between virtual
 // registers of a class become one register, and the copy goes, where their
@@ -3977,6 +4133,9 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
     loop {
         liveness(f);
         drop_dead_reloads(f);
+        if rounds > 0 {
+            sink_reloads(f);
+        }
         number(f);
         build_fixed(f);
         let iv = build_intervals(f);
