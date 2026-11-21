@@ -149,7 +149,11 @@
     X(ARM_CRC32C, "arm_crc32c", "ee") \
     X(LOAD_PARTIAL, "load_partial", "te") \
     X(STORE_PARTIAL, "store_partial", "ee") \
-    X(SWIZZLE2, "swizzle2", "eee")
+    X(SWIZZLE2, "swizzle2", "eee") \
+    X(VOLATILE_LOAD, "volatile_load", "e") \
+    X(VOLATILE_STORE, "volatile_store", "ee") \
+    X(VOLATILE_ZERO, "volatile_zero", "e") \
+    X(BLACK_BOX, "black_box", "e")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

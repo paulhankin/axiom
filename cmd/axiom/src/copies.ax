@@ -136,15 +136,32 @@ fn scan(f: *mut ir.Func) void {
         while u.notnil(i) {
             let op = i.op;
             if op == ir.OP_LOAD {
-                note(i, i.a, READ);
+                if i.flags != 0 {
+                    note(i, i.a, ESCAPE);
+                } else {
+                    note(i, i.a, READ);
+                }
             } else if op == ir.OP_STORE {
                 note(i, i.a, ESCAPE);  // (an address stored somewhere)
-                note(i, i.b, WRITE);
+                if i.flags != 0 {
+                    note(i, i.b, ESCAPE);
+                } else {
+                    note(i, i.b, WRITE);
+                }
             } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
-                note(i, i.a, WRITE);
-                note(i, i.b, READ);
+                if i.flags != 0 {
+                    note(i, i.a, ESCAPE);
+                    note(i, i.b, ESCAPE);
+                } else {
+                    note(i, i.a, WRITE);
+                    note(i, i.b, READ);
+                }
             } else if op == ir.OP_MEMSET {
-                note(i, i.a, WRITE);
+                if i.flags != 0 {
+                    note(i, i.a, ESCAPE);
+                } else {
+                    note(i, i.a, WRITE);
+                }
             } else if op == ir.OP_CALL {
                 note(i, i.a, ESCAPE);
                 for k in 0..i.xs.len {
@@ -209,6 +226,9 @@ fn dominates(a: *mut ir.Value, b: *mut ir.Value) bool {
 // Can copy c into slot D go: D only written by c and read after it, its
 // source unchanged while D is read?
 fn removable(c: *mut ir.Value) bool {
+    if c.flags != 0 {
+        return false;
+    }
     let d = c.a;
     if (d.kind != ir.V_INST) or (d.op != ir.OP_ALLOCA) or not ir.is_cint(c.c) or
        (ir.cint_val(c.c) != ir.aty_of(d).size) {
@@ -303,7 +323,7 @@ fn fold_offsets(f: *mut ir.Func) void {
 // published something in between (spec §12.8.2), which takes a write.
 fn writes_memory(i: *ir.Value) bool {
     let op = i.op;
-    return (ir.op_writes_mem(op) and (op != ir.OP_FENCE)) or (op == ir.OP_INTR);
+    return (ir.op_writes_mem(op) and (op != ir.OP_FENCE)) or (op == ir.OP_INTR) or (i.flags != 0);
 }
 
 fn whole(c: *ir.Value, d: *ir.Value) bool {
@@ -317,6 +337,9 @@ fn whole(c: *ir.Value, d: *ir.Value) bool {
 // be one (two pointer parameters, a parameter and a global): unless S and
 // c2's destination are known apart, c2 is put in moves, to become a memmove.
 fn copy_of_copy(c2: *mut ir.Value, moves: *mut u.List.[*mut ir.Value]) *mut ir.Value {
+    if c2.flags != 0 {
+        return u.nil.[ir.Value]();
+    }
     let d1 = c2.b;
     if not whole(c2, d1) {
         return u.nil.[ir.Value]();
@@ -326,7 +349,8 @@ fn copy_of_copy(c2: *mut ir.Value, moves: *mut u.List.[*mut ir.Value]) *mut ir.V
         return u.nil.[ir.Value]();
     }
     let c1 = o.writers.get(0);
-    if (c1.op != ir.OP_MEMCPY) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or (c1.pos >= c2.pos) {
+    if (c1.op != ir.OP_MEMCPY) or (c1.flags != 0) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or
+       (c1.pos >= c2.pos) {
         return u.nil.[ir.Value]();
     }
     let rs = root(c1.b);
@@ -351,6 +375,9 @@ fn copy_of_copy(c2: *mut ir.Value, moves: *mut u.List.[*mut ir.Value]) *mut ir.V
 // nothing else reads D1. c2 can fill its destination itself (then c1 is
 // dead): a zeroed struct returned and bound copies 0 into the variable.
 fn copy_of_fill(c2: *mut ir.Value) *mut ir.Value {
+    if c2.flags != 0 {
+        return u.nil.[ir.Value]();
+    }
     let d1 = c2.b;
     if not whole(c2, d1) {
         return u.nil.[ir.Value]();
@@ -360,7 +387,8 @@ fn copy_of_fill(c2: *mut ir.Value) *mut ir.Value {
         return u.nil.[ir.Value]();
     }
     let c1 = o.writers.get(0);
-    if (c1.op != ir.OP_MEMSET) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or (c1.pos >= c2.pos) {
+    if (c1.op != ir.OP_MEMSET) or (c1.flags != 0) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or
+       (c1.pos >= c2.pos) {
         return u.nil.[ir.Value]();
     }
     return c1;
@@ -371,8 +399,8 @@ fn copy_of_fill(c2: *mut ir.Value) *mut ir.Value {
 // the caller's fresh slot, which nothing else here reads or writes, so it
 // only must not be used between the call and the copy.
 fn result_into_result(f: *mut ir.Func, c: *mut ir.Value) *mut ir.Value {
-    if (f.params.len == 0) or (c.a != f.params[0]) or (f.param_ext.len == 0) or (f.param_ext[0] != ir.EXT_SRET) or
-       not whole(c, c.b) {
+    if (c.flags != 0) or (f.params.len == 0) or (c.a != f.params[0]) or (f.param_ext.len == 0) or
+       (f.param_ext[0] != ir.EXT_SRET) or not whole(c, c.b) {
         return u.nil.[ir.Value]();
     }
     let d = c.b;
@@ -458,13 +486,16 @@ fn written(w: *mut ir.Value, lo: *mut i64, hi: *mut i64) bool {
 // nowhere (which the source, read through another object, cannot be) may
 // come between them.
 fn source_unchanged(w: *mut ir.Value, c: *mut ir.Value) bool {
-    if ((w.op != ir.OP_MEMCPY) and (w.op != ir.OP_MEMMOVE)) or (w.blk != c.blk) {
+    if ((w.op != ir.OP_MEMCPY) and (w.op != ir.OP_MEMMOVE)) or (w.flags != 0) or (w.blk != c.blk) {
         return false;
     }
     let rs = root(w.b);
     let mut i = w.next;
     while u.notnil(i) and (i != c) {
         if writes_memory(i) {
+            if i.flags != 0 {
+                return false;
+            }
             let op = i.op;
             let mut p = i.a;
             if op == ir.OP_STORE {
@@ -493,7 +524,7 @@ const MAX_PIECES: usize = 16;
 // the slot may then not be read at all. Splitting a copy is always exact:
 // the slot's address goes nowhere else, so the copy cannot overlap it.
 fn split_copy(c: *mut ir.Value, B: *mut ir.Builder) bool {
-    if ((c.op != ir.OP_MEMCPY) and (c.op != ir.OP_MEMMOVE)) or not ir.is_cint(c.c) {
+    if ((c.op != ir.OP_MEMCPY) and (c.op != ir.OP_MEMMOVE)) or (c.flags != 0) or not ir.is_cint(c.c) {
         return false;
     }
     let r = root(c.b);
@@ -854,7 +885,7 @@ pub fn split_copies(f: *mut ir.Func) bool {
         while u.notnil(b) {
             let mut i = b.first;
             while u.notnil(i) {
-                if (i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) or (i.op == ir.OP_LOAD) {
+                if ((i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) or (i.op == ir.OP_LOAD)) and (i.flags == 0) {
                     cs.push(i);
                 }
                 i = i.next;
@@ -1022,7 +1053,7 @@ fn reaches_marked(c: *mut ir.Value) bool {
 // as large as D), and the copy goes. A value built in a function's local
 // and returned, then bound to a variable, is one slot instead of three.
 fn renamable(c: *mut ir.Value) bool {
-    if (c.op != ir.OP_MEMCPY) or not ir.is_cint(c.c) {
+    if (c.op != ir.OP_MEMCPY) or (c.flags != 0) or not ir.is_cint(c.c) {
         return false;
     }
     let d = c.a;
@@ -1096,7 +1127,7 @@ pub fn forward_copies(f: *mut ir.Func) bool {
         while u.notnil(b) {
             let mut i = b.first;
             while u.notnil(i) {
-                if i.op == ir.OP_MEMCPY {
+                if (i.op == ir.OP_MEMCPY) and (i.flags == 0) {
                     if removable(i) {
                         done.push(i);
                     } else if renamable(i) {
@@ -1559,16 +1590,16 @@ fn other_ok(i: *mut ir.Value, rd: *mut ir.Value) bool {
         return ir.inst_pure(i) or ir.is_rscope(i);  // (C's scopes access no memory)
     }
     if op == ir.OP_LOAD {
-        return ((i.flags & ir.F_ATOMIC) == 0) and apart_from(root_of(i.a), rd);
+        return (i.flags == 0) and apart_from(root_of(i.a), rd);
     }
     if op == ir.OP_STORE {
-        return ((i.flags & ir.F_ATOMIC) == 0) and apart_from(root_of(i.b), rd);
+        return (i.flags == 0) and apart_from(root_of(i.b), rd);
     }
     if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
-        return apart_from(root_of(i.a), rd) and apart_from(root_of(i.b), rd);
+        return (i.flags == 0) and apart_from(root_of(i.a), rd) and apart_from(root_of(i.b), rd);
     }
     if op == ir.OP_MEMSET {
-        return apart_from(root_of(i.a), rd);
+        return (i.flags == 0) and apart_from(root_of(i.a), rd);
     }
     return not ir.op_accesses_mem(op);
 }
@@ -1710,7 +1741,7 @@ pub fn forward_into(f: *mut ir.Func) bool {
         bl.push(b);
         let mut i = b.first;
         while u.notnil(i) {
-            if ((i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE)) and whole(i, i.b) {
+            if ((i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE)) and (i.flags == 0) and whole(i, i.b) {
                 let t = i.b;
                 let mut dup = false;
                 for x in ts.items() {

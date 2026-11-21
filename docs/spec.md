@@ -1792,9 +1792,11 @@ This section defines shared-memory concurrency. The design follows from three fa
   can. Share such values between threads only through a lock or other
   synchronization (std/sync), or as integers updated with atomics.
 - **Implementation obligation.** A conforming implementation MUST NOT perform
-  optimizations that are sound only if the program has no races. For example, it MUST
-  NOT assume that two reads of a racing location return the same value, or turn a
-  racing read into an unrelated value.
+  optimizations that are sound only if the program has no races, such as rematerializing
+  a single read into two separate loads or inventing speculative stores. Coalescing
+  redundant reads or keeping values in registers between synchronization points is valid,
+  because every read still observes some value written by a store that did not
+  happen-after it.
 - `@fence()` is a sequentially consistent fence. Ordinary code does not need it,
   because every atomic operation is already sequentially consistent.
 
@@ -3292,6 +3294,9 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
+| `@volatile_load(p)` | `*T → T` | Reads memory at `p` without load elimination, reordering across other volatile operations, or constant folding |
+| `@volatile_store(p, v)` | `*mut T, T → void` | Writes `v` to `p` without dead-store elimination or reordering across other volatile operations |
+| `@volatile_zero(s)` | `[]mut T → void` | Zeroes every byte of `s` without dead-store elimination (for wiping secrets before freeing or returning) |
 | `@memory_size()` | `→ usize` | In 64 KiB pages |
 | `@memory_grow(pages)` | `usize → !usize` | Returns the previous size, or `error.OutOfMemory` |
 | `@memory_discard(addr, len)` | `usize, usize → void` | The whole 64 KiB pages in `[addr, addr + len)` that `@memory_grow` handed out may be returned to the system; their bytes become unspecified (on native targets they read as zero). Pages outside that region (the stack, globals, code, memory from C) are left alone, and so is all of a range that misses it. WebAssembly memory cannot shrink, so there it does nothing |
@@ -3341,6 +3346,7 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 | Builtin | Notes |
 |---|---|
 | `@trap()` | Diverges and traps with `T0000`. Usable where any type is expected |
+| `@black_box(x)` | `T → T` | Returns `x` as an opaque value: prevents constant folding, dead-code elimination, and branch conversion across the call |
 | `@error_name(e)` | `error → []u8` |
 | `@expect(cond)` | Traps with `T0011` if `cond` is false (§17.1) |
 | `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§17.1) |
