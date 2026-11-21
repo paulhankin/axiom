@@ -75,6 +75,7 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     cg.hooks.local_init = init_local;
     cg.hooks.stmt_expr = stmt_expr;
     cg.hooks.trampolines = trampolines;
+    cg.hooks.inline_call = inline_call;
     gv.gen_expr = gx.rv;
     gv.outer_len = gnest.outer_len;
     gvec.install();
@@ -868,6 +869,18 @@ fn same_upper(a: []u64, b: []u64, n: usize) bool {
 fn return_stmt(s: *mut cast.Stmt) void {
     let F = cg.F;
     cg.continue_after();
+    let inl = cg.INL;
+    if u.notnil(inl) {
+        // (in an inlined call: the result stored, then its end)
+        if u.notnil(s.e) {
+            let v = gx.full(s.e);
+            if u.notnil(inl.res) {
+                put(inl.ret, v, inl.res);
+            }
+        }
+        cg.br(inl.exit);
+        return;
+    }
     if u.isnil(s.e) {
         cleanups();
         gva.ret_default(F.sig.plan, F.sret);
@@ -894,6 +907,246 @@ fn return_stmt(s: *mut cast.Stmt) void {
     }
     cleanups();
     gva.ret_value(F.sig.plan, F.sret, v);
+}
+
+// -----------------------------------------------------------------------------
+// Inlined calls: an inline definition that forwards its caller's variable
+// arguments (__builtin_va_arg_pack: the system's headers' wrappers of
+// printf, open ... under _FORTIFY_SOURCE), which only inlining gives them,
+// generated in place of each call (csema_marks.va_wrapper). The arguments
+// are evaluated in order into objects of their own, the parameters' and the
+// variable arguments' (cg.INL.pack); a call in the body whose last argument
+// is __builtin_va_arg_pack () gets the variable arguments in its place
+// (cgen_expr.call), and __builtin_va_arg_pack_len () is their number; a
+// return stores the result and goes to the end. The optimizer then sees
+// the caller's arguments in the parameters (__builtin_object_size,
+// __builtin_constant_p).
+// -----------------------------------------------------------------------------
+
+// A call e of function s, whose inline definition d (parameters ps)
+// forwards its variable arguments, inlined. done: false (and nothing
+// generated) when it cannot be: the body has what is not generated twice
+// in a function (a label, a static object, a statement expression ...),
+// an argument is of a type kept in memory other than a structure's, or the
+// call is in the inlined body of s itself; the call is then the external
+// function's.
+fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*mut cast.CSym,
+               done: *mut bool) *mut ir.Value {
+    done.* = false;
+    let n = e.args.len;
+    let mut locals = u.List.[*mut cast.CSym].empty();
+    if (ps.len > n) or u.isnil(d.body) or not inlinable(d.body, &mut locals) {
+        return ir.vnil();
+    }
+    for x in e.args.items() {
+        if not inline_type(x.ty) {
+            return ir.vnil();
+        }
+    }
+    for p in ps {
+        if not inline_type(p.ty) {
+            return ir.vnil();
+        }
+    }
+    let mut o = cg.INL;
+    while u.notnil(o) {
+        if o.callee == s {
+            return ir.vnil();
+        }
+        o = o.outer;
+    }
+    done.* = true;
+    let vs = u.newn.[*mut ir.Value](n + 1);
+    for i in 0..n {
+        vs[i] = gx.rv(e.args.get(i));
+    }
+    let inl = u.new.[cg.Inline]();
+    inl.callee = s;
+    inl.outer = cg.INL;
+    inl.pack = u.List.[*mut cast.Expr].empty();
+    // (the objects of the parameters and the body: this call's own)
+    let saved = u.newn.[*mut void](ps.len + locals.len + 1);
+    for j in 0..ps.len {
+        let p = ps[j];
+        saved[j] = p.ir;
+        let slot = cg.aligned_alloca(cty.unqual(p.ty), p.name, p.align);
+        put(cty.unqual(p.ty), vs[j], slot);
+        p.ir = @ptr_cast(*mut void, slot);
+    }
+    for j in 0..locals.len {
+        let x = locals.get(j);
+        saved[ps.len + j] = x.ir;
+        x.ir = @ptr_from_int(*mut void, 0);
+    }
+    for k in ps.len..n {
+        let a = e.args.get(k);
+        let t = cty.unqual(a.ty);
+        let slot = cg.alloca(t, "va.pack");
+        put(t, vs[k], slot);
+        let v = u.new.[cast.CSym]();
+        v.kind = cast.SK_OBJECT;
+        v.name = "va.pack";
+        v.span = a.span;
+        v.ty = t;
+        v.duration = cast.SD_AUTO;
+        v.ir = @ptr_cast(*mut void, slot);
+        let x = cast.new_expr(cast.ExprKind.IDENT, a.span);
+        x.name = v.name;
+        x.sym = v;
+        x.ty = t;
+        x.lvalue = true;
+        inl.pack.push(x);
+    }
+    inl.ret = cty.unqual(s.ty.ret);
+    if not cty.is_void(inl.ret) {
+        inl.res = cg.alloca(inl.ret, "inl.ret");
+    }
+    inl.exit = cg.new_block("inl.end");
+    cg.INL = inl;
+    let fp = gx.fp_state;
+    stmt(d.body);
+    gx.fp_state = fp;
+    cg.br(inl.exit);
+    cg.at_end(inl.exit);
+    cg.INL = inl.outer;
+    for j in 0..ps.len {
+        ps[j].ir = saved[j];
+    }
+    for j in 0..locals.len {
+        locals.get(j).ir = saved[ps.len + j];
+    }
+    if u.isnil(inl.res) {
+        return ir.vnil();
+    }
+    if cty.is_record(inl.ret) {
+        return inl.res;
+    }
+    return gx.load(inl.ret, inl.res);
+}
+
+// Is a value of type t one inline_call keeps in an object of its own: a
+// scalar in registers, or a structure or union (its address)?
+fn inline_type(t: *mut cty.CType) bool {
+    if u.isnil(t) {
+        return false;
+    }
+    if cty.is_record(t) or cty.is_pointer(t) {
+        return true;
+    }
+    return cty.is_arith(t) and not cty.is_complex(t) and not cty.is_wide(t) and not cty.is_wint(t) and
+           not cty.is_dec128(t) and not cty.is_vector(t);
+}
+
+// Can the statements of s be generated in each inlined call (inline_call):
+// blocks, declarations of automatic objects of types that are not variably
+// modified, without cleanups (locals: them), expression statements, if,
+// the loops, break, continue and return, with no statement expression,
+// compound literal or address of a label in their expressions?
+fn inlinable(s: *mut cast.Stmt, locals: *mut u.List.[*mut cast.CSym]) bool {
+    if u.isnil(s) {
+        return true;
+    }
+    let k = s.kind;
+    if k == cast.StmtKind.COMPOUND {
+        for x in s.items.items() {
+            if not inlinable(x, locals) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == cast.StmtKind.DECL {
+        return inlinable_decl(s.decl, locals);
+    }
+    if (k == cast.StmtKind.EXPR) or (k == cast.StmtKind.RETURN) {
+        return inlinable_expr(s.e);
+    }
+    if k == cast.StmtKind.IF {
+        return inlinable_expr(s.e) and inlinable(s.body, locals) and inlinable(s.els, locals);
+    }
+    if (k == cast.StmtKind.WHILE) or (k == cast.StmtKind.DO) {
+        return inlinable_expr(s.e) and inlinable(s.body, locals);
+    }
+    if k == cast.StmtKind.FOR {
+        return inlinable_expr(s.first) and (u.isnil(s.decl) or inlinable_decl(s.decl, locals)) and
+               inlinable_expr(s.e) and inlinable_expr(s.step) and inlinable(s.body, locals);
+    }
+    return (k == cast.StmtKind.BREAK) or (k == cast.StmtKind.CONTINUE);
+}
+
+fn inlinable_decl(d: *mut cast.Decl, locals: *mut u.List.[*mut cast.CSym]) bool {
+    if d.kind != cast.DeclKind.DECL {
+        return d.kind == cast.DeclKind.STATIC_ASSERT;
+    }
+    for x in d.decls.items() {
+        let s = x.sym;
+        if u.isnil(s) {
+            continue;
+        }
+        if s.kind == cast.SK_FUNC {
+            if u.notnil(s.def) or u.notnil(s.nest_parent) {
+                return false;
+            }
+            continue;
+        }
+        if s.kind != cast.SK_OBJECT {
+            continue;
+        }
+        if s.duration != cast.SD_AUTO {
+            if s.linkage == cast.LK_NONE {
+                return false;  // (a static object of its own)
+            }
+            continue;
+        }
+        if cty.is_vm(s.ty) {
+            return false;
+        }
+        let n = cgn.note_of(s);
+        if u.notnil(n) and u.notnil(n.cleanup_call) {
+            return false;
+        }
+        if u.notnil(s.init) {
+            if s.init.pre.len > 0 {
+                return false;
+            }
+            for it in s.init.items.items() {
+                if not inlinable_expr(it.e) {
+                    return false;
+                }
+            }
+        }
+        locals.push(s);
+    }
+    return true;
+}
+
+fn inlinable_expr(e: *mut cast.Expr) bool {
+    if u.isnil(e) {
+        return true;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.LABEL_ADDR) or
+       (k == cast.ExprKind.GENERIC) or (k == cast.ExprKind.VA_ARG) {
+        return false;
+    }
+    if not inlinable_expr(e.a) or not inlinable_expr(e.b) or not inlinable_expr(e.c) {
+        return false;
+    }
+    for x in e.args.items() {
+        if not inlinable_expr(x) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Stores value v of type t (a scalar, or a structure's address) at p.
+fn put(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    if cty.is_record(t) {
+        gx.copy(t, p, v);
+    } else {
+        gx.store(t, v, p);
+    }
 }
 
 // Before a return: the calls of the cleanups in scope (a GNU dialect), and
