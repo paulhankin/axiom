@@ -510,6 +510,65 @@ Type *builtin_check(Expr *e, Type *expected) {
             diag_error(e->span, "E0822", "@%s requires a pointer, found %s", e->name, type_str(p));
         return e->type = t_void;
     }
+    case BI_VOLATILE_LOAD: {
+        Type *p = check_expr(*earg(e, 0), NULL);
+        if (p->kind == TY_INVALID) return e->type = t_invalid;
+        if (p->kind != TY_PTR) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_load requires a pointer operand");
+            return e->type = t_invalid;
+        }
+        if (p->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0705", "cannot dereference *void");
+            return e->type = t_invalid;
+        }
+        return e->type = p->elem;
+    }
+    case BI_VOLATILE_STORE: {
+        Type *p = check_expr(*earg(e, 0), NULL);
+        if (p->kind == TY_INVALID) {
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (p->kind != TY_PTR) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_store requires a pointer operand");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (!p->mut) {
+            diag_error((*earg(e, 0))->span, "E0706", "@volatile_store requires a *mut pointer");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (p->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0705", "cannot dereference *void");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        check_expr_to(earg(e, 1), p->elem);
+        return e->type = t_void;
+    }
+    case BI_VOLATILE_ZERO: {
+        Type *d = check_expr(*earg(e, 0), NULL);
+        if (d->kind == TY_INVALID) return e->type = t_void;
+        if (d->kind != TY_SLICE || !d->mut) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_zero destination must be a []mut slice");
+            return e->type = t_void;
+        }
+        if (d->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_zero cannot zero void elements");
+            return e->type = t_void;
+        }
+        return e->type = t_void;
+    }
+    case BI_BLACK_BOX: {
+        Type *t = operand(earg(e, 0), expected);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (t->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0404", "@black_box cannot take void");
+            return e->type = t_invalid;
+        }
+        return e->type = t;
+    }
     case BI_CLZ:
     case BI_CTZ:
     case BI_POPCOUNT: {

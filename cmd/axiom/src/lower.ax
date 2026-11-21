@@ -269,45 +269,71 @@ fn slot_of(x: *mut ir.Value) *mut ir.Value {
     return const_global(x);
 }
 
-fn memcpy(d: *mut ir.Value, s: *mut ir.Value, n: u64) void {
+fn memcpy_f(d: *mut ir.Value, s: *mut ir.Value, n: u64, flags: u32) void {
     if n == 0 {
         return;
     }
-    _ = ir.memop(B, ir.OP_MEMCPY, d, s, isz(n));
+    let m = ir.memop(B, ir.OP_MEMCPY, d, s, isz(n));
+    m.flags = m.flags | flags;
 }
 
-// Stores constant c at address d.
-fn store_const(c: *mut ir.Value, d: *mut ir.Value) void {
+fn memcpy(d: *mut ir.Value, s: *mut ir.Value, n: u64) void {
+    memcpy_f(d, s, n, 0);
+}
+
+// Stores constant c at address d, preserving `flags` (such as F_VOLATILE).
+fn store_const_f(c: *mut ir.Value, d: *mut ir.Value, flags: u32) void {
     let t = c.ty;
     if c.kind == ir.V_UNDEF {
+        if flags == 0 {
+            return;
+        }
+        if not ir.is_agg(t) {
+            let st = ir.store(B, c, d);
+            st.align = @int_cast(u32, t.align);
+            st.flags = st.flags | flags;
+        } else {
+            memcpy_f(d, entry_alloca(t), t.size, flags);
+        }
         return;
     }
     if not ir.is_agg(t) {
         let st = ir.store(B, c, d);
         st.align = @int_cast(u32, t.align);
+        st.flags = st.flags | flags;
         return;
     }
     if ir.is_zero(c) {
-        _ = ir.memop(B, ir.OP_MEMSET, d, ir.cint(ir.t_int(8), 0), isz(t.size));
+        let ms = ir.memop(B, ir.OP_MEMSET, d, ir.cint(ir.t_int(8), 0), isz(t.size));
+        ms.flags = ms.flags | flags;
         return;
     }
     let n = ir.field_count(t);
     if n > 16 {
-        memcpy(d, const_global(c), t.size);
+        memcpy_f(d, const_global(c), t.size, flags);
         return;
     }
     for i in 0..n {
-        store_const(c.xs.get(i), ir.ptradd(B, d, isz(ir.field_off(t, i))));
+        store_const_f(c.xs.get(i), ir.ptradd(B, d, isz(ir.field_off(t, i))), flags);
     }
+}
+
+// Stores constant c at address d.
+fn store_const(c: *mut ir.Value, d: *mut ir.Value) void {
+    store_const_f(c, d, 0);
+}
+
+fn store_agg_f(x: *mut ir.Value, d: *mut ir.Value, flags: u32) void {
+    if ir.is_const(x) {
+        store_const_f(x, d, flags);
+        return;
+    }
+    memcpy_f(d, slot_of(x), x.ty.size, flags);
 }
 
 // Stores aggregate value x at address d.
 fn store_agg(x: *mut ir.Value, d: *mut ir.Value) void {
-    if ir.is_const(x) {
-        store_const(x, d);
-        return;
-    }
-    memcpy(d, slot_of(x), x.ty.size);
+    store_agg_f(x, d, 0);
 }
 
 fn field_const(c: *mut ir.Value, i: usize) *mut ir.Value {
@@ -460,12 +486,12 @@ fn lower_body(f: *mut ir.Func) void {
             let op = i.op;
             if (op == ir.OP_LOAD) and ir.is_agg(i.ty) {
                 let s = entry_alloca(i.ty);
-                memcpy(s, i.a, i.ty.size);
+                memcpy_f(s, i.a, i.ty.size, i.flags);
                 set_slot(i, s);
                 i.aux2 = 1;
                 ir.remove_inst(i);
             } else if (op == ir.OP_STORE) and ir.is_agg(i.a.ty) {
-                store_agg(i.a, i.b);
+                store_agg_f(i.a, i.b, i.flags);
                 ir.remove_inst(i);
             } else if op == ir.OP_INSERTVALUE {
                 let base = i.a;

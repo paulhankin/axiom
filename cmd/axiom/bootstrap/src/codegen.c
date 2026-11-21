@@ -3718,6 +3718,81 @@ static LLVMValueRef gen_builtin(Expr *e) {
         intrinsic("llvm.prefetch", tys, 1, args, 4);
         return NULL;
     }
+    case BI_VOLATILE_LOAD: {
+        Type *pt = ct(a[0].e->type);
+        Type *vt = pt->elem;
+        LLVMValueRef p = gen(a[0].e);
+        asan_check(p, usz(type_size(vt)));
+        if (in_mem(vt)) {
+            LLVMValueRef dst = temp_alloca(vt);
+            if (type_size(vt) > 0) {
+                LLVMValueRef mc = LLVMBuildMemCpy(B, dst, (unsigned)type_align(vt), p, 1, usz(type_size(vt)));
+                LLVMSetOperand(mc, 3, LLVMConstInt(T_i1, 1, false));
+            }
+            return dst;
+        }
+        LLVMValueRef ld = LLVMBuildLoad2(B, lty(vt), p, "");
+        LLVMSetAlignment(ld, 1);
+        LLVMSetVolatile(ld, true);
+        return from_mem(vt, ld);
+    }
+    case BI_VOLATILE_STORE: {
+        Type *pt = ct(a[0].e->type);
+        Type *vt = pt->elem;
+        LLVMValueRef p = gen(a[0].e);
+        LLVMValueRef v = gen(a[1].e);
+        asan_check(p, usz(type_size(vt)));
+        if (in_mem(vt)) {
+            LLVMValueRef src = spill(vt, v);
+            if (type_size(vt) > 0) {
+                LLVMValueRef mc = LLVMBuildMemMove(B, p, 1, src, known_align(src), usz(type_size(vt)));
+                LLVMSetOperand(mc, 3, LLVMConstInt(T_i1, 1, false));
+            }
+            return NULL;
+        }
+        LLVMValueRef st = LLVMBuildStore(B, to_mem(vt, v), p);
+        LLVMSetAlignment(st, 1);
+        LLVMSetVolatile(st, true);
+        return NULL;
+    }
+    case BI_VOLATILE_ZERO: {
+        Type *dt = ct(a[0].e->type);
+        LLVMValueRef d = gen(a[0].e);
+        LLVMValueRef ptr = LLVMBuildExtractValue(B, d, 0, "");
+        LLVMValueRef len = LLVMBuildExtractValue(B, d, 1, "");
+        asan_check_slice(d, dt->elem);
+        LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(dt->elem)), "");
+        LLVMValueRef ms = LLVMBuildMemSet(B, ptr, LLVMConstInt(T_i8, 0, false), bytes, 1);
+        LLVMSetOperand(ms, 3, LLVMConstInt(T_i1, 1, false));
+        return NULL;
+    }
+    case BI_BLACK_BOX: {
+        Type *vt = ct(e->type);
+        if (vt->kind == TY_NEVER) {
+            gen(a[0].e);
+            return NULL;
+        }
+        LLVMValueRef v = gen(a[0].e);
+        LLVMValueRef tmp = temp_alloca(vt);
+        if (in_mem(vt)) {
+            LLVMValueRef src = spill(vt, v);
+            if (type_size(vt) > 0) {
+                LLVMValueRef mc = LLVMBuildMemCpy(B, tmp, (unsigned)type_align(vt), src, known_align(src), usz(type_size(vt)));
+                LLVMSetOperand(mc, 3, LLVMConstInt(T_i1, 1, false));
+            }
+            LLVMValueRef out = temp_alloca(vt);
+            if (type_size(vt) > 0) {
+                LLVMValueRef mc2 = LLVMBuildMemCpy(B, out, (unsigned)type_align(vt), tmp, (unsigned)type_align(vt), usz(type_size(vt)));
+                LLVMSetOperand(mc2, 3, LLVMConstInt(T_i1, 1, false));
+            }
+            return out;
+        }
+        LLVMValueRef st = LLVMBuildStore(B, to_mem(vt, v), tmp);
+        LLVMSetVolatile(st, true);
+        LLVMValueRef ld = LLVMBuildLoad2(B, lty(vt), tmp, "");
+        LLVMSetVolatile(ld, true);
+        return from_mem(vt, ld);
+    }
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
     case BI_ATOMIC_ADD:
