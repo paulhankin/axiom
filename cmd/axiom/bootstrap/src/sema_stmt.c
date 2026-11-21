@@ -148,11 +148,24 @@ static void check_assign(Stmt *s) {
                 diag_error(s->e2->span, "E0412",
                            "per-lane shift counts must have the shape of the shifted vector: %s and %s", type_str(lt),
                            type_str(r));
+        } else if (r->kind == TY_PARAM && type_satisfies(r, C_INT_VEC) && r->constraint_lane &&
+                   ((r->constraint_lane->kind == TY_INT && !r->constraint_lane->is_signed) ||
+                    (r->constraint_lane->kind == TY_PARAM && type_satisfies(r->constraint_lane, C_UNSIGNED)))) {
+            if (lt->kind != TY_INVALID && r != lt)
+                diag_error(s->e2->span, "E0412",
+                           "per-lane shift counts must have the shape of the shifted vector: %s and %s", type_str(lt),
+                           type_str(r));
         } else if (!(r->kind == TY_INT && !r->is_signed) && r->kind != TY_INVALID &&
                    !(r->kind == TY_PARAM && type_satisfies(r, C_UNSIGNED)))
             diag_error(s->e2->span, "E0525", "shift count must be an unsigned integer, found %s", type_str(r));
-        if (lt->kind != TY_INT && !ty_is_vec_int(lt) && !(lt->kind == TY_PARAM && type_satisfies(lt, C_INT)))
-            diag_error(s->span, "E0513", "shift requires an integer operand, found %s", type_str(lt));
+        if (lt->kind != TY_INT && !ty_is_vec_int(lt) && lt->kind != TY_INVALID &&
+            !(lt->kind == TY_PARAM && (type_satisfies(lt, C_INT) || type_satisfies(lt, C_INT_VEC)))) {
+            if (lt->kind == TY_PARAM)
+                diag_error(s->span, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)",
+                           tok_kind_name((TokKind)op), lt->name, param_constraint_str(lt));
+            else
+                diag_error(s->span, "E0513", "shift requires an integer operand, found %s", type_str(lt));
+        }
         s->e3->b = s->e2;
         return;
     }

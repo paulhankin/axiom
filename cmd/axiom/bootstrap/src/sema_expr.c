@@ -175,7 +175,7 @@ void coerce(Expr **pe, Type *target) {
         if (target->kind == TY_PARAM && !target->is_const) {
             if (!lit_ok_for_param(e, target))
                 diag_error(e->span, "E0461", "float literal is not allowed for a parameter constrained by %s",
-                           constraint_name(target->constraint));
+                           param_constraint_str(target));
             e->type = target;
             return;
         }
@@ -464,6 +464,19 @@ static bool is_shift_op(int op) { return op == TK_SHL || op == TK_SHR; }
 
 static bool param_has(Type *t, Constraint c) { return t->kind == TY_PARAM && type_satisfies(t, c); }
 
+static bool lane_is_signed(Type *lane) {
+    return lane && ((lane->kind == TY_INT && lane->is_signed) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_SIGNED)));
+}
+static bool lane_is_unsigned(Type *lane) {
+    return lane && ((lane->kind == TY_INT && !lane->is_signed) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_UNSIGNED)));
+}
+static bool lane_is_non8bit(Type *lane) {
+    return lane && (lane->kind == TY_FLOAT || (lane->kind == TY_INT && lane->bits != 8) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_FLOAT)));
+}
+
 // Validate that arithmetic/bitwise operator `op` applies to operand type t.
 static bool check_arith_op(int op, Type *t, Span sp) {
     if (t->kind == TY_INVALID || t->kind == TY_NEVER) return true;
@@ -471,15 +484,26 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     switch (op) {
     case TK_PLUS:
     case TK_MINUS:
+        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || ty_is_vec_int(t) ||
+            param_has(t, C_NUM) || param_has(t, C_VEC))
+            return true;
+        break;
     case TK_STAR:
+        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM) || param_has(t, C_FLOAT_VEC))
+            return true;
+        if (param_has(t, C_INT_VEC) && lane_is_non8bit(t->constraint_lane)) return true;
+        if (ty_is_vec_int(t)) {
+            // lane-wise and wrapping, in every overflow mode (§13.1)
+            if (t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
+            else return true;
+            return false;
+        }
+        break;
     case TK_SLASH:
         if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM) || param_has(t, C_FLOAT_VEC))
             return true;
         if (ty_is_vec_int(t)) {
-            // lane-wise and wrapping, in every overflow mode (§13.1)
-            if (op == TK_SLASH) diag_error(sp, "E0811", "integer vectors do not support '/'");
-            else if (op == TK_STAR && t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
-            else return true;
+            diag_error(sp, "E0811", "integer vectors do not support '/'");
             return false;
         }
         break;
@@ -492,10 +516,15 @@ static bool check_arith_op(int op, Type *t, Span sp) {
         break;
     case TK_PLUS_PCT:
     case TK_MINUS_PCT:
+        if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || ty_is_vec_int(t) || param_has(t, C_INT) ||
+            param_has(t, C_INT_VEC))
+            return true;
+        break;
     case TK_STAR_PCT:
         if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || param_has(t, C_INT)) return true;
+        if (param_has(t, C_INT_VEC) && lane_is_non8bit(t->constraint_lane)) return true;
         if (ty_is_vec_int(t)) {
-            if (op == TK_STAR_PCT && t->elem->bits == 8) {
+            if (t->elem->bits == 8) {
                 diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
                 return false;
             }
@@ -506,13 +535,13 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     case TK_PIPE:
     case TK_CARET:
         if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || ty_is_vec_int(t) || t->kind == TY_V128 ||
-            param_has(t, C_INT))
+            param_has(t, C_INT) || param_has(t, C_INT_VEC))
             return true;
         break;
     }
     if (t->kind == TY_PARAM)
         diag_error(sp, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)", opn, t->name,
-                   constraint_name(t->constraint));
+                   param_constraint_str(t));
     else
         diag_error(sp, "E0513", "operator '%s' cannot be applied to %s", opn, type_str(t));
     return false;
@@ -525,7 +554,7 @@ static bool check_cmp_op(int op, Type *t, Span sp) {
     if (t->kind == TY_PARAM) {
         if (type_satisfies(t, eq ? C_EQ : C_ORD)) return true;
         diag_error(sp, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)", tok_kind_name((TokKind)op),
-                   t->name, constraint_name(t->constraint));
+                   t->name, param_constraint_str(t));
         return false;
     }
     if (eq && (t->kind == TY_BOOL || t->kind == TY_PTR || t->kind == TY_ERROR || t->kind == TY_FN || t->kind == TY_ENUM))
@@ -552,7 +581,8 @@ static bool check_shift_count(Expr **pb) {
     if (r->kind == TY_INVALID) return true;
     if ((r->kind == TY_INT && !r->is_signed) || param_has(r, C_UNSIGNED)) return true;
     if (ty_is_vec_int(r) && !r->elem->is_signed) return true;  // per lane (spec §13.1)
-    if (r->kind == TY_INT || param_has(r, C_SIGNED) || ty_is_vec_int(r)) {
+    if (param_has(r, C_INT_VEC) && lane_is_unsigned(r->constraint_lane)) return true;
+    if (r->kind == TY_INT || param_has(r, C_INT) || ty_is_vec_int(r) || param_has(r, C_INT_VEC)) {
         Diag *d = diag_error((*pb)->span, "E0525", "shift count must be unsigned, found %s", type_str(r));
         (void)d;
         return false;
@@ -590,16 +620,26 @@ static Type *check_binary(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
-        if (l->kind != TY_INT && !ty_is_vec_int(l) && !param_has(l, C_INT) && l->kind != TY_INVALID) {
-            diag_error(e->a->span, "E0513", "shift requires an integer operand, found %s", type_str(l));
+        if (l->kind != TY_INT && !ty_is_vec_int(l) && !param_has(l, C_INT) && !param_has(l, C_INT_VEC) &&
+            l->kind != TY_INVALID) {
+            if (l->kind == TY_PARAM)
+                diag_error(e->a->span, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)",
+                           tok_kind_name((TokKind)op), l->name, param_constraint_str(l));
+            else
+                diag_error(e->a->span, "E0513", "shift requires an integer operand, found %s", type_str(l));
             return e->type = t_invalid;
         }
         Type *k = e->b->type;
-        if (ok && ty_is_vec_int(k) && l->kind != TY_INVALID &&
-            !(ty_is_vec_int(l) && l->lanes == k->lanes && l->elem->bits == k->elem->bits)) {
-            diag_error(e->b->span, "E0412", "per-lane shift counts must have the shape of the shifted vector: %s and %s",
-                       type_str(l), type_str(k));
-            return e->type = t_invalid;
+        if (ok && (ty_is_vec_int(k) || param_has(k, C_INT_VEC)) && l->kind != TY_INVALID) {
+            bool shape_ok =
+                (ty_is_vec_int(l) && ty_is_vec_int(k) && l->lanes == k->lanes && l->elem->bits == k->elem->bits) ||
+                (param_has(k, C_INT_VEC) && k == l);
+            if (!shape_ok) {
+                diag_error(e->b->span, "E0412",
+                           "per-lane shift counts must have the shape of the shifted vector: %s and %s", type_str(l),
+                           type_str(k));
+                return e->type = t_invalid;
+            }
         }
         if (ok && e->a->is_const && e->b->is_const && l->kind == TY_INT) {
             i128 r;
@@ -750,7 +790,8 @@ static Type *check_unary(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if ((t->kind == TY_INT) || t->kind == TY_FLOAT || ty_is_vec_float(t) || param_has(t, C_SIGNED) ||
-            param_has(t, C_FLOAT) || param_has(t, C_FLOAT_VEC) || t->kind == TY_INVALID) {
+            param_has(t, C_FLOAT) || param_has(t, C_FLOAT_VEC) ||
+            (param_has(t, C_INT_VEC) && lane_is_signed(t->constraint_lane)) || t->kind == TY_INVALID) {
             if (e->a->is_const && t->kind == TY_INT) {
                 if (!fits_type(-e->a->cval, t)) diag_error(e->span, "E0530", "overflow in constant expression");
                 e->cval = -e->a->cval;
@@ -762,7 +803,11 @@ static Type *check_unary(Expr *e, Type *expected) {
             return e->type = t;
         }
         if (ty_is_vec_int(t)) return e->type = t;  // lane-wise, wrapping (§13.1)
-        diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
+        if (t->kind == TY_PARAM)
+            diag_error(e->span, "E0461", "operator '-' is not permitted on '%s' (constraint %s)", t->name,
+                       param_constraint_str(t));
+        else
+            diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
         return e->type = t_invalid;
     }
     case TK_MINUS_PCT:
@@ -778,10 +823,15 @@ static Type *check_unary(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
-        bool ok = t->kind == TY_INT || ty_is_vec_int(t) || param_has(t, C_INT) || t->kind == TY_INVALID ||
-                  (op == TK_TILDE && t->kind == TY_V128);
+        bool ok = t->kind == TY_INT || ty_is_vec_int(t) || param_has(t, C_INT) || param_has(t, C_INT_VEC) ||
+                  t->kind == TY_INVALID || (op == TK_TILDE && t->kind == TY_V128);
         if (!ok) {
-            diag_error(e->span, "E0513", "operator '%s' cannot be applied to %s", tok_kind_name((TokKind)op), type_str(t));
+            if (t->kind == TY_PARAM)
+                diag_error(e->span, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)",
+                           tok_kind_name((TokKind)op), t->name, param_constraint_str(t));
+            else
+                diag_error(e->span, "E0513", "operator '%s' cannot be applied to %s", tok_kind_name((TokKind)op),
+                           type_str(t));
             return e->type = t_invalid;
         }
         if (e->a->is_const && t->kind == TY_INT) {
@@ -1027,26 +1077,12 @@ static Type *check_field(Expr *e) {
 // ---------------------------------------------------------------------------
 // Generic application  x.[args]
 // ---------------------------------------------------------------------------
-static Type *resolve_garg(TypeExpr *te) {
-    if (te->kind == TE_INTLIT) return type_constint((int64_t)te->ival);
-    if (te->kind == TE_NAMED && !te->has_args && !te->qual) {
-        Type *gp = lookup_gparam(&C->tc, te->name);
-        if (gp) return gp;
-        Decl *d = module_lookup(C->tc.mod, te->name);
-        if (d && d->kind == D_CONST) {
-            resolve_decl(d);
-            if (d->cexpr && d->cexpr->is_const && d->type->kind == TY_INT) return type_constint((int64_t)d->cexpr->cval);
-        }
-    }
-    return resolve_type(te, &C->tc);
-}
-
 static Type *check_apply(Expr *e) {
     Expr *a = e->a;
     check_operand(a, NULL);
     int n = e->targs.len;
     Type **args = NEWN(Type *, n + 1);
-    for (int i = 0; i < n; i++) args[i] = resolve_garg(e->targs.data[i]);
+    for (int i = 0; i < n; i++) args[i] = resolve_generic_arg(e->targs.data[i], &C->tc);
     if (a->cat == CAT_GENERIC) {
         Decl *d = a->decl;
         if (!check_generic_args(d, args, n, e->span, &e->targs)) {
@@ -1073,13 +1109,13 @@ static Type *check_apply(Expr *e) {
         if (a->ngargs != fn->nall_gparams - fn->gparams.len) {
             diag_error(e->span, "E0469", "generic arguments were already given");
         }
-        check_generic_args(fn, args, n, e->span, &e->targs);
         int nowner = fn->nall_gparams - fn->gparams.len;
+        check_generic_args_ctx(fn, a->gargs, a->ngargs < nowner ? a->ngargs : nowner, args, n, e->span, &e->targs);
         e->cat = a->cat;
         e->decl = fn;
         e->ngargs = fn->nall_gparams;
         e->gargs = NEWN(Type *, fn->nall_gparams + 1);
-        for (int i = 0; i < nowner; i++) e->gargs[i] = a->gargs[i];
+        for (int i = 0; i < nowner; i++) e->gargs[i] = i < a->ngargs ? a->gargs[i] : t_invalid;
         for (int i = 0; i < fn->gparams.len; i++) e->gargs[nowner + i] = i < n ? args[i] : t_invalid;
         e->b = a->b;
         e->self_mode = a->self_mode;
@@ -1107,9 +1143,14 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
             if (vars[i] != pat) continue;
             if (!sol[i]) {
                 sol[i] = act;
-                return true;
+            } else if (sol[i] != act) {
+                return false;
             }
-            return sol[i] == act;
+            break;
+        }
+        if (pat->constraint_lane) {
+            Type *alane = act->kind == TY_VEC ? act->elem : (act->kind == TY_PARAM ? act->constraint_lane : NULL);
+            if (alane) return unify(pat->constraint_lane, alane, vars, sol, nv);
         }
         return true;
     case TY_PTR:
@@ -1138,6 +1179,11 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
     case TY_STRUCT:
     case TY_UNION:
         if (act->decl != pat->decl) return true;
+        for (int i = 0; i < pat->nargs; i++)
+            if (!unify(pat->args[i], act->args[i], vars, sol, nv)) return false;
+        return true;
+    case TY_CONSTFN:
+        if (act->kind != TY_CONSTFN || act->decl != pat->decl || act->nargs != pat->nargs) return true;
         for (int i = 0; i < pat->nargs; i++)
             if (!unify(pat->args[i], act->args[i], vars, sol, nv)) return false;
         return true;
@@ -1281,7 +1327,7 @@ static Type *check_call(Expr *e, Type *expected) {
                 }
             }
             for (int k = 0; k < nown; k++) gargs[nowner + k] = sol[k] ? sol[k] : t_invalid;
-            if (ok) check_generic_args(fn, gargs + nowner, nown, e->span, NULL);
+            if (ok) check_generic_args_ctx(fn, gargs, nowner, gargs + nowner, nown, e->span, NULL);
         }
         // phase 3: coerce args
         for (int i = 0; i < nargs; i++) {

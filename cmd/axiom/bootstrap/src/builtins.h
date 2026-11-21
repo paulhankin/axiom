@@ -56,6 +56,7 @@
     X(COPYSIGN, "copysign", "ee")             \
     X(SPLAT, "splat", "e")                    \
     X(VEC, "vec", "t*")                       \
+    X(LANES, "lanes", "t")                    \
     X(EXTRACT_LANE, "extract_lane", "ee")     \
     X(REPLACE_LANE, "replace_lane", "eee")    \
     X(LOAD, "load", "te")                     \
