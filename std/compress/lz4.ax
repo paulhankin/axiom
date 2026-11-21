@@ -81,7 +81,7 @@ fn decode_block(src: []u8, out: *mut strs.String, base: usize, max_size: usize) 
         if lit > (src.len - i) {
             return error.Corrupt;
         }
-        if (out.len + lit) > max_size {
+        if (out.len() + lit) > max_size {
             return error.TooLarge;
         }
         out.push_str(src[i..i + lit])!;
@@ -95,7 +95,7 @@ fn decode_block(src: []u8, out: *mut strs.String, base: usize, max_size: usize) 
         }
         let off = @as(usize, src[i]) | (@as(usize, src[i + 1]) << 8);
         i += 2;
-        if (off == 0) or (off > (out.len - base)) {
+        if (off == 0) or (off > (out.len() - base)) {
             return error.Corrupt;
         }
         let mut ml = @as(usize, token & 15) + MIN_MATCH;
@@ -115,23 +115,21 @@ fn decode_block(src: []u8, out: *mut strs.String, base: usize, max_size: usize) 
                 }
             }
         }
-        if (out.len + ml) > max_size {
+        if (out.len() + ml) > max_size {
             return error.TooLarge;
         }
-        out.reserve(ml)!;
-        let buf = out.buf;
-        let mut at = out.len;
-        let mut from = at - off;
+        let start = out.len();
+        _ = out.grow_zero(ml)!;
+        let buf = out.bytes_mut();
+        let mut from = start - off;
         if off >= ml {
-            @mem_copy(buf[at..at + ml], buf[from..from + ml]);
+            @mem_copy(buf[start..start + ml], buf[from..from + ml]);
         } else {
-            for _k in @as(usize, 0)..ml {
+            for at in start..start + ml {
                 buf[at] = buf[from];
-                at += 1;
                 from += 1;
             }
         }
-        out.len += ml;
     }
 }
 
@@ -319,7 +317,7 @@ fn legacy(data: []u8, at: usize, out: *mut strs.String, max_size: usize) Lz4Erro
         // legacy blocks are independent
         let mut blk = strs.String.init();
         defer blk.deinit();
-        decompress_block(data[i + 4..i + 4 + n], &mut blk, @min(max_size - out.len, 8 << 20))!;
+        decompress_block(data[i + 4..i + 4 + n], &mut blk, @min(max_size - out.len(), 8 << 20))!;
         out.push_str(blk.bytes())!;
         i += 4 + n;
     }
@@ -370,7 +368,7 @@ fn frame(data: []u8, at: usize, out: *mut strs.String, max_size: usize) Lz4Error
         }
     }
     i += hlen + 1;
-    let start = out.len;
+    let start = out.len();
     let mut blk = strs.String.init();
     defer blk.deinit();
     loop {
@@ -399,24 +397,24 @@ fn frame(data: []u8, at: usize, out: *mut strs.String, max_size: usize) Lz4Error
             i += 4;
         }
         if stored {
-            if (out.len + n) > max_size {
+            if (out.len() + n) > max_size {
                 return error.TooLarge;
             }
             out.push_str(b)!;
         } else if linked {
             // matches may reach into earlier blocks of the frame
-            let before = out.len;
+            let before = out.len();
             decode_block(b, out, start, @min(max_size, before + max_block))!;
-            if (out.len - before) > max_block {
+            if (out.len() - before) > max_block {
                 return error.Corrupt;
             }
         } else {
             blk.clear();
-            decompress_block(b, &mut blk, @min(max_size - out.len, max_block))!;
+            decompress_block(b, &mut blk, @min(max_size - out.len(), max_block))!;
             out.push_str(blk.bytes())!;
         }
     }
-    if has_size and (@as(u64, out.len - start) != content_size) {
+    if has_size and (@as(u64, out.len() - start) != content_size) {
         return error.Corrupt;
     }
     if content_sum {
@@ -497,13 +495,13 @@ pub fn compress_to(w: io.Writer, data: []u8, o: Options) !void {
         blk.clear();
         put32(&mut blk, 0)!;
         compress_block(chunk, &mut blk, o.level)!;
-        let mut word = @truncate(u32, blk.len - 4);
-        if (blk.len - 4) >= chunk.len {
+        let mut word = @truncate(u32, blk.len() - 4);
+        if (blk.len() - 4) >= chunk.len {
             blk.truncate(4);  // stored: compression did not help
             blk.push_str(chunk)!;
             word = @truncate(u32, chunk.len) | 0x80000000;
         }
-        let b = blk.bytes();
+        let b = blk.bytes_mut();
         b[0] = @truncate(u8, word);
         b[1] = @truncate(u8, word >> 8);
         b[2] = @truncate(u8, word >> 16);
@@ -610,13 +608,13 @@ test "damaged input" {
     let mut b = strs.String.from(c)!;
     defer b.deinit();
     for k in @as(usize, 0)..(c.len * 8) {
-        b.bytes()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
+        b.bytes_mut()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
         let r = decompress(b.bytes(), 1000) catch {
-            b.bytes()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
+            b.bytes_mut()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
             continue;
         };
         mem.free(r);
-        b.bytes()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
+        b.bytes_mut()[k / 8] ^= @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
     }
     // raw blocks: offsets before the start, and lengths past the end
     let mut out = strs.String.init();

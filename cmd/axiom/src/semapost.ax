@@ -127,7 +127,7 @@ fn tri(c: bool) i32 {
 // `feats`: 1 true, 0 false, -1 not a target condition. Target conditions
 // are @target_has, @target_arch, @target_os, @cpu_has of an extension the
 // code may use (true), true and false, combined with not, and, or.
-pub fn target_cond(e: *ast.Expr, feats: u64) i32 {
+pub fn target_cond(e: *mut ast.Expr, feats: u64) i32 {
     if e.kind == ast.E_BOOL {
         return tri(e.bval);
     }
@@ -277,7 +277,15 @@ fn need_text(nd: Need, feats: u64) []u8 {
     return u.f1("the extensions %s", tg.features_string(nd.feats & ~feats));
 }
 
-fn gate_expr(e: *ast.Expr, feats: u64) void {
+fn safe_b(e: *mut ast.Expr) *mut ast.Expr {
+    if (e.kind == ast.E_ARRAY_REPEAT) or (e.kind == ast.E_BINARY) or (e.kind == ast.E_FIELD) or
+       (e.kind == ast.E_CALL) or (e.kind == ast.E_INDEX) or (e.kind == ast.E_SLICE) or u.notnil(e.more) {
+        return ast.b_of(e);
+    }
+    return u.nil.[ast.Expr]();
+}
+
+fn gate_expr(e: *mut ast.Expr, feats: u64) void {
     if u.isnil(e) {
         return;
     }
@@ -298,8 +306,10 @@ fn gate_expr(e: *ast.Expr, feats: u64) void {
                         "use it under `if @target_has(...)` or `if @target_arch(...)`, or in a function declared with @features or @multiversion");
             }
         }
-        for i in 0..ast.more(e).bargs.len {
-            gate_expr(ast.more(e).bargs.at(i).e, feats);
+        if u.notnil(e.more) {
+            for i in 0..e.more.bargs.len {
+                gate_expr(e.more.bargs.at_mut(i).e, feats);
+            }
         }
         return;
     }
@@ -307,16 +317,20 @@ fn gate_expr(e: *ast.Expr, feats: u64) void {
     // A method callee keeps its receiver in b as well as in a, and the call (or
     // generic application) over it copies that b; walking those again would visit
     // a receiver chain exponentially often.
-    let b = ast.b_of(e);
-    if (b != e.a) and (u.isnil(e.a) or (b != ast.b_of(e.a))) {
+    let b = safe_b(e);
+    if u.notnil(b) and (b != e.a) and (u.isnil(e.a) or (b != safe_b(e.a))) {
         gate_expr(b, feats);
     }
-    gate_expr(ast.c_of(e), feats);
+    if (e.kind == ast.E_SLICE) or u.notnil(e.more) {
+        gate_expr(ast.c_of(e), feats);
+    }
     for i in 0..ast.args_of(e).len {
         gate_expr(ast.args_of(e).get(i), feats);
     }
-    for i in 0..ast.more(e).inits.len {
-        gate_expr(ast.more(e).inits.at(i).value, feats);
+    if u.notnil(e.more) {
+        for i in 0..e.more.inits.len {
+            gate_expr(e.more.inits.at_mut(i).value, feats);
+        }
     }
     if (e.kind == ast.E_CATCH) or (e.kind == ast.E_ORELSE) {
         gate_expr(ast.handler_expr(e), feats);
@@ -324,7 +338,7 @@ fn gate_expr(e: *ast.Expr, feats: u64) void {
     }
 }
 
-fn gate_stmt(s: *ast.Stmt, feats: u64) void {
+fn gate_stmt(s: *mut ast.Stmt, feats: u64) void {
     if u.isnil(s) {
         return;
     }
@@ -341,24 +355,28 @@ fn gate_stmt(s: *ast.Stmt, feats: u64) void {
     }
     gate_expr(s.e, feats);
     gate_expr(s.e2, feats);
-    gate_expr(ast.stmt_more(s).e3, feats);
+    if u.notnil(s.more) {
+        gate_expr(s.more.e3, feats);
+    }
     gate_stmt(s.body, feats);
     gate_stmt(s.els, feats);
     for i in 0..s.stmts.len {
         gate_stmt(s.stmts.get(i), feats);
     }
-    for i in 0..ast.stmt_more(s).arms.len {
-        if ast.stmt_more(s).arms.at(i).alt {
-            continue;
+    if u.notnil(s.more) {
+        for i in 0..s.more.arms.len {
+            if s.more.arms.at(i).alt {
+                continue;
+            }
+            gate_stmt(s.more.arms.at_mut(i).body, feats);
         }
-        gate_stmt(ast.stmt_more(s).arms.at(i).body, feats);
     }
 }
 
 // Each version of a function may use only the builtins its extensions
 // allow (in the code it compiles: a branch a target condition rules out
 // is not compiled).
-pub fn gate_fn(f: *ast.Decl) void {
+pub fn gate_fn(f: *mut ast.Decl) void {
     if u.isnil(f.body) {
         return;
     }

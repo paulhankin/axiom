@@ -2,10 +2,13 @@
 // std/collections/map.ax - hash maps: Swiss tables (open addressing over groups of 16
 // slots, each slot with a control byte).
 //
-// Axiom has no traits, so a map is given its hash and equality functions
-// when it is created:
+// `Map[K, V, HASH, EQ]` takes its hash and equality functions as `const`
+// generic arguments so every probe, insert and rehash calls them directly:
 //
-//     let mut m = map.Map.[u64, u32].init(hash.hash_u64, hash.eq_u64);
+//     let mut m = map.Map.[u64, u32, hash.hash_u64, hash.eq_u64].init();
+//
+// `MapDyn[K, V]` takes `hash_fn` and `eq_fn` at run time when they are not
+// statically known.
 //
 // Keys and values are stored by value. For []u8 keys only the slice is
 // stored, not the bytes it points to: keep the bytes alive for as long as the map.
@@ -31,19 +34,166 @@ fn tag(h: u64) u8 {
     return @truncate(u8, h >> 57);
 }
 
-pub struct Map[K, V] {
+struct DynFns[K] {
     hash_fn: fn(K) u64,
     eq_fn: fn(K, K) bool,
+}
+
+inline fn call_hash[K, const HASH: fn(K) u64](_c: u8, k: K) u64 {
+    return HASH(k);
+}
+
+inline fn call_eq[K, const EQ: fn(K, K) bool](_c: u8, a: K, b: K) bool {
+    return EQ(a, b);
+}
+
+inline fn dyn_hash[K](d: DynFns.[K], k: K) u64 {
+    return d.hash_fn(k);
+}
+
+inline fn dyn_eq[K](d: DynFns.[K], a: K, b: K) bool {
+    return d.eq_fn(a, b);
+}
+
+fn free_buckets[K, V](keys: []mut K, vals: []mut V, ctrl: []mut u8) void {
+    if ctrl.len > 0 {
+        mem.free(keys);
+        mem.free(vals);
+        mem.free(ctrl);
+    }
+}
+
+// The slot holding k (hash h), or NONE.
+fn slot_of_impl[K, C, const EQ: fn(C, K, K) bool](keys: []K, ctrl: []u8, count: usize, k: K, h: u64, ctx: C) usize {
+    if count == 0 {
+        return NONE;
+    }
+    let gmask = (ctrl.len / GROUP) - 1;
+    let t: u8x16 = @splat(tag(h));
+    let e: u8x16 = @splat(EMPTY);
+    let mut g = @truncate(usize, h) & gmask;
+    let mut step: usize = 0;
+    loop {
+        let base = g *% GROUP;  // (g is masked: no overflow)
+        let c = @load(u8x16, ctrl[base..base + GROUP]);
+        let mut m = @bitmask(@lanes_eq(c, t));
+        let empty = @bitmask(@lanes_eq(c, e));  // (no vector lives across the calls)
+        while m != 0 {
+            let i = base + @as(usize, @ctz(m));
+            if EQ(ctx, keys[i], k) {
+                return i;
+            }
+            m = m & (m -% 1);
+        }
+        if empty != 0 {
+            return NONE;
+        }
+        step +%= 1;
+        g = (g +% step) & gmask;
+    }
+}
+
+// A slot for a new key of hash h: the first EMPTY or DELETED slot on its
+// probe sequence (there is one: the table is never full).
+fn free_slot_ctrl(ctrl: []u8, h: u64) usize {
+    let gmask = (ctrl.len / GROUP) - 1;
+    let mut g = @truncate(usize, h) & gmask;
+    let mut step: usize = 0;
+    loop {
+        let base = g *% GROUP;
+        // EMPTY and DELETED have the high bit set, tags do not
+        let m = @bitmask(@load(u8x16, ctrl[base..base + GROUP]));
+        if m != 0 {
+            return base + @as(usize, @ctz(m));
+        }
+        step +%= 1;
+        g = (g +% step) & gmask;
+    }
+}
+
+// Rehash into a table of `cap` slots (a power of two >= GROUP, > count).
+fn rehash_impl[K, V, C, const HASH: fn(C, K) u64](keys: *mut []mut K, vals: *mut []mut V, ctrl: *mut []mut u8,
+                                                  count: usize, used: *mut usize, cap: usize, ctx: C) MapError!void {
+    let nk = mem.alloc.[K](cap)!;
+    let nv = mem.alloc.[V](cap) catch |e| {
+        mem.free(nk);
+        return e;
+    };
+    let nc = mem.alloc.[u8](cap) catch |e| {
+        mem.free(nk);
+        mem.free(nv);
+        return e;
+    };
+    @mem_set(nc, EMPTY);
+    let ok = keys.*;
+    let ov = vals.*;
+    let oc = ctrl.*;
+    keys.* = nk;
+    vals.* = nv;
+    ctrl.* = nc;
+    for i in 0..oc.len {
+        if oc[i] < 0x80 {
+            let h = HASH(ctx, ok[i]);
+            let j = free_slot_ctrl(nc, h);
+            nk[j] = ok[i];
+            nv[j] = ov[i];
+            nc[j] = tag(h);
+        }
+    }
+    free_buckets.[K, V](ok, ov, oc);
+    used.* = count;
+}
+
+fn put_impl[K, V, C, const HASH: fn(C, K) u64, const EQ: fn(C, K, K) bool](
+    keys: *mut []mut K, vals: *mut []mut V, ctrl: *mut []mut u8, count: *mut usize, used: *mut usize, k: K, v: V,
+    ctx: C) MapError!void {
+    let h = HASH(ctx, k);
+    let i = slot_of_impl.[K, C, EQ](keys.*, ctrl.*, count.*, k, h, ctx);
+    if i != NONE {
+        vals.*[i] = v;
+        return;
+    }
+    // at most 7/8 full (DELETED slots count: they lengthen searches)
+    if ((used.* + 1) * 8) > (ctrl.*.len * 7) {
+        let mut cap = @max(ctrl.*.len, GROUP);
+        if ((count.* + 1) * 2) > cap {
+            cap = @mul_checked(cap, 2) catch return error.OutOfMemory;
+        }
+        rehash_impl.[K, V, C, HASH](keys, vals, ctrl, count.*, used, cap, ctx)!;
+    }
+    let j = free_slot_ctrl(ctrl.*, h);
+    if ctrl.*[j] == EMPTY {
+        used.* += 1;
+    }
+    keys.*[j] = k;
+    vals.*[j] = v;
+    ctrl.*[j] = tag(h);
+    count.* += 1;
+}
+
+fn erase_slot(ctrl: []mut u8, i: usize, count: *mut usize, used: *mut usize) void {
+    // a group with an EMPTY slot ends every search that reaches it, so
+    // the slot can be EMPTY again; else searches must go on past it
+    let base = i & ~(GROUP - 1);
+    let e: u8x16 = @splat(EMPTY);
+    if @bitmask(@lanes_eq(@load(u8x16, ctrl[base..base + GROUP]), e)) != 0 {
+        ctrl[i] = EMPTY;
+        used.* -= 1;
+    } else {
+        ctrl[i] = DELETED;
+    }
+    count.* -= 1;
+}
+
+pub struct Map[K, V, const HASH: fn(K) u64, const EQ: fn(K, K) bool] {
     keys: []mut K,
     vals: []mut V,
     ctrl: []mut u8,  // capacity == ctrl.len: 0, or a power of two >= GROUP
     count: usize,    // full slots
     used: usize,     // full and DELETED slots
 
-    pub fn init(hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
+    pub fn init() Self {
         return Self.{
-            hash_fn: hash_fn,
-            eq_fn: eq_fn,
             keys: [],
             vals: [],
             ctrl: [],
@@ -53,11 +203,7 @@ pub struct Map[K, V] {
     }
 
     pub fn deinit(self: *mut Self) void {
-        if self.ctrl.len > 0 {
-            mem.free(self.keys);
-            mem.free(self.vals);
-            mem.free(self.ctrl);
-        }
+        free_buckets.[K, V](self.keys, self.vals, self.ctrl);
         self.keys = [];
         self.vals = [];
         self.ctrl = [];
@@ -73,122 +219,18 @@ pub struct Map[K, V] {
         return self.ctrl.len;
     }
 
-    // The slot holding k (hash h), or NONE.
-    fn slot_of(self: *Self, k: K, h: u64) usize {
-        if self.count == 0 {
-            return NONE;
-        }
-        let gmask = (self.ctrl.len / GROUP) - 1;
-        let t: u8x16 = @splat(tag(h));
-        let e: u8x16 = @splat(EMPTY);
-        let mut g = @truncate(usize, h) & gmask;
-        let mut step: usize = 0;
-        loop {
-            let base = g *% GROUP;  // (g is masked: no overflow)
-            let c = @load(u8x16, self.ctrl[base..base + GROUP]);
-            let mut m = @bitmask(@lanes_eq(c, t));
-            let empty = @bitmask(@lanes_eq(c, e));  // (no vector lives across the calls)
-            while m != 0 {
-                let i = base + @as(usize, @ctz(m));
-                if self.eq_fn(self.keys[i], k) {
-                    return i;
-                }
-                m = m & (m -% 1);
-            }
-            if empty != 0 {
-                return NONE;
-            }
-            step +%= 1;
-            g = (g +% step) & gmask;
-        }
-    }
-
     fn find(self: *Self, k: K) MapError!usize {
-        let i = self.slot_of(k, self.hash_fn(k));
+        let i = slot_of_impl.[K, u8, call_eq.[K, EQ]](self.keys, self.ctrl, self.count, k, HASH(k), 0);
         if i == NONE {
             return error.NotFound;
         }
         return i;
     }
 
-    // A slot for a new key of hash h: the first EMPTY or DELETED slot on its
-    // probe sequence (there is one: the table is never full).
-    fn free_slot(self: *Self, h: u64) usize {
-        let gmask = (self.ctrl.len / GROUP) - 1;
-        let mut g = @truncate(usize, h) & gmask;
-        let mut step: usize = 0;
-        loop {
-            let base = g *% GROUP;
-            // EMPTY and DELETED have the high bit set, tags do not
-            let m = @bitmask(@load(u8x16, self.ctrl[base..base + GROUP]));
-            if m != 0 {
-                return base + @as(usize, @ctz(m));
-            }
-            step +%= 1;
-            g = (g +% step) & gmask;
-        }
-    }
-
-    // Rehash into a table of `cap` slots (a power of two >= GROUP, > count).
-    fn rehash(self: *mut Self, cap: usize) MapError!void {
-        let nk = mem.alloc.[K](cap)!;
-        let nv = mem.alloc.[V](cap) catch |e| {
-            mem.free(nk);
-            return e;
-        };
-        let nc = mem.alloc.[u8](cap) catch |e| {
-            mem.free(nk);
-            mem.free(nv);
-            return e;
-        };
-        @mem_set(nc, EMPTY);
-        let ok = self.keys;
-        let ov = self.vals;
-        let oc = self.ctrl;
-        self.keys = nk;
-        self.vals = nv;
-        self.ctrl = nc;
-        for i in 0..oc.len {
-            if oc[i] < 0x80 {
-                let h = self.hash_fn(ok[i]);
-                let j = self.free_slot(h);
-                nk[j] = ok[i];
-                nv[j] = ov[i];
-                nc[j] = tag(h);
-            }
-        }
-        if oc.len > 0 {
-            mem.free(ok);
-            mem.free(ov);
-            mem.free(oc);
-        }
-        self.used = self.count;
-    }
-
     /// Inserts or replaces the value for `k`.
     pub fn put(self: *mut Self, k: K, v: V) MapError!void {
-        let h = self.hash_fn(k);
-        let i = self.slot_of(k, h);
-        if i != NONE {
-            self.vals[i] = v;
-            return;
-        }
-        // at most 7/8 full (DELETED slots count: they lengthen searches)
-        if ((self.used + 1) * 8) > (self.ctrl.len * 7) {
-            let mut cap = @max(self.ctrl.len, GROUP);
-            if ((self.count + 1) * 2) > cap {
-                cap = @mul_checked(cap, 2) catch return error.OutOfMemory;
-            }
-            self.rehash(cap)!;
-        }
-        let j = self.free_slot(h);
-        if self.ctrl[j] == EMPTY {
-            self.used += 1;
-        }
-        self.keys[j] = k;
-        self.vals[j] = v;
-        self.ctrl[j] = tag(h);
-        self.count += 1;
+        put_impl.[K, V, u8, call_hash.[K, HASH], call_eq.[K, EQ]](&mut self.keys, &mut self.vals, &mut self.ctrl,
+                                                                  &mut self.count, &mut self.used, k, v, 0)!;
     }
 
     pub fn get(self: *Self, k: K) MapError!V {
@@ -210,17 +252,7 @@ pub struct Map[K, V] {
     /// Removes `k`; returns whether it was present.
     pub fn remove(self: *mut Self, k: K) bool {
         let i = self.find(k) catch return false;
-        // a group with an EMPTY slot ends every search that reaches it, so
-        // the slot can be EMPTY again; else searches must go on past it
-        let base = i & ~(GROUP - 1);
-        let e: u8x16 = @splat(EMPTY);
-        if @bitmask(@lanes_eq(@load(u8x16, self.ctrl[base..base + GROUP]), e)) != 0 {
-            self.ctrl[i] = EMPTY;
-            self.used -= 1;
-        } else {
-            self.ctrl[i] = DELETED;
-        }
-        self.count -= 1;
+        erase_slot(self.ctrl, i, &mut self.count, &mut self.used);
         return true;
     }
 
@@ -233,27 +265,135 @@ pub struct Map[K, V] {
     /// Iterates over entries in unspecified order. Do not modify the map
     /// while iterating.
     pub fn iter(self: *Self) Iter.[K, V] {
-        return Iter.[K, V].{ map: self, i: 0 };
+        return Iter.[K, V].{ keys: self.keys, vals: self.vals, ctrl: self.ctrl, i: 0 };
+    }
+}
+
+/// A hash map whose hash and equality functions are chosen at run time.
+pub struct MapDyn[K, V] {
+    hash_fn: fn(K) u64,
+    eq_fn: fn(K, K) bool,
+    keys: []mut K,
+    vals: []mut V,
+    ctrl: []mut u8,  // capacity == ctrl.len: 0, or a power of two >= GROUP
+    count: usize,    // full slots
+    used: usize,     // full and DELETED slots
+
+    pub fn init(hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
+        return Self.{
+            hash_fn: hash_fn,
+            eq_fn: eq_fn,
+            keys: [],
+            vals: [],
+            ctrl: [],
+            count: 0,
+            used: 0,
+        };
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        free_buckets.[K, V](self.keys, self.vals, self.ctrl);
+        self.keys = [];
+        self.vals = [];
+        self.ctrl = [];
+        self.count = 0;
+        self.used = 0;
+    }
+
+    pub fn len(self: *Self) usize {
+        return self.count;
+    }
+
+    pub fn capacity(self: *Self) usize {
+        return self.ctrl.len;
+    }
+
+    fn fns(self: *Self) DynFns.[K] {
+        return DynFns.[K].{ hash_fn: self.hash_fn, eq_fn: self.eq_fn };
+    }
+
+    fn find(self: *Self, k: K) MapError!usize {
+        let i = slot_of_impl.[K, DynFns.[K], dyn_eq.[K]](self.keys, self.ctrl, self.count, k, self.hash_fn(k),
+                                                         self.fns());
+        if i == NONE {
+            return error.NotFound;
+        }
+        return i;
+    }
+
+    /// Inserts or replaces the value for `k`.
+    pub fn put(self: *mut Self, k: K, v: V) MapError!void {
+        put_impl.[K, V, DynFns.[K], dyn_hash.[K], dyn_eq.[K]](&mut self.keys, &mut self.vals, &mut self.ctrl,
+                                                              &mut self.count, &mut self.used, k, v, self.fns())!;
+    }
+
+    pub fn get(self: *Self, k: K) MapError!V {
+        let i = self.find(k)!;
+        return self.vals[i];
+    }
+
+    /// Pointer to the value for `k`; valid until the map is next modified.
+    pub fn get_ptr(self: *mut Self, k: K) MapError!*mut V {
+        let i = self.find(k)!;
+        return &mut self.vals[i];
+    }
+
+    pub fn contains(self: *Self, k: K) bool {
+        _ = self.find(k) catch return false;
+        return true;
+    }
+
+    /// Removes `k`; returns whether it was present.
+    pub fn remove(self: *mut Self, k: K) bool {
+        let i = self.find(k) catch return false;
+        erase_slot(self.ctrl, i, &mut self.count, &mut self.used);
+        return true;
+    }
+
+    pub fn clear(self: *mut Self) void {
+        @mem_set(self.ctrl, EMPTY);
+        self.count = 0;
+        self.used = 0;
+    }
+
+    /// Iterates over entries in unspecified order. Do not modify the map
+    /// while iterating.
+    pub fn iter(self: *Self) Iter.[K, V] {
+        return Iter.[K, V].{ keys: self.keys, vals: self.vals, ctrl: self.ctrl, i: 0 };
     }
 }
 
 pub struct Iter[K, V] {
-    map: *Map.[K, V],
+    keys: []K,
+    vals: []V,
+    ctrl: []u8,
     i: usize,
 
     /// Stores the next entry through `key` and `val` and returns true, or
     /// returns false when there are no more entries.
     pub fn next(self: *mut Self, key: *mut K, val: *mut V) bool {
-        while self.i < self.map.ctrl.len {
+        while self.i < self.ctrl.len {
             let j = self.i;
             self.i += 1;
-            if self.map.ctrl[j] < 0x80 {
-                key.* = self.map.keys[j];
-                val.* = self.map.vals[j];
+            if self.ctrl[j] < 0x80 {
+                key.* = self.keys[j];
+                val.* = self.vals[j];
                 return true;
             }
         }
         return false;
+    }
+
+    /// Returns a pointer to the next entry's key, or `.none` at the end.
+    pub fn next_key(self: *mut Self) ?*K {
+        while self.i < self.ctrl.len {
+            let j = self.i;
+            self.i += 1;
+            if self.ctrl[j] < 0x80 {
+                return .some(&self.keys[j]);
+            }
+        }
+        return .none;
     }
 }
 
@@ -264,7 +404,7 @@ pub struct Iter[K, V] {
 import "../hash.ax" as hash;
 
 test "put, get, overwrite, remove" {
-    let mut m = Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u64, hash.hash_u64, hash.eq_u64].init();
     defer m.deinit();
     for i in @as(u64, 0)..1000 {
         m.put(i, i * 2)!;
@@ -280,7 +420,7 @@ test "put, get, overwrite, remove" {
 }
 
 test "missing key is NotFound" {
-    let mut m = Map.[u32, u32].init(hash.hash_u32, hash.eq_u32);
+    let mut m = Map.[u32, u32, hash.hash_u32, hash.eq_u32].init();
     _ = m.get(7) catch |e| {
         @expect_eq(e, error.NotFound);
         return;
@@ -289,7 +429,7 @@ test "missing key is NotFound" {
 }
 
 test "tombstones are reused" {
-    let mut m = Map.[u64, u8].init(hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u8, hash.hash_u64, hash.eq_u64].init();
     defer m.deinit();
     for round in @as(u64, 0)..50 {
         for i in @as(u64, 0)..100 {
@@ -304,7 +444,7 @@ test "tombstones are reused" {
 }
 
 test "iteration visits every entry once" {
-    let mut m = Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    let mut m = Map.[[]u8, u32, hash.hash_bytes, hash.eq_bytes].init();
     defer m.deinit();
     m.put("a", 1)!;
     m.put("b", 2)!;
@@ -323,7 +463,7 @@ test "iteration visits every entry once" {
 }
 
 test "random operations agree with an array" {
-    let mut m = Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u64, hash.hash_u64, hash.eq_u64].init();
     defer m.deinit();
     let mut ref: [512]u64 = [0; 512];  // 0: absent, else value + 1
     let mut s: u64 = 0x9E3779B97F4A7C15;
@@ -364,7 +504,7 @@ fn same_hash(x: u64) u64 {
 }
 
 test "keys with the same hash probe past full groups" {
-    let mut m = Map.[u64, u64].init(same_hash, hash.eq_u64);
+    let mut m = Map.[u64, u64, same_hash, hash.eq_u64].init();
     defer m.deinit();
     for i in @as(u64, 0)..100 {
         m.put(i, i + 7)!;
@@ -381,4 +521,33 @@ test "keys with the same hash probe past full groups" {
     m.put(4, 1)!;
     @expect_eq(m.get(4)!, 1);
     @expect_eq(m.len(), 51);
+}
+
+test "MapDyn" {
+    let mut m = MapDyn.[u64, u64].init(same_hash, hash.eq_u64);
+    defer m.deinit();
+    for i in @as(u64, 0)..40 {
+        m.put(i, i * 3)!;
+    }
+    @expect_eq(m.len(), 40);
+    @expect_eq(m.get(12)!, 36);
+    (m.get_ptr(12)!).* = 99;
+    @expect_eq(m.get(12)!, 99);
+    @expect(m.remove(12));
+    @expect(not m.contains(12));
+    m.clear();
+    @expect_eq(m.len(), 0);
+
+    let mut ms = MapDyn.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    defer ms.deinit();
+    ms.put("x", 10)!;
+    ms.put("y", 20)!;
+    let mut it = ms.iter();
+    let mut k: []u8 = "";
+    let mut v: u32 = 0;
+    let mut sum: u32 = 0;
+    while it.next(&mut k, &mut v) {
+        sum += v;
+    }
+    @expect_eq(sum, 30);
 }

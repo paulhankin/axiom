@@ -128,7 +128,8 @@ i8x64  u8x64  i16x32  u16x32  i32x16  u32x16  i64x8  u64x8  f32x16  f64x8  v512
 ```
 
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
-`UnsignedInt`, `Float`, `FloatVector`. These may not be declared as identifiers.
+`UnsignedInt`, `Float`, `FloatVector`, `IntVector`, `Vector`. These may not be declared as
+identifiers.
 
 **Reserved for future use:** `async`, `await`, `comptime`, `impl`, `interface`,
 `null`, `trait`, `type`, `unsafe`, `yield`.
@@ -231,7 +232,7 @@ GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ```ebnf
 StructDecl    ::= "struct" IDENT GenericParams? "{" FieldList? MethodDecl* "}"
 FieldList     ::= Field ( "," Field )* ","?
-Field         ::= IDENT ":" Type
+Field         ::= "pub"? IDENT ":" Type
 
 UnionDecl     ::= "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
 Variant       ::= IDENT ( ":" Type )?
@@ -248,14 +249,16 @@ Param         ::= "noalias"? IDENT ":" Type
 
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
-Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float" | "FloatVector"
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
+                | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
 
-The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
-anything else ends the list. The FIRST sets of `Field` (`IDENT`) and `MethodDecl`
-(`pub`, `fn`) are disjoint, except for `inline`, an identifier: `inline` followed by
-`fn` begins a method, which takes one more token of lookahead (as `threadlocal let`
-does).
+The trailing-comma forms are LL(1). After a `,`, `pub` followed by an `IDENT` (other than
+`inline` before `fn`), or an `IDENT` other than `inline` before `fn`, begins another
+`Field`; anything else ends the list. The FIRST sets of `Field` (`pub`, `IDENT`) and
+`MethodDecl` (`pub`, `fn`) share `pub` and `inline`, which is resolved by one or two
+tokens of lookahead (`pub fn`, `pub inline fn`, `inline fn` begin methods, whereas
+`pub IDENT :`, `IDENT :` begin fields).
 
 ### 3.3 Types
 
@@ -273,7 +276,7 @@ Type          ::= "?" Type                          (* optional *)
                 | PrimType
                 | NamedType
 
-NamedType     ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )?
+NamedType     ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
 GenericArgs   ::= "." "[" GenericArgList "]"
 GenericArgList::= GenericArg ( "," GenericArg )* ","?
 GenericArg    ::= Type | INT_LIT
@@ -283,8 +286,10 @@ TypeList      ::= Type ( "," Type )* ","?
 PrimType      ::= (any reserved type name, §2.4)
 ```
 
-`NamedType` accepts `Name`, `module.Name`, `Name.[Args]` and `module.Name.[Args]`. After
-the `.`, the next token (`IDENT` or `[`) decides which form it is.
+`NamedType` accepts `Name`, `module.Name`, `Name.[Args]`, `module.Name.[Args]`, and in
+generic arguments associated functions/methods such as `Type.method`, `module.Type.method`,
+or `Type.[Args].method.[MArgs]`. After the `.`, the next token (`IDENT` or `[`) decides
+which form it is.
 
 ### 3.4 Statements
 
@@ -412,9 +417,11 @@ Import cycles are a compile error (`E0210`) in v0.1.
 
 ### 4.2 Visibility
 
-- `pub` makes a top-level item, or a method, visible to importing modules.
-- Struct and union **fields** are visible wherever the type is visible. v0.1 has no field
-  privacy.
+- `pub` makes a top-level item, a method, or a struct field visible to importing modules.
+- Named struct fields without `pub` are private to their declaring module; accessing or
+  constructing a non-`pub` field from another module is `E0203`. Anonymous struct
+  (`struct { ... }`) fields and union variants remain visible wherever their type is
+  visible.
 - `export` makes a function a WebAssembly export (§14.2). An exported function is not
   automatically `pub`.
 
@@ -879,6 +886,12 @@ A place is **mutable** if it is any of the following:
 - `p.*` or `p.f` where `p: *mut T`,
 - `s[i]` where `s: []mut T`.
 
+Immutability is **transitive through field projection**: projecting a field of pointer or
+slice type (`*mut U`, `[]mut U`, or an optional, error-union, or array containing one)
+through an immutable pointer (`*S`) or immutable slice (`[]S`) weakens `*mut U` to `*U`
+and `[]mut U` to `[]U` (§7.9). Using such a weakened value where a mutable pointer or
+slice is required is `E0707`.
+
 The left-hand side of an assignment must be a mutable place (`E0701`).
 
 ### 7.3 Operators
@@ -897,7 +910,8 @@ The logical operators are the keywords `and`, `or` and `not`. That leaves `!` to
 propagation (`e!`) and error-union types (`!T`), with no lexical ambiguity between them.
 
 Both operands of a binary operator must have the **same type**, after literal typing
-(`E0412` otherwise). Axiom has no implicit widening, and mixed `u32 + u64` is an error.
+(`E0412` otherwise), except that `==` and `!=` between `*mut T` and `*T` coerce `*mut T`
+to `*T`. Axiom has no implicit widening, and mixed `u32 + u64` is an error.
 
 Structs, unions, arrays and slices do not support `==`. Compare them field by field or
 with `@mem_eq` (Appendix A).
@@ -1072,6 +1086,13 @@ nothing. Write the `%`-suffixed operators (`A +% 100`) to wrap a constant on pur
 `e.f` reads field `f`. If `e` has type `*T` or `*mut T` with `T` a struct, `e.f` means
 `e.*.f`. This is the only automatic dereference in the language, and it goes exactly one
 level deep. `e.len` and `e.ptr` on slices and `e.len` on arrays are built-in fields.
+
+If the base of a struct field access is reached through an immutable pointer (`*S`) or
+immutable slice (`[]S`), any `*mut U` or `[]mut U` inside the field's type (directly or
+within `?`, `!`, or `[N]`) weakens to `*U` or `[]U`. Obtaining `*mut U` or `[]mut U`
+through such a field requires a mutable base (`*mut S`, `[]mut S`, or a direct local
+binding). Failing to satisfy a `*mut` or `[]mut` expectation because of this weakening is
+`E0707`.
 
 ### 7.10 Struct literals
 
@@ -1427,18 +1448,26 @@ fn demo() !void {
 ```ebnf
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )?        (* type parameter *)
-                | "const" IDENT ":" Type           (* integer constant parameter *)
-Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float" | "FloatVector"
+                | "const" IDENT ":" Type           (* integer or function constant parameter *)
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
+                | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
 
 A parameter list may follow the name of a `fn`, a `struct` or a `union`. The parameters
 are in scope in the signature and the body, and also in every field, variant and method of
 a generic type. A method of a generic type may declare its own additional parameters, as
-in `fn map[U](…)`.
+in `fn map[U](…)`. Earlier parameters in the same list are in scope in later parameters'
+types and vector lane constraints, so one list may write:
 
-A `const` parameter must have an integer type. Inside the body it is a constant of that
-type, so it can be used both as a value and as an array length. For example,
-`fn sum[const N: usize](a: [N]f32) f32` has a parameter of type `[N]f32`.
+```axiom
+struct Map[K, V, const HASH: fn(K) u64, const EQ: fn(K, K) bool] { … }
+fn dot[S: Float, V: FloatVector[S]](a: []S, b: []S) S { … }
+```
+
+A `const` parameter must have either an integer type or a function pointer type `fn(…) R`
+(`E0471`). Inside the body, an integer `const` parameter is a constant of that type (usable
+both as a value and as an array length, e.g. `[N]f32`), and a function `const` parameter
+behaves as a value of its `fn(…) R` type that calls directly to the instantiated function.
 
 ### 10.3 Applying generic arguments: `Name.[Args]`
 
@@ -1453,6 +1482,7 @@ Generic arguments are written the same way in **type and expression position**:
 let xs: List.[u32] = List.[u32].init(alloc, 16)!;
 let p = max.[i64](a, b);
 let v: Grid.[f32, 4] = …;
+let mut m = Map.[u64, u32, hash_u64, eq_u64].init();
 ```
 
 **Why `.[`.** In expression position, `Name[` already means indexing and `Name<` already
@@ -1460,10 +1490,16 @@ means less-than. The sequence `.[` is unused, so it keeps the grammar LL(1). It 
 the existing "dot introduces a special postfix form" family (`.{`, `.*`). Using the same
 spelling everywhere means there is one canonical form.
 
-A constant argument is an integer literal or the name of a `const`, including an enclosing
-`const` parameter. A name parses as a `Type` and is resolved to a constant during name
-resolution, so the parser still needs no symbol table. Arbitrary expressions are not
-allowed as arguments; declare a `const` for them.
+A constant argument is:
+- for an integer `const` parameter: an integer literal or the name of an integer `const`,
+  including an enclosing integer `const` parameter;
+- for a function `const` parameter: the name of a function (`f`, `mod.f`), an instantiated
+  generic function (`f.[Args]`, `mod.f.[Args]`), an associated function or method
+  (`T.m`, `mod.T.m`, `T.[Args].m`), or an enclosing `const` function parameter.
+
+All argument forms parse as a `Type` (via `NamedType`) or `INT_LIT` and are resolved
+during semantic analysis, so the parser still needs no symbol table. Arbitrary expressions
+are not allowed as constant arguments; declare a `const` or `fn` for them.
 
 Other rules:
 
@@ -1520,7 +1556,19 @@ v0.1 has a closed set of builtin constraints. User-defined constraints are futur
 | `SignedInt` | `i8` … `i64`, `isize` | everything `Int` permits; unary `-`; `@abs` |
 | `UnsignedInt` | `u8` … `u64`, `usize` | everything `Int` permits |
 | `Float` | `f32`, `f64` | everything `Num` permits; unary `-`; `@sqrt`, `@floor` and the other float builtins |
-| `FloatVector` | the float vector types (`f32x4` … `f32x16`, `f64x2` … `f64x8`) | binary `+` `-` `*` `/`; unary `-`; `@min`, `@max`, `@abs`, `@sqrt`, `@fma`; `@load(T, s)` and `@store(s, v)`; `@splat(lit)` of a float literal (see below) |
+| `FloatVector[S]` | float vector types with lane type `S` (`f32x4` … `f32x16`, `f64x2` … `f64x8`) | binary `+` `-` `*` `/`; unary `-`; `@min`, `@max`, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma`; `@load(T, s)` and `@store(s, v)`; `@load_partial(T, s)` and `@store_partial(s, v)`; `@splat(x)` from `S`; `@reduce_add(v) -> S`; `@dot(a, b) -> S`; `@lanes(T) -> usize` |
+| `IntVector[S]` | integer vector types with lane type `S` (`i8x16`/`u8x16` … `i64x8`/`u64x8`) | binary `+` `-` `+%` `-%` `&` `\|` `^` (`*`/`*%` if `S` is concrete non-8-bit); unary `~` (unary `-` if `S` is signed); shifts `<<` `>>`; `@clz`, `@ctz`, `@popcount`; `@min`/`@max` (if non-64-bit), `@abs` (if signed); `@load(T, s)` and `@store(s, v)`; `@load_partial(T, s)` and `@store_partial(s, v)`; `@splat(x)` from `S`; `@reduce_add(v) -> S`; `@lanes(T) -> usize` |
+| `Vector[S]` | any lane-typed vector with lane type `S` | binary `+` `-` (and op variants valid for every `S`); `@load(T, s)` and `@store(s, v)`; `@load_partial(T, s)` and `@store_partial(s, v)`; `@splat(x)` from `S`; `@reduce_add(v) -> S`; `@lanes(T) -> usize` |
+
+In `FloatVector[S]`, `IntVector[S]`, and `Vector[S]`, `S` may be a concrete scalar type or an
+earlier generic type parameter in the same list (subject to `S` guaranteeing valid lane
+types for the constraint: `Float` for `FloatVector[S]`, an integer constraint for
+`IntVector[S]`, `Num`/`Int`/`Float` for `Vector[S]`).
+
+A `const` function parameter `const F: fn(…) R` is definition-site checked against its
+exact function signature; calling `F(…)` checks arguments and return type directly against
+that signature (`E0461` if wrong), and instantiation rejects any function whose signature
+does not match after substituting earlier generic arguments (`E0462`).
 
 **Literals in generic code.** An untyped literal is accepted as a value of type `T` only if
 it is representable in **every** type that satisfies `T`'s constraint:
@@ -1531,18 +1579,24 @@ it is representable in **every** type that satisfies `T`'s constraint:
 | `SignedInt` | integers `-128` … `127` |
 | `UnsignedInt` | integers `0` … `255` |
 | `Float` | any float literal, and integers exactly representable in `f32` |
-| `FloatVector` | none; `@splat` takes a float or integer literal, converted to the lane type when instantiated |
+| `FloatVector[S]`, `IntVector[S]`, `Vector[S]` | `@splat(x)` takes a value or literal valid for `S` |
 
-A `FloatVector` parameter's lane count and lane type are not known in the body, so
-operations that depend on them (lane access, shuffles, comparisons, reductions) are not
-permitted; `@size_of(T)` gives the width. For example, the same code at any width:
+A vector generic parameter knows its lane type `S` and queries its compile-time lane count
+with `@lanes(V)` (and byte width with `@size_of(V)`). For example, the same reduction works
+at any float width:
 
 ```axiom
-fn scale[V: FloatVector](xs: []mut V, k: V) void {
-    let half: V = @splat(0.5);
-    for i in 0..xs.len {
-        xs[i] = xs[i] * k * half;
+fn dot[S: Float, V: FloatVector[S]](a: []S, b: []S) S {
+    let n = @lanes(V);
+    let mut acc: V = @splat(0.0);
+    let mut i: usize = 0;
+    while i < a.len {
+        let va = @load_partial(V, a[i..]);
+        let vb = @load_partial(V, b[i..]);
+        acc += va * vb;
+        i += n;
     }
+    return @reduce_add(acc);
 }
 ```
 
@@ -1555,8 +1609,10 @@ instantiated type.
 ### 10.6 Monomorphization
 
 - **Identity.** Two instantiations are the same when all their arguments are identical:
-  types by structural identity (§5), constants by value. `List.[u32]` written in two
-  different modules is a single type.
+  types by structural identity (§5), integer constants by value, and `const` functions by
+  resolved function declaration and generic arguments. `List.[u32]` written in two
+  different modules is a single type. Calls to a `const` function generic parameter lower to
+  direct calls (enabling full inlining).
 - **Layout.** A generic type's layout is determined after substitution, by the rules in §5.
 - **Code.** Each distinct instantiation of a function is emitted exactly once per program.
   Its debug and symbol name is its canonical spelling, for example `max.[u32]`.
@@ -1567,10 +1623,12 @@ instantiated type.
 
 Axiom generics have no specialization, overloading, variadic parameters, default
 arguments, higher-kinded parameters, compile-time execution, or dynamic dispatch. There are
-two ways to make code vary in behavior rather than in type:
+three ways to make code vary in behavior rather than in type:
 
-- pass a function pointer explicitly, as in
-  `fn sort[T](items: []mut T, less: fn(T, T) bool) void`, or
+- pass a `const` function generic argument, as in
+  `fn sort[T, const LESS: fn(T, T) bool](xs: []mut T) void` (zero-overhead direct/inlined calls),
+- pass a function pointer explicitly at runtime, as in
+  `fn sort_dyn[T](items: []mut T, less: fn(T, T) bool) void`, or
 - dispatch over a tagged union with `match`.
 
 ---
@@ -2039,7 +2097,8 @@ Scalars are **never** broadcast implicitly. Write `@splat(x)`.
 Appendix A has full signatures.
 
 - Construction: `@splat`, `@vec` (from lane values).
-- Lanes: `@extract_lane`, `@replace_lane`. The lane index must be a constant expression.
+- Lanes: `@lanes(V)` (compile-time lane count as `usize`), `@extract_lane`, `@replace_lane`.
+  The lane index must be a constant expression.
 - Memory: `@load(V, s)` / `@store(s, v)`. `s` is a slice, and the program traps if
   `s.len * size_of(elem)` is less than the vector's size (`T0006`).
   `@load_partial(V, s)` reads lanes `0..min(s.len, n)` of an `n`-lane vector from a slice
@@ -2686,7 +2745,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0150 | Operators require parentheses (§7.4) |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
-| E0203 | Item is not public |
+| E0203 | Item, method, or field is not public |
 | E0204 | Shadowing |
 | E0205 | `Self` outside a struct or union |
 | E0206 | A reserved constraint name (`Ord`, `Num`, …) used as a generic parameter |
@@ -2714,7 +2773,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0315 | `noalias` on a parameter whose type is not a pointer or slice (§3.2, §12.1) |
 | E0350 | A `const`, global or array-repeat count that is not a constant expression |
 | E0351 | A `const` whose value depends on itself |
-| E0352 | A `const` of a type other than integer, float, bool or enum |
+| E0352 | A `const` of a type other than integer, float, bool, enum or struct |
 | E0353 | A `const` union value with a payload (not supported yet) |
 | E0354 | Thread-local global without `mut` |
 | E0355 | A function called in its own signature (a parameter's type, say), directly or through others |
@@ -2743,8 +2802,8 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0467 | Wrong number of generic arguments |
 | E0468 | Generic arguments given to something that is not generic |
 | E0469 | Generic arguments given twice |
-| E0470 | Unknown constraint |
-| E0471 | A `const` generic parameter of a non-integer type |
+| E0470 | Unknown or invalid constraint |
+| E0471 | A `const` generic parameter of an invalid type (must be an integer or function type) |
 | E0472 | Array length or `const` argument that is not a non-negative integer constant |
 | E0473 | Type larger than the target's largest object (§5.5), the globals together larger than that, or a function's locals larger than a frame may be (§12.2) |
 | E0502 | Cannot infer type of literal |
@@ -2791,6 +2850,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0704 | Slicing a temporary array |
 | E0705 | Dereferencing `*void` or a non-pointer |
 | E0706 | A pointer operation that needs `*mut`, or assignment to a non-place |
+| E0707 | Cannot obtain `*mut` or `[]mut` through an immutable place |
 | E0801 | Type not allowed at the export or import boundary |
 | E0802 | Export name used more than once |
 | E0810 | Comparing vectors with `==` or `<` (use `@lanes_eq`, …) |
@@ -3062,8 +3122,9 @@ object depends on:
 - the module's source and path;
 - recursively, the **interface keys** of the modules it imports: a module's source
   without the bodies of its non-generic, non-inline functions and methods (which
-  importers reach by name, through their signatures), its path, and its imports'
-  interface keys in turn;
+  importers reach by name, through their signatures; `inline` functions passed as `const`
+  function generic arguments retain their bodies in the interface key), its path, and its
+  imports' interface keys in turn;
 - on WebAssembly, the layout of the program's thread-locals (§12.8.6): their order,
   sizes and alignments.
 
@@ -3403,6 +3464,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 |---|---|
 | `@splat(x)` | Scalar to `Vec`, with the type taken from context |
 | `@vec(V, l0, l1, …)` | Construct a vector from exactly `lanes(V)` lane values |
+| `@lanes(V)` | Compile-time constant lane count of `V` as `usize` |
 | `@extract_lane(v, const i)` | `Vec → lane` |
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
 | `@load(V, s)` / `@store(s, v)` | Slice-checked load/store of the vector's size (§13.2) |

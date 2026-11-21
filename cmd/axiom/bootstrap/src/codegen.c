@@ -238,6 +238,9 @@ static void check_inst_sizes(Type *t, Span sp) {
             if (too_large(t->args[i])) inner = true;
         }
         break;
+    case TY_CONSTFN:
+        for (int i = 0; i < t->nargs; i++) check_inst_sizes(t->args[i], sp);
+        break;
     default: break;
     }
     if (!too_large(t) || inner) return;
@@ -1315,9 +1318,11 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
             LLVMValueRef el[2] = {tag, LLVMConstNull(LLVMStructGetTypeAtIndex(ut, 1))};
             return LLVMConstNamedStruct(ut, el, 2);
         }
+        if (e->op == FK_CONST && e->decl && e->decl->cexpr) return gen_const(e->decl->cexpr, t);
         if (e->op == FK_DECL && e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         break;
     case E_IDENT:
+        if (e->decl && e->decl->kind == D_CONST && e->decl->cexpr) return gen_const(e->decl->cexpr, t);
         if (e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         if (e->decl && e->decl->kind == D_HOST_FN) return get_inst(e->decl, NULL, 0)->fn;
         break;
@@ -1427,6 +1432,35 @@ static void mangle_type_into(CharVec *b, Type *t) {
         MPUT(")");
         mangle_type_into(b, t->ret);
         break;
+    case TY_CONSTFN: {
+        Decl *d = t->decl;
+        MPUT("fn$");
+        MPUT(mangle_prefix(d));
+        MPUT(".");
+        if (d->owner) {
+            MPUT(d->owner->name);
+            if (d->owner->gparams.len) {
+                MPUT("@[");
+                for (int i = 0; i < d->owner->gparams.len && i < t->nargs; i++) {
+                    if (i) MPUT(",");
+                    mangle_type_into(b, t->args[i]);
+                }
+                MPUT("]");
+            }
+            MPUT(".");
+        }
+        MPUT(d->name);
+        int nown = d->kind == D_HOST_FN ? 0 : d->gparams.len;
+        if (nown && t->nargs >= nown) {
+            MPUT(".[");
+            for (int i = t->nargs - nown; i < t->nargs; i++) {
+                if (i > t->nargs - nown) MPUT(",");
+                mangle_type_into(b, t->args[i]);
+            }
+            MPUT("]");
+        }
+        break;
+    }
     default: MPUT(type_str(t)); break;
     }
 #undef MPUT
@@ -2593,6 +2627,17 @@ static LLVMValueRef gen_call(Expr *e) {
         return load(ut, tmp, false);
     }
     if (e->op == CALLK_INDIRECT) {
+        Type *cfn = (e->a->kind == E_IDENT && !e->a->local && e->a->tval) ? ct(e->a->tval) : NULL;
+        if (cfn && cfn->kind == TY_CONSTFN) {
+            FnInst *fi = get_callee(cfn->decl, cfn->args, cfn->nargs);
+            int n = e->args.len;
+            LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
+            for (int i = 0; i < n; i++) {
+                Expr *a = e->args.data[i];
+                av[i] = gen_arg(a, i < fi->fnty->nparams ? fi->fnty->params[i] : ct(a->type));
+            }
+            return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, fi->fnty->params, fi->display, fi->ninl);
+        }
         Type *ft = ct(e->a->type);
         LLVMValueRef fp = gen(e->a);
         int n = e->args.len;
@@ -3765,6 +3810,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
             v = LLVMBuildInsertElement(B, v, gen(a[i].e), LLVMConstInt(T_i32, (unsigned)(i - 1), false), "");
         return v;
     }
+    case BI_LANES: return usz(ct(e->tval)->lanes);
     case BI_EXTRACT_LANE: {
         LLVMValueRef v = gen(a[0].e);
         return LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, (unsigned long long)a[1].e->cval, false), "");
@@ -4501,6 +4547,7 @@ static bool reads_no_memory(Expr *e) {
     case E_OPT_SOME: return reads_no_memory(e->a);
     case E_IDENT:
         if (e->local) return !e->local->addr_taken;
+        if (e->tval && e->tval->kind == TY_PARAM && e->tval->is_const) return true;
         return e->decl && e->decl->kind == D_CONST;
     case E_FIELD: return e->op == FK_CONST || e->op == FK_VARIANT_UNIT || e->op == FK_ARRAY_LEN;
     case E_STRUCT_LIT:
@@ -4702,6 +4749,7 @@ static LLVMValueRef gen_inner(Expr *e) {
         if (e->local) return load(t, local_ptr(e->local), false);
         if (e->tval && e->tval->kind == TY_PARAM && e->tval->is_const) {
             Type *c = ct(e->tval);
+            if (c->kind == TY_CONSTFN) return fn_ref(get_inst(c->decl, c->args, c->nargs));
             return cint(lty(t), c->cval);
         }
         if (e->decl) {

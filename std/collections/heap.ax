@@ -1,21 +1,151 @@
 // =============================================================================
 // std/collections/heap.ax - priority queues: binary heaps.
 //
-//     let mut h = heap.Heap.[u32].init(less_u32);   // a min-heap
+//     let mut h = heap.Heap.[u32, less_u32].init();   // a min-heap
 //     defer h.deinit();
 //     h.push(5)!;
 //     h.push(1)!;
-//     let smallest = h.pop()!;                      // 1
+//     let smallest = h.pop()!;                        // 1
 //
-// The heap keeps its least element (by `less`) on top; give a "greater"
-// function for a max-heap.
+// The heap keeps its least element (by `LESS`) on top; give a "greater"
+// function for a max-heap. `HeapDyn[T]` takes the comparator at run time.
 // =============================================================================
 
 import "vec.ax" as vec;
 
 pub error HeapError { Empty, OutOfMemory, NotFound }
 
-pub struct Heap[T] {
+inline fn call_less[T, const LESS: fn(T, T) bool](_c: u8, a: T, b: T) bool {
+    return LESS(a, b);
+}
+
+inline fn dyn_less[T](f: fn(T, T) bool, a: T, b: T) bool {
+    return f(a, b);
+}
+
+fn sift_up[T, C, const LESS: fn(C, T, T) bool](items: *mut vec.Vec.[T], i0: usize, ctx: C) void {
+    let a = items.items_mut();
+    let x = a[i0];
+    let mut i = i0;
+    while i > 0 {
+        let p = (i - 1) / 2;
+        if not LESS(ctx, x, a[p]) {
+            break;
+        }
+        a[i] = a[p];
+        i = p;
+    }
+    a[i] = x;
+}
+
+fn sift_down[T, C, const LESS: fn(C, T, T) bool](items: *mut vec.Vec.[T], i0: usize, ctx: C) void {
+    let a = items.items_mut();
+    let n = a.len;
+    let x = a[i0];
+    let mut i = i0;
+    loop {
+        let l = (2 * i) + 1;
+        if l >= n {
+            break;
+        }
+        let mut c = l;
+        if ((l + 1) < n) and LESS(ctx, a[l + 1], a[l]) {
+            c = l + 1;
+        }
+        if not LESS(ctx, a[c], x) {
+            break;
+        }
+        a[i] = a[c];
+        i = c;
+    }
+    a[i] = x;
+}
+
+fn heapify[T, C, const LESS: fn(C, T, T) bool](items: *mut vec.Vec.[T], xs: []T, ctx: C) HeapError!void {
+    items.extend(xs)!;
+    let mut i = items.len() / 2;
+    while i > 0 {
+        i -= 1;
+        sift_down.[T, C, LESS](items, i, ctx);
+    }
+}
+
+fn heap_pop[T, C, const LESS: fn(C, T, T) bool](items: *mut vec.Vec.[T], ctx: C) HeapError!T {
+    if items.len() == 0 {
+        return error.Empty;
+    }
+    let a = items.items();
+    let top = a[0];
+    let last = items.pop()!;
+    if items.len() > 0 {
+        items.set(0, last);
+        sift_down.[T, C, LESS](items, 0, ctx);
+    }
+    return top;
+}
+
+fn heap_replace[T, C, const LESS: fn(C, T, T) bool](items: *mut vec.Vec.[T], x: T, ctx: C) HeapError!T {
+    if items.len() == 0 {
+        return error.Empty;
+    }
+    let top = items.get(0);
+    items.set(0, x);
+    sift_down.[T, C, LESS](items, 0, ctx);
+    return top;
+}
+
+pub struct Heap[T, const LESS: fn(T, T) bool] {
+    items: vec.Vec.[T],
+
+    pub fn init() Self {
+        return Self.{ items: vec.Vec.[T].init() };
+    }
+
+    /// A heap of the elements of xs, built in linear time.
+    pub fn from_slice(xs: []T) HeapError!Self {
+        let mut h = Self.init();
+        heapify.[T, u8, call_less.[T, LESS]](&mut h.items, xs, 0)!;
+        return h;
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        self.items.deinit();
+    }
+
+    pub fn len(self: *Self) usize {
+        return self.items.len();
+    }
+
+    pub fn clear(self: *mut Self) void {
+        self.items.clear();
+    }
+
+    pub fn push(self: *mut Self, x: T) HeapError!void {
+        self.items.push(x)!;
+        sift_up.[T, u8, call_less.[T, LESS]](&mut self.items, self.items.len() - 1, 0);
+    }
+
+    /// The least element, without removing it.
+    pub fn peek(self: *Self) HeapError!T {
+        if self.items.len() == 0 {
+            return error.Empty;
+        }
+        return self.items.get(0);
+    }
+
+    /// Removes and returns the least element.
+    pub fn pop(self: *mut Self) HeapError!T {
+        return heap_pop.[T, u8, call_less.[T, LESS]](&mut self.items, 0);
+    }
+
+    /// Pops the least element and pushes x in one step (x may come back).
+    pub fn replace(self: *mut Self, x: T) HeapError!T {
+        return heap_replace.[T, u8, call_less.[T, LESS]](&mut self.items, x, 0);
+    }
+}
+
+/// A binary heap whose comparator function is chosen at run time.
+pub struct HeapDyn[T] {
     items: vec.Vec.[T],
     less: fn(T, T) bool,
 
@@ -26,13 +156,7 @@ pub struct Heap[T] {
     /// A heap of the elements of xs, built in linear time.
     pub fn from_slice(xs: []T, less: fn(T, T) bool) HeapError!Self {
         let mut h = Self.init(less);
-        h.items.extend(xs)!;
-        let n = h.items.len;
-        let mut i = n / 2;
-        while i > 0 {
-            i -= 1;
-            h.down(i);
-        }
+        heapify.[T, fn(T, T) bool, dyn_less.[T]](&mut h.items, xs, less)!;
         return h;
     }
 
@@ -41,7 +165,7 @@ pub struct Heap[T] {
     }
 
     pub fn len(self: *Self) usize {
-        return self.items.len;
+        return self.items.len();
     }
 
     pub fn clear(self: *mut Self) void {
@@ -50,12 +174,12 @@ pub struct Heap[T] {
 
     pub fn push(self: *mut Self, x: T) HeapError!void {
         self.items.push(x)!;
-        self.up(self.items.len - 1);
+        sift_up.[T, fn(T, T) bool, dyn_less.[T]](&mut self.items, self.items.len() - 1, self.less);
     }
 
     /// The least element, without removing it.
     pub fn peek(self: *Self) HeapError!T {
-        if self.items.len == 0 {
+        if self.items.len() == 0 {
             return error.Empty;
         }
         return self.items.get(0);
@@ -63,66 +187,12 @@ pub struct Heap[T] {
 
     /// Removes and returns the least element.
     pub fn pop(self: *mut Self) HeapError!T {
-        if self.items.len == 0 {
-            return error.Empty;
-        }
-        let a = self.items.items();
-        let top = a[0];
-        let last = self.items.pop()!;
-        if self.items.len > 0 {
-            self.items.set(0, last);
-            self.down(0);
-        }
-        return top;
+        return heap_pop.[T, fn(T, T) bool, dyn_less.[T]](&mut self.items, self.less);
     }
 
     /// Pops the least element and pushes x in one step (x may come back).
     pub fn replace(self: *mut Self, x: T) HeapError!T {
-        if self.items.len == 0 {
-            return error.Empty;
-        }
-        let top = self.items.get(0);
-        self.items.set(0, x);
-        self.down(0);
-        return top;
-    }
-
-    fn up(self: *mut Self, i0: usize) void {
-        let a = self.items.items();
-        let x = a[i0];
-        let mut i = i0;
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if not self.less(x, a[p]) {
-                break;
-            }
-            a[i] = a[p];
-            i = p;
-        }
-        a[i] = x;
-    }
-
-    fn down(self: *mut Self, i0: usize) void {
-        let a = self.items.items();
-        let n = a.len;
-        let x = a[i0];
-        let mut i = i0;
-        loop {
-            let l = (2 * i) + 1;
-            if l >= n {
-                break;
-            }
-            let mut c = l;
-            if ((l + 1) < n) and self.less(a[l + 1], a[l]) {
-                c = l + 1;
-            }
-            if not self.less(a[c], x) {
-                break;
-            }
-            a[i] = a[c];
-            i = c;
-        }
-        a[i] = x;
+        return heap_replace.[T, fn(T, T) bool, dyn_less.[T]](&mut self.items, x, self.less);
     }
 }
 
@@ -130,7 +200,7 @@ pub struct Heap[T] {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn lt(a: u64, b: u64) bool {
+inline fn lt(a: u64, b: u64) bool {
     return a < b;
 }
 
@@ -146,7 +216,7 @@ fn is_empty_error(r: !u64) bool {
 }
 
 test "heaps" {
-    let mut h = Heap.[u64].init(lt);
+    let mut h = Heap.[u64, lt].init();
     defer h.deinit();
     let mut x: u64 = 12345;
     for _i in @as(usize, 0)..1000 {
@@ -162,7 +232,7 @@ test "heaps" {
     }
     @expect(is_empty_error(h.pop()));
     let xs: [7]u64 = [5, 1, 9, 3, 7, 2, 8];
-    let mut m = Heap.[u64].from_slice(xs[..], gt)!;
+    let mut m = Heap.[u64, gt].from_slice(xs[..])!;
     defer m.deinit();
     @expect_eq(m.peek()!, 9);
     @expect_eq(m.replace(4)!, 9);
@@ -170,4 +240,27 @@ test "heaps" {
     @expect_eq(m.pop()!, 7);
     @expect_eq(m.pop()!, 5);
     @expect_eq(m.pop()!, 4);
+}
+
+test "HeapDyn" {
+    let mut h = HeapDyn.[u64].init(lt);
+    defer h.deinit();
+    h.push(5)!;
+    h.push(1)!;
+    h.push(3)!;
+    @expect_eq(h.len(), 3);
+    @expect_eq(h.peek()!, 1);
+    @expect_eq(h.replace(4)!, 1);
+    @expect_eq(h.pop()!, 3);
+    @expect_eq(h.pop()!, 4);
+    @expect_eq(h.pop()!, 5);
+    @expect(is_empty_error(h.pop()));
+
+    let xs: [7]u64 = [5, 1, 9, 3, 7, 2, 8];
+    let mut m = HeapDyn.[u64].from_slice(xs[..], gt)!;
+    defer m.deinit();
+    @expect_eq(m.peek()!, 9);
+    m.clear();
+    @expect_eq(m.len(), 0);
+    @expect(is_empty_error(m.peek()));
 }

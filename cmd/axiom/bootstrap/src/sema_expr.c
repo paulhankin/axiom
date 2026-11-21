@@ -18,7 +18,32 @@ static Expr *mkconv(Expr *e, ConvKind k, Type *t) {
     c->op = k;
     c->type = t;
     c->cat = CAT_VALUE;
+    c->weakened = e->weakened;
     return c;
+}
+
+static Type *weaken_mut(Type *t) {
+    if (!t) return t;
+    switch (t->kind) {
+    case TY_PTR: return t->mut ? type_ptr(t->elem, false) : t;
+    case TY_SLICE: return t->mut ? type_slice(t->elem, false) : t;
+    case TY_OPT: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return type_opt(w);
+        return t;
+    }
+    case TY_ERRUNION: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return type_errunion_set(w, t->decl);
+        return t;
+    }
+    case TY_ARRAY: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return t->len_param ? type_array_param(w, t->len_param) : type_array(w, t->len);
+        return t;
+    }
+    default: return t;
+    }
 }
 
 static Type *unwrap_hint(Type *t) {
@@ -175,7 +200,7 @@ void coerce(Expr **pe, Type *target) {
         if (target->kind == TY_PARAM && !target->is_const) {
             if (!lit_ok_for_param(e, target))
                 diag_error(e->span, "E0461", "float literal is not allowed for a parameter constrained by %s",
-                           constraint_name(target->constraint));
+                           param_constraint_str(target));
             e->type = target;
             return;
         }
@@ -244,6 +269,29 @@ void coerce(Expr **pe, Type *target) {
             }
             return;
         }
+    }
+    if (e->weakened && weaken_mut(target) == s) {
+        Diag *d = diag_error(e->span, "E0707", "cannot obtain %s through an immutable place (weakened to %s)",
+                             type_str(target), type_str(s));
+        diag_types(d, type_str(target), type_str(s));
+        if (C && C->fn && C->fn->params.len > 0) {
+            Param *p0 = &C->fn->params.data[0];
+            if (p0->name && !strcmp(p0->name, "self") && p0->te && p0->te->kind == TE_PTR && !p0->te->mut) {
+                DiagFix *fx = diag_fix(d, "make 'self' mutable", "suggestion");
+                Span ts = p0->te->span;
+                diag_fix_edit(fx, (Span){ts.file, ts.start + 1, ts.start + 1}, "mut ");
+            }
+        }
+        if (C && C->in_return && C->fn && C->fn->ret_te) {
+            TypeExpr *rt = C->fn->ret_te;
+            while (rt && (rt->kind == TE_ERRUNION || rt->kind == TE_OPT)) rt = rt->elem;
+            if (rt && (rt->kind == TE_PTR || rt->kind == TE_SLICE) && rt->mut && rt->elem) {
+                DiagFix *fx = diag_fix(d, "return an immutable view", "suggestion");
+                Span rep = {rt->span.file, rt->span.start, rt->elem->span.start};
+                diag_fix_edit(fx, rep, rt->kind == TE_PTR ? "*" : "[]");
+            }
+        }
+        return;
     }
     type_mismatch(e, target, s);
 }
@@ -347,6 +395,26 @@ bool is_mut_place(Expr *e) {
         if (e->op == IDX_ARRAY) return is_mut_place(e->a);
         return e->a->type->mut;
     default: return false;
+    }
+}
+
+// True iff place `e` is reached through an immutable pointer (`*T`) or immutable slice (`[]T`).
+static bool via_immut_indirection(Expr *e) {
+    for (;;) {
+        if (e->kind == E_DEREF) return e->a->type->kind == TY_PTR && !e->a->type->mut;
+        if (e->kind == E_FIELD && e->op == FK_STRUCT) {
+            if (e->self_mode == SELF_DEREF) return !e->a->type->mut;
+            e = e->a;
+            continue;
+        }
+        if (e->kind == E_INDEX) {
+            if (e->op == IDX_ARRAY) {
+                e = e->a;
+                continue;
+            }
+            return !e->a->type->mut;
+        }
+        return false;
     }
 }
 
@@ -464,6 +532,19 @@ static bool is_shift_op(int op) { return op == TK_SHL || op == TK_SHR; }
 
 static bool param_has(Type *t, Constraint c) { return t->kind == TY_PARAM && type_satisfies(t, c); }
 
+static bool lane_is_signed(Type *lane) {
+    return lane && ((lane->kind == TY_INT && lane->is_signed) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_SIGNED)));
+}
+static bool lane_is_unsigned(Type *lane) {
+    return lane && ((lane->kind == TY_INT && !lane->is_signed) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_UNSIGNED)));
+}
+static bool lane_is_non8bit(Type *lane) {
+    return lane && (lane->kind == TY_FLOAT || (lane->kind == TY_INT && lane->bits != 8) ||
+                    (lane->kind == TY_PARAM && type_satisfies(lane, C_FLOAT)));
+}
+
 // Validate that arithmetic/bitwise operator `op` applies to operand type t.
 static bool check_arith_op(int op, Type *t, Span sp) {
     if (t->kind == TY_INVALID || t->kind == TY_NEVER) return true;
@@ -471,15 +552,26 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     switch (op) {
     case TK_PLUS:
     case TK_MINUS:
+        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || ty_is_vec_int(t) ||
+            param_has(t, C_NUM) || param_has(t, C_VEC))
+            return true;
+        break;
     case TK_STAR:
+        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM) || param_has(t, C_FLOAT_VEC))
+            return true;
+        if (param_has(t, C_INT_VEC) && lane_is_non8bit(t->constraint_lane)) return true;
+        if (ty_is_vec_int(t)) {
+            // lane-wise and wrapping, in every overflow mode (§13.1)
+            if (t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
+            else return true;
+            return false;
+        }
+        break;
     case TK_SLASH:
         if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM) || param_has(t, C_FLOAT_VEC))
             return true;
         if (ty_is_vec_int(t)) {
-            // lane-wise and wrapping, in every overflow mode (§13.1)
-            if (op == TK_SLASH) diag_error(sp, "E0811", "integer vectors do not support '/'");
-            else if (op == TK_STAR && t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
-            else return true;
+            diag_error(sp, "E0811", "integer vectors do not support '/'");
             return false;
         }
         break;
@@ -492,10 +584,15 @@ static bool check_arith_op(int op, Type *t, Span sp) {
         break;
     case TK_PLUS_PCT:
     case TK_MINUS_PCT:
+        if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || ty_is_vec_int(t) || param_has(t, C_INT) ||
+            param_has(t, C_INT_VEC))
+            return true;
+        break;
     case TK_STAR_PCT:
         if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || param_has(t, C_INT)) return true;
+        if (param_has(t, C_INT_VEC) && lane_is_non8bit(t->constraint_lane)) return true;
         if (ty_is_vec_int(t)) {
-            if (op == TK_STAR_PCT && t->elem->bits == 8) {
+            if (t->elem->bits == 8) {
                 diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
                 return false;
             }
@@ -506,13 +603,13 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     case TK_PIPE:
     case TK_CARET:
         if (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || ty_is_vec_int(t) || t->kind == TY_V128 ||
-            param_has(t, C_INT))
+            param_has(t, C_INT) || param_has(t, C_INT_VEC))
             return true;
         break;
     }
     if (t->kind == TY_PARAM)
         diag_error(sp, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)", opn, t->name,
-                   constraint_name(t->constraint));
+                   param_constraint_str(t));
     else
         diag_error(sp, "E0513", "operator '%s' cannot be applied to %s", opn, type_str(t));
     return false;
@@ -525,7 +622,7 @@ static bool check_cmp_op(int op, Type *t, Span sp) {
     if (t->kind == TY_PARAM) {
         if (type_satisfies(t, eq ? C_EQ : C_ORD)) return true;
         diag_error(sp, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)", tok_kind_name((TokKind)op),
-                   t->name, constraint_name(t->constraint));
+                   t->name, param_constraint_str(t));
         return false;
     }
     if (eq && (t->kind == TY_BOOL || t->kind == TY_PTR || t->kind == TY_ERROR || t->kind == TY_FN || t->kind == TY_ENUM))
@@ -552,7 +649,8 @@ static bool check_shift_count(Expr **pb) {
     if (r->kind == TY_INVALID) return true;
     if ((r->kind == TY_INT && !r->is_signed) || param_has(r, C_UNSIGNED)) return true;
     if (ty_is_vec_int(r) && !r->elem->is_signed) return true;  // per lane (spec §13.1)
-    if (r->kind == TY_INT || param_has(r, C_SIGNED) || ty_is_vec_int(r)) {
+    if (param_has(r, C_INT_VEC) && lane_is_unsigned(r->constraint_lane)) return true;
+    if (r->kind == TY_INT || param_has(r, C_INT) || ty_is_vec_int(r) || param_has(r, C_INT_VEC)) {
         Diag *d = diag_error((*pb)->span, "E0525", "shift count must be unsigned, found %s", type_str(r));
         (void)d;
         return false;
@@ -590,16 +688,26 @@ static Type *check_binary(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
-        if (l->kind != TY_INT && !ty_is_vec_int(l) && !param_has(l, C_INT) && l->kind != TY_INVALID) {
-            diag_error(e->a->span, "E0513", "shift requires an integer operand, found %s", type_str(l));
+        if (l->kind != TY_INT && !ty_is_vec_int(l) && !param_has(l, C_INT) && !param_has(l, C_INT_VEC) &&
+            l->kind != TY_INVALID) {
+            if (l->kind == TY_PARAM)
+                diag_error(e->a->span, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)",
+                           tok_kind_name((TokKind)op), l->name, param_constraint_str(l));
+            else
+                diag_error(e->a->span, "E0513", "shift requires an integer operand, found %s", type_str(l));
             return e->type = t_invalid;
         }
         Type *k = e->b->type;
-        if (ok && ty_is_vec_int(k) && l->kind != TY_INVALID &&
-            !(ty_is_vec_int(l) && l->lanes == k->lanes && l->elem->bits == k->elem->bits)) {
-            diag_error(e->b->span, "E0412", "per-lane shift counts must have the shape of the shifted vector: %s and %s",
-                       type_str(l), type_str(k));
-            return e->type = t_invalid;
+        if (ok && (ty_is_vec_int(k) || param_has(k, C_INT_VEC)) && l->kind != TY_INVALID) {
+            bool shape_ok =
+                (ty_is_vec_int(l) && ty_is_vec_int(k) && l->lanes == k->lanes && l->elem->bits == k->elem->bits) ||
+                (param_has(k, C_INT_VEC) && k == l);
+            if (!shape_ok) {
+                diag_error(e->b->span, "E0412",
+                           "per-lane shift counts must have the shape of the shifted vector: %s and %s", type_str(l),
+                           type_str(k));
+                return e->type = t_invalid;
+            }
         }
         if (ok && e->a->is_const && e->b->is_const && l->kind == TY_INT) {
             i128 r;
@@ -631,6 +739,16 @@ static Type *check_binary(Expr *e, Type *expected) {
         coerce(&e->b, l);
         t = l;
     } else {
+        if ((op == TK_EQEQ || op == TK_NE) && l->kind == TY_PTR && r->kind == TY_PTR && l->elem == r->elem &&
+            l->mut != r->mut) {
+            if (l->mut) {
+                coerce(&e->a, r);
+                l = r;
+            } else {
+                coerce(&e->b, l);
+                r = l;
+            }
+        }
         t = l;
         if (l != r && l->kind != TY_INVALID && r->kind != TY_INVALID && l->kind != TY_NEVER && r->kind != TY_NEVER &&
             !(l->kind == TY_ERROR && r->kind == TY_ERROR)) {
@@ -750,7 +868,8 @@ static Type *check_unary(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if ((t->kind == TY_INT) || t->kind == TY_FLOAT || ty_is_vec_float(t) || param_has(t, C_SIGNED) ||
-            param_has(t, C_FLOAT) || param_has(t, C_FLOAT_VEC) || t->kind == TY_INVALID) {
+            param_has(t, C_FLOAT) || param_has(t, C_FLOAT_VEC) ||
+            (param_has(t, C_INT_VEC) && lane_is_signed(t->constraint_lane)) || t->kind == TY_INVALID) {
             if (e->a->is_const && t->kind == TY_INT) {
                 if (!fits_type(-e->a->cval, t)) diag_error(e->span, "E0530", "overflow in constant expression");
                 e->cval = -e->a->cval;
@@ -762,7 +881,11 @@ static Type *check_unary(Expr *e, Type *expected) {
             return e->type = t;
         }
         if (ty_is_vec_int(t)) return e->type = t;  // lane-wise, wrapping (§13.1)
-        diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
+        if (t->kind == TY_PARAM)
+            diag_error(e->span, "E0461", "operator '-' is not permitted on '%s' (constraint %s)", t->name,
+                       param_constraint_str(t));
+        else
+            diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
         return e->type = t_invalid;
     }
     case TK_MINUS_PCT:
@@ -778,10 +901,15 @@ static Type *check_unary(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
-        bool ok = t->kind == TY_INT || ty_is_vec_int(t) || param_has(t, C_INT) || t->kind == TY_INVALID ||
-                  (op == TK_TILDE && t->kind == TY_V128);
+        bool ok = t->kind == TY_INT || ty_is_vec_int(t) || param_has(t, C_INT) || param_has(t, C_INT_VEC) ||
+                  t->kind == TY_INVALID || (op == TK_TILDE && t->kind == TY_V128);
         if (!ok) {
-            diag_error(e->span, "E0513", "operator '%s' cannot be applied to %s", tok_kind_name((TokKind)op), type_str(t));
+            if (t->kind == TY_PARAM)
+                diag_error(e->span, "E0461", "operator '%s' is not permitted on '%s' (constraint %s)",
+                           tok_kind_name((TokKind)op), t->name, param_constraint_str(t));
+            else
+                diag_error(e->span, "E0513", "operator '%s' cannot be applied to %s", tok_kind_name((TokKind)op),
+                           type_str(t));
             return e->type = t_invalid;
         }
         if (e->a->is_const && t->kind == TY_INT) {
@@ -846,6 +974,7 @@ static void resolve_ident(Expr *e) {
         e->local = l;
         e->cat = CAT_VALUE;
         e->type = l->type;
+        e->weakened = l->weakened;
         return;
     }
     Type *gp = lookup_gparam(&C->tc, e->name);
@@ -887,6 +1016,13 @@ static void check_method_visible(Expr *e, Decl *m) {
     if (!m->is_pub && m->module != C->tc.mod) {
         Diag *dg = diag_error(e->name_span, "E0203", "'%s' is not public", e->name);
         diag_note(dg, m->name_span, "declared here");
+    }
+}
+
+static void check_field_visible(Span use_sp, Decl *base_decl, Field *f) {
+    if (!base_decl->anon && !f->is_pub && base_decl->module != C->tc.mod) {
+        Diag *dg = diag_error(use_sp, "E0203", "'%s' is not public", f->name);
+        diag_note(dg, f->span, "declared here");
     }
 }
 
@@ -984,9 +1120,19 @@ static Type *check_field(Expr *e) {
     if (base->kind == TY_STRUCT) {
         int fi = find_field(base->decl, name);
         if (fi >= 0) {
+            check_field_visible(e->name_span, base->decl, &base->decl->fields.data[fi]);
             e->op = FK_STRUCT;
             e->index = fi;
-            return e->type = type_field(base, fi);
+            Type *ft = type_field(base, fi);
+            bool base_immut = (e->self_mode == SELF_DEREF) ? !t->mut : via_immut_indirection(a);
+            if (base_immut) {
+                Type *wt = weaken_mut(ft);
+                if (wt != ft) {
+                    ft = wt;
+                    e->weakened = true;
+                }
+            }
+            return e->type = ft;
         }
     }
     if (base->kind == TY_STRUCT || base->kind == TY_UNION || base->kind == TY_ENUM) {
@@ -1009,6 +1155,7 @@ static Type *check_field(Expr *e) {
         }
         if (name == intern_cstr("ptr")) {
             e->op = FK_SLICE_PTR;
+            e->weakened = a->weakened;
             return e->type = type_ptr(t->elem, t->mut);
         }
     }
@@ -1027,26 +1174,12 @@ static Type *check_field(Expr *e) {
 // ---------------------------------------------------------------------------
 // Generic application  x.[args]
 // ---------------------------------------------------------------------------
-static Type *resolve_garg(TypeExpr *te) {
-    if (te->kind == TE_INTLIT) return type_constint((int64_t)te->ival);
-    if (te->kind == TE_NAMED && !te->has_args && !te->qual) {
-        Type *gp = lookup_gparam(&C->tc, te->name);
-        if (gp) return gp;
-        Decl *d = module_lookup(C->tc.mod, te->name);
-        if (d && d->kind == D_CONST) {
-            resolve_decl(d);
-            if (d->cexpr && d->cexpr->is_const && d->type->kind == TY_INT) return type_constint((int64_t)d->cexpr->cval);
-        }
-    }
-    return resolve_type(te, &C->tc);
-}
-
 static Type *check_apply(Expr *e) {
     Expr *a = e->a;
     check_operand(a, NULL);
     int n = e->targs.len;
     Type **args = NEWN(Type *, n + 1);
-    for (int i = 0; i < n; i++) args[i] = resolve_garg(e->targs.data[i]);
+    for (int i = 0; i < n; i++) args[i] = resolve_generic_arg(e->targs.data[i], &C->tc);
     if (a->cat == CAT_GENERIC) {
         Decl *d = a->decl;
         if (!check_generic_args(d, args, n, e->span, &e->targs)) {
@@ -1073,13 +1206,13 @@ static Type *check_apply(Expr *e) {
         if (a->ngargs != fn->nall_gparams - fn->gparams.len) {
             diag_error(e->span, "E0469", "generic arguments were already given");
         }
-        check_generic_args(fn, args, n, e->span, &e->targs);
         int nowner = fn->nall_gparams - fn->gparams.len;
+        check_generic_args_ctx(fn, a->gargs, a->ngargs < nowner ? a->ngargs : nowner, args, n, e->span, &e->targs);
         e->cat = a->cat;
         e->decl = fn;
         e->ngargs = fn->nall_gparams;
         e->gargs = NEWN(Type *, fn->nall_gparams + 1);
-        for (int i = 0; i < nowner; i++) e->gargs[i] = a->gargs[i];
+        for (int i = 0; i < nowner; i++) e->gargs[i] = i < a->ngargs ? a->gargs[i] : t_invalid;
         for (int i = 0; i < fn->gparams.len; i++) e->gargs[nowner + i] = i < n ? args[i] : t_invalid;
         e->b = a->b;
         e->self_mode = a->self_mode;
@@ -1107,9 +1240,14 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
             if (vars[i] != pat) continue;
             if (!sol[i]) {
                 sol[i] = act;
-                return true;
+            } else if (sol[i] != act) {
+                return false;
             }
-            return sol[i] == act;
+            break;
+        }
+        if (pat->constraint_lane) {
+            Type *alane = act->kind == TY_VEC ? act->elem : (act->kind == TY_PARAM ? act->constraint_lane : NULL);
+            if (alane) return unify(pat->constraint_lane, alane, vars, sol, nv);
         }
         return true;
     case TY_PTR:
@@ -1138,6 +1276,11 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
     case TY_STRUCT:
     case TY_UNION:
         if (act->decl != pat->decl) return true;
+        for (int i = 0; i < pat->nargs; i++)
+            if (!unify(pat->args[i], act->args[i], vars, sol, nv)) return false;
+        return true;
+    case TY_CONSTFN:
+        if (act->kind != TY_CONSTFN || act->decl != pat->decl || act->nargs != pat->nargs) return true;
         for (int i = 0; i < pat->nargs; i++)
             if (!unify(pat->args[i], act->args[i], vars, sol, nv)) return false;
         return true;
@@ -1281,7 +1424,7 @@ static Type *check_call(Expr *e, Type *expected) {
                 }
             }
             for (int k = 0; k < nown; k++) gargs[nowner + k] = sol[k] ? sol[k] : t_invalid;
-            if (ok) check_generic_args(fn, gargs + nowner, nown, e->span, NULL);
+            if (ok) check_generic_args_ctx(fn, gargs, nowner, gargs + nowner, nown, e->span, NULL);
         }
         // phase 3: coerce args
         for (int i = 0; i < nargs; i++) {
@@ -1412,7 +1555,27 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
     bool order_ok = e->inits.len == nf;
     for (int i = 0; i < e->inits.len && order_ok; i++)
         if (e->inits.data[i].name != d->fields.data[i].name) order_ok = false;
-    if (!order_ok) {
+    bool priv_missing = false;
+    if (!order_ok && !d->anon && d->module != C->tc.mod) {
+        for (int i = 0; i < nf; i++) {
+            if (d->fields.data[i].is_pub) continue;
+            bool present = false;
+            for (int j = 0; j < e->inits.len; j++) {
+                if (e->inits.data[j].name == d->fields.data[i].name) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                Diag *dg = diag_error(e->span, "E0203", "cannot construct %s: field '%s' is not public", type_str(t),
+                                      d->fields.data[i].name);
+                diag_note(dg, d->fields.data[i].span, "declared here");
+                priv_missing = true;
+                break;
+            }
+        }
+    }
+    if (!order_ok && !priv_missing) {
         // Build a helpful message: expected field order.
         CharVec b = {0};
         for (int i = 0; i < nf; i++) {
@@ -1468,6 +1631,7 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
             check_expr(fi->value, NULL);
             continue;
         }
+        check_field_visible(fi->span, d, &d->fields.data[idx]);
         check_expr_to(&fi->value, type_field(t, idx));
     }
     e->tval = t;
@@ -1568,11 +1732,12 @@ static void check_return_value(Expr **pe, Span sp) {
         diag_error((*pe)->span, "E0603", "a void function cannot return a value");
         return;
     }
-    if (r->kind == TY_ERRUNION && r->elem->kind == TY_VOID) {
-        check_expr_to(pe, r);
-        return;
-    }
-    check_expr_to(pe, r);
+    check_expr(*pe, r);
+    bool prev_ret = C->in_return;
+    C->in_return = true;
+    coerce(pe, r);
+    C->in_return = prev_ret;
+    if (r->kind == TY_ERRUNION && r->elem->kind == TY_VOID) return;
     check_escape(*pe);
 }
 
@@ -1618,6 +1783,7 @@ static Type *check_catch(Expr *e) {
         break;
     }
     scope_pop();
+    e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
 
@@ -1646,6 +1812,7 @@ static Type *check_orelse(Expr *e) {
                        type_str(vt));
         break;
     }
+    e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
 
@@ -1667,6 +1834,7 @@ static Type *check_try(Expr *e) {
         check_leave_ok(e->span, false);
         try_fits(e->span, t->decl, C->ret->decl);
     }
+    e->weakened = e->a->weakened;
     return e->type = t->elem;
 }
 
@@ -1702,6 +1870,7 @@ static Type *check_index(Expr *e) {
         }
         if (e->b->is_const && t->kind == TY_ARRAY && !t->len_param && (e->b->cval < 0 || e->b->cval >= t->len))
             diag_error(e->b->span, "E0541", "index %s is out of bounds for %s", i128_str(e->b->cval), type_str(t));
+        if (elem) e->weakened = e->a->weakened;
         return e->type = elem ? elem : t_invalid;
     }
     // slice
@@ -1725,6 +1894,7 @@ static Type *check_index(Expr *e) {
     } else {
         mut = t->mut;
     }
+    e->weakened = e->a->weakened;
     return e->type = type_slice(elem, mut);
 }
 
@@ -1768,6 +1938,7 @@ static Type *check_operand(Expr *e, Type *expected) {
         Type *ot = find_opt_expected(expected);
         if (ot) {
             check_expr_to(&e->a, ot->elem);
+            e->weakened = e->a->weakened;
             return e->type = ot;
         }
         Type *it = check_expr(e->a, NULL);
@@ -1780,6 +1951,7 @@ static Type *check_operand(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if (it->kind == TY_INVALID) return e->type = t_invalid;
+        e->weakened = e->a->weakened;
         return e->type = type_opt(it);
     }
     case E_EMPTY_SLICE: {
@@ -1817,7 +1989,15 @@ static Type *check_operand(Expr *e, Type *expected) {
                 diag_error(e->span, "E0705", "cannot dereference *void; convert it with @ptr_cast first");
                 return e->type = t_invalid;
             }
-            return e->type = t->elem;
+            Type *res = t->elem;
+            if (!t->mut) {
+                Type *wt = weaken_mut(res);
+                if (wt != res) {
+                    res = wt;
+                    e->weakened = true;
+                }
+            }
+            return e->type = res;
         }
         if (t->kind != TY_INVALID) diag_error(e->span, "E0705", "cannot dereference a value of type %s", type_str(t));
         return e->type = t_invalid;

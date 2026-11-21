@@ -268,33 +268,79 @@ int find_field(Decl *s, Sym name) {
 }
 
 static void ensure_gparams(Decl *d) {
+    if (!d || d->gparams_done || d->gparams_resolving) return;
+    if (d->gparams.len == 0) {
+        d->gparams_done = true;
+        return;
+    }
+    d->gparams_resolving = true;
+    Decl *owner = d->owner;
+    if (owner) resolve_decl(owner);
+    TypeCtx tc = {d->module, owner ? owner : (d->kind == D_FN ? NULL : d), d->kind == D_FN ? d : NULL,
+                  owner ? owner->type : NULL};
     for (int i = 0; i < d->gparams.len; i++) {
         GenericParam *g = &d->gparams.data[i];
         if (g->type) continue;
         Constraint c = C_NONE;
         Type *ct = NULL;
+        Type *lane = NULL;
         if (g->is_const) {
-            TypeCtx tc = {d->module, NULL, NULL, NULL};
             ct = resolve_type(g->const_te, &tc);
-            if (ct->kind != TY_INT && ct->kind != TY_INVALID) {
-                diag_error(g->const_te->span, "E0471", "const generic parameter must have an integer type, found %s",
-                           type_str(ct));
+            if (ct->kind != TY_INT && ct->kind != TY_FN && ct->kind != TY_INVALID) {
+                diag_error(g->const_te->span, "E0471",
+                           "const generic parameter must have an integer or function type, found %s", type_str(ct));
                 ct = t_usize;
             }
         } else if (g->constraint) {
             int cc = (int)constraint_from_name(g->constraint);
-            if (cc < 0 || !g->constraint) {
+            if (cc < 0 || cc == C_NONE) {
                 diag_error(g->constraint_span, "E0470",
-                           "unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt, Float or FloatVector)",
+                           "unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt, Float, FloatVector, IntVector or Vector)",
                            g->constraint);
-                cc = C_NONE;
+                c = C_NONE;
+            } else {
+                c = (Constraint)cc;
+                bool is_vec_c = constraint_is_vec(c);
+                if (is_vec_c && !g->constraint_te) {
+                    diag_error(g->constraint_span, "E0470",
+                               "vector constraint '%s' requires a lane type, e.g. %s[f32]", g->constraint,
+                               g->constraint);
+                    lane = t_invalid;
+                } else if (!is_vec_c && g->constraint_te) {
+                    diag_error(g->constraint_te->span, "E0470", "constraint '%s' does not take a lane type parameter",
+                               g->constraint);
+                } else if (is_vec_c && g->constraint_te) {
+                    lane = resolve_type(g->constraint_te, &tc);
+                    if (lane->kind != TY_INVALID) {
+                        bool ok_lane = false;
+                        if (c == C_FLOAT_VEC) {
+                            ok_lane = lane->kind == TY_FLOAT ||
+                                      (lane->kind == TY_PARAM && type_satisfies(lane, C_FLOAT));
+                        } else if (c == C_INT_VEC) {
+                            ok_lane = lane->kind == TY_INT ||
+                                      (lane->kind == TY_PARAM && type_satisfies(lane, C_INT));
+                        } else {
+                            ok_lane = lane->kind == TY_INT || lane->kind == TY_FLOAT ||
+                                      (lane->kind == TY_PARAM &&
+                                       (type_satisfies(lane, C_NUM) || type_satisfies(lane, C_INT) ||
+                                        type_satisfies(lane, C_FLOAT)));
+                        }
+                        if (!ok_lane) {
+                            diag_error(g->constraint_te->span, "E0470", "invalid lane type %s for constraint '%s'",
+                                       type_str(lane), g->constraint);
+                            lane = t_invalid;
+                        }
+                    }
+                }
             }
-            c = (Constraint)cc;
         }
         g->type = type_param(d, i, g->name, c, g->is_const, ct);
+        g->type->constraint_lane = lane;
         for (int j = 0; j < (placeholder(g->name) ? 0 : i); j++)
             if (d->gparams.data[j].name == g->name) dup_error(g->span, g->name, d->gparams.data[j].span);
     }
+    d->gparams_resolving = false;
+    d->gparams_done = true;
 }
 
 Type **decl_gparam_types(Decl *d) {
@@ -302,6 +348,12 @@ Type **decl_gparam_types(Decl *d) {
     Type **ts = NEWN(Type *, d->gparams.len + 1);
     for (int i = 0; i < d->gparams.len; i++) ts[i] = d->gparams.data[i].type;
     return ts;
+}
+
+const char *param_constraint_str(const Type *t) {
+    if (constraint_is_vec(t->constraint) && t->constraint_lane)
+        return arena_printf("%s[%s]", constraint_name(t->constraint), type_str(t->constraint_lane));
+    return constraint_name(t->constraint);
 }
 
 Type *make_self_type(Decl *d) {
@@ -316,7 +368,7 @@ Type *lookup_gparam(TypeCtx *tc, Sym name) {
         if (!d) continue;
         ensure_gparams(d);
         for (int i = 0; i < d->gparams.len; i++)
-            if (d->gparams.data[i].name == name) return d->gparams.data[i].type;
+            if (d->gparams.data[i].name == name && d->gparams.data[i].type) return d->gparams.data[i].type;
     }
     return NULL;
 }
@@ -372,26 +424,203 @@ static int64_t const_array_len(Expr *ce, TypeCtx *tc) {
     return -1;
 }
 
-// A generic argument: a type, an integer literal, or a const name.
-static Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc) {
-    if (te->kind == TE_INTLIT) return type_constint((int64_t)te->ival);
-    if (te->kind == TE_NAMED && !te->has_args) {
-        if (!te->qual) {
-            Type *gp = lookup_gparam(tc, te->name);
-            if (gp) return gp;
+static Type *check_size(Span sp, Type *t);
+
+static bool type_has_invalid(Type *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TY_INVALID: return true;
+    case TY_PTR:
+    case TY_SLICE:
+    case TY_ARRAY:
+    case TY_OPT:
+    case TY_ERRUNION:
+    case TY_VEC:
+    case TY_ENUM: return type_has_invalid(t->elem);
+    case TY_FN:
+        for (int i = 0; i < t->nparams; i++)
+            if (type_has_invalid(t->params[i])) return true;
+        return type_has_invalid(t->ret);
+    case TY_STRUCT:
+    case TY_UNION:
+    case TY_CONSTFN:
+        for (int i = 0; i < t->nargs; i++)
+            if (type_has_invalid(t->args[i])) return true;
+        return t->const_type && type_has_invalid(t->const_type);
+    case TY_PARAM:
+        return (t->const_type && type_has_invalid(t->const_type)) ||
+               (t->constraint_lane && type_has_invalid(t->constraint_lane));
+    default: return false;
+    }
+}
+
+static Type *resolve_fn_garg(Decl *fn, Type **owner_args, int nowner, bool has_args, TypeExprVec *args_tes,
+                              Span sp, Span name_span, TypeCtx *tc) {
+    resolve_decl(fn);
+    if (fn->state != 2 || !fn->type) return t_invalid;
+    if (fn->cabi) {
+        diag_error(name_span, "E0801",
+                   "the C function '%s' takes or returns a structure by value: it can only be called directly",
+                   fn->name);
+        return t_invalid;
+    }
+    if (fn->kind == D_HOST_FN || fn->gparams.len == 0) {
+        if (has_args) {
+            diag_error(sp, "E0468", "'%s' is not generic", fn->name);
+            return t_invalid;
         }
-        Decl *d = resolve_named_decl(te, tc, false);
-        if (d && d->kind == D_CONST) {
+        Type *fn_ty = nowner ? type_subst(fn->type, fn->all_gparams, owner_args, nowner) : fn->type;
+        return type_constfn(fn, owner_args, nowner, fn_ty);
+    }
+    if (!has_args) {
+        Diag *dg = diag_error(sp, "E0466", "generic function '%s' must be instantiated before use: %s.[...]",
+                              fn->name, fn->name);
+        diag_note(dg, fn->name_span, "'%s' declared here", fn->name);
+        return t_invalid;
+    }
+    int nown = args_tes ? args_tes->len : 0;
+    Type **own_args = NEWN(Type *, nown + 1);
+    for (int i = 0; i < nown; i++) own_args[i] = resolve_generic_arg(args_tes->data[i], tc);
+    if (!check_generic_args_ctx(fn, owner_args, nowner, own_args, nown, sp, args_tes)) return t_invalid;
+    int nall = nowner + nown;
+    Type **all_args = NEWN(Type *, nall + 1);
+    for (int i = 0; i < nowner; i++) all_args[i] = owner_args[i];
+    for (int i = 0; i < nown; i++) all_args[nowner + i] = own_args[i];
+    Type *fn_ty = nall ? type_subst(fn->type, fn->all_gparams, all_args, nall) : fn->type;
+    return type_constfn(fn, all_args, nall, fn_ty);
+}
+
+static Type *resolve_method_garg(Decl *td, Type **owner_args, int nowner, Sym mem, Span mem_span,
+                                  bool has_margs, TypeExprVec *margs_tes, Span sp, TypeCtx *tc) {
+    Decl *m = find_method(td, mem);
+    if (!m) {
+        Type *base_t = nowner ? type_named(td, owner_args, nowner) : td->type;
+        diag_error(mem_span, "E0404", "type %s has no member '%s'", type_str(base_t), mem);
+        return t_invalid;
+    }
+    if (!m->is_pub && m->module != tc->mod) {
+        Diag *dg = diag_error(mem_span, "E0203", "'%s' is not public", mem);
+        diag_note(dg, m->name_span, "declared here");
+        return t_invalid;
+    }
+    return resolve_fn_garg(m, owner_args, nowner, has_margs, margs_tes, sp, mem_span, tc);
+}
+
+// A generic argument: a type, an integer literal, a const name, or a function.
+Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc) {
+    if (te->kind == TE_INTLIT) return type_constint((int64_t)te->ival);
+    if (te->kind != TE_NAMED) return resolve_type(te, tc);
+    if (te->has_member) {
+        if (!te->qual && lookup_gparam(tc, te->name)) {
+            diag_error(te->span, "E0468", "generic parameter '%s' cannot take arguments", te->name);
+            return t_invalid;
+        }
+        Decl *td = resolve_named_decl(te, tc, true);
+        if (!td) return t_invalid;
+        if (td->kind != D_STRUCT && td->kind != D_UNION && td->kind != D_ENUM) {
+            diag_error(te->name_span, "E0400", "'%s' is not a type", te->name);
+            return t_invalid;
+        }
+        resolve_decl(td);
+        if (!td->type) return t_invalid;
+        Type **owner_args = NULL;
+        int nowner = 0;
+        if (td->gparams.len == 0) {
+            if (te->has_args) {
+                diag_error(te->span, "E0468", "'%s' is not generic", td->name);
+                return t_invalid;
+            }
+        } else {
+            if (!te->has_args) {
+                Diag *dg = diag_error(te->span, "E0460", "generic type '%s' must be given arguments: %s.[...]",
+                                      td->name, td->name);
+                diag_note(dg, td->name_span, "'%s' declared here", td->name);
+                return t_invalid;
+            }
+            nowner = te->args.len;
+            owner_args = NEWN(Type *, nowner + 1);
+            for (int i = 0; i < nowner; i++) owner_args[i] = resolve_generic_arg(te->args.data[i], tc);
+            if (!check_generic_args_ctx(td, NULL, 0, owner_args, nowner, te->span, &te->args)) return t_invalid;
+            check_size(te->span, type_named(td, owner_args, nowner));
+        }
+        return resolve_method_garg(td, owner_args, nowner, te->member, te->member_span,
+                                   te->member_has_args, &te->member_args, te->span, tc);
+    }
+    if (te->qual) {
+        Decl *imp = symmap_get(&tc->mod->imports, te->qual);
+        if (imp) {
+            if (!imp->imported) return t_invalid;
+            Decl *d = module_lookup(imp->imported, te->name);
+            if (!d) {
+                diag_error(te->name_span, "E0202", "module '%s' has no declaration '%s'", te->qual, te->name);
+                return t_invalid;
+            }
+            if (!d->is_pub) {
+                Diag *dg = diag_error(te->name_span, "E0203", "'%s' is not public in module '%s'", te->name, te->qual);
+                diag_note(dg, d->name_span, "declared here");
+                return t_invalid;
+            }
+            if (d->kind == D_FN || d->kind == D_HOST_FN)
+                return resolve_fn_garg(d, NULL, 0, te->has_args, &te->args, te->span, te->name_span, tc);
+            if (d->kind == D_CONST) {
+                if (te->has_args) {
+                    diag_error(te->span, "E0468", "'%s' is not generic", te->name);
+                    return t_invalid;
+                }
+                resolve_decl(d);
+                if (d->cexpr && d->cexpr->is_const && d->type->kind == TY_INT)
+                    return type_constint((int64_t)d->cexpr->cval);
+                diag_error(te->span, "E0472", "const '%s' is not an integer constant", te->name);
+                return t_invalid;
+            }
+            return resolve_type(te, tc);
+        }
+        Decl *td = module_lookup(tc->mod, te->qual);
+        if (td && (td->kind == D_STRUCT || td->kind == D_UNION || td->kind == D_ENUM)) {
+            resolve_decl(td);
+            if (!td->type) return t_invalid;
+            if (td->gparams.len > 0) {
+                Diag *dg = diag_error(te->span, "E0460", "generic type '%s' must be given arguments: %s.[...]",
+                                      td->name, td->name);
+                diag_note(dg, td->name_span, "'%s' declared here", td->name);
+                return t_invalid;
+            }
+            return resolve_method_garg(td, NULL, 0, te->name, te->name_span, te->has_args, &te->args, te->span, tc);
+        }
+        return resolve_type(te, tc);
+    }
+    if (!te->has_args) {
+        Type *gp = lookup_gparam(tc, te->name);
+        if (gp) return gp;
+    } else if (lookup_gparam(tc, te->name)) {
+        diag_error(te->span, "E0468", "generic parameter '%s' cannot take arguments", te->name);
+        return t_invalid;
+    }
+    Decl *d = module_lookup(tc->mod, te->name);
+    if (d) {
+        if (d->kind == D_FN || d->kind == D_HOST_FN)
+            return resolve_fn_garg(d, NULL, 0, te->has_args, &te->args, te->span, te->name_span, tc);
+        if (d->kind == D_CONST) {
+            if (te->has_args) {
+                diag_error(te->span, "E0468", "'%s' is not generic", te->name);
+                return t_invalid;
+            }
             resolve_decl(d);
-            if (d->cexpr && d->cexpr->is_const && d->type->kind == TY_INT) return type_constint((int64_t)d->cexpr->cval);
+            if (d->cexpr && d->cexpr->is_const && d->type->kind == TY_INT)
+                return type_constint((int64_t)d->cexpr->cval);
             diag_error(te->span, "E0472", "const '%s' is not an integer constant", te->name);
             return t_invalid;
         }
+        return resolve_type(te, tc);
+    }
+    if (C && tc == &C->tc && scope_lookup(te->name)) {
+        diag_error(te->span, "E0462", "'%s' is a local variable and cannot be used as a generic argument", te->name);
+        return t_invalid;
     }
     return resolve_type(te, tc);
 }
 
-bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes) {
+bool check_generic_args_ctx(Decl *d, Type **owner_args, int nowner, Type **args, int n, Span sp, TypeExprVec *tes) {
     ensure_gparams(d);
     if (n != d->gparams.len) {
         diag_error(sp, "E0467", "'%s' takes %d generic argument%s, but %d %s given", d->name, d->gparams.len,
@@ -399,27 +628,86 @@ bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes) 
         return false;
     }
     bool ok = true;
+    int op = d->owner ? d->owner->gparams.len : 0;
+    Type **from = NEWN(Type *, op + n + 1);
+    Type **to = NEWN(Type *, op + n + 1);
+    int base_sub = 0;
+    for (int k = 0; k < op; k++) {
+        from[base_sub] = d->owner->gparams.data[k].type;
+        to[base_sub] = (owner_args && k < nowner) ? owner_args[k] : d->owner->gparams.data[k].type;
+        base_sub++;
+    }
     for (int i = 0; i < n; i++) {
         GenericParam *g = &d->gparams.data[i];
         Type *a = args[i];
         Span asp = tes && i < tes->len ? tes->data[i]->span : sp;
+        int nsub = base_sub + i;
+        if (i > 0) {
+            from[base_sub + i - 1] = d->gparams.data[i - 1].type;
+            to[base_sub + i - 1] = args[i - 1];
+        }
         if (a->kind == TY_INVALID) continue;
         if (g->is_const) {
-            if (a->kind == TY_CONSTINT) {
-                if (!fits_type(a->cval, g->type->const_type)) {
-                    diag_error(asp, "E0462", "value %lld does not fit const parameter '%s' of type %s",
-                               (long long)a->cval, g->name, type_str(g->type->const_type));
+            Type *ect = nsub ? type_subst(g->type->const_type, from, to, nsub) : g->type->const_type;
+            if (type_has_invalid(ect)) continue;
+            if (ect->kind == TY_FN) {
+                if (a->kind == TY_CONSTFN) {
+                    if (type_has_invalid(a->const_type)) continue;
+                    if (a->const_type != ect) {
+                        Diag *dg = diag_error(asp, "E0462", "generic parameter '%s' expects function %s, found %s",
+                                              g->name, type_str(ect), type_str(a->const_type));
+                        diag_note(dg, g->span, "'%s' declared here", g->name);
+                        ok = false;
+                    }
+                } else if (a->kind == TY_PARAM && a->is_const) {
+                    Type *act = nsub ? type_subst(a->const_type, from, to, nsub) : a->const_type;
+                    if (act != ect) {
+                        Diag *dg = diag_error(asp, "E0462", "generic parameter '%s' expects function %s, found %s",
+                                              g->name, type_str(ect), type_str(act));
+                        diag_note(dg, g->span, "'%s' declared here", g->name);
+                        ok = false;
+                    }
+                } else {
+                    Diag *dg = diag_error(asp, "E0462", "generic parameter '%s' expects a %s function, found %s",
+                                          g->name, type_str(ect), type_str(a));
+                    diag_note(dg, g->span, "'%s' declared here", g->name);
                     ok = false;
                 }
-            } else if (!(a->kind == TY_PARAM && a->is_const && a->const_type == g->type->const_type)) {
-                diag_error(asp, "E0462", "generic parameter '%s' expects a %s constant, found %s", g->name,
-                           type_str(g->type->const_type), type_str(a));
-                ok = false;
+            } else {
+                if (a->kind == TY_CONSTINT) {
+                    if (!fits_type(a->cval, ect)) {
+                        diag_error(asp, "E0462", "value %lld does not fit const parameter '%s' of type %s",
+                                   (long long)a->cval, g->name, type_str(ect));
+                        ok = false;
+                    }
+                } else if (a->kind == TY_PARAM && a->is_const) {
+                    Type *act = nsub ? type_subst(a->const_type, from, to, nsub) : a->const_type;
+                    if (act != ect) {
+                        diag_error(asp, "E0462", "generic parameter '%s' expects a %s constant, found %s",
+                                   g->name, type_str(ect), type_str(act));
+                        ok = false;
+                    }
+                } else {
+                    diag_error(asp, "E0462", "generic parameter '%s' expects a %s constant, found %s", g->name,
+                               type_str(ect), type_str(a));
+                    ok = false;
+                }
             }
         } else {
-            if (a->kind == TY_CONSTINT || (a->kind == TY_PARAM && a->is_const)) {
+            if (a->kind == TY_CONSTINT || a->kind == TY_CONSTFN || (a->kind == TY_PARAM && a->is_const)) {
                 diag_error(asp, "E0462", "generic parameter '%s' expects a type, found a constant", g->name);
                 ok = false;
+            } else if (constraint_is_vec(g->type->constraint)) {
+                Type *elane = g->type->constraint_lane;
+                if (elane && nsub) elane = type_subst(elane, from, to, nsub);
+                if (!elane || type_has_invalid(elane)) continue;
+                if (!type_satisfies_with_lane(a, g->type->constraint, elane)) {
+                    Diag *dg = diag_error(asp, "E0462",
+                                          "type %s does not satisfy constraint %s[%s] of parameter '%s'",
+                                          type_str(a), constraint_name(g->type->constraint), type_str(elane), g->name);
+                    diag_note(dg, g->span, "'%s' declared here", g->name);
+                    ok = false;
+                }
             } else if (!type_satisfies(a, g->type->constraint)) {
                 Diag *dg = diag_error(asp, "E0462", "type %s does not satisfy constraint %s of parameter '%s'",
                                       type_str(a), constraint_name(g->type->constraint), g->name);
@@ -429,6 +717,10 @@ bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes) 
         }
     }
     return ok;
+}
+
+bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes) {
+    return check_generic_args_ctx(d, NULL, 0, args, n, sp, tes);
 }
 
 // Object sizes (spec §5.5): every array, error union, struct and union type
@@ -535,6 +827,11 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
             int64_t n = const_array_len(l->expr, tc);
             return n < 0 ? t_invalid : check_size(te->span, type_array(e, n));
         }
+        if (l->kind == TE_NAMED && C && tc == &C->tc && !l->qual && !l->has_args && !l->has_member &&
+            scope_lookup(l->name)) {
+            diag_error(l->span, "E0472", "array length must be an integer constant");
+            return t_invalid;
+        }
         Type *a = resolve_generic_arg(l, tc);
         if (a->kind == TY_CONSTINT) {
             if (a->cval < 0) {
@@ -543,7 +840,8 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
             }
             return check_size(te->span, type_array(e, a->cval));
         }
-        if (a->kind == TY_PARAM && a->is_const) return type_array_param(e, a);
+        if (a->kind == TY_PARAM && a->is_const && a->const_type && a->const_type->kind == TY_INT)
+            return type_array_param(e, a);
         if (a->kind != TY_INVALID) diag_error(l->span, "E0472", "array length must be an integer constant");
         return t_invalid;
     }
@@ -565,6 +863,10 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         return check_size(te->span, d->type);
     }
     case TE_NAMED: {
+        if (te->has_member) {
+            diag_error(te->span, "E0400", "expected a type");
+            return t_invalid;
+        }
         if (!te->qual) {
             Type *gp = lookup_gparam(tc, te->name);
             if (gp) {
@@ -589,6 +891,10 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         }
         resolve_decl(d);
         if (!d->type) {
+            if (d->kind != D_ENUM && d->gparams_resolving) {
+                diag_error(te->span, "E0355", "the generic parameters of '%s' depend on '%s'", d->name, d->name);
+                return t_invalid;
+            }
             // (an enum still being resolved: named in its own representation, or
             // in that of an enum it depends on)
             diag_error(te->span, "E0308", "an enum's representation must be an integer type, found %s",
@@ -696,7 +1002,7 @@ static void resolve_fn(Decl *d) {
     d->ret_type = d->ret_te ? resolve_type(d->ret_te, &tc) : t_void;
     d->type = type_fn(d->param_types, d->params.len, d->ret_type);
     d->self_kind = SELF_NONE;
-    if (owner && d->params.len > 0 && strcmp(d->params.data[0].name, "self") == 0) {
+    if (owner && owner->type && d->params.len > 0 && strcmp(d->params.data[0].name, "self") == 0) {
         Type *pt = d->param_types[0];
         Type *self = owner->type;
         if (pt == self) d->self_kind = SELF_VALUE;
@@ -815,7 +1121,7 @@ static void add_set_name(Decl *d, Sym n) {
 
 // The error set a type expression names, or NULL (after an error).
 Decl *resolve_set_te(TypeExpr *te, TypeCtx *tc) {
-    if (te->kind != TE_NAMED) {
+    if (te->kind != TE_NAMED || te->has_member) {
         diag_error(te->span, "E0654", "expected the name of an error set");
         return NULL;
     }
@@ -924,6 +1230,8 @@ Decl *expected_set(Type *t) {
 // The function E0355 was last reported for.
 static Decl *self_dep;
 
+static bool is_const_init(Expr *e);
+
 void resolve_decl(Decl *d) {
     if (d->state == 2) return;
     if (d->state == 1) {
@@ -973,8 +1281,9 @@ void resolve_decl(Decl *d) {
         TypeCtx tc = {d->module, NULL, NULL, NULL};
         d->type = resolve_type(d->te, &tc);
         if (d->type->kind != TY_INT && d->type->kind != TY_FLOAT && d->type->kind != TY_BOOL &&
-            d->type->kind != TY_ENUM && d->type->kind != TY_INVALID) {
-            diag_error(d->te->span, "E0352", "constants must have an integer, float, bool or enum type, found %s",
+            d->type->kind != TY_ENUM && d->type->kind != TY_STRUCT && d->type->kind != TY_INVALID) {
+            diag_error(d->te->span, "E0352",
+                       "constants must have an integer, float, bool, enum or struct type, found %s",
                        type_str(d->type));
             d->type = t_invalid;
         }
@@ -984,8 +1293,9 @@ void resolve_decl(Decl *d) {
         check_expr_to(&d->init, d->type);
         C = saved;
         d->cexpr = d->init;
-        if (!d->init->is_const && d->init->kind != E_BOOL && d->type->kind != TY_INVALID &&
-            d->init->type->kind != TY_INVALID)
+        bool ok_const = d->type->kind == TY_STRUCT ? is_const_init(d->init)
+                                                   : (d->init->is_const || d->init->kind == E_BOOL);
+        if (!ok_const && d->type->kind != TY_INVALID && d->init->type->kind != TY_INVALID)
             diag_error(d->init->span, "E0350", "constant initializer must be a constant expression");
         break;
     }
@@ -1062,7 +1372,9 @@ static bool is_const_init(Expr *e) {
         return true;
     case E_FIELD:
         return e->op == FK_VARIANT_UNIT || e->op == FK_CONST || (e->op == FK_DECL && e->decl && e->decl->kind == D_FN);
-    case E_IDENT: return e->cat == CAT_VALUE && e->decl && e->decl->kind == D_FN && e->type->kind == TY_FN;
+    case E_IDENT:
+        return e->cat == CAT_VALUE && e->decl &&
+               ((e->decl->kind == D_FN && e->type->kind == TY_FN) || e->decl->kind == D_CONST);
     case E_CALL: return e->op == CALLK_VARIANT && e->args.len == 1 && is_const_init(e->args.data[0]);
     case E_BUILTIN: return e->index == BI_PTR_FROM_INT && e->bargs.len == 2 && is_const_init(e->bargs.data[1].e);
     case E_UNARY: return e->op == TK_MINUS && is_const_init(e->a) && e->a->kind == E_FLOAT;

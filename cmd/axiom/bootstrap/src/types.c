@@ -30,6 +30,7 @@ static uint64_t type_hash(const Type *t) {
     h = mix(h, (uint64_t)(uintptr_t)t->len_param);
     h = mix(h, (uint64_t)(uintptr_t)t->ret);
     h = mix(h, (uint64_t)(uintptr_t)t->decl);
+    h = mix(h, (uint64_t)(uintptr_t)t->const_type);
     h = mix(h, (uint64_t)t->cval);
     for (int i = 0; i < t->nparams; i++) h = mix(h, (uint64_t)(uintptr_t)t->params[i]);
     for (int i = 0; i < t->nargs; i++) h = mix(h, (uint64_t)(uintptr_t)t->args[i]);
@@ -39,8 +40,8 @@ static uint64_t type_hash(const Type *t) {
 static bool type_eq_struct(const Type *a, const Type *b) {
     if (a->kind != b->kind || a->bits != b->bits || a->is_signed != b->is_signed || a->is_size != b->is_size ||
         a->mut != b->mut || a->lanes != b->lanes || a->elem != b->elem || a->len != b->len ||
-        a->len_param != b->len_param || a->ret != b->ret || a->decl != b->decl || a->cval != b->cval ||
-        a->nparams != b->nparams || a->nargs != b->nargs)
+        a->len_param != b->len_param || a->ret != b->ret || a->decl != b->decl || a->const_type != b->const_type ||
+        a->cval != b->cval || a->nparams != b->nparams || a->nargs != b->nargs)
         return false;
     for (int i = 0; i < a->nparams; i++)
         if (a->params[i] != b->params[i]) return false;
@@ -85,6 +86,7 @@ static Type *intern_type(Type *proto) {
     if (t->elem && t->elem->has_params) hp = true;
     if (t->len_param) hp = true;
     if (t->ret && t->ret->has_params) hp = true;
+    if (t->const_type && t->const_type->has_params) hp = true;
     for (int i = 0; i < t->nparams; i++)
         if (t->params[i]->has_params) hp = true;
     for (int i = 0; i < t->nargs; i++)
@@ -97,6 +99,7 @@ static Type *intern_type(Type *proto) {
     bool he = t->kind == TY_ENUM;
     if (t->elem && t->elem->has_enum) he = true;
     if (t->ret && t->ret->has_enum) he = true;
+    if (t->const_type && t->const_type->has_enum) he = true;
     for (int i = 0; i < t->nparams; i++)
         if (t->params[i]->has_enum) he = true;
     for (int i = 0; i < t->nargs; i++)
@@ -180,6 +183,11 @@ Type *type_errset(Decl *set) {
 }
 Type *type_constint(int64_t v) {
     Type p = {.kind = TY_CONSTINT, .cval = v};
+    return intern_type(&p);
+}
+
+Type *type_constfn(Decl *d, Type **args, int n, Type *fn_ty) {
+    Type p = {.kind = TY_CONSTFN, .decl = d, .args = args, .nargs = n, .const_type = fn_ty};
     return intern_type(&p);
 }
 
@@ -354,6 +362,11 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
         for (int i = 0; i < t->nargs; i++) as[i] = type_subst(t->args[i], from, to, n);
         return type_named(t->decl, as, t->nargs);
     }
+    case TY_CONSTFN: {
+        Type **as = NEWN(Type *, t->nargs + 1);
+        for (int i = 0; i < t->nargs; i++) as[i] = type_subst(t->args[i], from, to, n);
+        return type_constfn(t->decl, as, t->nargs, type_subst(t->const_type, from, to, n));
+    }
     default: return t;
     }
 }
@@ -390,6 +403,11 @@ Type *type_lower_enums(Type *t) {
         Type **as = NEWN(Type *, t->nargs + 1);
         for (int i = 0; i < t->nargs; i++) as[i] = type_lower_enums(t->args[i]);
         return type_named(t->decl, as, t->nargs);
+    }
+    case TY_CONSTFN: {
+        Type **as = NEWN(Type *, t->nargs + 1);
+        for (int i = 0; i < t->nargs; i++) as[i] = type_lower_enums(t->args[i]);
+        return type_constfn(t->decl, as, t->nargs, type_lower_enums(t->const_type));
     }
     default: return t;
     }
@@ -493,6 +511,33 @@ static void tstr(CharVec *b, Type *t) {
     case TY_ERROR: puts_b(b, t->decl ? t->decl->name : "error"); return;
     case TY_PARAM: puts_b(b, t->name); return;
     case TY_CONSTINT: snprintf(tmp, sizeof tmp, "%lld", (long long)t->cval); puts_b(b, tmp); return;
+    case TY_CONSTFN: {
+        Decl *d = t->decl;
+        int nown = d->kind == D_HOST_FN ? 0 : d->gparams.len;
+        int nowner = d->owner ? d->owner->gparams.len : 0;
+        if (d->owner) {
+            puts_b(b, d->owner->name);
+            if (nowner) {
+                puts_b(b, ".[");
+                for (int i = 0; i < nowner && i < t->nargs; i++) {
+                    if (i) puts_b(b, ", ");
+                    tstr(b, t->args[i]);
+                }
+                puts_b(b, "]");
+            }
+            puts_b(b, ".");
+        }
+        puts_b(b, d->name);
+        if (nown && t->nargs >= nown) {
+            puts_b(b, ".[");
+            for (int i = t->nargs - nown; i < t->nargs; i++) {
+                if (i > t->nargs - nown) puts_b(b, ", ");
+                tstr(b, t->args[i]);
+            }
+            puts_b(b, "]");
+        }
+        return;
+    }
     case TY_UNTYPED_INT: puts_b(b, "integer literal"); return;
     case TY_UNTYPED_FLOAT: puts_b(b, "float literal"); return;
     case TY_NEVER: puts_b(b, "noreturn"); return;
@@ -661,11 +706,14 @@ Constraint constraint_from_name(Sym s) {
     if (!strcmp(s, "UnsignedInt")) return C_UNSIGNED;
     if (!strcmp(s, "Float")) return C_FLOAT;
     if (!strcmp(s, "FloatVector")) return C_FLOAT_VEC;
+    if (!strcmp(s, "IntVector")) return C_INT_VEC;
+    if (!strcmp(s, "Vector")) return C_VEC;
     return (Constraint)-1;
 }
 
 const char *constraint_name(Constraint c) {
-    static const char *n[] = {"(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float", "FloatVector"};
+    static const char *n[] = {"(none)",   "Eq",          "Ord",         "Num",   "Int",   "SignedInt",
+                              "UnsignedInt", "Float",    "FloatVector", "IntVector", "Vector"};
     return n[c];
 }
 
@@ -679,15 +727,28 @@ static bool implies(Constraint a, Constraint b) {
     case C_SIGNED:
     case C_UNSIGNED: return b == C_EQ || b == C_ORD || b == C_NUM || b == C_INT;
     case C_FLOAT: return b == C_EQ || b == C_ORD || b == C_NUM;
+    case C_FLOAT_VEC:
+    case C_INT_VEC: return b == C_VEC;
     default: return false;
     }
 }
 
 bool type_satisfies(Type *t, Constraint c) {
     if (t->kind == TY_INVALID) return true;
-    if (t->kind == TY_PARAM) return !t->is_const && implies(t->constraint, c);
+    if (t->kind == TY_PARAM) {
+        if (t->is_const) return false;
+        if (c == C_FLOAT_VEC && t->constraint == C_VEC && t->constraint_lane) {
+            return t->constraint_lane->kind == TY_FLOAT ||
+                   (t->constraint_lane->kind == TY_PARAM && type_satisfies(t->constraint_lane, C_FLOAT));
+        }
+        if (c == C_INT_VEC && t->constraint == C_VEC && t->constraint_lane) {
+            return t->constraint_lane->kind == TY_INT ||
+                   (t->constraint_lane->kind == TY_PARAM && type_satisfies(t->constraint_lane, C_INT));
+        }
+        return implies(t->constraint, c);
+    }
     switch (c) {
-    case C_NONE: return t->kind != TY_VOID && t->kind != TY_CONSTINT && t->kind != TY_NEVER;
+    case C_NONE: return t->kind != TY_VOID && t->kind != TY_CONSTINT && t->kind != TY_CONSTFN && t->kind != TY_NEVER;
     case C_EQ:
         return t->kind == TY_INT || t->kind == TY_FLOAT || t->kind == TY_BOOL || t->kind == TY_PTR ||
                t->kind == TY_ERROR || t->kind == TY_FN || t->kind == TY_ENUM;
@@ -698,8 +759,26 @@ bool type_satisfies(Type *t, Constraint c) {
     case C_UNSIGNED: return t->kind == TY_INT && !t->is_signed;
     case C_FLOAT: return t->kind == TY_FLOAT;
     case C_FLOAT_VEC: return ty_is_vec_float(t);
+    case C_INT_VEC: return ty_is_vec_int(t);
+    case C_VEC: return t->kind == TY_VEC;
     }
     return false;
+}
+
+bool type_satisfies_with_lane(Type *t, Constraint c, Type *expected_lane) {
+    if (t->kind == TY_INVALID) return true;
+    if (!constraint_is_vec(c)) return type_satisfies(t, c);
+    if (expected_lane && expected_lane->kind == TY_INVALID) return true;
+    if (t->kind == TY_PARAM) {
+        if (!type_satisfies(t, c)) return false;
+        return !expected_lane || t->constraint_lane == expected_lane;
+    }
+    switch (c) {
+    case C_FLOAT_VEC: return ty_is_vec_float(t) && (!expected_lane || t->elem == expected_lane);
+    case C_INT_VEC: return ty_is_vec_int(t) && (!expected_lane || t->elem == expected_lane);
+    case C_VEC: return t->kind == TY_VEC && (!expected_lane || t->elem == expected_lane);
+    default: return false;
+    }
 }
 
 void int_range(Type *t, i128 *lo, i128 *hi) {

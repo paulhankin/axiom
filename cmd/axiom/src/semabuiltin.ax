@@ -64,7 +64,7 @@ fn set_ty(e: *mut ast.Expr, t: *mut ast.Type) *mut ast.Type {
 }
 
 pub fn earg(e: *mut ast.Expr, i: usize) *mut *mut ast.Expr {
-    return &mut ast.more(e).bargs.at(i).e;
+    return &mut ast.ext(e).bargs.at_mut(i).e;
 }
 
 pub fn find_field(s: *mut ast.Decl, name: []u8) i32 {
@@ -89,17 +89,17 @@ fn targ(e: *mut ast.Expr, i: usize) *mut ast.Type {
     if (i >= ast.more(e).bargs.len) or u.isnil(ast.more(e).bargs.at(i).t) {
         return ty.t_invalid;
     }
-    return resolve_arg(ast.more(e).bargs.at(i).t);
+    return resolve_arg(ast.ext(e).bargs.at_mut(i).t);
 }
 
 fn barg(e: *mut ast.Expr, i: usize) *mut ast.Expr {
-    return ast.more(e).bargs.at(i).e;
+    return ast.ext(e).bargs.at_mut(i).e;
 }
 
 fn check_bargs(e: *mut ast.Expr, from: usize) void {
     for i in from..ast.more(e).bargs.len {
         if u.notnil(ast.more(e).bargs.at(i).e) {
-            _ = check_expr(ast.more(e).bargs.at(i).e, tnil());
+            _ = check_expr(ast.ext(e).bargs.at_mut(i).e, tnil());
         }
     }
 }
@@ -137,8 +137,8 @@ fn is_unsigned_int_like(t: *ast.Type) bool {
 
 fn make_pair_struct(sp: u.Span, n0: []u8, t0: *mut ast.Type, n1: []u8, t1: *mut ast.Type) *mut ast.Type {
     let mut fv = u.List.[ast.Field].empty();
-    fv.push(ast.Field.{ name: u.intern(n0), te: u.nil.[ast.TypeExpr](), span: sp, ty: t0 });
-    fv.push(ast.Field.{ name: u.intern(n1), te: u.nil.[ast.TypeExpr](), span: sp, ty: t1 });
+    fv.push(ast.Field.{ name: u.intern(n0), te: u.nil.[ast.TypeExpr](), span: sp, ty: t0, is_pub: true });
+    fv.push(ast.Field.{ name: u.intern(n1), te: u.nil.[ast.TypeExpr](), span: sp, ty: t1, is_pub: true });
     return ty.anon_struct_decl(u.nil.[ast.Module](), fv, sp).ty;
 }
 
@@ -147,13 +147,26 @@ fn is_float_like(t: *ast.Type) bool {
            (t.kind == ast.TY_INVALID);
 }
 
-// A float vector, or a parameter constrained to be one (FloatVector).
-fn is_float_vec(t: *ast.Type) bool {
-    return ty.is_vec_float(t) or is_fvec_param(t);
+fn is_vec_param(t: *ast.Type) bool {
+    return (t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_VEC);
 }
 
 fn is_fvec_param(t: *ast.Type) bool {
     return (t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_FLOAT_VEC);
+}
+
+fn is_ivec_param(t: *ast.Type) bool {
+    return (t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_INT_VEC);
+}
+
+// A float vector, or a parameter constrained to be one (FloatVector, or Vector with float lane).
+fn is_float_vec(t: *ast.Type) bool {
+    return ty.is_vec_float(t) or is_fvec_param(t);
+}
+
+// An integer vector, or a parameter constrained to be one (IntVector, or Vector with integer lane).
+fn is_int_vec(t: *ast.Type) bool {
+    return ty.is_vec_int(t) or is_ivec_param(t);
 }
 
 // Check an operand; if it is an untyped literal, give it `hint` (or report).
@@ -776,7 +789,7 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     let id = ast.builtin_of(e);
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT) {
         let t = operand(earg(e, 0), x);
-        if not is_int_like(t) and not ty.is_vec_int(t) {
+        if not is_int_like(t) and not is_int_vec(t) {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires an integer, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
@@ -813,7 +826,9 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if (id == ast.BI_MIN) or (id == ast.BI_MAX) {
         let t = pair(e, x);
         let mut ok = ty.is_num(t) or is_float_vec(t) or ty.is_vec_int(t) or (t.kind == ast.TY_INVALID) or
-                     ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_ORD));
+                     ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_ORD)) or
+                     (is_ivec_param(t) and u.notnil(t.constraint_lane) and (t.constraint_lane.kind == ast.TY_INT) and
+                      (t.constraint_lane.bits != 64) and not t.constraint_lane.is_size);
         if ty.is_vec_int(t) and (t.elem.bits == 64) {
             ok = false;
         }
@@ -826,7 +841,10 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         let t = operand(earg(e, 0), x);
         let ok = ((t.kind == ast.TY_INT) and t.is_signed) or (t.kind == ast.TY_FLOAT) or is_float_vec(t) or
                  (ty.is_vec_int(t) and t.elem.is_signed) or (t.kind == ast.TY_INVALID) or
-                 ((t.kind == ast.TY_PARAM) and (ty.satisfies(t, ast.C_SIGNED) or ty.satisfies(t, ast.C_FLOAT)));
+                 ((t.kind == ast.TY_PARAM) and (ty.satisfies(t, ast.C_SIGNED) or ty.satisfies(t, ast.C_FLOAT))) or
+                 (is_ivec_param(t) and u.notnil(t.constraint_lane) and
+                  (((t.constraint_lane.kind == ast.TY_INT) and t.constraint_lane.is_signed) or
+                   ((t.constraint_lane.kind == ast.TY_PARAM) and ty.satisfies(t.constraint_lane, ast.C_SIGNED))));
         if not ok {
             _ = dg.err(e.span, "E0822", u.f1("@abs requires a signed integer or float, found %s", tstr(t)));
         }
@@ -943,16 +961,12 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
 
 // @splat(x): a vector of the type from context (x), each lane x.
 fn check_splat(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
-    if u.notnil(x) and is_fvec_param(x) {
-        // the lane type is not known: a float literal, converted to it
-        // when instantiated
-        let at = check_expr(barg(e, 0), tnil());
-        if (at.kind != ast.TY_UNTYPED_FLOAT) and (at.kind != ast.TY_UNTYPED_INT) and (at.kind != ast.TY_INVALID) {
-            _ = dg.err(barg(e, 0).span, "E0461",
-                       u.f1("@splat of a value to a FloatVector parameter '%s' needs a float literal", x.name));
-        } else {
-            _ = check_expr_to(earg(e, 0), ty.t_f64);
+    if u.notnil(x) and is_vec_param(x) {
+        if u.isnil(x.constraint_lane) or (x.constraint_lane.kind == ast.TY_INVALID) {
+            _ = check_expr(barg(e, 0), tnil());
+            return set_ty(e, x);
         }
+        _ = check_expr_to(earg(e, 0), x.constraint_lane);
         return set_ty(e, x);
     }
     if u.isnil(x) or ((x.kind != ast.TY_VEC) and (x.kind != ast.TY_INVALID)) {
@@ -990,7 +1004,7 @@ fn check_shuffle(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         return set_ty(e, t);
     }
     for i in 0..ast.args_of(idx).len {
-        let pi = ast.args_of(idx).at(i);
+        let pi = ast.args_mut(idx).at_mut(i);
         _ = check_expr(pi.*, ty.t_u32);
         if not pi.*.is_const or ast.cval_of(pi.*).is_neg() or ast.cval_of(pi.*).ge(u.I128.of(@as(i64, 2 * t.lanes))) {
             _ = dg.err(pi.*.span, "E0820", u.f1("shuffle index must be a constant in 0..%s",
@@ -1037,6 +1051,12 @@ fn check_dot(e: *mut ast.Expr) *mut ast.Type {
     }
     if ty.is_vec_float(t) {
         return set_ty(e, t.elem);
+    }
+    if is_fvec_param(t) {
+        if u.notnil(t.constraint_lane) {
+            return set_ty(e, t.constraint_lane);
+        }
+        return set_ty(e, ty.t_invalid);
     }
     if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i16) {
         return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 2));
@@ -1085,6 +1105,18 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_SPLAT {
         return check_splat(e, x);
     }
+    if id == ast.BI_LANES {
+        let v = targ(e, 0);
+        ast.set_tval(e, v);
+        if v.kind == ast.TY_VEC {
+            e.is_const = true;
+            ast.set_cval(e, u.I128.of(@as(i64, v.lanes)));
+        } else if not is_vec_param(v) and (v.kind != ast.TY_INVALID) {
+            _ = dg.err(e.span, "E0812", u.f1("@lanes requires a lane-typed vector type, found %s", tstr(v)));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, ty.t_usize);
+    }
     if id == ast.BI_VEC {
         let v = targ(e, 0);
         ast.set_tval(e, v);
@@ -1127,7 +1159,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_LOAD {
         let v = targ(e, 0);
         ast.set_tval(e, v);
-        if not ty.is_simd(v) and not is_fvec_param(v) and (v.kind != ast.TY_INVALID) {
+        if not ty.is_simd(v) and not is_vec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(e.span, "E0812", "@load requires a vector type");
         }
         let s = check_expr(barg(e, 1), tnil());
@@ -1142,7 +1174,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             _ = dg.err(barg(e, 0).span, "E0822", u.f1("@store writes to a []mut slice, found %s", tstr(s)));
         }
         let v = check_expr(barg(e, 1), tnil());
-        if not ty.is_simd(v) and not is_fvec_param(v) and (v.kind != ast.TY_INVALID) {
+        if not ty.is_simd(v) and not is_vec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(barg(e, 1).span, "E0812", "@store requires a vector value");
         }
         return set_ty(e, ty.t_void);
@@ -1177,13 +1209,19 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_LOAD_PARTIAL {
         let v = targ(e, 0);
         ast.set_tval(e, v);
-        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+        if (v.kind != ast.TY_VEC) and not is_vec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(e.span, "E0812", u.f1("@load_partial requires a vector type, found %s", tstr(v)));
         }
         let s = check_expr(barg(e, 1), tnil());
-        if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
-           not ((s.kind == ast.TY_SLICE) and (s.elem == v.elem)) {
-            _ = dg.err(barg(e, 1).span, "E0822", u.f2("@load_partial reads from a []%s slice, found %s", tstr(v.elem),
+        let mut lane = tnil();
+        if v.kind == ast.TY_VEC {
+            lane = v.elem;
+        } else if is_vec_param(v) {
+            lane = v.constraint_lane;
+        }
+        if u.notnil(lane) and (lane.kind != ast.TY_INVALID) and (s.kind != ast.TY_INVALID) and
+           not ((s.kind == ast.TY_SLICE) and (s.elem == lane)) {
+            _ = dg.err(barg(e, 1).span, "E0822", u.f2("@load_partial reads from a []%s slice, found %s", tstr(lane),
                                                       tstr(s)));
         }
         return set_ty(e, v);
@@ -1191,12 +1229,18 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_STORE_PARTIAL {
         let s = check_expr(barg(e, 0), tnil());
         let v = check_expr(barg(e, 1), tnil());
-        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+        let mut lane = tnil();
+        if v.kind == ast.TY_VEC {
+            lane = v.elem;
+        } else if is_vec_param(v) {
+            lane = v.constraint_lane;
+        }
+        if (v.kind != ast.TY_VEC) and not is_vec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(barg(e, 1).span, "E0812", u.f1("@store_partial requires a vector value, found %s", tstr(v)));
-        } else if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
-                  not ((s.kind == ast.TY_SLICE) and s.is_mut and (s.elem == v.elem)) {
-            _ = dg.err(barg(e, 0).span, "E0822", u.f2("@store_partial writes to a []mut %s slice, found %s",
-                                                      tstr(v.elem), tstr(s)));
+        } else if u.notnil(lane) and (lane.kind != ast.TY_INVALID) and (s.kind != ast.TY_INVALID) and
+                  not ((s.kind == ast.TY_SLICE) and s.is_mut and (s.elem == lane)) {
+            _ = dg.err(barg(e, 0).span, "E0822", u.f2("@store_partial writes to a []mut %s slice, found %s", tstr(lane),
+                                                      tstr(s)));
         }
         return set_ty(e, ty.t_void);
     }
@@ -1383,10 +1427,19 @@ fn check_vector_op_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     }
     if id == ast.BI_REDUCE_ADD {
         let t = check_expr(barg(e, 0), tnil());
-        if not require_vec(e, barg(e, 0), t) or (t.kind == ast.TY_INVALID) {
+        if t.kind == ast.TY_VEC {
+            return set_ty(e, t.elem);
+        }
+        if is_vec_param(t) {
+            if u.notnil(t.constraint_lane) {
+                return set_ty(e, t.constraint_lane);
+            }
             return set_ty(e, ty.t_invalid);
         }
-        return set_ty(e, t.elem);
+        if t.kind != ast.TY_INVALID {
+            _ = dg.err(barg(e, 0).span, "E0812", u.f2("@%s requires a SIMD vector, found %s", e.name, tstr(t)));
+        }
+        return set_ty(e, ty.t_invalid);
     }
     if id == ast.BI_DOT {
         return check_dot(e);

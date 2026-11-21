@@ -167,10 +167,21 @@ static TypeExpr *new_te(TEKind k, Span sp) {
     return t;
 }
 
+static bool at_field(Parser *P) {
+    if (pk(P) == KW_PUB) {
+        Token *t2 = peek2(P);
+        if (t2->kind != TK_IDENT) return false;
+        if (!strcmp(t2->name, "inline") && peek3(P)->kind == KW_FN) return false;
+        return true;
+    }
+    return pk(P) == TK_IDENT && !at_inline(P);
+}
+
 static void parse_field_list(Parser *P, FieldVec *out) {
     // Field ( "," Field )* ","?
-    while (pk(P) == TK_IDENT && !at_inline(P)) {
+    while (at_field(P)) {
         Field f = {0};
+        f.is_pub = accept(P, KW_PUB);
         f.name = expect_ident(P, &f.span);
         expect(P, TK_COLON);
         f.te = parse_type(P);
@@ -332,7 +343,7 @@ static TypeExpr *parse_type_in(Parser *P) {
         TypeExpr *te = new_te(TE_NAMED, start);
         te->name = t->name;
         te->name_span = t->span;
-        // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )?
+        // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
         if (pk(P) == TK_DOT) {
             TokKind k2 = peek2(P)->kind;
             if (k2 == TK_IDENT) {
@@ -352,6 +363,19 @@ static TypeExpr *parse_type_in(Parser *P) {
                 advance(P);
                 te->has_args = true;
                 parse_generic_arg_list(P, &te->args);
+            }
+        }
+        if (pk(P) == TK_DOT && peek2(P)->kind == TK_IDENT) {
+            advance(P);
+            Token *mem = advance(P);
+            te->has_member = true;
+            te->member = mem->name;
+            te->member_span = mem->span;
+            if (pk(P) == TK_DOT && peek2(P)->kind == TK_LBRACKET) {
+                advance(P);
+                advance(P);
+                te->member_has_args = true;
+                parse_generic_arg_list(P, &te->member_args);
             }
         }
         te->span = sp_from(P, start);
@@ -1168,7 +1192,13 @@ static void parse_generic_params(Parser *P, Decl *d) {
             g.const_te = parse_type(P);
         } else {
             g.name = expect_ident(P, &g.span);
-            if (accept(P, TK_COLON)) g.constraint = expect_ident(P, &g.constraint_span);
+            if (accept(P, TK_COLON)) {
+                g.constraint = expect_ident(P, &g.constraint_span);
+                if (accept(P, TK_LBRACKET)) {
+                    g.constraint_te = parse_type(P);
+                    expect(P, TK_RBRACKET);
+                }
+            }
         }
         vec_push(d->gparams, g);
         if (!accept(P, TK_COMMA)) break;

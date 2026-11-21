@@ -32,12 +32,14 @@ typedef struct FnCtx {
     Vec(bool) loop_breaks;  // per enclosing loop: has a break targeting it
     Vec(Sym) loop_labels;   // per enclosing loop: its label, or NULL
     bool const_ctx;
+    bool in_return;
 } FnCtx;
 
 extern FnCtx *C;
 
 // sema_decl.c
 Type *resolve_type(TypeExpr *te, TypeCtx *tc);
+Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc);
 void resolve_decl(Decl *d);
 Decl *resolve_set_te(TypeExpr *te, TypeCtx *tc);
 bool set_has(Decl *set, Sym name);
@@ -56,8 +58,10 @@ Decl *find_method(Decl *owner, Sym name);
 int find_variant(Decl *u, Sym name);
 int find_field(Decl *s, Sym name);
 bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes);
+bool check_generic_args_ctx(Decl *d, Type **owner_args, int nowner, Type **args, int n, Span sp, TypeExprVec *tes);
 Type *make_self_type(Decl *d);
 Type **decl_gparam_types(Decl *d);  // own params of a struct/union/fn
+const char *param_constraint_str(const Type *t);
 
 // sema_expr.c
 Type *check_expr(Expr *e, Type *expected);

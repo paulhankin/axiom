@@ -89,6 +89,12 @@ pub fn rune(r: u32) Arg {
 // Template entry points
 // -----------------------------------------------------------------------------
 
+/// Formats to `w` using a compile-time write function.
+pub fn write_to[W, const WRITE: fn(*mut W, []u8) !usize, const N: usize](
+    w: *mut W, template: []u8, args: [N]Arg) !void {
+    format_to.[W, WRITE](w, template, args[..])!;
+}
+
 /// Formats to a Writer.
 pub fn write[const N: usize](w: io.Writer, template: []u8, args: [N]Arg) !void {
     format(w, template, args[..])!;
@@ -111,7 +117,7 @@ pub fn eprint[const N: usize](template: []u8, args: [N]Arg) !void {
 /// Formats into new memory (free it with mem.free).
 pub fn alloc[const N: usize](template: []u8, args: [N]Arg) ![]mut u8 {
     let mut s = strs.String.init();
-    format(s.writer(), template, args[..]) catch |e| {
+    format_to.[strs.String, string_write_fn](&mut s, template, args[..]) catch |e| {
         s.deinit();
         return e;
     };
@@ -126,8 +132,23 @@ pub fn bufprint[const N: usize](out: []mut u8, template: []u8, args: [N]Arg) ![]
     return bw.written();
 }
 
+fn writer_write_fn(w: *mut io.Writer, buf: []u8) !usize {
+    return w.*.write(buf);
+}
+
+fn string_write_fn(s: *mut strs.String, buf: []u8) !usize {
+    s.push_str(buf)!;
+    return buf.len;
+}
+
 /// The template engine behind write, print, eprint, alloc and bufprint.
 pub fn format(w: io.Writer, template: []u8, args: []Arg) !void {
+    let mut wc = w;
+    format_to.[io.Writer, writer_write_fn](&mut wc, template, args)!;
+}
+
+/// The static template engine behind write_to and format.
+pub fn format_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, template: []u8, args: []Arg) !void {
     let mut next: usize = 0;
     let mut i: usize = 0;
     let mut lit: usize = 0;
@@ -135,7 +156,7 @@ pub fn format(w: io.Writer, template: []u8, args: []Arg) !void {
         let c = template[i];
         if c == '}' {
             if ((i + 1) < template.len) and (template[i + 1] == '}') {
-                w.write_all(template[lit..i + 1])!;
+                write_all_to.[W, WRITE](w, template[lit..i + 1])!;
                 i += 2;
                 lit = i;
                 continue;
@@ -146,9 +167,9 @@ pub fn format(w: io.Writer, template: []u8, args: []Arg) !void {
             i += 1;
             continue;
         }
-        w.write_all(template[lit..i])!;
+        write_all_to.[W, WRITE](w, template[lit..i])!;
         if ((i + 1) < template.len) and (template[i + 1] == '{') {
-            w.write_all("{")!;
+            write_all_to.[W, WRITE](w, "{")!;
             i += 2;
             lit = i;
             continue;
@@ -182,9 +203,9 @@ pub fn format(w: io.Writer, template: []u8, args: []Arg) !void {
         if index >= args.len {
             return error.BadFormat;
         }
-        write_arg(w, args[index], &spec)!;
+        write_arg_to.[W, WRITE](w, args[index], &spec)!;
     }
-    w.write_all(template[lit..])!;
+    write_all_to.[W, WRITE](w, template[lit..])!;
 }
 
 // -----------------------------------------------------------------------------
@@ -289,31 +310,43 @@ pub fn parse_spec(s: []u8) FmtError!Spec {
     return sp;
 }
 
-fn write_fill(w: io.Writer, fill: u8, n: usize) !void {
+fn write_all_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, bytes: []u8) !void {
+    let mut rest = bytes;
+    while rest.len > 0 {
+        let n = WRITE(w, rest)!;
+        if (n == 0) or (n > rest.len) {
+            return error.IoError;
+        }
+        rest = rest[n..];
+    }
+}
+
+fn write_fill_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, fill: u8, n: usize) !void {
     let mut chunk: [32]u8 = [0; 32];
     @mem_set(chunk[..], fill);
     let mut left = n;
     while left > 0 {
         let k = @min(left, 32);
-        w.write_all(chunk[..k])!;
+        write_all_to.[W, WRITE](w, chunk[..k])!;
         left -= k;
     }
 }
 
 /// Writes `sign` then `body` padded to the spec's width. Zero padding goes
 /// between the sign (and prefix) and the digits.
-fn write_padded(w: io.Writer, sp: *Spec, prefix: []u8, body: []u8, numeric: bool) !void {
+fn write_padded_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, sp: *Spec, prefix: []u8, body: []u8,
+                                                            numeric: bool) !void {
     let len = prefix.len + strs.rune_count(body);
     if len >= sp.width {
-        w.write_all(prefix)!;
-        w.write_all(body)!;
+        write_all_to.[W, WRITE](w, prefix)!;
+        write_all_to.[W, WRITE](w, body)!;
         return;
     }
     let pad = sp.width - len;
     if numeric and sp.zero and (sp.align == ALIGN_NONE) {
-        w.write_all(prefix)!;
-        write_fill(w, '0', pad)!;
-        w.write_all(body)!;
+        write_all_to.[W, WRITE](w, prefix)!;
+        write_fill_to.[W, WRITE](w, '0', pad)!;
+        write_all_to.[W, WRITE](w, body)!;
         return;
     }
     let mut align = sp.align;
@@ -329,13 +362,13 @@ fn write_padded(w: io.Writer, sp: *Spec, prefix: []u8, body: []u8, numeric: bool
     } else if align == ALIGN_CENTER {
         before = pad / 2;
     }
-    write_fill(w, sp.fill, before)!;
-    w.write_all(prefix)!;
-    w.write_all(body)!;
-    write_fill(w, sp.fill, pad - before)!;
+    write_fill_to.[W, WRITE](w, sp.fill, before)!;
+    write_all_to.[W, WRITE](w, prefix)!;
+    write_all_to.[W, WRITE](w, body)!;
+    write_fill_to.[W, WRITE](w, sp.fill, pad - before)!;
 }
 
-fn write_arg(w: io.Writer, a: Arg, sp: *Spec) !void {
+fn write_arg_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, a: Arg, sp: *Spec) !void {
     match a {
         .Int(v) => {
             let neg = v < 0;
@@ -343,27 +376,27 @@ fn write_arg(w: io.Writer, a: Arg, sp: *Spec) !void {
             if neg {
                 mag = 0 -% mag;
             }
-            write_integer(w, mag, neg, sp)!;
+            write_integer_to.[W, WRITE](w, mag, neg, sp)!;
         }
-        .Uint(v)    => { write_integer(w, v, false, sp)!; }
-        .Float(v)   => { write_float(w, @bit_cast(u64, v), F64, sp)!; }
-        .Float32(v) => { write_float(w, @as(u64, @bit_cast(u32, v)), F32, sp)!; }
-        .Str(s)     => { write_string(w, s, sp)!; }
+        .Uint(v)    => { write_integer_to.[W, WRITE](w, v, false, sp)!; }
+        .Float(v)   => { write_float_to.[W, WRITE](w, @bit_cast(u64, v), F64, sp)!; }
+        .Float32(v) => { write_float_to.[W, WRITE](w, @as(u64, @bit_cast(u32, v)), F32, sp)!; }
+        .Str(s)     => { write_string_to.[W, WRITE](w, s, sp)!; }
         .Bool(b) => {
             let mut t: []u8 = "false";
             if b {
                 t = "true";
             }
-            write_string(w, t, sp)!;
+            write_string_to.[W, WRITE](w, t, sp)!;
         }
         .Rune(r) => {
             let mut tmp: [4]u8 = [0; 4];
-            write_string(w, strs.encode_rune(tmp[..], r), sp)!;
+            write_string_to.[W, WRITE](w, strs.encode_rune(tmp[..], r), sp)!;
         }
     }
 }
 
-fn write_string(w: io.Writer, s: []u8, sp: *Spec) !void {
+fn write_string_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, s: []u8, sp: *Spec) !void {
     let mut body = s;
     if sp.has_precision {
         // at most `precision` code points
@@ -378,17 +411,22 @@ fn write_string(w: io.Writer, s: []u8, sp: *Spec) !void {
     if sp.kind == '?' {
         let mut q = strs.String.init();
         defer q.deinit();
-        write_quoted(q.writer(), body)!;
-        write_padded(w, sp, "", q.bytes(), false)!;
+        write_quoted_to.[strs.String, string_write_fn](&mut q, body)!;
+        write_padded_to.[W, WRITE](w, sp, "", q.bytes(), false)!;
         return;
     }
-    write_padded(w, sp, "", body, false)!;
+    write_padded_to.[W, WRITE](w, sp, "", body, false)!;
 }
 
 /// Writes s in double quotes with `"`, `\`, and control characters escaped
 /// (\n, \r, \t, or \u{..}); invalid UTF-8 bytes are written as \x...
 pub fn write_quoted(w: io.Writer, s: []u8) !void {
-    w.write_all("\"")!;
+    let mut wc = w;
+    write_quoted_to.[io.Writer, writer_write_fn](&mut wc, s)!;
+}
+
+fn write_quoted_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, s: []u8) !void {
+    write_all_to.[W, WRITE](w, "\"")!;
     let hex = "0123456789abcdef";
     let mut i: usize = 0;
     let mut lit: usize = 0;
@@ -427,14 +465,14 @@ pub fn write_quoted(w: io.Writer, s: []u8) !void {
             }
         }
         if esc.len > 0 {
-            w.write_all(s[lit..i])!;
-            w.write_all(esc)!;
+            write_all_to.[W, WRITE](w, s[lit..i])!;
+            write_all_to.[W, WRITE](w, esc)!;
             lit = i + n;
         }
         i += n;
     }
-    w.write_all(s[lit..])!;
-    w.write_all("\"")!;
+    write_all_to.[W, WRITE](w, s[lit..])!;
+    write_all_to.[W, WRITE](w, "\"")!;
 }
 
 // -----------------------------------------------------------------------------
@@ -478,7 +516,7 @@ pub fn format_int[T: Int](buf: []mut u8, x: T) []u8 {
     return format_uint(buf, @int_cast(u64, x), 10, false);
 }
 
-fn write_integer(w: io.Writer, mag: u64, neg: bool, sp: *Spec) !void {
+fn write_integer_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, mag: u64, neg: bool, sp: *Spec) !void {
     let mut base: u32 = 10;
     let mut pfx: []u8 = "";
     match sp.kind {
@@ -506,7 +544,7 @@ fn write_integer(w: io.Writer, mag: u64, neg: bool, sp: *Spec) !void {
         if neg {
             f = -f;
         }
-        write_float(w, @bit_cast(u64, f), F64, sp)!;
+        write_float_to.[W, WRITE](w, @bit_cast(u64, f), F64, sp)!;
         return;
     }
     let mut tmp: [64]u8 = [0; 64];
@@ -525,7 +563,7 @@ fn write_integer(w: io.Writer, mag: u64, neg: bool, sp: *Spec) !void {
         prefix[np + 1] = pfx[1];
         np += 2;
     }
-    write_padded(w, sp, prefix[..np], digits, true)!;
+    write_padded_to.[W, WRITE](w, sp, prefix[..np], digits, true)!;
 }
 
 fn digit_value(c: u8) u32 {
@@ -1506,11 +1544,10 @@ fn layout_shortest_sci(o: *mut Out, dg: *Digits) void {
     o.exponent(dg.dp - 1, true);
 }
 
-fn write_float(w: io.Writer, bits: u64, k: FloatKind, sp: *Spec) !void {
+fn format_float_parts(bits: u64, k: FloatKind, sp: *Spec, o: *mut Out, sign_out: *mut []u8) bool {
     let total_bits = k.mbits + k.ebits;
     let neg = ((bits >> total_bits) & 1) == 1;
     let mag = bits & ((@as(u64, 1) << total_bits) - 1);
-    let mut o = out_init();
     let inf_bits = exp_mask(k) << k.mbits;
     let mut sign: []u8 = "";
     if neg {
@@ -1519,13 +1556,14 @@ fn write_float(w: io.Writer, bits: u64, k: FloatKind, sp: *Spec) !void {
         sign = "+";
     }
     if mag > inf_bits {
-        write_padded(w, sp, "", "NaN", false)!;
-        return;
+        o.puts("NaN");
+        sign_out.* = "";
+        return false;
     }
+    sign_out.* = sign;
     if mag == inf_bits {
         o.puts("inf");
-        write_padded(w, sp, sign, o.b[..o.n], false)!;
-        return;
+        return false;
     }
     let kind = sp.kind;
     if (kind == 'f') or sp.has_precision {
@@ -1539,9 +1577,9 @@ fn write_float(w: io.Writer, bits: u64, k: FloatKind, sp: *Spec) !void {
             exact(p.m, p.e, &mut x);
         }
         if kind == 'e' {
-            layout_sci(&mut o, &mut x, prec);
+            layout_sci(o, &mut x, prec);
         } else {
-            layout_fixed(&mut o, &mut x, prec);
+            layout_fixed(o, &mut x, prec);
         }
     } else if mag == 0 {
         o.put('0');
@@ -1573,19 +1611,27 @@ fn write_float(w: io.Writer, bits: u64, k: FloatKind, sp: *Spec) !void {
             }
         }
         if kind == 'e' {
-            layout_shortest_sci(&mut o, &dg);
+            layout_shortest_sci(o, &dg);
         } else {
-            layout_shortest(&mut o, &dg);
+            layout_shortest(o, &dg);
         }
     }
-    write_padded(w, sp, sign, o.b[..o.n], true)!;
+    return true;
+}
+
+fn write_float_to[W, const WRITE: fn(*mut W, []u8) !usize](w: *mut W, bits: u64, k: FloatKind, sp: *Spec) !void {
+    let mut o = out_init();
+    let mut sign: []u8 = "";
+    let numeric = format_float_parts(bits, k, sp, &mut o, &mut sign);
+    write_padded_to.[W, WRITE](w, sp, sign, o.b[..o.n], numeric)!;
 }
 
 /// The shortest form of x that reads back as x (32 bytes suffice).
 pub fn format_float(out: []mut u8, x: f64) FmtError![]u8 {
     let mut bw = io.BufferWriter.init(out);
     let sp = Spec.default();
-    write_float(bw.writer(), @bit_cast(u64, x), F64, &sp) catch return error.NoSpaceLeft;
+    let mut w = bw.writer();
+    write_float_to.[io.Writer, writer_write_fn](&mut w, @bit_cast(u64, x), F64, &sp) catch return error.NoSpaceLeft;
     return bw.written();
 }
 
@@ -1594,7 +1640,9 @@ pub fn format_float(out: []mut u8, x: f64) FmtError![]u8 {
 pub fn format_float32(out: []mut u8, x: f32) FmtError![]u8 {
     let mut bw = io.BufferWriter.init(out);
     let sp = Spec.default();
-    write_float(bw.writer(), @as(u64, @bit_cast(u32, x)), F32, &sp) catch return error.NoSpaceLeft;
+    let mut w = bw.writer();
+    write_float_to.[io.Writer, writer_write_fn](&mut w, @as(u64, @bit_cast(u32, x)), F32,
+                                                &sp) catch return error.NoSpaceLeft;
     return bw.written();
 }
 
@@ -2022,4 +2070,126 @@ test "templates" {
     let s = alloc("{}-{}", [str("x"), float(0.5)])!;
     defer mem.free(s);
     @expect_eq(s, "x-0.5");
+}
+
+struct TestBufWriter {
+    buf: [128]u8,
+    len: usize,
+    max_chunk: usize,
+
+    fn init(max_chunk: usize) TestBufWriter {
+        return TestBufWriter.{ buf: [0; 128], len: 0, max_chunk: max_chunk };
+    }
+
+    fn write(self: *mut TestBufWriter, bytes: []u8) !usize {
+        let room = self.buf.len - self.len;
+        if (room == 0) and (bytes.len > 0) {
+            return error.NoSpaceLeft;
+        }
+        let mut n = @min(room, bytes.len);
+        if (self.max_chunk > 0) and (n > self.max_chunk) {
+            n = self.max_chunk;
+        }
+        @mem_copy(self.buf[self.len..self.len + n], bytes[..n]);
+        self.len += n;
+        return n;
+    }
+
+    fn written(self: *TestBufWriter) []u8 {
+        return self.buf[..self.len];
+    }
+}
+
+fn free_buf_write(w: *mut TestBufWriter, bytes: []u8) !usize {
+    return w.write(bytes);
+}
+
+struct TestFailWriter {
+    limit: usize,
+    written_count: usize,
+    return_zero: bool,
+    use_perm_err: bool,
+
+    fn write(self: *mut TestFailWriter, bytes: []u8) !usize {
+        if self.return_zero {
+            return 0;
+        }
+        if self.written_count >= self.limit {
+            if self.use_perm_err {
+                return error.PermissionDenied;
+            }
+            return error.NoSpaceLeft;
+        }
+        let n = @min(bytes.len, self.limit - self.written_count);
+        self.written_count += n;
+        return n;
+    }
+}
+
+fn fails_void_with(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+test "write_to and format_to" {
+    // associated method TestBufWriter.write
+    let mut w1 = TestBufWriter.init(0);
+    write_to.[TestBufWriter, TestBufWriter.write, 3](
+        &mut w1, "{} + {} = {:04x}", [str("a"), int.[i32](7), int.[u32](255)])!;
+    @expect_eq(w1.written(), "a + 7 = 00ff");
+
+    // free function free_buf_write, including quoted string, float, bool, rune
+    let mut w2 = TestBufWriter.init(0);
+    write_to.[TestBufWriter, free_buf_write, 5](
+        &mut w2, "[{:^6}] {:.2} {:?} {} {}", [str("ok"), float(1.5), str("x\"y\n"), boolean(true), rune(0x263A)])!;
+    @expect_eq(w2.written(), "[  ok  ] 1.50 \"x\\\"y\\n\" true \u{263A}");
+
+    // partial writes (at most 2 bytes per write call) via format_to
+    let mut w3 = TestBufWriter.init(2);
+    let args: [4]Arg = [int.[i64](-42), str("hi"), float(1234.5), int.[i32](7)];
+    format_to.[TestBufWriter, TestBufWriter.write](&mut w3, "hello {{world}} {1} {0:05} {2:.1e} {3:.2f}", args[..])!;
+    @expect_eq(w3.written(), "hello {world} hi -0042 1.2e+3 7.00");
+
+    // zero arguments via write_to and format_to
+    let mut w4 = TestBufWriter.init(0);
+    let empty: [0]Arg = [Arg.Bool(false); 0];
+    write_to.[TestBufWriter, TestBufWriter.write, 0](&mut w4, "plain {{braces}}", empty)!;
+    @expect_eq(w4.written(), "plain {braces}");
+    let mut w5 = TestBufWriter.init(0);
+    let empty_slice: []Arg = [];
+    format_to.[TestBufWriter, TestBufWriter.write](&mut w5, "empty slice", empty_slice)!;
+    @expect_eq(w5.written(), "empty slice");
+
+    // dynamic write / format / write_quoted backwards compatibility
+    let mut dbuf: [64]u8 = [0; 64];
+    let mut dbw = io.BufferWriter.init(dbuf[..]);
+    write(dbw.writer(), "dyn:{} ", [int.[i32](99)])!;
+    write_quoted(dbw.writer(), "a\tb")!;
+    @expect_eq(dbw.written(), "dyn:99 \"a\\tb\"");
+
+    // error propagation from custom WRITE (including errors outside FmtError)
+    let mut fw_perm = TestFailWriter.{ limit: 3, written_count: 0, return_zero: false, use_perm_err: true };
+    @expect(
+        fails_void_with(write_to.[TestFailWriter, TestFailWriter.write, 1](&mut fw_perm, "hello {}", [int.[i32](42)]),
+                        error.PermissionDenied));
+
+    let mut fw_space = TestFailWriter.{ limit: 2, written_count: 0, return_zero: false, use_perm_err: false };
+    @expect(
+        fails_void_with(write_to.[TestFailWriter, TestFailWriter.write, 1](&mut fw_space, "hello {}", [int.[i32](42)]),
+                        error.NoSpaceLeft));
+
+    let mut fw_zero = TestFailWriter.{ limit: 10, written_count: 0, return_zero: true, use_perm_err: false };
+    @expect(
+        fails_void_with(write_to.[TestFailWriter, TestFailWriter.write, 1](&mut fw_zero, "hello {}", [int.[i32](42)]),
+                        error.IoError));
+
+    let mut w_full = TestBufWriter.init(0);
+    @expect(fails_void_with(write_to.[TestBufWriter, TestBufWriter.write, 1](&mut w_full, "{:200}", [str("x")]),
+                            error.NoSpaceLeft));
+
+    let mut w_bad = TestBufWriter.init(0);
+    @expect(fails_void_with(write_to.[TestBufWriter, TestBufWriter.write, 1](&mut w_bad, "{", [int.[i32](1)]),
+                            error.BadFormat));
 }

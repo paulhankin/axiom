@@ -51,6 +51,7 @@ fn blank(k: ast.TyKind) ast.Type {
         owner: u.nil.[ast.Decl](),
         pindex: 0,
         constraint: 0,
+        constraint_lane: u.nil.[ast.Type](),
         is_const: false,
         const_type: u.nil.[ast.Type](),
         name: u.nosym(),
@@ -100,6 +101,7 @@ fn type_hash(t: *ast.Type) u64 {
     h = mix(h, @bit_cast(u64, t.len));
     h = mix(h, pv(t.len_param));
     h = mix(h, pv(t.ret));
+    h = mix(h, pv(t.const_type));
     h = mix(h, @as(u64, @int_from_ptr(t.decl)));
     h = mix(h, @bit_cast(u64, t.cval));
     for p in t.params {
@@ -114,8 +116,8 @@ fn type_hash(t: *ast.Type) u64 {
 fn type_eq_struct(a: *ast.Type, b: *ast.Type) bool {
     if (a.kind != b.kind) or (a.bits != b.bits) or (a.is_signed != b.is_signed) or (a.is_size != b.is_size) or
        (a.is_mut != b.is_mut) or (a.lanes != b.lanes) or (a.elem != b.elem) or (a.len != b.len) or
-       (a.len_param != b.len_param) or (a.ret != b.ret) or (a.decl != b.decl) or (a.cval != b.cval) or
-       (a.params.len != b.params.len) or (a.args.len != b.args.len) {
+       (a.len_param != b.len_param) or (a.ret != b.ret) or (a.const_type != b.const_type) or (a.decl != b.decl) or
+       (a.cval != b.cval) or (a.params.len != b.params.len) or (a.args.len != b.args.len) {
         return false;
     }
     for i in 0..a.params.len {
@@ -131,7 +133,7 @@ fn type_eq_struct(a: *ast.Type, b: *ast.Type) bool {
     return true;
 }
 
-fn copy_types(xs: []mut *mut ast.Type) []mut *mut ast.Type {
+fn copy_types(xs: []*mut ast.Type) []mut *mut ast.Type {
     if xs.len == 0 {
         return no_types();
     }
@@ -250,6 +252,9 @@ fn add_type(tabp: *mut *mut *mut ast.Type, capp: *mut usize, lenp: *mut usize, p
         hp = true;
     }
     if u.notnil(t.ret) and t.ret.has_params {
+        hp = true;
+    }
+    if u.notnil(t.const_type) and t.const_type.has_params {
         hp = true;
     }
     for p in t.params {
@@ -415,6 +420,14 @@ pub fn type_errset(set: *mut ast.Decl) *mut ast.Type {
 pub fn type_constint(v: i64) *mut ast.Type {
     let mut p = blank(ast.TY_CONSTINT);
     p.cval = v;
+    return intern_type(&p);
+}
+
+pub fn type_constfn(d: *mut ast.Decl, args: []mut *mut ast.Type, fn_ty: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_CONSTFN);
+    p.decl = d;
+    p.args = args;
+    p.const_type = fn_ty;
     return intern_type(&p);
 }
 
@@ -718,6 +731,13 @@ pub fn subst(t: *mut ast.Type, from: []mut *mut ast.Type, to: []mut *mut ast.Typ
         }
         return type_named(t.decl, xs);
     }
+    if k == ast.TY_CONSTFN {
+        let xs = u.newn.[*mut ast.Type](t.args.len);
+        for i in 0..t.args.len {
+            xs[i] = subst(t.args[i], from, to);
+        }
+        return type_constfn(t.decl, xs, subst(t.const_type, from, to));
+    }
     return t;
 }
 
@@ -728,18 +748,18 @@ fn inst_member(owner: *mut ast.Type, member: *mut ast.Type) *mut ast.Type {
     }
     let from = u.newn.[*mut ast.Type](d.gparams.len);
     for i in 0..d.gparams.len {
-        from[i] = d.gparams.at(i).ty;
+        from[i] = d.gparams.at_mut(i).ty;
     }
     return subst(member, from, owner.args);
 }
 
 // Field type of a struct instance / payload type of a union variant instance.
 pub fn type_field(st: *mut ast.Type, i: usize) *mut ast.Type {
-    return inst_member(st, st.decl.fields.at(i).ty);
+    return inst_member(st, st.decl.fields.at_mut(i).ty);
 }
 
 pub fn type_variant(ut: *mut ast.Type, i: usize) *mut ast.Type {
-    let p = ut.decl.variants.at(i).ty;
+    let p = ut.decl.variants.at_mut(i).ty;
     if u.isnil(p) {
         return p;
     }
@@ -830,8 +850,46 @@ fn tstr(b: *mut u.Buf, t: *ast.Type) void {
                 b.s("error");
             }
         }
-        .PARAM         => { b.s(t.name); }
-        .CONSTINT      => { b.s(u.dec(t.cval)); }
+        .PARAM    => { b.s(t.name); }
+        .CONSTINT => { b.s(u.dec(t.cval)); }
+        .CONSTFN => {
+            let d = t.decl;
+            let n = t.args.len;
+            let mut nowner: usize = 0;
+            if u.notnil(d.owner) {
+                nowner = d.owner.gparams.len;
+                b.s(d.owner.name);
+                if nowner != 0 {
+                    b.s(".[");
+                    for i in 0..nowner {
+                        if i >= n {
+                            break;
+                        }
+                        if i != 0 {
+                            b.s(", ");
+                        }
+                        tstr(b, t.args[i]);
+                    }
+                    b.s("]");
+                }
+                b.s(".");
+            }
+            b.s(d.name);
+            let mut nown = d.gparams.len;
+            if d.kind == ast.D_HOST_FN {
+                nown = 0;
+            }
+            if (nown != 0) and (n >= nown) {
+                b.s(".[");
+                for i in n - nown..n {
+                    if i > (n - nown) {
+                        b.s(", ");
+                    }
+                    tstr(b, t.args[i]);
+                }
+                b.s("]");
+            }
+        }
         .UNTYPED_INT   => { b.s("integer literal"); }
         .UNTYPED_FLOAT => { b.s("float literal"); }
         .NEVER         => { b.s("noreturn"); }
@@ -1117,11 +1175,18 @@ pub fn constraint_from_name(s: []u8) i32 {
     if u.str_eq(s, "FloatVector") {
         return ast.C_FLOAT_VEC;
     }
+    if u.str_eq(s, "IntVector") {
+        return ast.C_INT_VEC;
+    }
+    if u.str_eq(s, "Vector") {
+        return ast.C_VEC;
+    }
     return -1;
 }
 
 pub fn constraint_name(c: i32) []u8 {
-    let n = ["(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float", "FloatVector"];
+    let n = ["(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float", "FloatVector", "IntVector",
+             "Vector"];
     return n[@int_cast(usize, c)];
 }
 
@@ -1145,6 +1210,9 @@ fn implies(a: i32, b: i32) bool {
     if a == ast.C_FLOAT {
         return (b == ast.C_EQ) or (b == ast.C_ORD) or (b == ast.C_NUM);
     }
+    if (a == ast.C_FLOAT_VEC) or (a == ast.C_INT_VEC) {
+        return b == ast.C_VEC;
+    }
     return false;
 }
 
@@ -1154,10 +1222,21 @@ pub fn satisfies(t: *ast.Type, c: i32) bool {
         return true;
     }
     if k == ast.TY_PARAM {
-        return not t.is_const and implies(t.constraint, c);
+        if t.is_const {
+            return false;
+        }
+        if (c == ast.C_FLOAT_VEC) and (t.constraint == ast.C_VEC) and u.notnil(t.constraint_lane) {
+            return (t.constraint_lane.kind == ast.TY_FLOAT) or
+                   ((t.constraint_lane.kind == ast.TY_PARAM) and satisfies(t.constraint_lane, ast.C_FLOAT));
+        }
+        if (c == ast.C_INT_VEC) and (t.constraint == ast.C_VEC) and u.notnil(t.constraint_lane) {
+            return (t.constraint_lane.kind == ast.TY_INT) or
+                   ((t.constraint_lane.kind == ast.TY_PARAM) and satisfies(t.constraint_lane, ast.C_INT));
+        }
+        return implies(t.constraint, c);
     }
     if c == ast.C_NONE {
-        return (k != ast.TY_VOID) and (k != ast.TY_CONSTINT) and (k != ast.TY_NEVER);
+        return (k != ast.TY_VOID) and (k != ast.TY_CONSTINT) and (k != ast.TY_CONSTFN) and (k != ast.TY_NEVER);
     }
     if c == ast.C_EQ {
         return (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_BOOL) or (k == ast.TY_PTR) or
@@ -1181,12 +1260,37 @@ pub fn satisfies(t: *ast.Type, c: i32) bool {
     if c == ast.C_FLOAT_VEC {
         return (k == ast.TY_VEC) and (t.elem.kind == ast.TY_FLOAT);
     }
+    if c == ast.C_INT_VEC {
+        return (k == ast.TY_VEC) and (t.elem.kind == ast.TY_INT);
+    }
+    if c == ast.C_VEC {
+        return (k == ast.TY_VEC) and ((t.elem.kind == ast.TY_FLOAT) or (t.elem.kind == ast.TY_INT));
+    }
+    return false;
+}
+
+pub fn satisfies_lane(t: *ast.Type, c: i32, expected_lane: *mut ast.Type) bool {
+    if (t.kind == ast.TY_INVALID) or (u.notnil(expected_lane) and (expected_lane.kind == ast.TY_INVALID)) {
+        return true;
+    }
+    if not satisfies(t, c) {
+        return false;
+    }
+    if u.isnil(expected_lane) {
+        return true;
+    }
+    if t.kind == ast.TY_PARAM {
+        return u.notnil(t.constraint_lane) and (t.constraint_lane == expected_lane);
+    }
+    if t.kind == ast.TY_VEC {
+        return t.elem == expected_lane;
+    }
     return false;
 }
 
 pub struct Range {
-    lo: u.I128,
-    hi: u.I128,
+    pub lo: u.I128,
+    pub hi: u.I128,
 }
 
 // Integer range of a concrete integer type.

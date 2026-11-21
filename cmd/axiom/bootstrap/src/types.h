@@ -24,13 +24,26 @@ typedef enum TypeKind {
     TY_ERRUNION,
     TY_ERROR,
     TY_PARAM,     // generic parameter (type or const)
-    TY_CONSTINT,  // generic argument for a const parameter
+    TY_CONSTINT,  // generic argument for a const integer parameter
+    TY_CONSTFN,   // generic argument for a const function parameter
     TY_UNTYPED_INT,
     TY_UNTYPED_FLOAT,
     TY_NEVER,  // expression that never produces a value (@trap(), return in catch)
 } TypeKind;
 
-typedef enum Constraint { C_NONE, C_EQ, C_ORD, C_NUM, C_INT, C_SIGNED, C_UNSIGNED, C_FLOAT, C_FLOAT_VEC } Constraint;
+typedef enum Constraint {
+    C_NONE,
+    C_EQ,
+    C_ORD,
+    C_NUM,
+    C_INT,
+    C_SIGNED,
+    C_UNSIGNED,
+    C_FLOAT,
+    C_FLOAT_VEC,
+    C_INT_VEC,
+    C_VEC,
+} Constraint;
 
 struct Type {
     TypeKind kind;
@@ -53,6 +66,7 @@ struct Type {
     Decl *owner;
     int pindex;
     Constraint constraint;
+    Type *constraint_lane;  // FloatVector[S] / IntVector[S] / Vector[S]
     bool is_const;
     Type *const_type;
     Sym name;
@@ -98,6 +112,7 @@ Type *type_errunion(Type *elem);
 Type *type_errunion_set(Type *elem, Decl *set);
 Type *type_errset(Decl *set);
 Type *type_constint(int64_t v);
+Type *type_constfn(Decl *d, Type **args, int n, Type *fn_ty);
 Type *type_param(Decl *owner, int index, Sym name, Constraint c, bool is_const, Type *const_type);
 Decl *anon_struct_decl(Module *m, FieldVec fields, Span sp);  // interned by field list
 
@@ -139,6 +154,8 @@ bool ty_is_aggregate(Type *t);  // passed by reference in memory: struct, union,
 
 // Constraint satisfaction: does type t satisfy c? (t may itself be a TY_PARAM)
 bool type_satisfies(Type *t, Constraint c);
+bool type_satisfies_with_lane(Type *t, Constraint c, Type *expected_lane);
+static inline bool constraint_is_vec(Constraint c) { return c == C_FLOAT_VEC || c == C_INT_VEC || c == C_VEC; }
 Constraint constraint_from_name(Sym s);
 const char *constraint_name(Constraint c);
 

@@ -296,8 +296,18 @@ pub struct Voice {
         return @int_from_ptr(self.s) != 0;
     }
 
-    fn state(self: *Voice) *mut VoiceState {
+    fn state(self: *Voice) *VoiceState {
+        return &self.s.voices[self.slot];
+    }
+
+    fn state_mut(self: *mut Voice) *mut VoiceState {
         return &mut self.s.voices[self.slot];
+    }
+
+    // Shared is heap-allocated engine state synchronized by its atomic spinlock,
+    // so read-only queries on *Voice can still take and release the lock.
+    fn shared_lock(self: *Voice) *mut Shared {
+        return @ptr_from_int(*mut Shared, @int_from_ptr(self.s));
     }
 
     /// Plays a sound (all of it; again and again when `looping`) after what
@@ -315,7 +325,7 @@ pub struct Voice {
         }
         lock(self.s);
         defer unlock(self.s);
-        let v = self.state();
+        let v = self.state_mut();
         if v.count == MAX_QUEUED {
             return error.NoSpaceLeft;
         }
@@ -326,7 +336,7 @@ pub struct Voice {
 
     pub fn start(self: *mut Voice) void {
         lock(self.s);
-        let v = self.state();
+        let v = self.state_mut();
         if not v.running {
             v.running = true;
             v.played = 0;
@@ -337,7 +347,7 @@ pub struct Voice {
     /// Stops and forgets what was queued.
     pub fn stop(self: *mut Voice) void {
         lock(self.s);
-        let v = self.state();
+        let v = self.state_mut();
         v.running = false;
         v.count = 0;
         v.head = 0;
@@ -349,37 +359,39 @@ pub struct Voice {
     /// Ends a looping sound after its current pass.
     pub fn end_loop(self: *mut Voice) void {
         lock(self.s);
-        self.state().end_loop = true;
+        self.state_mut().end_loop = true;
         unlock(self.s);
     }
 
     /// The voice's volume (1: as is).
     pub fn set_volume(self: *mut Voice, v: f32) void {
         lock(self.s);
-        self.state().volume = @max(v, 0.0);
+        self.state_mut().volume = @max(v, 0.0);
         unlock(self.s);
     }
 
     /// Plays faster and higher (> 1) or slower and lower (< 1), up to 4.
     pub fn set_pitch(self: *mut Voice, ratio: f32) void {
         lock(self.s);
-        self.state().pitch = @max(@min(ratio, 4.0), 1.0 / 1024.0);
+        self.state_mut().pitch = @max(@min(ratio, 4.0), 1.0 / 1024.0);
         unlock(self.s);
     }
 
     /// Is something still queued?
     pub fn playing(self: *Voice) bool {
-        lock(self.s);
+        let s = self.shared_lock();
+        lock(s);
         let n = self.state().count;
-        unlock(self.s);
+        unlock(s);
         return n != 0;
     }
 
     /// Frames played since the voice started.
     pub fn frames_played(self: *Voice) u64 {
-        lock(self.s);
+        let s = self.shared_lock();
+        lock(s);
         let n = self.state().played;
-        unlock(self.s);
+        unlock(s);
         return n;
     }
 
@@ -388,8 +400,8 @@ pub struct Voice {
             return;
         }
         lock(self.s);
-        self.state().used = false;
-        self.state().count = 0;
+        self.state_mut().used = false;
+        self.state_mut().count = 0;
         unlock(self.s);
         self.s = @ptr_from_int(*mut Shared, 0);
     }

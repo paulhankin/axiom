@@ -37,6 +37,7 @@ typedef struct Field {
     TypeExpr *te;
     Span span;
     Type *type;
+    bool is_pub;
 } Field;
 
 typedef Vec(TypeExpr *) TypeExprVec;
@@ -51,6 +52,11 @@ struct TypeExpr {
     Span name_span;
     TypeExprVec args;  // TE_NAMED generic args; TE_FN params
     bool has_args;
+    Sym member;  // TE_NAMED optional .member[.[member_args]] (in generic args)
+    Span member_span;
+    TypeExprVec member_args;
+    bool has_member;
+    bool member_has_args;
     TypeExpr *elem;  // PTR, SLICE, ARRAY, ERRUNION; TE_FN: return type
     TypeExpr *set;   // ERRUNION: the error set named (Set!T), or NULL (!T: any error)
     bool mut;
@@ -177,6 +183,7 @@ struct Expr {
     i128 cval;          // folded integer constant (untyped / const refs)
     bool is_const;      // cval / fval valid
     bool lit_neg;       // literal arithmetic produced a negative value
+    bool weakened;
 };
 
 // ---------------------------------------------------------------------------
@@ -255,6 +262,7 @@ typedef struct GenericParam {
     Span span;
     Sym constraint;  // NULL if unconstrained
     Span constraint_span;
+    TypeExpr *constraint_te;  // FloatVector[S], IntVector[S], Vector[S]
     bool is_const;
     TypeExpr *const_te;
     Type *type;  // TY_PARAM
@@ -287,6 +295,7 @@ struct Local {
     bool mut;
     bool is_param;
     bool addr_taken;
+    bool weakened;
     int index;  // within its function
 };
 
@@ -340,6 +349,8 @@ struct Decl {
 
     // ---- sema ----
     int state;          // 0 = unresolved, 1 = resolving, 2 = done
+    bool gparams_done;
+    bool gparams_resolving;
     Type *type;         // fn: TY_FN signature; const/global: value type; struct/union: Self type
     Type *ret_type;
     Type **param_types;

@@ -41,7 +41,7 @@ pub fn compare(a: []u8, b: []u8) i32 {
     return 0;
 }
 
-/// For sorting: vec.sort(names, str.less).
+/// For sorting: vec.sort.[[]u8, str.less](names).
 pub fn less(a: []u8, b: []u8) bool {
     return compare(a, b) < 0;
 }
@@ -326,8 +326,8 @@ pub fn strip_suffix(s: []u8, suffix: []u8) StrError![]u8 {
 
 /// The two sides of the first `sep` in s.
 pub struct Cut {
-    before: []u8,
-    after: []u8,
+    pub before: []u8,
+    pub after: []u8,
 }
 
 /// Splits s around the first occurrence of sep: cut("k=v", "=") gives
@@ -353,7 +353,7 @@ pub fn cut(s: []u8, sep: []u8) StrError!Cut {
 pub struct Split {
     rest: []u8,
     sep: []u8,
-    done: bool,
+    pub done: bool,
 
     pub fn next(self: *mut Split) StrError![]u8 {
         if self.done {
@@ -557,8 +557,8 @@ pub const REPLACEMENT: u32 = 0xFFFD;
 
 /// A code point and the number of bytes it took.
 pub struct Rune {
-    value: u32,
-    len: usize,
+    pub value: u32,
+    pub len: usize,
 }
 
 /// Decodes the code point at the start of s (which must not be empty).
@@ -670,7 +670,7 @@ pub fn rune_count(s: []u8) usize {
 /// The code points of a string, with their byte offsets.
 pub struct Utf8Iter {
     s: []u8,
-    pos: usize,
+    pub pos: usize,
 
     /// The next code point; `self.pos` is then just past it.
     pub fn next(self: *mut Utf8Iter) StrError!u32 {
@@ -692,14 +692,14 @@ pub fn runes(s: []u8) Utf8Iter {
 // -----------------------------------------------------------------------------
 
 /// A growable byte string. `deinit` frees it; `take` hands the bytes to the
-/// caller instead. Slices from `bytes()` are invalidated by anything that
-/// grows the string.
+/// caller instead. Slices from `bytes()` and `bytes_mut()` are invalidated by
+/// anything that grows the string.
 pub struct String {
     buf: []mut u8,  // capacity == buf.len
-    len: usize,
+    count: usize,
 
     pub fn init() String {
-        return String.{ buf: [], len: 0 };
+        return String.{ buf: [], count: 0 };
     }
 
     pub fn with_capacity(cap: usize) StrError!String {
@@ -720,17 +720,36 @@ pub struct String {
     }
 
     /// The contents.
-    pub fn bytes(self: *String) []mut u8 {
-        return self.buf[..self.len];
+    pub fn bytes(self: *String) []u8 {
+        return self.buf[..self.count];
+    }
+
+    /// The contents, mutable.
+    pub fn bytes_mut(self: *mut String) []mut u8 {
+        return self.buf[..self.count];
+    }
+
+    pub fn len(self: *String) usize {
+        return self.count;
     }
 
     pub fn capacity(self: *String) usize {
         return self.buf.len;
     }
 
+    /// Reserves room for `n` more bytes, zero-initializes them, advances `len`,
+    /// and returns the writable slice of those newly added bytes.
+    pub fn grow_zero(self: *mut String, n: usize) StrError![]mut u8 {
+        let old = self.count;
+        self.reserve(n)!;
+        @mem_set(self.buf[old..old + n], 0);
+        self.count = old + n;
+        return self.buf[old..old + n];
+    }
+
     /// Ensures room for `extra` more bytes without reallocating.
     pub fn reserve(self: *mut String, extra: usize) StrError!void {
-        let need = @add_checked(self.len, extra) catch return error.OutOfMemory;
+        let need = @add_checked(self.count, extra) catch return error.OutOfMemory;
         if need <= self.buf.len {
             return;
         }
@@ -742,11 +761,11 @@ pub struct String {
     }
 
     pub fn push(self: *mut String, b: u8) StrError!void {
-        if self.len == self.buf.len {
+        if self.count == self.buf.len {
             self.reserve(1)!;
         }
-        self.buf[self.len] = b;
-        self.len += 1;
+        self.buf[self.count] = b;
+        self.count += 1;
     }
 
     pub fn push_str(self: *mut String, s: []u8) StrError!void {
@@ -759,12 +778,12 @@ pub struct String {
         if (at >= base) and (at - base < self.buf.len) {
             let off = at - base;
             self.reserve(s.len)!;
-            @mem_copy(self.buf[self.len..self.len + s.len], self.buf[off..off + s.len]);
+            @mem_copy(self.buf[self.count..self.count + s.len], self.buf[off..off + s.len]);
         } else {
             self.reserve(s.len)!;
-            @mem_copy(self.buf[self.len..self.len + s.len], s);
+            @mem_copy(self.buf[self.count..self.count + s.len], s);
         }
-        self.len += s.len;
+        self.count += s.len;
     }
 
     /// Appends a code point as UTF-8.
@@ -774,19 +793,19 @@ pub struct String {
     }
 
     pub fn clear(self: *mut String) void {
-        self.len = 0;
+        self.count = 0;
     }
 
     pub fn truncate(self: *mut String, n: usize) void {
-        if n < self.len {
-            self.len = n;
+        if n < self.count {
+            self.count = n;
         }
     }
 
     /// Returns the contents as memory the caller owns (free it with
     /// mem.free) and leaves the String empty.
     pub fn take(self: *mut String) StrError![]mut u8 {
-        let out = mem.realloc(self.buf, self.len)!;
+        let out = mem.realloc(self.buf, self.count)!;
         self.* = String.init();
         return out;
     }
@@ -940,7 +959,16 @@ test "String" {
     let owned = s.take()!;
     defer mem.free(owned);
     @expect_eq(owned.len, 15);
-    @expect_eq(s.len, 0);
+    @expect_eq(s.len(), 0);
+    let empty_z = s.grow_zero(0)!;
+    @expect_eq(empty_z.len, 0);
+    @expect_eq(s.len(), 0);
+    let z = s.grow_zero(4)!;
+    @expect_eq(z.len, 4);
+    @expect_eq(s.len(), 4);
+    @expect_eq(s.bytes(), "\x00\x00\x00\x00");
+    z[1] = 'x';
+    @expect_eq(s.bytes(), "\x00x\x00\x00");
 }
 
 test "push_str from itself" {

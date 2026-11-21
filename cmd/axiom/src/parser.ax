@@ -8,7 +8,7 @@ import "util.ax" as u;
 
 struct Parser {
     f: *mut u.SourceFile,
-    t: []mut lx.Token,
+    t: []lx.Token,
     pos: usize,
     n: usize,
     mod: *mut ast.Module,
@@ -18,30 +18,30 @@ struct Parser {
     high: usize,         // the deepest level of the tree reached (see chain_ok)
 }
 
-fn peek(P: *Parser) *mut lx.Token {
-    return &mut P.t[P.pos];
+fn peek(P: *Parser) *lx.Token {
+    return &P.t[P.pos];
 }
 
-fn peek2(P: *Parser) *mut lx.Token {
+fn peek2(P: *Parser) *lx.Token {
     if (P.pos + 1) < P.n {
-        return &mut P.t[P.pos + 1];
+        return &P.t[P.pos + 1];
     }
-    return &mut P.t[P.n - 1];
+    return &P.t[P.n - 1];
 }
 
-fn peek3(P: *Parser) *mut lx.Token {
+fn peek3(P: *Parser) *lx.Token {
     if (P.pos + 2) < P.n {
-        return &mut P.t[P.pos + 2];
+        return &P.t[P.pos + 2];
     }
-    return &mut P.t[P.n - 1];
+    return &P.t[P.n - 1];
 }
 
 fn pk(P: *Parser) lx.TokKind {
     return P.t[P.pos].kind;
 }
 
-fn advance(P: *mut Parser) *mut lx.Token {
-    let t = &mut P.t[P.pos];
+fn advance(P: *mut Parser) *lx.Token {
+    let t = &P.t[P.pos];
     if P.pos < (P.n - 1) {
         P.pos += 1;
     }
@@ -72,7 +72,7 @@ fn syntax_error(P: *mut Parser, what: []u8) void {
     _ = dg.err(t.span, "E0100", u.f2("expected %s, found '%s'", what, lx.tok_kind_name(t.kind)));
 }
 
-fn expect(P: *mut Parser, k: lx.TokKind) *mut lx.Token {
+fn expect(P: *mut Parser, k: lx.TokKind) *lx.Token {
     if pk(P) == k {
         return advance(P);
     }
@@ -197,13 +197,28 @@ fn at_inline(P: *Parser) bool {
     return (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "inline") and (peek2(P).kind == lx.KW_FN);
 }
 
+fn at_field(P: *Parser) bool {
+    if pk(P) == lx.KW_PUB {
+        let t2 = peek2(P);
+        if t2.kind != lx.TK_IDENT {
+            return false;
+        }
+        if u.str_eq(t2.name, "inline") and (peek3(P).kind == lx.KW_FN) {
+            return false;
+        }
+        return true;
+    }
+    return (pk(P) == lx.TK_IDENT) and not at_inline(P);
+}
+
 fn parse_field_list(P: *mut Parser, out: *mut u.List.[ast.Field]) void {
     // Field ( "," Field )* ","?
-    while (pk(P) == lx.TK_IDENT) and not at_inline(P) {
+    while at_field(P) {
+        let is_pub = accept(P, lx.KW_PUB);
         let id = expect_ident(P);
         _ = expect(P, lx.TK_COLON);
         let te = parse_type(P);
-        out.push(ast.Field.{ name: id.name, te: te, span: id.span, ty: u.nil.[ast.Type]() });
+        out.push(ast.Field.{ name: id.name, te: te, span: id.span, ty: u.nil.[ast.Type](), is_pub: is_pub });
         if not accept(P, lx.TK_COMMA) {
             break;
         }
@@ -229,10 +244,20 @@ fn parse_generic_arg_list(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) 
     _ = expect(P, lx.TK_RBRACKET);
 }
 
-// The named type `n`, unqualified and without arguments so far.
+// The named type `n`, unqualified and without arguments or member so far.
 fn named_type(n: *lx.Token) ast.NamedType {
-    return ast.NamedType.{ qual: u.nosym(), name: n.name, name_span: n.span, args: u.List.[*mut ast.TypeExpr].empty(),
-                           has_args: false };
+    return ast.NamedType.{
+        qual: u.nosym(),
+        name: n.name,
+        name_span: n.span,
+        args: u.List.[*mut ast.TypeExpr].empty(),
+        has_args: false,
+        has_member: false,
+        member: u.nosym(),
+        member_span: u.mkspan(0, 0, 0),
+        member_args: u.List.[*mut ast.TypeExpr].empty(),
+        has_member_args: false,
+    };
 }
 
 // An array's length, after '[': an integer literal, a name (a const or a
@@ -356,7 +381,8 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
     if k == lx.TK_IDENT {
         _ = advance(P);
         let mut nt = named_type(t);
-        // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )?
+        // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
+        let mut saw_dot = false;
         if pk(P) == lx.TK_DOT {
             let k2 = peek2(P).kind;
             if k2 == lx.TK_IDENT {
@@ -365,6 +391,7 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
                 nt.qual = nt.name;
                 nt.name = m.name;
                 nt.name_span = m.span;
+                saw_dot = true;
                 if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_LBRACKET) {
                     _ = advance(P);
                     _ = advance(P);
@@ -376,6 +403,20 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
                 _ = advance(P);
                 nt.has_args = true;
                 parse_generic_arg_list(P, &mut nt.args);
+                saw_dot = true;
+            }
+        }
+        if saw_dot and (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_IDENT) {
+            _ = advance(P);
+            let mem = advance(P);
+            nt.has_member = true;
+            nt.member = mem.name;
+            nt.member_span = mem.span;
+            if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_LBRACKET) {
+                _ = advance(P);
+                _ = advance(P);
+                nt.has_member_args = true;
+                parse_generic_arg_list(P, &mut nt.member_args);
             }
         }
         let named = ast.new_te(ast.TypeShape.Named(nt), sp_from(P, start));
@@ -1047,7 +1088,7 @@ fn set_arm_body(s: *mut ast.Stmt, body: *mut ast.Stmt) void {
     let mut i = ast.stmt_more(s).arms.len;
     while i > 0 {
         i -= 1;
-        ast.stmt_more(s).arms.at(i).body = body;
+        ast.stmt_ext(s).arms.at_mut(i).body = body;
         if not ast.stmt_more(s).arms.at(i).alt {
             break;
         }
@@ -1277,8 +1318,9 @@ fn parse_error_decl(P: *mut Parser, start: u.Span, is_pub: bool) *mut ast.Decl {
                 } else {
                     let n = peek(P);
                     let rid = expect_ident(P);
-                    let mut nt = ast.NamedType.{ qual: u.nosym(), name: rid.name, name_span: rid.span,
-                                                 args: u.List.[*mut ast.TypeExpr].empty(), has_args: false };
+                    let mut nt = named_type(n);
+                    nt.name = rid.name;
+                    nt.name_span = rid.span;
                     if accept(P, lx.TK_DOT) {
                         let m = expect_ident(P);
                         nt.qual = nt.name;
@@ -1315,7 +1357,7 @@ fn parse_error_names(P: *mut Parser, d: *mut ast.Decl) void {
     _ = expect(P, lx.TK_RBRACE);
 }
 
-fn new_decl(P: *Parser, k: ast.DeclKind, sp: u.Span) *mut ast.Decl {
+fn new_decl(P: *mut Parser, k: ast.DeclKind, sp: u.Span) *mut ast.Decl {
     let d = u.new.[ast.Decl]();
     d.kind = k;
     d.span = sp;
@@ -1344,6 +1386,10 @@ fn parse_generic_params(P: *mut Parser, d: *mut ast.Decl) void {
                 let c = expect_ident(P);
                 g.constraint = c.name;
                 g.constraint_span = c.span;
+                if accept(P, lx.TK_LBRACKET) {
+                    g.constraint_te = parse_type(P);
+                    _ = expect(P, lx.TK_RBRACKET);
+                }
             }
         }
         d.gparams.push(g.*);
@@ -1809,7 +1855,7 @@ fn parse_top(P: *mut Parser) void {
 
 // Parser entry point. Returns a module with decls; errors via diag.
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
-    let toks = lx.lex_file(f);
+    let mut toks = lx.lex_file(f);
     let mut P = Parser.{ f: f, t: toks.items(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
                          ntests: 0, depth: 0, high: 0 };
     P.mod.file = f;
