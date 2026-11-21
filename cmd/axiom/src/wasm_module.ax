@@ -1,0 +1,558 @@
+// =============================================================================
+// wasm_module.ax - function frame layout, setjmp/longjmp wrapping,
+// gen_function, data emission, and module compilation, part of wasm.ax.
+// =============================================================================
+import "bin.ax" as bn;
+import "dwarf.ax" as dw;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "opt.ax" as opt;
+import "switches.ax" as swl;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+// -----------------------------------------------------------------------------
+// Functions
+// -----------------------------------------------------------------------------
+// Which blocks (in order) are joins of forward edges (merge) and loop
+// headers (header).
+fn mark_joins(order: *u.List.[*mut ir.Block], merge: []mut bool, header: []mut bool) void {
+    for i in 0..order.len {
+        let b = order.get(i);
+        let mut fwd: usize = 0;
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if p.rpo < 0 {
+                continue;
+            }
+            if p.rpo < b.rpo {
+                // edges, not predecessors: a switch with several cases going
+                // to b makes it a merge too (else each case would emit all
+                // of b's subtree again, nested switches multiplying it)
+                let t = ir.terminator(p);
+                for e in 0..ir.succ_count(t) {
+                    if ir.succ(t, e) == b {
+                        fwd += 1;
+                    }
+                }
+            } else {
+                header[i] = true;
+            }
+        }
+        merge[i] = fwd >= 2;
+    }
+}
+
+// The frame: the allocas' offsets in it, and a buffer for the variadic
+// arguments of any call (frame_size, va_off). False (having failed) if it
+// is too large.
+fn lay_out_frame(f: *mut ir.Func) bool {
+    frame_size = 0;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                let al = @as(u64, i.align);
+                let mut a = ir.aty_of(i).align;
+                if al > a {
+                    a = al;
+                }
+                if a > 16 {
+                    a = 16;
+                }
+                if a == 0 {
+                    a = 1;
+                }
+                frame_size = (frame_size + a - 1) & ~(a - 1);
+                i.aux = @bit_cast(i64, frame_size);
+                frame_size += ir.aty_of(i).size;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // one buffer for the variadic arguments of any call
+    let mut va: u64 = 0;
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_CALL) and ir.fty_of(i).vararg {
+                let n = va_buffer_size(i);
+                if n > va {
+                    va = n;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if va > 0 {
+        frame_size = (frame_size + 15) & ~@as(u64, 15);
+        va_off = @bit_cast(i64, frame_size);
+        frame_size += va;
+    }
+    frame_size = (frame_size + 15) & ~@as(u64, 15);
+    if (frame_size == 0) and ir.uses_dyn_stack(f) {
+        frame_size = 16;  // (the epilogue resets the stack pointer from the frame's address)
+    }
+    if frame_size > FRAME_MAX {
+        fail("the stack frame is too large");
+        return false;
+    }
+    return true;
+}
+
+// The local declarations of the function (LT), run-length encoded.
+fn put_locals(body: *mut bn.Bytes) void {
+    let mut groups: u64 = 0;
+    let mut k: usize = 0;
+    while k < LT.len {
+        let mut j = k;
+        while (j < LT.len) and (LT.get(j) == LT.get(k)) {
+            j += 1;
+        }
+        groups += 1;
+        k = j;
+    }
+    body.uleb(groups);
+    k = 0;
+    while k < LT.len {
+        let mut j = k;
+        while (j < LT.len) and (LT.get(j) == LT.get(k)) {
+            j += 1;
+        }
+        body.uleb(@as(u64, j - k));
+        body.u8_(LT.get(k));
+        k = j;
+    }
+}
+
+// The start and the end of the body of a function that calls setjmp (see
+// "setjmp and longjmp", above).
+fn sjlj_begin() void {
+    sj_resumed = new_local(wo.I32);
+    sj_env = new_local(ptr_vt());
+    op(0x03);
+    op(0x40);
+    op(0x02);
+    op(ptr_vt());
+    op(0x1f);
+    op(0x40);
+    CB.uleb(1);
+    op(0x00);  // catch $tag $caught (label 0: the block)
+    reloc(wo.R_TAG_INDEX_LEB, tag_sym, 0);
+    CB.uleb5(0);
+    CB.uleb(0);
+    for _k in @as(usize, 0)..3 {
+        ctx.push(Ctx.{ kind: CTX_OTHER, target: u.nil.[ir.Block]() });
+    }
+}
+
+fn sjlj_end() void {
+    for _k in @as(usize, 0)..3 {
+        _ = ctx.pop();
+    }
+    op(0x0b);  // try_table
+    op(0x00);
+    op(0x0b);  // block: the jmp_buf on the stack
+    local_tee(sj_env);
+    if W64 {
+        op(0x29);
+        memarg(8, 8, 0);
+    } else {
+        op(0x28);
+        memarg(4, 4, 0);
+    }
+    local_get(fp_local);
+    ptr_ne();
+    op(0x04);
+    op(0x40);
+    local_get(sj_env);
+    op(0x08);
+    reloc(wo.R_TAG_INDEX_LEB, tag_sym, 0);
+    CB.uleb5(0);
+    op(0x0b);
+    i32c(1);
+    local_set(sj_resumed);
+    op(0x0c);
+    CB.uleb(0);
+    op(0x0b);  // loop
+    op(0x00);
+}
+
+fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
+    F = f;
+    CB = bn.new_bytes();
+    set_end = 0xffff_ffff;
+    RL = u.List.[wo.Reloc].empty();
+    LN = u.List.[u64].empty();
+    ln_last = 0;
+    SC = u.List.[u64].empty();
+    sc_last = 0;
+    line_row(f.src);
+    LT = u.List.[u8].empty();
+    ctx.clear();
+    nparams = @int_cast(u32, f.params.len);
+    swl.lower(f);  // (br_tables, bit tests, a search: switches.ax)
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    let nb = order.len;
+    let merge = u.newn.[bool](nb + 1);
+    let header = u.newn.[bool](nb + 1);
+    merge_p = merge.ptr;
+    header_p = header.ptr;
+    nblocks = nb;
+    mark_joins(&order, merge, header);
+    init_values(f);
+    classify(f);
+    if not lay_out_frame(f) {
+        return;
+    }
+    if frame_size > 0 {
+        fp_local = new_local(ptr_vt());
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.ty.kind == ir.T_VEC) and not tg.has(tg.W_SIMD128) {
+                fail("vector types need the simd128 extension (--features=+simd128)");
+                return;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // locals for values
+    alloc_locals(f, order);
+    WEVS.clear();
+    WV = ir.dbg_on and (tg.g_debug == tg.DEBUG_FULL);
+    // prologue
+    if frame_size > 0 {
+        sp_global(0x23);
+        pconst(frame_size);
+        padd_sub(true);
+        local_tee(fp_local);
+        sp_global(0x24);
+    }
+    let sjlj = f.returns_twice and tg.has(tg.W_EXCEPTION_HANDLING) and (frame_size > 0);
+    if sjlj {
+        sjlj_begin();
+    }
+    do_tree(order.get(0));
+    if sjlj {
+        sjlj_end();
+    } else if f.ty.ret.kind != ir.T_VOID {
+        op(0x00);
+    }
+    op(0x0b);
+    // body = locals (run-length encoded) + code
+    let mut body = bn.new_bytes();
+    put_locals(&mut body);
+    let base = @int_cast(u32, body.len());
+    body.put(CB.view());
+    wf.body = body;
+    wf.src = f.src;
+    for r in LN.items() {
+        wf.lines.push(r + (@as(u64, base) << 32));
+    }
+    LN.deinit();
+    if tg.g_debug == tg.DEBUG_FULL {
+        // (the types and variables: wlink.ax, from dbginfo.ax's records; the
+        // lists on the heap, which outlives this function's scratch scope)
+        wf.irf = @ptr_cast(*mut void, f);
+        for r in SC.items() {
+            wf.scopes.push(r + (@as(u64, base) << 32));
+        }
+        let mut vs = u.List.[i64].empty();
+        for x in dw.var_locs(f, var_slot_off, 0) {
+            vs.push(x);
+        }
+        wf.vars = vs.items();
+        wf.frame_local = -1;
+        if frame_size > 0 {
+            wf.frame_local = @as(i64, fp_local);
+        }
+        if WV {
+            // (offsets in the body: after the locals' declarations)
+            WBASE = @as(u64, base);
+            WVL.push(wasm_vlocs(f, order));
+            WVL_OF.put(u.addr_key(@int_from_ptr(wf)), @int_cast(i32, WVL.len));
+        }
+    }
+    SC.deinit();
+    for i in 0..RL.len {
+        let mut r = RL.get(i);
+        r.off += base;
+        wf.relocs.push(r);
+    }
+    CB.free();
+    u.free(@ptr_cast(*mut void, RL.data));
+    u.free(@ptr_cast(*mut void, LT.data));
+    order.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Module
+// -----------------------------------------------------------------------------
+// A constructor's place among the initialization arrays (.init_array.N: N;
+// .init_array: 65535), or -1 for any other global.
+fn init_priority(g: *ir.Global) i64 {
+    if u.isnil(g.init) or not u.starts(g.section, ".init_array") {
+        return -1;
+    }
+    let rest = g.section[11..];
+    if (rest.len > 1) and (rest[0] == '.') {
+        return @min(u.atol(rest[1..]), 65535);
+    }
+    return 65535;
+}
+
+fn sym_flags_for(linkage: i32, defined: bool) u32 {
+    let mut fl: u32 = 0;
+    if not defined {
+        fl = wo.F_UNDEFINED;
+        if linkage == ir.LINK_EXTWEAK {
+            fl = fl | wo.F_WEAK;
+        }
+        return fl;
+    }
+    if linkage == ir.LINK_INTERNAL {
+        fl = wo.F_LOCAL;
+    } else if (linkage == ir.LINK_LINKONCE) or (linkage == ir.LINK_WEAK) {
+        fl = wo.F_WEAK | wo.F_HIDDEN;
+    } else {
+        fl = wo.F_HIDDEN;
+    }
+    return fl;
+}
+
+fn emit_data(g: *mut ir.Global, seg: *mut wo.Seg, x: *mut ir.Value, off: u64) void {
+    let t = x.ty;
+    let k = x.kind;
+    if k == ir.V_GLOBAL {
+        let s = gsyms.get(@int_cast(usize, ir.gv_of(x).id));
+        if W64 {
+            seg.relocs.push(wo.Reloc.{ ty: wo.R_MEMORY_ADDR_I64, off: @truncate(u32, off), sym: s,
+                                       addend: @bit_cast(i64, x.cv) });
+        } else {
+            seg.relocs.push(wo.Reloc.{ ty: wo.R_MEMORY_ADDR_I32, off: @truncate(u32, off), sym: s,
+                                       addend: @bit_cast(i64, x.cv) });
+        }
+        return;
+    }
+    if k == ir.V_FUNC {
+        UN.uses_table = true;
+        let s = fsyms.get(@int_cast(usize, ir.fnp_of(x).id));
+        if W64 {
+            seg.relocs.push(wo.Reloc.{ ty: wo.R_TABLE_INDEX_I64, off: @truncate(u32, off), sym: s, addend: 0 });
+        } else {
+            seg.relocs.push(wo.Reloc.{ ty: wo.R_TABLE_INDEX_I32, off: @truncate(u32, off), sym: s, addend: 0 });
+        }
+        return;
+    }
+    if (k == ir.V_CAGG) and (t.kind != ir.T_VEC) {
+        for i in 0..x.xs.len {
+            emit_data(g, seg, x.xs.get(i), off + ir.field_off(t, i));
+        }
+        return;
+    }
+    is.const_le(x, &mut seg.data, @truncate(usize, off));
+}
+
+pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
+    W64 = wasm64;
+    errors = false;
+    F = u.nil.[ir.Func]();
+    UN = wo.new_unit(wasm64);
+    fsyms.clear();
+    gsyms.clear();
+    // __stack_pointer (always global import 0)
+    UN.gimports.push(wo.Import.{ module: "env", name: "__stack_pointer", ty: @as(u32, ptr_vt()), mutable: true });
+    sp_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: wo.F_UNDEFINED, name: "__stack_pointer", index: 0,
+                                     seg: 0, off: 0, size: 0 });
+    // (longjmp's tag, for functions that call setjmp: above)
+    let mut sjlj = false;
+    for i in 0..m.funcs.len {
+        sjlj = sjlj or m.funcs.get(i).returns_twice;
+    }
+    if sjlj and tg.has(tg.W_EXCEPTION_HANDLING) {
+        let pt: [1]u8 = [ptr_vt()];
+        UN.timports.push(wo.Import.{ module: "env", name: "__axc_longjmp_tag", ty: wo.type_index(UN, pt[..], ""),
+                                     mutable: false });
+        tag_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_TAG, flags: wo.F_UNDEFINED, name: "__axc_longjmp_tag", index: 0,
+                                          seg: 0, off: 0, size: 0 });
+    }
+    // (the size word of a thread's view of the memory, above)
+    view_sync = tg.has(tg.W_ATOMICS);
+    if view_sync {
+        pages_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: wo.F_UNDEFINED, name: "__axiom_memory_pages",
+                                            index: 0, seg: 0, off: 0, size: 0 });
+    }
+    // globals: wasm globals (imports first), then data
+    for i in 0..m.globals.len {
+        gsyms.push(0);
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if g.wasm_global and u.isnil(g.init) {
+            let gi = @int_cast(u32, UN.gimports.len);
+            UN.gimports.push(wo.Import.{ module: "env", name: g.name, ty: @as(u32, vt(g.ty)), mutable: true });
+            gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: wo.F_UNDEFINED, name: g.name, index: gi,
+                                                 seg: 0, off: 0, size: 0 }));
+        }
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if g.wasm_global and u.notnil(g.init) {
+            let gi = @int_cast(u32, UN.gimports.len + UN.globals.len);
+            let mut init: i64 = 0;
+            if g.init.kind == ir.V_CINT {
+                init = ir.sval(g.init);
+            }
+            UN.globals.push(wo.Global.{ vt: vt(g.ty), mutable: true, init: init, ik: wo.GI_CONST, hi: 0 });
+            gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: sym_flags_for(g.linkage, true),
+                                                 name: g.name, index: gi, seg: 0, off: 0, size: 0 }));
+        } else if not g.wasm_global and (init_priority(g) >= 0) {
+            continue;  // (a constructor: INIT_FUNCS, below)
+        } else if not g.wasm_global {
+            if u.isnil(g.init) {
+                gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: sym_flags_for(g.linkage, false),
+                                                     name: g.name, index: 0, seg: 0, off: 0, size: 0 }));
+            } else {
+                let seg = u.new.[wo.Seg]();
+                let mut al: u32 = 0;
+                while (@as(u64, 1) << al) < g.align {
+                    al += 1;
+                }
+                seg.align = al;
+                let pre = u.pick(g.is_const, ".rodata.", u.pick(ir.is_zero(g.init), ".bss.", ".data."));
+                seg.name = u.cat2(pre, g.name);
+                seg.tls = false;
+                UN.segs.push(seg);
+                gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: sym_flags_for(g.linkage, true),
+                                                     name: g.name, index: 0, seg: @int_cast(u32, UN.segs.len - 1),
+                                                     off: 0, size: g.ty.size }));
+            }
+        }
+    }
+    // functions: imports, then definitions (file-scope asm's after the IR's)
+    for i in 0..m.funcs.len {
+        fsyms.push(0);
+    }
+    if not top_assemble(m) {
+        return u.nil.[wo.Unit]();
+    }
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not ir.is_decl(f) or top_defines(f.name) {
+            continue;
+        }
+        let fi = @int_cast(u32, UN.fimports.len);
+        let mut modname: []u8 = "env";
+        let mut nm = f.name;
+        let mut fl = sym_flags_for(f.linkage, false);
+        if f.import_module.len > 0 {
+            modname = f.import_module;
+            nm = f.import_name;
+            fl = fl | wo.F_EXPLICIT_NAME;
+        }
+        UN.fimports.push(wo.Import.{ module: modname, name: nm, ty: fn_type(f.ty), mutable: false });
+        fsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: f.name, index: fi, seg: 0, off: 0,
+                                             size: 0 }));
+    }
+    top_imports();
+    top_field_imports();
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if ir.is_decl(f) {
+            continue;
+        }
+        let fi = @int_cast(u32, UN.fimports.len + UN.funcs.len);
+        let wf = u.new.[wo.Func]();
+        wf.ty = fn_type(f.ty);
+        wf.name = f.name;
+        let mut fl = sym_flags_for(f.linkage, true);
+        if f.export_name.len > 0 {
+            fl = (fl | wo.F_EXPORTED | wo.F_NO_STRIP) & ~wo.F_HIDDEN;
+            UN.exports.push(wo.Export.{ name: f.export_name, func: fi, kind: wo.EX_FUNC });
+        }
+        wf.sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: f.name, index: fi, seg: 0, off: 0,
+                                         size: 0 });
+        fsyms.set(i, wf.sym);
+        UN.funcs.push(wf);
+    }
+    top_functions();
+    top_fields();
+    top_elems();
+    top_code();
+    cur_text = -1;
+    // a C unit's constructors in an object (an entry of .init_array.N, a
+    // pointer: cgen.ax put_in_arrays), as the linking section's INIT_FUNCS:
+    // their priorities and symbols, which a linker calls in that order
+    // before the program starts (wlink.ax: __wasm_call_ctors)
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        let pr = init_priority(g);
+        if (pr >= 0) and (g.init.kind == ir.V_FUNC) {
+            let cf = ir.fnp_of(g.init);
+            if not ir.is_decl(cf) {
+                UN.inits.push((@bit_cast(u64, pr) << 32) | @as(u64, fsyms.get(@int_cast(usize, cf.id))));
+            }
+        }
+    }
+    // aliases (ir.Alias): symbols of their own for their targets' function
+    // or data
+    for k in 0..m.aliases.len {
+        let a = m.aliases.at_mut(k);
+        let af = ir.alias_func(m, a);
+        let ag = ir.alias_global(m, a);
+        let mut fl = wo.F_HIDDEN;
+        if a.weak {
+            fl = fl | wo.F_WEAK;
+        }
+        if u.notnil(af) and not ir.is_decl(af) {
+            let t = UN.syms.get(@as(usize, fsyms.get(@int_cast(usize, af.id))));
+            _ = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: a.name, index: t.index, seg: 0, off: 0,
+                                        size: 0 });
+        } else if u.notnil(ag) and u.notnil(ag.init) and not ag.wasm_global {
+            let t = UN.syms.get(@as(usize, gsyms.get(@int_cast(usize, ag.id))));
+            _ = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: fl, name: a.name, index: 0, seg: t.seg, off: t.off,
+                                        size: t.size });
+        }
+    }
+    // data
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if g.wasm_global or u.isnil(g.init) {
+            continue;
+        }
+        let s = UN.syms.get(@as(usize, gsyms.get(i)));
+        let seg = UN.segs.get(@as(usize, s.seg));
+        seg.data.zeros(@truncate(usize, g.ty.size));
+        emit_data(g, seg, g.init, 0);
+    }
+    // code
+    let mut k: usize = 0;
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if ir.is_decl(f) {
+            continue;
+        }
+        // the function's code and relocations are all that outlive it
+        u.scratch_begin();
+        gen_function(f, UN.funcs.get(k));
+        u.scratch_end();
+        k += 1;
+    }
+    if errors {
+        return u.nil.[wo.Unit]();
+    }
+    if tg.g_debug == tg.DEBUG_FULL {
+        unit_dwarf();
+    }
+    return UN;
+}

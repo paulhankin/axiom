@@ -380,10 +380,22 @@ fn contains(sp: u.Span, off: u32) bool {
     return (sp.start <= off) and (off <= sp.end);
 }
 
-fn tname(t: *ast.Type) []u8 {
-    if u.isnil(t) {
-        return "?";
+fn opt_ptr[T](p: *T) ?*T {
+    if u.isnil(p) {
+        return .none;
     }
+    return p;
+}
+
+fn opt_mut[T](p: *mut T) ?*mut T {
+    if u.isnil(p) {
+        return .none;
+    }
+    return p;
+}
+
+fn tname(ot: ?*ast.Type) []u8 {
+    let t = ot ?? return "?";
     return ty.type_str(t);
 }
 
@@ -401,71 +413,82 @@ const R_BUILTIN: i32 = 6;  // builtin `index`
 struct Ref {
     span: u.Span,  // the name in the source
     kind: i32,
-    local: *ast.Local,
-    decl: *ast.Decl,
+    local: ?*ast.Local,
+    decl: ?*ast.Decl,
     index: i32,
-    name: []u8,     // R_ERROR
-    ty: *ast.Type,  // the type here, when the use knows better than the declaration
-    def: bool,      // declares it
+    name: []u8,      // R_ERROR
+    ty: ?*ast.Type,  // the type here, when the use knows better than the declaration
+    def: bool,       // declares it
 }
 
 threadlocal let mut refs: u.List.[Ref] = u.List.[Ref].{ data: @ptr_from_int(*mut Ref, 0), len: 0, cap: 0 };
-threadlocal let mut w_mod: *mut ast.Module = @ptr_from_int(*mut ast.Module, 0);
-threadlocal let mut w_fn: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
-threadlocal let mut w_owner: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+threadlocal let mut w_mod: ?*mut ast.Module = .none;
+threadlocal let mut w_fn: ?*mut ast.Decl = .none;
+threadlocal let mut w_owner: ?*mut ast.Decl = .none;
 
 // What completion and signature help look for while walking: the member
 // access, qualified type name or error value whose name starts at
 // find_off, and the call whose argument list opens at call_off.
 threadlocal let mut find_file: i32 = -1;
 threadlocal let mut find_off: i64 = -1;
-threadlocal let mut found_field: *mut ast.Expr = @ptr_from_int(*mut ast.Expr, 0);
+threadlocal let mut found_field: ?*mut ast.Expr = .none;
 threadlocal let mut found_qual: []u8 = "";  // the module qualifying the type name found
 threadlocal let mut found_error: bool = false;
 threadlocal let mut call_off: i64 = -1;
-threadlocal let mut found_call: *mut ast.Expr = @ptr_from_int(*mut ast.Expr, 0);
+threadlocal let mut found_call: ?*mut ast.Expr = .none;
 threadlocal let mut found_call_end: u32 = 0;
 
-fn add(sp: u.Span, kind: i32, d: *ast.Decl, index: i32, l: *ast.Local, def: bool, t: *ast.Type) void {
+fn add(sp: u.Span, kind: i32, d: ?*ast.Decl, index: i32, l: ?*ast.Local, def: bool, t: ?*ast.Type) void {
     if sp.end <= sp.start {
         return;
     }
     refs.push(Ref.{ span: sp, kind: kind, local: l, decl: d, index: index, name: "", ty: t, def: def });
 }
 
-fn add_decl(sp: u.Span, d: *ast.Decl, def: bool, t: *ast.Type) void {
-    if u.notnil(d) {
-        add(sp, R_DECL, d, 0, u.nil.[ast.Local](), def, t);
+fn add_decl(sp: u.Span, d: ?*ast.Decl, def: bool, t: ?*ast.Type) void {
+    if let .some(decl) = d {
+        add(sp, R_DECL, decl, 0, .none, def, t);
     }
 }
 
-fn add_local(sp: u.Span, l: *ast.Local, def: bool) void {
-    if u.notnil(l) {
-        add(sp, R_LOCAL, u.nil.[ast.Decl](), 0, l, def, l.ty);
+fn add_local(sp: u.Span, l: ?*ast.Local, def: bool) void {
+    if let .some(loc) = l {
+        add(sp, R_LOCAL, .none, 0, loc, def, opt_ptr(loc.ty));
     }
 }
 
 fn add_error(sp: u.Span, name: []u8, def: bool) void {
     if sp.end > sp.start {
-        refs.push(Ref.{ span: sp, kind: R_ERROR, local: u.nil.[ast.Local](), decl: u.nil.[ast.Decl](), index: 0,
-                        name: name, ty: u.nil.[ast.Type](), def: def });
+        refs.push(Ref.{ span: sp, kind: R_ERROR, local: .none, decl: .none, index: 0, name: name, ty: .none,
+                        def: def });
     }
 }
 
-fn has_decl(t: *ast.Type) bool {
-    return u.notnil(t) and ((t.kind == ast.TY_STRUCT) or (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM)) and
-           u.notnil(t.decl);
+fn decl_of_type(ot: ?*ast.Type) ?*ast.Decl {
+    let t = ot ?? return .none;
+    if ((t.kind == ast.TY_STRUCT) or (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM)) and u.notnil(t.decl) {
+        return t.decl;
+    }
+    return .none;
+}
+
+fn has_decl(ot: ?*ast.Type) bool {
+    if let .some = decl_of_type(ot) {
+        return true;
+    }
+    return false;
 }
 
 // A struct, union or enum type, or a pointer to one: the type.
-fn aggregate(t: *mut ast.Type) *mut ast.Type {
-    if u.notnil(t) and (t.kind == ast.TY_PTR) and has_decl(t.elem) {
-        return t.elem;
+fn aggregate(ot: ?*mut ast.Type) ?*mut ast.Type {
+    let t = ot ?? return .none;
+    if (t.kind == ast.TY_PTR) and has_decl(opt_ptr(t.elem)) {
+        return opt_mut(t.elem);
     }
     return t;
 }
 
-fn field_index(d: *mut ast.Decl, name: []u8) i32 {
+fn field_index(d: *ast.Decl, name: []u8) i32 {
     for i in 0..d.fields.len {
         if u.str_eq(d.fields.at(i).name, name) {
             return @int_cast(i32, i);
@@ -474,7 +497,7 @@ fn field_index(d: *mut ast.Decl, name: []u8) i32 {
     return -1;
 }
 
-fn variant_index(d: *mut ast.Decl, name: []u8) i32 {
+fn variant_index(d: *ast.Decl, name: []u8) i32 {
     for i in 0..d.variants.len {
         if u.str_eq(d.variants.at(i).name, name) {
             return @int_cast(i32, i);
@@ -483,10 +506,8 @@ fn variant_index(d: *mut ast.Decl, name: []u8) i32 {
     return -1;
 }
 
-fn gparam_index(d: *mut ast.Decl, name: []u8) i32 {
-    if u.isnil(d) {
-        return -1;
-    }
+fn gparam_index(od: ?*mut ast.Decl, name: []u8) i32 {
+    let d = od ?? return -1;
     for i in 0..d.gparams.len {
         if u.str_eq(d.gparams.at(i).name, name) {
             return @int_cast(i32, i);
@@ -499,12 +520,12 @@ fn gparam_index(d: *mut ast.Decl, name: []u8) i32 {
 fn gparam_ref(sp: u.Span, name: []u8) bool {
     let i = gparam_index(w_fn, name);
     if i >= 0 {
-        add(sp, R_GPARAM, w_fn, i, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        add(sp, R_GPARAM, w_fn, i, .none, false, .none);
         return true;
     }
     let j = gparam_index(w_owner, name);
     if j >= 0 {
-        add(sp, R_GPARAM, w_owner, j, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        add(sp, R_GPARAM, w_owner, j, .none, false, .none);
         return true;
     }
     return false;
@@ -516,32 +537,36 @@ fn wte(te: *ast.TypeExpr) void {
     }
     match te.shape {
         .Named(nt) => {
+            let wm = w_mod ?? return;
             let file = nt.name_span.file;
             if not u.isnos(nt.qual) {
                 let qsp = u.mkspan(file, te.span.start, te.span.start + @int_cast(u32, nt.qual.len));
-                let imp = w_mod.imports.get(nt.qual);
+                let imp = modl.module_lookup_import(wm, file, nt.qual);
                 if u.notnil(imp) {
-                    add_decl(qsp, imp, false, u.nil.[ast.Type]());
-                    let bd = sema.module_lookup(imp.imported, nt.name);
-                    add_decl(nt.name_span, bd, false, u.nil.[ast.Type]());
-                    if nt.has_member and u.notnil(bd) {
-                        add_decl(nt.member_span, bd.method_map.get(nt.member), false, u.nil.[ast.Type]());
+                    add_decl(qsp, imp, false, .none);
+                    let bd = opt_mut(sema.module_lookup(imp.imported, nt.name));
+                    add_decl(nt.name_span, bd, false, .none);
+                    if nt.has_member {
+                        if let .some(b) = bd {
+                            add_decl(nt.member_span, opt_ptr(b.method_map.get(nt.member)), false, .none);
+                        }
                     }
                 } else {
-                    let bd = sema.module_lookup(w_mod, nt.qual);
-                    if u.notnil(bd) {
-                        add_decl(qsp, bd, false, u.nil.[ast.Type]());
-                        add_decl(nt.name_span, bd.method_map.get(nt.name), false, u.nil.[ast.Type]());
+                    if let .some(bd) = opt_mut(sema.module_lookup(wm, nt.qual)) {
+                        add_decl(qsp, bd, false, .none);
+                        add_decl(nt.name_span, opt_ptr(bd.method_map.get(nt.name)), false, .none);
                     }
                 }
                 if (file == find_file) and (@as(i64, nt.name_span.start) == find_off) {
                     found_qual = nt.qual;
                 }
             } else if not gparam_ref(nt.name_span, nt.name) {
-                let bd = sema.module_lookup(w_mod, nt.name);
-                add_decl(nt.name_span, bd, false, u.nil.[ast.Type]());
-                if nt.has_member and u.notnil(bd) {
-                    add_decl(nt.member_span, bd.method_map.get(nt.member), false, u.nil.[ast.Type]());
+                let bd = opt_mut(sema.module_lookup(wm, nt.name));
+                add_decl(nt.name_span, bd, false, .none);
+                if nt.has_member {
+                    if let .some(b) = bd {
+                        add_decl(nt.member_span, opt_ptr(b.method_map.get(nt.member)), false, .none);
+                    }
                 }
             }
             for i in 0..nt.args.len {
@@ -551,7 +576,7 @@ fn wte(te: *ast.TypeExpr) void {
                 wte(nt.member_args.get(i));
             }
         }
-        .SelfType  => { add_decl(te.span, w_owner, false, u.nil.[ast.Type]()); }
+        .SelfType  => { add_decl(te.span, w_owner, false, .none); }
         .Ptr(pt)   => { wte(pt.elem); }
         .Slice(pt) => { wte(pt.elem); }
         .Opt(el)   => { wte(el); }
@@ -581,12 +606,13 @@ fn wte(te: *ast.TypeExpr) void {
 }
 
 fn wident(e: *mut ast.Expr) void {
-    if u.notnil(ast.local_of(e)) {
-        add_local(e.span, ast.local_of(e), false);
-    } else if u.notnil(ast.decl_of(e)) {
-        add_decl(e.span, ast.decl_of(e), false, e.ty);
+    if let .some(l) = opt_ptr(ast.local_of(e)) {
+        add_local(e.span, l, false);
+    } else if let .some(d) = opt_ptr(ast.decl_of(e)) {
+        add_decl(e.span, d, false, opt_ptr(e.ty));
     } else if e.cat == ast.CAT_MODULE {
-        add_decl(e.span, w_mod.imports.get(e.name), false, u.nil.[ast.Type]());
+        let wm = w_mod ?? return;
+        add_decl(e.span, opt_ptr(modl.module_lookup_import(wm, e.span.file, e.name)), false, .none);
     } else {
         _ = gparam_ref(e.span, e.name);
     }
@@ -597,26 +623,27 @@ fn wfield(e: *mut ast.Expr) void {
     if (sp.file == find_file) and (@as(i64, sp.start) == find_off) {
         found_field = e;
     }
-    if u.notnil(ast.decl_of(e)) {
-        add_decl(sp, ast.decl_of(e), false, e.ty);  // module member, method
+    if let .some(d) = opt_ptr(ast.decl_of(e)) {
+        add_decl(sp, d, false, opt_ptr(e.ty));  // module member, method
         return;
     }
-    let a = e.a;
-    if u.isnil(a) {
-        return;
-    }
-    if (a.cat == ast.CAT_TYPE) and has_decl(ast.tval_of(a)) {
-        let v = variant_index(ast.tval_of(a).decl, e.name);
-        if v >= 0 {
-            add(sp, R_VARIANT, ast.tval_of(a).decl, v, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+    let a = opt_mut(e.a) ?? return;
+    if a.cat == ast.CAT_TYPE {
+        if let .some(td) = decl_of_type(opt_ptr(ast.tval_of(a))) {
+            let v = variant_index(td, e.name);
+            if v >= 0 {
+                add(sp, R_VARIANT, td, v, .none, false, .none);
+            }
+            return;
         }
-        return;
     }
-    let bt = aggregate(a.ty);
-    if has_decl(bt) and (bt.kind == ast.TY_STRUCT) {
-        let fi = field_index(bt.decl, e.name);
-        if fi >= 0 {
-            add(sp, R_FIELD, bt.decl, fi, u.nil.[ast.Local](), false, e.ty);
+    let bt = aggregate(opt_mut(a.ty)) ?? return;
+    if bt.kind == ast.TY_STRUCT {
+        if let .some(td) = decl_of_type(bt) {
+            let fi = field_index(td, e.name);
+            if fi >= 0 {
+                add(sp, R_FIELD, td, fi, .none, false, opt_ptr(e.ty));
+            }
         }
     }
 }
@@ -631,7 +658,7 @@ fn wexpr(e: *mut ast.Expr) void {
         return;
     }
     if k == ast.E_SELF {
-        add_decl(e.span, w_owner, false, u.nil.[ast.Type]());
+        add_decl(e.span, w_owner, false, .none);
         return;
     }
     if k == ast.E_FIELD {
@@ -641,14 +668,19 @@ fn wexpr(e: *mut ast.Expr) void {
     }
     if k == ast.E_STRUCT_LIT {
         wexpr(e.a);
-        let st = e.ty;
         if u.notnil(e.more) {
+            let mut struct_decl: ?*ast.Decl = .none;
+            if let .some(st) = opt_ptr(e.ty) {
+                if st.kind == ast.TY_STRUCT {
+                    struct_decl = decl_of_type(st);
+                }
+            }
             for i in 0..e.more.inits.len {
                 let fi = e.more.inits.at_mut(i);
-                if has_decl(st) and (st.kind == ast.TY_STRUCT) {
-                    let x = field_index(st.decl, fi.name);
+                if let .some(td) = struct_decl {
+                    let x = field_index(td, fi.name);
                     if x >= 0 {
-                        add(fi.span, R_FIELD, st.decl, x, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+                        add(fi.span, R_FIELD, td, x, .none, false, .none);
                     }
                 }
                 wexpr(fi.value);
@@ -664,8 +696,8 @@ fn wexpr(e: *mut ast.Expr) void {
         return;
     }
     if k == ast.E_BUILTIN {
-        add(u.mkspan(e.span.file, e.span.start, e.span.start + 1 + @int_cast(u32, e.name.len)), R_BUILTIN,
-            u.nil.[ast.Decl](), @int_from_enum(ast.builtin_of(e)), u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        add(u.mkspan(e.span.file, e.span.start, e.span.start + 1 + @int_cast(u32, e.name.len)), R_BUILTIN, .none,
+            @int_from_enum(ast.builtin_of(e)), .none, false, .none);
         note_call(e, e.span.start + 1 + @int_cast(u32, e.name.len));
         if u.notnil(e.more) {
             for i in 0..e.more.bargs.len {
@@ -679,7 +711,7 @@ fn wexpr(e: *mut ast.Expr) void {
     if (k == ast.E_CATCH) or (k == ast.E_ORELSE) {
         wexpr(e.a);
         if k == ast.E_CATCH {
-            add_local(ast.more(e).capture_span, ast.more(e).capture_local, true);
+            add_local(ast.more(e).capture_span, opt_ptr(ast.more(e).capture_local), true);
         }
         wexpr(ast.handler_expr(e));
         wstmt(ast.handler_block(e));
@@ -716,7 +748,13 @@ fn note_call(e: *mut ast.Expr, callee_end: u32) void {
     if @int_cast(i64, i) != call_off {
         return;
     }
-    if u.isnil(found_call) or (callee_end >= found_call_end) {
+    let mut take = false;
+    if let .none = found_call {
+        take = true;
+    } else if callee_end >= found_call_end {
+        take = true;
+    }
+    if take {
         found_call = e;
         found_call_end = callee_end;
     }
@@ -728,13 +766,13 @@ fn wstmt(s: *mut ast.Stmt) void {
     }
     let k = s.kind;
     if (k == ast.S_LET) or (k == ast.S_FOR) {
-        add_local(s.name_span, s.local, true);
+        add_local(s.name_span, opt_ptr(s.local), true);
     }
     if k == ast.S_MATCH {
         wexpr(s.e);
-        let mut st = u.nil.[ast.Type]();
+        let mut st: ?*mut ast.Type = .none;
         if u.notnil(s.e) {
-            st = aggregate(s.e.ty);
+            st = aggregate(opt_mut(s.e.ty));
         }
         if u.notnil(s.more) {
             for i in 0..s.more.arms.len {
@@ -742,14 +780,14 @@ fn wstmt(s: *mut ast.Stmt) void {
                 let file = a.span.file;
                 match a.pat {
                     .Variant(p) => {
-                        if has_decl(st) {
-                            let v = variant_index(st.decl, p.name);
+                        if let .some(td) = decl_of_type(st) {
+                            let v = variant_index(td, p.name);
                             if v >= 0 {
-                                add(word_span(file, a.span.start, a.span.end, p.name), R_VARIANT, st.decl, v,
-                                    u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+                                add(word_span(file, a.span.start, a.span.end, p.name), R_VARIANT, td, v, .none, false,
+                                    .none);
                             }
                         }
-                        add_local(p.bind_span, a.bind_local, true);
+                        add_local(p.bind_span, opt_ptr(a.bind_local), true);
                     }
                     .Error(name) => { add_error(word_span(file, a.span.start, a.span.end, name), name, false); }
                     else => {}
@@ -777,13 +815,15 @@ fn wstmt(s: *mut ast.Stmt) void {
 fn wdecl(d: *mut ast.Decl) void {
     let k = d.kind;
     if k == ast.D_IMPORT {
-        add_decl(d.name_span, d, true, u.nil.[ast.Type]());
-        add_decl(d.import_path_span, d, false, u.nil.[ast.Type]());
+        if not d.is_part {
+            add_decl(d.name_span, d, true, .none);
+        }
+        add_decl(d.import_path_span, d, false, .none);
         return;
     }
     if k == ast.D_ERROR {
         if not u.isnos(d.name) {
-            add_decl(d.name_span, d, true, u.nil.[ast.Type]());  // a named error set
+            add_decl(d.name_span, d, true, .none);  // a named error set
         }
         for j in 0..d.error_names.len {
             add_error(d.error_spans.get(j), d.error_names.get(j), true);
@@ -794,11 +834,11 @@ fn wdecl(d: *mut ast.Decl) void {
         return;
     }
     if not d.is_test {
-        add_decl(d.name_span, d, true, u.nil.[ast.Type]());
+        add_decl(d.name_span, d, true, .none);
     }
     for i in 0..d.gparams.len {
         let g = d.gparams.at(i);
-        add(g.span, R_GPARAM, d, @int_cast(i32, i), u.nil.[ast.Local](), true, u.nil.[ast.Type]());
+        add(g.span, R_GPARAM, d, @int_cast(i32, i), .none, true, .none);
         wte(g.const_te);
         wte(g.constraint_te);
     }
@@ -807,7 +847,7 @@ fn wdecl(d: *mut ast.Decl) void {
         w_fn = d;
         for i in 0..d.params.len {
             let p = d.params.at(i);
-            add_local(p.span, p.local, true);
+            add_local(p.span, opt_ptr(p.local), true);
             wte(p.te);
         }
         wte(d.ret_te);
@@ -817,12 +857,12 @@ fn wdecl(d: *mut ast.Decl) void {
     }
     for i in 0..d.fields.len {
         let f = d.fields.at(i);
-        add(f.span, R_FIELD, d, @int_cast(i32, i), u.nil.[ast.Local](), true, f.ty);
+        add(f.span, R_FIELD, d, @int_cast(i32, i), .none, true, opt_ptr(f.ty));
         wte(f.te);
     }
     for i in 0..d.variants.len {
         let v = d.variants.at(i);
-        add(v.span, R_VARIANT, d, @int_cast(i32, i), u.nil.[ast.Local](), true, u.nil.[ast.Type]());
+        add(v.span, R_VARIANT, d, @int_cast(i32, i), .none, true, .none);
         wte(v.te);
     }
     wte(d.te);
@@ -837,8 +877,8 @@ fn wdecl(d: *mut ast.Decl) void {
 
 fn walk_module(m: *mut ast.Module) void {
     w_mod = m;
-    w_fn = u.nil.[ast.Decl]();
-    w_owner = u.nil.[ast.Decl]();
+    w_fn = .none;
+    w_owner = .none;
     for i in 0..m.decls.len {
         wdecl(m.decls.get(i));
     }
@@ -878,16 +918,27 @@ fn ref_cmp(a: Ref, b: Ref) i32 {
     return 0;
 }
 
+fn same_opt[T](a: ?*T, b: ?*T) bool {
+    if let .some(pa) = a {
+        let pb = b ?? return false;
+        return pa == pb;
+    }
+    if let .some = b {
+        return false;
+    }
+    return true;
+}
+
 fn same_target(a: *Ref, b: *Ref) bool {
     if a.kind != b.kind {
         return false;
     }
     let k = a.kind;
     if k == R_LOCAL {
-        return a.local == b.local;
+        return same_opt(a.local, b.local);
     }
     if k == R_DECL {
-        return a.decl == b.decl;
+        return same_opt(a.decl, b.decl);
     }
     if k == R_ERROR {
         return u.str_eq(a.name, b.name);
@@ -895,7 +946,7 @@ fn same_target(a: *Ref, b: *Ref) bool {
     if k == R_BUILTIN {
         return a.index == b.index;
     }
-    return (a.decl == b.decl) and (a.index == b.index);
+    return same_opt(a.decl, b.decl) and (a.index == b.index);
 }
 
 // Sorts names by position and drops repeats (sema shares some subtrees);
@@ -929,10 +980,10 @@ fn sort_refs() void {
     name_runs.push(refs.items());
 }
 
-// The name at `off` in `file`, or nil. A name the cursor is inside beats
+// The name at `off` in `file`, or .none. A name the cursor is inside beats
 // one it is just after.
-fn ref_at(file: i32, off: u32) *Ref {
-    let mut best: *Ref = u.nil.[Ref]();
+fn ref_at(file: i32, off: u32) ?*Ref {
+    let mut best: ?*Ref = .none;
     let mut best_len: u32 = 0;
     let mut best_inside = false;
     for k in 0..name_runs.len {
@@ -947,7 +998,13 @@ fn ref_at(file: i32, off: u32) *Ref {
             }
             let inside = off < r.span.end;
             let len = r.span.end - r.span.start;
-            if u.isnil(best) or (inside and not best_inside) or ((inside == best_inside) and (len < best_len)) {
+            let mut better = false;
+            if let .none = best {
+                better = true;
+            } else if (inside and not best_inside) or ((inside == best_inside) and (len < best_len)) {
+                better = true;
+            }
+            if better {
                 best = r;
                 best_len = len;
                 best_inside = inside;
@@ -972,9 +1029,9 @@ struct Index {
     refs: []mut Ref,  // sorted (sort_names), on the heap
 }
 
-let mut kept_names: u.SymMap.[*mut Index] = u.SymMap.[*mut Index].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                    vals: @ptr_from_int(*mut *mut Index, 0), cap: 0,
-                                                                    len: 0 };
+let mut kept_names: u.SymMap.[?*mut Index] = u.SymMap.[?*mut Index].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                      vals: @ptr_from_int(*mut ?*mut Index, 0), cap: 0,
+                                                                      len: 0 };
 
 // Walks m into refs; false if a name it found is not in m's file.
 fn walk_own(m: *mut ast.Module) bool {
@@ -1007,19 +1064,18 @@ pub fn index_kept(m: *mut ast.Module) void {
 
 /// On the main thread: forgets the names of the module kept for `path`.
 pub fn drop_index(path: []u8) void {
-    let ix = kept_names.get(path);
-    if u.notnil(ix) {
+    if let .some(ix) = kept_names.get(path) {
         u.free(@ptr_cast(*mut void, ix.refs.ptr));
         u.free(@ptr_cast(*mut void, ix));
-        kept_names.put(path, u.nil.[Index]());
+        kept_names.put(path, .none);
     }
 }
 
 struct Run {
     rank: i64,
-    from: usize,  // in refs, if kept is nil
+    from: usize,  // in refs, if kept is .none
     to: usize,
-    kept: *mut Index,
+    kept: ?*mut Index,
 }
 
 fn run_cmp(a: Run, b: Run) i32 {
@@ -1041,10 +1097,13 @@ fn names_by_module() bool {
     for i in 0..ms.len {
         let m = ms.get(i);
         let rank = u.file_rank(m.file.id);
-        let ix = kept_names.get(m.path);
-        if m.base and u.notnil(ix) and (ix.m == m) {
-            runs.push(Run.{ rank: rank, from: 0, to: 0, kept: ix });
-            continue;
+        if m.base {
+            if let .some(ix) = kept_names.get(m.path) {
+                if ix.m == m {
+                    runs.push(Run.{ rank: rank, from: 0, to: 0, kept: ix });
+                    continue;
+                }
+            }
         }
         let from = refs.len;
         if not walk_own(m) {
@@ -1052,14 +1111,14 @@ fn names_by_module() bool {
         }
         let n = sort_names(refs.items_mut()[from..]);
         refs.len = from + n;
-        runs.push(Run.{ rank: rank, from: from, to: refs.len, kept: u.nil.[Index]() });
+        runs.push(Run.{ rank: rank, from: from, to: refs.len, kept: .none });
     }
     u.sort.[Run](runs.items_mut(), run_cmp);
     name_runs.len = 0;
     for i in 0..runs.len {
         let r = runs.get(i);
-        if u.notnil(r.kept) {
-            name_runs.push(r.kept.refs);
+        if let .some(ix) = r.kept {
+            name_runs.push(ix.refs);
         } else {
             name_runs.push(refs.items()[r.from..r.to]);
         }
@@ -1072,19 +1131,34 @@ fn target_name(r: *Ref) []u8 {
     let k = r.kind;
     let i = @int_cast(usize, r.index);
     if k == R_LOCAL {
-        return r.local.name;
+        if let .some(l) = r.local {
+            return l.name;
+        }
+        return "";
     }
     if k == R_DECL {
-        return r.decl.name;
+        if let .some(d) = r.decl {
+            return d.name;
+        }
+        return "";
     }
     if k == R_FIELD {
-        return r.decl.fields.at(i).name;
+        if let .some(d) = r.decl {
+            return d.fields.at(i).name;
+        }
+        return "";
     }
     if k == R_VARIANT {
-        return r.decl.variants.at(i).name;
+        if let .some(d) = r.decl {
+            return d.variants.at(i).name;
+        }
+        return "";
     }
     if k == R_GPARAM {
-        return r.decl.gparams.at(i).name;
+        if let .some(d) = r.decl {
+            return d.gparams.at(i).name;
+        }
+        return "";
     }
     if k == R_ERROR {
         return r.name;
@@ -1111,11 +1185,12 @@ struct Where {
 // declaration comes first.
 fn error_defs(name: []u8) u.List.[u.Span] {
     let mut out = u.List.[u.Span].empty();
+    let rm = root_mod ?? return out;
     let ms = &modl.g_prog.modules;
     for pass in @as(i32, 0)..2 {
         for mi in 0..ms.len {
             let m = ms.get(mi);
-            if (m == root_mod) != (pass == 0) {
+            if (m == rm) != (pass == 0) {
                 continue;
             }
             for i in 0..m.decls.len {
@@ -1146,10 +1221,11 @@ fn def_of(r: *Ref) Where {
     let k = r.kind;
     let i = @int_cast(usize, r.index);
     if k == R_LOCAL {
-        return Where.{ ok: true, span: r.local.span };
+        let l = r.local ?? return Where.{ ok: false, span: r.span };
+        return Where.{ ok: true, span: l.span };
     }
     if k == R_DECL {
-        let d = r.decl;
+        let d = r.decl ?? return Where.{ ok: false, span: r.span };
         if d.kind == ast.D_IMPORT {
             if u.isnil(d.imported) {
                 return Where.{ ok: false, span: r.span };
@@ -1159,13 +1235,16 @@ fn def_of(r: *Ref) Where {
         return Where.{ ok: not d.anon, span: d.name_span };
     }
     if k == R_FIELD {
-        return Where.{ ok: true, span: r.decl.fields.at(i).span };
+        let d = r.decl ?? return Where.{ ok: false, span: r.span };
+        return Where.{ ok: true, span: d.fields.at(i).span };
     }
     if k == R_VARIANT {
-        return Where.{ ok: true, span: r.decl.variants.at(i).span };
+        let d = r.decl ?? return Where.{ ok: false, span: r.span };
+        return Where.{ ok: true, span: d.variants.at(i).span };
     }
     if k == R_GPARAM {
-        return Where.{ ok: true, span: r.decl.gparams.at(i).span };
+        let d = r.decl ?? return Where.{ ok: false, span: r.span };
+        return Where.{ ok: true, span: d.gparams.at(i).span };
     }
     if k == R_ERROR {
         return error_def(r.name);
@@ -1305,14 +1384,14 @@ fn describe(r: *Ref) []u8 {
     let k = r.kind;
     let i = @int_cast(usize, r.index);
     if k == R_LOCAL {
-        let l = r.local;
+        let l = r.local ?? return "";
         if l.is_param {
-            return markdown(u.f2("%s: %s", l.name, tname(l.ty)), "parameter", "");
+            return markdown(u.f2("%s: %s", l.name, tname(opt_ptr(l.ty))), "parameter", "");
         }
-        return markdown(u.f3("let %s%s: %s", u.pick(l.is_mut, "mut ", ""), l.name, tname(l.ty)), "", "");
+        return markdown(u.f3("let %s%s: %s", u.pick(l.is_mut, "mut ", ""), l.name, tname(opt_ptr(l.ty))), "", "");
     }
     if k == R_DECL {
-        let d = r.decl;
+        let d = r.decl ?? return "";
         let mut extra: []u8 = "";
         if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) {
             extra = u.f1("`%s`", d.imported.file.display);
@@ -1333,15 +1412,15 @@ fn describe(r: *Ref) []u8 {
         return markdown(sig_of(d), extra, doc);
     }
     if k == R_FIELD {
-        let d = r.decl;
+        let d = r.decl ?? return "";
         let f = d.fields.at(i);
         let mut t = r.ty;
-        if u.isnil(t) {
-            t = f.ty;
+        if let .none = t {
+            t = opt_ptr(f.ty);
         }
         let mut typ = te_text(f.te);
-        if u.notnil(t) {
-            typ = tname(t);
+        if let .some(tv) = t {
+            typ = tname(tv);
         }
         let mut code = u.f3("%s.%s: %s", d.name, f.name, typ);
         if d.anon {
@@ -1350,7 +1429,7 @@ fn describe(r: *Ref) []u8 {
         return markdown(code, u.pick(not d.anon and f.is_pub, "pub field", "field"), doc_at(f.span));
     }
     if k == R_VARIANT {
-        let d = r.decl;
+        let d = r.decl ?? return "";
         let v = d.variants.at(i);
         let mut code = u.f2("%s.%s", d.name, v.name);
         if d.kind == ast.D_ENUM {
@@ -1361,7 +1440,7 @@ fn describe(r: *Ref) []u8 {
         return markdown(code, u.pick(d.kind == ast.D_ENUM, "enum member", "variant"), doc_at(v.span));
     }
     if k == R_GPARAM {
-        let d = r.decl;
+        let d = r.decl ?? return "";
         let g = d.gparams.at(i);
         let mut code = g.name;
         if g.is_const {
@@ -1389,21 +1468,20 @@ fn describe(r: *Ref) []u8 {
 // -----------------------------------------------------------------------------
 // Hover, definitions, references, rename
 // -----------------------------------------------------------------------------
-threadlocal let mut root_mod: *mut ast.Module = @ptr_from_int(*mut ast.Module, 0);
+threadlocal let mut root_mod: ?*mut ast.Module = .none;
 
 fn cursor() u32 {
-    return offset_in(root_mod.file.text, q_line, q_char);
+    let rm = root_mod ?? return 0;
+    return offset_in(rm.file.text, q_line, q_char);
 }
 
-fn cursor_ref() *Ref {
-    return ref_at(root_mod.file.id, cursor());
+fn cursor_ref() ?*Ref {
+    let rm = root_mod ?? return .none;
+    return ref_at(rm.file.id, cursor());
 }
 
 fn q_hover() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) {
-        return "null";
-    }
+    let r = cursor_ref() ?? return "null";
     let mut b = u.Buf.init();
     b.s("{\"contents\":{\"kind\":\"markdown\",\"value\":");
     jstr(&mut b, describe(r));
@@ -1414,10 +1492,7 @@ fn q_hover() []u8 {
 }
 
 fn q_definition() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) {
-        return "null";
-    }
+    let r = cursor_ref() ?? return "null";
     let mut b = u.Buf.init();
     if r.kind == R_ERROR {
         let ds = error_defs(r.name);
@@ -1444,44 +1519,50 @@ fn is_type_decl(d: *ast.Decl) bool {
 }
 
 fn q_type_definition() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) {
-        return "null";
-    }
+    let r = cursor_ref() ?? return "null";
     let k = r.kind;
     let mut t = r.ty;
     if k == R_LOCAL {
-        t = r.local.ty;
-    } else if (k == R_DECL) and is_type_decl(r.decl) {
-        t = r.decl.ty;
-    } else if (k == R_DECL) and u.isnil(t) {
-        t = r.decl.ty;
-        if (r.decl.kind == ast.D_FN) or (r.decl.kind == ast.D_HOST_FN) {
-            t = r.decl.ret_type;
+        t = opt_ptr((r.local ?? return "null").ty);
+    } else if k == R_DECL {
+        let d = r.decl ?? return "null";
+        if is_type_decl(d) {
+            t = opt_ptr(d.ty);
+        } else if let .none = t {
+            t = opt_ptr(d.ty);
+            if (d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN) {
+                t = opt_ptr(d.ret_type);
+            }
         }
-    } else if (k == R_FIELD) and u.isnil(t) {
-        t = r.decl.fields.at(@int_cast(usize, r.index)).ty;
+    } else if k == R_FIELD {
+        if let .none = t {
+            let d = r.decl ?? return "null";
+            t = opt_ptr(d.fields.at(@int_cast(usize, r.index)).ty);
+        }
     } else if k == R_VARIANT {
-        t = r.decl.ty;
+        let d = r.decl ?? return "null";
+        t = opt_ptr(d.ty);
     }
-    while u.notnil(t) and
-          ((t.kind == ast.TY_PTR) or (t.kind == ast.TY_SLICE) or (t.kind == ast.TY_ARRAY) or
-           (t.kind == ast.TY_ERRUNION) or (t.kind == ast.TY_OPT)) {
-        t = t.elem;
+    loop {
+        let cur = t ?? break;
+        if (cur.kind == ast.TY_PTR) or (cur.kind == ast.TY_SLICE) or (cur.kind == ast.TY_ARRAY) or
+           (cur.kind == ast.TY_ERRUNION) or (cur.kind == ast.TY_OPT) {
+            t = opt_ptr(cur.elem);
+        } else {
+            break;
+        }
     }
-    if not has_decl(t) or t.decl.anon {
+    let td = decl_of_type(t) ?? return "null";
+    if td.anon {
         return "null";
     }
     let mut b = u.Buf.init();
-    jlocation(&mut b, t.decl.name_span);
+    jlocation(&mut b, td.name_span);
     return b.done();
 }
 
 fn q_references() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) {
-        return "null";
-    }
+    let r = cursor_ref() ?? return "null";
     let mut b = u.Buf.init();
     b.c('[');
     let mut first = true;
@@ -1504,10 +1585,8 @@ fn q_references() []u8 {
 }
 
 fn q_highlight() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) {
-        return "null";
-    }
+    let r = cursor_ref() ?? return "null";
+    let rm = root_mod ?? return "null";
     let mut b = u.Buf.init();
     b.c('[');
     let mut first = true;
@@ -1515,7 +1594,7 @@ fn q_highlight() []u8 {
         let xs = name_runs.get(k);
         for j in 0..xs.len {
             let x = &xs[j];
-            if (x.span.file != root_mod.file.id) or not same_use(r, x) {
+            if (x.span.file != rm.file.id) or not same_use(r, x) {
                 continue;
             }
             if not first {
@@ -1553,8 +1632,8 @@ fn in_std(file: i32) bool {
 }
 
 fn q_rename() []u8 {
-    let r = cursor_ref();
-    if u.isnil(r) or not valid_name(q_new_name) {
+    let r = cursor_ref() ?? return "null";
+    if not valid_name(q_new_name) {
         return "null";
     }
     let w = def_of(r);
@@ -1644,7 +1723,11 @@ fn span_to(sp: u.Span, te: *ast.TypeExpr) u.Span {
 fn decl_symbol(b: *mut u.Buf, d: *mut ast.Decl) void {
     let k = d.kind;
     if k == ast.D_IMPORT {
-        sym_open(b, d.name, d.import_path, SK_MODULE, d.span, d.name_span);
+        if d.is_part {
+            sym_open(b, d.import_path, "part", SK_MODULE, d.span, d.import_path_span);
+        } else {
+            sym_open(b, d.name, d.import_path, SK_MODULE, d.span, d.name_span);
+        }
         b.s("]}");
         return;
     }
@@ -1725,14 +1808,20 @@ fn decl_symbol(b: *mut u.Buf, d: *mut ast.Decl) void {
 }
 
 fn q_symbols() []u8 {
-    let m = root_mod;
+    let m = root_mod ?? return "[]";
     let mut b = u.Buf.init();
     b.c('[');
+    let mut first = true;
     for i in 0..m.decls.len {
-        if i != 0 {
+        let d = m.decls.get(i);
+        if d.span.file != m.file.id {
+            continue;
+        }
+        if not first {
             b.c(',');
         }
-        decl_symbol(&mut b, m.decls.get(i));
+        first = false;
+        decl_symbol(&mut b, d);
     }
     b.c(']');
     return b.done();
@@ -1812,7 +1901,8 @@ fn decl_item(b: *mut u.Buf, d: *mut ast.Decl, sort: []u8) void {
 }
 
 fn module_items(b: *mut u.Buf, m: *mut ast.Module, sort: []u8) void {
-    let pub_only = m != root_mod;
+    let rm = root_mod ?? m;
+    let pub_only = m != rm;
     for i in 0..m.decls.len {
         let d = m.decls.get(i);
         if pub_only and not d.is_pub {
@@ -1822,10 +1912,14 @@ fn module_items(b: *mut u.Buf, m: *mut ast.Module, sort: []u8) void {
     }
 }
 
-fn method_items(b: *mut u.Buf, d: *mut ast.Decl, values_only: bool) void {
+fn method_items(b: *mut u.Buf, d: *ast.Decl, values_only: bool) void {
+    let mut foreign = false;
+    if let .some(rm) = root_mod {
+        foreign = d.module != rm;
+    }
     for i in 0..d.methods.len {
         let m = d.methods.get(i);
-        if (d.module != root_mod) and not m.is_pub {
+        if foreign and not m.is_pub {
             continue;
         }
         if values_only and (m.self_kind == ast.SELF_NONE) {
@@ -1836,53 +1930,49 @@ fn method_items(b: *mut u.Buf, d: *mut ast.Decl, values_only: bool) void {
 }
 
 fn member_items(b: *mut u.Buf, e: *mut ast.Expr) void {
-    let a = e.a;
-    if u.isnil(a) {
-        return;
-    }
+    let a = opt_mut(e.a) ?? return;
     if a.cat == ast.CAT_MODULE {
-        if u.notnil(ast.module_of(a)) {
-            module_items(b, ast.module_of(a), "1");
+        if let .some(am) = opt_mut(ast.module_of(a)) {
+            module_items(b, am, "1");
         }
         return;
     }
     if (a.cat == ast.CAT_TYPE) or (a.cat == ast.CAT_GENERIC) {
-        let mut d = u.nil.[ast.Decl]();
-        if (a.cat == ast.CAT_TYPE) and has_decl(ast.tval_of(a)) {
-            d = ast.tval_of(a).decl;
+        let mut d: ?*ast.Decl = .none;
+        if a.cat == ast.CAT_TYPE {
+            d = decl_of_type(opt_ptr(ast.tval_of(a)));
         } else if a.cat == ast.CAT_GENERIC {
-            d = ast.decl_of(a);
+            d = opt_ptr(ast.decl_of(a));
         }
-        if u.isnil(d) {
-            return;
-        }
-        for i in 0..d.variants.len {
-            let v = d.variants.at(i);
+        let td = d ?? return;
+        for i in 0..td.variants.len {
+            let v = td.variants.at(i);
             item(b, v.name, CK_ENUM_MEMBER, te_text(v.te), "0");
         }
-        method_items(b, d, false);
+        method_items(b, td, false);
         return;
     }
-    let t = aggregate(a.ty);
-    if u.isnil(t) {
-        return;
-    }
-    if has_decl(t) {
+    let t = aggregate(opt_mut(a.ty)) ?? return;
+    if let .some(td) = decl_of_type(t) {
         if t.kind == ast.TY_STRUCT {
-            for i in 0..t.decl.fields.len {
-                let f = t.decl.fields.at(i);
-                if not t.decl.anon and (t.decl.module != root_mod) and not f.is_pub {
+            let mut foreign = false;
+            if let .some(rm) = root_mod {
+                foreign = td.module != rm;
+            }
+            for i in 0..td.fields.len {
+                let f = td.fields.at(i);
+                if not td.anon and foreign and not f.is_pub {
                     continue;
                 }
-                item(b, f.name, CK_FIELD, tname(ty.type_field(t, i)), "0");
+                item(b, f.name, CK_FIELD, tname(opt_ptr(ty.type_field(t, i))), "0");
             }
         }
-        method_items(b, t.decl, true);
+        method_items(b, td, true);
         return;
     }
     if t.kind == ast.TY_SLICE {
         item(b, "len", CK_FIELD, "usize", "0");
-        item(b, "ptr", CK_FIELD, tname(ty.type_ptr(t.elem, t.is_mut)), "0");
+        item(b, "ptr", CK_FIELD, tname(opt_ptr(ty.type_ptr(t.elem, t.is_mut))), "0");
     } else if t.kind == ast.TY_ARRAY {
         item(b, "len", CK_FIELD, "usize", "0");
     }
@@ -1986,10 +2076,11 @@ fn sc_stmt(s: *mut ast.Stmt, off: u32) void {
     }
 }
 
-fn enclosing_fn(off: u32) *mut ast.Decl {
-    for i in 0..root_mod.decls.len {
-        let d = root_mod.decls.get(i);
-        if not contains(d.span, off) {
+fn enclosing_fn(off: u32) ?*mut ast.Decl {
+    let rm = root_mod ?? return .none;
+    for i in 0..rm.decls.len {
+        let d = rm.decls.get(i);
+        if (d.span.file != find_file) or not contains(d.span, off) {
             continue;
         }
         if d.kind == ast.D_FN {
@@ -2002,42 +2093,40 @@ fn enclosing_fn(off: u32) *mut ast.Decl {
             }
         }
     }
-    return u.nil.[ast.Decl]();
+    return .none;
 }
 
-fn gparam_items(b: *mut u.Buf, d: *mut ast.Decl) void {
-    if u.isnil(d) {
-        return;
-    }
+fn gparam_items(b: *mut u.Buf, od: ?*mut ast.Decl) void {
+    let d = od ?? return;
     for i in 0..d.gparams.len {
         item(b, d.gparams.at(i).name, CK_TYPE_PARAM, "generic parameter", "0");
     }
 }
 
 fn scope_items(b: *mut u.Buf, off: u32) void {
-    let f = enclosing_fn(off);
-    if u.notnil(f) {
+    if let .some(f) = enclosing_fn(off) {
         for i in 0..f.params.len {
             let p = f.params.at(i);
             if u.notnil(p.local) {
-                item(b, p.name, CK_VARIABLE, tname(p.local.ty), "0");
+                item(b, p.name, CK_VARIABLE, tname(opt_ptr(p.local.ty)), "0");
             }
         }
         sc_stmt(f.body, off);
         for i in 0..in_scope.len {
             let l = in_scope.get(i);
-            item(b, l.name, CK_VARIABLE, tname(l.ty), "0");
+            item(b, l.name, CK_VARIABLE, tname(opt_ptr(l.ty)), "0");
         }
         gparam_items(b, f);
-        gparam_items(b, f.owner);
+        gparam_items(b, opt_mut(f.owner));
         if u.notnil(f.owner) {
             item(b, "Self", CK_STRUCT, f.owner.name, "1");
         }
     }
-    module_items(b, root_mod, "1");
-    for i in 0..root_mod.decls.len {
-        let d = root_mod.decls.get(i);
-        if d.kind == ast.D_IMPORT {
+    let rm = root_mod ?? return;
+    module_items(b, rm, "1");
+    for i in 0..rm.decls.len {
+        let d = rm.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and not d.is_part and (d.span.file == find_file) {
             item(b, d.name, CK_MODULE, d.import_path, "1");
         }
     }
@@ -2113,13 +2202,14 @@ fn prepare_completion(path: []u8) void {
 }
 
 fn q_completion() []u8 {
+    let rm = root_mod ?? return "[]";
     let mut b = u.Buf.init();
     b.c('[');
     if c_mode == C_MEMBER {
-        if u.notnil(found_field) {
-            member_items(&mut b, found_field);
+        if let .some(ff) = found_field {
+            member_items(&mut b, ff);
         } else if found_qual.len > 0 {
-            let imp = root_mod.imports.get(found_qual);
+            let imp = modl.module_lookup_import(rm, find_file, found_qual);
             if u.notnil(imp) and u.notnil(imp.imported) {
                 module_items(&mut b, imp.imported, "1");
             }
@@ -2184,10 +2274,7 @@ fn open_paren(t: []u8, off: u32) i64 {
 }
 
 fn q_signature() []u8 {
-    if u.isnil(found_call) {
-        return "null";
-    }
-    let e = found_call;
+    let e = found_call ?? return "null";
     let mut label: []u8 = "";
     let mut params = u.List.[[]u8].empty();
     let mut doc: []u8 = "";
@@ -2223,17 +2310,26 @@ fn q_signature() []u8 {
             if (c.cat == ast.CAT_METHOD) and (d.self_kind != ast.SELF_NONE) {
                 active += 1;  // the receiver is the first parameter
             }
-        } else if (c.cat == ast.CAT_VARIANT) and has_decl(ast.tval_of(c)) and (ast.index_of(c) >= 0) {
-            let v = ast.tval_of(c).decl.variants.at(@int_cast(usize, ast.index_of(c)));
-            label = u.f3("%s.%s(%s)", ast.tval_of(c).decl.name, v.name, te_text(v.te));
-            params.push(te_text(v.te));
-        } else if u.notnil(c.ty) and (c.ty.kind == ast.TY_FN) {
-            label = tname(c.ty);
-            for i in 0..c.ty.params.len {
-                params.push(tname(c.ty.params[i]));
-            }
         } else {
-            return "null";
+            let mut done = false;
+            if (c.cat == ast.CAT_VARIANT) and (ast.index_of(c) >= 0) {
+                if let .some(vd) = decl_of_type(opt_ptr(ast.tval_of(c))) {
+                    let v = vd.variants.at(@int_cast(usize, ast.index_of(c)));
+                    label = u.f3("%s.%s(%s)", vd.name, v.name, te_text(v.te));
+                    params.push(te_text(v.te));
+                    done = true;
+                }
+            }
+            if not done {
+                if u.notnil(c.ty) and (c.ty.kind == ast.TY_FN) {
+                    label = tname(opt_ptr(c.ty));
+                    for i in 0..c.ty.params.len {
+                        params.push(tname(opt_ptr(c.ty.params[i])));
+                    }
+                } else {
+                    return "null";
+                }
+            }
         }
     }
     let mut b = u.Buf.init();
@@ -2299,10 +2395,23 @@ fn jdiag(b: *mut u.Buf, d: *mut dg.Diag, sp: u.Span, prefix: []u8) void {
     b.c('}');
 }
 
+fn module_has_file(m: *ast.Module, fid: i32) bool {
+    if m.file.id == fid {
+        return true;
+    }
+    for i in 0..m.parts.len {
+        if m.parts.at(i).file.id == fid {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The file's own diagnostics, and the first error in each module it
 // imports (on the import).
 fn q_diagnostics() []u8 {
-    let fid = root_mod.file.id;
+    let rm = root_mod ?? return "[]";
+    let fid = rm.file.id;
     let mut b = u.Buf.init();
     b.c('[');
     let mut done = u.List.[i32].empty();
@@ -2328,9 +2437,9 @@ fn q_diagnostics() []u8 {
         if seen {
             continue;
         }
-        for i in 0..root_mod.decls.len {
-            let imp = root_mod.decls.get(i);
-            if (imp.kind == ast.D_IMPORT) and u.notnil(imp.imported) and (imp.imported.file.id == sp.file) {
+        for i in 0..rm.decls.len {
+            let imp = rm.decls.get(i);
+            if (imp.kind == ast.D_IMPORT) and u.notnil(imp.imported) and module_has_file(imp.imported, sp.file) {
                 if b.len() > 1 {
                     b.c(',');
                 }
@@ -2451,22 +2560,20 @@ pub fn answer(input: []u8, std_dir: []u8) []u8 {
     }
     let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: extras.items() };
     _ = sema.run(input, &so);
-    root_mod = modl.g_prog.root;
-    if u.isnil(root_mod) {
-        return u.pick(u.str_eq(q, "diagnostics") or u.str_eq(q, "completion"), "[]", "null");
-    }
+    root_mod = opt_mut(modl.g_prog.root);
+    let rm = root_mod ?? return u.pick(u.str_eq(q, "diagnostics") or u.str_eq(q, "completion"), "[]", "null");
     if u.str_eq(q, "diagnostics") {
         return q_diagnostics();
     }
-    find_file = root_mod.file.id;
+    find_file = rm.file.id;
     if u.str_eq(q, "completion") {
         find_off = @as(i64, c_start);
     }
     if u.str_eq(q, "signatureHelp") {
-        call_off = open_paren(root_mod.file.text, cursor());
+        call_off = open_paren(rm.file.text, cursor());
     }
     if not whole {
-        walk_module(root_mod);
+        walk_module(rm);
         sort_refs();
     } else if not names_by_module() {
         refs.len = 0;

@@ -1,0 +1,630 @@
+// =============================================================================
+// std/net/http/server.ax - HTTP server configuration, Server[C], Router[C],
+// connection admission, and the poller wait loop (part of std/net/http).
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../mem.ax" as mem;
+import "../../net.ax" as net;
+import "../../str.ax" as strs;
+import "../../sync.ax" as sync;
+import "../../thread.ax" as thread;
+import "../tls.ax" as tls;
+
+// -----------------------------------------------------------------------------
+// The server
+//
+// run()'s thread waits on every connection at once (a net.Poller): for new
+// connections, and for bytes on each open connection that no worker is
+// serving. A connection goes to one of the Options.threads worker threads
+// only when bytes have arrived, and the worker reads without waiting: a
+// TLS handshake, a request head and a request body each get as far as the
+// bytes received allow, and the connection goes back to run()'s thread to
+// wait for more. So a worker is held only while a handler runs and its
+// response is sent: an idle keep-alive connection, or a client sending its
+// request slowly, costs a connection, not a thread. A worker hands a
+// connection back after 16 requests (or 256 KiB of a body) even when more
+// have arrived, so that one client cannot keep it.
+//
+// A connection closed after an error answer (or GOAWAY) while its client
+// may still be sending sends the end of the stream and is drained by
+// run()'s thread (DRAIN_MS, DRAIN_BYTES) before it is closed, so that the
+// client gets the answer rather than a reset.
+//
+// Connections are limited in number (max_connections, with the least
+// useful closed to make room: max_connections_per_addr), in time
+// (handshake_timeout_ms, head_timeout_ms, min_body_rate,
+// request_timeout_ms, and idle_timeout_ms between requests), and in the
+// memory their requests still arriving may hold (max_buffered_bytes).
+// -----------------------------------------------------------------------------
+
+pub struct Options {
+    /// Worker threads: how many requests are handled at once (run()'s own
+    /// thread waits for connections).
+    threads: u32,
+    /// The most a request line and headers may take (more: 431).
+    max_head_bytes: usize,
+    /// The most a request body may take (more: 413). No more than
+    /// max_buffered_bytes - max_head_bytes is taken whatever this says, so
+    /// that one request alone always fits the budget.
+    max_body_bytes: usize,
+    /// How long a connection may wait for its next request (bytes that
+    /// are not part of one, such as blank lines, do not extend it); and how
+    /// long a worker waits on any one write (or read, for HTTP/2's flow
+    /// control and upgraded connections).
+    idle_timeout_ms: u32,
+    /// How long a whole request may take to arrive, from its first byte
+    /// (HTTP/2: each request, from the last answer).
+    request_timeout_ms: u32,
+    /// How long a request head may take to arrive, from its first byte (a
+    /// new connection's, from when it was accepted or its TLS handshake
+    /// done; HTTP/2's preface and first request too); then 408 and the
+    /// connection is closed. Also the window min_body_rate is measured over.
+    head_timeout_ms: u32,
+    /// How long a TLS handshake may take, from the connection's accept.
+    handshake_timeout_ms: u32,
+    /// The bytes per second a request body must arrive at, in each window
+    /// of head_timeout_ms (0: no minimum); a slower one gets 408. (HTTP/2:
+    /// the bodies of a connection's requests together.)
+    min_body_rate: u32,
+    /// Connections open at once. When a new one would exceed it, one
+    /// waiting is closed to make room: first one that has not finished a
+    /// request (or TLS handshake) yet, then one idle between requests,
+    /// then one in the middle of a request; among those, from the address
+    /// with the most connections, then the one longest without an answer.
+    /// When every connection is in a worker, new ones wait in the listen
+    /// backlog. (Each takes a file descriptor or two: keep it under the
+    /// process's limit.)
+    max_connections: u32,
+    /// Connections open at once from one client address (IPv6: one /64);
+    /// more are closed as they are accepted. 0: no limit.
+    max_connections_per_addr: u32,
+    /// The bytes that connections may hold at once for requests still
+    /// arriving (heads and the body bytes received). Past it, waiting
+    /// connections are answered 503 (HTTP/2: GOAWAY) and closed until they
+    /// hold less: first those whose bodies came slowly in the last second
+    /// (under twice min_body_rate, or 8 KiB), from the client (address,
+    /// IPv6 /64) holding the most, the one holding the most; a connection
+    /// being read at full speed is not chosen. Also bounds the bodies
+    /// taken (max_body_bytes).
+    max_buffered_bytes: usize,
+
+    pub fn default() Options {
+        return Options.{
+            threads: 8,
+            max_head_bytes: 65536,
+            max_body_bytes: 8388608,
+            idle_timeout_ms: 30000,
+            request_timeout_ms: 60000,
+            head_timeout_ms: 5000,
+            handshake_timeout_ms: 5000,
+            min_body_rate: 500,
+            max_connections: 512,
+            max_connections_per_addr: 64,
+            max_buffered_bytes: 67108864,
+        };
+    }
+}
+
+/// A listening server; run() serves until stop().
+pub struct Server[C] {
+    listener: net.TcpListener,
+    handler: fn(*mut C, *Request, *mut Response) !void,
+    ctx: *mut C,
+    opts: Options,
+    stopping: u32,
+    tls_config: *tls.ServerConfig,
+    secure: bool,
+    work: *mut sync.Channel.[*mut Slot],  // connections with bytes to read, for the workers
+    back: *mut sync.Channel.[*mut Slot],  // from the workers: to wait on again, or closed
+    wake: net.UdpSocket,                  // a datagram to it ends run()'s wait
+    wake_addr: net.Addr,
+    has_wake: bool,
+    state: u32,        // RUN_NOT_YET, RUN_RUNNING, RUN_OVER (under lock)
+    lock: sync.Mutex,  // (state and wake, between run() and stop())
+
+    /// The port it listens on (useful after listening on port 0).
+    pub fn port(self: *Self) u16 {
+        return self.listener.port();
+    }
+
+    /// Serves until stop() is called: handlers run on Options.threads
+    /// worker threads, and this thread waits for connections.
+    pub fn run(self: *mut Self) HttpError!void {
+        let cap = @as(usize, @max(self.opts.max_connections, 1));
+        let work = mem.create(sync.Channel.[*mut Slot].init(cap)!)!;
+        defer mem.destroy(work);
+        defer work.deinit();
+        let back = mem.create(sync.Channel.[*mut Slot].init(cap)!)!;
+        defer mem.destroy(back);
+        defer back.deinit();
+        let n = @as(usize, @max(self.opts.threads, 1));
+        let ts = mem.alloc.[thread.Thread.[*mut Self]](n)!;
+        defer mem.free(ts);
+        self.lock.lock();
+        if self.state != RUN_NOT_YET {
+            self.lock.unlock();
+            return;  // (stopped already)
+        }
+        self.state = RUN_RUNNING;
+        self.work = work;
+        self.back = back;
+        // (without it, run() looks for returned connections every few ms)
+        self.wake = net.UdpSocket.bind(net.Addr.loopback(net.Family.V4, 0)) catch net.UdpSocket.{ handle: -1 };
+        if self.wake.handle >= 0 {
+            let none = net.Addr.loopback(net.Family.V4, 0);
+            self.wake_addr = self.wake.local_addr() catch none;
+            if self.wake_addr.port == 0 {
+                self.wake.close();
+                self.wake.handle = -1;
+            }
+        }
+        self.has_wake = self.wake.handle >= 0;
+        self.lock.unlock();
+        let mut started: usize = 0;
+        for i in 0..n {
+            ts[i] = thread.spawn(work_loop.[C], self) catch break;
+            started += 1;
+        }
+        let no_workers = started == 0;
+        if no_workers {
+            _ = @atomic_xchg(&mut self.stopping, 1);
+        }
+        wait_loop(self, ts[..started]);
+        self.lock.lock();
+        self.state = RUN_OVER;
+        if self.has_wake {
+            self.wake.close();
+            self.has_wake = false;
+        }
+        self.lock.unlock();
+        self.listener.close();
+        if no_workers {
+            return error.OutOfMemory;
+        }
+    }
+
+    /// Stops accepting connections; run() returns once the connections in
+    /// progress have finished their current request (connections waiting
+    /// for one are closed). May be called from a handler or any other
+    /// thread.
+    pub fn stop(self: *mut Self) void {
+        if @atomic_xchg(&mut self.stopping, 1) == 0 {
+            self.lock.lock();
+            if self.state == RUN_NOT_YET {
+                self.state = RUN_OVER;
+                self.listener.close();
+            } else if self.state == RUN_RUNNING {
+                self.wake_up();
+            }
+            self.lock.unlock();
+        }
+    }
+
+    // Ends run()'s wait.
+    fn wake_up(self: *mut Self) void {
+        if self.has_wake {
+            self.wake.send_to("w", self.wake_addr) catch {};
+        }
+    }
+}
+
+const RUN_NOT_YET: u32 = 0;
+const RUN_RUNNING: u32 = 1;
+const RUN_OVER: u32 = 2;
+
+/// Listens on hostname:port (hostname "" or "0.0.0.0" for every address; port 0
+/// for any free port). Call run() to serve.
+pub fn server[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
+                 opts: Options) HttpError!Server.[C] {
+    let l = net.listen(hostname, port)!;
+    return Server.[C].{
+        listener: l,
+        handler: handler,
+        ctx: ctx,
+        opts: opts,
+        stopping: 0,
+        tls_config: @ptr_from_int(*tls.ServerConfig, 8),
+        secure: false,
+        work: @ptr_from_int(*mut sync.Channel.[*mut Slot], 8),
+        back: @ptr_from_int(*mut sync.Channel.[*mut Slot], 8),
+        wake: net.UdpSocket.{ handle: -1 },
+        wake_addr: net.Addr.loopback(net.Family.V4, 0),
+        has_wake: false,
+        state: RUN_NOT_YET,
+        lock: sync.Mutex.init(),
+    };
+}
+
+/// Like server, but serving HTTPS with the given certificate and key, which
+/// must outlive the server.
+pub fn server_tls[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
+                     opts: Options, cfg: *tls.ServerConfig) HttpError!Server.[C] {
+    let mut s = server(hostname, port, handler, ctx, opts)!;
+    s.tls_config = cfg;
+    s.secure = true;
+    return s;
+}
+
+/// Listens on hostname:port and serves forever.
+pub fn serve[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
+                opts: Options) HttpError!void {
+    let mut s = server(hostname, port, handler, ctx, opts)!;
+    s.run()!;
+}
+
+// -----------------------------------------------------------------------------
+// Router
+// -----------------------------------------------------------------------------
+
+struct Route[C] {
+    method: []u8,
+    pattern: []u8,
+    handler: fn(*mut C, *Request, *mut Response) !void,
+}
+
+/// Dispatches requests by method and path pattern. Patterns are paths
+/// whose segments may be `{name}` (any one segment, see Request.param) and
+/// whose last segment may be `*` (the rest of the path). The first route
+/// that matches wins; HEAD requests use GET routes. Unmatched paths get
+/// 404, and paths that match only for other methods get 405.
+pub struct Router[C] {
+    routes: vec.Vec.[Route.[C]],
+    ctx: *mut C,
+
+    pub fn init(ctx: *mut C) Self {
+        return Self.{ routes: vec.Vec.[Route.[C]].init(), ctx: ctx };
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        self.routes.deinit();
+    }
+
+    /// Adds a route. The method and pattern must outlive the router (string
+    /// literals do).
+    pub fn route(self: *mut Self, method: []u8, pattern: []u8, h: fn(*mut C, *Request,
+                                                                     *mut Response) !void) { OutOfMemory }!void {
+        self.routes.push(Route.[C].{ method: method, pattern: pattern, handler: h })!;
+    }
+
+    pub fn get(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
+        self.route("GET", pattern, h)!;
+    }
+
+    pub fn post(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
+        self.route("POST", pattern, h)!;
+    }
+
+    pub fn put(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
+        self.route("PUT", pattern, h)!;
+    }
+
+    pub fn delete(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
+        self.route("DELETE", pattern, h)!;
+    }
+
+    /// The handler for Server: routes one request.
+    pub fn handle(self: *mut Self, req: *Request, res: *mut Response) !void {
+        let mut path_matched = false;
+        let mut allow = strs.String.init();
+        defer allow.deinit();
+        for r in self.routes.items() {
+            if not match_pattern(r.pattern, req.path, req.scratch_mut())! {
+                continue;
+            }
+            let method_ok = @mem_eq(r.method, req.method) or (@mem_eq(req.method, "HEAD") and @mem_eq(r.method, "GET"));
+            if method_ok {
+                return r.handler(self.ctx, req, res);
+            }
+            path_matched = true;
+            if allow.len() > 0 {
+                allow.push_str(", ")!;
+            }
+            allow.push_str(r.method)!;
+        }
+        if path_matched {
+            res.header("Allow", allow.bytes())!;
+            res.text(405, "Method Not Allowed\n")!;
+            return;
+        }
+        res.text(404, "Not Found\n")!;
+    }
+
+    /// Listens on hostname:port and serves requests with this router forever.
+    pub fn serve(self: *mut Self, hostname: []u8, port: u16, opts: Options) HttpError!void {
+        let mut s = server(hostname, port, Self.handle, self, opts)!;
+        s.run()!;
+    }
+
+    /// Listens on hostname:port and serves HTTPS with this router forever.
+    pub fn serve_tls(self: *mut Self, hostname: []u8, port: u16, opts: Options, cfg: *tls.ServerConfig) HttpError!void {
+        let mut s = server_tls(hostname, port, Self.handle, self, opts, cfg)!;
+        s.run()!;
+    }
+}
+
+/// Whether path matches pattern; the parameters are stored (decoded) in
+/// the request's scratch.
+fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) { OutOfMemory }!bool {
+    req.nparams = 0;
+    let mut pi = strs.split(pattern, "/");
+    let mut si = strs.split(path, "/");
+    loop {
+        let p = pi.next() ?? {
+            // the pattern is used up: so must the path be
+            _ = si.next() ?? return true;
+            return false;
+        };
+        if @mem_eq(p, "*") {
+            let rest = si.remainder();
+            _ = si.next();
+            return add_param(req, "*", rest);
+        }
+        let seg = si.next() ?? return false;
+        if (p.len >= 2) and (p[0] == '{') and (p[p.len - 1] == '}') {
+            if seg.len == 0 {
+                return false;
+            }
+            if not add_param(req, p[1..p.len - 1], seg)! {
+                return false;
+            }
+            continue;
+        }
+        if not @mem_eq(p, seg) {
+            return false;
+        }
+    }
+}
+
+fn add_param(req: *mut Scratch, name: []u8, raw: []u8) { OutOfMemory }!bool {
+    if req.nparams == MAX_PARAMS {
+        return false;
+    }
+    let out = req.alloc(raw.len)!;
+    let v = percent_decode(raw, out, false) catch return false;
+    // a parameter names something inside its place: no NUL, no "..", no "\"
+    // or ":" (Windows' separator, drive letters and streams), and (except for
+    // "*") no "/" smuggled in as %2F
+    if strs.contains(v, "\x00") or (not @mem_eq(name, "*") and strs.contains(v, "/")) {
+        return false;
+    }
+    let mut segs = strs.split(v, "/");
+    loop {
+        let seg = segs.next() ?? break;
+        if @mem_eq(seg, "..") or strs.contains(seg, "\\") or strs.contains(seg, ":") {
+            return false;
+        }
+    }
+    req.params[req.nparams] = Param.{ name: name, value: v };
+    req.nparams += 1;
+    return true;
+}
+
+// run()'s thread: waits for new connections, for bytes on connections
+// that are waiting, and for connections the workers hand back; then, once
+// stopping, closes them all and waits for the workers.
+fn wait_loop[C](s: *mut Server.[C], workers: []mut thread.Thread.[*mut Server.[C]]) void {
+    let mut all = vec.Vec.[*mut Slot].init();  // every open connection
+    defer all.deinit();
+    let mut waiting = vec.Vec.[*mut Slot].init();  // those waiting here, not with a worker
+    defer waiting.deinit();
+    let mut p = net.Poller.init();
+    defer p.deinit();
+    let mut paused_until: i64 = 0;  // (accept failed: out of file descriptors, say)
+    let mut accept_failures: u32 = 0;
+    loop {
+        if @atomic_load(&s.stopping) != 0 {
+            break;
+        }
+        let now = now_ns();
+        // those the workers are done with
+        loop {
+            let sl = s.back.try_recv() catch break;
+            if sl.closed {
+                forget(&mut all, sl);
+            } else {
+                waiting.push(sl) catch {
+                    close_slot(sl, false);
+                    forget(&mut all, sl);
+                };
+            }
+        }
+        enforce_budget(s, &mut all, &mut waiting);
+        // those handed back with more to do (after others' turn), and
+        // those whose time is up
+        let mut next = now + 1000000000;
+        let mut i = waiting.len();
+        while i > 0 {
+            i -= 1;
+            let sl = waiting.get(i);
+            if sl.ready {
+                _ = waiting.swap_remove(i);
+                sl.ready = false;
+                s.work.send(sl) catch {};
+            } else if sl.deadline <= now {
+                _ = waiting.swap_remove(i);
+                expire(s, &mut all, sl, 0);
+            } else {
+                next = @min(next, sl.deadline);
+            }
+        }
+        // (at the limit with nothing to close, new connections wait in the
+        // listen backlog)
+        let max = @as(usize, @max(s.opts.max_connections, 1));
+        let listening = ((all.len() < max) or (waiting.len() > 0)) and (now >= paused_until);
+        if now < paused_until {
+            next = @min(next, paused_until);
+        }
+        let mut timeout = @int_cast(i32, ((next - now) / 1000000) + 1);
+        if not s.has_wake {
+            timeout = @min(timeout, 5);
+        }
+        p.clear();
+        let mut base: usize = 0;
+        if s.has_wake {
+            _ = p.add(s.wake.handle, net.READABLE) catch 0;
+            base += 1;
+        }
+        if listening {
+            _ = p.add(s.listener.handle, net.READABLE) catch 0;
+            base += 1;
+        }
+        let mut polled: usize = 0;
+        for sl in waiting.items() {
+            _ = p.add(sl.fd, net.READABLE) catch break;
+            polled += 1;
+        }
+        let n = p.wait(timeout) catch {
+            thread.sleep_ms(5);
+            continue;
+        };
+        if (n == 0) or (@atomic_load(&s.stopping) != 0) {
+            continue;
+        }
+        // connections with something to read: to the workers (from the
+        // end, as swap_remove takes the last one)
+        let mut k = polled;
+        while k > 0 {
+            k -= 1;
+            if p.ready(base + k) != 0 {
+                let sl = waiting.swap_remove(k);
+                if sl.speaks != SPEAKS_NOTHING {
+                    s.work.send(sl) catch {};
+                } else if not drain(sl) {
+                    close_slot(sl, false);
+                    forget(&mut all, sl);
+                } else {
+                    waiting.push(sl) catch {
+                        close_slot(sl, false);
+                        forget(&mut all, sl);
+                    };
+                }
+            }
+        }
+        if s.has_wake and (p.ready(0) != 0) {
+            let mut b: [16]u8 = [0; 16];
+            let mut from = net.Addr.loopback(net.Family.V4, 0);
+            while (net.poll_one(s.wake.handle, net.READABLE, 0) catch 0) != 0 {
+                _ = s.wake.recv_from(b[..], &mut from) catch break;
+            }
+        }
+        if listening and ((p.ready(base - 1) & net.READABLE) != 0) {
+            let r = admit(s, &mut all, &mut waiting);
+            if r == ADMITTED {
+                accept_failures = 0;
+            } else {
+                // the listener stays readable: look again a little later,
+                // and if it keeps failing for want of descriptors, free one
+                paused_until = now_ns() + 10000000;
+                if r == ADMIT_NO_ROOM {
+                    accept_failures += 1;
+                }
+                if accept_failures >= 2 {
+                    let v = pick_victim(&all, &waiting);
+                    if (v < waiting.len()) and (eviction_class(waiting.get(v)) <= 2) {
+                        drop_waiting(&mut all, &mut waiting, v);
+                    }
+                }
+            }
+        }
+    }
+    // stopping: close those waiting; the workers finish what they have
+    for sl in waiting.items() {
+        close_slot(sl, false);
+    }
+    s.work.close();
+    for &mut w in workers {
+        w.join();
+    }
+    for sl in all.items() {
+        close_slot(sl, false);
+        mem.destroy(sl);
+    }
+    loop {
+        _ = s.back.try_recv() catch break;  // (all freed above)
+    }
+}
+
+const ADMITTED: u8 = 0;       // (or refused, or gone before it was taken)
+const ADMIT_NO_ROOM: u8 = 1;  // accept failed: out of descriptors or memory
+const ADMIT_FAILED: u8 = 2;   // accept failed otherwise
+
+// Takes a new connection, within the limits.
+fn admit[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) u8 {
+    let conn = s.listener.accept() catch |e| {
+        if e == error.Empty {
+            return ADMITTED;  // (reset by its client before it was taken)
+        }
+        if e == error.OutOfMemory {
+            return ADMIT_NO_ROOM;
+        }
+        return ADMIT_FAILED;
+    };
+    let o = s.opts;
+    let peer = conn.peer_addr() catch {
+        conn.close();
+        return ADMITTED;
+    };
+    if o.max_connections_per_addr > 0 {
+        let mut same: u32 = 0;
+        for x in all.items() {
+            if same_client(x.peer, peer) {
+                same += 1;
+            }
+        }
+        if same >= o.max_connections_per_addr {
+            conn.close();
+            return ADMITTED;
+        }
+    }
+    if all.len() >= @as(usize, @max(o.max_connections, 1)) {
+        let v = pick_victim(all, waiting);
+        if v == waiting.len() {
+            conn.close();
+            return ADMITTED;
+        }
+        drop_waiting(all, waiting, v);
+    }
+    conn.set_timeout(o.idle_timeout_ms) catch {
+        conn.close();
+        return ADMITTED;
+    };
+    let sl = mem.new_zeroed.[Slot]() catch {
+        conn.close();
+        return ADMITTED;
+    };
+    let now = now_ns();
+    sl.fd = conn.handle;
+    sl.peer = peer;
+    sl.t = Transport.plain(conn);
+    sl.body = strs.String.init();
+    sl.scratch = new_scratch();
+    sl.since = now;
+    sl.chunk = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+    if s.secure {
+        sl.speaks = SPEAKS_TLS_HANDSHAKE;
+        sl.tc = tls.server_start(conn, s.tls_config) catch {
+            conn.close();
+            sl.body.deinit();
+            mem.destroy(sl);
+            return ADMITTED;
+        };
+        sl.tc.nonblocking = true;
+        sl.tc.deadline = now + ms_ns(o.handshake_timeout_ms);
+        sl.deadline = sl.tc.deadline;
+    } else {
+        sl.speaks = SPEAKS_HTTP1;
+        sl.req_start = now;
+        sl.deadline = now + ms_ns(@min(o.head_timeout_ms, o.request_timeout_ms));
+    }
+    all.push(sl) catch {
+        close_slot(sl, false);
+        mem.destroy(sl);
+        return ADMITTED;
+    };
+    waiting.push(sl) catch {
+        close_slot(sl, false);
+        forget(all, sl);
+    };
+    return ADMITTED;
+}

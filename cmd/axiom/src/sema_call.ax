@@ -1,0 +1,472 @@
+// =============================================================================
+// sema_call.ax - function/method/variant/indirect calls, generic deduction
+// and unification, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Calls
+// ---------------------------------------------------------------------------
+fn unify(pat: *mut ast.Type, act: *mut ast.Type, vars: []mut *mut ast.Type, sol: []mut *mut ast.Type) bool {
+    if not pat.has_params {
+        return true;
+    }
+    if u.isnil(act) or (act.kind == ast.TY_INVALID) or ty.is_untyped(act) or (act.kind == ast.TY_NEVER) {
+        return true;
+    }
+    let k = pat.kind;
+    if k == ast.TY_PARAM {
+        let mut ok = true;
+        for i in 0..vars.len {
+            if vars[i] != pat {
+                continue;
+            }
+            if u.isnil(sol[i]) {
+                sol[i] = act;
+            } else if sol[i] != act {
+                ok = false;
+            }
+            break;
+        }
+        if not ok {
+            return false;
+        }
+        if not pat.is_const and u.notnil(pat.constraint_lane) {
+            if act.kind == ast.TY_VEC {
+                return unify(pat.constraint_lane, act.elem, vars, sol);
+            }
+            if (act.kind == ast.TY_PARAM) and not act.is_const and u.notnil(act.constraint_lane) {
+                return unify(pat.constraint_lane, act.constraint_lane, vars, sol);
+            }
+        }
+        return true;
+    }
+    if k == ast.TY_CONSTFN {
+        if (act.kind != ast.TY_CONSTFN) or (act.decl != pat.decl) or (act.args.len != pat.args.len) {
+            return true;
+        }
+        for i in 0..pat.args.len {
+            if not unify(pat.args[i], act.args[i], vars, sol) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (k == ast.TY_PTR) or (k == ast.TY_SLICE) {
+        if act.kind != k {
+            return true;
+        }
+        return unify(pat.elem, act.elem, vars, sol);
+    }
+    if k == ast.TY_ERRUNION {
+        if act.kind == ast.TY_ERRUNION {
+            if u.notnil(pat.err_param) {
+                let mut act_err = act.err_param;
+                if u.isnil(act_err) {
+                    act_err = ty.type_errset(act.decl);
+                }
+                if not unify(pat.err_param, act_err, vars, sol) {
+                    return false;
+                }
+            }
+            return unify(pat.elem, act.elem, vars, sol);
+        }
+        if u.notnil(pat.err_param) and is_err_type(act) {
+            return unify(pat.err_param, act, vars, sol);
+        }
+        return unify(pat.elem, act, vars, sol);
+    }
+    if k == ast.TY_OPT {
+        if act.kind == ast.TY_OPT {
+            return unify(pat.elem, act.elem, vars, sol);
+        }
+        return unify(pat.elem, act, vars, sol);
+    }
+    if k == ast.TY_ARRAY {
+        if act.kind != ast.TY_ARRAY {
+            return true;
+        }
+        if not unify(pat.elem, act.elem, vars, sol) {
+            return false;
+        }
+        if u.notnil(pat.len_param) {
+            let mut lv = act.len_param;
+            if u.isnil(lv) {
+                lv = ty.type_constint(act.len);
+            }
+            return unify(pat.len_param, lv, vars, sol);
+        }
+        return true;
+    }
+    if k == ast.TY_FN {
+        if (act.kind != ast.TY_FN) or (act.params.len != pat.params.len) {
+            return true;
+        }
+        for i in 0..pat.params.len {
+            if not unify(pat.params[i], act.params[i], vars, sol) {
+                return false;
+            }
+        }
+        return unify(pat.ret, act.ret, vars, sol);
+    }
+    if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        if act.decl != pat.decl {
+            return true;
+        }
+        for i in 0..pat.args.len {
+            if not unify(pat.args[i], act.args[i], vars, sol) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return true;
+}
+
+fn mentions(t: *mut ast.Type, vars: []mut *mut ast.Type) bool {
+    if not t.has_params {
+        return false;
+    }
+    for i in 0..vars.len {
+        let mut from: [1]*mut ast.Type = [vars[i]];
+        let mut to: [1]*mut ast.Type = [ty.t_invalid];
+        if ty.subst(t, from[..], to[..]) != t {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Arguments in the variadic part of a C call undergo C's default argument
+// promotions, so only already-promoted types are accepted (spec §14.5).
+fn check_vararg(pe: *mut *mut ast.Expr) void {
+    let t = check_expr(pe.*, tnil());
+    if t.kind == ast.TY_UNTYPED_INT {
+        if fits_type(ast.cval_of(pe.*), ty.t_i32) {
+            coerce(pe, ty.t_i32);
+        } else {
+            coerce(pe, ty.t_i64);
+        }
+        return;
+    }
+    if t.kind == ast.TY_UNTYPED_FLOAT {
+        coerce(pe, ty.t_f64);
+        return;
+    }
+    let ok = ((t.kind == ast.TY_INT) and (t.bits >= 32)) or ((t.kind == ast.TY_FLOAT) and (t.bits == 64)) or
+             (t.kind == ast.TY_PTR) or (t.kind == ast.TY_FN) or (t.kind == ast.TY_INVALID) or
+             ((t.kind == ast.TY_OPT) and ((t.elem.kind == ast.TY_PTR) or (t.elem.kind == ast.TY_FN)));
+    if ok {
+        return;
+    }
+    let d = dg.err(pe.*.span, "E0824",
+                   u.f1("C variadic arguments must be i32, u32, i64, u64, isize, usize, f64 or pointers (C's default argument promotions); found %s",
+                        tstr(t)));
+    if (t.kind == ast.TY_INT) or (t.kind == ast.TY_FLOAT) {
+        let txt = u.span_text(pe.*.span);
+        let mut to: []u8 = "u32";
+        if t.kind == ast.TY_FLOAT {
+            to = "f64";
+        } else if t.is_signed {
+            to = "i32";
+        }
+        let fx = dg.fix(d, "apply the promotion explicitly", "machine");
+        dg.edit(fx, pe.*.span, u.f2("@as(%s, %s)", to, txt));
+    }
+}
+
+fn check_args_count(e: *mut ast.Expr, want: usize, f: *mut ast.Decl) void {
+    let n = ast.args_of(e).len;
+    if u.notnil(f) and f.variadic {
+        if n < want {
+            let d = dg.err(e.span, "E0420", u.f3("expected at least %s argument%s, found %s", u.zdec(want),
+                                                 u.pick(want == 1, "", "s"), u.zdec(n)));
+            dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
+        }
+        return;
+    }
+    if n != want {
+        let d = dg.err(e.span, "E0420",
+                       u.f3("expected %s argument%s, found %s", u.zdec(want), u.pick(want == 1, "", "s"), u.zdec(n)));
+        if u.notnil(f) {
+            dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
+        }
+    }
+}
+
+fn check_all_args(e: *mut ast.Expr) void {
+    for i in 0..ast.args_of(e).len {
+        _ = check_expr(ast.args_of(e).get(i), tnil());
+    }
+}
+
+// A call of the function or method (callee) f: its arguments checked against
+// f's parameters (phase 1), generic arguments deduced from them unless all
+// are given (phase 2), and the arguments coerced to the parameters (phase 3).
+fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut ast.Type {
+    let f = ast.decl_of(callee);
+    resolve_decl(f);
+    if f.state != ast.DeclState.DONE {
+        // (a call in the function's own signature, E0355: its parameters are not known yet)
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
+    if method and (f.self_kind == ast.SELF_NONE) {
+        _ = dg.err(callee.span, "E0421", u.f3("'%s' has no 'self' parameter; call it as %s.%s(...)", f.name,
+                                              f.owner.name, f.name));
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
+    let mut first: usize = 0;
+    if method {
+        first = 1;
+    }
+    let nparams = f.params.len - first;
+    check_args_count(e, nparams, f);
+    let nall = f.all_gparams.len;
+    let mut nown = f.gparams.len;
+    if f.kind == ast.D_HOST_FN {
+        nown = 0;
+    }
+    let nowner = nall - nown;
+    let gargs = u.newn.[*mut ast.Type](nall);
+    let mut i: usize = 0;
+    while (i < ast.gargs_of(callee).len) and (i < nall) {
+        gargs[i] = ast.gargs_of(callee)[i];
+        i += 1;
+    }
+    let deduce = (nown > 0) and (ast.gargs_of(callee).len < nall);
+    let owner_from = f.all_gparams[0..nowner];
+    let owner_to = gargs[0..nowner];
+    let own_vars = f.all_gparams[nowner..];
+    // phase 1: check args
+    let mut nargs = ast.args_of(e).len;
+    if nargs > nparams {
+        nargs = nparams;
+    }
+    for j in 0..ast.args_of(e).len {
+        if j >= nparams {
+            if f.variadic {
+                check_vararg(ast.args_mut(e).at_mut(j));
+            } else {
+                _ = check_expr(ast.args_of(e).get(j), tnil());
+            }
+            continue;
+        }
+        let mut pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
+        if deduce and mentions(pt, own_vars) {
+            _ = check_expr(ast.args_of(e).get(j), tnil());
+        } else {
+            if not deduce {
+                pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
+            }
+            _ = check_expr(ast.args_of(e).get(j), pt);
+        }
+    }
+    // phase 2: deduce
+    if deduce {
+        deduce_gargs(e, f, first, nargs, nowner, gargs);
+    }
+    // phase 3: coerce args
+    for j in 0..nargs {
+        let pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
+        coerce(ast.args_mut(e).at_mut(j), pt);
+    }
+    for j in 0..ast.args_of(e).len {
+        check_no_copy(ast.args_of(e).get(j));
+    }
+    ast.set_decl(e, f);
+    ast.set_gargs(e, gargs);
+    ast.set_call_kind(e, ast.CALLK_DIRECT);
+    let fc = C;
+    if f.is_inline and u.notnil(fc.fnd) and fc.fnd.is_inline {
+        fc.fnd.inline_callees.push(f);
+        fc.fnd.inline_call_spans.push(e.span);
+    }
+    if method {
+        check_receiver(e, callee, f);
+    }
+    ensure_infer_ret(f);
+    e.ty = ty.subst(f.ret_type, f.all_gparams, gargs);
+    return e.ty;
+}
+
+// Phase 2 of a direct call of f with deduced generic arguments: f's own
+// generic parameters (gargs[nowner..]) solved from the types of the first
+// nargs arguments (checked in phase 1). `first` skips a method's self.
+fn deduce_gargs(e: *mut ast.Expr, f: *mut ast.Decl, first: usize, nargs: usize, nowner: usize,
+                gargs: []mut *mut ast.Type) void {
+    let nown = gargs.len - nowner;
+    let owner_from = f.all_gparams[0..nowner];
+    let owner_to = gargs[0..nowner];
+    let own_vars = f.all_gparams[nowner..];
+    let sol = u.newn.[*mut ast.Type](nown);
+    let mut ok = true;
+    for j in 0..nargs {
+        let pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
+        let arg = ast.args_of(e).get(j);
+        let mut before: [16]*mut ast.Type = [tnil(); 16];
+        for k in 0..nown {
+            if k >= 16 {
+                break;
+            }
+            before[k] = sol[k];
+        }
+        if not unify(pt, arg.ty, own_vars, sol) {
+            for k in 0..nown {
+                if k >= 16 {
+                    break;
+                }
+                if u.notnil(before[k]) and (sol[k] == before[k]) {
+                    let mut tmp: [1]*mut ast.Type = [tnil()];
+                    _ = unify(pt, arg.ty, own_vars[k..k + 1], tmp[..]);
+                    if u.notnil(tmp[0]) and (tmp[0] != before[k]) {
+                        let gp = f.gparams.at(k);
+                        let d = dg.err(arg.span, "E0464",
+                                       u.f3("conflicting types for generic parameter '%s': %s and %s", gp.name,
+                                            tstr(before[k]), tstr(tmp[0])));
+                        dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
+                    }
+                }
+            }
+            ok = false;
+        }
+    }
+    for k in 0..nown {
+        if not ok {
+            break;
+        }
+        if u.isnil(sol[k]) {
+            let gp = f.gparams.at(k);
+            let d = dg.err(e.span, "E0463",
+                           u.f3("cannot deduce generic parameter '%s' of '%s'; give it explicitly: %s.[...](...)",
+                                gp.name, f.name, f.name));
+            dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
+            ok = false;
+        }
+    }
+    for k in 0..nown {
+        if u.notnil(sol[k]) {
+            gargs[nowner + k] = sol[k];
+        } else {
+            gargs[nowner + k] = ty.t_invalid;
+        }
+    }
+    if ok {
+        _ = check_generic_args_ctx(f, gargs[0..nowner], gargs[nowner..nowner + nown], e.span,
+                                   u.nil.[u.List.[*mut ast.TypeExpr]]());
+    }
+}
+
+// How a method call passes its receiver (callee.b) to f's self.
+fn check_receiver(e: *mut ast.Expr, callee: *mut ast.Expr, f: *mut ast.Decl) void {
+    let recv = ast.b_of(callee);
+    let rt = recv.ty;
+    let via_ptr = ast.self_mode_of(callee) == ast.SELF_DEREF;
+    let sk = f.self_kind;
+    if sk == ast.SELF_VALUE {
+        if via_ptr {
+            if (rt.kind == ast.TY_PTR) and u.notnil(rt.elem) and (rt.elem.kind != ast.TY_INVALID) and
+               type_is_nocopy(rt.elem) {
+                _ = dg.err(recv.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(rt.elem)));
+            }
+            ast.set_self_mode(e, ast.SELF_DEREF);
+        } else {
+            check_no_copy(recv);
+            ast.set_self_mode(e, ast.SELF_VALUE);
+        }
+    } else if sk == ast.SELF_ADDR {
+        if via_ptr {
+            ast.set_self_mode(e, ast.SELF_PASS);
+        } else {
+            // a temporary receiver gets a slot, as &temporary does
+            ast.set_self_mode(e, ast.SELF_ADDR);
+            mark_addr_taken(recv);
+        }
+    } else if sk == ast.SELF_PASS {
+        if via_ptr {
+            if not rt.is_mut {
+                _ = dg.err(recv.span, "E0702", u.f2("method '%s' takes '*mut Self', but the receiver is %s", f.name,
+                                                    tstr(rt)));
+            }
+            ast.set_self_mode(e, ast.SELF_PASS);
+        } else if not is_place(recv) {
+            _ = dg.err(recv.span, "E0703",
+                       u.f1("method '%s' needs the mutable address of its receiver, but it is a temporary", f.name));
+        } else {
+            if not is_mut_place(recv) {
+                not_mutable(recv, u.f1("call '%s' (it takes *mut Self)", f.name));
+            }
+            ast.set_self_mode(e, ast.SELF_ADDR);
+            mark_addr_taken(recv);
+        }
+    }
+    ast.set_b(e, recv);
+}
+
+fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let callee = e.a;
+    _ = check_operand(callee, tnil());
+    e.cat = ast.CAT_VALUE;
+    let cc = callee.cat;
+    if (cc == ast.CAT_FUNC) or (cc == ast.CAT_METHOD) {
+        return check_direct_call(e, callee, cc == ast.CAT_METHOD);
+    }
+    if cc == ast.CAT_VARIANT {
+        let ut = ast.tval_of(callee);
+        let v = ast.index_of(callee);
+        let pt = ty.type_variant(ut, @int_cast(usize, v));
+        check_args_count(e, 1, dnil());
+        for i in 0..ast.args_of(e).len {
+            if i == 0 {
+                _ = check_expr_to(ast.args_mut(e).at_mut(0), pt);
+                move_or_check_nocopy(ast.args_of(e).get(0));
+            } else {
+                _ = check_expr(ast.args_of(e).get(i), tnil());
+            }
+        }
+        ast.set_call_kind(e, ast.CALLK_VARIANT);
+        ast.set_index(e, v);
+        ast.set_tval(e, ut);
+        e.ty = ut;
+        return e.ty;
+    }
+    if cc == ast.CAT_TYPE {
+        _ = dg.err(callee.span, "E0406", u.f2("%s is a type, not a function; use %s.{ ... } to construct a struct",
+                                              tstr(ast.tval_of(callee)), tstr(ast.tval_of(callee))));
+        return set_ty(e, ty.t_invalid);
+    }
+    if cc == ast.CAT_GENERIC {
+        _ = dg.err(callee.span, "E0460", u.f1("generic type '%s' must be given arguments", ast.decl_of(callee).name));
+        return set_ty(e, ty.t_invalid);
+    }
+    if cc == ast.CAT_MODULE {
+        _ = dg.err(callee.span, "E0406", "a module cannot be called");
+        return set_ty(e, ty.t_invalid);
+    }
+    let ft = callee.ty;
+    if u.isnil(ft) or (ft.kind == ast.TY_INVALID) {
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
+    if ft.kind != ast.TY_FN {
+        _ = dg.err(callee.span, "E0406", u.f1("cannot call a value of type %s", tstr(ft)));
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
+    check_args_count(e, ft.params.len, dnil());
+    for i in 0..ast.args_of(e).len {
+        if i < ft.params.len {
+            _ = check_expr_to(ast.args_mut(e).at_mut(i), ft.params[i]);
+            check_no_copy(ast.args_of(e).get(i));
+        } else {
+            _ = check_expr(ast.args_of(e).get(i), tnil());
+        }
+    }
+    ast.set_call_kind(e, ast.CALLK_INDIRECT);
+    e.ty = ft.ret;
+    return e.ty;
+}

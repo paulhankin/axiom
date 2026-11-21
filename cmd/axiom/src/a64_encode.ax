@@ -1,0 +1,613 @@
+// =============================================================================
+// a64_encode.ax - machine instruction encoding, addressing, and relocations, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "elf.ax" as elf;
+import "mach.ax" as mc;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+struct Rl {
+    off: u64,
+    ty: u32,
+    sym: i32,
+    addend: i64,
+}
+
+struct Fx {
+    off: u64,
+    label: i32,
+    kind: i32,  // 0: imm26, 1: imm19
+}
+
+fn P(r: i32) i32 {
+    return mc.phys(FN.mf, r);
+}
+
+fn w32(x: u64) void {
+    FN.code.u32_(x & 0xFFFF_FFFF);
+}
+
+fn here() u64 {
+    return @as(u64, FN.code.len());
+}
+
+fn tls_key_sym() i32 {
+    if O.tls_key_si < 0 {
+        O.tls_key_si = @bit_cast(i32, elf.ext_sym(O.obj, "axiom.tls_key", false));
+    }
+    return O.tls_key_si;
+}
+
+fn tls_index_sym() i32 {
+    if O.tls_index_si < 0 {
+        O.tls_index_si = @bit_cast(i32, elf.ext_sym(O.obj, "axiom.tls_index", false));
+    }
+    return O.tls_index_si;
+}
+
+fn reloc(ty: u32, sym: i32, addend: i64) void {
+    FN.rls.push(Rl.{ off: here(), ty: ty, sym: sym, addend: addend });
+}
+
+// rd = x (movz / movn / movk, or orr with a logical immediate)
+fn enc_movi(rd: i32, x0: i64, sf: u64) void {
+    let mut x = @bit_cast(u64, x0);
+    let mut nch: u64 = 4;
+    let mut width: u32 = 64;
+    if sf == 0 {
+        x = x & 0xFFFF_FFFF;
+        nch = 2;
+        width = 32;
+    }
+    let mut nzero: u64 = 0;
+    let mut nones: u64 = 0;
+    for i in @as(u64, 0)..nch {
+        let c = (x >> (16 * i)) & 0xffff;
+        if c == 0 {
+            nzero += 1;
+        } else if c == 0xffff {
+            nones += 1;
+        }
+    }
+    let mut need = nch - nzero;
+    let inverted = nones > nzero;
+    if inverted {
+        need = nch - nones;
+    }
+    if need > 1 {
+        let e = ae.logical_imm(x, width);
+        if e >= 0 {
+            w32(ae.logic_imm(sf, 1, rd, 31, @bit_cast(u64, e)));
+            return;
+        }
+    }
+    if x == 0 {
+        w32(ae.movw(sf, 2, rd, 0, 0));
+        return;
+    }
+    let mut first = true;
+    for i in @as(u64, 0)..nch {
+        let c = (x >> (16 * i)) & 0xffff;
+        if inverted {
+            if (c == 0xffff) and not (first and (i == (nch - 1))) {
+                continue;
+            }
+            if first {
+                w32(ae.movw(sf, 0, rd, (~c) & 0xffff, i));
+                first = false;
+            } else {
+                w32(ae.movw(sf, 3, rd, c, i));
+            }
+        } else {
+            if (c == 0) and not (first and (i == (nch - 1))) {
+                continue;
+            }
+            if first {
+                w32(ae.movw(sf, 2, rd, c, i));
+                first = false;
+            } else {
+                w32(ae.movw(sf, 3, rd, c, i));
+            }
+        }
+    }
+}
+
+fn log2(x: u64) u64 {
+    let mut k: u64 = 0;
+    while (@as(u64, 1) << k) < x {
+        k += 1;
+    }
+    return k;
+}
+
+// rd = base + index << sh
+fn add_index(rd: i32, base: i32, index: i32, sh: u64) void {
+    if base == SP {
+        w32(ae.addsub_ext(1, false, false, rd, base, index, sh));
+    } else {
+        w32(ae.addsub_reg(1, false, false, rd, base, index, 0, sh));
+    }
+}
+
+// rd = base + disp
+fn add_disp(rd: i32, base: i32, disp: i64) void {
+    if disp == 0 {
+        if rd != base {
+            w32(ae.addsub_imm(1, false, false, rd, base, 0, false));
+        }
+        return;
+    }
+    let sub = disp < 0;
+    let mut a = disp;
+    if sub {
+        a = 0 - disp;
+    }
+    if a <= 0xfff {
+        w32(ae.addsub_imm(1, sub, false, rd, base, @bit_cast(u64, a), false));
+        return;
+    }
+    if a <= 0xff_ffff {
+        w32(ae.addsub_imm(1, sub, false, rd, base, @bit_cast(u64, a) >> 12, true));
+        if (a & 0xfff) != 0 {
+            w32(ae.addsub_imm(1, sub, false, rd, rd, @bit_cast(u64, a) & 0xfff, false));
+        }
+        return;
+    }
+    enc_movi(X17, disp, 1);
+    w32(ae.addsub_ext(1, false, false, rd, base, X17, 0));
+}
+
+struct Loc {
+    base: i32,
+    index: i32,
+    scale: u64,
+    disp: i64,
+    sym: i32,
+    align: u64,
+}
+
+fn resolve(o: mc.MOp) Loc {
+    let mut l = Loc.{ base: -1, index: -1, scale: @as(u64, o.scale), disp: o.disp, sym: -1, align: 0 };
+    if o.slot >= 0 {
+        l.base = SP;
+        l.disp += FN.mf.slots.get(@int_cast(usize, o.slot)).offset;
+        if FN.dyn_frame {
+            // (x29 is the stack pointer after the prologue plus the frame)
+            l.base = FP;
+            l.disp -= FN.frame;
+        }
+        return l;
+    }
+    if o.base >= 0 {
+        l.base = P(o.base);
+    }
+    if o.index >= 0 {
+        l.index = P(o.index);
+    }
+    if (o.base < 0) and (o.sym >= 0) {
+        l.sym = o.sym;
+        if o.label > 0 {
+            l.align = @as(u64, @bit_cast(u32, o.label));
+        }
+    }
+    if l.scale == 0 {
+        l.scale = 1;
+    }
+    return l;
+}
+
+fn lo12_reloc(bytes: u64) u32 {
+    if bytes == 1 {
+        return elf.R_AARCH64_LDST8_ABS_LO12_NC;
+    }
+    if bytes == 2 {
+        return elf.R_AARCH64_LDST16_ABS_LO12_NC;
+    }
+    if bytes == 4 {
+        return elf.R_AARCH64_LDST32_ABS_LO12_NC;
+    }
+    if bytes == 8 {
+        return elf.R_AARCH64_LDST64_ABS_LO12_NC;
+    }
+    return elf.R_AARCH64_LDST128_ABS_LO12_NC;
+}
+
+// A load or store of `bytes` bytes of register rt at memory operand o.
+fn ldst(size: u64, v: bool, opc: u64, bytes: u64, rt: i32, o: mc.MOp) void {
+    let mut l = resolve(o);
+    if l.sym >= 0 {
+        if (l.index < 0) and (l.align >= bytes) and (l.disp >= 0) and ((l.disp % @bit_cast(i64, bytes)) == 0) {
+            reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, l.sym, l.disp);
+            w32(ae.adrp(X16));
+            reloc(lo12_reloc(bytes), l.sym, l.disp);
+            w32(ae.ldst_uimm(size, v, opc, rt, X16, 0));
+            return;
+        }
+        reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, l.sym, l.disp);
+        w32(ae.adrp(X16));
+        reloc(elf.R_AARCH64_ADD_ABS_LO12_NC, l.sym, l.disp);
+        w32(ae.addsub_imm(1, false, false, X16, X16, 0, false));
+        l.base = X16;
+        l.disp = 0;
+    }
+    if l.index >= 0 {
+        if (l.disp == 0) and ((l.scale == 1) or (l.scale == bytes)) {
+            w32(ae.ldst_reg(size, v, opc, rt, l.base, l.index, (l.scale == bytes) and (bytes > 1)));
+            return;
+        }
+        add_index(X16, l.base, l.index, log2(l.scale));
+        l.base = X16;
+    }
+    let d = l.disp;
+    let bi = @bit_cast(i64, bytes);
+    if (d >= 0) and ((d % bi) == 0) and ((d / bi) < 4096) {
+        w32(ae.ldst_uimm(size, v, opc, rt, l.base, @bit_cast(u64, d / bi)));
+        return;
+    }
+    if (d >= -256) and (d <= 255) {
+        w32(ae.ldst_simm9(size, v, opc, rt, l.base, d));
+        return;
+    }
+    enc_movi(X17, d, 1);
+    w32(ae.ldst_reg(size, v, opc, rt, l.base, X17, false));
+}
+
+fn lea(rd: i32, o: mc.MOp) void {
+    let l = resolve(o);
+    if l.sym >= 0 {
+        reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, l.sym, l.disp);
+        w32(ae.adrp(rd));
+        reloc(elf.R_AARCH64_ADD_ABS_LO12_NC, l.sym, l.disp);
+        w32(ae.addsub_imm(1, false, false, rd, rd, 0, false));
+        if l.index >= 0 {
+            add_index(rd, rd, l.index, log2(l.scale));
+        }
+        return;
+    }
+    if l.index >= 0 {
+        if l.disp == 0 {
+            add_index(rd, l.base, l.index, log2(l.scale));
+            return;
+        }
+        add_index(X16, l.base, l.index, log2(l.scale));
+        add_disp(rd, X16, l.disp);
+        return;
+    }
+    add_disp(rd, l.base, l.disp);
+}
+
+fn fldst_size(sz: u8) u64 {
+    if sz == 4 {
+        return 2;
+    }
+    if sz == 8 {
+        return 3;
+    }
+    return 0;
+}
+
+fn label_ref(l: i32, kind: i32) void {
+    FN.fxs.push(Fx.{ off: here(), label: l, kind: kind });
+}
+
+// DYNSTACK: the stack pointer moved, for dynamic allocation.
+fn enc_dynstack(i: *mut mc.MInst) void {
+    if i.cc == 1 {
+        w32(ae.addsub_imm(1, false, false, P(i.ops[0].reg), SP, 0, false));  // mov d, sp
+        return;
+    }
+    if i.cc == 2 {
+        w32(ae.addsub_imm(1, false, false, SP, P(i.ops[0].reg), 0, false));  // mov sp, s
+        return;
+    }
+    let t = P(i.ops[0].reg);
+    let d = P(i.ops[1].reg);
+    // t = (t + 15) & ~15
+    w32(ae.addsub_imm(1, false, false, t, t, 15, false));
+    w32(ae.logic_imm(1, 0, t, t, @bit_cast(u64, ae.logical_imm(~@as(u64, 15), 64))));
+    // while t > 4096: one page more, touched (as the prologue does)
+    w32(ae.addsub_imm(1, true, true, 31, t, 1, true));        // cmp t, #4096
+    w32(ae.bcond(cc64(LS)) | (5 << 5));                       // b.ls (past the loop)
+    w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));      // sub sp, sp, #4096
+    w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));                // str xzr, [sp]
+    w32(ae.addsub_imm(1, true, false, t, t, 1, true));        // sub t, t, #4096
+    w32(ae.B | (@bit_cast(u64, @as(i64, -5)) & 0x3ff_ffff));  // b (back to the cmp)
+    w32(ae.addsub_ext(1, true, false, SP, SP, t, 0));         // sub sp, sp, t
+    // d = sp + the outgoing arguments' area (below the allocation)
+    add_disp(d, SP, @bit_cast(i64, (FN.out_area + 15) & ~@as(u64, 15)));
+}
+
+fn enc_jtab(i: *mut mc.MInst) void {
+    let ix = ae.r5(P(i.ops[0].reg));
+    let t = P(i.ops[1].reg);
+    let tr = ae.r5(t);
+    let v = ae.r5(P(i.ops[2].reg));
+    let sym = @truncate(i32, i.aux);
+    reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, sym, 0);
+    w32(ae.adrp(t));
+    reloc(elf.R_AARCH64_ADD_ABS_LO12_NC, sym, 0);
+    w32(ae.addsub_imm(1, false, false, t, t, 0, false));
+    let mut option: u64 = 2;  // uxtw
+    if i.sz == 8 {
+        option = 3;  // lsl
+    }
+    w32(0xb8a0_1800 | (ix << 16) | (option << 13) | (tr << 5) | v);  // ldrsw v, [t, ix, <option> #2]
+    w32(0x8b00_0000 | (v << 16) | (tr << 5) | tr);                   // add t, t, v
+    w32(0xd61f_0000 | (tr << 5));                                    // br t
+    FN.jtabs.push(i);
+}
+
+// The entries of the tables of the function's jumps through one (encoded
+// at base in .text, its blocks at boff): each the 32-bit offset of its
+// target from the table's start, a PC-relative relocation against .text
+// with the entry's own offset added back (S + A - P, P the entry's address).
+fn fill_jump_tables(base: u64, boff: []u64) void {
+    if FN.jtabs.len == 0 {
+        return;
+    }
+    FN.jt_text = elf.sec_sym(O.obj, O.text);  // (the code's section: the function's)
+    for j in FN.jtabs.items() {
+        let ts = O.obj.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
+        let sec = O.obj.secs.get(@int_cast(usize, ts.sec));
+        for k in 3..j.ops.len {
+            let eo = 4 * @as(u64, k - 3);
+            let target = base + boff[@int_cast(usize, j.ops[k].label)];
+            sec.relocs.push(elf.Rel.{ off: ts.value + eo, ty: elf.R_AARCH64_PREL32, sym: FN.jt_text,
+                                      addend: @bit_cast(i64, target + eo) });
+        }
+    }
+    FN.jtabs.clear();
+}
+
+fn enc_inst(i: *mut mc.MInst) void {
+    let op = i.op;
+    let sz = i.sz;
+    if op == ASM {
+        enc_asm(i);
+        return;
+    }
+    if op == DYNSTACK {
+        enc_dynstack(i);
+        return;
+    }
+    if op == JTAB {
+        enc_jtab(i);
+        return;
+    }
+    if op == RAW {
+        let mut w = @bit_cast(u64, i.aux);
+        let shifts: [4]u64 = [0, 5, 16, 10];
+        for k in 0..@min(i.ops.len, 4) {
+            let o = i.ops[k];
+            if o.kind == mc.K_REG {
+                w = w | (ae.r5(P(o.reg)) << shifts[k]);
+            }
+        }
+        w32(w);
+        return;
+    }
+    if op == MOV {
+        let d = P(i.ops[0].reg);
+        let s = P(i.ops[1].reg);
+        if d != s {
+            w32(ae.logic_reg(1, 1, false, d, 31, s, 0, 0));
+        }
+        return;
+    }
+    if op == FMOV {
+        let d = P(i.ops[0].reg);
+        let s = P(i.ops[1].reg);
+        if d != s {
+            w32(ae.vmov(d, s));
+        }
+        return;
+    }
+    if op == MOVI {
+        let mut sf: u64 = 0;
+        if sz == 8 {
+            sf = 1;
+        }
+        enc_movi(P(i.ops[0].reg), i.ops[1].disp, sf);
+        return;
+    }
+    if op == LDR {
+        ldst(size_code(sz), false, 1, @as(u64, sz), P(i.ops[0].reg), i.ops[1]);
+        return;
+    }
+    if op == PRFM {
+        ldst(3, false, 2, 8, i.cc, i.ops[0]);  // (the loads' encodings with opc 2: prfm, prfum)
+        return;
+    }
+    if op == STR {
+        let mut rt: i32 = 31;
+        if i.ops[1].kind == mc.K_REG {
+            rt = P(i.ops[1].reg);
+        }
+        ldst(size_code(sz), false, 0, @as(u64, sz), rt, i.ops[0]);
+        return;
+    }
+    if op == FLDR {
+        let mut opc: u64 = 1;
+        if sz == 16 {
+            opc = 3;
+        }
+        ldst(fldst_size(sz), true, opc, @as(u64, sz), P(i.ops[0].reg), i.ops[1]);
+        return;
+    }
+    if op == FSTR {
+        let mut opc: u64 = 0;
+        if sz == 16 {
+            opc = 2;
+        }
+        ldst(fldst_size(sz), true, opc, @as(u64, sz), P(i.ops[1].reg), i.ops[0]);
+        return;
+    }
+    if op == LEA {
+        lea(P(i.ops[0].reg), i.ops[1]);
+        return;
+    }
+    if op == ADDR {
+        let d = P(i.ops[0].reg);
+        let s = i.ops[1];
+        reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, s.sym, s.disp);
+        w32(ae.adrp(d));
+        reloc(elf.R_AARCH64_ADD_ABS_LO12_NC, s.sym, s.disp);
+        w32(ae.addsub_imm(1, false, false, d, d, 0, false));
+        return;
+    }
+    if op == GOT {
+        let d = P(i.ops[0].reg);
+        let s = i.ops[1];
+        reloc(elf.R_AARCH64_ADR_GOT_PAGE, s.sym, 0);
+        w32(ae.adrp(d));
+        reloc(elf.R_AARCH64_LD64_GOT_LO12_NC, s.sym, 0);
+        w32(ae.ldst_uimm(3, false, 1, d, d, 0));
+        return;
+    }
+    if op == TLS {
+        let d = P(i.ops[0].reg);
+        let s = i.ops[1];
+        if tg.platform_tls() {
+            // macOS, --macos-tls=platform (the platform's thread-local
+            // descriptors, isel.ax platform_tlv): x0 = the descriptor's
+            // address (@TLVPPAGE, a GOT slot the linker makes an add for
+            // our own), and a call of
+            // its first word, the thunk, which returns the variable's
+            // address in x0 and changes x16, x17 and the flags, as the
+            // platform's code expects of it. What else the call changes is
+            // saved around it (x0, x9, the link register, the flags), below
+            // the red zone, so that the sequence is one instruction to the
+            // register allocator: sub sp, sp, #160; stp x0, x9, [sp];
+            // mrs x16, nzcv; stp x30, x16, [sp, #16]; adrp x0, s@TLVPPAGE;
+            // ldr x0, [x0, s@TLVPPAGEOFF]; ldr x16, [x0]; blr x16;
+            // mov x16, x0; ldp x30, x17, [sp, #16]; msr nzcv, x17;
+            // ldp x0, x9, [sp]; add sp, sp, #160; mov d, x16
+            w32(ae.addsub_imm(1, true, false, 31, 31, 160, false));
+            w32(0xa90027e0);
+            w32(0xd53b4210);
+            w32(0xa90143fe);
+            reloc(elf.R_AARCH64_AXIOM_TLVP_PAGE, s.sym, 0);
+            w32(ae.adrp(0));
+            reloc(elf.R_AARCH64_AXIOM_TLVP_PAGEOFF, s.sym, 0);
+            w32(ae.ldst_uimm(3, false, 1, 0, 0, 0));
+            w32(ae.ldst_uimm(3, false, 1, X16, 0, 0));
+            w32(ae.blr(X16));
+            w32(ae.logic_reg(1, 1, false, X16, 31, 0, 0, 0));
+            w32(0xa94147fe);
+            w32(0xd51b4211);
+            w32(0xa94027e0);
+            w32(ae.addsub_imm(1, false, false, 31, 31, 160, false));
+            w32(ae.logic_reg(1, 1, false, d, 31, X16, 0, 0));
+            let mut k = s.disp;
+            while k != 0 {
+                let part = @min(@max(k, -4095), 4095);
+                w32(ae.addsub_imm(1, part < 0, false, d, d, @bit_cast(u64, @max(part, -part)), false));
+                k -= part;
+            }
+            return;
+        } else if tg.is_darwin() {
+            // macOS has no thread pointer for programs: the thread-locals
+            // are a block whose address is in a TSD slot (the runtime's
+            // pthread key; axiom.tls_key holds the slot's byte offset), and
+            // TPIDRRO_EL0 addresses the slots (its low 3 bits are not part
+            // of the address)
+            w32(ae.mrs_tpidrro(d));
+            w32(ae.logic_imm(1, 0, d, d, @bit_cast(u64, ae.logical_imm(~@as(u64, 7), 64))));
+            let k = tls_key_sym();
+            reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, k, 0);
+            w32(ae.adrp(X16));
+            reloc(elf.R_AARCH64_LDST64_ABS_LO12_NC, k, 0);
+            w32(ae.ldst_uimm(3, false, 1, X16, X16, 0));
+            w32(ae.ldst_reg(3, false, 1, d, d, X16, false));
+        } else if O.win {
+            // Windows: the image's block of this thread is
+            // TEB.ThreadLocalStoragePointer[_tls_index] (x18 holds the TEB;
+            // the linker supplies the index as axiom.tls_index, and makes
+            // the offsets below those in the block: plink.ax)
+            let k = tls_index_sym();
+            w32(ae.ldst_uimm(3, false, 1, d, 18, 0x58 / 8));  // ldr d, [x18, #0x58]
+            reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, k, 0);
+            w32(ae.adrp(X16));
+            reloc(elf.R_AARCH64_LDST32_ABS_LO12_NC, k, 0);
+            w32(ae.ldst_uimm(2, false, 1, X16, X16, 0));     // ldr w16, [x16, :lo12:axiom.tls_index]
+            w32(ae.ldst_reg(3, false, 1, d, d, X16, true));  // ldr d, [d, x16, lsl #3]
+        } else if tg.g_pic {
+            // a shared library's (initial-exec): the offset from the thread
+            // pointer is in the variable's GOT slot, which the dynamic
+            // linker fills
+            w32(ae.mrs_tpidr(d));
+            reloc(elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21, s.sym, 0);
+            w32(ae.adrp(X16));
+            reloc(elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC, s.sym, 0);
+            w32(ae.ldst_uimm(3, false, 1, X16, X16, 0));
+            w32(ae.addsub_reg(1, false, false, d, d, X16, 0, 0));
+            if s.disp != 0 {
+                // (the offset within the variable)
+                let mut k = s.disp;
+                while k != 0 {
+                    let part = @min(@max(k, -4095), 4095);
+                    w32(ae.addsub_imm(1, part < 0, false, d, d, @bit_cast(u64, @max(part, -part)), false));
+                    k -= part;
+                }
+            }
+            return;
+        } else {
+            w32(ae.mrs_tpidr(d));
+        }
+        reloc(elf.R_AARCH64_TLSLE_ADD_TPREL_HI12, s.sym, s.disp);
+        w32(ae.addsub_imm(1, false, false, d, d, 0, true));
+        reloc(elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC, s.sym, s.disp);
+        w32(ae.addsub_imm(1, false, false, d, d, 0, false));
+        return;
+    }
+    if op == B {
+        label_ref(i.ops[0].label, 0);
+        w32(ae.B);
+        return;
+    }
+    if op == BCC {
+        label_ref(i.ops[0].label, 1);
+        w32(ae.bcond(cc64(i.cc)));
+        return;
+    }
+    if op == CBZ {
+        label_ref(i.ops[1].label, 1);
+        let mut sf: u64 = 0;
+        if sz == 8 {
+            sf = 1;
+        }
+        w32(ae.cbz(sf, i.cc == 1, P(i.ops[0].reg)));
+        return;
+    }
+    if op == LABEL {
+        let l = @truncate(i32, i.aux) - LOCAL_BASE;
+        while FN.local_off.len <= @int_cast(usize, l) {
+            FN.local_off.push(0);
+        }
+        FN.local_off.set(@int_cast(usize, l), here());
+        return;
+    }
+    if is_tail(i) {
+        enc_tail(i);
+        return;
+    }
+    if op == CALL {
+        let t = i.ops[0];
+        if t.kind == mc.K_SYM {
+            reloc(elf.R_AARCH64_CALL26, t.sym, 0);
+            w32(ae.BL);
+        } else {
+            w32(ae.blr(P(t.reg)));
+        }
+        return;
+    }
+    if op == RET {
+        epilogue();
+        return;
+    }
+    fail(u.f1("cannot encode machine op %s", u.idec(op)));
+}

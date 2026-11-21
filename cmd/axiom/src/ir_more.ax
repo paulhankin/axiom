@@ -1,0 +1,503 @@
+// =============================================================================
+// ir_more.ax - optional ValueMore extension records and call-site chains, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+// The group of v's record (0: none).
+fn more_group(v: *Value) u8 {
+    if v.more == 0 {
+        return 0;
+    }
+    return @ptr_from_int(*u8, v.more).*;
+}
+
+threadlocal let mut no_more: *mut ValueMore = @ptr_from_int(*mut ValueMore, 0);
+
+fn zero_more() *mut ValueMore {
+    if u.isnil(no_more) {
+        no_more = u.perm_new.[ValueMore]();
+    }
+    return no_more;
+}
+
+// Records of dead values, for reuse, by group.
+threadlocal let mut free_more: [8]u.List.[usize] = [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0,
+                                                                     cap: 0 }; 8];
+
+fn new_more(g: u8) usize {
+    let k = @as(usize, g);
+    if (free_more[k].len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
+    if free_more[k].len > 0 {
+        let r = free_more[k].pop();
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, r), more_size(g)), 0);
+        @ptr_from_int(*mut u8, r).* = g;
+        return r;
+    }
+    let mut r: usize = 0;
+    match g {
+        1    => { r = @int_from_ptr(u.perm_new.[VmBlocks]()); }
+        2    => { r = @int_from_ptr(u.perm_new.[VmCall]()); }
+        3    => { r = @int_from_ptr(u.perm_new.[VmAlloca]()); }
+        4    => { r = @int_from_ptr(u.perm_new.[VmMask]()); }
+        5    => { r = @int_from_ptr(u.perm_new.[VmConst]()); }
+        6    => { r = @int_from_ptr(u.perm_new.[ValueMore]()); }
+        7    => { r = @int_from_ptr(u.perm_new.[VmBytes]()); }
+        else => { u.die("more_new: no such group"); }
+    }
+    @ptr_from_int(*mut u8, r).* = g;
+    return r;
+}
+
+fn more_size(g: u8) usize {
+    match g {
+        1    => { return @size_of(VmBlocks); }
+        2    => { return @size_of(VmCall); }
+        3    => { return @size_of(VmAlloca); }
+        4    => { return @size_of(VmMask); }
+        5    => { return @size_of(VmConst); }
+        6    => { return @size_of(ValueMore); }
+        7    => { return @size_of(VmBytes); }
+        else => { return 0; }
+    }
+}
+
+// v's record as a ValueMore (with every field), made from the one it has.
+fn more_full(v: *mut Value) *mut ValueMore {
+    let g = more_group(v);
+    if g == 6 {
+        return @ptr_from_int(*mut ValueMore, v.more);
+    }
+    let r = new_more(6);
+    let m = @ptr_from_int(*mut ValueMore, r);
+    match g {
+        1 => {
+            let o = @ptr_from_int(*mut VmBlocks, v.more);
+            m.bs = o.bs;
+        }
+        2 => {
+            let o = @ptr_from_int(*mut VmCall, v.more);
+            m.fty = o.fty;
+            m.ext = o.ext;
+            m.chain = o.chain;
+        }
+        3 => {
+            let o = @ptr_from_int(*mut VmAlloca, v.more);
+            m.aty = o.aty;
+            m.name = o.name;
+        }
+        4 => {
+            let o = @ptr_from_int(*mut VmMask, v.more);
+            m.mask = o.mask;
+        }
+        5 => {
+            let o = @ptr_from_int(*mut VmConst, v.more);
+            m.fv = o.fv;
+            m.gv = o.gv;
+            m.fnp = o.fnp;
+            m.name = o.name;
+        }
+        7 => {
+            let o = @ptr_from_int(*mut VmBytes, v.more);
+            m.bytes = o.bytes;
+        }
+        else => {}
+    }
+    if g != 0 {
+        free_more[@as(usize, g)].push(v.more);
+    }
+    v.more = r;
+    return m;
+}
+
+// Gives back v's record (its block list freed), for reuse.
+fn release_more(v: *mut Value) void {
+    let g = more_group(v);
+    if g == 0 {
+        return;
+    }
+    if g == 1 {
+        @ptr_from_int(*mut VmBlocks, v.more).bs.deinit();
+    } else if g == 6 {
+        @ptr_from_int(*mut ValueMore, v.more).bs.deinit();
+    }
+    if not u.poisoning() {
+        free_more[@as(usize, g)].push(v.more);
+    }
+    v.more = 0;
+}
+
+// y gets a record like v's (with a block list of its own).
+fn copy_more(y: *mut Value, v: *Value) void {
+    let g = more_group(v);
+    if g == 0 {
+        return;
+    }
+    let r = new_more(g);
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, r), more_size(g)),
+              @slice_from_ptr(@ptr_from_int(*u8, v.more), more_size(g)));
+    if g == 1 {
+        @ptr_from_int(*mut VmBlocks, r).bs = u.List.[*mut Block].empty();
+    } else if g == 6 {
+        @ptr_from_int(*mut ValueMore, r).bs = u.List.[*mut Block].empty();
+    }
+    y.more = r;
+}
+
+pub fn bs_of(v: *Value) u.List.[*mut Block] {
+    match more_group(v) {
+        1    => { return @ptr_from_int(*VmBlocks, v.more).bs; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).bs; }
+        else => { return zero_more().bs; }
+    }
+}
+
+pub fn bs_mut(v: *mut Value) *mut u.List.[*mut Block] {
+    if v.more == 0 {
+        v.more = new_more(1);
+    }
+    match more_group(v) {
+        1    => { return &mut @ptr_from_int(*mut VmBlocks, v.more).bs; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).bs; }
+        else => { return &mut more_full(v).bs; }
+    }
+}
+
+pub fn set_bs(v: *mut Value, x: u.List.[*mut Block]) void {
+    if (v.more == 0) and ((x.len == 0) and (x.cap == 0)) {
+        return;
+    }
+    bs_mut(v).* = x;
+}
+
+pub fn fv_of(v: *Value) f64 {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).fv; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fv; }
+        else => { return zero_more().fv; }
+    }
+}
+
+pub fn fv_mut(v: *mut Value) *mut f64 {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).fv; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fv; }
+        else => { return &mut more_full(v).fv; }
+    }
+}
+
+pub fn set_fv(v: *mut Value, x: f64) void {
+    if (v.more == 0) and (@bit_cast(u64, x) == 0) {
+        return;
+    }
+    fv_mut(v).* = x;
+}
+
+pub fn aty_of(v: *mut Value) *mut Ty {
+    match more_group(v) {
+        3    => { return @ptr_from_int(*mut VmAlloca, v.more).aty; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).aty; }
+        else => { return zero_more().aty; }
+    }
+}
+
+fn aty_ro(v: *Value) *Ty {
+    match more_group(v) {
+        3    => { return @ptr_from_int(*VmAlloca, v.more).aty; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).aty; }
+        else => { return zero_more().aty; }
+    }
+}
+
+pub fn aty_mut(v: *mut Value) *mut *mut Ty {
+    if v.more == 0 {
+        v.more = new_more(3);
+    }
+    match more_group(v) {
+        3    => { return &mut @ptr_from_int(*mut VmAlloca, v.more).aty; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).aty; }
+        else => { return &mut more_full(v).aty; }
+    }
+}
+
+pub fn set_aty(v: *mut Value, x: *mut Ty) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    aty_mut(v).* = x;
+}
+
+pub fn fty_of(v: *mut Value) *mut Ty {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*mut VmCall, v.more).fty; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).fty; }
+        else => { return zero_more().fty; }
+    }
+}
+
+fn fty_ro(v: *Value) *Ty {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*VmCall, v.more).fty; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fty; }
+        else => { return zero_more().fty; }
+    }
+}
+
+pub fn fty_mut(v: *mut Value) *mut *mut Ty {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).fty; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fty; }
+        else => { return &mut more_full(v).fty; }
+    }
+}
+
+pub fn set_fty(v: *mut Value, x: *mut Ty) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    fty_mut(v).* = x;
+}
+
+pub fn mask_of(v: *mut Value) []mut i32 {
+    match more_group(v) {
+        4    => { return @ptr_from_int(*mut VmMask, v.more).mask; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).mask; }
+        else => { return zero_more().mask; }
+    }
+}
+
+fn mask_ro(v: *Value) []i32 {
+    match more_group(v) {
+        4    => { return @ptr_from_int(*VmMask, v.more).mask; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).mask; }
+        else => { return zero_more().mask; }
+    }
+}
+
+pub fn mask_mut(v: *mut Value) *mut []mut i32 {
+    if v.more == 0 {
+        v.more = new_more(4);
+    }
+    match more_group(v) {
+        4    => { return &mut @ptr_from_int(*mut VmMask, v.more).mask; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).mask; }
+        else => { return &mut more_full(v).mask; }
+    }
+}
+
+pub fn set_mask(v: *mut Value, x: []mut i32) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    mask_mut(v).* = x;
+}
+
+pub fn ext_of(v: *mut Value) []mut u8 {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*mut VmCall, v.more).ext; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).ext; }
+        else => { return zero_more().ext; }
+    }
+}
+
+fn ext_ro(v: *Value) []u8 {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*VmCall, v.more).ext; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).ext; }
+        else => { return zero_more().ext; }
+    }
+}
+
+pub fn ext_mut(v: *mut Value) *mut []mut u8 {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).ext; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).ext; }
+        else => { return &mut more_full(v).ext; }
+    }
+}
+
+pub fn set_ext(v: *mut Value, x: []mut u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    ext_mut(v).* = x;
+}
+
+pub fn gv_of(v: *mut Value) *mut Global {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*mut VmConst, v.more).gv; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).gv; }
+        else => { return zero_more().gv; }
+    }
+}
+
+fn gv_ro(v: *Value) *Global {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).gv; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).gv; }
+        else => { return zero_more().gv; }
+    }
+}
+
+pub fn gv_mut(v: *mut Value) *mut *mut Global {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).gv; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).gv; }
+        else => { return &mut more_full(v).gv; }
+    }
+}
+
+pub fn set_gv(v: *mut Value, x: *mut Global) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    gv_mut(v).* = x;
+}
+
+pub fn fnp_of(v: *mut Value) *mut Func {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*mut VmConst, v.more).fnp; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).fnp; }
+        else => { return zero_more().fnp; }
+    }
+}
+
+fn fnp_ro(v: *Value) *Func {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).fnp; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fnp; }
+        else => { return zero_more().fnp; }
+    }
+}
+
+pub fn fnp_mut(v: *mut Value) *mut *mut Func {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).fnp; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fnp; }
+        else => { return &mut more_full(v).fnp; }
+    }
+}
+
+pub fn set_fnp(v: *mut Value, x: *mut Func) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    fnp_mut(v).* = x;
+}
+
+pub fn name_of(v: *Value) []u8 {
+    match more_group(v) {
+        3    => { return @ptr_from_int(*VmAlloca, v.more).name; }
+        5    => { return @ptr_from_int(*VmConst, v.more).name; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).name; }
+        else => { return zero_more().name; }
+    }
+}
+
+pub fn name_mut(v: *mut Value) *mut []u8 {
+    if v.more == 0 {
+        v.more = new_more(u.pick(v.kind == V_INST, "\x03", "\x05")[0]);
+    }
+    match more_group(v) {
+        3    => { return &mut @ptr_from_int(*mut VmAlloca, v.more).name; }
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).name; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).name; }
+        else => { return &mut more_full(v).name; }
+    }
+}
+
+pub fn set_name(v: *mut Value, x: []u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    name_mut(v).* = x;
+}
+
+pub fn chain_of(v: *mut Value) *mut Chain {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*mut VmCall, v.more).chain; }
+        6    => { return @ptr_from_int(*mut ValueMore, v.more).chain; }
+        else => { return zero_more().chain; }
+    }
+}
+
+pub fn chain_mut(v: *mut Value) *mut *mut Chain {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).chain; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).chain; }
+        else => { return &mut more_full(v).chain; }
+    }
+}
+
+pub fn set_chain(v: *mut Value, x: *mut Chain) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    chain_mut(v).* = x;
+}
+
+pub fn bytes_of(v: *Value) []u8 {
+    match more_group(v) {
+        6    => { return @ptr_from_int(*ValueMore, v.more).bytes; }
+        7    => { return @ptr_from_int(*VmBytes, v.more).bytes; }
+        else => { return zero_more().bytes; }
+    }
+}
+
+pub fn bytes_mut(v: *mut Value) *mut []u8 {
+    if v.more == 0 {
+        v.more = new_more(7);
+    }
+    match more_group(v) {
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).bytes; }
+        7    => { return &mut @ptr_from_int(*mut VmBytes, v.more).bytes; }
+        else => { return &mut more_full(v).bytes; }
+    }
+}
+
+pub fn set_bytes(v: *mut Value, x: []u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    bytes_mut(v).* = x;
+}
+
+pub fn chain1(site: *mut Value) *mut Chain {
+    let c = u.perm_new.[Chain]();
+    c.site = site;
+    return c;
+}
+
+// The records of `a`, then those of `b` (inlining a call with chain `b`
+// moves code with chain `a` into the caller).
+pub fn chain_cat(a: *mut Chain, b: *mut Chain) *mut Chain {
+    if u.isnil(a) {
+        return b;
+    }
+    if u.isnil(b) {
+        return a;
+    }
+    let c = chain1(a.site);
+    c.c_code = a.c_code;
+    c.next = chain_cat(a.next, b);
+    return c;
+}

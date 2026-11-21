@@ -10,6 +10,7 @@ FnCtx *C;
 
 static SymMap mod_by_path;
 static SymMap mod_state;  // path -> 1 loading, 2 done
+static SymMap part_owners;  // realpath Sym -> owning Module *
 static const char *g_std_dir;
 static char g_cwd[PATH_MAX];
 
@@ -82,6 +83,108 @@ static size_t internal_violation(const char *importer, const char *target) {
     return strncmp(importer, target, k) == 0 && importer[k] == '/' ? 0 : k;
 }
 
+static void dir_of(const char *file_path, char *out, size_t cap) {
+    snprintf(out, cap, "%s", file_path);
+    char *slash = strrchr(out, '/');
+    if (slash) *slash = 0;
+}
+
+static bool resolve_import_path(Module *m, const char *importer_rp, Decl *d, char *out, size_t cap) {
+    char dir[PATH_MAX];
+    dir_of(importer_rp, dir, sizeof dir);
+    const char *ip = d->import_path;
+    if (strncmp(ip, "pkg:", 4) == 0) {
+        const char *ps = strchr(ip + 4, '/');
+        if (ps && !library_import(ps + 1)) {
+            diag_error(d->import_path_span, "E0218",
+                       "import path '%s' must name a module in package '%.*s', with '/' between its parts", ip,
+                       (int)(ps - (ip + 4)), ip + 4);
+            return false;
+        }
+        if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, out, cap)) return false;
+    } else if (strncmp(ip, "std/", 4) == 0) {
+        if (!library_import(ip + 4)) {
+            diag_error(d->import_path_span, "E0218",
+                       "import path '%s' must name a module in the standard library, with '/' between its parts", ip);
+            return false;
+        }
+        snprintf(out, cap, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ax");
+    } else if (!relative_import(ip)) {
+        diag_error(d->import_path_span, "E0218", "import path '%s' must be relative, with '/' between its parts", ip);
+        return false;
+    } else {
+        snprintf(out, cap, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
+    }
+    char tp[PATH_MAX];
+    size_t k = realpath(out, tp) ? internal_violation(importer_rp, tp) : 0;
+    if (k) {
+        diag_error(d->import_path_span, "E0219", "'%s' is internal: only modules under '%s' may import it",
+                   display_path(tp), display_dir(arena_strndup(tp, k)));
+        return false;
+    }
+    return true;
+}
+
+static void load_part_decl(Module *m, const char *mod_rp, Sym mod_key, Decl *d) {
+    const char *ip = d->import_path;
+    if (!relative_import(ip)) {
+        diag_error(d->import_path_span, "E0218", "import path '%s' must be relative, with '/' between its parts", ip);
+        return;
+    }
+    char dir[PATH_MAX];
+    dir_of(mod_rp, dir, sizeof dir);
+    char path[PATH_MAX * 2];
+    snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
+    char part_rp[PATH_MAX];
+    if (!realpath(path, part_rp)) {
+        diag_error(d->import_path_span, "E0211", "cannot find module '%s'", path);
+        return;
+    }
+    Sym part_key = intern_cstr(part_rp);
+    Module *owner = symmap_get(&part_owners, part_key);
+    if (part_key == mod_key || owner) {
+        diag_error(d->import_path_span, "E0222", "part file '%s' is already part of module '%s'",
+                   display_path(part_rp), (owner ? owner : m)->file->display);
+        return;
+    }
+    if (symmap_get(&mod_by_path, part_key)) {
+        diag_error(d->import_path_span, "E0221",
+                   "cannot use '%s' as a part file because it is already imported as a module",
+                   display_path(part_rp));
+        return;
+    }
+    const char *disp = display_path(part_rp);
+    SourceFile *pf = load_file(part_rp, arena_strndup(disp, strlen(disp)));
+    if (!pf) {
+        diag_error(d->import_path_span, "E0211", "cannot read module '%s'", path);
+        return;
+    }
+    symmap_put(&part_owners, part_key, m);
+    Module *pm = parse_module(pf);
+    vec_push(m->parts, ((PartFile){pf, part_key}));
+    for (int i = 0; i < pm->decls.len; i++) {
+        Decl *pd = pm->decls.data[i];
+        if (pd->kind == D_IMPORT && pd->is_part) {
+            diag_error(pd->span, "E0221", "a part file cannot declare 'import part'");
+            continue;
+        }
+        pd->module = m;
+        for (int j = 0; j < pd->methods.len; j++) pd->methods.data[j]->module = m;
+        vec_push(m->decls, pd);
+    }
+    for (int i = 0; i < pm->inline_error_names.len; i++) {
+        vec_push(m->inline_error_names, pm->inline_error_names.data[i]);
+    }
+}
+
+static Module *load_module(const char *fs_path, Span *from);
+
+static void load_regular_import(Module *m, const char *importer_rp, Decl *d) {
+    char path[PATH_MAX * 2];
+    if (!resolve_import_path(m, importer_rp, d, path, sizeof path)) return;
+    d->imported = load_module(path, &d->import_path_span);
+}
+
 static Module *load_module(const char *fs_path, Span *from) {
     char rp[PATH_MAX];
     if (!realpath(fs_path, rp)) {
@@ -89,6 +192,12 @@ static Module *load_module(const char *fs_path, Span *from) {
         return NULL;
     }
     Sym key = intern_cstr(rp);
+    if (symmap_get(&part_owners, key)) {
+        if (from)
+            diag_error(*from, "E0221", "cannot import part file '%s' directly; import its owning module instead",
+                       display_path(rp));
+        return NULL;
+    }
     Module *m = symmap_get(&mod_by_path, key);
     if (m) {
         if ((intptr_t)symmap_get(&mod_state, key) == 1 && from)
@@ -105,45 +214,17 @@ static Module *load_module(const char *fs_path, Span *from) {
     m->pkg = pkg_for_file(rp);
     symmap_put(&mod_by_path, key, m);
     symmap_put(&mod_state, key, (void *)1);
-    char dir[PATH_MAX];
-    snprintf(dir, sizeof dir, "%s", rp);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = 0;
-    for (int i = 0; i < m->decls.len; i++) {
+    int orig_n = m->decls.len;
+    for (int i = 0; i < orig_n; i++) {
         Decl *d = m->decls.data[i];
         if (d->kind != D_IMPORT || !d->import_path) continue;
-        char path[PATH_MAX * 2];
-        const char *ip = d->import_path;
-        if (strncmp(ip, "pkg:", 4) == 0) {
-            const char *slash = strchr(ip + 4, '/');
-            if (slash && !library_import(slash + 1)) {
-                diag_error(d->import_path_span, "E0218",
-                           "import path '%s' must name a module in package '%.*s', with '/' between its parts", ip,
-                           (int)(slash - (ip + 4)), ip + 4);
-                continue;
-            }
-            if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, path, sizeof path)) continue;
-        } else if (strncmp(ip, "std/", 4) == 0) {
-            if (!library_import(ip + 4)) {
-                diag_error(d->import_path_span, "E0218",
-                           "import path '%s' must name a module in the standard library, with '/' between its parts", ip);
-                continue;
-            }
-            snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ax");
-        } else if (!relative_import(ip)) {
-            diag_error(d->import_path_span, "E0218", "import path '%s' must be relative, with '/' between its parts", ip);
-            continue;
-        } else {
-            snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
-        }
-        char tp[PATH_MAX];
-        size_t k = realpath(path, tp) ? internal_violation(rp, tp) : 0;
-        if (k) {
-            diag_error(d->import_path_span, "E0219", "'%s' is internal: only modules under '%s' may import it",
-                       display_path(tp), display_dir(arena_strndup(tp, k)));
-            continue;
-        }
-        d->imported = load_module(path, &d->import_path_span);
+        if (d->is_part) load_part_decl(m, rp, key, d);
+        else load_regular_import(m, rp, d);
+    }
+    for (int i = orig_n; i < m->decls.len; i++) {
+        Decl *d = m->decls.data[i];
+        if (d->kind == D_IMPORT && !d->is_part && d->import_path)
+            load_regular_import(m, g_files.data[d->import_path_span.file]->path, d);
     }
     symmap_put(&mod_state, key, (void *)2);
     vec_push(g_prog.modules, m);
@@ -166,11 +247,47 @@ static void dup_error(Span sp, Sym name, Span prev) {
     diag_note(d, prev, "previous declaration of '%s'", name);
 }
 
+static FileImports *find_file_imports(Module *m, int file_id, bool create) {
+    if (!m) return NULL;
+    if (file_id < 0 && m->file) file_id = m->file->id;
+    for (int i = 0; i < m->file_imports.len; i++) {
+        if (m->file_imports.data[i].file_id == file_id) return &m->file_imports.data[i];
+    }
+    if (!create) return NULL;
+    FileImports fi = {.file_id = file_id};
+    vec_push(m->file_imports, fi);
+    return &m->file_imports.data[m->file_imports.len - 1];
+}
+
+Decl *module_lookup_import(Module *m, int file_id, Sym alias) {
+    if (!m || !alias) return NULL;
+    FileImports *fi = find_file_imports(m, file_id, false);
+    return fi ? symmap_get(&fi->imports, alias) : NULL;
+}
+
+void module_add_import(Module *m, int file_id, Sym alias, Decl *d) {
+    if (!m || !alias) return;
+    FileImports *fi = find_file_imports(m, file_id, true);
+    symmap_put(&fi->imports, alias, d);
+}
+
+static Decl *module_lookup_any_import(Module *m, Sym name) {
+    if (!m || !name) return NULL;
+    for (int i = 0; i < m->file_imports.len; i++) {
+        Decl *d = symmap_get(&m->file_imports.data[i].imports, name);
+        if (d) return d;
+    }
+    return NULL;
+}
+
 static void register_module(Module *m) {
+    int ntests = 0;
     for (int i = 0; i < m->decls.len; i++) {
         Decl *d = m->decls.data[i];
+        if (d->kind == D_IMPORT && d->is_part) continue;
         if (!d->name) continue;
         if (d->is_test) {  // tests are not names; their descriptions must be unique per module
+            d->name = intern_cstr(arena_printf("test.%d", ntests++));
             for (int j = 0; j < i; j++) {
                 Decl *o = m->decls.data[j];
                 if (o->is_test && o->test_name == d->test_name) {
@@ -185,13 +302,21 @@ static void register_module(Module *m) {
             continue;
         }
         Decl *prev = symmap_get(&m->names, d->name);
-        if (!prev) prev = symmap_get(&m->imports, d->name);
+        if (d->kind == D_IMPORT) {
+            if (!prev) prev = module_lookup_import(m, d->span.file, d->name);
+            if (prev) {
+                dup_error(d->name_span, d->name, prev->name_span);
+                continue;
+            }
+            module_add_import(m, d->span.file, d->name, d);
+            continue;
+        }
+        if (!prev) prev = module_lookup_any_import(m, d->name);
         if (prev) {
             dup_error(d->name_span, d->name, prev->name_span);
             continue;
         }
-        if (d->kind == D_IMPORT) symmap_put(&m->imports, d->name, d);
-        else symmap_put(&m->names, d->name, d);
+        symmap_put(&m->names, d->name, d);
         if (d->kind == D_STRUCT || d->kind == D_UNION || d->kind == D_ENUM) {
             for (int j = 0; j < d->methods.len; j++) {
                 Decl *md = d->methods.data[j];
@@ -391,7 +516,7 @@ Type *lookup_gparam(TypeCtx *tc, Sym name) {
 static Decl *resolve_named_decl(TypeExpr *te, TypeCtx *tc, bool report) {
     Module *m = tc->mod;
     if (te->qual) {
-        Decl *imp = symmap_get(&m->imports, te->qual);
+        Decl *imp = module_lookup_import(m, te->span.file, te->qual);
         if (!imp) {
             if (report) diag_error(te->span, "E0202", "unknown module '%s'", te->qual);
             return NULL;
@@ -565,7 +690,7 @@ Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc) {
                                    te->member_has_args, &te->member_args, te->span, tc);
     }
     if (te->qual) {
-        Decl *imp = symmap_get(&tc->mod->imports, te->qual);
+        Decl *imp = module_lookup_import(tc->mod, te->span.file, te->qual);
         if (imp) {
             if (!imp->imported) return t_invalid;
             Decl *d = module_lookup(imp->imported, te->name);

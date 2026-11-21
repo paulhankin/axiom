@@ -1,0 +1,685 @@
+// =============================================================================
+// std/net/http/server_proto.ax - server HTTP/1.1 and HTTP/2 request parsing,
+// body rate tracking, and handler dispatch (part of std/net/http).
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../fmt.ax" as fmt;
+import "../../io.ax" as io;
+import "../../mem.ax" as mem;
+import "../../net.ax" as net;
+import "../../str.ax" as strs;
+import "../http2.ax" as http2;
+
+const HTTP1_CLOSE: u8 = 0;
+const HTTP1_WAIT: u8 = 1;
+const HTTP1_TO_H2: u8 = 2;
+
+/// Requests (HTTP/2: answers) a worker serves on one connection before it
+/// lets the others have a turn; and the bytes of a body it reads.
+const TURN_REQUESTS: u32 = 16;
+const TURN_BYTES: usize = 262144;
+
+// HTTP/1: reads what has arrived, and serves each request once all of it
+// has.
+fn advance_http1[C](s: *mut Server.[C], sl: *mut Slot) u8 {
+    let o = s.opts;
+    if not sl.has_c {
+        sl.c = Conn.init(sl.t, o.max_head_bytes) catch return HTTP1_CLOSE;
+        sl.has_c = true;
+    }
+    let c = &mut sl.c;
+    c.set_nonblocking(true);
+    if sl.expired {
+        sl.expired = false;
+        if sl.evict_status != 0 {
+            return refuse(sl, sl.evict_status);
+        }
+        // a body may still be on time: its window had ended
+        if not (sl.in_body and on_time(o, sl, @as(u64, sl.body.len()), sl.body_left, now_ns())) {
+            return refuse(sl, 408);
+        }
+    }
+    let mut answered: u32 = 0;
+    loop {
+        if not sl.in_body {
+            c.deadline = 0;
+            if sl.req_start != 0 {
+                c.deadline = sl.req_start + ms_ns(o.request_timeout_ms);
+            }
+            let head_len = c.read_head() catch |e| {
+                if e == error.WouldBlock {
+                    if sl.req_start == 0 {
+                        if c.end == c.start {
+                            // idle (blank lines and empty records do not
+                            // count): its buffers go until a request comes
+                            sl.deadline = sl.idle_until;
+                            c.deinit();
+                            sl.has_c = false;
+                            return HTTP1_WAIT;
+                        }
+                        sl.req_start = now_ns();
+                    }
+                    sl.deadline = sl.req_start + ms_ns(@min(o.head_timeout_ms, o.request_timeout_ms));
+                    return HTTP1_WAIT;
+                }
+                if (e == error.Closed) or (e == error.NetError) {
+                    return HTTP1_CLOSE;
+                }
+                if (e == error.TimedOut) and (c.end == c.start) {
+                    return HTTP1_CLOSE;
+                }
+                return refuse(sl, status_for(e));
+            };
+            if head_len == 0 {
+                return HTTP1_CLOSE;
+            }
+            let now = now_ns();
+            if sl.req_start == 0 {
+                sl.req_start = now;
+                c.deadline = now + ms_ns(o.request_timeout_ms);
+            }
+            sl.head_off = c.start;
+            sl.head_len = head_len;
+            c.start += head_len;
+            c.pin = c.start;
+            let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
+            let h = check_head(c.buf[sl.head_off..sl.head_off + head_len], hs[..], body_limit(o));
+            if h.h2 {
+                return HTTP1_TO_H2;
+            }
+            if h.refuse != 0 {
+                return refuse(sl, h.refuse);
+            }
+            if h.expects_continue {
+                c.stream.write_all("HTTP/1.1 100 Continue\r\n\r\n") catch return HTTP1_CLOSE;
+            }
+            sl.in_body = true;
+            sl.chunked = h.fr.chunked;
+            sl.body_left = h.fr.length;
+            sl.chunk = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+            sl.win_start = now;
+            sl.win_mark = 0;
+        }
+        let whole = read_body(c, sl, body_limit(o)) catch |e| {
+            if e == error.WouldBlock {
+                if not on_time(o, sl, @as(u64, sl.body.len()), sl.body_left, now_ns()) {
+                    return refuse(sl, 408);  // too slow
+                }
+                sl.deadline = body_deadline(o, sl);
+                return HTTP1_WAIT;
+            }
+            if sl.chunked or (e == error.TimedOut) {
+                return refuse(sl, status_for(e));
+            }
+            return HTTP1_CLOSE;
+        };
+        if not whole {
+            sl.ready = true;  // (a turn's worth of body read: others' turn)
+            return HTTP1_WAIT;
+        }
+        // the whole request: answer it (waiting, as a handler may)
+        c.set_nonblocking(false);
+        let keep = dispatch(s, sl);
+        sl.scratch.clear();
+        if (not keep) or (@atomic_load(&s.stopping) != 0) {
+            // (with more of the client's bytes in: close without losing
+            // the answer)
+            sl.linger = (not keep) and (c.end > c.start);
+            return HTTP1_CLOSE;
+        }
+        c.set_nonblocking(true);
+        let now = now_ns();
+        sl.served = true;
+        sl.since = now;
+        sl.idle_until = now + ms_ns(o.idle_timeout_ms);
+        sl.in_body = false;
+        sl.req_start = 0;
+        c.reset();
+        if sl.body.capacity() > 4096 {
+            sl.body.deinit();
+        }
+        sl.body.clear();
+        answered += 1;
+        if answered >= TURN_REQUESTS {
+            sl.ready = true;  // (more requests may be in: others' turn first)
+            sl.deadline = sl.idle_until;
+            return HTTP1_WAIT;
+        }
+    }
+}
+
+// Reads what has arrived of the body; false if it stopped after a turn's
+// worth (TURN_BYTES), true once it is whole.
+fn read_body(c: *mut Conn, sl: *mut Slot, max: usize) !bool {
+    let stop = sl.body.len() + TURN_BYTES;
+    if sl.chunked {
+        return c.read_chunked_from(&mut sl.body, max, &mut sl.chunk, stop);
+    }
+    while sl.body_left > 0 {
+        if sl.body.len() >= stop {
+            return false;
+        }
+        let part = c.take(@min(sl.body_left, 65536))!;
+        sl.body.push_str(part)!;
+        sl.body_left -= part.len;
+    }
+    return true;
+}
+
+// Whether a request still arriving is on time: within request_timeout_ms,
+// and min_body_rate met in each window of head_timeout_ms (received: the
+// body bytes taken in so far; left: what the body still lacks, 0 if not
+// known). Starts the next window when one has ended.
+fn on_time(o: Options, sl: *mut Slot, received: u64, left: usize, now: i64) bool {
+    if now > (sl.req_start + ms_ns(o.request_timeout_ms)) {
+        return false;
+    }
+    let w = @max(o.head_timeout_ms, 1);
+    let elapsed = now - sl.win_start;
+    if elapsed < ms_ns(w) {
+        return true;
+    }
+    let got = received - @min(received, sl.win_mark);
+    sl.win_start = now;
+    sl.win_mark = received;
+    if o.min_body_rate == 0 {
+        return true;
+    }
+    let mut need = (@as(u64, o.min_body_rate) * @as(u64, w)) / 1000;
+    if left > 0 {
+        need = @min(need, @as(u64, left));
+    }
+    return got >= need;
+}
+
+// The body bytes a connection has taken in for the request arriving.
+fn received_by(sl: *Slot) u64 {
+    if sl.speaks == SPEAKS_HTTP2 {
+        return sl.h2.h.received;
+    }
+    return @as(u64, sl.body.len());
+}
+
+const RX_BUCKET: i64 = 500000000;
+
+// Counts n body bytes taken in at `now`.
+fn note_rx(sl: *mut Slot, n: u64, now: i64) void {
+    let age = now - sl.rx_bucket;
+    if age >= (2 * RX_BUCKET) {
+        sl.rx_prev = 0;
+        sl.rx_cur = 0;
+        sl.rx_bucket = now;
+    } else if age >= RX_BUCKET {
+        sl.rx_prev = sl.rx_cur;
+        sl.rx_cur = 0;
+        sl.rx_bucket += RX_BUCKET;
+    }
+    sl.rx_cur += n;
+}
+
+// The body bytes a connection took in over the last half second to a
+// second.
+fn recent_rx(sl: *Slot, now: i64) u64 {
+    let age = now - sl.rx_bucket;
+    if age >= (2 * RX_BUCKET) {
+        return 0;
+    }
+    if age >= RX_BUCKET {
+        return sl.rx_cur;
+    }
+    return sl.rx_prev + sl.rx_cur;
+}
+
+// The largest body the server takes: max_body_bytes, and no more than
+// max_buffered_bytes leaves room for beside a head (so that one request
+// alone is never over it).
+fn body_limit(o: Options) usize {
+    let room = o.max_buffered_bytes - @min(o.max_buffered_bytes, o.max_head_bytes);
+    return @min(o.max_body_bytes, room);
+}
+
+// When waiting for a body ends: the request's deadline, or the end of its
+// rate window (when on_time looks again).
+fn body_deadline(o: Options, sl: *Slot) i64 {
+    let mut d = sl.req_start + ms_ns(o.request_timeout_ms);
+    if o.min_body_rate > 0 {
+        d = @min(d, sl.win_start + ms_ns(@max(o.head_timeout_ms, 1)));
+    }
+    return d;
+}
+
+/// What a request head says, once checked.
+struct Head {
+    refuse: u16,  // the status to refuse it with (0: none)
+    h2: bool,     // HTTP/2's preface
+    method: []u8,
+    target: []u8,
+    version: Version,
+    nh: usize,  // headers, in the array check_head was given
+    fr: Framing,
+    keep: bool,
+    expects_continue: bool,
+}
+
+/// Parses and checks a request head (up to and including its blank line).
+fn check_head(head: []u8, hs: []mut Header, max_body: usize) Head {
+    let mut h = Head.{ refuse: 400, h2: false, method: "", target: "", version: Version.HTTP_1_1, nh: 0,
+                       fr: Framing.{ chunked: false, length: 0, has_length: false }, keep: false,
+                       expects_continue: false };
+    // the request line
+    let line_end = strs.index_of_byte(head, '\n') ?? return h;
+    let mut rl = head[..line_end];
+    if (rl.len > 0) and (rl[rl.len - 1] == '\r') {
+        rl = rl[..rl.len - 1];
+    }
+    let sp1 = strs.index_of_byte(rl, ' ') ?? return h;
+    let rest = rl[sp1 + 1..];
+    let sp2 = strs.index_of_byte(rest, ' ') ?? return h;
+    let method = rl[..sp1];
+    let target = rest[..sp2];
+    let proto = rest[sp2 + 1..];
+    if (method.len == 0) or (target.len == 0) {
+        return h;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return h;
+        }
+    }
+    for ch in target {
+        if (ch <= 0x20) or (ch == 0x7F) {
+            return h;
+        }
+    }
+    if @mem_eq(method, "PRI") and @mem_eq(target, "*") and @mem_eq(proto, "HTTP/2.0") {
+        h.h2 = true;
+        h.refuse = 0;
+        return h;
+    }
+    let mut version = Version.HTTP_1_1;
+    if @mem_eq(proto, "HTTP/1.0") {
+        version = Version.HTTP_1_0;
+    } else if not @mem_eq(proto, "HTTP/1.1") {
+        if strs.starts_with(proto, "HTTP/") {
+            h.refuse = 505;
+        }
+        return h;
+    }
+    let nh = parse_headers(head[line_end + 1..], hs) catch |e| {
+        h.refuse = status_for(e);
+        return h;
+    };
+    let headers = hs[..nh];
+    // exactly one Host (RFC 9112 3.2)
+    let mut hosts: usize = 0;
+    for x in headers {
+        if strs.eq_ignore_case(x.name, "Host") {
+            hosts += 1;
+        }
+    }
+    if (hosts > 1) or ((version == Version.HTTP_1_1) and (hosts == 0)) {
+        return h;
+    }
+    let fr = framing(headers) catch |e| {
+        h.refuse = status_for(e);
+        return h;
+    };
+    if fr.chunked and (version == Version.HTTP_1_0) {
+        return h;  // (HTTP/1.0 has no transfer codings: faulty framing)
+    }
+    if fr.has_length and (fr.length > max_body) {
+        h.refuse = 413;
+        return h;
+    }
+    // keep-alive
+    let conn_hdr = find_header(headers, "Connection") ?? "";
+    let mut keep = version == Version.HTTP_1_1;
+    if has_token(conn_hdr, "close") {
+        keep = false;
+    } else if (version == Version.HTTP_1_0) and has_token(conn_hdr, "keep-alive") {
+        keep = true;
+    }
+    h.refuse = 0;
+    h.method = method;
+    h.target = target;
+    h.version = version;
+    h.nh = nh;
+    h.fr = fr;
+    h.keep = keep;
+    h.expects_continue = (fr.chunked or (fr.length > 0)) and
+                         has_token(find_header(headers, "Expect") ?? "", "100-continue");
+    return h;
+}
+
+/// Sends a short error response and returns false (close the connection).
+fn reject(stream: Transport, status: u16) bool {
+    let mut b: [160]u8 = [0; 160];
+    let msg = fmt.bufprint(b[..],
+                           "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}\n",
+                           [
+                               fmt.int(status),
+                               fmt.str(reason_phrase(status)),
+                               fmt.int(reason_phrase(status).len + 1),
+                               fmt.str(reason_phrase(status)),
+                           ]) catch return false;
+    stream.write_all(msg) catch return false;
+    return false;
+}
+
+fn status_for(e: error) u16 {
+    match e {
+        error.HeadTooLarge => { return 431; }
+        error.TooLarge     => { return 413; }
+        error.Unsupported  => { return 501; }
+        error.TimedOut     => { return 408; }
+        else               => { return 400; }
+    }
+}
+
+// Runs the handler on a request that has arrived whole; false if the
+// connection should close.
+fn dispatch[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    let c = &mut sl.c;
+    let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
+    let h = check_head(c.buf[sl.head_off..sl.head_off + sl.head_len], hs[..], body_limit(s.opts));
+    let target = h.target;
+    let q = strs.index_of_byte(target, '?') ?? target.len;
+    let mut query: []u8 = "";
+    if q < target.len {
+        query = target[q + 1..];
+    }
+    let req = Request.{
+        method: h.method,
+        target: target,
+        path: target[..q],
+        query: query,
+        version: h.version,
+        headers: hs[..h.nh],
+        body: sl.body.bytes(),
+        scratch: &mut sl.scratch,
+    };
+    let mut res = Response.{
+        stream: c.stream,
+        status: 200,
+        head: strs.String.init(),
+        body: strs.String.init(),
+        version: h.version,
+        head_only: @mem_eq(h.method, "HEAD"),
+        keep_alive: h.keep,
+        started: false,
+        chunked: false,
+        has_type: false,
+        upgraded: false,
+        h2: @ptr_from_int(*mut http2.Conn, 8),
+        h2_id: 0,
+        is_h2: false,
+    };
+    defer res.head.deinit();
+    defer res.body.deinit();
+    s.handler(s.ctx, &req, &mut res) catch {
+        if res.started {
+            return false;  // too late to report it: drop the connection
+        }
+        res.status = 500;
+        res.head.clear();
+        res.body.clear();
+        res.has_type = false;
+        res.write("Internal Server Error\n") catch return false;
+    };
+    if res.upgraded {
+        return false;  // the handler has had the connection
+    }
+    res.finish() catch return false;
+    return res.keep_alive;
+}
+
+/// An HTTP/2 connection, with the transport its reads come through.
+struct H2Conn {
+    t: Transport,
+    nonblocking: bool,
+    started: bool,  // the preface and settings exchanged
+    h: http2.Conn,
+    hs: vec.Vec.[Header],
+
+    fn set_nonblocking(self: *mut H2Conn, on: bool) void {
+        self.nonblocking = on;
+        if self.t.secure {
+            self.t.tls.nonblocking = on;
+        }
+    }
+}
+
+fn h2_read(ctx: *mut void, buf: []mut u8) !usize {
+    let x = @ptr_cast(*mut H2Conn, ctx);
+    if x.nonblocking and not x.t.secure and (net.poll_one(x.t.tcp.handle, net.READABLE, 0)! == 0) {
+        return error.WouldBlock;
+    }
+    return x.t.read(buf)!;
+}
+
+fn h2_write(ctx: *mut void, bytes: []u8) !usize {
+    let x = @ptr_cast(*mut H2Conn, ctx);
+    x.t.write_all(bytes)!;
+    return bytes.len;
+}
+
+// Says GOAWAY, and has the connection closed once drained.
+fn h2_goaway(sl: *mut Slot, h: *mut http2.Conn) bool {
+    h.goaway(http2.NO_ERROR) catch {};
+    sl.linger = true;
+    return false;
+}
+
+// Whether an HTTP/2 request breaks the rules HTTP/1's do: the method a
+// token, the target without controls or spaces, no control bytes in
+// values, and Host (if any) the same as :authority.
+fn h2_malformed(st: *mut http2.Stream) bool {
+    let method = st.header(":method");
+    let target = st.header(":path");
+    if (method.len == 0) or (target.len == 0) or strs.eq(method, "CONNECT") {
+        return true;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return true;
+        }
+    }
+    for ch in target {
+        if (ch <= 0x20) or (ch == 0x7F) {
+            return true;
+        }
+    }
+    let authority = st.header(":authority");
+    for x in st.headers() {
+        for c in x.value {
+            if ((c < 0x20) and (c != '\t')) or (c == 0x7f) {
+                return true;
+            }
+        }
+        if strs.eq(x.name, "host") and (authority.len > 0) and not strs.eq_ignore_case(x.value, authority) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Makes a connection HTTP/2's (prefill: what was read of it already).
+fn start_h2[C](s: *mut Server.[C], sl: *mut Slot, prefill: []u8) bool {
+    let x = mem.new_zeroed.[H2Conn]() catch return false;
+    x.t = sl.t;
+    let r = io.Reader.{ ctx: @ptr_cast(*mut void, x), read_fn: h2_read };
+    let w = io.Writer.{ ctx: @ptr_cast(*mut void, x), write_fn: h2_write };
+    x.h = http2.Conn.init(r, w, true, prefill) catch {
+        mem.destroy(x);
+        return false;
+    };
+    x.h.max_body = body_limit(s.opts);
+    // (the preface and the first request's headers: as a head)
+    x.h.deadline = now_ns() + ms_ns(@min(s.opts.head_timeout_ms, s.opts.request_timeout_ms));
+    x.hs = vec.Vec.[Header].init();
+    sl.h2 = x;
+    sl.speaks = SPEAKS_HTTP2;
+    sl.in_body = false;
+    return true;
+}
+
+// HTTP/2, waiting for frames: until when, by what is in progress; false if
+// the bodies coming are too slow (min_body_rate).
+fn h2_wait(o: Options, sl: *mut Slot, h: *mut http2.Conn) bool {
+    let now = now_ns();
+    if h.streams.len() == 0 {
+        sl.in_body = false;
+    } else if not sl.in_body {
+        // a request has begun: it has request_timeout_ms, and its body
+        // min_body_rate
+        sl.in_body = true;
+        sl.req_start = now;
+        sl.win_start = now;
+        sl.win_mark = h.received;
+        if not sl.served {
+            h.deadline = now + ms_ns(o.request_timeout_ms);
+        }
+    }
+    sl.deadline = h.deadline;
+    if sl.in_body {
+        if not on_time(o, sl, h.received, 0, now) {
+            return false;
+        }
+        sl.deadline = @min(sl.deadline, body_deadline(o, sl));
+    }
+    return true;
+}
+
+// HTTP/2: reads the frames that have arrived, and answers each request
+// once all of it has. Requests must arrive within request_timeout_ms of
+// the last answer (or the start), and are answered one at a time.
+fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    let o = s.opts;
+    let x = sl.h2;
+    let h = &mut x.h;
+    let timeout = ms_ns(o.request_timeout_ms);
+    x.set_nonblocking(true);
+    if sl.expired {
+        sl.expired = false;
+        // (a body may still be on time: its window had ended)
+        let ok = (sl.evict_status == 0) and sl.in_body and (now_ns() < h.deadline) and
+                 on_time(o, sl, h.received, 0, now_ns());
+        if not ok {
+            return h2_goaway(sl, h);
+        }
+    }
+    if not x.started {
+        h.handshake() catch |e| {
+            if e == error.WouldBlock {
+                sl.deadline = h.deadline;
+                return true;
+            }
+            return false;
+        };
+        x.started = true;
+    }
+    let t = x.t;
+    let mut answered: u32 = 0;
+    let turn_start = h.received;
+    loop {
+        if @atomic_load(&s.stopping) != 0 {
+            return h2_goaway(sl, h);
+        }
+        let mut id = h.take_done();
+        if id == 0 {
+            id = h.step() catch |e| {
+                if e == error.WouldBlock {
+                    if h2_wait(o, sl, h) {
+                        return true;
+                    }
+                    return h2_goaway(sl, h);
+                }
+                if e == error.TimedOut {
+                    return h2_goaway(sl, h);
+                }
+                return false;
+            };
+        }
+        if id == 0 {
+            // the client said goodbye, and nothing is left to answer
+            if h.got_goaway and (h.streams.len() == 0) {
+                return false;
+            }
+            if (h.received - turn_start) >= @as(u64, TURN_BYTES) {
+                sl.ready = true;  // (a turn's worth of bodies read: others' turn)
+                sl.deadline = h.deadline;
+                return true;
+            }
+            continue;
+        }
+        let st = h.stream(id) catch continue;
+        if st.reset {
+            h.drop_stream(id);
+            continue;
+        }
+        if h2_malformed(st) {
+            h.reset_stream(id, http2.PROTOCOL_ERROR) catch return false;
+            h.drop_stream(id);
+            continue;
+        }
+        let method = st.header(":method");
+        let target = st.header(":path");
+        // the headers as HTTP/1's (with Host from :authority)
+        x.hs.clear();
+        let authority = st.header(":authority");
+        if authority.len > 0 {
+            x.hs.push(Header.{ name: "host", value: authority }) catch return false;
+        }
+        for hd in st.headers() {
+            if (hd.name.len > 0) and (hd.name[0] != ':') and not ((authority.len > 0) and strs.eq(hd.name, "host")) {
+                x.hs.push(Header.{ name: hd.name, value: hd.value }) catch return false;
+            }
+        }
+        let q = strs.index_of_byte(target, '?') ?? target.len;
+        let mut query: []u8 = "";
+        if q < target.len {
+            query = target[q + 1..];
+        }
+        let req = Request.{ method: method, target: target, path: target[..q], query: query, version: Version.HTTP_1_1,
+                            headers: x.hs.items(), body: st.body.bytes(), scratch: &mut sl.scratch };
+        let mut res = Response.{ stream: t, status: 200, head: strs.String.init(), body: strs.String.init(),
+                                 version: Version.HTTP_1_1, head_only: @mem_eq(method, "HEAD"), keep_alive: true,
+                                 started: false, chunked: false, has_type: false, upgraded: false, h2: h, h2_id: id,
+                                 is_h2: true };
+        // (the handler and the response wait, as for flow control)
+        x.set_nonblocking(false);
+        h.deadline = now_ns() + timeout;
+        s.handler(s.ctx, &req, &mut res) catch {
+            if not res.started {
+                res.status = 500;
+                res.head.clear();
+                res.body.clear();
+                res.has_type = false;
+                res.write("Internal Server Error\n") catch {};
+            }
+        };
+        let ok = res.finish();
+        res.head.deinit();
+        res.body.deinit();
+        sl.scratch.clear();
+        h.drop_stream(id);
+        ok catch |e| {
+            if e != error.StreamReset {
+                return false;
+            }
+        };
+        x.set_nonblocking(true);
+        let now = now_ns();
+        h.deadline = now + timeout;
+        sl.served = true;
+        sl.since = now;
+        sl.in_body = false;  // (h2_wait looks again)
+        answered += 1;
+        if answered >= TURN_REQUESTS {
+            sl.ready = true;  // (others' turn first)
+            sl.deadline = h.deadline;
+            return true;
+        }
+    }
+}

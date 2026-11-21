@@ -1,0 +1,554 @@
+// =============================================================================
+// ir_build.ax - IR instruction builder and source location helpers, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Builder
+// -----------------------------------------------------------------------------
+pub struct Builder {
+    pub blk: *mut Block,
+    pub before: *mut Value,  // insert before this instruction; nil: at the end
+}
+
+pub fn new_builder() *mut Builder {
+    return u.perm_new.[Builder]();
+}
+
+pub fn at_end(bd: *mut Builder, b: *mut Block) void {
+    bd.blk = b;
+    bd.before = vnil();
+}
+
+pub fn at_before(bd: *mut Builder, v: *mut Value) void {
+    bd.blk = v.blk;
+    bd.before = v;
+}
+
+pub fn insert_block(bd: *mut Builder) *mut Block {
+    return bd.blk;
+}
+
+// Source locations (debug information): a file and a line in a u32, for
+// every instruction. Code generation sets cur_src as it goes; instructions
+// passes insert before another take that one's.
+pub threadlocal let mut cur_src: u32 = 0;
+// (and the lexical block they are in, which goes with the location: C's
+// block scopes, dbginfo.ax; 0: none)
+pub threadlocal let mut cur_scope: u32 = 0;
+
+pub fn src_loc(file: i32, line: i32) u32 {
+    if (file < 0) or (file >= 4095) or (line <= 0) or (line >= 0x10_0000) {
+        return 0;
+    }
+    return (@bit_cast(u32, file + 1) << 20) | @bit_cast(u32, line);
+}
+
+pub fn src_file(s: u32) i32 {
+    return @bit_cast(i32, s >> 20) - 1;
+}
+
+pub fn src_line(s: u32) u32 {
+    return s & 0xf_ffff;
+}
+
+fn emit(bd: *mut Builder, op: i32, t: *mut Ty) *mut Value {
+    let v = new_val(V_INST, t);
+    v.op = op;
+    v.src = cur_src;
+    v.scope = cur_scope;
+    if (v.src == 0) and u.notnil(bd.before) {
+        v.src = bd.before.src;
+        v.scope = bd.before.scope;
+    }
+    let f = bd.blk.fnp;
+    v.id = f.nvals;
+    f.nvals += 1;
+    if u.notnil(bd.before) {
+        insert_before(bd.before, v);
+    } else {
+        append_inst(bd.blk, v);
+    }
+    return v;
+}
+
+// A new instruction that is not in any block (for passes).
+pub fn new_inst(f: *mut Func, op: i32, t: *mut Ty) *mut Value {
+    let v = new_val(V_INST, t);
+    v.op = op;
+    v.id = f.nvals;
+    f.nvals += 1;
+    return v;
+}
+
+// A new instruction of f with everything of v but its place: the same
+// operands, targets and source location (not in a block).
+pub fn copy_inst(f: *mut Func, v: *mut Value) *mut Value {
+    let y = new_inst(f, v.op, v.ty);
+    y.cv = v.cv;
+    y.flags = v.flags;
+    y.src = v.src;
+    y.scope = v.scope;
+    if dbg_on {
+        mk_copy_kills(y, dbg_marks_at(v));
+    }
+    y.align = v.align;
+    copy_more(y, v);  // (with a block list of its own, filled below)
+    set_a(y, v.a);
+    set_b(y, v.b);
+    set_c(y, v.c);
+    y.t1 = v.t1;
+    y.t2 = v.t2;
+    for j in 0..v.xs.len {
+        push_x(y, v.xs.get(j));
+    }
+    for j in 0..bs_of(v).len {
+        bs_mut(y).push(bs_of(v).get(j));
+    }
+    return y;
+}
+
+pub fn binop(bd: *mut Builder, op: i32, x: *mut Value, y: *mut Value) *mut Value {
+    let t = x.ty;
+    if (t.kind == T_INT) and is_cint(x) and is_cint(y) and (t.bits <= 64) {
+        let r = fold_int_bin(op, t, x, y);
+        if u.notnil(r) {
+            return r;
+        }
+    }
+    let v = emit(bd, op, t);
+    set_a(v, x);
+    set_b(v, y);
+    return v;
+}
+
+pub fn add(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_ADD, x, y);
+}
+
+pub fn sub(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_SUB, x, y);
+}
+
+pub fn mul(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_MUL, x, y);
+}
+
+pub fn and_(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_AND, x, y);
+}
+
+pub fn or_(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_OR, x, y);
+}
+
+pub fn xor(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_XOR, x, y);
+}
+
+pub fn not_(bd: *mut Builder, x: *mut Value) *mut Value {
+    return binop(bd, OP_XOR, x, cones(x.ty));
+}
+
+pub fn neg(bd: *mut Builder, x: *mut Value) *mut Value {
+    return binop(bd, OP_SUB, czero(x.ty), x);
+}
+
+pub fn fneg(bd: *mut Builder, x: *mut Value) *mut Value {
+    if x.kind == V_CFP {
+        return cfp(x.ty, -fv_of(x));
+    }
+    let v = emit(bd, OP_FNEG, x.ty);
+    set_a(v, x);
+    return v;
+}
+
+pub fn icmp(bd: *mut Builder, p: CmpPred, x: *mut Value, y: *mut Value) *mut Value {
+    let k = fold_icmp(p, x, y);
+    if u.notnil(k) {
+        return k;
+    }
+    let v = emit(bd, OP_ICMP, cmp_ty(x.ty));
+    v.cv = pred_cv(p);
+    set_a(v, x);
+    set_b(v, y);
+    return v;
+}
+
+pub fn fcmp(bd: *mut Builder, p: CmpPred, x: *mut Value, y: *mut Value) *mut Value {
+    let v = emit(bd, OP_FCMP, cmp_ty(x.ty));
+    v.cv = pred_cv(p);
+    set_a(v, x);
+    set_b(v, y);
+    return v;
+}
+
+pub fn is_null(bd: *mut Builder, p: *mut Value) *mut Value {
+    return icmp(bd, IntEQ, p, czero(p.ty));
+}
+
+pub fn select(bd: *mut Builder, c: *mut Value, x: *mut Value, y: *mut Value) *mut Value {
+    if c.kind == V_CINT {
+        if c.cv != 0 {
+            return x;
+        }
+        return y;
+    }
+    if x == y {
+        return x;
+    }
+    let v = emit(bd, OP_SELECT, x.ty);
+    set_a(v, c);
+    set_b(v, x);
+    set_c(v, y);
+    return v;
+}
+
+pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
+    let k = fold_cast(op, x, t);
+    if u.notnil(k) {
+        return k;
+    }
+    let v = emit(bd, op, t);
+    set_a(v, x);
+    return v;
+}
+
+pub fn zext(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_ZEXT, x, t);
+}
+
+pub fn sext(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_SEXT, x, t);
+}
+
+pub fn trunc(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_TRUNC, x, t);
+}
+
+pub fn bitcast(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_BITCAST, x, t);
+}
+
+pub fn ptrtoint(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    let v = cast(bd, OP_PTRTOINT, x, t_int(@int_cast(i32, ptr_bytes * 8)));
+    if t.bits == @int_cast(i32, ptr_bytes * 8) {
+        return v;
+    }
+    if t.bits < @int_cast(i32, ptr_bytes * 8) {
+        return trunc(bd, v, t);
+    }
+    return zext(bd, v, t);
+}
+
+pub fn inttoptr(bd: *mut Builder, x: *mut Value) *mut Value {
+    let pt = t_int(@int_cast(i32, ptr_bytes * 8));
+    let mut y = x;
+    if x.ty.bits < pt.bits {
+        y = zext(bd, x, pt);
+    } else if x.ty.bits > pt.bits {
+        y = trunc(bd, x, pt);
+    }
+    return cast(bd, OP_INTTOPTR, y, t_ptr());
+}
+
+pub fn alloca(bd: *mut Builder, t: *mut Ty, name: []u8) *mut Value {
+    let v = emit(bd, OP_ALLOCA, t_ptr());
+    set_aty(v, t);
+    v.align = @int_cast(u32, t.align);
+    set_name(v, name);
+    return v;
+}
+
+pub fn load(bd: *mut Builder, t: *mut Ty, p: *mut Value) *mut Value {
+    let v = emit(bd, OP_LOAD, t);
+    set_a(v, p);
+    v.align = @int_cast(u32, t.align);
+    tag_new(bd, v);
+    return v;
+}
+
+pub fn store(bd: *mut Builder, x: *mut Value, p: *mut Value) *mut Value {
+    let v = emit(bd, OP_STORE, t_void());
+    set_a(v, x);
+    set_b(v, p);
+    v.align = @int_cast(u32, x.ty.align);
+    tag_new(bd, v);
+    return v;
+}
+
+pub fn isz() *mut Ty {
+    return t_int(@int_cast(i32, ptr_bytes * 8));
+}
+
+// p + off bytes (off: a pointer-sized integer)
+pub fn ptradd(bd: *mut Builder, p: *mut Value, off: *mut Value) *mut Value {
+    if is_cint(off) and (cint_val(off) == 0) {
+        return p;
+    }
+    if (p.kind == V_INST) and (p.op == OP_PTRADD) and is_cint(p.b) and is_cint(off) {
+        return ptradd(bd, p.a, cint(isz(), cint_val(p.b) +% cint_val(off)));
+    }
+    let v = emit(bd, OP_PTRADD, t_ptr());
+    set_a(v, p);
+    set_b(v, off);
+    return v;
+}
+
+fn index_isz(bd: *mut Builder, i: *mut Value) *mut Value {
+    let t = isz();
+    if i.ty.bits < t.bits {
+        return sext(bd, i, t);
+    }
+    if i.ty.bits > t.bits {
+        return trunc(bd, i, t);
+    }
+    return i;
+}
+
+fn scaled(bd: *mut Builder, i: *mut Value, size: u64) *mut Value {
+    let x = index_isz(bd, i);
+    if size == 1 {
+        return x;
+    }
+    return mul(bd, x, cint(isz(), size));
+}
+
+// LLVM-style GEP: the first index steps over whole `t`s; the rest index
+// into struct fields (constant) or array elements.
+pub fn gep(bd: *mut Builder, t: *mut Ty, p: *mut Value, idx: []mut *mut Value) *mut Value {
+    let mut off = scaled(bd, idx[0], t.size);
+    let mut cur = t;
+    for k in 1..idx.len {
+        let i = idx[k];
+        if cur.kind == T_STRUCT {
+            let fi = @truncate(usize, cint_val(i));
+            off = add(bd, off, cint(isz(), cur.offs[fi]));
+            cur = cur.fields[fi];
+        } else {
+            off = add(bd, off, scaled(bd, i, cur.elem.size));
+            cur = cur.elem;
+        }
+    }
+    return ptradd(bd, p, off);
+}
+
+pub fn gep1(bd: *mut Builder, t: *mut Ty, p: *mut Value, i: *mut Value) *mut Value {
+    return ptradd(bd, p, scaled(bd, i, t.size));
+}
+
+pub fn struct_gep(bd: *mut Builder, t: *mut Ty, p: *mut Value, i: u32) *mut Value {
+    return ptradd(bd, p, cint(isz(), field_off(t, @as(usize, i))));
+}
+
+pub fn memop(bd: *mut Builder, op: i32, d: *mut Value, s: *mut Value, n: *mut Value) *mut Value {
+    let v = emit(bd, op, t_void());
+    set_a(v, d);
+    set_b(v, s);
+    set_c(v, index_isz(bd, n));
+    tag_new(bd, v);
+    return v;
+}
+
+pub fn rmw(bd: *mut Builder, op: i32, p: *mut Value, x: *mut Value) *mut Value {
+    let v = emit(bd, OP_RMW, x.ty);
+    v.cv = @as(u64, @bit_cast(u32, op));
+    set_a(v, p);
+    set_b(v, x);
+    v.align = @int_cast(u32, x.ty.size);
+    v.flags = F_ATOMIC;
+    return v;
+}
+
+pub fn cmpxchg(bd: *mut Builder, p: *mut Value, e: *mut Value, n: *mut Value) *mut Value {
+    let v = emit(bd, OP_CMPXCHG, e.ty);
+    set_a(v, p);
+    set_b(v, e);
+    set_c(v, n);
+    v.align = @int_cast(u32, e.ty.size);
+    v.flags = F_ATOMIC;
+    return v;
+}
+
+pub fn fence(bd: *mut Builder) *mut Value {
+    return emit(bd, OP_FENCE, t_void());
+}
+
+pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
+    let ft = field_ty(agg.ty, @as(usize, i));
+    if is_cagg(agg) {
+        return agg_elem(agg, @as(usize, i));
+    }
+    if agg.kind == V_ZERO {
+        return czero(ft);
+    }
+    if agg.kind == V_UNDEF {
+        return undef(ft);
+    }
+    // extract(insert(x, v, i), i) = v
+    if (agg.kind == V_INST) and (agg.op == OP_INSERTVALUE) and (agg.cv == @as(u64, i)) {
+        return agg.b;
+    }
+    let v = emit(bd, OP_EXTRACTVALUE, ft);
+    set_a(v, agg);
+    v.cv = @as(u64, i);
+    return v;
+}
+
+pub fn insert(bd: *mut Builder, agg: *mut Value, x: *mut Value, i: u32) *mut Value {
+    // constants fold (a literal of constants is a constant, and lowering
+    // turns a large one into read-only data instead of stores)
+    let ak = agg.kind;
+    if is_const(x) and not is_tls_addr(x) and
+       ((ak == V_CAGG) or (ak == V_CSTR) or (ak == V_UNDEF) or (ak == V_ZERO)) and (agg.ty.kind != T_VEC) and
+       (field_count(agg.ty) <= 256) {
+        let n = field_count(agg.ty);
+        let xs = u.perm_newn.[*mut Value](n + 1);
+        for k in 0..n {
+            if k == @as(usize, i) {
+                xs[k] = x;
+            } else if (ak == V_CAGG) or (ak == V_CSTR) {
+                xs[k] = agg_elem(agg, k);
+            } else if ak == V_ZERO {
+                xs[k] = czero(field_ty(agg.ty, k));
+            } else {
+                xs[k] = undef(field_ty(agg.ty, k));
+            }
+        }
+        return cagg(agg.ty, xs[0..n]);
+    }
+    let v = emit(bd, OP_INSERTVALUE, agg.ty);
+    set_a(v, agg);
+    set_b(v, x);
+    v.cv = @as(u64, i);
+    return v;
+}
+
+pub fn extract_elem(bd: *mut Builder, vec: *mut Value, i: u64) *mut Value {
+    let v = emit(bd, OP_EXTRACTELEM, vec.ty.elem);
+    set_a(v, vec);
+    v.cv = i;
+    return v;
+}
+
+pub fn insert_elem(bd: *mut Builder, vec: *mut Value, x: *mut Value, i: u64) *mut Value {
+    let v = emit(bd, OP_INSERTELEM, vec.ty);
+    set_a(v, vec);
+    set_b(v, x);
+    v.cv = i;
+    return v;
+}
+
+pub fn splat(bd: *mut Builder, vt: *mut Ty, x: *mut Value) *mut Value {
+    let v = emit(bd, OP_SPLAT, vt);
+    set_a(v, x);
+    return v;
+}
+
+// Result lanes pick from the concatenation of x and y (indices into 2n lanes).
+pub fn shuffle(bd: *mut Builder, x: *mut Value, y: *mut Value, mask: []i32) *mut Value {
+    let n = mask.len;
+    let v = emit(bd, OP_SHUFFLE, t_vec(x.ty.elem, @int_cast(u32, n)));
+    set_a(v, x);
+    set_b(v, y);
+    set_mask(v, u.perm_newn.[i32](n + 1)[0..n]);
+    for i in 0..n {
+        mask_of(v)[i] = mask[i];
+    }
+    return v;
+}
+
+pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut Value) *mut Value {
+    let v = emit(bd, OP_CALL, fty.ret);
+    set_fty(v, fty);
+    set_a(v, callee);
+    v.xs.reserve(args.len);
+    for x in args {
+        push_x(v, x);
+    }
+    set_ext(v, u.perm_newn.[u8](args.len + 1)[0..args.len + 1]);
+    tag_new(bd, v);
+    return v;
+}
+
+pub fn intr(bd: *mut Builder, id: Intrinsic, t: *mut Ty, args: []mut *mut Value) *mut Value {
+    let v = emit(bd, OP_INTR, t);
+    v.cv = intr_cv(id);
+    for x in args {
+        push_x(v, x);
+    }
+    return v;
+}
+
+pub fn intr1(bd: *mut Builder, id: Intrinsic, x: *mut Value) *mut Value {
+    let mut a: [1]*mut Value = [x];
+    return intr(bd, id, x.ty, a[..]);
+}
+
+pub fn intr2(bd: *mut Builder, id: Intrinsic, x: *mut Value, y: *mut Value) *mut Value {
+    let mut a: [2]*mut Value = [x, y];
+    return intr(bd, id, x.ty, a[..]);
+}
+
+pub fn phi(bd: *mut Builder, t: *mut Ty) *mut Value {
+    return emit(bd, OP_PHI, t);
+}
+
+pub fn add_incoming(p: *mut Value, x: *mut Value, b: *mut Block) void {
+    push_x(p, x);
+    bs_mut(p).push(b);
+}
+
+pub fn br(bd: *mut Builder, b: *mut Block) void {
+    let v = emit(bd, OP_BR, t_void());
+    v.t1 = b;
+}
+
+pub fn condbr(bd: *mut Builder, c: *mut Value, t: *mut Block, e: *mut Block) void {
+    if c.kind == V_CINT {
+        if c.cv != 0 {
+            br(bd, t);
+        } else {
+            br(bd, e);
+        }
+        return;
+    }
+    let v = emit(bd, OP_CONDBR, t_void());
+    set_a(v, c);
+    v.t1 = t;
+    v.t2 = e;
+}
+
+pub fn switch_(bd: *mut Builder, x: *mut Value, dflt: *mut Block) *mut Value {
+    let v = emit(bd, OP_SWITCH, t_void());
+    set_a(v, x);
+    v.t1 = dflt;
+    return v;
+}
+
+pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
+    cfg_edit(sw.blk);
+    push_x(sw, c);
+    bs_mut(sw).push(b);
+}
+
+pub fn ret(bd: *mut Builder, x: *mut Value) void {
+    let v = emit(bd, OP_RET, t_void());
+    set_a(v, x);
+}
+
+// A return of a result in registers (EXT_REGS): their values xs.
+pub fn ret_regs(bd: *mut Builder, xs: []*mut Value) void {
+    let v = emit(bd, OP_RET, t_void());
+    for y in xs {
+        push_x(v, y);
+    }
+}
+
+pub fn ret_void(bd: *mut Builder) void {
+    _ = emit(bd, OP_RET, t_void());
+}
+
+pub fn unreachable(bd: *mut Builder) void {
+    _ = emit(bd, OP_UNREACHABLE, t_void());
+}

@@ -1,0 +1,552 @@
+// =============================================================================
+// a64_frame.ax - frames, CFI, Windows/macOS/ELF unwind, and debug locations, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "a64unwind.ax" as uw;
+import "bin.ax" as bn;
+import "dloc.ax" as dloc;
+import "dwarf.ax" as dw;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "mach.ax" as mc;
+import "macunwind.ax" as mu;
+import "util.ax" as u;
+
+fn save_restore(load: bool) void {
+    let mut k: usize = 0;
+    while k < FN.nsaved {
+        let r = FN.saved[k];
+        // neighbours of a class in neighbouring slots: one STP / LDP
+        let mut size: i64 = 8;
+        if r >= V0 {
+            size = 16;
+        }
+        if ((k + 1) < FN.nsaved) and ((FN.saved[k + 1] >= V0) == (r >= V0)) and
+           (FN.save_off[k + 1] == (FN.save_off[k] + size)) and ((FN.save_off[k] / size) <= 63) {
+            let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
+            if r >= V0 {
+                w = 0xAD00_0000;  // stp q
+            }
+            if load {
+                w = w | (1 << 22);
+            }
+            let imm7 = @bit_cast(u64, FN.save_off[k] / size) & 0x7f;
+            w32(((w | (imm7 << 15)) | (ae.r5(FN.saved[k + 1]) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
+            k += 2;
+            continue;
+        }
+        let m = mc.mem(SP, -1, 0, FN.save_off[k]);
+        if r >= V0 {
+            let mut opc: u64 = 2;
+            if load {
+                opc = 3;
+            }
+            ldst(0, true, opc, 16, r, m);
+        } else {
+            let mut opc: u64 = 0;
+            if load {
+                opc = 1;
+            }
+            ldst(3, false, opc, 8, r, m);
+        }
+        k += 1;
+    }
+}
+
+fn needs_frame() bool {
+    if (FN.frame != 0) or (FN.nsaved > 0) or FN.dyn_frame {
+        return true;
+    }
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            if (i.clobber != 0) or ((O.ft.on or O.win) and (i.op == CALL) and not is_tail(i)) {
+                return true;
+            }
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == mc.K_REG) and ((P(o.reg) == FP) or (P(o.reg) == LR) or (P(o.reg) == SP)) {
+                    return true;
+                }
+                if (o.kind == mc.K_MEM) and
+                   ((o.slot >= 0) or (o.base == FP) or (o.base == SP) or (o.base == LR) or (o.index == FP) or
+                    (o.index == SP)) {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
+/// A call frame state of sp + 8 * CFI_NONE: no rule (Windows: in a function
+/// with a register save area, where sp is above the frame record's top by
+/// more than a state can say; codeview.ax describes nothing there).
+pub const CFI_NONE: u64 = 7;
+
+// From here on: CFA = reg + 8k, the save list's registers in mask saved.
+fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
+    if not O.dbg.on and not O.mu.on {
+        return;
+    }
+    let pc = here();
+    let st = dw.cfi_state(pc, cfa_reg, k, mask);
+    if (FN.cfis.len > 0) and ((FN.cfis.last() & 0xffff_ffff) == pc) {
+        FN.cfis.set(FN.cfis.len - 1, st);
+        return;
+    }
+    FN.cfis.push(st);
+}
+
+// The state in the function's body: CFA = x29 + 16, everything saved.
+fn cfi_body() void {
+    if FN.frameless {
+        cfi(dw.A64_SP, 0, 0);
+        return;
+    }
+    cfi(dw.A64_FP, 2, (@as(u64, 1) << @int_cast(u32, FN.nsaved + 2)) - 1);
+}
+
+fn prologue() void {
+    if O.win {
+        win_prologue();
+        return;
+    }
+    if FN.frameless {
+        return;
+    }
+    w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
+    cfi(dw.A64_SP, 2, 3);
+    w32(0x9100_03FD);  // mov x29, sp
+    cfi(dw.A64_FP, 2, 3);
+    let mut rem = FN.frame;
+    while rem > 4096 {
+        w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));  // sub sp, sp, #4096
+        w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));            // str xzr, [sp] (touch the page)
+        rem -= 4096;
+    }
+    if rem == 4096 {
+        w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));
+    } else if rem > 0 {
+        w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, rem), false));
+    }
+    save_restore(false);
+    cfi_body();
+}
+
+fn epilogue() void {
+    unframe();
+    w32(ae.RET);
+    cfi_body();
+}
+
+// The epilogue but its ret: the callee-saved registers, x29, x30 and sp back.
+fn unframe() void {
+    if O.win {
+        win_unframe();
+        return;
+    }
+    if FN.frameless {
+        return;
+    }
+    if FN.dyn_frame {
+        add_disp(SP, FP, -FN.frame);  // (the saved registers are where the prologue put them)
+    }
+    save_restore(true);
+    cfi(dw.A64_FP, 2, 3);  // (the callee-saved registers restored)
+    w32(0x9100_03BF);      // mov sp, x29
+    w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
+    cfi(dw.A64_SP, 0, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Windows: the prologue and epilogue, as its unwind information describes
+// them (a64unwind.ax: one code per instruction). The frame is laid out as
+// on the other systems (x29 at the frame record, the saved registers just
+// below it, then the slots and the outgoing arguments), but allocated in two
+// steps, so that the saved registers are within reach of the codes (at
+// most 504 bytes above sp):
+//
+//   [sub sp, sp, #64]           alloc_s     (a variadic C definition: the
+//                                           home area of x0-x7, ir.Func.va_home)
+//   stp x29, x30, [sp, #-16]!   save_fplr_x
+//   mov x29, sp                 set_fp
+//   sub sp, sp, #D              alloc_s     (D: the saved registers' part)
+//   stp/str ...                 save_regp, save_reg, save_freg (q registers
+//                                           one by one: the codes restore d8-d15)
+//   [add x29, sp, #D]           add_fp      (x29 unchanged: for a frame
+//                                           whose sp moves, DYNSTACK, so that
+//                                           unwinding reads the saves from x29)
+//   sub sp, sp, #rest           alloc_*     (more than a page: each page
+//                                           probed below sp first, in a loop
+//                                           whose instructions are nops)
+//
+// and every epilogue as
+//
+//   sub sp, x29, #D             add_fp
+//   ldp/ldr ...                 save_regp, save_reg, save_freg
+//   [add sp, sp, #D]            alloc_s
+//   ldp x29, x30, [sp], #16     save_fplr_x
+//   [add sp, sp, #64]           alloc_s
+//   ret (or a sibling call's b) end
+// -----------------------------------------------------------------------------
+
+// D: the bytes of the frame's top part, the saved registers' (from the
+// 16-byte boundary at or below the lowest save to the frame's top).
+fn win_top() i64 {
+    if FN.nsaved == 0 {
+        return 0;
+    }
+    return FN.frame - (FN.save_off[0] & ~@as(i64, 15));
+}
+
+fn win_prologue() void {
+    uw.clear(&mut FN.uw_pro);
+    uw.clear(&mut FN.uw_epi);
+    FN.uw_epis.clear();
+    if FN.frameless {
+        return;
+    }
+    // (the call frame's states, codeview.ax: the frame record's top, x29 +
+    // 16, stands for the CFA, which is 64 bytes above it in a function that
+    // keeps its register arguments in a save area above the record; where
+    // sp is that far above it, the state is CFI_NONE)
+    if FN.f.va_home {
+        cfi(dw.A64_SP, CFI_NONE, 0);
+        w32(ae.addsub_imm(1, true, false, SP, SP, 64, false));  // sub sp, sp, #64
+        _ = uw.alloc(&mut FN.uw_pro, 64);
+        cfi(dw.A64_SP, 0, 0);
+    }
+    w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
+    uw.save_fplr_x(&mut FN.uw_pro, 16);
+    cfi(dw.A64_SP, 2, 3);
+    w32(0x9100_03FD);  // mov x29, sp
+    uw.op1(&mut FN.uw_pro, uw.SET_FP);
+    cfi(dw.A64_FP, 2, 3);
+    let top = win_top();
+    if top > 0 {
+        w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, top), false));
+        _ = uw.alloc(&mut FN.uw_pro, @bit_cast(u64, top));
+    }
+    win_saves(false, &mut FN.uw_pro);
+    if FN.dyn_frame {
+        w32(ae.addsub_imm(1, false, false, FP, SP, @bit_cast(u64, top), false));  // add x29, sp, #D
+        uw.add_fp(&mut FN.uw_pro, @bit_cast(u64, top));
+    }
+    let rest = @bit_cast(u64, FN.frame - top);
+    if rest == 0 {
+        cfi_body();
+        return;
+    }
+    if rest <= 4096 {
+        if rest == 4096 {
+            w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));
+        } else {
+            w32(ae.addsub_imm(1, true, false, SP, SP, rest, false));
+        }
+        _ = uw.alloc(&mut FN.uw_pro, rest);
+        cfi_body();
+        return;
+    }
+    // each page below sp touched in order (the stack's guard page), with
+    // sp where it is, then sp moved once
+    let n0 = here();
+    enc_movi(X17, @bit_cast(i64, rest / 4096), 1);
+    w32(ae.addsub_imm(1, false, false, X16, SP, 0, false));                      // mov x16, sp
+    w32(ae.addsub_imm(1, true, false, X16, X16, 1, true));                       // sub x16, x16, #4096
+    w32(ae.ldst_uimm(3, false, 0, 31, X16, 0));                                  // str xzr, [x16]
+    w32(ae.addsub_imm(1, true, true, X17, X17, 1, false));                       // subs x17, x17, #1
+    w32(ae.bcond(cc64(NE)) | ((@bit_cast(u64, @as(i64, -3)) & 0x7_ffff) << 5));  // b.ne (back to the sub)
+    enc_movi(X16, @bit_cast(i64, rest), 1);
+    for _k in 0..(here() - n0) / 4 {
+        uw.op1(&mut FN.uw_pro, uw.NOP);
+    }
+    w32(ae.addsub_ext(1, true, false, SP, SP, X16, 0));  // sub sp, sp, x16
+    if not uw.alloc(&mut FN.uw_pro, rest) {
+        fail("the stack frame is too large for Windows unwind information (256 MiB)");
+    }
+    cfi_body();
+}
+
+// The saves (or with load the restores) of the callee-saved registers at
+// their offsets from sp below the frame's top part, each with its code in c.
+fn win_saves(load: bool, c: *mut uw.Codes) void {
+    let delta = FN.frame - win_top();
+    let mut k: usize = 0;
+    while k < FN.nsaved {
+        let r = FN.saved[k];
+        let off = FN.save_off[k] - delta;
+        let uoff = @bit_cast(u64, off);
+        if (r < V0) and ((k + 1) < FN.nsaved) and (FN.saved[k + 1] == (r + 1)) and
+           (FN.save_off[k + 1] == (FN.save_off[k] + 8)) {
+            let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
+            if load {
+                w = w | (1 << 22);
+            }
+            w32(((w | (((uoff / 8) & 0x7f) << 15)) | (ae.r5(r + 1) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
+            uw.save_regp(c, @bit_cast(u64, @as(i64, r)), uoff);
+            k += 2;
+            continue;
+        }
+        let m = mc.mem(SP, -1, 0, off);
+        let mut opc: u64 = 0;
+        if load {
+            opc = 1;
+        }
+        if r >= V0 {
+            ldst(0, true, opc + 2, 16, r, m);
+            uw.save_freg(c, @bit_cast(u64, @as(i64, r - V0)), uoff);
+        } else {
+            ldst(3, false, opc, 8, r, m);
+            uw.save_reg(c, @bit_cast(u64, @as(i64, r)), uoff);
+        }
+        k += 1;
+    }
+}
+
+fn win_unframe() void {
+    if FN.frameless {
+        return;
+    }
+    let first = FN.uw_epis.len == 0;
+    FN.uw_epis.push(here());
+    let mut sink = uw.new_codes();
+    let mut c = &mut FN.uw_epi;
+    if not first {
+        c = &mut sink;  // (every epilogue is the same: its codes once)
+    }
+    let top = win_top();
+    w32(ae.addsub_imm(1, true, false, SP, FP, @bit_cast(u64, top), false));  // sub sp, x29, #D
+    uw.add_fp(c, @bit_cast(u64, top));
+    win_saves(true, c);
+    if top > 0 {
+        w32(ae.addsub_imm(1, false, false, SP, SP, @bit_cast(u64, top), false));
+        _ = uw.alloc(c, @bit_cast(u64, top));
+    }
+    cfi(dw.A64_FP, 2, 3);  // (the callee-saved registers restored)
+    w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
+    uw.save_fplr_x(c, 16);
+    cfi(dw.A64_SP, 0, 0);
+    if FN.f.va_home {
+        w32(ae.addsub_imm(1, false, false, SP, SP, 64, false));
+        _ = uw.alloc(c, 64);
+        cfi(dw.A64_SP, CFI_NONE, 0);
+    }
+    sink.b.free();
+    sink.at.deinit();
+}
+
+// The function placed at `base` in .text with `size` bytes: its unwind
+// information in .xdata and its entry in .pdata (its start, and its
+// record's: addresses relative to the image, which plink.ax resolves).
+fn win_unwind(fs: u32, base: u64, size: u64) void {
+    let mut info = uw.xdata(size, &FN.uw_pro, &FN.uw_epi, FN.uw_epis.items());
+    if info.len() == 0 {
+        fail("the function is too large for Windows unwind information (1 MiB of code, or too many epilogues)");
+        return;
+    }
+    let x = O.obj.secs.get(@int_cast(usize, O.xdata));
+    x.data.align(4);
+    let xoff = @as(u64, x.data.len());
+    x.data.put(info.view());
+    info.free();
+    let p = O.obj.secs.get(@int_cast(usize, O.pdata));
+    let poff = @as(u64, p.data.len());
+    p.data.zeros(8);
+    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: fs, addend: 0 });
+    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: O.xdata_sym, addend: @bit_cast(i64, xoff) });
+}
+
+// macOS: the callee-saved registers in the order the compact unwind
+// encoding's FRAME mode has them (macunwind.ax): saved in pairs (x19 and
+// x20, ..., x27 and x28: a register's partner too), at the frame's top, x19
+// highest, from the frame record down (the list is in address order: the
+// vector registers, which the encoding cannot describe saved whole, then
+// x28, x27, ..., x20, x19).
+fn mac_save_order() void {
+    let mut xs: u64 = 0;
+    let mut vs = u.List.[i32].empty();
+    for k in 0..FN.nsaved {
+        if FN.saved[k] >= V0 {
+            vs.push(FN.saved[k]);
+        } else {
+            xs = xs | (@as(u64, 1) << @int_cast(u32, FN.saved[k]));
+        }
+    }
+    FN.nsaved = 0;
+    for v in vs.items() {
+        FN.saved[FN.nsaved] = v;
+        FN.nsaved += 1;
+    }
+    vs.deinit();
+    let mut p: i32 = 27;
+    while p >= 19 {
+        let pair = (@as(u64, 3) << @int_cast(u32, p));
+        if (xs & pair) != 0 {
+            FN.saved[FN.nsaved] = p + 1;
+            FN.saved[FN.nsaved + 1] = p;
+            FN.nsaved += 2;
+        }
+        p -= 2;
+    }
+}
+
+// The function's save list (dwarf.saved_reg): x29 at CFA - 16, x30 at
+// CFA - 8, then the callee-saved registers in their slots.
+fn save_list(regs: *mut [20]u64) usize {
+    regs[0] = dw.saved_reg(dw.A64_FP, -16);
+    regs[1] = dw.saved_reg(dw.A64_LR, -8);
+    for k in 0..FN.nsaved {
+        let r = FN.saved[k];
+        let mut dr = @bit_cast(u32, r);
+        if r >= V0 {
+            dr = 64 + @bit_cast(u32, r - V0);  // (v8..v15: their low halves are the callee-saved d8..d15)
+        }
+        regs[k + 2] = dw.saved_reg(dr, -16 - FN.frame + FN.save_off[k]);
+    }
+    return FN.nsaved + 2;
+}
+
+// macOS: the function's unwind entry (macunwind.ax): FRAMELESS, FRAME, or
+// an FDE where the encoding cannot describe the frame, the stack pointer
+// moves after the prologue (DYNSTACK) or a sibling call's jump is not the
+// function's end.
+fn mac_unwind(fs: u32, size: u64) void {
+    if FN.frameless {
+        mu.add(&mut O.mu, fs, 0, size, mu.A64_FRAMELESS, u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let mut regs: [20]u64 = [0; 20];
+    let n = save_list(&mut regs);
+    let mut enc = mu.a64_frame(regs[0..n]);
+    if FN.dyn_frame {
+        enc = 0;
+    }
+    for e in FN.tail_ends.items() {
+        if e != size {
+            enc = 0;
+        }
+    }
+    if enc != 0 {
+        mu.add(&mut O.mu, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: FN.cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, true, &df);
+    mu.add(&mut O.mu, fs, 0, size, 0, prog.view(), false, false);
+    prog.free();
+}
+
+// Linux: the function's FDE in .eh_frame (macunwind.ax), its code at `base`
+// of section TEXT (by the section's symbol: see there), from the same call
+// frame states as its .debug_frame FDE.
+fn elf_unwind(base: u64, size: u64) void {
+    let mut regs: [20]u64 = [0; 20];
+    let n = save_list(&mut regs);
+    let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: 0, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: FN.cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, true, &df);
+    mu.add(&mut O.mu, elf.sec_sym(O.obj, O.text), base, size, 0, prog.view(), false, false);
+    prog.free();
+}
+
+// What dloc.ax needs of AArch64's machine code (variables' locations): the
+// allocatable registers x0-x15, x19-x27, v0-v31.
+let DLOC: dloc.Tgt = dloc.Tgt.{ dw_reg: dw_reg, is_exit: is_exit, is_tail: is_tail, slot_off: slot_cfa_off,
+                                obj_off: obj_cfa_off, imm_of: imm_of, may_store: may_store, single: one_insn,
+                                alloc: 0xffff_ffff_0ff8_ffff };
+
+// Is i, of size bytes of code, one machine instruction (and not a call)?
+fn one_insn(i: *mc.MInst, size: u64) bool {
+    return (size == 4) and (i.clobber == 0) and (i.op != CALL);
+}
+
+// May i write its memory operand? (Loads, address computations and
+// prefetches only read theirs: a spill slot one reads keeps its value.)
+fn may_store(i: *mc.MInst) bool {
+    return (i.op != LDR) and (i.op != FLDR) and (i.op != LEA) and (i.op != PRFM);
+}
+
+// The constant instruction i puts in its register (MOVI: a 32-bit one
+// zero-extended), or NO_LOC.
+fn imm_of(i: *mc.MInst) i64 {
+    if (i.op != MOVI) or (i.ops.len < 2) or (i.ops[1].kind != mc.K_IMM) {
+        return dloc.NO_LOC;
+    }
+    if i.sz == 8 {
+        return i.ops[1].disp;
+    }
+    if i.sz == 4 {
+        return i.ops[1].disp & 0xffff_ffff;
+    }
+    return dloc.NO_LOC;
+}
+
+// The frame slot of alloca a: its offset from the CFA (the frame's bottom
+// is 16 + frame below it).
+fn obj_cfa_off(a: *ir.Value) i64 {
+    if FN.frameless {
+        return dloc.NO_LOC;
+    }
+    let o = var_slot_off(a);
+    if o == dw.NO_LOC {
+        return dloc.NO_LOC;
+    }
+    return o - (16 + FN.frame);
+}
+
+// A physical register's DWARF number (DWARF for the Arm 64-bit
+// architecture, 4.1): x0-x30 0-30, v0-v31 64-95.
+fn dw_reg(r: i32) i32 {
+    if (r >= 0) and (r <= 30) {
+        return r;
+    }
+    if (r >= V0) and (r < V0 + 32) {
+        return 64 + (r - V0);
+    }
+    return -1;
+}
+
+fn is_exit(i: *mc.MInst) bool {
+    return (i.op == RET) or is_tail(i);
+}
+
+// A frame slot's offset from the CFA (the frame's bottom is 16 + frame below it).
+fn slot_cfa_off(k: i32) i64 {
+    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= FN.mf.slots.len) or FN.frameless {
+        return dloc.NO_LOC;
+    }
+    return FN.mf.slots.at(@as(usize, @bit_cast(u32, k))).offset - (16 + FN.frame);
+}
+
+// The offset from the frame's bottom (the stack pointer after the
+// prologue) of the frame slot of alloca a (dwarf.var_locs).
+fn var_slot_off(a: *ir.Value) i64 {
+    let k = @int_cast(usize, a.aux);
+    if (a.aux < 0) or (k >= FN.mf.slots.len) {
+        return dw.NO_LOC;
+    }
+    return FN.mf.slots.at(k).offset;
+}
+
+// The location of f's first instruction that has one (or f's own).
+fn first_src(f: *ir.Func) u32 {
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.src != 0 {
+                return i.src;
+            }
+            i = i.next;
+        }
+    }
+    return f.src;
+}

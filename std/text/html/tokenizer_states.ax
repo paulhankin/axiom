@@ -1,0 +1,534 @@
+// =============================================================================
+// std/text/html/tokenizer_states.ax - HTML tokenizer tag, attribute and script states, part of std/text/html.
+// =============================================================================
+
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Tokenizer tag, text, attribute and script states
+// -----------------------------------------------------------------------------
+
+// The data state: a run of text up to a tag, a character reference or a NUL.
+fn tok_data(tz: *mut Tokenizer) HtmlError!TokenKind {
+    let s = tz.s;
+    let n = s.len;
+    let b = tz.i;
+    let mut i = b;
+    while (i < n) and (s[i] != '<') and (s[i] != '&') and (s[i] != 0) {
+        i += 1;
+    }
+    tz.chars.push_str(s[b..i])!;
+    tz.i = i;
+    if i >= n {
+        return TokenKind.EOF;
+    }
+    tz.i = i + 1;
+    let c = s[i];
+    if c == '&' {
+        tz.char_ref(false)!;
+    } else if c == '<' {
+        tz.state = State.TAG_OPEN;
+    } else {
+        tz.err();
+        tz.chars.push(0)!;  // (the tree builder drops it)
+    }
+    return TokenKind.NONE;
+}
+
+// The RCDATA, RAWTEXT, script data and PLAINTEXT states: a run of text.
+fn tok_text(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let s = tz.s;
+    let n = s.len;
+    let b = tz.i;
+    let mut i = b;
+    while (i < n) and (s[i] != '<') and (s[i] != 0) and ((s[i] != '&') or (st != State.RCDATA)) {
+        i += 1;
+    }
+    tz.chars.push_str(s[b..i])!;
+    tz.i = i;
+    if i >= n {
+        return TokenKind.EOF;
+    }
+    tz.i = i + 1;
+    let c = s[i];
+    if c == 0 {
+        tz.err();
+        tz.chars.push_str("\xef\xbf\xbd")!;
+    } else if c == '&' {
+        tz.char_ref(false)!;
+    } else if st == State.PLAINTEXT {
+        tz.chars.push('<')!;
+    } else if st == State.RCDATA {
+        tz.state = State.RCDATA_LT;
+    } else if st == State.RAWTEXT {
+        tz.state = State.RAWTEXT_LT;
+    } else {
+        tz.state = State.SCRIPT_LT;
+    }
+    return TokenKind.NONE;
+}
+
+// The tag open, end tag open and self-closing start tag states.
+fn tok_tag(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let c = tz.at();
+    if st == State.TAG_OPEN {
+        if c == '!' {
+            tz.i += 1;
+            tz.state = State.MARKUP_DECL;
+        } else if c == '/' {
+            tz.i += 1;
+            tz.state = State.END_TAG_OPEN;
+        } else if is_alpha(c) {
+            tz.new_tag(TokenKind.START);
+            tz.state = State.TAG_NAME;
+        } else if c == '?' {
+            tz.err();
+            tz.comment.clear();
+            tz.state = State.BOGUS_COMMENT;
+        } else if c < 0 {
+            tz.err();
+            tz.chars.push('<')!;
+            return TokenKind.EOF;
+        } else {
+            tz.err();
+            tz.chars.push('<')!;
+            tz.state = State.DATA;
+        }
+    } else if st == State.END_TAG_OPEN {
+        if is_alpha(c) {
+            tz.new_tag(TokenKind.END);
+            tz.state = State.TAG_NAME;
+        } else if c == '>' {
+            tz.err();
+            tz.i += 1;
+            tz.state = State.DATA;
+        } else if c < 0 {
+            tz.err();
+            tz.chars.push_str("</")!;
+            return TokenKind.EOF;
+        } else {
+            tz.err();
+            tz.comment.clear();
+            tz.state = State.BOGUS_COMMENT;
+        }
+    } else if st == State.SELF_CLOSING {
+        if c == '>' {
+            tz.i += 1;
+            tz.self_closing = true;
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        } else {
+            tz.err();
+            tz.state = State.BEFORE_ATTR_NAME;
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// The tag name state, a run of name characters at a time.
+fn tok_tag_name(tz: *mut Tokenizer) HtmlError!TokenKind {
+    let s = tz.s;
+    let mut i = tz.i;
+    while (i < s.len) and not is_ws(s[i]) and (s[i] != '/') and (s[i] != '>') and (s[i] != 0) {
+        tz.name.push(lower(@as(i32, s[i])))!;
+        i += 1;
+    }
+    tz.i = i;
+    let c = tz.at();
+    if c < 0 {
+        tz.err();
+        return TokenKind.EOF;
+    }
+    tz.i += 1;
+    let b = @truncate(u8, c);
+    if is_ws(b) {
+        tz.state = State.BEFORE_ATTR_NAME;
+    } else if b == '/' {
+        tz.state = State.SELF_CLOSING;
+    } else if b == '>' {
+        tz.state = State.DATA;
+        return tz.emit_tag();
+    } else {
+        tz.err();  // (NUL)
+        tz.name.push_str("\xef\xbf\xbd")!;
+    }
+    return TokenKind.NONE;
+}
+
+// The states before, in and after an attribute name.
+fn tok_attr_name(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let c = tz.at();
+    if st == State.BEFORE_ATTR_NAME {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+            tz.i += 1;
+        } else if (c == '/') or (c == '>') or (c < 0) {
+            tz.state = State.AFTER_ATTR_NAME;
+        } else if c == '=' {
+            tz.err();
+            tz.new_attr()!;
+            tz.abuf.push('=')!;
+            tz.i += 1;
+            tz.state = State.ATTR_NAME;
+        } else {
+            tz.new_attr()!;
+            tz.state = State.ATTR_NAME;
+        }
+    } else if st == State.ATTR_NAME {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') or (c < 0) {
+            tz.end_attr_name()!;
+            tz.state = State.AFTER_ATTR_NAME;
+        } else if c == '=' {
+            tz.end_attr_name()!;
+            tz.i += 1;
+            tz.state = State.BEFORE_ATTR_VALUE;
+        } else {
+            tz.i += 1;
+            if c == 0 {
+                tz.err();
+                tz.abuf.push_str("\xef\xbf\xbd")!;
+            } else {
+                if (c == '"') or (c == '\'') or (c == '<') {
+                    tz.err();
+                }
+                tz.abuf.push(lower(c))!;
+            }
+        }
+    } else if st == State.AFTER_ATTR_NAME {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+            tz.i += 1;
+        } else if c == '/' {
+            tz.i += 1;
+            tz.state = State.SELF_CLOSING;
+        } else if c == '=' {
+            tz.i += 1;
+            tz.state = State.BEFORE_ATTR_VALUE;
+        } else if c == '>' {
+            tz.i += 1;
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        } else {
+            tz.new_attr()!;
+            tz.state = State.ATTR_NAME;
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// The states before, in and after an attribute value.
+fn tok_attr_value(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let s = tz.s;
+    let n = s.len;
+    let c = tz.at();
+    if st == State.BEFORE_ATTR_VALUE {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+            tz.i += 1;
+        } else if c == '"' {
+            tz.i += 1;
+            tz.state = State.ATTR_VALUE_DQ;
+        } else if c == '\'' {
+            tz.i += 1;
+            tz.state = State.ATTR_VALUE_SQ;
+        } else if c == '>' {
+            tz.err();
+            tz.i += 1;
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else {
+            tz.state = State.ATTR_VALUE_UNQ;
+        }
+    } else if (st == State.ATTR_VALUE_DQ) or (st == State.ATTR_VALUE_SQ) {
+        let mut qq: u8 = '"';
+        if st == State.ATTR_VALUE_SQ {
+            qq = '\'';
+        }
+        let b = tz.i;
+        let mut i = b;
+        while (i < n) and (s[i] != qq) and (s[i] != '&') and (s[i] != 0) {
+            i += 1;
+        }
+        tz.abuf.push_str(s[b..i])!;
+        tz.i = i;
+        if i >= n {
+            tz.err();
+            return TokenKind.EOF;
+        }
+        tz.i = i + 1;
+        if s[i] == qq {
+            tz.state = State.AFTER_ATTR_VALUE;
+        } else if s[i] == '&' {
+            tz.char_ref(true)!;
+        } else {
+            tz.err();
+            tz.abuf.push_str("\xef\xbf\xbd")!;
+        }
+    } else if st == State.ATTR_VALUE_UNQ {
+        if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        }
+        tz.i += 1;
+        let b = @truncate(u8, c);
+        if (b == '\t') or (b == '\n') or (b == 12) or (b == ' ') {
+            tz.state = State.BEFORE_ATTR_NAME;
+        } else if b == '&' {
+            tz.char_ref(true)!;
+        } else if b == '>' {
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else if b == 0 {
+            tz.err();
+            tz.abuf.push_str("\xef\xbf\xbd")!;
+        } else {
+            if (b == '"') or (b == '\'') or (b == '<') or (b == '=') or (b == '`') {
+                tz.err();
+            }
+            tz.abuf.push(b)!;
+        }
+    } else if st == State.AFTER_ATTR_VALUE {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+            tz.i += 1;
+            tz.state = State.BEFORE_ATTR_NAME;
+        } else if c == '/' {
+            tz.i += 1;
+            tz.state = State.SELF_CLOSING;
+        } else if c == '>' {
+            tz.i += 1;
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        } else {
+            tz.err();
+            tz.state = State.BEFORE_ATTR_NAME;
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// End tags in RCDATA, RAWTEXT and script data (escaped or not): the
+// less-than sign, end tag open and end tag name states.
+fn tok_text_end_tag(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let c = tz.at();
+    if (st == State.RCDATA_LT) or (st == State.RAWTEXT_LT) {
+        let mut back = State.RCDATA;
+        if st == State.RAWTEXT_LT {
+            back = State.RAWTEXT;
+        }
+        if c == '/' {
+            tz.i += 1;
+            tz.tmp.clear();
+            if st == State.RCDATA_LT {
+                tz.state = State.RCDATA_END_OPEN;
+            } else {
+                tz.state = State.RAWTEXT_END_OPEN;
+            }
+        } else {
+            tz.chars.push('<')!;
+            tz.state = back;
+        }
+    } else if (st == State.RCDATA_END_OPEN) or (st == State.RAWTEXT_END_OPEN) or (st == State.SCRIPT_END_OPEN) or
+              (st == State.SCRIPT_ESC_END_OPEN) {
+        if is_alpha(c) {
+            tz.new_tag(TokenKind.END);
+            tz.state = end_name_state(st);
+        } else {
+            tz.chars.push_str("</")!;
+            tz.state = end_tag_back(st);
+        }
+    } else if (st == State.RCDATA_END_NAME) or (st == State.RAWTEXT_END_NAME) or (st == State.SCRIPT_END_NAME) or
+              (st == State.SCRIPT_ESC_END_NAME) {
+        if ((c == '\t') or (c == '\n') or (c == 12) or (c == ' ')) and tz.appropriate() {
+            tz.i += 1;
+            tz.state = State.BEFORE_ATTR_NAME;
+        } else if (c == '/') and tz.appropriate() {
+            tz.i += 1;
+            tz.state = State.SELF_CLOSING;
+        } else if (c == '>') and tz.appropriate() {
+            tz.i += 1;
+            tz.state = State.DATA;
+            return tz.emit_tag();
+        } else if is_alpha(c) {
+            tz.i += 1;
+            tz.name.push(lower(c))!;
+            tz.tmp.push(@truncate(u8, c))!;
+        } else {
+            tz.flush_end_tag()!;
+            tz.state = end_tag_back(st);
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// Script data: the less-than sign state and the escaped states.
+fn tok_script_escaped(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let c = tz.at();
+    if st == State.SCRIPT_LT {
+        if c == '/' {
+            tz.i += 1;
+            tz.tmp.clear();
+            tz.state = State.SCRIPT_END_OPEN;
+        } else if c == '!' {
+            tz.i += 1;
+            tz.chars.push_str("<!")!;
+            tz.state = State.SCRIPT_ESC_START;
+        } else {
+            tz.chars.push('<')!;
+            tz.state = State.SCRIPT;
+        }
+    } else if (st == State.SCRIPT_ESC_START) or (st == State.SCRIPT_ESC_START_DASH) {
+        if c == '-' {
+            tz.i += 1;
+            tz.chars.push('-')!;
+            if st == State.SCRIPT_ESC_START {
+                tz.state = State.SCRIPT_ESC_START_DASH;
+            } else {
+                tz.state = State.SCRIPT_ESC_DASH_DASH;
+            }
+        } else {
+            tz.state = State.SCRIPT;
+        }
+    } else if (st == State.SCRIPT_ESC) or (st == State.SCRIPT_ESC_DASH) or (st == State.SCRIPT_ESC_DASH_DASH) {
+        if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        }
+        tz.i += 1;
+        if c == '-' {
+            tz.chars.push('-')!;
+            if st == State.SCRIPT_ESC {
+                tz.state = State.SCRIPT_ESC_DASH;
+            } else {
+                tz.state = State.SCRIPT_ESC_DASH_DASH;
+            }
+        } else if c == '<' {
+            tz.state = State.SCRIPT_ESC_LT;
+        } else if (c == '>') and (st == State.SCRIPT_ESC_DASH_DASH) {
+            tz.chars.push('>')!;
+            tz.state = State.SCRIPT;
+        } else if c == 0 {
+            tz.err();
+            tz.chars.push_str("\xef\xbf\xbd")!;
+            tz.state = State.SCRIPT_ESC;
+        } else {
+            tz.chars.push(@truncate(u8, c))!;
+            tz.state = State.SCRIPT_ESC;
+        }
+    } else if st == State.SCRIPT_ESC_LT {
+        if c == '/' {
+            tz.i += 1;
+            tz.tmp.clear();
+            tz.state = State.SCRIPT_ESC_END_OPEN;
+        } else if is_alpha(c) {
+            tz.tmp.clear();
+            tz.chars.push('<')!;
+            tz.state = State.SCRIPT_DESC_START;
+        } else {
+            tz.chars.push('<')!;
+            tz.state = State.SCRIPT_ESC;
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// Script data: the double-escaped states.
+fn tok_script_double_escaped(tz: *mut Tokenizer, st: State) HtmlError!TokenKind {
+    let c = tz.at();
+    if (st == State.SCRIPT_DESC_START) or (st == State.SCRIPT_DESC_END) {
+        if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') {
+            tz.i += 1;
+            tz.chars.push(@truncate(u8, c))!;
+            let is_script = strs.eq(tz.tmp.bytes(), "script");
+            if st == State.SCRIPT_DESC_START {
+                if is_script {
+                    tz.state = State.SCRIPT_DESC;
+                } else {
+                    tz.state = State.SCRIPT_ESC;
+                }
+            } else {
+                if is_script {
+                    tz.state = State.SCRIPT_ESC;
+                } else {
+                    tz.state = State.SCRIPT_DESC;
+                }
+            }
+        } else if is_alpha(c) {
+            tz.i += 1;
+            tz.tmp.push(lower(c))!;
+            tz.chars.push(@truncate(u8, c))!;
+        } else {
+            if st == State.SCRIPT_DESC_START {
+                tz.state = State.SCRIPT_ESC;
+            } else {
+                tz.state = State.SCRIPT_DESC;
+            }
+        }
+    } else if (st == State.SCRIPT_DESC) or (st == State.SCRIPT_DESC_DASH) or (st == State.SCRIPT_DESC_DASH_DASH) {
+        if c < 0 {
+            tz.err();
+            return TokenKind.EOF;
+        }
+        tz.i += 1;
+        if c == '-' {
+            tz.chars.push('-')!;
+            if st == State.SCRIPT_DESC {
+                tz.state = State.SCRIPT_DESC_DASH;
+            } else {
+                tz.state = State.SCRIPT_DESC_DASH_DASH;
+            }
+        } else if c == '<' {
+            tz.chars.push('<')!;
+            tz.state = State.SCRIPT_DESC_LT;
+        } else if (c == '>') and (st == State.SCRIPT_DESC_DASH_DASH) {
+            tz.chars.push('>')!;
+            tz.state = State.SCRIPT;
+        } else if c == 0 {
+            tz.err();
+            tz.chars.push_str("\xef\xbf\xbd")!;
+            tz.state = State.SCRIPT_DESC;
+        } else {
+            tz.chars.push(@truncate(u8, c))!;
+            tz.state = State.SCRIPT_DESC;
+        }
+    } else if st == State.SCRIPT_DESC_LT {
+        if c == '/' {
+            tz.i += 1;
+            tz.tmp.clear();
+            tz.chars.push('/')!;
+            tz.state = State.SCRIPT_DESC_END;
+        } else {
+            tz.state = State.SCRIPT_DESC;
+        }
+    }
+    return TokenKind.NONE;
+}
+
+// Where an end tag that turns out not to be one goes back to (from its end
+// tag open or end tag name state).
+fn end_tag_back(st: State) State {
+    match st {
+        .RCDATA_END_OPEN  => { return State.RCDATA; }
+        .RCDATA_END_NAME  => { return State.RCDATA; }
+        .RAWTEXT_END_OPEN => { return State.RAWTEXT; }
+        .RAWTEXT_END_NAME => { return State.RAWTEXT; }
+        .SCRIPT_END_OPEN  => { return State.SCRIPT; }
+        .SCRIPT_END_NAME  => { return State.SCRIPT; }
+        else              => { return State.SCRIPT_ESC; }
+    }
+}
+
+// The end tag name state that follows an end tag open state.
+fn end_name_state(open_state: State) State {
+    match open_state {
+        .RCDATA_END_OPEN  => { return State.RCDATA_END_NAME; }
+        .RAWTEXT_END_OPEN => { return State.RAWTEXT_END_NAME; }
+        .SCRIPT_END_OPEN  => { return State.SCRIPT_END_NAME; }
+        else              => { return State.SCRIPT_ESC_END_NAME; }
+    }
+}

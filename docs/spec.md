@@ -209,6 +209,7 @@ TopDecl       ::= ImportDecl
 Item          ::= StructDecl | UnionDecl | EnumDecl | FnDecl | ConstDecl | GlobalDecl
 
 ImportDecl    ::= "import" ( STRING_LIT "as" IDENT ";"
+                           | "part" STRING_LIT ";"
                            | "host" STRING_LIT? "{" HostFnDecl* "}" )
 HostFnDecl    ::= "fn" IDENT "(" ParamList? ")" Type ";"
 
@@ -226,6 +227,9 @@ ErrorTerm     ::= "{" ErrorNames "}" | IDENT ( "." IDENT )?
 ConstDecl     ::= "const" IDENT ":" Type "=" Expr ";"
 GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ```
+
+`part` is not a keyword (§2.4); it is recognized contextually immediately after `import`
+to include another source file into the current module (§4.1).
 
 ### 3.2 Aggregates and functions
 
@@ -402,9 +406,11 @@ An unknown builtin name is a compile error (`E0120`) raised by the parser.
 
 ### 4.1 Modules
 
-Each `.ax` file is a module. `import "path.ax" as name;` binds `name` to that module's `pub`
-declarations. Paths are relative to the importing file, with `/` between their parts on
-every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` or a NUL byte is `E0218`.
+A module is an entry `.ax` file together with any part files it includes via `import part`
+(by default, a single `.ax` file). `import "path.ax" as name;` binds `name` to that
+module's `pub` declarations. Paths are relative to the importing file, with `/` between
+their parts on every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\`
+or a NUL byte is `E0218`.
 A path beginning with `std/` resolves to the standard library, for example
 `import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
 (§4.6). The rest of a `std/` path, and of a `pkg:name/` path, may not have a `..` part, so
@@ -417,7 +423,36 @@ the tree rooted at that directory's parent, as in Go: `a/b/internal/c.ax` by `a/
 standard library too, so `std/internal/...` (the runtime among it) can be imported only from
 `std`.
 
-Import cycles are a compile error (`E0210`) in v0.1.
+Inter-module import cycles are a compile error (`E0210`) in v0.1.
+
+**Multi-file modules (`import part`).** A module's entry file may split its implementation
+across multiple `.ax` files using `import part "sub.ax";`:
+
+```ebnf
+ImportDecl ::= "import" ( STRING_LIT "as" IDENT ";"
+                        | "part" STRING_LIT ";"
+                        | "host" STRING_LIT? "{" HostFnDecl* "}" )
+```
+
+`part` is contextual directly after `import` (not a reserved keyword), and `import part`
+paths follow the same path-resolution rules relative to the entry file (`E0218`, `E0211`,
+`E0219`).
+
+- **Entry file only:** Only a module's entry file may declare `import part`. Using
+  `import part` inside a part file, or importing a part file directly via
+  `import "part.ax" as name;`, is a compile error (`E0221`).
+- **Single ownership:** A file MUST NOT be claimed as a part more than once in the same
+  module or claimed by more than one module (`E0222`).
+- **Shared module namespace:** All parts of a module belong to the same module namespace.
+  Top-level declarations (including module-private types, functions, constants, globals,
+  and named or inline error declarations) and private struct/union fields or private methods
+  are shared across the entry file and all its parts, and functions/types in different
+  parts may mutually call or reference one another without triggering `E0210`. Duplicate
+  top-level names across files of the same module remain `E0201`.
+- **File-scoped imports:** `import "path" as alias;` declarations are scoped to the
+  individual `.ax` file in which they appear, so each part explicitly declares its own
+  imports and remains locally self-contained; different files of the same module may bind
+  different aliases or bind the same alias to different modules.
 
 ### 4.2 Visibility
 
@@ -2847,6 +2882,8 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0218 | Import path absolute or containing `\` or a NUL byte, or a `std/` or `pkg:` path with a `..` part |
 | E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
 | E0220 | A package needs a newer compiler (`axiom` in its manifest, §4.6) |
+| E0221 | Direct import of a module part file, or `import part` inside a part file (§4.1) |
+| E0222 | Part file claimed by more than one module, or listed twice (§4.1) |
 | E0301 | Missing return type |
 | E0304 | Union or enum without variants (members) |
 | E0305 | `self` parameter with a type other than `Self`, `*Self` or `*mut Self` |
@@ -3210,18 +3247,19 @@ object depends on:
 - the compiler binary;
 - the code-generation options (target, `-O`, overflow mode, stack traces, profiling,
   test mode);
-- the module's source and path;
-- recursively, the **interface keys** of the modules it imports: a module's source
-  without the bodies of its non-generic, non-inline functions and methods (which
-  importers reach by name, through their signatures; `inline` functions passed as `const`
-  function generic arguments retain their bodies in the interface key), its path, and its
-  imports' interface keys in turn;
+- the module's sources (its entry file and all its parts) and paths;
+- recursively, the **interface keys** of the modules it imports: the sources of a module's
+  entry file and all its parts without the bodies of its non-generic, non-inline functions
+  and methods (which importers reach by name, through their signatures; `inline` functions
+  passed as `const` function generic arguments retain their bodies in the interface key),
+  their paths, and the interface keys of all imports across the entry file and its parts
+  in turn;
 - on WebAssembly, the layout of the program's thread-locals (§12.8.6): their order,
   sizes and alignments.
 
-Editing a module recompiles it; editing its interface (anything but the body of a
-non-generic, non-inline function) also recompiles every module that imports it,
-directly or indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
+Editing a module (its entry file or any of its parts) recompiles it; editing its interface
+(anything but the body of a non-generic, non-inline function) also recompiles every module
+that imports it, directly or indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
 toolchain's C runtime (`std/internal/runtime/*.c`) is compiled once per content and cached the
 same way. `--verbose` reports how many modules were compiled and how many came from
 the cache.

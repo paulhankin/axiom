@@ -1,0 +1,653 @@
+// =============================================================================
+// sema_moves.ax - nocopy, move tracking, places and pointer-escape analysis,
+// part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// nocopy & move tracking (spec §5.9: E0708, E0709)
+// ---------------------------------------------------------------------------
+pub fn type_is_nocopy(t: *mut ast.Type) bool {
+    if u.isnil(t) {
+        return false;
+    }
+    let k = t.kind;
+    if k == ast.TY_STRUCT {
+        if u.isnil(t.decl) {
+            return false;
+        }
+        if t.decl.is_nocopy {
+            return true;
+        }
+        if t.decl.nocopy_visiting {
+            return false;
+        }
+        t.decl.nocopy_visiting = true;
+        if t.decl.state == ast.DeclState.UNRESOLVED {
+            resolve_decl(t.decl);
+        }
+        let mut res = false;
+        for i in 0..t.decl.fields.len {
+            let ft = ty.type_field(t, i);
+            if u.notnil(ft) and type_is_nocopy(ft) {
+                res = true;
+                break;
+            }
+        }
+        t.decl.nocopy_visiting = false;
+        return res;
+    }
+    if k == ast.TY_UNION {
+        if u.isnil(t.decl) {
+            return false;
+        }
+        if t.decl.is_nocopy {
+            return true;
+        }
+        if t.decl.nocopy_visiting {
+            return false;
+        }
+        t.decl.nocopy_visiting = true;
+        if t.decl.state == ast.DeclState.UNRESOLVED {
+            resolve_decl(t.decl);
+        }
+        let mut res = false;
+        for i in 0..t.decl.variants.len {
+            let vt = ty.type_variant(t, i);
+            if u.notnil(vt) and type_is_nocopy(vt) {
+                res = true;
+                break;
+            }
+        }
+        t.decl.nocopy_visiting = false;
+        return res;
+    }
+    if (k == ast.TY_ARRAY) or (k == ast.TY_OPT) or (k == ast.TY_ERRUNION) {
+        return type_is_nocopy(t.elem);
+    }
+    return false;
+}
+
+fn unwrap_conv(e0: *mut ast.Expr) *mut ast.Expr {
+    let mut e = e0;
+    while u.notnil(e) and (e.kind == ast.E_CONV) {
+        e = e.a;
+    }
+    return e;
+}
+
+fn check_no_copy(e0: *mut ast.Expr) void {
+    let e = unwrap_conv(e0);
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
+        return;
+    }
+    if is_place(e) and type_is_nocopy(e.ty) {
+        if (e.kind == ast.E_IDENT) and u.notnil(ast.local_of(e)) and ast.local_of(e).moved {
+            return;
+        }
+        _ = dg.err(e.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(e.ty)));
+    }
+}
+
+fn move_or_check_nocopy(e0: *mut ast.Expr) void {
+    let e = unwrap_conv(e0);
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
+        return;
+    }
+    if not type_is_nocopy(e.ty) {
+        return;
+    }
+    if (e.kind == ast.E_IDENT) and u.notnil(ast.local_of(e)) {
+        let l = ast.local_of(e);
+        if not C.flow_dead and not l.moved {
+            l.moved = true;
+            l.moved_span = e.span;
+        }
+        return;
+    }
+    check_no_copy(e);
+}
+
+fn save_moves(n: usize) MoveSnap {
+    let fc = C;
+    let m = u.newn.[bool](n);
+    let sp = u.newn.[u.Span](n);
+    let orig = u.newn.[*mut ast.Local](n);
+    let oflds = u.newn.[u64](n);
+    for i in 0..n {
+        let l = fc.locals.get(i);
+        m[i] = l.moved;
+        sp[i] = l.moved_span;
+        orig[i] = l.origin_local;
+        oflds[i] = l.origin_fields;
+    }
+    return MoveSnap.{ moved: m, spans: sp, origins: orig, origin_fields: oflds, n: n };
+}
+
+fn restore_moves(s: MoveSnap) void {
+    for i in 0..s.n {
+        let l = C.locals.get(i);
+        l.moved = s.moved[i];
+        l.moved_span = s.spans[i];
+        l.origin_local = s.origins[i];
+        l.origin_fields = s.origin_fields[i];
+    }
+}
+
+fn merge_moves_or(a: MoveSnap, b: MoveSnap) void {
+    for i in 0..a.n {
+        let l = C.locals.get(i);
+        if a.moved[i] {
+            l.moved = true;
+            l.moved_span = a.spans[i];
+        } else if (i < b.n) and b.moved[i] {
+            l.moved = true;
+            l.moved_span = b.spans[i];
+        } else {
+            l.moved = false;
+        }
+        if u.notnil(a.origins[i]) {
+            l.origin_local = a.origins[i];
+        } else if (i < b.n) and u.notnil(b.origins[i]) {
+            l.origin_local = b.origins[i];
+        } else {
+            l.origin_local = u.nil.[ast.Local]();
+        }
+        let mut ofld = a.origin_fields[i];
+        if i < b.n {
+            ofld = ofld | b.origin_fields[i];
+        }
+        l.origin_fields = ofld;
+    }
+}
+
+fn or_moves_into(dst: *mut MoveSnap, n: usize) void {
+    let k = @min(dst.n, n);
+    for i in 0..k {
+        let l = C.locals.get(i);
+        if l.moved and not dst.moved[i] {
+            dst.moved[i] = true;
+            dst.spans[i] = l.moved_span;
+        }
+        if u.notnil(l.origin_local) and u.isnil(dst.origins[i]) {
+            dst.origins[i] = l.origin_local;
+        }
+        dst.origin_fields[i] = dst.origin_fields[i] | l.origin_fields;
+    }
+}
+
+fn or_snap_into(dst: *mut MoveSnap, src: MoveSnap) void {
+    let k = @min(dst.n, src.n);
+    for i in 0..k {
+        if src.moved[i] and not dst.moved[i] {
+            dst.moved[i] = true;
+            dst.spans[i] = src.spans[i];
+        }
+        if u.notnil(src.origins[i]) and u.isnil(dst.origins[i]) {
+            dst.origins[i] = src.origins[i];
+        }
+        dst.origin_fields[i] = dst.origin_fields[i] | src.origin_fields[i];
+    }
+}
+
+fn span_eq(a: u.Span, b: u.Span) bool {
+    return (a.file == b.file) and (a.start == b.start) and (a.end == b.end);
+}
+
+fn check_loop_backedge(lm: *mut LoopMove, err_sp: u.Span, has_sp: bool) void {
+    for i in 0..lm.base {
+        let l = C.locals.get(i);
+        if l.moved and not lm.pre.moved[i] {
+            if not span_eq(lm.reported[i], l.moved_span) {
+                let mut sp = l.moved_span;
+                if has_sp {
+                    sp = err_sp;
+                }
+                let d = dg.err(sp, "E0709", u.f1("use of moved value '%s'", l.name));
+                dg.note(d, l.moved_span, "value moved here");
+                lm.reported[i] = l.moved_span;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Places
+// ---------------------------------------------------------------------------
+pub fn is_place(e: *mut ast.Expr) bool {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        return u.notnil(ast.local_of(e)) or (u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_GLOBAL));
+    }
+    if k == ast.E_DEREF {
+        return true;
+    }
+    if k == ast.E_FIELD {
+        if ast.field_kind_of(e) == ast.FK_DECL {
+            return u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_GLOBAL);
+        }
+        if ast.field_kind_of(e) != ast.FK_STRUCT {
+            return false;
+        }
+        if ast.self_mode_of(e) == ast.SELF_DEREF {
+            return true;
+        }
+        return is_place(e.a);
+    }
+    if k == ast.E_INDEX {
+        return (ast.index_kind_of(e) != ast.IDX_ARRAY) or is_place(e.a);
+    }
+    return false;
+}
+
+fn is_mut_place(e: *mut ast.Expr) bool {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        if u.notnil(ast.local_of(e)) {
+            return ast.local_of(e).is_mut;
+        }
+        return u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_GLOBAL) and ast.decl_of(e).is_mut;
+    }
+    if k == ast.E_DEREF {
+        return (e.a.ty.kind == ast.TY_PTR) and e.a.ty.is_mut;
+    }
+    if k == ast.E_FIELD {
+        if ast.field_kind_of(e) == ast.FK_DECL {
+            return u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_GLOBAL) and ast.decl_of(e).is_mut;
+        }
+        if ast.field_kind_of(e) != ast.FK_STRUCT {
+            return false;
+        }
+        if ast.self_mode_of(e) == ast.SELF_DEREF {
+            return e.a.ty.is_mut;
+        }
+        return is_mut_place(e.a);
+    }
+    if k == ast.E_INDEX {
+        if ast.index_kind_of(e) == ast.IDX_ARRAY {
+            return is_mut_place(e.a);
+        }
+        return e.a.ty.is_mut;
+    }
+    return false;
+}
+
+// True iff place `e` is reached through an immutable pointer (*T) or slice ([]T).
+fn via_immut_indirection(e0: *ast.Expr) bool {
+    let mut e = e0;
+    loop {
+        let k = e.kind;
+        if k == ast.E_DEREF {
+            return (e.a.ty.kind == ast.TY_PTR) and not e.a.ty.is_mut;
+        }
+        if (k == ast.E_FIELD) and (ast.field_kind_of(e) == ast.FK_STRUCT) {
+            if ast.self_mode_of(e) == ast.SELF_DEREF {
+                return not e.a.ty.is_mut;
+            }
+            e = e.a;
+            continue;
+        }
+        if k == ast.E_INDEX {
+            if ast.index_kind_of(e) == ast.IDX_ARRAY {
+                e = e.a;
+                continue;
+            }
+            return not e.a.ty.is_mut;
+        }
+        return false;
+    }
+}
+
+fn mark_addr_taken(e: *mut ast.Expr) void {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        if u.notnil(ast.local_of(e)) {
+            ast.local_of(e).addr_taken = true;
+        }
+        return;
+    }
+    if k == ast.E_FIELD {
+        if ast.self_mode_of(e) != ast.SELF_DEREF {
+            mark_addr_taken(e.a);
+        }
+        return;
+    }
+    if k == ast.E_INDEX {
+        if ast.index_kind_of(e) == ast.IDX_ARRAY {
+            mark_addr_taken(e.a);
+        }
+        return;
+    }
+}
+
+fn root_local(e0: *mut ast.Expr) *mut ast.Local {
+    let mut e = e0;
+    loop {
+        if e.kind == ast.E_IDENT {
+            return ast.local_of(e);
+        }
+        if ((e.kind == ast.E_FIELD) and (ast.self_mode_of(e) != ast.SELF_DEREF)) or
+           ((e.kind == ast.E_INDEX) and (ast.index_kind_of(e) == ast.IDX_ARRAY)) {
+            e = e.a;
+        } else {
+            return u.nil.[ast.Local]();
+        }
+    }
+}
+
+fn not_mutable(e: *mut ast.Expr, what: []u8) void {
+    let d = dg.err(e.span, "E0701", u.f1("cannot %s: this place is not mutable", what));
+    let l = root_local(e);
+    if u.notnil(l) and not l.is_param {
+        dg.note(d, l.span, u.f1("'%s' is declared without 'mut'", l.name));
+        let fx = dg.fix(d, "declare the variable as mutable", "suggestion");
+        dg.edit(fx, sp_at(l.span), "mut ");
+    } else if u.notnil(l) and l.is_param {
+        dg.note(d, l.span, u.f1("parameters are immutable; copy '%s' into a 'let mut' first", l.name));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Escape and origin analysis (spec §12.2: E0710)
+// ---------------------------------------------------------------------------
+fn type_can_hold_ptr_rec(t0: *mut ast.Type, depth: i32) bool {
+    if u.isnil(t0) or (depth >= 16) {
+        return false;
+    }
+    let k = t0.kind;
+    if (k == ast.TY_PTR) or (k == ast.TY_SLICE) {
+        return true;
+    }
+    if (k == ast.TY_OPT) or (k == ast.TY_ERRUNION) or (k == ast.TY_ARRAY) {
+        return type_can_hold_ptr_rec(t0.elem, depth + 1);
+    }
+    if k == ast.TY_STRUCT {
+        let d = t0.decl;
+        if u.isnil(d) {
+            return false;
+        }
+        if not d.anon and (d.state == ast.DeclState.UNRESOLVED) {
+            resolve_decl(d);
+        }
+        for i in 0..d.fields.len {
+            if u.isnil(d.fields.at(i).ty) {
+                continue;
+            }
+            if type_can_hold_ptr_rec(ty.type_field(t0, i), depth + 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == ast.TY_UNION {
+        let d = t0.decl;
+        if u.isnil(d) {
+            return false;
+        }
+        if not d.anon and (d.state == ast.DeclState.UNRESOLVED) {
+            resolve_decl(d);
+        }
+        for i in 0..d.variants.len {
+            if u.isnil(d.variants.at(i).ty) {
+                continue;
+            }
+            let vt = ty.type_variant(t0, i);
+            if u.notnil(vt) and type_can_hold_ptr_rec(vt, depth + 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+fn type_can_hold_ptr(t0: *mut ast.Type) bool {
+    return type_can_hold_ptr_rec(t0, 0);
+}
+
+// The local whose storage place e is part of (nil: a global, or memory
+// reached through a pointer or a slice).
+fn place_local(e: *mut ast.Expr) *mut ast.Local {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        return ast.local_of(e);
+    }
+    if (k == ast.E_FIELD) and (ast.field_kind_of(e) == ast.FK_STRUCT) and (ast.self_mode_of(e) != ast.SELF_DEREF) {
+        return place_local(e.a);
+    }
+    if (k == ast.E_INDEX) and (ast.index_kind_of(e) == ast.IDX_ARRAY) {
+        return place_local(e.a);
+    }
+    return u.nil.[ast.Local]();
+}
+
+// The local whose storage place `e` points into or is part of (following
+// pointer dereferences and slice indexing via expr_local_origin).
+fn place_origin(e: *mut ast.Expr) *mut ast.Local {
+    if u.isnil(e) {
+        return u.nil.[ast.Local]();
+    }
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        return ast.local_of(e);
+    }
+    if k == ast.E_FIELD {
+        if ast.field_kind_of(e) == ast.FK_STRUCT {
+            if ast.self_mode_of(e) != ast.SELF_DEREF {
+                return place_origin(e.a);
+            }
+            return expr_local_origin(e.a);
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_INDEX {
+        if ast.index_kind_of(e) == ast.IDX_ARRAY {
+            return place_origin(e.a);
+        }
+        return expr_local_origin(e.a);
+    }
+    if k == ast.E_DEREF {
+        return expr_local_origin(e.a);
+    }
+    return u.nil.[ast.Local]();
+}
+
+fn expr_local_origin_mask(e: *mut ast.Expr, mask_out: *mut u64) *mut ast.Local {
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) or not type_can_hold_ptr(e.ty) {
+        mask_out.* = 0;
+        return u.nil.[ast.Local]();
+    }
+    let k = e.kind;
+    if k == ast.E_CONV {
+        if (e.ty.kind == ast.TY_SLICE) and u.notnil(e.a) and u.notnil(e.a.ty) and (e.a.ty.kind == ast.TY_ARRAY) {
+            let l = place_origin(e.a);
+            if u.notnil(l) {
+                mask_out.* = ~@as(u64, 0);
+            } else {
+                mask_out.* = 0;
+            }
+            return l;
+        }
+        return expr_local_origin_mask(e.a, mask_out);
+    }
+    if k == ast.E_OPT_SOME {
+        return expr_local_origin_mask(e.a, mask_out);
+    }
+    if k == ast.E_STRUCT_LIT {
+        let mut mask: u64 = 0;
+        let mut first = u.nil.[ast.Local]();
+        let mut d = u.nil.[ast.Decl]();
+        if e.ty.kind == ast.TY_STRUCT {
+            d = e.ty.decl;
+        }
+        for i in 0..ast.more_ro(e).inits.len {
+            let fi = ast.more_ro(e).inits.at_mut(i);
+            let fo = expr_local_origin(fi.value);
+            if u.isnil(fo) {
+                continue;
+            }
+            if u.isnil(first) {
+                first = fo;
+            }
+            let mut idx: i32 = @int_cast(i32, i);
+            if u.notnil(d) {
+                idx = find_field(d, fi.name);
+            }
+            if (idx >= 0) and (idx < 64) {
+                mask = mask | (@as(u64, 1) << @int_cast(u32, idx));
+            } else {
+                mask = ~@as(u64, 0);
+            }
+        }
+        mask_out.* = mask;
+        return first;
+    }
+    if k == ast.E_IDENT {
+        let l = ast.local_of(e);
+        if u.notnil(l) {
+            mask_out.* = l.origin_fields;
+            return l.origin_local;
+        }
+        mask_out.* = 0;
+        return u.nil.[ast.Local]();
+    }
+    if (k == ast.E_CATCH) or (k == ast.E_ORELSE) {
+        let mut m1: u64 = 0;
+        let mut m2: u64 = 0;
+        let l1 = expr_local_origin_mask(e.a, &mut m1);
+        let mut l2 = u.nil.[ast.Local]();
+        match ast.more_ro(e).handler {
+            .Value(h) => { l2 = expr_local_origin_mask(h, &mut m2); }
+            else => {}
+        }
+        mask_out.* = m1 | m2;
+        if u.notnil(l1) {
+            return l1;
+        }
+        return l2;
+    }
+    let l = expr_local_origin(e);
+    if u.notnil(l) {
+        mask_out.* = ~@as(u64, 0);
+    } else {
+        mask_out.* = 0;
+    }
+    return l;
+}
+
+fn expr_local_origin(e: *mut ast.Expr) *mut ast.Local {
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) or not type_can_hold_ptr(e.ty) {
+        return u.nil.[ast.Local]();
+    }
+    let k = e.kind;
+    if k == ast.E_CONV {
+        if (e.ty.kind == ast.TY_SLICE) and u.notnil(e.a) and u.notnil(e.a.ty) and (e.a.ty.kind == ast.TY_ARRAY) {
+            return place_origin(e.a);
+        }
+        return expr_local_origin(e.a);
+    }
+    if k == ast.E_OPT_SOME {
+        return expr_local_origin(e.a);
+    }
+    if k == ast.E_UNARY {
+        if (ast.op_of(e) == lx.TK_AMP) and is_place(e.a) {
+            return place_origin(e.a);
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_SLICE {
+        if ast.index_kind_of(e) == ast.IDX_ARRAY {
+            return place_origin(e.a);
+        }
+        return expr_local_origin(e.a);
+    }
+    if k == ast.E_IDENT {
+        let l = ast.local_of(e);
+        if u.notnil(l) {
+            return l.origin_local;
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_FIELD {
+        let fk = ast.field_kind_of(e);
+        if (fk == ast.FK_STRUCT) and (ast.self_mode_of(e) != ast.SELF_DEREF) {
+            let mut m: u64 = 0;
+            let l = expr_local_origin_mask(e.a, &mut m);
+            if u.isnil(l) {
+                return u.nil.[ast.Local]();
+            }
+            let idx = ast.index_of(e);
+            if (idx >= 0) and (idx < 64) and ((m & (@as(u64, 1) << @int_cast(u32, idx))) == 0) {
+                return u.nil.[ast.Local]();
+            }
+            return l;
+        }
+        if fk == ast.FK_SLICE_PTR {
+            return expr_local_origin(e.a);
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_INDEX {
+        if ast.index_kind_of(e) == ast.IDX_ARRAY {
+            return expr_local_origin(e.a);
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_STRUCT_LIT {
+        for i in 0..ast.more_ro(e).inits.len {
+            let o = expr_local_origin(ast.more_ro(e).inits.at_mut(i).value);
+            if u.notnil(o) {
+                return o;
+            }
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_ARRAY_LIT {
+        for i in 0..ast.args_of(e).len {
+            let o = expr_local_origin(ast.args_of(e).get(i));
+            if u.notnil(o) {
+                return o;
+            }
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_ARRAY_REPEAT {
+        return expr_local_origin(e.a);
+    }
+    if k == ast.E_CALL {
+        if (ast.call_kind_of(e) == ast.CALLK_VARIANT) and (ast.args_of(e).len > 0) {
+            return expr_local_origin(ast.args_of(e).get(0));
+        }
+        return u.nil.[ast.Local]();
+    }
+    if k == ast.E_TRY {
+        return expr_local_origin(e.a);
+    }
+    if (k == ast.E_CATCH) or (k == ast.E_ORELSE) {
+        let o = expr_local_origin(e.a);
+        if u.notnil(o) {
+            return o;
+        }
+        match ast.more_ro(e).handler {
+            .Value(h) => { return expr_local_origin(h); }
+            else => {}
+        }
+        return u.nil.[ast.Local]();
+    }
+    return u.nil.[ast.Local]();
+}
+
+// A returned address of a local (`&x`, `&mut x.f`, `&a[i]`), slice of a
+// local array (`a[..]`, `a[i..j]`), or a value derived from one, dangles once
+// the function returns (spec §12.2: E0710).
+fn check_escape(e0: *mut ast.Expr) void {
+    let l = expr_local_origin(e0);
+    if u.notnil(l) {
+        _ = dg.err(e0.span, "E0710", u.f1("this points into local '%s', whose storage ends when the function returns",
+                                          l.name));
+    }
+}

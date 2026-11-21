@@ -1,0 +1,484 @@
+// =============================================================================
+// ir_intr.ax - IR intrinsic IDs and queries, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+// Intrinsics (OP_INTR; its cv): NONE for an instruction that is no call
+// of one (intr_id)
+pub enum Intrinsic: i32 {
+    NONE = 0,
+    CTLZ = 1,
+    CTTZ = 2,
+    CTPOP = 3,
+    ROTL = 4,
+    ROTR = 5,
+    SADD_SAT = 6,
+    UADD_SAT = 7,
+    SSUB_SAT = 8,
+    USUB_SAT = 9,
+    SMIN = 10,
+    SMAX = 11,
+    UMIN = 12,
+    UMAX = 13,
+    FMIN = 14,  // IEEE minimum: NaN-propagating, -0 < +0
+    FMAX = 15,
+    FABS = 16,
+    SQRT = 17,
+    FLOOR = 18,
+    CEIL = 19,
+    FTRUNC = 20,
+    NEAREST = 21,  // round to nearest, ties to even
+    FMA = 22,
+    COPYSIGN = 23,
+    ABS = 24,  // wrapping integer abs
+    TRAP = 25,
+    MEMSIZE = 26,  // wasm memory.size (pages)
+    MEMGROW = 27,  // wasm memory.grow
+    WAIT32 = 28,   // wasm memory.atomic.wait32
+    NOTIFY = 29,   // wasm memory.atomic.notify
+    SET_SP = 30,   // set the stack pointer (thread entry on wasm)
+    ANYTRUE = 31,  // i1: any bit of the vector set
+    ALLTRUE = 32,  // i1: every lane nonzero
+    BITMASK = 33,  // i32: top bit of each lane
+    SWIZZLE = 34,  // i8x16 swizzle (out-of-range index: 0)
+    DOT_I16 = 35,  // i32x4 dot product of i16x8 lanes
+    UMUL_OV = 36,  // i1: the unsigned product of the two operands overflows
+    SMUL_OV = 37,  // i1: the signed product overflows (64-bit operands)
+    // the stack pointer, after this function's frame (wasm); with one operand
+    // (a constant), the stack check's (codegen.ax: check_stack), whose value is
+    // only compared with the limit, which a sibling call may follow
+    GET_SP = 38,
+    CPUID = 39,   // x86-64 cpuid (leaf, subleaf) -> <4 x i32> eax, ebx, ecx, edx
+    XGETBV = 40,  // x86-64 xgetbv (register) -> i64
+    // The processor instructions of spec §13.5, in the order of their builtins
+    // (ast.BI_X86_AESENC ...): operands as the builtin's, immediates as constants.
+    AESENC = 41,
+    AESENCLAST = 42,
+    AESDEC = 43,
+    AESDECLAST = 44,
+    AESIMC = 45,
+    AESKEYGEN = 46,
+    CLMUL = 47,
+    SHA1RNDS4 = 48,
+    SHA1NEXTE = 49,
+    SHA1MSG1 = 50,
+    SHA1MSG2 = 51,
+    SHA256RNDS2 = 52,
+    SHA256MSG1 = 53,
+    SHA256MSG2 = 54,
+    CRC32C = 55,
+    AESE = 56,
+    AESD = 57,
+    AESMC = 58,
+    AESIMC_A = 59,
+    PMULL = 60,
+    PMULL2 = 61,
+    SHA1C = 62,
+    SHA1P = 63,
+    SHA1M = 64,
+    SHA1H = 65,
+    SHA1SU0 = 66,
+    SHA1SU1 = 67,
+    SHA256H = 68,
+    SHA256H2 = 69,
+    SHA256SU0 = 70,
+    SHA256SU1 = 71,
+    SHA512H = 72,
+    SHA512H2 = 73,
+    SHA512SU0 = 74,
+    SHA512SU1 = 75,
+    EOR3 = 76,
+    BCAX = 77,
+    RAX1 = 78,
+    XAR = 79,
+    CRC32 = 80,
+    CRC32C_A = 81,
+    // Vector operations that only x86-64 code generation makes (codegen.ax, where
+    // the function's extensions select them: AVX2 or AVX-512):
+    PERM = 82,           // (table, idx): lane i is table[idx[i]], or 0 when idx[i] (unsigned) is not a lane
+    PERM2 = 83,          // (a, b, idx): the same over the lanes of a, then b
+    LOAD_PARTIAL = 84,   // (ptr, mask i64): the lanes whose mask bit is set loaded, the others 0
+    STORE_PARTIAL = 85,  // (vec, ptr, mask i64): the lanes whose mask bit is set stored
+    SHLV = 86,           // (x, n): lane by lane x << n, 0 where n (unsigned) >= the lane's bits
+    LSHRV = 87,          // x >> n (logical), 0 where n >= bits
+    ASHRV = 88,          // x >> n (arithmetic), the sign where n >= bits
+    // The native frame address (rbp, x29): the function's frame record {the
+    // caller's frame address, the return address}; codegen's axiom.trap.
+    FRAME_ADDR = 89,
+    // The bytes of a 32- or 64-bit integer reversed (bswap, rev): made by
+    // combine.ax for the native targets only.
+    BSWAP = 90,
+    // Cache hints (@prefetch, @prefetch_write) of the line at their one operand,
+    // a pointer; codegen.ax makes them for the native targets only. They read
+    // and write nothing and never trap, but are kept (has_effects) where
+    // they are: optimizations that track memory pass over them.
+    PREFETCH = 91,   // for reading (prefetcht0, prfm pldl1keep)
+    PREFETCHW = 92,  // for writing (prefetchw with prfchw, else prefetcht0; prfm pstl1keep)
+
+    // The sums of each 8 bytes of a <16k x i8> vector, unsigned, as <2k x i64>
+    // (x86-64 psadbw against zero; made by slp.ax for sums of neighbouring bytes).
+    SAD_U8 = 93,
+
+    // The lanes of the low (_LO) or high (_HI) half of an integer vector, each
+    // sign- (S) or zero-extended (U) to twice its width (@widen_low and
+    // @widen_high; codegen.ax makes them for AArch64, whose a64.ax makes sxtl,
+    // uxtl2 ..., or fuses them into the multiplies they feed: smull, smlal2 ...,
+    // and for x86-64 with SSE4.1, whose x64.ax makes pmovsx, pmovzx).
+    SWIDEN_LO = 94,
+    SWIDEN_HI = 95,
+    UWIDEN_LO = 96,
+    UWIDEN_HI = 97,
+    // <n/4 x i32> sums of the products of each four neighbouring lanes of two <n x i8>
+    // vectors, signed (@dot of i8 lanes; codegen.ax makes it for AArch64 only: sdot,
+    // or fused into the add it feeds, a64.ax).
+    DOT_I8 = 98,
+    // <n/4 x i32> sums of the products of each four neighbouring lanes of a <n x u8> vector (the
+    // first operand, unsigned) and a <n x i8> one (@dot of u8 by i8 lanes; codegen.ax makes it for
+    // x86-64 with VNNI only: vpdpbusd into zero).
+    DOT_U8I8 = 99,
+    // Dynamic stack allocation (C's variable-length arrays; only the C front end
+    // makes them). IN_STACK_ALLOC(n: pointer-sized integer) -> ptr: n bytes
+    // (rounded up to 16) below the stack pointer, 16-aligned, the stack probed
+    // page by page as the prologues do; they last until IN_STACK_RESTORE moves
+    // the stack pointer back past them, or the function returns.
+    // IN_STACK_SAVE() -> ptr: the stack pointer, for IN_STACK_RESTORE(p). A
+    // function that has any of them keeps its calls (it is not inlined,
+    // outlined from or turned into a loop: the allocations would outlive the
+    // call); its frame is addressed from the frame pointer.
+    STACK_ALLOC = 100,
+    STACK_SAVE = 101,
+    STACK_RESTORE = 102,
+    // IN_CALL_RESULT(call, k: i32 constant): register k (from 0) of the result
+    // of a call whose result's mark is EXT_REGS. It stays where it is made,
+    // after the call in its block (kept like a hint: it has no effect, but is
+    // not moved), so that copies of the block copy it with its call; the
+    // backends define its value at the call.
+    CALL_RESULT = 103,
+    // The high half of the double-width product of two 64-bit integers, unsigned
+    // (IN_UMULH) or signed (IN_SMULH): made by divconst.ax for the native targets
+    // only (x86-64 mul / imul, AArch64 umulh / smulh).
+    UMULH = 104,
+    SMULH = 105,
+    // The x87 register stack's top at a C call's result and a C function's
+    // return (x86-64 System V returns long double in st(0): only the C front
+    // end makes them, cgen_ld.ax, for --c-long-double=80): IN_X87_LOAD(p) pushes
+    // the 80-bit value at p (fld; just before a return), IN_X87_STORE(p) pops
+    // st(0) into p (fstp; just after a call). No other code uses the x87, so
+    // nothing between them touches its stack; opaque, they are not moved.
+    X87_LOAD = 106,
+    X87_STORE = 107,
+    // An asm statement (the C front end's GNU dialects, native targets): its
+    // first operand the index of its description (asm/inline.ax: a Blob), the
+    // others its operands, as that file says; void, or for `asm goto` an i32
+    // (which of its labels the template jumped to: 0 none, k + 1 label k).
+    // Opaque: as though it read and wrote any memory, never removed or moved
+    // (every asm statement is treated as volatile and as clobbering memory).
+    ASM = 108,
+    // The floating-point environment (C's <fenv.h>: cgen_fp.ax), through the 8
+    // bytes at the pointer operand: x86-64 MXCSR in the first 4 (stmxcsr,
+    // ldmxcsr); AArch64 FPCR in the first 4 and FPSR in the next (mrs, msr);
+    // nothing on WebAssembly.
+    FPENV_GET = 109,  // reads the registers into the memory
+    FPENV_SET = 110,  // sets them from it
+    // The 64-bit quotient of the 128-bit hi:lo by d, unsigned, for hi < d
+    // (IN_UDIV128(hi, lo, d); x86-64's div with rdx:rax): only the C front end
+    // makes it, for x86-64 (cgen_wint.ax, whose code ensures hi < d). It faults
+    // otherwise: opaque, so that nothing moves it to where that is not ensured.
+    UDIV128 = 111,
+    // setjmp and longjmp on WebAssembly with the exception-handling extension
+    // (the C front end makes them, c/cgen_sjlj.ax; only wasm.ax implements
+    // them): a function that has IN_SJLJ_CAUGHT runs its body in a try_table
+    // that catches longjmp's exception (a tag carrying the jmp_buf's address),
+    // and re-enters the body after one that names this activation.
+    // IN_SJLJ_TOKEN() -> ptr: this activation's identity (its frame's address);
+    // IN_SJLJ_CAUGHT() -> i1: whether the body was re-entered after a longjmp
+    // (clearing it), IN_SJLJ_ENV() -> ptr: that longjmp's jmp_buf. Opaque.
+    SJLJ_TOKEN = 112,
+    SJLJ_CAUGHT = 113,
+    SJLJ_ENV = 114,
+    // IN_CMPXCHG_OK(cas) -> i1: whether cas (a cmpxchg with F_WEAK, which may
+    // fail spuriously: C's compare_exchange_weak) stored its new value. Kept
+    // where it is made, right after its cmpxchg (like IN_CALL_RESULT), so that
+    // copies of the block copy it with it; the backend defines its value at the
+    // cmpxchg. Only the C front end makes it, for AArch64 (cgen_atomic.ax); a
+    // backend whose compare-exchange never fails spuriously computes it as the
+    // old value's equality with the expected one.
+    CMPXCHG_OK = 115,
+    // IN_CAS16(p, e, d) -> i1: the atomic compare-exchange of the 16 bytes at p
+    // (aligned to 16) with the 16 bytes at e (expected) and d (desired): if p's
+    // equal e's, d's are stored at p (1), else p's are copied to e (0); its
+    // order in its flags (set_order). e and d are ordinary memory. Only the C
+    // front end makes it, for x86-64 (lock cmpxchg16b, which the processor
+    // must have: cgen_atomic.ax checks) and AArch64 (an exclusive pair, or
+    // LSE's CASP). Opaque: never moved or removed.
+    CAS16 = 116,
+    // IN_OBJSIZE(p, kind, dynamic) -> size_t: C's __builtin_object_size(p, kind)
+    // (dynamic 0) or __builtin_dynamic_object_size(p, kind) (1), kind and dynamic
+    // constants: the bytes from p to the end of the object it points into, when
+    // that object is seen in the IR (opt.objsize: a stack slot, a defined
+    // global, a variable length array, a call of a function with
+    // Func.size_args), else the unknown answer ((size_t)-1 for kinds 0 and 1, 0
+    // for 2 and 3). Only the C front end makes it, where the expression does not
+    // show the object (csema_gbuiltin.ax); the passes fold it where they find the
+    // object, and the last pass over a function (passes.finish_funcs) at every
+    // level folds what is left, so no backend sees it. Pure.
+    OBJSIZE = 117,
+    // C's restrict on pointers other than parameters (6.7.3.1), made only by the
+    // C front end (c/cgen_restrict.ax, whose header gives the soundness
+    // argument) and the inliner, and removed by the last pass over a function
+    // (passes.finish_funcs, at every level: no backend sees them).
+    // IN_RSCOPE(parent?) -> i32: an execution of a block of C that declares
+    // restricted pointer objects begins (a function's body, for its restrict
+    // parameters once inlined): each time it runs is another instance of the
+    // scope. Its operand, if any, is the scope of the block it is in (another
+    // IN_RSCOPE, which dominates it). A hint, kept where it is and never merged
+    // with another, copied with its block (inlining, unrolling: each copy is a
+    // scope of its own); its value means nothing. The same intrinsic of type
+    // ptr, without operands, stands for a structure object that scalar
+    // replacement took apart (sroa.ax), in IN_RESTRICT's s below.
+    // Loads, stores, calls and memory operations executed in such a block (in
+    // an instance of the scope: the front end's and the inliner's, the only
+    // ones that know) carry the innermost IN_RSCOPE as their "tag" (tag_of,
+    // set_tag: a load's, store's or call's operand c, a memcpy's, memmove's or
+    // memset's only xs; nothing else gives those operations one); in a block it
+    // is in an enclosing scope's instance too. An operation without a tag may be anywhere.
+    // IN_RESTRICT(p, s, k) -> ptr: p, the value of a restricted object.
+    // Pure. Either s is an IN_RSCOPE (i32) and k (a constant) numbers the
+    // restricted pointer objects of that scope, and every value of the object
+    // is such an IN_RESTRICT or based on one (stores of other values are
+    // marked: an address based on the object in the IR is based on one of its
+    // IN_RESTRICTs, through ptradds, phis and selects, unless it went through
+    // memory, an integer or a call, which no rule here sees through); or s is
+    // the address of a structure object (ptr) and k the offset in it of the
+    // restrict-qualified member p was read from, for an access through it only,
+    // with a fourth operand: the scope of the block the rule holds in.
+    // Two accesses, one of them a write, are apart (restrict_apart,
+    // restrict_tagged) when:
+    //   - both are tagged in instance s, based on IN_RESTRICTs of s with
+    //     different k (two restricted objects of one block, neither based on
+    //     the other within it, 6.7.3.1p4); for a scope in a cycle too, since
+    //     what passes compare across iterations depends on s's value;
+    //   - both are tagged in instance s, one based on an IN_RESTRICT (s, k), the
+    //     other on a parameter, a global, a stack slot or IN_RESTRICTs of other
+    //     objects not based on (s, k) (an object not based on the restricted
+    //     one: 6.7.3.1p4 again), when s is in no cycle of the function
+    //     (F_RCYCLE clear: then all its tagged operations are of its one
+    //     instance, while a known value from before the scope may meet writes of
+    //     another iteration's instance in a loop);
+    //   - both are tagged in the scope of a member's read IN_RESTRICT(p, s, k,
+    //     scope) (main's: c/cgen_restrict.ax), and their addresses are based on
+    //     such reads with the same structure address s and different k (two
+    //     restrict-qualified members of one structure object), or one is a
+    //     member's read whose structure address s is a stack slot or a global
+    //     and the other is based on s itself.
+    // The same scopes say where C's automatic objects live (6.2.4p6: from entry
+    // into their block until its execution ends): the C front end also begins a
+    // scope for each block that declares automatic objects (and has no label in
+    // it), and numbers the scopes of a function (scope_num, in cv's high half;
+    // copies keep the number, numbers of an inlined function's scopes may equal
+    // the caller's). An alloca of such an object holds its block's number
+    // (life_of; 0: the object may be alive anywhere in the function). The rule:
+    // an object is alive during an operation only if its number is that of the
+    // operation's tag or of a scope around it; for an untagged operation it may
+    // be. Kept true by: the inliner (the copy's outermost scopes in the call's
+    // tag; for an untagged call, every life of the function forgotten), the
+    // passes that drop scopes (opt.loop_restricts: the lives of its objects
+    // forgotten), copies.ax (a slot that takes another's place keeps a life only
+    // if both had it). tailrec.mark_frame_dead uses it before the scopes go.
+    RSCOPE = 118,
+    RESTRICT = 119,
+    // IN_CONSTANT_P(x) -> i32: C's __builtin_constant_p(x) (a GNU dialect) where
+    // the front end does not see a constant (x has no side effects): 1 once the
+    // passes have made x a constant (an integer, floating-point or null
+    // constant: is_known_const), else 0; the last pass over a function
+    // (passes.finish_funcs, at every level) folds what is left, so no backend
+    // sees it. Only the C front end makes it (cgen_gbuiltin.ax). Pure.
+    CONSTANT_P = 120,
+}
+
+pub const IN_NONE: Intrinsic = Intrinsic.NONE;
+pub const IN_CTLZ: Intrinsic = Intrinsic.CTLZ;
+pub const IN_CTTZ: Intrinsic = Intrinsic.CTTZ;
+pub const IN_CTPOP: Intrinsic = Intrinsic.CTPOP;
+pub const IN_ROTL: Intrinsic = Intrinsic.ROTL;
+pub const IN_ROTR: Intrinsic = Intrinsic.ROTR;
+pub const IN_SADD_SAT: Intrinsic = Intrinsic.SADD_SAT;
+pub const IN_UADD_SAT: Intrinsic = Intrinsic.UADD_SAT;
+pub const IN_SSUB_SAT: Intrinsic = Intrinsic.SSUB_SAT;
+pub const IN_USUB_SAT: Intrinsic = Intrinsic.USUB_SAT;
+pub const IN_SMIN: Intrinsic = Intrinsic.SMIN;
+pub const IN_SMAX: Intrinsic = Intrinsic.SMAX;
+pub const IN_UMIN: Intrinsic = Intrinsic.UMIN;
+pub const IN_UMAX: Intrinsic = Intrinsic.UMAX;
+pub const IN_FMIN: Intrinsic = Intrinsic.FMIN;
+pub const IN_FMAX: Intrinsic = Intrinsic.FMAX;
+pub const IN_FABS: Intrinsic = Intrinsic.FABS;
+pub const IN_SQRT: Intrinsic = Intrinsic.SQRT;
+pub const IN_FLOOR: Intrinsic = Intrinsic.FLOOR;
+pub const IN_CEIL: Intrinsic = Intrinsic.CEIL;
+pub const IN_FTRUNC: Intrinsic = Intrinsic.FTRUNC;
+pub const IN_NEAREST: Intrinsic = Intrinsic.NEAREST;
+pub const IN_FMA: Intrinsic = Intrinsic.FMA;
+pub const IN_COPYSIGN: Intrinsic = Intrinsic.COPYSIGN;
+pub const IN_ABS: Intrinsic = Intrinsic.ABS;
+pub const IN_TRAP: Intrinsic = Intrinsic.TRAP;
+pub const IN_MEMSIZE: Intrinsic = Intrinsic.MEMSIZE;
+pub const IN_MEMGROW: Intrinsic = Intrinsic.MEMGROW;
+pub const IN_WAIT32: Intrinsic = Intrinsic.WAIT32;
+pub const IN_NOTIFY: Intrinsic = Intrinsic.NOTIFY;
+pub const IN_SET_SP: Intrinsic = Intrinsic.SET_SP;
+pub const IN_ANYTRUE: Intrinsic = Intrinsic.ANYTRUE;
+pub const IN_ALLTRUE: Intrinsic = Intrinsic.ALLTRUE;
+pub const IN_BITMASK: Intrinsic = Intrinsic.BITMASK;
+pub const IN_SWIZZLE: Intrinsic = Intrinsic.SWIZZLE;
+pub const IN_DOT_I16: Intrinsic = Intrinsic.DOT_I16;
+pub const IN_UMUL_OV: Intrinsic = Intrinsic.UMUL_OV;
+pub const IN_SMUL_OV: Intrinsic = Intrinsic.SMUL_OV;
+pub const IN_GET_SP: Intrinsic = Intrinsic.GET_SP;
+pub const IN_CPUID: Intrinsic = Intrinsic.CPUID;
+pub const IN_XGETBV: Intrinsic = Intrinsic.XGETBV;
+pub const IN_AESENC: Intrinsic = Intrinsic.AESENC;
+pub const IN_AESENCLAST: Intrinsic = Intrinsic.AESENCLAST;
+pub const IN_AESDEC: Intrinsic = Intrinsic.AESDEC;
+pub const IN_AESDECLAST: Intrinsic = Intrinsic.AESDECLAST;
+pub const IN_AESIMC: Intrinsic = Intrinsic.AESIMC;
+pub const IN_AESKEYGEN: Intrinsic = Intrinsic.AESKEYGEN;
+pub const IN_CLMUL: Intrinsic = Intrinsic.CLMUL;
+pub const IN_SHA1RNDS4: Intrinsic = Intrinsic.SHA1RNDS4;
+pub const IN_SHA1NEXTE: Intrinsic = Intrinsic.SHA1NEXTE;
+pub const IN_SHA1MSG1: Intrinsic = Intrinsic.SHA1MSG1;
+pub const IN_SHA1MSG2: Intrinsic = Intrinsic.SHA1MSG2;
+pub const IN_SHA256RNDS2: Intrinsic = Intrinsic.SHA256RNDS2;
+pub const IN_SHA256MSG1: Intrinsic = Intrinsic.SHA256MSG1;
+pub const IN_SHA256MSG2: Intrinsic = Intrinsic.SHA256MSG2;
+pub const IN_CRC32C: Intrinsic = Intrinsic.CRC32C;
+pub const IN_AESE: Intrinsic = Intrinsic.AESE;
+pub const IN_AESD: Intrinsic = Intrinsic.AESD;
+pub const IN_AESMC: Intrinsic = Intrinsic.AESMC;
+pub const IN_AESIMC_A: Intrinsic = Intrinsic.AESIMC_A;
+pub const IN_PMULL: Intrinsic = Intrinsic.PMULL;
+pub const IN_PMULL2: Intrinsic = Intrinsic.PMULL2;
+pub const IN_SHA1C: Intrinsic = Intrinsic.SHA1C;
+pub const IN_SHA1P: Intrinsic = Intrinsic.SHA1P;
+pub const IN_SHA1M: Intrinsic = Intrinsic.SHA1M;
+pub const IN_SHA1H: Intrinsic = Intrinsic.SHA1H;
+pub const IN_SHA1SU0: Intrinsic = Intrinsic.SHA1SU0;
+pub const IN_SHA1SU1: Intrinsic = Intrinsic.SHA1SU1;
+pub const IN_SHA256H: Intrinsic = Intrinsic.SHA256H;
+pub const IN_SHA256H2: Intrinsic = Intrinsic.SHA256H2;
+pub const IN_SHA256SU0: Intrinsic = Intrinsic.SHA256SU0;
+pub const IN_SHA256SU1: Intrinsic = Intrinsic.SHA256SU1;
+pub const IN_SHA512H: Intrinsic = Intrinsic.SHA512H;
+pub const IN_SHA512H2: Intrinsic = Intrinsic.SHA512H2;
+pub const IN_SHA512SU0: Intrinsic = Intrinsic.SHA512SU0;
+pub const IN_SHA512SU1: Intrinsic = Intrinsic.SHA512SU1;
+pub const IN_EOR3: Intrinsic = Intrinsic.EOR3;
+pub const IN_BCAX: Intrinsic = Intrinsic.BCAX;
+pub const IN_RAX1: Intrinsic = Intrinsic.RAX1;
+pub const IN_XAR: Intrinsic = Intrinsic.XAR;
+pub const IN_CRC32: Intrinsic = Intrinsic.CRC32;
+pub const IN_CRC32C_A: Intrinsic = Intrinsic.CRC32C_A;
+pub const IN_PERM: Intrinsic = Intrinsic.PERM;
+pub const IN_PERM2: Intrinsic = Intrinsic.PERM2;
+pub const IN_LOAD_PARTIAL: Intrinsic = Intrinsic.LOAD_PARTIAL;
+pub const IN_STORE_PARTIAL: Intrinsic = Intrinsic.STORE_PARTIAL;
+pub const IN_SHLV: Intrinsic = Intrinsic.SHLV;
+pub const IN_LSHRV: Intrinsic = Intrinsic.LSHRV;
+pub const IN_ASHRV: Intrinsic = Intrinsic.ASHRV;
+pub const IN_FRAME_ADDR: Intrinsic = Intrinsic.FRAME_ADDR;
+pub const IN_BSWAP: Intrinsic = Intrinsic.BSWAP;
+pub const IN_PREFETCH: Intrinsic = Intrinsic.PREFETCH;
+pub const IN_PREFETCHW: Intrinsic = Intrinsic.PREFETCHW;
+pub const IN_SAD_U8: Intrinsic = Intrinsic.SAD_U8;
+pub const IN_SWIDEN_LO: Intrinsic = Intrinsic.SWIDEN_LO;
+pub const IN_SWIDEN_HI: Intrinsic = Intrinsic.SWIDEN_HI;
+pub const IN_UWIDEN_LO: Intrinsic = Intrinsic.UWIDEN_LO;
+pub const IN_UWIDEN_HI: Intrinsic = Intrinsic.UWIDEN_HI;
+pub const IN_DOT_I8: Intrinsic = Intrinsic.DOT_I8;
+pub const IN_DOT_U8I8: Intrinsic = Intrinsic.DOT_U8I8;
+pub const IN_STACK_ALLOC: Intrinsic = Intrinsic.STACK_ALLOC;
+pub const IN_STACK_SAVE: Intrinsic = Intrinsic.STACK_SAVE;
+pub const IN_STACK_RESTORE: Intrinsic = Intrinsic.STACK_RESTORE;
+pub const IN_CALL_RESULT: Intrinsic = Intrinsic.CALL_RESULT;
+pub const IN_UMULH: Intrinsic = Intrinsic.UMULH;
+pub const IN_SMULH: Intrinsic = Intrinsic.SMULH;
+pub const IN_X87_LOAD: Intrinsic = Intrinsic.X87_LOAD;
+pub const IN_X87_STORE: Intrinsic = Intrinsic.X87_STORE;
+pub const IN_ASM: Intrinsic = Intrinsic.ASM;
+pub const IN_FPENV_GET: Intrinsic = Intrinsic.FPENV_GET;
+pub const IN_FPENV_SET: Intrinsic = Intrinsic.FPENV_SET;
+pub const IN_UDIV128: Intrinsic = Intrinsic.UDIV128;
+pub const IN_SJLJ_TOKEN: Intrinsic = Intrinsic.SJLJ_TOKEN;
+pub const IN_SJLJ_CAUGHT: Intrinsic = Intrinsic.SJLJ_CAUGHT;
+pub const IN_SJLJ_ENV: Intrinsic = Intrinsic.SJLJ_ENV;
+pub const IN_CMPXCHG_OK: Intrinsic = Intrinsic.CMPXCHG_OK;
+pub const IN_CAS16: Intrinsic = Intrinsic.CAS16;
+pub const IN_OBJSIZE: Intrinsic = Intrinsic.OBJSIZE;
+pub const IN_RSCOPE: Intrinsic = Intrinsic.RSCOPE;
+pub const IN_RESTRICT: Intrinsic = Intrinsic.RESTRICT;
+pub const IN_CONSTANT_P: Intrinsic = Intrinsic.CONSTANT_P;
+
+// Is id one of lo .. hi (in their order here)?
+pub fn intr_between(id: Intrinsic, lo: Intrinsic, hi: Intrinsic) bool {
+    let k = @int_from_enum(id);
+    return (k >= @int_from_enum(lo)) and (k <= @int_from_enum(hi));
+}
+
+// The low (_LO) and high (_HI) halves' widening of the same kind as id.
+pub fn widen_low(id: Intrinsic) Intrinsic {
+    match id {
+        .SWIDEN_HI => { return IN_SWIDEN_LO; }
+        .UWIDEN_HI => { return IN_UWIDEN_LO; }
+        else       => { return id; }
+    }
+}
+
+pub fn widen_high(id: Intrinsic) Intrinsic {
+    match id {
+        .SWIDEN_LO => { return IN_SWIDEN_HI; }
+        .UWIDEN_LO => { return IN_UWIDEN_HI; }
+        else       => { return id; }
+    }
+}
+
+pub fn is_widen(id: Intrinsic) bool {
+    return intr_between(id, IN_SWIDEN_LO, IN_UWIDEN_HI);
+}
+
+pub fn is_dyn_stack(id: Intrinsic) bool {
+    return intr_between(id, IN_STACK_ALLOC, IN_STACK_RESTORE);
+}
+
+/// Does f allocate on the stack dynamically, or move the stack pointer
+/// (IN_STACK_ALLOC, IN_STACK_SAVE, IN_STACK_RESTORE)?
+pub fn uses_dyn_stack(f: *Func) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == OP_INTR) and is_dyn_stack(intr_id(i)) {
+                return true;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+pub fn is_prefetch(id: Intrinsic) bool {
+    return (id == IN_PREFETCH) or (id == IN_PREFETCHW);
+}
+
+// The intrinsic (IN_*) an instruction calls; 0 when it is not OP_INTR.
+pub fn intr_id(v: *Value) Intrinsic {
+    if v.op != OP_INTR {
+        return IN_NONE;
+    }
+    return @enum_from_int(Intrinsic, @truncate(i32, @bit_cast(i64, v.cv)));
+}
+
+// An intrinsic call's cv for id (in its low 32 bits).
+pub fn intr_cv(id: Intrinsic) u64 {
+    return @as(u64, @bit_cast(u32, @int_from_enum(id)));
+}

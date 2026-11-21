@@ -1,0 +1,707 @@
+// =============================================================================
+// sema_stmt.ax - statements, blocks, assignments, let, return, loops,
+// jumps and defer, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------------
+fn check_block(b: *mut ast.Stmt) bool {
+    let fc = C;
+    let entry_dead = fc.flow_dead;
+    scope_push();
+    let mut div = false;
+    let mut warned = false;
+    for i in 0..b.stmts.len {
+        let s = b.stmts.get(i);
+        if div and not warned {
+            _ = dg.warning(s.span, "W0601", "unreachable statement");
+            warned = true;
+        }
+        if check_stmt(s) {
+            div = true;
+            C.flow_dead = true;
+        }
+    }
+    scope_pop();
+    C.flow_dead = entry_dead or div;
+    b.diverges = div;
+    return div;
+}
+
+fn is_leaving_catch(e: *mut ast.Expr) bool {
+    if u.isnil(e) or ((e.kind != ast.E_CATCH) and (e.kind != ast.E_ORELSE)) {
+        return false;
+    }
+    match ast.more(e).handler {
+        .Return   => { return true; }
+        .Break    => { return true; }
+        .Continue => { return true; }
+        else      => { return false; }
+    }
+}
+
+fn conv_probe(t: *mut ast.Type, sp: u.Span) *mut ast.Expr {
+    let p = ast.new_expr(ast.E_CONV, sp);
+    p.ty = t;
+    p.cat = ast.CAT_VALUE;
+    return p;
+}
+
+fn check_assign(s: *mut ast.Stmt) void {
+    let lhs = s.e;
+    let direct_ident = (s.op == lx.TK_EQ) and (lhs.kind == ast.E_IDENT);
+    let prev_skip = C.skip_moved_check;
+    if direct_ident {
+        C.skip_moved_check = true;
+    }
+    let lt = check_expr(lhs, tnil());
+    C.skip_moved_check = prev_skip;
+    if lt.kind == ast.TY_INVALID {
+        _ = check_expr(s.e2, tnil());
+        return;
+    }
+    if not is_place(lhs) {
+        _ = dg.err(lhs.span, "E0706",
+                   "the left-hand side of an assignment must be a variable, field, element or dereference");
+        _ = check_expr(s.e2, tnil());
+        return;
+    }
+    if not is_mut_place(lhs) {
+        let d = dg.err(lhs.span, "E0701", "cannot assign: this place is not mutable");
+        let mut r = lhs;
+        while ((r.kind == ast.E_FIELD) and (ast.self_mode_of(r) != ast.SELF_DEREF)) or
+              ((r.kind == ast.E_INDEX) and (ast.index_kind_of(r) == ast.IDX_ARRAY)) {
+            r = r.a;
+        }
+        if (r.kind == ast.E_IDENT) and u.notnil(ast.local_of(r)) {
+            if ast.local_of(r).is_param {
+                dg.note(d, ast.local_of(r).span, u.f1("parameters are immutable; copy '%s' into a 'let mut' first",
+                                                      ast.local_of(r).name));
+            } else {
+                dg.note(d, ast.local_of(r).span, u.f1("'%s' is declared without 'mut'", ast.local_of(r).name));
+                let fx = dg.fix(d, "declare the variable as mutable", "machine");
+                dg.edit(fx, sp_at(ast.local_of(r).span), "mut ");
+            }
+        }
+    }
+    if s.op == lx.TK_EQ {
+        _ = check_expr_to(&mut s.e2, lt);
+        check_no_copy(s.e2);
+        if direct_ident and (lhs.kind == ast.E_IDENT) and u.notnil(ast.local_of(lhs)) and not C.flow_dead {
+            ast.local_of(lhs).moved = false;
+        }
+        if (lhs.kind == ast.E_IDENT) and u.notnil(ast.local_of(lhs)) {
+            let lhs_l = ast.local_of(lhs);
+            lhs_l.origin_local = expr_local_origin_mask(s.e2, &mut lhs_l.origin_fields);
+        } else if (lhs.kind == ast.E_FIELD) and (ast.field_kind_of(lhs) == ast.FK_STRUCT) and
+                  (ast.self_mode_of(lhs) != ast.SELF_DEREF) and (lhs.a.kind == ast.E_IDENT) and
+                  u.notnil(ast.local_of(lhs.a)) {
+            let src = expr_local_origin(s.e2);
+            let l = ast.local_of(lhs.a);
+            let idx = ast.index_of(lhs);
+            if (idx >= 0) and (idx < 64) {
+                let bit = @as(u64, 1) << @int_cast(u32, idx);
+                if u.notnil(src) {
+                    l.origin_fields = l.origin_fields | bit;
+                    if u.isnil(l.origin_local) {
+                        l.origin_local = src;
+                    }
+                } else {
+                    l.origin_fields = l.origin_fields & ~bit;
+                    if l.origin_fields == 0 {
+                        l.origin_local = u.nil.[ast.Local]();
+                    }
+                }
+            } else if u.notnil(src) {
+                l.origin_fields = ~@as(u64, 0);
+                if u.isnil(l.origin_local) {
+                    l.origin_local = src;
+                }
+            }
+        } else {
+            let src = expr_local_origin(s.e2);
+            let dst_local = place_local(lhs);
+            if u.notnil(dst_local) {
+                if u.notnil(src) {
+                    dst_local.origin_local = src;
+                    dst_local.origin_fields = ~@as(u64, 0);
+                }
+            } else {
+                let po = place_origin(lhs);
+                if u.notnil(po) {
+                    if u.notnil(src) {
+                        po.origin_local = src;
+                        po.origin_fields = ~@as(u64, 0);
+                    }
+                } else if u.notnil(src) {
+                    _ = dg.err(s.e2.span, "E0710",
+                               u.f1("this points into local '%s', which cannot be stored in a global or caller-reachable place",
+                                    src.name));
+                }
+            }
+        }
+        return;
+    }
+    // compound assignment: lhs op= rhs, with the semantics of lhs op rhs
+    let so = s.op;
+    let mut op = lx.TK_SHR;
+    match so {
+        .PLUS_EQ      => { op = lx.TK_PLUS; }
+        .MINUS_EQ     => { op = lx.TK_MINUS; }
+        .STAR_EQ      => { op = lx.TK_STAR; }
+        .SLASH_EQ     => { op = lx.TK_SLASH; }
+        .PERCENT_EQ   => { op = lx.TK_PERCENT; }
+        .PLUS_PCT_EQ  => { op = lx.TK_PLUS_PCT; }
+        .MINUS_PCT_EQ => { op = lx.TK_MINUS_PCT; }
+        .STAR_PCT_EQ  => { op = lx.TK_STAR_PCT; }
+        .AMP_EQ       => { op = lx.TK_AMP; }
+        .PIPE_EQ      => { op = lx.TK_PIPE; }
+        .CARET_EQ     => { op = lx.TK_CARET; }
+        .SHL_EQ       => { op = lx.TK_SHL; }
+        else => {}
+    }
+    let e3 = ast.new_expr(ast.E_BINARY, s.span);  // synthetic binary expr describing the operation (for codegen)
+    ast.stmt_ext(s).e3 = e3;
+    ast.set_op(e3, op);
+    e3.a = lhs;
+    ast.set_b(e3, s.e2);
+    e3.ty = lt;
+    e3.cat = ast.CAT_VALUE;
+    if (op == lx.TK_SHL) or (op == lx.TK_SHR) {
+        let r = check_expr(s.e2, tnil());
+        if r.kind == ast.TY_UNTYPED_INT {
+            coerce(&mut s.e2, ty.t_u32);
+        } else if (ty.is_vec_int(r) and not r.elem.is_signed) or
+                  (is_vec_param(r) and lane_is_unsigned_int(r.constraint_lane)) {
+            // per lane (spec §13.1)
+            let shape_ok = (ty.is_vec_int(lt) and ty.is_vec_int(r) and (lt.lanes == r.lanes) and
+                            (lt.elem.bits == r.elem.bits)) or (is_vec_param(lt) and (lt == r));
+            if (lt.kind != ast.TY_INVALID) and not shape_ok {
+                _ = dg.err(s.e2.span, "E0412",
+                           u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(lt),
+                                tstr(r)));
+            }
+        } else if not ((r.kind == ast.TY_INT) and not r.is_signed) and (r.kind != ast.TY_INVALID) and
+                  not ((r.kind == ast.TY_PARAM) and ty.satisfies(r, ast.C_UNSIGNED)) {
+            _ = dg.err(s.e2.span, "E0525", u.f1("shift count must be an unsigned integer, found %s", tstr(r)));
+        }
+        if (lt.kind != ast.TY_INT) and not ty.is_vec_int(lt) and
+           not ((lt.kind == ast.TY_PARAM) and ty.satisfies(lt, ast.C_INT)) and not is_int_vec_param(lt) {
+            if lt.kind == ast.TY_PARAM {
+                _ = dg.err(s.span, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)",
+                                                 lx.tok_kind_name(op), lt.name,
+                                                 constraint_str(lt.constraint, lt.constraint_lane)));
+            } else {
+                _ = dg.err(s.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(lt)));
+            }
+        }
+        ast.set_b(ast.stmt_ext(s).e3, s.e2);
+        return;
+    }
+    _ = check_expr_to(&mut s.e2, lt);
+    ast.set_b(ast.stmt_ext(s).e3, s.e2);
+    // reuse the binary-operator validation by type-checking a probe
+    let probe = ast.copy_expr(ast.stmt_more(s).e3);
+    probe.a = conv_probe(lt, lhs.span);
+    ast.set_b(probe, conv_probe(lt, s.e2.span));
+    probe.ty = tnil();
+    _ = check_expr(probe, tnil());
+}
+
+fn check_stmt(s: *mut ast.Stmt) bool {
+    let mut div = false;
+    match s.kind {
+        .LET    => { div = check_let(s); }
+        .EXPR   => { div = check_expr_stmt(s); }
+        .ASSIGN => { check_assign(s); }
+        .DISCARD => {
+            let t = check_expr(s.e, tnil());
+            if ty.is_untyped(t) {
+                _ = finalize_untyped(&mut s.e);
+            } else if t.kind == ast.TY_VOID {
+                _ = dg.err(s.e.span, "E0622", "nothing to discard: the expression has type void");
+            } else if t.kind == ast.TY_ERRUNION {
+                _ = dg.err(s.e.span, "E0621", "an error union cannot be discarded; handle it with '!' or 'catch'");
+            } else {
+                check_no_copy(s.e);
+            }
+        }
+        .IF => {
+            _ = check_expr_to(&mut s.e, ty.t_bool);
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
+            let a = check_block(s.body);
+            let then_dead = pre_dead or a;
+            let then_snap = save_moves(nloc);
+            let mut b = false;
+            if u.notnil(s.els) {
+                restore_moves(pre);
+                C.flow_dead = pre_dead;
+                if s.els.kind == ast.S_IF {
+                    b = check_stmt(s.els);
+                } else {
+                    b = check_block(s.els);
+                }
+                let else_dead = pre_dead or b;
+                let else_snap = save_moves(nloc);
+                if then_dead and else_dead {
+                    C.flow_dead = true;
+                } else if then_dead {
+                    restore_moves(else_snap);
+                    C.flow_dead = pre_dead;
+                } else if else_dead {
+                    restore_moves(then_snap);
+                    C.flow_dead = pre_dead;
+                } else {
+                    merge_moves_or(then_snap, else_snap);
+                    C.flow_dead = pre_dead;
+                }
+            } else {
+                if then_dead {
+                    restore_moves(pre);
+                    C.flow_dead = pre_dead;
+                } else {
+                    merge_moves_or(pre, then_snap);
+                    C.flow_dead = pre_dead;
+                }
+            }
+            div = u.notnil(s.els) and a and b;
+        }
+        .WHILE => {
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
+            _ = check_expr_to(&mut s.e, ty.t_bool);
+            let exit_snap = save_moves(nloc);
+            enter_loop(s, nloc, pre, pre_dead);
+            let body_dead = check_block(s.body);
+            _ = leave_loop(exit_snap, true, body_dead);
+        }
+        .LOOP => {
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
+            enter_loop(s, nloc, pre, pre_dead);
+            let body_dead = check_block(s.body);
+            div = not leave_loop(pre, false, body_dead);
+        }
+        .FOR   => { check_for(s); }
+        .MATCH => { div = check_match(s); }
+        .RETURN => {
+            if u.notnil(s.e) {
+                check_return_value(&mut s.e, s.span);
+            } else {
+                check_return_value(u.nil.[*mut ast.Expr](), s.span);
+            }
+            div = true;
+        }
+        .BREAK => {
+            check_jump(s);
+            div = true;
+        }
+        .CONTINUE => {
+            check_jump(s);
+            div = true;
+        }
+        .DEFER => { check_defer(s); }
+        .BLOCK => { div = check_block(s); }
+    }
+    s.diverges = div;
+    return div;
+}
+
+// let x = e; true if e never returns.
+fn check_let(s: *mut ast.Stmt) bool {
+    if s.undef {
+        check_let_undefined(s);
+        return false;
+    }
+    let mut t = tnil();
+    if u.notnil(s.te) {
+        t = resolve_type(s.te, &mut C.tc);
+        if t.kind == ast.TY_VOID {
+            _ = dg.err(s.te.span, "E0409", "a variable cannot have type void");
+            t = ty.t_invalid;
+        }
+        _ = check_expr_to(&mut s.e, t);
+    } else {
+        t = check_expr(s.e, tnil());
+        if ty.is_untyped(t) {
+            let d = dg.err(s.e.span, "E0502",
+                           u.f1("cannot infer the type of '%s' from a literal; add a type annotation", s.name));
+            let fx = dg.fix(d, "annotate the type", "placeholder");
+            dg.edit(fx, u.mkspan(s.name_span.file, s.name_span.end, s.name_span.end), ": <type>");
+            t = ty.t_invalid;
+        } else if t.kind == ast.TY_VOID {
+            _ = dg.err(s.e.span, "E0409", "cannot bind a value of type void");
+            t = ty.t_invalid;
+        } else if t.kind == ast.TY_NEVER {
+            t = ty.t_invalid;
+        }
+    }
+    check_no_copy(s.e);
+    s.local = declare_local(s.name, s.name_span, t, s.is_mut, false);
+    s.local.weakened = s.e.weakened;
+    s.local.origin_local = expr_local_origin_mask(s.e, &mut s.local.origin_fields);
+    return u.notnil(s.e.ty) and (s.e.ty.kind == ast.TY_NEVER);
+}
+
+// let x: T = undefined;
+fn check_let_undefined(s: *mut ast.Stmt) void {
+    // `= undefined`: the type must be written, and the variable writable
+    let mut t = ty.t_invalid;
+    if u.notnil(s.te) {
+        t = resolve_type(s.te, &mut C.tc);
+        if t.kind == ast.TY_VOID {
+            _ = dg.err(s.te.span, "E0409", "a variable cannot have type void");
+            t = ty.t_invalid;
+        }
+    } else {
+        let d = dg.err(s.e.span, "E0414", u.f1("'undefined' gives '%s' no type; add a type annotation", s.name));
+        let fx = dg.fix(d, "annotate the type", "placeholder");
+        dg.edit(fx, u.mkspan(s.name_span.file, s.name_span.end, s.name_span.end), ": <type>");
+    }
+    if not s.is_mut {
+        let d = dg.err(s.e.span, "E0413",
+                       u.f1("'%s' is left undefined but immutable, so it could never be written; use 'let mut'",
+                            s.name));
+        let fx = dg.fix(d, "make it mutable", "machine");
+        dg.edit(fx, u.mkspan(s.name_span.file, s.name_span.start, s.name_span.start), "mut ");
+    }
+    s.e.ty = t;
+    s.local = declare_local(s.name, s.name_span, t, s.is_mut, false);
+}
+
+// An expression statement; true if it never returns.
+fn check_expr_stmt(s: *mut ast.Stmt) bool {
+    let t = check_expr(s.e, tnil());
+    if t.kind == ast.TY_NEVER {
+        return true;
+    }
+    if ty.is_untyped(t) or ((t.kind != ast.TY_VOID) and (t.kind != ast.TY_INVALID)) {
+        if t.kind == ast.TY_ERRUNION {
+            let d = dg.err(s.e.span, "E0620", u.f1("error union result of type %s must be handled", tstr(t)));
+            let fx = dg.fix(d, "propagate the error", "suggestion");
+            dg.edit(fx, u.mkspan(s.e.span.file, s.e.span.end, s.e.span.end), "!");
+        } else {
+            let d = dg.err(s.e.span, "E0620", u.f1("result of type %s is discarded; write '_ = ...' to discard it",
+                                                   tstr(t)));
+            let fx = dg.fix(d, "discard explicitly", "machine");
+            dg.edit(fx, sp_at(s.e.span), "_ = ");
+        }
+    }
+    return false;
+}
+
+// for x in a..b / for x in xs / for &x in xs / for &mut x in xs
+fn check_for(s: *mut ast.Stmt) void {
+    let ref_iter = ast.stmt_more(s).ref_iter;
+    let ref_mut = ast.stmt_more(s).ref_mut;
+    let mut vt = tnil();
+    if u.notnil(s.e2) {
+        if ref_iter {
+            _ = dg.err(s.span, "E0706", "by-reference 'for &' cannot iterate over a range");
+            _ = check_expr(s.e, tnil());
+            _ = check_expr(s.e2, tnil());
+            vt = ty.t_invalid;
+        } else {
+            let mut a = check_expr(s.e, tnil());
+            let mut bh = a;
+            if ty.is_untyped(a) {
+                bh = tnil();
+            }
+            let mut b = check_expr(s.e2, bh);
+            if ty.is_untyped(a) and not ty.is_untyped(b) {
+                coerce(&mut s.e, b);
+                a = b;
+            } else if not ty.is_untyped(a) and ty.is_untyped(b) {
+                coerce(&mut s.e2, a);
+                b = a;
+            } else if ty.is_untyped(a) and ty.is_untyped(b) {
+                _ = dg.err(s.e.span, "E0502",
+                           "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
+                a = ty.t_invalid;
+                b = ty.t_invalid;
+            }
+            if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
+                let d = dg.err(s.e2.span, "E0412", u.f2("range bounds have different types: %s and %s", tstr(a),
+                                                        tstr(b)));
+                dg.set_types(d, tstr(a), tstr(b));
+            }
+            if (a.kind != ast.TY_INT) and (a.kind != ast.TY_INVALID) and
+               not ((a.kind == ast.TY_PARAM) and ty.satisfies(a, ast.C_INT)) {
+                _ = dg.err(s.e.span, "E0412", u.f1("range bounds must be integers, found %s", tstr(a)));
+            }
+            vt = a;
+        }
+    } else {
+        let t = check_expr(s.e, tnil());
+        if t.kind == ast.TY_ARRAY {
+            if ref_iter {
+                if ref_mut {
+                    if not is_place(s.e) {
+                        _ = dg.err(s.e.span, "E0703", "'&mut' cannot take the address of a temporary");
+                    } else if not is_mut_place(s.e) {
+                        _ = dg.err(s.e.span, "E0701", "cannot take '*mut' elements from an immutable array");
+                    }
+                }
+                if is_place(s.e) {
+                    mark_addr_taken(s.e);
+                }
+                vt = ty.type_ptr(t.elem, ref_mut);
+            } else {
+                vt = t.elem;
+            }
+        } else if t.kind == ast.TY_SLICE {
+            if ref_iter {
+                if ref_mut and not t.is_mut {
+                    _ = dg.err(s.e.span, "E0701", u.f1("cannot take '*mut' elements from immutable slice %s", tstr(t)));
+                }
+                vt = ty.type_ptr(t.elem, ref_mut);
+            } else {
+                vt = t.elem;
+            }
+        } else {
+            if t.kind != ast.TY_INVALID {
+                _ = dg.err(s.e.span, "E0412",
+                           u.f1("'for x in' needs an array or slice, found %s (use lo..hi for ranges)", tstr(t)));
+            }
+            vt = ty.t_invalid;
+        }
+        if not ref_iter and ((t.kind == ast.TY_ARRAY) or (t.kind == ast.TY_SLICE)) and u.notnil(vt) and
+           type_is_nocopy(vt) {
+            let d = dg.err(s.name_span, "E0708", u.f1("cannot copy nocopy element of type %s in value loop", tstr(vt)));
+            let can_mut = ((t.kind == ast.TY_SLICE) and t.is_mut and not s.e.weakened) or
+                          ((t.kind == ast.TY_ARRAY) and is_place(s.e) and is_mut_place(s.e));
+            if can_mut {
+                let fm = dg.fix(d, "iterate by mutable pointer", "machine");
+                dg.edit(fm, s.name_span, u.cat2("&mut ", s.name));
+            }
+            let fr = dg.fix(d, "iterate by pointer", "machine");
+            dg.edit(fr, s.name_span, u.cat2("&", s.name));
+        }
+    }
+    let nloc = C.locals.len;
+    let pre = save_moves(nloc);
+    let pre_dead = C.flow_dead;
+    scope_push();
+    s.local = declare_local(s.name, s.name_span, vt, false, false);
+    if u.isnil(s.e2) and u.notnil(s.e.ty) {
+        if ref_iter {
+            if s.e.ty.kind == ast.TY_ARRAY {
+                s.local.origin_local = place_origin(s.e);
+            } else if s.e.ty.kind == ast.TY_SLICE {
+                s.local.origin_local = expr_local_origin(s.e);
+            }
+        } else if type_can_hold_ptr(vt) {
+            s.local.origin_local = expr_local_origin(s.e);
+        }
+        if u.notnil(s.local.origin_local) {
+            s.local.origin_fields = ~@as(u64, 0);
+        }
+    }
+    enter_loop(s, nloc, pre, pre_dead);
+    let body_dead = check_block(s.body);
+    _ = leave_loop(pre, true, body_dead);
+    scope_pop();
+}
+
+fn enter_loop(s: *mut ast.Stmt, nloc: usize, pre: MoveSnap, pre_dead: bool) void {
+    C.loop_depth += 1;
+    C.loop_breaks.push(false);
+    C.loop_labels.push(ast.stmt_more(s).label);
+    let brk = MoveSnap.{
+        moved: u.newn.[bool](nloc),
+        spans: u.newn.[u.Span](nloc),
+        origins: u.newn.[*mut ast.Local](nloc),
+        origin_fields: u.newn.[u64](nloc),
+        n: nloc,
+    };
+    C.loop_moves.push(LoopMove.{
+        base: nloc,
+        pre: pre,
+        brk: brk,
+        reported: u.newn.[u.Span](nloc),
+        pre_dead: pre_dead,
+        has_break: false,
+    });
+}
+
+// Whether a break targeted the loop.
+fn leave_loop(exit_snap: MoveSnap, has_cond: bool, body_dead: bool) bool {
+    let lm = C.loop_moves.at_mut(C.loop_moves.len - 1);
+    if not body_dead and not lm.pre_dead {
+        check_loop_backedge(lm, u.mkspan(0, 0, 0), false);
+    }
+    if not has_cond {
+        if lm.has_break {
+            restore_moves(lm.brk);
+            C.flow_dead = lm.pre_dead;
+        } else {
+            restore_moves(lm.pre);
+            C.flow_dead = true;
+        }
+    } else {
+        let mut acc = MoveSnap.{
+            moved: u.newn.[bool](lm.base),
+            spans: u.newn.[u.Span](lm.base),
+            origins: u.newn.[*mut ast.Local](lm.base),
+            origin_fields: u.newn.[u64](lm.base),
+            n: lm.base,
+        };
+        or_snap_into(&mut acc, exit_snap);
+        if lm.has_break {
+            or_snap_into(&mut acc, lm.brk);
+        }
+        if not body_dead and not lm.pre_dead {
+            or_moves_into(&mut acc, lm.base);
+        }
+        restore_moves(acc);
+        C.flow_dead = lm.pre_dead;
+    }
+    _ = C.loop_moves.pop();
+    C.loop_labels.len -= 1;
+    C.loop_depth -= 1;
+    return C.loop_breaks.pop();
+}
+
+// A break or continue (statement or catch handler) at `sp`, naming the
+// loop `label` (or none): the number of loops it leaves beyond the
+// innermost, or -1 after an error.
+fn check_jump_target(label: []u8, sp: u.Span, is_break: bool) i32 {
+    if C.loop_depth == 0 {
+        _ = dg.err(sp, "E0604", u.f1("'%s' outside of a loop", u.pick(is_break, "break", "continue")));
+        return -1;
+    }
+    let mut d: i32 = 0;
+    if label.len > 0 {
+        let n = C.loop_labels.len;
+        let mut i = n;
+        while (i > 0) and not u.str_eq(C.loop_labels.get(i - 1), label) {
+            i -= 1;
+        }
+        if i == 0 {
+            _ = dg.err(sp, "E0605", u.f1("no enclosing loop is labeled '%s'", label));
+            return -1;
+        }
+        d = @int_cast(i32, n - i);
+    }
+    if (C.defer_depth > 0) and ((C.loop_depth - d) <= C.defer_loop_base) {
+        _ = dg.err(sp, "E0640", "control flow cannot leave a deferred statement");
+        return -1;
+    }
+    let idx = C.loop_moves.len - 1 - @int_cast(usize, d);
+    if is_break {
+        C.loop_breaks.set(idx, true);
+        if not C.flow_dead {
+            let lm = C.loop_moves.at_mut(idx);
+            or_moves_into(&mut lm.brk, lm.base);
+            lm.has_break = true;
+        }
+    } else if not C.flow_dead {
+        check_loop_backedge(C.loop_moves.at_mut(idx), sp, true);
+    }
+    return d;
+}
+
+// break / continue
+fn check_jump(s: *mut ast.Stmt) void {
+    let mut sp = s.span;
+    if ast.stmt_more(s).label.len > 0 {
+        sp = ast.stmt_more(s).label_span;
+    }
+    s.jump_depth = @max(check_jump_target(ast.stmt_more(s).label, sp, s.kind == ast.S_BREAK), 0);
+}
+
+fn check_defer(s: *mut ast.Stmt) void {
+    if ast.stmt_more(s).on_error and (u.isnil(C.ret) or (C.ret.kind != ast.TY_ERRUNION)) {
+        _ = dg.err(s.span, "E0641", "errdefer needs a function that returns an error union (!T)");
+    }
+    let nloc = C.locals.len;
+    let pre = save_moves(nloc);
+    let saved_base = C.defer_loop_base;
+    let saved_dead = C.flow_dead;
+    C.defer_depth += 1;
+    C.defer_loop_base = C.loop_depth;
+    if s.body.kind == ast.S_BLOCK {
+        _ = check_block(s.body);
+    } else {
+        _ = check_stmt(s.body);
+        if (s.body.kind == ast.S_EXPR) and is_leaving_catch(s.body.e) {
+            _ = dg.err(s.body.span, "E0640", "control flow cannot leave a deferred statement");
+        }
+    }
+    restore_moves(pre);
+    C.flow_dead = saved_dead;
+    C.defer_depth -= 1;
+    C.defer_loop_base = saved_base;
+}
+
+fn check_leave_ok(sp: u.Span, is_loop_exit: bool) bool {
+    if (C.defer_depth > 0) and (not is_loop_exit or (C.loop_depth <= C.defer_loop_base)) {
+        _ = dg.err(sp, "E0640", "control flow cannot leave a deferred statement");
+        return false;
+    }
+    return true;
+}
+
+fn check_return_value(pe: *mut *mut ast.Expr, sp: u.Span) void {
+    if u.isnil(C.fnd) {
+        _ = dg.err(sp, "E0602", "'return' outside of a function");
+        return;
+    }
+    _ = check_leave_ok(sp, false);
+    let r = C.ret;
+    if u.isnil(pe) or u.isnil(pe.*) {
+        if (r.kind != ast.TY_VOID) and not ((r.kind == ast.TY_ERRUNION) and (r.elem.kind == ast.TY_VOID)) and
+           (r.kind != ast.TY_INVALID) {
+            _ = dg.err(sp, "E0602", u.f1("this function must return a value of type %s", tstr(r)));
+        }
+        return;
+    }
+    if r.kind == ast.TY_VOID {
+        _ = check_expr(pe.*, tnil());
+        _ = dg.err(pe.*.span, "E0603", "a void function cannot return a value");
+        return;
+    }
+    _ = check_expr(pe.*, r);
+    if (r.kind == ast.TY_ERRUNION) and not C.ret_err_open {
+        let e = pe.*;
+        let s = e.ty;
+        let ue = unwrap_conv(e);
+        if u.notnil(ue) and (ue.kind == ast.E_ERROR_VAL) {
+            if not ast.cval_of(ue).is_zero() {
+                record_ret_err(ue.name);
+            }
+        } else if s.kind == ast.TY_ERROR {
+            if u.notnil(s.decl) {
+                record_ret_set(s.decl);
+            } else {
+                C.ret_err_open = true;
+            }
+        } else if (s.kind == ast.TY_PARAM) and s.is_error_param {
+            C.ret_err_open = true;
+        } else if s.kind == ast.TY_ERRUNION {
+            if u.notnil(s.err_param) {
+                C.ret_err_open = true;
+            } else if u.notnil(s.decl) {
+                record_ret_set(s.decl);
+            } else if not is_self_infer_call(e) {
+                C.ret_err_open = true;
+            }
+        }
+    }
+    let prev_ret = C.in_return;
+    C.in_return = true;
+    coerce(pe, r);
+    C.in_return = prev_ret;
+    move_or_check_nocopy(pe.*);
+    check_escape(pe.*);
+}

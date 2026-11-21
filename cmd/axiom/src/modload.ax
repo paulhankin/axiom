@@ -26,6 +26,9 @@ pub threadlocal let mut g_prog: *mut Program = @ptr_from_int(*mut Program, 0);
 pub threadlocal let mut mod_by_path: u.SymMap.[*mut ast.Module] =
     u.SymMap.[*mut ast.Module].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0),
                                  cap: 0, len: 0 };
+pub threadlocal let mut part_owners: u.SymMap.[*mut ast.Module] =
+    u.SymMap.[*mut ast.Module].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0),
+                                 cap: 0, len: 0 };
 pub threadlocal let mut mod_state: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
                                                                      vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
 // The real paths found so far, by the path asked about (an import is resolved twice, and a module is imported
@@ -156,31 +159,212 @@ fn internal_violation(importer: []u8, target: []u8) usize {
     return k;
 }
 
+/// Returns the `D_IMPORT` declaration for `alias` in `file_id` (falling back
+/// to `m.file.id` when `file_id < 0`), or nil if absent.
+pub fn module_lookup_import(m: *mut ast.Module, file_id: i32, alias: []u8) *mut ast.Decl {
+    if u.isnil(m) {
+        return u.nil.[ast.Decl]();
+    }
+    let mut fid = file_id;
+    if fid < 0 {
+        fid = m.file.id;
+    }
+    for i in 0..m.file_imports.len {
+        if m.file_imports.at(i).file_id == fid {
+            return m.file_imports.at_mut(i).imports.get(alias);
+        }
+    }
+    return u.nil.[ast.Decl]();
+}
+
+/// Returns any `D_IMPORT` declaration for `name` across all files in `m`, or nil.
+pub fn module_lookup_any_import(m: *mut ast.Module, name: []u8) *mut ast.Decl {
+    if u.isnil(m) or u.isnos(name) {
+        return u.nil.[ast.Decl]();
+    }
+    for i in 0..m.file_imports.len {
+        let d = m.file_imports.at_mut(i).imports.get(name);
+        if u.notnil(d) {
+            return d;
+        }
+    }
+    return u.nil.[ast.Decl]();
+}
+
+fn dir_of(p: []u8) []u8 {
+    let slash = u.rfind(p, '/');
+    if slash >= 0 {
+        return u.dup(p[0..@int_cast(usize, slash)]);
+    }
+    return p;
+}
+
+/// Records `alias -> d` for `file_id` (falling back to `m.file.id` when
+/// `file_id < 0`) in `m.file_imports`.
+pub fn module_add_import(m: *mut ast.Module, file_id: i32, alias: []u8, d: *mut ast.Decl) void {
+    if u.isnil(m) {
+        return;
+    }
+    let mut fid = file_id;
+    if fid < 0 {
+        fid = m.file.id;
+    }
+    for i in 0..m.file_imports.len {
+        if m.file_imports.at(i).file_id == fid {
+            m.file_imports.at_mut(i).imports.put(alias, d);
+            return;
+        }
+    }
+    let mut fi = ast.FileImports.{
+        file_id: fid,
+        imports: u.SymMap.[*mut ast.Decl].{ keys: u.nil.[usize](), vals: u.nil.[*mut ast.Decl](), cap: 0, len: 0 },
+    };
+    fi.imports.put(alias, d);
+    m.file_imports.push(fi);
+}
+
+fn load_part_decl(m: *mut ast.Module, d: *mut ast.Decl, dir: []u8) void {
+    let ip = d.import_path;
+    let ext = u.pick(has_ext(ip), "", ".ax");
+    if not relative_import(ip) {
+        _ = dg.err(d.import_path_span, "E0218", u.f1("import path '%s' must be relative, with '/' between its parts",
+                                                     ip));
+        return;
+    }
+    let path = u.f3("%s/%s%s", dir, ip, ext);
+    let prp = real_path_of(path);
+    if u.isnos(prp) {
+        _ = dg.err(d.import_path_span, "E0211", u.f1("cannot find module '%s'", path));
+        return;
+    }
+    let pkey = u.intern(prp);
+    let mut prev_owner: ?*mut ast.Module = .none;
+    let owner_found = part_owners.get(pkey);
+    if u.notnil(owner_found) {
+        prev_owner = owner_found;
+    }
+    if u.str_eq(prp, m.path) {
+        prev_owner = m;
+    }
+    if let .some(owner) = prev_owner {
+        _ = dg.err(d.import_path_span, "E0222", u.f2("part file '%s' is already part of module '%s'", display_path(prp),
+                                                     owner.file.display));
+        return;
+    }
+    if u.notnil(mod_by_path.get(pkey)) {
+        _ = dg.err(d.import_path_span, "E0221",
+                   u.f1("cannot use '%s' as a part file because it is already imported as a module",
+                        display_path(prp)));
+        return;
+    }
+    let pf = u.load_file(prp, u.dup(display_path(prp)));
+    if u.isnil(pf) {
+        _ = dg.err(d.import_path_span, "E0211", u.f1("cannot read module '%s'", path));
+        return;
+    }
+    part_owners.put(pkey, m);
+    let pm = parser.parse_module(pf);
+    m.parts.push(ast.PartFile.{ file: pf, path: pkey });
+    for j in 0..pm.decls.len {
+        let pd = pm.decls.get(j);
+        if (pd.kind == ast.D_IMPORT) and pd.is_part {
+            _ = dg.err(pd.span, "E0221", "a part file cannot declare 'import part'");
+            continue;
+        }
+        pd.module = m;
+        for k in 0..pd.methods.len {
+            pd.methods.get(k).module = m;
+        }
+        m.decls.push(pd);
+    }
+    for j in 0..pm.inline_error_names.len {
+        m.inline_error_names.push(pm.inline_error_names.get(j));
+    }
+}
+
+fn load_regular_import(m: *mut ast.Module, importer_rp: []u8, d: *mut ast.Decl) void {
+    let dir = dir_of(importer_rp);
+    let ip = d.import_path;
+    let ext = u.pick(has_ext(ip), "", ".ax");
+    let mut path = u.nosym();
+    if u.starts(ip, "pkg:") {
+        let ps = u.find(ip[4..], '/');
+        if (ps >= 0) and not library_import(ip[4 + @int_cast(usize, ps) + 1..]) {
+            _ = dg.err(d.import_path_span, "E0218",
+                       u.f2("import path '%s' must name a module in package '%s', with '/' between its parts", ip,
+                            ip[4..4 + @int_cast(usize, ps)]));
+            return;
+        }
+        path = pkg.resolve_import(m.pkg, ip, d.import_path_span);
+        if u.isnos(path) {
+            return;
+        }
+    } else if u.starts(ip, "std/") {
+        if not library_import(ip[4..]) {
+            _ = dg.err(d.import_path_span, "E0218",
+                       u.f1("import path '%s' must name a module in the standard library, with '/' between its parts",
+                            ip));
+            return;
+        }
+        path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
+    } else if not relative_import(ip) {
+        _ = dg.err(d.import_path_span, "E0218", u.f1("import path '%s' must be relative, with '/' between its parts",
+                                                     ip));
+        return;
+    } else {
+        path = u.f3("%s/%s%s", dir, ip, ext);
+    }
+    let tp = real_path_of(path);
+    if not u.isnos(tp) {
+        let k = internal_violation(importer_rp, tp);
+        if k > 0 {
+            _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under '%s' may import it",
+                                                         display_path(tp), display_dir(tp[..k])));
+            return;
+        }
+    }
+    d.imported = load_module(path, &d.import_path_span);
+}
+
 pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
+    let mut from_sp: ?*u.Span = .none;
+    if u.notnil(from) {
+        from_sp = from;
+    }
     let rp = real_path_of(fs_path);
     if u.isnos(rp) {
-        if u.notnil(from) {
-            _ = dg.err(from.*, "E0211", u.f1("cannot find module '%s'", fs_path));
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0211", u.f1("cannot find module '%s'", fs_path));
         }
         return u.nil.[ast.Module]();
     }
     let key = u.intern(rp);
+    if u.notnil(part_owners.get(key)) {
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0221", u.f1("cannot import part file '%s' directly; import its owning module instead",
+                                           display_path(rp)));
+        }
+        return u.nil.[ast.Module]();
+    }
     let found = mod_by_path.get(key);
     if u.notnil(found) {
-        if (mod_state.get(key) == 1) and u.notnil(from) {
-            _ = dg.err(from.*, "E0210", u.f1("import cycle: '%s' is already being imported", display_path(rp)));
+        if mod_state.get(key) == 1 {
+            if let .some(sp) = from_sp {
+                _ = dg.err(sp.*, "E0210", u.f1("import cycle: '%s' is already being imported", display_path(rp)));
+            }
         }
         return found;
     }
-    let kept = base_by_path.get(key);
-    if u.notnil(kept) and reads_as_kept(kept) {
-        take_base(kept);
-        return kept;
+    if let .some(kept) = base_by_path.get(key) {
+        if reads_as_kept(kept) {
+            take_base(kept);
+            return kept;
+        }
     }
     let f = u.load_file(rp, u.dup(display_path(rp)));
     if u.isnil(f) {
-        if u.notnil(from) {
-            _ = dg.err(from.*, "E0211", u.f1("cannot read module '%s'", fs_path));
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0211", u.f1("cannot read module '%s'", fs_path));
         }
         return u.nil.[ast.Module]();
     }
@@ -189,56 +373,28 @@ pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
     m.pkg = pkg.for_file(rp);
     mod_by_path.put(key, m);
     mod_state.put(key, 1);
-    let mut dir = rp;
-    let slash = u.rfind(rp, '/');
-    if slash >= 0 {
-        dir = u.dup(rp[0..@int_cast(usize, slash)]);
-    }
-    for i in 0..m.decls.len {
+    let dir = dir_of(rp);
+    // Process entry declarations in source order so `import` claims part owners
+    // before subsequent `import part` checks, then load regular imports from parts
+    // relative to each part file.
+    let orig_n = m.decls.len;
+    for i in 0..orig_n {
         let d = m.decls.get(i);
         if (d.kind != ast.D_IMPORT) or u.isnos(d.import_path) {
             continue;
         }
-        let ip = d.import_path;
-        let ext = u.pick(has_ext(ip), "", ".ax");
-        let mut path = u.nosym();
-        if u.starts(ip, "pkg:") {
-            let ps = u.find(ip[4..], '/');
-            if (ps >= 0) and not library_import(ip[4 + @int_cast(usize, ps) + 1..]) {
-                _ = dg.err(d.import_path_span, "E0218",
-                           u.f2("import path '%s' must name a module in package '%s', with '/' between its parts", ip,
-                                ip[4..4 + @int_cast(usize, ps)]));
-                continue;
-            }
-            path = pkg.resolve_import(m.pkg, ip, d.import_path_span);
-            if u.isnos(path) {
-                continue;
-            }
-        } else if u.starts(ip, "std/") {
-            if not library_import(ip[4..]) {
-                _ = dg.err(d.import_path_span, "E0218",
-                           u.f1("import path '%s' must name a module in the standard library, with '/' between its parts",
-                                ip));
-                continue;
-            }
-            path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
-        } else if not relative_import(ip) {
-            _ = dg.err(d.import_path_span, "E0218",
-                       u.f1("import path '%s' must be relative, with '/' between its parts", ip));
-            continue;
+        if d.is_part {
+            load_part_decl(m, d, dir);
         } else {
-            path = u.f3("%s/%s%s", dir, ip, ext);
+            load_regular_import(m, rp, d);
         }
-        let tp = real_path_of(path);
-        if not u.isnos(tp) {
-            let k = internal_violation(rp, tp);
-            if k > 0 {
-                _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under '%s' may import it",
-                                                             display_path(tp), display_dir(tp[..k])));
-                continue;
-            }
+    }
+    for i in orig_n..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind != ast.D_IMPORT) or d.is_part or u.isnos(d.import_path) {
+            continue;
         }
-        d.imported = load_module(path, &d.import_path_span);
+        load_regular_import(m, u.file_of(d.import_path_span.file).path, d);
     }
     mod_state.put(key, 2);
     g_prog.modules.push(m);
@@ -254,14 +410,19 @@ pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
 // the globals' total size) still sees them, so that the run reports what a
 // run from nothing would.
 // ---------------------------------------------------------------------------
-let mut base_by_path: u.SymMap.[*mut ast.Module] = u.SymMap.[*mut ast.Module].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0), cap: 0, len: 0 };
+let mut base_by_path: u.SymMap.[?*mut ast.Module] = u.SymMap.[?*mut ast.Module].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut ?*mut ast.Module, 0), cap: 0, len: 0 };
 
 // Takes kept module m (and the kept modules it imports) into this run.
 fn take_base(m: *mut ast.Module) void {
     mod_by_path.put(m.path, m);
     mod_state.put(m.path, 1);
     u.note_file(m.file.id);
+    for i in 0..m.parts.len {
+        let pf = m.parts.at(i);
+        u.note_file(pf.file.id);
+        part_owners.put(pf.path, m);
+    }
     if u.notnil(m.pkg) {
         _ = pkg.for_file(m.path);  // (its manifest is read again, as loading it would)
     }
@@ -280,7 +441,17 @@ fn take_base(m: *mut ast.Module) void {
 // change its own (completion puts a name where the cursor is: ide.ax).
 fn reads_as_kept(m: *mut ast.Module) bool {
     let ov = u.overlay_text(m.path);
-    return u.isnos(ov) or u.str_eq(ov, m.file.text);
+    if not u.isnos(ov) and not u.str_eq(ov, m.file.text) {
+        return false;
+    }
+    for i in 0..m.parts.len {
+        let pf = m.parts.at(i);
+        let pov = u.overlay_text(pf.path);
+        if not u.isnos(pov) and not u.str_eq(pov, pf.file.text) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// On the main thread: keeps m, which this run checked, for later runs.
@@ -292,14 +463,14 @@ pub fn admit(m: *mut ast.Module) void {
 /// On the main thread: no longer takes the module kept for `path` (nor
 /// does any later run).
 pub fn evict(path: []u8) void {
-    if u.notnil(base_by_path.get(path)) {
-        base_by_path.put(path, u.nil.[ast.Module]());
+    if let .some = base_by_path.get(path) {
+        base_by_path.put(path, .none);
     }
 }
 
 /// The module kept for `path` (a real path, interned), or nil.
 pub fn kept_module(path: []u8) *mut ast.Module {
-    return base_by_path.get(path);
+    return base_by_path.get(path) ?? u.nil.[ast.Module]();
 }
 
 // Whether error `name` is declared in m or a module it imports.
@@ -321,6 +492,18 @@ fn declares_error(m: *mut ast.Module, name: []u8, seen: *mut u.SymMap.[bool]) bo
         }
     }
     return false;
+}
+
+fn overlay_matches_disk(path: []u8) bool {
+    let ov = u.overlay_text(path);
+    if u.isnos(ov) {
+        return true;
+    }
+    if u.overlay_edited(path) {
+        return false;
+    }
+    let disk = u.read_file(path);
+    return not u.isnos(disk) and u.str_eq(disk, ov);
 }
 
 /// Which modules of this run, checked by it, a later run may take as they
@@ -345,9 +528,16 @@ pub fn clean() u.List.[*mut ast.Module] {
         bad[@int_cast(usize, d.span.file)] = 1;
     }
     for mi in 0..g_prog.modules.len {
-        let id = @int_cast(usize, g_prog.modules.get(mi).file.id);
+        let m = g_prog.modules.get(mi);
+        let id = @int_cast(usize, m.file.id);
         if bad[id] != 0 {
             bad[id] = 2;
+        }
+        for pi in 0..m.parts.len {
+            let pid = @int_cast(usize, m.parts.at(pi).file.id);
+            if bad[pid] != 0 {
+                bad[pid] = 2;
+            }
         }
     }
     for b in bad {
@@ -361,23 +551,19 @@ pub fn clean() u.List.[*mut ast.Module] {
             ok.put(m.path, true);
             continue;
         }
-        if bad[@int_cast(usize, m.file.id)] != 0 {
+        let mut good = (bad[@int_cast(usize, m.file.id)] == 0) and overlay_matches_disk(m.path);
+        for pi in 0..m.parts.len {
+            let pf = m.parts.at(pi);
+            if (bad[@int_cast(usize, pf.file.id)] != 0) or not overlay_matches_disk(pf.path) {
+                good = false;
+            }
+        }
+        if not good {
             continue;
         }
-        let ov = u.overlay_text(m.path);
-        if not u.isnos(ov) {
-            if u.overlay_edited(m.path) {
-                continue;
-            }
-            let disk = u.read_file(m.path);
-            if u.isnos(disk) or not u.str_eq(disk, ov) {
-                continue;
-            }
-        }
-        let mut good = true;
         for i in 0..m.decls.len {
             let d = m.decls.get(i);
-            if (d.kind == ast.D_IMPORT) and (u.isnil(d.imported) or not ok.get(d.imported.path)) {
+            if (d.kind == ast.D_IMPORT) and not d.is_part and (u.isnil(d.imported) or not ok.get(d.imported.path)) {
                 good = false;
             }
         }

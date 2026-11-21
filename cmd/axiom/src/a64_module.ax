@@ -1,0 +1,647 @@
+// =============================================================================
+// a64_module.ax - register allocation hooks, function compilation, and module compilation, part of a64.ax.
+// =============================================================================
+import "asm/a64.ax" as aa;
+import "asm/core.ax" as acr;
+import "asm/inline.ax" as ai;
+import "asm/obj.ax" as aob;
+import "bin.ax" as bn;
+import "codeview.ax" as codeview;
+import "dloc.ax" as dloc;
+import "dwarf.ax" as dw;
+import "elf.ax" as elf;
+import "ftab.ax" as ft;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "lower.ax" as lower;
+import "mach.ax" as mc;
+import "macunwind.ax" as mu;
+import "opt.ax" as opt;
+import "switches.ax" as swl;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "winlines.ax" as wlines;
+
+// x9-x15 first (free temporaries), then the argument registers, then the
+// callee-saved x19-x28; v16-v31, v0-v7, then v8-v15
+let gpr_order: [25]i32 = [9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+let vr_order: [32]i32 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 32, 33, 34, 35, 36, 37, 38, 39,
+                         40, 41, 42, 43, 44, 45, 46, 47];
+
+// Instructions whose only effect is their register result (for mc.dce; not
+// loads: a volatile load must happen, and not instructions setting flags).
+fn pure_inst(i: *mc.MInst) bool {
+    let op = i.op;
+    if (op == MOV) or (op == FMOV) or (op == MOVI) or (op == LEA) or (op == ADDR) or (op == GOT) {
+        return true;
+    }
+    return (op == RAW) and pure_word(@bit_cast(u64, i.aux));
+}
+
+// The instruction word of a RAW that only computes its destination register.
+fn pure_word(w: u64) bool {
+    let op0 = (w >> 25) & 15;  // bits 28..25
+    if (op0 & 14) == 8 {
+        // data processing (immediate): add/sub (S: flags), logical (ANDS: flags), move wide,
+        // bitfield, extract, adr
+        let k = (w >> 23) & 7;
+        if (k == 2) or (k == 3) {
+            return ((w >> 29) & 1) == 0;
+        }
+        if k == 4 {
+            return ((w >> 29) & 3) != 3;
+        }
+        return true;
+    }
+    if (op0 & 7) == 5 {
+        // data processing (register)
+        if ((w >> 28) & 1) == 0 {
+            if ((w >> 24) & 1) == 0 {
+                return ((w >> 29) & 3) != 3;  // logical (ANDS / BICS: flags)
+            }
+            return ((w >> 29) & 1) == 0;  // add/sub (S: flags)
+        }
+        let k = (w >> 21) & 15;
+        if k == 0 {
+            return ((w >> 29) & 1) == 0;  // adc / sbc
+        }
+        return (k == 4) or (k == 6) or (k >= 8);  // csel, 1-/2-source, 3-source (not ccmp)
+    }
+    if ((op0 & 7) == 7) and FN.strict_fp {
+        return false;  // (strict floating point: the exceptions are effects)
+    }
+    if (op0 & 7) == 7 {
+        // SIMD and floating point: all but the comparisons that set flags (fcmp, fccmp)
+        if (((w >> 24) & 0xff) == 0x1e) and (((w >> 21) & 1) == 1) {
+            if (((w >> 10) & 15) == 8) or (((w >> 10) & 3) == 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// (nothing is rematerialized on AArch64)
+fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
+    return false;
+}
+
+fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
+    let ops = is.mk2(W(r), mc.mem_slot(slot, 0));
+    if class == 0 {
+        return mc.new_inst(LDR, 8, ops[..]);
+    }
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        return mc.new_inst(FLDR, 8, ops[..]);  // (a scalar float's slot: mc.set_bytes)
+    }
+    return mc.new_inst(FLDR, 16, ops[..]);
+}
+
+fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
+    let ops = is.mk2(mc.mem_slot(slot, 0), R(r));
+    if class == 0 {
+        return mc.new_inst(STR, 8, ops[..]);
+    }
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        return mc.new_inst(FSTR, 8, ops[..]);
+    }
+    return mc.new_inst(FSTR, 16, ops[..]);
+}
+
+fn spill_move(f: *mut mc.MFunc, d: i32, s: i32, class: i32) *mut mc.MInst {
+    let ops = is.mk2(W(d), R(s));
+    let mut i = mc.new_inst(MOV, 8, ops[..]);
+    if class != 0 {
+        i = mc.new_inst(FMOV, 16, ops[..]);
+    }
+    i.is_move = true;
+    return i;
+}
+
+fn no_copy(i: *mc.MInst) bool {
+    _ = i;
+    return false;
+}
+
+fn is_label(i: *mc.MInst) bool {
+    return i.op == LABEL;
+}
+
+// The function-name suffix of AXIOM_DEBUG_RA (debugging: the allocator reports the functions ending in
+// it), read once per build.
+threadlocal let mut debug_ra_name: []u8 = "";
+threadlocal let mut debug_ra_read: bool = false;
+
+fn debug_ra_suffix() []u8 {
+    if not debug_ra_read {
+        debug_ra_name = u.perm_dup(u.env("AXIOM_DEBUG_RA"));
+        debug_ra_read = true;
+    }
+    return debug_ra_name;
+}
+
+fn compile_func(f: *mut ir.Func) void {
+    FN.f = f;
+    FN.gaddr.clear();
+    FN.gaddr_blk = @ptr_from_int(*mut mc.MBlock, 0);
+    FN.vcs.clear();
+    FN.vc_blk = @ptr_from_int(*mut mc.MBlock, 0);
+    FN.nlocal = 0;
+    FN.out_area = 0;
+    FN.dyn_frame = false;
+    swl.lower(f);  // (jump tables, bit tests, a search: switches.ax)
+    opt.split_critical_edges(f);
+    lower.scalarize(f, legal);
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    opt.loop_depths(f, &order);
+    opt.hoist_constants(f, &order, const_needs_reg, true, opt.no_operand_needs);
+    // (on macOS, ax_rt_args and darwin.thread_main fill the TSD slot that
+    // thread-local addresses read, so their entry blocks have none yet)
+    if not (tg.is_darwin() and (u.ends(f.name, "darwin.thread_main") or u.str_eq(f.name, "ax_rt_args"))) {
+        opt.hoist_to_entry(f, is_tls_global);
+    }
+    opt.layout(&mut order);
+    prepare(f);
+    FN.mf = is.new_mfunc(f, &order);
+    dloc.begin(f, O.dbg.full);
+    // parameters
+    mc.cur_src = f.src;
+    mc.cur_scope = 0;
+    FN.cb = FN.mf.blocks.get(0);
+    let mut ng: i32 = 0;
+    let mut nv: i32 = 0;
+    let mut soff: i64 = 16;
+    if f.va_home {
+        soff += 64;  // (Windows: x0-x7's home area, win_prologue)
+    }
+    FN.call_results.clear();
+    FN.cas_oks.clear();
+    for pi in 0..f.params.len {
+        let p = f.params[pi];
+        let c = class_of(p.ty);
+        let d = vreg(p);
+        let mut e: u8 = 0;
+        if pi < f.param_ext.len {
+            e = f.param_ext[pi];
+        }
+        if e == ir.EXT_X8SRET {
+            copy(d, X8, GPR);
+        } else if (c == GPR) and (ng < 8) {
+            copy(d, ng, GPR);
+            dloc.param(p, ng, dloc.NO_LOC);
+            ng += 1;
+        } else if (c == VR) and (nv < 8) {
+            copy(d, V0 + nv, VR);
+            dloc.param(p, V0 + nv, dloc.NO_LOC);
+            nv += 1;
+        } else {
+            let sz = @bit_cast(i64, stack_arg_size(p.ty));
+            soff = (soff + sz - 1) & ~(sz - 1);
+            dloc.param(p, -1, soff - 16);  // (x29 is the CFA - 16)
+            let m = mc.mem(FP, -1, 0, soff);
+            if c == GPR {
+                _ = e2(LDR, @truncate(u8, sz), W(d), m);
+            } else {
+                _ = e2(FLDR, @truncate(u8, p.ty.size), W(d), m);
+            }
+            soff += sz;
+        }
+    }
+    for bi in 0..order.len {
+        let ib = order.get(bi);
+        FN.cb = FN.mf.blocks.get(bi);
+        dloc.enter_block(ib, FN.cb);
+        let mut i = ib.first;
+        while u.notnil(i) {
+            if i.src != 0 {
+                mc.cur_src = i.src;  // (the line of the instructions made for it)
+                mc.cur_scope = i.scope;
+            }
+            if dloc.active {
+                dloc.before(i, FN.cb);  // (-g: the variables' assignments before it)
+            }
+            if not ir.is_term(i.op) {
+                gen_inst(i);
+                if dloc.active {
+                    dloc.selected(i, FN.cb, i.loc);
+                }
+            }
+            i = i.next;
+        }
+        gen_term(ib);
+        dloc.end_block(FN.cb);
+        is.push_succs(FN.cb, ir.terminator(ib));
+    }
+    mc.cur_src = 0;
+    mc.cur_scope = 0;
+    order.deinit();
+    if O.errors {
+        return;
+    }
+    let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], vr_order[..], vr_order[..], vr_order[..]],
+                          caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store,
+                          spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
+    let dn = debug_ra_suffix();
+    mc.debug_ra = (dn.len > 0) and (dn.len <= f.name.len) and u.str_eq(f.name[(f.name.len - dn.len)..f.name.len], dn);
+    FN.strict_fp = f.strict_fp;
+    mc.dce(FN.mf, pure_inst);
+    mc.allocate(FN.mf, &tgt);
+    mc.drop_reloads(FN.mf, is_label, no_copy);
+    encode_func(f);
+    mc.free_func(FN.mf);
+}
+
+// A block's closing jump to a later block that only empty blocks separate
+// from it falls through instead.
+fn drop_jumps_to_next() void {
+    let nb = FN.mf.blocks.len;
+    for bi in 0..nb {
+        let b = FN.mf.blocks.get(bi);
+        let j = b.last;
+        if u.isnil(j) or (j.op != B) or (j.ops[0].kind != mc.K_LABEL) or (j.ops[0].label >= LOCAL_BASE) {
+            continue;
+        }
+        let t = @int_cast(usize, j.ops[0].label);
+        if t <= bi {
+            continue;
+        }
+        let mut empty = true;
+        for k in (bi + 1)..t {
+            if u.notnil(FN.mf.blocks.get(k).first) {
+                empty = false;
+                break;
+            }
+        }
+        if empty {
+            mc.remove(b, j);
+        }
+    }
+}
+
+fn encode_func(f: *mut ir.Func) void {
+    asm_used_regs();
+    // callee-saved registers in use
+    FN.nsaved = 0;
+    for r in @as(usize, 19)..29 {
+        if (FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            FN.saved[FN.nsaved] = @int_cast(i32, r);
+            FN.nsaved += 1;
+        }
+    }
+    for r in @as(usize, 40)..48 {
+        if (FN.mf.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            FN.saved[FN.nsaved] = @int_cast(i32, r);
+            FN.nsaved += 1;
+        }
+    }
+    if O.macos {
+        mac_save_order();
+    }
+    // frame layout from sp: outgoing arguments, slots, saved registers
+    let mut cur = @bit_cast(i64, (FN.out_area + 15) & ~@as(u64, 15));
+    for k in 0..FN.mf.slots.len {
+        let s = FN.mf.slots.at_mut(k);
+        let a = @bit_cast(i64, s.align);
+        cur = (cur + a - 1) & ~(a - 1);
+        s.offset = cur;
+        cur += @bit_cast(i64, s.size);
+    }
+    if O.macos {
+        cur = (cur + 15) & ~@as(i64, 15);  // (the saves end at the frame's top: mac_save_order)
+    }
+    for k in 0..FN.nsaved {
+        if FN.saved[k] >= V0 {
+            cur = (cur + 15) & ~@as(i64, 15);
+            FN.save_off[k] = cur;
+            cur += 16;
+        } else {
+            cur = (cur + 7) & ~@as(i64, 7);
+            FN.save_off[k] = cur;
+            cur += 8;
+        }
+    }
+    FN.frame = (cur + 15) & ~@as(i64, 15);
+    if FN.frame > 0x7000_0000 {
+        // (code generation keeps a function's locals to 1 GiB, E0473, and inlining keeps to that too)
+        fail("the stack frame is too large");
+    }
+    drop_jumps_to_next();
+    FN.code = bn.new_bytes();
+    FN.rls.clear();
+    FN.fxs.clear();
+    FN.jtabs.clear();
+    FN.local_off.clear();
+    FN.frameless = not needs_frame();
+    FN.cfis.clear();
+    FN.xcfis.clear();
+    FN.tail_ends.clear();
+    aob.inline_pass(O.obj);
+    prologue();
+    let nb = FN.mf.blocks.len;
+    let boff = u.newn.[u64](nb + 1);
+    // frame tables: (offset after each call, its chain)
+    let mut calls = u.List.[u64].empty();
+    // -g: the line table, (code offset, source location) where the location changes
+    let mut rows = u.List.[u64].empty();
+    let mut last_src: u32 = 0;
+    let mut pe_done = false;
+    let lines = O.dbg.on or O.win;  // (Windows: for the PDB, winlines.ax)
+    // -g (full): (code offset, lexical block) where the block changes
+    let mut scopes = u.List.[u64].empty();
+    let mut last_scope: u32 = 0;
+    if O.dbg.on {
+        if f.src != 0 {
+            rows.push(@as(u64, f.src));
+        }
+        last_src = first_src(f);
+        rows.push((here() << 32) | @as(u64, last_src));
+    } else if lines and (f.src != 0) {
+        rows.push(@as(u64, f.src));
+        last_src = f.src;
+    }
+    for bi in 0..nb {
+        let b = FN.mf.blocks.get(bi);
+        boff[bi] = here();
+        dloc.block_at(bi, boff[bi], bi == 0);
+        let mut i = b.first;
+        while u.notnil(i) {
+            // (the prologue ends, for a debugger, at the first instruction of
+            // another line than the function's: past the parameters' stores)
+            if O.dbg.on and not pe_done and (i.src != 0) and (i.src != f.src) {
+                rows.push(((here() << 32) | dw.ROW_PE) | @as(u64, i.src));
+                last_src = i.src;
+                pe_done = true;
+            } else if lines and (i.src != 0) and (i.src != last_src) {
+                rows.push((here() << 32) | @as(u64, i.src));
+                last_src = i.src;
+            }
+            if O.dbg.on and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
+                scopes.push((here() << 32) | @as(u64, i.scope));
+                last_scope = i.scope;
+            }
+            dloc.inst_at(i, here());
+            enc_inst(i);
+            if O.ft.on and (i.op == CALL) and not is_tail(i) {
+                calls.push(here());
+                calls.push(@bit_cast(u64, i.aux));
+            }
+            i = i.next;
+        }
+    }
+    // branch targets
+    let cv = FN.code.view();
+    for k in 0..FN.fxs.len {
+        let x = FN.fxs.get(k);
+        let mut target: u64 = 0;
+        if x.label >= LOCAL_BASE {
+            target = FN.local_off.get(@int_cast(usize, x.label - LOCAL_BASE));
+        } else {
+            target = boff[@int_cast(usize, x.label)];
+        }
+        let rel = (@bit_cast(i64, target) - @bit_cast(i64, x.off)) / 4;
+        let o = @truncate(usize, x.off);
+        let mut w = @as(u64, cv[o]) | (@as(u64, cv[o + 1]) << 8) | (@as(u64, cv[o + 2]) << 16) | (
+            @as(u64, cv[o + 3]) << 24);
+        if x.kind == 0 {
+            w = w | (@bit_cast(u64, rel) & 0x3ff_ffff);
+        } else {
+            if (rel < -0x4_0000) or (rel >= 0x4_0000) {
+                fail("conditional branch out of range (function too large)");
+            }
+            w = w | ((@bit_cast(u64, rel) & 0x7_ffff) << 5);
+        }
+        FN.code.set_u32(o, w);
+    }
+    let text = O.obj.secs.get(@int_cast(usize, O.text));
+    // (16 bytes, or the function's own alignment: C's attribute aligned)
+    let mut falign: u64 = 16;
+    if f.align > falign {
+        falign = f.align;
+        if falign > text.align {
+            text.align = falign;
+        }
+    }
+    text.data.align(@truncate(usize, falign));
+    let base = @as(u64, text.data.len());
+    text.data.put(FN.code.view());
+    fill_jump_tables(base, boff);
+    for k in 0..FN.rls.len {
+        let r = FN.rls.get(k);
+        text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
+    }
+    let mut s = O.obj.syms.at_mut(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
+    s.value = base;
+    s.size = @as(u64, FN.code.len());
+    aob.inline_place(O.obj, O.text, base);
+    ft.func(&mut O.ft, O.text, base, s.size, FN.frameless, calls.items()[0..0], calls.items(), rows.items(),
+            scopes.items(), dw.func_name(f, elf.display_name(s.name)));
+    if O.win and not FN.frameless {
+        // (code in a COMDAT group: its group's own unwind sections)
+        let sx = O.xdata;
+        let sp = O.pdata;
+        let ss = O.xdata_sym;
+        O.xdata = is.group_unwind(O.obj, O.text, ".xdata", O.xdata);
+        O.pdata = is.group_unwind(O.obj, O.text, ".pdata", O.pdata);
+        if O.xdata != sx {
+            O.xdata_sym = elf.sec_sym(O.obj, O.xdata);
+        }
+        win_unwind(O.fsym.get(@int_cast(usize, f.id)), base, @as(u64, FN.code.len()));
+        O.xdata = sx;
+        O.pdata = sp;
+        O.xdata_sym = ss;
+    }
+    // (the symbol again: a section symbol made since may have moved the list)
+    s = O.obj.syms.at_mut(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
+    if O.macos {
+        mac_unwind(O.fsym.get(@int_cast(usize, f.id)), s.size);
+    } else if O.mu.on {
+        elf_unwind(base, s.size);
+        s = O.obj.syms.at_mut(@as(usize, O.fsym.get(@int_cast(usize, f.id))));
+    }
+    if O.win and (rows.len > 0) {
+        wlines.emit(O.obj, O.lines, codeview.func_key(s.name, s.value), rows.items());
+    }
+    if O.dbg.on {
+        let mut regs: [20]u64 = [0; 20];
+        _ = save_list(&mut regs);
+        let df = dw.Func.{ xcfi: FN.xcfis.items(), sym: O.fsym.get(@int_cast(usize, f.id)),
+                           name: dw.func_name(f, elf.display_name(s.name)), external: s.bind != elf.B_LOCAL,
+                           size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: FN.cfis.items(),
+                           regs: regs[0..FN.nsaved + 2], irf: f, vars: dw.var_locs(f, var_slot_off, 16 + FN.frame),
+                           vlocs: dloc.compute(FN.mf, &DLOC, s.size), frame_local: -1, calls: dloc.calls() };
+        if O.win {
+            codeview.add_func(&df, s);
+        } else {
+            dw.add_func(&mut O.dbg, &df);
+        }
+        dloc.release(df.vlocs, df.calls);
+    }
+    rows.deinit();
+    scopes.deinit();
+    FN.code.free();
+    calls.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Module
+// -----------------------------------------------------------------------------
+pub fn compile(m: *mut ir.Module) *mut elf.Obj {
+    O.errors = false;
+    O.lse = tg.has(tg.A_LSE);
+    O.win = tg.is_windows();
+    O.macos = tg.is_darwin();
+    O.obj = elf.new_obj(elf.EM_AARCH64);
+    O.tls_key_si = -1;
+    O.tls_index_si = -1;
+    O.consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    O.libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    O.text = elf.add_sec(O.obj, ".text", elf.S_TEXT, 16);
+    O.text0 = O.text;
+    O.rodata = elf.add_sec(O.obj, ".rodata", elf.S_RODATA, 16);
+    O.xdata = -1;
+    O.pdata = -1;
+    O.lines = -1;
+    if O.win {
+        // (here, not when the first function needs them: functions are
+        // compiled in scratch scopes, and the sections must outlive them)
+        O.lines = wlines.begin(O.obj);
+        O.xdata = elf.add_sec(O.obj, ".xdata", elf.S_RODATA, 4);
+        O.pdata = elf.add_sec(O.obj, ".pdata", elf.S_RODATA, 4);
+        O.xdata_sym = elf.add_sym(O.obj, elf.Sym.{ name: "", sec: O.xdata, value: 0, size: 0, bind: elf.B_LOCAL,
+                                                   ty: elf.T_NOTYPE, hidden: false, protected: false });
+    }
+    O.mu = mu.begin(O.macos, O.obj, false);
+    if (tg.g_os == tg.OS_LINUX) and tg.g_unwind_tables {
+        O.mu = mu.begin_elf(true, O.obj, false);
+    }
+    let relro = is.add_symbols(O.obj, m, O.text, O.rodata, elf.R_AARCH64_ABS64, &mut O.fsym, &mut O.gsym);
+    aob.part_sym = is.part_sym;  // (asm naming internal functions and data)
+    // file-scope asm (the C front end's GNU dialects): its sections and symbols
+    for b in ai.toplevel.items() {
+        let A = aa.assemble_file(b.text);
+        if acr.failed(A) {
+            u.eprint(u.f2("axiom: AArch64 code generation: file-scope asm at %s: %s\n", b.loc, acr.message(A)));
+            return u.nil.[elf.Obj]();
+        }
+        aob.add_file(O.obj, O.text, A, b.aliases, b.file_id);
+        if aob.add_error.len > 0 {
+            u.eprint(u.f2("axiom: AArch64 code generation: asm at %s: %s\n", b.loc, aob.add_error));
+            aob.add_error = "";
+            return u.nil.[elf.Obj]();
+        }
+    }
+    // (its procedures' Windows unwind records: .xdata, and their .pdata entries)
+    for p in aob.sehs.items() {
+        if O.win {
+            let x = O.obj.secs.get(@int_cast(usize, O.xdata));
+            x.data.align(4);
+            let xoff = @as(u64, x.data.len());
+            x.data.put(p.xdata);
+            let pd = O.obj.secs.get(@int_cast(usize, O.pdata));
+            let poff = @as(u64, pd.data.len());
+            pd.data.zeros(8);
+            pd.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: p.sym, addend: 0 });
+            pd.relocs.push(
+                elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: O.xdata_sym, addend: @bit_cast(i64, xoff) });
+        }
+    }
+    aob.sehs.clear();
+    // each global's known alignment (mem_sym)
+    O.galign.clear();
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        let mut al = g.align;
+        if al == 0 {
+            al = 1;
+        }
+        O.galign.push(al);
+    }
+    O.ft = ft.begin(O.obj, m, O.text, relro, &mut O.gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
+    // (Windows: the same records feed CodeView for the PDB, codeview.ax,
+    // and the lines are .axiom.lines)
+    O.dbg = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
+    if O.win and O.dbg.on {
+        codeview.begin(O.obj, true, O.dbg.full);
+    }
+    for p in aob.procs.items() {
+        // (in the sections .cfi_sections names: .debug_frame with -g, and the
+        // unwind table, whose kinds with a personality routine, an LSDA, ...
+        // are ELF's: macunwind.ax add_proc_x)
+        if not p.x.no_debug {
+            dw.add_asm_fde(&mut O.dbg, p.sym, 0, p.size, p.prog, p.simple, p.signal, p.x.ra);
+        }
+        if p.x.no_eh {
+            continue;
+        }
+        if mu.needs_x(p.x) and O.mu.elf {
+            mu.add_proc_x(&mut O.mu, p.sym, p.size, p.prog, p.simple, p.signal, p.x, p.psym_i, p.lsym_i);
+        } else {
+            mu.add_proc(&mut O.mu, p.sym, p.size, p.prog, p.simple, p.signal);
+        }
+    }
+    aob.procs.clear();
+    // (assembly sources' line information: DWARF, or on Windows the PDB's)
+    for p in aob.funcs.items() {
+        let df = dw.Func.{ xcfi: u.nil_slice.[dw.XCfi](), sym: p.sym, name: p.name, external: p.external, size: p.size,
+                           src: 0, rows: p.rows, scopes: u.nil_slice.[u64](), cfi: u.nil_slice.[u64](),
+                           regs: u.nil_slice.[u64](), irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](),
+                           vlocs: u.nil_slice.[dloc.VLoc](), frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
+        if p.rows.len > 0 {
+            dw.add_func(&mut O.dbg, &df);
+            if O.win and (O.lines >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
+                let ps = O.obj.syms.at(@as(usize, p.sym));
+                wlines.emit(O.obj, O.lines, codeview.func_key(ps.name, ps.value), p.rows);
+            }
+        }
+    }
+    aob.funcs.clear();
+    O.dbg.lang = dw.module_lang(m);
+    dloc.g_typed = false;  // (the system's AArch64 debugger evaluates no typed operations)
+    if tg.is_darwin() {
+        O.dbg.tls_rel = dw.TLS_DESC;
+        if tg.platform_tls() {
+            O.dbg.tls_rel = dw.TLS_PDESC;
+        }
+    } else {
+        O.dbg.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
+    }
+    for i in 0..m.globals.len {
+        dw.add_data_sym(&mut O.dbg, m.globals.get(i).name, O.gsym.get(i));
+        codeview.add_data_sym(m.globals.get(i).name, O.gsym.get(i));
+    }
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not ir.is_decl(f) {
+            // the function's machine code is all that outlives it
+            u.scratch_begin();
+            let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
+            O.lse = tg.has(tg.A_LSE);
+            O.text = O.obj.syms.get(@as(usize, O.fsym.get(@int_cast(usize, f.id)))).sec;  // (its section: isel.ax)
+            compile_func(f);
+            O.text = O.text0;
+            tg.end_fn(outer);
+            u.scratch_end();
+            ir.release_lists(f);
+            if O.errors {
+                return u.nil.[elf.Obj]();
+            }
+        }
+    }
+    is.finish_aliases(O.obj);
+    let mut msg = aob.resolve(O.obj);
+    if (msg.len == 0) and (tg.is_darwin() or tg.is_windows()) {
+        msg = aob.relax_abs_movw(O.obj);
+    }
+    if msg.len > 0 {
+        u.eprint(u.f1("axiom: AArch64 code generation: %s\n", msg));
+        return u.nil.[elf.Obj]();
+    }
+    if O.win {
+        codeview.finish();
+    } else {
+        dw.finish_elf(&mut O.dbg, O.obj, O.text, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
+    }
+    return O.obj;
+}

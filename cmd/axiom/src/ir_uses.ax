@@ -1,0 +1,434 @@
+// =============================================================================
+// ir_uses.ax - def-use chains and operand replacement, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Def-use lists (see Use)
+// -----------------------------------------------------------------------------
+const USE_TAG: usize = 3;
+const XU_REG: u32 = 0x8000_0000;
+const XU_CAP: u32 = 0x7fff_ffff;
+
+// Whether i is registered (see Use).
+pub inline fn is_reg(i: *Value) bool {
+    return (i.xucap & XU_REG) != 0;
+}
+
+// Whether x has a list of uses.
+inline fn tracked(x: *Value) bool {
+    return u.notnil(x) and (x.kind == V_INST);
+}
+
+inline fn use_ptr(a: usize) *mut *mut Use {
+    return @ptr_from_int(*mut *mut Use, a & ~USE_TAG);
+}
+
+// Puts place p (with its tag) first on x's list.
+inline fn use_link(p: *mut Use, x: *mut Value, tag: usize) void {
+    let h = x.first_use;
+    p.next = h;
+    if u.notnil(h) {
+        h.back = @int_from_ptr(&mut p.next) | (h.back & USE_TAG);
+    }
+    p.back = @int_from_ptr(&mut x.first_use) | tag;
+    x.first_use = p;
+    x.nuses += 1;
+}
+
+// Takes place p off the list of x, the value its operand reads (if it is on one).
+inline fn use_unlink(p: *mut Use, x: *mut Value) void {
+    if p.back == 0 {
+        return;
+    }
+    use_ptr(p.back).* = p.next;
+    if u.notnil(p.next) {
+        p.next.back = (p.back & ~USE_TAG) | (p.next.back & USE_TAG);
+    }
+    p.back = 0;
+    p.next = u.nil.[Use]();
+    x.nuses -= 1;
+}
+
+// The instruction whose operand place p is.
+pub fn use_user(p: *mut Use) *mut Value {
+    let tag = p.back & USE_TAG;
+    if tag == USE_TAG {
+        return @ptr_cast(*mut XUse, p).user;
+    }
+    return @ptr_from_int(*mut Value, (@int_from_ptr(p) - @offset_of(Value, ua)) - (tag * @size_of(Use)));
+}
+
+fn use_user_ro(p: *Use) *Value {
+    let tag = p.back & USE_TAG;
+    if tag == USE_TAG {
+        return @ptr_cast(*XUse, p).user;
+    }
+    return @ptr_from_int(*Value, (@int_from_ptr(p) - @offset_of(Value, ua)) - (tag * @size_of(Use)));
+}
+
+// Which operand of its user place p is: 0 a, 1 b, 2 c, 3 + k xs[k].
+pub fn use_slot(p: *Use) usize {
+    let tag = p.back & USE_TAG;
+    if tag == USE_TAG {
+        let x = @ptr_cast(*XUse, p);
+        return 3 + ((@int_from_ptr(p) - @int_from_ptr(x.user.xu)) / @size_of(XUse));
+    }
+    return tag;
+}
+
+// v's only user when it has one use (else nil).
+pub fn single_user(v: *mut Value) *mut Value {
+    if v.nuses != 1 {
+        return vnil();
+    }
+    return use_user(v.first_use);
+}
+
+// Whether all of v's uses (at least one) are in one instruction (`x + x`).
+pub fn one_user(v: *Value) bool {
+    let p = v.first_use;
+    if u.isnil(p) {
+        return false;
+    }
+    let w = use_user_ro(p);
+    let mut q = p.next;
+    while u.notnil(q) {
+        if use_user_ro(q) != w {
+            return false;
+        }
+        q = q.next;
+    }
+    return true;
+}
+
+// Operand k of i: a, b, c, then xs.
+pub fn operand(i: *mut Value, k: usize) *mut Value {
+    if k == 0 {
+        return i.a;
+    }
+    if k == 1 {
+        return i.b;
+    }
+    if k == 2 {
+        return i.c;
+    }
+    return i.xs.get(k - 3);
+}
+
+// Sets operand k of i (as set_a ... set_x do).
+pub fn set_operand(i: *mut Value, k: usize, x: *mut Value) void {
+    if k == 0 {
+        set_a(i, x);
+    } else if k == 1 {
+        set_b(i, x);
+    } else if k == 2 {
+        set_c(i, x);
+    } else {
+        set_x(i, k - 3, x);
+    }
+}
+
+// What a registered instruction's operand reads: x after replacements.
+inline fn live_op(x: *mut Value) *mut Value {
+    if u.notnil(x) and x.replaced {
+        return resolve(x);
+    }
+    return x;
+}
+
+inline fn set_slot(i: *mut Value, p: *mut Use, old: *mut Value, x: *mut Value, tag: usize) void {
+    use_unlink(p, old);
+    if tracked(x) {
+        use_link(p, x, tag);
+    }
+}
+
+pub inline fn set_a(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.a) or not is_reg(i) {
+        i.a = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.ua, i.a, x, 0);
+    i.a = x;
+}
+
+pub inline fn set_b(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.b) or not is_reg(i) {
+        i.b = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.ub, i.b, x, 1);
+    i.b = x;
+}
+
+pub inline fn set_c(i: *mut Value, x0: *mut Value) void {
+    if (x0 == i.c) or not is_reg(i) {
+        i.c = x0;
+        return;
+    }
+    let x = live_op(x0);
+    set_slot(i, &mut i.uc, i.c, x, 2);
+    i.c = x;
+}
+
+fn xuse(i: *mut Value, k: usize) *mut Use {
+    return @ptr_cast(*mut Use, @ptr_from_int(*mut XUse, @int_from_ptr(i.xu) + (k * @size_of(XUse))));
+}
+
+// Room for n places of xs in xu (moving the first `live`, which may be on
+// lists, with their neighbours' links).
+fn xu_room(i: *mut Value, n: usize, live: usize) void {
+    if n <= @as(usize, i.xucap & XU_CAP) {
+        return;
+    }
+    let mut cap = @as(usize, i.xucap & XU_CAP) * 2;
+    if cap < n {
+        cap = n;
+    }
+    if cap < 4 {
+        cap = 4;
+    }
+    let nx = @ptr_cast(*mut XUse, u.malloc(cap * @size_of(XUse)));
+    let old = i.xu;
+    i.xu = nx;
+    for k in 0..live {
+        let o = @ptr_from_int(*mut XUse, @int_from_ptr(old) + (k * @size_of(XUse)));
+        let p = @ptr_from_int(*mut XUse, @int_from_ptr(nx) + (k * @size_of(XUse)));
+        p.* = o.*;
+        if p.u.back != 0 {
+            use_ptr(p.u.back).* = &mut p.u;
+            if u.notnil(p.u.next) {
+                p.u.next.back = @int_from_ptr(&mut p.u.next) | (p.u.next.back & USE_TAG);
+            }
+        }
+    }
+    if @int_from_ptr(old) != 0 {
+        u.free(@ptr_cast(*mut void, old));
+    }
+    i.xucap = (i.xucap & XU_REG) | @truncate(u32, cap);
+}
+
+fn xs_link(i: *mut Value, k: usize, x: *mut Value) void {
+    let p = xuse(i, k);
+    @ptr_cast(*mut XUse, p).user = i;
+    p.back = 0;
+    p.next = u.nil.[Use]();
+    if tracked(x) {
+        use_link(p, x, USE_TAG);
+    }
+}
+
+// Sets xs[k] of i.
+pub inline fn set_x(i: *mut Value, k: usize, x0: *mut Value) void {
+    if not is_reg(i) {
+        i.xs.set(k, x0);
+        return;
+    }
+    let x = live_op(x0);
+    if x == i.xs.get(k) {
+        return;
+    }
+    use_unlink(xuse(i, k), i.xs.get(k));
+    if tracked(x) {
+        use_link(xuse(i, k), x, USE_TAG);
+    }
+    i.xs.set(k, x);
+}
+
+// Appends x to i's xs.
+pub fn push_x(i: *mut Value, x0: *mut Value) void {
+    if not is_reg(i) {
+        i.xs.push(x0);
+        return;
+    }
+    let x = live_op(x0);
+    xu_room(i, i.xs.len + 1, i.xs.len);
+    i.xs.push(x);
+    xs_link(i, i.xs.len - 1, x);
+}
+
+// Keeps the first n of i's xs.
+pub fn trunc_x(i: *mut Value, n: usize) void {
+    if is_reg(i) {
+        for k in n..i.xs.len {
+            use_unlink(xuse(i, k), i.xs.get(k));
+        }
+    }
+    i.xs.len = n;
+}
+
+pub fn clear_x(i: *mut Value) void {
+    trunc_x(i, 0);
+}
+
+// Gives i the operands xs (a list it takes).
+pub fn set_xs(i: *mut Value, xs: u.List.[*mut Value]) void {
+    if not is_reg(i) {
+        i.xs = xs;
+        return;
+    }
+    trunc_x(i, 0);
+    i.xs.deinit();
+    i.xs = xs;
+    xu_room(i, xs.len, 0);
+    for k in 0..i.xs.len {
+        let x = live_op(i.xs.get(k));
+        i.xs.set(k, x);
+        xs_link(i, k, x);
+    }
+}
+
+// Puts i on the lists of what it reads (its operands through resolve(),
+// which those of an instruction out of a block may need).
+fn register(i: *mut Value) void {
+    i.xucap = i.xucap | XU_REG;
+    i.a = live_op(i.a);
+    i.ua.back = 0;
+    if tracked(i.a) {
+        use_link(&mut i.ua, i.a, 0);
+    }
+    i.b = live_op(i.b);
+    i.ub.back = 0;
+    if tracked(i.b) {
+        use_link(&mut i.ub, i.b, 1);
+    }
+    i.c = live_op(i.c);
+    i.uc.back = 0;
+    if tracked(i.c) {
+        use_link(&mut i.uc, i.c, 2);
+    }
+    let n = i.xs.len;
+    if n > 0 {
+        xu_room(i, n, 0);
+        for k in 0..n {
+            let x = live_op(i.xs.get(k));
+            i.xs.set(k, x);
+            xs_link(i, k, x);
+        }
+    }
+}
+
+// Takes i off the lists of what it reads.
+fn unregister(i: *mut Value) void {
+    if not is_reg(i) {
+        return;
+    }
+    i.xucap = i.xucap & XU_CAP;
+    use_unlink(&mut i.ua, i.a);
+    use_unlink(&mut i.ub, i.b);
+    use_unlink(&mut i.uc, i.c);
+    for k in 0..i.xs.len {
+        use_unlink(xuse(i, k), i.xs.get(k));
+    }
+}
+
+// i goes into block b: registered if b is in its function.
+inline fn placed(i: *mut Value, b: *Block) void {
+    if b.gone {
+        unregister(i);
+    } else if not is_reg(i) {
+        register(i);
+    }
+}
+
+// Every use of instruction `old` reads `new` instead, at a cost of one
+// step per use.
+pub fn replace_all(old: *mut Value, new: *mut Value) void {
+    let h = old.first_use;
+    if (old == new) or u.isnil(h) {
+        return;
+    }
+    let mut p = h;
+    let mut last = h;
+    while u.notnil(p) {
+        let i = use_user(p);
+        let k = use_slot(p);
+        if k == 0 {
+            i.a = new;
+        } else if k == 1 {
+            i.b = new;
+        } else if k == 2 {
+            i.c = new;
+        } else {
+            i.xs.set(k - 3, new);
+        }
+        last = p;
+        p = p.next;
+    }
+    let n = old.nuses;
+    old.first_use = u.nil.[Use]();
+    old.nuses = 0;
+    if not tracked(new) {
+        p = h;
+        while u.notnil(p) {
+            let nx = p.next;
+            p.back = 0;
+            p.next = u.nil.[Use]();
+            p = nx;
+        }
+        return;
+    }
+    // (old's list goes before new's)
+    let nh = new.first_use;
+    last.next = nh;
+    if u.notnil(nh) {
+        nh.back = @int_from_ptr(&mut last.next) | (nh.back & USE_TAG);
+    }
+    h.back = @int_from_ptr(&mut new.first_use) | (h.back & USE_TAG);
+    new.first_use = h;
+    new.nuses += n;
+}
+
+// The places on v's list come off it (v is gone; its users, which should
+// have none, keep reading it).
+fn drop_uses(v: *mut Value) void {
+    let mut p = v.first_use;
+    while u.notnil(p) {
+        let nx = p.next;
+        p.back = 0;
+        p.next = u.nil.[Use]();
+        p = nx;
+    }
+    v.first_use = u.nil.[Use]();
+    v.nuses = 0;
+}
+
+// Replaces every use of `old` by `new` in function f (operands only).
+pub fn replace_uses(f: *mut Func, old: *mut Value, new: *mut Value) void {
+    if dbg_on {
+        dbg_replace(old, new);
+    }
+    if tracked(old) {
+        replace_all(old, live_op(new));
+        return;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            replace_in(i, old, new);
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
+    if i.a == old {
+        set_a(i, new);
+    }
+    if i.b == old {
+        set_b(i, new);
+    }
+    if i.c == old {
+        set_c(i, new);
+    }
+    for k in 0..i.xs.len {
+        if i.xs.get(k) == old {
+            set_x(i, k, new);
+        }
+    }
+}

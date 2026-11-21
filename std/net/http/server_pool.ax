@@ -1,0 +1,481 @@
+// =============================================================================
+// std/net/http/server_pool.ax - connection slots, client tracking, eviction,
+// memory budget enforcement, draining, and worker dispatch (part of std/net/http).
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../mem.ax" as mem;
+import "../../net.ax" as net;
+import "../../str.ax" as strs;
+import "../../time.ax" as time;
+import "../tls.ax" as tls;
+
+// What a connection is speaking.
+const SPEAKS_TLS_HANDSHAKE: u8 = 0;
+const SPEAKS_HTTP1: u8 = 1;
+const SPEAKS_HTTP2: u8 = 2;
+const SPEAKS_NOTHING: u8 = 3;  // answered for the last time: what still comes is drained (drain)
+
+/// A connection of a server's: waiting in run()'s Poller, or with a worker
+/// (one thread at a time has it).
+struct Slot {
+    fd: i32,
+    peer: net.Addr,
+    speaks: u8,
+    t: Transport,       // (once any TLS handshake is done)
+    tc: *mut tls.Conn,  // (during the handshake)
+    c: Conn,            // (HTTP/1, has_c)
+    has_c: bool,
+    h2: *mut H2Conn,  // (HTTP/2)
+    body: strs.String,
+    scratch: Scratch,
+    deadline: i64,    // monotonic ns at which waiting for it ends
+    since: i64,       // when it was accepted, or last answered a request
+    idle_until: i64,  // (between requests) when it is closed
+    req_start: i64,   // when the request being received began (0: none, between requests)
+    served: bool,     // a request has been answered
+    in_body: bool,    // the head is in, the body is coming (HTTP/2: a request is)
+    win_start: i64,   // the window min_body_rate is measured in, and the body bytes received by then
+    win_mark: u64,
+    rx_bucket: i64,  // body bytes taken in recently: in the RX_BUCKET from rx_bucket, and the one before
+    rx_cur: u64,
+    rx_prev: u64,
+    head_off: usize,
+    head_len: usize,
+    chunked: bool,
+    body_left: usize,  // (Content-Length)
+    chunk: ChunkState,
+    held: usize,        // bytes its buffers hold (atomic: run()'s thread reads it)
+    ready: bool,        // handed back with more to do: straight to a worker again
+    expired: bool,      // its time ran out: a worker answers (408, GOAWAY) and closes it
+    evict_status: u16,  // (expired) made to give back its memory: 503
+    linger: bool,       // (closing) the client may still be sending: drain first
+    drain_left: usize,  // (draining) bytes more it may send before it is closed
+    closed: bool,
+}
+
+fn ms_ns(ms: u32) i64 {
+    return @as(i64, ms) * 1000000;
+}
+
+fn now_ns() i64 {
+    return time.Instant.now().ns;
+}
+
+// Closes a connection and frees what it holds but the Slot. polite: with
+// TLS's close_notify (a write: workers only).
+fn close_slot(sl: *mut Slot, polite: bool) void {
+    if sl.closed {
+        return;
+    }
+    if sl.speaks == SPEAKS_TLS_HANDSHAKE {
+        sl.tc.closed_write = true;  // (no alert)
+        sl.tc.close();
+    } else {
+        if sl.speaks == SPEAKS_HTTP2 {
+            sl.h2.h.deinit();
+            sl.h2.hs.deinit();
+            mem.destroy(sl.h2);
+        }
+        if sl.t.secure and not polite {
+            sl.t.tls.closed_write = true;
+        }
+        sl.t.close();
+    }
+    if sl.has_c {
+        sl.c.deinit();
+        sl.has_c = false;
+    }
+    sl.body.deinit();
+    sl.scratch.clear();
+    sl.scratch.blocks.deinit();
+    sl.closed = true;
+}
+
+// Whether a connection whose time ran out is owed an answer: one with part
+// of a request (408), or HTTP/2 (GOAWAY).
+fn owed_answer(sl: *Slot) bool {
+    if sl.speaks == SPEAKS_HTTP2 {
+        return true;
+    }
+    return (sl.speaks == SPEAKS_HTTP1) and sl.has_c and (sl.in_body or (sl.c.end > sl.c.start));
+}
+
+// Drops a closed connection from the list of open ones and frees it.
+fn forget(all: *mut vec.Vec.[*mut Slot], sl: *mut Slot) void {
+    let xs = all.items();
+    for k in @as(usize, 0)..xs.len {
+        if xs[k] == sl {
+            _ = all.swap_remove(k);
+            break;
+        }
+    }
+    mem.destroy(sl);
+}
+
+// The bytes a connection's buffers hold.
+fn held_by(sl: *Slot) usize {
+    if sl.closed {
+        return 0;
+    }
+    let mut n = sl.body.len();
+    if sl.has_c {
+        n += sl.c.buf.len;
+    }
+    if sl.speaks == SPEAKS_HTTP2 {
+        n += sl.h2.h.buffered + sl.h2.h.rbuf.len;
+    }
+    return n;
+}
+
+// How readily a waiting connection is closed to make room: 0 one being
+// drained after its last answer, 1 one that has not been answered yet (nor
+// is sending a body), 2 one idle between requests, 3 one in the middle of
+// a request.
+fn eviction_class(sl: *Slot) u8 {
+    if sl.speaks == SPEAKS_NOTHING {
+        return 0;
+    }
+    if sl.in_body {
+        return 3;
+    }
+    if not sl.served {
+        return 1;
+    }
+    if (sl.speaks == SPEAKS_HTTP1) and (sl.req_start != 0) {
+        return 3;
+    }
+    return 2;
+}
+
+/// One client (an IPv4 address, or an IPv6 /64) and what its connections
+/// hold, for choosing among connections.
+struct ClientStat {
+    used: bool,
+    family: net.Family,
+    ip: [16]u8,  // (the part that counts; the rest zero)
+    count: usize,
+    held: usize,
+}
+
+/// The clients of a set of connections, by address (open addressing).
+struct Clients {
+    stats: []mut ClientStat,
+
+    fn of(all: *vec.Vec.[*mut Slot]) { OutOfMemory }!Clients {
+        let mut cap: usize = 16;
+        while cap < (2 * all.len()) {
+            cap *= 2;
+        }
+        let mut t = Clients.{ stats: mem.alloc_zeroed.[ClientStat](cap)! };
+        for x in all.items() {
+            let st = t.find(x.peer);
+            st.count += 1;
+            st.held += @atomic_load(&x.held);
+        }
+        return t;
+    }
+
+    fn deinit(self: *mut Clients) void {
+        mem.free(self.stats);
+    }
+
+    /// The client's entry (a new one if it has none).
+    fn find(self: *mut Clients, a: net.Addr) *mut ClientStat {
+        let mut ip: [16]u8 = [0; 16];
+        let n = client_bytes(a);
+        @mem_copy(ip[..n], a.ip[..n]);
+        let mut h: u64 = 14695981039346656037 ^ @as(u64, @int_from_enum(a.family));
+        for b in ip {
+            h = (h ^ @as(u64, b)) *% 1099511628211;
+        }
+        let mask = self.stats.len - 1;
+        let mut i = @truncate(usize, h) & mask;
+        loop {
+            let st = &mut self.stats[i];
+            if not st.used {
+                st.used = true;
+                st.family = a.family;
+                st.ip = ip;
+                return st;
+            }
+            if (st.family == a.family) and @mem_eq(st.ip[..], ip[..]) {
+                return st;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+// How many bytes of an address say which client it is: an IPv4 address,
+// an IPv6 /64 (an IPv4-mapped one whole).
+fn client_bytes(a: net.Addr) usize {
+    if a.family != net.Family.V6 {
+        return 4;
+    }
+    let mapped: [12]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF];
+    if @mem_eq(a.ip[..12], mapped[..]) {
+        return 16;
+    }
+    return 8;
+}
+
+// Whether two peers count as one client.
+fn same_client(a: net.Addr, b: net.Addr) bool {
+    if a.family != b.family {
+        return false;
+    }
+    let n = client_bytes(a);
+    return @mem_eq(a.ip[..n], b.ip[..n]);
+}
+
+// The waiting connection to close to make room (waiting.len: none): see
+// Options.max_connections.
+fn pick_victim(all: *vec.Vec.[*mut Slot], waiting: *vec.Vec.[*mut Slot]) usize {
+    let ws = waiting.items();
+    // (out of memory: by class and age alone)
+    let none = Clients.{ stats: [] };
+    let mut clients = Clients.of(all) catch none;
+    let have = clients.stats.len > 0;
+    defer {
+        if have {
+            clients.deinit();
+        }
+    }
+    let mut best: usize = ws.len;
+    let mut best_class: u8 = 4;
+    let mut best_count: usize = 0;
+    for k in @as(usize, 0)..ws.len {
+        let class = eviction_class(ws[k]);
+        if class > best_class {
+            continue;
+        }
+        let mut count: usize = 0;
+        if have {
+            count = clients.find(ws[k].peer).count;
+        }
+        if (class < best_class) or (count > best_count) or ((count == best_count) and (ws[k].since < ws[best].since)) {
+            best = k;
+            best_class = class;
+            best_count = count;
+        }
+    }
+    return best;
+}
+
+// Closes a waiting connection at once (no answer) and frees it.
+fn drop_waiting(all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot], k: usize) void {
+    let sl = waiting.swap_remove(k);
+    close_slot(sl, false);
+    forget(all, sl);
+}
+
+// Hands a waiting connection to a worker to be answered (status: 408, or
+// 503 to give its memory back; HTTP/2: GOAWAY) and closed, or closes it
+// here if it is owed no answer.
+fn expire[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], sl: *mut Slot, status: u16) void {
+    if owed_answer(sl) {
+        sl.expired = true;
+        sl.evict_status = status;
+        @atomic_store(&mut sl.held, 0);  // (being given back)
+        s.work.send(sl) catch {};
+    } else {
+        close_slot(sl, false);
+        forget(all, sl);
+    }
+}
+
+/// A body that took in fewer bytes than this over the last half second
+/// (or second) is the first to give its memory back when the server holds
+/// too much: twice min_body_rate's second's worth, so well above what a
+/// client could aim for just to stay, and at least 8 KiB.
+fn slow_rx(o: Options) u64 {
+    return @max(@as(u64, o.min_body_rate) * 2, 8192);
+}
+
+// Keeps the bytes held by connections within max_buffered_bytes. Those
+// that give theirs back (503) are chosen among the connections waiting
+// (not those that have more already arrived: a worker took a turn's worth
+// and gives them another at once), slow ones first (slow_rx), from the
+// client holding the most, the one holding the most.
+fn enforce_budget[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting: *mut vec.Vec.[*mut Slot]) void {
+    let mut total: usize = 0;
+    for x in all.items() {
+        total += @atomic_load(&x.held);
+    }
+    if total <= s.opts.max_buffered_bytes {
+        return;
+    }
+    let mut clients = Clients.of(all) catch return;
+    defer clients.deinit();
+    let now = now_ns();
+    let slow = slow_rx(s.opts);
+    while total > s.opts.max_buffered_bytes {
+        let ws = waiting.items();
+        let mut best: usize = ws.len;
+        let mut best_fast = true;
+        let mut best_client: usize = 0;
+        for k in @as(usize, 0)..ws.len {
+            let x = ws[k];
+            if (x.held == 0) or x.ready {
+                continue;
+            }
+            let fast = recent_rx(x, now) >= slow;
+            let by_client = clients.find(x.peer).held;
+            let better = (best == ws.len) or (best_fast and not fast) or
+                         ((fast == best_fast) and
+                          ((by_client > best_client) or ((by_client == best_client) and (x.held > ws[best].held))));
+            if better {
+                best = k;
+                best_fast = fast;
+                best_client = by_client;
+            }
+        }
+        if best == ws.len {
+            return;  // (what is left is with the workers, or being read)
+        }
+        let sl = waiting.swap_remove(best);
+        let st = clients.find(sl.peer);
+        st.held -= @min(st.held, sl.held);
+        total -= @min(total, sl.held);
+        expire(s, all, sl, 503);
+    }
+}
+
+/// How long, and for how many bytes, a connection answered for the last
+/// time is drained of what its client still sends before it is closed
+/// (closing with bytes unread may reset the connection, and the client
+/// lose the answer).
+const DRAIN_MS: u32 = 2000;
+const DRAIN_BYTES: usize = 1048576;
+
+// Answers status (an error) and has the connection closed once drained.
+fn refuse(sl: *mut Slot, status: u16) u8 {
+    _ = reject(sl.c.stream, status);
+    sl.linger = true;
+    return HTTP1_CLOSE;
+}
+
+// After a last answer: sends the end of the stream (TLS: close_notify
+// first), frees what the connection held, and leaves it to run()'s thread
+// to drain (drain) for at most DRAIN_MS and DRAIN_BYTES. False if it is
+// to be closed at once.
+fn begin_drain(sl: *mut Slot) bool {
+    if (sl.speaks != SPEAKS_HTTP1) and (sl.speaks != SPEAKS_HTTP2) {
+        return false;
+    }
+    if sl.t.secure {
+        sl.t.tls.close_write();
+    }
+    sl.t.tcp.shutdown_write() catch return false;
+    if sl.speaks == SPEAKS_HTTP2 {
+        sl.h2.h.deinit();
+        sl.h2.hs.deinit();
+        mem.destroy(sl.h2);
+    }
+    if sl.has_c {
+        sl.c.deinit();
+        sl.has_c = false;
+    }
+    sl.body.deinit();
+    sl.body = strs.String.init();
+    sl.speaks = SPEAKS_NOTHING;
+    sl.in_body = false;
+    sl.req_start = 0;
+    sl.ready = false;
+    sl.expired = false;
+    sl.drain_left = DRAIN_BYTES;
+    sl.deadline = now_ns() + ms_ns(DRAIN_MS);
+    return true;
+}
+
+// (run()'s thread) Reads and drops what a draining connection's client
+// sent; false once it should be closed (the client closed, or it is past
+// DRAIN_BYTES).
+fn drain(sl: *mut Slot) bool {
+    let mut junk: [16384]u8 = [0; 16384];
+    while sl.drain_left > 0 {
+        if (net.poll_one(sl.fd, net.READABLE, 0) catch 0) == 0 {
+            return true;
+        }
+        let n = sl.t.tcp.read(junk[..@min(junk.len, sl.drain_left)]) catch return false;
+        if n == 0 {
+            return false;
+        }
+        sl.drain_left -= n;
+    }
+    return false;
+}
+
+// A worker: serves connections with bytes to read, and hands each back
+// (to wait for more, or closed).
+fn work_loop[C](s: *mut Server.[C]) void {
+    loop {
+        let sl = s.work.recv() catch return;  // (closed: stopping)
+        let mut more = false;
+        let before = received_by(sl);
+        if @atomic_load(&s.stopping) == 0 {
+            more = advance(s, sl);
+        }
+        if more {
+            let after = received_by(sl);
+            if after >= before {
+                note_rx(sl, after - before, now_ns());
+            } else {
+                note_rx(sl, after, now_ns());  // (a new request)
+            }
+        }
+        if not more and sl.linger and (@atomic_load(&s.stopping) == 0) {
+            more = begin_drain(sl);  // (closed, without losing the answer, once drained)
+        }
+        if not more or (@atomic_load(&s.stopping) != 0) {
+            close_slot(sl, true);
+        }
+        @atomic_store(&mut sl.held, held_by(sl));
+        s.back.send(sl) catch {};  // (never full: it holds every connection)
+        s.wake_up();
+    }
+}
+
+// Serves what has arrived on a connection; true to wait for more, false to
+// close it.
+fn advance[C](s: *mut Server.[C], sl: *mut Slot) bool {
+    if sl.speaks == SPEAKS_TLS_HANDSHAKE {
+        if sl.expired {
+            return false;
+        }
+        _ = sl.tc.handshake_step() catch |e| {
+            if e == error.WouldBlock {
+                sl.deadline = sl.tc.deadline;
+                return true;
+            }
+            return false;
+        };
+        sl.t = Transport.over_tls(sl.tc);
+        if strs.eq(sl.tc.protocol(), "h2") {
+            if not start_h2(s, sl, "") {
+                return false;
+            }
+        } else {
+            sl.speaks = SPEAKS_HTTP1;
+            sl.req_start = now_ns();
+        }
+    }
+    if sl.speaks == SPEAKS_HTTP1 {
+        let r = advance_http1(s, sl);
+        if r != HTTP1_TO_H2 {
+            return r == HTTP1_WAIT;
+        }
+        // the preface was read as a request head: give HTTP/2 all of it
+        let mut pre = strs.String.init();
+        defer pre.deinit();
+        pre.push_str("PRI * HTTP/2.0\r\n\r\n") catch return false;
+        pre.push_str(sl.c.buf[sl.c.start..sl.c.end]) catch return false;
+        sl.c.deinit();
+        sl.has_c = false;
+        if not start_h2(s, sl, pre.bytes()) {
+            return false;
+        }
+    }
+    return advance_h2(s, sl);
+}

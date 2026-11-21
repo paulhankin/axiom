@@ -13,7 +13,6 @@
 import "ast.ax" as ast;
 import "axdebug.ax" as axd;
 import "cgbase.ax" as cgb;
-import "cgbuiltin.ax" as bi;
 import "cgctx.ax" as cx;
 import "cgrt.ax" as cgrt;
 import "diag.ax" as dg;
@@ -24,6 +23,7 @@ import "semapost.ax" as spost;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
+import part "cgbuiltin.ax";
 
 fn type_mentions_error(t: *mut ast.Type) bool {
     let k = t.kind;
@@ -213,7 +213,7 @@ fn emit_ret(v: *mut ir.Value) void {
         }
     }
     if cx.F.asan_stack.len > 0 {
-        let ff = bi.mem_fn("asan_stack_free");
+        let ff = mem_fn("asan_stack_free");
         for i in 0..cx.F.asan_stack.len {
             let slot = cx.F.asan_stack.get(i);
             let mut fargs: [2]*mut ir.Value = [slot.ptr_u, cx.usz(slot.size)];
@@ -796,7 +796,7 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
     if u.notnil(t) and (t.kind == ast.TY_NEVER) {
         // The expression diverges; generate it and hand back a placeholder.
         if e.kind == ast.E_BUILTIN {
-            _ = bi.gen_builtin(e);
+            _ = gen_builtin(e);
         }
         let mut want = cx.tnil();
         if u.notnil(ast.tval_of(e)) {
@@ -868,7 +868,7 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
     } else if k == ast.E_ERROR_VAL {
         return cgb.errcode_value(@truncate(u32, ast.cval_of(e).lo));
     } else if k == ast.E_BUILTIN {
-        return bi.gen_builtin(e);
+        return gen_builtin(e);
     } else if k == ast.E_UNARY {
         return gen_unary(e);
     } else if k == ast.E_BINARY {
@@ -895,10 +895,10 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         let fk = ast.field_kind_of(e);
         if fk == ast.FK_STRUCT {
             if sema.is_place(e) {
-                return cgrt.load(t, bi.asan_place(e, gen_addr(e)), cgb.via_pointer(e));
+                return cgrt.load(t, asan_place(e, gen_addr(e)), cgb.via_pointer(e));
             }
             if ast.self_mode_of(e) == ast.SELF_DEREF {
-                return cgrt.load(t, bi.asan_place(e, gen_addr(e)), true);
+                return cgrt.load(t, asan_place(e, gen_addr(e)), true);
             }
             return cgrt.from_mem(t, cx.extract(gen(e.a), @int_cast(u32, ast.index_of(e))));
         }
@@ -927,10 +927,9 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
             return cgb.get_inst(ast.decl_of(e), subst_gargs(ast.gargs_of(e))).fnv;
         }
     } else if k == ast.E_DEREF {
-        return cgrt.load(t, bi.asan_place(e, gen_addr(e)), true);
+        return cgrt.load(t, asan_place(e, gen_addr(e)), true);
     } else if k == ast.E_INDEX {
-        return cgrt.load(t, bi.asan_place(e, gen_addr(e)), cgb.via_pointer(e) or
-                         (ast.index_kind_of(e) != ast.IDX_ARRAY));
+        return cgrt.load(t, asan_place(e, gen_addr(e)), cgb.via_pointer(e) or (ast.index_kind_of(e) != ast.IDX_ARRAY));
     } else if k == ast.E_SLICE {
         return gen_slice(e);
     } else if k == ast.E_APPLY {
@@ -1095,7 +1094,7 @@ fn gen_for(s: *mut ast.Stmt) void {
         cgrt.store(vt, ep, var, false);
     } else {
         if ctt.kind == ast.TY_SLICE {
-            bi.asan_check(ep, cx.usz(ty.type_size(elt)));
+            asan_check(ep, cx.usz(ty.type_size(elt)));
         }
         cgrt.store(elt, cgrt.load(elt, ep, ctt.kind == ast.TY_SLICE), var, false);
     }
@@ -1156,7 +1155,7 @@ fn gen_match(s: *mut ast.Stmt) void {
         let mut up = cx.vnil();
         if by_ref {
             up = gen(s.e);
-            bi.asan_check(up, cx.usz(ty.type_size(t)));
+            asan_check(up, cx.usz(ty.type_size(t)));
         } else {
             up = addr_or_spill(s.e);
         }
@@ -1210,7 +1209,7 @@ fn gen_match(s: *mut ast.Stmt) void {
         let mut has = cx.vnil();
         if by_ref {
             let up = gen(s.e);
-            bi.asan_check(up, cx.usz(ty.type_size(t)));
+            asan_check(up, cx.usz(ty.type_size(t)));
             let niche = ty.opt_niche(t);
             if niche == ty.OPT_PTR {
                 let pv = cgrt.load(t.elem, up, true);
@@ -1384,10 +1383,10 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
             if u.isnil(v) {
                 return;
             }
-            cgrt.store(t, v, bi.asan_place(s.e, addr), un);
+            cgrt.store(t, v, asan_place(s.e, addr), un);
             return;
         }
-        _ = bi.asan_place(s.e, addr);
+        _ = asan_place(s.e, addr);
         let old = cgrt.load(t, addr, un);
         let r = gen(s.e2);
         let nv = cgb.gen_binop(ast.op_of(ast.stmt_more(s).e3), t, old, r);
@@ -1439,14 +1438,6 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
     } else if k == ast.S_BLOCK {
         gen_block(s);
     }
-}
-
-// cgbuiltin.ax's way back to this module's expressions: set when a unit's
-// code generation starts, on each thread that generates code (cgmain.ax:
-// codegen_program, on the main thread and units.ax's; the threads of a
-// program's parts, backend.compile_parts, generate none).
-pub fn set_hooks() void {
-    bi.gen = gen;
 }
 
 // Wrappers that track the source span of the code being generated, for
@@ -1545,7 +1536,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     // code before its body's first statement)
     cgrt.set_span(d.name_span);
     ir.fnp_of(fi.fnv).src = ir.cur_src;
-    ir.fnp_of(fi.fnv).coverage = bi.cov_on(d.module);
+    ir.fnp_of(fi.fnv).coverage = cov_on(d.module);
     stt.no_trace = cgrt.is_runtime_module(d.module);
     stt.locals = u.newn.[*mut ir.Value](d.locals.len + 1);
     stt.asan_stack = u.List.[cx.AsanStackSlot].empty();
@@ -1561,7 +1552,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
         stt.sret_ptr = cgrt.param(fi.fnv, k);
         k += 1;
     }
-    let asan_noalias = bi.asan_on() and has_noalias_param(d);
+    let asan_noalias = asan_on() and has_noalias_param(d);
     let mut na_addrs = u.List.[*mut ir.Value].empty();
     let mut na_sizes = u.List.[*mut ir.Value].empty();
     if asan_noalias {
@@ -1607,7 +1598,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     }
     na_addrs.deinit();
     na_sizes.deinit();
-    if bi.asan_on() {
+    if asan_on() {
         cgrt.set_span(d.name_span);
         for i in 0..d.locals.len {
             let l = d.locals.get(i);
@@ -1616,7 +1607,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
                 let sz = ty.type_size(t);
                 if ((t.kind == ast.TY_ARRAY) or (t.kind == ast.TY_STRUCT) or (t.kind == ast.TY_UNION)) and (sz > 0) {
                     let fb = cgrt.local_ptr(l);
-                    let fa = bi.mem_fn("asan_stack_alloc");
+                    let fa = mem_fn("asan_stack_alloc");
                     let mut aargs: [2]*mut ir.Value = [cx.usz(sz), cx.usz(ty.type_align(t))];
                     let heap_u = cx.call(fa.llty, fa.fnv, aargs[..]);
                     let ok = cx.icmp(ir.IntNE, heap_u, cx.usz(0));

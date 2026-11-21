@@ -1,0 +1,512 @@
+// =============================================================================
+// sema_generics.ax - generic parameters, constraints, argument checking and
+// generic application, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "modload.ax" as modl;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Generic parameters and arguments
+// ---------------------------------------------------------------------------
+fn ensure_gparams(d: *mut ast.Decl) void {
+    if d.gparams_done or d.gparams_resolving {
+        return;
+    }
+    d.gparams_resolving = true;
+    let mut gowner = d;
+    let mut gfn = dnil();
+    let mut oself = tnil();
+    if u.notnil(d.owner) {
+        if d.owner.state == ast.DeclState.UNRESOLVED {
+            resolve_decl(d.owner);
+        }
+        ensure_gparams(d.owner);
+        gowner = d.owner;
+        gfn = d;
+        oself = d.owner.ty;
+    } else if (d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN) {
+        gowner = dnil();
+        gfn = d;
+    }
+    for i in 0..d.gparams.len {
+        let g = d.gparams.at_mut(i);
+        if u.notnil(g.ty) {
+            continue;
+        }
+        let mut c = ast.C_NONE;
+        let mut ct = tnil();
+        let mut lane = tnil();
+        if g.is_const {
+            let mut tc = type_ctx(d.module, gowner, gfn, oself);
+            ct = resolve_type(g.const_te, &mut tc);
+            if (ct.kind != ast.TY_INT) and (ct.kind != ast.TY_FN) and (ct.kind != ast.TY_INVALID) {
+                _ = dg.err(g.const_te.span, "E0471",
+                           u.f1("const generic parameter must have an integer or function type, found %s", tstr(ct)));
+                ct = ty.t_usize;
+            }
+            g.ty = ty.type_param(d, @int_cast(i32, i), g.name, c, g.is_const, ct);
+        } else if g.is_error {
+            g.ty = ty.type_err_param(d, @int_cast(i32, i), g.name);
+        } else {
+            if not u.isnos(g.constraint) {
+                let mut cc = ty.constraint_from_name(g.constraint);
+                if cc < 0 {
+                    _ = dg.err(g.constraint_span, "E0470",
+                               u.f1("unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt, Float, FloatVector, IntVector or Vector)",
+                                    g.constraint));
+                    cc = ast.C_NONE;
+                } else if (cc == ast.C_FLOAT_VEC) or (cc == ast.C_INT_VEC) or (cc == ast.C_VEC) {
+                    if u.isnil(g.constraint_te) {
+                        _ = dg.err(g.constraint_span, "E0470",
+                                   u.f2("vector constraint '%s' requires a lane type, e.g. %s[f32]", g.constraint,
+                                        g.constraint));
+                    } else {
+                        let mut tc = type_ctx(d.module, gowner, gfn, oself);
+                        let lt = resolve_type(g.constraint_te, &mut tc);
+                        if lt.kind != ast.TY_INVALID {
+                            let mut ok = false;
+                            if cc == ast.C_FLOAT_VEC {
+                                ok = (lt.kind == ast.TY_FLOAT) or
+                                     ((lt.kind == ast.TY_PARAM) and not lt.is_const and ty.satisfies(lt, ast.C_FLOAT));
+                            } else if cc == ast.C_INT_VEC {
+                                ok = ((lt.kind == ast.TY_INT) and not lt.is_size) or
+                                     ((lt.kind == ast.TY_PARAM) and not lt.is_const and ty.satisfies(lt, ast.C_INT));
+                            } else {
+                                ok = (lt.kind == ast.TY_FLOAT) or ((lt.kind == ast.TY_INT) and not lt.is_size) or
+                                     ((lt.kind == ast.TY_PARAM) and not lt.is_const and ty.satisfies(lt, ast.C_NUM));
+                            }
+                            if ok {
+                                lane = lt;
+                            } else {
+                                _ = dg.err(g.constraint_te.span, "E0470",
+                                           u.f2("invalid lane type %s for constraint '%s'", tstr(lt), g.constraint));
+                            }
+                        }
+                    }
+                } else if u.notnil(g.constraint_te) {
+                    _ = dg.err(g.constraint_te.span, "E0470",
+                               u.f1("constraint '%s' does not take a lane type parameter", g.constraint));
+                }
+                c = cc;
+            }
+            g.ty = ty.type_param(d, @int_cast(i32, i), g.name, c, g.is_const, ct);
+            g.ty.constraint_lane = lane;
+        }
+        for j in 0..i {
+            if placeholder(g.name) {
+                break;
+            }
+            if u.same(d.gparams.at(j).name, g.name) {
+                dup_error(g.span, g.name, d.gparams.at(j).span);
+            }
+        }
+    }
+    d.gparams_resolving = false;
+    d.gparams_done = true;
+}
+
+fn decl_gparam_types(d: *mut ast.Decl) []mut *mut ast.Type {
+    ensure_gparams(d);
+    let ts = u.newn.[*mut ast.Type](d.gparams.len);
+    for i in 0..d.gparams.len {
+        ts[i] = d.gparams.at_mut(i).ty;
+    }
+    return ts;
+}
+
+fn make_self_type(d: *mut ast.Decl) *mut ast.Type {
+    return ty.type_named(d, decl_gparam_types(d));
+}
+
+fn lookup_gparam(tc: *mut TypeCtx, name: []u8) *mut ast.Type {
+    let ds = [tc.gfn, tc.gowner];
+    for d in ds {
+        if u.isnil(d) {
+            continue;
+        }
+        ensure_gparams(d);
+        for i in 0..d.gparams.len {
+            if u.same(d.gparams.at(i).name, name) {
+                return d.gparams.at_mut(i).ty;
+            }
+        }
+    }
+    return tnil();
+}
+
+fn constraint_str(c: i32, lane: *ast.Type) []u8 {
+    if u.notnil(lane) and ((c == ast.C_FLOAT_VEC) or (c == ast.C_INT_VEC) or (c == ast.C_VEC)) {
+        return u.f2("%s[%s]", ty.constraint_name(c), tstr(lane));
+    }
+    return ty.constraint_name(c);
+}
+
+fn resolve_constfn_decl(d: *mut ast.Decl, owner_args: []mut *mut ast.Type, fn_arg_tes: *u.List.[*mut ast.TypeExpr],
+                        has_fn_args: bool, sp: u.Span, name_span: u.Span, tc: *mut TypeCtx) *mut ast.Type {
+    resolve_decl(d);
+    if (d.state != ast.DeclState.DONE) or u.isnil(d.ty) {
+        return ty.t_invalid;
+    }
+    if (d.kind == ast.D_HOST_FN) and d.cabi {
+        _ = dg.err(name_span, "E0801",
+                   u.f1("the C function '%s' takes or returns a structure by value: it can only be called, not used as a function value",
+                        d.name));
+        return ty.t_invalid;
+    }
+    if d.gparams.len == 0 {
+        if has_fn_args {
+            _ = dg.err(sp, "E0468", u.f1("'%s' is not generic", d.name));
+            return ty.t_invalid;
+        }
+        ensure_infer_ret(d);
+        let mut fn_ty = d.ty;
+        if owner_args.len != 0 {
+            fn_ty = ty.subst(d.ty, d.all_gparams, owner_args);
+        }
+        return ty.type_constfn(d, owner_args, fn_ty);
+    }
+    if not has_fn_args {
+        let g = dg.err(sp, "E0466", u.f2("generic function '%s' must be instantiated before use: %s.[...]", d.name,
+                                         d.name));
+        dg.note(g, d.name_span, u.f1("'%s' declared here", d.name));
+        return ty.t_invalid;
+    }
+    let margs = u.newn.[*mut ast.Type](fn_arg_tes.len);
+    for i in 0..fn_arg_tes.len {
+        margs[i] = resolve_generic_arg(fn_arg_tes.get(i), tc);
+    }
+    if not check_generic_args_ctx(d, owner_args, margs, sp, fn_arg_tes) {
+        return ty.t_invalid;
+    }
+    let all_args = u.newn.[*mut ast.Type](owner_args.len + margs.len);
+    for i in 0..owner_args.len {
+        all_args[i] = owner_args[i];
+    }
+    for i in 0..margs.len {
+        all_args[owner_args.len + i] = margs[i];
+    }
+    ensure_infer_ret(d);
+    let fn_ty = ty.subst(d.ty, d.all_gparams, all_args);
+    return ty.type_constfn(d, all_args, fn_ty);
+}
+
+// A generic argument: a type, an integer literal, a const name, or a function.
+fn resolve_generic_arg(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
+    match te.shape {
+        .IntLit(v) => { return ty.type_constint(@bit_cast(i64, v)); }
+        .Named(nt) => {
+            if nt.has_member {
+                let base_nt = ast.NamedType.{
+                    qual: nt.qual,
+                    name: nt.name,
+                    name_span: nt.name_span,
+                    args: nt.args,
+                    has_args: nt.has_args,
+                    has_member: false,
+                    member: u.nosym(),
+                    member_span: u.mkspan(0, 0, 0),
+                    member_args: u.List.[*mut ast.TypeExpr].empty(),
+                    has_member_args: false,
+                };
+                let td = resolve_named_decl(base_nt, te.span, tc, true);
+                if u.isnil(td) {
+                    return ty.t_invalid;
+                }
+                if (td.kind != ast.D_STRUCT) and (td.kind != ast.D_UNION) and (td.kind != ast.D_ENUM) {
+                    _ = dg.err(nt.name_span, "E0400", u.f1("'%s' is not a type", nt.name));
+                    return ty.t_invalid;
+                }
+                resolve_decl(td);
+                let mut owner_args = ty.no_types();
+                if td.gparams.len == 0 {
+                    if nt.has_args {
+                        _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", nt.name));
+                        return ty.t_invalid;
+                    }
+                } else {
+                    if not nt.has_args {
+                        let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]",
+                                                              td.name, td.name));
+                        dg.note(g, td.name_span, u.f1("'%s' declared here", td.name));
+                        return ty.t_invalid;
+                    }
+                    owner_args = u.newn.[*mut ast.Type](nt.args.len);
+                    for i in 0..nt.args.len {
+                        owner_args[i] = resolve_generic_arg(nt.args.get(i), tc);
+                    }
+                    if not check_generic_args(td, owner_args, te.span, &nt.args) {
+                        return ty.t_invalid;
+                    }
+                }
+                let md = find_method(td, nt.member);
+                if u.isnil(md) {
+                    _ = dg.err(nt.member_span, "E0404", u.f2("type %s has no method '%s'", td.name, nt.member));
+                    return ty.t_invalid;
+                }
+                if not md.is_pub and (md.module != tc.mod) {
+                    let g = dg.err(nt.member_span, "E0203", u.f1("'%s' is not public", nt.member));
+                    dg.note(g, md.name_span, "declared here");
+                    return ty.t_invalid;
+                }
+                return resolve_constfn_decl(md, owner_args, &nt.member_args, nt.has_member_args, te.span,
+                                            nt.member_span, tc);
+            }
+            if not u.isnos(nt.qual) {
+                let imp = modl.module_lookup_import(tc.mod, te.span.file, nt.qual);
+                if u.notnil(imp) {
+                    if u.isnil(imp.imported) {
+                        return ty.t_invalid;
+                    }
+                    let d = module_lookup(imp.imported, nt.name);
+                    if u.isnil(d) {
+                        _ = dg.err(nt.name_span, "E0202", u.f2("module '%s' has no declaration '%s'", nt.qual,
+                                                               nt.name));
+                        return ty.t_invalid;
+                    }
+                    if not d.is_pub {
+                        let g = dg.err(nt.name_span, "E0203", u.f2("'%s' is not public in module '%s'", nt.name,
+                                                                   nt.qual));
+                        dg.note(g, d.name_span, "declared here");
+                        return ty.t_invalid;
+                    }
+                    if d.kind == ast.D_CONST {
+                        if nt.has_args {
+                            _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", nt.name));
+                            return ty.t_invalid;
+                        }
+                        resolve_decl(d);
+                        if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
+                            return ty.type_constint(ast.cval_of(d.cexpr).i64v());
+                        }
+                        _ = dg.err(te.span, "E0472", u.f1("const '%s' is not an integer constant", nt.name));
+                        return ty.t_invalid;
+                    }
+                    if (d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN) {
+                        return resolve_constfn_decl(d, ty.no_types(), &nt.args, nt.has_args, te.span, nt.name_span, tc);
+                    }
+                    return resolve_type(te, tc);
+                }
+                let td = module_lookup(tc.mod, nt.qual);
+                if u.notnil(td) and ((td.kind == ast.D_STRUCT) or (td.kind == ast.D_UNION) or (td.kind == ast.D_ENUM)) {
+                    resolve_decl(td);
+                    if td.gparams.len != 0 {
+                        let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]",
+                                                              td.name, td.name));
+                        dg.note(g, td.name_span, u.f1("'%s' declared here", td.name));
+                        return ty.t_invalid;
+                    }
+                    let md = find_method(td, nt.name);
+                    if u.isnil(md) {
+                        _ = dg.err(nt.name_span, "E0404", u.f2("type %s has no method '%s'", td.name, nt.name));
+                        return ty.t_invalid;
+                    }
+                    if not md.is_pub and (md.module != tc.mod) {
+                        let g = dg.err(nt.name_span, "E0203", u.f1("'%s' is not public", nt.name));
+                        dg.note(g, md.name_span, "declared here");
+                        return ty.t_invalid;
+                    }
+                    return resolve_constfn_decl(md, ty.no_types(), &nt.args, nt.has_args, te.span, nt.name_span, tc);
+                }
+            } else {
+                let gp = lookup_gparam(tc, nt.name);
+                if u.notnil(gp) {
+                    if nt.has_args {
+                        _ = dg.err(te.span, "E0468", u.f1("generic parameter '%s' cannot take arguments", nt.name));
+                        return ty.t_invalid;
+                    }
+                    return gp;
+                }
+                let d = module_lookup(tc.mod, nt.name);
+                if u.notnil(d) {
+                    if d.kind == ast.D_CONST {
+                        if nt.has_args {
+                            _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", nt.name));
+                            return ty.t_invalid;
+                        }
+                        resolve_decl(d);
+                        if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
+                            return ty.type_constint(ast.cval_of(d.cexpr).i64v());
+                        }
+                        _ = dg.err(te.span, "E0472", u.f1("const '%s' is not an integer constant", nt.name));
+                        return ty.t_invalid;
+                    }
+                    if (d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN) {
+                        return resolve_constfn_decl(d, ty.no_types(), &nt.args, nt.has_args, te.span, nt.name_span, tc);
+                    }
+                } else if u.notnil(C) and (tc == &mut C.tc) and u.notnil(scope_lookup(nt.name)) {
+                    _ = dg.err(te.span, "E0462",
+                               u.f1("'%s' is a local variable and cannot be used as a generic argument", nt.name));
+                    return ty.t_invalid;
+                }
+            }
+        }
+        else => {}
+    }
+    return resolve_type(te, tc);
+}
+
+fn check_generic_args_ctx(d: *mut ast.Decl, owner_args: []mut *mut ast.Type, args: []mut *mut ast.Type, sp: u.Span,
+                          tes: *u.List.[*mut ast.TypeExpr]) bool {
+    ensure_gparams(d);
+    let n = args.len;
+    if n != d.gparams.len {
+        let gl = d.gparams.len;
+        _ = dg.err(sp, "E0467", u.f5("'%s' takes %s generic argument%s, but %s %s given", d.name, u.zdec(gl),
+                                     u.pick(gl == 1, "", "s"), u.zdec(n), u.pick(n == 1, "was", "were")));
+        return false;
+    }
+    let mut nowner: usize = 0;
+    if u.notnil(d.owner) and (owner_args.len == d.owner.gparams.len) {
+        nowner = d.owner.gparams.len;
+    }
+    let from = u.newn.[*mut ast.Type](nowner + n);
+    let to = u.newn.[*mut ast.Type](nowner + n);
+    for j in 0..nowner {
+        from[j] = d.owner.gparams.at_mut(j).ty;
+        to[j] = owner_args[j];
+    }
+    let mut ok = true;
+    for i in 0..n {
+        let g = d.gparams.at_mut(i);
+        let a = args[i];
+        from[nowner + i] = g.ty;
+        to[nowner + i] = a;
+        let mut asp = sp;
+        if u.notnil(tes) and (i < tes.len) {
+            asp = tes.get(i).span;
+        }
+        if a.kind == ast.TY_INVALID {
+            continue;
+        }
+        if g.is_const {
+            let ct = ty.subst(g.ty.const_type, from[0..nowner + i], to[0..nowner + i]);
+            if ct.kind == ast.TY_FN {
+                if a.kind == ast.TY_CONSTFN {
+                    if (a.const_type != ct) and not type_has_invalid(ct) and not type_has_invalid(a.const_type) {
+                        let dg_e = dg.err(asp, "E0462", u.f3("generic parameter '%s' expects function %s, found %s",
+                                                             g.name, tstr(ct), tstr(a.const_type)));
+                        dg.note(dg_e, g.span, u.f1("'%s' declared here", g.name));
+                        ok = false;
+                    }
+                } else if (a.kind == ast.TY_PARAM) and a.is_const {
+                    let act = ty.subst(a.const_type, from[0..nowner + i], to[0..nowner + i]);
+                    if act != ct {
+                        let dg_e = dg.err(asp, "E0462", u.f3("generic parameter '%s' expects function %s, found %s",
+                                                             g.name, tstr(ct), tstr(act)));
+                        dg.note(dg_e, g.span, u.f1("'%s' declared here", g.name));
+                        ok = false;
+                    }
+                } else {
+                    let dg_e = dg.err(asp, "E0462", u.f3("generic parameter '%s' expects a %s function, found %s",
+                                                         g.name, tstr(ct), tstr(a)));
+                    dg.note(dg_e, g.span, u.f1("'%s' declared here", g.name));
+                    ok = false;
+                }
+            } else if a.kind == ast.TY_CONSTINT {
+                if not fits_type(u.I128.of(a.cval), ct) {
+                    _ = dg.err(asp, "E0462", u.f3("value %s does not fit const parameter '%s' of type %s",
+                                                  u.dec(a.cval), g.name, tstr(ct)));
+                    ok = false;
+                }
+            } else if not ((a.kind == ast.TY_PARAM) and a.is_const and (a.const_type == ct)) {
+                _ = dg.err(asp, "E0462", u.f3("generic parameter '%s' expects a %s constant, found %s", g.name,
+                                              tstr(ct), tstr(a)));
+                ok = false;
+            }
+        } else if g.is_error {
+            if (a.kind != ast.TY_ERROR) and not ((a.kind == ast.TY_PARAM) and a.is_error_param) {
+                _ = dg.err(asp, "E0654", u.f2("expected an error set for generic error parameter '%s', found %s",
+                                              g.name, tstr(a)));
+                ok = false;
+            }
+        } else {
+            let expected_lane = ty.subst(g.ty.constraint_lane, from[0..nowner + i], to[0..nowner + i]);
+            if (a.kind == ast.TY_CONSTINT) or (a.kind == ast.TY_CONSTFN) or ((a.kind == ast.TY_PARAM) and a.is_const) {
+                _ = dg.err(asp, "E0462", u.f1("generic parameter '%s' expects a type, found a constant", g.name));
+                ok = false;
+            } else if not ty.satisfies_lane(a, g.ty.constraint, expected_lane) {
+                let e = dg.err(asp, "E0462", u.f3("type %s does not satisfy constraint %s of parameter '%s'", tstr(a),
+                                                  constraint_str(g.ty.constraint, expected_lane), g.name));
+                dg.note(e, g.span, u.f1("'%s' declared here", g.name));
+                ok = false;
+            }
+        }
+    }
+    return ok;
+}
+
+fn check_generic_args(d: *mut ast.Decl, args: []mut *mut ast.Type, sp: u.Span, tes: *u.List.[*mut ast.TypeExpr]) bool {
+    return check_generic_args_ctx(d, ty.no_types(), args, sp, tes);
+}
+
+// ---------------------------------------------------------------------------
+// Generic application  x.[args]
+// ---------------------------------------------------------------------------
+fn resolve_garg(te: *mut ast.TypeExpr) *mut ast.Type {
+    return resolve_generic_arg(te, &mut C.tc);
+}
+
+fn check_apply(e: *mut ast.Expr) void {
+    let a = e.a;
+    _ = check_operand(a, tnil());
+    let n = ast.more(e).targs.len;
+    let args = u.newn.[*mut ast.Type](n);
+    for i in 0..n {
+        args[i] = resolve_garg(ast.more(e).targs.get(i));
+    }
+    if a.cat == ast.CAT_GENERIC {
+        let d = ast.decl_of(a);
+        if not check_generic_args(d, args, e.span, &ast.more(e).targs) {
+            e.cat = ast.CAT_TYPE;
+            ast.set_tval(e, ty.t_invalid);
+            return;
+        }
+        e.cat = ast.CAT_TYPE;
+        ast.set_tval(e, ty.type_named(d, args));
+        return;
+    }
+    if (a.cat == ast.CAT_FUNC) or (a.cat == ast.CAT_METHOD) {
+        let f = ast.decl_of(a);
+        if (f.kind == ast.D_HOST_FN) or (f.gparams.len == 0) {
+            _ = dg.err(e.span, "E0468", u.f1("'%s' is not generic", f.name));
+            e.cat = a.cat;
+            ast.set_decl(e, f);
+            ast.set_gargs(e, ast.gargs_of(a));
+            ast.set_b(e, ast.b_of(a));
+            ast.set_self_mode(e, ast.self_mode_of(a));
+            return;
+        }
+        let nall = f.all_gparams.len;
+        if ast.gargs_of(a).len != (nall - f.gparams.len) {
+            _ = dg.err(e.span, "E0469", "generic arguments were already given");
+        }
+        _ = check_generic_args_ctx(f, ast.gargs_of(a), args, e.span, &ast.more(e).targs);
+        let nowner = nall - f.gparams.len;
+        e.cat = a.cat;
+        ast.set_decl(e, f);
+        ast.set_gargs(e, u.newn.[*mut ast.Type](nall));
+        for i in 0..nowner {
+            ast.gargs_of(e)[i] = ast.gargs_of(a)[i];
+        }
+        for i in 0..f.gparams.len {
+            if i < n {
+                ast.gargs_of(e)[nowner + i] = args[i];
+            } else {
+                ast.gargs_of(e)[nowner + i] = ty.t_invalid;
+            }
+        }
+        ast.set_b(e, ast.b_of(a));
+        ast.set_self_mode(e, ast.self_mode_of(a));
+        return;
+    }
+    if a.cat == ast.CAT_TYPE {
+        _ = dg.err(e.span, "E0468", u.f1("type %s is not generic", tstr(ast.tval_of(a))));
+    } else if u.notnil(a.ty) and (a.ty.kind != ast.TY_INVALID) {
+        _ = dg.err(e.span, "E0468", "generic arguments can only be applied to generic types and functions");
+    }
+    e.cat = ast.CAT_VALUE;
+    e.ty = ty.t_invalid;
+}

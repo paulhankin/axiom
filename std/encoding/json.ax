@@ -5,8 +5,11 @@
 //
 //     let mut doc = json.parse(text)!;
 //     defer doc.deinit();
-//     let name = doc.root.get("user")!.get("name")!.as_str()!;
-//     for item in doc.root.get("items")!.as_array()! { ... }
+//     let user = doc.root.get("user") ?? return error.NotFound;
+//     let name = (user.get("name") ?? return error.NotFound).as_str()!;
+//     if let .some(items) = doc.root.get("items") {
+//         for item in items.as_array()! { ... }
+//     }
 //
 // A Document owns everything the tree points at (strings are copied out of
 // the input, so the input may be freed); deinit frees it all at once.
@@ -64,9 +67,8 @@ pub union Value {
     Array: []Value,
     Object: []Member,
 
-    /// The value of `key` in an object: NotFound if it has no such member,
-    /// WrongType if this is not an object.
-    pub fn get(self: Value, key: []u8) JsonError!Value {
+    /// The value of `key` in an object, or .none if absent or not an object.
+    pub fn get(self: Value, key: []u8) ?Value {
         match self {
             .Object(ms) => {
                 let mut i = ms.len;
@@ -76,23 +78,22 @@ pub union Value {
                         return ms[i].value;
                     }
                 }
-                return error.NotFound;
+                return .none;
             }
-            else => { return error.WrongType; }
+            else => { return .none; }
         }
     }
 
-    /// Element i of an array: NotFound if out of range, WrongType if this is
-    /// not an array.
-    pub fn at(self: Value, i: usize) JsonError!Value {
+    /// Element i of an array, or .none if out of range or not an array.
+    pub fn at(self: Value, i: usize) ?Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
-                    return error.NotFound;
+                    return .none;
                 }
                 return xs[i];
             }
-            else => { return error.WrongType; }
+            else => { return .none; }
         }
     }
 
@@ -186,7 +187,7 @@ struct Arena {
         self.chunks.deinit();
     }
 
-    fn bytes(self: *mut Arena, n: usize) JsonError![]mut u8 {
+    fn bytes(self: *mut Arena, n: usize) { OutOfMemory }![]mut u8 {
         let start = (self.used + 7) & ~@as(usize, 7);
         if (start + n) <= self.cur.len {
             self.used = start + n;
@@ -212,7 +213,7 @@ struct Arena {
         return c[..n];
     }
 
-    fn values(self: *mut Arena, xs: []Value) JsonError![]Value {
+    fn values(self: *mut Arena, xs: []Value) { OutOfMemory }![]Value {
         if xs.len == 0 {
             return [];
         }
@@ -222,7 +223,7 @@ struct Arena {
         return out;
     }
 
-    fn members(self: *mut Arena, xs: []Member) JsonError![]Member {
+    fn members(self: *mut Arena, xs: []Member) { OutOfMemory }![]Member {
         if xs.len == 0 {
             return [];
         }
@@ -915,6 +916,19 @@ pub fn stringify_pretty_to(w: io.Writer, v: Value, indent: u32) !void {
 // Tests (axiom test std/encoding/json.ax)
 // -----------------------------------------------------------------------------
 
+fn must_val(v: ?Value) Value {
+    return v ?? {
+        @trap();
+    };
+}
+
+fn is_none_val(v: ?Value) bool {
+    if let .none = v {
+        return true;
+    }
+    return false;
+}
+
 test "parse and read" {
     let text =
         " {\"name\": \"Ada\", \"age\": 36, \"langs\": [\"en\", \"fr\"], \"x\": -1.5e3, \"ok\": true, \"none\": null, \"big\": 12345678901234567890} ";
@@ -922,18 +936,18 @@ test "parse and read" {
     defer doc.deinit();
     let r = doc.root;
     @expect_eq(r.len(), 7);
-    @expect_eq(r.get("name")!.as_str()!, "Ada");
-    @expect_eq(r.get("age")!.as_i64()!, 36);
-    @expect_eq(r.get("langs")!.at(1)!.as_str()!, "fr");
-    @expect_eq(r.get("x")!.as_f64()!, -1500.0);
-    @expect_eq(r.get("x")!.as_i64()!, -1500);
-    @expect(r.get("ok")!.as_bool()!);
-    @expect(r.get("none")!.is_null());
-    @expect_eq(r.get("big")!.as_f64()!, 12345678901234567890.0);
-    @expect(fails(r.get("big")!.as_i64(), error.WrongType));
-    @expect(fails(r.get("missing"), error.NotFound));
-    @expect(fails(r.get("langs")!.get("x"), error.WrongType));
-    @expect(fails(r.get("langs")!.at(2), error.NotFound));
+    @expect_eq(must_val(r.get("name")).as_str()!, "Ada");
+    @expect_eq(must_val(r.get("age")).as_i64()!, 36);
+    @expect_eq(must_val(must_val(r.get("langs")).at(1)).as_str()!, "fr");
+    @expect_eq(must_val(r.get("x")).as_f64()!, -1500.0);
+    @expect_eq(must_val(r.get("x")).as_i64()!, -1500);
+    @expect(must_val(r.get("ok")).as_bool()!);
+    @expect(must_val(r.get("none")).is_null());
+    @expect_eq(must_val(r.get("big")).as_f64()!, 12345678901234567890.0);
+    @expect(fails(must_val(r.get("big")).as_i64(), error.WrongType));
+    @expect(is_none_val(r.get("missing")));
+    @expect(is_none_val(must_val(r.get("langs")).get("x")));
+    @expect(is_none_val(must_val(r.get("langs")).at(2)));
 }
 
 fn fails_void(r: !void, want: error) bool {
@@ -955,11 +969,11 @@ test "strings and escapes" {
         parse("[\"a\\\"b\\\\c\\/\\n\\t\", \"\\u00e9\\u20AC\", \"\\ud83d\\ude00\", \"\\ud800x\", \"h\u{e9}\"]")!;
     defer doc.deinit();
     let r = doc.root;
-    @expect_eq(r.at(0)!.as_str()!, "a\"b\\c/\n\t");
-    @expect_eq(r.at(1)!.as_str()!, "\u{e9}\u{20ac}");
-    @expect_eq(r.at(2)!.as_str()!, "\u{1F600}");
-    @expect_eq(r.at(3)!.as_str()!, "\u{FFFD}x");
-    @expect_eq(r.at(4)!.as_str()!, "h\u{e9}");
+    @expect_eq(must_val(r.at(0)).as_str()!, "a\"b\\c/\n\t");
+    @expect_eq(must_val(r.at(1)).as_str()!, "\u{e9}\u{20ac}");
+    @expect_eq(must_val(r.at(2)).as_str()!, "\u{1F600}");
+    @expect_eq(must_val(r.at(3)).as_str()!, "\u{FFFD}x");
+    @expect_eq(must_val(r.at(4)).as_str()!, "h\u{e9}");
 }
 
 test "numbers" {
@@ -1088,7 +1102,7 @@ test "a larger document" {
     let mut doc = parse(s.bytes())!;
     defer doc.deinit();
     @expect_eq(doc.root.len(), 3000);
-    @expect_eq(doc.root.at(2999)!.get("id")!.as_i64()!, 2999);
+    @expect_eq(must_val(must_val(doc.root.at(2999)).get("id")).as_i64()!, 2999);
     let again = stringify(doc.root)!;
     defer mem.free(again);
     @expect_eq(again, s.bytes());
@@ -1131,7 +1145,7 @@ test "values of every size" {
         src.push_str(t.bytes())!;
         let mut doc = parse(src.bytes())!;
         defer doc.deinit();
-        @expect_eq(doc.root.at(0)!.len(), n * 25);
-        @expect_eq(doc.root.at(1)!.len(), n * 300);
+        @expect_eq(must_val(doc.root.at(0)).len(), n * 25);
+        @expect_eq(must_val(doc.root.at(1)).len(), n * 300);
     }
 }

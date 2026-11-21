@@ -1,0 +1,480 @@
+// =============================================================================
+// ir_cfg.ax - blocks, terminators, instruction lists, phi edges, and CFG cleanup, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+fn new_block() *mut Block {
+    if (free_blocks.len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
+    if free_blocks.len > 0 {
+        let b = free_blocks.pop();
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, b), @size_of(Block)), 0);
+        return b;
+    }
+    return u.perm_new.[Block]();
+}
+
+pub fn append_block(f: *mut Func, name: []u8) *mut Block {
+    let b = new_block();
+    b.fnp = f;
+    b.name = u.perm_dup(name);  // (made while the code generator's own memory is given back after)
+    b.id = f.nblocks;
+    f.nblocks += 1;
+    f.cfg_ver +%= 1;
+    if u.isnil(f.last) {
+        f.first = b;
+    } else {
+        f.last.next = b;
+        b.prev = f.last;
+    }
+    f.last = b;
+    return b;
+}
+
+// Takes all of f's blocks out and gives them and their instructions back
+// for reuse: f is left a declaration. For a function nothing refers to.
+pub fn drop_body(f: *mut Func) void {
+    recycle(f);
+    // (opt.ax's CFG analyses kept on it)
+    f.cfg_ver +%= 1;
+    f.cfg_order.deinit();
+    f.cfg_order = u.List.[*mut Block].empty();
+    f.cfg_have = 0;
+    forget_uses(f);
+    // last first, so that they are reused in the order they lie in memory
+    let mut b = f.last;
+    while u.notnil(b) {
+        let prev = b.prev;
+        let mut i = b.last;
+        while u.notnil(i) {
+            let before = i.prev;
+            bury_value(i);
+            i = before;
+        }
+        b.first = vnil();
+        b.last = vnil();
+        b.prev = bnil();
+        b.next = bnil();
+        bury_block(b);
+        b = prev;
+    }
+    f.first = bnil();
+    f.last = bnil();
+}
+
+pub fn remove_block(b: *mut Block) void {
+    if dbg_on {
+        mk_block_gone(b);
+    }
+    unlink_block(b);
+    gone_block(b);
+}
+
+// b is out of its function: its instructions read nothing.
+fn gone_block(b: *mut Block) void {
+    b.gone = true;
+    let mut i = b.first;
+    while u.notnil(i) {
+        unregister(i);
+        i = i.next;
+    }
+}
+
+// Removes block b, which no path reaches: what its marks say never takes
+// effect (its successors' variables are what their other paths make them).
+fn remove_unreached_block(b: *mut Block) void {
+    if dbg_on {
+        let mut i = b.first;
+        while u.notnil(i) {
+            _ = dbg_take(i);
+            i = i.next;
+        }
+        _ = mk_block_take(b);
+    }
+    unlink_block(b);
+    gone_block(b);
+}
+
+fn unlink_block(b: *mut Block) void {
+    let f = b.fnp;
+    f.cfg_ver +%= 1;
+    block_to_grave(b);
+    if u.notnil(b.prev) {
+        b.prev.next = b.next;
+    } else {
+        f.first = b.next;
+    }
+    if u.notnil(b.next) {
+        b.next.prev = b.prev;
+    } else {
+        f.last = b.prev;
+    }
+    b.prev = bnil();
+    b.next = bnil();
+}
+
+// Moves `b` to directly after `after`.
+pub fn move_block_after(b: *mut Block, after: *mut Block) void {
+    if b == after {
+        return;
+    }
+    unlink_block(b);
+    let f = after.fnp;
+    b.prev = after;
+    b.next = after.next;
+    if u.notnil(after.next) {
+        after.next.prev = b;
+    } else {
+        f.last = b;
+    }
+    after.next = b;
+    if b.gone {
+        // (back in)
+        b.gone = false;
+        let mut i = b.first;
+        while u.notnil(i) {
+            register(i);
+            i = i.next;
+        }
+    }
+}
+
+pub inline fn terminator(b: *mut Block) *mut Value {
+    let l = b.last;
+    if u.notnil(l) and is_term(l.op) {
+        return l;
+    }
+    return vnil();
+}
+
+pub inline fn is_term(op: i32) bool {
+    return (op_props(op) & OPF_TERM) != 0;
+}
+
+// Successor blocks of a terminator.
+pub inline fn succ_count(t: *Value) usize {
+    if u.isnil(t) {
+        return 0;
+    }
+    let op = t.op;
+    if op == OP_BR {
+        return 1;
+    }
+    if op == OP_CONDBR {
+        return 2;
+    }
+    if op == OP_SWITCH {
+        return 1 + bs_of(t).len;
+    }
+    return 0;
+}
+
+pub inline fn succ(t: *mut Value, i: usize) *mut Block {
+    if i == 0 {
+        return t.t1;
+    }
+    if t.op == OP_CONDBR {
+        return t.t2;
+    }
+    return bs_of(t).get(i - 1);
+}
+
+pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
+    cfg_edit(t.blk);
+    if i == 0 {
+        t.t1 = b;
+    } else if t.op == OP_CONDBR {
+        t.t2 = b;
+    } else {
+        bs_mut(t).set(i - 1, b);
+    }
+}
+
+/// Debugging (AXIOM_CHECK_CFG): each CFG analysis opt.ax keeps (and
+/// remove_unreachable's knowing that there is nothing to remove) is checked
+/// against one worked out again. (Set before the threads start.)
+pub let mut check_cfg: bool = false;
+
+/// The CFG of b's function changed (its blocks, their order, or a
+/// terminator or its targets): the analyses opt.ax keeps of it are out of
+/// date. b may be nil (a terminator not in a block yet).
+pub fn cfg_edit(b: *mut Block) void {
+    if u.notnil(b) and u.notnil(b.fnp) {
+        b.fnp.cfg_ver +%= 1;
+    }
+}
+
+// Instruction list editing.
+pub fn insert_before(pos: *mut Value, v: *mut Value) void {
+    let b = pos.blk;
+    if is_term(v.op) {
+        cfg_edit(b);
+    }
+    v.blk = b;
+    v.next = pos;
+    v.prev = pos.prev;
+    if u.notnil(pos.prev) {
+        pos.prev.next = v;
+    } else {
+        b.first = v;
+    }
+    pos.prev = v;
+    placed(v, b);
+}
+
+pub fn append_inst(b: *mut Block, v: *mut Value) void {
+    if dbg_on and (mk_end.len > 0) {
+        let k = mk_block_take(b);
+        if k >= 0 {
+            mk_set(v, mk_cat(k, dbg_marks_at(v)));  // (the marks left at the block's end)
+        }
+    }
+    if is_term(v.op) {
+        cfg_edit(b);
+    }
+    v.blk = b;
+    v.prev = b.last;
+    v.next = vnil();
+    if u.notnil(b.last) {
+        b.last.next = v;
+    } else {
+        b.first = v;
+    }
+    b.last = v;
+    placed(v, b);
+}
+
+/// Moves the instructions after v in its block, in order, to the end of the
+/// empty block `to` (each with its debug marks, as remove_inst and
+/// append_inst of each would, at a cost of one step each: inlining many
+/// calls of one long block moves its rest at each).
+pub fn move_rest(v: *mut Value, to: *mut Block) void {
+    let b = v.blk;
+    let first = v.next;
+    if u.isnil(first) {
+        return;
+    }
+    cfg_edit(b);
+    let mut i = first;
+    while u.notnil(i) {
+        if dbg_on {
+            dbg_alt(i);
+        }
+        to_grave(i, b.fnp);
+        i.blk = to;
+        placed(i, to);
+        i = i.next;
+    }
+    first.prev = vnil();
+    to.first = first;
+    to.last = b.last;
+    v.next = vnil();
+    b.last = v;
+}
+
+pub fn remove_inst(v: *mut Value) void {
+    let b = v.blk;
+    if is_term(v.op) {
+        cfg_edit(b);
+    }
+    if dbg_on {
+        mk_leave(v);
+        dbg_alt(v);
+    }
+    to_grave(v, b.fnp);
+    if u.notnil(v.prev) {
+        v.prev.next = v.next;
+    } else {
+        b.first = v.next;
+    }
+    if u.notnil(v.next) {
+        v.next.prev = v.prev;
+    } else {
+        b.last = v.prev;
+    }
+    v.prev = vnil();
+    v.next = vnil();
+    v.blk = bnil();
+    unregister(v);
+}
+
+// Operands of an instruction, in order: a, b, c, then xs.
+pub fn nops(v: *Value) usize {
+    let mut n: usize = 0;
+    if u.notnil(v.a) {
+        n = 1;
+    }
+    if u.notnil(v.b) {
+        n = 2;
+    }
+    if u.notnil(v.c) {
+        n = 3;
+    }
+    return n;
+}
+
+// -----------------------------------------------------------------------------
+// Phi inputs and edges
+// -----------------------------------------------------------------------------
+
+// The value phi p takes over the edge from block `from` (nil: none).
+pub fn incoming(p: *Value, from: *mut Block) *mut Value {
+    for k in 0..bs_of(p).len {
+        if bs_of(p).get(k) == from {
+            return p.xs.get(k);
+        }
+    }
+    return vnil();
+}
+
+// Removes input k of phi p (the last input takes its place).
+pub fn remove_incoming(p: *mut Value, k: usize) void {
+    bs_mut(p).set(k, bs_of(p).get(bs_of(p).len - 1));
+    set_x(p, k, p.xs.get(p.xs.len - 1));
+    bs_mut(p).len -= 1;
+    trunc_x(p, p.xs.len - 1);
+}
+
+// Removes phi p's inputs from block `from`.
+pub fn drop_incoming(p: *mut Value, from: *mut Block) void {
+    let mut k: usize = 0;
+    while k < bs_of(p).len {
+        if bs_of(p).get(k) == from {
+            remove_incoming(p, k);
+        } else {
+            k += 1;
+        }
+    }
+}
+
+// Removes the inputs from block `from` of the phis of s.
+pub fn remove_phi_input(s: *mut Block, from: *mut Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == OP_PHI) {
+        drop_incoming(p, from);
+        p = p.next;
+    }
+}
+
+// The phis of s take their inputs from `old` as from `new`.
+pub fn replace_phi_block(s: *mut Block, old: *mut Block, new: *mut Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == OP_PHI) {
+        for k in 0..bs_of(p).len {
+            if bs_of(p).get(k) == old {
+                bs_mut(p).set(k, new);
+            }
+        }
+        p = p.next;
+    }
+}
+
+// Points the edges from b to `old` at `new`.
+pub fn retarget(b: *mut Block, old: *mut Block, new: *mut Block) void {
+    let t = terminator(b);
+    for k in 0..succ_count(t) {
+        if succ(t, k) == old {
+            set_succ(t, k, new);
+        }
+    }
+}
+
+// A new block (named `name`, last in f) on the way from `from` to `to`: it
+// jumps to `to`, whose phis take their inputs from `from` from it. The
+// caller points from's edges at it.
+pub fn edge_block(f: *mut Func, name: []u8, from: *mut Block, to: *mut Block) *mut Block {
+    let nb = append_block(f, name);
+    let j = new_inst(f, OP_BR, t_void());
+    j.t1 = to;
+    append_inst(nb, j);
+    replace_phi_block(to, from, nb);
+    return nb;
+}
+
+// Splits the edges from `from` to `to` by a new block (edge_block).
+pub fn split_edge(f: *mut Func, name: []u8, from: *mut Block, to: *mut Block) *mut Block {
+    let nb = edge_block(f, name, from, to);
+    retarget(from, to, nb);
+    return nb;
+}
+
+// -----------------------------------------------------------------------------
+// CFG utilities
+// -----------------------------------------------------------------------------
+// (remove_unreachable, kept for the next call)
+threadlocal let mut ru_work: u.List.[*mut Block] = u.List.[*mut Block].{
+    data: @ptr_from_int(*mut *mut Block, 0), len: 0, cap: 0 };
+
+// Deletes the blocks not reachable from the entry, and the phi inputs that
+// came from them.
+pub fn remove_unreachable(f: *mut Func) void {
+    if u.isnil(f.first) {
+        return;
+    }
+    let mut b = f.first;
+    let clean = f.cfg_clean == f.cfg_ver +% 1;
+    // (or a reverse postorder kept since the last edit has every block)
+    let all = (f.cfg_key == f.cfg_ver) and ((f.cfg_have & 10) == 10);
+    if (clean or all) and not check_cfg {
+        // (no edit since every block was reached: each still is)
+        while u.notnil(b) {
+            b.aux = 1;
+            b = b.next;
+        }
+        f.cfg_clean = f.cfg_ver +% 1;
+        return;
+    }
+    while u.notnil(b) {
+        b.aux = 0;
+        b = b.next;
+    }
+    let work = &mut ru_work;
+    work.clear();
+    f.first.aux = 1;
+    work.push(f.first);
+    while work.len > 0 {
+        let x = work.pop();
+        let t = terminator(x);
+        for i in 0..succ_count(t) {
+            let s = succ(t, i);
+            if s.aux == 0 {
+                s.aux = 1;
+                work.push(s);
+            }
+        }
+    }
+    b = f.first;
+    let mut any = false;
+    while u.notnil(b) {
+        let next = b.next;
+        if b.aux == 0 {
+            remove_unreached_block(b);
+            any = true;
+        }
+        b = next;
+    }
+    if any and (clean or all) {
+        u.die("AXIOM_CHECK_CFG: a block was unreachable though no edit was counted");
+    }
+    f.cfg_clean = f.cfg_ver +% 1;
+    if not any {
+        return;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == OP_PHI) {
+            let mut k: usize = 0;
+            while k < bs_of(i).len {
+                if bs_of(i).get(k).aux == 0 {
+                    remove_incoming(i, k);
+                } else {
+                    k += 1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}

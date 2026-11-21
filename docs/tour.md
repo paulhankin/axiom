@@ -95,7 +95,7 @@ export fn main() i32 {
     let tail = squares[2..];  // a slice: a pointer and a length into the array
     fmt.print("{} {} {}\n", [fmt.int(total(squares[..])), fmt.int(total(tail)), fmt.int(tail.len)]) catch return 1;
     let line = "key=value";  // a string literal is a []u8 too
-    let eq = str.index_of_byte(line, '=') catch return 1;
+    let eq = str.index_of_byte(line, '=') ?? return 1;
     let key = line[..eq];
     let value = line[eq + 1..];
     fmt.print("{} / {} / {}\n", [fmt.str(key), fmt.str(value), fmt.boolean(str.eq(key, "key"))]) catch return 1;
@@ -355,7 +355,7 @@ export fn main() i32 {
     ages.put("ada", 36) catch return 1;
     ages.put("alan", 41) catch return 1;
     fmt.print("{} {} {} {}\n", [fmt.float(buf[3]), fmt.int(primes.items().len), fmt.int(primes.get(3)),
-                                fmt.int(ages.get("alan") catch 0)]) catch return 1;
+                                fmt.int(ages.get("alan") ?? 0)]) catch return 1;
     return 0;
 }
 ```
@@ -457,7 +457,7 @@ test "palindromes" {
 }
 
 test "str helpers" {
-    @expect_eq(str.index_of_byte("a=b", '=')!, 1);
+    @expect_eq(str.index_of_byte("a=b", '=') ?? @trap(), 1);
     @expect(str.eq(str.trim(" x "), "x"));
 }
 

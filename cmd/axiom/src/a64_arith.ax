@@ -1,0 +1,720 @@
+// =============================================================================
+// a64_arith.ax - integer arithmetic, comparisons, casts, and floating point, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Integer operations
+// -----------------------------------------------------------------------------
+// ADD/SUB immediate encoding for x (either sign), or false.
+fn addsub_imm_ok(x: i64) bool {
+    let mut a = x;
+    if x < 0 {
+        a = 0 - x;
+    }
+    return (a >= 0) and ((a <= 0xfff) or (((a & 0xfff) == 0) and (a <= 0xff_f000)));
+}
+
+// d = a +/- imm
+fn add_imm(sf: u64, d: i32, a: i32, x: i64) void {
+    let sub = x < 0;
+    let mut v = x;
+    if sub {
+        v = 0 - x;
+    }
+    if v <= 0xfff {
+        raw2(ae.addsub_imm(sf, sub, false, 0, 0, @bit_cast(u64, v), false), d, a);
+    } else {
+        raw2(ae.addsub_imm(sf, sub, false, 0, 0, @bit_cast(u64, v) >> 12, true), d, a);
+    }
+}
+
+fn logic_opc(o: i32) u64 {
+    if o == ir.OP_AND {
+        return 0;
+    }
+    if o == ir.OP_OR {
+        return 1;
+    }
+    return 2;
+}
+
+fn gen_alu(v: *mut ir.Value) void {
+    if (v.flag & F_ADC) != 0 {
+        gen_carry(v);
+        return;
+    }
+    let o = v.op;
+    let t = v.ty;
+    let sf = sfv(t);
+    let mut a = v.a;
+    let mut b = v.b;
+    if is.is_c(a) and not is.is_c(b) and (o != ir.OP_SUB) {
+        a = v.b;
+        b = v.a;
+    }
+    let d = vreg(v);
+    let ra = reg(a);
+    if o == ir.OP_MUL {
+        if is.is_c(b) and (is.cval(b) > 0) and ((is.cval(b) & (is.cval(b) - 1)) == 0) {
+            raw2(ae.lsl_imm(sf, 0, 0, @as(u64, @ctz(@bit_cast(u64, is.cval(b))))), d, ra);
+        } else {
+            raw3(ae.madd(sf, false, 0, 0, 0, 31), d, ra, reg(b));
+        }
+    } else if (o == ir.OP_ADD) or (o == ir.OP_SUB) {
+        if is.is_c(b) and addsub_imm_ok(is.cval(b)) {
+            let mut x = is.cval(b);
+            if o == ir.OP_SUB {
+                x = -x;
+            }
+            add_imm(sf, d, ra, x);
+        } else {
+            raw3(ae.addsub_reg(sf, o == ir.OP_SUB, false, 0, 0, 0, 0, 0), d, ra, reg(b));
+        }
+    } else {
+        let opc = logic_opc(o);
+        let mut done = false;
+        // with an operand inverted: bic, orn, eon (and mvn: x ^ ~0); the inversion is
+        // left dead
+        let mut na = scalar_not(a);
+        let mut other = b;
+        if u.isnil(na) {
+            na = scalar_not(b);
+            other = a;
+        }
+        if (o == ir.OP_XOR) and (t.bits > 1) and is.is_c(b) and all_ones_int(b) {
+            raw_dm(ae.logic_reg(sf, 1, true, 0, 31, 0, 0, 0), d, ra);  // mvn (orn d, zr, a)
+            done = true;
+        } else if u.notnil(na) and not is.is_c(other) {
+            raw3(ae.logic_reg(sf, opc, true, 0, 0, 0, 0, 0), d, reg(other), reg(na));
+            done = true;
+        }
+        if not done and is.is_c(b) {
+            let mut width: u32 = 32;
+            if sf == 1 {
+                width = 64;
+            }
+            let e = ae.logical_imm(@bit_cast(u64, is.cval(b)), width);
+            if e >= 0 {
+                raw2(ae.logic_imm(sf, opc, 0, 0, @bit_cast(u64, e)), d, ra);
+                done = true;
+            }
+        }
+        if not done {
+            raw3(ae.logic_reg(sf, opc, false, 0, 0, 0, 0, 0), d, ra, reg(b));
+        }
+    }
+    if (t.bits == 1) and (o != ir.OP_AND) and (o != ir.OP_OR) and (o != ir.OP_XOR) {
+        raw2(ae.logic_imm(0, 0, 0, 0, @bit_cast(u64, ae.logical_imm(1, 32))), d, d);
+    }
+}
+
+fn all_ones_int(c: *ir.Value) bool {
+    let m = ir.mask_bits(c.ty.bits);
+    return (@bit_cast(u64, is.cval(c)) & m) == m;
+}
+
+// x for an integer v = x ^ ~0 (32 or 64 bits), or nil.
+fn scalar_not(v: *mut ir.Value) *mut ir.Value {
+    if ir.is_op(v, ir.OP_XOR) and (v.ty.kind == ir.T_INT) and ((v.ty.bits == 32) or (v.ty.bits == 64)) and
+       is.is_c(v.b) and all_ones_int(v.b) and not is.is_c(v.a) {
+        return v.a;
+    }
+    return ir.vnil();
+}
+
+// The bits of integer constant x (narrower than 32 bits) extended to 32
+// bits, zero- or sign- (a result's ABI extension).
+fn ext_const(x: *ir.Value, sign: bool) i64 {
+    let bits = x.ty.bits;
+    let m = (@as(u64, 1) << @truncate(u32, @bit_cast(i64, @as(i64, bits)))) - 1;
+    let mut v = @bit_cast(u64, is.cval(x)) & m;
+    if sign and ((v >> @truncate(u32, @bit_cast(i64, @as(i64, bits - 1)))) != 0) {
+        v = v | ~m;
+    }
+    return @bit_cast(i64, v & 0xffff_ffff);
+}
+
+// Extends the narrow integer in r into a fresh register (32 or 64 bits).
+fn ext_reg(r: i32, bits: i32, sign: bool, to64: bool) i32 {
+    let d = vgpr();
+    let mut sf: u64 = 0;
+    if to64 {
+        sf = 1;
+    }
+    if bits == 1 {
+        if sign {
+            raw_dm(ae.addsub_reg(sf, true, false, 0, 31, 0, 0, 0), d, r);  // neg
+        } else {
+            copy(d, r, GPR);
+        }
+        return d;
+    }
+    if bits == 32 {
+        if sign {
+            raw2(ae.bfm(1, 0, 0, 0, 0, 31), d, r);  // sxtw
+        } else {
+            raw_dm(ae.logic_reg(0, 1, false, 0, 31, 0, 0, 0), d, r);  // mov wd, wn
+        }
+        return d;
+    }
+    let hi = @as(u64, @bit_cast(u32, bits - 1));
+    if sign {
+        raw2(ae.bfm(sf, 0, 0, 0, 0, hi), d, r);
+    } else {
+        raw2(ae.bfm(0, 2, 0, 0, 0, hi), d, r);
+    }
+    return d;
+}
+
+// Is the integer v known to be zero-extended from `bits` in its register (the
+// upper bits of a narrower value are otherwise unspecified)? Loads zero-extend
+// into the whole register, and so does every instruction writing a W
+// register: those computing 32-bit values.
+fn zext_clean(v: *ir.Value, bits: i32) bool {
+    if (v.kind != ir.V_INST) or (v.ty.kind != ir.T_INT) {
+        return false;
+    }
+    let o = v.op;
+    if (o == ir.OP_LOAD) and (v.ty.bits <= bits) {
+        return true;
+    }
+    if (o == ir.OP_AND) and is.is_c(v.b) and (is.cval(v.b) >= 0) and (bits < 64) and
+       (is.cval(v.b) <= ((@as(i64, 1) << @int_cast(u32, bits)) - 1)) {
+        return true;
+    }
+    if (o == ir.OP_EXTRACTELEM) and (v.ty.bits <= bits) {
+        return true;  // (umov)
+    }
+    if (o == ir.OP_INTR) and (v.xs.len == 2) and (v.ty.bits == bits) and (bits < 64) {
+        let id = ir.intr_id(v);
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            // (a csel of the operands as extended: reg_ext extends them, constants included)
+            return true;
+        }
+    }
+    if (bits == 32) and (v.ty.bits == 32) {
+        return ir.is_int_binop(o) or (o == ir.OP_SELECT) or (o == ir.OP_ZEXT) or (o == ir.OP_SEXT) or
+               (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT);
+    }
+    return false;
+}
+
+// A register with v extended to 32 bits (narrow) or v itself.
+fn reg_ext(v: *mut ir.Value, sign: bool) i32 {
+    let b = v.ty.bits;
+    if (v.kind == ir.V_CINT) and (v.ty.kind == ir.T_INT) and (b < 32) and (b > 1) {
+        // a constant extended here rather than by an instruction
+        let m = (@as(i64, 1) << @int_cast(u32, b)) - 1;
+        let mut x = is.cval(v) & m;
+        if sign and ((x >> @int_cast(u32, b - 1)) != 0) {
+            x = x - (m + 1);
+        }
+        let c = vgpr();
+        movi(c, x & 0xffff_ffff, 0);
+        return c;
+    }
+    let r = reg(v);
+    if not sign and zext_clean(v, b) {
+        return r;
+    }
+    if (v.ty.kind == ir.T_INT) and (b < 32) and (b > 1) {
+        return ext_reg(r, b, sign, false);
+    }
+    return r;
+}
+
+fn gen_div(v: *mut ir.Value) void {
+    let o = v.op;
+    let sg = (o == ir.OP_SDIV) or (o == ir.OP_SREM);
+    let sf = sfv(v.ty);
+    let a = reg_ext(v.a, sg);
+    let b = reg_ext(v.b, sg);
+    let mut opc: u64 = 2;
+    if sg {
+        opc = 3;
+    }
+    let d = vreg(v);
+    if (o == ir.OP_UDIV) or (o == ir.OP_SDIV) {
+        raw3(ae.dp2(sf, opc, 0, 0, 0), d, a, b);
+        return;
+    }
+    let qv = is.rem_quotient(v);
+    let mut q: i32 = 0;
+    if u.notnil(qv) {
+        q = reg(qv);  // (the quotient's udiv / sdiv, before)
+    } else {
+        q = vgpr();
+        raw3(ae.dp2(sf, opc, 0, 0, 0), q, a, b);
+    }
+    // d = a - q * b
+    _ = raw(ae.madd(sf, true, 0, 0, 0, 0), W(d), R(q), R(b), R(a));
+}
+
+fn gen_shift(v: *mut ir.Value) void {
+    let o = v.op;
+    let t = v.ty;
+    let sf = sfv(t);
+    let bits = t.bits;
+    let d = vreg(v);
+    let mut a = reg(v.a);
+    if (bits < 32) and (bits > 1) {
+        if o == ir.OP_LSHR {
+            a = ext_reg(a, bits, false, false);
+        } else if o == ir.OP_ASHR {
+            a = ext_reg(a, bits, true, false);
+        }
+    }
+    let mut w: u64 = 32;
+    if sf == 1 {
+        w = 64;
+    }
+    if is.is_c(v.b) {
+        let k = @bit_cast(u64, is.cval(v.b)) & (w - 1);
+        if o == ir.OP_SHL {
+            raw2(ae.lsl_imm(sf, 0, 0, k), d, a);
+        } else if o == ir.OP_LSHR {
+            raw2(ae.lsr_imm(sf, 0, 0, k), d, a);
+        } else {
+            raw2(ae.asr_imm(sf, 0, 0, k), d, a);
+        }
+        return;
+    }
+    let mut c = reg(v.b);
+    if (v.b.ty.bits < 32) and (bits < 32) {
+        let m = vgpr();
+        raw2(ae.logic_imm(0, 0, 0, 0, @bit_cast(u64, ae.logical_imm(@as(u64, @bit_cast(u32, bits - 1)), 32))), m, c);
+        c = m;
+    }
+    let mut opc: u64 = 8;
+    if o == ir.OP_LSHR {
+        opc = 9;
+    } else if o == ir.OP_ASHR {
+        opc = 10;
+    }
+    raw3(ae.dp2(sf, opc, 0, 0, 0), d, a, c);
+}
+
+// The condition codes of the integer predicates, ir.IntEQ to ir.IntSLE.
+let icc_of: [10]i32 = [EQ, NE, HI, HS, LO, LS, GT, GE, LT, LE];
+
+fn icc(p: ir.CmpPred) i32 {
+    return icc_of[@int_cast(usize, @int_from_enum(p) - @int_from_enum(ir.IntEQ))];
+}
+
+// cmp a, #x (or cmn) when x fits an immediate; false otherwise
+fn cmp_imm(sf: u64, a: i32, x: i64) bool {
+    if (x >= 0) and (x <= 0xfff) {
+        _ = raw(ae.addsub_imm(sf, true, true, 31, 0, @bit_cast(u64, x), false), NONE(), R(a), NONE(), NONE());
+        return true;
+    }
+    if (x < 0) and (x >= -0xfff) {
+        _ = raw(ae.addsub_imm(sf, false, true, 31, 0, @bit_cast(u64, 0 - x), false), NONE(), R(a), NONE(), NONE());
+        return true;
+    }
+    return false;
+}
+
+fn cmp_reg(sf: u64, a: i32, b: i32) void {
+    _ = raw(ae.addsub_reg(sf, true, true, 31, 0, 0, 0, 0), NONE(), R(a), R(b), NONE());
+}
+
+// Emits the comparison for an icmp and returns the condition.
+fn int_compare(v: *mut ir.Value) i32 {
+    let p = ir.pred_of(v);
+    let t = v.a.ty;
+    let sf = sfv(t);
+    let sg = ir.is_signed_pred(p);
+    let a = reg_ext(v.a, sg);
+    if is.is_c(v.b) {
+        let mut x = is.cval(v.b);
+        let bits = t.bits;
+        if (t.kind == ir.T_INT) and (bits < 32) and (bits > 1) and not sg {
+            x = x & ((@as(i64, 1) << @int_cast(u32, bits)) - 1);
+        } else if (sf == 0) and not sg {
+            x = x & 0xffff_ffff;
+        }
+        if cmp_imm(sf, a, x) {
+            return icc(p);
+        }
+    }
+    cmp_reg(sf, a, reg_ext(v.b, sg));
+    return icc(p);
+}
+
+fn fty(t: *ir.Ty) u64 {
+    if t.bits == 32 {
+        return 0;
+    }
+    return 1;
+}
+
+fn float_compare(v: *mut ir.Value) i32 {
+    let p = ir.pred_of(v);
+    let a = reg(v.a);
+    // fcmpe (opc bit 4) for a signaling compare (ir.F_SIGNALING)
+    let mut e: u64 = 0;
+    if (v.flags & ir.F_SIGNALING) != 0 {
+        e = 0x10;
+    }
+    if ((v.b.kind == ir.V_CFP) or (v.b.kind == ir.V_ZERO)) and ir.is_zero(v.b) {
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | 8 | e, NONE(), R(a), NONE(), NONE());  // fcmp a, #0.0
+    } else {
+        let b = reg(v.b);
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | e, NONE(), R(a), R(b), NONE());
+    }
+    if p == ir.RealOEQ {
+        return EQ;
+    }
+    if p == ir.RealUNE {
+        return NE;
+    }
+    if p == ir.RealOLT {
+        return MI;
+    }
+    if p == ir.RealOLE {
+        return LS;
+    }
+    if p == ir.RealOGT {
+        return GT;
+    }
+    return GE;
+}
+
+fn cset(d: i32, cc: i32) void {
+    raw1(ae.csel(0, 1, 0, 31, 31, @as(u64, @bit_cast(u32, is.invert(cc)))), d);
+}
+
+fn cond_code(c: *mut ir.Value) i32 {
+    if is.fused(c) {
+        if c.op == ir.OP_ICMP {
+            return int_compare(c);
+        }
+        return float_compare(c);
+    }
+    let r = reg(c);
+    _ = cmp_imm(0, r, 0);
+    return NE;
+}
+
+fn cc64(cc: i32) u64 {
+    return @as(u64, @bit_cast(u32, cc));
+}
+
+fn gen_select(v: *mut ir.Value) void {
+    let d = vreg(v);
+    let t = v.ty;
+    let rt = reg(v.b);
+    let rf = reg(v.c);
+    if class_of(t) == GPR {
+        let cc = cond_code(v.a);
+        raw3(ae.csel(sfv(t), 0, 0, 0, 0, cc64(cc)), d, rt, rf);
+        return;
+    }
+    if t.kind == ir.T_FLOAT {
+        let cc = cond_code(v.a);
+        raw3(ae.fcsel(fty(t), 0, 0, 0, cc64(cc)), d, rt, rf);
+        return;
+    }
+    copy(d, rf, VR);
+    let cc = cond_code(v.a);
+    let skip = new_label();
+    bcc(is.invert(cc), skip);
+    let m = e2(FMOV, 16, RW(d), R(rt));
+    _ = m;
+    place(skip);
+}
+
+fn gen_icmp(v: *mut ir.Value) void {
+    if v.a.ty.kind == ir.T_VEC {
+        vec_icmp(v);
+        return;
+    }
+    let d = vreg(v);
+    let cc = int_compare(v);
+    cset(d, cc);
+}
+
+fn gen_fcmp(v: *mut ir.Value) void {
+    if v.a.ty.kind == ir.T_VEC {
+        vec_fcmp(v);
+        return;
+    }
+    let d = vreg(v);
+    let cc = float_compare(v);
+    cset(d, cc);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions
+// -----------------------------------------------------------------------------
+fn gen_cast(v: *mut ir.Value) void {
+    let o = v.op;
+    let from = v.a.ty;
+    let to = v.ty;
+    let d = vreg(v);
+    if (to.kind == ir.T_VEC) and (o >= ir.OP_SITOFP) and (o <= ir.OP_FPTOUI_SAT) {
+        let mut u_: u64 = 0;
+        if (o == ir.OP_UITOFP) or (o == ir.OP_FPTOUI_SAT) {
+            u_ = 1;
+        }
+        if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) {
+            raw2(ae.v2(1, u_, fsz(to), 0x1d, 0, 0), d, reg(v.a));  // scvtf / ucvtf
+        } else {
+            raw2(ae.v2(1, u_, 2 | fsz(from), 0x1b, 0, 0), d, reg(v.a));  // fcvtzs / fcvtzu
+        }
+        return;
+    }
+    if (o == ir.OP_ZEXT) or (o == ir.OP_SEXT) {
+        if to.kind == ir.T_VEC {
+            copy(d, reg(v.a), VR);  // lane masks are already all ones / zeros
+            return;
+        }
+        if (o == ir.OP_ZEXT) and zext_clean(v.a, from.bits) {
+            copy(d, reg(v.a), GPR);
+            return;
+        }
+        let x = ext_reg(reg(v.a), from.bits, o == ir.OP_SEXT, to.bits > 32);
+        copy(d, x, GPR);
+        return;
+    }
+    if o == ir.OP_TRUNC {
+        let r = reg(v.a);
+        if to.bits == 1 {
+            raw2(ae.logic_imm(0, 0, 0, 0, @bit_cast(u64, ae.logical_imm(1, 32))), d, r);
+        } else {
+            copy(d, r, GPR);
+        }
+        return;
+    }
+    if (o == ir.OP_PTRTOINT) or (o == ir.OP_INTTOPTR) {
+        copy(d, reg(v.a), GPR);
+        return;
+    }
+    if o == ir.OP_BITCAST {
+        let fc = class_of(from);
+        let tc = class_of(to);
+        let r = reg(v.a);
+        if fc == tc {
+            copy(d, r, fc);
+        } else if tc == VR {
+            if from.bits == 64 {
+                raw2(ae.fcvt_int(1, 1, 0, 7, 0, 0), d, r);
+            } else {
+                raw2(ae.fcvt_int(0, 0, 0, 7, 0, 0), d, r);
+            }
+        } else {
+            if to.bits == 64 {
+                raw2(ae.fcvt_int(1, 1, 0, 6, 0, 0), d, r);
+            } else {
+                raw2(ae.fcvt_int(0, 0, 0, 6, 0, 0), d, r);
+            }
+        }
+        return;
+    }
+    if o == ir.OP_FPEXT {
+        raw2(ae.fp1(0, 5, 0, 0), d, reg(v.a));
+        return;
+    }
+    if o == ir.OP_FPTRUNC {
+        raw2(ae.fp1(1, 4, 0, 0), d, reg(v.a));
+        return;
+    }
+    if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) {
+        let sg = o == ir.OP_SITOFP;
+        let mut r = reg(v.a);
+        let fb = from.bits;
+        if fb < 32 {
+            r = ext_reg(r, fb, sg, false);
+        }
+        let mut sf: u64 = 0;
+        if fb > 32 {
+            sf = 1;
+        }
+        let mut opc: u64 = 3;
+        if sg {
+            opc = 2;
+        }
+        raw2(ae.fcvt_int(sf, fty(to), 0, opc, 0, 0), d, r);
+        return;
+    }
+    gen_float_to_int(v, d);
+}
+
+// Saturating float -> int: FCVTZS / FCVTZU saturate (NaN -> 0); narrower
+// results are clamped from 32 bits.
+fn gen_float_to_int(v: *mut ir.Value, d: i32) void {
+    let sg = v.op == ir.OP_FPTOSI_SAT;
+    let x = reg(v.a);
+    let tb = v.ty.bits;
+    let mut sf: u64 = 0;
+    if tb > 32 {
+        sf = 1;
+    }
+    let mut opc: u64 = 1;
+    if sg {
+        opc = 0;
+    }
+    if tb >= 32 {
+        raw2(ae.fcvt_int(sf, fty(v.a.ty), 3, opc, 0, 0), d, x);
+        return;
+    }
+    let r = vgpr();
+    raw2(ae.fcvt_int(0, fty(v.a.ty), 3, opc, 0, 0), r, x);
+    let k = @int_cast(u32, tb);
+    if sg {
+        let hi = (@as(i64, 1) << (k - 1)) - 1;
+        let lo = -(@as(i64, 1) << (k - 1));
+        let h = vgpr();
+        let l = vgpr();
+        let t = vgpr();
+        movi(h, hi, 0);
+        movi(l, lo & 0xffff_ffff, 0);
+        cmp_reg(0, r, h);
+        raw3(ae.csel(0, 0, 0, 0, 0, cc64(LT)), t, r, h);
+        cmp_reg(0, t, l);
+        raw3(ae.csel(0, 0, 0, 0, 0, cc64(GT)), d, t, l);
+        return;
+    }
+    let hi = (@as(i64, 1) << k) - 1;
+    let h = vgpr();
+    movi(h, hi, 0);
+    cmp_reg(0, r, h);
+    raw3(ae.csel(0, 0, 0, 0, 0, cc64(LO)), d, r, h);
+}
+
+// -----------------------------------------------------------------------------
+// Floating point
+// -----------------------------------------------------------------------------
+fn fsz(t: *ir.Ty) u64 {
+    if is.is_f32(t) {
+        return 0;
+    }
+    return 1;
+}
+
+fn gen_fbin(v: *mut ir.Value) void {
+    let d = vreg(v);
+    let a = reg(v.a);
+    let b = reg(v.b);
+    let o = v.op;
+    let s = fsz(v.ty);
+    if v.ty.kind == ir.T_VEC {
+        let mut w: u64 = 0;
+        if o == ir.OP_FADD {
+            w = ae.v3(1, 0, s, 0x1a, 0, 0, 0);
+        } else if o == ir.OP_FSUB {
+            w = ae.v3(1, 0, 2 | s, 0x1a, 0, 0, 0);
+        } else if o == ir.OP_FMUL {
+            w = ae.v3(1, 1, s, 0x1b, 0, 0, 0);
+        } else {
+            w = ae.v3(1, 1, s, 0x1f, 0, 0, 0);
+        }
+        raw3(w, d, a, b);
+        return;
+    }
+    let mut opc: u64 = 1;
+    if o == ir.OP_FADD {
+        opc = 2;
+    } else if o == ir.OP_FSUB {
+        opc = 3;
+    } else if o == ir.OP_FMUL {
+        opc = 0;
+    }
+    raw3(ae.fp2(s, opc, 0, 0, 0), d, a, b);
+}
+
+fn gen_fneg(v: *mut ir.Value) void {
+    let d = vreg(v);
+    let a = reg(v.a);
+    let s = fsz(v.ty);
+    if v.ty.kind == ir.T_VEC {
+        raw2(ae.v2(1, 1, 2 | s, 0x0f, 0, 0), d, a);
+    } else {
+        raw2(ae.fp1(s, 2, 0, 0), d, a);
+    }
+}
+
+fn sign_mask(single: bool) i32 {
+    if single {
+        return vconst(0x8000_0000_8000_0000, 0x8000_0000_8000_0000);
+    }
+    return vconst(0x8000_0000_0000_0000, 0x8000_0000_0000_0000);
+}
+
+fn gen_float_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let vec = t.kind == ir.T_VEC;
+    let s = fsz(t);
+    let d = vreg(v);
+    let a = reg(v.xs.get(0));
+    if (id == ir.IN_FABS) or (id == ir.IN_SQRT) or (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or
+       (id == ir.IN_NEAREST) {
+        if vec {
+            let mut w: u64 = 0;
+            match id {
+                .FABS    => { w = ae.v2(1, 0, 2 | s, 0x0f, 0, 0); }
+                .SQRT    => { w = ae.v2(1, 1, 2 | s, 0x1f, 0, 0); }
+                .NEAREST => { w = ae.v2(1, 0, s, 0x18, 0, 0); }
+                .FLOOR   => { w = ae.v2(1, 0, s, 0x19, 0, 0); }
+                .CEIL    => { w = ae.v2(1, 0, 2 | s, 0x18, 0, 0); }
+                else     => { w = ae.v2(1, 0, 2 | s, 0x19, 0, 0); }
+            }
+            raw2(w, d, a);
+            return;
+        }
+        let mut opc: u64 = 11;
+        match id {
+            .FABS    => { opc = 1; }
+            .SQRT    => { opc = 3; }
+            .NEAREST => { opc = 8; }
+            .CEIL    => { opc = 9; }
+            .FLOOR   => { opc = 10; }
+            else => {}
+        }
+        raw2(ae.fp1(s, opc, 0, 0), d, a);
+        return;
+    }
+    if (id == ir.IN_FMIN) or (id == ir.IN_FMAX) {
+        let b = reg(v.xs.get(1));
+        if vec {
+            let mut size = s;
+            if id == ir.IN_FMIN {
+                size = 2 | s;
+            }
+            raw3(ae.v3(1, 0, size, 0x1e, 0, 0, 0), d, a, b);
+        } else {
+            let mut opc: u64 = 4;
+            if id == ir.IN_FMIN {
+                opc = 5;
+            }
+            raw3(ae.fp2(s, opc, 0, 0, 0), d, a, b);
+        }
+        return;
+    }
+    if id == ir.IN_COPYSIGN {
+        let b = reg(v.xs.get(1));
+        let m = sign_mask(s == 0);
+        let x = vvr();
+        let y = vvr();
+        raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), x, a, m);  // bic: a without the sign
+        raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), y, b, m);  // and: b's sign
+        raw3(ae.v3(1, 0, 2, 3, 0, 0, 0), d, x, y);  // orr
+        return;
+    }
+    if id == ir.IN_FMA {
+        let b = reg(v.xs.get(1));
+        let c = reg(v.xs.get(2));
+        if vec {
+            copy(d, c, VR);
+            _ = raw(ae.v3(1, 0, s, 0x19, 0, 0, 0), RW(d), R(a), R(b), NONE());
+        } else {
+            _ = raw(ae.fmadd(s, 0, 0, 0, 0), W(d), R(a), R(b), R(c));
+        }
+        return;
+    }
+    fail(u.f1("float intrinsic %s", u.idec(@int_from_enum(id))));
+}

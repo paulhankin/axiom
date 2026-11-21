@@ -1,0 +1,601 @@
+// =============================================================================
+// sema_errors.ax - error sets, return-error inference, catch, try, orelse
+// and optional/slice inference, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Error sets (spec §11.3)
+// ---------------------------------------------------------------------------
+// The names of a named error set: its own, and those of the sets it includes.
+fn resolve_error_set(d: *mut ast.Decl) void {
+    for i in 0..d.error_names.len {
+        add_set_name(d, d.error_names.get(i));
+    }
+    let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
+    for i in 0..d.error_refs.len {
+        let s = resolve_set_te(d.error_refs.get(i), &mut tc);
+        if u.notnil(s) {
+            resolve_decl(s);
+            for j in 0..s.set_names.len {
+                add_set_name(d, s.set_names.get(j));
+            }
+        }
+    }
+}
+
+fn add_set_name(d: *mut ast.Decl, n: []u8) void {
+    for i in 0..d.set_names.len {
+        if u.same(d.set_names.get(i), n) {
+            return;
+        }
+    }
+    d.set_names.push(n);
+}
+
+// The error set a type expression names, or nil (after an error).
+fn resolve_set_te(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Decl {
+    match te.shape {
+        .ErrSetInline(ies) => { return intern_anon_errset(&ies.names); }
+        .Named(nt) => {
+            let d = resolve_named_decl(nt, te.span, tc, true);
+            if u.isnil(d) {
+                return dnil();
+            }
+            if (d.kind != ast.D_ERROR) or nt.has_args or nt.has_member {
+                _ = dg.err(nt.name_span, "E0654", u.f1("'%s' is not an error set", nt.name));
+                return dnil();
+            }
+            return d;
+        }
+        else => {}
+    }
+    _ = dg.err(te.span, "E0654", "expected the name of an error set");
+    return dnil();
+}
+
+// Whether the error set `set` (nil: any error) holds the error `name`.
+fn set_has(set: *mut ast.Decl, name: []u8) bool {
+    if u.isnil(set) {
+        return true;
+    }
+    resolve_decl(set);
+    for i in 0..set.set_names.len {
+        if u.same(set.set_names.get(i), name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The first error of set a that set b does not hold, or no string (both
+// named sets).
+fn set_missing(a: *mut ast.Decl, b: *mut ast.Decl) []u8 {
+    resolve_decl(a);
+    for i in 0..a.set_names.len {
+        if not set_has(b, a.set_names.get(i)) {
+            return a.set_names.get(i);
+        }
+    }
+    return u.nosym();
+}
+
+fn errset_label(decl: *mut ast.Decl, ep: *mut ast.Type) []u8 {
+    if u.notnil(ep) {
+        return ep.name;
+    }
+    return decl.name;
+}
+
+// An error of (a_decl, a_ep) where (b_decl, b_ep) is needed (both nil: any error).
+fn error_fits(sp: u.Span, a_decl: *mut ast.Decl, a_ep: *mut ast.Type, b_decl: *mut ast.Decl, b_ep: *mut ast.Type) bool {
+    if u.isnil(b_decl) and u.isnil(b_ep) {
+        return true;
+    }
+    if u.notnil(a_ep) and (a_ep == b_ep) {
+        return true;
+    }
+    if u.isnil(a_ep) and u.isnil(b_ep) and (a_decl == b_decl) {
+        return true;
+    }
+    if u.notnil(a_decl) {
+        resolve_decl(a_decl);
+    }
+    if u.notnil(b_decl) {
+        resolve_decl(b_decl);
+    }
+    if u.isnil(a_ep) and u.notnil(a_decl) and (a_decl.set_names.len == 0) {
+        return true;
+    }
+    if u.notnil(a_ep) {
+        _ = dg.err(sp, "E0653", u.f2("%s can hold errors unknown to %s", a_ep.name, errset_label(b_decl, b_ep)));
+        return false;
+    }
+    if u.isnil(a_decl) {
+        if u.notnil(b_ep) {
+            _ = dg.err(sp, "E0653",
+                       u.f1("a value of type error can hold any error, but %s may hold fewer; match on it to choose",
+                            b_ep.name));
+        } else {
+            _ = dg.err(sp, "E0653",
+                       u.f1("a value of type error can hold any error, but %s holds only its own; match on it to choose",
+                            b_decl.name));
+        }
+        return false;
+    }
+    if u.notnil(b_ep) {
+        _ = dg.err(sp, "E0653", u.f3("%s can hold error.%s, which %s may not hold", a_decl.name,
+                                     a_decl.set_names.get(0), b_ep.name));
+        return false;
+    }
+    let m = set_missing(a_decl, b_decl);
+    if not u.isnos(m) {
+        _ = dg.err(sp, "E0653", u.f3("%s can hold error.%s, which %s does not", a_decl.name, m, b_decl.name));
+        return false;
+    }
+    return true;
+}
+
+// Whether (b_decl, b_ep) holds every error of (a_decl, a_ep), without reporting.
+fn set_within_err(a_decl: *mut ast.Decl, a_ep: *mut ast.Type, b_decl: *mut ast.Decl, b_ep: *mut ast.Type) bool {
+    if u.isnil(b_decl) and u.isnil(b_ep) {
+        return true;
+    }
+    if u.notnil(a_ep) and (a_ep == b_ep) {
+        return true;
+    }
+    if u.isnil(a_ep) and u.isnil(b_ep) and (a_decl == b_decl) {
+        return true;
+    }
+    if u.isnil(a_ep) and u.notnil(a_decl) {
+        resolve_decl(a_decl);
+        if a_decl.set_names.len == 0 {
+            return true;
+        }
+    }
+    if u.notnil(a_ep) or u.isnil(a_decl) or u.notnil(b_ep) {
+        return false;
+    }
+    return u.isnos(set_missing(a_decl, b_decl));
+}
+
+// An error union s where the wider t is expected: the same value type, and
+// t's set holds every error of s's (spec §11.3).
+fn union_fits(sp: u.Span, s: *mut ast.Type, t: *mut ast.Type) bool {
+    if (u.notnil(t.decl) or u.notnil(t.err_param)) and u.isnil(s.decl) and u.isnil(s.err_param) {
+        if u.notnil(t.err_param) {
+            _ = dg.err(sp, "E0653", u.f2("%s can hold any error, but %s may hold fewer; handle the others with catch",
+                                         tstr(s), tstr(t)));
+        } else {
+            _ = dg.err(sp, "E0653",
+                       u.f2("%s can hold any error, but %s holds only those of its set; handle the others with catch",
+                            tstr(s), tstr(t)));
+        }
+        return false;
+    }
+    return error_fits(sp, s.decl, s.err_param, t.decl, t.err_param);
+}
+
+// A function whose results widen to those of t (an error union of a set
+// within t's), with the same parameters.
+fn fn_widens(s: *mut ast.Type, t: *mut ast.Type) bool {
+    if s.params.len != t.params.len {
+        return false;
+    }
+    for i in 0..s.params.len {
+        if s.params[i] != t.params[i] {
+            return false;
+        }
+    }
+    let a = s.ret;
+    let b = t.ret;
+    return (a.kind == ast.TY_ERRUNION) and (b.kind == ast.TY_ERRUNION) and (a.elem == b.elem) and
+           set_within_err(a.decl, a.err_param, b.decl, b.err_param);
+}
+
+// The error set an expected type asks for (nil: none, or any error).
+fn expected_set(t0: *mut ast.Type) *mut ast.Decl {
+    let mut t = t0;
+    while u.notnil(t) and (t.kind == ast.TY_OPT) {
+        t = t.elem;
+    }
+    if u.notnil(t) and ((t.kind == ast.TY_ERROR) or (t.kind == ast.TY_ERRUNION)) {
+        return t.decl;
+    }
+    return dnil();
+}
+
+// The function E0355 was last reported for.
+fn record_ret_err(name: []u8) void {
+    for i in 0..C.ret_errs.len {
+        if u.same(C.ret_errs.get(i), name) {
+            return;
+        }
+    }
+    C.ret_errs.push(name);
+}
+
+fn record_ret_set(d: *mut ast.Decl) void {
+    resolve_decl(d);
+    for i in 0..d.set_names.len {
+        record_ret_err(d.set_names.get(i));
+    }
+}
+
+fn is_self_infer_call(e0: *mut ast.Expr) bool {
+    let e = unwrap_conv(e0);
+    return u.notnil(e) and u.notnil(C.fnd) and C.fnd.inferring_ret and (e.kind == ast.E_CALL) and
+           (ast.call_kind_of(e) == ast.CALLK_DIRECT) and (ast.decl_of(e) == C.fnd);
+}
+
+// pe is nil for a return without a value.
+
+fn ensure_infer_ret(f: *mut ast.Decl) void {
+    if (f.kind == ast.D_FN) and (f.state == ast.DeclState.DONE) and f.is_infer_ret and not f.checked and
+       not f.inferring_ret {
+        check_fn_body(f);
+    }
+}
+
+fn list_has_sym(xs: *u.List.[[]u8], name: []u8) bool {
+    for i in 0..xs.len {
+        if u.same(xs.get(i), name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn check_unused_errset(decl: *mut ast.Decl, ret_errs: *u.List.[[]u8], set_sp: u.Span, elem_sp: u.Span) void {
+    let mut kept = u.List.[[]u8].empty();
+    let mut dropped = false;
+    for i in 0..decl.set_names.len {
+        let n = decl.set_names.get(i);
+        if list_has_sym(ret_errs, n) {
+            kept.push(n);
+        } else {
+            dropped = true;
+        }
+    }
+    if not dropped {
+        kept.deinit();
+        return;
+    }
+    let d = dg.warning(set_sp, "W0655", "declared error set contains errors this function can never return");
+    if kept.len > 0 {
+        let mut b = u.Buf.init();
+        b.s("{ ");
+        for i in 0..kept.len {
+            if i != 0 {
+                b.s(", ");
+            }
+            b.s(kept.get(i));
+        }
+        b.s(" }");
+        let fx = dg.fix(d, "narrow the error set", "machine");
+        dg.edit(fx, set_sp, b.done());
+    } else {
+        let fx = dg.fix(d, "remove the unused error set", "suggestion");
+        dg.edit(fx, u.mkspan(set_sp.file, set_sp.start, elem_sp.start), "");
+    }
+    kept.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// catch / try
+// ---------------------------------------------------------------------------
+fn check_catch(e: *mut ast.Expr) *mut ast.Type {
+    let t = check_expr(e.a, tnil());
+    check_no_copy(e.a);
+    let mut vt = ty.t_invalid;
+    let mut et = ty.t_error;
+    if t.kind == ast.TY_ERRUNION {
+        vt = t.elem;
+        if u.notnil(t.err_param) {
+            et = t.err_param;
+        } else {
+            et = ty.type_errset(t.decl);
+        }
+    } else if t.kind != ast.TY_INVALID {
+        _ = dg.err(e.a.span, "E0611", u.f1("'catch' requires an error union (!T), found %s", tstr(t)));
+    }
+    let fc = C;
+    let nloc = fc.locals.len;
+    let pre_snap = save_moves(nloc);
+    let pre_dead = fc.flow_dead;
+    let mut h_dead = false;
+    scope_push();
+    if not u.isnos(ast.more(e).capture) {
+        ast.ext(e).capture_local = declare_local(ast.ext(e).capture, ast.ext(e).capture_span, et, false, false);
+    }
+    match ast.more(e).handler {
+        .Value(h) => {
+            let mut x = h;
+            if vt.kind == ast.TY_VOID {
+                // For !void only a diverging handler (e.g. @trap()) makes sense.
+                let ht = check_expr(x, tnil());
+                if (ht.kind != ast.TY_NEVER) and (ht.kind != ast.TY_INVALID) {
+                    _ = dg.err(x.span, "E0613", "a fallback value makes no sense for !void; use a block");
+                }
+                h_dead = C.flow_dead or (ht.kind == ast.TY_NEVER);
+            } else {
+                _ = check_expr_to(&mut x, vt);
+                check_no_copy(x);
+                h_dead = C.flow_dead or (u.notnil(x.ty) and (x.ty.kind == ast.TY_NEVER));
+            }
+            ast.ext(e).handler = ast.Handler.Value(x);
+        }
+        .Return(h) => {
+            let mut x = h;
+            if u.notnil(x) {
+                check_return_value(&mut x, e.span);
+            } else {
+                check_return_value(u.nil.[*mut ast.Expr](), e.span);
+            }
+            ast.ext(e).handler = ast.Handler.Return(x);
+            h_dead = true;
+        }
+        .Break => {
+            check_catch_jump(e, true);
+            h_dead = true;
+        }
+        .Continue => {
+            check_catch_jump(e, false);
+            h_dead = true;
+        }
+        .Block(blk) => {
+            // For !void the block may complete normally: execution continues after
+            // the expression. For !T there is no value to produce, so it must diverge.
+            let bdiv = check_block(blk);
+            if not bdiv and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
+                _ = dg.err(blk.span, "E0612",
+                           u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
+                                tstr(vt)));
+            }
+            h_dead = bdiv or pre_dead;
+        }
+    }
+    scope_pop();
+    if h_dead {
+        restore_moves(pre_snap);
+        C.flow_dead = pre_dead;
+    } else {
+        let h_snap = save_moves(nloc);
+        merge_moves_or(pre_snap, h_snap);
+        C.flow_dead = pre_dead;
+    }
+    let mut hw = e.a.weakened;
+    match ast.more(e).handler {
+        .Value(h) => {
+            if h.weakened {
+                hw = true;
+            }
+        }
+        else => {}
+    }
+    e.weakened = hw;
+    e.ty = vt;
+    return e.ty;
+}
+
+fn opt_target(expected: *mut ast.Type) *mut ast.Type {
+    let mut e = expected;
+    if u.notnil(e) and (e.kind == ast.TY_ERRUNION) {
+        e = e.elem;
+    }
+    if u.notnil(e) and (e.kind == ast.TY_OPT) {
+        return e;
+    }
+    return tnil();
+}
+
+fn check_opt_none(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let t = opt_target(expected);
+    if u.notnil(t) {
+        return set_ty(e, t);
+    }
+    _ = dg.err(e.span, "E0502", "cannot infer the type of '.none'; add a type annotation");
+    return set_ty(e, ty.t_invalid);
+}
+
+fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let t = opt_target(expected);
+    if u.notnil(t) {
+        _ = check_expr_to(&mut e.a, t.elem);
+        move_or_check_nocopy(e.a);
+        e.weakened = e.a.weakened;
+        if t.elem.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, t);
+    }
+    let mut it = check_expr(e.a, tnil());
+    if ty.is_untyped(it) {
+        it = finalize_untyped(&mut e.a);
+    }
+    move_or_check_nocopy(e.a);
+    e.weakened = e.a.weakened;
+    if it.kind == ast.TY_INVALID {
+        return set_ty(e, ty.t_invalid);
+    }
+    if it.kind == ast.TY_NEVER {
+        return set_ty(e, ty.t_never);
+    }
+    if it.kind == ast.TY_VOID {
+        _ = dg.err(e.a.span, "E0404", "optional element type cannot be void");
+        return set_ty(e, ty.t_invalid);
+    }
+    return set_ty(e, ty.type_opt(it));
+}
+
+fn check_empty_slice(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let mut t = expected;
+    while u.notnil(t) and ((t.kind == ast.TY_ERRUNION) or (t.kind == ast.TY_OPT)) {
+        t = t.elem;
+    }
+    if u.notnil(t) and (t.kind == ast.TY_SLICE) {
+        return set_ty(e, t);
+    }
+    _ = dg.err(e.span, "E0502", "cannot infer the element type of empty slice '[]'; add a type annotation");
+    return set_ty(e, ty.t_invalid);
+}
+
+fn check_orelse(e: *mut ast.Expr) *mut ast.Type {
+    let mut t = check_expr(e.a, tnil());
+    if ty.is_untyped(t) {
+        t = finalize_untyped(&mut e.a);
+    }
+    check_no_copy(e.a);
+    let mut vt = ty.t_invalid;
+    if t.kind == ast.TY_OPT {
+        vt = t.elem;
+    } else if t.kind != ast.TY_INVALID {
+        _ = dg.err(e.a.span, "E0614", u.f1("'??' requires an optional (?T), found %s", tstr(t)));
+    }
+    let nloc = C.locals.len;
+    let pre_snap = save_moves(nloc);
+    let pre_dead = C.flow_dead;
+    let mut h_dead = false;
+    match ast.more(e).handler {
+        .Value(h) => {
+            let mut x = h;
+            _ = check_expr_to(&mut x, vt);
+            check_no_copy(x);
+            ast.ext(e).handler = ast.Handler.Value(x);
+            h_dead = C.flow_dead or (u.notnil(x.ty) and (x.ty.kind == ast.TY_NEVER));
+        }
+        .Return(h) => {
+            let mut x = h;
+            if u.notnil(x) {
+                check_return_value(&mut x, e.span);
+            } else {
+                check_return_value(u.nil.[*mut ast.Expr](), e.span);
+            }
+            ast.ext(e).handler = ast.Handler.Return(x);
+            h_dead = true;
+        }
+        .Break => {
+            check_catch_jump(e, true);
+            h_dead = true;
+        }
+        .Continue => {
+            check_catch_jump(e, false);
+            h_dead = true;
+        }
+        .Block(blk) => {
+            let bdiv = check_block(blk);
+            if not bdiv and (vt.kind != ast.TY_INVALID) {
+                _ = dg.err(blk.span, "E0612",
+                           u.f1("this '??' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use '?? <value>')",
+                                tstr(vt)));
+            }
+            h_dead = bdiv or pre_dead;
+        }
+    }
+    if h_dead {
+        restore_moves(pre_snap);
+        C.flow_dead = pre_dead;
+    } else {
+        let h_snap = save_moves(nloc);
+        merge_moves_or(pre_snap, h_snap);
+        C.flow_dead = pre_dead;
+    }
+    e.weakened = e.a.weakened;
+    match ast.more(e).handler {
+        .Value(h) => {
+            if h.weakened {
+                e.weakened = true;
+            }
+        }
+        else => {}
+    }
+    e.ty = vt;
+    return e.ty;
+}
+
+// catch break / catch continue (the label, if any, is in e.name)
+fn check_catch_jump(e: *mut ast.Expr, is_break: bool) void {
+    let mut sp = e.span;
+    if e.name.len > 0 {
+        sp = ast.name_span_of(e);
+    }
+    ast.set_index(e, @max(check_jump_target(e.name, sp, is_break), 0));
+}
+
+fn check_try(e: *mut ast.Expr) *mut ast.Type {
+    let t = check_expr(e.a, tnil());
+    if t.kind == ast.TY_INVALID {
+        return set_ty(e, ty.t_invalid);
+    }
+    check_no_copy(e.a);
+    if t.kind != ast.TY_ERRUNION {
+        _ = dg.err(e.span, "E0611", u.f1("'!' requires an error union (!T), found %s", tstr(t)));
+        return set_ty(e, ty.t_invalid);
+    }
+    if u.isnil(C.fnd) or u.isnil(C.ret) or (C.ret.kind != ast.TY_ERRUNION) {
+        let d = dg.err(e.span, "E0610", "'!' can only be used in a function that returns an error union");
+        if u.notnil(C.fnd) and u.notnil(C.fnd.ret_te) {
+            let fx = dg.fix(d, "make the function return an error union", "suggestion");
+            dg.edit(fx, sp_at(C.fnd.ret_te.span), "!");
+        }
+    } else {
+        _ = check_leave_ok(e.span, false);
+        try_fits(e.span, t.decl, t.err_param, C.ret.decl, C.ret.err_param);
+        if not C.ret_err_open {
+            if u.notnil(t.err_param) {
+                C.ret_err_open = true;
+            } else if u.notnil(t.decl) {
+                record_ret_set(t.decl);
+            } else if not is_self_infer_call(e.a) {
+                C.ret_err_open = true;
+            }
+        }
+    }
+    e.weakened = e.a.weakened;
+    e.ty = t.elem;
+    return e.ty;
+}
+
+// '!' on an error union of (a_decl, a_ep) in a function returning (b_decl, b_ep).
+fn try_fits(sp: u.Span, a_decl: *mut ast.Decl, a_ep: *mut ast.Type, b_decl: *mut ast.Decl, b_ep: *mut ast.Type) void {
+    if u.isnil(b_decl) and u.isnil(b_ep) {
+        return;
+    }
+    if u.notnil(a_ep) and (a_ep == b_ep) {
+        return;
+    }
+    if u.isnil(a_ep) and u.isnil(b_ep) and (a_decl == b_decl) {
+        return;
+    }
+    if u.notnil(a_decl) {
+        resolve_decl(a_decl);
+    }
+    if u.notnil(b_decl) {
+        resolve_decl(b_decl);
+    }
+    if u.isnil(a_ep) and u.notnil(a_decl) and (a_decl.set_names.len == 0) {
+        return;
+    }
+    if u.notnil(a_ep) {
+        _ = dg.err(sp, "E0653", u.f2("this '!' can pass on errors of %s, which %s may not hold", a_ep.name,
+                                     errset_label(b_decl, b_ep)));
+        return;
+    }
+    if u.isnil(a_decl) {
+        _ = dg.err(sp, "E0653", u.f1("this '!' can pass on any error, but this function returns only those of %s",
+                                     errset_label(b_decl, b_ep)));
+        return;
+    }
+    if u.notnil(b_ep) {
+        _ = dg.err(sp, "E0653", u.f2("this '!' can pass on error.%s, which %s may not hold", a_decl.set_names.get(0),
+                                     b_ep.name));
+        return;
+    }
+    let m = set_missing(a_decl, b_decl);
+    if not u.isnos(m) {
+        _ = dg.err(sp, "E0653", u.f2("this '!' can pass on error.%s, which %s does not hold", m, b_decl.name));
+    }
+}

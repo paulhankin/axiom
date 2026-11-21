@@ -1,0 +1,602 @@
+// =============================================================================
+// ir_verify.ax - IR printing and consistency/parts verification, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+// Debugging (AXIOM_CHECK_CINTS): that no constant was changed.
+pub fn check_cints() void {
+    let tys = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let vals = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let cs = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    let mut bad: usize = 0;
+    for k in 0..CINTS.cap {
+        if tys[k] == 0 {
+            continue;
+        }
+        let c = cs[k];
+        if (c.kind != V_CINT) or (@int_from_ptr(c.ty) != tys[k]) or (c.cv != vals[k]) or c.replaced or u.notnil(c.a) or
+           (c.xs.len != 0) or u.notnil(c.blk) or u.notnil(c.next) {
+            bad += 1;
+        }
+    }
+    u.eprint(u.f2("cints: %s, changed: %s\n", u.zdec(CINTS.len), u.zdec(bad)));
+}
+
+// Debugging (AXIOM_CHECK_IR): that each instruction's operands from its own
+// block (but a phi's, and allocas, which are the frame's) come before it;
+// stops at the first that does not.
+pub fn check_order(m: *mut Module) void {
+    for fi in 0..m.funcs.len {
+        check_order_of(m.funcs.get(fi));
+    }
+}
+
+/// check_order, of one function.
+pub fn check_order_of(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.pos = 1;  // (not reached yet)
+            i = i.next;
+        }
+        i = b.first;
+        while u.notnil(i) {
+            if i.op != OP_PHI {
+                check_operand(f, i, i.a);
+                check_operand(f, i, i.b);
+                check_operand(f, i, i.c);
+                for k in 0..i.xs.len {
+                    check_operand(f, i, i.xs.get(k));
+                }
+            }
+            i.pos = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+fn check_operand(f: *Func, i: *Value, x0: *mut Value) void {
+    if u.isnil(x0) {
+        return;
+    }
+    let x = resolve(x0);
+    if (x.kind == V_INST) and (x.blk == i.blk) and (x.pos != 0) and (x.op != OP_ALLOCA) {
+        u.die(u.f3("%s: %s before %s", f.name, inst_str(i), inst_str(x)));
+    }
+}
+
+threadlocal let mut checking: i32 = -1;  // AXIOM_CHECK_IR: unknown, no, yes
+
+// Debugging (AXIOM_CHECK_IR): check_uses(f) between passes.
+pub fn check_point(f: *mut Func) void {
+    if checking < 0 {
+        checking = 0;
+        if not u.isnos(u.env("AXIOM_CHECK_IR")) {
+            checking = 1;
+        }
+    }
+    if checking == 1 {
+        check_uses(f);
+    }
+}
+
+// Debugging (AXIOM_CHECK_IR): the lists of uses of f's instructions are
+// those of its blocks' operands.
+pub fn check_uses(f: *mut Func) void {
+    let mut seen = u.U64Map.empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            seen.put(@as(u64, @int_from_ptr(i)), 1);
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        if b.gone {
+            u.die(u.f2("%s: block %s is gone but in the function", f.name, b.name));
+        }
+        let mut i = b.first;
+        while u.notnil(i) {
+            if not is_reg(i) {
+                u.die(u.f2("%s: %s is not registered", f.name, inst_str(i)));
+            }
+            let n = 3 + i.xs.len;
+            for k in 0..n {
+                let x = operand(i, k);
+                let mut p = xuse(i, k - 3);
+                if k == 0 {
+                    p = &mut i.ua;
+                } else if k == 1 {
+                    p = &mut i.ub;
+                } else if k == 2 {
+                    p = &mut i.uc;
+                }
+                if tracked(x) != (p.back != 0) {
+                    u.die(
+                        u.f3(
+                            "%s: %s: operand %s is not on its list of uses", f.name, inst_str(i), u.udec(@as(u64, k))));
+                }
+                if u.notnil(x) and x.replaced {
+                    u.die(u.f3("%s: %s: operand %s was replaced", f.name, inst_str(i), u.udec(@as(u64, k))));
+                }
+            }
+            let mut c: i32 = 0;
+            let mut p = i.first_use;
+            while u.notnil(p) {
+                let w = use_user(p);
+                if (seen.get(@as(u64, @int_from_ptr(w))) == 0) or not is_reg(w) or (operand(w, use_slot(p)) != i) {
+                    u.die(u.f3("%s: %s: a use by %s that is not one", f.name, inst_str(i), inst_str(w)));
+                }
+                c += 1;
+                p = p.next;
+            }
+            if c != i.nuses {
+                u.die(u.f3("%s: %s: %s uses counted", f.name, inst_str(i), u.idec(i.nuses)));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    seen.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Printing (for --emit=ir and debugging)
+// -----------------------------------------------------------------------------
+fn op_name(op: i32) []u8 {
+    let names = ["?", "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "and", "or", "xor", "shl", "lshr", "ashr",
+                 "fadd", "fsub", "fmul", "fdiv", "frem", "fneg", "icmp", "fcmp", "select", "zext", "sext", "trunc",
+                 "bitcast", "ptrtoint", "inttoptr", "fpext", "fptrunc", "sitofp", "uitofp", "fptosi.sat", "fptoui.sat",
+                 "alloca", "load", "store", "ptradd", "memcpy", "memmove", "memset", "atomicrmw", "cmpxchg", "fence",
+                 "extractvalue", "insertvalue", "extractelement", "insertelement", "shuffle", "splat", "call", "intr",
+                 "phi", "br", "condbr", "switch", "ret", "unreachable", "copy"];
+    if (op < 0) or (@int_cast(usize, op) >= names.len) {
+        return "?";
+    }
+    return names[@int_cast(usize, op)];
+}
+
+pub fn val_str(v: *Value) []u8 {
+    let k = v.kind;
+    if k == V_INST {
+        return u.cat2("%", u.idec(v.id));
+    }
+    if k == V_PARAM {
+        return u.cat2("%arg", u.udec(v.cv));
+    }
+    if k == V_CINT {
+        if v.ty.bits == 1 {
+            return u.pick(v.cv != 0, "true", "false");
+        }
+        return u.dec(sval(v));
+    }
+    if k == V_CFP {
+        return u.ffmt("%g", fv_of(v));
+    }
+    if k == V_ZERO {
+        return "zero";
+    }
+    if k == V_UNDEF {
+        return "undef";
+    }
+    if k == V_GLOBAL {
+        let g = gv_ro(v);
+        if v.cv != 0 {
+            return u.f2("@%s+%s", g.name, u.udec(v.cv));
+        }
+        return u.cat2("@", g.name);
+    }
+    if k == V_FUNC {
+        return u.cat2("@", fnp_ro(v).name);
+    }
+    let mut b = u.Buf.init();
+    b.s("{");
+    for i in 0..agg_len(v) {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(val_str(agg_elem(v, i)));
+    }
+    b.s("}");
+    return b.done();
+}
+
+fn blk_str(b: *Block) []u8 {
+    return u.f2("%%%s.%s", b.name, u.idec(b.id));
+}
+
+pub fn inst_str(v: *Value) []u8 {
+    let mut b = u.Buf.init();
+    if v.ty.kind != T_VOID {
+        b.s(val_str(v));
+        b.s(" = ");
+    }
+    b.s(op_name(v.op));
+    if (v.op == OP_ICMP) or (v.op == OP_FCMP) or (v.op == OP_RMW) or (v.op == OP_INTR) or (v.op == OP_EXTRACTVALUE) or
+       (v.op == OP_INSERTVALUE) or (v.op == OP_EXTRACTELEM) or (v.op == OP_INSERTELEM) {
+        b.s(".");
+        b.s(u.udec(v.cv));
+    }
+    if ((v.flags & F_ATOMIC) != 0) or (v.op == OP_FENCE) {
+        if v.op != OP_FENCE {
+            b.s(" atomic");
+        }
+        if (v.flags & F_WEAK) != 0 {
+            b.s(" weak");
+        }
+        if (v.flags & F_SIGNAL) != 0 {
+            b.s(" signal");
+        }
+        let names: [5][]u8 = ["", " relaxed", " acquire", " release", " acq_rel"];
+        let o = @as(usize, order(v));
+        if o < 5 {
+            b.s(names[o]);
+        }
+        let fo = @as(usize, fail_order(v));
+        if (v.op == OP_CMPXCHG) and (fo != o) and (fo < 5) {
+            b.s(" fail");
+            b.s(u.pick(fo == 0, " seq_cst", names[fo]));
+        }
+    }
+    if (v.flags & F_VOLATILE) != 0 {
+        b.s(" volatile");
+    }
+    if (v.op == OP_CALL) and ((v.flags & F_TAIL) != 0) {
+        b.s(" tail");
+    }
+    if no_wrap(v, F_NSW) {
+        b.s(" nsw");
+    }
+    if no_wrap(v, F_NUW) {
+        b.s(" nuw");
+    }
+    b.s(" ");
+    b.s(ty_str(v.ty));
+    if v.op == OP_ALLOCA {
+        b.s(" ");
+        b.s(ty_str(aty_ro(v)));
+    }
+    let ops: [3]*Value = [v.a, v.b, v.c];
+    for o in ops {
+        if u.notnil(o) {
+            b.s(" ");
+            b.s(val_str(o));
+        }
+    }
+    let ext = ext_ro(v);
+    for i in 0..v.xs.len {
+        b.s(", ");
+        b.s(val_str(v.xs.get(i)));
+        if (v.op == OP_CALL) and ((i + 1) < ext.len) {
+            if ext[i + 1] == EXT_BYVAL {
+                b.s(" byval");
+            } else if ext[i + 1] == EXT_SRET {
+                b.s(" sret");
+            }
+        }
+        if i < bs_of(v).len {
+            b.s(" ");
+            b.s(blk_str(bs_of(v).get(i)));
+        }
+    }
+    if u.notnil(v.t1) {
+        b.s(" -> ");
+        b.s(blk_str(v.t1));
+    }
+    if u.notnil(v.t2) {
+        b.s(", ");
+        b.s(blk_str(v.t2));
+    }
+    let mask = mask_ro(v);
+    if mask.len > 0 {
+        b.s(" [");
+        for i in 0..mask.len {
+            if i != 0 {
+                b.s(",");
+            }
+            b.s(u.idec(mask[i]));
+        }
+        b.s("]");
+    }
+    if v.align != 0 {
+        b.s(", align ");
+        b.s(u.udec(@as(u64, v.align)));
+    }
+    return b.done();
+}
+
+pub fn func_str(f: *mut Func) []u8 {
+    let mut b = u.Buf.init();
+    b.s(u.pick(is_decl(f), "declare ", "define "));
+    b.s(ty_str(f.ty.ret));
+    b.s(" @");
+    b.s(f.name);
+    b.s("(");
+    for i in 0..f.params.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(ty_str(f.params[i].ty));
+    }
+    b.s(")");
+    if is_decl(f) {
+        b.s("\n");
+        return b.done();
+    }
+    b.s(" {\n");
+    let mut bb = f.first;
+    while u.notnil(bb) {
+        b.s(blk_str(bb));
+        b.s(":\n");
+        let mut i = bb.first;
+        while u.notnil(i) {
+            marks_str(&mut b, dbg_marks_at(i));
+            b.s("    ");
+            b.s(inst_str(i));
+            b.s("\n");
+            i = i.next;
+        }
+        marks_str(&mut b, dbg_marks_end(bb));
+        bb = bb.next;
+    }
+    b.s("}\n");
+    return b.done();
+}
+
+// The marks of chain k (-g: dbg_mark), one line each: "; var N[.off:size]
+// (inline instance I) = value" (a kill: "?").
+fn marks_str(b: *mut u.Buf, k0: i32) void {
+    let mut k = k0;
+    while k >= 0 {
+        let m = dbg_marks.get(@int_cast(usize, k));
+        b.s("    ; var ");
+        b.s(u.idec(m.var));
+        if m.size != 0 {
+            b.s(u.f2(".%s:%s", u.idec(@bit_cast(i32, m.off)), u.idec(@bit_cast(i32, m.size))));
+        }
+        if m.inst != 0 {
+            b.s(u.f2(" (%s %s)", m.owner.name, u.idec(@bit_cast(i32, m.inst))));
+        }
+        let v = dbg_mark_value(k);
+        if u.isnil(v) {
+            b.s(" = ?\n");
+        } else {
+            b.s(" = ");
+            b.s(val_str(v));
+            if dbg_mark_low(k) {
+                b.s(" (low)");
+            }
+            let a = dbg_mark_add(k);
+            if a != 0 {
+                b.s(u.f1(" + %s", u.idec(@truncate(i32, a))));
+            }
+            b.s("\n");
+        }
+        k = m.next;
+    }
+}
+
+pub fn module_str(m: *mut Module) []u8 {
+    let mut b = u.Buf.init();
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        b.s("@");
+        b.s(g.name);
+        b.s(" = ");
+        b.s(u.pick(g.is_const, "constant ", "global "));
+        b.s(ty_str(g.ty));
+        if u.notnil(g.init) {
+            b.s(" ");
+            b.s(val_str(g.init));
+        }
+        b.s("\n");
+    }
+    for i in 0..m.funcs.len {
+        b.s("\n");
+        b.s(func_str(m.funcs.get(i)));
+    }
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Debugging (AXIOM_CHECK_PARTS: backend.ax runs the parts one at a time):
+// that a part changes nothing of the module but its own functions, nor the
+// constants and types the parts share. The memory of each is copied when
+// the parts begin (watch_module), and compared after each part
+// (watch_check).
+// -----------------------------------------------------------------------------
+struct WatchRegion {
+    addr: usize,
+    len: usize,
+    owner: i32,  // the function it is part of (-1: none: shared by all)
+    what: []u8,
+    copy: usize,  // its offset in the copy
+}
+
+pub struct Watch {
+    regions: u.List.[WatchRegion],
+    copy: u.List.[u8],
+    seen: u.U64Map,
+}
+
+fn watch(w: *mut Watch, p: usize, len: usize, owner: i32, what: []u8) void {
+    if (p == 0) or (len == 0) {
+        return;
+    }
+    if w.seen.get(@as(u64, p)) != 0 {
+        return;
+    }
+    w.seen.put(@as(u64, p), 1);
+    let at = w.copy.len;
+    let dst = w.copy.extend(len);
+    @mem_copy(dst, @slice_from_ptr(@ptr_from_int(*u8, p), len));
+    w.regions.push(WatchRegion.{ addr: p, len: len, owner: owner, what: what, copy: at });
+}
+
+fn watch_ty(w: *mut Watch, t: *mut Ty) void {
+    if u.isnil(t) or (w.seen.get(@as(u64, @int_from_ptr(t))) != 0) {
+        return;
+    }
+    watch(w, @int_from_ptr(t), @size_of(Ty), -1, "type");
+    watch_ty(w, t.elem);
+    watch_ty(w, t.ret);
+    for x in t.fields {
+        watch_ty(w, x);
+    }
+    for x in t.params {
+        watch_ty(w, x);
+    }
+    watch(w, @int_from_ptr(t.fields.ptr), t.fields.len * @size_of(*mut Ty), -1, "type fields");
+    watch(w, @int_from_ptr(t.params.ptr), t.params.len * @size_of(*mut Ty), -1, "type params");
+    watch(w, @int_from_ptr(t.offs.ptr), t.offs.len * 8, -1, "type offsets");
+}
+
+fn watch_val(w: *mut Watch, v: *mut Value, owner: i32) void {
+    if u.isnil(v) or (w.seen.get(@as(u64, @int_from_ptr(v))) != 0) {
+        return;
+    }
+    let mut o = owner;
+    if v.kind != V_INST {
+        o = -1;  // (constants, globals' and functions' values: shared)
+        if v.kind == V_PARAM {
+            o = owner;
+        }
+    }
+    if o < 0 {
+        // (the scratch of what is shared, poisoned: a part that sets it and
+        // then clears it is seen; its uses stay, which some read: 0)
+        v.aux = 0x5A5A5A5A5A5A5A5A;
+        v.aux2 = 0x5A5A5A5A5A5A5A5A;
+        v.pos = 0x5A5A5A5A;
+        v.loc = 0x5A5A5A5A;
+        v.flag = 0x5A5A5A5A;
+    }
+    let mut what = "constant";
+    if v.kind == V_INST {
+        what = "instruction";
+    } else if v.kind == V_PARAM {
+        what = "parameter";
+    }
+    watch(w, @int_from_ptr(v), @size_of(Value), o, what);
+    watch_ty(w, v.ty);
+    if v.more != 0 {
+        watch(w, v.more, more_size(more_group(v)), o, "value record");
+    }
+    watch(w, @int_from_ptr(v.xs.data), v.xs.len * @size_of(*mut Value), o, "operands");
+    if (v.kind == V_INST) and (v.op == OP_CALL) {
+        // (the records of calls, which functions share: inlining, copies)
+        let mut c = chain_of(v);
+        while u.notnil(c) {
+            watch(w, @int_from_ptr(c), @size_of(Chain), -1, "call's chain");
+            watch_val(w, c.site, -1);
+            c = c.next;
+        }
+    }
+    if v.kind != V_INST {
+        for k in 0..v.xs.len {
+            watch_val(w, v.xs.get(k), o);
+        }
+    }
+}
+
+/// The copy of m's memory, and the shared constants' and types'.
+pub fn watch_module(m: *mut Module) *mut Watch {
+    let w = u.new.[Watch]();
+    w.* = Watch.{ regions: u.List.[WatchRegion].empty(), copy: u.List.[u8].empty(), seen: u.U64Map.empty() };
+    watch(w, @int_from_ptr(m), @size_of(Module), -1, "module");
+    watch(w, @int_from_ptr(m.funcs.data), m.funcs.len * 8, -1, "the module's functions");
+    watch(w, @int_from_ptr(m.globals.data), m.globals.len * 8, -1, "the module's globals");
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        watch(w, @int_from_ptr(g), @size_of(Global), -1, "global");
+        watch_val(w, g.val, -1);
+        watch_val(w, g.init, -1);
+        watch_ty(w, g.ty);
+    }
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        let o = @int_cast(i32, i);
+        watch(w, @int_from_ptr(f), @size_of(Func), o, "function");
+        watch_val(w, f.val, -1);
+        watch_ty(w, f.ty);
+        for p in f.params {
+            watch_val(w, p, o);
+        }
+        let mut b = f.first;
+        while u.notnil(b) {
+            watch(w, @int_from_ptr(b), @size_of(Block), o, "block");
+            let mut x = b.first;
+            while u.notnil(x) {
+                watch_val(w, x, o);
+                for k in 0..(3 + x.xs.len) {
+                    let y = operand(x, k);
+                    if u.notnil(y) and (y.kind != V_INST) {
+                        watch_val(w, y, o);
+                    }
+                }
+                x = x.next;
+            }
+            b = b.next;
+        }
+    }
+    for i in @as(usize, 0)..129 {
+        watch_ty(w, TT.int_tys[i]);
+    }
+    let dv = @slice_from_ptr(TT.derived.vals, TT.derived.cap);
+    for i in 0..TT.derived.cap {
+        watch_ty(w, dv[i]);
+    }
+    let vv = @slice_from_ptr(TT.vecs.vals, TT.vecs.cap);
+    for i in 0..TT.vecs.cap {
+        if vv[i] != 0 {
+            watch_ty(w, @ptr_from_int(*mut Ty, @truncate(usize, vv[i])));
+        }
+    }
+    watch(w, @int_from_ptr(asm_flags.data), asm_flags.len * 4, -1, "asm flags");
+    watch(w, @int_from_ptr(asm_mems.data), asm_mems.len * @size_of([]AsmMem), -1, "asm memory operands");
+    return w;
+}
+
+/// Adds the memory [p, p + len) to w (what is outside the IR: backend.ax).
+pub fn watch_more(w: *mut Watch, p: usize, len: usize, what: []u8) void {
+    watch(w, p, len, -1, what);
+}
+
+/// After a part whose functions are mine: reports what changed of the rest
+/// (at most a few places); the number of regions changed.
+pub fn watch_check(w: *mut Watch, k: usize, mine: []bool) usize {
+    let mut bad: usize = 0;
+    let mut kept = u.List.[WatchRegion].empty();
+    for r in w.regions.items() {
+        if (r.owner >= 0) and mine[@as(usize, @bit_cast(u32, r.owner))] {
+            continue;  // (its own: what is left of it may be reused by the next part)
+        }
+        kept.push(r);
+        let now = @slice_from_ptr(@ptr_from_int(*mut u8, r.addr), r.len);
+        let was = w.copy.items()[r.copy..(r.copy + r.len)];
+        if @mem_eq(now, was) {
+            continue;
+        }
+        bad += 1;
+        if bad <= 20 {
+            let mut off: usize = 0;
+            while now[off] == was[off] {
+                off += 1;
+            }
+            let mut who = "";
+            if r.owner >= 0 {
+                who = u.f1(" of function %s", u.zdec(@as(usize, @bit_cast(u32, r.owner))));
+            }
+            u.eprint(u.f4("axiom: part %s changed a %s%s at byte %s", u.zdec(k), r.what, who, u.zdec(off)));
+            u.eprint(u.f2(" (kind %s, at %s)\n", u.zdec(@as(usize, now[0])), u.zdec(r.addr)));
+        }
+        @mem_copy(now, was);  // (for the next part, as a process of its own would see it)
+    }
+    w.regions = kept;
+    return bad;
+}

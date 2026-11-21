@@ -1,0 +1,554 @@
+// =============================================================================
+// a64_vec.ax - NEON vector legalization, pattern fusion, ops, and shuffles, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Vectors
+// -----------------------------------------------------------------------------
+// lane size code 0..3 for 8/16/32/64-bit lanes
+fn lk(t: *ir.Ty) u64 {
+    let b = is.lane_bits(t);
+    if b == 8 {
+        return 0;
+    }
+    if b == 16 {
+        return 1;
+    }
+    if b == 32 {
+        return 2;
+    }
+    return 3;
+}
+
+// Can the instruction selector handle this vector instruction directly?
+// (Everything else is split into lanes by lower.scalarize.)
+pub fn legal(v: *mut ir.Value) bool {
+    let t = v.ty;
+    let o = v.op;
+    if (o == ir.OP_INTR) and is.is_insn(ir.intr_id(v)) {
+        return true;  // (sema allowed it only where the extension is there)
+    }
+    if o == ir.OP_ICMP {
+        return true;
+    }
+    if (o == ir.OP_INTR) and (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
+        let id = ir.intr_id(v);
+        let at_ = v.xs.get(0).ty;
+        if (id == ir.IN_ANYTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_DOT_I16) or (id == ir.IN_DOT_I8) or
+           (id == ir.IN_ALLTRUE) or ir.intr_between(id, ir.IN_SHLV, ir.IN_ASHRV) or (id == ir.IN_SWIZZLE) or
+           ir.is_widen(id) {
+            return true;
+        }
+        if is.lane_float(at_) {
+            return (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST) or
+                   (id == ir.IN_FMA) or (id == ir.IN_FABS) or (id == ir.IN_SQRT) or (id == ir.IN_FMIN) or
+                   (id == ir.IN_FMAX) or (id == ir.IN_COPYSIGN);
+        }
+        let b = is.lane_bits(at_);
+        if id == ir.IN_ABS {
+            return true;
+        }
+        if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            return b < 64;
+        }
+        if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+            return true;
+        }
+        return false;
+    }
+    if t.kind != ir.T_VEC {
+        return true;
+    }
+    if o == ir.OP_MUL {
+        return is.lane_bits(t) < 64;
+    }
+    if (o == ir.OP_UDIV) or (o == ir.OP_SDIV) or (o == ir.OP_UREM) or (o == ir.OP_SREM) or (o == ir.OP_FREM) {
+        return false;
+    }
+    if ir.is_cast(o) {
+        if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) or (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT) {
+            // lane for lane (FCVTZS / FCVTZU saturate, NaN -> 0, as WebAssembly's trunc_sat)
+            return (v.a.ty.kind == ir.T_VEC) and (is.lane_bits(v.a.ty) == is.lane_bits(t)) and (is.lane_bits(t) >= 32);
+        }
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT);
+    }
+    return true;
+}
+
+// ~m (m ^ all ones): m, or nil.
+fn not_of(n: *mut ir.Value) *mut ir.Value {
+    if ir.is_op(n, ir.OP_XOR) and (n.ty.kind == ir.T_VEC) {
+        if is.all_ones(n.b) {
+            return n.a;
+        }
+        if is.all_ones(n.a) {
+            return n.b;
+        }
+    }
+    return ir.vnil();
+}
+
+// The operand of an and that is a not (the and is a bit clear), or nil.
+fn not_operand(i: *mut ir.Value) *mut ir.Value {
+    if u.notnil(not_of(i.b)) {
+        return i.b;
+    }
+    if u.notnil(not_of(i.a)) {
+        return i.a;
+    }
+    return ir.vnil();
+}
+
+// m ? x : y, bit by bit: BSL (the destination starts as the mask)
+fn gen_bsl(v: *mut ir.Value) void {
+    let s = is.sel_parts(v);
+    let d = vreg(v);
+    let rx = reg(s.x);
+    let ry = reg(s.y);
+    copy(d, reg(s.m), VR);
+    _ = raw(ae.v3(1, 1, 1, 3, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+}
+
+// y & ~m: BIC
+fn gen_bic(v: *mut ir.Value) void {
+    let n = not_operand(v);
+    let mut y = v.a;
+    if n == v.a {
+        y = v.b;
+    }
+    raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), vreg(v), reg(y), reg(not_of(n)));
+}
+
+// A widening intrinsic's half (1: the high one) and sign (1: unsigned).
+fn widen_q(id: ir.Intrinsic) u64 {
+    return @as(u64, @bit_cast(u32, (@int_from_enum(id) - @int_from_enum(ir.IN_SWIDEN_LO)) % 2));
+}
+
+fn widen_u(id: ir.Intrinsic) u64 {
+    return @as(u64, @bit_cast(u32, (@int_from_enum(id) - @int_from_enum(ir.IN_SWIDEN_LO)) / 2));
+}
+
+// A widening intrinsic's id, or IN_NONE.
+fn widen_id(v: *ir.Value) ir.Intrinsic {
+    if ir.is_op(v, ir.OP_INTR) {
+        let id = ir.intr_id(v);
+        if ir.is_widen(id) {
+            return id;
+        }
+    }
+    return ir.IN_NONE;
+}
+
+// A vector multiply of two halves widened alike (SMULL, UMULL2 ...): their
+// intrinsic, or IN_NONE.
+fn widening_mul(m: *ir.Value) ir.Intrinsic {
+    if not ir.is_op(m, ir.OP_MUL) or (m.ty.kind != ir.T_VEC) {
+        return ir.IN_NONE;
+    }
+    let id = widen_id(m.a);
+    if (id != ir.IN_NONE) and (id == widen_id(m.b)) {
+        return id;
+    }
+    return ir.IN_NONE;
+}
+
+fn is_dot8(m: *ir.Value) bool {
+    return (m.op == ir.OP_INTR) and (ir.intr_id(m) == ir.IN_DOT_I8);
+}
+
+// The multiply a vector add can take in, as MLA (or SMLAL, UMLAL2 ... when
+// it multiplies widened halves): its operand, or nil.
+fn mla_operand(i: *mut ir.Value) *mut ir.Value {
+    let ops: [2]*mut ir.Value = [i.b, i.a];
+    for k in @as(usize, 0)..2 {
+        let m = ops[k];
+        if is_dot8(m) and (m.nuses == 1) and (m != ops[1 - k]) {
+            return m;
+        }
+        if ir.is_op(m, ir.OP_MUL) and (m.ty.kind == ir.T_VEC) and (m.nuses == 1) and (m != ops[1 - k]) and
+           (((is.lane_bits(m.ty) < 64) and not is.lane_float(m.ty)) or (widening_mul(m) != ir.IN_NONE)) {
+            return m;
+        }
+    }
+    return ir.vnil();
+}
+
+// acc + x * y: MLA, or SMLAL, UMLAL2 ... of the widened halves' sources
+// (prepare marked the multiply, which is made here)
+fn gen_mla(v: *mut ir.Value) void {
+    let mut m = v.b;
+    let mut acc = v.a;
+    if not (ir.is_op(m, ir.OP_MUL) or is_dot8(m)) or ((m.flag & 4) == 0) {
+        m = v.a;
+        acc = v.b;
+    }
+    let d = vreg(v);
+    if is_dot8(m) {
+        // acc + @dot(x, y) of i8 lanes: SDOT
+        let rx = reg(m.xs.get(0));
+        let ry = reg(m.xs.get(1));
+        copy(d, reg(acc), VR);
+        _ = raw(ae.sdot(0, 0, 0), RW(d), R(rx), R(ry), NONE());
+        return;
+    }
+    let id = widening_mul(m);
+    if id != ir.IN_NONE {
+        let x = m.a.xs.get(0);
+        let rx = reg(x);
+        let ry = reg(m.b.xs.get(0));
+        copy(d, reg(acc), VR);
+        _ = raw(ae.mull(widen_q(id), widen_u(id), lk(x.ty), 8, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+        return;
+    }
+    let rx = reg(m.a);
+    let ry = reg(m.b);
+    copy(d, reg(acc), VR);
+    _ = raw(ae.v3(1, 0, lk(v.ty), 0x12, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+}
+
+// The widened half an add (either operand) or a subtract (the second) can take
+// in, as SADDW, USUBW2 ...: it, or nil.
+fn addw_operand(i: *mut ir.Value) *mut ir.Value {
+    if (widen_id(i.b) != ir.IN_NONE) and ((i.b.flag & 4) == 0) and (i.b != i.a) {
+        return i.b;
+    }
+    if (i.op == ir.OP_ADD) and (widen_id(i.a) != ir.IN_NONE) and ((i.a.flag & 4) == 0) and (i.b != i.a) {
+        return i.a;
+    }
+    return ir.vnil();
+}
+
+// acc + x, acc - x of a widened half x: SADDW, USUBW2 ... of its source
+fn gen_addw(v: *mut ir.Value) void {
+    let mut w = v.b;
+    let mut acc = v.a;
+    if widen_id(w) == ir.IN_NONE {  // (addw_operand's choice: the second operand when it can)
+        w = v.a;
+        acc = v.b;
+    }
+    let id = widen_id(w);
+    let x = w.xs.get(0);
+    let mut opc: u64 = 1;
+    if v.op == ir.OP_SUB {
+        opc = 3;
+    }
+    raw3(ae.mull(widen_q(id), widen_u(id), lk(x.ty), opc, 0, 0, 0), vreg(v), reg(acc), reg(x));
+}
+
+// x * y of widened halves: SMULL, UMULL2 ... of their sources
+fn gen_mull(v: *mut ir.Value) void {
+    let id = widening_mul(v);
+    let x = v.a.xs.get(0);
+    raw3(ae.mull(widen_q(id), widen_u(id), lk(x.ty), 0xc, 0, 0, 0), vreg(v), reg(x), reg(v.b.xs.get(0)));
+}
+
+fn vec_binop(v: *mut ir.Value) void {
+    let t = v.ty;
+    let o = v.op;
+    let d = vreg(v);
+    let a = reg(v.a);
+    if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+        vec_shift(v, d, a);
+        return;
+    }
+    let b = reg(v.b);
+    let k = lk(t);
+    let mut w: u64 = 0;
+    if o == ir.OP_ADD {
+        w = ae.v3(1, 0, k, 0x10, 0, 0, 0);
+    } else if o == ir.OP_SUB {
+        w = ae.v3(1, 1, k, 0x10, 0, 0, 0);
+    } else if o == ir.OP_MUL {
+        w = ae.v3(1, 0, k, 0x13, 0, 0, 0);
+    } else if o == ir.OP_AND {
+        w = ae.v3(1, 0, 0, 3, 0, 0, 0);
+    } else if o == ir.OP_OR {
+        w = ae.v3(1, 0, 2, 3, 0, 0, 0);
+    } else if o == ir.OP_XOR {
+        w = ae.v3(1, 1, 0, 3, 0, 0, 0);
+    } else {
+        fail(u.f1("vector op %s", u.idec(o)));
+        return;
+    }
+    raw3(w, d, a, b);
+}
+
+fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
+    let t = v.ty;
+    let o = v.op;
+    let k = lk(t);
+    let esize = @as(u64, @bit_cast(u32, is.lane_bits(t)));
+    let c = v.b;
+    if (c.kind == ir.V_CAGG) or (c.kind == ir.V_ZERO) or (ir.is_op(c, ir.OP_SPLAT) and is.is_c(c.a)) {
+        let mut n: u64 = 0;
+        if c.kind == ir.V_CAGG {
+            n = @bit_cast(u64, is.cval(c.xs.get(0)));
+        } else if ir.is_op(c, ir.OP_SPLAT) {
+            n = @bit_cast(u64, is.cval(c.a));
+        }
+        n = n & (esize - 1);
+        if n == 0 {
+            copy(d, a, VR);
+            return;
+        }
+        if o == ir.OP_SHL {
+            raw2(ae.vshift(1, 0, 0x0a, esize, true, n, 0, 0), d, a);
+        } else if o == ir.OP_LSHR {
+            raw2(ae.vshift(1, 1, 0, esize, false, n, 0, 0), d, a);
+        } else {
+            raw2(ae.vshift(1, 0, 0, esize, false, n, 0, 0), d, a);
+        }
+        return;
+    }
+    // by a register: SSHL / USHL shift left by a signed per-lane count
+    let cs = reg(c.a);
+    let m = vgpr();
+    and_imm(0, m, cs, esize - 1);
+    let mut cnt = m;
+    if o != ir.OP_SHL {
+        cnt = vgpr();
+        raw_dm(ae.addsub_reg(0, true, false, 0, 31, 0, 0, 0), cnt, m);
+    }
+    let vc = vvr();
+    raw2(ae.dup_gen(k, 0, 0), vc, cnt);
+    let mut u_: u64 = 1;
+    if o == ir.OP_ASHR {
+        u_ = 0;
+    }
+    raw3(ae.v3(1, u_, k, 0x08, 0, 0, 0), d, a, vc);
+}
+
+fn vnot(d: i32, r: i32) void {
+    raw2(ae.v2(1, 1, 0, 5, 0, 0), d, r);
+}
+
+fn vec_icmp(v: *mut ir.Value) void {
+    let t = v.a.ty;
+    let p = ir.pred_of(v);
+    let d = vreg(v);
+    let a = reg(v.a);
+    let b = reg(v.b);
+    let k = lk(t);
+    if (p == ir.IntEQ) or (p == ir.IntNE) {
+        if p == ir.IntEQ {
+            raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), d, a, b);
+        } else {
+            let x = vvr();
+            raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), x, a, b);
+            vnot(d, x);
+        }
+        return;
+    }
+    let mut u_: u64 = 0;
+    if (p == ir.IntULT) or (p == ir.IntULE) or (p == ir.IntUGT) or (p == ir.IntUGE) {
+        u_ = 1;
+    }
+    let mut opc: u64 = 0x06;  // greater than (CMGT / CMHI)
+    if (p == ir.IntSGE) or (p == ir.IntUGE) or (p == ir.IntSLE) or (p == ir.IntULE) {
+        opc = 0x07;  // or equal (CMGE / CMHS)
+    }
+    if (p == ir.IntSLT) or (p == ir.IntULT) or (p == ir.IntSLE) or (p == ir.IntULE) {
+        raw3(ae.v3(1, u_, k, opc, 0, 0, 0), d, b, a);
+    } else {
+        raw3(ae.v3(1, u_, k, opc, 0, 0, 0), d, a, b);
+    }
+}
+
+fn vec_fcmp(v: *mut ir.Value) void {
+    let t = v.a.ty;
+    let p = ir.pred_of(v);
+    let d = vreg(v);
+    let a = reg(v.a);
+    let b = reg(v.b);
+    let s = fsz(t);
+    let eq = ae.v3(1, 0, s, 0x1c, 0, 0, 0);
+    let ge = ae.v3(1, 1, s, 0x1c, 0, 0, 0);
+    let gt = ae.v3(1, 1, 2 | s, 0x1c, 0, 0, 0);
+    match p {
+        .OEQ => { raw3(eq, d, a, b); }
+        .UNE => {
+            let x = vvr();
+            raw3(eq, x, a, b);
+            vnot(d, x);
+        }
+        .OGT => { raw3(gt, d, a, b); }
+        .OGE => { raw3(ge, d, a, b); }
+        .OLT => { raw3(gt, d, b, a); }
+        else => { raw3(ge, d, b, a); }
+    }
+}
+
+fn gen_extract(v: *mut ir.Value) void {
+    let t = v.a.ty;
+    let lane = @bit_cast(u64, v.cv);
+    let d = vreg(v);
+    let a = reg(v.a);
+    let k = lk(t);
+    if is.lane_float(t) {
+        if lane == 0 {
+            copy(d, a, VR);
+        } else {
+            raw2(ae.dup_scalar(k, lane, 0, 0), d, a);
+        }
+        return;
+    }
+    raw2(ae.umov(k, lane, 0, 0), d, a);
+}
+
+fn gen_insert(v: *mut ir.Value) void {
+    let t = v.ty;
+    let lane = @bit_cast(u64, v.cv);
+    let d = vreg(v);
+    let a = reg(v.a);
+    let x = reg(v.b);
+    let k = lk(t);
+    copy(d, a, VR);
+    if is.lane_float(t) {
+        _ = raw(ae.ins_elem(k, lane, 0, 0, 0), RW(d), R(x), NONE(), NONE());
+    } else {
+        _ = raw(ae.ins_gen(k, lane, 0, 0), RW(d), R(x), NONE(), NONE());
+    }
+}
+
+fn gen_splat(v: *mut ir.Value) void {
+    let t = v.ty;
+    let d = vreg(v);
+    let x = reg(v.a);
+    if is.lane_float(t) {
+        raw2(ae.dup_elem(lk(t), 0, 0, 0), d, x);
+    } else {
+        raw2(ae.dup_gen(lk(t), 0, 0), d, x);
+    }
+}
+
+// Lane i of the permute with opcode `op` (1 UZP1, 2 TRN1, 3 ZIP1, 5 UZP2, 6 TRN2,
+// 7 ZIP2) of n-lane vectors, indexing a's lanes, then b's.
+fn perm_lane(op: u64, i: i32, n: i32) i32 {
+    let h = i / 2;
+    let odd = (i % 2) == 1;
+    if op == 1 {
+        return 2 * i;
+    }
+    if op == 5 {
+        return (2 * i) + 1;
+    }
+    if op == 3 {
+        if odd {
+            return n + h;
+        }
+        return h;
+    }
+    if op == 7 {
+        if odd {
+            return (n + (n / 2)) + h;
+        }
+        return (n / 2) + h;
+    }
+    if op == 2 {
+        if odd {
+            return (n + i) - 1;
+        }
+        return i;
+    }
+    if odd {
+        return n + i;
+    }
+    return i + 1;
+}
+
+// The one instruction a shuffle of two 128-bit vectors is, when it is one:
+// UZP1, ZIP2, TRN1 ... or EXT; or 0 (TBL).
+fn permute_word(v: *mut ir.Value) u64 {
+    let t = v.ty;
+    let n = @truncate(i32, @as(u64, ir.mask_of(v).len));
+    if (t.kind != ir.T_VEC) or ((t.lanes * is.lane_bits(t)) != 128) or (v.a.ty.lanes != t.lanes) or (n != t.lanes) {
+        return 0;
+    }
+    let same = v.a == v.b;  // (then lane i of b is lane i of a)
+    let ops: [6]u64 = [1, 5, 3, 7, 2, 6];
+    for c in @as(usize, 0)..6 {
+        let op = ops[c];
+        let mut ok = true;
+        for i in @as(i32, 0)..n {
+            let m = ir.mask_of(v)[@as(usize, @bit_cast(u32, i))];
+            let e = perm_lane(op, i, n);
+            if (m >= 0) and (m != e) and not (same and ((m % n) == (e % n))) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return ((0x4E00_0800 | (lk(t) << 22)) | (op << 12));
+        }
+    }
+    // EXT: lanes k, k + 1, ... of a, then b (k from the first lane given)
+    let mut k: i32 = -1;
+    for i in @as(i32, 0)..n {
+        let m = ir.mask_of(v)[@as(usize, @bit_cast(u32, i))];
+        if m < 0 {
+            continue;
+        }
+        if k < 0 {
+            k = m - i;
+            if same {
+                k = ((k % n) + n) % n;
+            }
+            if (k <= 0) or (k >= n) {
+                return 0;
+            }
+        }
+        if (m != (i + k)) and not (same and ((m % n) == ((i + k) % n))) {
+            return 0;
+        }
+    }
+    if k < 0 {
+        return 0;
+    }
+    let lb = @as(u64, @bit_cast(u32, is.lane_bits(t) / 8));
+    return 0x6E00_0000 | ((@as(u64, @bit_cast(u32, k)) * lb) << 11);
+}
+
+fn gen_shuffle(v: *mut ir.Value) void {
+    let t = v.ty;
+    let d = vreg(v);
+    let a = reg(v.a);
+    let b = reg(v.b);
+    let pw = permute_word(v);
+    if pw != 0 {
+        raw3(pw, d, a, b);
+        return;
+    }
+    let lb = @int_cast(u64, is.lane_bits(t) / 8);
+    let n = @as(u64, ir.mask_of(v).len);
+    // bytes from a and from b (out of range: zero), or'ed
+    let mut ma: [16]u8 = [0xff; 16];
+    let mut mb: [16]u8 = [0xff; 16];
+    let mut any_b = false;
+    for i in 0..ir.mask_of(v).len {
+        let m = @as(u64, @bit_cast(u32, ir.mask_of(v)[i]));
+        for k in @as(u64, 0)..lb {
+            let dst = @truncate(usize, (@as(u64, i) * lb) + k);
+            if m < n {
+                ma[dst] = @truncate(u8, (m * lb) + k);
+            } else {
+                mb[dst] = @truncate(u8, ((m - n) * lb) + k);
+                any_b = true;
+            }
+        }
+    }
+    let ia = vconst(is.le8(ma[0..8]), is.le8(ma[8..16]));
+    if not any_b {
+        raw3(ae.tbl(0, 0, 0), d, a, ia);
+        return;
+    }
+    let ib = vconst(is.le8(mb[0..8]), is.le8(mb[8..16]));
+    let xa = vvr();
+    let xb = vvr();
+    raw3(ae.tbl(0, 0, 0), xa, a, ia);
+    raw3(ae.tbl(0, 0, 0), xb, b, ib);
+    raw3(ae.v3(1, 0, 2, 3, 0, 0, 0), d, xa, xb);
+}

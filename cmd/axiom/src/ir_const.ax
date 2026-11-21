@@ -1,0 +1,521 @@
+// =============================================================================
+// ir_const.ax - IR constants, integer interning table, and constant folding, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+fn empty_cints() CintTable {
+    return CintTable.{ tys: u.nil.[usize](), vals: u.nil.[u64](), cs: u.nil.[*mut Value](), cap: 0, len: 0 };
+}
+
+fn free_cints(c: *mut CintTable) void {
+    if c.cap > 0 {
+        u.free_slice.[usize](@slice_from_ptr(c.tys, c.cap));
+        u.free_slice.[u64](@slice_from_ptr(c.vals, c.cap));
+        u.free_slice.[*mut Value](@slice_from_ptr(c.cs, c.cap));
+    }
+    c.* = empty_cints();
+}
+
+/// Is v a constant for C's __builtin_constant_p (IN_CONSTANT_P): an integer,
+/// floating-point, zero or aggregate constant (not undef, which is no
+/// value, nor an address, which the program's link decides).
+pub fn is_known_const(v: *Value) bool {
+    let k = v.kind;
+    return (k == V_CINT) or (k == V_CFP) or (k == V_ZERO) or (k == V_CAGG) or (k == V_CSTR);
+}
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+pub fn mask_bits(bits: i32) u64 {
+    if bits >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return (@as(u64, 1) << @int_cast(u32, bits)) - 1;
+}
+
+// The constant's value sign-extended from its width.
+pub fn sval(v: *Value) i64 {
+    let bits = v.ty.bits;
+    if bits >= 64 {
+        return @bit_cast(i64, v.cv);
+    }
+    let sh = @int_cast(u32, 64 - bits);
+    return @bit_cast(i64, v.cv << sh) >> sh;
+}
+
+// Integer constants are shared: one Value per type and value, in permanent
+// memory. Nothing changes a constant once made (passes and backends write
+// their scratch fields on instructions only), and folding makes them by the
+// million.
+struct CintTable {
+    tys: *mut usize,
+    vals: *mut u64,
+    cs: *mut *mut Value,
+    cap: usize,
+    len: usize,
+}
+
+threadlocal let mut CINTS: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                   cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+
+fn cint_slot(tys: []usize, vals: []u64, t: usize, v: u64) usize {
+    let mask = tys.len - 1;
+    let mut j = @truncate(usize, ((@as(u64, t) *% 0x9E3779B97F4A7C15) ^ (v *% 0xC2B2AE3D27D4EB4F)) >> 17) & mask;
+    while (tys[j] != 0) and not ((tys[j] == t) and (vals[j] == v)) {
+        j = (j + 1) & mask;
+    }
+    return j;
+}
+
+fn cint_grow() void {
+    let mut n: usize = 4096;
+    if CINTS.cap != 0 {
+        n = CINTS.cap * 2;
+    }
+    let tys = u.calloc_slice.[usize](n);
+    let vals = u.calloc_slice.[u64](n);
+    let cs = u.calloc_slice.[*mut Value](n);
+    let ot = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let ov = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let oc = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    for k in 0..CINTS.cap {
+        if ot[k] != 0 {
+            let j = cint_slot(tys, vals, ot[k], ov[k]);
+            tys[j] = ot[k];
+            vals[j] = ov[k];
+            cs[j] = oc[k];
+        }
+    }
+    u.free_slice.[usize](ot);
+    u.free_slice.[u64](ov);
+    u.free_slice.[*mut Value](oc);
+    CINTS.tys = tys.ptr;
+    CINTS.vals = vals.ptr;
+    CINTS.cs = cs.ptr;
+    CINTS.cap = n;
+}
+
+pub fn cint(t: *mut Ty, v: u64) *mut Value {
+    let x = v & mask_bits(t.bits);
+    if (CINTS.len + 1) * 2 > CINTS.cap {
+        cint_grow();
+    }
+    let tys = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let vals = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let cs = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    let key = @int_from_ptr(t);
+    let j = cint_slot(tys, vals, key, x);
+    if tys[j] != 0 {
+        return cs[j];
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let c = cint(t, x);
+        sh_exit();
+        // (this thread's table only remembers it: the slot is still free,
+        // as nothing changed the table meanwhile)
+        tys[j] = key;
+        vals[j] = x;
+        cs[j] = c;
+        CINTS.len += 1;
+        return c;
+    }
+    // (shared by every function: outside any scratch scope)
+    let c = u.perm_new.[Value]();
+    c.kind = V_CINT;
+    c.ty = t;
+    c.cv = x;
+    tys[j] = key;
+    vals[j] = x;
+    cs[j] = c;
+    CINTS.len += 1;
+    return c;
+}
+
+pub fn ci32(v: u64) *mut Value {
+    return cint(t_int(32), v);
+}
+
+/// The bits of the float whose value the double x is (a float's value
+/// widened, or rounded to float): a NaN keeps its sign, its quiet bit and
+/// the top of its payload, so that a signaling one stays one (which a
+/// conversion would quiet).
+pub fn f32_bits(x: f64) u32 {
+    let b = @bit_cast(u64, x);
+    if (((b >> 52) & 0x7FF) == 0x7FF) and ((b << 12) != 0) {
+        let mut fr = (b >> 29) & 0x7F_FFFF;
+        if fr == 0 {
+            fr = 0x40_0000;  // (a payload below float's: a quiet NaN)
+        }
+        return @truncate(u32, (((b >> 63) << 31) | 0x7F80_0000) | fr);
+    }
+    return @bit_cast(u32, @float_cast(f32, x));
+}
+
+/// The float with bits b, widened to double the same way (f32_bits's inverse).
+pub fn f32_value(b: u32) f64 {
+    if ((b & 0x7F80_0000) == 0x7F80_0000) and ((b & 0x7F_FFFF) != 0) {
+        let w = (@as(u64, b >> 31) << 63) | 0x7FF0_0000_0000_0000 | (@as(u64, b & 0x7F_FFFF) << 29);
+        return @bit_cast(f64, w);
+    }
+    return @float_cast(f64, @bit_cast(f32, b));
+}
+
+pub fn cfp(t: *mut Ty, x: f64) *mut Value {
+    let c = new_val(V_CFP, t);
+    if t.bits == 32 {
+        set_fv(c, f32_value(f32_bits(x)));
+    } else {
+        set_fv(c, x);
+    }
+    return c;
+}
+
+pub fn czero(t: *mut Ty) *mut Value {
+    if t.kind == T_INT {
+        return cint(t, 0);
+    }
+    return new_val(V_ZERO, t);
+}
+
+pub fn cones(t: *mut Ty) *mut Value {
+    if t.kind == T_VEC {
+        let n = @int_cast(usize, t.lanes);
+        let xs = u.perm_newn.[*mut Value](n);
+        for i in 0..n {
+            xs[i] = cint(t.elem, 0xFFFF_FFFF_FFFF_FFFF);
+        }
+        return cagg(t, xs);
+    }
+    return cint(t, 0xFFFF_FFFF_FFFF_FFFF);
+}
+
+// One undef per type, shared as integer constants are.
+pub fn undef(t: *mut Ty) *mut Value {
+    if sh_on and not sh_inside {
+        let k = @as(u64, @int_from_ptr(t));
+        let have = sh_undefs.get(k);
+        if have != 0 {
+            return @ptr_from_int(*mut Value, @truncate(usize, have));
+        }
+        sh_enter();
+        let v = undef(t);
+        sh_exit();
+        sh_undefs.put(k, @as(u64, @int_from_ptr(v)));
+        return v;
+    }
+    if u.isnil(t.undef_v) and (t.id <= pv_tys) {
+        // (a type the parts share, which the thread of each part does not
+        // change: its undef is the part's)
+        let k = @as(u64, @bit_cast(u32, t.id));
+        let have = pv_undefs.get(k);
+        if have != 0 {
+            return @ptr_from_int(*mut Value, @truncate(usize, have));
+        }
+        let v = u.perm_new.[Value]();
+        v.kind = V_UNDEF;
+        v.ty = t;
+        pv_undefs.put(k, @as(u64, @int_from_ptr(v)));
+        return v;
+    }
+    if u.isnil(t.undef_v) {
+        let v = u.perm_new.[Value]();
+        v.kind = V_UNDEF;
+        v.ty = t;
+        t.undef_v = v;
+    }
+    return t.undef_v;
+}
+
+pub fn cagg(t: *mut Ty, xs: []mut *mut Value) *mut Value {
+    let c = new_val(V_CAGG, t);
+    c.xs.reserve(xs.len);
+    for x in xs {
+        push_x(c, x);
+    }
+    return c;
+}
+
+pub fn cstruct(xs: []mut *mut Value) *mut Value {
+    let ts = u.perm_newn.[*mut Ty](xs.len + 1);
+    for i in 0..xs.len {
+        ts[i] = xs[i].ty;
+    }
+    return cagg(t_struct(ts[0..xs.len]), xs);
+}
+
+/// A constant of t_struct_packed's type of xs.
+pub fn cstruct_packed(xs: []mut *mut Value) *mut Value {
+    let ts = u.perm_newn.[*mut Ty](xs.len + 1);
+    for i in 0..xs.len {
+        ts[i] = xs[i].ty;
+    }
+    return cagg(t_struct_packed(ts[0..xs.len]), xs);
+}
+
+pub fn carray(el: *mut Ty, xs: []mut *mut Value) *mut Value {
+    return cagg(t_array(el, @as(u64, xs.len)), xs);
+}
+
+// The bytes of `s` followed by a NUL, as an [n+1 x i8] constant: a V_CSTR,
+// which holds them as bytes (not as a V_CAGG of byte constants, eight bytes
+// a byte); agg_len and agg_elem read either.
+pub fn cstring(s: []u8) *mut Value {
+    let c = new_val(V_CSTR, t_array(t_int(8), @as(u64, s.len) + 1));
+    let b = u.perm_newn.[u8](s.len + 1);
+    @mem_copy(b[0..s.len], s);
+    b[s.len] = 0;
+    set_bytes(c, b);
+    return c;
+}
+
+// Is v a constant aggregate whose elements agg_elem reads?
+pub fn is_cagg(v: *Value) bool {
+    return (v.kind == V_CAGG) or (v.kind == V_CSTR);
+}
+
+// The number of elements of a constant aggregate (V_CAGG or V_CSTR).
+pub fn agg_len(v: *Value) usize {
+    if v.kind == V_CSTR {
+        return bytes_of(v).len;
+    }
+    return v.xs.len;
+}
+
+// Element i of a constant aggregate (V_CAGG or V_CSTR).
+pub fn agg_elem(v: *Value, i: usize) *mut Value {
+    if v.kind == V_CSTR {
+        return cint(t_int(8), @as(u64, bytes_of(v)[i]));
+    }
+    return v.xs.get(i);
+}
+
+pub fn cinttoptr(v: *mut Value) *mut Value {
+    if (v.kind == V_CINT) and (v.cv == 0) {
+        return czero(t_ptr());
+    }
+    return cint(t_ptr(), v.cv);
+}
+
+// The address of global g plus `off` bytes, for the initial values of
+// globals only (data: a relocation with an addend; C's address constants):
+// a V_GLOBAL whose cv is the addend. (Code reaches g + off with ptradd.)
+pub fn cgaddr(g: *mut Global, off: u64) *mut Value {
+    if off == 0 {
+        return g.val;
+    }
+    let v = new_val(V_GLOBAL, t_ptr());
+    set_gv(v, g);
+    v.cv = off;
+    return v;
+}
+
+pub fn is_const(v: *Value) bool {
+    return (v.kind != V_INST) and (v.kind != V_PARAM);
+}
+
+// The address of a thread-local: a constant in a function (the running
+// thread's copy), but not one data can hold (a relocation there is to the
+// initial image), so no constant aggregate has one.
+pub fn is_tls_addr(v: *Value) bool {
+    return (v.kind == V_GLOBAL) and gv_ro(v).tls;
+}
+
+// An integer (or null pointer) constant.
+pub fn is_cint(v: *Value) bool {
+    return (v.kind == V_CINT) or ((v.kind == V_ZERO) and ((v.ty.kind == T_INT) or (v.ty.kind == T_PTR)));
+}
+
+// An integer constant of at most 64 bits (not a pointer).
+pub fn is_small_cint(v: *Value) bool {
+    return is_cint(v) and (v.ty.kind == T_INT) and (v.ty.bits <= 64);
+}
+
+// The i1 constant b.
+pub fn kbool(b: bool) *mut Value {
+    if b {
+        return cint(t_int(1), 1);
+    }
+    return cint(t_int(1), 0);
+}
+
+pub fn cint_val(v: *Value) u64 {
+    if v.kind == V_CINT {
+        return v.cv;
+    }
+    return 0;
+}
+
+pub fn is_zero(v: *Value) bool {
+    if v.kind == V_ZERO {
+        return true;
+    }
+    if v.kind == V_CINT {
+        return v.cv == 0;
+    }
+    if v.kind == V_CFP {
+        return (fv_of(v) == 0.0) and (@bit_cast(u64, fv_of(v)) == 0);
+    }
+    if v.kind == V_CAGG {
+        for i in 0..v.xs.len {
+            if not is_zero(v.xs.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if v.kind == V_CSTR {
+        for c in bytes_of(v) {
+            if c != 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+pub fn fold_int_bin(op: i32, t: *mut Ty, x: *Value, y: *Value) *mut Value {
+    let a = cint_val(x);
+    let b = cint_val(y);
+    let bits = t.bits;
+    let mut r: u64 = 0;
+    if op == OP_ADD {
+        r = a +% b;
+    } else if op == OP_SUB {
+        r = a -% b;
+    } else if op == OP_MUL {
+        r = a *% b;
+    } else if op == OP_AND {
+        r = a & b;
+    } else if op == OP_OR {
+        r = a | b;
+    } else if op == OP_XOR {
+        r = a ^ b;
+    } else if op == OP_SHL {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = a << @truncate(u32, b);
+    } else if op == OP_LSHR {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = a >> @truncate(u32, b);
+    } else if op == OP_ASHR {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = @bit_cast(u64, sval(x) >> @truncate(u32, b));
+    } else if op == OP_UDIV {
+        if b == 0 {
+            return vnil();
+        }
+        r = a / b;
+    } else if op == OP_UREM {
+        if b == 0 {
+            return vnil();
+        }
+        r = a % b;
+    } else if (op == OP_SDIV) or (op == OP_SREM) {
+        let sa = sval(x);
+        let sb = sval(y);
+        if (sb == 0) or ((sb == -1) and (a == (@as(u64, 1) << @int_cast(u32, bits - 1)))) {
+            return vnil();
+        }
+        if op == OP_SDIV {
+            r = @bit_cast(u64, sa / sb);
+        } else {
+            r = @bit_cast(u64, sa % sb);
+        }
+    } else {
+        return vnil();
+    }
+    return cint(t, r);
+}
+
+fn cmp_fold(p: CmpPred, x: *Value, y: *Value) i32 {
+    let a = cint_val(x);
+    let b = cint_val(y);
+    let sa = sval(x);
+    let sb = sval(y);
+    let mut r = false;
+    match p {
+        .EQ  => { r = a == b; }
+        .NE  => { r = a != b; }
+        .UGT => { r = a > b; }
+        .UGE => { r = a >= b; }
+        .ULT => { r = a < b; }
+        .ULE => { r = a <= b; }
+        .SGT => { r = sa > sb; }
+        .SGE => { r = sa >= sb; }
+        .SLT => { r = sa < sb; }
+        .SLE => { r = sa <= sb; }
+        else => {}
+    }
+    if r {
+        return 1;
+    }
+    return 0;
+}
+
+// Comparisons: i1, or for vectors a lane mask (all ones / zeros) of the
+// operands' shape with integer lanes.
+fn cmp_ty(t: *mut Ty) *mut Ty {
+    if t.kind == T_VEC {
+        if t.elem.kind == T_FLOAT {
+            return t_vec(t_int(t.elem.bits), @int_cast(u32, t.lanes));
+        }
+        return t;
+    }
+    return t_int(1);
+}
+
+// The comparison `x p y` folded: nil unless x and y are integer constants of
+// at most 64 bits.
+pub fn fold_icmp(p: CmpPred, x: *Value, y: *Value) *mut Value {
+    if (x.ty.kind != T_VEC) and is_cint(x) and is_cint(y) and (x.ty.bits <= 64) {
+        return cint(t_int(1), @as(u64, @bit_cast(u32, cmp_fold(p, x, y))));
+    }
+    return vnil();
+}
+
+// The cast of x to t, when it needs no instruction (x is t already, or a
+// constant): nil otherwise.
+pub fn fold_cast(op: i32, x: *mut Value, t: *mut Ty) *mut Value {
+    if x.ty == t {
+        if (op == OP_ZEXT) or (op == OP_SEXT) or (op == OP_TRUNC) or (op == OP_BITCAST) {
+            return x;
+        }
+    }
+    if (x.kind == V_CINT) or ((x.kind == V_ZERO) and (x.ty.kind == T_INT)) {
+        if (op == OP_ZEXT) or (op == OP_TRUNC) {
+            return cint(t, cint_val(x));
+        }
+        if op == OP_SEXT {
+            return cint(t, @bit_cast(u64, sval(x)));
+        }
+        if op == OP_INTTOPTR {
+            return cinttoptr(x);
+        }
+    }
+    if (x.kind == V_ZERO) and (op == OP_PTRTOINT) {
+        return cint(t, 0);
+    }
+    if (x.kind == V_UNDEF) and (op != OP_FPTOSI_SAT) and (op != OP_FPTOUI_SAT) {
+        return undef(t);
+    }
+    return vnil();
+}
+
+fn resolve_const(c: *mut Value) void {
+    if c.kind != V_CAGG {
+        return;
+    }
+    for k in 0..c.xs.len {
+        let x = c.xs.get(k);
+        set_x(c, k, x);
+        resolve_const(x);
+    }
+}
