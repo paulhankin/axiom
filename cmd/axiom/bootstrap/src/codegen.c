@@ -182,7 +182,7 @@ static LLVMTypeRef lty(Type *t);
 static FnInst *get_inst(Decl *d, Type **gargs, int n);
 static LLVMValueRef fn_ref(FnInst *fi);
 static LLVMValueRef cpu_has_bits(uint64_t bits);
-static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
+static void add_ext_attrs(LLVMValueRef v, Type *fnty, Decl *d, bool sret, bool is_call);
 
 // The concrete type of t in the function being generated. An enum is its
 // representation from here on: code generation never needs to tell them apart.
@@ -1719,7 +1719,7 @@ static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
         LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, k, 0));
     }
     if (d->kind == D_FN) set_fn_features(fi->fn, fi->feats);
-    add_ext_attrs(fi->fn, fi->fnty, fi->sret, false);
+    add_ext_attrs(fi->fn, fi->fnty, fi->decl, fi->sret, false);
     if (d->kind == D_HOST_FN) {
         if (d->extern_c) {
             // libraries: see collect_link_names
@@ -1767,7 +1767,7 @@ static LLVMValueRef fn_ref(FnInst *fi) {
     const char *name = LLVMGetValueName2(fi->fn, &len);
     fi->ref = LLVMAddFunction(mod, arena_printf("%s.ref", name), fi->ref_llty);
     LLVMSetLinkage(fi->ref, LLVMInternalLinkage);
-    add_ext_attrs(fi->ref, fi->fnty, fi->sret, false);
+    add_ext_attrs(fi->ref, fi->fnty, fi->decl, fi->sret, false);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
     LLVMMetadataRef loc = dbg_suspend();
     LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fi->ref, "entry"));
@@ -1776,7 +1776,7 @@ static LLVMValueRef fn_ref(FnInst *fi) {
     for (unsigned i = 0; i < np; i++) av[i] = LLVMGetParam(fi->ref, i);
     for (int i = 0; i < fi->ninl; i++) av[np + i] = LLVMConstNull(T_ptr);
     LLVMValueRef r = LLVMBuildCall2(B, fi->llty, fi->fn, av, np + (unsigned)fi->ninl, "");
-    add_ext_attrs(r, fi->fnty, fi->sret, true);
+    add_ext_attrs(r, fi->fnty, fi->decl, fi->sret, true);
     if (LLVMGetTypeKind(LLVMGetReturnType(fi->ref_llty)) == LLVMVoidTypeKind) LLVMBuildRetVoid(B);
     else LLVMBuildRet(B, r);
     if (saved) LLVMPositionBuilderAtEnd(B, saved);
@@ -1800,11 +1800,17 @@ static void ext_attr(LLVMValueRef v, unsigned idx, Type *t, bool is_call) {
     else LLVMAddAttributeAtIndex(v, idx, a);
 }
 
-static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call) {
+static void add_ext_attrs(LLVMValueRef v, Type *fnty, Decl *d, bool sret, bool is_call) {
     if (!sret && fnty->ret->kind != TY_VOID) ext_attr(v, LLVMAttributeReturnIndex, fnty->ret, is_call);
     unsigned first = sret ? 2 : 1;
-    for (int i = 0; i < fnty->nparams; i++)
+    for (int i = 0; i < fnty->nparams; i++) {
         if (!by_ptr(fnty->params[i])) ext_attr(v, first + (unsigned)i, fnty->params[i], is_call);
+        if (!is_call && d && i < d->params.len && d->params.data[i].is_noalias && fnty->params[i]->kind == TY_PTR) {
+            unsigned k = LLVMGetEnumAttributeKindForName("noalias", 7);
+            if (!LLVMGetEnumAttributeAtIndex(v, first + (unsigned)i, k))
+                LLVMAddAttributeAtIndex(v, first + (unsigned)i, LLVMCreateEnumAttribute(ctx, k, 0));
+        }
+    }
 }
 
 static Type **subst_gargs(Type **g, int n) {
@@ -2321,7 +2327,7 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
         frame_call_end(r, loc);
         ss_pop(sf);
     }
-    add_ext_attrs(r, fnty, sret, true);
+    add_ext_attrs(r, fnty, NULL, sret, true);
     if (sret) return load(fnty->ret, ret_tmp, false);
     if (fnty->ret->kind == TY_VOID) return NULL;
     return r;
@@ -3221,6 +3227,16 @@ static LLVMValueRef gen_insn(Expr *e, Type *rt) {
     return NULL;
 }
 
+static LLVMAtomicOrdering atomic_ordering(Expr *e, int ord_idx) {
+    if (ord_idx >= e->bargs.len) return LLVMAtomicOrderingSequentiallyConsistent;
+    const char *s = e->bargs.data[ord_idx].e->str;
+    if (!strcmp(s, "relaxed")) return LLVMAtomicOrderingMonotonic;
+    if (!strcmp(s, "acquire")) return LLVMAtomicOrderingAcquire;
+    if (!strcmp(s, "release")) return LLVMAtomicOrderingRelease;
+    if (!strcmp(s, "acq_rel")) return LLVMAtomicOrderingAcquireRelease;
+    return LLVMAtomicOrderingSequentiallyConsistent;
+}
+
 static LLVMValueRef gen_builtin(Expr *e) {
     BuiltinArg *a = e->bargs.data;
     Type *rt = ct(e->type);
@@ -3850,7 +3866,12 @@ static LLVMValueRef gen_builtin(Expr *e) {
     }
     case BI_EXPECT: check_or_trap(gen(a[0].e), T_EXPECT); return NULL;
     case BI_EXPECT_EQ: gen_expect_eq(e); return NULL;
-    case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
+    case BI_FENCE: {
+        LLVMAtomicOrdering ord = atomic_ordering(e, 0);
+        if (ord == LLVMAtomicOrderingMonotonic) return NULL;
+        LLVMBuildFence(B, ord, false, "");
+        return NULL;
+    }
     case BI_PREFETCH:
     case BI_PREFETCH_WRITE: {
         // A hint (spec §5.7): read (prefetcht0, prfm pldl1keep) or write
@@ -4083,24 +4104,33 @@ static LLVMValueRef gen_atomic(Expr *e) {
         check_or_trap(LLVMBuildICmp(B, LLVMIntEQ, LLVMBuildAnd(B, addr, usz(size - 1), ""), usz(0), ""), T_ATOMIC_ALIGN);
     }
     asan_check(p, usz(size));
-    LLVMAtomicOrdering sc = LLVMAtomicOrderingSequentiallyConsistent;
+    LLVMAtomicOrdering ord = LLVMAtomicOrderingSequentiallyConsistent;
+    if (id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY) {
+        int ord_idx = (id == BI_ATOMIC_LOAD) ? 1 : (id == BI_ATOMIC_CAS) ? 3 : 2;
+        ord = atomic_ordering(e, ord_idx);
+    }
     switch (id) {
     case BI_ATOMIC_LOAD: {
         LLVMValueRef v = LLVMBuildLoad2(B, lty(t), p, "");
-        LLVMSetOrdering(v, sc);
+        LLVMSetOrdering(v, ord);
         LLVMSetAlignment(v, (unsigned)size);
         return v;
     }
     case BI_ATOMIC_STORE: {
         LLVMValueRef v = gen(a[1].e);
         LLVMValueRef st = LLVMBuildStore(B, v, p);
-        LLVMSetOrdering(st, sc);
+        LLVMSetOrdering(st, ord);
         LLVMSetAlignment(st, (unsigned)size);
         return NULL;
     }
     case BI_ATOMIC_CAS: {
         LLVMValueRef expv = gen(a[1].e), newv = gen(a[2].e);
-        LLVMValueRef r = LLVMBuildAtomicCmpXchg(B, p, expv, newv, sc, sc, false);
+        LLVMAtomicOrdering fail =
+            (ord == LLVMAtomicOrderingAcquireRelease || ord == LLVMAtomicOrderingAcquire)
+                ? LLVMAtomicOrderingAcquire
+                : (ord == LLVMAtomicOrderingSequentiallyConsistent ? LLVMAtomicOrderingSequentiallyConsistent
+                                                                   : LLVMAtomicOrderingMonotonic);
+        LLVMValueRef r = LLVMBuildAtomicCmpXchg(B, p, expv, newv, ord, fail, false);
         LLVMSetAlignment(r, (unsigned)size);
         return LLVMBuildExtractValue(B, r, 0, "");
     }
@@ -4141,7 +4171,7 @@ static LLVMValueRef gen_atomic(Expr *e) {
     default: op = sg ? LLVMAtomicRMWBinOpMax : LLVMAtomicRMWBinOpUMax; break;
     }
     LLVMValueRef v = gen(a[1].e);
-    LLVMValueRef r = LLVMBuildAtomicRMW(B, op, p, v, sc, false);
+    LLVMValueRef r = LLVMBuildAtomicRMW(B, op, p, v, ord, false);
     LLVMSetAlignment(r, (unsigned)size);
     return r;
 }
@@ -5137,7 +5167,7 @@ static FnInst *get_version(FnInst *fi, int k, uint64_t feats) {
     v->fn = LLVMAddFunction(mod, arena_printf("%.*s.%s", (int)nl, base, suffix), v->llty);
     set_fn_features(v->fn, feats);
     LLVMSetLinkage(v->fn, LLVMInternalLinkage);
-    add_ext_attrs(v->fn, v->fnty, v->sret, false);
+    add_ext_attrs(v->fn, v->fnty, v->decl, v->sret, false);
     if (pending_tail) pending_tail->next = v;
     else pending_head = v;
     pending_tail = v;
@@ -5166,7 +5196,7 @@ static LLVMValueRef cpu_has_bits(uint64_t bits) {
 
 static void dispatch_call(FnInst *fi, FnInst *v, LLVMValueRef *args, unsigned n) {
     LLVMValueRef r = LLVMBuildCall2(B, fi->llty, v->fn, args, n, "");
-    add_ext_attrs(r, fi->fnty, fi->sret, true);
+    add_ext_attrs(r, fi->fnty, fi->decl, fi->sret, true);
     if (LLVMGetTypeKind(LLVMGetReturnType(fi->llty)) == LLVMVoidTypeKind) LLVMBuildRetVoid(B);
     else LLVMBuildRet(B, r);
 }
@@ -5268,6 +5298,17 @@ static void gen_fn_body_of(FnInst *fi) {
     LLVMPositionBuilderAtEnd(B, start);
     int k = 0;
     if (fi->sret) st.sret_ptr = LLVMGetParam(fi->fn, (unsigned)k++);
+    bool check_noalias = false;
+    if (asan_on()) {
+        for (int i = 0; i < d->params.len; i++) {
+            if (d->params.data[i].is_noalias) {
+                check_noalias = true;
+                break;
+            }
+        }
+    }
+    LLVMValueRef *p_addr = check_noalias ? NEWN(LLVMValueRef, d->params.len + 1) : NULL;
+    LLVMValueRef *p_size = check_noalias ? NEWN(LLVMValueRef, d->params.len + 1) : NULL;
     for (int i = 0; i < d->params.len; i++) {
         Local *l = d->params.data[i].local;
         Type *pt = fi->fnty->params[i];
@@ -5277,11 +5318,43 @@ static void gen_fn_body_of(FnInst *fi) {
         } else {
             store(pt, p, local_ptr(l), false);
         }
+        if (check_noalias) {
+            if (pt->kind == TY_SLICE) {
+                p_addr[i] = LLVMBuildPtrToInt(B, LLVMBuildExtractValue(B, p, 0, ""), T_isz, "");
+                p_size[i] = LLVMBuildMul(B, LLVMBuildExtractValue(B, p, 1, ""), usz(type_size(pt->elem)), "");
+            } else if (pt->kind == TY_PTR && type_size(pt->elem) > 0) {
+                p_addr[i] = LLVMBuildPtrToInt(B, p, T_isz, "");
+                p_size[i] = usz(type_size(pt->elem));
+            }
+        }
     }
     if (fi->ninl) {
         st.ninl = fi->ninl;
         st.inl = NEWN(LLVMValueRef, fi->ninl);
         for (int i = 0; i < fi->ninl; i++) st.inl[i] = LLVMGetParam(fi->fn, (unsigned)k++);
+    }
+    if (check_noalias) {
+        Span saved_sp = g_cur_span;
+        g_cur_span = d->name_span;
+        for (int i = 0; i < d->params.len; i++) {
+            if (!p_addr[i]) continue;
+            for (int j = i + 1; j < d->params.len; j++) {
+                if (!p_addr[j]) continue;
+                if (!d->params.data[i].is_noalias && !d->params.data[j].is_noalias) continue;
+                LLVMValueRef sz_i = p_size[i], sz_j = p_size[j];
+                LLVMValueRef a_i = p_addr[i], a_j = p_addr[j];
+                LLVMValueRef both_nz = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntUGT, sz_i, usz(0), ""),
+                                                   LLVMBuildICmp(B, LLVMIntUGT, sz_j, usz(0), ""), "");
+                LLVMValueRef a_le_b = LLVMBuildICmp(B, LLVMIntULE, a_i, a_j, "");
+                LLVMValueRef diff = LLVMBuildSelect(B, a_le_b, LLVMBuildSub(B, a_j, a_i, ""),
+                                                    LLVMBuildSub(B, a_i, a_j, ""), "");
+                LLVMValueRef bound = LLVMBuildSelect(B, a_le_b, sz_i, sz_j, "");
+                LLVMValueRef no_overlap = LLVMBuildOr(B, LLVMBuildNot(B, both_nz, ""),
+                                                      LLVMBuildICmp(B, LLVMIntUGE, diff, bound, ""), "");
+                check_or_trap(no_overlap, T_MEMORY);
+            }
+        }
+        g_cur_span = saved_sp;
     }
     gen_block(d->body);
     if (!terminated()) {

@@ -244,7 +244,7 @@ MethodDecl    ::= "pub"? FnDecl
 FnDecl        ::= "inline"? "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block   (* §9.5 *)
 FnAttr        ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"   (* §13.4 *)
 ParamList     ::= Param ( "," Param )* ","?
-Param         ::= IDENT ":" Type
+Param         ::= "noalias"? IDENT ":" Type
 
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
@@ -1665,6 +1665,14 @@ wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code 
   (address 0 among it) stops the program with a crash report and a stack trace (§16.4);
   in a test binary it is reported as `T0005`.
 
+A parameter declared `noalias` (§3.2) is an additional promise about pointers and slices
+(`*T`, `*mut T`, `[]T`, `[]mut T`): while the function runs, memory reached through
+that parameter must not overlap any memory reached through any other pointer or slice
+parameter of the same call. Breaking this promise is undefined behavior just like any
+other breach of the access rule. Under `--sanitize=address`, the compiler checks at
+function entry that slice and typed pointer arguments in a `noalias` call do not overlap,
+trapping with `T0012` if they do.
+
 There is no null: address 0 is not an object on any target. A pointer from C that may be
 NULL is checked with `std/c.is_null` (§14.5.4). `--sanitize=address` (§16.8) finds the
 commonest breaches of the rule, use after free and accesses outside a heap block, and
@@ -1803,17 +1811,33 @@ This section defines shared-memory concurrency. The design follows from three fa
 #### 12.8.3 Atomic builtins
 
 `p` is a pointer to an integer type (`*T` for reads, `*mut T` for writes). `T` may be
-8, 16, 32 or 64 bits, or a generic `T: Int`. Every operation is sequentially consistent.
+8, 16, 32 or 64 bits, or a generic `T: Int`. By default every operation is sequentially
+consistent (`"seq_cst"`).
+
+The load, store, read-modify-write, `@atomic_cas`, and `@fence` builtins accept an
+optional trailing string-literal memory order: `"relaxed"`, `"acquire"`, `"release"`,
+`"acq_rel"`, or `"seq_cst"` (checked at compile time; unknown orders or invalid
+operation/order pairs produce `E0830`):
+
+- `@atomic_load(p)` / `@atomic_load(p, order)`: `"relaxed"`, `"acquire"`, `"seq_cst"`.
+- `@atomic_store(p, v)` / `@atomic_store(p, v, order)`: `"relaxed"`, `"release"`, `"seq_cst"`.
+- `@atomic_add` … `@atomic_max` `(p, v)` / `(…, order)`: all five orders.
+- `@atomic_cas(p, expected, desired)` / `(…, order)`: all five orders; the failure
+  ordering is the load part of `order` (`"seq_cst"` -> `"seq_cst"`, `"acq_rel"` ->
+  `"acquire"`, `"acquire"` -> `"acquire"`, `"release"` -> `"relaxed"`, `"relaxed"` ->
+  `"relaxed"`).
+- `@fence()` / `@fence(order)`: `"relaxed"`, `"acquire"`, `"release"`, `"acq_rel"`,
+  `"seq_cst"` (`"relaxed"` is a no-op).
 
 | Builtin | Result |
 |---|---|
-| `@atomic_load(p)` | `T` |
-| `@atomic_store(p, v)` | `void` |
-| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
-| `@atomic_cas(p, expected, desired)` | the previous value. The exchange happened iff it equals `expected` |
+| `@atomic_load(p [, order])` | `T` |
+| `@atomic_store(p, v [, order])` | `void` |
+| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v [, order])` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
+| `@atomic_cas(p, expected, desired [, order])` | the previous value. The exchange happened iff it equals `expected` |
 | `@atomic_wait(p, expected, timeout_ns: i64)` | `u32`: `0` woken by a notify, `1` the value was not `expected`, `2` timed out. A negative timeout waits forever. `p: *i32` or `*u32` only |
 | `@atomic_notify(p, count: u32)` | `u32`: the number of threads woken. `p: *i32` or `*u32` only. `0xFFFF_FFFF` wakes all |
-| `@fence()` | `void` |
+| `@fence([order])` | `void` |
 
 The address must be aligned to `@size_of(T)`, otherwise the program traps (`T0010`),
 as in WebAssembly. Alignment is otherwise not semantic (§12.5), so this is the one
@@ -2635,6 +2659,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0312 | Duplicate test name in a module |
 | E0313 | `inline` on an exported function, or with `@features` / `@multiversion` (§9.5) |
 | E0314 | Recursion through inline functions (§9.5) |
+| E0315 | `noalias` on a parameter whose type is not a pointer or slice (§3.2, §12.1) |
 | E0350 | A `const`, global or array-repeat count that is not a constant expression |
 | E0351 | A `const` whose value depends on itself |
 | E0352 | A `const` of a type other than integer, float, bool or enum |
@@ -2728,6 +2753,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0827 | Unknown processor extension, architecture or operating system name (§13.4) |
 | E0828 | Builtin used in code not compiled for the architecture or extensions it needs (§13.4) |
 | E0829 | Invalid function attribute (`@features`, `@multiversion`) |
+| E0830 | Invalid atomic memory order or invalid operation/order combination (§12.8.3) |
 | E9001 | Invalid invocation: unknown option, unexpected argument, missing input |
 | E9002 | Unknown target, processor or extension |
 | E9003 | A tool the command needs is missing (node, cc, the native runtime) |
