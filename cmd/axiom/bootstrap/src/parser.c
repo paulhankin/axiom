@@ -1141,6 +1141,10 @@ static void parse_params(Parser *P, Decl *d) {
             break;
         }
         Param p = {0};
+        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "noalias") && peek2(P)->kind == TK_IDENT) {
+            p.is_noalias = true;
+            p.noalias_span = advance(P)->span;
+        }
         p.name = expect_ident(P, &p.span);
         expect(P, TK_COLON);
         p.te = parse_type(P);

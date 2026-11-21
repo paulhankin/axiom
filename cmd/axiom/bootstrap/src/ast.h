@@ -258,6 +258,8 @@ typedef struct Param {
     Span span;
     TypeExpr *te;
     Local *local;
+    bool is_noalias;
+    Span noalias_span;
 } Param;
 
 typedef struct Variant {

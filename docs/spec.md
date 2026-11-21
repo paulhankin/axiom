@@ -244,7 +244,7 @@ MethodDecl    ::= "pub"? FnDecl
 FnDecl        ::= "inline"? "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block   (* §9.5 *)
 FnAttr        ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"   (* §13.4 *)
 ParamList     ::= Param ( "," Param )* ","?
-Param         ::= IDENT ":" Type
+Param         ::= "noalias"? IDENT ":" Type
 
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
@@ -1665,6 +1665,14 @@ wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code 
   (address 0 among it) stops the program with a crash report and a stack trace (§16.4);
   in a test binary it is reported as `T0005`.
 
+A parameter declared `noalias` (§3.2) is an additional promise about pointers and slices
+(`*T`, `*mut T`, `[]T`, `[]mut T`): while the function runs, memory reached through
+that parameter must not overlap any memory reached through any other pointer or slice
+parameter of the same call. Breaking this promise is undefined behavior just like any
+other breach of the access rule. Under `--sanitize=address`, the compiler checks at
+function entry that slice and typed pointer arguments in a `noalias` call do not overlap,
+trapping with `T0012` if they do.
+
 There is no null: address 0 is not an object on any target. A pointer from C that may be
 NULL is checked with `std/c.is_null` (§14.5.4). `--sanitize=address` (§16.8) finds the
 commonest breaches of the rule, use after free and accesses outside a heap block, and
@@ -1792,26 +1800,44 @@ This section defines shared-memory concurrency. The design follows from three fa
   can. Share such values between threads only through a lock or other
   synchronization (std/sync), or as integers updated with atomics.
 - **Implementation obligation.** A conforming implementation MUST NOT perform
-  optimizations that are sound only if the program has no races. For example, it MUST
-  NOT assume that two reads of a racing location return the same value, or turn a
-  racing read into an unrelated value.
+  optimizations that are sound only if the program has no races, such as rematerializing
+  a single read into two separate loads or inventing speculative stores. Coalescing
+  redundant reads or keeping values in registers between synchronization points is valid,
+  because every read still observes some value written by a store that did not
+  happen-after it.
 - `@fence()` is a sequentially consistent fence. Ordinary code does not need it,
   because every atomic operation is already sequentially consistent.
 
 #### 12.8.3 Atomic builtins
 
 `p` is a pointer to an integer type (`*T` for reads, `*mut T` for writes). `T` may be
-8, 16, 32 or 64 bits, or a generic `T: Int`. Every operation is sequentially consistent.
+8, 16, 32 or 64 bits, or a generic `T: Int`. By default every operation is sequentially
+consistent (`"seq_cst"`).
+
+The load, store, read-modify-write, `@atomic_cas`, and `@fence` builtins accept an
+optional trailing string-literal memory order: `"relaxed"`, `"acquire"`, `"release"`,
+`"acq_rel"`, or `"seq_cst"` (checked at compile time; unknown orders or invalid
+operation/order pairs produce `E0830`):
+
+- `@atomic_load(p)` / `@atomic_load(p, order)`: `"relaxed"`, `"acquire"`, `"seq_cst"`.
+- `@atomic_store(p, v)` / `@atomic_store(p, v, order)`: `"relaxed"`, `"release"`, `"seq_cst"`.
+- `@atomic_add` … `@atomic_max` `(p, v)` / `(…, order)`: all five orders.
+- `@atomic_cas(p, expected, desired)` / `(…, order)`: all five orders; the failure
+  ordering is the load part of `order` (`"seq_cst"` -> `"seq_cst"`, `"acq_rel"` ->
+  `"acquire"`, `"acquire"` -> `"acquire"`, `"release"` -> `"relaxed"`, `"relaxed"` ->
+  `"relaxed"`).
+- `@fence()` / `@fence(order)`: `"relaxed"`, `"acquire"`, `"release"`, `"acq_rel"`,
+  `"seq_cst"` (`"relaxed"` is a no-op).
 
 | Builtin | Result |
 |---|---|
-| `@atomic_load(p)` | `T` |
-| `@atomic_store(p, v)` | `void` |
-| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
-| `@atomic_cas(p, expected, desired)` | the previous value. The exchange happened iff it equals `expected` |
+| `@atomic_load(p [, order])` | `T` |
+| `@atomic_store(p, v [, order])` | `void` |
+| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v [, order])` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
+| `@atomic_cas(p, expected, desired [, order])` | the previous value. The exchange happened iff it equals `expected` |
 | `@atomic_wait(p, expected, timeout_ns: i64)` | `u32`: `0` woken by a notify, `1` the value was not `expected`, `2` timed out. A negative timeout waits forever. `p: *i32` or `*u32` only |
 | `@atomic_notify(p, count: u32)` | `u32`: the number of threads woken. `p: *i32` or `*u32` only. `0xFFFF_FFFF` wakes all |
-| `@fence()` | `void` |
+| `@fence([order])` | `void` |
 
 The address must be aligned to `@size_of(T)`, otherwise the program traps (`T0010`),
 as in WebAssembly. Alignment is otherwise not semantic (§12.5), so this is the one
@@ -2633,6 +2659,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0312 | Duplicate test name in a module |
 | E0313 | `inline` on an exported function, or with `@features` / `@multiversion` (§9.5) |
 | E0314 | Recursion through inline functions (§9.5) |
+| E0315 | `noalias` on a parameter whose type is not a pointer or slice (§3.2, §12.1) |
 | E0350 | A `const`, global or array-repeat count that is not a constant expression |
 | E0351 | A `const` whose value depends on itself |
 | E0352 | A `const` of a type other than integer, float, bool or enum |
@@ -2726,6 +2753,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0827 | Unknown processor extension, architecture or operating system name (§13.4) |
 | E0828 | Builtin used in code not compiled for the architecture or extensions it needs (§13.4) |
 | E0829 | Invalid function attribute (`@features`, `@multiversion`) |
+| E0830 | Invalid atomic memory order or invalid operation/order combination (§12.8.3) |
 | E9001 | Invalid invocation: unknown option, unexpected argument, missing input |
 | E9002 | Unknown target, processor or extension |
 | E9003 | A tool the command needs is missing (node, cc, the native runtime) |
@@ -3292,6 +3320,9 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
+| `@volatile_load(p)` | `*T → T` | Reads memory at `p` without load elimination, reordering across other volatile operations, or constant folding |
+| `@volatile_store(p, v)` | `*mut T, T → void` | Writes `v` to `p` without dead-store elimination or reordering across other volatile operations |
+| `@volatile_zero(s)` | `[]mut T → void` | Zeroes every byte of `s` without dead-store elimination (for wiping secrets before freeing or returning) |
 | `@memory_size()` | `→ usize` | In 64 KiB pages |
 | `@memory_grow(pages)` | `usize → !usize` | Returns the previous size, or `error.OutOfMemory` |
 | `@memory_discard(addr, len)` | `usize, usize → void` | The whole 64 KiB pages in `[addr, addr + len)` that `@memory_grow` handed out may be returned to the system; their bytes become unspecified (on native targets they read as zero). Pages outside that region (the stack, globals, code, memory from C) are left alone, and so is all of a range that misses it. WebAssembly memory cannot shrink, so there it does nothing |
@@ -3304,6 +3335,11 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@rotl(x, k)`, `@rotr(x, k)` | `k` is taken modulo the width |
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
 | `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
+| `@mul_wide(a, b)` | `T, T → struct { lo: T, hi: T }` for any integer `T` (double-width product) |
+| `@mul_high(a, b)` | `T, T → T` for any integer `T` (high half of the double-width product) |
+| `@add_carry(a, b, cin)` | `T, T, u8 → struct { value: T, carry: u8 }` for unsigned `T` (`cin & 1` in, `0`/`1` out) |
+| `@sub_borrow(a, b, bin)` | `T, T, u8 → struct { value: T, borrow: u8 }` for unsigned `T` (`bin & 1` in, `0`/`1` out) |
+| `@div_wide(hi, lo, d)` | `T, T, T → struct { quo: T, rem: T }` for unsigned `T`; traps `T0003` if `d == 0` or `hi >= d` |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
 | `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it is `MIN` by default, traps under `--overflow=trap`. Lane-wise on vectors, where it always wraps |
 | `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |
@@ -3341,6 +3377,7 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 | Builtin | Notes |
 |---|---|
 | `@trap()` | Diverges and traps with `T0000`. Usable where any type is expected |
+| `@black_box(x)` | `T → T` | Returns `x` as an opaque value: prevents constant folding, dead-code elimination, and branch conversion across the call |
 | `@error_name(e)` | `error → []u8` |
 | `@expect(cond)` | Traps with `T0011` if `cond` is false (§17.1) |
 | `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§17.1) |

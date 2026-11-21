@@ -15,7 +15,9 @@
 //   cpu_supports, cpu_is   std/os/cpu.ax's features() (or cpuid's vendor) tested
 //   setjmp, longjmp    <setjmp.h>'s, with a jmp_buf in the caller's frame whose address is in buf[0]
 //   ia32_pause         nothing (a hint); ia32_mfence, lfence, sfence: a full fence
-//   expect, prefetch, assume_aligned   their (first) operand, or nothing
+//   expect, prefetch, assume_aligned, speculation_safe_value   their (first) operand, or nothing
+//   __clear_cache      nothing (but on AArch64: csema_gbuiltin.ax's asm statement)
+//   bswap128           the 64-bit halves' bytes reversed, the halves swapped
 //   isnan ... fpclassify, isgreater ... isunordered   comparisons that raise no exception on a quiet NaN
 //
 // A long double wider than double (cty.is_wide: in memory, cgen_ld.ax) has
@@ -114,8 +116,18 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     if (id == gb.GB_SHUFFLE) or (id == gb.GB_SHUFFLEVECTOR) {
         return vec_builtin(e, vs);
     }
-    if (id == gb.GB_EXPECT) or (id == gb.GB_ASSUME_ALIGNED) {
+    if (id == gb.GB_EXPECT) or (id == gb.GB_ASSUME_ALIGNED) or (id == gb.GB_SPEC_SAFE) {
         return vs[0];
+    }
+    if (id == gb.GB_VA_PACK) or (id == gb.GB_VA_PACK_LEN) {
+        // (the number of the inlined call's variable arguments; the pack
+        // itself is replaced by them where it is a call's argument:
+        // cgen_expr.call)
+        let mut k: u64 = 0;
+        if (id == gb.GB_VA_PACK_LEN) and u.notnil(cg.INL) {
+            k = @as(u64, cg.INL.pack.len);
+        }
+        return ir.cint(ir.t_int(32), k);
     }
     if id == gb.GB_CONSTANT_P {
         let mut a: [1]*mut ir.Value = [vs[0]];
@@ -127,7 +139,7 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         let mut a: [3]*mut ir.Value = [vs[0], ir.cint(t32, e.cval & 3), ir.cint(t32, (e.cval >> 2) & 1)];
         return ir.intr(B(), ir.IN_OBJSIZE, cg.T_isz, a[..]);
     }
-    if (id == gb.GB_PREFETCH) or (id == gb.GB_PAUSE) {
+    if (id == gb.GB_PREFETCH) or (id == gb.GB_PAUSE) or (id == gb.GB_CLEAR_CACHE) {
         return ir.vnil();
     }
     if id == gb.GB_FENCE {
@@ -145,6 +157,17 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         ir.unreachable(B());
         cg.continue_after();
         return ir.vnil();
+    }
+    if (id == gb.GB_BSWAP) and cty.is_wint(e.ty) {
+        // (unsigned __int128, in memory: each half's bytes reversed, the halves swapped)
+        let i64_ = ir.t_int(64);
+        let r = cg.alloca(e.ty, "bswap");
+        for k in @as(u64, 0)..2 {
+            let x = ir.load(B(), i64_, ir.ptradd(B(), vs[0], cg.usz(8 * k)));
+            let s = ir.store(B(), bits(id, x, cty.t_ullong), ir.ptradd(B(), r, cg.usz(8 * (1 - k))));
+            s.align = 8;
+        }
+        return r;
     }
     if (id >= gb.GB_CLZ) and (id <= gb.GB_BSWAP) {
         return bits(id, vs[0], e.ty);

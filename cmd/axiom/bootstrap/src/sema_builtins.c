@@ -30,6 +30,20 @@ static bool argc_ok(Expr *e) {
 static bool is_int_like(Type *t) {
     return t->kind == TY_INT || (t->kind == TY_PARAM && type_satisfies(t, C_INT)) || t->kind == TY_INVALID;
 }
+static bool is_unsigned_int_like(Type *t) {
+    return (t->kind == TY_INT && !t->is_signed) || (t->kind == TY_PARAM && type_satisfies(t, C_UNSIGNED)) ||
+           t->kind == TY_INVALID;
+}
+static Type *make_pair_struct(Span sp, const char *n0, Type *t0, const char *n1, Type *t1) {
+    FieldVec fv = {0};
+    Field f0 = {.name = intern_cstr(n0), .span = sp, .type = t0};
+    Field f1 = {.name = intern_cstr(n1), .span = sp, .type = t1};
+    vec_push(fv, f0);
+    vec_push(fv, f1);
+    Decl *d = anon_struct_decl(NULL, fv, sp);
+    if (d->fields.data != fv.data) free(fv.data);
+    return d->type;
+}
 static bool is_float_like(Type *t) {
     return t->kind == TY_FLOAT || (t->kind == TY_PARAM && type_satisfies(t, C_FLOAT)) || t->kind == TY_INVALID;
 }
@@ -197,6 +211,40 @@ static bool require_vec(Expr *e, Expr *arg, Type *t) {
     if (t->kind == TY_VEC || t->kind == TY_INVALID) return true;
     diag_error(arg->span, "E0812", "@%s requires a SIMD vector, found %s", e->name, type_str(t));
     return false;
+}
+
+static bool str_lit_eq(Expr *e, const char *lit) {
+    size_t n = strlen(lit);
+    return e->slen == n && memcmp(e->str, lit, n) == 0;
+}
+
+// Validate optional trailing atomic memory-order argument at index `ord_idx`.
+static void check_atomic_order(Expr *e, BuiltinId id, int ord_idx) {
+    Expr *ord_e = *earg(e, ord_idx);
+    if (ord_e->kind != E_STRING) {
+        check_expr(ord_e, NULL);
+        diag_error(ord_e->span, "E0830",
+                   "@%s memory order must be a string literal (\"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                   e->name);
+        return;
+    }
+    ord_e->type = type_slice(t_u8, false);
+    if (!str_lit_eq(ord_e, "relaxed") && !str_lit_eq(ord_e, "acquire") && !str_lit_eq(ord_e, "release") &&
+        !str_lit_eq(ord_e, "acq_rel") && !str_lit_eq(ord_e, "seq_cst")) {
+        diag_error(ord_e->span, "E0830",
+                   "unknown atomic memory order '%s' (expected \"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                   ord_e->str);
+        return;
+    }
+    if (id == BI_ATOMIC_LOAD && (str_lit_eq(ord_e, "release") || str_lit_eq(ord_e, "acq_rel"))) {
+        diag_error(ord_e->span, "E0830",
+                   "@atomic_load cannot use memory order '%s' (expected \"relaxed\", \"acquire\", or \"seq_cst\")",
+                   ord_e->str);
+    } else if (id == BI_ATOMIC_STORE && (str_lit_eq(ord_e, "acquire") || str_lit_eq(ord_e, "acq_rel"))) {
+        diag_error(ord_e->span, "E0830",
+                   "@atomic_store cannot use memory order '%s' (expected \"relaxed\", \"release\", or \"seq_cst\")",
+                   ord_e->str);
+    }
 }
 
 Type *builtin_check(Expr *e, Type *expected) {
@@ -510,6 +558,65 @@ Type *builtin_check(Expr *e, Type *expected) {
             diag_error(e->span, "E0822", "@%s requires a pointer, found %s", e->name, type_str(p));
         return e->type = t_void;
     }
+    case BI_VOLATILE_LOAD: {
+        Type *p = check_expr(*earg(e, 0), NULL);
+        if (p->kind == TY_INVALID) return e->type = t_invalid;
+        if (p->kind != TY_PTR) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_load requires a pointer operand");
+            return e->type = t_invalid;
+        }
+        if (p->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0705", "cannot dereference *void");
+            return e->type = t_invalid;
+        }
+        return e->type = p->elem;
+    }
+    case BI_VOLATILE_STORE: {
+        Type *p = check_expr(*earg(e, 0), NULL);
+        if (p->kind == TY_INVALID) {
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (p->kind != TY_PTR) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_store requires a pointer operand");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (!p->mut) {
+            diag_error((*earg(e, 0))->span, "E0706", "@volatile_store requires a *mut pointer");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (p->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0705", "cannot dereference *void");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        check_expr_to(earg(e, 1), p->elem);
+        return e->type = t_void;
+    }
+    case BI_VOLATILE_ZERO: {
+        Type *d = check_expr(*earg(e, 0), NULL);
+        if (d->kind == TY_INVALID) return e->type = t_void;
+        if (d->kind != TY_SLICE || !d->mut) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_zero destination must be a []mut slice");
+            return e->type = t_void;
+        }
+        if (d->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0822", "@volatile_zero cannot zero void elements");
+            return e->type = t_void;
+        }
+        return e->type = t_void;
+    }
+    case BI_BLACK_BOX: {
+        Type *t = operand(earg(e, 0), expected);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (t->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0404", "@black_box cannot take void");
+            return e->type = t_invalid;
+        }
+        return e->type = t;
+    }
     case BI_CLZ:
     case BI_CTZ:
     case BI_POPCOUNT: {
@@ -542,6 +649,76 @@ Type *builtin_check(Expr *e, Type *expected) {
         Type *t = pair(e, x);
         if (!is_int_like(t)) diag_error(e->span, "E0822", "@%s requires integers, found %s", e->name, type_str(t));
         return e->type = type_errunion(t);
+    }
+    case BI_MUL_WIDE: {
+        Type *t = pair(e, NULL);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_int_like(t)) {
+            diag_error(e->span, "E0822", "@mul_wide requires integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "lo", t, "hi", t);
+    }
+    case BI_MUL_HIGH: {
+        Type *t = pair(e, x && x->kind != TY_VOID ? x : expected);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_int_like(t)) {
+            diag_error(e->span, "E0822", "@mul_high requires integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = t;
+    }
+    case BI_ADD_CARRY:
+    case BI_SUB_BORROW: {
+        BuiltinId id = (BuiltinId)e->index;
+        Type *t = pair(e, NULL);
+        check_expr_to(earg(e, 2), t_u8);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_unsigned_int_like(t)) {
+            diag_error(e->span, "E0822", "@%s requires unsigned integer operands", e->name);
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "value", t, id == BI_ADD_CARRY ? "carry" : "borrow", t_u8);
+    }
+    case BI_DIV_WIDE: {
+        Type *ts[3];
+        for (int i = 0; i < 3; i++) ts[i] = check_expr(*earg(e, i), NULL);
+        Type *t = NULL;
+        bool has_invalid = false;
+        for (int i = 0; i < 3; i++) {
+            if (ts[i]->kind == TY_INVALID) has_invalid = true;
+            else if (!t && !ty_is_untyped(ts[i])) t = ts[i];
+        }
+        if (!t) {
+            for (int i = 0; i < 3; i++) {
+                if (ty_is_untyped(ts[i])) {
+                    finalize_untyped(earg(e, i));
+                    break;
+                }
+            }
+            return e->type = t_invalid;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (ty_is_untyped(ts[i])) {
+                coerce(earg(e, i), t);
+                ts[i] = (*earg(e, i))->type;
+            }
+            if (ts[i]->kind == TY_INVALID) has_invalid = true;
+        }
+        if (has_invalid) return e->type = t_invalid;
+        for (int i = 0; i < 3; i++) {
+            if (ts[i] != t) {
+                Diag *d = diag_error(e->span, "E0412", "@div_wide operands have different types: %s and %s",
+                                     type_str(t), type_str(ts[i]));
+                diag_types(d, type_str(t), type_str(ts[i]));
+                return e->type = t_invalid;
+            }
+        }
+        if (!is_unsigned_int_like(t)) {
+            diag_error(e->span, "E0822", "@div_wide requires unsigned integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "quo", t, "rem", t);
     }
     case BI_MIN:
     case BI_MAX: {
@@ -917,7 +1094,15 @@ Type *builtin_check(Expr *e, Type *expected) {
                        type_str(t));
         return e->type = t_void;
     }
-    case BI_FENCE: return e->type = t_void;
+    case BI_FENCE:
+        if (e->bargs.len > 1) {
+            diag_error(e->span, "E0420", "@fence expects at most 1 argument, found %d", e->bargs.len);
+            for (int i = 0; i < e->bargs.len; i++)
+                if (e->bargs.data[i].e) check_expr(e->bargs.data[i].e, NULL);
+            return e->type = t_void;
+        }
+        if (e->bargs.len == 1) check_atomic_order(e, BI_FENCE, 0);
+        return e->type = t_void;
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
     case BI_ATOMIC_ADD:
@@ -934,6 +1119,12 @@ Type *builtin_check(Expr *e, Type *expected) {
         // First argument: pointer to an integer (spec §12.8). Everything but
         // load, wait and notify needs *mut.
         BuiltinId id = (BuiltinId)e->index;
+        int base_n = (id == BI_ATOMIC_LOAD) ? 1 : (id == BI_ATOMIC_CAS) ? 3 : 2;
+        bool has_order_arg = id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY;
+        bool too_many = has_order_arg && e->bargs.len > base_n + 1;
+        if (too_many)
+            diag_error(e->span, "E0420", "@%s expects at most %d argument%s, found %d", e->name, base_n + 1,
+                       (base_n + 1) == 1 ? "" : "s", e->bargs.len);
         bool need_mut = id != BI_ATOMIC_LOAD && id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY;
         Type *p = check_expr(*earg(e, 0), NULL);
         Type *t = t_invalid;
@@ -951,26 +1142,39 @@ Type *builtin_check(Expr *e, Type *expected) {
         if ((id == BI_ATOMIC_WAIT || id == BI_ATOMIC_NOTIFY) && t->kind == TY_PARAM) {
             diag_error((*earg(e, 0))->span, "E0823", "@%s works on 32-bit integers (*i32 or *u32)", e->name);
         }
+        Type *ret;
         switch (id) {
-        case BI_ATOMIC_LOAD: return e->type = t;
+        case BI_ATOMIC_LOAD: ret = t; break;
         case BI_ATOMIC_STORE:
             check_expr_to(earg(e, 1), t);
-            return e->type = t_void;
+            ret = t_void;
+            break;
         case BI_ATOMIC_CAS:
             check_expr_to(earg(e, 1), t);
             check_expr_to(earg(e, 2), t);
-            return e->type = t;
+            ret = t;
+            break;
         case BI_ATOMIC_WAIT:
             check_expr_to(earg(e, 1), t);
             check_expr_to(earg(e, 2), t_i64);
-            return e->type = t_u32;
+            ret = t_u32;
+            break;
         case BI_ATOMIC_NOTIFY:
             check_expr_to(earg(e, 1), t_u32);
-            return e->type = t_u32;
+            ret = t_u32;
+            break;
         default:
             check_expr_to(earg(e, 1), t);
-            return e->type = t;  // read-modify-write: the old value
+            ret = t;  // read-modify-write: the old value
+            break;
         }
+        if (too_many) {
+            for (int i = base_n; i < e->bargs.len; i++)
+                if (e->bargs.data[i].e) check_expr(e->bargs.data[i].e, NULL);
+        } else if (has_order_arg && e->bargs.len == base_n + 1) {
+            check_atomic_order(e, id, base_n);
+        }
+        return e->type = ret;
     }
     case BI_ERROR_NAME:
         check_expr_to(earg(e, 0), t_error);

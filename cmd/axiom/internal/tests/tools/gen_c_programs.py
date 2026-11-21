@@ -19,7 +19,10 @@ converted to integers only when in range, array indices are reduced modulo
 the length, loops have fixed trip counts, recursion has a depth argument,
 and a global fuel counter bounds the total number of calls. Expressions have
 no side effects (functions called in them are pure), so the order of
-evaluation does not matter. With --no-long the program does not use long, so
+evaluation does not matter. A plain char holds only 0 to 127 (its signedness is
+the implementation's: a value above 127 would print differently where char
+is unsigned, a difference that is not a bug), so the output is the same with
+signed and unsigned char. With --no-long the program does not use long, so
 that it prints the same on ILP32 and LP64 targets. With --hosted the program
 is a hosted one, for the C library's differential testing: it prints with
 printf, and each checksum also goes through the library (snprintf's %llx,
@@ -48,7 +51,12 @@ array's name reads in the next iteration.
 import random
 import sys
 
-# name: (spelling, bits, signed, rank); plain char's signedness is the target's
+# name: (spelling, bits, signed, rank); plain char's signedness is the target's,
+# so a plain char only ever holds 0 to 127 (CHAR_BITS): its constants are in that
+# range, and every conversion to it, every store into it and every element
+# computed into an array of it keep only the low 7 bits. A value above 127 would
+# be one the program prints differently with signed and with unsigned char.
+CHAR_BITS = 7
 INTS = {
     'bool': ('_Bool', 1, False, 0),
     'char': ('char', 8, None, 1),
@@ -83,6 +91,14 @@ def is_float(t):
 
 def is_int(t):
     return t in INTS
+
+
+def uconv(t, e):
+    """e (an unsigned long long) converted to the integer type t; for plain
+    char only its low 7 bits (see CHAR_BITS)"""
+    if t == 'char':
+        return '(char)((%s) & 127u)' % e
+    return '(%s)(%s)' % (spell(t), e)
 
 
 def spell(t):
@@ -155,12 +171,12 @@ class Gen:
         _, bits, signed, _ = INTS[t]
         if signed is None:
             signed = False
-            bits = 7
+            bits = CHAR_BITS
         if signed:
             v = self.pick([0, 1, -1, 2, r.randint(-100, 100), r.randint(-(1 << (bits - 1)), (1 << (bits - 1)) - 1),
                            (1 << (bits - 1)) - 1, -(1 << (bits - 1))])
         else:
-            v = self.pick([0, 1, 2, r.randint(0, 255), r.randint(0, (1 << bits) - 1), (1 << bits) - 1])
+            v = self.pick([0, 1, 2, r.randint(0, min(255, (1 << bits) - 1)), r.randint(0, (1 << bits) - 1), (1 << bits) - 1])
         if t in ('int',):
             return str(v) if v != -(1 << 31) else '(-2147483647 - 1)'
         if t in ('llong', 'long'):
@@ -184,7 +200,11 @@ class Gen:
             pt = t if t in F2I else 'int'
             lo, hi = F2I[pt]
             inner = '((%s > %s && %s < %s) ? (%s)%s : 0)' % (e, lo, e, hi, spell(pt), e)
+            if t == 'char':
+                return '(%s)' % uconv(t, inner)
             return inner if pt == t else '((%s)%s)' % (spell(t), inner)
+        if t == 'char':
+            return '(%s)' % uconv(t, e)
         return '((%s)%s)' % (spell(t), e)
 
     def leaf(self, t, env):
@@ -584,7 +604,7 @@ class Gen:
         if is_float(t) and self.chance(0.3):
             e, _ = self.expr(t, env, depth)
             return ['%s%s %s %s;' % (ind, name, self.pick(['+=', '-=', '*=', '/=']), e)]
-        if is_int(t) and t != 'bool' and self.chance(0.15):
+        if is_int(t) and t not in ('bool', 'char') and self.chance(0.15):
             u = 'ullong' if INTS[t][1] == 64 else 'uint'
             e, _ = self.expr(u, env, depth)
             op = self.pick(['+=', '-=', '*='])
@@ -714,7 +734,7 @@ class Gen:
         if is_float(t):
             mix = lambda x, y: '%s * (%s)0.5 + %s' % (x, T, y)
         else:
-            mix = lambda x, y: '(%s)((unsigned long long)%s * 3u + (unsigned long long)%s)' % (T, x, y)
+            mix = lambda x, y: uconv(t, '(unsigned long long)%s * 3u + (unsigned long long)%s' % (x, y))
         if kind in (10, 13, 14, 15, 16, 18, 19, 21) and src == name:
             # (one array: through restricted pointers only read, apart each
             # iteration, or reached through other pointers after the block)
@@ -844,8 +864,8 @@ class Gen:
                          % (i2, name, dx, src, T, T, self.const(t)))
             else:
                 ut = 'unsigned long long'
-                b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = (%s)((%s)%s[ii] * 3u + (%s)%s[ii + %d]);'
-                         % (i2, name, dx, T, ut, src, ut, name, dy))
+                b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = %s;'
+                         % (i2, name, dx, uconv(t, '(%s)%s[ii] * 3u + (%s)%s[ii + %d]' % (ut, src, ut, name, dy))))
         b.append('%s}' % ind)
         return b
 
@@ -1086,7 +1106,7 @@ class Gen:
                 if is_float(t):
                     e = 's[i] * (%s)0.5 + d[i]' % T
                 else:
-                    e = '(%s)((unsigned long long)s[i] * 3u + (unsigned long long)d[i])' % T
+                    e = uconv(t, '(unsigned long long)s[i] * 3u + (unsigned long long)d[i]')
                 o.append('static inline void rmix_%s(%s *restrict d, const %s *restrict s, unsigned n) {' % (t, T, T))
                 o.append('    for (unsigned i = 0; i < n; i++) d[i] = %s;' % e)
                 o.append('}')

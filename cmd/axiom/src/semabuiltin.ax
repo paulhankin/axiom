@@ -130,6 +130,18 @@ fn is_int_like(t: *ast.Type) bool {
            (t.kind == ast.TY_INVALID);
 }
 
+fn is_unsigned_int_like(t: *ast.Type) bool {
+    return ((t.kind == ast.TY_INT) and not t.is_signed) or
+           ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_UNSIGNED)) or (t.kind == ast.TY_INVALID);
+}
+
+fn make_pair_struct(sp: u.Span, n0: []u8, t0: *mut ast.Type, n1: []u8, t1: *mut ast.Type) *mut ast.Type {
+    let mut fv = u.List.[ast.Field].empty();
+    fv.push(ast.Field.{ name: u.intern(n0), te: u.nil.[ast.TypeExpr](), span: sp, ty: t0 });
+    fv.push(ast.Field.{ name: u.intern(n1), te: u.nil.[ast.TypeExpr](), span: sp, ty: t1 });
+    return ty.anon_struct_decl(u.nil.[ast.Module](), fv, sp).ty;
+}
+
 fn is_float_like(t: *ast.Type) bool {
     return (t.kind == ast.TY_FLOAT) or ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_FLOAT)) or
            (t.kind == ast.TY_INVALID);
@@ -302,7 +314,7 @@ pub fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         r = check_vector_op_builtin(e, x);
     }
     if u.isnil(r) {
-        r = check_system_builtin(e);
+        r = check_system_builtin(e, x);
     }
     if u.isnil(r) {
         return set_ty(e, ty.t_invalid);
@@ -702,6 +714,60 @@ fn check_memory_builtin(e: *mut ast.Expr) *mut ast.Type {
         }
         return set_ty(e, ty.t_void);
     }
+    if id == ast.BI_VOLATILE_LOAD {
+        let p = check_expr(barg(e, 0), tnil());
+        if p.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if p.kind != ast.TY_PTR {
+            _ = dg.err(barg(e, 0).span, "E0822", "@volatile_load requires a pointer operand");
+            return set_ty(e, ty.t_invalid);
+        }
+        if p.elem.kind == ast.TY_VOID {
+            _ = dg.err(barg(e, 0).span, "E0705", "cannot dereference *void");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, p.elem);
+    }
+    if id == ast.BI_VOLATILE_STORE {
+        let p = check_expr(barg(e, 0), tnil());
+        if p.kind == ast.TY_INVALID {
+            _ = check_expr(barg(e, 1), tnil());
+            return set_ty(e, ty.t_void);
+        }
+        if p.kind != ast.TY_PTR {
+            _ = dg.err(barg(e, 0).span, "E0822", "@volatile_store requires a pointer operand");
+            _ = check_expr(barg(e, 1), tnil());
+            return set_ty(e, ty.t_void);
+        }
+        if not p.is_mut {
+            _ = dg.err(barg(e, 0).span, "E0706", "@volatile_store requires a *mut pointer");
+            _ = check_expr(barg(e, 1), tnil());
+            return set_ty(e, ty.t_void);
+        }
+        if p.elem.kind == ast.TY_VOID {
+            _ = dg.err(barg(e, 0).span, "E0705", "cannot dereference *void");
+            _ = check_expr(barg(e, 1), tnil());
+            return set_ty(e, ty.t_void);
+        }
+        _ = check_expr_to(earg(e, 1), p.elem);
+        return set_ty(e, ty.t_void);
+    }
+    if id == ast.BI_VOLATILE_ZERO {
+        let d = check_expr(barg(e, 0), tnil());
+        if d.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_void);
+        }
+        if (d.kind != ast.TY_SLICE) or not d.is_mut {
+            _ = dg.err(barg(e, 0).span, "E0822", "@volatile_zero destination must be a []mut slice");
+            return set_ty(e, ty.t_void);
+        }
+        if d.elem.kind == ast.TY_VOID {
+            _ = dg.err(barg(e, 0).span, "E0822", "@volatile_zero cannot zero void elements");
+            return set_ty(e, ty.t_void);
+        }
+        return set_ty(e, ty.t_void);
+    }
     return tnil();
 }
 
@@ -792,6 +858,85 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires floats, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
+    }
+    if id == ast.BI_MUL_WIDE {
+        let t = pair(e, tnil());
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@mul_wide requires integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "lo", t, "hi", t));
+    }
+    if id == ast.BI_MUL_HIGH {
+        let t = pair(e, x);
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@mul_high requires integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, t);
+    }
+    if (id == ast.BI_ADD_CARRY) or (id == ast.BI_SUB_BORROW) {
+        let t = pair(e, tnil());
+        _ = check_expr_to(earg(e, 2), ty.t_u8);
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_unsigned_int_like(t) {
+            _ = dg.err(e.span, "E0822", u.f1("@%s requires unsigned integer operands", e.name));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "value", t, u.pick(id == ast.BI_ADD_CARRY, "carry", "borrow"),
+                                          ty.t_u8));
+    }
+    if id == ast.BI_DIV_WIDE {
+        let mut ts: [3]*mut ast.Type = [check_expr(barg(e, 0), tnil()), check_expr(barg(e, 1), tnil()),
+                                        check_expr(barg(e, 2), tnil())];
+        let mut t = tnil();
+        let mut any_invalid = false;
+        let mut first_untyped: usize = 3;
+        for i in @as(usize, 0)..3 {
+            if ts[i].kind == ast.TY_INVALID {
+                any_invalid = true;
+            } else if ty.is_untyped(ts[i]) {
+                if first_untyped == 3 {
+                    first_untyped = i;
+                }
+            } else if u.isnil(t) {
+                t = ts[i];
+            }
+        }
+        if any_invalid {
+            return set_ty(e, ty.t_invalid);
+        }
+        if u.isnil(t) {
+            _ = finalize_untyped(earg(e, first_untyped));
+            return set_ty(e, ty.t_invalid);
+        }
+        for i in @as(usize, 0)..3 {
+            if ty.is_untyped(ts[i]) {
+                coerce(earg(e, i), t);
+                ts[i] = barg(e, i).ty;
+            }
+        }
+        for i in @as(usize, 0)..3 {
+            if (ts[i] != t) and (ts[i].kind != ast.TY_INVALID) {
+                let d = dg.err(e.span, "E0412", u.f2("@div_wide operands have different types: %s and %s", tstr(t),
+                                                     tstr(ts[i])));
+                dg.set_types(d, tstr(t), tstr(ts[i]));
+                return set_ty(e, ty.t_invalid);
+            }
+        }
+        if not is_unsigned_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@div_wide requires unsigned integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "quo", t, "rem", t));
     }
     return tnil();
 }
@@ -1102,10 +1247,53 @@ fn check_expect_eq(e: *mut ast.Expr) *mut ast.Type {
     return set_ty(e, ty.t_void);
 }
 
+fn check_atomic_order(e: *ast.Expr, id: ast.BuiltinId, ord_e: *mut ast.Expr) void {
+    if ord_e.kind != ast.E_STRING {
+        _ = check_expr(ord_e, tnil());
+        _ = dg.err(ord_e.span, "E0830",
+                   u.f1("@%s memory order must be a string literal (\"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                        e.name));
+        return;
+    }
+    ord_e.ty = ty.type_slice(ty.t_u8, false);
+    let s = ast.more(ord_e).str;
+    let known = u.str_eq(s, "relaxed") or u.str_eq(s, "acquire") or u.str_eq(s, "release") or u.str_eq(s, "acq_rel") or
+                u.str_eq(s, "seq_cst");
+    if not known {
+        _ = dg.err(ord_e.span, "E0830",
+                   u.f1("unknown atomic memory order '%s' (expected \"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                        s));
+        return;
+    }
+    if (id == ast.BI_ATOMIC_LOAD) and (u.str_eq(s, "release") or u.str_eq(s, "acq_rel")) {
+        _ = dg.err(ord_e.span, "E0830",
+                   u.f1("@atomic_load cannot use memory order '%s' (expected \"relaxed\", \"acquire\", or \"seq_cst\")",
+                        s));
+    }
+    if (id == ast.BI_ATOMIC_STORE) and (u.str_eq(s, "acquire") or u.str_eq(s, "acq_rel")) {
+        _ = dg.err(ord_e.span, "E0830",
+                   u.f1("@atomic_store cannot use memory order '%s' (expected \"relaxed\", \"release\", or \"seq_cst\")",
+                        s));
+    }
+}
+
 // @atomic_load ... @atomic_notify. The first argument is a pointer to an integer
 // (spec §12.8); everything but load, wait and notify needs *mut.
 fn check_atomic_builtin(e: *mut ast.Expr, id: ast.BuiltinId) *mut ast.Type {
     let need_mut = (id != ast.BI_ATOMIC_LOAD) and (id != ast.BI_ATOMIC_WAIT) and (id != ast.BI_ATOMIC_NOTIFY);
+    let wn = (id == ast.BI_ATOMIC_WAIT) or (id == ast.BI_ATOMIC_NOTIFY);
+    let mut base_n: usize = 2;
+    if id == ast.BI_ATOMIC_LOAD {
+        base_n = 1;
+    } else if id == ast.BI_ATOMIC_CAS {
+        base_n = 3;
+    }
+    let nargs = ast.more(e).bargs.len;
+    if not wn and (nargs > (base_n + 1)) {
+        _ = dg.err(e.span, "E0420", u.f3("@%s expects at most %s arguments, found %s", e.name, u.zdec(base_n + 1),
+                                         u.zdec(nargs)));
+        check_bargs(e, base_n + 1);
+    }
     let p = check_expr(barg(e, 0), tnil());
     let mut t = ty.t_invalid;
     if (p.kind == ast.TY_PTR) and
@@ -1117,7 +1305,6 @@ fn check_atomic_builtin(e: *mut ast.Expr, id: ast.BuiltinId) *mut ast.Type {
     } else if p.kind != ast.TY_INVALID {
         _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s needs a pointer to an integer, found %s", e.name, tstr(p)));
     }
-    let wn = (id == ast.BI_ATOMIC_WAIT) or (id == ast.BI_ATOMIC_NOTIFY);
     if wn and (t.kind == ast.TY_INT) and (t.bits != 32) {
         _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s works on 32-bit integers (*i32 or *u32), found %s", e.name,
                                                   tstr(p)));
@@ -1125,29 +1312,31 @@ fn check_atomic_builtin(e: *mut ast.Expr, id: ast.BuiltinId) *mut ast.Type {
     if wn and (t.kind == ast.TY_PARAM) {
         _ = dg.err(barg(e, 0).span, "E0823", u.f1("@%s works on 32-bit integers (*i32 or *u32)", e.name));
     }
+    let mut ret = t;
     if id == ast.BI_ATOMIC_LOAD {
-        return set_ty(e, t);
-    }
-    if id == ast.BI_ATOMIC_STORE {
+        ret = t;
+    } else if id == ast.BI_ATOMIC_STORE {
         _ = check_expr_to(earg(e, 1), t);
-        return set_ty(e, ty.t_void);
-    }
-    if id == ast.BI_ATOMIC_CAS {
+        ret = ty.t_void;
+    } else if id == ast.BI_ATOMIC_CAS {
         _ = check_expr_to(earg(e, 1), t);
         _ = check_expr_to(earg(e, 2), t);
-        return set_ty(e, t);
-    }
-    if id == ast.BI_ATOMIC_WAIT {
+        ret = t;
+    } else if id == ast.BI_ATOMIC_WAIT {
         _ = check_expr_to(earg(e, 1), t);
         _ = check_expr_to(earg(e, 2), ty.t_i64);
-        return set_ty(e, ty.t_u32);
-    }
-    if id == ast.BI_ATOMIC_NOTIFY {
+        ret = ty.t_u32;
+    } else if id == ast.BI_ATOMIC_NOTIFY {
         _ = check_expr_to(earg(e, 1), ty.t_u32);
-        return set_ty(e, ty.t_u32);
+        ret = ty.t_u32;
+    } else {
+        _ = check_expr_to(earg(e, 1), t);
+        ret = t;  // read-modify-write: the old value
     }
-    _ = check_expr_to(earg(e, 1), t);
-    return set_ty(e, t);  // read-modify-write: the old value
+    if not wn and (nargs == (base_n + 1)) {
+        check_atomic_order(e, id, barg(e, base_n));
+    }
+    return set_ty(e, ret);
 }
 
 // @lanes_eq ... @dot, @widen_low ... @narrow: operations on SIMD vectors.
@@ -1221,9 +1410,21 @@ fn check_vector_op_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     return tnil();
 }
 
-// @trap, the target and processor queries, tests, atomics and @error_name.
-fn check_system_builtin(e: *mut ast.Expr) *mut ast.Type {
+// @trap, the target and processor queries, tests, atomics, @black_box and
+// @error_name.
+fn check_system_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     let id = ast.builtin_of(e);
+    if id == ast.BI_BLACK_BOX {
+        let t = operand(earg(e, 0), x);
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if t.kind == ast.TY_VOID {
+            _ = dg.err(barg(e, 0).span, "E0404", "@black_box cannot take void");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, t);
+    }
     if (id == ast.BI_TRAP) or (id == ast.BI_MEMORY_ERROR) {
         return set_ty(e, ty.t_never);
     }
@@ -1280,6 +1481,13 @@ fn check_system_builtin(e: *mut ast.Expr) *mut ast.Type {
         return check_expect_eq(e);
     }
     if id == ast.BI_FENCE {
+        let nargs = ast.more(e).bargs.len;
+        if nargs > 1 {
+            _ = dg.err(e.span, "E0420", u.f1("@fence expects at most 1 argument, found %s", u.zdec(nargs)));
+            check_bargs(e, 1);
+        } else if nargs == 1 {
+            check_atomic_order(e, id, barg(e, 0));
+        }
         return set_ty(e, ty.t_void);
     }
     if ast.builtin_between(id, ast.BI_ATOMIC_LOAD, ast.BI_ATOMIC_NOTIFY) {

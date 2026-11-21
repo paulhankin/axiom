@@ -675,6 +675,11 @@ static void resolve_fn(Decl *d) {
             diag_error(p->te->span, "E0404", "parameter '%s' cannot have type void", p->name);
             d->param_types[i] = t_invalid;
         }
+        if (p->is_noalias && d->param_types[i]->kind != TY_PTR && d->param_types[i]->kind != TY_SLICE &&
+            d->param_types[i]->kind != TY_INVALID) {
+            diag_error(p->noalias_span, "E0315", "noalias is only allowed on pointer or slice parameters, found %s",
+                       type_str(d->param_types[i]));
+        }
         for (int j = 0; j < (placeholder(p->name) ? 0 : i); j++)
             if (d->params.data[j].name == p->name) dup_error(p->span, p->name, d->params.data[j].span);
     }
