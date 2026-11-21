@@ -1637,7 +1637,7 @@ fn save_dearer(f: *MFunc, t: *Target, cs: *CallSites, x: *Interval, c: u8) bool 
     return ncut > 0;
 }
 
-fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
+fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, frameless: *mut bool) usize {
     let n = iv.len;
     let cs = CallSites.of(f);
     defer cs.deinit();
@@ -1819,6 +1819,7 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
     }
     heap.deinit();
     vict.deinit();
+    frameless.* = (nspill > 0) and spills_frameless(f, iv);
     for k in 0..n {
         u.free(@ptr_cast(*mut void, iv[k].ranges.data));
     }
@@ -3941,6 +3942,31 @@ fn remat_uses(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
     }
 }
 
+// Is a spilled interval live in a block before the frame is set up?
+fn spills_frameless(f: *MFunc, iv: []Interval) bool {
+    if f.noframe_regs == 0 {
+        return false;
+    }
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        if not b.noframe {
+            continue;
+        }
+        for k in 0..iv.len {
+            let x = &iv[k];
+            if x.spilled and (x.s <= b.end) and (x.e >= b.start) {
+                for j in 0..x.ranges.len {
+                    let rg = x.ranges.get(j);
+                    if (rg.s <= b.end) and (rg.e >= b.start) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
     block_freqs(f);
@@ -3968,11 +3994,26 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
                 }
             }
         }
-        let ns = greedy(f, t, iv);
+        let mut frameless = false;
+        let ns = greedy(f, t, iv, &mut frameless);
         if debug_ra {
             u.eprint(u.f1("round %s\n", u.idec(rounds)));
         }
         rounds += 1;
+        if frameless {
+            // a value of the frameless blocks (shrink_wrap) goes to the
+            // stack: they need the frame after all, and the target sets it
+            // up at the entry; their values may take the registers it saves
+            // (else they are short of registers for nothing)
+            if debug_ra {
+                u.eprint("  frameless blocks spill: no shrink-wrapping\n");
+            }
+            for bi in 0..f.blocks.len {
+                f.blocks.get(bi).noframe = false;
+            }
+            f.noframe_regs = 0;
+            continue;
+        }
         if ns == 0 {
             let nv = iv.len;
             f.assign = u.newn.[i32](nv + 1);
