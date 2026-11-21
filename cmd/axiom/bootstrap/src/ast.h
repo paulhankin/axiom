@@ -23,6 +23,7 @@ typedef enum TEKind {
     TE_ARRAY,
     TE_FN,
     TE_ANON_STRUCT,
+    TE_OPT,
     TE_ERRUNION,
     TE_ERROR,
     TE_INVALID,  // what the parser makes of a type it could not read (reported already)
@@ -70,6 +71,9 @@ typedef enum ExprKind {
     E_STRING,
     E_BOOL,
     E_STRUCT_LIT,   // a.{...} (a may be NULL for anonymous .{...})
+    E_OPT_NONE,     // .none
+    E_OPT_SOME,     // .some(a)
+    E_EMPTY_SLICE,  // []
     E_ARRAY_LIT,    // [a, b, c]
     E_ARRAY_REPEAT, // [a; b]
     E_ERROR_VAL,    // error.Name
@@ -77,6 +81,7 @@ typedef enum ExprKind {
     E_UNARY,
     E_BINARY,
     E_CATCH,
+    E_ORELSE,       // a ?? H
     E_FIELD,  // a.name
     E_DEREF,  // a.*
     E_CALL,
@@ -87,7 +92,7 @@ typedef enum ExprKind {
     E_CONV,   // implicit conversion inserted by sema (op = ConvKind)
 } ExprKind;
 
-typedef enum ConvKind { CONV_NOOP, CONV_WRAP_OK, CONV_WRAP_ERR } ConvKind;
+typedef enum ConvKind { CONV_NOOP, CONV_WRAP_OK, CONV_WRAP_ERR, CONV_WRAP_SOME } ConvKind;
 
 // E_CALL kinds (stored in Expr.op after sema)
 typedef enum CallKind { CALLK_DIRECT = 0, CALLK_INDIRECT = 1, CALLK_VARIANT = 2 } CallKind;
@@ -220,6 +225,8 @@ struct Stmt {
     Sym name;  // let / for variable
     Span name_span;
     bool mut;
+    bool ref_iter;  // for &x / for &mut x
+    bool ref_mut;   // for &mut x
     bool undef;  // let ... = undefined (§8.1): `e` is that identifier, its bytes left unspecified
     TypeExpr *te;
     Expr *e, *e2, *e3;

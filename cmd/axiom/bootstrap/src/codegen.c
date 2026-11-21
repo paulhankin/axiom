@@ -203,7 +203,8 @@ static void internal_error(const char *msg) {
 }
 
 static bool too_large(Type *t) {
-    if (t->kind != TY_ARRAY && t->kind != TY_ERRUNION && t->kind != TY_STRUCT && t->kind != TY_UNION) return false;
+    if (t->kind != TY_ARRAY && t->kind != TY_ERRUNION && t->kind != TY_OPT && t->kind != TY_STRUCT && t->kind != TY_UNION)
+        return false;
     return !t->has_params && type_size_problem(t);
 }
 
@@ -221,6 +222,7 @@ static void check_inst_sizes(Type *t, Span sp) {
     case TY_PTR:
     case TY_SLICE:
     case TY_ARRAY:
+    case TY_OPT:
     case TY_ERRUNION:
         check_inst_sizes(t->elem, sp);
         inner = too_large(t->elem);
@@ -296,6 +298,23 @@ static LLVMTypeRef lty(Type *t) {
         break;
     }
     case TY_ARRAY: r = LLVMArrayType2(lty(t->elem), (uint64_t)t->len); break;
+    case TY_OPT: {
+        switch (opt_niche(t)) {
+        case OPT_PTR: r = T_ptr; break;
+        case OPT_BOOL: r = T_i8; break;
+        case OPT_SLICE: {
+            LLVMTypeRef el[2] = {T_ptr, T_isz};
+            r = LLVMStructTypeInContext(ctx, el, 2, false);
+            break;
+        }
+        case OPT_TAGGED: {
+            LLVMTypeRef el[2] = {T_i8, lty(t->elem)};
+            r = LLVMStructTypeInContext(ctx, el, 2, false);
+            break;
+        }
+        }
+        break;
+    }
     case TY_ERRUNION: {
         if (t->elem->kind == TY_VOID) {
             LLVMTypeRef el[1] = {T_i16};
@@ -1201,6 +1220,34 @@ static LLVMValueRef const_slice(LLVMValueRef ptr, int64_t len) {
     return LLVMConstStructInContext(ctx, el, 2, false);
 }
 
+static LLVMValueRef empty_slice_const(Type *st) {
+    LLVMValueRef ptr = LLVMConstIntToPtr(usz(type_align(st->elem)), T_ptr);
+    return const_slice(ptr, 0);
+}
+
+static LLVMValueRef opt_none_const(Type *t) {
+    switch (opt_niche(t)) {
+    case OPT_PTR: return LLVMConstNull(T_ptr);
+    case OPT_BOOL: return LLVMConstInt(T_i8, 2, false);
+    case OPT_SLICE:
+    case OPT_TAGGED: return LLVMConstNull(lty(t));
+    }
+    return NULL;
+}
+
+static LLVMValueRef opt_some_const(Type *t, LLVMValueRef iv) {
+    switch (opt_niche(t)) {
+    case OPT_PTR:
+    case OPT_BOOL:
+    case OPT_SLICE: return iv;
+    case OPT_TAGGED: {
+        LLVMValueRef el[2] = {LLVMConstInt(T_i8, 1, false), iv};
+        return LLVMConstStructInContext(ctx, el, 2, false);
+    }
+    }
+    return NULL;
+}
+
 static SymMap global_vals;  // Decl* name -> LLVMValueRef (keyed by arena string of pointer)
 
 static LLVMValueRef global_ref(Decl *d);
@@ -1228,6 +1275,7 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
             LLVMValueRef el[2] = {code, LLVMConstNull(lty(t->elem))};
             return LLVMConstStructInContext(ctx, el, 2, false);
         }
+        case CONV_WRAP_SOME: return opt_some_const(t, gen_const(e->a, t->elem));
         }
     }
     if (e->is_const && (t->kind == TY_INT)) return cint(lty(t), e->cval);
@@ -1236,6 +1284,9 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
     switch (e->kind) {
     case E_FLOAT: return cfloat(t, e);
     case E_STRING: return const_slice(string_ptr(e->str, e->slen), e->slen);
+    case E_EMPTY_SLICE: return empty_slice_const(t);
+    case E_OPT_NONE: return opt_none_const(t);
+    case E_OPT_SOME: return opt_some_const(t, gen_const(e->a, t->elem));
     case E_ERROR_VAL: return LLVMConstInt(T_i16, (unsigned long long)e->cval, false);
     case E_ARRAY_LIT: {
         int n = e->args.len;
@@ -1343,6 +1394,10 @@ static void mangle_type_into(CharVec *b, Type *t) {
         break;
     case TY_ARRAY:
         MPUT(arena_printf("[%lld]", (long long)t->len));
+        mangle_type_into(b, t->elem);
+        break;
+    case TY_OPT:
+        MPUT("?");
         mangle_type_into(b, t->elem);
         break;
     case TY_ERRUNION:
@@ -1539,6 +1594,7 @@ static bool type_mentions_error(Type *t) {
     switch (t->kind) {
     case TY_ERROR:
     case TY_ERRUNION: return true;
+    case TY_OPT:
     case TY_ARRAY: return type_mentions_error(t->elem);
     case TY_STRUCT:
         for (int i = 0; i < t->decl->fields.len; i++)
@@ -1878,6 +1934,47 @@ static LLVMValueRef errunion_value(Type *eu, LLVMValueRef code, LLVMValueRef pay
     if (eu->elem->kind != TY_VOID)
         v = LLVMBuildInsertValue(B, v, payload ? to_mem(eu->elem, payload) : LLVMConstNull(lty(eu->elem)), 1, "");
     return v;
+}
+
+static LLVMValueRef opt_some_value(Type *t, LLVMValueRef v) {
+    switch (opt_niche(t)) {
+    case OPT_PTR:
+    case OPT_SLICE: return v;
+    case OPT_BOOL: return LLVMBuildZExt(B, v, T_i8, "");
+    case OPT_TAGGED: {
+        LLVMTypeRef lt = lty(t);
+        if (in_mem(t)) {
+            LLVMValueRef tmp = temp_alloca(t);
+            LLVMBuildStore(B, LLVMConstInt(T_i8, 1, false), LLVMBuildStructGEP2(B, lt, tmp, 0, ""));
+            store(t->elem, v, LLVMBuildStructGEP2(B, lt, tmp, 1, ""), false);
+            return tmp;
+        }
+        LLVMValueRef ov = LLVMGetUndef(lt);
+        ov = LLVMBuildInsertValue(B, ov, LLVMConstInt(T_i8, 1, false), 0, "");
+        return LLVMBuildInsertValue(B, ov, to_mem(t->elem, v), 1, "");
+    }
+    }
+    return NULL;
+}
+
+static LLVMValueRef opt_is_some(Type *ot, LLVMValueRef v) {
+    switch (opt_niche(ot)) {
+    case OPT_PTR: return LLVMBuildIsNotNull(B, v, "");
+    case OPT_BOOL: return LLVMBuildICmp(B, LLVMIntNE, v, LLVMConstInt(T_i8, 2, false), "");
+    case OPT_SLICE: return LLVMBuildIsNotNull(B, LLVMBuildExtractValue(B, v, 0, ""), "");
+    case OPT_TAGGED: return field_value(ot, v, 0, t_bool);
+    }
+    return NULL;
+}
+
+static LLVMValueRef opt_payload(Type *ot, LLVMValueRef v) {
+    switch (opt_niche(ot)) {
+    case OPT_PTR:
+    case OPT_SLICE: return v;
+    case OPT_BOOL: return from_mem(t_bool, v);
+    case OPT_TAGGED: return field_value(ot, v, 1, ot->elem);
+    }
+    return NULL;
 }
 
 static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool unaligned);
@@ -2597,6 +2694,48 @@ static LLVMValueRef gen_catch(Expr *e) {
     LLVMBuildBr(B, merge);
     LLVMPositionBuilderAtEnd(B, merge);
     if (vt->kind == TY_VOID) return NULL;
+    if (!hbb || !hv) return ov;
+    LLVMValueRef phi = LLVMBuildPhi(B, in_mem(vt) ? T_ptr : vty(vt), "");
+    LLVMValueRef vals[2] = {ov, hv};
+    LLVMBasicBlockRef bbs[2] = {obb, hbb};
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
+}
+
+static LLVMValueRef gen_orelse(Expr *e) {
+    Type *ot = ct(e->a->type);
+    Type *vt = ot->elem;
+    LLVMValueRef v = gen(e->a);
+    LLVMValueRef is_some = opt_is_some(ot, v);
+    LLVMBasicBlockRef some_bb = new_bb("orelse.some"), none_bb = new_bb("orelse.none"), merge = new_bb("orelse.end");
+    LLVMBuildCondBr(B, is_some, some_bb, none_bb);
+    LLVMPositionBuilderAtEnd(B, none_bb);
+    LLVMValueRef hv = NULL;
+    LLVMBasicBlockRef hbb = NULL;
+    switch (e->hkind) {
+    case H_VALUE:
+        hv = gen(e->hexpr);
+        if (!terminated() && (LLVMGetInsertBlock(B) == none_bb || LLVMGetFirstUse(LLVMBasicBlockAsValue(LLVMGetInsertBlock(B))))) {
+            if (hv && in_mem(vt)) hv = spill(vt, hv);
+            hbb = LLVMGetInsertBlock(B);
+            LLVMBuildBr(B, merge);
+        }
+        break;
+    case H_RETURN: gen_return(e->hexpr); break;
+    case H_BREAK: gen_break(true, e->index); break;
+    case H_CONTINUE: gen_break(false, e->index); break;
+    case H_BLOCK:
+        gen_block(e->hblock);
+        if (!terminated()) LLVMBuildBr(B, merge);
+        break;
+    }
+    if (!terminated()) LLVMBuildUnreachable(B);
+    LLVMPositionBuilderAtEnd(B, some_bb);
+    LLVMValueRef ov = opt_payload(ot, v);
+    if (ov && in_mem(vt) && hbb && hv) ov = spill(vt, ov);
+    LLVMBasicBlockRef obb = LLVMGetInsertBlock(B);
+    LLVMBuildBr(B, merge);
+    LLVMPositionBuilderAtEnd(B, merge);
     if (!hbb || !hv) return ov;
     LLVMValueRef phi = LLVMBuildPhi(B, in_mem(vt) ? T_ptr : vty(vt), "");
     LLVMValueRef vals[2] = {ov, hv};
@@ -4356,7 +4495,10 @@ static bool reads_no_memory(Expr *e) {
     case E_FLOAT:
     case E_BOOL:
     case E_STRING:
-    case E_ERROR_VAL: return true;
+    case E_ERROR_VAL:
+    case E_OPT_NONE:
+    case E_EMPTY_SLICE: return true;
+    case E_OPT_SOME: return reads_no_memory(e->a);
     case E_IDENT:
         if (e->local) return !e->local->addr_taken;
         return e->decl && e->decl->kind == D_CONST;
@@ -4387,6 +4529,13 @@ static void gen_into_inner(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
             lit_into(e, t, dest, fresh, un);
             return;
         case E_ARRAY_REPEAT: lit_into(e, t, dest, fresh, un); return;
+        case E_OPT_SOME:
+            if (fresh && opt_niche(t) == OPT_TAGGED) {
+                LLVMBuildStore(B, LLVMConstInt(T_i8, 1, false), LLVMBuildStructGEP2(B, lty(t), dest, 0, ""));
+                gen_into(e->a, LLVMBuildStructGEP2(B, lty(t), dest, 1, ""), fresh, un);
+                return;
+            }
+            break;
         case E_CONV:
             if (e->op == CONV_NOOP) {
                 gen_into(e->a, dest, fresh, un);
@@ -4394,6 +4543,11 @@ static void gen_into_inner(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
             }
             if (e->op == CONV_WRAP_OK && fresh && t->elem->kind != TY_VOID) {
                 LLVMBuildStore(B, LLVMConstInt(T_i16, 0, false), LLVMBuildStructGEP2(B, lty(t), dest, 0, ""));
+                gen_into(e->a, LLVMBuildStructGEP2(B, lty(t), dest, 1, ""), fresh, un);
+                return;
+            }
+            if (e->op == CONV_WRAP_SOME && fresh && opt_niche(t) == OPT_TAGGED) {
+                LLVMBuildStore(B, LLVMConstInt(T_i8, 1, false), LLVMBuildStructGEP2(B, lty(t), dest, 0, ""));
                 gen_into(e->a, LLVMBuildStructGEP2(B, lty(t), dest, 1, ""), fresh, un);
                 return;
             }
@@ -4563,6 +4717,9 @@ static LLVMValueRef gen_inner(Expr *e) {
         }
         break;
     case E_STRING: return const_slice(string_ptr(e->str, e->slen), e->slen);
+    case E_EMPTY_SLICE: return empty_slice_const(t);
+    case E_OPT_NONE: return opt_none_const(t);
+    case E_OPT_SOME: return opt_some_value(t, gen(e->a));
     case E_BOOL: return LLVMConstInt(T_i1, e->bval ? 1 : 0, false);
     case E_INT: return cint(lty(t), (i128)e->ival);
     case E_FLOAT: return cfloat(t, e);
@@ -4574,6 +4731,7 @@ static LLVMValueRef gen_inner(Expr *e) {
     case E_UNARY: return gen_unary(e);
     case E_BINARY: return gen_binary(e);
     case E_CATCH: return gen_catch(e);
+    case E_ORELSE: return gen_orelse(e);
     case E_TRY: return gen_try(e);
     case E_CALL: return gen_call(e);
     case E_FIELD:
@@ -4609,6 +4767,7 @@ static LLVMValueRef gen_inner(Expr *e) {
             return errunion_value(t, LLVMConstInt(T_i16, 0, false), v);
         }
         case CONV_WRAP_ERR: return errunion_value(t, gen(e->a), NULL);
+        case CONV_WRAP_SOME: return opt_some_value(t, gen(e->a));
         }
         break;
     default: break;
@@ -4819,9 +4978,14 @@ static void gen_for(Stmt *s) {
     LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
     LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, len, ""), body, end);
     LLVMPositionBuilderAtEnd(B, body);
-    LLVMValueRef ep = LLVMBuildInBoundsGEP2(B, lty(vt), ptr, &i, 1, "");
-    if (ct_->kind == TY_SLICE) asan_check(ep, usz(type_size(vt)));
-    store(vt, load(vt, ep, ct_->kind == TY_SLICE), var, false);
+    Type *et = ct_->elem;
+    LLVMValueRef ep = LLVMBuildInBoundsGEP2(B, lty(et), ptr, &i, 1, "");
+    if (s->ref_iter) {
+        store(vt, ep, var, false);
+    } else {
+        if (ct_->kind == TY_SLICE) asan_check(ep, usz(type_size(et)));
+        store(et, load(et, ep, ct_->kind == TY_SLICE), var, false);
+    }
     push_loop(end, step);
     gen_block(s->body);
     F->loops.len--;
@@ -4844,25 +5008,80 @@ static void gen_match(Stmt *s) {
         bbs[i] = s->arms.data[i].alt ? bbs[i - 1] : new_bb("match.arm");
         if (s->arms.data[i].kind == P_ELSE && else_idx < 0) else_idx = i;
     }
+    Type *ref_ptr = (t->kind == TY_PTR && (t->elem->kind == TY_UNION || t->elem->kind == TY_OPT)) ? t : NULL;
+    Type *base = ref_ptr ? t->elem : t;
     LLVMValueRef payload_ptr = NULL;
-    if (t->kind == TY_UNION) {
-        LLVMValueRef up = addr_or_spill(s->e);
-        LLVMValueRef tag = LLVMBuildLoad2(B, lty(union_tag_type(t)), LLVMBuildStructGEP2(B, lty(t), up, 0, ""), "");
-        if (LLVMCountStructElementTypes(lty(t)) > 1) payload_ptr = LLVMBuildStructGEP2(B, lty(t), up, 1, "");
-        int nv = t->decl->variants.len;
+    LLVMValueRef opt_val = NULL;
+    if (base->kind == TY_UNION) {
+        LLVMValueRef up = ref_ptr ? gen(s->e) : addr_or_spill(s->e);
+        if (ref_ptr) asan_check(up, usz(type_size(base)));
+        LLVMValueRef tag =
+            LLVMBuildLoad2(B, lty(union_tag_type(base)), LLVMBuildStructGEP2(B, lty(base), up, 0, ""), "");
+        if (ref_ptr) LLVMSetAlignment(tag, 1);
+        if (LLVMCountStructElementTypes(lty(base)) > 1)
+            payload_ptr = LLVMBuildStructGEP2(B, lty(base), up, 1, "");
+        int nv = base->decl->variants.len;
         LLVMValueRef sw = LLVMBuildSwitch(B, tag, trap_block(T_UNIONTAG), (unsigned)nv);
         bool *covered = NEWN(bool, nv + 1);
         for (int i = 0; i < n; i++) {
             MatchArm *a = &s->arms.data[i];
             if (a->kind == P_VARIANT && !covered[a->variant]) {
                 covered[a->variant] = true;
-                LLVMAddCase(sw, LLVMConstInt(lty(union_tag_type(t)), (unsigned long long)a->variant, false), bbs[i]);
+                LLVMAddCase(sw, LLVMConstInt(lty(union_tag_type(base)), (unsigned long long)a->variant, false), bbs[i]);
             }
         }
         if (else_idx >= 0)
             for (int v = 0; v < nv; v++)
-                if (!covered[v]) LLVMAddCase(sw, LLVMConstInt(lty(union_tag_type(t)), (unsigned long long)v, false), bbs[else_idx]);
-    } else if (O->unit == CG_MODULE && n > 0 && ct(s->e->type)->kind == TY_ERROR) {
+                if (!covered[v])
+                    LLVMAddCase(sw, LLVMConstInt(lty(union_tag_type(base)), (unsigned long long)v, false), bbs[else_idx]);
+    } else if (base->kind == TY_OPT) {
+        LLVMValueRef is_some;
+        if (ref_ptr) {
+            LLVMValueRef up = gen(s->e);
+            asan_check(up, usz(type_size(base)));
+            switch (opt_niche(base)) {
+            case OPT_PTR: {
+                LLVMValueRef ld = LLVMBuildLoad2(B, T_ptr, up, "");
+                LLVMSetAlignment(ld, 1);
+                is_some = LLVMBuildIsNotNull(B, ld, "");
+                payload_ptr = up;
+                break;
+            }
+            case OPT_BOOL: {
+                LLVMValueRef ld = LLVMBuildLoad2(B, T_i8, up, "");
+                is_some = LLVMBuildICmp(B, LLVMIntNE, ld, LLVMConstInt(T_i8, 2, false), "");
+                payload_ptr = up;
+                break;
+            }
+            case OPT_SLICE: {
+                LLVMValueRef ld = LLVMBuildLoad2(B, T_ptr, LLVMBuildStructGEP2(B, lty(base), up, 0, ""), "");
+                LLVMSetAlignment(ld, 1);
+                is_some = LLVMBuildIsNotNull(B, ld, "");
+                payload_ptr = up;
+                break;
+            }
+            case OPT_TAGGED: {
+                LLVMValueRef ld = LLVMBuildLoad2(B, T_i8, LLVMBuildStructGEP2(B, lty(base), up, 0, ""), "");
+                is_some = LLVMBuildICmp(B, LLVMIntNE, ld, LLVMConstInt(T_i8, 0, false), "");
+                payload_ptr = LLVMBuildStructGEP2(B, lty(base), up, 1, "");
+                break;
+            }
+            }
+        } else {
+            opt_val = gen(s->e);
+            is_some = opt_is_some(base, opt_val);
+        }
+        LLVMBasicBlockRef none_bb = else_idx >= 0 ? bbs[else_idx] : trap_block(T_UNIONTAG);
+        LLVMBasicBlockRef some_bb = else_idx >= 0 ? bbs[else_idx] : trap_block(T_UNIONTAG);
+        for (int i = 0; i < n && (else_idx < 0 || i < else_idx); i++) {
+            MatchArm *a = &s->arms.data[i];
+            if (a->kind == P_VARIANT) {
+                if (a->variant == 0) none_bb = bbs[i];
+                else if (a->variant == 1) some_bb = bbs[i];
+            }
+        }
+        LLVMBuildCondBr(B, is_some, some_bb, none_bb);
+    } else if (O->unit == CG_MODULE && n > 0 && base->kind == TY_ERROR) {
         // Error codes are link-time values here: compare in arm order.
         LLVMValueRef v = gen(s->e);
         for (int i = 0; i < n; i++) {
@@ -4902,9 +5121,15 @@ static void gen_match(Stmt *s) {
         MatchArm *a = &s->arms.data[i];
         if (a->alt) continue;
         LLVMPositionBuilderAtEnd(B, bbs[i]);
-        if (a->bind_local && payload_ptr) {
-            Type *pt = type_variant(t, a->variant);
-            store(pt, load(pt, payload_ptr, true), local_ptr(a->bind_local), false);
+        if (a->bind_local) {
+            if (ref_ptr && payload_ptr) {
+                store(ct(a->bind_local->type), payload_ptr, local_ptr(a->bind_local), false);
+            } else if (base->kind == TY_OPT) {
+                store(base->elem, opt_payload(base, opt_val), local_ptr(a->bind_local), false);
+            } else if (payload_ptr) {
+                Type *pt = type_variant(base, a->variant);
+                store(pt, load(pt, payload_ptr, true), local_ptr(a->bind_local), false);
+            }
         }
         gen_block(a->body);
         if (!terminated()) LLVMBuildBr(B, end);

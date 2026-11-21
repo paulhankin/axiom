@@ -152,7 +152,7 @@ static Type *pair(Expr *e, Type *expected) {
         coerce(earg(e, 1), a);
         b = a;
     } else if (ty_is_untyped(a) && ty_is_untyped(b)) {
-        if (expected && expected->kind != TY_ERRUNION) {
+        if (expected && expected->kind != TY_ERRUNION && expected->kind != TY_OPT) {
             coerce(earg(e, 0), expected);
             coerce(earg(e, 1), expected);
             return expected;
@@ -254,7 +254,8 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t_invalid;
     }
     if (!argc_ok(e)) return e->type = t_invalid;
-    Type *x = expected && expected->kind == TY_ERRUNION ? expected->elem : expected;
+    Type *x = expected;
+    while (x && (x->kind == TY_ERRUNION || x->kind == TY_OPT)) x = x->elem;
     switch ((BuiltinId)e->index) {
     case BI_SIZE_OF:
     case BI_ALIGN_OF: {
@@ -609,7 +610,7 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t_void;
     }
     case BI_BLACK_BOX: {
-        Type *t = operand(earg(e, 0), expected);
+        Type *t = operand(earg(e, 0), x);
         if (t->kind == TY_INVALID) return e->type = t_invalid;
         if (t->kind == TY_VOID) {
             diag_error((*earg(e, 0))->span, "E0404", "@black_box cannot take void");

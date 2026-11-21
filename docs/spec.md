@@ -167,7 +167,7 @@ The lexer uses **maximal munch**. The complete token set is:
 &   |   ^   ~   <<  >>
 ==  !=  <   <=  >   >=
 =   +=  -=  *=  /=  %=  +%= -%= *%= &=  |=  ^=  <<= >>=
-!   .   ..  ... ,   :   ;   =>  @
+!   ?   ??  .   ..  ... ,   :   ;   =>  @
 (   )   {   }   [   ]
 ```
 
@@ -260,7 +260,8 @@ does).
 ### 3.3 Types
 
 ```ebnf
-Type          ::= "!" Type                          (* error union *)
+Type          ::= "?" Type                          (* optional *)
+                | "!" Type                          (* error union *)
                 | NamedType "!" Type                (* error union of a named error set, §11.3 *)
                 | "*" "mut"? Type                   (* raw pointer *)
                 | "[" "]" "mut"? Type               (* slice *)
@@ -306,7 +307,7 @@ AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
 IfStmt        ::= "if" ( Expr | "let" Patterns "=" Expr ) Block ( "else" ( IfStmt | Block ) )?
 WhileStmt     ::= Label? "while" Expr Block
 LoopStmt      ::= Label? "loop" Block
-ForStmt       ::= Label? "for" IDENT "in" Expr ( ".." Expr )? Block
+ForStmt       ::= Label? "for" ( "&" "mut"? )? IDENT "in" Expr ( ".." Expr )? Block
 Label         ::= IDENT ":"
 MatchStmt     ::= "match" Expr "{" MatchArm* "}"
 MatchArm      ::= ( Patterns | "else" ) "=>" Block
@@ -328,9 +329,10 @@ is the standard LL(1) factoring.
 ### 3.5 Expressions
 
 ```ebnf
-Expr          ::= BinExpr ( "catch" Handler )?
+Expr          ::= BinExpr ( "catch" Handler | "??" OptHandler )?
 Handler       ::= ( "|" IDENT "|" )?
                   ( "return" Expr? | "break" IDENT? | "continue" IDENT? | Block | BinExpr )
+OptHandler    ::= "return" Expr? | "break" IDENT? | "continue" IDENT? | Block | BinExpr
 
 BinExpr       ::= UnaryExpr ( BinOp UnaryExpr )*
 BinOp         ::= "*" | "/" | "%" | "*%"
@@ -354,6 +356,9 @@ PrimaryExpr   ::= IDENT | "Self"
                 | INT_LIT | FLOAT_LIT | STRING_LIT | CHAR_LIT | "true" | "false"
                 | "(" Expr ")"
                 | "." "{" FieldInits "}"           (* struct literal, type from context *)
+                | "." "none"                        (* empty optional, type from context *)
+                | "." "some" "(" Expr ")"           (* populated optional *)
+                | "[" "]"                           (* empty slice literal, type from context *)
                 | "[" Expr ( ";" Expr | ( "," Expr )* ","? ) "]"   (* array literal *)
                 | "error" "." IDENT
                 | BuiltinCall
@@ -597,7 +602,9 @@ computed exactly: they never wrap.
 A slice is a fat pointer `{ ptr: *T, len: usize }` with that exact layout (pointer first).
 The fields `.ptr` and `.len` are readable but not assignable. Every index `s[i]` is
 bounds-checked and traps when `i >= s.len` (§7.8). Through a `[]T`, elements are read-only.
-Through a `[]mut T`, they are readable and writable.
+Through a `[]mut T`, they are readable and writable. An empty slice literal `[]` takes its
+slice type from context (`E0502` otherwise) and produces a length-0 slice whose `.ptr` is
+`@ptr_from_int(*T, @align_of(T))` (non-zero, preserving the `?[]T` niche).
 
 ### 5.7 Raw pointers: `*T` and `*mut T`
 
@@ -733,7 +740,21 @@ pointer traps (`T0009`), which follows WASM `call_indirect` semantics.
 of `value` are unspecified. `S!T`, for a named error set `S` (§11.3), has the same layout
 and holds only the errors of `S`.
 
-### 5.13 The `error` type
+### 5.13 Optional types: `?T`
+
+`?T` holds either a value of type `T` (`.some(v)`) or nothing (`.none`). `T` cannot be
+`void` (`E0404`). `.none` takes its `?T` type from context (`E0502` without context);
+`.some(v)` takes its inner type from context or from `v` itself.
+
+`?T` has a deterministic layout with niche optimization:
+
+- `?*T`, `?*mut T`, and `?fn(…)`: pointer size and alignment; bit pattern `0` is `.none`.
+- `?bool`: 1 byte (`0` = `false`, `1` = `true`, `2` = `.none`).
+- `?[]T` and `?[]mut T`: two words (`{ ptr, len }`); `.ptr == 0` is `.none` (valid
+  slices, including `[]`, use non-zero aligned pointers).
+- All other `?T` (including `??T`): `struct { has: bool, value: T }`.
+
+### 5.14 The `error` type
 
 `error` is a 16-bit code. Code 0 is reserved and never names an error. Every name declared
 in any `error { … }` block in the program is assigned a distinct non-zero code (§11.1).
@@ -796,8 +817,9 @@ The following are the **only** conversions the compiler performs without being a
    the type as a whole: its float literals are rounded to it and its operations rounded as
    at run time (§7.7), so `let y: f32 = 16777216.0 + 1.0 + 1.0;` is 16777216 (an integer
    part such as `7 / 2` is evaluated exactly, as integers, first).
-2. **Mutability weakening.** `[]mut T → []T` and `*mut T → *T`.
-3. **Error-union wrapping.** A `T` or an `error` converts to `!T` in a `return` statement,
+2. **Mutability weakening.** `[]mut T → []T`, `*mut T → *T`, `?[]mut T → ?[]T`, and `?*mut T → ?*T`.
+3. **Optional wrapping.** A `T` converts implicitly to `?T` (when the target is `?T`, including `.some` wrapping).
+4. **Error-union wrapping.** A `T` or an `error` converts to `!T` in a `return` statement,
    an assignment, or an argument passed to a `!T` parameter.
 
 If an untyped literal has no contextual type, the compiler reports an error (`E0502`,
@@ -1086,7 +1108,21 @@ return some `!U` (`E0610`).
 `catch` applies to the whole `BinExpr` on its left, so `a + f() catch 0` is `E0150`.
 Write `a + (f() catch 0)`.
 
-### 7.13 Calls
+### 7.13 Optional unwrapping `??`
+
+`e ?? H` requires `e: ?T` (`E0614` otherwise) and evaluates to `T`. If `e` is `.some(v)`,
+the result is `v` and `H` is not evaluated. If `e` is `.none`, `H` runs:
+
+| Handler form | Result |
+|---|---|
+| `?? fallback` | Evaluates to `fallback`, which must have type `T` |
+| `?? return x` / `?? break` / `?? continue` | Leaves the function or enclosing loop |
+| `?? { … }` | Block must not complete normally (`return`, `break`, `continue`, or `@trap()`, `E0612`) |
+
+Like `catch`, `??` applies to the whole `BinExpr` on its left, so `a + opt ?? 0` is `E0150`;
+write `a + (opt ?? 0)`.
+
+### 7.14 Calls
 
 - `f(a, b)` calls a function or function pointer.
 - `Module.f(…)` and `Type.f(…)` call qualified functions.
@@ -1137,12 +1173,15 @@ chains are written as `else if …`.
 
 `if let P = e { A } else { B }` tests `e` against the patterns `P` of a `match` arm
 (§8.6): it is exactly `match e { P => { A } else => { B } }`, so the scrutinee and the
-patterns follow the rules of `match`, and a binding `.Variant(x)` is in scope in `A` only.
-The `else` part is optional, and may be another `if` or `if let`.
+patterns follow the rules of `match`, and a binding `.Variant(x)` or `.some(x)` is in
+scope in `A` only. The `else` part is optional, and may be another `if` or `if let`.
 
 ```axiom
 if let .Circle(c) = shape {
     total += c.radius;
+}
+if let .some(v) = opt {
+    total += v;
 }
 ```
 
@@ -1159,8 +1198,13 @@ reaches a `break` or `return`.
    the same integer type, which becomes the type of `i`. The body runs for
    `i = lo, lo+1, …, hi−1`. If `lo >= hi`, the body never runs. Inside the body, `i` is
    immutable.
-2. `for x in s { … }` evaluates `s` (an array place or a slice) once. The body runs with
-   `x` bound to a copy of each element in order. No bounds check is emitted.
+2. `for x in s { … }`, `for &x in s { … }`, and `for &mut x in s { … }` evaluate `s` (an
+   array or slice) once and iterate over its elements in order without bounds checks.
+   - `for x in s` binds `x: T` to a copy of each element.
+   - `for &x in s` binds `x: *T` pointing to each element in place (with zero copying).
+   - `for &mut x in s` binds `x: *mut T` pointing to each element; `s` must be `[]mut T`
+     or a mutable array place (`E0701` / `E0704` otherwise).
+   By-reference `for &` / `for &mut` is not allowed on ranges `lo..hi` (`E0706`).
 
 `break` and `continue` apply to the innermost loop, unless they name a label. A loop
 may be labeled, `rows: for r in 0..n { … }`, and `break rows;` or `continue rows;`
@@ -1171,20 +1215,28 @@ name means the inner loop. Naming no enclosing loop is `E0605`.
 
 ### 8.6 `match`
 
-The scrutinee of a `match` must be a union, an enum, an integer (character patterns are
-allowed for `u8`), `bool`, or `error`.
+The scrutinee of a `match` must be a union, an optional `?T`, a pointer `*U` or `*mut U`
+(where `U` is a union or `?T`), an enum, an integer (character patterns are allowed for
+`u8`), `bool`, or `error`.
 
 - **Union**: each arm is `.Variant` or `.Variant(name)`. `name` binds a copy of the
   payload.
+- **Optional (`?T`)**: each arm is `.none` or `.some` / `.some(name)`. `name` binds a
+  copy of the payload.
+- **Pointer to union or optional (`*U`, `*mut U`)**: arms use the same `.Variant` / `.none`
+  / `.some` patterns as `U`, and a payload binding `.Variant(p)` or `.some(p)` binds
+  `p: *Payload` (for `*U`) or `p: *mut Payload` (for `*mut U`) pointing directly into the
+  scrutinee without copying.
 - **Enum**: each arm is `.MEMBER`.
 - **Integer**, `bool`, or `error`: each arm is a literal or `error.Name`.
 - An arm may list several patterns, separated by commas: `.Sat, .Sun => { … }`. It is
   taken when any of them matches. Such an arm cannot bind a payload (`E0635`), and
   `else` stands alone.
 - Arms are tested in order. Each pattern may appear at most once (`E0631`).
-- The match must be **exhaustive** (`E0630`). A union or enum match must list every variant
-  (member) or end with `else`, and so must a match on a named error set (§11.3): every
-  error of the set. Integer and `error` matches always need `else`.
+- The match must be **exhaustive** (`E0630`). A union, optional, or enum match must list
+  every variant (`.none` and `.some` for `?T`) or end with `else`, and so must a match on
+  a named error set (§11.3): every error of the set. Integer and `error` matches always
+  need `else`.
 - An arm body is a block. Axiom has no fall-through.
 
 ```axiom
@@ -2333,8 +2385,8 @@ library (`--emit=shared`) holds C units only: the runtime is an executable's.
 | `i8` … `i64`, `u8` … `u64` | `int8_t` … `uint64_t` (`int` is `i32` on every supported target) |
 | `isize`, `usize` | `ptrdiff_t` / `long`, `size_t` / `unsigned long` |
 | `f32`, `f64`, `bool` | `float`, `double`, `bool` |
-| `*T`, `*mut T` | `const T *`, `T *` (`*void` is `const void *`) |
-| `fn(A, B) R` | `R (*)(A, B)` |
+| `*T`, `*mut T`, `?*T`, `?*mut T` | `const T *`, `T *` (`*void` / `?*void` is `const void *`, `.none` is `NULL`) |
+| `fn(A, B) R`, `?fn(A, B) R` | `R (*)(A, B)` (`.none` is `NULL`) |
 | SIMD types | `__attribute__((vector_size(16)))` vectors |
 
 **Structs cross the boundary by pointer, and by value.** Axiom's struct layout rules
@@ -2716,6 +2768,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0611 | `!` or `catch` on a value that is not an error union |
 | E0612 | `catch` block completes normally |
 | E0613 | `catch <value>` on `!void` |
+| E0614 | `'??'` on a value that is not an optional (`?T`) |
 | E0620 | Non-`void` result discarded |
 | E0621 | Error union discarded with `_ =` |
 | E0622 | Discarding a `void` expression |

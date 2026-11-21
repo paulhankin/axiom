@@ -291,6 +291,16 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
         let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: elem };
         return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
     }
+    if k == lx.TK_QUESTION {
+        _ = advance(P);
+        return ast.new_te(ast.TypeShape.Opt(parse_type(P)), sp_from(P, start));
+    }
+    if k == lx.TK_QQ {
+        _ = advance(P);
+        let inner_start = u.mkspan(start.file, start.start + 1, start.end);
+        let inner = ast.new_te(ast.TypeShape.Opt(parse_type(P)), sp_from(P, inner_start));
+        return ast.new_te(ast.TypeShape.Opt(inner), sp_from(P, start));
+    }
     if k == lx.TK_STAR {
         _ = advance(P);
         let is_mut = accept(P, lx.KW_MUT);
@@ -484,6 +494,26 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     }
     if k == lx.TK_DOT {
         _ = advance(P);
+        if pk(P) == lx.TK_LBRACE {
+            _ = advance(P);
+            let e = ast.new_expr(ast.E_STRUCT_LIT, start);
+            parse_field_inits(P, e);
+            e.span = sp_from(P, start);
+            return e;
+        }
+        if (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "none") {
+            _ = advance(P);
+            return ast.new_expr(ast.E_OPT_NONE, sp_from(P, start));
+        }
+        if (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "some") {
+            _ = advance(P);
+            _ = expect(P, lx.TK_LPAREN);
+            let e = ast.new_expr(ast.E_OPT_SOME, start);
+            e.a = parse_expr(P);
+            _ = expect(P, lx.TK_RPAREN);
+            e.span = sp_from(P, start);
+            return e;
+        }
         _ = expect(P, lx.TK_LBRACE);
         let e = ast.new_expr(ast.E_STRUCT_LIT, start);
         parse_field_inits(P, e);
@@ -492,6 +522,9 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     }
     if k == lx.TK_LBRACKET {
         _ = advance(P);
+        if accept(P, lx.TK_RBRACKET) {
+            return ast.new_expr(ast.E_EMPTY_SLICE, sp_from(P, start));
+        }
         let first = parse_expr(P);
         let mut e = u.nil.[ast.Expr]();
         if accept(P, lx.TK_SEMI) {
@@ -827,20 +860,27 @@ fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
 
 fn parse_expr(P: *mut Parser) *mut ast.Expr {
     let e = parse_binexpr(P);
-    if pk(P) != lx.KW_CATCH {
+    let is_catch = pk(P) == lx.KW_CATCH;
+    let is_orelse = pk(P) == lx.TK_QQ;
+    if not is_catch and not is_orelse {
         return e;
     }
     let start = e.span;
     if (e.kind == ast.E_BINARY) and not e.parens {
-        let d = dg.err(e.span, "E0150", u.f1("'catch' applies to the whole expression '... %s ...'; add parentheses",
-                                             lx.tok_kind_name(ast.op_of(e))));
-        let fx = dg.fix(d, "catch only the right operand", "suggestion");
+        let d = dg.err(e.span, "E0150", u.f2("'%s' applies to the whole expression '... %s ...'; add parentheses",
+                                             u.pick(is_orelse, "??", "catch"), lx.tok_kind_name(ast.op_of(e))));
+        let fx = dg.fix(d, u.pick(is_orelse, "unwrap only the right operand", "catch only the right operand"),
+                        "suggestion");
         dg.edit(fx, u.mkspan(ast.b_of(e).span.file, ast.b_of(e).span.start, ast.b_of(e).span.start), "(");
     }
     _ = advance(P);
-    let c = ast.new_expr(ast.E_CATCH, start);
+    let mut kind = ast.E_CATCH;
+    if is_orelse {
+        kind = ast.E_ORELSE;
+    }
+    let c = ast.new_expr(kind, start);
     c.a = e;
-    if accept(P, lx.TK_PIPE) {
+    if is_catch and accept(P, lx.TK_PIPE) {
         let id = expect_ident(P);
         ast.ext(c).capture = id.name;
         ast.ext(c).capture_span = id.span;
@@ -938,9 +978,14 @@ fn parse_pattern(P: *mut Parser, arm: *mut ast.MatchArm, allow_else: bool) bool 
     if accept(P, lx.TK_DOT) {
         let mut vp = ast.VariantPattern.{ name: expect_ident(P).name, bind: u.nosym(), bind_span: u.mkspan(0, 0, 0) };
         if accept(P, lx.TK_LPAREN) {
-            let id = expect_ident(P);
-            vp.bind = id.name;
-            vp.bind_span = id.span;
+            if accept(P, lx.TK_DISCARD) {
+                vp.bind = u.intern("_");
+                vp.bind_span = prev_span(P);
+            } else {
+                let id = expect_ident(P);
+                vp.bind = id.name;
+                vp.bind_span = id.span;
+            }
             _ = expect(P, lx.TK_RPAREN);
         }
         arm.pat = ast.Pattern.Variant(vp);
@@ -1125,6 +1170,10 @@ fn parse_stmt(P: *mut Parser) *mut ast.Stmt {
     if k == lx.KW_FOR {
         _ = advance(P);
         let s = ast.new_stmt(ast.S_FOR, start);
+        if accept(P, lx.TK_AMP) {
+            ast.stmt_ext(s).ref_iter = true;
+            ast.stmt_ext(s).ref_mut = accept(P, lx.KW_MUT);
+        }
         let id = expect_ident(P);
         s.name = id.name;
         s.name_span = id.span;

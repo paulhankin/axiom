@@ -483,6 +483,14 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
             }
             return spost.check_size(te.span, ty.type_errunion_set(e, set));
         }
+        .Opt(el) => {
+            let e = resolve_type(el, tc);
+            if e.kind == ast.TY_VOID {
+                _ = dg.err(te.span, "E0404", "optional element type cannot be void");
+                return ty.t_invalid;
+            }
+            return spost.check_size(te.span, ty.type_opt(e));
+        }
         .Ptr(pt) => { return ty.type_ptr(resolve_type(pt.elem, tc), pt.is_mut); }
         .Slice(pt) => {
             let e = resolve_type(pt.elem, tc);
@@ -713,6 +721,9 @@ fn boundary_type_ok(t: *ast.Type, is_ret: bool) bool {
     }
     if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_INVALID) {
         return true;
+    }
+    if k == ast.TY_OPT {
+        return ((t.elem.kind == ast.TY_PTR) or (t.elem.kind == ast.TY_FN)) and boundary_type_ok(t.elem, false);
     }
     if k == ast.TY_VOID {
         return is_ret;
@@ -1099,7 +1110,11 @@ fn fn_widens(s: *mut ast.Type, t: *mut ast.Type) bool {
 }
 
 // The error set an expected type asks for (nil: none, or any error).
-fn expected_set(t: *mut ast.Type) *mut ast.Decl {
+fn expected_set(t0: *mut ast.Type) *mut ast.Decl {
+    let mut t = t0;
+    while u.notnil(t) and (t.kind == ast.TY_OPT) {
+        t = t.elem;
+    }
     if u.notnil(t) and ((t.kind == ast.TY_ERROR) or (t.kind == ast.TY_ERRUNION)) {
         return t.decl;
     }
@@ -1216,7 +1231,7 @@ fn contains_by_value(t: *mut ast.Type, target: *mut ast.Decl, depth: i32) bool {
         return false;
     }
     let k = t.kind;
-    if (k == ast.TY_ARRAY) or (k == ast.TY_ERRUNION) {
+    if (k == ast.TY_ARRAY) or (k == ast.TY_ERRUNION) or (k == ast.TY_OPT) {
         return contains_by_value(t.elem, target, depth + 1);
     }
     if k == ast.TY_STRUCT {
@@ -1253,8 +1268,12 @@ fn is_const_init(e: *mut ast.Expr) bool {
         return true;
     }
     let k = e.kind;
-    if (k == ast.E_INT) or (k == ast.E_FLOAT) or (k == ast.E_BOOL) or (k == ast.E_STRING) or (k == ast.E_ERROR_VAL) {
+    if (k == ast.E_INT) or (k == ast.E_FLOAT) or (k == ast.E_BOOL) or (k == ast.E_STRING) or (k == ast.E_ERROR_VAL) or
+       (k == ast.E_OPT_NONE) or (k == ast.E_EMPTY_SLICE) {
         return true;
+    }
+    if k == ast.E_OPT_SOME {
+        return is_const_init(e.a);
     }
     if k == ast.E_CONV {
         return is_const_init(e.a);
@@ -1431,6 +1450,19 @@ pub fn const_f32(e: *mut ast.Expr) f32 {
     return @float_cast(f32, ast.fval_of(e));
 }
 
+fn can_take_untyped_float(t: *ast.Type) bool {
+    if t.kind == ast.TY_FLOAT {
+        return true;
+    }
+    if (t.kind == ast.TY_PARAM) and not t.is_const {
+        return true;
+    }
+    if (t.kind == ast.TY_OPT) or (t.kind == ast.TY_ERRUNION) {
+        return can_take_untyped_float(t.elem);
+    }
+    return false;
+}
+
 fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
     let e = pe.*;
     let s = e.ty;
@@ -1477,6 +1509,11 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
             pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
             return;
         }
+        if target.kind == ast.TY_OPT {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
+            return;
+        }
         type_mismatch(e, target, s);
         e.ty = ty.t_invalid;
         return;
@@ -1502,6 +1539,11 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
             pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
             return;
         }
+        if (target.kind == ast.TY_OPT) and can_take_untyped_float(target.elem) {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
+            return;
+        }
         type_mismatch(e, target, s);
         e.ty = ty.t_invalid;
         return;
@@ -1509,6 +1551,12 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
     // mutability weakening
     if ((s.kind == ast.TY_SLICE) or (s.kind == ast.TY_PTR)) and (target.kind == s.kind) and s.is_mut and
        not target.is_mut and (s.elem == target.elem) {
+        pe.* = mkconv(e, ast.CONV_NOOP, target);
+        return;
+    }
+    if (s.kind == ast.TY_OPT) and (target.kind == ast.TY_OPT) and
+       ((s.elem.kind == ast.TY_SLICE) or (s.elem.kind == ast.TY_PTR)) and (target.elem.kind == s.elem.kind) and
+       s.elem.is_mut and not target.elem.is_mut and (s.elem.elem == target.elem.elem) {
         pe.* = mkconv(e, ast.CONV_NOOP, target);
         return;
     }
@@ -1542,6 +1590,22 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
             coerce(pe, target.elem);
             if (pe.*.ty == target.elem) or (pe.*.ty.kind == ast.TY_INVALID) {
                 pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
+                pe.*.ty = target;
+            }
+            return;
+        }
+    }
+    if target.kind == ast.TY_OPT {
+        let can_wrap = ((s.kind != ast.TY_OPT) or (target.elem.kind == ast.TY_OPT) or
+                        (target.elem.kind == ast.TY_ERRUNION)) and
+                       ((s.kind != ast.TY_ERRUNION) or (target.elem.kind == ast.TY_ERRUNION) or
+                        (target.elem.kind == ast.TY_OPT)) and
+                       ((s.kind != ast.TY_ERROR) or (target.elem.kind == ast.TY_ERROR) or
+                        (target.elem.kind == ast.TY_ERRUNION) or (target.elem.kind == ast.TY_OPT));
+        if can_wrap {
+            coerce(pe, target.elem);
+            if (pe.*.ty == target.elem) or (pe.*.ty.kind == ast.TY_INVALID) {
+                pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
                 pe.*.ty = target;
             }
             return;
@@ -2125,7 +2189,7 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if cmp {
         hint = tnil();
     }
-    if u.notnil(hint) and (hint.kind == ast.TY_ERRUNION) {
+    while u.notnil(hint) and ((hint.kind == ast.TY_ERRUNION) or (hint.kind == ast.TY_OPT)) {
         hint = hint.elem;
     }
     let l = check_expr(e.a, hint);
@@ -2269,7 +2333,7 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if op == lx.TK_MINUS {
         let mut hint = tnil();
-        if u.notnil(expected) and (expected.kind != ast.TY_ERRUNION) {
+        if u.notnil(expected) and (expected.kind != ast.TY_ERRUNION) and (expected.kind != ast.TY_OPT) {
             hint = expected;
         }
         let t = check_expr(e.a, hint);
@@ -2311,10 +2375,14 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         return set_ty(e, ty.t_invalid);
     }
     if (op == lx.TK_MINUS_PCT) or (op == lx.TK_TILDE) {
-        let mut t = check_expr(e.a, expected);
+        let mut hint = expected;
+        while u.notnil(hint) and ((hint.kind == ast.TY_ERRUNION) or (hint.kind == ast.TY_OPT)) {
+            hint = hint.elem;
+        }
+        let mut t = check_expr(e.a, hint);
         if ty.is_untyped(t) {
-            if u.notnil(expected) and ((expected.kind == ast.TY_INT) or (expected.kind == ast.TY_PARAM)) {
-                coerce(&mut e.a, expected);
+            if u.notnil(hint) and ((hint.kind == ast.TY_INT) or (hint.kind == ast.TY_PARAM)) {
+                coerce(&mut e.a, hint);
                 t = e.a.ty;
             } else {
                 _ = sb.finalize_untyped(&mut e.a);
@@ -2697,6 +2765,12 @@ fn unify(pat: *mut ast.Type, act: *mut ast.Type, vars: []mut *mut ast.Type, sol:
         }
         return unify(pat.elem, act, vars, sol);
     }
+    if k == ast.TY_OPT {
+        if act.kind == ast.TY_OPT {
+            return unify(pat.elem, act.elem, vars, sol);
+        }
+        return unify(pat.elem, act, vars, sol);
+    }
     if k == ast.TY_ARRAY {
         if act.kind != ast.TY_ARRAY {
             return true;
@@ -2769,7 +2843,8 @@ fn check_vararg(pe: *mut *mut ast.Expr) void {
         return;
     }
     let ok = ((t.kind == ast.TY_INT) and (t.bits >= 32)) or ((t.kind == ast.TY_FLOAT) and (t.bits == 64)) or
-             (t.kind == ast.TY_PTR) or (t.kind == ast.TY_FN) or (t.kind == ast.TY_INVALID);
+             (t.kind == ast.TY_PTR) or (t.kind == ast.TY_FN) or (t.kind == ast.TY_INVALID) or
+             ((t.kind == ast.TY_OPT) and ((t.elem.kind == ast.TY_PTR) or (t.elem.kind == ast.TY_FN)));
     if ok {
         return;
     }
@@ -3087,8 +3162,8 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
     } else if u.notnil(expected) {
         let mut x = expected;
-        if expected.kind == ast.TY_ERRUNION {
-            x = expected.elem;
+        while u.notnil(x) and ((x.kind == ast.TY_ERRUNION) or (x.kind == ast.TY_OPT)) {
+            x = x.elem;
         }
         if x.kind == ast.TY_STRUCT {
             t = x;
@@ -3188,8 +3263,8 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
 
 fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let mut x = expected;
-    if u.notnil(expected) and (expected.kind == ast.TY_ERRUNION) {
-        x = expected.elem;
+    while u.notnil(x) and ((x.kind == ast.TY_ERRUNION) or (x.kind == ast.TY_OPT)) {
+        x = x.elem;
     }
     let mut elem = tnil();
     if u.notnil(x) and (x.kind == ast.TY_ARRAY) {
@@ -3308,7 +3383,7 @@ fn place_local(e: *mut ast.Expr) *mut ast.Local {
 // §12.2: W0710).
 fn check_escape(e0: *mut ast.Expr) void {
     let mut e = e0;
-    while e.kind == ast.E_CONV {
+    while (e.kind == ast.E_CONV) or (e.kind == ast.E_OPT_SOME) {
         e = e.a;
     }
     if u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
@@ -3376,6 +3451,104 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
         }
     }
     scope_pop();
+    e.ty = vt;
+    return e.ty;
+}
+
+fn opt_target(expected: *mut ast.Type) *mut ast.Type {
+    let mut e = expected;
+    if u.notnil(e) and (e.kind == ast.TY_ERRUNION) {
+        e = e.elem;
+    }
+    if u.notnil(e) and (e.kind == ast.TY_OPT) {
+        return e;
+    }
+    return tnil();
+}
+
+fn check_opt_none(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let t = opt_target(expected);
+    if u.notnil(t) {
+        return set_ty(e, t);
+    }
+    _ = dg.err(e.span, "E0502", "cannot infer the type of '.none'; add a type annotation");
+    return set_ty(e, ty.t_invalid);
+}
+
+fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let t = opt_target(expected);
+    if u.notnil(t) {
+        _ = check_expr_to(&mut e.a, t.elem);
+        if t.elem.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, t);
+    }
+    let mut it = check_expr(e.a, tnil());
+    if ty.is_untyped(it) {
+        it = sb.finalize_untyped(&mut e.a);
+    }
+    if it.kind == ast.TY_INVALID {
+        return set_ty(e, ty.t_invalid);
+    }
+    if it.kind == ast.TY_NEVER {
+        return set_ty(e, ty.t_never);
+    }
+    if it.kind == ast.TY_VOID {
+        _ = dg.err(e.a.span, "E0404", "optional element type cannot be void");
+        return set_ty(e, ty.t_invalid);
+    }
+    return set_ty(e, ty.type_opt(it));
+}
+
+fn check_empty_slice(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let mut t = expected;
+    while u.notnil(t) and ((t.kind == ast.TY_ERRUNION) or (t.kind == ast.TY_OPT)) {
+        t = t.elem;
+    }
+    if u.notnil(t) and (t.kind == ast.TY_SLICE) {
+        return set_ty(e, t);
+    }
+    _ = dg.err(e.span, "E0502", "cannot infer the element type of empty slice '[]'; add a type annotation");
+    return set_ty(e, ty.t_invalid);
+}
+
+fn check_orelse(e: *mut ast.Expr) *mut ast.Type {
+    let mut t = check_expr(e.a, tnil());
+    if ty.is_untyped(t) {
+        t = sb.finalize_untyped(&mut e.a);
+    }
+    let mut vt = ty.t_invalid;
+    if t.kind == ast.TY_OPT {
+        vt = t.elem;
+    } else if t.kind != ast.TY_INVALID {
+        _ = dg.err(e.a.span, "E0614", u.f1("'??' requires an optional (?T), found %s", tstr(t)));
+    }
+    match ast.more(e).handler {
+        .Value(h) => {
+            let mut x = h;
+            _ = check_expr_to(&mut x, vt);
+            ast.ext(e).handler = ast.Handler.Value(x);
+        }
+        .Return(h) => {
+            let mut x = h;
+            if u.notnil(x) {
+                check_return_value(&mut x, e.span);
+            } else {
+                check_return_value(u.nil.[*mut ast.Expr](), e.span);
+            }
+            ast.ext(e).handler = ast.Handler.Return(x);
+        }
+        .Break    => { check_catch_jump(e, true); }
+        .Continue => { check_catch_jump(e, false); }
+        .Block(blk) => {
+            if not check_block(blk) and (vt.kind != ast.TY_INVALID) {
+                _ = dg.err(blk.span, "E0612",
+                           u.f1("this '??' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use '?? <value>')",
+                                tstr(vt)));
+            }
+        }
+    }
     e.ty = vt;
     return e.ty;
 }
@@ -3550,10 +3723,14 @@ fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             }
             return set_ty(e, ty.type_errset(set));
         }
-        .BUILTIN => { return sb.builtin_check(e, expected); }
-        .UNARY   => { return check_unary(e, expected); }
-        .BINARY  => { return check_binary(e, expected); }
-        .CATCH   => { return check_catch(e); }
+        .BUILTIN     => { return sb.builtin_check(e, expected); }
+        .UNARY       => { return check_unary(e, expected); }
+        .BINARY      => { return check_binary(e, expected); }
+        .CATCH       => { return check_catch(e); }
+        .OPT_NONE    => { return check_opt_none(e, expected); }
+        .OPT_SOME    => { return check_opt_some(e, expected); }
+        .ORELSE      => { return check_orelse(e); }
+        .EMPTY_SLICE => { return check_empty_slice(e, expected); }
         .FIELD => {
             _ = check_field(e);
             return e.ty;
@@ -3677,7 +3854,7 @@ fn check_block(b: *mut ast.Stmt) bool {
 }
 
 fn is_leaving_catch(e: *mut ast.Expr) bool {
-    if u.isnil(e) or (e.kind != ast.E_CATCH) {
+    if u.isnil(e) or ((e.kind != ast.E_CATCH) and (e.kind != ast.E_ORELSE)) {
         return false;
     }
     match ast.more(e).handler {
@@ -3790,7 +3967,7 @@ fn check_assign(s: *mut ast.Stmt) void {
 
 // The arms of a match on a union or enum (t): its variants or members, each at
 // most once, all of them unless there is an else. Whether every arm diverges.
-fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
+fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut: bool) bool {
     let mut all_div = true;
     let mut has_else = false;
     let narms = ast.stmt_more(s).arms.len;
@@ -3827,10 +4004,17 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
                             _ = dg.err(p.bind_span, "E0633",
                                        u.f2("%s '%s' has no payload to bind", u.pick(is_enum, "enum member", "variant"),
                                             p.name));
-                        } else if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
-                            _ = dg.err(p.bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
-                        } else {
-                            a.bind_local = declare_local(p.bind, p.bind_span, pt, false, false);
+                        } else if not u.str_eq(p.bind, "_") {
+                            if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
+                                _ = dg.err(p.bind_span, "E0635",
+                                           "a match arm with several patterns cannot bind a payload");
+                            } else {
+                                let mut bt = pt;
+                                if by_ref {
+                                    bt = ty.type_ptr(pt, ref_mut);
+                                }
+                                a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                            }
                         }
                     }
                 }
@@ -3863,6 +4047,75 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
         let ms = missing.done();
         if nm != 0 {
             _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+        }
+    }
+    return all_div;
+}
+
+fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut: bool) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let mut seen_none = false;
+    let mut seen_some = false;
+    let narms = ast.stmt_more(s).arms.len;
+    for i in 0..narms {
+        let a = ast.stmt_more(s).arms.at(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        match a.pat {
+            .Else => { has_else = true; }
+            .Variant(p) => {
+                if u.str_eq(p.name, "none") {
+                    a.variant = 0;
+                    a.value = u.I128.zero();
+                    if seen_none {
+                        _ = dg.err(a.span, "E0631", "variant 'none' is matched more than once");
+                    }
+                    seen_none = true;
+                    if not u.isnos(p.bind) {
+                        _ = dg.err(p.bind_span, "E0633", "variant 'none' has no payload to bind");
+                    }
+                } else if u.str_eq(p.name, "some") {
+                    a.variant = 1;
+                    a.value = u.I128.of(1);
+                    if seen_some {
+                        _ = dg.err(a.span, "E0631", "variant 'some' is matched more than once");
+                    }
+                    seen_some = true;
+                    if not u.isnos(p.bind) and not u.str_eq(p.bind, "_") {
+                        if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
+                            _ = dg.err(p.bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
+                        } else {
+                            let mut bt = base.elem;
+                            if by_ref {
+                                bt = ty.type_ptr(base.elem, ref_mut);
+                            }
+                            a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                        }
+                    }
+                } else {
+                    _ = dg.err(a.span, "E0632", u.f2("%s has no variant '%s' (expected 'none' or 'some')", tstr(base),
+                                                     p.name));
+                }
+            }
+            else => {
+                _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of optional type %s", tstr(base)));
+            }
+        }
+        if not a.alt and not check_block(a.body) {
+            all_div = false;
+        }
+        scope_pop();
+    }
+    if not has_else {
+        if not seen_none and not seen_some {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .none, .some");
+        } else if not seen_none {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .none");
+        } else if not seen_some {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .some");
         }
     }
     return all_div;
@@ -3990,16 +4243,26 @@ fn check_match(s: *mut ast.Stmt) bool {
     if ty.is_untyped(t) {
         t = sb.finalize_untyped(&mut s.e);
     }
+    let mut base = t;
+    let mut by_ref = false;
+    let mut ref_mut = false;
+    if (t.kind == ast.TY_PTR) and ((t.elem.kind == ast.TY_UNION) or (t.elem.kind == ast.TY_OPT)) {
+        base = t.elem;
+        by_ref = true;
+        ref_mut = t.is_mut;
+    }
     let narms = ast.stmt_more(s).arms.len;
     let mut all_div = false;
-    if (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM) {
-        all_div = check_variant_match(s, t);
+    if (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM) {
+        all_div = check_variant_match(s, base, by_ref, ref_mut);
+    } else if base.kind == ast.TY_OPT {
+        all_div = check_opt_match(s, base, by_ref, ref_mut);
     } else if (t.kind == ast.TY_INT) or (t.kind == ast.TY_BOOL) or (t.kind == ast.TY_ERROR) {
         all_div = check_value_match(s, t);
     } else {
         if t.kind != ast.TY_INVALID {
             _ = dg.err(s.e.span, "E0634",
-                       u.f1("cannot match on a value of type %s (only unions, enums, integers, bool and error)",
+                       u.f1("cannot match on a value of type %s (only unions, optionals, *union, *optional, enums, integers, bool and error)",
                             tstr(t)));
         }
         for i in 0..narms {
@@ -4159,43 +4422,74 @@ fn check_expr_stmt(s: *mut ast.Stmt) bool {
     return false;
 }
 
-// for x in a..b / for x in xs
+// for x in a..b / for x in xs / for &x in xs / for &mut x in xs
 fn check_for(s: *mut ast.Stmt) void {
+    let ref_iter = ast.stmt_more(s).ref_iter;
+    let ref_mut = ast.stmt_more(s).ref_mut;
     let mut vt = tnil();
     if u.notnil(s.e2) {
-        let mut a = check_expr(s.e, tnil());
-        let mut bh = a;
-        if ty.is_untyped(a) {
-            bh = tnil();
+        if ref_iter {
+            _ = dg.err(s.span, "E0706", "by-reference 'for &' cannot iterate over a range");
+            _ = check_expr(s.e, tnil());
+            _ = check_expr(s.e2, tnil());
+            vt = ty.t_invalid;
+        } else {
+            let mut a = check_expr(s.e, tnil());
+            let mut bh = a;
+            if ty.is_untyped(a) {
+                bh = tnil();
+            }
+            let mut b = check_expr(s.e2, bh);
+            if ty.is_untyped(a) and not ty.is_untyped(b) {
+                coerce(&mut s.e, b);
+                a = b;
+            } else if not ty.is_untyped(a) and ty.is_untyped(b) {
+                coerce(&mut s.e2, a);
+                b = a;
+            } else if ty.is_untyped(a) and ty.is_untyped(b) {
+                _ = dg.err(s.e.span, "E0502",
+                           "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
+                a = ty.t_invalid;
+                b = ty.t_invalid;
+            }
+            if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
+                let d = dg.err(s.e2.span, "E0412", u.f2("range bounds have different types: %s and %s", tstr(a),
+                                                        tstr(b)));
+                dg.set_types(d, tstr(a), tstr(b));
+            }
+            if (a.kind != ast.TY_INT) and (a.kind != ast.TY_INVALID) and
+               not ((a.kind == ast.TY_PARAM) and ty.satisfies(a, ast.C_INT)) {
+                _ = dg.err(s.e.span, "E0412", u.f1("range bounds must be integers, found %s", tstr(a)));
+            }
+            vt = a;
         }
-        let mut b = check_expr(s.e2, bh);
-        if ty.is_untyped(a) and not ty.is_untyped(b) {
-            coerce(&mut s.e, b);
-            a = b;
-        } else if not ty.is_untyped(a) and ty.is_untyped(b) {
-            coerce(&mut s.e2, a);
-            b = a;
-        } else if ty.is_untyped(a) and ty.is_untyped(b) {
-            _ = dg.err(s.e.span, "E0502",
-                       "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
-            a = ty.t_invalid;
-            b = ty.t_invalid;
-        }
-        if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
-            let d = dg.err(s.e2.span, "E0412", u.f2("range bounds have different types: %s and %s", tstr(a), tstr(b)));
-            dg.set_types(d, tstr(a), tstr(b));
-        }
-        if (a.kind != ast.TY_INT) and (a.kind != ast.TY_INVALID) and
-           not ((a.kind == ast.TY_PARAM) and ty.satisfies(a, ast.C_INT)) {
-            _ = dg.err(s.e.span, "E0412", u.f1("range bounds must be integers, found %s", tstr(a)));
-        }
-        vt = a;
     } else {
         let t = check_expr(s.e, tnil());
         if t.kind == ast.TY_ARRAY {
-            vt = t.elem;
+            if ref_iter {
+                if ref_mut {
+                    if not is_place(s.e) {
+                        _ = dg.err(s.e.span, "E0703", "'&mut' cannot take the address of a temporary");
+                    } else if not is_mut_place(s.e) {
+                        _ = dg.err(s.e.span, "E0701", "cannot take '*mut' elements from an immutable array");
+                    }
+                }
+                if is_place(s.e) {
+                    mark_addr_taken(s.e);
+                }
+                vt = ty.type_ptr(t.elem, ref_mut);
+            } else {
+                vt = t.elem;
+            }
         } else if t.kind == ast.TY_SLICE {
-            vt = t.elem;
+            if ref_iter {
+                if ref_mut and not t.is_mut {
+                    _ = dg.err(s.e.span, "E0701", u.f1("cannot take '*mut' elements from immutable slice %s", tstr(t)));
+                }
+                vt = ty.type_ptr(t.elem, ref_mut);
+            } else {
+                vt = t.elem;
+            }
         } else {
             if t.kind != ast.TY_INVALID {
                 _ = dg.err(s.e.span, "E0412",
