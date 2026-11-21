@@ -150,13 +150,22 @@ pub struct Vec[T] {
         return x;
     }
 
-    pub fn sort(self: *mut Self, less: fn(T, T) bool) void {
-        sort(self.buf[..self.len], less);
+    pub fn sort[const LESS: fn(T, T) bool](self: *mut Self) void {
+        sort.[T, LESS](self.buf[..self.len]);
+    }
+
+    pub fn sort_dyn(self: *mut Self, less: fn(T, T) bool) void {
+        sort_dyn.[T](self.buf[..self.len], less);
     }
 
     /// Sorts keeping equal elements in order (allocates scratch memory).
-    pub fn sort_stable(self: *mut Self, less: fn(T, T) bool) VecError!void {
-        sort_stable(self.buf[..self.len], less)!;
+    pub fn sort_stable[const LESS: fn(T, T) bool](self: *mut Self) VecError!void {
+        sort_stable.[T, LESS](self.buf[..self.len])!;
+    }
+
+    /// Sorts keeping equal elements in order using a runtime comparator.
+    pub fn sort_stable_dyn(self: *mut Self, less: fn(T, T) bool) VecError!void {
+        sort_stable_dyn.[T](self.buf[..self.len], less)!;
     }
 }
 
@@ -166,11 +175,29 @@ pub struct Vec[T] {
 
 // The sorts take a context value passed to every comparison (`ctx`), so a
 // comparison can depend on data outside the elements (sort indices by the
-// keys they point at, a collation, a direction). `sort(xs, less)` is
-// `sort_with(xs, less, ...)` with the function itself as the context.
+// keys they point at, a collation, a direction). `sort` calls `sort_with`
+// with a dummy context, and `*_dyn` wraps the runtime comparator in a
+// small context struct.
 
-fn plain_less[T](f: fn(T, T) bool, a: T, b: T) bool {
-    return f(a, b);
+struct DynLess[T] {
+    f: fn(T, T) bool,
+}
+
+struct DynCtxLess[C, T] {
+    ctx: C,
+    f: fn(C, T, T) bool,
+}
+
+inline fn call_plain[T, const LESS: fn(T, T) bool](_ctx: u8, a: T, b: T) bool {
+    return LESS(a, b);
+}
+
+inline fn call_dyn[T](d: DynLess.[T], a: T, b: T) bool {
+    return d.f(a, b);
+}
+
+inline fn call_dyn_ctx[C, T](d: DynCtxLess.[C, T], a: T, b: T) bool {
+    return d.f(d.ctx, a, b);
 }
 
 fn swap[T](xs: []mut T, i: usize, j: usize) void {
@@ -179,7 +206,7 @@ fn swap[T](xs: []mut T, i: usize, j: usize) void {
     xs[j] = tmp;
 }
 
-fn sift_down[T, C](xs: []mut T, start: usize, end: usize, ctx: C, less: fn(C, T, T) bool) void {
+fn sift_down[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, start: usize, end: usize, ctx: C) void {
     let mut root = start;
     loop {
         let child = (2 * root) + 1;
@@ -187,10 +214,10 @@ fn sift_down[T, C](xs: []mut T, start: usize, end: usize, ctx: C, less: fn(C, T,
             return;
         }
         let mut top = root;
-        if less(ctx, xs[top], xs[child]) {
+        if LESS(ctx, xs[top], xs[child]) {
             top = child;
         }
-        if ((child + 1) < end) and less(ctx, xs[top], xs[child + 1]) {
+        if ((child + 1) < end) and LESS(ctx, xs[top], xs[child + 1]) {
             top = child + 1;
         }
         if top == root {
@@ -201,27 +228,27 @@ fn sift_down[T, C](xs: []mut T, start: usize, end: usize, ctx: C, less: fn(C, T,
     }
 }
 
-fn heapsort[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) void {
+fn heapsort[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, ctx: C) void {
     let n = xs.len;
     let mut start = n / 2;
     while start > 0 {
         start -= 1;
-        sift_down(xs, start, n, ctx, less);
+        sift_down.[T, C, LESS](xs, start, n, ctx);
     }
     let mut end = n;
     while end > 1 {
         end -= 1;
         swap(xs, 0, end);
-        sift_down(xs, 0, end, ctx, less);
+        sift_down.[T, C, LESS](xs, 0, end, ctx);
     }
 }
 
 // Stable: an element moves left only past greater ones.
-fn insertion_sort[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) void {
+fn insertion_sort[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, ctx: C) void {
     for i in @as(usize, 1)..xs.len {
         let x = xs[i];
         let mut j = i;
-        while (j > 0) and less(ctx, x, xs[j - 1]) {
+        while (j > 0) and LESS(ctx, x, xs[j - 1]) {
             xs[j] = xs[j - 1];
             j -= 1;
         }
@@ -229,49 +256,58 @@ fn insertion_sort[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) void {
     }
 }
 
-/// Sorts in place in O(n log n), not stable: `sort_with` with the function
-/// as its own context.
-pub fn sort[T](xs: []mut T, less: fn(T, T) bool) void {
-    sort_with(xs, less, plain_less.[T]);
+/// Sorts in place in O(n log n), not stable.
+pub fn sort[T, const LESS: fn(T, T) bool](xs: []mut T) void {
+    sort_with.[T, u8, call_plain.[T, LESS]](xs, 0);
+}
+
+/// Sorts in place in O(n log n) using a runtime comparator, not stable.
+pub fn sort_dyn[T](xs: []mut T, less: fn(T, T) bool) void {
+    sort_with.[T, DynLess.[T], call_dyn.[T]](xs, DynLess.[T].{ f: less });
 }
 
 /// Sorts in place in O(n log n) time and no extra memory, not stable
 /// (introsort: quicksort on a median of three, heapsort past a depth of
-/// 2 log2 n, insertion sort for short ranges). `less(ctx, a, b)` must be a
+/// 2 log2 n, insertion sort for short ranges). `LESS(ctx, a, b)` must be a
 /// strict weak order.
-pub fn sort_with[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) void {
+pub fn sort_with[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, ctx: C) void {
     let mut depth: usize = 0;
     let mut n = xs.len;
     while n > 1 {
         depth += 2;
         n >>= 1;
     }
-    introsort(xs, ctx, less, depth);
+    introsort.[T, C, LESS](xs, ctx, depth);
 }
 
-fn introsort[T, C](all: []mut T, ctx: C, less: fn(C, T, T) bool, max_depth: usize) void {
+/// `sort_with` using a runtime comparator.
+pub fn sort_with_dyn[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) void {
+    sort_with.[T, DynCtxLess.[C, T], call_dyn_ctx.[C, T]](xs, DynCtxLess.[C, T].{ ctx: ctx, f: less });
+}
+
+fn introsort[T, C, const LESS: fn(C, T, T) bool](all: []mut T, ctx: C, max_depth: usize) void {
     let mut xs = all;
     let mut depth = max_depth;
     loop {
         let n = xs.len;
         if n <= 16 {
-            insertion_sort(xs, ctx, less);
+            insertion_sort.[T, C, LESS](xs, ctx);
             return;
         }
         if depth == 0 {
-            heapsort(xs, ctx, less);
+            heapsort.[T, C, LESS](xs, ctx);
             return;
         }
         depth -= 1;
         // The median of the first, middle and last elements is the pivot;
         // the other two bound the scans below.
         let m = n / 2;
-        if less(ctx, xs[m], xs[0]) {
+        if LESS(ctx, xs[m], xs[0]) {
             swap(xs, m, 0);
         }
-        if less(ctx, xs[n - 1], xs[m]) {
+        if LESS(ctx, xs[n - 1], xs[m]) {
             swap(xs, n - 1, m);
-            if less(ctx, xs[m], xs[0]) {
+            if LESS(ctx, xs[m], xs[0]) {
                 swap(xs, m, 0);
             }
         }
@@ -279,10 +315,10 @@ fn introsort[T, C](all: []mut T, ctx: C, less: fn(C, T, T) bool, max_depth: usiz
         let mut i: usize = 0;
         let mut j = n - 1;
         loop {
-            while less(ctx, xs[i], p) {
+            while LESS(ctx, xs[i], p) {
                 i += 1;
             }
-            while less(ctx, p, xs[j]) {
+            while LESS(ctx, p, xs[j]) {
                 j -= 1;
             }
             if i >= j {
@@ -296,10 +332,10 @@ fn introsort[T, C](all: []mut T, ctx: C, less: fn(C, T, T) bool, max_depth: usiz
         // smaller part and loop on the larger, so the stack stays O(log n).
         let split = j + 1;
         if split < (n - split) {
-            introsort(xs[..split], ctx, less, depth);
+            introsort.[T, C, LESS](xs[..split], ctx, depth);
             xs = xs[split..];
         } else {
-            introsort(xs[split..], ctx, less, depth);
+            introsort.[T, C, LESS](xs[split..], ctx, depth);
             xs = xs[..split];
         }
     }
@@ -307,32 +343,42 @@ fn introsort[T, C](all: []mut T, ctx: C, less: fn(C, T, T) bool, max_depth: usiz
 
 /// Sorts in place keeping equal elements in their order (merge sort,
 /// O(n log n)); allocates n / 2 elements of scratch memory.
-pub fn sort_stable[T](xs: []mut T, less: fn(T, T) bool) VecError!void {
-    sort_stable_with(xs, less, plain_less.[T])!;
+pub fn sort_stable[T, const LESS: fn(T, T) bool](xs: []mut T) VecError!void {
+    sort_stable_with.[T, u8, call_plain.[T, LESS]](xs, 0)!;
+}
+
+/// `sort_stable` using a runtime comparator.
+pub fn sort_stable_dyn[T](xs: []mut T, less: fn(T, T) bool) VecError!void {
+    sort_stable_with.[T, DynLess.[T], call_dyn.[T]](xs, DynLess.[T].{ f: less })!;
 }
 
 /// sort_stable with a context passed to every comparison.
-pub fn sort_stable_with[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) VecError!void {
+pub fn sort_stable_with[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, ctx: C) VecError!void {
     if xs.len <= 16 {
-        insertion_sort(xs, ctx, less);
+        insertion_sort.[T, C, LESS](xs, ctx);
         return;
     }
     let buf = mem.alloc.[T]((xs.len + 1) / 2)!;
     defer mem.free(buf);
-    merge_sort(xs, buf, ctx, less);
+    merge_sort.[T, C, LESS](xs, buf, ctx);
+}
+
+/// `sort_stable_with` using a runtime comparator.
+pub fn sort_stable_with_dyn[T, C](xs: []mut T, ctx: C, less: fn(C, T, T) bool) VecError!void {
+    sort_stable_with.[T, DynCtxLess.[C, T], call_dyn_ctx.[C, T]](xs, DynCtxLess.[C, T].{ ctx: ctx, f: less })!;
 }
 
 // Sorts xs using buf (at least half as long) for the left halves.
-fn merge_sort[T, C](xs: []mut T, buf: []mut T, ctx: C, less: fn(C, T, T) bool) void {
+fn merge_sort[T, C, const LESS: fn(C, T, T) bool](xs: []mut T, buf: []mut T, ctx: C) void {
     let n = xs.len;
     if n <= 16 {
-        insertion_sort(xs, ctx, less);
+        insertion_sort.[T, C, LESS](xs, ctx);
         return;
     }
     let mid = n / 2;
-    merge_sort(xs[..mid], buf, ctx, less);
-    merge_sort(xs[mid..], buf, ctx, less);
-    if not less(ctx, xs[mid], xs[mid - 1]) {
+    merge_sort.[T, C, LESS](xs[..mid], buf, ctx);
+    merge_sort.[T, C, LESS](xs[mid..], buf, ctx);
+    if not LESS(ctx, xs[mid], xs[mid - 1]) {
         return;  // already in order
     }
     // Merge: the left half moves to buf, then the two are merged back into
@@ -342,7 +388,7 @@ fn merge_sort[T, C](xs: []mut T, buf: []mut T, ctx: C, less: fn(C, T, T) bool) v
     let mut j = mid;
     let mut k: usize = 0;
     while (i < mid) and (j < n) {
-        if less(ctx, xs[j], buf[i]) {
+        if LESS(ctx, xs[j], buf[i]) {
             xs[k] = xs[j];
             j += 1;
         } else {
@@ -358,25 +404,32 @@ fn merge_sort[T, C](xs: []mut T, buf: []mut T, ctx: C, less: fn(C, T, T) bool) v
     }
 }
 
-/// Whether xs is in order under `less` (no element less than the one
-/// before it).
-pub fn is_sorted[T](xs: []T, less: fn(T, T) bool) bool {
+fn is_sorted_ctx[T, C, const LESS: fn(C, T, T) bool](xs: []T, ctx: C) bool {
     for i in @as(usize, 1)..xs.len {
-        if less(xs[i], xs[i - 1]) {
+        if LESS(ctx, xs[i], xs[i - 1]) {
             return false;
         }
     }
     return true;
 }
 
-/// In a slice sorted by `less`, the index of the first element not less
-/// than x (xs.len if there is none): where x would be inserted first.
-pub fn lower_bound[T](xs: []T, x: T, less: fn(T, T) bool) usize {
+/// Whether xs is in order under `LESS` (no element less than the one
+/// before it).
+pub fn is_sorted[T, const LESS: fn(T, T) bool](xs: []T) bool {
+    return is_sorted_ctx.[T, u8, call_plain.[T, LESS]](xs, 0);
+}
+
+/// Whether xs is in order under `less`.
+pub fn is_sorted_dyn[T](xs: []T, less: fn(T, T) bool) bool {
+    return is_sorted_ctx.[T, DynLess.[T], call_dyn.[T]](xs, DynLess.[T].{ f: less });
+}
+
+fn lower_bound_ctx[T, C, const LESS: fn(C, T, T) bool](xs: []T, x: T, ctx: C) usize {
     let mut lo: usize = 0;
     let mut hi = xs.len;
     while lo < hi {
         let mid = lo + ((hi - lo) / 2);
-        if less(xs[mid], x) {
+        if LESS(ctx, xs[mid], x) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -385,20 +438,40 @@ pub fn lower_bound[T](xs: []T, x: T, less: fn(T, T) bool) usize {
     return lo;
 }
 
-/// In a slice sorted by `less`, the index of the first element greater
-/// than x (xs.len if there is none): where x would be inserted last.
-pub fn upper_bound[T](xs: []T, x: T, less: fn(T, T) bool) usize {
+/// In a slice sorted by `LESS`, the index of the first element not less
+/// than x (xs.len if there is none): where x would be inserted first.
+pub fn lower_bound[T, const LESS: fn(T, T) bool](xs: []T, x: T) usize {
+    return lower_bound_ctx.[T, u8, call_plain.[T, LESS]](xs, x, 0);
+}
+
+/// `lower_bound` using a runtime comparator.
+pub fn lower_bound_dyn[T](xs: []T, x: T, less: fn(T, T) bool) usize {
+    return lower_bound_ctx.[T, DynLess.[T], call_dyn.[T]](xs, x, DynLess.[T].{ f: less });
+}
+
+fn upper_bound_ctx[T, C, const LESS: fn(C, T, T) bool](xs: []T, x: T, ctx: C) usize {
     let mut lo: usize = 0;
     let mut hi = xs.len;
     while lo < hi {
         let mid = lo + ((hi - lo) / 2);
-        if less(x, xs[mid]) {
+        if LESS(ctx, x, xs[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
         }
     }
     return lo;
+}
+
+/// In a slice sorted by `LESS`, the index of the first element greater
+/// than x (xs.len if there is none): where x would be inserted last.
+pub fn upper_bound[T, const LESS: fn(T, T) bool](xs: []T, x: T) usize {
+    return upper_bound_ctx.[T, u8, call_plain.[T, LESS]](xs, x, 0);
+}
+
+/// `upper_bound` using a runtime comparator.
+pub fn upper_bound_dyn[T](xs: []T, x: T, less: fn(T, T) bool) usize {
+    return upper_bound_ctx.[T, DynLess.[T], call_dyn.[T]](xs, x, DynLess.[T].{ f: less });
 }
 
 pub fn reverse[T](xs: []mut T) void {
@@ -425,22 +498,31 @@ pub fn index_of[T: Eq](xs: []T, x: T) VecError!usize {
     return error.NotFound;
 }
 
-/// Binary search in a slice sorted by `less`. Returns the index of an element
-/// equal to `x`, or error.NotFound.
-pub fn binary_search[T](xs: []T, x: T, less: fn(T, T) bool) VecError!usize {
+fn binary_search_ctx[T, C, const LESS: fn(C, T, T) bool](xs: []T, x: T, ctx: C) VecError!usize {
     let mut lo: usize = 0;
     let mut hi = xs.len;
     while lo < hi {
         let mid = lo + ((hi - lo) / 2);
-        if less(xs[mid], x) {
+        if LESS(ctx, xs[mid], x) {
             lo = mid + 1;
-        } else if less(x, xs[mid]) {
+        } else if LESS(ctx, x, xs[mid]) {
             hi = mid;
         } else {
             return mid;
         }
     }
     return error.NotFound;
+}
+
+/// Binary search in a slice sorted by `LESS`. Returns the index of an element
+/// equal to `x`, or error.NotFound.
+pub fn binary_search[T, const LESS: fn(T, T) bool](xs: []T, x: T) VecError!usize {
+    return binary_search_ctx.[T, u8, call_plain.[T, LESS]](xs, x, 0);
+}
+
+/// `binary_search` using a runtime comparator.
+pub fn binary_search_dyn[T](xs: []T, x: T, less: fn(T, T) bool) VecError!usize {
+    return binary_search_ctx.[T, DynLess.[T], call_dyn.[T]](xs, x, DynLess.[T].{ f: less });
 }
 
 // -----------------------------------------------------------------------------
@@ -492,15 +574,30 @@ test "insert, remove, swap_remove" {
 
 test "sort and binary_search" {
     let mut xs: [9]i32 = [5, -3, 8, 0, 8, 2, -7, 1, 9];
-    sort(xs[..], test_less);
+    sort.[i32, test_less](xs[..]);
     for i in 1..xs.len {
         @expect(xs[i - 1] <= xs[i]);
     }
-    let found = binary_search(xs[..], 2, test_less)!;
+    let found = binary_search.[i32, test_less](xs[..], 2)!;
     @expect_eq(xs[found], 2);
+    @expect_eq(binary_search_dyn(xs[..], 2, test_less)!, found);
     reverse(xs[..]);
     @expect_eq(xs[0], 9);
     @expect_eq(index_of(xs[..], -7)!, 8);
+
+    let mut ys: [9]i32 = [5, -3, 8, 0, 8, 2, -7, 1, 9];
+    sort_dyn(ys[..], test_less);
+    @expect(is_sorted_dyn(ys[..], test_less));
+    @expect(is_sorted.[i32, test_less](ys[..]));
+    let mut v = Vec.[i32].init();
+    defer v.deinit();
+    v.extend(ys[..])!;
+    reverse(v.items());
+    v.sort.[test_less]();
+    @expect(is_sorted.[i32, test_less](v.items()));
+    reverse(v.items());
+    v.sort_dyn(test_less);
+    @expect(is_sorted.[i32, test_less](v.items()));
 }
 
 test "extend from itself" {
@@ -555,7 +652,7 @@ fn fill_pattern(xs: []mut u32, pattern: u32, seed: *mut u64) void {
     }
 }
 
-fn u32_less(a: u32, b: u32) bool {
+inline fn u32_less(a: u32, b: u32) bool {
     return a < b;
 }
 
@@ -565,7 +662,7 @@ test "sort, sort_with and sort_stable on many sizes and patterns" {
     let mut seed: u64 = 1;
     for n in sizes {
         for pattern in @as(u32, 0)..7 {
-            for algo in @as(u32, 0)..2 {
+            for algo in @as(u32, 0)..4 {
                 let xs = buf[..n];
                 fill_pattern(xs, pattern, &mut seed);
                 // A checksum of the multiset: sum and xor of hashed values.
@@ -576,11 +673,16 @@ test "sort, sort_with and sort_stable on many sizes and patterns" {
                     x ^= (@as(u64, v) + 1) *% 0xff51afd7ed558ccd;
                 }
                 if algo == 0 {
-                    sort(xs, u32_less);
+                    sort.[u32, u32_less](xs);
+                } else if algo == 1 {
+                    sort_stable.[u32, u32_less](xs)!;
+                } else if algo == 2 {
+                    sort_dyn(xs, u32_less);
                 } else {
-                    sort_stable(xs, u32_less)!;
+                    sort_stable_dyn(xs, u32_less)!;
                 }
-                @expect(is_sorted(xs, u32_less));
+                @expect(is_sorted.[u32, u32_less](xs));
+                @expect(is_sorted_dyn(xs, u32_less));
                 for v in xs {
                     sum -%= @as(u64, v) *% 0x9e3779b97f4a7c15;
                     x ^= (@as(u64, v) + 1) *% 0xff51afd7ed558ccd;
@@ -592,10 +694,25 @@ test "sort, sort_with and sort_stable on many sizes and patterns" {
     // Sort indices by the keys they point at.
     let keys: [6]u32 = [50, 10, 40, 10, 30, 0];
     let mut idx: [6]usize = [0, 1, 2, 3, 4, 5];
-    sort_with(idx[..], keys[..], by_key);
+    sort_with.[usize, []u32, by_key](idx[..], keys[..]);
     @expect_eq(idx[0], 5);
     @expect_eq(keys[idx[1]], 10);
     @expect_eq(idx[5], 0);
+    let mut idx2: [6]usize = [0, 1, 2, 3, 4, 5];
+    sort_with_dyn(idx2[..], keys[..], by_key);
+    @expect_eq(idx2[0], 5);
+    @expect_eq(keys[idx2[1]], 10);
+    @expect_eq(idx2[5], 0);
+    let mut idx3: [6]usize = [0, 1, 2, 3, 4, 5];
+    sort_stable_with.[usize, []u32, by_key](idx3[..], keys[..])!;
+    @expect_eq(idx3[0], 5);
+    @expect_eq(idx3[1], 1);
+    @expect_eq(idx3[2], 3);
+    let mut idx4: [6]usize = [0, 1, 2, 3, 4, 5];
+    sort_stable_with_dyn(idx4[..], keys[..], by_key)!;
+    @expect_eq(idx4[0], 5);
+    @expect_eq(idx4[1], 1);
+    @expect_eq(idx4[2], 3);
 }
 
 test "sort_stable keeps equal elements in order" {
@@ -605,7 +722,7 @@ test "sort_stable keeps equal elements in order" {
         seed = (seed *% 6364136223846793005) +% 1442695040888963407;
         recs[i] = Rec.{ key: @truncate(u32, seed >> 40) % 50, seq: @truncate(u32, i) };
     }
-    sort_stable(recs[..], rec_less)!;
+    sort_stable.[Rec, rec_less](recs[..])!;
     for i in @as(usize, 1)..recs.len {
         @expect(recs[i - 1].key <= recs[i].key);
         if recs[i - 1].key == recs[i].key {
@@ -618,22 +735,39 @@ test "sort_stable keeps equal elements in order" {
     v.push(Rec.{ key: 1, seq: 1 })!;
     v.push(Rec.{ key: 2, seq: 2 })!;
     v.push(Rec.{ key: 1, seq: 3 })!;
-    v.sort_stable(rec_less)!;
+    v.sort_stable.[rec_less]()!;
     @expect_eq(v.get(0).seq, 1);
     @expect_eq(v.get(1).seq, 3);
     @expect_eq(v.get(2).seq, 0);
     @expect_eq(v.get(3).seq, 2);
+
+    let mut vd = Vec.[Rec].init();
+    defer vd.deinit();
+    vd.push(Rec.{ key: 2, seq: 0 })!;
+    vd.push(Rec.{ key: 1, seq: 1 })!;
+    vd.push(Rec.{ key: 2, seq: 2 })!;
+    vd.push(Rec.{ key: 1, seq: 3 })!;
+    vd.sort_stable_dyn(rec_less)!;
+    @expect_eq(vd.get(0).seq, 1);
+    @expect_eq(vd.get(1).seq, 3);
+    @expect_eq(vd.get(2).seq, 0);
+    @expect_eq(vd.get(3).seq, 2);
 }
 
 test "lower_bound and upper_bound" {
     let xs: [7]u32 = [1, 3, 3, 3, 5, 8, 8];
-    @expect_eq(lower_bound(xs[..], 3, u32_less), 1);
-    @expect_eq(upper_bound(xs[..], 3, u32_less), 4);
-    @expect_eq(lower_bound(xs[..], 0, u32_less), 0);
-    @expect_eq(upper_bound(xs[..], 8, u32_less), 7);
-    @expect_eq(lower_bound(xs[..], 6, u32_less), 5);
-    @expect_eq(lower_bound(xs[..0], 6, u32_less), 0);
-    @expect(is_sorted(xs[..], u32_less));
+    @expect_eq(lower_bound.[u32, u32_less](xs[..], 3), 1);
+    @expect_eq(upper_bound.[u32, u32_less](xs[..], 3), 4);
+    @expect_eq(lower_bound.[u32, u32_less](xs[..], 0), 0);
+    @expect_eq(upper_bound.[u32, u32_less](xs[..], 8), 7);
+    @expect_eq(lower_bound.[u32, u32_less](xs[..], 6), 5);
+    @expect_eq(lower_bound.[u32, u32_less](xs[..0], 6), 0);
+    @expect(is_sorted.[u32, u32_less](xs[..]));
     let ys: [3]u32 = [2, 1, 3];
-    @expect(not is_sorted(ys[..], u32_less));
+    @expect(not is_sorted.[u32, u32_less](ys[..]));
+
+    @expect_eq(lower_bound_dyn(xs[..], 3, u32_less), 1);
+    @expect_eq(upper_bound_dyn(xs[..], 3, u32_less), 4);
+    @expect(is_sorted_dyn(xs[..], u32_less));
+    @expect(not is_sorted_dyn(ys[..], u32_less));
 }

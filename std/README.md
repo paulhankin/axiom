@@ -30,14 +30,14 @@ that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`collections/vec`](collections/vec.ax) | `Vec[T]`: growable array. On slices: `sort` (introsort, in place), `sort_stable` (merge sort), `sort_with` / `sort_stable_with` (a context value passed to each comparison, e.g. sorting indices by keys), `is_sorted`, `binary_search`, `lower_bound`, `upper_bound`, `reverse`, `index_of` |
+| [`collections/vec`](collections/vec.ax) | `Vec[T]`: growable array (`sort.[LESS]`, `sort_stable.[LESS]`, and `*_dyn`). On slices: `sort.[T, LESS]` (introsort, in place), `sort_stable.[T, LESS]` (merge sort), `sort_with.[T, C, LESS]` / `sort_stable_with.[T, C, LESS]` (a context value passed to each comparison, e.g. sorting indices by keys), `is_sorted.[T, LESS]`, `binary_search.[T, LESS]`, `lower_bound.[T, LESS]`, `upper_bound.[T, LESS]` (and `*_dyn` for runtime comparators), `reverse`, `index_of` |
 | [`collections/arena`](collections/arena.ax) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
-| [`collections/map`](collections/map.ax) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
-| [`collections/set`](collections/set.ax) | `Set[K]`: hash set with union, intersection and difference in place |
-| [`collections/treemap`](collections/treemap.ax) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
+| [`collections/map`](collections/map.ax) | `Map[K, V, HASH, EQ]`: open-addressing hash map (and `MapDyn[K, V]`, `Iter[K, V]`) |
+| [`collections/set`](collections/set.ax) | `Set[K, HASH, EQ]`: hash set with union, intersection and difference in place (and `SetDyn[K]`) |
+| [`collections/treemap`](collections/treemap.ax) | `TreeMap[K, V, LESS]`: ordered map (AVL tree, and `TreeMapDyn[K, V]`): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
 | [`collections/deque`](collections/deque.ax) | `Deque[T]`: double-ended queue on a ring buffer |
-| [`collections/heap`](collections/heap.ax) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
-| [`collections/lru`](collections/lru.ax) | `Lru[K, V]`: least-recently-used cache of a fixed capacity (a `Map` and a doubly linked list in a `Vec`, O(1) operations): `get` (marks recent), `put` (gives back the evicted entry), `peek`, `remove`, `pop_lru`, iteration from most to least recent |
+| [`collections/heap`](collections/heap.ax) | `Heap[T, LESS]`: priority queue (binary heap, and `HeapDyn[T]`), built from a slice in linear time |
+| [`collections/lru`](collections/lru.ax) | `Lru[K, V, HASH, EQ]`: least-recently-used cache of a fixed capacity (a `Map` and a doubly linked list in a `Vec`, O(1) operations; also `LruDyn[K, V]`): `get` (marks recent), `put` (gives back the evicted entry), `peek`, `remove`, `pop_lru`, iteration from most to least recent |
 | [`collections/bitset`](collections/bitset.ax) | `BitSet`: sets of bits of a given length (`resize`), `next_set`/`next_clear`, union, intersection and difference (`union_with`, `intersect_with`, `difference_with`) |
 
 ## Operating system
@@ -257,8 +257,9 @@ has not been audited: review it before relying on it.
 - **Interfaces are structs of function pointers.** `Writer` and `Reader`
   each hold a context pointer plus the functions that operate on it. This is how the
   language expresses polymorphism without traits or vtables.
-- **Maps take their hash and equality functions at construction.** For example:
-  `Map.[u64, V].init(hash.hash_u64, hash.eq_u64)`.
+- **Maps take their hash and equality functions as type arguments.** For example:
+  `Map.[u64, V, hash.hash_u64, hash.eq_u64].init()` (or
+  `MapDyn.[u64, V].init(hash_fn, eq_fn)` when chosen at run time).
 - **Errors, not sentinels.** Lookups that can fail return `!T` (for example
   `error.NotFound`, `error.Empty`). The idiom for "value or default" is
   `m.get(k) catch 0`.
@@ -326,7 +327,7 @@ import "std/hash" as hash;
 import "std/io" as io;
 
 export fn main() i32 {
-    let mut ages = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    let mut ages = map.Map.[[]u8, u32, hash.hash_bytes, hash.eq_bytes].init();
     defer ages.deinit();
     ages.put("ada", 36) catch return 1;
     io.stdout().print_u64(@as(u64, ages.get("ada") catch 0)) catch return 1;

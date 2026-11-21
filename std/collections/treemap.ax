@@ -1,7 +1,7 @@
 // =============================================================================
 // std/collections/treemap.ax - ordered maps: AVL trees.
 //
-//     let mut m = treemap.TreeMap.[u64, u32].init(less_u64);
+//     let mut m = treemap.TreeMap.[u64, u32, less_u64].init();
 //     defer m.deinit();
 //     m.put(5, 50)!;
 //     let v = m.get(5)!;
@@ -10,9 +10,9 @@
 //     while it.next(&mut k, &mut v) { ... }
 //     let mut r = m.iter_from(3);           // keys >= 3, in order
 //
-// Keys are ordered by the `less` function given to init; two keys are the
-// same when neither is less than the other. Lookups, insertions and
-// removals take O(log n) time.
+// Keys are ordered by `LESS` (`TreeMapDyn[K, V]` takes `less` at run time);
+// two keys are the same when neither is less than the other. Lookups,
+// insertions and removals take O(log n) time.
 //
 // The nodes live in arrays and link by index, so the tree needs no
 // pointers that could dangle; removed nodes are reused.
@@ -25,8 +25,15 @@ pub error TreemapError { NotFound, OutOfMemory }
 const NIL: u32 = 0xffffffff;
 const MAX_HEIGHT: usize = 64;  // an AVL tree of 2^32 nodes is < 48 high
 
-pub struct TreeMap[K, V] {
-    less: fn(K, K) bool,
+inline fn call_less[K, const LESS: fn(K, K) bool](_c: u8, a: K, b: K) bool {
+    return LESS(a, b);
+}
+
+inline fn dyn_less[K](f: fn(K, K) bool, a: K, b: K) bool {
+    return f(a, b);
+}
+
+struct Tree[K, V] {
     keys: []mut K,
     vals: []mut V,
     left: []mut u32,
@@ -37,9 +44,8 @@ pub struct TreeMap[K, V] {
     used: u32,  // nodes ever handed out: [0, used)
     count: usize,
 
-    pub fn init(less: fn(K, K) bool) Self {
+    fn init() Self {
         return Self.{
-            less: less,
             keys: [],
             vals: [],
             left: [],
@@ -52,7 +58,7 @@ pub struct TreeMap[K, V] {
         };
     }
 
-    pub fn deinit(self: *mut Self) void {
+    fn deinit(self: *mut Self) void {
         if self.left.len > 0 {
             mem.free(self.keys);
             mem.free(self.vals);
@@ -60,16 +66,10 @@ pub struct TreeMap[K, V] {
             mem.free(self.right);
             mem.free(self.height);
         }
-        let less = self.less;
-        self.* = Self.init(less);
+        self.* = Self.init();
     }
 
-    pub fn len(self: *Self) usize {
-        return self.count;
-    }
-
-    /// Removes every entry (keeping the memory).
-    pub fn clear(self: *mut Self) void {
+    fn clear(self: *mut Self) void {
         self.root = NIL;
         self.free = NIL;
         self.used = 0;
@@ -206,13 +206,13 @@ pub struct TreeMap[K, V] {
 
     // --- lookups -----------------------------------------------------------------
 
-    fn find(self: *Self, k: K) u32 {
+    fn find[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, k: K) u32 {
         let mut n = self.root;
         while n != NIL {
             let i = @as(usize, n);
-            if self.less(k, self.keys[i]) {
+            if LESS(ctx, k, self.keys[i]) {
                 n = self.left[i];
-            } else if self.less(self.keys[i], k) {
+            } else if LESS(ctx, self.keys[i], k) {
                 n = self.right[i];
             } else {
                 return n;
@@ -221,29 +221,23 @@ pub struct TreeMap[K, V] {
         return NIL;
     }
 
-    pub fn get(self: *Self, k: K) TreemapError!V {
-        let n = self.find(k);
+    fn get[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, k: K) TreemapError!V {
+        let n = self.find.[C, LESS](ctx, k);
         if n == NIL {
             return error.NotFound;
         }
         return self.vals[@as(usize, n)];
     }
 
-    /// The value for k, to change in place; valid until the map changes.
-    pub fn get_ptr(self: *mut Self, k: K) TreemapError!*mut V {
-        let n = self.find(k);
+    fn get_ptr[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, k: K) TreemapError!*mut V {
+        let n = self.find.[C, LESS](ctx, k);
         if n == NIL {
             return error.NotFound;
         }
         return &mut self.vals[@as(usize, n)];
     }
 
-    pub fn contains(self: *Self, k: K) bool {
-        return self.find(k) != NIL;
-    }
-
-    /// The least key.
-    pub fn min(self: *Self) TreemapError!K {
+    fn min(self: *Self) TreemapError!K {
         let mut n = self.root;
         if n == NIL {
             return error.NotFound;
@@ -254,8 +248,7 @@ pub struct TreeMap[K, V] {
         return self.keys[@as(usize, n)];
     }
 
-    /// The greatest key.
-    pub fn max(self: *Self) TreemapError!K {
+    fn max(self: *Self) TreemapError!K {
         let mut n = self.root;
         if n == NIL {
             return error.NotFound;
@@ -266,13 +259,12 @@ pub struct TreeMap[K, V] {
         return self.keys[@as(usize, n)];
     }
 
-    /// The greatest key <= k.
-    pub fn floor(self: *Self, k: K) TreemapError!K {
+    fn floor[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, k: K) TreemapError!K {
         let mut n = self.root;
         let mut best = NIL;
         while n != NIL {
             let i = @as(usize, n);
-            if self.less(k, self.keys[i]) {
+            if LESS(ctx, k, self.keys[i]) {
                 n = self.left[i];
             } else {
                 best = n;
@@ -285,13 +277,12 @@ pub struct TreeMap[K, V] {
         return self.keys[@as(usize, best)];
     }
 
-    /// The least key >= k.
-    pub fn ceil(self: *Self, k: K) TreemapError!K {
+    fn ceil[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, k: K) TreemapError!K {
         let mut n = self.root;
         let mut best = NIL;
         while n != NIL {
             let i = @as(usize, n);
-            if self.less(self.keys[i], k) {
+            if LESS(ctx, self.keys[i], k) {
                 n = self.right[i];
             } else {
                 best = n;
@@ -306,61 +297,58 @@ pub struct TreeMap[K, V] {
 
     // --- changes -----------------------------------------------------------------
 
-    /// Inserts or replaces the value for k.
-    pub fn put(self: *mut Self, k: K, v: V) TreemapError!void {
-        let n = self.find(k);
+    fn put[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, k: K, v: V) TreemapError!void {
+        let n = self.find.[C, LESS](ctx, k);
         if n != NIL {
             self.vals[@as(usize, n)] = v;
             return;
         }
         let fresh = self.new_node(k, v)!;
-        self.root = self.insert(self.root, fresh);
+        self.root = self.insert.[C, LESS](ctx, self.root, fresh);
         self.count += 1;
     }
 
     // Inserts node x (a key not in the tree) under n; returns the new root.
-    fn insert(self: *mut Self, n: u32, x: u32) u32 {
+    fn insert[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, n: u32, x: u32) u32 {
         if n == NIL {
             return x;
         }
         let i = @as(usize, n);
-        if self.less(self.keys[@as(usize, x)], self.keys[i]) {
-            self.left[i] = self.insert(self.left[i], x);
+        if LESS(ctx, self.keys[@as(usize, x)], self.keys[i]) {
+            self.left[i] = self.insert.[C, LESS](ctx, self.left[i], x);
         } else {
-            self.right[i] = self.insert(self.right[i], x);
+            self.right[i] = self.insert.[C, LESS](ctx, self.right[i], x);
         }
         return self.balance(n);
     }
 
-    /// Removes k; returns whether it was there.
-    pub fn remove(self: *mut Self, k: K) bool {
-        let n = self.find(k);
+    fn remove[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, k: K) bool {
+        let n = self.find.[C, LESS](ctx, k);
         if n == NIL {
             return false;
         }
-        self.root = self.delete(self.root, k);
+        self.root = self.delete.[C, LESS](ctx, self.root, k);
         self.left[@as(usize, n)] = self.free;
         self.free = n;
         self.count -= 1;
         return true;
     }
 
-    /// Removes and returns the value for k.
-    pub fn take(self: *mut Self, k: K) TreemapError!V {
-        let v = self.get(k)!;
-        _ = self.remove(k);
+    fn take[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, k: K) TreemapError!V {
+        let v = self.get.[C, LESS](ctx, k)!;
+        _ = self.remove.[C, LESS](ctx, k);
         return v;
     }
 
     // Unlinks the node with key k from under n; returns the new root.
-    fn delete(self: *mut Self, n: u32, k: K) u32 {
+    fn delete[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, n: u32, k: K) u32 {
         let i = @as(usize, n);
-        if self.less(k, self.keys[i]) {
-            self.left[i] = self.delete(self.left[i], k);
+        if LESS(ctx, k, self.keys[i]) {
+            self.left[i] = self.delete.[C, LESS](ctx, self.left[i], k);
             return self.balance(n);
         }
-        if self.less(self.keys[i], k) {
-            self.right[i] = self.delete(self.right[i], k);
+        if LESS(ctx, self.keys[i], k) {
+            self.right[i] = self.delete.[C, LESS](ctx, self.right[i], k);
             return self.balance(n);
         }
         let l = self.left[i];
@@ -394,20 +382,18 @@ pub struct TreeMap[K, V] {
 
     // --- iteration -----------------------------------------------------------------
 
-    /// Every entry in key order. Do not change the map while iterating.
-    pub fn iter(self: *Self) Iter.[K, V] {
-        let mut it = Iter.[K, V].{ map: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
+    fn iter(self: *Self) Iter.[K, V] {
+        let mut it = Iter.[K, V].{ tree: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
         it.push_left(self.root);
         return it;
     }
 
-    /// The entries with keys >= lo, in key order.
-    pub fn iter_from(self: *Self, lo: K) Iter.[K, V] {
-        let mut it = Iter.[K, V].{ map: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
+    fn iter_from[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, lo: K) Iter.[K, V] {
+        let mut it = Iter.[K, V].{ tree: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
         let mut n = self.root;
         while n != NIL {
             let i = @as(usize, n);
-            if self.less(self.keys[i], lo) {
+            if LESS(ctx, self.keys[i], lo) {
                 n = self.right[i];
             } else {
                 it.stack[it.sp] = n;
@@ -419,8 +405,168 @@ pub struct TreeMap[K, V] {
     }
 }
 
+pub struct TreeMap[K, V, const LESS: fn(K, K) bool] {
+    t: Tree.[K, V],
+
+    pub fn init() Self {
+        return Self.{ t: Tree.[K, V].init() };
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        self.t.deinit();
+    }
+
+    pub fn len(self: *Self) usize {
+        return self.t.count;
+    }
+
+    /// Removes every entry (keeping the memory).
+    pub fn clear(self: *mut Self) void {
+        self.t.clear();
+    }
+
+    pub fn get(self: *Self, k: K) TreemapError!V {
+        return self.t.get.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    /// The value for k, to change in place; valid until the map changes.
+    pub fn get_ptr(self: *mut Self, k: K) TreemapError!*mut V {
+        return self.t.get_ptr.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    pub fn contains(self: *Self, k: K) bool {
+        return self.t.find.[u8, call_less.[K, LESS]](0, k) != NIL;
+    }
+
+    /// The least key.
+    pub fn min(self: *Self) TreemapError!K {
+        return self.t.min();
+    }
+
+    /// The greatest key.
+    pub fn max(self: *Self) TreemapError!K {
+        return self.t.max();
+    }
+
+    /// The greatest key <= k.
+    pub fn floor(self: *Self, k: K) TreemapError!K {
+        return self.t.floor.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    /// The least key >= k.
+    pub fn ceil(self: *Self, k: K) TreemapError!K {
+        return self.t.ceil.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    /// Inserts or replaces the value for k.
+    pub fn put(self: *mut Self, k: K, v: V) TreemapError!void {
+        self.t.put.[u8, call_less.[K, LESS]](0, k, v)!;
+    }
+
+    /// Removes k; returns whether it was there.
+    pub fn remove(self: *mut Self, k: K) bool {
+        return self.t.remove.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    /// Removes and returns the value for k.
+    pub fn take(self: *mut Self, k: K) TreemapError!V {
+        return self.t.take.[u8, call_less.[K, LESS]](0, k);
+    }
+
+    /// Every entry in key order. Do not change the map while iterating.
+    pub fn iter(self: *Self) Iter.[K, V] {
+        return self.t.iter();
+    }
+
+    /// The entries with keys >= lo, in key order.
+    pub fn iter_from(self: *Self, lo: K) Iter.[K, V] {
+        return self.t.iter_from.[u8, call_less.[K, LESS]](0, lo);
+    }
+}
+
+/// An ordered map whose comparator function is chosen at run time.
+pub struct TreeMapDyn[K, V] {
+    t: Tree.[K, V],
+    less: fn(K, K) bool,
+
+    pub fn init(less: fn(K, K) bool) Self {
+        return Self.{ t: Tree.[K, V].init(), less: less };
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        self.t.deinit();
+    }
+
+    pub fn len(self: *Self) usize {
+        return self.t.count;
+    }
+
+    /// Removes every entry (keeping the memory).
+    pub fn clear(self: *mut Self) void {
+        self.t.clear();
+    }
+
+    pub fn get(self: *Self, k: K) TreemapError!V {
+        return self.t.get.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    /// The value for k, to change in place; valid until the map changes.
+    pub fn get_ptr(self: *mut Self, k: K) TreemapError!*mut V {
+        return self.t.get_ptr.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    pub fn contains(self: *Self, k: K) bool {
+        return self.t.find.[fn(K, K) bool, dyn_less.[K]](self.less, k) != NIL;
+    }
+
+    /// The least key.
+    pub fn min(self: *Self) TreemapError!K {
+        return self.t.min();
+    }
+
+    /// The greatest key.
+    pub fn max(self: *Self) TreemapError!K {
+        return self.t.max();
+    }
+
+    /// The greatest key <= k.
+    pub fn floor(self: *Self, k: K) TreemapError!K {
+        return self.t.floor.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    /// The least key >= k.
+    pub fn ceil(self: *Self, k: K) TreemapError!K {
+        return self.t.ceil.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    /// Inserts or replaces the value for k.
+    pub fn put(self: *mut Self, k: K, v: V) TreemapError!void {
+        self.t.put.[fn(K, K) bool, dyn_less.[K]](self.less, k, v)!;
+    }
+
+    /// Removes k; returns whether it was there.
+    pub fn remove(self: *mut Self, k: K) bool {
+        return self.t.remove.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    /// Removes and returns the value for k.
+    pub fn take(self: *mut Self, k: K) TreemapError!V {
+        return self.t.take.[fn(K, K) bool, dyn_less.[K]](self.less, k);
+    }
+
+    /// Every entry in key order. Do not change the map while iterating.
+    pub fn iter(self: *Self) Iter.[K, V] {
+        return self.t.iter();
+    }
+
+    /// The entries with keys >= lo, in key order.
+    pub fn iter_from(self: *Self, lo: K) Iter.[K, V] {
+        return self.t.iter_from.[fn(K, K) bool, dyn_less.[K]](self.less, lo);
+    }
+}
+
 pub struct Iter[K, V] {
-    map: *TreeMap.[K, V],
+    tree: *Tree.[K, V],
     stack: [MAX_HEIGHT]u32,  // nodes whose left subtree is done
     sp: usize,
 
@@ -429,7 +575,7 @@ pub struct Iter[K, V] {
         while n != NIL {
             self.stack[self.sp] = n;
             self.sp += 1;
-            n = self.map.left[@as(usize, n)];
+            n = self.tree.left[@as(usize, n)];
         }
     }
 
@@ -442,9 +588,9 @@ pub struct Iter[K, V] {
         self.sp -= 1;
         let n = self.stack[self.sp];
         let i = @as(usize, n);
-        key.* = self.map.keys[i];
-        val.* = self.map.vals[i];
-        self.push_left(self.map.right[i]);
+        key.* = self.tree.keys[i];
+        val.* = self.tree.vals[i];
+        self.push_left(self.tree.right[i]);
         return true;
     }
 }
@@ -453,7 +599,7 @@ pub struct Iter[K, V] {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn lt(a: u64, b: u64) bool {
+inline fn lt(a: u64, b: u64) bool {
     return a < b;
 }
 
@@ -468,27 +614,27 @@ fn str_lt(a: []u8, b: []u8) bool {
 }
 
 // Checks the AVL invariants and ordering; returns the height.
-fn check[K, V](m: *TreeMap.[K, V], n: u32) i32 {
+fn check[K, V, C, const LESS: fn(C, K, K) bool](t: *Tree.[K, V], ctx: C, n: u32) i32 {
     if n == NIL {
         return 0;
     }
     let i = @as(usize, n);
-    let hl = check(m, m.left[i]);
-    let hr = check(m, m.right[i]);
+    let hl = check.[K, V, C, LESS](t, ctx, t.left[i]);
+    let hr = check.[K, V, C, LESS](t, ctx, t.right[i]);
     @expect((hl - hr) <= 1);
     @expect((hr - hl) <= 1);
-    @expect_eq(@as(i32, m.height[i]), @max(hl, hr) + 1);
-    if m.left[i] != NIL {
-        @expect(m.less(m.keys[@as(usize, m.left[i])], m.keys[i]));
+    @expect_eq(@as(i32, t.height[i]), @max(hl, hr) + 1);
+    if t.left[i] != NIL {
+        @expect(LESS(ctx, t.keys[@as(usize, t.left[i])], t.keys[i]));
     }
-    if m.right[i] != NIL {
-        @expect(m.less(m.keys[i], m.keys[@as(usize, m.right[i])]));
+    if t.right[i] != NIL {
+        @expect(LESS(ctx, t.keys[i], t.keys[@as(usize, t.right[i])]));
     }
     return @max(hl, hr) + 1;
 }
 
 test "ordered maps" {
-    let mut m = TreeMap.[u64, u64].init(lt);
+    let mut m = TreeMap.[u64, u64, lt].init();
     defer m.deinit();
     let mut x: u64 = 1;
     let mut keys: [2000]u64 = [0; 2000];
@@ -497,7 +643,7 @@ test "ordered maps" {
         keys[i] = (x >> 33) % 100000;
         m.put(keys[i], @as(u64, i))!;
     }
-    _ = check(&m, m.root);
+    _ = check.[u64, u64, u8, call_less.[u64, lt]](&m.t, 0, m.t.root);
     // in order, and the values are the last put for each key
     let mut it = m.iter();
     let mut k: u64 = 0;
@@ -517,21 +663,21 @@ test "ordered maps" {
     for i in @as(usize, 0)..1000 {
         _ = m.remove(keys[i]);
         if (i % 97) == 0 {
-            _ = check(&m, m.root);
+            _ = check.[u64, u64, u8, call_less.[u64, lt]](&m.t, 0, m.t.root);
         }
     }
-    _ = check(&m, m.root);
+    _ = check.[u64, u64, u8, call_less.[u64, lt]](&m.t, 0, m.t.root);
     for i in @as(usize, 0)..1000 {
         @expect(not m.contains(keys[i]));
     }
     // reuse of removed nodes
-    let used = m.used;
+    let used = m.t.used;
     m.put(123456789, 1)!;
-    @expect_eq(m.used, used);
+    @expect_eq(m.t.used, used);
     @expect_eq(m.max()!, 123456789);
     @expect_eq(m.take(123456789)!, 1);
     // floor, ceil, iter_from
-    let mut s = TreeMap.[u64, u64].init(lt);
+    let mut s = TreeMap.[u64, u64, lt].init();
     defer s.deinit();
     for i in @as(u64, 1)..11 {
         s.put(i * 10, i)!;
@@ -556,7 +702,7 @@ test "ordered maps" {
 }
 
 test "ordered maps of strings" {
-    let mut m = TreeMap.[[]u8, i32].init(str_lt);
+    let mut m = TreeMap.[[]u8, i32, str_lt].init();
     defer m.deinit();
     m.put("pear", 1)!;
     m.put("apple", 2)!;
@@ -568,6 +714,35 @@ test "ordered maps of strings" {
     @expect_eq(k, "apple");
     @expect(it.next(&mut k, &mut v));
     @expect_eq(k, "fig");
+}
+
+test "TreeMapDyn" {
+    let mut m = TreeMapDyn.[u64, u64].init(lt);
+    defer m.deinit();
+    for i in @as(u64, 1)..20 {
+        m.put(i * 5, i)!;
+    }
+    _ = check.[u64, u64, fn(u64, u64) bool, dyn_less.[u64]](&m.t, lt, m.t.root);
+    @expect_eq(m.len(), 19);
+    @expect_eq(m.floor(33)!, 30);
+    @expect_eq(m.ceil(33)!, 35);
+    @expect_eq(m.min()!, 5);
+    @expect_eq(m.max()!, 95);
+    @expect(m.contains(50));
+    @expect_eq(m.take(50)!, 10);
+    @expect(not m.remove(50));
+    (m.get_ptr(5)!).* = 42;
+    @expect_eq(m.get(5)!, 42);
+    let mut r = m.iter_from(85);
+    let mut k: u64 = 0;
+    let mut v: u64 = 0;
+    let mut sum: u64 = 0;
+    while r.next(&mut k, &mut v) {
+        sum += k;
+    }
+    @expect_eq(sum, 85 + 90 + 95);
+    m.clear();
+    @expect_eq(m.len(), 0);
 }
 
 fn failed(r: !u64) bool {

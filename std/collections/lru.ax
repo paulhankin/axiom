@@ -1,7 +1,7 @@
 // =============================================================================
 // std/collections/lru.ax - least-recently-used caches.
 //
-//     let mut c = lru.Lru.[[]u8, u32].init(100, hash.hash_bytes, hash.eq_bytes);
+//     let mut c = lru.Lru.[[]u8, u32, hash.hash_bytes, hash.eq_bytes].init(100);
 //     defer c.deinit();
 //     let mut old = lru.Entry.[[]u8, u32].{ key: "", value: 0 };
 //     if c.put("a", 1, &mut old)! {
@@ -18,9 +18,9 @@
 // used, with a Map from each key to its node: every operation takes O(1)
 // time (amortized, for the Map). Removed nodes are kept on a free list.
 //
-// Like Map, the cache is given its hash and equality functions, stores keys
-// and values by value (for []u8 keys only the slice, not its bytes), and is
-// not safe to use from several threads at once.
+// `LruDyn[K, V]` takes its hash and equality functions at run time. Both store
+// keys and values by value (for []u8 keys only the slice, not its bytes), and
+// are not safe to use from several threads at once.
 // =============================================================================
 
 import "map.ax" as map;
@@ -43,20 +43,15 @@ struct Node[K, V] {
     next: usize,  // towards the least recent (or the next free node), or NONE
 }
 
-/// A cache of at most `capacity` entries that evicts the least recently used.
-pub struct Lru[K, V] {
-    index: map.Map.[K, usize],
+struct List[K, V] {
     nodes: vec.Vec.[Node.[K, V]],
     head: usize,  // most recently used, or NONE
     tail: usize,  // least recently used, or NONE
     free: usize,  // first unused node, or NONE
     cap: usize,
 
-    /// An empty cache for at most `capacity` entries (with 0, nothing is
-    /// ever kept).
-    pub fn init(capacity: usize, hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
+    fn init(capacity: usize) Self {
         return Self.{
-            index: map.Map.[K, usize].init(hash_fn, eq_fn),
             nodes: vec.Vec.[Node.[K, V]].init(),
             head: NONE,
             tail: NONE,
@@ -65,23 +60,18 @@ pub struct Lru[K, V] {
         };
     }
 
-    /// Frees the memory (not what keys and values point at).
-    pub fn deinit(self: *mut Self) void {
-        self.index.deinit();
+    fn deinit(self: *mut Self) void {
         self.nodes.deinit();
         self.head = NONE;
         self.tail = NONE;
         self.free = NONE;
     }
 
-    /// The number of entries.
-    pub fn len(self: *Self) usize {
-        return self.index.len();
-    }
-
-    /// The most entries the cache holds.
-    pub fn capacity(self: *Self) usize {
-        return self.cap;
+    fn clear(self: *mut Self) void {
+        self.nodes.clear();
+        self.head = NONE;
+        self.tail = NONE;
+        self.free = NONE;
     }
 
     // Takes node i out of the list.
@@ -119,26 +109,94 @@ pub struct Lru[K, V] {
         }
     }
 
+    fn update_found(self: *mut Self, i: usize, k: K, v: V, evicted: *mut Entry.[K, V]) void {
+        let p = self.nodes.get_ptr(i);
+        evicted.* = Entry.[K, V].{ key: p.key, value: p.value };
+        p.key = k;
+        p.value = v;
+        self.touch(i);
+    }
+
+    fn reuse_tail(self: *mut Self, i: usize, k: K, v: V, old: Node.[K, V], evicted: *mut Entry.[K, V]) void {
+        self.unlink(i);
+        let p = self.nodes.get_ptr(i);
+        p.key = k;
+        p.value = v;
+        self.push_front(i);
+        evicted.* = Entry.[K, V].{ key: old.key, value: old.value };
+    }
+
+    fn release(self: *mut Self, i: usize) Entry.[K, V] {
+        let n = self.nodes.get(i);
+        self.unlink(i);
+        self.nodes.get_ptr(i).next = self.free;
+        self.free = i;
+        return Entry.[K, V].{ key: n.key, value: n.value };
+    }
+
+    fn peek_lru(self: *Self) LruError!Entry.[K, V] {
+        if self.tail == NONE {
+            return error.Empty;
+        }
+        let n = self.nodes.get(self.tail);
+        return Entry.[K, V].{ key: n.key, value: n.value };
+    }
+
+    fn iter(self: *Self) Iter.[K, V] {
+        return Iter.[K, V].{ nodes: self.nodes.items(), i: self.head };
+    }
+}
+
+/// A cache of at most `capacity` entries that evicts the least recently used.
+pub struct Lru[K, V, const HASH: fn(K) u64, const EQ: fn(K, K) bool] {
+    index: map.Map.[K, usize, HASH, EQ],
+    list: List.[K, V],
+
+    /// An empty cache for at most `capacity` entries (with 0, nothing is
+    /// ever kept).
+    pub fn init(capacity: usize) Self {
+        return Self.{
+            index: map.Map.[K, usize, HASH, EQ].init(),
+            list: List.[K, V].init(capacity),
+        };
+    }
+
+    /// Frees the memory (not what keys and values point at).
+    pub fn deinit(self: *mut Self) void {
+        self.index.deinit();
+        self.list.deinit();
+    }
+
+    /// The number of entries.
+    pub fn len(self: *Self) usize {
+        return self.index.len();
+    }
+
+    /// The most entries the cache holds.
+    pub fn capacity(self: *Self) usize {
+        return self.list.cap;
+    }
+
     /// The value for `k`, making it the most recently used; NotFound if
     /// absent.
     pub fn get(self: *mut Self, k: K) LruError!V {
         let i = self.index.get(k)!;
-        self.touch(i);
-        return self.nodes.get(i).value;
+        self.list.touch(i);
+        return self.list.nodes.get(i).value;
     }
 
     /// A pointer to the value for `k`, making it the most recently used;
     /// valid until the cache is next modified.
     pub fn get_ptr(self: *mut Self, k: K) LruError!*mut V {
         let i = self.index.get(k)!;
-        self.touch(i);
-        return &mut self.nodes.get_ptr(i).value;
+        self.list.touch(i);
+        return &mut self.list.nodes.get_ptr(i).value;
     }
 
     /// The value for `k` without changing the order of use.
     pub fn peek(self: *Self, k: K) LruError!V {
         let i = self.index.get(k)!;
-        return self.nodes.get(i).value;
+        return self.list.nodes.get(i).value;
     }
 
     /// Whether `k` is present, without changing the order of use.
@@ -154,61 +212,48 @@ pub struct Lru[K, V] {
     pub fn put(self: *mut Self, k: K, v: V, evicted: *mut Entry.[K, V]) LruError!bool {
         let found = self.index.get(k) catch NONE;
         if found != NONE {
-            let p = self.nodes.get_ptr(found);
-            evicted.* = Entry.[K, V].{ key: p.key, value: p.value };
-            p.key = k;
-            p.value = v;
-            self.touch(found);
+            self.list.update_found(found, k, v, evicted);
             return true;
         }
-        if self.cap == 0 {
+        if self.list.cap == 0 {
             evicted.* = Entry.[K, V].{ key: k, value: v };
             return true;
         }
-        if self.index.len() >= self.cap {
+        if self.index.len() >= self.list.cap {
             // reuse the least recently used node
-            let i = self.tail;
-            let old = self.nodes.get(i);
+            let i = self.list.tail;
+            let old = self.list.nodes.get(i);
             // make room in the map first, so that a failure changes nothing
             _ = self.index.remove(old.key);
             self.index.put(k, i) catch |e| {
                 self.index.put(old.key, i) catch @trap();  // (its slot is still free)
                 return e;
             };
-            self.unlink(i);
-            let p = self.nodes.get_ptr(i);
-            p.key = k;
-            p.value = v;
-            self.push_front(i);
-            evicted.* = Entry.[K, V].{ key: old.key, value: old.value };
+            self.list.reuse_tail(i, k, v, old, evicted);
             return true;
         }
-        let mut i = self.free;
+        let mut i = self.list.free;
         let node = Node.[K, V].{ key: k, value: v, prev: NONE, next: NONE };
         if i == NONE {
-            i = self.nodes.len;
-            self.nodes.push(node)!;
+            i = self.list.nodes.len;
+            self.list.nodes.push(node)!;
             self.index.put(k, i) catch |e| {
-                _ = self.nodes.pop() catch @trap();
+                _ = self.list.nodes.pop() catch @trap();
                 return e;
             };
         } else {
             self.index.put(k, i)!;
-            self.free = self.nodes.get(i).next;
-            self.nodes.set(i, node);
+            self.list.free = self.list.nodes.get(i).next;
+            self.list.nodes.set(i, node);
         }
-        self.push_front(i);
+        self.list.push_front(i);
         return false;
     }
 
-    // Unlinks node i, drops its key from the index and frees the node.
     fn drop_node(self: *mut Self, i: usize) Entry.[K, V] {
-        let n = self.nodes.get(i);
-        self.unlink(i);
-        _ = self.index.remove(n.key);
-        self.nodes.get_ptr(i).next = self.free;
-        self.free = i;
-        return Entry.[K, V].{ key: n.key, value: n.value };
+        let e = self.list.release(i);
+        _ = self.index.remove(e.key);
+        return e;
     }
 
     /// Removes `k` and returns its entry; NotFound if absent.
@@ -220,41 +265,172 @@ pub struct Lru[K, V] {
     /// Removes and returns the least recently used entry; Empty if there
     /// is none.
     pub fn pop_lru(self: *mut Self) LruError!Entry.[K, V] {
-        if self.tail == NONE {
+        if self.list.tail == NONE {
             return error.Empty;
         }
-        return self.drop_node(self.tail);
+        return self.drop_node(self.list.tail);
     }
 
     /// The least recently used entry, without changing anything; Empty if
     /// there is none.
     pub fn peek_lru(self: *Self) LruError!Entry.[K, V] {
-        if self.tail == NONE {
-            return error.Empty;
-        }
-        let n = self.nodes.get(self.tail);
-        return Entry.[K, V].{ key: n.key, value: n.value };
+        return self.list.peek_lru();
     }
 
     /// Removes every entry (keeping the memory).
     pub fn clear(self: *mut Self) void {
         self.index.clear();
-        self.nodes.clear();
-        self.head = NONE;
-        self.tail = NONE;
-        self.free = NONE;
+        self.list.clear();
     }
 
     /// Iterates from the most to the least recently used entry, without
     /// changing the order. Do not modify the cache while iterating.
     pub fn iter(self: *Self) Iter.[K, V] {
-        return Iter.[K, V].{ lru: self, i: self.head };
+        return self.list.iter();
+    }
+}
+
+/// An LRU cache whose hash and equality functions are chosen at run time.
+pub struct LruDyn[K, V] {
+    index: map.MapDyn.[K, usize],
+    list: List.[K, V],
+
+    /// An empty cache for at most `capacity` entries (with 0, nothing is
+    /// ever kept).
+    pub fn init(capacity: usize, hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
+        return Self.{
+            index: map.MapDyn.[K, usize].init(hash_fn, eq_fn),
+            list: List.[K, V].init(capacity),
+        };
+    }
+
+    /// Frees the memory (not what keys and values point at).
+    pub fn deinit(self: *mut Self) void {
+        self.index.deinit();
+        self.list.deinit();
+    }
+
+    /// The number of entries.
+    pub fn len(self: *Self) usize {
+        return self.index.len();
+    }
+
+    /// The most entries the cache holds.
+    pub fn capacity(self: *Self) usize {
+        return self.list.cap;
+    }
+
+    /// The value for `k`, making it the most recently used; NotFound if
+    /// absent.
+    pub fn get(self: *mut Self, k: K) LruError!V {
+        let i = self.index.get(k)!;
+        self.list.touch(i);
+        return self.list.nodes.get(i).value;
+    }
+
+    /// A pointer to the value for `k`, making it the most recently used;
+    /// valid until the cache is next modified.
+    pub fn get_ptr(self: *mut Self, k: K) LruError!*mut V {
+        let i = self.index.get(k)!;
+        self.list.touch(i);
+        return &mut self.list.nodes.get_ptr(i).value;
+    }
+
+    /// The value for `k` without changing the order of use.
+    pub fn peek(self: *Self, k: K) LruError!V {
+        let i = self.index.get(k)!;
+        return self.list.nodes.get(i).value;
+    }
+
+    /// Whether `k` is present, without changing the order of use.
+    pub fn contains(self: *Self, k: K) bool {
+        return self.index.contains(k);
+    }
+
+    /// Inserts or replaces the value for `k` and makes it the most recently
+    /// used.
+    pub fn put(self: *mut Self, k: K, v: V, evicted: *mut Entry.[K, V]) LruError!bool {
+        let found = self.index.get(k) catch NONE;
+        if found != NONE {
+            self.list.update_found(found, k, v, evicted);
+            return true;
+        }
+        if self.list.cap == 0 {
+            evicted.* = Entry.[K, V].{ key: k, value: v };
+            return true;
+        }
+        if self.index.len() >= self.list.cap {
+            let i = self.list.tail;
+            let old = self.list.nodes.get(i);
+            _ = self.index.remove(old.key);
+            self.index.put(k, i) catch |e| {
+                self.index.put(old.key, i) catch @trap();
+                return e;
+            };
+            self.list.reuse_tail(i, k, v, old, evicted);
+            return true;
+        }
+        let mut i = self.list.free;
+        let node = Node.[K, V].{ key: k, value: v, prev: NONE, next: NONE };
+        if i == NONE {
+            i = self.list.nodes.len;
+            self.list.nodes.push(node)!;
+            self.index.put(k, i) catch |e| {
+                _ = self.list.nodes.pop() catch @trap();
+                return e;
+            };
+        } else {
+            self.index.put(k, i)!;
+            self.list.free = self.list.nodes.get(i).next;
+            self.list.nodes.set(i, node);
+        }
+        self.list.push_front(i);
+        return false;
+    }
+
+    fn drop_node(self: *mut Self, i: usize) Entry.[K, V] {
+        let e = self.list.release(i);
+        _ = self.index.remove(e.key);
+        return e;
+    }
+
+    /// Removes `k` and returns its entry; NotFound if absent.
+    pub fn remove(self: *mut Self, k: K) LruError!Entry.[K, V] {
+        let i = self.index.get(k)!;
+        return self.drop_node(i);
+    }
+
+    /// Removes and returns the least recently used entry; Empty if there
+    /// is none.
+    pub fn pop_lru(self: *mut Self) LruError!Entry.[K, V] {
+        if self.list.tail == NONE {
+            return error.Empty;
+        }
+        return self.drop_node(self.list.tail);
+    }
+
+    /// The least recently used entry, without changing anything; Empty if
+    /// there is none.
+    pub fn peek_lru(self: *Self) LruError!Entry.[K, V] {
+        return self.list.peek_lru();
+    }
+
+    /// Removes every entry (keeping the memory).
+    pub fn clear(self: *mut Self) void {
+        self.index.clear();
+        self.list.clear();
+    }
+
+    /// Iterates from the most to the least recently used entry, without
+    /// changing the order. Do not modify the cache while iterating.
+    pub fn iter(self: *Self) Iter.[K, V] {
+        return self.list.iter();
     }
 }
 
 /// An iterator over a cache, from Lru.iter.
 pub struct Iter[K, V] {
-    lru: *Lru.[K, V],
+    nodes: []Node.[K, V],
     i: usize,
 
     /// Stores the next entry through `key` and `val` and returns true, or
@@ -263,7 +439,7 @@ pub struct Iter[K, V] {
         if self.i == NONE {
             return false;
         }
-        let n = self.lru.nodes.get(self.i);
+        let n = self.nodes[self.i];
         key.* = n.key;
         val.* = n.value;
         self.i = n.next;
@@ -278,8 +454,8 @@ pub struct Iter[K, V] {
 import "../hash.ax" as hash;
 
 // The keys from most to least recent, as digits ("312").
-fn order(c: *Lru.[u64, u64], out: []mut u8) []u8 {
-    let mut it = c.iter();
+fn order(it0: Iter.[u64, u64], out: []mut u8) []u8 {
+    let mut it = it0;
     let mut k: u64 = 0;
     let mut v: u64 = 0;
     let mut n: usize = 0;
@@ -291,28 +467,28 @@ fn order(c: *Lru.[u64, u64], out: []mut u8) []u8 {
 }
 
 test "get marks recent, put evicts the least recent" {
-    let mut c = Lru.[u64, u64].init(3, hash.hash_u64, hash.eq_u64);
+    let mut c = Lru.[u64, u64, hash.hash_u64, hash.eq_u64].init(3);
     defer c.deinit();
     let mut buf: [16]u8 = [0; 16];
     let mut ev = Entry.[u64, u64].{ key: 0, value: 0 };
     @expect(not c.put(1, 10, &mut ev)!);
     @expect(not c.put(2, 20, &mut ev)!);
     @expect(not c.put(3, 30, &mut ev)!);
-    @expect_eq(order(&c, buf[..]), "321");
+    @expect_eq(order(c.iter(), buf[..]), "321");
     @expect_eq(c.get(1)!, 10);
-    @expect_eq(order(&c, buf[..]), "132");
+    @expect_eq(order(c.iter(), buf[..]), "132");
     @expect_eq(c.peek(2)!, 20);  // peek does not reorder
-    @expect_eq(order(&c, buf[..]), "132");
+    @expect_eq(order(c.iter(), buf[..]), "132");
     @expect(c.put(4, 40, &mut ev)!);
     @expect((ev.key == 2) and (ev.value == 20));
-    @expect_eq(order(&c, buf[..]), "413");
+    @expect_eq(order(c.iter(), buf[..]), "413");
     @expect(not c.contains(2));
     _ = c.get(2) catch |e| {
         @expect_eq(e, error.NotFound);
         // replacing a present key gives back its old entry
         @expect(c.put(3, 33, &mut ev)!);
         @expect((ev.key == 3) and (ev.value == 30));
-        @expect_eq(order(&c, buf[..]), "341");
+        @expect_eq(order(c.iter(), buf[..]), "341");
         @expect_eq(c.len(), 3);
         @expect_eq(c.peek_lru()!.key, 1);
         return;
@@ -321,7 +497,7 @@ test "get marks recent, put evicts the least recent" {
 }
 
 test "remove, pop_lru, free nodes are reused" {
-    let mut c = Lru.[u64, u64].init(4, hash.hash_u64, hash.eq_u64);
+    let mut c = Lru.[u64, u64, hash.hash_u64, hash.eq_u64].init(4);
     defer c.deinit();
     let mut buf: [16]u8 = [0; 16];
     let mut ev = Entry.[u64, u64].{ key: 0, value: 0 };
@@ -330,21 +506,21 @@ test "remove, pop_lru, free nodes are reused" {
     }
     let r = c.remove(3)!;
     @expect((r.key == 3) and (r.value == 30));
-    @expect_eq(order(&c, buf[..]), "421");
+    @expect_eq(order(c.iter(), buf[..]), "421");
     let p = c.pop_lru()!;
     @expect_eq(p.key, 1);
-    @expect_eq(order(&c, buf[..]), "42");
+    @expect_eq(order(c.iter(), buf[..]), "42");
     @expect(not c.put(5, 50, &mut ev)!);
     @expect(not c.put(6, 60, &mut ev)!);
-    @expect_eq(c.nodes.len, 4);  // the two freed nodes were reused
-    @expect_eq(order(&c, buf[..]), "6542");
+    @expect_eq(c.list.nodes.len, 4);  // the two freed nodes were reused
+    @expect_eq(order(c.iter(), buf[..]), "6542");
     @expect(c.put(7, 70, &mut ev)!);
     @expect_eq(ev.key, 2);
     _ = c.remove(9) catch |e| {
         @expect_eq(e, error.NotFound);
         c.clear();
         @expect_eq(c.len(), 0);
-        @expect_eq(order(&c, buf[..]), "");
+        @expect_eq(order(c.iter(), buf[..]), "");
         _ = c.pop_lru() catch |e2| {
             @expect_eq(e2, error.Empty);
             return;
@@ -355,12 +531,12 @@ test "remove, pop_lru, free nodes are reused" {
 }
 
 test "capacity 0 and 1" {
-    let mut z = Lru.[u64, u64].init(0, hash.hash_u64, hash.eq_u64);
+    let mut z = Lru.[u64, u64, hash.hash_u64, hash.eq_u64].init(0);
     defer z.deinit();
     let mut ev = Entry.[u64, u64].{ key: 0, value: 0 };
     @expect(z.put(5, 6, &mut ev)!);
     @expect((ev.key == 5) and (ev.value == 6) and (z.len() == 0));
-    let mut one = Lru.[[]u8, u32].init(1, hash.hash_bytes, hash.eq_bytes);
+    let mut one = Lru.[[]u8, u32, hash.hash_bytes, hash.eq_bytes].init(1);
     defer one.deinit();
     let mut e2 = Entry.[[]u8, u32].{ key: "", value: 0 };
     @expect(not one.put("a", 1, &mut e2)!);
@@ -374,7 +550,7 @@ test "capacity 0 and 1" {
 
 test "random operations agree with a reference" {
     // reference: stamp[k] is the time of k's last use (0: absent)
-    let mut c = Lru.[u64, u64].init(16, hash.hash_u64, hash.eq_u64);
+    let mut c = Lru.[u64, u64, hash.hash_u64, hash.eq_u64].init(16);
     defer c.deinit();
     let mut stamp: [64]u64 = [0; 64];
     let mut val: [64]u64 = [0; 64];
@@ -440,4 +616,29 @@ test "random operations agree with a reference" {
         n += 1;
     }
     @expect_eq(n, c.len());
+}
+
+test "LruDyn" {
+    let mut c = LruDyn.[u64, u64].init(3, hash.hash_u64, hash.eq_u64);
+    defer c.deinit();
+    @expect_eq(c.capacity(), 3);
+    let mut buf: [16]u8 = [0; 16];
+    let mut ev = Entry.[u64, u64].{ key: 0, value: 0 };
+    @expect(not c.put(1, 10, &mut ev)!);
+    @expect(not c.put(2, 20, &mut ev)!);
+    @expect(not c.put(3, 30, &mut ev)!);
+    @expect_eq(c.get(1)!, 10);
+    @expect(c.put(4, 40, &mut ev)!);
+    @expect_eq(ev.key, 2);
+    @expect_eq(order(c.iter(), buf[..]), "413");
+    (c.get_ptr(3)!).* = 33;
+    @expect_eq(order(c.iter(), buf[..]), "341");
+    @expect_eq(c.peek(3)!, 33);
+    @expect(c.contains(1));
+    @expect_eq(c.peek_lru()!.key, 1);
+    @expect_eq(c.pop_lru()!.key, 1);
+    @expect_eq(c.remove(4)!.value, 40);
+    @expect_eq(c.len(), 1);
+    c.clear();
+    @expect_eq(c.len(), 0);
 }

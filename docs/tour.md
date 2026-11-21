@@ -350,7 +350,7 @@ export fn main() i32 {
     for p in first {
         primes.push(p) catch return 1;
     }
-    let mut ages = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    let mut ages = map.Map.[[]u8, u32, hash.hash_bytes, hash.eq_bytes].init();
     defer ages.deinit();
     ages.put("ada", 36) catch return 1;
     ages.put("alan", 41) catch return 1;
@@ -368,7 +368,7 @@ No construct allocates. Memory comes from `std/mem`, the one global allocator, t
 calls you can see, and goes back with `mem.free`; `defer mem.free(buf)` is the idiom.
 The collections (`std/collections`: `vec`, `map`, `set`, `deque`, …) are built on it
 and own what they allocate until `deinit`. A `Map` takes its hash and equality
-functions when made, because the language has no traits to find them by.
+functions as generic arguments, because the language has no traits to find them by.
 
 Raw pointers (`*T`, `*mut T`) exist for the allocator, the runtime and C interop, and
 are the one place the checks stop: a pointer must stay inside the object it came from
