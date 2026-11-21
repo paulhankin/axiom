@@ -10,7 +10,7 @@
 //
 //     let mut it = url.query(u.query);                        // raw pairs
 //     loop {
-//         let p = it.next() catch break;
+//         let p = it.next() ?? break;
 //         let v = url.percent_decode(p.value, buf[..], true)!;   // '+' is a space
 //     }
 //     let mut q = url.query_writer(s.writer());               // "q=a+b&lang=fr"
@@ -50,8 +50,7 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 
-pub error UrlError { InvalidUrl, InvalidEscape, NotAbsolute, NotFound, Done, OutOfMemory, InvalidUtf8, IoError,
-                     EndOfStream }
+pub error UrlError { InvalidUrl, InvalidEscape, NotAbsolute, OutOfMemory }
 
 let HEX: []u8 = "0123456789ABCDEF";
 
@@ -116,10 +115,10 @@ pub struct Url {
         return self.userinfo[..c];
     }
 
-    /// The password: the userinfo after its first ':'; NotFound if there is
+    /// The password: the userinfo after its first ':'; .none if there is
     /// no ':'. (RFC 3986 deprecates passwords in URLs.)
-    pub fn password(self: Url) UrlError![]u8 {
-        let c = strs.index_of_byte(self.userinfo, ':') ?? return error.NotFound;
+    pub fn password(self: Url) ?[]u8 {
+        let c = strs.index_of_byte(self.userinfo, ':') ?? return .none;
         return self.userinfo[c + 1..];
     }
 
@@ -128,18 +127,21 @@ pub struct Url {
         return self.ip_literal and (self.hostname.len > 0) and (lower(self.hostname[0]) != 'v');
     }
 
-    /// The port given in the URL; NotFound if there is none (or it is empty).
-    pub fn port_number(self: Url) UrlError!u16 {
+    /// The port given in the URL; .none if there is none (or it is empty).
+    pub fn port_number(self: Url) ?u16 {
         if not self.has_port or (self.port.len == 0) {
-            return error.NotFound;
+            return .none;
         }
-        return parse_port(self.port) catch return error.NotFound;
+        return parse_port(self.port) catch return .none;
     }
 
-    /// The port given in the URL, else the scheme's default; NotFound if
+    /// The port given in the URL, else the scheme's default; .none if
     /// neither.
-    pub fn effective_port(self: Url) UrlError!u16 {
-        return self.port_number() catch return default_port(self.scheme);
+    pub fn effective_port(self: Url) ?u16 {
+        if let .some(p) = self.port_number() {
+            return p;
+        }
+        return default_port(self.scheme);
     }
 
     /// Writes the URL (RFC 3986 §5.3). A path that would be read as an
@@ -198,8 +200,8 @@ fn is_special_scheme(s: []u8) bool {
 }
 
 /// The default port of a scheme (ignoring case): http and ws 80, https and
-/// wss 443, ftp 21; NotFound for any other.
-pub fn default_port(scheme: []u8) UrlError!u16 {
+/// wss 443, ftp 21; .none for any other.
+pub fn default_port(scheme: []u8) ?u16 {
     if strs.eq_ignore_case(scheme, "http") or strs.eq_ignore_case(scheme, "ws") {
         return 80;
     }
@@ -209,7 +211,7 @@ pub fn default_port(scheme: []u8) UrlError!u16 {
     if strs.eq_ignore_case(scheme, "ftp") {
         return 21;
     }
-    return error.NotFound;
+    return .none;
 }
 
 // -----------------------------------------------------------------------------
@@ -319,7 +321,7 @@ pub fn form_encode_to(w: io.Writer, s: []u8) !void {
 /// strings and form data) into out, which must be at least as long as s and
 /// may be s itself. Fails with InvalidEscape on a '%' without two hex
 /// digits after it.
-pub fn percent_decode(s: []u8, out: []mut u8, plus: bool) UrlError![]mut u8 {
+pub fn percent_decode(s: []u8, out: []mut u8, plus: bool) { InvalidEscape }![]mut u8 {
     let mut n: usize = 0;
     let mut i: usize = 0;
     while i < s.len {
@@ -348,7 +350,7 @@ pub fn percent_decode(s: []u8, out: []mut u8, plus: bool) UrlError![]mut u8 {
 }
 
 /// s with its %XX escapes decoded, in new memory (free it with mem.free).
-pub fn decode(s: []u8, plus: bool) UrlError![]mut u8 {
+pub fn decode(s: []u8, plus: bool) { InvalidEscape, OutOfMemory }![]mut u8 {
     let out = mem.alloc.[u8](s.len)!;
     let d = percent_decode(s, out, plus) catch |e| {
         mem.free(out);
@@ -385,8 +387,8 @@ pub struct Query {
     s: []u8,
     i: usize,
 
-    /// The next pair; Done after the last.
-    pub fn next(self: *mut Query) UrlError!Pair {
+    /// The next pair; .none after the last.
+    pub fn next(self: *mut Query) ?Pair {
         while self.i < self.s.len {
             let rest = self.s[self.i..];
             let amp = strs.index_of_byte(rest, '&') ?? rest.len;
@@ -401,7 +403,7 @@ pub struct Query {
             }
             return Pair.{ key: item[..eq], value: item[eq + 1..] };
         }
-        return error.Done;
+        return .none;
     }
 }
 
@@ -411,16 +413,16 @@ pub fn query(q: []u8) Query {
 }
 
 /// The value of the first pair whose name is `name` (compared as written,
-/// still encoded); NotFound if there is none.
-pub fn query_value(q: []u8, name: []u8) UrlError![]u8 {
+/// still encoded); .none if there is none.
+pub fn query_value(q: []u8, name: []u8) ?[]u8 {
     let mut it = query(q);
     loop {
-        let p = it.next() catch break;
+        let p = it.next() ?? break;
         if @mem_eq(p.key, name) {
             return p.value;
         }
     }
-    return error.NotFound;
+    return .none;
 }
 
 /// Writes a query string pair by pair, form-encoding names and values:
@@ -464,7 +466,7 @@ pub fn build_query(pairs: []Pair) ![]mut u8 {
 // Parsing
 // -----------------------------------------------------------------------------
 
-fn parse_port(s: []u8) UrlError!u16 {
+fn parse_port(s: []u8) { InvalidUrl }!u16 {
     let mut v: u32 = 0;
     for c in s {
         if not strs.is_digit(c) {
@@ -684,7 +686,7 @@ fn valid_ipvfuture(s: []u8) bool {
     return true;
 }
 
-fn parse_authority(a: []u8, u: *mut Url) UrlError!void {
+fn parse_authority(a: []u8, u: *mut Url) { InvalidUrl }!void {
     let mut hp = a;
     let at = strs.last_index_of_byte(a, '@') ?? a.len;
     if at < a.len {
@@ -735,7 +737,7 @@ fn parse_authority(a: []u8, u: *mut Url) UrlError!void {
 /// "//host/p") into its components (slices of s). InvalidUrl if s holds a
 /// space or a control character, or its scheme, host or port is malformed
 /// (see the module comment for what else is accepted).
-pub fn parse(s: []u8) UrlError!Url {
+pub fn parse(s: []u8) { InvalidUrl }!Url {
     for c in s {
         if (c <= 0x20) or (c == 0x7f) {
             return error.InvalidUrl;
@@ -997,8 +999,8 @@ pub fn normalize_to(w: io.Writer, u: Url) !void {
             normalize_part(sw, u.hostname, Component.HOST, true)!;
         }
         // (default ports are never 0)
-        let port = u.port_number() catch 0;
-        let def = default_port(u.scheme) catch 0;
+        let port = u.port_number() ?? 0;
+        let def = default_port(u.scheme) ?? 0;
         if u.has_port and (u.port.len > 0) and ((def == 0) or (port != def)) {
             sw.write_all(":")!;
             sw.print_u64(@as(u64, port))!;
@@ -1067,10 +1069,10 @@ test "components and accessors" {
     @expect_eq(u.scheme, "https");
     @expect_eq(u.userinfo, "user:pa%3Ass");
     @expect_eq(u.username(), "user");
-    @expect_eq(u.password()!, "pa%3Ass");
+    @expect_eq(u.password() ?? @trap(), "pa%3Ass");
     @expect_eq(u.hostname, "Example.COM");
     @expect_eq(u.port, "8443");
-    @expect_eq(u.port_number()!, 8443);
+    @expect_eq(u.port_number() ?? @trap(), 8443);
     @expect_eq(u.path, "/a/b");
     @expect_eq(u.query, "x=1&y=two%20words");
     @expect_eq(u.fragment, "top");
@@ -1078,25 +1080,32 @@ test "components and accessors" {
     let v = parse("HTTP://[2001:DB8::1]/")!;
     @expect(v.scheme_is("http") and v.is_ipv6());
     @expect_eq(v.hostname, "2001:DB8::1");
-    @expect_eq(v.effective_port()!, 80);
-    _ = v.port_number() catch |e| {
-        @expect_eq(e, error.NotFound);
-        let r = parse("../g?q")!;
-        @expect(not r.is_absolute() and not r.has_authority and r.has_query);
-        @expect_eq(r.path, "../g");
-        let e2 = parse("http://h:/?#")!;
-        @expect(e2.has_port and (e2.port.len == 0) and e2.has_query and e2.has_fragment);
-        @expect_eq(e2.query, "");
-        let m = parse("mailto:a@example.com")!;
-        @expect_eq(m.path, "a@example.com");
-        @expect(not m.has_authority);
-        _ = m.effective_port() catch |e3| {
-            @expect_eq(e3, error.NotFound);
-            return;
-        };
+    @expect_eq(v.effective_port() ?? @trap(), 80);
+    if let .some(p) = v.port_number() {
+        _ = p;
         @trap();
-    };
-    @trap();
+    }
+    if let .some(pw) = v.password() {
+        _ = pw;
+        @trap();
+    }
+    let r = parse("../g?q")!;
+    @expect(not r.is_absolute() and not r.has_authority and r.has_query);
+    @expect_eq(r.path, "../g");
+    let e2 = parse("http://h:/?#")!;
+    @expect(e2.has_port and (e2.port.len == 0) and e2.has_query and e2.has_fragment);
+    @expect_eq(e2.query, "");
+    let m = parse("mailto:a@example.com")!;
+    @expect_eq(m.path, "a@example.com");
+    @expect(not m.has_authority);
+    if let .some(p) = m.effective_port() {
+        _ = p;
+        @trap();
+    }
+    if let .some(p) = default_port("mailto") {
+        _ = p;
+        @trap();
+    }
 }
 
 test "invalid URLs" {
@@ -1303,8 +1312,12 @@ test "encoding, decoding and queries" {
         };
         @trap();
     }
-    @expect_eq(query_value("a=1&bb=x%20y&c", "bb")!, "x%20y");
-    @expect_eq(query_value("a=1&bb=x%20y&c", "c")!, "");
+    @expect_eq(query_value("a=1&bb=x%20y&c", "bb") ?? @trap(), "x%20y");
+    @expect_eq(query_value("a=1&bb=x%20y&c", "c") ?? @trap(), "");
+    if let .some(val) = query_value("a=1&bb=x%20y&c", "missing") {
+        _ = val;
+        @trap();
+    }
     s.clear();
     let mut q = query_writer(s.writer());
     q.add("q", "a b&c=d")!;
@@ -1381,10 +1394,10 @@ test "Python's urllib.parse" {
             if strs.eq(want_port, "-") {
                 @expect(not u.has_port);
             } else {
-                @expect_eq(@as(u64, u.port_number()!), io.parse_u64(want_port)!);
+                @expect_eq(@as(u64, u.port_number() ?? @trap()), io.parse_u64(want_port)!);
             }
             @expect_eq(opt(u.has_userinfo, u.username()), f.next() ?? @trap());
-            @expect_eq(u.password() catch "-", f.next() ?? @trap());
+            @expect_eq(u.password() ?? "-", f.next() ?? @trap());
             // and it serializes as it was
             u.write_to(s.writer())!;
             @expect_eq(s.bytes(), text);
@@ -1412,7 +1425,7 @@ test "Python's urllib.parse" {
             let mut it = query(f.next() ?? @trap());
             let mut want = strs.split(f.next() ?? @trap(), ",");
             loop {
-                let p = it.next() catch break;
+                let p = it.next() ?? break;
                 let w = want.next() ?? @trap();
                 let eq = strs.index_of_byte(w, '=') ?? @trap();
                 @expect_eq(percent_decode(p.key, b1[..], true)!, hexs(w[..eq], b2[..]));

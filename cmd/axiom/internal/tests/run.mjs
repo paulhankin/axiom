@@ -2329,7 +2329,7 @@ await section('spec §16.3', {
         '    if (s.len > 1) and (s[0] == \'a\') and (s[1] == \'b\') {', '        return "ab";', '    }',
         '    let mut n: usize = 0;', '    for c in s {', '        if c == \'x\' {', '            n += 1;', '        }', '    }',
         '    if n > 2 {', '        return "many";', '    }', '    return "other";', '}', '',
-        'export fn main() i32 {', '    let s = os.arg(1) catch return 1;',
+        'export fn main() i32 {', '    let s = (os.arg(1) catch return 1) ?? return 1;',
         '    io.stdout().write_all(classify(s)) catch return 1;', '    return 0;', '}', ''].join('\n'));
       const o = path.join(dir, 'cov');
       const c = spawnSync(compiler, ['build', f, '--coverage=afl', '-o', o, '--target=native', ...extraFlags], { encoding: 'utf8' });

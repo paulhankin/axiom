@@ -12,7 +12,7 @@
 //
 //     let mut r = protobuf.Reader.init(bytes);          // reading
 //     loop {
-//         let f = r.next() catch |err| { if err == error.Done { break; } return err; };
+//         let f = r.next()! ?? break;
 //         if f.number == 2 { name = f.as_string()!; }
 //         if f.number == 3 { let mut inner = f.message()!; ... }
 //     }
@@ -37,8 +37,8 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "hex.ax" as hex;
 
-pub error ProtobufError { Done, Truncated, Corrupt, Overflow, WrongType, TooDeep, NotFound, OutOfMemory, IoError,
-                          BadFormat, InvalidUtf8, Empty, InvalidNumber }
+pub error ProtobufError { Truncated, Corrupt, Overflow, WrongType, TooDeep, OutOfMemory, IoError, BadFormat,
+                          InvalidUtf8, Empty, InvalidNumber }
 
 // Wire types
 pub const VARINT: u8 = 0;
@@ -428,16 +428,16 @@ pub struct Varints {
     single: bool,
     one: u64,
 
-    pub fn next(self: *mut Varints) ProtobufError!u64 {
+    pub fn next(self: *mut Varints) ProtobufError!?u64 {
         if self.single {
             self.single = false;
             self.s = "";
-            return self.one;
+            return .some(self.one);
         }
         if self.i >= self.s.len {
-            return error.Done;
+            return .none;
         }
-        return read_varint(self.s, &mut self.i);
+        return .some(read_varint(self.s, &mut self.i)!);
     }
 }
 
@@ -446,10 +446,11 @@ pub struct Fixed {
     i: usize,
     size: usize,
 
-    /// The next value's bits (bit_cast them for floats and signed types).
-    pub fn next(self: *mut Fixed) ProtobufError!u64 {
+    /// The next value's bits (bit_cast them for floats and signed types), or
+    /// .none at the end.
+    pub fn next(self: *mut Fixed) ?u64 {
         if self.i >= self.s.len {
-            return error.Done;
+            return .none;
         }
         let mut v: u64 = 0;
         for k in @as(usize, 0)..self.size {
@@ -469,10 +470,10 @@ pub struct Reader {
         return Reader.{ s: bytes, i: 0 };
     }
 
-    /// The next field, or error.Done at the end.
-    pub fn next(self: *mut Reader) ProtobufError!Field {
+    /// The next field, or .none at the end.
+    pub fn next(self: *mut Reader) ProtobufError!?Field {
         if self.i >= self.s.len {
-            return error.Done;
+            return .none;
         }
         let k = read_varint(self.s, &mut self.i)!;
         let num = k >> 3;
@@ -510,7 +511,7 @@ pub struct Reader {
         } else {
             return error.Corrupt;  // (a stray end-group, or wire types 6 and 7)
         }
-        return f;
+        return .some(f);
     }
 
     // Skips to the end of a group: returns where its contents end.
@@ -549,25 +550,15 @@ pub struct Reader {
     }
 
     /// The last field with this number (for singular fields, the last one
-    /// wins), or error.NotFound.
-    pub fn last(self: *Reader, number: u32) ProtobufError!Field {
+    /// wins), or .none.
+    pub fn last(self: *Reader, number: u32) ProtobufError!?Field {
         let mut r = Reader.init(self.s);
-        let mut found = false;
-        let mut out = Field.{ number: 0, wire: 0, bits: 0, data: "" };
+        let mut out: ?Field = .none;
         loop {
-            let f = r.next() catch |e| {
-                if e == error.Done {
-                    break;
-                }
-                return e;
-            };
+            let f = r.next()! ?? break;
             if f.number == number {
-                out = f;
-                found = true;
+                out = .some(f);
             }
-        }
-        if not found {
-            return error.NotFound;
         }
         return out;
     }
@@ -577,12 +568,7 @@ pub struct Reader {
         let mut r = Reader.init(self.s);
         let mut n: usize = 0;
         loop {
-            let f = r.next() catch |e| {
-                if e == error.Done {
-                    break;
-                }
-                return e;
-            };
+            let f = r.next()! ?? break;
             if f.number == number {
                 n += 1;
             }
@@ -595,9 +581,7 @@ pub struct Reader {
 pub fn is_message(bytes: []u8) bool {
     let mut r = Reader.init(bytes);
     loop {
-        _ = r.next() catch |e| {
-            return e == error.Done;
-        };
+        _ = (r.next() catch return false) ?? return true;
     }
 }
 
@@ -633,12 +617,7 @@ fn raw_fields(out: io.Writer, bytes: []u8, depth: u32) !void {
     }
     let mut r = Reader.init(bytes);
     loop {
-        let f = r.next() catch |e| {
-            if e == error.Done {
-                return;
-            }
-            return e;
-        };
+        let f = r.next()! ?? return;
         indent(out, depth)!;
         if (f.wire == LEN) or (f.wire == SGROUP) {
             if (f.data.len > 0) and ((f.wire == SGROUP) or is_message(f.data)) and (depth < MAX_DEPTH) {
@@ -705,17 +684,28 @@ test "the encoding guide's examples" {
     // (the packed field happens to parse as a message too, as protoc also shows)
     @expect_eq(raw, "1: 150\n2: \"testing\"\n3 {\n  1: 150\n}\n4: \"\\003\\216\\002\\236\\247\\005\"\n");
     let mut r = Reader.init(e.bytes());
-    @expect_eq(r.last(2)!.as_string()!, "testing");
-    let mut inner = r.last(3)!.message()!;
-    @expect_eq(inner.next()!.as_u64()!, 150);
-    let mut vs = r.last(4)!.varints()!;
+    @expect_eq((r.last(2)! ?? @trap()).as_string()!, "testing");
+    let mut inner = (r.last(3)! ?? @trap()).message()!;
+    @expect_eq((inner.next()! ?? @trap()).as_u64()!, 150);
+    @expect(is_none_opt(inner.next()!));
+    let mut vs = (r.last(4)! ?? @trap()).varints()!;
     let mut sum: u64 = 0;
     while true {
-        sum += vs.next() catch break;
+        sum += vs.next()! ?? break;
     }
     @expect_eq(sum, 3 + 270 + 86942);
     @expect_eq(r.count(1)!, 1);
-    @expect(fails_field(r.last(9)));
+    @expect(is_none_opt(r.last(9)!));
+    // packed fixed32 round-trip
+    let mut fx_enc = Encoder.init();
+    defer fx_enc.deinit();
+    let fvals: [2]u32 = [11, 22];
+    fx_enc.packed_fixed32(5, fvals[..])!;
+    let fx_r = Reader.init(fx_enc.bytes());
+    let mut fx_it = (fx_r.last(5)! ?? @trap()).fixed(4)!;
+    @expect_eq(fx_it.next() ?? @trap(), 11);
+    @expect_eq(fx_it.next() ?? @trap(), 22);
+    @expect(is_none_opt(fx_it.next()));
     // deeper nesting fills in every length
     let mut d = Encoder.init();
     defer d.deinit();
@@ -729,8 +719,10 @@ test "the encoding guide's examples" {
     @expect_eq(d.bytes(), "\x0a\x07\x0a\x05\x0a\x03\x12\x01x");
 }
 
-fn fails_field(r: !Field) bool {
-    _ = r catch return true;
+fn is_none_opt[T](v: ?T) bool {
+    if let .none = v {
+        return true;
+    }
     return false;
 }
 
@@ -751,7 +743,7 @@ test "every scalar type, against the protobuf library" {
         let mut e = Encoder.init();
         defer e.deinit();
         let mut r = Reader.init(want);
-        let fld = r.next()!;
+        let fld = r.next()! ?? @trap();
         @expect_eq(fld.number, num);
         if strs.eq(typ, "int32") {
             let v = fmt.parse_int.[i32](val)!;
@@ -833,15 +825,10 @@ test "a real message: descriptor.proto" {
     let mut fields: usize = 0;
     let mut it = Reader.init(bin);
     loop {
-        let f = it.next() catch |e| {
-            if e == error.Done {
-                break;
-            }
-            return e;
-        };
+        let f = it.next()! ?? break;
         if f.number == 4 {
             let mut m = f.message()!;
-            let name = m.last(1)!.as_string()!;
+            let name = (m.last(1)! ?? @trap()).as_string()!;
             let nf = m.count(2)!;  // DescriptorProto.field
             fields += nf;
             fmt.write(names.writer(), "message {} {}\n", [fmt.str(name), fmt.int(nf)])!;
@@ -850,8 +837,8 @@ test "a real message: descriptor.proto" {
     let mut want = strs.String.init();
     defer want.deinit();
     fmt.write(want.writer(), "name {}\npackage {}\nmessages {}\nfields {}\nenums {}\n{}",
-              [fmt.str(r.last(1)!.as_string()!), fmt.str(r.last(2)!.as_string()!), fmt.int(r.count(4)!),
-               fmt.int(fields), fmt.int(r.count(5)!), fmt.str(names.bytes())])!;
+              [fmt.str((r.last(1)! ?? @trap()).as_string()!), fmt.str((r.last(2)! ?? @trap()).as_string()!),
+               fmt.int(r.count(4)!), fmt.int(fields), fmt.int(r.count(5)!), fmt.str(names.bytes())])!;
     let body = facts[(strs.index_of(facts, "\n") ?? @trap()) + 1..];
     @expect_eq(want.bytes(), body);
     // copying every field reproduces the message
@@ -859,12 +846,7 @@ test "a real message: descriptor.proto" {
     defer e.deinit();
     let mut all = Reader.init(bin);
     loop {
-        let f = all.next() catch |err| {
-            if err == error.Done {
-                break;
-            }
-            return err;
-        };
+        let f = all.next()! ?? break;
         if f.wire == LEN {
             e.bytes_field(f.number, f.data)!;
         } else if f.wire == VARINT {
@@ -885,9 +867,7 @@ test "a real message: descriptor.proto" {
 fn fails_all(bytes: []u8) bool {
     let mut r = Reader.init(bytes);
     loop {
-        _ = r.next() catch |e| {
-            return e != error.Done;
-        };
+        _ = (r.next() catch return true) ?? return false;
     }
 }
 

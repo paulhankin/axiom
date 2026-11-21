@@ -338,13 +338,13 @@ export fn main() i32 {
 See also [`examples/wordcount/wordcount.ax`](../examples/wordcount/wordcount.ax) and
 [`examples/http_server/http_server.ax`](../examples/http_server/http_server.ax), a JSON API over HTTP.
 
-Iterators (`str.split`, `regex.find_all`, …) have a `next()` that fails with
-`error.Done` after the last item:
+Iterators (`str.split`, `regex.find_all`, …) have a `next()` that returns
+`.none` after the last item (with `!` when an iteration step can fail):
 
 ```axiom
 let mut it = str.split(line, ",");
 loop {
-    let field = it.next() catch break;
+    let field = it.next() ?? break;
     ...
 }
 ```

@@ -4,12 +4,12 @@
 //
 //     mime.type_by_extension("png")                   // "image/png"
 //     let mt = mime.parse_media_type(content_type);  // mt.essence, mt.is("text/html")
-//     let b = mime.param_alloc(content_type, "boundary")!;
+//     let b = (mime.param_alloc(content_type, "boundary")!) ?? ...;
 //
 //     let mut mp = mime.Multipart.init(body, b)!;
 //     loop {
-//         let part = mp.next() catch |e| { if e == error.Done { break; } return e; };
-//         let name = part.param_alloc("Content-Disposition", "name")!;
+//         let part = mp.next()! ?? break;
+//         let name = (part.param_alloc("Content-Disposition", "name")!) ?? "";
 //         ... part.body ...
 //     }
 //
@@ -29,8 +29,8 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 
-pub error MimeError { NotFound, Done, InvalidMultipart, InvalidEncoding, InvalidArgument, OutOfMemory, Unavailable,
-                      InvalidUtf8, IoError, RandomFailed }
+pub error MimeError { InvalidMultipart, InvalidEncoding, InvalidArgument, OutOfMemory, Unavailable, InvalidUtf8,
+                      IoError, RandomFailed }
 
 // -----------------------------------------------------------------------------
 // Media types
@@ -109,15 +109,15 @@ pub fn type_by_extension(ext0: []u8) []u8 {
     return "application/octet-stream";
 }
 
-/// The usual extension (without the dot) for a media type.
-pub fn extension_by_type(t: []u8) MimeError![]u8 {
+/// The usual extension (without the dot) for a media type, or .none.
+pub fn extension_by_type(t: []u8) ?[]u8 {
     let essence = parse_media_type(t).essence;
     for e in TYPES {
         if strs.eq_ignore_case(parse_media_type(e[1]).essence, essence) {
             return e[0];
         }
     }
-    return error.NotFound;
+    return .none;
 }
 
 /// A Content-Type value split into "type/subtype" and its parameters.
@@ -148,11 +148,11 @@ fn is_token_char(c: u8) bool {
 /// The value of parameter `name` in a header value such as
 /// `form-data; name="field"; filename*=UTF-8''na%C3%AFve.txt` (free it with
 /// mem.free): quoted strings are unescaped, and the RFC 2231 `name*` form
-/// (UTF-8 or US-ASCII) is decoded and preferred.
-pub fn param_alloc(h: []u8, name: []u8) MimeError![]mut u8 {
+/// (UTF-8 or US-ASCII) is decoded and preferred. Returns .none if absent.
+pub fn param_alloc(h: []u8, name: []u8) MimeError!?[]mut u8 {
     let mut plain = NO_RANGE;
     let mut ext = NO_RANGE;
-    let mut i = strs.index_of_byte(h, ';') ?? return error.NotFound;
+    let mut i = strs.index_of_byte(h, ';') ?? return .none;
     while i < h.len {
         // ; name = value
         i += 1;
@@ -208,12 +208,12 @@ pub fn param_alloc(h: []u8, name: []u8) MimeError![]mut u8 {
         i = strs.index_of_from(h, ";", i) ?? h.len;
     }
     if ext.start != NO_RANGE.start {
-        return decode_ext_value(strs.trim(h[ext.start..ext.end]));
+        return .some(decode_ext_value(strs.trim(h[ext.start..ext.end]))!);
     }
     if plain.start != NO_RANGE.start {
-        return unquote(strs.trim(h[plain.start..plain.end]));
+        return .some(unquote(strs.trim(h[plain.start..plain.end]))!);
     }
-    return error.NotFound;
+    return .none;
 }
 
 struct Range {
@@ -295,8 +295,8 @@ fn hexv(c: u8) u8 {
 }
 
 /// The value of header `name` in a block of "Name: value" lines (CRLF or
-/// LF), trimmed; the first one if repeated.
-pub fn header(block: []u8, name: []u8) MimeError![]u8 {
+/// LF), trimmed; the first one if repeated, or .none.
+pub fn header(block: []u8, name: []u8) ?[]u8 {
     let mut i: usize = 0;
     while i < block.len {
         let nl = strs.index_of_from(block, "\n", i) ?? block.len;
@@ -310,7 +310,7 @@ pub fn header(block: []u8, name: []u8) MimeError![]u8 {
         }
         i = nl + 1;
     }
-    return error.NotFound;
+    return .none;
 }
 
 // -----------------------------------------------------------------------------
@@ -418,13 +418,14 @@ pub struct Part {
     body: []u8,
 
     /// A header of the part (see header()).
-    pub fn header(self: *Part, name: []u8) MimeError![]u8 {
+    pub fn header(self: *Part, name: []u8) ?[]u8 {
         return header(self.headers, name);
     }
 
     /// A parameter of one of the part's headers (see param_alloc()).
-    pub fn param_alloc(self: *Part, header_name: []u8, name: []u8) MimeError![]mut u8 {
-        return param_alloc(header(self.headers, header_name)!, name);
+    pub fn param_alloc(self: *Part, header_name: []u8, name: []u8) MimeError!?[]mut u8 {
+        let h = header(self.headers, header_name) ?? return .none;
+        return param_alloc(h, name);
     }
 }
 
@@ -477,10 +478,10 @@ pub struct Multipart {
         return (j < d.len) and ((d[j] == '\r') or (d[j] == '\n'));
     }
 
-    /// The next part, or Done after the last.
-    pub fn next(self: *mut Multipart) MimeError!Part {
+    /// The next part, or .none after the last.
+    pub fn next(self: *mut Multipart) MimeError!?Part {
         if self.done {
-            return error.Done;
+            return .none;
         }
         let d = self.data;
         if not self.started {
@@ -491,7 +492,7 @@ pub struct Multipart {
         let mut i = self.pos + self.dlen;
         if ((i + 2) <= d.len) and (d[i] == '-') and (d[i + 1] == '-') {
             self.done = true;
-            return error.Done;
+            return .none;
         }
         while (i < d.len) and ((d[i] == ' ') or (d[i] == '\t')) {
             i += 1;
@@ -528,7 +529,7 @@ pub struct Multipart {
             }
         }
         self.pos = next;
-        return Part.{ headers: d[hs..he], body: d[bs..be] };
+        return .some(Part.{ headers: d[hs..he], body: d[bs..be] });
     }
 }
 
@@ -708,23 +709,43 @@ fn push_escaped(s: *mut strs.String, v: []u8) MimeError!void {
 test "media types and parameters" {
     @expect_eq(type_by_extension(".PNG"), "image/png");
     @expect_eq(type_by_extension("unknown"), "application/octet-stream");
-    @expect_eq(extension_by_type("image/jpeg; q=1")!, "jpg");
+    @expect_eq(extension_by_type("image/jpeg; q=1") ?? @trap(), "jpg");
+    @expect(is_none_opt(extension_by_type("application/x-unknown")));
     let mt = parse_media_type(" Text/HTML ; charset=UTF-8");
     @expect(mt.is("text/html"));
     @expect(mt.is("text/*"));
     @expect(not mt.is("image/*"));
     let h = "form-data; name=\"a \\\"b\\\"\"; filename=plain.txt; filename*=UTF-8''na%C3%AFve%20file.txt";
-    let n = param_alloc(h, "name")!;
+    let n = (param_alloc(h, "name")!) ?? @trap();
     defer mem.free(n);
     @expect_eq(n, "a \"b\"");
-    let f = param_alloc(h, "FILENAME")!;
+    let f = (param_alloc(h, "FILENAME")!) ?? @trap();
     defer mem.free(f);
     @expect_eq(f, "na\xc3\xafve file.txt");
-    @expect(missing(param_alloc(h, "size")));
-    @expect(missing(param_alloc("text/plain", "charset")));
-    let b = param_alloc("multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW", "boundary")!;
+    @expect(is_none_opt(param_alloc(h, "size")!));
+    @expect(is_none_opt(param_alloc("text/plain", "charset")!));
+    @expect(is_invalid_enc(param_alloc("x; name=\"unterminated", "name")));
+    let b = (param_alloc("multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+                         "boundary")!) ?? @trap();
     defer mem.free(b);
     @expect_eq(b, "----WebKitFormBoundary7MA4YWxkTrZu0gW");
+}
+
+fn is_invalid_enc(r: MimeError!?[]mut u8) bool {
+    let v = r catch |e| {
+        return e == error.InvalidEncoding;
+    };
+    if let .some(s) = v {
+        mem.free(s);
+    }
+    return false;
+}
+
+fn is_none_opt[T](v: ?T) bool {
+    if let .none = v {
+        return true;
+    }
+    return false;
 }
 
 fn missing(r: ![]mut u8) bool {
@@ -757,15 +778,17 @@ test "multipart" {
     let body =
         "preamble\r\n--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--XyZ\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nline 1\r\n--XyZnot a delimiter\r\n\r\n--XyZ--\r\nepilogue";
     let mut mp = Multipart.init(body, "XyZ")!;
-    let p1 = mp.next()!;
+    let p1 = (mp.next()!) ?? @trap();
     @expect_eq(p1.body, "Hello");
-    let n1 = p1.param_alloc("content-disposition", "name")!;
+    let n1 = (p1.param_alloc("content-disposition", "name")!) ?? @trap();
     defer mem.free(n1);
     @expect_eq(n1, "title");
-    let p2 = mp.next()!;
-    @expect_eq(p2.header("Content-Type")!, "text/plain");
+    @expect(is_none_opt(p1.header("X-Missing")));
+    @expect(is_none_opt(p1.param_alloc("X-Missing", "name")!));
+    let p2 = (mp.next()!) ?? @trap();
+    @expect_eq(p2.header("Content-Type") ?? @trap(), "text/plain");
     @expect_eq(p2.body, "line 1\r\n--XyZnot a delimiter\r\n");
-    @expect(done(mp.next()));
+    @expect(is_none_opt(mp.next()!));
 }
 
 test "multipart round trip and bad input" {
@@ -775,27 +798,27 @@ test "multipart round trip and bad input" {
     w.add_file("up", "x\r\ny.bin", "application/octet-stream", "\x00\x01\x02")!;
     let ct = w.content_type_alloc()!;
     defer mem.free(ct);
-    let b = param_alloc(ct, "boundary")!;
+    let b = (param_alloc(ct, "boundary")!) ?? @trap();
     defer mem.free(b);
     let body = w.finish()!;
     defer mem.free(body);
     let mut mp = Multipart.init(body, b)!;
-    let p1 = mp.next()!;
-    let n = p1.param_alloc("Content-Disposition", "name")!;
+    let p1 = (mp.next()!) ?? @trap();
+    let n = (p1.param_alloc("Content-Disposition", "name")!) ?? @trap();
     defer mem.free(n);
     @expect_eq(n, "na%22me");
     @expect_eq(p1.body, "value");
-    let p2 = mp.next()!;
+    let p2 = (mp.next()!) ?? @trap();
     @expect_eq(p2.body, "\x00\x01\x02");
-    let f = p2.param_alloc("Content-Disposition", "filename")!;
+    let f = (p2.param_alloc("Content-Disposition", "filename")!) ?? @trap();
     defer mem.free(f);
     @expect_eq(f, "x%0D%0Ay.bin");
-    @expect(done(mp.next()));
+    @expect(is_none_opt(mp.next()!));
     // truncated or malformed bodies fail cleanly
     let cuts: [4][]u8 = ["--b\r\nX: y", "--b\r\n\r\nno end", "no delimiter", "--bX\r\n"];
     for c in cuts {
         let mut m = Multipart.init(c, "b")!;
-        @expect(not done(m.next()));
+        @expect(is_err_part(m.next()));
     }
     let mut w2 = MultipartWriter.init()!;
     defer w2.deinit();
@@ -840,9 +863,9 @@ test "multipart writing to an io.Writer" {
     @expect_eq(sink.bytes(), body);
     @expect_eq(copy.bytes(), body);
     let mut mp = Multipart.init(body, w.boundary_text())!;
-    @expect_eq(mp.next()!.body, "1");
-    @expect_eq(mp.next()!.body, "hello\r\n");
-    @expect(done(mp.next()));
+    @expect_eq((mp.next()! ?? @trap()).body, "1");
+    @expect_eq((mp.next()! ?? @trap()).body, "hello\r\n");
+    @expect(is_none_opt(mp.next()!));
     // a full destination fails with its error
     let mut small: [10]u8 = [0; 10];
     let mut bw = io.BufferWriter.init(small[..]);
@@ -861,10 +884,8 @@ fn done_or_ok_bytes(r: ![]mut u8) bool {
     return true;
 }
 
-fn done(r: !Part) bool {
-    _ = r catch |e| {
-        return e == error.Done;
-    };
+fn is_err_part(r: MimeError!?Part) bool {
+    _ = r catch return true;
     return false;
 }
 
