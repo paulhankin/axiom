@@ -33,7 +33,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
-AX = ['hashmap', 'matmul', 'sieve', 'sort', 'strings', 'alloc_tree']
+AX = ['hashmap', 'matmul', 'sieve', 'sort', 'strings', 'alloc_tree', 'vecpush']
 
 
 def programs(flt):
