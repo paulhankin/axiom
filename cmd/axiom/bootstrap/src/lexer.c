@@ -14,6 +14,7 @@ static const char *kw_names[] = {
     KEYWORDS(X)
 #undef X
 };
+_Static_assert(sizeof kw_names / sizeof *kw_names == (size_t)(KW_WHILE - KW_AND + 1), "kw_names mismatch");
 
 static const char *reserved_future[] = {"async", "await", "comptime", "impl", "interface",
                                         "null", "trait", "type", "unsafe", "yield"};

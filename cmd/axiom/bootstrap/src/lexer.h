@@ -25,18 +25,25 @@
     X(IF, "if")              \
     X(IMPORT, "import")      \
     X(IN, "in")              \
+    X(INFER, "infer")        \
+    X(INLINE, "inline")      \
     X(LET, "let")            \
     X(LOOP, "loop")          \
     X(MATCH, "match")        \
     X(MUT, "mut")            \
+    X(NOALIAS, "noalias")    \
+    X(NOCOPY, "nocopy")      \
     X(NOT, "not")            \
     X(OR, "or")              \
+    X(PART, "part")          \
     X(PUB, "pub")            \
     X(RETURN, "return")      \
     X(SELF, "Self")          \
     X(STRUCT, "struct")      \
     X(TEST, "test")          \
+    X(THREADLOCAL, "threadlocal") \
     X(TRUE, "true")          \
+    X(UNDEFINED, "undefined") \
     X(UNION, "union")        \
     X(WHILE, "while")
 
