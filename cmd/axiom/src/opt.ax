@@ -84,11 +84,14 @@ pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
 // rpo, after cfg_sync.
 fn rpo_kept(f: *mut ir.Func) u.List.[*mut ir.Block] {
     if (f.cfg_have & 2) != 0 {
-        let mut b = f.first;
-        while u.notnil(b) {
-            b.rpo = -1;
-            b.aux = 0;
-            b = b.next;
+        if (f.cfg_have & 8) == 0 {
+            // (the blocks it does not reach)
+            let mut b = f.first;
+            while u.notnil(b) {
+                b.rpo = -1;
+                b.aux = 0;
+                b = b.next;
+            }
         }
         let order = f.cfg_order.copy();
         for i in 0..order.len {
@@ -101,6 +104,9 @@ fn rpo_kept(f: *mut ir.Func) u.List.[*mut ir.Block] {
             if not same_blocks(&again, &order) {
                 u.die("AXIOM_CHECK_CFG: a kept reverse postorder is not the CFG's");
             }
+            if ((f.cfg_have & 8) != 0) and (again.len != rpo_blocks) {
+                u.die("AXIOM_CHECK_CFG: a kept reverse postorder has not every block");
+            }
             again.deinit();
         }
         return order;
@@ -109,6 +115,9 @@ fn rpo_kept(f: *mut ir.Func) u.List.[*mut ir.Block] {
     f.cfg_order.clear();
     @mem_copy(f.cfg_order.extend(order.len), order.items());
     f.cfg_have |= 2;
+    if order.len == rpo_blocks {
+        f.cfg_have |= 8;
+    }
     return order;
 }
 
@@ -124,6 +133,9 @@ fn same_blocks(x: *u.List.[*mut ir.Block], y: *u.List.[*mut ir.Block]) bool {
     return true;
 }
 
+// (rpo_now) The number of f's blocks, reached or not.
+threadlocal let mut rpo_blocks: usize = 0;
+
 fn rpo_now(f: *mut ir.Func) u.List.[*mut ir.Block] {
     let mut out = u.List.[*mut ir.Block].empty();
     let mut b = f.first;
@@ -134,6 +146,7 @@ fn rpo_now(f: *mut ir.Func) u.List.[*mut ir.Block] {
         n += 1;
         b = b.next;
     }
+    rpo_blocks = n;
     if u.isnil(f.first) {
         return out;
     }
@@ -489,7 +502,8 @@ pub fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) 
     out.clear();
     h.mark = tag;
     out.push(h);
-    let mut work = u.List.[*mut ir.Block].empty();
+    let work = &mut mem_work;
+    work.clear();
     for k in 0..h.preds.len {
         let p = h.preds.get(k);
         if is_back_edge(p, h) and (p.mark != tag) {
@@ -508,8 +522,11 @@ pub fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) 
             }
         }
     }
-    work.deinit();
 }
+
+// (members_of, kept for the next call)
+threadlocal let mut mem_work: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{
+    data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0, cap: 0 };
 
 // True if v is an instruction in a block marked tag.
 pub fn in_members(v: *ir.Value, tag: i64) bool {
@@ -590,10 +607,12 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
     for i in 0..order.len {
         order.get(i).loop_depth = 0;
     }
+    let mut body = u.List.[*mut ir.Block].empty();
+    let mut members = u.List.[*mut ir.Block].empty();
     for i in 0..order.len {
         let h = order.get(i);
         // back edges into h: collect the loop body by walking predecessors
-        let mut body = u.List.[*mut ir.Block].empty();
+        body.clear();
         for k in 0..h.preds.len {
             let p = h.preds.get(k);
             if is_back_edge(p, h) {
@@ -605,7 +624,7 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
         }
         let mark = @int_cast(i64, i) + 1000000;
         h.aux = mark;
-        let mut members = u.List.[*mut ir.Block].empty();
+        members.clear();
         members.push(h);
         while body.len > 0 {
             let x = body.pop();
@@ -624,9 +643,9 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
         for k in 0..members.len {
             members.get(k).loop_depth += 1;
         }
-        body.deinit();
-        members.deinit();
     }
+    body.deinit();
+    members.deinit();
 }
 
 // -----------------------------------------------------------------------------
@@ -762,10 +781,11 @@ pub fn mem2reg(f: *mut ir.Func) void {
     let B = ir.new_builder();
     let placed = u.newn.[i64](n + 1);
     let inwork = u.newn.[i64](n + 1);
+    let mut work = u.List.[*mut ir.Block].empty();
     for si in 0..slots.len {
         let s = slots.get(si);
         let tag = @int_cast(i64, si) + 1;
-        let mut work = u.List.[*mut ir.Block].empty();
+        work.clear();
         for k in 0..s.defs.len {
             let d = s.defs.get(k);
             inwork[@int_cast(usize, d.rpo)] = tag;
@@ -803,8 +823,8 @@ pub fn mem2reg(f: *mut ir.Func) void {
                 }
             }
         }
-        work.deinit();
     }
+    work.deinit();
     // renaming, over the dominator tree
     struct_rename(f, order.get(0), slots.items_mut());
     // delete the promoted allocas
@@ -1538,37 +1558,42 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
         return vnil();
     }
     if op == ir.OP_PHI {
-        // all inputs the same (ignoring the phi itself)
-        let mut same = vnil();
-        let mut undefs = false;
-        for k in 0..i.xs.len {
-            let x = i.xs.get(k);
-            if x == i {
-                continue;
-            }
-            if x.kind == ir.V_UNDEF {
-                undefs = true;
-                continue;
-            }
-            if u.isnil(same) {
-                same = x;
-            } else if same != x {
-                return vnil();
-            }
-        }
-        if u.isnil(same) {
-            return ir.undef(i.ty);
-        }
-        // phi(x, undef) is x only where x is defined on every path: else the
-        // undef paths would read a value never computed on them. An x of
-        // the phi's own block comes round a loop: after the phi, or a phi
-        // whose value from the previous iteration this phi holds.
-        if undefs and (same.kind == ir.V_INST) and ((same.blk == i.blk) or not fold_dominates(same.blk, i.blk)) {
-            return vnil();
-        }
-        return same;
+        return fold_phi(i);
     }
     return vnil();
+}
+
+// (fold) A phi of one value: that value.
+fn fold_phi(i: *mut ir.Value) *mut ir.Value {
+    // all inputs the same (ignoring the phi itself)
+    let mut same = vnil();
+    let mut undefs = false;
+    for k in 0..i.xs.len {
+        let x = i.xs.get(k);
+        if x == i {
+            continue;
+        }
+        if x.kind == ir.V_UNDEF {
+            undefs = true;
+            continue;
+        }
+        if u.isnil(same) {
+            same = x;
+        } else if same != x {
+            return vnil();
+        }
+    }
+    if u.isnil(same) {
+        return ir.undef(i.ty);
+    }
+    // phi(x, undef) is x only where x is defined on every path: else the
+    // undef paths would read a value never computed on them. An x of
+    // the phi's own block comes round a loop: after the phi, or a phi
+    // whose value from the previous iteration this phi holds.
+    if undefs and (same.kind == ir.V_INST) and ((same.blk == i.blk) or not fold_dominates(same.blk, i.blk)) {
+        return vnil();
+    }
+    return same;
 }
 
 // An integer constant converted to a float type, rounded once to that type
@@ -1691,6 +1716,41 @@ fn fold_insert(i: *mut ir.Value) *mut ir.Value {
     return ir.cagg(t, xs);
 }
 
+// What instruction i (without effects) folds to: cb.simplify's (with
+// combine), else fold's; or nil. For the operations of most instructions,
+// what the tests of both come to: those of every other operation come
+// before them, and nothing but the builder's place (at i) is left of them.
+fn fold_one(i: *mut ir.Value, combine: bool) *mut ir.Value {
+    let op = i.op;
+    if (op == ir.OP_LOAD) or (op == ir.OP_PTRADD) or (op == ir.OP_PHI) or (op == ir.OP_ALLOCA) {
+        ir.at_before(FB, i);
+        if combine {
+            let mut r = vnil();
+            if op == ir.OP_LOAD {
+                r = cb.simplify_load(i);
+            } else if op == ir.OP_PTRADD {
+                r = cb.simplify_ptradd(FB, i);
+            }
+            if u.notnil(r) {
+                return r;
+            }
+            ir.at_before(FB, i);
+        }
+        if op == ir.OP_PHI {
+            return fold_phi(i);
+        }
+        return vnil();
+    }
+    let mut r = vnil();
+    if combine {
+        r = cb.simplify(FB, i);
+    }
+    if u.isnil(r) {
+        r = fold(i);
+    }
+    return r;
+}
+
 pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     if u.isnil(FB) {
         FB = ir.new_builder();
@@ -1719,13 +1779,7 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
             while u.notnil(i) {
                 let next = i.next;
                 if not ir.has_effects(i) {
-                    let mut r = vnil();
-                    if combine {
-                        r = cb.simplify(FB, i);
-                    }
-                    if u.isnil(r) {
-                        r = fold(i);
-                    }
+                    let r = fold_one(i, combine);
                     if u.notnil(r) and (r != i) {
                         ir.forward(i, r);
                         ir.remove_inst(i);
@@ -1759,8 +1813,13 @@ fn mark_live(o: *mut ir.Value, work: *mut u.List.[*mut ir.Value]) void {
 
 // Removes instructions whose results are unused and that have no effects
 // (including cycles of dead phis).
+// (dce, kept for the next call)
+threadlocal let mut dce_work: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+
 pub fn dce(f: *mut ir.Func) void {
-    let mut work = u.List.[*mut ir.Value].empty();
+    let work = &mut dce_work;
+    work.clear();
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -1778,14 +1837,13 @@ pub fn dce(f: *mut ir.Func) void {
     }
     while work.len > 0 {
         let i = work.pop();
-        mark_live(i.a, &mut work);
-        mark_live(i.b, &mut work);
-        mark_live(i.c, &mut work);
+        mark_live(i.a, work);
+        mark_live(i.b, work);
+        mark_live(i.c, work);
         for k in 0..i.xs.len {
-            mark_live(i.xs.get(k), &mut work);
+            mark_live(i.xs.get(k), work);
         }
     }
-    work.deinit();
     b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
