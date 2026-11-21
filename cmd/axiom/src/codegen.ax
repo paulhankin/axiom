@@ -1280,6 +1280,43 @@ pub fn gen_fn_body(fi: *mut cx.FnInst) void {
     tg.g_features = saved_feats;
 }
 
+fn has_noalias_param(d: *ast.Decl) bool {
+    for i in 0..d.params.len {
+        if d.params.at(i).is_noalias {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn emit_noalias_checks(d: *ast.Decl, addrs: *u.List.[*mut ir.Value], sizes: *u.List.[*mut ir.Value]) void {
+    let z = cx.usz(0);
+    for i in 0..d.params.len {
+        let ai = addrs.get(i);
+        let szi = sizes.get(i);
+        if u.isnil(ai) or u.isnil(szi) {
+            continue;
+        }
+        let ni = d.params.at(i).is_noalias;
+        for j in (i + 1)..d.params.len {
+            if not ni and not d.params.at(j).is_noalias {
+                continue;
+            }
+            let aj = addrs.get(j);
+            let szj = sizes.get(j);
+            if u.isnil(aj) or u.isnil(szj) {
+                continue;
+            }
+            let both_nz = cx.b_and(cx.icmp(ir.IntNE, szi, z), cx.icmp(ir.IntNE, szj, z));
+            let le = cx.icmp(ir.IntULE, ai, aj);
+            let diff = cx.sel(le, cx.b_sub(aj, ai), cx.b_sub(ai, aj));
+            let bound = cx.sel(le, szi, szj);
+            let ok = cx.b_or(cx.b_not(both_nz), cx.icmp(ir.IntUGE, diff, bound));
+            cgrt.check_or_trap(ok, cgrt.T_MEMORY);
+        }
+    }
+}
+
 fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     let d = fi.decl;
     let stt = u.new.[cx.FnState]();
@@ -1307,11 +1344,37 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
         stt.sret_ptr = cgrt.param(fi.fnv, k);
         k += 1;
     }
+    let asan_noalias = bi.asan_on() and has_noalias_param(d);
+    let mut na_addrs = u.List.[*mut ir.Value].empty();
+    let mut na_sizes = u.List.[*mut ir.Value].empty();
+    if asan_noalias {
+        na_addrs.reserve(d.params.len);
+        na_sizes.reserve(d.params.len);
+    }
     for i in 0..d.params.len {
         let l = d.params.at(i).local;
         let pt = fi.fnty.params[i];
         let p = cgrt.param(fi.fnv, k);
         k += 1;
+        if asan_noalias {
+            let mut addr = cx.vnil();
+            let mut sz = cx.vnil();
+            if pt.kind == ast.TY_SLICE {
+                let esz = ty.type_size(pt.elem);
+                if esz > 0 {
+                    addr = cx.ptrtoint(cx.extract(p, 0), cx.T_isz);
+                    sz = cx.b_mul(cx.extract(p, 1), cx.usz(esz));
+                }
+            } else if pt.kind == ast.TY_PTR {
+                let psz = ty.type_size(pt.elem);
+                if psz > 0 {
+                    addr = cx.ptrtoint(p, cx.T_isz);
+                    sz = cx.usz(psz);
+                }
+            }
+            na_addrs.push(addr);
+            na_sizes.push(sz);
+        }
         if cx.by_ptr(pt) {
             stt.locals[@int_cast(usize, l.index)] = p;  // params are immutable: use the caller's copy directly
             // (its address in an object of its own: -O0 keeps it there, for debuggers)
@@ -1322,6 +1385,11 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
             cgrt.store(pt, p, cgrt.local_ptr(l), false);
         }
     }
+    if asan_noalias {
+        emit_noalias_checks(d, &na_addrs, &na_sizes);
+    }
+    na_addrs.deinit();
+    na_sizes.deinit();
     gen_block(d.body);
     if not cx.terminated() {
         if stt.ret.kind == ast.TY_VOID {

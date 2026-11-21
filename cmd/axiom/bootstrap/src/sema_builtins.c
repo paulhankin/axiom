@@ -213,6 +213,40 @@ static bool require_vec(Expr *e, Expr *arg, Type *t) {
     return false;
 }
 
+static bool str_lit_eq(Expr *e, const char *lit) {
+    size_t n = strlen(lit);
+    return e->slen == n && memcmp(e->str, lit, n) == 0;
+}
+
+// Validate optional trailing atomic memory-order argument at index `ord_idx`.
+static void check_atomic_order(Expr *e, BuiltinId id, int ord_idx) {
+    Expr *ord_e = *earg(e, ord_idx);
+    if (ord_e->kind != E_STRING) {
+        check_expr(ord_e, NULL);
+        diag_error(ord_e->span, "E0830",
+                   "@%s memory order must be a string literal (\"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                   e->name);
+        return;
+    }
+    ord_e->type = type_slice(t_u8, false);
+    if (!str_lit_eq(ord_e, "relaxed") && !str_lit_eq(ord_e, "acquire") && !str_lit_eq(ord_e, "release") &&
+        !str_lit_eq(ord_e, "acq_rel") && !str_lit_eq(ord_e, "seq_cst")) {
+        diag_error(ord_e->span, "E0830",
+                   "unknown atomic memory order '%s' (expected \"relaxed\", \"acquire\", \"release\", \"acq_rel\", or \"seq_cst\")",
+                   ord_e->str);
+        return;
+    }
+    if (id == BI_ATOMIC_LOAD && (str_lit_eq(ord_e, "release") || str_lit_eq(ord_e, "acq_rel"))) {
+        diag_error(ord_e->span, "E0830",
+                   "@atomic_load cannot use memory order '%s' (expected \"relaxed\", \"acquire\", or \"seq_cst\")",
+                   ord_e->str);
+    } else if (id == BI_ATOMIC_STORE && (str_lit_eq(ord_e, "acquire") || str_lit_eq(ord_e, "acq_rel"))) {
+        diag_error(ord_e->span, "E0830",
+                   "@atomic_store cannot use memory order '%s' (expected \"relaxed\", \"release\", or \"seq_cst\")",
+                   ord_e->str);
+    }
+}
+
 Type *builtin_check(Expr *e, Type *expected) {
     if (e->index < 0) {
         for (int i = 0; i < e->bargs.len; i++)
@@ -1060,7 +1094,15 @@ Type *builtin_check(Expr *e, Type *expected) {
                        type_str(t));
         return e->type = t_void;
     }
-    case BI_FENCE: return e->type = t_void;
+    case BI_FENCE:
+        if (e->bargs.len > 1) {
+            diag_error(e->span, "E0420", "@fence expects at most 1 argument, found %d", e->bargs.len);
+            for (int i = 0; i < e->bargs.len; i++)
+                if (e->bargs.data[i].e) check_expr(e->bargs.data[i].e, NULL);
+            return e->type = t_void;
+        }
+        if (e->bargs.len == 1) check_atomic_order(e, BI_FENCE, 0);
+        return e->type = t_void;
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
     case BI_ATOMIC_ADD:
@@ -1077,6 +1119,12 @@ Type *builtin_check(Expr *e, Type *expected) {
         // First argument: pointer to an integer (spec §12.8). Everything but
         // load, wait and notify needs *mut.
         BuiltinId id = (BuiltinId)e->index;
+        int base_n = (id == BI_ATOMIC_LOAD) ? 1 : (id == BI_ATOMIC_CAS) ? 3 : 2;
+        bool has_order_arg = id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY;
+        bool too_many = has_order_arg && e->bargs.len > base_n + 1;
+        if (too_many)
+            diag_error(e->span, "E0420", "@%s expects at most %d argument%s, found %d", e->name, base_n + 1,
+                       (base_n + 1) == 1 ? "" : "s", e->bargs.len);
         bool need_mut = id != BI_ATOMIC_LOAD && id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY;
         Type *p = check_expr(*earg(e, 0), NULL);
         Type *t = t_invalid;
@@ -1094,26 +1142,39 @@ Type *builtin_check(Expr *e, Type *expected) {
         if ((id == BI_ATOMIC_WAIT || id == BI_ATOMIC_NOTIFY) && t->kind == TY_PARAM) {
             diag_error((*earg(e, 0))->span, "E0823", "@%s works on 32-bit integers (*i32 or *u32)", e->name);
         }
+        Type *ret;
         switch (id) {
-        case BI_ATOMIC_LOAD: return e->type = t;
+        case BI_ATOMIC_LOAD: ret = t; break;
         case BI_ATOMIC_STORE:
             check_expr_to(earg(e, 1), t);
-            return e->type = t_void;
+            ret = t_void;
+            break;
         case BI_ATOMIC_CAS:
             check_expr_to(earg(e, 1), t);
             check_expr_to(earg(e, 2), t);
-            return e->type = t;
+            ret = t;
+            break;
         case BI_ATOMIC_WAIT:
             check_expr_to(earg(e, 1), t);
             check_expr_to(earg(e, 2), t_i64);
-            return e->type = t_u32;
+            ret = t_u32;
+            break;
         case BI_ATOMIC_NOTIFY:
             check_expr_to(earg(e, 1), t_u32);
-            return e->type = t_u32;
+            ret = t_u32;
+            break;
         default:
             check_expr_to(earg(e, 1), t);
-            return e->type = t;  // read-modify-write: the old value
+            ret = t;  // read-modify-write: the old value
+            break;
         }
+        if (too_many) {
+            for (int i = base_n; i < e->bargs.len; i++)
+                if (e->bargs.data[i].e) check_expr(e->bargs.data[i].e, NULL);
+        } else if (has_order_arg && e->bargs.len == base_n + 1) {
+            check_atomic_order(e, id, base_n);
+        }
+        return e->type = ret;
     }
     case BI_ERROR_NAME:
         check_expr_to(earg(e, 0), t_error);

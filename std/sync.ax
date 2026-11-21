@@ -54,26 +54,26 @@ pub struct Mutex {
     }
 
     pub fn lock(self: *mut Mutex) void {
-        let mut s = @atomic_cas(&mut self.state, 0, 1);
+        let mut s = @atomic_cas(&mut self.state, 0, 1, "acquire");
         if s == 0 {
             return;
         }
         if s != 2 {
-            s = @atomic_xchg(&mut self.state, 2);
+            s = @atomic_xchg(&mut self.state, 2, "acquire");
         }
         while s != 0 {
             _ = @atomic_wait(&self.state, 2, WAIT_FOREVER);
-            s = @atomic_xchg(&mut self.state, 2);
+            s = @atomic_xchg(&mut self.state, 2, "acquire");
         }
     }
 
     pub fn try_lock(self: *mut Mutex) bool {
-        return @atomic_cas(&mut self.state, 0, 1) == 0;
+        return @atomic_cas(&mut self.state, 0, 1, "acquire") == 0;
     }
 
     pub fn unlock(self: *mut Mutex) void {
-        if @atomic_sub(&mut self.state, 1) != 1 {
-            @atomic_store(&mut self.state, 0);
+        if @atomic_sub(&mut self.state, 1, "release") != 1 {
+            @atomic_store(&mut self.state, 0, "release");
             _ = @atomic_notify(&self.state, 1);
         }
     }
@@ -88,11 +88,11 @@ pub struct WaitGroup {
     }
 
     pub fn add(self: *mut WaitGroup, n: u32) void {
-        _ = @atomic_add(&mut self.count, n);
+        _ = @atomic_add(&mut self.count, n, "relaxed");
     }
 
     pub fn done(self: *mut WaitGroup) void {
-        if @atomic_sub(&mut self.count, 1) == 1 {
+        if @atomic_sub(&mut self.count, 1, "release") == 1 {
             _ = @atomic_notify(&self.count, NOTIFY_ALL);
         }
     }
@@ -100,7 +100,7 @@ pub struct WaitGroup {
     /// Blocks until the count reaches zero.
     pub fn wait(self: *mut WaitGroup) void {
         loop {
-            let c = @atomic_load(&self.count);
+            let c = @atomic_load(&self.count, "acquire");
             if c == 0 {
                 return;
             }
@@ -346,12 +346,12 @@ pub struct Semaphore {
 
     pub fn acquire(self: *mut Semaphore) void {
         loop {
-            let p = @atomic_load(&self.permits);
+            let p = @atomic_load(&self.permits, "relaxed");
             if p == 0 {
                 _ = @atomic_wait(&self.permits, 0, WAIT_FOREVER);
                 continue;
             }
-            if @atomic_cas(&mut self.permits, p, p - 1) == p {
+            if @atomic_cas(&mut self.permits, p, p - 1, "acquire") == p {
                 return;
             }
         }
@@ -360,24 +360,24 @@ pub struct Semaphore {
     /// Takes a permit if one is free, without waiting.
     pub fn try_acquire(self: *mut Semaphore) bool {
         loop {
-            let p = @atomic_load(&self.permits);
+            let p = @atomic_load(&self.permits, "relaxed");
             if p == 0 {
                 return false;
             }
-            if @atomic_cas(&mut self.permits, p, p - 1) == p {
+            if @atomic_cas(&mut self.permits, p, p - 1, "acquire") == p {
                 return true;
             }
         }
     }
 
     pub fn release(self: *mut Semaphore, n: u32) void {
-        _ = @atomic_add(&mut self.permits, n);
+        _ = @atomic_add(&mut self.permits, n, "release");
         _ = @atomic_notify(&self.permits, n);
     }
 
     /// The permits free now (which may change at once).
     pub fn available(self: *Semaphore) u32 {
-        return @atomic_load(&self.permits);
+        return @atomic_load(&self.permits, "relaxed");
     }
 }
 
@@ -391,22 +391,22 @@ pub struct Once {
     }
 
     pub fn call[C](self: *mut Once, f: fn(C) void, arg: C) void {
-        if @atomic_load(&self.state) == 2 {
+        if @atomic_load(&self.state, "acquire") == 2 {
             return;
         }
-        if @atomic_cas(&mut self.state, 0, 1) == 0 {
+        if @atomic_cas(&mut self.state, 0, 1, "relaxed") == 0 {
             f(arg);
-            @atomic_store(&mut self.state, 2);
+            @atomic_store(&mut self.state, 2, "release");
             _ = @atomic_notify(&self.state, NOTIFY_ALL);
             return;
         }
-        while @atomic_load(&self.state) != 2 {
+        while @atomic_load(&self.state, "acquire") != 2 {
             _ = @atomic_wait(&self.state, 1, WAIT_FOREVER);
         }
     }
 
     pub fn done(self: *Once) bool {
-        return @atomic_load(&self.state) == 2;
+        return @atomic_load(&self.state, "acquire") == 2;
     }
 }
 
@@ -430,13 +430,13 @@ pub struct Barrier {
         self.arrived += 1;
         if self.arrived == self.n {
             self.arrived = 0;
-            _ = @atomic_add(&mut self.generation, 1);
+            _ = @atomic_add(&mut self.generation, 1, "release");
             self.lock.unlock();
             _ = @atomic_notify(&self.generation, NOTIFY_ALL);
             return true;
         }
         self.lock.unlock();
-        while @atomic_load(&self.generation) == g {
+        while @atomic_load(&self.generation, "acquire") == g {
             _ = @atomic_wait(&self.generation, g, WAIT_FOREVER);
         }
         return false;

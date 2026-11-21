@@ -1284,7 +1284,9 @@ fn gen_system_builtin(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *m
         return cx.vnil();
     }
     if id == ast.BI_FENCE {
-        _ = ir.fence(cx.B);
+        let o = atomic_order(e, 0);
+        let f = ir.fence(cx.B);
+        ir.set_order(f, o.ord, o.ord);
         return cx.vnil();
     }
     if ast.builtin_between(id, ast.BI_ATOMIC_LOAD, ast.BI_ATOMIC_NOTIFY) {
@@ -1353,7 +1355,7 @@ fn rt_fn(name: []u8) *mut cx.FnInst {
 // checked against std/mem.ax's shadow memory (mem.asan_check), trapping with
 // T0012 when it touches memory that is not allocated. The allocator itself
 // and the runtime are not checked.
-fn asan_on() bool {
+pub fn asan_on() bool {
     if not cx.O.sanitize_address or u.isnil(cx.F) or u.isnil(cx.F.decl) or u.isnil(cx.F.decl.module) {
         return false;
     }
@@ -1658,6 +1660,30 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
     cx.at_end(ok);
 }
 
+struct AtomicOrd {
+    ord: u32,
+    fail: u32,
+}
+
+fn atomic_order(e: *mut ast.Expr, idx: usize) AtomicOrd {
+    if idx < ast.more(e).bargs.len {
+        let s = ast.more(barg(e, idx)).str;
+        if u.str_eq(s, "relaxed") {
+            return AtomicOrd.{ ord: ir.ORD_RELAXED, fail: ir.ORD_RELAXED };
+        }
+        if u.str_eq(s, "acquire") {
+            return AtomicOrd.{ ord: ir.ORD_ACQUIRE, fail: ir.ORD_ACQUIRE };
+        }
+        if u.str_eq(s, "release") {
+            return AtomicOrd.{ ord: ir.ORD_RELEASE, fail: ir.ORD_RELAXED };
+        }
+        if u.str_eq(s, "acq_rel") {
+            return AtomicOrd.{ ord: ir.ORD_ACQ_REL, fail: ir.ORD_ACQUIRE };
+        }
+    }
+    return AtomicOrd.{ ord: ir.ORD_SEQ_CST, fail: ir.ORD_SEQ_CST };
+}
+
 fn gen_atomic(e: *mut ast.Expr) *mut ir.Value {
     let id = ast.builtin_of(e);
     let pt = cx.ct(barg(e, 0).ty);
@@ -1671,22 +1697,28 @@ fn gen_atomic(e: *mut ast.Expr) *mut ir.Value {
     }
     asan_check(p, cx.usz(size));
     if id == ast.BI_ATOMIC_LOAD {
+        let o = atomic_order(e, 1);
         let v = cx.ld(cx.lty(t), p);
         v.flags = ir.F_ATOMIC;
+        ir.set_order(v, o.ord, o.ord);
         cgrt.set_align(v, asz);
         return v;
     }
     if id == ast.BI_ATOMIC_STORE {
+        let o = atomic_order(e, 2);
         let v = gen(barg(e, 1));
         let s = cx.st(v, p);
         s.flags = ir.F_ATOMIC;
+        ir.set_order(s, o.ord, o.ord);
         cgrt.set_align(s, asz);
         return cx.vnil();
     }
     if id == ast.BI_ATOMIC_CAS {
+        let o = atomic_order(e, 3);
         let expv = gen(barg(e, 1));
         let newv = gen(barg(e, 2));
         let r = ir.cmpxchg(cx.B, p, expv, newv);
+        ir.set_order(r, o.ord, o.fail);
         cgrt.set_align(r, asz);
         return r;
     }
@@ -1733,8 +1765,10 @@ fn gen_atomic(e: *mut ast.Expr) *mut ir.Value {
         }
         else => {}
     }
+    let o = atomic_order(e, 2);
     let v = gen(barg(e, 1));
     let r = ir.rmw(cx.B, op, p, v);
+    ir.set_order(r, o.ord, o.ord);
     cgrt.set_align(r, asz);
     return r;
 }
