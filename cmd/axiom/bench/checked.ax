@@ -1,0 +1,97 @@
+// Checked arithmetic and error codes in hot loops: decimal parsing with
+// @mul_checked / @add_checked and `!` (a function returning !u64, called through a
+// pointer so that its result is tested where it is called), sums with
+// `catch` fallbacks, and a product that saturates on overflow.
+import "common.ax" as c;
+import "std/mem" as mem;
+
+error { Empty, BadDigit }
+
+fn parse(s: []u8) !u64 {
+    if s.len == 0 {
+        return error.Empty;
+    }
+    let mut n: u64 = 0;
+    for i in 0..s.len {
+        let d = s[i] -% '0';
+        if d > 9 {
+            return error.BadDigit;
+        }
+        n = @mul_checked(n, 10)!;
+        n = @add_checked(n, @as(u64, d))!;
+    }
+    return n;
+}
+
+let mut PARSE: fn([]u8) !u64 = parse;
+
+// The fields of buf, separated by spaces: their values summed, an error counted.
+fn sum_fields(buf: []u8, bad: *mut u64) u64 {
+    let mut total: u64 = 0;
+    let mut start: usize = 0;
+    for i in 0..(buf.len + 1) {
+        if (i == buf.len) or (buf[i] == ' ') {
+            let v = PARSE(buf[start..i]) catch {
+                bad.* += 1;
+                start = i + 1;
+                continue;
+            };
+            total = @add_checked(total, v) catch total;
+            start = i + 1;
+        }
+    }
+    return total;
+}
+
+fn products(xs: []i64) i64 {
+    let mut acc: i64 = 0;
+    for i in 0..xs.len {
+        let p = @mul_checked(xs[i], xs[(i + 1) % xs.len]) catch 0x7fff_ffff;
+        acc = @add_checked(acc, p) catch 0;
+        acc = @sub_checked(acc, @int_cast(i64, i)) catch acc;
+    }
+    return acc;
+}
+
+export fn main() i32 {
+    // fields of 1 to 20 digits (those of 20 overflowing now and then), a few bad ones
+    let n: usize = 4_000_000;
+    let buf = mem.alloc.[u8](n) catch return 1;
+    let mut seed: u64 = 12345;
+    let mut k: usize = 0;
+    while k < n {
+        seed = (seed *% 6364136223846793005) +% 1442695040888963407;
+        let len = 1 + @int_cast(usize, (seed >> 33) % 20);
+        let mut j: usize = 0;
+        while (j < len) and (k < n) {
+            seed = (seed *% 6364136223846793005) +% 1442695040888963407;
+            let mut ch = '0' + @truncate(u8, (seed >> 40) % 10);
+            if ((seed >> 20) % 4096) == 0 {
+                ch = 'x';
+            }
+            buf[k] = ch;
+            k += 1;
+            j += 1;
+        }
+        if k < n {
+            buf[k] = ' ';
+            k += 1;
+        }
+    }
+    let xs = mem.alloc.[i64](4096) catch return 1;
+    for i in 0..xs.len {
+        seed = (seed *% 6364136223846793005) +% 1442695040888963407;
+        xs[i] = @bit_cast(i64, seed) >> @int_cast(u32, 20 + ((seed >> 7) % 40));
+    }
+    let mut bad: u64 = 0;
+    let mut total: u64 = 0;
+    for _r in 0..@as(usize, 40) {
+        total +%= sum_fields(buf, &mut bad);
+    }
+    let mut acc: u64 = 0;
+    for _r in 0..@as(usize, 20000) {
+        acc +%= @bit_cast(u64, products(xs));
+    }
+    c.result("checked", (total +% bad) +% acc);
+    return 0;
+}
