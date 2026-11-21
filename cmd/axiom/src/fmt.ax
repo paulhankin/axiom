@@ -67,6 +67,7 @@ struct El {
     x: bool,       // a bracket written with a trailing comma: one item per line
     xcomma: bool,  // a comma between those items
     eol: bool,     // the '}' that ends an error declaration
+    errset: bool,  // the '{' or '}' of an inline error set { A, B }
     comma: bool,   // a comma is added after it (the last struct member)
     setb: bool,    // the '!' of Set!T: no space on either side
 }
@@ -74,7 +75,7 @@ struct El {
 fn mk_el(kind: lx.TokKind, text: []u8, nl: i32, col: i32) El {
     return El.{ kind: kind, text: text, nl: nl, col: col, sp: false, opnd: false, unary: false, binop: false, brace: 0,
                 empty: false, fnsig: false, pfx: false, cap: 0, trail: false, x: false, xcomma: false, eol: false,
-                comma: false, setb: false };
+                errset: false, comma: false, setb: false };
 }
 
 fn el_list() u.List.[El] {
@@ -630,11 +631,11 @@ fn space_before(p: *El, c: *El) bool {
     if c.binop or p.binop {
         return true;
     }
-    if ck == lx.TK_LBRACE {
-        return true;  // (`for x in [a, b] {`: no type prefix ends before a brace)
-    }
     if (pk == lx.TK_RBRACKET) and p.pfx {
         return false;
+    }
+    if ck == lx.TK_LBRACE {
+        return true;  // (`for x in [a, b] {`: p.pfx is false)
     }
     if ck == lx.TK_DOT {
         return not p.opnd;
@@ -651,16 +652,53 @@ fn space_before(p: *El, c: *El) bool {
     return true;
 }
 
-// Whether the '!' after els[prev] makes Set!T, an error union of a named
-// error set: after a name, and before what only a type starts with (a
-// postfix '!' is never followed by a name), or before '*' or '[' where the
-// name follows ':' or ')' (a parameter's, field's or result's type).
-fn set_bang(els: []mut El, prev: usize, nk: lx.TokKind) bool {
-    if (prev == NONE) or (els[prev].kind != lx.TK_IDENT) {
+// Whether els[open_idx] ('{') is an inline error set: empty '{}' in a type
+// position, or '{ Ident (, Ident)* ,? }' (no block, struct literal, or
+// pending struct/enum/error-decl brace can have that shape).
+fn at_inline_errset_el(els: []El, open_idx: usize, pk: lx.TokKind) bool {
+    if els[open_idx].kind != lx.TK_LBRACE {
+        return false;
+    }
+    let mut j = next_tok(els, open_idx);
+    if j == NONE {
+        return false;
+    }
+    if els[j].kind == lx.TK_RBRACE {
+        let af = next_tok(els, j);
+        return ((af != NONE) and
+                ((els[af].kind == lx.TK_BANG) or (els[af].kind == lx.TK_LBRACE) or (els[af].kind == lx.TK_RBRACKET))) or
+               (pk == lx.TK_COLON) or (pk == lx.TK_LBRACKET);
+    }
+    while (j != NONE) and (els[j].kind == lx.TK_IDENT) {
+        j = next_tok(els, j);
+        if (j != NONE) and (els[j].kind == lx.TK_COMMA) {
+            j = next_tok(els, j);
+        } else {
+            break;
+        }
+    }
+    return (j != NONE) and (els[j].kind == lx.TK_RBRACE);
+}
+
+// Whether the '!' after els[prev] makes Set!T, { A, B }!T, or infer!T: after
+// an inline error set '}', or after a name and before what only a type starts
+// with (a postfix '!' is never followed by a name), or before '*' or '[' where
+// the name follows ':' or ')'.
+fn set_bang(els: []mut El, prev: usize, nt: usize, nk: lx.TokKind) bool {
+    if prev == NONE {
+        return false;
+    }
+    if (els[prev].kind == lx.TK_RBRACE) and els[prev].errset {
+        return true;
+    }
+    if els[prev].kind != lx.TK_IDENT {
         return false;
     }
     if (nk == lx.TK_IDENT) or (nk == lx.TK_PRIM) or (nk == lx.KW_FN) or (nk == lx.KW_STRUCT) or (nk == lx.KW_ERROR) or
        (nk == lx.KW_SELF) or (nk == lx.TK_QUESTION) or (nk == lx.TK_QQ) {
+        return true;
+    }
+    if (nk == lx.TK_LBRACE) and (nt != NONE) and at_inline_errset_el(els, nt, lx.TK_BANG) {
         return true;
     }
     if (nk != lx.TK_STAR) and (nk != lx.TK_LBRACKET) {
@@ -716,7 +754,7 @@ fn fn_sig_paren(els: []El, mate: []usize, prev: usize, pk: lx.TokKind) bool {
 // Marks els[i] as an operand's end, a unary or a binary operator. prev: the
 // token before it (of kind pk; popnd: that ends an operand); nk: the kind of
 // the token after it.
-fn mark_operator(els: []mut El, i: usize, prev: usize, pk: lx.TokKind, popnd: bool, nk: lx.TokKind) void {
+fn mark_operator(els: []mut El, i: usize, prev: usize, pk: lx.TokKind, popnd: bool, nt: usize, nk: lx.TokKind) void {
     let k = els[i].kind;
     if operand_token(k) {
         els[i].opnd = true;
@@ -726,7 +764,7 @@ fn mark_operator(els: []mut El, i: usize, prev: usize, pk: lx.TokKind, popnd: bo
         els[i].opnd = not els[i].pfx;
     } else if k == lx.TK_RBRACE {
         els[i].opnd = els[i].brace == BR_INLINE;
-    } else if (k == lx.TK_BANG) and set_bang(els, prev, nk) {
+    } else if (k == lx.TK_BANG) and set_bang(els, prev, nt, nk) {
         els[i].setb = true;
         els[i].unary = true;
     } else if k == lx.TK_BANG {
@@ -848,16 +886,22 @@ fn classify(els: []mut El) void {
             pending = BR_DECLS;
         } else if k == lx.TK_LBRACE {
             let mut br = BR_BLOCK;
+            let mut is_errset = false;
             if (pk == lx.TK_DOT) or err_union {
                 br = BR_INLINE;
             } else if pending != 0 {
                 br = pending;
                 pending = 0;
+            } else if at_inline_errset_el(els, i, pk) {
+                br = BR_INLINE;
+                is_errset = true;
             }
             els[i].brace = br;
+            els[i].errset = is_errset;
             let m = mate[i];
             if m != NONE {
                 els[m].brace = br;
+                els[m].errset = is_errset;
                 if (m == (i + 1)) and (br != BR_INLINE) {
                     els[i].empty = true;
                     els[m].empty = true;
@@ -872,7 +916,9 @@ fn classify(els: []mut El) void {
             if not popnd and (pk != lx.TK_DOT) and (mate[i] != NONE) {
                 let m = mate[i];
                 let af = next_tok(els, m);
-                if (af != NONE) and is_type_after_bracket(els[af].kind) {
+                if (af != NONE) and
+                   (is_type_after_bracket(els[af].kind) or
+                    ((els[af].kind == lx.TK_LBRACE) and at_inline_errset_el(els, af, lx.TK_RBRACKET))) {
                     els[i].pfx = true;
                     els[m].pfx = true;
                 }
@@ -889,7 +935,7 @@ fn classify(els: []mut El) void {
                 els[i].trail = true;
             }
         }
-        mark_operator(els, i, prev, pk, popnd, nk);
+        mark_operator(els, i, prev, pk, popnd, nt, nk);
         if prev != NONE {
             els[i].sp = space_before(&els[prev], &els[i]);
         }

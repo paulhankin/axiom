@@ -7,6 +7,15 @@ enum { IDX_ARRAY, IDX_SLICE, IDX_PTR_ARRAY };
 
 static Type *check_operand(Expr *e, Type *expected);
 
+static bool is_error_type(Type *t) {
+    return t && (t->kind == TY_ERROR || (t->kind == TY_PARAM && t->is_error_param));
+}
+
+static void ensure_fn_inferred(Decl *fn) {
+    if (fn && fn->kind == D_FN && fn->state == 2 && fn->is_infer_ret && !fn->checked && !fn->inferring_ret)
+        check_fn_body(fn);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -34,7 +43,7 @@ static Type *weaken_mut(Type *t) {
     }
     case TY_ERRUNION: {
         Type *w = weaken_mut(t->elem);
-        if (w != t->elem) return type_errunion_set(w, t->decl);
+        if (w != t->elem) return t->err_param ? type_errunion_param(w, t->err_param) : type_errunion_set(w, t->decl);
         return t;
     }
     case TY_ARRAY: {
@@ -232,8 +241,8 @@ void coerce(Expr **pe, Type *target) {
         return;
     }
     // an error of one set where one of another (or any error) is needed
-    if (s->kind == TY_ERROR && target->kind == TY_ERROR) {
-        if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_NOOP, target);
+    if (is_error_type(s) && is_error_type(target)) {
+        if (error_fits(e->span, s, target)) *pe = mkconv(e, CONV_NOOP, target);
         return;
     }
     // a narrower error union where a wider one is expected
@@ -247,8 +256,8 @@ void coerce(Expr **pe, Type *target) {
         return;
     }
     if (target->kind == TY_ERRUNION) {
-        if (s->kind == TY_ERROR) {
-            if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_WRAP_ERR, target);
+        if (is_error_type(s)) {
+            if (error_fits(e->span, s, target)) *pe = mkconv(e, CONV_WRAP_ERR, target);
             return;
         }
         if (s->kind != TY_ERRUNION && target->elem->kind != TY_VOID) {
@@ -814,7 +823,7 @@ static Type *check_binary(Expr *e, Type *expected) {
         }
         t = l;
         if (l != r && l->kind != TY_INVALID && r->kind != TY_INVALID && l->kind != TY_NEVER && r->kind != TY_NEVER &&
-            !(l->kind == TY_ERROR && r->kind == TY_ERROR)) {
+            !(is_error_type(l) && is_error_type(r))) {
             Diag *d = diag_error(e->span, "E0412", "operands of '%s' have different types: %s and %s",
                                  tok_kind_name((TokKind)op), type_str(l), type_str(r));
             diag_types(d, type_str(l), type_str(r));
@@ -994,6 +1003,7 @@ static void decl_ref(Expr *e, Decl *d) {
     switch (d->kind) {
     case D_FN:
     case D_HOST_FN:
+        ensure_fn_inferred(d);
         e->cat = CAT_FUNC;
         e->ngargs = 0;
         e->type = NULL;
@@ -1131,6 +1141,7 @@ static Type *check_field(Expr *e) {
         if (m) {
             check_method_visible(e, m);
             resolve_decl(m);
+            ensure_fn_inferred(m);
             e->cat = CAT_FUNC;
             e->op = FK_DECL;
             e->decl = m;
@@ -1207,6 +1218,7 @@ static Type *check_field(Expr *e) {
         if (m) {
             check_method_visible(e, m);
             resolve_decl(m);
+            ensure_fn_inferred(m);
             e->cat = CAT_METHOD;
             e->decl = m;
             e->b = a;  // receiver
@@ -1325,7 +1337,14 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
         if (act->kind == TY_OPT) return unify(pat->elem, act->elem, vars, sol, nv);
         return unify(pat->elem, act, vars, sol, nv);
     case TY_ERRUNION:
-        if (act->kind == TY_ERRUNION) return unify(pat->elem, act->elem, vars, sol, nv);
+        if (act->kind == TY_ERRUNION) {
+            if (pat->err_param) {
+                Type *ae = act->err_param ? act->err_param : type_errset(act->decl);
+                if (!unify(pat->err_param, ae, vars, sol, nv)) return false;
+            }
+            return unify(pat->elem, act->elem, vars, sol, nv);
+        }
+        if (pat->err_param && is_error_type(act)) return unify(pat->err_param, act, vars, sol, nv);
         return unify(pat->elem, act, vars, sol, nv);
     case TY_ARRAY:
         if (act->kind != TY_ARRAY) return true;
@@ -1418,6 +1437,7 @@ static Type *check_call(Expr *e, Type *expected) {
     case CAT_METHOD: {
         Decl *fn = callee->decl;
         resolve_decl(fn);
+        ensure_fn_inferred(fn);
         if (fn->state != 2) {
             // (a call in the function's own signature, E0355: its parameters are not known yet)
             for (int i = 0; i < e->args.len; i++) check_expr(e->args.data[i], NULL);
@@ -1977,6 +1997,28 @@ static void check_escape(Expr *e0) {
     if (l) diag_error(e0->span, "E0710", "this points into local '%s', whose storage ends when the function returns", l->name);
 }
 
+static void record_ret_err_name(Sym n) {
+    if (!C || !n) return;
+    for (int i = 0; i < C->ret_errs.len; i++)
+        if (C->ret_errs.data[i] == n) return;
+    vec_push(C->ret_errs, n);
+}
+
+static void record_ret_err_set(Type *t) {
+    if (!C || !t) return;
+    if (t->kind == TY_PARAM && t->is_error_param) {
+        C->ret_err_open = true;
+        return;
+    }
+    if (t->kind != TY_ERROR && t->kind != TY_ERRUNION) return;
+    if (t->err_param || !t->decl) {
+        C->ret_err_open = true;
+        return;
+    }
+    resolve_decl(t->decl);
+    for (int i = 0; i < t->decl->set_names.len; i++) record_ret_err_name(t->decl->set_names.data[i]);
+}
+
 static void check_return_value(Expr **pe, Span sp) {
     if (!C->fn) {
         diag_error(sp, "E0602", "'return' outside of a function");
@@ -1995,6 +2037,13 @@ static void check_return_value(Expr **pe, Span sp) {
         return;
     }
     check_expr(*pe, r);
+    Expr *re = *pe;
+    if (re->kind == E_ERROR_VAL) {
+        if (re->cval) record_ret_err_name(re->name);
+    } else if (re->type->kind == TY_ERRUNION || is_error_type(re->type)) {
+        if (!(C->fn->inferring_ret && re->kind == E_CALL && re->decl == C->fn))
+            record_ret_err_set(re->type);
+    }
     bool prev_ret = C->in_return;
     C->in_return = true;
     coerce(pe, r);
@@ -2012,7 +2061,7 @@ static Type *check_catch(Expr *e) {
     Type *et = t_error;
     if (t->kind == TY_ERRUNION) {
         vt = t->elem;
-        et = type_errset(t->decl);
+        et = t->err_param ? t->err_param : type_errset(t->decl);
         check_consume_nocopy(e->a, false);
     } else if (t->kind != TY_INVALID) diag_error(e->a->span, "E0611", "'catch' requires an error union (!T), found %s", type_str(t));
     bool dead_before = C ? C->flow_dead : false;
@@ -2133,7 +2182,9 @@ static Type *check_try(Expr *e) {
         }
     } else {
         check_leave_ok(e->span, false);
-        try_fits(e->span, t->decl, C->ret->decl);
+        try_fits(e->span, t, C->ret);
+        if (!(C->fn->inferring_ret && e->a->kind == E_CALL && e->a->decl == C->fn))
+            record_ret_err_set(t);
     }
     e->weakened = e->a->weakened;
     return e->type = t->elem;

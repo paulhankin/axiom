@@ -26,6 +26,7 @@ typedef enum TEKind {
     TE_OPT,
     TE_ERRUNION,
     TE_ERROR,
+    TE_ERRSET_INLINE,
     TE_INVALID,  // what the parser makes of a type it could not read (reported already)
     TE_SELF,
     TE_INTLIT,     // generic const argument, or an array length
@@ -59,6 +60,9 @@ struct TypeExpr {
     bool member_has_args;
     TypeExpr *elem;  // PTR, SLICE, ARRAY, ERRUNION; TE_FN: return type
     TypeExpr *set;   // ERRUNION: the error set named (Set!T), or NULL (!T: any error)
+    Vec(Sym) error_names;   // TE_ERRSET_INLINE
+    Vec(Span) error_spans;  // TE_ERRSET_INLINE
+    bool is_infer;          // TE_ERRUNION: infer!T
     bool mut;
     TypeExpr *len;  // ARRAY: TE_INTLIT, TE_NAMED (a const or a const parameter) or TE_CONSTEXPR
     FieldVec fields;
@@ -264,6 +268,7 @@ typedef struct GenericParam {
     Span constraint_span;
     TypeExpr *constraint_te;  // FloatVector[S], IntVector[S], Vector[S]
     bool is_const;
+    bool is_error;
     TypeExpr *const_te;
     Type *type;  // TY_PARAM
 } GenericParam;
@@ -366,6 +371,9 @@ struct Decl {
     bool checked;
     bool layout_done;
     bool anon;
+    bool is_anon;        // D_ERROR: anonymous interned error set ({ A, B })
+    bool is_infer_ret;   // D_FN: declared with `infer!T` return type
+    bool inferring_ret;  // D_FN: currently inferring `infer!T` body
     bool is_nocopy;
     bool nocopy_visiting;
     Expr *cexpr;  // const: checked init expression
@@ -385,6 +393,7 @@ struct Module {
     SymMap names;    // top-level names (items, not imports)
     SymMap imports;  // alias -> Decl(D_IMPORT)
     struct Package *pkg;  // the package this module belongs to, or NULL
+    Vec(Sym) inline_error_names;
     bool checked;
 };
 

@@ -565,7 +565,8 @@ static void check_match(Stmt *s, bool *diverges) {
             }
             free(missing.data);
         }
-    } else if (t->kind == TY_INT || t->kind == TY_BOOL || t->kind == TY_ERROR) {
+    } else if (t->kind == TY_INT || t->kind == TY_BOOL || t->kind == TY_ERROR ||
+               (t->kind == TY_PARAM && t->is_error_param)) {
         Vec(Sym) seen_names = {0};
         Vec(i128) seenv = {0};
         bool seen_true = false, seen_false = false;
@@ -589,10 +590,10 @@ static void check_match(Stmt *s, bool *diverges) {
                 if (a->bval ? seen_true : seen_false) diag_error(a->span, "E0631", "pattern is matched more than once");
                 if (a->bval) seen_true = true;
                 else seen_false = true;
-            } else if (a->kind == P_ERROR && t->kind == TY_ERROR) {
+            } else if (a->kind == P_ERROR && (t->kind == TY_ERROR || (t->kind == TY_PARAM && t->is_error_param))) {
                 uint32_t code = error_code_of(a->name);
                 if (!code) diag_error(a->span, "E0650", "'error.%s' is not declared", a->name);
-                else if (!set_has(t->decl, a->name))
+                else if (t->kind == TY_ERROR && !set_has(t->decl, a->name))
                     diag_error(a->span, "E0652", "'error.%s' is not in error set %s", a->name, t->decl->name);
                 vec_push(seen_names, a->name);
                 a->error_code = code;
@@ -1061,6 +1062,7 @@ void check_fn_body(Decl *fn) {
     ctx.tc = (TypeCtx){fn->module, fn->owner, fn, fn->owner ? fn->owner->type : NULL};
     ctx.fn = fn;
     ctx.ret = fn->ret_type;
+    if (fn->is_infer_ret) fn->inferring_ret = true;
     FnCtx *saved = C;
     C = &ctx;
     scope_push();
@@ -1069,6 +1071,61 @@ void check_fn_body(Decl *fn) {
         p->local = declare_local(p->name, p->span, fn->param_types[i], false, true);
     }
     bool div = check_block(fn->body);
+    if (fn->is_infer_ret) {
+        Type *r0 = fn->ret_type;
+        Type *elem = r0->kind == TY_ERRUNION ? r0->elem : r0;
+        if (ctx.ret_err_open) {
+            fn->ret_type = type_errunion(elem);
+        } else {
+            Decl *set = intern_anon_errset(ctx.ret_errs.data, ctx.ret_errs.len);
+            fn->ret_type = type_errunion_set(elem, set);
+        }
+        fn->type = type_fn(fn->param_types, fn->params.len, fn->ret_type);
+        fn->inferring_ret = false;
+    } else if (!fn->gparams.len && (!fn->owner || !fn->owner->gparams.len) &&
+               fn->ret_type->kind == TY_ERRUNION && fn->ret_type->decl && fn->ret_type->decl->is_anon &&
+               !ctx.ret_err_open && fn->ret_te && fn->ret_te->kind == TE_ERRUNION && fn->ret_te->set &&
+               fn->ret_te->set->kind == TE_ERRSET_INLINE && fn->ret_te->elem) {
+        Decl *decl = fn->ret_type->decl;
+        Vec(Sym) kept = {0};
+        for (int i = 0; i < decl->set_names.len; i++) {
+            Sym s = decl->set_names.data[i];
+            bool found = false;
+            for (int j = 0; j < ctx.ret_errs.len; j++) {
+                if (ctx.ret_errs.data[j] == s) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) vec_push(kept, s);
+        }
+        if (kept.len < decl->set_names.len) {
+            Span sp = fn->ret_te->set->span;
+            Diag *dg = diag_warning(sp, "W0655", "declared error set contains errors this function can never return");
+            if (kept.len > 0) {
+                CharVec b = {0};
+                vec_push(b, '{');
+                vec_push(b, ' ');
+                for (int i = 0; i < kept.len; i++) {
+                    if (i) {
+                        vec_push(b, ',');
+                        vec_push(b, ' ');
+                    }
+                    for (const char *p = kept.data[i]; *p; p++) vec_push(b, *p);
+                }
+                vec_push(b, ' ');
+                vec_push(b, '}');
+                vec_push(b, 0);
+                DiagFix *fx = diag_fix(dg, "narrow the error set", "machine");
+                diag_fix_edit(fx, sp, arena_strndup(b.data, strlen(b.data)));
+                free(b.data);
+            } else {
+                DiagFix *fx = diag_fix(dg, "remove the unused error set", "suggestion");
+                diag_fix_edit(fx, (Span){sp.file, sp.start, fn->ret_te->elem->span.start}, "");
+            }
+        }
+        free(kept.data);
+    }
     Type *r = fn->ret_type;
     if (!div && r->kind != TY_VOID && r->kind != TY_INVALID && !(r->kind == TY_ERRUNION && r->elem->kind == TY_VOID)) {
         Span end = {fn->body->span.file, fn->body->span.end > 0 ? fn->body->span.end - 1 : 0, fn->body->span.end};
@@ -1081,6 +1138,7 @@ void check_fn_body(Decl *fn) {
     free(ctx.marks.data);
     free(ctx.loops.data);
     free(ctx.locals.data);
+    free(ctx.ret_errs.data);
     C = saved;
     gate_fn(fn);
 }

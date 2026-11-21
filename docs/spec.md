@@ -248,7 +248,7 @@ ParamList     ::= Param ( "," Param )* ","?
 Param         ::= "noalias"? IDENT ":" Type
 
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
-GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
+GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type | "error" IDENT
 Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
                 | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
@@ -265,7 +265,9 @@ tokens of lookahead (`pub fn`, `pub inline fn`, `inline fn` begin methods, where
 ```ebnf
 Type          ::= "?" Type                          (* optional *)
                 | "!" Type                          (* error union *)
-                | NamedType "!" Type                (* error union of a named error set, §11.3 *)
+                | NamedType "!" Type                (* error union of a named or generic error set, §11.3 *)
+                | "{" ErrorNames "}" ( "!" Type )?  (* inline error set or error union, §11.3 *)
+                | "infer" "!" Type                  (* inferred return error set, §11.3 *)
                 | "*" "mut"? Type                   (* raw pointer *)
                 | "[" "]" "mut"? Type               (* slice *)
                 | "[" ArrayLen "]" Type             (* array *)
@@ -289,7 +291,9 @@ PrimType      ::= (any reserved type name, §2.4)
 `NamedType` accepts `Name`, `module.Name`, `Name.[Args]`, `module.Name.[Args]`, and in
 generic arguments associated functions/methods such as `Type.method`, `module.Type.method`,
 or `Type.[Args].method.[MArgs]`. After the `.`, the next token (`IDENT` or `[`) decides
-which form it is.
+which form it is. `infer` is not a keyword; it is parsed contextually before `!` in type
+position, and `infer!Type` is valid only as the return type of a private (`fn`, non-`pub`,
+non-`export`, non-`extern`) function (§11.3).
 
 ### 3.4 Statements
 
@@ -1470,6 +1474,7 @@ fn demo() !void {
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )?        (* type parameter *)
                 | "const" IDENT ":" Type           (* integer or function constant parameter *)
+                | "error" IDENT                    (* error-set parameter, §11.3 *)
 Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
                 | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
@@ -1483,12 +1488,16 @@ types and vector lane constraints, so one list may write:
 ```axiom
 struct Map[K, V, const HASH: fn(K) u64, const EQ: fn(K, K) bool] { … }
 fn dot[S: Float, V: FloatVector[S]](a: []S, b: []S) S { … }
+fn retry[error E, T](attempts: i32, f: fn() E!T) E!T { … }
 ```
 
 A `const` parameter must have either an integer type or a function pointer type `fn(…) R`
 (`E0471`). Inside the body, an integer `const` parameter is a constant of that type (usable
 both as a value and as an array length, e.g. `[N]f32`), and a function `const` parameter
 behaves as a value of its `fn(…) R` type that calls directly to the instantiated function.
+An `error` parameter (`[error E]`, `[T, error E]`) binds an error-set parameter usable as
+`E` or `E!T`; it is instantiated with an error set (named, inline, or `error`) or deduced
+from error-set and error-union arguments (§11.3).
 
 ### 10.3 Applying generic arguments: `Name.[Args]`
 
@@ -1738,6 +1747,61 @@ fn describe(e: ConfigError) []u8 {
   not narrow: a `!T` cannot become an `S!T`, since it may hold any error (`E0653`); handle
   the others with `catch`.
 - Errors of different sets compare by their codes, with `==`, `!=` and `@expect_eq`.
+
+**Inline anonymous error sets.** `{ A, B }` and `{ OutOfMemory }!void` write an error set
+directly in type position without declaring a separate named set:
+
+```axiom
+fn push_byte(b: u8) { OutOfMemory }!void { … }
+fn parse(e: { BadHeader, Truncated }) []u8 {
+    match e {                                    // no else: exhaustive over { BadHeader, Truncated }
+        error.BadHeader => { return "header"; }
+        error.Truncated => { return "eof"; }
+    }
+}
+```
+
+- Every error name mentioned in an inline set is entered into the program's global error
+  table (§11.1), even with no separate `error { … }` declaration.
+- Inline error sets are structural, order-insensitive, and deduplicated: `{ A, B }`,
+  `{ B, A }`, and `{ A, B, A }` are the exact same type, and `{ A, B }!T` and `{ B, A }!T`
+  are interchangeable in variables, parameters, returns, and function-pointer types.
+- Widening and matching follow member-subset inclusion across inline sets, named sets, and
+  open `error` / `!T`: `{ A }` fits `{ A, B }`, fits any named set such as `FileError` that
+  contains `A`, and fits `error` (and likewise `{ A }!T` widens to `{ A, B }!T`,
+  `FileError!T`, and `!T`). A named set and an inline set with the exact same members convert
+  in both directions. Standalone inline sets support exhaustive `match` without `else`.
+
+**Error-set generic parameters.** Functions and types may parameterize over an error set
+with `error E` in their generic parameter list:
+
+```axiom
+fn retry[error E, T](attempts: i32, f: fn() E!T) E!T { … }
+```
+
+- Instantiation accepts any error set (`retry.[IoErr, i32](…)`, `retry.[{ Bad }, i32](…)`,
+  or `retry.[error, i32](…)`). Supplying a non-error type such as `retry.[i32, i32]` is
+  `E0654`.
+- Argument deduction deduces `E` from error-set and error-union arguments: an argument of
+  type `S` or `S!T` deduces `E = S`, and an open `error` or `!T` deduces `E = error`.
+- Inside the generic body, `E` is opaque and cannot be assumed to fit inside or equal any
+  closed error set: assigning or returning `E` or `E!T` as `{ A }` or `S`, or using `!` on
+  `E!T` inside a function returning a closed set, is `E0653`, and `match` over `E` requires
+  an `else` arm (`E0630`).
+
+**Private return inference (`infer!T`) and dead-error warnings (`W0655`).**
+
+- `pub`, `export`, and `extern` functions must declare explicit error sets so
+  separate-compilation module interfaces (§16.7) never depend on function bodies.
+- `infer!T` is valid **only** as the return type of a private (`fn`, non-`pub`, non-`export`,
+  non-`extern`) non-host function; using `infer!T` anywhere else (including `pub fn`,
+  `export fn`, `extern fn`, host imports, parameters, fields, or local annotations) is
+  `E0654`. The compiler infers the closed set of errors the body can return or propagate
+  via `!`, and callers receive that closed set (allowing exhaustive `match` without `else`
+  and subset widening).
+- A concrete non-generic function declaring an inline error set `{ … }!T` whose body can
+  never return or propagate one or more of its listed errors emits warning `W0655` with a
+  fix narrowing the inline error set.
 
 ---
 
@@ -2747,7 +2811,7 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else` |
+| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`, `W0655` inline error set contains errors the function can never return (§11.3) |
 | `Txxxx` | Runtime traps (Appendix B) |
 
 The registry. It lists every code the compilers emit, and the test suite checks that
@@ -2867,7 +2931,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0651 | Too many error names (more than 65535) |
 | E0652 | `error.X` is not in the error set expected (§11.3) |
 | E0653 | An error, or an error union, that may not be in the error set expected, or `!` that could pass one on (§11.3) |
-| E0654 | An error set that includes itself, or a name used as an error set that is not one (§11.3) |
+| E0654 | An error set that includes itself, a non-error-set type used as an error set, or invalid `infer!T` (§11.3) |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
 | E0703 | Mutable address of a temporary (`&mut`, or a `*mut Self` method on one) |

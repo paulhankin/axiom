@@ -313,8 +313,31 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
     if k == lx.TK_BANG {
         _ = advance(P);
         let elem = parse_type(P);
-        let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: elem };
+        let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: elem, is_infer: false };
         return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
+    }
+    if k == lx.TK_LBRACE {
+        _ = advance(P);
+        let mut ies = ast.InlineErrSet.{
+            names: u.List.[[]u8].empty(),
+            spans: u.List.[u.Span].empty(),
+        };
+        while pk(P) == lx.TK_IDENT {
+            let id = expect_ident(P);
+            ies.names.push(id.name);
+            ies.spans.push(id.span);
+            P.mod.inline_error_names.push(id.name);
+            if not accept(P, lx.TK_COMMA) {
+                break;
+            }
+        }
+        _ = expect(P, lx.TK_RBRACE);
+        let set_te = ast.new_te(ast.TypeShape.ErrSetInline(ies), sp_from(P, start));
+        if accept(P, lx.TK_BANG) {
+            let eu = ast.ErrUnionType.{ set: set_te, elem: parse_type(P), is_infer: false };
+            return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
+        }
+        return set_te;
     }
     if k == lx.TK_QUESTION {
         _ = advance(P);
@@ -379,6 +402,12 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
         return ast.new_te(ast.TypeShape.Prim(t.prim), start);
     }
     if k == lx.TK_IDENT {
+        if u.str_eq(t.name, "infer") and (peek2(P).kind == lx.TK_BANG) {
+            _ = advance(P);
+            _ = advance(P);
+            let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: parse_type(P), is_infer: true };
+            return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
+        }
         _ = advance(P);
         let mut nt = named_type(t);
         // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
@@ -423,7 +452,7 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
         // Set!T: an error union of the error set named
         if pk(P) == lx.TK_BANG {
             _ = advance(P);
-            let eu = ast.ErrUnionType.{ set: named, elem: parse_type(P) };
+            let eu = ast.ErrUnionType.{ set: named, elem: parse_type(P), is_infer: false };
             return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
         }
         return named;
@@ -1378,6 +1407,11 @@ fn parse_generic_params(P: *mut Parser, d: *mut ast.Decl) void {
             g.span = id.span;
             _ = expect(P, lx.TK_COLON);
             g.const_te = parse_type(P);
+        } else if accept(P, lx.KW_ERROR) {
+            g.is_error = true;
+            let id = expect_ident(P);
+            g.name = id.name;
+            g.span = id.span;
         } else {
             let id = expect_ident(P);
             g.name = id.name;
@@ -1426,6 +1460,25 @@ fn parse_params(P: *mut Parser, d: *mut ast.Decl) void {
     _ = expect(P, lx.TK_RPAREN);
 }
 
+fn at_inline_errset(P: *Parser) bool {
+    if pk(P) != lx.TK_LBRACE {
+        return false;
+    }
+    let mut i = P.pos + 1;
+    if (i < P.n) and (P.t[i].kind == lx.TK_RBRACE) {
+        return ((i + 1) < P.n) and (P.t[i + 1].kind == lx.TK_BANG);
+    }
+    while (i < P.n) and (P.t[i].kind == lx.TK_IDENT) {
+        i += 1;
+        if (i < P.n) and (P.t[i].kind == lx.TK_COMMA) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    return (i < P.n) and (P.t[i].kind == lx.TK_RBRACE);
+}
+
 fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut ast.Decl {
     _ = expect(P, lx.KW_FN);
     let d = new_decl(P, ast.D_FN, start);
@@ -1434,7 +1487,7 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
     parse_decl_name(P, d);
     parse_generic_params(P, d);
     parse_params(P, d);
-    if pk(P) == lx.TK_LBRACE {
+    if (pk(P) == lx.TK_LBRACE) and not at_inline_errset(P) {
         let sp = peek(P).span;
         let dgn = dg.err(sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
         let fx = dg.fix(dgn, "declare a void return type", "suggestion");
@@ -1629,7 +1682,8 @@ fn parse_test(P: *mut Parser, start: u.Span) *mut ast.Decl {
         }
     }
     let v = ast.new_te(ast.TypeShape.Prim(lx.PRIM_VOID), start);
-    d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: v }), start);
+    d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: v,
+                                                                    is_infer: false }), start);
     d.body = parse_block(P);
     d.span = sp_from(P, start);
     return d;

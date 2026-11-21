@@ -332,6 +332,28 @@ static TypeExpr *parse_type_in(Parser *P) {
     }
     case KW_ERROR: advance(P); return new_te(TE_ERROR, start);
     case KW_SELF: advance(P); return new_te(TE_SELF, start);
+    case TK_LBRACE: {
+        advance(P);
+        TypeExpr *te = new_te(TE_ERRSET_INLINE, start);
+        while (pk(P) == TK_IDENT) {
+            Span sp;
+            Sym n = expect_ident(P, &sp);
+            vec_push(te->error_names, n);
+            vec_push(te->error_spans, sp);
+            vec_push(P->mod->inline_error_names, n);
+            if (!accept(P, TK_COMMA)) break;
+        }
+        expect(P, TK_RBRACE);
+        te->span = sp_from(P, start);
+        if (accept(P, TK_BANG)) {
+            TypeExpr *eu = new_te(TE_ERRUNION, start);
+            eu->set = te;
+            eu->elem = parse_type(P);
+            eu->span = sp_from(P, start);
+            return eu;
+        }
+        return te;
+    }
     case TK_PRIM: {
         advance(P);
         TypeExpr *te = new_te(TE_PRIM, start);
@@ -339,6 +361,15 @@ static TypeExpr *parse_type_in(Parser *P) {
         return te;
     }
     case TK_IDENT: {
+        if (!strcmp(t->name, "infer") && peek2(P)->kind == TK_BANG) {
+            advance(P);
+            advance(P);
+            TypeExpr *eu = new_te(TE_ERRUNION, start);
+            eu->is_infer = true;
+            eu->elem = parse_type(P);
+            eu->span = sp_from(P, start);
+            return eu;
+        }
         advance(P);
         TypeExpr *te = new_te(TE_NAMED, start);
         te->name = t->name;
@@ -1185,7 +1216,10 @@ static void parse_generic_params(Parser *P, Decl *d) {
     if (!accept(P, TK_LBRACKET)) return;
     while (pk(P) != TK_RBRACKET && pk(P) != TK_EOF) {
         GenericParam g = {0};
-        if (accept(P, KW_CONST)) {
+        if (accept(P, KW_ERROR)) {
+            g.is_error = true;
+            g.name = expect_ident(P, &g.span);
+        } else if (accept(P, KW_CONST)) {
             g.is_const = true;
             g.name = expect_ident(P, &g.span);
             expect(P, TK_COLON);
@@ -1258,6 +1292,19 @@ static void parse_fn_attr(Parser *P, Decl *d) {
     if (kind != ATTR_NONE) d->attr_span = sp_from(P, ts);
 }
 
+static bool at_inline_errset(Parser *P) {
+    if (pk(P) != TK_LBRACE) return false;
+    int k = P->pos + 1;
+    if (k < P->n && P->t[k].kind == TK_RBRACE)
+        return k + 1 < P->n && P->t[k + 1].kind == TK_BANG;
+    while (k < P->n && P->t[k].kind == TK_IDENT) {
+        k++;
+        if (k < P->n && P->t[k].kind == TK_COMMA) k++;
+        else break;
+    }
+    return k < P->n && P->t[k].kind == TK_RBRACE;
+}
+
 static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     expect(P, KW_FN);
     Decl *d = new_decl(P, D_FN, start);
@@ -1266,7 +1313,7 @@ static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     d->name = expect_ident(P, &d->name_span);
     parse_generic_params(P, d);
     parse_params(P, d);
-    if (pk(P) == TK_LBRACE) {
+    if (pk(P) == TK_LBRACE && !at_inline_errset(P)) {
         Diag *dg = diag_error(peek(P)->span, "E0301", "missing return type (write 'void' if the function returns nothing)");
         DiagFix *fx = diag_fix(dg, "declare a void return type", "suggestion");
         diag_fix_edit(fx, (Span){peek(P)->span.file, peek(P)->span.start, peek(P)->span.start}, "void ");
