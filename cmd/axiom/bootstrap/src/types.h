@@ -60,6 +60,7 @@ struct Type {
     int nparams;
     Type *ret;
     Decl *decl;      // STRUCT, UNION, ENUM; ERROR, ERRUNION: the error set (NULL: any error)
+    Type *err_param; // ERRUNION: generic error-set parameter [error E]
     Type **args;
     int nargs;
     // PARAM
@@ -68,6 +69,7 @@ struct Type {
     Constraint constraint;
     Type *constraint_lane;  // FloatVector[S] / IntVector[S] / Vector[S]
     bool is_const;
+    bool is_error_param;
     Type *const_type;
     Sym name;
     int64_t cval;    // CONSTINT
@@ -110,10 +112,12 @@ typedef enum OptNiche { OPT_PTR, OPT_BOOL, OPT_SLICE, OPT_TAGGED } OptNiche;
 OptNiche opt_niche(const Type *t);
 Type *type_errunion(Type *elem);
 Type *type_errunion_set(Type *elem, Decl *set);
+Type *type_errunion_param(Type *elem, Type *ep);
 Type *type_errset(Decl *set);
 Type *type_constint(int64_t v);
 Type *type_constfn(Decl *d, Type **args, int n, Type *fn_ty);
 Type *type_param(Decl *owner, int index, Sym name, Constraint c, bool is_const, Type *const_type);
+Type *type_err_param(Decl *owner, int index, Sym name);
 Decl *anon_struct_decl(Module *m, FieldVec fields, Span sp);  // interned by field list
 
 // Substitute generic parameters: every TY_PARAM from[i] becomes to[i].

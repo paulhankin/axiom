@@ -56,6 +56,8 @@ typedef struct FnCtx {
     bool suppress_moved_ident;
     bool const_ctx;
     bool in_return;
+    bool ret_err_open;
+    Vec(Sym) ret_errs;
 } FnCtx;
 
 extern FnCtx *C;
@@ -65,9 +67,10 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc);
 Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc);
 void resolve_decl(Decl *d);
 Decl *resolve_set_te(TypeExpr *te, TypeCtx *tc);
+Decl *intern_anon_errset(Sym *names, int n);
 bool set_has(Decl *set, Sym name);
-bool error_fits(Span sp, Decl *a, Decl *b);
-void try_fits(Span sp, Decl *a, Decl *b);
+bool error_fits(Span sp, Type *src, Type *dst);
+void try_fits(Span sp, Type *src, Type *dst);
 Decl *expected_set(Type *t);
 bool union_fits(Span sp, Type *s, Type *t);
 bool fn_widens(Type *s, Type *t);

@@ -238,6 +238,12 @@ static void assign_error_codes(void) {
                 vec_push(names, n);
             }
         }
+        for (int i = 0; i < m->inline_error_names.len; i++) {
+            Sym n = m->inline_error_names.data[i];
+            if (symmap_get(&seen, n)) continue;
+            symmap_put(&seen, n, (void *)1);
+            vec_push(names, n);
+        }
     }
     qsort(names.data, (size_t)names.len, sizeof(Sym), sym_cmp);
     for (int i = 0; i < names.len; i++) {
@@ -281,6 +287,12 @@ static void ensure_gparams(Decl *d) {
     for (int i = 0; i < d->gparams.len; i++) {
         GenericParam *g = &d->gparams.data[i];
         if (g->type) continue;
+        if (g->is_error) {
+            g->type = type_err_param(d, i, g->name);
+            for (int j = 0; j < (placeholder(g->name) ? 0 : i); j++)
+                if (d->gparams.data[j].name == g->name) dup_error(g->span, g->name, d->gparams.data[j].span);
+            continue;
+        }
         Constraint c = C_NONE;
         Type *ct = NULL;
         Type *lane = NULL;
@@ -438,9 +450,10 @@ static bool type_has_invalid(Type *t) {
     case TY_SLICE:
     case TY_ARRAY:
     case TY_OPT:
-    case TY_ERRUNION:
     case TY_VEC:
     case TY_ENUM: return type_has_invalid(t->elem);
+    case TY_ERRUNION:
+        return type_has_invalid(t->elem) || (t->err_param && type_has_invalid(t->err_param));
     case TY_FN:
         for (int i = 0; i < t->nparams; i++)
             if (type_has_invalid(t->params[i])) return true;
@@ -462,6 +475,7 @@ static Type *resolve_fn_garg(Decl *fn, Type **owner_args, int nowner, bool has_a
                               Span sp, Span name_span, TypeCtx *tc) {
     resolve_decl(fn);
     if (fn->state != 2 || !fn->type) return t_invalid;
+    if (fn->kind == D_FN && fn->is_infer_ret && !fn->checked && !fn->inferring_ret) check_fn_body(fn);
     if (fn->cabi) {
         diag_error(name_span, "E0801",
                    "the C function '%s' takes or returns a structure by value: it can only be called directly",
@@ -651,7 +665,13 @@ bool check_generic_args_ctx(Decl *d, Type **owner_args, int nowner, Type **args,
             to[base_sub + i - 1] = args[i - 1];
         }
         if (a->kind == TY_INVALID) continue;
-        if (g->is_const) {
+        if (g->is_error) {
+            if (a->kind != TY_ERROR && !(a->kind == TY_PARAM && a->is_error_param)) {
+                diag_error(asp, "E0654", "expected an error set for generic error parameter '%s', found %s", g->name,
+                           type_str(a));
+                ok = false;
+            }
+        } else if (g->is_const) {
             Type *ect = nsub ? type_subst(g->type->const_type, from, to, nsub) : g->type->const_type;
             if (type_has_invalid(ect)) continue;
             if (ect->kind == TY_FN) {
@@ -783,6 +803,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
     switch (te->kind) {
     case TE_PRIM: return type_prim(te->prim);
     case TE_ERROR: return t_error;
+    case TE_ERRSET_INLINE: return type_errset(intern_anon_errset(te->error_names.data, te->error_names.len));
     case TE_INVALID: return t_invalid;
     case TE_SELF:
         if (!tc->self) {
@@ -801,12 +822,34 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         return check_size(te->span, type_opt(e));
     }
     case TE_ERRUNION: {
-        Decl *set = te->set ? resolve_set_te(te->set, tc) : NULL;
+        if (te->is_infer) {
+            diag_error(te->span, "E0654", "'infer!T' is only allowed as the return type of a private function");
+            Type *e = resolve_type(te->elem, tc);
+            return e->kind == TY_ERRUNION ? e : type_errunion(e);
+        }
+        Type *ep = NULL;
+        Decl *set = NULL;
+        if (te->set) {
+            if (te->set->kind == TE_ERRSET_INLINE) {
+                set = intern_anon_errset(te->set->error_names.data, te->set->error_names.len);
+            } else if (te->set->kind == TE_NAMED && !te->set->qual && !te->set->has_member && !te->set->has_args) {
+                Type *gp = lookup_gparam(tc, te->set->name);
+                if (gp) {
+                    if (gp->is_error_param) ep = gp;
+                    else diag_error(te->set->name_span, "E0654", "'%s' is not an error set", te->set->name);
+                } else {
+                    set = resolve_set_te(te->set, tc);
+                }
+            } else {
+                set = resolve_set_te(te->set, tc);
+            }
+        }
         Type *e = resolve_type(te->elem, tc);
         if (e->kind == TY_ERRUNION) {
             diag_error(te->span, "E0401", "nested error unions (!!T) are not allowed");
             return e;
         }
+        if (ep) return check_size(te->span, type_errunion_param(e, ep));
         return check_size(te->span, type_errunion_set(e, set));
     }
     case TE_PTR: return type_ptr(resolve_type(te->elem, tc), te->mut);
@@ -1003,7 +1046,19 @@ static void resolve_fn(Decl *d) {
         for (int j = 0; j < (placeholder(p->name) ? 0 : i); j++)
             if (d->params.data[j].name == p->name) dup_error(p->span, p->name, d->params.data[j].span);
     }
-    d->ret_type = d->ret_te ? resolve_type(d->ret_te, &tc) : t_void;
+    if (d->kind == D_FN && !d->is_pub && !d->is_export && !d->extern_c &&
+        d->ret_te && d->ret_te->kind == TE_ERRUNION && d->ret_te->is_infer) {
+        Type *e = resolve_type(d->ret_te->elem, &tc);
+        if (e->kind == TY_ERRUNION) {
+            diag_error(d->ret_te->span, "E0401", "nested error unions (!!T) are not allowed");
+            d->ret_type = e;
+        } else {
+            d->is_infer_ret = true;
+            d->ret_type = check_size(d->ret_te->span, type_errunion(e));
+        }
+    } else {
+        d->ret_type = d->ret_te ? resolve_type(d->ret_te, &tc) : t_void;
+    }
     d->type = type_fn(d->param_types, d->params.len, d->ret_type);
     d->self_kind = SELF_NONE;
     if (owner && owner->type && d->params.len > 0 && strcmp(d->params.data[0].name, "self") == 0) {
@@ -1117,6 +1172,56 @@ static void resolve_enum(Decl *d) {
 // ---------------------------------------------------------------------------
 // Error sets (spec §11.3)
 // ---------------------------------------------------------------------------
+static SymMap anon_errsets;
+
+Decl *intern_anon_errset(Sym *names, int n) {
+    Vec(Sym) uniq = {0};
+    if (n > 0) {
+        Sym *tmp = malloc(sizeof(Sym) * (size_t)n);
+        memcpy(tmp, names, sizeof(Sym) * (size_t)n);
+        qsort(tmp, (size_t)n, sizeof(Sym), sym_cmp);
+        for (int i = 0; i < n; i++) {
+            if (i == 0 || tmp[i] != tmp[i - 1]) vec_push(uniq, tmp[i]);
+        }
+        free(tmp);
+    }
+    Sym cname;
+    if (uniq.len == 0) {
+        cname = intern_cstr("{}");
+    } else {
+        CharVec b = {0};
+        vec_push(b, '{');
+        vec_push(b, ' ');
+        for (int i = 0; i < uniq.len; i++) {
+            if (i) {
+                vec_push(b, ',');
+                vec_push(b, ' ');
+            }
+            for (const char *p = uniq.data[i]; *p; p++) vec_push(b, *p);
+        }
+        vec_push(b, ' ');
+        vec_push(b, '}');
+        cname = intern(b.data, (size_t)b.len);
+        free(b.data);
+    }
+    Decl *d = symmap_get(&anon_errsets, cname);
+    if (d) {
+        free(uniq.data);
+        return d;
+    }
+    d = NEW(Decl);
+    d->kind = D_ERROR;
+    d->name = cname;
+    d->module = NULL;
+    d->is_anon = true;
+    d->state = 2;
+    d->set_names.data = uniq.data;
+    d->set_names.len = uniq.len;
+    d->set_names.cap = uniq.cap;
+    symmap_put(&anon_errsets, cname, d);
+    return d;
+}
+
 static void add_set_name(Decl *d, Sym n) {
     for (int i = 0; i < d->set_names.len; i++)
         if (d->set_names.data[i] == n) return;
@@ -1167,51 +1272,147 @@ static Sym set_missing(Decl *a, Decl *b) {
     return NULL;
 }
 
-// An error of set a (NULL: any) where one of set b (NULL: any) is needed.
-bool error_fits(Span sp, Decl *a, Decl *b) {
-    if (!b || a == b) return true;
-    if (!a) {
-        diag_error(sp, "E0653",
-                   "a value of type error can hold any error, but %s holds only its own; match on it to choose",
-                   b->name);
+static void err_set_parts(Type *t, Decl **decl_out, Type **ep_out) {
+    if (!t) {
+        *decl_out = NULL;
+        *ep_out = NULL;
+        return;
+    }
+    if (t->kind == TY_PARAM && t->is_error_param) {
+        *decl_out = NULL;
+        *ep_out = t;
+        return;
+    }
+    if (t->kind == TY_ERRUNION) {
+        *decl_out = t->decl;
+        *ep_out = t->err_param;
+        return;
+    }
+    if (t->kind == TY_ERROR) {
+        *decl_out = t->decl;
+        *ep_out = NULL;
+        return;
+    }
+    *decl_out = NULL;
+    *ep_out = NULL;
+}
+
+// An error of src's set where one of dst's set is needed.
+bool error_fits(Span sp, Type *src, Type *dst) {
+    Decl *ad, *bd;
+    Type *aep, *bep;
+    err_set_parts(src, &ad, &aep);
+    err_set_parts(dst, &bd, &bep);
+    if (!bd && !bep) return true;
+    if (aep && bep && aep == bep) return true;
+    if (!aep && !bep && ad == bd) return true;
+    if (ad && !aep) {
+        resolve_decl(ad);
+        if (ad->set_names.len == 0) return true;
+    }
+    if (bep) {
+        if (!ad && !aep) {
+            diag_error(sp, "E0653",
+                       "a value of type error can hold any error, but %s may hold fewer; match on it to choose",
+                       bep->name);
+            return false;
+        }
+        if (aep) {
+            diag_error(sp, "E0653", "%s can hold errors unknown to %s", aep->name, bep->name);
+            return false;
+        }
+        diag_error(sp, "E0653", "%s can hold error.%s, which %s may not hold", ad->name, ad->set_names.data[0],
+                   bep->name);
         return false;
     }
-    Sym m = set_missing(a, b);
+    if (aep) {
+        diag_error(sp, "E0653", "%s can hold errors unknown to %s", aep->name, bd->name);
+        return false;
+    }
+    if (!ad) {
+        diag_error(sp, "E0653",
+                   "a value of type error can hold any error, but %s holds only its own; match on it to choose",
+                   bd->name);
+        return false;
+    }
+    Sym m = set_missing(ad, bd);
     if (m) {
-        diag_error(sp, "E0653", "%s can hold error.%s, which %s does not", a->name, m, b->name);
+        diag_error(sp, "E0653", "%s can hold error.%s, which %s does not", ad->name, m, bd->name);
         return false;
     }
     return true;
 }
 
-// '!' on an error union of set a (NULL: any) in a function returning set b.
-void try_fits(Span sp, Decl *a, Decl *b) {
-    if (!b || a == b) return;
-    if (!a) {
-        diag_error(sp, "E0653", "this '!' can pass on any error, but this function returns only those of %s",
-                   b->name);
+// '!' on an error union of src in a function returning dst.
+void try_fits(Span sp, Type *src, Type *dst) {
+    Decl *ad, *bd;
+    Type *aep, *bep;
+    err_set_parts(src, &ad, &aep);
+    err_set_parts(dst, &bd, &bep);
+    if (!bd && !bep) return;
+    if (aep && bep && aep == bep) return;
+    if (!aep && !bep && ad == bd) return;
+    if (ad && !aep) {
+        resolve_decl(ad);
+        if (ad->set_names.len == 0) return;
+    }
+    if (bep) {
+        if (!ad && !aep) {
+            diag_error(sp, "E0653", "this '!' can pass on any error, but this function returns only those of %s",
+                       bep->name);
+            return;
+        }
+        if (aep) {
+            diag_error(sp, "E0653", "this '!' can pass on errors of %s, which %s may not hold", aep->name, bep->name);
+            return;
+        }
+        diag_error(sp, "E0653", "this '!' can pass on error.%s, which %s may not hold", ad->set_names.data[0],
+                   bep->name);
         return;
     }
-    Sym m = set_missing(a, b);
-    if (m) diag_error(sp, "E0653", "this '!' can pass on error.%s, which %s does not hold", m, b->name);
+    if (aep) {
+        diag_error(sp, "E0653", "this '!' can pass on errors of %s, which %s may not hold", aep->name, bd->name);
+        return;
+    }
+    if (!ad) {
+        diag_error(sp, "E0653", "this '!' can pass on any error, but this function returns only those of %s",
+                   bd->name);
+        return;
+    }
+    Sym m = set_missing(ad, bd);
+    if (m) diag_error(sp, "E0653", "this '!' can pass on error.%s, which %s does not hold", m, bd->name);
 }
 
-// Whether set b (NULL: any) holds every error of set a (NULL: any), without reporting.
-static bool set_within(Decl *a, Decl *b) {
-    if (!b || a == b) return true;
-    if (!a) return false;
-    return set_missing(a, b) == NULL;
+// Whether dst's error set holds every error of src's, without reporting.
+static bool set_within(Type *src, Type *dst) {
+    Decl *ad, *bd;
+    Type *aep, *bep;
+    err_set_parts(src, &ad, &aep);
+    err_set_parts(dst, &bd, &bep);
+    if (!bd && !bep) return true;
+    if (ad && !aep) {
+        resolve_decl(ad);
+        if (ad->set_names.len == 0) return true;
+    }
+    if (aep || bep) return aep && bep && aep == bep;
+    if (!ad) return false;
+    return set_missing(ad, bd) == NULL;
 }
 
 // An error union s where the wider t is expected: the same value type, and t's set holds
 // every error of s's (spec §11.3).
 bool union_fits(Span sp, Type *s, Type *t) {
-    if (t->decl && !s->decl) {
+    if (t->err_param && !s->decl && !s->err_param) {
+        diag_error(sp, "E0653", "%s can hold any error, but %s may hold fewer; handle the others with catch",
+                   type_str(s), type_str(t));
+        return false;
+    }
+    if (t->decl && !s->decl && !s->err_param) {
         diag_error(sp, "E0653", "%s can hold any error, but %s holds only those of its set; handle the others with catch",
                    type_str(s), type_str(t));
         return false;
     }
-    return error_fits(sp, s->decl, t->decl);
+    return error_fits(sp, s, t);
 }
 
 // A function whose results widen to those of t (an error union of a set within t's), with
@@ -1221,7 +1422,7 @@ bool fn_widens(Type *s, Type *t) {
     for (int i = 0; i < s->nparams; i++)
         if (s->params[i] != t->params[i]) return false;
     Type *a = s->ret, *b = t->ret;
-    return a->kind == TY_ERRUNION && b->kind == TY_ERRUNION && a->elem == b->elem && set_within(a->decl, b->decl);
+    return a->kind == TY_ERRUNION && b->kind == TY_ERRUNION && a->elem == b->elem && set_within(a, b);
 }
 
 // The error set an expected type asks for (NULL: none, or any error).

@@ -30,6 +30,7 @@ static uint64_t type_hash(const Type *t) {
     h = mix(h, (uint64_t)(uintptr_t)t->len_param);
     h = mix(h, (uint64_t)(uintptr_t)t->ret);
     h = mix(h, (uint64_t)(uintptr_t)t->decl);
+    h = mix(h, (uint64_t)(uintptr_t)t->err_param);
     h = mix(h, (uint64_t)(uintptr_t)t->const_type);
     h = mix(h, (uint64_t)t->cval);
     for (int i = 0; i < t->nparams; i++) h = mix(h, (uint64_t)(uintptr_t)t->params[i]);
@@ -40,8 +41,8 @@ static uint64_t type_hash(const Type *t) {
 static bool type_eq_struct(const Type *a, const Type *b) {
     if (a->kind != b->kind || a->bits != b->bits || a->is_signed != b->is_signed || a->is_size != b->is_size ||
         a->mut != b->mut || a->lanes != b->lanes || a->elem != b->elem || a->len != b->len ||
-        a->len_param != b->len_param || a->ret != b->ret || a->decl != b->decl || a->const_type != b->const_type ||
-        a->cval != b->cval || a->nparams != b->nparams || a->nargs != b->nargs)
+        a->len_param != b->len_param || a->ret != b->ret || a->decl != b->decl || a->err_param != b->err_param ||
+        a->const_type != b->const_type || a->cval != b->cval || a->nparams != b->nparams || a->nargs != b->nargs)
         return false;
     for (int i = 0; i < a->nparams; i++)
         if (a->params[i] != b->params[i]) return false;
@@ -84,6 +85,7 @@ static Type *intern_type(Type *proto) {
     // has_params
     bool hp = t->kind == TY_PARAM;
     if (t->elem && t->elem->has_params) hp = true;
+    if (t->err_param && t->err_param->has_params) hp = true;
     if (t->len_param) hp = true;
     if (t->ret && t->ret->has_params) hp = true;
     if (t->const_type && t->const_type->has_params) hp = true;
@@ -175,6 +177,11 @@ Type *type_errunion_set(Type *elem, Decl *set) {
     Type p = {.kind = TY_ERRUNION, .elem = elem, .decl = set};
     return intern_type(&p);
 }
+Type *type_errunion_param(Type *elem, Type *ep) {
+    if (!ep) return type_errunion(elem);
+    Type p = {.kind = TY_ERRUNION, .elem = elem, .err_param = ep};
+    return intern_type(&p);
+}
 // The error type of the set declared by set (NULL: error, any error).
 Type *type_errset(Decl *set) {
     if (!set) return t_error;
@@ -202,6 +209,12 @@ Type *type_param(Decl *owner, int index, Sym name, Constraint c, bool is_const, 
     t->is_const = is_const;
     t->const_type = const_type;
     t->has_params = true;
+    return t;
+}
+
+Type *type_err_param(Decl *owner, int index, Sym name) {
+    Type *t = type_param(owner, index, name, C_NONE, false, NULL);
+    t->is_error_param = true;
     return t;
 }
 
@@ -329,7 +342,16 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
     case TY_PTR: return type_ptr(type_subst(t->elem, from, to, n), t->mut);
     case TY_SLICE: return type_slice(type_subst(t->elem, from, to, n), t->mut);
     case TY_OPT: return type_opt(type_subst(t->elem, from, to, n));
-    case TY_ERRUNION: return type_errunion_set(type_subst(t->elem, from, to, n), t->decl);
+    case TY_ERRUNION: {
+        Type *sub_elem = type_subst(t->elem, from, to, n);
+        if (t->err_param) {
+            Type *s = type_subst(t->err_param, from, to, n);
+            if (s->kind == TY_PARAM && s->is_error_param) return type_errunion_param(sub_elem, s);
+            if (s->kind == TY_ERROR) return type_errunion_set(sub_elem, s->decl);
+            return type_errunion(sub_elem);
+        }
+        return type_errunion_set(sub_elem, t->decl);
+    }
     case TY_ARRAY: {
         Type *e = type_subst(t->elem, from, to, n);
         if (t->len_param) {
@@ -378,7 +400,9 @@ Type *type_lower_enums(Type *t) {
     case TY_PTR: return type_ptr(type_lower_enums(t->elem), t->mut);
     case TY_SLICE: return type_slice(type_lower_enums(t->elem), t->mut);
     case TY_OPT: return type_opt(type_lower_enums(t->elem));
-    case TY_ERRUNION: return type_errunion_set(type_lower_enums(t->elem), t->decl);
+    case TY_ERRUNION:
+        if (t->err_param) return type_errunion_param(type_lower_enums(t->elem), t->err_param);
+        return type_errunion_set(type_lower_enums(t->elem), t->decl);
     case TY_ARRAY:
         if (t->len_param) return type_array_param(type_lower_enums(t->elem), t->len_param);
         return type_array(type_lower_enums(t->elem), t->len);
@@ -504,7 +528,8 @@ static void tstr(CharVec *b, Type *t) {
     case TY_ENUM: puts_b(b, t->decl->name); return;
     case TY_OPT: puts_b(b, "?"); tstr(b, t->elem); return;
     case TY_ERRUNION:
-        if (t->decl) puts_b(b, t->decl->name);
+        if (t->err_param) tstr(b, t->err_param);
+        else if (t->decl) puts_b(b, t->decl->name);
         puts_b(b, "!");
         tstr(b, t->elem);
         return;
@@ -737,6 +762,7 @@ bool type_satisfies(Type *t, Constraint c) {
     if (t->kind == TY_INVALID) return true;
     if (t->kind == TY_PARAM) {
         if (t->is_const) return false;
+        if (t->is_error_param) return c == C_NONE || c == C_EQ;
         if (c == C_FLOAT_VEC && t->constraint == C_VEC && t->constraint_lane) {
             return t->constraint_lane->kind == TY_FLOAT ||
                    (t->constraint_lane->kind == TY_PARAM && type_satisfies(t->constraint_lane, C_FLOAT));

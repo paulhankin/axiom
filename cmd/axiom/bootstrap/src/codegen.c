@@ -1362,6 +1362,26 @@ static const char *mangle_prefix(Decl *d) {
     return arena_strndup(base, n);
 }
 
+static void mangle_errset_into(CharVec *b, Decl *d) {
+#define MPUT(str)                                                  \
+    do {                                                           \
+        for (const char *q_ = (str); *q_; q_++) vec_push(*b, *q_); \
+    } while (0)
+    if (d->is_anon) {
+        MPUT("errors(");
+        for (int i = 0; i < d->set_names.len; i++) {
+            if (i) MPUT(",");
+            MPUT(d->set_names.data[i]);
+        }
+        MPUT(")");
+    } else {
+        MPUT(mangle_prefix(d));
+        MPUT(".");
+        MPUT(d->name);
+    }
+#undef MPUT
+}
+
 // A type in a symbol name: like type_str, but struct and union names are
 // qualified by their module, so instances are named the same in every unit.
 static void mangle_type_into(CharVec *b, Type *t) {
@@ -1412,22 +1432,14 @@ static void mangle_type_into(CharVec *b, Type *t) {
         mangle_type_into(b, t->elem);
         break;
     case TY_ERRUNION:
-        if (t->decl) {
-            MPUT(mangle_prefix(t->decl));
-            MPUT(".");
-            MPUT(t->decl->name);
-        }
+        if (t->err_param) mangle_type_into(b, t->err_param);
+        else if (t->decl) mangle_errset_into(b, t->decl);
         MPUT("!");
         mangle_type_into(b, t->elem);
         break;
     case TY_ERROR:
-        if (t->decl) {
-            MPUT(mangle_prefix(t->decl));
-            MPUT(".");
-            MPUT(t->decl->name);
-        } else {
-            MPUT("error");
-        }
+        if (t->decl) mangle_errset_into(b, t->decl);
+        else MPUT("error");
         break;
     case TY_FN:
         MPUT("fn(");

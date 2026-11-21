@@ -47,12 +47,14 @@ fn blank(k: ast.TyKind) ast.Type {
         params: no_types(),
         ret: u.nil.[ast.Type](),
         decl: u.nil.[ast.Decl](),
+        err_param: u.nil.[ast.Type](),
         args: no_types(),
         owner: u.nil.[ast.Decl](),
         pindex: 0,
         constraint: 0,
         constraint_lane: u.nil.[ast.Type](),
         is_const: false,
+        is_error_param: false,
         const_type: u.nil.[ast.Type](),
         name: u.nosym(),
         cval: 0,
@@ -103,6 +105,7 @@ fn type_hash(t: *ast.Type) u64 {
     h = mix(h, pv(t.ret));
     h = mix(h, pv(t.const_type));
     h = mix(h, @as(u64, @int_from_ptr(t.decl)));
+    h = mix(h, pv(t.err_param));
     h = mix(h, @bit_cast(u64, t.cval));
     for p in t.params {
         h = mix(h, pv(p));
@@ -117,7 +120,8 @@ fn type_eq_struct(a: *ast.Type, b: *ast.Type) bool {
     if (a.kind != b.kind) or (a.bits != b.bits) or (a.is_signed != b.is_signed) or (a.is_size != b.is_size) or
        (a.is_mut != b.is_mut) or (a.lanes != b.lanes) or (a.elem != b.elem) or (a.len != b.len) or
        (a.len_param != b.len_param) or (a.ret != b.ret) or (a.const_type != b.const_type) or (a.decl != b.decl) or
-       (a.cval != b.cval) or (a.params.len != b.params.len) or (a.args.len != b.args.len) {
+       (a.err_param != b.err_param) or (a.cval != b.cval) or (a.params.len != b.params.len) or
+       (a.args.len != b.args.len) {
         return false;
     }
     for i in 0..a.params.len {
@@ -257,6 +261,9 @@ fn add_type(tabp: *mut *mut *mut ast.Type, capp: *mut usize, lenp: *mut usize, p
     if u.notnil(t.const_type) and t.const_type.has_params {
         hp = true;
     }
+    if u.notnil(t.err_param) and t.err_param.has_params {
+        hp = true;
+    }
     for p in t.params {
         if p.has_params {
             hp = true;
@@ -375,6 +382,14 @@ pub fn type_errunion_set(elem: *mut ast.Type, set: *mut ast.Decl) *mut ast.Type 
     return intern_type(&p);
 }
 
+// ep!T where ep is a generic error set parameter ([error E]).
+pub fn type_errunion_param(elem: *mut ast.Type, ep: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_ERRUNION);
+    p.elem = elem;
+    p.err_param = ep;
+    return intern_type(&p);
+}
+
 pub enum OptNiche: i32 {
     PTR,
     BOOL,
@@ -444,6 +459,12 @@ pub fn type_param(owner: *mut ast.Decl, index: i32, name: []u8, c: i32, is_const
     t.is_const = is_const;
     t.const_type = const_type;
     t.has_params = true;
+    return t;
+}
+
+pub fn type_err_param(owner: *mut ast.Decl, index: i32, name: []u8) *mut ast.Type {
+    let t = type_param(owner, index, name, ast.C_NONE, false, u.nil.[ast.Type]());
+    t.is_error_param = true;
     return t;
 }
 
@@ -689,7 +710,18 @@ pub fn subst(t: *mut ast.Type, from: []mut *mut ast.Type, to: []mut *mut ast.Typ
         return type_slice(subst(t.elem, from, to), t.is_mut);
     }
     if k == ast.TY_ERRUNION {
-        return type_errunion_set(subst(t.elem, from, to), t.decl);
+        let el = subst(t.elem, from, to);
+        if u.notnil(t.err_param) {
+            let ep = subst(t.err_param, from, to);
+            if ep.kind == ast.TY_PARAM {
+                return type_errunion_param(el, ep);
+            }
+            if ep.kind == ast.TY_ERROR {
+                return type_errunion_set(el, ep.decl);
+            }
+            return type_errunion(el);
+        }
+        return type_errunion_set(el, t.decl);
     }
     if k == ast.TY_OPT {
         return type_opt(subst(t.elem, from, to));
@@ -833,7 +865,9 @@ fn tstr(b: *mut u.Buf, t: *ast.Type) void {
         .UNION  => { tstr_aggregate(b, t); }
         .ENUM   => { b.s(t.decl.name); }
         .ERRUNION => {
-            if u.notnil(t.decl) {
+            if u.notnil(t.err_param) {
+                b.s(t.err_param.name);
+            } else if u.notnil(t.decl) {
                 b.s(t.decl.name);
             }
             b.s("!");
@@ -1224,6 +1258,9 @@ pub fn satisfies(t: *ast.Type, c: i32) bool {
     if k == ast.TY_PARAM {
         if t.is_const {
             return false;
+        }
+        if t.is_error_param {
+            return (c == ast.C_NONE) or (c == ast.C_EQ);
         }
         if (c == ast.C_FLOAT_VEC) and (t.constraint == ast.C_VEC) and u.notnil(t.constraint_lane) {
             return (t.constraint_lane.kind == ast.TY_FLOAT) or
