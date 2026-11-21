@@ -71,6 +71,11 @@ typedef struct LoopCtx {
     int defer_height;
 } LoopCtx;
 
+typedef struct AsanStackSlot {
+    LLVMValueRef ptr_u;
+    int64_t size;
+} AsanStackSlot;
+
 typedef struct FnState {
     FnInst *inst;
     Decl *decl;
@@ -84,6 +89,7 @@ typedef struct FnState {
     Type *ret;  // concrete
     Vec(Stmt *) defers;
     Vec(LoopCtx) loops;
+    Vec(AsanStackSlot) asan_stack;
     LLVMBasicBlockRef entry, trap_bb;
     LLVMValueRef *inl;  // inline fn: its callers' call-site records, innermost first (NULL: none)
     int ninl;
@@ -1939,16 +1945,28 @@ static void emit_defers(int down_to, LLVMValueRef err, bool always) {
     }
 }
 
+static FnInst *mem_fn(const char *name);
+static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool sret, LLVMValueRef *argv, int argc,
+                              Type **argt, const char *callee, int ninl);
+
 // v: NULL when the result is already in F->sret_ptr
 static void emit_ret(LLVMValueRef v) {
+    LLVMValueRef ret_val = NULL;
     if (F->sret_ptr) {
         if (v) store(F->ret, v, F->sret_ptr, false);
-        LLVMBuildRetVoid(B);
-    } else if (F->ret->kind == TY_VOID) {
-        LLVMBuildRetVoid(B);
-    } else {
-        LLVMBuildRet(B, as_val(F->ret, v));
+    } else if (F->ret->kind != TY_VOID) {
+        ret_val = as_val(F->ret, v);
     }
+    if (F->asan_stack.len > 0) {
+        FnInst *ff = mem_fn("asan_stack_free");
+        for (int i = 0; i < F->asan_stack.len; i++) {
+            AsanStackSlot sl = F->asan_stack.data[i];
+            LLVMValueRef args[2] = {sl.ptr_u, usz(sl.size)};
+            emit_call(ff->llty, ff->fn, ff->fnty, false, args, 2, ff->fnty->params, NULL, ff->ninl);
+        }
+    }
+    if (F->sret_ptr || F->ret->kind == TY_VOID) LLVMBuildRetVoid(B);
+    else LLVMBuildRet(B, ret_val);
 }
 
 static LLVMValueRef errunion_code(Type *eu, LLVMValueRef v) { return field_value(eu, v, 0, t_error); }
@@ -5652,12 +5670,39 @@ static void gen_fn_body_of(FnInst *fi) {
         }
         g_cur_span = saved_sp;
     }
+    if (asan_on()) {
+        Span saved_sp = g_cur_span;
+        g_cur_span = d->name_span;
+        for (int i = 0; i < d->locals.len; i++) {
+            Local *l = d->locals.data[i];
+            if (l->is_param || !l->addr_taken || !l->type) continue;
+            Type *t = ct(l->type);
+            int64_t sz = type_size(t);
+            if ((t->kind == TY_ARRAY || t->kind == TY_STRUCT || t->kind == TY_UNION) && sz > 0) {
+                LLVMValueRef fb = alloca_in_entry(lty(t), l->name);
+                add_frame(t);
+                LLVMSetAlignment(fb, (unsigned)type_align(t));
+                FnInst *fa = mem_fn("asan_stack_alloc");
+                LLVMValueRef args[2] = {usz(sz), usz(type_align(t))};
+                LLVMValueRef heap_u = emit_call(fa->llty, fa->fn, fa->fnty, false, args, 2, fa->fnty->params, NULL, fa->ninl);
+                LLVMValueRef ok = LLVMBuildICmp(B, LLVMIntNE, heap_u, usz(0), "");
+                LLVMValueRef hp = LLVMBuildIntToPtr(B, heap_u, T_ptr, "");
+                st.locals[l->index] = LLVMBuildSelect(B, ok, hp, fb, "");
+                AsanStackSlot slot = {heap_u, sz};
+                vec_push(st.asan_stack, slot);
+            }
+        }
+        g_cur_span = saved_sp;
+    }
     gen_block(d->body);
     if (!terminated()) {
-        if (st.ret->kind == TY_VOID) LLVMBuildRetVoid(B);
+        Span saved_sp = g_cur_span;
+        g_cur_span = d->name_span;
+        if (st.ret->kind == TY_VOID) emit_ret(NULL);
         else if (st.ret->kind == TY_ERRUNION && st.ret->elem->kind == TY_VOID)
             emit_ret(errunion_value(st.ret, LLVMConstInt(T_i16, 0, false), NULL));
         else LLVMBuildUnreachable(B);
+        g_cur_span = saved_sp;
     }
     if (st.frame > MAX_FRAME)
         diag_error(d->name_span, "E0473", "the locals of '%s' need more than %lld bytes of stack, the most a function can have",
@@ -5668,6 +5713,7 @@ static void gen_fn_body_of(FnInst *fi) {
     delete_unreachable(fi->fn);
     free(st.defers.data);
     free(st.loops.data);
+    free(st.asan_stack.data);
     F = saved;
 }
 

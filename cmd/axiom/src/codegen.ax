@@ -208,9 +208,19 @@ fn emit_defers(down_to: usize, err: *mut ir.Value, always: bool) void {
 
 fn emit_ret(v: *mut ir.Value) void {
     if u.notnil(cx.F.sret_ptr) {
-        cgrt.store(cx.F.ret, v, cx.F.sret_ptr, false);
-        ir.ret_void(cx.B);
-    } else if cx.F.ret.kind == ast.TY_VOID {
+        if u.notnil(v) {
+            cgrt.store(cx.F.ret, v, cx.F.sret_ptr, false);
+        }
+    }
+    if cx.F.asan_stack.len > 0 {
+        let ff = bi.mem_fn("asan_stack_free");
+        for i in 0..cx.F.asan_stack.len {
+            let slot = cx.F.asan_stack.get(i);
+            let mut fargs: [2]*mut ir.Value = [slot.ptr_u, cx.usz(slot.size)];
+            _ = cx.call(ff.llty, ff.fnv, fargs[..]);
+        }
+    }
+    if u.notnil(cx.F.sret_ptr) or (cx.F.ret.kind == ast.TY_VOID) {
         ir.ret_void(cx.B);
     } else {
         ir.ret(cx.B, v);
@@ -1538,6 +1548,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     ir.fnp_of(fi.fnv).coverage = bi.cov_on(d.module);
     stt.no_trace = cgrt.is_runtime_module(d.module);
     stt.locals = u.newn.[*mut ir.Value](d.locals.len + 1);
+    stt.asan_stack = u.List.[cx.AsanStackSlot].empty();
     let saved = cx.F;
     cx.F = stt;
     stt.ret = fi.fnty.ret;
@@ -1596,10 +1607,31 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     }
     na_addrs.deinit();
     na_sizes.deinit();
+    if bi.asan_on() {
+        cgrt.set_span(d.name_span);
+        for i in 0..d.locals.len {
+            let l = d.locals.get(i);
+            if not l.is_param and l.addr_taken and u.notnil(l.ty) {
+                let t = cx.ct(l.ty);
+                let sz = ty.type_size(t);
+                if ((t.kind == ast.TY_ARRAY) or (t.kind == ast.TY_STRUCT) or (t.kind == ast.TY_UNION)) and (sz > 0) {
+                    let fb = cgrt.local_ptr(l);
+                    let fa = bi.mem_fn("asan_stack_alloc");
+                    let mut aargs: [2]*mut ir.Value = [cx.usz(sz), cx.usz(ty.type_align(t))];
+                    let heap_u = cx.call(fa.llty, fa.fnv, aargs[..]);
+                    let ok = cx.icmp(ir.IntNE, heap_u, cx.usz(0));
+                    let hp = cx.inttoptr(heap_u, cx.T_ptr);
+                    stt.locals[@int_cast(usize, l.index)] = ir.select(cx.B, ok, hp, fb);
+                    stt.asan_stack.push(cx.AsanStackSlot.{ ptr_u: heap_u, size: sz });
+                }
+            }
+        }
+    }
     gen_block(d.body);
     if not cx.terminated() {
+        cgrt.set_span(d.name_span);
         if stt.ret.kind == ast.TY_VOID {
-            ir.ret_void(cx.B);
+            emit_ret(cx.vnil());
         } else if (stt.ret.kind == ast.TY_ERRUNION) and (stt.ret.elem.kind == ast.TY_VOID) {
             emit_ret(cgb.errunion_value(stt.ret, ir.cint(cx.T_i16, 0), cx.vnil()));
         } else {
@@ -1622,6 +1654,7 @@ fn gen_fn_body_of(fi: *mut cx.FnInst) void {
     ir.remove_unreachable(ir.fnp_of(stt.fnv));
     stt.defers.deinit();
     stt.loops.deinit();
+    stt.asan_stack.deinit();
     cx.F = saved;
 }
 

@@ -1819,11 +1819,14 @@ traps on them with `T0012`.
 | Allocator blocks and `@memory_grow` pages | linear memory | one region of address space, reserved at the first `@memory_grow` (up to 1 TiB) |
 | Memory from C or the host | linear memory, which C code linked into the module shares | anywhere in the process |
 
-After a function returns, its locals' storage is reused, and a pointer to one of them
-dangles. The compiler SHOULD warn when such a pointer escapes (`W0710`); the compilers
-warn when a function returns the address of a local or of part of one (`&x`,
-`&mut x.f`, `&a[i]`), or a slice of a local array (`a[..]`, `a[i..j]`), parameters
-included.
+After a function returns, its locals' storage is reused, and a pointer or slice to one
+of them dangles. Returning, or storing into a global or parameter-reachable place, a
+pointer or slice derived from a local variable (including parameters) is a compile
+error (`E0710`). Within each function body, the compiler tracks local-origin pointers
+and slices across `&`/`&mut` places (`&x`, `&mut x.f`, `&a[i]`), array slicing
+(`a[..]`, `a[lo..hi]`), slice sub-slicing (`s[lo..hi]`), `let` bindings, assignments,
+field projections, and struct, array, optional (`?T`), and error-union (`!T`) literals;
+indirect escapes through calls are caught at runtime under `--sanitize=address` (§16.8).
 
 A function's frame, its locals and the temporaries the compiler makes for it, may
 take at most 1 GiB (2³⁰ bytes) on every target; a function that needs more is a
@@ -2744,7 +2747,7 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`, `W0710` a returned pointer to a local, or slice of a local array (§12.2) |
+| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else` |
 | `Txxxx` | Runtime traps (Appendix B) |
 
 The registry. It lists every code the compilers emit, and the test suite checks that
@@ -2874,6 +2877,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0707 | Cannot obtain `*mut` or `[]mut` through an immutable place |
 | E0708 | Cannot copy or repeat a `nocopy` value from a place (§5.9) |
 | E0709 | Use of a moved `nocopy` local variable (§5.9) |
+| E0710 | Returning or storing into a global or caller-reachable place a pointer or slice derived from a local variable (§12.2) |
 | E0801 | Type not allowed at the export or import boundary |
 | E0802 | Export name used more than once |
 | E0810 | Comparing vectors with `==` or `<` (use `@lanes_eq`, …) |
@@ -3232,8 +3236,12 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
   test runs in a process or instance of its own, a test that passes but leaves
   allocations unfreed fails with the code `leak`, and the report is its output.
 
-The allocator and the runtime are not instrumented. Memory that is not from the heap
-(globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from
+The allocator and the runtime are not instrumented. Under `--sanitize=address`,
+address-taken local arrays, structs, and unions are allocated in an ASan stack
+quarantine frame and poisoned on function exit, trapping indirect stack use-after-return
+(such as a local-derived pointer or slice returned through a call) with `T0012`
+(`stack-use-after-return`). Other memory that is not from the heap (globals, scalar
+locals, memory from `@memory_grow`) is not checked. Allocation sites come from
 the shadow stack (which sanitizer builds keep also where other builds use frame tables,
 §16.4.1), so they need `--stack-traces=on` (the default). Each checked access
 looks its shadow byte up inline and calls into `std/mem.ax` only when that test fails, so

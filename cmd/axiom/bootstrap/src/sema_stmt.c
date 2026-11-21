@@ -67,9 +67,13 @@ MoveSnap move_snap_take(void) {
     s.len = C->locals.len;
     s.moved = calloc((size_t)s.len, sizeof(bool));
     s.spans = calloc((size_t)s.len, sizeof(Span));
+    s.origins = calloc((size_t)s.len, sizeof(Local *));
+    s.origin_fields = calloc((size_t)s.len, sizeof(uint64_t));
     for (int i = 0; i < s.len; i++) {
         s.moved[i] = C->locals.data[i]->moved;
         s.spans[i] = C->locals.data[i]->moved_span;
+        s.origins[i] = C->locals.data[i]->origin_local;
+        s.origin_fields[i] = C->locals.data[i]->origin_fields;
     }
     return s;
 }
@@ -79,6 +83,8 @@ void move_snap_restore(const MoveSnap *s) {
     for (int i = 0; i < s->len && i < C->locals.len; i++) {
         C->locals.data[i]->moved = s->moved[i];
         C->locals.data[i]->moved_span = s->spans[i];
+        C->locals.data[i]->origin_local = s->origins ? s->origins[i] : NULL;
+        C->locals.data[i]->origin_fields = s->origin_fields ? s->origin_fields[i] : 0ULL;
     }
 }
 
@@ -90,14 +96,24 @@ void move_snap_join(const MoveSnap *s) {
             l->moved = true;
             l->moved_span = s->spans[i];
         }
+        if (!l->origin_local && s->origins && s->origins[i]) {
+            l->origin_local = s->origins[i];
+        }
+        if (s->origin_fields) {
+            l->origin_fields |= s->origin_fields[i];
+        }
     }
 }
 
 void move_snap_free(MoveSnap *s) {
     free(s->moved);
     free(s->spans);
+    free(s->origins);
+    free(s->origin_fields);
     s->moved = NULL;
     s->spans = NULL;
+    s->origins = NULL;
+    s->origin_fields = NULL;
     s->len = 0;
 }
 
@@ -108,6 +124,12 @@ static void move_snap_or_into(MoveSnap *acc, int prefix_len) {
         if (l->moved && !acc->moved[i]) {
             acc->moved[i] = true;
             acc->spans[i] = l->moved_span;
+        }
+        if (l->origin_local && acc->origins && !acc->origins[i]) {
+            acc->origins[i] = l->origin_local;
+        }
+        if (acc->origin_fields) {
+            acc->origin_fields[i] |= l->origin_fields;
         }
     }
 }
@@ -175,6 +197,42 @@ static void check_assign(Stmt *s) {
         if (plain_ident && lhs->local) {
             lhs->local->moved = false;
             lhs->local->moved_span = (Span){0};
+        }
+        if (lhs->kind == E_IDENT && lhs->local) {
+            lhs->local->origin_local = expr_local_origin_mask(s->e2, &lhs->local->origin_fields);
+        } else if (lhs->kind == E_FIELD && lhs->op == FK_STRUCT && lhs->self_mode != SELF_DEREF &&
+                   lhs->a && lhs->a->kind == E_IDENT && lhs->a->local) {
+            Local *l = lhs->a->local;
+            Local *src = expr_local_origin(s->e2);
+            if (src != NULL) {
+                if (lhs->index >= 0 && lhs->index < 64) l->origin_fields |= (1ULL << lhs->index);
+                else l->origin_fields = ~0ULL;
+                if (!l->origin_local) l->origin_local = src;
+            } else if (lhs->index >= 0 && lhs->index < 64) {
+                l->origin_fields &= ~(1ULL << lhs->index);
+                if (l->origin_fields == 0) l->origin_local = NULL;
+            }
+        } else {
+            Local *src = expr_local_origin(s->e2);
+            Local *dst_local = place_local(lhs);
+            if (dst_local != NULL) {
+                if (src != NULL) {
+                    dst_local->origin_local = src;
+                    dst_local->origin_fields = ~0ULL;
+                }
+            } else {
+                Local *po = place_origin(lhs);
+                if (po != NULL) {
+                    if (src != NULL) {
+                        po->origin_local = src;
+                        po->origin_fields = ~0ULL;
+                    }
+                } else if (src != NULL) {
+                    diag_error(s->e2->span, "E0710",
+                               "this points into local '%s', which cannot be stored in a global or caller-reachable place",
+                               src->name);
+                }
+            }
         }
         return;
     }
@@ -262,6 +320,8 @@ static void enter_loop(Stmt *s, const MoveSnap *entry) {
         li.entry_spans = calloc((size_t)li.local_base, sizeof(Span));
         li.break_moved = calloc((size_t)li.local_base, sizeof(bool));
         li.break_spans = calloc((size_t)li.local_base, sizeof(Span));
+        li.break_origins = calloc((size_t)li.local_base, sizeof(Local *));
+        li.break_origin_fields = calloc((size_t)li.local_base, sizeof(uint64_t));
         memcpy(li.entry_moved, entry->moved, (size_t)li.local_base * sizeof(bool));
         memcpy(li.entry_spans, entry->spans, (size_t)li.local_base * sizeof(Span));
     }
@@ -278,6 +338,8 @@ static void free_loop_info(LoopInfo *li) {
     free(li->entry_spans);
     free(li->break_moved);
     free(li->break_spans);
+    free(li->break_origins);
+    free(li->break_origin_fields);
 }
 
 static void check_loop_iter_end(const LoopInfo *L) {
@@ -321,6 +383,10 @@ int check_jump_target(Sym label, Span sp, bool is_break) {
                     L->break_moved[i] = true;
                     L->break_spans[i] = loc->moved_span;
                 }
+                if (loc->origin_local && !L->break_origins[i]) {
+                    L->break_origins[i] = loc->origin_local;
+                }
+                L->break_origin_fields[i] |= loc->origin_fields;
             }
         }
     } else if (!C->flow_dead) {
@@ -359,6 +425,8 @@ static void check_match(Stmt *s, bool *diverges) {
         acc.len = before.len;
         acc.moved = calloc((size_t)acc.len, sizeof(bool));
         acc.spans = calloc((size_t)acc.len, sizeof(Span));
+        acc.origins = calloc((size_t)acc.len, sizeof(Local *));
+        acc.origin_fields = calloc((size_t)acc.len, sizeof(uint64_t));
     }
     bool any_live = false;
     Type *ref_ptr = (t->kind == TY_PTR && (t->elem->kind == TY_UNION || t->elem->kind == TY_OPT)) ? t : NULL;
@@ -392,6 +460,12 @@ static void check_match(Stmt *s, bool *diverges) {
                             Type *pt = ref_ptr ? type_ptr(base->elem, ref_ptr->mut) : base->elem;
                             a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
                             a->bind_local->weakened = s->e->weakened;
+                            if (ref_ptr) {
+                                a->bind_local->origin_local = expr_local_origin(s->e);
+                                a->bind_local->origin_fields = a->bind_local->origin_local ? ~0ULL : 0ULL;
+                            } else {
+                                a->bind_local->origin_local = expr_local_origin_mask(s->e, &a->bind_local->origin_fields);
+                            }
                         }
                     }
                 } else {
@@ -452,6 +526,8 @@ static void check_match(Stmt *s, bool *diverges) {
                             Type *bt = ref_ptr ? type_ptr(pt, ref_ptr->mut) : pt;
                             a->bind_local = declare_local(a->bind, a->bind_span, bt, false, false);
                             a->bind_local->weakened = s->e->weakened;
+                            a->bind_local->origin_local = expr_local_origin(s->e);
+                            a->bind_local->origin_fields = a->bind_local->origin_local ? ~0ULL : 0ULL;
                         }
                     }
                 }
@@ -656,7 +732,10 @@ bool check_stmt(Stmt *s) {
         if (s->e->type && s->e->type->kind == TY_NEVER) div = true;
         else if (s->e->type == t) check_consume_nocopy(s->e, false);
         s->local = declare_local(s->name, s->name_span, t, s->mut, false);
-        if (s->e) s->local->weakened = s->e->weakened;
+        if (s->e) {
+            s->local->weakened = s->e->weakened;
+            s->local->origin_local = expr_local_origin_mask(s->e, &s->local->origin_fields);
+        }
         break;
     }
     case S_EXPR: {
@@ -740,16 +819,28 @@ bool check_stmt(Stmt *s) {
                 Local *loc = C->locals.data[i];
                 bool m = post_cond.moved[i];
                 Span sp = post_cond.spans[i];
+                Local *orig = post_cond.origins ? post_cond.origins[i] : NULL;
+                uint64_t fmask = post_cond.origin_fields ? post_cond.origin_fields[i] : 0ULL;
                 if (li.break_snap_init && li.break_moved[i] && !m) {
                     m = true;
                     sp = li.break_spans[i];
+                }
+                if (li.break_snap_init) {
+                    if (li.break_origins[i] && !orig) orig = li.break_origins[i];
+                    fmask |= li.break_origin_fields[i];
                 }
                 if (falls && loc->moved && !m) {
                     m = true;
                     sp = loc->moved_span;
                 }
+                if (falls) {
+                    if (loc->origin_local && !orig) orig = loc->origin_local;
+                    fmask |= loc->origin_fields;
+                }
                 loc->moved = m;
                 loc->moved_span = sp;
+                loc->origin_local = orig;
+                loc->origin_fields = fmask;
             }
             C->flow_dead = false;
         }
@@ -772,6 +863,8 @@ bool check_stmt(Stmt *s) {
             for (int i = 0; i < li.local_base && i < C->locals.len; i++) {
                 C->locals.data[i]->moved = li.break_moved[i];
                 C->locals.data[i]->moved_span = li.break_spans[i];
+                C->locals.data[i]->origin_local = li.break_origins[i];
+                C->locals.data[i]->origin_fields = li.break_origin_fields[i];
             }
             C->flow_dead = false;
         } else {
@@ -784,6 +877,7 @@ bool check_stmt(Stmt *s) {
     }
     case S_FOR: {
         Type *vt;
+        Local *for_origin = NULL;
         if (s->e2) {
             if (s->ref_iter) {
                 diag_error(s->span, "E0706", "by-reference 'for &' cannot iterate over a range");
@@ -821,6 +915,7 @@ bool check_stmt(Stmt *s) {
                         diag_error(s->e->span, "E0701", "cannot take '*mut' elements from immutable slice %s",
                                    type_str(t));
                     vt = type_ptr(t->elem, s->ref_mut);
+                    for_origin = expr_local_origin(s->e);
                 } else if (t->kind == TY_ARRAY) {
                     if (s->ref_mut) {
                         if (!is_place(s->e))
@@ -828,7 +923,10 @@ bool check_stmt(Stmt *s) {
                         else if (!is_mut_place(s->e))
                             diag_error(s->e->span, "E0701", "cannot take '*mut' elements from an immutable array");
                     }
-                    if (is_place(s->e)) mark_addr_taken(s->e);
+                    if (is_place(s->e)) {
+                        mark_addr_taken(s->e);
+                        for_origin = place_origin(s->e);
+                    }
                     vt = type_ptr(t->elem, s->ref_mut);
                 } else {
                     if (t->kind != TY_INVALID)
@@ -839,6 +937,7 @@ bool check_stmt(Stmt *s) {
             } else {
                 if (t->kind == TY_ARRAY) {
                     vt = t->elem;
+                    for_origin = expr_local_origin(s->e);
                     if (!is_place(s->e)) {
                         // iterating a temporary array is fine: codegen spills it
                     }
@@ -868,6 +967,8 @@ bool check_stmt(Stmt *s) {
         MoveSnap entry = move_snap_take();
         scope_push();
         s->local = declare_local(s->name, s->name_span, vt, false, false);
+        s->local->origin_local = for_origin;
+        s->local->origin_fields = for_origin ? ~0ULL : 0ULL;
         enter_loop(s, &entry);
         bool bdiv = check_block(s->body);
         LoopInfo li = leave_loop();
@@ -881,16 +982,28 @@ bool check_stmt(Stmt *s) {
                 Local *loc = C->locals.data[i];
                 bool m = entry.moved[i];
                 Span sp = entry.spans[i];
+                Local *orig = entry.origins ? entry.origins[i] : NULL;
+                uint64_t fmask = entry.origin_fields ? entry.origin_fields[i] : 0ULL;
                 if (li.break_snap_init && li.break_moved[i] && !m) {
                     m = true;
                     sp = li.break_spans[i];
+                }
+                if (li.break_snap_init) {
+                    if (li.break_origins[i] && !orig) orig = li.break_origins[i];
+                    fmask |= li.break_origin_fields[i];
                 }
                 if (falls && loc->moved && !m) {
                     m = true;
                     sp = loc->moved_span;
                 }
+                if (falls) {
+                    if (loc->origin_local && !orig) orig = loc->origin_local;
+                    fmask |= loc->origin_fields;
+                }
                 loc->moved = m;
                 loc->moved_span = sp;
+                loc->origin_local = orig;
+                loc->origin_fields = fmask;
             }
             C->flow_dead = false;
         }

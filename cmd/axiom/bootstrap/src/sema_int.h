@@ -23,11 +23,13 @@ typedef struct ScopeEntry {
 typedef struct LoopInfo {
     Sym label;
     bool has_break;
-    int local_base;     // C->locals.len at loop entry
-    bool *entry_moved;  // length local_base
-    Span *entry_spans;  // length local_base
-    bool *break_moved;  // length local_base
-    Span *break_spans;  // length local_base
+    int local_base;         // C->locals.len at loop entry
+    bool *entry_moved;      // length local_base
+    Span *entry_spans;      // length local_base
+    bool *break_moved;      // length local_base
+    Span *break_spans;      // length local_base
+    Local **break_origins;        // length local_base
+    uint64_t *break_origin_fields;  // length local_base
     bool break_snap_init;
 } LoopInfo;
 
@@ -35,6 +37,8 @@ typedef struct MoveSnap {
     int len;
     bool *moved;
     Span *spans;
+    Local **origins;
+    uint64_t *origin_fields;
 } MoveSnap;
 
 typedef struct FnCtx {
@@ -95,6 +99,10 @@ Type *finalize_untyped(Expr **pe);  // untyped literal without context -> E0502
 Type *builtin_check(Expr *e, Type *expected);
 bool fits_type(i128 v, Type *t);
 void check_consume_nocopy(Expr *e, bool allow_local_move);
+Local *place_local(Expr *e);
+Local *place_origin(Expr *e);
+Local *expr_local_origin(Expr *e);
+Local *expr_local_origin_mask(Expr *e, uint64_t *mask_out);
 
 // sema_stmt.c
 bool check_block(Stmt *b);

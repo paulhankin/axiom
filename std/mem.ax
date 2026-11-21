@@ -1398,7 +1398,7 @@ const H_SIZE: usize = 1;
 const H_PREV: usize = 2;
 const H_NEXT: usize = 3;
 const H_SITE: usize = 4;   // 4, 5, 6: innermost call sites outside this module
-const H_FLAGS: usize = 7;  // 1: not a leak; above 8 bits, the padding before the header (alloc_aligned)
+const H_FLAGS: usize = 7;  // bit 0: not a leak; bit 1: stack slot; above 8 bits, the padding before the header (alloc_aligned)
 
 fn as_enter() void {
     if multi {
@@ -1755,9 +1755,14 @@ fn as_print_sites_at(o: *mut AsOut, at: usize, what: []u8) void {
 
 fn as_report_access(addr: usize, size: usize, bad: usize, v: u8) void {
     let mut o = AsOut.{ buf: [0; 1024], n: 0 };
+    let raw = as_find(bad);
     o.s("axiom: AddressSanitizer: ");
     if v == SH_FREED {
-        o.s("heap-use-after-free");
+        if (raw != 0) and ((hfield(raw, H_FLAGS).* & 2) != 0) {
+            o.s("stack-use-after-return");
+        } else {
+            o.s("heap-use-after-free");
+        }
     } else {
         o.s("heap-buffer-overflow");
     }
@@ -1765,7 +1770,6 @@ fn as_report_access(addr: usize, size: usize, bad: usize, v: u8) void {
     o.dec(@as(u64, size));
     o.s("-byte access at ");
     o.hex(@as(u64, addr));
-    let raw = as_find(bad);
     if raw != 0 {
         let p = raw + AS_HDR;
         let n = @truncate(usize, hfield(raw, H_SIZE).*);
@@ -1831,9 +1835,22 @@ fn asan_alloc(size: usize) usize {
     return asan_alloc_aligned(size, 16);
 }
 
+fn asan_alloc_aligned(size: usize, align: usize) usize {
+    return asan_alloc_inner(size, align, false);
+}
+
+/// Allocates a quarantine-backed stack slot under --sanitize=address;
+/// returns 0 when ASan is disabled or size is 0.
+pub fn asan_stack_alloc(size: usize, align: usize) usize {
+    if not @sanitize_address() or (size == 0) {
+        return 0;
+    }
+    return asan_alloc_inner(size, align, true);
+}
+
 // With `align` above 64, the header is `pad` bytes into memory aligned to
 // `align`, so the allocation after it is aligned too.
-fn asan_alloc_aligned(size: usize, align: usize) usize {
+fn asan_alloc_inner(size: usize, align: usize, is_stack: bool) usize {
     if (size == 0) or too_big(size) {
         return 0;
     }
@@ -1872,9 +1889,13 @@ fn asan_alloc_aligned(size: usize, align: usize) usize {
         hfield(as_live, H_PREV).* = @as(u64, raw);
     }
     as_live = raw;
-    as_live_bytes += size;
+    if not is_stack {
+        as_live_bytes += size;
+    }
     hfield(raw, H_FLAGS).* = @as(u64, pad) << 8;
-    if as_ignoring > 0 {
+    if is_stack {
+        hfield(raw, H_FLAGS).* |= 3;
+    } else if as_ignoring > 0 {
         hfield(raw, H_FLAGS).* |= 1;
     }
     as_record_sites(raw);
@@ -1884,17 +1905,22 @@ fn asan_alloc_aligned(size: usize, align: usize) usize {
 
 /// Checks that p and size are an allocation that may be freed; reports and
 /// traps (T0012) if not.
-fn as_check_free(p: usize, size: usize) void {
+fn as_check_free(p: usize, size: usize, is_stack: bool) void {
     let raw = p -% AS_HDR;
     let s = as_shadow(raw, false);
     let ok_place = ((p & 15) == 0) and (s != 0) and (sbyte(s).* == SH_LEFT) and (as_shadow(p - 8, false) != 0);
     if ok_place {
         let m = hfield(raw, H_MAGIC).*;
-        if m == tag(MAGIC_DEAD, raw) {
-            as_report_free(p, size, "double free", raw);
-            @memory_error();
-        }
-        if m == tag(MAGIC_ALIVE, raw) {
+        if (m == tag(MAGIC_ALIVE, raw)) or (m == tag(MAGIC_DEAD, raw)) {
+            let stack_slot = (hfield(raw, H_FLAGS).* & 2) != 0;
+            if stack_slot != is_stack {
+                as_report_free(p, size, "free of memory that was not allocated", 0);
+                @memory_error();
+            }
+            if m == tag(MAGIC_DEAD, raw) {
+                as_report_free(p, size, "double free", raw);
+                @memory_error();
+            }
             if hfield(raw, H_SIZE).* != @as(u64, size) {
                 as_report_free(p, size, "free with the wrong size", raw);
                 @memory_error();
@@ -1907,11 +1933,23 @@ fn as_check_free(p: usize, size: usize) void {
 }
 
 fn asan_free(p: usize, size: usize) void {
+    asan_free_inner(p, size, false);
+}
+
+/// Poisons and quarantines a stack slot on function exit under --sanitize=address.
+pub fn asan_stack_free(p: usize, size: usize) void {
+    if not @sanitize_address() or (p == 0) or (size == 0) {
+        return;
+    }
+    asan_free_inner(p, size, true);
+}
+
+fn asan_free_inner(p: usize, size: usize, is_stack: bool) void {
     if size == 0 {
         return;
     }
     as_enter();
-    as_check_free(p, size);
+    as_check_free(p, size, is_stack);
     let raw = p - AS_HDR;
     // out of the live list
     let prev = @truncate(usize, hfield(raw, H_PREV).*);
@@ -1925,7 +1963,9 @@ fn asan_free(p: usize, size: usize) void {
         hfield(next, H_PREV).* = @as(u64, prev);
     }
     hfield(raw, H_MAGIC).* = tag(MAGIC_DEAD, raw);
-    as_live_bytes -= size;
+    if not is_stack {
+        as_live_bytes -= size;
+    }
     as_set(p, (size + 7) & ~@as(usize, 7), SH_FREED);
     as_record_sites_at(as_free_sites(raw));
     // into the quarantine; the oldest out of it
@@ -1960,7 +2000,7 @@ fn asan_realloc(p: usize, old: usize, size: usize) usize {
         return 0;
     }
     as_enter();
-    as_check_free(p, old);
+    as_check_free(p, old, false);
     as_leave();
     // always moves, so that stale pointers to the old memory are caught
     let q = asan_alloc(size);

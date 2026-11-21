@@ -298,6 +298,8 @@ struct Local {
     bool weakened;
     bool moved;
     Span moved_span;
+    struct Local *origin_local;
+    uint64_t origin_fields;
     int index;  // within its function
 };
 

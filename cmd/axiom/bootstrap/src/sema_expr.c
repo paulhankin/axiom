@@ -1784,26 +1784,197 @@ static bool check_leave_ok(Span sp, bool is_loop_exit) {
     return true;
 }
 
+static bool type_can_hold_ptr_rec(Type *t, int depth) {
+    if (!t || depth >= 16) return false;
+    switch (t->kind) {
+    case TY_PTR:
+    case TY_SLICE:
+        return true;
+    case TY_OPT:
+    case TY_ERRUNION:
+    case TY_ARRAY:
+        return type_can_hold_ptr_rec(t->elem, depth + 1);
+    case TY_STRUCT: {
+        Decl *d = t->decl;
+        if (!d) return false;
+        for (int i = 0; i < d->fields.len; i++) {
+            if (!d->fields.data[i].type) continue;
+            if (type_can_hold_ptr_rec(type_field(t, i), depth + 1)) return true;
+        }
+        return false;
+    }
+    case TY_UNION: {
+        Decl *d = t->decl;
+        if (!d) return false;
+        for (int i = 0; i < d->variants.len; i++) {
+            if (!d->variants.data[i].type) continue;
+            Type *vt = type_variant(t, i);
+            if (vt && type_can_hold_ptr_rec(vt, depth + 1)) return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+static bool type_can_hold_ptr(Type *t) { return type_can_hold_ptr_rec(t, 0); }
+
 // The local whose storage place e is part of (NULL: a global, or memory
 // reached through a pointer or a slice).
-static Local *place_local(Expr *e) {
+Local *place_local(Expr *e) {
     if (e->kind == E_IDENT) return e->local;
     if (e->kind == E_FIELD && e->op == FK_STRUCT && e->self_mode != SELF_DEREF) return place_local(e->a);
     if (e->kind == E_INDEX && e->op == IDX_ARRAY) return place_local(e->a);
     return NULL;
 }
 
+Local *place_origin(Expr *e) {
+    if (!e) return NULL;
+    switch (e->kind) {
+    case E_IDENT: return e->local;
+    case E_FIELD:
+        if (e->op == FK_STRUCT) {
+            if (e->self_mode != SELF_DEREF) return place_origin(e->a);
+            return expr_local_origin(e->a);
+        }
+        return NULL;
+    case E_INDEX:
+        if (e->op == IDX_ARRAY) return place_origin(e->a);
+        return expr_local_origin(e->a);
+    case E_DEREF:
+        return expr_local_origin(e->a);
+    default:
+        return NULL;
+    }
+}
+
+Local *expr_local_origin_mask(Expr *e, uint64_t *mask_out) {
+    if (!e || !e->type || e->type->kind == TY_INVALID || !type_can_hold_ptr(e->type)) {
+        *mask_out = 0;
+        return NULL;
+    }
+    switch (e->kind) {
+    case E_CONV:
+        if (e->type->kind == TY_SLICE && e->a && e->a->type && e->a->type->kind == TY_ARRAY) {
+            Local *l = place_origin(e->a);
+            *mask_out = l ? ~0ULL : 0ULL;
+            return l;
+        }
+        return expr_local_origin_mask(e->a, mask_out);
+    case E_OPT_SOME:
+        return expr_local_origin_mask(e->a, mask_out);
+    case E_STRUCT_LIT: {
+        uint64_t mask = 0;
+        Local *first = NULL;
+        Decl *d = (e->type && e->type->kind == TY_STRUCT) ? e->type->decl : NULL;
+        for (int i = 0; i < e->inits.len; i++) {
+            FieldInit *fi = &e->inits.data[i];
+            Local *fo = expr_local_origin(fi->value);
+            if (!fo) continue;
+            if (!first) first = fo;
+            int idx = d ? find_field(d, fi->name) : i;
+            if (idx >= 0 && idx < 64) mask |= (1ULL << idx);
+            else mask = ~0ULL;
+        }
+        *mask_out = mask;
+        return first;
+    }
+    case E_IDENT:
+        if (e->local) {
+            *mask_out = e->local->origin_fields;
+            return e->local->origin_local;
+        }
+        *mask_out = 0;
+        return NULL;
+    case E_CATCH:
+    case E_ORELSE: {
+        uint64_t m1 = 0, m2 = 0;
+        Local *l1 = expr_local_origin_mask(e->a, &m1);
+        Local *l2 = (e->hkind == H_VALUE && e->hexpr) ? expr_local_origin_mask(e->hexpr, &m2) : NULL;
+        *mask_out = m1 | m2;
+        return l1 ? l1 : l2;
+    }
+    default: {
+        Local *l = expr_local_origin(e);
+        *mask_out = l ? ~0ULL : 0ULL;
+        return l;
+    }
+    }
+}
+
+Local *expr_local_origin(Expr *e) {
+    if (!e || !e->type || e->type->kind == TY_INVALID || !type_can_hold_ptr(e->type)) return NULL;
+    switch (e->kind) {
+    case E_CONV:
+        if (e->type->kind == TY_SLICE && e->a && e->a->type && e->a->type->kind == TY_ARRAY)
+            return place_origin(e->a);
+        return expr_local_origin(e->a);
+    case E_OPT_SOME:
+        return expr_local_origin(e->a);
+    case E_UNARY:
+        if (e->op == TK_AMP && is_place(e->a)) return place_origin(e->a);
+        return NULL;
+    case E_SLICE:
+        if (e->op == IDX_ARRAY) return place_origin(e->a);
+        return expr_local_origin(e->a);
+    case E_IDENT:
+        return e->local ? e->local->origin_local : NULL;
+    case E_FIELD:
+        if (e->op == FK_STRUCT && e->self_mode != SELF_DEREF) {
+            uint64_t m = 0;
+            Local *l = expr_local_origin_mask(e->a, &m);
+            if (!l) return NULL;
+            if (e->index >= 0 && e->index < 64 && (m & (1ULL << e->index)) == 0) return NULL;
+            return l;
+        }
+        if (e->op == FK_SLICE_PTR) return expr_local_origin(e->a);
+        return NULL;
+    case E_INDEX:
+        if (e->op == IDX_ARRAY) return expr_local_origin(e->a);
+        return NULL;
+    case E_STRUCT_LIT:
+        for (int i = 0; i < e->inits.len; i++) {
+            Local *o = expr_local_origin(e->inits.data[i].value);
+            if (o) return o;
+        }
+        return NULL;
+    case E_ARRAY_LIT:
+        for (int i = 0; i < e->args.len; i++) {
+            Local *o = expr_local_origin(e->args.data[i]);
+            if (o) return o;
+        }
+        return NULL;
+    case E_ARRAY_REPEAT:
+        return expr_local_origin(e->a);
+    case E_CALL:
+        if (e->op == CALLK_VARIANT && e->args.len > 0) return expr_local_origin(e->args.data[0]);
+        return NULL;
+    case E_TRY:
+        return expr_local_origin(e->a);
+    case E_CATCH: {
+        Local *o = expr_local_origin(e->a);
+        if (o) return o;
+        if (e->hkind == H_VALUE && e->hexpr) return expr_local_origin(e->hexpr);
+        return NULL;
+    }
+    case E_ORELSE: {
+        Local *o = expr_local_origin(e->a);
+        if (o) return o;
+        if (e->hkind == H_VALUE && e->hexpr) return expr_local_origin(e->hexpr);
+        return NULL;
+    }
+    default:
+        return NULL;
+    }
+}
+
 // A returned address of a local (`&x`, `&mut x.f`, `&a[i]`) or slice of a
-// local array (`a[..]`, `a[i..j]`) dangles once the function returns (spec
-// §12.2: W0710).
+// local array (`a[..]`, `a[i..j]`), or a value derived from one, dangles once
+// the function returns (spec §12.2: E0710).
 static void check_escape(Expr *e0) {
-    Expr *e = e0;
-    while (e->kind == E_CONV || e->kind == E_OPT_SOME) e = e->a;
-    if (!e->type || e->type->kind == TY_INVALID) return;
-    Local *l = NULL;
-    if (e->kind == E_UNARY && e->op == TK_AMP && is_place(e->a)) l = place_local(e->a);
-    else if (e->kind == E_SLICE && e->op == IDX_ARRAY) l = place_local(e->a);
-    if (l) diag_warning(e0->span, "W0710", "this points into local '%s', whose storage ends when the function returns", l->name);
+    Local *l = expr_local_origin(e0);
+    if (l) diag_error(e0->span, "E0710", "this points into local '%s', whose storage ends when the function returns", l->name);
 }
 
 static void check_return_value(Expr **pe, Span sp) {
