@@ -1658,20 +1658,56 @@ fn operands_live_at(uses: *u.List.[u.List.[*mut ir.Value]], i: *mut ir.Value, t:
     return true;
 }
 
+// (sink_uses, kept for the next call) the users of all the lists, each
+// list's after the one before's, and how many each has
+threadlocal let mut su_all: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
+    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+threadlocal let mut su_count: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+// The users of each instruction in a reachable block (in order's blocks, in
+// order), the list of instruction i at i.aux (-1 for the others). The lists
+// are views of one buffer (su_all), each with room for exactly its users:
+// valid until the next call; free them with uses.deinit() alone.
 fn sink_uses(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) u.List.[u.List.[*mut ir.Value]] {
     let mut uses = u.List.[u.List.[*mut ir.Value]].empty();
+    su_count.clear();
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
             i.aux = -1;
             if b.rpo >= 0 {
-                i.aux = @int_cast(i64, uses.len);
-                uses.push(u.List.[*mut ir.Value].empty());
+                i.aux = @int_cast(i64, su_count.len);
+                su_count.push(0);
             }
             i = i.next;
         }
         b = b.next;
+    }
+    for bi in 0..order.len {
+        let mut i = order.get(bi).first;
+        while u.notnil(i) {
+            count_use(i.a);
+            count_use(i.b);
+            count_use(i.c);
+            for k in 0..i.xs.len {
+                count_use(i.xs.get(k));
+            }
+            i = i.next;
+        }
+    }
+    let mut total: usize = 0;
+    for k in 0..su_count.len {
+        total += su_count.get(k);
+    }
+    su_all.clear();
+    su_all.reserve(total + 1);
+    uses.reserve(su_count.len);
+    let mut at = su_all.data;
+    for k in 0..su_count.len {
+        let n = su_count.get(k);
+        uses.push(u.List.[*mut ir.Value].{ data: at, len: 0, cap: n });
+        at = @ptr_from_int(*mut *mut ir.Value, @int_from_ptr(at) + (n * @size_of(*mut ir.Value)));
     }
     for bi in 0..order.len {
         let mut i = order.get(bi).first;
@@ -1688,6 +1724,14 @@ fn sink_uses(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) u.List.[u.List.[*m
     return uses;
 }
 
+// (sink_uses) Counts a use of o (note_use's).
+fn count_use(o: *mut ir.Value) void {
+    if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux >= 0) {
+        let k = @int_cast(usize, o.aux);
+        su_count.set(k, su_count.get(k) + 1);
+    }
+}
+
 pub fn sink(f: *mut ir.Func) bool {
     if u.isnil(f.first) {
         return false;
@@ -1700,9 +1744,6 @@ pub fn sink(f: *mut ir.Func) bool {
     let mut uses = sink_uses(f, &order);
     let mut any = sink_fills(f, &uses);
     if any {
-        for k in 0..uses.len {
-            u.free(@ptr_cast(*mut void, uses.at_mut(k).data));
-        }
         uses.deinit();
         uses = sink_uses(f, &order);
     }
@@ -1777,9 +1818,6 @@ pub fn sink(f: *mut ir.Func) bool {
             }
             i = prev;
         }
-    }
-    for k in 0..uses.len {
-        u.free(@ptr_cast(*mut void, uses.at_mut(k).data));
     }
     uses.deinit();
     order.deinit();
