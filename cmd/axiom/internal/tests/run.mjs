@@ -1736,7 +1736,25 @@ function dirsUnder(dir) {
     .flatMap((n) => dirsUnder(path.join(dir, n)))];
 }
 const stdDirs = dirsUnder(path.join(root, 'std'));
-const stdFiles = stdDirs.flatMap(files).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
+const allStdFiles = stdDirs.flatMap(files);
+const stdSrc = new Map(allStdFiles.map((f) => [path.resolve(f), fs.readFileSync(f, 'utf8')]));
+const partOwned = new Set();
+const partTargets = new Map();
+for (const [f, src] of stdSrc) {
+  const parts = [];
+  for (const m of src.matchAll(/^import\s+part\s+"([^"]+)"\s*;/gm)) {
+    const p = path.resolve(path.dirname(f), m[1]);
+    parts.push(p);
+    partOwned.add(p);
+  }
+  partTargets.set(f, parts);
+}
+const hasTestBlock = (f) => /^test "/m.test(stdSrc.get(f) || '');
+const stdFiles = allStdFiles.filter((f) => {
+  const r = path.resolve(f);
+  if (partOwned.has(r)) return false;
+  return hasTestBlock(r) || (partTargets.get(r) || []).some(hasTestBlock);
+});
 await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/internal/tests/testing'))], '[axiom test]', async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
