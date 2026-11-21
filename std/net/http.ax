@@ -82,32 +82,39 @@ import "http2.ax" as http2;
 import "tls.ax" as tls;
 import "url.ax" as urls;
 
-pub error HttpError { InvalidArgument, BadRequest, BadResponse, BadUrl, TooLarge, HeadTooLarge, NotFound, Closed,
-                      InvalidHeader, OutOfMemory, NetError, TimedOut, Unsupported, ProxyRefused, HandshakeFailure,
-                      BadFormat, ConnectionRefused, IoError, Done, InvalidCookie, Empty, InvalidUrl, PermissionDenied,
-                      ProtocolError, StreamReset, DecodeError, InvalidNumber, AddressInUse, InvalidUtf8, InvalidEscape,
-                      NotADirectory, FlowControlError, UnexpectedMessage, Overflow, InvalidAddress, NotAbsolute, Failed,
-                      FrameSizeError, BadRecordMac, EndOfStream, CompressionError, RecordOverflow, StreamClosed,
-                      ProtocolVersion, GoAway, IllegalParameter, TooBig, AlertReceived, ListTooLarge, BadCertificate,
-                      NoCertificate, RandomFailed, InvalidKey, InvalidPoint, InvalidCertificate, AuthFailed,
-                      InvalidLength, InvalidPem, MessageTooLong, WeakKey, UnsupportedAlgorithm, DivisionByZero,
-                      UnknownAuthority, Expired, NotYetValid, Negative, HostnameMismatch, NotInvertible, BadSignature,
-                      NoSpaceLeft, NotCA, IncompatibleUsage, NameConstraint, UnhandledCriticalExtension, Distrusted,
-                      PathTooLong, Corrupt, InvalidBase64, UnexpectedTag, WouldBlock }
+pub error HttpParseError { BadRequest, BadResponse, BadUrl, HeadTooLarge, TooLarge, InvalidHeader, InvalidArgument,
+                           Unsupported, InvalidUrl, InvalidEscape, NotAbsolute, InvalidNumber, InvalidUtf8, BadFormat,
+                           InvalidCookie, DecodeError, Overflow, Negative, InvalidBase64, UnexpectedTag, Corrupt }
+
+pub error HttpTransportError { Closed, NetError, TimedOut, WouldBlock, ConnectionRefused, AddressInUse, InvalidAddress,
+                               IoError, EndOfStream, NoSpaceLeft, ProxyRefused, ProtocolError, StreamReset,
+                               FlowControlError, FrameSizeError, CompressionError, StreamClosed, GoAway, TooBig,
+                               ListTooLarge }
+
+pub error HttpTlsError { HandshakeFailure, UnexpectedMessage, BadRecordMac, RecordOverflow, ProtocolVersion,
+                         IllegalParameter, AlertReceived, BadCertificate, NoCertificate, RandomFailed, InvalidKey,
+                         InvalidPoint, InvalidCertificate, AuthFailed, InvalidLength, InvalidPem, MessageTooLong,
+                         WeakKey, UnsupportedAlgorithm, DivisionByZero, UnknownAuthority, Expired, NotYetValid,
+                         HostnameMismatch, NotInvertible, BadSignature, NotCA, IncompatibleUsage, NameConstraint,
+                         UnhandledCriticalExtension, Distrusted, PathTooLong }
+
+pub error HttpServerError { OutOfMemory, NotFound, Empty, Done, PermissionDenied, NotADirectory, Failed }
+
+pub error HttpError = HttpParseError | HttpTransportError | HttpTlsError | HttpServerError;
 
 pub struct Header {
     pub name: []u8,
     pub value: []u8,
 }
 
-/// Case-insensitive header lookup: the first header called `name`.
-pub fn find_header(headers: []Header, name: []u8) HttpError![]u8 {
+/// Case-insensitive header lookup: the first header called `name`, or .none.
+pub fn find_header(headers: []Header, name: []u8) ?[]u8 {
     for h in headers {
         if strs.eq_ignore_case(h.name, name) {
             return h.value;
         }
     }
-    return error.NotFound;
+    return .none;
 }
 
 /// Whether a comma-separated header value (such as Connection) contains
@@ -115,7 +122,7 @@ pub fn find_header(headers: []Header, name: []u8) HttpError![]u8 {
 fn has_token(value: []u8, token: []u8) bool {
     let mut it = strs.split(value, ",");
     loop {
-        let t = it.next() catch break;
+        let t = it.next() ?? break;
         if strs.eq_ignore_case(strs.trim(t), token) {
             return true;
         }
@@ -182,7 +189,7 @@ fn hex_value(c: u8) u32 {
 /// strings) into out, which must be at least as long as s. Fails with
 /// BadRequest on a malformed escape. (std/net/url has the rest of
 /// percent-encoding.)
-pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) HttpError![]u8 {
+pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) HttpParseError![]u8 {
     return urls.percent_decode(s, out, plus_space) catch return error.BadRequest;
 }
 
@@ -251,7 +258,7 @@ struct Conn {
     scanned: usize,     // how much of a head read_head has searched for its end
     nonblocking: bool,  // reads fail with WouldBlock rather than wait (set_nonblocking)
 
-    fn init(stream: Transport, limit: usize) HttpError!Conn {
+    fn init(stream: Transport, limit: usize) { OutOfMemory }!Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
         return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, scanned: 0,
                       nonblocking: false };
@@ -388,7 +395,7 @@ struct Conn {
     fn read_line(self: *mut Conn) ![]u8 {
         loop {
             let data = self.buf[self.start..self.end];
-            let nl = strs.index_of_byte(data, '\n') catch data.len;
+            let nl = strs.index_of_byte(data, '\n') ?? data.len;
             if nl < data.len {
                 if (nl == 0) or (data[nl - 1] != '\r') {
                     return error.BadRequest;
@@ -438,7 +445,7 @@ struct Conn {
         loop {
             if st.phase == CHUNK_SIZE {
                 let line = self.read_line()!;
-                let semi = strs.index_of_byte(line, ';') catch line.len;
+                let semi = strs.index_of_byte(line, ';') ?? line.len;
                 if not valid_chunk_ext(line[semi..]) {
                     return error.BadRequest;
                 }
@@ -592,18 +599,18 @@ fn is_token_char(c: u8) bool {
 }
 
 /// Parses header lines ("Name: value") into out; returns how many.
-pub fn parse_headers(lines: []u8, out: []mut Header) HttpError!usize {
+pub fn parse_headers(lines: []u8, out: []mut Header) HttpParseError!usize {
     let mut n: usize = 0;
     let mut it = strs.lines(lines);
     loop {
-        let line = it.next() catch break;
+        let line = it.next() ?? break;
         if line.len == 0 {
             break;
         }
         if (line[0] == ' ') or (line[0] == '\t') {
             return error.BadRequest;  // obsolete line folding
         }
-        let colon = strs.index_of_byte(line, ':') catch return error.BadRequest;
+        let colon = strs.index_of_byte(line, ':') ?? return error.BadRequest;
         let name = line[..colon];
         if name.len == 0 {
             return error.BadRequest;
@@ -648,7 +655,7 @@ struct Framing {
     has_length: bool,
 }
 
-fn framing(headers: []Header) HttpError!Framing {
+fn framing(headers: []Header) { Unsupported, BadRequest, TooLarge }!Framing {
     let mut f = Framing.{ chunked: false, length: 0, has_length: false };
     for h in headers {
         if strs.eq_ignore_case(h.name, "Transfer-Encoding") {
@@ -703,7 +710,7 @@ struct Scratch {
     params: [8]Param,
     nparams: usize,
 
-    fn alloc(self: *mut Scratch, n: usize) HttpError![]mut u8 {
+    fn alloc(self: *mut Scratch, n: usize) { OutOfMemory }![]mut u8 {
         let b = mem.alloc.[u8](n)!;
         self.blocks.push(b) catch |e| {
             mem.free(b);
@@ -737,8 +744,8 @@ pub struct Request {
     pub body: []u8,
     scratch: *mut Scratch,
 
-    /// The first header called `name` (case-insensitive), or NotFound.
-    pub fn header(self: *Request, name: []u8) HttpError![]u8 {
+    /// The first header called `name` (case-insensitive), or .none.
+    pub fn header(self: *Request, name: []u8) ?[]u8 {
         return find_header(self.headers, name);
     }
 
@@ -746,7 +753,7 @@ pub struct Request {
     /// for the rest of the path after a trailing "/*". Percent-decoded; a
     /// path whose parameter would hold NUL, a ".." segment, "\" or ":" (or,
     /// except in "*", "/") matches no route.
-    pub fn param(self: *Request, name: []u8) HttpError![]u8 {
+    pub fn param(self: *Request, name: []u8) { NotFound }![]u8 {
         let sc = self.scratch;
         for i in 0..sc.nparams {
             if @mem_eq(sc.params[i].name, name) {
@@ -808,7 +815,7 @@ pub struct Response {
     /// the server; "Connection: close" ends the connection after this
     /// response. Fails if called after the head was sent, or if the name or
     /// value is malformed.
-    pub fn header(self: *mut Response, name: []u8, value: []u8) HttpError!void {
+    pub fn header(self: *mut Response, name: []u8, value: []u8) { InvalidHeader, OutOfMemory }!void {
         if self.started or (name.len == 0) {
             return error.InvalidHeader;
         }
@@ -971,8 +978,8 @@ pub struct Response {
         spans.push([0, 7, 7, st.len])!;
         let mut lines = strs.lines(self.head.bytes());
         while true {
-            let line = lines.next() catch break;
-            let c = strs.index_of(line, ": ") catch continue;
+            let line = lines.next() ?? break;
+            let c = strs.index_of(line, ": ") ?? continue;
             let name = line[..c];
             if strs.eq_ignore_case(name, "Connection") or strs.eq_ignore_case(name, "Keep-Alive") or
                strs.eq_ignore_case(name, "Upgrade") or strs.eq_ignore_case(name, "Transfer-Encoding") {
@@ -1488,7 +1495,7 @@ struct ClientStat {
 struct Clients {
     stats: []mut ClientStat,
 
-    fn of(all: *vec.Vec.[*mut Slot]) HttpError!Clients {
+    fn of(all: *vec.Vec.[*mut Slot]) { OutOfMemory }!Clients {
         let mut cap: usize = 16;
         while cap < (2 * all.len()) {
             cap *= 2;
@@ -2299,14 +2306,14 @@ fn check_head(head: []u8, hs: []mut Header, max_body: usize) Head {
                        fr: Framing.{ chunked: false, length: 0, has_length: false }, keep: false,
                        expects_continue: false };
     // the request line
-    let line_end = strs.index_of_byte(head, '\n') catch return h;
+    let line_end = strs.index_of_byte(head, '\n') ?? return h;
     let mut rl = head[..line_end];
     if (rl.len > 0) and (rl[rl.len - 1] == '\r') {
         rl = rl[..rl.len - 1];
     }
-    let sp1 = strs.index_of_byte(rl, ' ') catch return h;
+    let sp1 = strs.index_of_byte(rl, ' ') ?? return h;
     let rest = rl[sp1 + 1..];
-    let sp2 = strs.index_of_byte(rest, ' ') catch return h;
+    let sp2 = strs.index_of_byte(rest, ' ') ?? return h;
     let method = rl[..sp1];
     let target = rest[..sp2];
     let proto = rest[sp2 + 1..];
@@ -2364,7 +2371,7 @@ fn check_head(head: []u8, hs: []mut Header, max_body: usize) Head {
         return h;
     }
     // keep-alive
-    let conn_hdr = find_header(headers, "Connection") catch "";
+    let conn_hdr = find_header(headers, "Connection") ?? "";
     let mut keep = version == Version.HTTP_1_1;
     if has_token(conn_hdr, "close") {
         keep = false;
@@ -2379,7 +2386,7 @@ fn check_head(head: []u8, hs: []mut Header, max_body: usize) Head {
     h.fr = fr;
     h.keep = keep;
     h.expects_continue = (fr.chunked or (fr.length > 0)) and
-                         has_token(find_header(headers, "Expect") catch "", "100-continue");
+                         has_token(find_header(headers, "Expect") ?? "", "100-continue");
     return h;
 }
 
@@ -2415,7 +2422,7 @@ fn dispatch[C](s: *mut Server.[C], sl: *mut Slot) bool {
     let mut hs: [100]Header = [Header.{ name: "", value: "" }; 100];
     let h = check_head(c.buf[sl.head_off..sl.head_off + sl.head_len], hs[..], body_limit(s.opts));
     let target = h.target;
-    let q = strs.index_of_byte(target, '?') catch target.len;
+    let q = strs.index_of_byte(target, '?') ?? target.len;
     let mut query: []u8 = "";
     if q < target.len {
         query = target[q + 1..];
@@ -2641,7 +2648,7 @@ fn advance_h2[C](s: *mut Server.[C], sl: *mut Slot) bool {
                 x.hs.push(Header.{ name: hd.name, value: hd.value }) catch return false;
             }
         }
-        let q = strs.index_of_byte(target, '?') catch target.len;
+        let q = strs.index_of_byte(target, '?') ?? target.len;
         let mut query: []u8 = "";
         if q < target.len {
             query = target[q + 1..];
@@ -2694,7 +2701,7 @@ fn new_scratch() Scratch {
 }
 
 fn has_header(headers: []Header, name: []u8) bool {
-    _ = find_header(headers, name) catch return false;
+    _ = find_header(headers, name) ?? return false;
     return true;
 }
 
@@ -2728,23 +2735,23 @@ pub struct Router[C] {
     /// Adds a route. The method and pattern must outlive the router (string
     /// literals do).
     pub fn route(self: *mut Self, method: []u8, pattern: []u8, h: fn(*mut C, *Request,
-                                                                     *mut Response) !void) HttpError!void {
+                                                                     *mut Response) !void) { OutOfMemory }!void {
         self.routes.push(Route.[C].{ method: method, pattern: pattern, handler: h })!;
     }
 
-    pub fn get(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
+    pub fn get(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
         self.route("GET", pattern, h)!;
     }
 
-    pub fn post(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
+    pub fn post(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
         self.route("POST", pattern, h)!;
     }
 
-    pub fn put(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
+    pub fn put(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
         self.route("PUT", pattern, h)!;
     }
 
-    pub fn delete(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
+    pub fn delete(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) { OutOfMemory }!void {
         self.route("DELETE", pattern, h)!;
     }
 
@@ -2790,22 +2797,22 @@ pub struct Router[C] {
 
 /// Whether path matches pattern; the parameters are stored (decoded) in
 /// the request's scratch.
-fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) HttpError!bool {
+fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) { OutOfMemory }!bool {
     req.nparams = 0;
     let mut pi = strs.split(pattern, "/");
     let mut si = strs.split(path, "/");
     loop {
-        let p = pi.next() catch {
+        let p = pi.next() ?? {
             // the pattern is used up: so must the path be
-            _ = si.next() catch return true;
+            _ = si.next() ?? return true;
             return false;
         };
         if @mem_eq(p, "*") {
             let rest = si.remainder();
-            _ = si.next() catch "";
+            _ = si.next();
             return add_param(req, "*", rest);
         }
-        let seg = si.next() catch return false;
+        let seg = si.next() ?? return false;
         if (p.len >= 2) and (p[0] == '{') and (p[p.len - 1] == '}') {
             if seg.len == 0 {
                 return false;
@@ -2821,7 +2828,7 @@ fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) HttpError!bool {
     }
 }
 
-fn add_param(req: *mut Scratch, name: []u8, raw: []u8) HttpError!bool {
+fn add_param(req: *mut Scratch, name: []u8, raw: []u8) { OutOfMemory }!bool {
     if req.nparams == MAX_PARAMS {
         return false;
     }
@@ -2835,7 +2842,7 @@ fn add_param(req: *mut Scratch, name: []u8, raw: []u8) HttpError!bool {
     }
     let mut segs = strs.split(v, "/");
     loop {
-        let seg = segs.next() catch break;
+        let seg = segs.next() ?? break;
         if @mem_eq(seg, "..") or strs.contains(seg, "\\") or strs.contains(seg, ":") {
             return false;
         }
@@ -2859,7 +2866,7 @@ pub struct Url {
 
 /// Parses "http[s]://hostname[:port][/path][?query]" (with std/net/url;
 /// no user information or IPv6 addresses, and the scheme in lowercase).
-pub fn parse_url(text: []u8) HttpError!Url {
+pub fn parse_url(text: []u8) HttpParseError!Url {
     let u = urls.parse(text) catch return error.BadUrl;
     let secure = strs.eq(u.scheme, "https");
     if (not secure and not strs.eq(u.scheme, "http")) or not u.has_authority or u.has_userinfo or u.ip_literal {
@@ -2974,7 +2981,8 @@ pub struct ClientResponse {
     header_mem: []mut Header,
     body_mem: strs.String,
 
-    pub fn header(self: *ClientResponse, name: []u8) HttpError![]u8 {
+    /// The first header called `name` (case-insensitive), or .none.
+    pub fn header(self: *ClientResponse, name: []u8) ?[]u8 {
         return find_header(self.headers, name);
     }
 
@@ -3081,13 +3089,13 @@ pub struct Proxy {
     }
 
     /// Every request through the proxy at url.
-    pub fn to(url: []u8) HttpError!Proxy {
+    pub fn to(url: []u8) { BadUrl, Unsupported, OutOfMemory }!Proxy {
         return Proxy.init(url, url, "");
     }
 
     /// The proxies for http:// and https:// requests ("" for none) and the
     /// hosts to reach directly, as NO_PROXY lists them.
-    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) HttpError!Proxy {
+    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) { BadUrl, Unsupported, OutOfMemory }!Proxy {
         if http_url.len > 0 {
             _ = parse_proxy_url(http_url)!;
         }
@@ -3170,7 +3178,7 @@ fn is_loopback(hostname: []u8) bool {
 fn excluded(list: []u8, hostname: []u8, port: u16) bool {
     let mut it = strs.split(list, ",");
     loop {
-        let piece = it.next() catch return false;
+        let piece = it.next() ?? return false;
         let mut e = strs.trim(piece);
         if e.len == 0 {
             continue;
@@ -3178,7 +3186,7 @@ fn excluded(list: []u8, hostname: []u8, port: u16) bool {
         if strs.eq(e, "*") {
             return true;
         }
-        let colon = strs.last_index_of_byte(e, ':') catch e.len;
+        let colon = strs.last_index_of_byte(e, ':') ?? e.len;
         if colon < e.len {
             let want = fmt.parse_int.[u16](e[colon + 1..]) catch continue;
             if want != port {
@@ -3186,8 +3194,8 @@ fn excluded(list: []u8, hostname: []u8, port: u16) bool {
             }
             e = e[..colon];
         }
-        e = strs.strip_prefix(e, "*") catch e;
-        e = strs.strip_prefix(e, ".") catch e;
+        e = strs.strip_prefix(e, "*") ?? e;
+        e = strs.strip_prefix(e, ".") ?? e;
         if e.len == 0 {
             continue;
         }
@@ -3210,7 +3218,7 @@ struct ProxyAddr {
     has_auth: bool,
 }
 
-fn parse_proxy_url(text: []u8) HttpError!ProxyAddr {
+fn parse_proxy_url(text: []u8) { BadUrl, Unsupported }!ProxyAddr {
     let t = text;
     if not strs.contains(t, "://") {
         // "[user:password@]host[:port][/]"
@@ -3219,16 +3227,16 @@ fn parse_proxy_url(text: []u8) HttpError!ProxyAddr {
             rest = rest[..rest.len - 1];
         }
         let mut a = ProxyAddr.{ hostname: "", port: 80, user: "", password: "", has_auth: false };
-        let at = strs.last_index_of_byte(rest, '@') catch rest.len;
+        let at = strs.last_index_of_byte(rest, '@') ?? rest.len;
         if at < rest.len {
             let info = rest[..at];
-            let c = strs.index_of_byte(info, ':') catch info.len;
+            let c = strs.index_of_byte(info, ':') ?? info.len;
             a.user = info[..c];
             a.password = info[@min(c + 1, info.len)..];
             a.has_auth = true;
             rest = rest[at + 1..];
         }
-        let colon = strs.last_index_of_byte(rest, ':') catch rest.len;
+        let colon = strs.last_index_of_byte(rest, ':') ?? rest.len;
         if colon < rest.len {
             a.port = fmt.parse_int.[u16](rest[colon + 1..]) catch return error.BadUrl;
             rest = rest[..colon];
@@ -3346,7 +3354,7 @@ pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: Cli
         if (hops >= opts.max_redirects) or not redirect {
             return resp;
         }
-        let loc = resp.header("Location") catch return resp;
+        let loc = resp.header("Location") ?? return resp;
         let next = urls.join(cur.bytes(), loc) catch |e| {
             if e == error.OutOfMemory {
                 resp.deinit();
@@ -3427,12 +3435,12 @@ fn exchange(method: []u8, u: Url, headers: []Header, body: []u8, opts: ClientOpt
 
 // The path of a request target, without its query.
 fn target_path(target: []u8) []u8 {
-    let q = strs.index_of_byte(target, '?') catch target.len;
+    let q = strs.index_of_byte(target, '?') ?? target.len;
     return target[..q];
 }
 
 // "Basic base64(user:password)" for a proxy's credentials, in buf.
-fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) HttpError![]u8 {
+fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) { BadUrl }![]u8 {
     let mut raw: [384]u8 = [0; 384];
     // (percent_decode needs room for its input: decoding only shortens)
     if (pa.user.len >= 256) or (pa.password.len > (raw.len - 256)) {
@@ -3591,7 +3599,10 @@ fn request_once(method: []u8, u: Url, headers: []Header, body: []u8, opts: Clien
     let head = c.buf[c.start..c.start + head_len];
     c.start += head_len;
     c.pin = c.start;
-    let line_end = strs.index_of_byte(head, '\n')!;
+    let line_end = strs.index_of_byte(head, '\n') ?? {
+        c.deinit();
+        return error.BadResponse;
+    };
     let hmem = mem.alloc.[Header](100) catch |e| {
         c.deinit();
         return e;
@@ -3642,7 +3653,7 @@ fn read_response_body(c: *mut Conn, headers: []Header, out: *mut strs.String, ma
 }
 
 /// The status code from "HTTP/1.1 200 OK".
-fn parse_status(head: []u8) HttpError!u16 {
+fn parse_status(head: []u8) { BadResponse }!u16 {
     if (head.len < 12) or not strs.starts_with(head, "HTTP/1.") or (head[8] != ' ') {
         return error.BadResponse;
     }
@@ -3656,6 +3667,19 @@ fn parse_status(head: []u8) HttpError!u16 {
 // -----------------------------------------------------------------------------
 // Tests (axiom test std/net/http.ax)
 // -----------------------------------------------------------------------------
+
+fn must[T](v: ?T) T {
+    return v ?? {
+        @trap();
+    };
+}
+
+fn is_none[T](v: ?T) bool {
+    if let .none = v {
+        return true;
+    }
+    return false;
+}
 
 test "urls and encoding" {
     let u = parse_url("http://example.com:8080/a/b?x=1#frag")!;
@@ -3798,18 +3822,20 @@ test "server and client" {
     @expect_eq(a.status, 200);
     @expect_eq(a.reason, "OK");
     @expect_eq(a.body, "hello, A B");
-    @expect_eq(a.header("content-type")!, "text/plain; charset=utf-8");
+    @expect_eq(must(a.header("content-type")), "text/plain; charset=utf-8");
+    @expect(is_none(a.header("x-missing")));
+    @expect(is_none(find_header(no_headers(), "Host")));
     a.deinit();
 
     let mut b = get(fmt.bufprint(url[..], "{}/users/42", [fmt.str(base)])!)!;
     @expect_eq(b.body, "{\"id\":\"42\"}");
-    @expect_eq(b.header("Content-Type")!, "application/json");
+    @expect_eq(must(b.header("Content-Type")), "application/json");
     b.deinit();
 
     let mut c = post(fmt.bufprint(url[..], "{}/echo", [fmt.str(base)])!, "text/plain", "some data")!;
     @expect_eq(c.status, 201);
     @expect_eq(c.body, "some data");
-    @expect_eq(c.header("x-length")!, "9");
+    @expect_eq(must(c.header("x-length")), "9");
     c.deinit();
 
     let mut d = get(fmt.bufprint(url[..], "{}/nope", [fmt.str(base)])!)!;
@@ -3817,13 +3843,13 @@ test "server and client" {
     d.deinit();
     let mut e = post(fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, "text/plain", "")!;
     @expect_eq(e.status, 405);
-    @expect_eq(e.header("Allow")!, "GET");
+    @expect_eq(must(e.header("Allow")), "GET");
     e.deinit();
 
     // streamed (chunked) response
     let mut f = get(fmt.bufprint(url[..], "{}/big", [fmt.str(base)])!)!;
     @expect_eq(f.body.len, 110000);
-    @expect_eq(f.header("Transfer-Encoding")!, "chunked");
+    @expect_eq(must(f.header("Transfer-Encoding")), "chunked");
     @expect(strs.ends_with(f.body, "line 09999\n"));
     f.deinit();
 
@@ -4047,7 +4073,7 @@ test "HTTP/2" {
                         no_headers(), "", h2)!;
     @expect_eq(a.status, 200);
     @expect_eq(a.body, "hello, h2");
-    @expect_eq(a.header("content-type")!, "text/plain; charset=utf-8");
+    @expect_eq(must(a.header("content-type")), "text/plain; charset=utf-8");
     a.deinit();
     let mut c = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/big", [fmt.int(port)])!, no_headers(), "",
                         h2)!;
@@ -4063,7 +4089,7 @@ test "HTTP/2" {
                         h2)!;
     @expect(e.status == 201);
     @expect(@mem_eq(e.body, big));
-    @expect_eq(e.header("x-length")!, "3000000");
+    @expect_eq(must(e.header("x-length")), "3000000");
     e.deinit();
     // several requests on one connection
     let mut tcp = net.connect("127.0.0.1", port)!;
@@ -4147,7 +4173,7 @@ fn t_login(app: *mut TestApp, req: *Request, res: *mut Response) HttpError!void 
 }
 
 fn t_home(app: *mut TestApp, req: *Request, res: *mut Response) !void {
-    fmt.write(res.writer(), "cookie={}", [fmt.str(req.header("Cookie") catch "none")])!;
+    fmt.write(res.writer(), "cookie={}", [fmt.str(req.header("Cookie") ?? "none")])!;
 }
 
 fn t_see_other(app: *mut TestApp, req: *Request, res: *mut Response) HttpError!void {
@@ -4166,7 +4192,7 @@ fn t_loop(app: *mut TestApp, req: *Request, res: *mut Response) HttpError!void {
 
 fn t_temporary(app: *mut TestApp, req: *Request, res: *mut Response) !void {
     res.set_status(307);
-    let loc = fmt.bufprint(req.scratch_mut().alloc(300)!, "http://{}/method", [fmt.str(req.header("Host")!)])!;
+    let loc = fmt.bufprint(req.scratch_mut().alloc(300)!, "http://{}/method", [fmt.str(must(req.header("Host")))])!;
     res.header("Location", loc)!;
 }
 
@@ -4207,7 +4233,7 @@ test "redirects and cookies" {
     let mut b = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/login", [fmt.int(port)])!, no_headers(), "",
                         ClientOptions.default().with_redirects(0))!;
     @expect_eq(b.status, 302);
-    @expect_eq(b.header("Location")!, "/home?x=1");
+    @expect_eq(must(b.header("Location")), "/home?x=1");
     b.deinit();
     // 303 turns a POST into a GET; 307 keeps it
     let mut c = request("POST", fmt.bufprint(url[..], "http://127.0.0.1:{}/see", [fmt.int(port)])!, no_headers(),
@@ -4393,10 +4419,10 @@ fn read_reply(st: net.TcpStream, buf: []mut u8) ![]u8 {
             return error.Closed;
         }
         n += got;
-        let end = strs.index_of(buf[..n], "\r\n\r\n") catch continue;
-        let at = strs.index_of(buf[..end], "Content-Length: ") catch return error.BadResponse;
+        let end = strs.index_of(buf[..n], "\r\n\r\n") ?? continue;
+        let at = strs.index_of(buf[..end], "Content-Length: ") ?? return error.BadResponse;
         let digits = buf[at + 16..];
-        let nl = strs.index_of_byte(digits, '\r')!;
+        let nl = strs.index_of_byte(digits, '\r') ?? return error.BadResponse;
         let len = fmt.parse_int.[usize](digits[..nl])!;
         if n >= (end + 4 + len) {
             return buf[..end + 4 + len];
@@ -4602,7 +4628,7 @@ test "deadlines for heads, bodies, handshakes and idle connections" {
     }
     k.write_all("GET /hello?name=1 HTTP/1.1\r\nHost: x\r\n\r\nGET /hello?name=2 HTTP/1.1\r\nHost: x\r\n\r\n")!;
     let both = read_until(k, buf[..], "hello, 2")!;
-    let first = strs.index_of(both, "hello, 1")!;
+    let first = must(strs.index_of(both, "hello, 1"));
     @expect(strs.starts_with(both[first + 8..], "HTTP/1.1 200 OK\r\n"));
     // a body sent in pieces, fast enough
     k.write_all("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc")!;
@@ -4926,7 +4952,7 @@ test "many pipelined requests on one connection" {
     let mut n: usize = 0;
     let mut rest = got;
     while true {
-        let at = strs.index_of(rest, "HTTP/1.1 200 OK") catch break;
+        let at = strs.index_of(rest, "HTTP/1.1 200 OK") ?? break;
         n += 1;
         rest = rest[at + 15..];
     }

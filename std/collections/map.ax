@@ -113,7 +113,8 @@ fn free_slot_ctrl(ctrl: []u8, h: u64) usize {
 
 // Rehash into a table of `cap` slots (a power of two >= GROUP, > count).
 fn rehash_impl[K, V, C, const HASH: fn(C, K) u64](keys: *mut []mut K, vals: *mut []mut V, ctrl: *mut []mut u8,
-                                                  count: usize, used: *mut usize, cap: usize, ctx: C) MapError!void {
+                                                  count: usize, used: *mut usize, cap: usize,
+                                                  ctx: C) { OutOfMemory }!void {
     let nk = mem.alloc.[K](cap)!;
     let nv = mem.alloc.[V](cap) catch |e| {
         mem.free(nk);
@@ -146,7 +147,7 @@ fn rehash_impl[K, V, C, const HASH: fn(C, K) u64](keys: *mut []mut K, vals: *mut
 
 fn put_impl[K, V, C, const HASH: fn(C, K) u64, const EQ: fn(C, K, K) bool](
     keys: *mut []mut K, vals: *mut []mut V, ctrl: *mut []mut u8, count: *mut usize, used: *mut usize, k: K, v: V,
-    ctx: C) MapError!void {
+    ctx: C) { OutOfMemory }!void {
     let h = HASH(ctx, k);
     let i = slot_of_impl.[K, C, EQ](keys.*, ctrl.*, count.*, k, h, ctx);
     if i != NONE {
@@ -219,39 +220,39 @@ pub nocopy struct Map[K, V, const HASH: fn(K) u64, const EQ: fn(K, K) bool] {
         return self.ctrl.len;
     }
 
-    fn find(self: *Self, k: K) MapError!usize {
+    fn find(self: *Self, k: K) ?usize {
         let i = slot_of_impl.[K, u8, call_eq.[K, EQ]](self.keys, self.ctrl, self.count, k, HASH(k), 0);
         if i == NONE {
-            return error.NotFound;
+            return .none;
         }
-        return i;
+        return .some(i);
     }
 
     /// Inserts or replaces the value for `k`.
-    pub fn put(self: *mut Self, k: K, v: V) MapError!void {
+    pub fn put(self: *mut Self, k: K, v: V) { OutOfMemory }!void {
         put_impl.[K, V, u8, call_hash.[K, HASH], call_eq.[K, EQ]](&mut self.keys, &mut self.vals, &mut self.ctrl,
                                                                   &mut self.count, &mut self.used, k, v, 0)!;
     }
 
-    pub fn get(self: *Self, k: K) MapError!V {
-        let i = self.find(k)!;
-        return self.vals[i];
+    pub fn get(self: *Self, k: K) ?V {
+        let i = self.find(k) ?? return .none;
+        return .some(self.vals[i]);
     }
 
     /// Pointer to the value for `k`; valid until the map is next modified.
-    pub fn get_ptr(self: *mut Self, k: K) MapError!*mut V {
-        let i = self.find(k)!;
-        return &mut self.vals[i];
+    pub fn get_ptr(self: *mut Self, k: K) ?*mut V {
+        let i = self.find(k) ?? return .none;
+        return .some(&mut self.vals[i]);
     }
 
     pub fn contains(self: *Self, k: K) bool {
-        _ = self.find(k) catch return false;
+        _ = self.find(k) ?? return false;
         return true;
     }
 
     /// Removes `k`; returns whether it was present.
     pub fn remove(self: *mut Self, k: K) bool {
-        let i = self.find(k) catch return false;
+        let i = self.find(k) ?? return false;
         erase_slot(self.ctrl, i, &mut self.count, &mut self.used);
         return true;
     }
@@ -312,40 +313,40 @@ pub nocopy struct MapDyn[K, V] {
         return DynFns.[K].{ hash_fn: self.hash_fn, eq_fn: self.eq_fn };
     }
 
-    fn find(self: *Self, k: K) MapError!usize {
+    fn find(self: *Self, k: K) ?usize {
         let i = slot_of_impl.[K, DynFns.[K], dyn_eq.[K]](self.keys, self.ctrl, self.count, k, self.hash_fn(k),
                                                          self.fns());
         if i == NONE {
-            return error.NotFound;
+            return .none;
         }
-        return i;
+        return .some(i);
     }
 
     /// Inserts or replaces the value for `k`.
-    pub fn put(self: *mut Self, k: K, v: V) MapError!void {
+    pub fn put(self: *mut Self, k: K, v: V) { OutOfMemory }!void {
         put_impl.[K, V, DynFns.[K], dyn_hash.[K], dyn_eq.[K]](&mut self.keys, &mut self.vals, &mut self.ctrl,
                                                               &mut self.count, &mut self.used, k, v, self.fns())!;
     }
 
-    pub fn get(self: *Self, k: K) MapError!V {
-        let i = self.find(k)!;
-        return self.vals[i];
+    pub fn get(self: *Self, k: K) ?V {
+        let i = self.find(k) ?? return .none;
+        return .some(self.vals[i]);
     }
 
     /// Pointer to the value for `k`; valid until the map is next modified.
-    pub fn get_ptr(self: *mut Self, k: K) MapError!*mut V {
-        let i = self.find(k)!;
-        return &mut self.vals[i];
+    pub fn get_ptr(self: *mut Self, k: K) ?*mut V {
+        let i = self.find(k) ?? return .none;
+        return .some(&mut self.vals[i]);
     }
 
     pub fn contains(self: *Self, k: K) bool {
-        _ = self.find(k) catch return false;
+        _ = self.find(k) ?? return false;
         return true;
     }
 
     /// Removes `k`; returns whether it was present.
     pub fn remove(self: *mut Self, k: K) bool {
-        let i = self.find(k) catch return false;
+        let i = self.find(k) ?? return false;
         erase_slot(self.ctrl, i, &mut self.count, &mut self.used);
         return true;
     }
@@ -410,22 +411,29 @@ test "put, get, overwrite, remove" {
         m.put(i, i * 2)!;
     }
     @expect_eq(m.len(), 1000);
-    @expect_eq(m.get(500)!, 1000);
+    @expect_eq(m.get(500) ?? {
+        @trap();
+    }, 1000);
     m.put(500, 1)!;
-    @expect_eq(m.get(500)!, 1);
+    @expect_eq(m.get(500) ?? {
+        @trap();
+    }, 1);
     @expect(m.remove(500));
     @expect(not m.remove(500));
     @expect(not m.contains(500));
     @expect_eq(m.len(), 999);
 }
 
-test "missing key is NotFound" {
+test "missing key is none" {
     let mut m = Map.[u32, u32, hash.hash_u32, hash.eq_u32].init();
-    _ = m.get(7) catch |e| {
-        @expect_eq(e, error.NotFound);
-        return;
-    };
-    @trap();
+    if let .some(got) = m.get(7) {
+        _ = got;
+        @trap();
+    }
+    if let .some(got) = m.get_ptr(7) {
+        _ = got;
+        @trap();
+    }
 }
 
 test "tombstones are reused" {
@@ -481,7 +489,7 @@ test "random operations agree with an array" {
             @expect_eq(m.remove(k), ref[ki] != 0);
             ref[ki] = 0;
         } else {
-            let got = m.get(k) catch 0xFFFF_FFFF_FFFF_FFFF;
+            let got = m.get(k) ?? 0xFFFF_FFFF_FFFF_FFFF;
             if ref[ki] == 0 {
                 @expect_eq(got, 0xFFFF_FFFF_FFFF_FFFF);
             } else {
@@ -510,7 +518,9 @@ test "keys with the same hash probe past full groups" {
         m.put(i, i + 7)!;
     }
     for i in @as(u64, 0)..100 {
-        @expect_eq(m.get(i)!, i + 7);
+        @expect_eq(m.get(i) ?? {
+            @trap();
+        }, i + 7);
     }
     for i in @as(u64, 0)..50 {
         @expect(m.remove(i * 2));
@@ -519,7 +529,9 @@ test "keys with the same hash probe past full groups" {
         @expect_eq(m.contains(i), (i % 2) == 1);
     }
     m.put(4, 1)!;
-    @expect_eq(m.get(4)!, 1);
+    @expect_eq(m.get(4) ?? {
+        @trap();
+    }, 1);
     @expect_eq(m.len(), 51);
 }
 
@@ -530,11 +542,25 @@ test "MapDyn" {
         m.put(i, i * 3)!;
     }
     @expect_eq(m.len(), 40);
-    @expect_eq(m.get(12)!, 36);
-    (m.get_ptr(12)!).* = 99;
-    @expect_eq(m.get(12)!, 99);
+    @expect_eq(m.get(12) ?? {
+        @trap();
+    }, 36);
+    (m.get_ptr(12) ?? {
+        @trap();
+    }).* = 99;
+    @expect_eq(m.get(12) ?? {
+        @trap();
+    }, 99);
     @expect(m.remove(12));
     @expect(not m.contains(12));
+    if let .some(got) = m.get(12) {
+        _ = got;
+        @trap();
+    }
+    if let .some(got) = m.get_ptr(12) {
+        _ = got;
+        @trap();
+    }
     m.clear();
     @expect_eq(m.len(), 0);
 

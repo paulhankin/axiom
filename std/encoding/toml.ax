@@ -3,8 +3,8 @@
 //
 //     let mut doc = toml.parse(text)!;
 //     defer doc.deinit();
-//     let port = doc.root.path("server.port")!.as_i64()!;
-//     for t in doc.root.get("products")!.as_array()! { ... }
+//     let port = (doc.root.path("server.port") ?? return error.NotFound).as_i64()!;
+//     for t in (doc.root.get("products") ?? return error.NotFound).as_array()! { ... }
 //
 //     let s = toml.stringify(doc.root)!;   // mem.free
 //     toml.stringify_to(w, doc.root)!;     // to an io.Writer
@@ -122,9 +122,8 @@ pub union Value {
     Array: []Value,
     Table: []Member,
 
-    /// The value of key in a table: NotFound if absent, WrongType if this is
-    /// not a table.
-    pub fn get(self: Value, key: []u8) TomlError!Value {
+    /// The value of key in a table, or .none if absent or not a table.
+    pub fn get(self: Value, key: []u8) ?Value {
         match self {
             .Table(ms) => {
                 for m in ms {
@@ -132,32 +131,33 @@ pub union Value {
                         return m.value;
                     }
                 }
-                return error.NotFound;
+                return .none;
             }
-            else => { return error.WrongType; }
+            else => { return .none; }
         }
     }
 
     /// Follows a dotted path of bare keys: path("a.b.c").
-    pub fn path(self: Value, p: []u8) TomlError!Value {
+    pub fn path(self: Value, p: []u8) ?Value {
         let mut v = self;
         let mut it = strs.split(p, ".");
         while true {
-            let k = it.next() catch break;
-            v = v.get(k)!;
+            let k = it.next() ?? break;
+            v = v.get(k) ?? return .none;
         }
         return v;
     }
 
-    pub fn at(self: Value, i: usize) TomlError!Value {
+    /// Element i of an array, or .none if out of range or not an array.
+    pub fn at(self: Value, i: usize) ?Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
-                    return error.NotFound;
+                    return .none;
                 }
                 return xs[i];
             }
-            else => { return error.WrongType; }
+            else => { return .none; }
         }
     }
 
@@ -304,7 +304,7 @@ struct Parser {
     }
 
     fn find(self: *mut Parser, parent: u32, key: []u8) u32 {
-        let mut n = self.index.get(key_hash(parent, key)) catch return NIL;
+        let mut n = self.index.get(key_hash(parent, key)) ?? return NIL;
         while n != NIL {
             let nd = self.node(n);
             if (nd.parent == parent) and @mem_eq(nd.key, key) {
@@ -349,7 +349,7 @@ struct Parser {
         p2.count += 1;
         if p2.kind == NodeKind.TABLE {
             let h = key_hash(parent, key);
-            let prev = self.index.get(h) catch NIL;
+            let prev = self.index.get(h) ?? NIL;
             self.node(n).chain = prev;
             self.index.put(h, n)!;
         }
@@ -1263,7 +1263,7 @@ fn parse_number(tok: []u8) TomlError!Value {
             }
         }
     }
-    if (strs.index_of_byte(tok, '_') catch tok.len) == tok.len {
+    if let .none = strs.index_of_byte(tok, '_') {
         return Value.Float(fmt.parse_float(tok) catch return error.SyntaxError);
     }
     let mut digits = strs.String.init();
@@ -1501,7 +1501,7 @@ fn write_value(w: io.Writer, v: Value) !void {
                 let t = fmt.format_float(buf[..], x)!;
                 w.write_all(t)!;
                 // TOML floats need a point or an exponent
-                if (strs.index_of_any(t, ".eE") catch 999) == 999 {
+                if let .none = strs.index_of_any(t, ".eE") {
                     w.write_all(".0")!;
                 }
             }
@@ -1549,10 +1549,10 @@ fn write_value(w: io.Writer, v: Value) !void {
 
 // Compares a parsed value with toml-test's tagged JSON for it.
 fn matches(v: Value, j: json.Value) bool {
-    let ty = j.get("type") catch json.Value.Null;
+    let ty = j.get("type") ?? json.Value.Null;
     let tag = ty.as_str() catch "";
     if (tag.len > 0) and (j.len() == 2) {
-        let want = (j.get("value") catch return false).as_str() catch return false;
+        let want = (j.get("value") ?? return false).as_str() catch return false;
         return leaf_matches(v, tag, want);
     }
     match j {
@@ -1574,7 +1574,7 @@ fn matches(v: Value, j: json.Value) bool {
                 return false;
             }
             for m in ms {
-                let x = v.get(m.key) catch return false;
+                let x = v.get(m.key) ?? return false;
                 if not matches(x, m.value) {
                     return false;
                 }
@@ -1622,14 +1622,14 @@ fn leaf_matches(v: Value, tag: []u8, want: []u8) bool {
     src.push_str(want) catch return false;
     let mut doc = parse(src.bytes()) catch return false;
     defer doc.deinit();
-    let e = (doc.root.get("x") catch return false).as_datetime() catch return false;
+    let e = (doc.root.get("x") ?? return false).as_datetime() catch return false;
     let kinds: [4][]u8 = ["datetime", "datetime-local", "date-local", "time-local"];
     return d.eq(e) and strs.eq(kinds[@as(usize, @int_from_enum(d.kind))], tag);
 }
 
 fn next_line(data: []u8, at: *mut usize) []u8 {
     let st = at.*;
-    let nl = strs.index_of_from(data, "\n", st) catch data.len;
+    let nl = strs.index_of_from(data, "\n", st) ?? data.len;
     at.* = nl + 1;
     return data[st..nl];
 }
@@ -1644,14 +1644,14 @@ test "toml-test: the TOML 1.0.0 cases" {
     while at < data.len {
         let head = next_line(data, &mut at);
         let mut f = strs.fields(head);
-        let kind = f.next() catch break;
-        let name = f.next() catch break;
-        let tlen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let kind = f.next() ?? break;
+        let name = f.next() ?? break;
+        let tlen = fmt.parse_int.[usize](f.next() ?? break) catch break;
         let text = data[at..at + tlen];
         at += tlen + 1;
         let mut ok = false;
         if strs.eq(kind, "valid") {
-            let jlen = fmt.parse_int.[usize](f.next() catch break) catch break;
+            let jlen = fmt.parse_int.[usize](f.next() ?? break) catch break;
             let jtext = data[at..at + jlen];
             at += jlen + 1;
             let mut want = json.parse(jtext) catch @trap();
@@ -1687,17 +1687,33 @@ test "toml-test: the TOML 1.0.0 cases" {
     @expect(passed > 700);
 }
 
+fn must_val(v: ?Value) Value {
+    return v ?? {
+        @trap();
+    };
+}
+
+fn is_none_val(v: ?Value) bool {
+    if let .none = v {
+        return true;
+    }
+    return false;
+}
+
 test "values, paths and writing" {
     let text =
         "title = \"TOML \\u00e9\"\n[owner]\nname = 'Tom'\ndob = 1979-05-27T07:32:00-08:00\n[database]\nports = [ 8000, 8001 ]\nenabled = true\ntemp = { cpu = 79.5 }\n[[products]]\nname = \"Hammer\"\n[[products]]\nname = \"Nail\"\nsku = 0x10\n";
     let mut doc = parse(text)!;
     defer doc.deinit();
-    @expect_eq(doc.root.get("title")!.as_str()!, "TOML \xc3\xa9");
-    @expect_eq(doc.root.path("database.temp.cpu")!.as_f64()!, 79.5);
-    @expect_eq(doc.root.path("database.ports")!.at(1)!.as_i64()!, 8001);
-    let d = doc.root.path("owner.dob")!.as_datetime()!;
+    @expect_eq(must_val(doc.root.get("title")).as_str()!, "TOML \xc3\xa9");
+    @expect_eq(must_val(doc.root.path("database.temp.cpu")).as_f64()!, 79.5);
+    @expect_eq(must_val(must_val(doc.root.path("database.ports")).at(1)).as_i64()!, 8001);
+    let d = must_val(doc.root.path("owner.dob")).as_datetime()!;
     @expect_eq(d.offset_minutes, -480);
-    @expect_eq(doc.root.get("products")!.at(1)!.get("sku")!.as_i64()!, 16);
+    @expect_eq(must_val(must_val(must_val(doc.root.get("products")).at(1)).get("sku")).as_i64()!, 16);
+    @expect(is_none_val(doc.root.get("missing")));
+    @expect(is_none_val(must_val(doc.root.path("database.ports")).at(99)));
+    @expect(is_none_val(doc.root.path("title.sub")));
     let out = stringify(doc.root)!;
     defer mem.free(out);
     let mut again = parse(out)!;
@@ -1762,10 +1778,10 @@ test "long numbers" {
     s.push_str(".5e-100\nn = 1_2_3\n")!;
     let mut doc = parse(s.bytes())!;
     defer doc.deinit();
-    @expect_eq(doc.root.get("f")!.as_f64()!, 1e-201);
-    @expect_eq(doc.root.get("h")!.as_i64()!, 31);
-    @expect_eq(doc.root.get("u")!.as_f64()!, 1.0);
-    @expect_eq(doc.root.get("n")!.as_i64()!, 123);
+    @expect_eq(must_val(doc.root.get("f")).as_f64()!, 1e-201);
+    @expect_eq(must_val(doc.root.get("h")).as_i64()!, 31);
+    @expect_eq(must_val(doc.root.get("u")).as_f64()!, 1.0);
+    @expect_eq(must_val(doc.root.get("n")).as_i64()!, 123);
     for bad in ["x = 0x_1\n", "x = 0x1_\n", "x = 1__2\n", "x = 01\n", "x = 0b2\n", "x = 1_.5\n", "x = 1._5\n"] {
         _ = parse(bad) catch |e| {
             @expect_eq(e, error.SyntaxError);
