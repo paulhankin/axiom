@@ -73,11 +73,16 @@ static const char *decl(HeaderGen *g, Type *t, const char *inner, bool konst) {
     const char *sc = scalar_name(t);
     if (sc) return arena_printf("%s%s%s%s", k, sc, sep, inner);
     switch (t->kind) {
+    case TY_OPT:
+        if (t->elem->kind == TY_PTR || t->elem->kind == TY_FN) return decl(g, t->elem, inner, konst);
+        return arena_printf("%sAXIOM_ALIGNAS(%lld) unsigned char %s[%lld]", k, (long long)type_align(t), inner,
+                            (long long)type_size(t));
     case TY_PTR: {
         const char *in = arena_printf("*%s%s", konst ? "const " : "", inner);
         if (t->elem->kind == TY_ARRAY) in = arena_printf("(%s)", in);
         Type *e = t->elem;
-        if (e->kind == TY_STRUCT || scalar_name(e) || e->kind == TY_PTR || e->kind == TY_FN || e->kind == TY_ARRAY)
+        if (e->kind == TY_STRUCT || scalar_name(e) || e->kind == TY_PTR || e->kind == TY_FN || e->kind == TY_ARRAY ||
+            (e->kind == TY_OPT && (e->elem->kind == TY_PTR || e->elem->kind == TY_FN)))
             return decl(g, e, in, !t->mut);
         return arena_printf("%svoid %s", t->mut ? "" : "const ", in);  // pointee has no C spelling
     }

@@ -21,6 +21,16 @@ static Expr *mkconv(Expr *e, ConvKind k, Type *t) {
     return c;
 }
 
+static Type *unwrap_hint(Type *t) {
+    while (t && (t->kind == TY_OPT || t->kind == TY_ERRUNION)) t = t->elem;
+    return t;
+}
+
+static Type *find_opt_expected(Type *t) {
+    while (t && t->kind == TY_ERRUNION) t = t->elem;
+    return (t && t->kind == TY_OPT) ? t : NULL;
+}
+
 static void type_mismatch(Expr *e, Type *expected, Type *found) {
     if (expected->kind == TY_INVALID || found->kind == TY_INVALID) return;
     Diag *d = diag_error(e->span, "E0412", "type mismatch: expected %s, found %s", type_str(expected), type_str(found));
@@ -147,6 +157,11 @@ void coerce(Expr **pe, Type *target) {
             *pe = mkconv(*pe, CONV_WRAP_OK, target);
             return;
         }
+        if (target->kind == TY_OPT) {
+            coerce(pe, target->elem);
+            *pe = mkconv(*pe, CONV_WRAP_SOME, target);
+            return;
+        }
         type_mismatch(e, target, s);
         e->type = t_invalid;
         return;
@@ -164,9 +179,15 @@ void coerce(Expr **pe, Type *target) {
             e->type = target;
             return;
         }
-        if (target->kind == TY_ERRUNION && target->elem->kind == TY_FLOAT) {
+        Type *inner = unwrap_hint(target);
+        if (target->kind == TY_ERRUNION && inner && (inner->kind == TY_FLOAT || inner->kind == TY_PARAM)) {
             coerce(pe, target->elem);
             *pe = mkconv(*pe, CONV_WRAP_OK, target);
+            return;
+        }
+        if (target->kind == TY_OPT && inner && (inner->kind == TY_FLOAT || inner->kind == TY_PARAM)) {
+            coerce(pe, target->elem);
+            *pe = mkconv(*pe, CONV_WRAP_SOME, target);
             return;
         }
         type_mismatch(e, target, s);
@@ -176,6 +197,12 @@ void coerce(Expr **pe, Type *target) {
     // mutability weakening
     if ((s->kind == TY_SLICE || s->kind == TY_PTR) && target->kind == s->kind && s->mut && !target->mut &&
         s->elem == target->elem) {
+        *pe = mkconv(e, CONV_NOOP, target);
+        return;
+    }
+    if (s->kind == TY_OPT && target->kind == TY_OPT &&
+        (s->elem->kind == TY_SLICE || s->elem->kind == TY_PTR) &&
+        target->elem->kind == s->elem->kind && s->elem->mut && !target->elem->mut && s->elem->elem == target->elem->elem) {
         *pe = mkconv(e, CONV_NOOP, target);
         return;
     }
@@ -203,6 +230,16 @@ void coerce(Expr **pe, Type *target) {
             coerce(pe, target->elem);
             if ((*pe)->type == target->elem || (*pe)->type->kind == TY_INVALID) {
                 *pe = mkconv(*pe, CONV_WRAP_OK, target);
+                (*pe)->type = target;
+            }
+            return;
+        }
+    }
+    if (target->kind == TY_OPT) {
+        if (s->kind != TY_OPT || target->elem->kind == TY_OPT) {
+            coerce(pe, target->elem);
+            if ((*pe)->type == target->elem || (*pe)->type->kind == TY_INVALID) {
+                *pe = mkconv(*pe, CONV_WRAP_SOME, target);
                 (*pe)->type = target;
             }
             return;
@@ -532,9 +569,8 @@ static Type *check_binary(Expr *e, Type *expected) {
         return e->type = t_bool;
     }
     if (is_shift_op(op)) {
-        Type *hint = expected && (expected->kind == TY_INT || ty_is_vec_int(expected) || expected->kind == TY_PARAM)
-                         ? expected
-                         : NULL;
+        Type *ex = unwrap_hint(expected);
+        Type *hint = ex && (ex->kind == TY_INT || ty_is_vec_int(ex) || ex->kind == TY_PARAM) ? ex : NULL;
         Type *l = check_expr(e->a, hint);
         bool ok = check_shift_count(&e->b);
         if (l->kind == TY_UNTYPED_INT) {
@@ -575,8 +611,7 @@ static Type *check_binary(Expr *e, Type *expected) {
         return e->type = l;
     }
     bool cmp = is_cmp_op(op);
-    Type *hint = cmp ? NULL : expected;
-    if (hint && (hint->kind == TY_ERRUNION)) hint = hint->elem;
+    Type *hint = cmp ? NULL : unwrap_hint(expected);
     Type *l = check_expr(e->a, hint);
     Type *r = check_expr(e->b, ty_is_untyped(l) ? hint : l);
     Type *t;
@@ -671,7 +706,8 @@ static Type *check_unary(Expr *e, Type *expected) {
         return e->type = t_bool;
     case TK_AMP: {
         // the pointee type expected, if any, types an untyped temporary
-        Type *hint = expected && expected->kind == TY_PTR ? expected->elem : NULL;
+        Type *ex = unwrap_hint(expected);
+        Type *hint = ex && ex->kind == TY_PTR ? ex->elem : NULL;
         check_operand(e->a, hint);
         check_value(e->a);
         if (ty_is_untyped(e->a->type)) {
@@ -698,7 +734,7 @@ static Type *check_unary(Expr *e, Type *expected) {
         return e->type = type_ptr(t, e->bval);
     }
     case TK_MINUS: {
-        Type *t = check_expr(e->a, expected && expected->kind != TY_ERRUNION ? expected : NULL);
+        Type *t = check_expr(e->a, unwrap_hint(expected));
         if (ty_is_untyped(t)) {
             if (e->a->is_const) {
                 e->cval = -e->a->cval;
@@ -731,10 +767,11 @@ static Type *check_unary(Expr *e, Type *expected) {
     }
     case TK_MINUS_PCT:
     case TK_TILDE: {
-        Type *t = check_expr(e->a, expected);
+        Type *ex = unwrap_hint(expected);
+        Type *t = check_expr(e->a, ex);
         if (ty_is_untyped(t)) {
-            if (expected && (expected->kind == TY_INT || expected->kind == TY_PARAM)) {
-                coerce(&e->a, expected);
+            if (ex && (ex->kind == TY_INT || ex->kind == TY_PARAM)) {
+                coerce(&e->a, ex);
                 t = e->a->type;
             } else {
                 finalize_untyped(&e->a);
@@ -1079,6 +1116,9 @@ static bool unify(Type *pat, Type *act, Type **vars, Type **sol, int nv) {
     case TY_SLICE:
         if (act->kind != pat->kind) return true;
         return unify(pat->elem, act->elem, vars, sol, nv);
+    case TY_OPT:
+        if (act->kind == TY_OPT) return unify(pat->elem, act->elem, vars, sol, nv);
+        return unify(pat->elem, act, vars, sol, nv);
     case TY_ERRUNION:
         if (act->kind == TY_ERRUNION) return unify(pat->elem, act->elem, vars, sol, nv);
         return unify(pat->elem, act, vars, sol, nv);
@@ -1356,9 +1396,9 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
             diag_error(e->a->span, "E0408", "struct literal requires a struct type");
         }
     } else if (expected) {
-        Type *x = expected->kind == TY_ERRUNION ? expected->elem : expected;
-        if (x->kind == TY_STRUCT) t = x;
-        else if (x->kind != TY_INVALID)
+        Type *x = unwrap_hint(expected);
+        if (x && x->kind == TY_STRUCT) t = x;
+        else if (x && x->kind != TY_INVALID)
             diag_error(e->span, "E0408", "anonymous struct literal where %s is expected", type_str(expected));
     } else {
         diag_error(e->span, "E0503", "cannot infer the type of '.{ ... }'; write T.{ ... }");
@@ -1435,7 +1475,7 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
 }
 
 static Type *check_array_lit(Expr *e, Type *expected) {
-    Type *x = expected && expected->kind == TY_ERRUNION ? expected->elem : expected;
+    Type *x = unwrap_hint(expected);
     Type *elem = x && x->kind == TY_ARRAY ? x->elem : NULL;
     if (e->kind == E_ARRAY_REPEAT) {
         check_expr_to(&e->b, t_usize);
@@ -1503,7 +1543,7 @@ static Local *place_local(Expr *e) {
 // §12.2: W0710).
 static void check_escape(Expr *e0) {
     Expr *e = e0;
-    while (e->kind == E_CONV) e = e->a;
+    while (e->kind == E_CONV || e->kind == E_OPT_SOME) e = e->a;
     if (!e->type || e->type->kind == TY_INVALID) return;
     Local *l = NULL;
     if (e->kind == E_UNARY && e->op == TK_AMP && is_place(e->a)) l = place_local(e->a);
@@ -1578,6 +1618,34 @@ static Type *check_catch(Expr *e) {
         break;
     }
     scope_pop();
+    return e->type = vt;
+}
+
+static Type *check_orelse(Expr *e) {
+    Type *t = check_expr(e->a, NULL);
+    Type *vt = t_invalid;
+    if (t->kind == TY_OPT) {
+        vt = t->elem;
+    } else if (t->kind != TY_INVALID) {
+        diag_error(e->a->span, "E0614", "'?\?' requires an optional (?T), found %s", type_str(t));
+    }
+    switch (e->hkind) {
+    case H_VALUE: check_expr_to(&e->hexpr, vt); break;
+    case H_RETURN: check_return_value(e->hexpr ? &e->hexpr : NULL, e->span); break;
+    case H_BREAK:
+    case H_CONTINUE: {
+        int d = check_jump_target(e->name, e->name ? e->name_span : e->span, e->hkind == H_BREAK);
+        e->index = d < 0 ? 0 : d;
+        break;
+    }
+    case H_BLOCK:
+        if (!check_block(e->hblock) && vt->kind != TY_INVALID)
+            diag_error(e->hblock->span, "E0612",
+                       "this '?\?' block must not complete normally, because the expression needs a value of type %s "
+                       "(end it with return, break, continue or @trap(), or use '?? <value>')",
+                       type_str(vt));
+        break;
+    }
     return e->type = vt;
 }
 
@@ -1686,6 +1754,41 @@ static Type *check_operand(Expr *e, Type *expected) {
     case E_STRING: return e->type = type_slice(t_u8, false);
     case E_BOOL: return e->type = t_bool;
     case E_STRUCT_LIT: return check_struct_lit(e, expected);
+    case E_OPT_NONE: {
+        Type *ex = unwrap_hint(expected);
+        if (ex && ex->kind == TY_INVALID) return e->type = t_invalid;
+        Type *ot = find_opt_expected(expected);
+        if (!ot) {
+            diag_error(e->span, "E0502", "cannot infer the type of '.none'; add a type annotation");
+            return e->type = t_invalid;
+        }
+        return e->type = ot;
+    }
+    case E_OPT_SOME: {
+        Type *ot = find_opt_expected(expected);
+        if (ot) {
+            check_expr_to(&e->a, ot->elem);
+            return e->type = ot;
+        }
+        Type *it = check_expr(e->a, NULL);
+        if (ty_is_untyped(it)) {
+            finalize_untyped(&e->a);
+            return e->type = t_invalid;
+        }
+        if (it->kind == TY_VOID) {
+            diag_error(e->span, "E0404", "optional element type cannot be void");
+            return e->type = t_invalid;
+        }
+        if (it->kind == TY_INVALID) return e->type = t_invalid;
+        return e->type = type_opt(it);
+    }
+    case E_EMPTY_SLICE: {
+        Type *x = unwrap_hint(expected);
+        if (x && x->kind == TY_INVALID) return e->type = t_invalid;
+        if (x && x->kind == TY_SLICE) return e->type = x;
+        diag_error(e->span, "E0502", "cannot infer the element type of empty slice '[]'; add a type annotation");
+        return e->type = t_invalid;
+    }
     case E_ARRAY_LIT:
     case E_ARRAY_REPEAT: return check_array_lit(e, expected);
     case E_ERROR_VAL: {
@@ -1705,6 +1808,7 @@ static Type *check_operand(Expr *e, Type *expected) {
     case E_UNARY: return check_unary(e, expected);
     case E_BINARY: return check_binary(e, expected);
     case E_CATCH: return check_catch(e);
+    case E_ORELSE: return check_orelse(e);
     case E_FIELD: check_field(e); return e->type;
     case E_DEREF: {
         Type *t = check_expr(e->a, NULL);

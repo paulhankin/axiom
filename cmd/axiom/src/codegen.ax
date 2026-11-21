@@ -30,7 +30,7 @@ fn type_mentions_error(t: *mut ast.Type) bool {
     if (k == ast.TY_ERROR) or (k == ast.TY_ERRUNION) {
         return true;
     }
-    if k == ast.TY_ARRAY {
+    if (k == ast.TY_ARRAY) or (k == ast.TY_OPT) {
         return type_mentions_error(t.elem);
     }
     if k == ast.TY_STRUCT {
@@ -527,6 +527,93 @@ fn gen_catch(e: *mut ast.Expr) *mut ir.Value {
     return phi;
 }
 
+fn opt_some_val(t: *mut ast.Type, v0: *mut ir.Value) *mut ir.Value {
+    let niche = ty.opt_niche(t);
+    if niche == ty.OPT_BOOL {
+        return cgrt.to_mem(ty.t_bool, v0);
+    }
+    if niche == ty.OPT_TAGGED {
+        let lt = cx.lty(t);
+        let mut res = ir.undef(lt);
+        res = cx.insert(res, ir.cint(cx.T_i8, 1), 0);
+        res = cx.insert(res, cgrt.to_mem(t.elem, v0), 1);
+        return res;
+    }
+    return v0;
+}
+
+fn opt_has_value(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
+    let niche = ty.opt_niche(t);
+    if niche == ty.OPT_PTR {
+        return cx.icmp(ir.IntNE, v, ir.czero(cx.T_ptr));
+    }
+    if niche == ty.OPT_BOOL {
+        return cx.icmp(ir.IntNE, v, ir.cint(cx.T_i8, 2));
+    }
+    if niche == ty.OPT_SLICE {
+        return cx.icmp(ir.IntNE, cx.extract(v, 0), ir.czero(cx.T_ptr));
+    }
+    return cx.icmp(ir.IntNE, cx.extract(v, 0), ir.cint(cx.T_i8, 0));
+}
+
+fn opt_extract_val(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
+    let niche = ty.opt_niche(t);
+    if niche == ty.OPT_BOOL {
+        return cgrt.from_mem(ty.t_bool, v);
+    }
+    if niche == ty.OPT_TAGGED {
+        return cgrt.from_mem(t.elem, cx.extract(v, 1));
+    }
+    return v;
+}
+
+fn gen_orelse(e: *mut ast.Expr) *mut ir.Value {
+    let ot = cx.ct(e.a.ty);
+    let vt = ot.elem;
+    let v = gen(e.a);
+    if cx.terminated() {
+        return ir.undef(cx.vty(vt));
+    }
+    let has = opt_has_value(ot, v);
+    let none_bb = cx.new_bb("orelse.none".ptr);
+    let some_bb = cx.new_bb("orelse.some".ptr);
+    let merge = cx.new_bb("orelse.end".ptr);
+    cx.condbr(has, some_bb, none_bb);
+    cx.at_end(none_bb);
+    let mut hv = cx.vnil();
+    let mut hbb = cx.bbnil();
+    match ast.more(e).handler {
+        .Value(h) => {
+            hv = gen(h);
+            if not cx.terminated() {
+                hbb = ir.insert_block(cx.B);
+                cx.br(merge);
+            }
+        }
+        .Return(h)  => { gen_return(h); }
+        .Break      => { gen_break(true, ast.index_of(e)); }
+        .Continue   => { gen_break(false, ast.index_of(e)); }
+        .Block(blk) => { gen_block(blk); }
+    }
+    if not cx.terminated() {
+        ir.unreachable(cx.B);
+    }
+    cx.at_end(some_bb);
+    let ov = opt_extract_val(ot, v);
+    let obb = ir.insert_block(cx.B);
+    cx.br(merge);
+    cx.at_end(merge);
+    if u.isnil(hbb) or u.isnil(hv) {
+        return ov;
+    }
+    let phi = ir.phi(cx.B, cx.vty(vt));
+    let mut vals: [2]*mut ir.Value = [ov, hv];
+    let mut bbs: [2]*mut ir.Block = [obb, hbb];
+    ir.add_incoming(phi, vals[0], bbs[0]);
+    ir.add_incoming(phi, vals[1], bbs[1]);
+    return phi;
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -763,6 +850,18 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         return gen_binary(e);
     } else if k == ast.E_CATCH {
         return gen_catch(e);
+    } else if k == ast.E_OPT_NONE {
+        return cgb.opt_none_val(t);
+    } else if k == ast.E_OPT_SOME {
+        let v = gen(e.a);
+        if cx.terminated() {
+            return ir.undef(cx.vty(t));
+        }
+        return opt_some_val(t, v);
+    } else if k == ast.E_ORELSE {
+        return gen_orelse(e);
+    } else if k == ast.E_EMPTY_SLICE {
+        return cgb.empty_slice_val(t);
     } else if k == ast.E_TRY {
         return gen_try(e);
     } else if k == ast.E_CALL {
@@ -824,6 +923,13 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         }
         if ast.conv_of(e) == ast.CONV_WRAP_ERR {
             return cgb.errunion_value(t, gen(e.a), cx.vnil());
+        }
+        if ast.conv_of(e) == ast.CONV_WRAP_SOME {
+            let v = gen(e.a);
+            if cx.terminated() {
+                return ir.undef(cx.vty(t));
+            }
+            return opt_some_val(t, v);
         }
     }
     cx.internal_error(u.f1("cannot generate expression kind %s", u.idec(@as(i32, @int_from_enum(e.kind)))));
@@ -958,11 +1064,16 @@ fn gen_for(s: *mut ast.Stmt) void {
     let i = cx.ld(cx.T_isz, iv);
     cx.condbr(cx.icmp(ir.IntULT, i, len), body, end);
     cx.at_end(body);
-    let ep = cx.gep1(cx.lty(vt), ptr, i);
-    if ctt.kind == ast.TY_SLICE {
-        bi.asan_check(ep, cx.usz(ty.type_size(vt)));
+    let elt = cx.ct(ctt.elem);
+    let ep = cx.gep1(cx.lty(elt), ptr, i);
+    if ast.stmt_more(s).ref_iter {
+        cgrt.store(vt, ep, var, false);
+    } else {
+        if ctt.kind == ast.TY_SLICE {
+            bi.asan_check(ep, cx.usz(ty.type_size(elt)));
+        }
+        cgrt.store(elt, cgrt.load(elt, ep, ctt.kind == ast.TY_SLICE), var, false);
     }
-    cgrt.store(vt, cgrt.load(vt, ep, ctt.kind == ast.TY_SLICE), var, false);
     push_loop(end, step);
     gen_block(s.body);
     cx.F.loops.len -= 1;
@@ -992,7 +1103,13 @@ fn is_error_arm(a: *ast.MatchArm) bool {
 }
 
 fn gen_match(s: *mut ast.Stmt) void {
-    let t = cx.ct(s.e.ty);
+    let t0 = cx.ct(s.e.ty);
+    let mut by_ref = false;
+    let mut t = t0;
+    if (t0.kind == ast.TY_PTR) and ((t0.elem.kind == ast.TY_UNION) or (t0.elem.kind == ast.TY_OPT)) {
+        by_ref = true;
+        t = cx.ct(t0.elem);
+    }
     let end = cx.new_bb("match.end".ptr);
     let n = ast.stmt_more(s).arms.len;
     let bbs = u.newn.[*mut ir.Block](n + 1);
@@ -1009,9 +1126,16 @@ fn gen_match(s: *mut ast.Stmt) void {
         }
     }
     let mut payload_ptr = cx.vnil();
+    let mut opt_val = cx.vnil();
     if t.kind == ast.TY_UNION {
-        let up = addr_or_spill(s.e);
-        let tag = cx.ld(cx.lty(ty.union_tag_type(t)), cx.sgep(cx.lty(t), up, 0));
+        let mut up = cx.vnil();
+        if by_ref {
+            up = gen(s.e);
+            bi.asan_check(up, cx.usz(ty.type_size(t)));
+        } else {
+            up = addr_or_spill(s.e);
+        }
+        let tag = cgrt.load(ty.union_tag_type(t), cx.sgep(cx.lty(t), up, 0), by_ref);
         if ir.field_count(cx.lty(t)) > 1 {
             payload_ptr = cx.sgep(cx.lty(t), up, 1);
         }
@@ -1032,6 +1156,65 @@ fn gen_match(s: *mut ast.Stmt) void {
                         sw, ir.cint(cx.lty(ty.union_tag_type(t)), @as(u64, v)), bbs[@int_cast(usize, else_idx)]);
                 }
             }
+        }
+    } else if t.kind == ast.TY_OPT {
+        let mut none_bb = cx.bbnil();
+        let mut some_bb = cx.bbnil();
+        for i in 0..n {
+            let a = ast.stmt_more(s).arms.at(i);
+            if is_variant_arm(a) {
+                if a.variant == 0 {
+                    none_bb = bbs[i];
+                } else {
+                    some_bb = bbs[i];
+                }
+            }
+        }
+        if u.isnil(none_bb) and (else_idx >= 0) {
+            none_bb = bbs[@int_cast(usize, else_idx)];
+        }
+        if u.isnil(some_bb) and (else_idx >= 0) {
+            some_bb = bbs[@int_cast(usize, else_idx)];
+        }
+        if u.isnil(none_bb) {
+            none_bb = cgrt.trap_block(cgrt.T_UNIONTAG);
+        }
+        if u.isnil(some_bb) {
+            some_bb = cgrt.trap_block(cgrt.T_UNIONTAG);
+        }
+        let mut has = cx.vnil();
+        if by_ref {
+            let up = gen(s.e);
+            bi.asan_check(up, cx.usz(ty.type_size(t)));
+            let niche = ty.opt_niche(t);
+            if niche == ty.OPT_PTR {
+                let pv = cgrt.load(t.elem, up, true);
+                has = cx.icmp(ir.IntNE, pv, ir.czero(cx.T_ptr));
+                payload_ptr = up;
+            } else if niche == ty.OPT_BOOL {
+                let bv = cgrt.load(ty.t_u8, up, true);
+                has = cx.icmp(ir.IntNE, bv, ir.cint(cx.T_i8, 2));
+                payload_ptr = up;
+            } else if niche == ty.OPT_SLICE {
+                let sp = cx.sgep(cx.lty(t), up, 0);
+                let pv = cgrt.load(ty.type_ptr(ty.t_u8, false), sp, true);
+                has = cx.icmp(ir.IntNE, pv, ir.czero(cx.T_ptr));
+                payload_ptr = up;
+            } else {
+                let tp = cx.sgep(cx.lty(t), up, 0);
+                let tag = cgrt.load(ty.t_u8, tp, true);
+                has = cx.icmp(ir.IntNE, tag, ir.cint(cx.T_i8, 0));
+                payload_ptr = cx.sgep(cx.lty(t), up, 1);
+            }
+        } else {
+            opt_val = gen(s.e);
+            if cx.terminated() {
+                opt_val = ir.undef(cx.lty(t));
+            }
+            has = opt_has_value(t, opt_val);
+        }
+        if not cx.terminated() {
+            cx.condbr(has, some_bb, none_bb);
         }
     } else if (cx.O.unit == cx.CG_MODULE) and (n > 0) and (cx.ct(s.e.ty).kind == ast.TY_ERROR) {
         // Error codes are link-time values here: compare in arm order.
@@ -1098,9 +1281,17 @@ fn gen_match(s: *mut ast.Stmt) void {
             continue;
         }
         cx.at_end(bbs[i]);
-        if u.notnil(a.bind_local) and u.notnil(payload_ptr) {
-            let pt = ty.type_variant(t, @int_cast(usize, a.variant));
-            cgrt.store(pt, cgrt.load(pt, payload_ptr, true), cgrt.local_ptr(a.bind_local), false);
+        if u.notnil(a.bind_local) {
+            if by_ref {
+                if u.notnil(payload_ptr) {
+                    cgrt.store(cx.ct(a.bind_local.ty), payload_ptr, cgrt.local_ptr(a.bind_local), false);
+                }
+            } else if t.kind == ast.TY_OPT {
+                cgrt.store(cx.ct(t.elem), opt_extract_val(t, opt_val), cgrt.local_ptr(a.bind_local), false);
+            } else if u.notnil(payload_ptr) {
+                let pt = ty.type_variant(t, @int_cast(usize, a.variant));
+                cgrt.store(pt, cgrt.load(pt, payload_ptr, true), cgrt.local_ptr(a.bind_local), false);
+            }
         }
         gen_block(a.body);
         if not cx.terminated() {

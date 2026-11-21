@@ -156,6 +156,16 @@ Type *type_enum(Decl *d, Type *repr) {
     Type p = {.kind = TY_ENUM, .decl = d, .elem = repr};
     return intern_type(&p);
 }
+Type *type_opt(Type *elem) {
+    Type p = {.kind = TY_OPT, .elem = elem};
+    return intern_type(&p);
+}
+OptNiche opt_niche(const Type *t) {
+    if (t->elem->kind == TY_PTR || t->elem->kind == TY_FN) return OPT_PTR;
+    if (t->elem->kind == TY_BOOL) return OPT_BOOL;
+    if (t->elem->kind == TY_SLICE) return OPT_SLICE;
+    return OPT_TAGGED;
+}
 Type *type_errunion(Type *elem) { return type_errunion_set(elem, NULL); }
 // set!T for the error set declared by set (NULL: any error).
 Type *type_errunion_set(Type *elem, Decl *set) {
@@ -290,6 +300,10 @@ Decl *anon_struct_decl(Module *m, FieldVec fields, Span sp) {
 bool ty_is_aggregate(Type *t) {
     switch (t->kind) {
     case TY_STRUCT: case TY_UNION: case TY_ARRAY: case TY_SLICE: case TY_ERRUNION: return true;
+    case TY_OPT: {
+        OptNiche n = opt_niche(t);
+        return n == OPT_SLICE || n == OPT_TAGGED;
+    }
     default: return false;
     }
 }
@@ -306,6 +320,7 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
         return t;
     case TY_PTR: return type_ptr(type_subst(t->elem, from, to, n), t->mut);
     case TY_SLICE: return type_slice(type_subst(t->elem, from, to, n), t->mut);
+    case TY_OPT: return type_opt(type_subst(t->elem, from, to, n));
     case TY_ERRUNION: return type_errunion_set(type_subst(t->elem, from, to, n), t->decl);
     case TY_ARRAY: {
         Type *e = type_subst(t->elem, from, to, n);
@@ -349,6 +364,7 @@ Type *type_lower_enums(Type *t) {
     case TY_ENUM: return t->elem;
     case TY_PTR: return type_ptr(type_lower_enums(t->elem), t->mut);
     case TY_SLICE: return type_slice(type_lower_enums(t->elem), t->mut);
+    case TY_OPT: return type_opt(type_lower_enums(t->elem));
     case TY_ERRUNION: return type_errunion_set(type_lower_enums(t->elem), t->decl);
     case TY_ARRAY:
         if (t->len_param) return type_array_param(type_lower_enums(t->elem), t->len_param);
@@ -468,6 +484,7 @@ static void tstr(CharVec *b, Type *t) {
         }
         return;
     case TY_ENUM: puts_b(b, t->decl->name); return;
+    case TY_OPT: puts_b(b, "?"); tstr(b, t->elem); return;
     case TY_ERRUNION:
         if (t->decl) puts_b(b, t->decl->name);
         puts_b(b, "!");
@@ -578,6 +595,24 @@ static void layout(Type *t) {
         t->align = type_align(t->elem);
         t->size = sat_mul(t->len, type_size(t->elem));
         break;
+    case TY_OPT: {
+        OptNiche n = opt_niche(t);
+        if (n == OPT_PTR) {
+            t->size = t->align = ps;
+        } else if (n == OPT_BOOL) {
+            t->size = t->align = 1;
+        } else if (n == OPT_SLICE) {
+            t->size = 2 * ps;
+            t->align = ps;
+        } else {
+            int64_t ea = type_align(t->elem);
+            int64_t es = type_size(t->elem);
+            t->align = ea < 1 ? 1 : ea;
+            int64_t off = round_up(1, t->align);
+            t->size = round_up(sat_add(off, es), t->align);
+        }
+        break;
+    }
     case TY_ERRUNION: {
         int64_t a = type_align(t->elem);
         if (a < 2) a = 2;

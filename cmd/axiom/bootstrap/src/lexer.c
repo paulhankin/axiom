@@ -22,7 +22,7 @@ const char *tok_kind_name(TokKind k) {
     static const char *punct[] = {
         "+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>",
         "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=",
-        "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>",
+        "&=", "|=", "^=", "<<=", ">>=", "!", "?", "??", ".", "..", "...", ",", ":", ";", "=>",
         "(", ")", "{", "}", "[", "]",
     };
     switch (k) {
@@ -426,11 +426,11 @@ TokenVec lex_file(SourceFile *f) {
             {"<=", TK_LE},           {">=", TK_GE},            {"+=", TK_PLUS_EQ},      {"-=", TK_MINUS_EQ},
             {"*=", TK_STAR_EQ},      {"/=", TK_SLASH_EQ},      {"%=", TK_PERCENT_EQ},   {"&=", TK_AMP_EQ},
             {"|=", TK_PIPE_EQ},      {"^=", TK_CARET_EQ},      {"..", TK_DOTDOT},       {"=>", TK_FATARROW},
-            {"+", TK_PLUS},           {"-", TK_MINUS},         {"*", TK_STAR},
+            {"??", TK_QQ},           {"+", TK_PLUS},           {"-", TK_MINUS},         {"*", TK_STAR},
             {"/", TK_SLASH},         {"%", TK_PERCENT},        {"&", TK_AMP},           {"|", TK_PIPE},
             {"^", TK_CARET},         {"~", TK_TILDE},          {"<", TK_LT},            {">", TK_GT},
-            {"=", TK_EQ},            {"!", TK_BANG},           {".", TK_DOT},           {",", TK_COMMA},
-            {":", TK_COLON},         {";", TK_SEMI},           {"(", TK_LPAREN},        {")", TK_RPAREN},
+            {"=", TK_EQ},            {"!", TK_BANG},           {"?", TK_QUESTION},      {".", TK_DOT},
+            {",", TK_COMMA},         {":", TK_COLON},          {";", TK_SEMI},          {"(", TK_LPAREN},        {")", TK_RPAREN},
             {"{", TK_LBRACE},        {"}", TK_RBRACE},         {"[", TK_LBRACKET},      {"]", TK_RBRACKET},
         };
         bool matched = false;

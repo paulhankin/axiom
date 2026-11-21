@@ -20,6 +20,7 @@ typedef enum TypeKind {
     TY_STRUCT,
     TY_UNION,
     TY_ENUM,   // elem: the representation (an integer type)
+    TY_OPT,    // ?elem
     TY_ERRUNION,
     TY_ERROR,
     TY_PARAM,     // generic parameter (type or const)
@@ -90,6 +91,9 @@ Type *type_array_param(Type *elem, Type *len_param);
 Type *type_fn(Type **params, int n, Type *ret);
 Type *type_named(Decl *d, Type **args, int n);  // struct or union instance
 Type *type_enum(Decl *d, Type *repr);
+Type *type_opt(Type *elem);
+typedef enum OptNiche { OPT_PTR, OPT_BOOL, OPT_SLICE, OPT_TAGGED } OptNiche;
+OptNiche opt_niche(const Type *t);
 Type *type_errunion(Type *elem);
 Type *type_errunion_set(Type *elem, Decl *set);
 Type *type_errset(Decl *set);

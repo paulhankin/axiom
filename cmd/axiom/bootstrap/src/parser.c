@@ -214,6 +214,24 @@ static TypeExpr *parse_type_in(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
     switch (t->kind) {
+    case TK_QUESTION: {
+        advance(P);
+        TypeExpr *te = new_te(TE_OPT, start);
+        te->elem = parse_type(P);
+        te->span = sp_from(P, start);
+        return te;
+    }
+    case TK_QQ: {
+        advance(P);
+        Span inner_start = {start.file, start.start + 1, start.end};
+        TypeExpr *inner = new_te(TE_OPT, inner_start);
+        inner->elem = parse_type(P);
+        inner->span = sp_from(P, inner_start);
+        TypeExpr *outer = new_te(TE_OPT, start);
+        outer->elem = inner;
+        outer->span = sp_from(P, start);
+        return outer;
+    }
     case TK_BANG: {
         advance(P);
         TypeExpr *te = new_te(TE_ERRUNION, start);
@@ -449,6 +467,21 @@ static Expr *parse_primary(Parser *P) {
     }
     case TK_DOT: {
         advance(P);
+        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "none")) {
+            advance(P);
+            Expr *e = new_expr(E_OPT_NONE, start);
+            e->span = sp_from(P, start);
+            return e;
+        }
+        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "some")) {
+            advance(P);
+            expect(P, TK_LPAREN);
+            Expr *e = new_expr(E_OPT_SOME, start);
+            e->a = parse_expr(P);
+            expect(P, TK_RPAREN);
+            e->span = sp_from(P, start);
+            return e;
+        }
         expect(P, TK_LBRACE);
         Expr *e = new_expr(E_STRUCT_LIT, start);
         parse_field_inits(P, e);
@@ -457,6 +490,11 @@ static Expr *parse_primary(Parser *P) {
     }
     case TK_LBRACKET: {
         advance(P);
+        if (accept(P, TK_RBRACKET)) {
+            Expr *e = new_expr(E_EMPTY_SLICE, start);
+            e->span = sp_from(P, start);
+            return e;
+        }
         Expr *first = parse_expr(P);
         Expr *e;
         if (accept(P, TK_SEMI)) {
@@ -711,19 +749,21 @@ static Expr *parse_binexpr(Parser *P) {
 
 static Expr *parse_expr(Parser *P) {
     Expr *e = parse_binexpr(P);
-    if (pk(P) != KW_CATCH) return e;
+    if (pk(P) != KW_CATCH && pk(P) != TK_QQ) return e;
+    bool is_orelse = pk(P) == TK_QQ;
     Span start = e->span;
     if (e->kind == E_BINARY && !e->parens) {
-        Diag *d = diag_error(e->span, "E0150", "'catch' applies to the whole expression '... %s ...'; add parentheses",
-                             tok_kind_name((TokKind)e->op));
-        DiagFix *fx = diag_fix(d, "catch only the right operand", "suggestion");
+        Diag *d = diag_error(e->span, "E0150", "'%s' applies to the whole expression '... %s ...'; add parentheses",
+                             is_orelse ? "??" : "catch", tok_kind_name((TokKind)e->op));
+        DiagFix *fx = diag_fix(d, is_orelse ? "unwrap only the right operand" : "catch only the right operand",
+                               "suggestion");
         diag_fix_edit(fx, (Span){e->b->span.file, e->b->span.start, e->b->span.start}, "(");
         (void)fx;
     }
     advance(P);
-    Expr *c = new_expr(E_CATCH, start);
+    Expr *c = new_expr(is_orelse ? E_ORELSE : E_CATCH, start);
     c->a = e;
-    if (accept(P, TK_PIPE)) {
+    if (!is_orelse && accept(P, TK_PIPE)) {
         c->capture = expect_ident(P, &c->capture_span);
         expect(P, TK_PIPE);
     }
@@ -983,6 +1023,10 @@ static Stmt *parse_stmt(Parser *P) {
     case KW_FOR: {
         advance(P);
         Stmt *s = new_stmt(S_FOR, start);
+        if (accept(P, TK_AMP)) {
+            s->ref_iter = true;
+            s->ref_mut = accept(P, KW_MUT);
+        }
         s->name = expect_ident(P, &s->name_span);
         expect(P, KW_IN);
         s->e = parse_expr(P);

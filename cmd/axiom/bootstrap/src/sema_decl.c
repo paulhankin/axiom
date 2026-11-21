@@ -496,6 +496,14 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         return tc->self;
     case TE_INTLIT: diag_error(te->span, "E0400", "expected a type, found an integer"); return t_invalid;
     case TE_CONSTEXPR: diag_error(te->span, "E0400", "expected a type, found an expression"); return t_invalid;
+    case TE_OPT: {
+        Type *e = resolve_type(te->elem, tc);
+        if (e->kind == TY_VOID) {
+            diag_error(te->span, "E0404", "optional element type cannot be void");
+            return t_invalid;
+        }
+        return check_size(te->span, type_opt(e));
+    }
     case TE_ERRUNION: {
         Decl *set = te->set ? resolve_set_te(te->set, tc) : NULL;
         Type *e = resolve_type(te->elem, tc);
@@ -620,6 +628,8 @@ static bool boundary_type_ok(Type *t, bool is_ret) {
     case TY_VEC: case TY_V128: return simd_bits(t) == 128;  // (WebAssembly has nothing wider)
     case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_INVALID:
         return true;
+    case TY_OPT:
+        return (t->elem->kind == TY_PTR || t->elem->kind == TY_FN) && boundary_type_ok(t->elem, false);
     case TY_VOID: return is_ret;
     default: return false;
     }
@@ -906,6 +916,7 @@ bool fn_widens(Type *s, Type *t) {
 
 // The error set an expected type asks for (NULL: none, or any error).
 Decl *expected_set(Type *t) {
+    while (t && t->kind == TY_OPT) t = t->elem;
     if (t && (t->kind == TY_ERROR || t->kind == TY_ERRUNION)) return t->decl;
     return NULL;
 }
@@ -1012,6 +1023,7 @@ static bool contains_by_value(Type *t, Decl *target, int depth) {
     if (depth > 64) return false;
     switch (t->kind) {
     case TY_ARRAY: return contains_by_value(t->elem, target, depth + 1);
+    case TY_OPT:
     case TY_ERRUNION: return contains_by_value(t->elem, target, depth + 1);
     case TY_STRUCT:
         if (t->decl == target && depth > 0) return true;
@@ -1035,7 +1047,9 @@ static bool contains_by_value(Type *t, Decl *target, int depth) {
 static bool is_const_init(Expr *e) {
     if (e->is_const) return true;
     switch (e->kind) {
-    case E_INT: case E_FLOAT: case E_BOOL: case E_STRING: case E_ERROR_VAL: return true;
+    case E_INT: case E_FLOAT: case E_BOOL: case E_STRING: case E_ERROR_VAL:
+    case E_OPT_NONE: case E_EMPTY_SLICE: return true;
+    case E_OPT_SOME: return is_const_init(e->a);
     case E_CONV: return is_const_init(e->a);
     case E_ARRAY_LIT:
         for (int i = 0; i < e->args.len; i++)

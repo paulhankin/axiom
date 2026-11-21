@@ -80,7 +80,8 @@ bool check_block(Stmt *b) {
 }
 
 static bool is_leaving_catch(Expr *e) {
-    return e && e->kind == E_CATCH && (e->hkind == H_RETURN || e->hkind == H_BREAK || e->hkind == H_CONTINUE);
+    return e && (e->kind == E_CATCH || e->kind == E_ORELSE) &&
+           (e->hkind == H_RETURN || e->hkind == H_BREAK || e->hkind == H_CONTINUE);
 }
 
 static void check_assign(Stmt *s) {
@@ -216,9 +217,52 @@ static void check_match(Stmt *s, bool *diverges) {
     bool all_div = true;
     bool has_else = false;
     int narms = s->arms.len;
-    if (t->kind == TY_UNION || t->kind == TY_ENUM) {
-        Decl *u = t->decl;
-        bool is_enum = t->kind == TY_ENUM;
+    Type *ref_ptr = (t->kind == TY_PTR && (t->elem->kind == TY_UNION || t->elem->kind == TY_OPT)) ? t : NULL;
+    Type *base = ref_ptr ? t->elem : t;
+    if (base->kind == TY_OPT) {
+        bool seen[2] = {false, false};
+        for (int i = 0; i < narms; i++) {
+            MatchArm *a = &s->arms.data[i];
+            if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
+            scope_push();
+            if (a->kind == P_ELSE) {
+                has_else = true;
+            } else if (a->kind == P_VARIANT) {
+                if (!strcmp(a->name, "none")) {
+                    a->variant = 0;
+                    if (seen[0]) diag_error(a->span, "E0631", "variant 'none' is matched more than once");
+                    seen[0] = true;
+                    if (a->bind) diag_error(a->bind_span, "E0633", "variant 'none' has no payload to bind");
+                } else if (!strcmp(a->name, "some")) {
+                    a->variant = 1;
+                    if (seen[1]) diag_error(a->span, "E0631", "variant 'some' is matched more than once");
+                    seen[1] = true;
+                    if (a->bind) {
+                        if (a->alt || (i + 1 < narms && s->arms.data[i + 1].alt))
+                            diag_error(a->bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
+                        else {
+                            Type *pt = ref_ptr ? type_ptr(base->elem, ref_ptr->mut) : base->elem;
+                            a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
+                        }
+                    }
+                } else {
+                    diag_error(a->span, "E0632", "%s has no variant '%s' (expected 'none' or 'some')",
+                               type_str(base), a->name);
+                }
+            } else {
+                diag_error(a->span, "E0634", "this pattern cannot match a value of optional type %s", type_str(base));
+            }
+            if (!a->alt && !check_block(a->body)) all_div = false;
+            scope_pop();
+        }
+        if (!has_else) {
+            if (!seen[0] && !seen[1]) diag_error(s->span, "E0630", "non-exhaustive match: missing .none, .some");
+            else if (!seen[0]) diag_error(s->span, "E0630", "non-exhaustive match: missing .none");
+            else if (!seen[1]) diag_error(s->span, "E0630", "non-exhaustive match: missing .some");
+        }
+    } else if (base->kind == TY_UNION || base->kind == TY_ENUM) {
+        Decl *u = base->decl;
+        bool is_enum = base->kind == TY_ENUM;
         bool *seen = NEWN(bool, u->variants.len + 1);
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
@@ -229,7 +273,7 @@ static void check_match(Stmt *s, bool *diverges) {
             } else if (a->kind == P_VARIANT) {
                 int v = find_variant(u, a->name);
                 if (v < 0) {
-                    diag_error(a->span, "E0632", "%s has no %s '%s'", type_str(t), is_enum ? "member" : "variant", a->name);
+                    diag_error(a->span, "E0632", "%s has no %s '%s'", type_str(base), is_enum ? "member" : "variant", a->name);
                 } else {
                     a->variant = v;
                     a->ival = u->variants.data[v].value;
@@ -237,19 +281,22 @@ static void check_match(Stmt *s, bool *diverges) {
                         diag_error(a->span, "E0631", "%s '%s' is matched more than once", is_enum ? "member" : "variant",
                                    a->name);
                     seen[v] = true;
-                    Type *pt = is_enum ? NULL : type_variant(t, v);
+                    Type *pt = is_enum ? NULL : type_variant(base, v);
                     if (a->bind) {
                         if (!pt)
                             diag_error(a->bind_span, "E0633", "%s '%s' has no payload to bind",
                                        is_enum ? "enum member" : "variant", a->name);
                         else if (a->alt || (i + 1 < narms && s->arms.data[i + 1].alt))
                             diag_error(a->bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
-                        else a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
+                        else {
+                            Type *bt = ref_ptr ? type_ptr(pt, ref_ptr->mut) : pt;
+                            a->bind_local = declare_local(a->bind, a->bind_span, bt, false, false);
+                        }
                     }
                 }
             } else {
                 diag_error(a->span, "E0634", "this pattern cannot match a value of %s type %s", is_enum ? "enum" : "union",
-                           type_str(t));
+                           type_str(base));
             }
             if (!a->alt && !check_block(a->body)) all_div = false;
             scope_pop();
@@ -343,7 +390,7 @@ static void check_match(Stmt *s, bool *diverges) {
     } else {
         if (t->kind != TY_INVALID)
             diag_error(s->e->span, "E0634",
-                       "cannot match on a value of type %s (only unions, enums, integers, bool and error)",
+                       "cannot match on a value of type %s (only unions, optionals, *union, *optional, enums, integers, bool and error)",
                        type_str(t));
         for (int i = 0; i < narms; i++) {
             if (s->arms.data[i].alt) continue;
@@ -462,41 +509,71 @@ bool check_stmt(Stmt *s) {
     case S_FOR: {
         Type *vt;
         if (s->e2) {
-            Type *a = check_expr(s->e, NULL);
-            Type *b = check_expr(s->e2, ty_is_untyped(a) ? NULL : a);
-            if (ty_is_untyped(a) && !ty_is_untyped(b)) {
-                coerce(&s->e, b);
-                a = b;
-            } else if (!ty_is_untyped(a) && ty_is_untyped(b)) {
-                coerce(&s->e2, a);
-                b = a;
-            } else if (ty_is_untyped(a) && ty_is_untyped(b)) {
-                Diag *d = diag_error(s->e->span, "E0502", "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
-                (void)d;
-                a = b = t_invalid;
+            if (s->ref_iter) {
+                diag_error(s->span, "E0706", "by-reference 'for &' cannot iterate over a range");
+                check_expr(s->e, NULL);
+                check_expr(s->e2, NULL);
+                vt = t_invalid;
+            } else {
+                Type *a = check_expr(s->e, NULL);
+                Type *b = check_expr(s->e2, ty_is_untyped(a) ? NULL : a);
+                if (ty_is_untyped(a) && !ty_is_untyped(b)) {
+                    coerce(&s->e, b);
+                    a = b;
+                } else if (!ty_is_untyped(a) && ty_is_untyped(b)) {
+                    coerce(&s->e2, a);
+                    b = a;
+                } else if (ty_is_untyped(a) && ty_is_untyped(b)) {
+                    Diag *d = diag_error(s->e->span, "E0502", "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
+                    (void)d;
+                    a = b = t_invalid;
+                }
+                if (a != b && a->kind != TY_INVALID && b->kind != TY_INVALID) {
+                    Diag *d = diag_error(s->e2->span, "E0412", "range bounds have different types: %s and %s", type_str(a),
+                                         type_str(b));
+                    diag_types(d, type_str(a), type_str(b));
+                }
+                if (a->kind != TY_INT && a->kind != TY_INVALID && !(a->kind == TY_PARAM && type_satisfies(a, C_INT)))
+                    diag_error(s->e->span, "E0412", "range bounds must be integers, found %s", type_str(a));
+                vt = a;
             }
-            if (a != b && a->kind != TY_INVALID && b->kind != TY_INVALID) {
-                Diag *d = diag_error(s->e2->span, "E0412", "range bounds have different types: %s and %s", type_str(a),
-                                     type_str(b));
-                diag_types(d, type_str(a), type_str(b));
-            }
-            if (a->kind != TY_INT && a->kind != TY_INVALID && !(a->kind == TY_PARAM && type_satisfies(a, C_INT)))
-                diag_error(s->e->span, "E0412", "range bounds must be integers, found %s", type_str(a));
-            vt = a;
         } else {
             Type *t = check_expr(s->e, NULL);
-            if (t->kind == TY_ARRAY) {
-                vt = t->elem;
-                if (!is_place(s->e)) {
-                    // iterating a temporary array is fine: codegen spills it
+            if (s->ref_iter) {
+                if (t->kind == TY_SLICE) {
+                    if (s->ref_mut && !t->mut)
+                        diag_error(s->e->span, "E0701", "cannot take '*mut' elements from immutable slice %s",
+                                   type_str(t));
+                    vt = type_ptr(t->elem, s->ref_mut);
+                } else if (t->kind == TY_ARRAY) {
+                    if (s->ref_mut) {
+                        if (!is_place(s->e))
+                            diag_error(s->e->span, "E0703", "'&mut' cannot take the address of a temporary");
+                        else if (!is_mut_place(s->e))
+                            diag_error(s->e->span, "E0701", "cannot take '*mut' elements from an immutable array");
+                    }
+                    if (is_place(s->e)) mark_addr_taken(s->e);
+                    vt = type_ptr(t->elem, s->ref_mut);
+                } else {
+                    if (t->kind != TY_INVALID)
+                        diag_error(s->e->span, "E0412", "'for &%s in' needs an array or slice, found %s",
+                                   s->ref_mut ? "mut x" : "x", type_str(t));
+                    vt = t_invalid;
                 }
-            } else if (t->kind == TY_SLICE) {
-                vt = t->elem;
             } else {
-                if (t->kind != TY_INVALID)
-                    diag_error(s->e->span, "E0412", "'for x in' needs an array or slice, found %s (use lo..hi for ranges)",
-                               type_str(t));
-                vt = t_invalid;
+                if (t->kind == TY_ARRAY) {
+                    vt = t->elem;
+                    if (!is_place(s->e)) {
+                        // iterating a temporary array is fine: codegen spills it
+                    }
+                } else if (t->kind == TY_SLICE) {
+                    vt = t->elem;
+                } else {
+                    if (t->kind != TY_INVALID)
+                        diag_error(s->e->span, "E0412", "'for x in' needs an array or slice, found %s (use lo..hi for ranges)",
+                                   type_str(t));
+                    vt = t_invalid;
+                }
             }
         }
         scope_push();
