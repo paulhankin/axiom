@@ -1,0 +1,403 @@
+// =============================================================================
+// std/net/http/client.ax - HTTP client URLs, options, responses, proxies, and
+// convenience helpers (part of std/net/http).
+// =============================================================================
+
+import "../../fmt.ax" as fmt;
+import "../../mem.ax" as mem;
+import "../../os.ax" as os;
+import "../../str.ax" as strs;
+import "../../sync.ax" as sync;
+import "../cookie.ax" as cookie;
+import "../tls.ax" as tls;
+import "../url.ax" as urls;
+
+// -----------------------------------------------------------------------------
+// The client
+// -----------------------------------------------------------------------------
+
+/// The parts of an http:// or https:// URL.
+pub struct Url {
+    pub hostname: []u8,
+    pub port: u16,
+    pub target: []u8,  // path and query, "/" if empty
+    pub secure: bool,  // https
+}
+
+/// Parses "http[s]://hostname[:port][/path][?query]" (with std/net/url;
+/// no user information or IPv6 addresses, and the scheme in lowercase).
+pub fn parse_url(text: []u8) HttpParseError!Url {
+    let u = urls.parse(text) catch return error.BadUrl;
+    let secure = strs.eq(u.scheme, "https");
+    if (not secure and not strs.eq(u.scheme, "http")) or not u.has_authority or u.has_userinfo or u.ip_literal {
+        return error.BadUrl;
+    }
+    // the target is the path and query, which end the text but for a fragment
+    let mut end = text.len;
+    if u.has_fragment {
+        end -= u.fragment.len + 1;
+    }
+    let mut target = text[end - u.path.len..end];
+    if u.has_query {
+        target = text[(end - u.query.len) - (u.path.len + 1)..end];
+        if u.path.len == 0 {
+            return error.BadUrl;  // "http://h?q"
+        }
+    }
+    if target.len == 0 {
+        target = "/";
+    }
+    let mut port: u16 = 80;
+    if secure {
+        port = 443;
+    }
+    if u.has_port {
+        port = u.port_number() catch return error.BadUrl;  // (also for an empty port)
+    }
+    if u.hostname.len == 0 {
+        return error.BadUrl;
+    }
+    // a host name or an IPv4 address: letters, digits, '-' and '.'
+    for ch in u.hostname {
+        if not (strs.is_alnum(ch) or (ch == '-') or (ch == '.')) {
+            return error.BadUrl;
+        }
+    }
+    return Url.{ hostname: u.hostname, port: port, target: target, secure: secure };
+}
+
+/// A response received by the client. It owns its memory: call deinit.
+pub struct ClientResponse {
+    pub status: u16,
+    reason: []u8,
+    headers: []Header,
+    body: []u8,
+    head_mem: []mut u8,
+    header_mem: []mut Header,
+    body_mem: strs.String,
+
+    /// The first header called `name` (case-insensitive), or .none.
+    pub fn header(self: *ClientResponse, name: []u8) ?[]u8 {
+        return find_header(self.headers, name);
+    }
+
+    pub fn deinit(self: *mut ClientResponse) void {
+        mem.free(self.head_mem);
+        mem.free(self.header_mem);
+        self.body_mem.deinit();
+    }
+}
+
+/// Client limits and timeouts.
+pub struct ClientOptions {
+    pub timeout_ms: u32,
+    max_body_bytes: usize,
+    pub tls_config: *tls.ClientConfig,  // for https (see with_tls)
+    pub has_tls_config: bool,
+    http2: bool,           // offer HTTP/2 (ALPN "h2"; for http://, assume it)
+    max_redirects: u32,    // redirects followed (0: the 3xx response is returned)
+    jar: *mut cookie.Jar,  // see with_cookies
+    has_jar: bool,
+    proxy: *Proxy,  // see with_proxy
+    has_proxy: bool,
+
+    pub fn default() ClientOptions {
+        return ClientOptions.{
+            timeout_ms: 30000,
+            max_body_bytes: 1073741824,
+            tls_config: @ptr_from_int(*tls.ClientConfig, 8),
+            has_tls_config: false,
+            http2: false,
+            max_redirects: 10,
+            jar: @ptr_from_int(*mut cookie.Jar, 8),
+            has_jar: false,
+            proxy: @ptr_from_int(*Proxy, 8),
+            has_proxy: false,
+        };
+    }
+
+    /// These options, with HTTP/2 when the server speaks it: https://
+    /// servers that agree to "h2" by ALPN; http:// ones are assumed to
+    /// speak it ("prior knowledge"), so use this only for those that do.
+    pub fn with_http2(self: ClientOptions) ClientOptions {
+        let mut o = self;
+        o.http2 = true;
+        return o;
+    }
+
+    /// These options with https:// connections using cfg (which must
+    /// outlive the requests) rather than the system's root certificates.
+    pub fn with_tls(self: ClientOptions, cfg: *tls.ClientConfig) ClientOptions {
+        let mut o = self;
+        o.tls_config = cfg;
+        o.has_tls_config = true;
+        return o;
+    }
+
+    /// These options following at most n redirects (301, 302, 303, 307 and
+    /// 308 with a Location; 10 by default, 0 returns the redirect itself).
+    pub fn with_redirects(self: ClientOptions, n: u32) ClientOptions {
+        let mut o = self;
+        o.max_redirects = n;
+        return o;
+    }
+
+    /// These options keeping cookies in jar (which must outlive the
+    /// requests): Set-Cookie headers of every response, redirects
+    /// included, are stored, and a Cookie header is sent from it.
+    pub fn with_cookies(self: ClientOptions, jar: *mut cookie.Jar) ClientOptions {
+        let mut o = self;
+        o.jar = jar;
+        o.has_jar = true;
+        return o;
+    }
+
+    /// These options sending requests through the proxies of p (which
+    /// must outlive the requests), for example Proxy.from_env().
+    pub fn with_proxy(self: ClientOptions, p: *Proxy) ClientOptions {
+        let mut o = self;
+        o.proxy = p;
+        o.has_proxy = true;
+        return o;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Proxies
+// -----------------------------------------------------------------------------
+
+/// The HTTP proxies to use: one for http:// requests and one for https://
+/// ones (tunnelled with CONNECT), each "http://[user:password@]host[:port]"
+/// (or "host:port"; the port defaults to 80) or empty for none, and hosts
+/// to reach directly: NO_PROXY's comma-separated list of names ("example.com"
+/// also covers its subdomains; a leading "." or "*." is ignored), names
+/// with ":port", or "*" for all. localhost and loopback addresses are
+/// always reached directly.
+pub struct Proxy {
+    buf: strs.String,  // the http proxy, the https proxy, the exclusions
+    http_end: usize,
+    https_end: usize,
+
+    /// No proxy.
+    pub fn none() Proxy {
+        return Proxy.{ buf: strs.String.init(), http_end: 0, https_end: 0 };
+    }
+
+    /// Every request through the proxy at url.
+    pub fn to(url: []u8) { BadUrl, Unsupported, OutOfMemory }!Proxy {
+        return Proxy.init(url, url, "");
+    }
+
+    /// The proxies for http:// and https:// requests ("" for none) and the
+    /// hosts to reach directly, as NO_PROXY lists them.
+    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) { BadUrl, Unsupported, OutOfMemory }!Proxy {
+        if http_url.len > 0 {
+            _ = parse_proxy_url(http_url)!;
+        }
+        if https_url.len > 0 {
+            _ = parse_proxy_url(https_url)!;
+        }
+        let mut p = Proxy.none();
+        p.buf.push_str(http_url) catch |e| {
+            p.deinit();
+            return e;
+        };
+        p.http_end = p.buf.len();
+        p.buf.push_str(https_url) catch |e| {
+            p.deinit();
+            return e;
+        };
+        p.https_end = p.buf.len();
+        p.buf.push_str(no_proxy) catch |e| {
+            p.deinit();
+            return e;
+        };
+        return p;
+    }
+
+    /// The proxies the environment names: HTTP_PROXY, HTTPS_PROXY and
+    /// NO_PROXY (or their lower-case forms). HTTP_PROXY is ignored when
+    /// REQUEST_METHOD is set, in a CGI program, where a client's "Proxy:"
+    /// header would arrive as HTTP_PROXY ("httpoxy").
+    pub fn from_env() HttpError!Proxy {
+        let cgi = os.has_env("REQUEST_METHOD");
+        let mut h = env_either("HTTP_PROXY", "http_proxy")!;
+        defer mem.free(h);
+        if cgi {
+            h = h[..0];
+        }
+        let hs = env_either("HTTPS_PROXY", "https_proxy")!;
+        defer mem.free(hs);
+        let np = env_either("NO_PROXY", "no_proxy")!;
+        defer mem.free(np);
+        return Proxy.init(h, hs, np);
+    }
+
+    pub fn deinit(self: *mut Proxy) void {
+        self.buf.deinit();
+    }
+
+    /// The proxy a request for u goes through, or "" to go directly.
+    pub fn url_for(self: *Proxy, u: Url) []u8 {
+        let b = self.buf.bytes();
+        let mut p = b[..self.http_end];
+        if u.secure {
+            p = b[self.http_end..self.https_end];
+        }
+        if (p.len == 0) or is_loopback(u.hostname) or excluded(b[self.https_end..], u.hostname, u.port) {
+            return "";
+        }
+        return p;
+    }
+}
+
+fn env_either(upper: []u8, lower: []u8) HttpError![]mut u8 {
+    return os.getenv(upper) catch |e| {
+        if e != error.NotFound {
+            return e;
+        }
+        return os.getenv(lower) catch |e2| {
+            if e2 != error.NotFound {
+                return e2;
+            }
+            return mem.alloc.[u8](0);
+        };
+    };
+}
+
+fn is_loopback(hostname: []u8) bool {
+    return strs.eq_ignore_case(hostname, "localhost") or strs.starts_with(hostname, "127.") or strs.eq(hostname, "::1");
+}
+
+// Whether NO_PROXY's list excludes hostname:port.
+fn excluded(list: []u8, hostname: []u8, port: u16) bool {
+    let mut it = strs.split(list, ",");
+    loop {
+        let piece = it.next() ?? return false;
+        let mut e = strs.trim(piece);
+        if e.len == 0 {
+            continue;
+        }
+        if strs.eq(e, "*") {
+            return true;
+        }
+        let colon = strs.last_index_of_byte(e, ':') ?? e.len;
+        if colon < e.len {
+            let want = fmt.parse_int.[u16](e[colon + 1..]) catch continue;
+            if want != port {
+                continue;
+            }
+            e = e[..colon];
+        }
+        e = strs.strip_prefix(e, "*") ?? e;
+        e = strs.strip_prefix(e, ".") ?? e;
+        if e.len == 0 {
+            continue;
+        }
+        if strs.eq_ignore_case(hostname, e) {
+            return true;
+        }
+        if (hostname.len > e.len) and (hostname[(hostname.len - e.len) - 1] == '.') and
+           strs.eq_ignore_case(hostname[hostname.len - e.len..], e) {
+            return true;
+        }
+    }
+}
+
+// A proxy's address and credentials.
+struct ProxyAddr {
+    hostname: []u8,
+    port: u16,
+    user: []u8,  // percent-encoded, as in the URL
+    password: []u8,
+    has_auth: bool,
+}
+
+fn parse_proxy_url(text: []u8) { BadUrl, Unsupported }!ProxyAddr {
+    let t = text;
+    if not strs.contains(t, "://") {
+        // "[user:password@]host[:port][/]"
+        let mut rest = t;
+        if (rest.len > 0) and (rest[rest.len - 1] == '/') {
+            rest = rest[..rest.len - 1];
+        }
+        let mut a = ProxyAddr.{ hostname: "", port: 80, user: "", password: "", has_auth: false };
+        let at = strs.last_index_of_byte(rest, '@') ?? rest.len;
+        if at < rest.len {
+            let info = rest[..at];
+            let c = strs.index_of_byte(info, ':') ?? info.len;
+            a.user = info[..c];
+            a.password = info[@min(c + 1, info.len)..];
+            a.has_auth = true;
+            rest = rest[at + 1..];
+        }
+        let colon = strs.last_index_of_byte(rest, ':') ?? rest.len;
+        if colon < rest.len {
+            a.port = fmt.parse_int.[u16](rest[colon + 1..]) catch return error.BadUrl;
+            rest = rest[..colon];
+        }
+        if rest.len == 0 {
+            return error.BadUrl;
+        }
+        for ch in rest {
+            if not (strs.is_alnum(ch) or (ch == '-') or (ch == '.')) {
+                return error.BadUrl;
+            }
+        }
+        a.hostname = rest;
+        return a;
+    }
+    let u = urls.parse(t) catch return error.BadUrl;
+    if not strs.eq_ignore_case(u.scheme, "http") {
+        return error.Unsupported;  // https:// proxies (TLS to the proxy) are not spoken
+    }
+    if not u.has_authority or (u.hostname.len == 0) or u.ip_literal {
+        return error.BadUrl;
+    }
+    let mut port: u16 = 80;
+    if u.has_port {
+        port = u.port_number() catch return error.BadUrl;
+    }
+    let mut a = ProxyAddr.{ hostname: u.hostname, port: port, user: "", password: "", has_auth: u.has_userinfo };
+    if u.has_userinfo {
+        a.user = u.username();
+        a.password = u.password() catch "";
+    }
+    return a;
+}
+
+// The configuration for https:// by default, trusting the system's roots,
+// made the first time it is needed.
+let mut SYSTEM_TLS_LOCK: sync.Mutex = sync.MUTEX_INIT;
+let mut SYSTEM_TLS: usize = 0;
+
+pub fn system_tls() HttpError!*tls.ClientConfig {
+    SYSTEM_TLS_LOCK.lock();
+    defer SYSTEM_TLS_LOCK.unlock();
+    if SYSTEM_TLS == 0 {
+        // kept until the program ends: not a leak
+        mem.leaks_ignored(true);
+        defer mem.leaks_ignored(false);
+        let p = mem.new.[tls.ClientConfig]()!;
+        p.* = tls.ClientConfig.system() catch |e| {
+            mem.destroy(p);
+            return e;
+        };
+        SYSTEM_TLS = @int_from_ptr(p);
+    }
+    return @ptr_from_int(*tls.ClientConfig, SYSTEM_TLS);
+}
+
+pub fn get(url: []u8) !ClientResponse {
+    return request("GET", url, no_headers(), "", ClientOptions.default());
+}
+
+pub fn post(url: []u8, content_type: []u8, body: []u8) !ClientResponse {
+    let hs: [1]Header = [Header.{ name: "Content-Type", value: content_type }];
+    return request("POST", url, hs[..], body, ClientOptions.default());
+}
+
+/// An empty header list, for request().
+pub fn no_headers() []Header {
+    return [];
+}

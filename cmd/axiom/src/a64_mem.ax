@@ -1,0 +1,618 @@
+// =============================================================================
+// a64_mem.ax - loads, stores, bulk memory ops, and atomics, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "mach.ax" as mc;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Memory
+// -----------------------------------------------------------------------------
+fn size_code(sz: u8) u64 {
+    if sz == 1 {
+        return 0;
+    }
+    if sz == 2 {
+        return 1;
+    }
+    if sz == 4 {
+        return 2;
+    }
+    return 3;
+}
+
+// A register holding the address of memory operand m.
+fn base_reg(m: mc.MOp) i32 {
+    if (m.base >= 0) and (m.index < 0) and (m.disp == 0) and (m.slot < 0) and (m.sym < 0) {
+        return m.base;
+    }
+    let r = vgpr();
+    _ = e2(LEA, 8, W(r), m);
+    return r;
+}
+
+fn gen_load(v: *mut ir.Value) void {
+    let t = v.ty;
+    let d = vreg(v);
+    let m = addr(v.a);
+    let k = t.kind;
+    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) and (ir.order(v) != ir.ORD_RELAXED) {
+        // (the C11 mapping: a sequentially consistent load is LDAR, which
+        // the STLR of a seq_cst store before it waits for; an acquire one
+        // LDAPR where RCpc is (no such wait), else LDAR. A relaxed one is
+        // a plain LDR, below: aligned, it is single-copy atomic.)
+        let b = base_reg(m);
+        let sc = size_code(is.mem_size(t));
+        if (ir.order(v) == ir.ORD_ACQUIRE) and tg.has(tg.A_RCPC) {
+            _ = raw(ae.ldapr(sc, 0, 0), W(d), R(b), NONE(), NONE());
+        } else {
+            _ = raw(ae.ldar(sc, 0, 0), W(d), R(b), NONE(), NONE());
+        }
+        return;
+    }
+    if k == ir.T_VEC {
+        _ = e2(FLDR, 16, W(d), m);
+        return;
+    }
+    if k == ir.T_FLOAT {
+        _ = e2(FLDR, @truncate(u8, t.size), W(d), m);
+        return;
+    }
+    _ = e2(LDR, is.mem_size(t), W(d), m);
+}
+
+fn gen_store(v: *mut ir.Value) void {
+    let x = v.a;
+    let t = x.ty;
+    let m = addr(v.b);
+    let k = t.kind;
+    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) and (ir.order(v) != ir.ORD_RELAXED) {
+        // (a relaxed store is a plain STR, below)
+        let b = base_reg(m);
+        let r = reg(x);
+        // STLR alone: with LDAR for atomic loads and the *AL read-modify-writes, it is
+        // sequentially consistent (the ARMv8 mapping of C++'s seq_cst store).
+        _ = raw(ae.stlr(size_code(is.mem_size(t)), 0, 0), R(r), R(b), NONE(), NONE());
+        return;
+    }
+    if k == ir.T_VEC {
+        _ = e2(FSTR, 16, m, R(reg(x)));
+        return;
+    }
+    if k == ir.T_FLOAT {
+        _ = e2(FSTR, @truncate(u8, t.size), m, R(reg(x)));
+        return;
+    }
+    if is.is_c(x) and (is.cval(x) == 0) {
+        _ = e2(STR, is.mem_size(t), m, I(0));
+        return;
+    }
+    _ = e2(STR, is.mem_size(t), m, R(reg(x)));
+}
+
+// The floating-point environment (IN_FPENV_GET, IN_FPENV_SET): FPCR at the
+// 8 bytes' first 4, FPSR at the next (mrs / msr, through a register).
+fn gen_fpenv(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let m = addr(v.xs.get(0));
+    let t = vgpr();
+    if id == ir.IN_FPENV_GET {
+        raw(0xd53b4400, W(t), NONE(), NONE(), NONE()).keep = true;  // mrs t, fpcr
+        _ = e2(STR, 4, m, R(t));
+        let u2 = vgpr();
+        raw(0xd53b4420, W(u2), NONE(), NONE(), NONE()).keep = true;  // mrs u2, fpsr
+        _ = e2(STR, 4, at(m, 4), R(u2));
+        return;
+    }
+    _ = e2(LDR, 4, W(t), m);
+    raw(0xd51b4400, R(t), NONE(), NONE(), NONE()).keep = true;  // msr fpcr, t
+    let u2 = vgpr();
+    _ = e2(LDR, 4, W(u2), at(m, 4));
+    raw(0xd51b4420, R(u2), NONE(), NONE(), NONE()).keep = true;  // msr fpsr, u2
+}
+
+// prfm pldl1keep (IN_PREFETCH) or pstl1keep (IN_PREFETCHW) at the address.
+fn gen_prefetch(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let i = e1(PRFM, 8, addr(v.xs.get(0)));
+    if id == ir.IN_PREFETCHW {
+        i.cc = 0x10;
+    }
+}
+
+fn raw_none(w: u64) void {
+    _ = raw(w, NONE(), NONE(), NONE(), NONE());
+}
+
+fn at(m: mc.MOp, k: i64) mc.MOp {
+    let mut x = m;
+    x.disp += k;
+    return x;
+}
+
+// A call to a C library function with integer arguments in x0-x2.
+fn call_lib(name: []u8, args: []i32) void {
+    let mut ops = u.List.[mc.MOp].empty();
+    ops.push(mc.symop(lib_sym(name), 0));
+    for k in 0..args.len {
+        let m = e2(MOV, 8, W(@int_cast(i32, k)), R(args[k]));
+        m.is_move = true;
+        ops.push(R(@int_cast(i32, k)));
+    }
+    let ci = emit(CALL, 0, ops.items());
+    ci.clobber = caller_saved();
+    FN.mf.has_calls = true;
+}
+
+// memcpy / memmove / memset. Forward copies and fills of a constant size
+// up to 2 KiB beyond those below are loops of Q-register pairs (pair_loop),
+// the others calls. Copies of a constant size up to 128 bytes are
+// 16-, 8-, 4-, 2- and 1-byte loads and stores: for memcpy, and memmove of
+// operands the same or apart (ir.same_or_apart), each store after its
+// load (a forward copy, which copies the same bytes onto themselves); for
+// other memmoves all loads first, so that overlapping operands read the
+// source before any of it is written.
+fn gen_memop(v: *mut ir.Value) void {
+    let o = v.op;
+    let fwd = (o == ir.OP_MEMCPY) or ir.same_or_apart(v);
+    if (o != ir.OP_MEMSET) and is.is_c(v.c) and (is.cval(v.c) >= 0) and (is.cval(v.c) <= 128) {
+        let n = is.cval(v.c);
+        let dm = addr(v.a);
+        let sm = addr(v.b);
+        let mut regs: [16]i32 = [0; 16];
+        let mut offs: [16]i64 = [0; 16];
+        let mut wds: [16]i64 = [0; 16];
+        let mut m: usize = 0;
+        let mut k: i64 = 0;
+        while k < n {
+            let rem = n - k;
+            let mut w: i64 = 16;
+            while w > rem {
+                w = w / 2;
+            }
+            if w == 16 {
+                regs[m] = vvr();
+                _ = e2(FLDR, 16, W(regs[m]), at(sm, k));
+            } else {
+                regs[m] = vgpr();
+                _ = e2(LDR, @truncate(u8, @bit_cast(u64, w)), W(regs[m]), at(sm, k));
+            }
+            offs[m] = k;
+            wds[m] = w;
+            m += 1;
+            k += w;
+            if fwd or (k == n) {
+                for j in 0..m {
+                    if wds[j] == 16 {
+                        _ = e2(FSTR, 16, at(dm, offs[j]), R(regs[j]));
+                    } else {
+                        _ = e2(STR, @truncate(u8, @bit_cast(u64, wds[j])), at(dm, offs[j]), R(regs[j]));
+                    }
+                }
+                m = 0;
+            }
+        }
+        return;
+    }
+    if (o == ir.OP_MEMSET) and is.is_c(v.c) and (is.cval(v.c) <= 64) and is.is_c(v.b) {
+        let n = is.cval(v.c);
+        let dm = addr(v.a);
+        let byte = is.cval(v.b) & 0xff;
+        let pat = byte *% 0x0101_0101_0101_0101;
+        let t = vgpr();
+        movi(t, pat, 1);
+        let mut k: i64 = 0;
+        while k < n {
+            let mut w: i64 = 8;
+            while w > (n - k) {
+                w = w / 2;
+            }
+            _ = e2(STR, @truncate(u8, @bit_cast(u64, w)), at(dm, k), R(t));
+            k += w;
+        }
+        return;
+    }
+    if is.is_c(v.c) and (is.cval(v.c) > 64) and (is.cval(v.c) <= 2048) and
+       (((o == ir.OP_MEMSET) and is.is_c(v.b)) or ((o != ir.OP_MEMSET) and fwd)) {
+        pair_loop(v, is.cval(v.c));
+        return;
+    }
+    let args: [3]i32 = [reg(v.a), reg(v.b), reg(v.c)];
+    if o == ir.OP_MEMSET {
+        call_lib("memset", args[..]);
+    } else if o == ir.OP_MEMCPY {
+        call_lib("memcpy", args[..]);
+    } else {
+        call_lib("memmove", args[..]);
+    }
+}
+
+// LDP / STP of two Q registers (Rt in the Rd field, Rt2 in the Ra field, Rn
+// the base): mode 1 post-index (the base moves by imm after the access),
+// 2 signed offset; imm a multiple of 16 in -1024..1008.
+fn pair_q(load: bool, mode: u64, imm: i64) u64 {
+    let mut w: u64 = 0xAC00_0000 | (mode << 23);
+    if load {
+        w = w | (1 << 22);
+    }
+    return w | ((@bit_cast(u64, imm / 16) & 0x7f) << 15);
+}
+
+// A forward copy (memcpy, or memmove of operands the same or apart) of n
+// bytes, 128 < n <= 2048, or a fill of n bytes, 64 < n <= 2048, with a
+// constant byte: a loop of two LDP / STP pairs of Q registers (64 bytes) an
+// iteration, n / 64 times, the pointers moved by the second pair
+// (post-index); then, when n % 64 is not 0, the last 64 bytes from the
+// pointers moved back by 64 - n % 64 (overlapping the loop's last bytes,
+// which then hold what the source has there, and so right for operands
+// that are the same). Destinations are not aligned first: on AArch64
+// processors an unaligned Q store costs about as much as an aligned one
+// (only crossing a cache line costs more), unlike x86-64's copy_loop.
+fn pair_loop(v: *mut ir.Value, n: i64) void {
+    let set = v.op == ir.OP_MEMSET;
+    let pd = vgpr();
+    copy(pd, reg(v.a), GPR);
+    let mut ps: i32 = -1;
+    let mut q: [4]i32 = [-1; 4];
+    if set {
+        // the byte in every lane (movi #0 for zeros)
+        q[0] = vvr();
+        let byte = is.cval(v.b) & 0xff;
+        if byte == 0 {
+            raw1(ae.movi_zero(0), q[0]);
+        } else {
+            let b = vgpr();
+            movi(b, byte, 0);
+            raw2(ae.dup_gen(0, 0, 0), q[0], b);
+        }
+        q[1] = q[0];
+        q[2] = q[0];
+        q[3] = q[0];
+    } else {
+        ps = vgpr();
+        copy(ps, reg(v.b), GPR);
+    }
+    let cnt = vgpr();
+    movi(cnt, n / 64, 1);
+    let lp = new_label();
+    place(lp);
+    pair_step(set, ps, pd, q, 64);
+    add_imm(1, cnt, cnt, -1);
+    // (live across the back edge: the pointers, a fill's pattern)
+    let mut uses: [2]i32 = [pd, ps];
+    if set {
+        uses[1] = q[0];
+    }
+    loop_branch(CBZ, 1, cnt, lp, uses[..]);
+    let r = n % 64;
+    if r != 0 {
+        add_imm(1, pd, pd, r - 64);
+        if not set {
+            add_imm(1, ps, ps, r - 64);
+        }
+        pair_step(set, ps, pd, q, 0);
+    }
+}
+
+// 64 bytes from [ps] to [pd] (a fill: q's registers to [pd]), then the
+// pointers moved by `step` (0 or 64).
+fn pair_step(set: bool, ps: i32, pd: i32, q0: [4]i32, step: i64) void {
+    let mut q = q0;
+    let mut mode: u64 = 1;
+    let mut bs = RW(ps);
+    let mut bd = RW(pd);
+    if step == 0 {
+        mode = 2;
+        bs = R(ps);
+        bd = R(pd);
+    }
+    if not set {
+        for k in @as(usize, 0)..4 {
+            q[k] = vvr();
+        }
+        _ = raw(pair_q(true, 2, 32), W(q[0]), R(ps), NONE(), W(q[1]));
+        _ = raw(pair_q(true, mode, step), W(q[2]), bs, NONE(), W(q[3]));
+    }
+    _ = raw(pair_q(false, 2, 32), R(q[0]), R(pd), NONE(), R(q[1]));
+    _ = raw(pair_q(false, mode, step), R(q[2]), bd, NONE(), R(q[3]));
+}
+
+// -----------------------------------------------------------------------------
+// Atomics
+// -----------------------------------------------------------------------------
+// A backward (or forward) branch within a block, with fake reads of what
+// the loop uses so their registers stay allocated across it.
+fn loop_branch(op: i32, cc: i32, r: i32, l: i32, uses: []i32) void {
+    let mut ops = u.List.[mc.MOp].empty();
+    if op == CBZ {
+        ops.push(R(r));
+    }
+    ops.push(mc.label(l));
+    for x in uses {
+        ops.push(R(x));
+    }
+    let i = emit(op, 8, ops.items());
+    i.cc = cc;
+}
+
+fn gen_rmw(v: *mut ir.Value) void {
+    let o = @truncate(i32, @bit_cast(i64, v.cv));
+    let t = v.ty;
+    let msz = is.mem_size(t);
+    let sc = size_code(msz);
+    let sf = sfv(t);
+    let d = vreg(v);
+    let a = base_reg(addr(v.a));
+    let mut x = reg(v.b);
+    // (the order: acquire, release or both on the instruction, or on the
+    // exclusive load and store of the loop)
+    let acq = ir.ord_acquires(ir.order(v));
+    let rel = ir.ord_releases(ir.order(v));
+    if O.lse {
+        if o == ir.RMW_XCHG {
+            _ = raw(ae.swp(sc, acq, rel, 0, 0, 0), W(d), R(a), R(x), NONE());
+            return;
+        }
+        let mut op: u64 = 0;
+        if o == ir.RMW_SUB {
+            let n = vgpr();
+            raw_dm(ae.addsub_reg(sf, true, false, 0, 31, 0, 0, 0), n, x);
+            x = n;
+        } else if o == ir.RMW_AND {
+            let n = vgpr();
+            raw_dm(ae.logic_reg(sf, 1, true, 0, 31, 0, 0, 0), n, x);  // mvn
+            x = n;
+            op = 1;
+        } else if o == ir.RMW_OR {
+            op = 3;
+        } else if o == ir.RMW_XOR {
+            op = 2;
+        } else if o == ir.RMW_MAX {
+            op = 4;
+        } else if o == ir.RMW_MIN {
+            op = 5;
+        } else if o == ir.RMW_UMAX {
+            op = 6;
+        } else if o == ir.RMW_UMIN {
+            op = 7;
+        }
+        _ = raw(ae.ldop(sc, op, acq, rel, 0, 0, 0), W(d), R(a), R(x), NONE());
+        return;
+    }
+    // load-exclusive / store-exclusive loop
+    let sg = (o == ir.RMW_MIN) or (o == ir.RMW_MAX);
+    if (msz < 4) and ((o == ir.RMW_MIN) or (o == ir.RMW_MAX) or (o == ir.RMW_UMIN) or (o == ir.RMW_UMAX)) {
+        x = ext_reg(x, t.bits, sg, false);
+    }
+    let lp = new_label();
+    place(lp);
+    _ = raw(ae.ldxr(sc, acq, 0, 0), W(d), R(a), NONE(), NONE());
+    let mut nv = x;
+    if o != ir.RMW_XCHG {
+        nv = vgpr();
+        if o == ir.RMW_ADD {
+            raw3(ae.addsub_reg(sf, false, false, 0, 0, 0, 0, 0), nv, d, x);
+        } else if o == ir.RMW_SUB {
+            raw3(ae.addsub_reg(sf, true, false, 0, 0, 0, 0, 0), nv, d, x);
+        } else if o == ir.RMW_AND {
+            raw3(ae.logic_reg(sf, 0, false, 0, 0, 0, 0, 0), nv, d, x);
+        } else if o == ir.RMW_OR {
+            raw3(ae.logic_reg(sf, 1, false, 0, 0, 0, 0, 0), nv, d, x);
+        } else if o == ir.RMW_XOR {
+            raw3(ae.logic_reg(sf, 2, false, 0, 0, 0, 0, 0), nv, d, x);
+        } else {
+            let mut cur = d;
+            if (msz < 4) and sg {
+                cur = ext_reg(d, t.bits, true, false);
+            }
+            cmp_reg(sf, cur, x);
+            let mut cc = LT;
+            if o == ir.RMW_MAX {
+                cc = GT;
+            } else if o == ir.RMW_UMIN {
+                cc = LO;
+            } else if o == ir.RMW_UMAX {
+                cc = HI;
+            }
+            raw3(ae.csel(sf, 0, 0, 0, 0, cc64(cc)), nv, cur, x);
+        }
+    }
+    let st = vgpr();
+    _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(nv), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+    let uses: [2]i32 = [a, x];
+    loop_branch(CBZ, 1, st, lp, uses[..]);
+}
+
+fn gen_cmpxchg(v: *mut ir.Value) void {
+    let t = v.ty;
+    let msz = is.mem_size(t);
+    let sc = size_code(msz);
+    let sf = sfv(t);
+    let a = base_reg(addr(v.a));
+    let e = reg(v.b);
+    let n = reg(v.c);
+    let d = vreg(v);
+    // (one instruction for both orders: at least as strong as each)
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let acq = ir.ord_acquires(ord);
+    let rel = ir.ord_releases(ord);
+    if O.lse {
+        copy(d, e, GPR);
+        _ = raw(ae.cas(sc, acq, rel, 0, 0, 0), R(n), R(a), RW(d), NONE());
+        return;
+    }
+    let mut ex = e;
+    if msz < 4 {
+        ex = ext_reg(e, t.bits, false, false);
+    }
+    let lp = new_label();
+    let done = new_label();
+    place(lp);
+    _ = raw(ae.ldxr(sc, acq, 0, 0), W(d), R(a), NONE(), NONE());
+    cmp_reg(sf, d, ex);
+    let u1: [3]i32 = [a, ex, n];
+    let weak = (v.flags & ir.F_WEAK) != 0;
+    if weak {
+        // C's compare_exchange_weak: one attempt, which fails (IN_CMPXCHG_OK
+        // 0) when the values differ or the exclusive store does: no loop.
+        // The status is 0 on success; ok is 1 - status, or 0 when they differ.
+        let ok = cas_ok_vreg(v);
+        let st = vgpr();
+        movi(ok, 0, 0);
+        let u2: [4]i32 = [a, ex, n, ok];
+        loop_branch(BCC, NE, 0, done, u2[..]);
+        _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(n), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+        raw3(ae.logic_reg(0, 2, false, 0, 0, 0, 0, 0), ok, st, one_reg());  // eor ok, st, #1 (st is 0 or 1)
+        place(done);
+        // (on a mismatch the exclusive monitor is left open: harmless, the
+        // next exclusive load resets it; CLREX would only shorten that)
+        return;
+    }
+    loop_branch(BCC, NE, 0, done, u1[..]);
+    let st = vgpr();
+    _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(n), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+    loop_branch(CBZ, 1, st, lp, u1[..]);
+    place(done);
+}
+
+// IN_CAS16(p, e, d): an exclusive pair loop. LDAXP / LDXP reads the 16
+// bytes; if they are e's, STLXP / STXP stores d's (again if the store
+// fails); if not, the same instruction stores back what was read, which
+// makes the read single-copy atomic (an exclusive pair's load alone is not,
+// before LSE2), and the value goes to e. With LSE, one CASP: its pairs in
+// the fixed registers x0, x1 (e's bytes, then the old ones) and x2, x3
+// (d's), each pair named in the instruction by its first register and all
+// four given to the register allocator as operands of the RAW (whose
+// operands after the fourth are not encoded); e is written only when the
+// old bytes differ.
+fn gen_cas16(v: *mut ir.Value) void {
+    if O.lse {
+        gen_casp(v);
+        return;
+    }
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let acq = ir.ord_acquires(ord);
+    let rel = ir.ord_releases(ord);
+    let a = reg(v.xs.get(0));
+    let e = reg(v.xs.get(1));
+    let d = reg(v.xs.get(2));
+    let el = vgpr();
+    let eh = vgpr();
+    let dl = vgpr();
+    let dh = vgpr();
+    _ = e2(LDR, 8, W(el), mc.mem(e, -1, 0, 0));
+    _ = e2(LDR, 8, W(eh), mc.mem(e, -1, 0, 8));
+    _ = e2(LDR, 8, W(dl), mc.mem(d, -1, 0, 0));
+    _ = e2(LDR, 8, W(dh), mc.mem(d, -1, 0, 8));
+    let ok = vreg(v);
+    movi(ok, 0, 0);
+    let lo = vgpr();
+    let hi = vgpr();
+    let t1 = vgpr();
+    let t2 = vgpr();
+    let st = vgpr();
+    let lp = new_label();
+    let differ = new_label();
+    let done = new_label();
+    let uses: [9]i32 = [a, e, el, eh, dl, dh, ok, lo, hi];
+    place(lp);
+    _ = raw(ae.ldxp(acq, 0, 0, 0), W(lo), R(a), NONE(), W(hi));
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t1, lo, el);  // eor
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t2, hi, eh);
+    raw3(ae.logic_reg(1, 1, false, 0, 0, 0, 0, 0), t1, t1, t2);  // orr
+    loop_branch(CBZ, 1, t1, differ, uses[..]);
+    _ = raw(ae.stxp(rel, 0, 0, 0, 0), R(dl), R(a), mc.reg(st, mc.RD | mc.RE), R(dh));
+    loop_branch(CBZ, 1, st, lp, uses[..]);
+    movi(ok, 1, 0);
+    loop_branch(CBZ, 1, ok, done, uses[..]);  // (taken: ok is 1)
+    place(differ);
+    _ = raw(ae.stxp(rel, 0, 0, 0, 0), R(lo), R(a), mc.reg(st, mc.RD | mc.RE), R(hi));
+    loop_branch(CBZ, 1, st, lp, uses[..]);
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 0), R(lo));
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 8), R(hi));
+    place(done);
+}
+
+fn gen_casp(v: *mut ir.Value) void {
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let a = reg(v.xs.get(0));
+    let e = reg(v.xs.get(1));
+    let d = reg(v.xs.get(2));
+    let el = vgpr();
+    let eh = vgpr();
+    _ = e2(LDR, 8, W(el), mc.mem(e, -1, 0, 0));
+    _ = e2(LDR, 8, W(eh), mc.mem(e, -1, 0, 8));
+    copy(X0, el, GPR);
+    copy(X0 + 1, eh, GPR);
+    _ = e2(LDR, 8, W(X0 + 2), mc.mem(d, -1, 0, 0));
+    _ = e2(LDR, 8, W(X0 + 3), mc.mem(d, -1, 0, 8));
+    // (Rt: x2 in bits 0-4, Rn: a, Rs: x0 in bits 16-20; x1 and x3 only for
+    // the allocator)
+    let ops: [6]mc.MOp = [R(X0 + 2), R(a), RW(X0), NONE(), RW(X0 + 1), R(X0 + 3)];
+    let ci = emit(RAW, 0, ops[..]);
+    ci.aux = @bit_cast(i64, ae.casp(ir.ord_acquires(ord), ir.ord_releases(ord), 0, 0, 0));
+    let lo = vgpr();
+    let hi = vgpr();
+    copy(lo, X0, GPR);
+    copy(hi, X0 + 1, GPR);
+    let t1 = vgpr();
+    let t2 = vgpr();
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t1, lo, el);  // eor
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t2, hi, eh);
+    raw3(ae.logic_reg(1, 1, false, 0, 0, 0, 0, 0), t1, t1, t2);  // orr
+    let ok = vreg(v);
+    movi(ok, 1, 0);
+    let done = new_label();
+    let uses: [5]i32 = [e, lo, hi, ok, t1];
+    loop_branch(CBZ, 0, t1, done, uses[..]);  // (cbz: the same, stored)
+    movi(ok, 0, 0);
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 0), R(lo));
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 8), R(hi));
+    place(done);
+}
+
+// The success flags of weak compare-exchanges (IN_CMPXCHG_OK), made when the
+// cmpxchg is selected.
+struct CasOk {
+    cas: *ir.Value,
+    r: i32,
+}
+
+fn cas_ok_vreg(v: *ir.Value) i32 {
+    for x in FN.cas_oks.items() {
+        if x.cas == v {
+            return x.r;
+        }
+    }
+    let r = vgpr();
+    FN.cas_oks.push(CasOk.{ cas: v, r: r });
+    return r;
+}
+
+// A register holding 1.
+fn one_reg() i32 {
+    let r = vgpr();
+    movi(r, 1, 0);
+    return r;
+}
+
+// IN_CMPXCHG_OK(cas): whether the compare-exchange stored. Of a weak one
+// that the exclusive pair made (gen_cmpxchg), its flag; else (LSE's CAS,
+// which does not fail spuriously) whether the old value is the expected one.
+fn gen_cas_ok(v: *mut ir.Value) void {
+    let c = v.xs.get(0);
+    if ((c.flags & ir.F_WEAK) != 0) and not O.lse {
+        copy(vreg(v), cas_ok_vreg(c), GPR);
+        return;
+    }
+    let t = c.ty;
+    let mut e = reg(c.b);
+    let mut d = reg(c);
+    if is.mem_size(t) < 4 {
+        e = ext_reg(e, t.bits, false, false);
+        d = ext_reg(d, t.bits, false, false);
+    }
+    cmp_reg(sfv(t), d, e);
+    cset(vreg(v), EQ);
+}

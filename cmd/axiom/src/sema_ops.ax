@@ -1,0 +1,720 @@
+// =============================================================================
+// sema_ops.ax - constant folding and unary/binary/shift/vector operators,
+// part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Constant folding
+// ---------------------------------------------------------------------------
+fn wrap_to(v: u.I128, t: *ast.Type) u.I128 {
+    let b = @int_cast(u32, t.bits);
+    let mut x = v.lo;
+    if b < 64 {
+        x = x & ((@as(u64, 1) << b) - 1);
+        if t.is_signed and (((x >> (b - 1)) & 1) != 0) {
+            return u.I128.of(@bit_cast(i64, x | ~((@as(u64, 1) << b) - 1)));
+        }
+        return u.I128.ofu(x);
+    }
+    if t.is_signed {
+        return u.I128.of(@bit_cast(i64, x));
+    }
+    return u.I128.ofu(x);
+}
+
+fn untyped_limit() u.I128 {
+    return u.I128.pow2(100);
+}
+
+fn too_big(v: u.I128) bool {
+    return v.gt(untyped_limit()) or v.lt(untyped_limit().neg());
+}
+
+struct Folded {
+    ok: bool,
+    v: u.I128,
+}
+
+// Folds integer op. t == nil for untyped. !ok on error (reported).
+fn fold_int(op: lx.TokKind, a: u.I128, b: u.I128, t: *mut ast.Type, sp: u.Span) Folded {
+    let bad = Folded.{ ok: false, v: u.I128.zero() };
+    let typed = u.notnil(t);
+    let mut r = u.I128.zero();
+    match op {
+        .PLUS  => { r = a.add(b); }
+        .MINUS => { r = a.sub(b); }
+        .STAR => {
+            if not a.is_zero() and (too_big(b) or too_big(a)) {
+                _ = dg.err(sp, "E0530", "overflow in constant expression");
+                return bad;
+            }
+            r = a.mul(b);
+        }
+        .SLASH, .PERCENT => {
+            if b.is_zero() {
+                _ = dg.err(sp, "E0531", "division by zero in constant expression");
+                return bad;
+            }
+            if op == lx.TK_SLASH {
+                r = a.div(b);
+            } else {
+                r = a.rem(b);
+            }
+        }
+        .PLUS_PCT => {
+            r = a.add(b);
+            if typed {
+                r = wrap_to(r, t);
+            }
+        }
+        .MINUS_PCT => {
+            r = a.sub(b);
+            if typed {
+                r = wrap_to(r, t);
+            }
+        }
+        .STAR_PCT => {
+            if typed {
+                r = wrap_to(wrap_to(a, t).mul(wrap_to(b, t)), t);
+            } else {
+                r = a.mul(b);
+            }
+        }
+        .AMP => {
+            r = a.and_(b);
+            if typed {
+                r = wrap_to(r, t);
+            }
+        }
+        .PIPE => {
+            r = a.or_(b);
+            if typed {
+                r = wrap_to(r, t);
+            }
+        }
+        .CARET => {
+            r = a.xor(b);
+            if typed {
+                r = wrap_to(r, t);
+            }
+        }
+        .SHL => {
+            if typed {
+                if not b.lt(u.I128.of(@as(i64, t.bits))) {
+                    r = u.I128.zero();
+                } else {
+                    r = wrap_to(a.shl(@truncate(u32, b.lo)), t);
+                }
+            } else {
+                if b.gti(100) {
+                    _ = dg.err(sp, "E0530", "overflow in constant expression");
+                    return bad;
+                }
+                r = a.shl(@truncate(u32, b.lo));
+            }
+        }
+        .SHR => {
+            if not b.lti(120) {
+                if a.is_neg() {
+                    r = u.I128.of(-1);
+                } else {
+                    r = u.I128.zero();
+                }
+            } else {
+                r = a.sar(@truncate(u32, b.lo));
+            }
+        }
+        else => { return bad; }
+    }
+    if typed and not fits_type(r, t) {
+        _ = dg.err(sp, "E0530", u.f2("overflow in constant expression: %s does not fit in %s", r.str(), tstr(t)));
+        return bad;
+    }
+    if not typed and too_big(r) {
+        _ = dg.err(sp, "E0530", "constant expression is too large");
+        return bad;
+    }
+    return Folded.{ ok: true, v: r };
+}
+
+// ---------------------------------------------------------------------------
+// Operators
+// ---------------------------------------------------------------------------
+fn is_shift_op(op: lx.TokKind) bool {
+    return (op == lx.TK_SHL) or (op == lx.TK_SHR);
+}
+
+fn param_has(t: *ast.Type, c: i32) bool {
+    return (t.kind == ast.TY_PARAM) and ty.satisfies(t, c);
+}
+
+fn is_vec_param(t: *ast.Type) bool {
+    return (t.kind == ast.TY_PARAM) and not t.is_const and ty.satisfies(t, ast.C_VEC);
+}
+
+fn lane_is_float(lane: *ast.Type) bool {
+    return u.notnil(lane) and ((lane.kind == ast.TY_FLOAT) or param_has(lane, ast.C_FLOAT));
+}
+
+fn lane_is_int(lane: *ast.Type) bool {
+    return u.notnil(lane) and ((lane.kind == ast.TY_INT) or param_has(lane, ast.C_INT));
+}
+
+fn lane_is_signed(lane: *ast.Type) bool {
+    return lane_is_float(lane) or
+           (u.notnil(lane) and (((lane.kind == ast.TY_INT) and lane.is_signed) or param_has(lane, ast.C_SIGNED)));
+}
+
+fn lane_is_unsigned_int(lane: *ast.Type) bool {
+    return u.notnil(lane) and (((lane.kind == ast.TY_INT) and not lane.is_signed) or param_has(lane, ast.C_UNSIGNED));
+}
+
+fn lane_mul_ok(lane: *ast.Type) bool {
+    return lane_is_float(lane) or (u.notnil(lane) and (lane.kind == ast.TY_INT) and (lane.bits != 8));
+}
+
+fn is_int_vec_param(t: *ast.Type) bool {
+    return param_has(t, ast.C_INT_VEC) or (param_has(t, ast.C_VEC) and lane_is_int(t.constraint_lane));
+}
+
+fn vec_param_allows_arith(op: lx.TokKind, t: *ast.Type) bool {
+    if not param_has(t, ast.C_VEC) {
+        return false;
+    }
+    let lane = t.constraint_lane;
+    if (op == lx.TK_PLUS) or (op == lx.TK_MINUS) {
+        return true;
+    }
+    if op == lx.TK_STAR {
+        return param_has(t, ast.C_FLOAT_VEC) or lane_mul_ok(lane);
+    }
+    if op == lx.TK_SLASH {
+        return param_has(t, ast.C_FLOAT_VEC) or lane_is_float(lane);
+    }
+    if (op == lx.TK_PLUS_PCT) or (op == lx.TK_MINUS_PCT) or (op == lx.TK_AMP) or (op == lx.TK_PIPE) or
+       (op == lx.TK_CARET) {
+        return is_int_vec_param(t);
+    }
+    if op == lx.TK_STAR_PCT {
+        return is_int_vec_param(t) and u.notnil(lane) and (lane.kind == ast.TY_INT) and (lane.bits != 8);
+    }
+    return false;
+}
+
+// Validate that arithmetic/bitwise operator `op` applies to operand type t.
+fn check_arith_op(op: lx.TokKind, t: *mut ast.Type, sp: u.Span) bool {
+    if (t.kind == ast.TY_INVALID) or (t.kind == ast.TY_NEVER) {
+        return true;
+    }
+    let opn = lx.tok_kind_name(op);
+    if vec_param_allows_arith(op, t) {
+        return true;
+    }
+    match op {
+        .PLUS, .MINUS, .STAR, .SLASH => {
+            if ty.is_num(t) or ty.is_untyped(t) or ty.is_vec_float(t) or param_has(t, ast.C_NUM) {
+                return true;
+            }
+            if ty.is_vec_int(t) {
+                // lane-wise and wrapping, in every overflow mode (§13.1)
+                if op == lx.TK_SLASH {
+                    _ = dg.err(sp, "E0811", "integer vectors do not support '/'");
+                } else if (op == lx.TK_STAR) and (t.elem.bits == 8) {
+                    _ = dg.err(sp, "E0811", "8-bit lane vectors have no multiplication");
+                } else {
+                    return true;
+                }
+                return false;
+            }
+        }
+        .PERCENT => {
+            if (t.kind == ast.TY_INT) or (t.kind == ast.TY_UNTYPED_INT) or param_has(t, ast.C_INT) {
+                return true;
+            }
+            if (t.kind == ast.TY_FLOAT) or (t.kind == ast.TY_UNTYPED_FLOAT) {
+                _ = dg.err(sp, "E0521", "'%' is not defined for floats; use @rem");
+                return false;
+            }
+        }
+        .PLUS_PCT, .MINUS_PCT, .STAR_PCT => {
+            if (t.kind == ast.TY_INT) or (t.kind == ast.TY_UNTYPED_INT) or param_has(t, ast.C_INT) {
+                return true;
+            }
+            if ty.is_vec_int(t) {
+                if (op == lx.TK_STAR_PCT) and (t.elem.bits == 8) {
+                    _ = dg.err(sp, "E0811", "8-bit lane vectors have no multiplication");
+                    return false;
+                }
+                return true;
+            }
+        }
+        .AMP, .PIPE, .CARET => {
+            if (t.kind == ast.TY_INT) or (t.kind == ast.TY_UNTYPED_INT) or ty.is_vec_int(t) or
+               (t.kind == ast.TY_V128) or param_has(t, ast.C_INT) {
+                return true;
+            }
+        }
+        else => {}
+    }
+    if t.kind == ast.TY_PARAM {
+        _ = dg.err(sp, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)", opn, t.name,
+                                     constraint_str(t.constraint, t.constraint_lane)));
+    } else {
+        _ = dg.err(sp, "E0513", u.f2("operator '%s' cannot be applied to %s", opn, tstr(t)));
+    }
+    return false;
+}
+
+fn check_cmp_op(op: lx.TokKind, t: *mut ast.Type, sp: u.Span) bool {
+    if (t.kind == ast.TY_INVALID) or (t.kind == ast.TY_NEVER) {
+        return true;
+    }
+    let eq = (op == lx.TK_EQEQ) or (op == lx.TK_NE);
+    if ty.is_num(t) or ty.is_untyped(t) {
+        return true;
+    }
+    if t.kind == ast.TY_PARAM {
+        let mut c = ast.C_ORD;
+        if eq {
+            c = ast.C_EQ;
+        }
+        if ty.satisfies(t, c) {
+            return true;
+        }
+        _ = dg.err(sp, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)", lx.tok_kind_name(op),
+                                     t.name, constraint_str(t.constraint, t.constraint_lane)));
+        return false;
+    }
+    if eq and
+       ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN) or
+        (t.kind == ast.TY_ENUM)) {
+        return true;
+    }
+    if (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
+        _ = dg.err(sp, "E0810", u.f1("vectors cannot be compared with '%s'; use @lanes_eq, @lanes_lt, ...",
+                                     lx.tok_kind_name(op)));
+    } else {
+        _ = dg.err(sp, "E0513", u.f2("operator '%s' cannot be applied to %s", lx.tok_kind_name(op), tstr(t)));
+    }
+    return false;
+}
+
+// Checks the right operand of a shift; returns false on error.
+fn check_shift_count(pb: *mut *mut ast.Expr) bool {
+    let r = check_expr(pb.*, tnil());
+    if r.kind == ast.TY_UNTYPED_INT {
+        if ast.cval_of(pb.*).is_neg() {
+            _ = dg.err(pb.*.span, "E0525", "shift count must not be negative");
+            return false;
+        }
+        coerce(pb, ty.t_u32);
+        return true;
+    }
+    if r.kind == ast.TY_INVALID {
+        return true;
+    }
+    if ((r.kind == ast.TY_INT) and not r.is_signed) or param_has(r, ast.C_UNSIGNED) {
+        return true;
+    }
+    if ty.is_vec_int(r) and not r.elem.is_signed {
+        return true;  // per lane (spec §13.1)
+    }
+    if is_vec_param(r) and lane_is_unsigned_int(r.constraint_lane) {
+        return true;
+    }
+    if (r.kind == ast.TY_INT) or param_has(r, ast.C_SIGNED) or ty.is_vec_int(r) or is_vec_param(r) {
+        _ = dg.err(pb.*.span, "E0525", u.f1("shift count must be unsigned, found %s", tstr(r)));
+        return false;
+    }
+    _ = dg.err(pb.*.span, "E0412", u.f1("shift count must be an unsigned integer, found %s", tstr(r)));
+    return false;
+}
+
+// x op y for a comparison operator op.
+fn compare_f64(op: lx.TokKind, x: f64, y: f64) bool {
+    if op == lx.TK_EQEQ {
+        return x == y;
+    }
+    if op == lx.TK_NE {
+        return x != y;
+    }
+    if op == lx.TK_LT {
+        return x < y;
+    }
+    if op == lx.TK_LE {
+        return x <= y;
+    }
+    if op == lx.TK_GT {
+        return x > y;
+    }
+    if op == lx.TK_GE {
+        return x >= y;
+    }
+    return false;
+}
+
+fn compare_i128(op: lx.TokKind, x: u.I128, y: u.I128) bool {
+    if op == lx.TK_EQEQ {
+        return x.eq(y);
+    }
+    if op == lx.TK_NE {
+        return not x.eq(y);
+    }
+    if op == lx.TK_LT {
+        return x.lt(y);
+    }
+    if op == lx.TK_LE {
+        return x.le(y);
+    }
+    if op == lx.TK_GT {
+        return x.gt(y);
+    }
+    if op == lx.TK_GE {
+        return x.ge(y);
+    }
+    return false;
+}
+
+// E0412 for the operands of a binary operator op, of types l and r: with a
+// fix that splats a scalar operand of a vector's lane type.
+fn operand_types_differ(e: *mut ast.Expr, op: lx.TokKind, l: *mut ast.Type, r: *mut ast.Type) void {
+    let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s", lx.tok_kind_name(op),
+                                         tstr(l), tstr(r)));
+    dg.set_types(d, tstr(l), tstr(r));
+    if (l.kind == ast.TY_VEC) and (r == l.elem) {
+        let txt = u.span_text(ast.b_of(e).span);
+        let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
+        dg.edit(fx, ast.b_of(e).span, u.f1("@splat(%s)", txt));
+    } else if (r.kind == ast.TY_VEC) and (l == r.elem) {
+        let txt = u.span_text(e.a.span);
+        let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
+        dg.edit(fx, e.a.span, u.f1("@splat(%s)", txt));
+    }
+}
+
+// A shift (op): the count unsigned, the operand an integer (vectors shift
+// per lane, by a scalar or a vector of counts of their shape).
+fn check_shift(e: *mut ast.Expr, expected: *mut ast.Type, op: lx.TokKind) *mut ast.Type {
+    let mut hint = tnil();
+    if u.notnil(expected) and
+       ((expected.kind == ast.TY_INT) or ty.is_vec_int(expected) or (expected.kind == ast.TY_PARAM)) {
+        hint = expected;
+    }
+    let mut l = check_expr(e.a, hint);
+    let ok = check_shift_count(ast.b_mut(e));
+    if l.kind == ast.TY_UNTYPED_INT {
+        if e.a.is_const and ast.b_of(e).is_const and (ast.b_of(e).ty.kind == ast.TY_INT) {
+            let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), tnil(), e.span);
+            if r.ok {
+                ast.set_cval(e, r.v);
+                e.is_const = true;
+            }
+            e.ty = ty.t_untyped_int;
+            return e.ty;
+        }
+        if u.notnil(hint) {
+            coerce(&mut e.a, hint);
+            l = e.a.ty;
+        } else {
+            _ = finalize_untyped(&mut e.a);
+            return set_ty(e, ty.t_invalid);
+        }
+    }
+    let l_ok = (l.kind == ast.TY_INT) or ty.is_vec_int(l) or param_has(l, ast.C_INT) or is_int_vec_param(l) or
+               (l.kind == ast.TY_INVALID);
+    if not l_ok {
+        if l.kind == ast.TY_PARAM {
+            _ = dg.err(e.span, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)",
+                                             lx.tok_kind_name(op), l.name,
+                                             constraint_str(l.constraint, l.constraint_lane)));
+        } else {
+            _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
+        }
+        return set_ty(e, ty.t_invalid);
+    }
+    let k = ast.b_of(e).ty;
+    if ok and (ty.is_vec_int(k) or is_vec_param(k)) and (l.kind != ast.TY_INVALID) {
+        let shape_ok = (ty.is_vec_int(l) and ty.is_vec_int(k) and (l.lanes == k.lanes) and
+                        (l.elem.bits == k.elem.bits)) or (is_vec_param(l) and (l == k));
+        if not shape_ok {
+            _ = dg.err(ast.b_of(e).span, "E0412",
+                       u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(l),
+                            tstr(k)));
+            return set_ty(e, ty.t_invalid);
+        }
+    }
+    if ok and e.a.is_const and ast.b_of(e).is_const and (l.kind == ast.TY_INT) {
+        let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), l, e.span);
+        if r.ok {
+            ast.set_cval(e, r.v);
+            e.is_const = true;
+        }
+    }
+    e.ty = l;
+    return e.ty;
+}
+
+fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let op = ast.op_of(e);
+    if (op == lx.KW_AND) or (op == lx.KW_OR) {
+        _ = check_expr_to(&mut e.a, ty.t_bool);
+        _ = check_expr_to(ast.b_mut(e), ty.t_bool);
+        e.ty = ty.t_bool;
+        return e.ty;
+    }
+    if is_shift_op(op) {
+        return check_shift(e, expected, op);
+    }
+    let cmp = lx.is_compare_op(op);
+    let mut hint = expected;
+    if cmp {
+        hint = tnil();
+    }
+    while u.notnil(hint) and ((hint.kind == ast.TY_ERRUNION) or (hint.kind == ast.TY_OPT)) {
+        hint = hint.elem;
+    }
+    let mut l = check_expr(e.a, hint);
+    let mut rhint = l;
+    if ty.is_untyped(l) {
+        rhint = hint;
+    }
+    let mut r = check_expr(ast.b_of(e), rhint);
+    let mut t = tnil();
+    if ty.is_untyped(l) and ty.is_untyped(r) {
+        t = ty.t_untyped_int;
+        if (l.kind == ast.TY_UNTYPED_FLOAT) or (r.kind == ast.TY_UNTYPED_FLOAT) {
+            t = ty.t_untyped_float;
+        }
+        if t == ty.t_untyped_float {
+            if l.kind == ast.TY_UNTYPED_INT {
+                ast.set_fval(e.a, ast.cval_of(e.a).to_f64());
+            }
+            if r.kind == ast.TY_UNTYPED_INT {
+                ast.set_fval(ast.b_of(e), ast.cval_of(ast.b_of(e)).to_f64());
+            }
+        }
+    } else if ty.is_untyped(l) {
+        coerce(&mut e.a, r);
+        t = r;
+    } else if ty.is_untyped(r) {
+        coerce(ast.b_mut(e), l);
+        t = l;
+    } else {
+        if ((op == lx.TK_EQEQ) or (op == lx.TK_NE)) and (l.kind == ast.TY_PTR) and (r.kind == ast.TY_PTR) and
+           (l.elem == r.elem) and (l.is_mut != r.is_mut) {
+            if l.is_mut {
+                coerce(&mut e.a, r);
+                l = r;
+            } else {
+                coerce(ast.b_mut(e), l);
+                r = l;
+            }
+        }
+        t = l;
+        if (l != r) and (l.kind != ast.TY_INVALID) and (r.kind != ast.TY_INVALID) and (l.kind != ast.TY_NEVER) and
+           (r.kind != ast.TY_NEVER) and not (is_err_type(l) and is_err_type(r)) {
+            operand_types_differ(e, op, l, r);
+            if cmp {
+                e.ty = ty.t_bool;
+            } else {
+                e.ty = ty.t_invalid;
+            }
+            return e.ty;
+        }
+    }
+    if cmp {
+        _ = check_cmp_op(op, t, e.span);
+        if ty.is_untyped(t) and e.a.is_const and ast.b_of(e).is_const {
+            // two untyped constants: the comparison is a bool constant
+            if t.kind == ast.TY_UNTYPED_FLOAT {
+                e.bval = compare_f64(op, ast.fval_of(e.a), ast.fval_of(ast.b_of(e)));
+            } else {
+                e.bval = compare_i128(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)));
+            }
+            e.is_const = true;
+        }
+        e.ty = ty.t_bool;
+        return e.ty;
+    }
+    if not check_arith_op(op, t, e.span) {
+        return set_ty(e, ty.t_invalid);
+    }
+    // constant folding
+    if e.a.is_const and ast.b_of(e).is_const {
+        if (t.kind == ast.TY_UNTYPED_INT) or (t.kind == ast.TY_INT) {
+            let mut tt = tnil();
+            if t.kind == ast.TY_INT {
+                tt = t;
+            }
+            let r2 = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), tt, e.span);
+            if r2.ok {
+                ast.set_cval(e, r2.v);
+                e.is_const = true;
+            }
+        } else if (t.kind == ast.TY_UNTYPED_FLOAT) or (t.kind == ast.TY_FLOAT) {
+            let a = ast.fval_of(e.a);
+            let b = ast.fval_of(ast.b_of(e));
+            let mut r2: f64 = 0.0;
+            match op {
+                .PLUS  => { r2 = a + b; }
+                .MINUS => { r2 = a - b; }
+                .STAR  => { r2 = a * b; }
+                .SLASH => { r2 = a / b; }
+                else => {
+                    e.ty = t;
+                    return e.ty;
+                }
+            }
+            if (t.kind == ast.TY_FLOAT) and (t.bits == 32) {
+                r2 = @as(f64, @float_cast(f32, r2));
+            }
+            ast.set_fval(e, r2);
+            e.is_const = true;
+        }
+    }
+    e.ty = t;
+    return e.ty;
+}
+
+fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let op = ast.op_of(e);
+    if op == lx.KW_NOT {
+        _ = check_expr_to(&mut e.a, ty.t_bool);
+        e.ty = ty.t_bool;
+        return e.ty;
+    }
+    if op == lx.TK_AMP {
+        // the pointee type expected, if any, types an untyped temporary
+        let mut hint = tnil();
+        if u.notnil(expected) and (expected.kind == ast.TY_PTR) {
+            hint = expected.elem;
+        }
+        _ = check_operand(e.a, hint);
+        check_value(e.a);
+        if ty.is_untyped(e.a.ty) {
+            if u.notnil(hint) {
+                coerce(&mut e.a, hint);
+            } else {
+                _ = finalize_untyped(&mut e.a);
+            }
+        }
+        let t = e.a.ty;
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_place(e.a) {
+            // a temporary: codegen gives it a slot that lives to the end of
+            // the function (spec §7.5); only its immutable address is given
+            if e.bval {
+                _ = dg.err(e.a.span, "E0703", "cannot take a mutable address of a temporary value");
+                return set_ty(e, ty.t_invalid);
+            }
+            if t.kind == ast.TY_VOID {
+                _ = dg.err(e.a.span, "E0703", "cannot take the address of a void value");
+                return set_ty(e, ty.t_invalid);
+            }
+        } else {
+            if e.bval and not is_mut_place(e.a) {
+                not_mutable(e.a, "take a mutable address");
+            }
+            mark_addr_taken(e.a);
+        }
+        e.ty = ty.type_ptr(t, e.bval);
+        return e.ty;
+    }
+    if op == lx.TK_MINUS {
+        let mut hint = tnil();
+        if u.notnil(expected) and (expected.kind != ast.TY_ERRUNION) and (expected.kind != ast.TY_OPT) {
+            hint = expected;
+        }
+        let t = check_expr(e.a, hint);
+        if ty.is_untyped(t) {
+            if e.a.is_const {
+                ast.set_cval(e, ast.cval_of(e.a).neg());
+                ast.set_fval(e, -ast.fval_of(e.a));
+                e.is_const = true;
+            }
+            e.ty = t;
+            return e.ty;
+        }
+        if ((t.kind == ast.TY_INT) and not t.is_signed) or (ty.is_vec_int(t) and not t.elem.is_signed) {
+            let d = dg.err(e.span, "E0520", u.f1("unary '-' cannot be applied to unsigned type %s", tstr(t)));
+            let fx = dg.fix(d, "use wrapping negation", "suggestion");
+            dg.edit(fx, u.mkspan(e.span.file, e.span.start, e.span.start + 1), "-%");
+            return set_ty(e, ty.t_invalid);
+        }
+        let vec_neg_ok = param_has(t, ast.C_FLOAT_VEC) or
+                         (param_has(t, ast.C_VEC) and lane_is_signed(t.constraint_lane));
+        if (t.kind == ast.TY_INT) or (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) or param_has(t, ast.C_SIGNED) or
+           param_has(t, ast.C_FLOAT) or vec_neg_ok or (t.kind == ast.TY_INVALID) {
+            if e.a.is_const and (t.kind == ast.TY_INT) {
+                if not fits_type(ast.cval_of(e.a).neg(), t) {
+                    _ = dg.err(e.span, "E0530", "overflow in constant expression");
+                }
+                ast.set_cval(e, ast.cval_of(e.a).neg());
+                e.is_const = true;
+            } else if e.a.is_const and (t.kind == ast.TY_FLOAT) {
+                ast.set_fval(e, -ast.fval_of(e.a));
+                e.is_const = true;
+            }
+            e.ty = t;
+            return e.ty;
+        }
+        if ty.is_vec_int(t) {
+            e.ty = t;  // lane-wise, wrapping (§13.1)
+            return e.ty;
+        }
+        if t.kind == ast.TY_PARAM {
+            _ = dg.err(e.span, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)", "-", t.name,
+                                             constraint_str(t.constraint, t.constraint_lane)));
+        } else {
+            _ = dg.err(e.span, "E0513", u.f1("unary '-' cannot be applied to %s", tstr(t)));
+        }
+        return set_ty(e, ty.t_invalid);
+    }
+    if (op == lx.TK_MINUS_PCT) or (op == lx.TK_TILDE) {
+        let mut hint = expected;
+        while u.notnil(hint) and ((hint.kind == ast.TY_ERRUNION) or (hint.kind == ast.TY_OPT)) {
+            hint = hint.elem;
+        }
+        let mut t = check_expr(e.a, hint);
+        if ty.is_untyped(t) {
+            if u.notnil(hint) and ((hint.kind == ast.TY_INT) or (hint.kind == ast.TY_PARAM)) {
+                coerce(&mut e.a, hint);
+                t = e.a.ty;
+            } else {
+                _ = finalize_untyped(&mut e.a);
+                return set_ty(e, ty.t_invalid);
+            }
+        }
+        let ok = (t.kind == ast.TY_INT) or ty.is_vec_int(t) or param_has(t, ast.C_INT) or is_int_vec_param(t) or
+                 (t.kind == ast.TY_INVALID) or ((op == lx.TK_TILDE) and (t.kind == ast.TY_V128));
+        if not ok {
+            if t.kind == ast.TY_PARAM {
+                _ = dg.err(e.span, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)",
+                                                 lx.tok_kind_name(op), t.name,
+                                                 constraint_str(t.constraint, t.constraint_lane)));
+            } else {
+                _ = dg.err(e.span, "E0513", u.f2("operator '%s' cannot be applied to %s", lx.tok_kind_name(op),
+                                                 tstr(t)));
+            }
+            return set_ty(e, ty.t_invalid);
+        }
+        if e.a.is_const and (t.kind == ast.TY_INT) {
+            if op == lx.TK_TILDE {
+                ast.set_cval(e, wrap_to(ast.cval_of(e.a).not_(), t));
+            } else {
+                ast.set_cval(e, wrap_to(ast.cval_of(e.a).neg(), t));
+            }
+            e.is_const = true;
+        }
+        e.ty = t;
+        return e.ty;
+    }
+    return set_ty(e, ty.t_invalid);
+}

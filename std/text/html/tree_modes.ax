@@ -1,0 +1,636 @@
+// =============================================================================
+// std/text/html/tree_modes.ax - HTML tree construction dispatch and framing modes, part of std/text/html.
+// =============================================================================
+
+import "../../str.ax" as strs;
+import "../internal/html/tags.ax" as tags;
+
+// -----------------------------------------------------------------------------
+// Tree construction
+// -----------------------------------------------------------------------------
+
+fn is_start(t: *Token, tag: u16) bool {
+    return (t.kind == TokenKind.START) and (t.tag == tag);
+}
+
+fn is_end(t: *Token, tag: u16) bool {
+    return (t.kind == TokenKind.END) and (t.tag == tag);
+}
+
+fn tag_in(t: *Token, set: []u16) bool {
+    if t.tag == 0 {
+        return false;
+    }
+    for x in set {
+        if x == t.tag {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Runs the tree construction dispatcher for one token.
+fn dispatch(p: *mut Parser, t0: Token) HtmlError!void {
+    let mut t = t0;
+    loop {
+        let mut again = false;
+        if html_content(p, &t) {
+            again = step(p, p.mode, &mut t)!;
+        } else {
+            again = foreign(p, &mut t)!;
+        }
+        if not again {
+            return;
+        }
+    }
+}
+
+fn html_content(p: *mut Parser, t: *Token) bool {
+    if p.stack.len() == 0 {
+        return true;
+    }
+    let a = p.adjusted_current();
+    let n = p.nd(a);
+    if (n.ns == Namespace.HTML) or (t.kind == TokenKind.EOF) {
+        return true;
+    }
+    if p.mathml_text_ip(a) {
+        if (t.kind == TokenKind.START) and (t.tag != tags.T_MGLYPH) and (t.tag != tags.T_MALIGNMARK) {
+            return true;
+        }
+        if t.kind == TokenKind.CHARS {
+            return true;
+        }
+    }
+    if (n.ns == Namespace.MATHML) and (n.tag == tags.T_ANNOTATION_XML) and is_start(t, tags.T_SVG) {
+        return true;
+    }
+    if p.html_ip(a) and ((t.kind == TokenKind.START) or (t.kind == TokenKind.CHARS)) {
+        return true;
+    }
+    return false;
+}
+
+// Processes the token by the rules of an insertion mode: true to reprocess
+// it (in p.mode).
+fn step(p: *mut Parser, mode: Mode, t: *mut Token) HtmlError!bool {
+    if mode == Mode.IN_BODY {
+        return in_body(p, t);
+    }
+    if mode == Mode.TEXT {
+        return in_text(p, t);
+    }
+    if mode == Mode.IN_TABLE {
+        return in_table(p, t);
+    }
+    if mode == Mode.IN_CELL {
+        return in_cell(p, t);
+    }
+    if mode == Mode.IN_ROW {
+        return in_row(p, t);
+    }
+    if mode == Mode.IN_TABLE_BODY {
+        return in_table_body(p, t);
+    }
+    if mode == Mode.IN_TABLE_TEXT {
+        return in_table_text(p, t);
+    }
+    if mode == Mode.IN_HEAD {
+        return in_head(p, t);
+    }
+    if mode == Mode.INITIAL {
+        return initial(p, t);
+    }
+    if mode == Mode.BEFORE_HTML {
+        return before_html(p, t);
+    }
+    if mode == Mode.BEFORE_HEAD {
+        return before_head(p, t);
+    }
+    if mode == Mode.IN_HEAD_NOSCRIPT {
+        return in_head_noscript(p, t);
+    }
+    if mode == Mode.AFTER_HEAD {
+        return after_head(p, t);
+    }
+    if mode == Mode.IN_CAPTION {
+        return in_caption(p, t);
+    }
+    if mode == Mode.IN_COLUMN_GROUP {
+        return in_column_group(p, t);
+    }
+    if mode == Mode.IN_TEMPLATE {
+        return in_template(p, t);
+    }
+    if mode == Mode.AFTER_BODY {
+        return after_body(p, t);
+    }
+    if mode == Mode.IN_FRAMESET {
+        return in_frameset(p, t);
+    }
+    if mode == Mode.AFTER_FRAMESET {
+        return after_frameset(p, t);
+    }
+    if mode == Mode.AFTER_AFTER_BODY {
+        return after_after_body(p, t);
+    }
+    return after_after_frameset(p, t);
+}
+
+// What split_ws does with whitespace at the start of a character token.
+enum Whitespace: u8 {
+    INSERT,   // insert it
+    DROP,     // drop it
+    IN_BODY,  // process it as in_body does
+}
+
+// Handles whitespace at the start of a character token as `how` says; true
+// if characters remain in t.
+fn split_ws(p: *mut Parser, t: *mut Token, how: Whitespace) HtmlError!bool {
+    let k = leading_ws(t.data);
+    if k > 0 {
+        if how == Whitespace.INSERT {
+            p.insert_text(t.data[..k])!;
+        } else if how == Whitespace.IN_BODY {
+            let mut w = t.*;
+            w.data = t.data[..k];
+            _ = in_body(p, &mut w)!;
+        }
+    }
+    t.data = t.data[k..];
+    return t.data.len > 0;
+}
+
+fn initial(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
+            return false;
+        }
+    } else if t.kind == TokenKind.COMMENT {
+        p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
+        return false;
+    } else if t.kind == TokenKind.DOCTYPE {
+        let id = p.doc.new_node(Kind.DOCTYPE)!;
+        let n = p.ndm(id);
+        n.name = p.doc.arena.dup(t.name)!;
+        n.text = p.doc.arena.dup(t.public_id)!;
+        n.system_id = p.doc.arena.dup(t.system_id)!;
+        p.doc.append_child(0, id);
+        p.doc.mode = doctype_mode(t);
+        p.mode = Mode.BEFORE_HTML;
+        return false;
+    }
+    p.doc.mode = QuirksMode.QUIRKS;
+    p.mode = Mode.BEFORE_HTML;
+    return true;
+}
+
+let QUIRKY_PUBLIC: [55][]u8 = [
+    "+//silmaril//dtd html pro v0r11 19970101//",
+    "-//as//dtd html 3.0 aswedit + extensions//",
+    "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+    "-//ietf//dtd html 2.0 level 1//",
+    "-//ietf//dtd html 2.0 level 2//",
+    "-//ietf//dtd html 2.0 strict level 1//",
+    "-//ietf//dtd html 2.0 strict level 2//",
+    "-//ietf//dtd html 2.0 strict//",
+    "-//ietf//dtd html 2.0//",
+    "-//ietf//dtd html 2.1e//",
+    "-//ietf//dtd html 3.0//",
+    "-//ietf//dtd html 3.2 final//",
+    "-//ietf//dtd html 3.2//",
+    "-//ietf//dtd html 3//",
+    "-//ietf//dtd html level 0//",
+    "-//ietf//dtd html level 1//",
+    "-//ietf//dtd html level 2//",
+    "-//ietf//dtd html level 3//",
+    "-//ietf//dtd html strict level 0//",
+    "-//ietf//dtd html strict level 1//",
+    "-//ietf//dtd html strict level 2//",
+    "-//ietf//dtd html strict level 3//",
+    "-//ietf//dtd html strict//",
+    "-//ietf//dtd html//",
+    "-//metrius//dtd metrius presentational//",
+    "-//microsoft//dtd internet explorer 2.0 html strict//",
+    "-//microsoft//dtd internet explorer 2.0 html//",
+    "-//microsoft//dtd internet explorer 2.0 tables//",
+    "-//microsoft//dtd internet explorer 3.0 html strict//",
+    "-//microsoft//dtd internet explorer 3.0 html//",
+    "-//microsoft//dtd internet explorer 3.0 tables//",
+    "-//netscape comm. corp.//dtd html//",
+    "-//netscape comm. corp.//dtd strict html//",
+    "-//o'reilly and associates//dtd html 2.0//",
+    "-//o'reilly and associates//dtd html extended 1.0//",
+    "-//o'reilly and associates//dtd html extended relaxed 1.0//",
+    "-//sq//dtd html 2.0 hotmetal + extensions//",
+    "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+    "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
+    "-//spyglass//dtd html 2.0 extended//",
+    "-//sun microsystems corp.//dtd hotjava html//",
+    "-//sun microsystems corp.//dtd hotjava strict html//",
+    "-//w3c//dtd html 3 1995-03-24//",
+    "-//w3c//dtd html 3.2 draft//",
+    "-//w3c//dtd html 3.2 final//",
+    "-//w3c//dtd html 3.2//",
+    "-//w3c//dtd html 3.2s draft//",
+    "-//w3c//dtd html 4.0 frameset//",
+    "-//w3c//dtd html 4.0 transitional//",
+    "-//w3c//dtd html experimental 19960712//",
+    "-//w3c//dtd html experimental 970421//",
+    "-//w3c//dtd w3 html//",
+    "-//w3o//dtd w3 html 3.0//",
+    "-//webtechs//dtd mozilla html 2.0//",
+    "-//webtechs//dtd mozilla html//",
+];
+
+fn starts_ci(s: []u8, prefix: []u8) bool {
+    return (s.len >= prefix.len) and strs.eq_ignore_case(s[..prefix.len], prefix);
+}
+
+fn doctype_mode(t: *Token) QuirksMode {
+    let pub_id = t.public_id;
+    let sys = t.system_id;
+    if t.force_quirks or not strs.eq(t.name, "html") {
+        return QuirksMode.QUIRKS;
+    }
+    if t.has_public {
+        if strs.eq_ignore_case(pub_id, "-//W3O//DTD W3 HTML Strict 3.0//EN//") or
+           strs.eq_ignore_case(pub_id, "-/W3C/DTD HTML 4.0 Transitional/EN") or strs.eq_ignore_case(pub_id, "HTML") {
+            return QuirksMode.QUIRKS;
+        }
+        for q in QUIRKY_PUBLIC {
+            if starts_ci(pub_id, q) {
+                return QuirksMode.QUIRKS;
+            }
+        }
+    }
+    if t.has_system and strs.eq_ignore_case(sys, "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
+        return QuirksMode.QUIRKS;
+    }
+    let html401 = starts_ci(pub_id, "-//W3C//DTD HTML 4.01 Frameset//") or
+                  starts_ci(pub_id, "-//W3C//DTD HTML 4.01 Transitional//");
+    if t.has_public and html401 and not t.has_system {
+        return QuirksMode.QUIRKS;
+    }
+    if t.has_public and
+       (starts_ci(pub_id, "-//W3C//DTD XHTML 1.0 Frameset//") or
+        starts_ci(pub_id, "-//W3C//DTD XHTML 1.0 Transitional//") or (html401 and t.has_system)) {
+        return QuirksMode.LIMITED_QUIRKS;
+    }
+    return QuirksMode.NO_QUIRKS;
+}
+
+// An end tag the "before" modes treat as anything else.
+fn end_hbhb(t: *Token) bool {
+    return (t.kind == TokenKind.END) and
+           ((t.tag == tags.T_HEAD) or (t.tag == tags.T_BODY) or (t.tag == tags.T_HTML) or (t.tag == tags.T_BR));
+}
+
+fn before_html(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.DOCTYPE {
+        return false;
+    }
+    if t.kind == TokenKind.COMMENT {
+        p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
+        return false;
+    }
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
+            return false;
+        }
+    }
+    if is_start(t, tags.T_HTML) {
+        let id = p.create_element(t, Namespace.HTML)!;
+        p.doc.append_child(0, id);
+        _ = p.push(id)!;
+        p.mode = Mode.BEFORE_HEAD;
+        return false;
+    }
+    if (t.kind == TokenKind.END) and not end_hbhb(t) {
+        return false;
+    }
+    let mut h = fake_token(tags.T_HTML);
+    let id = p.create_element(&mut h, Namespace.HTML)!;
+    p.doc.append_child(0, id);
+    _ = p.push(id)!;
+    p.mode = Mode.BEFORE_HEAD;
+    return true;
+}
+
+fn before_head(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
+            return false;
+        }
+    } else if t.kind == TokenKind.COMMENT {
+        p.insert_comment(t, p.place(NONE))!;
+        return false;
+    } else if t.kind == TokenKind.DOCTYPE {
+        return false;
+    } else if is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    } else if is_start(t, tags.T_HEAD) {
+        p.head = p.insert(t, Namespace.HTML)!;
+        p.mode = Mode.IN_HEAD;
+        return false;
+    } else if (t.kind == TokenKind.END) and not end_hbhb(t) {
+        return false;
+    }
+    p.head = p.insert_fake(tags.T_HEAD)!;
+    p.mode = Mode.IN_HEAD;
+    return true;
+}
+
+fn in_head(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
+            return false;
+        }
+    } else if t.kind == TokenKind.COMMENT {
+        p.insert_comment(t, p.place(NONE))!;
+        return false;
+    } else if t.kind == TokenKind.DOCTYPE {
+        return false;
+    } else if t.kind == TokenKind.START {
+        let g = t.tag;
+        if g == tags.T_HTML {
+            return in_body(p, t);
+        }
+        if (g == tags.T_BASE) or (g == tags.T_BASEFONT) or (g == tags.T_BGSOUND) or (g == tags.T_LINK) or
+           (g == tags.T_META) {
+            _ = p.insert_void(t)!;
+            return false;
+        }
+        if g == tags.T_TITLE {
+            p.raw_text(t, State.RCDATA)!;
+            return false;
+        }
+        if ((g == tags.T_NOSCRIPT) and p.scripting) or (g == tags.T_NOFRAMES) or (g == tags.T_STYLE) {
+            p.raw_text(t, State.RAWTEXT)!;
+            return false;
+        }
+        if g == tags.T_NOSCRIPT {
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_HEAD_NOSCRIPT;
+            return false;
+        }
+        if g == tags.T_SCRIPT {
+            p.raw_text(t, State.SCRIPT)!;
+            return false;
+        }
+        if g == tags.T_TEMPLATE {
+            let id = p.insert(t, Namespace.HTML)!;
+            if not p.opened(id) {
+                return false;
+            }
+            p.afe.push(MARKER)!;
+            p.frameset_ok = false;
+            p.mode = Mode.IN_TEMPLATE;
+            p.tmodes.push(Mode.IN_TEMPLATE)!;
+            return false;
+        }
+        if g == tags.T_HEAD {
+            return false;
+        }
+    } else if t.kind == TokenKind.END {
+        let g = t.tag;
+        if g == tags.T_HEAD {
+            p.pop();
+            p.mode = Mode.AFTER_HEAD;
+            return false;
+        }
+        if g == tags.T_TEMPLATE {
+            if not p.has_template() {
+                return false;
+            }
+            p.gen_thorough();
+            p.pop_until(tags.T_TEMPLATE);
+            p.afe_clear_to_marker();
+            _ = p.tmodes.pop() ?? Mode.IN_BODY;
+            p.reset_mode();
+            return false;
+        }
+        if (g != tags.T_BODY) and (g != tags.T_HTML) and (g != tags.T_BR) {
+            return false;
+        }
+    }
+    p.pop();
+    p.mode = Mode.AFTER_HEAD;
+    return true;
+}
+
+fn in_head_noscript(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.DOCTYPE {
+        return false;
+    }
+    if is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    }
+    if is_end(t, tags.T_NOSCRIPT) {
+        p.pop();
+        p.mode = Mode.IN_HEAD;
+        return false;
+    }
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
+            return false;
+        }
+    } else if t.kind == TokenKind.COMMENT {
+        return in_head(p, t);
+    } else if t.kind == TokenKind.START {
+        let g = t.tag;
+        if (g == tags.T_BASEFONT) or (g == tags.T_BGSOUND) or (g == tags.T_LINK) or (g == tags.T_META) or
+           (g == tags.T_NOFRAMES) or (g == tags.T_STYLE) {
+            return in_head(p, t);
+        }
+        if (g == tags.T_HEAD) or (g == tags.T_NOSCRIPT) {
+            return false;
+        }
+    } else if (t.kind == TokenKind.END) and (t.tag != tags.T_BR) {
+        return false;
+    }
+    p.pop();
+    p.mode = Mode.IN_HEAD;
+    return true;
+}
+
+fn after_head(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
+            return false;
+        }
+    } else if t.kind == TokenKind.COMMENT {
+        p.insert_comment(t, p.place(NONE))!;
+        return false;
+    } else if t.kind == TokenKind.DOCTYPE {
+        return false;
+    } else if t.kind == TokenKind.START {
+        let g = t.tag;
+        if g == tags.T_HTML {
+            return in_body(p, t);
+        }
+        if g == tags.T_BODY {
+            _ = p.insert(t, Namespace.HTML)!;
+            p.frameset_ok = false;
+            p.mode = Mode.IN_BODY;
+            return false;
+        }
+        if g == tags.T_FRAMESET {
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_FRAMESET;
+            return false;
+        }
+        if (g == tags.T_BASE) or (g == tags.T_BASEFONT) or (g == tags.T_BGSOUND) or (g == tags.T_LINK) or
+           (g == tags.T_META) or (g == tags.T_NOFRAMES) or (g == tags.T_SCRIPT) or (g == tags.T_STYLE) or
+           (g == tags.T_TEMPLATE) or (g == tags.T_TITLE) {
+            let h = p.head;
+            if (h == NONE) or not p.push(h)! {
+                return in_head(p, t);
+            }
+            let r = in_head(p, t)!;
+            p.stack_remove(h);
+            return r;
+        }
+        if g == tags.T_HEAD {
+            return false;
+        }
+    } else if t.kind == TokenKind.END {
+        if t.tag == tags.T_TEMPLATE {
+            return in_head(p, t);
+        }
+        if (t.tag != tags.T_BODY) and (t.tag != tags.T_HTML) and (t.tag != tags.T_BR) {
+            return false;
+        }
+    }
+    _ = p.insert_fake(tags.T_BODY)!;
+    p.frameset_ok = true;
+    p.mode = Mode.IN_BODY;
+    return true;
+}
+
+fn after_body(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let k = t.kind;
+    if k == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.IN_BODY)! {
+            return false;
+        }
+    } else if k == TokenKind.COMMENT {
+        p.insert_comment(t, Loc.{ parent: p.stack.items()[0], before: NONE })!;
+        return false;
+    } else if k == TokenKind.DOCTYPE {
+        return false;
+    } else if is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    } else if is_end(t, tags.T_HTML) {
+        if p.context == NONE {
+            p.mode = Mode.AFTER_AFTER_BODY;
+        }
+        return false;
+    } else if k == TokenKind.EOF {
+        return false;
+    }
+    p.mode = Mode.IN_BODY;
+    return true;
+}
+
+// Inserts the whitespace characters of t (the rest are dropped).
+fn insert_ws_only(p: *mut Parser, t: *Token) HtmlError!void {
+    p.sbuf.clear();
+    for c in t.data {
+        if is_ws(c) {
+            p.sbuf.push(c)!;
+        }
+    }
+    p.insert_text(p.sbuf.bytes())!;
+}
+
+fn in_frameset(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let k = t.kind;
+    if k == TokenKind.CHARS {
+        insert_ws_only(p, t)!;
+    } else if k == TokenKind.COMMENT {
+        p.insert_comment(t, p.place(NONE))!;
+    } else if is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    } else if is_start(t, tags.T_FRAMESET) {
+        _ = p.insert(t, Namespace.HTML)!;
+    } else if is_end(t, tags.T_FRAMESET) {
+        if p.stack.len() > 1 {
+            p.pop();
+            if (p.context == NONE) and not p.cur_is(tags.T_FRAMESET) {
+                p.mode = Mode.AFTER_FRAMESET;
+            }
+        }
+    } else if is_start(t, tags.T_FRAME) {
+        _ = p.insert_void(t)!;
+    } else if is_start(t, tags.T_NOFRAMES) {
+        return in_head(p, t);
+    }
+    return false;
+}
+
+fn after_frameset(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let k = t.kind;
+    if k == TokenKind.CHARS {
+        insert_ws_only(p, t)!;
+    } else if k == TokenKind.COMMENT {
+        p.insert_comment(t, p.place(NONE))!;
+    } else if is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    } else if is_end(t, tags.T_HTML) {
+        p.mode = Mode.AFTER_AFTER_FRAMESET;
+    } else if is_start(t, tags.T_NOFRAMES) {
+        return in_head(p, t);
+    }
+    return false;
+}
+
+fn after_after_body(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let k = t.kind;
+    if k == TokenKind.COMMENT {
+        p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
+        return false;
+    }
+    if (k == TokenKind.DOCTYPE) or is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    }
+    if k == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.IN_BODY)! {
+            return false;
+        }
+    }
+    if k == TokenKind.EOF {
+        return false;
+    }
+    p.mode = Mode.IN_BODY;
+    return true;
+}
+
+fn after_after_frameset(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let k = t.kind;
+    if k == TokenKind.COMMENT {
+        p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
+        return false;
+    }
+    if (k == TokenKind.DOCTYPE) or is_start(t, tags.T_HTML) {
+        return in_body(p, t);
+    }
+    if k == TokenKind.CHARS {
+        p.sbuf.clear();
+        for c in t.data {
+            if is_ws(c) {
+                p.sbuf.push(c)!;
+            }
+        }
+        let mut w = t.*;
+        w.data = p.sbuf.bytes();
+        if w.data.len > 0 {
+            return in_body(p, &mut w);
+        }
+        return false;
+    }
+    if is_start(t, tags.T_NOFRAMES) {
+        return in_head(p, t);
+    }
+    return false;
+}

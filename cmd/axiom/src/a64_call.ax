@@ -1,0 +1,431 @@
+// =============================================================================
+// a64_call.ax - calls, register returns, and sibling tail calls, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "elf.ax" as elf;
+import "ftab.ax" as ft;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "mach.ax" as mc;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Calls
+// -----------------------------------------------------------------------------
+fn caller_saved() u64 {
+    // x0-x18, x30 and (conservatively: only their low halves are preserved) all
+    // vector registers
+    return (0x7_ffff | (@as(u64, 1) << 30)) | (@as(u64, 0xFFFF_FFFF) << 32);
+}
+
+// The bytes a fixed argument of type t takes on the stack: an 8-byte slot
+// (a vector's 16 bytes), but Apple's AArch64 ABI packs them, each at its
+// own size and alignment (an i32 or f32 in 4 bytes).
+fn stack_arg_size(t: *ir.Ty) u64 {
+    if t.kind == ir.T_VEC {
+        return 16;
+    }
+    if not tg.is_darwin() {
+        return 8;
+    }
+    return @as(u64, is.mem_size(t));
+}
+
+fn gen_call(v: *mut ir.Value) void {
+    let fty_ = ir.fty_of(v);
+    let n = v.xs.len;
+    let regs = is.call_args(v, reg, ext_reg);
+    let mut target: i32 = -1;
+    if v.a.kind != ir.V_FUNC {
+        target = reg(v.a);
+    }
+    let mut ng: i32 = 0;
+    let mut nv: i32 = 0;
+    let mut off: u64 = 0;
+    let mut uses = u.List.[mc.MOp].empty();
+    let dest = u.newn.[i32](n + 1);
+    // Apple's AArch64 ABI passes the variadic arguments of a C call on the
+    // stack, each in an 8-byte slot
+    let mut nfixed = n;
+    if tg.is_darwin() and fty_.vararg {
+        nfixed = fty_.params.len;
+    }
+    // Windows passes every argument of a variadic function in x0-x7 and
+    // then 8-byte stack slots, floating-point ones as their bits
+    let win_va = O.win and fty_.vararg;
+    for i in 0..n {
+        let x = v.xs.get(i);
+        let mut c = class_of(x.ty);
+        if win_va and (c == VR) {
+            if x.ty.size > 8 {
+                fail("a vector argument of a variadic function (Windows)");
+            }
+            let t = vgpr();
+            if x.ty.bits == 64 {
+                raw2(ae.fcvt_int(1, 1, 0, 6, 0, 0), t, regs[i]);  // fmov xt, d
+            } else {
+                raw2(ae.fcvt_int(0, 0, 0, 6, 0, 0), t, regs[i]);  // fmov wt, s
+            }
+            regs[i] = t;
+            c = GPR;
+        }
+        dest[i] = -1;
+        let mut e: u8 = 0;
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
+        }
+        if e == ir.EXT_X8SRET {
+            dest[i] = X8;  // (the C result's address)
+            continue;
+        }
+        if i >= nfixed {
+            off = (off + 7) & ~@as(u64, 7);  // (after packed fixed arguments)
+            let m = mc.mem(SP, -1, 0, @bit_cast(i64, off));
+            if c == GPR {
+                _ = e2(STR, 8, m, R(regs[i]));
+            } else {
+                _ = e2(FSTR, @truncate(u8, x.ty.size), m, R(regs[i]));
+            }
+            off += 8;
+        } else if (c == GPR) and (ng < 8) {
+            dest[i] = ng;
+            ng += 1;
+        } else if (c == VR) and (nv < 8) {
+            dest[i] = V0 + nv;
+            nv += 1;
+        } else {
+            let sz = stack_arg_size(x.ty);
+            off = (off + sz - 1) & ~(sz - 1);
+            let m = mc.mem(SP, -1, 0, @bit_cast(i64, off));
+            if c == GPR {
+                _ = e2(STR, @truncate(u8, sz), m, R(regs[i]));
+            } else {
+                _ = e2(FSTR, @truncate(u8, x.ty.size), m, R(regs[i]));
+            }
+            off += sz;
+        }
+    }
+    off = (off + 15) & ~@as(u64, 15);
+    if off > FN.out_area {
+        FN.out_area = off;
+    }
+    for i in 0..n {
+        if dest[i] >= 0 {
+            if dest[i] >= V0 {
+                let m = e2(FMOV, 16, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            } else {
+                let m = e2(MOV, 8, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            }
+            mc.hint(FN.mf, regs[i], dest[i]);
+            uses.push(R(dest[i]));
+        }
+    }
+    let rt = fty_.ret;
+    let mut rreg: i32 = -1;
+    if rt.kind != ir.T_VOID {
+        rreg = X0;
+        if class_of(rt) == VR {
+            rreg = V0;
+        }
+    }
+    let mut ops = is.call_ops(v, target, &uses, func_sym, rreg);
+    let mut rcode: u8 = 0;
+    if (ir.ext_of(v).len > 0) and (ir.ext_of(v)[0] >= ir.EXT_REGS) {
+        rcode = ir.ext_of(v)[0];
+        // (the call defines the result's registers)
+        for k in 0..c_result_count(rcode) {
+            ops.push(mc.reg(c_result_reg(rcode, k), mc.RD));
+        }
+    }
+    let ci = emit(CALL, 0, ops.items());
+    is.finish_call(FN.mf, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
+    if rcode != 0 {
+        // the registers, for the IN_CALL_RESULTs
+        for k in 0..c_result_count(rcode) {
+            let r = c_result_reg(rcode, k);
+            if r >= V0 {
+                copy(call_result_vreg(v, k, VR), r, VR);
+            } else {
+                copy(call_result_vreg(v, k, GPR), r, GPR);
+            }
+        }
+    }
+    if (rreg >= 0) and is.foreign_bool(v) {
+        let t = vgpr();
+        copy(t, rreg, GPR);
+        copy(vreg(v), ext_reg(t, 8, false, false), GPR);
+    } else if rreg >= 0 {
+        copy(vreg(v), rreg, class_of(rt));
+    }
+    uses.deinit();
+    ops.deinit();
+}
+
+// A result in registers (AAPCS64: a structure or union in x0 and x1, or
+// a homogeneous floating-point aggregate in v0-v3; Axiom's small
+// aggregates, lower.ax, by place: the k-th in xk or vk), as ir.EXT_REGS rc
+// says: register k, and its class.
+fn c_result_reg(rc: u8, k: usize) i32 {
+    if (rc & (ir.EXT_REGS_FP0 << @truncate(u8, k))) != 0 {
+        return V0 + @int_cast(i32, k);
+    }
+    return X0 + @int_cast(i32, k);
+}
+
+fn c_result_count(rc: u8) usize {
+    return @as(usize, rc & 3) + 1;
+}
+
+// The virtual registers that hold register k of the results of calls in
+// registers (IN_CALL_RESULT), made when the call or the intrinsic is
+// selected, whichever comes first.
+struct CallResult {
+    call: *ir.Value,
+    k: usize,
+    r: i32,
+}
+
+fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
+    for x in FN.call_results.items() {
+        if (x.call == v) and (x.k == k) {
+            return x.r;
+        }
+    }
+    let mut r: i32 = 0;
+    if c == VR {
+        r = vvr();
+    } else {
+        r = vgpr();
+    }
+    FN.call_results.push(CallResult.{ call: v, k: k, r: r });
+    return r;
+}
+
+// IN_CALL_RESULT(call, k): the copy the call made of register k.
+fn gen_call_result(v: *mut ir.Value) void {
+    let c = v.xs.get(0);
+    if FN.tail_jumped and ((c.flags & ir.F_TAIL) != 0) {
+        return;  // (the call left the function: its registers are the callee's result, gen_tail_call)
+    }
+    let k = @truncate(usize, ir.cint_val(v.xs.get(1)));
+    let cl = class_of(v.ty);
+    copy(vreg(v), call_result_vreg(c, k, cl), cl);
+}
+
+// The return of a function whose result is in registers (ir.EXT_REGS):
+// t's xs in them.
+fn ret_c_result(t: *mut ir.Value) void {
+    let rc = FN.f.ret_ext;
+    let n = c_result_count(rc);
+    let mut ops = u.List.[mc.MOp].empty();
+    for k in 0..n {
+        let r = c_result_reg(rc, k);
+        let x = t.xs.get(k);
+        if r >= V0 {
+            let m = e2(FMOV, 16, W(r), R(reg(x)));
+            m.is_move = true;
+        } else {
+            let m = e2(MOV, 8, W(r), R(reg(x)));
+            m.is_move = true;
+        }
+        ops.push(R(r));
+    }
+    _ = emit(RET, 0, ops.items());
+    ops.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Sibling calls (tailrec.ax: mark_sibling_calls)
+//
+// As on x86-64 (x64.ax: gen_tail_call): the arguments where a call puts
+// them, then one CALL with cc TAIL restores the callee-saved registers and
+// the frame (x29, x30) and branches to the callee (`b`, or `br x16` for a
+// call through a pointer: x16 is not an argument register and the epilogue
+// does not restore it; no landing pads or signed return addresses are in
+// use). Stack arguments (AAPCS64's 8-byte slots, Apple's packed ones and
+// its variadic arguments) go through the outgoing area to the bottom of the
+// incoming one, at x29 + 16, copied up through x9 by the jump; only when the
+// callee needs no more of it than the caller took. A result in x8's memory
+// (ir.EXT_X8SRET) is the caller's own, passed on (tailrec.ax); one in
+// registers (ir.EXT_REGS) that the caller returns as it is stays in the
+// callee's registers (neither gen_call_result nor the return is selected).
+// -----------------------------------------------------------------------------
+const TAIL: i32 = 1;  // (a CALL's cc: the jump; aux: the bytes of stack arguments it copies)
+const X9: i32 = 9;    // (a scratch register for the copy: no argument, nothing live past the jump)
+
+fn is_tail(i: *mc.MInst) bool {
+    return (i.op == CALL) and (i.cc == TAIL);
+}
+
+// The bytes of stack arguments call v passes, or of stack parameters f
+// takes (as gen_call and compile_func place them).
+fn stack_bytes(f: *ir.Func, v: *mut ir.Value) u64 {
+    let mut ng: i32 = 0;
+    let mut nv: i32 = 0;
+    let mut off: u64 = 0;
+    let mut n = f.params.len;
+    let mut nfixed = n;
+    if u.notnil(v) {
+        n = v.xs.len;
+        nfixed = n;
+        if tg.is_darwin() and ir.fty_of(v).vararg {
+            nfixed = ir.fty_of(v).params.len;
+        }
+    }
+    for i in 0..n {
+        let mut t = u.nil.[ir.Ty]();
+        let mut e: u8 = 0;
+        if u.notnil(v) {
+            t = v.xs.get(i).ty;
+            if (i + 1) < ir.ext_of(v).len {
+                e = ir.ext_of(v)[i + 1];
+            }
+        } else {
+            t = f.params[i].ty;
+            if i < f.param_ext.len {
+                e = f.param_ext[i];
+            }
+        }
+        let c = class_of(t);
+        if e == ir.EXT_X8SRET {
+            continue;
+        }
+        if i >= nfixed {
+            off = ((off + 7) & ~@as(u64, 7)) + 8;
+        } else if (c == GPR) and (ng < 8) {
+            ng += 1;
+        } else if (c == VR) and (nv < 8) {
+            nv += 1;
+        } else {
+            let sz = stack_arg_size(t);
+            off = ((off + sz - 1) & ~(sz - 1)) + sz;
+        }
+    }
+    // (in whole 8-byte words: an area of Apple's packed slots ends where the
+    // 16-aligned stack of the frame that made it does, past what it holds)
+    return (off + 7) & ~@as(u64, 7);
+}
+
+// Call v as a jump to its callee, if its stack arguments fit (see above).
+fn gen_tail_call(v: *mut ir.Value) bool {
+    if O.win and (FN.f.va_home or ir.fty_of(v).vararg) {
+        return false;  // (the home area above the frame record; arguments as gen_call places them)
+    }
+    let need = stack_bytes(FN.f, v);
+    if need > stack_bytes(FN.f, u.nil.[ir.Value]()) {
+        return false;  // (the callee needs more of the stack than the caller was given)
+    }
+    let fty_ = ir.fty_of(v);
+    let n = v.xs.len;
+    let regs = is.call_args(v, reg, ext_reg);
+    let mut target: i32 = -1;
+    if v.a.kind != ir.V_FUNC {
+        target = reg(v.a);
+    }
+    let mut ng: i32 = 0;
+    let mut nv: i32 = 0;
+    let mut off: u64 = 0;
+    let mut uses = u.List.[mc.MOp].empty();
+    let dest = u.newn.[i32](n + 1);
+    let mut nfixed = n;
+    if tg.is_darwin() and fty_.vararg {
+        nfixed = fty_.params.len;
+    }
+    for i in 0..n {
+        let x = v.xs.get(i);
+        let c = class_of(x.ty);
+        dest[i] = -1;
+        let mut e: u8 = 0;
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
+        }
+        if e == ir.EXT_X8SRET {
+            dest[i] = X8;
+            continue;
+        }
+        let mut sz: u64 = 0;
+        if i >= nfixed {
+            off = (off + 7) & ~@as(u64, 7);
+            sz = 8;
+        } else if (c == GPR) and (ng < 8) {
+            dest[i] = ng;
+            ng += 1;
+        } else if (c == VR) and (nv < 8) {
+            dest[i] = V0 + nv;
+            nv += 1;
+        } else {
+            sz = stack_arg_size(x.ty);
+            off = (off + sz - 1) & ~(sz - 1);
+        }
+        if sz > 0 {
+            let m = mc.mem(SP, -1, 0, @bit_cast(i64, off));
+            if c == GPR {
+                _ = e2(STR, @truncate(u8, @min(sz, 8)), m, R(regs[i]));
+            } else {
+                _ = e2(FSTR, @truncate(u8, x.ty.size), m, R(regs[i]));
+            }
+            off += sz;
+        }
+    }
+    off = (off + 15) & ~@as(u64, 15);
+    if off > FN.out_area {
+        FN.out_area = off;
+    }
+    for i in 0..n {
+        if dest[i] >= 0 {
+            if dest[i] >= V0 {
+                let m = e2(FMOV, 16, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            } else {
+                let m = e2(MOV, 8, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            }
+            mc.hint(FN.mf, regs[i], dest[i]);
+            uses.push(R(dest[i]));
+        }
+    }
+    if target >= 0 {
+        let m = e2(MOV, 8, W(X16), R(target));
+        m.is_move = true;
+        target = X16;
+    }
+    let mut ops = is.call_ops(v, target, &uses, func_sym, -1);
+    if need > 0 {
+        ops.push(mc.mem(FP, -1, 0, 16));  // (the incoming area it writes: the frame)
+    }
+    let ci = emit(CALL, 0, ops.items());
+    ci.cc = TAIL;
+    ci.aux = @bit_cast(i64, need);
+    ci.clobber = 0;  // (nothing of the function runs after it)
+    FN.tail_jumped = true;
+    uses.deinit();
+    ops.deinit();
+    return true;
+}
+
+// The jump of a sibling call: its stack arguments copied up from the
+// outgoing area to the incoming one, the epilogue, then `b` or `br x16`
+// (no return address: the frame tables have no entry for it).
+fn enc_tail(i: *mut mc.MInst) void {
+    let mut k: i64 = 0;
+    while k < i.aux {
+        ldst(3, false, 1, 8, X9, mc.mem(SP, -1, 0, k));
+        ldst(3, false, 0, 8, X9, mc.mem(FP, -1, 0, 16 + k));
+        k += 8;
+    }
+    unframe();
+    let t = i.ops[0];
+    if t.kind == mc.K_SYM {
+        reloc(elf.R_AARCH64_JUMP26, t.sym, 0);
+        w32(ae.B);
+    } else {
+        w32(0xD61F_0000 | (ae.r5(P(t.reg)) << 5));  // br
+    }
+    if O.macos {
+        FN.tail_ends.push(here());
+    }
+    cfi_body();
+}

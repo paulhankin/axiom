@@ -1,0 +1,318 @@
+// =============================================================================
+// a64_asm.ax - inline assembly selection, expansion, and encoding, part of a64.ax.
+// =============================================================================
+import "asm/a64.ax" as aa;
+import "asm/core.ax" as acr;
+import "asm/inline.ax" as ai;
+import "asm/obj.ax" as aob;
+import "dwarf.ax" as dw;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "mach.ax" as mc;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Inline assembly (ir.IN_ASM; asm/inline.ax says what its operands are)
+// -----------------------------------------------------------------------------
+
+fn u8_of(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The register of class cls in mask `subset` (of the class's 0-31; 0: any)
+// that no fixed operand or clobber of the statement takes.
+fn asm_pick(subset: u64, cls: u8, taken: u64) i32 {
+    let mut base: i32 = 0;
+    if cls == ai.CL_VEC {
+        base = V0;
+    }
+    for k in @as(i32, 0)..32 {
+        let r = base + k;
+        if (subset != 0) and ((subset & (@as(u64, 1) << @int_cast(u32, k))) == 0) {
+            continue;
+        }
+        if (cls == ai.CL_GPR) and (((k >= 16) and (k <= 18)) or (k >= 29)) {
+            continue;
+        }
+        if (taken & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            continue;
+        }
+        return r;
+    }
+    fail("an asm statement whose operands need more registers of a class than there are");
+    return base;
+}
+
+// The asm statement's MInst ASM, as x64.ax's gen_asm makes xe.ASM: one
+// operand for each of the blob's (a register, memory at a base register, or
+// a constant), the clobbered registers (written before the inputs are
+// read), and asm goto's result; outputs in registers are written early and
+// stored to their temporaries after it; tied inputs are copied into their
+// outputs' registers first, pinned operands into and out of theirs.
+fn gen_asm(v: *mut ir.Value) void {
+    let bi = is.cval(v.xs.get(0));
+    let b = ai.blob(bi);
+    let n = b.ops.len;
+    let ops = u.newn.[mc.MOp](n + 66);
+    let regs = u.newn.[i32](n + 1);
+    let vals = u.newn.[i32](n + 1);
+    let mut taken = b.clobber;
+    for k in 0..n {
+        let op = b.ops[k];
+        if (op.kind == ai.OK_FIXED) and (op.reg >= 0) {
+            taken = taken | (@as(u64, 1) << @int_cast(u32, op.reg));
+        }
+    }
+    for k in 0..n {
+        let op = b.ops[k];
+        vals[k] = -1;
+        regs[k] = -1;
+        if not op.out and ((op.kind == ai.OK_REG) or (op.kind == ai.OK_FIXED) or (op.kind == ai.OK_MEM)) {
+            vals[k] = reg(v.xs.get(k + 1));
+        }
+    }
+    for k in 0..n {
+        let op = b.ops[k];
+        let x = v.xs.get(k + 1);
+        if op.kind == ai.OK_MEM {
+            // (always at a base register: [xn] is an operand of every load and store)
+            let mut r = vals[k];
+            if r < 0 {
+                r = reg(x);
+            }
+            ops[k] = mc.mem(r, -1, 0, 0);
+            continue;
+        }
+        if op.kind == ai.OK_IMM {
+            ops[k] = asm_imm(x);
+            continue;
+        }
+        let cls = u8_of(op.cls == ai.CL_VEC, VR, GPR);
+        if op.tie >= 0 {
+            let t = regs[@int_cast(usize, op.tie)];
+            regs[k] = t;
+            ops[k] = R(t);
+            ops[@int_cast(usize, op.tie)].role = mc.RUD;
+            continue;
+        }
+        let mut r: i32 = -1;
+        if op.kind == ai.OK_FIXED {
+            r = op.reg;
+        } else if op.subset != 0 {
+            r = asm_pick(op.subset, op.cls, taken);
+            taken = taken | (@as(u64, 1) << @int_cast(u32, r));
+        } else {
+            r = mc.new_vreg(FN.mf, cls);
+        }
+        regs[k] = r;
+        if op.out {
+            // (an early-clobber output is written before the inputs are read:
+            // in none of their registers; another may share one)
+            // A clobbered register is available to no operand: a clobber is
+            // written early, so an output written late could be given its
+            // register; with clobbers every output is written early too.
+            if op.early or (b.clobber != 0) {
+                ops[k] = mc.reg(r, mc.RD | mc.RE);
+            } else {
+                ops[k] = W(r);
+            }
+        } else if mc.is_vreg(r) {
+            ops[k] = R(vals[k]);
+            regs[k] = vals[k];
+        } else {
+            ops[k] = R(r);
+        }
+    }
+    for k in 0..n {
+        let op = b.ops[k];
+        if op.out or ((op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED)) {
+            continue;
+        }
+        if (op.kind == ai.OK_FIXED) and (op.reg == 31) {
+            continue;  // (the stack pointer, 'k': its own value)
+        }
+        if (op.tie >= 0) or not mc.is_vreg(regs[k]) {
+            let mut c = op.cls;
+            if op.tie >= 0 {
+                c = b.ops[@int_cast(usize, op.tie)].cls;
+            }
+            copy(regs[k], vals[k], u8_of(c == ai.CL_VEC, VR, GPR));
+        }
+    }
+    let mut no = n;
+    for r in @as(i32, 0)..64 {
+        if (b.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            ops[no] = mc.reg(r, mc.RD | mc.RE);
+            no += 1;
+        }
+    }
+    if b.goto_ {
+        ops[no] = mc.reg(vreg(v), mc.RD | mc.RE);
+        no += 1;
+    }
+    let i = emit(ASM, 0, ops[0..no]);
+    i.aux = bi;
+    O.asm_count += 1;
+    i.cc = O.asm_count;
+    i.keep = true;
+    for k in 0..n {
+        let op = b.ops[k];
+        if not op.out or ((op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED)) {
+            continue;
+        }
+        let vec = op.cls == ai.CL_VEC;
+        let mut r = regs[k];
+        if not mc.is_vreg(r) {
+            let t = mc.new_vreg(FN.mf, u8_of(vec, VR, GPR));
+            copy(t, r, u8_of(vec, VR, GPR));
+            r = t;
+        }
+        // (the asm's result k: IN_CALL_RESULT(asm, k) reads it)
+        copy(call_result_vreg(v, k, u8_of(vec, VR, GPR)), r, u8_of(vec, VR, GPR));
+    }
+}
+
+// An immediate operand of an asm statement: a constant, or a symbol's
+// address plus a constant.
+fn asm_imm(x: *mut ir.Value) mc.MOp {
+    if is.is_c(x) {
+        return I(is.cval(x));
+    }
+    let mut p = x;
+    let mut off: i64 = 0;
+    if ir.is_op(p, ir.OP_PTRADD) and is.is_c(p.b) {
+        off = is.cval(p.b);
+        p = p.a;
+    }
+    if p.kind == ir.V_GLOBAL {
+        return mc.symop(global_sym(ir.gv_of(p)), off);
+    }
+    if p.kind == ir.V_FUNC {
+        return mc.symop(func_sym(ir.fnp_of(p)), off);
+    }
+    fail("an asm operand that must be a constant is not one after optimization");
+    return I(0);
+}
+
+// The callee-saved registers asm statements name (clobbers, pinned
+// operands) are saved as those allocation chose are.
+fn asm_used_regs() void {
+    for bi in 0..FN.mf.blocks.len {
+        let mut i = FN.mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.op == ASM {
+                for k in 0..i.ops.len {
+                    let o = i.ops[k];
+                    if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) and (o.reg < 64) {
+                        FN.mf.used_regs = FN.mf.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
+                    }
+                }
+            }
+            i = i.next;
+        }
+    }
+}
+
+fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
+    let o = FN.asm_inst.ops[k];
+    let op = b.ops[k];
+    let mut r = ai.rop_reg(0, op.bits, op.fp);
+    match o.kind {
+        .REG => { r.reg = P(o.reg); }
+        .MEM => {
+            r.kind = ai.OK_MEM;
+            r.base = P(o.base);
+        }
+        .SYM => {
+            r.kind = ai.OK_IMM;
+            r.sym = true;
+            r.name = u.cat2("__axiom_sym_", u.idec(o.sym));
+            r.k = o.disp;
+        }
+        else => {
+            r.kind = ai.OK_IMM;
+            r.k = o.disp;
+        }
+    }
+    let mut err = "";
+    let t = aa.render(&r, mod, &mut err);
+    if (err.len > 0) and (FN.asm_err.len == 0) {
+        FN.asm_err = u.f2("operand %s: %s", u.zdec(k), err);
+    }
+    return t;
+}
+
+fn asm_symbol(name: []u8) i32 {
+    return @bit_cast(i32, asm_symbol_u(name));
+}
+
+// (asm/obj.ax's form: an operand's symbol, a name of internal linkage the
+// text names, else the symbol of the name)
+fn asm_symbol_u(name: []u8) u32 {
+    if u.starts(name, "__axiom_sym_") {
+        return @truncate(u32, @bit_cast(u64, u.atol(name[12..])));
+    }
+    let al = aob.alias_sym(O.obj, ai.blob(FN.asm_inst.aux).aliases, name);
+    if al >= 0 {
+        return @truncate(u32, @bit_cast(u64, al));
+    }
+    return elf.ext_sym(O.obj, u.perm_dup(name), false);
+}
+
+// The template with the operands where they were allocated, assembled
+// (asm/a64.ax) into the function's code.
+fn enc_asm(i: *mut mc.MInst) void {
+    let b = ai.blob(i.aux);
+    FN.asm_inst = i;
+    FN.asm_err = "";
+    let mut text = ai.expand(b, asm_operand, aa.label_text, @as(u64, @bit_cast(u32, i.cc)));
+    if b.goto_ {
+        text = u.cat2(text, aa.goto_tail(b.nlabels, P(i.ops[i.ops.len - 1].reg)));
+    }
+    if FN.asm_err.len > 0 {
+        fail(u.f2("inline assembly at %s: %s", b.loc, FN.asm_err));
+        return;
+    }
+    let start = here();
+    let A = aa.assemble_inline(text, start);
+    if acr.failed(A) {
+        fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
+        return;
+    }
+    FN.code.put(A.secs.at(0).data.items());
+    let rels = aob.inline_asm(O.obj, A, O.fsym.get(@int_cast(usize, FN.f.id)), start, asm_symbol_u);
+    if acr.failed(A) {
+        fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
+        return;
+    }
+    for r in rels {
+        FN.rls.push(Rl.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, r.sym), addend: r.addend });
+    }
+    if O.dbg.on and (A.icfi.len > 0) {
+        // (the registers the template saves: rules from sp; the frame's: x29
+        // and x30 at CFA - 16 and - 8, the callee-saved ones in their slots)
+        let n = @int_cast(usize, FN.nsaved) + 2;
+        let regs = u.newn.[u32](n);
+        let offs = u.newn.[i64](n);
+        regs[0] = dw.A64_FP;
+        offs[0] = -16;
+        regs[1] = dw.A64_LR;
+        offs[1] = -8;
+        for k in 0..@int_cast(usize, FN.nsaved) {
+            let r = FN.saved[k];
+            let mut dr = @bit_cast(u32, r);
+            if r >= V0 {
+                dr = 64 + @bit_cast(u32, r - V0);
+            }
+            regs[k + 2] = dr;
+            offs[k + 2] = -16 - FN.frame + FN.save_off[k];
+        }
+        for c in acr.inline_cfi(A, dw.A64_SP, regs[0..n], offs[0..n]) {
+            FN.xcfis.push(dw.XCfi.{ off: start + c.off, bytes: u.perm_dup(c.bytes) });
+        }
+    }
+}

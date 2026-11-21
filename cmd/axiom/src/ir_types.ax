@@ -1,0 +1,398 @@
+// =============================================================================
+// ir_types.ax - IR type interning, struct layout, queries, and formatting, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+pub threadlocal let mut ptr_bytes: u64 = 8;  // the target's pointer width (init_types)
+
+// The interned types: one of each (t_int, t_void, ...; derived types by key)
+struct TypeTab {
+    ty_count: i32,
+    int_tys: [129]*mut Ty,
+    t_void: *mut Ty,
+    t_ptr: *mut Ty,
+    t_f32: *mut Ty,
+    t_f64: *mut Ty,
+    derived: u.SymMap.[*mut Ty],
+    vecs: u.U64Map,  // vector types by lane type's id and count (t_vec)
+}
+
+threadlocal let mut TT: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
+                                            t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
+                                            t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
+                                            derived: u.SymMap.[*mut Ty].{
+                                                keys: @ptr_from_int(*mut usize, 0),
+                                                vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 },
+                                            vecs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0),
+                                                             vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };
+
+fn new_ty(k: TyKind) *mut Ty {
+    let t = u.perm_new.[Ty]();
+    t.kind = k;
+    if sh_on and not sh_inside {
+        sh_lock.lock();
+        sh_tt.ty_count += 1;
+        t.id = sh_tt.ty_count;
+        sh_lock.unlock();
+        return t;
+    }
+    TT.ty_count += 1;
+    t.id = TT.ty_count;
+    return t;
+}
+
+// A copy of the shared types' table (holding the lock), for a thread's own.
+fn tt_copy(t: *TypeTab) TypeTab {
+    let mut c = t.*;
+    c.derived = t.derived.copy();
+    c.vecs = t.vecs.copy();
+    return c;
+}
+
+fn free_tt(t: *mut TypeTab) void {
+    u.free(@ptr_cast(*mut void, t.derived.keys));
+    u.free(@ptr_cast(*mut void, t.derived.vals));
+    t.vecs.deinit();
+}
+
+pub fn init_types(pbytes: u64) void {
+    ptr_bytes = pbytes;
+}
+
+pub fn t_int(bits: i32) *mut Ty {
+    let i = @int_cast(usize, bits);
+    if u.isnil(TT.int_tys[i]) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_int(bits);
+        sh_exit();
+        TT.int_tys[i] = t;
+        return t;
+    }
+    if u.isnil(TT.int_tys[i]) {
+        let t = new_ty(T_INT);
+        t.bits = bits;
+        let mut sz: u64 = 1;
+        if bits > 8 {
+            sz = @int_cast(u64, bits) / 8;
+        }
+        t.size = sz;
+        t.align = sz;
+        if sz > 8 {
+            t.align = 16;
+        }
+        TT.int_tys[i] = t;
+    }
+    return TT.int_tys[i];
+}
+
+pub fn t_void() *mut Ty {
+    if u.isnil(TT.t_void) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_void();
+        sh_exit();
+        TT.t_void = t;
+        return t;
+    }
+    if u.isnil(TT.t_void) {
+        TT.t_void = new_ty(T_VOID);
+        TT.t_void.align = 1;
+    }
+    return TT.t_void;
+}
+
+pub fn t_ptr() *mut Ty {
+    if u.isnil(TT.t_ptr) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_ptr();
+        sh_exit();
+        TT.t_ptr = t;
+        return t;
+    }
+    if u.isnil(TT.t_ptr) {
+        TT.t_ptr = new_ty(T_PTR);
+        TT.t_ptr.size = ptr_bytes;
+        TT.t_ptr.align = ptr_bytes;
+        TT.t_ptr.bits = @int_cast(i32, ptr_bytes * 8);
+    }
+    return TT.t_ptr;
+}
+
+pub fn t_float(bits: i32) *mut Ty {
+    if sh_on and not sh_inside and (((bits == 32) and u.isnil(TT.t_f32)) or ((bits != 32) and u.isnil(TT.t_f64))) {
+        sh_enter();
+        let t = t_float(bits);
+        sh_exit();
+        if bits == 32 {
+            TT.t_f32 = t;
+        } else {
+            TT.t_f64 = t;
+        }
+        return t;
+    }
+    if bits == 32 {
+        if u.isnil(TT.t_f32) {
+            TT.t_f32 = new_ty(T_FLOAT);
+            TT.t_f32.bits = 32;
+            TT.t_f32.size = 4;
+            TT.t_f32.align = 4;
+        }
+        return TT.t_f32;
+    }
+    if u.isnil(TT.t_f64) {
+        TT.t_f64 = new_ty(T_FLOAT);
+        TT.t_f64.bits = 64;
+        TT.t_f64.size = 8;
+        TT.t_f64.align = 8;
+    }
+    return TT.t_f64;
+}
+
+pub fn t_vec(lane: *mut Ty, nl: u32) *mut Ty {
+    let lanes = @int_cast(i32, nl);
+    let k = (@as(u64, @bit_cast(u32, lane.id)) << 32) | @as(u64, nl);
+    let found = TT.vecs.get(k);
+    if found != 0 {
+        return @ptr_from_int(*mut Ty, @truncate(usize, found));
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_vec(lane, nl);
+        sh_exit();
+        TT.vecs.put(k, @as(u64, @int_from_ptr(t)));
+        return t;
+    }
+    let t = new_ty(T_VEC);
+    t.elem = lane;
+    t.lanes = lanes;
+    t.bits = lane.bits;
+    t.size = lane.size * @int_cast(u64, lanes);
+    t.align = t.size;
+    if t.align < 16 {
+        t.align = 16;
+    }
+    TT.vecs.put(k, @as(u64, @int_from_ptr(t)));
+    return t;
+}
+
+pub fn t_array(el: *mut Ty, n: u64) *mut Ty {
+    let k = u.intern(u.f2("a%s.%s", u.idec(el.id), u.udec(n)));
+    let found = TT.derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_array(el, n);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
+    }
+    let t = new_ty(T_ARRAY);
+    t.elem = el;
+    t.count = n;
+    t.size = el.size * n;
+    t.align = el.align;
+    t.has_body = true;
+    TT.derived.put(k, t);
+    return t;
+}
+
+fn layout_struct(t: *mut Ty) void {
+    let n = t.fields.len;
+    t.offs = u.perm_newn.[u64](n + 1);
+    let mut off: u64 = 0;
+    let mut al: u64 = 1;
+    for i in 0..n {
+        let f = t.fields[i];
+        off = (off + f.align - 1) & ~(f.align - 1);
+        t.offs[i] = off;
+        off += f.size;
+        if f.align > al {
+            al = f.align;
+        }
+    }
+    t.size = (off + al - 1) & ~(al - 1);
+    t.align = al;
+    t.has_body = true;
+}
+
+// A literal (anonymous) struct type: interned by its field types.
+pub fn t_struct(fields: []mut *mut Ty) *mut Ty {
+    let mut b = u.Buf.init();
+    b.s("s");
+    for f in fields {
+        b.s(".");
+        b.s(u.idec(f.id));
+    }
+    let k = u.intern(b.done());
+    let found = TT.derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_struct(fields);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
+    }
+    let t = new_ty(T_STRUCT);
+    let fs = u.perm_newn.[*mut Ty](fields.len + 1);
+    for i in 0..fields.len {
+        fs[i] = fields[i];
+    }
+    t.fields = fs[0..fields.len];
+    layout_struct(t);
+    TT.derived.put(k, t);
+    return t;
+}
+
+/// A literal struct type whose fields are at consecutive offsets, with no
+/// padding (alignment 1): the initial value of an object whose layout puts
+/// an address at an offset its type does not align (a packed C structure);
+/// the object's own alignment is its global's.
+pub fn t_struct_packed(fields: []mut *mut Ty) *mut Ty {
+    let mut b = u.Buf.init();
+    b.s("p");
+    for f in fields {
+        b.s(".");
+        b.s(u.idec(f.id));
+    }
+    let k = u.intern(b.done());
+    let found = TT.derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_struct_packed(fields);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
+    }
+    let t = new_ty(T_STRUCT);
+    let n = fields.len;
+    let fs = u.perm_newn.[*mut Ty](n + 1);
+    t.offs = u.perm_newn.[u64](n + 1);
+    let mut off: u64 = 0;
+    for i in 0..n {
+        fs[i] = fields[i];
+        t.offs[i] = off;
+        off += fields[i].size;
+    }
+    t.fields = fs[0..n];
+    t.size = off;
+    t.align = 1;
+    t.has_body = true;
+    TT.derived.put(k, t);
+    return t;
+}
+
+pub fn t_named_struct(name: []u8) *mut Ty {
+    let t = new_ty(T_STRUCT);
+    t.name = u.perm_dup(name);
+    t.align = 1;
+    return t;
+}
+
+pub fn struct_set_body(t: *mut Ty, fields: []mut *mut Ty) void {
+    let fs = u.perm_newn.[*mut Ty](fields.len + 1);
+    for i in 0..fields.len {
+        fs[i] = fields[i];
+    }
+    t.fields = fs[0..fields.len];
+    layout_struct(t);
+}
+
+pub fn t_fn(rt: *mut Ty, params: []mut *mut Ty, vararg: bool) *mut Ty {
+    let t = new_ty(T_FN);
+    t.ret = rt;
+    let ps = u.perm_newn.[*mut Ty](params.len + 1);
+    for i in 0..params.len {
+        ps[i] = params[i];
+    }
+    t.params = ps[0..params.len];
+    t.vararg = vararg;
+    return t;
+}
+
+pub fn is_agg(t: *Ty) bool {
+    return (t.kind == T_STRUCT) or (t.kind == T_ARRAY);
+}
+
+// Integer width in bits (pointers: the pointer width).
+pub fn int_width(t: *Ty) u32 {
+    return @int_cast(u32, t.bits);
+}
+
+pub fn field_ty(t: *mut Ty, i: usize) *mut Ty {
+    if (t.kind == T_ARRAY) or (t.kind == T_VEC) {
+        return t.elem;
+    }
+    return t.fields[i];
+}
+
+pub fn field_off(t: *mut Ty, i: usize) u64 {
+    if (t.kind == T_ARRAY) or (t.kind == T_VEC) {
+        return t.elem.size * @as(u64, i);
+    }
+    return t.offs[i];
+}
+
+pub fn field_count(t: *mut Ty) usize {
+    if t.kind == T_ARRAY {
+        return @int_cast(usize, t.count);
+    }
+    return t.fields.len;
+}
+
+pub fn ty_str(t: *Ty) []u8 {
+    let k = t.kind;
+    if k == T_VOID {
+        return "void";
+    }
+    if k == T_INT {
+        return u.cat2("i", u.idec(t.bits));
+    }
+    if k == T_FLOAT {
+        return u.pick(t.bits == 32, "float", "double");
+    }
+    if k == T_PTR {
+        return "ptr";
+    }
+    if k == T_VEC {
+        return u.f2("<%s x %s>", u.idec(t.lanes), ty_str(t.elem));
+    }
+    if k == T_ARRAY {
+        return u.f2("[%s x %s]", u.udec(t.count), ty_str(t.elem));
+    }
+    if k == T_STRUCT {
+        if t.name.len > 0 {
+            return u.cat2("%", t.name);
+        }
+        let mut b = u.Buf.init();
+        b.s("{ ");
+        for i in 0..t.fields.len {
+            if i != 0 {
+                b.s(", ");
+            }
+            b.s(ty_str(t.fields[i]));
+        }
+        b.s(" }");
+        return b.done();
+    }
+    let mut b = u.Buf.init();
+    b.s(ty_str(t.ret));
+    b.s(" (");
+    for i in 0..t.params.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(ty_str(t.params[i]));
+    }
+    if t.vararg {
+        b.s(", ...");
+    }
+    b.s(")");
+    return b.done();
+}

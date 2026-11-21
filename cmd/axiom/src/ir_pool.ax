@@ -1,0 +1,555 @@
+// =============================================================================
+// ir_pool.ax - thread-shared tables and dead value/block recycling, part of ir.ax.
+// =============================================================================
+import "std/sync" as sync;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Shared tables (passes.ax: the functions of a module optimized on threads
+// at once). While sh_on, the interned types, integer constants and undefs
+// are those of sh_tt and sh_cints, which a thread reads and changes only
+// holding sh_lock (sh_enter .. sh_exit, where it works on them as its own);
+// each thread's own TT and CINTS (and sh_undefs) only remember what it found
+// there. So every thread finds the one type, constant or undef there is of
+// each, whichever thread made it first; what the tables hold is the same
+// whatever the order (only the types' ids, which are keys, may differ).
+// -----------------------------------------------------------------------------
+let mut sh_on: bool = false;
+let mut sh_lock: sync.Mutex = sync.MUTEX_INIT;
+let mut sh_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
+                                   t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
+                                   t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
+                                   derived: u.SymMap.[*mut Ty].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                 vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 },
+                                   vecs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                    cap: 0, len: 0 } };
+let mut sh_cints: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                          cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+threadlocal let mut sh_inside: bool = false;  // between sh_enter and sh_exit
+// The rounds of threads begun (shared_begin), and the one whose tables this
+// thread has (sh_task_begin).
+let mut sh_round: u64 = 0;
+threadlocal let mut my_round: u64 = 0;
+// What the thread that made the module had forwarded when the round began
+// (read only while it lasts): for a value another thread finds replaced
+// that it was not given as an operand (replacement).
+let mut sh_repl: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                       len: 0 };
+threadlocal let mut sh_my_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
+                                                  t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
+                                                  t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
+                                                  derived: u.SymMap.[*mut Ty].{
+                                                      keys: @ptr_from_int(*mut usize, 0),
+                                                      vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 },
+                                                  vecs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0),
+                                                                   vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };
+threadlocal let mut sh_my_cints: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0),
+                                                         vals: @ptr_from_int(*mut u64, 0),
+                                                         cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+threadlocal let mut sh_undefs: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                     cap: 0, len: 0 };
+// (the values other than instructions a thread forwarded, for the thread
+// that made the module to forward too: shared_forwards)
+threadlocal let mut sh_fwds: u.List.[*mut Value] = u.List.[*mut Value].{
+    data: @ptr_from_int(*mut *mut Value, 0), len: 0, cap: 0 };
+
+// Takes the lock, with the shared tables as this thread's own.
+fn sh_enter() void {
+    sh_lock.lock();
+    sh_my_tt = TT;
+    sh_my_cints = CINTS;
+    TT = sh_tt;
+    CINTS = sh_cints;
+    sh_inside = true;
+}
+
+fn sh_exit() void {
+    sh_tt = TT;
+    sh_cints = CINTS;
+    TT = sh_my_tt;
+    CINTS = sh_my_cints;
+    sh_inside = false;
+    sh_lock.unlock();
+}
+
+/// On the thread that made the module, before threads optimize functions
+/// of it at once (passes.ax): its tables become the shared ones.
+pub fn shared_begin() void {
+    // (under the lock: a thread of the pool may be taking its copy of the
+    // last round's tables, sh_task_begin)
+    sh_lock.lock();
+    sh_tt = TT;
+    sh_cints = CINTS;
+    TT = tt_copy(&sh_tt);
+    sh_repl = REPL.copy();
+    sh_on = true;
+    sh_round += 1;
+    sh_lock.unlock();
+    CINTS = empty_cints();
+    sh_undefs = u.U64Map.empty();
+    u.intern_shared = true;
+}
+
+/// On that thread, once the others are done: the shared tables its own
+/// again.
+pub fn shared_end() void {
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_undefs.deinit();
+    sh_lock.lock();
+    TT = sh_tt;
+    CINTS = sh_cints;
+    sh_repl.deinit();
+    sh_on = false;
+    sh_lock.unlock();
+    u.intern_shared = false;
+}
+
+/// What a thread that optimizes functions while sh_on starts from (besides
+/// a copy of the shared types' table): the target's pointer width, and the
+/// C front end's records of inline assembly (read only).
+pub struct ShStart {
+    ptr_bytes: u64,
+    asm_flags: u.List.[u32],
+    asm_mems: u.List.[[]AsmMem],
+}
+
+pub fn sh_start() ShStart {
+    return ShStart.{ ptr_bytes: ptr_bytes, asm_flags: asm_flags, asm_mems: asm_mems };
+}
+
+/// On such a thread, first; its forwarding epochs go on from `epoch`, which
+/// tells them apart from every other thread's (SH_EPOCH).
+pub fn sh_thread_begin(s: *ShStart, epoch: u64) void {
+    ptr_bytes = s.ptr_bytes;
+    asm_flags = s.asm_flags;  // (read only: the C front end's)
+    asm_mems = s.asm_mems;
+    // (its copy of the shared types' table is taken in each round, from that
+    // round's: sh_task_begin)
+    CINTS = empty_cints();
+    sh_undefs = u.U64Map.empty();
+    REPL = u.U64Map.empty();
+    fwd_epoch = epoch;
+    cur_src = 0;
+    cur_scope = 0;
+    sh_fwds.clear();
+}
+
+/// What a thread that optimized functions while sh_on leaves: its
+/// forwarding epoch (for its next start), and the dead values, blocks and
+/// value records it kept for reuse (for the thread that made the module:
+/// shared_reuse).
+pub struct ShEnd {
+    pub epoch: u64,
+    pub vals: u.List.[*mut Value],
+    pub blocks: u.List.[*mut Block],
+    pub more: [8]u.List.[usize],
+}
+
+/// On such a thread, before each function it optimizes: on the first of a
+/// round, its own tables from that round's shared ones (while the round
+/// lasts they change only under the lock; between rounds, the thread that
+/// made the module has them as its own).
+pub fn sh_task_begin() void {
+    if (fwd_epoch < SH_EPOCH) or (my_round == sh_round) {
+        return;  // (the thread that made the module, or a round it began)
+    }
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_lock.lock();
+    TT = tt_copy(&sh_tt);
+    my_round = sh_round;
+    sh_lock.unlock();
+}
+
+/// On such a thread, last (its caches given back).
+pub fn sh_thread_end() ShEnd {
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_undefs.deinit();
+    let r = ShEnd.{ epoch: fwd_epoch, vals: free_vals, blocks: free_blocks, more: free_more };
+    free_vals = u.List.[*mut Value].empty();
+    free_blocks = u.List.[*mut Block].empty();
+    for k in @as(usize, 0)..8 {
+        free_more[k] = u.List.[usize].empty();
+    }
+    return r;
+}
+
+/// On the thread that made the module: what another thread kept for reuse
+/// (sh_thread_end) is this one's to reuse.
+pub fn shared_reuse(e: *mut ShEnd) void {
+    for v in e.vals.items() {
+        free_vals.push(v);
+    }
+    for b in e.blocks.items() {
+        free_blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in e.more[k].items() {
+            free_more[k].push(x);
+        }
+        e.more[k].deinit();
+    }
+    e.vals.deinit();
+    e.blocks.deinit();
+}
+
+// What the threads of a pool (passes.ax) buried, for any of them to reuse:
+// a thread gives its own after each function, and takes these when it has
+// none left of a kind (sh_take_spare). (Which memory a value reuses does
+// not change the code made.)
+let mut sh_spare_lock: sync.Mutex = sync.MUTEX_INIT;
+let mut sh_spare_n: u32 = 0;  // (not 0: something to take)
+let mut sh_spare: ShEnd = ShEnd.{ epoch: 0, vals: u.List.[*mut Value].{ data: @ptr_from_int(*mut *mut Value, 0), len: 0,
+                                                                        cap: 0 },
+                                  blocks: u.List.[*mut Block].{ data: @ptr_from_int(*mut *mut Block, 0), len: 0,
+                                                                cap: 0 },
+                                  more: [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 }; 8] };
+
+const SPARE_MIN: usize = 4096;  // (fewer: kept)
+
+fn sh_give_spare() void {
+    let mut n = free_vals.len + free_blocks.len;
+    for k in @as(usize, 0)..8 {
+        n += free_more[k].len;
+    }
+    if n < SPARE_MIN {
+        return;
+    }
+    sh_spare_lock.lock();
+    for v in free_vals.items() {
+        sh_spare.vals.push(v);
+    }
+    for b in free_blocks.items() {
+        sh_spare.blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in free_more[k].items() {
+            sh_spare.more[k].push(x);
+        }
+        free_more[k].clear();
+    }
+    free_vals.clear();
+    free_blocks.clear();
+    @atomic_store(&mut sh_spare_n, 1);
+    sh_spare_lock.unlock();
+}
+
+// Takes what the others gave (sh_give_spare), all of it.
+fn sh_take_spare() void {
+    sh_spare_lock.lock();
+    for v in sh_spare.vals.items() {
+        free_vals.push(v);
+    }
+    for b in sh_spare.blocks.items() {
+        free_blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in sh_spare.more[k].items() {
+            free_more[k].push(x);
+        }
+        sh_spare.more[k].clear();
+    }
+    sh_spare.vals.clear();
+    sh_spare.blocks.clear();
+    @atomic_store(&mut sh_spare_n, 0);
+    sh_spare_lock.unlock();
+}
+
+/// On such a thread, after the passes over a function: the values other
+/// than instructions it forwarded, each followed by its replacement, for
+/// the thread that made the module to forward the same (shared_forwards).
+/// What it forwarded is forgotten here: no later pass on this thread looks
+/// at that function's values.
+pub fn sh_task_end() u.List.[*mut Value] {
+    if fwd_epoch < SH_EPOCH {
+        return u.List.[*mut Value].empty();  // (the thread that made the module: its own)
+    }
+    let r = sh_fwds;
+    sh_fwds = u.List.[*mut Value].empty();
+    if REPL.len > 0 {
+        REPL.deinit();
+    }
+    sh_give_spare();
+    return r;
+}
+
+/// On the thread that made the module: what another thread forwarded
+/// (sh_task_end: each value, then its replacement) forwarded here too.
+pub fn shared_forwards(l: *u.List.[*mut Value]) void {
+    let mut k: usize = 0;
+    while (k + 1) < l.len {
+        forward(l.get(k), l.get(k + 1));
+        k += 2;
+    }
+}
+
+/// The graveyard holds nothing (of any function).
+pub fn graves_empty() bool {
+    return (grave_v.len + grave_b.len) == 0;
+}
+
+// Must be called before any type is created (pointer width of the target).
+pub fn vnil() *mut Value {
+    return u.nil.[Value]();
+}
+
+pub fn bnil() *mut Block {
+    return u.nil.[Block]();
+}
+
+fn new_val(k: ValueKind, t: *mut Ty) *mut Value {
+    let mut v = vnil();
+    if (free_vals.len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
+    if free_vals.len > 0 {
+        v = free_vals.pop();
+        if v.replaced {
+            REPL.del(@as(u64, @int_from_ptr(v)));
+        }
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0);
+    } else {
+        v = u.perm_new.[Value]();
+    }
+    v.kind = k;
+    v.ty = t;
+    return v;
+}
+
+// (The IR is allocated with perm_alloc (perm_new, perm_newn, perm_dup): it
+// outlives the code generator's memory, which util.tree_default gives back.)
+
+// -----------------------------------------------------------------------------
+// Recycling. Instructions and blocks taken out of a function go to a
+// graveyard with their function: they may be put back (moved) or be dead.
+// recycle(f), called where no pass is at work on f, takes the dead ones
+// (still out, with the instructions of dead blocks) for new values and
+// blocks to reuse, and frees their lists. Passes delete most of what they
+// make, so without this the IR of a build is mostly garbage. With
+// AXIOM_POISON, dead values and blocks are filled with 0xA5 instead and
+// never reused.
+// -----------------------------------------------------------------------------
+threadlocal let mut grave_v: u.List.[*mut Value] = u.List.[*mut Value].{
+    data: @ptr_from_int(*mut *mut Value, 0), len: 0, cap: 0 };
+threadlocal let mut grave_vf: u.List.[*mut Func] = u.List.[*mut Func].{ data: @ptr_from_int(*mut *mut Func, 0), len: 0,
+                                                                        cap: 0 };
+threadlocal let mut grave_b: u.List.[*mut Block] = u.List.[*mut Block].{
+    data: @ptr_from_int(*mut *mut Block, 0), len: 0, cap: 0 };
+threadlocal let mut free_vals: u.List.[*mut Value] = u.List.[*mut Value].{
+    data: @ptr_from_int(*mut *mut Value, 0), len: 0, cap: 0 };
+threadlocal let mut free_blocks: u.List.[*mut Block] = u.List.[*mut Block].{
+    data: @ptr_from_int(*mut *mut Block, 0), len: 0, cap: 0 };
+
+fn bury_value(v: *mut Value) void {
+    if v.grave != 0 {
+        // (an instruction of a dead block that had been moved before)
+        let k = @as(usize, v.grave - 1);
+        let last = grave_v.get(grave_v.len - 1);
+        grave_v.set(k, last);
+        grave_vf.set(k, grave_vf.get(grave_vf.len - 1));
+        last.grave = v.grave;
+        grave_v.len -= 1;
+        grave_vf.len -= 1;
+        v.grave = 0;
+    }
+    if dbg_on {
+        dbg_buried(v);
+        _ = dbg_take(v);
+    }
+    unregister(v);
+    drop_uses(v);
+    free_xu(v);
+    v.xs.deinit();
+    release_more(v);
+    if u.poisoning() {
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0xA5);
+        return;
+    }
+    free_vals.push(v);
+}
+
+// Gives back the lists of f's instructions and blocks, once its code is made
+// and the function is not read again.
+pub fn release_lists(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            // (off the lists, which go: see forget_uses)
+            i.xucap = i.xucap & XU_CAP;
+            i.first_use = u.nil.[Use]();
+            i.nuses = 0;
+            free_xu(i);
+            i.xs.deinit();
+            set_xs(i, u.List.[*mut Value].empty());
+            i = i.next;
+        }
+        b.preds.deinit();
+        b.preds = u.List.[*mut Block].empty();
+        b.dom_kids.deinit();
+        b.dom_kids = u.List.[*mut Block].empty();
+        b = b.next;
+    }
+}
+
+fn free_xu(v: *mut Value) void {
+    if @int_from_ptr(v.xu) != 0 {
+        u.free(@ptr_cast(*mut void, v.xu));
+        v.xu = @ptr_from_int(*mut XUse, 0);
+        v.xucap = v.xucap & XU_REG;
+    }
+}
+
+// f's instructions are done with: off the lists, which go (together: none
+// is taken off another's).
+fn forget_uses(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.xucap = i.xucap & XU_CAP;
+            i.first_use = u.nil.[Use]();
+            i.nuses = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+fn bury_block(b: *mut Block) void {
+    if dbg_on {
+        _ = mk_block_take(b);
+    }
+    let mut i = b.first;
+    while u.notnil(i) {
+        let next = i.next;
+        bury_value(i);
+        i = next;
+    }
+    b.preds.deinit();
+    b.dom_kids.deinit();
+    if u.poisoning() {
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, b), @size_of(Block)), 0xA5);
+        return;
+    }
+    free_blocks.push(b);
+}
+
+// Each value or block is in the graveyard once, under the function it was
+// last taken out of (a value may move between functions, and in and out
+// of blocks, before it dies).
+fn to_grave(v: *mut Value, f: *mut Func) void {
+    if v.grave != 0 {
+        let k = @as(usize, v.grave - 1);
+        if grave_vf.get(k) != f {
+            grave_vf.set(k, f);
+            f.graves.push(v);
+        }
+        return;
+    }
+    grave_v.push(v);
+    grave_vf.push(f);
+    v.grave = @truncate(u32, grave_v.len);
+    f.graves.push(v);
+}
+
+fn block_to_grave(b: *mut Block) void {
+    if b.grave != 0 {
+        return;
+    }
+    grave_b.push(b);
+    b.grave = @truncate(u32, grave_b.len);
+    b.fnp.bgraves.push(b);
+}
+
+// The places in the graveyard of f's entries (from f's lists, which may
+// name entries that have since moved on or gone), in order.
+fn grave_places(vs: *mut u.List.[*mut Value], bs: *mut u.List.[*mut Block], f: *mut Func) u.List.[usize] {
+    let mut pos = u.List.[usize].empty();
+    for k in 0..vs.len {
+        let v = vs.get(k);
+        let x = @as(usize, v.grave) -% 1;  // (a buried value may be poison)
+        if (x < grave_v.len) and (grave_v.get(x) == v) and (grave_vf.get(x) == f) {
+            pos.push(x);
+        }
+    }
+    for k in 0..bs.len {
+        let b = bs.get(k);
+        let x = @as(usize, b.grave) -% 1;
+        if (x < grave_b.len) and (grave_b.get(x) == b) and (b.fnp == f) {
+            pos.push(x);
+        }
+    }
+    vs.clear();
+    bs.clear();
+    u.sort_usize(pos.items_mut());
+    let mut n: usize = 0;
+    for k in 0..pos.len {
+        if (n == 0) or (pos.get(n - 1) != pos.get(k)) {
+            pos.set(n, pos.get(k));
+            n += 1;
+        }
+    }
+    pos.len = n;
+    return pos;
+}
+
+// Takes f's entries out of the graveyard in the order a scan from the start
+// would (each taken out with the last entry moved into its place, which is
+// looked at again), going only to the places of f's entries.
+pub fn recycle(f: *mut Func) void {
+    // (operands still reaching a replaced parameter, global or function go
+    // straight on)
+    apply_forwarding(f);
+    let mut nob = u.List.[*mut Block].empty();
+    let mut pv = grave_places(&mut f.graves, &mut nob, f);
+    let mut i: usize = 0;
+    let mut j: usize = pv.len;  // pv[i..j]: the places still holding f's entries
+    while i < j {
+        let k = pv.get(i);
+        let v = grave_v.get(k);
+        let lastk = grave_v.len - 1;
+        let last = grave_v.get(lastk);
+        grave_v.set(k, last);
+        grave_vf.set(k, grave_vf.get(lastk));
+        last.grave = @truncate(u32, k + 1);
+        grave_v.len -= 1;
+        grave_vf.len -= 1;
+        v.grave = 0;
+        if u.isnil(v.blk) {
+            bury_value(v);
+        }
+        if pv.get(j - 1) == lastk {
+            // (f's last entry, now at k: next; or the one just taken out)
+            j -= 1;
+        } else {
+            i += 1;
+        }
+    }
+    pv.deinit();
+    let mut nov = u.List.[*mut Value].empty();
+    let mut pb = grave_places(&mut nov, &mut f.bgraves, f);
+    i = 0;
+    j = pb.len;
+    while i < j {
+        let k = pb.get(i);
+        let b = grave_b.get(k);
+        let lastk = grave_b.len - 1;
+        let last = grave_b.get(lastk);
+        grave_b.set(k, last);
+        last.grave = @truncate(u32, k + 1);
+        grave_b.len -= 1;
+        b.grave = 0;
+        if u.isnil(b.prev) and u.isnil(b.next) and (f.first != b) {
+            bury_block(b);
+        }
+        if pb.get(j - 1) == lastk {
+            j -= 1;
+        } else {
+            i += 1;
+        }
+    }
+    pb.deinit();
+}

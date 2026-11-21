@@ -1,0 +1,415 @@
+// =============================================================================
+// wasm_intr.ax - scalar and system intrinsic lowering, part of wasm.ax.
+// =============================================================================
+import "ir.ax" as ir;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+fn gen_intr(v: *mut ir.Value) void {
+    let id = ir.intr_id(v);
+    let t = v.ty;
+    if id == ir.IN_ASM {
+        gen_asm(v);
+        return;
+    }
+    if id == ir.IN_CALL_RESULT {
+        asm_result(v);
+        return;
+    }
+    if gen_sys_intr(v, id) {
+        return;
+    }
+    let a = v.xs.get(0);
+    if t.kind == ir.T_VEC {
+        gen_vec_intr(v, id);
+        return;
+    }
+    if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_SWIZZLE) or
+       (id == ir.IN_DOT_I16) {
+        gen_vec_intr(v, id);
+        return;
+    }
+    if t.kind == ir.T_FLOAT {
+        gen_float_intr(v, id);
+        return;
+    }
+    // integers
+    let bits = t.bits;
+    if id == ir.IN_CTLZ {
+        push_ext(a, false);
+        iop(t, 0x67, 0x79);
+        if bits < 32 {
+            i32c(@as(i64, 32 - bits));
+            op(0x6b);
+        }
+        return;
+    }
+    if id == ir.IN_CTTZ {
+        push(a);
+        if bits < 32 {
+            i32c(@as(i64, 1) << @int_cast(u32, bits));
+            op(0x72);
+        }
+        iop(t, 0x68, 0x7a);
+        return;
+    }
+    if id == ir.IN_CTPOP {
+        push_ext(a, false);
+        iop(t, 0x69, 0x7b);
+        return;
+    }
+    if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
+        gen_rotate(v, id);
+        return;
+    }
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        gen_minmax(v, id);
+        return;
+    }
+    if id == ir.IN_ABS {
+        gen_abs(v);
+        return;
+    }
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        scalar_sat(v, id);
+        return;
+    }
+    fail(u.f1("intrinsic %s", u.idec(@int_from_enum(id))));
+}
+
+// The intrinsics of the machine rather than of values: traps, memory size
+// and growth, atomic waits and notifies, the stack pointer. False if v is
+// not one.
+fn gen_sys_intr(v: *mut ir.Value, id: ir.Intrinsic) bool {
+    if id == ir.IN_TRAP {
+        op(0x00);
+        return true;
+    }
+    if id == ir.IN_MEMSIZE {
+        op(0x3f);
+        op(0);
+        return true;
+    }
+    if id == ir.IN_MEMGROW {
+        push(v.xs.get(0));
+        op(0x40);
+        op(0);
+        view_after_grow();
+        return true;
+    }
+    if id == ir.IN_WAIT32 {
+        push(v.xs.get(0));
+        view_before_addr(0, 4);
+        push(v.xs.get(1));
+        push(v.xs.get(2));
+        op_fe(1);
+        memarg(4, 4, 0);
+        view_after_acquire();
+        return true;
+    }
+    if id == ir.IN_NOTIFY {
+        push(v.xs.get(0));
+        view_before_addr(0, 4);
+        push(v.xs.get(1));
+        op_fe(0);
+        memarg(4, 4, 0);
+        return true;
+    }
+    if id == ir.IN_GET_SP {
+        sp_global(0x23);
+        return true;
+    }
+    if id == ir.IN_SJLJ_TOKEN {
+        local_get(fp_local);
+        return true;
+    }
+    if id == ir.IN_SJLJ_CAUGHT {
+        // (the flag, cleared)
+        local_get(sj_resumed);
+        i32c(0);
+        local_set(sj_resumed);
+        return true;
+    }
+    if id == ir.IN_SJLJ_ENV {
+        local_get(sj_env);
+        return true;
+    }
+    if id == ir.IN_SET_SP {
+        push(v.xs.get(0));
+        sp_global(0x24);
+        return true;
+    }
+    if id == ir.IN_STACK_SAVE {
+        sp_global(0x23);
+        return true;
+    }
+    if id == ir.IN_STACK_RESTORE {
+        push(v.xs.get(0));
+        sp_global(0x24);
+        return true;
+    }
+    if id == ir.IN_STACK_ALLOC {
+        // sp = sp - ((n + 15) & ~15): 16-aligned, as every frame keeps it
+        let t = new_local(ptr_vt());
+        sp_global(0x23);
+        push(v.xs.get(0));
+        pconst(15);
+        padd_sub(false);
+        pconst(~@as(u64, 15));
+        op(u.pick(W64, "\x83", "\x71")[0]);  // and
+        padd_sub(true);
+        local_tee(t);
+        sp_global(0x24);
+        local_get(t);
+        return true;
+    }
+    return false;
+}
+
+// A float intrinsic (f32 or f64 by v's type).
+fn gen_float_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let f64_ = t.bits == 64;
+    let mut base: u8 = 0x8b;
+    if f64_ {
+        base = 0x99;
+    }
+    match id {
+        .FABS => {
+            push(a);
+            op(base);
+        }
+        .CEIL => {
+            push(a);
+            op(base + 2);
+        }
+        .FLOOR => {
+            push(a);
+            op(base + 3);
+        }
+        .FTRUNC => {
+            push(a);
+            op(base + 4);
+        }
+        .NEAREST => {
+            push(a);
+            op(base + 5);
+        }
+        .SQRT => {
+            push(a);
+            op(base + 6);
+        }
+        .FMIN => {
+            push(a);
+            push(v.xs.get(1));
+            op(base + 11);
+        }
+        .FMAX => {
+            push(a);
+            push(v.xs.get(1));
+            op(base + 12);
+        }
+        .COPYSIGN => {
+            push(a);
+            push(v.xs.get(1));
+            op(base + 13);
+        }
+        else => { fail(u.f1("float intrinsic %s", u.idec(@int_from_enum(id)))); }
+    }
+}
+
+// Rotations: wasm's own for 32 and 64 bits, shifts for narrower ones.
+fn gen_rotate(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let bits = t.bits;
+    let k = v.xs.get(1);
+    if bits >= 32 {
+        push(a);
+        push(k);
+        if id == ir.IN_ROTL {
+            iop(t, 0x77, 0x89);
+        } else {
+            iop(t, 0x78, 0x8a);
+        }
+        return;
+    }
+    // narrow: (x << k | x >> (bits - k)) with k taken mod bits
+    let x = new_local(wo.I32);
+    let kk = new_local(wo.I32);
+    push_ext(a, false);
+    local_set(x);
+    push(k);
+    i32c(@as(i64, bits - 1));
+    op(0x71);
+    if id == ir.IN_ROTR {
+        // rotr k = rotl (bits - k) mod bits
+        local_set(kk);
+        i32c(@as(i64, bits));
+        local_get(kk);
+        op(0x6b);
+        i32c(@as(i64, bits - 1));
+        op(0x71);
+    }
+    local_set(kk);
+    local_get(x);
+    local_get(kk);
+    op(0x74);
+    local_get(x);
+    i32c(@as(i64, bits));
+    local_get(kk);
+    op(0x6b);
+    op(0x76);
+    op(0x72);
+}
+
+// Integer minimum and maximum: a select on a comparison.
+fn gen_minmax(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let w = is64(t);
+    let sg = (id == ir.IN_SMIN) or (id == ir.IN_SMAX);
+    let x = new_local(vt(t));
+    let y = new_local(vt(t));
+    push_ext(a, sg);
+    local_tee(x);
+    push_ext(v.xs.get(1), sg);
+    local_tee(y);
+    local_get(x);
+    local_get(y);
+    match id {
+        .SMIN => { icmp_op(ir.IntSLT, w); }
+        .SMAX => { icmp_op(ir.IntSGT, w); }
+        .UMIN => { icmp_op(ir.IntULT, w); }
+        else  => { icmp_op(ir.IntUGT, w); }
+    }
+    op(0x1b);
+}
+
+// Absolute value: a select of x and 0 - x.
+fn gen_abs(v: *mut ir.Value) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let w = is64(t);
+    let x = new_local(vt(t));
+    push_ext(a, true);
+    local_set(x);
+    if w {
+        i64c(0);
+    } else {
+        i32c(0);
+    }
+    local_get(x);
+    iop(t, 0x6b, 0x7d);
+    local_get(x);
+    local_get(x);
+    if w {
+        i64c(0);
+    } else {
+        i32c(0);
+    }
+    icmp_op(ir.IntSLT, w);
+    op(0x1b);
+}
+
+// Saturating add / sub on scalars: computed wide (i64 for <= 32 bits) and
+// clamped; 64-bit uses the overflow tests.
+fn scalar_sat(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let bits = t.bits;
+    let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
+    let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
+    if bits <= 32 {
+        let r = new_local(wo.I64);
+        push_ext(v.xs.get(0), sg);
+        op(u.pick(sg, "\xac", "\xad")[0]);
+        push_ext(v.xs.get(1), sg);
+        op(u.pick(sg, "\xac", "\xad")[0]);
+        op(u.pick(is_add, "\x7c", "\x7d")[0]);
+        local_set(r);
+        let mut lo: i64 = 0;
+        let mut hi: i64 = 0;
+        if sg {
+            lo = -(@as(i64, 1) << @int_cast(u32, bits - 1));
+            hi = (@as(i64, 1) << @int_cast(u32, bits - 1)) - 1;
+        } else {
+            hi = @bit_cast(i64, (@as(u64, 1) << @int_cast(u32, bits)) - 1);
+        }
+        // clamp in i64: r < lo ? lo : (r > hi ? hi : r)
+        i64c(lo);
+        i64c(hi);
+        local_get(r);
+        local_get(r);
+        i64c(hi);
+        op(0x55);  // i64.gt_s
+        op(0x1b);
+        let r2 = new_local(wo.I64);
+        local_tee(r2);
+        local_get(r2);
+        i64c(lo);
+        op(0x53);  // i64.lt_s
+        op(0x1b);
+        op(0xa7);
+        return;
+    }
+    // 64-bit
+    let x = new_local(wo.I64);
+    let y = new_local(wo.I64);
+    let r = new_local(wo.I64);
+    push(v.xs.get(0));
+    local_set(x);
+    push(v.xs.get(1));
+    local_set(y);
+    local_get(x);
+    local_get(y);
+    op(u.pick(is_add, "\x7c", "\x7d")[0]);
+    local_set(r);
+    if not sg {
+        if is_add {
+            // r < x: max
+            i64c(-1);
+            local_get(r);
+            local_get(r);
+            local_get(x);
+            op(0x54);  // lt_u
+            op(0x1b);
+        } else {
+            // x < y: 0
+            i64c(0);
+            local_get(r);
+            local_get(x);
+            local_get(y);
+            op(0x54);
+            op(0x1b);
+        }
+        return;
+    }
+    // signed: overflow if ((x ^ r) & (y ^ r)) < 0 (add), ((x ^ y) & (x ^ r)) < 0 (sub)
+    // saturated value: x < 0 ? MIN : MAX
+    local_get(x);
+    i64c(63);
+    op(0x87);  // shr_s: 0 or -1
+    i64c(9223372036854775807);
+    op(0x85);  // xor: MAX or MIN
+    local_get(r);
+    if is_add {
+        local_get(x);
+        local_get(r);
+        op(0x85);
+        local_get(y);
+        local_get(r);
+        op(0x85);
+    } else {
+        local_get(x);
+        local_get(y);
+        op(0x85);
+        local_get(x);
+        local_get(r);
+        op(0x85);
+    }
+    op(0x83);
+    i64c(0);
+    op(0x53);
+    op(0x1b);
+}

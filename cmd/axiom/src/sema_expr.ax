@@ -1,0 +1,770 @@
+// =============================================================================
+// sema_expr.ax - expression dispatch, names, field access, literals,
+// indexing/slicing, dereference and instruction builtins, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "modload.ax" as modl;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+fn decl_ref(e: *mut ast.Expr, d: *mut ast.Decl) void {
+    resolve_decl(d);
+    ast.set_decl(e, d);
+    let k = d.kind;
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        ensure_infer_ret(d);
+        e.cat = ast.CAT_FUNC;
+        ast.set_gargs(e, ty.no_types());
+        e.ty = tnil();
+        return;
+    }
+    if k == ast.D_CONST {
+        e.cat = ast.CAT_VALUE;
+        e.ty = d.ty;
+        if u.notnil(d.cexpr) {
+            e.is_const = d.cexpr.is_const or (d.cexpr.kind == ast.E_BOOL);
+            ast.set_cval(e, ast.cval_of(d.cexpr));
+            ast.set_fval(e, ast.fval_of(d.cexpr));
+            e.bval = d.cexpr.bval;
+        }
+        return;
+    }
+    if k == ast.D_GLOBAL {
+        e.cat = ast.CAT_VALUE;
+        e.ty = d.ty;
+        if u.notnil(C) and C.const_ctx {
+            e.is_const = false;
+        }
+        return;
+    }
+    if (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM) {
+        if d.gparams.len != 0 {
+            e.cat = ast.CAT_GENERIC;
+        } else {
+            e.cat = ast.CAT_TYPE;
+            ast.set_tval(e, d.ty);
+        }
+        return;
+    }
+    e.cat = ast.CAT_VALUE;
+    e.ty = ty.t_invalid;
+}
+
+fn resolve_ident(e: *mut ast.Expr) void {
+    let fc = C;
+    let l = scope_lookup(e.name);
+    if u.notnil(l) {
+        if not fc.flow_dead and not fc.skip_moved_check and l.moved {
+            let d = dg.err(e.span, "E0709", u.f1("use of moved value '%s'", l.name));
+            dg.note(d, l.moved_span, "value moved here");
+        }
+        ast.set_local(e, l);
+        e.cat = ast.CAT_VALUE;
+        e.ty = l.ty;
+        e.weakened = l.weakened;
+        return;
+    }
+    let gp = lookup_gparam(&mut C.tc, e.name);
+    if u.notnil(gp) {
+        if gp.is_const {
+            e.cat = ast.CAT_VALUE;
+            e.ty = gp.const_type;
+            ast.set_tval(e, gp);
+        } else {
+            e.cat = ast.CAT_TYPE;
+            ast.set_tval(e, gp);
+        }
+        return;
+    }
+    let d = module_lookup(C.tc.mod, e.name);
+    if u.notnil(d) {
+        decl_ref(e, d);
+        return;
+    }
+    let imp = modl.module_lookup_import(C.tc.mod, e.span.file, e.name);
+    if u.notnil(imp) {
+        e.cat = ast.CAT_MODULE;
+        ast.set_module(e, imp.imported);
+        e.ty = ty.t_invalid;
+        if u.isnil(imp.imported) {
+            e.cat = ast.CAT_VALUE;
+        }
+        return;
+    }
+    _ = dg.err(e.span, "E0202", u.f1("unknown name '%s'", e.name));
+    e.cat = ast.CAT_VALUE;
+    e.ty = ty.t_invalid;
+}
+
+// ---------------------------------------------------------------------------
+// Field access
+// ---------------------------------------------------------------------------
+// A method or associated function is visible outside its module only if it is
+// `pub` (spec §4.2).
+fn check_method_visible(e: *mut ast.Expr, m: *mut ast.Decl) void {
+    if not m.is_pub and (m.module != C.tc.mod) {
+        let g = dg.err(ast.name_span_of(e), "E0203", u.f1("'%s' is not public", e.name));
+        dg.note(g, m.name_span, "declared here");
+    }
+}
+
+// A named struct's field is visible outside its module only if it is `pub`
+// (spec §4.2).
+fn check_field_visible(use_sp: u.Span, base_decl: *ast.Decl, f: *ast.Field) void {
+    if not base_decl.anon and not f.is_pub and (base_decl.module != C.tc.mod) {
+        let g = dg.err(use_sp, "E0203", u.f1("'%s' is not public", f.name));
+        dg.note(g, f.span, "declared here");
+    }
+}
+
+fn check_field(e: *mut ast.Expr) *mut ast.Type {
+    let a = e.a;
+    _ = check_operand(a, tnil());
+    let name = e.name;
+    let ac = a.cat;
+    if ac == ast.CAT_MODULE {
+        let d = module_lookup(ast.module_of(a), name);
+        if u.isnil(d) {
+            _ = dg.err(ast.name_span_of(e), "E0202", u.f1("module has no declaration '%s'", name));
+            return set_ty(e, ty.t_invalid);
+        }
+        if not d.is_pub {
+            let g = dg.err(ast.name_span_of(e), "E0203", u.f1("'%s' is not public", name));
+            dg.note(g, d.name_span, "declared here");
+        }
+        decl_ref(e, d);
+        if d.kind == ast.D_CONST {
+            ast.set_field_kind(e, ast.FK_CONST);
+        } else {
+            ast.set_field_kind(e, ast.FK_DECL);
+        }
+        return e.ty;
+    }
+    if ac == ast.CAT_GENERIC {
+        _ = dg.err(a.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", ast.decl_of(a).name,
+                                         ast.decl_of(a).name));
+        return set_ty(e, ty.t_invalid);
+    }
+    if ac == ast.CAT_TYPE {
+        let t = ast.tval_of(a);
+        if (t.kind != ast.TY_STRUCT) and (t.kind != ast.TY_UNION) and (t.kind != ast.TY_ENUM) {
+            _ = dg.err(ast.name_span_of(e), "E0404", u.f2("type %s has no member '%s'", tstr(t), name));
+            return set_ty(e, ty.t_invalid);
+        }
+        let m = find_method(t.decl, name);
+        if u.notnil(m) {
+            check_method_visible(e, m);
+            resolve_decl(m);
+            ensure_infer_ret(m);
+            e.cat = ast.CAT_FUNC;
+            ast.set_field_kind(e, ast.FK_DECL);
+            ast.set_decl(e, m);
+            ast.set_gargs(e, t.args);
+            return tnil();
+        }
+        if t.kind == ast.TY_UNION {
+            let v = find_variant(t.decl, name);
+            if v >= 0 {
+                ast.set_index(e, v);
+                ast.set_tval(e, t);
+                if u.notnil(t.decl.variants.at(@int_cast(usize, v)).ty) {
+                    e.cat = ast.CAT_VARIANT;
+                    return tnil();
+                }
+                e.cat = ast.CAT_VALUE;
+                ast.set_field_kind(e, ast.FK_VARIANT_UNIT);
+                e.ty = t;
+                return e.ty;
+            }
+        }
+        if t.kind == ast.TY_ENUM {
+            let v = find_variant(t.decl, name);
+            if v >= 0 {
+                ast.set_index(e, v);
+                e.cat = ast.CAT_VALUE;
+                ast.set_field_kind(e, ast.FK_CONST);
+                e.is_const = true;
+                ast.set_cval(e, t.decl.variants.at(@int_cast(usize, v)).value);
+                e.ty = t;
+                return e.ty;
+            }
+            _ = dg.err(ast.name_span_of(e), "E0404", u.f2("enum %s has no member or method '%s'", tstr(t), name));
+            return set_ty(e, ty.t_invalid);
+        }
+        _ = dg.err(ast.name_span_of(e), "E0404", u.f2("type %s has no method or variant '%s'", tstr(t), name));
+        return set_ty(e, ty.t_invalid);
+    }
+    if (ac == ast.CAT_FUNC) or (ac == ast.CAT_METHOD) or (ac == ast.CAT_VARIANT) {
+        check_value(a);
+    }
+    let t = a.ty;
+    if u.isnil(t) or (t.kind == ast.TY_INVALID) {
+        return set_ty(e, ty.t_invalid);
+    }
+    let mut base = t;
+    if (t.kind == ast.TY_PTR) and
+       ((t.elem.kind == ast.TY_STRUCT) or (t.elem.kind == ast.TY_UNION) or (t.elem.kind == ast.TY_ENUM)) {
+        base = t.elem;
+        ast.set_self_mode(e, ast.SELF_DEREF);
+    }
+    if base.kind == ast.TY_STRUCT {
+        let fi = find_field(base.decl, name);
+        if fi >= 0 {
+            check_field_visible(ast.name_span_of(e), base.decl, base.decl.fields.at(@int_cast(usize, fi)));
+            ast.set_field_kind(e, ast.FK_STRUCT);
+            ast.set_index(e, fi);
+            let mut ft = ty.type_field(base, @int_cast(usize, fi));
+            let base_immut = ((ast.self_mode_of(e) == ast.SELF_DEREF) and not t.is_mut) or
+                             ((ast.self_mode_of(e) != ast.SELF_DEREF) and via_immut_indirection(a));
+            if base_immut {
+                let wt = weaken_mut(ft);
+                if wt != ft {
+                    ft = wt;
+                    e.weakened = true;
+                }
+            }
+            e.ty = ft;
+            return e.ty;
+        }
+    }
+    if (base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM) {
+        let m = find_method(base.decl, name);
+        if u.notnil(m) {
+            check_method_visible(e, m);
+            resolve_decl(m);
+            ensure_infer_ret(m);
+            e.cat = ast.CAT_METHOD;
+            ast.set_decl(e, m);
+            ast.set_b(e, a);  // receiver
+            ast.set_gargs(e, base.args);
+            return tnil();
+        }
+    }
+    if t.kind == ast.TY_SLICE {
+        if u.str_eq(name, "len") {
+            ast.set_field_kind(e, ast.FK_SLICE_LEN);
+            e.ty = ty.t_usize;
+            return e.ty;
+        }
+        if u.str_eq(name, "ptr") {
+            ast.set_field_kind(e, ast.FK_SLICE_PTR);
+            e.ty = ty.type_ptr(t.elem, t.is_mut);
+            e.weakened = a.weakened;
+            return e.ty;
+        }
+    }
+    if (t.kind == ast.TY_ARRAY) and u.str_eq(name, "len") {
+        ast.set_field_kind(e, ast.FK_ARRAY_LEN);
+        if u.isnil(t.len_param) {
+            e.is_const = true;
+            ast.set_cval(e, u.I128.of(t.len));
+        }
+        e.ty = ty.t_usize;
+        return e.ty;
+    }
+    _ = dg.err(ast.name_span_of(e), "E0404", u.f2("%s has no field or method '%s'", tstr(t), name));
+    return set_ty(e, ty.t_invalid);
+}
+
+// ---------------------------------------------------------------------------
+// Literals
+// ---------------------------------------------------------------------------
+fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let mut t = tnil();
+    if u.notnil(e.a) {
+        _ = check_operand(e.a, tnil());
+        if (e.a.cat == ast.CAT_TYPE) and (ast.tval_of(e.a).kind == ast.TY_STRUCT) {
+            t = ast.tval_of(e.a);
+        } else if e.a.cat == ast.CAT_GENERIC {
+            _ = dg.err(e.a.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]",
+                                               ast.decl_of(e.a).name, ast.decl_of(e.a).name));
+        } else if not ((e.a.cat == ast.CAT_TYPE) and (ast.tval_of(e.a).kind == ast.TY_INVALID)) and
+                  not (u.notnil(e.a.ty) and (e.a.ty.kind == ast.TY_INVALID)) {
+            _ = dg.err(e.a.span, "E0408", "struct literal requires a struct type");
+        }
+    } else if u.notnil(expected) {
+        let mut x = expected;
+        while u.notnil(x) and ((x.kind == ast.TY_ERRUNION) or (x.kind == ast.TY_OPT)) {
+            x = x.elem;
+        }
+        if x.kind == ast.TY_STRUCT {
+            t = x;
+        } else if x.kind != ast.TY_INVALID {
+            _ = dg.err(e.span, "E0408", u.f1("anonymous struct literal where %s is expected", tstr(expected)));
+        }
+    } else {
+        _ = dg.err(e.span, "E0503", "cannot infer the type of '.{ ... }'; write T.{ ... }");
+    }
+    if u.isnil(t) {
+        for i in 0..ast.more(e).inits.len {
+            _ = check_expr(ast.ext(e).inits.at_mut(i).value, tnil());
+        }
+        return set_ty(e, ty.t_invalid);
+    }
+    let d = t.decl;
+    let nf = d.fields.len;
+    let mut order_ok = ast.more(e).inits.len == nf;
+    for i in 0..ast.more(e).inits.len {
+        if not order_ok {
+            break;
+        }
+        if not u.same(ast.more(e).inits.at(i).name, d.fields.at(i).name) {
+            order_ok = false;
+        }
+    }
+    let mut priv_missing = false;
+    if not d.anon and (d.module != C.tc.mod) {
+        for i in 0..nf {
+            let f = d.fields.at(i);
+            if f.is_pub {
+                continue;
+            }
+            let mut given = false;
+            for j in 0..ast.more(e).inits.len {
+                if u.same(ast.more(e).inits.at(j).name, f.name) {
+                    given = true;
+                    break;
+                }
+            }
+            if not given {
+                let dg2 = dg.err(e.span, "E0203", u.f2("cannot construct %s: field '%s' is not public", tstr(t),
+                                                       f.name));
+                dg.note(dg2, f.span, "declared here");
+                priv_missing = true;
+                break;
+            }
+        }
+    }
+    if not priv_missing and not order_ok {
+        // Build a helpful message: expected field order.
+        let mut b = u.Buf.init();
+        for i in 0..nf {
+            if i != 0 {
+                b.s(", ");
+            }
+            b.s(d.fields.at(i).name);
+        }
+        let dgn = dg.err(e.span, "E0410", u.f2("struct literal of %s must list every field, in declaration order: %s",
+                                               tstr(t), b.done()));
+        // machine fix: reorder when the set of names is exactly right
+        let mut same_set = ast.more(e).inits.len == nf;
+        for i in 0..nf {
+            if not same_set {
+                break;
+            }
+            let mut found = false;
+            for j in 0..ast.more(e).inits.len {
+                if u.same(ast.more(e).inits.at(j).name, d.fields.at(i).name) {
+                    found = true;
+                }
+            }
+            if not found {
+                same_set = false;
+            }
+        }
+        if same_set and (nf > 0) {
+            let mut r = u.Buf.init();
+            for i in 0..nf {
+                for j in 0..ast.more(e).inits.len {
+                    let fi = ast.more(e).inits.at(j);
+                    if not u.same(fi.name, d.fields.at(i).name) {
+                        continue;
+                    }
+                    if i != 0 {
+                        r.s(", ");
+                    }
+                    r.s(fi.name);
+                    r.s(": ");
+                    r.s(u.span_text(fi.value.span));
+                }
+            }
+            let whole = u.mkspan(e.span.file, ast.more(e).inits.at(0).span.start,
+                                 ast.more(e).inits.at(ast.more(e).inits.len - 1).value.span.end);
+            let fx = dg.fix(dgn, "reorder the fields", "machine");
+            let text = r.done();
+            // (the C implementation copies the replacement as a C string)
+            let z = u.find(text, 0);
+            if z >= 0 {
+                dg.edit(fx, whole, u.dup(text[0..@int_cast(usize, z)]));
+            } else {
+                dg.edit(fx, whole, text);
+            }
+        }
+    }
+    for i in 0..ast.more(e).inits.len {
+        let fi = ast.ext(e).inits.at_mut(i);
+        let idx = find_field(d, fi.name);
+        if idx < 0 {
+            _ = dg.err(fi.span, "E0404", u.f2("%s has no field '%s'", tstr(t), fi.name));
+            _ = check_expr(fi.value, tnil());
+            continue;
+        }
+        check_field_visible(fi.span, d, d.fields.at(@int_cast(usize, idx)));
+        _ = check_expr_to(&mut fi.value, ty.type_field(t, @int_cast(usize, idx)));
+        move_or_check_nocopy(fi.value);
+    }
+    ast.set_tval(e, t);
+    e.ty = t;
+    return e.ty;
+}
+
+fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    let mut x = expected;
+    while u.notnil(x) and ((x.kind == ast.TY_ERRUNION) or (x.kind == ast.TY_OPT)) {
+        x = x.elem;
+    }
+    let mut elem = tnil();
+    if u.notnil(x) and (x.kind == ast.TY_ARRAY) {
+        elem = x.elem;
+    }
+    if e.kind == ast.E_ARRAY_REPEAT {
+        _ = check_expr_to(ast.b_mut(e), ty.t_usize);
+        // a const generic parameter gives an array of that (symbolic) length
+        let mut lenp = tnil();
+        if (ast.b_of(e).kind == ast.E_IDENT) and u.notnil(ast.tval_of(ast.b_of(e))) and
+           (ast.tval_of(ast.b_of(e)).kind == ast.TY_PARAM) and ast.tval_of(ast.b_of(e)).is_const and
+           (ast.tval_of(ast.b_of(e)).const_type.kind == ast.TY_INT) {
+            lenp = ast.tval_of(ast.b_of(e));
+        }
+        if u.isnil(lenp) and not ast.b_of(e).is_const and (ast.b_of(e).ty.kind != ast.TY_INVALID) {
+            _ = dg.err(ast.b_of(e).span, "E0350", "array repeat count must be a constant");
+            return set_ty(e, ty.t_invalid);
+        }
+        let n = ast.cval_of(ast.b_of(e)).i64v();
+        if u.notnil(elem) {
+            _ = check_expr_to(&mut e.a, elem);
+        } else {
+            elem = check_expr(e.a, tnil());
+            if ty.is_untyped(elem) {
+                _ = finalize_untyped(&mut e.a);
+                return set_ty(e, ty.t_invalid);
+            }
+        }
+        if (u.notnil(lenp) or (n > 1)) and u.notnil(elem) and type_is_nocopy(elem) {
+            _ = dg.err(e.span, "E0708", u.f1("cannot repeat nocopy value of type %s", tstr(elem)));
+        } else {
+            move_or_check_nocopy(e.a);
+        }
+        if u.notnil(lenp) {
+            e.ty = ty.type_array_param(elem, lenp);
+            return e.ty;
+        }
+        let t = ty.type_array(elem, n);
+        if u.notnil(x) and (x.kind == ast.TY_ARRAY) and u.isnil(x.len_param) and (x.len != n) and
+           (x.elem.kind != ast.TY_INVALID) {
+            type_mismatch(e, x, t);
+        }
+        e.ty = t;
+        return e.ty;
+    }
+    let n = ast.args_of(e).len;
+    for i in 0..n {
+        if u.notnil(elem) {
+            _ = check_expr_to(ast.args_mut(e).at_mut(i), elem);
+            move_or_check_nocopy(ast.args_of(e).get(i));
+        } else {
+            elem = check_expr(ast.args_of(e).get(i), tnil());
+            if ty.is_untyped(elem) {
+                _ = finalize_untyped(ast.args_mut(e).at_mut(i));
+                elem = tnil();
+            } else {
+                move_or_check_nocopy(ast.args_of(e).get(i));
+            }
+        }
+    }
+    if u.isnil(elem) {
+        return set_ty(e, ty.t_invalid);
+    }
+    let t = ty.type_array(elem, @int_cast(i64, n));
+    if u.notnil(x) and (x.kind == ast.TY_ARRAY) and u.isnil(x.len_param) and (x.len != @int_cast(i64, n)) {
+        type_mismatch(e, x, t);
+    }
+    e.ty = t;
+    return e.ty;
+}
+
+// ---------------------------------------------------------------------------
+// Index / slice
+// ---------------------------------------------------------------------------
+fn check_index(e: *mut ast.Expr) *mut ast.Type {
+    let t = check_expr(e.a, tnil());
+    let mut elem = tnil();
+    if t.kind == ast.TY_ARRAY {
+        elem = t.elem;
+        ast.set_index_kind(e, ast.IDX_ARRAY);
+    } else if t.kind == ast.TY_SLICE {
+        elem = t.elem;
+        ast.set_index_kind(e, ast.IDX_SLICE);
+    } else if (t.kind == ast.TY_PTR) and (t.elem.kind == ast.TY_ARRAY) {
+        elem = t.elem.elem;
+        ast.set_index_kind(e, ast.IDX_PTR_ARRAY);
+    } else if t.kind != ast.TY_INVALID {
+        _ = dg.err(e.a.span, "E0407", u.f1("cannot index a value of type %s", tstr(t)));
+    }
+    if e.kind == ast.E_INDEX {
+        let it = check_expr(ast.b_of(e), ty.t_usize);
+        if it.kind == ast.TY_UNTYPED_INT {
+            coerce(ast.b_mut(e), ty.t_usize);
+        } else if (it != ty.t_usize) and (it.kind != ast.TY_INVALID) {
+            let d = dg.err(ast.b_of(e).span, "E0540", u.f1("index must have type usize, found %s", tstr(it)));
+            if it.kind == ast.TY_INT {
+                let txt = u.span_text(ast.b_of(e).span);
+                let fx = dg.fix(d, "convert the index", "suggestion");
+                dg.edit(fx, ast.b_of(e).span, u.f1("@int_cast(usize, %s)", txt));
+            }
+        }
+        if ast.b_of(e).is_const and (t.kind == ast.TY_ARRAY) and u.isnil(t.len_param) and
+           (ast.cval_of(ast.b_of(e)).is_neg() or ast.cval_of(ast.b_of(e)).ge(u.I128.of(t.len))) {
+            _ = dg.err(ast.b_of(e).span, "E0541", u.f2("index %s is out of bounds for %s",
+                                                       ast.cval_of(ast.b_of(e)).str(), tstr(t)));
+        }
+        if u.notnil(elem) {
+            e.ty = elem;
+            e.weakened = e.a.weakened;
+        } else {
+            e.ty = ty.t_invalid;
+        }
+        return e.ty;
+    }
+    // slice
+    for k in @as(i32, 0)..2 {
+        let mut pb = ast.b_mut(e);
+        if k == 1 {
+            pb = ast.c_mut(e);
+        }
+        if u.isnil(pb.*) {
+            continue;
+        }
+        let it = check_expr(pb.*, ty.t_usize);
+        if it.kind == ast.TY_UNTYPED_INT {
+            coerce(pb, ty.t_usize);
+        } else if (it != ty.t_usize) and (it.kind != ast.TY_INVALID) {
+            _ = dg.err(pb.*.span, "E0540", u.f1("slice bound must have type usize, found %s", tstr(it)));
+        }
+    }
+    if u.isnil(elem) {
+        return set_ty(e, ty.t_invalid);
+    }
+    let mut m = false;
+    if ast.index_kind_of(e) == ast.IDX_ARRAY {
+        if not is_place(e.a) {
+            _ = dg.err(e.a.span, "E0704", "cannot slice a temporary array; bind it to a variable first");
+            return set_ty(e, ty.t_invalid);
+        }
+        mark_addr_taken(e.a);
+        m = is_mut_place(e.a);
+    } else {
+        m = t.is_mut;
+    }
+    e.ty = ty.type_slice(elem, m);
+    e.weakened = e.a.weakened;
+    return e.ty;
+}
+
+// ---------------------------------------------------------------------------
+// Main dispatch
+// ---------------------------------------------------------------------------
+fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    e.cat = ast.CAT_VALUE;
+    match e.kind {
+        .IDENT => {
+            resolve_ident(e);
+            return e.ty;
+        }
+        .SELF => {
+            if u.isnil(C.tc.self_) {
+                _ = dg.err(e.span, "E0205", "'Self' is only available inside a struct or union");
+                return set_ty(e, ty.t_invalid);
+            }
+            e.cat = ast.CAT_TYPE;
+            ast.set_tval(e, C.tc.self_);
+            return tnil();
+        }
+        .INT => {
+            e.is_const = true;
+            ast.set_cval(e, u.I128.ofu(ast.ival_of(e)));
+            return set_ty(e, ty.t_untyped_int);
+        }
+        .FLOAT => {
+            e.is_const = true;
+            return set_ty(e, ty.t_untyped_float);
+        }
+        .STRING       => { return set_ty(e, ty.type_slice(ty.t_u8, false)); }
+        .BOOL         => { return set_ty(e, ty.t_bool); }
+        .STRUCT_LIT   => { return check_struct_lit(e, expected); }
+        .ARRAY_LIT    => { return check_array_lit(e, expected); }
+        .ARRAY_REPEAT => { return check_array_lit(e, expected); }
+        .ERROR_VAL => {
+            let code = error_code_here(e.name);
+            if code == 0 {
+                _ = dg.err(ast.name_span_of(e), "E0650",
+                           u.f1("'error.%s' is not declared; add it to an 'error { ... }' block", e.name));
+            }
+            ast.set_cval(e, u.I128.ofu(@as(u64, code)));
+            let set = expected_set(expected);
+            if (code != 0) and not set_has(set, e.name) {
+                _ = dg.err(ast.name_span_of(e), "E0652", u.f2("'error.%s' is not in error set %s", e.name, set.name));
+            }
+            return set_ty(e, ty.type_errset(set));
+        }
+        .BUILTIN     => { return builtin_check(e, expected); }
+        .UNARY       => { return check_unary(e, expected); }
+        .BINARY      => { return check_binary(e, expected); }
+        .CATCH       => { return check_catch(e); }
+        .OPT_NONE    => { return check_opt_none(e, expected); }
+        .OPT_SOME    => { return check_opt_some(e, expected); }
+        .ORELSE      => { return check_orelse(e); }
+        .EMPTY_SLICE => { return check_empty_slice(e, expected); }
+        .FIELD => {
+            _ = check_field(e);
+            return e.ty;
+        }
+        .DEREF => { return check_deref(e); }
+        .CALL  => { return check_call(e, expected); }
+        .INDEX => { return check_index(e); }
+        .SLICE => { return check_index(e); }
+        .TRY   => { return check_try(e); }
+        .APPLY => {
+            check_apply(e);
+            return e.ty;
+        }
+        .CONV => { return e.ty; }
+    }
+}
+
+fn check_deref(e: *mut ast.Expr) *mut ast.Type {
+    let t = check_expr(e.a, tnil());
+    if t.kind == ast.TY_PTR {
+        if t.elem.kind == ast.TY_VOID {
+            _ = dg.err(e.span, "E0705", "cannot dereference *void; convert it with @ptr_cast first");
+            return set_ty(e, ty.t_invalid);
+        }
+        let mut res = t.elem;
+        if not t.is_mut {
+            let wt = weaken_mut(res);
+            if wt != res {
+                res = wt;
+                e.weakened = true;
+            }
+        }
+        return set_ty(e, res);
+    }
+    if t.kind != ast.TY_INVALID {
+        _ = dg.err(e.span, "E0705", u.f1("cannot dereference a value of type %s", tstr(t)));
+    }
+    return set_ty(e, ty.t_invalid);
+}
+
+// ---------------------------------------------------------------------------
+// Processor-instruction builtins
+// ---------------------------------------------------------------------------
+// The operands of the processor-instruction builtins (spec §13.5), one
+// letter each: W a byte vector (u8x16, u8x32, u8x64), Y a u64 vector (u64x2,
+// u64x4, u64x8), B u8x16, Q u64x2, D u32x4, V a 128-bit integer vector, S
+// u32, C u8, u16, u32 or u64 (CRC data), I a constant.
+fn insn_ops(id: ast.BuiltinId) []u8 {
+    let t = ["WW", "WW", "WW", "WW", "B", "BI", "YYI", "DDI", "DD", "DD", "DD", "DDD", "DD", "DD", "SC", "BB", "BB",
+             "B", "B", "QQ", "QQ", "DSD", "DSD", "DSD", "S", "DDD", "DD", "DDD", "DDD", "DD", "DDD", "QQQ", "QQQ", "QQ",
+             "QQQ", "VVV", "VVV", "QQ", "QQI", "SC", "SC"];
+    return t[@int_cast(usize, ast.builtin_index(id, ast.BI_X86_AESENC))];
+}
+
+fn insn_kind_ok(c: u8, t: *mut ast.Type) bool {
+    if t.kind == ast.TY_INVALID {
+        return true;
+    }
+    if c == 'W' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u8);
+    }
+    if c == 'Y' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u64);
+    }
+    if c == 'B' {
+        return t == ty.type_vec(ty.t_u8, 16);
+    }
+    if c == 'Q' {
+        return t == ty.type_vec(ty.t_u64, 2);
+    }
+    if c == 'D' {
+        return t == ty.type_vec(ty.t_u32, 4);
+    }
+    return ty.is_vec_int(t) and (ty.simd_bits(t) == 128);  // V
+}
+
+fn insn_kind_name(c: u8) []u8 {
+    if c == 'W' {
+        return "u8x16, u8x32 or u8x64";
+    }
+    if c == 'Y' {
+        return "u64x2, u64x4 or u64x8";
+    }
+    if c == 'B' {
+        return "u8x16";
+    }
+    if c == 'Q' {
+        return "u64x2";
+    }
+    if c == 'D' {
+        return "u32x4";
+    }
+    return "a 128-bit integer vector";
+}
+
+fn insn_check(e: *mut ast.Expr, id: ast.BuiltinId) *mut ast.Type {
+    let ops = insn_ops(id);
+    let mut first = tnil();
+    let mut first_kind: u8 = 0;
+    for k in 0..ops.len {
+        let c = ops[k];
+        let pe = earg(e, k);
+        if c == 'I' {
+            let mut max: i64 = 255;
+            if id == ast.BI_X86_SHA1RNDS4 {
+                max = 3;
+            } else if id == ast.BI_ARM_XAR {
+                max = 63;
+            }
+            let t = check_expr(pe.*, ty.t_u32);
+            if ty.is_untyped(t) {
+                coerce(pe, ty.t_u32);
+            }
+            let a = pe.*;
+            if not a.is_const or ast.cval_of(a).is_neg() or ast.cval_of(a).ge(u.I128.of(max + 1)) {
+                _ = dg.err(a.span, "E0820", u.f2("@%s needs a constant in 0..%s here", e.name, u.dec(max)));
+            }
+        } else if c == 'S' {
+            _ = check_expr_to(pe, ty.t_u32);
+        } else if c == 'C' {
+            let t = check_expr(pe.*, tnil());
+            if ty.is_untyped(t) {
+                _ = finalize_untyped(pe);
+            } else if not ((t.kind == ast.TY_INT) and not t.is_signed and not t.is_size) and
+                      (t.kind != ast.TY_INVALID) {
+                _ = dg.err(pe.*.span, "E0822", u.f2("@%s takes u8, u16, u32 or u64 data, found %s", e.name, tstr(t)));
+            }
+        } else if u.notnil(first) and (c == first_kind) {
+            _ = check_expr_to(pe, first);
+        } else {
+            let t = check_expr(pe.*, tnil());
+            if not insn_kind_ok(c, t) {
+                _ = dg.err(pe.*.span, "E0812", u.f3("@%s needs %s operands, found %s", e.name, insn_kind_name(c),
+                                                    tstr(t)));
+            }
+            if u.isnil(first) {
+                first = t;
+                first_kind = c;
+            }
+        }
+    }
+    if (ops[0] == 'S') or (u.isnil(first)) {
+        return ty.t_u32;
+    }
+    if not insn_kind_ok(first_kind, first) {
+        return ty.t_invalid;
+    }
+    return first;
+}

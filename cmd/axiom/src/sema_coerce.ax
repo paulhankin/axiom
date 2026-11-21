@@ -1,0 +1,471 @@
+// =============================================================================
+// sema_coerce.ax - implicit conversions, coercions, literal fitting and
+// expression value checking, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Expressions: helpers
+// ---------------------------------------------------------------------------
+fn mkconv(e: *mut ast.Expr, k: ast.Conv, t: *mut ast.Type) *mut ast.Expr {
+    let c = ast.new_expr(ast.E_CONV, e.span);
+    c.a = e;
+    ast.set_conv(c, k);
+    c.ty = t;
+    c.cat = ast.CAT_VALUE;
+    c.weakened = e.weakened;
+    return c;
+}
+
+fn type_mismatch(e: *mut ast.Expr, expected: *mut ast.Type, found: *mut ast.Type) void {
+    if (expected.kind == ast.TY_INVALID) or (found.kind == ast.TY_INVALID) {
+        return;
+    }
+    let d = dg.err(e.span, "E0412", u.f2("type mismatch: expected %s, found %s", tstr(expected), tstr(found)));
+    dg.set_types(d, tstr(expected), tstr(found));
+    if (expected.kind == ast.TY_VEC) and (found == expected.elem) {
+        let txt = u.span_text(e.span);
+        let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
+        dg.edit(fx, e.span, u.f1("@splat(%s)", txt));
+    } else if (expected.kind == ast.TY_INT) and (found.kind == ast.TY_INT) {
+        let txt = u.span_text(e.span);
+        let is_lossless = ((found.is_signed == expected.is_signed) and (found.bits < expected.bits)) or
+                          (not found.is_signed and expected.is_signed and (found.bits < expected.bits));
+        let fx = dg.fix(d, u.pick(is_lossless, "convert explicitly (lossless)",
+                                  "convert explicitly (checked at run time)"), "suggestion");
+        dg.edit(fx, e.span, u.f2(u.pick(is_lossless, "@as(%s, %s)", "@int_cast(%s, %s)"), tstr(expected), txt));
+    }
+}
+
+pub fn fits_type(v: u.I128, t: *ast.Type) bool {
+    if t.kind != ast.TY_INT {
+        return true;
+    }
+    let r = ty.int_range(t);
+    return v.ge(r.lo) and v.le(r.hi);
+}
+
+// Literal ranges allowed for a generic parameter type (spec §10.5).
+fn lit_ok_for_param(e: *mut ast.Expr, p: *mut ast.Type) bool {
+    if e.ty.kind == ast.TY_UNTYPED_FLOAT {
+        return p.constraint == ast.C_FLOAT;
+    }
+    let v = ast.cval_of(e);
+    let c = p.constraint;
+    if (c == ast.C_NUM) or (c == ast.C_INT) {
+        return not v.lti(0) and not v.gti(127);
+    }
+    if c == ast.C_SIGNED {
+        return not v.lti(-128) and not v.gti(127);
+    }
+    if c == ast.C_UNSIGNED {
+        return not v.lti(0) and not v.gti(255);
+    }
+    if c == ast.C_FLOAT {
+        return not v.lti(-16777216) and not v.gti(16777216);
+    }
+    return false;
+}
+
+// Whether constant e has an integer value: an untyped integer, or one
+// coerced to a type parameter.
+fn int_valued(e: *mut ast.Expr) bool {
+    if u.notnil(e.ty) and (e.ty.kind == ast.TY_UNTYPED_INT) {
+        return true;
+    }
+    let k = e.kind;
+    if k == ast.E_INT {
+        return true;
+    }
+    if k == ast.E_UNARY {
+        return int_valued(e.a);
+    }
+    if k == ast.E_BINARY {
+        return int_valued(e.a) and int_valued(ast.b_of(e));
+    }
+    return false;
+}
+
+// The value of a constant float expression of type f32 (or untyped,
+// becoming f32): its literals are rounded to f32, a decimal one directly
+// rather than through f64, and its operations are f32 operations (§6.1).
+pub fn const_f32(e: *mut ast.Expr) f32 {
+    if int_valued(e) {
+        return ast.cval_of(e).to_f32();
+    }
+    let k = e.kind;
+    if k == ast.E_FLOAT {
+        return u.parse_f32(ast.more(e).float_text);
+    }
+    if (k == ast.E_UNARY) and (ast.op_of(e) == lx.TK_MINUS) and e.a.is_const {
+        return -const_f32(e.a);
+    }
+    if (k == ast.E_BINARY) and e.a.is_const and ast.b_of(e).is_const {
+        let a = const_f32(e.a);
+        let b = const_f32(ast.b_of(e));
+        if ast.op_of(e) == lx.TK_PLUS {
+            return a + b;
+        }
+        if ast.op_of(e) == lx.TK_MINUS {
+            return a - b;
+        }
+        if ast.op_of(e) == lx.TK_STAR {
+            return a * b;
+        }
+        if ast.op_of(e) == lx.TK_SLASH {
+            return a / b;
+        }
+    }
+    return @float_cast(f32, ast.fval_of(e));
+}
+
+fn can_take_untyped_float(t: *ast.Type) bool {
+    if t.kind == ast.TY_FLOAT {
+        return true;
+    }
+    if (t.kind == ast.TY_PARAM) and not t.is_const {
+        return true;
+    }
+    if (t.kind == ast.TY_OPT) or (t.kind == ast.TY_ERRUNION) {
+        return can_take_untyped_float(t.elem);
+    }
+    return false;
+}
+
+fn weaken_mut(t: *mut ast.Type) *mut ast.Type {
+    if u.isnil(t) {
+        return t;
+    }
+    if t.kind == ast.TY_PTR {
+        if t.is_mut {
+            return ty.type_ptr(t.elem, false);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_SLICE {
+        if t.is_mut {
+            return ty.type_slice(t.elem, false);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_OPT {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            return ty.type_opt(w);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_ERRUNION {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            if u.notnil(t.err_param) {
+                return ty.type_errunion_param(w, t.err_param);
+            }
+            return ty.type_errunion_set(w, t.decl);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_ARRAY {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            if u.notnil(t.len_param) {
+                return ty.type_array_param(w, t.len_param);
+            }
+            return ty.type_array(w, t.len);
+        }
+        return t;
+    }
+    return t;
+}
+
+fn is_err_type(t: *ast.Type) bool {
+    return (t.kind == ast.TY_ERROR) or ((t.kind == ast.TY_PARAM) and t.is_error_param);
+}
+
+fn err_decl_of(t: *mut ast.Type) *mut ast.Decl {
+    if (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_ERRUNION) {
+        return t.decl;
+    }
+    return dnil();
+}
+
+fn err_param_of(t: *mut ast.Type) *mut ast.Type {
+    if (t.kind == ast.TY_PARAM) and t.is_error_param {
+        return t;
+    }
+    if t.kind == ast.TY_ERRUNION {
+        return t.err_param;
+    }
+    return tnil();
+}
+
+fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
+    let e = pe.*;
+    let s = e.ty;
+    if u.isnil(s) or u.isnil(target) {
+        return;
+    }
+    if s.kind == ast.TY_NEVER {
+        ast.set_tval(e, target);
+        return;
+    }
+    if (s == target) or (s.kind == ast.TY_INVALID) or (target.kind == ast.TY_INVALID) {
+        return;
+    }
+    if s.kind == ast.TY_UNTYPED_INT {
+        if target.kind == ast.TY_INT {
+            if not fits_type(ast.cval_of(e), target) {
+                let r = ty.int_range(target);
+                _ = dg.err(e.span, "E0503", u.f4("literal %s does not fit in %s (range %s..%s)", ast.cval_of(e).str(),
+                                                 tstr(target), r.lo.str(), r.hi.str()));
+            }
+            e.ty = target;
+            return;
+        }
+        if target.kind == ast.TY_FLOAT {
+            ast.set_fval(e, ast.cval_of(e).to_f64());
+            if target.bits == 32 {
+                ast.set_fval(e, @as(f64, ast.cval_of(e).to_f32()));
+            }
+            e.ty = target;
+            return;
+        }
+        if (target.kind == ast.TY_PARAM) and not target.is_const {
+            if not lit_ok_for_param(e, target) {
+                _ = dg.err(e.span, "E0461",
+                           u.f2("literal %s is not representable in every type satisfying %s; convert explicitly",
+                                ast.cval_of(e).str(), constraint_str(target.constraint, target.constraint_lane)));
+            }
+            ast.set_fval(e, ast.cval_of(e).to_f64());
+            e.ty = target;
+            return;
+        }
+        if (target.kind == ast.TY_ERRUNION) and (target.elem.kind != ast.TY_VOID) {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
+            return;
+        }
+        if target.kind == ast.TY_OPT {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
+            return;
+        }
+        type_mismatch(e, target, s);
+        e.ty = ty.t_invalid;
+        return;
+    }
+    if s.kind == ast.TY_UNTYPED_FLOAT {
+        if target.kind == ast.TY_FLOAT {
+            if (target.bits == 32) and e.is_const {
+                ast.set_fval(e, @as(f64, const_f32(e)));
+            }
+            e.ty = target;
+            return;
+        }
+        if (target.kind == ast.TY_PARAM) and not target.is_const {
+            if not lit_ok_for_param(e, target) {
+                _ = dg.err(e.span, "E0461", u.f1("float literal is not allowed for a parameter constrained by %s",
+                                                 constraint_str(target.constraint, target.constraint_lane)));
+            }
+            e.ty = target;
+            return;
+        }
+        if (target.kind == ast.TY_ERRUNION) and (target.elem.kind == ast.TY_FLOAT) {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
+            return;
+        }
+        if (target.kind == ast.TY_OPT) and can_take_untyped_float(target.elem) {
+            coerce(pe, target.elem);
+            pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
+            return;
+        }
+        type_mismatch(e, target, s);
+        e.ty = ty.t_invalid;
+        return;
+    }
+    // mutability weakening
+    if ((s.kind == ast.TY_SLICE) or (s.kind == ast.TY_PTR)) and (target.kind == s.kind) and s.is_mut and
+       not target.is_mut and (s.elem == target.elem) {
+        pe.* = mkconv(e, ast.CONV_NOOP, target);
+        return;
+    }
+    if (s.kind == ast.TY_OPT) and (target.kind == ast.TY_OPT) and
+       ((s.elem.kind == ast.TY_SLICE) or (s.elem.kind == ast.TY_PTR)) and (target.elem.kind == s.elem.kind) and
+       s.elem.is_mut and not target.elem.is_mut and (s.elem.elem == target.elem.elem) {
+        pe.* = mkconv(e, ast.CONV_NOOP, target);
+        return;
+    }
+    // an error of one set where one of another (or any error) is needed
+    if is_err_type(s) and is_err_type(target) {
+        if error_fits(e.span, err_decl_of(s), err_param_of(s), err_decl_of(target), err_param_of(target)) {
+            pe.* = mkconv(e, ast.CONV_NOOP, target);
+        }
+        return;
+    }
+    // a narrower error union where a wider one is expected
+    if (s.kind == ast.TY_ERRUNION) and (target.kind == ast.TY_ERRUNION) and (s.elem == target.elem) {
+        if union_fits(e.span, s, target) {
+            pe.* = mkconv(e, ast.CONV_NOOP, target);
+        }
+        return;
+    }
+    // a function whose results widen so
+    if (s.kind == ast.TY_FN) and (target.kind == ast.TY_FN) and fn_widens(s, target) {
+        pe.* = mkconv(e, ast.CONV_NOOP, target);
+        return;
+    }
+    if target.kind == ast.TY_ERRUNION {
+        if is_err_type(s) {
+            if error_fits(e.span, err_decl_of(s), err_param_of(s), target.decl, target.err_param) {
+                pe.* = mkconv(e, ast.CONV_WRAP_ERR, target);
+            }
+            return;
+        }
+        if (s.kind != ast.TY_ERRUNION) and (target.elem.kind != ast.TY_VOID) {
+            coerce(pe, target.elem);
+            if (pe.*.ty == target.elem) or (pe.*.ty.kind == ast.TY_INVALID) {
+                pe.* = mkconv(pe.*, ast.CONV_WRAP_OK, target);
+                pe.*.ty = target;
+            }
+            return;
+        }
+    }
+    if target.kind == ast.TY_OPT {
+        let can_wrap = ((s.kind != ast.TY_OPT) or (target.elem.kind == ast.TY_OPT) or
+                        (target.elem.kind == ast.TY_ERRUNION)) and
+                       ((s.kind != ast.TY_ERRUNION) or (target.elem.kind == ast.TY_ERRUNION) or
+                        (target.elem.kind == ast.TY_OPT)) and
+                       (not is_err_type(s) or is_err_type(target.elem) or (target.elem.kind == ast.TY_ERRUNION) or
+                        (target.elem.kind == ast.TY_OPT));
+        if can_wrap {
+            coerce(pe, target.elem);
+            if (pe.*.ty == target.elem) or (pe.*.ty.kind == ast.TY_INVALID) {
+                pe.* = mkconv(pe.*, ast.CONV_WRAP_SOME, target);
+                pe.*.ty = target;
+            }
+            return;
+        }
+    }
+    if e.weakened and (weaken_mut(target) == s) {
+        let d = dg.err(e.span, "E0707", u.f2("cannot obtain %s through an immutable place (weakened to %s)",
+                                             tstr(target), tstr(s)));
+        dg.set_types(d, tstr(target), tstr(s));
+        if u.notnil(C) and u.notnil(C.fnd) and (C.fnd.params.len > 0) {
+            let p0 = C.fnd.params.at(0);
+            if u.str_eq(p0.name, "self") and u.notnil(p0.te) {
+                match p0.te.shape {
+                    .Ptr(pt) => {
+                        if not pt.is_mut {
+                            let fx = dg.fix(d, "make 'self' mutable", "suggestion");
+                            let ts = p0.te.span;
+                            dg.edit(fx, u.mkspan(ts.file, ts.start + 1, ts.start + 1), "mut ");
+                        }
+                    }
+                    else => {}
+                }
+            }
+        }
+        if u.notnil(C) and C.in_return and u.notnil(C.fnd) and u.notnil(C.fnd.ret_te) {
+            let mut rt: *ast.TypeExpr = C.fnd.ret_te;
+            loop {
+                match rt.shape {
+                    .ErrUnion(eu) => { rt = eu.elem; }
+                    .Opt(inner)   => { rt = inner; }
+                    else          => { break; }
+                }
+            }
+            match rt.shape {
+                .Ptr(pt) => {
+                    if pt.is_mut {
+                        let fx = dg.fix(d, "return an immutable view", "suggestion");
+                        let rs = rt.span;
+                        dg.edit(fx, u.mkspan(rs.file, rs.start, pt.elem.span.start), "*");
+                    }
+                }
+                .Slice(pt) => {
+                    if pt.is_mut {
+                        let fx = dg.fix(d, "return an immutable view", "suggestion");
+                        let rs = rt.span;
+                        dg.edit(fx, u.mkspan(rs.file, rs.start, pt.elem.span.start), "[]");
+                    }
+                }
+                else => {}
+            }
+        }
+        return;
+    }
+    type_mismatch(e, target, s);
+}
+
+fn check_expr_to(pe: *mut *mut ast.Expr, target: *mut ast.Type) *mut ast.Type {
+    _ = check_expr(pe.*, target);
+    coerce(pe, target);
+    return pe.*.ty;
+}
+
+fn cat_name(c: ast.Cat) []u8 {
+    match c {
+        .VALUE   => { return "a value"; }
+        .TYPE    => { return "a type"; }
+        .MODULE  => { return "a module"; }
+        .FUNC    => { return "a function"; }
+        .METHOD  => { return "a method"; }
+        .VARIANT => { return "a union variant constructor"; }
+        .GENERIC => { return "a generic declaration"; }
+    }
+}
+
+fn func_to_value(e: *mut ast.Expr) void {
+    let f = ast.decl_of(e);
+    if f.kind == ast.D_HOST_FN {
+        if f.cabi {
+            // (its structures travel as C's ABI says, and Axiom's calls
+            // through a function value do not: spec §14.5.3)
+            _ = dg.err(e.span, "E0801",
+                       u.f1("the C function '%s' takes or returns a structure by value: it can only be called, not used as a function value",
+                            f.name));
+        }
+        e.cat = ast.CAT_VALUE;
+        e.ty = f.ty;
+        return;
+    }
+    if ast.gargs_of(e).len < f.all_gparams.len {
+        let d = dg.err(e.span, "E0466",
+                       u.f2("generic function '%s' must be instantiated before use as a value: %s.[...]", f.name,
+                            f.name));
+        dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
+        e.cat = ast.CAT_VALUE;
+        e.ty = ty.t_invalid;
+        return;
+    }
+    ensure_infer_ret(f);
+    e.cat = ast.CAT_VALUE;
+    e.ty = ty.subst(f.ty, f.all_gparams, ast.gargs_of(e)[0..f.all_gparams.len]);
+}
+
+fn check_value(e: *mut ast.Expr) void {
+    if e.cat == ast.CAT_VALUE {
+        return;
+    }
+    if e.cat == ast.CAT_FUNC {
+        func_to_value(e);
+        return;
+    }
+    _ = dg.err(e.span, "E0405", u.f1("expected a value, found %s", cat_name(e.cat)));
+    e.cat = ast.CAT_VALUE;
+    e.ty = ty.t_invalid;
+}
+
+fn check_expr(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
+    _ = check_operand(e, expected);
+    check_value(e);
+    if u.isnil(e.ty) {
+        e.ty = ty.t_invalid;
+    }
+    return e.ty;
+}

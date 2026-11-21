@@ -1,0 +1,423 @@
+// =============================================================================
+// sema_match.ax - match statements and per-arm move/flow tracking, part of
+// sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Match flow and exhaustiveness (spec §9.4, §11.3)
+// ---------------------------------------------------------------------------
+fn match_flow_begin() MatchFlow {
+    let nloc = C.locals.len;
+    let pre = save_moves(nloc);
+    let acc = MoveSnap.{
+        moved: u.newn.[bool](nloc),
+        spans: u.newn.[u.Span](nloc),
+        origins: u.newn.[*mut ast.Local](nloc),
+        origin_fields: u.newn.[u64](nloc),
+        n: nloc,
+    };
+    return MatchFlow.{ nloc: nloc, pre: pre, acc: acc, pre_dead: C.flow_dead, any_live: false };
+}
+
+fn match_flow_arm_begin(mf: *MatchFlow) void {
+    restore_moves(mf.pre);
+    let fc = C;
+    fc.flow_dead = mf.pre_dead;
+}
+
+fn match_flow_arm_end(mf: *mut MatchFlow, div_arm: bool) void {
+    if not div_arm and not mf.pre_dead {
+        mf.any_live = true;
+        or_moves_into(&mut mf.acc, mf.nloc);
+    }
+}
+
+fn match_flow_end(mf: *MatchFlow, narms: usize) void {
+    if narms == 0 {
+        return;
+    }
+    if not mf.any_live {
+        restore_moves(mf.pre);
+        C.flow_dead = true;
+    } else {
+        restore_moves(mf.acc);
+        C.flow_dead = mf.pre_dead;
+    }
+}
+
+// The arms of a match on a union or enum (t): its variants or members, each at
+// most once, all of them unless there is an else. Whether every arm diverges.
+fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut: bool) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let narms = ast.stmt_more(s).arms.len;
+    let ud = t.decl;
+    let is_enum = t.kind == ast.TY_ENUM;
+    let what = u.pick(is_enum, "member", "variant");
+    let seen = u.newn.[bool](ud.variants.len);
+    let mut mf = match_flow_begin();
+    for i in 0..narms {
+        let a = ast.stmt_ext(s).arms.at_mut(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
+        match a.pat {
+            .Else => { has_else = true; }
+            .Variant(p) => {
+                let v = find_variant(ud, p.name);
+                if v < 0 {
+                    _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, p.name));
+                } else {
+                    let vi = @int_cast(usize, v);
+                    a.variant = v;
+                    a.value = ud.variants.at(vi).value;
+                    if seen[vi] {
+                        _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, p.name));
+                    }
+                    seen[vi] = true;
+                    let mut pt = tnil();
+                    if not is_enum {
+                        pt = ty.type_variant(t, vi);
+                    }
+                    if not u.isnos(p.bind) {
+                        if u.isnil(pt) {
+                            _ = dg.err(p.bind_span, "E0633",
+                                       u.f2("%s '%s' has no payload to bind", u.pick(is_enum, "enum member", "variant"),
+                                            p.name));
+                        } else if not u.str_eq(p.bind, "_") {
+                            if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
+                                _ = dg.err(p.bind_span, "E0635",
+                                           "a match arm with several patterns cannot bind a payload");
+                            } else {
+                                let mut bt = pt;
+                                if by_ref {
+                                    bt = ty.type_ptr(pt, ref_mut);
+                                }
+                                a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                                a.bind_local.weakened = s.e.weakened;
+                                if type_can_hold_ptr(bt) {
+                                    a.bind_local.origin_local = expr_local_origin(s.e);
+                                    if u.notnil(a.bind_local.origin_local) {
+                                        a.bind_local.origin_fields = ~@as(u64, 0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else => {
+                _ = dg.err(a.span, "E0634",
+                           u.f2("this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"),
+                                tstr(t)));
+            }
+        }
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
+        }
+        scope_pop();
+    }
+    match_flow_end(&mf, narms);
+    if not has_else {
+        let mut missing = u.Buf.init();
+        let mut nm: i32 = 0;
+        for v in 0..ud.variants.len {
+            if seen[v] {
+                continue;
+            }
+            if nm != 0 {
+                missing.s(", ");
+            }
+            nm += 1;
+            missing.c('.');
+            missing.s(ud.variants.at(v).name);
+        }
+        let ms = missing.done();
+        if nm != 0 {
+            _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+        }
+    }
+    return all_div;
+}
+
+fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut: bool) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let mut seen_none = false;
+    let mut seen_some = false;
+    let narms = ast.stmt_more(s).arms.len;
+    let mut mf = match_flow_begin();
+    for i in 0..narms {
+        let a = ast.stmt_ext(s).arms.at_mut(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
+        match a.pat {
+            .Else => { has_else = true; }
+            .Variant(p) => {
+                if u.str_eq(p.name, "none") {
+                    a.variant = 0;
+                    a.value = u.I128.zero();
+                    if seen_none {
+                        _ = dg.err(a.span, "E0631", "variant 'none' is matched more than once");
+                    }
+                    seen_none = true;
+                    if not u.isnos(p.bind) {
+                        _ = dg.err(p.bind_span, "E0633", "variant 'none' has no payload to bind");
+                    }
+                } else if u.str_eq(p.name, "some") {
+                    a.variant = 1;
+                    a.value = u.I128.of(1);
+                    if seen_some {
+                        _ = dg.err(a.span, "E0631", "variant 'some' is matched more than once");
+                    }
+                    seen_some = true;
+                    if not u.isnos(p.bind) and not u.str_eq(p.bind, "_") {
+                        if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
+                            _ = dg.err(p.bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
+                        } else {
+                            let mut bt = base.elem;
+                            if by_ref {
+                                bt = ty.type_ptr(base.elem, ref_mut);
+                            }
+                            a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                            a.bind_local.weakened = s.e.weakened;
+                            if type_can_hold_ptr(bt) {
+                                a.bind_local.origin_local = expr_local_origin(s.e);
+                                if u.notnil(a.bind_local.origin_local) {
+                                    a.bind_local.origin_fields = ~@as(u64, 0);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    _ = dg.err(a.span, "E0632", u.f2("%s has no variant '%s' (expected 'none' or 'some')", tstr(base),
+                                                     p.name));
+                }
+            }
+            else => {
+                _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of optional type %s", tstr(base)));
+            }
+        }
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
+        }
+        scope_pop();
+    }
+    match_flow_end(&mf, narms);
+    if not has_else {
+        if not seen_none and not seen_some {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .none, .some");
+        } else if not seen_none {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .none");
+        } else if not seen_some {
+            _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .some");
+        }
+    }
+    return all_div;
+}
+
+// The arms of a match on an integer, bool or error (t): values of its type, each
+// at most once, every one (bool, a named error set) or an else. Whether every
+// arm diverges.
+fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let narms = ast.stmt_more(s).arms.len;
+    let mut seen_names = u.List.[[]u8].empty();
+    let mut seenv = u.List.[u.I128].empty();
+    let mut seen_true = false;
+    let mut seen_false = false;
+    let mut mf = match_flow_begin();
+    for i in 0..narms {
+        let a = ast.stmt_ext(s).arms.at_mut(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
+        let mut key = u.I128.zero();
+        let mut keyed = false;
+        let mut fits = false;  // the pattern is of the scrutinee's kind
+        match a.pat {
+            .Else => {
+                has_else = true;
+                fits = true;
+            }
+            .Int(n) => {
+                if t.kind == ast.TY_INT {
+                    if not fits_type(n, t) {
+                        _ = dg.err(a.span, "E0503", u.f1("pattern does not fit in %s", tstr(t)));
+                    }
+                    key = n;
+                    keyed = true;
+                    fits = true;
+                }
+            }
+            .Bool(bv) => {
+                if t.kind == ast.TY_BOOL {
+                    let dupe = (bv and seen_true) or (not bv and seen_false);
+                    if dupe {
+                        _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                    }
+                    if bv {
+                        seen_true = true;
+                    } else {
+                        seen_false = true;
+                    }
+                    fits = true;
+                }
+            }
+            .Error(name) => {
+                if is_err_type(t) {
+                    let code = error_code_here(name);
+                    if code == 0 {
+                        _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
+                    } else if (t.kind == ast.TY_ERROR) and not set_has(t.decl, name) {
+                        _ = dg.err(a.span, "E0652", u.f2("'error.%s' is not in error set %s", name, t.decl.name));
+                    }
+                    seen_names.push(name);
+                    a.error_code = code;
+                    key = u.I128.ofu(@as(u64, code));
+                    keyed = true;
+                    fits = true;
+                }
+            }
+            .Variant => {}
+        }
+        if not fits {
+            _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of type %s", tstr(t)));
+        }
+        if keyed {
+            for k in 0..seenv.len {
+                if seenv.get(k).eq(key) {
+                    _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                }
+            }
+            seenv.push(key);
+        }
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
+        }
+        scope_pop();
+    }
+    match_flow_end(&mf, narms);
+    seenv.deinit();
+    let exhaustive = has_else or ((t.kind == ast.TY_BOOL) and seen_true and seen_false);
+    if not exhaustive and (t.kind == ast.TY_ERROR) and u.notnil(t.decl) {
+        // a named error set: every error it holds, or else
+        let mut missing = u.Buf.init();
+        let mut nm: i32 = 0;
+        for v in 0..t.decl.set_names.len {
+            let n = t.decl.set_names.get(v);
+            let mut hit = false;
+            for k in 0..seen_names.len {
+                if u.same(seen_names.get(k), n) {
+                    hit = true;
+                }
+            }
+            if hit {
+                continue;
+            }
+            if nm != 0 {
+                missing.s(", ");
+            }
+            nm += 1;
+            missing.s("error.");
+            missing.s(n);
+        }
+        let ms = missing.done();
+        if nm != 0 {
+            _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+        }
+    } else if not exhaustive {
+        _ = dg.err(s.span, "E0630", "non-exhaustive match: add an 'else' arm");
+    }
+    seen_names.deinit();
+    return all_div;
+}
+
+fn check_match(s: *mut ast.Stmt) bool {
+    let mut t = check_expr(s.e, tnil());
+    if ty.is_untyped(t) {
+        t = finalize_untyped(&mut s.e);
+    }
+    let se = unwrap_conv(s.e);
+    let scrut_moved = u.notnil(se) and (se.kind == ast.E_IDENT) and u.notnil(ast.local_of(se)) and
+                      ast.local_of(se).moved;
+    let mut base = t;
+    let mut by_ref = false;
+    let mut ref_mut = false;
+    if (t.kind == ast.TY_PTR) and ((t.elem.kind == ast.TY_UNION) or (t.elem.kind == ast.TY_OPT)) {
+        base = t.elem;
+        by_ref = true;
+        ref_mut = t.is_mut;
+    }
+    let narms = ast.stmt_more(s).arms.len;
+    let mut all_div = false;
+    if (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM) {
+        all_div = check_variant_match(s, base, by_ref, ref_mut);
+    } else if base.kind == ast.TY_OPT {
+        all_div = check_opt_match(s, base, by_ref, ref_mut);
+    } else if (t.kind == ast.TY_INT) or (t.kind == ast.TY_BOOL) or is_err_type(t) {
+        all_div = check_value_match(s, t);
+    } else {
+        if t.kind != ast.TY_INVALID {
+            _ = dg.err(s.e.span, "E0634",
+                       u.f1("cannot match on a value of type %s (only unions, optionals, *union, *optional, enums, integers, bool and error)",
+                            tstr(t)));
+        }
+        let mut mf = match_flow_begin();
+        for i in 0..narms {
+            if ast.stmt_more(s).arms.at(i).alt {
+                continue;
+            }
+            scope_push();
+            match_flow_arm_begin(&mf);
+            let div_arm = check_block(ast.stmt_ext(s).arms.at_mut(i).body);
+            match_flow_arm_end(&mut mf, div_arm);
+            scope_pop();
+        }
+        match_flow_end(&mf, narms);
+    }
+    if not by_ref and not scrut_moved {
+        let mut has_bind = false;
+        for i in 0..narms {
+            if u.notnil(ast.stmt_more(s).arms.at(i).bind_local) {
+                has_bind = true;
+                break;
+            }
+        }
+        if has_bind and u.notnil(se) and is_place(se) and u.notnil(se.ty) and (se.ty.kind != ast.TY_INVALID) and
+           type_is_nocopy(se.ty) {
+            _ = dg.err(se.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(se.ty)));
+        }
+    }
+    return (narms > 0) and all_div;
+}

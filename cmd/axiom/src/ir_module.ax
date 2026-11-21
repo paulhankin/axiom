@@ -1,0 +1,479 @@
+// =============================================================================
+// ir_module.ax - module, function, global, alias, forwarding, and parts state, part of ir.ax.
+// =============================================================================
+import "util.ax" as u;
+
+/// Adds alias `name` of `target` to m.
+pub fn add_alias(m: *mut Module, name: []u8, target: *mut Value, weak: bool, visibility: u8) void {
+    m.aliases.push(Alias.{ name: u.intern(name), target: target, weak: weak, visibility: visibility, ifunc: false });
+}
+
+/// Adds indirect function `name`, whose resolver is `resolver`, to m.
+pub fn add_ifunc(m: *mut Module, name: []u8, resolver: *mut Value, weak: bool, visibility: u8) void {
+    m.aliases.push(Alias.{ name: u.intern(name), target: resolver, weak: weak, visibility: visibility, ifunc: true });
+}
+
+/// The function an alias names, or nil (it names a global, or a definition
+/// of its name overrides it: a weak alias).
+pub fn alias_func(m: *mut Module, a: *mut Alias) *mut Func {
+    if (a.target.kind != V_FUNC) or alias_overridden(m, a) {
+        return u.nil.[Func]();
+    }
+    return fnp_of(a.target);
+}
+
+/// The global an alias names, or nil (likewise).
+pub fn alias_global(m: *mut Module, a: *mut Alias) *mut Global {
+    if (a.target.kind != V_GLOBAL) or alias_overridden(m, a) {
+        return u.nil.[Global]();
+    }
+    return gv_of(a.target);
+}
+
+// Is a weak alias's name defined otherwise (a strong definition wins)?
+fn alias_overridden(m: *mut Module, a: *Alias) bool {
+    if not a.weak {
+        return false;
+    }
+    let f = m.fmap.get(a.name);
+    if u.notnil(f) and not is_decl(f) {
+        return true;
+    }
+    let g = m.gmap.get(a.name);
+    return u.notnil(g) and u.notnil(init_of(g));
+}
+
+// -----------------------------------------------------------------------------
+// Module, functions, globals
+// -----------------------------------------------------------------------------
+pub fn new_module(name: []u8) *mut Module {
+    let m = u.perm_new.[Module]();
+    m.name = u.perm_dup(name);
+    return m;
+}
+
+pub fn add_function(m: *mut Module, name: []u8, fty: *mut Ty) *mut Func {
+    let f = u.perm_new.[Func]();
+    f.name = u.intern(name);
+    f.ty = fty;
+    f.id = @int_cast(i32, m.funcs.len);
+    let n = fty.params.len;
+    f.params = u.perm_newn.[*mut Value](n + 1)[0..n];
+    for i in 0..n {
+        let p = new_val(V_PARAM, fty.params[i]);
+        p.cv = @as(u64, i);
+        set_fnp(p, f);
+        f.params[i] = p;
+    }
+    f.param_ext = u.perm_newn.[u8](n + 1)[0..n];
+    let fv = new_val(V_FUNC, t_ptr());
+    set_fnp(fv, f);
+    f.val = fv;
+    m.funcs.push(f);
+    if not m.fmap.has(f.name) {
+        m.fmap.put(f.name, f);
+    }
+    return f;
+}
+
+/// Gives declaration f the signature fty, with new parameters for it (a
+/// declaration made for one language's calls that the other defines: C and
+/// Axiom in one program).
+pub fn retype_decl(f: *mut Func, fty: *mut Ty) void {
+    f.ty = fty;
+    let n = fty.params.len;
+    if (f.params.len == n) and (f.param_ext.len == n) {
+        for i in 0..n {
+            f.params[i].ty = fty.params[i];
+        }
+        return;
+    }
+    f.params = u.perm_newn.[*mut Value](n + 1)[0..n];
+    for i in 0..n {
+        f.params[i] = new_param(f, fty.params[i], i);
+    }
+    f.param_ext = u.perm_newn.[u8](n + 1)[0..n];
+}
+
+pub fn new_param(f: *mut Func, t: *mut Ty, idx: usize) *mut Value {
+    let p = new_val(V_PARAM, t);
+    p.cv = @as(u64, idx);
+    set_fnp(p, f);
+    return p;
+}
+
+// The replacements of the values forwarded (forward: those marked
+// replaced), by address. An entry outlives its value's replacement (which
+// forwarding nil stops) until the value is made again (new_val).
+threadlocal let mut REPL: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                cap: 0, len: 0 };
+
+fn replacement(v: *Value) *mut Value {
+    let k = @as(u64, @int_from_ptr(v));
+    let mut r = REPL.get(k);
+    if (r == 0) and sh_on and (fwd_epoch >= SH_EPOCH) {
+        r = sh_repl.get(k);  // (forwarded before the round, by the thread that made the module)
+    }
+    return @ptr_from_int(*mut Value, @truncate(usize, r));
+}
+
+// The value `v` stands for after replacements: for a pass that kept v
+// where replace_all does not reach (its own tables, the operands of an
+// instruction out of its block). Operands of registered instructions are
+// never replaced values (they are rewritten at once: see Use).
+pub inline fn resolve(v: *mut Value) *mut Value {
+    let mut x = v;
+    while u.notnil(x) and x.replaced {
+        x = replacement(x);
+    }
+    return x;
+}
+
+// Bumped whenever a value other than an instruction is forwarded: a
+// function that apply_forwarding has rewritten since then has no operand to
+// rewrite.
+threadlocal let mut fwd_epoch: u64 = 1;
+
+// (the epochs of the threads passes.ax optimizes functions on: slot k's
+// from k * SH_EPOCH up, apart from each other's and from the first
+// thread's, so that no function's fwd_seen is an epoch of another thread)
+pub const SH_EPOCH: u64 = 0x0100_0000_0000_0000;
+
+// Forwards v's uses to r (or, with r nil, stops forwarding them). The uses
+// of an instruction move to r at once (replace_all: its operands are
+// rewritten, and v reads as r through resolve() to whoever kept it); those
+// of other values (parameters, globals, functions), which have no lists,
+// when apply_forwarding next rewrites a function.
+pub fn forward(v: *mut Value, r: *mut Value) void {
+    v.replaced = u.notnil(r);
+    if v.replaced {
+        REPL.put(@as(u64, @int_from_ptr(v)), @as(u64, @int_from_ptr(r)));
+    }
+    if dbg_on and u.notnil(r) {
+        dbg_replace(v, r);  // (nil: forwarding stops, v is v again)
+    }
+    if (v.kind == V_INST) and u.notnil(r) {
+        replace_all(v, resolve(r));
+    } else {
+        fwd_epoch += 1;
+        if sh_on and (fwd_epoch >= SH_EPOCH) {
+            sh_fwds.push(v);
+            sh_fwds.push(r);
+        }
+    }
+}
+
+// Rewrites every operand of f's instructions through resolve().
+pub fn apply_forwarding(f: *mut Func) void {
+    if f.fwd_seen == fwd_epoch {
+        return;
+    }
+    f.fwd_seen = fwd_epoch;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if u.notnil(i.a) {
+                set_a(i, resolve(i.a));
+            }
+            if u.notnil(i.b) {
+                set_b(i, resolve(i.b));
+            }
+            if u.notnil(i.c) {
+                set_c(i, resolve(i.c));
+            }
+            for k in 0..i.xs.len {
+                set_x(i, k, resolve(i.xs.get(k)));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+pub fn get_function(m: *mut Module, name: []u8) *mut Func {
+    return m.fmap.get(u.intern(name));
+}
+
+pub fn add_global(m: *mut Module, t: *mut Ty, name: []u8) *mut Global {
+    let g = u.perm_new.[Global]();
+    g.name = u.intern(name);
+    g.ty = t;
+    g.align = t.align;
+    g.id = @int_cast(i32, m.globals.len);
+    let gv = new_val(V_GLOBAL, t_ptr());
+    set_gv(gv, g);
+    g.val = gv;
+    m.globals.push(g);
+    if not m.gmap.has(g.name) {
+        m.gmap.put(g.name, g);
+    }
+    return g;
+}
+
+pub fn get_global(m: *mut Module, name: []u8) *mut Global {
+    return m.gmap.get(u.intern(name));
+}
+
+pub fn is_decl(f: *Func) bool {
+    if (pv_n > 0) and (f.id >= 0) and (@as(usize, @bit_cast(u32, f.id)) < pv_n) {
+        let s = pv_vis.get(@as(usize, @bit_cast(u32, f.id)));
+        if s != PV_OWN {
+            return s == PV_DECL;
+        }
+    }
+    return u.isnil(f.first);
+}
+
+/// A global's initial value (nil: a declaration). A part of a module
+/// compiled in parts (but the first) declares the data the parts share.
+pub fn init_of(g: *mut Global) *mut Value {
+    if not pv_inits and (g.id >= 0) and (@as(usize, @bit_cast(u32, g.id)) < pv_globals) {
+        return u.nil.[Value]();
+    }
+    return g.init;
+}
+// Declarations of a function the module also defines (an extern "C" block
+// naming a runtime export, say) refer to the definition. Same for globals.
+pub fn merge_same_named(m: *mut Module) void {
+    let mut defs = u.SymMap.[*mut Func].{ keys: u.nil.[usize](), vals: u.nil.[*mut Func](), cap: 0, len: 0 };
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not is_decl(f) and (f.linkage != LINK_INTERNAL) {
+            defs.put(f.name, f);
+        }
+    }
+    let mut any = false;
+    // an alias's name, declared (by another C unit): its target, unless a
+    // definition of the name overrides a weak alias
+    for k in 0..m.aliases.len {
+        let a = m.aliases.at_mut(k);
+        if a.ifunc {
+            continue;  // (the name's declaration stays: its calls are the name's)
+        }
+        let af = alias_func(m, a);
+        if u.notnil(af) and u.isnil(defs.get(a.name)) {
+            defs.put(a.name, af);
+        }
+        let ag = alias_global(m, a);
+        let dg = m.gmap.get(a.name);
+        if u.notnil(ag) and u.notnil(dg) and u.isnil(dg.init) and (dg != ag) {
+            forward(dg.val, ag.val);
+            any = true;
+        }
+    }
+    let mut kept = u.List.[*mut Func].empty();
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if is_decl(f) {
+            let d = defs.get(f.name);
+            if u.notnil(d) {
+                forward(f.val, d.val);
+                any = true;
+                continue;
+            }
+        }
+        f.id = @int_cast(i32, kept.len);
+        kept.push(f);
+    }
+    if not any {
+        return;
+    }
+    m.funcs = kept;
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        m.fmap.put(f.name, f);
+        apply_forwarding(f);
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if u.notnil(g.init) {
+            g.init = resolve(g.init);
+            resolve_const(g.init);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parts (backend.ax: compile_parts). After inlining, the functions of a
+// module may be finished and compiled in parts, each on a thread of its
+// own, all from the one module: a part's thread changes its own functions
+// (and what it adds to the module: part_module), and reads the rest of the
+// module as it was when the parts began (the other functions, the globals,
+// constants and types: nothing changes them while the parts run). The
+// other parts' functions are defined to the passes (as they were) and
+// declared to the code generator (part_declare_others); in all but the
+// first part, the data the parts share is declared too (init_of). The
+// IR's tables (the types, the integer constants, the records of the
+// variables' assignments) each part starts from a copy of, as a process
+// forked when the parts began would; a type made before has its undef made
+// by each part (undef).
+// -----------------------------------------------------------------------------
+const PV_OWN: u8 = 0;  // its own function (or one made after the parts began)
+const PV_DECL: u8 = 1;
+const PV_DEF: u8 = 2;
+
+threadlocal let mut pv_n: usize = 0;  // the functions the parts share (0: not a part)
+threadlocal let mut pv_vis: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };  // by Func.id: PV_
+threadlocal let mut pv_globals: usize = 0;  // the globals the parts share
+threadlocal let mut pv_inits: bool = true;  // their initial values are this part's
+threadlocal let mut pv_tys: i32 = 0;        // the types made before the parts began
+threadlocal let mut pv_undefs: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                     cap: 0, len: 0 };
+
+/// What the thread of each part starts from: the module's functions and
+/// globals as the parts began, and this thread's tables (part_start).
+pub struct PartStart {
+    nfuncs: usize,
+    nglobals: usize,
+    decl: []mut bool,  // by function: declared when the parts began
+    ptr_bytes: u64,
+    tt: TypeTab,
+    cints: CintTable,
+    repl: u.U64Map,
+    fwd_epoch: u64,
+    asm_flags: u.List.[u32],
+    asm_mems: u.List.[[]AsmMem],
+    dbg_on: bool,
+    dbg_scopes: bool,
+    dbg_refs: u.List.[DbgRef],
+    dbg_at: u.SymMap.[i32],
+    dbg_merged: u.SymMap.[i32],
+    filt_at: *mut u64,
+    filt_inst: *mut u64,
+    filt_end: *mut u64,
+    dbg_marks: u.List.[DbgMark],
+    mk_inst: u.SymMap.[MkAt],
+    mk_end: u.SymMap.[MkAt],
+    dbg_slots: u.List.[DbgSlot],
+    dbg_slot_at: u.SymMap.[i32],
+    cur_src: u32,
+    cur_scope: u32,
+}
+
+/// On the thread that made m, as the parts begin: what their threads start
+/// from (nil if m cannot be cut: a function's or a global's id is not its
+/// index; the graveyard is not empty).
+pub fn part_start(m: *mut Module) *mut PartStart {
+    if grave_v.len + grave_b.len > 0 {
+        return u.nil.[PartStart]();
+    }
+    let decl = u.newn.[bool](m.funcs.len + 1);
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if f.id != @int_cast(i32, i) {
+            return u.nil.[PartStart]();
+        }
+        decl[i] = is_decl(f);
+    }
+    for i in 0..m.globals.len {
+        if m.globals.get(i).id != @int_cast(i32, i) {
+            return u.nil.[PartStart]();
+        }
+    }
+    let ps = u.new.[PartStart]();
+    ps.* = PartStart.{ nfuncs: m.funcs.len, nglobals: m.globals.len, decl: decl[0..m.funcs.len], ptr_bytes: ptr_bytes,
+                       tt: TT, cints: CINTS, repl: REPL, fwd_epoch: fwd_epoch, asm_flags: asm_flags, asm_mems: asm_mems,
+                       dbg_on: dbg_on, dbg_scopes: dbg_scopes, dbg_refs: dbg_refs, dbg_at: dbg_at,
+                       dbg_merged: dbg_merged, filt_at: filt_at, filt_inst: filt_inst, filt_end: filt_end,
+                       dbg_marks: dbg_marks, mk_inst: mk_inst, mk_end: mk_end, dbg_slots: dbg_slots,
+                       dbg_slot_at: dbg_slot_at, cur_src: cur_src, cur_scope: cur_scope };
+    return ps;
+}
+
+fn copy_filter(f: *u64) *mut u64 {
+    if u.isnil(f) {
+        return u.nil.[u64]();
+    }
+    let n = @as(usize, 1) << (FILT_BITS - 6);
+    let c = u.calloc_slice.[u64](n);
+    @mem_copy(c, @slice_from_ptr(f, n));
+    return c.ptr;
+}
+
+/// On the thread of a part, first: its view of the module (the functions
+/// with mine, its own), and copies of the tables. The functions of the
+/// other parts are defined, as they were when the parts began; the shared
+/// data's initial values are the first part's (first).
+pub fn part_begin(ps: *PartStart, mine: []bool, first: bool) void {
+    pv_n = ps.nfuncs;
+    pv_vis = u.List.[u8].empty();
+    for i in 0..ps.nfuncs {
+        if mine[i] {
+            pv_vis.push(PV_OWN);
+        } else if ps.decl[i] {
+            pv_vis.push(PV_DECL);
+        } else {
+            pv_vis.push(PV_DEF);
+        }
+    }
+    pv_globals = ps.nglobals;
+    pv_inits = true;
+    pv_first = first;
+    pv_tys = ps.tt.ty_count;
+    ptr_bytes = ps.ptr_bytes;
+    TT = ps.tt;
+    TT.derived = ps.tt.derived.copy();
+    TT.vecs = ps.tt.vecs.copy();
+    CINTS = ps.cints;
+    REPL = ps.repl.copy();
+    if ps.cints.cap > 0 {
+        let n = ps.cints.cap;
+        let tys = u.calloc_slice.[usize](n);
+        let vals = u.calloc_slice.[u64](n);
+        let cs = u.calloc_slice.[*mut Value](n);
+        @mem_copy(tys, @slice_from_ptr(ps.cints.tys, n));
+        @mem_copy(vals, @slice_from_ptr(ps.cints.vals, n));
+        @mem_copy(cs, @slice_from_ptr(ps.cints.cs, n));
+        CINTS.tys = tys.ptr;
+        CINTS.vals = vals.ptr;
+        CINTS.cs = cs.ptr;
+    }
+    fwd_epoch = ps.fwd_epoch;
+    // (read only: the C front end's)
+    asm_flags = ps.asm_flags;
+    asm_mems = ps.asm_mems;
+    dbg_on = ps.dbg_on;
+    dbg_scopes = ps.dbg_scopes;
+    dbg_refs = ps.dbg_refs.copy();
+    dbg_at = ps.dbg_at.copy();
+    dbg_merged = ps.dbg_merged.copy();
+    filt_at = copy_filter(ps.filt_at);
+    filt_inst = copy_filter(ps.filt_inst);
+    filt_end = copy_filter(ps.filt_end);
+    dbg_marks = ps.dbg_marks.copy();
+    mk_inst = ps.mk_inst.copy();
+    mk_end = ps.mk_end.copy();
+    dbg_slots = ps.dbg_slots.copy();
+    dbg_slot_at = ps.dbg_slot_at.copy();
+    cur_src = ps.cur_src;
+    cur_scope = ps.cur_scope;
+}
+
+threadlocal let mut pv_first: bool = true;
+
+/// On the thread of a part, once its functions are finished: the other
+/// parts' functions are declared, and (but in the first part) the data the
+/// parts share.
+pub fn part_declare_others() void {
+    for i in 0..pv_n {
+        if pv_vis.get(i) != PV_OWN {
+            pv_vis.set(i, PV_DECL);
+        }
+    }
+    pv_inits = pv_first;
+}
+
+/// The module a part's thread works on: m's lists of functions and globals
+/// (and names) copied, which the passes and code generator of the part add
+/// to (switch tables, coverage counters), and the rest of m.
+pub fn part_module(m: *Module) *mut Module {
+    let pm = u.new.[Module]();
+    pm.* = m.*;
+    pm.funcs = m.funcs.copy();
+    pm.globals = m.globals.copy();
+    pm.fmap = m.fmap.copy();
+    pm.gmap = m.gmap.copy();
+    pm.aliases = m.aliases.copy();
+    return pm;
+}

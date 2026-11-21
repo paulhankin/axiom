@@ -1,0 +1,717 @@
+// =============================================================================
+// wasm_emit.ax - scalar comparisons, arithmetic/bitwise operations, casts,
+// calls, and expression dispatch, part of wasm.ax.
+// =============================================================================
+import "ir.ax" as ir;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+// -----------------------------------------------------------------------------
+// Instructions
+// -----------------------------------------------------------------------------
+
+// i32 comparison opcodes by predicate
+fn icmp_op(p: ir.CmpPred, wide: bool) void {
+    let mut base: u8 = 0x46;
+    if wide {
+        base = 0x51;
+    }
+    let mut k: u8 = 0;
+    match p {
+        .EQ  => { k = 0; }
+        .NE  => { k = 1; }
+        .SLT => { k = 2; }
+        .ULT => { k = 3; }
+        .SGT => { k = 4; }
+        .UGT => { k = 5; }
+        .SLE => { k = 6; }
+        .ULE => { k = 7; }
+        .SGE => { k = 8; }
+        else => { k = 9; }
+    }
+    op(base + k);
+}
+
+fn fcmp_k(p: ir.CmpPred) u64 {
+    if p == ir.RealOEQ {
+        return 0;
+    }
+    if p == ir.RealUNE {
+        return 1;
+    }
+    if p == ir.RealOLT {
+        return 2;
+    }
+    if p == ir.RealOGT {
+        return 3;
+    }
+    if p == ir.RealOLE {
+        return 4;
+    }
+    return 5;
+}
+
+// Flips the sign bit of each i64 lane of the v128 on the stack.
+
+fn gen_icmp(v: *mut ir.Value) void {
+    let p = ir.pred_of(v);
+    let t = v.a.ty;
+    if t.kind == ir.T_VEC {
+        let sh = lane_shape(t);
+        let unsigned64 = (sh == 3) and ((p == ir.IntULT) or (p == ir.IntUGT) or (p == ir.IntULE) or (p == ir.IntUGE));
+        push(v.a);
+        if unsigned64 {
+            flip_i64_signs();
+        }
+        push(v.b);
+        if unsigned64 {
+            flip_i64_signs();
+        }
+        vec_icmp(p, t);
+        return;
+    }
+    let sg = ir.is_signed_pred(p);
+    push_ext(v.a, sg);
+    push_ext(v.b, sg);
+    icmp_op(p, is64(t));
+}
+
+fn gen_fcmp(v: *mut ir.Value) void {
+    let p = ir.pred_of(v);
+    let t = v.a.ty;
+    push(v.a);
+    push(v.b);
+    let k = fcmp_k(p);
+    if t.kind == ir.T_VEC {
+        if lane_shape(t) == 4 {
+            op_fd(65 + k);
+        } else {
+            op_fd(71 + k);
+        }
+        return;
+    }
+    if t.bits == 32 {
+        op(@truncate(u8, 0x5b + k));
+    } else {
+        op(@truncate(u8, 0x61 + k));
+    }
+}
+
+fn gen_binop(v: *mut ir.Value) void {
+    let o = v.op;
+    let t = v.ty;
+    if t.kind == ir.T_VEC {
+        if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+            vec_shift(v);
+            return;
+        }
+        push(v.a);
+        push(v.b);
+        vec_binop(o, t);
+        return;
+    }
+    if t.kind == ir.T_FLOAT {
+        push(v.a);
+        push(v.b);
+        let mut base: u8 = 0x92;
+        if t.bits == 64 {
+            base = 0xa0;
+        }
+        if o == ir.OP_FADD {
+            op(base);
+        } else if o == ir.OP_FSUB {
+            op(base + 1);
+        } else if o == ir.OP_FMUL {
+            op(base + 2);
+        } else if o == ir.OP_FDIV {
+            op(base + 3);
+        } else {
+            fail("frem is not supported on wasm yet");
+        }
+        return;
+    }
+    let bits = t.bits;
+    let w = is64(t);
+    if (o == ir.OP_UDIV) or (o == ir.OP_UREM) or (o == ir.OP_LSHR) {
+        push_ext(v.a, false);
+        if o == ir.OP_LSHR {
+            push(v.b);
+            if bits < 32 {
+                norm_u(bits);
+            }
+        } else {
+            push_ext(v.b, false);
+        }
+    } else if (o == ir.OP_SDIV) or (o == ir.OP_SREM) or (o == ir.OP_ASHR) {
+        push_ext(v.a, true);
+        if o == ir.OP_ASHR {
+            push(v.b);
+            if bits < 32 {
+                norm_u(bits);
+            }
+        } else {
+            push_ext(v.b, true);
+        }
+    } else {
+        push(v.a);
+        push(v.b);
+        if (o == ir.OP_SHL) and (bits < 32) {
+            norm_u(bits);
+        }
+    }
+    let mut k: u8 = 0;
+    if o == ir.OP_ADD {
+        k = 3;
+    } else if o == ir.OP_SUB {
+        k = 4;
+    } else if o == ir.OP_MUL {
+        k = 5;
+    } else if o == ir.OP_SDIV {
+        k = 6;
+    } else if o == ir.OP_UDIV {
+        k = 7;
+    } else if o == ir.OP_SREM {
+        k = 8;
+    } else if o == ir.OP_UREM {
+        k = 9;
+    } else if o == ir.OP_AND {
+        k = 10;
+    } else if o == ir.OP_OR {
+        k = 11;
+    } else if o == ir.OP_XOR {
+        k = 12;
+    } else if o == ir.OP_SHL {
+        k = 13;
+    } else if o == ir.OP_ASHR {
+        k = 14;
+    } else {
+        k = 15;
+    }
+    if w {
+        op(0x79 + k);
+    } else {
+        op(0x67 + k);
+    }
+    if (bits == 1) and ((o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_MUL) or (o == ir.OP_SHL)) {
+        i32c(1);
+        op(0x71);
+    }
+}
+
+fn gen_cast(v: *mut ir.Value) void {
+    let o = v.op;
+    let from = v.a.ty;
+    let to = v.ty;
+    if o == ir.OP_ZEXT {
+        push_ext(v.a, false);
+        if is64(to) and not is64(from) {
+            op(0xad);
+        }
+        return;
+    }
+    if o == ir.OP_SEXT {
+        if to.kind == ir.T_VEC {
+            push(v.a);  // lane masks are already all-ones / zeros
+            return;
+        }
+        push_ext(v.a, true);
+        if is64(to) and not is64(from) {
+            op(0xac);
+        }
+        return;
+    }
+    if o == ir.OP_TRUNC {
+        push(v.a);
+        if is64(from) and not is64(to) {
+            op(0xa7);
+        }
+        if to.bits == 1 {
+            i32c(1);
+            op(0x71);
+        }
+        return;
+    }
+    if (o == ir.OP_PTRTOINT) or (o == ir.OP_INTTOPTR) {
+        push(v.a);
+        return;
+    }
+    if o == ir.OP_BITCAST {
+        push(v.a);
+        let fv = vt(from);
+        let tv = vt(to);
+        if fv == tv {
+            return;
+        }
+        if (fv == wo.F32) and (tv == wo.I32) {
+            op(0xbc);
+        } else if (fv == wo.F64) and (tv == wo.I64) {
+            op(0xbd);
+        } else if (fv == wo.I32) and (tv == wo.F32) {
+            op(0xbe);
+        } else if (fv == wo.I64) and (tv == wo.F64) {
+            op(0xbf);
+        } else {
+            fail("unsupported bitcast");
+        }
+        return;
+    }
+    if o == ir.OP_FPEXT {
+        push(v.a);
+        if to.kind == ir.T_VEC {
+            op_fd(95);
+        } else {
+            op(0xbb);
+        }
+        return;
+    }
+    if o == ir.OP_FPTRUNC {
+        push(v.a);
+        op(0xb6);
+        return;
+    }
+    if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) {
+        let sg = o == ir.OP_SITOFP;
+        push_ext(v.a, sg);
+        let w = is64(from);
+        let mut code: u8 = 0;
+        if to.bits == 32 {
+            code = 0xb2;
+        } else {
+            code = 0xb7;
+        }
+        if w {
+            code += 2;
+        }
+        if not sg {
+            code += 1;
+        }
+        op(code);
+        return;
+    }
+    if (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT) {
+        let sg = o == ir.OP_FPTOSI_SAT;
+        push(v.a);
+        let from64 = from.bits == 64;
+        let wide = is64(to);
+        if tg.has(tg.W_NONTRAPPING_FPTOINT) {
+            let mut n: u64 = 0;
+            if wide {
+                n = 4;
+            }
+            if from64 {
+                n += 2;
+            }
+            if not sg {
+                n += 1;
+            }
+            op_fc(n);
+        } else {
+            trunc_sat_fallback(from64, wide, sg);
+        }
+        if to.bits < 32 {
+            clamp_narrow(to.bits, sg);
+        }
+        return;
+    }
+    fail(u.f1("cast %s", u.idec(o)));
+}
+
+// The i32 on the stack clamped to the range of a narrower integer type (it
+// holds a saturated i32 / u32 conversion result).
+fn clamp_narrow(bits: i32, sg: bool) void {
+    let t = new_local(wo.I32);
+    local_set(t);
+    let mut lo: i64 = 0;
+    let mut hi: i64 = (@as(i64, 1) << @int_cast(u32, bits)) - 1;
+    if sg {
+        lo = -(@as(i64, 1) << @int_cast(u32, bits - 1));
+        hi = (@as(i64, 1) << @int_cast(u32, bits - 1)) - 1;
+    }
+    // t = x > hi ? hi : x
+    i32c(hi);
+    local_get(t);
+    local_get(t);
+    i32c(hi);
+    if sg {
+        op(0x4a);  // gt_s
+    } else {
+        op(0x4b);  // gt_u
+    }
+    op(0x1b);
+    if sg {
+        // t < lo ? lo : t
+        local_set(t);
+        i32c(lo);
+        local_get(t);
+        local_get(t);
+        i32c(lo);
+        op(0x48);  // lt_s
+        op(0x1b);
+    }
+}
+
+// Saturating float -> int conversion without the nontrapping-fptoint
+// extension: NaN gives 0, out-of-range values the nearest bound.
+fn trunc_sat_fallback(from64: bool, wide: bool, sg: bool) void {
+    let fvt = u.pick(from64, "\x7c", "\x7d")[0];
+    let x = new_local(fvt);
+    local_set(x);
+    let rv = u.pick(wide, "\x7e", "\x7f")[0];
+    // limits as floats: [lo, hi) is safe for the trapping conversion
+    let mut lo: f64 = 0.0;
+    let mut hi: f64 = 0.0;
+    if wide {
+        if sg {
+            lo = -9223372036854775808.0;
+            hi = 9223372036854775808.0;
+        } else {
+            lo = 0.0;
+            hi = 18446744073709551616.0;
+        }
+    } else {
+        if sg {
+            lo = -2147483648.0;
+            hi = 2147483648.0;
+        } else {
+            lo = 0.0;
+            hi = 4294967296.0;
+        }
+    }
+    let r = new_local(rv);
+    // if x != x: 0 else if x < lo: min else if x >= hi: max else trunc(x)
+    local_get(x);
+    local_get(x);
+    op(u.pick(from64, "\x62", "\x5c")[0]);  // ne
+    op(0x04);
+    op(rv);
+    if wide {
+        i64c(0);
+    } else {
+        i32c(0);
+    }
+    op(0x05);
+    local_get(x);
+    fconst(from64, lo);
+    op(u.pick(from64, "\x63", "\x5d")[0]);  // lt
+    op(0x04);
+    op(rv);
+    if wide {
+        if sg {
+            i64c(-9223372036854775807 - 1);
+        } else {
+            i64c(0);
+        }
+    } else {
+        if sg {
+            i32c(-2147483648);
+        } else {
+            i32c(0);
+        }
+    }
+    op(0x05);
+    local_get(x);
+    fconst(from64, hi);
+    op(u.pick(from64, "\x66", "\x60")[0]);  // ge
+    op(0x04);
+    op(rv);
+    if wide {
+        if sg {
+            i64c(9223372036854775807);
+        } else {
+            i64c(-1);
+        }
+    } else {
+        if sg {
+            i32c(2147483647);
+        } else {
+            i32c(-1);
+        }
+    }
+    op(0x05);
+    local_get(x);
+    let mut code: u8 = 0xa8;
+    if wide {
+        code = 0xae;
+    }
+    if from64 {
+        code += 2;
+    }
+    if not sg {
+        code += 1;
+    }
+    op(code);
+    op(0x0b);
+    op(0x0b);
+    op(0x0b);
+    local_set(r);
+    local_get(r);
+}
+
+fn fconst(is64f: bool, x: f64) void {
+    if is64f {
+        op(0x44);
+        CB.u64_(@bit_cast(u64, x));
+    } else {
+        op(0x43);
+        CB.u32_(@as(u64, ir.f32_bits(x)));
+    }
+}
+
+fn arg_ext(x: *mut ir.Value, e: u8) void {
+    if e == 1 {
+        push_ext(x, false);
+    } else if e == 2 {
+        push_ext(x, true);
+    } else {
+        push(x);
+    }
+}
+
+// Size and alignment of a C variadic argument in the wasm varargs buffer.
+fn va_size(t: *ir.Ty) u64 {
+    if t.size <= 4 {
+        return 4;
+    }
+    return t.size;
+}
+
+fn va_buffer_size(v: *mut ir.Value) u64 {
+    let nfixed = ir.fty_of(v).params.len;
+    let mut off: u64 = 0;
+    for i in nfixed..v.xs.len {
+        let sz = va_size(v.xs.get(i).ty);
+        off = (off + sz - 1) & ~(sz - 1);
+        off += sz;
+    }
+    return off;
+}
+
+fn gen_call(v: *mut ir.Value) void {
+    if ir.fty_of(v).vararg {
+        // C variadic call (wasm C ABI): the extra arguments go in a buffer on
+        // the stack, whose address is passed after the fixed arguments
+        let nfixed = ir.fty_of(v).params.len;
+        for i in 0..nfixed {
+            let mut e: u8 = 0;
+            if (i + 1) < ir.ext_of(v).len {
+                e = ir.ext_of(v)[i + 1];
+            }
+            arg_ext(v.xs.get(i), e);
+        }
+        // each extra argument into a local first: one computed inline may be
+        // a variadic call itself, which reuses the buffer
+        let ls = u.newn.[u32](v.xs.len);
+        for i in nfixed..v.xs.len {
+            let x = v.xs.get(i);
+            ls[i] = new_local(vt(x.ty));
+            push_ext(x, true);
+            local_set(ls[i]);
+        }
+        let mut off: u64 = 0;
+        for i in nfixed..v.xs.len {
+            let x = v.xs.get(i);
+            let sz = va_size(x.ty);
+            off = (off + sz - 1) & ~(sz - 1);
+            local_get(fp_local);
+            local_get(ls[i]);
+            if (x.ty.kind == ir.T_INT) and (x.ty.size < 4) {
+                store_op(ir.t_int(32), false);
+            } else {
+                store_op(x.ty, false);
+            }
+            memarg(@int_cast(u32, sz), sz, @bit_cast(u64, va_off) + off);
+            off += sz;
+        }
+        local_get(fp_local);
+        pconst(@bit_cast(u64, va_off));
+        padd_sub(false);
+        op(0x10);
+        reloc(wo.R_FUNCTION_INDEX_LEB, fsyms.get(@int_cast(usize, ir.fnp_of(v.a).id)), 0);
+        CB.uleb5(0);
+        return;
+    }
+    for i in 0..v.xs.len {
+        let mut e: u8 = 0;
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
+        }
+        arg_ext(v.xs.get(i), e);
+    }
+    let cal = v.a;
+    let tail = tail_call(v);
+    if u.notnil(ir.direct_callee(v)) {
+        if tail {
+            epilogue();
+        }
+        op(u.pick(tail, "\x12", "\x10")[0]);  // return_call / call
+        reloc(wo.R_FUNCTION_INDEX_LEB, fsyms.get(@int_cast(usize, ir.fnp_of(cal).id)), 0);
+        CB.uleb5(0);
+        return;
+    }
+    push(cal);
+    if W64 {
+        op(0xa7);
+    }
+    let ti = fn_type(ir.fty_of(v));
+    if tail {
+        epilogue();
+    }
+    op(u.pick(tail, "\x13", "\x11")[0]);  // return_call_indirect / call_indirect
+    reloc(wo.R_TYPE_INDEX_LEB, ti, 0);
+    CB.uleb5(@as(u64, ti));
+    CB.u8_(0);
+    UN.uses_table = true;
+}
+
+// Is call v a sibling call (tailrec.ax, ir.F_TAIL: its block returns its
+// result, or nothing, right after it) to make with the tail-call extension:
+// the frame released (the epilogue) after the arguments are computed, then
+// return_call, which needs the callee's results to be the caller's? The
+// return after it is dead code then.
+fn tail_call(v: *mut ir.Value) bool {
+    if ((v.flags & ir.F_TAIL) == 0) or not tg.has(tg.W_TAIL_CALL) or ir.fty_of(v).vararg or F.returns_twice {
+        return false;
+    }
+    let r = v.next;
+    if u.isnil(r) or (r.op != ir.OP_RET) {
+        return false;
+    }
+    let ct = ir.fty_of(v).ret;
+    let ft = F.ty.ret;
+    if (ct.kind == ir.T_VOID) or (ft.kind == ir.T_VOID) {
+        return (ct.kind == ir.T_VOID) and (ft.kind == ir.T_VOID) and u.isnil(r.a);
+    }
+    return (vt(ct) == vt(ft)) and (@int_from_ptr(r.a) == @int_from_ptr(v));
+}
+
+pub fn fn_type(t: *ir.Ty) u32 {
+    let ps = u.newn.[u8](t.params.len + 2);
+    for i in 0..t.params.len {
+        ps[i] = vt(t.params[i]);
+    }
+    let mut np = t.params.len;
+    if t.vararg {
+        ps[np] = ptr_vt();
+        np += 1;
+    }
+    let mut rs: []u8 = "";
+    if t.ret.kind != ir.T_VOID {
+        let r = u.newn.[u8](1);
+        r[0] = vt(t.ret);
+        rs = r[0..1];
+    }
+    return wo.type_index(UN, ps[0..np], rs);
+}
+
+fn frame_addr(p: *mut ir.Value) void {
+    local_get(fp_local);
+    if p.aux != 0 {
+        pconst(@bit_cast(u64, p.aux));
+        padd_sub(false);
+    }
+}
+
+// The code computing v's value (or effect) onto the stack.
+fn expr(v: *mut ir.Value) void {
+    let o = v.op;
+    if o == ir.OP_ALLOCA {
+        frame_addr(v);
+        return;
+    }
+    if ir.is_binop(o) {
+        gen_binop(v);
+        return;
+    }
+    if o == ir.OP_FNEG {
+        push(v.a);
+        if v.ty.kind == ir.T_VEC {
+            op_fd(@as(u64, u.pick(lane_shape(v.ty) == 4, "\xe1", "\xed")[0]));
+        } else {
+            op(u.pick(v.ty.bits == 32, "\x8c", "\x9a")[0]);
+        }
+        return;
+    }
+    if o == ir.OP_ICMP {
+        gen_icmp(v);
+        return;
+    }
+    if o == ir.OP_FCMP {
+        gen_fcmp(v);
+        return;
+    }
+    if o == ir.OP_SELECT {
+        push(v.b);
+        push(v.c);
+        push(v.a);
+        op(0x1b);
+        return;
+    }
+    if ir.is_cast(o) {
+        gen_cast(v);
+        return;
+    }
+    if o == ir.OP_LOAD {
+        gen_load(v);
+        return;
+    }
+    if o == ir.OP_STORE {
+        gen_store(v);
+        return;
+    }
+    if o == ir.OP_PTRADD {
+        push(v.a);
+        push(v.b);
+        padd_sub(false);
+        return;
+    }
+    if (o == ir.OP_MEMCPY) or (o == ir.OP_MEMMOVE) or (o == ir.OP_MEMSET) {
+        gen_memop(v);
+        return;
+    }
+    if o == ir.OP_RMW {
+        gen_rmw(v);
+        return;
+    }
+    if o == ir.OP_CMPXCHG {
+        gen_cmpxchg(v);
+        return;
+    }
+    if o == ir.OP_FENCE {
+        if tg.has(tg.W_ATOMICS) {
+            op_fe(3);
+            op(0);
+            view_after_acquire();
+        }
+        return;
+    }
+    if o == ir.OP_EXTRACTELEM {
+        push(v.a);
+        extract_lane(v.a.ty, v.cv, false);
+        return;
+    }
+    if o == ir.OP_INSERTELEM {
+        push(v.a);
+        push(v.b);
+        replace_lane(v.ty, v.cv);
+        return;
+    }
+    if o == ir.OP_SPLAT {
+        push(v.a);
+        splat_op(v.ty);
+        return;
+    }
+    if o == ir.OP_SHUFFLE {
+        gen_shuffle(v);
+        return;
+    }
+    if o == ir.OP_CALL {
+        gen_call(v);
+        return;
+    }
+    if o == ir.OP_INTR {
+        gen_intr(v);
+        return;
+    }
+    fail(u.f1("cannot generate %s", ir.inst_str(v)));
+}

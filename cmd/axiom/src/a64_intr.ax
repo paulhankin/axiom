@@ -1,0 +1,508 @@
+// =============================================================================
+// a64_intr.ax - integer, target-instruction, and vector intrinsics, part of a64.ax.
+// =============================================================================
+import "a64enc.ax" as ae;
+import "combine.ax" as cb;
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Integer intrinsics
+// -----------------------------------------------------------------------------
+fn and_imm(sf: u64, d: i32, a: i32, x: u64) void {
+    let mut w: u32 = 32;
+    if sf == 1 {
+        w = 64;
+    }
+    raw2(ae.logic_imm(sf, 0, 0, 0, @bit_cast(u64, ae.logical_imm(x, w))), d, a);
+}
+
+fn orr_imm(sf: u64, d: i32, a: i32, x: u64) void {
+    let mut w: u32 = 32;
+    if sf == 1 {
+        w = 64;
+    }
+    raw2(ae.logic_imm(sf, 1, 0, 0, @bit_cast(u64, ae.logical_imm(x, w))), d, a);
+}
+
+fn gen_int_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let t = v.ty;
+    let bits = t.bits;
+    let sf = sfv(t);
+    let d = vreg(v);
+    let a0 = v.xs.get(0);
+    if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
+        // unsigned: the high half is nonzero; signed: the high half is not
+        // the sign extension of the low half
+        let a = reg(a0);
+        let b = reg(v.xs.get(1));
+        let h = vgpr();
+        raw3(ae.mulh(id == ir.IN_SMUL_OV, 0, 0, 0), h, a, b);
+        if id == ir.IN_UMUL_OV {
+            _ = cmp_imm(1, h, 0);
+        } else {
+            let l = vgpr();
+            raw3(ae.madd(1, false, 0, 0, 0, 31), l, a, b);
+            _ = raw(ae.addsub_reg(1, true, true, 31, 0, 0, 2, 63), NONE(), R(h), R(l), NONE());
+        }
+        cset(d, NE);
+        return;
+    }
+    if (id == ir.IN_UMULH) or (id == ir.IN_SMULH) {
+        raw3(ae.mulh(id == ir.IN_SMULH, 0, 0, 0), d, reg(a0), reg(v.xs.get(1)));
+        return;
+    }
+    if id == ir.IN_BSWAP {
+        let x = cb.bit_reversed(v);
+        if u.notnil(x) {
+            // a bit reversal by swaps (combine.ax): rbit (the swaps are left dead)
+            raw2(ae.dp1(sf, 0, 0, 0), d, reg(x));
+            return;
+        }
+        // rev (32 bits: opc 2, 64 bits: opc 3)
+        raw2(ae.dp1(sf, 2 + sf, 0, 0), d, reg(a0));
+        return;
+    }
+    if id == ir.IN_CTLZ {
+        let x = reg_ext(a0, false);
+        if bits < 32 {
+            let c = vgpr();
+            raw2(ae.dp1(0, 4, 0, 0), c, x);
+            add_imm(0, d, c, -@as(i64, 32 - bits));
+        } else {
+            raw2(ae.dp1(sf, 4, 0, 0), d, x);
+        }
+        return;
+    }
+    if id == ir.IN_CTTZ {
+        let mut x = reg(a0);
+        if bits < 32 {
+            let y = vgpr();
+            orr_imm(0, y, x, @as(u64, 1) << @int_cast(u32, bits));
+            x = y;
+        }
+        let r = vgpr();
+        raw2(ae.dp1(sf, 0, 0, 0), r, x);
+        raw2(ae.dp1(sf, 4, 0, 0), d, r);
+        return;
+    }
+    if id == ir.IN_CTPOP {
+        let x = reg_ext(a0, false);
+        let f = vvr();
+        if bits > 32 {
+            raw2(ae.fcvt_int(1, 1, 0, 7, 0, 0), f, x);
+        } else {
+            raw2(ae.fcvt_int(0, 0, 0, 7, 0, 0), f, x);
+        }
+        let c = vvr();
+        raw2(ae.v2(0, 0, 0, 5, 0, 0), c, f);  // cnt v.8b
+        let s = vvr();
+        raw2(ae.vacross(0, 0, 0, 0x1b, 0, 0), s, c);  // addv b, v.8b
+        raw2(ae.umov(0, 0, 0, 0), d, s);
+        return;
+    }
+    if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
+        gen_rotate(v, id, d);
+        return;
+    }
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        let sg = (id == ir.IN_SMIN) or (id == ir.IN_SMAX);
+        let a = reg_ext(a0, sg);
+        let b = reg_ext(v.xs.get(1), sg);
+        cmp_reg(sf, a, b);
+        let mut cc = LT;
+        match id {
+            .SMAX => { cc = GT; }
+            .UMIN => { cc = LO; }
+            .UMAX => { cc = HI; }
+            else => {}
+        }
+        raw3(ae.csel(sf, 0, 0, 0, 0, cc64(cc)), d, a, b);
+        return;
+    }
+    if id == ir.IN_ABS {
+        let a = reg_ext(a0, true);
+        _ = cmp_imm(sf, a, 0);
+        raw3(ae.csel(sf, 3, 0, 0, 0, cc64(GE)), d, a, a);
+        return;
+    }
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        gen_sat(v, id, d);
+        return;
+    }
+    fail(u.f1("integer intrinsic %s", u.idec(@int_from_enum(id))));
+}
+
+// d = v, a rotate left or right (id) of its first argument.
+fn gen_rotate(v: *mut ir.Value, id: ir.Intrinsic, d: i32) void {
+    let bits = v.ty.bits;
+    let sf = sfv(v.ty);
+    let a0 = v.xs.get(0);
+    let mut x = reg(a0);
+    let k = v.xs.get(1);
+    let mut rsf = sf;
+    if bits < 32 {
+        // replicate the value so a 32-bit rotation rotates it
+        let z = ext_reg(x, bits, false, false);
+        let y = vgpr();
+        _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, @as(u64, @bit_cast(u32, bits))), W(y), R(z), R(z), NONE());
+        x = y;
+        if bits == 8 {
+            let y2 = vgpr();
+            _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 16), W(y2), R(y), R(y), NONE());
+            x = y2;
+        }
+        rsf = 0;
+    }
+    if is.is_c(k) {
+        let m = @bit_cast(u64, is.cval(k)) & @as(u64, @bit_cast(u32, bits - 1));
+        let mut n = m;
+        if id == ir.IN_ROTL {
+            n = (@as(u64, @bit_cast(u32, bits)) - m) & @as(u64, @bit_cast(u32, bits - 1));
+        }
+        _ = raw(ae.extr(rsf, 0, 0, 0, n), W(d), R(x), R(x), NONE());
+        return;
+    }
+    let mut c = reg(k);
+    if id == ir.IN_ROTL {
+        let nc = vgpr();
+        raw_dm(ae.addsub_reg(0, true, false, 0, 31, 0, 0, 0), nc, c);
+        c = nc;
+    }
+    raw3(ae.dp2(rsf, 11, 0, 0, 0), d, x, c);
+}
+
+// d = v, the saturating signed or unsigned sum or difference (id) of its
+// arguments.
+fn gen_sat(v: *mut ir.Value, id: ir.Intrinsic, d: i32) void {
+    let bits = v.ty.bits;
+    let a0 = v.xs.get(0);
+    let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
+    let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
+    if bits < 64 {
+        // exact in 64 bits, then clamped
+        let a = ext_reg(reg(a0), bits, sg, true);
+        let b = ext_reg(reg(v.xs.get(1)), bits, sg, true);
+        let r = vgpr();
+        raw3(ae.addsub_reg(1, not is_add, false, 0, 0, 0, 0, 0), r, a, b);
+        let lr = vgpr();
+        let hr = vgpr();
+        movi(lr, is.sat_min(bits, sg), 1);
+        movi(hr, is.sat_max(bits, sg), 1);
+        let r2 = vgpr();
+        cmp_reg(1, r, lr);
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(GT)), r2, r, lr);
+        cmp_reg(1, r2, hr);
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(LT)), d, r2, hr);
+        return;
+    }
+    let a = reg(a0);
+    let b = reg(v.xs.get(1));
+    let r = vgpr();
+    raw3(ae.addsub_reg(1, not is_add, true, 0, 0, 0, 0, 0), r, a, b);
+    if sg {
+        // on overflow: a < 0 ? MIN : MAX
+        let s = vgpr();
+        raw2(ae.asr_imm(1, 0, 0, 63), s, a);
+        let mx = vgpr();
+        movi(mx, 9223372036854775807, 1);
+        let sat = vgpr();
+        raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), sat, s, mx);
+        // flags are from the adds / subs above (the moves do not set them)
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(VS)), d, sat, r);
+    } else if is_add {
+        raw2(ae.csel(1, 2, 0, 0, 31, cc64(LO)), d, r);  // carry: all ones
+    } else {
+        raw2(ae.csel(1, 0, 0, 0, 31, cc64(HS)), d, r);  // borrow: zero
+    }
+}
+
+// An S register (lane 0 of a vector register) holding the u32 in r.
+fn s_reg(r: i32) i32 {
+    let s = vvr();
+    raw2(ae.ins_gen(2, 0, 0, 0), s, r);
+    return s;
+}
+
+// AES rounds, polynomial multiply, SHA steps, the SHA-3 instructions, CRC32.
+// Most of them accumulate into their destination: it starts as a copy of
+// the first operand.
+fn gen_insn(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let d = vreg(v);
+    let a = reg(v.xs.get(0));
+    if (id == ir.IN_CRC32) or (id == ir.IN_CRC32C_A) {
+        let x = v.xs.get(1);
+        let sz = x.ty.size;
+        let mut w: u64 = 0x1AC0_4000;
+        if sz == 2 {
+            w = 0x1AC0_4400;
+        } else if sz == 4 {
+            w = 0x1AC0_4800;
+        } else if sz == 8 {
+            w = 0x9AC0_4C00;
+        }
+        if id == ir.IN_CRC32C_A {
+            w = w | 0x1000;
+        }
+        raw3(w, d, a, reg(x));
+        return;
+    }
+    if id == ir.IN_AESMC {
+        raw2(0x4E28_6800, d, a);
+        return;
+    }
+    if id == ir.IN_AESIMC_A {
+        raw2(0x4E28_7800, d, a);
+        return;
+    }
+    if id == ir.IN_SHA1H {
+        let s = s_reg(a);
+        let r = vvr();
+        raw2(0x5E28_0800, r, s);
+        raw2(ae.umov(2, 0, 0, 0), d, r);
+        return;
+    }
+    let b = reg(v.xs.get(1));
+    if (id == ir.IN_PMULL) or (id == ir.IN_PMULL2) {
+        let mut w: u64 = 0x0EE0_E000;
+        if id == ir.IN_PMULL2 {
+            w = 0x4EE0_E000;
+        }
+        raw3(w, d, a, b);
+        return;
+    }
+    if id == ir.IN_RAX1 {
+        raw3(0xCE60_8C00, d, a, b);
+        return;
+    }
+    if id == ir.IN_XAR {
+        let k = @bit_cast(u64, is.cval(v.xs.get(2))) & 63;
+        raw3(0xCE80_0000 | (k << 10), d, a, b);
+        return;
+    }
+    if (id == ir.IN_EOR3) or (id == ir.IN_BCAX) {
+        let c = reg(v.xs.get(2));
+        let mut w: u64 = 0xCE00_0000;
+        if id == ir.IN_BCAX {
+            w = 0xCE20_0000;
+        }
+        _ = raw(w, W(d), R(a), R(b), R(c));
+        return;
+    }
+    // destructive: Vd (= a) op= Vn [, Vm]
+    let t = vvr();
+    copy(t, a, VR);
+    match id {
+        .AESE, .AESD => {
+            let mut w: u64 = 0x4E28_4800;
+            if id == ir.IN_AESD {
+                w = 0x4E28_5800;
+            }
+            _ = raw(w, RW(t), R(b), NONE(), NONE());
+        }
+        .SHA1SU1, .SHA256SU0 => {
+            let mut w: u64 = 0x5E28_1800;
+            if id == ir.IN_SHA256SU0 {
+                w = 0x5E28_2800;
+            }
+            _ = raw(w, RW(t), R(b), NONE(), NONE());
+        }
+        .SHA512SU0 => { _ = raw(0xCEC0_8000, RW(t), R(b), NONE(), NONE()); }
+        else => {
+            // three operands: Vd op= Vn, Vm
+            let c = reg(v.xs.get(2));
+            let mut n = b;
+            if (id == ir.IN_SHA1C) or (id == ir.IN_SHA1P) or (id == ir.IN_SHA1M) {
+                n = s_reg(b);  // (e: an S register)
+            }
+            let ids: [10]ir.Intrinsic = [ir.IN_SHA1C, ir.IN_SHA1P, ir.IN_SHA1M, ir.IN_SHA1SU0, ir.IN_SHA256H,
+                                         ir.IN_SHA256H2, ir.IN_SHA256SU1, ir.IN_SHA512H, ir.IN_SHA512H2,
+                                         ir.IN_SHA512SU1];
+            let ws: [10]u64 = [0x5E00_0000, 0x5E00_1000, 0x5E00_2000, 0x5E00_3000, 0x5E00_4000, 0x5E00_5000,
+                               0x5E00_6000, 0xCE60_8000, 0xCE60_8400, 0xCE60_8800];
+            let mut w: u64 = 0;
+            for k in @as(usize, 0)..10 {
+                if ids[k] == id {
+                    w = ws[k];
+                }
+            }
+            _ = raw(w, RW(t), R(n), R(c), NONE());
+        }
+    }
+    copy(d, t, VR);
+}
+
+fn gen_vec_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
+    let a0 = v.xs.get(0);
+    let at_ = a0.ty;
+    let d = vreg(v);
+    let k = lk(at_);
+    if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) {
+        gen_any_all(id, d, reg(a0), k);
+        return;
+    }
+    if id == ir.IN_BITMASK {
+        gen_bitmask(a0, d, k);
+        return;
+    }
+    if id == ir.IN_SWIZZLE {
+        raw3(ae.tbl(0, 0, 0), d, reg(a0), reg(v.xs.get(1)));
+        return;
+    }
+    if ir.is_widen(id) {
+        // SSHLL / USHLL{2} #0 (SXTL, UXTL2 ...)
+        raw2(ae.vshift(widen_q(id), widen_u(id), 0x14, @as(u64, 8) << k, true, 0, 0, 0), d, reg(a0));
+        return;
+    }
+    if ir.intr_between(id, ir.IN_SHLV, ir.IN_ASHRV) {
+        // USHL / SSHL by each lane's count (codegen.ax clamped it to the lane's
+        // bits), negated to shift right
+        let mut c = reg(v.xs.get(1));
+        if id != ir.IN_SHLV {
+            let n = vvr();
+            raw2(ae.v2(1, 1, k, 0x0b, 0, 0), n, c);
+            c = n;
+        }
+        let mut u_: u64 = 1;
+        if id == ir.IN_ASHRV {
+            u_ = 0;
+        }
+        raw3(ae.v3(1, u_, k, 0x08, 0, 0, 0), d, reg(a0), c);
+        return;
+    }
+    if id == ir.IN_DOT_I8 {
+        // SDOT into zero
+        raw1(ae.movi_zero(0), d);
+        _ = raw(ae.sdot(0, 0, 0), RW(d), R(reg(a0)), R(reg(v.xs.get(1))), NONE());
+        return;
+    }
+    if id == ir.IN_DOT_I16 {
+        let a = reg(a0);
+        let b = reg(v.xs.get(1));
+        let p0 = vvr();
+        let p1 = vvr();
+        raw3(ae.smull(0, 0, 0, 0), p0, a, b);
+        raw3(ae.smull(1, 0, 0, 0), p1, a, b);
+        raw3(ae.v3(1, 0, 2, 0x17, 0, 0, 0), d, p0, p1);  // addp .4s
+        return;
+    }
+    if is.lane_float(at_) {
+        gen_float_intr(v, id);
+        return;
+    }
+    let a = reg(a0);
+    if id == ir.IN_ABS {
+        raw2(ae.v2(1, 0, k, 0x0b, 0, 0), d, a);
+        return;
+    }
+    let b = reg(v.xs.get(1));
+    let mut w: u64 = 0;
+    match id {
+        .SMIN     => { w = ae.v3(1, 0, k, 0x0d, 0, 0, 0); }
+        .SMAX     => { w = ae.v3(1, 0, k, 0x0c, 0, 0, 0); }
+        .UMIN     => { w = ae.v3(1, 1, k, 0x0d, 0, 0, 0); }
+        .UMAX     => { w = ae.v3(1, 1, k, 0x0c, 0, 0, 0); }
+        .SADD_SAT => { w = ae.v3(1, 0, k, 0x01, 0, 0, 0); }
+        .UADD_SAT => { w = ae.v3(1, 1, k, 0x01, 0, 0, 0); }
+        .SSUB_SAT => { w = ae.v3(1, 0, k, 0x05, 0, 0, 0); }
+        .USUB_SAT => { w = ae.v3(1, 1, k, 0x05, 0, 0, 0); }
+        else => {
+            fail(u.f1("vector intrinsic %s", u.idec(@int_from_enum(id))));
+            return;
+        }
+    }
+    raw3(w, d, a, b);
+}
+
+// d = any_true or all_true (id) of the lanes of a, k their size (lk).
+fn gen_any_all(id: ir.Intrinsic, d: i32, a: i32, k: u64) void {
+    let s = vvr();
+    let g = vgpr();
+    if id == ir.IN_ANYTRUE {
+        raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, a);  // umaxv b
+        raw2(ae.umov(0, 0, 0, 0), g, s);
+        _ = cmp_imm(0, g, 0);
+        cset(d, NE);
+        return;
+    }
+    if k == 3 {
+        let z = vvr();
+        raw2(ae.v2(1, 0, 3, 0x09, 0, 0), z, a);       // cmeq v.2d, #0
+        raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, z);  // any zero lane?
+        raw2(ae.umov(0, 0, 0, 0), g, s);
+        _ = cmp_imm(0, g, 0);
+        cset(d, EQ);
+        return;
+    }
+    raw2(ae.vacross(1, 1, k, 0x1a, 0, 0), s, a);  // uminv
+    raw2(ae.umov(k, 0, 0, 0), g, s);
+    _ = cmp_imm(0, g, 0);
+    cset(d, NE);
+}
+
+// d = the bitmask of a0's lanes (each lane's top bit), k their size (lk).
+fn gen_bitmask(a0: *mut ir.Value, d: i32, k: u64) void {
+    let a = reg(a0);
+    let esize = @as(u64, 8) << @truncate(u32, k);
+    let bitv = vvr();
+    if k == 3 {
+        raw2(ae.vshift(1, 1, 0, esize, false, esize - 1, 0, 0), bitv, a);  // ushr: top bits as 0 / 1
+        let l0 = vgpr();
+        let l1 = vgpr();
+        raw2(ae.umov(3, 0, 0, 0), l0, bitv);
+        raw2(ae.umov(3, 1, 0, 0), l1, bitv);
+        _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 1), W(d), R(l0), R(l1), NONE());
+        return;
+    }
+    let mut inverted = false;
+    if (ir.is_op(a0, ir.OP_ICMP) and (ir.pred_of(a0) == ir.IntNE)) or
+       (ir.is_op(a0, ir.OP_FCMP) and (ir.pred_of(a0) == ir.RealUNE)) {
+        // x != y: the equal lanes, cleared from the weights below (BIC) rather than
+        // inverted first (the compare's own instructions are left dead)
+        let ea = reg(a0.a);
+        let eb = reg(a0.b);
+        if ir.is_op(a0, ir.OP_ICMP) {
+            raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), bitv, ea, eb);  // cmeq
+        } else {
+            raw3(ae.v3(1, 0, fsz(a0.a.ty), 0x1c, 0, 0, 0), bitv, ea, eb);  // fcmeq
+        }
+        inverted = true;
+    } else if ir.is_op(a0, ir.OP_ICMP) or ir.is_op(a0, ir.OP_FCMP) {
+        copy(bitv, a, VR);  // (a compare's lanes are all ones or zeros already)
+    } else {
+        raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
+    }
+    let mut wl: u64 = 0;
+    let mut wh: u64 = 0;
+    if k == 0 {
+        wl = 0x8040_2010_0804_0201;
+        wh = wl;
+    } else if k == 1 {
+        wl = 0x0008_0004_0002_0001;
+        wh = 0x0080_0040_0020_0010;
+    } else {
+        wl = 0x0000_0002_0000_0001;
+        wh = 0x0000_0008_0000_0004;
+    }
+    let wv = vconst(wl, wh);
+    let m = vvr();
+    if inverted {
+        raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), m, wv, bitv);  // bic: weights of the lanes not equal
+    } else {
+        raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), m, bitv, wv);  // and
+    }
+    let s = vvr();
+    if k == 0 {
+        // the high half's bytes interleaved with the low half's, summed as halfwords
+        let hi = vvr();
+        raw3(0x6E00_4000, hi, m, m);  // ext hi.16b, m, m, #8
+        let z = vvr();
+        raw3(0x4E00_3800, z, m, hi);                  // zip1 z.16b, m, hi
+        raw2(ae.vacross(1, 0, 1, 0x1b, 0, 0), s, z);  // addv h
+        raw2(ae.umov(1, 0, 0, 0), d, s);
+        return;
+    }
+    raw2(ae.vacross(1, 0, k, 0x1b, 0, 0), s, m);
+    raw2(ae.umov(k, 0, 0, 0), d, s);
+}

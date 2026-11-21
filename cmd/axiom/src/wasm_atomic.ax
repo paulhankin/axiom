@@ -1,0 +1,698 @@
+// =============================================================================
+// wasm_atomic.ax - memory loads/stores, shared-memory growth view
+// synchronization, atomic RMW/cmpxchg, and bulk memory operations, part of
+// wasm.ax.
+// =============================================================================
+import "ir.ax" as ir;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+// -----------------------------------------------------------------------------
+// A thread's view of a growing shared memory (spec §12.8.5, "Memory growth")
+//
+// An engine may keep, in each thread's instance, the memory's size as that
+// thread last saw it, check atomic and bulk accesses (and, on memory64,
+// every access) against it, and bring it up to date only some time after
+// another thread has grown the memory: an access to memory that another
+// thread added, which the program has every right to make (it happens after
+// the growth), then traps as out of bounds. `memory.grow` by 0 pages brings
+// the calling thread's view up to date. So, with the atomics extension:
+// - each `memory.grow` that succeeds raises the word __axiom_memory_pages
+//   (linker-provided) to the memory's size in pages, before the program can
+//   use the new pages;
+// - each atomic operation that can observe another thread's writes (loads,
+//   read-modify-writes, compare-exchanges, waits, fences) is followed by a
+//   look at that word: if it is beyond the thread's own memory.size, the
+//   thread grows the memory by 0. Whatever happens after another thread's
+//   growth reaches the thread through such an operation, so the thread's
+//   view covers it by then;
+// - an atomic or bulk access whose end is beyond the view (memory reached
+//   through a pointer read in a race) refreshes it first.
+// The cost is a load and a compare per atomic operation; the refresh itself
+// happens only after another thread has grown the memory.
+// -----------------------------------------------------------------------------
+threadlocal let mut pages_sym: u32 = 0;
+threadlocal let mut view_sync: bool = false;
+
+// Pushes the address of __axiom_memory_pages.
+fn pages_word() void {
+    if W64 {
+        op(0x42);
+        reloc(wo.R_MEMORY_ADDR_SLEB64, pages_sym, 0);
+        CB.sleb10(0);
+    } else {
+        op(0x41);
+        reloc(wo.R_MEMORY_ADDR_SLEB, pages_sym, 0);
+        CB.sleb5(0);
+    }
+}
+
+// memory.size
+fn mem_size() void {
+    op(0x3f);
+    op(0);
+}
+
+// The unsigned > and != of the memory's address width.
+fn ptr_gt_u() void {
+    op(u.pick(W64, "\x56", "\x4b")[0]);
+}
+
+fn ptr_ne() void {
+    op(u.pick(W64, "\x52", "\x47")[0]);
+}
+
+// memory.grow 0 (its result dropped): the thread's view brought up to date.
+fn view_refresh() void {
+    pconst(0);
+    op(0x40);
+    op(0);
+    op(0x1a);
+}
+
+// The pointer-sized atomic load and compare-exchange of __axiom_memory_pages.
+fn pages_atomic(load: bool) void {
+    let mut code: u64 = 0x48;
+    if load {
+        code = 0x10;
+    }
+    if W64 {
+        code += 1;
+        op_fe(code);
+        memarg(8, 8, 0);
+    } else {
+        op_fe(code);
+        memarg(4, 4, 0);
+    }
+}
+
+// After an atomic operation that may observe another thread's writes: the
+// view refreshed if another thread has grown the memory beyond it.
+fn view_after_acquire() void {
+    if not view_sync {
+        return;
+    }
+    pages_word();
+    if W64 {
+        op(0x29);
+        memarg(8, 8, 0);
+    } else {
+        op(0x28);
+        memarg(4, 4, 0);
+    }
+    mem_size();
+    ptr_gt_u();
+    op(0x04);
+    op(0x40);
+    view_refresh();
+    op(0x0b);
+}
+
+// Before an atomic or bulk access of [a, a + n + len) (a in local la, n
+// constant, len in local nl if has_nl): the view refreshed if the access
+// reaches beyond it. Computed in 64 bits, so that the end of a 4 GiB wasm32
+// memory does not wrap.
+fn view_before(la: u32, n: u64, nl: u32, has_nl: bool) void {
+    if not view_sync {
+        return;
+    }
+    local_get(la);
+    if not W64 {
+        op(0xad);  // i64.extend_i32_u
+    }
+    if has_nl {
+        local_get(nl);
+        if not W64 {
+            op(0xad);
+        }
+        op(0x7c);
+    }
+    if n != 0 {
+        i64c(@bit_cast(i64, n));
+        op(0x7c);
+    }
+    mem_size();
+    if not W64 {
+        op(0xad);
+    }
+    i64c(16);
+    op(0x86);  // i64.shl
+    op(0x56);  // i64.gt_u
+    op(0x04);
+    op(0x40);
+    view_refresh();
+    op(0x0b);
+}
+
+// After memory.grow (its result on the stack, kept): on success, raises
+// __axiom_memory_pages to the memory's size, which this thread's view now
+// has, atomically (another thread may be raising it too).
+fn view_after_grow() void {
+    if not view_sync {
+        return;
+    }
+    let g = new_local(ptr_vt());
+    let old = new_local(ptr_vt());
+    local_set(g);
+    local_get(g);
+    pconst(~@as(u64, 0));
+    ptr_ne();
+    op(0x04);
+    op(0x40);
+    op(0x02);
+    op(0x40);
+    op(0x03);
+    op(0x40);
+    pages_word();
+    pages_atomic(true);
+    local_set(old);
+    mem_size();
+    local_get(old);
+    ptr_gt_u();
+    op(0x45);  // i32.eqz: not higher, done
+    op(0x0d);
+    CB.uleb(1);
+    pages_word();
+    local_get(old);
+    mem_size();
+    pages_atomic(false);
+    local_get(old);
+    ptr_ne();  // another thread raised it meanwhile: again
+    op(0x0d);
+    CB.uleb(0);
+    op(0x0b);
+    op(0x0b);
+    op(0x0b);
+    local_get(g);
+}
+
+// After push_addr of an atomic access of `size` bytes at offset `off`: the
+// view checked for it (the address kept on the stack).
+fn view_before_addr(off: u64, size: u64) void {
+    if not view_sync {
+        return;
+    }
+    let la = new_local(ptr_vt());
+    local_tee(la);
+    view_before(la, off + size, 0, false);
+}
+
+fn load_op(t: *ir.Ty, atomic: bool) void {
+    let k = t.kind;
+    if atomic {
+        if (k == ir.T_INT) or (k == ir.T_PTR) {
+            let b = t.bits;
+            if is64(t) {
+                op_fe(0x11);
+            } else if b == 8 {
+                op_fe(0x12);
+            } else if b == 16 {
+                op_fe(0x13);
+            } else {
+                op_fe(0x10);
+            }
+            return;
+        }
+    }
+    if k == ir.T_VEC {
+        op_fd(0);
+        return;
+    }
+    if k == ir.T_FLOAT {
+        op(u.pick(t.bits == 32, "\x2a", "\x2b")[0]);
+        return;
+    }
+    if is64(t) {
+        op(0x29);
+        return;
+    }
+    let b = t.bits;
+    if (b == 8) or (b == 1) {
+        op(0x2d);
+    } else if b == 16 {
+        op(0x2f);
+    } else {
+        op(0x28);
+    }
+}
+
+fn store_op(t: *ir.Ty, atomic: bool) void {
+    let k = t.kind;
+    if atomic {
+        if (k == ir.T_INT) or (k == ir.T_PTR) {
+            let b = t.bits;
+            if is64(t) {
+                op_fe(0x18);
+            } else if b == 8 {
+                op_fe(0x19);
+            } else if b == 16 {
+                op_fe(0x1a);
+            } else {
+                op_fe(0x17);
+            }
+            return;
+        }
+    }
+    if k == ir.T_VEC {
+        op_fd(11);
+        return;
+    }
+    if k == ir.T_FLOAT {
+        op(u.pick(t.bits == 32, "\x38", "\x39")[0]);
+        return;
+    }
+    if is64(t) {
+        op(0x37);
+        return;
+    }
+    let b = t.bits;
+    if (b == 8) or (b == 1) {
+        op(0x3a);
+    } else if b == 16 {
+        op(0x3b);
+    } else {
+        op(0x36);
+    }
+}
+
+fn is_wasm_global(p: *mut ir.Value) bool {
+    return (p.kind == ir.V_GLOBAL) and ir.gv_of(p).wasm_global;
+}
+
+fn gen_load(v: *mut ir.Value) void {
+    if is_wasm_global(v.a) {
+        op(0x23);
+        reloc(wo.R_GLOBAL_INDEX_LEB, gsyms.get(@int_cast(usize, ir.gv_of(v.a).id)), 0);
+        CB.uleb5(0);
+        return;
+    }
+    let off = push_addr(v.a);
+    let atomic = (v.flags & ir.F_ATOMIC) != 0;
+    if atomic {
+        view_before_addr(off, v.ty.size);
+    }
+    load_op(v.ty, atomic and tg.has(tg.W_ATOMICS));
+    let mut al = v.align;
+    if atomic {
+        al = @int_cast(u32, v.ty.size);
+    }
+    memarg(al, v.ty.size, off);
+    if atomic {
+        view_after_acquire();
+    }
+}
+
+fn gen_store(v: *mut ir.Value) void {
+    if is_wasm_global(v.b) {
+        push(v.a);
+        op(0x24);
+        reloc(wo.R_GLOBAL_INDEX_LEB, gsyms.get(@int_cast(usize, ir.gv_of(v.b).id)), 0);
+        CB.uleb5(0);
+        return;
+    }
+    let off = push_addr(v.b);
+    let atomic = (v.flags & ir.F_ATOMIC) != 0;
+    if atomic {
+        view_before_addr(off, v.a.ty.size);
+    }
+    push(v.a);
+    let t = v.a.ty;
+    store_op(t, atomic and tg.has(tg.W_ATOMICS));
+    let mut al = v.align;
+    if atomic {
+        al = @int_cast(u32, t.size);
+    }
+    memarg(al, t.size, off);
+}
+
+// Atomic read-modify-write opcode: base + width variant.
+fn rmw_code(base: u64, t: *ir.Ty) u64 {
+    if is64(t) {
+        return base + 1;
+    }
+    if t.bits == 8 {
+        return base + 2;
+    }
+    if t.bits == 16 {
+        return base + 3;
+    }
+    return base;
+}
+
+fn gen_rmw(v: *mut ir.Value) void {
+    let o = @truncate(i32, @bit_cast(i64, v.cv));
+    let t = v.ty;
+    let sz = t.size;
+    if (o == ir.RMW_MIN) or (o == ir.RMW_MAX) or (o == ir.RMW_UMIN) or (o == ir.RMW_UMAX) or not tg.has(tg.W_ATOMICS) {
+        rmw_loop(v, o);
+        return;
+    }
+    let off = push_addr(v.a);
+    view_before_addr(off, sz);
+    push(v.b);
+    let mut base: u64 = 0x1e;
+    if o == ir.RMW_SUB {
+        base = 0x25;
+    } else if o == ir.RMW_AND {
+        base = 0x2c;
+    } else if o == ir.RMW_OR {
+        base = 0x33;
+    } else if o == ir.RMW_XOR {
+        base = 0x3a;
+    } else if o == ir.RMW_XCHG {
+        base = 0x41;
+    }
+    op_fe(rmw_code(base, t));
+    memarg(@int_cast(u32, sz), sz, off);
+    view_after_acquire();
+}
+
+// old = *p; loop { new = op(old, x); cur = cmpxchg(p, old, new); if cur == old break; old = cur }
+fn rmw_loop(v: *mut ir.Value, o: i32) void {
+    let t = v.ty;
+    let w = vt(t);
+    let sz = t.size;
+    let pl = new_local(ptr_vt());
+    let xl = new_local(w);
+    let old = new_local(w);
+    let cur = new_local(w);
+    push(v.a);
+    local_set(pl);
+    push(v.b);
+    local_set(xl);
+    let atomics = tg.has(tg.W_ATOMICS);
+    if atomics {
+        view_before(pl, sz, 0, false);
+    }
+    local_get(pl);
+    load_op(t, atomics);
+    memarg(@int_cast(u32, sz), sz, 0);
+    local_set(old);
+    op(0x03);
+    op(0x40);
+    local_get(pl);
+    local_get(old);
+    // new value
+    let sg = (o == ir.RMW_MIN) or (o == ir.RMW_MAX);
+    if (o == ir.RMW_MIN) or (o == ir.RMW_MAX) or (o == ir.RMW_UMIN) or (o == ir.RMW_UMAX) {
+        let is_min = (o == ir.RMW_MIN) or (o == ir.RMW_UMIN);
+        // select(old, x, old < x) for min, old > x for max
+        local_get(old);
+        local_get(xl);
+        local_get(old);
+        if t.bits < 32 {
+            if sg {
+                norm_s(t.bits);
+            } else {
+                norm_u(t.bits);
+            }
+        }
+        local_get(xl);
+        if t.bits < 32 {
+            if sg {
+                norm_s(t.bits);
+            } else {
+                norm_u(t.bits);
+            }
+        }
+        if is_min {
+            if sg {
+                icmp_op(ir.IntSLT, is64(t));
+            } else {
+                icmp_op(ir.IntULT, is64(t));
+            }
+        } else {
+            if sg {
+                icmp_op(ir.IntSGT, is64(t));
+            } else {
+                icmp_op(ir.IntUGT, is64(t));
+            }
+        }
+        op(0x1b);
+    } else {
+        local_get(old);
+        local_get(xl);
+        if o == ir.RMW_ADD {
+            iop(t, 0x6a, 0x7c);
+        } else if o == ir.RMW_SUB {
+            iop(t, 0x6b, 0x7d);
+        } else if o == ir.RMW_AND {
+            iop(t, 0x71, 0x83);
+        } else if o == ir.RMW_OR {
+            iop(t, 0x72, 0x84);
+        } else if o == ir.RMW_XOR {
+            iop(t, 0x73, 0x85);
+        } else {
+            op(0x1a);
+            op(0x1a);
+            local_get(xl);
+        }
+    }
+    if atomics {
+        op_fe(rmw_code(0x48, t));
+        memarg(@int_cast(u32, sz), sz, 0);
+    } else {
+        // plain store, then the loaded value compares equal
+        let nv = new_local(w);
+        local_set(nv);
+        local_set(cur);
+        op(0x1a);
+        local_get(pl);
+        local_get(nv);
+        store_op(t, false);
+        memarg(@int_cast(u32, sz), sz, 0);
+        local_get(old);
+    }
+    local_tee(cur);
+    local_get(old);
+    if t.bits < 32 {
+        // compare the accessed bits only
+        let tmp = new_local(wo.I32);
+        local_set(tmp);
+        norm_u(t.bits);
+        local_get(tmp);
+        norm_u(t.bits);
+    }
+    icmp_op(ir.IntNE, is64(t));
+    op(0x04);
+    op(0x40);
+    local_get(cur);
+    local_set(old);
+    op(0x0c);
+    CB.uleb(1);
+    op(0x0b);
+    op(0x0b);
+    if atomics {
+        view_after_acquire();
+    }
+    local_get(old);
+}
+
+fn gen_cmpxchg(v: *mut ir.Value) void {
+    let t = v.ty;
+    let sz = t.size;
+    if not tg.has(tg.W_ATOMICS) {
+        // single-threaded: load, compare, maybe store (the operands first, in
+        // order: computed inline, they may have effects)
+        let w = vt(t);
+        let pl = new_local(ptr_vt());
+        let el = new_local(w);
+        let nl = new_local(w);
+        let old = new_local(w);
+        push(v.a);
+        local_set(pl);
+        push_ext(v.b, false);
+        local_set(el);
+        push(v.c);
+        local_set(nl);
+        local_get(pl);
+        load_op(t, false);
+        memarg(@int_cast(u32, sz), sz, 0);
+        local_set(old);
+        local_get(old);
+        local_get(el);
+        if t.bits < 32 {
+            let tmp = new_local(wo.I32);
+            local_set(tmp);
+            norm_u(t.bits);
+            local_get(tmp);
+        }
+        icmp_op(ir.IntEQ, is64(t));
+        op(0x04);
+        op(0x40);
+        local_get(pl);
+        local_get(nl);
+        store_op(t, false);
+        memarg(@int_cast(u32, sz), sz, 0);
+        op(0x0b);
+        local_get(old);
+        return;
+    }
+    let off = push_addr(v.a);
+    view_before_addr(off, sz);
+    push_ext(v.b, false);
+    push(v.c);
+    op_fe(rmw_code(0x48, t));
+    memarg(@int_cast(u32, sz), sz, off);
+    view_after_acquire();
+}
+
+fn gen_memop(v: *mut ir.Value) void {
+    let o = v.op;
+    if (o == ir.OP_MEMCPY) and (v.c.kind == ir.V_CINT) and (v.c.cv <= 64) {
+        // small copies: loads and stores
+        let n = v.c.cv;
+        let d = new_local(ptr_vt());
+        let s = new_local(ptr_vt());
+        let doff = push_addr(v.a);
+        local_set(d);
+        let soff = push_addr(v.b);
+        local_set(s);
+        let mut k: u64 = 0;
+        while k < n {
+            let mut w: u64 = 8;
+            while (k + w) > n {
+                w = w / 2;
+            }
+            local_get(d);
+            local_get(s);
+            if w == 8 {
+                op(0x29);
+            } else if w == 4 {
+                op(0x28);
+            } else if w == 2 {
+                op(0x2f);
+            } else {
+                op(0x2d);
+            }
+            memarg(1, w, soff + k);
+            if w == 8 {
+                op(0x37);
+            } else if w == 4 {
+                op(0x36);
+            } else if w == 2 {
+                op(0x3b);
+            } else {
+                op(0x3a);
+            }
+            memarg(1, w, doff + k);
+            k += w;
+        }
+        return;
+    }
+    if not tg.has(tg.W_BULK_MEMORY) {
+        mem_loop(v);
+        return;
+    }
+    if view_sync {
+        // (the operands in locals, in order, to check the ranges' ends)
+        let pv = ptr_vt();
+        let d = new_local(pv);
+        let s = new_local(vt(v.b.ty));
+        let n = new_local(pv);
+        push(v.a);
+        local_set(d);
+        push(v.b);
+        local_set(s);
+        push(v.c);
+        local_set(n);
+        view_before(d, 0, n, true);
+        if o != ir.OP_MEMSET {
+            view_before(s, 0, n, true);
+        }
+        local_get(d);
+        local_get(s);
+        local_get(n);
+    } else {
+        push(v.a);
+        push(v.b);
+        push(v.c);
+    }
+    if o == ir.OP_MEMSET {
+        op_fc(11);
+        op(0);
+    } else {
+        op_fc(10);
+        op(0);
+        op(0);
+    }
+}
+
+// memcpy / memmove / memset as a byte loop (no bulk-memory extension).
+fn mem_loop(v: *mut ir.Value) void {
+    let pv = ptr_vt();
+    let d = new_local(pv);
+    let s = new_local(vt(v.b.ty));  // (memset: the byte)
+    let n = new_local(pv);
+    let i = new_local(pv);
+    push(v.a);
+    local_set(d);
+    push(v.b);
+    local_set(s);
+    push(v.c);
+    local_set(n);
+    let is_set = v.op == ir.OP_MEMSET;
+    // memmove: copy backwards when d > s
+    let back = new_local(wo.I32);
+    if v.op == ir.OP_MEMMOVE {
+        local_get(d);
+        local_get(s);
+        if W64 {
+            op(0x56);
+        } else {
+            op(0x4b);
+        }
+    } else {
+        i32c(0);
+    }
+    local_set(back);
+    pconst(0);
+    local_set(i);
+    op(0x02);
+    op(0x40);
+    op(0x03);
+    op(0x40);
+    local_get(i);
+    local_get(n);
+    if W64 {
+        op(0x5a);  // i64.ge_u
+    } else {
+        op(0x4f);
+    }
+    op(0x0d);
+    CB.uleb(1);
+    // index j = back ? n-1-i : i
+    let j = new_local(pv);
+    local_get(n);
+    pconst(1);
+    padd_sub(true);
+    local_get(i);
+    padd_sub(true);
+    local_get(i);
+    local_get(back);
+    op(0x1b);
+    local_set(j);
+    local_get(d);
+    local_get(j);
+    padd_sub(false);
+    if is_set {
+        local_get(s);
+    } else {
+        local_get(s);
+        local_get(j);
+        padd_sub(false);
+        op(0x2d);
+        memarg(1, 1, 0);
+    }
+    op(0x3a);
+    memarg(1, 1, 0);
+    local_get(i);
+    pconst(1);
+    padd_sub(false);
+    local_set(i);
+    op(0x0c);
+    CB.uleb(0);
+    op(0x0b);
+    op(0x0b);
+}

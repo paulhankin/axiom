@@ -1,0 +1,425 @@
+// =============================================================================
+// wasm_stackify.ax - structured WebAssembly control flow ("Beyond Relooper")
+// and switch/jump-table emission, part of wasm.ax.
+// =============================================================================
+import "combine.ax" as cb;
+import "ir.ax" as ir;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+// -----------------------------------------------------------------------------
+// Control flow
+// -----------------------------------------------------------------------------
+fn depth_of(kind: i32, target: *mut ir.Block) u64 {
+    let n = ctx.len;
+    for k in 0..n {
+        let c = ctx.get(n - 1 - k);
+        if (c.kind == kind) and (c.target == target) {
+            return @as(u64, k);
+        }
+    }
+    fail(u.f1("no enclosing label for block %s", target.name));
+    return 0;
+}
+
+fn phi_copies(from: *mut ir.Block, to: *mut ir.Block) void {
+    let mut n: usize = 0;
+    let mut p = to.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut found = false;
+        for k in 0..ir.bs_of(p).len {
+            if ir.bs_of(p).get(k) == from {
+                push(p.xs.get(k));
+                found = true;
+                break;
+            }
+        }
+        if not found {
+            push_const(ir.undef(p.ty));
+        }
+        n += 1;
+        p = p.next;
+    }
+    // set in reverse order
+    let mut last = to.first;
+    for k in 0..n {
+        last = last.next;
+    }
+    let mut q = to.first;
+    let ps = u.newn.[*mut ir.Value](n + 1);
+    for k in 0..n {
+        ps[k] = q;
+        q = q.next;
+    }
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        local_set(@int_cast(u32, ps[k].loc));
+    }
+}
+
+// Pushes the negation of i1 value c: an inlined integer comparison with the
+// inverse predicate, else c and i32.eqz.
+fn push_not(c: *mut ir.Value) void {
+    if (c.kind == ir.V_INST) and (c.op == ir.OP_ICMP) and (c.flag == FL_INLINE) and (c.a.ty.kind != ir.T_VEC) {
+        let p = cb.inv_pred(ir.pred_of(c));
+        let sg = ir.is_signed_pred(p);
+        push_ext(c.a, sg);
+        push_ext(c.b, sg);
+        icmp_op(p, is64(c.a.ty));
+        return;
+    }
+    push(c);
+    op(0x45);  // i32.eqz
+}
+
+// Would a branch from `from` to `to` be just a `br` (no phi copies)?
+fn plain_branch(from: *mut ir.Block, to: *mut ir.Block) bool {
+    if u.notnil(to.first) and (to.first.op == ir.OP_PHI) {
+        return false;
+    }
+    return (to.rpo <= from.rpo) or is_merge(to);
+}
+
+fn branch_depth(from: *mut ir.Block, to: *mut ir.Block) u64 {
+    if to.rpo <= from.rpo {
+        return depth_of(CTX_LOOP, to);
+    }
+    return depth_of(CTX_BLOCK, to);
+}
+
+// The branch from `from` to `to`: a `br` to a loop's start or to a merge
+// block's place (nil is returned), or nothing, where `to` is to be emitted
+// right here: then `to` is returned, for the caller to emit.
+fn branch_next(from: *mut ir.Block, to: *mut ir.Block) *mut ir.Block {
+    phi_copies(from, to);
+    if to.rpo <= from.rpo {
+        op(0x0c);
+        CB.uleb(depth_of(CTX_LOOP, to));
+        return u.nil.[ir.Block]();
+    }
+    if is_merge(to) {
+        op(0x0c);
+        CB.uleb(depth_of(CTX_BLOCK, to));
+        return u.nil.[ir.Block]();
+    }
+    return to;
+}
+
+fn do_branch(from: *mut ir.Block, to: *mut ir.Block) void {
+    let n = branch_next(from, to);
+    if u.notnil(n) {
+        do_tree(n);
+    }
+}
+
+// The merge children of x, in decreasing reverse postorder.
+fn merges_of(x: *mut ir.Block) u.List.[*mut ir.Block] {
+    let mut ys = u.List.[*mut ir.Block].empty();
+    for k in 0..x.dom_kids.len {
+        let y = x.dom_kids.get(k);
+        if is_merge(y) {
+            ys.push(y);
+        }
+    }
+    // sort by rpo descending (small lists: insertion sort)
+    for i in 1..ys.len {
+        let mut j = i;
+        while (j > 0) and (ys.get(j - 1).rpo < ys.get(j).rpo) {
+            let t = ys.get(j - 1);
+            ys.set(j - 1, ys.get(j));
+            ys.set(j, t);
+            j -= 1;
+        }
+    }
+    return ys;
+}
+
+// The code of x and of the blocks it dominates. What comes last in it, the
+// block a plain branch falls into or the last of x's merge children, is done
+// in a loop here, not by a call: a long run of statements is a chain of such
+// blocks as long as the function, and each call's frames would stay on the
+// compiler's stack.
+fn do_tree(x0: *mut ir.Block) void {
+    let mut x = x0;
+    loop {
+        let mut ys = merges_of(x);
+        if is_header(x) {
+            op(0x03);
+            op(0x40);
+            ctx.push(Ctx.{ kind: CTX_LOOP, target: x });
+            node_within(x, ys.items());
+            _ = ctx.pop();
+            op(0x0b);
+            ys.deinit();
+            return;
+        }
+        if ys.len == 0 {
+            ys.deinit();
+            let n = emit_block(x);
+            if u.isnil(n) {
+                return;
+            }
+            x = n;
+            continue;
+        }
+        let y = ys.get(0);
+        op(0x02);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_BLOCK, target: y });
+        node_within(x, ys.items()[1..]);
+        _ = ctx.pop();
+        op(0x0b);
+        ys.deinit();
+        x = y;
+    }
+}
+
+fn node_within(x: *mut ir.Block, ys: []*mut ir.Block) void {
+    if ys.len > 0 {
+        let y = ys[0];
+        op(0x02);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_BLOCK, target: y });
+        node_within(x, ys[1..]);
+        _ = ctx.pop();
+        op(0x0b);
+        do_tree(y);
+        return;
+    }
+    let n = emit_block(x);
+    if u.notnil(n) {
+        do_tree(n);
+    }
+}
+
+// The code of block x. Returns the block its last branch falls into, for
+// the caller to emit next (nil: none).
+
+fn emit_block(x: *mut ir.Block) *mut ir.Block {
+    wev(3, x.rpo, u.nil.[ir.Value]());
+    let mut i = x.first;
+    while u.notnil(i) {
+        let o = i.op;
+        if WV and not ir.is_term(o) {
+            wev(1, ir.dbg_marks_at(i), u.nil.[ir.Value]());
+        }
+        if (o == ir.OP_PHI) or ir.is_term(o) or (i.flag != FL_LOCAL) {
+            i = i.next;
+            continue;
+        }
+        line_row(i.src);
+        scope_row(i.scope);
+        expr(i);
+        if i.ty.kind != ir.T_VOID {
+            if i.nuses > 0 {
+                local_set(@int_cast(u32, i.loc));
+                wev(2, i.loc, i);
+            } else {
+                op(0x1a);
+            }
+        }
+        i = i.next;
+    }
+    let t = ir.terminator(x);
+    if WV {
+        wev(1, ir.dbg_marks_at(t), u.nil.[ir.Value]());
+        wev(1, ir.dbg_marks_end(x), u.nil.[ir.Value]());
+    }
+    wev(4, x.rpo, u.nil.[ir.Value]());
+    line_row(t.src);
+    scope_row(t.scope);
+    let o = t.op;
+    if o == ir.OP_BR {
+        return branch_next(x, t.t1);
+    } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t1) {
+        // br_if to the target, then the other side inline
+        push(t.a);
+        op(0x0d);
+        CB.uleb(branch_depth(x, t.t1));
+        return branch_next(x, t.t2);
+    } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t2) {
+        push_not(t.a);
+        op(0x0d);
+        CB.uleb(branch_depth(x, t.t2));
+        return branch_next(x, t.t1);
+    } else if o == ir.OP_CONDBR {
+        push(t.a);
+        op(0x04);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_IF, target: u.nil.[ir.Block]() });
+        do_branch(x, t.t1);
+        op(0x05);
+        do_branch(x, t.t2);
+        _ = ctx.pop();
+        op(0x0b);
+    } else if o == ir.OP_SWITCH {
+        emit_switch(x, t);
+    } else if o == ir.OP_RET {
+        if u.notnil(t.a) {
+            arg_ext(t.a, F.ret_ext);
+        }
+        epilogue();
+        op(0x0f);
+    } else {
+        op(0x00);
+    }
+    return u.nil.[ir.Block]();
+}
+
+// A jump table (switches.ax, ir.SW_TABLE: the cases 0..n-1, the value less
+// than n): one br_table, with a nested block per distinct target (depth k:
+// the k-th, in the order the cases first name them).
+fn emit_table(x: *mut ir.Block, t: *mut ir.Value) void {
+    let n = t.xs.len;
+    let bs = ir.bs_of(t);
+    let at = u.calloc_slice.[u32](@int_cast(usize, F.nblocks) + 1);  // by block id: 1 + its depth
+    let mut ts = u.List.[*mut ir.Block].empty();
+    for k in 0..n {
+        let s = bs.get(k);
+        if at[@int_cast(usize, s.id)] == 0 {
+            ts.push(s);
+            at[@int_cast(usize, s.id)] = @int_cast(u32, ts.len);
+        }
+    }
+    for _k in 0..ts.len {
+        op(0x02);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_OTHER, target: u.nil.[ir.Block]() });
+    }
+    push_ext(t.a, false);
+    if is64(t.a.ty) {
+        op(0xa7);  // (less than n: the low half)
+    }
+    op(0x0e);
+    CB.uleb(@as(u64, n));
+    for k in 0..n {
+        CB.uleb(@as(u64, at[@int_cast(usize, bs.get(k).id)] - 1));
+    }
+    CB.uleb(0);
+    for k in 0..ts.len {
+        _ = ctx.pop();
+        op(0x0b);
+        do_branch(x, ts.get(k));
+    }
+    ts.deinit();
+    u.free_slice(at);
+}
+
+fn emit_switch(x: *mut ir.Block, t: *mut ir.Value) void {
+    if t.cv == ir.SW_TABLE {
+        emit_table(x, t);
+        return;
+    }
+    let n = t.xs.len;
+    // dense range of case values?
+    let mut lo: i64 = 0;
+    let mut hi: i64 = 0;
+    for k in 0..n {
+        let c = ir.sval(t.xs.get(k));
+        if (k == 0) or (c < lo) {
+            lo = c;
+        }
+        if (k == 0) or (c > hi) {
+            hi = c;
+        }
+    }
+    // (hi - lo as unsigned: it may not fit an i64, cases MIN and MAX)
+    let d = @bit_cast(u64, hi) -% @bit_cast(u64, lo);
+    if (n == 0) or (d >= @as(u64, @int_cast(u32, n)) * 3 + 8) or (d >= 10000) {
+        // compare chain
+        let v = new_local(wo.I64);
+        let sg = true;
+        push_ext(t.a, sg);
+        if not is64(t.a.ty) {
+            op(0xac);
+        }
+        local_set(v);
+        for k in 0..n {
+            local_get(v);
+            i64c(ir.sval(t.xs.get(k)));
+            op(0x51);
+            op(0x04);
+            op(0x40);
+            ctx.push(Ctx.{ kind: CTX_IF, target: u.nil.[ir.Block]() });
+            do_branch(x, ir.bs_of(t).get(k));
+            _ = ctx.pop();
+            op(0x0b);
+        }
+        do_branch(x, t.t1);
+        return;
+    }
+    let span = @bit_cast(i64, d) + 1;
+    // targets: 0..n-1 cases, n default; one nested block per case edge
+    let nt = n + 1;
+    for k in 0..nt {
+        op(0x02);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_OTHER, target: u.nil.[ir.Block]() });
+    }
+    // index = value - lo (as i32), with out-of-range going to default
+    let idx = new_local(wo.I32);
+    push_ext(t.a, true);
+    if is64(t.a.ty) {
+        i64c(lo);
+        op(0x7d);
+        let w = new_local(wo.I64);
+        local_tee(w);
+        i64c(span);
+        op(0x5a);  // ge_u
+        op(0x04);
+        op(0x40);
+        i32c(span);  // (past the table: the default)
+        local_set(idx);
+        op(0x05);
+        local_get(w);
+        op(0xa7);
+        local_set(idx);
+        op(0x0b);
+    } else {
+        i32c(lo);
+        op(0x6b);
+        local_set(idx);
+    }
+    // br_table: depth k for case index; table entries for each value in range
+    local_get(idx);
+    op(0x0e);
+    CB.uleb(@bit_cast(u64, span));
+    for j in 0..@int_cast(usize, span) {
+        let val = lo + @as(i64, @int_cast(i32, j));
+        let mut target = n;  // default
+        for k in 0..n {
+            if ir.sval(t.xs.get(k)) == val {
+                target = k;
+                break;
+            }
+        }
+        CB.uleb(@as(u64, target));
+    }
+    CB.uleb(@as(u64, n));
+    for k in 0..nt {
+        _ = ctx.pop();
+        op(0x0b);
+        if k < n {
+            do_branch(x, ir.bs_of(t).get(k));
+        } else {
+            do_branch(x, t.t1);
+        }
+    }
+}
+
+// global.get (0x23) or global.set (0x24) of the stack pointer.
+fn sp_global(opcode: u8) void {
+    op(opcode);
+    reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
+    CB.uleb5(0);
+}
+
+fn epilogue() void {
+    if frame_size > 0 {
+        local_get(fp_local);
+        pconst(frame_size);
+        padd_sub(false);
+        sp_global(0x24);
+    }
+}

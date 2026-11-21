@@ -1,0 +1,470 @@
+// =============================================================================
+// std/net/http/parse.ax - buffered HTTP/1.1 connection reading, chunked
+// transfer decoding, header parsing, and message framing (part of std/net/http).
+// =============================================================================
+
+import "../../fmt.ax" as fmt;
+import "../../mem.ax" as mem;
+import "../../net.ax" as net;
+import "../../str.ax" as strs;
+import "../../time.ax" as time;
+
+// -----------------------------------------------------------------------------
+// Buffered connection reading (shared by the server and the client)
+// -----------------------------------------------------------------------------
+
+struct Conn {
+    stream: Transport,
+    buf: []mut u8,
+    start: usize,  // unread data is buf[start..end]
+    end: usize,
+    pin: usize,         // buf[..pin] holds the current head: never moved
+    limit: usize,       // the most buf may grow to
+    deadline: i64,      // monotonic ns by which the current message must arrive (0: none)
+    scanned: usize,     // how much of a head read_head has searched for its end
+    nonblocking: bool,  // reads fail with WouldBlock rather than wait (set_nonblocking)
+
+    fn init(stream: Transport, limit: usize) { OutOfMemory }!Conn {
+        let b = mem.alloc.[u8](@min(16384, limit))!;
+        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, scanned: 0,
+                      nonblocking: false };
+    }
+
+    /// Whether reads fail with WouldBlock when nothing has arrived, rather
+    /// than wait (TLS included). The read methods may be called again after
+    /// WouldBlock: they go on where they stopped.
+    fn set_nonblocking(self: *mut Conn, on: bool) void {
+        self.nonblocking = on;
+        if self.stream.secure {
+            self.stream.tls.nonblocking = on;
+        }
+    }
+
+    fn deinit(self: *mut Conn) void {
+        mem.free(self.buf);
+    }
+
+    /// Reads more data. 0 means the peer closed the connection.
+    fn fill(self: *mut Conn) !usize {
+        if self.end == self.buf.len {
+            if self.start > self.pin {
+                // make room by moving unread data down to the pinned head
+                let n = self.end - self.start;
+                @mem_copy(self.buf[self.pin..self.pin + n], self.buf[self.start..self.end]);
+                self.start = self.pin;
+                self.end = self.pin + n;
+            } else if (self.pin == 0) and (self.buf.len < self.limit) {
+                self.buf = mem.realloc(self.buf, @min(self.buf.len * 2, self.limit))!;
+            } else {
+                return error.HeadTooLarge;
+            }
+        }
+        // (a peer dripping bytes must not hold the connection forever: each
+        // read has the socket's timeout, the whole message has this)
+        if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+            return error.TimedOut;
+        }
+        if self.nonblocking and not self.stream.secure and
+           (net.poll_one(self.stream.tcp.handle, net.READABLE, 0)! == 0) {
+            return error.WouldBlock;
+        }
+        let n = self.stream.read(self.buf[self.end..])!;
+        self.end += n;
+        return n;
+    }
+
+    /// Starts a new message: unread data moves to the front.
+    fn reset(self: *mut Conn) void {
+        let n = self.end - self.start;
+        if (self.start > 0) and (n > 0) {
+            @mem_copy(self.buf[..n], self.buf[self.start..self.end]);
+        }
+        self.start = 0;
+        self.end = n;
+        self.pin = 0;
+        self.scanned = 0;
+    }
+
+    /// Waits for a whole head (up to and including the blank line) and
+    /// returns its length from `start`; 0 if the peer closed the connection
+    /// before sending anything.
+    fn read_head(self: *mut Conn) !usize {
+        loop {
+            // blank lines before a message are ignored (RFC 9112 section 2.2)
+            while (self.scanned == 0) and (self.start < self.end) and
+                  ((self.buf[self.start] == '\r') or (self.buf[self.start] == '\n')) {
+                self.start += 1;
+            }
+            let data = self.buf[self.start..self.end];
+            let mut i = self.scanned;
+            while i < data.len {
+                if data[i] == '\n' {
+                    if ((i + 1) < data.len) and (data[i + 1] == '\n') {
+                        self.scanned = 0;
+                        return i + 2;
+                    }
+                    if ((i + 2) < data.len) and (data[i + 1] == '\r') and (data[i + 2] == '\n') {
+                        self.scanned = 0;
+                        return i + 3;
+                    }
+                }
+                i += 1;
+            }
+            // (kept across WouldBlock: a head dripped a byte at a time is
+            // searched once, not once per byte)
+            self.scanned = @max(data.len, 2) - 2;
+            let n = self.fill()!;
+            if n == 0 {
+                if self.end == self.start {
+                    return 0;
+                }
+                return error.Closed;
+            }
+        }
+    }
+
+    /// Takes up to `max` buffered or newly read bytes.
+    fn take(self: *mut Conn, max: usize) ![]u8 {
+        if self.start == self.end {
+            if self.fill()! == 0 {
+                return error.Closed;
+            }
+        }
+        let n = @min(max, self.end - self.start);
+        let out = self.buf[self.start..self.start + n];
+        self.start += n;
+        return out;
+    }
+
+    /// Appends exactly n bytes to out, growing it as they arrive (a peer
+    /// announcing a large body must send it before we allocate it).
+    fn read_into(self: *mut Conn, out: *mut strs.String, n: usize) !void {
+        let mut left = n;
+        while left > 0 {
+            let part = self.take(@min(left, 65536))!;
+            out.push_str(part)!;
+            left -= part.len;
+        }
+    }
+
+    /// Reads exactly dst.len bytes.
+    fn read_exact(self: *mut Conn, dst: []mut u8) !void {
+        let mut got: usize = 0;
+        while got < dst.len {
+            let part = self.take(dst.len - got)!;
+            @mem_copy(dst[got..got + part.len], part);
+            got += part.len;
+        }
+    }
+
+    /// One line without its CRLF (at most a few KiB; a bare LF is refused).
+    fn read_line(self: *mut Conn) ![]u8 {
+        loop {
+            let data = self.buf[self.start..self.end];
+            let nl = strs.index_of_byte(data, '\n') ?? data.len;
+            if nl < data.len {
+                if (nl == 0) or (data[nl - 1] != '\r') {
+                    return error.BadRequest;
+                }
+                self.start += nl + 1;
+                return data[..nl - 1];
+            }
+            if data.len > 8192 {
+                return error.BadRequest;
+            }
+            if self.fill()! == 0 {
+                return error.Closed;
+            }
+        }
+    }
+
+    /// Everything until the peer closes the connection, appended to out.
+    fn read_to_end(self: *mut Conn, out: *mut strs.String, max: usize) !void {
+        loop {
+            if self.start < self.end {
+                let part = self.buf[self.start..self.end];
+                if (out.len() + part.len) > max {
+                    return error.TooLarge;
+                }
+                out.push_str(part)!;
+                self.start = self.end;
+            }
+            // only a clean close ends the body: a TLS connection cut without
+            // close_notify fails here (it may be a truncation attack)
+            if self.fill()! == 0 {
+                return;
+            }
+        }
+    }
+
+    /// A chunked body (RFC 9112 section 7.1), appended to out; trailers are
+    /// checked as headers are, then dropped. Lines must end in CRLF.
+    fn read_chunked(self: *mut Conn, out: *mut strs.String, max: usize) !void {
+        let mut st = ChunkState.{ phase: CHUNK_SIZE, left: 0 };
+        _ = self.read_chunked_from(out, max, &mut st, @max_value(usize))!;
+    }
+
+    /// read_chunked from where st says it stopped (after WouldBlock); true
+    /// once the body is whole, false if it stopped as out reached `stop`
+    /// bytes.
+    fn read_chunked_from(self: *mut Conn, out: *mut strs.String, max: usize, st: *mut ChunkState, stop: usize) !bool {
+        loop {
+            if st.phase == CHUNK_SIZE {
+                let line = self.read_line()!;
+                let semi = strs.index_of_byte(line, ';') ?? line.len;
+                if not valid_chunk_ext(line[semi..]) {
+                    return error.BadRequest;
+                }
+                // chunk-size = 1*HEXDIG, then optional whitespace before extensions
+                let size_text = trim_trailing_blanks(line[..semi]);
+                if (size_text.len == 0) or (size_text.len > ((2 * @size_of(usize)) - 1)) {
+                    return error.BadRequest;
+                }
+                let mut size: usize = 0;
+                for c in size_text {
+                    let d = hex_value(c);
+                    if d > 15 {
+                        return error.BadRequest;
+                    }
+                    size = (size * 16) + @as(usize, d);
+                }
+                if size == 0 {
+                    st.phase = CHUNK_TRAILERS;  // (left counts them)
+                    st.left = 0;
+                } else {
+                    if (out.len() + size) > max {
+                        return error.TooLarge;
+                    }
+                    st.phase = CHUNK_DATA;
+                    st.left = size;
+                }
+            } else if st.phase == CHUNK_DATA {
+                while st.left > 0 {
+                    if out.len() >= stop {
+                        return false;
+                    }
+                    let part = self.take(@min(st.left, 65536))!;
+                    out.push_str(part)!;
+                    st.left -= part.len;
+                }
+                st.phase = CHUNK_CRLF;
+            } else if st.phase == CHUNK_CRLF {
+                while (self.end - self.start) < 2 {
+                    if self.fill()! == 0 {
+                        return error.Closed;
+                    }
+                }
+                if not @mem_eq(self.buf[self.start..self.start + 2], "\r\n") {
+                    return error.BadRequest;
+                }
+                self.start += 2;
+                st.phase = CHUNK_SIZE;
+            } else {
+                // trailers until a blank line (a bounded number)
+                if st.left == MAX_TRAILERS {
+                    return error.HeadTooLarge;
+                }
+                let t = self.read_line()!;
+                if t.len == 0 {
+                    return true;
+                }
+                let mut one: [1]Header = [Header.{ name: "", value: "" }];
+                if parse_headers(t, one[..])! != 1 {
+                    return error.BadRequest;
+                }
+                st.left += 1;
+            }
+        }
+    }
+}
+
+/// Where a chunked body's reading stopped.
+struct ChunkState {
+    phase: u8,
+    left: usize,  // of the chunk's data; or trailers read
+}
+
+const CHUNK_SIZE: u8 = 0;      // the size line
+const CHUNK_DATA: u8 = 1;      // the data
+const CHUNK_CRLF: u8 = 2;      // the CRLF after it
+const CHUNK_TRAILERS: u8 = 3;  // the trailers
+
+fn hex_value(c: u8) u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    let l = c | 0x20;
+    if (l >= 'a') and (l <= 'f') {
+        return @as(u32, l - 'a') + 10;
+    }
+    return 16;
+}
+
+// Chunk extensions: *( BWS ";" BWS name [ BWS "=" BWS ( token /
+// quoted-string ) ] ), with no control bytes.
+fn valid_chunk_ext(s: []u8) bool {
+    let mut i: usize = 0;
+    while i < s.len {
+        i = skip_blanks(s, i);
+        if (i == s.len) or (s[i] != ';') {
+            return false;
+        }
+        i = skip_blanks(s, i + 1);
+        let n0 = i;
+        while (i < s.len) and is_token_char(s[i]) {
+            i += 1;
+        }
+        if i == n0 {
+            return false;
+        }
+        i = skip_blanks(s, i);
+        if (i == s.len) or (s[i] != '=') {
+            continue;
+        }
+        i = skip_blanks(s, i + 1);
+        if (i < s.len) and (s[i] == '"') {
+            i += 1;
+            loop {
+                if i == s.len {
+                    return false;
+                }
+                let c = s[i];
+                if c == '"' {
+                    i += 1;
+                    break;
+                }
+                if (c == '\\') and ((i + 1) < s.len) {
+                    i += 1;
+                }
+                if ((s[i] < 0x20) and (s[i] != '\t')) or (s[i] == 0x7f) {
+                    return false;
+                }
+                i += 1;
+            }
+        } else {
+            let v0 = i;
+            while (i < s.len) and is_token_char(s[i]) {
+                i += 1;
+            }
+            if i == v0 {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn skip_blanks(s: []u8, i0: usize) usize {
+    let mut i = i0;
+    while (i < s.len) and ((s[i] == ' ') or (s[i] == '\t')) {
+        i += 1;
+    }
+    return i;
+}
+
+fn is_token_char(c: u8) bool {
+    if strs.is_alnum(c) {
+        return true;
+    }
+    let specials = "!#$%&'*+-.^_`|~";
+    for s in specials {
+        if c == s {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Parses header lines ("Name: value") into out; returns how many.
+pub fn parse_headers(lines: []u8, out: []mut Header) HttpParseError!usize {
+    let mut n: usize = 0;
+    let mut it = strs.lines(lines);
+    loop {
+        let line = it.next() ?? break;
+        if line.len == 0 {
+            break;
+        }
+        if (line[0] == ' ') or (line[0] == '\t') {
+            return error.BadRequest;  // obsolete line folding
+        }
+        let colon = strs.index_of_byte(line, ':') ?? return error.BadRequest;
+        let name = line[..colon];
+        if name.len == 0 {
+            return error.BadRequest;
+        }
+        for c in name {
+            if not is_token_char(c) {
+                return error.BadRequest;
+            }
+        }
+        if n == out.len {
+            return error.HeadTooLarge;
+        }
+        let value = strs.trim_bytes(line[colon + 1..], " \t");
+        for c in value {
+            // (a CR, NUL or other control byte can be read differently
+            // by a proxy in front: reject it)
+            if ((c < 0x20) and (c != '\t')) or (c == 0x7f) {
+                return error.BadRequest;
+            }
+        }
+        out[n] = Header.{ name: name, value: value };
+        n += 1;
+    }
+    return n;
+}
+
+fn trim_trailing_blanks(s: []u8) []u8 {
+    let mut e = s.len;
+    while (e > 0) and ((s[e - 1] == ' ') or (s[e - 1] == '\t')) {
+        e -= 1;
+    }
+    return s[..e];
+}
+
+/// Trailer lines accepted after a chunked body.
+const MAX_TRAILERS: usize = 100;
+
+/// How a message body is delimited.
+struct Framing {
+    chunked: bool,
+    length: usize,
+    has_length: bool,
+}
+
+fn framing(headers: []Header) { Unsupported, BadRequest, TooLarge }!Framing {
+    let mut f = Framing.{ chunked: false, length: 0, has_length: false };
+    for h in headers {
+        if strs.eq_ignore_case(h.name, "Transfer-Encoding") {
+            // chunked must be the last coding; no others are supported
+            if f.chunked or not strs.eq_ignore_case(h.value, "chunked") {
+                return error.Unsupported;
+            }
+            f.chunked = true;
+        } else if strs.eq_ignore_case(h.name, "Content-Length") {
+            // 1*DIGIT: no sign, no spaces
+            if (h.value.len == 0) or (h.value.len > 18) {
+                return error.BadRequest;
+            }
+            for c in h.value {
+                if (c < '0') or (c > '9') {
+                    return error.BadRequest;
+                }
+            }
+            let v = fmt.parse_int.[u64](h.value) catch return error.BadRequest;
+            if v > @as(u64, @max_value(usize) / 2) {
+                return error.TooLarge;
+            }
+            let len = @truncate(usize, v);
+            if f.has_length and (len != f.length) {
+                return error.BadRequest;
+            }
+            f.length = len;
+            f.has_length = true;
+        }
+    }
+    if f.chunked and f.has_length {
+        return error.BadRequest;  // a request smuggling risk (RFC 9112 6.3)
+    }
+    return f;
+}

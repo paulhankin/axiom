@@ -1,0 +1,675 @@
+// =============================================================================
+// sema_decls.ax - declaration resolution, ABI boundary checks, enums,
+// globals and function body/attribute checking, part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "semapost.ax" as spost;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// ---------------------------------------------------------------------------
+// Declarations
+// ---------------------------------------------------------------------------
+// A function type is allowed when its own parameters and result are: C
+// calls a callback with its own calling convention.
+fn boundary_ok_in(t: *mut ast.Type, is_ret: bool, c_fn: bool) bool {
+    if c_fn {
+        return boundary_value_ok(t, is_ret);
+    }
+    return boundary_type_ok(t, is_ret);
+}
+
+// A parameter or result of an extern "C" function or an export: a boundary
+// type, or a structure of them passed by value as the C ABI says (spec
+// §14.5.3); not in `import host` functions (WebAssembly imports' types are
+// the scalars).
+fn boundary_value_ok(t: *mut ast.Type, is_ret: bool) bool {
+    if t.kind == ast.TY_STRUCT {
+        return boundary_struct_ok(t);
+    }
+    return boundary_type_ok(t, is_ret);
+}
+
+// A structure that crosses by value, or the type of a C object (spec
+// §14.5.6): every member a boundary type (but void, and a function type
+// only as a member), a structure of such members, or an array of one.
+fn boundary_struct_ok(t: *mut ast.Type) bool {
+    if u.isnil(t.decl) or (t.decl.fields.len == 0) {
+        return false;
+    }
+    for i in 0..t.decl.fields.len {
+        if not boundary_data_ok(ty.type_field(t, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn boundary_data_ok(t: *mut ast.Type) bool {
+    if t.kind == ast.TY_STRUCT {
+        return boundary_struct_ok(t);
+    }
+    if t.kind == ast.TY_ARRAY {
+        return (t.len > 0) and boundary_data_ok(t.elem);
+    }
+    if (t.kind == ast.TY_VOID) or (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
+        return false;  // (a vector's layout in C is not the standard's)
+    }
+    return boundary_type_ok(t, false);
+}
+
+fn boundary_type_ok(t: *ast.Type, is_ret: bool) bool {
+    let k = t.kind;
+    if k == ast.TY_FN {
+        for p in t.params {
+            if not boundary_type_ok(p, false) {
+                return false;
+            }
+        }
+        return boundary_type_ok(t.ret, true);
+    }
+    if (k == ast.TY_VEC) or (k == ast.TY_V128) {
+        return ty.simd_bits(t) == 128;  // (WebAssembly has nothing wider)
+    }
+    if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_INVALID) {
+        return true;
+    }
+    if k == ast.TY_OPT {
+        return ((t.elem.kind == ast.TY_PTR) or (t.elem.kind == ast.TY_FN)) and boundary_type_ok(t.elem, false);
+    }
+    if k == ast.TY_VOID {
+        return is_ret;
+    }
+    return false;
+}
+
+fn resolve_fn(d: *mut ast.Decl) void {
+    let owner = d.owner;
+    if u.notnil(owner) {
+        resolve_decl(owner);
+    }
+    ensure_gparams(d);
+    let mut nown: usize = 0;
+    if u.notnil(owner) {
+        nown = owner.gparams.len;
+    }
+    d.all_gparams = u.newn.[*mut ast.Type](nown + d.gparams.len);
+    for i in 0..nown {
+        d.all_gparams[i] = owner.gparams.at_mut(i).ty;
+    }
+    for i in 0..d.gparams.len {
+        d.all_gparams[nown + i] = d.gparams.at_mut(i).ty;
+    }
+    let mut oself = tnil();
+    if u.notnil(owner) {
+        oself = owner.ty;
+    }
+    let mut tc = type_ctx(d.module, owner, d, oself);
+    d.param_types = u.newn.[*mut ast.Type](d.params.len);
+    for i in 0..d.params.len {
+        let p = d.params.at_mut(i);
+        p.local = u.nil.[ast.Local]();
+        d.param_types[i] = resolve_type(p.te, &mut tc);
+        if d.param_types[i].kind == ast.TY_VOID {
+            _ = dg.err(p.te.span, "E0404", u.f1("parameter '%s' cannot have type void", p.name));
+            d.param_types[i] = ty.t_invalid;
+        }
+        if p.is_noalias {
+            let pt = d.param_types[i];
+            if (pt.kind != ast.TY_PTR) and (pt.kind != ast.TY_SLICE) and (pt.kind != ast.TY_INVALID) {
+                _ = dg.err(p.noalias_span, "E0315",
+                           u.f1("noalias is only allowed on pointer or slice parameters, found %s", tstr(pt)));
+            }
+        }
+        for j in 0..i {
+            if placeholder(p.name) {
+                break;
+            }
+            if u.same(d.params.at(j).name, p.name) {
+                dup_error(p.span, p.name, d.params.at(j).span);
+            }
+        }
+    }
+    if u.notnil(d.ret_te) {
+        let mut handled_infer = false;
+        if (d.kind == ast.D_FN) and not d.is_pub and not d.is_export and not d.extern_c {
+            match d.ret_te.shape {
+                .ErrUnion(eu) => {
+                    if eu.is_infer {
+                        handled_infer = true;
+                        let e = resolve_type(eu.elem, &mut tc);
+                        if e.kind == ast.TY_ERRUNION {
+                            _ = dg.err(d.ret_te.span, "E0401", "nested error unions (!!T) are not allowed");
+                            d.ret_type = e;
+                        } else {
+                            d.is_infer_ret = true;
+                            d.ret_type = spost.check_size(d.ret_te.span, ty.type_errunion(e));
+                        }
+                    }
+                }
+                else => {}
+            }
+        }
+        if not handled_infer {
+            d.ret_type = resolve_type(d.ret_te, &mut tc);
+        }
+    } else {
+        d.ret_type = ty.t_void;
+    }
+    d.ty = ty.type_fn(d.param_types, d.ret_type);
+    d.self_kind = ast.SELF_NONE;
+    if u.notnil(owner) and (d.params.len > 0) and u.str_eq(d.params.at(0).name, "self") {
+        let pt = d.param_types[0];
+        let sf = owner.ty;
+        if pt == sf {
+            d.self_kind = ast.SELF_VALUE;
+        } else if (pt.kind == ast.TY_PTR) and (pt.elem == sf) {
+            if pt.is_mut {
+                d.self_kind = ast.SELF_PASS;
+            } else {
+                d.self_kind = ast.SELF_ADDR;
+            }
+        } else if pt.kind != ast.TY_INVALID {
+            _ = dg.err(d.params.at(0).te.span, "E0305", u.f1("'self' must have type Self, *Self or *mut Self, found %s",
+                                                             tstr(pt)));
+        }
+    }
+    if d.extern_c and not u.isnos(d.abi) and not u.str_eq(d.abi, "C") {
+        _ = dg.err(d.abi_span, "E0306", u.f1("unknown ABI \"%s\" (only \"C\" is supported)", d.abi));
+    }
+    if d.variadic and not d.extern_c {
+        _ = dg.err(d.abi_span, "E0307", "'...' (C varargs) is only allowed in extern \"C\" declarations");
+    } else if d.variadic and (d.params.len == 0) {
+        _ = dg.err(d.abi_span, "E0307", "a variadic C function needs at least one fixed parameter");
+    }
+    if d.is_inline {
+        if d.is_export {
+            _ = dg.err(d.inline_span, "E0313",
+                       "an exported function cannot be inline (its callers are outside the program)");
+        } else if d.attr != ast.ATTR_NONE {
+            let mut an: []u8 = "multiversion";
+            if d.attr == ast.ATTR_FEATURES {
+                an = "features";
+            }
+            _ = dg.err(d.inline_span, "E0313",
+                       u.f1("an inline function cannot have @%s (it is compiled as part of its callers)", an));
+        }
+    }
+    if d.is_export or (d.kind == ast.D_HOST_FN) {
+        let mut what: []u8 = "imported";
+        if d.is_export {
+            what = "exported";
+        } else if d.extern_c {
+            what = "C";
+        }
+        if d.gparams.len != 0 {
+            _ = dg.err(d.name_span, "E0466", u.f1("%s functions cannot be generic", what));
+        }
+        // (structures cross by value in C functions, not in WebAssembly's
+        // imports: spec §14.5.3)
+        let c_fn = d.extern_c or d.is_export;
+        for i in 0..d.params.len {
+            if c_fn and (d.param_types[i].kind == ast.TY_STRUCT) {
+                d.cabi = true;
+            }
+            if not boundary_ok_in(d.param_types[i], false, c_fn) and (d.param_types[i].kind != ast.TY_INVALID) {
+                _ = dg.err(d.params.at(i).te.span, "E0801", u.f3("type %s is not allowed at the %s function boundary%s",
+                                                                 tstr(d.param_types[i]), what,
+                                                                 fn_type_hint(d.param_types[i])));
+            }
+        }
+        if c_fn and (d.ret_type.kind == ast.TY_STRUCT) {
+            d.cabi = true;
+        }
+        if d.cabi and d.variadic {
+            _ = dg.err(d.name_span, "E0801", "a variadic C function cannot take or return a structure by value");
+        }
+        if not boundary_ok_in(d.ret_type, true, c_fn) {
+            let mut sp = d.name_span;
+            if u.notnil(d.ret_te) {
+                sp = d.ret_te.span;
+            }
+            let mut hint = fn_type_hint(d.ret_type);
+            if d.ret_type.kind == ast.TY_ERRUNION {
+                hint = " (handle errors before the export boundary)";
+            }
+            _ = dg.err(sp, "E0801", u.f3("return type %s is not allowed at the %s function boundary%s",
+                                         tstr(d.ret_type), what, hint));
+        }
+    }
+}
+
+fn fn_type_hint(t: *ast.Type) []u8 {
+    if t.kind == ast.TY_FN {
+        return " (a function type's parameters and result must be allowed there too)";
+    }
+    return "";
+}
+
+fn pick_span(c: bool, a: u.Span, b: u.Span) u.Span {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The name a type expression gives, for a message ("this type" if it is
+// not a name).
+fn te_name(te: *ast.TypeExpr) []u8 {
+    match te.shape {
+        .Named(nt) => {
+            if u.isnos(nt.qual) {
+                return nt.name;
+            }
+            return u.f2("%s.%s", nt.qual, nt.name);
+        }
+        else => { return "this type"; }
+    }
+}
+
+// An enum's representation and its members' values: each member without
+// `= value` is one more than the member before it (the first is 0). Without
+// a representation type, the smallest unsigned type that holds every value
+// (or signed, when one is negative).
+fn resolve_enum(d: *mut ast.Decl) void {
+    let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
+    let mut repr = tnil();
+    if u.notnil(d.te) {
+        repr = resolve_type(d.te, &mut tc);
+        if u.isnil(repr) {
+            // (an enum whose representation is itself, or an enum whose
+            // representation depends on it: not yet a type)
+            _ = dg.err(d.te.span, "E0308", u.f1("an enum's representation must be an integer type, found %s",
+                                                te_name(d.te)));
+            repr = ty.t_invalid;
+        }
+        if repr.kind != ast.TY_INT {
+            if repr.kind != ast.TY_INVALID {
+                _ = dg.err(d.te.span, "E0308", u.f1("an enum's representation must be an integer type, found %s",
+                                                    tstr(repr)));
+            }
+            repr = tnil();
+        }
+    }
+    if d.variants.len == 0 {
+        _ = dg.err(d.name_span, "E0304", u.f1("enum '%s' must have at least one member", d.name));
+    }
+    let one = u.I128.of(1);
+    let mut next = u.I128.zero();
+    let mut lo = u.I128.zero();
+    let mut hi = u.I128.zero();
+    for i in 0..d.variants.len {
+        let v = d.variants.at_mut(i);
+        if not v.has_value {
+            v.value = next;
+        }
+        next = v.value.add(one);
+        if v.value.lt(lo) {
+            lo = v.value;
+        }
+        if v.value.gt(hi) {
+            hi = v.value;
+        }
+        for j in 0..i {
+            let w = d.variants.at(j);
+            if w.value.eq(v.value) {
+                let dd = dg.err(pick_span(v.has_value, v.value_span, v.span), "E0309",
+                                u.f2("enum member '%s' has the same value as '%s'", v.name, w.name));
+                dg.note(dd, w.span, u.f1("'%s' declared here", w.name));
+                break;
+            }
+        }
+    }
+    if u.isnil(repr) {
+        let cands = [ty.t_u8, ty.t_u16, ty.t_u32, ty.t_u64, ty.t_i8, ty.t_i16, ty.t_i32, ty.t_i64];
+        repr = ty.t_i64;
+        let mut k: usize = 0;
+        if lo.is_neg() {
+            k = 4;
+        }
+        while k < cands.len {
+            let r = ty.int_range(cands[k]);
+            if lo.ge(r.lo) and hi.le(r.hi) {
+                repr = cands[k];
+                break;
+            }
+            k += 1;
+        }
+    }
+    let r = ty.int_range(repr);
+    for i in 0..d.variants.len {
+        let v = d.variants.at_mut(i);
+        if v.value.lt(r.lo) or v.value.gt(r.hi) {
+            _ = dg.err(pick_span(v.has_value, v.value_span, v.span), "E0503",
+                       u.f2("the value of '%s' does not fit in %s", v.name, tstr(repr)));
+        }
+    }
+    d.ty = ty.type_enum(d, repr);
+}
+
+threadlocal let mut g_self_dep: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+
+fn resolve_decl(d: *mut ast.Decl) void {
+    if d.state == ast.DeclState.DONE {
+        return;
+    }
+    if d.state == ast.DeclState.RESOLVING {
+        if d.kind == ast.D_CONST {
+            _ = dg.err(d.name_span, "E0351", u.f1("constant '%s' depends on itself", d.name));
+        } else if d.kind == ast.D_ERROR {
+            _ = dg.err(d.name_span, "E0654", u.f1("error set '%s' includes itself", d.name));
+        } else if ((d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN)) and (d != g_self_dep) {
+            _ = dg.err(d.name_span, "E0355", u.f1("the signature of function '%s' depends on itself", d.name));
+            g_self_dep = d;  // (once, however often its signature calls it)
+        }
+        return;
+    }
+    d.state = ast.DeclState.RESOLVING;
+    let k = d.kind;
+    if (k == ast.D_STRUCT) or (k == ast.D_UNION) {
+        d.ty = make_self_type(d);
+        let mut tc = type_ctx(d.module, d, dnil(), d.ty);
+        d.state = ast.DeclState.DONE;  // fields may refer to Self through pointers
+        for i in 0..d.fields.len {
+            let f = d.fields.at_mut(i);
+            f.ty = resolve_type(f.te, &mut tc);
+            if f.ty.kind == ast.TY_VOID {
+                _ = dg.err(f.te.span, "E0404", u.f1("field '%s' cannot have type void", f.name));
+                f.ty = ty.t_invalid;
+            }
+        }
+        for i in 0..d.variants.len {
+            let v = d.variants.at_mut(i);
+            if u.notnil(v.te) {
+                v.ty = resolve_type(v.te, &mut tc);
+                if v.ty.kind == ast.TY_VOID {
+                    v.ty = tnil();
+                }
+            }
+        }
+        if (k == ast.D_UNION) and (d.variants.len == 0) {
+            _ = dg.err(d.name_span, "E0304", u.f1("union '%s' must have at least one variant", d.name));
+        }
+        if (k == ast.D_UNION) and (d.variants.len > 65536) {
+            _ = dg.err(d.name_span, "E0304", u.f1("union '%s' has too many variants", d.name));
+        }
+        _ = spost.check_size(d.name_span, d.ty);
+        return;
+    }
+    if k == ast.D_ENUM {
+        resolve_enum(d);
+    } else if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        resolve_fn(d);
+    } else if k == ast.D_CONST {
+        let tc = type_ctx(d.module, dnil(), dnil(), tnil());
+        let mut tc2 = tc;
+        d.ty = resolve_type(d.te, &mut tc2);
+        let dk = d.ty.kind;
+        if (dk != ast.TY_INT) and (dk != ast.TY_FLOAT) and (dk != ast.TY_BOOL) and (dk != ast.TY_ENUM) and
+           (dk != ast.TY_STRUCT) and (dk != ast.TY_INVALID) {
+            _ = dg.err(d.te.span, "E0352",
+                       u.f1("constants must have an integer, float, bool, enum or struct type, found %s", tstr(d.ty)));
+            d.ty = ty.t_invalid;
+        }
+        let ctx = u.new.[FnCtx]();
+        ctx.* = fn_ctx(tc);
+        ctx.const_ctx = true;
+        let saved = C;
+        C = ctx;
+        _ = check_expr_to(&mut d.init, d.ty);
+        check_no_copy(d.init);
+        C = saved;
+        d.cexpr = d.init;
+        let mut ok_const = d.init.is_const or (d.init.kind == ast.E_BOOL);
+        if d.ty.kind == ast.TY_STRUCT {
+            ok_const = is_const_init(d.init);
+        }
+        if not ok_const and (d.ty.kind != ast.TY_INVALID) and (d.init.ty.kind != ast.TY_INVALID) {
+            _ = dg.err(d.init.span, "E0350", "constant initializer must be a constant expression");
+        }
+    } else if (k == ast.D_ERROR) and not u.isnos(d.name) {
+        resolve_error_set(d);
+    } else if k == ast.D_GLOBAL {
+        let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
+        d.ty = resolve_type(d.te, &mut tc);
+        if d.ty.kind == ast.TY_VOID {
+            _ = dg.err(d.te.span, "E0404", u.f1("global '%s' cannot have type void", d.name));
+            d.ty = ty.t_invalid;
+        }
+        if d.is_tls and not d.is_mut {
+            _ = dg.err(d.name_span, "E0354",
+                       u.f1("thread-local '%s' must be mutable (`threadlocal let mut`; a constant needs no copy per thread)",
+                            d.name));
+        }
+        if (d.extern_c or d.is_export) and (d.ty.kind != ast.TY_INVALID) and not boundary_data_ok(d.ty) {
+            // an object C defines, or one C code may use (spec §14.5.6)
+            _ = dg.err(d.te.span, "E0801", u.f3("type %s is not allowed for %s object '%s'", tstr(d.ty),
+                                                u.pick(d.extern_c, "a C", "an exported"), d.name));
+        }
+        if d.extern_c and not u.isnos(d.abi) and not u.str_eq(d.abi, "C") {
+            _ = dg.err(d.abi_span, "E0306", u.f1("unknown ABI \"%s\" (only \"C\" is supported)", d.abi));
+        }
+    }
+    d.state = ast.DeclState.DONE;
+}
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+fn is_const_init(e: *mut ast.Expr) bool {
+    if e.is_const {
+        return true;
+    }
+    let k = e.kind;
+    if (k == ast.E_INT) or (k == ast.E_FLOAT) or (k == ast.E_BOOL) or (k == ast.E_STRING) or (k == ast.E_ERROR_VAL) or
+       (k == ast.E_OPT_NONE) or (k == ast.E_EMPTY_SLICE) {
+        return true;
+    }
+    if k == ast.E_OPT_SOME {
+        return is_const_init(e.a);
+    }
+    if k == ast.E_CONV {
+        return is_const_init(e.a);
+    }
+    if k == ast.E_ARRAY_LIT {
+        for i in 0..ast.args_of(e).len {
+            if not is_const_init(ast.args_of(e).get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == ast.E_ARRAY_REPEAT {
+        return is_const_init(e.a);
+    }
+    if k == ast.E_STRUCT_LIT {
+        for i in 0..ast.more(e).inits.len {
+            if not is_const_init(ast.ext(e).inits.at_mut(i).value) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == ast.E_FIELD {
+        return (ast.field_kind_of(e) == ast.FK_VARIANT_UNIT) or (ast.field_kind_of(e) == ast.FK_CONST) or
+               ((ast.field_kind_of(e) == ast.FK_DECL) and u.notnil(ast.decl_of(e)) and
+                (ast.decl_of(e).kind == ast.D_FN));
+    }
+    if k == ast.E_IDENT {
+        return (e.cat == ast.CAT_VALUE) and u.notnil(ast.decl_of(e)) and
+               (((ast.decl_of(e).kind == ast.D_FN) and (e.ty.kind == ast.TY_FN)) or
+                (ast.decl_of(e).kind == ast.D_CONST));
+    }
+    if k == ast.E_CALL {
+        return (ast.call_kind_of(e) == ast.CALLK_VARIANT) and (ast.args_of(e).len == 1) and
+               is_const_init(ast.args_of(e).get(0));
+    }
+    if k == ast.E_BUILTIN {
+        return (ast.builtin_of(e) == ast.BI_PTR_FROM_INT) and (ast.more(e).bargs.len == 2) and
+               is_const_init(ast.ext(e).bargs.at_mut(1).e);
+    }
+    if k == ast.E_UNARY {
+        return (ast.op_of(e) == lx.TK_MINUS) and is_const_init(e.a) and (e.a.kind == ast.E_FLOAT);
+    }
+    return false;
+}
+
+fn check_global(d: *mut ast.Decl) void {
+    resolve_decl(d);
+    if d.extern_c {
+        return;  // (C defines it: no initializer)
+    }
+    let ctx = u.new.[FnCtx]();
+    ctx.* = fn_ctx(type_ctx(d.module, dnil(), dnil(), tnil()));
+    ctx.const_ctx = true;
+    let saved = C;
+    C = ctx;
+    _ = check_expr_to(&mut d.init, d.ty);
+    check_no_copy(d.init);
+    C = saved;
+    if (d.ty.kind != ast.TY_INVALID) and (d.init.ty.kind != ast.TY_INVALID) and not is_const_init(d.init) {
+        _ = dg.err(d.init.span, "E0350", "global initializer must be a constant expression");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function bodies and attributes
+// ---------------------------------------------------------------------------
+fn check_fn_body(f: *mut ast.Decl) void {
+    if f.checked or f.inferring_ret {
+        return;
+    }
+    if f.is_infer_ret {
+        f.inferring_ret = true;
+    }
+    resolve_decl(f);
+    check_fn_attr(f);
+    let mut oself = tnil();
+    if u.notnil(f.owner) {
+        oself = f.owner.ty;
+    }
+    let ctx = u.new.[FnCtx]();
+    ctx.* = fn_ctx(type_ctx(f.module, f.owner, f, oself));
+    ctx.fnd = f;
+    ctx.ret = f.ret_type;
+    let saved = C;
+    C = ctx;
+    scope_push();
+    for i in 0..f.params.len {
+        let p = f.params.at_mut(i);
+        p.local = declare_local(p.name, p.span, f.param_types[i], false, true);
+    }
+    let div = check_block(f.body);
+    if f.is_infer_ret and (f.ret_type.kind == ast.TY_ERRUNION) {
+        if not ctx.ret_err_open {
+            let set = intern_anon_errset(&ctx.ret_errs);
+            f.ret_type = ty.type_errunion_set(f.ret_type.elem, set);
+            f.ty = ty.type_fn(f.param_types, f.ret_type);
+        }
+    } else if not ctx.ret_err_open and (f.all_gparams.len == 0) and (f.ret_type.kind == ast.TY_ERRUNION) and
+              u.notnil(f.ret_type.decl) and f.ret_type.decl.is_anon and u.notnil(f.ret_te) {
+        match f.ret_te.shape {
+            .ErrUnion(eu) => {
+                if u.notnil(eu.set) and u.notnil(eu.elem) {
+                    match eu.set.shape {
+                        .ErrSetInline => {
+                            check_unused_errset(f.ret_type.decl, &ctx.ret_errs, eu.set.span, eu.elem.span);
+                        }
+                        else => {}
+                    }
+                }
+            }
+            else => {}
+        }
+    }
+    let r = f.ret_type;
+    if not div and (r.kind != ast.TY_VOID) and (r.kind != ast.TY_INVALID) and
+       not ((r.kind == ast.TY_ERRUNION) and (r.elem.kind == ast.TY_VOID)) {
+        let bs = f.body.span;
+        let mut st: u32 = 0;
+        if bs.end > 0 {
+            st = bs.end - 1;
+        }
+        let d = dg.err(u.mkspan(bs.file, st, bs.end), "E0601",
+                       u.f2("missing return: function '%s' must return %s on every path", f.name, tstr(r)));
+        dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
+    }
+    scope_pop();
+    f.inferring_ret = false;
+    f.checked = true;
+    ctx.scope.deinit();
+    ctx.marks.deinit();
+    ctx.locals.deinit();
+    ctx.loop_moves.deinit();
+    ctx.loop_breaks.deinit();
+    ctx.loop_labels.deinit();
+    ctx.ret_errs.deinit();
+    C = saved;
+    spost.gate_fn(f);
+}
+
+// @features / @multiversion: the extension sets, closed under implication.
+// A set naming another architecture's extension is NO_VERSION.
+fn check_fn_attr(f: *mut ast.Decl) void {
+    if f.attr == ast.ATTR_NONE {
+        return;
+    }
+    let n = f.attr_args.len;
+    f.feat_sets = u.newn.[u64](n + 1)[0..n];
+    let what = u.pick(f.attr == ast.ATTR_FEATURES, "features", "multiversion");
+    if n == 0 {
+        _ = dg.err(f.attr_span, "E0829", u.f1("@%s needs at least one set of extensions, such as \"avx2,fma\"", what));
+        return;
+    }
+    if (f.attr == ast.ATTR_FEATURES) and (n != 1) {
+        _ = dg.err(f.attr_span, "E0829",
+                   "@features takes one set of extensions (\"a,b\"); @multiversion takes several");
+    }
+    for i in 0..n {
+        let spec = f.attr_args.get(i);
+        let sp = f.attr_arg_spans.get(i);
+        let mut bits: u64 = 0;
+        let mut foreign = false;
+        let mut empty = true;
+        let mut k: usize = 0;
+        while k <= spec.len {
+            let mut j = k;
+            while (j < spec.len) and (spec[j] != ',') {
+                j += 1;
+            }
+            let mut name = spec[k..j];
+            k = j + 1;
+            while (name.len > 0) and (name[0] == ' ') {
+                name = name[1..];
+            }
+            if (name.len > 0) and (name[0] == '+') {
+                name = name[1..];
+            }
+            if name.len == 0 {
+                continue;
+            }
+            empty = false;
+            if not tg.feature_known(name) {
+                _ = dg.err(sp, "E0827", u.f2("unknown processor extension '%s' (this target has: %s)", name,
+                                             tg.feature_names()));
+                continue;
+            }
+            let b = tg.feature_bit(name);
+            if b == 0 {
+                foreign = true;
+            }
+            bits = bits | b;
+        }
+        if empty {
+            _ = dg.err(sp, "E0829", "empty set of extensions");
+        }
+        if foreign {
+            f.feat_sets[i] = spost.NO_VERSION;
+        } else {
+            f.feat_sets[i] = tg.parse_features(spec).bits;
+        }
+    }
+}
