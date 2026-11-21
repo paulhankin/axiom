@@ -30,6 +30,20 @@ static bool argc_ok(Expr *e) {
 static bool is_int_like(Type *t) {
     return t->kind == TY_INT || (t->kind == TY_PARAM && type_satisfies(t, C_INT)) || t->kind == TY_INVALID;
 }
+static bool is_unsigned_int_like(Type *t) {
+    return (t->kind == TY_INT && !t->is_signed) || (t->kind == TY_PARAM && type_satisfies(t, C_UNSIGNED)) ||
+           t->kind == TY_INVALID;
+}
+static Type *make_pair_struct(Span sp, const char *n0, Type *t0, const char *n1, Type *t1) {
+    FieldVec fv = {0};
+    Field f0 = {.name = intern_cstr(n0), .span = sp, .type = t0};
+    Field f1 = {.name = intern_cstr(n1), .span = sp, .type = t1};
+    vec_push(fv, f0);
+    vec_push(fv, f1);
+    Decl *d = anon_struct_decl(NULL, fv, sp);
+    if (d->fields.data != fv.data) free(fv.data);
+    return d->type;
+}
 static bool is_float_like(Type *t) {
     return t->kind == TY_FLOAT || (t->kind == TY_PARAM && type_satisfies(t, C_FLOAT)) || t->kind == TY_INVALID;
 }
@@ -601,6 +615,76 @@ Type *builtin_check(Expr *e, Type *expected) {
         Type *t = pair(e, x);
         if (!is_int_like(t)) diag_error(e->span, "E0822", "@%s requires integers, found %s", e->name, type_str(t));
         return e->type = type_errunion(t);
+    }
+    case BI_MUL_WIDE: {
+        Type *t = pair(e, NULL);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_int_like(t)) {
+            diag_error(e->span, "E0822", "@mul_wide requires integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "lo", t, "hi", t);
+    }
+    case BI_MUL_HIGH: {
+        Type *t = pair(e, x && x->kind != TY_VOID ? x : expected);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_int_like(t)) {
+            diag_error(e->span, "E0822", "@mul_high requires integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = t;
+    }
+    case BI_ADD_CARRY:
+    case BI_SUB_BORROW: {
+        BuiltinId id = (BuiltinId)e->index;
+        Type *t = pair(e, NULL);
+        check_expr_to(earg(e, 2), t_u8);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!is_unsigned_int_like(t)) {
+            diag_error(e->span, "E0822", "@%s requires unsigned integer operands", e->name);
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "value", t, id == BI_ADD_CARRY ? "carry" : "borrow", t_u8);
+    }
+    case BI_DIV_WIDE: {
+        Type *ts[3];
+        for (int i = 0; i < 3; i++) ts[i] = check_expr(*earg(e, i), NULL);
+        Type *t = NULL;
+        bool has_invalid = false;
+        for (int i = 0; i < 3; i++) {
+            if (ts[i]->kind == TY_INVALID) has_invalid = true;
+            else if (!t && !ty_is_untyped(ts[i])) t = ts[i];
+        }
+        if (!t) {
+            for (int i = 0; i < 3; i++) {
+                if (ty_is_untyped(ts[i])) {
+                    finalize_untyped(earg(e, i));
+                    break;
+                }
+            }
+            return e->type = t_invalid;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (ty_is_untyped(ts[i])) {
+                coerce(earg(e, i), t);
+                ts[i] = (*earg(e, i))->type;
+            }
+            if (ts[i]->kind == TY_INVALID) has_invalid = true;
+        }
+        if (has_invalid) return e->type = t_invalid;
+        for (int i = 0; i < 3; i++) {
+            if (ts[i] != t) {
+                Diag *d = diag_error(e->span, "E0412", "@div_wide operands have different types: %s and %s",
+                                     type_str(t), type_str(ts[i]));
+                diag_types(d, type_str(t), type_str(ts[i]));
+                return e->type = t_invalid;
+            }
+        }
+        if (!is_unsigned_int_like(t)) {
+            diag_error(e->span, "E0822", "@div_wide requires unsigned integer operands");
+            return e->type = t_invalid;
+        }
+        return e->type = make_pair_struct(e->span, "quo", t, "rem", t);
     }
     case BI_MIN:
     case BI_MAX: {

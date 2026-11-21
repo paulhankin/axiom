@@ -89,6 +89,10 @@ static Type *intern_type(Type *proto) {
         if (t->params[i]->has_params) hp = true;
     for (int i = 0; i < t->nargs; i++)
         if (t->args[i]->has_params) hp = true;
+    if (t->kind == TY_STRUCT && t->decl && t->decl->anon) {
+        for (int i = 0; i < t->decl->fields.len; i++)
+            if (t->decl->fields.data[i].type && t->decl->fields.data[i].type->has_params) hp = true;
+    }
     t->has_params = hp;
     bool he = t->kind == TY_ENUM;
     if (t->elem && t->elem->has_enum) he = true;
@@ -97,6 +101,10 @@ static Type *intern_type(Type *proto) {
         if (t->params[i]->has_enum) he = true;
     for (int i = 0; i < t->nargs; i++)
         if (t->args[i]->has_enum) he = true;
+    if (t->kind == TY_STRUCT && t->decl && t->decl->anon) {
+        for (int i = 0; i < t->decl->fields.len; i++)
+            if (t->decl->fields.data[i].type && t->decl->fields.data[i].type->has_enum) he = true;
+    }
     t->has_enum = he;
     ttab[j] = t;
     ttab_len++;
@@ -316,6 +324,17 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
     }
     case TY_STRUCT:
     case TY_UNION: {
+        if (t->kind == TY_STRUCT && t->decl && t->decl->anon) {
+            FieldVec fv = {0};
+            for (int i = 0; i < t->decl->fields.len; i++) {
+                Field f = t->decl->fields.data[i];
+                f.type = type_subst(f.type, from, to, n);
+                vec_push(fv, f);
+            }
+            Decl *d = anon_struct_decl(t->decl->module, fv, t->decl->span);
+            if (d->fields.data != fv.data) free(fv.data);
+            return d->type;
+        }
         Type **as = NEWN(Type *, t->nargs + 1);
         for (int i = 0; i < t->nargs; i++) as[i] = type_subst(t->args[i], from, to, n);
         return type_named(t->decl, as, t->nargs);
@@ -341,6 +360,17 @@ Type *type_lower_enums(Type *t) {
     }
     case TY_STRUCT:
     case TY_UNION: {
+        if (t->kind == TY_STRUCT && t->decl && t->decl->anon) {
+            FieldVec fv = {0};
+            for (int i = 0; i < t->decl->fields.len; i++) {
+                Field f = t->decl->fields.data[i];
+                f.type = type_lower_enums(f.type);
+                vec_push(fv, f);
+            }
+            Decl *d = anon_struct_decl(t->decl->module, fv, t->decl->span);
+            if (d->fields.data != fv.data) free(fv.data);
+            return d->type;
+        }
         Type **as = NEWN(Type *, t->nargs + 1);
         for (int i = 0; i < t->nargs; i++) as[i] = type_lower_enums(t->args[i]);
         return type_named(t->decl, as, t->nargs);

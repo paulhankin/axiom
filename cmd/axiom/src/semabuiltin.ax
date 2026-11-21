@@ -130,6 +130,18 @@ fn is_int_like(t: *ast.Type) bool {
            (t.kind == ast.TY_INVALID);
 }
 
+fn is_unsigned_int_like(t: *ast.Type) bool {
+    return ((t.kind == ast.TY_INT) and not t.is_signed) or
+           ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_UNSIGNED)) or (t.kind == ast.TY_INVALID);
+}
+
+fn make_pair_struct(sp: u.Span, n0: []u8, t0: *mut ast.Type, n1: []u8, t1: *mut ast.Type) *mut ast.Type {
+    let mut fv = u.List.[ast.Field].empty();
+    fv.push(ast.Field.{ name: u.intern(n0), te: u.nil.[ast.TypeExpr](), span: sp, ty: t0 });
+    fv.push(ast.Field.{ name: u.intern(n1), te: u.nil.[ast.TypeExpr](), span: sp, ty: t1 });
+    return ty.anon_struct_decl(u.nil.[ast.Module](), fv, sp).ty;
+}
+
 fn is_float_like(t: *ast.Type) bool {
     return (t.kind == ast.TY_FLOAT) or ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_FLOAT)) or
            (t.kind == ast.TY_INVALID);
@@ -846,6 +858,85 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires floats, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
+    }
+    if id == ast.BI_MUL_WIDE {
+        let t = pair(e, tnil());
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@mul_wide requires integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "lo", t, "hi", t));
+    }
+    if id == ast.BI_MUL_HIGH {
+        let t = pair(e, x);
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@mul_high requires integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, t);
+    }
+    if (id == ast.BI_ADD_CARRY) or (id == ast.BI_SUB_BORROW) {
+        let t = pair(e, tnil());
+        _ = check_expr_to(earg(e, 2), ty.t_u8);
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not is_unsigned_int_like(t) {
+            _ = dg.err(e.span, "E0822", u.f1("@%s requires unsigned integer operands", e.name));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "value", t, u.pick(id == ast.BI_ADD_CARRY, "carry", "borrow"),
+                                          ty.t_u8));
+    }
+    if id == ast.BI_DIV_WIDE {
+        let mut ts: [3]*mut ast.Type = [check_expr(barg(e, 0), tnil()), check_expr(barg(e, 1), tnil()),
+                                        check_expr(barg(e, 2), tnil())];
+        let mut t = tnil();
+        let mut any_invalid = false;
+        let mut first_untyped: usize = 3;
+        for i in @as(usize, 0)..3 {
+            if ts[i].kind == ast.TY_INVALID {
+                any_invalid = true;
+            } else if ty.is_untyped(ts[i]) {
+                if first_untyped == 3 {
+                    first_untyped = i;
+                }
+            } else if u.isnil(t) {
+                t = ts[i];
+            }
+        }
+        if any_invalid {
+            return set_ty(e, ty.t_invalid);
+        }
+        if u.isnil(t) {
+            _ = finalize_untyped(earg(e, first_untyped));
+            return set_ty(e, ty.t_invalid);
+        }
+        for i in @as(usize, 0)..3 {
+            if ty.is_untyped(ts[i]) {
+                coerce(earg(e, i), t);
+                ts[i] = barg(e, i).ty;
+            }
+        }
+        for i in @as(usize, 0)..3 {
+            if (ts[i] != t) and (ts[i].kind != ast.TY_INVALID) {
+                let d = dg.err(e.span, "E0412", u.f2("@div_wide operands have different types: %s and %s", tstr(t),
+                                                     tstr(ts[i])));
+                dg.set_types(d, tstr(t), tstr(ts[i]));
+                return set_ty(e, ty.t_invalid);
+            }
+        }
+        if not is_unsigned_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@div_wide requires unsigned integer operands");
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, make_pair_struct(e.span, "quo", t, "rem", t));
     }
     return tnil();
 }
