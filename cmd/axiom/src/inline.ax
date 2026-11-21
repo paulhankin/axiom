@@ -696,6 +696,7 @@ fn build_graph(m: *mut ir.Module) void {
         n.inlinable = -1;
         n.frame = -1;
         n.selfcall = -1;
+        n.pos = NOT_IN_ORDER;
         nodes.push(n);
     }
     for i in 0..m.funcs.len {
@@ -879,6 +880,13 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32, budget: i32) bool {
         return false;
     }
     let gn = node_of(g);
+    if gn.pos < n.pos {
+        // (a call inlining brought in to a function that n's callees do
+        // not lead to, which is before n in the order: a function pointer
+        // passed down to a callee that calls it, now a constant; it is done
+        // first, as with the steps one after another)
+        step_wait(gn.pos);
+    }
     if not node_inlinable(gn) {
         return false;
     }
@@ -1050,9 +1058,12 @@ fn add_node(g: *mut ir.Func) void {
     n.frame = -1;
     n.selfcall = -1;
     n.calls = 1;
+    n.pos = NOT_IN_ORDER;
     g.aux = @int_cast(i64, nodes.len);
     nodes.push(n);
 }
+
+const NOT_IN_ORDER: usize = 0xFFFF_FFFF_FFFF_FFFF;
 
 // Inlining over the module bottom-up, in steps (passes.ax runs them):
 // inline_begin orders the functions, callees first (`order`); then, for
@@ -1072,6 +1083,9 @@ fn add_node(g: *mut ir.Func) void {
 // their components or below, and their nodes) is then as it would be with
 // the steps one after another, and inline_after changes only its own
 // function's node, the counts of live calls and the bodies nothing calls.
+// (But for a call that inlining brings in to a function those do not lead
+// to, a function pointer the caller passed down: inline_step waits for that
+// one, if it comes before.)
 threadlocal let mut in_order: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0,
                                                                         cap: 0 };
 threadlocal let mut need: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
@@ -1171,13 +1185,29 @@ pub fn inline_func(k: usize) *mut ir.Func {
 }
 
 /// Inlines the chosen calls of the function at k; true if any (it is then
-/// to be simplified, and inline_after to look at it).
-pub fn inline_step(k: usize) bool {
+/// to be simplified, and inline_after to look at it). wait(j) is to make
+/// sure that the function at j (before k) is done, when inlining into k
+/// comes to look at it without inline_need saying so (a call of a function
+/// pointer that inlining made a constant).
+pub fn inline_step(k: usize, wait: fn(usize) void) bool {
     let n = in_order.get(k);
     if ir.is_decl(n.f) or n.f.returns_twice {
         return false;  // (a function that calls setjmp is not optimized: ir.Func)
     }
-    return inline_into(n);
+    waiter = wait;
+    let r = inline_into(n);
+    waiter = no_wait;
+    return r;
+}
+
+threadlocal let mut waiter: fn(usize) void = no_wait;
+
+fn no_wait(k: usize) void {
+    _ = k;
+}
+
+fn step_wait(k: usize) void {
+    waiter(k);
 }
 
 /// After inline_step k inlined calls and the function was simplified.

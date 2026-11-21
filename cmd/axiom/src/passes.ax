@@ -353,39 +353,67 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
 // Inlining over the module bottom-up (inline.ax), each function simplified
 // again after its calls are inlined (resimplify, which may run on another
 // thread while the inlining goes on into functions that do not call it).
+struct InlineRun {
+    m: *mut ir.Module,
+    w: *mut Work,
+    task: []mut usize,  // by place in the order: its task + 1, or 0: none
+    next: usize,        // the next to inline into
+    done: usize,        // the functions done (inline_after), in order
+}
+
+threadlocal let mut inl_run: *mut InlineRun = @ptr_from_int(*mut InlineRun, 0);
+
 fn inline_module(pool: *mut Pool, m: *mut ir.Module) void {
     let n = inl.inline_begin(m);
-    let w = par_begin(pool, m, 2);
-    let task = u.newn.[usize](n + 1);  // by place in the order: its task + 1, or 0: none
-    let mut next: usize = 0;           // the next to inline into
-    let mut done: usize = 0;           // the functions done (inline_after), in order
-    while done < n {
-        let seen = @atomic_load(&w.ndone);
-        let mut moved = false;
-        // what was simplified, in order
-        while (done < next) and ((task[done] == 0) or par_done(w, task[done] - 1)) {
-            if task[done] > 0 {
-                inl.inline_after(m, done, split_cold);
-            }
-            done += 1;
-            moved = true;
-        }
+    let r = u.new.[InlineRun]();
+    r.m = m;
+    r.w = par_begin(pool, m, 2);
+    r.task = u.newn.[usize](n + 1);
+    inl_run = r;
+    while r.done < n {
+        let seen = @atomic_load(&r.w.ndone);
+        let mut moved = inline_finish(r);
         // the next function whose callees are done
-        while (next < n) and (inl.inline_need(next) <= done) {
-            if inl.inline_step(next) {
-                let f = inl.inline_func(next);
+        while (r.next < n) and (inl.inline_need(r.next) <= r.done) {
+            if inl.inline_step(r.next, inline_wait) {
+                let f = inl.inline_func(r.next);
                 ir.recycle(f);  // (what inlining took out: no other thread has a graveyard with it)
-                task[next] = par_push(w, f, K_SIMPLIFY) + 1;
+                r.task[r.next] = par_push(r.w, f, K_SIMPLIFY) + 1;
             }
-            next += 1;
+            r.next += 1;
             moved = true;
         }
         if not moved {
-            par_wait(w, seen);
+            par_wait(r.w, seen);
         }
     }
-    par_end(w);
+    par_end(r.w);
+    inl_run = u.nil.[InlineRun]();
     inl.inline_end(m);
+}
+
+// What was simplified, in order (inline_after); whether anything was.
+fn inline_finish(r: *mut InlineRun) bool {
+    let mut moved = false;
+    while (r.done < r.next) and ((r.task[r.done] == 0) or par_done(r.w, r.task[r.done] - 1)) {
+        if r.task[r.done] > 0 {
+            inl.inline_after(r.m, r.done, split_cold);
+        }
+        r.done += 1;
+        moved = true;
+    }
+    return moved;
+}
+
+// (inline.inline_step) Until the function at k is done.
+fn inline_wait(k: usize) void {
+    let r = inl_run;
+    while r.done <= k {
+        let seen = @atomic_load(&r.w.ndone);
+        if not inline_finish(r) {
+            par_wait(r.w, seen);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
