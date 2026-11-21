@@ -1,0 +1,485 @@
+// =============================================================================
+// ctypes_compat.ax - integer value range checks, integer promotions, usual
+// arithmetic conversions, type compatibility, and composite types, part of
+// ctypes.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "copts.ax" as co;
+
+// -----------------------------------------------------------------------------
+// Integer values
+// -----------------------------------------------------------------------------
+
+/// The low `bits` bits of x, sign-extended when `sg` (the canonical form of
+/// an integer constant's bits).
+pub fn wrap_bits(x: u64, bits: i32, sg: bool) u64 {
+    if bits >= 64 {
+        return x;
+    }
+    let sh = @as(u32, @bit_cast(u32, 64 - bits));
+    if sg {
+        return @bit_cast(u64, @bit_cast(i64, x << sh) >> sh);
+    }
+    return (x << sh) >> sh;
+}
+
+/// x converted to integer type t (6.3.1.3; a signed result wraps, as the
+/// implementation defines). _Bool: 0 or 1.
+pub fn wrap(t: *CType, x: u64) u64 {
+    if t.kind == TK_BOOL {
+        if x != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    return wrap_bits(x, t.bits, t.is_signed);
+}
+
+/// The largest value of integer type t, as bits (of a type wider than 64
+/// bits: the largest u64, which every such type holds).
+pub fn int_max(t: *CType) u64 {
+    if t.kind == TK_BOOL {
+        return 1;
+    }
+    if t.bits > 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    if t.is_signed {
+        return (@as(u64, 1) << @as(u32, @bit_cast(u32, t.bits - 1))) - 1;
+    }
+    if t.bits >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return (@as(u64, 1) << @as(u32, @bit_cast(u32, t.bits))) - 1;
+}
+
+/// Does integer type t hold the value v (the bits of a value of type `from`)?
+pub fn fits(t: *CType, v: u64, from_signed: bool) bool {
+    let neg = from_signed and (@bit_cast(i64, v) < 0);
+    if t.bits > 64 {
+        return t.is_signed or not neg;
+    }
+    if neg {
+        if not t.is_signed {
+            return false;
+        }
+        let min = -@bit_cast(i64, int_max(t)) - 1;
+        return @bit_cast(i64, v) >= min;
+    }
+    return v <= int_max(t);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions (6.3.1)
+// -----------------------------------------------------------------------------
+
+/// The signed integer type of t's rank.
+pub fn to_signed(t: *mut CType) *mut CType {
+    let k = t.unq.kind;
+    if (k == TK_UCHAR) or (k == TK_CHAR) {
+        return t_schar;
+    }
+    if k == TK_USHORT {
+        return t_short;
+    }
+    if k == TK_UINT {
+        return t_int;
+    }
+    if k == TK_ULONG {
+        return t_long;
+    }
+    if k == TK_ULLONG {
+        return t_llong;
+    }
+    if k == TK_UINT128 {
+        return t_int128;
+    }
+    if k == TK_ENUM {
+        return to_signed(t.unq.tag.base);
+    }
+    if k == TK_BITINT {
+        return bitint(t.bits, true);
+    }
+    return t.unq;
+}
+
+/// The unsigned integer type of t's rank.
+pub fn to_unsigned(t: *mut CType) *mut CType {
+    let k = t.unq.kind;
+    if (k == TK_SCHAR) or (k == TK_CHAR) {
+        return t_uchar;
+    }
+    if k == TK_SHORT {
+        return t_ushort;
+    }
+    if k == TK_INT {
+        return t_uint;
+    }
+    if k == TK_LONG {
+        return t_ulong;
+    }
+    if k == TK_LLONG {
+        return t_ullong;
+    }
+    if k == TK_INT128 {
+        return t_uint128;
+    }
+    if k == TK_ENUM {
+        return to_unsigned(t.unq.tag.base);
+    }
+    if k == TK_BITINT {
+        return bitint(t.bits, false);
+    }
+    return t.unq;
+}
+
+/// The integer promotions (6.3.1.1p2) of an arithmetic type (others:
+/// unqualified, unchanged). An enumeration is first its compatible type; a
+/// bit-precise integer type is not promoted.
+pub fn promote(t0: *mut CType) *mut CType {
+    let mut t = t0.unq;
+    if t.kind == TK_ENUM {
+        t = t.tag.base;
+    }
+    if not is_integer(t) or (t.rank >= t_int.rank) or (t.kind == TK_BITINT) {
+        return t;
+    }
+    // int holds every value of a narrower type, and of one as wide that is signed
+    if (t.bits < t_int.bits) or t.is_signed {
+        return t_int;
+    }
+    return t_uint;
+}
+
+/// The default argument promotions (6.5.2.2p6): the integer promotions, and
+/// float to double.
+pub fn arg_promote(t: *mut CType) *mut CType {
+    // (a decimal floating type is not promoted: _Decimal32 stays itself)
+    if t.unq.kind == TK_FLOAT {
+        return t_double;
+    }
+    return promote(t);
+}
+
+/// The common type of the usual arithmetic conversions (6.3.1.8) of two
+/// arithmetic types: their common real type, or with a complex operand the
+/// complex type of the common real type of their corresponding real types.
+/// (An operand is converted to the common real type in its own type domain:
+/// domain_type.)
+pub fn common_type(a0: *mut CType, b0: *mut CType) *mut CType {
+    if (a0.unq.kind == TK_COMPLEX) or (b0.unq.kind == TK_COMPLEX) {
+        return complex_of(common_real(real_of(a0), real_of(b0)));
+    }
+    return common_real(real_of(a0), real_of(b0));
+}
+
+/// The type an operand of type t is converted to by the usual arithmetic
+/// conversions whose common type is c (6.3.1.8p1: "without change of type
+/// domain"): c's corresponding real type for a real operand, else c.
+pub fn domain_type(t: *mut CType, c: *mut CType) *mut CType {
+    if (c.unq.kind == TK_COMPLEX) and (t.unq.kind != TK_COMPLEX) {
+        return c.unq.elem;
+    }
+    return c;
+}
+
+fn common_real(a0: *mut CType, b0: *mut CType) *mut CType {
+    let a = promote(a0);
+    let b = promote(b0);
+    // C23 6.3.1.8p1: a decimal floating operand (whose other operand is
+    // decimal or an integer: csema checks that) makes the common type the
+    // wider decimal type (H.4.3: of _Decimal64x and _Decimal128, whose
+    // values are the same, the interchange type _Decimal128)
+    if is_decimal(a) or is_decimal(b) {
+        return dec_of_rank(@max(@max(dec_rank(a), dec_rank(b)), 1));
+    }
+    if is_floating(a) or is_floating(b) {
+        // (C23 6.3.1.8: the type of greater floating-point conversion rank,
+        // and an integer operand converted to the floating one)
+        if not is_floating(b) {
+            return a;
+        }
+        if not is_floating(a) {
+            return b;
+        }
+        if float_rank(b) > float_rank(a) {
+            return b;
+        }
+        return a;
+    }
+    if a == b {
+        return a;
+    }
+    if a.is_signed == b.is_signed {
+        if a.rank >= b.rank {
+            return a;
+        }
+        return b;
+    }
+    let mut s = a;
+    let mut uu = b;
+    if not a.is_signed {
+        s = b;
+        uu = a;
+    }
+    if uu.rank >= s.rank {
+        return uu;
+    }
+    if s.bits > uu.bits {
+        return s;
+    }
+    return to_unsigned(s);
+}
+
+// -----------------------------------------------------------------------------
+// Compatibility and composite types (6.2.7)
+// -----------------------------------------------------------------------------
+
+/// Are a and b compatible types (qualifiers included)?
+pub fn compatible(a: *CType, b: *CType) bool {
+    if (a.kind == TK_ERROR) or (b.kind == TK_ERROR) {
+        return true;
+    }
+    // (an array's qualifiers are its element's, which compatible_unq
+    // compares: C23 6.7.4.1p3 marks them on the array type too)
+    if (a.quals != b.quals) and (a.kind != TK_ARRAY) {
+        return false;
+    }
+    return compatible_unq(a.unq, b.unq);
+}
+
+// Is t0 a transparent union (a GNU dialect's attribute transparent_union)
+// with a member of a type compatible with o0's? As a parameter's type it is
+// compatible with o0 (as the GNU compilers take it: the system's headers
+// declare getsockname with such a union for its address, which a program
+// passes where a function of a struct sockaddr * is wanted).
+fn transparent_param(t0: *CType, o0: *CType) bool {
+    let t = t0.unq;
+    let o = o0.unq;
+    if (t.kind != TK_UNION) or u.isnil(t.tag) or not t.tag.complete or (o.kind == TK_UNION) {
+        return false;
+    }
+    if not t.tag.transparent {
+        return false;
+    }
+    for m in t.tag.members.items() {
+        if (m.name.len > 0) and not m.is_bitfield and compatible_unq(m.ty, o) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Are a and b compatible once their own (outermost) qualifiers are ignored?
+pub fn compatible_unq(a0: *CType, b0: *CType) bool {
+    let a = a0.unq;
+    let b = b0.unq;
+    if a == b {
+        return true;
+    }
+    if (a.kind == TK_ERROR) or (b.kind == TK_ERROR) {
+        return true;
+    }
+    // an enumeration is compatible with its integer type
+    if (a.kind == TK_ENUM) and (b.kind != TK_ENUM) {
+        return a.tag.base == b;
+    }
+    if (b.kind == TK_ENUM) and (a.kind != TK_ENUM) {
+        return b.tag.base == a;
+    }
+    if a.kind != b.kind {
+        return false;
+    }
+    let k = a.kind;
+    if k == TK_POINTER {
+        return compatible(a.elem, b.elem);
+    }
+    if k == TK_ARRAY {
+        if not compatible(a.elem, b.elem) {
+            return false;
+        }
+        if a.has_len and b.has_len and not a.vla and not b.vla {
+            return a.len == b.len;
+        }
+        return true;
+    }
+    if k == TK_FUNCTION {
+        if not compatible(a.ret, b.ret) {
+            return false;
+        }
+        if a.proto and b.proto {
+            if (a.params.len != b.params.len) or (a.variadic != b.variadic) {
+                return false;
+            }
+            for i in 0..a.params.len {
+                if not same_atomic(a.params[i], b.params[i]) or not compatible_unq(a.params[i], b.params[i]) {
+                    if not transparent_param(a.params[i], b.params[i]) and
+                       not transparent_param(b.params[i], a.params[i]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        if a.proto or b.proto {
+            let p = pick_proto(a, b);
+            let mut o = a;
+            if a.proto {
+                o = b;
+            }
+            if p.variadic {
+                return false;
+            }
+            if o.kr {
+                // the other is a definition with an identifier list: as
+                // many parameters, each compatible with the promoted type
+                // of the definition's (6.7.6.3p15)
+                if p.params.len != o.params.len {
+                    return false;
+                }
+                for i in 0..p.params.len {
+                    if not compatible_unq(p.params[i], arg_promote(o.params[i])) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            // the other gives no parameters: the prototype's must be ones
+            // the default argument promotions do not change (6.7.6.3p15)
+            for x in p.params {
+                if not compatible_unq(arg_promote(x), x) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) {
+        return (a.tag == b.tag) or same_content(a.tag, b.tag);
+    }
+    if k == TK_ENUM {
+        return (a.tag == b.tag) or same_enum(a.tag, b.tag);
+    }
+    return false;
+}
+
+// C23 6.2.7p1: two enumerations with the same tag (in different scopes, or
+// one redefining the other) are compatible if their constants correspond:
+// the same names with the same values, and fixed underlying types that are
+// compatible if either has one.
+fn same_enum(x: *TagInfo, y: *TagInfo) bool {
+    if (g_opts.std < co.C23) or (x.name.len == 0) or not u.same(x.name, y.name) or not x.listed or not y.listed or
+       (x.consts.len != y.consts.len) {
+        return false;
+    }
+    if u.notnil(x.fixed) != u.notnil(y.fixed) {
+        return false;
+    }
+    if u.notnil(x.fixed) and not compatible_unq(x.fixed, y.fixed) {
+        return false;
+    }
+    for i in 0..x.consts.len {
+        let mut found = false;
+        for j in 0..y.consts.len {
+            if u.same(x.consts.get(i), y.consts.get(j)) {
+                found = (x.cvals.get(i) == y.cvals.get(j)) and (x.chis.get(i) == y.chis.get(j));
+                break;
+            }
+        }
+        if not found {
+            return false;
+        }
+    }
+    return true;
+}
+
+// C23 6.2.7p1: two complete structures or unions declared with the same tag
+// (in different scopes, or one redefining the other) are compatible if their
+// members correspond: the same names in the same order, compatible types,
+// the same widths of bit-fields and the same alignment specifiers.
+fn same_content(x: *TagInfo, y: *TagInfo) bool {
+    if (g_opts.std < co.C23) or (x.kind != y.kind) or (x.name.len == 0) or not u.same(x.name, y.name) or
+       not x.complete or not y.complete or (x.members.len != y.members.len) {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < g_comparing.len {
+        if ((g_comparing.get(i) == x) and (g_comparing.get(i + 1) == y)) or
+           ((g_comparing.get(i) == y) and (g_comparing.get(i + 1) == x)) {
+            return true;
+        }
+        i += 2;
+    }
+    g_comparing.push(x);
+    g_comparing.push(y);
+    let mut ok = true;
+    for j in 0..x.members.len {
+        let m = x.members.get(j);
+        let n = y.members.get(j);
+        if not u.same(m.name, n.name) or (m.is_bitfield != n.is_bitfield) or (m.bit_width != n.bit_width) or
+           (m.align != n.align) or not compatible(m.ty, n.ty) {
+            ok = false;
+            break;
+        }
+    }
+    _ = g_comparing.pop();
+    _ = g_comparing.pop();
+    return ok;
+}
+
+// The one of two function types that has a prototype, else the one that
+// has parameters (a definition with an identifier list), else b.
+fn pick_proto(a: *CType, b: *CType) *CType {
+    if a.proto or (a.kr and not b.proto) {
+        return a;
+    }
+    return b;
+}
+
+/// The composite type of two compatible types (6.2.7p3).
+pub fn composite(a: *mut CType, b: *mut CType) *mut CType {
+    if a.kind == TK_ERROR {
+        return b;
+    }
+    if (b.kind == TK_ERROR) or (a == b) {
+        return a;
+    }
+    let k = a.kind;
+    if (k == TK_ARRAY) and (b.kind == TK_ARRAY) {
+        let el = composite(a.elem, b.elem);
+        if a.has_len {
+            return qualify(array_of(el, a.len, true), a.quals);
+        }
+        if not b.has_len and (a.vla or b.vla) {
+            // (a variable length array's length: the one evaluated, if either is)
+            let mut x = a.vexpr;
+            if u.isvnil(x) or not a.vla {
+                x = b.vexpr;
+            }
+            return qualify(vla_of(el, x), a.quals);
+        }
+        return qualify(array_of(el, b.len, b.has_len), a.quals);
+    }
+    if (k == TK_POINTER) and (b.kind == TK_POINTER) {
+        return qualify(pointer_to(composite(a.elem, b.elem)), a.quals);
+    }
+    if (k == TK_FUNCTION) and (b.kind == TK_FUNCTION) {
+        let ret = composite(a.ret, b.ret);
+        if a.proto and b.proto {
+            let n = a.params.len;
+            let ps = u.newn.[*mut CType](n + 1);
+            for i in 0..n {
+                ps[i] = composite(a.params[i], b.params[i]);
+            }
+            return function(ret, ps[0..n], true, a.variadic);
+        }
+        let mut p = b;
+        if a.proto or (a.kr and not b.proto) {
+            p = a;
+        }
+        let f = function(ret, p.params, p.proto, p.variadic);
+        f.kr = p.kr;
+        return f;
+    }
+    return a;
+}

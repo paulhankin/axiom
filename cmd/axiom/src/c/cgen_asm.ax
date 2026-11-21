@@ -1,6 +1,7 @@
 // =============================================================================
 // cgen_asm.ax - IR generation for asm statements and file-scope asm (a GNU
 // dialect): the intrinsic IN_ASM with the operands asm/inline.ax describes.
+// Part of cgen.ax.
 //
 // Before the intrinsic, in the order of the operands: each output's address
 // (an output in a register gets a temporary object, which the backend stores
@@ -21,35 +22,33 @@ import "../ir.ax" as ir;
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
-import "cgen_expr.ax" as gx;
-import "csema_asm.ax" as csa;
+import "csema.ax" as cs;
 import "ctypes.ax" as cty;
 
 /// File-scope asm a: its text joins the program's (asm/inline.ax:
 /// toplevel), to be assembled into the object.
-pub fn toplevel(a: *mut cast.Asm) void {
+fn asm_toplevel(a: *mut cast.Asm) void {
     if u.isnil(a.blob) {
         return;
     }
-    a.blob.aliases = aliases(a);
+    a.blob.aliases = asm_aliases(a);
     ai.toplevel.push(a.blob);
 }
 
 // The functions and objects of internal linkage asm a's text names (made
 // in the IR if they are not yet): each name and its symbol's.
-fn aliases(a: *cast.Asm) [][]u8 {
+fn asm_aliases(a: *cast.Asm) [][]u8 {
     let out = u.perm_newn.[[]u8](2 * a.statics.len + 1);
     for k in 0..a.statics.len {
         let s = a.statics.get(k);
         // (kept: only the text refers to it, which the optimizer does not see)
         if s.kind == cast.SK_FUNC {
-            cg.keep(cg.func_of(s, cg.func_sig(s)).val);
+            keep(func_of(s, func_sig(s)).val);
         } else {
-            cg.keep(cg.object_addr(s));
+            keep(object_addr(s));
         }
         out[2 * k] = u.perm_dup(s.name);
-        out[(2 * k) + 1] = u.perm_dup(cg.symbol_name(s));
+        out[(2 * k) + 1] = u.perm_dup(symbol_name(s));
     }
     return out[0..2 * a.statics.len];
 }
@@ -57,29 +56,29 @@ fn aliases(a: *cast.Asm) [][]u8 {
 // v (of C type t) as the type a register of op's class holds. On
 // WebAssembly, a local of the value's own type (an integer narrower than
 // 32 bits extended to an i32 as its C type's signedness says: et).
-fn to_class(v: *mut ir.Value, op: ai.Op, et: *cty.CType) *mut ir.Value {
+fn asm_to_class(v: *mut ir.Value, op: ai.Op, et: *cty.CType) *mut ir.Value {
     let k = v.ty.kind;
     if tg.is_wasm() {
         if (k == ir.T_INT) and (v.ty.bits < 32) {
             if cty.is_signed_int(et) {
-                return ir.sext(cg.B, v, ir.t_int(32));
+                return ir.sext(B, v, ir.t_int(32));
             }
-            return ir.zext(cg.B, v, ir.t_int(32));
+            return ir.zext(B, v, ir.t_int(32));
         }
         return v;
     }
     if (op.cls == ai.CL_GPR) and (k == ir.T_FLOAT) {
-        return ir.bitcast(cg.B, v, ir.t_int(v.ty.bits));
+        return ir.bitcast(B, v, ir.t_int(v.ty.bits));
     }
     if (op.cls == ai.CL_VEC) and ((k == ir.T_INT) or (k == ir.T_PTR)) {
         let mut x = v;
         if k == ir.T_PTR {
-            x = ir.ptrtoint(cg.B, v, ir.t_int(@int_cast(i32, cty.ptr_bytes * 8)));
+            x = ir.ptrtoint(B, v, ir.t_int(@int_cast(i32, cty.ptr_bytes * 8)));
         }
         if x.ty.bits < 32 {
-            x = ir.zext(cg.B, x, ir.t_int(32));
+            x = ir.zext(B, x, ir.t_int(32));
         }
-        return ir.bitcast(cg.B, x, ir.t_float(x.ty.bits));
+        return ir.bitcast(B, x, ir.t_float(x.ty.bits));
     }
     return v;
 }
@@ -87,12 +86,12 @@ fn to_class(v: *mut ir.Value, op: ai.Op, et: *cty.CType) *mut ir.Value {
 /// Asm statement a: IN_ASM, and the stores of its outputs. Returns the
 /// intrinsic (for `asm goto`, an i32 that says which label the template
 /// jumped to: 0 none, k + 1 label k), or nil after an error.
-pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
+fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
     let b = a.blob;
     if u.isnil(b) {
         return u.nil.[ir.Value]();
     }
-    b.aliases = aliases(a);
+    b.aliases = asm_aliases(a);
     let mut index = ai.add(b);
     let mut flags: u32 = 0;
     if b.defines {
@@ -123,7 +122,7 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
         flags = flags | ir.ASM_PURE;
         // (one index for equal pure statements, so that value numbering
         // merges them: the same template, operands and clobbers)
-        let key = u.intern(pure_key(a, b));
+        let key = u.intern(asm_pure_key(a, b));
         let prev = pure_keys.get(key);
         if prev != 0 {
             index = prev - 1;
@@ -160,13 +159,13 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     for k in 0..b.ops.len {
         let op = b.ops[k];
         let e = a.exprs.get(k);
-        let reuse = plus_input(a, b, k, oaddr);
+        let reuse = asm_plus_input(a, b, k, oaddr);
         if op.hi {
             if op.out {
                 xs.push(ir.ci32(0));
             } else {
-                let at = ir.ptradd(cg.B, pairv[@int_cast(usize, op.pair)], ir.cint(ir.isz(), 8));
-                xs.push(ir.load(cg.B, ir.t_int(64), at));
+                let at = ir.ptradd(B, pairv[@int_cast(usize, op.pair)], ir.cint(ir.isz(), 8));
+                xs.push(ir.load(B, ir.t_int(64), at));
             }
             continue;
         }
@@ -175,68 +174,68 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
                 let t = cty.unqual(e.ty);
                 pouts.push(k);
                 pes.push(e);
-                oaddr[k] = gx.lv(e);
+                oaddr[k] = lv(e);
                 paddrs.push(oaddr[k]);
-                ptmps.push(cg.alloca(t, "asm.out"));
+                ptmps.push(alloca(t, "asm.out"));
                 xs.push(ir.ci32(0));
             } else {
                 let mut p = reuse;
                 if u.isnil(p) {
-                    p = gx.rv(e);  // (a 128-bit value: its address)
+                    p = rv(e);  // (a 128-bit value: its address)
                 }
                 pairv[k] = p;
-                xs.push(ir.load(cg.B, ir.t_int(64), p));
+                xs.push(ir.load(B, ir.t_int(64), p));
             }
             continue;
         }
-        if is_vbuf(op) {
+        if asm_is_vbuf(op) {
             // a buffer of the whole register's size (the vector length's
             // largest for z), holding the value at its start, zeros after
-            let buf = vbuf(op);
+            let buf = asm_vbuf(op);
             let t = cty.unqual(e.ty);
             if op.out {
-                let at = gx.lv(e);
+                let at = lv(e);
                 oaddr[k] = at;
                 if op.inout {
-                    gx.copy(t, buf, at);
+                    copy(t, buf, at);
                 }
                 vouts.push(k);
                 vbufs.push(buf);
                 vaddrs.push(at);
             } else if not u.isnil(reuse) {
-                gx.copy(t, buf, reuse);
+                copy(t, buf, reuse);
             } else if e.lvalue {
-                gx.copy(t, buf, gx.lv(e));
+                copy(t, buf, lv(e));
             } else if cty.is_wide(t) or not cty.is_scalar(t) {
-                gx.copy(t, buf, gx.rv(e));
+                copy(t, buf, rv(e));
             } else {
-                gx.store(t, gx.rv(e), buf);
+                store(t, rv(e), buf);
             }
             xs.push(buf);
             continue;
         }
         if op.out {
             if op.kind == ai.OK_MEM {
-                xs.push(gx.lv(e));
+                xs.push(lv(e));
                 continue;
             }
             outk.push(k);
             outs.push(e);
-            oaddr[k] = gx.lv(e);
+            oaddr[k] = lv(e);
             addrs.push(oaddr[k]);
             xs.push(ir.ci32(0));  // (its register: the asm's result k)
             continue;
         }
         if op.kind == ai.OK_MEM {
             if e.lvalue {
-                xs.push(gx.lv(e));
+                xs.push(lv(e));
             } else {
                 let t = cty.unqual(e.ty);
-                let tmp = cg.alloca(t, "asm.in");
+                let tmp = alloca(t, "asm.in");
                 if cty.is_wide(t) or not cty.is_scalar(t) {
-                    gx.copy(t, tmp, gx.rv(e));  // (a value kept in memory: its address)
+                    copy(t, tmp, rv(e));  // (a value kept in memory: its address)
                 } else {
-                    gx.store(t, gx.rv(e), tmp);
+                    store(t, rv(e), tmp);
                 }
                 xs.push(tmp);
             }
@@ -248,62 +247,62 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
         }
         if tg.is_wasm() and (op.bits == 128) {
             // (a vector, which C keeps in memory: its value, for a v128 local)
-            xs.push(ir.load(cg.B, cg.lty(cty.unqual(e.ty)), gx.rv(e)));
+            xs.push(ir.load(B, lty(cty.unqual(e.ty)), rv(e)));
             continue;
         }
         let mut v = ir.vnil();
         if not u.isnil(reuse) {
-            v = gx.load_lv(e.a, reuse);
+            v = load_lv(e.a, reuse);
         } else {
-            v = gx.rv(e);
+            v = rv(e);
         }
         if op.kind == ai.OK_IMM {
             xs.push(v);
             continue;
         }
-        xs.push(to_class(v, op, cty.unqual(e.ty)));
+        xs.push(asm_to_class(v, op, cty.unqual(e.ty)));
     }
     if exact {
-        ir.note_asm_mem(@as(i64, index), mem_list(a, b));
+        ir.note_asm_mem(@as(i64, index), asm_mem_list(a, b));
     }
-    let mut rt = cg.T_void;
+    let mut rt = T_void;
     if b.goto_ {
-        rt = cg.T_i32;
+        rt = T_i32;
     }
-    let r = ir.intr(cg.B, ir.IN_ASM, rt, xs.items_mut());
+    let r = ir.intr(B, ir.IN_ASM, rt, xs.items_mut());
     // (the results first, just after it: then the stores)
     let vs = u.newn.[*mut ir.Value](outk.len + 1);
     for j in 0..outk.len {
-        vs[j] = result(r, outk.get(j), b.ops[outk.get(j)], cty.unqual(outs.get(j).ty));
+        vs[j] = asm_result(r, outk.get(j), b.ops[outk.get(j)], cty.unqual(outs.get(j).ty));
     }
     let lo = u.newn.[*mut ir.Value](pouts.len + 1);
     let hi = u.newn.[*mut ir.Value](pouts.len + 1);
     for j in 0..pouts.len {
         let k = pouts.get(j);
         let pt = cty.unqual(pes.get(j).ty);
-        lo[j] = result(r, k, b.ops[k], pt);
-        hi[j] = result(r, @int_cast(usize, b.ops[k].pair), b.ops[@int_cast(usize, b.ops[k].pair)], pt);
+        lo[j] = asm_result(r, k, b.ops[k], pt);
+        hi[j] = asm_result(r, @int_cast(usize, b.ops[k].pair), b.ops[@int_cast(usize, b.ops[k].pair)], pt);
     }
     for j in 0..outk.len {
         let e = outs.get(j);
         let t = cty.unqual(e.ty);
         if tg.is_wasm() and (b.ops[outk.get(j)].bits == 128) {
-            _ = ir.store(cg.B, vs[j], addrs.get(j));  // (a vector's value to its object)
+            _ = ir.store(B, vs[j], addrs.get(j));  // (a vector's value to its object)
             continue;
         }
-        _ = gx.store_lv(e, t, from_class(vs[j], t), addrs.get(j));
+        _ = store_lv(e, t, asm_from_class(vs[j], t), addrs.get(j));
     }
     for j in 0..vouts.len {
         let t = cty.unqual(a.exprs.get(vouts.get(j)).ty);
-        gx.copy(t, vaddrs.get(j), vbufs.get(j));
+        copy(t, vaddrs.get(j), vbufs.get(j));
     }
     for j in 0..pouts.len {
         let e = pes.get(j);
         let t = cty.unqual(e.ty);
         let tmp = ptmps.get(j);
-        _ = ir.store(cg.B, lo[j], tmp);
-        _ = ir.store(cg.B, hi[j], ir.ptradd(cg.B, tmp, ir.cint(ir.isz(), 8)));
-        _ = gx.store_lv(e, t, gx.load(t, tmp), paddrs.get(j));
+        _ = ir.store(B, lo[j], tmp);
+        _ = ir.store(B, hi[j], ir.ptradd(B, tmp, ir.cint(ir.isz(), 8)));
+        _ = store_lv(e, t, load(t, tmp), paddrs.get(j));
     }
     return r;
 }
@@ -312,7 +311,7 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
 // operand (operand k is k + 1), its object's size, and whether the template
 // reads it (an input, or an output that is also one) and writes it (an
 // output). An operand in a register through memory is its temporary.
-fn mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
+fn asm_mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
     let ms = u.perm_newn.[ir.AsmMem](b.ops.len + 1);
     let mut n: usize = 0;
     for k in 0..b.ops.len {
@@ -322,8 +321,8 @@ fn mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
         }
         let t = cty.unqual(a.exprs.get(k).ty);
         let mut size: i64 = -1;
-        if is_vbuf(op) {
-            size = @bit_cast(i64, vbuf_bytes(op));
+        if asm_is_vbuf(op) {
+            size = @bit_cast(i64, asm_vbuf_bytes(op));
         } else if (t.kind != cty.TK_FUNCTION) and (t.kind != cty.TK_VOID) and cty.is_complete(t) and not cty.is_vla(t) {
             size = @bit_cast(i64, cty.size_of(t));
         }
@@ -337,7 +336,7 @@ fn mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
 // The address of the output that operand k, an input '+' added (the value
 // of that output's lvalue, read before the asm), reads: oaddr's, the
 // output's lvalue evaluated once; or nil.
-fn plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) *mut ir.Value {
+fn asm_plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) *mut ir.Value {
     let op = b.ops[k];
     if op.out or op.hi or (op.tie < 0) {
         return ir.vnil();
@@ -351,20 +350,20 @@ fn plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) *
     return oaddr[t];
 }
 
-fn is_vbuf(op: ai.Op) bool {
+fn asm_is_vbuf(op: ai.Op) bool {
     return (op.via == ai.VIA_V) or (op.via == ai.VIA_P);
 }
 
 // A zeroed buffer for operand op's register: 16 bytes for q, 32 for p, 256 for
 // z (an SVE vector of the architecture's largest length, 2048 bits).
-fn vbuf(op: ai.Op) *mut ir.Value {
-    let n = vbuf_bytes(op);
-    let buf = cg.alloca(cty.array_of(cty.t_ullong, n / 8, true), "asm.reg");
-    gx.zero(buf, n);
+fn asm_vbuf(op: ai.Op) *mut ir.Value {
+    let n = asm_vbuf_bytes(op);
+    let buf = alloca(cty.array_of(cty.t_ullong, n / 8, true), "asm.reg");
+    zero_mem(buf, n);
     return buf;
 }
 
-fn vbuf_bytes(op: ai.Op) u64 {
+fn asm_vbuf_bytes(op: ai.Op) u64 {
     if op.via == ai.VIA_P {
         return 32;
     }
@@ -374,13 +373,9 @@ fn vbuf_bytes(op: ai.Op) u64 {
     return 256;
 }
 
-// The pure asm statements so far, by what they are (pure_key): index + 1.
-let mut pure_keys: u.SymMap.[i32] = u.SymMap.[i32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
-
 // What makes two asm statements the same: the template, each operand's
 // constraint and what was chosen for it, the clobbers, the syntax.
-fn pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
+fn asm_pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
     let mut k = u.Buf.init();
     k.s(a.tmpl);
     for o in a.outputs.items() {
@@ -416,35 +411,35 @@ fn pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
 // Output k (op, of C type t) of asm r: the register its value is in, as
 // the type of its class (an integer of its width, or a floating type of
 // it); on WebAssembly a local of its own type (a vector's, a float's).
-fn result(r: *mut ir.Value, k: usize, op: ai.Op, t: *mut cty.CType) *mut ir.Value {
+fn asm_result(r: *mut ir.Value, k: usize, op: ai.Op, t: *mut cty.CType) *mut ir.Value {
     let mut ty = ir.t_int(@as(i32, @bit_cast(i32, op.bits)));
     if op.cls == ai.CL_VEC {
         ty = ir.t_float(@as(i32, @bit_cast(i32, op.bits)));
     }
     if tg.is_wasm() and (op.fp or (op.bits == 128)) {
-        ty = cg.lty(t);
+        ty = lty(t);
     }
     let mut args: [2]*mut ir.Value = [r, ir.ci32(@as(u64, k))];
-    return ir.intr(cg.B, ir.IN_CALL_RESULT, ty, args[..]);
+    return ir.intr(B, ir.IN_CALL_RESULT, ty, args[..]);
 }
 
-// A register's value v as C type t (to_class's inverse).
-fn from_class(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
-    let want = cg.lty(t);
+// A register's value v as C type t (asm_to_class's inverse).
+fn asm_from_class(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let want = lty(t);
     if v.ty == want {
         return v;
     }
     if want.kind == ir.T_PTR {
-        return ir.inttoptr(cg.B, v);
+        return ir.inttoptr(B, v);
     }
-    return ir.bitcast(cg.B, v, want);
+    return ir.bitcast(B, v, want);
 }
 
 /// A function with the attribute naked, of symbol `name`: no IR body; its
 /// asm statements' text, after a label of its name, is file-scope asm (so
 /// the function has no prologue or epilogue; its symbol is global, an
 /// internal function's name being unique).
-pub fn naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) void {
+fn asm_naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) void {
     f.linkage = ir.LINK_EXTERNAL;
     if tg.is_wasm() {
         // (WebAssembly: the function's code is its asm, csema_asm.ax)
@@ -452,12 +447,12 @@ pub fn naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
         nb.arch = tg.g_arch;
         nb.file_id = -1;
         nb.basic = true;
-        nb.text = u.perm_dup(csa.naked_text(name, ct, body));
+        nb.text = u.perm_dup(cs.naked_text(name, ct, body));
         nb.loc = u.perm_dup(u.file_of(body.span.file).display);
         let mut al = u.List.[[]u8].empty();
         for x in body.items.items() {
             if (x.kind == cast.StmtKind.ASM) and u.notnil(x.asm) {
-                for n in aliases(x.asm) {
+                for n in asm_aliases(x.asm) {
                     al.push(n);
                 }
             }
@@ -489,7 +484,7 @@ pub fn naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
         if u.isnil(first) {
             first = b;
         }
-        for n in aliases(x.asm) {
+        for n in asm_aliases(x.asm) {
             al.push(n);
         }
         if b.basic {

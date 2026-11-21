@@ -1,11 +1,10 @@
 // =============================================================================
 // cgen.ax - IR generation for a C translation unit (its typed tree: csema.ax)
 // into the compiler's IR module (ir.ax), next to the Axiom program that
-// starts it (std/internal/runtime/c_start.ax): the module's functions and
-// objects, their symbol names and linkage, the data of objects with static
-// storage duration, string literals, the IR types of C types and the
-// signatures of C functions. cgen_expr.ax and cgen_stmt.ax generate the
-// code of functions; cgen_stmt.generate is the entry point.
+// starts it (std/internal/runtime/c_start.ax): shared module state, types,
+// signatures, function frame helpers, and the `generate` entry point.
+// Its parts are the `import part` files below; `cgen_abi.ax`, `cgen_atomic.ax`,
+// `cgen_debug.ax`, and `cgen_tls.ax` remain standalone modules.
 //
 // Representation: a C scalar is an IR value of the type lty gives (_Bool an
 // i8 that is 0 or 1; every integer its width, but those wider than 64 bits,
@@ -21,28 +20,73 @@
 // no shadow-stack records. On native targets its calls have call-site
 // records, so a stack trace shows C functions and the lines of their calls.
 // =============================================================================
-import "../dbginfo.ax" as dbi;
 import "../diag.ax" as dg;
 import "../ir.ax" as ir;
-import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cconst.ax" as cc;
-import "cdec.ax" as cdec;
 import "cgen_abi.ax" as abi;
-import "cgen_debug.ax" as cdbg;
-import "cldbl.ax" as cl;
 import "csema.ax" as cs;
-import "csema_attr.ax" as catr;
-import "csema_gnu.ax" as cgn;
-import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
-import "cwide.ax" as cw;
-import "std/c/rt/ldouble" as ld;
+
+import part "cgen_asm.ax";
+import part "cgen_atomic_ops.ax";
+import part "cgen_atomic_rt.ax";
+import part "cgen_bitint.ax";
+import part "cgen_bits.ax";
+import part "cgen_complex.ax";
+import part "cgen_data.ax";
+import part "cgen_dec.ax";
+import part "cgen_expr.ax";
+import part "cgen_expr_lv.ax";
+import part "cgen_expr_ops.ax";
+import part "cgen_expr_val.ax";
+import part "cgen_flow.ax";
+import part "cgen_fp.ax";
+import part "cgen_gatomic.ax";
+import part "cgen_gbuiltin.ax";
+import part "cgen_half.ax";
+import part "cgen_ld.ax";
+import part "cgen_nest.ax";
+import part "cgen_restrict.ax";
+import part "cgen_simd.ax";
+import part "cgen_sjlj.ax";
+import part "cgen_start.ax";
+import part "cgen_stmt.ax";
+import part "cgen_stmt_ctrl.ax";
+import part "cgen_syms.ax";
+import part "cgen_va.ax";
+import part "cgen_va_arg.ax";
+import part "cgen_vec.ax";
+import part "cgen_vla.ax";
+import part "cgen_wint.ax";
+import part "cgen_wint_ops.ax";
 
 /// The symbol C's main is generated under, and the one the start-up calls.
 pub let MAIN_SYMBOL: []u8 = "axiom.c.main";
 pub let START_SYMBOL: []u8 = "__axiom_c_main";
+
+// The runners of the constructors and destructors (define_runners).
+pub let CTORS_FN: []u8 = "__axiom_c_ctors";
+pub let DTORS_FN: []u8 = "__axiom_c_dtors";
+// exit's slot for the destructors (the hosted C library's, std/c/lib/core)
+let DTORS_HOOK: []u8 = "__axc_at_exit_dtors";
+/// The C library's function of exit's handlers (std/c/lib/core): an Axiom
+/// program's main calls it when it returns (wrap_axiom_main).
+pub let EXIT_HANDLERS: []u8 = "__axc_exit_handlers";
+
+let SETJMP: []u8 = "__axc_setjmp";
+let UDIV_FN: []u8 = "__axiom_c_udivmod128";
+let CAS16_FN: []u8 = "__axiom_atomic_cas16";
+let CX16_FLAG: []u8 = "__axiom_atomic_cx16";
+let OL_NAMES: [4][]u8 = ["__atomic_load", "__atomic_store", "__atomic_exchange", "__atomic_compare_exchange"];
+let LOCK_TABLE: []u8 = "__axiom_atomic_locks";
+let LOCK_FN: []u8 = "__axiom_atomic_lock";
+let UNLOCK_FN: []u8 = "__axiom_atomic_unlock";
+let SIZED_OPS: [6][]u8 = ["add", "sub", "and", "or", "xor", "nand"];
+
+let DARWIN_INODE64: [16][]u8 = ["stat", "lstat", "fstat", "fstatat", "statfs", "fstatfs", "getfsstat", "opendir",
+                                "fdopendir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir", "scandir",
+                                "alphasort"];
 
 // -----------------------------------------------------------------------------
 // State
@@ -54,6 +98,7 @@ pub let mut is_wasm: bool = false;
 // --c-fenv-access: every function's floating point is strict (ir.Func's
 // strict_fp), as under #pragma STDC FENV_ACCESS ON
 pub let mut fenv_all: bool = false;
+pub let mut g_wrapv: bool = false;
 pub let mut T_i1: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 pub let mut T_i8: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 pub let mut T_i32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
@@ -77,19 +122,8 @@ pub struct FnState {
 
 pub let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
 
-/// The code generation of a function's body (cgen_stmt.ax).
-pub struct Hooks {
-    pub body: fn(*mut cast.CSym) void,
-    pub local_init: fn(*mut cast.CSym, *mut ir.Value) void,  // stores an automatic object's initializer at its address
-    pub stmt_expr: fn(*mut cast.Expr) *mut ir.Value,         // a statement expression's value (a GNU dialect)
-    pub trampolines: fn(*mut cast.CSym) void,                // a function's nested functions' trampolines (cgen_nest.ax)
-    // a call of a function whose inline definition forwards its variable
-    // arguments, inlined (done: false if it cannot be, and is not generated)
-    pub inline_call: fn(*mut cast.Expr, *mut cast.CSym, *mut cast.Decl, []*mut cast.CSym, *mut bool) *mut ir.Value,
-}
-
-/// A call being inlined (cgen_stmt.inline_call): an inline definition that
-/// forwards its caller's variable arguments (__builtin_va_arg_pack).
+/// A call being inlined (cgen_stmt_ctrl.ax: inline_call): an inline definition
+/// that forwards its caller's variable arguments (__builtin_va_arg_pack).
 pub struct Inline {
     pub callee: *mut cast.CSym,
     pub pack: u.List.[*mut cast.Expr],  // the call's variable arguments: expressions naming objects holding their values
@@ -101,36 +135,9 @@ pub struct Inline {
 
 pub let mut INL: *mut Inline = @ptr_from_int(*mut Inline, 0);
 
-fn no_inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*mut cast.CSym,
-                  done: *mut bool) *mut ir.Value {
-    _ = e;
-    _ = s;
-    _ = d;
-    _ = ps;
-    done.* = false;
-    return ir.vnil();
-}
-
-fn no_body(s: *mut cast.CSym) void {
-    _ = s;
-}
-
-fn no_local_init(s: *mut cast.CSym, p: *mut ir.Value) void {
-    _ = s;
-    _ = p;
-}
-
-fn no_stmt_expr(e: *mut cast.Expr) *mut ir.Value {
-    _ = e;
-    return ir.vnil();
-}
-
-fn no_trampolines(s: *mut cast.CSym) void {
-    _ = s;
-}
-
-pub let mut hooks: Hooks = Hooks.{ body: no_body, local_init: no_local_init, stmt_expr: no_stmt_expr,
-                                   trampolines: no_trampolines, inline_call: no_inline_call };
+// -----------------------------------------------------------------------------
+// Driver / runtime bridge hooks (set by cc.ax)
+// -----------------------------------------------------------------------------
 
 fn no_call_site(sp: u.Span, fname: []u8, callee: []u8) *mut ir.Value {
     _ = sp;
@@ -188,6 +195,127 @@ pub let mut next_site: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 /// The chain (a frame record) the next call of a nested function passes (cgen_nest.ax).
 pub let mut next_chain: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
+/// Does the program (a unit: cc.ax sets it) define the external name?
+pub let mut defined_here: fn([]u8) bool = nothing_defined;
+
+fn nothing_defined(name: []u8) bool {
+    _ = name;
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Unit and part-module globals
+// -----------------------------------------------------------------------------
+
+// The names of the C units' functions in the module (1), which the units share.
+let mut c_functions: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+let mut strings: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                       cap: 0, len: 0 };
+
+// The entities the unit defines, by name, for the targets of aliases.
+let mut g_defs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                        cap: 0, len: 0 };
+
+let mut g_kept: i32 = 0;
+
+// The constructors and destructors of the program's units (the attributes
+// constructor and destructor, a GNU dialect), in the order they are
+// generated: the start-up calls them around main.
+let mut g_ctors: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                     len: 0, cap: 0 };
+
+/// The program's main is an object's (cc.ax: set_object_main): the name
+/// the start-up calls, with g_obj_main_args arguments; g_obj_main_start: it
+/// is this compiler's object's call of its main, (argc, argv) to an i32.
+pub let mut g_obj_main: []u8 = "";
+pub let mut g_obj_main_args: i32 = 2;
+pub let mut g_obj_main_start: bool = false;
+let mut program_exit: bool = false;
+
+/// The program is linked with objects whose constructors and destructors
+/// are in initialization and termination arrays (cc.ax, nlink.ax).
+pub let mut g_init_arrays: bool = false;
+/// An object for other links (--emit=obj).
+pub let mut g_object_output: bool = false;
+/// --c-lib=system: the system's C library and headers.
+pub let mut g_system_c_lib: bool = false;
+
+let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
+let mut VS: *mut VlaState = @ptr_from_int(*mut VlaState, 0);
+let mut VA: VaState = VaState.{ p: @ptr_from_int(*mut abi.Plan, 0), f: @ptr_from_int(*mut ir.Func, 0), on: false,
+                                save: @ptr_from_int(*mut ir.Value, 0), args: @ptr_from_int(*mut ir.Value, 0),
+                                from: @ptr_from_int(*mut ir.Value, 0) };
+
+let mut known01: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut known01_fn: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut fp_state: u32 = 0;
+let mut fp_slot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut fp_dslot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+let mut g_pools: u.SymMap.[*mut Pool] = u.SymMap.[*mut Pool].{ keys: @ptr_from_int(*mut usize, 0),
+                                                               vals: @ptr_from_int(*mut *mut Pool, 0), cap: 0, len: 0 };
+let mut g_entries: u.SymMap.[*mut ir.Func] = u.SymMap.[*mut ir.Func].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Func, 0),
+                                                                       cap: 0, len: 0 };
+let mut g_sites: u.List.[NestSite] = u.List.[NestSite].{ data: @ptr_from_int(*mut NestSite, 0), len: 0, cap: 0 };
+let mut g_labels: u.SymMap.[*mut void] = u.SymMap.[*mut void].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                vals: @ptr_from_int(*mut *mut void, 0), cap: 0,
+                                                                len: 0 };
+let mut g_hooks: u.List.[NestHook] = u.List.[NestHook].{ data: @ptr_from_int(*mut NestHook, 0), len: 0, cap: 0 };
+let mut g_hook_jb: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut g_pending: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+let mut g_scope: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                       cap: 0, len: 0 };
+let mut g_num: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                 cap: 0, len: 0 };
+let mut g_objs: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0), len: 0,
+                                                                    cap: 0 };
+let mut g_file: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0), len: 0,
+                                                                    cap: 0 };
+let mut g_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut g_addr: bool = false;
+let mut g_scopes: u32 = 0;
+let mut g_lscopes: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                     cap: 0 };
+let mut g_body: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+let mut flow_signed: bool = false;
+let mut flow_bits: i32 = 64;
+
+let mut pure_keys: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut simd_keys: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+let mut g_wfmt_t: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);
+
+let mut ld_consts: u.List.[LdConst] = u.List.[LdConst].{ data: @ptr_from_int(*mut LdConst, 0), len: 0, cap: 0 };
+let mut ld_consts_m: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+
+let mut wint_consts: u.List.[WintConst] = u.List.[WintConst].{ data: @ptr_from_int(*mut WintConst, 0), len: 0, cap: 0 };
+let mut wint_consts_m: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+
+let mut sj_sites: u.List.[SjSite] = u.List.[SjSite].{ data: @ptr_from_int(*mut SjSite, 0), len: 0, cap: 0 };
+
+// -----------------------------------------------------------------------------
+// Shared core helpers
+// -----------------------------------------------------------------------------
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn no_vals() []mut *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](1);
+    return xs[0..0];
+}
+
 /// The alignment of object s: its type's, or an alignment specifier's if stricter.
 pub fn object_align(s: *cast.CSym) u64 {
     let a = cty.align_of(s.ty);
@@ -196,15 +324,6 @@ pub fn object_align(s: *cast.CSym) u64 {
     }
     return a;
 }
-
-// The names of the C units' functions in the module (1), which the units
-// share.
-let mut c_functions: u.SymMap.[i32] = u.SymMap.[i32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
-
-let mut strings: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                       vals: @ptr_from_int(*mut *mut ir.Value, 0),
-                                                                       cap: 0, len: 0 };
 
 fn internal_error(msg: []u8) void {
     u.die(u.cat2("internal compiler error (C front end): ", msg));
@@ -403,880 +522,6 @@ pub fn mark_func(f: *mut ir.Func, p: *abi.Plan) void {
 }
 
 // -----------------------------------------------------------------------------
-// Symbols
-// -----------------------------------------------------------------------------
-
-let DARWIN_INODE64: [16][]u8 = ["stat", "lstat", "fstat", "fstatat", "statfs", "fstatfs", "getfsstat", "opendir",
-                                "fdopendir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir", "scandir",
-                                "alphasort"];
-
-fn is_darwin_inode64(n: []u8) bool {
-    for f in DARWIN_INODE64 {
-        if u.str_eq(f, n) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// The symbol name of an entity: its own with external linkage (main's is
-// MAIN_SYMBOL), else made unique.
-pub fn symbol_name(s: *cast.CSym) []u8 {
-    if (s.linkage == cast.LK_EXTERNAL) and not ((s.kind == cast.SK_FUNC) and csm.is_inline_def(s)) {
-        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") and (g_obj_main.len > 0) and not g_obj_main_start {
-            return g_obj_main;  // (an object's main: cc.ax, set_object_main)
-        }
-        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") {
-            return MAIN_SYMBOL;
-        }
-        if s.asm_name.len > 0 {
-            if tg.is_darwin() {
-                // On Darwin __USER_LABEL_PREFIX__ is "_", so system headers
-                // write asm("_fopen") or asm("_fopen$DARWIN_EXTSN"). Strip a
-                // plain leading '_' so it matches unsuffixed C declarations,
-                // mark suffixed "_foo$..." names with '\x01' so macho.ax and
-                // mlink.ax emit them verbatim, and leave unprefixed names to
-                // normal Mach-O '_' mangling.
-                if s.asm_name[0] == 1 {
-                    return s.asm_name;
-                }
-                if (s.asm_name.len > 1) and (s.asm_name[0] == '_') {
-                    if (u.find(s.asm_name, '$') < 0) and
-                       not ((tg.g_arch == tg.ARCH_X64) and is_darwin_inode64(s.asm_name[1..])) {
-                        return s.asm_name[1..];
-                    }
-                    return u.cat2("\x01", s.asm_name);
-                }
-            }
-            return s.asm_name;  // (a GNU dialect's asm label)
-        }
-        return s.name;
-    }
-    return u.f2("%s.%s", s.name, u.idec(s.uid));
-}
-
-/// The parameter types of function s's IR signature: its definition's
-/// parameters (promoted, for a definition with an identifier list: the
-/// arguments arrive so), or its type's (a declaration with a prototype).
-pub fn param_types(s: *mut cast.CSym) []mut *mut cty.CType {
-    if u.notnil(s.def) {
-        let dt = s.def.decls.get(0).ty;
-        let kr = u.notnil(dt) and (dt.kind == cty.TK_FUNCTION) and dt.kr;
-        let n = s.params.len;
-        let ts = u.newn.[*mut cty.CType](n + 1);
-        for i in 0..n {
-            ts[i] = cty.unqual(s.params.get(i).ty);
-            if kr {
-                ts[i] = cty.arg_promote(ts[i]);
-            }
-        }
-        return ts[0..n];
-    }
-    return s.ty.params;
-}
-
-/// Function s's signature (nil ty: a function without a prototype that is
-/// not defined, whose signature comes from its calls).
-pub fn func_sig(s: *mut cast.CSym) Sig {
-    if not s.ty.proto and u.isnil(s.def) {
-        return Sig.{ ty: u.nil.[ir.Ty](), plan: u.nil.[abi.Plan]() };
-    }
-    let ps = param_types(s);
-    if u.notnil(s.nest_parent) {
-        // (a nested function: its chain after its arguments, cgen_nest.ax;
-        // a variadic one's IR function takes, before it, the address of its
-        // entry's va_list instead of variable arguments)
-        let mut sig = sig_of(s.ty.ret, ps, ps.len, false, u.notnil(s.def));
-        if s.ty.variadic {
-            let ps2 = u.newn.[*mut cty.CType](ps.len + 2);
-            for i in 0..ps.len {
-                ps2[i] = ps[i];
-            }
-            ps2[ps.len] = cty.pointer_to(cty.t_void);
-            sig = sig_of(s.ty.ret, ps2[0..ps.len + 1], ps.len + 1, false, u.notnil(s.def));
-        }
-        abi.add_chain(sig.plan);
-        return Sig.{ ty: sig.plan.fty, plan: sig.plan };
-    }
-    return sig_of(s.ty.ret, ps, ps.len, s.ty.variadic, u.notnil(s.def));
-}
-
-/// The IR function of C function s; `sig`: the signature to declare it
-/// with if it has none of its own (a call's, without a prototype).
-pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
-    if not u.isvnil(s.ir) {
-        return @ptr_cast(*mut ir.Func, s.ir);
-    }
-    let target = alias_target(s);
-    if u.notnil(target) {
-        let tf = func_of(target, sig0);
-        s.ir = @ptr_cast(*mut void, tf);
-        return tf;
-    }
-    let mut sig = func_sig(s);
-    if u.isnil(sig.ty) {
-        sig = sig0;
-    }
-    if u.isnil(sig.ty) {
-        // (the address of a function without a prototype that this unit
-        // neither defines nor has called yet: a declaration of no
-        // parameters; a call converts, as through any function pointer)
-        sig = Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), plan: u.nil.[abi.Plan]() };
-    }
-    let name = symbol_name(s);
-    let mut f = ir.get_function(M, name);
-    if u.notnil(f) and not ir.is_decl(f) and (c_functions.get(u.intern(name)) == 0) {
-        if u.notnil(s.def) or (s.linkage != cast.LK_EXTERNAL) {
-            _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
-            f = u.nil.[ir.Func]();
-        } else {
-            // a function C declares and Axiom code defines (an `export fn`,
-            // docs/c.md "C and Axiom in one program"): calls are to it, with
-            // the C signature, which the boundary types make the same ABI
-            s.ir = @ptr_cast(*mut void, f);
-            return f;
-        }
-    }
-    // (another unit's function of the same name is the same: cc.ax has
-    // checked that only one unit defines it)
-    c_functions.put(u.intern(name), 1);
-    if (tg.g_debug != tg.DEBUG_NONE) and not u.str_eq(name, s.name) {
-        dbi.note_func_name(name, s.name);
-    }
-    if u.isnil(f) {
-        f = ir.add_function(M, name, sig.ty);
-    } else if u.notnil(s.def) and ir.is_decl(f) {
-        // a declaration (another unit's, or an Axiom extern "C" one) of the
-        // function this unit defines: the definition's signature, whose
-        // parameters may differ (a variadic definition's save area)
-        ir.retype_decl(f, sig.ty);
-        f.import_module = u.nosym();
-        f.import_name = u.nosym();
-    } else if ir.is_decl(f) {
-        // (another declaration: a function already defined keeps its own)
-        ir.retype_decl(f, sig.ty);
-    }
-    cdbg.note_func(f, s);
-    if (s.linkage != cast.LK_EXTERNAL) or csm.is_inline_def(s) {
-        // (an inline definition is for this unit only: 6.7.4p7)
-        f.linkage = ir.LINK_INTERNAL;
-    }
-    if u.str_eq(name, MAIN_SYMBOL) {
-        f.linkage = ir.LINK_INTERNAL;
-    } else if s.weak and u.notnil(s.def) and (f.linkage != ir.LINK_INTERNAL) {
-        f.linkage = ir.LINK_WEAK;  // (kept: no unit has another definition; an object's users may)
-    }
-    if u.notnil(sig.plan) and (ir.is_decl(f) or u.notnil(s.def)) {
-        mark_func(f, sig.plan);
-    }
-    if u.isnil(s.def) and is_wasm and (s.linkage == cast.LK_EXTERNAL) and not s.weak {
-        // a function the program does not define: the host's (not a weak
-        // reference's, which is null when nothing defines it: wlink.ax)
-        f.import_module = "env";
-        f.import_name = name;
-    }
-    gnu_func(s, f);
-    if u.notnil(sig.plan) {
-        alloc_facts(s, f, sig.plan);
-    }
-    if u.isnil(s.def) and (s.linkage == cast.LK_EXTERNAL) and tg.is_windows() {
-        c_library_import(name);
-    }
-    s.ir = @ptr_cast(*mut void, f);
-    return f;
-}
-
-/// On Windows, a function C code declares and no unit defines is the C
-/// library's (or a system DLL's, by its name): the linker reads a constant
-/// axiom.import.<name> holding "c" (cmd/axiom/src/plink.ax). A unit that
-/// defines the function makes the constant unused.
-pub fn c_library_import(name: []u8) void {
-    let gname = u.cat2("axiom.import.", name);
-    if u.notnil(ir.get_global(M, gname)) {
-        return;
-    }
-    let g = ir.add_global(M, ir.t_array(T_i8, 2), gname);
-    g.init = ir.cstring("c");
-    g.linkage = ir.LINK_LINKONCE;
-    g.is_const = true;
-    g.align = 1;
-}
-
-/// Does the program (a unit: cc.ax sets it) define the external name?
-pub let mut defined_here: fn([]u8) bool = nothing_defined;
-
-fn nothing_defined(name: []u8) bool {
-    _ = name;
-    return false;
-}
-
-/// Is object s one of a DLL's (Windows): external, and defined by no unit?
-/// Code reaches it through its import address table slot, as through a
-/// GOT (an external global's address is loaded: x64.ax), which plink.ax
-/// fills with the address of the DLL's object; c_library_import names the
-/// DLL (the C library's, or a system DLL's by the name's rules).
-pub fn dll_object(s: *cast.CSym) bool {
-    return tg.is_windows() and (s.linkage == cast.LK_EXTERNAL) and not defined_here(s.name);
-}
-
-/// The address of object s (with static storage duration).
-pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
-    if not u.isvnil(s.ir) {
-        return @ptr_cast(*mut ir.Value, s.ir);
-    }
-    let target = alias_target(s);
-    if u.notnil(target) {
-        let tv = object_addr(target);
-        s.ir = @ptr_cast(*mut void, tv);
-        return tv;
-    }
-    let name = symbol_name(s);
-    let mut g = ir.get_global(M, name);
-    if u.isnil(g) {
-        g = ir.add_global(M, lty(s.ty), name);
-    }
-    if dll_object(s) {
-        c_library_import(name);
-    }
-    g.align = object_align(s);
-    if s.linkage != cast.LK_EXTERNAL {
-        g.linkage = ir.LINK_INTERNAL;
-    } else if s.weak and s.defined {
-        g.linkage = ir.LINK_WEAK;  // (as a function's: func_of)
-    }
-    if ((s.flags & cast.CF_THREAD_LOCAL) != 0) and not is_wasm {
-        // (thread storage duration: on WebAssembly, cgen_tls.ax)
-        g.tls = true;
-    }
-    let n = cgn.note_of(s);
-    if u.notnil(n) {
-        if n.weak and (s.linkage == cast.LK_EXTERNAL) and not s.defined and not defined_here(s.name) {
-            g.linkage = ir.LINK_EXTWEAK;  // a weak reference: no unit defines it (a weak definition: s.weak)
-        }
-        if n.section.len > 0 {
-            g.section = u.perm_dup(n.section);  // (the syntax tree is given back before code generation)
-            if u.starts(n.section, ".init_array") or u.starts(n.section, ".fini_array") or
-               u.starts(n.section, ".preinit_array") or u.contains(n.section, "__mod_init_func") or
-               u.contains(n.section, "__mod_term_func") {
-                g_init_arrays = true;
-            }
-        }
-        g.visibility = @truncate(u8, @bit_cast(u32, n.visibility));  // (for the object writers)
-        if n.used and s.defined {
-            keep(g.val);
-        }
-    }
-    s.ir = @ptr_cast(*mut void, g.val);
-    return g.val;
-}
-
-// -----------------------------------------------------------------------------
-// The GNU dialects' attributes of functions and objects (csema_gnu.ax)
-// -----------------------------------------------------------------------------
-
-// The entities the unit defines, by name, for the targets of aliases.
-let mut g_defs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                        vals: @ptr_from_int(*mut *mut cast.CSym, 0),
-                                                                        cap: 0, len: 0 };
-
-// The entity s is another name for (alias("target")), or nil. The target
-// is defined in the same unit (else C3090); references to s are to it, and
-// s has no symbol of its own.
-fn alias_target(s: *mut cast.CSym) *mut cast.CSym {
-    let n = cgn.note_of(s);
-    if u.isnil(n) or (n.alias.len == 0) {
-        return u.nil.[cast.CSym]();
-    }
-    let t = g_defs.get(n.alias);
-    if u.isnil(t) or (t == s) or (t.kind != s.kind) {
-        _ = dg.err(n.alias_span, "C3090",
-                   u.f1("the target of the alias, '%s', is not a function or object of the same kind defined in this translation unit",
-                        n.alias));
-        n.alias = "";
-        return u.nil.[cast.CSym]();
-    }
-    return t;
-}
-
-// An alias of external linkage (the attribute alias, a GNU dialect) is a
-// symbol of its own at its target's place, which other units' references to
-// its name are references to (ir.Alias).
-fn note_alias(s: *mut cast.CSym) void {
-    let n = cgn.note_of(s);
-    if u.notnil(n) and (n.ifunc.len > 0) {
-        note_ifunc(s, n);
-        return;
-    }
-    if u.isnil(n) or (n.alias.len == 0) or (s.linkage != cast.LK_EXTERNAL) {
-        return;
-    }
-    let mut tv = u.nil.[ir.Value]();
-    if s.kind == cast.SK_FUNC {
-        tv = func_of(s, func_sig(s)).val;
-    } else {
-        tv = object_addr(s);
-    }
-    if n.alias.len > 0 {
-        ir.add_alias(M, symbol_name(s), tv, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
-    }
-}
-
-// An indirect function (the attribute ifunc): its name is a symbol of
-// type STT_GNU_IFUNC at its resolver, a function the unit defines (else
-// C3090), whose result the linker's start-up or the dynamic linker makes
-// the function's address (ir.Alias.ifunc); calls and addresses are the
-// name's, which the function's declaration stays.
-fn note_ifunc(s: *mut cast.CSym, n: *mut cgn.Note) void {
-    let t = g_defs.get(n.ifunc);
-    if u.isnil(t) or (t == s) or (t.kind != cast.SK_FUNC) or u.isnil(t.def) {
-        _ = dg.err(n.alias_span, "C3090",
-                   u.f1("the resolver of the indirect function, '%s', is not a function defined in this translation unit",
-                        n.ifunc));
-        return;
-    }
-    if u.notnil(s.def) {
-        _ = dg.err(n.alias_span, "C3090", u.f1("the indirect function '%s' has a body: its resolver is its definition",
-                                               s.name));
-        return;
-    }
-    let tf = func_of(t, func_sig(t));
-    ir.add_ifunc(M, symbol_name(s), tf.val, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
-}
-
-// The IR function f of C function s: what its GNU attributes ask, and
-// C23's unsequenced and reproducible (catr.fx_of).
-fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
-    let mut fx = catr.fx_of(s);
-    let n = cgn.note_of(s);
-    // const and pure: ir.Func.fx, the promise of a function that returns
-    // (not one declared not to: catr.is_noreturn, which ir.call_fx would
-    // see only once the IR's noreturn is set)
-    if u.notnil(n) and not catr.is_noreturn(s) {
-        if n.is_const {
-            fx = ir.FX_NONE;
-        } else if n.is_pure and (fx == ir.FX_ANY) {
-            fx = ir.FX_READS;
-        }
-    }
-    f.fx = @max(f.fx, fx_by_abi(s.ty, fx));
-    if u.isnil(n) {
-        return;
-    }
-    if n.noinline {
-        f.noinline = true;
-    }
-    if n.always_inline {
-        f.always_inline = true;
-    }
-    if n.cold {
-        f.cold = true;
-    }
-    if n.hot {
-        f.hot = true;
-    }
-    if n.opt_level >= 0 {
-        f.opt_override = @truncate(u8, @bit_cast(u32, n.opt_level + 1));
-    }
-    if n.target.len > 0 {
-        // (the target's extensions and these: the backends compile it so,
-        // and the inliner does not put it into code compiled for less)
-        f.features = tg.fn_features(f) | tg.parse_features(n.target).bits;
-        f.has_features = true;
-    }
-    if n.section.len > 0 {
-        f.section = u.perm_dup(n.section);  // (for the object writers; the syntax tree is given back first)
-    }
-    if n.aligned > 1 {
-        f.align = n.aligned;  // (the backends start its code there)
-    }
-    f.visibility = @truncate(u8, @bit_cast(u32, n.visibility));
-    if n.weak and (s.linkage == cast.LK_EXTERNAL) and u.isnil(s.def) and ir.is_decl(f) and not defined_here(s.name) {
-        f.linkage = ir.LINK_EXTWEAK;  // a weak reference: no unit defines it (a weak definition: s.weak, func_of)
-    }
-    if n.used and u.notnil(s.def) {
-        keep(f.val);
-    }
-}
-
-// What a call of a function of type t may be said to do (fx, ir.FX_) as the
-// platforms' calling conventions pass it: nothing for a result that is not
-// a plain scalar (a structure, union, complex or long double result may be
-// written to the caller's memory through an address that is an ordinary
-// argument in the IR, which ir.call_fx cannot tell from others); FX_READS at
-// most when a parameter is not one (it may be passed as the address of a
-// copy, which the callee reads).
-fn fx_by_abi(t: *cty.CType, fx: u8) u8 {
-    if (fx == ir.FX_ANY) or u.isnil(t) or not cty.is_func(t) or not plain_scalar(t.ret) {
-        return ir.FX_ANY;
-    }
-    for p in t.params {
-        if not plain_scalar(p) {
-            return @min(fx, ir.FX_READS);
-        }
-    }
-    return fx;
-}
-
-// An integer (no wider than 64 bits), a pointer, float or double.
-fn plain_scalar(t0: *cty.CType) bool {
-    let t = t0.unq;
-    if cty.is_pointer(t) {
-        return true;
-    }
-    if cty.is_integer(t) {
-        return cty.size_of(t) <= 8;
-    }
-    return (t == cty.t_float) or (t == cty.t_double);
-}
-
-// The IR parameter of C parameter k (from 1) of a call by plan, or -1
-// (one not passed as one scalar).
-fn ir_param(plan: *abi.Plan, k: i32) i32 {
-    if (k < 1) or (@int_cast(usize, k) > plan.args.len) {
-        return -1;
-    }
-    let a = plan.args[@int_cast(usize, k - 1)];
-    if a.kind != abi.A_SCALAR {
-        return -1;
-    }
-    return a.slot[0];
-}
-
-// What returns_nonnull, malloc, alloc_size, alloc_align and assume_aligned
-// say of function s's results (ir.Func's ret_nonnull, allocator, size_args,
-// align_arg, ret_align), for a result that is a pointer in a register.
-fn alloc_facts(s: *mut cast.CSym, f: *mut ir.Func, plan: *abi.Plan) void {
-    let n = cgn.note_of(s);
-    if u.isnil(n) or (f.ty.ret.kind != ir.T_PTR) or (f.ret_ext != 0) {
-        return;
-    }
-    if n.ret_nonnull and not cs.opts().keep_null_checks {
-        f.ret_nonnull = true;
-    }
-    if n.malloc {
-        f.allocator = true;  // (gvn.fresh: an object of its own)
-    }
-    if n.alloc_size[0] > 0 {
-        let a = ir_param(plan, n.alloc_size[0]);
-        let mut b: i32 = 0;
-        if n.alloc_size[1] > 0 {
-            b = ir_param(plan, n.alloc_size[1]);
-        }
-        if (a >= 0) and (a < 127) and (b >= 0) and (b < 127) {
-            let mut second: i32 = 0;
-            if n.alloc_size[1] > 0 {
-                second = b + 1;
-            }
-            f.size_args = [@truncate(i8, a + 1), @truncate(i8, second)];
-        }
-    }
-    if n.alloc_align > 0 {
-        let a = ir_param(plan, n.alloc_align);
-        if (a >= 0) and (a < 127) {
-            f.align_arg = @truncate(i8, a + 1);
-        }
-    }
-    if n.assume_aligned > 0 {
-        f.ret_align = n.assume_aligned;
-    }
-}
-
-let mut g_kept: i32 = 0;
-
-// Keeps the function or object at address v though nothing refers to it
-// (the attribute used): a constant holding its address refers to it.
-/// Keeps v (a function or object) in the program though no code refers to it.
-pub fn keep(v: *mut ir.Value) void {
-    g_kept += 1;
-    let g = ir.add_global(M, T_ptr, u.f1("axiom.c.used.%s", u.idec(g_kept)));
-    g.init = v;
-    g.linkage = ir.LINK_INTERNAL;
-    g.is_const = true;
-    g.align = cty.ptr_bytes;
-}
-
-/// The address of string literal e (its array, NUL-terminated).
-pub fn string_addr(e: *mut cast.Expr) *mut ir.Value {
-    let key = u.addr_key(@int_from_ptr(e));
-    let found = strings.get(key);
-    if u.notnil(found) {
-        return found;
-    }
-    let el = e.ty.elem;
-    let units = e.tok.units;
-    let mut init = ir.vnil();
-    if cty.size_of(el) == 1 {
-        let bs = u.newn.[u8](units.len + 1);
-        for i in 0..units.len {
-            bs[i] = @truncate(u8, units[i]);
-        }
-        init = ir.cstring(bs[0..units.len]);
-    } else {
-        let et = lty(el);
-        let xs = u.newn.[*mut ir.Value](units.len + 2);
-        for i in 0..units.len {
-            xs[i] = ir.cint(et, @as(u64, units[i]));
-        }
-        xs[units.len] = ir.cint(et, 0);
-        init = ir.carray(et, xs[0..units.len + 1]);
-    }
-    let g = ir.add_global(M, init.ty, ".str");
-    g.init = init;
-    g.linkage = ir.LINK_INTERNAL;
-    g.is_const = true;
-    g.align = cty.align_of(el);
-    strings.put(key, g.val);
-    return g.val;
-}
-
-// -----------------------------------------------------------------------------
-// Data: the initial values of objects with static storage duration
-// -----------------------------------------------------------------------------
-
-// An address in an object's data.
-struct Reloc {
-    off: u64,
-    v: *mut ir.Value,  // a global's or function's address, with its addend
-}
-
-struct Image {
-    bytes: []mut u8,
-    relocs: u.List.[Reloc],
-    reloc_end: u64,  // the end of the furthest address so far: an item before it may override one
-}
-
-// An item at off of size bytes overrides what was there before it
-// (csema_desig.ax keeps a later item for the same subobject after the
-// earlier one): the addresses it covers go.
-fn drop_relocs(im: *mut Image, off: u64, size: u64) void {
-    if off >= im.reloc_end {
-        return;
-    }
-    let ps = cty.size_of(cty.t_size);
-    let rs = im.relocs.items_mut();
-    let mut j: usize = 0;
-    for i in 0..rs.len {
-        let r = rs[i];
-        if (r.off < off + size) and (off < r.off + ps) {
-            continue;
-        }
-        rs[j] = r;
-        j += 1;
-    }
-    im.relocs.len = j;
-}
-
-fn put_le(im: *mut Image, off: u64, v: u64, n: u64) void {
-    for i in 0..n {
-        let at = @truncate(usize, off + i);
-        if at < im.bytes.len {
-            im.bytes[at] = @truncate(u8, v >> @truncate(u32, i * 8));
-        }
-    }
-}
-
-// Writes value v of bit-field m into the bytes of its unit at off
-// (little-endian), keeping the other bits (bit by bit: a packed
-// structure's run may span 9 bytes, csema_bits.is_run).
-fn put_bits(im: *mut Image, off: u64, m: *cty.Member, v: u64) void {
-    let base = (off * 8) + @as(u64, @bit_cast(u32, m.bit_off));
-    for k in @as(u64, 0)..@as(u64, @bit_cast(u32, m.bit_width)) {
-        let bit = (v >> @truncate(u32, k)) & 1;
-        let at = @truncate(usize, (base + k) / 8);
-        if at < im.bytes.len {
-            let sh = @truncate(u32, (base + k) % 8);
-            im.bytes[at] = (im.bytes[at] & ~(@as(u8, 1) << sh)) | (@truncate(u8, bit) << sh);
-        }
-    }
-}
-
-// The address constant a as an IR constant (a global or function's
-// address with an addend), or nil for a plain integer.
-fn addr_value(a: cc.Addr) *mut ir.Value {
-    let mut base = ir.vnil();
-    if u.notnil(a.sym) and (a.sym.kind == cast.SK_LABEL) {
-        return label_address(a.sym);
-    }
-    if u.notnil(a.sym) {
-        if a.sym.kind == cast.SK_FUNC {
-            base = func_of(a.sym, func_sig(a.sym)).val;
-        } else {
-            base = object_addr(a.sym);
-        }
-    } else if u.notnil(a.str) {
-        base = string_addr(a.str);
-    } else {
-        return ir.vnil();
-    }
-    if a.off == 0 {
-        return base;
-    }
-    if base.kind == ir.V_FUNC {
-        return base;  // (a function's address plus an offset: meaningless; the function)
-    }
-    return ir.cgaddr(ir.gv_of(base), a.off);
-}
-
-// Writes the value f of real floating type t at off.
-fn put_float(im: *mut Image, off: u64, t: *cty.CType, f: f64) void {
-    let w = cty.ffmt(t);
-    if cty.is_bf16(t) {
-        put_le(im, off, ld.b_from_f64(@bit_cast(u64, f)), 2);  // (f is a bfloat16 value: exact)
-        return;
-    }
-    if w == 32 {
-        put_le(im, off, @as(u64, ir.f32_bits(f)), 4);  // (a NaN's bits kept: FLT_SNAN)
-    } else if w == 16 {
-        let b = @bit_cast(u64, f);
-        if ((((b >> 52) & 0x7FF) == 0x7FF) and ((b << 12) != 0)) and (((b >> 51) & 1) == 0) {
-            put_le(im, off, ((b >> 48) & 0x8000) | 0x7D00, 2);  // (a signaling NaN: FLT16_SNAN)
-        } else {
-            put_le(im, off, ld.h_from_f64(b), 2);  // (f is a binary16 value: exact)
-        }
-    } else {
-        put_le(im, off, @bit_cast(u64, f), 8);
-    }
-}
-
-// Writes item it's value into the image.
-fn put_item(im: *mut Image, it: *mut cast.InitItem) void {
-    let t = it.ty;
-    let e = it.e;
-    let size = cty.size_of(t);
-    drop_relocs(im, it.off, size);
-    if u.isnil(e) {
-        for i in 0..size {
-            put_le(im, it.off + i, 0, 1);
-        }
-        return;
-    }
-    if t.kind == cty.TK_ARRAY {
-        // a string literal
-        let es = cty.size_of(t.elem);
-        let us = e.tok.units;
-        let mut n = @as(u64, us.len);
-        if n > t.len {
-            n = t.len;
-        }
-        for i in 0..n {
-            put_le(im, it.off + (i * es), @as(u64, us[@truncate(usize, i)]), es);
-        }
-        return;
-    }
-    if cty.is_wide(t) {
-        let bs = cl.bytes(e.xv);
-        for i in @as(usize, 0)..16 {
-            put_le(im, it.off + @as(u64, i), @as(u64, bs[i]), 1);
-        }
-        return;
-    }
-    if cty.is_decimal(t) {
-        let bs = cdec.bytes(e);
-        for i in @as(u64, 0)..size {
-            put_le(im, it.off + i, @as(u64, bs[@truncate(usize, i)]), 1);
-        }
-        return;
-    }
-    if cty.is_floating(t) {
-        put_float(im, it.off, t, e.fcval);
-        return;
-    }
-    if cty.is_imaginary(t) {
-        put_float(im, it.off, t.unq.elem, e.fcval);  // (its coefficient)
-        return;
-    }
-    if cty.is_complex(t) and cty.is_wide(t.elem) {
-        let bre = cl.bytes(e.xv);
-        let bim = cl.bytes(e.xvim);
-        for i in @as(usize, 0)..16 {
-            put_le(im, it.off + @as(u64, i), @as(u64, bre[i]), 1);
-            put_le(im, it.off + 16 + @as(u64, i), @as(u64, bim[i]), 1);
-        }
-        return;
-    }
-    if cty.is_complex(t) and cty.is_integer(t.elem) {
-        let n = cty.size_of(t.elem);
-        put_le(im, it.off, e.cval, n);  // (an integer complex value's parts)
-        put_le(im, it.off + n, e.cimag, n);
-        return;
-    }
-    if cty.is_complex(t) {
-        put_float(im, it.off, t.elem, e.fcval);
-        put_float(im, it.off + cty.size_of(t.elem), t.elem, e.fcimag);
-        return;
-    }
-    if cty.is_wint(t) and e.is_const and u.notnil(it.bits) {
-        // (a bit-field: its bits, from the unit's bit_off, csema_bits.ax)
-        let m = it.bits;
-        let v = cw.value(e, cty.limbs(t));
-        let base = (it.off * 8) + @as(u64, @bit_cast(u32, m.bit_off));
-        for k in @as(u64, 0)..@as(u64, @bit_cast(u32, m.bit_width)) {
-            let bit = (v[@truncate(usize, k / 64)] >> @truncate(u32, k % 64)) & 1;
-            let at = @truncate(usize, (base + k) / 8);
-            if at < im.bytes.len {
-                let sh = @truncate(u32, (base + k) % 8);
-                im.bytes[at] = (im.bytes[at] & ~(@as(u8, 1) << sh)) | (@truncate(u8, bit) << sh);
-            }
-        }
-        return;
-    }
-    if cty.is_wint(t) and e.is_const {
-        let v = cw.value(e, cty.limbs(t));
-        for k in 0..v.len {
-            put_le(im, it.off + (@as(u64, k) * 8), v[k], 8);
-        }
-        return;
-    }
-    if cty.is_integer(t) and e.is_const {
-        if u.notnil(it.bits) {
-            put_bits(im, it.off, it.bits, e.cval);
-            return;
-        }
-        put_le(im, it.off, e.cval, size);
-        return;
-    }
-    let a = cc.address(e);
-    if u.notnil(a.sym) and (a.sym.kind != cast.SK_FUNC) and dll_object(a.sym) {
-        // (code reads its address from the import address table; data
-        // cannot hold it, and the image has no relocation for it)
-        _ = dg.err(e.span, "C3067",
-                   u.f1("the address of '%s', an object of a DLL, is not an address constant (on Windows the program finds it when it runs)",
-                        a.sym.name));
-    }
-    let v = addr_value(a);
-    if u.isnil(v) {
-        put_le(im, it.off, a.off, size);
-        return;
-    }
-    im.relocs.push(Reloc.{ off: it.off, v: v });
-    if it.off + size > im.reloc_end {
-        im.reloc_end = it.off + size;
-    }
-}
-
-fn byte_run(bs: []mut u8) *mut ir.Value {
-    let mut zero = true;
-    for b in bs {
-        if b != 0 {
-            zero = false;
-        }
-    }
-    if zero {
-        return ir.czero(ir.t_array(T_i8, @as(u64, bs.len)));
-    }
-    let xs = u.newn.[*mut ir.Value](bs.len + 1);
-    for i in 0..bs.len {
-        xs[i] = ir.cint(T_i8, @as(u64, bs[i]));
-    }
-    return ir.carray(T_i8, xs[0..bs.len]);
-}
-
-// The IR constant of object s's initial value: runs of bytes and the
-// addresses between them.
-fn initial_value(s: *mut cast.CSym) *mut ir.Value {
-    let mut size = cty.size_of(s.ty);
-    if u.notnil(s.init) and (s.init.size > size) {
-        size = s.init.size;  // (a GNU dialect: a flexible array member initialized)
-    }
-    let im = u.new.[Image]();
-    im.bytes = u.newn.[u8](@truncate(usize, size) + 1)[0..@truncate(usize, size)];
-    @mem_set(im.bytes, 0);
-    if u.notnil(s.init) {
-        for k in 0..s.init.items.len {
-            put_item(im, s.init.items.at_mut(k));
-        }
-    }
-    let rs = im.relocs.items_mut();
-    if rs.len == 0 {
-        if u.isnil(s.init) or (s.init.items.len == 0) {
-            return ir.czero(ir.t_array(T_i8, size));
-        }
-    }
-    // relocations in order of offset
-    let n = rs.len;
-    for i in 1..n {
-        let mut j = i;
-        while (j > 0) and (rs[j - 1].off > rs[j].off) {
-            let x = rs[j];
-            rs[j] = rs[j - 1];
-            rs[j - 1] = x;
-            j -= 1;
-        }
-    }
-    let mut parts = u.List.[*mut ir.Value].empty();
-    let mut at: u64 = 0;
-    let mut packed = false;
-    for r in rs {
-        if (r.off % cty.ptr_bytes) != 0 {
-            // (an address a packed structure, or #pragma pack, puts at an
-            // offset that does not align it: the parts without padding)
-            packed = true;
-        }
-        if r.off > at {
-            parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, r.off)]));
-        }
-        parts.push(r.v);
-        at = r.off + cty.ptr_bytes;
-    }
-    if at < size {
-        parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, size)]));
-    }
-    if packed {
-        return ir.cstruct_packed(parts.items_mut());
-    }
-    return ir.cstruct(parts.items_mut());
-}
-
-fn define_object(s: *mut cast.CSym) void {
-    let n = cgn.note_of(s);
-    if u.notnil(n) and (n.alias.len > 0) {
-        return;  // (another name for an object defined in the unit)
-    }
-    let g = ir.gv_of(object_addr(s));
-    cdbg.note_static(u.nil.[ir.Func](), s, g);
-    let init = initial_value(s);
-    g.ty = init.ty;
-    g.init = init;
-    g.align = object_align(s);
-    // an object defined with a const-qualified type, nothing in it volatile
-    // or atomic: read-only, its value never changes (6.7.3p6: modifying it is
-    // undefined), so the optimizer may read it where it is loaded
-    if read_only_type(s.ty) and not g.tls and (g.section.len == 0) {
-        g.is_const = true;
-    }
-}
-
-// Is t a const-qualified type (an array of such elements) with no volatile
-// or atomic part?
-fn read_only_type(t0: *mut cty.CType) bool {
-    let mut t = t0;
-    let mut c = (t.quals & cty.Q_CONST) != 0;
-    while t.kind == cty.TK_ARRAY {
-        t = t.elem;
-        c = c or ((t.quals & cty.Q_CONST) != 0);
-    }
-    return c and not volatile_part(t0, 0);
-}
-
-// Has t a volatile or atomic part (itself, an element, a member)?
-fn volatile_part(t: *mut cty.CType, depth: i32) bool {
-    if ((t.quals & (cty.Q_VOLATILE | cty.Q_ATOMIC)) != 0) or (depth > 32) {
-        return true;
-    }
-    if t.kind == cty.TK_ARRAY {
-        return volatile_part(t.elem, depth + 1);
-    }
-    if ((t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION)) and u.notnil(t.tag) {
-        for m in t.tag.members.items() {
-            if volatile_part(m.ty, depth + 1) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// -----------------------------------------------------------------------------
 // Functions: helpers for the code of one
 // -----------------------------------------------------------------------------
 
@@ -1442,27 +687,23 @@ pub fn label_address_code(l: *mut cast.CSym) *mut ir.Value {
     return ir.ptradd(B, t, ir.cint(T_isz, l.value));
 }
 
-// The constructors and destructors of the program's units (the attributes
-// constructor and destructor, a GNU dialect), in the order they are
-// generated: the start-up calls them around main.
-let mut g_ctors: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0),
-                                                                     len: 0, cap: 0 };
-
 /// Generates unit cu into module m (wasm: for a WebAssembly target): its
-/// objects and functions. False after an error (reported). The units of a
-/// program are generated in turn, then the start-up (generate_start).
+/// objects, functions, and top-level assembly. False after an error (reported).
+/// The units of a program are generated in turn, then the start-up
+/// (generate_start).
 pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     M = m;
     B = ir.new_builder();
     is_wasm = wasm;
     init_types();
+    restrict_unit(cu.objects.items());  // (restrict: cgen_restrict.ax)
     g_defs = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
     for s in cu.objects.items() {
         g_defs.put(s.name, s);
     }
     for s in cu.funcs.items() {
         g_defs.put(s.name, s);
-        let n = cgn.note_of(s);
+        let n = cs.note_of(s);
         if u.notnil(n) and (n.ctor or n.dtor) {
             g_ctors.push(s);
         }
@@ -1485,16 +726,20 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
         st.ret = s.ty.ret;
         st.sig = func_sig(s);
         F = st;
-        hooks.body(s);
+        function_body(s);
         F = u.nil.[FnState]();
     }
     for s in cu.funcs.items() {
         if ((s.tramps.len > 0) or (u.notnil(s.nest_parent) and s.ty.variadic)) and not unreferenced_inline(s) {
-            hooks.trampolines(s);
+            stmt_trampolines(s);
         }
     }
     if g_object_output {
         put_in_arrays();
+    }
+    // (after the unit's functions and objects: the names of internal linkage file-scope asm names are theirs)
+    for a in cu.asms.items() {
+        asm_toplevel(a);
     }
     return dg.error_count() == 0;
 }
@@ -1503,19 +748,12 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
 // call, no address: CSym.used) and no attribute keeps: never generated (the
 // intrinsics headers' thousands of functions cost nothing unless called).
 fn unreferenced_inline(s: *cast.CSym) bool {
-    let n = cgn.note_of(s);
+    let n = cs.note_of(s);
     if s.used or (s.linkage != cast.LK_INTERNAL) or u.isnil(n) {
         return false;
     }
     return n.always_inline and not n.used and not n.ctor and not n.dtor and (n.alias.len == 0);
 }
-
-/// The program's main is an object's (cc.ax: set_object_main): the name
-/// the start-up calls, with g_obj_main_args arguments; g_obj_main_start: it
-/// is this compiler's object's call of its main, (argc, argv) to an i32.
-pub let mut g_obj_main: []u8 = "";
-pub let mut g_obj_main_args: i32 = 2;
-pub let mut g_obj_main_start: bool = false;
 
 /// Generates START_SYMBOL(argc, argv) into module m, after the units: it
 /// calls main (the function main of the unit that defines it: cu; or with
@@ -1531,499 +769,6 @@ pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool, exit: bo
     }
     is_wasm = wasm;
     init_types();
-    start(cu);
+    start_entry(cu);
     return dg.error_count() == 0;
-}
-
-// Does the program define exit (generate_start)?
-let mut program_exit: bool = false;
-
-// START_SYMBOL(argc, argv): main's value (an i32).
-fn start(cu: *mut cs.CUnit) void {
-    let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
-    let fty = ir.t_fn(T_i32, pi[..], false);
-    let mut f = ir.get_function(M, START_SYMBOL);
-    if u.isnil(f) {
-        f = ir.add_function(M, START_SYMBOL, fty);
-    }
-    if not ir.is_decl(f) {
-        return;
-    }
-    let st = u.new.[FnState]();
-    st.f = f;
-    F = st;
-    st.entry = new_block("entry");
-    at_end(st.entry);
-    let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
-    let mut n: usize = 0;
-    let mut np: usize = 0;
-    let mut sig = Sig.{ ty: fty, plan: u.nil.[abi.Plan]() };
-    let mut mf = u.nil.[ir.Func]();
-    let mut ib = cty.t_int.bits;
-    if u.notnil(cu) {
-        sig = func_sig(cu.main);
-        mf = func_of(cu.main, sig);
-        sig.ty = mf.ty;  // (the call's type: the function's)
-        np = cu.main.params.len;
-    } else {
-        // an object's main (linkin.ax: take_main): int main(int, char **),
-        // or int main(void) (a WebAssembly function of no parameters); or
-        // this compiler's object's start-up, which has START_SYMBOL's type
-        np = @int_cast(usize, g_obj_main_args);
-        if g_obj_main_start {
-            ib = 32;
-        } else if np == 2 {
-            let mut ps: [2]*mut cty.CType = [cty.t_int, cty.pointer_to(cty.pointer_to(cty.t_char))];
-            sig = sig_of(cty.t_int, ps[..], 2, false, false);
-        } else {
-            sig = sig_of(cty.t_int, u.nil_slice.[*mut cty.CType](), 0, false, false);
-        }
-        mf = ir.get_function(M, g_obj_main);
-        if u.isnil(mf) {
-            mf = ir.add_function(M, g_obj_main, sig.ty);
-        }
-    }
-    if np >= 1 {
-        // (main(int argc) in a GNU dialect: argc alone)
-        av[0] = f.params[0];
-        if not g_obj_main_start {
-            av[0] = conv_i32(f.params[0], cty.t_int);
-        }
-        n = 1;
-    }
-    if np == 2 {
-        av[1] = f.params[1];
-        n = 2;
-    }
-    let runners = define_runners();
-    if runners {
-        call_runner(CTORS_FN);
-    }
-    let r = ir.call(B, sig.ty, mf.val, av[0..n]);
-    if u.notnil(sig.plan) {
-        mark_call(r, sig.plan);
-    }
-    if runners and not program_exit {
-        // (a program without exit: the destructors when main returns; else
-        // exit runs them, through __axc_at_exit_dtors)
-        call_runner(DTORS_FN);
-    }
-    let mut status = r;
-    if ib > 32 {
-        status = ir.trunc(B, r, T_i32);
-    } else if ib < 32 {
-        status = ir.sext(B, r, T_i32);
-    }
-    if program_exit or (tg.is_windows() and tg.g_system_c_library) {
-        // returning from main is calling exit with its value (5.1.2.2.3):
-        // the C library's exit flushes its streams and runs the atexit
-        // functions (the start-up's return would end the process at once).
-        // That is the program's own exit if it has one (a C unit's, or an
-        // Axiom module's export: the hosted C library's, docs/c.md), else
-        // (tg.g_system_c_library) the system's C library's on Windows.
-        let mut pe: [1]*mut ir.Ty = [T_i32];
-        let ety = ir.t_fn(T_void, pe[..], false);
-        let mut ef = ir.get_function(M, "exit");
-        if u.isnil(ef) {
-            ef = ir.add_function(M, "exit", ety);
-        }
-        if not program_exit {
-            c_library_import("exit");
-        }
-        // (a C unit's exit takes an int of the build's width, --c-int)
-        let mut arg = status;
-        if ef.ty.params.len == 1 {
-            let pt = ef.ty.params[0];
-            if (pt.kind == ir.T_INT) and (pt.bits > 32) {
-                arg = ir.sext(B, status, pt);
-            } else if (pt.kind == ir.T_INT) and (pt.bits < 32) {
-                arg = ir.trunc(B, status, pt);
-            }
-        }
-        let mut ea: [1]*mut ir.Value = [arg];
-        _ = ir.call(B, ef.ty, ef.val, ea[..]);
-    }
-    ir.ret(B, status);
-    F = u.nil.[FnState]();
-}
-
-// The runners of the constructors and destructors (define_runners).
-pub let CTORS_FN: []u8 = "__axiom_c_ctors";
-pub let DTORS_FN: []u8 = "__axiom_c_dtors";
-// exit's slot for the destructors (the hosted C library's, std/c/lib/core)
-let DTORS_HOOK: []u8 = "__axc_at_exit_dtors";
-
-fn call_runner(name: []u8) void {
-    let f = ir.get_function(M, name);
-    _ = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
-}
-
-/// The program is linked with objects whose constructors and destructors
-/// are in initialization and termination arrays (theirs, or this
-/// compiler's objects': --emit=obj): the runners walk the arrays too,
-/// between __init_array_start and __init_array_end (and the fini ones),
-/// which the linker defines (nlink.ax), the initialization array first,
-/// forward, before the units' constructors, and the termination array
-/// last, backward, after their destructors (the generic ABI's order). The
-/// functions are called with no arguments.
-pub let mut g_init_arrays: bool = false;
-
-// A weak reference to the linker's symbol `name` (an address).
-fn weak_symbol(name: []u8) *mut ir.Global {
-    let g = ir.get_global(M, name);
-    if u.notnil(g) {
-        return g;
-    }
-    let n = ir.add_global(M, T_i8, name);
-    n.linkage = ir.LINK_EXTWEAK;
-    return n;
-}
-
-// Calls each function of the array between the weak symbols first_sym
-// and end_sym: forward, or from the end backward.
-fn walk_array(first_sym: []u8, end_sym: []u8, forward: bool) void {
-    let s = weak_symbol(first_sym);
-    let e = weak_symbol(end_sym);
-    let pre = ir.insert_block(B);
-    let head = new_block("array");
-    let body = new_block("array_call");
-    let out = new_block("array_done");
-    ir.br(B, head);
-    at_end(head);
-    let p = ir.phi(B, T_ptr);
-    let mut first = s.val;
-    let mut last = e.val;
-    if not forward {
-        first = e.val;
-        last = s.val;
-    }
-    ir.add_incoming(p, first, pre);
-    ir.condbr(B, ir.icmp(B, ir.IntNE, p, last), body, out);
-    at_end(body);
-    let mut at = p;
-    let mut next = ir.gep1(B, T_ptr, p, ir.cint(T_isz, 1));
-    if not forward {
-        at = ir.gep1(B, T_ptr, p, ir.cint(T_isz, 0xffff_ffff_ffff_ffff));
-        next = at;
-    }
-    let f = ir.load(B, T_ptr, at);
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
-    _ = ir.call(B, fty, f, u.nil_slice.[*mut ir.Value]());
-    ir.add_incoming(p, next, body);
-    ir.br(B, head);
-    at_end(out);
-}
-
-/// An object for other links (--emit=obj): the constructors and
-/// destructors are entries of its initialization and termination arrays
-/// (put_in_arrays), which the program that links it runs.
-pub let mut g_object_output: bool = false;
-/// --c-lib=system: the system's C library and headers (cgen_expr.ax: its
-/// setjmp's names).
-pub let mut g_system_c_lib: bool = false;
-
-// The constructors in .init_array, the destructors in .fini_array: a
-// pointer each, in the section of their priority (.init_array.NNNNN, the
-// generic ABI's and the platform toolchain's convention, which its linkers
-// sort; the default priority: the plain section, after them). Once.
-fn put_in_arrays() void {
-    for i in 0..g_ctors.len {
-        let s = g_ctors.get(i);
-        let n = cgn.note_of(s);
-        let f = func_of(s, func_sig(s));
-        for pass in @as(i32, 0)..2 {
-            let ctor = pass == 0;
-            if (ctor and not n.ctor) or (not ctor and not n.dtor) {
-                continue;
-            }
-            let mut prio = @as(i64, n.ctor_prio);
-            if not ctor {
-                prio = @as(i64, n.dtor_prio);
-            }
-            let mut sec = u.pick(ctor, ".init_array", ".fini_array");
-            if (prio >= 0) and (prio < 65535) {
-                let d = u.udec(@bit_cast(u64, prio));
-                let mut z = u.Buf.init();
-                z.s(sec);
-                z.c('.');
-                for k in d.len..5 {
-                    _ = k;
-                    z.c('0');
-                }
-                z.s(d);
-                sec = u.dup(z.view());
-            }
-            let name = u.f2("axiom.c.%s.%s", u.pick(ctor, "ctor", "dtor"), u.zdec(i));
-            if u.notnil(ir.get_global(M, name)) {
-                continue;
-            }
-            let mut fv = f.val;
-            if is_wasm and not ctor {
-                // (WebAssembly objects have constructors only, the tool
-                // conventions' INIT_FUNCS: one of the destructor's priority
-                // registers it with atexit, which runs it in the reverse
-                // order of registration, the higher priorities first)
-                fv = atexit_registrar(f, i);
-                sec = u.cat2(".init_array", sec[11..]);
-            }
-            let g = ir.add_global(M, T_ptr, name);
-            g.init = fv;
-            g.linkage = ir.LINK_INTERNAL;
-            g.section = u.perm_dup(sec);
-            g.align = 8;
-        }
-    }
-}
-
-// A function that registers destructor f (the i-th of g_ctors) with atexit.
-fn atexit_registrar(f: *mut ir.Func, i: usize) *mut ir.Value {
-    let saved_b = B;
-    let saved_f = F;
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
-    let rf = ir.add_function(M, u.f1("axiom.c.atexit_dtor.%s", u.zdec(i)), fty);
-    rf.linkage = ir.LINK_INTERNAL;
-    let mut pa: [1]*mut ir.Ty = [T_ptr];
-    let aty = ir.t_fn(lty(cty.t_int), pa[..], false);
-    let mut af = ir.get_function(M, "atexit");
-    if u.isnil(af) {
-        af = ir.add_function(M, "atexit", aty);
-    }
-    B = ir.new_builder();
-    let st = u.new.[FnState]();
-    st.f = rf;
-    F = st;
-    at_end(new_block("entry"));
-    let mut args: [1]*mut ir.Value = [f.val];
-    _ = ir.call(B, af.ty, af.val, args[..]);
-    ir.ret_void(B);
-    B = saved_b;
-    F = saved_f;
-    return rf.val;
-}
-
-/// Defines CTORS_FN and DTORS_FN if the program has constructors or
-/// destructors (true then). CTORS_FN calls the constructors, and gives exit
-/// the destructors where the C library has exit's slot for them
-/// (DTORS_HOOK), so that exit, the program's end however it comes, runs
-/// them after the atexit functions; DTORS_FN calls them, once.
-pub fn define_runners() bool {
-    if g_object_output and not is_wasm {
-        return false;  // (put_in_arrays)
-    }
-    if (g_ctors.len == 0) and not g_init_arrays {
-        return false;
-    }
-    if u.notnil(ir.get_function(M, CTORS_FN)) {
-        return true;
-    }
-    let saved_b = B;
-    let saved_f = F;
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
-    let df = ir.add_function(M, DTORS_FN, fty);
-    df.linkage = ir.LINK_INTERNAL;
-    let cf = ir.add_function(M, CTORS_FN, fty);
-    cf.linkage = ir.LINK_INTERNAL;
-    B = ir.new_builder();
-    // the destructors, once (exit's, or main's return)
-    let done = ir.add_global(M, T_i8, "axiom.c.dtors_done");
-    done.init = ir.cint(T_i8, 0);
-    done.linkage = ir.LINK_INTERNAL;
-    let dst = u.new.[FnState]();
-    dst.f = df;
-    F = dst;
-    let entry = new_block("entry");
-    let run = new_block("run");
-    let out = new_block("done");
-    at_end(entry);
-    let was = ir.load(B, T_i8, done.val);
-    ir.condbr(B, ir.icmp(B, ir.IntEQ, was, ir.cint(T_i8, 0)), run, out);
-    at_end(run);
-    _ = ir.store(B, ir.cint(T_i8, 1), done.val);
-    call_ctors(false);
-    if g_init_arrays and not is_wasm {
-        // (backward, the generic ABI's order; forward on Windows, as the C
-        // runtime runs .CRT$XT*, whose suffixes say the order: coff.ax)
-        walk_array("__fini_array_start", "__fini_array_end", tg.is_windows());
-    }
-    ir.br(B, out);
-    at_end(out);
-    ir.ret_void(B);
-    let cst = u.new.[FnState]();
-    cst.f = cf;
-    F = cst;
-    at_end(new_block("entry"));
-    let hook = ir.get_global(M, DTORS_HOOK);
-    if u.notnil(hook) {
-        _ = ir.store(B, df.val, hook.val);
-    }
-    if g_init_arrays and is_wasm {
-        // (the objects' constructors on WebAssembly: their INIT_FUNCS, which
-        // the linker's __wasm_call_ctors calls, the tool conventions' name)
-        let mut wf = ir.get_function(M, "__wasm_call_ctors");
-        if u.isnil(wf) {
-            wf = ir.add_function(M, "__wasm_call_ctors", fty);
-        }
-        _ = ir.call(B, wf.ty, wf.val, u.nil_slice.[*mut ir.Value]());
-    } else if g_init_arrays {
-        walk_array("__preinit_array_start", "__preinit_array_end", true);
-        walk_array("__init_array_start", "__init_array_end", true);
-    }
-    call_ctors(true);
-    ir.ret_void(B);
-    B = saved_b;
-    F = saved_f;
-    return true;
-}
-
-/// For a program whose main is the Axiom module's (main: its function):
-/// the C units' constructors before it, their destructors when it returns
-/// (and from exit, as for a C program: define_runners).
-pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
-    M = m;
-    if u.isnil(B) {
-        B = ir.new_builder();
-    }
-    init_types();
-    if ir.is_decl(main) {
-        return;
-    }
-    let runners = define_runners();
-    // with the C library: when main returns, what exit does before the
-    // process ends (its atexit functions, the destructors through exit's
-    // slot for them, the streams' flushing), as for a C program's main
-    let handlers = ir.get_function(M, EXIT_HANDLERS);
-    let has_handlers = u.notnil(handlers) and not ir.is_decl(handlers);
-    if not runners and not has_handlers {
-        return;
-    }
-    let saved = B;
-    B = ir.new_builder();
-    let tmp = ir.append_block(main, "tmp");
-    if runners {
-        // a call before the first instruction
-        let cf = ir.get_function(M, CTORS_FN);
-        ir.at_end(B, tmp);
-        let c0 = ir.call(B, cf.ty, cf.val, u.nil_slice.[*mut ir.Value]());
-        unlink_last(tmp);
-        ir.insert_before(main.first.first, c0);
-    }
-    let mut end = handlers;
-    if not has_handlers {
-        end = ir.get_function(M, DTORS_FN);
-    }
-    // and one before each return
-    let mut b = main.first;
-    while u.notnil(b) {
-        let mut v = b.first;
-        while u.notnil(v) {
-            if v.op == ir.OP_RET {
-                ir.at_end(B, tmp);
-                let c = ir.call(B, end.ty, end.val, u.nil_slice.[*mut ir.Value]());
-                unlink_last(tmp);
-                ir.insert_before(v, c);
-            }
-            v = v.next;
-        }
-        b = b.next;
-    }
-    ir.remove_block(tmp);
-    B = saved;
-}
-
-/// The C library's function of exit's handlers (std/c/lib/core): an Axiom
-/// program's main calls it when it returns (wrap_axiom_main).
-pub let EXIT_HANDLERS: []u8 = "__axc_exit_handlers";
-
-// Takes the last instruction out of block b (to put it elsewhere).
-fn unlink_last(b: *mut ir.Block) void {
-    let v = b.last;
-    b.last = v.prev;
-    if u.notnil(v.prev) {
-        v.prev.next = ir.vnil();
-    } else {
-        b.first = ir.vnil();
-    }
-    v.prev = ir.vnil();
-}
-
-fn ctor_key(s: *mut cast.CSym, ctor: bool) i64 {
-    let n = cgn.note_of(s);
-    if ctor {
-        return @as(i64, n.ctor_prio);
-    }
-    return @as(i64, n.dtor_prio);
-}
-
-// The constructors (ctor) before main, by priority, lowest first, and in
-// the order they are defined for a priority; or the destructors after it,
-// highest priority first, the last defined first for a priority. (A
-// program that ends otherwise than by returning from main does not run its
-// destructors: docs/c.md.)
-fn call_ctors(ctor: bool) void {
-    let xs = u.List.[*mut cast.CSym].empty();
-    let mut l = xs;
-    for s in g_ctors.items() {
-        let n = cgn.note_of(s);
-        if (ctor and n.ctor) or (not ctor and n.dtor) {
-            l.push(s);
-        }
-    }
-    let items = l.items_mut();
-    // (a stable insertion sort: few of them)
-    for i in 1..items.len {
-        let mut j = i;
-        while j > 0 {
-            let a = ctor_key(items[j - 1], ctor);
-            let b = ctor_key(items[j], ctor);
-            let before = (ctor and (a <= b)) or (not ctor and (a >= b));
-            if before {
-                break;
-            }
-            let x = items[j];
-            items[j] = items[j - 1];
-            items[j - 1] = x;
-            j -= 1;
-        }
-    }
-    if not ctor {
-        // (the same priority: the last defined first)
-        let mut a: usize = 0;
-        while a < items.len {
-            let mut b = a + 1;
-            while (b < items.len) and (ctor_key(items[b], false) == ctor_key(items[a], false)) {
-                b += 1;
-            }
-            let mut x = a;
-            let mut y = b - 1;
-            while x < y {
-                let t = items[x];
-                items[x] = items[y];
-                items[y] = t;
-                x += 1;
-                y -= 1;
-            }
-            a = b;
-        }
-    }
-    for s in items {
-        let f = func_of(s, func_sig(s));
-        let sig = func_sig(s);
-        let r = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
-        if u.notnil(sig.plan) {
-            mark_call(r, sig.plan);
-        }
-    }
-    l.deinit();
-}
-
-// i32 v as a value of integer type t.
-fn conv_i32(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
-    let it = lty(t);
-    if it.bits > 32 {
-        return ir.sext(B, v, it);
-    }
-    if it.bits < 32 {
-        return ir.trunc(B, v, it);
-    }
-    return v;
 }

@@ -1,12 +1,12 @@
 // =============================================================================
 // cgen_vec.ax - IR generation for the GNU dialects' vector types
 // (csema_vec.ax): their operators, conversions, lane-wise conditions and
-// the vector builtins.
+// the vector builtins. Part of cgen.ax.
 //
 // A vector value is memory, as a structure's is (its address: a temporary's
 // or an object's, never written through), so that copies, initializers,
 // members, arguments and results need nothing of their own. Where the IR's
-// vector types hold its lanes (cgen.vec_chunk: integers of 8 to 64 bits,
+// vector types hold its lanes (vec_chunk: integers of 8 to 64 bits,
 // binary32, binary64, _Float16's bits; 16 bytes or more, on a target that
 // has them: WebAssembly with simd128), that memory is chunks of an IR vector
 // type of at most 64 bytes, and each operation is one IR vector operation per
@@ -23,26 +23,9 @@
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
-import "cgen_expr.ax" as gx;
-import "cgen_gbuiltin.ax" as gbg;
-import "cgen_ld.ax" as gld;
-import "cgen_wint.ax" as cgw;
-import "csema_gbuiltin.ax" as gb;
-import "csema_vec.ax" as csv;
+import "csema.ax" as cs;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
-
-/// Installs the generation of vector expressions in cgen_expr.ax and of the
-/// vector builtins in cgen_gbuiltin.ax.
-pub fn install() void {
-    gx.vec_expr = gen;
-    gbg.vec_builtin = builtin;
-}
-
-fn B() *mut ir.Builder {
-    return cg.B;
-}
 
 // A vector type as its memory is laid out: its lanes (n, of type el, es
 // bytes each), and where the IR's vector types hold them its chunks (ch,
@@ -58,9 +41,9 @@ struct Shape {
     al: u64,  // the alignment chunks and lanes are accessed with
 }
 
-fn shape(t0: *mut cty.CType) Shape {
+fn vec_shape(t0: *mut cty.CType) Shape {
     let t = cty.unqual(t0);
-    let ch = cg.vec_chunk(t);
+    let ch = vec_chunk(t);
     let mut nch: u64 = 0;
     let mut lpc: u64 = 0;
     if u.notnil(ch) {
@@ -71,53 +54,53 @@ fn shape(t0: *mut cty.CType) Shape {
                    al: @min(cty.align_of(t), 16) };
 }
 
-fn temp(t: *mut cty.CType) *mut ir.Value {
-    return cg.temp_object(cty.unqual(t), "vec");
+fn vec_temp(t: *mut cty.CType) *mut ir.Value {
+    return temp_object(cty.unqual(t), "vec");
 }
 
-fn at(p: *mut ir.Value, off: u64) *mut ir.Value {
+fn vec_at(p: *mut ir.Value, off: u64) *mut ir.Value {
     if off == 0 {
         return p;
     }
-    return ir.ptradd(B(), p, cg.usz(off));
+    return ir.ptradd(B, p, usz(off));
 }
 
-fn load_chunk(s: *mut Shape, p: *mut ir.Value, k: u64) *mut ir.Value {
-    let v = ir.load(B(), s.ch, at(p, k * s.ch.size));
+fn vec_load_chunk(s: *mut Shape, p: *mut ir.Value, k: u64) *mut ir.Value {
+    let v = ir.load(B, s.ch, vec_at(p, k * s.ch.size));
     v.align = @truncate(u32, s.al);
     return v;
 }
 
-fn store_chunk(s: *Shape, v: *mut ir.Value, p: *mut ir.Value, k: u64) void {
-    let st = ir.store(B(), v, at(p, k * s.ch.size));
+fn vec_store_chunk(s: *Shape, v: *mut ir.Value, p: *mut ir.Value, k: u64) void {
+    let st = ir.store(B, v, vec_at(p, k * s.ch.size));
     st.align = @truncate(u32, s.al);
 }
 
 // Lane i of the vector at p (of shape s), from memory: a scalar, or the
 // address of a copy (an element that is a value in memory).
-fn lane_load(s: *mut Shape, p: *mut ir.Value, i: u64) *mut ir.Value {
-    let a = at(p, i * s.es);
+fn vec_lane_load(s: *mut Shape, p: *mut ir.Value, i: u64) *mut ir.Value {
+    let a = vec_at(p, i * s.es);
     if cty.is_wide(s.el) {
-        return gld.snapshot(a, false);
+        return ld_snapshot(a, false);
     }
-    let v = gx.load(s.el, a);
+    let v = load(s.el, a);
     if (v.kind == ir.V_INST) and (v.op == ir.OP_LOAD) {
         v.align = @truncate(u32, @min(s.es, s.al));
     }
     return v;
 }
 
-fn lane_store(s: *Shape, v: *mut ir.Value, p: *mut ir.Value, i: u64) void {
-    let a = at(p, i * s.es);
+fn vec_lane_store(s: *Shape, v: *mut ir.Value, p: *mut ir.Value, i: u64) void {
+    let a = vec_at(p, i * s.es);
     if cty.is_wide(s.el) {
-        gld.copy(a, v, false);
+        ld_copy(a, v, false);
         return;
     }
     if cty.is_wint(s.el) {
-        cgw.copy(s.el, a, v, false);
+        wint_copy(s.el, a, v, false);
         return;
     }
-    let st = ir.store(B(), v, a);
+    let st = ir.store(B, v, a);
     st.align = @truncate(u32, @min(s.es, s.al));
 }
 
@@ -125,58 +108,58 @@ fn lane_store(s: *Shape, v: *mut ir.Value, p: *mut ir.Value, i: u64) void {
 // The expressions
 // -----------------------------------------------------------------------------
 
-fn gen(e: *mut cast.Expr, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+fn vec_expr(e: *mut cast.Expr, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     let k = e.kind;
     if k == cast.ExprKind.CAST {
         if e.op == cast.CV_SPLAT {
-            return splat(e.ty, gx.rv(e.a));
+            return vec_splat(e.ty, rv(e.a));
         }
-        return bits(e.a.ty, e.ty, gx.rv(e.a));
+        return vec_bits(e.a.ty, e.ty, rv(e.a));
     }
     if k == cast.ExprKind.BINARY {
-        let a = gx.rv(e.a);
-        if is_shift(e.op) and splatted(e.b) {
-            return shift(e.op, e.a.ty, a, gx.rv(e.b.a));
+        let a = rv(e.a);
+        if vec_is_shift(e.op) and vec_splatted(e.b) {
+            return vec_shift(e.op, e.a.ty, a, rv(e.b.a));
         }
-        let b = gx.rv(e.b);
-        return binop(e.op, e.a.ty, a, b);
+        let b = rv(e.b);
+        return vec_binop(e.op, e.a.ty, a, b);
     }
     if k == cast.ExprKind.UNARY {
-        return unary(e.op, e.ty, gx.rv(e.a));
+        return vec_unary(e.op, e.ty, rv(e.a));
     }
     if k == cast.ExprKind.ASSIGN {
         // (compound: x the old value, y the right operand's; a count given
         // to every lane is lane 0's)
-        let op = base_op(e.op);
-        if is_shift(op) and splatted(e.b) {
-            let mut s = shape(e.b.ty);
-            return shift(op, e.opty, x, lane_load(&mut s, y, 0));
+        let op = vec_base_op(e.op);
+        if vec_is_shift(op) and vec_splatted(e.b) {
+            let mut s = vec_shape(e.b.ty);
+            return vec_shift(op, e.opty, x, vec_lane_load(&mut s, y, 0));
         }
-        return binop(op, e.opty, x, y);
+        return vec_binop(op, e.opty, x, y);
     }
     if (k == cast.ExprKind.POSTFIX) or (k == cast.ExprKind.UNARY) {
-        let one = splat(e.opty, gx.one_of(e.opty.unq.elem));
+        let one = vec_splat(e.opty, one_of(e.opty.unq.elem));
         let mut op = ct.P_PLUS;
         if e.op == ct.P_DEC {
             op = ct.P_MINUS;
         }
-        return binop(op, e.opty, x, one);
+        return vec_binop(op, e.opty, x, one);
     }
     if k == cast.ExprKind.COND {
-        let c = gx.rv(e.a);
-        let a = gx.rv(e.b);
-        let b = gx.rv(e.c);
-        return select(e.a.ty, e.ty, c, a, b);
+        let c = rv(e.a);
+        let a = rv(e.b);
+        let b = rv(e.c);
+        return vec_select(e.a.ty, e.ty, c, a, b);
     }
-    return convertvector(e.a.ty, e.ty, gx.rv(e.a));
+    return vec_convertvector(e.a.ty, e.ty, rv(e.a));
 }
 
-fn is_shift(op: i32) bool {
+fn vec_is_shift(op: i32) bool {
     return (op == ct.P_SHL) or (op == ct.P_SHR);
 }
 
 // Is e a scalar given to every lane (a shift count the same for all)?
-fn splatted(e: *cast.Expr) bool {
+fn vec_splatted(e: *cast.Expr) bool {
     return (e.kind == cast.ExprKind.CAST) and (e.op == cast.CV_SPLAT);
 }
 
@@ -184,24 +167,24 @@ fn splatted(e: *cast.Expr) bool {
 // count of every lane: the IR's shift by a count given to every lane (as
 // Axiom's vector shifts are); a count of the lanes' width or more is
 // undefined in C (the backends mask it).
-fn shift(op: i32, t: *mut cty.CType, x: *mut ir.Value, n: *mut ir.Value) *mut ir.Value {
-    let mut s = shape(t);
+fn vec_shift(op: i32, t: *mut cty.CType, x: *mut ir.Value, n: *mut ir.Value) *mut ir.Value {
+    let mut s = vec_shape(t);
     if u.isnil(s.ch) {
-        return binop(op, t, x, splat(t, n));
+        return vec_binop(op, t, x, vec_splat(t, n));
     }
-    let r = temp(t);
-    let c = ir.splat(B(), s.ch, n);
+    let r = vec_temp(t);
+    let c = ir.splat(B, s.ch, n);
     let mut o = ir.OP_SHL;
     if op == ct.P_SHR {
-        o = pick(s.el.unq.is_signed, ir.OP_ASHR, ir.OP_LSHR);
+        o = vec_pick(s.el.unq.is_signed, ir.OP_ASHR, ir.OP_LSHR);
     }
     for k in 0..s.nch {
-        store_chunk(&s, ir.binop(B(), o, load_chunk(&mut s, x, k), c), r, k);
+        vec_store_chunk(&s, ir.binop(B, o, vec_load_chunk(&mut s, x, k), c), r, k);
     }
     return r;
 }
 
-fn base_op(op: i32) i32 {
+fn vec_base_op(op: i32) i32 {
     let ops: [10]i32 = [ct.P_MUL_EQ, ct.P_DIV_EQ, ct.P_MOD_EQ, ct.P_ADD_EQ, ct.P_SUB_EQ, ct.P_SHL_EQ, ct.P_SHR_EQ,
                         ct.P_AND_EQ, ct.P_XOR_EQ, ct.P_OR_EQ];
     let bs: [10]i32 = [ct.P_STAR, ct.P_SLASH, ct.P_PERCENT, ct.P_PLUS, ct.P_MINUS, ct.P_SHL, ct.P_SHR, ct.P_AMP,
@@ -215,54 +198,54 @@ fn base_op(op: i32) i32 {
 }
 
 /// Scalar v (of t's element type) in every lane of a new vector of type t.
-pub fn splat(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
-    let s = shape(t);
-    let r = temp(t);
+fn vec_splat(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    let s = vec_shape(t);
+    let r = vec_temp(t);
     if u.notnil(s.ch) {
-        let c = ir.splat(B(), s.ch, v);
+        let c = ir.splat(B, s.ch, v);
         for k in 0..s.nch {
-            store_chunk(&s, c, r, k);
+            vec_store_chunk(&s, c, r, k);
         }
         return r;
     }
     for i in 0..s.n {
-        lane_store(&s, v, r, i);
+        vec_lane_store(&s, v, r, i);
     }
     return r;
 }
 
 // The value v of type `from` (a vector, or an integer) as one of type t of
 // the same size (a vector, or an integer): its bytes.
-fn bits(from: *mut cty.CType, t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+fn vec_bits(from: *mut cty.CType, t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
     let n = cty.size_of(t);
     if cty.is_vector(t) and cty.is_integer(from) and not cty.is_wint(from) {
-        let r = temp(t);
-        let st = ir.store(B(), v, r);
+        let r = vec_temp(t);
+        let st = ir.store(B, v, r);
         st.align = @truncate(u32, @min(n, 16));
         return r;
     }
     if cty.is_integer(t) and not cty.is_wint(t) {
-        let x = ir.load(B(), cg.lty(t), v);
+        let x = ir.load(B, lty(t), v);
         x.align = @truncate(u32, @min(n, cty.align_of(from)));
         return x;
     }
     // (two vectors, or a vector and an integer wider than 64 bits: memory)
-    let r = cg.alloca(cty.unqual(t), "vec");
-    gx.vec_copy(from, r, v);
+    let r = alloca(cty.unqual(t), "vec");
+    vec_copy(from, r, v);
     return r;
 }
 
-fn is_float_lane(el: *cty.CType) bool {
+fn vec_is_float_lane(el: *cty.CType) bool {
     return cty.is_floating(el);
 }
 
 // Does the IR have op as one vector operation on chunks of shape s (its
 // result's lanes as wide as its operands')?
-fn native(op: i32, s: *Shape) bool {
+fn vec_native(op: i32, s: *Shape) bool {
     if u.isnil(s.ch) or cty.is_half(s.el) {
         return false;
     }
-    let fl = is_float_lane(s.el);
+    let fl = vec_is_float_lane(s.el);
     if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
         return true;
     }
@@ -281,16 +264,16 @@ fn native(op: i32, s: *Shape) bool {
     return false;
 }
 
-fn is_cmp(op: i32) bool {
+fn vec_is_cmp(op: i32) bool {
     return (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) or (op == ct.P_EQ) or
            (op == ct.P_NE);
 }
 
-// x op y on chunks a and b (native(op)).
-fn chunk_op(op: i32, s: *Shape, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
-    let fl = is_float_lane(s.el);
+// x op y on chunks a and b (vec_native(op)).
+fn vec_chunk_op(op: i32, s: *Shape, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let fl = vec_is_float_lane(s.el);
     let sg = s.el.unq.is_signed;
-    if is_cmp(op) {
+    if vec_is_cmp(op) {
         if fl {
             let mut p = ir.RealOEQ;
             if op == ct.P_NE {
@@ -304,7 +287,7 @@ fn chunk_op(op: i32, s: *Shape, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Valu
             } else if op == ct.P_GE {
                 p = ir.RealOGE;
             }
-            let c = ir.fcmp(B(), p, a, b);
+            let c = ir.fcmp(B, p, a, b);
             if (op != ct.P_EQ) and (op != ct.P_NE) and (c.kind == ir.V_INST) {
                 // (the relational operators signal "invalid" for a NaN lane, as
                 // the scalar ones do: F.9.3; the backends' vector compares do)
@@ -312,15 +295,15 @@ fn chunk_op(op: i32, s: *Shape, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Valu
             }
             return c;
         }
-        return ir.icmp(B(), gx.int_pred(op, sg), a, b);
+        return ir.icmp(B, int_pred(op, sg), a, b);
     }
     let mut o = ir.OP_ADD;
     if op == ct.P_MINUS {
-        o = pick(fl, ir.OP_FSUB, ir.OP_SUB);
+        o = vec_pick(fl, ir.OP_FSUB, ir.OP_SUB);
     } else if op == ct.P_PLUS {
-        o = pick(fl, ir.OP_FADD, ir.OP_ADD);
+        o = vec_pick(fl, ir.OP_FADD, ir.OP_ADD);
     } else if op == ct.P_STAR {
-        o = pick(fl, ir.OP_FMUL, ir.OP_MUL);
+        o = vec_pick(fl, ir.OP_FMUL, ir.OP_MUL);
     } else if op == ct.P_SLASH {
         o = ir.OP_FDIV;
     } else if op == ct.P_AMP {
@@ -332,12 +315,12 @@ fn chunk_op(op: i32, s: *Shape, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Valu
     } else if op == ct.P_SHL {
         o = ir.OP_SHL;
     } else {
-        o = pick(sg, ir.OP_ASHR, ir.OP_LSHR);
+        o = vec_pick(sg, ir.OP_ASHR, ir.OP_LSHR);
     }
-    return ir.binop(B(), o, a, b);
+    return ir.binop(B, o, a, b);
 }
 
-fn pick(c: bool, a: i32, b: i32) i32 {
+fn vec_pick(c: bool, a: i32, b: i32) i32 {
     if c {
         return a;
     }
@@ -346,161 +329,162 @@ fn pick(c: bool, a: i32, b: i32) i32 {
 
 // Lane values a and b (of element type el) op'd: the scalar operation, a
 // comparison's -1 or 0 of the result's element type rel.
-fn lane_op(op: i32, el: *mut cty.CType, rel: *mut cty.CType, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
-    if is_cmp(op) {
-        let c = gx.compare_values(op, el, a, b);
+fn vec_lane_op(op: i32, el: *mut cty.CType, rel: *mut cty.CType, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    if vec_is_cmp(op) {
+        let c = compare_values(op, el, a, b);
         if cty.is_wint(rel) {
-            let r = cgw.temp(rel);
-            let m = ir.sext(B(), c, ir.t_int(64));
+            let r = wint_temp(rel);
+            let m = ir.sext(B, c, ir.t_int(64));
             for k in 0..cty.limbs(rel) {
-                let st = ir.store(B(), m, at(r, @as(u64, k) * 8));
+                let st = ir.store(B, m, vec_at(r, @as(u64, k) * 8));
                 st.align = 8;
             }
             return r;
         }
-        return ir.sext(B(), c, cg.lty(rel));
+        return ir.sext(B, c, lty(rel));
     }
-    return gx.arith_wrap(op, el, a, b, el);
+    return arith_wrap(op, el, a, b, el);
 }
 
 /// x op y (both of vector type t; op a binary operator's): a new vector,
 /// of type t or for a comparison of csema_vec.cmp_type(t).
-pub fn binop(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
-    let mut s = shape(t);
+fn vec_binop(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut s = vec_shape(t);
     let mut rt = cty.unqual(t);
-    if is_cmp(op) {
-        rt = csv.cmp_type(t);
+    if vec_is_cmp(op) {
+        rt = cs.cmp_type(t);
     }
-    let rs = shape(rt);
-    let r = temp(rt);
+    let rs = vec_shape(rt);
+    let r = vec_temp(rt);
     if u.notnil(s.ch) {
-        let nat = native(op, &s);
+        let nat = vec_native(op, &s);
         for k in 0..s.nch {
-            let a = load_chunk(&mut s, x, k);
-            let b = load_chunk(&mut s, y, k);
+            let a = vec_load_chunk(&mut s, x, k);
+            let b = vec_load_chunk(&mut s, y, k);
             if nat {
-                store_chunk(&rs, chunk_op(op, &s, a, b), r, k);
+                vec_store_chunk(&rs, vec_chunk_op(op, &s, a, b), r, k);
                 continue;
             }
             let mut v = ir.undef(rs.ch);
             for i in 0..s.lpc {
-                let ai = ir.extract_elem(B(), a, i);
-                let bi = ir.extract_elem(B(), b, i);
-                v = ir.insert_elem(B(), v, lane_op(op, s.el, rs.el, ai, bi), i);
+                let ai = ir.extract_elem(B, a, i);
+                let bi = ir.extract_elem(B, b, i);
+                v = ir.insert_elem(B, v, vec_lane_op(op, s.el, rs.el, ai, bi), i);
             }
-            store_chunk(&rs, v, r, k);
+            vec_store_chunk(&rs, v, r, k);
         }
         return r;
     }
     for i in 0..s.n {
-        lane_store(&rs, lane_op(op, s.el, rs.el, lane_load(&mut s, x, i), lane_load(&mut s, y, i)), r, i);
+        vec_lane_store(&rs, vec_lane_op(op, s.el, rs.el, vec_lane_load(&mut s, x, i), vec_lane_load(&mut s, y, i)), r,
+                       i);
     }
     return r;
 }
 
 // op x (unary + - ~) of vector type t.
-fn unary(op: i32, t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
+fn vec_unary(op: i32, t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
     if op == ct.P_PLUS {
         return x;
     }
-    let mut s = shape(t);
-    let r = temp(t);
+    let mut s = vec_shape(t);
+    let r = vec_temp(t);
     if u.notnil(s.ch) {
         for k in 0..s.nch {
-            let a = load_chunk(&mut s, x, k);
+            let a = vec_load_chunk(&mut s, x, k);
             let mut v = ir.vnil();
             if op == ct.P_TILDE {
-                v = ir.xor(B(), a, ir.splat(B(), s.ch, ir.cint(s.ch.elem, 0xFFFF_FFFF_FFFF_FFFF)));
+                v = ir.xor(B, a, ir.splat(B, s.ch, ir.cint(s.ch.elem, 0xFFFF_FFFF_FFFF_FFFF)));
             } else if cty.is_half(s.el) {
-                v = ir.xor(B(), a, ir.splat(B(), s.ch, ir.cint(s.ch.elem, 0x8000)));  // (the sign bits)
-            } else if is_float_lane(s.el) {
-                v = ir.fneg(B(), a);
+                v = ir.xor(B, a, ir.splat(B, s.ch, ir.cint(s.ch.elem, 0x8000)));  // (the sign bits)
+            } else if vec_is_float_lane(s.el) {
+                v = ir.fneg(B, a);
             } else {
-                v = ir.sub(B(), ir.czero(s.ch), a);
+                v = ir.sub(B, ir.czero(s.ch), a);
             }
-            store_chunk(&s, v, r, k);
+            vec_store_chunk(&s, v, r, k);
         }
         return r;
     }
     for i in 0..s.n {
-        let a = lane_load(&mut s, x, i);
+        let a = vec_lane_load(&mut s, x, i);
         let mut v = ir.vnil();
         if op == ct.P_TILDE {
-            v = gx.bitnot_value(s.el, a);
+            v = bitnot_value(s.el, a);
         } else {
-            v = gx.negate_value(s.el, a);
+            v = negate_value(s.el, a);
         }
-        lane_store(&s, v, r, i);
+        vec_lane_store(&s, v, r, i);
     }
     return r;
 }
 
 // c ? a : b lane by lane: c of integer vector type ct, a and b of vector
 // type t (of c's shape).
-fn select(ctype: *mut cty.CType, t: *mut cty.CType, c: *mut ir.Value, a: *mut ir.Value,
-          b: *mut ir.Value) *mut ir.Value {
-    let mut cs = shape(ctype);
-    let mut s = shape(t);
-    let r = temp(t);
-    if u.notnil(s.ch) and u.notnil(cs.ch) {
+fn vec_select(ctype: *mut cty.CType, t: *mut cty.CType, c: *mut ir.Value, a: *mut ir.Value,
+              b: *mut ir.Value) *mut ir.Value {
+    let mut cshape = vec_shape(ctype);
+    let mut s = vec_shape(t);
+    let r = vec_temp(t);
+    if u.notnil(s.ch) and u.notnil(cshape.ch) {
         for k in 0..s.nch {
-            let m = ir.icmp(B(), ir.IntNE, load_chunk(&mut cs, c, k), ir.czero(cs.ch));  // (a lane mask: -1 or 0)
-            let x = ir.bitcast(B(), load_chunk(&mut s, a, k), m.ty);
-            let y = ir.bitcast(B(), load_chunk(&mut s, b, k), m.ty);
-            let ones = ir.splat(B(), m.ty, ir.cint(m.ty.elem, 0xFFFF_FFFF_FFFF_FFFF));
-            let v = ir.or_(B(), ir.and_(B(), x, m), ir.and_(B(), y, ir.xor(B(), m, ones)));
-            store_chunk(&s, ir.bitcast(B(), v, s.ch), r, k);
+            let m = ir.icmp(B, ir.IntNE, vec_load_chunk(&mut cshape, c, k), ir.czero(cshape.ch));  // (a lane mask: -1 or 0)
+            let x = ir.bitcast(B, vec_load_chunk(&mut s, a, k), m.ty);
+            let y = ir.bitcast(B, vec_load_chunk(&mut s, b, k), m.ty);
+            let ones = ir.splat(B, m.ty, ir.cint(m.ty.elem, 0xFFFF_FFFF_FFFF_FFFF));
+            let v = ir.or_(B, ir.and_(B, x, m), ir.and_(B, y, ir.xor(B, m, ones)));
+            vec_store_chunk(&s, ir.bitcast(B, v, s.ch), r, k);
         }
         return r;
     }
     for i in 0..s.n {
-        let ci = gx.truth(lane_load(&mut cs, c, i), cs.el);
+        let ci = truth(vec_lane_load(&mut cshape, c, i), cshape.el);
         let mut v = ir.vnil();
         if cty.is_wide(s.el) or cty.is_wint(s.el) {
-            v = ir.select(B(), ci, at(a, i * s.es), at(b, i * s.es));  // (the lane's address)
+            v = ir.select(B, ci, vec_at(a, i * s.es), vec_at(b, i * s.es));  // (the lane's address)
         } else {
-            v = ir.select(B(), ci, lane_load(&mut s, a, i), lane_load(&mut s, b, i));
+            v = ir.select(B, ci, vec_lane_load(&mut s, a, i), vec_lane_load(&mut s, b, i));
         }
-        lane_store(&s, v, r, i);
+        vec_lane_store(&s, v, r, i);
     }
     return r;
 }
 
 // __builtin_convertvector: each lane of v (of vector type f) converted to
 // t's element type.
-fn convertvector(f: *mut cty.CType, t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
-    let mut fs = shape(f);
-    let ts = shape(t);
-    let r = temp(t);
+fn vec_convertvector(f: *mut cty.CType, t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    let mut fs = vec_shape(f);
+    let ts = vec_shape(t);
+    let r = vec_temp(t);
     let fe = fs.el.unq;
     let te = ts.el.unq;
     if fe == te {
-        gx.vec_copy(f, r, v);
+        vec_copy(f, r, v);
         return r;
     }
     let same_kind = cty.is_integer(fe) == cty.is_integer(te);
     if u.notnil(fs.ch) and u.notnil(ts.ch) and (fs.es == ts.es) and not cty.is_half(fe) and not cty.is_half(te) and
-       (same_kind or not cg.is_wasm) {
+       (same_kind or not is_wasm) {
         // (lanes of one width: the IR's lane-wise conversion, or the bits
         // between integers of one width)
         let mut cop: i32 = -1;
         if cty.is_integer(fe) and cty.is_floating(te) {
-            cop = pick(fe.is_signed, ir.OP_SITOFP, ir.OP_UITOFP);
+            cop = vec_pick(fe.is_signed, ir.OP_SITOFP, ir.OP_UITOFP);
         } else if cty.is_floating(fe) and cty.is_integer(te) {
-            cop = pick(te.is_signed, ir.OP_FPTOSI_SAT, ir.OP_FPTOUI_SAT);
+            cop = vec_pick(te.is_signed, ir.OP_FPTOSI_SAT, ir.OP_FPTOUI_SAT);
         }
         for k in 0..fs.nch {
-            let a = load_chunk(&mut fs, v, k);
+            let a = vec_load_chunk(&mut fs, v, k);
             if cop < 0 {
-                store_chunk(&ts, ir.bitcast(B(), a, ts.ch), r, k);
+                vec_store_chunk(&ts, ir.bitcast(B, a, ts.ch), r, k);
             } else {
-                store_chunk(&ts, ir.cast(B(), cop, a, ts.ch), r, k);
+                vec_store_chunk(&ts, ir.cast(B, cop, a, ts.ch), r, k);
             }
         }
         return r;
     }
     for i in 0..fs.n {
-        lane_store(&ts, gx.convert(lane_load(&mut fs, v, i), fe, te), r, i);
+        vec_lane_store(&ts, convert(vec_lane_load(&mut fs, v, i), fe, te), r, i);
     }
     return r;
 }
@@ -509,54 +493,54 @@ fn convertvector(f: *mut cty.CType, t: *mut cty.CType, v: *mut ir.Value) *mut ir
 // The builtins
 // -----------------------------------------------------------------------------
 
-fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
-    if e.op == gb.GB_SHUFFLE {
-        return shuffle(e, vs);
+fn vec_builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    if e.op == cs.GB_SHUFFLE {
+        return vec_shuffle(e, vs);
     }
-    return shufflevector(e, vs);
+    return vec_shufflevector(e, vs);
 }
 
 // __builtin_shuffle(a, [b,] mask): lane i is lane (mask[i] modulo n, or 2n
 // with b) of a then b, from a copy of them side by side.
-fn shuffle(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+fn vec_shuffle(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let t = e.ty;
-    let mut s = shape(t);
+    let mut s = vec_shape(t);
     let two = vs.len == 3;
     let size = cty.size_of(t);
-    let both = cg.temp_object(cty.array_of(cty.t_uchar, 2 * size, true), "shuf");
-    gx.vec_copy(t, both, vs[0]);
+    let both = temp_object(cty.array_of(cty.t_uchar, 2 * size, true), "shuf");
+    vec_copy(t, both, vs[0]);
     let mut lanes = s.n;
     if two {
-        gx.vec_copy(t, at(both, size), vs[1]);
+        vec_copy(t, vec_at(both, size), vs[1]);
         lanes = 2 * s.n;
     }
     let mt = e.args.get(vs.len - 1).ty;
-    let mut ms = shape(mt);
-    let r = temp(t);
+    let mut ms = vec_shape(mt);
+    let r = vec_temp(t);
     for i in 0..s.n {
-        let mut m = lane_load(&mut ms, vs[vs.len - 1], i);
+        let mut m = vec_lane_load(&mut ms, vs[vs.len - 1], i);
         if cty.is_wint(ms.el) {
-            m = cgw.limb(m, 0);
+            m = wint_limb(m, 0);
         }
         let mut mi = m;
-        if mi.ty.bits < cg.T_isz.bits {
-            mi = ir.zext(B(), mi, cg.T_isz);
-        } else if mi.ty.bits > cg.T_isz.bits {
-            mi = ir.trunc(B(), mi, cg.T_isz);
+        if mi.ty.bits < T_isz.bits {
+            mi = ir.zext(B, mi, T_isz);
+        } else if mi.ty.bits > T_isz.bits {
+            mi = ir.trunc(B, mi, T_isz);
         }
-        let j = ir.and_(B(), mi, cg.usz(lanes - 1));
-        let src = ir.ptradd(B(), both, ir.mul(B(), j, cg.usz(s.es)));
-        lane_store(&s, lane_load(&mut s, src, 0), r, i);
+        let j = ir.and_(B, mi, usz(lanes - 1));
+        let src = ir.ptradd(B, both, ir.mul(B, j, usz(s.es)));
+        vec_lane_store(&s, vec_lane_load(&mut s, src, 0), r, i);
     }
     return r;
 }
 
 // __builtin_shufflevector(a, b, i...) (constant indices; -1: any lane).
-fn shufflevector(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+fn vec_shufflevector(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let t = e.ty;
     let at_ = e.args.get(0).ty;
-    let mut s = shape(at_);
-    let rs = shape(t);
+    let mut s = vec_shape(at_);
+    let rs = vec_shape(t);
     let m = e.args.len - 2;
     let mask = u.newn.[i32](m + 1);
     for k in 0..m {
@@ -566,11 +550,11 @@ fn shufflevector(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
             mask[k] = @truncate(i32, v);
         }
     }
-    let r = temp(t);
+    let r = vec_temp(t);
     if u.notnil(s.ch) and u.notnil(rs.ch) and (s.nch == 1) and (rs.nch == 1) {
-        let a = load_chunk(&mut s, vs[0], 0);
-        let b = load_chunk(&mut s, vs[1], 0);
-        store_chunk(&rs, ir.shuffle(B(), a, b, mask[0..m]), r, 0);
+        let a = vec_load_chunk(&mut s, vs[0], 0);
+        let b = vec_load_chunk(&mut s, vs[1], 0);
+        vec_store_chunk(&rs, ir.shuffle(B, a, b, mask[0..m]), r, 0);
         return r;
     }
     for k in 0..m {
@@ -581,7 +565,7 @@ fn shufflevector(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
             src = vs[1];
             l = j - s.n;
         }
-        lane_store(&rs, lane_load(&mut s, src, l), r, @as(u64, k));
+        vec_lane_store(&rs, vec_lane_load(&mut s, src, l), r, @as(u64, k));
     }
     return r;
 }

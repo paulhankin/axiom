@@ -2,12 +2,13 @@
 // cgen_sjlj.ax - setjmp and longjmp (C17 7.13) on WebAssembly, with its
 // exception-handling extension (--features=+exception-handling): the IR of
 // a function that calls setjmp, whose code wasm.ax runs inside a try_table
-// that catches longjmp's exception (wasm.ax: "setjmp and longjmp").
+// that catches longjmp's exception (wasm.ax: "setjmp and longjmp"). Part of
+// cgen.ax.
 //
 // A jmp_buf (std/c/include/setjmp.h: 32 64-bit words) holds, from setjmp
 // call k of a function's activation: word 0 the activation's token (its
 // frame's address, ir.IN_SJLJ_TOKEN), word 1 k, word 3 the stack pointer,
-// word 4 the shadow stack's depth (with call records: cgen.ss_depth);
+// word 4 the shadow stack's depth (with call records: ss_depth);
 // longjmp (wlink.ax's longjmp_unit) stores its value (1 for 0) in word 2 and
 // throws the jmp_buf's address, which the function catches if word 0 is its
 // own token, else throws on. Then its body runs again from the entry, which
@@ -31,96 +32,93 @@
 import "../ir.ax" as ir;
 import "../opt.ax" as opt;
 import "../util.ax" as u;
-import "cgen.ax" as cg;
 
-struct Site {
+struct SjSite {
     cont: *mut ir.Block,  // the block after the call
     slot: *mut ir.Value,  // its result (an int)
 }
 
-let mut sites: u.List.[Site] = u.List.[Site].{ data: @ptr_from_int(*mut Site, 0), len: 0, cap: 0 };
-
-/// Forgets the previous function's setjmp calls.
-pub fn begin_function() void {
-    sites.clear();
+// Forgets the previous function's setjmp calls.
+fn sj_begin_function() void {
+    sj_sites.clear();
 }
 
 // A slot of IR type t in the function's frame (its entry block).
-fn slot(t: *mut ir.Ty, name: []u8) *mut ir.Value {
-    let cur = ir.insert_block(cg.B);
-    let term = ir.terminator(cg.F.entry);
+fn sj_slot(t: *mut ir.Ty, name: []u8) *mut ir.Value {
+    let cur = ir.insert_block(B);
+    let term = ir.terminator(F.entry);
     if u.notnil(term) {
-        ir.at_before(cg.B, term);
+        ir.at_before(B, term);
     } else {
-        ir.at_end(cg.B, cg.F.entry);
+        ir.at_end(B, F.entry);
     }
-    let a = ir.alloca(cg.B, t, name);
-    ir.at_end(cg.B, cur);
+    let a = ir.alloca(B, t, name);
+    ir.at_end(B, cur);
     return a;
 }
 
-fn word(env: *mut ir.Value, k: u64) *mut ir.Value {
-    return ir.ptradd(cg.B, env, ir.cint(cg.T_isz, k * 8));
+fn sj_word(env: *mut ir.Value, k: u64) *mut ir.Value {
+    return ir.ptradd(B, env, ir.cint(T_isz, k * 8));
 }
 
-/// A call of setjmp(env) (7.13.1.1) in the function being generated: env
-/// takes the activation's token, the call's number and the stack pointer;
-/// the result is the call's slot, 0 here, longjmp's value after it.
-pub fn setjmp_call(env: *mut ir.Value) *mut ir.Value {
-    let k = sites.len;
-    let r = slot(cg.T_i32, "setjmp.result");
-    _ = ir.store(cg.B, ir.intr(cg.B, ir.IN_SJLJ_TOKEN, cg.T_ptr, u.newn.[*mut ir.Value](0)), word(env, 0));
-    _ = ir.store(cg.B, ir.cint(cg.T_i32, @as(u64, k)), word(env, 1));
-    _ = ir.store(cg.B, ir.intr(cg.B, ir.IN_GET_SP, cg.T_ptr, u.newn.[*mut ir.Value](0)), word(env, 3));
-    let ss = cg.ss_depth(cg.B);
+// A call of setjmp(env) (7.13.1.1) in the function being generated: env
+// takes the activation's token, the call's number and the stack pointer;
+// the result is the call's slot, 0 here, longjmp's value after it.
+fn sj_setjmp_call(env: *mut ir.Value) *mut ir.Value {
+    let k = sj_sites.len;
+    let r = sj_slot(T_i32, "setjmp.result");
+    _ = ir.store(B, ir.intr(B, ir.IN_SJLJ_TOKEN, T_ptr, u.newn.[*mut ir.Value](0)), sj_word(env, 0));
+    _ = ir.store(B, ir.cint(T_i32, @as(u64, k)), sj_word(env, 1));
+    _ = ir.store(B, ir.intr(B, ir.IN_GET_SP, T_ptr, u.newn.[*mut ir.Value](0)), sj_word(env, 3));
+    let ss = ss_depth(B);
     if u.notnil(ss[1]) {
-        _ = ir.store(cg.B, ss[1], word(env, 4));
+        _ = ir.store(B, ss[1], sj_word(env, 4));
     }
-    _ = ir.store(cg.B, ir.cint(cg.T_i32, 0), r);
-    let cont = cg.new_block("setjmp.cont");
-    ir.br(cg.B, cont);
-    cg.at_end(cont);
-    sites.push(Site.{ cont: cont, slot: r });
-    return ir.load(cg.B, cg.T_i32, r);
+    _ = ir.store(B, ir.cint(T_i32, 0), r);
+    let cont = new_block("setjmp.cont");
+    ir.br(B, cont);
+    at_end(cont);
+    sj_sites.push(SjSite.{ cont: cont, slot: r });
+    return ir.load(B, T_i32, r);
 }
 
-/// Whether the function being generated calls setjmp (then end_function
-/// ends its entry block).
-pub fn has_sites() bool {
-    return sites.len > 0;
+// Whether the function being generated calls setjmp (then sj_end_function
+// ends its entry block).
+fn sj_has_sites() bool {
+    return sj_sites.len > 0;
 }
 
-/// Ends the entry block of a function with setjmp calls: to `start`, or to
-/// the dispatch block when the body runs again after a longjmp; then keeps
-/// in slots the values whose definitions no longer dominate their uses.
-pub fn end_function(f: *mut ir.Func, start: *mut ir.Block) void {
-    cg.at_end(cg.F.entry);
-    let resumed = ir.intr(cg.B, ir.IN_SJLJ_CAUGHT, cg.T_i1, u.newn.[*mut ir.Value](0));
-    let d = cg.new_block("setjmp.dispatch");
-    ir.condbr(cg.B, resumed, d, start);
-    cg.at_end(d);
-    let env = ir.intr(cg.B, ir.IN_SJLJ_ENV, cg.T_ptr, u.newn.[*mut ir.Value](0));
-    let sp: [1]*mut ir.Value = [ir.load(cg.B, cg.T_ptr, word(env, 3))];
+// Ends the entry block of a function with setjmp calls: to `start`, or to
+// the dispatch block when the body runs again after a longjmp; then keeps
+// in slots the values whose definitions no longer dominate their uses.
+fn sj_end_function(f: *mut ir.Func, start: *mut ir.Block) void {
+    at_end(F.entry);
+    let resumed = ir.intr(B, ir.IN_SJLJ_CAUGHT, T_i1, u.newn.[*mut ir.Value](0));
+    let d = new_block("setjmp.dispatch");
+    ir.condbr(B, resumed, d, start);
+    at_end(d);
+    let env = ir.intr(B, ir.IN_SJLJ_ENV, T_ptr, u.newn.[*mut ir.Value](0));
+    let sp: [1]*mut ir.Value = [ir.load(B, T_ptr, sj_word(env, 3))];
     let mut spv = sp;
-    _ = ir.intr(cg.B, ir.IN_SET_SP, cg.T_void, spv[..]);
-    let ss = cg.ss_depth(cg.B);
+    _ = ir.intr(B, ir.IN_SET_SP, T_void, spv[..]);
+    let ss = ss_depth(B);
     if u.notnil(ss[0]) {
-        cg.ss_pop(cg.B, ss[0], ir.load(cg.B, cg.T_i32, word(env, 4)));
+        ss_pop(B, ss[0], ir.load(B, T_i32, sj_word(env, 4)));
     }
-    let v = ir.load(cg.B, cg.T_i32, word(env, 2));
-    let k = ir.load(cg.B, cg.T_i32, word(env, 1));
-    let none = cg.new_block("setjmp.none");
-    let sw = ir.switch_(cg.B, k, none);
-    for i in 0..sites.len {
-        let s = sites.get(i);
-        let b = cg.new_block("setjmp.resume");
-        ir.add_case(sw, ir.cint(cg.T_i32, @as(u64, i)), b);
-        cg.at_end(b);
-        _ = ir.store(cg.B, v, s.slot);
-        ir.br(cg.B, s.cont);
+    let v = ir.load(B, T_i32, sj_word(env, 2));
+    let k = ir.load(B, T_i32, sj_word(env, 1));
+    let none = new_block("setjmp.none");
+    let sw = ir.switch_(B, k, none);
+    for i in 0..sj_sites.len {
+        let s = sj_sites.get(i);
+        let b = new_block("setjmp.resume");
+        ir.add_case(sw, ir.cint(T_i32, @as(u64, i)), b);
+        at_end(b);
+        _ = ir.store(B, v, s.slot);
+        ir.br(B, s.cont);
     }
-    cg.at_end(none);
-    ir.unreachable(cg.B);
+    at_end(none);
+    ir.unreachable(B);
     demote(f);
 }
 
@@ -133,7 +131,7 @@ fn use_block(i: *mut ir.Value, k: usize) *mut ir.Block {
     return i.blk;
 }
 
-fn operand(i: *mut ir.Value, k: usize) *mut ir.Value {
+fn sj_operand(i: *mut ir.Value, k: usize) *mut ir.Value {
     if k == 0 {
         return i.a;
     }
@@ -193,7 +191,7 @@ fn demote(f: *mut ir.Func) void {
         while u.notnil(i) {
             let n = 3 + i.xs.len;
             for k in 0..n {
-                let x = operand(i, k);
+                let x = sj_operand(i, k);
                 if u.notnil(x) and (x.kind == ir.V_INST) and (x.op != ir.OP_ALLOCA) and u.notnil(x.blk) and
                    not reaches(x, i, k) {
                     fixes.push(i);
@@ -211,15 +209,15 @@ fn demote(f: *mut ir.Func) void {
         let x = fixes.get(2 * j + 1);
         let key = u.addr_key(@int_from_ptr(x));
         if u.isnil(slots.get(key)) {
-            let s = slot(x.ty, "setjmp.kept");
+            let s = sj_slot(x.ty, "setjmp.kept");
             let mut at = x.next;
             while u.notnil(at) and (at.op == ir.OP_PHI) {
                 at = at.next;
             }
-            let cur = ir.insert_block(cg.B);
-            ir.at_before(cg.B, at);
-            _ = ir.store(cg.B, x, s);
-            ir.at_end(cg.B, cur);
+            let cur = ir.insert_block(B);
+            ir.at_before(B, at);
+            _ = ir.store(B, x, s);
+            ir.at_end(B, cur);
             slots.put(key, s);
         }
     }
@@ -229,14 +227,14 @@ fn demote(f: *mut ir.Func) void {
         let k = ks.get(j);
         let s = slots.get(u.addr_key(@int_from_ptr(x)));
         let ub = use_block(i, k);
-        let cur = ir.insert_block(cg.B);
+        let cur = ir.insert_block(B);
         if (i.op == ir.OP_PHI) and (k >= 3) {
-            ir.at_before(cg.B, ir.terminator(ub));
+            ir.at_before(B, ir.terminator(ub));
         } else {
-            ir.at_before(cg.B, i);
+            ir.at_before(B, i);
         }
-        set_operand(i, k, ir.load(cg.B, x.ty, s));
-        ir.at_end(cg.B, cur);
+        set_operand(i, k, ir.load(B, x.ty, s));
+        ir.at_end(B, cur);
     }
     fixes.deinit();
     ks.deinit();

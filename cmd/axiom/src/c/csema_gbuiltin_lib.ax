@@ -1,0 +1,528 @@
+// =============================================================================
+// csema_gbuiltin_lib.ax - GNU fp classify, overflow, library, _chk and
+// atomic builtins, part of csema.ax.
+// =============================================================================
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cfeat.ax" as cf;
+import "ctypes.ax" as cty;
+
+fn atomic_op(name: []u8) u64 {
+    let ops: [6]u64 = [1, 2, 5, 3, 6, OP_NAND];  // (ir.RMW_ADD, RMW_SUB, RMW_OR, RMW_AND, RMW_XOR)
+    let k = cf.atomic_op_index(name);
+    if k >= 0 {
+        return ops[@int_cast(usize, k)];
+    }
+    return 0xFFFF;
+}
+
+// What an atomic builtin's name says: its A_ kind (or -1) and RMW op.
+struct Atomic {
+    kind: i32,
+    op: u64,
+    sync: bool,
+}
+
+fn atomic_of(name: []u8) Atomic {
+    let none = Atomic.{ kind: -1, op: 0, sync: false };
+    if u.starts(name, "__sync_") {
+        let r = name[7..];
+        if u.starts(r, "fetch_and_") {
+            let op = atomic_op(r[10..]);
+            if op != 0xFFFF {
+                return Atomic.{ kind: A_FETCH_OP, op: op, sync: true };
+            }
+        }
+        if u.ends(r, "_and_fetch") {
+            let op = atomic_op(r[0..r.len - 10]);
+            if op != 0xFFFF {
+                return Atomic.{ kind: A_OP_FETCH, op: op, sync: true };
+            }
+        }
+        let kinds: [5]i32 = [A_CAS_BOOL, A_CAS_VAL, A_XCHG, A_RELEASE, A_FENCE];
+        for k in 0..cf.SYNC_NAMES.len {
+            if u.str_eq(r, cf.SYNC_NAMES[k]) {
+                return Atomic.{ kind: kinds[k], op: 0, sync: true };
+            }
+        }
+        return none;
+    }
+    if not u.starts(name, "__atomic_") {
+        return none;
+    }
+    let r = name[9..];
+    if u.starts(r, "fetch_") {
+        let op = atomic_op(r[6..]);
+        if op != 0xFFFF {
+            return Atomic.{ kind: A_FETCH_OP, op: op, sync: false };
+        }
+    }
+    if u.ends(r, "_fetch") {
+        let op = atomic_op(r[0..r.len - 6]);
+        if op != 0xFFFF {
+            return Atomic.{ kind: A_OP_FETCH, op: op, sync: false };
+        }
+    }
+    let kinds: [12]i32 = [A_LOAD, A_STORE, A_XCHG, A_CMPXCHG, A_FENCE, A_FENCE, A_TEST_SET, A_CLEAR, A_LOAD_G,
+                          A_STORE_G, A_XCHG_G, A_CMPXCHG_G];
+    for k in 0..cf.ATOMIC_NAMES.len {
+        if u.str_eq(r, cf.ATOMIC_NAMES[k]) {
+            return Atomic.{ kind: kinds[k], op: 0, sync: false };
+        }
+    }
+    return none;
+}
+
+// isnan, isinf, isfinite, signbit, isnormal, isinf_sign, fpclassify, and the
+// comparisons isgreater ... isunordered: on a floating type (an integer is
+// converted to double), int results.
+fn classify(e: *mut cast.Expr, rest: []u8) void {
+    let fp = u.str_eq(rest, "fpclassify");
+    let cmp = cf.in_list(rest, cf.CMPS[..]);
+    let n: usize = pick_n(fp, 6, pick_n(cmp, 2, 1));
+    if not gbi_arity(e, n, n) or not gbi_args_ok(e) {
+        _ = bad_expr(e);
+        return;
+    }
+    let mut first: usize = 0;
+    if fp {
+        for k in @as(usize, 0)..5 {
+            if not gbi_arg_as(e, k, cty.t_int) {
+                _ = bad_expr(e);
+                return;
+            }
+        }
+        first = 5;
+    }
+    let mut ft = cty.t_error;
+    for k in first..n {
+        let x = e.args.get(k);
+        if cty.is_floating(x.ty) {
+            if cty.is_error(ft) or (cty.size_of(x.ty) > cty.size_of(ft)) {
+                ft = cty.unqual(x.ty);
+            }
+        } else if cty.is_integer(x.ty) {
+            if cty.is_error(ft) {
+                ft = cty.t_double;
+            }
+        } else {
+            err(x.span, "C3082", u.f2("the operand of '%s' has type %s, not a real floating type", e.a.name, tq(x.ty)));
+            _ = bad_expr(e);
+            return;
+        }
+    }
+    for k in first..n {
+        e.args.set(k, convert(e.args.get(k), ft));
+    }
+    e.ty = cty.t_int;
+    if cmp {
+        for k in 0..cf.CMPS.len {
+            if u.str_eq(rest, cf.CMPS[k]) {
+                e.op = GB_ISGREATER + @int_cast(i32, k);
+            }
+        }
+        return;
+    }
+    for k in 0..cf.CLASS.len {
+        if u.str_eq(rest, cf.CLASS[k]) {
+            e.op = GB_ISNAN + @int_cast(i32, k);
+        }
+    }
+}
+
+// isnanf, isinfl, finite ... : the classification of TCLASS_OF of an
+// operand converted to the type of the suffix (finite: double), as by a
+// prototype.
+fn typed_classify(e: *mut cast.Expr, rest: []u8) void {
+    let mut t = cty.t_double;
+    if u.ends(rest, "f") {
+        t = cty.t_float;
+    } else if u.ends(rest, "l") {
+        t = cty.t_ldouble;
+    }
+    if not gbi_arity(e, 1, 1) or not gbi_arg_as(e, 0, t) {
+        _ = bad_expr(e);
+        return;
+    }
+    e.ty = cty.t_int;
+    for k in 0..cf.TCLASS.len {
+        if u.str_eq(rest, cf.TCLASS[k]) {
+            for j in 0..cf.CLASS.len {
+                if u.str_eq(TCLASS_OF[k], cf.CLASS[j]) {
+                    e.op = GB_ISNAN + @int_cast(i32, j);
+                }
+            }
+        }
+    }
+}
+
+// __builtin_{add,sub,mul}_overflow(a, b, r) and the typed ones
+// (__builtin_sadd_overflow ...): ckd_add(r, a, b) (csema_builtin.ax); the
+// _p ones: whether the operation overflows the type of their third
+// argument, which is not evaluated otherwise.
+fn overflow(e: *mut cast.Expr, rest: []u8) void {
+    let p = u.ends(rest, "_p");
+    let mut op = rest[0..3];
+    let mut ty = u.nil.[cty.CType]();
+    if (rest.len > 4) and ((rest[0] == 's') or (rest[0] == 'u')) and not u.starts(rest, "sub_") {
+        // typed: sadd, uaddl, smulll ...
+        op = rest[1..4];
+        let mut longs: i32 = 0;
+        let mut k: usize = 4;
+        while (k < rest.len) and (rest[k] == 'l') {
+            longs += 1;
+            k += 1;
+        }
+        ty = by_longs(longs, rest[0] == 'u');
+    }
+    if not gbi_arity(e, 3, 3) {
+        _ = bad_expr(e);
+        return;
+    }
+    if u.notnil(ty) {
+        if not gbi_arg_as(e, 0, ty) or not gbi_arg_as(e, 1, ty) or not gbi_arg_as(e, 2, cty.pointer_to(ty)) {
+            _ = bad_expr(e);
+            return;
+        }
+    } else if not gbi_args_ok(e) {
+        _ = bad_expr(e);
+        return;
+    }
+    let mut id = BI_CKD_ADD;
+    if u.str_eq(op, "sub") {
+        id = BI_CKD_SUB;
+    } else if u.str_eq(op, "mul") {
+        id = BI_CKD_MUL;
+    }
+    let a = e.args.get(0);
+    let b = e.args.get(1);
+    let r = e.args.get(2);
+    for x in [a, b] {
+        if not cty.is_integer(x.ty) or (x.ty.unq.kind == cty.TK_BOOL) or (x.ty.unq.kind == cty.TK_ENUM) {
+            err(x.span, "C3082", u.f2("an operand of '%s' has type %s, not an integer type", e.a.name, tq(x.ty)));
+            _ = bad_expr(e);
+            return;
+        }
+    }
+    if p {
+        if not cty.is_integer(r.ty) or (r.ty.unq.kind == cty.TK_BOOL) {
+            err(r.span, "C3082", u.f2("the third operand of '%s' has type %s, not an integer type", e.a.name,
+                                      tq(r.ty)));
+            _ = bad_expr(e);
+            return;
+        }
+        e.op = GB_OV_P + (id - BI_CKD_ADD);
+        e.ty = cty.t_bool;
+        return;
+    }
+    if (r.ty.kind != cty.TK_POINTER) or not cty.is_integer(r.ty.elem) or (r.ty.elem.unq.kind == cty.TK_BOOL) or
+       (r.ty.elem.unq.kind == cty.TK_ENUM) or ((r.ty.elem.quals & cty.Q_CONST) != 0) {
+        err(r.span, "C3082", u.f2("the third operand of '%s' has type %s, not a pointer to a modifiable integer",
+                                  e.a.name, tq(r.ty)));
+        _ = bad_expr(e);
+        return;
+    }
+    e.args.set(0, r);
+    e.args.set(1, a);
+    e.args.set(2, b);
+    e.op = id;
+    e.ty = cty.t_bool;
+}
+
+// The C type of a code of LIB_TYPES.
+fn lib_type(c: u8) *mut cty.CType {
+    let cv = cty.qualify(cty.t_void, cty.Q_CONST);
+    let cch = cty.qualify(cty.t_char, cty.Q_CONST);
+    match c {
+        'v' => { return cty.t_void; }
+        'i' => { return cty.t_int; }
+        'u' => { return cty.t_uint; }
+        'l' => { return cty.t_long; }
+        'L' => { return cty.t_ulong; }
+        'q' => { return cty.t_llong; }
+        'z' => { return cty.t_size; }
+        'f' => { return cty.t_float; }
+        'd' => { return cty.t_double; }
+        'D' => { return cty.t_ldouble; }
+        'p' => { return cty.pointer_to(cty.t_void); }
+        'P' => { return cty.pointer_to(cv); }
+        'c' => { return cty.pointer_to(cty.t_char); }
+        'C' => { return cty.pointer_to(cch); }
+        'I' => { return cty.pointer_to(cty.t_int); }
+        'F' => { return cty.pointer_to(cty.t_float); }
+        'G' => { return cty.pointer_to(cty.t_double); }
+        'V' => {
+            // (va_list as a parameter: adjusted, an array to a pointer)
+            let t = va_list_type();
+            if t.kind == cty.TK_ARRAY {
+                return cty.pointer_to(t.elem);
+            }
+            return t;
+        }
+        else => { return cty.pointer_to(cty.t_ldouble); }
+    }
+}
+
+// __builtin___X_chk(..., size): the plain function's gbi_call, its arguments
+// but the object size, when that size is (size_t)-1 or (the memory
+// functions, the string copies of a length) a constant length is at most a
+// constant size; else a gbi_call of the library's __X_chk. The result as
+// gbi_call's: true when typed here.
+fn chk_call(e: *mut cast.Expr, k: usize) bool {
+    let plain = CHK_PLAIN[k];
+    let code = CHK_TYPES[k];
+    let nfixed = code.len - 1;
+    if (plain.len > 0) and (e.args.len == nfixed) {
+        let mut size: i64 = 0;
+        let sized = const_int(gbi_arg(e, nfixed - 1), &mut size);
+        let mut fits = sized and (size == -1);
+        if not fits and sized and (size >= 0) and (((k <= 3) and (k != 2)) or (k == 6)) {
+            // (memcpy (d, s, n, size), memmove, memset, strncpy: they write
+            // n bytes, at most size)
+            let mut n: i64 = 0;
+            fits = const_int(gbi_arg(e, 2), &mut n) and (n >= 0) and (n <= size);
+        }
+        if fits {
+            _ = e.args.pop();
+            let f = cast.new_expr(cast.ExprKind.IDENT, e.a.span);
+            f.name = u.intern(u.cat2("__builtin_", plain));
+            e.a = f;
+            return gbi_call(e);
+        }
+    }
+    library(e, cf.CHK_NAMES[k], code);
+    return false;
+}
+
+// __builtin_name(...) of a library function: a gbi_call of `name` (the
+// program's own declaration of it if it has one, else one of the type
+// LIB_TYPES gives, external).
+fn library(e: *mut cast.Expr, name0: []u8, code: []u8) void {
+    let name = u.intern(name0);
+    let mut s = linked(name);
+    if u.isnil(s) or (s.kind != cast.SK_FUNC) {
+        let mut ps = u.List.[*mut cty.CType].empty();
+        let mut variadic = false;
+        for k in 1..code.len {
+            if code[k] == '.' {
+                variadic = true;
+            } else {
+                ps.push(lib_type(code[k]));
+            }
+        }
+        s = new_sym(cast.SK_FUNC, name, e.a.span, cty.function(lib_type(code[0]), ps.items_mut(), true, variadic));
+        s.linkage = cast.LK_EXTERNAL;
+        set_linked(name, s);
+    }
+    let f = cast.new_expr(cast.ExprKind.IDENT, e.a.span);
+    f.name = name;
+    f.sym = s;
+    f.ty = s.ty;
+    f.lvalue = true;
+    s.used = true;
+    e.a = f;
+}
+
+// __atomic_always_lock_free(size, p), __atomic_is_lock_free: 1 for 1, 2, 4
+// and 8 bytes (every target has those), and for 16 on AArch64 and on
+// x86-64 with cmpxchg16b among the target's extensions (cgen_atomic.ax; on
+// one without, whether the processor has it is known only when the program
+// runs, which atomic_is_lock_free asks), else 0.
+fn lock_free(e: *mut cast.Expr) void {
+    if not gbi_arity(e, 2, 2) {
+        _ = bad_expr(e);
+        return;
+    }
+    let r = ice(e.args.get(0), u.f1("the size in '%s'", e.a.name));
+    _ = gbi_arg(e, 1);
+    if not r.ok {
+        _ = bad_expr(e);
+        return;
+    }
+    let v = r.v;
+    let wide = (v == 16) and ((tg.g_arch == tg.ARCH_A64) or ((tg.g_arch == tg.ARCH_X64) and tg.has(tg.X_CMPXCHG16B)));
+    fold_int(e, cty.t_bool, pick_u((v == 1) or (v == 2) or (v == 4) or (v == 8) or wide, 1, 0));
+}
+
+// The type an atomic builtin works on: what argument k points to, an
+// integer or pointer type of 1, 2, 4 or 8 bytes (is_generic: any complete
+// object type, other sizes under cgen_atomic.ax's lock); nil after an error
+// (reported).
+fn atomic_type(e: *mut cast.Expr, k: usize, is_generic: bool) *mut cty.CType {
+    let p = e.args.get(k);
+    if (p.ty.kind != cty.TK_POINTER) {
+        err(p.span, "C3082", u.f2("argument %s of '%s' is not a pointer", u.zdec(k + 1), e.a.name));
+        return u.nil.[cty.CType]();
+    }
+    let t = p.ty.elem;
+    let sz = cty.size_of(t);
+    let free = (sz == 1) or (sz == 2) or (sz == 4) or (sz == 8);
+    let size_ok = free or (is_generic and (sz > 0));
+    let kind_ok = is_generic or ((cty.is_integer(t) or cty.is_pointer(t)) and (t.unq.kind != cty.TK_BOOL));
+    if not cty.is_complete(t) or not size_ok or not kind_ok or cty.is_func(t) {
+        err(p.span, "C3082",
+            u.f3("'%s' takes a pointer to %s, not %s", e.a.name, u.pick(is_generic, "a complete object type",
+                                                                        "an integer or pointer type of 1, 2, 4 or 8 bytes"),
+                 tq(p.ty)));
+        return u.nil.[cty.CType]();
+    }
+    if (k == 0) and free and (cty.align_of(t) < sz) {
+        // (an atomic operation is on an object aligned to its size)
+        err(p.span, "C3082", u.f3("'%s' on an object of %s bytes aligned to %s (its size is needed)", e.a.name,
+                                  u.udec(sz), u.udec(cty.align_of(t))));
+        return u.nil.[cty.CType]();
+    }
+    return t;
+}
+
+fn atomic_call(e: *mut cast.Expr, at: Atomic) void {
+    let k = at.kind;
+    e.op = GB_ATOMIC + k;
+    e.cval = at.op;
+    e.ty = cty.t_void;
+    // the number of operands before the memory orders, and how many orders
+    let mut n: usize = 1;
+    let mut orders: usize = 1;
+    if (k == A_FETCH_OP) or (k == A_OP_FETCH) or (k == A_XCHG) or (k == A_STORE) or (k == A_LOAD_G) or
+       (k == A_STORE_G) {
+        n = 2;
+    } else if (k == A_CAS_BOOL) or (k == A_CAS_VAL) or (k == A_XCHG_G) {
+        n = 3;
+    } else if (k == A_CMPXCHG) or (k == A_CMPXCHG_G) {
+        n = 4;  // (with `weak`)
+        orders = 2;
+    } else if k == A_FENCE {
+        n = 0;
+    }
+    if at.sync {
+        orders = 0;
+        if k == A_FENCE {
+            n = 0;
+        }
+    }
+    let total = n + orders;
+    if at.sync and (k != A_FENCE) {
+        // (__sync_ builtins may take a list of variables after their operands: ignored)
+        if not gbi_arity(e, n, 64) {
+            _ = bad_expr(e);
+            return;
+        }
+        while e.args.len > n {
+            _ = e.args.pop();
+        }
+    } else if not gbi_arity(e, total, total) {
+        _ = bad_expr(e);
+        return;
+    }
+    if not gbi_args_ok(e) {
+        _ = bad_expr(e);
+        return;
+    }
+    for i in n..total {
+        if not cty.is_integer(e.args.get(i).ty) {
+            err(e.args.get(i).span, "C3082", u.f1("a memory order of '%s' is not an integer", e.a.name));
+            _ = bad_expr(e);
+            return;
+        }
+    }
+    if orders > 0 {
+        // (the orders each takes, as C11's: C4092)
+        let what = u.f1("'%s'", e.a.name);
+        let o = e.args.get(n);
+        if (k == A_LOAD) or (k == A_LOAD_G) {
+            check_order(o, OK_LOAD, what, true);
+        } else if (k == A_STORE) or (k == A_STORE_G) or (k == A_CLEAR) {
+            check_order(o, OK_STORE, what, true);
+        } else {
+            check_order(o, OK_ANY, what, true);
+        }
+        if orders == 2 {
+            check_failure(o, e.args.get(n + 1), what, true);
+        }
+    }
+    if k == A_FENCE {
+        return;
+    }
+    let is_generic = (k == A_LOAD_G) or (k == A_STORE_G) or (k == A_XCHG_G) or (k == A_CMPXCHG_G) or
+                     (k == A_TEST_SET) or (k == A_CLEAR);
+    let t = atomic_type(e, 0, is_generic);
+    if u.isnil(t) {
+        _ = bad_expr(e);
+        return;
+    }
+    if ((e.args.get(0).ty.elem.quals & cty.Q_CONST) != 0) and (k != A_LOAD) and (k != A_LOAD_G) {
+        err(e.args.get(0).span, "C3082", u.f1("'%s' of a const object", e.a.name));
+        _ = bad_expr(e);
+        return;
+    }
+    let vt = cty.unqual(t);
+    if is_generic and (k != A_TEST_SET) and (k != A_CLEAR) {
+        // (the other pointers: to objects of the same size)
+        let last = pick_n(k == A_CMPXCHG_G, 3, n);
+        for i in 1..last {
+            let q = atomic_type(e, i, true);
+            if u.isnil(q) or (cty.size_of(q) != cty.size_of(t)) {
+                if u.notnil(q) {
+                    err(e.args.get(i).span, "C3082", u.f1("the objects of '%s' are of different sizes", e.a.name));
+                }
+                _ = bad_expr(e);
+                return;
+            }
+        }
+        if k == A_CMPXCHG_G {
+            e.ty = cty.t_bool;
+        }
+        return;
+    }
+    if (k == A_TEST_SET) or (k == A_CLEAR) {
+        if k == A_TEST_SET {
+            e.ty = cty.t_bool;
+        }
+        return;
+    }
+    if (k == A_FETCH_OP) or (k == A_OP_FETCH) or (k == A_XCHG) or (k == A_STORE) {
+        if cty.is_pointer(vt) and (k != A_XCHG) and (k != A_STORE) {
+            // (an operation on a pointer: by bytes, its operand an integer)
+            if not gbi_arg_as(e, 1, cty.t_ptrdiff) {
+                _ = bad_expr(e);
+                return;
+            }
+        } else if not gbi_arg_as(e, 1, vt) {
+            _ = bad_expr(e);
+            return;
+        }
+        if k != A_STORE {
+            e.ty = vt;
+        }
+        return;
+    }
+    if (k == A_CAS_BOOL) or (k == A_CAS_VAL) {
+        if not gbi_arg_as(e, 1, vt) or not gbi_arg_as(e, 2, vt) {
+            _ = bad_expr(e);
+            return;
+        }
+        e.ty = pick_t(k == A_CAS_BOOL, cty.t_bool, vt);
+        return;
+    }
+    if k == A_LOAD {
+        e.ty = vt;
+        return;
+    }
+    if k == A_RELEASE {
+        return;
+    }
+    // __atomic_compare_exchange_n(p, expected, desired, weak, ...)
+    let ep = e.args.get(1);
+    if (ep.ty.kind != cty.TK_POINTER) or not cty.compatible_unq(ep.ty.elem, vt) {
+        err(ep.span, "C3082", u.f2("the expected value of '%s' must be pointed to by a %s", e.a.name,
+                                   tq(cty.pointer_to(vt))));
+        _ = bad_expr(e);
+        return;
+    }
+    if not gbi_arg_as(e, 2, vt) {
+        _ = bad_expr(e);
+        return;
+    }
+    e.ty = cty.t_bool;
+}

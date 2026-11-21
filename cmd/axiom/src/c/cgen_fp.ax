@@ -1,6 +1,7 @@
 // =============================================================================
 // cgen_fp.ax - IR generation for the builtins of <math.h> and <fenv.h>
 // (csema_fp.ax; __builtin_axiom_tg never gets here: it becomes a call).
+// Part of cgen.ax.
 //
 // The classification of x is done on its bits (integer operations), so it
 // raises no floating-point exception, signaling NaNs included; the
@@ -14,127 +15,118 @@
 import "../ir.ax" as ir;
 import "../target.ax" as tg;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
-import "cgen_dec.ax" as gdec;
-import "cgen_half.ax" as ghf;
-import "cgen_ld.ax" as gld;
-import "csema_fp.ax" as fp;
+import "csema.ax" as cs;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
-fn B() *mut ir.Builder {
-    return cg.B;
-}
-
-/// The value of builtin call e, its arguments' values vs.
-pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+// The value of builtin call e, its arguments' values vs.
+fn fp_builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let id = e.op;
-    let it = cg.lty(e.ty);
-    if id == fp.BI_FENV_GET {
-        let p = cg.alloca(cty.t_ullong, "fenv");
+    let it = lty(e.ty);
+    if id == cs.BI_FENV_GET {
+        let p = alloca(cty.t_ullong, "fenv");
         let t64 = ir.t_int(64);
-        _ = ir.store(B(), ir.cint(t64, 0), p);
+        _ = ir.store(B, ir.cint(t64, 0), p);
         if not tg.is_wasm() {
             let mut a: [1]*mut ir.Value = [p];
-            _ = ir.intr(B(), ir.IN_FPENV_GET, ir.t_void(), a[..]);
+            _ = ir.intr(B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
         }
-        return ir.load(B(), t64, p);
+        return ir.load(B, t64, p);
     }
-    if id == fp.BI_FENV_SET {
+    if id == cs.BI_FENV_SET {
         if not tg.is_wasm() {
-            let p = cg.alloca(cty.t_ullong, "fenv");
-            _ = ir.store(B(), vs[0], p);
+            let p = alloca(cty.t_ullong, "fenv");
+            _ = ir.store(B, vs[0], p);
             let mut a: [1]*mut ir.Value = [p];
-            _ = ir.intr(B(), ir.IN_FPENV_SET, ir.t_void(), a[..]);
+            _ = ir.intr(B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
         }
         return ir.vnil();
     }
     let t = e.args.get(0).ty;
-    if id == fp.BI_ISFPCLASS {
+    if id == cs.BI_ISFPCLASS {
         return fpclass(e.args.get(1).cval, t, vs[0], it);
     }
     if cty.is_decimal(t) {
         // (decimal.ax's: the class from the encoding; quiet comparisons)
-        if id >= fp.BI_ISGREATER {
-            return ir.zext(B(), compare_dec(id, t, vs[0], vs[1]), it);
+        if id >= cs.BI_ISGREATER {
+            return ir.zext(B, fp_compare_dec(id, t, vs[0], vs[1]), it);
         }
-        return ir.zext(B(), gdec.classify(id - fp.BI_FPCLASSIFY, t, vs[0]), it);
+        return ir.zext(B, dec_classify(id - cs.BI_FPCLASSIFY, t, vs[0]), it);
     }
     if cty.is_wide(t) {
         // a long double wider than double (cgen_ld.ax): in memory
-        if id >= fp.BI_ISGREATER {
-            return ir.zext(B(), compare_wide(id, vs[0], vs[1], t), it);
+        if id >= cs.BI_ISGREATER {
+            return ir.zext(B, fp_compare_wide(id, vs[0], vs[1], t), it);
         }
         return classify_wide(id, vs[0], it, cty.ffmt(t) == 80);
     }
-    if id >= fp.BI_ISGREATER {
+    if id >= cs.BI_ISGREATER {
         if cty.is_half(t) {
             // (the same values in float)
-            return ir.zext(B(), compare(id, ghf.to_f32(vs[0], t), ghf.to_f32(vs[1], t)), it);
+            return ir.zext(B, fp_compare(id, half_to_f32(vs[0], t), half_to_f32(vs[1], t)), it);
         }
-        return ir.zext(B(), compare(id, vs[0], vs[1]), it);
+        return ir.zext(B, fp_compare(id, vs[0], vs[1]), it);
     }
-    return classify(id, vs[0], it);
+    return fp_classify(id, vs[0], it);
 }
 
-fn compare(id: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
-    if id == fp.BI_ISGREATER {
-        return ir.fcmp(B(), ir.RealOGT, x, y);
+fn fp_compare(id: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    if id == cs.BI_ISGREATER {
+        return ir.fcmp(B, ir.RealOGT, x, y);
     }
-    if id == fp.BI_ISGREATEREQUAL {
-        return ir.fcmp(B(), ir.RealOGE, x, y);
+    if id == cs.BI_ISGREATEREQUAL {
+        return ir.fcmp(B, ir.RealOGE, x, y);
     }
-    if id == fp.BI_ISLESS {
-        return ir.fcmp(B(), ir.RealOLT, x, y);
+    if id == cs.BI_ISLESS {
+        return ir.fcmp(B, ir.RealOLT, x, y);
     }
-    if id == fp.BI_ISLESSEQUAL {
-        return ir.fcmp(B(), ir.RealOLE, x, y);
+    if id == cs.BI_ISLESSEQUAL {
+        return ir.fcmp(B, ir.RealOLE, x, y);
     }
-    if id == fp.BI_ISLESSGREATER {
-        return ir.binop(B(), ir.OP_OR, ir.fcmp(B(), ir.RealOLT, x, y), ir.fcmp(B(), ir.RealOGT, x, y));
+    if id == cs.BI_ISLESSGREATER {
+        return ir.binop(B, ir.OP_OR, ir.fcmp(B, ir.RealOLT, x, y), ir.fcmp(B, ir.RealOGT, x, y));
     }
     // unordered: x or y is a NaN
-    return ir.binop(B(), ir.OP_OR, ir.fcmp(B(), ir.RealUNE, x, x), ir.fcmp(B(), ir.RealUNE, y, y));
+    return ir.binop(B, ir.OP_OR, ir.fcmp(B, ir.RealUNE, x, x), ir.fcmp(B, ir.RealUNE, y, y));
 }
 
-fn compare_dec(id: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+fn fp_compare_dec(id: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     let mut op = ct.P_NE;  // (unordered: c == 2)
-    if id == fp.BI_ISGREATER {
+    if id == cs.BI_ISGREATER {
         op = ct.P_GT;
-    } else if id == fp.BI_ISGREATEREQUAL {
+    } else if id == cs.BI_ISGREATEREQUAL {
         op = ct.P_GE;
-    } else if id == fp.BI_ISLESS {
+    } else if id == cs.BI_ISLESS {
         op = ct.P_LT;
-    } else if id == fp.BI_ISLESSEQUAL {
+    } else if id == cs.BI_ISLESSEQUAL {
         op = ct.P_LE;
-    } else if id == fp.BI_ISLESSGREATER {
-        return ir.binop(
-            B(), ir.OP_OR, gdec.compare_q(ct.P_LT, t, x, y, false), gdec.compare_q(ct.P_GT, t, x, y, false));
+    } else if id == cs.BI_ISLESSGREATER {
+        return ir.binop(B, ir.OP_OR, dec_compare_q(ct.P_LT, t, x, y, false), dec_compare_q(ct.P_GT, t, x, y, false));
     } else {
-        return gdec.unordered(t, x, y);
+        return dec_unordered(t, x, y);
     }
-    return gdec.compare_q(op, t, x, y, false);
+    return dec_compare_q(op, t, x, y, false);
 }
 
-fn compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    if id == fp.BI_ISGREATER {
-        return gld.compare(ct.P_GT, x, y, t);
+fn fp_compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if id == cs.BI_ISGREATER {
+        return ld_compare(ct.P_GT, x, y, t);
     }
-    if id == fp.BI_ISGREATEREQUAL {
-        return gld.compare(ct.P_GE, x, y, t);
+    if id == cs.BI_ISGREATEREQUAL {
+        return ld_compare(ct.P_GE, x, y, t);
     }
-    if id == fp.BI_ISLESS {
-        return gld.compare(ct.P_LT, x, y, t);
+    if id == cs.BI_ISLESS {
+        return ld_compare(ct.P_LT, x, y, t);
     }
-    if id == fp.BI_ISLESSEQUAL {
-        return gld.compare(ct.P_LE, x, y, t);
+    if id == cs.BI_ISLESSEQUAL {
+        return ld_compare(ct.P_LE, x, y, t);
     }
-    if id == fp.BI_ISLESSGREATER {
-        return ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y, t), gld.compare(ct.P_GT, x, y, t));
+    if id == cs.BI_ISLESSGREATER {
+        return ir.binop(B, ir.OP_OR, ld_compare(ct.P_LT, x, y, t), ld_compare(ct.P_GT, x, y, t));
     }
     // unordered: neither <, = nor >
-    let o = ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y, t), gld.compare(ct.P_GT, x, y, t));
-    return ir.icmp(B(), ir.IntEQ, ir.binop(B(), ir.OP_OR, o, gld.compare(ct.P_EQ, x, y, t)), ir.cint(ir.t_int(1), 0));
+    let o = ir.binop(B, ir.OP_OR, ld_compare(ct.P_LT, x, y, t), ld_compare(ct.P_GT, x, y, t));
+    return ir.icmp(B, ir.IntEQ, ir.binop(B, ir.OP_OR, o, ld_compare(ct.P_EQ, x, y, t)), ir.cint(ir.t_int(1), 0));
 }
 
 // The class of a wide long double at p, from its bits: the x87's 80-bit
@@ -144,107 +136,105 @@ fn compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut
 // 112-bit fraction).
 fn classify_wide(id: i32, p: *mut ir.Value, it: *mut ir.Ty, x87: bool) *mut ir.Value {
     let t64 = ir.t_int(64);
-    let lo = ir.load(B(), t64, p);
-    let hi = ir.load(B(), t64, ir.ptradd(B(), p, cg.usz(8)));
-    let mut se = ir.binop(B(), ir.OP_LSHR, hi, ir.cint(t64, 48));  // sign and exponent
-    let mut frac = ir.binop(B(), ir.OP_OR, ir.binop(B(), ir.OP_AND, hi, ir.cint(t64, 0xffffffffffff)), lo);
-    let mut quiet = ir.binop(B(), ir.OP_AND, hi, ir.cint(t64, 0x800000000000));
+    let lo = ir.load(B, t64, p);
+    let hi = ir.load(B, t64, ir.ptradd(B, p, usz(8)));
+    let mut se = ir.binop(B, ir.OP_LSHR, hi, ir.cint(t64, 48));  // sign and exponent
+    let mut frac = ir.binop(B, ir.OP_OR, ir.binop(B, ir.OP_AND, hi, ir.cint(t64, 0xffffffffffff)), lo);
+    let mut quiet = ir.binop(B, ir.OP_AND, hi, ir.cint(t64, 0x800000000000));
     let mut int_ok = ir.cint(ir.t_int(1), 1);
     if x87 {
-        se = ir.binop(B(), ir.OP_AND, hi, ir.cint(t64, 0xffff));
-        frac = ir.binop(B(), ir.OP_SHL, lo, ir.cint(t64, 1));  // (without the integer bit)
-        quiet = ir.binop(B(), ir.OP_AND, lo, ir.cint(t64, 0x4000000000000000));
-        int_ok = ir.icmp(B(), ir.IntNE, ir.binop(B(), ir.OP_LSHR, lo, ir.cint(t64, 63)), ir.cint(t64, 0));
+        se = ir.binop(B, ir.OP_AND, hi, ir.cint(t64, 0xffff));
+        frac = ir.binop(B, ir.OP_SHL, lo, ir.cint(t64, 1));  // (without the integer bit)
+        quiet = ir.binop(B, ir.OP_AND, lo, ir.cint(t64, 0x4000000000000000));
+        int_ok = ir.icmp(B, ir.IntNE, ir.binop(B, ir.OP_LSHR, lo, ir.cint(t64, 63)), ir.cint(t64, 0));
     }
-    let ex = ir.binop(B(), ir.OP_AND, se, ir.cint(t64, 0x7fff));
-    if id == fp.BI_SIGNBIT {
-        return ir.zext(B(), ir.icmp(B(), ir.IntNE, ir.binop(B(), ir.OP_AND, se, ir.cint(t64, 0x8000)), ir.cint(t64, 0)),
-                       it);
+    let ex = ir.binop(B, ir.OP_AND, se, ir.cint(t64, 0x7fff));
+    if id == cs.BI_SIGNBIT {
+        return ir.zext(B, ir.icmp(B, ir.IntNE, ir.binop(B, ir.OP_AND, se, ir.cint(t64, 0x8000)), ir.cint(t64, 0)), it);
     }
-    if id == fp.BI_ISCANONICAL {
+    if id == cs.BI_ISCANONICAL {
         if x87 {
             // (the x87's invalid encodings are not canonical: an exponent
             // that is not 0 needs the integer bit)
-            let ez = ir.icmp(B(), ir.IntEQ, ex, ir.cint(t64, 0));
-            return ir.zext(B(), ir.binop(B(), ir.OP_OR, ez, int_ok), it);
+            let ez = ir.icmp(B, ir.IntEQ, ex, ir.cint(t64, 0));
+            return ir.zext(B, ir.binop(B, ir.OP_OR, ez, int_ok), it);
         }
         return ir.cint(it, 1);
     }
-    let fz = ir.icmp(B(), ir.IntEQ, frac, ir.cint(t64, 0));
-    let emax = ir.icmp(B(), ir.IntEQ, ex, ir.cint(t64, 0x7fff));
-    let ezero = ir.icmp(B(), ir.IntEQ, ex, ir.cint(t64, 0));
+    let fz = ir.icmp(B, ir.IntEQ, frac, ir.cint(t64, 0));
+    let emax = ir.icmp(B, ir.IntEQ, ex, ir.cint(t64, 0x7fff));
+    let ezero = ir.icmp(B, ir.IntEQ, ex, ir.cint(t64, 0));
     let one = ir.cint(ir.t_int(1), 1);
     // inf: the top exponent, no fraction (and on the x87 the integer bit)
-    let is_inf = ir.binop(B(), ir.OP_AND, ir.binop(B(), ir.OP_AND, emax, fz), int_ok);
-    let is_zero = ir.binop(B(), ir.OP_AND, ezero, ir.icmp(B(), ir.IntEQ, lo, ir.cint(t64, 0)));
-    let is_zero2 = ir.binop(B(), ir.OP_AND, is_zero, fz);
-    let is_sub = ir.binop(B(), ir.OP_AND, ezero, ir.binop(B(), ir.OP_XOR, is_zero2, one));
+    let is_inf = ir.binop(B, ir.OP_AND, ir.binop(B, ir.OP_AND, emax, fz), int_ok);
+    let is_zero = ir.binop(B, ir.OP_AND, ezero, ir.icmp(B, ir.IntEQ, lo, ir.cint(t64, 0)));
+    let is_zero2 = ir.binop(B, ir.OP_AND, is_zero, fz);
+    let is_sub = ir.binop(B, ir.OP_AND, ezero, ir.binop(B, ir.OP_XOR, is_zero2, one));
     // normal: the exponent neither 0 nor the top (and the integer bit)
-    let mid = ir.binop(B(), ir.OP_XOR, ir.binop(B(), ir.OP_OR, ezero, emax), one);
-    let is_normal = ir.binop(B(), ir.OP_AND, mid, int_ok);
+    let mid = ir.binop(B, ir.OP_XOR, ir.binop(B, ir.OP_OR, ezero, emax), one);
+    let is_normal = ir.binop(B, ir.OP_AND, mid, int_ok);
     // NaN: everything else
-    let any = ir.binop(
-        B(), ir.OP_OR, ir.binop(B(), ir.OP_OR, is_inf, is_zero2), ir.binop(B(), ir.OP_OR, is_sub, is_normal));
-    let is_nan = ir.binop(B(), ir.OP_XOR, any, one);
-    if id == fp.BI_ISFINITE {
-        return ir.zext(B(), ir.binop(B(), ir.OP_OR, ir.binop(B(), ir.OP_OR, is_zero2, is_sub), is_normal), it);
+    let any = ir.binop(B, ir.OP_OR, ir.binop(B, ir.OP_OR, is_inf, is_zero2), ir.binop(B, ir.OP_OR, is_sub, is_normal));
+    let is_nan = ir.binop(B, ir.OP_XOR, any, one);
+    if id == cs.BI_ISFINITE {
+        return ir.zext(B, ir.binop(B, ir.OP_OR, ir.binop(B, ir.OP_OR, is_zero2, is_sub), is_normal), it);
     }
-    if id == fp.BI_ISINF {
-        return ir.zext(B(), is_inf, it);
+    if id == cs.BI_ISINF {
+        return ir.zext(B, is_inf, it);
     }
-    if id == fp.BI_ISNAN {
-        return ir.zext(B(), is_nan, it);
+    if id == cs.BI_ISNAN {
+        return ir.zext(B, is_nan, it);
     }
-    if id == fp.BI_ISNORMAL {
-        return ir.zext(B(), is_normal, it);
+    if id == cs.BI_ISNORMAL {
+        return ir.zext(B, is_normal, it);
     }
-    if id == fp.BI_ISSUBNORMAL {
-        return ir.zext(B(), is_sub, it);
+    if id == cs.BI_ISSUBNORMAL {
+        return ir.zext(B, is_sub, it);
     }
-    if id == fp.BI_ISZERO {
-        return ir.zext(B(), is_zero2, it);
+    if id == cs.BI_ISZERO {
+        return ir.zext(B, is_zero2, it);
     }
-    if id == fp.BI_ISSIGNALING {
-        let q = ir.icmp(B(), ir.IntEQ, quiet, ir.cint(t64, 0));
-        let s = ir.binop(B(), ir.OP_AND, ir.binop(B(), ir.OP_AND, emax, int_ok), ir.binop(B(), ir.OP_XOR, fz, one));
-        return ir.zext(B(), ir.binop(B(), ir.OP_AND, s, q), it);
+    if id == cs.BI_ISSIGNALING {
+        let q = ir.icmp(B, ir.IntEQ, quiet, ir.cint(t64, 0));
+        let s = ir.binop(B, ir.OP_AND, ir.binop(B, ir.OP_AND, emax, int_ok), ir.binop(B, ir.OP_XOR, fz, one));
+        return ir.zext(B, ir.binop(B, ir.OP_AND, s, q), it);
     }
-    let r0 = ir.select(B(), is_sub, ir.cint(it, fp.FP_SUBNORMAL), ir.cint(it, fp.FP_NORMAL));
-    let r1 = ir.select(B(), is_zero2, ir.cint(it, fp.FP_ZERO), r0);
-    let r2 = ir.select(B(), is_inf, ir.cint(it, fp.FP_INFINITE), r1);
-    return ir.select(B(), is_nan, ir.cint(it, fp.FP_NAN), r2);
+    let r0 = ir.select(B, is_sub, ir.cint(it, cs.FP_SUBNORMAL), ir.cint(it, cs.FP_NORMAL));
+    let r1 = ir.select(B, is_zero2, ir.cint(it, cs.FP_ZERO), r0);
+    let r2 = ir.select(B, is_inf, ir.cint(it, cs.FP_INFINITE), r1);
+    return ir.select(B, is_nan, ir.cint(it, cs.FP_NAN), r2);
 }
 
 // x's class from its bits: b = |x|'s bits, then the thresholds of its format.
-// The classification id (fp.BI_FPCLASSIFY ... BI_ISSIGNALING) of x, of
+// The classification id (cs.BI_FPCLASSIFY ... BI_ISSIGNALING) of x, of
 // floating type t, an int (it) 0 or 1 but for fpclassify.
 fn class_of(id: i32, t: *cty.CType, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
     if cty.is_decimal(t) {
-        return ir.zext(B(), gdec.classify(id - fp.BI_FPCLASSIFY, t, x), it);
+        return ir.zext(B, dec_classify(id - cs.BI_FPCLASSIFY, t, x), it);
     }
     if cty.is_wide(t) {
         return classify_wide(id, x, it, cty.ffmt(t) == 80);
     }
-    return classify(id, x, it);
+    return fp_classify(id, x, it);
 }
 
 // __builtin_isfpclass(x, mask) (csema_fp.ax: the bits of mask): the OR of
 // the classes mask names, each the AND of classification results.
 fn fpclass(mask: u64, t: *cty.CType, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
     let one = ir.cint(it, 1);
-    let sig = class_of(fp.BI_ISSIGNALING, t, x, it);
-    let nan = class_of(fp.BI_ISNAN, t, x, it);
-    let neg = class_of(fp.BI_SIGNBIT, t, x, it);
-    let pos = ir.binop(B(), ir.OP_XOR, neg, one);
+    let sig = class_of(cs.BI_ISSIGNALING, t, x, it);
+    let nan = class_of(cs.BI_ISNAN, t, x, it);
+    let neg = class_of(cs.BI_SIGNBIT, t, x, it);
+    let pos = ir.binop(B, ir.OP_XOR, neg, one);
     let mut r = ir.cint(it, 0);
     if (mask & 1) != 0 {
-        r = ir.binop(B(), ir.OP_OR, r, sig);
+        r = ir.binop(B, ir.OP_OR, r, sig);
     }
     if (mask & 2) != 0 {
-        r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, nan, ir.binop(B(), ir.OP_XOR, sig, one)));
+        r = ir.binop(B, ir.OP_OR, r, ir.binop(B, ir.OP_AND, nan, ir.binop(B, ir.OP_XOR, sig, one)));
     }
     // (the other classes in pairs: negative at bit k, positive at bit 9 - k)
-    let ids: [4]i32 = [fp.BI_ISINF, fp.BI_ISNORMAL, fp.BI_ISSUBNORMAL, fp.BI_ISZERO];
+    let ids: [4]i32 = [cs.BI_ISINF, cs.BI_ISNORMAL, cs.BI_ISSUBNORMAL, cs.BI_ISZERO];
     for k in @as(usize, 0)..4 {
         let nb = @as(u64, 4) << @truncate(u32, k);
         let pb = @as(u64, 0x200) >> @truncate(u32, k);
@@ -253,19 +243,19 @@ fn fpclass(mask: u64, t: *cty.CType, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.V
         }
         let c = class_of(ids[k], t, x, it);
         if (mask & nb) != 0 {
-            r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, c, neg));
+            r = ir.binop(B, ir.OP_OR, r, ir.binop(B, ir.OP_AND, c, neg));
         }
         if (mask & pb) != 0 {
-            r = ir.binop(B(), ir.OP_OR, r, ir.binop(B(), ir.OP_AND, c, pos));
+            r = ir.binop(B, ir.OP_OR, r, ir.binop(B, ir.OP_AND, c, pos));
         }
     }
     return r;
 }
 
-fn classify(id: i32, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
+fn fp_classify(id: i32, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
     let w = x.ty.bits;
     let bt = ir.t_int(w);
-    let bits = ir.bitcast(B(), x, bt);
+    let bits = ir.bitcast(B, x, bt);
     let mut sign: u64 = 0x8000000000000000;
     let mut inf: u64 = 0x7ff0000000000000;
     let mut minn: u64 = 0x0010000000000000;
@@ -283,46 +273,46 @@ fn classify(id: i32, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
         quiet = 0x0200;
     }
     let one = ir.cint(it, 1);
-    if id == fp.BI_SIGNBIT {
-        let s = ir.icmp(B(), ir.IntNE, ir.binop(B(), ir.OP_AND, bits, ir.cint(bt, sign)), ir.cint(bt, 0));
-        return ir.zext(B(), s, it);
+    if id == cs.BI_SIGNBIT {
+        let s = ir.icmp(B, ir.IntNE, ir.binop(B, ir.OP_AND, bits, ir.cint(bt, sign)), ir.cint(bt, 0));
+        return ir.zext(B, s, it);
     }
-    if id == fp.BI_ISCANONICAL {
+    if id == cs.BI_ISCANONICAL {
         return one;  // (binary formats have no non-canonical encodings)
     }
-    let b = ir.binop(B(), ir.OP_AND, bits, ir.cint(bt, sign - 1));
-    let is_nan = ir.icmp(B(), ir.IntUGT, b, ir.cint(bt, inf));
-    let is_inf = ir.icmp(B(), ir.IntEQ, b, ir.cint(bt, inf));
-    let is_zero = ir.icmp(B(), ir.IntEQ, b, ir.cint(bt, 0));
+    let b = ir.binop(B, ir.OP_AND, bits, ir.cint(bt, sign - 1));
+    let is_nan = ir.icmp(B, ir.IntUGT, b, ir.cint(bt, inf));
+    let is_inf = ir.icmp(B, ir.IntEQ, b, ir.cint(bt, inf));
+    let is_zero = ir.icmp(B, ir.IntEQ, b, ir.cint(bt, 0));
     // b - 1 < minn - 1 (unsigned): subnormal; b - minn < inf - minn: normal
-    let is_sub = ir.icmp(B(), ir.IntULT, ir.sub(B(), b, ir.cint(bt, 1)), ir.cint(bt, minn - 1));
-    let is_normal = ir.icmp(B(), ir.IntULT, ir.sub(B(), b, ir.cint(bt, minn)), ir.cint(bt, inf - minn));
-    if id == fp.BI_ISFINITE {
-        return ir.zext(B(), ir.icmp(B(), ir.IntULT, b, ir.cint(bt, inf)), it);
+    let is_sub = ir.icmp(B, ir.IntULT, ir.sub(B, b, ir.cint(bt, 1)), ir.cint(bt, minn - 1));
+    let is_normal = ir.icmp(B, ir.IntULT, ir.sub(B, b, ir.cint(bt, minn)), ir.cint(bt, inf - minn));
+    if id == cs.BI_ISFINITE {
+        return ir.zext(B, ir.icmp(B, ir.IntULT, b, ir.cint(bt, inf)), it);
     }
-    if id == fp.BI_ISINF {
-        return ir.zext(B(), is_inf, it);
+    if id == cs.BI_ISINF {
+        return ir.zext(B, is_inf, it);
     }
-    if id == fp.BI_ISNAN {
-        return ir.zext(B(), is_nan, it);
+    if id == cs.BI_ISNAN {
+        return ir.zext(B, is_nan, it);
     }
-    if id == fp.BI_ISNORMAL {
-        return ir.zext(B(), is_normal, it);
+    if id == cs.BI_ISNORMAL {
+        return ir.zext(B, is_normal, it);
     }
-    if id == fp.BI_ISSUBNORMAL {
-        return ir.zext(B(), is_sub, it);
+    if id == cs.BI_ISSUBNORMAL {
+        return ir.zext(B, is_sub, it);
     }
-    if id == fp.BI_ISZERO {
-        return ir.zext(B(), is_zero, it);
+    if id == cs.BI_ISZERO {
+        return ir.zext(B, is_zero, it);
     }
-    if id == fp.BI_ISSIGNALING {
+    if id == cs.BI_ISSIGNALING {
         // a NaN whose quiet bit is clear
-        let q = ir.icmp(B(), ir.IntEQ, ir.binop(B(), ir.OP_AND, b, ir.cint(bt, quiet)), ir.cint(bt, 0));
-        return ir.zext(B(), ir.binop(B(), ir.OP_AND, is_nan, q), it);
+        let q = ir.icmp(B, ir.IntEQ, ir.binop(B, ir.OP_AND, b, ir.cint(bt, quiet)), ir.cint(bt, 0));
+        return ir.zext(B, ir.binop(B, ir.OP_AND, is_nan, q), it);
     }
     // fpclassify
-    let r0 = ir.select(B(), is_sub, ir.cint(it, fp.FP_SUBNORMAL), ir.cint(it, fp.FP_NORMAL));
-    let r1 = ir.select(B(), is_zero, ir.cint(it, fp.FP_ZERO), r0);
-    let r2 = ir.select(B(), is_inf, ir.cint(it, fp.FP_INFINITE), r1);
-    return ir.select(B(), is_nan, ir.cint(it, fp.FP_NAN), r2);
+    let r0 = ir.select(B, is_sub, ir.cint(it, cs.FP_SUBNORMAL), ir.cint(it, cs.FP_NORMAL));
+    let r1 = ir.select(B, is_zero, ir.cint(it, cs.FP_ZERO), r0);
+    let r2 = ir.select(B, is_inf, ir.cint(it, cs.FP_INFINITE), r1);
+    return ir.select(B, is_nan, ir.cint(it, cs.FP_NAN), r2);
 }

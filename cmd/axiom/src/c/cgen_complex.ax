@@ -1,11 +1,11 @@
 // =============================================================================
 // cgen_complex.ax - IR generation for complex arithmetic (C99 6.2.5p13,
-// 6.3.1.6-6.3.1.8, 6.5, Annex G.5).
+// 6.3.1.6-6.3.1.8, 6.5, Annex G.5). Part of cgen.ax.
 //
 // A value of a complex type is, as a structure's is, the address of memory
 // holding it: the real part, then the imaginary part, each of the
-// corresponding real type (cgen.lty: an IR struct of the two). The memory is
-// a temporary that is written once (make), or an object; scalar replacement
+// corresponding real type (lty: an IR struct of the two). The memory is
+// a temporary that is written once (cx_make), or an object; scalar replacement
 // (sroa.ax) turns the temporaries into registers. The operations take the
 // parts as a Pair; a Pair whose `im` is nil is a real operand, which the
 // usual arithmetic conversions leave real (csema_expr.arith; G.5: x(u + iv)
@@ -35,45 +35,42 @@
 // =============================================================================
 import "../ir.ax" as ir;
 import "../util.ax" as u;
-import "cgen.ax" as cg;
-import "cgen_half.ax" as ghf;
-import "cgen_ld.ax" as gld;
 import "cldbl.ax" as cl;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 import "std/c/rt/ldouble" as ld;
 
 /// The parts of a complex value (im nil: a real operand).
-pub struct Pair {
+struct Pair {
     pub re: *mut ir.Value,
     pub im: *mut ir.Value,
 }
 
 /// The value v of a real type as an operand.
-pub fn real(v: *mut ir.Value) Pair {
+fn cx_real(v: *mut ir.Value) Pair {
     return Pair.{ re: v, im: ir.vnil() };
 }
 
 /// The value v of real type t as an operand (a _Float16 widened to float,
 /// as the parts of its complex type are).
-pub fn real_t(v: *mut ir.Value, t: *cty.CType) Pair {
+fn cx_real_t(v: *mut ir.Value, t: *cty.CType) Pair {
     if cty.is_half(t) {
-        return real(ghf.to_f32(v, t));
+        return cx_real(half_to_f32(v, t));
     }
-    return real(v);
+    return cx_real(v);
 }
 
 // The complex type whose arithmetic t's is: t, but complex float for
 // _Float16 _Complex, whose parts are computed in float and rounded to
-// binary16 when the value is stored (put).
-fn compute_type(t: *mut cty.CType) *mut cty.CType {
+// binary16 when the value is stored (cx_put).
+fn cx_compute_type(t: *mut cty.CType) *mut cty.CType {
     if cty.is_half(t.unq.elem) {
         return cty.complex_of(cty.t_float);
     }
     return t;
 }
 
-fn mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
+fn cx_mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
     v.align = @truncate(u32, al);
     if (t.quals & cty.Q_VOLATILE) != 0 {
         v.flags = v.flags | ir.F_VOLATILE;
@@ -81,206 +78,206 @@ fn mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
 }
 
 // Are v's parts wide long doubles (addresses)?
-fn wide(v: Pair) bool {
+fn cx_wide(v: Pair) bool {
     return v.re.ty.kind == ir.T_PTR;
 }
 
 // Are v's parts integers (an integer complex type's)?
-fn ints(v: Pair) bool {
+fn cx_ints(v: Pair) bool {
     return v.re.ty.kind == ir.T_INT;
 }
 
 /// The parts of the complex value of type t at p (volatile: as t says).
-pub fn parts(t: *mut cty.CType, p: *mut ir.Value) Pair {
+fn cx_parts(t: *mut cty.CType, p: *mut ir.Value) Pair {
     let el = t.unq.elem;
     if cty.is_wide(el) {
         let vol = (t.quals & cty.Q_VOLATILE) != 0;
-        return Pair.{ re: gld.snapshot(p, vol), im: gld.snapshot(ir.ptradd(cg.B, p, cg.usz(16)), vol) };
+        return Pair.{ re: ld_snapshot(p, vol), im: ld_snapshot(ir.ptradd(B, p, usz(16)), vol) };
     }
-    let rt = cg.lty(el);
+    let rt = lty(el);
     let al = cty.align_of(el);
-    let re = ir.load(cg.B, rt, p);
-    mark(re, t, al);
-    let im = ir.load(cg.B, rt, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
-    mark(im, t, al);
+    let re = ir.load(B, rt, p);
+    cx_mark(re, t, al);
+    let im = ir.load(B, rt, ir.ptradd(B, p, usz(cty.size_of(el))));
+    cx_mark(im, t, al);
     if cty.is_half(el) {
-        return Pair.{ re: ghf.to_f32(re, el), im: ghf.to_f32(im, el) };  // (exact)
+        return Pair.{ re: half_to_f32(re, el), im: half_to_f32(im, el) };  // (exact)
     }
     return Pair.{ re: re, im: im };
 }
 
 /// Stores the complex value v (both parts) as one of type t at p.
-pub fn put(t: *cty.CType, v: Pair, p: *mut ir.Value) void {
+fn cx_put(t: *cty.CType, v: Pair, p: *mut ir.Value) void {
     let el = t.unq.elem;
     if cty.is_wide(el) {
         let vol = (t.quals & cty.Q_VOLATILE) != 0;
-        gld.copy(p, v.re, vol);
-        gld.copy(ir.ptradd(cg.B, p, cg.usz(16)), v.im, vol);
+        ld_copy(p, v.re, vol);
+        ld_copy(ir.ptradd(B, p, usz(16)), v.im, vol);
         return;
     }
     let al = cty.align_of(el);
     let mut re = v.re;
     let mut im = v.im;
     if cty.is_half(el) {
-        re = ghf.from_f32(re, el);  // (each part rounded to binary16)
-        im = ghf.from_f32(im, el);
+        re = half_from_f32(re, el);  // (each part rounded to binary16)
+        im = half_from_f32(im, el);
     }
-    let s1 = ir.store(cg.B, re, p);
-    mark(s1, t, al);
-    let s2 = ir.store(cg.B, im, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
-    mark(s2, t, al);
+    let s1 = ir.store(B, re, p);
+    cx_mark(s1, t, al);
+    let s2 = ir.store(B, im, ir.ptradd(B, p, usz(cty.size_of(el))));
+    cx_mark(s2, t, al);
 }
 
 /// The value v of complex type t: the address of a new temporary holding it.
-pub fn make(t: *mut cty.CType, v: Pair) *mut ir.Value {
-    let tmp = cg.alloca(t.unq, "cx");
-    put(t.unq, v, tmp);
+fn cx_make(t: *mut cty.CType, v: Pair) *mut ir.Value {
+    let tmp = alloca(t.unq, "cx");
+    cx_put(t.unq, v, tmp);
     return tmp;
 }
 
 /// The constant re + i im of complex type t whose parts are wide long doubles.
-pub fn constant_wide(t: *mut cty.CType, re: ld.W, im: ld.W) *mut ir.Value {
-    return make(t, Pair.{ re: gld.constant(re), im: gld.constant(im) });
+fn cx_constant_wide(t: *mut cty.CType, re: ld.W, im: ld.W) *mut ir.Value {
+    return cx_make(t, Pair.{ re: ld_constant(re), im: ld_constant(im) });
 }
 
 /// The constant re + i im of integer complex type t (each part's bits).
-pub fn constant_int(t: *mut cty.CType, re: u64, im: u64) *mut ir.Value {
-    let rt = cg.lty(t.unq.elem);
-    return make(t, Pair.{ re: ir.cint(rt, re), im: ir.cint(rt, im) });
+fn cx_constant_int(t: *mut cty.CType, re: u64, im: u64) *mut ir.Value {
+    let rt = lty(t.unq.elem);
+    return cx_make(t, Pair.{ re: ir.cint(rt, re), im: ir.cint(rt, im) });
 }
 
 /// The constant re + i im of complex type t.
-pub fn constant(t: *mut cty.CType, re: f64, im: f64) *mut ir.Value {
-    let rt = cg.lty(compute_type(t.unq).elem);
-    return make(t, Pair.{ re: ir.cfp(rt, re), im: ir.cfp(rt, im) });
+fn cx_constant(t: *mut cty.CType, re: f64, im: f64) *mut ir.Value {
+    let rt = lty(cx_compute_type(t.unq).elem);
+    return cx_make(t, Pair.{ re: ir.cfp(rt, re), im: ir.cfp(rt, im) });
 }
 
 /// A complex copy of the complex value at p (of type t): an object's value,
 /// taken now (lvalue conversion).
-pub fn snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
-    return make(t, parts(t, p));
+fn cx_snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    return cx_make(t, cx_parts(t, p));
 }
 
 /// The truth of complex value v of type t (6.3.1.2: unequal to 0, either part), as an i1.
-pub fn truth(t: *cty.CType, v: Pair) *mut ir.Value {
-    if wide(v) {
+fn cx_truth(t: *cty.CType, v: Pair) *mut ir.Value {
+    if cx_wide(v) {
         let el = t.unq.elem;
-        return ir.or_(cg.B, gld.truth(v.re, el), gld.truth(v.im, el));
+        return ir.or_(B, ld_truth(v.re, el), ld_truth(v.im, el));
     }
-    if ints(v) {
+    if cx_ints(v) {
         let zi = ir.cint(v.re.ty, 0);
-        return ir.or_(cg.B, ir.icmp(cg.B, ir.IntNE, v.re, zi), ir.icmp(cg.B, ir.IntNE, v.im, zi));
+        return ir.or_(B, ir.icmp(B, ir.IntNE, v.re, zi), ir.icmp(B, ir.IntNE, v.im, zi));
     }
     let z = ir.cfp(v.re.ty, 0.0);
-    return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, v.re, z), ir.fcmp(cg.B, ir.RealUNE, v.im, z));
+    return ir.or_(B, ir.fcmp(B, ir.RealUNE, v.re, z), ir.fcmp(B, ir.RealUNE, v.im, z));
 }
 
 /// x == y (both of complex type t: both parts equal, 6.5.9p4), as an i1; ne: x != y.
-pub fn equal(t: *cty.CType, x: Pair, y: Pair, ne: bool) *mut ir.Value {
-    if wide(x) {
+fn cx_equal(t: *cty.CType, x: Pair, y: Pair, ne: bool) *mut ir.Value {
+    if cx_wide(x) {
         let el = t.unq.elem;
         if ne {
-            return ir.or_(cg.B, gld.compare(ct.P_NE, x.re, y.re, el), gld.compare(ct.P_NE, x.im, y.im, el));
+            return ir.or_(B, ld_compare(ct.P_NE, x.re, y.re, el), ld_compare(ct.P_NE, x.im, y.im, el));
         }
-        return ir.and_(cg.B, gld.compare(ct.P_EQ, x.re, y.re, el), gld.compare(ct.P_EQ, x.im, y.im, el));
+        return ir.and_(B, ld_compare(ct.P_EQ, x.re, y.re, el), ld_compare(ct.P_EQ, x.im, y.im, el));
     }
-    if ints(x) {
+    if cx_ints(x) {
         if ne {
-            return ir.or_(cg.B, ir.icmp(cg.B, ir.IntNE, x.re, y.re), ir.icmp(cg.B, ir.IntNE, x.im, y.im));
+            return ir.or_(B, ir.icmp(B, ir.IntNE, x.re, y.re), ir.icmp(B, ir.IntNE, x.im, y.im));
         }
-        return ir.and_(cg.B, ir.icmp(cg.B, ir.IntEQ, x.re, y.re), ir.icmp(cg.B, ir.IntEQ, x.im, y.im));
+        return ir.and_(B, ir.icmp(B, ir.IntEQ, x.re, y.re), ir.icmp(B, ir.IntEQ, x.im, y.im));
     }
     if ne {
-        return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, x.re, y.re), ir.fcmp(cg.B, ir.RealUNE, x.im, y.im));
+        return ir.or_(B, ir.fcmp(B, ir.RealUNE, x.re, y.re), ir.fcmp(B, ir.RealUNE, x.im, y.im));
     }
-    return ir.and_(cg.B, ir.fcmp(cg.B, ir.RealOEQ, x.re, y.re), ir.fcmp(cg.B, ir.RealOEQ, x.im, y.im));
+    return ir.and_(B, ir.fcmp(B, ir.RealOEQ, x.re, y.re), ir.fcmp(B, ir.RealOEQ, x.im, y.im));
 }
 
 /// -v (of complex type t).
-pub fn negate(t: *cty.CType, v: Pair) Pair {
-    if wide(v) {
+fn cx_negate(t: *cty.CType, v: Pair) Pair {
+    if cx_wide(v) {
         let el = t.unq.elem;
-        return Pair.{ re: gld.negate(v.re, el), im: gld.negate(v.im, el) };
+        return Pair.{ re: ld_negate(v.re, el), im: ld_negate(v.im, el) };
     }
-    if ints(v) {
-        return Pair.{ re: ir.neg(cg.B, v.re), im: ir.neg(cg.B, v.im) };
+    if cx_ints(v) {
+        return Pair.{ re: ir.neg(B, v.re), im: ir.neg(B, v.im) };
     }
-    return Pair.{ re: ir.fneg(cg.B, v.re), im: ir.fneg(cg.B, v.im) };
+    return Pair.{ re: ir.fneg(B, v.re), im: ir.fneg(B, v.im) };
 }
 
 /// The conjugate of v (of complex type t).
-pub fn conj(t: *cty.CType, v: Pair) Pair {
-    if wide(v) {
-        return Pair.{ re: v.re, im: gld.negate(v.im, t.unq.elem) };
+fn cx_conj(t: *cty.CType, v: Pair) Pair {
+    if cx_wide(v) {
+        return Pair.{ re: v.re, im: ld_negate(v.im, t.unq.elem) };
     }
-    if ints(v) {
-        return Pair.{ re: v.re, im: ir.neg(cg.B, v.im) };
+    if cx_ints(v) {
+        return Pair.{ re: v.re, im: ir.neg(B, v.im) };
     }
-    return Pair.{ re: v.re, im: ir.fneg(cg.B, v.im) };
+    return Pair.{ re: v.re, im: ir.fneg(B, v.im) };
 }
 
-fn bin(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
-    return ir.binop(cg.B, op, x, y);
+fn cx_bin(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return ir.binop(B, op, x, y);
 }
 
-// The operators (ctok's P_ codes, which cgen_expr passes).
-pub const OP_ADD: i32 = 1;
-pub const OP_SUB: i32 = 2;
-pub const OP_MUL: i32 = 3;
-pub const OP_DIV: i32 = 4;
+// The operators.
+const CX_ADD: i32 = 1;
+const CX_SUB: i32 = 2;
+const CX_MUL: i32 = 3;
+const CX_DIV: i32 = 4;
 
-/// x op y in complex type t (op: OP_ADD ... OP_DIV), either operand maybe
+/// x op y in complex type t (op: CX_ADD ... CX_DIV), either operand maybe
 /// real (G.5).
-pub fn arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
-    let t = compute_type(t0);
-    if wide(x) {
-        return arith_wide(op, x, y, t.unq.elem);
+fn cx_arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
+    let t = cx_compute_type(t0);
+    if cx_wide(x) {
+        return cx_arith_wide(op, x, y, t.unq.elem);
     }
-    if ints(x) {
-        return arith_int(op, t.unq.elem.is_signed, x, y);
+    if cx_ints(x) {
+        return cx_arith_int(op, t.unq.elem.is_signed, x, y);
     }
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
-    if op == OP_ADD {
+    if op == CX_ADD {
         if xr {
-            return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: y.im };
+            return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: y.im };
         }
         if yr {
-            return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: x.im };
+            return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: x.im };
         }
-        return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: bin(ir.OP_FADD, x.im, y.im) };
+        return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: cx_bin(ir.OP_FADD, x.im, y.im) };
     }
-    if op == OP_SUB {
+    if op == CX_SUB {
         if xr {
-            return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: ir.fneg(cg.B, y.im) };
+            return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: ir.fneg(B, y.im) };
         }
         if yr {
-            return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: x.im };
+            return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: x.im };
         }
-        return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: bin(ir.OP_FSUB, x.im, y.im) };
+        return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: cx_bin(ir.OP_FSUB, x.im, y.im) };
     }
-    if op == OP_MUL {
+    if op == CX_MUL {
         if xr {
-            return Pair.{ re: bin(ir.OP_FMUL, x.re, y.re), im: bin(ir.OP_FMUL, x.re, y.im) };
+            return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, x.re, y.im) };
         }
         if yr {
-            return Pair.{ re: bin(ir.OP_FMUL, x.re, y.re), im: bin(ir.OP_FMUL, x.im, y.re) };
+            return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, x.im, y.re) };
         }
-        return multiply(t, x, y);
+        return cx_multiply(t, x, y);
     }
     if yr {
-        return Pair.{ re: bin(ir.OP_FDIV, x.re, y.re), im: bin(ir.OP_FDIV, x.im, y.re) };
+        return Pair.{ re: cx_bin(ir.OP_FDIV, x.re, y.re), im: cx_bin(ir.OP_FDIV, x.im, y.re) };
     }
     let mut xi = x.im;
     if xr {
         xi = ir.cfp(x.re.ty, 0.0);  // (x / (u + iv) as (x + i0) / (u + iv))
     }
-    return call_helper(t, false, x.re, xi, y.re, y.im);
+    return cx_call_helper(t, false, x.re, xi, y.re, y.im);
 }
 
-// arith where the parts are integers (an integer complex type's, signed or
+// cx_arith where the parts are integers (an integer complex type's, signed or
 // not): a real operand's imaginary part is 0.
-fn arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
+fn cx_arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
     let a = x.re;
     let c = y.re;
     let z = ir.cint(a.ty, 0);
@@ -292,15 +289,15 @@ fn arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
     if u.isnil(d) {
         d = z;
     }
-    if op == OP_ADD {
-        return Pair.{ re: bin(ir.OP_ADD, a, c), im: bin(ir.OP_ADD, b, d) };
+    if op == CX_ADD {
+        return Pair.{ re: cx_bin(ir.OP_ADD, a, c), im: cx_bin(ir.OP_ADD, b, d) };
     }
-    if op == OP_SUB {
-        return Pair.{ re: bin(ir.OP_SUB, a, c), im: bin(ir.OP_SUB, b, d) };
+    if op == CX_SUB {
+        return Pair.{ re: cx_bin(ir.OP_SUB, a, c), im: cx_bin(ir.OP_SUB, b, d) };
     }
-    if op == OP_MUL {
-        let re = bin(ir.OP_SUB, bin(ir.OP_MUL, a, c), bin(ir.OP_MUL, b, d));
-        let im = bin(ir.OP_ADD, bin(ir.OP_MUL, a, d), bin(ir.OP_MUL, b, c));
+    if op == CX_MUL {
+        let re = cx_bin(ir.OP_SUB, cx_bin(ir.OP_MUL, a, c), cx_bin(ir.OP_MUL, b, d));
+        let im = cx_bin(ir.OP_ADD, cx_bin(ir.OP_MUL, a, d), cx_bin(ir.OP_MUL, b, c));
         return Pair.{ re: re, im: im };
     }
     let mut div = ir.OP_UDIV;
@@ -308,164 +305,164 @@ fn arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
         div = ir.OP_SDIV;
     }
     if u.isnil(y.im) {
-        return Pair.{ re: bin(div, a, c), im: bin(div, b, c) };
+        return Pair.{ re: cx_bin(div, a, c), im: cx_bin(div, b, c) };
     }
-    let n = bin(ir.OP_ADD, bin(ir.OP_MUL, c, c), bin(ir.OP_MUL, d, d));
-    let re = bin(ir.OP_ADD, bin(ir.OP_MUL, a, c), bin(ir.OP_MUL, b, d));
-    let im = bin(ir.OP_SUB, bin(ir.OP_MUL, b, c), bin(ir.OP_MUL, a, d));
-    return Pair.{ re: bin(div, re, n), im: bin(div, im, n) };
+    let n = cx_bin(ir.OP_ADD, cx_bin(ir.OP_MUL, c, c), cx_bin(ir.OP_MUL, d, d));
+    let re = cx_bin(ir.OP_ADD, cx_bin(ir.OP_MUL, a, c), cx_bin(ir.OP_MUL, b, d));
+    let im = cx_bin(ir.OP_SUB, cx_bin(ir.OP_MUL, b, c), cx_bin(ir.OP_MUL, a, d));
+    return Pair.{ re: cx_bin(div, re, n), im: cx_bin(div, im, n) };
 }
 
-// arith where the parts are wide long doubles: the same operations, in
+// cx_arith where the parts are wide long doubles: the same operations, in
 // cgen_ld.ax's arithmetic; a complex product or quotient by ldouble.ax's
 // cmul and cdiv (ccomplex.ax's algorithms).
-fn arith_wide(op: i32, x: Pair, y: Pair, el: *cty.CType) Pair {
+fn cx_arith_wide(op: i32, x: Pair, y: Pair, el: *cty.CType) Pair {
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
     let mut cop = ct.P_PLUS;
-    if op == OP_SUB {
+    if op == CX_SUB {
         cop = ct.P_MINUS;
-    } else if op == OP_MUL {
+    } else if op == CX_MUL {
         cop = ct.P_STAR;
-    } else if op == OP_DIV {
+    } else if op == CX_DIV {
         cop = ct.P_SLASH;
     }
-    if (op == OP_ADD) or (op == OP_SUB) {
-        let re = gld.arith(cop, x.re, y.re, el);
+    if (op == CX_ADD) or (op == CX_SUB) {
+        let re = ld_arith(cop, x.re, y.re, el);
         if xr {
-            if op == OP_SUB {
-                return Pair.{ re: re, im: gld.negate(y.im, el) };
+            if op == CX_SUB {
+                return Pair.{ re: re, im: ld_negate(y.im, el) };
             }
             return Pair.{ re: re, im: y.im };
         }
         if yr {
             return Pair.{ re: re, im: x.im };
         }
-        return Pair.{ re: re, im: gld.arith(cop, x.im, y.im, el) };
+        return Pair.{ re: re, im: ld_arith(cop, x.im, y.im, el) };
     }
-    if op == OP_MUL {
+    if op == CX_MUL {
         if xr {
-            return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.re, y.im, el) };
+            return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.re, y.im, el) };
         }
         if yr {
-            return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.im, y.re, el) };
+            return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.im, y.re, el) };
         }
-        let r = gld.complex_call("cmul", x.re, x.im, y.re, y.im, el);
+        let r = ld_complex_call("cmul", x.re, x.im, y.re, y.im, el);
         return Pair.{ re: r[0], im: r[1] };
     }
     if yr {
-        return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.im, y.re, el) };
+        return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.im, y.re, el) };
     }
     let mut xi = x.im;
     if xr {
-        xi = gld.constant(cl.zero());  // (x / (u + iv) as (x + i0) / (u + iv))
+        xi = ld_constant(cl.zero());  // (x / (u + iv) as (x + i0) / (u + iv))
     }
-    let r = gld.complex_call("cdiv", x.re, xi, y.re, y.im, el);
+    let r = ld_complex_call("cdiv", x.re, xi, y.re, y.im, el);
     return Pair.{ re: r[0], im: r[1] };
 }
 
 // (a + ib)(c + id) in line; the helper when both parts are NaN.
-fn multiply(t: *mut cty.CType, x: Pair, y: Pair) Pair {
-    let ac = bin(ir.OP_FMUL, x.re, y.re);
-    let bd = bin(ir.OP_FMUL, x.im, y.im);
-    let ad = bin(ir.OP_FMUL, x.re, y.im);
-    let bc = bin(ir.OP_FMUL, x.im, y.re);
-    let re = bin(ir.OP_FSUB, ac, bd);
-    let im = bin(ir.OP_FADD, ad, bc);
+fn cx_multiply(t: *mut cty.CType, x: Pair, y: Pair) Pair {
+    let ac = cx_bin(ir.OP_FMUL, x.re, y.re);
+    let bd = cx_bin(ir.OP_FMUL, x.im, y.im);
+    let ad = cx_bin(ir.OP_FMUL, x.re, y.im);
+    let bc = cx_bin(ir.OP_FMUL, x.im, y.re);
+    let re = cx_bin(ir.OP_FSUB, ac, bd);
+    let im = cx_bin(ir.OP_FADD, ad, bc);
     if (re.kind == ir.V_CFP) and (im.kind == ir.V_CFP) {
         // (both folded: the IR folds no NaN, so neither is one)
         return Pair.{ re: re, im: im };
     }
-    let both = ir.and_(cg.B, is_nan(cg.B, re), is_nan(cg.B, im));
-    let from = ir.insert_block(cg.B);
-    let slow = cg.new_block("cmul.nan");
-    let done = cg.new_block("cmul");
-    ir.condbr(cg.B, both, slow, done);
-    cg.at_end(slow);
-    let r = call_helper(t, true, x.re, x.im, y.re, y.im);
-    let slow_end = ir.insert_block(cg.B);
-    ir.br(cg.B, done);
-    cg.at_end(done);
-    let pr = ir.phi(cg.B, re.ty);
+    let both = ir.and_(B, cx_is_nan(B, re), cx_is_nan(B, im));
+    let from = ir.insert_block(B);
+    let slow = new_block("cmul.nan");
+    let done = new_block("cmul");
+    ir.condbr(B, both, slow, done);
+    at_end(slow);
+    let r = cx_call_helper(t, true, x.re, x.im, y.re, y.im);
+    let slow_end = ir.insert_block(B);
+    ir.br(B, done);
+    at_end(done);
+    let pr = ir.phi(B, re.ty);
     ir.add_incoming(pr, re, from);
     ir.add_incoming(pr, r.re, slow_end);
-    let pi = ir.phi(cg.B, re.ty);
+    let pi = ir.phi(B, re.ty);
     ir.add_incoming(pi, im, from);
     ir.add_incoming(pi, r.im, slow_end);
     return Pair.{ re: pr, im: pi };
 }
 
 // A call of the multiplication (mul) or division helper of t's real type.
-fn call_helper(t: *mut cty.CType, mul: bool, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value,
-               d: *mut ir.Value) Pair {
-    let f = helper(mul, a.ty);
-    let out = cg.alloca(t.unq, "cres");
+fn cx_call_helper(t: *mut cty.CType, mul: bool, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value,
+                  d: *mut ir.Value) Pair {
+    let f = cx_helper(mul, a.ty);
+    let out = alloca(t.unq, "cres");
     let mut args: [5]*mut ir.Value = [out, a, b, c, d];
-    _ = ir.call(cg.B, f.ty, f.val, args[..]);
-    return parts(t.unq, out);
+    _ = ir.call(B, f.ty, f.val, args[..]);
+    return cx_parts(t.unq, out);
 }
 
 // -----------------------------------------------------------------------------
 // The helpers
 // -----------------------------------------------------------------------------
 
-fn is_nan(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+fn cx_is_nan(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
     return ir.fcmp(bd, ir.RealUNE, x, x);
 }
 
-fn fabs(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+fn cx_fabs(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
     let mut a: [1]*mut ir.Value = [x];
     return ir.intr(bd, ir.IN_FABS, x.ty, a[..]);
 }
 
-fn copysign(bd: *mut ir.Builder, m: *mut ir.Value, s: *mut ir.Value) *mut ir.Value {
+fn cx_copysign(bd: *mut ir.Builder, m: *mut ir.Value, s: *mut ir.Value) *mut ir.Value {
     let mut a: [2]*mut ir.Value = [m, s];
     return ir.intr(bd, ir.IN_COPYSIGN, m.ty, a[..]);
 }
 
-fn infinity(t: *mut ir.Ty) *mut ir.Value {
+fn cx_infinity(t: *mut ir.Ty) *mut ir.Value {
     let z: f64 = 0.0;
     return ir.cfp(t, 1.0 / z);
 }
 
-fn is_inf(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
-    return ir.fcmp(bd, ir.RealOEQ, fabs(bd, x), infinity(x.ty));
+fn cx_is_inf(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(bd, ir.RealOEQ, cx_fabs(bd, x), cx_infinity(x.ty));
 }
 
-fn is_finite(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
-    return ir.fcmp(bd, ir.RealOLT, fabs(bd, x), infinity(x.ty));
+fn cx_is_finite(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(bd, ir.RealOLT, cx_fabs(bd, x), cx_infinity(x.ty));
 }
 
 // copysign(isinf(x) ? 1 : 0, x)
-fn boxed(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+fn cx_boxed(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
     let one = ir.cfp(x.ty, 1.0);
     let zero = ir.cfp(x.ty, 0.0);
-    return copysign(bd, ir.select(bd, is_inf(bd, x), one, zero), x);
+    return cx_copysign(bd, ir.select(bd, cx_is_inf(bd, x), one, zero), x);
 }
 
 // isnan(x) ? copysign(0, x) : x
-fn nan0(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
-    return ir.select(bd, is_nan(bd, x), copysign(bd, ir.cfp(x.ty, 0.0), x), x);
+fn cx_nan0(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.select(bd, cx_is_nan(bd, x), cx_copysign(bd, ir.cfp(x.ty, 0.0), x), x);
 }
 
-fn sel(bd: *mut ir.Builder, c: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+fn cx_sel(bd: *mut ir.Builder, c: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     return ir.select(bd, c, x, y);
 }
 
-fn fb(bd: *mut ir.Builder, op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+fn cx_fb(bd: *mut ir.Builder, op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     return ir.binop(bd, op, x, y);
 }
 
 // The helper `__axiom_cmul_fN` (mul) or `__axiom_cdiv_fN` of real IR type
 // rt: void(ptr out, a, b, c, d), storing the result's parts at out.
-fn helper(mul: bool, rt: *mut ir.Ty) *mut ir.Func {
+fn cx_helper(mul: bool, rt: *mut ir.Ty) *mut ir.Func {
     let name = u.f2("__axiom_%s_f%s", u.pick(mul, "cmul", "cdiv"), u.idec(rt.bits));
-    let found = ir.get_function(cg.M, name);
+    let found = ir.get_function(M, name);
     if u.notnil(found) {
         return found;
     }
-    let mut ps: [5]*mut ir.Ty = [cg.T_ptr, rt, rt, rt, rt];
-    let f = ir.add_function(cg.M, name, ir.t_fn(cg.T_void, ps[..], false));
+    let mut ps: [5]*mut ir.Ty = [T_ptr, rt, rt, rt, rt];
+    let f = ir.add_function(M, name, ir.t_fn(T_void, ps[..], false));
     f.linkage = ir.LINK_INTERNAL;
     f.src = ir.cur_src;
     // (one copy: the multiplication's is called only for NaN results)
@@ -479,21 +476,21 @@ fn helper(mul: bool, rt: *mut ir.Ty) *mut ir.Func {
     let d = f.params[4];
     let mut r = Pair.{ re: ir.vnil(), im: ir.vnil() };
     if mul {
-        r = mul_body(bd, a, b, c, d);
+        r = cx_mul_body(bd, a, b, c, d);
     } else if rt.bits == 32 {
         // (float: in double, whose range holds every product and quotient
         // of the method, so that no part underflows or overflows before the
         // result does; then rounded to float)
         let t64 = ir.t_float(64);
-        let w = div_body(bd, ir.cast(bd, ir.OP_FPEXT, a, t64), ir.cast(bd, ir.OP_FPEXT, b, t64),
-                         ir.cast(bd, ir.OP_FPEXT, c, t64), ir.cast(bd, ir.OP_FPEXT, d, t64));
+        let w = cx_div_body(bd, ir.cast(bd, ir.OP_FPEXT, a, t64), ir.cast(bd, ir.OP_FPEXT, b, t64),
+                            ir.cast(bd, ir.OP_FPEXT, c, t64), ir.cast(bd, ir.OP_FPEXT, d, t64));
         r = Pair.{ re: ir.cast(bd, ir.OP_FPTRUNC, w.re, rt), im: ir.cast(bd, ir.OP_FPTRUNC, w.im, rt) };
     } else {
-        r = div_body(bd, a, b, c, d);
+        r = cx_div_body(bd, a, b, c, d);
     }
     let s1 = ir.store(bd, r.re, f.params[0]);
     s1.align = @truncate(u32, rt.align);
-    let s2 = ir.store(bd, r.im, ir.ptradd(bd, f.params[0], cg.usz(rt.size)));
+    let s2 = ir.store(bd, r.im, ir.ptradd(bd, f.params[0], usz(rt.size)));
     s2.align = @truncate(u32, rt.align);
     ir.ret_void(bd);
     return f;
@@ -501,100 +498,111 @@ fn helper(mul: bool, rt: *mut ir.Ty) *mut ir.Func {
 
 // (a + ib)(c + id) with G.5.1's recovery (ccomplex.cmul): the steps, each a
 // select on the condition the example's `if` tests.
-fn mul_body(bd: *mut ir.Builder, a0: *mut ir.Value, b0: *mut ir.Value, c0: *mut ir.Value, d0: *mut ir.Value) Pair {
-    let ac = fb(bd, ir.OP_FMUL, a0, c0);
-    let bd_ = fb(bd, ir.OP_FMUL, b0, d0);
-    let ad = fb(bd, ir.OP_FMUL, a0, d0);
-    let bc = fb(bd, ir.OP_FMUL, b0, c0);
-    let x = fb(bd, ir.OP_FSUB, ac, bd_);
-    let y = fb(bd, ir.OP_FADD, ad, bc);
+fn cx_mul_body(bd: *mut ir.Builder, a0: *mut ir.Value, b0: *mut ir.Value, c0: *mut ir.Value, d0: *mut ir.Value) Pair {
+    let ac = cx_fb(bd, ir.OP_FMUL, a0, c0);
+    let bd_ = cx_fb(bd, ir.OP_FMUL, b0, d0);
+    let ad = cx_fb(bd, ir.OP_FMUL, a0, d0);
+    let bc = cx_fb(bd, ir.OP_FMUL, b0, c0);
+    let x = cx_fb(bd, ir.OP_FSUB, ac, bd_);
+    let y = cx_fb(bd, ir.OP_FADD, ad, bc);
     // an infinite first operand: boxed, and NaNs in the other made zeros
-    let zinf = ir.or_(bd, is_inf(bd, a0), is_inf(bd, b0));
-    let a1 = sel(bd, zinf, boxed(bd, a0), a0);
-    let b1 = sel(bd, zinf, boxed(bd, b0), b0);
-    let c1 = sel(bd, zinf, nan0(bd, c0), c0);
-    let d1 = sel(bd, zinf, nan0(bd, d0), d0);
+    let zinf = ir.or_(bd, cx_is_inf(bd, a0), cx_is_inf(bd, b0));
+    let a1 = cx_sel(bd, zinf, cx_boxed(bd, a0), a0);
+    let b1 = cx_sel(bd, zinf, cx_boxed(bd, b0), b0);
+    let c1 = cx_sel(bd, zinf, cx_nan0(bd, c0), c0);
+    let d1 = cx_sel(bd, zinf, cx_nan0(bd, d0), d0);
     // an infinite second operand: likewise
-    let winf = ir.or_(bd, is_inf(bd, c1), is_inf(bd, d1));
-    let c2 = sel(bd, winf, boxed(bd, c1), c1);
-    let d2 = sel(bd, winf, boxed(bd, d1), d1);
-    let a2 = sel(bd, winf, nan0(bd, a1), a1);
-    let b2 = sel(bd, winf, nan0(bd, b1), b1);
+    let winf = ir.or_(bd, cx_is_inf(bd, c1), cx_is_inf(bd, d1));
+    let c2 = cx_sel(bd, winf, cx_boxed(bd, c1), c1);
+    let d2 = cx_sel(bd, winf, cx_boxed(bd, d1), d1);
+    let a2 = cx_sel(bd, winf, cx_nan0(bd, a1), a1);
+    let b2 = cx_sel(bd, winf, cx_nan0(bd, b1), b1);
     // neither, but a product overflowed: every NaN made a zero
     let some = ir.or_(bd, zinf, winf);
-    let prods = ir.or_(bd, ir.or_(bd, is_inf(bd, ac), is_inf(bd, bd_)), ir.or_(bd, is_inf(bd, ad), is_inf(bd, bc)));
+    let prods = ir.or_(
+        bd, ir.or_(bd, cx_is_inf(bd, ac), cx_is_inf(bd, bd_)), ir.or_(bd, cx_is_inf(bd, ad), cx_is_inf(bd, bc)));
     let ovf = ir.and_(bd, ir.not_(bd, some), prods);
-    let a3 = sel(bd, ovf, nan0(bd, a2), a2);
-    let b3 = sel(bd, ovf, nan0(bd, b2), b2);
-    let c3 = sel(bd, ovf, nan0(bd, c2), c2);
-    let d3 = sel(bd, ovf, nan0(bd, d2), d2);
+    let a3 = cx_sel(bd, ovf, cx_nan0(bd, a2), a2);
+    let b3 = cx_sel(bd, ovf, cx_nan0(bd, b2), b2);
+    let c3 = cx_sel(bd, ovf, cx_nan0(bd, c2), c2);
+    let d3 = cx_sel(bd, ovf, cx_nan0(bd, d2), d2);
     let recalc = ir.or_(bd, some, ovf);
-    let inf = infinity(a0.ty);
-    let rx = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, a3, c3), fb(bd, ir.OP_FMUL, b3, d3)));
-    let ry = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a3, d3), fb(bd, ir.OP_FMUL, b3, c3)));
+    let inf = cx_infinity(a0.ty);
+    let rx = cx_fb(
+        bd, ir.OP_FMUL, inf, cx_fb(bd, ir.OP_FSUB, cx_fb(bd, ir.OP_FMUL, a3, c3), cx_fb(bd, ir.OP_FMUL, b3, d3)));
+    let ry = cx_fb(
+        bd, ir.OP_FMUL, inf, cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, a3, d3), cx_fb(bd, ir.OP_FMUL, b3, c3)));
     // (the helper is called when x and y are both NaN; recovery only then)
-    let both = ir.and_(bd, is_nan(bd, x), is_nan(bd, y));
-    let pick = ir.and_(bd, both, recalc);
-    return Pair.{ re: sel(bd, pick, rx, x), im: sel(bd, pick, ry, y) };
+    let both = ir.and_(bd, cx_is_nan(bd, x), cx_is_nan(bd, y));
+    let pick_v = ir.and_(bd, both, recalc);
+    return Pair.{ re: cx_sel(bd, pick_v, rx, x), im: cx_sel(bd, pick_v, ry, y) };
 }
 
 // (a + ib) / (c + id) (ccomplex.cdiv): Smith's method, then G.5.1's
 // recovery when both parts are NaN.
-fn div_body(bd: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value) Pair {
+fn cx_div_body(bd: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value) Pair {
     let t = a.ty;
-    let zero = ir.cfp(t, 0.0);
+    let zero_v = ir.cfp(t, 0.0);
     // |c| >= |d|: r = d/c, den = c + d*r
-    let r1 = fb(bd, ir.OP_FDIV, d, c);
-    let den1 = fb(bd, ir.OP_FADD, c, fb(bd, ir.OP_FMUL, d, r1));
-    let x1 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, a, fb(bd, ir.OP_FMUL, b, r1)), den1);
-    let y1 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, b, fb(bd, ir.OP_FMUL, a, r1)), den1);
+    let r1 = cx_fb(bd, ir.OP_FDIV, d, c);
+    let den1 = cx_fb(bd, ir.OP_FADD, c, cx_fb(bd, ir.OP_FMUL, d, r1));
+    let x1 = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FADD, a, cx_fb(bd, ir.OP_FMUL, b, r1)), den1);
+    let y1 = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FSUB, b, cx_fb(bd, ir.OP_FMUL, a, r1)), den1);
     // (r underflowed to 0: d*(b/c) keeps what d*r lost)
-    let x1z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, a, fb(bd, ir.OP_FMUL, d, fb(bd, ir.OP_FDIV, b, c))), den1);
-    let y1z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, b, fb(bd, ir.OP_FMUL, d, fb(bd, ir.OP_FDIV, a, c))), den1);
-    let nz1 = ir.fcmp(bd, ir.RealUNE, r1, zero);
-    let xa = sel(bd, nz1, x1, x1z);
-    let ya = sel(bd, nz1, y1, y1z);
+    let x1z = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FADD, a, cx_fb(bd, ir.OP_FMUL, d, cx_fb(bd, ir.OP_FDIV, b, c))),
+                    den1);
+    let y1z = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FSUB, b, cx_fb(bd, ir.OP_FMUL, d, cx_fb(bd, ir.OP_FDIV, a, c))),
+                    den1);
+    let nz1 = ir.fcmp(bd, ir.RealUNE, r1, zero_v);
+    let xa = cx_sel(bd, nz1, x1, x1z);
+    let ya = cx_sel(bd, nz1, y1, y1z);
     // |c| < |d|: r = c/d, den = c*r + d
-    let r2 = fb(bd, ir.OP_FDIV, c, d);
-    let den2 = fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, c, r2), d);
-    let x2 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a, r2), b), den2);
-    let y2 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, b, r2), a), den2);
-    let x2z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, c, fb(bd, ir.OP_FDIV, a, d)), b), den2);
-    let y2z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, c, fb(bd, ir.OP_FDIV, b, d)), a), den2);
-    let nz2 = ir.fcmp(bd, ir.RealUNE, r2, zero);
-    let xb = sel(bd, nz2, x2, x2z);
-    let yb = sel(bd, nz2, y2, y2z);
-    let first = ir.fcmp(bd, ir.RealOGE, fabs(bd, c), fabs(bd, d));
-    let x = sel(bd, first, xa, xb);
-    let y = sel(bd, first, ya, yb);
+    let r2 = cx_fb(bd, ir.OP_FDIV, c, d);
+    let den2 = cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, c, r2), d);
+    let x2 = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, a, r2), b), den2);
+    let y2 = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FSUB, cx_fb(bd, ir.OP_FMUL, b, r2), a), den2);
+    let x2z = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, c, cx_fb(bd, ir.OP_FDIV, a, d)), b),
+                    den2);
+    let y2z = cx_fb(bd, ir.OP_FDIV, cx_fb(bd, ir.OP_FSUB, cx_fb(bd, ir.OP_FMUL, c, cx_fb(bd, ir.OP_FDIV, b, d)), a),
+                    den2);
+    let nz2 = ir.fcmp(bd, ir.RealUNE, r2, zero_v);
+    let xb = cx_sel(bd, nz2, x2, x2z);
+    let yb = cx_sel(bd, nz2, y2, y2z);
+    let first_v = ir.fcmp(bd, ir.RealOGE, cx_fabs(bd, c), cx_fabs(bd, d));
+    let x = cx_sel(bd, first_v, xa, xb);
+    let y = cx_sel(bd, first_v, ya, yb);
     // the recovery
-    let inf = infinity(t);
-    let both = ir.and_(bd, is_nan(bd, x), is_nan(bd, y));
+    let inf = cx_infinity(t);
+    let both = ir.and_(bd, cx_is_nan(bd, x), cx_is_nan(bd, y));
     // a zero divisor and a dividend that is not NaN + iNaN: an infinity
-    let wzero = ir.and_(bd, ir.fcmp(bd, ir.RealOEQ, c, zero), ir.fcmp(bd, ir.RealOEQ, d, zero));
-    let znum = ir.or_(bd, ir.not_(bd, is_nan(bd, a)), ir.not_(bd, is_nan(bd, b)));
+    let wzero = ir.and_(bd, ir.fcmp(bd, ir.RealOEQ, c, zero_v), ir.fcmp(bd, ir.RealOEQ, d, zero_v));
+    let znum = ir.or_(bd, ir.not_(bd, cx_is_nan(bd, a)), ir.not_(bd, cx_is_nan(bd, b)));
     let k1 = ir.and_(bd, both, ir.and_(bd, wzero, znum));
-    let ci = copysign(bd, inf, c);
-    let xk1 = fb(bd, ir.OP_FMUL, ci, a);
-    let yk1 = fb(bd, ir.OP_FMUL, ci, b);
+    let ci = cx_copysign(bd, inf, c);
+    let xk1 = cx_fb(bd, ir.OP_FMUL, ci, a);
+    let yk1 = cx_fb(bd, ir.OP_FMUL, ci, b);
     // an infinite dividend and a finite divisor: an infinity
-    let zinf = ir.or_(bd, is_inf(bd, a), is_inf(bd, b));
-    let wfin = ir.and_(bd, is_finite(bd, c), is_finite(bd, d));
+    let zinf = ir.or_(bd, cx_is_inf(bd, a), cx_is_inf(bd, b));
+    let wfin = ir.and_(bd, cx_is_finite(bd, c), cx_is_finite(bd, d));
     let k2 = ir.and_(bd, ir.and_(bd, both, ir.not_(bd, k1)), ir.and_(bd, zinf, wfin));
-    let ab = boxed(bd, a);
-    let bb = boxed(bd, b);
-    let xk2 = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, ab, c), fb(bd, ir.OP_FMUL, bb, d)));
-    let yk2 = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, bb, c), fb(bd, ir.OP_FMUL, ab, d)));
+    let ab = cx_boxed(bd, a);
+    let bb = cx_boxed(bd, b);
+    let xk2 = cx_fb(
+        bd, ir.OP_FMUL, inf, cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, ab, c), cx_fb(bd, ir.OP_FMUL, bb, d)));
+    let yk2 = cx_fb(
+        bd, ir.OP_FMUL, inf, cx_fb(bd, ir.OP_FSUB, cx_fb(bd, ir.OP_FMUL, bb, c), cx_fb(bd, ir.OP_FMUL, ab, d)));
     // a finite dividend and an infinite divisor: a zero
-    let winf = ir.or_(bd, is_inf(bd, c), is_inf(bd, d));
-    let zfin = ir.and_(bd, is_finite(bd, a), is_finite(bd, b));
+    let winf = ir.or_(bd, cx_is_inf(bd, c), cx_is_inf(bd, d));
+    let zfin = ir.and_(bd, cx_is_finite(bd, a), cx_is_finite(bd, b));
     let not12 = ir.and_(bd, ir.not_(bd, k1), ir.not_(bd, k2));
     let k3 = ir.and_(bd, ir.and_(bd, both, not12), ir.and_(bd, winf, zfin));
-    let cb = boxed(bd, c);
-    let db = boxed(bd, d);
-    let xk3 = fb(bd, ir.OP_FMUL, zero, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a, cb), fb(bd, ir.OP_FMUL, b, db)));
-    let yk3 = fb(bd, ir.OP_FMUL, zero, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, b, cb), fb(bd, ir.OP_FMUL, a, db)));
-    let rx = sel(bd, k1, xk1, sel(bd, k2, xk2, sel(bd, k3, xk3, x)));
-    let ry = sel(bd, k1, yk1, sel(bd, k2, yk2, sel(bd, k3, yk3, y)));
+    let cb = cx_boxed(bd, c);
+    let db = cx_boxed(bd, d);
+    let xk3 = cx_fb(
+        bd, ir.OP_FMUL, zero_v, cx_fb(bd, ir.OP_FADD, cx_fb(bd, ir.OP_FMUL, a, cb), cx_fb(bd, ir.OP_FMUL, b, db)));
+    let yk3 = cx_fb(
+        bd, ir.OP_FMUL, zero_v, cx_fb(bd, ir.OP_FSUB, cx_fb(bd, ir.OP_FMUL, b, cb), cx_fb(bd, ir.OP_FMUL, a, db)));
+    let rx = cx_sel(bd, k1, xk1, cx_sel(bd, k2, xk2, cx_sel(bd, k3, xk3, x)));
+    let ry = cx_sel(bd, k1, yk1, cx_sel(bd, k2, yk2, cx_sel(bd, k3, yk3, y)));
     return Pair.{ re: rx, im: ry };
 }

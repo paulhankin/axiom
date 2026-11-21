@@ -1,0 +1,424 @@
+// =============================================================================
+// ctypes_layout.ax - derived type construction, tags, struct/union layout,
+// size and alignment, and member lookup, part of ctypes.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "copts.ax" as co;
+
+/// The target's layout of bit-fields (copts.BF_).
+pub fn bitfield_rule() i32 {
+    return g_opts.bitfields;
+}
+
+/// The layout of bit-fields of structure or union ti (copts.BF_): the
+/// target's, or the one its attribute ms_struct or gcc_struct asks for.
+pub fn bitfield_rule_of(ti: *TagInfo) i32 {
+    if ti.layout == LAYOUT_MS {
+        return co.BF_MS;
+    }
+    if (ti.layout == LAYOUT_GCC) and (g_opts.bitfields == co.BF_MS) {
+        return co.BF_SYSV;
+    }
+    return g_opts.bitfields;
+}
+
+// -----------------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------------
+
+/// `t` with the qualifiers `q` added. An array type's qualifiers are its
+/// element type's (6.7.3p8; C23 6.7.4.1p10: the array's as well).
+pub fn qualify(t: *mut CType, q: i32) *mut CType {
+    if (q == 0) or (t.kind == TK_ERROR) {
+        return t;
+    }
+    if t.kind == TK_ARRAY {
+        let e = qualify(t.elem, q);
+        let mut aq = t.quals;
+        if std() >= co.C23 {
+            aq = t.quals | q;
+        }
+        if (e == t.elem) and (aq == t.quals) {
+            return t;
+        }
+        let n = new_type(TK_ARRAY);
+        n.elem = e;
+        n.len = t.len;
+        n.has_len = t.has_len;
+        n.vla = t.vla;
+        n.vexpr = t.vexpr;
+        return qualified(n, aq);
+    }
+    return qualified(t, q);
+}
+
+/// Type t aligned to a (a GNU dialect's typedef with the attribute
+/// aligned): the same type but for its alignment, compatible with t.
+pub fn aligned_variant(t: *mut CType, a: u64) *mut CType {
+    let n = u.new.[CType]();
+    n.* = t.*;
+    n.xalign = a;
+    n.ptr = u.nil.[CType]();
+    for j in @as(usize, 0)..16 {
+        n.qv[j] = u.nil.[CType]();
+    }
+    g_next_id += 1;
+    n.id = g_next_id;
+    return n;
+}
+
+// `t` with the qualifiers `q` added (made once for each combination).
+fn qualified(t: *mut CType, q: i32) *mut CType {
+    if q == 0 {
+        return t;
+    }
+    if t.xalign != 0 {
+        // (an aligned typedef's type, qualified: it keeps its alignment)
+        if (t.quals | q) == t.quals {
+            return t;
+        }
+        let n = aligned_variant(t, t.xalign);
+        n.quals = t.quals | q;
+        return n;
+    }
+    let all = t.quals | q;
+    if all == t.quals {
+        return t;
+    }
+    let b = t.unq;
+    let k = @int_cast(usize, all & 15);
+    if u.isnil(b.qv[k]) {
+        let n = u.new.[CType]();
+        n.* = b.*;
+        n.quals = all;
+        n.unq = b;
+        n.ptr = u.nil.[CType]();
+        for j in @as(usize, 0)..16 {
+            n.qv[j] = u.nil.[CType]();
+        }
+        g_next_id += 1;
+        n.id = g_next_id;
+        b.qv[k] = n;
+    }
+    return b.qv[k];
+}
+
+/// `t` without qualifiers.
+pub fn unqual(t: *mut CType) *mut CType {
+    return t.unq;
+}
+
+/// A pointer to `t`.
+pub fn pointer_to(t: *mut CType) *mut CType {
+    if u.isnil(t.ptr) {
+        let p = new_type(TK_POINTER);
+        p.elem = t;
+        p.bits = @bit_cast(i32, @truncate(u32, ptr_bytes * 8));
+        t.ptr = p;
+    }
+    return t.ptr;
+}
+
+/// An array of `n` (has_len) elements of type `t`.
+pub fn array_of(t: *mut CType, n: u64, has_len: bool) *mut CType {
+    let a = new_type(TK_ARRAY);
+    a.elem = t;
+    a.len = n;
+    a.has_len = has_len;
+    return a;
+}
+
+/// A variable length array of elements of type `t` whose length is the
+/// value of `vexpr` (a cast.Expr, or nil for `[*]`).
+pub fn vla_of(t: *mut CType, vexpr: *mut void) *mut CType {
+    let a = new_type(TK_ARRAY);
+    a.elem = t;
+    a.vla = true;
+    a.vexpr = vexpr;
+    return a;
+}
+
+/// Is t a variable length array type (6.7.6.2p4): an array whose length or
+/// element size is not a constant (so its size is known at run time only)?
+pub fn is_vla(t: *CType) bool {
+    return (t.kind == TK_ARRAY) and (t.vla or is_vla(t.elem));
+}
+
+/// Is t variably modified (6.7.6p3): a variable length array, or derived
+/// from one by arrays and pointers (and function results)?
+pub fn is_vm(t: *CType) bool {
+    let k = t.kind;
+    if k == TK_ARRAY {
+        return t.vla or is_vm(t.elem);
+    }
+    if k == TK_POINTER {
+        return is_vm(t.elem);
+    }
+    if k == TK_FUNCTION {
+        return is_vm(t.ret);
+    }
+    return false;
+}
+
+/// A function type returning `ret`.
+pub fn function(ret: *mut CType, params: []mut *mut CType, proto: bool, variadic: bool) *mut CType {
+    let f = new_type(TK_FUNCTION);
+    f.ret = ret;
+    f.params = params;
+    f.proto = proto;
+    f.variadic = variadic;
+    return f;
+}
+
+/// A new structure, union or enumeration type (incomplete), with tag `name`.
+pub fn new_tagged(kind: i32, name: []u8, sp: u.Span) *mut CType {
+    let ti = u.new.[TagInfo]();
+    ti.kind = kind;
+    ti.name = name;
+    ti.span = sp;
+    ti.align = 1;
+    ti.transparent = false;
+    g_next_id += 1;
+    ti.id = g_next_id;
+    let t = new_type(kind);
+    t.tag = ti;
+    if kind == TK_ENUM {
+        ti.base = t_uint;
+        t.bits = t_uint.bits;
+        t.is_signed = false;
+        t.rank = t_uint.rank;
+    }
+    return t;
+}
+
+/// Sets an enumeration's compatible integer type (once its constants are
+/// known); `t` is the enumeration type.
+pub fn set_enum_base(t: *mut CType, base: *mut CType) void {
+    let b = t.unq;
+    b.tag.base = base;
+    b.tag.complete = true;
+    b.bits = base.bits;
+    b.is_signed = base.is_signed;
+    b.rank = base.rank;
+    for j in @as(usize, 0)..16 {
+        let q = b.qv[j];
+        if u.notnil(q) {
+            q.bits = base.bits;
+            q.is_signed = base.is_signed;
+            q.rank = base.rank;
+        }
+    }
+}
+
+/// Lays out a structure or union whose members are in ti.members (their
+/// types complete, but a structure's last may be an array without a length:
+/// a flexible array member): sets their offsets, its size and alignment, and
+/// makes it complete.
+pub fn layout(ti: *mut TagInfo) void {
+    let mut off: u64 = 0;
+    let mut al: u64 = 1;
+    let mut size: u64 = 0;
+    for m in ti.members.items() {
+        let ma = align_of(m.ty);
+        let ms = size_of(m.ty);
+        if ma > al {
+            al = ma;
+        }
+        if ti.kind == TK_UNION {
+            m.offset = 0;
+            if ms > size {
+                size = ms;
+            }
+        } else {
+            off = round_up(off, ma);
+            m.offset = off;
+            off += ms;
+            if (m.ty.kind == TK_ARRAY) and not m.ty.has_len {
+                ti.has_flex = true;
+            }
+        }
+    }
+    if ti.kind == TK_STRUCT {
+        size = off;
+    }
+    ti.size = round_up(size, al);
+    ti.align = al;
+    ti.complete = true;
+}
+
+pub fn round_up(x: u64, a: u64) u64 {
+    if a <= 1 {
+        return x;
+    }
+    return ((x + a) - 1) / a * a;
+}
+
+// -----------------------------------------------------------------------------
+// Size and alignment
+// -----------------------------------------------------------------------------
+
+/// The size of a complete object type (0 for others).
+pub fn size_of(t: *CType) u64 {
+    if (t.quals & Q_ATOMIC) != 0 {
+        return atomic_size(value_size(t));
+    }
+    return value_size(t);
+}
+
+/// The size of t's non-atomic version (its values' size: an atomic object
+/// may be larger, atomic_size).
+pub fn value_size(t: *CType) u64 {
+    let k = t.kind;
+    if is_integer(t) or (k == TK_POINTER) or (k == TK_NULLPTR) {
+        return @as(u64, @bit_cast(u32, storage_bits(t) / 8));
+    }
+    if k == TK_DEC32 {
+        return 4;
+    }
+    if k == TK_DEC64 {
+        return 8;
+    }
+    if (k == TK_DEC128) or (k == TK_DEC64X) {
+        return 16;
+    }
+    if is_floating(t) {
+        let f = ffmt(t);
+        if f > 64 {
+            return 16;  // (the x87 format's 10 bytes and 6 of padding, or binary128)
+        }
+        return @as(u64, @bit_cast(u32, f / 8));
+    }
+    if k == TK_COMPLEX {
+        return 2 * size_of(t.elem);  // (6.2.5p13: an array of two of the real type)
+    }
+    if k == TK_IMAGINARY {
+        return size_of(t.elem);  // (G.2p2: as its real type)
+    }
+    if k == TK_VECTOR {
+        return t.len * size_of(t.elem);
+    }
+    if k == TK_ARRAY {
+        if not t.has_len {
+            return 0;
+        }
+        return t.len *% size_of(t.elem);
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) {
+        return t.tag.size;
+    }
+    return 0;
+}
+
+/// The alignment of an object type (1 for others).
+pub fn align_of(t: *CType) u64 {
+    if t.xalign != 0 {
+        return t.xalign;
+    }
+    let k = t.kind;
+    if k == TK_ARRAY {
+        return align_of(t.elem);
+    }
+    let mut a = value_size(t);
+    if (k == TK_STRUCT) or (k == TK_UNION) {
+        a = t.tag.align;
+    } else if (k == TK_INT128) or (k == TK_UINT128) {
+        a = 16;  // (every ABI's __int128)
+    } else if (k == TK_BITINT) and (t.bits > 64) {
+        // (8 bytes on x86-64 and Windows, whose psABIs make it an array of
+        // 8-byte chunks, and on WebAssembly; 16 on AArch64: AAPCS64)
+        a = @as(u64, @bit_cast(u32, g_opts.bitint_align));
+    } else if (k == TK_COMPLEX) or (k == TK_IMAGINARY) {
+        a = align_of(t.elem);
+    } else if k == TK_VECTOR {
+        a = vector_align(a);
+    } else if a == 0 {
+        return 1;
+    }
+    if (t.quals & Q_ATOMIC) != 0 {
+        return atomic_align(t, a);
+    }
+    return a;
+}
+
+// The alignment of a vector type of `size` bytes: its size, at most the
+// platform's limit (COptions.vec_align: x86-64 Linux and macOS 16, 32 with
+// AVX, 64 with AVX-512F, as the system's compilers align them; AArch64 16;
+// none on Windows and WebAssembly).
+fn vector_align(size: u64) u64 {
+    let cap = @as(u64, @bit_cast(u32, g_opts.vec_align));
+    if (cap != 0) and (size > cap) {
+        return cap;
+    }
+    return size;
+}
+
+// The size of an atomic type whose non-atomic version's size is s
+// (6.2.5p27 lets them differ; copts.ax: set_platform says which platform
+// does what): s, or where the platform pads atomic types (macOS, Windows,
+// WebAssembly), a size up to atomic_pad rounded up to a power of two, so
+// that the object is accessed with one instruction of that width (its
+// padding bytes are zeros: cgen_atomic.ax).
+fn atomic_size(s: u64) u64 {
+    let pad = @as(u64, @bit_cast(u32, g_opts.atomic_pad));
+    if (s == 0) or (s > pad) {
+        return s;
+    }
+    let mut p: u64 = 1;
+    while p < s {
+        p = p * 2;
+    }
+    return p;
+}
+
+// The alignment of atomic type t, whose non-atomic version is aligned to a:
+// a size of 1, 2, 4, 8 or 16 bytes (up to atomic_max: 8 on WebAssembly) is
+// aligned to its size, so that it can be accessed with one instruction (the
+// rule of the x86-64 System V and AAPCS64 psABIs for _Atomic, and of the
+// other platforms' compilers after the padding of atomic_size); any other
+// keeps its alignment. A wide _BitInt(N) of 16 bytes is aligned as the
+// atomic __int128 is, on every target (16: the platforms' compilers have no
+// atomic _BitInt to follow).
+fn atomic_align(t: *CType, a: u64) u64 {
+    let s = size_of(t);
+    let mut mx = @as(u64, @bit_cast(u32, g_opts.atomic_max));
+    if (t.kind == TK_BITINT) and (s == 16) {
+        mx = 16;
+    }
+    if ((s == 1) or (s == 2) or (s == 4) or (s == 8) or (s == 16)) and (s <= mx) and (s > a) {
+        return s;
+    }
+    return a;
+}
+
+/// Whether a and b are both atomic types or both not (the _Atomic
+/// qualifier is kept where the others are ignored: 6.2.5p27, 6.7.3).
+pub fn same_atomic(a: *CType, b: *CType) bool {
+    return ((a.quals ^ b.quals) & Q_ATOMIC) == 0;
+}
+
+/// t without its const, volatile and restrict qualifiers: an atomic type
+/// stays atomic (a parameter's type in a function type: 6.7.6.3p15).
+pub fn unqual_keep_atomic(t: *mut CType) *mut CType {
+    return qualify(t.unq, t.quals & Q_ATOMIC);
+}
+
+// -----------------------------------------------------------------------------
+// Members
+// -----------------------------------------------------------------------------
+
+/// The member `name` of structure or union type t (complete), or one with m nil.
+pub fn find_member(t: *mut CType, name: []u8) Found {
+    for m in t.unq.tag.members.items() {
+        if m.name.len == 0 {
+            if is_record(m.ty) {
+                let f = find_member(m.ty, name);
+                if u.notnil(f.m) {
+                    return Found.{ m: f.m, offset: f.offset + m.offset };
+                }
+            }
+        } else if u.same(m.name, name) {
+            return Found.{ m: m, offset: m.offset };
+        }
+    }
+    return Found.{ m: u.nil.[Member](), offset: 0 };
+}

@@ -1,0 +1,415 @@
+// =============================================================================
+// cpp_macros.ax - #define, #undef, and macro recording (-g), part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "cpp_lex.ax" as lx;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// #define and #undef
+// -----------------------------------------------------------------------------
+fn same_def(a: *Macro, b: *Macro) bool {
+    if (a.funclike != b.funclike) or (a.variadic != b.variadic) or (a.params.len != b.params.len) or
+       (a.body.len != b.body.len) {
+        return false;
+    }
+    for k in 0..a.params.len {
+        if not u.same(a.params[k], b.params[k]) {
+            return false;
+        }
+    }
+    for k in 0..a.body.len {
+        let x = &a.body[k];
+        let y = &b.body[k];
+        if (x.kind != y.kind) or (x.id != y.id) or not u.str_eq(x.text, y.text) or ((k > 0) and (x.space != y.space)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether `t` may be defined or undefined; else reported.
+fn definable(P: *mut PP, t: *lx.PTok, what: []u8) bool {
+    if t.kind != lx.PK_IDENT {
+        _ = dg.err(t.span, "C1052", u.f1("macro names must be identifiers, after #%s", what));
+        return false;
+    }
+    let m = lookup(P, t.name);
+    if u.notnil(m) and m.protected and in_system_header(P) and not u.str_eq(t.name, "defined") {
+        // the system's headers define what the implementation predefines
+        // (they are its headers: --c-lib=system); the compiler's definition
+        // stays
+        return false;
+    }
+    if u.str_eq(t.name, "defined") or (u.notnil(m) and m.protected) or
+       ((P.o.std >= co.C99) and u.str_eq(t.name, "__VA_ARGS__")) or
+       ((P.o.std >= co.C23) and u.str_eq(t.name, "__VA_OPT__")) {
+        _ = dg.err(t.span, "C1053", u.f2("'%s' cannot be the subject of #%s", t.name, what));
+        return false;
+    }
+    return true;
+}
+
+// The parameters of a function-like macro, from line[i] (after its `(`):
+// false after an error (reported). i is moved past the `)`.
+fn define_params(P: *mut PP, m: *mut Macro, line: []lx.PTok, i0: usize, params: *mut u.List.[[]u8], sp: u.Span,
+                 iout: *mut usize) bool {
+    let std = P.o.std;
+    let mut i = i0;
+    let mut ok = true;
+    if (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN) {
+        iout.* = i + 1;
+        return true;
+    }
+    loop {
+        if i >= line.len {
+            ok = false;
+            break;
+        }
+        let p = &line[i];
+        if lx.is_punct(p, ct.P_ELLIPSIS) {
+            if (std < co.C99) and not P.o.gnu {
+                _ = dg.err(p.span, "C1054", "variadic macros are a C99 feature");
+                return false;
+            }
+            m.variadic = true;
+            params.push(u.intern("__VA_ARGS__"));
+            i += 1;
+            ok = (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN);
+            i += 1;
+            break;
+        }
+        if (p.kind != lx.PK_IDENT) or u.str_eq(p.name, "__VA_ARGS__") or
+           ((std >= co.C23) and u.str_eq(p.name, "__VA_OPT__")) {
+            ok = false;
+            break;
+        }
+        for k in 0..params.len {
+            if u.same(params.get(k), p.name) {
+                _ = dg.err(p.span, "C1055", u.f1("duplicate macro parameter '%s'", p.name));
+                return false;
+            }
+        }
+        params.push(p.name);
+        i += 1;
+        if (i < line.len) and lx.is_punct(&line[i], ct.P_ELLIPSIS) and (P.o.gnu or in_system_header(P)) {
+            // `name...` (a GNU dialect, and the system's headers, which use
+            // it in every standard: --c-lib=system): the variable
+            // arguments, named
+            m.variadic = true;
+            i += 1;
+            ok = (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN);
+            i += 1;
+            break;
+        }
+        if (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN) {
+            i += 1;
+            break;
+        }
+        if (i >= line.len) or not lx.is_punct(&line[i], ct.P_COMMA) {
+            ok = false;
+            break;
+        }
+        i += 1;
+    }
+    if not ok {
+        let mut at = sp;
+        if i < line.len {
+            at = line[i].span;
+        }
+        _ = dg.err(at, "C1055", u.f1("invalid parameter list of macro '%s'", m.name));
+        return false;
+    }
+    iout.* = i;
+    return true;
+}
+
+// The replacement list line[i..] of m, its parameters marked: false after
+// an error (reported).
+fn define_body(P: *mut PP, m: *mut Macro, line: []lx.PTok, i: usize, sp: u.Span) bool {
+    let std = P.o.std;
+    let params = m.params;
+    let mut body = tok_list();
+    let mut vaopt_open: usize = 0;
+    let mut in_vaopt = false;
+    let mut vdepth: i32 = 0;
+    let mut k = i;
+    while k < line.len {
+        let mut t = line[k];
+        t.bol = false;
+        if k == i {
+            t.space = false;
+        }
+        if (t.kind == lx.PK_IDENT) and m.funclike {
+            for j in 0..params.len {
+                if u.same(params[j], t.name) {
+                    t.kind = lx.PK_PARAM;
+                    t.id = @int_cast(i32, j);
+                }
+            }
+        }
+        if (t.kind == lx.PK_IDENT) and u.str_eq(t.name, "__VA_ARGS__") and (std >= co.C99) {
+            _ = dg.err(t.span, "C1023", "'__VA_ARGS__' can appear only in the replacement list of a variadic macro");
+            return false;
+        }
+        if (t.kind == lx.PK_IDENT) and u.str_eq(t.name, "__VA_OPT__") and (std >= co.C23) {
+            if not m.variadic {
+                _ = dg.err(t.span, "C1023", "'__VA_OPT__' can appear only in the replacement list of a variadic macro");
+                return false;
+            }
+            if in_vaopt {
+                _ = dg.err(t.span, "C1057", "'__VA_OPT__' cannot be nested");
+                return false;
+            }
+            if ((k + 1) >= line.len) or not lx.is_punct(&line[k + 1], ct.P_LPAREN) {
+                _ = dg.err(t.span, "C1057", "'__VA_OPT__' must be followed by '('");
+                return false;
+            }
+            t.kind = lx.PK_VAOPT;
+            in_vaopt = true;
+            vaopt_open = body.len;
+            vdepth = 0;
+            body.push(t);
+            k += 1;
+            continue;
+        }
+        if in_vaopt {
+            if lx.is_punct(&t, ct.P_LPAREN) {
+                vdepth += 1;
+            } else if lx.is_punct(&t, ct.P_RPAREN) {
+                vdepth -= 1;
+                if vdepth == 0 {
+                    in_vaopt = false;
+                    body.at_mut(vaopt_open).id = @int_cast(i32, body.len);
+                    let b = body.items();
+                    if ((body.len - vaopt_open) > 2) and
+                       (lx.is_punct(&b[vaopt_open + 2], lx.PP_HASHHASH) or
+                        lx.is_punct(&b[body.len - 1], lx.PP_HASHHASH)) {
+                        _ = dg.err(t.span, "C1058", "'##' cannot appear at either end of '__VA_OPT__'");
+                        return false;
+                    }
+                }
+            }
+        }
+        body.push(t);
+        k += 1;
+    }
+    if in_vaopt {
+        _ = dg.err(sp, "C1057", "unterminated '__VA_OPT__'");
+        return false;
+    }
+    let b = body.items();
+    if b.len > 0 {
+        if lx.is_punct(&b[0], lx.PP_HASHHASH) or lx.is_punct(&b[b.len - 1], lx.PP_HASHHASH) {
+            _ = dg.err(b[0].span, "C1058", "'##' cannot appear at either end of a macro's replacement list");
+            return false;
+        }
+    }
+    if m.funclike {
+        for j in 0..b.len {
+            if lx.is_punct(&b[j], lx.PP_HASH) and
+               (((j + 1) >= b.len) or ((b[j + 1].kind != lx.PK_PARAM) and (b[j + 1].kind != lx.PK_VAOPT))) {
+                _ = dg.err(b[j].span, "C1059", "'#' is not followed by a macro parameter");
+                return false;
+            }
+        }
+    }
+    m.body = frozen(&mut body);
+    return true;
+}
+
+fn poisoned(sp: u.Span, name: []u8) void {
+    _ = dg.err(sp, "C1086", u.f1("'%s' is poisoned (#pragma GCC poison)", name));
+}
+
+// With the system's C library: the comparison macros of <math.h> (C17
+// 7.12.14), which the system's header defines for a compiler that is not
+// its own with GNU statement expressions, are the compiler's built-ins (as
+// its own <math.h> defines them), in every standard.
+fn system_math_macro(P: *mut PP, line: []lx.PTok) []lx.PTok {
+    if not in_system_header(P) {
+        return line;
+    }
+    let mname = line[0].name;
+    let names = ["isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered"];
+    for n in names {
+        if u.str_eq(n, mname) {
+            return lx.lex_all(u.f2("%s(x, y) __builtin_axiom_%s(x, y)", n, n), P.o.std, line[0].span);
+        }
+    }
+    if tg.is_darwin() {
+        // Darwin's <arm/_types.h>, <i386/_types.h> and <sys/_types/_*.h> fall back to
+        // `typedef void * __darwin_va_list;` without __GNUC__ unless USE_CLANG_* is 1;
+        // and <libkern/_OSByteOrder.h> omits _OSSwapInt* on arm64 without __GNUC__.
+        if u.str_eq(mname, "USE_CLANG_TYPES") or u.str_eq(mname, "USE_CLANG_STDDEF") or
+           u.str_eq(mname, "USE_CLANG_STDARG") or u.str_eq(mname, "TARGET_RT_64_BIT") {
+            return lx.lex_all(u.f1("%s 1", mname), P.o.std, line[0].span);
+        }
+        let swaps = ["__DARWIN_OSSwapInt16", "__DARWIN_OSSwapInt32", "__DARWIN_OSSwapInt64"];
+        let bits = ["16", "32", "64"];
+        for k in 0..swaps.len {
+            if u.str_eq(mname, swaps[k]) {
+                return lx.lex_all(u.f2("%s(x) __builtin_axiom_bswap%s(x)", mname, bits[k]), P.o.std, line[0].span);
+            }
+        }
+    }
+    return line;
+}
+
+fn do_define(P: *mut PP, line0: []lx.PTok, sp: u.Span) void {
+    let mut line = line0;
+    if (line.len > 0) and (line[0].kind == lx.PK_IDENT) and P.o.system_lib {
+        if tg.is_darwin() and in_system_header(P) and u.str_eq(line[0].name, "__TARGETCONDITIONALS__") {
+            do_define(P, lx.lex_all("TARGET_OS_MAC 1", P.o.std, sp), sp);
+            do_define(P, lx.lex_all("TARGET_OS_OSX 1", P.o.std, sp), sp);
+            let cpu = u.pick(tg.g_arch == tg.ARCH_A64, "TARGET_CPU_ARM64 1", "TARGET_CPU_X86_64 1");
+            do_define(P, lx.lex_all(cpu, P.o.std, sp), sp);
+        }
+        line = system_math_macro(P, line);
+    }
+    if line.len == 0 {
+        _ = dg.err(sp, "C1052", "macro names must be identifiers, after #define");
+        return;
+    }
+    if P.poisoned.len > 0 {
+        for t in line {
+            if (t.kind == lx.PK_IDENT) and (P.poisoned.get(t.name) != 0) {
+                poisoned(t.span, t.name);
+                return;
+            }
+        }
+    }
+    let nt = &line[0];
+    if not definable(P, nt, "define") {
+        return;
+    }
+    if P.o.gnu and (nt.kind == lx.PK_IDENT) and in_system_header(P) and (ct.keyword_id(nt.name, P.o.std) == 0) and
+       (ct.keyword_id_in(nt.name, P.o.std, true) != 0) {
+        // the system's headers' definitions of the GNU keywords, for a
+        // compiler that is not their own (`__attribute__(x)` as nothing,
+        // `__extension__`, ...): in a GNU dialect they are this one's
+        // keywords, which stay (the program's attributes too)
+        return;
+    }
+    let m = u.new.[Macro]();
+    m.name = nt.name;
+    m.span = nt.span;
+    m.builtin = B_NONE;
+    let mut i: usize = 1;
+    let mut params = u.List.[[]u8].empty();
+    if (i < line.len) and lx.is_punct(&line[i], ct.P_LPAREN) and not line[i].space {
+        m.funclike = true;
+        if not define_params(P, m, line, i + 1, &mut params, sp, &mut i) {
+            return;
+        }
+    } else if (i < line.len) and not line[i].space and (P.o.std >= co.C99) {
+        _ = dg.err(line[i].span, "C1056", u.f1("white space is required after the name of macro '%s'", nt.name));
+        return;
+    }
+    m.params = params.items();
+    if not define_body(P, m, line, i, sp) {
+        return;
+    }
+    let old = lookup(P, m.name);
+    if u.notnil(old) {
+        if old.ours and in_system_header(P) {
+            // the system's headers define what the compiler's own headers
+            // (--c-lib=system: <float.h>'s INFINITY and NAN in C23, ...)
+            // define: they are the implementation's, and the compiler's
+            // definition stays
+            return;
+        }
+        let target = (old.span.file == g_builtin_file) and (old.span.start >= g_target_from) and (old.builtin == 0);
+        // (a system header's redefinition of a system header's macro, which
+        // the system's headers make, guarded or not, of what one another
+        // defined, `CHAR_MAX` ...: the later definition replaces the earlier;
+        // and of the program's, which defined a name of theirs before them,
+        // `assert` before <assert.h>: theirs replaces it, as for the
+        // compilers they are written for)
+        let sys = not old.ours and in_system_header(P);
+        if not same_def(old, m) and not target and not sys {
+            let d = dg.err(nt.span, "C1060", u.f1("macro '%s' redefined differently", m.name));
+            dg.note(d, old.span, "the previous definition");
+            return;
+        }
+        if not (target or sys) or same_def(old, m) {
+            return;
+        }
+        // (a macro of the target's, ctarget.ax, is replaced: -D__x86_64__=2,
+        // as an #undef and a #define would)
+    }
+    m.ours = in_compiler_header(P);
+    m.sys = in_system_header(P);
+    P.macros.put(m.name, m);
+    if P.mac {
+        record_macro(P, 1, nt.span, line[line.len - 1].span.end, m.name);
+    }
+}
+
+// -g: a definition (kind 1, its text from the name to `end`) or an
+// undefinition (2) at span sp (u.g_macros).
+fn record_macro(P: *mut PP, kind: u8, sp: u.Span, end: u32, name: []u8) void {
+    if u.str_eq(name, "__DATE__") or u.str_eq(name, "__TIME__") {
+        return;  // (the time of the build: two builds are the same)
+    }
+    let s = cur_src(P);
+    let mut at: i32 = -1;
+    let mut line: i32 = 0;
+    if not u.str_eq(s.presumed, "<built-in>") and not u.str_eq(s.presumed, "<command line>") {
+        at = sp.file;
+        line = u.span_line(sp);
+    }
+    let mut text = name;
+    if kind == 1 {
+        // (the directive's text from the name on, its continued lines
+        // joined, white space as single spaces; an object-like macro's name
+        // and replacement apart by one: DWARF 5, 6.3.2.1)
+        let src = u.file_of(sp.file).text;
+        let mut b = u.Buf.init();
+        let mut k = @as(usize, sp.start);
+        let e = @min(@as(usize, end), src.len);
+        let mut space = false;
+        while k < e {
+            let c = src[k];
+            if (c == '\\') and (k + 1 < e) and (src[k + 1] == '\n') {
+                k += 2;
+                continue;
+            }
+            if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') {
+                space = true;
+            } else {
+                if space {
+                    b.s(" ");
+                    space = false;
+                }
+                b.c(c);
+            }
+            k += 1;
+        }
+        text = b.done();
+        if text.len == name.len {
+            text = u.f1("%s ", name);
+        }
+    }
+    u.g_macros.push(u.MacroEv.{ kind: kind, at: at, line: line, file: -1, text: text });
+}
+
+fn do_undef(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
+    if line.len == 0 {
+        _ = dg.err(sp, "C1052", "macro names must be identifiers, after #undef");
+        return;
+    }
+    if not definable(P, &line[0], "undef") {
+        return;
+    }
+    extra(line, 1, "undef");
+    if u.notnil(lookup(P, line[0].name)) {
+        P.macros.put(line[0].name, nilmac());
+    }
+    if P.mac {
+        record_macro(P, 2, line[0].span, line[0].span.end, line[0].name);
+    }
+}

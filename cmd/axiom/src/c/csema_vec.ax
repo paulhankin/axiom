@@ -40,9 +40,6 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "cldbl.ax" as cl;
-import "csema.ax" as cs;
-import "csema_expr.ax" as cx;
-import "csema_gbuiltin.ax" as gb;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -50,21 +47,6 @@ import "ctypes.ax" as cty;
 pub const MAX_VECTOR: u64 = 4096;
 
 /// Installs the vector operators in csema_expr.ax and the builtins in csema_gbuiltin.ax.
-pub fn install() void {
-    cx.vector_expr = vector_expr;
-    gb.vec_builtin = builtin;
-}
-
-fn bad(e: *mut cast.Expr) *mut cast.Expr {
-    e.ty = cty.t_error;
-    e.lvalue = false;
-    return e;
-}
-
-fn is_err(e: *cast.Expr) bool {
-    return u.isnil(e.ty) or cty.is_error(e.ty);
-}
-
 // -----------------------------------------------------------------------------
 // Types
 // -----------------------------------------------------------------------------
@@ -91,18 +73,16 @@ pub fn vector_type(t: *mut cty.CType, size: u64, sp: u.Span, what: []u8) *mut ct
         e = e.tag.base;
     }
     if not element_ok(e) {
-        cs.err(sp, "C3077", u.f2("%s on %s: a vector's elements are of an integer or real floating type", what,
-                                 cs.tq(t)));
+        err(sp, "C3077", u.f2("%s on %s: a vector's elements are of an integer or real floating type", what, tq(t)));
         return cty.t_error;
     }
     let es = cty.size_of(e);
     if (size == 0) or ((size % es) != 0) or (((size / es) & ((size / es) - 1)) != 0) {
-        cs.err(sp, "C3077", u.f3("%s: %s bytes are not a power of two times the size of %s", what, u.udec(size),
-                                 cs.tq(e)));
+        err(sp, "C3077", u.f3("%s: %s bytes are not a power of two times the size of %s", what, u.udec(size), tq(e)));
         return cty.t_error;
     }
     if size > MAX_VECTOR {
-        cs.err(sp, "C3077", u.f2("%s: a vector of %s bytes is too large (at most 4096)", what, u.udec(size)));
+        err(sp, "C3077", u.f2("%s: a vector of %s bytes is too large (at most 4096)", what, u.udec(size)));
         return cty.t_error;
     }
     return cty.qualify(cty.vector_of(e, size), t.quals);
@@ -243,20 +223,20 @@ fn exactly(f: f64, t: *cty.CType) bool {
 fn splat(s: *mut cast.Expr, vt: *mut cty.CType, op_sp: u.Span) *mut cast.Expr {
     let el = vt.unq.elem;
     if not cty.is_integer(s.ty) and not cty.is_floating(s.ty) {
-        cs.err(op_sp, "C3020", u.f2("a vector operand (%s) with an operand of type %s", cs.tq(vt), cs.tq(s.ty)));
+        err(op_sp, "C3020", u.f2("a vector operand (%s) with an operand of type %s", tq(vt), tq(s.ty)));
         return u.nil.[cast.Expr]();
     }
     if cty.is_floating(s.ty) and not cty.is_floating(el) {
-        cs.err(s.span, "C3020", u.f2("a floating value (%s) cannot be converted to the integer vector %s", cs.tq(s.ty),
-                                     cs.tq(vt)));
+        err(s.span, "C3020", u.f2("a floating value (%s) cannot be converted to the integer vector %s", tq(s.ty),
+                                  tq(vt)));
         return u.nil.[cast.Expr]();
     }
     if not splat_safe(s, el) {
-        cs.err(s.span, "C3020", u.f2("the conversion of a scalar of type %s to the vector %s would change its value",
-                                     cs.tq(s.ty), cs.tq(vt)));
+        err(s.span, "C3020", u.f2("the conversion of a scalar of type %s to the vector %s would change its value",
+                                  tq(s.ty), tq(vt)));
         return u.nil.[cast.Expr]();
     }
-    return cx.conv(cx.convert(s, el), cast.CV_SPLAT, cty.unqual(vt));
+    return conv(convert(s, el), cast.CV_SPLAT, cty.unqual(vt));
 }
 
 // Vector operand x converted to vector type t of the same shape (its bytes,
@@ -265,39 +245,39 @@ fn to_vec(x: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
     if x.ty.unq == t.unq {
         return x;
     }
-    return cx.conv(x, cast.CV_VBITS, cty.unqual(t));
+    return conv(x, cast.CV_VBITS, cty.unqual(t));
 }
 
 // -----------------------------------------------------------------------------
 // The operators
 // -----------------------------------------------------------------------------
 
-fn vector_expr(e: *mut cast.Expr, what: i32) *mut cast.Expr {
-    if what == cx.VX_BINARY {
-        return binary(e, e.op, false);
+fn vec_expr(e: *mut cast.Expr, what: i32) *mut cast.Expr {
+    if what == VX_BINARY {
+        return vec_binary(e, e.op, false);
     }
-    if what == cx.VX_ASSIGN {
+    if what == VX_ASSIGN {
         return compound(e);
     }
-    if what == cx.VX_UNARY {
-        return unary(e);
+    if what == VX_UNARY {
+        return vec_unary(e);
     }
-    if what == cx.VX_INCDEC {
+    if what == VX_INCDEC {
         e.opty = cty.unqual(e.a.ty);
         e.ty = e.opty;
         if not cty.is_vector(e.ty) {
-            return bad(e);
+            return bad_expr(e);
         }
         return e;
     }
-    if what == cx.VX_COND {
-        return conditional(e);
+    if what == VX_COND {
+        return vec_conditional(e);
     }
-    if what == cx.VX_INDEX {
-        return index(e);
+    if what == VX_INDEX {
+        return vec_index(e);
     }
-    if what == cx.VX_CAST {
-        return explicit_cast(e);
+    if what == VX_CAST {
+        return vec_explicit_cast(e);
     }
     return convertvector(e);
 }
@@ -307,9 +287,9 @@ fn op_text(op: i32) []u8 {
 }
 
 fn bad_ops(e: *mut cast.Expr, op: i32, why: []u8) *mut cast.Expr {
-    cs.err(e.span, "C3020", u.f4("invalid operands to binary '%s' (%s and %s)%s", op_text(op), cs.tq(e.a.ty),
-                                 cs.tq(e.b.ty), why));
-    return bad(e);
+    err(e.span, "C3020", u.f4("invalid operands to binary '%s' (%s and %s)%s", op_text(op), tq(e.a.ty), tq(e.b.ty),
+                              why));
+    return bad_expr(e);
 }
 
 fn is_shift(op: i32) bool {
@@ -323,14 +303,14 @@ fn int_only(op: i32) bool {
 // e.a op e.b (typed rvalues, one a vector; op a binary operator's, or a
 // compound assignment's: then e.a's type is the result's and only e.b is
 // converted, `assign`).
-fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
+fn vec_binary(e: *mut cast.Expr, op: i32, is_assign: bool) *mut cast.Expr {
     let a = e.a;
     let b = e.b;
     let ta = a.ty;
     let tb = b.ty;
     if (op == ct.P_ANDAND) or (op == ct.P_OROR) {
-        cs.err(e.span, "C3020", u.f1("a vector operand of '%s' (a vector is not a scalar)", op_text(op)));
-        return bad(e);
+        err(e.span, "C3020", u.f1("a vector operand of '%s' (a vector is not a scalar)", op_text(op)));
+        return bad_expr(e);
     }
     let va = cty.is_vector(ta);
     let vb = cty.is_vector(tb);
@@ -338,10 +318,10 @@ fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
     if not va {
         t = tb;
     }
-    if assign and not va {
-        cs.err(e.span, "C3020", u.f3("invalid operands to '%s' (%s and %s): a vector assigned to a scalar", op_text(op),
-                                     cs.tq(ta), cs.tq(tb)));
-        return bad(e);
+    if is_assign and not va {
+        err(e.span, "C3020", u.f3("invalid operands to '%s' (%s and %s): a vector assigned to a scalar", op_text(op),
+                                  tq(ta), tq(tb)));
+        return bad_expr(e);
     }
     let el = t.unq.elem;
     if int_only(op) and not cty.is_integer(el) {
@@ -362,18 +342,18 @@ fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
             if not cty.is_integer(tb) {
                 return bad_ops(e, op, "");
             }
-            e.b = cx.conv(cx.convert(b, el), cast.CV_SPLAT, cty.unqual(t));
+            e.b = conv(convert(b, el), cast.CV_SPLAT, cty.unqual(t));
         } else {
             let s = splat(a, t, e.span);
             if u.isnil(s) {
-                return bad(e);
+                return bad_expr(e);
             }
             e.a = s;
         }
     } else {
-        let s = splat(pick(va, b, a), t, e.span);
+        let s = splat(vec_pick(va, b, a), t, e.span);
         if u.isnil(s) {
-            return bad(e);
+            return bad_expr(e);
         }
         if va {
             e.b = s;
@@ -382,7 +362,7 @@ fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
         }
     }
     let rt = cty.unqual(t);
-    if assign {
+    if is_assign {
         e.opty = rt;
         e.ty = cty.unqual(e.a.ty);
         return e;
@@ -395,7 +375,7 @@ fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
     return e;
 }
 
-fn pick(c: bool, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
+fn vec_pick(c: bool, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
     if c {
         return a;
     }
@@ -406,9 +386,9 @@ fn pick(c: bool, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
 fn compound(e: *mut cast.Expr) *mut cast.Expr {
     let op = cast_op(e.op);
     if op < 0 {
-        return bad(e);
+        return bad_expr(e);
     }
-    return binary(e, op, true);
+    return vec_binary(e, op, true);
 }
 
 // The operator of compound assignment op ('+=' is '+'), or -1.
@@ -425,16 +405,16 @@ fn cast_op(op: i32) i32 {
     return -1;
 }
 
-fn unary(e: *mut cast.Expr) *mut cast.Expr {
+fn vec_unary(e: *mut cast.Expr) *mut cast.Expr {
     let t = e.a.ty;
     let op = e.op;
     if op == ct.P_BANG {
-        cs.err(e.span, "C3020", u.f1("the operand of '!' has type %s, a vector (not a scalar type)", cs.tq(t)));
-        return bad(e);
+        err(e.span, "C3020", u.f1("the operand of '!' has type %s, a vector (not a scalar type)", tq(t)));
+        return bad_expr(e);
     }
     if (op == ct.P_TILDE) and not is_int_vec(t) {
-        cs.err(e.span, "C3020", u.f1("the operand of '~' has type %s, not an integer vector", cs.tq(t)));
-        return bad(e);
+        err(e.span, "C3020", u.f1("the operand of '~' has type %s, not an integer vector", tq(t)));
+        return bad_expr(e);
     }
     e.ty = cty.unqual(t);
     return e;
@@ -443,17 +423,17 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
 // `a ? b : c` with a vector a: each lane of the result b's where a's lane
 // is nonzero, else c's. a is an integer vector; b and c vectors of one type
 // whose shape is a's (or scalars given to every lane of the other's).
-fn conditional(e: *mut cast.Expr) *mut cast.Expr {
+fn vec_conditional(e: *mut cast.Expr) *mut cast.Expr {
     let ta = e.a.ty;
     if not is_int_vec(ta) {
-        cs.err(e.a.span, "C3020", u.f1("the condition of '?:' is a vector (%s) that is no integer vector", cs.tq(ta)));
-        return bad(e);
+        err(e.a.span, "C3020", u.f1("the condition of '?:' is a vector (%s) that is no integer vector", tq(ta)));
+        return bad_expr(e);
     }
     let vb = cty.is_vector(e.b.ty);
     let vc = cty.is_vector(e.c.ty);
     if not vb and not vc {
-        cs.err(e.span, "C3020", "a vector condition of '?:' with operands that are not vectors");
-        return bad(e);
+        err(e.span, "C3020", "a vector condition of '?:' with operands that are not vectors");
+        return bad_expr(e);
     }
     let mut t = e.b.ty;
     if not vb {
@@ -461,9 +441,9 @@ fn conditional(e: *mut cast.Expr) *mut cast.Expr {
     }
     if vb and vc {
         if e.b.ty.unq != e.c.ty.unq {
-            cs.err(e.span, "C3020", u.f2("the operands of '?:' are vectors of different types (%s and %s)",
-                                         cs.tq(e.b.ty), cs.tq(e.c.ty)));
-            return bad(e);
+            err(e.span, "C3020", u.f2("the operands of '?:' are vectors of different types (%s and %s)", tq(e.b.ty),
+                                      tq(e.c.ty)));
+            return bad_expr(e);
         }
     } else if vb {
         e.c = splat(e.c, t, e.span);
@@ -472,12 +452,12 @@ fn conditional(e: *mut cast.Expr) *mut cast.Expr {
     }
     if u.isnil(e.b) or u.isnil(e.c) {
         e.b = u.nil.[cast.Expr]();
-        return bad(e);
+        return bad_expr(e);
     }
     if (t.unq.len != ta.unq.len) or (cty.size_of(t.unq.elem) != cty.size_of(ta.unq.elem)) {
-        cs.err(e.span, "C3020", u.f2("the vector condition of '?:' (%s) has not the shape of its operands (%s)",
-                                     cs.tq(ta), cs.tq(t)));
-        return bad(e);
+        err(e.span, "C3020", u.f2("the vector condition of '?:' (%s) has not the shape of its operands (%s)", tq(ta),
+                                  tq(t)));
+        return bad_expr(e);
     }
     e.ty = cty.unqual(t);
     return e;
@@ -485,21 +465,21 @@ fn conditional(e: *mut cast.Expr) *mut cast.Expr {
 
 // v[i]: lane i of vector v (an lvalue when v is one), of v's element type
 // with v's qualifiers.
-fn index(e: *mut cast.Expr) *mut cast.Expr {
+fn vec_index(e: *mut cast.Expr) *mut cast.Expr {
     let v = e.a;
-    let i = cx.rv(e.b);
+    let i = rv(e.b);
     e.b = i;
     if is_err(i) {
-        return bad(e);
+        return bad_expr(e);
     }
     if not cty.is_integer(i.ty) {
-        cs.err(e.span, "C3020", u.f2("subscript of %s by %s (an integer is needed)", cs.tq(v.ty), cs.tq(i.ty)));
-        return bad(e);
+        err(e.span, "C3020", u.f2("subscript of %s by %s (an integer is needed)", tq(v.ty), tq(i.ty)));
+        return bad_expr(e);
     }
     if cty.promote(i.ty).is_signed {
-        e.b = cx.convert(i, cty.t_ptrdiff);
+        e.b = convert(i, cty.t_ptrdiff);
     } else {
-        e.b = cx.convert(i, cty.t_size);
+        e.b = convert(i, cty.t_size);
     }
     e.ty = cty.qualify(v.ty.unq.elem, v.ty.quals);
     e.lvalue = v.lvalue;
@@ -511,17 +491,16 @@ fn index(e: *mut cast.Expr) *mut cast.Expr {
 }
 
 // A cast (e.ty, from e.a) to or from a vector type.
-fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
+fn vec_explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
     let t = e.ty;
     let s = e.a.ty;
     let n = cty.size_of(t);
     let ok = ((cty.is_vector(t) and (cty.is_vector(s) or cty.is_integer(s))) or
               (cty.is_vector(s) and cty.is_integer(t))) and (n == cty.size_of(s)) and (t.kind != cty.TK_BOOL);
     if not ok {
-        cs.err(e.span, "C3028",
-               u.f2("a cast from %s to %s (a vector converts only to a vector or an integer of its size)", cs.tq(s),
-                    cs.tq(t)));
-        return bad(e);
+        err(e.span, "C3028", u.f2("a cast from %s to %s (a vector converts only to a vector or an integer of its size)",
+                                  tq(s), tq(t)));
+        return bad_expr(e);
     }
     e.op = cast.CV_VBITS;
     return e;
@@ -530,16 +509,16 @@ fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
 // __builtin_convertvector(v, T): each lane of v converted to the element
 // type of vector type T, which has as many lanes.
 fn convertvector(e: *mut cast.Expr) *mut cast.Expr {
-    let v = cx.rv(e.a);
+    let v = rv(e.a);
     e.a = v;
-    let t = cs.hooks.type_name(e.tname);
+    let t = type_name(e.tname);
     if is_err(v) or cty.is_error(t) {
-        return bad(e);
+        return bad_expr(e);
     }
     if not cty.is_vector(v.ty) or not cty.is_vector(t) or (v.ty.unq.len != t.unq.len) {
-        cs.err(e.span, "C3082", u.f2("__builtin_convertvector of %s to %s (vectors of as many elements)", cs.tq(v.ty),
-                                     cs.tq(t)));
-        return bad(e);
+        err(e.span, "C3082", u.f2("__builtin_convertvector of %s to %s (vectors of as many elements)", tq(v.ty),
+                                  tq(t)));
+        return bad_expr(e);
     }
     e.ty = cty.unqual(t);
     return e;
@@ -555,7 +534,7 @@ fn convertvector(e: *mut cast.Expr) *mut cast.Expr {
 // each as wide. __builtin_shufflevector(a, b, i...) (constant indices into a
 // then b, -1 for a lane of any value): a vector of as many lanes as indices,
 // a power of two, of a's element type. True if e named one (typed then).
-fn builtin(e: *mut cast.Expr, name: []u8) bool {
+fn vec_builtin_call(e: *mut cast.Expr, name: []u8) bool {
     if u.str_eq(name, "__builtin_shuffle") {
         shuffle(e);
         return true;
@@ -567,10 +546,10 @@ fn builtin(e: *mut cast.Expr, name: []u8) bool {
     return false;
 }
 
-fn args(e: *mut cast.Expr) bool {
+fn vec_args(e: *mut cast.Expr) bool {
     let mut ok = true;
     for k in 0..e.args.len {
-        let x = cx.rv(e.args.get(k));
+        let x = rv(e.args.get(k));
         e.args.set(k, x);
         if is_err(x) {
             ok = false;
@@ -580,42 +559,42 @@ fn args(e: *mut cast.Expr) bool {
 }
 
 fn shuffle(e: *mut cast.Expr) void {
-    e.op = gb.GB_SHUFFLE;
+    e.op = GB_SHUFFLE;
     e.ty = cty.t_error;
-    if not args(e) {
+    if not vec_args(e) {
         return;
     }
     let n = e.args.len;
     if (n != 2) and (n != 3) {
-        cs.err(e.span, "C3082", "__builtin_shuffle takes (a, mask) or (a, b, mask)");
+        err(e.span, "C3082", "__builtin_shuffle takes (a, mask) or (a, b, mask)");
         return;
     }
     let a = e.args.get(0);
     let m = e.args.get(n - 1);
     if not cty.is_vector(a.ty) or not is_int_vec(m.ty) or (a.ty.unq.len != m.ty.unq.len) or
        (cty.size_of(a.ty.unq.elem) != cty.size_of(m.ty.unq.elem)) {
-        cs.err(e.span, "C3082", u.f2("__builtin_shuffle of %s by %s (a mask of integers, of the vector's shape)",
-                                     cs.tq(a.ty), cs.tq(m.ty)));
+        err(e.span, "C3082", u.f2("__builtin_shuffle of %s by %s (a mask of integers, of the vector's shape)", tq(a.ty),
+                                  tq(m.ty)));
         return;
     }
     if (n == 3) and (e.args.get(1).ty.unq != a.ty.unq) {
-        cs.err(e.span, "C3082", u.f2("__builtin_shuffle of vectors of different types (%s and %s)", cs.tq(a.ty),
-                                     cs.tq(e.args.get(1).ty)));
+        err(e.span, "C3082", u.f2("__builtin_shuffle of vectors of different types (%s and %s)", tq(a.ty),
+                                  tq(e.args.get(1).ty)));
         return;
     }
     e.ty = cty.unqual(a.ty);
 }
 
 fn shufflevector(e: *mut cast.Expr) void {
-    e.op = gb.GB_SHUFFLEVECTOR;
+    e.op = GB_SHUFFLEVECTOR;
     e.ty = cty.t_error;
     let n = e.args.len;
     if n < 3 {
-        cs.err(e.span, "C3082", "__builtin_shufflevector takes two vectors and the indices of the result's elements");
+        err(e.span, "C3082", "__builtin_shufflevector takes two vectors and the indices of the result's elements");
         return;
     }
     for k in @as(usize, 0)..2 {
-        let x = cx.rv(e.args.get(k));
+        let x = rv(e.args.get(k));
         e.args.set(k, x);
         if is_err(x) {
             return;
@@ -624,21 +603,21 @@ fn shufflevector(e: *mut cast.Expr) void {
     let a = e.args.get(0);
     let b = e.args.get(1);
     if not cty.is_vector(a.ty) or (a.ty.unq != b.ty.unq) {
-        cs.err(e.span, "C3082", u.f2("__builtin_shufflevector of %s and %s (two vectors of one type)", cs.tq(a.ty),
-                                     cs.tq(b.ty)));
+        err(e.span, "C3082", u.f2("__builtin_shufflevector of %s and %s (two vectors of one type)", tq(a.ty),
+                                  tq(b.ty)));
         return;
     }
     let lanes = 2 * a.ty.unq.len;
     let m = @as(u64, n - 2);
     let mut ok = true;
     for k in 2..n {
-        let r = cx.ice(e.args.get(k), "an index of __builtin_shufflevector");
+        let r = ice(e.args.get(k), "an index of __builtin_shufflevector");
         e.args.set(k, r.e);
         if not r.ok {
             ok = false;
         } else if (@bit_cast(i64, r.v) != -1) and (r.v >= lanes) {
-            cs.err(r.e.span, "C3082", u.f2("the index %s of __builtin_shufflevector is not one of the %s elements",
-                                           u.dec(@bit_cast(i64, r.v)), u.udec(lanes)));
+            err(r.e.span, "C3082", u.f2("the index %s of __builtin_shufflevector is not one of the %s elements",
+                                        u.dec(@bit_cast(i64, r.v)), u.udec(lanes)));
             ok = false;
         }
     }
@@ -646,8 +625,8 @@ fn shufflevector(e: *mut cast.Expr) void {
         return;
     }
     if (m & (m - 1)) != 0 {
-        cs.err(e.span, "C3082", u.f1("__builtin_shufflevector makes a vector of %s elements, not a power of two",
-                                     u.udec(m)));
+        err(e.span, "C3082", u.f1("__builtin_shufflevector makes a vector of %s elements, not a power of two",
+                                  u.udec(m)));
         return;
     }
     e.ty = cty.vector_of(a.ty.unq.elem, m * cty.size_of(a.ty.unq.elem));

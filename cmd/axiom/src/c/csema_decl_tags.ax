@@ -1,0 +1,560 @@
+// =============================================================================
+// csema_decl_tags.ax - structure, union and enum tags and declarators
+// (6.7.2.1 - 6.7.2.3, 6.7.6, 6.7.7), part of csema.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen_debug.ax" as cdbg;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+
+// -----------------------------------------------------------------------------
+// Structures, unions and enumerations (6.7.2.1 - 6.7.2.3)
+// -----------------------------------------------------------------------------
+
+fn tag_kind(kw: i32) i32 {
+    if kw == ct.K_STRUCT {
+        return cty.TK_STRUCT;
+    }
+    if kw == ct.K_UNION {
+        return cty.TK_UNION;
+    }
+    return cty.TK_ENUM;
+}
+
+// The type a struct-or-union or enum specifier names (lone: the whole
+// declaration is `struct S;`).
+fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
+    if u.notnil(ts.ty) {
+        return ts.ty;
+    }
+    let kind = tag_kind(ts.kw);
+    attrs(&ts.attrs, AP_TAG);
+    if kind == cty.TK_ENUM {
+        let et = enum_tag(ts, lone);
+        tag_attrs(ts, et, ts.has_body or lone or u.notnil(ts.fixed));
+        return et;
+    }
+    let named = ts.name.len > 0;
+    let mut t = u.nil.[cty.CType]();
+    if ts.has_body or lone {
+        if named {
+            t = lookup_tag_here(ts.name);
+        }
+        if u.notnil(t) {
+            if t.kind != kind {
+                err_note(ts.name_span, "C3011", u.f2("'%s' was declared as %s", ts.name,
+                                                     u.cat2(
+                                                         "a different kind of tag (", u.cat2(kind_word(t.kind), ")"))),
+                         t.tag.span, "declared here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+            if ts.has_body and t.tag.complete and (std() >= co.C23) {
+                return redefined_record(ts, t, kind);
+            }
+            if ts.has_body and (t.tag.complete or t.tag.defining) {
+                err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s'", kind_word(kind), ts.name), t.tag.span,
+                         "defined before here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+        } else if (kind == cty.TK_ENUM) and not ts.has_body {
+            return undefined_enum(ts);
+        } else {
+            t = cty.new_tagged(kind, ts.name, ts.name_span);
+            if not named {
+                t.tag.span = ts.span;
+            }
+            if named {
+                declare_tag(ts.name, t);
+            }
+        }
+    } else {
+        t = lookup_tag(ts.name);
+        if u.notnil(t) {
+            if t.kind != kind {
+                err_note(ts.name_span, "C3011", u.f2("'%s' is not a %s tag", ts.name, kind_word(kind)), t.tag.span,
+                         "declared here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+        } else if kind == cty.TK_ENUM {
+            return undefined_enum(ts);
+        } else {
+            t = cty.new_tagged(kind, ts.name, ts.name_span);
+            declare_tag(ts.name, t);
+        }
+    }
+    ts.ty = t;
+    tag_attrs(ts, t, ts.has_body or lone);
+    if ts.has_body {
+        t.tag.in_block = not at_file_scope();
+        record_body(t, ts);
+    }
+    return t;
+}
+
+// C23 6.7.2.3: a structure or union defined again in the same scope is
+// the same type if the definitions are compatible (6.2.7p1); the second
+// is read into a type of its own, then compared.
+fn redefined_record(ts: *mut cast.TagSpec, t: *mut cty.CType, kind: i32) *mut cty.CType {
+    let nt = cty.new_tagged(kind, ts.name, ts.name_span);
+    ts.ty = nt;
+    record_body(nt, ts);
+    if not cty.compatible(nt, t) {
+        err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s' with other members (or other types of them)",
+                                             kind_word(kind), ts.name), t.tag.span, "defined before here");
+        ts.ty = cty.t_error;
+        return ts.ty;
+    }
+    ts.ty = t;
+    attr_mark_tag(t, &ts.attrs);
+    return t;
+}
+
+// What the attributes of tag specifier ts say of its type t (declares: it
+// defines or declares the tag), or, for a use, a warning if it is deprecated.
+fn tag_attrs(ts: *mut cast.TagSpec, t: *mut cty.CType, declares: bool) void {
+    if cty.is_error(t) {
+        return;
+    }
+    if declares {
+        attr_mark_tag(t, &ts.attrs);
+        gnu_mark_tag(t, &ts.attrs);
+        return;
+    }
+    if ts.attrs.len > 0 {
+        err(ts.attrs.get(0).span, "C3077",
+            u.f1("attributes in '%s' can appear only where it is defined, or in a declaration of the tag alone",
+                 u.cat3(kind_word(tag_kind(ts.kw)), " ", ts.name)));
+    }
+    use_tag(t, ts.name_span);
+}
+
+fn undefined_enum(ts: *mut cast.TagSpec) *mut cty.CType {
+    err(ts.name_span, "C3011", u.f1("'enum %s' is not defined", ts.name));
+    ts.ty = cty.t_error;
+    return ts.ty;
+}
+
+fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
+    let ti = t.tag;
+    ti.defining = true;
+    let mut names = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let mut flex = u.nil.[cty.Member]();
+    let mut named: i32 = 0;
+    for md in ts.members.items() {
+        if md.kind == cast.DeclKind.STATIC_ASSERT {
+            static_assert(md);
+            continue;
+        }
+        if md.kind != cast.DeclKind.DECL {
+            continue;
+        }
+        let sp = specifiers(md.specs, CTX_MEMBER, md.decls.len == 0);
+        attrs(&md.attrs, AP_MEMBER);
+        attrs(&md.specs.gattrs, AP_MEMBER);
+        if md.decls.len == 0 {
+            // an anonymous structure or union (C11)
+            let at = sp.ty;
+            if cty.is_record(at) and (at.tag.name.len == 0) {
+                add_member(ti, "", md.span, at);
+                for m in at.tag.members.items() {
+                    if m.name.len > 0 {
+                        check_dup(&mut names, m.name, m.span);
+                    }
+                }
+            } else if not cty.is_error(at) {
+                err(md.span, "C3010", "a member declaration that declares no member");
+            }
+            continue;
+        }
+        for d in md.decls.items() {
+            g_fn_entity = has_function_deriv(d);
+            attrs(&d.attrs, AP_MEMBER);
+            g_fn_entity = false;
+            let mbase = mode_type(sp.ty, &md.specs.gattrs, &md.attrs, &d.attrs);
+            if u.notnil(d.width) {
+                let bt = derive(mbase, d, CTX_MEMBER);
+                d.ty = bt;
+                let w = bit_width(bt, d);
+                if sp.has_align {
+                    misplaced_alignment(sp.align_sp, u.pick(d.name.len > 0,
+                                                            u.f1("the declaration of the bit-field '%s'", d.name),
+                                                            "an unnamed bit-field"));
+                }
+                if w < 0 {
+                    continue;
+                }
+                if u.notnil(flex) {
+                    err(flex.span, "C3008", "a flexible array member that is not the last member");
+                    flex = u.nil.[cty.Member]();
+                }
+                if d.name.len > 0 {
+                    check_dup(&mut names, d.name, d.name_span);
+                    named += 1;
+                }
+                let mut msp = d.span;
+                if d.name.len > 0 {
+                    msp = d.name_span;
+                }
+                add_member(ti, d.name, msp, bt);
+                let bm = ti.members.last();
+                attr_mark_member(bm, &md.attrs);
+                attr_mark_member(bm, &d.attrs);
+                gnu_member(bm, md, d);
+                bm.is_bitfield = true;
+                bm.bit_width = w;
+                continue;
+            }
+            let mt = derive(mbase, d, CTX_MEMBER);
+            d.ty = mt;
+            if cty.is_error(mt) or not vla_check_member(d, mt) {
+                continue;
+            }
+            if u.notnil(flex) {
+                err(flex.span, "C3008", "a flexible array member that is not the last member");
+                flex = u.nil.[cty.Member]();
+            }
+            if cty.is_func(mt) {
+                err(d.name_span, "C3008", u.f1("the member '%s' has a function type", d.name));
+                continue;
+            }
+            let is_flex = (mt.kind == cty.TK_ARRAY) and not mt.has_len and not mt.vla and cty.is_complete(mt.elem);
+            if is_flex and (std() < co.C99) and not opts().gnu {
+                err(d.name_span, "C3007",
+                    u.f1("the member '%s' has incomplete type (flexible array members are a C99 feature)", d.name));
+                continue;
+            }
+            if not is_flex and not cty.is_complete(mt) {
+                err(d.name_span, "C3007", u.f2("the member '%s' has incomplete type %s", d.name, tq(mt)));
+                continue;
+            }
+            if cty.is_record(mt) and mt.tag.has_flex {
+                if ti.kind == cty.TK_STRUCT {
+                    err(d.name_span, "C3008", u.f1("the member '%s' has a flexible array member", d.name));
+                } else {
+                    ti.has_flex = true;  // (a union may hold one: 6.7.2.1p3; it is then as constrained)
+                }
+            }
+            check_dup(&mut names, d.name, d.name_span);
+            add_member(ti, d.name, d.name_span, mt);
+            attr_mark_member(ti.members.last(), &md.attrs);
+            attr_mark_member(ti.members.last(), &d.attrs);
+            gnu_member(ti.members.last(), md, d);
+            named += 1;
+            if sp.has_align and check_alignment(sp.align, sp.align_sp, mt, d.name) {
+                ti.members.last().align = sp.align;
+            }
+            if is_flex and (ti.kind == cty.TK_UNION) and opts().gnu {
+                // (a GNU dialect: a flexible array member of a union, at the
+                // union's start as every member, which 6.7.2.1p3 does not
+                // allow; the union is as constrained as one holding a
+                // structure with one)
+                warn(d.name_span, "C4151", u.f1("the flexible array member '%s' is a member of a union", d.name));
+                ti.has_flex = true;
+            } else if is_flex {
+                if (ti.kind == cty.TK_UNION) or (named == 1) {
+                    err(d.name_span, "C3008",
+                        u.f1("the flexible array member '%s' must follow another member of a structure", d.name));
+                }
+                flex = ti.members.last();
+            }
+        }
+    }
+    ti.defining = false;
+    if opts().gnu or opts().declspec {
+        // (a GNU dialect, or __declspec on Windows: packed, aligned, #pragma
+        // pack: csema_bits.ax)
+        let n = note_of_tag(ti);
+        if u.notnil(n) {
+            ti.packed = n.packed;
+            ti.min_align = n.aligned;
+            ti.layout = n.layout;
+        }
+        if (ti.layout == cty.LAYOUT_TARGET) and ts.ms_struct and (ti.kind != cty.TK_ENUM) {
+            ti.layout = cty.LAYOUT_MS;  // (#pragma ms_struct on; the attributes win)
+        }
+        ti.pack = ts.pack;
+    } else if ts.pack != 0 {
+        ti.pack = ts.pack;
+    }
+    bits_layout(ti);
+}
+
+// What the GNU attributes of member declaration md and its declarator d
+// say of member m: packed, aligned (a GNU dialect).
+fn gnu_member(m: *mut cty.Member, md: *mut cast.Decl, d: *mut cast.Declarator) void {
+    if not opts().gnu and not opts().declspec {
+        return;
+    }
+    gnu_mark_member(m, &md.attrs);
+    gnu_mark_member(m, &d.attrs);
+    gnu_mark_member(m, &md.specs.gattrs);
+    let n = note_of_member(m);
+    if u.isnil(n) {
+        return;
+    }
+    m.packed = n.packed;
+    if n.aligned > m.align {
+        m.align = n.aligned;
+    }
+}
+
+fn check_dup(names: *mut u.SymMap.[i32], name: []u8, sp: u.Span) void {
+    if names.get(name) != 0 {
+        err(sp, "C3002", u.f1("a duplicate member '%s'", name));
+        return;
+    }
+    names.put(name, 1);
+}
+
+fn add_member(ti: *mut cty.TagInfo, name: []u8, sp: u.Span, t: *mut cty.CType) void {
+    let m = u.new.[cty.Member]();
+    m.name = name;
+    m.span = sp;
+    m.ty = t;
+    m.index = @int_cast(i32, ti.members.len);
+    ti.members.push(m);
+}
+
+// -----------------------------------------------------------------------------
+// Declarators (6.7.6)
+// -----------------------------------------------------------------------------
+
+// The type declarator d gives the specifiers' type `base`.
+fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CType {
+    let mut t = base;
+    let n = d.derivs.len;
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        if cty.is_error(t) {
+            return t;
+        }
+        let dv = d.derivs.at_mut(k);
+        if dv.kind == cast.DerivKind.FUNCTION {
+            attrs(&dv.attrs, AP_FUNCTYPE);
+        } else {
+            attrs(&dv.attrs, AP_TYPE);
+        }
+        if dv.kind == cast.DerivKind.POINTER {
+            if ((dv.quals & cast.Q_RESTRICT) != 0) and cty.is_func(t) {
+                err(dv.span, "C3006", "'restrict' qualifies a pointer to a function");
+            }
+            if dv.dup_quals and (std() < co.C99) and not opts().gnu {
+                err(dv.span, "C3006", "a repeated type qualifier (allowed from C99)");
+            }
+            t = cty.qualify(cty.pointer_to(t), dv.quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
+            if (dv.quals & cast.Q_ATOMIC) != 0 {
+                t = atomic_qualifier(t, dv.span);
+            }
+        } else if dv.kind == cast.DerivKind.ARRAY {
+            t = array_deriv(t, dv, (ctx == CTX_PARAM) and (k == 0), ctx == CTX_PARAM);
+        } else {
+            if cty.is_func(t) or (t.kind == cty.TK_ARRAY) {
+                err(dv.span, "C3008",
+                    u.f1("a function returning %s", u.pick(cty.is_func(t), "a function", "an array")));
+                return cty.t_error;
+            }
+            t = function_deriv(t, dv, k == 0);
+        }
+    }
+    if ((t.quals & cty.Q_RESTRICT) != 0) and ((t.kind != cty.TK_POINTER) or cty.is_func(t.elem)) {
+        err(d.span, "C3006", u.f1("'restrict' qualifies %s, not a pointer to an object type", tq(t)));
+    }
+    return t;
+}
+
+fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool, in_param: bool) *mut cty.CType {
+    if cty.is_func(t) {
+        err(dv.span, "C3008", "an array of functions");
+        return cty.t_error;
+    }
+    if not cty.is_complete(t) {
+        err(dv.span, "C3007", u.f1("an array of elements of incomplete type %s", tq(t)));
+        return cty.t_error;
+    }
+    if cty.is_record(t) and t.tag.has_flex {
+        err(dv.span, "C3008", "an array of structures with a flexible array member");
+    }
+    if (cty.size_of(t) % cty.align_of(t)) != 0 {
+        // (a GNU dialect's typedef aligned beyond its type's size: the
+        // elements after the first would not be aligned)
+        err(dv.span, "C3008", u.f2("an array of elements of type %s, aligned to %s, more than their size", tq(t),
+                                   u.udec(cty.align_of(t))));
+        return cty.t_error;
+    }
+    if ((dv.quals != 0) or dv.is_static) and not outer_param {
+        err(dv.span, "C3008",
+            "'static' or a type qualifier in an array declarator that is not a parameter's outermost one");
+    }
+    if dv.is_star {
+        return vla_star(t, dv, in_param);
+    }
+    if u.isnil(dv.size) {
+        return cty.array_of(t, 0, false);
+    }
+    let x = rv(dv.size);
+    dv.size = x;
+    if u.isnil(x.ty) or cty.is_error(x.ty) {
+        return cty.t_error;
+    }
+    if not cty.is_integer(x.ty) {
+        err(x.span, "C3009", u.f1("the size of an array has type %s, not an integer type", tq(x.ty)));
+        return cty.t_error;
+    }
+    if not x.is_const or not is_ice(x) {
+        // (a size that is a constant but not an integer constant expression too)
+        let a = vla_array(t, x);
+        dv.size = @ptr_cast(*mut cast.Expr, a.vexpr);
+        return a;
+    }
+    if not const_in_range(x) {
+        return cty.t_error;
+    }
+    if not cw.fits64(x) {
+        err(x.span, "C3009", u.f1("the size of an array is %s, out of range", cw.text(x)));
+        return cty.t_error;
+    }
+    if (x.cval == 0) and opts().gnu {
+        return cty.array_of(t, 0, true);  // (a GNU dialect's zero-length array)
+    }
+    if (x.ty.is_signed and (@bit_cast(i64, x.cval) < 0)) or (x.cval == 0) {
+        err(x.span, "C3009",
+            u.f1(
+                "the size of an array is %s; it must be greater than zero",
+                u.pick(x.ty.is_signed, u.dec(@bit_cast(i64, x.cval)), u.udec(x.cval))));
+        return cty.t_error;
+    }
+    let es = cty.size_of(t);
+    if (es != 0) and (x.cval > (@as(u64, 1) << 47) / es) {
+        err(x.span, "C3009", "the array is too large");
+        return cty.t_error;
+    }
+    return cty.array_of(t, x.cval, true);
+}
+
+// A function returning ret; at_name: the declarator's innermost derivation,
+// whose parameters become g_params.
+fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut cty.CType {
+    let mut syms = u.List.[*mut cast.CSym].empty();
+    let mut types = u.List.[*mut cty.CType].empty();
+    let mut proto = true;
+    if dv.id_list {
+        proto = false;
+        if (dv.ids.len > 0) and not (at_name and g_defining) {
+            // (6.7.5.3p3: an identifier list only in a function definition's declarator)
+            err(dv.ids.at(0).span, "C3008", "an identifier list in a function declarator that is not a definition");
+        }
+        let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+        for id in dv.ids.items() {
+            if seen.get(id.name) != 0 {
+                err(id.span, "C3002", u.f1("a second parameter named '%s'", id.name));
+            }
+            seen.put(id.name, 1);
+            let s = new_sym(cast.SK_OBJECT, id.name, id.span, cty.t_int);
+            s.is_param = true;
+            syms.push(s);
+        }
+    } else if dv.empty {
+        proto = std() >= co.C23;
+    } else {
+        let defining = g_defining;
+        g_defining = false;
+        push_scope();
+        let ps = dv.params.items();
+        for i in 0..ps.len {
+            let p = ps[i];
+            let sp = specifiers(p.specs, CTX_PARAM, false);
+            if (sp.sc != 0) and (sp.sc != cast.SC_REGISTER) {
+                err(p.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
+            }
+            let pt = derive(mode_type(sp.ty, &p.specs.gattrs, &p.attrs, &p.decl.attrs), p.decl, CTX_PARAM);
+            p.decl.ty = pt;
+            if cty.is_void(pt) and (ps.len == 1) and (p.decl.name.len == 0) and (p.decl.derivs.len == 0) and
+               (pt.quals == 0) and not dv.variadic {
+                break;  // (void)
+            }
+            if cty.is_void(pt) {
+                err(p.span, "C3008", "a parameter of type void");
+            }
+            let adj = adjust_param(pt, p.decl);
+            let s = new_sym(cast.SK_OBJECT, p.decl.name, p.decl.name_span, adj);
+            s.is_param = true;
+            if (p.decl.derivs.len > 0) and (p.decl.derivs.at(0).kind == cast.DerivKind.ARRAY) and
+               p.decl.derivs.at(0).is_static and (pt.kind == cty.TK_ARRAY) {
+                // `[static n]` (6.7.6.3p7): at least n elements, so not null
+                let mut n: u64 = 0;
+                if pt.has_len and not pt.vla {
+                    n = cty.size_of(pt);
+                }
+                set_static_param(s, n);
+            }
+            cdbg.note_typedef_use(s, sp.tdef);
+            if sp.sc == cast.SC_REGISTER {
+                set_register(s);
+            }
+            attrs(&p.attrs, AP_OBJECT);
+            attrs(&p.decl.attrs, AP_OBJECT);
+            attrs(&p.specs.gattrs, AP_OBJECT);
+            p.decl.sym = s;
+            attr_mark_sym(s, &p.attrs);
+            attr_mark_sym(s, &p.decl.attrs);
+            attr_mark_sym(s, &p.specs.gattrs);
+            if p.decl.name.len > 0 {
+                let prior = lookup_here(p.decl.name);
+                if u.notnil(prior) {
+                    err_note(p.decl.name_span, "C3002", u.f1("a second parameter named '%s'", p.decl.name), prior.span,
+                             "the first");
+                }
+                declare(p.decl.name, s);
+            }
+            syms.push(s);
+            types.push(cty.unqual_keep_atomic(adj));
+        }
+        pop_scope();
+        g_defining = defining;
+    }
+    if at_name {
+        g_params = syms;
+        g_kr_ids = dv.id_list;
+    }
+    return cty.function(ret, types.items_mut(), proto, dv.variadic);
+}
+
+// A parameter's type adjusted (6.7.6.3p7-8): arrays to pointers (with the
+// qualifiers of the array declarator), functions to pointers.
+fn adjust_param(t: *mut cty.CType, d: *cast.Declarator) *mut cty.CType {
+    if t.kind == cty.TK_ARRAY {
+        let mut q: i32 = 0;
+        if (d.derivs.len > 0) and (d.derivs.at(0).kind == cast.DerivKind.ARRAY) {
+            q = d.derivs.at(0).quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT | cty.Q_ATOMIC);
+        }
+        return cty.qualify(cty.pointer_to(t.elem), q);
+    }
+    if cty.is_func(t) {
+        return cty.pointer_to(t);
+    }
+    return t;
+}
+
+/// The type of a type name (6.7.7).
+pub fn type_name(tn: *mut cast.TypeName) *mut cty.CType {
+    if u.notnil(tn.ty) {
+        return tn.ty;
+    }
+    attrs(&tn.specs.gattrs, AP_TYPE_NAME);
+    // (a GNU dialect: attributes in the abstract declarator, after a '(' or
+    // among a pointer's qualifiers, appertain to the type it names)
+    attrs(&tn.decl.attrs, AP_TYPE_NAME);
+    let sp = specifiers(tn.specs, CTX_TYPENAME, false);
+    // (vector_size and mode, as in a declaration: of the specifiers' type)
+    let none = u.List.[*mut cast.Attr].empty();
+    let t = derive(mode_type(sp.ty, &tn.specs.gattrs, &tn.decl.attrs, &none), tn.decl, CTX_TYPENAME);
+    tn.ty = t;
+    return t;
+}

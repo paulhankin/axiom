@@ -1,1114 +1,31 @@
 // =============================================================================
 // cgen_expr.ax - IR generation for C expressions (the typed tree: csema.ax).
+// Part of cgen.ax (see also cgen_expr_val.ax, cgen_expr_lv.ax, cgen_expr_ops.ax).
 //
 // rv(e) is e's value: a scalar's IR value, a structure's, union's or
 // complex value's address (memory holding the value: cgen_complex.ax), and
 // so a wide long double's (cgen_ld.ax) and an integer's wider than 64 bits
-// (cgen_wint.ax),
-// nothing for void; lv(e) is the address of
-// lvalue e (and of a structure member reached from a structure value). The
-// implicit conversions are CAST nodes, so each node does one thing.
+// (cgen_wint.ax), nothing for void; lv(e) is the address of lvalue e (and
+// of a structure member reached from a structure value). The implicit
+// conversions are CAST nodes, so each node does one thing.
 // =============================================================================
 import "../diag.ax" as dg;
 import "../divconst.ax" as divc;
 import "../ir.ax" as ir;
-import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
-import "cgen.ax" as cg;
-import "cgen_atomic.ax" as cga;
-import "cgen_bitint.ax" as cgbi;
-import "cgen_bits.ax" as cgb;
-import "cgen_complex.ax" as gcx;
-import "cgen_debug.ax" as cdbg;
-import "cgen_dec.ax" as gdec;
-import "cgen_fp.ax" as gfp;
-import "cgen_half.ax" as ghf;
-import "cgen_ld.ax" as gld;
-import "cgen_nest.ax" as gnest;
-import "cgen_restrict.ax" as grs;
-import "cgen_sjlj.ax" as sj;
-import "cgen_tls.ax" as cgt;
-import "cgen_va.ax" as gva;
-import "cgen_vla.ax" as gv;
-import "cgen_wint.ax" as cgw;
-import "cldbl.ax" as cl;
-import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
-import "csema_atomic.ax" as catm;
-import "csema_attr.ax" as catr;
-import "csema_builtin.ax" as csb;
-import "csema_expr.ax" as csx;
-import "csema_fp.ax" as cfp;
-import "csema_gbuiltin.ax" as gbi;
-import "csema_gnu.ax" as cgn;
-import "csema_marks.ax" as csm;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
-import "cwide.ax" as cw;
-
-fn lty(t: *mut cty.CType) *mut ir.Ty {
-    return cg.lty(t);
-}
-
-fn is_volatile(t: *cty.CType) bool {
-    return (t.quals & cty.Q_VOLATILE) != 0;
-}
-
-fn is_atomic(t: *cty.CType) bool {
-    return (t.quals & cty.Q_ATOMIC) != 0;
-}
-
-/// Loads a scalar of type t from p (volatile: as its type says); a complex
-/// value is copied to a temporary (its address).
-pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
-    if cty.is_complex(t) {
-        return gcx.snapshot(t, p);
-    }
-    if cty.is_wint(t) {
-        return cgw.snapshot(t, p, is_volatile(t));
-    }
-    let v = ir.load(cg.B, lty(t), p);
-    v.align = @truncate(u32, cty.align_of(t));
-    if is_volatile(t) {
-        v.flags = v.flags | ir.F_VOLATILE;
-    }
-    return v;
-}
-
-/// Stores scalar v of type t at p.
-pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
-    store_al(t, v, p, cty.align_of(t));
-}
-
-// Stores scalar v of type t at p, known to be aligned to al.
-fn store_al(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, al: u64) void {
-    if cty.is_complex(t) {
-        gcx.put(t, gcx.parts(t.unq, v), p);
-        return;
-    }
-    if cty.is_wint(t) {
-        cgw.copy(t, p, v, is_volatile(t));
-        return;
-    }
-    let s = ir.store(cg.B, v, p);
-    s.align = @truncate(u32, @min(al, cty.align_of(t)));
-    if is_volatile(t) {
-        s.flags = s.flags | ir.F_VOLATILE;
-    }
-}
-
-/// Copies an object of type t from src to dst (which may be the same).
-pub fn copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
-    let n = cty.size_of(t);
-    if n == 0 {
-        return;
-    }
-    // (a memmove: an assignment may copy an object onto itself, `*p = *q`
-    // with p == q; but never onto a part of itself, C11 6.5.16.1p3, nor
-    // an initializer, which copies into an object whose lifetime begins)
-    let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(n));
-    m.cv = ir.MEMMOVE_SAME_OR_APART;
-}
-
-/// Sets n bytes at p to zero.
-pub fn zero(p: *mut ir.Value, n: u64) void {
-    if n == 0 {
-        return;
-    }
-    _ = ir.memop(cg.B, ir.OP_MEMSET, p, ir.cint(cg.T_i8, 0), cg.usz(n));
-}
-
-/// The constant value of e (is_const, of arithmetic type).
-pub fn const_value(e: *mut cast.Expr) *mut ir.Value {
-    if cty.is_complex(e.ty) and cty.is_wide(e.ty.unq.elem) {
-        return gcx.constant_wide(e.ty, e.xv, e.xvim);
-    }
-    if cty.is_complex(e.ty) and cty.is_integer(e.ty.unq.elem) {
-        return gcx.constant_int(e.ty, e.cval, e.cimag);
-    }
-    if cty.is_complex(e.ty) {
-        return gcx.constant(e.ty, e.fcval, e.fcimag);
-    }
-    if cty.is_wide(e.ty) {
-        return gld.constant(e.xv);
-    }
-    if cty.is_decimal(e.ty) {
-        return gdec.constant_of(e.ty, e.xv);
-    }
-    if cty.is_wint(e.ty) {
-        return cgw.constant(e.ty, cw.value(e, cty.limbs(e.ty)));
-    }
-    if cty.is_half(e.ty) or (cty.is_imaginary(e.ty) and cty.is_half(e.ty.unq.elem)) {
-        return ghf.constant(e.fcval, cty.real_of(e.ty));
-    }
-    let t = lty(e.ty);
-    if cty.is_floating(e.ty) or cty.is_imaginary(e.ty) {
-        return ir.cfp(t, e.fcval);
-    }
-    return ir.cint(t, e.cval);
-}
-
-fn i1_to(t: *mut cty.CType, c: *mut ir.Value) *mut ir.Value {
-    return ir.zext(cg.B, c, lty(t));
-}
-
-/// The truth of scalar value v of type t, as an i1.
-pub fn truth(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
-    if cty.is_imaginary(t) and not cty.is_wide(t) {
-        return truth(v, t.unq.elem);  // (its coefficient's)
-    }
-    if cty.is_complex(t) {
-        return gcx.truth(t, gcx.parts(t, v));
-    }
-    if cty.is_wide(t) {
-        return gld.truth(v, t);
-    }
-    if cty.is_half(t) {
-        return ghf.truth(v);
-    }
-    if cty.is_decimal(t) {
-        return gdec.truth(v, t);
-    }
-    if cty.is_wint(t) {
-        return cgw.truth(t, v);
-    }
-    if cty.is_floating(t) {
-        return ir.fcmp(cg.B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
-    }
-    if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
-        return ir.icmp(cg.B, ir.IntNE, ir.ptrtoint(cg.B, v, cg.T_isz), cg.usz(0));
-    }
-    if (t.unq.kind == cty.TK_BOOL) and (v.ty.kind == ir.T_INT) and (v.ty.bits > 1) {
-        // a _Bool is 0 or 1: its low bit is its truth (a _Bool object holds
-        // no other value, 6.2.5p2; the ABIs give a _Bool argument or result
-        // in a register with its low 8 bits 0 or 1)
-        return ir.trunc(cg.B, v, ir.t_int(1));
-    }
-    return ir.icmp(cg.B, ir.IntNE, v, ir.cint(v.ty, 0));
-}
-
-fn no_vec(e: *mut cast.Expr, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
-    _ = e;
-    _ = x;
-    _ = y;
-    return ir.vnil();
-}
-
-/// The value of an expression of vector type, or with vector operands (a
-/// GNU dialect: cgen_vec.ax sets it): e, with x and y the old value and the
-/// right operand's of a compound assignment, the old value of ++ and --.
-pub let mut vec_expr: fn(*mut cast.Expr, *mut ir.Value, *mut ir.Value) *mut ir.Value = no_vec;
-
-// The values of && and || (0 or 1) made in the function being generated:
-// converted to _Bool, they need no comparison.
-// (by number in the function: a value's memory may be another's later)
-let mut known01: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
-let mut known01_fn: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
-
-fn note_01(v: *mut ir.Value) void {
-    let f = v.blk.fnp;
-    if f != known01_fn {
-        known01.clear();
-        known01_fn = f;
-    }
-    known01.push(v.id);
-}
-
-// Is v (an integer) 0 or 1: a constant, an i1 widened, or a value of && or
-// ||?
-fn is_01(v: *ir.Value) bool {
-    if ir.is_cint(v) {
-        return ir.cint_val(v) <= 1;
-    }
-    if ir.is_op(v, ir.OP_ZEXT) and (v.a.ty.bits == 1) {
-        return true;
-    }
-    if (v.kind != ir.V_INST) or (v.op != ir.OP_PHI) or u.isnil(v.blk) or (v.blk.fnp != known01_fn) {
-        return false;
-    }
-    for x in known01.items() {
-        if x == v.id {
-            return true;
-        }
-    }
-    return false;
-}
-
-/// Scalar value v of type `from` converted to type `to` (6.3.1, 6.3.2.3).
-pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
-    if cty.is_void(to) {
-        return ir.vnil();
-    }
-    let f = from.unq;
-    let t = to.unq;
-    if f == t {
-        return v;
-    }
-    if cty.is_imaginary(t) or cty.is_imaginary(f) {
-        return imag_convert(v, f, t);
-    }
-    if cty.is_complex(t) or cty.is_complex(f) {
-        return complex_convert(v, f, t);
-    }
-    if cty.is_decimal(f) or cty.is_decimal(t) {
-        return gdec.convert(v, f, t);  // (with _Float16 too: rounded once, decimal.ax's B_F16)
-    }
-    if cty.is_half(f) {
-        // (exact to float, which is converted as from float: the same value)
-        if cty.is_wide(t) {
-            return ghf.to_wide(v, t, f);
-        }
-        return convert(ghf.to_f32(v, f), cty.t_float, t);
-    }
-    if cty.is_half(t) {
-        return ghf.from(v, f, to_double, t);
-    }
-    if cty.is_wint(f) or cty.is_wint(t) {
-        return cgw.convert(v, f, t);
-    }
-    if cty.is_wide(f) or cty.is_wide(t) {
-        return gld.convert(v, f, t);
-    }
-    let tt = lty(t);
-    if t.kind == cty.TK_BOOL {
-        if cty.is_integer(f) and is_01(v) {
-            return int_resize(v, false, tt);
-        }
-        return ir.zext(cg.B, truth(v, f), tt);
-    }
-    if cty.is_integer(t) {
-        if cty.is_integer(f) {
-            return cgbi.norm(int_resize(v, f.is_signed, tt), t);
-        }
-        if f.kind == cty.TK_POINTER {
-            return cgbi.norm(ir.ptrtoint(cg.B, v, tt), t);
-        }
-        if t.is_signed {
-            return cgbi.norm(ir.cast(cg.B, ir.OP_FPTOSI_SAT, v, tt), t);
-        }
-        return cgbi.norm(ir.cast(cg.B, ir.OP_FPTOUI_SAT, v, tt), t);
-    }
-    if cty.is_floating(t) {
-        if cty.is_integer(f) {
-            if f.is_signed {
-                return ir.cast(cg.B, ir.OP_SITOFP, v, tt);
-            }
-            return ir.cast(cg.B, ir.OP_UITOFP, v, tt);
-        }
-        if tt.bits > v.ty.bits {
-            return ir.cast(cg.B, ir.OP_FPEXT, v, tt);
-        }
-        if tt.bits < v.ty.bits {
-            return ir.cast(cg.B, ir.OP_FPTRUNC, v, tt);
-        }
-        return v;
-    }
-    if t.kind == cty.TK_NULLPTR {
-        return ir.czero(cg.T_ptr);
-    }
-    if t.kind == cty.TK_POINTER {
-        if cty.is_integer(f) {
-            if ir.is_cint(v) and (ir.cint_val(v) == 0) {
-                return ir.czero(cg.T_ptr);
-            }
-            return ir.inttoptr(cg.B, int_resize(v, f.is_signed, cg.T_isz));
-        }
-        return v;
-    }
-    return v;
-}
-
-// v of type f converted to t, one of them imaginary (Annex G.4): an
-// imaginary value is its coefficient; a real value as an imaginary one, and
-// an imaginary one as a real one, is +0; between imaginary and complex
-// values, the imaginary part.
-fn imag_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
-    if t.kind == cty.TK_BOOL {
-        return ir.zext(cg.B, truth(v, f), lty(t));
-    }
-    if cty.is_imaginary(t) {
-        let el = t.elem;
-        if cty.is_imaginary(f) {
-            return convert(v, f.elem, el);
-        }
-        if cty.is_complex(f) {
-            return convert(gcx.parts(f, v).im, part_type(f), el);
-        }
-        return zero_of(el);
-    }
-    if cty.is_complex(t) {
-        let el = t.elem;
-        return gcx.make(t, gcx.Pair.{ re: as_part(zero_of(el), el), im: as_part(convert(v, f.elem, el), el) });
-    }
-    return convert(zero_of(f.elem), f.elem, t);
-}
-
-/// x op y (+ - * /) with an imaginary operand (Annex G.5.1, G.5.2): x of
-/// type xt, y of type yt, each in its own type domain of the real type of
-/// rt, the result's type (real, imaginary or complex: csema_expr.imag_arith).
-pub fn imag_arith(op: i32, rt: *mut cty.CType, x: *mut ir.Value, xt: *mut cty.CType, y: *mut ir.Value,
-                  yt: *mut cty.CType) *mut ir.Value {
-    let t = cty.real_of(rt);
-    let ka = cty.is_imaginary(xt);
-    let kb = cty.is_imaginary(yt);
-    if not cty.is_complex(xt) and not cty.is_complex(yt) {
-        // (real and imaginary operands: one real operation, maybe negated)
-        if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
-            if ka and kb {
-                return arith_op(op, t, x, y, t);
-            }
-            // (x + iv, iy + u: the complex value of the two parts)
-            let mut re = x;
-            let mut im = y;
-            if ka {
-                re = y;
-                im = x;
-                if op == ct.P_MINUS {
-                    re = negate_value(t, y);
-                }
-            } else if op == ct.P_MINUS {
-                im = negate_value(t, y);
-            }
-            return gcx.make(rt, gcx.Pair.{ re: as_part(re, t), im: as_part(im, t) });
-        }
-        let r = arith_op(op, t, x, y, t);
-        if ka and kb and (op == ct.P_STAR) {
-            return negate_value(t, r);  // (iy * iv = -yv)
-        }
-        if not ka and kb and (op == ct.P_SLASH) {
-            return negate_value(t, r);  // (x / iv = i (-x/v))
-        }
-        return r;  // (x * iv, iy * u, iy / u, iy / iv)
-    }
-    // with a complex operand: on its parts (in float for _Float16's, as
-    // their complex type computes: cgen_complex.ax)
-    let ct_ = cty.complex_of(t);
-    let pt = part_type(ct_);
-    let mut a = gcx.real(ir.vnil());
-    let mut b = gcx.real(ir.vnil());
-    let mut ai = ir.vnil();
-    let mut bi = ir.vnil();
-    if cty.is_complex(xt) {
-        a = gcx.parts(xt, x);
-    } else {
-        ai = as_part(x, t);  // (the imaginary operand's coefficient)
-    }
-    if cty.is_complex(yt) {
-        b = gcx.parts(yt, y);
-    } else {
-        bi = as_part(y, t);
-    }
-    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
-        if u.notnil(ai) {
-            // iy +- (u + iv)
-            let mut re = b.re;
-            if op == ct.P_MINUS {
-                re = negate_value(pt, b.re);
-            }
-            return gcx.make(rt, gcx.Pair.{ re: re, im: arith_op(op, pt, ai, b.im, pt) });
-        }
-        return gcx.make(rt, gcx.Pair.{ re: a.re, im: arith_op(op, pt, a.im, bi, pt) });
-    }
-    if op == ct.P_STAR {
-        if u.notnil(ai) {
-            // iy (u + iv) = -yv + i yu
-            return gcx.make(rt,
-                            gcx.Pair.{
-                                re: negate_value(pt, arith_op(op, pt, ai, b.im, pt)),
-                                im: arith_op(op, pt, ai, b.re, pt) });
-        }
-        // (x + iy) iv = -yv + i xv
-        return gcx.make(
-            rt, gcx.Pair.{ re: negate_value(pt, arith_op(op, pt, a.im, bi, pt)), im: arith_op(op, pt, a.re, bi, pt) });
-    }
-    if u.notnil(bi) {
-        // (x + iy) / iv = y/v + i (-x/v)
-        return gcx.make(
-            rt, gcx.Pair.{ re: arith_op(op, pt, a.im, bi, pt), im: negate_value(pt, arith_op(op, pt, a.re, bi, pt)) });
-    }
-    // iy / (u + iv): the complex quotient of 0 + iy
-    let num = gcx.Pair.{ re: zero_of(pt), im: ai };
-    return gcx.make(rt, gcx.arith(gcx.OP_DIV, ct_, num, b));
-}
-
-// v of type f (an integer wider than 64 bits) as a double (correctly rounded).
-fn to_double(v: *mut ir.Value, f: *mut cty.CType) *mut ir.Value {
-    return convert(v, f, cty.t_double);
-}
-
-// v of type f converted to t, one of them complex (6.3.1.6, 6.3.1.7): the
-// parts as real values are; a real value's imaginary part is +0; a complex
-// value to a real type is its real part's, to _Bool its truth.
-fn complex_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
-    if cty.is_complex(t) {
-        let el = t.elem;
-        if cty.is_complex(f) {
-            let p = gcx.parts(f, v);
-            let fe = part_type(f);
-            return gcx.make(
-                t, gcx.Pair.{ re: as_part(convert(p.re, fe, el), el), im: as_part(convert(p.im, fe, el), el) });
-        }
-        return gcx.make(t, gcx.Pair.{ re: as_part(convert(v, f, el), el), im: as_part(zero_of(el), el) });
-    }
-    if t.kind == cty.TK_BOOL {
-        return ir.zext(cg.B, truth(v, f), lty(t));
-    }
-    return convert(gcx.parts(f, v).re, part_type(f), t);
-}
-
-// The real type of the parts gcx.parts gives of complex type t (float for
-// _Float16 _Complex, whose parts are widened).
-fn part_type(t: *mut cty.CType) *mut cty.CType {
-    if cty.is_half(t.unq.elem) {
-        return cty.t_float;
-    }
-    return t.unq.elem;
-}
-
-// x (a value of real type el) as a part of a complex value (gcx.make).
-fn as_part(x: *mut ir.Value, el: *mut cty.CType) *mut ir.Value {
-    if cty.is_half(el) {
-        return ghf.to_f32(x, el);
-    }
-    return x;
-}
-
-/// The value +0 of real floating type t.
-pub fn zero_of(t: *mut cty.CType) *mut ir.Value {
-    if cty.is_wide(t) {
-        return gld.constant(cl.zero());
-    }
-    if cty.is_half(t) {
-        return ir.cint(ir.t_int(16), 0);
-    }
-    return ir.cfp(lty(t), 0.0);
-}
-
-/// The value 1 of arithmetic type t (++ and --).
-pub fn one_of(t: *mut cty.CType) *mut ir.Value {
-    if cty.is_wide(t) {
-        return gld.one_value(t);
-    }
-    if cty.is_wint(t) {
-        return cgw.one_value(t);
-    }
-    if cty.is_half(t) {
-        return ghf.constant(1.0, t);
-    }
-    if cty.is_decimal(t) {
-        return gdec.one(t);
-    }
-    if cty.is_floating(t) {
-        return ir.cfp(lty(t), 1.0);
-    }
-    return ir.cint(lty(t), 1);
-}
-
-// The operand value of e: a complex value's parts, or a real value.
-fn operand(e: *mut cast.Expr) gcx.Pair {
-    let v = rv(e);
-    if cty.is_complex(e.ty) {
-        return gcx.parts(e.ty, v);
-    }
-    return gcx.real_t(v, e.ty);
-}
-
-// The operation of the arithmetic operator op on complex values.
-fn complex_op(op: i32) i32 {
-    if op == ct.P_PLUS {
-        return gcx.OP_ADD;
-    }
-    if op == ct.P_MINUS {
-        return gcx.OP_SUB;
-    }
-    if op == ct.P_STAR {
-        return gcx.OP_MUL;
-    }
-    return gcx.OP_DIV;
-}
-
-fn int_resize(v: *mut ir.Value, from_signed: bool, tt: *mut ir.Ty) *mut ir.Value {
-    if v.ty.bits == tt.bits {
-        return v;
-    }
-    if v.ty.bits > tt.bits {
-        return ir.trunc(cg.B, v, tt);
-    }
-    if from_signed {
-        return ir.sext(cg.B, v, tt);
-    }
-    return ir.zext(cg.B, v, tt);
-}
-
-// -----------------------------------------------------------------------------
-// Lvalues
-// -----------------------------------------------------------------------------
-
-/// The address of lvalue e (an object, a function, or a member of a
-/// structure value).
-// The address of lvalue e for something else than an access through it
-// (`&e`, an array's decay): it may go anywhere (cgen_restrict.ax).
-fn addr_lv(e: *mut cast.Expr) *mut ir.Value {
-    let ao = grs.g_addr;
-    grs.g_addr = true;
-    let p = lv(e);
-    grs.g_addr = ao;
-    return p;
-}
-
-pub fn lv(e: *mut cast.Expr) *mut ir.Value {
-    let k = e.kind;
-    if k == cast.ExprKind.IDENT {
-        let s = e.sym;
-        if s.kind == cast.SK_FUNC {
-            if u.notnil(s.nest_parent) {
-                return gnest.address(s);  // (a nested function's: a trampoline, cgen_nest.ax)
-            }
-            return cg.func_of(s, cg.func_sig(s)).val;
-        }
-        if s.duration == cast.SD_STATIC {
-            return cgt.addr(s);
-        }
-        if gnest.is_outer(s) {
-            return gnest.object_addr(s);  // (an enclosing function's, in a nested function)
-        }
-        if u.isvnil(s.ir) {
-            s.ir = @ptr_cast(*mut void, cg.alloca(s.ty, s.name));
-            cdbg.note_var(cg.F.f, s, @ptr_cast(*mut ir.Value, s.ir));
-        }
-        return @ptr_cast(*mut ir.Value, s.ir);
-    }
-    if k == cast.ExprKind.STRING {
-        return cg.string_addr(e);
-    }
-    if k == cast.ExprKind.COMPOUND {
-        return compound_literal(e);
-    }
-    if (k == cast.ExprKind.UNARY) and ((e.op == ct.P_REAL) or (e.op == ct.P_IMAG)) {
-        // (__real__ and __imag__ of an lvalue: its part's address; of a real or
-        // imaginary one, the object itself)
-        let p = lv(e.a);
-        if cty.is_complex(e.a.ty) and (e.op == ct.P_IMAG) {
-            return ir.ptradd(cg.B, p, cg.usz(cty.size_of(e.a.ty.unq.elem)));
-        }
-        return p;
-    }
-    if k == cast.ExprKind.UNARY {
-        // *p (through a restricted pointer: cgen_restrict.ax)
-        return grs.wrap(e.a, rv(e.a));
-    }
-    if k == cast.ExprKind.INDEX {
-        // (a vector's lane: the vector's own memory, an lvalue's or a value's)
-        let mut p = rv_or_lv(e.a, cty.is_vector(e.a.ty));
-        if not cty.is_vector(e.a.ty) {
-            p = grs.wrap(e.a, p);
-        }
-        let i = index_of(rv(e.b), e.b.ty);
-        return offset(p, i, gv.size_value(e.ty), false);
-    }
-    if k == cast.ExprKind.MEMBER {
-        let mut base = rv_or_lv(e.a, e.op == ct.P_DOT);
-        if e.op == ct.P_ARROW {
-            base = grs.wrap(e.a, base);
-        }
-        return ir.ptradd(cg.B, base, cg.usz(e.cval));
-    }
-    // (a structure or union value: its address)
-    return rv(e);
-}
-
-// A compound literal's object: static, or (automatic) initialized again
-// each time it is evaluated.
-fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
-    let s = e.sym;
-    if s.duration == cast.SD_STATIC {
-        return cgt.addr(s);
-    }
-    if u.isvnil(s.ir) {
-        s.ir = @ptr_cast(*mut void, cg.aligned_alloca(s.ty, "literal", s.align));
-        grs.lifetime(@ptr_cast(*mut ir.Value, s.ir));  // (its block's, 6.5.2.5p5)
-    }
-    let p = @ptr_cast(*mut ir.Value, s.ir);
-    cg.hooks.local_init(s, p);
-    return p;
-}
-
-// The largest power of two that divides both a (a power of two) and off.
-fn common_align(a: u64, off: u64) u64 {
-    let mut r = a;
-    while (r > 1) and ((off % r) != 0) {
-        r = r / 2;
-    }
-    return r;
-}
-
-// The alignment lvalue e is known to have: its type's, or less for a member
-// of a packed structure (a GNU dialect: csema_bits.ax), whose offset is
-// only as aligned as the structure it is in.
-fn lv_align(e: *cast.Expr) u64 {
-    let a = cty.align_of(e.ty);
-    if (e.kind == cast.ExprKind.MEMBER) and u.notnil(e.mem) {
-        let mut base = e.a.ty;
-        let mut ba: u64 = 0;
-        if e.op == ct.P_ARROW {
-            base = e.a.ty.elem;
-        } else if e.a.lvalue {
-            ba = lv_align(e.a);
-        }
-        if ba == 0 {
-            ba = cty.align_of(base);
-        }
-        return @min(a, common_align(ba, e.cval));
-    }
-    if (e.kind == cast.ExprKind.INDEX) and (e.a.kind == cast.ExprKind.CAST) and (e.a.op == cast.CV_ADECAY) {
-        return @min(a, lv_align(e.a.a));
-    }
-    return a;
-}
-
-// The value of lvalue e at p (a bit-field's too; a wide long double's
-// copied, as the object may change before the value is used).
-/// The value of lvalue e, whose address is p.
-pub fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
-    let m = cgb.of(e);
-    if u.notnil(m) {
-        return cgb.load(m, e.ty, p);
-    }
-    if is_atomic(e.ty) {
-        return cga.load(e.ty, p, ir.ORD_SEQ_CST);
-    }
-    if cty.is_wide(e.ty) or cty.is_dec128(e.ty) {
-        return gld.snapshot(p, is_volatile(e.ty));
-    }
-    if cty.is_wint(e.ty) {
-        return cgw.snapshot(e.ty, p, is_volatile(e.ty));
-    }
-    if cty.is_vector(e.ty) {
-        return vec_snapshot(e.ty, p);
-    }
-    let v = load(e.ty, p);
-    let al = lv_align(e);
-    if ir.is_op(v, ir.OP_LOAD) and (al < @as(u64, v.align)) {
-        v.align = @truncate(u32, al);
-    }
-    return v;
-}
-
-// Stores v in lvalue e at p (of type t, e's unqualified); returns the value e then has.
-pub fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
-    let m = cgb.of(e);
-    if u.notnil(m) {
-        return cgb.store(m, e.ty, v, p);
-    }
-    if is_atomic(e.ty) {
-        cga.store(e.ty, v, p, ir.ORD_SEQ_CST);
-        return v;
-    }
-    if cty.is_wide(t) or cty.is_dec128(t) {
-        gld.copy(p, v, is_volatile(e.ty));
-        return v;
-    }
-    if cty.is_wint(t) {
-        cgw.copy(t, p, v, is_volatile(e.ty));
-        return v;
-    }
-    if cty.is_vector(t) {
-        vec_copy(e.ty, p, v);
-        return v;
-    }
-    store_al(t, v, p, lv_align(e));
-    return v;
-}
-
-/// A copy of the vector at p (of type t: volatile, as it says), in a temporary.
-pub fn vec_snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
-    let r = cg.alloca(cty.unqual(t), "vec");
-    vec_copy(t, r, p);
-    return r;
-}
-
-/// Copies the vector at src to dst (of type t: volatile, as it says).
-pub fn vec_copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
-    let n = cty.size_of(t);
-    if is_volatile(t) {
-        // (one volatile access per chunk of at most 8 bytes)
-        let mut off: u64 = 0;
-        while off < n {
-            let w = @min(n - off, 8);
-            let it = ir.t_int(@truncate(i32, @bit_cast(i64, w * 8)));
-            let x = ir.load(cg.B, it, ir.ptradd(cg.B, src, cg.usz(off)));
-            x.flags = x.flags | ir.F_VOLATILE;
-            x.align = @truncate(u32, @min(w, cty.align_of(t)));
-            let s = ir.store(cg.B, x, ir.ptradd(cg.B, dst, cg.usz(off)));
-            s.flags = s.flags | ir.F_VOLATILE;
-            s.align = x.align;
-            off += w;
-        }
-        return;
-    }
-    let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(n));
-    m.cv = ir.MEMMOVE_SAME_OR_APART;
-}
-
-fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
-    if want_lv and e.lvalue {
-        return lv(e);
-    }
-    return rv(e);
-}
-
-// An integer value v of type t as an index (an integer wider than 64 bits:
-// its low limb; its value beyond that leaves every object).
-fn index_of(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    if cty.is_wint(t) {
-        return cgw.limb(v, 0);
-    }
-    return v;
-}
-
-// p + i * size (i: a pointer-sized integer; size: the elements', cgen_vla.size_value), or minus.
-fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: *mut ir.Value, neg: bool) *mut ir.Value {
-    let mut i = i0;
-    if i.ty.bits != cg.T_isz.bits {
-        i = int_resize(i, true, cg.T_isz);
-    }
-    // (p + i * size points into p's object or just past it, which is never
-    // more than the largest signed size: the product cannot overflow)
-    let mut d = no_wrap(ir.mul(cg.B, i, size), ir.OP_MUL);
-    if neg {
-        d = ir.sub(cg.B, cg.usz(0), d);
-    }
-    return ir.ptradd(cg.B, p, d);
-}
-
-// -----------------------------------------------------------------------------
-// Values
-// -----------------------------------------------------------------------------
-
-// -----------------------------------------------------------------------------
-// The floating-point pragmas (cpragma.ax): FENV_ACCESS and FENV_ROUND
-// -----------------------------------------------------------------------------
-
-/// The floating-point pragmas' state of the block item being generated
-/// (cgen_stmt.ax sets it).
-pub let mut fp_state: u32 = 0;
-
-// While a full expression is evaluated under FENV_ROUND's static direction
-// (fp_enter): the slot that holds the dynamic mode's rounding bits; nil
-// otherwise.
-let mut fp_slot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-
-// While a full expression is evaluated under FENV_DEC_ROUND's static
-// direction: the slot that holds the dynamic decimal direction (an i32);
-// nil otherwise.
-let mut fp_dslot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-
-// The slots before a full expression began (fp_enter, fp_leave).
-struct FpPrev {
-    slot: *mut ir.Value,
-    dslot: *mut ir.Value,
-}
-
-// decimal.ax's dec_round_swap(m): the thread's decimal direction set to m
-// (an i32), the previous one returned.
-fn dec_swap(m: *mut ir.Value) *mut ir.Value {
-    let f = cg.ld_fn("dec_round_swap");
-    let mut xs: [1]*mut ir.Value = [m];
-    return ir.call(cg.B, ir.fnp_of(f).ty, f, xs[..]);
-}
-
-// Under FENV_ACCESS ON or FENV_ROUND (F.8.4, and 7.6.2 for FENV_ROUND's
-// static mode): is e an operation on floating values whose constant value
-// (folded by semantic analysis) is not used, the operation done at run time
-// instead, in the mode of that moment and raising its exceptions? (Not the
-// constants themselves, nor what is not of a floating type, binary or
-// decimal, and has no floating operand.)
-fn fp_runtime(e: *cast.Expr) bool {
-    if not cpg.fp_strict(fp_state) {
-        return false;
-    }
-    let k = e.kind;
-    if (k != cast.ExprKind.BINARY) and (k != cast.ExprKind.UNARY) and (k != cast.ExprKind.CAST) and
-       (k != cast.ExprKind.COND) {
-        return false;
-    }
-    if cty.is_real_floating(e.ty) or (cty.is_complex(e.ty)) {
-        return true;
-    }
-    return u.notnil(e.a) and u.notnil(e.a.ty) and (cty.is_real_floating(e.a.ty) or cty.is_complex(e.a.ty));
-}
-
-// The rounding-control bits of the environment's register (fenv_get's
-// value: MXCSR's RC, bits 13-14; AArch64's FPCR RMode, bits 22-23), and
-// their value for a static direction (cpragma.ax's FPR_).
-fn rm_mask() u64 {
-    if tg.g_arch == tg.ARCH_A64 {
-        return 0xC00000;
-    }
-    return 0x6000;
-}
-
-fn rm_bits(dir: u32) u64 {
-    let x86: [5]u64 = [0, 0, 0x4000, 0x2000, 0x6000];
-    let a64: [5]u64 = [0, 0, 0x400000, 0x800000, 0xC00000];
-    if tg.g_arch == tg.ARCH_A64 {
-        return a64[@as(usize, dir)];
-    }
-    return x86[@as(usize, dir)];
-}
-
-fn fenv_get() *mut ir.Value {
-    let p = cg.alloca(cty.t_ullong, "fenv");
-    let mut a: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
-    return ir.load(cg.B, ir.t_int(64), p);
-}
-
-fn fenv_set(v: *mut ir.Value) void {
-    let p = cg.alloca(cty.t_ullong, "fenv");
-    _ = ir.store(cg.B, v, p);
-    let mut a: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
-}
-
-// The environment with its rounding bits replaced by r (a value of those bits).
-fn with_rounding(r: *mut ir.Value) void {
-    let t64 = ir.t_int(64);
-    let cur = fenv_get();
-    fenv_set(ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), r));
-}
-
-// Starts a full expression under FENV_ROUND with a static direction: the
-// dynamic mode's rounding bits saved (in a slot of their own, so that full
-// expressions nest: GNU statement expressions), the static ones set; and
-// under FENV_DEC_ROUND's, the decimal direction likewise (decimal.ax's,
-// the software's: on every target). The previous slots, for fp_leave.
-fn fp_enter() FpPrev {
-    let prev = FpPrev.{ slot: fp_slot, dslot: fp_dslot };
-    if u.isnil(cg.F) or cg.terminated() {
-        return prev;
-    }
-    let ddir = cpg.fp_dec_round(fp_state);
-    if (ddir != cpg.FPD_DYNAMIC) and cty.g_used_dec {
-        let ds = cg.alloca(cty.t_int, "fpdround");
-        _ = ir.store(cg.B, dec_swap(ir.cint(ir.t_int(32), @as(u64, ddir - 1))), ds);
-        fp_dslot = ds;
-    }
-    let dir = cpg.fp_round(fp_state);
-    if (dir == cpg.FPR_DYNAMIC) or tg.is_wasm() {
-        return prev;
-    }
-    let t64 = ir.t_int(64);
-    let slot = cg.alloca(cty.t_ullong, "fpround");
-    let cur = fenv_get();
-    _ = ir.store(cg.B, ir.and_(cg.B, cur, ir.cint(t64, rm_mask())), slot);
-    fenv_set(ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(dir))));
-    fp_slot = slot;
-    return prev;
-}
-
-// Ends it: the dynamic mode's rounding bits back (the exception flags the
-// expression raised are kept), and the dynamic decimal direction.
-fn fp_leave(prev: FpPrev) void {
-    if (fp_slot != prev.slot) and not cg.terminated() {
-        with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
-    }
-    if (fp_dslot != prev.dslot) and not cg.terminated() {
-        _ = dec_swap(ir.load(cg.B, ir.t_int(32), fp_dslot));
-    }
-    fp_slot = prev.slot;
-    fp_dslot = prev.dslot;
-}
-
-/// The value of e, a full expression (a statement's, a condition, an
-/// initializer): under FENV_ROUND, evaluated in the static direction.
-pub fn full(e: *mut cast.Expr) *mut ir.Value {
-    let prev = fp_enter();
-    let v = rv(e);
-    fp_leave(prev);
-    return v;
-}
-
-/// Branches on e, a full expression (to t if it is nonzero, else to f).
-pub fn branch_full(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
-    let bin_dyn = (cpg.fp_round(fp_state) == cpg.FPR_DYNAMIC) or tg.is_wasm();
-    if bin_dyn and ((cpg.fp_dec_round(fp_state) == cpg.FPD_DYNAMIC) or not cty.g_used_dec) {
-        branch(e, t, f);
-        return;
-    }
-    let prev = fp_enter();
-    let v = rv(e);
-    fp_leave(prev);
-    ir.condbr(cg.B, truth(v, e.ty), t, f);
-}
-
-// The functions that FENV_ROUND's static direction applies to when called
-// in its scope (C23 7.6.2p4's table: <math.h>'s, and the conversions of
-// <stdlib.h>, <stdio.h> and <wchar.h>): the others run in the dynamic mode.
-fn static_rounding_fn(name: []u8) bool {
-    let n = name;
-    if io_conversion_fn(n) {
-        return true;
-    }
-    let fixed = ["atof", "strtod", "strtof", "strtold", "wcstod", "wcstof", "wcstold", "strfromd", "strfromf",
-                 "strfroml", "strtof16", "strtof32", "strtof64", "strtof128", "strtof32x", "strtof64x", "wcstof16",
-                 "wcstof32", "wcstof64", "wcstof128", "wcstof32x", "wcstof64x", "strfromf16", "strfromf32",
-                 "strfromf64", "strfromf128", "strfromf32x", "strfromf64x"];
-    for f in fixed {
-        if u.str_eq(n, f) {
-            return true;
-        }
-    }
-    if fixed_radix_fn(n) == 2 {
-        return true;
-    }
-    // (and their forms for the other types, Annex H's included)
-    let sfx = ["f", "l", "f16", "f32", "f64", "f128", "f32x", "f64x"];
-    let base = math_fns();
-    for b in base {
-        if u.str_eq(n, b) {
-            return true;
-        }
-        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
-            for x in sfx {
-                if u.str_eq(n[b.len..], x) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-// The radix (2 or 10) of a function of 7.6.2p4's or 7.6.3's table, or of
-// H.10p4-5's additions, whose name is not a family's name and a type's
-// suffix, or 0: the narrowing operations (7.12.14, H.11.2: f32addf64,
-// d64xsqrtd128 ...), the encoding conversions fMencfN, dMencdecdN and
-// dMencbindN (H.11.3.3), and the string conversions of encodings (H.12.4,
-// H.12.5: strfromencfN, strtoencdecdN, wcstoencbindN ...).
-fn fixed_radix_fn(n: []u8) i32 {
-    let pre = ["strfromenc", "strtoenc", "wcstoenc"];
-    for p in pre {
-        if (n.len > p.len) and u.str_eq(n[0..p.len], p) {
-            let r = n[p.len..];
-            if (r.len >= 3) and (r[0] == 'f') and type_width_end(r, 1) {
-                return 2;
-            }
-            if (r.len >= 6) and (u.str_eq(r[0..4], "decd") or u.str_eq(r[0..4], "bind")) and type_width_end(r, 4) {
-                return 10;
-            }
-            return 0;
-        }
-    }
-    if (n.len < 5) or ((n[0] != 'f') and (n[0] != 'd')) {
-        return 0;
-    }
-    // fM[x] then an operation or "enc", then the argument type
-    let mut i: usize = 1;
-    while (i < n.len) and (n[i] >= '0') and (n[i] <= '9') {
-        i += 1;
-    }
-    if i == 1 {
-        return 0;
-    }
-    if (i < n.len) and (n[i] == 'x') {
-        i += 1;
-    }
-    let ops = ["add", "sub", "mul", "div", "fma", "sqrt", "encdec", "encbin", "enc"];
-    for op in ops {
-        let e = i + op.len;
-        if (e < n.len) and u.str_eq(n[i..e], op) and (n[e] == n[0]) and type_width_end(n, e + 1) {
-            if u.str_eq(op, "enc") and (n[0] == 'd') {
-                return 0;  // (dMencdecdN and dMencbindN only)
-            }
-            if n[0] == 'f' {
-                return 2;
-            }
-            return 10;
-        }
-    }
-    return 0;
-}
-
-// Is s[i..] a type's width, digits and an optional x, to its end?
-fn type_width_end(s: []u8, i0: usize) bool {
-    let mut i = i0;
-    while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
-        i += 1;
-    }
-    if i == i0 {
-        return false;
-    }
-    if (i < s.len) and (s[i] == 'x') {
-        i += 1;
-    }
-    return i == s.len;
-}
-
-// The <math.h> functions of 7.6.2p4's table (without their suffixes).
-fn math_fns() [71][]u8 {
-    return ["acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh", "tanh",
-            "exp", "exp2", "expm1", "exp10", "exp10m1", "exp2m1", "log", "log10", "log1p", "log2", "logp1", "log10p1",
-            "log2p1", "cbrt", "hypot", "pow", "pown", "powr", "rootn", "compoundn", "rsqrt", "sqrt", "erf", "erfc",
-            "lgamma", "tgamma", "rint", "nearbyint", "lrint", "llrint", "fma", "acospi", "asinpi", "atanpi", "atan2pi",
-            "cospi", "sinpi", "tanpi", "fmod", "remainder", "remquo", "fdim", "scalbn", "scalbln", "ldexp", "fadd",
-            "fsub", "fmul", "fdiv", "ffma", "fsqrt", "dadd", "dsub", "dmul", "ddiv", "dfma", "dsqrt", "quantize"];
-}
-
-// The formatted input/output functions (in both tables).
-fn io_conversion_fn(n: []u8) bool {
-    let io = ["printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "scanf",
-              "fscanf", "sscanf", "vscanf", "vfscanf", "vsscanf", "wprintf", "fwprintf", "swprintf", "vwprintf",
-              "vfwprintf", "vswprintf", "wscanf", "fwscanf", "swscanf", "vwscanf", "vfwscanf", "vswscanf"];
-    for f in io {
-        if u.str_eq(n, f) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// The functions that FENV_DEC_ROUND's static direction applies to (C23
-// 7.6.3's table: <math.h>'s decimal forms of 7.6.2p4's functions, and
-// quantize; strtodN, wcstodN, strfromdN, and the formatted input/output).
-fn static_dec_rounding_fn(name: []u8) bool {
-    let n = name;
-    if io_conversion_fn(n) {
-        return true;
-    }
-    let fixed = ["strtod32", "strtod64", "strtod128", "strtod64x", "wcstod32", "wcstod64", "wcstod128", "wcstod64x",
-                 "strfromd32", "strfromd64", "strfromd128", "strfromd64x"];
-    for f in fixed {
-        if u.str_eq(n, f) {
-            return true;
-        }
-    }
-    if fixed_radix_fn(n) == 10 {
-        return true;
-    }
-    let sfx = ["d32", "d64", "d128", "d64x"];
-    let base = math_fns();
-    for b in base {
-        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
-            for x in sfx {
-                if u.str_eq(n[b.len..], x) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 /// The value of e.
-pub fn rv(e: *mut cast.Expr) *mut ir.Value {
+fn rv(e: *mut cast.Expr) *mut ir.Value {
     // (an rvalue's own accesses are accesses, wherever it is: cgen_restrict.ax)
-    let ao = grs.g_addr;
-    grs.g_addr = false;
+    let ao = g_addr;
+    g_addr = false;
     let v = rv_of(e);
-    grs.g_addr = ao;
+    g_addr = ao;
     return v;
 }
 
@@ -1141,22 +58,22 @@ fn rv_of(e: *mut cast.Expr) *mut ir.Value {
         return rv(e.b);
     }
     if k == cast.ExprKind.CALL {
-        return call(e);
+        return expr_call(e);
     }
     if k == cast.ExprKind.NULLPTR {
-        return ir.czero(cg.T_ptr);
+        return ir.czero(T_ptr);
     }
     if k == cast.ExprKind.VA_ARG {
         if cty.is_vector(e.ty) and u.str_eq(e.name, "__builtin_convertvector") {
             return vec_expr(e, ir.vnil(), ir.vnil());
         }
-        return gva.va_arg(rv(e.a), e.ty);
+        return va_arg(rv(e.a), e.ty);
     }
     if k == cast.ExprKind.STMT_EXPR {
-        return cg.hooks.stmt_expr(e);
+        return stmt_expr(e);
     }
     if k == cast.ExprKind.LABEL_ADDR {
-        return cg.label_address_code(e.sym);
+        return label_address_code(e.sym);
     }
     if (k == cast.ExprKind.SIZEOF_EXPR) or (k == cast.ExprKind.SIZEOF_TYPE) {
         return vla_sizeof(e);
@@ -1178,22 +95,22 @@ fn rv_of(e: *mut cast.Expr) *mut ir.Value {
 fn vla_sizeof(e: *mut cast.Expr) *mut ir.Value {
     if e.kind == cast.ExprKind.SIZEOF_EXPR {
         _ = rv_or_lv(e.a, true);
-        return gv.size_value(e.a.ty);
+        return vla_size_value(e.a.ty);
     }
-    gv.eval_type_name(e.tname, rv, effects);
-    return gv.size_value(e.tname.ty);
+    vla_eval_type_name(e.tname);
+    return vla_size_value(e.tname.ty);
 }
 
 /// Evaluates e (typed) for its effects (the operand of sizeof or typeof of
 /// a variably modified type).
-pub fn effects(e: *mut cast.Expr) void {
+fn effects(e: *mut cast.Expr) void {
     _ = rv_or_lv(e, true);
 }
 
 fn conversion(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
     if u.notnil(e.tname) and cty.is_vm(e.tname.ty) {
-        gv.eval_type_name(e.tname, rv, effects);  // (a cast to a variably modified type)
+        vla_eval_type_name(e.tname);  // (a cast to a variably modified type)
     }
     if op == cast.CV_LOAD {
         let p = lv(e.a);
@@ -1232,10 +149,10 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
         if cty.is_complex(a.ty) {
             let mut p = v;  // (a complex value is the address of its temporary)
             if imag {
-                p = ir.ptradd(cg.B, p, cg.usz(cty.size_of(a.ty.unq.elem)));
+                p = ir.ptradd(B, p, usz(cty.size_of(a.ty.unq.elem)));
             }
             if cty.is_wide(e.ty) {
-                return gld.snapshot(p, false);  // (a wide long double's value: its copy's address)
+                return ld_snapshot(p, false);  // (a wide long double's value: its copy's address)
             }
             return load(cty.unqual(e.ty), p);
         }
@@ -1257,7 +174,7 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
     }
     let v = rv(e.a);
     if op == ct.P_BANG {
-        return i1_to(e.ty, ir.not_(cg.B, truth(v, e.a.ty)));
+        return i1_to(e.ty, ir.not_(B, truth(v, e.a.ty)));
     }
     if cty.is_imaginary(e.ty) {
         if op == ct.P_MINUS {
@@ -1267,100 +184,100 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
     }
     if cty.is_complex(e.ty) {
         if op == ct.P_MINUS {
-            return gcx.make(e.ty, gcx.negate(e.ty, gcx.parts(e.ty, v)));
+            return cx_make(e.ty, cx_negate(e.ty, cx_parts(e.ty, v)));
         }
         if op == ct.P_TILDE {
-            return gcx.make(e.ty, gcx.conj(e.ty, gcx.parts(e.ty, v)));  // (an extension: csema_expr)
+            return cx_make(e.ty, cx_conj(e.ty, cx_parts(e.ty, v)));  // (an extension: csema_expr)
         }
         return v;
     }
     if cty.is_wint(e.ty) {
         if op == ct.P_MINUS {
-            return cgw.negate(e.ty, v);
+            return wint_negate(e.ty, v);
         }
         if op == ct.P_TILDE {
-            return cgw.bitnot(e.ty, v);
+            return wint_bitnot(e.ty, v);
         }
         return v;
     }
     if op == ct.P_MINUS {
         if cty.is_wide(e.ty) {
-            return gld.negate(v, e.ty);
+            return ld_negate(v, e.ty);
         }
         if cty.is_half(e.ty) {
-            return ghf.negate(v);
+            return half_negate(v);
         }
         if cty.is_decimal(e.ty) {
-            return gdec.negate(e.ty, v);
+            return dec_negate(e.ty, v);
         }
         if cty.is_floating(e.ty) {
-            return ir.fneg(cg.B, v);
+            return ir.fneg(B, v);
         }
-        return cgbi.norm(ir.sub(cg.B, ir.cint(v.ty, 0), v), e.ty);
+        return bitint_norm(ir.sub(B, ir.cint(v.ty, 0), v), e.ty);
     }
     if op == ct.P_TILDE {
-        return cgbi.norm(ir.xor(cg.B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), e.ty);
+        return bitint_norm(ir.xor(B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), e.ty);
     }
     return v;
 }
 
 /// x op y in arithmetic type t (both of type t but a shift's y, of type yt,
 /// converted to x's width).
-pub fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
+fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
     return arith_of(op, t, x, y0, yt, false);
 }
 
 /// arith_op, but a signed result that overflows wraps (a vector's lanes,
 /// whose arithmetic is the element type's modulo its width: cgen_vec.ax).
-pub fn arith_wrap(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
+fn arith_wrap(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
     return arith_of(op, t, x, y0, yt, true);
 }
 
 /// -v of real type t (wrapping, for an integer).
-pub fn negate_value(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+fn negate_value(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
     if cty.is_wint(t) {
-        return cgw.negate(t, v);
+        return wint_negate(t, v);
     }
     if cty.is_wide(t) {
-        return gld.negate(v, t);
+        return ld_negate(v, t);
     }
     if cty.is_half(t) {
-        return ghf.negate(v);
+        return half_negate(v);
     }
     if cty.is_floating(t) {
-        return ir.fneg(cg.B, v);
+        return ir.fneg(B, v);
     }
-    return cgbi.norm(ir.sub(cg.B, ir.cint(v.ty, 0), v), t);
+    return bitint_norm(ir.sub(B, ir.cint(v.ty, 0), v), t);
 }
 
 /// ~v of integer type t.
-pub fn bitnot_value(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+fn bitnot_value(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
     if cty.is_wint(t) {
-        return cgw.bitnot(t, v);
+        return wint_bitnot(t, v);
     }
-    return cgbi.norm(ir.xor(cg.B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), t);
+    return bitint_norm(ir.xor(B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), t);
 }
 
 fn arith_of(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType,
             wrap: bool) *mut ir.Value {
     if cty.is_wint(t) {
         if (op == ct.P_SHL) or (op == ct.P_SHR) {
-            return cgw.shift(op, t, x, y0, yt);
+            return wint_shift(op, t, x, y0, yt);
         }
-        return cgw.arith(op, t, x, y0);
+        return wint_arith(op, t, x, y0);
     }
     let mut y = y0;
     if cty.is_wint(yt) {
-        y = cgw.limb(y0, 0);  // (a shift count: its low bits, or it is out of range)
+        y = wint_limb(y0, 0);  // (a shift count: its low bits, or it is out of range)
     }
     if cty.is_wide(t) {
-        return gld.arith(op, x, y, t);
+        return ld_arith(op, x, y, t);
     }
     if cty.is_half(t) {
-        return ghf.arith(op, x, y, t);
+        return half_arith(op, x, y, t);
     }
     if cty.is_decimal(t) {
-        return gdec.arith(op, t, x, y);
+        return dec_arith(op, t, x, y);
     }
     if cty.is_floating(t) {
         let mut fo = ir.OP_FADD;
@@ -1371,7 +288,7 @@ fn arith_of(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt:
         } else if op == ct.P_SLASH {
             fo = ir.OP_FDIV;
         }
-        return ir.binop(cg.B, fo, x, y);
+        return ir.binop(B, fo, x, y);
     }
     let sg = t.unq.is_signed and (t.unq.kind != cty.TK_BOOL);
     let mut io = ir.OP_ADD;
@@ -1380,9 +297,9 @@ fn arith_of(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt:
     } else if op == ct.P_STAR {
         io = ir.OP_MUL;
     } else if op == ct.P_SLASH {
-        io = pick(sg, ir.OP_SDIV, ir.OP_UDIV);
+        io = expr_pick(sg, ir.OP_SDIV, ir.OP_UDIV);
     } else if op == ct.P_PERCENT {
-        io = pick(sg, ir.OP_SREM, ir.OP_UREM);
+        io = expr_pick(sg, ir.OP_SREM, ir.OP_UREM);
     } else if op == ct.P_AMP {
         io = ir.OP_AND;
     } else if op == ct.P_PIPE {
@@ -1392,22 +309,18 @@ fn arith_of(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt:
     } else if (op == ct.P_SHL) or (op == ct.P_SHR) {
         let k = int_resize(y, false, x.ty);
         if op == ct.P_SHL {
-            return cgbi.norm(ir.binop(cg.B, ir.OP_SHL, x, k), t);
+            return bitint_norm(ir.binop(B, ir.OP_SHL, x, k), t);
         }
-        return ir.binop(cg.B, pick(sg, ir.OP_ASHR, ir.OP_LSHR), x, k);
+        return ir.binop(B, expr_pick(sg, ir.OP_ASHR, ir.OP_LSHR), x, k);
     }
-    let v = ir.binop(cg.B, io, x, y);
+    let v = ir.binop(B, io, x, y);
     if sg and (t.unq.kind != cty.TK_BITINT) and not wrap and not g_wrapv {
         // signed + - * overflowing is undefined (C17 6.5p5); not the
-        // shifts, and not _BitInt's operations, which norm narrows after
+        // shifts, and not _BitInt's operations, which bitint_norm narrows after
         _ = no_wrap(v, io);
     }
-    return cgbi.norm(v, t);
+    return bitint_norm(v, t);
 }
-
-/// --c-wrapv: signed + - * wrap (in two's complement), as unsigned ones do;
-/// they are not marked as not overflowing (ir.F_NSW).
-pub let mut g_wrapv: bool = false;
 
 // v, marked as an operation that does not overflow as a signed one, if it is
 // the instruction op (not a constant it folded to). Only for operations whose
@@ -1420,7 +333,7 @@ fn no_wrap(v: *mut ir.Value, op: i32) *mut ir.Value {
     return v;
 }
 
-fn pick(c: bool, a: i32, b: i32) i32 {
+fn expr_pick(c: bool, a: i32, b: i32) i32 {
     if c {
         return a;
     }
@@ -1428,7 +341,7 @@ fn pick(c: bool, a: i32, b: i32) i32 {
 }
 
 // The operator of a compound assignment: '+=' is '+'.
-fn base_op(op: i32) i32 {
+fn expr_base_op(op: i32) i32 {
     if op == ct.P_MUL_EQ {
         return ct.P_STAR;
     }
@@ -1465,7 +378,7 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
     if cty.is_complex(t) {
         let cx = operand(e.a);
         let cy = operand(e.b);
-        return i1_to(e.ty, gcx.equal(cty.common_type(e.a.ty, e.b.ty), cx, cy, op == ct.P_NE));
+        return i1_to(e.ty, cx_equal(cty.common_type(e.a.ty, e.b.ty), cx, cy, op == ct.P_NE));
     }
     let x = rv(e.a);
     let y = rv(e.b);
@@ -1476,20 +389,20 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
 }
 
 /// x op y (a relational or equality operator) of real or pointer type t, as an i1.
-pub fn compare_values(op: i32, t: *mut cty.CType, x0: *mut ir.Value, y0: *mut ir.Value) *mut ir.Value {
+fn compare_values(op: i32, t: *mut cty.CType, x0: *mut ir.Value, y0: *mut ir.Value) *mut ir.Value {
     let mut x = x0;
     let mut y = y0;
     if cty.is_wide(t) {
-        return gld.compare(op, x, y, t);
+        return ld_compare(op, x, y, t);
     }
     if cty.is_half(t) {
-        return ghf.compare(op, x, y, t);
+        return half_compare(op, x, y, t);
     }
     if cty.is_decimal(t) {
-        return gdec.compare(op, t, x, y);
+        return dec_compare(op, t, x, y);
     }
     if cty.is_wint(t) {
-        return cgw.compare(op, t, x, y);
+        return wint_compare(op, t, x, y);
     }
     if cty.is_floating(t) {
         let mut p = ir.RealOEQ;
@@ -1504,7 +417,7 @@ pub fn compare_values(op: i32, t: *mut cty.CType, x0: *mut ir.Value, y0: *mut ir
         } else if op == ct.P_GE {
             p = ir.RealOGE;
         }
-        let c = ir.fcmp(cg.B, p, x, y);
+        let c = ir.fcmp(B, p, x, y);
         if (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) {
             // (the relational operators signal "invalid" for a NaN, F.9.3;
             // isless and the like do not: cgen_fp.ax)
@@ -1516,15 +429,15 @@ pub fn compare_values(op: i32, t: *mut cty.CType, x0: *mut ir.Value, y0: *mut ir
     }
     let mut sg = cty.is_integer(t) and t.is_signed and (t.kind != cty.TK_BOOL);
     if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
-        x = ir.ptrtoint(cg.B, x, cg.T_isz);
-        y = ir.ptrtoint(cg.B, y, cg.T_isz);
+        x = ir.ptrtoint(B, x, T_isz);
+        y = ir.ptrtoint(B, y, T_isz);
         sg = false;
     }
-    return ir.icmp(cg.B, int_pred(op, sg), x, y);
+    return ir.icmp(B, int_pred(op, sg), x, y);
 }
 
 /// The IR predicate of the integer comparison op (signed: sg).
-pub fn int_pred(op: i32, sg: bool) ir.CmpPred {
+fn int_pred(op: i32, sg: bool) ir.CmpPred {
     let mut p = ir.IntEQ;
     if op == ct.P_NE {
         p = ir.IntNE;
@@ -1541,24 +454,24 @@ pub fn int_pred(op: i32, sg: bool) ir.CmpPred {
 }
 
 /// Branches to t if scalar expression e is nonzero, else to f.
-pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
+fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
     if e.is_const and cty.is_arith(e.ty) and not e.soft {
         let c = cc.truth(e);
         if c {
-            cg.br(t);
+            br(t);
         } else {
-            cg.br(f);
+            br(f);
         }
         return;
     }
     if (e.kind == cast.ExprKind.BINARY) and ((e.op == ct.P_ANDAND) or (e.op == ct.P_OROR)) {
-        let mid = cg.new_block(u.pick(e.op == ct.P_ANDAND, "and", "or"));
+        let mid = new_block(u.pick(e.op == ct.P_ANDAND, "and", "or"));
         if e.op == ct.P_ANDAND {
             branch(e.a, mid, f);
         } else {
             branch(e.a, t, mid);
         }
-        cg.at_end(mid);
+        at_end(mid);
         branch(e.b, t, f);
         return;
     }
@@ -1572,7 +485,7 @@ pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
     while (x.kind == cast.ExprKind.CAST) and (x.op == cast.CV_VALUE) and u.isnil(x.tname) {
         x = x.a;
     }
-    if (x.kind == cast.ExprKind.CALL) and (x.op == gbi.GB_EXPECT) and (x.args.len >= 2) and x.args.get(1).is_const {
+    if (x.kind == cast.ExprKind.CALL) and (x.op == cs.GB_EXPECT) and (x.args.len >= 2) and x.args.get(1).is_const {
         let likely_true = x.args.get(1).cval != 0;
         let mut sure = true;
         if x.args.len == 3 {
@@ -1588,7 +501,7 @@ pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
         }
     }
     let v = rv(e);
-    ir.condbr(cg.B, truth(v, e.ty), t, f);
+    ir.condbr(B, truth(v, e.ty), t, f);
 }
 
 fn binary(e: *mut cast.Expr) *mut ir.Value {
@@ -1601,27 +514,27 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
         // second's truth is then the value, without a branch on it (a
         // call's _Bool result returned as it is)
         let is_and = op == ct.P_ANDAND;
-        let mid = cg.new_block(u.pick(is_and, "and", "or"));
-        let short = cg.new_block(u.pick(is_and, "false", "true"));
-        let done = cg.new_block("logic");
+        let mid = new_block(u.pick(is_and, "and", "or"));
+        let short = new_block(u.pick(is_and, "false", "true"));
+        let done = new_block("logic");
         if is_and {
             branch(e.a, mid, short);
         } else {
             branch(e.a, short, mid);
         }
-        cg.at_end(mid);
+        at_end(mid);
         let mut v = ir.vnil();
         if e.b.ty.unq.kind == cty.TK_BOOL {
             v = int_resize(rv(e.b), false, lty(e.ty));  // (0 or 1)
         } else {
             v = i1_to(e.ty, truth(rv(e.b), e.b.ty));
         }
-        let from = cg.B.blk;
-        ir.br(cg.B, done);
-        cg.at_end(short);
-        ir.br(cg.B, done);
-        cg.at_end(done);
-        let ph = ir.phi(cg.B, lty(e.ty));
+        let from = B.blk;
+        ir.br(B, done);
+        at_end(short);
+        ir.br(B, done);
+        at_end(done);
+        let ph = ir.phi(B, lty(e.ty));
         ir.add_incoming(ph, v, from);
         let mut sv: u64 = 1;
         if is_and {
@@ -1640,18 +553,18 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
         if e.b.ty.kind == cty.TK_POINTER {
             // p - q: the difference in elements
             let q = rv(e.b);
-            let d = ir.sub(cg.B, ir.ptrtoint(cg.B, p, cg.T_isz), ir.ptrtoint(cg.B, q, cg.T_isz));
+            let d = ir.sub(B, ir.ptrtoint(B, p, T_isz), ir.ptrtoint(B, q, T_isz));
             // (C11 6.5.6p9: defined only for pointers into the same array
             // object, whose distance is a multiple of the size; divconst.ax)
-            let sz = gv.size_value(ta.elem);
+            let sz = vla_size_value(ta.elem);
             if ir.is_cint(sz) and (ir.cint_val(sz) != 0) {
-                return int_resize(divc.exact_sdiv(cg.B, d, ir.cint_val(sz)), true, lty(e.ty));
+                return int_resize(divc.exact_sdiv(B, d, ir.cint_val(sz)), true, lty(e.ty));
             }
-            let n = ir.binop(cg.B, ir.OP_SDIV, d, sz);
+            let n = ir.binop(B, ir.OP_SDIV, d, sz);
             return int_resize(n, true, lty(e.ty));
         }
         let i = index_of(rv(e.b), e.b.ty);
-        return offset(p, i, gv.size_value(ta.elem), op == ct.P_MINUS);
+        return offset(p, i, vla_size_value(ta.elem), op == ct.P_MINUS);
     }
     if cty.is_imaginary(e.a.ty) or cty.is_imaginary(e.b.ty) {
         return imag_arith(op, e.ty, rv(e.a), e.a.ty, rv(e.b), e.b.ty);
@@ -1659,586 +572,9 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
     if cty.is_complex(e.ty) {
         let cx = operand(e.a);
         let cy = operand(e.b);
-        return gcx.make(e.ty, gcx.arith(complex_op(op), e.ty, cx, cy));
+        return cx_make(e.ty, cx_arith(complex_op(op), e.ty, cx, cy));
     }
     let x = rv(e.a);
     let y = rv(e.b);
     return arith_op(op, e.ty, x, y, e.b.ty);
-}
-
-fn assign(e: *mut cast.Expr) *mut ir.Value {
-    let lt = e.a.ty;
-    if e.op == ct.P_ASSIGN {
-        let v = rv(e.b);
-        let p = lv(e.a);
-        if is_atomic(lt) {
-            cga.store(lt, v, p, ir.ORD_SEQ_CST);
-            return v;
-        }
-        if cty.is_wide(lt) or cty.is_dec128(lt) {
-            gld.copy(p, v, is_volatile(lt));
-            return p;
-        }
-        if cty.is_wint(lt) and u.isnil(cgb.of(e.a)) {
-            cgw.copy(lt, p, v, is_volatile(lt));
-            return p;
-        }
-        if cty.is_record(lt) {
-            copy(lt, p, v);
-            return p;
-        }
-        if cty.is_vector(lt) {
-            vec_copy(lt, p, v);
-            return v;
-        }
-        return store_lv(e.a, lt, v, p);
-    }
-    if is_atomic(lt) {
-        return atomic_compound(e);
-    }
-    let p = lv(e.a);
-    let old = load_lv(e.a, p);
-    let r = rv(e.b);
-    return store_lv(e.a, lt, compound_value(e, old, r), p);
-}
-
-// The value compound assignment e stores, from the left operand's value old
-// and the right operand's r.
-fn compound_value(e: *mut cast.Expr, old: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
-    let lt = e.a.ty;
-    let ot = e.opty;
-    let mut nv = ir.vnil();
-    if ot.kind == cty.TK_POINTER {
-        nv = offset(old, index_of(r, e.b.ty), gv.size_value(ot.elem), e.op == ct.P_SUB_EQ);
-    } else if cty.is_vector(ot) {
-        nv = vec_expr(e, old, r);
-    } else if cty.is_imaginary(lt) or cty.is_imaginary(e.b.ty) {
-        // (G.5: the left operand in its own domain of the real type, the
-        // result of opty's type, converted back)
-        let r_ = cty.real_of(ot);
-        let xt = csx.in_domain(csx.domain(lt), r_);
-        let x = convert(old, lt, xt);
-        nv = convert(imag_arith(base_op(e.op), ot, x, xt, r, e.b.ty), ot, lt);
-    } else if cty.is_complex(ot) {
-        // (each operand in its type domain, as csema_expr.compound_arith says)
-        let xt = cty.domain_type(lt, ot);
-        let x = convert(old, lt, xt);
-        let mut cx = gcx.real_t(x, xt);
-        if cty.is_complex(xt) {
-            cx = gcx.parts(xt, x);
-        }
-        let mut cy = gcx.real_t(r, e.b.ty);
-        if cty.is_complex(e.b.ty) {
-            cy = gcx.parts(e.b.ty, r);
-        }
-        let res = gcx.make(ot, gcx.arith(complex_op(base_op(e.op)), ot, cx, cy));
-        nv = convert(res, ot, lt);
-    } else {
-        let x = convert(old, lt, ot);
-        nv = convert(arith_op(base_op(e.op), ot, x, r, e.b.ty), ot, lt);
-    }
-    return nv;
-}
-
-// ++ and --, prefix (UNARY) or postfix.
-fn incdec(e: *mut cast.Expr) *mut ir.Value {
-    let t = e.a.ty;
-    if is_atomic(t) {
-        return atomic_compound(e);
-    }
-    let p = lv(e.a);
-    let old = load_lv(e.a, p);
-    let ot = e.opty;
-    let dec = e.op == ct.P_DEC;
-    let mut nv = ir.vnil();
-    if ot.kind == cty.TK_POINTER {
-        nv = offset(old, cg.usz(1), gv.size_value(ot.elem), dec);
-    } else if cty.is_vector(ot) {
-        nv = vec_expr(e, old, ir.vnil());
-    } else {
-        let x = convert(old, t, ot);
-        nv = convert(arith_op(pick(dec, ct.P_MINUS, ct.P_PLUS), ot, x, one_of(ot), ot), ot, t);
-    }
-    let stored = store_lv(e.a, t, nv, p);
-    if e.kind == cast.ExprKind.POSTFIX {
-        return old;
-    }
-    return stored;
-}
-
-// A compound assignment, ++ or -- of an atomic lvalue (6.5.2.4p2,
-// 6.5.16.2p3): one atomic read-modify-write. Addition, subtraction and the
-// bitwise operations on an integer (other than _Bool and a _BitInt narrower
-// than its storage) or a pointer are one instruction (their result, in the
-// object's width, is the same as in the promoted type); the others are a
-// loop of compare-exchanges (or the lock: cgen_atomic.ax), which compute the
-// new value again when another thread changed the object meanwhile.
-fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
-    let t = e.a.ty;
-    let ot = e.opty;
-    let post = e.kind == cast.ExprKind.POSTFIX;
-    let mut op = ct.P_PLUS;
-    let mut r = ir.vnil();
-    if e.kind == cast.ExprKind.ASSIGN {
-        op = base_op(e.op);
-        r = rv(e.b);  // (before the object: the loop evaluates no operand again)
-    } else if e.op == ct.P_DEC {
-        op = ct.P_MINUS;
-    }
-    let p = lv(e.a);
-    let tt = lty(t);
-    let k = t.unq.kind;
-    let bitwise = (op == ct.P_AMP) or (op == ct.P_PIPE) or (op == ct.P_CARET);
-    let additive = (op == ct.P_PLUS) or (op == ct.P_MINUS);
-    let int_ok = cty.is_integer(t) and (k != cty.TK_BOOL) and (cty.storage_bits(t) == t.unq.bits) and
-                 cty.is_integer(ot) and (additive or bitwise);
-    let ptr_ok = (k == cty.TK_POINTER) and additive;
-    if cga.int_free(t) and (int_ok or ptr_ok) {
-        let mut x = ir.vnil();
-        if ptr_ok {
-            let mut n = cg.usz(1);
-            if u.notnil(r) {
-                n = int_resize(index_of(r, e.b.ty), true, cg.T_isz);
-            }
-            x = no_wrap(ir.mul(cg.B, n, gv.size_value(ot.elem)), ir.OP_MUL);
-        } else if u.isnil(r) {
-            x = ir.cint(tt, 1);
-        } else {
-            x = int_resize(r, ot.is_signed, tt);
-        }
-        let mut rop = ir.RMW_ADD;
-        let mut io = ir.OP_ADD;
-        if op == ct.P_MINUS {
-            rop = ir.RMW_SUB;
-            io = ir.OP_SUB;
-        } else if op == ct.P_AMP {
-            rop = ir.RMW_AND;
-            io = ir.OP_AND;
-        } else if op == ct.P_PIPE {
-            rop = ir.RMW_OR;
-            io = ir.OP_OR;
-        } else if op == ct.P_CARET {
-            rop = ir.RMW_XOR;
-            io = ir.OP_XOR;
-        }
-        let old = cga.fetch(t, rop, p, x, ir.ORD_SEQ_CST);
-        if post {
-            return old;
-        }
-        if ptr_ok {
-            return ir.ptradd(cg.B, old, pick_neg(op == ct.P_MINUS, x));
-        }
-        return ir.binop(cg.B, io, old, x);
-    }
-    let up = cga.update_begin(t, p, ir.ORD_SEQ_CST);
-    let old = up.old;
-    let mut nv = ir.vnil();
-    if e.kind == cast.ExprKind.ASSIGN {
-        nv = compound_value(e, old, r);
-    } else if ot.kind == cty.TK_POINTER {
-        nv = offset(old, cg.usz(1), gv.size_value(ot.elem), op == ct.P_MINUS);
-    } else {
-        let x = convert(old, t, ot);
-        nv = convert(arith_op(op, ot, x, one_of(ot), ot), ot, t);
-    }
-    cga.update_end(up, nv);
-    if post {
-        return old;
-    }
-    return nv;
-}
-
-// x, or its negation (a byte offset).
-fn pick_neg(neg: bool, x: *mut ir.Value) *mut ir.Value {
-    if neg {
-        return ir.sub(cg.B, cg.usz(0), x);
-    }
-    return x;
-}
-
-fn conditional(e: *mut cast.Expr) *mut ir.Value {
-    if cty.is_vector(e.a.ty) {
-        return vec_expr(e, ir.vnil(), ir.vnil());  // (lane by lane)
-    }
-    let yes = cg.new_block("then");
-    let no = cg.new_block("else");
-    let done = cg.new_block("cond");
-    let cplx = cty.is_complex(e.ty);
-    let mut px = gcx.real(ir.vnil());
-    let mut py = gcx.real(ir.vnil());
-    let mut x = ir.vnil();
-    if u.isnil(e.b) {
-        // `a ?: c` (a GNU dialect): a once, its value if nonzero
-        let v = rv(e.a);
-        ir.condbr(cg.B, truth(v, e.a.ty), yes, no);
-        cg.at_end(yes);
-        x = convert(v, e.a.ty, e.ty);
-    } else {
-        branch(e.a, yes, no);
-        cg.at_end(yes);
-        x = rv(e.b);
-    }
-    if cplx {
-        px = gcx.parts(e.ty, x);  // (the parts, which the phis join)
-    }
-    let xb = ir.insert_block(cg.B);
-    ir.br(cg.B, done);
-    cg.at_end(no);
-    let y = rv(e.c);
-    if cplx {
-        py = gcx.parts(e.ty, y);
-    }
-    let yb = ir.insert_block(cg.B);
-    ir.br(cg.B, done);
-    cg.at_end(done);
-    if cty.is_void(e.ty) {
-        return ir.vnil();
-    }
-    if cplx {
-        let rt = px.re.ty;
-        let pr = ir.phi(cg.B, rt);
-        ir.add_incoming(pr, px.re, xb);
-        ir.add_incoming(pr, py.re, yb);
-        let pi = ir.phi(cg.B, rt);
-        ir.add_incoming(pi, px.im, xb);
-        ir.add_incoming(pi, py.im, yb);
-        return gcx.make(e.ty, gcx.Pair.{ re: pr, im: pi });
-    }
-    let mut pt = cg.T_ptr;
-    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) and not cty.is_wint(e.ty) and not cty.is_dec128(e.ty) {
-        pt = lty(e.ty);
-    }
-    let ph = ir.phi(cg.B, pt);
-    ir.add_incoming(ph, x, xb);
-    ir.add_incoming(ph, y, yb);
-    return ph;
-}
-
-// <setjmp.h>'s setjmp (std/c/include/setjmp.h): a function the linkers
-// provide (cmd/axiom/src/jstub.ax) that returns twice.
-let SETJMP: []u8 = "__axc_setjmp";
-
-// A call of setjmp (C 7.13.1.1) in the function being generated: after
-// longjmp the call returns again, with the registers and the stack pointer
-// it saved, so the function is compiled without optimization (ir.Func's
-// returns_twice): every object stays in its own stack slot, where longjmp
-// finds what was stored before it (7.13.2.1p3), and no value lives in a
-// register across the call. WebAssembly returns to the frame through its
-// exception-handling extension (cgen_sjlj.ax), without which setjmp is
-// C3300.
-fn returns_twice(e: *cast.Expr) void {
-    if tg.is_wasm() and not tg.has(tg.W_EXCEPTION_HANDLING) {
-        _ = dg.err(e.span, "C3300",
-                   "setjmp and longjmp need WebAssembly's exception-handling extension (--features=+exception-handling)");
-        return;
-    }
-    if u.notnil(cg.F) {
-        cg.F.f.returns_twice = true;
-        cg.F.f.noinline = true;
-    }
-}
-
-// The system C library's names of setjmp (its <setjmp.h> under
-// --c-lib=system: setjmp, sigsetjmp and their kin, and those of the other
-// functions POSIX says return twice) also make a call return twice.
-fn returns_twice_name(n: []u8) bool {
-    if not cg.g_system_c_lib {
-        return false;
-    }
-    for x in ["setjmp", "_setjmp", "__sigsetjmp", "sigsetjmp", "savectx", "vfork", "getcontext"] {
-        if u.str_eq(n, x) {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn call(e: *mut cast.Expr) *mut ir.Value {
-    let n = e.args.len;
-    let vs = u.newn.[*mut ir.Value](n + 1);
-    if e.op != 0 {
-        // a builtin (csema_builtin.ax)
-        for i in 0..n {
-            vs[i] = rv(e.args.get(i));
-        }
-        if (e.op >= cfp.BI_FP) and (e.op <= cfp.BI_TG) {
-            return gfp.builtin(e, vs[0..n]);  // <math.h>, <fenv.h>
-        }
-        if catm.is_builtin(e.op) {
-            return cga.builtin(e, vs[0..n]);
-        }
-        if (e.op >= csb.BI_COMPLEX) and (e.op <= csb.BI_CONJ) {
-            return complex_builtin(e, vs[0..n]);
-        }
-        return gva.builtin(e, vs[0..n]);
-    }
-    let fe = e.a;
-    if (n > 0) and u.notnil(cg.INL) and (e.args.get(n - 1).kind == cast.ExprKind.CALL) and
-       (e.args.get(n - 1).op == gbi.GB_VA_PACK) {
-        // (in an inlined call: __builtin_va_arg_pack () is its variable arguments)
-        let e2 = u.new.[cast.Expr]();
-        e2.* = e.*;
-        let mut xs = u.List.[*mut cast.Expr].empty();
-        for i in 0..(n - 1) {
-            xs.push(e.args.get(i));
-        }
-        for x in cg.INL.pack.items() {
-            xs.push(x);
-        }
-        e2.args = xs;
-        return call(e2);
-    }
-    if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) and
-       u.notnil(fe.a.sym) {
-        // (a function whose inline definition forwards its variable
-        // arguments: the definition inlined, csema_marks.va_wrapper)
-        let mut ps: []*mut cast.CSym = u.newn.[*mut cast.CSym](1)[0..0];
-        let w = csm.va_wrapper(fe.a.sym, &mut ps);
-        if u.notnil(w) {
-            let mut done = false;
-            let v = cg.hooks.inline_call(e, fe.a.sym, w, ps, &mut done);
-            if done {
-                return v;
-            }
-        }
-    }
-    let ft = fe.ty.elem;
-    let ats = u.newn.[*mut cty.CType](n + 1);
-    for i in 0..n {
-        ats[i] = e.args.get(i).ty;
-    }
-    // the signature: the prototype's (and the variadic arguments'), or the arguments'
-    let mut nnamed = n;
-    if ft.proto {
-        nnamed = ft.params.len;
-    }
-    let mut sig = cg.sig_of(ft.ret, ats[0..n], nnamed, ft.proto and ft.variadic, false);
-    let mut callee = ir.vnil();
-    let mut noreturn = false;
-    let mut callee_name: []u8 = "";
-    let mut va_nested = u.nil.[cast.CSym]();
-    if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
-        noreturn = catr.is_noreturn(fe.a.sym);
-        callee_name = fe.a.sym.name;
-        if u.str_eq(callee_name, SETJMP) or returns_twice_name(callee_name) {
-            returns_twice(e);
-        }
-        if u.notnil(fe.a.sym.nest_parent) {
-            // (a nested function: its signature, with its chain after the
-            // arguments: the record of its enclosing function's call; a
-            // variadic one's entry, below)
-            sig = cg.func_sig(fe.a.sym);
-            if fe.a.sym.ty.variadic {
-                va_nested = fe.a.sym;
-            }
-        }
-        let f = cg.func_of(fe.a.sym, sig);
-        callee = f.val;
-        if same_sig(f.ty, sig.ty) {
-            sig.ty = f.ty;
-        }
-    } else {
-        callee = rv(fe);
-    }
-    for i in 0..n {
-        vs[i] = rv(e.args.get(i));
-    }
-    if (n == 3) and not tg.is_wasm() and lib_func(fe, "memcmp") and ir.is_cint(vs[2]) {
-        let k = ir.cint_val(vs[2]);
-        if (k == 1) or (k == 2) or (k == 4) or (k == 8) {
-            return small_memcmp(vs[0], vs[1], k, cg.lty(e.ty));
-        }
-    }
-    let lm = lib_memop(fe, n);
-    if lm != 0 {
-        if lm == ir.OP_MEMSET {
-            _ = ir.memop(cg.B, lm, vs[0], ir.trunc(cg.B, vs[1], cg.T_i8), vs[2]);
-        } else {
-            _ = ir.memop(cg.B, lm, vs[0], vs[1], vs[2]);
-        }
-        return vs[0];
-    }
-    if tg.is_wasm() and tg.has(tg.W_EXCEPTION_HANDLING) and (n == 1) and u.str_eq(callee_name, SETJMP) and
-       u.notnil(cg.F) {
-        return sj.setjmp_call(vs[0]);  // (cgen_sjlj.ax)
-    }
-    gnest.arm();  // (a function a nested function's goto may jump back to)
-    // (native stack traces show the C function's frame at this call)
-    let mut fname: []u8 = "";
-    if u.notnil(cg.F) and u.notnil(cg.F.sym) {
-        fname = cg.F.sym.name;
-    }
-    if not (tg.is_wasm() and cg.lib_unit) {
-        cg.next_site = cg.call_site(e.span, fname, callee_name);
-    }
-    if (sig.plan.chain >= 0) and (fe.kind == cast.ExprKind.CAST) and (fe.a.kind == cast.ExprKind.IDENT) and
-       u.isnil(va_nested) {
-        cg.next_chain = gnest.chain_for(fe.a.sym);
-    }
-    // under FENV_ROUND's static direction, a function that it does not apply
-    // to runs in the dynamic mode (and may change it): restored for the
-    // call, read again after it, and the static direction set again
-    let dynamic = u.notnil(fp_slot) and not static_rounding_fn(callee_name);
-    if dynamic {
-        with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
-    }
-    // (and FENV_DEC_ROUND's likewise, for the functions of C23 7.6.3's table)
-    let ddynamic = u.notnil(fp_dslot) and not static_dec_rounding_fn(callee_name);
-    let mut dstatic = ir.vnil();
-    if ddynamic {
-        dstatic = dec_swap(ir.load(cg.B, ir.t_int(32), fp_dslot));
-    }
-    let mut r = ir.vnil();
-    if u.notnil(va_nested) {
-        r = gnest.call_variadic(va_nested, ats[0..n], vs[0..n], nnamed);
-    } else {
-        r = gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
-    }
-    gnest.unhook();
-    if ddynamic and not noreturn {
-        _ = ir.store(cg.B, dec_swap(dstatic), fp_dslot);
-    }
-    if dynamic and not noreturn {
-        let t64 = ir.t_int(64);
-        let cur = fenv_get();
-        _ = ir.store(cg.B, ir.and_(cg.B, cur, ir.cint(t64, rm_mask())), fp_slot);
-        fenv_set(
-            ir.or_(cg.B, ir.and_(cg.B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(cpg.fp_round(fp_state)))));
-    }
-    if (fe.kind == cast.ExprKind.CAST) and (fe.a.kind == cast.ExprKind.IDENT) and u.notnil(fe.a.sym) and
-       cgn.is_cold(fe.a.sym) {
-        ir.insert_block(cg.B).cold = true;  // (a call of a function with the attribute cold: a cold path)
-    }
-    if noreturn {
-        // (a function declared _Noreturn or [[noreturn]] does not return)
-        ir.unreachable(cg.B);
-        cg.continue_after();
-    }
-    return r;
-}
-
-// A hosted program's call of the C library's memcpy, memmove or memset
-// (callee fe, of n arguments) is the IR's memory operation (as the GNU
-// dialects' __builtin_memcpy ...): its op, else 0. A constant size is then
-// copied in registers, and the others without a call where the target
-// allows (x64isel.ax: gen_memop). Not where the unit defines the function
-// itself (a program's own, as freestanding ones have), nor in those
-// functions (the library's definitions, std/c/lib/string), whose loops
-// would call them where memory operations are calls (AArch64).
-fn lib_memop(fe: *cast.Expr, n: usize) i32 {
-    if (n != 3) or not cs.opts().hosted or cs.opts().no_builtin or (fe.kind != cast.ExprKind.CAST) or
-       (fe.op != cast.CV_FDECAY) or (fe.a.kind != cast.ExprKind.IDENT) or u.isnil(fe.a.sym) {
-        return 0;
-    }
-    let s = fe.a.sym;
-    if (s.kind != cast.SK_FUNC) or (s.linkage != cast.LK_EXTERNAL) or (s.asm_name.len != 0) or s.defined or
-       u.notnil(s.nest_parent) {
-        return 0;
-    }
-    let mut op: i32 = 0;
-    if u.str_eq(s.name, "memcpy") {
-        op = ir.OP_MEMCPY;
-    } else if u.str_eq(s.name, "memmove") {
-        op = ir.OP_MEMMOVE;
-    } else if u.str_eq(s.name, "memset") {
-        op = ir.OP_MEMSET;
-    } else {
-        return 0;
-    }
-    // (the library's declaration: void *(void *, const void * or int, size_t))
-    let ft = fe.ty.elem;
-    if not ft.proto or ft.variadic or (ft.params.len != 3) or (ft.ret.unq.kind != cty.TK_POINTER) or
-       (cty.unqual(ft.params[0]).kind != cty.TK_POINTER) or not cty.is_integer(cty.unqual(ft.params[2])) or
-       (cty.size_of(cty.unqual(ft.params[2])) != cty.size_of(cty.t_size)) {
-        return 0;
-    }
-    let p1 = cty.unqual(ft.params[1]);
-    if (op == ir.OP_MEMSET) != (p1.kind != cty.TK_POINTER) {
-        return 0;
-    }
-    if (op == ir.OP_MEMSET) and not cty.is_integer(p1) {
-        return 0;
-    }
-    if u.notnil(cg.F) and u.notnil(cg.F.sym) {
-        let f = cg.F.sym.name;
-        if u.str_eq(f, "memcpy") or u.str_eq(f, "memmove") or u.str_eq(f, "memset") or u.str_eq(f, "memset_explicit") {
-            return 0;
-        }
-    }
-    return op;
-}
-
-// Is fe (a call's callee) the C library's function `name` in a hosted
-// program, declared as the library does (a prototype, not defined in the
-// unit, not in the library's own definition of it)?
-fn lib_func(fe: *cast.Expr, name: []u8) bool {
-    if not cs.opts().hosted or cs.opts().no_builtin or (fe.kind != cast.ExprKind.CAST) or (fe.op != cast.CV_FDECAY) or
-       (fe.a.kind != cast.ExprKind.IDENT) or u.isnil(fe.a.sym) {
-        return false;
-    }
-    let s = fe.a.sym;
-    if (s.kind != cast.SK_FUNC) or (s.linkage != cast.LK_EXTERNAL) or (s.asm_name.len != 0) or s.defined or
-       u.notnil(s.nest_parent) or not u.str_eq(s.name, name) or not fe.ty.elem.proto {
-        return false;
-    }
-    return u.isnil(cg.F) or u.isnil(cg.F.sym) or not u.str_eq(cg.F.sym.name, name);
-}
-
-// memcmp(a, b, k) of a constant k of 1, 2, 4 or 8 bytes (the C library's,
-// lib_func; natively: WebAssembly has no byte swap): the bytes loaded as one integer each, in big-endian order (the
-// first byte the most significant), and compared: the difference of the
-// bytes for one, else -1, 0 or 1 (memcmp's sign is all C says of it), of
-// type rt (int).
-fn small_memcmp(a: *mut ir.Value, b: *mut ir.Value, k: u64, rt: *mut ir.Ty) *mut ir.Value {
-    let t = ir.t_int(@truncate(i32, @bit_cast(i64, k * 8)));
-    let x = ir.load(cg.B, t, a);
-    x.align = 1;
-    let y = ir.load(cg.B, t, b);
-    y.align = 1;
-    if k == 1 {
-        return ir.sub(cg.B, ir.zext(cg.B, x, rt), ir.zext(cg.B, y, rt));
-    }
-    // (two bytes: swapped as 32-bit integers, the low half zero in both)
-    let mut st = t;
-    let mut xs: [1]*mut ir.Value = [x];
-    let mut ys: [1]*mut ir.Value = [y];
-    if k == 2 {
-        st = ir.t_int(32);
-        xs[0] = ir.zext(cg.B, x, st);
-        ys[0] = ir.zext(cg.B, y, st);
-    }
-    let bx = ir.intr(cg.B, ir.IN_BSWAP, st, xs[..]);
-    let by = ir.intr(cg.B, ir.IN_BSWAP, st, ys[..]);
-    let gt = ir.zext(cg.B, ir.icmp(cg.B, ir.IntUGT, bx, by), rt);
-    let lt = ir.zext(cg.B, ir.icmp(cg.B, ir.IntULT, bx, by), rt);
-    return ir.sub(cg.B, gt, lt);
-}
-
-// A <complex.h> builtin (csema_builtin.ax) of the argument values vs.
-fn complex_builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
-    if e.op == csb.BI_COMPLEX {
-        let el = e.ty.unq.elem;
-        return gcx.make(e.ty, gcx.Pair.{ re: as_part(vs[0], el), im: as_part(vs[1], el) });
-    }
-    let at = e.args.get(0).ty;
-    let p = gcx.parts(at, vs[0]);
-    if e.op == csb.BI_CREAL {
-        return convert(p.re, part_type(at), e.ty);
-    }
-    if e.op == csb.BI_CIMAG {
-        return convert(p.im, part_type(at), e.ty);
-    }
-    return gcx.make(e.ty, gcx.conj(e.ty, p));
-}
-
-fn same_sig(a: *ir.Ty, b: *ir.Ty) bool {
-    if (a.ret != b.ret) or (a.vararg != b.vararg) or (a.params.len != b.params.len) {
-        return false;
-    }
-    for i in 0..a.params.len {
-        if a.params[i] != b.params[i] {
-            return false;
-        }
-    }
-    return true;
 }

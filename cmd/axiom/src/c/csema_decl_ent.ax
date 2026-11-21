@@ -1,0 +1,721 @@
+// =============================================================================
+// csema_decl_ent.ax - declarations, function definitions and static
+// assertions (6.7, 6.9), part of csema.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cconst.ax" as cc;
+import "cgen_debug.ax" as cdbg;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// Declarations
+// -----------------------------------------------------------------------------
+
+/// An external declaration (6.9).
+pub fn external(d: *mut cast.Decl) void {
+    fp_dir(d.fp);
+    if d.kind == cast.DeclKind.DECL {
+        declaration(d, CTX_FILE);
+    } else if d.kind == cast.DeclKind.FUNC_DEF {
+        function_def(d);
+    } else if d.kind == cast.DeclKind.STATIC_ASSERT {
+        static_assert(d);
+    } else if d.kind == cast.DeclKind.ATTR {
+        attrs(&d.attrs, AP_NOTHING);
+    } else if d.kind == cast.DeclKind.ASM {
+        asm_toplevel(d.asm);
+        unit().asms.push(d.asm);
+    }
+}
+
+/// A declaration in a block.
+pub fn block_decl(d: *mut cast.Decl) void {
+    if d.kind == cast.DeclKind.DECL {
+        declaration(d, CTX_BLOCK);
+    } else if d.kind == cast.DeclKind.FUNC_DEF {
+        nested_def(d);
+    } else if d.kind == cast.DeclKind.STATIC_ASSERT {
+        static_assert(d);
+    } else if d.kind == cast.DeclKind.ATTR {
+        attrs(&d.attrs, AP_BLOCK_DECL);
+    }
+}
+
+/// The declaration in the first clause of a for statement (6.8.5p3: only
+/// objects with storage class auto or register).
+pub fn for_decl(d: *mut cast.Decl) void {
+    if d.kind != cast.DeclKind.DECL {
+        block_decl(d);
+        return;
+    }
+    let sc = d.specs.storage & ~(cast.SC_AUTO | cast.SC_REGISTER);
+    if sc != 0 {
+        err(d.specs.span, "C3006", "a declaration in 'for' can only declare objects that are auto or register");
+    }
+    declaration(d, CTX_FOR);
+    // (6.8.5p3: only objects; not a tag, an enumeration constant or a function)
+    for s in d.specs.items.items() {
+        if (s.kind != cast.SpecKind.TAG) or u.isnil(s.tag.ty) or cty.is_error(s.tag.ty) {
+            continue;
+        }
+        let ts = s.tag;
+        if (ts.name.len > 0) and (lookup_tag_here(ts.name) == ts.ty) {
+            err(ts.name_span, "C3006", u.f2("a declaration in 'for' declares the tag '%s %s', not only objects",
+                                            cast.kw_text(ts.kw), ts.name));
+        } else if (ts.kw == ct.K_ENUM) and ts.has_body and (ts.enumerators.len > 0) {
+            err(ts.enumerators.get(0).span, "C3006",
+                "a declaration in 'for' declares enumeration constants, not only objects");
+        }
+    }
+    for dcl in d.decls.items() {
+        if u.notnil(dcl.ty) and cty.is_func(dcl.ty) {
+            err(dcl.name_span, "C3006", u.f1("a declaration in 'for' declares the function '%s', not an object",
+                                             dcl.name));
+        }
+    }
+}
+
+fn declaration(d: *mut cast.Decl, ctx: i32) void {
+    let lone = d.decls.len == 0;
+    let mut sp = specifiers(d.specs, ctx, lone);
+    if lone {
+        if d.attrs.len > 0 {
+            err(d.attrs.get(0).span, "C3077",
+                "attributes before a declaration that declares no identifier (a tag's go after its keyword)");
+        }
+        if sp.infer_ or sp.constexpr_ {
+            err(d.span, u.pick(sp.infer_, "C3074", "C3073"), u.f1("a declaration with '%s' that declares no object",
+                                                                  u.pick(sp.infer_, "auto", "constexpr")));
+            return;
+        }
+        if not sp.tag_decl and not cty.is_error(sp.ty) {
+            err(d.span, "C3010", "a declaration that declares nothing");
+        }
+        return;
+    }
+    for dcl in d.decls.items() {
+        declare_one(&mut sp, dcl, ctx, d);
+    }
+}
+
+fn declare_one(sp: *mut Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Decl) void {
+    let mut t = cty.t_error;
+    if sp.infer_ {
+        t = inferred(dcl, sp.quals, d.decls.len > 1, dcl == d.decls.get(0));
+    } else {
+        // (a GNU dialect: mode(m) changes the specifiers' integer type)
+        let base = mode_type(sp.ty, &d.specs.gattrs, &d.attrs, &dcl.attrs);
+        t = derive(base, dcl, ctx);
+    }
+    dcl.ty = t;
+    let name = dcl.name;
+    let mut what = AP_OBJECT;
+    if sp.sc == cast.SC_TYPEDEF {
+        what = AP_TYPEDEF;
+    } else if cty.is_func(t) {
+        what = AP_FUNC;
+    }
+    g_fn_entity = has_function_deriv(dcl);
+    attrs(&d.attrs, what);
+    attrs(&dcl.attrs, what);
+    if dcl == d.decls.get(0) {
+        attrs(&d.specs.gattrs, what);  // (GNU attributes among the specifiers: checked once)
+    }
+    g_fn_entity = false;
+    if sp.has_align and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t) or (sp.sc == cast.SC_REGISTER)) {
+        let kind = u.pick(
+            sp.sc == cast.SC_TYPEDEF, "the typedef", u.pick(cty.is_func(t), "the function", "the register object"));
+        misplaced_alignment(sp.align_sp, u.f2("the declaration of %s '%s'", kind, name));
+    }
+    if sp.constexpr_ and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t)) {
+        err(dcl.name_span, "C3073", u.f1("'%s' is declared 'constexpr', but is not an object", name));
+    }
+    if cty.is_vm(t) {
+        vla_check_decl(name, dcl.name_span, t, sp.sc);
+    }
+    if sp.sc == cast.SC_TYPEDEF {
+        if u.notnil(dcl.init) {
+            err(dcl.init.span, "C3033", u.f1("the typedef '%s' has an initializer", name));
+        }
+        if sp.funcs != 0 {
+            // (6.7.4p1: function specifiers only in the declaration of a function)
+            err(dcl.name_span, "C3006", u.f1("'inline' or '_Noreturn' in the declaration of the typedef '%s'", name));
+        }
+        let prior = lookup_here(name);
+        if u.notnil(prior) {
+            let same = (prior.kind == cast.SK_TYPEDEF) and cty.compatible(prior.ty, t) and
+                       ((t.kind != cty.TK_ARRAY) or (prior.ty.has_len == t.has_len));
+            // (C11 6.7p3; the GNU dialects have it before C11 too, as the
+            // system's headers expect: <glob.h> and <stdio.h> define size_t
+            // and va_list again under a GNU compiler)
+            if not same or ((std() < co.C11) and not opts().gnu) or cty.is_vm(t) {
+                err_note(dcl.name_span, u.pick(same or (prior.kind == cast.SK_TYPEDEF), "C3002", "C3003"),
+                         u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+                return;
+            }
+            dcl.sym = prior;
+            mark_decl(d, dcl);
+            return;
+        }
+        let s = new_sym(cast.SK_TYPEDEF, name, dcl.name_span, t);
+        cdbg.note_typedef_use(s, sp.tdef);
+        dcl.sym = s;
+        declare(name, s);
+        mark_decl(d, dcl);
+        return;
+    }
+    if (sp.funcs != 0) and not cty.is_func(t) {
+        err(dcl.name_span, "C3006", u.f1("'inline' or '_Noreturn' in the declaration of '%s', not a function", name));
+    }
+    if cty.is_func(t) {
+        if sp.thread {
+            err(dcl.name_span, "C3076", u.f2("the function '%s' cannot be declared '%s'", name,
+                                             sc_name(cast.SC_THREAD_LOCAL)));
+        }
+        func_decl(sp, dcl, t, ctx, d);
+        if (sp.funcs & cast.FS_NORETURN) != 0 {
+            set_noreturn(dcl.sym);
+        }
+    } else {
+        object_decl(sp, dcl, t, ctx);
+    }
+    mark_decl(d, dcl);
+}
+
+// What the attributes of declaration d and of its declarator dcl say of the entity declared.
+fn mark_decl(d: *mut cast.Decl, dcl: *mut cast.Declarator) void {
+    attr_mark_sym(dcl.sym, &d.attrs);
+    attr_mark_sym(dcl.sym, &dcl.attrs);
+    attr_mark_sym(dcl.sym, &d.specs.gattrs);
+    mark_functype(dcl.sym, dcl);
+    // (the GNU dialects' attributes, and in every mode those of the
+    // compiler's headers, __axiom_attribute__: csema_gnu.is_gnu)
+    gnu_mark_sym(dcl.sym, &d.attrs);
+    gnu_mark_sym(dcl.sym, &dcl.attrs);
+    gnu_mark_sym(dcl.sym, &d.specs.gattrs);
+    pragma_visibility(dcl.sym, dcl.vis);
+    pragma_options(dcl.sym, dcl.fnopts);
+    if opts().gnu or opts().declspec {
+        gnu_entity(dcl.sym, dcl);
+    }
+}
+
+// The entity a declaration of `name` with linkage `lk` declares: the one of
+// an earlier declaration in the same scope or with the same linkage, its
+// type made the composite, or a new one, bound in the current scope.
+fn decl_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32) *mut cast.CSym {
+    let here = lookup_here(name);
+    let mut prior = here;
+    if u.isnil(prior) and (lk != cast.LK_NONE) {
+        prior = linked(name);
+    }
+    if u.notnil(prior) {
+        if prior.kind != kind {
+            err_note(sp, "C3003", u.f1("'%s' is redeclared as a different kind of identifier", name), prior.span,
+                     "declared before here");
+            return new_entity(name, sp, kind, t, lk, false);
+        }
+        if (prior.linkage == cast.LK_NONE) or (lk == cast.LK_NONE) {
+            err_note(sp, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+            return new_entity(name, sp, kind, t, lk, false);
+        }
+        if prior.linkage != lk {
+            err_note(sp, "C3004", u.f3("'%s' is declared with %s linkage after a declaration with %s linkage", name,
+                                       u.pick(lk == cast.LK_INTERNAL, "internal", "external"),
+                                       u.pick(lk == cast.LK_INTERNAL, "external", "internal")), prior.span,
+                     "declared before here");
+        }
+        if not cty.compatible(prior.ty, t) {
+            err_note(sp, "C3003", u.f3("conflicting types for '%s': %s, declared before as %s", name, tq(t),
+                                       tq(prior.ty)), prior.span, "declared before here");
+        } else {
+            prior.ty = cty.composite(prior.ty, t);
+        }
+        if u.isnil(here) {
+            declare(name, prior);
+        }
+        return prior;
+    }
+    return new_entity(name, sp, kind, t, lk, true);
+}
+
+fn new_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32, link: bool) *mut cast.CSym {
+    let s = new_sym(kind, name, sp, t);
+    s.linkage = lk;
+    if link and (lk != cast.LK_NONE) {
+        set_linked(name, s);
+    }
+    declare(name, s);
+    return s;
+}
+
+// Does declarator dcl derive a function type (a pointer to a function ...)?
+fn has_function_deriv(dcl: *cast.Declarator) bool {
+    for dv in dcl.derivs.items() {
+        if dv.kind == cast.DerivKind.FUNCTION {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Has declaration d of a function (its declarator dcl) the GNU89 inline
+// semantics: gnu89 or gnu90, or the attribute gnu_inline (csema_marks.ax)?
+fn is_gnu89_inline(d: *mut cast.Decl, dcl: *mut cast.Declarator) bool {
+    if not opts().gnu {
+        return false;
+    }
+    if std() < co.C99 {
+        return true;
+    }
+    return gnu_has(&d.attrs, "gnu_inline") or gnu_has(&dcl.attrs, "gnu_inline") or
+           gnu_has(&d.specs.gattrs, "gnu_inline");
+}
+
+fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32, d: *mut cast.Decl) void {
+    let sc = sp.sc;
+    if at_file_scope() {
+        if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
+            err(dcl.name_span, "C3006", u.f1("the function '%s' has an invalid storage class", dcl.name));
+        }
+    } else if (sc == cast.SC_AUTO) and opts().gnu {
+        // (a GNU dialect: the declaration of a nested function defined later in the block)
+        let prior = lookup_here(dcl.name);
+        if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and u.notnil(prior.nest_parent) {
+            dcl.sym = prior;
+            return;
+        }
+        let s = new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
+        s.linkage = cast.LK_NONE;
+        s.nest_parent = cur_fn();
+        if u.notnil(s.nest_parent) {
+            s.nest_parent.has_nested = true;
+        }
+        declare(dcl.name, s);
+        dcl.sym = s;
+        return;
+    } else if (sc != 0) and (sc != cast.SC_EXTERN) {
+        err(dcl.name_span, "C3006", u.f1("the function '%s', declared in a block, can only be extern", dcl.name));
+    }
+    if u.notnil(dcl.init) {
+        err(dcl.init.span, "C3033", u.f1("the function '%s' has an initializer", dcl.name));
+    }
+    let mut sc2 = sc;
+    if (sc != cast.SC_STATIC) and (sc != cast.SC_EXTERN) {
+        sc2 = 0;
+    }
+    if not at_file_scope() and (sc2 == cast.SC_STATIC) {
+        sc2 = 0;
+    }
+    let lk = linkage_of(dcl.name, sc2, true);
+    dcl.sym = decl_entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
+    if at_file_scope() and (dcl.sym.kind == cast.SK_FUNC) {
+        gnu89_inline = is_gnu89_inline(d, dcl);
+        function_declared(dcl.sym, sp.funcs, sc, dcl.name_span);
+        gnu89_inline = false;
+    }
+}
+
+fn object_decl(sp: *mut Specs, dcl: *mut cast.Declarator, t0: *mut cty.CType, ctx: i32) void {
+    let sc = sp.sc;
+    let name = dcl.name;
+    let mut t = t0;
+    if cty.is_void(t) {
+        err(dcl.name_span, "C3007", u.f1("the object '%s' has type void", name));
+        return;
+    }
+    if sp.constexpr_ {
+        // (C23 6.7.1: a definition with an initializer, of a const type)
+        if u.isnil(dcl.init) {
+            err(dcl.name_span, "C3073", u.f1("'%s' is declared 'constexpr' but has no initializer", name));
+        }
+        _ = constexpr_type(t, dcl.name_span);
+        t = cty.qualify(t, cty.Q_CONST);
+    }
+    if at_file_scope() {
+        if (sc == cast.SC_AUTO) or (sc == cast.SC_REGISTER) {
+            err(dcl.name_span, "C3006", u.f1("'%s' at file scope cannot be auto or register", name));
+        }
+        let mut sc2 = sc;
+        if (sc != cast.SC_STATIC) and (sc != cast.SC_EXTERN) {
+            sc2 = 0;
+        }
+        if sp.constexpr_ {
+            sc2 = cast.SC_STATIC;  // (internal linkage: C23 6.2.2p3)
+        }
+        let lk = linkage_of(name, sc2, false);
+        let s = decl_entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
+        s.duration = cast.SD_STATIC;
+        dcl.sym = s;
+        object_flags(sp, s, dcl);
+        let listed = s.defined or s.tentative;
+        if u.notnil(dcl.init) {
+            if s.defined {
+                err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), s.span, "defined before here");
+            }
+            init_object(s, dcl.init, true);
+            s.defined = true;
+        } else if sc != cast.SC_EXTERN {
+            if (lk == cast.LK_INTERNAL) and not cty.is_complete(s.ty) and not cty.is_error(s.ty) {
+                // (6.9.2p3)
+                err(dcl.name_span, "C3007",
+                    u.f2("the tentative definition of '%s', which has internal linkage, has incomplete type %s", name,
+                         tq(s.ty)));
+            }
+            s.tentative = true;
+        }
+        if not listed and (s.defined or s.tentative) {
+            add_object(s);
+        }
+        dcl.ty = s.ty;
+        return;
+    }
+    if sc == cast.SC_EXTERN {
+        let lk = linkage_of(name, sc, false);
+        let s = decl_entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
+        s.duration = cast.SD_STATIC;
+        dcl.sym = s;
+        object_flags(sp, s, dcl);
+        if u.notnil(dcl.init) {
+            err(dcl.init.span, "C3033", u.f1("'%s', declared extern in a block, has an initializer", name));
+        }
+        return;
+    }
+    let prior = lookup_here(name);
+    if u.notnil(prior) {
+        err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+    }
+    let s = new_sym(cast.SK_OBJECT, name, dcl.name_span, t);
+    s.owner = cur_fn();  // (a nested function may use it: csema_nest.ax)
+    if (sc == cast.SC_STATIC) or sp.thread {
+        s.duration = cast.SD_STATIC;
+    }
+    if sc == cast.SC_REGISTER {
+        set_register(s);
+    }
+    dcl.sym = s;
+    object_flags(sp, s, dcl);
+    declare(name, s);
+    if u.notnil(dcl.init) and cty.is_vla(s.ty) {
+        vla_init(s, dcl.init);
+    } else if u.notnil(dcl.init) {
+        init_object(s, dcl.init, s.duration == cast.SD_STATIC);
+    }
+    if not cty.is_complete(s.ty) and not cty.is_error(s.ty) {
+        err(dcl.name_span, "C3007", u.f2("the object '%s' has incomplete type %s", name, tq(s.ty)));
+    }
+    if s.duration == cast.SD_STATIC {
+        s.defined = true;
+        add_object(s);
+        static_defined(s, dcl.name_span);
+    }
+    dcl.ty = s.ty;
+}
+
+// What the specifiers sp say of object s besides its type: constexpr, thread_local (which every declaration of it says, or none:
+// 6.2.4p4), and its alignment (6.7.5p7: every declaration that has an
+// alignment specifier asks for the same).
+fn object_flags(sp: *mut Specs, s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
+    cdbg.note_typedef_use(s, sp.tdef);
+    let had = s.flags;
+    if sp.constexpr_ {
+        s.flags = s.flags | cast.CF_CONSTEXPR;
+    }
+    let tl = (had & cast.CF_THREAD_LOCAL) != 0;
+    if sp.thread {
+        s.flags = s.flags | cast.CF_THREAD_LOCAL;
+    }
+    let again = (s.span.file != dcl.name_span.file) or (s.span.start != dcl.name_span.start);
+    if (s.linkage != cast.LK_NONE) and again and (tl != sp.thread) {
+        err_note(dcl.name_span, "C3076", u.f2("'%s' is declared %s, after a declaration that says otherwise", dcl.name,
+                                              u.pick(sp.thread, u.cat3("'", sc_name(cast.SC_THREAD_LOCAL), "'"),
+                                                     u.cat2("without '", u.cat2(sc_name(cast.SC_THREAD_LOCAL), "'")))),
+                 s.span, "declared before here");
+    }
+    if sp.has_align {
+        if check_alignment(sp.align, sp.align_sp, s.ty, dcl.name) {
+            let a = sp.align;
+            if ((s.flags & cast.CF_ALIGNAS) != 0) and (a != s.align) and (a != 0) and (s.align != 0) {
+                err_note(sp.align_sp, "C3071", u.f3("'%s' is declared with alignment %s, before with %s", dcl.name,
+                                                    u.udec(a), u.udec(s.align)), s.span, "declared before here");
+            }
+            if a > s.align {
+                s.align = a;
+            }
+        }
+        s.flags = s.flags | cast.CF_ALIGNAS;
+    }
+}
+
+fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
+    if cty.is_error(s.ty) {
+        return;
+    }
+    let r = initializer(s.ty, it, is_static, (s.flags & cast.CF_CONSTEXPR) != 0);
+    s.init = r.list;
+    s.ty = r.ty;
+}
+
+// -----------------------------------------------------------------------------
+// Function definitions (6.9.1)
+// -----------------------------------------------------------------------------
+
+// The definition of a nested function (a GNU dialect: csema_nest.ax), in a
+// block of the function being analyzed: no linkage, no storage class but
+// auto; its body is analyzed in the scope of its block, so that it sees
+// the enclosing function's objects.
+fn nested_def(d: *mut cast.Decl) void {
+    let parent = cur_fn();
+    let sp = specifiers(d.specs, CTX_BLOCK, false);
+    let dcl = d.decls.get(0);
+    g_params = u.List.[*mut cast.CSym].empty();
+    g_kr_ids = false;
+    g_defining = true;
+    let mut t = derive(sp.ty, dcl, CTX_BLOCK);
+    g_defining = false;
+    let params = g_params;
+    if cty.is_error(t) or not cty.is_func(t) or u.isnil(parent) {
+        return;
+    }
+    if g_kr_ids {
+        t = kr_params(t, d, &params);
+    }
+    if (sp.sc != 0) and (sp.sc != cast.SC_AUTO) {
+        err(dcl.name_span, "C3006", u.f1("the nested function '%s' can only be declared auto", dcl.name));
+    }
+    let prior = lookup_here(dcl.name);
+    let mut s = u.nil.[cast.CSym]();
+    if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and (prior.nest_parent == parent) and not prior.defined {
+        // (declared auto before in the block: compatible types)
+        if not cty.compatible(prior.ty, t) {
+            err_note(dcl.name_span, "C3003", u.f1("conflicting types for '%s'", dcl.name), prior.span,
+                     "declared before here");
+        }
+        s = prior;
+        s.ty = t;
+    } else {
+        if u.notnil(prior) {
+            err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), prior.span,
+                     "declared before here");
+        }
+        s = new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
+        s.linkage = cast.LK_NONE;
+        s.nest_parent = parent;
+        declare(dcl.name, s);
+    }
+    parent.has_nested = true;
+    dcl.sym = s;
+    dcl.ty = t;
+    attrs(&d.attrs, AP_FUNC);
+    attrs(&d.specs.gattrs, AP_FUNC);
+    attrs(&dcl.attrs, AP_FUNC);
+    mark_decl(d, dcl);
+    for p in params.items() {
+        if not cty.is_complete(p.ty) and not cty.is_error(p.ty) {
+            err(p.span, "C3007", u.f2("the parameter '%s' has incomplete type %s", p.name, tq(p.ty)));
+        }
+    }
+    s.defined = true;
+    s.def = d;
+    s.params = params;
+    add_function(s);
+    function_body(s, d);
+}
+
+fn function_def(d: *mut cast.Decl) void {
+    let sp = specifiers(d.specs, CTX_FILE, false);
+    attrs(&d.attrs, AP_FUNC);
+    attrs(&d.specs.gattrs, AP_FUNC);
+    let dcl = d.decls.get(0);
+    g_params = u.List.[*mut cast.CSym].empty();
+    g_kr_ids = false;
+    g_defining = true;
+    let mut t = derive(sp.ty, dcl, CTX_FILE);
+    g_defining = false;
+    let params = g_params;
+    let kr = g_kr_ids;
+    if cty.is_error(t) or not cty.is_func(t) {
+        return;
+    }
+    if sp.sc == cast.SC_TYPEDEF {
+        err(dcl.name_span, "C3006", "a function definition cannot be a typedef");
+        return;
+    }
+    attrs(&dcl.attrs, AP_FUNC);
+    if sp.infer_ {
+        err(dcl.name_span, "C3074", u.f1("the function '%s' cannot have its type inferred ('auto')", dcl.name));
+    }
+    if sp.has_align {
+        misplaced_alignment(sp.align_sp, u.f1("the definition of the function '%s'", dcl.name));
+    }
+    if sp.constexpr_ or sp.thread {
+        err(dcl.name_span, u.pick(sp.constexpr_, "C3073", "C3076"),
+            u.f2(
+                "the function '%s' cannot be declared '%s'", dcl.name,
+                u.pick(sp.constexpr_, "constexpr", sc_name(cast.SC_THREAD_LOCAL))));
+    }
+    if kr {
+        t = kr_params(t, d, &params);
+    }
+    let mut sc = sp.sc;
+    if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
+        err(dcl.name_span, "C3006", u.f1("the function '%s' has an invalid storage class", dcl.name));
+        sc = 0;
+    }
+    if sc == cast.SC_EXTERN {
+        sc = 0;
+    }
+    let lk = linkage_of(dcl.name, sc, true);
+    let s = decl_entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
+    dcl.sym = s;
+    dcl.ty = t;
+    mark_decl(d, dcl);
+    if (sp.funcs & cast.FS_NORETURN) != 0 {
+        set_noreturn(s);
+    }
+    if s.defined {
+        err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), s.span, "defined before here");
+        return;
+    }
+    let rt = t.ret;
+    if not cty.is_void(rt) and not cty.is_complete(rt) {
+        err(dcl.name_span, "C3007", u.f2("'%s' returns incomplete type %s", dcl.name, tq(rt)));
+    }
+    for p in params.items() {
+        if not cty.is_complete(p.ty) and not cty.is_error(p.ty) {
+            err(p.span, "C3007", u.f2("the parameter '%s' has incomplete type %s", p.name, tq(p.ty)));
+        }
+    }
+    vla_check_params(dcl.derivs.at(0));
+    s.defined = true;
+    s.def = d;
+    s.params = params;
+    if u.str_eq(dcl.name, "main") and (lk == cast.LK_EXTERNAL) {
+        check_main(s, dcl);
+    }
+    gnu89_inline = is_gnu89_inline(d, dcl);
+    function_declared(s, sp.funcs, sp.sc, dcl.name_span);
+    gnu89_inline = false;
+    add_function(s);
+    marks_begin_body(s);
+    function_body(s, d);
+    if marks_end_body() {
+        // (an inline definition that forwards the caller's variable
+        // arguments: __builtin_va_arg_pack. The function is the external
+        // one, this definition no function of the unit, but inlined at its
+        // calls: csema_marks.end_body)
+        drop_function(s);
+        s.def = u.nil.[cast.Decl]();
+        s.defined = false;
+    }
+}
+
+// A K&R definition's parameters get their types from its declaration list
+// (int when they have none, before C99); the function's type, which is not a
+// prototype, gets them (kr: its compatibility with a prototype is by their
+// promoted types, 6.7.6.3p15).
+fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CSym]) *mut cty.CType {
+    let ps = params.items();
+    let mut given = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    for p in ps {
+        given.put(p.name, p);
+    }
+    let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    // (each parameter is in scope after its declarator, for the sizes of
+    // the later ones' variable length arrays: 6.2.1p7)
+    push_scope();
+    for kd in d.kr_decls.items() {
+        if kd.kind != cast.DeclKind.DECL {
+            continue;
+        }
+        let sp = specifiers(kd.specs, CTX_PARAM, false);
+        if (sp.sc != 0) and (sp.sc != cast.SC_REGISTER) {
+            err(kd.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
+        }
+        for x in kd.decls.items() {
+            let p = given.get(x.name);
+            if u.isnil(p) {
+                err(x.name_span, "C3010", u.f1("'%s' is declared, but is not a parameter", x.name));
+                continue;
+            }
+            if seen.get(x.name) != 0 {
+                err(x.name_span, "C3002", u.f1("the parameter '%s' is declared twice", x.name));
+            }
+            seen.put(x.name, 1);
+            if u.notnil(x.init) {
+                err(x.init.span, "C3033", u.f1("the parameter '%s' has an initializer", x.name));
+            }
+            let pt = derive(sp.ty, x, CTX_PARAM);
+            x.ty = pt;
+            x.sym = p;
+            if sp.sc == cast.SC_REGISTER {
+                set_register(p);
+            }
+            p.ty = adjust_param(pt, x);
+            p.span = x.name_span;
+            declare(x.name, p);
+        }
+    }
+    pop_scope();
+    let types = u.newn.[*mut cty.CType](ps.len + 1);
+    for i in 0..ps.len {
+        let p = ps[i];
+        if (seen.get(p.name) == 0) and (std() >= co.C99) {
+            err(p.span, "C3010", u.f1("the parameter '%s' has no declaration (implicit int is not in C99)", p.name));
+        }
+        types[i] = cty.unqual(p.ty);
+    }
+    // (callers pass each argument promoted: IR generation receives the
+    // parameters in their promoted types and converts them)
+    let f = cty.function(t.ret, types[0..ps.len], false, false);
+    f.kr = true;
+    return f;
+}
+
+// main is called by the program's start-up: int main(void) or
+// int main(int, char **) (in a GNU dialect also int main(int)).
+fn check_main(s: *mut cast.CSym, dcl: *cast.Declarator) void {
+    let t = s.ty;
+    let mut ok = cty.unqual(t.ret) == cty.t_int;
+    let n = t.params.len;
+    if n == 2 {
+        let p1 = t.params[1];
+        ok = ok and (cty.unqual(t.params[0]) == cty.t_int) and (p1.kind == cty.TK_POINTER) and
+             (p1.elem.kind == cty.TK_POINTER) and (cty.unqual(p1.elem.elem) == cty.t_char);
+    } else if (n == 1) and ok and opts().gnu and (cty.unqual(t.params[0]) == cty.t_int) and not t.variadic {
+        // (a GNU dialect: main(int argc), which 5.1.2.2.1p1's "some other
+        // implementation-defined manner" allows; it receives argc)
+        warn(dcl.name_span, "C4148", u.f1("main has type %s: it receives argc only", tq(t)));
+    } else if n != 0 {
+        ok = false;
+    }
+    if t.variadic {
+        ok = false;
+    }
+    if not ok {
+        err(dcl.name_span, "C3061", u.f1("main has type %s; it must be 'int (void)' or 'int (int, char **)'", tq(t)));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Static assertions (6.7.10)
+// -----------------------------------------------------------------------------
+
+fn static_assert(d: *mut cast.Decl) void {
+    let r = ice_wide(d.cond, "the condition of a static assertion");
+    d.cond = r.e;
+    if r.ok and not cc.truth(r.e) {
+        let mut msg: []u8 = "";
+        if u.notnil(d.msg) and u.notnil(d.msg.tok) {
+            let mut b = u.Buf.init();
+            for x in d.msg.tok.units {
+                b.c(@truncate(u8, x));
+            }
+            msg = u.cat2(": ", b.done());
+        }
+        err(d.cond.span, "C3050", u.cat2("static assertion failed", msg));
+    }
+}

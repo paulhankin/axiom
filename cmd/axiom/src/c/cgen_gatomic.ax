@@ -1,191 +1,186 @@
 // =============================================================================
 // cgen_gatomic.ax - IR generation for the GNU dialects' atomic builtins
 // (`__sync_...`, `__atomic_...`: csema_gbuiltin.ax types them), through
-// cgen_atomic.ax's operations (those of C11's atomics): lock-free on objects
-// of 1, 2, 4 and 8 bytes (and 16 where cgen_atomic.ax does them so), under
-// its lock for other sizes (the generic forms, on any object). The
-// __atomic_ builtins have the orders they are given (cgen_atomic.ax:
-// order_of); the __sync_ builtins are sequentially consistent but
-// __sync_lock_test_and_set (an acquire) and __sync_lock_release (a release). A pointer is operated on as
-// an integer of its width (in bytes, unscaled); nand, which the IR has no
-// read-modify-write for, is cgen_atomic's loop of compare-exchanges.
+// cgen_atomic_ops.ax's operations (those of C11's atomics): lock-free on
+// objects of 1, 2, 4 and 8 bytes (and 16 where cgen_atomic_ops.ax does them
+// so), under its lock for other sizes (the generic forms, on any object).
+// The __atomic_ builtins have the orders they are given (atomic_order_of);
+// the __sync_ builtins are sequentially consistent but
+// __sync_lock_test_and_set (an acquire) and __sync_lock_release (a release).
+// A pointer is operated on as an integer of its width (in bytes, unscaled);
+// nand, which the IR has no read-modify-write for, is cgen_atomic_ops's
+// loop of compare-exchanges. Part of cgen.ax.
 // =============================================================================
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
-import "cgen_atomic.ax" as cga;
-import "csema_gbuiltin.ax" as gb;
+import "csema.ax" as cs;
 import "ctypes.ax" as cty;
 
-fn B() *mut ir.Builder {
-    return cg.B;
-}
-
 // The IR integer type an atomic operation on objects of type t uses.
-fn int_ty(t: *cty.CType) *mut ir.Ty {
+fn gat_int_ty(t: *cty.CType) *mut ir.Ty {
     return ir.t_int(@truncate(i32, cty.size_of(t) * 8));
 }
 
 // Integer v as a value of C type t.
-fn from_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+fn gat_from_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if cty.is_pointer(t) {
-        return ir.inttoptr(B(), v);
+        return ir.inttoptr(B, v);
     }
     return v;
 }
 
 // v (of C type t: an integer or pointer) as an integer of t's width.
-fn as_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+fn gat_as_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if cty.is_pointer(t) {
-        return ir.ptrtoint(B(), v, int_ty(t));
+        return ir.ptrtoint(B, v, gat_int_ty(t));
     }
     return v;
 }
 
-// The plain operation `op` (an RMW_ number, or gb.OP_NAND) of integers x and y.
-fn apply(op: u64, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+// The plain operation `op` (an RMW_ number, or cs.OP_NAND) of integers x and y.
+fn gat_apply(op: u64, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     if op == @as(u64, @bit_cast(u32, ir.RMW_ADD)) {
-        return ir.add(B(), x, y);
+        return ir.add(B, x, y);
     }
     if op == @as(u64, @bit_cast(u32, ir.RMW_SUB)) {
-        return ir.sub(B(), x, y);
+        return ir.sub(B, x, y);
     }
     if op == @as(u64, @bit_cast(u32, ir.RMW_AND)) {
-        return ir.and_(B(), x, y);
+        return ir.and_(B, x, y);
     }
     if op == @as(u64, @bit_cast(u32, ir.RMW_OR)) {
-        return ir.or_(B(), x, y);
+        return ir.or_(B, x, y);
     }
     if op == @as(u64, @bit_cast(u32, ir.RMW_XOR)) {
-        return ir.xor(B(), x, y);
+        return ir.xor(B, x, y);
     }
-    return ir.xor(B(), ir.and_(B(), x, y), ir.cint(x.ty, 0xFFFF_FFFF_FFFF_FFFF));  // nand
+    return ir.xor(B, ir.and_(B, x, y), ir.cint(x.ty, 0xFFFF_FFFF_FFFF_FFFF));  // nand
 }
 
 // The atomic read-modify-write `op` of the object of type t at p with
 // integer v: the old value, as an integer.
-fn rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value, o: u32) *mut ir.Value {
-    if op != gb.OP_NAND {
-        return as_int(cga.fetch(t, @truncate(i32, @bit_cast(i64, op)), p, v, o), t);
+fn gat_rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value, o: u32) *mut ir.Value {
+    if op != cs.OP_NAND {
+        return gat_as_int(atomic_fetch(t, @truncate(i32, @bit_cast(i64, op)), p, v, o), t);
     }
-    let up = cga.update_begin(t, p, o);
-    let old = as_int(up.old, t);
-    cga.update_end(up, from_int(apply(op, old, v), t));
+    let up = atomic_update_begin(t, p, o);
+    let old = gat_as_int(up.old, t);
+    atomic_update_end(up, gat_from_int(gat_apply(op, old, v), t));
     return old;
 }
 
-/// The value of atomic builtin call e (e.op: gb.GB_ATOMIC + an A_ kind;
-/// e.cval: the RMW operation) with argument values vs.
-pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
-    let k = e.op - gb.GB_ATOMIC;
+// The value of atomic builtin call e (e.op: cs.GB_ATOMIC + an A_ kind;
+// e.cval: the RMW operation) with argument values vs.
+fn gat_gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    let k = e.op - cs.GB_ATOMIC;
     // (the orders follow the operands: csema_gbuiltin.ax's atomic_call)
     let sync = (e.a.kind == cast.ExprKind.IDENT) and u.starts(e.a.name, "__sync_");
     let mut n: usize = 1;
-    if (k == gb.A_FETCH_OP) or (k == gb.A_OP_FETCH) or (k == gb.A_XCHG) or (k == gb.A_STORE) or (k == gb.A_LOAD_G) or
-       (k == gb.A_STORE_G) {
+    if (k == cs.A_FETCH_OP) or (k == cs.A_OP_FETCH) or (k == cs.A_XCHG) or (k == cs.A_STORE) or (k == cs.A_LOAD_G) or
+       (k == cs.A_STORE_G) {
         n = 2;
-    } else if k == gb.A_XCHG_G {
+    } else if k == cs.A_XCHG_G {
         n = 3;
-    } else if (k == gb.A_CMPXCHG) or (k == gb.A_CMPXCHG_G) {
+    } else if (k == cs.A_CMPXCHG) or (k == cs.A_CMPXCHG_G) {
         n = 4;
-    } else if k == gb.A_FENCE {
+    } else if k == cs.A_FENCE {
         n = 0;
     }
     let mut o = ir.ORD_SEQ_CST;
     let mut fo = ir.ORD_SEQ_CST;
     if sync {
-        if k == gb.A_XCHG {
+        if k == cs.A_XCHG {
             o = ir.ORD_ACQUIRE;  // (__sync_lock_test_and_set)
-        } else if k == gb.A_RELEASE {
+        } else if k == cs.A_RELEASE {
             o = ir.ORD_RELEASE;
         }
     } else {
         if n < e.args.len {
-            o = cga.order_of(e.args.get(n));
+            o = atomic_order_of(e.args.get(n));
         }
         if n + 1 < e.args.len {
-            fo = cga.order_of(e.args.get(n + 1));
+            fo = atomic_order_of(e.args.get(n + 1));
         }
     }
-    if k == gb.A_FENCE {
-        cga.fence(o, not sync and u.ends(e.a.name, "signal_fence"));
+    if k == cs.A_FENCE {
+        atomic_fence(o, not sync and u.ends(e.a.name, "signal_fence"));
         return ir.vnil();
     }
     let p = vs[0];
     let t = cty.unqual(e.args.get(0).ty.elem);
-    let it = int_ty(t);
-    if (k == gb.A_FETCH_OP) or (k == gb.A_OP_FETCH) {
-        let v = resize(vs[1], it);
-        let old = rmw(e.cval, t, p, v, o);
-        if k == gb.A_FETCH_OP {
-            return from_int(old, t);
+    let it = gat_int_ty(t);
+    if (k == cs.A_FETCH_OP) or (k == cs.A_OP_FETCH) {
+        let v = gat_resize(vs[1], it);
+        let old = gat_rmw(e.cval, t, p, v, o);
+        if k == cs.A_FETCH_OP {
+            return gat_from_int(old, t);
         }
-        return from_int(apply(e.cval, old, v), t);
+        return gat_from_int(gat_apply(e.cval, old, v), t);
     }
-    if k == gb.A_XCHG {
-        return cga.exchange(t, vs[1], p, o);
+    if k == cs.A_XCHG {
+        return atomic_exchange(t, vs[1], p, o);
     }
-    if (k == gb.A_CAS_BOOL) or (k == gb.A_CAS_VAL) {
-        let old = cga.compare_exchange_value(t, p, vs[1], vs[2], o, o);
-        if k == gb.A_CAS_VAL {
+    if (k == cs.A_CAS_BOOL) or (k == cs.A_CAS_VAL) {
+        let old = atomic_compare_exchange_value(t, p, vs[1], vs[2], o, o);
+        if k == cs.A_CAS_VAL {
             return old;
         }
-        return ir.zext(B(), ir.icmp(B(), ir.IntEQ, as_int(old, t), as_int(vs[1], t)), cg.T_i8);
+        return ir.zext(B, ir.icmp(B, ir.IntEQ, gat_as_int(old, t), gat_as_int(vs[1], t)), T_i8);
     }
-    if k == gb.A_LOAD {
-        return cga.load(t, p, o);
+    if k == cs.A_LOAD {
+        return atomic_load(t, p, o);
     }
-    if k == gb.A_STORE {
-        cga.store(t, vs[1], p, o);
+    if k == cs.A_STORE {
+        atomic_store(t, vs[1], p, o);
         return ir.vnil();
     }
-    if k == gb.A_RELEASE {
-        cga.store(t, from_int(ir.cint(it, 0), t), p, o);
+    if k == cs.A_RELEASE {
+        atomic_store(t, gat_from_int(ir.cint(it, 0), t), p, o);
         return ir.vnil();
     }
-    if (k == gb.A_TEST_SET) or (k == gb.A_CLEAR) {
+    if (k == cs.A_TEST_SET) or (k == cs.A_CLEAR) {
         // (on the object's first byte, whatever its type)
         let flag = cty.t_uchar;
-        if k == gb.A_CLEAR {
-            cga.store(flag, ir.cint(cg.T_i8, 0), p, o);
+        if k == cs.A_CLEAR {
+            atomic_store(flag, ir.cint(T_i8, 0), p, o);
             return ir.vnil();
         }
-        let old = cga.exchange(flag, ir.cint(cg.T_i8, 1), p, o);
-        return ir.zext(B(), ir.icmp(B(), ir.IntNE, old, ir.cint(cg.T_i8, 0)), cg.T_i8);
+        let old = atomic_exchange(flag, ir.cint(T_i8, 1), p, o);
+        return ir.zext(B, ir.icmp(B, ir.IntNE, old, ir.cint(T_i8, 0)), T_i8);
     }
     // (a weak one: argument 3 a constant other than 0)
-    let weak = ((k == gb.A_CMPXCHG) or (k == gb.A_CMPXCHG_G)) and e.args.get(3).is_const and (e.args.get(3).cval != 0);
-    if k == gb.A_CMPXCHG {
+    let weak = ((k == cs.A_CMPXCHG) or (k == cs.A_CMPXCHG_G)) and e.args.get(3).is_const and (e.args.get(3).cval != 0);
+    if k == cs.A_CMPXCHG {
         // (*expected gets the value found)
-        return ir.zext(B(), cga.compare_exchange(t, p, vs[1], vs[2], o, fo, weak), cg.T_i8);
+        return ir.zext(B, atomic_compare_exchange(t, p, vs[1], vs[2], o, fo, weak), T_i8);
     }
     // the generic forms: values at addresses (objects of the same size)
-    if k == gb.A_LOAD_G {
-        cga.put_value(t, cga.load(t, p, o), vs[1]);
+    if k == cs.A_LOAD_G {
+        atomic_put_value(t, atomic_load(t, p, o), vs[1]);
         return ir.vnil();
     }
-    if k == gb.A_STORE_G {
-        cga.store(t, cga.value_at(t, vs[1]), p, o);
+    if k == cs.A_STORE_G {
+        atomic_store(t, atomic_value_at(t, vs[1]), p, o);
         return ir.vnil();
     }
-    if k == gb.A_XCHG_G {
-        cga.put_value(t, cga.exchange(t, cga.value_at(t, vs[1]), p, o), vs[2]);
+    if k == cs.A_XCHG_G {
+        atomic_put_value(t, atomic_exchange(t, atomic_value_at(t, vs[1]), p, o), vs[2]);
         return ir.vnil();
     }
     // A_CMPXCHG_G (p, expected *, desired *)
-    return ir.zext(B(), cga.compare_exchange(t, p, vs[1], cga.value_at(t, vs[2]), o, fo, weak), cg.T_i8);
+    return ir.zext(B, atomic_compare_exchange(t, p, vs[1], atomic_value_at(t, vs[2]), o, fo, weak), T_i8);
 }
 
-fn resize(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+fn gat_resize(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
     if v.ty.kind == ir.T_PTR {
-        return ir.ptrtoint(B(), v, t);
+        return ir.ptrtoint(B, v, t);
     }
     if v.ty.bits > t.bits {
-        return ir.trunc(B(), v, t);
+        return ir.trunc(B, v, t);
     }
     if v.ty.bits < t.bits {
-        return ir.sext(B(), v, t);
+        return ir.sext(B, v, t);
     }
     return v;
 }

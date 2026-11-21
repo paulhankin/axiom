@@ -1,0 +1,534 @@
+// =============================================================================
+// cparse_stmt.ax - C statement and GNU asm statement parsing, part of cparse.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "cpragma.ax" as cpg;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Statements
+// -----------------------------------------------------------------------------
+
+// `{ block-items }`, in a scope of its own if `new_scope` (not a function
+// body, which shares its parameters' scope).
+fn parse_compound(P: *mut Parser, new_scope: bool) *mut cast.Stmt {
+    let start = cur(P).span;
+    let s = cast.new_stmt(cast.StmtKind.COMPOUND, start);
+    if not expect_p(P, ct.P_LBRACE) {
+        sync(P);
+        return s;
+    }
+    if not enter(P) {
+        leave(P);
+        return s;
+    }
+    if new_scope {
+        push_scope(P);
+    }
+    // the floating-point pragmas hold to the end of the block (6.10.6p2;
+    // before any item, and here also between items)
+    let fp_outer = P.fp;
+    P.fp = cpg.fp_apply(P.fp, P.pos);
+    s.fp = P.fp;
+    if s.fp != 0 {
+        P.fp_any = true;
+    }
+    let mut seen_stmt: i32 = 0;
+    while not at_p(P, ct.P_RBRACE) and not at_eof(P) {
+        let before = P.pos;
+        P.fp = cpg.fp_apply(P.fp, P.pos);
+        let st = P.fp;
+        if st != 0 {
+            P.fp_any = true;
+        }
+        let it = parse_block_item(P, &mut seen_stmt);
+        if u.notnil(it) {
+            it.fp = st;
+            s.items.push(it);
+        }
+        if P.pos == before {
+            syntax(P, "a statement");
+            _ = advance(P);
+        }
+    }
+    if new_scope {
+        pop_scope(P);
+    }
+    P.fp = fp_outer;
+    leave(P);
+    _ = expect_p(P, ct.P_RBRACE);
+    s.span = span_from(P, start);
+    return s;
+}
+
+fn at_label(P: *mut Parser) bool {
+    if at_kw(P, ct.K_CASE) or at_kw(P, ct.K_DEFAULT) {
+        return true;
+    }
+    return (cur(P).kind == ct.T_IDENT) and is_p(peek(P, 1), ct.P_COLON);
+}
+
+fn decl_stmt(d: *mut cast.Decl) *mut cast.Stmt {
+    let s = cast.new_stmt(cast.StmtKind.DECL, d.span);
+    s.decl = d;
+    return s;
+}
+
+// A block item: a declaration, a statement, or (C23) a label.
+// seen_stmt: 0, 1 once a statement is seen, 2 once a declaration after one is reported.
+fn parse_block_item(P: *mut Parser, seen_stmt: *mut i32) *mut cast.Stmt {
+    let start = cur(P).span;
+    let mut attrs = u.List.[*mut cast.Attr].empty();
+    parse_attrs_g(P, &mut attrs);
+    unknown_type_name(P);
+    if not at_label(P) and (starts_decl(P) or ((attrs.len > 0) and at_p(P, ct.P_SEMI))) {
+        if seen_stmt.* == 1 {
+            // (once a block)
+            feature(P, co.C99, cur(P).span, "C2106", "mixed declarations and code are");
+            seen_stmt.* = 2;
+        }
+        let d = parse_declaration_after(P, CTX_BLOCK, attrs, start);
+        if u.isnil(d) {
+            return u.nil.[cast.Stmt]();
+        }
+        return decl_stmt(d);
+    }
+    if not at_label(P) and (seen_stmt.* == 0) {
+        seen_stmt.* = 1;
+    }
+    return parse_statement_after(P, attrs, start, true);
+}
+
+// A statement (where only a statement may be: not a declaration).
+fn parse_statement(P: *mut Parser) *mut cast.Stmt {
+    let start = cur(P).span;
+    let mut attrs = u.List.[*mut cast.Attr].empty();
+    parse_attrs_g(P, &mut attrs);
+    return parse_statement_after(P, attrs, start, false);
+}
+
+// The body of if, switch, while, do and for: a statement, in a scope of its
+// own from C99 on.
+fn parse_secondary(P: *mut Parser) *mut cast.Stmt {
+    if P.std >= co.C99 {
+        push_scope(P);
+    }
+    let s = parse_statement(P);
+    if P.std >= co.C99 {
+        pop_scope(P);
+    }
+    return s;
+}
+
+fn parse_paren_expr(P: *mut Parser) *mut cast.Expr {
+    if not expect_p(P, ct.P_LPAREN) {
+        return error_expr(P);
+    }
+    let e = parse_expr(P);
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    return e;
+}
+
+fn end_stmt(P: *mut Parser, s: *mut cast.Stmt, start: u.Span) *mut cast.Stmt {
+    if not expect_p(P, ct.P_SEMI) {
+        sync(P);
+    }
+    s.span = span_from(P, start);
+    return s;
+}
+
+fn parse_statement_after(P: *mut Parser, attrs: u.List.[*mut cast.Attr], start: u.Span, in_block: bool) *mut cast.Stmt {
+    if not enter(P) {
+        leave(P);
+        return cast.new_stmt(cast.StmtKind.EXPR, start);
+    }
+    let s = statement_body(P, start, in_block);
+    if attrs.len > 0 {
+        s.attrs = attrs;
+    }
+    leave(P);
+    return s;
+}
+
+fn statement_body(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt {
+    let t = cur(P);
+    let hints = cpg.loop_hints_at(P.pos);  // (#pragma GCC unroll, ivdep, novector)
+    if at_label(P) {
+        return parse_labeled(P, start, in_block);
+    }
+    if starts_decl(P) {
+        error_at(t.span, "C2011", "a declaration cannot be the body of a statement: put it in braces");
+        let d = parse_declaration(P, CTX_BLOCK);
+        if u.isnil(d) {
+            return cast.new_stmt(cast.StmtKind.EXPR, start);
+        }
+        return decl_stmt(d);
+    }
+    if is_p(t, ct.P_LBRACE) {
+        return parse_compound(P, true);
+    }
+    if is_p(t, ct.P_SEMI) {
+        _ = advance(P);
+        return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
+    }
+    if at_kw(P, ct.K_ASM) {
+        let a = asm_statement(P);
+        if u.isnil(a) {
+            return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
+        }
+        let s = cast.new_stmt(cast.StmtKind.ASM, span_from(P, start));
+        s.asm = a;
+        return s;
+    }
+    if t.kind == ct.T_KEYWORD {
+        let id = t.id;
+        if id == ct.K_IF {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.IF, start);
+            if P.std >= co.C99 {
+                push_scope(P);
+            }
+            s.e = parse_paren_expr(P);
+            s.body = parse_secondary(P);
+            if at_kw(P, ct.K_ELSE) {
+                _ = advance(P);
+                s.els = parse_secondary(P);
+            }
+            if P.std >= co.C99 {
+                pop_scope(P);
+            }
+            s.span = span_from(P, start);
+            return s;
+        }
+        if (id == ct.K_SWITCH) or (id == ct.K_WHILE) {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.SWITCH, start);
+            if id == ct.K_WHILE {
+                s.kind = cast.StmtKind.WHILE;
+                s.hints = hints;
+            }
+            if P.std >= co.C99 {
+                push_scope(P);
+            }
+            s.e = parse_paren_expr(P);
+            s.body = parse_secondary(P);
+            if P.std >= co.C99 {
+                pop_scope(P);
+            }
+            s.span = span_from(P, start);
+            return s;
+        }
+        if id == ct.K_DO {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.DO, start);
+            s.hints = hints;
+            s.body = parse_secondary(P);
+            if at_kw(P, ct.K_WHILE) {
+                _ = advance(P);
+                s.e = parse_paren_expr(P);
+            } else {
+                syntax(P, "'while'");
+                s.e = error_expr(P);
+            }
+            return end_stmt(P, s, start);
+        }
+        if id == ct.K_FOR {
+            let s = parse_for(P, start);
+            s.hints = hints;
+            return s;
+        }
+        if id == ct.K_GOTO {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.GOTO, start);
+            s.label = "";
+            let x = cur(P);
+            if P.gnu and is_p(x, ct.P_STAR) {
+                // `goto *expression;` (a GNU dialect)
+                _ = advance(P);
+                s.e = parse_expr(P);
+                return end_stmt(P, s, start);
+            }
+            if x.kind == ct.T_IDENT {
+                _ = advance(P);
+                s.label = x.text;
+                s.label_span = x.span;
+            } else {
+                syntax(P, "a label");
+            }
+            return end_stmt(P, s, start);
+        }
+        if (id == ct.K_CONTINUE) or (id == ct.K_BREAK) {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.CONTINUE, start);
+            if id == ct.K_BREAK {
+                s.kind = cast.StmtKind.BREAK;
+            }
+            return end_stmt(P, s, start);
+        }
+        if id == ct.K_RETURN {
+            _ = advance(P);
+            let s = cast.new_stmt(cast.StmtKind.RETURN, start);
+            if not at_p(P, ct.P_SEMI) {
+                s.e = parse_expr(P);
+            }
+            return end_stmt(P, s, start);
+        }
+    }
+    let s = cast.new_stmt(cast.StmtKind.EXPR, start);
+    let before = P.pos;
+    s.e = parse_expr(P);
+    if P.pos == before {
+        // nothing taken: no expression here (reported)
+        sync(P);
+        s.span = span_from(P, start);
+        return s;
+    }
+    return end_stmt(P, s, start);
+}
+
+// `label:`, `case e:` or `default:`, and the statement after it. In a block
+// (C23) a label may also stand before a declaration or the '}'.
+fn parse_labeled(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt {
+    let t = advance(P);
+    let s = cast.new_stmt(cast.StmtKind.LABEL, start);
+    if (t.kind == ct.T_KEYWORD) and (t.id == ct.K_CASE) {
+        s.kind = cast.StmtKind.CASE;
+        s.e = parse_cond(P);
+        if P.gnu and accept_p(P, ct.P_ELLIPSIS) {
+            // `case low ... high:` (a GNU dialect)
+            s.hi = parse_cond(P);
+        }
+    } else if t.kind == ct.T_KEYWORD {
+        s.kind = cast.StmtKind.DEFAULT;
+    } else {
+        s.label = t.text;
+        s.label_span = t.span;
+    }
+    if not expect_p(P, ct.P_COLON) {
+        sync(P);
+        s.span = span_from(P, start);
+        return s;
+    }
+    let head = span_from(P, start);
+    if (s.kind == cast.StmtKind.LABEL) and at_kw(P, ct.K_ATTRIBUTE) {
+        // (a GNU dialect: `label: __attribute__((unused))` appertain to the label)
+        parse_gnu_attrs(P, &mut s.attrs);
+    }
+    // (attributes after the label appertain to what follows it)
+    let k = attrs_ahead(P);
+    let nx = peek(P, k);
+    let at_end = (k == 0) and is_p(nx, ct.P_RBRACE);
+    let label_next = (nx.kind == ct.T_IDENT) and is_p(peek(P, k + 1), ct.P_COLON);
+    if at_end or (in_block and not label_next and (starts_decl_at(P, k) or ((k > 0) and is_p(nx, ct.P_SEMI)))) {
+        // a label with no statement: a block item of its own (C23); what
+        // follows is the next block item
+        feature(P, co.C23, head, "C2138", u.pick(at_end, "a label at the end of a block is",
+                                                 "a label before a declaration is"));
+        s.span = head;
+        return s;
+    }
+    let bstart = cur(P).span;
+    let mut attrs = u.List.[*mut cast.Attr].empty();
+    parse_attrs_g(P, &mut attrs);
+    s.body = parse_statement_after(P, attrs, bstart, in_block);
+    s.span = span_from(P, start);
+    return s;
+}
+
+fn parse_for(P: *mut Parser, start: u.Span) *mut cast.Stmt {
+    _ = advance(P);
+    let s = cast.new_stmt(cast.StmtKind.FOR, start);
+    push_scope(P);
+    if expect_p(P, ct.P_LPAREN) {
+        if starts_decl(P) or at_attr(P) {
+            feature(P, co.C99, cur(P).span, "C2107", "declarations in 'for' are");
+            s.decl = parse_declaration(P, CTX_FOR);
+        } else {
+            if not at_p(P, ct.P_SEMI) {
+                s.first = parse_expr(P);
+            }
+            _ = expect_p(P, ct.P_SEMI);
+        }
+        if not at_p(P, ct.P_SEMI) {
+            s.e = parse_expr(P);
+        }
+        _ = expect_p(P, ct.P_SEMI);
+        if not at_p(P, ct.P_RPAREN) {
+            s.step = parse_expr(P);
+        }
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+    }
+    s.body = parse_secondary(P);
+    pop_scope(P);
+    s.span = span_from(P, start);
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// GNU asm statements
+// -----------------------------------------------------------------------------
+// A string literal without an encoding prefix (an asm template, constraint
+// or clobber), as bytes; syntax error if there is none.
+fn asm_string(P: *mut Parser, what: []u8, out: *mut []u8, sp: *mut u.Span) bool {
+    let t = cur(P);
+    if (t.kind != ct.T_STRING) or (t.prefix != ct.ENC_NONE) {
+        syntax(P, what);
+        return false;
+    }
+    _ = advance(P);
+    let mut b = u.Buf.init();
+    for x in t.units {
+        b.c(@truncate(u8, x));
+    }
+    out.* = b.done();
+    sp.* = t.span;
+    return true;
+}
+
+// The next ':' of an asm statement: a C23 '::' is two of them (the second
+// left in place, as `kept`).
+fn asm_colon(P: *mut Parser, kept: *mut bool) bool {
+    if kept.* {
+        kept.* = false;
+        return true;
+    }
+    if at_p(P, ct.P_COLONCOLON) {
+        _ = advance(P);
+        kept.* = true;
+        return true;
+    }
+    return accept_p(P, ct.P_COLON);
+}
+
+// Is the next token where an asm statement's section ends (':' or ')')?
+fn asm_section_end(P: *mut Parser, kept: bool) bool {
+    return kept or at_p(P, ct.P_COLON) or at_p(P, ct.P_COLONCOLON) or at_p(P, ct.P_RPAREN);
+}
+
+// The operands of one section of an extended asm: `[name] "constraint" (e)`, ...
+fn asm_operands(P: *mut Parser, out: *mut u.List.[*mut cast.AsmOperand], kept: bool) void {
+    if asm_section_end(P, kept) {
+        return;
+    }
+    loop {
+        let o = u.new.[cast.AsmOperand]();
+        o.span = cur(P).span;
+        if accept_p(P, ct.P_LBRACKET) {
+            let t = cur(P);
+            if (t.kind == ct.T_IDENT) or (t.kind == ct.T_KEYWORD) {
+                o.name = t.text;
+                _ = advance(P);
+            } else {
+                syntax(P, "an operand name");
+            }
+            _ = expect_p(P, ct.P_RBRACKET);
+        }
+        if not asm_string(P, "a string literal (the operand's constraint)", &mut o.constraint, &mut o.cspan) {
+            return;
+        }
+        if not expect_p(P, ct.P_LPAREN) {
+            return;
+        }
+        o.e = parse_expr(P);
+        if not expect_p(P, ct.P_RPAREN) {
+            return;
+        }
+        o.span = span_from(P, o.span);
+        out.push(o);
+        if not accept_p(P, ct.P_COMMA) {
+            return;
+        }
+    }
+}
+
+// An `asm` statement or file-scope `asm(...)` (a GNU dialect), from `asm`
+// to its ';': `asm qualifiers ( template [: outputs [: inputs [: clobbers
+// [: labels]]]] )`. Nil after a syntax error (reported; skipped to ';').
+fn asm_statement(P: *mut Parser) *mut cast.Asm {
+    let sp = advance(P).span;
+    let a = u.new.[cast.Asm]();
+    a.span = sp;
+    loop {
+        if at_kw(P, ct.K_VOLATILE) {
+            a.volatile_ = true;
+        } else if at_kw(P, ct.K_INLINE) {
+            a.inline_ = true;
+        } else if at_kw(P, ct.K_GOTO) {
+            a.goto_ = true;
+        } else {
+            break;
+        }
+        _ = advance(P);
+    }
+    let mut ok = expect_p(P, ct.P_LPAREN) and
+                 asm_string(P, "a string literal (the assembly template)", &mut a.tmpl, &mut a.tspan);
+    a.basic = true;
+    let mut kept = false;
+    let mut section: i32 = 0;
+    while ok and (section < 4) and asm_colon(P, &mut kept) {
+        a.basic = false;
+        section += 1;
+        if section == 1 {
+            asm_operands(P, &mut a.outputs, kept);
+        } else if section == 2 {
+            asm_operands(P, &mut a.inputs, kept);
+        } else {
+            if asm_section_end(P, kept) {
+                continue;
+            }
+            loop {
+                let n = u.new.[cast.AsmName]();
+                if section == 3 {
+                    let mut nsp = cur(P).span;
+                    if not asm_string(P, "a string literal (a clobbered register)", &mut n.name, &mut nsp) {
+                        ok = false;
+                        break;
+                    }
+                    n.span = nsp;
+                    a.clobbers.push(n);
+                } else {
+                    let t = cur(P);
+                    if t.kind != ct.T_IDENT {
+                        syntax(P, "a label");
+                        ok = false;
+                        break;
+                    }
+                    _ = advance(P);
+                    n.name = t.text;
+                    n.span = t.span;
+                    a.labels.push(n);
+                }
+                if not accept_p(P, ct.P_COMMA) {
+                    break;
+                }
+            }
+        }
+    }
+    if ok and kept {
+        syntax(P, "')'");
+        ok = false;
+    }
+    if ok and not expect_p(P, ct.P_RPAREN) {
+        ok = false;
+    }
+    if not ok {
+        skip_to_rparen(P);
+        _ = accept_p(P, ct.P_RPAREN);
+        _ = expect_p(P, ct.P_SEMI);
+        return u.nil.[cast.Asm]();
+    }
+    a.span = span_from(P, sp);
+    if a.goto_ and (section < 4) {
+        error_at(a.span, "C2001", "'asm goto' needs a list of labels after a fourth ':'");
+    } else if not a.goto_ and (section == 4) {
+        error_at(a.span, "C2001", "only 'asm goto' has a list of labels");
+    }
+    _ = expect_p(P, ct.P_SEMI);
+    return a;
+}

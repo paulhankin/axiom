@@ -1,0 +1,508 @@
+// =============================================================================
+// cpp_directives.ax - conditional inclusion, GNU assertions, #line, and
+// preprocessing directive dispatch, part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "cpp_conv.ax" as cv;
+import "cpp_expr.ax" as ce;
+import "cpp_lex.ax" as lx;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Conditional inclusion
+// -----------------------------------------------------------------------------
+fn top_cond(P: *mut PP) *mut Cond {
+    return P.conds.at_mut(P.conds.len - 1);
+}
+
+fn in_file_conds(P: *mut PP) bool {
+    return P.conds.len > cur_src(P).cond_base;
+}
+
+// The tokens, macros replaced as in #if (defined an operator), and a PK_EOF.
+fn if_tokens(P: *mut PP, line: []lx.PTok, sp: u.Span) []lx.PTok {
+    P.in_if = true;
+    let ts = expand_list(P, line);
+    P.in_if = false;
+    let mut l = tok_list();
+    for k in 0..ts.len {
+        l.push(ts[k]);
+    }
+    return with_eof(P, &mut l, sp);
+}
+
+// The value of an #if or #elif line.
+fn if_value(P: *mut PP, line: []lx.PTok, sp: u.Span) bool {
+    if P.o.gnu {
+        return ce.eval(if_tokens(P, assertion_tests(P, line), sp), P.o, sp);
+    }
+    return ce.eval(if_tokens(P, line, sp), P.o, sp);
+}
+
+// -----------------------------------------------------------------------------
+// Assertions (a GNU dialect): `#assert pred(answer)` gives predicate pred the
+// answer, `#unassert pred(answer)` takes it back (`#unassert pred`: every
+// answer), and in an #if expression `#pred(answer)` is 1 if pred has that
+// answer, `#pred` 1 if it has any, else 0 (before macro replacement: the
+// predicate and the answer are not expanded). An answer is its tokens, compared
+// one by one, whatever whitespace is between them. The predicates cpu and
+// machine have the target's architecture (x86_64, aarch64, wasm32) and, on
+// Linux, system has linux, unix and posix.
+// -----------------------------------------------------------------------------
+
+// The tokens of an answer as one string: their spellings, one space between.
+fn answer_key(ts: []lx.PTok) []u8 {
+    let mut b = u.Buf.init();
+    for k in 0..ts.len {
+        if k > 0 {
+            b.c(' ');
+        }
+        b.s(ts[k].text);
+    }
+    return u.intern(b.done());
+}
+
+// A predicate and its answer (if it has one) at ts[i..]: next, the index
+// after them; ok false after an error (reported).
+struct Pred {
+    ok: bool,
+    name: []u8,
+    answer: []u8,
+    has_answer: bool,
+    next: usize,
+}
+
+fn parse_pred(ts: []lx.PTok, i0: usize, sp: u.Span, what: []u8) Pred {
+    let mut r = Pred.{ ok: false, name: "", answer: "", has_answer: false, next: i0 };
+    let mut i = i0;
+    if (i >= ts.len) or (ts[i].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1087", u.f1("%s needs a predicate (an identifier)", what));
+        return r;
+    }
+    r.name = ts[i].name;
+    i += 1;
+    if (i < ts.len) and lx.is_punct(&ts[i], ct.P_LPAREN) {
+        let start = i + 1;
+        let mut depth: i32 = 1;
+        let mut j = start;
+        while j < ts.len {
+            if lx.is_punct(&ts[j], ct.P_LPAREN) {
+                depth += 1;
+            } else if lx.is_punct(&ts[j], ct.P_RPAREN) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if j >= ts.len {
+            _ = dg.err(ts[i].span, "C1087", u.f2("missing ')' after the answer of '%s' in %s", r.name, what));
+            return r;
+        }
+        if j == start {
+            _ = dg.err(ts[i].span, "C1087", u.f2("the answer of '%s' in %s is empty", r.name, what));
+            return r;
+        }
+        r.answer = answer_key(ts[start..j]);
+        r.has_answer = true;
+        i = j + 1;
+    }
+    r.ok = true;
+    r.next = i;
+    return r;
+}
+
+fn answers_of(P: *mut PP, name0: []u8) *mut u.List.[[]u8] {
+    let name = u.intern(name0);  // (the map's keys are interned strings)
+    let mut l = P.asserts.get(name);
+    if u.isnil(l) {
+        l = u.new.[u.List.[[]u8]]();
+        P.asserts.put(name, l);
+    }
+    return l;
+}
+
+fn do_assert(P: *mut PP, ts: []lx.PTok, sp: u.Span) void {
+    let p = parse_pred(ts, 0, sp, "#assert");
+    if not p.ok {
+        return;
+    }
+    if not p.has_answer {
+        _ = dg.err(sp, "C1087", u.f1("#assert needs an answer: #assert %s(answer)", p.name));
+        return;
+    }
+    extra(ts, p.next, "assert");
+    add_answer(P, p.name, p.answer);
+}
+
+fn add_answer(P: *mut PP, name: []u8, answer: []u8) void {
+    let l = answers_of(P, name);
+    for a in l.items() {
+        if u.str_eq(a, answer) {
+            return;
+        }
+    }
+    l.push(answer);
+}
+
+fn do_unassert(P: *mut PP, ts: []lx.PTok, sp: u.Span) void {
+    let p = parse_pred(ts, 0, sp, "#unassert");
+    if not p.ok {
+        return;
+    }
+    extra(ts, p.next, "unassert");
+    let l = answers_of(P, p.name);
+    if not p.has_answer {
+        l.clear();
+        return;
+    }
+    let mut k: usize = 0;
+    while k < l.len {
+        if u.str_eq(l.get(k), p.answer) {
+            l.set(k, l.get(l.len - 1));
+            _ = l.pop();
+            continue;
+        }
+        k += 1;
+    }
+}
+
+// line (an #if's) with each assertion test (`#pred(answer)`, `#pred`) its value.
+fn assertion_tests(P: *mut PP, line: []lx.PTok) []lx.PTok {
+    let mut has = false;
+    for t in line {
+        if lx.is_punct(&t, lx.PP_HASH) {
+            has = true;
+        }
+    }
+    if not has {
+        return line;
+    }
+    let mut out = u.List.[lx.PTok].empty();
+    let mut i: usize = 0;
+    while i < line.len {
+        let t = line[i];
+        if lx.is_punct(&t, lx.PP_HASH) and ((i + 1) < line.len) and (line[i + 1].kind == lx.PK_IDENT) {
+            let p = parse_pred(line, i + 1, t.span, "an assertion test");
+            if not p.ok {
+                out.push(number_tok(0, t.span));
+                i = line.len;
+                continue;
+            }
+            let l = P.asserts.get(u.intern(p.name));
+            let mut v: i64 = 0;
+            if u.notnil(l) {
+                for a in l.items() {
+                    if not p.has_answer or u.str_eq(a, p.answer) {
+                        v = 1;
+                    }
+                }
+            }
+            out.push(number_tok(v, t.span));
+            i = p.next;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    return out.items();
+}
+
+// The target's assertions (cpu, machine, system: a GNU dialect).
+fn target_assertions(P: *mut PP) void {
+    let mut arch = "wasm32";
+    if tg.g_arch == tg.ARCH_X64 {
+        arch = "x86_64";
+    } else if tg.g_arch == tg.ARCH_A64 {
+        arch = "aarch64";
+    }
+    add_answer(P, "cpu", arch);
+    add_answer(P, "machine", arch);
+    if not tg.is_wasm() and (tg.g_os == tg.OS_LINUX) {
+        add_answer(P, "system", "linux");
+        add_answer(P, "system", "unix");
+        add_answer(P, "system", "posix");
+    }
+}
+
+// The identifier of #ifdef, #ifndef, #elifdef and #elifndef: whether it
+// is defined.
+fn ifdef_value(P: *mut PP, line: []lx.PTok, sp: u.Span, what: []u8) bool {
+    if (line.len == 0) or (line[0].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1052", u.f1("macro names must be identifiers, after #%s", what));
+        return false;
+    }
+    extra(line, 1, what);
+    return u.notnil(lookup(P, line[0].name));
+}
+
+// Checks that nothing follows #else or #endif (when its conditional is
+// live), or skips the rest of the line.
+fn end_line(P: *mut PP, c: *Cond, what: []u8) void {
+    let L = cur_src(P).L;
+    if c.dead {
+        lx.skip_line(L);
+        return;
+    }
+    L.quiet = false;
+    let mut line = line_tokens(P);
+    extra(line.items(), 0, what);
+    line.deinit();
+}
+
+// A conditional directive, in a group processed or skipped: true if it was one.
+fn conditional(P: *mut PP, name: []u8, nt: *lx.PTok) bool {
+    let std = P.o.std;
+    let L = cur_src(P).L;
+    let skipping = in_file_conds(P) and not top_cond(P).active;
+    let is_if = u.str_eq(name, "if") or u.str_eq(name, "ifdef") or u.str_eq(name, "ifndef");
+    let is_elif = u.str_eq(name, "elif") or
+                  ((std >= co.C23) and (u.str_eq(name, "elifdef") or u.str_eq(name, "elifndef")));
+    if is_if {
+        if skipping {
+            lx.skip_line(L);
+            P.conds.push(Cond.{ active: false, taken: true, seen_else: false, dead: true, span: nt.span });
+            return true;
+        }
+        let mut line = line_tokens(P);
+        let mut v = false;
+        if u.str_eq(name, "if") {
+            v = if_value(P, line.items(), nt.span);
+        } else {
+            v = ifdef_value(P, line.items(), nt.span, name);
+            if u.str_eq(name, "ifndef") {
+                v = not v;
+            }
+        }
+        line.deinit();
+        P.conds.push(Cond.{ active: v, taken: v, seen_else: false, dead: false, span: nt.span });
+        return true;
+    }
+    if not is_elif and not u.str_eq(name, "else") and not u.str_eq(name, "endif") {
+        return false;
+    }
+    if not in_file_conds(P) {
+        _ = dg.err(nt.span, "C1071", u.f1("#%s without #if", name));
+        lx.skip_line(L);
+        return true;
+    }
+    let c = top_cond(P);
+    if u.str_eq(name, "endif") {
+        end_line(P, c, name);
+        _ = P.conds.pop();
+        return true;
+    }
+    if c.seen_else and not c.dead {
+        _ = dg.err(nt.span, "C1072", u.f1("#%s after #else", name));
+    }
+    if u.str_eq(name, "else") {
+        c.seen_else = true;
+        end_line(P, c, name);
+        c.active = not c.taken and not c.dead;
+        c.taken = true;
+        return true;
+    }
+    // #elif, #elifdef, #elifndef: evaluated if no group has been taken
+    if c.taken or c.dead {
+        lx.skip_line(L);
+        c.active = false;
+        return true;
+    }
+    L.quiet = false;
+    let mut line = line_tokens(P);
+    let mut v = false;
+    if u.str_eq(name, "elif") {
+        v = if_value(P, line.items(), nt.span);
+    } else {
+        v = ifdef_value(P, line.items(), nt.span, name);
+        if u.str_eq(name, "elifndef") {
+            v = not v;
+        }
+    }
+    line.deinit();
+    c.active = v;
+    c.taken = v;
+    return true;
+}
+
+// Skips groups until one is processed (or the file ends).
+fn skip_groups(P: *mut PP) void {
+    let L = cur_src(P).L;
+    while in_file_conds(P) and not top_cond(P).active {
+        L.quiet = true;
+        let t = lx.next(L);
+        if t.kind == lx.PK_EOF {
+            L.has_la = true;
+            L.la = t;
+            break;
+        }
+        if not t.bol or not lx.is_punct(&t, lx.PP_HASH) {
+            lx.skip_line(L);
+            continue;
+        }
+        if lx.at_eol(L) or (lx.peek(L).kind != lx.PK_IDENT) {
+            lx.skip_line(L);
+            continue;
+        }
+        let nt = lx.next(L);
+        if not conditional(P, nt.name, &nt) {
+            lx.skip_line(L);
+        }
+    }
+    L.quiet = false;
+}
+
+// -----------------------------------------------------------------------------
+// #line, the others
+// -----------------------------------------------------------------------------
+fn do_line(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
+    let mut ts = line;
+    if (ts.len == 0) or (ts[0].kind != lx.PK_NUMBER) or not all_digits(ts[0].text) {
+        ts = expand_list(P, line);
+    }
+    if (ts.len == 0) or (ts[0].kind != lx.PK_NUMBER) or not all_digits(ts[0].text) {
+        _ = dg.err(sp, "C1085", "#line requires a positive decimal line number");
+        return;
+    }
+    let mut v: i64 = 0;
+    for c in ts[0].text {
+        if v < 10000000000 {
+            v = (v * 10) + @as(i64, c - '0');
+        }
+    }
+    let mut lim: i64 = 2147483647;
+    if P.o.std < co.C99 {
+        lim = 32767;
+    }
+    if (v == 0) or (v > lim) {
+        _ = dg.err(ts[0].span, "C1085", u.f1("line number %s is out of range", ts[0].text));
+        return;
+    }
+    let s = cur_src(P);
+    if ts.len >= 2 {
+        let f = &ts[1];
+        if (f.kind != lx.PK_STRING) or (f.id != ct.ENC_NONE) {
+            _ = dg.err(f.span, "C1085", "the file name of #line must be a character string literal");
+            return;
+        }
+        extra(ts, 2, "line");
+        // (the name's escape sequences are its characters)
+        let mut units = u.List.[u32].empty();
+        _ = cv.decode(f.text[1..f.text.len - 1], ct.ENC_NONE, P.o, f.span, &mut units, false);
+        let mut b = u.Buf.init();
+        for x in units.items() {
+            b.c(@truncate(u8, x));
+        }
+        units.deinit();
+        s.presumed = b.done();
+    }
+    // the line after the directive's
+    let next = lx.line_at(s.L, s.L.eol) + 1;
+    s.line_delta = v - next;
+    // (diagnostics show the presumed position too)
+    u.mark_lines(s.L.sf.id, @int_cast(i32, next), s.line_delta, s.presumed);
+}
+
+fn directive(P: *mut PP, hash: lx.PTok) void {
+    let s = cur_src(P);
+    let L = s.L;
+    if lx.at_eol(L) {
+        // the null directive
+        return;
+    }
+    let nt = lx.next(L);
+    let std = P.o.std;
+    if P.asm_ and ((nt.kind != lx.PK_IDENT) or not known_directive(nt.name)) {
+        lx.skip_line(L);  // (assembly: a comment, as the assembler reads `#` at a line's start)
+        return;
+    }
+    if (nt.kind == lx.PK_NUMBER) and P.o.gnu and all_digits(nt.text) and not P.asm_ {
+        // a GNU dialect's line marker, `# 12 "file" 1 3` (preprocessed
+        // text's, --emit=c-pp --c-line-markers): #line 12 "file", its flags
+        // ignored; line 0 (before the first line of a file) changes nothing
+        let rest = line_tokens(P);
+        let mut ts = tok_list();
+        ts.push(nt);
+        if (rest.len > 0) and (rest.get(0).kind == lx.PK_STRING) {
+            ts.push(rest.get(0));
+        }
+        let zero = (nt.text.len == 1) and (nt.text[0] == '0');
+        if not zero {
+            do_line(P, ts.items(), u.span_join(hash.span, nt.span));
+        }
+        return;
+    }
+    if nt.kind != lx.PK_IDENT {
+        _ = dg.err(nt.span, "C1041", u.f1("invalid preprocessing directive '#%s'", nt.text));
+        lx.skip_line(L);
+        return;
+    }
+    let name = nt.name;
+    if conditional(P, name, &nt) {
+        skip_groups(P);
+        return;
+    }
+    let mut line = line_tokens(P);
+    let ts = line.items();
+    let sp = u.span_join(hash.span, nt.span);
+    if u.str_eq(name, "define") {
+        do_define(P, ts, sp);
+    } else if u.str_eq(name, "undef") {
+        do_undef(P, ts, sp);
+    } else if u.str_eq(name, "include") {
+        do_include(P, ts, sp, false);
+    } else if u.str_eq(name, "include_next") and (P.o.gnu or in_compiler_header(P) or in_system_header(P)) {
+        do_include(P, ts, sp, true);
+    } else if u.str_eq(name, "import") and P.o.gnu {
+        // (a GNU dialect's: #include of a file not read again after it, as
+        // with #pragma once in it)
+        P.importing = true;
+        do_include(P, ts, sp, false);
+        P.importing = false;
+    } else if u.str_eq(name, "line") {
+        do_line(P, ts, sp);
+    } else if u.str_eq(name, "error") {
+        _ = dg.err(sp, "C1040", u.cat2("#error ", spelling(ts)));
+    } else if u.str_eq(name, "warning") and ((std >= co.C23) or P.o.gnu or in_system_header(P)) {
+        _ = dg.warning(sp, "C4103", u.cat2("#warning ", spelling(ts)));
+    } else if u.str_eq(name, "assert") and P.o.gnu {
+        do_assert(P, ts, sp);
+    } else if u.str_eq(name, "unassert") and P.o.gnu {
+        do_unassert(P, ts, sp);
+    } else if u.str_eq(name, "ident") and P.o.gnu {
+        // (a GNU dialect's #ident "text": the text is not kept)
+        if (ts.len != 1) or (ts[0].kind != lx.PK_STRING) {
+            _ = dg.err(sp, "C1041", "#ident takes a string literal");
+        }
+    } else if u.str_eq(name, "pragma") {
+        let pt = do_pragma(P, ts, sp);
+        if pt.kind == lx.PK_PRAGMA {
+            let one = u.newn.[lx.PTok](1);
+            one[0] = pt;
+            P.inject = one;
+            P.inject_pos = 0;
+        }
+    } else if u.str_eq(name, "embed") and (std >= co.C23) {
+        do_embed(P, ts, sp);
+    } else {
+        _ = dg.err(nt.span, "C1041", u.f1("invalid preprocessing directive '#%s'", nt.text));
+    }
+    line.deinit();
+}
+
+// Is `name` a directive of the preprocessor (assembly: any other line
+// starting with `#` is a comment)?
+fn known_directive(name: []u8) bool {
+    let ds = ["define", "undef", "include", "include_next", "import", "line", "error", "warning", "ident", "pragma",
+              "embed", "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif", "assert", "unassert"];
+    for d in ds {
+        if u.str_eq(name, d) {
+            return true;
+        }
+    }
+    return false;
+}

@@ -1,0 +1,572 @@
+// =============================================================================
+// cpp_expand.ax - token contexts, file token reading, and macro replacement
+// (C 6.10.3), part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "cpp_lex.ax" as lx;
+import "cpragma.ax" as cp;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Reading tokens: contexts, then the file
+// -----------------------------------------------------------------------------
+fn push_ctx(P: *mut PP, toks: []lx.PTok, m: *mut Macro) void {
+    P.ctx.push(Ctx.{ toks: toks, pos: 0, mac: m });
+    if u.notnil(m) {
+        m.disabled = true;
+    }
+}
+
+fn pop_ctx(P: *mut PP) void {
+    let c = P.ctx.pop();
+    if u.notnil(c.mac) {
+        c.mac.disabled = false;
+    }
+}
+
+// The next token, unreplaced: from the contexts, else (not in a list) from
+// the file, its directives done.
+fn raw_next(P: *mut PP) lx.PTok {
+    if P.fatal {
+        while P.ctx.len > P.floor {
+            pop_ctx(P);
+        }
+        return P.eof_tok;
+    }
+    loop {
+        if P.ctx.len > P.floor {
+            let c = P.ctx.at_mut(P.ctx.len - 1);
+            if c.pos < c.toks.len {
+                let t = c.toks[c.pos];
+                c.pos += 1;
+                return t;
+            }
+            if P.list_mode and ((P.ctx.len - 1) == P.floor) {
+                return P.eof_tok;
+            }
+            pop_ctx(P);
+            continue;
+        }
+        if P.list_mode {
+            return P.eof_tok;
+        }
+        return file_next(P);
+    }
+}
+
+// Whether the next token is `(` (it is left to be read). Contexts left on
+// the way are left for good.
+fn next_is_lparen(P: *mut PP) bool {
+    loop {
+        if P.ctx.len > P.floor {
+            let c = P.ctx.at_mut(P.ctx.len - 1);
+            if c.pos < c.toks.len {
+                return lx.is_punct(&c.toks[c.pos], ct.P_LPAREN);
+            }
+            if P.list_mode and ((P.ctx.len - 1) == P.floor) {
+                return false;
+            }
+            pop_ctx(P);
+            continue;
+        }
+        if P.list_mode or P.fatal {
+            return false;
+        }
+        if P.inject_pos < P.inject.len {
+            return lx.is_punct(&P.inject[P.inject_pos], ct.P_LPAREN);
+        }
+        let t = lx.peek(cur_src(P).L);
+        if t.bol and lx.is_punct(t, lx.PP_HASH) {
+            // (a directive comes first)
+            return false;
+        }
+        return lx.is_punct(t, ct.P_LPAREN);
+    }
+}
+
+// The next token of the file, after its directives (and skipped groups);
+// the files that end are left (not while reading arguments: then the end of
+// an included file is the end).
+fn file_next(P: *mut PP) lx.PTok {
+    loop {
+        if P.fatal {
+            return P.eof_tok;
+        }
+        if P.inject_pos < P.inject.len {
+            P.inject_pos += 1;
+            return P.inject[P.inject_pos - 1];
+        }
+        let s = cur_src(P);
+        let t = lx.next(s.L);
+        if t.kind == lx.PK_EOF {
+            if (P.files.len == 1) or (P.collecting > 0) {
+                if P.collecting == 0 {
+                    end_of_file(P);
+                }
+                let mut e = t;
+                e.bol = true;
+                return e;
+            }
+            end_of_file(P);
+            if P.mac and (P.files.len > 1) {
+                u.g_macros.push(u.MacroEv.{ kind: 4, at: -1, line: 0, file: -1, text: "" });
+            }
+            _ = P.files.pop();
+            continue;
+        }
+        if t.bol and lx.is_punct(&t, lx.PP_HASH) {
+            if P.collecting > 0 {
+                _ = dg.err(t.span, "C1043", "a preprocessing directive inside the arguments of a macro is not allowed");
+            }
+            directive(P, t);
+            continue;
+        }
+        return t;
+    }
+}
+
+// The conditionals a file leaves open are errors.
+fn end_of_file(P: *mut PP) void {
+    let s = cur_src(P);
+    while P.conds.len > s.cond_base {
+        let c = P.conds.pop();
+        _ = dg.err(c.span, "C1050", "unterminated conditional directive");
+    }
+}
+
+// The rest of the directive's line.
+fn line_tokens(P: *mut PP) u.List.[lx.PTok] {
+    let L = cur_src(P).L;
+    let mut l = tok_list();
+    while not lx.at_eol(L) {
+        l.push(lx.next(L));
+    }
+    return l;
+}
+
+// -----------------------------------------------------------------------------
+// Macro replacement
+// -----------------------------------------------------------------------------
+fn lookup(P: *mut PP, name: []u8) *mut Macro {
+    if u.isnos(name) {
+        return nilmac();
+    }
+    return P.macros.get(name);
+}
+
+// The fully replaced tokens of the list `ts` (as an argument is, 6.10.3.1).
+fn expand_list(P: *mut PP, ts: []lx.PTok) []mut lx.PTok {
+    let mut out = tok_list();
+    if ts.len == 0 {
+        return frozen(&mut out);
+    }
+    P.arg_depth += 1;
+    if P.arg_depth > MAX_ARG_DEPTH {
+        if not P.fatal {
+            _ = dg.err(ts[0].span, "C1061", "macro invocations nested too deeply in arguments");
+        }
+        P.fatal = true;
+        P.arg_depth -= 1;
+        return frozen(&mut out);
+    }
+    let floor = P.floor;
+    let lm = P.list_mode;
+    P.floor = P.ctx.len;
+    P.list_mode = true;
+    push_ctx(P, ts, nilmac());
+    loop {
+        let t = next_replaced(P);
+        if t.kind == lx.PK_EOF {
+            break;
+        }
+        out.push(t);
+    }
+    while P.ctx.len > P.floor {
+        pop_ctx(P);
+    }
+    P.floor = floor;
+    P.list_mode = lm;
+    P.arg_depth -= 1;
+    return frozen(&mut out);
+}
+
+// The next token after macro replacement.
+fn next_replaced(P: *mut PP) lx.PTok {
+    loop {
+        let mut t = raw_next(P);
+        if (t.kind != lx.PK_IDENT) or t.noexpand {
+            return t;
+        }
+        if P.in_if and if_operator(P, &mut t) {
+            return t;
+        }
+        let m = lookup(P, t.name);
+        if u.isnil(m) {
+            return t;
+        }
+        if m.disabled {
+            t.noexpand = true;
+            return t;
+        }
+        if m.sys and not P.o.gnu and not t.sys and not cp.is_system_file(t.span.file) {
+            keyword_away(P, m, t.span);
+        }
+        if not replace(P, m, &t) {
+            return t;
+        }
+    }
+}
+
+// Under an ISO standard with the system's C library, whose headers define
+// the GNU dialects' keywords away for a compiler that is not their own
+// (`#define __attribute__(x)`, as nothing): the program's use of such a
+// macro at sp (macro m) is the warning C4152, once for each name, since
+// what it says (an attribute, an asm label) is then dropped.
+fn keyword_away(P: *PP, m: *Macro, sp: u.Span) void {
+    let n = m.name;
+    if (n.len < 3) or (n[0] != '_') or (n[1] != '_') or (ct.keyword_id(n, P.o.std) != 0) or
+       (ct.keyword_id_in(n, P.o.std, true) == 0) or (g_away.get(u.intern(n)) != 0) {
+        return;
+    }
+    g_away.put(u.intern(n), 1);
+    _ = dg.warning(sp, "C4152",
+                   u.f1("'%s' is a macro of the system's headers that drops what it is given under an ISO standard: a GNU dialect (--c-std=gnuNN) has it as a keyword",
+                        n));
+}
+
+// Replaces the macro m, whose name is `inv`: true if it was (the
+// replacement is in a context), false if the name is to be kept (a
+// function-like macro without arguments).
+fn replace(P: *mut PP, m: *mut Macro, inv: *lx.PTok) bool {
+    if m.builtin != B_NONE {
+        return builtin(P, m, inv);
+    }
+    let mut args = u.List.[Arg].empty();
+    if m.funclike {
+        if not next_is_lparen(P) {
+            return false;
+        }
+        _ = raw_next(P);
+        if not collect_args(P, m, inv, &mut args) {
+            args.deinit();
+            return true;
+        }
+    }
+    let mut out = tok_list();
+    substitute(P, m, args.items_mut(), inv, 0, m.body.len, &mut out);
+    args.deinit();
+    // placemarkers go
+    let mut n: usize = 0;
+    let items = out.items_mut();
+    for k in 0..items.len {
+        if items[k].kind != lx.PK_PLACEMARKER {
+            items[n] = items[k];
+            n += 1;
+        }
+    }
+    out.len = n;
+    P.expanded += n;
+    if P.expanded > MAX_EXPANSION {
+        if not P.fatal {
+            _ = dg.err(inv.span, "C1062", u.f1("the replacement of macro '%s' is too large", inv.name));
+        }
+        P.fatal = true;
+        out.deinit();
+        return true;
+    }
+    if n == 0 {
+        P.pend_bol = P.pend_bol or inv.bol;
+        P.pend_space = P.pend_space or inv.space;
+    } else {
+        let f = out.at_mut(0);
+        f.bol = inv.bol;
+        f.space = inv.space;
+    }
+    push_ctx(P, frozen(&mut out), m);
+    return true;
+}
+
+// Reads the arguments of an invocation of m (its `(` read): false after an
+// error (reported).
+fn collect_args(P: *mut PP, m: *mut Macro, inv: *lx.PTok, args: *mut u.List.[Arg]) bool {
+    let np = m.params.len;
+    let mut cur = tok_list();
+    let mut depth: i32 = 0;
+    P.collecting += 1;
+    loop {
+        let mut t = raw_next(P);
+        if t.kind == lx.PK_EOF {
+            P.collecting -= 1;
+            if not P.fatal {
+                _ = dg.err(inv.span, "C1063", u.f1("unterminated invocation of macro '%s'", inv.name));
+            }
+            cur.deinit();
+            return false;
+        }
+        if t.bol {
+            t.bol = false;
+            t.space = true;
+        }
+        if lx.is_punct(&t, ct.P_LPAREN) {
+            depth += 1;
+        } else if lx.is_punct(&t, ct.P_RPAREN) {
+            if depth == 0 {
+                args.push(Arg.{ raw: frozen(&mut cur), exp: u.nil_slice.[lx.PTok](), done: false });
+                break;
+            }
+            depth -= 1;
+        } else if lx.is_punct(&t, ct.P_COMMA) and (depth == 0) and not (m.variadic and ((args.len + 1) == np)) {
+            args.push(Arg.{ raw: frozen(&mut cur), exp: u.nil_slice.[lx.PTok](), done: false });
+            continue;
+        }
+        cur.push(t);
+    }
+    P.collecting -= 1;
+    let mut n = args.len;
+    if (np == 0) and (n == 1) and (args.at(0).raw.len == 0) {
+        args.clear();
+        n = 0;
+    }
+    let std = P.o.std;
+    if m.variadic and ((n + 1) == np) {
+        // the variable arguments left out
+        if (std < co.C23) and (np >= 2) and not P.o.gnu {
+            _ = dg.err(inv.span, "C1064", u.f1("macro '%s' requires at least one argument for '...' before C23",
+                                               inv.name));
+            return false;
+        }
+        args.push(Arg.{ raw: u.nil_slice.[lx.PTok](), exp: u.nil_slice.[lx.PTok](), done: true });
+        n += 1;
+    }
+    if n != np {
+        let mut msg = u.f3("macro '%s' takes %s arguments, but %s are given", inv.name, u.zdec(np), u.zdec(n));
+        if m.variadic {
+            msg = u.f3("macro '%s' takes at least %s arguments, but %s are given", inv.name, u.zdec(np - 1), u.zdec(n));
+        }
+        _ = dg.err(inv.span, "C1064", msg);
+        return false;
+    }
+    if (std < co.C99) and not P.o.gnu {
+        for k in 0..n {
+            if args.at(k).raw.len == 0 {
+                _ = dg.err(inv.span, "C1065",
+                           u.f2("argument %s of macro '%s' is empty: empty arguments are a C99 feature", u.zdec(k + 1),
+                                inv.name));
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn arg_exp(P: *mut PP, a: *mut Arg) []lx.PTok {
+    if not a.done {
+        a.exp = expand_list(P, a.raw);
+        a.done = true;
+    }
+    return a.exp;
+}
+
+// The string literal of `#` applied to the tokens (6.10.3.2).
+fn stringify(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    let mut b = u.Buf.init();
+    b.c('"');
+    let mut first = true;
+    for k in 0..ts.len {
+        let t = &ts[k];
+        if t.kind == lx.PK_PLACEMARKER {
+            continue;
+        }
+        if not first and t.space {
+            b.c(' ');
+        }
+        first = false;
+        if (t.kind == lx.PK_STRING) or (t.kind == lx.PK_CHAR) {
+            for c in t.text {
+                if (c == '"') or (c == '\\') {
+                    b.c('\\');
+                }
+                b.c(c);
+            }
+        } else {
+            b.s(t.text);
+        }
+    }
+    b.c('"');
+    let text = b.done();
+    let mut whole = false;
+    let r = lx.lex_one(text, P.o.std, sp, &mut whole);
+    if not whole or (r.kind != lx.PK_STRING) {
+        _ = dg.err(sp, "C1066", u.f1("'#' does not make a valid string literal: %s", text));
+        return mklit(lx.PK_OTHER, 0, text, sp);
+    }
+    return mklit(lx.PK_STRING, ct.ENC_NONE, text, sp);
+}
+
+// The token `##` makes of a and b (6.10.3.3); an error if it is none.
+fn paste(P: *mut PP, a: lx.PTok, b: lx.PTok, out: *mut u.List.[lx.PTok]) void {
+    if a.kind == lx.PK_PLACEMARKER {
+        let mut r = b;
+        if b.kind != lx.PK_PLACEMARKER {
+            r.space = a.space;
+        }
+        out.push(r);
+        return;
+    }
+    if b.kind == lx.PK_PLACEMARKER {
+        out.push(a);
+        return;
+    }
+    let text = u.cat2(a.text, b.text);
+    let mut whole = false;
+    let mut r = lx.lex_one(text, P.o.std, a.span, &mut whole);
+    if not whole {
+        _ = dg.err(a.span, "C1067", u.f2("pasting '%s' and '%s' does not give a valid preprocessing token", a.text,
+                                         b.text));
+        out.push(a);
+        out.push(b);
+        return;
+    }
+    r.space = a.space;
+    r.bol = false;
+    r.exp = true;
+    out.push(r);
+}
+
+// Whether the variable arguments are absent, or replaced by nothing
+// (__VA_OPT__ is then replaced by nothing).
+fn va_empty(P: *mut PP, m: *Macro, args: []mut Arg) bool {
+    return arg_exp(P, &mut args[m.params.len - 1]).len == 0;
+}
+
+// The tokens body[i] stands for as an operand of ##: an argument
+// unreplaced, a string from #, __VA_OPT__'s; a placemarker for none. The
+// index after it in `next`.
+fn operand(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, i: usize, next: *mut usize) []lx.PTok {
+    let body = m.body;
+    let t = &body[i];
+    let mut l = tok_list();
+    next.* = i + 1;
+    if t.kind == lx.PK_PARAM {
+        let a = args[@int_cast(usize, t.id)].raw;
+        if a.len == 0 {
+            l.push(mklit(lx.PK_PLACEMARKER, 0, "", inv.span));
+        } else {
+            for k in 0..a.len {
+                l.push(a[k]);
+            }
+            l.at_mut(0).space = t.space;
+        }
+    } else if t.kind == lx.PK_VAOPT {
+        let close = @int_cast(usize, t.id);
+        if not va_empty(P, m, args) {
+            substitute(P, m, args, inv, i + 2, close, &mut l);
+        }
+        if l.len == 0 {
+            l.push(mklit(lx.PK_PLACEMARKER, 0, "", inv.span));
+        } else {
+            l.at_mut(0).space = t.space;
+        }
+        next.* = close + 1;
+    } else if m.funclike and lx.is_punct(t, lx.PP_HASH) {
+        let p = &body[i + 1];
+        if p.kind == lx.PK_VAOPT {
+            let close = @int_cast(usize, p.id);
+            let mut c = tok_list();
+            if not va_empty(P, m, args) {
+                substitute(P, m, args, inv, i + 3, close, &mut c);
+            }
+            let mut s = stringify(P, c.items(), inv.span);
+            s.space = t.space;
+            l.push(s);
+            c.deinit();
+            next.* = close + 1;
+        } else {
+            let mut s = stringify(P, args[@int_cast(usize, p.id)].raw, inv.span);
+            s.space = t.space;
+            l.push(s);
+            next.* = i + 2;
+        }
+    } else {
+        let mut c = t.*;
+        c.span = inv.span;
+        c.exp = true;
+        c.sys = m.sys;
+        l.push(c);
+    }
+    return frozen(&mut l);
+}
+
+// The replacement of body[lo..hi] of m for the invocation `inv` with the
+// arguments `args`: parameters replaced, # and ## done (placemarkers kept).
+fn substitute(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, lo: usize, hi: usize,
+              out: *mut u.List.[lx.PTok]) void {
+    let body = m.body;
+    let mut i = lo;
+    while i < hi {
+        let t = &body[i];
+        if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) and (P.o.gnu or m.sys) and m.variadic and
+           (body[i + 1].kind == lx.PK_PARAM) and (@int_cast(usize, body[i + 1].id) == (m.params.len - 1)) and
+           lx.is_punct(out.at(out.len - 1), ct.P_COMMA) {
+            // (a GNU dialect: `, ## __VA_ARGS__` is the comma and the
+            // variable arguments, or nothing if there are none)
+            let a = args[m.params.len - 1].raw;
+            if a.len == 0 {
+                _ = out.pop();
+            } else {
+                for k in 0..a.len {
+                    let mut c = a[k];
+                    if k == 0 {
+                        c.space = body[i + 1].space;
+                    }
+                    out.push(c);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) {
+            let mut nx: usize = 0;
+            let rhs = operand(P, m, args, inv, i + 1, &mut nx);
+            let lhs = out.pop();
+            paste(P, lhs, rhs[0], out);
+            for k in 1..rhs.len {
+                out.push(rhs[k]);
+            }
+            i = nx;
+            continue;
+        }
+        let next_paste = ((i + 1) < hi) and lx.is_punct(&body[i + 1], lx.PP_HASHHASH);
+        if (m.funclike and lx.is_punct(t, lx.PP_HASH)) or next_paste or (t.kind == lx.PK_VAOPT) {
+            let mut nx: usize = 0;
+            let ops = operand(P, m, args, inv, i, &mut nx);
+            for k in 0..ops.len {
+                out.push(ops[k]);
+            }
+            i = nx;
+            continue;
+        }
+        if t.kind == lx.PK_PARAM {
+            let idx = @int_cast(usize, t.id);
+            let a = arg_exp(P, &mut args[idx]);
+            for k in 0..a.len {
+                let mut c = a[k];
+                if k == 0 {
+                    c.space = t.space;
+                    c.bol = false;
+                }
+                out.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        let mut c = t.*;
+        c.span = inv.span;
+        c.exp = true;
+        c.sys = m.sys;
+        out.push(c);
+        i += 1;
+    }
+}

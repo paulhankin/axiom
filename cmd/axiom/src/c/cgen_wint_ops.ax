@@ -1,0 +1,566 @@
+// =============================================================================
+// cgen_wint_ops.ax - Conversions, <stdbit.h>, <stdckdint.h> and bit-fields for
+// integer types wider than 64 bits. Part of cgen.ax (see cgen_wint.ax).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cconst.ax" as cc;
+import "csema.ax" as cs;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// Conversions
+// -----------------------------------------------------------------------------
+
+/// Scalar value v of type `from` converted to type `to`, one of them wider
+/// than 64 bits (6.3.1.3, 6.3.1.4, 6.3.1.5, 6.3.2.3): its address for such a
+/// type, an IR scalar for the others (a wide long double: its address).
+fn wint_convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    let f = from.unq;
+    let t = to.unq;
+    if cty.is_wint(t) {
+        return wint_to_wide(v, f, t);
+    }
+    let tt = lty(t);
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(B, wint_truth(f, v), tt);
+    }
+    if cty.is_integer(t) {
+        // (the low bits: 6.3.1.3, a signed result wraps, as the
+        // implementation defines)
+        let lo = wint_limb(v, 0);
+        if tt.bits < 64 {
+            return bitint_norm(ir.trunc(B, lo, tt), t);
+        }
+        return bitint_norm(lo, t);
+    }
+    if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
+        let mut lo = wint_limb(v, 0);
+        if T_isz.bits < 64 {
+            lo = ir.trunc(B, lo, T_isz);
+        }
+        return ir.inttoptr(B, lo);
+    }
+    let n = cty.limbs(f);
+    let sg = wint_sg(f);
+    if cty.is_wide(t) {
+        let r = alloca(cty.t_float128, "ld");  // (16 bytes: any wide format)
+        let mut xs: [5]*mut ir.Value = [
+            r, v, wint_usz(n), wint_cbool(sg), ir.cint(ir.t_int(32), @as(u64, cc.fmt_t(t)))];
+        if ld_env_strict() {
+            _ = ld_env_call("e_from_int", xs[..]);
+            return r;
+        }
+        _ = wint_call("from_int", xs[..]);
+        return r;
+    }
+    // float or double: correctly rounded
+    if ld_env_strict() {
+        let ys: [4]*mut ir.Value = [v, wint_usz(n), wint_cbool(sg), ir.cint(ir.t_int(32), @int_cast(u64, cty.ffmt(t)))];
+        let b = ld_env_call("wi_e_to_bin", ys[..]);
+        if cty.ffmt(t) == 32 {
+            return ir.bitcast(B, ir.trunc(B, b, ir.t_int(32)), tt);
+        }
+        return ir.bitcast(B, b, tt);
+    }
+    let s = wint_temp(f);
+    let mut xs: [4]*mut ir.Value = [v, wint_usz(n), wint_cbool(sg), s];
+    if cty.ffmt(t) == 32 {
+        return ir.bitcast(B, wint_call("wi_to_f32", xs[..]), tt);
+    }
+    return ir.bitcast(B, wint_call("wi_to_f64", xs[..]), tt);
+}
+
+// v of type f converted to t, wider than 64 bits.
+fn wint_to_wide(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    if cty.is_wint(f) {
+        // (the limbs there are, and the sign's beyond them)
+        let m = cty.limbs(f);
+        if (f == t) or ((m == n) and (f.bits <= t.bits) and (f.is_signed == t.is_signed)) {
+            return v;
+        }
+        let r = wint_temp(t);
+        if n <= 4 {
+            let mut fill = wint_c64(0);
+            if wint_sg(f) {
+                fill = wint_sign_fill(wint_limb(v, m - 1));
+            }
+            for k in 0..n {
+                if k < m {
+                    wint_set_limb(r, k, wint_limb(v, k));
+                } else {
+                    wint_set_limb(r, k, fill);
+                }
+            }
+        } else {
+            let mut xs: [5]*mut ir.Value = [r, wint_usz(n), v, wint_usz(m), wint_cbool(wint_sg(f))];
+            _ = wint_call("wi_ext", xs[..]);
+        }
+        wint_norm(t, r);
+        return r;
+    }
+    if cty.is_integer(f) or (f.kind == cty.TK_POINTER) or (f.kind == cty.TK_NULLPTR) {
+        let mut x = v;
+        let mut sg = wint_sg(f);
+        if x.ty.kind == ir.T_PTR {
+            x = ir.ptrtoint(B, x, T_isz);
+            sg = false;
+        }
+        if x.ty.bits < 64 {
+            if sg {
+                x = ir.sext(B, x, i64t());
+            } else {
+                x = ir.zext(B, x, i64t());
+            }
+        }
+        let mut fill = wint_c64(0);
+        if sg {
+            fill = wint_sign_fill(x);
+        }
+        let r = wint_temp(t);
+        if n <= 4 {
+            wint_set_limb(r, 0, x);
+            for k in 1..n {
+                wint_set_limb(r, k, fill);
+            }
+        } else {
+            let one = alloca(cty.t_ullong, "wint1");
+            wint_set_limb(one, 0, x);
+            let mut xs: [5]*mut ir.Value = [r, wint_usz(n), one, wint_usz(1), wint_cbool(sg)];
+            _ = wint_call("wi_ext", xs[..]);
+        }
+        wint_norm(t, r);
+        return r;
+    }
+    let r = wint_temp(t);
+    let bits_v = ir.cint(ir.t_int(32), @as(u64, @bit_cast(u32, t.bits)));
+    if cty.is_wide(f) {
+        // (truncated toward zero; out of range, which is undefined,
+        // saturated, as for float and double: 6.3.1.4p1)
+        let mut xs: [6]*mut ir.Value = [
+            r, wint_usz(n), bits_v, wint_cbool(wint_sg(t)), v, ir.cint(ir.t_int(32), @as(u64, cc.fmt_t(f)))];
+        if ld_env_strict() {
+            _ = ld_env_call("e_to_wint", xs[..]);
+            return r;
+        }
+        _ = wint_call("to_int", xs[..]);
+        return r;
+    }
+    let mut d = v;
+    if v.ty.bits == 32 {
+        d = ir.cast(B, ir.OP_FPEXT, v, ir.t_float(64));  // (exact)
+    }
+    let mut xs: [5]*mut ir.Value = [r, wint_usz(n), bits_v, wint_cbool(wint_sg(t)), ir.bitcast(B, d, i64t())];
+    if ld_env_strict() {
+        _ = ld_env_call("wi_e_from_f64", xs[..]);
+        return r;
+    }
+    _ = wint_call("wi_from_f64", xs[..]);
+    return r;
+}
+
+/// <stdbit.h>'s function id (a csema_builtin BI_ number) of x, of an
+/// unsigned type t wider than 64 bits, whose width is that of its value
+/// (the bits of the storage above it are zero); rt: the result's type.
+fn wint_stdbit(id: i32, x: *mut ir.Value, t: *mut cty.CType, rt: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let w = @as(u64, @bit_cast(u32, t.unq.bits));
+    let wv = wint_c64(w);
+    let extra = wint_c64((@as(u64, n) * 64) - w);  // (zero bits above the width)
+    if (id == cs.BI_BIT_FLOOR) or (id == cs.BI_BIT_CEIL) {
+        return wint_floor_ceil(id == cs.BI_BIT_FLOOR, x, t);
+    }
+    let mut r = ir.vnil();
+    if (id == cs.BI_LEADING_ZEROS) or (id == cs.BI_FIRST_LEADING_ONE) or (id == cs.BI_BIT_WIDTH) {
+        r = ir.sub(B, wint_count(ir.IN_CTLZ, x, n), extra);
+        if id == cs.BI_FIRST_LEADING_ONE {
+            r = wint_first(r, wv);
+        } else if id == cs.BI_BIT_WIDTH {
+            r = ir.sub(B, wv, r);
+        }
+    } else if (id == cs.BI_LEADING_ONES) or (id == cs.BI_FIRST_LEADING_ZERO) {
+        r = ir.sub(B, wint_count(ir.IN_CTLZ, wint_bitnot(t, x), n), extra);
+        if id == cs.BI_FIRST_LEADING_ZERO {
+            r = wint_first(r, wv);
+        }
+    } else if (id == cs.BI_TRAILING_ZEROS) or (id == cs.BI_FIRST_TRAILING_ONE) {
+        r = wint_umin(wint_count(ir.IN_CTTZ, x, n), wv);
+        if id == cs.BI_FIRST_TRAILING_ONE {
+            r = wint_first(r, wv);
+        }
+    } else if (id == cs.BI_TRAILING_ONES) or (id == cs.BI_FIRST_TRAILING_ZERO) {
+        r = wint_umin(wint_count(ir.IN_CTTZ, wint_bitnot(t, x), n), wv);
+        if id == cs.BI_FIRST_TRAILING_ZERO {
+            r = wint_first(r, wv);
+        }
+    } else if id == cs.BI_COUNT_ONES {
+        r = wint_count(ir.IN_CTPOP, x, n);
+    } else if id == cs.BI_COUNT_ZEROS {
+        r = ir.sub(B, wv, wint_count(ir.IN_CTPOP, x, n));
+    } else {
+        let one = ir.icmp(B, ir.IntEQ, wint_count(ir.IN_CTPOP, x, n), wint_c64(1));
+        return ir.zext(B, one, ir.t_int(8));  // (has_single_bit)
+    }
+    let tt = lty(rt);
+    if tt.bits < 64 {
+        return ir.trunc(B, r, tt);
+    }
+    return r;
+}
+
+// k + 1, or 0 where k is the width w (none found): the first_* functions.
+fn wint_first(k: *mut ir.Value, w: *mut ir.Value) *mut ir.Value {
+    let none = ir.icmp(B, ir.IntEQ, k, w);
+    return ir.select(B, none, wint_c64(0), ir.add(B, k, wint_c64(1)));
+}
+
+fn wint_umin(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.select(B, ir.icmp(B, ir.IntULT, a, b), a, b);
+}
+
+// The leading zeros (IN_CTLZ), trailing zeros (IN_CTTZ) or bits set
+// (IN_CTPOP) of the n limbs at x, as an i64.
+fn wint_count(id: ir.Intrinsic, x: *mut ir.Value, n: usize) *mut ir.Value {
+    if n == 2 {
+        let lo = wint_limb(x, 0);
+        let hi = wint_limb(x, 1);
+        let cl = wint_intr1(id, lo);
+        let ch = wint_intr1(id, hi);
+        if id == ir.IN_CTPOP {
+            return ir.add(B, cl, ch);
+        }
+        if id == ir.IN_CTLZ {
+            let z = ir.icmp(B, ir.IntEQ, hi, wint_c64(0));
+            return ir.select(B, z, ir.add(B, cl, wint_c64(64)), ch);
+        }
+        let z = ir.icmp(B, ir.IntEQ, lo, wint_c64(0));
+        return ir.select(B, z, ir.add(B, ch, wint_c64(64)), cl);
+    }
+    let mut name: []u8 = "wi_popcount";
+    if id == ir.IN_CTLZ {
+        name = "wi_clz";
+    } else if id == ir.IN_CTTZ {
+        name = "wi_ctz";
+    }
+    let mut xs: [2]*mut ir.Value = [x, wint_usz(n)];
+    let c = wint_call(name, xs[..]);
+    if c.ty.bits < 64 {
+        return ir.zext(B, c, i64t());
+    }
+    return c;
+}
+
+fn wint_intr1(id: ir.Intrinsic, x: *mut ir.Value) *mut ir.Value {
+    let mut a: [1]*mut ir.Value = [x];
+    return ir.intr(B, id, x.ty, a[..]);
+}
+
+// stdc_bit_floor (floor) or stdc_bit_ceil of x (unsigned, of type t): 0 for
+// 0, else the highest bit set; 1 for 0 and 1, else 2 to the bits of x - 1
+// (0 when that is the width: not representable).
+fn wint_floor_ceil(floor: bool, x: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let w = @as(u64, @bit_cast(u32, t.unq.bits));
+    let extra = wint_c64((@as(u64, n) * 64) - w);
+    let one = wint_one_value(t);
+    let zero_v = wint_constant(t, wint_zeros(n));
+    let mut src = x;
+    if not floor {
+        src = wint_arith(ct.P_MINUS, t, x, one);
+    }
+    let bw = ir.sub(B, wint_c64(w), ir.sub(B, wint_count(ir.IN_CTLZ, src, n), extra));
+    if floor {
+        let z = wint_truth(t, x);
+        let k = ir.select(B, z, ir.sub(B, bw, wint_c64(1)), wint_c64(0));
+        let p = wint_shift(ct.P_SHL, t, one, k, cty.t_ullong);
+        return wint_select_value(t, z, p, zero_v);
+    }
+    let small = wint_compare(ct.P_LE, t, x, one);
+    let over = ir.icmp(B, ir.IntUGE, bw, wint_c64(w));
+    let k = ir.select(B, over, wint_c64(0), bw);
+    let p = wint_select_value(t, over, zero_v, wint_shift(ct.P_SHL, t, one, k, cty.t_ullong));
+    return wint_select_value(t, small, one, p);
+}
+
+fn wint_zeros(n: usize) []u64 {
+    let v = u.newn.[u64](n + 1)[0..n];
+    for k in 0..n {
+        v[k] = 0;
+    }
+    return v;
+}
+
+// c ? a : b, of type t (a new temporary).
+fn wint_select_value(t: *mut cty.CType, c: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    let r = wint_temp(t);
+    for k in 0..n {
+        wint_set_limb(r, k, ir.select(B, c, wint_limb(a, k), wint_limb(b, k)));
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// <stdckdint.h>
+// -----------------------------------------------------------------------------
+
+// Integer value v of type t (any integer type) as m limbs in a new
+// temporary, extended as t's signedness says.
+fn wint_widened(v: *mut ir.Value, t: *mut cty.CType, m: usize) *mut ir.Value {
+    let r = alloca(cty.array_of(cty.t_ullong, @as(u64, m), true), "ckd");
+    let mut src = v;
+    let mut n: usize = 1;
+    if cty.is_wint(t) {
+        n = cty.limbs(t);
+    } else {
+        let mut x = v;
+        if x.ty.bits < 64 {
+            if wint_sg(t) {
+                x = ir.sext(B, x, i64t());
+            } else {
+                x = ir.zext(B, x, i64t());
+            }
+        }
+        src = alloca(cty.t_ullong, "ckd1");
+        wint_set_limb(src, 0, x);
+    }
+    let mut xs: [5]*mut ir.Value = [r, wint_usz(m), src, wint_usz(n), wint_cbool(wint_sg(t))];
+    _ = wint_call("wi_ext", xs[..]);
+    return r;
+}
+
+/// ckd_add (add), ckd_sub (sub) or ckd_mul of a and b (of types at and bt)
+/// into *rp (of type rt), where one of the types is wider than 64 bits
+/// (C23 7.20): the exact result in limbs enough for it, wrapped into rt;
+/// whether it did not fit (an i8, 0 or 1).
+fn wint_ckd(add: bool, sub: bool, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at_: *mut cty.CType,
+            b: *mut ir.Value, bt: *mut cty.CType) *mut ir.Value {
+    let mut m: usize = 1;
+    let ts: [3]*mut cty.CType = [rt, at_, bt];
+    for t in ts {
+        if cty.is_wint(t) {
+            m = @max(m, cty.limbs(t));
+        }
+    }
+    m = m + 1;
+    if not add and not sub {
+        m = 2 * m;  // (a product: twice the limbs)
+    }
+    let xa = wint_widened(a, at_, m);
+    let xb = wint_widened(b, bt, m);
+    let ex = alloca(cty.array_of(cty.t_ullong, @as(u64, m), true), "ckd");
+    let mut xs: [4]*mut ir.Value = [ex, xa, xb, wint_usz(m)];
+    _ = wint_call(u.pick(add, "wi_add", u.pick(sub, "wi_sub", "wi_mul")), xs[..]);
+    // the result: the exact value converted to rt; it fits if it converts back
+    let mut back = ir.vnil();
+    if cty.is_wint(rt) {
+        let r = wint_temp(rt);
+        let mut ys: [5]*mut ir.Value = [r, wint_usz(cty.limbs(rt)), ex, wint_usz(m), wint_cbool(false)];
+        _ = wint_call("wi_ext", ys[..]);
+        wint_norm(rt, r);
+        wint_copy(rt, rp, r, false);
+        back = wint_widened(r, rt, m);
+    } else {
+        let lo = wint_limb(ex, 0);
+        let tt = lty(rt);
+        let mut r = lo;
+        if tt.bits < 64 {
+            r = bitint_norm(ir.trunc(B, lo, tt), rt);
+        }
+        let s = ir.store(B, r, rp);
+        s.align = @truncate(u32, cty.align_of(rt));
+        back = wint_widened(r, rt, m);
+    }
+    let mut zs: [4]*mut ir.Value = [ex, back, wint_usz(m), wint_cbool(false)];
+    let c = wint_call("wi_cmp", zs[..]);
+    return ir.zext(B, ir.icmp(B, ir.IntNE, c, ir.cint(c.ty, 0)), ir.t_int(8));
+}
+
+// -----------------------------------------------------------------------------
+// Bit-fields
+// -----------------------------------------------------------------------------
+
+// The limbs of bit-field m that hold its bits, from the unit at p (at an
+// 8-byte boundary: these types are aligned to 8 at least), as a value of
+// an unsigned type of as many limbs (two at least); their first limb's
+// index, their number and that type.
+struct BfUnit {
+    k: usize,
+    n: usize,
+    ut: *mut cty.CType,
+    v: *mut ir.Value,
+}
+
+// The largest piece of 4, 2 or 1 bytes that fits in c bytes.
+fn wint_piece(c: u64) u64 {
+    if c >= 4 {
+        return 4;
+    }
+    if c >= 2 {
+        return 2;
+    }
+    return 1;
+}
+
+/// The bytes [8k, 8k+c) of the run at p (c from 1 to 8) as the low bytes of
+/// a 64-bit integer, read in pieces of 8, 4, 2 and 1 bytes from the lowest
+/// address (alignment 1; each a volatile access if `volatile`).
+fn run_limb(p: *mut ir.Value, k: usize, c: u64, volatile: bool) *mut ir.Value {
+    let base = wint_at(p, k);
+    if c == 8 {
+        let v = ir.load(B, i64t(), base);
+        v.align = 1;
+        if volatile {
+            v.flags = v.flags | ir.F_VOLATILE;
+        }
+        return v;
+    }
+    let mut r = wint_c64(0);
+    let mut o: u64 = 0;
+    while o < c {
+        let n = wint_piece(c - o);
+        let v = ir.load(B, ir.t_int(@truncate(i32, n * 8)), ir.ptradd(B, base, usz(o)));
+        v.align = 1;
+        if volatile {
+            v.flags = v.flags | ir.F_VOLATILE;
+        }
+        let mut x = ir.zext(B, v, i64t());
+        if o > 0 {
+            x = ir.binop(B, ir.OP_SHL, x, wint_c64(o * 8));
+        }
+        r = ir.or_(B, r, x);
+        o += n;
+    }
+    return r;
+}
+
+/// Writes the low c bytes of 64-bit x at bytes [8k, 8k+c) of the run at p,
+/// in the pieces run_limb reads.
+fn run_set_limb(p: *mut ir.Value, k: usize, c: u64, x: *mut ir.Value, volatile: bool) void {
+    let base = wint_at(p, k);
+    if c == 8 {
+        let s = ir.store(B, x, base);
+        s.align = 1;
+        if volatile {
+            s.flags = s.flags | ir.F_VOLATILE;
+        }
+        return;
+    }
+    let mut o: u64 = 0;
+    while o < c {
+        let n = wint_piece(c - o);
+        let mut y = x;
+        if o > 0 {
+            y = ir.binop(B, ir.OP_LSHR, y, wint_c64(o * 8));
+        }
+        let s = ir.store(B, ir.trunc(B, y, ir.t_int(@truncate(i32, n * 8))), ir.ptradd(B, base, usz(o)));
+        s.align = 1;
+        if volatile {
+            s.flags = s.flags | ir.F_VOLATILE;
+        }
+        o += n;
+    }
+}
+
+// The bytes of limb j of a run of nb bytes.
+fn wint_run_count(nb: u64, j: usize) u64 {
+    let lo = @as(u64, j) * 8;
+    if lo >= nb {
+        return 0;
+    }
+    return @min(nb - lo, 8);
+}
+
+fn wint_bf_unit(m: *cty.Member, p: *mut ir.Value, volatile: bool) BfUnit {
+    if m.unit_bits != 0 {
+        // (a packed structure's: the run of the bytes it spans, csema_bits.is_run)
+        let nb = @as(u64, @bit_cast(u32, m.unit_bits)) / 8;
+        let n = @truncate(usize, (nb + 7) / 8);
+        let nl = @max(n, 2);
+        let ut = cty.bitint(@int_cast(i32, nl * 64), false);
+        let r = wint_temp(ut);
+        for j in 0..nl {
+            if j < n {
+                wint_set_limb(r, j, run_limb(p, j, wint_run_count(nb, j), volatile));
+            } else {
+                wint_set_limb(r, j, wint_c64(0));
+            }
+        }
+        return BfUnit.{ k: 0, n: n, ut: ut, v: r };
+    }
+    let off = @as(u64, @bit_cast(u32, m.bit_off));
+    let w = @as(u64, @bit_cast(u32, m.bit_width));
+    let k = @truncate(usize, off / 64);
+    let n = @truncate(usize, ((off % 64) + w + 63) / 64);
+    let nl = @max(n, 2);
+    let ut = cty.bitint(@int_cast(i32, nl * 64), false);
+    let r = wint_temp(ut);
+    for j in 0..nl {
+        if j < n {
+            let x = wint_limb(p, k + j);
+            if volatile {
+                x.flags = x.flags | ir.F_VOLATILE;
+            }
+            wint_set_limb(r, j, x);
+        } else {
+            wint_set_limb(r, j, wint_c64(0));
+        }
+    }
+    return BfUnit.{ k: k, n: n, ut: ut, v: r };
+}
+
+/// The value of bit-field m (of a type wider than 64 bits, t) in the unit
+/// at p (cgen_bits.ax: the window csema_bits.ax places it in).
+fn wint_bf_load(m: *cty.Member, t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let un = wint_bf_unit(m, p, (t.quals & cty.Q_VOLATILE) != 0);
+    let s = wint_c64(@as(u64, @bit_cast(u32, m.bit_off % 64)));
+    let x = wint_shift(ct.P_SHR, un.ut, un.v, s, cty.t_ullong);
+    let ft = cty.bitint(m.bit_width, wint_sg(t));
+    return wint_convert(wint_convert(x, un.ut, ft), ft, t);
+}
+
+/// Stores v (of t) into bit-field m in the unit at p; returns the value
+/// the bit-field then has, as a value of t.
+fn wint_bf_store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    let volatile = (t.quals & cty.Q_VOLATILE) != 0;
+    let un = wint_bf_unit(m, p, volatile);
+    let nl = @max(un.n, 2);
+    let sh = @as(u64, @bit_cast(u32, m.bit_off % 64));
+    let w = @as(u64, @bit_cast(u32, m.bit_width));
+    // the bits of the field in the unit's limbs
+    let mk = u.newn.[u64](nl + 1)[0..nl];
+    for j in 0..nl {
+        let lo = @as(u64, j) * 64;
+        let mut x: u64 = 0;
+        for b in @as(u64, 0)..64 {
+            if ((lo + b) >= sh) and ((lo + b) < (sh + w)) {
+                x = x | (@as(u64, 1) << @truncate(u32, b));
+            }
+        }
+        mk[j] = x;
+    }
+    let keep_mask = u.newn.[u64](nl + 1)[0..nl];
+    for j in 0..nl {
+        keep_mask[j] = ~mk[j];
+    }
+    let uf = cty.bitint(m.bit_width, false);
+    let bits_v = wint_convert(wint_convert(v, t, uf), uf, un.ut);
+    let placed = wint_shift(ct.P_SHL, un.ut, bits_v, wint_c64(sh), cty.t_ullong);
+    let nv = wint_arith(ct.P_PIPE, un.ut, wint_arith(ct.P_AMP, un.ut, un.v, wint_constant(un.ut, keep_mask)), placed);
+    for j in 0..un.n {
+        let x = wint_limb(nv, j);
+        if m.unit_bits != 0 {
+            run_set_limb(p, j, wint_run_count(@as(u64, @bit_cast(u32, m.unit_bits)) / 8, j), x, volatile);
+            continue;
+        }
+        let st = ir.store(B, x, wint_at(p, un.k + j));
+        st.align = 8;
+        if volatile {
+            st.flags = st.flags | ir.F_VOLATILE;
+        }
+    }
+    let ft = cty.bitint(m.bit_width, wint_sg(t));
+    return wint_convert(wint_convert(v, t, ft), ft, t);
+}

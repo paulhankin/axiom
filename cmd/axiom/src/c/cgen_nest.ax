@@ -1,6 +1,6 @@
 // =============================================================================
 // cgen_nest.ax - IR generation for the GNU dialects' nested functions
-// (csema_nest.ax).
+// (csema_nest.ax). Part of cgen.ax.
 //
 // A function with nested functions makes a frame record when it starts: an
 // array of pointers, in its frame, of
@@ -13,7 +13,7 @@
 //                     variable length array types it evaluates
 //                     (csema_nest.lengths): a nested function reads the
 //                     length of such a type there (outer_len), through
-//                     record_of
+//                     nest_record_of
 //   [.. +m)           for each of its nested functions whose address is
 //                     taken (tramps), the trampoline this call of it holds
 //                     (its index plus 1), or 0
@@ -44,7 +44,7 @@
 //
 // A variadic nested function's IR function takes, after its named
 // arguments, the address of a va_list (which its va_start copies:
-// cgen_va.va_from) and then its chain. A direct call calls its entry
+// va_from) and then its chain. A direct call calls its entry
 // (entry_of): a variadic function whose named arguments are the nested
 // function's and then the chain, so that the variable arguments come after
 // it on every ABI; the entry, and each trampoline, starts a va_list and calls
@@ -59,21 +59,21 @@
 // compiled as a function that calls setjmp (ir.Func.returns_twice), and
 // before each of its calls, setjmp (the linkers' __axc_setjmp; on
 // WebAssembly cgen_sjlj.ax's, with the exception-handling extension) arms
-// the jmp_buf there (arm): the call P makes when a nested function's goto
+// the jmp_buf there (nest_arm): the call P makes when a nested function's goto
 // runs is the last one armed. The goto makes its own function's cleanups'
 // calls and frees its variable length arrays, as a return does, gives back
 // the trampolines its call holds, stores the number in P's record and
 // longjmps to the jmp_buf (__axc_longjmp_restore, on WebAssembly longjmp).
-// setjmp then returns 1 at the call, and the code after it (finish) is a
+// setjmp then returns 1 at the call, and the code after it (nest_finish) is a
 // goto from there to the label: the cleanups of the scopes it leaves are
 // called and the variable length arrays freed (cgen_vla.ax), or, if the
 // label is in a scope the call is not (a jump into the scope of a variable
 // length array or of an object with a cleanup, 6.8.6.1p1), a trap. A
 // function nested in P that makes a call with cleanups in scope, or with
-// trampolines its call holds, hooks the call into the jumps to P (arm): the
+// trampolines its call holds, hooks the call into the jumps to P (nest_arm): the
 // slot gets its own jmp_buf for the call, so that a jump passing through
 // calls those cleanups, gives back the trampolines, and goes on to the
-// jmp_buf the slot held (finish). The frames of other functions between
+// jmp_buf the slot held (nest_finish). The frames of other functions between
 // are left as a longjmp leaves them.
 // =============================================================================
 import "../diag.ax" as dg;
@@ -81,50 +81,39 @@ import "../ir.ax" as ir;
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
-import "cgen_gbuiltin.ax" as ggb;
-import "cgen_sjlj.ax" as sj;
-import "cgen_va.ax" as gva;
-import "cgen_vla.ax" as gv;
-import "csema_nest.ax" as cnest;
-import "csema_vla.ax" as svla;
+import "csema.ax" as cs;
 import "ctypes.ax" as cty;
 
 /// The trampolines of each nested function whose address is taken.
-pub const POOL: u64 = 128;
+const POOL: u64 = 128;
 const NPOOL: usize = 128;  // (POOL, as an index)
 
-fn B() *mut ir.Builder {
-    return cg.B;
-}
-
-fn psz() u64 {
+fn nest_psz() u64 {
     return cty.ptr_bytes;
 }
 
-fn slot(r: *mut ir.Value, k: u64) *mut ir.Value {
-    return ir.ptradd(B(), r, cg.usz(k * psz()));
+fn nest_slot(r: *mut ir.Value, k: u64) *mut ir.Value {
+    return ir.ptradd(B, r, usz(k * nest_psz()));
 }
 
-fn ld(p: *mut ir.Value) *mut ir.Value {
-    let v = ir.load(B(), cg.T_ptr, p);
-    v.align = @truncate(u32, psz());
+fn nest_ld(p: *mut ir.Value) *mut ir.Value {
+    let v = ir.load(B, T_ptr, p);
+    v.align = @truncate(u32, nest_psz());
     return v;
 }
 
-fn st(v: *mut ir.Value, p: *mut ir.Value) void {
-    let s = ir.store(B(), v, p);
-    s.align = @truncate(u32, psz());
+fn nest_st(v: *mut ir.Value, p: *mut ir.Value) void {
+    let s = ir.store(B, v, p);
+    s.align = @truncate(u32, nest_psz());
 }
 
 /// The start of function s (its parameters' objects made): a nested
 /// function's chain kept in an object of the frame, and the frame record of
 /// a function with nested functions made.
-pub fn enter(s: *mut cast.CSym) void {
-    let F = cg.F;
+fn nest_enter(s: *mut cast.CSym) void {
     if u.notnil(s.nest_parent) {
-        F.chain = cg.alloca(cty.pointer_to(cty.t_void), "chain");
-        st(F.f.params[@int_cast(usize, F.sig.plan.chain)], F.chain);
+        F.chain = alloca(cty.pointer_to(cty.t_void), "chain");
+        nest_st(F.f.params[@int_cast(usize, F.sig.plan.chain)], F.chain);
     }
     g_sites.clear();
     g_hooks.clear();
@@ -133,83 +122,81 @@ pub fn enter(s: *mut cast.CSym) void {
     if not s.has_nested {
         return;
     }
-    let ls = cnest.lengths(s);
+    let ls = cs.lengths(s);
     let mut n = 1 + @as(u64, s.rec.len) + @as(u64, ls.len) + @as(u64, s.tramps.len);
     if s.nonlocal.len > 0 {
         n += 2;
     }
-    let r = cg.alloca(cty.array_of(cty.pointer_to(cty.t_void), n, true), "frame.rec");
+    let r = alloca(cty.array_of(cty.pointer_to(cty.t_void), n, true), "frame.rec");
     F.rec = r;
     if u.notnil(F.chain) {
-        st(ld(F.chain), r);
+        nest_st(nest_ld(F.chain), r);
     } else {
-        st(ir.czero(cg.T_ptr), r);
+        nest_st(ir.czero(T_ptr), r);
     }
     for k in 0..s.rec.len {
         let x = s.rec.get(k);
         if (x.owner == s) and cty.is_vla(x.ty) {
-            st(ir.czero(cg.T_ptr), slot(r, 1 + @as(u64, k)));  // (until it is allocated: allocated)
+            nest_st(ir.czero(T_ptr), nest_slot(r, 1 + @as(u64, k)));  // (until it is allocated: nest_allocated)
         } else {
-            st(object_addr(x), slot(r, 1 + @as(u64, k)));
+            nest_st(nest_object_addr(x), nest_slot(r, 1 + @as(u64, k)));
         }
     }
     for k in 0..ls.len {
-        let mut a = ir.czero(cg.T_ptr);
+        let mut a = ir.czero(T_ptr);
         if not u.isvnil(ls[k]) {
-            a = gv.len_addr(ls[k]);
+            a = vla_len_addr(ls[k]);
         }
-        st(a, slot(r, lens_field(s) + @as(u64, k)));
+        nest_st(a, nest_slot(r, nest_lens_field(s) + @as(u64, k)));
     }
     for k in 0..s.tramps.len {
-        st(ir.czero(cg.T_ptr), slot(r, lens_field(s) + @as(u64, ls.len) + @as(u64, k)));
+        nest_st(ir.czero(T_ptr), nest_slot(r, nest_lens_field(s) + @as(u64, ls.len) + @as(u64, k)));
     }
     if s.nonlocal.len > 0 {
-        if cg.is_wasm and not tg.has(tg.W_EXCEPTION_HANDLING) {
+        if is_wasm and not tg.has(tg.W_EXCEPTION_HANDLING) {
             _ = dg.err(s.nonlocal.get(0).span, "C3300",
                        "a jump from a nested function to its enclosing function needs WebAssembly's exception-handling extension (--features=+exception-handling)");
         }
         F.f.returns_twice = true;
         F.f.noinline = true;
-        let jb = cg.alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.jmpbuf");
-        st(jb, slot(r, jb_field(s)));
-        st(ir.czero(cg.T_ptr), slot(r, jb_field(s) + 1));
+        let jb = alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.jmpbuf");
+        nest_st(jb, nest_slot(r, nest_jb_field(s)));
+        nest_st(ir.czero(T_ptr), nest_slot(r, nest_jb_field(s) + 1));
     }
 }
 
 // The index of the jmp_buf's address in the record of function s with
 // non-local labels (then that of the jump's number).
-fn jb_field(s: *cast.CSym) u64 {
-    return lens_field(s) + @as(u64, cnest.lengths(s).len) + @as(u64, s.tramps.len);
+fn nest_jb_field(s: *cast.CSym) u64 {
+    return nest_lens_field(s) + @as(u64, cs.lengths(s).len) + @as(u64, s.tramps.len);
 }
 
 // The index of the first length slot's address in function s's record.
-fn lens_field(s: *cast.CSym) u64 {
+fn nest_lens_field(s: *cast.CSym) u64 {
     return 1 + @as(u64, s.rec.len);
 }
 
 /// Variable length array object s of the function being generated is
 /// allocated (its address in s.ir): its address in the frame record, if a
 /// nested function uses it.
-pub fn allocated(s: *mut cast.CSym) void {
-    let F = cg.F;
+fn nest_allocated(s: *mut cast.CSym) void {
     if u.isnil(F) or u.isnil(F.rec) or u.isnil(F.sym) {
         return;
     }
-    let idx = cnest.rec_index(F.sym, s);
+    let idx = cs.rec_index(F.sym, s);
     if idx >= 0 {
-        st(@ptr_cast(*mut ir.Value, s.ir), slot(F.rec, 1 + @as(u64, @bit_cast(u32, idx))));
+        nest_st(@ptr_cast(*mut ir.Value, s.ir), nest_slot(F.rec, 1 + @as(u64, @bit_cast(u32, idx))));
     }
 }
 
 /// The address of the slot of length n (a CType.vexpr) that an enclosing
 /// function of the function being generated evaluates, from its record; nil
-/// if the function being generated evaluates it (cgen_vla.slot).
-pub fn outer_len(n: *void) *mut ir.Value {
-    let F = cg.F;
+/// if the function being generated evaluates it (vla_slot).
+fn outer_len(n: *void) *mut ir.Value {
     if u.isnil(F) or u.isnil(F.sym) or u.isnil(F.sym.nest_parent) {
         return ir.vnil();
     }
-    let p = cnest.length_owner(n);
+    let p = cs.length_owner(n);
     if u.isnil(p) or (p == F.sym) {
         return ir.vnil();
     }
@@ -217,34 +204,32 @@ pub fn outer_len(n: *void) *mut ir.Value {
     while u.notnil(x) and (x != p) {
         x = x.nest_parent;
     }
-    let idx = cnest.length_index(p, n);
+    let idx = cs.length_index(p, n);
     if u.isnil(x) or (idx < 0) {
         return ir.vnil();  // (not an enclosing function's)
     }
-    return ld(slot(record_of(p), lens_field(p) + @as(u64, @bit_cast(u32, idx))));
+    return nest_ld(nest_slot(nest_record_of(p), nest_lens_field(p) + @as(u64, @bit_cast(u32, idx))));
 }
 
 /// The address of automatic object x of the function being generated, or
 /// (in a nested function) of an enclosing function: from the chain.
-pub fn object_addr(x: *mut cast.CSym) *mut ir.Value {
-    let F = cg.F;
+fn nest_object_addr(x: *mut cast.CSym) *mut ir.Value {
     let cur = F.sym;
     if u.notnil(cur) and u.notnil(x.owner) and (x.owner != cur) and u.notnil(cur.nest_parent) and
        (x.duration == cast.SD_AUTO) {
-        let idx = cnest.rec_index(cur.nest_parent, x);
+        let idx = cs.rec_index(cur.nest_parent, x);
         if idx >= 0 {
-            return ld(slot(ld(F.chain), 1 + @as(u64, @bit_cast(u32, idx))));
+            return nest_ld(nest_slot(nest_ld(F.chain), 1 + @as(u64, @bit_cast(u32, idx))));
         }
     }
     if u.isvnil(x.ir) {
-        x.ir = @ptr_cast(*mut void, cg.aligned_alloca(x.ty, x.name, x.align));
+        x.ir = @ptr_cast(*mut void, aligned_alloca(x.ty, x.name, x.align));
     }
     return @ptr_cast(*mut ir.Value, x.ir);
 }
 
 /// Is x an object of an enclosing function, seen from the function being generated?
-pub fn is_outer(x: *cast.CSym) bool {
-    let F = cg.F;
+fn is_outer(x: *cast.CSym) bool {
     return u.notnil(F) and u.notnil(F.sym) and u.notnil(x.owner) and (x.owner != F.sym) and
            (x.duration == cast.SD_AUTO) and u.notnil(F.sym.nest_parent);
 }
@@ -252,22 +237,21 @@ pub fn is_outer(x: *cast.CSym) bool {
 /// The frame record of the enclosing function of nested function g, seen
 /// from the function being generated (g's enclosing function, or a function
 /// nested in it).
-pub fn chain_for(g: *mut cast.CSym) *mut ir.Value {
-    return record_of(g.nest_parent);
+fn chain_for(g: *mut cast.CSym) *mut ir.Value {
+    return nest_record_of(g.nest_parent);
 }
 
 // The frame record of the call of function p (the function being generated,
 // or one it is nested in) that the function being generated belongs to.
-fn record_of(p: *mut cast.CSym) *mut ir.Value {
-    let F = cg.F;
+fn nest_record_of(p: *mut cast.CSym) *mut ir.Value {
     let cur = F.sym;
     if cur == p {
         return F.rec;
     }
-    let mut r = ld(F.chain);
+    let mut r = nest_ld(F.chain);
     let mut x = cur.nest_parent;
     while u.notnil(x) and (x != p) {
-        r = ld(r);  // (slot 0: that function's own chain)
+        r = nest_ld(r);  // (slot 0: that function's own chain)
         x = x.nest_parent;
     }
     return r;
@@ -282,59 +266,51 @@ struct Pool {
     pub thunks: []mut *mut ir.Func,
 }
 
-let mut g_pools: u.SymMap.[*mut Pool] = u.SymMap.[*mut Pool].{ keys: @ptr_from_int(*mut usize, 0),
-                                                               vals: @ptr_from_int(*mut *mut Pool, 0), cap: 0, len: 0 };
-
-fn key(g: *cast.CSym) []u8 {
+fn nest_key(g: *cast.CSym) []u8 {
     return u.addr_key(@int_from_ptr(g));
 }
 
 /// The trampolines of nested function g (made once: their functions declared).
-pub fn pool_of(g: *mut cast.CSym) *mut Pool {
-    let k = key(g);
+fn pool_of(g: *mut cast.CSym) *mut Pool {
+    let k = nest_key(g);
     let had = g_pools.get(k);
     if u.notnil(had) {
         return had;
     }
     let p = u.new.[Pool]();
     let base = u.f2("%s.%s", g.name, u.idec(g.uid));
-    let tab = ir.add_global(cg.M, ir.t_array(cg.T_ptr, POOL), u.cat2(base, ".chains"));
+    let tab = ir.add_global(M, ir.t_array(T_ptr, POOL), u.cat2(base, ".chains"));
     tab.init = ir.czero(tab.ty);
     tab.linkage = ir.LINK_INTERNAL;
     tab.align = 8;
     p.chains = tab.val;
-    let sig = cg.sig_of(g.ty.ret, cg.param_types(g), g.ty.params.len, g.ty.variadic, true);
+    let sig = sig_of(g.ty.ret, param_types(g), g.ty.params.len, g.ty.variadic, true);
     p.thunks = u.newn.[*mut ir.Func](NPOOL + 1)[0..NPOOL];
     let addrs = u.newn.[*mut ir.Value](NPOOL + 1);
     for i in 0..NPOOL {
-        let f = ir.add_function(cg.M, u.f2("%s.tramp.%s", base, u.zdec(i)), sig.ty);
+        let f = ir.add_function(M, u.f2("%s.tramp.%s", base, u.zdec(i)), sig.ty);
         f.linkage = ir.LINK_INTERNAL;
-        cg.mark_func(f, sig.plan);  // (the ABI's marks: a result through x8, in registers ...)
+        mark_func(f, sig.plan);  // (the ABI's marks: a result through x8, in registers ...)
         p.thunks[i] = f;
         addrs[i] = f.val;
     }
-    let fns = ir.add_global(cg.M, ir.t_array(cg.T_ptr, POOL), u.cat2(base, ".tramps"));
-    fns.init = ir.carray(cg.T_ptr, addrs[0..NPOOL]);
+    let fns = ir.add_global(M, ir.t_array(T_ptr, POOL), u.cat2(base, ".tramps"));
+    fns.init = ir.carray(T_ptr, addrs[0..NPOOL]);
     fns.linkage = ir.LINK_INTERNAL;
     fns.is_const = true;
     fns.align = 8;
     p.fns = fns.val;
-    let mut one: [1]*mut ir.Ty = [cg.T_ptr];
-    p.get = ir.add_function(cg.M, u.cat2(base, ".trampoline"), ir.t_fn(cg.T_ptr, one[..], false));
+    let mut one: [1]*mut ir.Ty = [T_ptr];
+    p.get = ir.add_function(M, u.cat2(base, ".trampoline"), ir.t_fn(T_ptr, one[..], false));
     p.get.linkage = ir.LINK_INTERNAL;
     g_pools.put(k, p);
     return p;
 }
 
-// The entries of variadic nested functions (entry_of), by function.
-let mut g_entries: u.SymMap.[*mut ir.Func] = u.SymMap.[*mut ir.Func].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                       vals: @ptr_from_int(*mut *mut ir.Func, 0),
-                                                                       cap: 0, len: 0 };
-
 /// The parameter types of variadic nested function g's entry: g's, then
 /// its chain.
-pub fn entry_params(g: *mut cast.CSym) []mut *mut cty.CType {
-    let ps = cg.param_types(g);
+fn entry_params(g: *mut cast.CSym) []mut *mut cty.CType {
+    let ps = param_types(g);
     let r = u.newn.[*mut cty.CType](ps.len + 2);
     for i in 0..ps.len {
         r[i] = ps[i];
@@ -344,21 +320,21 @@ pub fn entry_params(g: *mut cast.CSym) []mut *mut cty.CType {
 }
 
 /// The entry of variadic nested function g (declared once; defined with the
-/// trampolines, cgen_stmt.trampolines): a variadic function whose named
+/// trampolines, stmt_trampolines): a variadic function whose named
 /// arguments are g's and then its chain (so that va_start in it skips the
 /// chain, on every ABI), which calls g with a va_list of its variable
 /// arguments. A direct call of g calls it.
-pub fn entry_of(g: *mut cast.CSym) *mut ir.Func {
-    let k = key(g);
+fn entry_of(g: *mut cast.CSym) *mut ir.Func {
+    let k = nest_key(g);
     let had = g_entries.get(k);
     if u.notnil(had) {
         return had;
     }
     let ps = entry_params(g);
-    let sig = cg.sig_of(g.ty.ret, ps, ps.len, true, true);
-    let f = ir.add_function(cg.M, u.f2("%s.%s.entry", g.name, u.idec(g.uid)), sig.ty);
+    let sig = sig_of(g.ty.ret, ps, ps.len, true, true);
+    let f = ir.add_function(M, u.f2("%s.%s.entry", g.name, u.idec(g.uid)), sig.ty);
     f.linkage = ir.LINK_INTERNAL;
-    cg.mark_func(f, sig.plan);
+    mark_func(f, sig.plan);
     g_entries.put(k, f);
     return f;
 }
@@ -366,8 +342,7 @@ pub fn entry_of(g: *mut cast.CSym) *mut ir.Func {
 /// A direct call of variadic nested function g with arguments vs of types
 /// ats (nnamed of them named) from the function being generated: a call of
 /// its entry, the chain after the named arguments.
-pub fn call_variadic(g: *mut cast.CSym, ats: []mut *mut cty.CType, vs: []mut *mut ir.Value,
-                     nnamed: usize) *mut ir.Value {
+fn call_variadic(g: *mut cast.CSym, ats: []mut *mut cty.CType, vs: []mut *mut ir.Value, nnamed: usize) *mut ir.Value {
     let n = ats.len;
     let ts = u.newn.[*mut cty.CType](n + 2);
     let xs = u.newn.[*mut ir.Value](n + 2);
@@ -381,16 +356,16 @@ pub fn call_variadic(g: *mut cast.CSym, ats: []mut *mut cty.CType, vs: []mut *mu
     }
     ts[nnamed] = cty.pointer_to(cty.t_void);
     xs[nnamed] = chain_for(g);
-    let sig = cg.sig_of(g.ty.ret, ts[0..n + 1], nnamed + 1, true, false);
-    return gva.emit_call(sig.plan, sig.ty, entry_of(g).val, xs[0..n + 1]);
+    let sig = sig_of(g.ty.ret, ts[0..n + 1], nnamed + 1, true, false);
+    return emit_call(sig.plan, sig.ty, entry_of(g).val, xs[0..n + 1]);
 }
 
 // The index of nested function g's trampoline field in its enclosing function's record.
-fn field(g: *mut cast.CSym) u64 {
+fn nest_tramp_field(g: *mut cast.CSym) u64 {
     let p = g.nest_parent;
     for k in 0..p.tramps.len {
         if p.tramps.get(k) == g {
-            return lens_field(p) + @as(u64, cnest.lengths(p).len) + @as(u64, k);
+            return nest_lens_field(p) + @as(u64, cs.lengths(p).len) + @as(u64, k);
         }
     }
     return 0;
@@ -398,32 +373,31 @@ fn field(g: *mut cast.CSym) u64 {
 
 /// The address of nested function g (a trampoline's), in the function
 /// being generated.
-pub fn address(g: *mut cast.CSym) *mut ir.Value {
+fn nest_address(g: *mut cast.CSym) *mut ir.Value {
     let p = pool_of(g);
     let mut xs: [1]*mut ir.Value = [chain_for(g)];
-    return ir.call(B(), p.get.ty, p.get.val, xs[..]);
+    return ir.call(B, p.get.ty, p.get.val, xs[..]);
 }
 
 /// Before function s returns: the trampolines its call holds, given back.
-pub fn leave(s: *cast.CSym) void {
-    let F = cg.F;
-    if u.isnil(F) or u.isnil(F.rec) or (s.tramps.len == 0) or cg.terminated() {
+fn nest_leave(s: *cast.CSym) void {
+    if u.isnil(F) or u.isnil(F.rec) or (s.tramps.len == 0) or terminated() {
         return;
     }
     for g in s.tramps.items() {
         let p = pool_of(g);
-        let v = ir.ptrtoint(B(), ld(slot(F.rec, field(g))), cg.T_isz);
-        let has = ir.icmp(B(), ir.IntNE, v, cg.usz(0));
-        let yes = cg.new_block("tramp.free");
-        let done = cg.new_block("tramp.done");
-        ir.condbr(B(), has, yes, done);
-        cg.at_end(yes);
-        let at = ir.ptradd(B(), p.chains, ir.mul(B(), ir.sub(B(), v, cg.usz(1)), cg.usz(psz())));
-        let s0 = ir.store(B(), ir.czero(cg.T_ptr), at);
-        s0.align = @truncate(u32, psz());
+        let v = ir.ptrtoint(B, nest_ld(nest_slot(F.rec, nest_tramp_field(g))), T_isz);
+        let has = ir.icmp(B, ir.IntNE, v, usz(0));
+        let yes = new_block("tramp.free");
+        let done = new_block("tramp.done");
+        ir.condbr(B, has, yes, done);
+        at_end(yes);
+        let at = ir.ptradd(B, p.chains, ir.mul(B, ir.sub(B, v, usz(1)), usz(nest_psz())));
+        let s0 = ir.store(B, ir.czero(T_ptr), at);
+        s0.align = @truncate(u32, nest_psz());
         s0.flags = s0.flags | ir.F_VOLATILE;
-        ir.br(B(), done);
-        cg.at_end(done);
+        ir.br(B, done);
+        at_end(done);
     }
 }
 
@@ -431,56 +405,55 @@ pub fn leave(s: *cast.CSym) void {
 /// (its parameter): the one the record holds, else the first free slot,
 /// claimed with a compare-and-exchange of its chain from null to the
 /// record (a trap if none is free). F is set to a state of its own.
-pub fn define_get(g: *mut cast.CSym) void {
+fn define_get(g: *mut cast.CSym) void {
     let p = pool_of(g);
     let f = p.get;
-    let fld = field(g);
-    let st0 = u.new.[cg.FnState]();
+    let fld = nest_tramp_field(g);
+    let st0 = u.new.[FnState]();
     st0.f = f;
-    cg.F = st0;
-    st0.entry = cg.new_block("entry");
-    cg.at_end(st0.entry);
+    F = st0;
+    st0.entry = new_block("entry");
+    at_end(st0.entry);
     let rec = f.params[0];
-    let held = ir.ptrtoint(B(), ld(slot(rec, fld)), cg.T_isz);
-    let fresh = cg.new_block("claim");
-    let found = cg.new_block("found");
-    let have = ir.icmp(B(), ir.IntNE, held, cg.usz(0));
-    let from_entry = ir.insert_block(B());
-    ir.condbr(B(), have, found, fresh);
+    let held = ir.ptrtoint(B, nest_ld(nest_slot(rec, fld)), T_isz);
+    let fresh = new_block("claim");
+    let found = new_block("found");
+    let have = ir.icmp(B, ir.IntNE, held, usz(0));
+    let from_entry = ir.insert_block(B);
+    ir.condbr(B, have, found, fresh);
     // the claim: slot i from 0, until one is free
-    cg.at_end(fresh);
-    let loop_b = cg.new_block("try");
-    let next = cg.new_block("next");
-    let full = cg.new_block("full");
-    ir.br(B(), loop_b);
-    cg.at_end(loop_b);
-    let i = ir.phi(B(), cg.T_isz);
-    ir.add_incoming(i, cg.usz(0), fresh);
-    let at = ir.ptradd(B(), p.chains, ir.mul(B(), i, cg.usz(psz())));
-    let old = ir.cmpxchg(B(), at, ir.czero(cg.T_ptr), rec);
-    let got = ir.icmp(B(), ir.IntEQ, ir.ptrtoint(B(), old, cg.T_isz), cg.usz(0));
-    let claimed = cg.new_block("claimed");
-    ir.condbr(B(), got, claimed, next);
-    cg.at_end(next);
-    let i1 = ir.add(B(), i, cg.usz(1));
+    at_end(fresh);
+    let loop_b = new_block("try");
+    let next = new_block("next");
+    let full = new_block("full");
+    ir.br(B, loop_b);
+    at_end(loop_b);
+    let i = ir.phi(B, T_isz);
+    ir.add_incoming(i, usz(0), fresh);
+    let at = ir.ptradd(B, p.chains, ir.mul(B, i, usz(nest_psz())));
+    let old = ir.cmpxchg(B, at, ir.czero(T_ptr), rec);
+    let got = ir.icmp(B, ir.IntEQ, ir.ptrtoint(B, old, T_isz), usz(0));
+    let claimed = new_block("claimed");
+    ir.condbr(B, got, claimed, next);
+    at_end(next);
+    let i1 = ir.add(B, i, usz(1));
     ir.add_incoming(i, i1, next);
-    ir.condbr(B(), ir.icmp(B(), ir.IntULT, i1, cg.usz(POOL)), loop_b, full);
-    cg.at_end(full);
-    let none = u.newn.[*mut ir.Value](1);
-    _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, none[0..0]);
-    ir.unreachable(B());
-    cg.at_end(claimed);
-    let num = ir.add(B(), i, cg.usz(1));
-    st(ir.inttoptr(B(), num), slot(rec, fld));
-    ir.br(B(), found);
-    cg.at_end(found);
-    let n = ir.phi(B(), cg.T_isz);
+    ir.condbr(B, ir.icmp(B, ir.IntULT, i1, usz(POOL)), loop_b, full);
+    at_end(full);
+    _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+    ir.unreachable(B);
+    at_end(claimed);
+    let num = ir.add(B, i, usz(1));
+    nest_st(ir.inttoptr(B, num), nest_slot(rec, fld));
+    ir.br(B, found);
+    at_end(found);
+    let n = ir.phi(B, T_isz);
     ir.add_incoming(n, held, from_entry);
     ir.add_incoming(n, num, claimed);
-    let fa = ir.ptradd(B(), p.fns, ir.mul(B(), ir.sub(B(), n, cg.usz(1)), cg.usz(psz())));
-    ir.ret(B(), ld(fa));
+    let fa = ir.ptradd(B, p.fns, ir.mul(B, ir.sub(B, n, usz(1)), usz(nest_psz())));
+    ir.ret(B, nest_ld(fa));
     ir.remove_unreachable(f);
-    cg.F = u.nil.[cg.FnState]();
+    F = u.nil.[FnState]();
 }
 
 // -----------------------------------------------------------------------------
@@ -489,20 +462,12 @@ pub fn define_get(g: *mut cast.CSym) void {
 
 // A call of the function being generated, armed: its block that goes on
 // after a non-local goto, and what is in scope there.
-struct Site {
+struct NestSite {
     blk: *mut ir.Block,
     vla: *mut void,
 }
 
-let mut g_sites: u.List.[Site] = u.List.[Site].{ data: @ptr_from_int(*mut Site, 0), len: 0, cap: 0 };
-
-// What is in scope at each label of the function being generated that a
-// nested function jumps to.
-let mut g_labels: u.SymMap.[*mut void] = u.SymMap.[*mut void].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                vals: @ptr_from_int(*mut *mut void, 0), cap: 0,
-                                                                len: 0 };
-
-fn nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
+fn nest_nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
     for k in 0..p.nonlocal.len {
         if p.nonlocal.get(k) == l {
             return @int_cast(i32, k);
@@ -512,9 +477,9 @@ fn nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
 }
 
 // A call of the function being generated, hooked into the non-local gotos
-// to enclosing functions (hook): what each of their records' jmp_buf
+// to enclosing functions (nest_arm): what each of their records' jmp_buf
 // slots held before it.
-struct Hook {
+struct NestHook {
     blk: *mut ir.Block,
     vla: *mut void,
     at: []mut *mut ir.Value,     // the slots
@@ -522,40 +487,34 @@ struct Hook {
     fns: []mut *mut cast.CSym,   // whose
 }
 
-let mut g_hooks: u.List.[Hook] = u.List.[Hook].{ data: @ptr_from_int(*mut Hook, 0), len: 0, cap: 0 };
-
-// The jmp_buf of the function being generated for its hooks (nil: none yet).
-let mut g_hook_jb: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-
 // setjmp(jb), the linkers' or (WebAssembly) cgen_sjlj.ax's: nonzero after a
 // longjmp to jb; the function being generated is one that calls setjmp.
-fn setjmp(jb: *mut ir.Value) *mut ir.Value {
-    let F = cg.F;
+fn nest_setjmp(jb: *mut ir.Value) *mut ir.Value {
     F.f.returns_twice = true;
     F.f.noinline = true;
-    if cg.is_wasm {
-        return sj.setjmp_call(jb);
+    if is_wasm {
+        return sj_setjmp_call(jb);
     }
-    let mut ps: [1]*mut ir.Ty = [cg.T_ptr];
-    let f = ggb.extern_fn("__axc_setjmp", cg.T_i32, ps[..]);
+    let mut ps: [1]*mut ir.Ty = [T_ptr];
+    let f = extern_fn("__axc_setjmp", T_i32, ps[..]);
     let mut a: [1]*mut ir.Value = [jb];
-    return ir.call(B(), f.ty, f.val, a[..]);
+    return ir.call(B, f.ty, f.val, a[..]);
 }
 
-fn longjmp(jb: *mut ir.Value) void {
-    let mut ps: [2]*mut ir.Ty = [cg.T_ptr, cg.T_i32];
-    let f = ggb.extern_fn(u.pick(cg.is_wasm, "longjmp", "__axc_longjmp_restore"), cg.T_void, ps[..]);
-    let mut a: [2]*mut ir.Value = [jb, ir.cint(cg.T_i32, 1)];
-    _ = ir.call(B(), f.ty, f.val, a[..]);
-    ir.unreachable(B());
+fn nest_longjmp(jb: *mut ir.Value) void {
+    let mut ps: [2]*mut ir.Ty = [T_ptr, T_i32];
+    let f = extern_fn(u.pick(is_wasm, "longjmp", "__axc_longjmp_restore"), T_void, ps[..]);
+    let mut a: [2]*mut ir.Value = [jb, ir.cint(T_i32, 1)];
+    _ = ir.call(B, f.ty, f.val, a[..]);
+    ir.unreachable(B);
 }
 
 // Goes on at a new block if r is 0, else at the block returned.
-fn split(r: *mut ir.Value, name: []u8) *mut ir.Block {
-    let other = cg.new_block(name);
-    let cont = cg.new_block("nonlocal.call");
-    ir.condbr(B(), ir.icmp(B(), ir.IntNE, r, ir.cint(cg.T_i32, 0)), other, cont);
-    cg.at_end(cont);
+fn nest_split(r: *mut ir.Value, name: []u8) *mut ir.Block {
+    let other = new_block(name);
+    let cont = new_block("nonlocal.call");
+    ir.condbr(B, ir.icmp(B, ir.IntNE, r, ir.cint(T_i32, 0)), other, cont);
+    at_end(cont);
     return other;
 }
 
@@ -563,19 +522,18 @@ fn split(r: *mut ir.Value, name: []u8) *mut ir.Block {
 /// jumps to one of its labels, setjmp arms its jmp_buf for the call. And if
 /// it is nested in functions that nested functions jump to, and has
 /// cleanups in scope or trampolines, the call is hooked into those jumps:
-/// their records' jmp_buf slots get its own jmp_buf for the call (unhook
+/// their records' jmp_buf slots get its own jmp_buf for the call (nest_unhook
 /// gives back what they held), and a jump through it calls the cleanups,
-/// gives back the trampolines and goes on to what the slots held (finish).
-pub fn arm() void {
-    let F = cg.F;
+/// gives back the trampolines and goes on to what the slots held (nest_finish).
+fn nest_arm() void {
     if u.isnil(F) or u.isnil(F.sym) {
         return;
     }
-    if cg.terminated() {
-        g_pending.push(NONE);
+    if terminated() {
+        g_pending.push(NEST_NONE);
         return;
     }
-    if u.notnil(F.sym.nest_parent) and (gv.has_cleanups() or ((F.sym.tramps.len > 0) and u.notnil(F.rec))) {
+    if u.notnil(F.sym.nest_parent) and (vla_has_cleanups() or ((F.sym.tramps.len > 0) and u.notnil(F.rec))) {
         let mut fns = u.List.[*mut cast.CSym].empty();
         let mut a = F.sym.nest_parent;
         while u.notnil(a) {
@@ -586,89 +544,81 @@ pub fn arm() void {
         }
         if fns.len > 0 {
             if u.isnil(g_hook_jb) {
-                g_hook_jb = cg.alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.hook");
+                g_hook_jb = alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.hook");
             }
             let n = fns.len;
-            let h = Hook.{ blk: u.nil.[ir.Block](), vla: gv.snapshot(), at: u.newn.[*mut ir.Value](n + 1)[0..n],
-                           saved: u.newn.[*mut ir.Value](n + 1)[0..n], fns: fns.items_mut() };
+            let h = NestHook.{ blk: u.nil.[ir.Block](), vla: vla_snapshot(), at: u.newn.[*mut ir.Value](n + 1)[0..n],
+                               saved: u.newn.[*mut ir.Value](n + 1)[0..n], fns: fns.items_mut() };
             for k in 0..n {
-                h.at[k] = slot(record_of(fns.get(k)), jb_field(fns.get(k)));
-                h.saved[k] = ld(h.at[k]);
-                st(g_hook_jb, h.at[k]);
+                h.at[k] = nest_slot(nest_record_of(fns.get(k)), nest_jb_field(fns.get(k)));
+                h.saved[k] = nest_ld(h.at[k]);
+                nest_st(g_hook_jb, h.at[k]);
             }
             let mut hh = h;
-            hh.blk = split(setjmp(g_hook_jb), "nonlocal.hooked");
+            hh.blk = nest_split(nest_setjmp(g_hook_jb), "nonlocal.hooked");
             g_hooks.push(hh);
             g_pending.push(g_hooks.len - 1);
         } else {
-            g_pending.push(NONE);
+            g_pending.push(NEST_NONE);
         }
     } else {
-        g_pending.push(NONE);
+        g_pending.push(NEST_NONE);
     }
     if (F.sym.nonlocal.len == 0) or u.isnil(F.rec) {
         return;
     }
-    let jb = ld(slot(F.rec, jb_field(F.sym)));
-    let site = split(setjmp(jb), "nonlocal.site");
-    g_sites.push(Site.{ blk: site, vla: gv.snapshot() });
+    let jb = nest_ld(nest_slot(F.rec, nest_jb_field(F.sym)));
+    let site = nest_split(nest_setjmp(jb), "nonlocal.site");
+    g_sites.push(NestSite.{ blk: site, vla: vla_snapshot() });
 }
 
-const NONE: usize = 0xFFFF_FFFF;
+const NEST_NONE: usize = 0xFFFF_FFFF;
 
-// For each armed call being generated (innermost last), its hook in
-// g_hooks, or NONE.
-let mut g_pending: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
-
-/// After a call that arm armed: the slots it hooked given back.
-pub fn unhook() void {
-    if u.isnil(cg.F) or u.isnil(cg.F.sym) or (g_pending.len == 0) {
+/// After a call that nest_arm armed: the slots it hooked given back.
+fn nest_unhook() void {
+    if u.isnil(F) or u.isnil(F.sym) or (g_pending.len == 0) {
         return;
     }
     let k = g_pending.pop();
-    if (k == NONE) or cg.terminated() {
+    if (k == NEST_NONE) or terminated() {
         return;
     }
     let h = g_hooks.get(k);
     for i in 0..h.at.len {
-        st(h.saved[i], h.at[i]);
+        nest_st(h.saved[i], h.at[i]);
     }
 }
 
 /// Label l of the function being generated begins here.
-pub fn label(l: *mut cast.CSym) void {
-    let F = cg.F;
-    if u.notnil(F) and u.notnil(F.sym) and (nonlocal_index(F.sym, l) >= 0) {
-        g_labels.put(u.addr_key(@int_from_ptr(l)), gv.snapshot());
+fn nest_label(l: *mut cast.CSym) void {
+    if u.notnil(F) and u.notnil(F.sym) and (nest_nonlocal_index(F.sym, l) >= 0) {
+        g_labels.put(u.addr_key(@int_from_ptr(l)), vla_snapshot());
     }
 }
 
 /// A goto to label l of an enclosing function (a non-local goto).
-pub fn goto_(l: *mut cast.CSym) void {
-    let F = cg.F;
-    gv.release_to(0);
-    if cg.terminated() {
+fn nest_goto(l: *mut cast.CSym) void {
+    vla_release_to(0);
+    if terminated() {
         return;
     }
-    leave(F.sym);
+    nest_leave(F.sym);
     let p = l.owner;
-    let r = record_of(p);
-    let k = nonlocal_index(p, l);
-    st(ir.inttoptr(B(), cg.usz(@as(u64, @bit_cast(u32, k)) + 1)), slot(r, jb_field(p) + 1));
-    longjmp(ld(slot(r, jb_field(p))));
-    cg.continue_after();
+    let r = nest_record_of(p);
+    let k = nest_nonlocal_index(p, l);
+    nest_st(ir.inttoptr(B, usz(@as(u64, @bit_cast(u32, k)) + 1)), nest_slot(r, nest_jb_field(p) + 1));
+    nest_longjmp(nest_ld(nest_slot(r, nest_jb_field(p))));
+    continue_after();
 }
 
 /// After the body of the function being generated: at each armed call, the
-/// goto that a nested function's non-local goto goes on as (label_block:
-/// a label's block).
-pub fn finish(label_block: fn(*mut cast.CSym) *mut ir.Block) void {
-    let F = cg.F;
+/// goto that a nested function's non-local goto goes on as.
+fn nest_finish() void {
     if u.isnil(F.sym) or ((g_sites.len == 0) and (g_hooks.len == 0)) {
         return;
     }
     let ls = F.sym.nonlocal.items();
-    let saved = gv.snapshot();
+    let saved = vla_snapshot();
     let mut i: usize = 0;
     let mut j: usize = 0;
     // (a cleanup's call in one of these is armed too: g_sites and g_hooks grow)
@@ -680,58 +630,57 @@ pub fn finish(label_block: fn(*mut cast.CSym) *mut ir.Block) void {
             // (whose jump's number is not 0)
             let h = g_hooks.get(j);
             j += 1;
-            cg.at_end(h.blk);
-            gv.restore(h.vla);
-            gv.release_to(0);
-            if cg.terminated() {
+            at_end(h.blk);
+            vla_restore(h.vla);
+            vla_release_to(0);
+            if terminated() {
                 continue;
             }
-            leave(F.sym);
+            nest_leave(F.sym);
             for k in 0..h.at.len {
-                st(h.saved[k], h.at[k]);
+                nest_st(h.saved[k], h.at[k]);
             }
             for k in 0..h.fns.len {
-                let num = slot(record_of(h.fns[k]), jb_field(h.fns[k]) + 1);
-                let t = ir.ptrtoint(B(), ld(num), cg.T_isz);
-                let yes = cg.new_block("nonlocal.on");
-                let no = cg.new_block("nonlocal.next");
-                ir.condbr(B(), ir.icmp(B(), ir.IntNE, t, cg.usz(0)), yes, no);
-                cg.at_end(yes);
-                longjmp(h.saved[k]);
-                cg.at_end(no);
+                let num = nest_slot(nest_record_of(h.fns[k]), nest_jb_field(h.fns[k]) + 1);
+                let t = ir.ptrtoint(B, nest_ld(num), T_isz);
+                let yes = new_block("nonlocal.on");
+                let no = new_block("nonlocal.next");
+                ir.condbr(B, ir.icmp(B, ir.IntNE, t, usz(0)), yes, no);
+                at_end(yes);
+                nest_longjmp(h.saved[k]);
+                at_end(no);
             }
-            ir.unreachable(B());
+            ir.unreachable(B);
             continue;
         }
         let site = g_sites.get(i);
         i += 1;
-        cg.at_end(site.blk);
-        let num = slot(F.rec, jb_field(F.sym) + 1);
-        let t = ir.ptrtoint(B(), ld(num), cg.T_isz);
-        st(ir.czero(cg.T_ptr), num);  // (arrived: a hook on the way to another jump tells it from this one)
-        let none = cg.new_block("nonlocal.none");
-        let sw = ir.switch_(B(), t, none);
+        at_end(site.blk);
+        let num = nest_slot(F.rec, nest_jb_field(F.sym) + 1);
+        let t = ir.ptrtoint(B, nest_ld(num), T_isz);
+        nest_st(ir.czero(T_ptr), num);  // (arrived: a hook on the way to another jump tells it from this one)
+        let none = new_block("nonlocal.none");
+        let sw = ir.switch_(B, t, none);
         for k in 0..ls.len {
             let l = ls[k];
-            let b = cg.new_block("nonlocal.goto");
-            ir.add_case(sw, cg.usz(@as(u64, k) + 1), b);
-            cg.at_end(b);
+            let b = new_block("nonlocal.goto");
+            ir.add_case(sw, usz(@as(u64, k) + 1), b);
+            at_end(b);
             let at = g_labels.get(u.addr_key(@int_from_ptr(l)));
-            if not u.isvnil(at) and gv.is_prefix(at, site.vla) {
-                gv.restore(site.vla);
-                gv.release_to(svla.depth(l));
-                if not cg.terminated() {
-                    ir.br(B(), label_block(l));
+            if not u.isvnil(at) and vla_is_prefix(at, site.vla) {
+                vla_restore(site.vla);
+                vla_release_to(cs.vla_depth(l));
+                if not terminated() {
+                    ir.br(B, label_block(l));
                 }
             } else {
                 // (into a scope the call is not in: undefined, 6.8.6.1p1)
-                let no = u.newn.[*mut ir.Value](1);
-                _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, no[0..0]);
-                ir.unreachable(B());
+                _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+                ir.unreachable(B);
             }
         }
-        cg.at_end(none);
-        ir.unreachable(B());
+        at_end(none);
+        ir.unreachable(B);
     }
-    gv.restore(saved);
+    vla_restore(saved);
 }

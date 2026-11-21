@@ -1,0 +1,625 @@
+// =============================================================================
+// cpp_pragma.ax - #pragma and _Pragma handling (pack, STDC, GCC, push/pop
+// macro, weak, message), part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cpp_conv.ax" as cv;
+import "cpp_lex.ax" as lx;
+import "cpragma.ax" as cp;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Pragmas (6.10.6 and 6.10.9; docs/c.md lists them), in every mode. One that
+// changes a value the parser needs (pack, GCC visibility) gives a token for
+// it (lx.PK_PRAGMA); the others act here, or are recorded (cpragma.ax).
+// Unknown pragmas are ignored, with the warning C4111 under
+// --c-warn-unknown-pragmas; a malformed known one is ignored with C4112.
+// -----------------------------------------------------------------------------
+fn no_tok() lx.PTok {
+    return lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
+}
+
+fn pragma_tok(kind: i32, value: u64, sp: u.Span) lx.PTok {
+    return lx.mktok(lx.PK_PRAGMA, cp.event(kind, value), "", sp);
+}
+
+fn malformed(sp: u.Span, what: []u8) lx.PTok {
+    _ = dg.warning(sp, "C4112", u.f1("malformed '#pragma %s', ignored", what));
+    return no_tok();
+}
+
+// The characters of a string literal's spelling as _Pragma takes them
+// (6.10.9): the prefix and the quotes dropped, \" and \\ made " and \.
+fn destringize(text: []u8) []u8 {
+    let mut a: usize = 0;
+    while (a < text.len) and (text[a] != '"') {
+        a += 1;
+    }
+    let mut b = u.Buf.init();
+    let mut i = a + 1;
+    while (i + 1) < text.len {
+        let c = text[i];
+        if (c == '\\') and ((i + 2) < text.len) and ((text[i + 1] == '"') or (text[i + 1] == '\\')) {
+            b.c(text[i + 1]);
+            i += 2;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+    return b.done();
+}
+
+// The characters of a narrow string literal's spelling (escape sequences decoded).
+fn string_text(P: *PP, t: *lx.PTok) []u8 {
+    let mut units = u.List.[u32].empty();
+    _ = cv.decode(t.text[1..t.text.len - 1], ct.ENC_NONE, P.o, t.span, &mut units, false);
+    let mut b = u.Buf.init();
+    for x in units.items() {
+        b.c(@truncate(u8, x));
+    }
+    units.deinit();
+    return b.done();
+}
+
+// `( "text" )` or `"text"` (adjacent strings joined): the text, or nil.
+fn pragma_string(P: *PP, ts0: []lx.PTok) []u8 {
+    let mut ts = ts0;
+    if (ts.len >= 2) and lx.is_punct(&ts[0], ct.P_LPAREN) and lx.is_punct(&ts[ts.len - 1], ct.P_RPAREN) {
+        ts = ts[1..ts.len - 1];
+    }
+    if ts.len == 0 {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    for k in 0..ts.len {
+        if (ts[k].kind != lx.PK_STRING) or (ts[k].id != ct.ENC_NONE) {
+            return u.nosym();
+        }
+        b.s(string_text(P, &ts[k]));
+    }
+    return b.done();
+}
+
+// A pragma's tokens ts (its name first) at sp: what it says done or recorded.
+fn do_pragma(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts.len == 0) or (ts[0].kind != lx.PK_IDENT) {
+        if ts.len > 0 {
+            unknown_pragma(P, ts, sp);
+        }
+        return no_tok();
+    }
+    let n = ts[0].name;
+    if u.str_eq(n, "once") {
+        P.once.put(once_key(cur_src(P).path), 1);
+        return no_tok();
+    }
+    if u.str_eq(n, "pack") {
+        return pragma_pack(P, ts[1..], sp);
+    }
+    if u.str_eq(n, "ms_struct") and P.o.gnu and (tg.g_arch == tg.ARCH_X64) {
+        // (a GNU dialect on x86-64: the Microsoft layout of the structures
+        // and unions defined after `on`, until `off` or `reset`)
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) {
+            let w = ts[1].name;
+            if u.str_eq(w, "on") {
+                return pragma_tok(cp.EV_MS_STRUCT, 1, sp);
+            }
+            if u.str_eq(w, "off") or u.str_eq(w, "reset") {
+                return pragma_tok(cp.EV_MS_STRUCT, 0, sp);
+            }
+        }
+        return malformed(sp, "ms_struct");
+    }
+    if u.str_eq(n, "push_macro") or u.str_eq(n, "pop_macro") {
+        let name = pragma_string(P, ts[1..]);
+        if u.isnos(name) or (name.len == 0) {
+            return malformed(sp, n);
+        }
+        macro_stack(P, u.intern(name), u.str_eq(n, "push_macro"));
+        return no_tok();
+    }
+    if u.str_eq(n, "weak") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) {
+            cp.add_weak(ts[1].name, "", sp);
+        } else if (ts.len == 4) and (ts[1].kind == lx.PK_IDENT) and lx.is_punct(&ts[2], ct.P_ASSIGN) and
+                  (ts[3].kind == lx.PK_IDENT) {
+            cp.add_weak(ts[1].name, ts[3].name, sp);
+        } else {
+            return malformed(sp, "weak");
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "message") {
+        // (its operand is macro-replaced)
+        let text = pragma_string(P, expand_list(P, ts[1..]));
+        if u.isnos(text) {
+            return malformed(sp, "message");
+        }
+        _ = dg.warning(sp, "C4110", u.cat2("#pragma message: ", text));
+        return no_tok();
+    }
+    if u.str_eq(n, "STDC") {
+        return pragma_stdc(P, ts[1..], sp);
+    }
+    if u.str_eq(n, "GCC") and (ts.len >= 2) and (ts[1].kind == lx.PK_IDENT) {
+        return pragma_gcc(P, ts[1..], sp);
+    }
+    unknown_pragma(P, ts, sp);
+    return no_tok();
+}
+
+fn unknown_pragma(P: *PP, ts: []lx.PTok, sp: u.Span) void {
+    if P.o.warn_pragmas {
+        _ = dg.warning(sp, "C4111", u.f1("unknown pragma '%s', ignored", spelling(ts)));
+    }
+}
+
+// #pragma push_macro("name") and pop_macro("name"): name's definition (or
+// that it has none) saved, or the last one saved made its definition again.
+fn macro_stack(P: *mut PP, name: []u8, push: bool) void {
+    let mut st = P.pushed.get(name);
+    if push {
+        if u.isnil(st) {
+            st = u.new.[MacroStack]();
+            P.pushed.put(name, st);
+        }
+        st.defs.push(lookup(P, name));
+        return;
+    }
+    if u.notnil(st) and (st.defs.len > 0) {
+        let m = st.defs.pop();
+        let cur = lookup(P, name);
+        if u.notnil(cur) and cur.protected {
+            return;
+        }
+        P.macros.put(name, m);
+    }
+}
+
+// The value of `#pragma pack(n)`: 1, 2, 4, 8 or 16, or 0 if t is none.
+fn pack_value(t: *lx.PTok) u64 {
+    if (t.kind != lx.PK_NUMBER) or not all_digits(t.text) {
+        return 0;
+    }
+    let v = u.atol(t.text);
+    if (v == 1) or (v == 2) or (v == 4) or (v == 8) or (v == 16) {
+        return @bit_cast(u64, v);
+    }
+    return 0;
+}
+
+// #pragma pack(): `()`, `(n)`, `(push)`, `(push, n)`, `(push, id)`,
+// `(push, id, n)`, `(pop)`, `(pop, id)`, `(pop, n)`, `(show)`. The value
+// it sets: the strictest alignment a structure's members then get.
+fn pragma_pack(P: *mut PP, ts0: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts0.len < 2) or not lx.is_punct(&ts0[0], ct.P_LPAREN) or not lx.is_punct(&ts0[ts0.len - 1], ct.P_RPAREN) {
+        return malformed(sp, "pack");
+    }
+    // the operands, without their commas
+    let mut ops = u.List.[lx.PTok].empty();
+    let inner = ts0[1..ts0.len - 1];
+    for k in 0..inner.len {
+        if (k % 2) == 1 {
+            if not lx.is_punct(&inner[k], ct.P_COMMA) {
+                return malformed(sp, "pack");
+            }
+            continue;
+        }
+        ops.push(inner[k]);
+    }
+    if (inner.len > 0) and ((inner.len % 2) == 0) {
+        return malformed(sp, "pack");
+    }
+    let os = ops.items();
+    if os.len == 0 {
+        P.pack = 0;
+        return pragma_tok(cp.EV_PACK, 0, sp);
+    }
+    if (os[0].kind == lx.PK_NUMBER) and (os.len == 1) {
+        let v = pack_value(&os[0]);
+        if v == 0 {
+            return malformed(sp, "pack");
+        }
+        P.pack = v;
+        return pragma_tok(cp.EV_PACK, v, sp);
+    }
+    if os[0].kind != lx.PK_IDENT {
+        return malformed(sp, "pack");
+    }
+    let what = os[0].name;
+    if u.str_eq(what, "show") and (os.len == 1) {
+        let mut v = "the types' alignments (no value)";
+        if P.pack != 0 {
+            v = u.udec(P.pack);
+        }
+        _ = dg.warning(sp, "C4114", u.cat2("#pragma pack: ", v));
+        return no_tok();
+    }
+    if u.str_eq(what, "push") and (os.len <= 3) {
+        let mut id: []u8 = "";
+        let mut v = P.pack;
+        for k in 1..os.len {
+            if (os[k].kind == lx.PK_IDENT) and (k == 1) {
+                id = os[k].name;
+            } else if (os[k].kind == lx.PK_NUMBER) and (k == (os.len - 1)) {
+                v = pack_value(&os[k]);
+                if v == 0 {
+                    return malformed(sp, "pack");
+                }
+            } else {
+                return malformed(sp, "pack");
+            }
+        }
+        P.packs.push(Pack.{ value: P.pack, id: id });
+        P.pack = v;
+        return pragma_tok(cp.EV_PACK, v, sp);
+    }
+    if u.str_eq(what, "pop") and (os.len <= 2) {
+        if (os.len == 2) and (os[1].kind == lx.PK_IDENT) {
+            // (back to the entry pushed with that name, and past it)
+            let mut k = P.packs.len;
+            while k > 0 {
+                k -= 1;
+                if u.str_eq(P.packs.get(k).id, os[1].name) {
+                    P.pack = P.packs.get(k).value;
+                    P.packs.len = k;
+                    break;
+                }
+            }
+        } else if P.packs.len > 0 {
+            P.pack = P.packs.pop().value;
+        }
+        if (os.len == 2) and (os[1].kind == lx.PK_NUMBER) {
+            let v = pack_value(&os[1]);
+            if v == 0 {
+                return malformed(sp, "pack");
+            }
+            P.pack = v;
+        }
+        return pragma_tok(cp.EV_PACK, P.pack, sp);
+    }
+    return malformed(sp, "pack");
+}
+
+// #pragma STDC FP_CONTRACT, FENV_ACCESS, CX_LIMITED_RANGE (on-off-switch),
+// and C23's FENV_ROUND (a direction). Not macro-replaced (6.10.6p2).
+// FENV_ACCESS, FENV_ROUND and FENV_DEC_ROUND are honoured (an event at the
+// next token, for the parser: cpragma.ax, EV_FENV_ACCESS, EV_FENV_ROUND,
+// EV_FENV_DEC_ROUND; docs/c.md, "The
+// floating-point environment"). No floating operations are ever
+// contracted (an FMA is only made where the program calls fma), so
+// FP_CONTRACT OFF holds always, and ON allows what is not done;
+// CX_LIMITED_RANGE is accepted (it allows what the implementation may then
+// do, and asks for nothing). WebAssembly has no rounding modes: there
+// FENV_ROUND's directed modes are C4113. FENV_DEC_ROUND (C23 7.6.3) is an
+// event too (EV_FENV_DEC_ROUND), in every direction and on every target.
+fn pragma_stdc(P: *PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    _ = P;
+    if (ts.len != 2) or (ts[0].kind != lx.PK_IDENT) or (ts[1].kind != lx.PK_IDENT) {
+        return malformed(sp, "STDC");
+    }
+    let n = ts[0].name;
+    let v = ts[1].name;
+    if u.str_eq(n, "FENV_ROUND") {
+        let names = ["FE_DYNAMIC", "FE_TONEAREST", "FE_UPWARD", "FE_DOWNWARD", "FE_TOWARDZERO"];
+        for k in @as(usize, 0)..names.len {
+            if u.str_eq(v, names[k]) {
+                if (k >= 2) and tg.is_wasm() {
+                    _ = dg.warning(sp, "C4113",
+                                   u.f1("'#pragma STDC FENV_ROUND %s' is not honoured: WebAssembly rounds to nearest",
+                                        v));
+                    return no_tok();
+                }
+                return pragma_tok(cp.EV_FENV_ROUND, @as(u64, @truncate(u32, k)), sp);
+            }
+        }
+        if u.str_eq(v, "FE_TONEARESTFROMZERO") {
+            _ = dg.warning(sp, "C4113",
+                           "'#pragma STDC FENV_ROUND FE_TONEARESTFROMZERO' is not honoured: no target has that direction");
+            return no_tok();
+        }
+        return malformed(sp, "STDC FENV_ROUND");
+    }
+    if u.str_eq(n, "FENV_DEC_ROUND") {
+        // (the decimal floating types' static direction, C23 7.6.3: an
+        // event for the parser, as FENV_ROUND's; the decimal arithmetic is
+        // software on every target, so every direction is honoured)
+        let names = ["FE_DEC_DYNAMIC", "FE_DEC_TONEAREST", "FE_DEC_DOWNWARD", "FE_DEC_UPWARD", "FE_DEC_TOWARDZERO",
+                     "FE_DEC_TONEARESTFROMZERO"];
+        for k in @as(usize, 0)..names.len {
+            if u.str_eq(v, names[k]) {
+                return pragma_tok(cp.EV_FENV_DEC_ROUND, @as(u64, @truncate(u32, k)), sp);
+            }
+        }
+        return malformed(sp, "STDC FENV_DEC_ROUND");
+    }
+    let sw = u.str_eq(v, "ON") or u.str_eq(v, "OFF") or u.str_eq(v, "DEFAULT");
+    if not sw or not (u.str_eq(n, "FP_CONTRACT") or u.str_eq(n, "FENV_ACCESS") or u.str_eq(n, "CX_LIMITED_RANGE")) {
+        return malformed(sp, "STDC");
+    }
+    if u.str_eq(n, "FENV_ACCESS") {
+        let mut on: u64 = 0;
+        if u.str_eq(v, "ON") {
+            on = 1;
+        }
+        return pragma_tok(cp.EV_FENV_ACCESS, on, sp);
+    }
+    return no_tok();
+}
+
+// #pragma GCC diagnostic, visibility, poison, system_header, warning, error,
+// dependency; the functions' options (optimize, target, push_options,
+// pop_options, reset_options: an event, EV_FNOPTS); the loop hints (unroll,
+// ivdep, novector: an event at the loop, EV_LOOP).
+fn pragma_gcc(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    let n = ts[0].name;
+    if u.str_eq(n, "diagnostic") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) and
+           (u.str_eq(ts[1].name, "push") or u.str_eq(ts[1].name, "pop")) {
+            cp.diagnostic(sp, ts[1].name, "");
+            return no_tok();
+        }
+        if (ts.len == 3) and (ts[1].kind == lx.PK_IDENT) and (ts[2].kind == lx.PK_STRING) and
+           (u.str_eq(ts[1].name, "ignored") or u.str_eq(ts[1].name, "warning") or u.str_eq(ts[1].name, "error")) {
+            let code = cp.option_code(string_text(P, &ts[2]));
+            if not u.isnos(code) {
+                // (several codes: a rule for each)
+                let mut start: usize = 0;
+                for k in 0..code.len + 1 {
+                    if (k == code.len) or (code[k] == ',') {
+                        if (k > start) or (code.len == 0) {
+                            cp.diagnostic(sp, ts[1].name, u.intern(code[start..k]));
+                        }
+                        start = k + 1;
+                    }
+                }
+            }
+            return no_tok();
+        }
+        if (ts.len >= 2) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "ignored_attributes") {
+            return no_tok();
+        }
+        return malformed(sp, "GCC diagnostic");
+    }
+    if u.str_eq(n, "visibility") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "pop") {
+            let mut v: u64 = 0;
+            if P.vis.len > 0 {
+                _ = P.vis.pop();
+            }
+            if P.vis.len > 0 {
+                v = P.vis.last();
+            }
+            return pragma_tok(cp.EV_VISIBILITY, v, sp);
+        }
+        if (ts.len == 5) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "push") and
+           lx.is_punct(&ts[2], ct.P_LPAREN) and (ts[3].kind == lx.PK_IDENT) and lx.is_punct(&ts[4], ct.P_RPAREN) {
+            let names = ["default", "hidden", "protected", "internal"];
+            for k in 0..names.len {
+                if u.str_eq(ts[3].name, names[k]) {
+                    P.vis.push(@as(u64, k));
+                    return pragma_tok(cp.EV_VISIBILITY, @as(u64, k), sp);
+                }
+            }
+        }
+        return malformed(sp, "GCC visibility");
+    }
+    if u.str_eq(n, "poison") {
+        for k in 1..ts.len {
+            if ts[k].kind != lx.PK_IDENT {
+                return malformed(sp, "GCC poison");
+            }
+        }
+        for k in 1..ts.len {
+            P.poisoned.put(ts[k].name, 1);
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "system_header") {
+        // (not in the main file, where it means nothing)
+        if P.files.len > 1 {
+            cp.system_header(sp);
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "warning") or u.str_eq(n, "error") {
+        let text = pragma_string(P, expand_list(P, ts[1..]));
+        if u.isnos(text) {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        if u.str_eq(n, "error") {
+            _ = dg.err(sp, "C1040", u.cat2("#pragma GCC error: ", text));
+        } else {
+            _ = dg.warning(sp, "C4103", u.cat2("#pragma GCC warning: ", text));
+        }
+        return no_tok();
+    }
+    // the options of the functions defined after them (as the attributes
+    // optimize and target: csema_gnu.pragma_options)
+    if u.str_eq(n, "push_options") or u.str_eq(n, "pop_options") or u.str_eq(n, "reset_options") {
+        if ts.len != 1 {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        if u.str_eq(n, "push_options") {
+            P.fnopts_saved.push(P.fnopts);
+            return no_tok();
+        }
+        if u.str_eq(n, "pop_options") {
+            if P.fnopts_saved.len == 0 {
+                _ = dg.warning(sp, "C4112", "'#pragma GCC pop_options' without a 'push_options', ignored");
+                return no_tok();
+            }
+            P.fnopts = P.fnopts_saved.pop();
+        } else {
+            P.fnopts = 0;
+        }
+        return pragma_tok(cp.EV_FNOPTS, P.fnopts, sp);
+    }
+    if u.str_eq(n, "optimize") or u.str_eq(n, "target") {
+        return pragma_fnopts(P, ts, sp);
+    }
+    // the loop pragmas: of the loop statement right after them
+    if u.str_eq(n, "unroll") {
+        let xs = expand_list(P, ts[1..]);
+        if (xs.len != 1) or (xs[0].kind != lx.PK_NUMBER) {
+            return malformed(sp, "GCC unroll");
+        }
+        let v = number_value(xs[0].text);
+        if (v < 0) or (v > 65534) {
+            return malformed(sp, "GCC unroll");
+        }
+        return pragma_tok(cp.EV_LOOP, @as(u64, @bit_cast(u64, v)) + 1, sp);
+    }
+    if u.str_eq(n, "ivdep") or u.str_eq(n, "novector") {
+        if ts.len != 1 {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        let mut v = cp.LH_IVDEP;
+        if u.str_eq(n, "novector") {
+            v = cp.LH_NOVECTOR;
+        }
+        return pragma_tok(cp.EV_LOOP, @as(u64, v), sp);
+    }
+    if u.str_eq(n, "dependency") {
+        return pragma_dependency(P, ts[1..], sp);
+    }
+    unknown_pragma(P, ts, sp);
+    return no_tok();
+}
+
+// The value of a decimal integer constant's spelling (no suffix), or -1.
+fn number_value(t: []u8) i64 {
+    if (t.len == 0) or (t.len > 9) {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    for c in t {
+        if (c < '0') or (c > '9') {
+            return -1;
+        }
+        v = (v * 10) + @as(i64, c - '0');
+    }
+    return v;
+}
+
+// The optimizer's level an option of `#pragma GCC optimize` asks for (as
+// the attribute: "O0" ... "O3", "-O2", "Os" and "Oz" 2, "Og" and "O" 1, a
+// number 0 to 3), or -1 for another option (ignored).
+fn level_option(s0: []u8) i32 {
+    let mut s = s0;
+    if (s.len > 0) and (s[0] == '-') {
+        s = s[1..];
+    }
+    if (s.len == 1) and (s[0] >= '0') and (s[0] <= '3') {
+        return @as(i32, s[0] - '0');
+    }
+    if u.str_eq(s, "O") or u.str_eq(s, "Og") or u.str_eq(s, "O1") {
+        return 1;
+    }
+    if u.str_eq(s, "Os") or u.str_eq(s, "Oz") or u.str_eq(s, "O2") {
+        return 2;
+    }
+    if u.str_eq(s, "O0") {
+        return 0;
+    }
+    if u.str_eq(s, "O3") {
+        return 3;
+    }
+    return -1;
+}
+
+// `#pragma GCC optimize (options)` and `#pragma GCC target (extensions)`:
+// the options are strings (each a comma-separated list) or numbers, in
+// parentheses or not, separated by commas; the functions defined after it
+// get them, added to those in force.
+fn pragma_fnopts(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    let n = ts[0].name;
+    let mut xs = ts[1..];
+    if (xs.len >= 2) and lx.is_punct(&xs[0], ct.P_LPAREN) and lx.is_punct(&xs[xs.len - 1], ct.P_RPAREN) {
+        xs = xs[1..xs.len - 1];
+    }
+    let mut opts = u.List.[[]u8].empty();
+    for k in 0..xs.len {
+        if (k % 2) == 1 {
+            if not lx.is_punct(&xs[k], ct.P_COMMA) {
+                return malformed(sp, u.cat2("GCC ", n));
+            }
+            continue;
+        }
+        if (xs[k].kind == lx.PK_STRING) and (xs[k].id == ct.ENC_NONE) {
+            let parts = u.split(string_text(P, &xs[k]), ',', 1000);
+            for piece in parts.items() {
+                if piece.len > 0 {
+                    opts.push(piece);
+                }
+            }
+        } else if (xs[k].kind == lx.PK_NUMBER) and u.str_eq(n, "optimize") {
+            opts.push(xs[k].text);
+        } else {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+    }
+    if (opts.len == 0) or ((xs.len % 2) == 0) {
+        return malformed(sp, u.cat2("GCC ", n));
+    }
+    let mut level = cp.fn_level(P.fnopts);
+    let mut target = cp.fn_target(P.fnopts);
+    for o in opts.items() {
+        if u.str_eq(n, "optimize") {
+            let l = level_option(o);
+            if l >= 0 {
+                level = l;
+            }
+            continue;
+        }
+        let r = tg.parse_features(o);
+        if not u.isnos(r.bad) {
+            _ = dg.warning(sp, "C4112",
+                           u.f1("'#pragma GCC target': the extension '%s' is not one this target has, and is ignored",
+                                r.bad));
+            continue;
+        }
+        if target.len > 0 {
+            target = u.cat3(target, ",", o);
+        } else {
+            target = o;
+        }
+    }
+    if (level == cp.fn_level(P.fnopts)) and u.str_eq(target, cp.fn_target(P.fnopts)) {
+        return no_tok();  // (nothing changes)
+    }
+    P.fnopts = cp.fn_options(level, target);
+    return pragma_tok(cp.EV_FNOPTS, P.fnopts, sp);
+}
+
+// `#pragma GCC dependency "file" [text]`: the warning C4115 (with the
+// text) if the file, looked for as `#include "file"` would be, was changed
+// after the current one.
+fn pragma_dependency(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts.len == 0) or ((ts[0].kind != lx.PK_STRING) and (ts[0].kind != lx.PK_HEADER)) {
+        return malformed(sp, "GCC dependency");
+    }
+    let t = ts[0].text;
+    if t.len < 2 {
+        return malformed(sp, "GCC dependency");
+    }
+    let name = t[1..t.len - 1];
+    let path = find_file(P, name, t[0] == '"');
+    if u.isnos(path) {
+        _ = dg.warning(sp, "C4112", u.f1("'#pragma GCC dependency': cannot find '%s', ignored", name));
+        return no_tok();
+    }
+    let mine = u.file_mtime(cur_src(P).path);
+    let theirs = u.file_mtime(path);
+    if (mine >= 0) and (theirs > mine) {
+        let mut msg = u.f1("the current file is older than '%s'", name);
+        if ts.len > 1 {
+            msg = u.cat3(msg, ": ", spelling(ts[1..]));
+        }
+        _ = dg.warning(sp, "C4115", msg);
+    }
+    return no_tok();
+}

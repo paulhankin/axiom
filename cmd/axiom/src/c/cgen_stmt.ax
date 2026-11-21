@@ -1,7 +1,7 @@
 // =============================================================================
 // cgen_stmt.ax - IR generation for C statements and function bodies, and
-// the initialization of automatic objects; generate is the entry point of
-// IR generation (it installs the hook cgen.ax calls for function bodies).
+// the initialization of automatic objects. Part of cgen.ax (see also
+// cgen_stmt_ctrl.ax).
 //
 // Every object of a function is an alloca in its entry block (mem2reg
 // promotes those whose address is not taken), but for the variable length
@@ -12,39 +12,18 @@
 // for WebAssembly cgen_flow.ax makes it reducible.
 // =============================================================================
 import "../ir.ax" as ir;
-import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
 import "cgen_abi.ax" as abi;
-import "cgen_asm.ax" as gasm;
-import "cgen_bits.ax" as cgb;
 import "cgen_debug.ax" as cdbg;
-import "cgen_expr.ax" as gx;
-import "cgen_flow.ax" as flow;
-import "cgen_ld.ax" as gld;
-import "cgen_nest.ax" as gnest;
-import "cgen_restrict.ax" as grs;
-import "cgen_sjlj.ax" as sj;
-import "cgen_va.ax" as gva;
-import "cgen_vec.ax" as gvec;
-import "cgen_vla.ax" as gv;
-import "cgen_wint.ax" as cgw;
 import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
-import "csema_attr.ax" as catr;
-import "csema_builtin.ax" as csb;
-import "csema_gnu.ax" as cgn;
-import "csema_stmt.ax" as css;
-import "csema_vla.ax" as svla;
-import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
-import "cwide.ax" as cw;
 
 struct Jump {
     brk: *mut ir.Block,
     cont: *mut ir.Block,  // nil for a switch
-    brk_depth: i32,       // the variable length arrays in scope where they go (cgen_vla.depth)
+    brk_depth: i32,       // the variable length arrays in scope where they go (vla_depth)
     cont_depth: i32,
 }
 
@@ -52,7 +31,7 @@ struct Body {
     jumps: u.List.[Jump],
     cases: u.SymMap.[*mut ir.Block],  // a CASE or DEFAULT statement's block, by its address
     is_main: bool,
-    at_labels: u.SymMap.[*mut void],  // what is in scope at each label whose address is taken (cgen_vla.snapshot)
+    at_labels: u.SymMap.[*mut void],  // what is in scope at each label whose address is taken (vla_snapshot)
     landings: u.List.[Landing],       // the jumps of `goto *` that leave scopes (computed_goto), made at the end
 }
 
@@ -62,31 +41,8 @@ struct Body {
 // at the label is known.
 struct Landing {
     blk: *mut ir.Block,
-    from: *mut void,  // what is in scope at the goto (cgen_vla.snapshot)
+    from: *mut void,  // what is in scope at the goto (vla_snapshot)
     to: *mut cast.CSym,
-}
-
-let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
-
-/// Generates unit cu into module m (wasm: for a WebAssembly target).
-/// False after an error (reported).
-pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
-    cg.hooks.body = function_body;
-    cg.hooks.local_init = init_local;
-    cg.hooks.stmt_expr = stmt_expr;
-    cg.hooks.trampolines = trampolines;
-    cg.hooks.inline_call = inline_call;
-    gv.gen_expr = gx.rv;
-    gv.outer_len = gnest.outer_len;
-    gvec.install();
-    cdbg.vla_len_slot = gv.len_slot;
-    grs.unit(cu.objects.items());  // (restrict: cgen_restrict.ax)
-    let ok = cg.generate(m, cu, wasm);
-    // (after the unit's functions and objects: the names of internal linkage file-scope asm names are theirs)
-    for a in cu.asms.items() {
-        gasm.toplevel(a);
-    }
-    return ok;
 }
 
 // Has f (its unreachable blocks removed) a return?
@@ -103,11 +59,10 @@ fn can_return(f: *mut ir.Func) bool {
 }
 
 fn function_body(s: *mut cast.CSym) void {
-    let F = cg.F;
     let f = F.f;
-    let gn = cgn.note_of(s);
+    let gn = cs.note_of(s);
     if u.notnil(gn) and gn.naked {
-        gasm.naked(f.name, f, s.ty, s.def.body);  // (its body is its asm)
+        asm_naked(f.name, f, s.ty, s.def.body);  // (its body is its asm)
         return;
     }
     // (C's rules for races and loops, ir.Func: c_progress cleared by the
@@ -119,20 +74,20 @@ fn function_body(s: *mut cast.CSym) void {
     b.is_main = u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL);
     b.at_labels = u.SymMap.[*mut void].{ keys: u.nil.[usize](), vals: u.nil.[*mut void](), cap: 0, len: 0 };
     BD = b;
-    gv.begin_function();
-    sj.begin_function();
+    vla_begin_function();
+    sj_begin_function();
     let d = s.def;
-    cg.set_span(d.decls.get(0).name_span);
+    set_span(d.decls.get(0).name_span);
     f.src = ir.cur_src;
-    F.entry = cg.new_block("entry");
-    let start = cg.new_block("start");
-    cg.at_end(start);
+    F.entry = new_block("entry");
+    let start = new_block("start");
+    at_end(start);
     cdbg.begin_function(f);
     let va_nested = s.ty.variadic and u.notnil(s.nest_parent);
-    F.sret = gva.enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic and not va_nested);
+    F.sret = enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic and not va_nested);
     if va_nested {
         // (its variable arguments: its entry's va_list, cgen_nest.ax)
-        gva.va_from(f.params[@int_cast(usize, F.sig.plan.args[s.params.len].slot[0])]);
+        va_from(f.params[@int_cast(usize, F.sig.plan.args[s.params.len].slot[0])]);
     }
     // (a restrict-qualified pointer parameter passed in a register:
     // ir.F_NOALIAS, 6.7.3.1; one the attribute nonnull or `[static n]` says
@@ -147,7 +102,7 @@ fn function_body(s: *mut cast.CSym) void {
         }
         if (a.kind == abi.A_SCALAR) and (p.ty.kind == cty.TK_POINTER) {
             let pv = f.params[@int_cast(usize, a.slot[0])];
-            let st = catr.static_param(p);
+            let st = cs.static_param(p);
             let nn = u.notnil(gn) and
                      (gn.nonnull_all or ((j < 64) and ((gn.nonnull & (@as(u64, 1) << @truncate(u32, j))) != 0)));
             if (nn or (st >= 0)) and not cs.opts().keep_null_checks {
@@ -162,53 +117,53 @@ fn function_body(s: *mut cast.CSym) void {
         }
     }
     // (a parameter of a definition with an identifier list arrives promoted)
-    let pts = cg.param_types(s);
+    let pts = param_types(s);
     for j in 0..s.params.len {
         let p = s.params.get(j);
         let a = F.sig.plan.args[j];
         if (a.kind == abi.A_SCALAR) and (pts[j] != cty.unqual(p.ty)) {
             let pv = f.params[@int_cast(usize, a.slot[0])];
-            gx.store(cty.unqual(p.ty), gx.convert(pv, pts[j], p.ty), @ptr_cast(*mut ir.Value, p.ir));
+            store(cty.unqual(p.ty), convert(pv, pts[j], p.ty), @ptr_cast(*mut ir.Value, p.ir));
         }
     }
-    gnest.enter(s);  // (a nested function's chain, the record of a function with them)
-    grs.function(d.body.items.items(), b.is_main);  // (restrict: cgen_restrict.ax)
+    nest_enter(s);  // (a nested function's chain, the record of a function with them)
+    restrict_function(d.body.items.items(), b.is_main);  // (restrict: cgen_restrict.ax)
     param_lengths(d);
     // floating point under FENV_ACCESS ON or FENV_ROUND anywhere in it:
     // strict for the whole function (the passes consult ir.Func's strict_fp)
-    f.strict_fp = d.fp_strict or cg.fenv_all;
+    f.strict_fp = d.fp_strict or fenv_all;
     for x in d.body.items.items() {
-        item(x);
+        stmt_item(x);
     }
-    if not cg.terminated() {
+    if not terminated() {
         // the end of the body: main returns 0 (5.1.2.2.3); the value of
         // any other is undefined (6.9.1p12); the cleanups of its outermost
         // block's objects first
-        if gv.has_cleanups() {
-            gv.release_to(0);
+        if vla_has_cleanups() {
+            vla_release_to(0);
         }
-        gnest.leave(s);
-        if not cg.terminated() {
-            gva.ret_default(F.sig.plan, F.sret);
+        nest_leave(s);
+        if not terminated() {
+            ret_default(F.sig.plan, F.sret);
         }
     }
     landings();
-    gnest.finish(label_block);  // (the non-local gotos' ends)
-    if sj.has_sites() {
-        sj.end_function(f, start);  // (setjmp on WebAssembly: the dispatch after a longjmp)
+    nest_finish();  // (the non-local gotos' ends)
+    if sj_has_sites() {
+        sj_end_function(f, start);  // (setjmp on WebAssembly: the dispatch after a longjmp)
     } else {
-        cg.at_end(F.entry);
-        ir.br(cg.B, start);
+        at_end(F.entry);
+        ir.br(B, start);
     }
     ir.remove_unreachable(f);
-    if catr.is_noreturn(s) and can_return(f) {
+    if cs.is_noreturn(s) and can_return(f) {
         cs.warn(d.decls.get(0).name_span, "C4053",
                 u.f1("the function '%s' is declared not to return ('noreturn'), but it can return", s.name));
     }
-    if cg.is_wasm {
-        flow.make_reducible(f);
+    if is_wasm {
+        make_reducible(f);
     }
-    grs.finish(f);  // (restrict: cgen_restrict.ax)
+    restrict_finish(f);  // (restrict: cgen_restrict.ax)
     cdbg.end_function();
     BD = u.nil.[Body]();
 }
@@ -219,25 +174,25 @@ fn param_lengths(d: *cast.Decl) void {
     let fd = d.decls.get(0).derivs.at(0);
     for p in fd.params.items() {
         if u.notnil(p.decl.ty) and cty.is_vm(p.decl.ty) {
-            gv.eval_specs(p.specs, gx.rv, gx.effects);
-            gv.eval_declarator(p.decl, p.decl.ty, gx.rv);
+            vla_eval_specs(p.specs);
+            vla_eval_declarator(p.decl, p.decl.ty);
         }
     }
     for kd in d.kr_decls.items() {
         for x in kd.decls.items() {
             if u.notnil(x.ty) and cty.is_vm(x.ty) {
-                gv.eval_declarator(x, x.ty, gx.rv);
+                vla_eval_declarator(x, x.ty);
             }
         }
     }
 }
 
 // A block item, under its floating-point pragmas' state (cpragma.ax).
-fn item(s: *mut cast.Stmt) void {
+fn stmt_item(s: *mut cast.Stmt) void {
     if u.notnil(s) {
-        gx.fp_state = s.fp;
-        if cg.fenv_all {
-            gx.fp_state = gx.fp_state | cpg.FP_ACCESS;
+        fp_state = s.fp;
+        if fenv_all {
+            fp_state = fp_state | cpg.FP_ACCESS;
         }
     }
     stmt(s);
@@ -247,26 +202,26 @@ fn stmt(s: *mut cast.Stmt) void {
     if u.isnil(s) {
         return;
     }
-    cg.set_span(s.span);
+    set_span(s.span);
     let k = s.kind;
     if k == cast.StmtKind.COMPOUND {
-        let d = gv.depth();
+        let d = vla_depth();
         let sc = cdbg.open_block(s.items.items());
-        let rs = grs.block(s.items.items(), u.nil.[cast.Stmt]());  // (restrict: cgen_restrict.ax)
-        let outer = gx.fp_state;
+        let rs = restrict_block(s.items.items(), u.nil.[cast.Stmt]());  // (restrict: cgen_restrict.ax)
+        let outer = fp_state;
         for x in s.items.items() {
-            item(x);
+            stmt_item(x);
         }
-        gx.fp_state = outer;
-        gv.leave(d);
-        grs.close(rs);
+        fp_state = outer;
+        vla_leave(d);
+        restrict_close(rs);
         cdbg.close_scope(sc);
     } else if k == cast.StmtKind.DECL {
         decl(s.decl);
     } else if k == cast.StmtKind.EXPR {
         if u.notnil(s.e) {
-            cg.continue_after();
-            _ = gx.full(s.e);
+            continue_after();
+            _ = lv_full(s.e);
         }
     } else if k == cast.StmtKind.IF {
         if_stmt(s);
@@ -279,47 +234,47 @@ fn stmt(s: *mut cast.Stmt) void {
     } else if k == cast.StmtKind.FOR {
         for_stmt(s);
     } else if (k == cast.StmtKind.GOTO) and u.notnil(s.e) {
-        cg.F.f.c_progress = false;  // (a goto may loop: not an iteration statement)
+        F.f.c_progress = false;  // (a goto may loop: not an iteration statement)
         computed_goto(s);
-    } else if (k == cast.StmtKind.GOTO) and u.notnil(s.sym.owner) and (s.sym.owner != cg.F.sym) {
-        cg.F.f.c_progress = false;
-        gnest.goto_(s.sym);  // (to a label of an enclosing function)
+    } else if (k == cast.StmtKind.GOTO) and u.notnil(s.sym.owner) and (s.sym.owner != F.sym) {
+        F.f.c_progress = false;
+        nest_goto(s.sym);  // (to a label of an enclosing function)
     } else if k == cast.StmtKind.GOTO {
-        cg.F.f.c_progress = false;
-        gv.release_to(svla.depth(s.sym));
-        cg.br(label_block(s.sym));
+        F.f.c_progress = false;
+        vla_release_to(cs.vla_depth(s.sym));
+        br(label_block(s.sym));
     } else if k == cast.StmtKind.CONTINUE {
         let mut i = BD.jumps.len;
         while i > 0 {
             i -= 1;
             if u.notnil(BD.jumps.at(i).cont) {
-                gv.release_to(BD.jumps.at(i).cont_depth);
-                cg.br(BD.jumps.at_mut(i).cont);
+                vla_release_to(BD.jumps.at(i).cont_depth);
+                br(BD.jumps.at_mut(i).cont);
                 break;
             }
         }
     } else if k == cast.StmtKind.BREAK {
-        gv.release_to(BD.jumps.last().brk_depth);
-        cg.br(BD.jumps.last().brk);
+        vla_release_to(BD.jumps.last().brk_depth);
+        br(BD.jumps.last().brk);
     } else if k == cast.StmtKind.RETURN {
         return_stmt(s);
     } else if k == cast.StmtKind.LABEL {
         let b = label_block(s.sym);
-        cg.br(b);
-        cg.at_end(b);
-        gnest.label(s.sym);  // (a nested function's non-local goto's target)
+        br(b);
+        at_end(b);
+        nest_label(s.sym);  // (a nested function's non-local goto's target)
         if s.sym.label_addr {
-            BD.at_labels.put(u.addr_key(@int_from_ptr(s.sym)), gv.snapshot());  // (a `goto *`'s target)
+            BD.at_labels.put(u.addr_key(@int_from_ptr(s.sym)), vla_snapshot());  // (a `goto *`'s target)
         }
         stmt(s.body);
     } else if k == cast.StmtKind.ASM {
-        cg.F.f.c_progress = false;  // (asm goto may loop)
+        F.f.c_progress = false;  // (asm goto may loop)
         asm_stmt(s.asm);
     } else {
         // CASE, DEFAULT
         let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
-        cg.br(b);
-        cg.at_end(b);
+        br(b);
+        at_end(b);
         stmt(s.body);
     }
 }
@@ -328,8 +283,8 @@ fn stmt(s: *mut cast.Stmt) void {
 // on which label its template jumped to, each case a goto to its label
 // (leaving the scopes it leaves as a goto statement does).
 fn asm_stmt(a: *mut cast.Asm) void {
-    cg.continue_after();
-    let r = gasm.stmt(a);
+    continue_after();
+    let r = asm_stmt_gen(a);
     if u.isnil(r) or not a.goto_ {
         return;
     }
@@ -338,19 +293,19 @@ fn asm_stmt(a: *mut cast.Asm) void {
     let bs = u.newn.[*mut ir.Block](n + 1);
     for i in 0..n {
         vs[i] = @as(u64, i) + 1;
-        bs[i] = cg.new_block("asm.goto");
+        bs[i] = new_block("asm.goto");
     }
-    let next = cg.new_block("asm.next");
-    flow.switch_to(r, false, vs[0..n], bs[0..n], next);
+    let next = new_block("asm.next");
+    switch_to(r, false, vs[0..n], bs[0..n], next);
     for i in 0..n {
-        cg.at_end(bs[i]);
+        at_end(bs[i]);
         stmt(a.labels.get(i).stmt);
     }
-    cg.at_end(next);
+    at_end(next);
 }
 
 // `goto *p` (a GNU dialect): p is the address of one of the function's
-// labels (`&&label`: cgen.label_address), found by its distance from their
+// labels (`&&label`: label_address), found by its distance from their
 // table's start; any other value is undefined (the switch's default). A
 // label in a scope of a variable length array or of an object with a
 // cleanup, or a goto in one, goes through a landing (made at the end:
@@ -359,29 +314,29 @@ fn asm_stmt(a: *mut cast.Asm) void {
 // is not in (6.8.6.1p1: a jump into it, which the label's address makes
 // possible at run time), it traps.
 fn computed_goto(s: *mut cast.Stmt) void {
-    cg.continue_after();
-    let p = gx.full(s.e);
-    let f = cg.F.sym;
-    let ls = css.addr_labels(f);
-    let base = cg.label_table(f);
-    let k = ir.sub(cg.B, ir.ptrtoint(cg.B, p, cg.T_isz), ir.ptrtoint(cg.B, base, cg.T_isz));
-    let dead = cg.new_block("badgoto");
+    continue_after();
+    let p = lv_full(s.e);
+    let f = F.sym;
+    let ls = cs.addr_labels(f);
+    let base = label_table(f);
+    let k = ir.sub(B, ir.ptrtoint(B, p, T_isz), ir.ptrtoint(B, base, T_isz));
+    let dead = new_block("badgoto");
     let vs = u.newn.[u64](ls.len + 1);
     let bs = u.newn.[*mut ir.Block](ls.len + 1);
-    let from = gv.snapshot();
-    let scoped = gv.depth() > 0;
+    let from = vla_snapshot();
+    let scoped = vla_depth() > 0;
     for i in 0..ls.len {
         vs[i] = ls[i].value;
-        if scoped or (svla.depth(ls[i]) > 0) {
-            bs[i] = cg.new_block("goto.leave");
+        if scoped or (cs.vla_depth(ls[i]) > 0) {
+            bs[i] = new_block("goto.leave");
             BD.landings.push(Landing.{ blk: bs[i], from: from, to: ls[i] });
         } else {
             bs[i] = label_block(ls[i]);
         }
     }
-    flow.switch_to(k, false, vs[0..ls.len], bs[0..ls.len], dead);
-    cg.at_end(dead);
-    ir.unreachable(cg.B);
+    switch_to(k, false, vs[0..ls.len], bs[0..ls.len], dead);
+    at_end(dead);
+    ir.unreachable(B);
 }
 
 // The landings of the function's `goto *` statements (computed_goto).
@@ -389,24 +344,23 @@ fn landings() void {
     if BD.landings.len == 0 {
         return;
     }
-    let saved = gv.snapshot();
+    let saved = vla_snapshot();
     for x in BD.landings.items() {
-        cg.at_end(x.blk);
+        at_end(x.blk);
         let at = BD.at_labels.get(u.addr_key(@int_from_ptr(x.to)));
-        if not u.isvnil(at) and gv.is_prefix(at, x.from) {
-            gv.restore(x.from);
-            gv.release_to(svla.depth(x.to));
-            if not cg.terminated() {
-                cg.br(label_block(x.to));
+        if not u.isvnil(at) and vla_is_prefix(at, x.from) {
+            vla_restore(x.from);
+            vla_release_to(cs.vla_depth(x.to));
+            if not terminated() {
+                br(label_block(x.to));
             }
         } else {
             // (into a scope the goto is not in: undefined, 6.8.6.1p1)
-            let no = u.newn.[*mut ir.Value](1);
-            _ = ir.intr(cg.B, ir.IN_TRAP, cg.T_void, no[0..0]);
-            ir.unreachable(cg.B);
+            _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+            ir.unreachable(B);
         }
     }
-    gv.restore(saved);
+    vla_restore(saved);
     BD.landings.clear();
 }
 
@@ -416,60 +370,60 @@ fn landings() void {
 // copied first).
 fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
     let s = e.body;
-    let d = gv.depth();
+    let d = vla_depth();
     let xs = s.items.items();
     let sc = cdbg.open_block(xs);
     let mut v = ir.vnil();
     for i in 0..xs.len {
         let x = xs[i];
-        if (i + 1 == xs.len) and u.notnil(css.value_stmt(x)) and not cty.is_void(e.ty) {
+        if (i + 1 == xs.len) and u.notnil(cs.value_stmt(x)) and not cty.is_void(e.ty) {
             v = last_value(x);
             if (cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty)) and
-               (gv.depth() > d) {
-                let tmp = cg.alloca(e.ty, "stmtexpr");
-                gx.copy(e.ty, tmp, v);
+               (vla_depth() > d) {
+                let tmp = alloca(e.ty, "stmtexpr");
+                copy(e.ty, tmp, v);
                 v = tmp;
             }
             continue;
         }
         stmt(x);
     }
-    gv.leave(d);
+    vla_leave(d);
     cdbg.close_scope(sc);
-    cg.continue_after();
+    continue_after();
     if u.isnil(v) and not cty.is_void(e.ty) {
         // (the block ended in a jump: the value is never used)
         if cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
-            return cg.alloca(e.ty, "stmtexpr");
+            return alloca(e.ty, "stmtexpr");
         }
-        return ir.czero(cg.lty(e.ty));
+        return ir.czero(lty(e.ty));
     }
     return v;
 }
 
 // The labels of statement s, then the value of its expression statement
-// (a statement expression's last: css.value_stmt).
+// (a statement expression's last: cs.value_stmt).
 fn last_value(s: *mut cast.Stmt) *mut ir.Value {
-    cg.set_span(s.span);
+    set_span(s.span);
     if s.kind == cast.StmtKind.LABEL {
         let b = label_block(s.sym);
-        cg.br(b);
-        cg.at_end(b);
+        br(b);
+        at_end(b);
         return last_value(s.body);
     }
     if (s.kind == cast.StmtKind.CASE) or (s.kind == cast.StmtKind.DEFAULT) {
         let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
-        cg.br(b);
-        cg.at_end(b);
+        br(b);
+        at_end(b);
         return last_value(s.body);
     }
-    cg.continue_after();
-    return gx.rv(s.e);
+    continue_after();
+    return rv(s.e);
 }
 
 fn label_block(l: *mut cast.CSym) *mut ir.Block {
     if u.isvnil(l.ir) {
-        l.ir = @ptr_cast(*mut void, cg.new_block(l.name));
+        l.ir = @ptr_cast(*mut void, new_block(l.name));
     }
     return @ptr_cast(*mut ir.Block, l.ir);
 }
@@ -495,40 +449,40 @@ fn decl(d: *mut cast.Decl) void {
     }
     cdbg.note_block_decl(d);
     if (d.decls.len > 0) and has_vm_typeof(d.specs) {
-        cg.continue_after();
-        gv.eval_specs(d.specs, gx.rv, gx.effects);
+        continue_after();
+        vla_eval_specs(d.specs);
     }
     for x in d.decls.items() {
         let s = x.sym;
         if u.notnil(x.ty) and cty.is_vm(x.ty) and not cty.is_func(x.ty) {
-            cg.continue_after();
-            gv.eval_declarator(x, x.ty, gx.rv);
+            continue_after();
+            vla_eval_declarator(x, x.ty);
         }
         if u.isnil(s) or (s.kind != cast.SK_OBJECT) or (s.duration != cast.SD_AUTO) {
             continue;
         }
-        if svla.allocates(s) {
-            cg.continue_after();
-            let p = gv.allocate(s.ty, cg.object_align(s));
+        if cs.vla_allocates(s) {
+            continue_after();
+            let p = vla_allocate(s.ty, object_align(s));
             s.ir = @ptr_cast(*mut void, p);
-            gnest.allocated(s);  // (for its nested functions)
+            nest_allocated(s);  // (for its nested functions)
             // (its address in an object of its own: -O0 keeps it there, for debuggers)
-            let a = cg.alloca(cty.pointer_to(s.ty.elem), "vla.addr");
-            _ = ir.store(cg.B, p, a);
-            cdbg.note_indirect(cg.F.f, s, a);
+            let a = alloca(cty.pointer_to(s.ty.elem), "vla.addr");
+            _ = ir.store(B, p, a);
+            cdbg.note_indirect(F.f, s, a);
             if u.notnil(s.init) {
-                _ = ir.memop(cg.B, ir.OP_MEMSET, p, ir.cint(cg.T_i8, 0), gv.size_value(s.ty));  // (C23: `= {}`)
+                _ = ir.memop(B, ir.OP_MEMSET, p, ir.cint(T_i8, 0), vla_size_value(s.ty));  // (C23: `= {}`)
             }
             push_cleanup(s);
             continue;
         }
         if u.isvnil(s.ir) {
-            s.ir = @ptr_cast(*mut void, cg.aligned_alloca(s.ty, s.name, s.align));
-            grs.lifetime(@ptr_cast(*mut ir.Value, s.ir));  // (its block's: cgen_restrict.ax)
-            cdbg.note_var(cg.F.f, s, @ptr_cast(*mut ir.Value, s.ir));
+            s.ir = @ptr_cast(*mut void, aligned_alloca(s.ty, s.name, s.align));
+            restrict_lifetime(@ptr_cast(*mut ir.Value, s.ir));  // (its block's: cgen_restrict.ax)
+            cdbg.note_var(F.f, s, @ptr_cast(*mut ir.Value, s.ir));
         }
         if u.notnil(s.init) {
-            cg.continue_after();
+            continue_after();
             init_local(s, @ptr_cast(*mut ir.Value, s.ir));
         }
         push_cleanup(s);
@@ -537,9 +491,9 @@ fn decl(d: *mut cast.Decl) void {
 
 // An automatic object with a cleanup (a GNU dialect) comes in scope.
 fn push_cleanup(s: *cast.CSym) void {
-    let n = cgn.note_of(s);
+    let n = cs.note_of(s);
     if u.notnil(n) and u.notnil(n.cleanup_call) {
-        gv.push_cleanup(n.cleanup_call);
+        vla_push_cleanup(n.cleanup_call);
     }
 }
 
@@ -549,19 +503,19 @@ fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
     let vol = volatile_of(s.ty);
     for t in list.pre.items() {
         // (a designator range's value, evaluated once: csema_desig.once)
-        let tp = cg.alloca(t.ty, t.name);
+        let tp = alloca(t.ty, t.name);
         t.ir = @ptr_cast(*mut void, tp);
         init_local(t, tp);
     }
     if list.zero {
-        gx.zero(p, cty.size_of(s.ty));
+        zero_mem(p, cty.size_of(s.ty));
     }
     for k in 0..list.items.len {
         let it = list.items.at_mut(k);
-        let at = ir.ptradd(cg.B, p, cg.usz(it.off));
+        let at = ir.ptradd(B, p, usz(it.off));
         let t = it.ty;
         if u.isnil(it.e) {
-            gx.zero(at, cty.size_of(t));
+            zero_mem(at, cty.size_of(t));
         } else if t.kind == cty.TK_ARRAY {
             // a string literal: its code units, then zeros
             let es = cty.size_of(t.elem);
@@ -570,22 +524,22 @@ fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
                 n = t.len;
             }
             if not list.zero and (n < t.len) {
-                gx.zero(at, t.len * es);
+                zero_mem(at, t.len * es);
             }
-            _ = ir.memop(cg.B, ir.OP_MEMCPY, at, cg.string_addr(it.e), cg.usz(n * es));
+            _ = ir.memop(B, ir.OP_MEMCPY, at, string_addr(it.e), usz(n * es));
         } else if cty.is_wide(t) or cty.is_dec128(t) {
-            gld.copy(at, gx.full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
+            ld_copy(at, lv_full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_wint(t) and u.isnil(it.bits) {
-            cgw.copy(t, at, gx.full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
+            wint_copy(t, at, lv_full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_record(t) {
-            gx.copy(t, at, gx.full(it.e));
+            copy(t, at, lv_full(it.e));
         } else if cty.is_vector(t) {
-            gx.vec_copy(cty.qualify(t, vol), at, gx.full(it.e));
+            vec_copy(cty.qualify(t, vol), at, lv_full(it.e));
         } else if u.notnil(it.bits) {
-            _ = cgb.store(it.bits, cty.qualify(t, vol), gx.full(it.e), at);
+            _ = bf_store(it.bits, cty.qualify(t, vol), lv_full(it.e), at);
         } else {
             // (a volatile object's initialization is a volatile access too)
-            gx.store(cty.qualify(t, vol), gx.full(it.e), at);
+            store(cty.qualify(t, vol), lv_full(it.e), at);
         }
     }
 }
@@ -596,665 +550,4 @@ fn volatile_of(t: *cty.CType) i32 {
         return volatile_of(t.elem);
     }
     return t.quals & cty.Q_VOLATILE;
-}
-
-fn if_stmt(s: *mut cast.Stmt) void {
-    cg.continue_after();
-    let yes = cg.new_block("then");
-    let done = cg.new_block("endif");
-    let mut no = done;
-    if u.notnil(s.els) {
-        no = cg.new_block("else");
-    }
-    gx.branch_full(s.e, yes, no);
-    cg.at_end(yes);
-    stmt(s.body);
-    cg.br(done);
-    if u.notnil(s.els) {
-        cg.at_end(no);
-        stmt(s.els);
-        cg.br(done);
-    }
-    cg.at_end(done);
-}
-
-// What the loop pragmas before loop statement s ask of the loop whose
-// header is h (ir.Block's unroll_hint, ivdep, novector).
-fn loop_hints(h: *mut ir.Block, s: *cast.Stmt) void {
-    let x = s.hints;
-    let n = x & cpg.LH_UNROLL_MASK;
-    if n != 0 {
-        h.unroll_hint = @max(@bit_cast(i32, n - 1), 1);  // (unroll 0 and 1: none)
-    }
-    h.ivdep = (x & cpg.LH_IVDEP) != 0;
-    h.novector = (x & cpg.LH_NOVECTOR) != 0;
-}
-
-// A loop that 6.8.5p6 does not let be taken to end (its controlling
-// expression a constant, or none) clears the function's c_progress.
-fn loop_ends(e: *cast.Expr) void {
-    if u.isnil(e) or e.is_const {
-        cg.F.f.c_progress = false;
-    }
-}
-
-fn while_stmt(s: *mut cast.Stmt) void {
-    loop_ends(s.e);
-    let head = cg.new_block("while");
-    loop_hints(head, s);
-    let body = cg.new_block("body");
-    let done = cg.new_block("endwhile");
-    cg.br(head);
-    cg.at_end(head);
-    gx.branch_full(s.e, body, done);
-    cg.at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: head, brk_depth: gv.depth(), cont_depth: gv.depth() });
-    stmt(s.body);
-    _ = BD.jumps.pop();
-    cg.br(head);
-    cg.at_end(done);
-}
-
-fn do_stmt(s: *mut cast.Stmt) void {
-    loop_ends(s.e);
-    let body = cg.new_block("do");
-    loop_hints(body, s);
-    let cond = cg.new_block("dotest");
-    let done = cg.new_block("enddo");
-    cg.br(body);
-    cg.at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: cond, brk_depth: gv.depth(), cont_depth: gv.depth() });
-    stmt(s.body);
-    _ = BD.jumps.pop();
-    cg.br(cond);
-    cg.at_end(cond);
-    gx.branch_full(s.e, body, done);
-    cg.at_end(done);
-}
-
-fn for_stmt(s: *mut cast.Stmt) void {
-    loop_ends(s.e);
-    let d0 = gv.depth();
-    let sc = cdbg.open_for(s.decl);
-    let mut rs = ir.rtag;
-    if u.notnil(s.decl) {
-        rs = grs.block(s.items.items(), s);  // (restrict: cgen_restrict.ax)
-        decl(s.decl);
-    } else if u.notnil(s.first) {
-        cg.continue_after();
-        _ = gx.full(s.first);
-    }
-    let d1 = gv.depth();
-    let head = cg.new_block("for");
-    loop_hints(head, s);
-    let body = cg.new_block("body");
-    let step = cg.new_block("step");
-    let done = cg.new_block("endfor");
-    // (the loop's end leaves the scope of the variable length arrays its
-    // first clause declares)
-    let mut exit = done;
-    if d1 > d0 {
-        exit = cg.new_block("forexit");
-    }
-    cg.br(head);
-    cg.at_end(head);
-    if u.notnil(s.e) {
-        gx.branch_full(s.e, body, exit);
-    } else {
-        ir.br(cg.B, body);
-    }
-    cg.at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: step, brk_depth: d0, cont_depth: d1 });
-    stmt(s.body);
-    _ = BD.jumps.pop();
-    cg.br(step);
-    cg.at_end(step);
-    if u.notnil(s.step) {
-        _ = gx.full(s.step);
-    }
-    cg.br(head);
-    if d1 > d0 {
-        cg.at_end(exit);
-        gv.leave(d0);
-        cg.br(done);
-    }
-    grs.close(rs);
-    cdbg.close_scope(sc);
-    cg.at_end(done);
-}
-
-fn switch_stmt(s: *mut cast.Stmt) void {
-    cg.continue_after();
-    let v = gx.full(s.e);
-    if cty.is_wint(s.e.ty) {
-        wide_switch(s, v);
-        return;
-    }
-    let done = cg.new_block("endswitch");
-    let mut dflt = done;
-    let blocks = u.newn.[*mut ir.Block](s.cases.len + 1);
-    for i in 0..s.cases.len {
-        let c = s.cases.get(i);
-        let b = cg.new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
-        blocks[i] = b;
-        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
-        if c.kind == cast.StmtKind.DEFAULT {
-            dflt = b;
-        }
-    }
-    let mut vs = u.List.[u64].empty();
-    let mut bs = u.List.[*mut ir.Block].empty();
-    let mask = ~@as(u64, 0) >> @int_cast(u32, 64 - v.ty.bits);
-    for i in 0..s.cases.len {
-        let c = s.cases.get(i);
-        if (c.kind == cast.StmtKind.CASE) and u.notnil(c.hi) {
-            // a case range (a GNU dialect): its values, if few; else a test first
-            let span = (c.cval_hi -% c.cval) & mask;
-            if span < 256 {
-                for k in 0..span + 1 {
-                    vs.push((c.cval +% k) & mask);
-                    bs.push(blocks[i]);
-                }
-            } else {
-                let next = cg.new_block("range");
-                let d = ir.sub(cg.B, v, ir.cint(v.ty, c.cval & mask));
-                ir.condbr(cg.B, ir.icmp(cg.B, ir.IntULE, d, ir.cint(v.ty, span)), blocks[i], next);
-                cg.at_end(next);
-            }
-        } else if c.kind == cast.StmtKind.CASE {
-            vs.push(c.cval & mask);
-            bs.push(blocks[i]);
-        }
-    }
-    flow.switch_to(v, s.e.ty.is_signed, vs.items(), bs.items(), dflt);
-    cg.at_end(cg.new_block("switchbody"));
-    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: gv.depth(), cont_depth: gv.depth() });
-    stmt(s.body);
-    _ = BD.jumps.pop();
-    cg.br(done);
-    cg.at_end(done);
-}
-
-// A switch on a value v wider than 64 bits (its address): for each value of
-// the limbs above the first that some case has, a comparison of those, then
-// a switch on the first limb among those cases; before them, a test of
-// each case range.
-fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
-    let t = s.e.ty;
-    let n = cty.limbs(t);
-    let done = cg.new_block("endswitch");
-    let mut dflt = done;
-    let nc = s.cases.len;
-    let blocks = u.newn.[*mut ir.Block](nc + 1);
-    let vals = u.newn.[[]u64](nc + 1);
-    for i in 0..nc {
-        let c = s.cases.get(i);
-        let b = cg.new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
-        blocks[i] = b;
-        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
-        if c.kind == cast.StmtKind.DEFAULT {
-            dflt = b;
-        } else {
-            vals[i] = cw.value(c.e, n);
-        }
-    }
-    // the case ranges first: lo <= v and v <= hi
-    for i in 0..nc {
-        let c = s.cases.get(i);
-        if (c.kind != cast.StmtKind.CASE) or u.isnil(c.hi) {
-            continue;
-        }
-        let ge = cgw.compare(ct.P_GE, t, v, cgw.constant(t, vals[i]));
-        let le = cgw.compare(ct.P_LE, t, v, cgw.constant(t, cw.value(c.hi, n)));
-        let next = cg.new_block("wrange");
-        ir.condbr(cg.B, ir.and_(cg.B, ge, le), blocks[i], next);
-        cg.at_end(next);
-    }
-    let lo = cgw.limb(v, 0);
-    let mut seen = u.List.[usize].empty();  // (a case of each group: its first)
-    for i in 0..nc {
-        if (s.cases.get(i).kind != cast.StmtKind.CASE) or u.notnil(s.cases.get(i).hi) {
-            continue;
-        }
-        let mut grouped = false;
-        for j in seen.items() {
-            if same_upper(vals[i], vals[j], n) {
-                grouped = true;
-            }
-        }
-        if grouped {
-            continue;
-        }
-        seen.push(i);
-        // the limbs above the first equal to this group's?
-        let mut d = ir.cint(ir.t_int(64), 0);
-        for k in 1..n {
-            d = ir.or_(cg.B, d, ir.xor(cg.B, cgw.limb(v, k), ir.cint(ir.t_int(64), vals[i][k])));
-        }
-        let yes = cg.new_block("wcase");
-        let no = cg.new_block("wnext");
-        ir.condbr(cg.B, ir.icmp(cg.B, ir.IntEQ, d, ir.cint(ir.t_int(64), 0)), yes, no);
-        cg.at_end(yes);
-        let mut vs = u.List.[u64].empty();
-        let mut bs = u.List.[*mut ir.Block].empty();
-        for k in i..nc {
-            if (s.cases.get(k).kind == cast.StmtKind.CASE) and u.isnil(s.cases.get(k).hi) and
-               same_upper(vals[k], vals[i], n) {
-                vs.push(vals[k][0]);
-                bs.push(blocks[k]);
-            }
-        }
-        flow.switch_to(lo, false, vs.items(), bs.items(), dflt);
-        cg.at_end(no);
-    }
-    cg.br(dflt);
-    cg.at_end(cg.new_block("switchbody"));
-    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: gv.depth(), cont_depth: gv.depth() });
-    stmt(s.body);
-    _ = BD.jumps.pop();
-    cg.br(done);
-    cg.at_end(done);
-}
-
-// Are the limbs of a and b above the first the same?
-fn same_upper(a: []u64, b: []u64, n: usize) bool {
-    for k in 1..n {
-        if a[k] != b[k] {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn return_stmt(s: *mut cast.Stmt) void {
-    let F = cg.F;
-    cg.continue_after();
-    let inl = cg.INL;
-    if u.notnil(inl) {
-        // (in an inlined call: the result stored, then its end)
-        if u.notnil(s.e) {
-            let v = gx.full(s.e);
-            if u.notnil(inl.res) {
-                put(inl.ret, v, inl.res);
-            }
-        }
-        cg.br(inl.exit);
-        return;
-    }
-    if u.isnil(s.e) {
-        cleanups();
-        gva.ret_default(F.sig.plan, F.sret);
-        return;
-    }
-    // (WebAssembly with tail calls: the calls of a return's expression,
-    // which may be in tail position, push no record on the shadow stack:
-    // cgen_va.ax; a sibling call leaves no frame for one)
-    let tail = cg.ss_tail;
-    cg.ss_tail = tg.is_wasm() and tg.has(tg.W_TAIL_CALL);
-    let mut v = gx.full(s.e);
-    cg.ss_tail = tail;
-    if cty.is_void(F.ret) {
-        cleanups();
-        ir.ret_void(cg.B);
-        return;
-    }
-    if gv.has_cleanups() and
-       (cty.is_record(F.ret) or cty.is_wint(F.ret) or cty.is_vector(F.ret) or cty.is_wide(F.ret)) {
-        // (the value copied before the cleanups run)
-        let tmp = cg.alloca(F.ret, "retval");
-        gx.copy(F.ret, tmp, v);
-        v = tmp;
-    }
-    cleanups();
-    gva.ret_value(F.sig.plan, F.sret, v);
-}
-
-// -----------------------------------------------------------------------------
-// Inlined calls: an inline definition that forwards its caller's variable
-// arguments (__builtin_va_arg_pack: the system's headers' wrappers of
-// printf, open ... under _FORTIFY_SOURCE), which only inlining gives them,
-// generated in place of each call (csema_marks.va_wrapper). The arguments
-// are evaluated in order into objects of their own, the parameters' and the
-// variable arguments' (cg.INL.pack); a call in the body whose last argument
-// is __builtin_va_arg_pack () gets the variable arguments in its place
-// (cgen_expr.call), and __builtin_va_arg_pack_len () is their number; a
-// return stores the result and goes to the end. The optimizer then sees
-// the caller's arguments in the parameters (__builtin_object_size,
-// __builtin_constant_p).
-// -----------------------------------------------------------------------------
-
-// A call e of function s, whose inline definition d (parameters ps)
-// forwards its variable arguments, inlined. done: false (and nothing
-// generated) when it cannot be: the body has what is not generated twice
-// in a function (a label, a static object, a statement expression ...),
-// an argument is of a type kept in memory other than a structure's, or the
-// call is in the inlined body of s itself; the call is then the external
-// function's.
-fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*mut cast.CSym,
-               done: *mut bool) *mut ir.Value {
-    done.* = false;
-    let n = e.args.len;
-    let mut locals = u.List.[*mut cast.CSym].empty();
-    if (ps.len > n) or u.isnil(d.body) or not inlinable(d.body, &mut locals) {
-        return ir.vnil();
-    }
-    for x in e.args.items() {
-        if not inline_type(x.ty) {
-            return ir.vnil();
-        }
-    }
-    for p in ps {
-        if not inline_type(p.ty) {
-            return ir.vnil();
-        }
-    }
-    let mut o = cg.INL;
-    while u.notnil(o) {
-        if o.callee == s {
-            return ir.vnil();
-        }
-        o = o.outer;
-    }
-    done.* = true;
-    let vs = u.newn.[*mut ir.Value](n + 1);
-    for i in 0..n {
-        vs[i] = gx.rv(e.args.get(i));
-    }
-    let inl = u.new.[cg.Inline]();
-    inl.callee = s;
-    inl.outer = cg.INL;
-    inl.pack = u.List.[*mut cast.Expr].empty();
-    // (the objects of the parameters and the body: this call's own)
-    let saved = u.newn.[*mut void](ps.len + locals.len + 1);
-    for j in 0..ps.len {
-        let p = ps[j];
-        saved[j] = p.ir;
-        let slot = cg.aligned_alloca(cty.unqual(p.ty), p.name, p.align);
-        put(cty.unqual(p.ty), vs[j], slot);
-        p.ir = @ptr_cast(*mut void, slot);
-    }
-    for j in 0..locals.len {
-        let x = locals.get(j);
-        saved[ps.len + j] = x.ir;
-        x.ir = @ptr_from_int(*mut void, 0);
-    }
-    for k in ps.len..n {
-        let a = e.args.get(k);
-        let t = cty.unqual(a.ty);
-        let slot = cg.alloca(t, "va.pack");
-        put(t, vs[k], slot);
-        let v = u.new.[cast.CSym]();
-        v.kind = cast.SK_OBJECT;
-        v.name = "va.pack";
-        v.span = a.span;
-        v.ty = t;
-        v.duration = cast.SD_AUTO;
-        v.ir = @ptr_cast(*mut void, slot);
-        let x = cast.new_expr(cast.ExprKind.IDENT, a.span);
-        x.name = v.name;
-        x.sym = v;
-        x.ty = t;
-        x.lvalue = true;
-        inl.pack.push(x);
-    }
-    inl.ret = cty.unqual(s.ty.ret);
-    if not cty.is_void(inl.ret) {
-        inl.res = cg.alloca(inl.ret, "inl.ret");
-    }
-    inl.exit = cg.new_block("inl.end");
-    cg.INL = inl;
-    let fp = gx.fp_state;
-    stmt(d.body);
-    gx.fp_state = fp;
-    cg.br(inl.exit);
-    cg.at_end(inl.exit);
-    cg.INL = inl.outer;
-    for j in 0..ps.len {
-        ps[j].ir = saved[j];
-    }
-    for j in 0..locals.len {
-        locals.get(j).ir = saved[ps.len + j];
-    }
-    if u.isnil(inl.res) {
-        return ir.vnil();
-    }
-    if cty.is_record(inl.ret) {
-        return inl.res;
-    }
-    return gx.load(inl.ret, inl.res);
-}
-
-// Is a value of type t one inline_call keeps in an object of its own: a
-// scalar in registers, or a structure or union (its address)?
-fn inline_type(t: *mut cty.CType) bool {
-    if u.isnil(t) {
-        return false;
-    }
-    if cty.is_record(t) or cty.is_pointer(t) {
-        return true;
-    }
-    return cty.is_arith(t) and not cty.is_complex(t) and not cty.is_wide(t) and not cty.is_wint(t) and
-           not cty.is_dec128(t) and not cty.is_vector(t);
-}
-
-// Can the statements of s be generated in each inlined call (inline_call):
-// blocks, declarations of automatic objects of types that are not variably
-// modified, without cleanups (locals: them), expression statements, if,
-// the loops, break, continue and return, with no statement expression,
-// compound literal or address of a label in their expressions?
-fn inlinable(s: *mut cast.Stmt, locals: *mut u.List.[*mut cast.CSym]) bool {
-    if u.isnil(s) {
-        return true;
-    }
-    let k = s.kind;
-    if k == cast.StmtKind.COMPOUND {
-        for x in s.items.items() {
-            if not inlinable(x, locals) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if k == cast.StmtKind.DECL {
-        return inlinable_decl(s.decl, locals);
-    }
-    if (k == cast.StmtKind.EXPR) or (k == cast.StmtKind.RETURN) {
-        return inlinable_expr(s.e);
-    }
-    if k == cast.StmtKind.IF {
-        return inlinable_expr(s.e) and inlinable(s.body, locals) and inlinable(s.els, locals);
-    }
-    if (k == cast.StmtKind.WHILE) or (k == cast.StmtKind.DO) {
-        return inlinable_expr(s.e) and inlinable(s.body, locals);
-    }
-    if k == cast.StmtKind.FOR {
-        return inlinable_expr(s.first) and (u.isnil(s.decl) or inlinable_decl(s.decl, locals)) and
-               inlinable_expr(s.e) and inlinable_expr(s.step) and inlinable(s.body, locals);
-    }
-    return (k == cast.StmtKind.BREAK) or (k == cast.StmtKind.CONTINUE);
-}
-
-fn inlinable_decl(d: *mut cast.Decl, locals: *mut u.List.[*mut cast.CSym]) bool {
-    if d.kind != cast.DeclKind.DECL {
-        return d.kind == cast.DeclKind.STATIC_ASSERT;
-    }
-    for x in d.decls.items() {
-        let s = x.sym;
-        if u.isnil(s) {
-            continue;
-        }
-        if s.kind == cast.SK_FUNC {
-            if u.notnil(s.def) or u.notnil(s.nest_parent) {
-                return false;
-            }
-            continue;
-        }
-        if s.kind != cast.SK_OBJECT {
-            continue;
-        }
-        if s.duration != cast.SD_AUTO {
-            if s.linkage == cast.LK_NONE {
-                return false;  // (a static object of its own)
-            }
-            continue;
-        }
-        if cty.is_vm(s.ty) {
-            return false;
-        }
-        let n = cgn.note_of(s);
-        if u.notnil(n) and u.notnil(n.cleanup_call) {
-            return false;
-        }
-        if u.notnil(s.init) {
-            if s.init.pre.len > 0 {
-                return false;
-            }
-            for it in s.init.items.items() {
-                if not inlinable_expr(it.e) {
-                    return false;
-                }
-            }
-        }
-        locals.push(s);
-    }
-    return true;
-}
-
-fn inlinable_expr(e: *mut cast.Expr) bool {
-    if u.isnil(e) {
-        return true;
-    }
-    let k = e.kind;
-    if (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.LABEL_ADDR) or
-       (k == cast.ExprKind.GENERIC) or (k == cast.ExprKind.VA_ARG) {
-        return false;
-    }
-    if not inlinable_expr(e.a) or not inlinable_expr(e.b) or not inlinable_expr(e.c) {
-        return false;
-    }
-    for x in e.args.items() {
-        if not inlinable_expr(x) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Stores value v of type t (a scalar, or a structure's address) at p.
-fn put(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
-    if cty.is_record(t) {
-        gx.copy(t, p, v);
-    } else {
-        gx.store(t, v, p);
-    }
-}
-
-// Before a return: the calls of the cleanups in scope (a GNU dialect), and
-// the trampolines of nested functions the call holds given back.
-fn cleanups() void {
-    if gv.has_cleanups() {
-        gv.release_to(0);
-        cg.continue_after();
-    }
-    if u.notnil(cg.F.sym) {
-        gnest.leave(cg.F.sym);
-    }
-}
-
-// The trampolines of function s's nested functions whose addresses are
-// taken (cgen_nest.ax): the function that gives one, and each one: a
-// function of the nested function's C type that calls it with the chain its
-// slot holds, its arguments as they arrive (cgen_va.ax: the C ABI's both
-// ways).
-//
-// A variadic nested function g (s itself) gets its entry too
-// (gnest.entry_of): the function its direct calls call, whose arguments are
-// g's and its chain as a last named argument (so that the variable
-// arguments start after it, on every ABI); it, and each trampoline of g,
-// starts a va_list of its variable arguments and calls g's IR function
-// with its address (which g's va_start copies: cgen_va.va_from).
-fn trampolines(s: *mut cast.CSym) void {
-    let saved = cg.F;
-    for g in s.tramps.items() {
-        gnest.define_get(g);
-        let p = gnest.pool_of(g);
-        for i in 0..p.thunks.len {
-            forwarder(p.thunks[i], g, p.chains, i);
-        }
-    }
-    if u.notnil(s.nest_parent) and s.ty.variadic {
-        forwarder(gnest.entry_of(s), s, ir.vnil(), 0);
-    }
-    cg.F = saved;
-}
-
-// Defines f, which calls nested function g with its arguments as they
-// arrive (cgen_va.ax: the C ABI's both ways) and the chain in slot i of the
-// table `chains`; or (chains nil: g's variadic entry) the chain its last
-// named argument is.
-fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize) void {
-    let pts0 = cg.param_types(g);
-    let entry = u.isnil(chains);
-    let mut pts = pts0;
-    if entry {
-        pts = gnest.entry_params(g);
-    }
-    let st = u.new.[cg.FnState]();
-    st.f = f;
-    st.ret = g.ty.ret;
-    st.sig = cg.sig_of(g.ty.ret, pts, pts.len, g.ty.variadic, true);
-    cg.F = st;
-    st.entry = cg.new_block("entry");
-    let start = cg.new_block("start");
-    cg.at_end(start);
-    let fakes = u.newn.[*mut cast.CSym](pts.len + 1);
-    for j in 0..pts.len {
-        let x = u.new.[cast.CSym]();
-        x.kind = cast.SK_OBJECT;
-        x.name = "";
-        x.ty = pts[j];
-        x.duration = cast.SD_AUTO;
-        fakes[j] = x;
-    }
-    st.sret = gva.enter_function(st.sig.plan, f, fakes[0..pts.len], g.ty.variadic);
-    let n = pts0.len;
-    let vs = u.newn.[*mut ir.Value](n + 2);
-    for j in 0..n {
-        let at = @ptr_cast(*mut ir.Value, fakes[j].ir);
-        if abi.aggregate(pts[j]) {
-            vs[j] = at;
-        } else {
-            vs[j] = gx.load(pts[j], at);
-        }
-    }
-    let mut chain = ir.vnil();
-    if entry {
-        chain = gx.load(pts[n], @ptr_cast(*mut ir.Value, fakes[n].ir));
-    } else {
-        let ch = ir.ptradd(cg.B, chains, cg.usz(@as(u64, i) * cty.ptr_bytes));
-        chain = ir.load(cg.B, cg.T_ptr, ch);
-        chain.flags = chain.flags | ir.F_VOLATILE;
-    }
-    let mut nv = n;
-    if g.ty.variadic {
-        // (its variable arguments: a va_list, whose address g takes)
-        let ap = cg.alloca(csb.va_list_type(), "ap");
-        gva.start(ap);
-        vs[n] = ap;
-        nv = n + 1;
-    }
-    let gs = cg.func_sig(g);
-    cg.next_chain = chain;
-    let r = gva.emit_call(gs.plan, gs.ty, cg.func_of(g, gs).val, vs[0..nv]);
-    if cty.is_void(g.ty.ret) {
-        gva.ret_value(st.sig.plan, st.sret, ir.vnil());
-    } else {
-        gva.ret_value(st.sig.plan, st.sret, r);
-    }
-    cg.at_end(st.entry);
-    ir.br(cg.B, start);
-    ir.remove_unreachable(f);
-    if cg.is_wasm {
-        flow.make_reducible(f);
-    }
 }

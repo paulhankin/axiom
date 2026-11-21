@@ -1,0 +1,393 @@
+// =============================================================================
+// cgen_abi_class.ax - scalar leaf flattening and ABI type classification for
+// System V, AAPCS64 (HFA/HVA), and WebAssembly, part of cgen_abi.ax.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// The scalars of a type
+// -----------------------------------------------------------------------------
+
+// A scalar inside a structure or union: its offset, size and whether it is
+// floating-point.
+struct Leaf {
+    off: u64,
+    size: u64,
+    fp: bool,
+    x87: bool,  // the x87's long double (its 16 bytes)
+    dec: bool,  // a decimal floating type (fp too: AAPCS64 does not mix it with the binary ones)
+    vec: bool,  // a vector of 8 bytes or more, whole (a short vector of AAPCS64, __m64 ... of System V)
+    bf: bool,   // a __bf16 (a GNU dialect's): of no homogeneous aggregate (hfa_of)
+}
+
+const MAX_LEAVES: usize = 64;
+
+struct Leaves {
+    xs: [64]Leaf,
+    n: usize,
+    ok: bool,  // all of them fit in xs
+}
+
+fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
+    let t = t0.unq;
+    if t.kind == cty.TK_ARRAY {
+        if not t.has_len {
+            return;
+        }
+        let es = cty.size_of(t.elem);
+        for i in 0..t.len {
+            if not l.ok {
+                return;
+            }
+            add_leaves(t.elem, off + (i * es), l);
+        }
+        return;
+    }
+    if (t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION) {
+        for m in t.tag.members.items() {
+            add_leaves(m.ty, off + m.offset, l);
+        }
+        return;
+    }
+    if t.kind == cty.TK_COMPLEX {
+        // (the real part and the imaginary part)
+        add_leaves(t.elem, off, l);
+        add_leaves(t.elem, off + cty.size_of(t.elem), l);
+        return;
+    }
+    let size = cty.size_of(t);
+    if (t.kind == cty.TK_VECTOR) and (size < 8) {
+        // (a vector of fewer than 8 bytes: its elements, as an array's: the
+        // System V psABI and AAPCS64 have no class of their own for one)
+        let es = cty.size_of(t.elem);
+        for i in 0..t.len {
+            add_leaves(t.elem, off + (i * es), l);
+        }
+        return;
+    }
+    if l.n >= MAX_LEAVES {
+        l.ok = false;
+        return;
+    }
+    // (a vector of 8 bytes or more is one leaf: SSE, or SSE and SSEUP, on
+    // System V whatever its elements, as __m64 and __m128 are; a short vector
+    // on AAPCS64, a member of a homogeneous aggregate of short vectors)
+    let vec = t.kind == cty.TK_VECTOR;
+    let dec = cty.is_decimal(t) and (abi() != ABI_WIN);
+    l.xs[l.n] = Leaf.{ off: off, size: size, fp: cty.is_floating(t) or cty.is_imaginary(t) or vec or
+                       dec, x87: cty.ffmt(t) == 80, dec: dec, vec: vec, bf: cty.is_bf16(t) };
+    l.n += 1;
+}
+
+fn leaves_of(t: *cty.CType, l: *mut Leaves) void {
+    l.n = 0;
+    l.ok = true;
+    add_leaves(t, 0, l);
+}
+
+// The IR type of an HFA's members: a float, a double, or a binary128 (a
+// quad-precision register: a 128-bit vector); a _Float16 an f32 with its
+// bits low (an h register is the low 16 bits of the v register); the
+// short vectors of an HVA a double (8 bytes) or a 128-bit vector.
+fn hfa_elem(h: Hfa) *mut ir.Ty {
+    if h.es == 16 {
+        return quad_ty();
+    }
+    if h.es == 2 {
+        return ir.t_float(32);
+    }
+    return ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+}
+
+// The members of a homogeneous floating-point aggregate (AAPCS64, a
+// binary128 long double alone counted as one): its count (1 to 4) and
+// their size (4, 8 or 16), or count 0.
+struct Hfa {
+    n: u64,
+    es: u64,
+}
+
+fn hfa_of(t: *cty.CType) Hfa {
+    let none = Hfa.{ n: 0, es: 0 };
+    let size = cty.size_of(t);
+    if not aggregate(t) or (size == 0) or (size > 64) {
+        return none;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return none;
+    }
+    let es = l.xs[0].size;
+    let vec = l.xs[0].vec;
+    if vec and (es != 8) and (es != 16) {
+        return none;  // (AAPCS64's short vectors are 8 and 16 bytes; others are composites)
+    }
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if not x.fp or (x.size != es) or ((x.off % es) != 0) or (x.vec != vec) or (x.dec != l.xs[0].dec) or x.bf {
+            // (a __bf16 member makes no homogeneous aggregate: the platform's
+            // AArch64 C compilers pass such a structure as a composite one)
+            return none;
+        }
+    }
+    if (size % es) != 0 {
+        return none;
+    }
+    let n = size / es;
+    if n > 4 {
+        return none;
+    }
+    // (every element there: a union's members overlap, padding is not allowed)
+    let mut seen: [4]bool = [false, false, false, false];
+    for i in 0..l.n {
+        seen[@truncate(usize, l.xs[i].off / es)] = true;
+    }
+    for k in 0..n {
+        if not seen[@truncate(usize, k)] {
+            return none;
+        }
+    }
+    return Hfa.{ n: n, es: es };
+}
+
+// The x86-64 System V classes of a structure or union's eightbytes.
+const C_NONE: u8 = 0;
+const C_INT: u8 = 1;
+const C_SSE: u8 = 2;
+const C_SSEUP: u8 = 3;
+const C_X87: u8 = 4;
+const C_X87UP: u8 = 5;
+const C_MEM: u8 = 6;
+
+struct Classes {
+    n: usize,  // 0: MEMORY
+    c: [2]u8,
+    fsize: [2]u64,  // the bytes of floating-point data in each SSE eightbyte
+    x87: bool,      // X87 and X87UP: MEMORY as an argument, st(0) as a result
+}
+
+// Two classes of one eightbyte merged (System V ABI 3.2.3, "merge").
+fn merge(a: u8, b: u8) u8 {
+    if a == b {
+        return a;
+    }
+    if a == C_NONE {
+        return b;
+    }
+    if b == C_NONE {
+        return a;
+    }
+    if (a == C_MEM) or (b == C_MEM) {
+        return C_MEM;
+    }
+    if (a == C_INT) or (b == C_INT) {
+        return C_INT;
+    }
+    if (a == C_X87) or (a == C_X87UP) or (b == C_X87) or (b == C_X87UP) {
+        return C_MEM;
+    }
+    return C_SSE;
+}
+
+fn classify_sysv(t: *cty.CType) Classes {
+    let mem = Classes.{ n: 0, c: [C_NONE, C_NONE], fsize: [0, 0], x87: false };
+    let size = cty.size_of(t);
+    if (size == 0) or (size > 16) {
+        return mem;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok {
+        return mem;
+    }
+    let mut r = Classes.{ n: @truncate(usize, (size + 7) / 8), c: [C_NONE, C_NONE], fsize: [0, 0], x87: false };
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.size > 0) and (x.size <= 16) and ((x.off % x.size) != 0) and (x.fp or (x.size <= 8)) {
+            return mem;  // (an unaligned member)
+        }
+        let k = @truncate(usize, x.off / 8);
+        if k >= r.n {
+            continue;
+        }
+        if not x.fp and (x.size > 8) {
+            // an integer wider than 64 bits: INTEGER eightbytes (an
+            // unaligned one: MEMORY)
+            if (x.off % 8) != 0 {
+                return mem;
+            }
+            for j in k..@min(r.n, k + @truncate(usize, x.size / 8)) {
+                r.c[j] = merge(r.c[j], C_INT);
+            }
+            continue;
+        }
+        if x.size == 16 {
+            // a long double: X87 and X87UP, or binary128's SSE and SSEUP
+            if x.x87 {
+                r.c[0] = merge(r.c[0], C_X87);
+                r.c[1] = merge(r.c[1], C_X87UP);
+            } else {
+                r.c[0] = merge(r.c[0], C_SSE);
+                r.c[1] = merge(r.c[1], C_SSEUP);
+                r.fsize[0] = 8;
+            }
+        } else if x.fp {
+            r.c[k] = merge(r.c[k], C_SSE);
+            let end = (x.off % 8) + x.size;
+            if end > r.fsize[k] {
+                r.fsize[k] = end;
+            }
+        } else {
+            r.c[k] = merge(r.c[k], C_INT);
+        }
+    }
+    // post-merger cleanup: MEMORY if any is; X87UP only after X87, SSEUP
+    // only after SSE (or else SSE)
+    for k in 0..r.n {
+        if r.c[k] == C_MEM {
+            return mem;
+        }
+    }
+    if (r.n == 2) and (r.c[1] == C_X87UP) {
+        if r.c[0] != C_X87 {
+            return mem;
+        }
+        r.x87 = true;
+        return r;
+    }
+    if (r.c[0] == C_X87) or (r.c[0] == C_X87UP) {
+        return mem;
+    }
+    if (r.n == 2) and (r.c[1] == C_SSEUP) and (r.c[0] != C_SSE) {
+        r.c[1] = C_SSE;
+        r.fsize[1] = 8;
+    }
+    // (an eightbyte of padding only: the last is left out, another passed as INTEGER)
+    if (r.n == 2) and (r.c[1] == C_NONE) {
+        r.n = 1;
+    }
+    for k in 0..r.n {
+        if r.c[k] == C_NONE {
+            r.c[k] = C_INT;
+        }
+    }
+    return r;
+}
+
+// Is t a binary128 long double, or a structure or union that is one (a
+// WebAssembly single-element structure of that type)?
+fn wasm_quad(t: *cty.CType) bool {
+    if not aggregate(t) or (cty.size_of(t) != 16) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return false;
+    }
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.off != 0) or (x.size != 16) or not x.fp or x.vec {
+            return false;
+        }
+    }
+    return true;
+}
+
+// WebAssembly with simd128: is t a 16-byte vector, or a structure or union
+// that is one (a single-element structure), passed as a v128?
+fn wasm_v128(t: *cty.CType) bool {
+    if (cty.size_of(t) != 16) or not cty.vec_ir() {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    return l.ok and (l.n == 1) and l.xs[0].vec;
+}
+
+// x86-64 System V: is t a vector of 32 or 64 bytes, or a structure or union
+// that is one, which the AVX registers hold (with AVX, or AVX-512F for 64
+// bytes: COptions.vec_reg, from --cpu and --features)? The psABI (3.2.3)
+// passes it in one ymm or zmm register then, its classes SSE and SSEUP
+// (x64.ax: arg_reg); without the extension it is MEMORY. (Axiom's own
+// convention passes such vectors in memory whatever the extensions, spec
+// 13.3.)
+fn sysv_wide_vec(t: *cty.CType) bool {
+    let size = cty.size_of(t);
+    if ((size != 32) and (size != 64)) or (size > cty.vec_reg()) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    return l.ok and (l.n == 1) and l.xs[0].vec and (l.xs[0].off == 0);
+}
+
+/// The IR type of a vector register's piece of `size` bytes (16, 32 or 64).
+pub fn vreg_ty(size: u64) *mut ir.Ty {
+    return ir.t_vec(ir.t_int(64), @truncate(u32, size / 8));
+}
+
+// Is t an integer of 16 bytes (wider than 64 bits), or a structure or union
+// that is one (a WebAssembly single-element structure): two i64s there?
+fn wasm_wint(t: *cty.CType) bool {
+    if cty.size_of(t) != 16 {
+        return false;
+    }
+    if cty.is_wint(t) {
+        return true;
+    }
+    if not cty.is_record(t) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return false;
+    }
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.off != 0) or (x.size != 16) or x.fp {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The type of a WebAssembly single-scalar structure or union (a member, or
+// a member of one, that is all of it), or nil.
+fn single_scalar(t: *cty.CType) *mut ir.Ty {
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return u.nil.[ir.Ty]();
+    }
+    let x = l.xs[0];
+    for i in 1..l.n {
+        if (l.xs[i].off != x.off) or (l.xs[i].size != x.size) or (l.xs[i].fp != x.fp) {
+            return u.nil.[ir.Ty]();
+        }
+    }
+    if (x.off != 0) or (x.size != cty.size_of(t)) or (x.size > 8) or x.vec {
+        return u.nil.[ir.Ty]();
+    }
+    // (a union of a float and an int of one size is not one scalar)
+    let mut fp_and_int = false;
+    for i in 0..l.n {
+        if l.xs[i].fp != x.fp {
+            fp_and_int = true;
+        }
+    }
+    if fp_and_int {
+        return u.nil.[ir.Ty]();
+    }
+    if x.fp and (x.size <= 4) {
+        return ir.t_float(32);  // (a _Float16's in its low 16 bits)
+    }
+    if x.fp {
+        return ir.t_float(64);
+    }
+    return int_piece(x.size);
+}
