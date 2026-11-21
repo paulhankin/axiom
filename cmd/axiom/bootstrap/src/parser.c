@@ -1346,6 +1346,15 @@ static void parse_methods(Parser *P, Decl *owner) {
     }
 }
 
+static void set_import_path(Decl *d, Token *s) {
+    if (memchr(s->str.bytes, 0, s->str.len))
+        diag_error(s->span, "E0218", "an import path may not contain a NUL byte");
+    else {
+        d->import_path = intern(s->str.bytes, s->str.len);
+        d->import_path_span = s->span;
+    }
+}
+
 static void parse_top(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
@@ -1372,14 +1381,19 @@ static void parse_top(Parser *P) {
             expect(P, TK_RBRACE);
             return;
         }
+        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "part") && peek2(P)->kind == TK_STRING) {
+            advance(P);
+            Decl *d = new_decl(P, D_IMPORT, start);
+            d->is_part = true;
+            set_import_path(d, advance(P));
+            expect(P, TK_SEMI);
+            d->span = sp_from(P, start);
+            vec_push(P->mod->decls, d);
+            return;
+        }
         Decl *d = new_decl(P, D_IMPORT, start);
         Token *s = expect(P, TK_STRING);
-        if (s->kind == TK_STRING && memchr(s->str.bytes, 0, s->str.len))
-            diag_error(s->span, "E0218", "an import path may not contain a NUL byte");
-        else if (s->kind == TK_STRING) {
-            d->import_path = intern(s->str.bytes, s->str.len);
-            d->import_path_span = s->span;
-        }
+        if (s->kind == TK_STRING) set_import_path(d, s);
         expect(P, KW_AS);
         d->name = expect_ident(P, &d->name_span);
         expect(P, TK_SEMI);

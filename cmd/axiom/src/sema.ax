@@ -416,12 +416,15 @@ fn dup_error(sp: u.Span, name: []u8, prev: u.Span) void {
 }
 
 fn register_module(m: *mut ast.Module) void {
+    let mut ntests: i32 = 0;
     for i in 0..m.decls.len {
         let d = m.decls.get(i);
-        if u.isnos(d.name) {
+        if ((d.kind == ast.D_IMPORT) and d.is_part) or u.isnos(d.name) {
             continue;
         }
         if d.is_test {  // tests are not names; their descriptions must be unique per module
+            d.name = u.intern(u.f1("test.%s", u.idec(ntests)));
+            ntests += 1;
             for j in 0..i {
                 let o = m.decls.get(j);
                 if o.is_test and u.same(o.test_name, d.test_name) {
@@ -436,18 +439,25 @@ fn register_module(m: *mut ast.Module) void {
             continue;
         }
         let mut prev = m.names.get(d.name);
+        if d.kind == ast.D_IMPORT {
+            if u.isnil(prev) {
+                prev = modl.module_lookup_import(m, d.span.file, d.name);
+            }
+            if u.notnil(prev) {
+                dup_error(d.name_span, d.name, prev.name_span);
+                continue;
+            }
+            modl.module_add_import(m, d.span.file, d.name, d);
+            continue;
+        }
         if u.isnil(prev) {
-            prev = m.imports.get(d.name);
+            prev = modl.module_lookup_any_import(m, d.name);
         }
         if u.notnil(prev) {
             dup_error(d.name_span, d.name, prev.name_span);
             continue;
         }
-        if d.kind == ast.D_IMPORT {
-            m.imports.put(d.name, d);
-        } else {
-            m.names.put(d.name, d);
-        }
+        m.names.put(d.name, d);
         if (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM) {
             for j in 0..d.methods.len {
                 let md = d.methods.get(j);
@@ -691,7 +701,7 @@ fn lookup_gparam(tc: *mut TypeCtx, name: []u8) *mut ast.Type {
 fn resolve_named_decl(nt: ast.NamedType, sp: u.Span, tc: *mut TypeCtx, report: bool) *mut ast.Decl {
     let m = tc.mod;
     if not u.isnos(nt.qual) {
-        let imp = m.imports.get(nt.qual);
+        let imp = modl.module_lookup_import(m, sp.file, nt.qual);
         if u.isnil(imp) {
             if report {
                 _ = dg.err(sp, "E0202", u.f1("unknown module '%s'", nt.qual));
@@ -882,7 +892,7 @@ fn resolve_generic_arg(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
                                             nt.member_span, tc);
             }
             if not u.isnos(nt.qual) {
-                let imp = tc.mod.imports.get(nt.qual);
+                let imp = modl.module_lookup_import(tc.mod, te.span.file, nt.qual);
                 if u.notnil(imp) {
                     if u.isnil(imp.imported) {
                         return ty.t_invalid;
@@ -3514,7 +3524,7 @@ fn resolve_ident(e: *mut ast.Expr) void {
         decl_ref(e, d);
         return;
     }
-    let imp = C.tc.mod.imports.get(e.name);
+    let imp = modl.module_lookup_import(C.tc.mod, e.span.file, e.name);
     if u.notnil(imp) {
         e.cat = ast.CAT_MODULE;
         ast.set_module(e, imp.imported);
@@ -5361,7 +5371,7 @@ fn declare_local(name: []u8, sp: u.Span, t: *mut ast.Type, is_mut: bool, is_para
         }
     }
     if not clash {
-        let d = C.tc.mod.imports.get(name);
+        let d = modl.module_lookup_import(C.tc.mod, sp.file, name);
         if u.notnil(d) {
             clash = true;
             prev_span = d.name_span;
@@ -6711,6 +6721,8 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
     // afresh too)
     C = u.nil.[FnCtx]();
     modl.mod_by_path = u.SymMap.[*mut ast.Module].{ keys: u.nil.[usize](), vals: u.nil.[*mut ast.Module](), cap: 0,
+                                                    len: 0 };
+    modl.part_owners = u.SymMap.[*mut ast.Module].{ keys: u.nil.[usize](), vals: u.nil.[*mut ast.Module](), cap: 0,
                                                     len: 0 };
     modl.mod_state = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     spost.size_checks = u.List.[spost.SizeCheck].empty();

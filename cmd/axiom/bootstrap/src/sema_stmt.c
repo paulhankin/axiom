@@ -34,7 +34,7 @@ Local *declare_local(Sym name, Span sp, Type *t, bool mut, bool is_param) {
         }
     }
     if (!clash) {
-        Decl *d = symmap_get(&C->tc.mod->imports, name);
+        Decl *d = module_lookup_import(C->tc.mod, sp.file, name);
         if (d) {
             clash = true;
             prev_span = d->name_span;

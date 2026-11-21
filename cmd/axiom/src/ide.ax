@@ -519,7 +519,7 @@ fn wte(te: *ast.TypeExpr) void {
             let file = nt.name_span.file;
             if not u.isnos(nt.qual) {
                 let qsp = u.mkspan(file, te.span.start, te.span.start + @int_cast(u32, nt.qual.len));
-                let imp = w_mod.imports.get(nt.qual);
+                let imp = modl.module_lookup_import(w_mod, file, nt.qual);
                 if u.notnil(imp) {
                     add_decl(qsp, imp, false, u.nil.[ast.Type]());
                     let bd = sema.module_lookup(imp.imported, nt.name);
@@ -586,7 +586,7 @@ fn wident(e: *mut ast.Expr) void {
     } else if u.notnil(ast.decl_of(e)) {
         add_decl(e.span, ast.decl_of(e), false, e.ty);
     } else if e.cat == ast.CAT_MODULE {
-        add_decl(e.span, w_mod.imports.get(e.name), false, u.nil.[ast.Type]());
+        add_decl(e.span, modl.module_lookup_import(w_mod, e.span.file, e.name), false, u.nil.[ast.Type]());
     } else {
         _ = gparam_ref(e.span, e.name);
     }
@@ -777,7 +777,9 @@ fn wstmt(s: *mut ast.Stmt) void {
 fn wdecl(d: *mut ast.Decl) void {
     let k = d.kind;
     if k == ast.D_IMPORT {
-        add_decl(d.name_span, d, true, u.nil.[ast.Type]());
+        if not d.is_part {
+            add_decl(d.name_span, d, true, u.nil.[ast.Type]());
+        }
         add_decl(d.import_path_span, d, false, u.nil.[ast.Type]());
         return;
     }
@@ -1644,7 +1646,11 @@ fn span_to(sp: u.Span, te: *ast.TypeExpr) u.Span {
 fn decl_symbol(b: *mut u.Buf, d: *mut ast.Decl) void {
     let k = d.kind;
     if k == ast.D_IMPORT {
-        sym_open(b, d.name, d.import_path, SK_MODULE, d.span, d.name_span);
+        if d.is_part {
+            sym_open(b, d.import_path, "part", SK_MODULE, d.span, d.import_path_span);
+        } else {
+            sym_open(b, d.name, d.import_path, SK_MODULE, d.span, d.name_span);
+        }
         b.s("]}");
         return;
     }
@@ -1728,11 +1734,17 @@ fn q_symbols() []u8 {
     let m = root_mod;
     let mut b = u.Buf.init();
     b.c('[');
+    let mut first = true;
     for i in 0..m.decls.len {
-        if i != 0 {
+        let d = m.decls.get(i);
+        if d.span.file != m.file.id {
+            continue;
+        }
+        if not first {
             b.c(',');
         }
-        decl_symbol(&mut b, m.decls.get(i));
+        first = false;
+        decl_symbol(&mut b, d);
     }
     b.c(']');
     return b.done();
@@ -1989,7 +2001,7 @@ fn sc_stmt(s: *mut ast.Stmt, off: u32) void {
 fn enclosing_fn(off: u32) *mut ast.Decl {
     for i in 0..root_mod.decls.len {
         let d = root_mod.decls.get(i);
-        if not contains(d.span, off) {
+        if (d.span.file != find_file) or not contains(d.span, off) {
             continue;
         }
         if d.kind == ast.D_FN {
@@ -2037,7 +2049,7 @@ fn scope_items(b: *mut u.Buf, off: u32) void {
     module_items(b, root_mod, "1");
     for i in 0..root_mod.decls.len {
         let d = root_mod.decls.get(i);
-        if d.kind == ast.D_IMPORT {
+        if (d.kind == ast.D_IMPORT) and not d.is_part and (d.span.file == find_file) {
             item(b, d.name, CK_MODULE, d.import_path, "1");
         }
     }
@@ -2119,7 +2131,7 @@ fn q_completion() []u8 {
         if u.notnil(found_field) {
             member_items(&mut b, found_field);
         } else if found_qual.len > 0 {
-            let imp = root_mod.imports.get(found_qual);
+            let imp = modl.module_lookup_import(root_mod, find_file, found_qual);
             if u.notnil(imp) and u.notnil(imp.imported) {
                 module_items(&mut b, imp.imported, "1");
             }
@@ -2299,6 +2311,18 @@ fn jdiag(b: *mut u.Buf, d: *mut dg.Diag, sp: u.Span, prefix: []u8) void {
     b.c('}');
 }
 
+fn module_has_file(m: *ast.Module, fid: i32) bool {
+    if m.file.id == fid {
+        return true;
+    }
+    for i in 0..m.parts.len {
+        if m.parts.at(i).file.id == fid {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The file's own diagnostics, and the first error in each module it
 // imports (on the import).
 fn q_diagnostics() []u8 {
@@ -2330,7 +2354,7 @@ fn q_diagnostics() []u8 {
         }
         for i in 0..root_mod.decls.len {
             let imp = root_mod.decls.get(i);
-            if (imp.kind == ast.D_IMPORT) and u.notnil(imp.imported) and (imp.imported.file.id == sp.file) {
+            if (imp.kind == ast.D_IMPORT) and u.notnil(imp.imported) and module_has_file(imp.imported, sp.file) {
                 if b.len() > 1 {
                     b.c(',');
                 }

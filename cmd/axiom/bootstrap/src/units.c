@@ -93,6 +93,24 @@ static void hash_blanked(Hasher *h, const char *text, size_t len, size_t *from, 
     *from = b;
 }
 
+static void hash_file_interface(Hasher *h, Module *m, SourceFile *f) {
+    hash_str(h, f->display);
+    size_t from = 0;
+    for (int i = 0; i < m->decls.len; i++) {
+        Decl *d = m->decls.data[i];
+        if (body_private(d)) {
+            if (d->body->span.file == f->id) hash_blanked(h, f->text, f->len, &from, d->body);
+        } else if ((d->kind == D_STRUCT || d->kind == D_UNION || d->kind == D_ENUM) && d->gparams.len == 0) {
+            for (int j = 0; j < d->methods.len; j++) {
+                Decl *md = d->methods.data[j];
+                if (body_private(md) && md->body->span.file == f->id)
+                    hash_blanked(h, f->text, f->len, &from, md->body);
+            }
+        }
+    }
+    hash_bytes(h, f->text + from, f->len - from);
+}
+
 /* What a module's importers depend on: its source without the bodies of the
    functions they never see (body_private), its path, and the interface keys
    of its imports in turn. A change inside such a body changes the module's
@@ -104,21 +122,10 @@ static const char *interface_key(Module *m, const char *opts) {
     Hasher h = hasher();
     hash_str(&h, compiler_id());
     hash_str(&h, opts);
-    SourceFile *f = g_files.data[m->file->id];
-    hash_str(&h, f->display);
-    size_t from = 0;
-    for (int i = 0; i < m->decls.len; i++) {
-        Decl *d = m->decls.data[i];
-        if (body_private(d)) {
-            hash_blanked(&h, f->text, f->len, &from, d->body);
-        } else if ((d->kind == D_STRUCT || d->kind == D_UNION || d->kind == D_ENUM) && d->gparams.len == 0) {
-            for (int j = 0; j < d->methods.len; j++) {
-                Decl *md = d->methods.data[j];
-                if (body_private(md)) hash_blanked(&h, f->text, f->len, &from, md->body);
-            }
-        }
+    hash_file_interface(&h, m, g_files.data[m->file->id]);
+    for (int i = 0; i < m->parts.len; i++) {
+        hash_file_interface(&h, m, g_files.data[m->parts.data[i].file->id]);
     }
-    hash_bytes(&h, f->text + from, f->len - from);
     for (int i = 0; i < m->decls.len; i++) {
         Decl *d = m->decls.data[i];
         if (d->kind == D_IMPORT && d->imported) hash_str(&h, interface_key(d->imported, opts));
@@ -138,6 +145,11 @@ static const char *module_key(Module *m, const char *opts) {
     SourceFile *f = g_files.data[m->file->id];
     hash_str(&h, f->display);
     hash_bytes(&h, f->text, f->len);
+    for (int i = 0; i < m->parts.len; i++) {
+        SourceFile *pf = g_files.data[m->parts.data[i].file->id];
+        hash_str(&h, pf->display);
+        hash_bytes(&h, pf->text, pf->len);
+    }
     bool has_tests = false;
     for (int i = 0; i < g_prog.tests.len; i++)
         if (g_prog.tests.data[i]->module == m) has_tests = true;

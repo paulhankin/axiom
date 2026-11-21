@@ -80,6 +80,8 @@ bool type_is_nocopy(Type *t);
 // NULL): the loops it leaves beyond the innermost, or -1 after an error.
 int check_jump_target(Sym label, Span sp, bool is_break);
 Decl *module_lookup(Module *m, Sym name);
+Decl *module_lookup_import(Module *m, int file_id, Sym alias);
+void module_add_import(Module *m, int file_id, Sym alias, Decl *d);
 Type *lookup_gparam(TypeCtx *tc, Sym name);
 Decl *find_method(Decl *owner, Sym name);
 int find_variant(Decl *u, Sym name);

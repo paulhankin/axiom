@@ -331,6 +331,7 @@ struct Decl {
     Sym import_path;
     Span import_path_span;
     Module *imported;
+    bool is_part;
     Sym host_module;   // D_HOST_FN from `import host "mod"`; NULL for extern "C"
     bool extern_c;     // declared in an extern "C" block
     bool cabi;         // a C function (extern "C" or export) with a structure by value (spec section 14.5.3)
@@ -386,12 +387,23 @@ enum {
     ATTR_MULTIVERSION,  // @multiversion: one version per set, chosen at run time
 };
 
+typedef struct PartFile {
+    SourceFile *file;
+    Sym path;
+} PartFile;
+
+typedef struct FileImports {
+    int file_id;
+    SymMap imports;
+} FileImports;
+
 struct Module {
     SourceFile *file;
     Sym path;
     Vec(Decl *) decls;
+    Vec(PartFile) parts;
     SymMap names;    // top-level names (items, not imports)
-    SymMap imports;  // alias -> Decl(D_IMPORT)
+    Vec(FileImports) file_imports;  // per-file alias -> Decl(D_IMPORT)
     struct Package *pkg;  // the package this module belongs to, or NULL
     Vec(Sym) inline_error_names;
     bool checked;

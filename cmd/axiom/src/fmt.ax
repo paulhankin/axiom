@@ -176,6 +176,7 @@ struct Imp {
     path: []u8,  // without the quotes
     alias: []u8,
     run: usize,  // the first import of its run
+    is_part: bool,
 }
 
 fn imp_list() u.List.[Imp] {
@@ -183,6 +184,12 @@ fn imp_list() u.List.[Imp] {
 }
 
 fn cmp_imp(x: Imp, y: Imp) i32 {
+    if x.is_part != y.is_part {
+        if x.is_part {
+            return 1;
+        }
+        return -1;
+    }
     return u.str_cmp(x.path, y.path);
 }
 
@@ -320,6 +327,14 @@ fn is_import_at(els: []El, i: usize) bool {
            (els[i + 3].kind == lx.TK_IDENT) and (els[i + 4].kind == lx.TK_SEMI);
 }
 
+fn is_part_import_at(els: []El, i: usize) bool {
+    if (i + 3) >= els.len {
+        return false;
+    }
+    return (els[i].kind == lx.KW_IMPORT) and (els[i + 1].kind == lx.TK_IDENT) and u.str_eq(els[i + 1].text, "part") and
+           (els[i + 2].kind == lx.TK_STRING) and (els[i + 3].kind == lx.TK_SEMI);
+}
+
 fn push_tok(out: *mut u.List.[El], kind: lx.TokKind, text: []u8, nl: i32) void {
     out.push(mk_el(kind, text, nl, 0));
 }
@@ -342,10 +357,23 @@ fn find_imports(els: []El) u.List.[Imp] {
                 b += 1;
             }
             let mut run = i;
-            if (imps.len > 0) and (imps.last().b == i) and (els[i].nl == 1) {
+            if (imps.len > 0) and not imps.last().is_part and (imps.last().b == i) and (els[i].nl == 1) {
                 run = imps.last().run;
             }
-            imps.push(Imp.{ a: i, b: b, path: s[1..s.len - 1], alias: els[i + 3].text, run: run });
+            imps.push(Imp.{ a: i, b: b, path: s[1..s.len - 1], alias: els[i + 3].text, run: run, is_part: false });
+            i = b;
+            continue;
+        } else if (depth == 0) and is_part_import_at(els, i) {
+            let s = els[i + 2].text;
+            let mut b = i + 4;
+            if (b < els.len) and is_cmt(&els[b]) and (els[b].nl == 0) {
+                b += 1;
+            }
+            let mut run = i;
+            if (imps.len > 0) and imps.last().is_part and (imps.last().b == i) and (els[i].nl == 1) {
+                run = imps.last().run;
+            }
+            imps.push(Imp.{ a: i, b: b, path: s[1..s.len - 1], alias: u.nosym(), run: run, is_part: true });
             i = b;
             continue;
         }
@@ -362,7 +390,8 @@ fn alias_used(els: []El, imps: *u.List.[Imp], m: Imp) bool {
             if (pt == NONE) or (els[pt].kind != lx.TK_DOT) {
                 let mut decl = false;
                 for r in 0..imps.len {
-                    if q == (imps.get(r).a + 3) {
+                    let ri = imps.get(r);
+                    if (not ri.is_part and (q == (ri.a + 3))) or (ri.is_part and (q == (ri.a + 1))) {
                         decl = true;
                     }
                 }
@@ -381,9 +410,18 @@ fn imports_to_keep(els: []El, imps: *u.List.[Imp], file_dir: []u8, std_dir: []u8
     for j in 0..imps.len {
         let m = imps.get(j);
         keep[j] = true;
+        if m.is_part {
+            for q in 0..j {
+                let o = imps.get(q);
+                if keep[q] and o.is_part and u.str_eq(o.path, m.path) {
+                    keep[j] = false;
+                }
+            }
+            continue;
+        }
         for q in 0..j {
             let o = imps.get(q);
-            if keep[q] and u.str_eq(o.path, m.path) and u.str_eq(o.alias, m.alias) {
+            if keep[q] and not o.is_part and u.str_eq(o.path, m.path) and u.str_eq(o.alias, m.alias) {
                 keep[j] = false;
             }
         }
@@ -431,7 +469,7 @@ fn missing_imports(els: []El, imps: *u.List.[Imp], path: []u8, std_dir: []u8, su
         }
         let mut known = false;
         for r in 0..imps.len {
-            if u.str_eq(imps.get(r).alias, name) {
+            if not imps.get(r).is_part and u.str_eq(imps.get(r).alias, name) {
                 known = true;
             }
         }
@@ -446,7 +484,7 @@ fn missing_imports(els: []El, imps: *u.List.[Imp], path: []u8, std_dir: []u8, su
         if in_std {
             ip = u.cat2(rel_to(module, sub), ".ax");
         }
-        adds.push(Imp.{ a: NONE, b: NONE, path: ip, alias: name, run: NONE });
+        adds.push(Imp.{ a: NONE, b: NONE, path: ip, alias: name, run: NONE, is_part: false });
     }
     return adds;
 }
@@ -538,6 +576,11 @@ fn fix_imports(els: []El, path: []u8, std_dir: []u8) u.List.[El] {
 fn first_run_of(imps: *u.List.[Imp]) usize {
     if imps.len == 0 {
         return NONE;
+    }
+    for i in 0..imps.len {
+        if not imps.get(i).is_part {
+            return imps.get(i).run;
+        }
     }
     return imps.get(0).run;
 }

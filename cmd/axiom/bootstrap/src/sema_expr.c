@@ -1071,7 +1071,7 @@ static void resolve_ident(Expr *e) {
         decl_ref(e, d);
         return;
     }
-    Decl *imp = symmap_get(&C->tc.mod->imports, e->name);
+    Decl *imp = module_lookup_import(C->tc.mod, e->span.file, e->name);
     if (imp) {
         e->cat = CAT_MODULE;
         e->module = imp->imported;
