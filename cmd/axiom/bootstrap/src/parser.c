@@ -29,13 +29,7 @@ typedef struct Parser {
 } Parser;
 
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
-static Token *peek2(Parser *P) { return &P->t[P->pos + 1 < P->n ? P->pos + 1 : P->n - 1]; }
-static Token *peek3(Parser *P) { return &P->t[P->pos + 2 < P->n ? P->pos + 2 : P->n - 1]; }
 static TokKind pk(Parser *P) { return P->t[P->pos].kind; }
-// `inline` is a keyword only before `fn` (spec §9.5)
-static bool at_inline(Parser *P) {
-    return pk(P) == TK_IDENT && !strcmp(peek(P)->name, "inline") && peek2(P)->kind == KW_FN;
-}
 
 static Token *advance(Parser *P) {
     Token *t = &P->t[P->pos];
@@ -167,25 +161,19 @@ static TypeExpr *new_te(TEKind k, Span sp) {
     return t;
 }
 
-static bool at_field(Parser *P) {
-    if (pk(P) == KW_PUB) {
-        Token *t2 = peek2(P);
-        if (t2->kind != TK_IDENT) return false;
-        if (!strcmp(t2->name, "inline") && peek3(P)->kind == KW_FN) return false;
-        return true;
-    }
-    return pk(P) == TK_IDENT && !at_inline(P);
+static Field parse_field(Parser *P, bool is_pub) {
+    Field f = {0};
+    f.is_pub = is_pub;
+    f.name = expect_ident(P, &f.span);
+    expect(P, TK_COLON);
+    f.te = parse_type(P);
+    return f;
 }
 
 static void parse_field_list(Parser *P, FieldVec *out) {
     // Field ( "," Field )* ","?
-    while (at_field(P)) {
-        Field f = {0};
-        f.is_pub = accept(P, KW_PUB);
-        f.name = expect_ident(P, &f.span);
-        expect(P, TK_COLON);
-        f.te = parse_type(P);
-        vec_push(*out, f);
+    while (pk(P) == KW_PUB || pk(P) == TK_IDENT) {
+        vec_push(*out, parse_field(P, accept(P, KW_PUB)));
         if (!accept(P, TK_COMMA)) break;
     }
 }
@@ -207,6 +195,66 @@ static void parse_generic_arg_list(Parser *P, TypeExprVec *out) {
         if (!accept(P, TK_COMMA)) break;
     }
     expect(P, TK_RBRACKET);
+}
+
+static TypeExpr *parse_array_len(Parser *P) {
+    if (pk(P) == TK_RBRACKET) {
+        syntax_error(P, "array length");
+        return NULL;
+    }
+    Expr *e = parse_expr(P);
+    if (!e->parens) {
+        if (e->kind == E_INT) {
+            TypeExpr *len = new_te(TE_INTLIT, e->span);
+            len->ival = e->ival;
+            return len;
+        }
+        if (e->kind == E_IDENT) {
+            TypeExpr *len = new_te(TE_NAMED, e->span);
+            len->name = e->name;
+            len->name_span = e->span;
+            return len;
+        }
+        if (e->kind == E_FIELD && e->a->kind == E_IDENT && !e->a->parens) {
+            TypeExpr *len = new_te(TE_NAMED, e->span);
+            len->qual = e->a->name;
+            len->name = e->name;
+            len->name_span = e->name_span;
+            return len;
+        }
+    }
+    TypeExpr *len = new_te(TE_CONSTEXPR, e->span);
+    len->expr = e;
+    return len;
+}
+
+static TypeExpr *parse_inline_errset_tail(Parser *P, Span start, Token *first_id) {
+    TypeExpr *te = new_te(TE_ERRSET_INLINE, start);
+    if (first_id) {
+        vec_push(te->error_names, first_id->name);
+        vec_push(te->error_spans, first_id->span);
+        vec_push(P->mod->inline_error_names, first_id->name);
+    }
+    if (!first_id || accept(P, TK_COMMA)) {
+        while (pk(P) == TK_IDENT) {
+            Span sp;
+            Sym n = expect_ident(P, &sp);
+            vec_push(te->error_names, n);
+            vec_push(te->error_spans, sp);
+            vec_push(P->mod->inline_error_names, n);
+            if (!accept(P, TK_COMMA)) break;
+        }
+    }
+    expect(P, TK_RBRACE);
+    te->span = sp_from(P, start);
+    if (accept(P, TK_BANG)) {
+        TypeExpr *eu = new_te(TE_ERRUNION, start);
+        eu->set = te;
+        eu->elem = parse_type(P);
+        eu->span = sp_from(P, start);
+        return eu;
+    }
+    return te;
 }
 
 static TypeExpr *parse_type_in(Parser *P);
@@ -270,39 +318,7 @@ static TypeExpr *parse_type_in(Parser *P) {
         // the length: an integer literal, a name (a const or a const
         // parameter, perhaps qualified), or any other constant expression
         TypeExpr *te = new_te(TE_ARRAY, start);
-        bool qualified = pk(P) == TK_IDENT && peek2(P)->kind == TK_DOT && peek3(P)->kind == TK_IDENT;
-        if (pk(P) == TK_INT && peek2(P)->kind == TK_RBRACKET) {
-            Token *n = advance(P);
-            te->len = new_te(TE_INTLIT, n->span);
-            te->len->ival = n->ival;
-        } else if (pk(P) == TK_IDENT && (peek2(P)->kind == TK_RBRACKET || qualified)) {
-            int save = P->pos;
-            Token *n = advance(P);
-            te->len = new_te(TE_NAMED, n->span);
-            te->len->name = n->name;
-            te->len->name_span = n->span;
-            if (qualified) {
-                advance(P);
-                Token *m = advance(P);
-                te->len->qual = te->len->name;
-                te->len->name = m->name;
-                te->len->name_span = m->span;
-                te->len->span = span_join(n->span, m->span);
-            }
-            if (pk(P) != TK_RBRACKET) {  // an expression after all
-                P->pos = save;
-                te->len = NULL;
-            }
-        }
-        if (!te->len) {
-            if (pk(P) == TK_RBRACKET) {
-                syntax_error(P, "array length");
-            } else {
-                Expr *e = parse_expr(P);
-                te->len = new_te(TE_CONSTEXPR, e->span);
-                te->len->expr = e;
-            }
-        }
+        te->len = parse_array_len(P);
         expect(P, TK_RBRACKET);
         te->elem = parse_type(P);
         te->span = sp_from(P, start);
@@ -332,87 +348,60 @@ static TypeExpr *parse_type_in(Parser *P) {
     }
     case KW_ERROR: advance(P); return new_te(TE_ERROR, start);
     case KW_SELF: advance(P); return new_te(TE_SELF, start);
-    case TK_LBRACE: {
-        advance(P);
-        TypeExpr *te = new_te(TE_ERRSET_INLINE, start);
-        while (pk(P) == TK_IDENT) {
-            Span sp;
-            Sym n = expect_ident(P, &sp);
-            vec_push(te->error_names, n);
-            vec_push(te->error_spans, sp);
-            vec_push(P->mod->inline_error_names, n);
-            if (!accept(P, TK_COMMA)) break;
-        }
-        expect(P, TK_RBRACE);
-        te->span = sp_from(P, start);
-        if (accept(P, TK_BANG)) {
-            TypeExpr *eu = new_te(TE_ERRUNION, start);
-            eu->set = te;
-            eu->elem = parse_type(P);
-            eu->span = sp_from(P, start);
-            return eu;
-        }
-        return te;
-    }
+    case TK_LBRACE: advance(P); return parse_inline_errset_tail(P, start, NULL);
     case TK_PRIM: {
         advance(P);
         TypeExpr *te = new_te(TE_PRIM, start);
         te->prim = t->prim;
         return te;
     }
+    case KW_INFER: {
+        advance(P);
+        expect(P, TK_BANG);
+        TypeExpr *eu = new_te(TE_ERRUNION, start);
+        eu->is_infer = true;
+        eu->elem = parse_type(P);
+        eu->span = sp_from(P, start);
+        return eu;
+    }
     case TK_IDENT: {
-        if (!strcmp(t->name, "infer") && peek2(P)->kind == TK_BANG) {
-            advance(P);
-            advance(P);
-            TypeExpr *eu = new_te(TE_ERRUNION, start);
-            eu->is_infer = true;
-            eu->elem = parse_type(P);
-            eu->span = sp_from(P, start);
-            return eu;
-        }
         advance(P);
         TypeExpr *te = new_te(TE_NAMED, start);
         te->name = t->name;
         te->name_span = t->span;
         // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
-        if (pk(P) == TK_DOT) {
-            TokKind k2 = peek2(P)->kind;
-            if (k2 == TK_IDENT) {
-                advance(P);
-                Token *m = advance(P);
-                te->qual = te->name;
-                te->name = m->name;
-                te->name_span = m->span;
-                if (pk(P) == TK_DOT && peek2(P)->kind == TK_LBRACKET) {
-                    advance(P);
-                    advance(P);
-                    te->has_args = true;
-                    parse_generic_arg_list(P, &te->args);
-                }
-            } else if (k2 == TK_LBRACKET) {
-                advance(P);
+        if (accept(P, TK_DOT)) {
+            if (pk(P) == TK_LBRACKET) {
                 advance(P);
                 te->has_args = true;
                 parse_generic_arg_list(P, &te->args);
+            } else {
+                te->qual = te->name;
+                te->name = expect_ident(P, &te->name_span);
+                if (accept(P, TK_DOT)) {
+                    if (pk(P) == TK_LBRACKET) {
+                        advance(P);
+                        te->has_args = true;
+                        parse_generic_arg_list(P, &te->args);
+                    } else {
+                        te->has_member = true;
+                        te->member = expect_ident(P, &te->member_span);
+                    }
+                }
             }
-        }
-        if (pk(P) == TK_DOT && peek2(P)->kind == TK_IDENT) {
-            advance(P);
-            Token *mem = advance(P);
-            te->has_member = true;
-            te->member = mem->name;
-            te->member_span = mem->span;
-            if (pk(P) == TK_DOT && peek2(P)->kind == TK_LBRACKET) {
-                advance(P);
-                advance(P);
+            if (!te->has_member && accept(P, TK_DOT)) {
+                te->has_member = true;
+                te->member = expect_ident(P, &te->member_span);
+            }
+            if (te->has_member && accept(P, TK_DOT)) {
+                expect(P, TK_LBRACKET);
                 te->member_has_args = true;
                 parse_generic_arg_list(P, &te->member_args);
             }
         }
         te->span = sp_from(P, start);
         // Set!T: an error union of the error set named
-        if (pk(P) == TK_BANG) {
-            advance(P);
+        if (accept(P, TK_BANG)) {
             TypeExpr *eu = new_te(TE_ERRUNION, start);
             eu->set = te;
             eu->elem = parse_type(P);
@@ -584,10 +573,9 @@ static Expr *parse_primary(Parser *P) {
     }
 }
 
-static Expr *parse_postfix(Parser *P) {
+static Expr *parse_postfix_from(Parser *P, Expr *e) {
     int outer = P->high;
     P->high = P->depth;
-    Expr *e = parse_primary(P);
     Span start = e->span;
     int links = 0;
     for (;;) {
@@ -665,6 +653,18 @@ static Expr *parse_postfix(Parser *P) {
         e->span = sp_from(P, start);
     }
     if (!chain_ok(P, outer, links - 1, e->span)) return new_expr(E_INT, start);
+    return e;
+}
+
+static Expr *parse_postfix(Parser *P) { return parse_postfix_from(P, parse_primary(P)); }
+
+static Expr *parse_unary_from(Parser *P, Expr *e0) {
+    if (!enter(P)) {
+        leave(P);
+        return new_expr(E_INT, e0->span);
+    }
+    Expr *e = parse_postfix_from(P, e0);
+    leave(P);
     return e;
 }
 
@@ -748,12 +748,12 @@ static void check_mix(Expr *parent, Expr *child, bool is_left) {
     diag_fix_edit(fx, (Span){child->span.file, child->span.end, child->span.end}, ")");
 }
 
-static Expr *parse_binexpr(Parser *P) {
+static Expr *parse_binexpr_seed(Parser *P, Expr *seed) {
     int outer = P->high;
     P->high = P->depth;
     Vec(Expr *) operands = {0};
     Vec(TokKind) ops = {0};
-    vec_push(operands, parse_unary(P));
+    vec_push(operands, seed ? parse_unary_from(P, seed) : parse_unary(P));
     while (op_family(pk(P)) != F_NONE) {
         vec_push(ops, advance(P)->kind);
         vec_push(operands, parse_unary(P));
@@ -802,8 +802,9 @@ static Expr *parse_binexpr(Parser *P) {
     return res;
 }
 
-static Expr *parse_expr(Parser *P) {
-    Expr *e = parse_binexpr(P);
+static Expr *parse_binexpr(Parser *P) { return parse_binexpr_seed(P, NULL); }
+
+static Expr *parse_expr_tail(Parser *P, Expr *e) {
     if (pk(P) != KW_CATCH && pk(P) != TK_QQ) return e;
     bool is_orelse = pk(P) == TK_QQ;
     Span start = e->span;
@@ -844,6 +845,10 @@ static Expr *parse_expr(Parser *P) {
     return c;
 }
 
+static Expr *parse_expr(Parser *P) { return parse_expr_tail(P, parse_binexpr(P)); }
+
+static Expr *parse_expr_from(Parser *P, Expr *seed) { return parse_expr_tail(P, parse_binexpr_seed(P, seed)); }
+
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
@@ -866,10 +871,9 @@ static Stmt *parse_block(Parser *P) {
     return b;
 }
 
-static Stmt *parse_block_in(Parser *P) {
-    Span start = peek(P)->span;
+static Stmt *parse_block_tail(Parser *P, Span start, Stmt *first) {
     Stmt *b = new_stmt(S_BLOCK, start);
-    expect(P, TK_LBRACE);
+    if (first) vec_push(b->stmts, first);
     while (pk(P) != TK_RBRACE && pk(P) != TK_EOF) {
         int before = P->pos;
         Stmt *s = parse_stmt(P);
@@ -879,6 +883,12 @@ static Stmt *parse_block_in(Parser *P) {
     expect(P, TK_RBRACE);
     b->span = sp_from(P, start);
     return b;
+}
+
+static Stmt *parse_block_in(Parser *P) {
+    Span start = peek(P)->span;
+    expect(P, TK_LBRACE);
+    return parse_block_tail(P, start, NULL);
 }
 
 static bool is_assign_op(TokKind k) {
@@ -891,9 +901,7 @@ static bool is_assign_op(TokKind k) {
 }
 
 // ExprStmt ::= Expr ( AssignOp Expr )? ";"
-static Stmt *parse_expr_stmt(Parser *P) {
-    Span start = peek(P)->span;
-    Expr *e = parse_expr(P);
+static Stmt *parse_expr_stmt_from(Parser *P, Span start, Expr *e) {
     Stmt *s;
     if (is_assign_op(pk(P))) {
         s = new_stmt(S_ASSIGN, start);
@@ -910,6 +918,11 @@ static Stmt *parse_expr_stmt(Parser *P) {
     }
     s->span = sp_from(P, start);
     return s;
+}
+
+static Stmt *parse_expr_stmt(Parser *P) {
+    Span start = peek(P)->span;
+    return parse_expr_stmt_from(P, start, parse_expr(P));
 }
 
 // Pattern ::= "." IDENT ( "(" IDENT ")" )? | "error" "." IDENT | "-"? INT_LIT | CHAR_LIT
@@ -1024,23 +1037,33 @@ static Stmt *parse_if(Parser *P) {
     return s;
 }
 
+static Stmt *parse_stmt_from_ident(Parser *P, Token id) {
+    Span start = id.span;
+    if (accept(P, TK_COLON)) {
+        if (pk(P) != KW_WHILE && pk(P) != KW_LOOP && pk(P) != KW_FOR) {
+            syntax_error(P, "while, loop, or for");
+            sync_stmt(P);
+            return NULL;
+        }
+        Stmt *s = parse_stmt(P);
+        s->label = id.name;
+        s->label_span = id.span;
+        s->span = sp_from(P, start);
+        return s;
+    }
+    Expr *e0 = new_expr(E_IDENT, id.span);
+    e0->name = id.name;
+    return parse_expr_stmt_from(P, start, parse_expr_from(P, e0));
+}
+
 static Stmt *parse_stmt(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
-    if (t->kind == TK_IDENT && peek2(P)->kind == TK_COLON) {
-        // a loop label: `name: while|loop|for`
-        int k3 = peek3(P)->kind;
-        if (k3 == KW_WHILE || k3 == KW_LOOP || k3 == KW_FOR) {
-            Token *id = advance(P);
-            advance(P);
-            Stmt *s = parse_stmt(P);
-            s->label = id->name;
-            s->label_span = id->span;
-            s->span = sp_from(P, start);
-            return s;
-        }
-    }
     switch (t->kind) {
+    case TK_IDENT: {
+        Token id = *advance(P);
+        return parse_stmt_from_ident(P, id);
+    }
     case KW_LET: {
         advance(P);
         Stmt *s = new_stmt(S_LET, start);
@@ -1048,10 +1071,14 @@ static Stmt *parse_stmt(Parser *P) {
         s->name = expect_ident(P, &s->name_span);
         if (accept(P, TK_COLON)) s->te = parse_type(P);
         expect(P, TK_EQ);
-        // `undefined` (contextual) as the whole initializer: the variable's bytes left
-        // unspecified until written
-        s->undef = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "undefined") && peek2(P)->kind == TK_SEMI;
-        s->e = parse_expr(P);
+        if (pk(P) == KW_UNDEFINED) {
+            Token *u = advance(P);
+            s->undef = true;
+            s->e = new_expr(E_IDENT, u->span);
+            s->e->name = intern_cstr("undefined");
+        } else {
+            s->e = parse_expr(P);
+        }
         if (!accept(P, TK_SEMI)) {
             syntax_error(P, "';'");
             sync_stmt(P);
@@ -1249,9 +1276,10 @@ static void parse_params(Parser *P, Decl *d) {
             break;
         }
         Param p = {0};
-        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "noalias") && peek2(P)->kind == TK_IDENT) {
+        Span ns = peek(P)->span;
+        if (accept(P, KW_NOALIAS)) {
             p.is_noalias = true;
-            p.noalias_span = advance(P)->span;
+            p.noalias_span = ns;
         }
         p.name = expect_ident(P, &p.span);
         expect(P, TK_COLON);
@@ -1292,17 +1320,64 @@ static void parse_fn_attr(Parser *P, Decl *d) {
     if (kind != ATTR_NONE) d->attr_span = sp_from(P, ts);
 }
 
-static bool at_inline_errset(Parser *P) {
-    if (pk(P) != TK_LBRACE) return false;
-    int k = P->pos + 1;
-    if (k < P->n && P->t[k].kind == TK_RBRACE)
-        return k + 1 < P->n && P->t[k + 1].kind == TK_BANG;
-    while (k < P->n && P->t[k].kind == TK_IDENT) {
-        k++;
-        if (k < P->n && P->t[k].kind == TK_COMMA) k++;
-        else break;
+static void missing_ret_type_error(Span sp) {
+    Diag *dg = diag_error(sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
+    DiagFix *fx = diag_fix(dg, "declare a void return type", "suggestion");
+    diag_fix_edit(fx, (Span){sp.file, sp.start, sp.start}, "void ");
+}
+
+static void parse_fn_ret_or_body(Parser *P, Decl *d) {
+    if (pk(P) != TK_LBRACE) {
+        d->ret_te = parse_type(P);
+        while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
+        d->body = parse_block(P);
+        return;
     }
-    return k < P->n && P->t[k].kind == TK_RBRACE;
+    if (!enter(P)) {
+        leave(P);
+        d->ret_te = new_te(TE_INVALID, peek(P)->span);
+        d->body = new_stmt(S_BLOCK, peek(P)->span);
+        return;
+    }
+    Span lbrace_sp = advance(P)->span;
+    if (pk(P) == TK_RBRACE) {
+        advance(P);
+        if (pk(P) == TK_BANG) {
+            advance(P);
+            TypeExpr *set = new_te(TE_ERRSET_INLINE, lbrace_sp);
+            set->span = sp_from(P, lbrace_sp);
+            TypeExpr *eu = new_te(TE_ERRUNION, lbrace_sp);
+            eu->set = set;
+            eu->elem = parse_type(P);
+            eu->span = sp_from(P, lbrace_sp);
+            leave(P);
+            d->ret_te = eu;
+            while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
+            d->body = parse_block(P);
+            return;
+        }
+        missing_ret_type_error(lbrace_sp);
+        d->body = new_stmt(S_BLOCK, sp_from(P, lbrace_sp));
+        leave(P);
+        return;
+    }
+    if (pk(P) == TK_IDENT) {
+        Token id1 = *advance(P);
+        if (pk(P) == TK_COMMA || pk(P) == TK_RBRACE) {
+            d->ret_te = parse_inline_errset_tail(P, lbrace_sp, &id1);
+            leave(P);
+            while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
+            d->body = parse_block(P);
+            return;
+        }
+        missing_ret_type_error(lbrace_sp);
+        d->body = parse_block_tail(P, lbrace_sp, parse_stmt_from_ident(P, id1));
+        leave(P);
+        return;
+    }
+    missing_ret_type_error(lbrace_sp);
+    d->body = parse_block_tail(P, lbrace_sp, NULL);
+    leave(P);
 }
 
 static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
@@ -1313,23 +1388,28 @@ static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     d->name = expect_ident(P, &d->name_span);
     parse_generic_params(P, d);
     parse_params(P, d);
-    if (pk(P) == TK_LBRACE && !at_inline_errset(P)) {
-        Diag *dg = diag_error(peek(P)->span, "E0301", "missing return type (write 'void' if the function returns nothing)");
-        DiagFix *fx = diag_fix(dg, "declare a void return type", "suggestion");
-        diag_fix_edit(fx, (Span){peek(P)->span.file, peek(P)->span.start, peek(P)->span.start}, "void ");
-    } else {
-        d->ret_te = parse_type(P);
-    }
-    while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
-    d->body = parse_block(P);
+    parse_fn_ret_or_body(P, d);
     d->span = sp_from(P, start);
     return d;
 }
 
 static Decl *parse_fn_inline(Parser *P, Span start, bool is_pub, bool is_export) {
     Span is = peek(P)->span;
-    bool inl = at_inline(P);
-    if (inl) advance(P);
+    bool inl = accept(P, KW_INLINE);
+    if (inl && pk(P) != KW_FN) {
+        expect(P, KW_FN);
+        sync_stmt(P);
+        Decl *d = new_decl(P, D_FN, start);
+        d->is_pub = is_pub;
+        d->is_export = is_export;
+        d->is_inline = true;
+        d->inline_span = is;
+        d->name = intern_cstr("<error>");
+        d->name_span = is;
+        d->ret_te = new_te(TE_INVALID, is);
+        d->body = new_stmt(S_BLOCK, is);
+        return d;
+    }
     Decl *d = parse_fn(P, start, is_pub, is_export);
     d->is_inline = inl;
     d->inline_span = is;
@@ -1337,13 +1417,80 @@ static Decl *parse_fn_inline(Parser *P, Span start, bool is_pub, bool is_export)
 }
 
 static void parse_methods(Parser *P, Decl *owner) {
-    while (pk(P) == KW_PUB || pk(P) == KW_FN || at_inline(P)) {
+    while (pk(P) == KW_PUB || pk(P) == KW_FN || pk(P) == KW_INLINE) {
         Span ms = peek(P)->span;
         bool mp = accept(P, KW_PUB);
         Decl *m = parse_fn_inline(P, ms, mp, false);
         m->owner = owner;
         vec_push(owner->methods, m);
     }
+}
+
+static Decl *parse_struct_decl(Parser *P, Span start, bool is_pub, bool is_nocopy) {
+    advance(P);
+    Decl *d = new_decl(P, D_STRUCT, start);
+    d->is_pub = is_pub;
+    d->is_nocopy = is_nocopy;
+    d->name = expect_ident(P, &d->name_span);
+    parse_generic_params(P, d);
+    expect(P, TK_LBRACE);
+    while (pk(P) == KW_PUB || pk(P) == TK_IDENT || pk(P) == KW_FN || pk(P) == KW_INLINE) {
+        Span ms = peek(P)->span;
+        bool fp = accept(P, KW_PUB);
+        if (pk(P) == KW_FN || pk(P) == KW_INLINE) {
+            Decl *m = parse_fn_inline(P, ms, fp, false);
+            m->owner = d;
+            vec_push(d->methods, m);
+            break;
+        }
+        vec_push(d->fields, parse_field(P, fp));
+        if (!accept(P, TK_COMMA)) break;
+    }
+    parse_methods(P, d);
+    expect(P, TK_RBRACE);
+    d->span = sp_from(P, start);
+    return d;
+}
+
+static Decl *parse_union_decl(Parser *P, Span start, bool is_pub, bool is_nocopy) {
+    advance(P);
+    Decl *d = new_decl(P, D_UNION, start);
+    d->is_pub = is_pub;
+    d->is_nocopy = is_nocopy;
+    d->name = expect_ident(P, &d->name_span);
+    parse_generic_params(P, d);
+    expect(P, TK_LBRACE);
+    while (pk(P) == TK_IDENT) {
+        Variant v = {0};
+        v.name = expect_ident(P, &v.span);
+        if (accept(P, TK_COLON)) v.te = parse_type(P);
+        vec_push(d->variants, v);
+        if (!accept(P, TK_COMMA)) break;
+    }
+    parse_methods(P, d);
+    expect(P, TK_RBRACE);
+    d->span = sp_from(P, start);
+    return d;
+}
+
+static Decl *parse_global_decl(Parser *P, Span start, bool is_pub, bool is_export, bool tls) {
+    advance(P);
+    Decl *d = new_decl(P, D_GLOBAL, start);
+    d->is_pub = is_pub;
+    d->is_export = is_export;
+    d->tls = tls;
+    d->mut = accept(P, KW_MUT);
+    d->name = expect_ident(P, &d->name_span);
+    if (!accept(P, TK_COLON)) {
+        syntax_error(P, "':' (global variables need an explicit type)");
+    } else {
+        d->te = parse_type(P);
+    }
+    expect(P, TK_EQ);
+    d->init = parse_expr(P);
+    expect(P, TK_SEMI);
+    d->span = sp_from(P, start);
+    return d;
 }
 
 static void set_import_path(Decl *d, Token *s) {
@@ -1381,11 +1528,11 @@ static void parse_top(Parser *P) {
             expect(P, TK_RBRACE);
             return;
         }
-        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "part") && peek2(P)->kind == TK_STRING) {
-            advance(P);
+        if (accept(P, KW_PART)) {
             Decl *d = new_decl(P, D_IMPORT, start);
             d->is_part = true;
-            set_import_path(d, advance(P));
+            Token *s = expect(P, TK_STRING);
+            if (s->kind == TK_STRING) set_import_path(d, s);
             expect(P, TK_SEMI);
             d->span = sp_from(P, start);
             vec_push(P->mod->decls, d);
@@ -1456,24 +1603,10 @@ static void parse_top(Parser *P) {
         advance(P);
         if (pk(P) == KW_LET) {
             // an object C code may use, under its name (spec section 14.5.6)
-            advance(P);
-            Decl *d = new_decl(P, D_GLOBAL, start);
-            d->is_export = true;
-            d->mut = accept(P, KW_MUT);
-            d->name = expect_ident(P, &d->name_span);
-            if (!accept(P, TK_COLON)) {
-                syntax_error(P, "':' (global variables need an explicit type)");
-            } else {
-                d->te = parse_type(P);
-            }
-            expect(P, TK_EQ);
-            d->init = parse_expr(P);
-            expect(P, TK_SEMI);
-            d->span = sp_from(P, start);
-            vec_push(P->mod->decls, d);
+            vec_push(P->mod->decls, parse_global_decl(P, start, false, true, false));
             return;
         }
-        if (pk(P) != KW_FN && !at_inline(P)) {
+        if (pk(P) != KW_FN && pk(P) != KW_INLINE) {
             syntax_error(P, "'fn' or 'let' after 'export'");
             sync_stmt(P);
             return;
@@ -1541,54 +1674,33 @@ static void parse_top(Parser *P) {
         expect(P, TK_RBRACE);
         return;
     }
-    // `threadlocal` is a keyword only here, before a module-level `let`
-    bool tls = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "threadlocal") && peek2(P)->kind == KW_LET;
-    if (tls) advance(P);
-    if (at_inline(P)) {
+    switch (pk(P)) {
+    case KW_THREADLOCAL:
+        advance(P);
+        if (pk(P) != KW_LET) {
+            expect(P, KW_LET);
+            sync_stmt(P);
+            return;
+        }
+        vec_push(P->mod->decls, parse_global_decl(P, start, is_pub, false, true));
+        return;
+    case KW_INLINE:
         vec_push(P->mod->decls, parse_fn_inline(P, start, is_pub, false));
         return;
-    }
-    bool is_nocopy = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "nocopy") &&
-                     (peek2(P)->kind == KW_STRUCT || peek2(P)->kind == KW_UNION);
-    if (is_nocopy) advance(P);
-    switch (pk(P)) {
-    case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
-    case KW_STRUCT: {
+    case KW_NOCOPY:
         advance(P);
-        Decl *d = new_decl(P, D_STRUCT, start);
-        d->is_pub = is_pub;
-        d->is_nocopy = is_nocopy;
-        d->name = expect_ident(P, &d->name_span);
-        parse_generic_params(P, d);
-        expect(P, TK_LBRACE);
-        parse_field_list(P, &d->fields);
-        parse_methods(P, d);
-        expect(P, TK_RBRACE);
-        d->span = sp_from(P, start);
-        vec_push(P->mod->decls, d);
-        return;
-    }
-    case KW_UNION: {
-        advance(P);
-        Decl *d = new_decl(P, D_UNION, start);
-        d->is_pub = is_pub;
-        d->is_nocopy = is_nocopy;
-        d->name = expect_ident(P, &d->name_span);
-        parse_generic_params(P, d);
-        expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT && !at_inline(P)) {
-            Variant v = {0};
-            v.name = expect_ident(P, &v.span);
-            if (accept(P, TK_COLON)) v.te = parse_type(P);
-            vec_push(d->variants, v);
-            if (!accept(P, TK_COMMA)) break;
+        if (pk(P) == KW_STRUCT) {
+            vec_push(P->mod->decls, parse_struct_decl(P, start, is_pub, true));
+        } else if (pk(P) == KW_UNION) {
+            vec_push(P->mod->decls, parse_union_decl(P, start, is_pub, true));
+        } else {
+            syntax_error(P, "'struct' or 'union' after 'nocopy'");
+            sync_stmt(P);
         }
-        parse_methods(P, d);
-        expect(P, TK_RBRACE);
-        d->span = sp_from(P, start);
-        vec_push(P->mod->decls, d);
         return;
-    }
+    case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
+    case KW_STRUCT: vec_push(P->mod->decls, parse_struct_decl(P, start, is_pub, false)); return;
+    case KW_UNION: vec_push(P->mod->decls, parse_union_decl(P, start, is_pub, false)); return;
     case KW_ENUM: {
         advance(P);
         Decl *d = new_decl(P, D_ENUM, start);
@@ -1596,7 +1708,7 @@ static void parse_top(Parser *P) {
         d->name = expect_ident(P, &d->name_span);
         if (accept(P, TK_COLON)) d->te = parse_type(P);
         expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT && !at_inline(P)) {
+        while (pk(P) == TK_IDENT) {
             Variant v = {0};
             v.name = expect_ident(P, &v.span);
             if (accept(P, TK_EQ)) {
@@ -1635,25 +1747,9 @@ static void parse_top(Parser *P) {
         vec_push(P->mod->decls, d);
         return;
     }
-    case KW_LET: {
-        advance(P);
-        Decl *d = new_decl(P, D_GLOBAL, start);
-        d->is_pub = is_pub;
-        d->tls = tls;
-        d->mut = accept(P, KW_MUT);
-        d->name = expect_ident(P, &d->name_span);
-        if (!accept(P, TK_COLON)) {
-            syntax_error(P, "':' (global variables need an explicit type)");
-        } else {
-            d->te = parse_type(P);
-        }
-        expect(P, TK_EQ);
-        d->init = parse_expr(P);
-        expect(P, TK_SEMI);
-        d->span = sp_from(P, start);
-        vec_push(P->mod->decls, d);
+    case KW_LET:
+        vec_push(P->mod->decls, parse_global_decl(P, start, is_pub, false, false));
         return;
-    }
     default:
         syntax_error(P, "declaration");
         sync_stmt(P);

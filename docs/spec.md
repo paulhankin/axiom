@@ -107,16 +107,14 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 ### 2.4 Keywords
 
 ```
-and       as        break     catch     const     continue  defer     else
-enum      errdefer  error     export    extern    false     fn        for
-host      if        import    in        let       loop      match     mut
-not       or        pub       return    Self      struct    test      true
-union     while
+and          as           break        catch        const        continue
+defer        else         enum         errdefer     error        export
+extern       false        fn           for          host         if
+import       in           infer        inline       let          loop
+match        mut          noalias      nocopy       not          or
+part         pub          return       Self         struct       test
+threadlocal  true         undefined    union        while
 ```
-
-`threadlocal` is not a keyword. It is an identifier that has its special meaning
-only at the start of a module-level `let` (§12.8.6). Likewise `inline` has its meaning
-only directly before `fn` (§9.5).
 
 **Reserved type names.** These lex as keywords:
 
@@ -228,8 +226,10 @@ ConstDecl     ::= "const" IDENT ":" Type "=" Expr ";"
 GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ```
 
-`part` is not a keyword (§2.4); it is recognized contextually immediately after `import`
-to include another source file into the current module (§4.1).
+`part` and `threadlocal` are reserved keywords (§2.4). `ImportDecl` and `GlobalDecl`
+are strictly LL(1) (`import part` includes another source file into the current module,
+§4.1). `TopDecl` left-factors leading `"pub"` and `"export"` so one token after either
+keyword selects the declaration form.
 
 ### 3.2 Aggregates and functions
 
@@ -257,12 +257,17 @@ Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "
                 | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
 
-The trailing-comma forms are LL(1). After a `,`, `pub` followed by an `IDENT` (other than
-`inline` before `fn`), or an `IDENT` other than `inline` before `fn`, begins another
-`Field`; anything else ends the list. The FIRST sets of `Field` (`pub`, `IDENT`) and
-`MethodDecl` (`pub`, `fn`) share `pub` and `inline`, which is resolved by one or two
-tokens of lookahead (`pub fn`, `pub inline fn`, `inline fn` begin methods, whereas
-`pub IDENT :`, `IDENT :` begin fields).
+The trailing-comma forms and aggregate bodies are strictly LL(1). Because `inline` is a
+reserved keyword (§2.4) and never an `IDENT`, variants and enum members (`IDENT`) are
+disjoint from `MethodDecl` (`pub`, `inline`, `fn`): after a `,`, `IDENT` begins another
+variant or member, while `pub`, `inline`, `fn`, or `}` ends the list. In a struct body,
+`Field` (`pub`, `IDENT`) and `MethodDecl` (`pub`, `inline`, `fn`) share only `pub`,
+which is resolved by left-factoring: at `{` or after a `,`, `IDENT` begins a `Field`,
+`fn` or `inline` begins `MethodDecl*`, `}` ends the body, and after consuming `pub`, the
+next token alone selects a field (`IDENT`) or a method (`fn` or `inline`). Likewise
+`nocopy` and `noalias` are reserved keywords: `Param` chooses on `noalias` vs `IDENT`,
+and left-factoring `nocopy` lets the single token after it (`struct` vs `union`) select
+`StructDecl` or `UnionDecl`.
 
 ### 3.3 Types
 
@@ -295,9 +300,10 @@ PrimType      ::= (any reserved type name, §2.4)
 `NamedType` accepts `Name`, `module.Name`, `Name.[Args]`, `module.Name.[Args]`, and in
 generic arguments associated functions/methods such as `Type.method`, `module.Type.method`,
 or `Type.[Args].method.[MArgs]`. After the `.`, the next token (`IDENT` or `[`) decides
-which form it is. `infer` is not a keyword; it is parsed contextually before `!` in type
-position, and `infer!Type` is valid only as the return type of a private (`fn`, non-`pub`,
-non-`export`, non-`extern`) function (§11.3).
+which form it is. `infer` is a reserved keyword (§2.4), so `infer!Type` is selected on
+the single token `infer` with strictly LL(1) parsing, and is valid only as the return
+type of a private (`fn`, non-`pub`, non-`export`, non-`extern`) non-host function
+(§11.3).
 
 ### 3.4 Statements
 
@@ -311,7 +317,7 @@ Stmt          ::= LetStmt
                 | Block
                 | ExprStmt
 
-LetStmt       ::= "let" "mut"? IDENT ( ":" Type )? "=" Expr ";"
+LetStmt       ::= "let" "mut"? IDENT ( ":" Type )? "=" ( "undefined" | Expr ) ";"
 ExprStmt      ::= Expr ( AssignOp Expr )? ";"
 DiscardStmt   ::= "_" "=" Expr ";"
 AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
@@ -337,7 +343,9 @@ DeferStmt     ::= ( "defer" | "errdefer" ) ( Block | ExprStmt )
 
 Assignment and expression statements share one production because both begin with an
 expression. Whether the left-hand side is assignable is checked afterwards (§7.2). This
-is the standard LL(1) factoring.
+is the standard LL(1) factoring. In `LetStmt`, `undefined` is a reserved keyword (§2.4)
+recognized only immediately after `=`, keeping the choice between `undefined` and `Expr`
+strictly LL(1).
 
 ### 3.5 Expressions
 
@@ -434,9 +442,9 @@ ImportDecl ::= "import" ( STRING_LIT "as" IDENT ";"
                         | "host" STRING_LIT? "{" HostFnDecl* "}" )
 ```
 
-`part` is contextual directly after `import` (not a reserved keyword), and `import part`
-paths follow the same path-resolution rules relative to the entry file (`E0218`, `E0211`,
-`E0219`).
+`part` is a reserved keyword (§2.4) with strictly LL(1) parsing directly after `import`,
+and `import part` paths follow the same path-resolution rules relative to the entry file
+(`E0218`, `E0211`, `E0219`).
 
 - **Entry file only:** Only a module's entry file may declare `import part`. Using
   `import part` inside a part file, or importing a part file directly via
@@ -746,13 +754,13 @@ A struct (or union) larger than the target's largest object is rejected (§5.5, 
 Anonymous struct types `struct { … }` follow the same rules. Two anonymous struct types are
 the same type when their field names and field types match exactly, in the same order.
 
-**`nocopy` types.** A `nocopy struct` or `nocopy union` (where `nocopy` is contextual
-directly before `struct` or `union`) forbids implicit bitwise copying from places so that
-owning containers and address-pinned synchronization types cannot be accidentally aliased or
-double-freed. `nocopy` propagates structurally through value containment: any struct,
-union, array (`[N]T`), optional (`?T`), or error union (`!T`) containing a `nocopy` type by
-value is also `nocopy`. Raw pointers (`*T`, `*mut T`) and slices (`[]T`, `[]mut T`) are
-always copyable.
+**`nocopy` types.** A `nocopy struct` or `nocopy union` (`nocopy` is a reserved keyword,
+§2.4, left-factored before `struct` and `union` for strictly LL(1) parsing) forbids
+implicit bitwise copying from places so that owning containers and address-pinned
+synchronization types cannot be accidentally aliased or double-freed. `nocopy` propagates
+structurally through value containment: any struct, union, array (`[N]T`), optional
+(`?T`), or error union (`!T`) containing a `nocopy` type by value is also `nocopy`. Raw
+pointers (`*T`, `*mut T`) and slices (`[]T`, `[]mut T`) are always copyable.
 
 - Rvalues (calls, struct/union/array literals, `@swap(&mut a, &mut b)`, `.some(x)`, `catch`,
   `??`, and `e!` on an rvalue) may produce `nocopy` values freely.
@@ -1226,10 +1234,11 @@ need not be cleared first.
 let mut rows: [64]usize = undefined;   // only rows[0..n] are written, and read
 ```
 
-`undefined` is recognised only as the whole initializer of a `let` (elsewhere it is an
-ordinary identifier). The binding must be `let mut` (`E0413`: it could never be written)
-and must have a type annotation (`E0414`). Only a variable of **plain data**, integers,
-floats and vectors and arrays and structs of them, is left with unspecified bytes:
+`undefined` is a reserved keyword (§2.4) allowed only as the whole initializer of a local
+`let` (parsed strictly LL(1) after `=`, §3.4). The binding must be `let mut` (`E0413`: it
+could never be written) and must have a type annotation (`E0414`). Only a variable of
+**plain data**, integers, floats and vectors and arrays and structs of them, is left
+with unspecified bytes:
 reading them before they are written gives unspecified values, never poison (§12.3);
 an implementation may give them any values, zeroes included (it may zero a variable
 small enough to be kept in registers). A variable whose type holds anything else (a
@@ -1425,12 +1434,14 @@ field access followed by a call, not a method call, because `alloc_fn` is a fiel
 inline fn bit(x: u64, k: u32) u64 { return (x >> k) & 1; }
 ```
 
-A function (or method) declared `inline` is **always inlined** where the compiler
-inlines at all (at `-O2` and above): every direct call it can see the body of is
-replaced by the function's body, whatever its size, so a small helper called with
-constant arguments costs what the same code written out would, the way macros or
-`#[inline(always)]` are used elsewhere. At `-O0` and `-O1` a call to it is an ordinary
-call. It changes no behavior: traps, overflow checks and stack traces are the same.
+`inline` is a reserved keyword (§2.4) placed directly before `fn`, so function and method
+declarations parse strictly LL(1) (§3.2). A function (or method) declared `inline` is
+**always inlined** where the compiler inlines at all (at `-O2` and above): every direct
+call it can see the body of is replaced by the function's body, whatever its size, so a
+small helper called with constant arguments costs what the same code written out would,
+the way macros or `#[inline(always)]` are used elsewhere. At `-O0` and `-O1` a call to it
+is an ordinary call. It changes no behavior: traps, overflow checks and stack traces are
+the same.
 
 - An inline function cannot be recursive, directly or through other inline functions
   (`E0314`, reported at each call on the cycle). Recursion through a function that is not
@@ -1828,12 +1839,13 @@ fn retry[error E, T](attempts: i32, f: fn() E!T) E!T { … }
 
 - `pub`, `export`, and `extern` functions must declare explicit error sets so
   separate-compilation module interfaces (§16.7) never depend on function bodies.
-- `infer!T` is valid **only** as the return type of a private (`fn`, non-`pub`, non-`export`,
-  non-`extern`) non-host function; using `infer!T` anywhere else (including `pub fn`,
-  `export fn`, `extern fn`, host imports, parameters, fields, or local annotations) is
-  `E0654`. The compiler infers the closed set of errors the body can return or propagate
-  via `!`, and callers receive that closed set (allowing exhaustive `match` without `else`
-  and subset widening).
+- `infer` is a reserved keyword (§2.4) with strictly LL(1) parsing in type position
+  (`infer!T`, §3.3). `infer!T` is valid **only** as the return type of a private (`fn`,
+  non-`pub`, non-`export`, non-`extern`) non-host function; using `infer!T` anywhere else
+  (including `pub fn`, `export fn`, `extern fn`, host imports, parameters, fields, or
+  local annotations) is `E0654`. The compiler infers the closed set of errors the body
+  can return or propagate via `!`, and callers receive that closed set (allowing
+  exhaustive `match` without `else` and subset widening).
 - A concrete non-generic function declaring an inline error set `{ … }!T` whose body can
   never return or propagate one or more of its listed errors emits warning `W0655` with a
   fix narrowing the inline error set.
@@ -1895,13 +1907,14 @@ wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code 
   (address 0 among it) stops the program with a crash report and a stack trace (§16.4);
   in a test binary it is reported as `T0005`.
 
-A parameter declared `noalias` (§3.2) is an additional promise about pointers and slices
-(`*T`, `*mut T`, `[]T`, `[]mut T`): while the function runs, memory reached through
-that parameter must not overlap any memory reached through any other pointer or slice
-parameter of the same call. Breaking this promise is undefined behavior just like any
-other breach of the access rule. Under `--sanitize=address`, the compiler checks at
-function entry that slice and typed pointer arguments in a `noalias` call do not overlap,
-trapping with `T0012` if they do.
+A parameter declared `noalias` (§3.2; `noalias` is a reserved keyword, §2.4, parsed
+strictly LL(1)) is an additional promise about pointers and slices (`*T`, `*mut T`,
+`[]T`, `[]mut T`): while the function runs, memory reached through that parameter must
+not overlap any memory reached through any other pointer or slice parameter of the same
+call. Breaking this promise is undefined behavior just like any other breach of the
+access rule. Under `--sanitize=address`, the compiler checks at function entry that slice
+and typed pointer arguments in a `noalias` call do not overlap, trapping with `T0012` if
+they do.
 
 There is no null: address 0 is not an object on any target. A pointer from C that may be
 NULL is checked with `std/c.is_null` (§14.5.4). `--sanitize=address` (§16.8) finds the
@@ -2183,8 +2196,9 @@ address (`&mut calls`) in the same way, and a pointer to it may be given to anot
 thread, which then accesses the first thread's copy. Such a pointer dangles once its
 thread has ended (§12.1).
 
-A thread-local must be `mut` (E0354). `threadlocal` is recognized only before a
-module-level `let` and is otherwise an ordinary identifier.
+A thread-local must be `mut` (E0354). `threadlocal` is a reserved keyword (§2.4), valid
+only before a module-level `let` (after optional `pub`, parsed strictly LL(1) in
+`GlobalDecl`, §3.1).
 
 Implementation: native code uses the platform's thread-local storage (ELF TLS, the
 initial-exec model). On WebAssembly, where each thread is a separate instance, the
