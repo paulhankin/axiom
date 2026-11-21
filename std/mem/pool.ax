@@ -1,0 +1,638 @@
+// =============================================================================
+// std/mem/pool.ax - system page growth, size-binned large blocks, decay, and
+// the empty-span cache (part of std/mem).
+// =============================================================================
+
+let mut pool_lock: u32 = 0;
+let mut wild_lo: usize = 0;  // [wild_lo, wild_hi): memory never used
+let mut wild_hi: usize = 0;
+// [clean, wild_hi) has never been handed out, so it is still zero (as the
+// system gives it); [wild_lo, clean) is memory freed back to the wilderness.
+let mut clean: usize = 0;
+// where the fresh (zero) part of the last block_alloc starts
+let mut fresh_at: usize = 0;
+let mut bins: [160]usize = [0; 160];
+let mut bin_bits: [3]u64 = [0; 3];
+let mut span_cache: usize = 0;
+let mut span_cached: usize = 0;
+let mut large_bytes: usize = 0;  // bytes of large blocks in use
+let mut retained: usize = 0;     // free block bytes not given back (their dirty)
+// [wild_lo, wild_dirty) was handed out and returned to the wilderness: it may
+// be resident
+let mut wild_dirty: usize = 0;
+let mut mapped: usize = 0;     // bytes taken from the system
+let mut given_back: u64 = 0;   // bytes given back to the system, in all
+let mut decay_ops: u32 = 0;    // pool operations since the last look at the clock
+let mut decay_start: i64 = 0;  // when the current epoch began (0: not yet)
+let mut decay_epoch: usize = 0;
+let mut freed_in: [20]usize = [0; 20];  // bytes freed in each of the last epochs (a ring)
+
+fn pool_enter() void {
+    if multi {
+        lock(&mut pool_lock);
+    }
+}
+
+fn pool_leave() void {
+    if multi {
+        unlock(&mut pool_lock);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The pool: memory from the system, large blocks, empty spans
+// -----------------------------------------------------------------------------
+fn bin_of(units: usize) usize {
+    if units < 64 {
+        return units;
+    }
+    let b = log2(units);
+    return 64 + ((b - 6) * 4) + ((units >> (b - 2)) & 3);
+}
+
+fn bin_insert(s: usize, size: usize, dirty: usize) void {
+    let bi = bin_of(size / UNIT);
+    let b = block(s);
+    b.magic = tag(MAGIC_FREE, s);
+    b.size = size;
+    b.dirty = @min(dirty, size);
+    retained += b.dirty;
+    b.prev = 0;
+    b.next = bins[bi];
+    if b.next != 0 {
+        block(b.next).prev = s;
+    }
+    bins[bi] = s;
+    bin_bits[bi >> 6] |= @as(u64, 1) << @truncate(u32, bi & 63);
+    word((s + size) - @size_of(usize)).* = size;
+    set_prev_free(s + size, 1);
+}
+
+fn bin_remove(s: usize) void {
+    let b = block(s);
+    let bi = bin_of(b.size / UNIT);
+    retained -= b.dirty;
+    if b.prev != 0 {
+        block(b.prev).next = b.next;
+    } else {
+        bins[bi] = b.next;
+        if b.next == 0 {
+            bin_bits[bi >> 6] &= ~(@as(u64, 1) << @truncate(u32, bi & 63));
+        }
+    }
+    if b.next != 0 {
+        block(b.next).prev = b.prev;
+    }
+    set_prev_free(s + b.size, 0);
+}
+
+// Marks whether the block before the one at `a` is free (if a block starts
+// there: a used block or a span; the wilderness and memory from elsewhere
+// have no header).
+fn set_prev_free(a: usize, v: usize) void {
+    if a == wild_lo {
+        return;
+    }
+    let m = magic_at(a);
+    if (m == tag(MAGIC_USED, a)) or (m == tag(MAGIC_SPAN, a)) {
+        block(a).prev_free = v;
+    }
+}
+
+// A free block of at least `size` bytes, taken out of its bin (0: none).
+fn take_free(size: usize) usize {
+    let units = size / UNIT;
+    let first = bin_of(units);
+    // the first bin can hold smaller blocks (above 63 units)
+    let mut s = bins[first];
+    while s != 0 {
+        if block(s).size >= size {
+            bin_remove(s);
+            return s;
+        }
+        s = block(s).next;
+    }
+    let mut bi = first + 1;
+    while bi < NBINS {
+        let w = bin_bits[bi >> 6] >> @truncate(u32, bi & 63);
+        if w == 0 {
+            bi = (bi | 63) + 1;
+            continue;
+        }
+        bi += @truncate(usize, @ctz(w));
+        let t = bins[bi];
+        bin_remove(t);
+        return t;
+    }
+    return 0;
+}
+
+// Makes [s, s + size) a free block: merged with free neighbours, returned to
+// the wilderness if it borders it, else put in a bin.
+fn release_block(s0: usize, size0: usize) void {
+    block(s0).magic = 0;  // no longer a used block (a second free traps)
+    freed_in[decay_epoch] += size0;
+    let mut s = s0;
+    let mut size = size0;
+    let mut dirty = size0;
+    let n = s + size;
+    if (n != wild_lo) and (magic_at(n) == tag(MAGIC_FREE, n)) {
+        let ns = block(n).size;
+        dirty += block(n).dirty;
+        bin_remove(n);
+        size += ns;
+    }
+    if block(s).prev_free != 0 {
+        let ps = word(s - @size_of(usize)).*;
+        dirty += block(s - ps).dirty;
+        bin_remove(s - ps);
+        s -= ps;
+        size += ps;
+    }
+    if (s + size) == wild_lo {
+        wild_dirty = @max(wild_dirty, wild_lo);
+        wild_lo = s;
+        if dirty_bytes() > RETAIN {
+            purge_wild(dirty_bytes() - RETAIN);  // past the budget
+        }
+        decay_tick();
+        return;
+    }
+    block(s).prev_free = 0;
+    if (size >= DISCARD_MIN) and ((retained + dirty) > RETAIN) {
+        // past the budget: the pages of what was just freed go back, with a
+        // page on either side (which held a neighbour's header or size, so
+        // could not go back before), but not again all of the neighbours
+        // merged with it, which may be back already
+        let lo = @max(@sub_sat(s0 & ~(PAGE - 1), PAGE), s + UNIT);
+        let hi = @min((((s0 + size0) + PAGE - 1) & ~(PAGE - 1)) + PAGE, (s + size) - UNIT);
+        let got = whole_pages(lo, hi);
+        if got > 0 {
+            @memory_discard(lo, hi - lo);
+            given_back += @as(u64, @min(got, dirty));
+            dirty -= @min(got, dirty);
+        }
+    }
+    bin_insert(s, size, dirty);
+    decay_tick();
+}
+
+// The bytes of the whole pages (PAGE) in [a, b).
+fn whole_pages(a: usize, b: usize) usize {
+    let lo = (a + PAGE - 1) & ~(PAGE - 1);
+    let hi = b & ~(PAGE - 1);
+    if hi > lo {
+        return hi - lo;
+    }
+    return 0;
+}
+
+// Gives about n bytes of the free block at s back to the system (all of it
+// if n >= dirty, but for its first and last units, which hold its header and
+// size); returns how much of it may still be resident. The resident part is
+// taken to be at the start: the pages given back are below s + dirty.
+fn give_back(s: usize, size: usize, dirty: usize, n: usize) usize {
+    let lo0 = s + UNIT;
+    let hi0 = (s + size) - UNIT;
+    let mut lo = lo0;
+    let mut hi = hi0;
+    if n < dirty {
+        hi = @min(hi0, s + dirty) & ~(PAGE - 1);
+        lo = @max(lo0, @sub_sat(hi, (n + PAGE) - 1));
+    }
+    let got = whole_pages(lo, hi);
+    if got == 0 {
+        return dirty;
+    }
+    @memory_discard(lo, hi - lo);
+    given_back += @as(u64, @min(got, dirty));
+    if (lo == lo0) and (hi == hi0) {
+        return @min(dirty, size - got);
+    }
+    return dirty - @min(got, dirty);
+}
+
+// The free memory that may be resident (pool lock).
+fn dirty_bytes() usize {
+    return retained + @sub_sat(wild_dirty, wild_lo);
+}
+
+// Decay: free memory goes back to the system once it has stayed unused for a
+// while. Time is divided into epochs of EPOCH_NS; the pool counts the bytes
+// freed in each of the last EPOCHS, and of the free memory that may be
+// resident it keeps no more than those counts weighted by age, along a
+// smooth curve from all (this epoch) to none (EPOCHS epochs ago). Every
+// DECAY_EVERY pool operations it looks at the clock; when an epoch has
+// passed, it gives back what is over that limit: the wilderness first, then
+// free blocks, the biggest first. (RETAIN still gives big blocks back at once.)
+fn decay_tick() void {
+    // (WebAssembly memory cannot shrink; and a freestanding module's host
+    // need not provide the clock, so the call is not compiled there)
+    if not (@target_arch("wasm32") or @target_arch("wasm64")) {
+        decay_ops += 1;
+        if decay_ops >= DECAY_EVERY {
+            decay_ops = 0;
+            decay_at(ax_clock_ns(1));
+        }
+    }
+}
+
+// The weight of memory freed `age` epochs ago, out of 1024.
+fn decay_weight(age: usize) u64 {
+    if age >= EPOCHS {
+        return 0;
+    }
+    let x = (@as(u64, age) * 1024) / @as(u64, EPOCHS);
+    return 1024 - ((x * x * (3072 - (2 * x))) >> 20);
+}
+
+// The decay at time `now` (monotonic nanoseconds; pool lock).
+fn decay_at(now: i64) void {
+    if now <= 0 {
+        return;  // no clock
+    }
+    if decay_start == 0 {
+        decay_start = now;
+        return;
+    }
+    let k = (now - decay_start) / EPOCH_NS;
+    if k <= 0 {
+        return;
+    }
+    decay_start += k * EPOCH_NS;
+    let mut passed = EPOCHS;
+    if k < 20 {  // (EPOCHS)
+        passed = @truncate(usize, k);
+    }
+    for _e in 0..passed {
+        decay_epoch = (decay_epoch + 1) % EPOCHS;
+        freed_in[decay_epoch] = 0;
+    }
+    let mut keep: u64 = 0;
+    for age in 0..EPOCHS {
+        let e = ((decay_epoch + EPOCHS) - age) % EPOCHS;
+        keep += (@as(u64, freed_in[e]) * decay_weight(age)) >> 10;
+    }
+    let limit = @truncate(usize, @min(keep, @as(u64, @max_value(usize))));
+    if dirty_bytes() > limit {
+        purge(limit);
+    }
+}
+
+// Gives back about `over` bytes of the wilderness's resident part (its top).
+fn purge_wild(over: usize) void {
+    let wd = @sub_sat(wild_dirty, wild_lo);
+    if wd == 0 {
+        return;
+    }
+    let lo_page = (wild_lo + PAGE - 1) & ~(PAGE - 1);
+    let mut a = lo_page;
+    if over < wd {
+        a = @max(lo_page, (wild_dirty - over) & ~(PAGE - 1));
+    }
+    if a < wild_dirty {
+        given_back += @as(u64, whole_pages(a, wild_dirty));
+        @memory_discard(a, wild_dirty - a);
+    }
+    wild_dirty = @max(a, wild_lo);
+    if a == lo_page {
+        wild_dirty = wild_lo;  // (what is left is part of a page)
+    }
+}
+
+// Gives back free memory until no more than `limit` bytes of it may be
+// resident (or what is left cannot be: parts of pages).
+fn purge(limit: usize) void {
+    purge_wild(dirty_bytes() - limit);
+    let mut bi = NBINS;
+    while (bi > 0) and (retained > limit) {
+        bi -= 1;
+        let mut b = bins[bi];
+        while (b != 0) and (retained > limit) {
+            let blk = block(b);
+            if blk.dirty > 0 {
+                let d = give_back(b, blk.size, blk.dirty, retained - limit);
+                retained -= blk.dirty - d;
+                blk.dirty = d;
+            }
+            b = blk.next;
+        }
+    }
+}
+
+// How much of [a, b), in the wilderness, may be resident.
+fn wild_dirty_in(a: usize, b: usize) usize {
+    return @sub_sat(@min(b, wild_dirty), a);
+}
+
+// Takes `pages` more pages from the system; false if there are none.
+fn grow(pages: usize) bool {
+    let n = @max(pages, GROW_MIN);
+    let prev = @memory_grow(n) catch return false;
+    let base = prev * PAGE;
+    if base != wild_hi {
+        // not next to the wilderness (memory was grown elsewhere): what is
+        // left of it becomes a free block
+        if wild_hi > wild_lo {
+            let rest_at = wild_lo;
+            let rest = wild_hi - wild_lo;
+            let d = wild_dirty_in(rest_at, wild_hi);
+            wild_lo = base;
+            block(rest_at).prev_free = 0;
+            bin_insert(rest_at, rest, d);
+        }
+        wild_lo = base;
+        wild_dirty = base;
+        clean = base;
+    }
+    wild_hi = base + (n * PAGE);
+    mapped += n * PAGE;
+    return true;
+}
+
+// A used block of at least `size` bytes (a multiple of UNIT), or 0.
+fn block_alloc(size: usize) usize {
+    let mut s = take_free(size);
+    if s != 0 {
+        fresh_at = s + size;  // (none of it is known to be zero)
+        let rest = block(s).size - size;
+        if rest >= UNIT {
+            let t = s + size;
+            let d = block(s).dirty;
+            block(t).prev_free = 0;
+            block(s).size = size;
+            bin_insert(t, rest, d);
+        }
+    } else {
+        if (wild_hi - wild_lo) < size {
+            let need = (size - (wild_hi - wild_lo)) + PAGE - 1;
+            if not grow(need / PAGE) {
+                return 0;
+            }
+            if (wild_hi - wild_lo) < size {
+                if not grow((size + PAGE - 1) / PAGE) {
+                    return 0;
+                }
+            }
+        }
+        s = wild_lo;
+        wild_lo += size;
+        fresh_at = @max(s, clean);
+        clean = @max(clean, wild_lo);
+        let b = block(s);
+        b.size = size;
+        b.prev_free = 0;
+    }
+    block(s).magic = tag(MAGIC_USED, s);
+    set_prev_free(s + block(s).size, 0);
+    decay_tick();
+    return s;
+}
+
+// An empty 64 KiB-aligned span, or 0. Its prev_free is kept up to date.
+fn span_take() usize {
+    if span_cache != 0 {
+        let s = span_cache;
+        span_cache = span(s).next;
+        span_cached -= 1;
+        return s;
+    }
+    let b = span_from_bins();
+    if b != 0 {
+        return b;
+    }
+    let mut a = (wild_lo + PAGE - 1) & ~(PAGE - 1);
+    if (a + PAGE) > wild_hi {
+        if not grow(2) {
+            return 0;
+        }
+        a = (wild_lo + PAGE - 1) & ~(PAGE - 1);
+    }
+    let gap = a - wild_lo;
+    if gap > 0 {
+        block(wild_lo).prev_free = 0;
+        let g = wild_lo;
+        wild_lo = a;
+        bin_insert(g, gap, wild_dirty_in(g, a));
+    }
+    wild_lo = a + PAGE;
+    clean = @max(clean, wild_lo);
+    let sp = span(a);
+    sp.magic = tag(MAGIC_SPAN, a);
+    sp.size = PAGE;
+    sp.prev_free = 0;
+    if gap > 0 {
+        sp.prev_free = 1;
+    }
+    return a;
+}
+
+// A span carved from a free block (spans given back are reused, rather than
+// the wilderness growing), or 0 if no free block holds an aligned span.
+fn span_from_bins() usize {
+    let mut s = take_free(PAGE);
+    if s != 0 {
+        if (((s + PAGE - 1) & ~(PAGE - 1)) + PAGE) > (s + block(s).size) {
+            bin_insert(s, block(s).size, block(s).dirty);  // (too small once aligned)
+            s = take_free(2 * PAGE);
+        }
+    }
+    if s == 0 {
+        return 0;
+    }
+    let size = block(s).size;
+    let d = block(s).dirty;
+    let a = (s + PAGE - 1) & ~(PAGE - 1);
+    let gap = a - s;
+    if gap > 0 {
+        bin_insert(s, gap, d);
+    }
+    let rest = (s + size) - (a + PAGE);
+    if rest > 0 {
+        block(a + PAGE).prev_free = 0;
+        bin_insert(a + PAGE, rest, d);
+    }
+    let sp = span(a);
+    sp.magic = tag(MAGIC_SPAN, a);
+    sp.size = PAGE;
+    sp.prev_free = 0;
+    if gap > 0 {
+        sp.prev_free = 1;
+    }
+    decay_tick();
+    return a;
+}
+
+fn span_give(s: usize) void {
+    if span_cached < SPAN_CACHE {
+        let sp = span(s);
+        sp.state = CACHED;
+        sp.next = span_cache;
+        span_cache = s;
+        span_cached += 1;
+        return;
+    }
+    block(s).magic = tag(MAGIC_USED, s);  // (a block now, about to be freed)
+    release_block(s, PAGE);
+}
+
+// -----------------------------------------------------------------------------
+// Large objects
+// -----------------------------------------------------------------------------
+/// Requests beyond what any machine has fail (with OutOfMemory) before
+/// their sizes are rounded, binned or added to (which could overflow).
+fn too_big(size: usize) bool {
+    return (size > (@max_value(usize) / 2)) or (@as(u64, size) > (@as(u64, 1) << 40));
+}
+
+fn block_size_for(size: usize) usize {
+    return ((size + HDR) + UNIT - 1) & ~(UNIT - 1);
+}
+
+fn large_alloc(size: usize) usize {
+    if too_big(size) {
+        return 0;
+    }
+    let bs = block_size_for(size);
+    pool_enter();
+    let s = block_alloc(bs);
+    if s != 0 {
+        large_bytes += block(s).size;
+    }
+    pool_leave();
+    if s == 0 {
+        return 0;
+    }
+    return s + HDR;
+}
+
+/// A large object whose bytes are all zero: only the part that is not
+/// fresh from the system needs clearing (so a huge zeroed buffer costs
+/// nothing until it is used).
+fn large_alloc_zeroed(size: usize) usize {
+    if too_big(size) {
+        return 0;
+    }
+    let bs = block_size_for(size);
+    pool_enter();
+    let s = block_alloc(bs);
+    let f = fresh_at;
+    if s != 0 {
+        large_bytes += block(s).size;
+    }
+    pool_leave();
+    if s == 0 {
+        return 0;
+    }
+    let p = s + HDR;
+    if f > p {
+        let n = @min(f - p, size);
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, p), n), 0);
+    }
+    return p;
+}
+
+fn large_check(s: usize) void {
+    if ((s & (UNIT - 1)) != 0) or (magic_at(s) != tag(MAGIC_USED, s)) {
+        @trap();  // not a large object from the allocator (or freed twice)
+    }
+}
+
+fn large_free(p: usize) void {
+    let mut s = p - HDR;
+    if is_over_aligned(p) {
+        block(s).magic = 0;
+        s = block(s).size;
+    }
+    pool_enter();
+    large_check(s);
+    large_bytes -= block(s).size;
+    release_block(s, block(s).size);
+    pool_leave();
+}
+
+/// Whether p is an object of large_alloc_aligned (aligned beyond 128): its
+/// alias header in front names the block it is in.
+fn is_over_aligned(p: usize) bool {
+    return ((p & ((2 * HDR) - 1)) == 0) and (magic_at(p - HDR) == tag(MAGIC_ALIGNED, p - HDR));
+}
+
+/// A large object at a multiple of `align` (256 to MAX_ALIGN): the block's
+/// first `align` bytes hold its header, then the alias header right before
+/// the object.
+fn large_alloc_aligned(size: usize, align: usize) usize {
+    if too_big(size) {
+        return 0;
+    }
+    let bs = block_size_for((size + align) + HDR);
+    pool_enter();
+    let s = block_alloc(bs);
+    if s != 0 {
+        large_bytes += block(s).size;
+    }
+    pool_leave();
+    if s == 0 {
+        return 0;
+    }
+    let p = ((s + (2 * HDR)) + (align - 1)) & ~(align - 1);
+    let a = p - HDR;
+    block(a).magic = tag(MAGIC_ALIGNED, a);
+    block(a).size = s;
+    return p;
+}
+
+// Resizes the large object at p in place if it can; true if it did.
+fn large_resize(p: usize, size: usize) bool {
+    if too_big(size) {
+        return false;
+    }
+    let s = p - HDR;
+    let need = block_size_for(size);
+    pool_enter();
+    large_check(s);
+    let b = block(s);
+    let have = b.size;
+    let mut ok = false;
+    if need <= have {
+        if (have - need) >= UNIT {
+            b.size = need;
+            large_bytes -= have - need;
+            block(s + need).magic = tag(MAGIC_USED, s + need);
+            block(s + need).prev_free = 0;
+            release_block(s + need, have - need);
+        }
+        ok = true;
+    } else {
+        let n = s + have;
+        let extra = need - have;
+        if n == wild_lo {
+            if (wild_hi - wild_lo) < extra {
+                _ = grow(((extra - (wild_hi - wild_lo)) + PAGE - 1) / PAGE);
+            }
+            if (wild_lo == n) and ((wild_hi - wild_lo) >= extra) {
+                wild_lo += extra;
+                clean = @max(clean, wild_lo);  // (no longer known to be zero)
+                b.size = need;
+                large_bytes += extra;
+                ok = true;
+            }
+        } else if (magic_at(n) == tag(MAGIC_FREE, n)) and ((have + block(n).size) >= need) {
+            let ns = block(n).size;
+            let d = block(n).dirty;
+            bin_remove(n);
+            let rest = (have + ns) - need;
+            b.size = need;
+            large_bytes += need - have;
+            if rest >= UNIT {
+                block(s + need).prev_free = 0;
+                bin_insert(s + need, rest, d);
+            } else {
+                b.size = have + ns;
+                large_bytes += rest;
+            }
+            ok = true;
+        }
+    }
+    pool_leave();
+    return ok;
+}

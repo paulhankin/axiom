@@ -1,0 +1,391 @@
+// =============================================================================
+// std/text/math/text_render.ax - Linear Unicode text output, part of std/text/math.
+// =============================================================================
+
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Text
+// -----------------------------------------------------------------------------
+
+let SUP_FROM: []u8 = "0123456789+-=()niabcdefghjklmoprstuvwxyzABDEGHIJKLMNOPRTUVW";
+let SUP_TO: [61][]u8 = ["\u{2070}", "\u{b9}", "\u{b2}", "\u{b3}", "\u{2074}", "\u{2075}", "\u{2076}", "\u{2077}",
+                        "\u{2078}", "\u{2079}", "\u{207a}", "\u{207b}", "\u{207c}", "\u{207d}", "\u{207e}", "\u{207f}",
+                        "\u{2071}", "\u{1d43}", "\u{1d47}", "\u{1d9c}", "\u{1d48}", "\u{1d49}", "\u{1da0}", "\u{1d4d}",
+                        "\u{2b0}", "\u{2b2}", "\u{1d4f}", "\u{2e1}", "\u{1d50}", "\u{1d52}", "\u{1d56}", "\u{2b3}",
+                        "\u{2e2}", "\u{1d57}", "\u{1d58}", "\u{1d5b}", "\u{2b7}", "\u{2e3}", "\u{2b8}", "\u{1dbb}",
+                        "\u{1d2c}", "\u{1d2e}", "\u{1d30}", "\u{1d31}", "\u{1d33}", "\u{1d34}", "\u{1d35}", "\u{1d36}",
+                        "\u{1d37}", "\u{1d38}", "\u{1d39}", "\u{1d3a}", "\u{1d3c}", "\u{1d3e}", "\u{1d3f}", "\u{1d40}",
+                        "\u{1d41}", "\u{2c7d}", "\u{1d42}", "", ""];
+let SUB_FROM: []u8 = "0123456789+-=()aehijklmnoprstuvx";
+let SUB_TO: [32][]u8 = ["\u{2080}", "\u{2081}", "\u{2082}", "\u{2083}", "\u{2084}", "\u{2085}", "\u{2086}", "\u{2087}",
+                        "\u{2088}", "\u{2089}", "\u{208a}", "\u{208b}", "\u{208c}", "\u{208d}", "\u{208e}", "\u{2090}",
+                        "\u{2091}", "\u{2095}", "\u{1d62}", "\u{2c7c}", "\u{2096}", "\u{2097}", "\u{2098}", "\u{2099}",
+                        "\u{2092}", "\u{209a}", "\u{1d63}", "\u{209b}", "\u{209c}", "\u{1d64}", "\u{1d65}", "\u{2093}"];
+
+// t in super- or subscript characters, if every character has one.
+fn script_chars(t: []u8, sup: bool, out: *mut strs.String) TexError!bool {
+    let mut from = SUB_FROM;
+    if sup {
+        from = SUP_FROM;
+    }
+    let mut it = strs.runes(t);
+    let start = out.len();
+    loop {
+        let r = it.next() ?? break;
+        let mut c = r;
+        if c == 0x2212 {
+            c = '-';
+        }
+        if c == ' ' {
+            continue;
+        }
+        let mut found = false;
+        if c < 0x80 {
+            for k in @as(usize, 0)..from.len {
+                if from[k] == @truncate(u8, c) {
+                    if sup {
+                        out.push_str(SUP_TO[k])!;
+                    } else {
+                        out.push_str(SUB_TO[k])!;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        } else if sup and ((c == 0x2032) or (c == 0x2033) or (c == 0x2034)) {
+            // primes are already raised
+            let mut b: [4]u8 = [0; 4];
+            out.push_str(strs.encode_rune(b[..], c))!;
+            found = true;
+        }
+        if not found {
+            out.truncate(start);
+            return false;
+        }
+    }
+    return out.len() > start;
+}
+
+// Whether node i reads as one unit in linear text (no parentheses needed).
+fn simple(f: *Formula, i: u32) bool {
+    if i == NIL {
+        return true;
+    }
+    let n = f.node(i);
+    match n.kind {
+        .ROW => {
+            if n.first == NIL {
+                return true;
+            }
+            if f.node(n.first).next == NIL {
+                return simple(f, n.first);
+            }
+            return false;
+        }
+        .IDENT   => { return ((n.flags & F_FUNC) != 0) or (strs.rune_count(f.str(n.s, n.sl)) == 1); }
+        .NUMBER  => { return true; }
+        .SQRT    => { return true; }
+        .ROOT    => { return true; }
+        .FENCE   => { return true; }
+        .SCRIPTS => { return true; }
+        .OP      => { return n.cls != C_BIN; }
+        .ACCENT  => { return simple(f, n.a); }
+        else     => { return false; }
+    }
+}
+
+fn text_to_string(f: *Formula, i: u32) !strs.String {
+    let mut s = strs.String.init();
+    let mut o = Out.init(s.writer());
+    text(f, &mut o, i) catch |e| {
+        s.deinit();
+        return e;
+    };
+    o.flush() catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s;
+}
+
+fn text_group(f: *Formula, o: *mut Out, i: u32) !void {
+    if simple(f, i) {
+        text(f, o, i)!;
+        return;
+    }
+    o.s("(")!;
+    text(f, o, i)!;
+    o.s(")")!;
+}
+
+fn text_script(f: *Formula, o: *mut Out, i: u32, sup: bool) !void {
+    let mut inner = text_to_string(f, i)!;
+    defer inner.deinit();
+    let mut conv = strs.String.init();
+    defer conv.deinit();
+    if script_chars(inner.bytes(), sup, &mut conv)! {
+        o.s(conv.bytes())!;
+        return;
+    }
+    if sup {
+        o.s("^")!;
+    } else {
+        o.s("_")!;
+    }
+    if strs.rune_count(inner.bytes()) == 1 {
+        o.s(inner.bytes())!;
+    } else {
+        o.s("(")!;
+        o.s(inner.bytes())!;
+        o.s(")")!;
+    }
+}
+
+// Node i with single-child rows unwrapped.
+fn unwrap(f: *Formula, i: u32) u32 {
+    let mut j = i;
+    while (j != NIL) and (f.node(j).kind == Kind.ROW) and (f.node(j).first != NIL) and
+          (f.node(f.node(j).first).next == NIL) {
+        j = f.node(j).first;
+    }
+    return j;
+}
+
+// How node i spaces in linear text: an operator's class, or that of a
+// scripted relation or binary operator, else C_ORD.
+fn text_class(f: *Formula, i: u32) u8 {
+    let n = f.node(i);
+    if n.kind == Kind.OP {
+        return n.cls;
+    }
+    if (n.kind == Kind.SCRIPTS) or (n.kind == Kind.LIMITS) {
+        let b = unwrap(f, n.a);
+        if (b != NIL) and (f.node(b).kind == Kind.OP) and
+           ((f.node(b).cls == C_REL) or (f.node(b).cls == C_BIN) or (f.node(b).cls == C_LARGE) or
+            (f.node(b).cls == C_INT)) {
+            return f.node(b).cls;
+        }
+    }
+    if (n.kind == Kind.FENCE) or (n.kind == Kind.ROW) {
+        return C_CLOSE;
+    }
+    return C_ORD;
+}
+
+// Whether node i is a function name (sin, lim), maybe with scripts, or a
+// big operator with scripts: text after it is spaced off.
+fn is_func(f: *Formula, i: u32) bool {
+    let n = f.node(i);
+    if (n.kind == Kind.IDENT) and ((n.flags & F_FUNC) != 0) {
+        return true;
+    }
+    if (n.kind == Kind.SCRIPTS) or (n.kind == Kind.LIMITS) {
+        let b = unwrap(f, n.a);
+        if b == NIL {
+            return false;
+        }
+        let bn = f.node(b);
+        return ((bn.kind == Kind.IDENT) and ((bn.flags & F_FUNC) != 0)) or
+               ((bn.kind == Kind.OP) and ((bn.cls == C_LARGE) or (bn.cls == C_INT)));
+    }
+    return false;
+}
+
+fn text_scripts(f: *Formula, o: *mut Out, n: *Node) !void {
+    text_group(f, o, n.a)!;
+    if n.b != NIL {
+        text_script(f, o, n.b, false)!;
+    }
+    if n.c != NIL {
+        text_script(f, o, n.c, true)!;
+    }
+}
+
+fn text(f: *Formula, o: *mut Out, i: u32) !void {
+    if i == NIL {
+        return;
+    }
+    let n = f.node(i);
+    let t = f.str(n.s, n.sl);
+    match n.kind {
+        .ROW    => { row_text(f, o, n)!; }
+        .IDENT  => { o.s(t)!; }
+        .NUMBER => { o.s(t)!; }
+        .TEXT   => { o.s(t)!; }
+        .OP => {
+            o.s(t)!;
+            if ((n.cls == C_LARGE) or (n.cls == C_INT)) and (n.next != NIL) and (f.node(n.next).kind != Kind.SPACE) {
+                o.s(" ")!;
+            }
+        }
+        .SPACE => {
+            if n.width >= 0.16 {
+                o.s(" ")!;
+            }
+        }
+        .FRAC => {
+            if (n.flags & F_THIN0) != 0 {
+                // a binomial coefficient: C(n, k) reads oddly; "n choose k"
+                text_group(f, o, n.a)!;
+                o.s(" choose ")!;
+                text_group(f, o, n.b)!;
+                return;
+            }
+            text_group(f, o, n.a)!;
+            o.s("/")!;
+            text_group(f, o, n.b)!;
+        }
+        .SQRT => {
+            o.s("\u{221a}")!;
+            text_group(f, o, n.a)!;
+        }
+        .ROOT => {
+            let mut idx = text_to_string(f, n.b)!;
+            defer idx.deinit();
+            if strs.eq(idx.bytes(), "3") {
+                o.s("\u{221b}")!;
+            } else if strs.eq(idx.bytes(), "4") {
+                o.s("\u{221c}")!;
+            } else {
+                text_script(f, o, n.b, true)!;
+                o.s("\u{221a}")!;
+            }
+            text_group(f, o, n.a)!;
+        }
+        .SCRIPTS => { text_scripts(f, o, n)!; }
+        .LIMITS  => { text_scripts(f, o, n)!; }
+        .ACCENT  => { accent_text(f, o, n)!; }
+        .FENCE => {
+            o.s(t)!;
+            text(f, o, n.a)!;
+            o.s(f.str(n.s2, n.s2l))!;
+        }
+        .TABLE => { table_text(f, o, n)!; }
+        .TROW => {}
+        .TCELL => {}
+        .ENCLOSE => { enclose_text(f, o, n)!; }
+        .STYLE   => { text(f, o, n.a)!; }
+    }
+}
+
+// A row: spaces around relations and binary operators (not signs), after
+// punctuation, and around function names.
+fn row_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.first != NIL) and (f.node(n.first).next == NIL) {
+        text(f, o, n.first)!;
+        return;
+    }
+    let mut prev_cls: u8 = 255;  // nothing yet: a + or - is a sign
+    let mut c = n.first;
+    while c != NIL {
+        let cn = f.node(c);
+        let cls = text_class(f, c);
+        let unary = (prev_cls == 255) or (prev_cls == C_BIN) or (prev_cls == C_REL) or (prev_cls == C_OPEN) or
+                    (prev_cls == C_PUNCT) or (prev_cls == C_LARGE);
+        let func = is_func(f, c);
+        if (cls == C_REL) or ((cls == C_BIN) and not unary) {
+            o.s(" ")!;
+            text(f, o, c)!;
+            o.s(" ")!;
+        } else if cls == C_PUNCT {
+            text(f, o, c)!;
+            o.s(" ")!;
+        } else {
+            // a space between a name and a function name: "n log n"
+            if func and ((prev_cls == C_ORD) or (prev_cls == C_CLOSE)) {
+                o.s(" ")!;
+            }
+            text(f, o, c)!;
+        }
+        prev_cls = cls;
+        // a space after a function name, unless brackets follow
+        let nx = cn.next;
+        if func and (nx != NIL) and
+           not ((f.node(nx).kind == Kind.FENCE) or (f.node(nx).kind == Kind.SPACE) or
+                ((f.node(nx).kind == Kind.OP) and
+                 ((f.node(nx).cls == C_OPEN) or (f.node(nx).cls == C_REL) or (f.node(nx).cls == C_BIN) or
+                  (f.node(nx).cls == C_PUNCT)))) {
+            o.s(" ")!;
+            prev_cls = C_OPEN;
+        }
+        c = cn.next;
+    }
+}
+
+// An accent: its combining character after the base (after each character
+// of it, for bars).
+fn accent_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    let comb = f.str(n.s2, n.s2l);
+    let mut inner = text_to_string(f, n.a)!;
+    defer inner.deinit();
+    let b = inner.bytes();
+    if comb.len == 0 {
+        o.s(b)!;  // braces have no combining form
+        return;
+    }
+    let per_char = strs.eq(comb, "\u{305}") or strs.eq(comb, "\u{332}") or strs.eq(comb, "\u{304}");
+    let mut it = strs.runes(b);
+    let count = strs.rune_count(b);
+    let mut k: usize = 0;
+    loop {
+        let r = it.next() ?? break;
+        let mut buf: [4]u8 = [0; 4];
+        o.s(strs.encode_rune(buf[..], r))!;
+        k += 1;
+        if per_char or (k == count) {
+            o.s(comb)!;
+        }
+    }
+}
+
+// An array or matrix: rows separated by semicolons, cells by commas.
+fn table_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    let mut r = n.first;
+    let mut first_row = true;
+    while r != NIL {
+        if not first_row {
+            o.s("; ")!;
+        }
+        first_row = false;
+        let mut line = strs.String.init();
+        defer line.deinit();
+        let mut lo = Out.init(line.writer());
+        let mut c = f.node(r).first;
+        let mut first = true;
+        while c != NIL {
+            if (not first) and ((n.flags & F_ALIGN) == 0) {
+                lo.s(", ")!;
+            }
+            first = false;
+            text(f, &mut lo, f.node(c).a)!;
+            c = f.node(c).next;
+        }
+        lo.flush()!;
+        o.s(strs.trim(line.bytes()))!;
+        r = f.node(r).next;
+    }
+}
+
+// \boxed (its content) or \cancel and friends (struck through); phantoms
+// leave nothing.
+fn enclose_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.cls == E_CANCEL) or (n.cls == E_BCANCEL) or (n.cls == E_XCANCEL) {
+        // a stroke over each character
+        let mut inner = text_to_string(f, n.a)!;
+        defer inner.deinit();
+        let mut it = strs.runes(inner.bytes());
+        loop {
+            let r = it.next() ?? break;
+            let mut b: [4]u8 = [0; 4];
+            o.s(strs.encode_rune(b[..], r))!;
+            if n.cls == E_BCANCEL {
+                o.s("\u{20e5}")!;
+            } else {
+                o.s("\u{338}")!;
+            }
+        }
+    } else if n.cls == E_BOX {
+        text(f, o, n.a)!;
+    }
+}

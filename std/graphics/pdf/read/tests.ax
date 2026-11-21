@@ -1,0 +1,419 @@
+// =============================================================================
+// std/graphics/pdf/read/tests.ax - Unit tests for PDF reading, filters,
+// damaged file repair, and hostile inputs, part of std/graphics/pdf/read.
+// =============================================================================
+
+import "../../../collections/vec.ax" as vec;
+import "../../../compress/deflate.ax" as deflate;
+import "../../../mem.ax" as mem;
+import "../../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+/// A PDF from object bodies (object i + 1 is objs[i]), with a
+/// cross-reference table; the catalog is object 1.
+fn build(objs: [][]u8) ReadError![]mut u8 {
+    let mut out = strs.String.init();
+    out.push_str("%PDF-1.7\n")!;
+    let mut offs = vec.Vec.[usize].init();
+    defer offs.deinit();
+    for i in 0..objs.len {
+        offs.push(out.len())!;
+        put_dec(&mut out, i + 1)!;
+        out.push_str(" 0 obj\n")!;
+        out.push_str(objs[i])!;
+        out.push_str("\nendobj\n")!;
+    }
+    let xref = out.len();
+    out.push_str("xref\n0 ")!;
+    put_dec(&mut out, objs.len + 1)!;
+    out.push_str("\n0000000000 65535 f \n")!;
+    for o in offs.items() {
+        let mut d: [10]u8 = [0; 10];
+        let mut v = o;
+        let mut k: usize = 10;
+        while k > 0 {
+            k -= 1;
+            d[k] = @truncate(u8, v % 10) + '0';
+            v /= 10;
+        }
+        out.push_str(d[..])!;
+        out.push_str(" 00000 n \n")!;
+    }
+    out.push_str("trailer\n<< /Size ")!;
+    put_dec(&mut out, objs.len + 1)!;
+    out.push_str(" /Root 1 0 R /Info << /Title (T\\351st) >> >>\nstartxref\n")!;
+    put_dec(&mut out, xref)!;
+    out.push_str("\n%%EOF\n")!;
+    return out.take();
+}
+
+fn put_dec(out: *mut strs.String, v: usize) ReadError!void {
+    if v >= 10 {
+        put_dec(out, v / 10)!;
+    }
+    out.push(@truncate(u8, v % 10) + '0')!;
+}
+
+fn stream_obj(dict: []u8, data: []u8) ReadError![]mut u8 {
+    let mut s = strs.String.init();
+    s.push_str("<< ")!;
+    s.push_str(dict)!;
+    s.push_str(" /Length ")!;
+    put_dec(&mut s, data.len)!;
+    s.push_str(" >>\nstream\n")!;
+    s.push_str(data)!;
+    s.push_str("\nendstream")!;
+    return s.take();
+}
+
+fn page_text_of(pdf: []u8, i: usize) ReadError![]mut u8 {
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    return r.page_text(i);
+}
+
+let CMAP: []u8 =
+    "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n1 begincodespacerange <0000> <FFFF> endcodespacerange\n2 beginbfchar <0001> <0048> <0002> <0069> endbfchar\n1 beginbfrange <0003> <0004> [<0041> <D83DDE00>] endbfrange\n1 beginbfrange <0010> <0012> <0061> endbfrange\nendcmap end end";
+
+test "simple fonts, encodings and ToUnicode maps" {
+    let content =
+        "BT /F1 12 Tf 72 700 Td (Caf\\351 \\223ok\\224) Tj ET\nBT /F2 12 Tf 72 680 Td (ABCD) Tj ET\nBT /F3 12 Tf 72 660 Td <00010002> Tj [<0003> -2000 <0004>] TJ 0 -20 Td <001000110012> Tj ET";
+    let c6 = stream_obj("", content)!;
+    defer mem.free(c6);
+    let c8 = stream_obj("", CMAP)!;
+    defer mem.free(c8);
+    let objs: [8][]u8 = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 7 0 R >> >> /Contents 6 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /X /Encoding << /Differences [65 /Alpha /uni263A /fi] >> >>",
+        c6,
+        "<< /Type /Font /Subtype /Type0 /BaseFont /Y /Encoding /Identity-H /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /DW 1000 >>] /ToUnicode 8 0 R >>",
+        c8,
+    ];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    let sz = r.page_size(0)!;
+    @expect_eq(sz[0], 612.0);
+    let title = r.info("Title")!;
+    defer mem.free(title);
+    @expect(strs.eq(title, "T\xc3\xa9st"));
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(strs.eq(t,
+                    "Caf\xc3\xa9 \xe2\x80\x9cok\xe2\x80\x9d\n\xce\x91\xe2\x98\xba\xef\xac\x81D\nHiA \xf0\x9f\x98\x80\nabc"));
+}
+
+test "object streams and compressed cross-reference streams" {
+    // objects 3 (the page) and 4 (a font) live in object stream 5
+    let o3 =
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>";
+    let o4 = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+    let mut hdr = strs.String.init();
+    defer hdr.deinit();
+    hdr.push_str("3 0 4 ")!;
+    put_dec(&mut hdr, o3.len + 1)!;
+    hdr.push(' ')!;
+    let mut body = strs.String.init();
+    defer body.deinit();
+    body.push_str(hdr.bytes())!;
+    body.push_str(o3)!;
+    body.push(' ')!;
+    body.push_str(o4)!;
+    let packed = deflate.compress(body.bytes(), deflate.Format.ZLIB, 6)!;
+    defer mem.free(packed);
+    let mut sdict = strs.String.init();
+    defer sdict.deinit();
+    sdict.push_str("/Type /ObjStm /N 2 /Filter /FlateDecode /First ")!;
+    put_dec(&mut sdict, hdr.len())!;
+    let content = "BT /F1 10 Tf 10 50 Td (packed) Tj ET";
+    let cpacked = deflate.compress(content, deflate.Format.ZLIB, 6)!;
+    defer mem.free(cpacked);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    out.push_str("%PDF-1.5\n")!;
+    let mut offs: [7]usize = [0; 7];
+    offs[1] = out.len();
+    out.push_str("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")!;
+    offs[2] = out.len();
+    out.push_str("2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")!;
+    offs[5] = out.len();
+    let o5 = stream_obj(sdict.bytes(), packed)!;
+    defer mem.free(o5);
+    out.push_str("5 0 obj ")!;
+    out.push_str(o5)!;
+    out.push_str(" endobj\n")!;
+    offs[6] = out.len();
+    let o6 = stream_obj("/Filter /FlateDecode", cpacked)!;
+    defer mem.free(o6);
+    out.push_str("6 0 obj ")!;
+    out.push_str(o6)!;
+    out.push_str(" endobj\n")!;
+    // the cross-reference stream, rows of W [1 4 2], PNG "Up" predicted
+    let mut rows = strs.String.init();
+    defer rows.deinit();
+    let mut prev: [7]u8 = [0; 7];
+    for n in @as(usize, 0)..8 {
+        let mut row: [7]u8 = [0; 7];
+        if (n == 1) or (n == 2) or (n == 5) or (n == 6) {
+            row[0] = 1;
+            let v = offs[n];
+            row[1] = @truncate(u8, v >> 24);
+            row[2] = @truncate(u8, v >> 16);
+            row[3] = @truncate(u8, v >> 8);
+            row[4] = @truncate(u8, v);
+        } else if (n == 3) or (n == 4) {
+            row[0] = 2;
+            row[4] = 5;
+            row[6] = @truncate(u8, n - 3);
+        } else if n == 7 {
+            row[0] = 1;
+            let v = out.len();
+            row[1] = @truncate(u8, v >> 24);
+            row[2] = @truncate(u8, v >> 16);
+            row[3] = @truncate(u8, v >> 8);
+            row[4] = @truncate(u8, v);
+        }
+        rows.push(2)!;
+        for k in @as(usize, 0)..7 {
+            rows.push(row[k] -% prev[k])!;
+        }
+        prev = row;
+    }
+    let xpacked = deflate.compress(rows.bytes(), deflate.Format.ZLIB, 6)!;
+    defer mem.free(xpacked);
+    let xref_at = out.len();
+    let o7 =
+        stream_obj("/Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >>",
+                   xpacked)!;
+    defer mem.free(o7);
+    out.push_str("7 0 obj ")!;
+    out.push_str(o7)!;
+    out.push_str(" endobj\nstartxref\n")!;
+    put_dec(&mut out, xref_at)!;
+    out.push_str("\n%%EOF\n")!;
+    let mut r = Reader.open(out.bytes())!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    @expect_eq(r.xref.get(4).kind, 2);
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(strs.eq(t, "packed"));
+    let sz = r.page_size(0)!;
+    @expect_eq(sz[1], 100.0);
+}
+
+test "filters" {
+    let a = ascii85("87cURD]i,\"Ebo8;+AbHq+T~>", 1000)!;
+    defer mem.free(a);
+    @expect(strs.eq(a, "Hello World, PDF!"));
+    let rl = run_length("\x02abc\xfdz\x80", 1000)!;
+    defer mem.free(rl);
+    @expect(strs.eq(rl, "abczzzz"));
+    // the example from the PDF specification
+    let lz = lzw_decode("\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01", true, 1000)!;
+    defer mem.free(lz);
+    @expect(strs.eq(lz, "-----A---B"));
+    // decoding stops at the size limit
+    @expect(failed(run_length("\x81x\x81x\x81x", 200)));
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let mut p: usize = 1;
+    hex_into("<48 65 6c6C6f 7>", &mut p, &mut out)!;
+    @expect(strs.eq(out.bytes(), "Hellop"));
+    @expect_eq(glyph_unicode("Euro"), 0x20ac);
+    @expect_eq(glyph_unicode("uni00E9"), 0xe9);
+    @expect_eq(glyph_unicode("u1F600"), 0x1f600);
+    @expect_eq(glyph_unicode("a.sc"), 'a');
+    @expect_eq(glyph_unicode("nonsense"), 0);
+}
+
+fn failed(r: ![]mut u8) bool {
+    let v = r catch return true;
+    mem.free(v);
+    return false;
+}
+
+fn simple_pdf(content: []u8) ReadError![]mut u8 {
+    let c = stream_obj("", content)!;
+    defer mem.free(c);
+    let objs: [5][]u8 = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 4 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        c,
+    ];
+    return build(objs[..]);
+}
+
+test "damaged files are repaired" {
+    let pdf = simple_pdf("BT /F1 12 Tf 72 700 Td (repaired) Tj ET")!;
+    defer mem.free(pdf);
+    // no cross-reference table at all
+    let x = strs.last_index_of(pdf, "xref") ?? 0;
+    let t1 = page_text_of(pdf[..x], 0)!;
+    defer mem.free(t1);
+    @expect(strs.eq(t1, "repaired"));
+    // a table pointing at the wrong places
+    let bad = strs.dup(pdf)!;
+    defer mem.free(bad);
+    let mut k = strs.last_index_of(bad, "xref") ?? 0;
+    while k + 18 <= bad.len {
+        if strs.starts_with(bad[k + 10..], " 00000 n") {
+            @mem_copy(bad[k..k + 10], "0000000001");
+        }
+        k += 1;
+    }
+    let t2 = page_text_of(bad, 0)!;
+    defer mem.free(t2);
+    @expect(strs.eq(t2, "repaired"));
+}
+
+test "object numbers larger than the file" {
+    // (a damaged file is rebuilt from its "N 0 obj" lines: a stray one with
+    // a huge N grew the tables to N entries)
+    let pdf = simple_pdf("BT /F1 12 Tf 72 700 Td (small) Tj ET")!;
+    defer mem.free(pdf);
+    let x = strs.last_index_of(pdf, "xref") ?? 0;
+    let mut s = strs.String.from(pdf[..x])!;
+    defer s.deinit();
+    s.push_str("8000000 0 obj\n<< >>\nendobj\n")!;
+    let mut r = Reader.open(s.bytes())!;
+    defer r.deinit();
+    @expect(r.xref.len() <= s.len() + 1);
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(strs.eq(t, "small"));
+}
+
+test "hostile structures" {
+    // deep nesting, self references, a page tree that loops, huge counts
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for _k in @as(usize, 0)..100000 {
+        deep.push('[')!;
+    }
+    let objs: [6][]u8 = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 2 0 R 6 0 R] /Count 99999999999 >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> /XObject << /X 5 0 R >> >> >>",
+        "4 0 R",
+        "<< /Length 5 0 R /Subtype /Form /Resources << /XObject << /X 5 0 R >> >> >>\nstream\nBT /F1 9 Tf (loop) Tj ET /X Do\nendstream",
+        deep.bytes(),
+    ];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(r.resolve(r.object(4)!)!.is_null());
+    // mutations of a good file never trap
+    let good = simple_pdf("BT /F1 12 Tf 72 700 Td (fuzz) Tj ET q 1 0 0 1 5 5 cm Q")!;
+    defer mem.free(good);
+    let mut buf = mem.alloc.[u8](good.len)!;
+    defer mem.free(buf);
+    let mut seed: u64 = 0x9e3779b97f4a7c15;
+    for _round in @as(usize, 0)..300 {
+        @mem_copy(buf, good);
+        for _m in @as(usize, 0)..4 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let at_ = @truncate(usize, seed % @as(u64, buf.len));
+            buf[at_] = @truncate(u8, seed >> 32);
+        }
+        let mut rr = Reader.open(buf) catch continue;
+        for i in 0..rr.page_count() {
+            let pt = rr.page_text(i) catch continue;
+            mem.free(pt);
+        }
+        rr.deinit();
+    }
+}
+
+test "cross-reference subsections past 2^32 are dropped" {
+    let objs: [4][]u8 = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                         "<< /Type /Page /Parent 2 0 R >>", "(four)"];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    // a subsection freeing object 2^32 + 4, ahead of the real one: with a
+    // 32-bit usize it once freed object 4
+    let x = (strs.index_of(pdf, "\nxref\n") ?? 0) + 6;
+    let mut s = strs.String.from(pdf[..x])!;
+    defer s.deinit();
+    s.push_str("4294967300 1\n0000000000 65535 f \n")!;
+    s.push_str(pdf[x..])!;
+    let mut r = Reader.open(s.bytes())!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    @expect(not r.resolve(r.object(4)!)!.is_null());
+}
+
+test "objects that fail to parse, used many times" {
+    // an array that never closes, referred to 2000 times: parsed once, and
+    // what the parse made is freed
+    let mut refs = strs.String.init();
+    defer refs.deinit();
+    refs.push_str("<< /Type /Page /Parent 2 0 R /Contents [")!;
+    for _k in @as(usize, 0)..2000 {
+        refs.push_str("4 0 R ")!;
+    }
+    refs.push_str("] >>")!;
+    let mut bad = strs.String.init();
+    defer bad.deinit();
+    bad.push('[')!;
+    for _k in @as(usize, 0)..2000 {
+        bad.push_str("() [] ")!;
+    }
+    let objs: [4][]u8 = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", refs.bytes(),
+                         bad.bytes()];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    let before = r.parse_budget;
+    let kept = r.bytes.len();
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect((before - r.parse_budget) < pdf.len);
+    @expect(r.bytes.len() < (kept + 10));
+}
+
+test "a form that draws itself many times" {
+    // ten uses of itself, eight deep: decoded once, and the uses limited
+    let mut uses = strs.String.init();
+    defer uses.deinit();
+    for _k in @as(usize, 0)..10 {
+        uses.push_str("BT /F1 9 Tf (x) Tj ET /X Do ")!;
+    }
+    let form = stream_obj("/Type /XObject /Subtype /Form", uses.bytes())!;
+    defer mem.free(form);
+    let content = stream_obj("", "/X Do")!;
+    defer mem.free(content);
+    let objs: [6][]u8 = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /X 4 0 R >> >> >>",
+        form,
+        content,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(r.bytes.len() < 10);
+    @expect(t.len < (1 << 20));
+}

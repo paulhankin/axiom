@@ -1,0 +1,455 @@
+// =============================================================================
+// std/graphics/svg/tests_slow.ax - Round-trip, malformed input, limit, PDF,
+// and hostile-document tests, part of std/graphics/svg.
+// =============================================================================
+
+import "../../encoding/base64.ax" as base64;
+import "../../io.ax" as io;
+import "../../mem.ax" as mem;
+import "../../os/fs.ax" as files;
+import "../../str.ax" as strs;
+import "../color.ax" as color;
+import "../draw.ax" as draw;
+import "../image.ax" as image;
+import "../image/png.ax" as png;
+import "../pdf.ax" as pdf;
+
+// -----------------------------------------------------------------------------
+// Round-trip, limits, PDF, and hostile-document tests
+// -----------------------------------------------------------------------------
+
+test "writing, then reading back" {
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let red = draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0));
+    let stops: [2]draw.Stop = [
+        draw.Stop.{ offset: 0.0, color: color.Color.rgb(0.0, 0.0, 1.0) },
+        draw.Stop.{ offset: 1.0, color: color.Color.rgb(0.0, 1.0, 0.0) },
+    ];
+    let grad = draw.Paint.linear(10.0, 0.0, 40.0, 0.0, stops[..]).with_spread(draw.Spread.PAD);
+    let mut tri = draw.Path.init();
+    defer tri.deinit();
+    let corners: [6]f64 = [10.0, 10.0, 50.0, 10.0, 30.0, 40.0];
+    tri.polygon(corners[..])!;
+    let mut line = draw.Path.init();
+    defer line.deinit();
+    line.move_to(60.0, 20.0)!;
+    line.line_to(110.0, 20.0)!;
+    let mut disc = draw.Path.init();
+    defer disc.deinit();
+    disc.circle(100.0, 60.0, 15.0)!;
+    let mut st = draw.Stroke.width(6.0);
+    st.cap = draw.Cap.ROUND;
+    let dashes: [2]f64 = [6.0, 3.0];
+    let mut dst = draw.Stroke.width(2.0);
+    dst.dash = dashes[..];
+    let mut small = image.Image.init(2, 2, 4, image.Depth.U8)!;
+    defer small.deinit();
+    small.fill(color.Color.rgb(1.0, 1.0, 0.0));
+    {
+        let mut w = Writer.begin(out.writer(), 120.0, 80.0)!;
+        defer w.deinit();
+        w.fill_rect(0.0, 0.0, 120.0, 80.0, draw.Paint.solid(color.Color.rgb(1.0, 1.0, 1.0)))!;
+        w.fill(&tri, red, draw.FillRule.NONZERO)!;
+        w.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 1.0)), st)!;
+        w.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), dst)!;
+        w.fill_rect(0.0, 50.0, 50.0, 20.0, grad)!;
+        w.begin_group(draw.Affine.translation(60.0, 30.0), 0.5)!;
+        w.fill_rect(0.0, 0.0, 20.0, 10.0, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)))!;
+        w.end_group()!;
+        w.begin_clip(&disc, draw.FillRule.NONZERO)!;
+        w.fill_rect(80.0, 40.0, 40.0, 40.0, draw.Paint.solid(color.Color.rgba(0.0, 0.5, 0.0, 1.0)))!;
+        w.end_group()!;
+        w.text(5.0, 78.0, "a < b & c", 8.0, "sans-serif", color.Color.rgb(0.0, 0.0, 0.0))!;
+        w.image(&small, 0.0, 0.0, 4.0, 4.0)!;
+        @expect(void_fails(w.end_group(), error.SyntaxError));
+        w.finish()!;
+    }
+    let text = out.bytes();
+    @expect(strs.starts_with(text, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><svg xmlns="));
+    @expect(strs.contains(text, "<linearGradient id=\"g1\" gradientUnits=\"userSpaceOnUse\" x1=\"10\""));
+    @expect(strs.contains(text, "stroke-dasharray=\"6 3\""));
+    @expect(strs.contains(text, "stroke-linecap=\"round\""));
+    @expect(strs.contains(text, "opacity=\"0.5\""));
+    @expect(strs.contains(text, "clip-path=\"url(#c2)\""));
+    @expect(strs.contains(text, ">a &lt; b &amp; c</text>"));
+    @expect(strs.contains(text, "xlink:href=\"data:image/png;base64,"));
+    @expect(strs.ends_with(text, "</svg>\n"));
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    // the same, drawn directly
+    let mut ref = image.Image.init(120, 80, 4, image.Depth.U8)!;
+    defer ref.deinit();
+    let mut cv = draw.Canvas.init(&mut ref);
+    defer cv.deinit();
+    cv.clear(color.Color.rgb(1.0, 1.0, 1.0));
+    cv.fill(&tri, red, draw.FillRule.NONZERO)!;
+    cv.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 1.0)), st)!;
+    cv.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), dst)!;
+    cv.fill_rect(60.0, 30.0, 20.0, 10.0, draw.Paint.solid(color.Color.rgba(0.0, 0.0, 0.0, 0.5)))!;
+    cv.save()!;
+    cv.clip_to(&disc, draw.FillRule.NONZERO)!;
+    cv.fill_rect(80.0, 40.0, 40.0, 40.0, draw.Paint.solid(color.Color.rgba(0.0, 0.5, 0.0, 1.0)))!;
+    cv.restore();
+    cv.draw_image(&small, 0.0, 0.0, 4.0, 4.0)!;
+    // everything but the gradient's inside (SVG interpolates in sRGB) and the text
+    for y in @as(usize, 0)..80 {
+        for x in @as(usize, 0)..120 {
+            let in_grad = (x < 50) and (y >= 50) and (y < 70);
+            let in_text = (x < 60) and (y >= 70);
+            if in_grad or in_text {
+                continue;
+            }
+            // (where nothing is translucent: SVG blends sRGB values, draw linear ones)
+            if (x >= 59) and (x <= 80) and (y >= 29) and (y <= 40) {
+                continue;
+            }
+            if not uniform(&ref, x, y) {
+                continue;
+            }
+            let a = px(&img, x, y);
+            @expect(near(&ref, x, y, a, 1));
+        }
+    }
+    @expect(near(&img, 70, 35, 0x808080ff, 1));  // the half black group
+    // the gradient's pad regions
+    @expect(near(&img, 5, 60, 0x0000ffff, 0));
+    @expect(near(&img, 45, 60, 0x00ff00ff, 0));
+    // near halfway (t = 0.483), interpolated in sRGB
+    @expect(near(&img, 24, 60, 0x007b84ff, 2));
+}
+
+test "malformed documents" {
+    // (bad01.svg is empty, bad02 not XML, bad03 cut short, bad04 not SVG; the
+    // rest are SVG with wrong values, references and structures)
+    let mut nb = strs.String.init();
+    defer nb.deinit();
+    for k in @as(usize, 1)..23 {
+        nb.clear();
+        nb.push_str("std/graphics/svg/testdata/bad")!;
+        nb.push('0' + @truncate(u8, k / 10))!;
+        nb.push('0' + @truncate(u8, k % 10))!;
+        nb.push_str(".svg")!;
+        let b = files.read_file(nb.bytes())!;
+        defer mem.free(b);
+        let mut doc = parse(b) catch continue;
+        defer doc.deinit();
+        let mut img = render_image(&doc, 16, 16)!;
+        img.deinit();
+    }
+    // every prefix of a document
+    let full = files.read_file("std/graphics/svg/testdata/groups.svg")!;
+    defer mem.free(full);
+    let mut n: usize = 0;
+    while n < full.len {
+        let mut doc = parse(full[..n]) catch {
+            n += 13;
+            continue;
+        };
+        let mut img = render_image(&doc, 8, 8)!;
+        img.deinit();
+        doc.deinit();
+        n += 13;
+    }
+}
+
+test "limits" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // a use that multiplies: refused, not run for ever
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'><rect id='l0' width='1' height='1'/>")!;
+    let digits = "0123456789";
+    for level in @as(usize, 1)..8 {
+        s.push_str("<g id='l")!;
+        s.push(digits[level])!;
+        s.push_str("'>")!;
+        for _k in @as(usize, 0)..10 {
+            s.push_str("<use href='#l")!;
+            s.push(digits[level - 1])!;
+            s.push_str("'/>")!;
+        }
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_parse(s.bytes(), error.TooComplex));
+    // deep nesting
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'>")!;
+    for _k in @as(usize, 0)..1000 {
+        s.push_str("<g>")!;
+    }
+    for _k in @as(usize, 0)..1000 {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_parse(s.bytes(), error.TooComplex));
+    // as deep as allowed: parsed and rendered
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("<g>")!;
+    }
+    s.push_str("<rect width='4' height='4' fill='#f00'/>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    let mut d = parse(s.bytes())!;
+    defer d.deinit();
+    let mut img = render_image(&d, 4, 4)!;
+    defer img.deinit();
+}
+
+/// A document whose last use draws leaf 10^levels times (through levels of
+/// groups of 10 uses of the one below).
+fn use_tree(s: *mut strs.String, leaf: []u8, levels: usize) infer!void {
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48'><defs>")!;
+    s.push_str(leaf)!;
+    let digits = "0123456789";
+    for level in @as(usize, 1)..levels + 1 {
+        s.push_str("<g id='g")!;
+        s.push(digits[level])!;
+        s.push_str("'>")!;
+        for _k in @as(usize, 0)..10 {
+            s.push_str("<use href='#g")!;
+            s.push(digits[level - 1])!;
+            s.push_str("'/>")!;
+        }
+        s.push_str("</g>")!;
+    }
+    s.push_str("</defs><use href='#g")!;
+    s.push(digits[levels])!;
+    s.push_str("'/></svg>")!;
+}
+
+test "hostile documents: uses" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // uses that multiply what draws nothing: refused (a work limit), not run for ever
+    use_tree(&mut s, "<path id='g0' d='M0 0L1 1' fill='none' stroke='none'/>", 7)!;
+    @expect(fails_parse(s.bytes(), error.TooComplex));
+    // a big path used 10^4 times is parsed once
+    let mut leaf = strs.String.init();
+    defer leaf.deinit();
+    leaf.push_str("<path id='g0' d='M0 0")!;
+    for _k in @as(usize, 0)..2000 {
+        leaf.push_str(" L1 1")!;
+    }
+    leaf.push_str("'/>")!;
+    use_tree(&mut s, leaf.bytes(), 4)!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.items.len(), 10000);
+        @expect_eq(d.paths.len(), 1);
+    }
+    // a gradient's stops, a clip path and an image, each kept once
+    leaf.clear();
+    leaf.push_str("<linearGradient id='lg'>")!;
+    for k in @as(usize, 0)..20 {
+        leaf.push_str("<stop offset='0.")!;
+        leaf.push('0' + @truncate(u8, k % 10))!;
+        leaf.push_str("' stop-color='red'/>")!;
+    }
+    leaf.push_str("</linearGradient><clipPath id='c'><path d='M0 0")!;
+    for _k in @as(usize, 0)..200 {
+        leaf.push_str(" L1 1")!;
+    }
+    leaf.push_str("'/></clipPath><g id='g0'><rect width='1' height='1' fill='url(#lg)' clip-path='url(#c)'/>")!;
+    leaf.push_str("<image width='1' height='1' href='data:image/png;base64,")!;
+    let mut px1 = image.Image.init(1, 1, 4, image.Depth.U8)!;
+    defer px1.deinit();
+    let png1 = png.encode(&px1, 6)!;
+    defer mem.free(png1);
+    base64.encode_to(leaf.writer(), png1, base64.STANDARD)!;
+    leaf.push_str("'/></g>")!;
+    use_tree(&mut s, leaf.bytes(), 3)!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.images.len(), 1);
+        @expect(d.paths.len() <= 3);  // the rect, the clip path's path and the clip
+        let mut stops: usize = 0;
+        for it in d.items.items() {
+            if (it.kind == ItemKind.SHAPE) and (it.fill.kind == draw.PaintKind.LINEAR) {
+                if stops == 0 {
+                    stops = @int_from_ptr(it.fill.stops.ptr);
+                }
+                @expect_eq(@int_from_ptr(it.fill.stops.ptr), stops);
+            }
+        }
+        @expect(stops != 0);
+        let mut img = render_image(&d, 16, 16)!;
+        img.deinit();
+    }
+    // clip paths that differ for each use: refused past the data limit
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'><defs><clipPath id='c'><path d='M0 0")!;
+    for _k in @as(usize, 0)..2000 {
+        s.push_str(" L1 1")!;
+    }
+    s.push_str("'/></clipPath><rect id='r' width='1' height='1' clip-path='url(#c)'/></defs>")!;
+    let mut nb: [24]u8 = [0; 24];
+    for k in @as(usize, 0)..3000 {
+        s.push_str("<use href='#r' x='")!;
+        s.push_str(io.fmt_u64(nb[..], @as(u64, k)))!;
+        s.push_str("'/>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_parse(s.bytes(), error.TooComplex));
+}
+
+test "hostile documents: style sheets" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // a descendant selector of many compounds over deep groups: no backtracking
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><style>a")!;
+    for _k in @as(usize, 0)..20 {
+        s.push_str(" g")!;
+    }
+    s.push_str(" rect { fill: red } g g > g rect { fill: #00f }</style>")!;
+    for _k in @as(usize, 0)..200 {
+        s.push_str("<g>")!;
+    }
+    s.push_str("<rect width='4' height='4'/>")!;
+    for _k in @as(usize, 0)..200 {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        let mut img = render_image(&d, 4, 4)!;
+        defer img.deinit();
+        @expect(near(&img, 2, 2, 0x0000ffff, 0));
+    }
+    // many rules and many elements: each element tested only against the
+    // rules it could match
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><style>")!;
+    let mut nb: [24]u8 = [0; 24];
+    for k in @as(usize, 0)..20000 {
+        s.push_str(".c")!;
+        s.push_str(io.fmt_u64(nb[..], @as(u64, k)))!;
+        s.push_str("{fill:red}")!;
+    }
+    s.push_str(".c7 { fill: #0f0 }</style>")!;
+    for _k in @as(usize, 0)..20000 {
+        s.push_str("<rect width='4' height='4'/>")!;
+    }
+    s.push_str("<rect class='x c7' width='4' height='4'/></svg>")!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.items.len(), 20001);
+        let c = d.items.get(20000).fill.color.to_rgba8().to_u32();
+        @expect_eq(c, 0x00ff00ff);
+    }
+}
+
+test "hostile documents: rendering groups" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // many groups with an opacity: each layer only as big as what it draws
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 48 48'>")!;
+    for _k in @as(usize, 0)..3000 {
+        s.push_str("<g opacity='0.5'><rect x='40' y='40' width='1' height='1' fill='#f00'/></g>")!;
+    }
+    // nested ones, as deep as allowed, each covering everything: past a few
+    // canvases of layers, their opacity applies to what they draw
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("<g opacity='0.99'>")!;
+    }
+    s.push_str("<rect width='20' height='20' fill='#00f'/>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    let mut d = parse(s.bytes())!;
+    defer d.deinit();
+    let mut img = render_image(&d, 480, 480)!;
+    defer img.deinit();
+    @expect(near(&img, 405, 405, 0xff0000ff, 1));  // 3000 halves of red
+    @expect_eq(px(&img, 395, 395), 0);
+    let c = img.get(100, 100);
+    @expect((c.b > 0.9) and (c.a > 0.05) and (c.a < 0.2));  // 0.99^254
+}
+
+test "rendering onto a PDF page" {
+    let text = files.read_file("std/graphics/svg/testdata/clip.svg")!;
+    defer mem.free(text);
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let mut pd = pdf.Document.init();
+    defer pd.deinit();
+    let mut page = pd.page(300.0, 300.0)!;
+    defer page.deinit();
+    render_page(&doc, &mut page, 50.0, 50.0, 200.0, 200.0)!;
+    let c = page.content.bytes();
+    @expect(strs.contains(c, "W n\n"));   // the clips
+    @expect(strs.contains(c, "W* n\n"));  // (one even-odd)
+    @expect(strs.contains(c, " c\n"));    // curves
+    @expect(strs.contains(c, "f\n"));     // fills
+    pd.add_page(&mut page)!;
+    let bytes = pd.bytes()!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-"));
+}
+
+test "viewbox transforms" {
+    let vb: [4]f64 = [10.0, 20.0, 50.0, 25.0];
+    // meet, centred: scale 2 (100 x 50 of 100 x 80), 15 down
+    let t = viewbox_transform(vb, Fit.default(), 100.0, 80.0);
+    let p = t.apply(10.0, 20.0);
+    @expect(@abs(p.x) < 1.0e-12);
+    @expect(@abs(p.y - 15.0) < 1.0e-12);
+    let q = t.apply(60.0, 45.0);
+    @expect(@abs(q.x - 100.0) < 1.0e-12);
+    @expect(@abs(q.y - 65.0) < 1.0e-12);
+    // slice at the maximum: scale 3.2, overflowing to the left
+    let s = viewbox_transform(vb, parse_fit("xMaxYMax slice"), 100.0, 80.0);
+    let r = s.apply(60.0, 45.0);
+    @expect(@abs(r.x - 100.0) < 1.0e-9);
+    @expect(@abs(r.y - 80.0) < 1.0e-9);
+    @expect(@abs(s.a - 3.2) < 1.0e-12);
+    // none stretches
+    let n = viewbox_transform(vb, parse_fit("none"), 100.0, 100.0);
+    @expect(@abs(n.a - 2.0) < 1.0e-12);
+    @expect(@abs(n.d - 4.0) < 1.0e-12);
+}
+
+test "focal radial gradients are written and read back" {
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let stops: [2]draw.Stop = [
+        draw.Stop.{ offset: 0.0, color: color.Color.rgb(1.0, 1.0, 1.0) },
+        draw.Stop.{ offset: 1.0, color: color.Color.rgb(0.0, 0.0, 0.0) },
+    ];
+    let p = draw.Paint.radial_focal(40.0, 40.0, 30.0, 25.0, 40.0, stops[..]);
+    {
+        let mut w = Writer.begin(out.writer(), 80.0, 80.0)!;
+        defer w.deinit();
+        w.fill_rect(0.0, 0.0, 80.0, 80.0, p)!;
+        w.finish()!;
+    }
+    @expect(strs.contains(out.bytes(), " fx=\"25\" fy=\"40\""));
+    let mut img = render_text(out.bytes())!;
+    defer img.deinit();
+    let mut ref = image.Image.init(80, 80, 4, image.Depth.U8)!;
+    defer ref.deinit();
+    let mut cv = draw.Canvas.init(&mut ref);
+    defer cv.deinit();
+    cv.fill_rect(0.0, 0.0, 80.0, 80.0, p)!;
+    // white at the focal point, black at and beyond the circle on both sides
+    @expect(near(&img, 25, 40, 0xffffffff, 24));
+    @expect(near(&img, 72, 40, 0x000000ff, 0));
+    @expect(near(&img, 8, 40, 0x000000ff, 0));
+    // the focal point pulls the light to the left: (30, 40) is lighter
+    // than (50, 40), the same distance from the centre
+    @expect(px(&img, 30, 40) > px(&img, 50, 40));
+    @expect(near(&ref, 25, 40, 0xffffffff, 24));
+    // a focal point outside the circle moves just inside it
+    let q = draw.Paint.radial_focal(0.0, 0.0, 10.0, 30.0, 0.0, stops[..]);
+    @expect((q.x1 < 10.0) and (q.x1 > 9.9) and (q.y1 == 0.0));
+}

@@ -1,0 +1,435 @@
+// =============================================================================
+// std/graphics/pdf/read/fonts.ax - Font encodings, glyph widths, ToUnicode
+// CMaps, and Adobe Glyph List lookup, part of std/graphics/pdf/read.
+// =============================================================================
+
+import "../../../collections/map.ax" as maps;
+import "../../../collections/vec.ax" as vec;
+import "../../../hash.ax" as hash;
+import "../../../str.ax" as strs;
+import "../tables.ax" as tb;
+
+// -----------------------------------------------------------------------------
+// Font maps, CMaps, and glyph names
+// -----------------------------------------------------------------------------
+
+pub const NO_FONT: usize = 0xffffffff;
+
+/// How a font's strings become text.
+nocopy struct FontMap {
+    key: []u8,       // the resource name
+    two_byte: bool,  // Identity-H style: every code is 2 bytes
+    ranges: [4]u32,  // codespace: for each code length (1-4 bytes), whether it is used
+    uni: maps.Map.[u32, u64, hash.hash_u32, hash.eq_u32],  // code -> (offset << 16 | length) in `pool`
+    simple: [256]u32,  // simple fonts: the encoding's character per code
+    widths: maps.Map.[u32, f64, hash.hash_u32, hash.eq_u32],  // code (or CID) -> width in 1/1000
+    default_width: f64,
+    has_simple: bool,
+}
+
+const T_HEX: u8 = 0;
+const T_OPEN: u8 = 1;
+const T_CLOSE: u8 = 2;
+const T_OTHER: u8 = 3;
+const T_END_SPACE: u8 = 4;
+const T_END_CHAR: u8 = 5;
+const T_END_RANGE: u8 = 6;
+
+struct Tok {
+    kind: u8,
+    a: usize,
+    b: usize,
+}
+
+fn load_font(ex: *mut Extractor, key: []u8, res: Dict) ReadError!usize {
+    for i in 0..ex.fonts.len() {
+        if strs.eq(ex.fonts.get(i).key, key) {
+            return i;
+        }
+    }
+    let fo = ex.r.get(res, "Font")!;
+    let fd = fo.as_dict() catch return NO_FONT;
+    let f = ex.r.get(fd, key)!;
+    let d = f.as_dict() catch return NO_FONT;
+    let mut m = FontMap.{
+        key: key,
+        two_byte: false,
+        ranges: [0, 0, 0, 0],
+        uni: maps.Map.[u32, u64, hash.hash_u32, hash.eq_u32].init(),
+        simple: [0; 256],
+        widths: maps.Map.[u32, f64, hash.hash_u32, hash.eq_u32].init(),
+        default_width: 500.0,
+        has_simple: false,
+    };
+    // (the key's bytes live in the content scratch; keep a copy)
+    let kc = ex.r.keep(strs.dup(key)!)!;
+    m.key = kc;
+    setup_font(ex, &mut m, d) catch |e| {
+        m.uni.deinit();
+        m.widths.deinit();
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return NO_FONT;
+    };
+    ex.fonts.push(FontMap.{
+        key: kc,
+        two_byte: false,
+        ranges: [0, 0, 0, 0],
+        uni: maps.Map.[u32, u64, hash.hash_u32, hash.eq_u32].init(),
+        simple: [0; 256],
+        widths: maps.Map.[u32, f64, hash.hash_u32, hash.eq_u32].init(),
+        default_width: 500.0,
+        has_simple: false,
+    }) catch |e| {
+        m.uni.deinit();
+        m.widths.deinit();
+        return e;
+    };
+    let idx = ex.fonts.len() - 1;
+    @swap(ex.fonts.get_ptr(idx), &mut m);
+    return idx;
+}
+
+fn setup_font(ex: *mut Extractor, m: *mut FontMap, d: Dict) ReadError!void {
+    let sub = ex.r.get(d, "Subtype")!;
+    let sn = sub.as_name() catch "";
+    let r = ex.r;
+    if strs.eq(sn, "Type0") {
+        m.two_byte = true;
+        m.default_width = 1000.0;
+        let desc = r.get(d, "DescendantFonts")!;
+        let da = desc.as_array() catch [];
+        if da.len > 0 {
+            let cf = r.resolve(da[0])!;
+            let cd = cf.as_dict() catch empty_dict();
+            let dw = r.get(cd, "DW")!;
+            m.default_width = dw.as_num() catch 1000.0;
+            let wo = r.get(cd, "W")!;
+            let wa = wo.as_array() catch [];
+            let mut k: usize = 0;
+            while k < wa.len {
+                let first = (r.resolve(wa[k])!).as_int() catch break;
+                if k + 1 >= wa.len {
+                    break;
+                }
+                let second = r.resolve(wa[k + 1])!;
+                match second {
+                    .Array(ws) => {
+                        for j in 0..@min(ws.len, 65536) {
+                            let w = (r.resolve(ws[j])!).as_num() catch 0.0;
+                            m.widths.put(@truncate(u32, @bit_cast(u64, first)) +% @truncate(u32, j), w)!;
+                        }
+                        k += 2;
+                    }
+                    else => {
+                        let last = second.as_int() catch break;
+                        if k + 2 >= wa.len {
+                            break;
+                        }
+                        let w = (r.resolve(wa[k + 2])!).as_num() catch 0.0;
+                        let mut c = first;
+                        while (c <= last) and (c - first < 65536) {
+                            m.widths.put(@truncate(u32, @bit_cast(u64, c)), w)!;
+                            c += 1;
+                        }
+                        k += 3;
+                    }
+                }
+            }
+        }
+    } else {
+        // a simple font: one-byte codes, its encoding, then its widths
+        m.has_simple = true;
+        m.ranges[0] = 1;
+        let mut base = tb.STANDARD[..];
+        if strs.eq(sn, "TrueType") {
+            base = tb.WIN_ANSI[..];
+        }
+        let enc = r.get(d, "Encoding")!;
+        let mut diffs: []Object = [];
+        match enc {
+            .Name(n) => { base = encoding_table(n, base); }
+            .Dict(ed) => {
+                let bo = r.get(ed, "BaseEncoding")!;
+                let bn = bo.as_name() catch "";
+                base = encoding_table(bn, base);
+                let dfo = r.get(ed, "Differences")!;
+                diffs = dfo.as_array() catch [];
+            }
+            else => {}
+        }
+        for c in @as(usize, 0)..256 {
+            let mut u = @as(u32, base[c]);
+            if (u == 0) and (c >= 32) and (c < 127) {
+                u = @truncate(u32, c);
+            }
+            m.simple[c] = u;
+        }
+        let mut code: i64 = 0;
+        for o in diffs {
+            match o {
+                .Int(v) => { code = v; }
+                .Name(gname) => {
+                    if (code >= 0) and (code < 256) {
+                        let u = glyph_unicode(gname);
+                        if u != 0 {
+                            m.simple[@truncate(usize, @bit_cast(u64, code))] = u;
+                        }
+                    }
+                    code += 1;
+                }
+                else => {}
+            }
+        }
+        let fc = (r.get(d, "FirstChar")!).as_int() catch 0;
+        let wo = r.get(d, "Widths")!;
+        let wa = wo.as_array() catch [];
+        for j in 0..@min(wa.len, 256) {
+            let w = (r.resolve(wa[j])!).as_num() catch 0.0;
+            m.widths.put(@truncate(u32, @bit_cast(u64, fc)) +% @truncate(u32, j), w)!;
+        }
+    }
+    // ToUnicode, when there is one, wins
+    let tu = r.get(d, "ToUnicode")!;
+    let ts = tu.as_stream() catch return;
+    let cm = decode_stream(r, ts) catch return;
+    parse_cmap(ex, m, cm)!;
+}
+
+/// A ToUnicode CMap: codespace ranges, bfchar and bfrange.
+fn parse_cmap(ex: *mut Extractor, m: *mut FontMap, s: []u8) ReadError!void {
+    let mut i: usize = 0;
+    let mut toks = vec.Vec.[Tok].init();
+    defer toks.deinit();
+    let mut buf = strs.String.init();
+    defer buf.deinit();
+    // tokens: hex strings, arrays, and keywords
+    while i < s.len {
+        i = skip_white(s, i);
+        if i >= s.len {
+            break;
+        }
+        let c = s[i];
+        if (c == '<') and (at(s, i + 1) != '<') {
+            let a = buf.len();
+            let mut p = i + 1;
+            hex_into(s, &mut p, &mut buf)!;
+            toks.push(Tok.{ kind: T_HEX, a: a, b: buf.len() })!;
+            i = p;
+        } else if c == '[' {
+            toks.push(Tok.{ kind: T_OPEN, a: 0, b: 0 })!;
+            i += 1;
+        } else if c == ']' {
+            toks.push(Tok.{ kind: T_CLOSE, a: 0, b: 0 })!;
+            i += 1;
+        } else if is_regular(c) {
+            let st = i;
+            while (i < s.len) and is_regular(s[i]) {
+                i += 1;
+            }
+            let w = s[st..i];
+            let mut kind = T_OTHER;
+            if strs.eq(w, "endcodespacerange") {
+                kind = T_END_SPACE;
+            } else if strs.eq(w, "endbfchar") {
+                kind = T_END_CHAR;
+            } else if strs.eq(w, "endbfrange") {
+                kind = T_END_RANGE;
+            }
+            toks.push(Tok.{ kind: kind, a: 0, b: 0 })!;
+        } else {
+            i += 1;
+        }
+        if toks.len() > (1 << 22) {
+            break;
+        }
+    }
+    let b = buf.bytes();
+    let t = toks.items();
+    let mut spaces = false;
+    let mut k: usize = 0;
+    let mut start: usize = 0;
+    while k < t.len {
+        let kind = t[k].kind;
+        if kind == T_END_SPACE {
+            // pairs of hex strings before it
+            let mut j = start;
+            while j + 1 < k {
+                if (t[j].kind == T_HEX) and (t[j + 1].kind == T_HEX) {
+                    let len = t[j].b - t[j].a;
+                    if (len >= 1) and (len <= 4) {
+                        m.ranges[len - 1] = 1;
+                        spaces = true;
+                    }
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            start = k + 1;
+        } else if kind == T_END_CHAR {
+            let mut j = start;
+            while j + 1 < k {
+                if (t[j].kind == T_HEX) and (t[j + 1].kind == T_HEX) {
+                    let code = be_num(b[t[j].a..t[j].b]);
+                    map_code(ex, m, code, b[t[j + 1].a..t[j + 1].b], 0)!;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            start = k + 1;
+        } else if kind == T_END_RANGE {
+            let mut j = start;
+            while j + 2 < k {
+                if (t[j].kind != T_HEX) or (t[j + 1].kind != T_HEX) {
+                    j += 1;
+                    continue;
+                }
+                let lo = be_num(b[t[j].a..t[j].b]);
+                let hi = be_num(b[t[j + 1].a..t[j + 1].b]);
+                if (hi < lo) or (hi - lo > 65535) {
+                    j += 3;
+                    continue;
+                }
+                if t[j + 2].kind == T_HEX {
+                    let dst = b[t[j + 2].a..t[j + 2].b];
+                    let mut c = lo;
+                    while c <= hi {
+                        map_code(ex, m, c, dst, c - lo)!;
+                        if c == 0xffffffff {
+                            break;
+                        }
+                        c += 1;
+                    }
+                    j += 3;
+                } else if t[j + 2].kind == T_OPEN {
+                    let mut q = j + 3;
+                    let mut c = lo;
+                    while (q < k) and (t[q].kind == T_HEX) and (c <= hi) {
+                        map_code(ex, m, c, b[t[q].a..t[q].b], 0)!;
+                        c += 1;
+                        q += 1;
+                    }
+                    while (q < k) and (t[q].kind != T_CLOSE) {
+                        q += 1;
+                    }
+                    j = q + 1;
+                } else {
+                    j += 1;
+                }
+            }
+            start = k + 1;
+        } else if kind == T_OTHER {
+            // keywords like beginbfchar start a section
+            start = k + 1;
+        }
+        k += 1;
+    }
+    if spaces and m.two_byte and (m.ranges[1] == 0) {
+        // a Type0 font whose codes are not 2 bytes
+        m.two_byte = false;
+    }
+    if not m.two_byte and not spaces {
+        m.ranges[0] = 1;
+    }
+}
+
+/// Maps a code to UTF-16BE text (plus `add` to its last unit, for ranges).
+fn map_code(ex: *mut Extractor, m: *mut FontMap, code: u32, dst: []u8, add: u32) ReadError!void {
+    let off = ex.pool.len();
+    let mut i: usize = 0;
+    while i + 1 < dst.len {
+        let mut u = (@as(u32, dst[i]) << 8) | @as(u32, dst[i + 1]);
+        i += 2;
+        if i + 1 >= dst.len {
+            u +%= add;
+        }
+        if (u >= 0xd800) and (u < 0xdc00) and (i + 1 < dst.len) {
+            let mut lo = (@as(u32, dst[i]) << 8) | @as(u32, dst[i + 1]);
+            i += 2;
+            if i + 1 >= dst.len {
+                lo +%= add;
+            }
+            if (lo >= 0xdc00) and (lo < 0xe000) {
+                u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
+            }
+        }
+        if ((u >= 0xd800) and (u < 0xe000)) or (u > 0x10ffff) {
+            u = 0xfffd;
+        }
+        if u != 0 {
+            ex.pool.push_rune(u)!;
+        }
+    }
+    let len = ex.pool.len() - off;
+    if (len > 0) and (len < 65536) and (@as(u64, off) < (@as(u64, 1) << 40)) {
+        m.uni.put(code, (@as(u64, off) << 16) | @as(u64, len))!;
+    }
+}
+
+fn be_num(b: []u8) u32 {
+    let mut v: u32 = 0;
+    for k in 0..@min(b.len, 4) {
+        v = (v << 8) | @as(u32, b[k]);
+    }
+    return v;
+}
+
+fn encoding_table(name: []u8, dflt: []u16) []u16 {
+    if strs.eq(name, "WinAnsiEncoding") {
+        return tb.WIN_ANSI[..];
+    }
+    if strs.eq(name, "MacRomanEncoding") {
+        return tb.MAC_ROMAN[..];
+    }
+    if strs.eq(name, "StandardEncoding") {
+        return tb.STANDARD[..];
+    }
+    return dflt;
+}
+
+/// A glyph name's character: the Adobe Glyph List, uniXXXX, uXXXX[XX].
+pub fn glyph_unicode(name0: []u8) u32 {
+    // drop a suffix: "a.sc", "f_i" keeps its first part
+    let mut name = name0;
+    let dot = strs.index_of_byte(name, '.') ?? name.len;
+    name = name[..dot];
+    let mut lo: usize = 0;
+    let mut hi: usize = tb.GLYPH_COUNT;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let k = tb.GLYPH_NAMES[@as(usize, tb.GLYPH_OFFSET[mid])..@as(usize, tb.GLYPH_OFFSET[mid + 1])];
+        let c = strs.compare(k, name);
+        if c == 0 {
+            return @as(u32, tb.GLYPH_UNICODE[mid]);
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut hex: []u8 = "";
+    if strs.starts_with(name, "uni") and (name.len >= 7) {
+        hex = name[3..7];
+    } else if strs.starts_with(name, "u") and (name.len >= 5) and (name.len <= 7) {
+        hex = name[1..];
+    }
+    if hex.len == 0 {
+        return 0;
+    }
+    let mut v: u32 = 0;
+    for c in hex {
+        let h = hexval(c);
+        if h < 0 {
+            return 0;
+        }
+        v = (v << 4) | @bit_cast(u32, h);
+    }
+    if (v > 0x10ffff) or ((v >= 0xd800) and (v < 0xe000)) {
+        return 0;
+    }
+    return v;
+}

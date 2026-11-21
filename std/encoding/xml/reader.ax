@@ -1,0 +1,530 @@
+// =============================================================================
+// std/encoding/xml/reader.ax - Streaming pull parser (Reader), source stack,
+// token scanning, entity expansion, comments, CDATA, and PIs, part of std/encoding/xml.
+// =============================================================================
+
+import "../../collections/arena.ax" as arena;
+import "../../collections/map.ax" as maps;
+import "../../collections/vec.ax" as vec;
+import "../../diag.ax" as diag;
+import "../../hash.ax" as hash;
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// The pull parser
+// -----------------------------------------------------------------------------
+
+struct Source {
+    text: []u8,
+    pos: usize,
+    entity: []u8,  // the entity being expanded ("" for the document)
+    in_attr: bool,
+}
+
+const NONE: usize = @max_value(usize);
+
+// Elements with more attributes than this check them for duplicates with a
+// hash set, not by comparing pairs.
+const FEW_ATTRS: usize = 16;
+
+/// A streaming parser over a document.
+pub nocopy struct Reader {
+    ar: arena.Arena,
+    opts: Options,
+    src: vec.Vec.[Source],
+    general: maps.Map.[[]u8, Entity, hash.hash_bytes, hash.eq_bytes],
+    params: maps.Map.[[]u8, Entity, hash.hash_bytes, hash.eq_bytes],
+    attdefs: vec.Vec.[AttDef],
+    attdef_of: maps.Map.[[]u8, usize, hash.hash_bytes, hash.eq_bytes],    // "element name" -> index in attdefs
+    defaults: maps.Map.[[]u8, Defaults, hash.hash_bytes, hash.eq_bytes],  // element -> its attribute defaults
+    seen: maps.Map.[[]u8, usize, hash.hash_bytes, hash.eq_bytes],         // a start tag's attribute names, past FEW_ATTRS
+    sorted: vec.Vec.[Attr],
+    key: strs.String,
+    open: vec.Vec.[[]u8],       // names of open elements
+    open_src: vec.Vec.[usize],  // the source depth each was opened in
+    scope: Scope,
+    attrs: vec.Vec.[Attr],
+    buf: strs.String,
+    buf2: strs.String,
+    pending_end: bool,  // after <x/>: the END token comes next
+    pending_name: []u8,
+    pending_local: []u8,
+    pending_ns: []u8,
+    pending_depth: usize,
+    seen_root: bool,
+    seen_doctype: bool,
+    done: bool,
+    expanded: usize,
+    defaulted: usize,  // what attribute defaults have added
+    default_limit: usize,
+    has_external_subset: bool,
+    standalone: bool,
+    msg: []u8,
+    err_pos: usize,
+    line: u32,
+    col: u32,
+
+    /// A reader over text (copied and decoded, so text may be freed).
+    pub fn init(text: []u8, opts: Options) XmlError!Reader {
+        let mut m: []u8 = "";
+        return Reader.init_info(text, opts, &mut m);
+    }
+
+    /// As init; on failure, msg says why.
+    pub fn init_info(text: []u8, opts: Options, msg: *mut []u8) XmlError!Reader {
+        let mut dinfo = diag.ErrorInfo.init();
+        let r = Reader.init_diag(text, opts, &mut dinfo) catch |e| {
+            msg.* = dinfo.detail;
+            return e;
+        };
+        return r;
+    }
+
+    fn init_diag(text: []u8, opts: Options, info: *mut diag.ErrorInfo) XmlError!Reader {
+        let mut r = Reader.{
+            ar: arena.Arena.init(),
+            opts: opts,
+            src: vec.Vec.[Source].init(),
+            general: maps.Map.[[]u8, Entity, hash.hash_bytes, hash.eq_bytes].init(),
+            params: maps.Map.[[]u8, Entity, hash.hash_bytes, hash.eq_bytes].init(),
+            attdefs: vec.Vec.[AttDef].init(),
+            attdef_of: maps.Map.[[]u8, usize, hash.hash_bytes, hash.eq_bytes].init(),
+            defaults: maps.Map.[[]u8, Defaults, hash.hash_bytes, hash.eq_bytes].init(),
+            seen: maps.Map.[[]u8, usize, hash.hash_bytes, hash.eq_bytes].init(),
+            sorted: vec.Vec.[Attr].init(),
+            key: strs.String.init(),
+            open: vec.Vec.[[]u8].init(),
+            open_src: vec.Vec.[usize].init(),
+            scope: Scope.init(),
+            attrs: vec.Vec.[Attr].init(),
+            buf: strs.String.init(),
+            buf2: strs.String.init(),
+            pending_end: false,
+            pending_name: "",
+            pending_local: "",
+            pending_ns: "",
+            pending_depth: 0,
+            seen_root: false,
+            seen_doctype: false,
+            done: false,
+            expanded: 0,
+            defaulted: 0,
+            default_limit: MAX_EXPANSION,
+            has_external_subset: false,
+            standalone: false,
+            msg: "",
+            err_pos: 0,
+            line: 0,
+            col: 0,
+        };
+        let t = decode_input_diag(text, &mut r.ar, info) catch |e| {
+            r.deinit();
+            return e;
+        };
+        r.default_limit = @max(MAX_EXPANSION, @mul_checked(t.len, 4) catch @max_value(usize));
+        r.src.push(Source.{ text: t, pos: 0, entity: "", in_attr: false }) catch |e| {
+            info.* = diag.ErrorInfo.at(0, 1, 1, "out of memory");
+            r.deinit();
+            return e;
+        };
+        reader_xml_decl(&mut r) catch |e| {
+            if r.line == 0 {
+                r.record_pos();
+            }
+            let mut detail = r.msg;
+            if (detail.len == 0) and (e == error.OutOfMemory) {
+                detail = "out of memory";
+            }
+            info.* = diag.ErrorInfo.at(map_input_offset(text, r.err_pos), r.line, r.col, detail);
+            r.deinit();
+            return e;
+        };
+        return r;
+    }
+
+    pub fn deinit(self: *mut Reader) void {
+        self.ar.deinit();
+        self.src.deinit();
+        self.general.deinit();
+        self.params.deinit();
+        self.attdefs.deinit();
+        self.attdef_of.deinit();
+        self.defaults.deinit();
+        self.seen.deinit();
+        self.sorted.deinit();
+        self.key.deinit();
+        self.open.deinit();
+        self.open_src.deinit();
+        self.scope.deinit();
+        self.attrs.deinit();
+        self.buf.deinit();
+        self.buf2.deinit();
+    }
+
+    /// Why the last SyntaxError happened.
+    pub fn error_message(self: *Reader) []u8 {
+        return self.msg;
+    }
+
+    /// The line (from 1) of the document where the last error happened.
+    pub fn error_line(self: *Reader) u32 {
+        return self.line;
+    }
+
+    fn record_pos(self: *mut Reader) void {
+        if self.src.len() == 0 {
+            self.err_pos = 0;
+            self.line = 1;
+            self.col = 1;
+            return;
+        }
+        let doc = self.src.get(0);
+        let p = @min(doc.pos, doc.text.len);
+        let mut l: u32 = 1;
+        let mut c: u32 = 1;
+        for ch in doc.text[..p] {
+            if ch == '\n' {
+                l += 1;
+                c = 1;
+            } else {
+                c += 1;
+            }
+        }
+        self.err_pos = p;
+        self.line = l;
+        self.col = c;
+    }
+
+    fn fail(self: *mut Reader, m: []u8) XmlError {
+        return self.fail_err(m, error.SyntaxError);
+    }
+
+    fn fail_err(self: *mut Reader, m: []u8, e: XmlError) XmlError {
+        if self.msg.len == 0 {
+            self.msg = m;
+            self.record_pos();
+        }
+        return e;
+    }
+
+    // --- the current source ----------------------------------------------------------
+
+    fn cur(self: *mut Reader) *mut Source {
+        return self.src.get_ptr(self.src.len() - 1);
+    }
+
+    fn at(self: *mut Reader, k: usize) u8 {
+        let s = self.cur();
+        let i = s.pos + k;
+        if i < s.text.len {
+            return s.text[i];
+        }
+        return 0;
+    }
+
+    fn eof(self: *mut Reader) bool {
+        let s = self.cur();
+        return s.pos >= s.text.len;
+    }
+
+    fn looking_at(self: *mut Reader, w: []u8) bool {
+        let s = self.cur();
+        return ((s.pos + w.len) <= s.text.len) and @mem_eq(s.text[s.pos..s.pos + w.len], w);
+    }
+
+    fn advance(self: *mut Reader, n: usize) void {
+        self.cur().pos += n;
+    }
+
+    fn expect(self: *mut Reader, w: []u8, m: []u8) XmlError!void {
+        if not self.looking_at(w) {
+            return self.fail(m);
+        }
+        self.advance(w.len);
+    }
+
+    fn skip_space(self: *mut Reader) bool {
+        let mut any = false;
+        while not self.eof() and is_space(self.at(0)) {
+            self.advance(1);
+            any = true;
+        }
+        return any;
+    }
+
+    fn name(self: *mut Reader) XmlError![]u8 {
+        let s = self.cur();
+        let st = s.pos;
+        let mut i = st;
+        let mut first = true;
+        while i < s.text.len {
+            let r = strs.decode_rune(s.text[i..]);
+            let ok = (first and is_name_start(r.value)) or (not first and is_name_char(r.value));
+            if not ok {
+                break;
+            }
+            first = false;
+            i += r.len;
+        }
+        if i == st {
+            return self.fail("expected a name");
+        }
+        s.pos = i;
+        return s.text[st..i];
+    }
+
+    // --- tokens ---------------------------------------------------------------------------
+
+    fn token(kind: TokenKind) Token {
+        return Token.{ kind: kind, name: "", local: "", ns: "", attrs: [], text: "", self_closing: false };
+    }
+
+    /// The next token; TokenKind.END_DOCUMENT at the end. Strings live as long as
+    /// the Reader.
+    pub fn next(self: *mut Reader) XmlError!Token {
+        if self.pending_end {
+            self.pending_end = false;
+            reader_close_scope(self, self.pending_depth);
+            let mut t = Reader.token(TokenKind.END);
+            t.name = self.pending_name;
+            t.local = self.pending_local;
+            t.ns = self.pending_ns;
+            return t;
+        }
+        if self.done {
+            return Reader.token(TokenKind.END_DOCUMENT);
+        }
+        loop {
+            // entity ends
+            if self.eof() {
+                if self.src.len() > 1 {
+                    if (self.open_src.len() > 0) and
+                       (self.open_src.get(self.open_src.len() - 1) == (self.src.len() - 1)) {
+                        return self.fail("an element starts in an entity and ends outside it");
+                    }
+                    _ = self.src.pop();
+                    continue;
+                }
+                if self.open.len() > 0 {
+                    return self.fail("unexpected end of document: an element is not closed");
+                }
+                if not self.seen_root {
+                    return self.fail("the document has no root element");
+                }
+                self.done = true;
+                return Reader.token(TokenKind.END_DOCUMENT);
+            }
+            let inside = self.open.len() > 0;
+            let c = self.at(0);
+            if c == '<' {
+                let d = self.at(1);
+                if d == '/' {
+                    return reader_end_tag(self);
+                }
+                if d == '?' {
+                    return self.pi();
+                }
+                if self.looking_at("<!--") {
+                    return self.comment();
+                }
+                if self.looking_at("<![CDATA[") {
+                    if not inside {
+                        return self.fail("CDATA outside the root element");
+                    }
+                    return self.cdata();
+                }
+                if self.looking_at("<!DOCTYPE") {
+                    if inside or self.seen_root or self.seen_doctype {
+                        return self.fail("misplaced DOCTYPE");
+                    }
+                    return reader_doctype(self);
+                }
+                if d == '!' {
+                    return self.fail("unexpected markup");
+                }
+                if not inside and self.seen_root {
+                    return self.fail("content after the root element");
+                }
+                return reader_start_tag(self);
+            }
+            if not inside {
+                // outside the root: white space only
+                if is_space(c) {
+                    self.advance(1);
+                    continue;
+                }
+                if self.src.len() > 1 {
+                    return self.fail("text in an entity outside the root element");
+                }
+                return self.fail("text outside the root element");
+            }
+            let t = self.char_data()!;
+            if t.text.len > 0 {
+                return t;
+            }
+        }
+    }
+
+    // Text up to the next markup, with references resolved (entity
+    // references with markup push their text as a new source).
+    fn char_data(self: *mut Reader) XmlError!Token {
+        self.buf.clear();
+        loop {
+            if self.eof() {
+                break;
+            }
+            let c = self.at(0);
+            if c == '<' {
+                break;
+            }
+            if c == '&' {
+                if self.reference_in_content()! {
+                    break;  // a new source: return what we have
+                }
+                continue;
+            }
+            if (c == ']') and self.looking_at("]]>") {
+                return self.fail("]]> in text");
+            }
+            self.buf.push(c)!;
+            self.advance(1);
+        }
+        let mut t = Reader.token(TokenKind.TEXT);
+        t.text = self.ar.dup(self.buf.bytes())!;
+        return t;
+    }
+
+    // At '&' in content: appends a character or predefined entity to buf, or
+    // pushes an entity's text (returns true).
+    fn reference_in_content(self: *mut Reader) XmlError!bool {
+        if self.at(1) == '#' {
+            self.char_ref(&mut self.buf)!;
+            return false;
+        }
+        self.advance(1);
+        let n = self.name()!;
+        self.expect(";", "expected ; after an entity name")!;
+        let p = predefined(n);
+        if (p.len > 0) and not self.general.contains(n) {
+            self.buf.push_str(p)!;
+            return false;
+        }
+        let e = self.general.get(n) ?? {
+            if (p.len > 0) {
+                self.buf.push_str(p)!;
+                return false;
+            }
+            return self.fail("reference to an undeclared entity");
+        };
+        if e.unparsed {
+            return self.fail("reference to an unparsed entity");
+        }
+        if e.external {
+            return self.fail("reference to an external entity (not loaded)");
+        }
+        self.push_entity(n, e.value, false)!;
+        return true;
+    }
+
+    fn push_entity(self: *mut Reader, name: []u8, value: []u8, in_attr: bool) XmlError!void {
+        for s in self.src.items() {
+            if strs.eq(s.entity, name) {
+                return self.fail("recursive entity reference");
+            }
+        }
+        if self.src.len() > 64 {
+            return self.fail_err("entity expansion nested too deeply", error.TooDeep);
+        }
+        self.expanded += value.len;
+        if self.expanded > MAX_EXPANSION {
+            return self.fail_err("entity expansion exceeds size limit", error.TooLarge);
+        }
+        self.src.push(Source.{ text: value, pos: 0, entity: name, in_attr: in_attr })!;
+    }
+
+    fn char_ref(self: *mut Reader, out: *mut strs.String) XmlError!void {
+        self.advance(2);
+        let mut v: u32 = 0;
+        let mut digits: usize = 0;
+        if self.at(0) == 'x' {
+            self.advance(1);
+            loop {
+                let h = hexv(self.at(0));
+                if h > 15 {
+                    break;
+                }
+                v = @min((v << 4) | h, 0x110000);
+                digits += 1;
+                self.advance(1);
+            }
+        } else {
+            while (self.at(0) >= '0') and (self.at(0) <= '9') {
+                v = @min((v * 10) + @as(u32, self.at(0) - '0'), 0x110000);
+                digits += 1;
+                self.advance(1);
+            }
+        }
+        if (digits == 0) or (self.at(0) != ';') {
+            return self.fail("malformed character reference");
+        }
+        self.advance(1);
+        if not is_char(v) {
+            return self.fail("a character reference to a character XML does not allow");
+        }
+        let mut b: [4]u8 = [0; 4];
+        out.push_str(strs.encode_rune(b[..], v))!;
+    }
+
+    fn comment(self: *mut Reader) XmlError!Token {
+        self.advance(4);
+        let s = self.cur();
+        let st = s.pos;
+        let end = strs.index_of_from(s.text, "--", st) ?? return self.fail("unterminated comment");
+        if (end + 2 >= s.text.len) or (s.text[end + 2] != '>') {
+            return self.fail("-- in a comment");
+        }
+        s.pos = end + 3;
+        let mut t = Reader.token(TokenKind.COMMENT);
+        t.text = s.text[st..end];
+        return t;
+    }
+
+    fn cdata(self: *mut Reader) XmlError!Token {
+        self.advance(9);
+        let s = self.cur();
+        let st = s.pos;
+        let end = strs.index_of_from(s.text, "]]>", st) ?? return self.fail("unterminated CDATA section");
+        s.pos = end + 3;
+        let mut t = Reader.token(TokenKind.CDATA);
+        t.text = s.text[st..end];
+        return t;
+    }
+
+    fn pi(self: *mut Reader) XmlError!Token {
+        self.advance(2);
+        let target = self.name()!;
+        if (target.len == 3) and ((target[0] | 32) == 'x') and ((target[1] | 32) == 'm') and ((target[2] | 32) == 'l') {
+            return self.fail("a processing instruction named xml (a misplaced XML declaration?)");
+        }
+        if self.opts.namespaces and strs.contains(target, ":") {
+            return self.fail("a colon in a processing instruction target");
+        }
+        let mut data: []u8 = "";
+        if not self.looking_at("?>") {
+            if not self.skip_space() {
+                return self.fail("expected white space after the target");
+            }
+            let s = self.cur();
+            let st = s.pos;
+            let end = strs.index_of_from(s.text, "?>", st) ?? return self.fail("unterminated processing instruction");
+            data = s.text[st..end];
+            s.pos = end;
+        }
+        self.advance(2);
+        let mut t = Reader.token(TokenKind.PI);
+        t.name = target;
+        t.local = target;
+        t.text = data;
+        return t;
+    }
+}

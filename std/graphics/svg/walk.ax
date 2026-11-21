@@ -1,0 +1,525 @@
+// =============================================================================
+// std/graphics/svg/walk.ax - Walking the SVG tree: groups, clip paths, masks,
+// nested viewports, and <use> expansion, part of std/graphics/svg.
+// =============================================================================
+
+import "../../encoding/xml.ax" as xml;
+import "../../str.ax" as strs;
+import "../draw.ax" as draw;
+import "css.ax" as css;
+import "path.ax" as pathdata;
+
+// -----------------------------------------------------------------------------
+// Walking the tree
+// -----------------------------------------------------------------------------
+
+/// Elements that draw nothing where they stand.
+fn is_hidden_element(name: []u8) bool {
+    let names: [16][]u8 = [
+        "defs",
+        "symbol",
+        "clipPath",
+        "mask",
+        "linearGradient",
+        "radialGradient",
+        "pattern",
+        "marker",
+        "style",
+        "title",
+        "desc",
+        "metadata",
+        "filter",
+        "script",
+        "foreignObject",
+        "font",
+    ];
+    for n in names {
+        if strs.eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Elements nest at most this deep (each level is a few frames of stack:
+// deeper documents fail with TooComplex rather than exhaust a 1 MiB stack).
+const MAX_NESTING: usize = 256;
+
+fn walk(b: *mut Builder, e: *xml.Element, parent: *Style, ctm: draw.Affine, depth: usize) SvgError!void {
+    if depth > MAX_NESTING {
+        return error.TooComplex;
+    }
+    b.charge(1)!;
+    if not is_svg(e) or is_hidden_element(e.local) {
+        return;
+    }
+    b.enter(e)!;
+    defer b.leave();
+    let s = b.compute_style(e, parent)!;
+    if not s.display {
+        return;
+    }
+    let mut t = ctm;
+    let tv = e.attr("transform") catch "";
+    if tv.len > 0 {
+        let mut local = draw.Affine.identity();
+        css.parse_transform(tv, &mut local) catch {};
+        t = local.then(ctm);
+    }
+    let name = e.local;
+    if strs.eq(name, "g") or strs.eq(name, "a") {
+        group(b, e, &s, t, depth, false)!;
+    } else if strs.eq(name, "switch") {
+        group(b, e, &s, t, depth, true)!;
+    } else if strs.eq(name, "svg") {
+        // a nested viewport (its transform attribute, if any, is SVG 2's)
+        let x = b.attr_length(e, "x", 'x', s.font_size, 0.0);
+        let y = b.attr_length(e, "y", 'y', s.font_size, 0.0);
+        let w = b.attr_length(e, "width", 'x', s.font_size, b.vw);
+        let h = b.attr_length(e, "height", 'y', s.font_size, b.vh);
+        viewport(b, e, &s, t, x, y, w, h, depth)!;
+    } else if strs.eq(name, "use") {
+        use_element(b, e, &s, t, depth)!;
+    } else if strs.eq(name, "text") {
+        text_element(b, e, &s, t, depth)!;
+    } else if strs.eq(name, "image") {
+        image_element(b, e, &s, t)!;
+    } else {
+        shape(b, e, &s, t)!;
+    }
+}
+
+/// A group opened for an element's opacity, clip path or mask.
+struct GroupInfo {
+    opened: bool,
+    begin: usize,  // its BEGIN_GROUP item
+    clip: []u8,    // the clipPath's id (if it is one)
+    mask: *xml.Element,
+    has_mask: bool,
+    t: draw.Affine,
+    bbox: pathdata.Box,  // the element's box (empty: from what the group draws)
+}
+
+/// The element (of a kind) an id names.
+fn element_of(b: *Builder, id: []u8, kind: []u8) SvgError!*xml.Element {
+    let e = b.ids.get(id) ?? return error.NotFound;
+    if not is_svg(e) or not strs.eq(e.local, kind) {
+        return error.SyntaxError;
+    }
+    return e;
+}
+
+fn is_element(b: *Builder, id: []u8, kind: []u8) bool {
+    _ = element_of(b, id, kind) catch return false;
+    return true;
+}
+
+/// Opens a group if the element has an opacity, a clip path or a mask (the
+/// clip and mask are made when the group closes, when its box is known).
+fn begin_group(b: *mut Builder, s: *Style, t: draw.Affine, bbox: pathdata.Box) SvgError!GroupInfo {
+    let mut g = GroupInfo.{ opened: false, begin: 0, clip: "", mask: @ptr_from_int(*xml.Element, 8), has_mask: false,
+                            t: t, bbox: bbox };
+    if (s.clip_path.len > 0) and is_element(b, s.clip_path, "clipPath") {
+        g.clip = s.clip_path;
+    }
+    if s.mask.len > 0 {
+        if let .some(m) = b.ids.get(s.mask) {
+            if is_svg(m) and strs.eq(m.local, "mask") {
+                g.mask = m;
+                g.has_mask = true;
+            }
+        }
+    }
+    if (g.clip.len == 0) and not g.has_mask and not (s.opacity < 1.0) {
+        return g;
+    }
+    let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+    it.opacity = s.opacity;
+    it.masked = g.has_mask;
+    b.push_item(it)!;
+    g.opened = true;
+    g.begin = b.doc.items.len() - 1;
+    return g;
+}
+
+/// Closes a group begin_group opened: its clip, then its mask's content.
+fn end_group(b: *mut Builder, g: *GroupInfo, depth: usize) SvgError!void {
+    if not g.opened {
+        return;
+    }
+    let mut bbox = g.bbox;
+    if bbox.is_empty() and ((g.clip.len > 0) or g.has_mask) {
+        bbox = items_bbox(b, g.begin + 1, g.t)!;
+    }
+    if g.clip.len > 0 {
+        let mut rule = draw.FillRule.NONZERO;
+        let idx = clip_path(b, g.clip, g.t, bbox, &mut rule)!;
+        let it = &mut b.doc.items.items_mut()[g.begin];
+        it.path = idx;
+        it.fill_rule = rule;
+    }
+    if g.has_mask {
+        b.push_item(blank_item(ItemKind.BEGIN_MASK, g.t))!;
+        mask_content(b, g.mask, g.t, bbox, depth)!;
+    }
+    close_group(b)!;
+}
+
+fn close_group(b: *mut Builder) SvgError!void {
+    b.push_item(blank_item(ItemKind.END_GROUP, draw.Affine.identity()))!;
+}
+
+/// The box (in t's space) of the shapes and images drawn since item `from`.
+fn items_bbox(b: *mut Builder, from: usize, t: draw.Affine) SvgError!pathdata.Box {
+    let mut box = pathdata.Box.empty();
+    if @abs(t.determinant()) < 1.0e-12 {
+        return box;
+    }
+    let inv = t.invert();
+    let items = b.doc.items.items();
+    b.charge(items.len - from)!;
+    for i in from..items.len {
+        let it = items[i];
+        let mut local = pathdata.Box.empty();
+        if it.kind == ItemKind.SHAPE {
+            local = b.bounds.get(it.path);
+        } else if it.kind == ItemKind.IMAGE {
+            local = pathdata.Box.{ x0: 0.0, y0: 0.0, x1: it.width, y1: it.height };
+        } else {
+            continue;
+        }
+        if local.is_empty() {
+            continue;
+        }
+        let m = it.transform.then(inv);
+        let xs: [2]f64 = [local.x0, local.x1];
+        let ys: [2]f64 = [local.y0, local.y1];
+        for xv in xs {
+            for yv in ys {
+                let q = m.apply(xv, yv);
+                box.add(q.x, q.y);
+            }
+        }
+    }
+    return box;
+}
+
+/// The content of a mask, for an element of box bbox drawn through t.
+fn mask_content(b: *mut Builder, m: *xml.Element, t: draw.Affine, bbox: pathdata.Box, depth: usize) SvgError!void {
+    if (b.masks.len() >= 8) or (depth > MAX_NESTING) {
+        return;
+    }
+    for x in b.masks.items() {
+        if x == m {
+            return;  // a mask inside itself
+        }
+    }
+    let base = initial_style();
+    b.enter(m)!;
+    defer b.leave();
+    let ms = b.compute_style(m, &base)!;
+    let bw = bbox.x1 - bbox.x0;
+    let bh = bbox.y1 - bbox.y0;
+    let has_box = not bbox.is_empty() and (bw > 0.0) and (bh > 0.0);
+    // the region it covers
+    let mut region = pathdata.Box.empty();
+    let user = strs.eq(strs.trim(m.attr("maskUnits") catch ""), "userSpaceOnUse");
+    if user {
+        let rx = b.attr_length(m, "x", 'x', 16.0, -0.1 * b.vw);
+        let ry = b.attr_length(m, "y", 'y', 16.0, -0.1 * b.vh);
+        let rw = b.attr_length(m, "width", 'x', 16.0, 1.2 * b.vw);
+        let rh = b.attr_length(m, "height", 'y', 16.0, 1.2 * b.vh);
+        region = pathdata.Box.{ x0: rx, y0: ry, x1: rx + rw, y1: ry + rh };
+    } else if has_box {
+        let fx = number_or_percent(m.attr("x") catch "-10%") catch -0.1;
+        let fy = number_or_percent(m.attr("y") catch "-10%") catch -0.1;
+        let fw = number_or_percent(m.attr("width") catch "120%") catch 1.2;
+        let fh = number_or_percent(m.attr("height") catch "120%") catch 1.2;
+        region = pathdata.Box.{ x0: bbox.x0 + (fx * bw), y0: bbox.y0 + (fy * bh), x1: bbox.x0 + ((fx + fw) * bw),
+                                y1: bbox.y0 + ((fy + fh) * bh) };
+    }
+    let mut ct = t;
+    if strs.eq(strs.trim(m.attr("maskContentUnits") catch ""), "objectBoundingBox") {
+        if not has_box {
+            return;  // an empty mask: nothing shows
+        }
+        ct = draw.Affine.scaling(bw, bh).then(draw.Affine.translation(bbox.x0, bbox.y0)).then(t);
+    }
+    let clipped = not region.is_empty();
+    if clipped {
+        let mut rp = rect_path(region.x0, region.y0, region.x1 - region.x0, region.y1 - region.y0)!;
+        let mut dp = draw.Path.init();
+        pathdata.append_transformed(&mut dp, &rp, t) catch |er| {
+            rp.deinit();
+            dp.deinit();
+            return er;
+        };
+        rp.deinit();
+        let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+        it.path = b.store_path(&mut dp)!;
+        b.push_item(it)!;
+    }
+    b.masks.push(m)!;
+    defer b.masks.truncate(b.masks.len() - 1);
+    for c in m.children {
+        match c {
+            .Element(x) => { walk(b, x, &ms, ct, depth + 1)!; }
+            else => {}
+        }
+    }
+    if clipped {
+        close_group(b)!;
+    }
+}
+
+/// The clip path an element refers to, in the document's space (NO_PATH if
+/// the reference is not to a clipPath).
+fn clip_path(b: *mut Builder, id: []u8, t: draw.Affine, bbox: pathdata.Box, rule: *mut draw.FillRule) SvgError!usize {
+    let cp = b.ids.get(id) ?? return NO_PATH;
+    if not is_svg(cp) or not strs.eq(cp.local, "clipPath") {
+        return NO_PATH;
+    }
+    let mut m = draw.Affine.identity();
+    let tv = cp.attr("transform") catch "";
+    if tv.len > 0 {
+        css.parse_transform(tv, &mut m) catch {};
+    }
+    m = m.then(t);
+    if strs.eq(strs.trim(cp.attr("clipPathUnits") catch ""), "objectBoundingBox") {
+        let bw = bbox.x1 - bbox.x0;
+        let bh = bbox.y1 - bbox.y0;
+        if bbox.is_empty() {
+            return NO_PATH;
+        }
+        m = draw.Affine.scaling(bw, bh).then(draw.Affine.translation(bbox.x0, bbox.y0)).then(m);
+    }
+    let mut out = draw.Path.init();
+    let base = initial_style();
+    b.enter(cp) catch |e| {
+        out.deinit();
+        return e;
+    };
+    let cps = b.compute_style(cp, &base);
+    b.leave();
+    let cs = cps catch |e| {
+        out.deinit();
+        return e;
+    };
+    let mut first = true;
+    for c in cp.children {
+        match c {
+            .Element(x) => {
+                clip_child(b, x, &cs, m, &mut out, rule, &mut first) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+            }
+            else => {}
+        }
+    }
+    // the same path as last time (for another use of the element it clips): shared
+    let key = @int_from_ptr(cp);
+    let last = b.clips.get(key) ?? NO_PATH;
+    if (last != NO_PATH) and same_path(&b.doc.paths.items()[last], &out) {
+        out.deinit();
+        return last;
+    }
+    let idx = b.store_path(&mut out)!;
+    b.clips.put(key, idx)!;
+    return idx;
+}
+
+fn same_path(a: *draw.Path, b: *draw.Path) bool {
+    if (a.verbs.len() != b.verbs.len()) or (a.pts.len() != b.pts.len()) {
+        return false;
+    }
+    let av = a.verbs.items();
+    let bv = b.verbs.items();
+    for i in @as(usize, 0)..av.len {
+        if av[i] != bv[i] {
+            return false;
+        }
+    }
+    let ap = a.pts.items();
+    let bp = b.pts.items();
+    for i in @as(usize, 0)..ap.len {
+        if ap[i] != bp[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn clip_child(b: *mut Builder, x0: *xml.Element, parent: *Style, m: draw.Affine, out: *mut draw.Path,
+              rule: *mut draw.FillRule, first: *mut bool) SvgError!void {
+    let mut x = x0;
+    let mut t = m;
+    let mut ps = parent.*;
+    if not is_svg(x) {
+        return;
+    }
+    let tv = x.attr("transform") catch "";
+    if tv.len > 0 {
+        let mut local = draw.Affine.identity();
+        css.parse_transform(tv, &mut local) catch {};
+        t = local.then(t);
+    }
+    if strs.eq(x.local, "use") {
+        // a use of a shape
+        b.enter(x)!;
+        let us = b.compute_style(x, parent);
+        b.leave();
+        ps = us!;
+        let ux = b.attr_length(x, "x", 'x', ps.font_size, 0.0);
+        let uy = b.attr_length(x, "y", 'y', ps.font_size, 0.0);
+        t = draw.Affine.translation(ux, uy).then(t);
+        x = b.href(x) catch return;
+        let tv2 = x.attr("transform") catch "";
+        if tv2.len > 0 {
+            let mut local2 = draw.Affine.identity();
+            css.parse_transform(tv2, &mut local2) catch {};
+            t = local2.then(t);
+        }
+    }
+    b.enter(x)!;
+    let ss = b.compute_style(x, &ps);
+    b.leave();
+    let s = ss!;
+    if not s.display or not s.visible {
+        return;
+    }
+    let pi = element_path(b, x, &s)!;
+    if pi == NO_PATH {
+        return;
+    }
+    if first.* {
+        rule.* = s.clip_rule;
+        first.* = false;
+    }
+    let p = &b.doc.paths.items()[pi];
+    b.charge(p.pts.len() / 4)!;  // (and as much to compare it with the last)
+    pathdata.append_transformed(out, p, t)!;
+}
+
+fn group(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize, only_first: bool) SvgError!void {
+    let mut wrapped = begin_group(b, s, t, pathdata.Box.empty())!;
+    for c in e.children {
+        match c {
+            .Element(x) => {
+                walk(b, x, s, t, depth + 1)!;
+                if only_first and is_svg(x) and not is_hidden_element(x.local) {
+                    break;
+                }
+            }
+            else => {}
+        }
+    }
+    end_group(b, &mut wrapped, depth)!;
+}
+
+/// A rectangle's path, in t's space.
+fn rect_path(x: f64, y: f64, w: f64, h: f64) infer!draw.Path {
+    let mut p = draw.Path.init();
+    p.rect(x, y, w, h) catch |e| {
+        p.deinit();
+        return e;
+    };
+    return p;
+}
+
+/// A nested viewport (svg, or a symbol a use refers to): x, y, w, h in t's space.
+fn viewport(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, x: f64, y: f64, w: f64, h: f64,
+            depth: usize) SvgError!void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    let mut inner = draw.Affine.translation(x, y).then(t);
+    let mut vw = w;
+    let mut vh = h;
+    let vbv = e.attr("viewBox") catch "";
+    if vbv.len > 0 {
+        let vb = parse_view_box(vbv) catch [0.0, 0.0, 0.0, 0.0];
+        if vb[2] > 0.0 {
+            let fit = parse_fit(e.attr("preserveAspectRatio") catch "");
+            inner = viewbox_transform(vb, fit, w, h).then(inner);
+            vw = vb[2];
+            vh = vb[3];
+        }
+    }
+    // the viewport clips (overflow: hidden), and the element's opacity and clip apply
+    let overflow = strs.trim(e.attr("overflow") catch "hidden");
+    let clips = not strs.eq(overflow, "visible") and not strs.eq(overflow, "auto");
+    if clips {
+        let mut rp = rect_path(x, y, w, h)!;
+        let mut dp = draw.Path.init();
+        pathdata.append_transformed(&mut dp, &rp, t) catch |er| {
+            rp.deinit();
+            dp.deinit();
+            return er;
+        };
+        rp.deinit();
+        let idx = b.store_path(&mut dp)!;
+        let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+        it.path = idx;
+        b.push_item(it)!;
+    }
+    let mut g = begin_group(b, s, t, pathdata.Box.empty())!;
+    let saved_w = b.vw;
+    let saved_h = b.vh;
+    b.vw = vw;
+    b.vh = vh;
+    for c in e.children {
+        match c {
+            .Element(xe) => {
+                walk(b, xe, s, inner, depth + 1) catch |er| {
+                    b.vw = saved_w;
+                    b.vh = saved_h;
+                    return er;
+                };
+            }
+            else => {}
+        }
+    }
+    b.vw = saved_w;
+    b.vh = saved_h;
+    end_group(b, &mut g, depth)!;
+    if clips {
+        close_group(b)!;
+    }
+}
+
+fn use_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize) SvgError!void {
+    let target = b.href(e) catch return;
+    if (b.uses.len() >= 32) or not is_svg(target) {
+        return;
+    }
+    for u in b.uses.items() {
+        if u == e {
+            return;  // a use that contains itself
+        }
+    }
+    let x = b.attr_length(e, "x", 'x', s.font_size, 0.0);
+    let y = b.attr_length(e, "y", 'y', s.font_size, 0.0);
+    let t2 = draw.Affine.translation(x, y).then(t);
+    b.uses.push(e)!;
+    defer b.uses.truncate(b.uses.len() - 1);
+    let mut wrapped = begin_group(b, s, t, pathdata.Box.empty())!;
+    if strs.eq(target.local, "symbol") or strs.eq(target.local, "svg") {
+        b.enter(target)!;
+        let ts = b.compute_style(target, s);
+        b.leave();
+        let tst = ts!;
+        if tst.display {
+            let w = b.attr_length(e, "width", 'x', s.font_size, b.attr_length(target, "width", 'x', s.font_size, b.vw));
+            let h = b.attr_length(
+                e, "height", 'y', s.font_size, b.attr_length(target, "height", 'y', s.font_size, b.vh));
+            b.enter(target)!;
+            let r = viewport(b, target, &tst, t2, 0.0, 0.0, w, h, depth + 1);
+            b.leave();
+            r!;
+        }
+    } else {
+        walk(b, target, s, t2, depth + 1)!;
+    }
+    end_group(b, &mut wrapped, depth)!;
+}

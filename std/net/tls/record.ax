@@ -1,0 +1,548 @@
+// =============================================================================
+// std/net/tls/record.ax - TLS Conn state, record layer framing and encryption,
+// post-handshake messages, key updates, and handshake stepping (part of std/net/tls).
+// =============================================================================
+
+import "../../crypto/sha2.ax" as sha2;
+import "../../io.ax" as io;
+import "../../mem.ax" as mem;
+import "../../net.ax" as net;
+import "../../str.ax" as strs;
+import "../../time.ax" as time;
+
+// -----------------------------------------------------------------------------
+// Connections
+// -----------------------------------------------------------------------------
+
+pub nocopy struct Conn {
+    pub stream: net.TcpStream,
+    is_client: bool,
+    suite: Suite,
+    rd: Cipher,
+    wr: Cipher,
+    // records received: raw bytes in inbuf[..inlen]
+    inbuf: [16645]u8,
+    inlen: usize,
+    // the plaintext of the last record
+    plain: [16645]u8,
+    plain_start: usize,
+    plain_end: usize,
+    plain_type: u8,
+    // handshake bytes not yet made into messages
+    hs: strs.String,
+    hs_start: usize,
+    // application data received and not yet read
+    app_start: usize,
+    app_end: usize,
+    closed_read: bool,
+    pub closed_write: bool,
+    secret_rd: [48]u8,  // the current traffic secrets, for KeyUpdate
+    secret_wr: [48]u8,
+    alpn_selected: [32]u8,
+    alpn_len: usize,
+    sni: [256]u8,  // the server name (client: requested; server: received)
+    sni_len: usize,
+    established: bool,  // the handshake is over
+    pub deadline: i64,  // monotonic ns by which the handshake must be done (0: none)
+    v12: bool,          // TLS 1.2 records
+    rd_next: Cipher,    // (TLS 1.2) the read keys a ChangeCipherSpec switches to
+    ccs_expected: bool,
+    /// Reads fail with WouldBlock instead of waiting when the socket has
+    /// nothing to read (false: they wait, up to the socket's timeout).
+    pub nonblocking: bool,
+    srv: *mut ServerHs,  // a server's handshake in progress (has_srv)
+    has_srv: bool,
+
+    /// The protocol version in use: VERSION_1_3 or VERSION_1_2.
+    pub fn version(self: *Conn) u16 {
+        if self.v12 {
+            return VERSION_1_2;
+        }
+        return VERSION_1_3;
+    }
+
+    /// Reads decrypted application data; 0 means the peer closed the
+    /// connection (with close_notify).
+    pub fn read(self: *mut Conn, buf: []mut u8) TlsError!usize {
+        loop {
+            if self.app_start < self.app_end {
+                let n = @min(buf.len, self.app_end - self.app_start);
+                @mem_copy(buf[..n], self.plain[self.app_start..self.app_start + n]);
+                self.app_start += n;
+                return n;
+            }
+            if self.closed_read {
+                return 0;
+            }
+            let ty = self.read_record() catch |e| {
+                if (e == error.Closed) and self.closed_read {
+                    return 0;  // close_notify
+                }
+                return e;
+            };
+            if ty == CT_APPLICATION_DATA {
+                self.app_start = self.plain_start;
+                self.app_end = self.plain_end;
+            } else if ty == CT_HANDSHAKE {
+                self.post_handshake()!;
+            } else {
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
+        }
+    }
+
+    /// Encrypts and sends bytes (in records of at most 16 KiB).
+    pub fn write(self: *mut Conn, bytes: []u8) TlsError!usize {
+        if self.closed_write {
+            return error.Closed;
+        }
+        let n = @min(bytes.len, MAX_PLAINTEXT);
+        self.send_record(CT_APPLICATION_DATA, bytes[..n])!;
+        return n;
+    }
+
+    pub fn write_all(self: *mut Conn, bytes: []u8) TlsError!void {
+        let mut rest = bytes;
+        while rest.len > 0 {
+            let n = self.write(rest)!;
+            rest = rest[n..];
+        }
+    }
+
+    pub fn reader(self: *mut Conn) io.Reader {
+        return io.Reader.{ ctx: @ptr_cast(*mut void, self), read_fn: conn_read };
+    }
+
+    pub fn writer(self: *mut Conn) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: conn_write };
+    }
+
+    /// The protocol chosen by ALPN ("" if none).
+    pub fn protocol(self: *Conn) []u8 {
+        return self.alpn_selected[..self.alpn_len];
+    }
+
+    /// The server name: the one the client asked for (SNI).
+    pub fn server_name(self: *Conn) []u8 {
+        return self.sni[..self.sni_len];
+    }
+
+    /// Sends close_notify (once), and nothing more; reading goes on.
+    pub fn close_write(self: *mut Conn) void {
+        if not self.closed_write {
+            let a: [2]u8 = [1, ALERT_CLOSE_NOTIFY];
+            self.send_record(CT_ALERT, a[..]) catch {};
+            self.closed_write = true;
+        }
+    }
+
+    /// Sends close_notify, closes the socket and frees the connection.
+    pub fn close(self: *mut Conn) void {
+        if not self.closed_write {
+            let a: [2]u8 = [1, ALERT_CLOSE_NOTIFY];
+            self.send_record(CT_ALERT, a[..]) catch {};
+            self.closed_write = true;
+        }
+        self.stream.close();
+        self.drop_server_state();
+        self.hs.deinit();
+        mem.destroy(self);
+    }
+
+    fn drop_server_state(self: *mut Conn) void {
+        if self.has_srv {
+            self.srv.tr.deinit();
+            @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, self.srv), @size_of(ServerHs)), 0);  // (keys)
+            mem.destroy(self.srv);
+            self.has_srv = false;
+        }
+    }
+
+    // --- records -------------------------------------------------------------
+
+    /// Sends one record, encrypted once keys are set.
+    fn send_record(self: *mut Conn, ty: u8, data: []u8) TlsError!void {
+        let mut rec: [16645]u8 = [0; 16645];
+        if not self.wr.active {
+            rec[0] = ty;
+            rec[1] = 3;
+            rec[2] = 3;
+            rec[3] = @truncate(u8, data.len >> 8);
+            rec[4] = @truncate(u8, data.len);
+            @mem_copy(rec[5..5 + data.len], data);
+            stream_write_all(self.stream, rec[..5 + data.len])!;
+            return;
+        }
+        if self.v12 {
+            let clen = self.wr.seal12(ty, data, rec[5..])!;
+            rec[0] = ty;
+            rec[1] = 3;
+            rec[2] = 3;
+            rec[3] = @truncate(u8, clen >> 8);
+            rec[4] = @truncate(u8, clen);
+            stream_write_all(self.stream, rec[..5 + clen])!;
+            return;
+        }
+        // TLSInnerPlaintext: content || type, sealed
+        let mut inner: [16385]u8 = [0; 16385];
+        @mem_copy(inner[..data.len], data);
+        inner[data.len] = ty;
+        let clen = (data.len + 1) + 16;
+        rec[0] = CT_APPLICATION_DATA;
+        rec[1] = 3;
+        rec[2] = 3;
+        rec[3] = @truncate(u8, clen >> 8);
+        rec[4] = @truncate(u8, clen);
+        let hdr: [5]u8 = [rec[0], rec[1], rec[2], rec[3], rec[4]];
+        self.wr.seal(hdr[..], inner[..data.len + 1], rec[5..5 + clen])!;
+        stream_write_all(self.stream, rec[..5 + clen])!;
+    }
+
+    /// Reads bytes until inbuf holds at least n.
+    fn fill(self: *mut Conn, n: usize) TlsError!void {
+        while self.inlen < n {
+            // (a peer dripping a byte at a time must not hold a handshake open)
+            if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+                return error.TimedOut;
+            }
+            if self.nonblocking and (net.poll_one(self.stream.handle, net.READABLE, 0)! == 0) {
+                return error.WouldBlock;
+            }
+            let got = self.stream.read(self.inbuf[self.inlen..])!;
+            if got == 0 {
+                return error.Closed;
+            }
+            self.inlen += got;
+        }
+    }
+
+    /// Reads the next record (skipping ChangeCipherSpec) into plain; returns
+    /// its content type. Alerts end the connection here.
+    fn read_record(self: *mut Conn) TlsError!u8 {
+        loop {
+            self.fill(5)!;
+            let ty = self.inbuf[0];
+            let len = (@as(usize, self.inbuf[3]) << 8) | @as(usize, self.inbuf[4]);
+            // not TLS at all (plain HTTP, say): say so now rather than wait
+            // for a body that isn't coming
+            if (ty < CT_CHANGE_CIPHER_SPEC) or (ty > CT_APPLICATION_DATA) or (self.inbuf[1] != 3) {
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
+            if len > MAX_CIPHERTEXT {
+                return self.fail(ALERT_DECODE_ERROR, error.RecordOverflow);
+            }
+            self.fill(5 + len)!;
+            let hdr: [5]u8 = [self.inbuf[0], self.inbuf[1], self.inbuf[2], self.inbuf[3], self.inbuf[4]];
+            let body = self.inbuf[5..5 + len];
+            let mut real_type = ty;
+            let mut plen: usize = 0;
+            if (ty == CT_CHANGE_CIPHER_SPEC) and self.v12 {
+                // TLS 1.2: the peer's keys change here, between whole
+                // handshake messages
+                if not self.ccs_expected or (len != 1) or (body[0] != 1) or (self.hs_start != self.hs.len()) {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
+                self.ccs_expected = false;
+                self.rd = self.rd_next;
+                self.consume(5 + len);
+                continue;
+            }
+            if ty == CT_CHANGE_CIPHER_SPEC {
+                // compatibility mode: a single 0x01, dropped, and only during
+                // the handshake (RFC 8446 5)
+                if self.established or (len != 1) or (body[0] != 1) {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
+                self.consume(5 + len);
+                continue;
+            }
+            if self.rd.active and self.v12 {
+                let opened = self.rd.open12(ty, body, self.plain[..]);
+                self.consume(5 + len);
+                plen = opened catch |e| {
+                    return self.fail(ALERT_BAD_RECORD_MAC, e);
+                };
+                if plen > MAX_PLAINTEXT {
+                    return self.fail(ALERT_RECORD_OVERFLOW, error.RecordOverflow);
+                }
+            } else if self.rd.active {
+                if (ty != CT_APPLICATION_DATA) or (len < 17) {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
+                let n = len - 16;
+                let open_result = self.rd.open(hdr[..], body, self.plain[..n]);
+                self.consume(5 + len);
+                open_result catch |e| {
+                    return self.fail(ALERT_BAD_RECORD_MAC, e);
+                };
+                // strip the zero padding; the last non-zero byte is the type
+                let mut k = n;
+                while (k > 0) and (self.plain[k - 1] == 0) {
+                    k -= 1;
+                }
+                if k == 0 {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
+                real_type = self.plain[k - 1];
+                plen = k - 1;
+                if plen > MAX_PLAINTEXT {
+                    return self.fail(ALERT_RECORD_OVERFLOW, error.RecordOverflow);
+                }
+            } else {
+                if len > MAX_PLAINTEXT {
+                    return self.fail(ALERT_DECODE_ERROR, error.RecordOverflow);
+                }
+                @mem_copy(self.plain[..len], body);
+                plen = len;
+                self.consume(5 + len);
+            }
+            self.plain_start = 0;
+            self.plain_end = plen;
+            self.plain_type = real_type;
+            if real_type == CT_ALERT {
+                if plen < 2 {
+                    return error.DecodeError;
+                }
+                if self.plain[1] == ALERT_CLOSE_NOTIFY {
+                    self.closed_read = true;
+                    return error.Closed;
+                }
+                self.closed_read = true;
+                self.closed_write = true;
+                return error.AlertReceived;
+            }
+            if (plen == 0) and (real_type != CT_APPLICATION_DATA) {
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
+            return real_type;
+        }
+    }
+
+    fn consume(self: *mut Conn, n: usize) void {
+        let rest = self.inlen - n;
+        if rest > 0 {
+            @mem_copy(self.inbuf[..rest], self.inbuf[n..self.inlen]);
+        }
+        self.inlen = rest;
+    }
+
+    /// Sends a fatal alert (best effort) and returns e.
+    fn fail(self: *mut Conn, alert: u8, e: TlsError) TlsError {
+        if not self.closed_write {
+            let a: [2]u8 = [2, alert];
+            self.send_record(CT_ALERT, a[..]) catch {};
+            self.closed_write = true;
+        }
+        return e;
+    }
+
+    // --- handshake messages --------------------------------------------------
+
+    /// The next handshake message (header included), reading records as
+    /// needed. The slice is valid until the next call.
+    fn next_message(self: *mut Conn) TlsError![]u8 {
+        loop {
+            let avail = self.hs.len() - self.hs_start;
+            if avail >= 4 {
+                let b = self.hs.bytes()[self.hs_start..];
+                let len = ((@as(usize, b[1]) << 16) | (@as(usize, b[2]) << 8)) | @as(usize, b[3]);
+                if len > 65536 {
+                    return self.fail(ALERT_DECODE_ERROR, error.DecodeError);
+                }
+                if avail >= (4 + len) {
+                    let msg = b[..4 + len];
+                    self.hs_start += 4 + len;
+                    return msg;
+                }
+            }
+            if self.hs_start == self.hs.len() {
+                self.hs.clear();
+                self.hs_start = 0;
+            }
+            let ty = self.read_record()!;
+            if ty != CT_HANDSHAKE {
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
+            self.hs.push_str(self.plain[self.plain_start..self.plain_end])!;
+        }
+    }
+
+    /// The next message, which must have the given type.
+    fn expect_message(self: *mut Conn, ty: u8) TlsError![]u8 {
+        let m = self.next_message()!;
+        if m[0] != ty {
+            return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+        }
+        return m;
+    }
+
+    fn send_handshake(self: *mut Conn, msg: []u8) TlsError!void {
+        let mut rest = msg;
+        while rest.len > 0 {
+            let n = @min(rest.len, MAX_PLAINTEXT);
+            self.send_record(CT_HANDSHAKE, rest[..n])!;
+            rest = rest[n..];
+        }
+    }
+
+    /// Handshake messages after the handshake: tickets and key updates.
+    fn post_handshake(self: *mut Conn) TlsError!void {
+        self.hs.push_str(self.plain[self.plain_start..self.plain_end])!;
+        loop {
+            let avail = self.hs.len() - self.hs_start;
+            if avail < 4 {
+                break;
+            }
+            let b = self.hs.bytes()[self.hs_start..];
+            let len = ((@as(usize, b[1]) << 16) | (@as(usize, b[2]) << 8)) | @as(usize, b[3]);
+            if len > 65536 {
+                return self.fail(ALERT_DECODE_ERROR, error.DecodeError);
+            }
+            if avail < (4 + len) {
+                break;
+            }
+            let ty = b[0];
+            let body = b[4..4 + len];
+            self.hs_start += 4 + len;
+            if self.v12 {
+                if (ty == HS_HELLO_REQUEST) and self.is_client and (len == 0) {
+                    // a server asking to renegotiate: refused with a
+                    // warning, and the connection goes on
+                    let a: [2]u8 = [1, ALERT_NO_RENEGOTIATION];
+                    self.send_record(CT_ALERT, a[..])!;
+                    continue;
+                }
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
+            if (ty == HS_NEW_SESSION_TICKET) and self.is_client {
+                continue;  // no resumption (and only servers send tickets)
+            }
+            if ty == HS_KEY_UPDATE {
+                if (len != 1) or (body[0] > 1) {
+                    return self.fail(ALERT_DECODE_ERROR, error.DecodeError);
+                }
+                // the key changes here: nothing more may share its record
+                if self.hs_start != self.hs.len() {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
+                let requested = body[0] == 1;
+                self.update_read_key()!;
+                if requested {
+                    let msg: [5]u8 = [HS_KEY_UPDATE, 0, 0, 1, 0];
+                    self.send_record(CT_HANDSHAKE, msg[..])!;
+                    self.update_write_key()!;
+                }
+                continue;
+            }
+            return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+        }
+        // keep only the unfinished message (the buffer cannot grow without bound)
+        let rest = self.hs.len() - self.hs_start;
+        if (self.hs_start > 0) and (rest > 0) {
+            let bytes = self.hs.bytes_mut();
+            @mem_copy(bytes[..rest], bytes[self.hs_start..self.hs.len()]);
+        }
+        self.hs.truncate(rest);
+        self.hs_start = 0;
+    }
+
+    /// Switches to new read keys during the handshake: handshake messages
+    /// must not straddle the change (RFC 8446 5.1).
+    fn handshake_read_key(self: *mut Conn, secret: []u8) TlsError!void {
+        if self.hs_start != self.hs.len() {
+            return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+        }
+        self.rd.set(self.suite, secret)!;
+    }
+
+    fn update_read_key(self: *mut Conn) TlsError!void {
+        let n = sha2.digest_size(self.suite.hash);
+        let mut next: [48]u8 = [0; 48];
+        expand_label(self.suite.hash, self.secret_rd[..n], "traffic upd", "", next[..n]);
+        self.secret_rd = next;
+        self.rd.set(self.suite, self.secret_rd[..n])!;
+    }
+
+    fn update_write_key(self: *mut Conn) TlsError!void {
+        let n = sha2.digest_size(self.suite.hash);
+        let mut next: [48]u8 = [0; 48];
+        expand_label(self.suite.hash, self.secret_wr[..n], "traffic upd", "", next[..n]);
+        self.secret_wr = next;
+        self.wr.set(self.suite, self.secret_wr[..n])!;
+    }
+
+    /// Asks the peer to update its keys too (and updates ours).
+    /// Runs a handshake from server_start as far as the data received
+    /// allows; true once it is done. With nonblocking set, fails with
+    /// WouldBlock when it must wait for the peer: call it again when the
+    /// socket is readable. Any other failure ends the handshake (close()
+    /// the Conn).
+    pub fn handshake_step(self: *mut Conn) TlsError!bool {
+        while not self.established {
+            if not self.has_srv {
+                return error.InvalidArgument;
+            }
+            let st = self.srv;
+            if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+                return error.TimedOut;
+            }
+            if st.phase == PHASE_HELLO {
+                srv_hello(self, st)!;
+            } else if st.phase == PHASE_HELLO2 {
+                srv_hello2(self, st)!;
+            } else if st.phase == PHASE_FINISHED {
+                srv13_finished(self, st)!;
+            } else if st.phase == PHASE_KEY_EXCHANGE12 {
+                srv12_key_exchange(self, st)!;
+            } else {
+                srv12_finished(self, st)!;
+            }
+        }
+        self.drop_server_state();
+        self.deadline = 0;
+        return true;
+    }
+
+    pub fn key_update(self: *mut Conn) TlsError!void {
+        if self.v12 {
+            return error.Unsupported;  // a TLS 1.3 message
+        }
+        let msg: [5]u8 = [HS_KEY_UPDATE, 0, 0, 1, 1];
+        self.send_record(CT_HANDSHAKE, msg[..])!;
+        self.update_write_key()!;
+    }
+}
+
+fn stream_write_all(s: net.TcpStream, bytes: []u8) TlsError!void {
+    let mut rest = bytes;
+    while rest.len > 0 {
+        let n = s.write(rest)!;
+        if n == 0 {
+            return error.IoError;
+        }
+        rest = rest[n..];
+    }
+}
+
+fn conn_read(ctx: *mut void, buf: []mut u8) !usize {
+    let c = @ptr_cast(*mut Conn, ctx);
+    return c.read(buf);
+}
+
+fn conn_write(ctx: *mut void, bytes: []u8) !usize {
+    let c = @ptr_cast(*mut Conn, ctx);
+    return c.write(bytes);
+}
+
+fn new_conn(stream: net.TcpStream, is_client: bool) TlsError!*mut Conn {
+    // most fields are buffers: start from zeros
+    let p = mem.new_zeroed.[Conn]()!;
+    p.stream = stream;
+    p.is_client = is_client;
+    p.suite = Suite.{ id: 0, hash: sha2.Algorithm.SHA256, key_len: 0, v12: false, ecdsa: false };
+    p.rd = Cipher.none();
+    p.wr = Cipher.none();
+    p.rd_next = Cipher.none();
+    p.hs = strs.String.init();
+    return p;
+}
