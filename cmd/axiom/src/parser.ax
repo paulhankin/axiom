@@ -22,20 +22,6 @@ fn peek(P: *Parser) *lx.Token {
     return &P.t[P.pos];
 }
 
-fn peek2(P: *Parser) *lx.Token {
-    if (P.pos + 1) < P.n {
-        return &P.t[P.pos + 1];
-    }
-    return &P.t[P.n - 1];
-}
-
-fn peek3(P: *Parser) *lx.Token {
-    if (P.pos + 2) < P.n {
-        return &P.t[P.pos + 2];
-    }
-    return &P.t[P.n - 1];
-}
-
 fn pk(P: *Parser) lx.TokKind {
     return P.t[P.pos].kind;
 }
@@ -192,33 +178,18 @@ fn sp_from(P: *Parser, start: u.Span) u.Span {
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-// `inline` is a keyword only before `fn` (spec §9.5)
-fn at_inline(P: *Parser) bool {
-    return (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "inline") and (peek2(P).kind == lx.KW_FN);
-}
-
-fn at_field(P: *Parser) bool {
-    if pk(P) == lx.KW_PUB {
-        let t2 = peek2(P);
-        if t2.kind != lx.TK_IDENT {
-            return false;
-        }
-        if u.str_eq(t2.name, "inline") and (peek3(P).kind == lx.KW_FN) {
-            return false;
-        }
-        return true;
-    }
-    return (pk(P) == lx.TK_IDENT) and not at_inline(P);
+fn parse_field(P: *mut Parser, is_pub: bool) ast.Field {
+    let id = expect_ident(P);
+    _ = expect(P, lx.TK_COLON);
+    let te = parse_type(P);
+    return ast.Field.{ name: id.name, te: te, span: id.span, ty: u.nil.[ast.Type](), is_pub: is_pub };
 }
 
 fn parse_field_list(P: *mut Parser, out: *mut u.List.[ast.Field]) void {
     // Field ( "," Field )* ","?
-    while at_field(P) {
+    while (pk(P) == lx.KW_PUB) or (pk(P) == lx.TK_IDENT) {
         let is_pub = accept(P, lx.KW_PUB);
-        let id = expect_ident(P);
-        _ = expect(P, lx.TK_COLON);
-        let te = parse_type(P);
-        out.push(ast.Field.{ name: id.name, te: te, span: id.span, ty: u.nil.[ast.Type](), is_pub: is_pub });
+        out.push(parse_field(P, is_pub));
         if not accept(P, lx.TK_COMMA) {
             break;
         }
@@ -244,12 +215,11 @@ fn parse_generic_arg_list(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) 
     _ = expect(P, lx.TK_RBRACKET);
 }
 
-// The named type `n`, unqualified and without arguments or member so far.
-fn named_type(n: *lx.Token) ast.NamedType {
+fn named_type_from(name: []u8, span: u.Span) ast.NamedType {
     return ast.NamedType.{
         qual: u.nosym(),
-        name: n.name,
-        name_span: n.span,
+        name: name,
+        name_span: span,
         args: u.List.[*mut ast.TypeExpr].empty(),
         has_args: false,
         has_member: false,
@@ -260,40 +230,73 @@ fn named_type(n: *lx.Token) ast.NamedType {
     };
 }
 
+// The named type `n`, unqualified and without arguments or member so far.
+fn named_type(n: *lx.Token) ast.NamedType {
+    return named_type_from(n.name, n.span);
+}
+
 // An array's length, after '[': an integer literal, a name (a const or a
 // const parameter, perhaps qualified), or any other constant expression.
 fn parse_array_len(P: *mut Parser) ?*mut ast.TypeExpr {
-    if (pk(P) == lx.TK_INT) and (peek2(P).kind == lx.TK_RBRACKET) {
-        let n = advance(P);
-        return ast.new_te(ast.TypeShape.IntLit(n.ival), n.span);
-    }
-    if pk(P) == lx.TK_IDENT {
-        let qualified = (peek2(P).kind == lx.TK_DOT) and (peek3(P).kind == lx.TK_IDENT);
-        if (peek2(P).kind == lx.TK_RBRACKET) or qualified {
-            let save = P.pos;
-            let n = advance(P);
-            let mut nt = named_type(n);
-            let mut sp = n.span;
-            if qualified {
-                _ = advance(P);
-                let m = advance(P);
-                nt.qual = nt.name;
-                nt.name = m.name;
-                nt.name_span = m.span;
-                sp = u.span_join(n.span, m.span);
-            }
-            if pk(P) == lx.TK_RBRACKET {
-                return ast.new_te(ast.TypeShape.Named(nt), sp);
-            }
-            P.pos = save;  // an expression after all
-        }
-    }
     if pk(P) == lx.TK_RBRACKET {
         syntax_error(P, "array length");
         return .none;
     }
     let e = parse_expr(P);
+    if not e.parens {
+        if e.kind == ast.E_INT {
+            return ast.new_te(ast.TypeShape.IntLit(ast.ival_of(e)), e.span);
+        }
+        if e.kind == ast.E_IDENT {
+            return ast.new_te(ast.TypeShape.Named(named_type_from(e.name, e.span)), e.span);
+        }
+        if (e.kind == ast.E_FIELD) and u.notnil(e.a) and (e.a.kind == ast.E_IDENT) and not e.a.parens {
+            let mut nt = named_type_from(e.name, ast.name_span_of(e));
+            nt.qual = e.a.name;
+            return ast.new_te(ast.TypeShape.Named(nt), u.span_join(e.a.span, nt.name_span));
+        }
+    }
     return ast.new_te(ast.TypeShape.ConstExpr(e), e.span);
+}
+
+fn parse_inline_errset_from(P: *mut Parser, lsp: u.Span, first: ?*lx.Token) *mut ast.TypeExpr {
+    let mut ies = ast.InlineErrSet.{
+        names: u.List.[[]u8].empty(),
+        spans: u.List.[u.Span].empty(),
+    };
+    let mut more = true;
+    if let .some(f) = first {
+        ies.names.push(f.name);
+        ies.spans.push(f.span);
+        P.mod.inline_error_names.push(f.name);
+        more = accept(P, lx.TK_COMMA);
+    }
+    while more and (pk(P) == lx.TK_IDENT) {
+        let id = advance(P);
+        ies.names.push(id.name);
+        ies.spans.push(id.span);
+        P.mod.inline_error_names.push(id.name);
+        more = accept(P, lx.TK_COMMA);
+    }
+    _ = expect(P, lx.TK_RBRACE);
+    let set_te = ast.new_te(ast.TypeShape.ErrSetInline(ies), sp_from(P, lsp));
+    if accept(P, lx.TK_BANG) {
+        let eu = ast.ErrUnionType.{ set: set_te, elem: parse_type(P), is_infer: false };
+        return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, lsp));
+    }
+    return set_te;
+}
+
+fn parse_named_member(P: *mut Parser, nt: *mut ast.NamedType) void {
+    let mem = expect_ident(P);
+    nt.has_member = true;
+    nt.member = mem.name;
+    nt.member_span = mem.span;
+    if accept(P, lx.TK_DOT) {
+        _ = expect(P, lx.TK_LBRACKET);
+        nt.has_member_args = true;
+        parse_generic_arg_list(P, &mut nt.member_args);
+    }
 }
 
 fn parse_type(P: *mut Parser) *mut ast.TypeExpr {
@@ -318,26 +321,7 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
     }
     if k == lx.TK_LBRACE {
         _ = advance(P);
-        let mut ies = ast.InlineErrSet.{
-            names: u.List.[[]u8].empty(),
-            spans: u.List.[u.Span].empty(),
-        };
-        while pk(P) == lx.TK_IDENT {
-            let id = expect_ident(P);
-            ies.names.push(id.name);
-            ies.spans.push(id.span);
-            P.mod.inline_error_names.push(id.name);
-            if not accept(P, lx.TK_COMMA) {
-                break;
-            }
-        }
-        _ = expect(P, lx.TK_RBRACE);
-        let set_te = ast.new_te(ast.TypeShape.ErrSetInline(ies), sp_from(P, start));
-        if accept(P, lx.TK_BANG) {
-            let eu = ast.ErrUnionType.{ set: set_te, elem: parse_type(P), is_infer: false };
-            return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
-        }
-        return set_te;
+        return parse_inline_errset_from(P, start, .none);
     }
     if k == lx.TK_QUESTION {
         _ = advance(P);
@@ -401,57 +385,45 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
         _ = advance(P);
         return ast.new_te(ast.TypeShape.Prim(t.prim), start);
     }
+    if k == lx.KW_INFER {
+        _ = advance(P);
+        _ = expect(P, lx.TK_BANG);
+        let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: parse_type(P), is_infer: true };
+        return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
+    }
     if k == lx.TK_IDENT {
-        if u.str_eq(t.name, "infer") and (peek2(P).kind == lx.TK_BANG) {
-            _ = advance(P);
-            _ = advance(P);
-            let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: parse_type(P), is_infer: true };
-            return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
-        }
         _ = advance(P);
         let mut nt = named_type(t);
         // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
         let mut saw_dot = false;
-        if pk(P) == lx.TK_DOT {
-            let k2 = peek2(P).kind;
-            if k2 == lx.TK_IDENT {
-                _ = advance(P);
-                let m = advance(P);
-                nt.qual = nt.name;
-                nt.name = m.name;
-                nt.name_span = m.span;
-                saw_dot = true;
-                if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_LBRACKET) {
-                    _ = advance(P);
-                    _ = advance(P);
-                    nt.has_args = true;
-                    parse_generic_arg_list(P, &mut nt.args);
-                }
-            } else if k2 == lx.TK_LBRACKET {
-                _ = advance(P);
+        if accept(P, lx.TK_DOT) {
+            saw_dot = true;
+            if pk(P) == lx.TK_LBRACKET {
                 _ = advance(P);
                 nt.has_args = true;
                 parse_generic_arg_list(P, &mut nt.args);
-                saw_dot = true;
+            } else {
+                let m = expect_ident(P);
+                nt.qual = nt.name;
+                nt.name = m.name;
+                nt.name_span = m.span;
+                if accept(P, lx.TK_DOT) {
+                    if pk(P) == lx.TK_LBRACKET {
+                        _ = advance(P);
+                        nt.has_args = true;
+                        parse_generic_arg_list(P, &mut nt.args);
+                    } else {
+                        parse_named_member(P, &mut nt);
+                    }
+                }
             }
         }
-        if saw_dot and (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_IDENT) {
-            _ = advance(P);
-            let mem = advance(P);
-            nt.has_member = true;
-            nt.member = mem.name;
-            nt.member_span = mem.span;
-            if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_LBRACKET) {
-                _ = advance(P);
-                _ = advance(P);
-                nt.has_member_args = true;
-                parse_generic_arg_list(P, &mut nt.member_args);
-            }
+        if saw_dot and not nt.has_member and accept(P, lx.TK_DOT) {
+            parse_named_member(P, &mut nt);
         }
         let named = ast.new_te(ast.TypeShape.Named(nt), sp_from(P, start));
         // Set!T: an error union of the error set named
-        if pk(P) == lx.TK_BANG {
-            _ = advance(P);
+        if accept(P, lx.TK_BANG) {
             let eu = ast.ErrUnionType.{ set: named, elem: parse_type(P), is_infer: false };
             return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
         }
@@ -638,10 +610,10 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     return ast.new_expr(ast.E_INT, start);
 }
 
-fn parse_postfix(P: *mut Parser) *mut ast.Expr {
+fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
     let outer = P.high;
     P.high = P.depth;
-    let mut e = parse_primary(P);
+    let mut e = e0;
     let start = e.span;
     let mut links: usize = 0;
     loop {
@@ -747,6 +719,10 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
         return ast.new_expr(ast.E_INT, start);
     }
     return e;
+}
+
+fn parse_postfix(P: *mut Parser) *mut ast.Expr {
+    return parse_postfix_from(P, parse_primary(P));
 }
 
 fn parse_unary(P: *mut Parser) *mut ast.Expr {
@@ -890,10 +866,7 @@ fn reduce(out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[lx.TokKind]) void {
     out.push(b);
 }
 
-fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
-    let outer = P.high;
-    P.high = P.depth;
-    let first = parse_unary(P);
+fn parse_binexpr_rest(P: *mut Parser, first: *mut ast.Expr, outer: usize) *mut ast.Expr {
     if op_family(pk(P)) == F_NONE {
         if outer > P.high {
             P.high = outer;
@@ -935,8 +908,13 @@ fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
     return res;
 }
 
-fn parse_expr(P: *mut Parser) *mut ast.Expr {
-    let e = parse_binexpr(P);
+fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
+    let outer = P.high;
+    P.high = P.depth;
+    return parse_binexpr_rest(P, parse_unary(P), outer);
+}
+
+fn parse_expr_rest(P: *mut Parser, e: *mut ast.Expr) *mut ast.Expr {
     let is_catch = pk(P) == lx.KW_CATCH;
     let is_orelse = pk(P) == lx.TK_QQ;
     if not is_catch and not is_orelse {
@@ -994,9 +972,41 @@ fn parse_expr(P: *mut Parser) *mut ast.Expr {
     return c;
 }
 
+fn parse_expr(P: *mut Parser) *mut ast.Expr {
+    return parse_expr_rest(P, parse_binexpr(P));
+}
+
+fn parse_expr_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
+    let outer = P.high;
+    P.high = P.depth;
+    let mut first = e0;
+    if not enter(P) {
+        leave(P);
+        first = ast.new_expr(ast.E_INT, e0.span);
+    } else {
+        first = parse_postfix_from(P, e0);
+        leave(P);
+    }
+    return parse_expr_rest(P, parse_binexpr_rest(P, first, outer));
+}
+
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
+fn parse_block_rest(P: *mut Parser, b: *mut ast.Stmt, start: u.Span) void {
+    while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) {
+        let before = P.pos;
+        if let .some(s) = parse_stmt(P) {
+            b.stmts.push(s);
+        }
+        if P.pos == before {
+            _ = advance(P);  // guarantee progress
+        }
+    }
+    _ = expect(P, lx.TK_RBRACE);
+    b.span = sp_from(P, start);
+}
+
 fn parse_block(P: *mut Parser) *mut ast.Stmt {
     if not enter(P) {
         leave(P);
@@ -1011,24 +1021,12 @@ fn parse_block_in(P: *mut Parser) *mut ast.Stmt {
     let start = peek(P).span;
     let b = ast.new_stmt(ast.S_BLOCK, start);
     _ = expect(P, lx.TK_LBRACE);
-    while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) {
-        let before = P.pos;
-        if let .some(s) = parse_stmt(P) {
-            b.stmts.push(s);
-        }
-        if P.pos == before {
-            _ = advance(P);  // guarantee progress
-        }
-    }
-    _ = expect(P, lx.TK_RBRACE);
-    b.span = sp_from(P, start);
+    parse_block_rest(P, b, start);
     return b;
 }
 
 // ExprStmt ::= Expr ( AssignOp Expr )? ";"
-fn parse_expr_stmt(P: *mut Parser) *mut ast.Stmt {
-    let start = peek(P).span;
-    let e = parse_expr(P);
+fn parse_expr_stmt_from(P: *mut Parser, start: u.Span, e: *mut ast.Expr) *mut ast.Stmt {
     let mut k = ast.S_EXPR;
     if lx.is_assign_op(pk(P)) {
         k = ast.S_ASSIGN;
@@ -1047,6 +1045,11 @@ fn parse_expr_stmt(P: *mut Parser) *mut ast.Stmt {
     }
     s.span = sp_from(P, start);
     return s;
+}
+
+fn parse_expr_stmt(P: *mut Parser) *mut ast.Stmt {
+    let start = peek(P).span;
+    return parse_expr_stmt_from(P, start, parse_expr(P));
 }
 
 // Pattern ::= "." IDENT ( "(" IDENT ")" )? | "error" "." IDENT | "-"? INT_LIT | CHAR_LIT
@@ -1188,49 +1191,10 @@ fn parse_if(P: *mut Parser) ?*mut ast.Stmt {
     return s;
 }
 
-fn parse_stmt(P: *mut Parser) ?*mut ast.Stmt {
+fn parse_loop_stmt(P: *mut Parser) ?*mut ast.Stmt {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
-    if (k == lx.TK_IDENT) and (peek2(P).kind == lx.TK_COLON) {
-        // a loop label: `name: while|loop|for`
-        let k3 = peek3(P).kind;
-        if (k3 == lx.KW_WHILE) or (k3 == lx.KW_LOOP) or (k3 == lx.KW_FOR) {
-            let id = advance(P);
-            _ = advance(P);
-            let s = parse_stmt(P) ?? return .none;
-            ast.stmt_ext(s).label = id.name;
-            ast.stmt_ext(s).label_span = id.span;
-            s.span = sp_from(P, start);
-            return s;
-        }
-    }
-    if k == lx.KW_LET {
-        _ = advance(P);
-        let s = ast.new_stmt(ast.S_LET, start);
-        s.is_mut = accept(P, lx.KW_MUT);
-        let id = expect_ident(P);
-        s.name = id.name;
-        s.name_span = id.span;
-        if accept(P, lx.TK_COLON) {
-            s.te = parse_type(P);
-        }
-        _ = expect(P, lx.TK_EQ);
-        // `undefined` (contextual) as the whole initializer: the variable's bytes left
-        // unspecified until written
-        s.undef = (peek(P).kind == lx.TK_IDENT) and u.str_eq(peek(P).name, "undefined") and
-                  (peek2(P).kind == lx.TK_SEMI);
-        s.e = parse_expr(P);
-        if not accept(P, lx.TK_SEMI) {
-            syntax_error(P, "';'");
-            sync_stmt(P);
-        }
-        s.span = sp_from(P, start);
-        return s;
-    }
-    if k == lx.KW_IF {
-        return parse_if(P);
-    }
     if k == lx.KW_WHILE {
         _ = advance(P);
         let s = ast.new_stmt(ast.S_WHILE, start);
@@ -1264,6 +1228,66 @@ fn parse_stmt(P: *mut Parser) ?*mut ast.Stmt {
         s.body = parse_block(P);
         s.span = sp_from(P, start);
         return s;
+    }
+    syntax_error(P, "'while', 'loop' or 'for' after label");
+    sync_stmt(P);
+    return .none;
+}
+
+fn parse_stmt_from_ident(P: *mut Parser, id: *lx.Token) ?*mut ast.Stmt {
+    let start = id.span;
+    if accept(P, lx.TK_COLON) {
+        let s = parse_loop_stmt(P) ?? return .none;
+        ast.stmt_ext(s).label = id.name;
+        ast.stmt_ext(s).label_span = id.span;
+        s.span = sp_from(P, start);
+        return s;
+    }
+    let e0 = ast.new_expr(ast.E_IDENT, id.span);
+    e0.name = id.name;
+    return parse_expr_stmt_from(P, start, parse_expr_from(P, e0));
+}
+
+fn parse_stmt(P: *mut Parser) ?*mut ast.Stmt {
+    let t = peek(P);
+    let start = t.span;
+    let k = t.kind;
+    if k == lx.TK_IDENT {
+        return parse_stmt_from_ident(P, advance(P));
+    }
+    if k == lx.KW_LET {
+        _ = advance(P);
+        let s = ast.new_stmt(ast.S_LET, start);
+        s.is_mut = accept(P, lx.KW_MUT);
+        let id = expect_ident(P);
+        s.name = id.name;
+        s.name_span = id.span;
+        if accept(P, lx.TK_COLON) {
+            s.te = parse_type(P);
+        }
+        _ = expect(P, lx.TK_EQ);
+        // `undefined` as the whole initializer: the variable's bytes left
+        // unspecified until written
+        if pk(P) == lx.KW_UNDEFINED {
+            let ut = advance(P);
+            s.undef = true;
+            s.e = ast.new_expr(ast.E_IDENT, ut.span);
+            s.e.name = u.intern("undefined");
+        } else {
+            s.e = parse_expr(P);
+        }
+        if not accept(P, lx.TK_SEMI) {
+            syntax_error(P, "';'");
+            sync_stmt(P);
+        }
+        s.span = sp_from(P, start);
+        return s;
+    }
+    if k == lx.KW_IF {
+        return parse_if(P);
+    }
+    if (k == lx.KW_WHILE) or (k == lx.KW_LOOP) or (k == lx.KW_FOR) {
+        return parse_loop_stmt(P);
     }
     if k == lx.KW_MATCH {
         _ = advance(P);
@@ -1451,11 +1475,10 @@ fn parse_params(P: *mut Parser, d: *mut ast.Decl) void {
             d.abi_span = advance(P).span;
             break;
         }
-        let mut is_noalias = false;
+        let is_noalias = accept(P, lx.KW_NOALIAS);
         let mut noalias_span = u.mkspan(0, 0, 0);
-        if (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "noalias") and (peek2(P).kind == lx.TK_IDENT) {
-            is_noalias = true;
-            noalias_span = advance(P).span;
+        if is_noalias {
+            noalias_span = prev_span(P);
         }
         let id = expect_ident(P);
         _ = expect(P, lx.TK_COLON);
@@ -1469,23 +1492,25 @@ fn parse_params(P: *mut Parser, d: *mut ast.Decl) void {
     _ = expect(P, lx.TK_RPAREN);
 }
 
-fn at_inline_errset(P: *Parser) bool {
-    if pk(P) != lx.TK_LBRACE {
-        return false;
-    }
-    let mut i = P.pos + 1;
-    if (i < P.n) and (P.t[i].kind == lx.TK_RBRACE) {
-        return ((i + 1) < P.n) and (P.t[i + 1].kind == lx.TK_BANG);
-    }
-    while (i < P.n) and (P.t[i].kind == lx.TK_IDENT) {
-        i += 1;
-        if (i < P.n) and (P.t[i].kind == lx.TK_COMMA) {
-            i += 1;
-        } else {
-            break;
+fn missing_ret_error(sp: u.Span) void {
+    let dgn = dg.err(sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
+    let fx = dg.fix(dgn, "declare a void return type", "suggestion");
+    dg.edit(fx, u.mkspan(sp.file, sp.start, sp.start), "void ");
+}
+
+fn parse_missing_ret_body(P: *mut Parser, lsp: u.Span, first: ?*lx.Token) *mut ast.Stmt {
+    missing_ret_error(lsp);
+    let b = ast.new_stmt(ast.S_BLOCK, lsp);
+    if enter(P) {
+        if let .some(f) = first {
+            if let .some(s0) = parse_stmt_from_ident(P, f) {
+                b.stmts.push(s0);
+            }
         }
+        parse_block_rest(P, b, lsp);
     }
-    return (i < P.n) and (P.t[i].kind == lx.TK_RBRACE);
+    leave(P);
+    return b;
 }
 
 fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut ast.Decl {
@@ -1496,11 +1521,39 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
     parse_decl_name(P, d);
     parse_generic_params(P, d);
     parse_params(P, d);
-    if (pk(P) == lx.TK_LBRACE) and not at_inline_errset(P) {
-        let sp = peek(P).span;
-        let dgn = dg.err(sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
-        let fx = dg.fix(dgn, "declare a void return type", "suggestion");
-        dg.edit(fx, u.mkspan(sp.file, sp.start, sp.start), "void ");
+    if pk(P) == lx.TK_LBRACE {
+        let lsp = advance(P).span;
+        if pk(P) == lx.TK_RBRACE {
+            _ = advance(P);
+            let set_sp = sp_from(P, lsp);
+            if accept(P, lx.TK_BANG) {
+                let ies = ast.InlineErrSet.{
+                    names: u.List.[[]u8].empty(),
+                    spans: u.List.[u.Span].empty(),
+                };
+                let set_te = ast.new_te(ast.TypeShape.ErrSetInline(ies), set_sp);
+                let eu = ast.ErrUnionType.{ set: set_te, elem: parse_type(P), is_infer: false };
+                d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, lsp));
+            } else {
+                missing_ret_error(lsp);
+                d.body = ast.new_stmt(ast.S_BLOCK, set_sp);
+                d.span = sp_from(P, start);
+                return d;
+            }
+        } else if pk(P) == lx.TK_IDENT {
+            let first = advance(P);
+            if (pk(P) == lx.TK_COMMA) or (pk(P) == lx.TK_RBRACE) {
+                d.ret_te = parse_inline_errset_from(P, lsp, first);
+            } else {
+                d.body = parse_missing_ret_body(P, lsp, first);
+                d.span = sp_from(P, start);
+                return d;
+            }
+        } else {
+            d.body = parse_missing_ret_body(P, lsp, .none);
+            d.span = sp_from(P, start);
+            return d;
+        }
     } else {
         d.ret_te = parse_type(P);
     }
@@ -1514,9 +1567,20 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
 
 fn parse_fn_inline(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut ast.Decl {
     let is = peek(P).span;
-    let inl = at_inline(P);
-    if inl {
-        _ = advance(P);
+    let inl = accept(P, lx.KW_INLINE);
+    if inl and (pk(P) != lx.KW_FN) {
+        _ = expect(P, lx.KW_FN);
+        sync_stmt(P);
+        let d = new_decl(P, ast.D_FN, start);
+        d.is_pub = is_pub;
+        d.is_export = is_export;
+        d.is_inline = true;
+        d.inline_span = is;
+        d.name = u.intern("<error>");
+        d.name_span = is;
+        d.ret_te = ast.new_te(ast.TypeShape.Invalid, is);
+        d.body = ast.new_stmt(ast.S_BLOCK, is);
+        return d;
     }
     let d = parse_fn(P, start, is_pub, is_export);
     d.is_inline = inl;
@@ -1570,7 +1634,7 @@ fn new_variant(name: []u8, span: u.Span) ast.Variant {
 }
 
 fn parse_methods(P: *mut Parser, owner: *mut ast.Decl) void {
-    while (pk(P) == lx.KW_PUB) or (pk(P) == lx.KW_FN) or at_inline(P) {
+    while (pk(P) == lx.KW_PUB) or (pk(P) == lx.KW_FN) or (pk(P) == lx.KW_INLINE) {
         let ms = peek(P).span;
         let mp = accept(P, lx.KW_PUB);
         let m = parse_fn_inline(P, ms, mp, false);
@@ -1632,10 +1696,7 @@ fn parse_import(P: *mut Parser, start: u.Span) void {
         _ = expect(P, lx.TK_RBRACE);
         return;
     }
-    let is_part = (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "part") and (peek2(P).kind == lx.TK_STRING);
-    if is_part {
-        _ = advance(P);
-    }
+    let is_part = accept(P, lx.KW_PART);
     let d = new_decl(P, ast.D_IMPORT, start);
     d.is_part = is_part;
     let s = expect(P, lx.TK_STRING);
@@ -1762,7 +1823,20 @@ fn parse_struct(P: *mut Parser, start: u.Span, is_pub: bool, is_nocopy: bool) *m
     d.is_nocopy = is_nocopy;
     parse_generic_params(P, d);
     _ = expect(P, lx.TK_LBRACE);
-    parse_field_list(P, &mut d.fields);
+    while (pk(P) == lx.KW_PUB) or (pk(P) == lx.TK_IDENT) {
+        let ms = peek(P).span;
+        let mp = accept(P, lx.KW_PUB);
+        if (pk(P) == lx.KW_FN) or (pk(P) == lx.KW_INLINE) {
+            let m = parse_fn_inline(P, ms, mp, false);
+            m.owner = d;
+            d.methods.push(m);
+            break;
+        }
+        d.fields.push(parse_field(P, mp));
+        if not accept(P, lx.TK_COMMA) {
+            break;
+        }
+    }
     parse_methods(P, d);
     _ = expect(P, lx.TK_RBRACE);
     d.span = sp_from(P, start);
@@ -1775,7 +1849,7 @@ fn parse_union(P: *mut Parser, start: u.Span, is_pub: bool, is_nocopy: bool) *mu
     d.is_nocopy = is_nocopy;
     parse_generic_params(P, d);
     _ = expect(P, lx.TK_LBRACE);
-    while (pk(P) == lx.TK_IDENT) and not at_inline(P) {
+    while pk(P) == lx.TK_IDENT {
         let vid = expect_ident(P);
         let mut v = new_variant(vid.name, vid.span);
         if accept(P, lx.TK_COLON) {
@@ -1817,7 +1891,7 @@ fn parse_enum(P: *mut Parser, start: u.Span, is_pub: bool) *mut ast.Decl {
         d.te = parse_type(P);
     }
     _ = expect(P, lx.TK_LBRACE);
-    while (pk(P) == lx.TK_IDENT) and not at_inline(P) {
+    while pk(P) == lx.TK_IDENT {
         let vid = expect_ident(P);
         let mut v = new_variant(vid.name, vid.span);
         if accept(P, lx.TK_EQ) {
@@ -1848,10 +1922,7 @@ fn parse_const(P: *mut Parser, start: u.Span, is_pub: bool) *mut ast.Decl {
 
 // GlobalDecl ::= "pub"? "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 fn parse_global(P: *mut Parser, start: u.Span, is_pub: bool, tls: bool) *mut ast.Decl {
-    if tls {
-        _ = advance(P);
-    }
-    _ = advance(P);
+    _ = expect(P, lx.KW_LET);
     let d = new_decl(P, ast.D_GLOBAL, start);
     d.is_pub = is_pub;
     d.is_tls = tls;
@@ -1894,7 +1965,7 @@ fn parse_top(P: *mut Parser) void {
             mdecls.push(d);
             return;
         }
-        if (pk(P) != lx.KW_FN) and not at_inline(P) {
+        if (pk(P) != lx.KW_FN) and (pk(P) != lx.KW_INLINE) {
             syntax_error(P, "'fn' or 'let' after 'export'");
             sync_stmt(P);
             return;
@@ -1903,32 +1974,41 @@ fn parse_top(P: *mut Parser) void {
         return;
     }
     let is_pub = accept(P, lx.KW_PUB);
-    // `nocopy` is contextual immediately before a top-level `struct` or `union`
-    let mut is_nocopy = false;
-    if (pk(P) == lx.TK_IDENT) and u.str_eq(peek(P).name, "nocopy") and
-       ((peek2(P).kind == lx.KW_STRUCT) or (peek2(P).kind == lx.KW_UNION)) {
-        _ = advance(P);
-        is_nocopy = true;
+    if accept(P, lx.KW_NOCOPY) {
+        if pk(P) == lx.KW_STRUCT {
+            mdecls.push(parse_struct(P, start, is_pub, true));
+        } else if pk(P) == lx.KW_UNION {
+            mdecls.push(parse_union(P, start, is_pub, true));
+        } else {
+            syntax_error(P, "'struct' or 'union' after 'nocopy'");
+            sync_stmt(P);
+        }
+        return;
     }
     let k = pk(P);
-    // `threadlocal` is a keyword only here, before a module-level `let`
-    let tls = (k == lx.TK_IDENT) and u.str_eq(peek(P).name, "threadlocal") and (peek2(P).kind == lx.KW_LET);
     if k == lx.KW_ERROR {
         mdecls.push(parse_error_decl(P, start, is_pub));
     } else if k == lx.KW_EXTERN {
         parse_extern(P, is_pub);
-    } else if (k == lx.KW_FN) or at_inline(P) {
+    } else if (k == lx.KW_FN) or (k == lx.KW_INLINE) {
         mdecls.push(parse_fn_inline(P, start, is_pub, false));
     } else if k == lx.KW_STRUCT {
-        mdecls.push(parse_struct(P, start, is_pub, is_nocopy));
+        mdecls.push(parse_struct(P, start, is_pub, false));
     } else if k == lx.KW_UNION {
-        mdecls.push(parse_union(P, start, is_pub, is_nocopy));
+        mdecls.push(parse_union(P, start, is_pub, false));
     } else if k == lx.KW_ENUM {
         mdecls.push(parse_enum(P, start, is_pub));
     } else if k == lx.KW_CONST {
         mdecls.push(parse_const(P, start, is_pub));
-    } else if (k == lx.KW_LET) or tls {
-        mdecls.push(parse_global(P, start, is_pub, tls));
+    } else if accept(P, lx.KW_THREADLOCAL) {
+        if pk(P) != lx.KW_LET {
+            syntax_error(P, "'let' after 'threadlocal'");
+            sync_stmt(P);
+        } else {
+            mdecls.push(parse_global(P, start, is_pub, true));
+        }
+    } else if k == lx.KW_LET {
+        mdecls.push(parse_global(P, start, is_pub, false));
     } else {
         syntax_error(P, "declaration");
         sync_stmt(P);
