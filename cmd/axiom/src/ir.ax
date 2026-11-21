@@ -12,6 +12,7 @@
 // The builder folds constant integer operations, like LLVM's IRBuilder, so a
 // check whose condition is a constant disappears when the IR is built.
 // =============================================================================
+import "std/sync" as sync;
 import "util.ax" as u;
 
 // -----------------------------------------------------------------------------
@@ -83,9 +84,296 @@ threadlocal let mut TT: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int
 fn new_ty(k: TyKind) *mut Ty {
     let t = u.perm_new.[Ty]();
     t.kind = k;
+    if sh_on and not sh_inside {
+        sh_lock.lock();
+        sh_tt.ty_count += 1;
+        t.id = sh_tt.ty_count;
+        sh_lock.unlock();
+        return t;
+    }
     TT.ty_count += 1;
     t.id = TT.ty_count;
     return t;
+}
+
+// -----------------------------------------------------------------------------
+// Shared tables (passes.ax: the functions of a module optimized on threads
+// at once). While sh_on, the interned types, integer constants and undefs
+// are those of sh_tt and sh_cints, which a thread reads and changes only
+// holding sh_lock (sh_enter .. sh_exit, where it works on them as its own);
+// each thread's own TT and CINTS (and sh_undefs) only remember what it found
+// there. So every thread finds the one type, constant or undef there is of
+// each, whichever thread made it first; what the tables hold is the same
+// whatever the order (only the types' ids, which are keys, may differ).
+// -----------------------------------------------------------------------------
+let mut sh_on: bool = false;
+let mut sh_lock: sync.Mutex = sync.Mutex.{ state: 0 };
+let mut sh_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
+                                   t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
+                                   t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
+                                   derived: u.SymMap.[*mut Ty].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                 vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 },
+                                   vecs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                    cap: 0, len: 0 } };
+let mut sh_cints: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                          cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+threadlocal let mut sh_inside: bool = false;  // between sh_enter and sh_exit
+threadlocal let mut sh_my_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
+                                                  t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
+                                                  t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
+                                                  derived: u.SymMap.[*mut Ty].{
+                                                      keys: @ptr_from_int(*mut usize, 0),
+                                                      vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 },
+                                                  vecs: u.U64Map.{ keys: @ptr_from_int(*mut u64, 0),
+                                                                   vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };
+threadlocal let mut sh_my_cints: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0),
+                                                         vals: @ptr_from_int(*mut u64, 0),
+                                                         cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+threadlocal let mut sh_undefs: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                     cap: 0, len: 0 };
+// (the values other than instructions a thread forwarded, for the thread
+// that made the module to forward too: shared_forwards)
+threadlocal let mut sh_fwds: u.List.[*mut Value] = u.List.[*mut Value].{
+    data: @ptr_from_int(*mut *mut Value, 0), len: 0, cap: 0 };
+
+// Takes the lock, with the shared tables as this thread's own.
+fn sh_enter() void {
+    sh_lock.lock();
+    sh_my_tt = TT;
+    sh_my_cints = CINTS;
+    TT = sh_tt;
+    CINTS = sh_cints;
+    sh_inside = true;
+}
+
+fn sh_exit() void {
+    sh_tt = TT;
+    sh_cints = CINTS;
+    TT = sh_my_tt;
+    CINTS = sh_my_cints;
+    sh_inside = false;
+    sh_lock.unlock();
+}
+
+fn empty_cints() CintTable {
+    return CintTable.{ tys: u.nil.[usize](), vals: u.nil.[u64](), cs: u.nil.[*mut Value](), cap: 0, len: 0 };
+}
+
+fn free_cints(c: *mut CintTable) void {
+    if c.cap > 0 {
+        u.free_slice.[usize](@slice_from_ptr(c.tys, c.cap));
+        u.free_slice.[u64](@slice_from_ptr(c.vals, c.cap));
+        u.free_slice.[*mut Value](@slice_from_ptr(c.cs, c.cap));
+    }
+    c.* = empty_cints();
+}
+
+// A copy of the shared types' table (holding the lock), for a thread's own.
+fn tt_copy(t: *TypeTab) TypeTab {
+    let mut c = t.*;
+    c.derived = t.derived.copy();
+    c.vecs = t.vecs.copy();
+    return c;
+}
+
+fn free_tt(t: *mut TypeTab) void {
+    u.free(@ptr_cast(*mut void, t.derived.keys));
+    u.free(@ptr_cast(*mut void, t.derived.vals));
+    t.vecs.deinit();
+}
+
+/// On the thread that made the module, before threads optimize functions
+/// of it at once (passes.ax): its tables become the shared ones.
+pub fn shared_begin() void {
+    sh_tt = TT;
+    sh_cints = CINTS;
+    TT = tt_copy(&sh_tt);
+    CINTS = empty_cints();
+    sh_undefs = u.U64Map.empty();
+    sh_on = true;
+    u.intern_shared = true;
+}
+
+/// On that thread, once the others are done: the shared tables its own
+/// again.
+pub fn shared_end() void {
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_undefs.deinit();
+    TT = sh_tt;
+    CINTS = sh_cints;
+    sh_on = false;
+    u.intern_shared = false;
+}
+
+/// What a thread that optimizes functions while sh_on starts from (besides
+/// a copy of the shared types' table): the target's pointer width, and the
+/// C front end's records of inline assembly (read only).
+pub struct ShStart {
+    ptr_bytes: u64,
+    asm_flags: u.List.[u32],
+    asm_mems: u.List.[[]AsmMem],
+}
+
+pub fn sh_start() ShStart {
+    return ShStart.{ ptr_bytes: ptr_bytes, asm_flags: asm_flags, asm_mems: asm_mems };
+}
+
+/// On such a thread, first; its forwarding epochs go on from `epoch`, which
+/// tells them apart from every other thread's (SH_EPOCH).
+pub fn sh_thread_begin(s: *ShStart, epoch: u64) void {
+    ptr_bytes = s.ptr_bytes;
+    asm_flags = s.asm_flags;  // (read only: the C front end's)
+    asm_mems = s.asm_mems;
+    sh_lock.lock();
+    TT = tt_copy(&sh_tt);
+    sh_lock.unlock();
+    CINTS = empty_cints();
+    sh_undefs = u.U64Map.empty();
+    REPL = u.U64Map.empty();
+    fwd_epoch = epoch;
+    cur_src = 0;
+    cur_scope = 0;
+    sh_fwds.clear();
+}
+
+/// What a thread that optimized functions while sh_on leaves: its
+/// forwarding epoch (for its next start), and the dead values, blocks and
+/// value records it kept for reuse (for the thread that made the module:
+/// shared_reuse).
+pub struct ShEnd {
+    epoch: u64,
+    vals: u.List.[*mut Value],
+    blocks: u.List.[*mut Block],
+    more: [8]u.List.[usize],
+}
+
+/// On such a thread, last (its caches given back).
+pub fn sh_thread_end() ShEnd {
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_undefs.deinit();
+    let r = ShEnd.{ epoch: fwd_epoch, vals: free_vals, blocks: free_blocks, more: free_more };
+    free_vals = u.List.[*mut Value].empty();
+    free_blocks = u.List.[*mut Block].empty();
+    for k in @as(usize, 0)..8 {
+        free_more[k] = u.List.[usize].empty();
+    }
+    return r;
+}
+
+/// On the thread that made the module: what another thread kept for reuse
+/// (sh_thread_end) is this one's to reuse.
+pub fn shared_reuse(e: *mut ShEnd) void {
+    for v in e.vals.items() {
+        free_vals.push(v);
+    }
+    for b in e.blocks.items() {
+        free_blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in e.more[k].items() {
+            free_more[k].push(x);
+        }
+        e.more[k].deinit();
+    }
+    e.vals.deinit();
+    e.blocks.deinit();
+}
+
+// What the threads of a pool (passes.ax) buried, for any of them to reuse:
+// a thread gives its own after each function, and takes these when it has
+// none left of a kind (sh_take_spare). (Which memory a value reuses does
+// not change the code made.)
+let mut sh_spare_lock: sync.Mutex = sync.Mutex.{ state: 0 };
+let mut sh_spare_n: u32 = 0;  // (not 0: something to take)
+let mut sh_spare: ShEnd = ShEnd.{ epoch: 0, vals: u.List.[*mut Value].{ data: @ptr_from_int(*mut *mut Value, 0), len: 0,
+                                                                        cap: 0 },
+                                  blocks: u.List.[*mut Block].{ data: @ptr_from_int(*mut *mut Block, 0), len: 0,
+                                                                cap: 0 },
+                                  more: [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 }; 8] };
+
+const SPARE_MIN: usize = 4096;  // (fewer: kept)
+
+fn sh_give_spare() void {
+    let mut n = free_vals.len + free_blocks.len;
+    for k in @as(usize, 0)..8 {
+        n += free_more[k].len;
+    }
+    if n < SPARE_MIN {
+        return;
+    }
+    sh_spare_lock.lock();
+    for v in free_vals.items() {
+        sh_spare.vals.push(v);
+    }
+    for b in free_blocks.items() {
+        sh_spare.blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in free_more[k].items() {
+            sh_spare.more[k].push(x);
+        }
+        free_more[k].clear();
+    }
+    free_vals.clear();
+    free_blocks.clear();
+    @atomic_store(&mut sh_spare_n, 1);
+    sh_spare_lock.unlock();
+}
+
+// Takes what the others gave (sh_give_spare), all of it.
+fn sh_take_spare() void {
+    sh_spare_lock.lock();
+    for v in sh_spare.vals.items() {
+        free_vals.push(v);
+    }
+    for b in sh_spare.blocks.items() {
+        free_blocks.push(b);
+    }
+    for k in @as(usize, 0)..8 {
+        for x in sh_spare.more[k].items() {
+            free_more[k].push(x);
+        }
+        sh_spare.more[k].clear();
+    }
+    sh_spare.vals.clear();
+    sh_spare.blocks.clear();
+    @atomic_store(&mut sh_spare_n, 0);
+    sh_spare_lock.unlock();
+}
+
+/// On such a thread, after the passes over a function: the values other
+/// than instructions it forwarded, each followed by its replacement, for
+/// the thread that made the module to forward the same (shared_forwards).
+/// What it forwarded is forgotten here: no later pass on this thread looks
+/// at that function's values.
+pub fn sh_task_end() u.List.[*mut Value] {
+    if fwd_epoch < SH_EPOCH {
+        return u.List.[*mut Value].empty();  // (the thread that made the module: its own)
+    }
+    let r = sh_fwds;
+    sh_fwds = u.List.[*mut Value].empty();
+    if REPL.len > 0 {
+        REPL.deinit();
+    }
+    sh_give_spare();
+    return r;
+}
+
+/// On the thread that made the module: what another thread forwarded
+/// (sh_task_end: each value, then its replacement) forwarded here too.
+pub fn shared_forwards(l: *u.List.[*mut Value]) void {
+    let mut k: usize = 0;
+    while (k + 1) < l.len {
+        forward(l.get(k), l.get(k + 1));
+        k += 2;
+    }
+}
+
+/// The graveyard holds nothing (of any function).
+pub fn graves_empty() bool {
+    return (grave_v.len + grave_b.len) == 0;
 }
 
 // Must be called before any type is created (pointer width of the target).
@@ -95,6 +383,13 @@ pub fn init_types(pbytes: u64) void {
 
 pub fn t_int(bits: i32) *mut Ty {
     let i = @int_cast(usize, bits);
+    if u.isnil(TT.int_tys[i]) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_int(bits);
+        sh_exit();
+        TT.int_tys[i] = t;
+        return t;
+    }
     if u.isnil(TT.int_tys[i]) {
         let t = new_ty(T_INT);
         t.bits = bits;
@@ -113,6 +408,13 @@ pub fn t_int(bits: i32) *mut Ty {
 }
 
 pub fn t_void() *mut Ty {
+    if u.isnil(TT.t_void) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_void();
+        sh_exit();
+        TT.t_void = t;
+        return t;
+    }
     if u.isnil(TT.t_void) {
         TT.t_void = new_ty(T_VOID);
         TT.t_void.align = 1;
@@ -121,6 +423,13 @@ pub fn t_void() *mut Ty {
 }
 
 pub fn t_ptr() *mut Ty {
+    if u.isnil(TT.t_ptr) and sh_on and not sh_inside {
+        sh_enter();
+        let t = t_ptr();
+        sh_exit();
+        TT.t_ptr = t;
+        return t;
+    }
     if u.isnil(TT.t_ptr) {
         TT.t_ptr = new_ty(T_PTR);
         TT.t_ptr.size = ptr_bytes;
@@ -131,6 +440,17 @@ pub fn t_ptr() *mut Ty {
 }
 
 pub fn t_float(bits: i32) *mut Ty {
+    if sh_on and not sh_inside and (((bits == 32) and u.isnil(TT.t_f32)) or ((bits != 32) and u.isnil(TT.t_f64))) {
+        sh_enter();
+        let t = t_float(bits);
+        sh_exit();
+        if bits == 32 {
+            TT.t_f32 = t;
+        } else {
+            TT.t_f64 = t;
+        }
+        return t;
+    }
     if bits == 32 {
         if u.isnil(TT.t_f32) {
             TT.t_f32 = new_ty(T_FLOAT);
@@ -156,6 +476,13 @@ pub fn t_vec(lane: *mut Ty, nl: u32) *mut Ty {
     if found != 0 {
         return @ptr_from_int(*mut Ty, @truncate(usize, found));
     }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_vec(lane, nl);
+        sh_exit();
+        TT.vecs.put(k, @as(u64, @int_from_ptr(t)));
+        return t;
+    }
     let t = new_ty(T_VEC);
     t.elem = lane;
     t.lanes = lanes;
@@ -174,6 +501,13 @@ pub fn t_array(el: *mut Ty, n: u64) *mut Ty {
     let found = TT.derived.get(k);
     if u.notnil(found) {
         return found;
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_array(el, n);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
     }
     let t = new_ty(T_ARRAY);
     t.elem = el;
@@ -217,6 +551,13 @@ pub fn t_struct(fields: []mut *mut Ty) *mut Ty {
     if u.notnil(found) {
         return found;
     }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_struct(fields);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
+    }
     let t = new_ty(T_STRUCT);
     let fs = u.perm_newn.[*mut Ty](fields.len + 1);
     for i in 0..fields.len {
@@ -243,6 +584,13 @@ pub fn t_struct_packed(fields: []mut *mut Ty) *mut Ty {
     let found = TT.derived.get(k);
     if u.notnil(found) {
         return found;
+    }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let t = t_struct_packed(fields);
+        sh_exit();
+        TT.derived.put(k, t);
+        return t;
     }
     let t = new_ty(T_STRUCT);
     let n = fields.len;
@@ -2219,6 +2567,9 @@ threadlocal let mut free_more: [8]u.List.[usize] = [u.List.[usize].{ data: @ptr_
 
 fn new_more(g: u8) usize {
     let k = @as(usize, g);
+    if (free_more[k].len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
     if free_more[k].len > 0 {
         let r = free_more[k].pop();
         @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, r), more_size(g)), 0);
@@ -2667,15 +3018,15 @@ pub struct Block {
     aux: i64,
     auxp: *mut void,
     mark: i64,  // pass scratch that survives CFG analyses
+    // its place in the dominator tree when opt.dominators last ran over its
+    // function (run dom_run): it dominates the blocks numbered dom_lo..dom_hi
+    dom_run: i64,
     // (the small fields last, together: no padding between them)
     id: i32,
     rpo: i32,
     depth: i32,  // dominator tree depth
-    // its place in the dominator tree when opt.dominators last ran over its
-    // function (run dom_run): it dominates the blocks numbered dom_lo..dom_hi
     dom_lo: i32,
     dom_hi: i32,
-    dom_run: i32,
     grave: u32,  // 1 + its index in the graveyard (0: not there)
     loop_depth: i32,
     split: bool,    // a loop header whose range was split (lopt.split_loops)
@@ -2896,6 +3247,9 @@ pub fn bnil() *mut Block {
 
 fn new_val(k: ValueKind, t: *mut Ty) *mut Value {
     let mut v = vnil();
+    if (free_vals.len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
     if free_vals.len > 0 {
         v = free_vals.pop();
         if v.replaced {
@@ -3231,6 +3585,18 @@ pub fn cint(t: *mut Ty, v: u64) *mut Value {
     if tys[j] != 0 {
         return cs[j];
     }
+    if sh_on and not sh_inside {
+        sh_enter();
+        let c = cint(t, x);
+        sh_exit();
+        // (this thread's table only remembers it: the slot is still free,
+        // as nothing changed the table meanwhile)
+        tys[j] = key;
+        vals[j] = x;
+        cs[j] = c;
+        CINTS.len += 1;
+        return c;
+    }
     // (shared by every function: outside any scratch scope)
     let c = u.perm_new.[Value]();
     c.kind = V_CINT;
@@ -3367,6 +3733,18 @@ pub fn cones(t: *mut Ty) *mut Value {
 
 // One undef per type, shared as integer constants are.
 pub fn undef(t: *mut Ty) *mut Value {
+    if sh_on and not sh_inside {
+        let k = @as(u64, @int_from_ptr(t));
+        let have = sh_undefs.get(k);
+        if have != 0 {
+            return @ptr_from_int(*mut Value, @truncate(usize, have));
+        }
+        sh_enter();
+        let v = undef(t);
+        sh_exit();
+        sh_undefs.put(k, @as(u64, @int_from_ptr(v)));
+        return v;
+    }
     if u.isnil(t.undef_v) and (t.id <= pv_tys) {
         // (a type the parts share, which the thread of each part does not
         // change: its undef is the part's)
@@ -3624,6 +4002,11 @@ pub inline fn resolve(v: *mut Value) *mut Value {
 // rewrite.
 threadlocal let mut fwd_epoch: u64 = 1;
 
+// (the epochs of the threads passes.ax optimizes functions on: slot k's
+// from k * SH_EPOCH up, apart from each other's and from the first
+// thread's, so that no function's fwd_seen is an epoch of another thread)
+pub const SH_EPOCH: u64 = 0x0100_0000_0000_0000;
+
 // Forwards v's uses to r (or, with r nil, stops forwarding them). The uses
 // of an instruction move to r at once (replace_all: its operands are
 // rewritten, and v reads as r through resolve() to whoever kept it); those
@@ -3641,6 +4024,10 @@ pub fn forward(v: *mut Value, r: *mut Value) void {
         replace_all(v, resolve(r));
     } else {
         fwd_epoch += 1;
+        if sh_on and (fwd_epoch >= SH_EPOCH) {
+            sh_fwds.push(v);
+            sh_fwds.push(r);
+        }
     }
 }
 
@@ -4799,6 +5186,9 @@ pub fn init_of(g: *Global) *mut Value {
 }
 
 fn new_block() *mut Block {
+    if (free_blocks.len == 0) and (@atomic_load(&sh_spare_n) > 0) {
+        sh_take_spare();
+    }
     if free_blocks.len > 0 {
         let b = free_blocks.pop();
         @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, b), @size_of(Block)), 0);

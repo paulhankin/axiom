@@ -2,8 +2,8 @@
 // inline.ax - function inlining over the module's call graph.
 //
 // Functions are visited bottom-up (callees before callers, by strongly
-// connected components of the call graph), so a callee is already inlined
-// into and simplified when its cost is measured. A direct call is inlined
+// connected components of the call graph, level by level: inline_begin), so
+// a callee is already inlined into and simplified when its cost is measured. A direct call is inlined
 // when the callee is small, or internal with a single call site. Calls in
 // recursion (a callee in the caller's strongly connected component, or one
 // that is recursive itself) are inlined under the rules at `want` that keep
@@ -531,6 +531,8 @@ struct Node {
     recursive: bool,   // calls itself, directly or not
     selfcall: i8,      // its function has a direct call to itself: 1 or 0, or -1: not known
     cycle_calls: i32,  // its direct calls of functions of its component (node_selfcall)
+    pos: usize,        // its place in the order of inlining (inline_begin)
+    level: i32,        // its component's level (inline_begin)
 }
 
 threadlocal let mut nodes: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0,
@@ -1045,51 +1047,157 @@ fn add_node(g: *mut ir.Func) void {
     nodes.push(n);
 }
 
-// Inlines over the module bottom-up; `simplify` runs on every function after
-// its calls are inlined (and before its callers look at it). Then, if the
-// function is no longer small, `split` may move an uncommon path that makes
-// calls into a function of its own (returned, or nil), so that what is left
-// is: inlining a lazy initialisation's check brings in the initialisation,
-// which then should not make its callers' common path pay for it.
-pub fn inline_module(
-    m: *mut ir.Module, simplify: fn(*mut ir.Func) void, split: fn(*mut ir.Module, *mut ir.Func) *mut ir.Func) void {
+// Inlining over the module bottom-up, in steps (passes.ax runs them):
+// inline_begin orders the functions, callees first (`order`); then, for
+// each in turn, inline_step inlines its calls, and when it did, the
+// function is simplified (by passes.ax) before inline_after looks at it
+// again (and then its callers at it). After all of them, inline_end.
+// inline_after may also move an uncommon path that makes calls into a
+// function of its own (`split`, which returns it, or nil), so that what is
+// left is small: inlining a lazy initialisation's check brings in the
+// initialisation, which then should not make its callers' common path pay
+// for it.
+//
+// Steps of different functions may overlap (the simplification of one with
+// the inlining into a later one) as long as each inline_step k comes after
+// inline_after of every function before inline_need(k) in the order: what
+// step k reads (its callees and what inlining them brings in, which are in
+// their components or below, and their nodes) is then as it would be with
+// the steps one after another, and inline_after changes only its own
+// function's node, the counts of live calls and the bodies nothing calls.
+threadlocal let mut in_order: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0,
+                                                                        cap: 0 };
+threadlocal let mut need: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+/// Orders m's functions for inlining; their number.
+pub fn inline_begin(m: *mut ir.Module) usize {
     build_graph(m);
-    let mut order = u.List.[*mut Node].empty();
-    sccs(&mut order);
-    for k in 0..order.len {
-        let n = order.get(k);
+    in_order.clear();
+    sccs(&mut in_order);
+    // by level: a component's level is one more than the highest of those
+    // of the components it calls (0 if none), so that the functions of a
+    // level, which do not call each other, can be simplified at once
+    // (passes.inline_module); within a level, in the order of the components
+    let mut levels = u.List.[i32].empty();
+    for k in 0..in_order.len {
+        let n = in_order.get(k);
+        let sc = @as(usize, @bit_cast(u32, n.scc));
+        while levels.len <= sc {
+            levels.push(0);
+        }
         for j in 0..n.callees.len {
-            if nodes.get(@int_cast(usize, n.callees.get(j))).scc == n.scc {
+            let c = nodes.get(@int_cast(usize, n.callees.get(j)));
+            if c.scc == n.scc {
                 n.recursive = true;
+            } else {
+                let l = levels.get(@as(usize, @bit_cast(u32, c.scc))) + 1;
+                if l > levels.get(sc) {
+                    levels.set(sc, l);
+                }
             }
         }
     }
-    for k in 0..order.len {
-        let n = order.get(k);
-        if ir.is_decl(n.f) or n.f.returns_twice {
-            continue;  // (a function that calls setjmp is not optimized: ir.Func)
+    for k in 0..in_order.len {
+        let n = in_order.get(k);
+        n.pos = k;
+        n.level = levels.get(@as(usize, @bit_cast(u32, n.scc)));
+    }
+    levels.deinit();
+    u.sort(in_order.items(), by_level);
+    for k in 0..in_order.len {
+        in_order.get(k).pos = k;
+    }
+    // the last place of each component (a component's functions are
+    // together in the order)
+    let mut last = u.List.[usize].empty();
+    for k in 0..in_order.len {
+        last.push(k);
+    }
+    let mut x = in_order.len;
+    while x > 1 {
+        x -= 1;
+        if in_order.get(x - 1).scc == in_order.get(x).scc {
+            last.set(x - 1, last.get(x));
         }
-        if inline_into(n) {
-            simplify(n.f);
+    }
+    need.clear();
+    for k in 0..in_order.len {
+        let n = in_order.get(k);
+        let mut nd: usize = 0;
+        if (k > 0) and (in_order.get(k - 1).scc == n.scc) {
+            nd = k;  // (after the functions of its component before it)
+        }
+        for j in 0..n.callees.len {
+            let c = nodes.get(@int_cast(usize, n.callees.get(j)));
+            if (c.scc != n.scc) and ((last.get(c.pos) + 1) > nd) {
+                nd = last.get(c.pos) + 1;
+            }
+        }
+        need.push(nd);
+    }
+    last.deinit();
+    return in_order.len;
+}
+
+fn by_level(a: *mut Node, b: *mut Node) i32 {
+    if a.level != b.level {
+        return a.level - b.level;
+    }
+    if a.pos < b.pos {
+        return -1;
+    }
+    if a.pos > b.pos {
+        return 1;
+    }
+    return 0;
+}
+
+/// How many functions of the order (from the first) must be done
+/// (inline_after) before inline_step k.
+pub fn inline_need(k: usize) usize {
+    return need.get(k);
+}
+
+/// The function at k in the order.
+pub fn inline_func(k: usize) *mut ir.Func {
+    return in_order.get(k).f;
+}
+
+/// Inlines the chosen calls of the function at k; true if any (it is then
+/// to be simplified, and inline_after to look at it).
+pub fn inline_step(k: usize) bool {
+    let n = in_order.get(k);
+    if ir.is_decl(n.f) or n.f.returns_twice {
+        return false;  // (a function that calls setjmp is not optimized: ir.Func)
+    }
+    return inline_into(n);
+}
+
+/// After inline_step k inlined calls and the function was simplified.
+pub fn inline_after(m: *mut ir.Module, k: usize, split: fn(*mut ir.Module, *mut ir.Func) *mut ir.Func) void {
+    let n = in_order.get(k);
+    n.cost = -1;
+    n.inlinable = -1;
+    n.frame = -1;
+    n.selfcall = -1;
+    let mut g = u.nil.[ir.Func]();
+    if node_cost(n) > SMALL {
+        g = split(m, n.f);
+        if u.notnil(g) {
+            add_node(g);
             n.cost = -1;
             n.inlinable = -1;
             n.frame = -1;
             n.selfcall = -1;
-            let mut g = u.nil.[ir.Func]();
-            if node_cost(n) > SMALL {
-                g = split(m, n.f);
-                if u.notnil(g) {
-                    add_node(g);
-                    n.cost = -1;
-                    n.inlinable = -1;
-                    n.frame = -1;
-                    n.selfcall = -1;
-                }
-            }
-            retire(n, g);
         }
     }
-    order.deinit();
+    retire(n, g);
+}
+
+/// Once every function of the order is done: the internal functions
+/// nothing refers to any more are deleted.
+pub fn inline_end(m: *mut ir.Module) void {
+    in_order.clear();
     remove_dead(m);
 }
 

@@ -24,6 +24,7 @@
 // =============================================================================
 import "copies.ax" as copies;
 import "cover.ax" as cover;
+import "dbginfo.ax" as dbi;
 import "divconst.ax" as divc;
 import "dse.ax" as dse;
 import "gvn.ax" as gvn;
@@ -37,6 +38,7 @@ import "outline.ax" as outl;
 import "slots.ax" as slots;
 import "slp.ax" as slp;
 import "sroa.ax" as sroa;
+import "std/thread" as thread;
 import "switches.ax" as sw;
 import "tailrec.ax" as tre;
 import "target.ax" as tg;
@@ -303,20 +305,25 @@ fn split_cold(m: *mut ir.Module, f: *mut ir.Func) *mut ir.Func {
 
 pub fn optimize_module(m: *mut ir.Module, level: i32) void {
     opt.keep_vars = level == 0;
+    let pool = pool_start(level);
+    let w = par_begin(pool, m, level);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {
-            optimize_func(f, level);
+            _ = par_push(w, f, K_OPT);
         }
     }
+    par_end(w);
     u.phase("optimize: functions");
     if level >= 2 {
         // uncommon paths that make calls leave small functions (to inline)
         let mut changed = u.List.[*mut ir.Func].empty();
         if outl.outline_module(m, &mut changed) {
+            let wo = par_begin(pool, m, level);
             for i in 0..changed.len {
-                optimize_func(changed.get(i), level);
+                _ = par_push(wo, changed.get(i), K_OPT);
             }
+            par_end(wo);
         }
         changed.deinit();
         u.phase("optimize: outline");
@@ -324,19 +331,389 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
         // passed down through an inlined call), which make new direct calls
         for _round in @as(i32, 0)..2 {
             let consts = inl.ipcp(m);
+            let wc = par_begin(pool, m, level);
             for i in 0..consts.len {
-                optimize_func(consts.get(i), level);
+                _ = par_push(wc, consts.get(i), K_OPT);
             }
+            par_end(wc);
             u.phase("optimize: constant arguments");
-            inl.inline_module(m, resimplify, split_cold);
+            inline_module(pool, m);
             u.phase("optimize: inline");
         }
     }
+    pool_stop(pool);
     if level > 0 {
         // (before finish_funcs, from the IR all parts of a module compiled in
         // parts see alike: backend.ax)
         slots.find_kept_params(m);
     }
+}
+
+// Inlining over the module bottom-up (inline.ax), each function simplified
+// again after its calls are inlined (resimplify, which may run on another
+// thread while the inlining goes on into functions that do not call it).
+fn inline_module(pool: *mut Pool, m: *mut ir.Module) void {
+    let n = inl.inline_begin(m);
+    let w = par_begin(pool, m, 2);
+    let task = u.newn.[usize](n + 1);  // by place in the order: its task + 1, or 0: none
+    let mut next: usize = 0;           // the next to inline into
+    let mut done: usize = 0;           // the functions done (inline_after), in order
+    while done < n {
+        let seen = @atomic_load(&w.ndone);
+        let mut moved = false;
+        // what was simplified, in order
+        while (done < next) and ((task[done] == 0) or par_done(w, task[done] - 1)) {
+            if task[done] > 0 {
+                inl.inline_after(m, done, split_cold);
+            }
+            done += 1;
+            moved = true;
+        }
+        // the next function whose callees are done
+        while (next < n) and (inl.inline_need(next) <= done) {
+            if inl.inline_step(next) {
+                let f = inl.inline_func(next);
+                ir.recycle(f);  // (what inlining took out: no other thread has a graveyard with it)
+                task[next] = par_push(w, f, K_SIMPLIFY) + 1;
+            }
+            next += 1;
+            moved = true;
+        }
+        if not moved {
+            par_wait(w, seen);
+        }
+    }
+    par_end(w);
+    inl.inline_end(m);
+}
+
+// -----------------------------------------------------------------------------
+// Functions optimized on threads at once. At -O2 and up (without -g), the
+// functions' first round of optimization, the round after constant
+// arguments, and the simplification after inlining (inline_module) run on
+// as many threads as the build may use (u.jobs), the thread that made the
+// module among them: each runs the passes over one function at a time,
+// which read of other functions only what does not change meanwhile (their
+// attributes; inline_module waits for a function's callees). The types and
+// constants are the module's, which the threads share (ir.shared_begin);
+// what else the passes keep between functions is the thread's own (and
+// starts out as on the first thread: WStart). The marks the passes leave in
+// a function (Tags) are told apart by thread: a thread's tags never equal
+// another's. So each function is optimized as it would be on one thread,
+// and the result is the same for any number of threads.
+// -----------------------------------------------------------------------------
+const K_OPT: i32 = 0;       // optimize_func at Work.level
+const K_SIMPLIFY: i32 = 1;  // resimplify
+const PAR_MAX: usize = 32;  // threads at most (the tags of thread k are k * TAG_SPAN up)
+const TAG_SPAN: i64 = 0x0100_0000_0000_0000;
+
+struct Task {
+    f: *mut ir.Func,
+    kind: i32,
+    done: u32,
+    fwds: u.List.[*mut ir.Value],  // (ir.sh_task_end)
+}
+
+// The passes' tag counters, of one thread.
+struct Tags {
+    dom_runs: i64,
+    rs_tag: i64,
+    region_tag: i64,
+    way_mark: i64,
+    addr_gen: i64,
+    ss_mark: i64,
+    loop_mark: i64,
+    loop_tag: i64,
+    idioms_tag: i64,
+    vec_tag: i64,
+    slp_gen: i64,
+    unroll_mark: i64,
+    outl_tag: i64,
+}
+
+fn tags_now() Tags {
+    return Tags.{ dom_runs: opt.dom_runs, rs_tag: opt.rs_tag, region_tag: thr.region_tag, way_mark: thr.way_mark,
+                  addr_gen: thr.addr_gen, ss_mark: dse.ss_mark, loop_mark: lopt.loop_mark, loop_tag: loops.loop_tag,
+                  idioms_tag: idioms.tag_base, vec_tag: vec.tag_base, slp_gen: slp.slp_gen,
+                  unroll_mark: unr.unroll_mark, outl_tag: outl.tag_gen };
+}
+
+fn tags_set(t: *Tags) void {
+    opt.dom_runs = t.dom_runs;
+    opt.rs_tag = t.rs_tag;
+    thr.region_tag = t.region_tag;
+    thr.way_mark = t.way_mark;
+    thr.addr_gen = t.addr_gen;
+    dse.ss_mark = t.ss_mark;
+    lopt.loop_mark = t.loop_mark;
+    loops.loop_tag = t.loop_tag;
+    idioms.tag_base = t.idioms_tag;
+    vec.tag_base = t.vec_tag;
+    slp.slp_gen = t.slp_gen;
+    unr.unroll_mark = t.unroll_mark;
+    outl.tag_gen = t.outl_tag;
+}
+
+// Thread k's tags (k from 1; the first thread's are its own) and
+// forwarding epochs (ir.SH_EPOCH), kept from one round of threads to the
+// next: thread k starts from the first thread's when the first round
+// began, k * TAG_SPAN up (no pass marks that much in a build).
+let mut slot_tags: u.List.[Tags] = u.List.[Tags].{ data: @ptr_from_int(*mut Tags, 0), len: 0, cap: 0 };
+let mut slot_epochs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+fn span_up(x: i64, k: usize) i64 {
+    return x +% (@as(i64, @bit_cast(i64, @as(u64, k))) *% TAG_SPAN);
+}
+
+fn slots_for(n: usize) void {
+    if slot_tags.len == 0 {
+        slot_tags.push(tags_now());  // (the first thread's, unused)
+        slot_epochs.push(0);
+    }
+    let t0 = slot_tags.get(0);
+    while slot_tags.len <= n {
+        let k = slot_tags.len;
+        slot_tags.push(Tags.{ dom_runs: span_up(t0.dom_runs, k), rs_tag: span_up(t0.rs_tag, k),
+                              region_tag: span_up(t0.region_tag, k), way_mark: span_up(t0.way_mark, k),
+                              addr_gen: span_up(t0.addr_gen, k), ss_mark: span_up(t0.ss_mark, k),
+                              loop_mark: span_up(t0.loop_mark, k), loop_tag: span_up(t0.loop_tag, k),
+                              idioms_tag: span_up(t0.idioms_tag, k), vec_tag: span_up(t0.vec_tag, k),
+                              slp_gen: span_up(t0.slp_gen, k), unroll_mark: span_up(t0.unroll_mark, k),
+                              outl_tag: span_up(t0.outl_tag, k) });
+        slot_epochs.push(@as(u64, k) * ir.SH_EPOCH);
+    }
+}
+
+// What the other threads start from: the first thread's state.
+struct WStart {
+    ir: ir.ShStart,
+    features: u64,
+    locations: bool,
+    c_version: i64,
+    thr: thr.PartState,
+    opt: opt.PartState,
+    lopt: lopt.PartState,
+    gvn: i32,
+}
+
+// The threads of optimize_module besides the first (pool_start), which run
+// the tasks of its rounds (Work, cur) between pool_start and pool_stop, and
+// otherwise wait.
+struct Pool {
+    cur: usize,  // the round's Work (0: none)
+    seq: u32,    // bumped (and notified) when a task is published, or the threads are to stop
+    stop: u32,
+    st: WStart,
+    workers: []mut Worker,
+    threads: u.List.[thread.Thread.[*mut Worker]],
+}
+
+struct Worker {
+    p: *mut Pool,
+    slot: usize,
+    end: ir.ShEnd,
+}
+
+// A round: the tasks (published up to ntasks; each taken once, by the
+// first thread to get it).
+struct Work {
+    tasks: []mut Task,
+    ntasks: u32,
+    taken: u32,
+    ndone: u32,  // the tasks done (notified on each)
+    level: i32,
+    pool: *mut Pool,  // nil: one thread, which runs each task as it comes
+}
+
+// The threads to run on, besides this one (0: this one only).
+fn par_threads(level: i32) usize {
+    if (level < 2) or (tg.g_debug != tg.DEBUG_NONE) or ir.dbg_on or u.is_worker() {
+        return 0;
+    }
+    return @min(u.jobs(), PAR_MAX) - 1;
+}
+
+// The threads for optimize_module at `level`, or nil (none: the passes run
+// on this thread).
+fn pool_start(level: i32) *mut Pool {
+    let n = par_threads(level);
+    if n == 0 {
+        return u.nil.[Pool]();
+    }
+    slots_for(n);
+    let p = u.new.[Pool]();
+    p.st = WStart.{ ir: ir.sh_start(), features: tg.g_features, locations: dbi.locations, c_version: dbi.c_version,
+                    thr: thr.part_state(), opt: opt.part_state(), lopt: lopt.part_state(), gvn: gvn.part_state() };
+    p.threads = u.List.[thread.Thread.[*mut Worker]].empty();
+    p.workers = u.newn.[Worker](n);
+    for k in 0..n {
+        p.workers[k] = Worker.{ p: p, slot: k + 1, end: ir.ShEnd.{ epoch: 0, vals: u.List.[*mut ir.Value].empty(),
+                                                                   blocks: u.List.[*mut ir.Block].empty(),
+                                                                   more: [u.List.[usize].empty(); 8] } };
+        let t = thread.spawn(run_worker, &mut p.workers[k]) catch {
+            break;  // (this thread does the rest)
+        };
+        p.threads.push(t);
+    }
+    if p.threads.len == 0 {
+        return u.nil.[Pool]();
+    }
+    return p;
+}
+
+fn pool_stop(p: *mut Pool) void {
+    if u.isnil(p) {
+        return;
+    }
+    @atomic_store(&mut p.stop, 1);
+    _ = @atomic_add(&mut p.seq, 1);
+    _ = @atomic_notify(&p.seq, 0xFFFF_FFFF);
+    for t in p.threads.items() {
+        t.join();
+    }
+    for k in 0..p.threads.len {
+        let wk = &mut p.workers[k];
+        ir.shared_reuse(&mut wk.end);
+        slot_epochs.set(wk.slot, wk.end.epoch);
+    }
+    p.threads.deinit();
+}
+
+// Starts a round for the tasks to come (par_push) over m's functions, at
+// most one per function, on the threads of p (nil: on this one).
+fn par_begin(p: *mut Pool, m: *mut ir.Module, level: i32) *mut Work {
+    let w = u.new.[Work]();
+    w.tasks = u.newn.[Task](m.funcs.len + 1);
+    w.level = level;
+    w.pool = p;
+    if u.isnil(p) {
+        return w;
+    }
+    if not ir.graves_empty() {
+        // (a function's graveyard is the thread's that took its values out)
+        for i in 0..m.funcs.len {
+            ir.recycle(m.funcs.get(i));
+        }
+    }
+    ir.shared_begin();
+    @atomic_store(&mut p.cur, @int_from_ptr(w));
+    return w;
+}
+
+// Adds a task: kind on f (run at once if no other thread runs); its index.
+fn par_push(w: *mut Work, f: *mut ir.Func, kind: i32) usize {
+    let k = @as(usize, w.ntasks);
+    w.tasks[k] = Task.{ f: f, kind: kind, done: 0, fwds: u.List.[*mut ir.Value].empty() };
+    if u.isnil(w.pool) {
+        w.ntasks += 1;
+        w.taken += 1;
+        run_task(w, &mut w.tasks[k]);
+        return k;
+    }
+    // (what this thread forwarded reaches f's operands here: the other
+    // threads do not know it)
+    ir.apply_forwarding(f);
+    @atomic_store(&mut w.ntasks, w.ntasks + 1);
+    _ = @atomic_add(&mut w.pool.seq, 1);
+    _ = @atomic_notify(&w.pool.seq, 0xFFFF_FFFF);
+    return k;
+}
+
+fn par_done(w: *mut Work, k: usize) bool {
+    return @atomic_load(&w.tasks[k].done) == 1;
+}
+
+// Until a task is done that was not when ndone was `seen`: one waiting is
+// run on this thread (if any).
+fn par_wait(w: *mut Work, seen: u32) void {
+    if run_one(w) {
+        return;
+    }
+    while @atomic_load(&w.ndone) == seen {
+        _ = @atomic_wait(&w.ndone, seen, -1);
+    }
+}
+
+// Runs one task not taken yet, if there is one.
+fn run_one(w: *mut Work) bool {
+    loop {
+        let t = @atomic_load(&w.taken);
+        if t >= @atomic_load(&w.ntasks) {
+            return false;
+        }
+        if @atomic_cas(&mut w.taken, t, t + 1) == t {
+            run_task(w, &mut w.tasks[@as(usize, t)]);
+            return true;
+        }
+    }
+}
+
+fn run_task(w: *mut Work, t: *mut Task) void {
+    if t.kind == K_OPT {
+        optimize_func(t.f, w.level);
+    } else {
+        resimplify(t.f);
+    }
+    if u.notnil(w.pool) {
+        t.fwds = ir.sh_task_end();
+    }
+    @atomic_store(&mut t.done, 1);
+    _ = @atomic_add(&mut w.ndone, 1);
+    _ = @atomic_notify(&w.ndone, 0xFFFF_FFFF);
+}
+
+// Once every task is pushed: runs them (with the other threads) to the
+// end, and ends the round.
+fn par_end(w: *mut Work) void {
+    if u.isnil(w.pool) {
+        return;
+    }
+    while run_one(w) {}
+    loop {
+        let d = @atomic_load(&w.ndone);
+        if d == @atomic_load(&w.ntasks) {
+            break;
+        }
+        _ = @atomic_wait(&w.ndone, d, -1);
+    }
+    @atomic_store(&mut w.pool.cur, 0);
+    ir.shared_end();
+    // (in the order of the tasks, as on one thread)
+    for k in 0..@as(usize, w.ntasks) {
+        let t = &mut w.tasks[k];
+        if t.fwds.len > 0 {
+            ir.shared_forwards(&t.fwds);
+            t.fwds.deinit();
+        }
+    }
+}
+
+// On a thread of the pool: the tasks of its rounds until it stops.
+fn run_worker(wk: *mut Worker) void {
+    let p = wk.p;
+    let s = &p.st;
+    tg.g_features = s.features;
+    dbi.locations = s.locations;
+    dbi.c_version = s.c_version;
+    thr.part_begin(&s.thr);
+    opt.part_begin(&s.opt);
+    lopt.part_begin(&s.lopt);
+    gvn.part_begin(s.gvn);
+    ir.sh_thread_begin(&s.ir, slot_epochs.get(wk.slot));
+    tags_set(slot_tags.at(wk.slot));
+    loop {
+        let seq = @atomic_load(&p.seq);
+        let w = @atomic_load(&p.cur);
+        if (w != 0) and run_one(@ptr_from_int(*mut Work, w)) {
+            continue;
+        }
+        if @atomic_load(&p.stop) == 1 {
+            break;
+        }
+        _ = @atomic_wait(&p.seq, seq, -1);
+    }
+    slot_tags.set(wk.slot, tags_now());
+    wk.end = ir.sh_thread_end();
 }
 
 // The passes after inlining, which see one function at a time, over the
