@@ -2231,6 +2231,64 @@ fn peephole(b: *mut mc.MBlock) void {
     }
 }
 
+// A constant, an address or a copy put in a general register that the block
+// writes again before anything reads it goes (the definitions of
+// rematerialized values whose every use builds them again). Only plain
+// operations are followed; anything else ends what is known.
+fn drop_dead_writes(b: *mut mc.MBlock) void {
+    let mut dead: u64 = 0;  // registers written later in the block before being read
+    let mut i = b.last;
+    while u.notnil(i) {
+        let pv = i.prev;
+        let op = i.op;
+        if ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA)) and (i.sz >= 4) and (i.ops[0].kind == mc.K_REG) {
+            let d = P(i.ops[0].reg);
+            if (d >= 0) and (d < 16) and (d != xe.RSP) and (d != xe.RBP) and ((dead & gpr_bit(d)) != 0) {
+                mc.remove(b, i);
+                i = pv;
+                continue;
+            }
+        }
+        if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.LOAD) or (op == xe.STORE) or
+                (op == xe.STORE_I) or (op == xe.ALU) or (op == xe.TEST) or (op == xe.IMUL) or (op == xe.IMUL_I) or
+                (op == xe.EXT)) {
+            dead = 0;  // (a jump: what is read where it goes is not known)
+            i = pv;
+            continue;
+        }
+        // written (whole: 4 or 8 bytes), then read
+        let full = (i.sz >= 4) or ((op == xe.LOAD) and (i.cc != 0)) or (op == xe.EXT);
+        for k in 0..i.ops.len {
+            let o = i.ops[k];
+            if (o.kind == mc.K_REG) and ((o.role & mc.RD) != 0) and ((o.role & mc.RU) == 0) and full and (o.reg >= 0) {
+                dead |= gpr_bit(P(o.reg));
+            }
+        }
+        for k in 0..i.ops.len {
+            let o = i.ops[k];
+            if (o.kind == mc.K_REG) and (((o.role & mc.RU) != 0) or ((o.role & mc.RD) == 0) or not full) and
+               (o.reg >= 0) {
+                dead = dead & ~gpr_bit(P(o.reg));
+            } else if o.kind == mc.K_MEM {
+                if o.base >= 0 {
+                    dead = dead & ~gpr_bit(P(o.base));
+                }
+                if o.index >= 0 {
+                    dead = dead & ~gpr_bit(P(o.index));
+                }
+            }
+        }
+        i = pv;
+    }
+}
+
+fn gpr_bit(r: i32) u64 {
+    if (r < 0) or (r >= 16) {
+        return 0;
+    }
+    return @as(u64, 1) << @int_cast(u64, r);
+}
+
 // A compare of registers (or a register and a constant) that an identical
 // earlier one in the block makes redundant, with nothing between that sets
 // the flags or writes the registers, is dropped (before allocation, and
@@ -2633,6 +2691,7 @@ fn tidy_branches() []mut bool {
         reuse_flags(xc.FN.mf.blocks.get(bi));
         reuse_k1(xc.FN.mf.blocks.get(bi));
         peephole(xc.FN.mf.blocks.get(bi));
+        drop_dead_writes(xc.FN.mf.blocks.get(bi));
         // (again: the adds that peephole made leas no longer set the
         // flags between two compares of the same, as `cmp; cmov; lea; cmp`)
         reuse_flags(xc.FN.mf.blocks.get(bi));
