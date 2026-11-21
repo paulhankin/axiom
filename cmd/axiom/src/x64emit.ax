@@ -2656,10 +2656,12 @@ fn tidy_branches() []mut bool {
     return skip;
 }
 
-// A compare that starts a block, after every jump into it (and the code
+// A compare that starts a block (or follows only moves and the like that
+// keep the flags and its registers), after every jump into it (and the code
 // falling into it) has left the flags of that same compare: it goes (`cmp
 // x, 2; jle L` ... `L: cmp x, 2; jge M`, the two tests of an if-else
-// chain on one value).
+// chain on one value; `cmp len, cap; jne L` ... `L: cmp len, cap; jae
+// M`, a vector's push testing for room and then the bounds).
 fn reuse_flags_across(skip: []bool) void {
     let nb = xc.FN.mf.blocks.len;
     // the compare each block starts with, if any
@@ -2671,40 +2673,37 @@ fn reuse_flags_across(skip: []bool) void {
         if skip[bi] or (@as(i32, @int_cast(i32, bi)) == xc.FN.sw) {
             continue;  // (SW starts with the prologue, which sets the flags)
         }
-        let mut c = xc.FN.mf.blocks.get(bi).first;
-        while u.notnil(c) and noop_move(c) {
+        // (past moves and other operations that keep the flags and do not
+        // write the compare's registers: `mov rax, rcx; cmp rdx, rcx`)
+        let b0 = xc.FN.mf.blocks.get(bi).first;
+        let mut c = b0;
+        while u.notnil(c) and (noop_move(c) or (keeps_flags(c) and (c.op != xe.SETCC) and (c.op != xe.CMOV))) {
             c = c.next;
         }
         if u.notnil(c) and plain_compare(c) {
-            first[bi] = c;
-            any = true;
+            let mut w = b0;
+            while (w != c) and not writes_reg_of(w, c) {
+                w = w.next;
+            }
+            if w == c {
+                first[bi] = c;
+                any = true;
+            }
         }
     }
     if any {
-        for pj in 0..nb {
-            if skip[pj] {
+        let mut ws = ways_into(skip);
+        for t in 0..nb {
+            if u.isnil(first[t]) {
                 continue;
             }
-            let p = xc.FN.mf.blocks.get(pj);
-            let mut j = p.first;
-            while u.notnil(j) {
-                if j.op == xe.JTAB {
-                    // (the flags of the table's arithmetic)
-                    for k in 3..j.ops.len {
-                        bad[@int_cast(usize, j.ops[k].label)] = true;
-                    }
+            bad[t] = ws.table[t];  // (the flags of the table's arithmetic)
+            let js = &ws.jumps[t];
+            for k in 0..js.len {
+                npred[t] += 1;
+                if not hold_at(skip, &ws, ws.from[t].get(k), js.get(k).prev, first[t], true) {
+                    bad[t] = true;
                 }
-                if ((j.op == xe.JMP) or (j.op == xe.JCC)) and (j.ops.len > 0) and (j.ops[0].kind == mc.K_LABEL) and
-                   (j.ops[0].label >= 0) and (j.ops[0].label < @int_cast(i32, nb)) {
-                    let t = @int_cast(usize, j.ops[0].label);
-                    if u.notnil(first[t]) {
-                        npred[t] += 1;
-                        if not flags_hold(j, first[t]) {
-                            bad[t] = true;
-                        }
-                    }
-                }
-                j = j.next;
             }
         }
         for bi in 1..nb {
@@ -2719,7 +2718,17 @@ fn reuse_flags_across(skip: []bool) void {
             }
             let p = xc.FN.mf.blocks.get(pj);
             if not skip[pj] and not ends_flow(p) {
-                if u.isnil(p.last) or not falls_to(skip, pj, @int_cast(i32, bi)) or not flags_hold_after(p.last, c) {
+                if u.isnil(p.last) or not falls_to(skip, pj, @int_cast(i32, bi)) {
+                    continue;
+                }
+                if not hold_at(skip, &ws, pj, p.last, c, true) {
+                    // the jumps in have those flags, the code falling in not:
+                    // that code compares (the moves before c keep its flags
+                    // and registers)
+                    if (npred[bi] > 0) and (pj != 0) and (@as(i32, @int_cast(i32, pj)) != xc.FN.sw) {
+                        mc.remove(xc.FN.mf.blocks.get(bi), c);
+                        mc.append(p, c);
+                    }
                     continue;
                 }
                 npred[bi] += 1;
@@ -2728,27 +2737,22 @@ fn reuse_flags_across(skip: []bool) void {
                 mc.remove(xc.FN.mf.blocks.get(bi), c);
             }
         }
+        free_ways(&mut ws);
     }
     u.free_slice(first);
     u.free_slice(bad);
     u.free_slice(npred);
 }
 
-// Do the flags at jump j (before it) come from a compare the same as c,
-// with c's registers unchanged since?
-fn flags_hold(j: *mc.MInst, c: *mc.MInst) bool {
-    if u.isnil(j.prev) {
-        return false;
-    }
-    return flags_hold_after(j.prev, c);
-}
-
-// The same after instruction i (included).
-fn flags_hold_after(i: *mc.MInst, c: *mc.MInst) bool {
+// After instruction i (included; nil: at the start of its block): 1 if the
+// flags come from a compare the same as c with c's registers unchanged
+// since, 2 if nothing from the start of the block on changes the flags or
+// those registers, 0 otherwise.
+fn flags_walk(i: *mc.MInst, c: *mc.MInst) i32 {
     let mut w = i;
     while u.notnil(w) {
         if (w.op == xe.LABEL) or (w.op == xe.CALL) {
-            return false;
+            return 0;
         }
         if (w.op == xe.JCC) or noop_move(w) {
             w = w.prev;
@@ -2756,14 +2760,96 @@ fn flags_hold_after(i: *mc.MInst, c: *mc.MInst) bool {
         }
         if (w.op == c.op) and (w.sz == c.sz) and (w.cc == c.cc) and same_mop(w.ops[0], c.ops[0]) and
            same_mop(w.ops[1], c.ops[1]) {
-            return true;
+            return 1;
         }
         if not keeps_flags(w) or writes_reg_of(w, c) {
-            return false;
+            return 0;
         }
         w = w.prev;
     }
-    return false;
+    return 2;
+}
+
+// The jumps into each block (and the blocks they are in), and whether a
+// jump table goes there.
+struct Ways {
+    jumps: []mut u.List.[*mc.MInst],
+    from: []mut u.List.[usize],
+    table: []mut bool,
+}
+
+fn ways_into(skip: []bool) Ways {
+    let nb = xc.FN.mf.blocks.len;
+    let w = Ways.{ jumps: u.newn.[u.List.[*mc.MInst]](nb + 1), from: u.newn.[u.List.[usize]](nb + 1),
+                   table: u.newn.[bool](nb + 1) };
+    for bi in 0..nb {
+        w.jumps[bi] = u.List.[*mc.MInst].empty();
+        w.from[bi] = u.List.[usize].empty();
+        w.table[bi] = false;
+    }
+    for pj in 0..nb {
+        if skip[pj] {
+            continue;
+        }
+        let mut j = xc.FN.mf.blocks.get(pj).first;
+        while u.notnil(j) {
+            if j.op == xe.JTAB {
+                for k in 3..j.ops.len {
+                    w.table[@int_cast(usize, j.ops[k].label)] = true;
+                }
+            }
+            if ((j.op == xe.JMP) or (j.op == xe.JCC)) and (j.ops.len > 0) and (j.ops[0].kind == mc.K_LABEL) and
+               (j.ops[0].label >= 0) and (j.ops[0].label < @int_cast(i32, nb)) {
+                let t = @int_cast(usize, j.ops[0].label);
+                w.jumps[t].push(j);
+                w.from[t].push(pj);
+            }
+            j = j.next;
+        }
+    }
+    return w;
+}
+
+fn free_ways(w: *mut Ways) void {
+    for bi in 0..xc.FN.mf.blocks.len {
+        w.jumps[bi].deinit();
+        w.from[bi].deinit();
+    }
+}
+
+// flags_walk from i in block bi; when that reaches the start of the block
+// (and deeper is set), every way into the block must leave those flags
+// (one level: `cmp a, b; jne L` ... `L: mov x, b` falling into the block
+// that compares again).
+fn hold_at(skip: []bool, ws: *Ways, bi: usize, i: *mc.MInst, c: *mc.MInst, deeper: bool) bool {
+    let r = flags_walk(i, c);
+    if r != 2 {
+        return r == 1;
+    }
+    if not deeper or (bi == 0) or skip[bi] or (@as(i32, @int_cast(i32, bi)) == xc.FN.sw) or ws.table[bi] {
+        return false;
+    }
+    let mut n: i32 = 0;
+    let js = &ws.jumps[bi];
+    for k in 0..js.len {
+        if not hold_at(skip, ws, ws.from[bi].get(k), js.get(k).prev, c, false) {
+            return false;
+        }
+        n += 1;
+    }
+    let mut pj = bi - 1;
+    while (pj > 0) and skip[pj] {
+        pj -= 1;
+    }
+    let p = xc.FN.mf.blocks.get(pj);
+    if not skip[pj] and not ends_flow(p) {
+        if u.isnil(p.last) or not falls_to(skip, pj, @int_cast(i32, bi)) or
+           not hold_at(skip, ws, pj, p.last, c, false) {
+            return false;
+        }
+        n += 1;
+    }
+    return n > 0;
 }
 
 // The real instructions of block b (no no-op moves or local labels), when
@@ -2957,7 +3043,10 @@ fn dup_exit_tests(skip: []bool) void {
     for bi in 0..xc.FN.mf.blocks.len {
         if not skip[bi] {
             dup_exit_test(skip, bi);
-            dup_tail(skip, bi);
+            if dup_tail(skip, bi) {
+                // (now jumping to where that block went, perhaps a test)
+                dup_exit_test(skip, bi);
+            }
         }
     }
     drop_fall_tests(skip);
@@ -3080,29 +3169,30 @@ fn copy_inst(i: *mc.MInst) *mut mc.MInst {
 // latch, where the cases of a switch meet) that it does not fall into, and
 // is not on a cold path, it does that
 // block's work itself and branches from there, a jump fewer on the way (a
-// switch's cases each branch back to its loop's head). Not at -O0.
-fn dup_tail(skip: []bool, bi: usize) void {
+// switch's cases each branch back to its loop's head). Not at -O0. Whether
+// it did.
+fn dup_tail(skip: []bool, bi: usize) bool {
     let f = xc.FN.f;
     let mut level = tg.g_opt_level;
     if f.opt_override > 0 {
         level = @as(i32, f.opt_override) - 1;
     }
     if level == 0 {
-        return;
+        return false;
     }
     let nb = xc.FN.mf.blocks.len;
     let p = xc.FN.mf.blocks.get(bi);
     let l = p.last;
     if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].kind != mc.K_LABEL) or (l.ops[0].label >= xe.LOCAL_BASE) {
-        return;
+        return false;
     }
     let t = @int_cast(usize, l.ops[0].label);
     if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == xc.FN.sw) {
-        return;
+        return false;
     }
     let tb = xc.FN.mf.blocks.get(t);
     if (tb.noframe != p.noframe) or (tb.loop_depth == 0) or p.cold {
-        return;
+        return false;
     }
     // its instructions, and those of the blocks it falls into, up to the
     // branches at the end: a conditional one (falling to the next block, or
@@ -3173,7 +3263,7 @@ fn dup_tail(skip: []bool, bi: usize) void {
     }
     if not ok or (body == 0) or (body > 4) {
         ins.deinit();
-        return;
+        return false;
     }
     mc.remove(p, l);
     for k in 0..n {
@@ -3184,6 +3274,7 @@ fn dup_tail(skip: []bool, bi: usize) void {
         let ops: [1]mc.MOp = [mc.label(after)];
         mc.append(p, mc.new_inst(xe.JMP, 0, ops[..]));
     }
+    return true;
 }
 
 // dup_exit_tests' second part: a test at the start of a block entered only
