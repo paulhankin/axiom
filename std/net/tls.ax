@@ -641,11 +641,11 @@ pub struct ServerConfig {
             return e;
         };
         let mut kind = x509.KeyKind.UNSUPPORTED;
-        match key {
-            .Rsa(k)     => { kind = x509.KeyKind.RSA; }
-            .P256(k)    => { kind = x509.KeyKind.P256; }
-            .P384(k)    => { kind = x509.KeyKind.P384; }
-            .Ed25519(k) => { kind = x509.KeyKind.ED25519; }
+        match &key {
+            .Rsa(_)     => { kind = x509.KeyKind.RSA; }
+            .P256(_)    => { kind = x509.KeyKind.P256; }
+            .P384(_)    => { kind = x509.KeyKind.P384; }
+            .Ed25519(_) => { kind = x509.KeyKind.ED25519; }
         }
         return ServerConfig.{ chain: chain, key: key, key_kind: kind, alpn: [], min_version: VERSION_1_2 };
     }
@@ -1293,7 +1293,7 @@ fn if_u8(b: bool) u8 {
 
 /// Signs content with the server key; returns the scheme and signature.
 fn sign_content(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) TlsError![]u8 {
-    match cfg.key {
+    match &cfg.key {
         .Ed25519(k) => {
             if not scheme_offered(schemes, SIG_ED25519) {
                 return error.HandshakeFailure;
@@ -1363,6 +1363,12 @@ pub fn connect(hostname: []u8, port: u16, cfg: *ClientConfig) !*mut Conn {
 /// SNI (unless it is an IP address) and checked against the certificate.
 /// The stream belongs to the Conn afterwards (on failure too).
 pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut Conn {
+    return client_with_alpn(stream, hostname, cfg, cfg.alpn);
+}
+
+/// Runs the client handshake over a connected stream, offering `alpn` instead
+/// of `cfg.alpn`. The stream belongs to the Conn afterwards (on failure too).
+pub fn client_with_alpn(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig, alpn: [][]u8) !*mut Conn {
     // (longer than any DNS name; and with no name, the certificate could
     // belong to anyone: verification needs one)
     if (hostname.len > 255) or ((hostname.len == 0) and cfg.verify) {
@@ -1378,7 +1384,7 @@ pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut C
     @mem_copy(c.sni[..n], hostname[..n]);
     c.sni_len = n;
     c.deadline = time.Instant.now().ns + (HANDSHAKE_TIMEOUT_MS * 1000000);
-    client_handshake(c, cfg) catch |e| {
+    client_handshake(c, cfg, alpn) catch |e| {
         stream.close();
         c.hs.deinit();
         mem.destroy(c);
@@ -1411,7 +1417,7 @@ fn is_host_name(n: []u8) bool {
     return true;
 }
 
-fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes: []u8, session_id: []u8,
+fn client_hello(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8, shares: *Shares, random_bytes: []u8, session_id: []u8,
                 cookie: []u8) TlsError!Out {
     let mut o = out();
     o.put8(HS_CLIENT_HELLO)!;
@@ -1513,11 +1519,11 @@ fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes:
         o.put(cookie)!;
         o.close(ck, 2);
     }
-    if cfg.alpn.len > 0 {
+    if alpn.len > 0 {
         o.put16(EXT_ALPN)!;
         let a = o.open(2)!;
         let al = o.open(2)!;
-        for p in cfg.alpn {
+        for p in alpn {
             o.put8(@truncate(u8, p.len))!;
             o.put(p)!;
         }
@@ -1586,7 +1592,7 @@ fn parse_server_hello(msg: []u8) TlsError!ServerHello {
     return sh;
 }
 
-fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
+fn client_handshake(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8) !void {
     let mut shares = make_shares()!;
     let mut rnd: [32]u8 = [0; 32];
     let mut sid: [32]u8 = [0; 32];
@@ -1594,7 +1600,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     random.fill(sid[..])!;
     let mut tr = Transcript.init();
     defer tr.deinit();
-    let mut ch = client_hello(c, cfg, &shares, rnd[..], sid[..], "")!;
+    let mut ch = client_hello(c, cfg, alpn, &shares, rnd[..], sid[..], "")!;
     tr.add(ch.bytes())!;
     c.send_handshake(ch.bytes())!;
     ch.s.deinit();
@@ -1614,7 +1620,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
             // resuming a session we never had
             return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
         }
-        return client_handshake12(c, cfg, &mut tr, msg, sh, rnd[..]);
+        return client_handshake12(c, cfg, alpn, &mut tr, msg, sh, rnd[..]);
     }
     if (cfg.max_version < VERSION_1_3) or not @mem_eq(sh.session_id, sid[..]) {
         return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);  // must echo ours
@@ -1644,7 +1650,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         let mut cookie = strs.String.init();
         defer cookie.deinit();
         cookie.push_str(sh.cookie)!;
-        let mut ch2 = client_hello(c, cfg, &shares, rnd[..], sid[..], cookie.bytes())!;
+        let mut ch2 = client_hello(c, cfg, alpn, &shares, rnd[..], sid[..], cookie.bytes())!;
         tr.add(ch2.bytes())!;
         c.send_handshake(ch2.bytes())!;
         ch2.s.deinit();
@@ -1681,7 +1687,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     // encrypted handshake messages
     let ee = c.expect_message(HS_ENCRYPTED_EXTENSIONS)!;
     tr.add(ee)!;
-    read_encrypted_extensions(c, ee, cfg.alpn)!;
+    read_encrypted_extensions(c, ee, alpn)!;
     let mut next = c.next_message()!;
     let mut cert_requested = false;
     if next[0] == HS_CERTIFICATE_REQUEST {
@@ -1699,8 +1705,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         return c.fail(ALERT_DECODE_ERROR, error.BadCertificate);
     }
     if cfg.verify {
-        let mut roots = cfg.roots;
-        x509.verify_chain(chain.items(), &roots, c.sni[..c.sni_len], time.now()) catch |e| {
+        x509.verify_chain(chain.items(), &cfg.roots, c.sni[..c.sni_len], time.now()) catch |e| {
             return c.fail(ALERT_BAD_CERTIFICATE, e);
         };
     }
@@ -1793,15 +1798,14 @@ fn parse_certificates(c: *mut Conn, msg: []u8) !vec.Vec.[x509.Certificate] {
             free_certs(&mut list);
             return e;
         };
-        let mut cert = x509.Certificate.parse(d) catch |e| {
-            free_certs(&mut list);
-            return c.fail(ALERT_BAD_CERTIFICATE, e);
-        };
-        list.push(cert) catch |e| {
-            cert.deinit();
+        list.reserve(1) catch |e| {
             free_certs(&mut list);
             return e;
         };
+        list.push(x509.Certificate.parse(d) catch |e| {
+            free_certs(&mut list);
+            return c.fail(ALERT_BAD_CERTIFICATE, e);
+        })!;
     }
     return list;
 }
@@ -1983,15 +1987,14 @@ fn parse_certificates12(c: *mut Conn, msg: []u8) !vec.Vec.[x509.Certificate] {
             free_certs(&mut list);
             return e;
         };
-        let mut cert = x509.Certificate.parse(d) catch |e| {
-            free_certs(&mut list);
-            return c.fail(ALERT_BAD_CERTIFICATE, e);
-        };
-        list.push(cert) catch |e| {
-            cert.deinit();
+        list.reserve(1) catch |e| {
             free_certs(&mut list);
             return e;
         };
+        list.push(x509.Certificate.parse(d) catch |e| {
+            free_certs(&mut list);
+            return c.fail(ALERT_BAD_CERTIFICATE, e);
+        })!;
     }
     return list;
 }
@@ -2022,7 +2025,7 @@ fn check_signature12(key: *x509.PublicKey, scheme: u16, content: []u8, sig: []u8
 /// Signs a ServerKeyExchange: as sign_content, or with PKCS #1 v1.5 for an
 /// RSA key when the client does not offer PSS.
 fn sign_content12(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) TlsError![]u8 {
-    match cfg.key {
+    match &cfg.key {
         .Rsa(k) => {
             if not scheme_offered(schemes, SIG_RSA_PSS_SHA256) and scheme_offered(schemes, SIG_RSA_PKCS1_SHA256) {
                 let mut d: [32]u8 = [0; 32];
@@ -2038,8 +2041,8 @@ fn sign_content12(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u
     return sign_content(cfg, schemes, content, sig, scheme);
 }
 
-fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, tr: *mut Transcript, sh_msg: []u8, sh: ServerHello,
-                      cr: []u8) !void {
+fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8, tr: *mut Transcript, sh_msg: []u8,
+                      sh: ServerHello, cr: []u8) !void {
     c.v12 = true;
     let mut sr: [32]u8 = [0; 32];
     @mem_copy(sr[..], sh.random);
@@ -2051,7 +2054,7 @@ fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, tr: *mut Transcript, sh_
         return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
     }
     if sh.alpn.len > 0 {
-        accept_alpn(c, sh.alpn, cfg.alpn)!;
+        accept_alpn(c, sh.alpn, alpn)!;
     }
     let ems = sh.ems;
     tr.add(sh_msg)!;
@@ -2066,8 +2069,7 @@ fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, tr: *mut Transcript, sh_
         return c.fail(ALERT_DECODE_ERROR, error.BadCertificate);
     }
     if cfg.verify {
-        let mut roots = cfg.roots;
-        x509.verify_chain(chain.items(), &roots, c.sni[..c.sni_len], time.now()) catch |e| {
+        x509.verify_chain(chain.items(), &cfg.roots, c.sni[..c.sni_len], time.now()) catch |e| {
             return c.fail(ALERT_BAD_CERTIFICATE, e);
         };
     }
@@ -2902,7 +2904,7 @@ test "client and server" {
     scfg.alpn = protos[1..];
     let mut ts = TestServer.{ listener: net.listen("127.0.0.1", 0)!, cfg: &scfg, failures: 0 };
     let port = ts.listener.port();
-    let th = thread.spawn(test_serve, &mut ts)!;
+    let mut th = thread.spawn(test_serve, &mut ts)!;
 
     let mut ccfg = ClientConfig.with_roots_pem(cert)!;
     defer ccfg.deinit();
@@ -3056,7 +3058,7 @@ test "TLS 1.2" {
         scfg.alpn = protos[1..];
         let mut port: u16 = 0;
         let mut ts = serve_once_with(&scfg, &mut port)!;
-        let th = thread.spawn(test_serve, &mut ts)!;
+        let mut th = thread.spawn(test_serve, &mut ts)!;
         let mut ccfg = ClientConfig.with_roots_pem(cert)!;
         defer ccfg.deinit();
         ccfg.max_version = VERSION_1_2;
@@ -3208,7 +3210,7 @@ fn against_server_hello(suite: u16, hrr: bool, group: u16) error {
     let mut f = FakeServer.{ listener: net.listen("127.0.0.1", 0) catch |e| return e, suite: suite, hrr: hrr,
                              group: group };
     defer f.listener.close();
-    let th = thread.spawn(fake_serve, &mut f) catch |e| return e;
+    let mut th = thread.spawn(fake_serve, &mut f) catch |e| return e;
     defer th.join();
     let mut insecure = ClientConfig.insecure();
     defer insecure.deinit();

@@ -230,11 +230,11 @@ GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ### 3.2 Aggregates and functions
 
 ```ebnf
-StructDecl    ::= "struct" IDENT GenericParams? "{" FieldList? MethodDecl* "}"
+StructDecl    ::= "nocopy"? "struct" IDENT GenericParams? "{" FieldList? MethodDecl* "}"
 FieldList     ::= Field ( "," Field )* ","?
 Field         ::= "pub"? IDENT ":" Type
 
-UnionDecl     ::= "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
+UnionDecl     ::= "nocopy"? "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
 Variant       ::= IDENT ( ":" Type )?
 
 EnumDecl      ::= "enum" IDENT ( ":" PrimType )? "{" Member ( "," Member )* ","? MethodDecl* "}"
@@ -706,6 +706,25 @@ A struct (or union) larger than the target's largest object is rejected (§5.5, 
 
 Anonymous struct types `struct { … }` follow the same rules. Two anonymous struct types are
 the same type when their field names and field types match exactly, in the same order.
+
+**`nocopy` types.** A `nocopy struct` or `nocopy union` (where `nocopy` is contextual
+directly before `struct` or `union`) forbids implicit bitwise copying from places so that
+owning containers and address-pinned synchronization types cannot be accidentally aliased or
+double-freed. `nocopy` propagates structurally through value containment: any struct,
+union, array (`[N]T`), optional (`?T`), or error union (`!T`) containing a `nocopy` type by
+value is also `nocopy`. Raw pointers (`*T`, `*mut T`) and slices (`[]T`, `[]mut T`) are
+always copyable.
+
+- Rvalues (calls, struct/union/array literals, `@swap(&mut a, &mut b)`, `.some(x)`, `catch`,
+  `??`, and `e!` on an rvalue) may produce `nocopy` values freely.
+- Moving a bare local variable `v` is allowed in `return v;`, struct literal fields
+  `S.{ f: v }`, union variant constructors `U.V(v)`, array literals `[v]`, and `.some(v)`.
+  Any later read, address-take (`&v`, `&mut v`), method call, or second move of `v` before
+  direct reassignment (`v = …;`) is `E0709`.
+- Copying a `nocopy` value from any other place (including `let b = a;`, `dst = a;`,
+  by-value call arguments `f(a)`, `for x in s`, `match u`, `[e; N]` with `N > 1`, or
+  `return s.f` / `return p.*`) is `E0708` (use pointers `*T`/`*mut T`, `for &x`/`for &mut x`,
+  `match &u`, `.clone()`, or `@swap(&mut a, &mut b)`).
 
 ### 5.10 Tagged unions
 
@@ -1221,7 +1240,8 @@ reaches a `break` or `return`.
    immutable.
 2. `for x in s { … }`, `for &x in s { … }`, and `for &mut x in s { … }` evaluate `s` (an
    array or slice) once and iterate over its elements in order without bounds checks.
-   - `for x in s` binds `x: T` to a copy of each element.
+   - `for x in s` binds `x: T` to a copy of each element (rejected with `E0708` when `T` is
+     `nocopy`).
    - `for &x in s` binds `x: *T` pointing to each element in place (with zero copying).
    - `for &mut x in s` binds `x: *mut T` pointing to each element; `s` must be `[]mut T`
      or a mutable array place (`E0701` / `E0704` otherwise).
@@ -1241,7 +1261,8 @@ The scrutinee of a `match` must be a union, an optional `?T`, a pointer `*U` or 
 `u8`), `bool`, or `error`.
 
 - **Union**: each arm is `.Variant` or `.Variant(name)`. `name` binds a copy of the
-  payload.
+  payload (matching a `nocopy` union or optional place by value with a payload binding is
+  `E0708`; match `&u` or `&mut u` instead).
 - **Optional (`?T`)**: each arm is `.none` or `.some` / `.some(name)`. `name` binds a
   copy of the payload.
 - **Pointer to union or optional (`*U`, `*mut U`)**: arms use the same `.Variant` / `.none`
@@ -2851,6 +2872,8 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0705 | Dereferencing `*void` or a non-pointer |
 | E0706 | A pointer operation that needs `*mut`, or assignment to a non-place |
 | E0707 | Cannot obtain `*mut` or `[]mut` through an immutable place |
+| E0708 | Cannot copy or repeat a `nocopy` value from a place (§5.9) |
+| E0709 | Use of a moved `nocopy` local variable (§5.9) |
 | E0801 | Type not allowed at the export or import boundary |
 | E0802 | Export name used more than once |
 | E0810 | Comparing vectors with `==` or `<` (use `@lanes_eq`, …) |
@@ -3432,6 +3455,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@prefetch_write(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be written soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
+| `@swap(a, b)` | `*mut T, *mut T → void` | Exchanges the values at `a` and `b` in place (works for `nocopy` types) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
 | `@volatile_load(p)` | `*T → T` | Reads memory at `p` without load elimination, reordering across other volatile operations, or constant folding |

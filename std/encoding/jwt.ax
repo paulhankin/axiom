@@ -212,7 +212,7 @@ fn sign_bytes(alg: Alg, key: SigningKey, msg: []u8, out: []mut u8) JwtError!usiz
             return hl;
         }
         .Private(p) => {
-            match p.* {
+            match p {
                 .Rsa(k) => {
                     if not (is_pkcs1(alg) or is_pss(alg)) or (k.public.bits() < MIN_RSA_BITS) {
                         return error.InvalidKey;
@@ -656,8 +656,14 @@ fn read_key_file(name: []u8, suffix: []u8) JwtError![]mut u8 {
     return fs.read_file(p.bytes());
 }
 
-fn result_of(r: !Token) []u8 {
-    let mut t = r catch |e| return @error_name(e);
+fn decode_result(token: []u8, alg: Alg, key: VerifyingKey, v: Validation) []u8 {
+    let mut t = decode(token, alg, key, v) catch |e| return @error_name(e);
+    t.deinit();
+    return "ok";
+}
+
+fn verify_result(token: []u8, alg: Alg, key: VerifyingKey) []u8 {
+    let mut t = verify(token, alg, key) catch |e| return @error_name(e);
     t.deinit();
     return "ok";
 }
@@ -690,7 +696,7 @@ test "tokens from PyJWT" {
             pk = PublicKey.from_pem(pem)!;
             vk = pk.verifying();
         }
-        let got = result_of(decode(token, alg, vk, v));
+        let got = decode_result(token, alg, vk, v);
         if not strs.eq(got, want) {
             io.stderr().println(c.get("note")!.as_str()!) catch {};
         }
@@ -740,33 +746,33 @@ test "claims at their boundaries" {
     let tok = sign(Alg.HS256, SigningKey.Secret(secret), "{\"exp\":1000,\"nbf\":900,\"iat\":900}", "")!;
     defer mem.free(tok);
     let mut v = Validation.at(999);
-    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    @expect_eq(decode_result(tok, Alg.HS256, key, v), "ok");
     v.now = 1000;
-    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "Expired");  // exp <= now
+    @expect_eq(decode_result(tok, Alg.HS256, key, v), "Expired");  // exp <= now
     v.leeway = 1;
-    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    @expect_eq(decode_result(tok, Alg.HS256, key, v), "ok");
     v = Validation.at(899);
-    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "NotYetValid");
+    @expect_eq(decode_result(tok, Alg.HS256, key, v), "NotYetValid");
     v.leeway = 1;
-    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    @expect_eq(decode_result(tok, Alg.HS256, key, v), "ok");
     // required claims, and claims of the wrong type
     let bare = sign(Alg.HS256, SigningKey.Secret(secret), "{\"sub\":\"x\",\"aud\":[]}", "")!;
     defer mem.free(bare);
     v = Validation.at(0);
-    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "ok");  // (an empty aud is no aud)
+    @expect_eq(decode_result(bare, Alg.HS256, key, v), "ok");  // (an empty aud is no aud)
     v.require_exp = true;
-    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "MissingClaim");
+    @expect_eq(decode_result(bare, Alg.HS256, key, v), "MissingClaim");
     v = Validation.at(0);
     v.require_nbf = true;
-    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "MissingClaim");
+    @expect_eq(decode_result(bare, Alg.HS256, key, v), "MissingClaim");
     let odd = sign(Alg.HS256, SigningKey.Secret(secret), "{\"exp\":\"tomorrow\"}", "")!;
     defer mem.free(odd);
-    @expect_eq(result_of(decode(odd, Alg.HS256, key, Validation.at(0))), "InvalidClaim");
+    @expect_eq(decode_result(odd, Alg.HS256, key, Validation.at(0)), "InvalidClaim");
     let iss = sign(Alg.HS256, SigningKey.Secret(secret), "{\"iss\":7}", "")!;
     defer mem.free(iss);
     v = Validation.at(0);
     v.issuer = "7";
-    @expect_eq(result_of(decode(iss, Alg.HS256, key, v)), "InvalidIssuer");
+    @expect_eq(decode_result(iss, Alg.HS256, key, v), "InvalidIssuer");
     // verify alone does not look at the claims
     let mut t = verify(tok, Alg.HS256, key)!;
     defer t.deinit();
@@ -782,8 +788,8 @@ test "keys must suit the algorithm" {
     @expect(fails_sign(sign(Alg.HS512, SigningKey.Secret(long), "{}", "")));
     let tok = sign(Alg.HS384, SigningKey.Secret(long), "{}", "")!;
     defer mem.free(tok);
-    @expect_eq(result_of(verify(tok, Alg.HS384, VerifyingKey.Secret(long[..40]))), "InvalidKey");
-    @expect_eq(result_of(verify(tok, Alg.HS384, VerifyingKey.Secret(long))), "ok");
+    @expect_eq(verify_result(tok, Alg.HS384, VerifyingKey.Secret(long[..40])), "InvalidKey");
+    @expect_eq(verify_result(tok, Alg.HS384, VerifyingKey.Secret(long)), "ok");
     // an Ed25519 key for everything but EdDSA
     let seed: [32]u8 = [7; 32];
     let ed = curve25519.Ed25519.from_seed(seed[..]);
@@ -793,13 +799,13 @@ test "keys must suit the algorithm" {
     @expect(fails_sign(sign(Alg.HS256, SigningKey.Private(&xk), "{}", "")));
     let et = sign(Alg.EDDSA, SigningKey.Private(&xk), "{\"a\":1}", "k")!;
     defer mem.free(et);
-    @expect_eq(result_of(verify(et, Alg.EDDSA, ed_public(&ed))), "ok");
-    @expect_eq(result_of(verify(et, Alg.ES256, ed_public(&ed))), "AlgorithmMismatch");
+    @expect_eq(verify_result(et, Alg.EDDSA, ed_public(&ed)), "ok");
+    @expect_eq(verify_result(et, Alg.ES256, ed_public(&ed)), "AlgorithmMismatch");
     // the HMAC algorithm with a public key, and EdDSA with a secret
     let forged = sign(Alg.HS256, SigningKey.Secret(ed.public[..]), "{\"a\":1}", "")!;
     defer mem.free(forged);
-    @expect_eq(result_of(verify(forged, Alg.HS256, ed_public(&ed))), "InvalidKey");
-    @expect_eq(result_of(verify(et, Alg.EDDSA, VerifyingKey.Secret(long))), "InvalidKey");
+    @expect_eq(verify_result(forged, Alg.HS256, ed_public(&ed)), "InvalidKey");
+    @expect_eq(verify_result(et, Alg.EDDSA, VerifyingKey.Secret(long)), "InvalidKey");
     // RSA: the key file from the tests above, against ES256
     let pem = read_key_file("rsa", "-public.pem") catch return;
     defer mem.free(pem);
@@ -811,9 +817,9 @@ test "keys must suit the algorithm" {
     defer esk.deinit();
     let et2 = sign(Alg.ES256, SigningKey.Private(&esk), "{}", "")!;
     defer mem.free(et2);
-    @expect_eq(result_of(verify(et2, Alg.ES256, pk.verifying())), "InvalidKey");
+    @expect_eq(verify_result(et2, Alg.ES256, pk.verifying()), "InvalidKey");
     @expect(fails_sign(sign(Alg.ES384, SigningKey.Private(&esk), "{}", "")));
-    @expect_eq(result_of(verify(et2, Alg.ES256, VerifyingKey.Secret(long))), "InvalidKey");
+    @expect_eq(verify_result(et2, Alg.ES256, VerifyingKey.Secret(long)), "InvalidKey");
     let bad_pem = PublicKey.from_pem("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n") catch pk;
     @expect_eq(bad_pem.der.len, pk.der.len);
 }
@@ -848,12 +854,12 @@ test "malformed tokens" {
         "bm90IGpzb24.e30.",            // a header that is not JSON
     ];
     for c in cases {
-        @expect_eq(result_of(verify(c, Alg.HS256, key)), "InvalidToken");
+        @expect_eq(verify_result(c, Alg.HS256, key), "InvalidToken");
     }
-    @expect_eq(result_of(verify("eyJhbGciOiJIUzM4NCJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");
-    @expect_eq(result_of(verify("eyJhbGciOiJoczI1NiJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");  // "hs256"
-    @expect_eq(result_of(verify("eyJhbGciOiJub25lIn0.e30.", Alg.HS256, key)), "AlgorithmMismatch");   // "none"
-    @expect(fails_header(header_unverified("x.y.z")));
+    @expect_eq(verify_result("eyJhbGciOiJIUzM4NCJ9.e30.", Alg.HS256, key), "AlgorithmMismatch");
+    @expect_eq(verify_result("eyJhbGciOiJoczI1NiJ9.e30.", Alg.HS256, key), "AlgorithmMismatch");  // "hs256"
+    @expect_eq(verify_result("eyJhbGciOiJub25lIn0.e30.", Alg.HS256, key), "AlgorithmMismatch");   // "none"
+    @expect(fails_header("x.y.z"));
     // every byte changed: an error (or, where base64url has slack, the same token), never a trap
     let mut m = strs.String.init();
     defer m.deinit();
@@ -862,14 +868,14 @@ test "malformed tokens" {
             m.clear();
             m.push_str(good)!;
             m.bytes_mut()[i] ^= flip;
-            let r = result_of(decode(m.bytes(), Alg.HS256, key, Validation.at(0)));
+            let r = decode_result(m.bytes(), Alg.HS256, key, Validation.at(0));
             @expect(not strs.eq(r, "ok"));
         }
     }
 }
 
-fn fails_header(r: !json.Document) bool {
-    let mut d = r catch return true;
+fn fails_header(token: []u8) bool {
+    let mut d = header_unverified(token) catch return true;
     d.deinit();
     return false;
 }

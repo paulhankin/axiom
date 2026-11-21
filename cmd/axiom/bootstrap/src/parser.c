@@ -1487,12 +1487,16 @@ static void parse_top(Parser *P) {
         vec_push(P->mod->decls, parse_fn_inline(P, start, is_pub, false));
         return;
     }
+    bool is_nocopy = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "nocopy") &&
+                     (peek2(P)->kind == KW_STRUCT || peek2(P)->kind == KW_UNION);
+    if (is_nocopy) advance(P);
     switch (pk(P)) {
     case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
     case KW_STRUCT: {
         advance(P);
         Decl *d = new_decl(P, D_STRUCT, start);
         d->is_pub = is_pub;
+        d->is_nocopy = is_nocopy;
         d->name = expect_ident(P, &d->name_span);
         parse_generic_params(P, d);
         expect(P, TK_LBRACE);
@@ -1507,6 +1511,7 @@ static void parse_top(Parser *P) {
         advance(P);
         Decl *d = new_decl(P, D_UNION, start);
         d->is_pub = is_pub;
+        d->is_nocopy = is_nocopy;
         d->name = expect_ident(P, &d->name_span);
         parse_generic_params(P, d);
         expect(P, TK_LBRACE);

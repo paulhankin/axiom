@@ -20,6 +20,23 @@ typedef struct ScopeEntry {
     Local *local;
 } ScopeEntry;
 
+typedef struct LoopInfo {
+    Sym label;
+    bool has_break;
+    int local_base;     // C->locals.len at loop entry
+    bool *entry_moved;  // length local_base
+    Span *entry_spans;  // length local_base
+    bool *break_moved;  // length local_base
+    Span *break_spans;  // length local_base
+    bool break_snap_init;
+} LoopInfo;
+
+typedef struct MoveSnap {
+    int len;
+    bool *moved;
+    Span *spans;
+} MoveSnap;
+
 typedef struct FnCtx {
     TypeCtx tc;
     Decl *fn;   // NULL when checking a const/global initializer
@@ -29,8 +46,10 @@ typedef struct FnCtx {
     int loop_depth;
     int defer_depth;
     int defer_loop_base;  // loop_depth when the innermost defer began
-    Vec(bool) loop_breaks;  // per enclosing loop: has a break targeting it
-    Vec(Sym) loop_labels;   // per enclosing loop: its label, or NULL
+    Vec(LoopInfo) loops;  // enclosing loops
+    Vec(Local *) locals;  // all locals created in this context
+    bool flow_dead;
+    bool suppress_moved_ident;
     bool const_ctx;
     bool in_return;
 } FnCtx;
@@ -48,6 +67,7 @@ void try_fits(Span sp, Decl *a, Decl *b);
 Decl *expected_set(Type *t);
 bool union_fits(Span sp, Type *s, Type *t);
 bool fn_widens(Type *s, Type *t);
+bool type_is_nocopy(Type *t);
 
 // sema_stmt.c: a break or continue at `sp` naming the loop `label` (or
 // NULL): the loops it leaves beyond the innermost, or -1 after an error.
@@ -74,6 +94,7 @@ void check_value(Expr *e);  // reports if e is not a value (type/module/...)
 Type *finalize_untyped(Expr **pe);  // untyped literal without context -> E0502
 Type *builtin_check(Expr *e, Type *expected);
 bool fits_type(i128 v, Type *t);
+void check_consume_nocopy(Expr *e, bool allow_local_move);
 
 // sema_stmt.c
 bool check_block(Stmt *b);
@@ -83,6 +104,10 @@ Local *declare_local(Sym name, Span sp, Type *t, bool mut, bool is_param);
 void scope_push(void);
 void scope_pop(void);
 Local *scope_lookup(Sym name);
+MoveSnap move_snap_take(void);
+void move_snap_restore(const MoveSnap *s);
+void move_snap_join(const MoveSnap *s);
+void move_snap_free(MoveSnap *s);
 
 // sema_target.c
 int target_name_value(int id, const char *name);

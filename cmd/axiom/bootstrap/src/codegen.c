@@ -3625,6 +3625,29 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMPositionBuilderAtEnd(B, end);
         return LLVMBuildLoad2(B, T_i1, res, "");
     }
+    case BI_SWAP: {
+        Type *pt = ct(a[0].e->type);
+        Type *elem = ct(pt->elem);
+        LLVMValueRef pa = gen(a[0].e), pb = gen(a[1].e);
+        if (elem->kind == TY_VOID) return NULL;
+        asan_check(pa, usz(type_size(elem)));
+        asan_check(pb, usz(type_size(elem)));
+        if (type_size(elem) == 0) return NULL;
+        if (in_mem(elem)) {
+            LLVMValueRef tmp = temp_alloca(elem);
+            unsigned al = (unsigned)type_align(elem);
+            LLVMValueRef sz = usz(type_size(elem));
+            LLVMBuildMemCpy(B, tmp, al, pa, 1, sz);
+            LLVMBuildMemMove(B, pa, 1, pb, 1, sz);
+            LLVMBuildMemCpy(B, pb, 1, tmp, al, sz);
+            return NULL;
+        }
+        LLVMValueRef va = load(elem, pa, true);
+        LLVMValueRef vb = load(elem, pb, true);
+        store(elem, vb, pa, true);
+        store(elem, va, pb, true);
+        return NULL;
+    }
     case BI_MEMORY_SIZE: return mem_size();
     case BI_MEMORY_GROW: {
         LLVMValueRef prev = mem_grow(gen(a[0].e));

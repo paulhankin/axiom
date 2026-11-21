@@ -545,6 +545,20 @@ Type *builtin_check(Expr *e, Type *expected) {
         check_expr_to(earg(e, 1), type_slice(a->elem, false));
         return e->type = t_bool;
     }
+    case BI_SWAP: {
+        Type *t0 = check_expr(*earg(e, 0), NULL);
+        if (!t0 || t0->kind == TY_INVALID) {
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        if (t0->kind != TY_PTR || !t0->mut || t0->elem->kind == TY_VOID) {
+            diag_error((*earg(e, 0))->span, "E0706", "@swap expects *mut T pointers to a non-void type");
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_void;
+        }
+        check_expr_to(earg(e, 1), t0);
+        return e->type = t_void;
+    }
     case BI_MEMORY_SIZE: return e->type = t_usize;
     case BI_MEMORY_GROW:
         check_expr_to(earg(e, 0), t_usize);
@@ -595,6 +609,7 @@ Type *builtin_check(Expr *e, Type *expected) {
             return e->type = t_void;
         }
         check_expr_to(earg(e, 1), p->elem);
+        if ((*earg(e, 1))->type == p->elem) check_consume_nocopy(*earg(e, 1), false);
         return e->type = t_void;
     }
     case BI_VOLATILE_ZERO: {
@@ -617,6 +632,7 @@ Type *builtin_check(Expr *e, Type *expected) {
             diag_error((*earg(e, 0))->span, "E0404", "@black_box cannot take void");
             return e->type = t_invalid;
         }
+        check_consume_nocopy(*earg(e, 0), false);
         return e->type = t;
     }
     case BI_CLZ:

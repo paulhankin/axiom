@@ -453,6 +453,61 @@ static void not_mutable(Expr *e, const char *what) {
     }
 }
 
+void check_consume_nocopy(Expr *e, bool allow_local_move) {
+    if (!e || !e->type || !type_is_nocopy(e->type)) return;
+    while (e->kind == E_CONV) {
+        if (e->op == CONV_WRAP_ERR) return;
+        e = e->a;
+        if (!e || !e->type || !type_is_nocopy(e->type)) return;
+    }
+    switch (e->kind) {
+    case E_STRUCT_LIT:
+    case E_ARRAY_LIT:
+    case E_ARRAY_REPEAT:
+    case E_OPT_NONE:
+    case E_OPT_SOME:
+    case E_EMPTY_SLICE:
+    case E_CALL:
+    case E_BUILTIN:
+    case E_CATCH:
+    case E_ORELSE:
+    case E_TRY:
+        return;
+    case E_IDENT:
+        if (e->local) {
+            if (e->local->moved) return;  // E0709 already reported
+            if (allow_local_move) {
+                e->local->moved = true;
+                e->local->moved_span = e->span;
+                return;
+            }
+            diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+            return;
+        }
+        if (e->decl && e->decl->kind == D_CONST) return;
+        if (e->decl && e->decl->kind == D_GLOBAL) {
+            diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+            return;
+        }
+        return;
+    case E_FIELD:
+        if (e->op == FK_VARIANT_UNIT || e->op == FK_CONST) return;
+        if (!is_place(e)) return;
+        diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+        return;
+    case E_INDEX:
+        if (!is_place(e)) return;
+        diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+        return;
+    case E_DEREF:
+        diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+        return;
+    default:
+        if (is_place(e)) diag_error(e->span, "E0708", "cannot copy nocopy value of type %s", type_str(e->type));
+        return;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constant folding
 // ---------------------------------------------------------------------------
@@ -663,7 +718,15 @@ static Type *check_binary(Expr *e, Type *expected) {
     int op = e->op;
     if (op == KW_AND || op == KW_OR) {
         check_expr_to(&e->a, t_bool);
+        bool dead_before = C ? C->flow_dead : false;
+        MoveSnap before = move_snap_take();
         check_expr_to(&e->b, t_bool);
+        if (C) {
+            if (dead_before || e->b->type->kind == TY_NEVER) move_snap_restore(&before);
+            else move_snap_join(&before);
+            C->flow_dead = dead_before;
+        }
+        move_snap_free(&before);
         return e->type = t_bool;
     }
     if (is_shift_op(op)) {
@@ -971,6 +1034,10 @@ static void decl_ref(Expr *e, Decl *d) {
 static void resolve_ident(Expr *e) {
     Local *l = scope_lookup(e->name);
     if (l) {
+        if (l->moved && !(C && C->suppress_moved_ident)) {
+            Diag *dg = diag_error(e->span, "E0709", "use of moved value '%s'", l->name);
+            diag_note(dg, l->moved_span, "value moved here");
+        }
         e->local = l;
         e->cat = CAT_VALUE;
         e->type = l->type;
@@ -1430,6 +1497,7 @@ static Type *check_call(Expr *e, Type *expected) {
         for (int i = 0; i < nargs; i++) {
             Type *pt = type_subst(fn->param_types[first + i], fn->all_gparams, gargs, nall);
             coerce(&e->args.data[i], pt);
+            if (e->args.data[i]->type == pt) check_consume_nocopy(e->args.data[i], false);
         }
         e->decl = fn;
         e->gargs = gargs;
@@ -1445,7 +1513,16 @@ static Type *check_call(Expr *e, Type *expected) {
             Type *rt = recv->type;
             bool via_ptr = callee->self_mode == SELF_DEREF;
             switch (fn->self_kind) {
-            case SELF_VALUE: e->self_mode = via_ptr ? SELF_DEREF : SELF_VALUE; break;
+            case SELF_VALUE:
+                e->self_mode = via_ptr ? SELF_DEREF : SELF_VALUE;
+                if (via_ptr) {
+                    if (rt->kind == TY_PTR && type_is_nocopy(rt->elem)) {
+                        diag_error(recv->span, "E0708", "cannot copy nocopy value of type %s", type_str(rt->elem));
+                    }
+                } else {
+                    check_consume_nocopy(recv, false);
+                }
+                break;
             case SELF_ADDR:
                 if (via_ptr) e->self_mode = SELF_PASS;
                 else {
@@ -1484,8 +1561,10 @@ static Type *check_call(Expr *e, Type *expected) {
         Type *pt = type_variant(ut, v);
         check_args_count(e, 1, NULL);
         for (int i = 0; i < e->args.len; i++) {
-            if (i == 0) check_expr_to(&e->args.data[0], pt);
-            else check_expr(e->args.data[i], NULL);
+            if (i == 0) {
+                check_expr_to(&e->args.data[0], pt);
+                if (e->args.data[0]->type == pt) check_consume_nocopy(e->args.data[0], true);
+            } else check_expr(e->args.data[i], NULL);
         }
         e->op = CALLK_VARIANT;
         e->index = v;
@@ -1516,8 +1595,10 @@ static Type *check_call(Expr *e, Type *expected) {
     }
     check_args_count(e, ft->nparams, NULL);
     for (int i = 0; i < e->args.len; i++) {
-        if (i < ft->nparams) check_expr_to(&e->args.data[i], ft->params[i]);
-        else check_expr(e->args.data[i], NULL);
+        if (i < ft->nparams) {
+            check_expr_to(&e->args.data[i], ft->params[i]);
+            if (e->args.data[i]->type == ft->params[i]) check_consume_nocopy(e->args.data[i], false);
+        } else check_expr(e->args.data[i], NULL);
     }
     e->op = CALLK_INDIRECT;
     return e->type = ft->ret;
@@ -1632,7 +1713,9 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
             continue;
         }
         check_field_visible(fi->span, d, &d->fields.data[idx]);
-        check_expr_to(&fi->value, type_field(t, idx));
+        Type *ft = type_field(t, idx);
+        check_expr_to(&fi->value, ft);
+        if (fi->value->type == ft) check_consume_nocopy(fi->value, true);
     }
     e->tval = t;
     return e->type = t;
@@ -1659,6 +1742,10 @@ static Type *check_array_lit(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
+        if (type_is_nocopy(e->a->type)) {
+            if (!lenp && n >= 0 && n <= 1) check_consume_nocopy(e->a, true);
+            else diag_error(e->span, "E0708", "cannot repeat nocopy value of type %s", type_str(e->a->type));
+        }
         if (lenp) return e->type = type_array_param(elem, lenp);
         Type *t = type_array(elem, n);
         if (x && x->kind == TY_ARRAY && !x->len_param && x->len != n && x->elem->kind != TY_INVALID)
@@ -1667,12 +1754,16 @@ static Type *check_array_lit(Expr *e, Type *expected) {
     }
     int n = e->args.len;
     for (int i = 0; i < n; i++) {
-        if (elem) check_expr_to(&e->args.data[i], elem);
-        else {
+        if (elem) {
+            check_expr_to(&e->args.data[i], elem);
+            if (e->args.data[i]->type == elem) check_consume_nocopy(e->args.data[i], true);
+        } else {
             elem = check_expr(e->args.data[i], NULL);
             if (ty_is_untyped(elem)) {
                 finalize_untyped(&e->args.data[i]);
                 elem = NULL;
+            } else {
+                check_consume_nocopy(e->args.data[i], true);
             }
         }
     }
@@ -1737,6 +1828,7 @@ static void check_return_value(Expr **pe, Span sp) {
     C->in_return = true;
     coerce(pe, r);
     C->in_return = prev_ret;
+    if ((*pe)->type == r) check_consume_nocopy(*pe, true);
     if (r->kind == TY_ERRUNION && r->elem->kind == TY_VOID) return;
     check_escape(*pe);
 }
@@ -1750,7 +1842,11 @@ static Type *check_catch(Expr *e) {
     if (t->kind == TY_ERRUNION) {
         vt = t->elem;
         et = type_errset(t->decl);
+        check_consume_nocopy(e->a, false);
     } else if (t->kind != TY_INVALID) diag_error(e->a->span, "E0611", "'catch' requires an error union (!T), found %s", type_str(t));
+    bool dead_before = C ? C->flow_dead : false;
+    MoveSnap before = move_snap_take();
+    bool h_dead = false;
     scope_push();
     if (e->capture) e->capture_local = declare_local(e->capture, e->capture_span, et, false, false);
     switch (e->hkind) {
@@ -1760,16 +1856,23 @@ static Type *check_catch(Expr *e) {
             Type *ht = check_expr(e->hexpr, NULL);
             if (ht->kind != TY_NEVER && ht->kind != TY_INVALID)
                 diag_error(e->hexpr->span, "E0613", "a fallback value makes no sense for !void; use a block");
+            if (ht->kind == TY_NEVER) h_dead = true;
         } else {
             check_expr_to(&e->hexpr, vt);
+            if (e->hexpr->type == vt) check_consume_nocopy(e->hexpr, false);
+            if (e->hexpr->type->kind == TY_NEVER) h_dead = true;
         }
         break;
-    case H_RETURN: check_return_value(e->hexpr ? &e->hexpr : NULL, e->span); break;
+    case H_RETURN:
+        check_return_value(e->hexpr ? &e->hexpr : NULL, e->span);
+        h_dead = true;
+        break;
     case H_BREAK:
     case H_CONTINUE: {
         // the label, if any, is in e->name; the loops left in e->index
         int d = check_jump_target(e->name, e->name ? e->name_span : e->span, e->hkind == H_BREAK);
         e->index = d < 0 ? 0 : d;
+        h_dead = true;
         break;
     }
     case H_BLOCK:
@@ -1780,9 +1883,16 @@ static Type *check_catch(Expr *e) {
                        "this 'catch' block must not complete normally, because the expression needs a value of type %s "
                        "(end it with return, break, continue or @trap(), or use 'catch <value>')",
                        type_str(vt));
+        h_dead = e->hblock->diverges || (C && C->flow_dead);
         break;
     }
     scope_pop();
+    if (C) {
+        if (dead_before || h_dead) move_snap_restore(&before);
+        else move_snap_join(&before);
+        C->flow_dead = dead_before;
+    }
+    move_snap_free(&before);
     e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
@@ -1792,16 +1902,28 @@ static Type *check_orelse(Expr *e) {
     Type *vt = t_invalid;
     if (t->kind == TY_OPT) {
         vt = t->elem;
+        check_consume_nocopy(e->a, false);
     } else if (t->kind != TY_INVALID) {
         diag_error(e->a->span, "E0614", "'?\?' requires an optional (?T), found %s", type_str(t));
     }
+    bool dead_before = C ? C->flow_dead : false;
+    MoveSnap before = move_snap_take();
+    bool h_dead = false;
     switch (e->hkind) {
-    case H_VALUE: check_expr_to(&e->hexpr, vt); break;
-    case H_RETURN: check_return_value(e->hexpr ? &e->hexpr : NULL, e->span); break;
+    case H_VALUE:
+        check_expr_to(&e->hexpr, vt);
+        if (e->hexpr->type == vt) check_consume_nocopy(e->hexpr, false);
+        if (e->hexpr->type->kind == TY_NEVER) h_dead = true;
+        break;
+    case H_RETURN:
+        check_return_value(e->hexpr ? &e->hexpr : NULL, e->span);
+        h_dead = true;
+        break;
     case H_BREAK:
     case H_CONTINUE: {
         int d = check_jump_target(e->name, e->name ? e->name_span : e->span, e->hkind == H_BREAK);
         e->index = d < 0 ? 0 : d;
+        h_dead = true;
         break;
     }
     case H_BLOCK:
@@ -1810,8 +1932,15 @@ static Type *check_orelse(Expr *e) {
                        "this '?\?' block must not complete normally, because the expression needs a value of type %s "
                        "(end it with return, break, continue or @trap(), or use '?? <value>')",
                        type_str(vt));
+        h_dead = e->hblock->diverges || (C && C->flow_dead);
         break;
     }
+    if (C) {
+        if (dead_before || h_dead) move_snap_restore(&before);
+        else move_snap_join(&before);
+        C->flow_dead = dead_before;
+    }
+    move_snap_free(&before);
     e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
@@ -1823,6 +1952,7 @@ static Type *check_try(Expr *e) {
         diag_error(e->span, "E0611", "'!' requires an error union (!T), found %s", type_str(t));
         return e->type = t_invalid;
     }
+    check_consume_nocopy(e->a, false);
     if (!C->fn || !C->ret || C->ret->kind != TY_ERRUNION) {
         Diag *d = diag_error(e->span, "E0610", "'!' can only be used in a function that returns an error union");
         if (C->fn && C->fn->ret_te) {
@@ -1938,6 +2068,7 @@ static Type *check_operand(Expr *e, Type *expected) {
         Type *ot = find_opt_expected(expected);
         if (ot) {
             check_expr_to(&e->a, ot->elem);
+            if (e->a->type == ot->elem) check_consume_nocopy(e->a, true);
             e->weakened = e->a->weakened;
             return e->type = ot;
         }
@@ -1951,6 +2082,7 @@ static Type *check_operand(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if (it->kind == TY_INVALID) return e->type = t_invalid;
+        check_consume_nocopy(e->a, true);
         e->weakened = e->a->weakened;
         return e->type = type_opt(it);
     }

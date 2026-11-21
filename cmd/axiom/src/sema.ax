@@ -36,12 +36,37 @@ struct ScopeEntry {
     local: *mut ast.Local,
 }
 
+struct MoveSnap {
+    moved: []mut bool,
+    spans: []mut u.Span,
+    n: usize,
+}
+
+struct LoopMove {
+    base: usize,
+    pre: MoveSnap,
+    brk: MoveSnap,
+    reported: []mut u.Span,
+    pre_dead: bool,
+    has_break: bool,
+}
+
+struct MatchFlow {
+    nloc: usize,
+    pre: MoveSnap,
+    acc: MoveSnap,
+    pre_dead: bool,
+    any_live: bool,
+}
+
 struct FnCtx {
     tc: TypeCtx,
     fnd: *mut ast.Decl,  // nil when checking a const/global initializer
     ret: *mut ast.Type,  // declared return type
     scope: u.List.[ScopeEntry],
     marks: u.List.[usize],
+    locals: u.List.[*mut ast.Local],
+    loop_moves: u.List.[LoopMove],
     loop_depth: i32,
     defer_depth: i32,
     defer_loop_base: i32,        // loop_depth when the innermost defer began
@@ -49,6 +74,8 @@ struct FnCtx {
     loop_labels: u.List.[[]u8],  // per enclosing loop: its label, or an empty string
     const_ctx: bool,
     in_return: bool,
+    flow_dead: bool,
+    skip_moved_check: bool,
 }
 
 threadlocal let mut C: *mut FnCtx = @ptr_from_int(*mut FnCtx, 0);
@@ -68,6 +95,8 @@ fn fn_ctx(tc: TypeCtx) FnCtx {
         ret: tnil(),
         scope: u.List.[ScopeEntry].empty(),
         marks: u.List.[usize].empty(),
+        locals: u.List.[*mut ast.Local].empty(),
+        loop_moves: u.List.[LoopMove].empty(),
         loop_depth: 0,
         defer_depth: 0,
         defer_loop_base: 0,
@@ -75,7 +104,221 @@ fn fn_ctx(tc: TypeCtx) FnCtx {
         loop_labels: u.List.[[]u8].empty(),
         const_ctx: false,
         in_return: false,
+        flow_dead: false,
+        skip_moved_check: false,
     };
+}
+
+// ---------------------------------------------------------------------------
+// nocopy & move tracking (spec §5.9: E0708, E0709)
+// ---------------------------------------------------------------------------
+pub fn type_is_nocopy(t: *mut ast.Type) bool {
+    if u.isnil(t) {
+        return false;
+    }
+    let k = t.kind;
+    if k == ast.TY_STRUCT {
+        if u.isnil(t.decl) {
+            return false;
+        }
+        if t.decl.is_nocopy {
+            return true;
+        }
+        if t.decl.nocopy_visiting {
+            return false;
+        }
+        t.decl.nocopy_visiting = true;
+        if t.decl.state == ast.DeclState.UNRESOLVED {
+            resolve_decl(t.decl);
+        }
+        let mut res = false;
+        for i in 0..t.decl.fields.len {
+            let ft = ty.type_field(t, i);
+            if u.notnil(ft) and type_is_nocopy(ft) {
+                res = true;
+                break;
+            }
+        }
+        t.decl.nocopy_visiting = false;
+        return res;
+    }
+    if k == ast.TY_UNION {
+        if u.isnil(t.decl) {
+            return false;
+        }
+        if t.decl.is_nocopy {
+            return true;
+        }
+        if t.decl.nocopy_visiting {
+            return false;
+        }
+        t.decl.nocopy_visiting = true;
+        if t.decl.state == ast.DeclState.UNRESOLVED {
+            resolve_decl(t.decl);
+        }
+        let mut res = false;
+        for i in 0..t.decl.variants.len {
+            let vt = ty.type_variant(t, i);
+            if u.notnil(vt) and type_is_nocopy(vt) {
+                res = true;
+                break;
+            }
+        }
+        t.decl.nocopy_visiting = false;
+        return res;
+    }
+    if (k == ast.TY_ARRAY) or (k == ast.TY_OPT) or (k == ast.TY_ERRUNION) {
+        return type_is_nocopy(t.elem);
+    }
+    return false;
+}
+
+fn unwrap_conv(e0: *mut ast.Expr) *mut ast.Expr {
+    let mut e = e0;
+    while u.notnil(e) and (e.kind == ast.E_CONV) {
+        e = e.a;
+    }
+    return e;
+}
+
+fn check_no_copy(e0: *mut ast.Expr) void {
+    let e = unwrap_conv(e0);
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
+        return;
+    }
+    if is_place(e) and type_is_nocopy(e.ty) {
+        if (e.kind == ast.E_IDENT) and u.notnil(ast.local_of(e)) and ast.local_of(e).moved {
+            return;
+        }
+        _ = dg.err(e.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(e.ty)));
+    }
+}
+
+fn move_or_check_nocopy(e0: *mut ast.Expr) void {
+    let e = unwrap_conv(e0);
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
+        return;
+    }
+    if not type_is_nocopy(e.ty) {
+        return;
+    }
+    if (e.kind == ast.E_IDENT) and u.notnil(ast.local_of(e)) {
+        let l = ast.local_of(e);
+        if not C.flow_dead and not l.moved {
+            l.moved = true;
+            l.moved_span = e.span;
+        }
+        return;
+    }
+    check_no_copy(e);
+}
+
+fn save_moves(n: usize) MoveSnap {
+    let m = u.newn.[bool](n);
+    let sp = u.newn.[u.Span](n);
+    for i in 0..n {
+        let l = C.locals.get(i);
+        m[i] = l.moved;
+        sp[i] = l.moved_span;
+    }
+    return MoveSnap.{ moved: m, spans: sp, n: n };
+}
+
+fn restore_moves(s: MoveSnap) void {
+    for i in 0..s.n {
+        let l = C.locals.get(i);
+        l.moved = s.moved[i];
+        l.moved_span = s.spans[i];
+    }
+}
+
+fn merge_moves_or(a: MoveSnap, b: MoveSnap) void {
+    for i in 0..a.n {
+        let l = C.locals.get(i);
+        if a.moved[i] {
+            l.moved = true;
+            l.moved_span = a.spans[i];
+        } else if (i < b.n) and b.moved[i] {
+            l.moved = true;
+            l.moved_span = b.spans[i];
+        } else {
+            l.moved = false;
+        }
+    }
+}
+
+fn or_moves_into(dst: *mut MoveSnap, n: usize) void {
+    let k = @min(dst.n, n);
+    for i in 0..k {
+        let l = C.locals.get(i);
+        if l.moved and not dst.moved[i] {
+            dst.moved[i] = true;
+            dst.spans[i] = l.moved_span;
+        }
+    }
+}
+
+fn or_snap_into(dst: *mut MoveSnap, src: MoveSnap) void {
+    let k = @min(dst.n, src.n);
+    for i in 0..k {
+        if src.moved[i] and not dst.moved[i] {
+            dst.moved[i] = true;
+            dst.spans[i] = src.spans[i];
+        }
+    }
+}
+
+fn span_eq(a: u.Span, b: u.Span) bool {
+    return (a.file == b.file) and (a.start == b.start) and (a.end == b.end);
+}
+
+fn check_loop_backedge(lm: *mut LoopMove, err_sp: u.Span, has_sp: bool) void {
+    for i in 0..lm.base {
+        let l = C.locals.get(i);
+        if l.moved and not lm.pre.moved[i] {
+            if not span_eq(lm.reported[i], l.moved_span) {
+                let mut sp = l.moved_span;
+                if has_sp {
+                    sp = err_sp;
+                }
+                let d = dg.err(sp, "E0709", u.f1("use of moved value '%s'", l.name));
+                dg.note(d, l.moved_span, "value moved here");
+                lm.reported[i] = l.moved_span;
+            }
+        }
+    }
+}
+
+fn match_flow_begin() MatchFlow {
+    let nloc = C.locals.len;
+    let pre = save_moves(nloc);
+    let acc = MoveSnap.{ moved: u.newn.[bool](nloc), spans: u.newn.[u.Span](nloc), n: nloc };
+    return MatchFlow.{ nloc: nloc, pre: pre, acc: acc, pre_dead: C.flow_dead, any_live: false };
+}
+
+fn match_flow_arm_begin(mf: *MatchFlow) void {
+    restore_moves(mf.pre);
+    C.flow_dead = mf.pre_dead;
+}
+
+fn match_flow_arm_end(mf: *mut MatchFlow, div_arm: bool) void {
+    if not div_arm and not mf.pre_dead {
+        mf.any_live = true;
+        or_moves_into(&mut mf.acc, mf.nloc);
+    }
+}
+
+fn match_flow_end(mf: *MatchFlow, narms: usize) void {
+    if narms == 0 {
+        return;
+    }
+    if not mf.any_live {
+        restore_moves(mf.pre);
+        C.flow_dead = true;
+    } else {
+        restore_moves(mf.acc);
+        C.flow_dead = mf.pre_dead;
+    }
 }
 
 fn type_ctx(m: *mut ast.Module, gowner: *mut ast.Decl, gfn: *mut ast.Decl, self_: *mut ast.Type) TypeCtx {
@@ -896,6 +1139,7 @@ fn const_array_len(ce: *mut ast.Expr, tc: *mut TypeCtx) i64 {
     let saved = C;
     C = &mut ctx;
     let t = check_expr(ce, ty.t_usize);
+    check_no_copy(ce);
     C = saved;
     if ce.is_const and ((t.kind == ast.TY_INT) or (t.kind == ast.TY_UNTYPED_INT) or (t.kind == ast.TY_CONSTINT)) {
         if ast.cval_of(ce).is_neg() {
@@ -1511,6 +1755,7 @@ fn resolve_decl(d: *mut ast.Decl) void {
         let saved = C;
         C = &mut ctx;
         _ = check_expr_to(&mut d.init, d.ty);
+        check_no_copy(d.init);
         C = saved;
         d.cexpr = d.init;
         let mut ok_const = d.init.is_const or (d.init.kind == ast.E_BOOL);
@@ -1654,6 +1899,7 @@ fn check_global(d: *mut ast.Decl) void {
     let saved = C;
     C = &mut ctx;
     _ = check_expr_to(&mut d.init, d.ty);
+    check_no_copy(d.init);
     C = saved;
     if (d.ty.kind != ast.TY_INVALID) and (d.init.ty.kind != ast.TY_INVALID) and not is_const_init(d.init) {
         _ = dg.err(d.init.span, "E0350", "global initializer must be a constant expression");
@@ -2992,6 +3238,10 @@ fn decl_ref(e: *mut ast.Expr, d: *mut ast.Decl) void {
 fn resolve_ident(e: *mut ast.Expr) void {
     let l = scope_lookup(e.name);
     if u.notnil(l) {
+        if not C.flow_dead and not C.skip_moved_check and l.moved {
+            let d = dg.err(e.span, "E0709", u.f1("use of moved value '%s'", l.name));
+            dg.note(d, l.moved_span, "value moved here");
+        }
         ast.set_local(e, l);
         e.cat = ast.CAT_VALUE;
         e.ty = l.ty;
@@ -3523,6 +3773,9 @@ fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut
         let pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
         coerce(ast.args_mut(e).at_mut(j), pt);
     }
+    for j in 0..ast.args_of(e).len {
+        check_no_copy(ast.args_of(e).get(j));
+    }
     ast.set_decl(e, f);
     ast.set_gargs(e, gargs);
     ast.set_call_kind(e, ast.CALLK_DIRECT);
@@ -3612,8 +3865,13 @@ fn check_receiver(e: *mut ast.Expr, callee: *mut ast.Expr, f: *mut ast.Decl) voi
     let sk = f.self_kind;
     if sk == ast.SELF_VALUE {
         if via_ptr {
+            if (rt.kind == ast.TY_PTR) and u.notnil(rt.elem) and (rt.elem.kind != ast.TY_INVALID) and
+               type_is_nocopy(rt.elem) {
+                _ = dg.err(recv.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(rt.elem)));
+            }
             ast.set_self_mode(e, ast.SELF_DEREF);
         } else {
+            check_no_copy(recv);
             ast.set_self_mode(e, ast.SELF_VALUE);
         }
     } else if sk == ast.SELF_ADDR {
@@ -3661,6 +3919,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         for i in 0..ast.args_of(e).len {
             if i == 0 {
                 _ = check_expr_to(ast.args_mut(e).at_mut(0), pt);
+                move_or_check_nocopy(ast.args_of(e).get(0));
             } else {
                 _ = check_expr(ast.args_of(e).get(i), tnil());
             }
@@ -3698,6 +3957,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     for i in 0..ast.args_of(e).len {
         if i < ft.params.len {
             _ = check_expr_to(ast.args_mut(e).at_mut(i), ft.params[i]);
+            check_no_copy(ast.args_of(e).get(i));
         } else {
             _ = check_expr(ast.args_of(e).get(i), tnil());
         }
@@ -3842,6 +4102,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         check_field_visible(fi.span, d, d.fields.at(@int_cast(usize, idx)));
         _ = check_expr_to(&mut fi.value, ty.type_field(t, @int_cast(usize, idx)));
+        move_or_check_nocopy(fi.value);
     }
     ast.set_tval(e, t);
     e.ty = t;
@@ -3880,6 +4141,11 @@ fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 return set_ty(e, ty.t_invalid);
             }
         }
+        if (u.notnil(lenp) or (n > 1)) and u.notnil(elem) and type_is_nocopy(elem) {
+            _ = dg.err(e.span, "E0708", u.f1("cannot repeat nocopy value of type %s", tstr(elem)));
+        } else {
+            move_or_check_nocopy(e.a);
+        }
         if u.notnil(lenp) {
             e.ty = ty.type_array_param(elem, lenp);
             return e.ty;
@@ -3896,11 +4162,14 @@ fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     for i in 0..n {
         if u.notnil(elem) {
             _ = check_expr_to(ast.args_mut(e).at_mut(i), elem);
+            move_or_check_nocopy(ast.args_of(e).get(i));
         } else {
             elem = check_expr(ast.args_of(e).get(i), tnil());
             if ty.is_untyped(elem) {
                 _ = sb.finalize_untyped(ast.args_mut(e).at_mut(i));
                 elem = tnil();
+            } else {
+                move_or_check_nocopy(ast.args_of(e).get(i));
             }
         }
     }
@@ -3951,6 +4220,7 @@ fn check_return_value(pe: *mut *mut ast.Expr, sp: u.Span) void {
     C.in_return = true;
     coerce(pe, r);
     C.in_return = prev_ret;
+    move_or_check_nocopy(pe.*);
     check_escape(pe.*);
 }
 
@@ -3995,6 +4265,7 @@ fn check_escape(e0: *mut ast.Expr) void {
 
 fn check_catch(e: *mut ast.Expr) *mut ast.Type {
     let t = check_expr(e.a, tnil());
+    check_no_copy(e.a);
     let mut vt = ty.t_invalid;
     let mut et = ty.t_error;
     if t.kind == ast.TY_ERRUNION {
@@ -4003,6 +4274,10 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
     } else if t.kind != ast.TY_INVALID {
         _ = dg.err(e.a.span, "E0611", u.f1("'catch' requires an error union (!T), found %s", tstr(t)));
     }
+    let nloc = C.locals.len;
+    let pre_snap = save_moves(nloc);
+    let pre_dead = C.flow_dead;
+    let mut h_dead = false;
     scope_push();
     if not u.isnos(ast.more(e).capture) {
         ast.ext(e).capture_local = declare_local(ast.ext(e).capture, ast.ext(e).capture_span, et, false, false);
@@ -4016,8 +4291,11 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
                 if (ht.kind != ast.TY_NEVER) and (ht.kind != ast.TY_INVALID) {
                     _ = dg.err(x.span, "E0613", "a fallback value makes no sense for !void; use a block");
                 }
+                h_dead = C.flow_dead or (ht.kind == ast.TY_NEVER);
             } else {
                 _ = check_expr_to(&mut x, vt);
+                check_no_copy(x);
+                h_dead = C.flow_dead or (u.notnil(x.ty) and (x.ty.kind == ast.TY_NEVER));
             }
             ast.ext(e).handler = ast.Handler.Value(x);
         }
@@ -4029,20 +4307,37 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
                 check_return_value(u.nil.[*mut ast.Expr](), e.span);
             }
             ast.ext(e).handler = ast.Handler.Return(x);
+            h_dead = true;
         }
-        .Break    => { check_catch_jump(e, true); }
-        .Continue => { check_catch_jump(e, false); }
+        .Break => {
+            check_catch_jump(e, true);
+            h_dead = true;
+        }
+        .Continue => {
+            check_catch_jump(e, false);
+            h_dead = true;
+        }
         .Block(blk) => {
             // For !void the block may complete normally: execution continues after
             // the expression. For !T there is no value to produce, so it must diverge.
-            if not check_block(blk) and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
+            let bdiv = check_block(blk);
+            if not bdiv and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
                 _ = dg.err(blk.span, "E0612",
                            u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
                                 tstr(vt)));
             }
+            h_dead = bdiv or pre_dead;
         }
     }
     scope_pop();
+    if h_dead {
+        restore_moves(pre_snap);
+        C.flow_dead = pre_dead;
+    } else {
+        let h_snap = save_moves(nloc);
+        merge_moves_or(pre_snap, h_snap);
+        C.flow_dead = pre_dead;
+    }
     let mut hw = e.a.weakened;
     match ast.more(e).handler {
         .Value(h) => {
@@ -4081,6 +4376,7 @@ fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let t = opt_target(expected);
     if u.notnil(t) {
         _ = check_expr_to(&mut e.a, t.elem);
+        move_or_check_nocopy(e.a);
         e.weakened = e.a.weakened;
         if t.elem.kind == ast.TY_INVALID {
             return set_ty(e, ty.t_invalid);
@@ -4091,6 +4387,7 @@ fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if ty.is_untyped(it) {
         it = sb.finalize_untyped(&mut e.a);
     }
+    move_or_check_nocopy(e.a);
     e.weakened = e.a.weakened;
     if it.kind == ast.TY_INVALID {
         return set_ty(e, ty.t_invalid);
@@ -4122,17 +4419,24 @@ fn check_orelse(e: *mut ast.Expr) *mut ast.Type {
     if ty.is_untyped(t) {
         t = sb.finalize_untyped(&mut e.a);
     }
+    check_no_copy(e.a);
     let mut vt = ty.t_invalid;
     if t.kind == ast.TY_OPT {
         vt = t.elem;
     } else if t.kind != ast.TY_INVALID {
         _ = dg.err(e.a.span, "E0614", u.f1("'??' requires an optional (?T), found %s", tstr(t)));
     }
+    let nloc = C.locals.len;
+    let pre_snap = save_moves(nloc);
+    let pre_dead = C.flow_dead;
+    let mut h_dead = false;
     match ast.more(e).handler {
         .Value(h) => {
             let mut x = h;
             _ = check_expr_to(&mut x, vt);
+            check_no_copy(x);
             ast.ext(e).handler = ast.Handler.Value(x);
+            h_dead = C.flow_dead or (u.notnil(x.ty) and (x.ty.kind == ast.TY_NEVER));
         }
         .Return(h) => {
             let mut x = h;
@@ -4142,16 +4446,33 @@ fn check_orelse(e: *mut ast.Expr) *mut ast.Type {
                 check_return_value(u.nil.[*mut ast.Expr](), e.span);
             }
             ast.ext(e).handler = ast.Handler.Return(x);
+            h_dead = true;
         }
-        .Break    => { check_catch_jump(e, true); }
-        .Continue => { check_catch_jump(e, false); }
+        .Break => {
+            check_catch_jump(e, true);
+            h_dead = true;
+        }
+        .Continue => {
+            check_catch_jump(e, false);
+            h_dead = true;
+        }
         .Block(blk) => {
-            if not check_block(blk) and (vt.kind != ast.TY_INVALID) {
+            let bdiv = check_block(blk);
+            if not bdiv and (vt.kind != ast.TY_INVALID) {
                 _ = dg.err(blk.span, "E0612",
                            u.f1("this '??' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use '?? <value>')",
                                 tstr(vt)));
             }
+            h_dead = bdiv or pre_dead;
         }
+    }
+    if h_dead {
+        restore_moves(pre_snap);
+        C.flow_dead = pre_dead;
+    } else {
+        let h_snap = save_moves(nloc);
+        merge_moves_or(pre_snap, h_snap);
+        C.flow_dead = pre_dead;
     }
     e.weakened = e.a.weakened;
     match ast.more(e).handler {
@@ -4180,6 +4501,7 @@ fn check_try(e: *mut ast.Expr) *mut ast.Type {
     if t.kind == ast.TY_INVALID {
         return set_ty(e, ty.t_invalid);
     }
+    check_no_copy(e.a);
     if t.kind != ast.TY_ERRUNION {
         _ = dg.err(e.span, "E0611", u.f1("'!' requires an error union (!T), found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
@@ -4451,6 +4773,7 @@ fn declare_local(name: []u8, sp: u.Span, t: *mut ast.Type, is_mut: bool, is_para
         l.index = @int_cast(i32, C.fnd.locals.len);
         C.fnd.locals.push(l);
     }
+    C.locals.push(l);
     C.scope.push(ScopeEntry.{ name: name, local: l });
     return l;
 }
@@ -4459,6 +4782,7 @@ fn declare_local(name: []u8, sp: u.Span, t: *mut ast.Type, is_mut: bool, is_para
 // Statements
 // ---------------------------------------------------------------------------
 fn check_block(b: *mut ast.Stmt) bool {
+    let entry_dead = C.flow_dead;
     scope_push();
     let mut div = false;
     let mut warned = false;
@@ -4470,9 +4794,11 @@ fn check_block(b: *mut ast.Stmt) bool {
         }
         if check_stmt(s) {
             div = true;
+            C.flow_dead = true;
         }
     }
     scope_pop();
+    C.flow_dead = entry_dead or div;
     b.diverges = div;
     return div;
 }
@@ -4498,7 +4824,13 @@ fn conv_probe(t: *mut ast.Type, sp: u.Span) *mut ast.Expr {
 
 fn check_assign(s: *mut ast.Stmt) void {
     let lhs = s.e;
+    let direct_ident = (s.op == lx.TK_EQ) and (lhs.kind == ast.E_IDENT);
+    let prev_skip = C.skip_moved_check;
+    if direct_ident {
+        C.skip_moved_check = true;
+    }
     let lt = check_expr(lhs, tnil());
+    C.skip_moved_check = prev_skip;
     if lt.kind == ast.TY_INVALID {
         _ = check_expr(s.e2, tnil());
         return;
@@ -4529,6 +4861,10 @@ fn check_assign(s: *mut ast.Stmt) void {
     }
     if s.op == lx.TK_EQ {
         _ = check_expr_to(&mut s.e2, lt);
+        check_no_copy(s.e2);
+        if direct_ident and (lhs.kind == ast.E_IDENT) and u.notnil(ast.local_of(lhs)) and not C.flow_dead {
+            ast.local_of(lhs).moved = false;
+        }
         return;
     }
     // compound assignment: lhs op= rhs, with the semantics of lhs op rhs
@@ -4607,12 +4943,16 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut
     let is_enum = t.kind == ast.TY_ENUM;
     let what = u.pick(is_enum, "member", "variant");
     let seen = u.newn.[bool](ud.variants.len);
+    let mut mf = match_flow_begin();
     for i in 0..narms {
         let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
         scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
         match a.pat {
             .Else => { has_else = true; }
             .Variant(p) => {
@@ -4658,11 +4998,16 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut
                                 tstr(t)));
             }
         }
-        if not a.alt and not check_block(a.body) {
-            all_div = false;
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
         }
         scope_pop();
     }
+    match_flow_end(&mf, narms);
     if not has_else {
         let mut missing = u.Buf.init();
         let mut nm: i32 = 0;
@@ -4691,12 +5036,16 @@ fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut:
     let mut seen_none = false;
     let mut seen_some = false;
     let narms = ast.stmt_more(s).arms.len;
+    let mut mf = match_flow_begin();
     for i in 0..narms {
         let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
         scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
         match a.pat {
             .Else => { has_else = true; }
             .Variant(p) => {
@@ -4738,11 +5087,16 @@ fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut:
                 _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of optional type %s", tstr(base)));
             }
         }
-        if not a.alt and not check_block(a.body) {
-            all_div = false;
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
         }
         scope_pop();
     }
+    match_flow_end(&mf, narms);
     if not has_else {
         if not seen_none and not seen_some {
             _ = dg.err(s.span, "E0630", "non-exhaustive match: missing .none, .some");
@@ -4766,12 +5120,16 @@ fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
     let mut seenv = u.List.[u.I128].empty();
     let mut seen_true = false;
     let mut seen_false = false;
+    let mut mf = match_flow_begin();
     for i in 0..narms {
         let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
         scope_push();
+        if not a.alt {
+            match_flow_arm_begin(&mf);
+        }
         let mut key = u.I128.zero();
         let mut keyed = false;
         let mut fits = false;  // the pattern is of the scrutinee's kind
@@ -4832,11 +5190,16 @@ fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
             }
             seenv.push(key);
         }
-        if not a.alt and not check_block(a.body) {
-            all_div = false;
+        if not a.alt {
+            let div_arm = check_block(a.body);
+            if not div_arm {
+                all_div = false;
+            }
+            match_flow_arm_end(&mut mf, div_arm);
         }
         scope_pop();
     }
+    match_flow_end(&mf, narms);
     seenv.deinit();
     let exhaustive = has_else or ((t.kind == ast.TY_BOOL) and seen_true and seen_false);
     if not exhaustive and (t.kind == ast.TY_ERROR) and u.notnil(t.decl) {
@@ -4877,6 +5240,9 @@ fn check_match(s: *mut ast.Stmt) bool {
     if ty.is_untyped(t) {
         t = sb.finalize_untyped(&mut s.e);
     }
+    let se = unwrap_conv(s.e);
+    let scrut_moved = u.notnil(se) and (se.kind == ast.E_IDENT) and u.notnil(ast.local_of(se)) and
+                      ast.local_of(se).moved;
     let mut base = t;
     let mut by_ref = false;
     let mut ref_mut = false;
@@ -4899,13 +5265,30 @@ fn check_match(s: *mut ast.Stmt) bool {
                        u.f1("cannot match on a value of type %s (only unions, optionals, *union, *optional, enums, integers, bool and error)",
                             tstr(t)));
         }
+        let mut mf = match_flow_begin();
         for i in 0..narms {
             if ast.stmt_more(s).arms.at(i).alt {
                 continue;
             }
             scope_push();
-            _ = check_block(ast.stmt_ext(s).arms.at_mut(i).body);
+            match_flow_arm_begin(&mf);
+            let div_arm = check_block(ast.stmt_ext(s).arms.at_mut(i).body);
+            match_flow_arm_end(&mut mf, div_arm);
             scope_pop();
+        }
+        match_flow_end(&mf, narms);
+    }
+    if not by_ref and not scrut_moved {
+        let mut has_bind = false;
+        for i in 0..narms {
+            if u.notnil(ast.stmt_more(s).arms.at(i).bind_local) {
+                has_bind = true;
+                break;
+            }
+        }
+        if has_bind and u.notnil(se) and is_place(se) and u.notnil(se.ty) and (se.ty.kind != ast.TY_INVALID) and
+           type_is_nocopy(se.ty) {
+            _ = dg.err(se.span, "E0708", u.f1("cannot copy nocopy value of type %s", tstr(se.ty)));
         }
     }
     return (narms > 0) and all_div;
@@ -4925,31 +5308,69 @@ fn check_stmt(s: *mut ast.Stmt) bool {
                 _ = dg.err(s.e.span, "E0622", "nothing to discard: the expression has type void");
             } else if t.kind == ast.TY_ERRUNION {
                 _ = dg.err(s.e.span, "E0621", "an error union cannot be discarded; handle it with '!' or 'catch'");
+            } else {
+                check_no_copy(s.e);
             }
         }
         .IF => {
             _ = check_expr_to(&mut s.e, ty.t_bool);
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
             let a = check_block(s.body);
+            let then_dead = pre_dead or a;
+            let then_snap = save_moves(nloc);
             let mut b = false;
             if u.notnil(s.els) {
+                restore_moves(pre);
+                C.flow_dead = pre_dead;
                 if s.els.kind == ast.S_IF {
                     b = check_stmt(s.els);
                 } else {
                     b = check_block(s.els);
                 }
+                let else_dead = pre_dead or b;
+                let else_snap = save_moves(nloc);
+                if then_dead and else_dead {
+                    C.flow_dead = true;
+                } else if then_dead {
+                    restore_moves(else_snap);
+                    C.flow_dead = pre_dead;
+                } else if else_dead {
+                    restore_moves(then_snap);
+                    C.flow_dead = pre_dead;
+                } else {
+                    merge_moves_or(then_snap, else_snap);
+                    C.flow_dead = pre_dead;
+                }
+            } else {
+                if then_dead {
+                    restore_moves(pre);
+                    C.flow_dead = pre_dead;
+                } else {
+                    merge_moves_or(pre, then_snap);
+                    C.flow_dead = pre_dead;
+                }
             }
             div = u.notnil(s.els) and a and b;
         }
         .WHILE => {
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
             _ = check_expr_to(&mut s.e, ty.t_bool);
-            enter_loop(s);
-            _ = check_block(s.body);
-            _ = leave_loop();
+            let exit_snap = save_moves(nloc);
+            enter_loop(s, nloc, pre, pre_dead);
+            let body_dead = check_block(s.body);
+            _ = leave_loop(exit_snap, true, body_dead);
         }
         .LOOP => {
-            enter_loop(s);
-            _ = check_block(s.body);
-            div = not leave_loop();
+            let nloc = C.locals.len;
+            let pre = save_moves(nloc);
+            let pre_dead = C.flow_dead;
+            enter_loop(s, nloc, pre, pre_dead);
+            let body_dead = check_block(s.body);
+            div = not leave_loop(pre, false, body_dead);
         }
         .FOR   => { check_for(s); }
         .MATCH => { div = check_match(s); }
@@ -5005,6 +5426,7 @@ fn check_let(s: *mut ast.Stmt) bool {
             t = ty.t_invalid;
         }
     }
+    check_no_copy(s.e);
     s.local = declare_local(s.name, s.name_span, t, s.is_mut, false);
     s.local.weakened = s.e.weakened;
     return u.notnil(s.e.ty) and (s.e.ty.kind == ast.TY_NEVER);
@@ -5132,23 +5554,72 @@ fn check_for(s: *mut ast.Stmt) void {
             }
             vt = ty.t_invalid;
         }
+        if not ref_iter and ((t.kind == ast.TY_ARRAY) or (t.kind == ast.TY_SLICE)) and u.notnil(vt) and
+           type_is_nocopy(vt) {
+            let d = dg.err(s.name_span, "E0708", u.f1("cannot copy nocopy element of type %s in value loop", tstr(vt)));
+            let can_mut = ((t.kind == ast.TY_SLICE) and t.is_mut and not s.e.weakened) or
+                          ((t.kind == ast.TY_ARRAY) and is_place(s.e) and is_mut_place(s.e));
+            if can_mut {
+                let fm = dg.fix(d, "iterate by mutable pointer", "machine");
+                dg.edit(fm, s.name_span, u.cat2("&mut ", s.name));
+            }
+            let fr = dg.fix(d, "iterate by pointer", "machine");
+            dg.edit(fr, s.name_span, u.cat2("&", s.name));
+        }
     }
+    let nloc = C.locals.len;
+    let pre = save_moves(nloc);
+    let pre_dead = C.flow_dead;
     scope_push();
     s.local = declare_local(s.name, s.name_span, vt, false, false);
-    enter_loop(s);
-    _ = check_block(s.body);
-    _ = leave_loop();
+    enter_loop(s, nloc, pre, pre_dead);
+    let body_dead = check_block(s.body);
+    _ = leave_loop(pre, true, body_dead);
     scope_pop();
 }
 
-fn enter_loop(s: *mut ast.Stmt) void {
+fn enter_loop(s: *mut ast.Stmt, nloc: usize, pre: MoveSnap, pre_dead: bool) void {
     C.loop_depth += 1;
     C.loop_breaks.push(false);
     C.loop_labels.push(ast.stmt_more(s).label);
+    let brk = MoveSnap.{ moved: u.newn.[bool](nloc), spans: u.newn.[u.Span](nloc), n: nloc };
+    C.loop_moves.push(LoopMove.{
+        base: nloc,
+        pre: pre,
+        brk: brk,
+        reported: u.newn.[u.Span](nloc),
+        pre_dead: pre_dead,
+        has_break: false,
+    });
 }
 
 // Whether a break targeted the loop.
-fn leave_loop() bool {
+fn leave_loop(exit_snap: MoveSnap, has_cond: bool, body_dead: bool) bool {
+    let lm = C.loop_moves.at_mut(C.loop_moves.len - 1);
+    if not body_dead and not lm.pre_dead {
+        check_loop_backedge(lm, u.mkspan(0, 0, 0), false);
+    }
+    if not has_cond {
+        if lm.has_break {
+            restore_moves(lm.brk);
+            C.flow_dead = lm.pre_dead;
+        } else {
+            restore_moves(lm.pre);
+            C.flow_dead = true;
+        }
+    } else {
+        let mut acc = MoveSnap.{ moved: u.newn.[bool](lm.base), spans: u.newn.[u.Span](lm.base), n: lm.base };
+        or_snap_into(&mut acc, exit_snap);
+        if lm.has_break {
+            or_snap_into(&mut acc, lm.brk);
+        }
+        if not body_dead and not lm.pre_dead {
+            or_moves_into(&mut acc, lm.base);
+        }
+        restore_moves(acc);
+        C.flow_dead = lm.pre_dead;
+    }
+    _ = C.loop_moves.pop();
     C.loop_labels.len -= 1;
     C.loop_depth -= 1;
     return C.loop_breaks.pop();
@@ -5179,8 +5650,16 @@ fn check_jump_target(label: []u8, sp: u.Span, is_break: bool) i32 {
         _ = dg.err(sp, "E0640", "control flow cannot leave a deferred statement");
         return -1;
     }
+    let idx = C.loop_moves.len - 1 - @int_cast(usize, d);
     if is_break {
-        C.loop_breaks.set(C.loop_breaks.len - 1 - @int_cast(usize, d), true);
+        C.loop_breaks.set(idx, true);
+        if not C.flow_dead {
+            let lm = C.loop_moves.at_mut(idx);
+            or_moves_into(&mut lm.brk, lm.base);
+            lm.has_break = true;
+        }
+    } else if not C.flow_dead {
+        check_loop_backedge(C.loop_moves.at_mut(idx), sp, true);
     }
     return d;
 }
@@ -5199,6 +5678,7 @@ fn check_defer(s: *mut ast.Stmt) void {
         _ = dg.err(s.span, "E0641", "errdefer needs a function that returns an error union (!T)");
     }
     let saved_base = C.defer_loop_base;
+    let saved_dead = C.flow_dead;
     C.defer_depth += 1;
     C.defer_loop_base = C.loop_depth;
     if s.body.kind == ast.S_BLOCK {
@@ -5209,6 +5689,7 @@ fn check_defer(s: *mut ast.Stmt) void {
             _ = dg.err(s.body.span, "E0640", "control flow cannot leave a deferred statement");
         }
     }
+    C.flow_dead = saved_dead;
     C.defer_depth -= 1;
     C.defer_loop_base = saved_base;
 }
@@ -5250,7 +5731,10 @@ fn check_fn_body(f: *mut ast.Decl) void {
     scope_pop();
     ctx.scope.deinit();
     ctx.marks.deinit();
+    ctx.locals.deinit();
+    ctx.loop_moves.deinit();
     ctx.loop_breaks.deinit();
+    ctx.loop_labels.deinit();
     C = saved;
     spost.gate_fn(f);
 }
@@ -5440,6 +5924,7 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
     sb.coerce = coerce;
     sb.resolve_arg = resolve_arg;
     sb.insn_check = insn_check;
+    sb.check_no_copy = check_no_copy;
     // (a thread's second run, as axiom lsp's main thread makes, starts
     // afresh too)
     C = u.nil.[FnCtx]();

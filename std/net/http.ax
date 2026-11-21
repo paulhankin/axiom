@@ -1671,7 +1671,7 @@ fn enforce_budget[C](s: *mut Server.[C], all: *mut vec.Vec.[*mut Slot], waiting:
 // run()'s thread: waits for new connections, for bytes on connections
 // that are waiting, and for connections the workers hand back; then, once
 // stopping, closes them all and waits for the workers.
-fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) void {
+fn wait_loop[C](s: *mut Server.[C], workers: []mut thread.Thread.[*mut Server.[C]]) void {
     let mut all = vec.Vec.[*mut Slot].init();  // every open connection
     defer all.deinit();
     let mut waiting = vec.Vec.[*mut Slot].init();  // those waiting here, not with a worker
@@ -1801,7 +1801,7 @@ fn wait_loop[C](s: *mut Server.[C], workers: []thread.Thread.[*mut Server.[C]]) 
         close_slot(sl, false);
     }
     s.work.close();
-    for w in workers {
+    for &mut w in workers {
         w.join();
     }
     for sl in all.items() {
@@ -3275,10 +3275,9 @@ pub fn system_tls() HttpError!*tls.ClientConfig {
         // kept until the program ends: not a leak
         mem.leaks_ignored(true);
         defer mem.leaks_ignored(false);
-        let cfg = tls.ClientConfig.system()!;
-        let p = mem.create(cfg) catch |e| {
-            let mut c = cfg;
-            c.deinit();
+        let p = mem.new.[tls.ClientConfig]()!;
+        p.* = tls.ClientConfig.system() catch |e| {
+            mem.destroy(p);
             return e;
         };
         SYSTEM_TLS = @int_from_ptr(p);
@@ -3522,12 +3521,12 @@ fn request_once(method: []u8, u: Url, headers: []Header, body: []u8, opts: Clien
                 return e;
             };
         }
-        // (offering h2 by ALPN on a copy of the configuration)
-        let mut c2 = cfg.*;
+        // (offering h2 by ALPN without copying the configuration)
+        let mut alpn = cfg.alpn;
         if opts.http2 {
-            c2.alpn = H2_ALPN[..];
+            alpn = H2_ALPN[..];
         }
-        stream = Transport.over_tls(tls.client(tcp, u.hostname, &c2)!);  // closes tcp on failure
+        stream = Transport.over_tls(tls.client_with_alpn(tcp, u.hostname, cfg, alpn)!);  // closes tcp on failure
         use_h2 = opts.http2 and strs.eq(stream.tls.protocol(), "h2");
     }
     defer stream.close();
@@ -3790,7 +3789,7 @@ test "server and client" {
     opts.max_head_bytes = 4096;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut ub: [64]u8 = [0; 64];
     let base = fmt.bufprint(ub[..], "http://127.0.0.1:{}", [fmt.int(port)])!;
     let mut url: [128]u8 = [0; 128];
@@ -3931,22 +3930,28 @@ test "server and client" {
     @expect(strs.starts_with(o11, "HTTP/1.1 404 "));
     // the client will not send requests its caller could have split
     let bad_url = fmt.bufprint(url[..], "{}/a HTTP/1.1\r\nX: 1\r\n\r\nGET /b", [fmt.str(base)])!;
-    @expect(failed(get(bad_url)));
+    @expect(failed_get(bad_url));
     let hdrs: [1]Header = [Header.{ name: "X-Evil", value: "1\r\nContent-Length: 0" }];
-    @expect(failed(request("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs[..], "",
-                           ClientOptions.default())));
+    @expect(failed_req("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs[..], "",
+                       ClientOptions.default()));
     let hdrs2: [1]Header = [Header.{ name: "Transfer-Encoding", value: "chunked" }];
-    @expect(failed(request("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs2[..], "",
-                           ClientOptions.default())));
-    @expect(failed(get("http://internal\x00.example.com/")));
+    @expect(failed_req("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs2[..], "",
+                       ClientOptions.default()));
+    @expect(failed_get("http://internal\x00.example.com/"));
 
     @expect_eq(@atomic_load(&app.hits), 3);
     srv.stop();
     th.join();
 }
 
-fn failed(r: !ClientResponse) bool {
-    let mut v = r catch return true;
+fn failed_get(url: []u8) bool {
+    let mut v = get(url) catch return true;
+    v.deinit();
+    return false;
+}
+
+fn failed_req(method: []u8, url: []u8, headers: []Header, body: []u8, opts: ClientOptions) bool {
+    let mut v = request(method, url, headers, body, opts) catch return true;
     v.deinit();
     return false;
 }
@@ -3968,7 +3973,7 @@ test "https" {
     opts.threads = 2;
     let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut ccfg = tls.ClientConfig.with_roots_pem(cert)!;
     defer ccfg.deinit();
     let copts = ClientOptions.default().with_tls(&ccfg);
@@ -4034,7 +4039,7 @@ test "HTTP/2" {
     opts.max_body_bytes = 8388608;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut url: [128]u8 = [0; 128];
     let h2 = ClientOptions.default().with_http2();
     // prior knowledge, on a plain connection
@@ -4108,7 +4113,7 @@ test "HTTP/2 over TLS" {
     opts.threads = 2;
     let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut ccfg = tls.ClientConfig.with_roots_pem(cert)!;
     defer ccfg.deinit();
     let mut url: [128]u8 = [0; 128];
@@ -4180,7 +4185,7 @@ test "redirects and cookies" {
     opts.threads = 2;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut url: [128]u8 = [0; 128];
 
     let mut jar = cookie.Jar.init();
@@ -4317,7 +4322,7 @@ test "proxies" {
     let mut pu: [64]u8 = [0; 64];
     let mut px = Proxy.to(fmt.bufprint(pu[..], "http://user:pass@127.0.0.1:{}", [fmt.int(fp.l.port())])!)!;
     defer px.deinit();
-    let th = thread.spawn(fake_proxy_run, &mut fp)!;
+    let mut th = thread.spawn(fake_proxy_run, &mut fp)!;
     let mut r = request("GET", "http://example.test:81/x?y=1", no_headers(), "",
                         ClientOptions.default().with_proxy(&px))!;
     th.join();
@@ -4339,7 +4344,7 @@ test "proxies" {
     defer px2.deinit();
     let mut ccfg = tls.ClientConfig.insecure();
     defer ccfg.deinit();
-    let th2 = thread.spawn(fake_proxy_run, &mut fp2)!;
+    let mut th2 = thread.spawn(fake_proxy_run, &mut fp2)!;
     let mut t = request("GET", "https://tunnelled.test/", no_headers(), "",
                         ClientOptions.default().with_proxy(&px2).with_tls(&ccfg))!;
     th2.join();
@@ -4443,7 +4448,7 @@ test "idle and slow clients do not hold the workers" {
     opts.min_body_rate = 1;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     // 4 idle connections, 4 dripping a head, 4 dripping a body: each
     // group more than there are workers
     let mut idle: [4]net.TcpStream = [net.TcpStream.{ handle: -1 }; 4];
@@ -4459,7 +4464,7 @@ test "idle and slow clients do not hold the workers" {
             d.socks[k].write_all("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")!;
         }
     }
-    let dt = thread.spawn(drip_run, &mut d)!;
+    let mut dt = thread.spawn(drip_run, &mut d)!;
     while @atomic_load(&d.sent) < 40 {
         thread.sleep_ms(5);
     }
@@ -4511,7 +4516,7 @@ test "idle and slow TLS clients do not hold the workers" {
     opts.handshake_timeout_ms = 20000;
     let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     // 4 that never start a handshake, 4 dripping a ClientHello
     let mut idle: [4]net.TcpStream = [net.TcpStream.{ handle: -1 }; 4];
     for k in @as(usize, 0)..4 {
@@ -4523,7 +4528,7 @@ test "idle and slow TLS clients do not hold the workers" {
         let hdr: [5]u8 = [22, 3, 1, 0x40, 0];  // a handshake record of 16 KiB
         d.socks[k].write_all(hdr[..])!;
     }
-    let dt = thread.spawn(drip_run, &mut d)!;
+    let mut dt = thread.spawn(drip_run, &mut d)!;
     while @atomic_load(&d.sent) < 20 {
         thread.sleep_ms(5);
     }
@@ -4565,7 +4570,7 @@ test "deadlines for heads, bodies, handshakes and idle connections" {
     opts.min_body_rate = 1000;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut buf: [1024]u8 = [0; 1024];
     // a head that stalls: 408, then closed
     let a = dial(port)!;
@@ -4622,7 +4627,7 @@ test "deadlines for heads, bodies, handshakes and idle connections" {
     opts.handshake_timeout_ms = 200;
     let mut srv2 = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
     let port2 = srv2.port();
-    let th2 = thread.spawn(t_run, &mut srv2)!;
+    let mut th2 = thread.spawn(t_run, &mut srv2)!;
     let h = dial(port2)!;
     let t2 = time.Instant.now();
     @expect(closed_by_server(h, buf[..]));
@@ -4642,7 +4647,7 @@ test "connection limits" {
     opts.max_connections_per_addr = 3;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut buf: [1024]u8 = [0; 1024];
     // three from one address are served; a fourth is closed unanswered
     let mut cs: [5]net.TcpStream = [net.TcpStream.{ handle: -1 }; 5];
@@ -4684,7 +4689,7 @@ test "connection limits" {
     opts.max_connections = 4;
     let mut srv2 = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port2 = srv2.port();
-    let th2 = thread.spawn(t_run, &mut srv2)!;
+    let mut th2 = thread.spawn(t_run, &mut srv2)!;
     for k in @as(usize, 0)..4 {
         cs[k] = dial(port2)!;
         cs[k].write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
@@ -4717,7 +4722,7 @@ test "memory held by requests still arriving is bounded" {
     opts.max_buffered_bytes = 3145728;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     // bodies of 1 MiB of a promised 2 MiB, then nothing: more than the
     // budget together
     let part = mem.alloc.[u8](1048576)!;
@@ -4765,7 +4770,7 @@ test "a body that stops after a burst is too slow" {
     opts.min_body_rate = 10000;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let part = mem.alloc.[u8](200000)!;
     defer mem.free(part);
     @mem_set(part, 'a');
@@ -4792,7 +4797,7 @@ test "bytes between requests do not keep a connection open" {
     opts.idle_timeout_ms = 600;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let c = dial(port)!;
     let mut buf: [1024]u8 = [0; 1024];
     c.write_all("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")!;
@@ -4830,7 +4835,7 @@ test "room is made by closing connections that have not finished a request" {
     opts.head_timeout_ms = 20000;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut buf: [1024]u8 = [0; 1024];
     // two clients served and idle, then two that send nothing
     let mut cs: [5]net.TcpStream = [net.TcpStream.{ handle: -1 }; 5];
@@ -4872,7 +4877,7 @@ test "HTTP/2's preface and first request have the head's deadline" {
     opts.head_timeout_ms = 200;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut buf: [1024]u8 = [0; 1024];
     // the preface, then nothing
     let c = dial(port)!;
@@ -4900,7 +4905,7 @@ test "many pipelined requests on one connection" {
     opts.threads = 1;
     let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     // more than a worker serves at a turn, with another client meanwhile
     let mut many = strs.String.init();
     defer many.deinit();
@@ -4968,7 +4973,7 @@ test "bodies the server could never hold are refused at once" {
     opts.max_buffered_bytes = 1048576;
     let mut srv = sized_server(&mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let mut buf: [1024]u8 = [0; 1024];
     // just under the room the budget leaves: served, on an idle server
     let n: usize = 1048576 - 65536;
@@ -5023,7 +5028,7 @@ test "a fast upload is not the one that gives its memory back" {
     opts.min_body_rate = 0;
     let mut srv = sized_server(&mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     // 30 uploads of 192 KiB each that then stall: more than the budget
     let mut st = mem.new.[Stall]()!;
     defer mem.destroy(st);
@@ -5080,7 +5085,7 @@ test "HTTP/2: a reset stream does not count against the others' rate" {
     opts.min_body_rate = 1000;
     let mut srv = sized_server(&mut r, opts)!;
     let port = srv.port();
-    let th = thread.spawn(t_run, &mut srv)!;
+    let mut th = thread.spawn(t_run, &mut srv)!;
     let c = dial(port)!;
     let mut block = strs.String.init();
     defer block.deinit();

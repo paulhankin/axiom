@@ -627,13 +627,14 @@ pub struct Document {
         self.arena.deinit();
     }
 
-    fn add_path(self: *mut Document, p: draw.Path) SvgError!usize {
-        let mut q = p;
-        self.paths.push(p) catch |e| {
-            q.deinit();
+    fn add_path(self: *mut Document, p: *mut draw.Path) SvgError!usize {
+        self.paths.push(draw.Path.init()) catch |e| {
+            p.deinit();
             return e;
         };
-        return self.paths.len() - 1;
+        let idx = self.paths.len() - 1;
+        @swap(self.paths.get_ptr(idx), p);
+        return idx;
     }
 }
 
@@ -903,19 +904,18 @@ struct Builder {
     }
 
     /// Adds a path to the document (taking it), returning its index.
-    fn store_path(self: *mut Builder, p: draw.Path) SvgError!usize {
-        let mut q = p;
-        let r = self.charge_data(((q.pts.len() * 8) + q.verbs.len()) + 64);
-        let r2 = self.bounds.push(pathdata.bounds(&q));
+    fn store_path(self: *mut Builder, p: *mut draw.Path) SvgError!usize {
+        let r = self.charge_data(((p.pts.len() * 8) + p.verbs.len()) + 64);
+        let r2 = self.bounds.push(pathdata.bounds(p));
         r catch |e| {
-            q.deinit();
+            p.deinit();
             return e;
         };
         r2 catch |e| {
-            q.deinit();
+            p.deinit();
             return e;
         };
-        return self.doc.add_path(q);
+        return self.doc.add_path(p);
     }
 
     fn push_item(self: *mut Builder, it: Item) SvgError!void {
@@ -1879,7 +1879,7 @@ fn mask_content(b: *mut Builder, m: *xml.Element, t: draw.Affine, bbox: pathdata
         };
         rp.deinit();
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
-        it.path = b.store_path(dp)!;
+        it.path = b.store_path(&mut dp)!;
         b.push_item(it)!;
     }
     b.masks.push(m)!;
@@ -1947,7 +1947,7 @@ fn clip_path(b: *mut Builder, id: []u8, t: draw.Affine, bbox: pathdata.Box, rule
         out.deinit();
         return last;
     }
-    let idx = b.store_path(out)!;
+    let idx = b.store_path(&mut out)!;
     b.clips.put(key, idx)!;
     return idx;
 }
@@ -2081,7 +2081,7 @@ fn viewport(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, x: f64,
             return er;
         };
         rp.deinit();
-        let idx = b.store_path(dp)!;
+        let idx = b.store_path(&mut dp)!;
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
         it.path = idx;
         b.push_item(it)!;
@@ -2278,7 +2278,7 @@ fn element_path(b: *mut Builder, e: *xml.Element, s: *Style) SvgError!usize {
         p.deinit();
         return last;
     }
-    let idx = b.store_path(p)!;
+    let idx = b.store_path(&mut p)!;
     b.shape_paths.put(key, idx)!;
     return idx;
 }
@@ -2429,7 +2429,7 @@ fn image_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !v
         };
         rp.deinit();
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
-        it.path = b.store_path(dp)!;
+        it.path = b.store_path(&mut dp)!;
         b.push_item(it)!;
     }
     let mut g = begin_group(b, s, t, pathdata.Box.{ x0: x, y0: y, x1: x + w, y1: y + h })!;
@@ -4119,7 +4119,7 @@ test "limits" {
         s.push_str("</g>")!;
     }
     s.push_str("</svg>")!;
-    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    @expect(fails_parse(s.bytes(), error.TooComplex));
     // deep nesting
     s.clear();
     s.push_str("<svg xmlns='http://www.w3.org/2000/svg'>")!;
@@ -4130,7 +4130,7 @@ test "limits" {
         s.push_str("</g>")!;
     }
     s.push_str("</svg>")!;
-    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    @expect(fails_parse(s.bytes(), error.TooComplex));
     // as deep as allowed: parsed and rendered
     s.clear();
     s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>")!;
@@ -4176,7 +4176,7 @@ test "hostile documents: uses" {
     defer s.deinit();
     // uses that multiply what draws nothing: refused (a work limit), not run for ever
     use_tree(&mut s, "<path id='g0' d='M0 0L1 1' fill='none' stroke='none'/>", 7)!;
-    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    @expect(fails_parse(s.bytes(), error.TooComplex));
     // a big path used 10^4 times is parsed once
     let mut leaf = strs.String.init();
     defer leaf.deinit();
@@ -4245,7 +4245,7 @@ test "hostile documents: uses" {
         s.push_str("'/>")!;
     }
     s.push_str("</svg>")!;
-    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    @expect(fails_parse(s.bytes(), error.TooComplex));
 }
 
 test "hostile documents: style sheets" {
@@ -4324,8 +4324,8 @@ test "hostile documents: rendering groups" {
     @expect((c.b > 0.9) and (c.a > 0.05) and (c.a < 0.2));  // 0.99^254
 }
 
-fn fails_doc(r: !Document, want: error) bool {
-    let mut d = r catch |e| return e == want;
+fn fails_parse(src: []u8, want: error) bool {
+    let mut d = parse(src) catch |e| return e == want;
     d.deinit();
     return false;
 }

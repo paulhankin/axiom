@@ -55,9 +55,61 @@ Local *declare_local(Sym name, Span sp, Type *t, bool mut, bool is_param) {
         l->index = C->fn->locals.len;
         vec_push(C->fn->locals, l);
     }
+    if (C) vec_push(C->locals, l);
     ScopeEntry se = {name, l};
     vec_push(C->scope, se);
     return l;
+}
+
+MoveSnap move_snap_take(void) {
+    MoveSnap s = {0};
+    if (!C || C->locals.len == 0) return s;
+    s.len = C->locals.len;
+    s.moved = calloc((size_t)s.len, sizeof(bool));
+    s.spans = calloc((size_t)s.len, sizeof(Span));
+    for (int i = 0; i < s.len; i++) {
+        s.moved[i] = C->locals.data[i]->moved;
+        s.spans[i] = C->locals.data[i]->moved_span;
+    }
+    return s;
+}
+
+void move_snap_restore(const MoveSnap *s) {
+    if (!C) return;
+    for (int i = 0; i < s->len && i < C->locals.len; i++) {
+        C->locals.data[i]->moved = s->moved[i];
+        C->locals.data[i]->moved_span = s->spans[i];
+    }
+}
+
+void move_snap_join(const MoveSnap *s) {
+    if (!C) return;
+    for (int i = 0; i < s->len && i < C->locals.len; i++) {
+        Local *l = C->locals.data[i];
+        if (!l->moved && s->moved[i]) {
+            l->moved = true;
+            l->moved_span = s->spans[i];
+        }
+    }
+}
+
+void move_snap_free(MoveSnap *s) {
+    free(s->moved);
+    free(s->spans);
+    s->moved = NULL;
+    s->spans = NULL;
+    s->len = 0;
+}
+
+static void move_snap_or_into(MoveSnap *acc, int prefix_len) {
+    if (!C) return;
+    for (int i = 0; i < prefix_len && i < C->locals.len; i++) {
+        Local *l = C->locals.data[i];
+        if (l->moved && !acc->moved[i]) {
+            acc->moved[i] = true;
+            acc->spans[i] = l->moved_span;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,9 +138,16 @@ static bool is_leaving_catch(Expr *e) {
 
 static void check_assign(Stmt *s) {
     Expr *lhs = s->e;
+    bool plain_ident = (s->op == TK_EQ && lhs->kind == E_IDENT);
+    if (plain_ident && C) C->suppress_moved_ident = true;
     Type *lt = check_expr(lhs, NULL);
+    if (C) C->suppress_moved_ident = false;
     if (lt->kind == TY_INVALID) {
         check_expr(s->e2, NULL);
+        if (plain_ident && lhs->local) {
+            lhs->local->moved = false;
+            lhs->local->moved_span = (Span){0};
+        }
         return;
     }
     if (!is_place(lhs)) {
@@ -112,6 +171,11 @@ static void check_assign(Stmt *s) {
     }
     if (s->op == TK_EQ) {
         check_expr_to(&s->e2, lt);
+        if (s->e2->type == lt) check_consume_nocopy(s->e2, false);
+        if (plain_ident && lhs->local) {
+            lhs->local->moved = false;
+            lhs->local->moved_span = (Span){0};
+        }
         return;
     }
     // compound assignment: lhs op= rhs, with the semantics of lhs op rhs
@@ -188,17 +252,43 @@ static void check_assign(Stmt *s) {
 }
 
 
-static void enter_loop(Stmt *s) {
+static void enter_loop(Stmt *s, const MoveSnap *entry) {
     C->loop_depth++;
-    vec_push(C->loop_breaks, false);
-    vec_push(C->loop_labels, s->label);
+    LoopInfo li = {0};
+    li.label = s->label;
+    li.local_base = entry->len;
+    if (li.local_base > 0) {
+        li.entry_moved = calloc((size_t)li.local_base, sizeof(bool));
+        li.entry_spans = calloc((size_t)li.local_base, sizeof(Span));
+        li.break_moved = calloc((size_t)li.local_base, sizeof(bool));
+        li.break_spans = calloc((size_t)li.local_base, sizeof(Span));
+        memcpy(li.entry_moved, entry->moved, (size_t)li.local_base * sizeof(bool));
+        memcpy(li.entry_spans, entry->spans, (size_t)li.local_base * sizeof(Span));
+    }
+    vec_push(C->loops, li);
 }
 
-// Whether a break targeted the loop.
-static bool leave_loop(void) {
-    C->loop_labels.len--;
+static LoopInfo leave_loop(void) {
     C->loop_depth--;
-    return vec_pop(C->loop_breaks);
+    return vec_pop(C->loops);
+}
+
+static void free_loop_info(LoopInfo *li) {
+    free(li->entry_moved);
+    free(li->entry_spans);
+    free(li->break_moved);
+    free(li->break_spans);
+}
+
+static void check_loop_iter_end(const LoopInfo *L) {
+    if (C->flow_dead) return;
+    for (int i = 0; i < L->local_base && i < C->locals.len; i++) {
+        Local *loc = C->locals.data[i];
+        if (!L->entry_moved[i] && loc->moved) {
+            Diag *dg = diag_error(loc->moved_span, "E0709", "use of moved value '%s'", loc->name);
+            diag_note(dg, loc->moved_span, "value moved here");
+        }
+    }
 }
 
 int check_jump_target(Sym label, Span sp, bool is_break) {
@@ -208,8 +298,8 @@ int check_jump_target(Sym label, Span sp, bool is_break) {
     }
     int d = 0;
     if (label) {
-        int n = C->loop_labels.len, i = n;
-        while (i > 0 && !(C->loop_labels.data[i - 1] && !strcmp(C->loop_labels.data[i - 1], label))) i--;
+        int n = C->loops.len, i = n;
+        while (i > 0 && !(C->loops.data[i - 1].label && !strcmp(C->loops.data[i - 1].label, label))) i--;
         if (i == 0) {
             diag_error(sp, "E0605", "no enclosing loop is labeled '%s'", label);
             return -1;
@@ -220,22 +310,67 @@ int check_jump_target(Sym label, Span sp, bool is_break) {
         diag_error(sp, "E0640", "control flow cannot leave a deferred statement");
         return -1;
     }
-    if (is_break) C->loop_breaks.data[C->loop_breaks.len - 1 - d] = true;
+    LoopInfo *L = &C->loops.data[C->loops.len - 1 - d];
+    if (is_break) {
+        L->has_break = true;
+        if (!C->flow_dead) {
+            L->break_snap_init = true;
+            for (int i = 0; i < L->local_base && i < C->locals.len; i++) {
+                Local *loc = C->locals.data[i];
+                if (loc->moved && !L->break_moved[i]) {
+                    L->break_moved[i] = true;
+                    L->break_spans[i] = loc->moved_span;
+                }
+            }
+        }
+    } else if (!C->flow_dead) {
+        for (int i = 0; i < L->local_base && i < C->locals.len; i++) {
+            Local *loc = C->locals.data[i];
+            if (!L->entry_moved[i] && loc->moved) {
+                Diag *dg = diag_error(sp, "E0709", "use of moved value '%s'", loc->name);
+                diag_note(dg, loc->moved_span, "value moved here");
+            }
+        }
+    }
     return d;
 }
 
 static void check_match(Stmt *s, bool *diverges) {
     Type *t = check_expr(s->e, NULL);
     if (ty_is_untyped(t)) t = finalize_untyped(&s->e);
+    if (t->kind != TY_PTR && type_is_nocopy(t) && is_place(s->e) &&
+        !(s->e->kind == E_IDENT && s->e->local && s->e->local->moved)) {
+        bool has_bind = false;
+        for (int i = 0; i < s->arms.len; i++) {
+            if (s->arms.data[i].bind) {
+                has_bind = true;
+                break;
+            }
+        }
+        if (has_bind) diag_error(s->e->span, "E0708", "cannot copy nocopy value of type %s", type_str(t));
+    }
     bool all_div = true;
     bool has_else = false;
     int narms = s->arms.len;
+    bool dead_before = C->flow_dead;
+    MoveSnap before = move_snap_take();
+    MoveSnap acc = {0};
+    if (before.len > 0) {
+        acc.len = before.len;
+        acc.moved = calloc((size_t)acc.len, sizeof(bool));
+        acc.spans = calloc((size_t)acc.len, sizeof(Span));
+    }
+    bool any_live = false;
     Type *ref_ptr = (t->kind == TY_PTR && (t->elem->kind == TY_UNION || t->elem->kind == TY_OPT)) ? t : NULL;
     Type *base = ref_ptr ? t->elem : t;
     if (base->kind == TY_OPT) {
         bool seen[2] = {false, false};
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
+            if (!a->alt) {
+                move_snap_restore(&before);
+                C->flow_dead = dead_before;
+            }
             if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
             scope_push();
             if (a->kind == P_ELSE) {
@@ -266,7 +401,14 @@ static void check_match(Stmt *s, bool *diverges) {
             } else {
                 diag_error(a->span, "E0634", "this pattern cannot match a value of optional type %s", type_str(base));
             }
-            if (!a->alt && !check_block(a->body)) all_div = false;
+            if (!a->alt) {
+                bool arm_div = check_block(a->body);
+                if (!arm_div) all_div = false;
+                if (!dead_before && !arm_div && !C->flow_dead) {
+                    any_live = true;
+                    move_snap_or_into(&acc, before.len);
+                }
+            }
             scope_pop();
         }
         if (!has_else) {
@@ -280,6 +422,10 @@ static void check_match(Stmt *s, bool *diverges) {
         bool *seen = NEWN(bool, u->variants.len + 1);
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
+            if (!a->alt) {
+                move_snap_restore(&before);
+                C->flow_dead = dead_before;
+            }
             if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
             scope_push();
             if (a->kind == P_ELSE) {
@@ -313,7 +459,14 @@ static void check_match(Stmt *s, bool *diverges) {
                 diag_error(a->span, "E0634", "this pattern cannot match a value of %s type %s", is_enum ? "enum" : "union",
                            type_str(base));
             }
-            if (!a->alt && !check_block(a->body)) all_div = false;
+            if (!a->alt) {
+                bool arm_div = check_block(a->body);
+                if (!arm_div) all_div = false;
+                if (!dead_before && !arm_div && !C->flow_dead) {
+                    any_live = true;
+                    move_snap_or_into(&acc, before.len);
+                }
+            }
             scope_pop();
         }
         if (!has_else) {
@@ -342,6 +495,10 @@ static void check_match(Stmt *s, bool *diverges) {
         bool seen_true = false, seen_false = false;
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
+            if (!a->alt) {
+                move_snap_restore(&before);
+                C->flow_dead = dead_before;
+            }
             if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
             scope_push();
             i128 key = 0;
@@ -373,7 +530,14 @@ static void check_match(Stmt *s, bool *diverges) {
                     if (seenv.data[k] == key) diag_error(a->span, "E0631", "pattern is matched more than once");
                 vec_push(seenv, key);
             }
-            if (!a->alt && !check_block(a->body)) all_div = false;
+            if (!a->alt) {
+                bool arm_div = check_block(a->body);
+                if (!arm_div) all_div = false;
+                if (!dead_before && !arm_div && !C->flow_dead) {
+                    any_live = true;
+                    move_snap_or_into(&acc, before.len);
+                }
+            }
             scope_pop();
         }
         free(seenv.data);
@@ -409,13 +573,31 @@ static void check_match(Stmt *s, bool *diverges) {
                        type_str(t));
         for (int i = 0; i < narms; i++) {
             if (s->arms.data[i].alt) continue;
+            move_snap_restore(&before);
+            C->flow_dead = dead_before;
             scope_push();
-            check_block(s->arms.data[i].body);
+            bool arm_div = check_block(s->arms.data[i].body);
+            if (!dead_before && !arm_div && !C->flow_dead) {
+                any_live = true;
+                move_snap_or_into(&acc, before.len);
+            }
             scope_pop();
         }
         all_div = false;
         has_else = true;
     }
+    if (narms == 0) {
+        move_snap_restore(&before);
+        C->flow_dead = dead_before;
+    } else if (dead_before || !any_live) {
+        move_snap_restore(&before);
+        C->flow_dead = true;
+    } else {
+        move_snap_restore(&acc);
+        C->flow_dead = false;
+    }
+    move_snap_free(&acc);
+    move_snap_free(&before);
     *diverges = narms > 0 && all_div;
 }
 
@@ -472,6 +654,7 @@ bool check_stmt(Stmt *s) {
             }
         }
         if (s->e->type && s->e->type->kind == TY_NEVER) div = true;
+        else if (s->e->type == t) check_consume_nocopy(s->e, false);
         s->local = declare_local(s->name, s->name_span, t, s->mut, false);
         if (s->e) s->local->weakened = s->e->weakened;
         break;
@@ -500,26 +683,103 @@ bool check_stmt(Stmt *s) {
         else if (t->kind == TY_VOID) diag_error(s->e->span, "E0622", "nothing to discard: the expression has type void");
         else if (t->kind == TY_ERRUNION)
             diag_error(s->e->span, "E0621", "an error union cannot be discarded; handle it with '!' or 'catch'");
+        else check_consume_nocopy(s->e, false);
+        if (t->kind == TY_NEVER && C) C->flow_dead = true;
         break;
     }
     case S_IF: {
         check_expr_to(&s->e, t_bool);
+        bool dead_before = C->flow_dead;
+        MoveSnap before = move_snap_take();
+        C->flow_dead = dead_before;
         bool a = check_block(s->body);
+        bool then_dead = dead_before || a || C->flow_dead;
+        MoveSnap after_then = move_snap_take();
+        move_snap_restore(&before);
+        C->flow_dead = dead_before;
         bool b = false;
-        if (s->els) b = s->els->kind == S_IF ? check_stmt(s->els) : check_block(s->els);
+        bool else_dead = dead_before;
+        if (s->els) {
+            b = s->els->kind == S_IF ? check_stmt(s->els) : check_block(s->els);
+            else_dead = dead_before || b || C->flow_dead;
+        }
+        if (dead_before) {
+            move_snap_restore(&before);
+            C->flow_dead = true;
+        } else if (then_dead && else_dead) {
+            C->flow_dead = true;
+        } else if (then_dead) {
+            C->flow_dead = false;
+        } else if (else_dead) {
+            move_snap_restore(&after_then);
+            C->flow_dead = false;
+        } else {
+            move_snap_join(&after_then);
+            C->flow_dead = false;
+        }
+        move_snap_free(&after_then);
+        move_snap_free(&before);
         div = s->els && a && b;
         break;
     }
-    case S_WHILE:
+    case S_WHILE: {
+        bool dead_before = C->flow_dead;
+        MoveSnap pre_cond = move_snap_take();
         check_expr_to(&s->e, t_bool);
-        enter_loop(s);
-        check_block(s->body);
-        leave_loop();
+        MoveSnap post_cond = move_snap_take();
+        enter_loop(s, &pre_cond);
+        bool bdiv = check_block(s->body);
+        LoopInfo li = leave_loop();
+        if (!dead_before && !bdiv) check_loop_iter_end(&li);
+        if (dead_before) {
+            move_snap_restore(&pre_cond);
+            C->flow_dead = true;
+        } else {
+            bool falls = !bdiv && !C->flow_dead;
+            for (int i = 0; i < li.local_base && i < C->locals.len; i++) {
+                Local *loc = C->locals.data[i];
+                bool m = post_cond.moved[i];
+                Span sp = post_cond.spans[i];
+                if (li.break_snap_init && li.break_moved[i] && !m) {
+                    m = true;
+                    sp = li.break_spans[i];
+                }
+                if (falls && loc->moved && !m) {
+                    m = true;
+                    sp = loc->moved_span;
+                }
+                loc->moved = m;
+                loc->moved_span = sp;
+            }
+            C->flow_dead = false;
+        }
+        free_loop_info(&li);
+        move_snap_free(&post_cond);
+        move_snap_free(&pre_cond);
         break;
+    }
     case S_LOOP: {
-        enter_loop(s);
-        check_block(s->body);
-        div = !leave_loop();
+        bool dead_before = C->flow_dead;
+        MoveSnap entry = move_snap_take();
+        enter_loop(s, &entry);
+        bool bdiv = check_block(s->body);
+        LoopInfo li = leave_loop();
+        if (!dead_before && !bdiv) check_loop_iter_end(&li);
+        if (dead_before) {
+            move_snap_restore(&entry);
+            C->flow_dead = true;
+        } else if (li.break_snap_init) {
+            for (int i = 0; i < li.local_base && i < C->locals.len; i++) {
+                C->locals.data[i]->moved = li.break_moved[i];
+                C->locals.data[i]->moved_span = li.break_spans[i];
+            }
+            C->flow_dead = false;
+        } else {
+            C->flow_dead = true;
+        }
+        div = !li.has_break;
+        free_loop_info(&li);
+        move_snap_free(&entry);
         break;
     }
     case S_FOR: {
@@ -590,13 +850,52 @@ bool check_stmt(Stmt *s) {
                                    type_str(t));
                     vt = t_invalid;
                 }
+                if (type_is_nocopy(vt)) {
+                    Diag *dg = diag_error(s->name_span, "E0708", "cannot copy nocopy element of type %s in value loop",
+                                          type_str(vt));
+                    bool can_mut = (t->kind == TY_SLICE && t->mut && !s->e->weakened) ||
+                                   (t->kind == TY_ARRAY && is_place(s->e) && is_mut_place(s->e) && !s->e->weakened);
+                    if (can_mut) {
+                        DiagFix *fx = diag_fix(dg, "iterate by mutable pointer", "machine");
+                        diag_fix_edit(fx, s->name_span, arena_printf("&mut %s", s->name));
+                    }
+                    DiagFix *fx = diag_fix(dg, "iterate by pointer", "machine");
+                    diag_fix_edit(fx, s->name_span, arena_printf("&%s", s->name));
+                }
             }
         }
+        bool dead_before = C->flow_dead;
+        MoveSnap entry = move_snap_take();
         scope_push();
         s->local = declare_local(s->name, s->name_span, vt, false, false);
-        enter_loop(s);
-        check_block(s->body);
-        leave_loop();
+        enter_loop(s, &entry);
+        bool bdiv = check_block(s->body);
+        LoopInfo li = leave_loop();
+        if (!dead_before && !bdiv) check_loop_iter_end(&li);
+        if (dead_before) {
+            move_snap_restore(&entry);
+            C->flow_dead = true;
+        } else {
+            bool falls = !bdiv && !C->flow_dead;
+            for (int i = 0; i < li.local_base && i < C->locals.len; i++) {
+                Local *loc = C->locals.data[i];
+                bool m = entry.moved[i];
+                Span sp = entry.spans[i];
+                if (li.break_snap_init && li.break_moved[i] && !m) {
+                    m = true;
+                    sp = li.break_spans[i];
+                }
+                if (falls && loc->moved && !m) {
+                    m = true;
+                    sp = loc->moved_span;
+                }
+                loc->moved = m;
+                loc->moved_span = sp;
+            }
+            C->flow_dead = false;
+        }
+        free_loop_info(&li);
+        move_snap_free(&entry);
         scope_pop();
         break;
     }
@@ -615,6 +914,8 @@ bool check_stmt(Stmt *s) {
     case S_DEFER: {
         if (s->on_error && (!C->ret || C->ret->kind != TY_ERRUNION))
             diag_error(s->span, "E0641", "errdefer needs a function that returns an error union (!T)");
+        bool dead_before = C->flow_dead;
+        MoveSnap before = move_snap_take();
         int saved_base = C->defer_loop_base;
         C->defer_depth++;
         C->defer_loop_base = C->loop_depth;
@@ -626,10 +927,14 @@ bool check_stmt(Stmt *s) {
         }
         C->defer_depth--;
         C->defer_loop_base = saved_base;
+        move_snap_restore(&before);
+        move_snap_free(&before);
+        C->flow_dead = dead_before;
         break;
     }
     case S_BLOCK: div = check_block(s); break;
     }
+    if (div) C->flow_dead = true;
     s->diverges = div;
     return div;
 }
@@ -661,8 +966,8 @@ void check_fn_body(Decl *fn) {
     scope_pop();
     free(ctx.scope.data);
     free(ctx.marks.data);
-    free(ctx.loop_breaks.data);
-    free(ctx.loop_labels.data);
+    free(ctx.loops.data);
+    free(ctx.locals.data);
     C = saved;
     gate_fn(fn);
 }

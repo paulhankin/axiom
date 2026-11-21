@@ -409,6 +409,10 @@ static int64_t const_array_len(Expr *ce, TypeCtx *tc) {
     C = &ctx;
     Type *t = check_expr(ce, t_usize);
     C = saved;
+    free(ctx.scope.data);
+    free(ctx.marks.data);
+    free(ctx.loops.data);
+    free(ctx.locals.data);
     if (ce->is_const && (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || t->kind == TY_CONSTINT)) {
         if (ce->cval < 0) {
             diag_error(ce->span, "E0472", "array length must not be negative");
@@ -1291,7 +1295,12 @@ void resolve_decl(Decl *d) {
         FnCtx *saved = C;
         C = &ctx;
         check_expr_to(&d->init, d->type);
+        if (d->init->type == d->type) check_consume_nocopy(d->init, false);
         C = saved;
+        free(ctx.scope.data);
+        free(ctx.marks.data);
+        free(ctx.loops.data);
+        free(ctx.locals.data);
         d->cexpr = d->init;
         bool ok_const = d->type->kind == TY_STRUCT ? is_const_init(d->init)
                                                    : (d->init->is_const || d->init->kind == E_BOOL);
@@ -1351,6 +1360,57 @@ static bool contains_by_value(Type *t, Decl *target, int depth) {
     }
 }
 
+static bool type_is_nocopy_rec(Type *t, int depth) {
+    if (!t || depth > 64) return false;
+    switch (t->kind) {
+    case TY_STRUCT: {
+        Decl *d = t->decl;
+        if (!d) return false;
+        if (d->is_nocopy) return true;
+        if (d->nocopy_visiting) return false;
+        if (!d->anon) resolve_decl(d);
+        d->nocopy_visiting = true;
+        bool nc = false;
+        for (int i = 0; i < d->fields.len; i++) {
+            if (!d->fields.data[i].type) continue;
+            if (type_is_nocopy_rec(type_field(t, i), depth + 1)) {
+                nc = true;
+                break;
+            }
+        }
+        d->nocopy_visiting = false;
+        return nc;
+    }
+    case TY_UNION: {
+        Decl *d = t->decl;
+        if (!d) return false;
+        if (d->is_nocopy) return true;
+        if (d->nocopy_visiting) return false;
+        resolve_decl(d);
+        d->nocopy_visiting = true;
+        bool nc = false;
+        for (int i = 0; i < d->variants.len; i++) {
+            if (!d->variants.data[i].type) continue;
+            Type *vt = type_variant(t, i);
+            if (vt && type_is_nocopy_rec(vt, depth + 1)) {
+                nc = true;
+                break;
+            }
+        }
+        d->nocopy_visiting = false;
+        return nc;
+    }
+    case TY_ARRAY:
+    case TY_OPT:
+    case TY_ERRUNION:
+        return type_is_nocopy_rec(t->elem, depth + 1);
+    default:
+        return false;
+    }
+}
+
+bool type_is_nocopy(Type *t) { return type_is_nocopy_rec(t, 0); }
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
@@ -1389,7 +1449,12 @@ static void check_global(Decl *d) {
     FnCtx *saved = C;
     C = &ctx;
     check_expr_to(&d->init, d->type);
+    if (d->init->type == d->type) check_consume_nocopy(d->init, false);
     C = saved;
+    free(ctx.scope.data);
+    free(ctx.marks.data);
+    free(ctx.loops.data);
+    free(ctx.locals.data);
     if (d->type->kind != TY_INVALID && d->init->type->kind != TY_INVALID && !is_const_init(d->init))
         diag_error(d->init->span, "E0350", "global initializer must be a constant expression");
 }

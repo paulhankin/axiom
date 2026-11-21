@@ -296,6 +296,8 @@ struct Local {
     bool is_param;
     bool addr_taken;
     bool weakened;
+    bool moved;
+    Span moved_span;
     int index;  // within its function
 };
 
@@ -362,6 +364,8 @@ struct Decl {
     bool checked;
     bool layout_done;
     bool anon;
+    bool is_nocopy;
+    bool nocopy_visiting;
     Expr *cexpr;  // const: checked init expression
     uint64_t *feat_sets;  // fn with an attribute: the extensions each version adds (closed under implication)
 };
