@@ -1154,6 +1154,7 @@ fn constant_p(i: *mut ir.Value) *mut ir.Value {
 /// The object size intrinsics left in f: their values (objsize's last).
 pub fn finish_objsizes(f: *mut ir.Func) void {
     // (and C's restrict scopes, ir.IN_RSCOPE and IN_RESTRICT, removed)
+    let mut decided = false;
     let mut bd = u.nil.[ir.Builder]();
     let mut b = f.first;
     while u.notnil(b) {
@@ -1172,6 +1173,7 @@ pub fn finish_objsizes(f: *mut ir.Func) void {
                 // (C's __builtin_constant_p: 0 unless the passes made it a constant)
                 ir.forward(i, constant_p(i));
                 ir.remove_inst(i);
+                decided = true;
             } else if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_RESTRICT) {
                 // (C's restrict: what the passes knew from it is used)
                 ir.forward(i, i.xs.get(0));
@@ -1187,6 +1189,15 @@ pub fn finish_objsizes(f: *mut ir.Func) void {
             i = next;
         }
         b = b.next;
+    }
+    if decided {
+        // (the branches it decides taken, and the code they leave never
+        // run removed, at every level: what the system's headers' wrappers
+        // call there to report a misuse at compile time is defined nowhere)
+        _ = fold_combine(f, false);
+        if constant_branches(f) {
+            ir.remove_unreachable(f);
+        }
     }
 }
 
@@ -1544,15 +1555,10 @@ pub fn dce(f: *mut ir.Func) void {
     }
 }
 
-fn has_phis(b: *ir.Block) bool {
-    return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
-}
-
-// Constant branches, unreachable blocks, jump threading through empty
-// blocks and merging of straight-line blocks. True if anything changed.
-pub fn simplify_cfg(f: *mut ir.Func) bool {
+// Conditional branches on constants (or to one block either way) made
+// branches. True if anything changed.
+fn constant_branches(f: *mut ir.Func) bool {
     let mut any = false;
-    // constant conditions
     let mut b = f.first;
     while u.notnil(b) {
         let t = ir.terminator(b);
@@ -1574,7 +1580,25 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
                 t.t2 = bnil();
                 any = true;
             }
-        } else if u.notnil(t) and (t.op == ir.OP_SWITCH) and (t.a.kind == ir.V_CINT) {
+        }
+        b = b.next;
+    }
+    return any;
+}
+
+fn has_phis(b: *ir.Block) bool {
+    return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
+}
+
+// Constant branches, unreachable blocks, jump threading through empty
+// blocks and merging of straight-line blocks. True if anything changed.
+pub fn simplify_cfg(f: *mut ir.Func) bool {
+    // constant conditions
+    let mut any = constant_branches(f);
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (t.a.kind == ir.V_CINT) {
             let mut target = t.t1;
             for k in 0..t.xs.len {
                 if t.xs.get(k).cv == t.a.cv {

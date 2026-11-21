@@ -2140,12 +2140,18 @@ library's functions of them declared), and with `_FORTIFY_SOURCE` at `-O1` and a
 `extern inline` wrappers of the string and `printf` functions, which call the
 object-size-checking builtins (`__builtin___memcpy_chk` ...); they declare `size_t` and
 `va_list` again, which the GNU dialects take in every standard. A wrapper that forwards its
-caller's variable arguments (`__builtin_va_arg_pack`: `printf`'s and `open`'s under
-`_FORTIFY_SOURCE`, `error`'s when optimizing) is not used: the GNU compilers give it those
-arguments by inlining each call, and here the call is the library's function itself, as
-without the wrapper (so those calls are not checked). The calls in such wrappers of
-functions with the attribute `error` or `warning` (the headers' checks of the arguments,
-in code that inlining removes) are not reported. Without the option, in
+caller's variable arguments (`__builtin_va_arg_pack`: `sprintf`'s, `printf`'s and `open`'s
+under `_FORTIFY_SOURCE`, `error`'s when optimizing) is inlined at each call, as the GNU
+compilers inline it, so those calls are checked too: `sprintf` into an array whose size the
+optimizer sees calls `__sprintf_chk` with it, which ends the program on an overflow. The
+calls in such wrappers of functions with the attribute `error` or `warning` (the headers'
+checks of the arguments) are not reported, and code that the inlined call's constants
+leave never run (`__builtin_constant_p` decided, at every optimization level) is removed;
+where one is left, a misuse that the GNU compilers report when compiling (`open` with
+`O_CREAT` and no mode), the link fails, naming the headers' check (`__open_missing_mode`).
+A wrapper whose body has what is not inlined (a label, a static object, a statement
+expression, a compound literal, an object with a cleanup) leaves its calls the external
+function's, as before. Without the option, in
 `axiom build`, the macros are not defined, as before: a dialect's extensions do not claim
 another compiler's.
 
@@ -2882,9 +2888,9 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_offsetof(T, m)` | As `offsetof`. |
 | `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The bytes from p to the end of the object (t 0, 2) or of the closest member (t 1, 3; a member array at the end of its structure counts to the object's end), when the expression shows the object: a declared object of a complete non-VLA type, a string literal or a compound literal, its address, its array decayed, an element at a constant index, a member, or such a pointer converted or offset by a constant (0 past the end). Otherwise, when the argument has no side effects, the optimizer looks for the object after it has propagated the values (inlined, folded): a stack object, a global no other unit's definition can replace, a variable length array, the result of a call of a function with `alloc_size` (the argument, or the product of the two), with p at a constant offset from its start; for t 3 (the closest member's lower bound) it does not. A size known only when the program runs (a variable length array's, `alloc_size` of arguments that are not constants) is the answer of `__builtin_dynamic_object_size` only, computed there. Else unknown: `(size_t)-1` for t 0 and 1, 0 for 2 and 3 (an object whose type has a flexible array member is unknown; so is everything at `-O0` but what the expression shows and the variable length arrays). |
 | `__builtin___memcpy_chk`, `__builtin___memmove_chk`, `__builtin___mempcpy_chk`, `__builtin___memset_chk`, `__builtin___strcpy_chk`, `__builtin___stpcpy_chk`, `__builtin___strncpy_chk`, `__builtin___stpncpy_chk`, `__builtin___strcat_chk`, `__builtin___strncat_chk`, `__builtin___sprintf_chk`, `__builtin___snprintf_chk`, `__builtin___vsprintf_chk`, `__builtin___vsnprintf_chk`, `__builtin___printf_chk`, `__builtin___fprintf_chk` | The object-size-checked functions the system's headers call for `_FORTIFY_SOURCE` (with the destination's size, `__builtin_object_size`'s, as the last fixed argument): calls of the C library's `__memcpy_chk` ... (the system's, or this library's, which end the program with `*** buffer overflow detected ***` and `abort` when the object is too small); with a size of `(size_t)-1` (not known), and for `memcpy`, `memmove`, `memset` and `strncpy` with a constant length at most a constant size, the plain function (`strcpy` ...), as the GNU compilers fold them. |
-| `__builtin_va_arg_pack()`, `__builtin_va_arg_pack_len()` | In the inline definition of a function with variable arguments: its caller's variable arguments (as the last arguments of a call), and how many. Such a definition is not used ("GNU compatibility"): its calls are the external function's. Elsewhere `C3090`. |
+| `__builtin_va_arg_pack()`, `__builtin_va_arg_pack_len()` | In the inline definition of a function with variable arguments: its caller's variable arguments, and how many. Each call of the function inlines the definition ("GNU compatibility"): the call's arguments are evaluated once, in order, the pack is replaced by its variable arguments, and the length is their number, a constant at each call. The pack is only the last of a call's variable arguments; elsewhere, and outside such a definition, `C3090`. |
 | `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb`, with `l` and `ll` | Of `unsigned int` (ffs, clrsb: `int`) ... `unsigned long long`; clz and ctz of 0 give the type's width. |
-| `__builtin_bswap16`, `bswap32`, `bswap64` | |
+| `__builtin_bswap16`, `bswap32`, `bswap64`, `bswap128` | `bswap128` of `unsigned __int128`. |
 | `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
 | `__builtin_memcpy`, `memmove`, `memset` | The IR's operations; their value is the destination. |
 | `__builtin_abs`, `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, `copysign`, `fma` (with `f` and `l`; `fabs` and `copysign` also with `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | The IR's operations (`sqrt` of a negative number is a NaN; errno is not set; `fma` on WebAssembly calls the library's). Where `long double` is wider than `double`, the `l` forms but `fabsl` and `copysignl` (which change the sign bit) call the library's function of that name. |
@@ -2898,6 +2904,9 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_shufflevector(a, b, i, ...)` | The vector of the lanes the constant indexes select from a then b (-1: any value); as many lanes as indexes. |
 | `__builtin_convertvector(v, T)` | v's lanes converted to vector type T's element type (as a cast of each), T of as many lanes. |
 | `__builtin_prefetch(p, ...)`, `__builtin_assume_aligned(p, a [, o])` | Nothing; p. |
+| `__builtin_speculation_safe_value(v [, fail])` | v (an integer or a pointer, promoted): no speculative execution is tracked. |
+| `__builtin_LINE()`, `__builtin_FILE()`, `__builtin_FUNCTION()` | The presumed line (an `int` constant) and file name (`#line`'s) of the call, and the name of the function it is in (`""` outside one), as `const char *`. |
+| `__builtin___clear_cache(b, e)` | The instruction cache made to see what the program wrote to [b, e): nothing on x86-64 and WebAssembly, whose caches are coherent; on AArch64 the data cache's lines over it cleaned and the instruction cache's invalidated (with the line sizes of the processor's cache type register). |
 | `__builtin_inf`, `huge_val`, `nan("")`, `nans("")` (with `f`, `l`, `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | Constants (a NaN's payload is not kept; `nans` is a signaling NaN, as C23's `SNAN`; a NaN is positive). |
 | `__builtin_isnan`, `isinf`, `isfinite`, `isnormal`, `signbit`, `isinf_sign`, `fpclassify(a, b, c, d, e, x)`, `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered` | Of the floating type of the operands (an integer is a double). `__builtin_isnanf`, `isnanl`, `isinff`, `isinfl`, `signbitf`, `signbitl`, `finite`, `finitef` and `finitel` (`isfinite`'s) of the operand converted to `float`, `long double` or (`finite`) `double`, as a prototype converts it. In the x87 format an encoding the processor treats as invalid (a pseudo-infinity, pseudo-NaN or unnormal) is a NaN. |
 | `__builtin_issignaling`, `issubnormal`, `iszero` | C23's `issignaling`, `issubnormal` and `iszero`. |

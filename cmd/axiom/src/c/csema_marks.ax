@@ -18,6 +18,7 @@
 //   C3220  main declared inline or _Noreturn
 //   C3221  an inline definition that defines a modifiable static object or refers to an internal identifier
 //   C3222  the address of an object declared register is taken (or a register array is used as a pointer)
+//   C3090  __builtin_va_arg_pack() other than as the last of a call's variable arguments
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
@@ -32,6 +33,14 @@ struct InlineFn {
     gnu: bool,      // GNU89's `extern inline` (only for inlining, whatever else declares it)
     va_pack: bool,  // its body uses __builtin_va_arg_pack: not used (end_body)
     problems: u.List.[Problem],
+    // a body with va_pack: its __builtin_va_arg_pack() calls, and those a
+    // call takes as its last variable argument (pack_argument); at its end
+    // (end_body) the definition and its parameters, which each call of the
+    // function inlines (cgen_stmt.inline_call)
+    packs: u.List.[*mut cast.Expr],
+    taken: u.List.[*mut cast.Expr],
+    wrapper: *mut cast.Decl,
+    wparams: []*mut cast.CSym,
 }
 
 struct Problem {
@@ -199,27 +208,87 @@ pub fn in_gnu_inline_body() bool {
 
 /// The body being analyzed uses __builtin_va_arg_pack or _len (the caller's
 /// variable arguments, which an inline definition forwards): false if it
-/// is not that of an inline definition.
-pub fn va_pack_use() bool {
+/// is not that of an inline definition. e: the call of
+/// __builtin_va_arg_pack (nil for _len), which must be the last of a call's
+/// variable arguments (pack_argument).
+pub fn va_pack_use(e: *mut cast.Expr) bool {
     let f = marks().body;
     if u.isnil(f) {
         return false;
     }
+    if not f.va_pack {
+        f.packs = u.List.[*mut cast.Expr].empty();
+        f.taken = u.List.[*mut cast.Expr].empty();
+    }
     f.va_pack = true;
+    if u.notnil(e) {
+        f.packs.push(e);
+    }
     return true;
 }
 
+/// Is e (typed) a call of __builtin_va_arg_pack of the body being analyzed?
+/// last: it is the last of a call's variable arguments, the place it is
+/// replaced by them (taken: not reported at the body's end).
+pub fn pack_argument(e: *mut cast.Expr, last: bool) bool {
+    let f = marks().body;
+    if u.isnil(f) or not f.va_pack {
+        return false;
+    }
+    for x in f.packs.items() {
+        if x == e {
+            if last {
+                f.taken.push(e);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The definition of function s that its calls inline, an inline
+/// definition that forwards its caller's variable arguments
+/// (__builtin_va_arg_pack), or nil; params: its parameters.
+pub fn va_wrapper(s: *cast.CSym, params: *mut []*mut cast.CSym) *mut cast.Decl {
+    if u.isnil(M) or (s.linkage != cast.LK_EXTERNAL) {
+        return u.nil.[cast.Decl]();
+    }
+    let f = M.fns.get(key(s));
+    if u.isnil(f) or u.isnil(f.wrapper) {
+        return u.nil.[cast.Decl]();
+    }
+    params.* = f.wparams;
+    return f.wrapper;
+}
+
 /// The body analyzed ends. True when the inline definition is not to be
-/// used: it forwards the caller's variable arguments (va_pack_use), which
-/// only the GNU compilers' inlining of each call gives it; the function is
-/// then the external one, the definition dropped (a plain declaration of
-/// the function from now on).
+/// generated as a function: it forwards the caller's variable arguments
+/// (va_pack_use), which only inlining each call gives it; the function is
+/// then the external one (a plain declaration of it from now on), and the
+/// definition is kept for the calls to inline (va_wrapper), unless a
+/// __builtin_va_arg_pack () in it is not the last of a call's variable
+/// arguments (C3090).
 pub fn end_body() bool {
     let m = marks();
     let f = m.body;
     m.body = u.nil.[InlineFn]();
     if u.isnil(f) or not f.va_pack {
         return false;
+    }
+    let mut bad = false;
+    for x in f.packs.items() {
+        let mut ok = false;
+        for y in f.taken.items() {
+            ok = ok or (x == y);
+        }
+        if not ok {
+            cs.err(x.span, "C3090", "'__builtin_va_arg_pack ()' is only the last of a call's variable arguments");
+            bad = true;
+        }
+    }
+    if not bad and u.notnil(f.sym.def) {
+        f.wrapper = f.sym.def;
+        f.wparams = f.sym.params.items();
     }
     f.plain = true;
     f.problems.clear();
