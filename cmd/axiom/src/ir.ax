@@ -118,6 +118,15 @@ let mut sh_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty,
 let mut sh_cints: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
                                           cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
 threadlocal let mut sh_inside: bool = false;  // between sh_enter and sh_exit
+// The rounds of threads begun (shared_begin), and the one whose tables this
+// thread has (sh_task_begin).
+let mut sh_round: u64 = 0;
+threadlocal let mut my_round: u64 = 0;
+// What the thread that made the module had forwarded when the round began
+// (read only while it lasts): for a value another thread finds replaced
+// that it was not given as an operand (replacement).
+let mut sh_repl: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0,
+                                       len: 0 };
 threadlocal let mut sh_my_tt: TypeTab = TypeTab.{ ty_count: 0, int_tys: [@ptr_from_int(*mut Ty, 0); 129],
                                                   t_void: @ptr_from_int(*mut Ty, 0), t_ptr: @ptr_from_int(*mut Ty, 0),
                                                   t_f32: @ptr_from_int(*mut Ty, 0), t_f64: @ptr_from_int(*mut Ty, 0),
@@ -185,12 +194,18 @@ fn free_tt(t: *mut TypeTab) void {
 /// On the thread that made the module, before threads optimize functions
 /// of it at once (passes.ax): its tables become the shared ones.
 pub fn shared_begin() void {
+    // (under the lock: a thread of the pool may be taking its copy of the
+    // last round's tables, sh_task_begin)
+    sh_lock.lock();
     sh_tt = TT;
     sh_cints = CINTS;
     TT = tt_copy(&sh_tt);
+    sh_repl = REPL.copy();
+    sh_on = true;
+    sh_round += 1;
+    sh_lock.unlock();
     CINTS = empty_cints();
     sh_undefs = u.U64Map.empty();
-    sh_on = true;
     u.intern_shared = true;
 }
 
@@ -200,9 +215,12 @@ pub fn shared_end() void {
     free_tt(&mut TT);
     free_cints(&mut CINTS);
     sh_undefs.deinit();
+    sh_lock.lock();
     TT = sh_tt;
     CINTS = sh_cints;
+    sh_repl.deinit();
     sh_on = false;
+    sh_lock.unlock();
     u.intern_shared = false;
 }
 
@@ -225,9 +243,8 @@ pub fn sh_thread_begin(s: *ShStart, epoch: u64) void {
     ptr_bytes = s.ptr_bytes;
     asm_flags = s.asm_flags;  // (read only: the C front end's)
     asm_mems = s.asm_mems;
-    sh_lock.lock();
-    TT = tt_copy(&sh_tt);
-    sh_lock.unlock();
+    // (its copy of the shared types' table is taken in each round, from that
+    // round's: sh_task_begin)
     CINTS = empty_cints();
     sh_undefs = u.U64Map.empty();
     REPL = u.U64Map.empty();
@@ -246,6 +263,22 @@ pub struct ShEnd {
     vals: u.List.[*mut Value],
     blocks: u.List.[*mut Block],
     more: [8]u.List.[usize],
+}
+
+/// On such a thread, before each function it optimizes: on the first of a
+/// round, its own tables from that round's shared ones (while the round
+/// lasts they change only under the lock; between rounds, the thread that
+/// made the module has them as its own).
+pub fn sh_task_begin() void {
+    if (fwd_epoch < SH_EPOCH) or (my_round == sh_round) {
+        return;  // (the thread that made the module, or a round it began)
+    }
+    free_tt(&mut TT);
+    free_cints(&mut CINTS);
+    sh_lock.lock();
+    TT = tt_copy(&sh_tt);
+    my_round = sh_round;
+    sh_lock.unlock();
 }
 
 /// On such a thread, last (its caches given back).
@@ -3991,7 +4024,12 @@ threadlocal let mut REPL: u.U64Map = u.U64Map.{ keys: @ptr_from_int(*mut u64, 0)
                                                 cap: 0, len: 0 };
 
 fn replacement(v: *Value) *mut Value {
-    return @ptr_from_int(*mut Value, @truncate(usize, REPL.get(@as(u64, @int_from_ptr(v)))));
+    let k = @as(u64, @int_from_ptr(v));
+    let mut r = REPL.get(k);
+    if (r == 0) and sh_on and (fwd_epoch >= SH_EPOCH) {
+        r = sh_repl.get(k);  // (forwarded before the round, by the thread that made the module)
+    }
+    return @ptr_from_int(*mut Value, @truncate(usize, r));
 }
 
 // The value `v` stands for after replacements: for a pass that kept v
