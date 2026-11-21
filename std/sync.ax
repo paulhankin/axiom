@@ -22,26 +22,26 @@ pub struct Atomic[T: Int] {
         return Self.{ value: v };
     }
     pub fn load(self: *Self) T {
-        return @atomic_load(&self.value);
+        return @atomic_load(&self.value, "seq_cst");
     }
     pub fn store(self: *mut Self, v: T) void {
-        @atomic_store(&mut self.value, v);
+        @atomic_store(&mut self.value, v, "seq_cst");
     }
     /// Adds (wrapping) and returns the previous value.
     pub fn add(self: *mut Self, v: T) T {
-        return @atomic_add(&mut self.value, v);
+        return @atomic_add(&mut self.value, v, "seq_cst");
     }
     /// Subtracts (wrapping) and returns the previous value.
     pub fn sub(self: *mut Self, v: T) T {
-        return @atomic_sub(&mut self.value, v);
+        return @atomic_sub(&mut self.value, v, "seq_cst");
     }
     pub fn swap(self: *mut Self, v: T) T {
-        return @atomic_xchg(&mut self.value, v);
+        return @atomic_xchg(&mut self.value, v, "seq_cst");
     }
     /// Stores `desired` if the value is `expected`; returns the previous value
     /// (the exchange happened iff it equals `expected`).
     pub fn compare_exchange(self: *mut Self, expected: T, desired: T) T {
-        return @atomic_cas(&mut self.value, expected, desired);
+        return @atomic_cas(&mut self.value, expected, desired, "seq_cst");
     }
 }
 
@@ -95,7 +95,7 @@ pub nocopy struct WaitGroup {
     }
 
     pub fn done(self: *mut WaitGroup) void {
-        if @atomic_sub(&mut self.count, 1, "release") == 1 {
+        if @atomic_sub(&mut self.count, 1, "acq_rel") == 1 {
             _ = @atomic_notify(&self.count, NOTIFY_ALL);
         }
     }
@@ -143,14 +143,14 @@ pub nocopy struct Channel[T] {
             if self.len < self.buf.len {
                 break;
             }
-            let seq = @atomic_load(&self.not_full);
+            let seq = @atomic_load(&self.not_full, "relaxed");
             self.lock.unlock();
             _ = @atomic_wait(&self.not_full, seq, WAIT_FOREVER);
             self.lock.lock();
         }
         self.buf[(self.head + self.len) % self.buf.len] = x;
         self.len += 1;
-        _ = @atomic_add(&mut self.not_empty, 1);
+        _ = @atomic_add(&mut self.not_empty, 1, "relaxed");
         self.lock.unlock();
         _ = @atomic_notify(&self.not_empty, 1);
     }
@@ -167,7 +167,7 @@ pub nocopy struct Channel[T] {
                 self.lock.unlock();
                 return error.Closed;
             }
-            let seq = @atomic_load(&self.not_empty);
+            let seq = @atomic_load(&self.not_empty, "relaxed");
             self.lock.unlock();
             _ = @atomic_wait(&self.not_empty, seq, WAIT_FOREVER);
             self.lock.lock();
@@ -175,7 +175,7 @@ pub nocopy struct Channel[T] {
         let x = self.buf[self.head];
         self.head = (self.head + 1) % self.buf.len;
         self.len -= 1;
-        _ = @atomic_add(&mut self.not_full, 1);
+        _ = @atomic_add(&mut self.not_full, 1, "relaxed");
         self.lock.unlock();
         _ = @atomic_notify(&self.not_full, 1);
         return x;
@@ -195,7 +195,7 @@ pub nocopy struct Channel[T] {
         let x = self.buf[self.head];
         self.head = (self.head + 1) % self.buf.len;
         self.len -= 1;
-        _ = @atomic_add(&mut self.not_full, 1);
+        _ = @atomic_add(&mut self.not_full, 1, "relaxed");
         self.lock.unlock();
         _ = @atomic_notify(&self.not_full, 1);
         return x;
@@ -206,8 +206,8 @@ pub nocopy struct Channel[T] {
     pub fn close(self: *mut Self) void {
         self.lock.lock();
         self.closed = true;
-        _ = @atomic_add(&mut self.not_empty, 1);
-        _ = @atomic_add(&mut self.not_full, 1);
+        _ = @atomic_add(&mut self.not_empty, 1, "relaxed");
+        _ = @atomic_add(&mut self.not_full, 1, "relaxed");
         self.lock.unlock();
         _ = @atomic_notify(&self.not_empty, NOTIFY_ALL);
         _ = @atomic_notify(&self.not_full, NOTIFY_ALL);
@@ -226,7 +226,7 @@ pub nocopy struct Condvar {
 
     /// Atomically unlocks m and waits; locks m again before returning.
     pub fn wait(self: *mut Condvar, m: *mut Mutex) void {
-        let s = @atomic_load(&self.seq);
+        let s = @atomic_load(&self.seq, "seq_cst");
         m.unlock();
         _ = @atomic_wait(&self.seq, s, WAIT_FOREVER);
         m.lock();
@@ -234,7 +234,7 @@ pub nocopy struct Condvar {
 
     /// wait, for at most timeout_ns nanoseconds; false if it timed out.
     pub fn wait_timeout(self: *mut Condvar, m: *mut Mutex, timeout_ns: i64) bool {
-        let s = @atomic_load(&self.seq);
+        let s = @atomic_load(&self.seq, "seq_cst");
         m.unlock();
         let r = @atomic_wait(&self.seq, s, @max(timeout_ns, 0));
         m.lock();
@@ -243,13 +243,13 @@ pub nocopy struct Condvar {
 
     /// Wakes one waiting thread.
     pub fn signal(self: *mut Condvar) void {
-        _ = @atomic_add(&mut self.seq, 1);
+        _ = @atomic_add(&mut self.seq, 1, "seq_cst");
         _ = @atomic_notify(&self.seq, 1);
     }
 
     /// Wakes every waiting thread.
     pub fn broadcast(self: *mut Condvar) void {
-        _ = @atomic_add(&mut self.seq, 1);
+        _ = @atomic_add(&mut self.seq, 1, "seq_cst");
         _ = @atomic_notify(&self.seq, NOTIFY_ALL);
     }
 }
@@ -292,7 +292,7 @@ pub nocopy struct RwLock {
         self.readers -= 1;
         let wake = self.readers == 0;
         if wake {
-            _ = @atomic_add(&mut self.seq, 1);
+            _ = @atomic_add(&mut self.seq, 1, "relaxed");
         }
         self.lock.unlock();
         if wake {
@@ -324,14 +324,14 @@ pub nocopy struct RwLock {
     pub fn write_unlock(self: *mut RwLock) void {
         self.lock.lock();
         self.writer = false;
-        _ = @atomic_add(&mut self.seq, 1);
+        _ = @atomic_add(&mut self.seq, 1, "relaxed");
         self.lock.unlock();
         _ = @atomic_notify(&self.seq, NOTIFY_ALL);
     }
 
     // (called with the lock held; returns with it held)
     fn sleep(self: *mut RwLock) void {
-        let s = @atomic_load(&self.seq);
+        let s = @atomic_load(&self.seq, "relaxed");
         self.lock.unlock();
         _ = @atomic_wait(&self.seq, s, WAIT_FOREVER);
         self.lock.lock();
@@ -536,7 +536,7 @@ fn rw_worker(s: *mut Shared) void {
         } else {
             s.rw.read_lock();
             if s.a != s.b {
-                _ = @atomic_add(&mut s.bad, 1);
+                _ = @atomic_add(&mut s.bad, 1, "relaxed");
             }
             s.rw.read_unlock();
         }
@@ -546,22 +546,22 @@ fn rw_worker(s: *mut Shared) void {
 fn sem_worker(s: *mut Shared) void {
     for _i in @as(u32, 0)..200 {
         s.sem.acquire();
-        let now = @atomic_add(&mut s.inside, 1) + 1;
-        _ = @atomic_max(&mut s.most, now);
-        _ = @atomic_sub(&mut s.inside, 1);
+        let now = @atomic_add(&mut s.inside, 1, "relaxed") + 1;
+        _ = @atomic_max(&mut s.most, now, "relaxed");
+        _ = @atomic_sub(&mut s.inside, 1, "relaxed");
         s.sem.release(1);
     }
 }
 
 fn init_once(s: *mut Shared) void {
-    _ = @atomic_add(&mut s.runs, 1);
+    _ = @atomic_add(&mut s.runs, 1, "relaxed");
 }
 
 fn once_worker(s: *mut Shared) void {
     s.once.call(init_once, s);
     // the others wait for it to finish
-    if @atomic_load(&s.runs) != 1 {
-        _ = @atomic_add(&mut s.bad, 1);
+    if @atomic_load(&s.runs, "relaxed") != 1 {
+        _ = @atomic_add(&mut s.bad, 1, "relaxed");
     }
 }
 
@@ -574,11 +574,11 @@ fn cv_worker(s: *mut Shared) void {
 
 fn bar_worker(s: *mut Shared) void {
     for p in @as(usize, 0)..3 {
-        _ = @atomic_add(&mut s.phase_sum[p], 1);
+        _ = @atomic_add(&mut s.phase_sum[p], 1, "relaxed");
         _ = s.bar.wait();
         // everyone has finished phase p before anyone goes on
-        if @atomic_load(&s.phase_sum[p]) != 4 {
-            _ = @atomic_add(&mut s.bad, 1);
+        if @atomic_load(&s.phase_sum[p], "relaxed") != 4 {
+            _ = @atomic_add(&mut s.bad, 1, "relaxed");
         }
         _ = s.bar.wait();
     }
