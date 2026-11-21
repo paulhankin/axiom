@@ -21,7 +21,38 @@ fn bnil() *mut ir.Block {
 // -----------------------------------------------------------------------------
 // CFG analyses
 // -----------------------------------------------------------------------------
+//
+// Predecessors, the reverse postorder and the dominator tree are kept on
+// the function (ir.Func's cfg_) until its CFG changes: ir.cfg_edit, which
+// the editing functions of ir.ax call (and the passes, where they change a
+// terminator's targets themselves). What a pass changes in the blocks' own
+// analysis fields without changing the CFG (b.rpo, b.aux) is set again when
+// a kept order is handed out; the predecessor lists and the tree are left
+// to the passes that edit the CFG.
+
+// Has f's CFG not changed since its analyses were kept? If it has, forgets
+// them.
+fn cfg_sync(f: *mut ir.Func) bool {
+    if f.cfg_key == f.cfg_ver {
+        return true;
+    }
+    f.cfg_key = f.cfg_ver;
+    f.cfg_have = 0;
+    return false;
+}
+
 pub fn compute_preds(f: *mut ir.Func) void {
+    if cfg_sync(f) and ((f.cfg_have & 1) != 0) {
+        if ir.check_cfg {
+            check_preds(f);
+        }
+        return;
+    }
+    preds_now(f);
+    f.cfg_have |= 1;
+}
+
+fn preds_now(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
         b.preds.clear();
@@ -46,6 +77,54 @@ pub fn compute_preds(f: *mut ir.Func) void {
 // so a block's first successor (the then-block, a loop's body) comes right
 // after it: loops stay contiguous in the code layout.
 pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
+    _ = cfg_sync(f);
+    return rpo_kept(f);
+}
+
+// rpo, after cfg_sync.
+fn rpo_kept(f: *mut ir.Func) u.List.[*mut ir.Block] {
+    if (f.cfg_have & 2) != 0 {
+        let mut b = f.first;
+        while u.notnil(b) {
+            b.rpo = -1;
+            b.aux = 0;
+            b = b.next;
+        }
+        let order = f.cfg_order.copy();
+        for i in 0..order.len {
+            let x = order.get(i);
+            x.rpo = @int_cast(i32, i);
+            x.aux = 1;
+        }
+        if ir.check_cfg {
+            let mut again = rpo_now(f);
+            if not same_blocks(&again, &order) {
+                u.die("AXIOM_CHECK_CFG: a kept reverse postorder is not the CFG's");
+            }
+            again.deinit();
+        }
+        return order;
+    }
+    let order = rpo_now(f);
+    f.cfg_order.clear();
+    @mem_copy(f.cfg_order.extend(order.len), order.items());
+    f.cfg_have |= 2;
+    return order;
+}
+
+fn same_blocks(x: *u.List.[*mut ir.Block], y: *u.List.[*mut ir.Block]) bool {
+    if x.len != y.len {
+        return false;
+    }
+    for i in 0..x.len {
+        if x.get(i) != y.get(i) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn rpo_now(f: *mut ir.Func) u.List.[*mut ir.Block] {
     let mut out = u.List.[*mut ir.Block].empty();
     let mut b = f.first;
     let mut n: usize = 0;
@@ -138,14 +217,75 @@ fn intersect(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
 // Dominator tree (Cooper, Harvey and Kennedy). Needs compute_preds; returns
 // the reverse postorder.
 pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
-    let order = rpo(f);
+    let same = cfg_sync(f);
+    let order = rpo_kept(f);
+    if same and ((f.cfg_have & 4) != 0) {
+        if ir.check_cfg {
+            check_doms(&order);
+        }
+        return order;
+    }
+    doms_of(&order);
+    if (f.cfg_have & 1) != 0 {
+        f.cfg_have |= 4;  // (only for predecessors as compute_preds made them)
+    }
+    return order;
+}
+
+// (doms_of) The edges the first round passed over, from a block after its
+// target, as pairs (target, source).
+threadlocal let mut dom_back: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{
+    data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0, cap: 0 };
+
+// After the first round: is the source of each edge dom_back holds below
+// its target's dominator in the round's tree? Then the next round finds
+// for each block what this one did (its dominator is the common ancestor of
+// those of its predecessors this round saw and of these, below it), and
+// the tree is the dominator tree; else it takes more rounds (an irreducible
+// loop).
+fn back_edges_below() bool {
+    let mut k: usize = 0;
+    while k < dom_back.len {
+        let d = dom_back.get(k).idom;
+        if intersect(dom_back.get(k + 1), d) != d {
+            return false;
+        }
+        k += 2;
+    }
+    return true;
+}
+
+// (AXIOM_CHECK_CFG) A second round of doms_of would change nothing.
+fn check_round(order: *u.List.[*mut ir.Block]) void {
+    for i in 1..order.len {
+        let b = order.get(i);
+        let mut nd = bnil();
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if p.rpo < 0 {
+                continue;
+            }
+            if u.isnil(nd) {
+                nd = p;
+            } else {
+                nd = intersect(p, nd);
+            }
+        }
+        if nd != b.idom {
+            u.die("AXIOM_CHECK_CFG: a dominator tree of one round is not the tree");
+        }
+    }
+}
+
+// The dominator tree of the blocks of order (a reverse postorder).
+fn doms_of(order: *u.List.[*mut ir.Block]) void {
     for i in 0..order.len {
         let b = order.get(i);
         b.idom = bnil();
         b.dom_kids.clear();
     }
     if order.len == 0 {
-        return order;
+        return;
     }
     let entry = order.get(0);
     entry.idom = entry;
@@ -153,7 +293,7 @@ pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
     let mut first = true;
     while changed {
         changed = false;
-        let mut back = false;  // (an edge from a block after its target: a round more)
+        dom_back.clear();
         for i in 1..order.len {
             let b = order.get(i);
             let mut nd = bnil();
@@ -163,7 +303,12 @@ pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
                     continue;
                 }
                 if u.isnil(p.idom) {
-                    back = true;
+                    // (an edge from a block after b: a round more, unless
+                    // the round's tree has b above it)
+                    if first {
+                        dom_back.push(b);
+                        dom_back.push(p);
+                    }
                     continue;
                 }
                 if u.isnil(nd) {
@@ -177,10 +322,13 @@ pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
                 changed = true;
             }
         }
-        if first and not back {
-            // (every block's predecessors came before it: the dominators
-            // of each were known when it was done, so a second round would
-            // change nothing)
+        if first and back_edges_below() {
+            // (every block's predecessors came before it, or are below its
+            // dominator in the tree: the dominators of each were known when
+            // it was done, so a second round would change nothing)
+            if ir.check_cfg {
+                check_round(order);
+            }
             break;
         }
         first = false;
@@ -194,8 +342,67 @@ pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
         let b = order.get(i);
         b.depth = b.idom.depth + 1;
     }
-    number_tree(&order);
-    return order;
+    number_tree(order);
+    return;
+}
+
+// (AXIOM_CHECK_CFG) The kept predecessor lists are the CFG's.
+fn check_preds(f: *mut ir.Func) void {
+    let mut kept = u.List.[*mut ir.Block].empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        kept.push(b);
+        kept.push(@ptr_from_int(*mut ir.Block, b.preds.len));
+        for k in 0..b.preds.len {
+            kept.push(b.preds.get(k));
+        }
+        b = b.next;
+    }
+    preds_now(f);
+    let mut again = u.List.[*mut ir.Block].empty();
+    b = f.first;
+    while u.notnil(b) {
+        again.push(b);
+        again.push(@ptr_from_int(*mut ir.Block, b.preds.len));
+        for k in 0..b.preds.len {
+            again.push(b.preds.get(k));
+        }
+        b = b.next;
+    }
+    if not same_blocks(&kept, &again) {
+        u.die("AXIOM_CHECK_CFG: kept predecessor lists are not the CFG's");
+    }
+    kept.deinit();
+    again.deinit();
+}
+
+// (AXIOM_CHECK_CFG) The kept dominator tree of the blocks of order is the
+// CFG's.
+fn check_doms(order: *u.List.[*mut ir.Block]) void {
+    let mut kept = u.List.[*mut ir.Block].empty();
+    doms_record(order, &mut kept);
+    doms_of(order);
+    let mut again = u.List.[*mut ir.Block].empty();
+    doms_record(order, &mut again);
+    if not same_blocks(&kept, &again) {
+        u.die("AXIOM_CHECK_CFG: a kept dominator tree is not the CFG's");
+    }
+    kept.deinit();
+    again.deinit();
+}
+
+fn doms_record(order: *u.List.[*mut ir.Block], out: *mut u.List.[*mut ir.Block]) void {
+    for i in 0..order.len {
+        let b = order.get(i);
+        out.push(b.idom);
+        out.push(@ptr_from_int(*mut ir.Block, @as(usize, @bit_cast(u32, b.depth))));
+        out.push(@ptr_from_int(*mut ir.Block, @as(usize, @bit_cast(u32, b.dom_lo))));
+        out.push(@ptr_from_int(*mut ir.Block, @as(usize, @bit_cast(u32, b.dom_hi))));
+        out.push(@ptr_from_int(*mut ir.Block, b.dom_kids.len));
+        for k in 0..b.dom_kids.len {
+            out.push(b.dom_kids.get(k));
+        }
+    }
 }
 
 // Numbers the blocks of the dominator tree so that a block's subtree is a
@@ -355,9 +562,11 @@ pub fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64
                 for j in 0..bs.len {
                     bs.set(j, member_copy_blk(bs.get(j), tag));
                 }
+                ir.cfg_edit(y.blk);
             }
             y.t1 = member_copy_blk(y.t1, tag);
             y.t2 = member_copy_blk(y.t2, tag);
+            ir.cfg_edit(y.blk);
             // (-g: the copies of the marks, the values they give mapped alike)
             let mut mk = ir.dbg_marks_at(y);
             while mk >= 0 {
@@ -1614,6 +1823,7 @@ fn constant_branches(f: *mut ir.Func) bool {
                 ir.set_a(t, vnil());
                 t.t1 = keep;
                 t.t2 = bnil();
+                ir.cfg_edit(t.blk);
                 any = true;
             }
         }
@@ -1652,6 +1862,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
             t.t1 = target;
             ir.clear_x(t);
             ir.bs_mut(t).clear();
+            ir.cfg_edit(t.blk);
             any = true;
         } else if u.notnil(t) and swl.simplify(b, t) {
             any = true;  // (cases going where the default does, one case or none)

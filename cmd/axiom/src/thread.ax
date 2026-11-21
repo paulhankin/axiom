@@ -784,6 +784,18 @@ threadlocal let mut rcost: i32 = 0;
 threadlocal let mut budget_fn: *ir.Func = @ptr_from_int(*ir.Func, 0);
 threadlocal let mut budget_left: i32 = 0;
 
+// f's budget, afresh when the last function thread_region_of looked at
+// was another.
+fn region_budget(f: *mut ir.Func) void {
+    if budget_fn != f {
+        budget_fn = f;
+        budget_left = REGION_FN_BASE + (f.nvals / 64);
+        if budget_left > REGION_FN_MAX {
+            budget_left = REGION_FN_MAX;
+        }
+    }
+}
+
 // x's place in rblocks (R, then B), or -1.
 fn rindex(x: *ir.Block) i64 {
     for k in 0..rblocks.len {
@@ -1576,13 +1588,7 @@ fn edge_facts(h: *mut ir.Block) bool {
 // block H above it; true if it did.
 fn thread_region_of(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Block, t: *mut ir.Value,
                     done: i32) bool {
-    if budget_fn != f {
-        budget_fn = f;
-        budget_left = REGION_FN_BASE + (f.nvals / 64);
-        if budget_left > REGION_FN_MAX {
-            budget_left = REGION_FN_MAX;
-        }
-    }
+    region_budget(f);
     if not regions_on or (budget_left < 4) or (b.mark == region_tag) {
         return false;
     }
@@ -1817,47 +1823,183 @@ fn phi_branch(b: *mut ir.Block, t: *mut ir.Value, p: *mut ir.Block) bool {
            (op == ir.OP_INTR);
 }
 
-// Could thread_one find anything (before it works out dominators): a
-// block, cheap to copy, that branches on a value it computes, known on the
-// edge from one of its predecessors?
+// Could thread_one find anything (before dead code is removed and
+// dominators are worked out): a block, cheap to copy, that branches on a
+// value it computes, known on the edge from one of its predecessors?
 fn candidates(f: *mut ir.Func) bool {
     opt.compute_preds(f);
     let mut b = f.first.next;
     while u.notnil(b) {
-        let t = ir.terminator(b);
-        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
-           (copy_cost(b) <= MAX_COPY) {
-            for k in 0..b.preds.len {
-                let p = b.preds.get(k);
-                if (p != b) and u.notnil(eval(t.a, b, p, 0)) {
-                    return true;
-                }
-            }
-        }
-        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (b.preds.len >= 2) and
-           (t.a.kind == ir.V_INST) and (copy_cost(b) <= MAX_COPY) {
-            for k in 0..b.preds.len {
-                let p = b.preds.get(k);
-                if p == b {
-                    continue;
-                }
-                let c = known_on_edge(t.a, b, p);
-                if u.isnil(c) {
-                    if phi_branch(b, t, p) {
-                        return true;
-                    }
-                    continue;
-                }
-                let mut s = t.t2;
-                if ir.cint_val(c) != 0 {
-                    s = t.t1;
-                }
-                if s != b {
-                    return true;
-                }
-            }
+        if may_thread(b) {
+            return true;
         }
         b = b.next;
+    }
+    return false;
+}
+
+// Will thread_some find anything (after dead code is removed)? Its first
+// scan, but for the threading: the same tests of the same blocks in the
+// same order (what they fold, they fold in the same order), with loop
+// headers found without the dominator tree (header).
+fn candidates_exact(f: *mut ir.Func) bool {
+    let mut order = opt.rpo(f);
+    let mut found = false;
+    for bi in 1..order.len {
+        if would_thread(f, order.get(bi)) {
+            found = true;
+            break;
+        }
+    }
+    order.deinit();
+    return found;
+}
+
+// opt.is_loop_header(h) after opt.rpo (b.aux 1 for the blocks it reaches),
+// without the dominator tree: an edge from P into H is a back edge when P
+// comes no earlier than H in the order (only then can H dominate P) and no
+// path from the entry reaches P but through H, which a search backwards
+// from P finds (through the loop's blocks only, when it is one).
+fn header(f: *mut ir.Func, h: *mut ir.Block) bool {
+    let mut r = false;
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if (p.rpo >= h.rpo) and not reached_around(f, p, h) {
+            r = true;
+            break;
+        }
+    }
+    if ir.check_cfg {
+        let mut order = opt.dominators(f);
+        order.deinit();
+        if r != opt.is_loop_header(h) {
+            u.die("AXIOM_CHECK_CFG: thread.header is not opt.is_loop_header");
+        }
+    }
+    return r;
+}
+
+threadlocal let mut hwork: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{
+    data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0, cap: 0 };
+threadlocal let mut hseen: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{
+    data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0, cap: 0 };
+
+// (header) Does a path from the entry reach p without passing through h?
+// Marks the blocks it searches with aux 2, and sets them back to 1.
+fn reached_around(f: *mut ir.Func, p: *mut ir.Block, h: *mut ir.Block) bool {
+    if p == h {
+        return false;
+    }
+    hwork.clear();
+    hseen.clear();
+    p.aux = 2;
+    hwork.push(p);
+    hseen.push(p);
+    let mut found = false;
+    while hwork.len > 0 {
+        let x = hwork.pop();
+        if x == f.first {
+            found = true;
+            break;
+        }
+        for k in 0..x.preds.len {
+            let q = x.preds.get(k);
+            if (q != h) and (q.aux == 1) {
+                q.aux = 2;
+                hwork.push(q);
+                hseen.push(q);
+            }
+        }
+    }
+    for k in 0..hseen.len {
+        hseen.get(k).aux = 1;
+    }
+    return found;
+}
+
+// (thread_some, when b would not be threaded on its own, looks for a region
+// to thread through: thread_region_of, which starts f's budget for them.)
+fn would_thread(f: *mut ir.Func, b: *mut ir.Block) bool {
+    let t = ir.terminator(b);
+    if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
+       (copy_cost(b) <= MAX_COPY) and not header(f, b) {
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if (p == b) or (p.rpo < 0) {
+                continue;
+            }
+            let c = eval(t.a, b, p, 0);
+            if u.notnil(c) and (switch_target(t, c) != b) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) or (b.preds.len == 0) or (t.a.kind != ir.V_INST) or
+       header(f, b) {
+        return false;
+    }
+    if (b.preds.len >= 2) and (copy_cost(b) <= MAX_COPY) {
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if (p == b) or (p.rpo < 0) {
+                continue;
+            }
+            let c = known_on_edge(t.a, b, p);
+            if u.isnil(c) {
+                if phi_branch(b, t, p) {
+                    return true;
+                }
+                continue;
+            }
+            let mut s = t.t2;
+            if ir.cint_val(c) != 0 {
+                s = t.t1;
+            }
+            if s != b {
+                return true;
+            }
+        }
+    }
+    region_budget(f);
+    return false;
+}
+
+// (candidates) Is b, by the test of its terminator alone, a block an edge
+// can be threaded through?
+fn may_thread(b: *mut ir.Block) bool {
+    let t = ir.terminator(b);
+    if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
+       (copy_cost(b) <= MAX_COPY) {
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if (p != b) and u.notnil(eval(t.a, b, p, 0)) {
+                return true;
+            }
+        }
+    }
+    if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
+       (copy_cost(b) <= MAX_COPY) {
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if p == b {
+                continue;
+            }
+            let c = known_on_edge(t.a, b, p);
+            if u.isnil(c) {
+                if phi_branch(b, t, p) {
+                    return true;
+                }
+                continue;
+            }
+            let mut s = t.t2;
+            if ir.cint_val(c) != 0 {
+                s = t.t1;
+            }
+            if s != b {
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -2006,6 +2148,9 @@ pub fn jump_thread(f: *mut ir.Func) bool {
     // (dead phis, of a value set in each iteration of a loop, would count as
     // uses that keep blocks from being threaded)
     opt.dce(f);
+    if not regions_on and not candidates_exact(f) {
+        return false;  // (as when thread_some finds nothing: what phi_conditions did is not counted)
+    }
     region_tag += 1;
     let mut n: i32 = 0;
     let mut first = true;
@@ -2436,6 +2581,7 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
     ir.set_a(br, vnil());
     br.t1 = m;
     br.t2 = ir.bnil();
+    ir.cfg_edit(br.blk);
     return true;
 }
 
@@ -2714,6 +2860,7 @@ fn eq_chain(d: *mut ir.Block) bool {
     ir.set_a(br, c);
     br.t1 = t;
     br.t2 = cur;
+    ir.cfg_edit(br.blk);
     return true;
 }
 
@@ -2843,6 +2990,7 @@ fn and_chain(d: *mut ir.Block) bool {
     }
     br.t1 = way;
     br.t2 = e;
+    ir.cfg_edit(br.blk);
     return true;
 }
 
@@ -3216,6 +3364,7 @@ fn select_ways(f: *mut ir.Func, d: *mut ir.Block) bool {
     ir.set_a(br, vnil());
     br.t1 = j;
     br.t2 = ir.bnil();
+    ir.cfg_edit(br.blk);
     return true;
 }
 
@@ -3332,6 +3481,7 @@ fn merge_conds(f: *mut ir.Func, d: *mut ir.Block) bool {
         ir.set_a(br, ir.and_(bld, c1, c2));
         br.t1 = t;
         br.t2 = y;
+        ir.cfg_edit(br.blk);
         ir.remove_phi_input(m, x);
         ir.replace_phi_block(t, x, d);
         _ = f;

@@ -1490,6 +1490,19 @@ threadlocal let mut synth: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
     data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
 threadlocal let mut n_synth: usize = 0;
 
+// The constants true and false and their type, of the current run (looked
+// up once: assume makes several facts of each condition).
+threadlocal let mut g_true: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+threadlocal let mut g_false: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+threadlocal let mut g_i1: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+
+fn kb(x: bool) *mut ir.Value {
+    if x {
+        return g_true;
+    }
+    return g_false;
+}
+
 fn synth_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     if n_synth == synth.len {
         synth.push(u.new.[ir.Value]());
@@ -1498,11 +1511,21 @@ fn synth_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
     n_synth += 1;
     v.kind = ir.V_INST;
     v.op = ir.OP_ICMP;
-    v.ty = ir.t_int(1);
+    v.ty = g_i1;
     v.cv = ir.pred_cv(p);
     ir.set_a(v, a);
     ir.set_b(v, b);
     return v;
+}
+
+// add_expr(synth_icmp(p, a, b), val), given hv(a) and hv(b): the hash is
+// hash_expr's of such a comparison (not commutative, no c, xs or mask).
+fn add_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, ha: u64, hb: u64, val: *mut ir.Value) void {
+    let key = synth_icmp(p, a, b);
+    let mut h = mix(@as(u64, @bit_cast(u32, ir.OP_ICMP)), @as(u64, @bit_cast(u32, g_i1.id)));
+    h = mix(h, ir.pred_cv(p));
+    h = mix(mix(mix(h, ha), hb), 7);
+    push_ent(K_EXPR, h, key, 0, g_i1, val);
 }
 
 // c is known to be `val` in the current scope.
@@ -1510,7 +1533,7 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     if (depth > 4) or ir.is_const(c) {
         return;
     }
-    add_known(c, ir.kbool(val));
+    add_known(c, kb(val));
     if c.kind != ir.V_INST {
         return;
     }
@@ -1521,11 +1544,13 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
             tp = ir.inv_pred(p);
         }
         assume_bounds(tp, c.a, c.b);
-        add_expr(synth_icmp(tp, c.a, c.b), ir.kbool(true));
-        add_expr(synth_icmp(ir.inv_pred(tp), c.a, c.b), ir.kbool(false));
-        add_expr(synth_icmp(ir.swap_pred(tp), c.b, c.a), ir.kbool(true));
-        add_expr(synth_icmp(ir.inv_pred(ir.swap_pred(tp)), c.b, c.a), ir.kbool(false));
-        assume_order(tp, c.a, c.b);
+        let ha = hv(c.a);
+        let hb = hv(c.b);
+        add_icmp(tp, c.a, c.b, ha, hb, g_true);
+        add_icmp(ir.inv_pred(tp), c.a, c.b, ha, hb, g_false);
+        add_icmp(ir.swap_pred(tp), c.b, c.a, hb, ha, g_true);
+        add_icmp(ir.inv_pred(ir.swap_pred(tp)), c.b, c.a, hb, ha, g_false);
+        assume_order(tp, c.a, c.b, ha, hb);
         // x > K is x >= K + 1, x >= K is x > K - 1, and so on
         if ir.is_cint(c.b) and not ir.is_const(c.a) {
             assume_adjacent(tp, c.a, c.b);
@@ -1596,7 +1621,7 @@ fn outcomes(p: ir.CmpPred) u32 {
 // tp and its inverse): x < y makes x > y and x == y false and x != y and
 // x <= y true, in both operand orders; x == y decides every order; an
 // order of one signedness says nothing of the other's.
-fn assume_order(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
+fn assume_order(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, ha: u64, hb: u64) void {
     let s = outcomes(tp);
     let signed = ir.is_signed_pred(tp);
     for qi in @int_from_enum(ir.IntEQ)..(@int_from_enum(ir.IntSLE) + 1) {
@@ -1610,11 +1635,11 @@ fn assume_order(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
         }
         let o = outcomes(q);
         if (s & o) == s {
-            add_expr(synth_icmp(q, a, b), ir.kbool(true));
-            add_expr(synth_icmp(ir.swap_pred(q), b, a), ir.kbool(true));
+            add_icmp(q, a, b, ha, hb, g_true);
+            add_icmp(ir.swap_pred(q), b, a, hb, ha, g_true);
         } else if (s & o) == 0 {
-            add_expr(synth_icmp(q, a, b), ir.kbool(false));
-            add_expr(synth_icmp(ir.swap_pred(q), b, a), ir.kbool(false));
+            add_icmp(q, a, b, ha, hb, g_false);
+            add_icmp(ir.swap_pred(q), b, a, hb, ha, g_false);
         }
     }
 }
@@ -1652,8 +1677,10 @@ fn assume_adjacent(tp: ir.CmpPred, x: *mut ir.Value, k: *mut ir.Value) void {
     }
     let q = @enum_from_int(ir.CmpPred, np);
     let c = ir.cint(t, nk);
-    add_expr(synth_icmp(q, x, c), ir.kbool(true));
-    add_expr(synth_icmp(ir.inv_pred(q), x, c), ir.kbool(false));
+    let hx = hv(x);
+    let hc = hv(c);
+    add_icmp(q, x, c, hx, hc, g_true);
+    add_icmp(ir.inv_pred(q), x, c, hx, hc, g_false);
 }
 
 const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
@@ -1730,8 +1757,8 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
     }
     add_le(x, vnil(), @bit_cast(i64, lo + (n - 1)));
     add_ge(x, @bit_cast(i64, lo));
-    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), ir.kbool(true));
-    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), ir.kbool(true));
+    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), g_true);
+    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), g_true);
 }
 
 // a <= b + c with a = x + k (k a small constant, the sum not wrapping):
@@ -1880,10 +1907,10 @@ fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
         // a >= lo >= 0 (signed): a is not negative, and at least lo
         let lo = ir.sval(b) + pick1(tp == ir.IntSGT);
         if lo >= 0 {
-            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), ir.kbool(true));
-            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), ir.kbool(true));
+            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), g_true);
+            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), g_true);
             if lo >= 1 {
-                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), ir.kbool(true));
+                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), g_true);
             }
         }
     } else if ((tp == ir.IntSLT) or (tp == ir.IntSLE)) and ir.is_cint(b) and not ir.is_const(a) {
@@ -1905,8 +1932,8 @@ fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
             sub_le_busy = false;
             let lo = kv(a.a) - hi;
             if (m >= 0) and (m <= smax_of(a.ty)) and (lo >= 1) and (lo <= m) {
-                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), ir.kbool(true));
-                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), ir.kbool(true));
+                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), g_true);
+                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), g_true);
             }
         }
     }
@@ -2909,10 +2936,10 @@ fn table_cmp(i: *mut ir.Value) *mut ir.Value {
         }
     }
     if count == 0 {
-        return ir.kbool(false);
+        return g_false;
     }
     if count == (hi + 1) {
-        return ir.kbool(true);
+        return g_true;
     }
     ir.at_before(B, i);
     if runs == 1 {
@@ -3030,14 +3057,14 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             prove_budget = 64;
             let need = d + pick1(p == ir.IntULT);
             if below_max(a, need, 0) {
-                return ir.kbool(true);
+                return g_true;
             }
         }
         if (d < 0x1_0000_0000) and (((p == ir.IntUGT) and (d >= 1)) or ((p == ir.IntUGE) and (d >= 0))) {
             prove_budget = 64;
             let need = d + pick1(p == ir.IntUGE);
             if below_max(a, need, 0) {
-                return ir.kbool(false);
+                return g_false;
             }
         }
         return vnil();
@@ -3051,14 +3078,14 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             p = ir.unsigned_pred(p);  // both not negative: the unsigned comparison
         }
         if (kv(b) == 0) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
-            return ir.kbool(p == ir.IntUGE);
+            return kb(p == ir.IntUGE);
         }
         if m >= 0 {
             if ((p == ir.IntULT) and (m < kv(b))) or ((p == ir.IntUGE) and (m < kv(b))) {
-                return ir.kbool(p == ir.IntULT);
+                return kb(p == ir.IntULT);
             }
             if ((p == ir.IntULE) and (m <= kv(b))) or ((p == ir.IntUGT) and (m <= kv(b))) {
-                return ir.kbool(p == ir.IntULE);
+                return kb(p == ir.IntULE);
             }
         }
     }
@@ -3069,7 +3096,7 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             need += 1;
         }
         if at_least(a, need, 0) {
-            return ir.kbool((p == ir.IntUGE) or (p == ir.IntUGT));
+            return kb((p == ir.IntUGE) or (p == ir.IntUGT));
         }
     }
     // k <= x, k < x (and their negations) likewise
@@ -3080,7 +3107,7 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             need += 1;
         }
         if at_least(b, need, 0) {
-            return ir.kbool((p == ir.IntULE) or (p == ir.IntULT));
+            return kb((p == ir.IntULE) or (p == ir.IntULT));
         }
     }
     // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
@@ -3095,7 +3122,7 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
         }
         if (d >= 1) and (d < 0x1_0000_0000) and (m >= 0) and (m <= smax_of(a.ty)) and (need >= 1) and
            (need <= smax_of(a.ty)) and known_at_least(a.a, need) {
-            return ir.kbool((p == ir.IntSGT) or (p == ir.IntSGE));
+            return kb((p == ir.IntSGT) or (p == ir.IntSGE));
         }
     }
     if ir.is_op(a, ir.OP_ADD) and ((a.a == b) or (a.b == b)) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
@@ -3103,23 +3130,23 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
         let x = ub(a.a, 0);
         let y = ub(a.b, 0);
         if (x >= 0) and (y >= 0) and fits_type(x + y, a.ty) {
-            return ir.kbool(p == ir.IntUGE);
+            return kb(p == ir.IntUGE);
         }
     }
     if (p == ir.IntULT) or (p == ir.IntUGE) {
         // a < b: a <= b - 1; a >= b: b <= a
         if prove_le(a, b, -1) {
-            return ir.kbool(p == ir.IntULT);
+            return kb(p == ir.IntULT);
         }
         if not ir.is_const(b) and prove_le(b, a, 0) {
-            return ir.kbool(p == ir.IntUGE);
+            return kb(p == ir.IntUGE);
         }
     } else if (p == ir.IntULE) or (p == ir.IntUGT) {
         if prove_le(a, b, 0) {
-            return ir.kbool(p == ir.IntULE);
+            return kb(p == ir.IntULE);
         }
         if not ir.is_const(b) and prove_le(b, a, -1) {
-            return ir.kbool(p == ir.IntUGT);
+            return kb(p == ir.IntUGT);
         }
     }
     return vnil();
@@ -3448,6 +3475,9 @@ pub fn gvn(f: *mut ir.Func) bool {
         B = ir.new_builder();
     }
     g_fn = f;
+    g_true = ir.kbool(true);
+    g_false = ir.kbool(false);
+    g_i1 = ir.t_int(1);
     _ = opt.rscope_cycles(f);  // (C's restrict: ir.restrict_tagged)
     sw_of = vnil();            // (switch_case_to's table: made again in each walk)
     changed = false;

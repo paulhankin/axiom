@@ -3172,6 +3172,16 @@ pub struct Func {
     pub va_home: bool,             // Windows ARM64: 64 bytes for x0-x7 between the frame record and the stack arguments (a64.ax)
     graves: u.List.[*mut Value],   // values put in the graveyard under it (some since moved on)
     bgraves: u.List.[*mut Block],  // its blocks put there
+    // opt.ax's CFG analyses, kept while the CFG stays as it was: every edit
+    // of its blocks, their order or their successors counts in cfg_ver
+    // (cfg_edit); cfg_key is the count when they were worked out. cfg_have:
+    // 1 the predecessor lists, 2 the reverse postorder (cfg_order), 4 the
+    // dominator tree
+    pub cfg_ver: u64,
+    pub cfg_key: u64,
+    pub cfg_order: u.List.[*mut Block],
+    pub cfg_have: u8,
+    cfg_clean: u64,  // cfg_ver + 1 when remove_unreachable last found every block reached
     // calls a function that returns twice (C's setjmp, c/cgen_expr.ax): not
     // optimized (its objects stay in memory, their slots apart), not inlined,
     // no sibling calls or shrink-wrapping (passes.ax, inline.ax, the backends)
@@ -5306,6 +5316,7 @@ pub fn append_block(f: *mut Func, name: []u8) *mut Block {
     b.name = u.perm_dup(name);  // (made while the code generator's own memory is given back after)
     b.id = f.nblocks;
     f.nblocks += 1;
+    f.cfg_ver +%= 1;
     if u.isnil(f.last) {
         f.first = b;
     } else {
@@ -5320,6 +5331,11 @@ pub fn append_block(f: *mut Func, name: []u8) *mut Block {
 // for reuse: f is left a declaration. For a function nothing refers to.
 pub fn drop_body(f: *mut Func) void {
     recycle(f);
+    // (opt.ax's CFG analyses kept on it)
+    f.cfg_ver +%= 1;
+    f.cfg_order.deinit();
+    f.cfg_order = u.List.[*mut Block].empty();
+    f.cfg_have = 0;
     forget_uses(f);
     // last first, so that they are reused in the order they lie in memory
     let mut b = f.last;
@@ -5391,6 +5407,7 @@ pub fn dbg_move_end(from: *Block, to: *Block) void {
 
 fn unlink_block(b: *mut Block) void {
     let f = b.fnp;
+    f.cfg_ver +%= 1;
     block_to_grave(b);
     if u.notnil(b.prev) {
         b.prev.next = b.next;
@@ -5473,6 +5490,7 @@ pub fn succ(t: *mut Value, i: usize) *mut Block {
 }
 
 pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
+    cfg_edit(t.blk);
     if i == 0 {
         t.t1 = b;
     } else if t.op == OP_CONDBR {
@@ -5482,9 +5500,26 @@ pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
     }
 }
 
+/// Debugging (AXIOM_CHECK_CFG): each CFG analysis opt.ax keeps (and
+/// remove_unreachable's knowing that there is nothing to remove) is checked
+/// against one worked out again. (Set before the threads start.)
+pub let mut check_cfg: bool = false;
+
+/// The CFG of b's function changed (its blocks, their order, or a
+/// terminator or its targets): the analyses opt.ax keeps of it are out of
+/// date. b may be nil (a terminator not in a block yet).
+pub fn cfg_edit(b: *mut Block) void {
+    if u.notnil(b) and u.notnil(b.fnp) {
+        b.fnp.cfg_ver +%= 1;
+    }
+}
+
 // Instruction list editing.
 pub fn insert_before(pos: *mut Value, v: *mut Value) void {
     let b = pos.blk;
+    if is_term(v.op) {
+        cfg_edit(b);
+    }
     v.blk = b;
     v.next = pos;
     v.prev = pos.prev;
@@ -5503,6 +5538,9 @@ pub fn append_inst(b: *mut Block, v: *mut Value) void {
         if k >= 0 {
             mk_set(v, mk_cat(k, dbg_marks_at(v)));  // (the marks left at the block's end)
         }
+    }
+    if is_term(v.op) {
+        cfg_edit(b);
     }
     v.blk = b;
     v.prev = b.last;
@@ -5526,6 +5564,7 @@ pub fn move_rest(v: *mut Value, to: *mut Block) void {
     if u.isnil(first) {
         return;
     }
+    cfg_edit(b);
     let mut i = first;
     while u.notnil(i) {
         if dbg_on {
@@ -5545,6 +5584,9 @@ pub fn move_rest(v: *mut Value, to: *mut Block) void {
 
 pub fn remove_inst(v: *mut Value) void {
     let b = v.blk;
+    if is_term(v.op) {
+        cfg_edit(b);
+    }
     if dbg_on {
         mk_leave(v);
         dbg_alt(v);
@@ -6602,6 +6644,7 @@ pub fn switch_(bd: *mut Builder, x: *mut Value, dflt: *mut Block) *mut Value {
 }
 
 pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
+    cfg_edit(sw.blk);
     push_x(sw, c);
     bs_mut(sw).push(b);
 }
@@ -6895,6 +6938,15 @@ pub fn remove_unreachable(f: *mut Func) void {
         return;
     }
     let mut b = f.first;
+    let clean = f.cfg_clean == f.cfg_ver +% 1;
+    if clean and not check_cfg {
+        // (no edit since every block was reached: each still is)
+        while u.notnil(b) {
+            b.aux = 1;
+            b = b.next;
+        }
+        return;
+    }
     while u.notnil(b) {
         b.aux = 0;
         b = b.next;
@@ -6924,6 +6976,10 @@ pub fn remove_unreachable(f: *mut Func) void {
         }
         b = next;
     }
+    if any and clean {
+        u.die("AXIOM_CHECK_CFG: a block was unreachable though no edit was counted");
+    }
+    f.cfg_clean = f.cfg_ver +% 1;
     if not any {
         return;
     }
