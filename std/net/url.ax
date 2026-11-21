@@ -148,49 +148,89 @@ pub struct Url {
     /// authority (no authority, and a path starting "//") is written with
     /// "/." in front, as the WHATWG standard does.
     pub fn write_to(self: Url, w: io.Writer) !void {
-        if self.scheme.len > 0 {
-            w.write_all(self.scheme)!;
-            w.write_all(":")!;
-        }
-        if self.has_authority {
-            w.write_all("//")!;
-            if self.has_userinfo {
-                w.write_all(self.userinfo)!;
-                w.write_all("@")!;
-            }
-            if self.ip_literal {
-                w.write_all("[")!;
-                w.write_all(self.hostname)!;
-                w.write_all("]")!;
-            } else {
-                w.write_all(self.hostname)!;
-            }
-            if self.has_port {
-                w.write_all(":")!;
-                w.write_all(self.port)!;
-            }
-        } else if strs.starts_with(self.path, "//") {
-            w.write_all("/.")!;
-        }
-        w.write_all(self.path)!;
-        if self.has_query {
-            w.write_all("?")!;
-            w.write_all(self.query)!;
-        }
-        if self.has_fragment {
-            w.write_all("#")!;
-            w.write_all(self.fragment)!;
-        }
+        let mut wr = w;
+        write_url_out(io_out(&mut wr), self)!;
     }
 
     /// The URL as text in new memory (free it with mem.free).
-    pub fn to_string(self: Url) ![]mut u8 {
+    pub fn to_string(self: Url) { OutOfMemory }![]mut u8 {
         let mut s = strs.String.init();
-        self.write_to(s.writer()) catch |e| {
+        write_url_out(str_out(&mut s), self) catch |e| {
             s.deinit();
             return e;
         };
         return s.take();
+    }
+}
+
+struct Out[error E] {
+    ctx: *mut void,
+    put: fn(*mut void, []u8) E!void,
+
+    fn write_all(self: Out.[E], bytes: []u8) E!void {
+        return self.put(self.ctx, bytes);
+    }
+
+    fn print_byte(self: Out.[E], b: u8) E!void {
+        let one: [1]u8 = [b];
+        return self.put(self.ctx, one[..]);
+    }
+
+    fn print_u64(self: Out.[E], x: u64) E!void {
+        let mut buf: [20]u8 = [0; 20];
+        return self.put(self.ctx, io.fmt_u64(buf[..], x));
+    }
+}
+
+fn io_put(ctx: *mut void, bytes: []u8) !void {
+    return (@ptr_cast(*mut io.Writer, ctx)).write_all(bytes);
+}
+
+fn str_put(ctx: *mut void, bytes: []u8) { OutOfMemory }!void {
+    return (@ptr_cast(*mut strs.String, ctx)).push_str(bytes);
+}
+
+fn io_out(w: *mut io.Writer) Out.[error] {
+    return Out.[error].{ ctx: @ptr_cast(*mut void, w), put: io_put };
+}
+
+fn str_out(s: *mut strs.String) Out.[{ OutOfMemory }] {
+    return Out.[{ OutOfMemory }].{ ctx: @ptr_cast(*mut void, s), put: str_put };
+}
+
+fn write_url_out[error E](w: Out.[E], u: Url) E!void {
+    if u.scheme.len > 0 {
+        w.write_all(u.scheme)!;
+        w.write_all(":")!;
+    }
+    if u.has_authority {
+        w.write_all("//")!;
+        if u.has_userinfo {
+            w.write_all(u.userinfo)!;
+            w.write_all("@")!;
+        }
+        if u.ip_literal {
+            w.write_all("[")!;
+            w.write_all(u.hostname)!;
+            w.write_all("]")!;
+        } else {
+            w.write_all(u.hostname)!;
+        }
+        if u.has_port {
+            w.write_all(":")!;
+            w.write_all(u.port)!;
+        }
+    } else if strs.starts_with(u.path, "//") {
+        w.write_all("/.")!;
+    }
+    w.write_all(u.path)!;
+    if u.has_query {
+        w.write_all("?")!;
+        w.write_all(u.query)!;
+    }
+    if u.has_fragment {
+        w.write_all("#")!;
+        w.write_all(u.fragment)!;
     }
 }
 
@@ -275,7 +315,7 @@ fn allowed(c: u8, comp: Component) bool {
 
 // Writes s, escaping the bytes `comp` does not allow; with `plus`, a space
 // becomes '+'.
-fn escape_to(w: io.Writer, s: []u8, comp: Component, plus: bool) !void {
+fn escape_out[error E](w: Out.[E], s: []u8, comp: Component, plus: bool) E!void {
     let mut lit: usize = 0;
     for i in 0..s.len {
         let c = s[i];
@@ -296,13 +336,14 @@ fn escape_to(w: io.Writer, s: []u8, comp: Component, plus: bool) !void {
 
 /// Writes s percent-encoded for use in `comp` (uppercase hex digits).
 pub fn encode_to(w: io.Writer, s: []u8, comp: Component) !void {
-    escape_to(w, s, comp, false)!;
+    let mut wr = w;
+    escape_out(io_out(&mut wr), s, comp, false)!;
 }
 
 /// s percent-encoded for `comp`, in new memory (free it with mem.free).
-pub fn encode(s: []u8, comp: Component) ![]mut u8 {
+pub fn encode(s: []u8, comp: Component) { OutOfMemory }![]mut u8 {
     let mut out = strs.String.init();
-    escape_to(out.writer(), s, comp, false) catch |e| {
+    escape_out(str_out(&mut out), s, comp, false) catch |e| {
         out.deinit();
         return e;
     };
@@ -314,7 +355,8 @@ pub fn encode(s: []u8, comp: Component) ![]mut u8 {
 /// (as Python's quote_plus; the WHATWG standard also leaves '*' alone and
 /// encodes '~').
 pub fn form_encode_to(w: io.Writer, s: []u8) !void {
-    escape_to(w, s, Component.COMPONENT, true)!;
+    let mut wr = w;
+    escape_out(io_out(&mut wr), s, Component.COMPONENT, true)!;
 }
 
 /// Decodes %XX escapes (and, with `plus`, '+' as a space, as in query
@@ -450,14 +492,29 @@ pub fn query_writer(w: io.Writer) QueryWriter {
 
 /// The query string of the pairs (as Python's urlencode), in new memory
 /// (free it with mem.free).
-pub fn build_query(pairs: []Pair) ![]mut u8 {
+pub fn build_query(pairs: []Pair) { OutOfMemory }![]mut u8 {
     let mut s = strs.String.init();
-    let mut q = query_writer(s.writer());
+    let mut n: usize = 0;
     for p in pairs {
-        q.add(p.key, p.value) catch |e| {
+        if n > 0 {
+            s.push('&') catch |e| {
+                s.deinit();
+                return e;
+            };
+        }
+        escape_out(str_out(&mut s), p.key, Component.COMPONENT, true) catch |e| {
             s.deinit();
             return e;
         };
+        s.push('=') catch |e| {
+            s.deinit();
+            return e;
+        };
+        escape_out(str_out(&mut s), p.value, Component.COMPONENT, true) catch |e| {
+            s.deinit();
+            return e;
+        };
+        n += 1;
     }
     return s.take();
 }
@@ -615,6 +672,11 @@ pub fn parse_ipv6(s: []u8, out: *mut [8]u16) bool {
 /// without leading zeros, the longest run of two or more zero groups (the
 /// first, of equal runs) as "::".
 pub fn format_ipv6_to(w: io.Writer, g: [8]u16) !void {
+    let mut wr = w;
+    format_ipv6_out(io_out(&mut wr), g)!;
+}
+
+fn format_ipv6_out[error E](w: Out.[E], g: [8]u16) E!void {
     let mut best: usize = 8;
     let mut best_len: usize = 1;
     let mut i: usize = 0;
@@ -843,17 +905,11 @@ pub fn remove_dot_segments(path: []mut u8) []mut u8 {
     return b[..n];
 }
 
-/// Writes the target URI of reference `r` against the absolute URI `base`
-/// (RFC 3986 §5.2.2, strict: a scheme in r is always taken). NotAbsolute
-/// if base has no scheme.
-pub fn resolve_to(w: io.Writer, base: Url, r: Url) !void {
+fn resolve_target(base: Url, r: Url, buf: []mut u8) { NotAbsolute }!Url {
     if base.scheme.len == 0 {
         return error.NotAbsolute;
     }
     let mut t = r;
-    // the merged path, then with dot segments removed
-    let buf = mem.alloc.[u8](@add_checked(base.path.len, r.path.len + 1) catch return error.OutOfMemory)!;
-    defer mem.free(buf);
     let mut n: usize = 0;
     if r.scheme.len == 0 {
         t.scheme = base.scheme;
@@ -891,30 +947,43 @@ pub fn resolve_to(w: io.Writer, base: Url, r: Url) !void {
                 n += r.path.len;
                 t.path = remove_dot_segments(buf[..n]);
             }
-            t.write_to(w)!;
-            return;
+            return t;
         }
     }
     @mem_copy(buf[..r.path.len], r.path);
     t.path = remove_dot_segments(buf[..r.path.len]);
+    return t;
+}
+
+/// Writes the target URI of reference `r` against the absolute URI `base`
+/// (RFC 3986 §5.2.2, strict: a scheme in r is always taken). NotAbsolute
+/// if base has no scheme.
+pub fn resolve_to(w: io.Writer, base: Url, r: Url) !void {
+    if base.scheme.len == 0 {
+        return error.NotAbsolute;
+    }
+    let buf = mem.alloc.[u8](@add_checked(base.path.len, r.path.len + 1) catch return error.OutOfMemory)!;
+    defer mem.free(buf);
+    let t = resolve_target(base, r, buf)!;
     t.write_to(w)!;
 }
 
 /// The target URI of reference `r` against `base`, in new memory (free
 /// it with mem.free).
-pub fn resolve(base: Url, r: Url) ![]mut u8 {
-    let mut s = strs.String.init();
-    resolve_to(s.writer(), base, r) catch |e| {
-        s.deinit();
-        return e;
-    };
-    return s.take();
+pub fn resolve(base: Url, r: Url) { NotAbsolute, OutOfMemory }![]mut u8 {
+    if base.scheme.len == 0 {
+        return error.NotAbsolute;
+    }
+    let buf = mem.alloc.[u8](@add_checked(base.path.len, r.path.len + 1) catch return error.OutOfMemory)!;
+    defer mem.free(buf);
+    let t = resolve_target(base, r, buf)!;
+    return t.to_string();
 }
 
 /// Parses `base` and `reference` and resolves the one against the other:
 /// join("http://a/b/c/d;p?q", "../g") is "http://a/b/g". In new memory
 /// (free it with mem.free).
-pub fn join(base: []u8, reference: []u8) ![]mut u8 {
+pub fn join(base: []u8, reference: []u8) { InvalidUrl, NotAbsolute, OutOfMemory }![]mut u8 {
     return resolve(parse(base)!, parse(reference)!);
 }
 
@@ -925,7 +994,7 @@ pub fn join(base: []u8, reference: []u8) ![]mut u8 {
 // Writes s with escapes of unreserved characters decoded, other escapes in
 // uppercase, and bytes `comp` does not allow (and stray '%'s) escaped; with
 // `lowercase`, letters in lowercase (for hosts).
-fn normalize_part(w: io.Writer, s: []u8, comp: Component, lowercase: bool) !void {
+fn normalize_part(sw: Out.[{ OutOfMemory }], s: []u8, comp: Component, lowercase: bool) { OutOfMemory }!void {
     let mut i: usize = 0;
     while i < s.len {
         let c = s[i];
@@ -937,41 +1006,31 @@ fn normalize_part(w: io.Writer, s: []u8, comp: Component, lowercase: bool) !void
                     if lowercase {
                         d = lower(v);
                     }
-                    w.print_byte(d)!;
+                    sw.print_byte(d)!;
                 } else {
                     let esc: [3]u8 = ['%', HEX[@as(usize, v >> 4)], HEX[@as(usize, v & 15)]];
-                    w.write_all(esc[..])!;
+                    sw.write_all(esc[..])!;
                 }
                 i += 3;
                 continue;
             }
-            w.write_all("%25")!;
+            sw.write_all("%25")!;
         } else if allowed(c, comp) {
             if lowercase {
-                w.print_byte(lower(c))!;
+                sw.print_byte(lower(c))!;
             } else {
-                w.print_byte(c)!;
+                sw.print_byte(c)!;
             }
         } else {
             let esc: [3]u8 = ['%', HEX[@as(usize, c >> 4)], HEX[@as(usize, c & 15)]];
-            w.write_all(esc[..])!;
+            sw.write_all(esc[..])!;
         }
         i += 1;
     }
 }
 
-/// Writes u normalized: the scheme and host in lowercase, percent-encoding
-/// normalized (escapes of unreserved characters decoded, the others in
-/// uppercase, characters a component does not allow encoded), dot segments
-/// removed from the path (unless it is a relative path: "../a" stays as it
-/// is), an IPv6 host in RFC 5952 form,
-/// an empty or default port dropped, and an empty path with an authority
-/// of a special scheme given as "/". Equivalent URLs (RFC 3986 §6.2.2)
-/// normalize to the same text.
-pub fn normalize_to(w: io.Writer, u: Url) !void {
-    let mut s = strs.String.init();
-    defer s.deinit();
-    let sw = s.writer();
+fn normalize_into(s: *mut strs.String, u: Url) { OutOfMemory }!void {
+    let sw = str_out(s);
     for c in u.scheme {
         sw.print_byte(lower(c))!;
     }
@@ -987,7 +1046,7 @@ pub fn normalize_to(w: io.Writer, u: Url) !void {
         let mut g: [8]u16 = [0; 8];
         if u.is_ipv6() and parse_ipv6(u.hostname, &mut g) {
             sw.write_all("[")!;
-            format_ipv6_to(sw, g)!;
+            format_ipv6_out(sw, g)!;
             sw.write_all("]")!;
         } else if u.ip_literal {
             sw.write_all("[")!;
@@ -1006,12 +1065,26 @@ pub fn normalize_to(w: io.Writer, u: Url) !void {
             sw.print_u64(@as(u64, port))!;
         }
     }
-    normalize_rest(sw, &mut s, u)!;
+    normalize_rest(sw, s, u)!;
+}
+
+/// Writes u normalized: the scheme and host in lowercase, percent-encoding
+/// normalized (escapes of unreserved characters decoded, the others in
+/// uppercase, characters a component does not allow encoded), dot segments
+/// removed from the path (unless it is a relative path: "../a" stays as it
+/// is), an IPv6 host in RFC 5952 form,
+/// an empty or default port dropped, and an empty path with an authority
+/// of a special scheme given as "/". Equivalent URLs (RFC 3986 §6.2.2)
+/// normalize to the same text.
+pub fn normalize_to(w: io.Writer, u: Url) !void {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    normalize_into(&mut s, u)!;
     w.write_all(s.bytes())!;
 }
 
 // The path, query and fragment of normalize_to, onto s.
-fn normalize_rest(sw: io.Writer, s: *mut strs.String, u: Url) !void {
+fn normalize_rest(sw: Out.[{ OutOfMemory }], s: *mut strs.String, u: Url) { OutOfMemory }!void {
     let start = s.bytes().len;
     normalize_part(sw, u.path, Component.PATH, false)!;
     // (dot segments mean something only in a relative-path reference)
@@ -1042,10 +1115,10 @@ fn normalize_rest(sw: io.Writer, s: *mut strs.String, u: Url) !void {
 
 /// Parses s and returns it normalized (see normalize_to) in new memory
 /// (free it with mem.free).
-pub fn normalize(s: []u8) ![]mut u8 {
+pub fn normalize(s: []u8) { InvalidUrl, OutOfMemory }![]mut u8 {
     let u = parse(s)!;
     let mut out = strs.String.init();
-    normalize_to(out.writer(), u) catch |e| {
+    normalize_into(&mut out, u) catch |e| {
         out.deinit();
         return e;
     };

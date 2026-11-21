@@ -560,20 +560,25 @@ fn key_less(b: []u8, x: Entry, y: Entry) bool {
 
 /// The CBOR encoding of a value (preferred serialization); the caller frees
 /// it.
-pub fn encode(v: Value) ![]mut u8 {
+pub fn encode(v: Value) { Corrupt, OutOfMemory }![]mut u8 {
     return encode_with(v, false);
 }
 
 /// The deterministic encoding (map keys sorted).
-pub fn encode_canonical(v: Value) ![]mut u8 {
+pub fn encode_canonical(v: Value) { Corrupt, OutOfMemory }![]mut u8 {
     return encode_with(v, true);
 }
 
-fn encode_with(v: Value, canonical: bool) ![]mut u8 {
+fn encode_with(v: Value, canonical: bool) infer![]mut u8 {
     let mut s = strs.String.init();
-    encode_to_with(s.writer(), v, canonical) catch |e| {
+    let mut w = Writer.init(s.writer());
+    w.canonical = canonical;
+    w.value(v) catch |e| {
         s.deinit();
-        return e;
+        match e {
+            error.Corrupt => { return error.Corrupt; }
+            else          => { return error.OutOfMemory; }
+        }
     };
     return s.take();
 }
@@ -599,14 +604,14 @@ fn encode_to_with(w: io.Writer, v: Value, canonical: bool) !void {
 }
 
 /// Converts JSON text to CBOR; the caller frees the result.
-pub fn from_json_text(text: []u8) ![]mut u8 {
+pub fn from_json_text(text: []u8) CborError![]mut u8 {
     let mut doc = json.parse(text)!;
     defer doc.deinit();
     let mut s = strs.String.init();
     let mut w = Writer.init(s.writer());
-    w.json(doc.root) catch |e| {
+    w.json(doc.root) catch {
         s.deinit();
-        return e;
+        return error.OutOfMemory;
     };
     return s.take();
 }
@@ -678,7 +683,7 @@ struct Decoder {
     i: usize,
     arena: *mut arena.Arena,
 
-    fn byte(self: *mut Decoder) CborError!u8 {
+    fn byte(self: *mut Decoder) infer!u8 {
         if self.i >= self.s.len {
             return error.Truncated;
         }
@@ -687,7 +692,7 @@ struct Decoder {
         return b;
     }
 
-    fn take(self: *mut Decoder, n: u64) CborError![]u8 {
+    fn take(self: *mut Decoder, n: u64) infer![]u8 {
         if n > @as(u64, self.s.len - self.i) {
             return error.Truncated;
         }
@@ -698,7 +703,7 @@ struct Decoder {
     }
 
     // The argument of a head with additional information ai (< 28).
-    fn arg(self: *mut Decoder, ai: u8) CborError!u64 {
+    fn arg(self: *mut Decoder, ai: u8) infer!u64 {
         if ai < 24 {
             return @as(u64, ai);
         }
@@ -719,7 +724,7 @@ struct Decoder {
     }
 
     // A string of major type 2 or 3; indefinite ones are joined.
-    fn string(self: *mut Decoder, major: u8, ai: u8) CborError![]u8 {
+    fn string(self: *mut Decoder, major: u8, ai: u8) infer![]u8 {
         if ai != 31 {
             let n = self.arg(ai)!;
             let b = self.take(n)!;
@@ -749,7 +754,7 @@ struct Decoder {
 
     // Reads one head: a value into v, or a container's header (its length
     // into n, or NONE for indefinite).
-    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) CborError!Head {
+    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) infer!Head {
         let b = self.byte()!;
         let major = b >> 5;
         let ai = b & 31;
@@ -820,7 +825,7 @@ struct Decoder {
     }
 
     // One data item, with its nested items, read with an explicit stack.
-    fn item_tree(self: *mut Decoder) CborError!Value {
+    fn item_tree(self: *mut Decoder) infer!Value {
         let mut frames = vec.Vec.[Frame].init();
         defer frames.deinit();
         let mut vals = vec.Vec.[Value].init();
@@ -899,7 +904,7 @@ struct Decoder {
     }
 
     // Builds a finished container from its items (removing them).
-    fn close(self: *mut Decoder, f: Frame, vals: *mut vec.Vec.[Value], pairs: *mut vec.Vec.[Pair]) CborError!Value {
+    fn close(self: *mut Decoder, f: Frame, vals: *mut vec.Vec.[Value], pairs: *mut vec.Vec.[Pair]) infer!Value {
         let items = vals.items()[f.start..];
         let mut v = Value.Null;
         if f.kind == FrameKind.MAP {
@@ -1033,11 +1038,11 @@ fn diag_float(out: io.Writer, f: f64) !void {
 }
 
 /// The diagnostic notation of a value; the caller frees it.
-pub fn diagnostic_alloc(v: Value) ![]mut u8 {
+pub fn diagnostic_alloc(v: Value) { OutOfMemory }![]mut u8 {
     let mut s = strs.String.init();
-    diagnostic(s.writer(), v) catch |e| {
+    diagnostic(s.writer(), v) catch {
         s.deinit();
-        return e;
+        return error.OutOfMemory;
     };
     return s.take();
 }
@@ -1293,4 +1298,37 @@ fn write_fails(r: !void) bool {
         return e == error.NoSpaceLeft;
     };
     return false;
+}
+
+fn encode_corrupt_check(v: Value) bool {
+    let b = encode(v) catch |e| {
+        match e {
+            error.Corrupt     => { return true; }
+            error.OutOfMemory => { return false; }
+        }
+    };
+    mem.free(b);
+    return false;
+}
+
+fn json_text_err(s: []u8) CborError!void {
+    let b = from_json_text(s)!;
+    mem.free(b);
+}
+
+test "narrowed error sets" {
+    @expect(encode_corrupt_check(Value.Simple(24)));
+
+    let mut got_json_err = false;
+    json_text_err("{") catch |e| {
+        if e == error.SyntaxError {
+            got_json_err = true;
+        }
+    };
+    @expect(got_json_err);
+
+    let widened: CborError![]mut u8 = diagnostic_alloc(Value.Null);
+    let d = widened!;
+    defer mem.free(d);
+    @expect_eq(d, "null");
 }

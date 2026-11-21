@@ -358,23 +358,51 @@ pub fn page_count(data: []u8) TiffError!usize {
     return k;
 }
 
+fn to_tiff_error(e: error) TiffError {
+    match e {
+        error.TooLarge         => { return error.TooLarge; }
+        error.Unsupported      => { return error.Unsupported; }
+        error.OutOfMemory      => { return error.OutOfMemory; }
+        error.NotFound         => { return error.NotFound; }
+        error.IoError          => { return error.IoError; }
+        error.ChecksumMismatch => { return error.ChecksumMismatch; }
+        error.Done             => { return error.Done; }
+        error.Truncated        => { return error.Truncated; }
+        error.InvalidUtf8      => { return error.InvalidUtf8; }
+        error.EndOfStream      => { return error.EndOfStream; }
+        error.NoSpaceLeft      => { return error.NoSpaceLeft; }
+        error.PermissionDenied => { return error.PermissionDenied; }
+        error.IsDirectory      => { return error.IsDirectory; }
+        else                   => { return error.Corrupt; }
+    }
+}
+
+fn to_image_error(e: error) image.ImageError {
+    match e {
+        error.OutOfMemory => { return error.OutOfMemory; }
+        error.Unsupported => { return error.Unsupported; }
+        error.TooLarge    => { return error.TooLarge; }
+        else              => { return error.Corrupt; }
+    }
+}
+
 /// The first page, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
-pub fn decode(data: []u8) !image.Image {
+pub fn decode(data: []u8) TiffError!image.Image {
     return decode_page(data, 0);
 }
 
 /// The first page, of at most opts.max_pixels (else TooLarge).
-pub fn decode_with(data: []u8, opts: image.DecodeOptions) !image.Image {
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) TiffError!image.Image {
     return decode_page_with(data, 0, opts);
 }
 
 /// Page n (from 0), of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
-pub fn decode_page(data: []u8, n: usize) !image.Image {
+pub fn decode_page(data: []u8, n: usize) TiffError!image.Image {
     return decode_page_with(data, n, image.DecodeOptions.default());
 }
 
 /// Page n (from 0), of at most opts.max_pixels (else TooLarge).
-pub fn decode_page_with(data: []u8, n: usize, opts: image.DecodeOptions) !image.Image {
+pub fn decode_page_with(data: []u8, n: usize, opts: image.DecodeOptions) TiffError!image.Image {
     let mut f = open(data)!;
     f.opts = opts;
     let p = page_at(&f, n)!;
@@ -477,7 +505,7 @@ fn read_samples(f: *File, p: *Page) TiffError!Samples {
     return Samples.{ spp: spp, bps: bps, float: float, signed: signed, photo: photo, colors: colors, alpha: alpha };
 }
 
-fn decode_ifd(f: *File, p: *Page) !image.Image {
+fn decode_ifd(f: *File, p: *Page) TiffError!image.Image {
     if (p.width == 0) or (p.height == 0) or (p.width > 0x10000000) or (p.height > 0x10000000) {
         return error.Corrupt;
     }
@@ -568,7 +596,7 @@ struct Chunks {
 
 // The chunks' samples into raw (zeroed, px * spp samples): u8 up to 8 bits,
 // u16 up to 16 (and deeper integers) or f32.
-fn read_chunks(f: *File, p: *Page, sm: *Samples, lay: *Chunks, raw: []mut u8, w: usize, h: usize) !void {
+fn read_chunks(f: *File, p: *Page, sm: *Samples, lay: *Chunks, raw: []mut u8, w: usize, h: usize) TiffError!void {
     let spp = sm.spp;
     let bps = sm.bps;
     let comp = p.compression;
@@ -802,7 +830,7 @@ fn store_row(be: bool, row: []u8, raw: []mut u8, start: usize, step: usize, n: u
 // to out, returning the length k decoded: the rest of out is to be zero
 // filled where src runs short (out[k..] is left as it was).
 fn decompress_chunk(f: *File, p: *Page, fx: *Fax, src: []u8, out: []mut u8, cw: usize, rows: usize, rowbytes: usize,
-                    spc: usize) !usize {
+                    spc: usize) TiffError!usize {
     let comp = p.compression;
     if comp == 1 {
         let k = @min(src.len, out.len);
@@ -811,11 +839,11 @@ fn decompress_chunk(f: *File, p: *Page, fx: *Fax, src: []u8, out: []mut u8, cw: 
     } else if comp == 32773 {
         return unpackbits(src, out);
     } else if comp == 5 {
-        return lzw_decode(src, out)!;
+        return lzw_decode(src, out);
     } else if (comp == 8) or (comp == 32946) {
         let z = deflate.decompress(src, deflate.Format.ZLIB, out.len + 65536) catch |e| {
             if e == error.OutOfMemory {
-                return e;
+                return error.OutOfMemory;
             }
             return error.Corrupt;
         };
@@ -1880,7 +1908,7 @@ nocopy struct Fax {
 // -----------------------------------------------------------------------------
 
 /// Writes one image (free the result with mem.free).
-pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
+pub fn encode(img: *image.Image, opts: Options) image.ImageError![]mut u8 {
     let one: [1]*image.Image = [img];
     return encode_pages(one[..], opts);
 }
@@ -1910,11 +1938,11 @@ fn field(o: *mut strs.String, tag: u64, typ: u64, count: u64, value: u64) TiffEr
 }
 
 /// Writes images as the pages of one file (free the result with mem.free).
-pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
+pub fn encode_pages(imgs: []*image.Image, opts: Options) image.ImageError![]mut u8 {
     let mut s = strs.String.init();
     write_pages(s.writer(), imgs, opts, true) catch |e| {
         s.deinit();
-        return e;
+        return to_image_error(e);
     };
     return s.take();
 }
@@ -1973,7 +2001,7 @@ fn layout_of(img: *image.Image, opts: Options) PageLayout {
 
 // Strip si of a page, compressed into packed (strip is scratch space).
 fn pack_strip(img: *image.Image, lay: *PageLayout, comp: Compression, si: usize, strip: *mut strs.String,
-              packed: *mut strs.String) !void {
+              packed: *mut strs.String) TiffError!void {
     let ch = img.channels;
     let rowbytes = lay.rowbytes;
     let y0 = si * lay.rps;
@@ -1998,8 +2026,12 @@ fn pack_strip(img: *image.Image, lay: *PageLayout, comp: Compression, si: usize,
     } else {
         let z = deflate.Compressor.init(packed.writer(), deflate.Format.ZLIB, deflate.DEFAULT_LEVEL)!;
         defer z.deinit();
-        z.write_all(sb)!;
-        z.finish()!;
+        z.write_all(sb) catch |e| {
+            return to_tiff_error(e);
+        };
+        z.finish() catch |e| {
+            return to_tiff_error(e);
+        };
     }
 }
 
@@ -2155,7 +2187,7 @@ fn write_pages(w: io.Writer, imgs: []*image.Image, opts: Options, keep: bool) !v
 // A page's arrays too long to go inline in its directory (bits per sample
 // and sample formats of more than two channels, the offsets and sizes of
 // more than one strip), at an even offset (o starts at offset at).
-fn write_arrays(o: *mut strs.String, at: u64, ch: usize, lay: *PageLayout, offs: []u64, sizes: []u64) !void {
+fn write_arrays(o: *mut strs.String, at: u64, ch: usize, lay: *PageLayout, offs: []u64, sizes: []u64) TiffError!void {
     if ((at + @as(u64, o.len())) & 1) != 0 {
         o.push(0)!;
     }

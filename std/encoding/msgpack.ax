@@ -495,11 +495,12 @@ pub struct Writer {
 }
 
 /// The MessagePack encoding of a value; the caller frees it.
-pub fn encode(v: Value) ![]mut u8 {
+pub fn encode(v: Value) { OutOfMemory }![]mut u8 {
     let mut s = strs.String.init();
-    encode_to(s.writer(), v) catch |e| {
+    let mut w = Writer.init(s.writer());
+    w.value(v) catch {
         s.deinit();
-        return e;
+        return error.OutOfMemory;
     };
     return s.take();
 }
@@ -514,14 +515,14 @@ pub fn encode_to(w: io.Writer, v: Value) !void {
 }
 
 /// Converts JSON text to MessagePack; the caller frees the result.
-pub fn from_json_text(text: []u8) ![]mut u8 {
+pub fn from_json_text(text: []u8) MsgpackError![]mut u8 {
     let mut doc = json.parse(text)!;
     defer doc.deinit();
     let mut s = strs.String.init();
     let mut w = Writer.init(s.writer());
-    w.json(doc.root) catch |e| {
+    w.json(doc.root) catch {
         s.deinit();
-        return e;
+        return error.OutOfMemory;
     };
     return s.take();
 }
@@ -583,7 +584,7 @@ struct Decoder {
     opts: Options,
     arena: *mut arena.Arena,
 
-    fn take(self: *mut Decoder, n: usize) MsgpackError![]u8 {
+    fn take(self: *mut Decoder, n: usize) infer![]u8 {
         if n > (self.s.len - self.i) {
             return error.Truncated;
         }
@@ -592,7 +593,7 @@ struct Decoder {
         return b;
     }
 
-    fn uint_n(self: *mut Decoder, n: usize) MsgpackError!u64 {
+    fn uint_n(self: *mut Decoder, n: usize) infer!u64 {
         let b = self.take(n)!;
         let mut v: u64 = 0;
         for c in b {
@@ -602,7 +603,7 @@ struct Decoder {
     }
 
     // A length of n bytes.
-    fn len_n(self: *mut Decoder, n: usize) MsgpackError!usize {
+    fn len_n(self: *mut Decoder, n: usize) infer!usize {
         let v = self.uint_n(n)!;
         if v > @as(u64, self.s.len) {
             return error.Truncated;
@@ -610,7 +611,7 @@ struct Decoder {
         return @truncate(usize, v);
     }
 
-    fn string(self: *mut Decoder, n: usize) MsgpackError!Value {
+    fn string(self: *mut Decoder, n: usize) infer!Value {
         let b = self.take(n)!;
         if self.opts.check_utf8 and not strs.valid_utf8(b) {
             return error.Corrupt;
@@ -618,14 +619,14 @@ struct Decoder {
         return Value.Str(b);
     }
 
-    fn ext(self: *mut Decoder, n: usize) MsgpackError!Value {
+    fn ext(self: *mut Decoder, n: usize) infer!Value {
         let t = self.take(1)!;
         let d = self.take(n)!;
         return Value.Ext(Ext.{ kind: @bit_cast(i8, t[0]), data: d });
     }
 
     // One value; arrays and maps are read with an explicit stack.
-    fn value(self: *mut Decoder, depth0: u32) MsgpackError!Value {
+    fn value(self: *mut Decoder, depth0: u32) infer!Value {
         let mut frames = vec.Vec.[Frame].init();
         defer frames.deinit();
         let mut vals = vec.Vec.[Value].init();  // the elements of open arrays and maps
@@ -685,7 +686,7 @@ struct Decoder {
 
     // Reads one item: a scalar into v, or the header of an array or map
     // (its length into n).
-    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) MsgpackError!ItemKind {
+    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) infer!ItemKind {
         let b = self.take(1)![0];
         if b < 0x80 {
             v.* = Value.Int(@as(i64, b));
@@ -730,7 +731,7 @@ struct Decoder {
         return ItemKind.SCALAR;
     }
 
-    fn scalar(self: *mut Decoder, b: u8) MsgpackError!Value {
+    fn scalar(self: *mut Decoder, b: u8) infer!Value {
         match b {
             0xc0 => { return Value.Nil; }
             0xc2 => { return Value.Bool(false); }
@@ -1118,4 +1119,22 @@ test "hostile input" {
     let mut d = decode_prefix("\x01\x02", Options.default(), &mut used)!;
     d.deinit();
     @expect_eq(used, 1);
+
+    // narrowed error sets on encode and from_json_text
+    let enc_res: MsgpackError![]mut u8 = encode(Value.Nil);
+    let eb = enc_res!;
+    defer mem.free(eb);
+    @expect_eq(eb, "\xc0");
+    let mut got_json_err = false;
+    json_text_err("{") catch |e| {
+        if e == error.SyntaxError {
+            got_json_err = true;
+        }
+    };
+    @expect(got_json_err);
+}
+
+fn json_text_err(s: []u8) MsgpackError!void {
+    let b = from_json_text(s)!;
+    mem.free(b);
 }

@@ -45,6 +45,7 @@
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
+import "../diag.ax" as diag;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 import "internal/html/tags.ax" as tags;
@@ -144,7 +145,7 @@ fn lower(c: i32) u8 {
 /// The input stream: s with CR and CRLF made LF and invalid UTF-8 replaced
 /// by U+FFFD. Returns s itself when it needs no change, else a copy (also
 /// stored in owned) that the caller frees.
-fn preprocess(s: []u8, owned: *mut []mut u8) HtmlError![]u8 {
+fn preprocess(s: []u8, owned: *mut []mut u8) infer![]u8 {
     let mut clean = true;
     let mut i: usize = 0;
     while i < s.len {
@@ -177,7 +178,7 @@ fn preprocess(s: []u8, owned: *mut []mut u8) HtmlError![]u8 {
     return b;
 }
 
-fn normalize(s: []u8, i0: usize, out: *mut strs.String) HtmlError!void {
+fn normalize(s: []u8, i0: usize, out: *mut strs.String) infer!void {
     let mut i = i0;
     out.reserve(s.len + 16)!;
     out.push_str(s[..i])!;
@@ -254,7 +255,7 @@ fn new_parser(doc: *mut Document, tz: *mut Tokenizer, opts: Options) Parser {
                     abuf: vec.Vec.[Attr].init() };
 }
 
-fn run_parser(p: *mut Parser) HtmlError!void {
+fn run_parser(p: *mut Parser) infer!void {
     loop {
         let a = p.adjusted_current();
         p.tz.cdata_ok = (a != NONE) and (p.nd(a).ns != Namespace.HTML);
@@ -283,6 +284,23 @@ pub fn parse(text: []u8) HtmlError!Document {
 pub fn parse_with(text: []u8, opts: Options) HtmlError!Document {
     let mut doc = Document.init();
     build(&mut doc, text, opts, "", Namespace.HTML) catch |e| {
+        doc.deinit();
+        return e;
+    };
+    return doc;
+}
+
+/// Parses an HTML document (UTF-8), clearing `info` on success and filling
+/// `info` with byte offset, 1-based line and column, and detail on failure.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) HtmlError!Document {
+    return parse_with_diag(text, Options.default(), info);
+}
+
+/// Like parse_diag, with explicit Options.
+pub fn parse_with_diag(text: []u8, opts: Options, info: *mut diag.ErrorInfo) HtmlError!Document {
+    info.* = diag.ErrorInfo.init();
+    let mut doc = Document.init();
+    build_diag(&mut doc, text, opts, "", Namespace.HTML, info) catch |e| {
         doc.deinit();
         return e;
     };
@@ -441,15 +459,67 @@ fn charset_in(tag: []u8) []u8 {
     return "";
 }
 
-fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Namespace) HtmlError!void {
-    _ = doc.new_node(Kind.DOCUMENT)!;
+fn diag_detail_for(e: HtmlError) []u8 {
+    match e {
+        error.OutOfMemory => { return "out of memory"; }
+        error.InvalidUtf8 => { return "invalid UTF-8"; }
+        error.SyntaxError => { return "syntax error"; }
+        error.NotFound    => { return "not found"; }
+        error.Empty       => { return "empty input"; }
+        error.Done        => { return "done"; }
+        error.IoError     => { return "I/O error"; }
+    }
+}
+
+fn record_diag_at(text: []u8, pos: usize, e: HtmlError, info: *mut diag.ErrorInfo) void {
+    let off = @min(pos, text.len);
+    let mut line: u32 = 1;
+    let mut col: u32 = 1;
+    for i in @as(usize, 0)..off {
+        if text[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    info.* = diag.ErrorInfo.at(off, line, col, diag_detail_for(e));
+}
+
+fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Namespace) infer!void {
+    let mut info = diag.ErrorInfo.init();
+    build_diag(doc, text0, opts, context, cns, &mut info)!;
+}
+
+fn build_diag(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Namespace,
+              info: *mut diag.ErrorInfo) infer!void {
+    _ = doc.new_node(Kind.DOCUMENT) catch |e| {
+        record_diag_at(text0, 0, e, info);
+        return e;
+    };
     let mut text = text0;
+    let mut bom: usize = 0;
     if (text.len >= 3) and (text[0] == 0xef) and (text[1] == 0xbb) and (text[2] == 0xbf) {
         text = text[3..];  // a byte-order mark
+        bom = 3;
     }
-    let mut tz = Tokenizer.init(text)!;
+    let mut tz = Tokenizer.init(text) catch |e| {
+        record_diag_at(text0, bom, e, info);
+        return e;
+    };
     defer tz.deinit();
-    let mut p = new_parser(doc, &mut tz, opts);
+    build_with_tokenizer(doc, &mut tz, opts, context, cns) catch |e| {
+        record_diag_at(tz.s, tz.i, e, info);
+        if tz.owned.len == 0 {
+            info.offset += bom;
+        }
+        return e;
+    };
+}
+
+fn build_with_tokenizer(doc: *mut Document, tz: *mut Tokenizer, opts: Options, context: []u8,
+                        cns: Namespace) infer!void {
+    let mut p = new_parser(doc, tz, opts);
     defer p.deinit();
     let mut root = NONE;
     if context.len > 0 {
@@ -512,7 +582,7 @@ fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Nam
 
 // A <select>'s <selectedcontent> shows a copy of the selected <option>'s
 // content (the last option marked selected, else the first).
-fn fill_selectedcontent(doc: *mut Document) HtmlError!void {
+fn fill_selectedcontent(doc: *mut Document) infer!void {
     let n = @truncate(u32, doc.nodes.len());
     for sel in @as(u32, 0)..n {
         let s = doc.node(sel);

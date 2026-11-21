@@ -43,6 +43,7 @@
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
+import "../diag.ax" as diag;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 import "../sync.ax" as sync;
@@ -249,16 +250,16 @@ nocopy struct Parser {
         return error.SyntaxError;
     }
 
-    fn node(self: *mut Parser, n: Node) RegexError!u32 {
+    fn node(self: *mut Parser, n: Node) infer!u32 {
         self.nodes.push(n)!;
         return @int_cast(u32, self.nodes.len() - 1);
     }
 
-    fn leaf(self: *mut Parser, kind: NodeKind, a: u32) RegexError!u32 {
+    fn leaf(self: *mut Parser, kind: NodeKind, a: u32) infer!u32 {
         return self.node(Node.{ kind: kind, greedy: false, a: a, b: 0, min: 0, max: 0, first: 0, count: 0 });
     }
 
-    fn list(self: *mut Parser, kind: NodeKind, items: []u32) RegexError!u32 {
+    fn list(self: *mut Parser, kind: NodeKind, items: []u32) infer!u32 {
         let first = @int_cast(u32, self.kids.len());
         self.kids.extend(items)!;
         return self.node(Node.{ kind: kind, greedy: false, a: 0, b: 0, min: 0, max: 0, first: first,
@@ -266,7 +267,7 @@ nocopy struct Parser {
     }
 
     /// Stores a finished set as a class and returns its index.
-    fn class_of(self: *mut Parser, set: *mut Set) RegexError!u32 {
+    fn class_of(self: *mut Parser, set: *mut Set) infer!u32 {
         set.normalize();
         let first = @int_cast(u32, self.ranges.len());
         self.ranges.extend(set.rs.items())!;
@@ -327,7 +328,7 @@ nocopy struct Parser {
         return self.list(NodeKind.CAT, items.items());
     }
 
-    fn number(self: *mut Parser) RegexError!u32 {
+    fn number(self: *mut Parser) infer!u32 {
         if not strs.is_digit(self.peek()) {
             return self.fail("expected a number");
         }
@@ -500,7 +501,7 @@ nocopy struct Parser {
     }
 
     /// The code point of a character escape (after the backslash).
-    fn escaped_rune(self: *mut Parser) RegexError!u32 {
+    fn escaped_rune(self: *mut Parser) infer!u32 {
         let c = self.peek();
         self.i += 1;
         match c {
@@ -710,7 +711,7 @@ nocopy struct Parser {
         }
     }
 
-    fn class_rune(self: *mut Parser) RegexError!u32 {
+    fn class_rune(self: *mut Parser) infer!u32 {
         if self.peek() == '\\' {
             self.i += 1;
             if not self.more() {
@@ -722,7 +723,7 @@ nocopy struct Parser {
     }
 
     /// [:name:] inside a class.
-    fn posix(self: *mut Parser, set: *mut Set) RegexError!void {
+    fn posix(self: *mut Parser, set: *mut Set) infer!void {
         let start = self.i + 2;
         let end = strs.index_of_from(self.s, ":]", start) ?? return self.fail("bad POSIX class");
         let raw = self.s[start..end];
@@ -814,7 +815,7 @@ nocopy struct Compiler {
     work: usize,
     depth: u32,
 
-    fn emit(self: *mut Compiler, op: Op, a: u32, b: u32) RegexError!u32 {
+    fn emit(self: *mut Compiler, op: Op, a: u32, b: u32) infer!u32 {
         if self.prog.len() >= MAX_PROGRAM {
             return error.TooBig;
         }
@@ -898,7 +899,7 @@ nocopy struct Compiler {
     }
 
     /// A split whose targets set_split fills in.
-    fn split(self: *mut Compiler) RegexError!u32 {
+    fn split(self: *mut Compiler) infer!u32 {
         return self.emit(Op.SPLIT, 0, 0);
     }
 
@@ -1329,7 +1330,34 @@ pub fn compile_with(pattern: []u8, info: *mut ErrorInfo) RegexError!Regex {
     return re;
 }
 
-fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) RegexError!Regex {
+/// Like compile, and on failure fills `info` with byte offset, 1-based line
+/// and column, and detail.
+pub fn compile_diag(pattern: []u8, info: *mut diag.ErrorInfo) RegexError!Regex {
+    info.* = diag.ErrorInfo.init();
+    let mut local = ErrorInfo.{ offset: 0, message: "" };
+    let re = compile_with(pattern, &mut local) catch |e| {
+        let pos = @min(local.offset, pattern.len);
+        let mut line: u32 = 1;
+        let mut col: u32 = 1;
+        for i in @as(usize, 0)..pos {
+            if pattern[i] == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        let mut detail = local.message;
+        if (detail.len == 0) and (e == error.OutOfMemory) {
+            detail = "out of memory";
+        }
+        info.* = diag.ErrorInfo.at(pos, line, col, detail);
+        return e;
+    };
+    return re;
+}
+
+fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) infer!Regex {
     let mut flags = Flags.{ fold: false, multiline: false, dotall: false, ungreedy: false };
     let root = p.alternation(&mut flags)!;
     if p.more() {
@@ -2369,4 +2397,42 @@ test "groups and templates cost what they should" {
     let out = a.replace_all("a", pat.bytes())!;
     defer mem.free(out);
     @expect_eq(out, pat.bytes());
+}
+
+fn compile_diag_err(pattern: []u8, info: *mut diag.ErrorInfo) ?RegexError {
+    let mut re = compile_diag(pattern, info) catch |e| {
+        return .some(e);
+    };
+    re.deinit();
+    return .none;
+}
+
+test "compile_diag" {
+    let mut info = diag.ErrorInfo.at(99, 9, 9, "stale");
+    let mut ok = compile_diag("a+\\d+", &mut info)!;
+    defer ok.deinit();
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
+
+    let e1 = compile_diag_err("ab(cd", &mut info) ?? @trap();
+    @expect_eq(e1, error.SyntaxError);
+    @expect_eq(info.offset, 2);
+    @expect_eq(info.line, 1);
+    @expect_eq(info.col, 3);
+    @expect_eq(info.detail, "missing )");
+
+    let e2 = compile_diag_err("a+\n[z-a]", &mut info) ?? @trap();
+    @expect_eq(e2, error.SyntaxError);
+    @expect_eq(info.offset, 7);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 5);
+    @expect_eq(info.detail, "bad class range");
+
+    let e3 = compile_diag_err("(?:){1000}{1000}{1000}{1000}", &mut info) ?? @trap();
+    @expect_eq(e3, error.TooBig);
+    @expect_eq(info.line, 1);
+    @expect(info.col >= 1);
+    @expect_eq(info.detail, "pattern too big");
 }
