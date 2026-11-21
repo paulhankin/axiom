@@ -153,7 +153,12 @@
     X(VOLATILE_LOAD, "volatile_load", "e") \
     X(VOLATILE_STORE, "volatile_store", "ee") \
     X(VOLATILE_ZERO, "volatile_zero", "e") \
-    X(BLACK_BOX, "black_box", "e")
+    X(BLACK_BOX, "black_box", "e") \
+    X(MUL_WIDE, "mul_wide", "ee") \
+    X(MUL_HIGH, "mul_high", "ee") \
+    X(ADD_CARRY, "add_carry", "eee") \
+    X(SUB_BORROW, "sub_borrow", "eee") \
+    X(DIV_WIDE, "div_wide", "eee")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

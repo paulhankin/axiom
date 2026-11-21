@@ -3309,6 +3309,11 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@rotl(x, k)`, `@rotr(x, k)` | `k` is taken modulo the width |
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
 | `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
+| `@mul_wide(a, b)` | `T, T → struct { lo: T, hi: T }` for any integer `T` (double-width product) |
+| `@mul_high(a, b)` | `T, T → T` for any integer `T` (high half of the double-width product) |
+| `@add_carry(a, b, cin)` | `T, T, u8 → struct { value: T, carry: u8 }` for unsigned `T` (`cin & 1` in, `0`/`1` out) |
+| `@sub_borrow(a, b, bin)` | `T, T, u8 → struct { value: T, borrow: u8 }` for unsigned `T` (`bin & 1` in, `0`/`1` out) |
+| `@div_wide(hi, lo, d)` | `T, T, T → struct { quo: T, rem: T }` for unsigned `T`; traps `T0003` if `d == 0` or `hi >= d` |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
 | `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it is `MIN` by default, traps under `--overflow=trap`. Lane-wise on vectors, where it always wraps |
 | `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |

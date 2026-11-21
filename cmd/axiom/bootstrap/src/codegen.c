@@ -2661,6 +2661,78 @@ static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
     return is_signed ? LLVMBuildSExt(B, v, to, "") : LLVMBuildZExt(B, v, to, "");
 }
 
+static int type_bits(Type *t) { return t->is_size ? g_target.ptr_bits : t->bits; }
+
+static LLVMValueRef make_pair_val(Type *rt, LLVMValueRef f0, LLVMValueRef f1) {
+    LLVMTypeRef st = lty(rt);
+    if (in_mem(rt)) {
+        LLVMValueRef tmp = temp_alloca(rt);
+        LLVMBuildStore(B, f0, LLVMBuildStructGEP2(B, st, tmp, 0, ""));
+        LLVMBuildStore(B, f1, LLVMBuildStructGEP2(B, st, tmp, 1, ""));
+        return tmp;
+    }
+    LLVMValueRef v = LLVMGetUndef(st);
+    v = LLVMBuildInsertValue(B, v, f0, 0, "");
+    return LLVMBuildInsertValue(B, v, f1, 1, "");
+}
+
+// Restoring 128-by-64 unsigned division for wasm (no __udivti3 in freestanding
+// wasm). Precondition: d != 0 && hi < d.
+static LLVMValueRef udiv128_fn(LLVMTypeRef *fty_out) {
+    LLVMTypeRef ps[4] = {T_i64, T_i64, T_i64, T_ptr};
+    LLVMTypeRef fty = LLVMFunctionType(T_i64, ps, 4, false);
+    *fty_out = fty;
+    LLVMValueRef fn = LLVMGetNamedFunction(mod, "__axiom_udiv128");
+    if (fn) return fn;
+    fn = LLVMAddFunction(mod, "__axiom_udiv128", fty);
+    LLVMSetLinkage(fn, O->unit == CG_WHOLE ? LLVMInternalLinkage : LLVMLinkOnceODRLinkage);
+    if (O->unit != CG_WHOLE) LLVMSetVisibility(fn, LLVMHiddenVisibility);
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, nw, 0));
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(B);
+    LLVMMetadataRef loc = dbg_suspend();
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(ctx, fn, "loop");
+    LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(ctx, fn, "exit");
+    LLVMPositionBuilderAtEnd(B, entry);
+    LLVMBuildBr(B, loop);
+    LLVMPositionBuilderAtEnd(B, loop);
+    LLVMValueRef i = LLVMBuildPhi(B, T_i32, "i");
+    LLVMValueRef r = LLVMBuildPhi(B, T_i64, "r");
+    LLVMValueRef lo = LLVMBuildPhi(B, T_i64, "lo");
+    LLVMValueRef q = LLVMBuildPhi(B, T_i64, "q");
+    LLVMValueRef zero64 = LLVMConstInt(T_i64, 0, false);
+    LLVMValueRef one64 = LLVMConstInt(T_i64, 1, false);
+    LLVMValueRef c63 = LLVMConstInt(T_i64, 63, false);
+    LLVMValueRef d = LLVMGetParam(fn, 2);
+    LLVMValueRef carry = LLVMBuildICmp(B, LLVMIntSLT, r, zero64, "");
+    LLVMValueRef lo_top = LLVMBuildLShr(B, lo, c63, "");
+    LLVMValueRef r_sh = LLVMBuildOr(B, LLVMBuildShl(B, r, one64, ""), lo_top, "");
+    LLVMValueRef lo_next = LLVMBuildShl(B, lo, one64, "");
+    LLVMValueRef ge = LLVMBuildOr(B, carry, LLVMBuildICmp(B, LLVMIntUGE, r_sh, d, ""), "");
+    LLVMValueRef r_sub = LLVMBuildSub(B, r_sh, d, "");
+    LLVMValueRef r_next = LLVMBuildSelect(B, ge, r_sub, r_sh, "");
+    LLVMValueRef q_next = LLVMBuildOr(B, LLVMBuildShl(B, q, one64, ""), LLVMBuildZExt(B, ge, T_i64, ""), "");
+    LLVMValueRef i_next = LLVMBuildAdd(B, i, LLVMConstInt(T_i32, 1, false), "");
+    LLVMValueRef done = LLVMBuildICmp(B, LLVMIntEQ, i_next, LLVMConstInt(T_i32, 64, false), "");
+    LLVMBuildCondBr(B, done, exit_bb, loop);
+    LLVMBasicBlockRef bbs[2] = {entry, loop};
+    LLVMValueRef iv[2] = {LLVMConstInt(T_i32, 0, false), i_next};
+    LLVMAddIncoming(i, iv, bbs, 2);
+    LLVMValueRef rv[2] = {LLVMGetParam(fn, 0), r_next};
+    LLVMAddIncoming(r, rv, bbs, 2);
+    LLVMValueRef lv[2] = {LLVMGetParam(fn, 1), lo_next};
+    LLVMAddIncoming(lo, lv, bbs, 2);
+    LLVMValueRef qv[2] = {zero64, q_next};
+    LLVMAddIncoming(q, qv, bbs, 2);
+    LLVMPositionBuilderAtEnd(B, exit_bb);
+    LLVMBuildStore(B, r_next, LLVMGetParam(fn, 3));
+    LLVMBuildRet(B, q_next);
+    LLVMPositionBuilderAtEnd(B, saved_bb);
+    dbg_resume(loc);
+    return fn;
+}
+
 static LLVMValueRef mem_grow(LLVMValueRef pages);
 static LLVMValueRef mem_size(void);
 static LLVMValueRef native_rt_fn(const char *name, LLVMTypeRef ret, LLVMTypeRef *ps, int n, LLVMTypeRef *fty);
@@ -3402,6 +3474,81 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef code = LLVMBuildSelect(B, ovf, errcode_value(error_code_of(intern_cstr("Overflow"))),
                                             LLVMConstInt(T_i16, 0, false), "");
         return errunion_value(rt, code, val);
+    }
+    case BI_MUL_WIDE:
+    case BI_MUL_HIGH: {
+        Type *t = ct(a[0].e->type);
+        int w = type_bits(t);
+        bool sg = t->is_signed;
+        LLVMValueRef av = gen(a[0].e), bv = gen(a[1].e);
+        LLVMTypeRef wty = LLVMIntTypeInContext(ctx, (unsigned)(w * 2));
+        LLVMTypeRef tty = lty(t);
+        LLVMValueRef aw = sg ? LLVMBuildSExt(B, av, wty, "") : LLVMBuildZExt(B, av, wty, "");
+        LLVMValueRef bw = sg ? LLVMBuildSExt(B, bv, wty, "") : LLVMBuildZExt(B, bv, wty, "");
+        LLVMValueRef p = LLVMBuildMul(B, aw, bw, "");
+        LLVMValueRef hi = LLVMBuildTrunc(B, LLVMBuildLShr(B, p, LLVMConstInt(wty, (unsigned long long)w, false), ""), tty, "");
+        if (e->index == BI_MUL_HIGH) return hi;
+        LLVMValueRef lo = LLVMBuildTrunc(B, p, tty, "");
+        return make_pair_val(rt, lo, hi);
+    }
+    case BI_ADD_CARRY: {
+        Type *t = ct(a[0].e->type);
+        LLVMTypeRef tty = lty(t);
+        LLVMValueRef av = gen(a[0].e), bv = gen(a[1].e), cin = gen(a[2].e);
+        LLVMValueRef cm = LLVMBuildAnd(B, cin, LLVMConstInt(T_i8, 1, false), "");
+        LLVMValueRef c_in = ext_int(cm, tty, false);
+        LLVMValueRef s1 = LLVMBuildAdd(B, av, bv, "");
+        LLVMValueRef c1 = LLVMBuildICmp(B, LLVMIntULT, s1, av, "");
+        LLVMValueRef s2 = LLVMBuildAdd(B, s1, c_in, "");
+        LLVMValueRef c2 = LLVMBuildICmp(B, LLVMIntULT, s2, s1, "");
+        LLVMValueRef carry = LLVMBuildZExt(B, LLVMBuildOr(B, c1, c2, ""), T_i8, "");
+        return make_pair_val(rt, s2, carry);
+    }
+    case BI_SUB_BORROW: {
+        Type *t = ct(a[0].e->type);
+        LLVMTypeRef tty = lty(t);
+        LLVMValueRef av = gen(a[0].e), bv = gen(a[1].e), binv = gen(a[2].e);
+        LLVMValueRef bm = LLVMBuildAnd(B, binv, LLVMConstInt(T_i8, 1, false), "");
+        LLVMValueRef b_in = ext_int(bm, tty, false);
+        LLVMValueRef d1 = LLVMBuildSub(B, av, bv, "");
+        LLVMValueRef br1 = LLVMBuildICmp(B, LLVMIntULT, av, bv, "");
+        LLVMValueRef d2 = LLVMBuildSub(B, d1, b_in, "");
+        LLVMValueRef br2 = LLVMBuildICmp(B, LLVMIntULT, d1, b_in, "");
+        LLVMValueRef borrow = LLVMBuildZExt(B, LLVMBuildOr(B, br1, br2, ""), T_i8, "");
+        return make_pair_val(rt, d2, borrow);
+    }
+    case BI_DIV_WIDE: {
+        Type *t = ct(a[0].e->type);
+        int w = type_bits(t);
+        LLVMTypeRef tty = lty(t);
+        LLVMValueRef hi = gen(a[0].e), lo = gen(a[1].e), d = gen(a[2].e);
+        LLVMValueRef ok = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntNE, d, LLVMConstNull(tty), ""),
+                                       LLVMBuildICmp(B, LLVMIntULT, hi, d, ""), "");
+        check_or_trap(ok, T_DIVZERO);
+        LLVMValueRef quo, rem;
+        if (w <= 32) {
+            LLVMValueRef num = LLVMBuildOr(B, LLVMBuildShl(B, LLVMBuildZExt(B, hi, T_i64, ""),
+                                                           LLVMConstInt(T_i64, (unsigned long long)w, false), ""),
+                                           LLVMBuildZExt(B, lo, T_i64, ""), "");
+            LLVMValueRef dw = LLVMBuildZExt(B, d, T_i64, "");
+            quo = LLVMBuildTrunc(B, LLVMBuildUDiv(B, num, dw, ""), tty, "");
+            rem = LLVMBuildTrunc(B, LLVMBuildURem(B, num, dw, ""), tty, "");
+        } else if (!g_target.wasm) {
+            LLVMValueRef num = LLVMBuildOr(B, LLVMBuildShl(B, LLVMBuildZExt(B, hi, T_i128, ""),
+                                                           LLVMConstInt(T_i128, 64, false), ""),
+                                           LLVMBuildZExt(B, lo, T_i128, ""), "");
+            LLVMValueRef dw = LLVMBuildZExt(B, d, T_i128, "");
+            quo = LLVMBuildTrunc(B, LLVMBuildUDiv(B, num, dw, ""), T_i64, "");
+            rem = LLVMBuildTrunc(B, LLVMBuildURem(B, num, dw, ""), T_i64, "");
+        } else {
+            LLVMValueRef rem_slot = temp_alloca(t_u64);
+            LLVMTypeRef fty;
+            LLVMValueRef fn = udiv128_fn(&fty);
+            LLVMValueRef args[4] = {hi, lo, d, rem_slot};
+            quo = LLVMBuildCall2(B, fty, fn, args, 4, "");
+            rem = LLVMBuildLoad2(B, T_i64, rem_slot, "");
+        }
+        return make_pair_val(rt, quo, rem);
     }
     case BI_MIN:
     case BI_MAX: {

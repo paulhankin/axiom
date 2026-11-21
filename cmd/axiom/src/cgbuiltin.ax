@@ -223,7 +223,8 @@ pub fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
        ast.builtin_between(id, ast.BI_VOLATILE_LOAD, ast.BI_VOLATILE_ZERO) {
         return gen_memory_builtin(e, id, rt);
     }
-    if ast.builtin_between(id, ast.BI_CLZ, ast.BI_COPYSIGN) {
+    if ast.builtin_between(id, ast.BI_CLZ, ast.BI_COPYSIGN) or
+       ast.builtin_between(id, ast.BI_MUL_WIDE, ast.BI_DIV_WIDE) {
         return gen_math_builtin(e, id, rt);
     }
     if ast.builtin_between(id, ast.BI_SPLAT, ast.BI_DOT) or
@@ -609,6 +610,206 @@ fn signed_lanes(t: *mut ast.Type) bool {
     return t.elem.is_signed;
 }
 
+fn int_bits(t: *ast.Type) i32 {
+    if t.is_size {
+        return ty.g_target.ptr_bits;
+    }
+    return t.bits;
+}
+
+fn make_pair_val(rt: *mut ast.Type, f0: *mut ir.Value, f1: *mut ir.Value) *mut ir.Value {
+    let mut v = ir.undef(cx.lty(rt));
+    v = cx.insert(v, f0, 0);
+    return cx.insert(v, f1, 1);
+}
+
+fn udiv128_fty() *mut ir.Ty {
+    let mut ps: [4]*mut ir.Ty = [cx.T_i64, cx.T_i64, cx.T_i64, cx.T_ptr];
+    return ir.t_fn(cx.T_i64, ps[..], false);
+}
+
+fn udiv128_fn() *mut ir.Value {
+    let existing = ir.get_function(cx.M, "__axiom_udiv128");
+    if u.notnil(existing) and not ir.is_decl(existing) {
+        return existing.val;
+    }
+    let fty = udiv128_fty();
+    let mut f = existing;
+    if u.isnil(f) {
+        f = ir.add_function(cx.M, "__axiom_udiv128", fty);
+    }
+    f.linkage = ir.LINK_LINKONCE;
+    let saved = ir.insert_block(cx.B);
+    let saved_src = ir.cur_src;
+    ir.cur_src = 0;
+    let entry = ir.append_block(f, "entry");
+    let hdr = ir.append_block(f, "loop");
+    let body = ir.append_block(f, "body");
+    let done = ir.append_block(f, "done");
+    let hi = f.params[0];
+    let lo = f.params[1];
+    let d = f.params[2];
+    let rp = f.params[3];
+
+    cx.at_end(entry);
+    cx.br(hdr);
+
+    cx.at_end(hdr);
+    let zero = ir.cint(cx.T_i64, 0);
+    let i = ir.phi(cx.B, cx.T_i64);
+    let r = ir.phi(cx.B, cx.T_i64);
+    let lo_v = ir.phi(cx.B, cx.T_i64);
+    let q = ir.phi(cx.B, cx.T_i64);
+    ir.add_incoming(i, zero, entry);
+    ir.add_incoming(r, hi, entry);
+    ir.add_incoming(lo_v, lo, entry);
+    ir.add_incoming(q, zero, entry);
+    cx.condbr(cx.icmp(ir.IntULT, i, ir.cint(cx.T_i64, 64)), body, done);
+
+    cx.at_end(body);
+    let c1 = ir.cint(cx.T_i64, 1);
+    let c63 = ir.cint(cx.T_i64, 63);
+    let c = ir.binop(cx.B, ir.OP_LSHR, r, c63);
+    let r_shl = cx.b_or(ir.binop(cx.B, ir.OP_SHL, r, c1), ir.binop(cx.B, ir.OP_LSHR, lo_v, c63));
+    let lo_next = ir.binop(cx.B, ir.OP_SHL, lo_v, c1);
+    let take = cx.b_or(cx.icmp(ir.IntNE, c, zero), cx.icmp(ir.IntUGE, r_shl, d));
+    let r_next = cx.sel(take, cx.b_sub(r_shl, d), r_shl);
+    let q_next = cx.b_or(ir.binop(cx.B, ir.OP_SHL, q, c1), cx.zext(take, cx.T_i64));
+    let i_next = cx.b_add(i, c1);
+    ir.add_incoming(i, i_next, body);
+    ir.add_incoming(r, r_next, body);
+    ir.add_incoming(lo_v, lo_next, body);
+    ir.add_incoming(q, q_next, body);
+    cx.br(hdr);
+
+    cx.at_end(done);
+    _ = cx.st(r, rp);
+    ir.ret(cx.B, q);
+
+    ir.cur_src = saved_src;
+    if u.notnil(saved) {
+        cx.at_end(saved);
+    }
+    return f.val;
+}
+
+fn gen_mul_wide(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *mut ir.Value {
+    let t = cx.ct(barg(e, 0).ty);
+    let w = int_bits(t);
+    let sg = t.is_signed;
+    let a = gen(barg(e, 0));
+    let b = gen(barg(e, 1));
+    if w <= 32 {
+        let mut aw = cx.vnil();
+        let mut bw = cx.vnil();
+        if sg {
+            aw = cx.sext(a, cx.T_i64);
+            bw = cx.sext(b, cx.T_i64);
+        } else {
+            aw = cx.zext(a, cx.T_i64);
+            bw = cx.zext(b, cx.T_i64);
+        }
+        let p = cx.b_mul(aw, bw);
+        let lt = cx.lty(t);
+        let hi = cx.trunc(ir.binop(cx.B, ir.OP_LSHR, p, ir.cint(cx.T_i64, @int_cast(u64, w))), lt);
+        if id == ast.BI_MUL_HIGH {
+            return hi;
+        }
+        let lo = cx.trunc(p, lt);
+        return make_pair_val(rt, lo, hi);
+    }
+    if not ty.g_target.is_wasm {
+        let mut args: [2]*mut ir.Value = [a, b];
+        let mut iid = ir.IN_UMULH;
+        if sg {
+            iid = ir.IN_SMULH;
+        }
+        let hi = ir.intr(cx.B, iid, cx.T_i64, args[..]);
+        if id == ast.BI_MUL_HIGH {
+            return hi;
+        }
+        return make_pair_val(rt, cx.b_mul(a, b), hi);
+    }
+    let m = ir.cint(cx.T_i64, 0xFFFF_FFFF);
+    let c32 = ir.cint(cx.T_i64, 32);
+    let a0 = cx.b_and(a, m);
+    let a1 = ir.binop(cx.B, ir.OP_LSHR, a, c32);
+    let b0 = cx.b_and(b, m);
+    let b1 = ir.binop(cx.B, ir.OP_LSHR, b, c32);
+    let p00 = cx.b_mul(a0, b0);
+    let p01 = cx.b_mul(a0, b1);
+    let p10 = cx.b_mul(a1, b0);
+    let p11 = cx.b_mul(a1, b1);
+    let mid = cx.b_add(cx.b_add(ir.binop(cx.B, ir.OP_LSHR, p00, c32), cx.b_and(p01, m)), cx.b_and(p10, m));
+    let mut hi = cx.b_add(
+        cx.b_add(cx.b_add(p11, ir.binop(cx.B, ir.OP_LSHR, p01, c32)), ir.binop(cx.B, ir.OP_LSHR, p10, c32)),
+        ir.binop(cx.B, ir.OP_LSHR, mid, c32));
+    if sg {
+        let zero64 = ir.czero(cx.T_i64);
+        let ca = cx.sel(cx.icmp(ir.IntSLT, a, zero64), b, zero64);
+        let cb = cx.sel(cx.icmp(ir.IntSLT, b, zero64), a, zero64);
+        hi = cx.b_sub(hi, cx.b_add(ca, cb));
+    }
+    if id == ast.BI_MUL_HIGH {
+        return hi;
+    }
+    let lo = cx.b_or(cx.b_and(p00, m), ir.binop(cx.B, ir.OP_SHL, mid, c32));
+    return make_pair_val(rt, lo, hi);
+}
+
+fn gen_add_sub_carry(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *mut ir.Value {
+    let t = cx.ct(barg(e, 0).ty);
+    let lt = cx.lty(t);
+    let a = gen(barg(e, 0));
+    let b = gen(barg(e, 1));
+    let cin = gen(barg(e, 2));
+    let cin1 = cx.zext(cx.b_and(cin, ir.cint(cx.T_i8, 1)), lt);
+    if id == ast.BI_ADD_CARRY {
+        let s1 = cx.b_add(a, b);
+        let c1 = cx.icmp(ir.IntULT, s1, a);
+        let s2 = cx.b_add(s1, cin1);
+        let c2 = cx.icmp(ir.IntULT, s2, s1);
+        let carry = cx.zext(cx.b_or(c1, c2), cx.T_i8);
+        return make_pair_val(rt, s2, carry);
+    }
+    let d1 = cx.b_sub(a, b);
+    let b1 = cx.icmp(ir.IntULT, a, b);
+    let d2 = cx.b_sub(d1, cin1);
+    let b2 = cx.icmp(ir.IntULT, d1, cin1);
+    let borrow = cx.zext(cx.b_or(b1, b2), cx.T_i8);
+    return make_pair_val(rt, d2, borrow);
+}
+
+fn gen_div_wide(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let t = cx.ct(barg(e, 0).ty);
+    let w = int_bits(t);
+    let lt = cx.lty(t);
+    let hi = gen(barg(e, 0));
+    let lo = gen(barg(e, 1));
+    let d = gen(barg(e, 2));
+    let zero = ir.czero(lt);
+    cgrt.check_or_trap(cx.b_and(cx.icmp(ir.IntNE, d, zero), cx.icmp(ir.IntULT, hi, d)), cgrt.T_DIVZERO);
+    if w <= 32 {
+        let num = cx.b_or(ir.binop(cx.B, ir.OP_SHL, cx.zext(hi, cx.T_i64), ir.cint(cx.T_i64, @int_cast(u64, w))),
+                          cx.zext(lo, cx.T_i64));
+        let dw = cx.zext(d, cx.T_i64);
+        let quo = cx.trunc(ir.binop(cx.B, ir.OP_UDIV, num, dw), lt);
+        let rem = cx.trunc(ir.binop(cx.B, ir.OP_UREM, num, dw), lt);
+        return make_pair_val(rt, quo, rem);
+    }
+    if not ty.g_target.is_wasm and (tg.g_arch == tg.ARCH_X64) {
+        let mut args: [3]*mut ir.Value = [hi, lo, d];
+        let quo = ir.intr(cx.B, ir.IN_UDIV128, cx.T_i64, args[..]);
+        let rem = cx.b_sub(lo, cx.b_mul(quo, d));
+        return make_pair_val(rt, quo, rem);
+    }
+    let rp = cgrt.temp_alloca(ty.t_u64);
+    let mut args: [4]*mut ir.Value = [hi, lo, d, rp];
+    let quo = cx.call(udiv128_fty(), udiv128_fn(), args[..]);
+    let rem = cx.ld(cx.T_i64, rp);
+    return make_pair_val(rt, quo, rem);
+}
+
 fn gen_math_builtin(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *mut ir.Value {
     if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
         let v = gen(barg(e, 0));
@@ -723,6 +924,15 @@ fn gen_math_builtin(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *mut
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
         return cx.intr2("llvm.copysign", x, y);
+    }
+    if (id == ast.BI_MUL_WIDE) or (id == ast.BI_MUL_HIGH) {
+        return gen_mul_wide(e, id, rt);
+    }
+    if (id == ast.BI_ADD_CARRY) or (id == ast.BI_SUB_BORROW) {
+        return gen_add_sub_carry(e, id, rt);
+    }
+    if id == ast.BI_DIV_WIDE {
+        return gen_div_wide(e, rt);
     }
     return builtin_missing(e);
 }
