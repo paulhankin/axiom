@@ -238,13 +238,17 @@ fn load_part_decl(m: *mut ast.Module, d: *mut ast.Decl, dir: []u8) void {
         return;
     }
     let pkey = u.intern(prp);
-    let mut prev_owner = part_owners.get(pkey);
+    let mut prev_owner: ?*mut ast.Module = .none;
+    let owner_found = part_owners.get(pkey);
+    if u.notnil(owner_found) {
+        prev_owner = owner_found;
+    }
     if u.str_eq(prp, m.path) {
         prev_owner = m;
     }
-    if u.notnil(prev_owner) {
+    if let .some(owner) = prev_owner {
         _ = dg.err(d.import_path_span, "E0222", u.f2("part file '%s' is already part of module '%s'", display_path(prp),
-                                                     prev_owner.file.display));
+                                                     owner.file.display));
         return;
     }
     if u.notnil(mod_by_path.get(pkey)) {
@@ -323,37 +327,44 @@ fn load_regular_import(m: *mut ast.Module, importer_rp: []u8, d: *mut ast.Decl) 
 }
 
 pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
+    let mut from_sp: ?*u.Span = .none;
+    if u.notnil(from) {
+        from_sp = from;
+    }
     let rp = real_path_of(fs_path);
     if u.isnos(rp) {
-        if u.notnil(from) {
-            _ = dg.err(from.*, "E0211", u.f1("cannot find module '%s'", fs_path));
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0211", u.f1("cannot find module '%s'", fs_path));
         }
         return u.nil.[ast.Module]();
     }
     let key = u.intern(rp);
     if u.notnil(part_owners.get(key)) {
-        if u.notnil(from) {
-            _ = dg.err(from.*, "E0221", u.f1("cannot import part file '%s' directly; import its owning module instead",
-                                             display_path(rp)));
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0221", u.f1("cannot import part file '%s' directly; import its owning module instead",
+                                           display_path(rp)));
         }
         return u.nil.[ast.Module]();
     }
     let found = mod_by_path.get(key);
     if u.notnil(found) {
-        if (mod_state.get(key) == 1) and u.notnil(from) {
-            _ = dg.err(from.*, "E0210", u.f1("import cycle: '%s' is already being imported", display_path(rp)));
+        if mod_state.get(key) == 1 {
+            if let .some(sp) = from_sp {
+                _ = dg.err(sp.*, "E0210", u.f1("import cycle: '%s' is already being imported", display_path(rp)));
+            }
         }
         return found;
     }
-    let kept = base_by_path.get(key);
-    if u.notnil(kept) and reads_as_kept(kept) {
-        take_base(kept);
-        return kept;
+    if let .some(kept) = base_by_path.get(key) {
+        if reads_as_kept(kept) {
+            take_base(kept);
+            return kept;
+        }
     }
     let f = u.load_file(rp, u.dup(display_path(rp)));
     if u.isnil(f) {
-        if u.notnil(from) {
-            _ = dg.err(from.*, "E0211", u.f1("cannot read module '%s'", fs_path));
+        if let .some(sp) = from_sp {
+            _ = dg.err(sp.*, "E0211", u.f1("cannot read module '%s'", fs_path));
         }
         return u.nil.[ast.Module]();
     }
@@ -399,8 +410,8 @@ pub fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
 // the globals' total size) still sees them, so that the run reports what a
 // run from nothing would.
 // ---------------------------------------------------------------------------
-let mut base_by_path: u.SymMap.[*mut ast.Module] = u.SymMap.[*mut ast.Module].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ast.Module, 0), cap: 0, len: 0 };
+let mut base_by_path: u.SymMap.[?*mut ast.Module] = u.SymMap.[?*mut ast.Module].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut ?*mut ast.Module, 0), cap: 0, len: 0 };
 
 // Takes kept module m (and the kept modules it imports) into this run.
 fn take_base(m: *mut ast.Module) void {
@@ -452,14 +463,14 @@ pub fn admit(m: *mut ast.Module) void {
 /// On the main thread: no longer takes the module kept for `path` (nor
 /// does any later run).
 pub fn evict(path: []u8) void {
-    if u.notnil(base_by_path.get(path)) {
-        base_by_path.put(path, u.nil.[ast.Module]());
+    if let .some = base_by_path.get(path) {
+        base_by_path.put(path, .none);
     }
 }
 
 /// The module kept for `path` (a real path, interned), or nil.
 pub fn kept_module(path: []u8) *mut ast.Module {
-    return base_by_path.get(path);
+    return base_by_path.get(path) ?? u.nil.[ast.Module]();
 }
 
 // Whether error `name` is declared in m or a module it imports.
