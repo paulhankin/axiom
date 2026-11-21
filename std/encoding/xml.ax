@@ -28,6 +28,7 @@
 import "../collections/arena.ax" as arena;
 import "../collections/map.ax" as maps;
 import "../collections/vec.ax" as vec;
+import "../diag.ax" as diag;
 import "../fmt.ax" as fmt;
 import "../hash.ax" as hash;
 import "../io.ax" as io;
@@ -117,16 +118,61 @@ fn is_nmtoken(s: []u8) bool {
 // Input: encodings and line ends
 // -----------------------------------------------------------------------------
 
+fn set_diag_from_text(text: []u8, at: usize, msg: []u8, info: *mut diag.ErrorInfo) void {
+    let pos = @min(at, text.len);
+    let mut line: u32 = 1;
+    let mut col: u32 = 1;
+    for i in @as(usize, 0)..pos {
+        if text[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    info.* = diag.ErrorInfo.at(pos, line, col, msg);
+}
+
+fn map_input_offset(text: []u8, norm_pos: usize) usize {
+    if (text.len >= 2) and (((text[0] == 0xfe) and (text[1] == 0xff)) or ((text[0] == 0xff) and (text[1] == 0xfe))) {
+        return norm_pos;
+    }
+    let mut ti: usize = 0;
+    if (text.len >= 3) and (text[0] == 0xef) and (text[1] == 0xbb) and (text[2] == 0xbf) {
+        ti = 3;
+    }
+    if declares_latin1(text[ti..]) {
+        return norm_pos;
+    }
+    let mut ni: usize = 0;
+    while (ti < text.len) and (ni < norm_pos) {
+        if text[ti] == '\r' {
+            ti += 1;
+            if (ti < text.len) and (text[ti] == '\n') {
+                ti += 1;
+            }
+            ni += 1;
+        } else {
+            ti += 1;
+            ni += 1;
+        }
+    }
+    return ti;
+}
+
 // The document as UTF-8 with normalized line ends, in the arena.
-fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) XmlError![]u8 {
+fn decode_input_diag(text: []u8, a: *mut arena.Arena, info: *mut diag.ErrorInfo) infer![]u8 {
     let mut s = strs.String.init();
     defer s.deinit();
     if (text.len >= 2) and (((text[0] == 0xfe) and (text[1] == 0xff)) or ((text[0] == 0xff) and (text[1] == 0xfe))) {
         // UTF-16 with a byte-order mark
         let be = text[0] == 0xfe;
         let mut i: usize = 2;
+        let mut line: u32 = 1;
+        let mut col: u32 = 1;
         let mut b: [4]u8 = [0; 4];
         while (i + 1) < text.len {
+            let start_i = i;
             let mut u = @as(u32, text[i + 1]) | (@as(u32, text[i]) << 8);
             if not be {
                 u = @as(u32, text[i]) | (@as(u32, text[i + 1]) << 8);
@@ -134,7 +180,7 @@ fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) XmlError![]u8 {
             i += 2;
             if (u >= 0xd800) and (u <= 0xdbff) {
                 if (i + 1) >= text.len {
-                    msg.* = "truncated UTF-16";
+                    info.* = diag.ErrorInfo.at(start_i, line, col, "truncated UTF-16");
                     return error.SyntaxError;
                 }
                 let mut l = @as(u32, text[i + 1]) | (@as(u32, text[i]) << 8);
@@ -142,42 +188,83 @@ fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) XmlError![]u8 {
                     l = @as(u32, text[i]) | (@as(u32, text[i + 1]) << 8);
                 }
                 if (l < 0xdc00) or (l > 0xdfff) {
-                    msg.* = "invalid UTF-16";
+                    info.* = diag.ErrorInfo.at(i, line, col + 1, "invalid UTF-16");
                     return error.SyntaxError;
                 }
                 i += 2;
                 u = 0x10000 + (((u - 0xd800) << 10) | (l - 0xdc00));
             } else if (u >= 0xdc00) and (u <= 0xdfff) {
-                msg.* = "invalid UTF-16";
+                info.* = diag.ErrorInfo.at(start_i, line, col, "invalid UTF-16");
                 return error.SyntaxError;
             }
-            s.push_str(strs.encode_rune(b[..], u))!;
+            if u == '\n' {
+                line += 1;
+                col = 1;
+            } else if u == '\r' {
+                let mut next_lf = false;
+                if (i + 1) < text.len {
+                    let mut nu = @as(u32, text[i + 1]) | (@as(u32, text[i]) << 8);
+                    if not be {
+                        nu = @as(u32, text[i]) | (@as(u32, text[i + 1]) << 8);
+                    }
+                    next_lf = nu == '\n';
+                }
+                if not next_lf {
+                    line += 1;
+                    col = 1;
+                }
+            } else {
+                col += 1;
+            }
+            s.push_str(strs.encode_rune(b[..], u)) catch |e| {
+                info.* = diag.ErrorInfo.at(start_i, line, col, "out of memory");
+                return e;
+            };
         }
         if i < text.len {
-            msg.* = "truncated UTF-16";
+            info.* = diag.ErrorInfo.at(i, line, col, "truncated UTF-16");
             return error.SyntaxError;
         }
     } else {
         let mut t = text;
+        let mut bom: usize = 0;
         if (t.len >= 3) and (t[0] == 0xef) and (t[1] == 0xbb) and (t[2] == 0xbf) {
             t = t[3..];
+            bom = 3;
         }
         if declares_latin1(t) {
             let mut b: [4]u8 = [0; 4];
             for c in t {
-                s.push_str(strs.encode_rune(b[..], @as(u32, c)))!;
+                s.push_str(strs.encode_rune(b[..], @as(u32, c))) catch |e| {
+                    info.* = diag.ErrorInfo.at(0, 1, 1, "out of memory");
+                    return e;
+                };
             }
         } else {
             if not strs.valid_utf8(t) {
-                msg.* = "invalid UTF-8";
+                let mut bad_at: usize = 0;
+                while bad_at < t.len {
+                    let q = strs.decode_rune(t[bad_at..]);
+                    if (q.value == strs.REPLACEMENT) and not ((q.len == 3) and (t[bad_at] == 0xef)) {
+                        break;
+                    }
+                    bad_at += q.len;
+                }
+                set_diag_from_text(text, bom + bad_at, "invalid UTF-8", info);
                 return error.SyntaxError;
             }
-            s.push_str(t)!;
+            s.push_str(t) catch |e| {
+                info.* = diag.ErrorInfo.at(0, 1, 1, "out of memory");
+                return e;
+            };
         }
     }
     // line ends: CR LF and lone CR become LF
     let src = s.bytes();
-    let out = a.bytes(src.len)!;
+    let out = a.bytes(src.len) catch |e| {
+        info.* = diag.ErrorInfo.at(0, 1, 1, "out of memory");
+        return e;
+    };
     let mut n: usize = 0;
     let mut i: usize = 0;
     while i < src.len {
@@ -201,7 +288,8 @@ fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) XmlError![]u8 {
     while k < r.len {
         let q = strs.decode_rune(r[k..]);
         if not is_char(q.value) {
-            msg.* = "a character that XML does not allow";
+            set_diag_from_text(r, k, "a character that XML does not allow", info);
+            info.offset = map_input_offset(text, k);
             return error.SyntaxError;
         }
         k += q.len;
@@ -391,6 +479,7 @@ pub nocopy struct Reader {
     msg: []u8,
     err_pos: usize,
     line: u32,
+    col: u32,
 
     /// A reader over text (copied and decoded, so text may be freed).
     pub fn init(text: []u8, opts: Options) XmlError!Reader {
@@ -400,6 +489,15 @@ pub nocopy struct Reader {
 
     /// As init; on failure, msg says why.
     pub fn init_info(text: []u8, opts: Options, msg: *mut []u8) XmlError!Reader {
+        let mut dinfo = diag.ErrorInfo.init();
+        let r = Reader.init_diag(text, opts, &mut dinfo) catch |e| {
+            msg.* = dinfo.detail;
+            return e;
+        };
+        return r;
+    }
+
+    fn init_diag(text: []u8, opts: Options, info: *mut diag.ErrorInfo) XmlError!Reader {
         let mut r = Reader.{
             ar: arena.Arena.init(),
             opts: opts,
@@ -434,20 +532,27 @@ pub nocopy struct Reader {
             msg: "",
             err_pos: 0,
             line: 0,
+            col: 0,
         };
-        let mut m: []u8 = "";
-        let t = decode_input(text, &mut r.ar, &mut m) catch |e| {
-            msg.* = m;
+        let t = decode_input_diag(text, &mut r.ar, info) catch |e| {
             r.deinit();
             return e;
         };
         r.default_limit = @max(MAX_EXPANSION, @mul_checked(t.len, 4) catch @max_value(usize));
         r.src.push(Source.{ text: t, pos: 0, entity: "", in_attr: false }) catch |e| {
+            info.* = diag.ErrorInfo.at(0, 1, 1, "out of memory");
             r.deinit();
             return e;
         };
         r.xml_decl() catch |e| {
-            msg.* = r.msg;
+            if r.line == 0 {
+                r.record_pos();
+            }
+            let mut detail = r.msg;
+            if (detail.len == 0) and (e == error.OutOfMemory) {
+                detail = "out of memory";
+            }
+            info.* = diag.ErrorInfo.at(map_input_offset(text, r.err_pos), r.line, r.col, detail);
             r.deinit();
             return e;
         };
@@ -483,20 +588,40 @@ pub nocopy struct Reader {
         return self.line;
     }
 
+    fn record_pos(self: *mut Reader) void {
+        if self.src.len() == 0 {
+            self.err_pos = 0;
+            self.line = 1;
+            self.col = 1;
+            return;
+        }
+        let doc = self.src.get(0);
+        let p = @min(doc.pos, doc.text.len);
+        let mut l: u32 = 1;
+        let mut c: u32 = 1;
+        for ch in doc.text[..p] {
+            if ch == '\n' {
+                l += 1;
+                c = 1;
+            } else {
+                c += 1;
+            }
+        }
+        self.err_pos = p;
+        self.line = l;
+        self.col = c;
+    }
+
     fn fail(self: *mut Reader, m: []u8) XmlError {
+        return self.fail_err(m, error.SyntaxError);
+    }
+
+    fn fail_err(self: *mut Reader, m: []u8, e: XmlError) XmlError {
         if self.msg.len == 0 {
             self.msg = m;
-            let doc = self.src.get(0);
-            let p = @min(doc.pos, doc.text.len);
-            let mut l: u32 = 1;
-            for c in doc.text[..p] {
-                if c == '\n' {
-                    l += 1;
-                }
-            }
-            self.line = l;
+            self.record_pos();
         }
-        return error.SyntaxError;
+        return e;
     }
 
     // --- the current source ----------------------------------------------------------
@@ -793,11 +918,11 @@ pub nocopy struct Reader {
             }
         }
         if self.src.len() > 64 {
-            return error.TooDeep;
+            return self.fail_err("entity expansion nested too deeply", error.TooDeep);
         }
         self.expanded += value.len;
         if self.expanded > MAX_EXPANSION {
-            return error.TooLarge;
+            return self.fail_err("entity expansion exceeds size limit", error.TooLarge);
         }
         self.src.push(Source.{ text: value, pos: 0, entity: name, in_attr: in_attr })!;
     }
@@ -956,13 +1081,13 @@ pub nocopy struct Reader {
             if not have {
                 self.defaulted += d.value.len + @size_of(Attr);
                 if self.defaulted > self.default_limit {
-                    return error.TooLarge;
+                    return self.fail_err("attribute defaults exceed size limit", error.TooLarge);
                 }
                 self.attrs.push(Attr.{ name: d.name, local: d.name, ns: "", value: d.value })!;
             }
         }
         if self.open.len() >= MAX_DEPTH {
-            return error.TooDeep;
+            return self.fail_err("elements nested too deeply", error.TooDeep);
         }
         let depth = self.open.len() + 1;
         let mut t = Reader.token(TokenKind.START);
@@ -1477,7 +1602,7 @@ pub nocopy struct Reader {
     // A choice or sequence (or a name), with an optional ?, * or +.
     fn content_particle(self: *mut Reader, depth: usize) XmlError!void {
         if depth > 64 {
-            return error.TooDeep;
+            return self.fail_err("content model nested too deeply", error.TooDeep);
         }
         if self.at(0) == '(' {
             self.advance(1);
@@ -1928,23 +2053,44 @@ pub fn parse(text: []u8) XmlError!Document {
 }
 
 pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) XmlError!Document {
-    let mut m: []u8 = "";
-    let mut r = Reader.init_info(text, opts, &mut m) catch |e| {
-        info.message = m;
-        info.line = 1;
+    let mut dinfo = diag.ErrorInfo.init();
+    let doc = parse_with_diag(text, opts, &mut dinfo) catch |e| {
+        info.message = dinfo.detail;
+        info.line = dinfo.line;
+        return e;
+    };
+    return doc;
+}
+
+/// Parses an XML document; on failure fills `info` with byte offset, 1-based
+/// line and column, and detail.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) XmlError!Document {
+    return parse_with_diag(text, Options.default(), info);
+}
+
+/// Like parse_diag, with explicit Options.
+pub fn parse_with_diag(text: []u8, opts: Options, info: *mut diag.ErrorInfo) XmlError!Document {
+    info.* = diag.ErrorInfo.init();
+    let mut r = Reader.init_diag(text, opts, info) catch |e| {
         return e;
     };
     let mut doc = Document.{ root: @ptr_from_int(*Element, 8), prolog: [], epilog: [], doctype: "", reader: r };
     build(&mut doc) catch |e| {
-        info.message = doc.reader.error_message();
-        info.line = doc.reader.error_line();
+        if doc.reader.line == 0 {
+            doc.reader.record_pos();
+        }
+        let mut detail = doc.reader.error_message();
+        if (detail.len == 0) and (e == error.OutOfMemory) {
+            detail = "out of memory";
+        }
+        info.* = diag.ErrorInfo.at(map_input_offset(text, doc.reader.err_pos), doc.reader.line, doc.reader.col, detail);
         doc.reader.deinit();
         return e;
     };
     return doc;
 }
 
-fn build(doc: *mut Document) XmlError!void {
+fn build(doc: *mut Document) infer!void {
     let r = &mut doc.reader;
     let mut frames = vec.Vec.[Frame].init();
     defer {
@@ -2002,7 +2148,7 @@ fn build(doc: *mut Document) XmlError!void {
     doc.epilog = all[prolog_len..];
 }
 
-fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) XmlError!void {
+fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) infer!void {
     if frames.len() > 0 {
         frames.get_ptr(frames.len() - 1).kids.push(n)!;
     } else {
@@ -2236,17 +2382,27 @@ pub nocopy struct Writer {
 // Canonical XML (1.0, with comments)
 // -----------------------------------------------------------------------------
 
+fn to_xml_write_error(e: error) XmlError {
+    if e == error.TooDeep {
+        return error.TooDeep;
+    }
+    if e == error.OutOfMemory {
+        return error.OutOfMemory;
+    }
+    return error.IoError;
+}
+
 /// The document's canonical form (W3C Canonical XML 1.0 with comments; free
 /// it with mem.free): no declaration or DOCTYPE, attributes sorted,
 /// namespace declarations only where they change something, empty elements
 /// as start-end pairs, and fixed escaping.
-pub fn canonicalize(doc: *Document) ![]mut u8 {
+pub fn canonicalize(doc: *Document) XmlError![]mut u8 {
     let mut s = strs.String.init();
     let mut rendered = Scope.init();
     defer rendered.deinit();
     canon_doc(doc, s.writer(), &mut rendered) catch |e| {
         s.deinit();
-        return e;
+        return to_xml_write_error(e);
     };
     return s.take();
 }
@@ -2613,4 +2769,71 @@ fn fails_doc(text: []u8) bool {
     let mut d = parse(text) catch return true;
     d.deinit();
     return false;
+}
+
+fn parse_with_diag_err(text: []u8, opts: Options, info: *mut diag.ErrorInfo) ?XmlError {
+    let mut d = parse_with_diag(text, opts, info) catch |e| {
+        return .some(e);
+    };
+    d.deinit();
+    return .none;
+}
+
+test "parse_diag and parse_with_diag" {
+    let mut info = diag.ErrorInfo.at(99, 9, 9, "stale");
+    let mut ok = parse_diag("<a>\n  <b/>\n</a>", &mut info)!;
+    defer ok.deinit();
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
+
+    // mismatched end tag on line 2
+    let e1 = parse_with_diag_err("<a>\n  <b></c>\n</a>", Options.default(), &mut info) ?? @trap();
+    @expect_eq(e1, error.SyntaxError);
+    @expect_eq(info.offset, 13);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 10);
+    @expect_eq(info.detail, "an end tag does not match its start tag");
+
+    // CRLF input still maps offset back to input bytes
+    let e_crlf = parse_with_diag_err("<a>\r\n  <b></c>\r\n</a>", Options.default(), &mut info) ?? @trap();
+    @expect_eq(e_crlf, error.SyntaxError);
+    @expect_eq(info.offset, 14);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 10);
+
+    // invalid UTF-8 detected during decode
+    let e2 = parse_with_diag_err("<a>\xff</a>", Options.default(), &mut info) ?? @trap();
+    @expect_eq(e2, error.SyntaxError);
+    @expect_eq(info.offset, 3);
+    @expect_eq(info.line, 1);
+    @expect_eq(info.col, 4);
+    @expect_eq(info.detail, "invalid UTF-8");
+
+    // deep nesting records TooDeep with position and detail
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for _k in @as(usize, 0)..1100 {
+        deep.push_str("<a>")!;
+    }
+    let e3 = parse_with_diag_err(deep.bytes(), Options.default(), &mut info) ?? @trap();
+    @expect_eq(e3, error.TooDeep);
+    @expect(info.offset > 0);
+    @expect_eq(info.line, 1);
+    @expect(info.col > 1);
+    @expect_eq(info.detail, "elements nested too deeply");
+
+    // parse_with_diag respects Options.namespaces
+    let e4 = parse_with_diag_err("<p:a/>", Options.default(), &mut info) ?? @trap();
+    @expect_eq(e4, error.SyntaxError);
+    @expect_eq(info.line, 1);
+    @expect(info.detail.len > 0);
+
+    let mut no_ns = parse_with_diag("<p:a/>", Options.{ namespaces: false, keep_whitespace: false }, &mut info)!;
+    defer no_ns.deinit();
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
 }

@@ -728,7 +728,7 @@ pub nocopy struct Conn {
 
     /// Reads decrypted application data; 0 means the peer closed the
     /// connection (with close_notify).
-    pub fn read(self: *mut Conn, buf: []mut u8) !usize {
+    pub fn read(self: *mut Conn, buf: []mut u8) TlsError!usize {
         loop {
             if self.app_start < self.app_end {
                 let n = @min(buf.len, self.app_end - self.app_start);
@@ -757,7 +757,7 @@ pub nocopy struct Conn {
     }
 
     /// Encrypts and sends bytes (in records of at most 16 KiB).
-    pub fn write(self: *mut Conn, bytes: []u8) !usize {
+    pub fn write(self: *mut Conn, bytes: []u8) TlsError!usize {
         if self.closed_write {
             return error.Closed;
         }
@@ -766,7 +766,7 @@ pub nocopy struct Conn {
         return n;
     }
 
-    pub fn write_all(self: *mut Conn, bytes: []u8) !void {
+    pub fn write_all(self: *mut Conn, bytes: []u8) TlsError!void {
         let mut rest = bytes;
         while rest.len > 0 {
             let n = self.write(rest)!;
@@ -826,7 +826,7 @@ pub nocopy struct Conn {
     // --- records -------------------------------------------------------------
 
     /// Sends one record, encrypted once keys are set.
-    fn send_record(self: *mut Conn, ty: u8, data: []u8) !void {
+    fn send_record(self: *mut Conn, ty: u8, data: []u8) TlsError!void {
         let mut rec: [16645]u8 = [0; 16645];
         if not self.wr.active {
             rec[0] = ty;
@@ -835,7 +835,7 @@ pub nocopy struct Conn {
             rec[3] = @truncate(u8, data.len >> 8);
             rec[4] = @truncate(u8, data.len);
             @mem_copy(rec[5..5 + data.len], data);
-            self.stream.write_all(rec[..5 + data.len])!;
+            stream_write_all(self.stream, rec[..5 + data.len])!;
             return;
         }
         if self.v12 {
@@ -845,7 +845,7 @@ pub nocopy struct Conn {
             rec[2] = 3;
             rec[3] = @truncate(u8, clen >> 8);
             rec[4] = @truncate(u8, clen);
-            self.stream.write_all(rec[..5 + clen])!;
+            stream_write_all(self.stream, rec[..5 + clen])!;
             return;
         }
         // TLSInnerPlaintext: content || type, sealed
@@ -860,7 +860,7 @@ pub nocopy struct Conn {
         rec[4] = @truncate(u8, clen);
         let hdr: [5]u8 = [rec[0], rec[1], rec[2], rec[3], rec[4]];
         self.wr.seal(hdr[..], inner[..data.len + 1], rec[5..5 + clen])!;
-        self.stream.write_all(rec[..5 + clen])!;
+        stream_write_all(self.stream, rec[..5 + clen])!;
     }
 
     /// Reads bytes until inbuf holds at least n.
@@ -883,7 +883,7 @@ pub nocopy struct Conn {
 
     /// Reads the next record (skipping ChangeCipherSpec) into plain; returns
     /// its content type. Alerts end the connection here.
-    fn read_record(self: *mut Conn) !u8 {
+    fn read_record(self: *mut Conn) TlsError!u8 {
         loop {
             self.fill(5)!;
             let ty = self.inbuf[0];
@@ -992,7 +992,7 @@ pub nocopy struct Conn {
     }
 
     /// Sends a fatal alert (best effort) and returns e.
-    fn fail(self: *mut Conn, alert: u8, e: error) error {
+    fn fail(self: *mut Conn, alert: u8, e: TlsError) TlsError {
         if not self.closed_write {
             let a: [2]u8 = [2, alert];
             self.send_record(CT_ALERT, a[..]) catch {};
@@ -1005,7 +1005,7 @@ pub nocopy struct Conn {
 
     /// The next handshake message (header included), reading records as
     /// needed. The slice is valid until the next call.
-    fn next_message(self: *mut Conn) ![]u8 {
+    fn next_message(self: *mut Conn) TlsError![]u8 {
         loop {
             let avail = self.hs.len() - self.hs_start;
             if avail >= 4 {
@@ -1033,7 +1033,7 @@ pub nocopy struct Conn {
     }
 
     /// The next message, which must have the given type.
-    fn expect_message(self: *mut Conn, ty: u8) ![]u8 {
+    fn expect_message(self: *mut Conn, ty: u8) TlsError![]u8 {
         let m = self.next_message()!;
         if m[0] != ty {
             return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
@@ -1041,7 +1041,7 @@ pub nocopy struct Conn {
         return m;
     }
 
-    fn send_handshake(self: *mut Conn, msg: []u8) !void {
+    fn send_handshake(self: *mut Conn, msg: []u8) TlsError!void {
         let mut rest = msg;
         while rest.len > 0 {
             let n = @min(rest.len, MAX_PLAINTEXT);
@@ -1051,7 +1051,7 @@ pub nocopy struct Conn {
     }
 
     /// Handshake messages after the handshake: tickets and key updates.
-    fn post_handshake(self: *mut Conn) !void {
+    fn post_handshake(self: *mut Conn) TlsError!void {
         self.hs.push_str(self.plain[self.plain_start..self.plain_end])!;
         loop {
             let avail = self.hs.len() - self.hs_start;
@@ -1113,7 +1113,7 @@ pub nocopy struct Conn {
 
     /// Switches to new read keys during the handshake: handshake messages
     /// must not straddle the change (RFC 8446 5.1).
-    fn handshake_read_key(self: *mut Conn, secret: []u8) !void {
+    fn handshake_read_key(self: *mut Conn, secret: []u8) TlsError!void {
         if self.hs_start != self.hs.len() {
             return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
         }
@@ -1142,7 +1142,7 @@ pub nocopy struct Conn {
     /// WouldBlock when it must wait for the peer: call it again when the
     /// socket is readable. Any other failure ends the handshake (close()
     /// the Conn).
-    pub fn handshake_step(self: *mut Conn) !bool {
+    pub fn handshake_step(self: *mut Conn) TlsError!bool {
         while not self.established {
             if not self.has_srv {
                 return error.InvalidArgument;
@@ -1168,13 +1168,24 @@ pub nocopy struct Conn {
         return true;
     }
 
-    pub fn key_update(self: *mut Conn) !void {
+    pub fn key_update(self: *mut Conn) TlsError!void {
         if self.v12 {
             return error.Unsupported;  // a TLS 1.3 message
         }
         let msg: [5]u8 = [HS_KEY_UPDATE, 0, 0, 1, 1];
         self.send_record(CT_HANDSHAKE, msg[..])!;
         self.update_write_key()!;
+    }
+}
+
+fn stream_write_all(s: net.TcpStream, bytes: []u8) TlsError!void {
+    let mut rest = bytes;
+    while rest.len > 0 {
+        let n = s.write(rest)!;
+        if n == 0 {
+            return error.IoError;
+        }
+        rest = rest[n..];
     }
 }
 
@@ -1366,7 +1377,7 @@ fn scheme_offered(list: []u8, id: u16) bool {
 // -----------------------------------------------------------------------------
 
 /// Connects to hostname:port and performs the handshake.
-pub fn connect(hostname: []u8, port: u16, cfg: *ClientConfig) !*mut Conn {
+pub fn connect(hostname: []u8, port: u16, cfg: *ClientConfig) TlsError!*mut Conn {
     let s = net.connect(hostname, port)!;
     return client(s, hostname, cfg);
 }
@@ -1374,13 +1385,13 @@ pub fn connect(hostname: []u8, port: u16, cfg: *ClientConfig) !*mut Conn {
 /// Runs the client handshake over a connected stream. hostname is sent as
 /// SNI (unless it is an IP address) and checked against the certificate.
 /// The stream belongs to the Conn afterwards (on failure too).
-pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut Conn {
+pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) TlsError!*mut Conn {
     return client_with_alpn(stream, hostname, cfg, cfg.alpn);
 }
 
 /// Runs the client handshake over a connected stream, offering `alpn` instead
 /// of `cfg.alpn`. The stream belongs to the Conn afterwards (on failure too).
-pub fn client_with_alpn(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig, alpn: [][]u8) !*mut Conn {
+pub fn client_with_alpn(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig, alpn: [][]u8) TlsError!*mut Conn {
     // (longer than any DNS name; and with no name, the certificate could
     // belong to anyone: verification needs one)
     if (hostname.len > 255) or ((hostname.len == 0) and cfg.verify) {
@@ -1604,7 +1615,39 @@ fn parse_server_hello(msg: []u8) TlsError!ServerHello {
     return sh;
 }
 
-fn client_handshake(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8) !void {
+fn to_x509_tls_error(e: error) TlsError {
+    match e {
+        error.InvalidCertificate         => { return error.InvalidCertificate; }
+        error.InvalidPem                 => { return error.InvalidPem; }
+        error.InvalidKey                 => { return error.InvalidKey; }
+        error.UnsupportedAlgorithm       => { return error.UnsupportedAlgorithm; }
+        error.UnknownAuthority           => { return error.UnknownAuthority; }
+        error.Expired                    => { return error.Expired; }
+        error.NotYetValid                => { return error.NotYetValid; }
+        error.HostnameMismatch           => { return error.HostnameMismatch; }
+        error.BadSignature               => { return error.BadSignature; }
+        error.NotCA                      => { return error.NotCA; }
+        error.IncompatibleUsage          => { return error.IncompatibleUsage; }
+        error.NameConstraint             => { return error.NameConstraint; }
+        error.UnhandledCriticalExtension => { return error.UnhandledCriticalExtension; }
+        error.PathTooLong                => { return error.PathTooLong; }
+        error.NotFound                   => { return error.NotFound; }
+        error.OutOfMemory                => { return error.OutOfMemory; }
+        error.Done                       => { return error.Done; }
+        error.IoError                    => { return error.IoError; }
+        error.Empty                      => { return error.Empty; }
+        error.Corrupt                    => { return error.Corrupt; }
+        error.InvalidBase64              => { return error.InvalidBase64; }
+        error.InvalidUtf8                => { return error.InvalidUtf8; }
+        error.EndOfStream                => { return error.EndOfStream; }
+        error.UnexpectedTag              => { return error.UnexpectedTag; }
+        error.NoSpaceLeft                => { return error.NoSpaceLeft; }
+        error.Distrusted                 => { return error.Distrusted; }
+        else                             => { return error.BadCertificate; }
+    }
+}
+
+fn client_handshake(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8) TlsError!void {
     let mut shares = make_shares()!;
     let mut rnd: [32]u8 = [0; 32];
     let mut sid: [32]u8 = [0; 32];
@@ -1718,7 +1761,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8) !void {
     }
     if cfg.verify {
         x509.verify_chain(chain.items(), &cfg.roots, c.sni[..c.sni_len], time.now()) catch |e| {
-            return c.fail(ALERT_BAD_CERTIFICATE, e);
+            return c.fail(ALERT_BAD_CERTIFICATE, to_x509_tls_error(e));
         };
     }
     let cv = c.expect_message(HS_CERTIFICATE_VERIFY)!;
@@ -1762,7 +1805,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8) !void {
     @mem_copy(c.secret_wr[..hl], ks.client_ap[..hl]);
 }
 
-fn read_encrypted_extensions(c: *mut Conn, ee: []u8, offered: [][]u8) !void {
+fn read_encrypted_extensions(c: *mut Conn, ee: []u8, offered: [][]u8) TlsError!void {
     let mut r = cur(ee[4..]);
     let mut e = cur(r.vec16()!);
     while not e.done() {
@@ -1775,7 +1818,7 @@ fn read_encrypted_extensions(c: *mut Conn, ee: []u8, offered: [][]u8) !void {
 }
 
 // The server's ALPN choice (an extension's data): one of ours.
-fn accept_alpn(c: *mut Conn, data: []u8, offered: [][]u8) !void {
+fn accept_alpn(c: *mut Conn, data: []u8, offered: [][]u8) TlsError!void {
     let mut a = cur(data);
     let mut l = cur(a.vec16()!);
     let p = l.vec8()!;
@@ -1796,7 +1839,7 @@ fn accept_alpn(c: *mut Conn, data: []u8, offered: [][]u8) !void {
     c.alpn_len = p.len;
 }
 
-fn parse_certificates(c: *mut Conn, msg: []u8) !vec.Vec.[x509.Certificate] {
+fn parse_certificates(c: *mut Conn, msg: []u8) TlsError!vec.Vec.[x509.Certificate] {
     let mut list = vec.Vec.[x509.Certificate].init();
     let mut r = cur(msg[4..]);
     _ = r.vec8()!;  // certificate_request_context
@@ -1990,7 +2033,7 @@ fn finished12(hash: sha2.Algorithm, master: []u8, label: []u8, th: []u8, out_buf
 }
 
 /// The certificate list of a TLS 1.2 Certificate message.
-fn parse_certificates12(c: *mut Conn, msg: []u8) !vec.Vec.[x509.Certificate] {
+fn parse_certificates12(c: *mut Conn, msg: []u8) TlsError!vec.Vec.[x509.Certificate] {
     let mut list = vec.Vec.[x509.Certificate].init();
     let mut r = cur(msg[4..]);
     let mut entries = cur(r.vec24()!);
@@ -2054,7 +2097,7 @@ fn sign_content12(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u
 }
 
 fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8, tr: *mut Transcript, sh_msg: []u8,
-                      sh: ServerHello, cr: []u8) !void {
+                      sh: ServerHello, cr: []u8) TlsError!void {
     c.v12 = true;
     let mut sr: [32]u8 = [0; 32];
     @mem_copy(sr[..], sh.random);
@@ -2082,7 +2125,7 @@ fn client_handshake12(c: *mut Conn, cfg: *ClientConfig, alpn: [][]u8, tr: *mut T
     }
     if cfg.verify {
         x509.verify_chain(chain.items(), &cfg.roots, c.sni[..c.sni_len], time.now()) catch |e| {
-            return c.fail(ALERT_BAD_CERTIFICATE, e);
+            return c.fail(ALERT_BAD_CERTIFICATE, to_x509_tls_error(e));
         };
     }
     let key = &chain.get_ptr(0).key;
@@ -2188,7 +2231,7 @@ fn choose_suite12(offered: []u8, kind: x509.KeyKind) u16 {
 // TLS 1.2, after the ClientHello: our flight, from ServerHello to
 // ServerHelloDone. The client's answer is read by srv12_key_exchange and
 // srv12_finished.
-fn srv12_flight(c: *mut Conn, st: *mut ServerHs, ch_msg: []u8, hello: Hello) !void {
+fn srv12_flight(c: *mut Conn, st: *mut ServerHs, ch_msg: []u8, hello: Hello) TlsError!void {
     let cfg = st.cfg;
     let tr = &mut st.tr;
     c.v12 = true;
@@ -2314,7 +2357,7 @@ fn srv12_flight(c: *mut Conn, st: *mut ServerHs, ch_msg: []u8, hello: Hello) !vo
 }
 
 // TLS 1.2: the client's ClientKeyExchange.
-fn srv12_key_exchange(c: *mut Conn, st: *mut ServerHs) !void {
+fn srv12_key_exchange(c: *mut Conn, st: *mut ServerHs) TlsError!void {
     let cke = c.expect_message(HS_CLIENT_KEY_EXCHANGE)!;
     let mut r = cur(cke[4..]);
     let point = r.vec8()!;
@@ -2333,7 +2376,7 @@ fn srv12_key_exchange(c: *mut Conn, st: *mut ServerHs) !void {
 }
 
 // TLS 1.2: the client's ChangeCipherSpec and Finished, then ours.
-fn srv12_finished(c: *mut Conn, st: *mut ServerHs) !void {
+fn srv12_finished(c: *mut Conn, st: *mut ServerHs) TlsError!void {
     let hash = c.suite.hash;
     let cf = c.expect_message(HS_FINISHED)!;
     if c.ccs_expected {
@@ -2361,7 +2404,7 @@ fn srv12_finished(c: *mut Conn, st: *mut ServerHs) !void {
 
 /// Runs the server handshake on an accepted connection. The stream
 /// belongs to the Conn afterwards (and is closed if the handshake fails).
-pub fn server(stream: net.TcpStream, cfg: *ServerConfig) !*mut Conn {
+pub fn server(stream: net.TcpStream, cfg: *ServerConfig) TlsError!*mut Conn {
     let c = server_start(stream, cfg) catch |e| {
         stream.close();
         return e;
@@ -2630,7 +2673,7 @@ const PHASE_KEY_EXCHANGE12: u8 = 3;  // (1.2) ClientKeyExchange
 const PHASE_FINISHED12: u8 = 4;      // (1.2) ChangeCipherSpec and Finished
 
 // The ClientHello: a HelloRetryRequest, or our flight.
-fn srv_hello(c: *mut Conn, st: *mut ServerHs) !void {
+fn srv_hello(c: *mut Conn, st: *mut ServerHs) TlsError!void {
     let cfg = st.cfg;
     let msg = c.expect_message(HS_CLIENT_HELLO)!;
     let hello = parse_client_hello(c, msg) catch |e| {
@@ -2683,7 +2726,7 @@ fn srv_hello(c: *mut Conn, st: *mut ServerHs) !void {
 }
 
 // The second ClientHello, with a share of the group asked for.
-fn srv_hello2(c: *mut Conn, st: *mut ServerHs) !void {
+fn srv_hello2(c: *mut Conn, st: *mut ServerHs) TlsError!void {
     let msg = c.expect_message(HS_CLIENT_HELLO)!;
     let hello = parse_client_hello(c, msg) catch |e| {
         return c.fail(hello_alert(e), e);
@@ -2696,7 +2739,7 @@ fn srv_hello2(c: *mut Conn, st: *mut ServerHs) !void {
 }
 
 // TLS 1.3: our flight, from ServerHello to Finished.
-fn srv13_flight(c: *mut Conn, st: *mut ServerHs, hello: Hello) !void {
+fn srv13_flight(c: *mut Conn, st: *mut ServerHs, hello: Hello) TlsError!void {
     let cfg = st.cfg;
     let hash = c.suite.hash;
     let hl = sha2.digest_size(hash);
@@ -2796,7 +2839,7 @@ fn srv13_flight(c: *mut Conn, st: *mut ServerHs, hello: Hello) !void {
 }
 
 // TLS 1.3: the client's Finished.
-fn srv13_finished(c: *mut Conn, st: *mut ServerHs) !void {
+fn srv13_finished(c: *mut Conn, st: *mut ServerHs) TlsError!void {
     let hash = c.suite.hash;
     let hl = sha2.digest_size(hash);
     let ks = &st.ks;

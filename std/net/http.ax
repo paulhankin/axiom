@@ -217,18 +217,25 @@ pub struct Transport {
         return Transport.{ tcp: c.stream, tls: c, secure: true };
     }
 
-    pub fn read(self: Transport, buf: []mut u8) !usize {
+    pub fn read(self: Transport, buf: []mut u8) HttpError!usize {
         if self.secure {
             return self.tls.read(buf);
         }
         return self.tcp.read(buf);
     }
 
-    pub fn write_all(self: Transport, bytes: []u8) !void {
+    pub fn write_all(self: Transport, bytes: []u8) HttpError!void {
         if self.secure {
             return self.tls.write_all(bytes);
         }
-        return self.tcp.write_all(bytes);
+        let mut rest = bytes;
+        while rest.len > 0 {
+            let n = self.tcp.write(rest)!;
+            if n == 0 {
+                return error.IoError;
+            }
+            rest = rest[n..];
+        }
     }
 
     pub fn close(self: Transport) void {
@@ -398,7 +405,7 @@ pub struct Response {
     }
 
     /// Appends to the body.
-    pub fn write(self: *mut Response, bytes: []u8) !void {
+    pub fn write(self: *mut Response, bytes: []u8) HttpError!void {
         self.body.push_str(bytes)!;
         if self.body.len() >= STREAM_THRESHOLD {
             self.flush()!;
@@ -411,7 +418,7 @@ pub struct Response {
     }
 
     /// Sets the status and a text/plain body in one go.
-    pub fn text(self: *mut Response, status: u16, body: []u8) !void {
+    pub fn text(self: *mut Response, status: u16, body: []u8) HttpError!void {
         self.status = status;
         if not self.has_type {
             self.header("Content-Type", "text/plain; charset=utf-8")!;
@@ -420,13 +427,13 @@ pub struct Response {
     }
 
     /// Sends what is buffered now and streams the rest of the body.
-    pub fn flush(self: *mut Response) !void {
+    pub fn flush(self: *mut Response) HttpError!void {
         if self.is_h2 {
             if not self.started {
                 self.h2_head(false, 0, false)!;
             }
             if (self.body.len() > 0) and not self.head_only and not self.no_body() {
-                self.h2.send_data(self.h2_id, self.body.bytes(), false)!;
+                self.h2.send_data(self.h2_id, self.body.bytes(), false) catch |e| return to_http_error(e);
             }
             self.body.clear();
             return;
@@ -470,7 +477,7 @@ pub struct Response {
     /// does): sends "101 Switching Protocols" with the headers set so far,
     /// and returns the connection. The handler then speaks the new protocol
     /// on it until it returns, when the server closes it.
-    pub fn upgrade(self: *mut Response) !Transport {
+    pub fn upgrade(self: *mut Response) HttpError!Transport {
         if self.started or self.is_h2 {
             return error.InvalidHeader;
         }
@@ -483,24 +490,30 @@ pub struct Response {
 
     /// Sends the status line and headers, followed by `body` in the same
     /// write.
-    fn send_head(self: *mut Response, length: usize, with_length: bool, body: []u8) !void {
+    fn send_head(self: *mut Response, length: usize, with_length: bool, body: []u8) HttpError!void {
         let mut h = strs.String.with_capacity(256 + self.head.len() + body.len)!;
         defer h.deinit();
-        let w = h.writer();
         if self.version == Version.HTTP_1_0 {
             h.push_str("HTTP/1.0 ")!;
         } else {
             h.push_str("HTTP/1.1 ")!;
         }
-        fmt.write(w, "{} {}\r\n", [fmt.int(self.status), fmt.str(reason_phrase(self.status))])!;
+        let mut sb: [20]u8 = [0; 20];
+        h.push_str(io.fmt_u64(sb[..], @as(u64, self.status)))!;
+        h.push(' ')!;
+        h.push_str(reason_phrase(self.status))!;
+        h.push_str("\r\nDate: ")!;
         let mut db: [32]u8 = [0; 32];
-        fmt.write(w, "Date: {}\r\n", [fmt.str(time.now().format_http(db[..]))])!;
+        h.push_str(time.now().format_http(db[..]))!;
+        h.push_str("\r\n")!;
         h.push_str(self.head.bytes())!;
         if (not self.has_type) and ((length > 0) or self.chunked) {
             h.push_str("Content-Type: text/plain; charset=utf-8\r\n")!;
         }
         if with_length and not self.no_body() {
-            fmt.write(w, "Content-Length: {}\r\n", [fmt.int(length)])!;
+            h.push_str("Content-Length: ")!;
+            h.push_str(io.fmt_u64(sb[..], @as(u64, length)))!;
+            h.push_str("\r\n")!;
         }
         if self.chunked {
             h.push_str("Transfer-Encoding: chunked\r\n")!;
@@ -581,21 +594,21 @@ pub struct Response {
     }
 
     /// Completes the response after the handler returns.
-    fn finish(self: *mut Response) !void {
+    fn finish(self: *mut Response) HttpError!void {
         if self.is_h2 {
             let no_body = self.no_body() or self.head_only;
             if not self.started {
                 let n = self.body.len();
                 self.h2_head(true, n, no_body or (n == 0))!;
                 if not no_body and (n > 0) {
-                    self.h2.send_data(self.h2_id, self.body.bytes(), true)!;
+                    self.h2.send_data(self.h2_id, self.body.bytes(), true) catch |e| return to_http_error(e);
                 }
             } else {
                 let mut rest: []u8 = "";
                 if not no_body {
                     rest = self.body.bytes();
                 }
-                self.h2.send_data(self.h2_id, rest, true)!;
+                self.h2.send_data(self.h2_id, rest, true) catch |e| return to_http_error(e);
             }
             self.body.clear();
             return;
@@ -614,6 +627,91 @@ pub struct Response {
         if self.chunked and not self.head_only {
             self.stream.write_all("0\r\n\r\n")!;
         }
+    }
+}
+
+fn to_http_error(e: error) HttpError {
+    match e {
+        error.BadRequest                 => { return error.BadRequest; }
+        error.BadResponse                => { return error.BadResponse; }
+        error.BadUrl                     => { return error.BadUrl; }
+        error.HeadTooLarge               => { return error.HeadTooLarge; }
+        error.TooLarge                   => { return error.TooLarge; }
+        error.InvalidHeader              => { return error.InvalidHeader; }
+        error.InvalidArgument            => { return error.InvalidArgument; }
+        error.Unsupported                => { return error.Unsupported; }
+        error.InvalidUrl                 => { return error.InvalidUrl; }
+        error.InvalidEscape              => { return error.InvalidEscape; }
+        error.NotAbsolute                => { return error.NotAbsolute; }
+        error.InvalidNumber              => { return error.InvalidNumber; }
+        error.InvalidUtf8                => { return error.InvalidUtf8; }
+        error.BadFormat                  => { return error.BadFormat; }
+        error.InvalidCookie              => { return error.InvalidCookie; }
+        error.DecodeError                => { return error.DecodeError; }
+        error.Overflow                   => { return error.Overflow; }
+        error.Negative                   => { return error.Negative; }
+        error.InvalidBase64              => { return error.InvalidBase64; }
+        error.UnexpectedTag              => { return error.UnexpectedTag; }
+        error.Corrupt                    => { return error.Corrupt; }
+        error.Closed                     => { return error.Closed; }
+        error.NetError                   => { return error.NetError; }
+        error.TimedOut                   => { return error.TimedOut; }
+        error.WouldBlock                 => { return error.WouldBlock; }
+        error.ConnectionRefused          => { return error.ConnectionRefused; }
+        error.AddressInUse               => { return error.AddressInUse; }
+        error.InvalidAddress             => { return error.InvalidAddress; }
+        error.IoError                    => { return error.IoError; }
+        error.EndOfStream                => { return error.EndOfStream; }
+        error.NoSpaceLeft                => { return error.NoSpaceLeft; }
+        error.ProxyRefused               => { return error.ProxyRefused; }
+        error.ProtocolError              => { return error.ProtocolError; }
+        error.StreamReset                => { return error.StreamReset; }
+        error.FlowControlError           => { return error.FlowControlError; }
+        error.FrameSizeError             => { return error.FrameSizeError; }
+        error.CompressionError           => { return error.CompressionError; }
+        error.StreamClosed               => { return error.StreamClosed; }
+        error.GoAway                     => { return error.GoAway; }
+        error.TooBig                     => { return error.TooBig; }
+        error.ListTooLarge               => { return error.ListTooLarge; }
+        error.HandshakeFailure           => { return error.HandshakeFailure; }
+        error.UnexpectedMessage          => { return error.UnexpectedMessage; }
+        error.BadRecordMac               => { return error.BadRecordMac; }
+        error.RecordOverflow             => { return error.RecordOverflow; }
+        error.ProtocolVersion            => { return error.ProtocolVersion; }
+        error.IllegalParameter           => { return error.IllegalParameter; }
+        error.AlertReceived              => { return error.AlertReceived; }
+        error.BadCertificate             => { return error.BadCertificate; }
+        error.NoCertificate              => { return error.NoCertificate; }
+        error.RandomFailed               => { return error.RandomFailed; }
+        error.InvalidKey                 => { return error.InvalidKey; }
+        error.InvalidPoint               => { return error.InvalidPoint; }
+        error.InvalidCertificate         => { return error.InvalidCertificate; }
+        error.AuthFailed                 => { return error.AuthFailed; }
+        error.InvalidLength              => { return error.InvalidLength; }
+        error.InvalidPem                 => { return error.InvalidPem; }
+        error.MessageTooLong             => { return error.MessageTooLong; }
+        error.WeakKey                    => { return error.WeakKey; }
+        error.UnsupportedAlgorithm       => { return error.UnsupportedAlgorithm; }
+        error.DivisionByZero             => { return error.DivisionByZero; }
+        error.UnknownAuthority           => { return error.UnknownAuthority; }
+        error.Expired                    => { return error.Expired; }
+        error.NotYetValid                => { return error.NotYetValid; }
+        error.HostnameMismatch           => { return error.HostnameMismatch; }
+        error.NotInvertible              => { return error.NotInvertible; }
+        error.BadSignature               => { return error.BadSignature; }
+        error.NotCA                      => { return error.NotCA; }
+        error.IncompatibleUsage          => { return error.IncompatibleUsage; }
+        error.NameConstraint             => { return error.NameConstraint; }
+        error.UnhandledCriticalExtension => { return error.UnhandledCriticalExtension; }
+        error.Distrusted                 => { return error.Distrusted; }
+        error.PathTooLong                => { return error.PathTooLong; }
+        error.OutOfMemory                => { return error.OutOfMemory; }
+        error.NotFound                   => { return error.NotFound; }
+        error.Empty                      => { return error.Empty; }
+        error.Done                       => { return error.Done; }
+        error.PermissionDenied           => { return error.PermissionDenied; }
+        error.NotADirectory              => { return error.NotADirectory; }
+        else                             => { return error.Failed; }
     }
 }
 

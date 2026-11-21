@@ -37,6 +37,7 @@
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
+import "../diag.ax" as diag;
 import "../fmt.ax" as fmt;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
@@ -283,7 +284,7 @@ struct Parser {
         }
     }
 
-    fn literal(self: *mut Parser, word: []u8, v: Value) JsonError!Value {
+    fn literal(self: *mut Parser, word: []u8, v: Value) infer!Value {
         if ((self.i + word.len) > self.s.len) or not @mem_eq(self.s[self.i..self.i + word.len], word) {
             return self.fail("invalid literal");
         }
@@ -313,7 +314,7 @@ struct Parser {
         }
     }
 
-    fn enter(self: *mut Parser) JsonError!void {
+    fn enter(self: *mut Parser) infer!void {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             _ = self.fail("nested too deeply");
@@ -393,7 +394,7 @@ struct Parser {
         return Value.Object(ms);
     }
 
-    fn hex4(self: *mut Parser) JsonError!u32 {
+    fn hex4(self: *mut Parser) infer!u32 {
         if (self.i + 4) > self.s.len {
             return self.fail("truncated \\u escape");
         }
@@ -415,7 +416,7 @@ struct Parser {
     }
 
     /// A string starting at the opening quote, unescaped into the arena.
-    fn string(self: *mut Parser) JsonError![]u8 {
+    fn string(self: *mut Parser) infer![]u8 {
         self.i += 1;
         let start = self.i;
         // the common case: no escapes
@@ -517,7 +518,7 @@ struct Parser {
 
     /// The offset of the closing quote of the string whose body starts at
     /// `from` (an upper bound on its unescaped length).
-    fn find_end(self: *mut Parser, from: usize) JsonError!usize {
+    fn find_end(self: *mut Parser, from: usize) infer!usize {
         let mut j = from;
         while j < self.s.len {
             let c = self.s[j];
@@ -532,7 +533,7 @@ struct Parser {
         return self.fail("unterminated string");
     }
 
-    fn number(self: *mut Parser) JsonError!Value {
+    fn number(self: *mut Parser) infer!Value {
         let start = self.i;
         let s = self.s;
         if s[self.i] == '-' {
@@ -621,6 +622,18 @@ pub fn parse_with(text: []u8, info: *mut ErrorInfo) JsonError!Document {
         return error.SyntaxError;
     }
     return Document.{ root: root, arena: arena };
+}
+
+/// Like parse, and on failure fills `info` with byte offset, 1-based line and
+/// column, and detail.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) JsonError!Document {
+    info.* = diag.ErrorInfo.init();
+    let mut local = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
+    let doc = parse_with(text, &mut local) catch |e| {
+        info.* = diag.ErrorInfo.at(local.offset, local.line, local.column, local.message);
+        return e;
+    };
+    return doc;
 }
 
 fn fill_info(text: []u8, at: usize, msg: []u8, info: *mut ErrorInfo) void {
@@ -827,7 +840,8 @@ fn write_float(w: io.Writer, x: f64) !void {
         return;
     }
     let mut b: [32]u8 = [0; 32];
-    w.write_all(fmt.format_float(b[..], x)!)!;
+    let s = fmt.format_float(b[..], x) catch return error.BadFormat;
+    w.write_all(s)!;
 }
 
 /// Writes s as a JSON string: quoted, with `"`, `\` and control characters
@@ -877,22 +891,30 @@ pub fn write_string(w: io.Writer, s: []u8) !void {
     w.write_all("\"")!;
 }
 
+fn to_json_write_error(e: error) JsonError {
+    if e == error.BadNesting {
+        return error.BadNesting;
+    }
+    if e == error.OutOfMemory {
+        return error.OutOfMemory;
+    }
+    if e == error.BadFormat {
+        return error.BadFormat;
+    }
+    return error.IoError;
+}
+
 /// v as compact JSON text in new memory (free it with mem.free).
-pub fn stringify(v: Value) ![]mut u8 {
-    let mut s = strs.String.init();
-    stringify_to(s.writer(), v) catch |e| {
-        s.deinit();
-        return e;
-    };
-    return s.take();
+pub fn stringify(v: Value) JsonError![]mut u8 {
+    return stringify_pretty(v, 0);
 }
 
 /// v as indented JSON text in new memory (free it with mem.free).
-pub fn stringify_pretty(v: Value, indent: u32) ![]mut u8 {
+pub fn stringify_pretty(v: Value, indent: u32) JsonError![]mut u8 {
     let mut s = strs.String.init();
     stringify_pretty_to(s.writer(), v, indent) catch |e| {
         s.deinit();
-        return e;
+        return to_json_write_error(e);
     };
     return s.take();
 }
@@ -1148,4 +1170,57 @@ test "values of every size" {
         @expect_eq(must_val(doc.root.at(0)).len(), n * 25);
         @expect_eq(must_val(doc.root.at(1)).len(), n * 300);
     }
+}
+
+fn parse_diag_err(text: []u8, info: *mut diag.ErrorInfo) ?JsonError {
+    let mut doc = parse_diag(text, info) catch |e| {
+        return .some(e);
+    };
+    doc.deinit();
+    return .none;
+}
+
+test "parse_diag and narrowed stringify" {
+    let mut info = diag.ErrorInfo.at(99, 9, 9, "stale");
+    let mut ok_doc = parse_diag("{\"ok\":true}", &mut info)!;
+    defer ok_doc.deinit();
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
+
+    let e1 = parse_diag_err("{\n  \"a\": [1,\n  2,,]\n}", &mut info) ?? @trap();
+    @expect_eq(e1, error.SyntaxError);
+    @expect_eq(info.offset, 17);
+    @expect_eq(info.line, 3);
+    @expect_eq(info.col, 5);
+    @expect_eq(info.detail, "unexpected character");
+
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for _i in @as(u32, 0)..600 {
+        deep.push('[')!;
+    }
+    let e2 = parse_diag_err(deep.bytes(), &mut info) ?? @trap();
+    @expect_eq(e2, error.TooDeep);
+    @expect_eq(info.offset, @as(usize, MAX_DEPTH));
+    @expect_eq(info.line, 1);
+    @expect_eq(info.col, MAX_DEPTH + 1);
+    @expect_eq(info.detail, "nested too deeply");
+
+    // stringify preserves BadNesting when a Value exceeds Writer depth
+    let mut cells: [520]Value = [Value.Null; 520];
+    let mut cur = Value.Null;
+    for i in @as(usize, 0)..520 {
+        cells[i] = cur;
+        cur = Value.Array(cells[i..i + 1]);
+    }
+    let mut nesting_failed = false;
+    let out = stringify(cur) catch |e| {
+        @expect_eq(e, error.BadNesting);
+        nesting_failed = true;
+        return;
+    };
+    mem.free(out);
+    @expect(nesting_failed);
 }

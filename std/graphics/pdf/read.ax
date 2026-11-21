@@ -283,7 +283,7 @@ pub nocopy struct Reader {
     parse_budget: usize,
 
     /// Opens a PDF held in memory (which must outlive the Reader).
-    pub fn open(data: []u8) !Reader {
+    pub fn open(data: []u8) ReadError!Reader {
         let mut r = Reader.{
             data: data,
             xref: vec.Vec.[Entry].init(),
@@ -359,7 +359,7 @@ pub nocopy struct Reader {
         self.parse_budget -= @min(self.parse_budget, n);
     }
 
-    fn load(self: *mut Reader) !void {
+    fn load(self: *mut Reader) ReadError!void {
         if not strs.contains(self.data[..@min(self.data.len, 1024)], "%PDF-") {
             return error.Corrupt;
         }
@@ -415,7 +415,7 @@ pub nocopy struct Reader {
     }
 
     /// Follows startxref and the /Prev chain; false if the file has no usable table.
-    fn read_xref_chain(self: *mut Reader) !bool {
+    fn read_xref_chain(self: *mut Reader) ReadError!bool {
         let d = self.data;
         let tail = d.len - @min(d.len, 2048);
         let sx = strs.last_index_of(d[tail..], "startxref") ?? return false;
@@ -509,7 +509,7 @@ pub nocopy struct Reader {
         return error.Corrupt;
     }
 
-    fn xref_stream(self: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) !Dict {
+    fn xref_stream(self: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) ReadError!Dict {
         let mut lx = Lexer.{ s: self.data, pos: p };
         let obj = self.parse_indirect(&mut lx)!;
         let st = obj.as_stream()!;
@@ -669,7 +669,7 @@ pub nocopy struct Reader {
     // --- objects ---
 
     /// Indirect object `num` (Null if it does not exist).
-    pub fn object(self: *mut Reader, num: u32) !Object {
+    pub fn object(self: *mut Reader, num: u32) ReadError!Object {
         let n = @as(usize, num);
         if n >= self.xref.len() {
             return Object.Null;
@@ -718,7 +718,7 @@ pub nocopy struct Reader {
     }
 
     /// Follows references (a few levels at most) to a direct object.
-    pub fn resolve(self: *mut Reader, o: Object) !Object {
+    pub fn resolve(self: *mut Reader, o: Object) ReadError!Object {
         let mut cur = o;
         for _k in @as(usize, 0)..16 {
             match cur {
@@ -730,11 +730,11 @@ pub nocopy struct Reader {
     }
 
     /// A dictionary entry, resolved.
-    pub fn get(self: *mut Reader, d: Dict, key: []u8) !Object {
+    pub fn get(self: *mut Reader, d: Dict, key: []u8) ReadError!Object {
         return self.resolve(d.get(key));
     }
 
-    fn from_objstm(self: *mut Reader, stm: u64, index: u32) !Object {
+    fn from_objstm(self: *mut Reader, stm: u64, index: u32) ReadError!Object {
         let mut oi: usize = 0;
         if let .some(found) = self.objstm.get(stm) {
             oi = found;
@@ -1067,11 +1067,11 @@ pub nocopy struct Reader {
     // --- streams ---
 
     /// A stream's data, decoded (kept until deinit).
-    pub fn stream_data(self: *mut Reader, st: Stream) ![]u8 {
+    pub fn stream_data(self: *mut Reader, st: Stream) ReadError![]u8 {
         return self.decode(st);
     }
 
-    fn decode(self: *mut Reader, st: Stream) ![]u8 {
+    fn decode(self: *mut Reader, st: Stream) ReadError![]u8 {
         if (st.start > self.data.len) or (st.len > self.data.len - st.start) {
             return error.Corrupt;
         }
@@ -1145,17 +1145,23 @@ pub nocopy struct Reader {
         return data;
     }
 
-    fn apply_filter(self: *mut Reader, f: []u8, data: []u8, parms: Object) ![]mut u8 {
+    fn apply_filter(self: *mut Reader, f: []u8, data: []u8, parms: Object) ReadError![]mut u8 {
         let limit = @min(self.max_stream, self.budget);
         if strs.eq(f, "FlateDecode") or strs.eq(f, "Fl") {
             let out = deflate.decompress(data, deflate.Format.ZLIB, limit) catch |e| {
-                if (e == error.OutOfMemory) or (e == error.TooLarge) {
-                    return e;
+                if e == error.OutOfMemory {
+                    return error.OutOfMemory;
+                }
+                if e == error.TooLarge {
+                    return error.TooLarge;
                 }
                 // raw deflate?
                 let raw = deflate.decompress(data, deflate.Format.RAW, limit) catch |e2| {
-                    if (e2 == error.OutOfMemory) or (e2 == error.TooLarge) {
-                        return e2;
+                    if e2 == error.OutOfMemory {
+                        return error.OutOfMemory;
+                    }
+                    if e2 == error.TooLarge {
+                        return error.TooLarge;
                     }
                     return [];
                 };
@@ -1205,7 +1211,7 @@ pub nocopy struct Reader {
 
     // --- pages ---
 
-    fn load_pages(self: *mut Reader) !void {
+    fn load_pages(self: *mut Reader) ReadError!void {
         let root = self.get(self.trailer, "Root")!;
         let cat = root.as_dict() catch return error.Corrupt;
         let top = self.get(cat, "Pages")!;
@@ -1296,7 +1302,7 @@ pub nocopy struct Reader {
     }
 
     /// A page's size in points: [width, height] of its MediaBox.
-    pub fn page_size(self: *mut Reader, i: usize) ![2]f64 {
+    pub fn page_size(self: *mut Reader, i: usize) ReadError![2]f64 {
         let d = self.page(i)!;
         let mb = self.get(d, "MediaBox")!;
         let a = mb.as_array() catch return [612.0, 792.0];
@@ -1311,7 +1317,7 @@ pub nocopy struct Reader {
     }
 
     /// A metadata entry (Title, Author, ...) as UTF-8; empty if absent.
-    pub fn info(self: *mut Reader, key: []u8) ![]mut u8 {
+    pub fn info(self: *mut Reader, key: []u8) ReadError![]mut u8 {
         let io_ = self.get(self.trailer, "Info")!;
         let d = io_.as_dict() catch return [];
         let v = self.get(d, key)!;
@@ -1320,7 +1326,7 @@ pub nocopy struct Reader {
     }
 
     /// The text of page i, as UTF-8 lines.
-    pub fn page_text(self: *mut Reader, i: usize) ![]mut u8 {
+    pub fn page_text(self: *mut Reader, i: usize) ReadError![]mut u8 {
         let d = self.page(i)!;
         let mut ex = Extractor.init(self);
         defer ex.deinit();
@@ -1879,7 +1885,7 @@ nocopy struct Extractor {
     }
 
     /// Interprets a content stream with its resources.
-    fn run(self: *mut Extractor, data: []u8, res: Dict, depth: u32) !void {
+    fn run(self: *mut Extractor, data: []u8, res: Dict, depth: u32) ReadError!void {
         if depth > 8 {
             return;
         }
@@ -1999,7 +2005,7 @@ nocopy struct Extractor {
         return 0.0;
     }
 
-    fn operator(self: *mut Extractor, op: []u8, ops: []Operand, sc: []u8, res: Dict, depth: u32) !void {
+    fn operator(self: *mut Extractor, op: []u8, ops: []Operand, sc: []u8, res: Dict, depth: u32) ReadError!void {
         let n = ops.len;
         if strs.eq(op, "q") {
             if self.stack.len() < 256 {
@@ -2085,7 +2091,7 @@ nocopy struct Extractor {
     }
 
     /// A form XObject: its content, with its own resources.
-    fn form(self: *mut Extractor, name: []u8, res: Dict, depth: u32) !void {
+    fn form(self: *mut Extractor, name: []u8, res: Dict, depth: u32) ReadError!void {
         // each use costs steps of its own, so a form that draws itself many
         // times over (a tree of uses, 8 deep) cannot run on for long
         self.steps += 1024;
@@ -2220,7 +2226,7 @@ nocopy struct Extractor {
         self.last_size = sz;
     }
 
-    fn load_font(self: *mut Extractor, key: []u8, res: Dict) !usize {
+    fn load_font(self: *mut Extractor, key: []u8, res: Dict) ReadError!usize {
         for i in 0..self.fonts.len() {
             if strs.eq(self.fonts.get(i).key, key) {
                 return i;
@@ -2270,7 +2276,7 @@ nocopy struct Extractor {
         return idx;
     }
 
-    fn setup_font(self: *mut Extractor, m: *mut FontMap, d: Dict) !void {
+    fn setup_font(self: *mut Extractor, m: *mut FontMap, d: Dict) ReadError!void {
         let sub = self.r.get(d, "Subtype")!;
         let sn = sub.as_name() catch "";
         let r = self.r;
@@ -2717,7 +2723,7 @@ fn stream_obj(dict: []u8, data: []u8) ReadError![]mut u8 {
     return s.take();
 }
 
-fn page_text_of(pdf: []u8, i: usize) ![]mut u8 {
+fn page_text_of(pdf: []u8, i: usize) ReadError![]mut u8 {
     let mut r = Reader.open(pdf)!;
     defer r.deinit();
     return r.page_text(i);

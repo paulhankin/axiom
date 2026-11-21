@@ -36,7 +36,40 @@ import "qoi.ax" as qoi;
 import "tiff.ax" as tiff;
 import "webp.ax" as webp;
 
-error { Unsupported, Corrupt, OutOfMemory }
+/// Any error returned by decoding or loading an image file.
+pub error FormatsError = avif.AvifError | bmp.BmpError | exr.ExrError | gif.GifError | hdr.HdrError | jpeg.JpegError |
+                         png.PngError | pnm.PnmError | qoi.QoiError | tiff.TiffError | webp.WebpError | io.IoError |
+                         image.ImageError;
+
+/// Any error returned by saving an encoded image to a file.
+pub error SaveError = io.IoError | image.ImageError;
+
+fn to_io_error(e: error) io.IoError {
+    match e {
+        error.EndOfStream      => { return error.EndOfStream; }
+        error.NoSpaceLeft      => { return error.NoSpaceLeft; }
+        error.NotFound         => { return error.NotFound; }
+        error.PermissionDenied => { return error.PermissionDenied; }
+        error.IsDirectory      => { return error.IsDirectory; }
+        error.OutOfMemory      => { return error.OutOfMemory; }
+        else                   => { return error.IoError; }
+    }
+}
+
+fn to_save_error(e: error) SaveError {
+    match e {
+        error.EndOfStream      => { return error.EndOfStream; }
+        error.NoSpaceLeft      => { return error.NoSpaceLeft; }
+        error.NotFound         => { return error.NotFound; }
+        error.PermissionDenied => { return error.PermissionDenied; }
+        error.IsDirectory      => { return error.IsDirectory; }
+        error.OutOfMemory      => { return error.OutOfMemory; }
+        error.IoError          => { return error.IoError; }
+        error.Unsupported      => { return error.Unsupported; }
+        error.TooLarge         => { return error.TooLarge; }
+        else                   => { return error.Corrupt; }
+    }
+}
 
 /// An image file format.
 pub enum Format: u8 {
@@ -157,13 +190,13 @@ pub fn from_extension(path: []u8) Format {
 
 /// Decodes an image in any supported format, of at most
 /// image.DEFAULT_MAX_PIXELS (else TooLarge).
-pub fn decode(data: []u8) !image.Image {
+pub fn decode(data: []u8) FormatsError!image.Image {
     return decode_with(data, image.DecodeOptions.default());
 }
 
 /// Decodes an image in any supported format, of at most opts.max_pixels
 /// (else TooLarge): raise it, up to image.MAX_PIXELS, for files you trust.
-pub fn decode_with(data: []u8, opts: image.DecodeOptions) !image.Image {
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) FormatsError!image.Image {
     let f = detect(data);
     if f == Format.PNG {
         return png.decode_with(data, opts);
@@ -215,7 +248,7 @@ pub fn decode_from_with(r: io.Reader, opts: image.DecodeOptions) !image.Image {
 }
 
 /// Encodes an image (free the result with mem.free).
-pub fn encode(img: *image.Image, format: Format, opts: Options) ![]mut u8 {
+pub fn encode(img: *image.Image, format: Format, opts: Options) image.ImageError![]mut u8 {
     if format == Format.PNG {
         return png.encode(img, opts.level);
     }
@@ -286,20 +319,22 @@ pub fn encode_to(w: io.Writer, img: *image.Image, format: Format, opts: Options)
 }
 
 /// Reads and decodes an image file (of at most image.DEFAULT_MAX_PIXELS).
-pub fn load(path: []u8) !image.Image {
+pub fn load(path: []u8) FormatsError!image.Image {
     return load_with(path, image.DecodeOptions.default());
 }
 
 /// Reads and decodes an image file, of at most opts.max_pixels.
-pub fn load_with(path: []u8, opts: image.DecodeOptions) !image.Image {
+pub fn load_with(path: []u8, opts: image.DecodeOptions) FormatsError!image.Image {
     let f = io.open(path)!;
     defer f.close();
-    return decode_from_with(f.reader(), opts);
+    let data = f.reader().read_all() catch |e| return to_io_error(e);
+    defer mem.free(data);
+    return decode_with(data, opts);
 }
 
 /// Encodes an image in the format its file name's extension names, and
 /// writes the file as it is encoded. If that fails, the file is removed.
-pub fn save(path: []u8, img: *image.Image, opts: Options) !void {
+pub fn save(path: []u8, img: *image.Image, opts: Options) SaveError!void {
     let format = from_extension(path);
     if format == Format.UNKNOWN {
         return error.Unsupported;
@@ -313,18 +348,18 @@ pub fn save(path: []u8, img: *image.Image, opts: Options) !void {
     f.close();
 }
 
-fn write_file(f: *io.File, img: *image.Image, format: Format, opts: Options) !void {
+fn write_file(f: *io.File, img: *image.Image, format: Format, opts: Options) SaveError!void {
     if (format == Format.TIFF) or (format == Format.EXR) {
         // their encode_to compresses twice (the offsets that come first need
         // the compressed sizes); in memory it is one pass
         let b = encode(img, format, opts)!;
         defer mem.free(b);
-        f.writer().write_all(b)!;
+        f.writer().write_all(b) catch |e| return to_io_error(e);
         return;
     }
     let mut bw = io.BufWriter.init(f.writer());
-    encode_to(bw.writer(), img, format, opts)!;
-    bw.flush()!;
+    encode_to(bw.writer(), img, format, opts) catch |e| return to_save_error(e);
+    bw.flush() catch |e| return to_io_error(e);
 }
 
 test "every format" {

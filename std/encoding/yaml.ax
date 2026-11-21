@@ -32,6 +32,7 @@
 import "../collections/arena.ax" as arena;
 import "../collections/map.ax" as maps;
 import "../collections/vec.ax" as vec;
+import "../diag.ax" as diag;
 import "../fmt.ax" as fmt;
 import "../hash.ax" as hash;
 import "../io.ax" as io;
@@ -344,6 +345,10 @@ nocopy struct Scanner {
 
     fn flow_in(self: *mut Scanner, mapping: bool) YamlError!void {
         if self.keys.len() > MAX_DEPTH {
+            if self.err.len == 0 {
+                self.err = "nesting too deep";
+                self.err_mark = self.m;
+            }
             return error.TooDeep;
         }
         self.keys.push(SimpleKey.{ possible: false, required: false, token_number: 0, mark: self.m })!;
@@ -369,6 +374,10 @@ nocopy struct Scanner {
         }
         if self.indent < column {
             if self.indents.len() > MAX_DEPTH {
+                if self.err.len == 0 {
+                    self.err = "nesting too deep";
+                    self.err_mark = mark;
+                }
                 return error.TooDeep;
             }
             // the white space before a block collection's first token
@@ -1390,6 +1399,10 @@ pub nocopy struct Events {
 
     fn push_state(self: *mut Events, s: State) YamlError!void {
         if self.states.len() > (2 * MAX_DEPTH) {
+            if self.sc.err.len == 0 {
+                self.sc.err = "nesting too deep";
+                self.sc.err_mark = self.sc.m;
+            }
             return error.TooDeep;
         }
         self.states.push(s)!;
@@ -1996,10 +2009,20 @@ nocopy struct Composer {
     total: u64,
     limit: u64,
     msg: []u8,
+    cur_mark: Mark,
+    doc_start: Mark,
+    err_mark: Mark,
+    has_err_mark: bool,
 
-    fn fail(self: *mut Composer, m: []u8, e: error) error {
+    fn fail(self: *mut Composer, m: []u8, e: YamlError) YamlError {
+        return self.fail_at(m, self.cur_mark, e);
+    }
+
+    fn fail_at(self: *mut Composer, m: []u8, mark: Mark, e: YamlError) YamlError {
         if self.msg.len == 0 {
             self.msg = m;
+            self.err_mark = mark;
+            self.has_err_mark = true;
         }
         return e;
     }
@@ -2007,7 +2030,7 @@ nocopy struct Composer {
     // Adds a finished value (of `size`: a node counts 1, and a scalar its
     // length more) to the current collection, or returns true when it is the
     // document's root.
-    fn add(self: *mut Composer, v: json.Value, size: u64, root: *mut json.Value) !bool {
+    fn add(self: *mut Composer, v: json.Value, size: u64, root: *mut json.Value) infer!bool {
         self.total = @add_checked(self.total, size) catch @max_value(u64);
         if self.total > self.limit {
             return self.fail("aliases expand beyond the size limit", error.TooLarge);
@@ -2038,14 +2061,14 @@ nocopy struct Composer {
         return false;
     }
 
-    fn remember(self: *mut Composer, anchor: []u8, v: json.Value, size: u64) YamlError!void {
+    fn remember(self: *mut Composer, anchor: []u8, v: json.Value, size: u64) infer!void {
         if anchor.len > 0 {
             self.anchors.put(anchor, Anchored.{ value: v, size: size })!;
         }
     }
 
     // The next document's root, or .none at the end of the stream.
-    fn document(self: *mut Composer) !?json.Value {
+    fn document(self: *mut Composer) infer!?json.Value {
         loop {
             let e = self.ev.next()! ?? return .none;
             if e.kind == EventKind.STREAM_START {
@@ -2055,6 +2078,8 @@ nocopy struct Composer {
                 return .none;
             }
             if e.kind == EventKind.DOCUMENT_START {
+                self.doc_start = e.start;
+                self.cur_mark = e.start;
                 break;
             }
         }
@@ -2062,6 +2087,7 @@ nocopy struct Composer {
         let mut root = json.Value.Null;
         loop {
             let e = self.ev.next()! ?? return self.fail("expected the end of the document", error.SyntaxError);
+            self.cur_mark = e.start;
             match e.kind {
                 .ALIAS => {
                     let a = self.anchors.get(e.anchor) ?? return self.fail(
@@ -2138,7 +2164,7 @@ nocopy struct Composer {
     }
 }
 
-fn scalar_text(a: *mut arena.Arena, v: json.Value, s: []u8) ![]u8 {
+fn scalar_text(a: *mut arena.Arena, v: json.Value, s: []u8) infer![]u8 {
     match v {
         .String(x) => { return x; }
         .Null      => { return ""; }
@@ -2150,11 +2176,12 @@ fn scalar_text(a: *mut arena.Arena, v: json.Value, s: []u8) ![]u8 {
         }
         .Int(i) => {
             let mut buf: [24]u8 = [0; 24];
-            return a.dup(fmt.bufprint(buf[..], "{}", [fmt.int(i)])!);
+            return a.dup(fmt.format_int(buf[..], i));
         }
         .Float(x) => {
             let mut buf: [40]u8 = [0; 40];
-            return a.dup(fmt.format_float(buf[..], x)!);
+            let t = fmt.format_float(buf[..], x) catch return error.NoSpaceLeft;
+            return a.dup(t);
         }
         else => { return s; }
     }
@@ -2193,7 +2220,7 @@ fn has_duplicates(ms: []json.Member) bool {
 let CORE: []u8 = "tag:yaml.org,2002:";
 
 // A scalar's value under the core schema (or its tag).
-fn resolve(a: *mut arena.Arena, e: Event) YamlError!json.Value {
+fn resolve(a: *mut arena.Arena, e: Event) infer!json.Value {
     let s = e.value;
     let t = e.tag;
     if strs.starts_with(t, CORE) {
@@ -2351,10 +2378,11 @@ fn is_float(s: []u8) bool {
     return i == s.len;
 }
 
-fn compose_all(text: []u8, a: *mut arena.Arena, docs: *mut vec.Vec.[json.Value], info: *mut ErrorInfo,
-               one: bool) !void {
+fn compose_all_diag(text: []u8, a: *mut arena.Arena, docs: *mut vec.Vec.[json.Value], info: *mut diag.ErrorInfo,
+                    one: bool) infer!void {
     let mut ev = Events.with_arena(text, a);
     defer ev.deinit();
+    let zero_mark = Mark.{ index: 0, line: 0, column: 0 };
     let mut c = Composer.{
         ev: &mut ev,
         ar: a,
@@ -2363,6 +2391,10 @@ fn compose_all(text: []u8, a: *mut arena.Arena, docs: *mut vec.Vec.[json.Value],
         total: 0,
         limit: (100 * @as(u64, text.len)) + 100000,
         msg: "",
+        cur_mark: zero_mark,
+        doc_start: zero_mark,
+        err_mark: zero_mark,
+        has_err_mark: false,
     };
     defer c.anchors.deinit();
     let r = compose_loop(&mut c, docs, one);
@@ -2373,25 +2405,31 @@ fn compose_all(text: []u8, a: *mut arena.Arena, docs: *mut vec.Vec.[json.Value],
     c.frames.deinit();
     r catch |e| {
         let mut m = ev.error_mark();
-        info.message = ev.error_message();
-        if info.message.len == 0 {
-            info.message = c.msg;
-            m = ev.sc.m;
+        let mut msg = ev.error_message();
+        if msg.len == 0 {
+            msg = c.msg;
+            if c.has_err_mark {
+                m = c.err_mark;
+            } else {
+                m = ev.sc.m;
+            }
         }
-        if (info.message.len == 0) and (e == error.TooDeep) {
-            info.message = "nesting too deep";
+        if (msg.len == 0) and (e == error.TooDeep) {
+            msg = "nesting too deep";
         }
-        info.line = m.line + 1;
-        info.column = m.column + 1;
+        if (msg.len == 0) and (e == error.OutOfMemory) {
+            msg = "out of memory";
+        }
+        info.* = diag.ErrorInfo.at(m.index, m.line + 1, m.column + 1, msg);
         return e;
     };
 }
 
-fn compose_loop(c: *mut Composer, docs: *mut vec.Vec.[json.Value], one: bool) !void {
+fn compose_loop(c: *mut Composer, docs: *mut vec.Vec.[json.Value], one: bool) infer!void {
     loop {
         let v = c.document()! ?? return;
         if one and (docs.len() == 1) {
-            return c.fail("more than one document", error.MultipleDocuments);
+            return c.fail_at("more than one document", c.doc_start, error.MultipleDocuments);
         }
         docs.push(v)!;
     }
@@ -2399,16 +2437,30 @@ fn compose_loop(c: *mut Composer, docs: *mut vec.Vec.[json.Value], one: bool) !v
 
 /// Parses a stream holding (at most) one document; an empty stream gives
 /// null. MultipleDocuments if there are more.
-pub fn parse(text: []u8) !Document {
+pub fn parse(text: []u8) YamlError!Document {
     let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
     return parse_with(text, &mut info);
 }
 
-pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) YamlError!Document {
+    let mut dinfo = diag.ErrorInfo.init();
+    let d = parse_diag(text, &mut dinfo) catch |e| {
+        info.line = dinfo.line;
+        info.column = dinfo.col;
+        info.message = dinfo.detail;
+        return e;
+    };
+    return d;
+}
+
+/// Parses a stream holding (at most) one document; on failure fills `info`
+/// with byte offset, 1-based line and column, and detail.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) YamlError!Document {
+    info.* = diag.ErrorInfo.init();
     let mut d = Document.{ root: json.Value.Null, arena: arena.Arena.init() };
     let mut docs = vec.Vec.[json.Value].init();
     defer docs.deinit();
-    compose_all(text, &mut d.arena, &mut docs, info, true) catch |e| {
+    compose_all_diag(text, &mut d.arena, &mut docs, info, true) catch |e| {
         d.arena.deinit();
         return e;
     };
@@ -2419,20 +2471,35 @@ pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
 }
 
 /// Parses every document of a stream.
-pub fn parse_all(text: []u8) !Stream {
+pub fn parse_all(text: []u8) YamlError!Stream {
     let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
     return parse_all_with(text, &mut info);
 }
 
-pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) !Stream {
+pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) YamlError!Stream {
+    let mut dinfo = diag.ErrorInfo.init();
+    let s = parse_all_diag(text, &mut dinfo) catch |e| {
+        info.line = dinfo.line;
+        info.column = dinfo.col;
+        info.message = dinfo.detail;
+        return e;
+    };
+    return s;
+}
+
+/// Parses every document of a stream; on failure fills `info` with byte
+/// offset, 1-based line and column, and detail.
+pub fn parse_all_diag(text: []u8, info: *mut diag.ErrorInfo) YamlError!Stream {
+    info.* = diag.ErrorInfo.init();
     let mut s = Stream.{ documents: [], arena: arena.Arena.init() };
     let mut docs = vec.Vec.[json.Value].init();
     defer docs.deinit();
-    compose_all(text, &mut s.arena, &mut docs, info, false) catch |e| {
+    compose_all_diag(text, &mut s.arena, &mut docs, info, false) catch |e| {
         s.arena.deinit();
         return e;
     };
     s.documents = s.arena.copy.[json.Value](docs.items()) catch |e| {
+        info.* = diag.ErrorInfo.at(text.len, 1, 1, "out of memory");
         s.arena.deinit();
         return e;
     };
@@ -2443,13 +2510,29 @@ pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) !Stream {
 // Writing
 // -----------------------------------------------------------------------------
 
+fn to_yaml_write_error(e: error) YamlError {
+    if e == error.TooDeep {
+        return error.TooDeep;
+    }
+    if e == error.OutOfMemory {
+        return error.OutOfMemory;
+    }
+    if e == error.NoSpaceLeft {
+        return error.NoSpaceLeft;
+    }
+    if e == error.BadFormat {
+        return error.BadFormat;
+    }
+    return error.IoError;
+}
+
 /// A value as block-style YAML (free it with mem.free). Strings are plain
 /// when that reads back as the same string, and double-quoted otherwise.
-pub fn stringify(v: json.Value) ![]mut u8 {
+pub fn stringify(v: json.Value) YamlError![]mut u8 {
     let mut s = strs.String.init();
     stringify_to(s.writer(), v) catch |e| {
         s.deinit();
-        return e;
+        return to_yaml_write_error(e);
     };
     return s.take();
 }
@@ -2524,7 +2607,11 @@ fn write_block(w: io.Writer, v: json.Value, ind: usize, depth: usize) !void {
                 w.write_all("false\n")!;
             }
         }
-        .Int(i) => { fmt.write(w, "{}\n", [fmt.int(i)])!; }
+        .Int(i) => {
+            let mut buf: [32]u8 = [0; 32];
+            w.write_all(fmt.format_int(buf[..], i))!;
+            w.write_all("\n")!;
+        }
         .Float(x) => {
             if x != x {
                 w.write_all(".nan\n")!;
@@ -2534,7 +2621,7 @@ fn write_block(w: io.Writer, v: json.Value, ind: usize, depth: usize) !void {
                 w.write_all("-.inf\n")!;
             } else {
                 let mut buf: [40]u8 = [0; 40];
-                let t = fmt.format_float(buf[..], x)!;
+                let t = fmt.format_float(buf[..], x) catch return error.NoSpaceLeft;
                 w.write_all(t)!;
                 if (strs.index_of_any(t, ".eE") ?? 999) == 999 {
                     w.write_all(".0")!;
@@ -2745,7 +2832,7 @@ fn fails(r: !void) bool {
 }
 
 // The top-level JSON values of text (the suite's in.json holds one per document).
-fn json_values(text: []u8, out: *mut vec.Vec.[[]u8]) YamlError!void {
+fn json_values(text: []u8, out: *mut vec.Vec.[[]u8]) infer!void {
     let mut i: usize = 0;
     while i < text.len {
         while (i < text.len) and ((text[i] == ' ') or (text[i] == '\n') or (text[i] == '\t') or (text[i] == '\r')) {
@@ -3038,4 +3125,83 @@ test "writing long keys, byte order marks and C1 controls" {
     @expect(strs.contains(out, "  jjj"));
     @expect(not strs.contains(out, "? jjj"));
     @expect(strs.contains(out, "  ? \u{e9}"));
+}
+
+fn parse_diag_err(text: []u8, info: *mut diag.ErrorInfo) ?YamlError {
+    let mut d = parse_diag(text, info) catch |e| {
+        return .some(e);
+    };
+    d.deinit();
+    return .none;
+}
+
+fn parse_all_diag_err(text: []u8, info: *mut diag.ErrorInfo) ?YamlError {
+    let mut s = parse_all_diag(text, info) catch |e| {
+        return .some(e);
+    };
+    s.deinit();
+    return .none;
+}
+
+test "parse_diag, parse_all_diag and narrowed stringify" {
+    let mut info = diag.ErrorInfo.at(99, 9, 9, "stale");
+    let mut ok = parse_diag("a: 1\nb: 2\n", &mut info)!;
+    defer ok.deinit();
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
+
+    let e1 = parse_diag_err("a: 1\nb: [1, 2\n", &mut info) ?? @trap();
+    @expect_eq(e1, error.SyntaxError);
+    @expect(info.offset >= 7);
+    @expect(info.line >= 2);
+    @expect(info.col >= 1);
+    @expect(info.detail.len > 0);
+
+    let e2 = parse_diag_err("--- 1\n--- 2\n", &mut info) ?? @trap();
+    @expect_eq(e2, error.MultipleDocuments);
+    @expect_eq(info.offset, 6);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 1);
+    @expect_eq(info.detail, "more than one document");
+
+    let e3 = parse_diag_err("a: 1\nx: !!int abc\n", &mut info) ?? @trap();
+    @expect_eq(e3, error.WrongType);
+    @expect_eq(info.offset, 8);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 4);
+    @expect_eq(info.detail, "a scalar does not match its tag");
+
+    info = diag.ErrorInfo.at(77, 7, 7, "stale");
+    let mut st = parse_all_diag("--- 1\n--- 2\n", &mut info)!;
+    defer st.deinit();
+    @expect_eq(st.documents.len, 2);
+    @expect_eq(info.offset, 0);
+    @expect_eq(info.line, 0);
+    @expect_eq(info.col, 0);
+    @expect_eq(info.detail, "");
+
+    let e4 = parse_all_diag_err("--- 1\n--- *nope\n", &mut info) ?? @trap();
+    @expect_eq(e4, error.SyntaxError);
+    @expect_eq(info.offset, 10);
+    @expect_eq(info.line, 2);
+    @expect_eq(info.col, 5);
+    @expect_eq(info.detail, "an alias to an unknown anchor");
+
+    // stringify preserves TooDeep when value exceeds MAX_DEPTH
+    let mut cells: [520]json.Value = [json.Value.Null; 520];
+    let mut cur = json.Value.Null;
+    for i in @as(usize, 0)..520 {
+        cells[i] = cur;
+        cur = json.Value.Array(cells[i..i + 1]);
+    }
+    let mut deep_failed = false;
+    let out = stringify(cur) catch |e| {
+        @expect_eq(e, error.TooDeep);
+        deep_failed = true;
+        return;
+    };
+    mem.free(out);
+    @expect(deep_failed);
 }
