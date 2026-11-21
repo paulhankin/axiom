@@ -167,10 +167,21 @@ static TypeExpr *new_te(TEKind k, Span sp) {
     return t;
 }
 
+static bool at_field(Parser *P) {
+    if (pk(P) == KW_PUB) {
+        Token *t2 = peek2(P);
+        if (t2->kind != TK_IDENT) return false;
+        if (!strcmp(t2->name, "inline") && peek3(P)->kind == KW_FN) return false;
+        return true;
+    }
+    return pk(P) == TK_IDENT && !at_inline(P);
+}
+
 static void parse_field_list(Parser *P, FieldVec *out) {
     // Field ( "," Field )* ","?
-    while (pk(P) == TK_IDENT && !at_inline(P)) {
+    while (at_field(P)) {
         Field f = {0};
+        f.is_pub = accept(P, KW_PUB);
         f.name = expect_ident(P, &f.span);
         expect(P, TK_COLON);
         f.te = parse_type(P);

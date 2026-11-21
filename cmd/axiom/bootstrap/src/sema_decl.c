@@ -1230,6 +1230,8 @@ Decl *expected_set(Type *t) {
 // The function E0355 was last reported for.
 static Decl *self_dep;
 
+static bool is_const_init(Expr *e);
+
 void resolve_decl(Decl *d) {
     if (d->state == 2) return;
     if (d->state == 1) {
@@ -1279,8 +1281,9 @@ void resolve_decl(Decl *d) {
         TypeCtx tc = {d->module, NULL, NULL, NULL};
         d->type = resolve_type(d->te, &tc);
         if (d->type->kind != TY_INT && d->type->kind != TY_FLOAT && d->type->kind != TY_BOOL &&
-            d->type->kind != TY_ENUM && d->type->kind != TY_INVALID) {
-            diag_error(d->te->span, "E0352", "constants must have an integer, float, bool or enum type, found %s",
+            d->type->kind != TY_ENUM && d->type->kind != TY_STRUCT && d->type->kind != TY_INVALID) {
+            diag_error(d->te->span, "E0352",
+                       "constants must have an integer, float, bool, enum or struct type, found %s",
                        type_str(d->type));
             d->type = t_invalid;
         }
@@ -1290,8 +1293,9 @@ void resolve_decl(Decl *d) {
         check_expr_to(&d->init, d->type);
         C = saved;
         d->cexpr = d->init;
-        if (!d->init->is_const && d->init->kind != E_BOOL && d->type->kind != TY_INVALID &&
-            d->init->type->kind != TY_INVALID)
+        bool ok_const = d->type->kind == TY_STRUCT ? is_const_init(d->init)
+                                                   : (d->init->is_const || d->init->kind == E_BOOL);
+        if (!ok_const && d->type->kind != TY_INVALID && d->init->type->kind != TY_INVALID)
             diag_error(d->init->span, "E0350", "constant initializer must be a constant expression");
         break;
     }
@@ -1368,7 +1372,9 @@ static bool is_const_init(Expr *e) {
         return true;
     case E_FIELD:
         return e->op == FK_VARIANT_UNIT || e->op == FK_CONST || (e->op == FK_DECL && e->decl && e->decl->kind == D_FN);
-    case E_IDENT: return e->cat == CAT_VALUE && e->decl && e->decl->kind == D_FN && e->type->kind == TY_FN;
+    case E_IDENT:
+        return e->cat == CAT_VALUE && e->decl &&
+               ((e->decl->kind == D_FN && e->type->kind == TY_FN) || e->decl->kind == D_CONST);
     case E_CALL: return e->op == CALLK_VARIANT && e->args.len == 1 && is_const_init(e->args.data[0]);
     case E_BUILTIN: return e->index == BI_PTR_FROM_INT && e->bargs.len == 2 && is_const_init(e->bargs.data[1].e);
     case E_UNARY: return e->op == TK_MINUS && is_const_init(e->a) && e->a->kind == E_FLOAT;

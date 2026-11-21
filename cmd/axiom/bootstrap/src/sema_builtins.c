@@ -36,8 +36,8 @@ static bool is_unsigned_int_like(Type *t) {
 }
 static Type *make_pair_struct(Span sp, const char *n0, Type *t0, const char *n1, Type *t1) {
     FieldVec fv = {0};
-    Field f0 = {.name = intern_cstr(n0), .span = sp, .type = t0};
-    Field f1 = {.name = intern_cstr(n1), .span = sp, .type = t1};
+    Field f0 = {.name = intern_cstr(n0), .span = sp, .type = t0, .is_pub = true};
+    Field f1 = {.name = intern_cstr(n1), .span = sp, .type = t1, .is_pub = true};
     vec_push(fv, f0);
     vec_push(fv, f1);
     Decl *d = anon_struct_decl(NULL, fv, sp);

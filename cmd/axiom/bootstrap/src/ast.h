@@ -37,6 +37,7 @@ typedef struct Field {
     TypeExpr *te;
     Span span;
     Type *type;
+    bool is_pub;
 } Field;
 
 typedef Vec(TypeExpr *) TypeExprVec;

@@ -1318,9 +1318,11 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
             LLVMValueRef el[2] = {tag, LLVMConstNull(LLVMStructGetTypeAtIndex(ut, 1))};
             return LLVMConstNamedStruct(ut, el, 2);
         }
+        if (e->op == FK_CONST && e->decl && e->decl->cexpr) return gen_const(e->decl->cexpr, t);
         if (e->op == FK_DECL && e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         break;
     case E_IDENT:
+        if (e->decl && e->decl->kind == D_CONST && e->decl->cexpr) return gen_const(e->decl->cexpr, t);
         if (e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         if (e->decl && e->decl->kind == D_HOST_FN) return get_inst(e->decl, NULL, 0)->fn;
         break;

@@ -1019,6 +1019,13 @@ static void check_method_visible(Expr *e, Decl *m) {
     }
 }
 
+static void check_field_visible(Span use_sp, Decl *base_decl, Field *f) {
+    if (!base_decl->anon && !f->is_pub && base_decl->module != C->tc.mod) {
+        Diag *dg = diag_error(use_sp, "E0203", "'%s' is not public", f->name);
+        diag_note(dg, f->span, "declared here");
+    }
+}
+
 static Type *check_field(Expr *e) {
     Expr *a = e->a;
     check_operand(a, NULL);
@@ -1113,6 +1120,7 @@ static Type *check_field(Expr *e) {
     if (base->kind == TY_STRUCT) {
         int fi = find_field(base->decl, name);
         if (fi >= 0) {
+            check_field_visible(e->name_span, base->decl, &base->decl->fields.data[fi]);
             e->op = FK_STRUCT;
             e->index = fi;
             Type *ft = type_field(base, fi);
@@ -1547,7 +1555,27 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
     bool order_ok = e->inits.len == nf;
     for (int i = 0; i < e->inits.len && order_ok; i++)
         if (e->inits.data[i].name != d->fields.data[i].name) order_ok = false;
-    if (!order_ok) {
+    bool priv_missing = false;
+    if (!order_ok && !d->anon && d->module != C->tc.mod) {
+        for (int i = 0; i < nf; i++) {
+            if (d->fields.data[i].is_pub) continue;
+            bool present = false;
+            for (int j = 0; j < e->inits.len; j++) {
+                if (e->inits.data[j].name == d->fields.data[i].name) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                Diag *dg = diag_error(e->span, "E0203", "cannot construct %s: field '%s' is not public", type_str(t),
+                                      d->fields.data[i].name);
+                diag_note(dg, d->fields.data[i].span, "declared here");
+                priv_missing = true;
+                break;
+            }
+        }
+    }
+    if (!order_ok && !priv_missing) {
         // Build a helpful message: expected field order.
         CharVec b = {0};
         for (int i = 0; i < nf; i++) {
@@ -1603,6 +1631,7 @@ static Type *check_struct_lit(Expr *e, Type *expected) {
             check_expr(fi->value, NULL);
             continue;
         }
+        check_field_visible(fi->span, d, &d->fields.data[idx]);
         check_expr_to(&fi->value, type_field(t, idx));
     }
     e->tval = t;

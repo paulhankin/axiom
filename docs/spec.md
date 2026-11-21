@@ -232,7 +232,7 @@ GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ```ebnf
 StructDecl    ::= "struct" IDENT GenericParams? "{" FieldList? MethodDecl* "}"
 FieldList     ::= Field ( "," Field )* ","?
-Field         ::= IDENT ":" Type
+Field         ::= "pub"? IDENT ":" Type
 
 UnionDecl     ::= "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
 Variant       ::= IDENT ( ":" Type )?
@@ -253,11 +253,12 @@ Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "
                 | ( "FloatVector" | "IntVector" | "Vector" ) "[" Type "]"
 ```
 
-The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
-anything else ends the list. The FIRST sets of `Field` (`IDENT`) and `MethodDecl`
-(`pub`, `fn`) are disjoint, except for `inline`, an identifier: `inline` followed by
-`fn` begins a method, which takes one more token of lookahead (as `threadlocal let`
-does).
+The trailing-comma forms are LL(1). After a `,`, `pub` followed by an `IDENT` (other than
+`inline` before `fn`), or an `IDENT` other than `inline` before `fn`, begins another
+`Field`; anything else ends the list. The FIRST sets of `Field` (`pub`, `IDENT`) and
+`MethodDecl` (`pub`, `fn`) share `pub` and `inline`, which is resolved by one or two
+tokens of lookahead (`pub fn`, `pub inline fn`, `inline fn` begin methods, whereas
+`pub IDENT :`, `IDENT :` begin fields).
 
 ### 3.3 Types
 
@@ -416,9 +417,11 @@ Import cycles are a compile error (`E0210`) in v0.1.
 
 ### 4.2 Visibility
 
-- `pub` makes a top-level item, or a method, visible to importing modules.
-- Struct and union **fields** are visible wherever the type is visible. v0.1 has no field
-  privacy.
+- `pub` makes a top-level item, a method, or a struct field visible to importing modules.
+- Named struct fields without `pub` are private to their declaring module; accessing or
+  constructing a non-`pub` field from another module is `E0203`. Anonymous struct
+  (`struct { ... }`) fields and union variants remain visible wherever their type is
+  visible.
 - `export` makes a function a WebAssembly export (§14.2). An exported function is not
   automatically `pub`.
 
@@ -2742,7 +2745,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0150 | Operators require parentheses (§7.4) |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
-| E0203 | Item is not public |
+| E0203 | Item, method, or field is not public |
 | E0204 | Shadowing |
 | E0205 | `Self` outside a struct or union |
 | E0206 | A reserved constraint name (`Ord`, `Num`, …) used as a generic parameter |
@@ -2770,7 +2773,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0315 | `noalias` on a parameter whose type is not a pointer or slice (§3.2, §12.1) |
 | E0350 | A `const`, global or array-repeat count that is not a constant expression |
 | E0351 | A `const` whose value depends on itself |
-| E0352 | A `const` of a type other than integer, float, bool or enum |
+| E0352 | A `const` of a type other than integer, float, bool, enum or struct |
 | E0353 | A `const` union value with a payload (not supported yet) |
 | E0354 | Thread-local global without `mut` |
 | E0355 | A function called in its own signature (a parameter's type, say), directly or through others |

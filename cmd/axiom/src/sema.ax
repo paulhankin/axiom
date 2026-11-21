@@ -16,10 +16,10 @@ import "types.ax" as ty;
 import "util.ax" as u;
 
 pub struct SemaOptions {
-    std_dir: []u8,
+    pub std_dir: []u8,
     // Extra modules to load after the root (axiom test <package> loads
     // every source file of the package).
-    extra_files: [][]u8,
+    pub extra_files: [][]u8,
 }
 
 // Context for resolving type expressions: which generic parameters and
@@ -1501,9 +1501,9 @@ fn resolve_decl(d: *mut ast.Decl) void {
         d.ty = resolve_type(d.te, &mut tc2);
         let dk = d.ty.kind;
         if (dk != ast.TY_INT) and (dk != ast.TY_FLOAT) and (dk != ast.TY_BOOL) and (dk != ast.TY_ENUM) and
-           (dk != ast.TY_INVALID) {
-            _ = dg.err(d.te.span, "E0352", u.f1("constants must have an integer, float, bool or enum type, found %s",
-                                                tstr(d.ty)));
+           (dk != ast.TY_STRUCT) and (dk != ast.TY_INVALID) {
+            _ = dg.err(d.te.span, "E0352",
+                       u.f1("constants must have an integer, float, bool, enum or struct type, found %s", tstr(d.ty)));
             d.ty = ty.t_invalid;
         }
         let mut ctx = fn_ctx(tc);
@@ -1513,8 +1513,11 @@ fn resolve_decl(d: *mut ast.Decl) void {
         _ = check_expr_to(&mut d.init, d.ty);
         C = saved;
         d.cexpr = d.init;
-        if not d.init.is_const and (d.init.kind != ast.E_BOOL) and (d.ty.kind != ast.TY_INVALID) and
-           (d.init.ty.kind != ast.TY_INVALID) {
+        let mut ok_const = d.init.is_const or (d.init.kind == ast.E_BOOL);
+        if d.ty.kind == ast.TY_STRUCT {
+            ok_const = is_const_init(d.init);
+        }
+        if not ok_const and (d.ty.kind != ast.TY_INVALID) and (d.init.ty.kind != ast.TY_INVALID) {
             _ = dg.err(d.init.span, "E0350", "constant initializer must be a constant expression");
         }
     } else if (k == ast.D_ERROR) and not u.isnos(d.name) {
@@ -1623,8 +1626,9 @@ fn is_const_init(e: *mut ast.Expr) bool {
                 (ast.decl_of(e).kind == ast.D_FN));
     }
     if k == ast.E_IDENT {
-        return (e.cat == ast.CAT_VALUE) and u.notnil(ast.decl_of(e)) and (ast.decl_of(e).kind == ast.D_FN) and
-               (e.ty.kind == ast.TY_FN);
+        return (e.cat == ast.CAT_VALUE) and u.notnil(ast.decl_of(e)) and
+               (((ast.decl_of(e).kind == ast.D_FN) and (e.ty.kind == ast.TY_FN)) or
+                (ast.decl_of(e).kind == ast.D_CONST));
     }
     if k == ast.E_CALL {
         return (ast.call_kind_of(e) == ast.CALLK_VARIANT) and (ast.args_of(e).len == 1) and
@@ -3038,6 +3042,15 @@ fn check_method_visible(e: *mut ast.Expr, m: *mut ast.Decl) void {
     }
 }
 
+// A named struct's field is visible outside its module only if it is `pub`
+// (spec §4.2).
+fn check_field_visible(use_sp: u.Span, base_decl: *ast.Decl, f: *ast.Field) void {
+    if not base_decl.anon and not f.is_pub and (base_decl.module != C.tc.mod) {
+        let g = dg.err(use_sp, "E0203", u.f1("'%s' is not public", f.name));
+        dg.note(g, f.span, "declared here");
+    }
+}
+
 fn check_field(e: *mut ast.Expr) *mut ast.Type {
     let a = e.a;
     _ = check_operand(a, tnil());
@@ -3130,6 +3143,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
     if base.kind == ast.TY_STRUCT {
         let fi = sb.find_field(base.decl, name);
         if fi >= 0 {
+            check_field_visible(ast.name_span_of(e), base.decl, base.decl.fields.at(@int_cast(usize, fi)));
             ast.set_field_kind(e, ast.FK_STRUCT);
             ast.set_index(e, fi);
             let mut ft = ty.type_field(base, @int_cast(usize, fi));
@@ -3739,7 +3753,30 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             order_ok = false;
         }
     }
-    if not order_ok {
+    let mut priv_missing = false;
+    if not d.anon and (d.module != C.tc.mod) {
+        for i in 0..nf {
+            let f = d.fields.at(i);
+            if f.is_pub {
+                continue;
+            }
+            let mut given = false;
+            for j in 0..ast.more(e).inits.len {
+                if u.same(ast.more(e).inits.at(j).name, f.name) {
+                    given = true;
+                    break;
+                }
+            }
+            if not given {
+                let dg2 = dg.err(e.span, "E0203", u.f2("cannot construct %s: field '%s' is not public", tstr(t),
+                                                       f.name));
+                dg.note(dg2, f.span, "declared here");
+                priv_missing = true;
+                break;
+            }
+        }
+    }
+    if not priv_missing and not order_ok {
         // Build a helpful message: expected field order.
         let mut b = u.Buf.init();
         for i in 0..nf {
@@ -3803,6 +3840,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             _ = check_expr(fi.value, tnil());
             continue;
         }
+        check_field_visible(fi.span, d, d.fields.at(@int_cast(usize, idx)));
         _ = check_expr_to(&mut fi.value, ty.type_field(t, @int_cast(usize, idx)));
     }
     ast.set_tval(e, t);
