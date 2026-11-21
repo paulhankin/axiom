@@ -93,7 +93,7 @@ struct Set {
 
     /// Sorts and merges overlapping and adjacent ranges.
     fn normalize(self: *mut Set) void {
-        let xs = self.rs.items();
+        let xs = self.rs.items_mut();
         if xs.len < 2 {
             return;
         }
@@ -1978,11 +1978,17 @@ struct Dfa {
     }
 }
 
+// DfaCache is heap-allocated interior-mutable state guarded by `cache.lock` so
+// compiled Regex values remain shareable across threads via `*Regex`.
+fn dfa_cache(re: *Regex) *mut DfaCache {
+    return @ptr_from_int(*mut DfaCache, @int_from_ptr(re.cache));
+}
+
 /// Where the leftmost-first match starting at or after pos ends, -1 if
 /// there is none, or GAVE_UP if the DFA grew too big.
 fn dfa_forward(re: *Regex, text: []u8, pos: usize, earliest: bool) i64 {
     let prog = re.prog.items();
-    let d = &mut re.cache.fwd;
+    let d = &mut dfa_cache(re).fwd;
     d.ensure(prog.len) catch return GAVE_UP;
     let start = d.start_state(prog) catch {
         d.reset();
@@ -2041,7 +2047,7 @@ fn dfa_forward(re: *Regex, text: []u8, pos: usize, earliest: bool) i64 {
 /// ending at `end`.
 fn dfa_reverse(re: *Regex, text: []u8, pos: usize, end: usize) i64 {
     let prog = re.rprog.items();
-    let d = &mut re.cache.rev;
+    let d = &mut dfa_cache(re).rev;
     d.ensure(prog.len) catch return GAVE_UP;
     let mut si = d.start_state(prog) catch {
         d.reset();
@@ -2088,10 +2094,11 @@ fn dfa_find(re: *Regex, text: []u8, pos: usize, m: *mut Match, earliest: bool) i
     if not re.use_dfa {
         return -1;
     }
-    if not re.cache.lock.try_lock() {
+    let cache = dfa_cache(re);
+    if not cache.lock.try_lock() {
         return -1;  // in use by another thread
     }
-    defer re.cache.lock.unlock();
+    defer cache.lock.unlock();
     let e = dfa_forward(re, text, pos, earliest);
     if e == GAVE_UP {
         return -1;

@@ -48,6 +48,7 @@ struct FnCtx {
     loop_breaks: u.List.[bool],  // per enclosing loop: has a break targeting it
     loop_labels: u.List.[[]u8],  // per enclosing loop: its label, or an empty string
     const_ctx: bool,
+    in_return: bool,
 }
 
 threadlocal let mut C: *mut FnCtx = @ptr_from_int(*mut FnCtx, 0);
@@ -73,6 +74,7 @@ fn fn_ctx(tc: TypeCtx) FnCtx {
         loop_breaks: u.List.[bool].empty(),
         loop_labels: u.List.[[]u8].empty(),
         const_ctx: false,
+        in_return: false,
     };
 }
 
@@ -230,7 +232,7 @@ fn assign_error_codes() void {
             }
         }
     }
-    u.sort(names.items(), sym_cmp);
+    u.sort(names.items_mut(), sym_cmp);
     for i in 0..names.len {
         modl.g_prog.error_names.push(names.get(i));
         modl.g_prog.error_codes.put(names.get(i), @int_cast(i32, i) + 1);
@@ -289,7 +291,7 @@ fn ensure_gparams(d: *mut ast.Decl) void {
         gfn = d;
     }
     for i in 0..d.gparams.len {
-        let g = d.gparams.at(i);
+        let g = d.gparams.at_mut(i);
         if u.notnil(g.ty) {
             continue;
         }
@@ -364,7 +366,7 @@ fn decl_gparam_types(d: *mut ast.Decl) []mut *mut ast.Type {
     ensure_gparams(d);
     let ts = u.newn.[*mut ast.Type](d.gparams.len);
     for i in 0..d.gparams.len {
-        ts[i] = d.gparams.at(i).ty;
+        ts[i] = d.gparams.at_mut(i).ty;
     }
     return ts;
 }
@@ -373,7 +375,7 @@ fn make_self_type(d: *mut ast.Decl) *mut ast.Type {
     return ty.type_named(d, decl_gparam_types(d));
 }
 
-fn lookup_gparam(tc: *TypeCtx, name: []u8) *mut ast.Type {
+fn lookup_gparam(tc: *mut TypeCtx, name: []u8) *mut ast.Type {
     let ds = [tc.gfn, tc.gowner];
     for d in ds {
         if u.isnil(d) {
@@ -382,7 +384,7 @@ fn lookup_gparam(tc: *TypeCtx, name: []u8) *mut ast.Type {
         ensure_gparams(d);
         for i in 0..d.gparams.len {
             if u.same(d.gparams.at(i).name, name) {
-                return d.gparams.at(i).ty;
+                return d.gparams.at_mut(i).ty;
             }
         }
     }
@@ -691,12 +693,12 @@ fn check_generic_args_ctx(d: *mut ast.Decl, owner_args: []mut *mut ast.Type, arg
     let from = u.newn.[*mut ast.Type](nowner + n);
     let to = u.newn.[*mut ast.Type](nowner + n);
     for j in 0..nowner {
-        from[j] = d.owner.gparams.at(j).ty;
+        from[j] = d.owner.gparams.at_mut(j).ty;
         to[j] = owner_args[j];
     }
     let mut ok = true;
     for i in 0..n {
-        let g = d.gparams.at(i);
+        let g = d.gparams.at_mut(i);
         let a = args[i];
         from[nowner + i] = g.ty;
         to[nowner + i] = a;
@@ -1061,10 +1063,10 @@ fn resolve_fn(d: *mut ast.Decl) void {
     }
     d.all_gparams = u.newn.[*mut ast.Type](nown + d.gparams.len);
     for i in 0..nown {
-        d.all_gparams[i] = owner.gparams.at(i).ty;
+        d.all_gparams[i] = owner.gparams.at_mut(i).ty;
     }
     for i in 0..d.gparams.len {
-        d.all_gparams[nown + i] = d.gparams.at(i).ty;
+        d.all_gparams[nown + i] = d.gparams.at_mut(i).ty;
     }
     let mut oself = tnil();
     if u.notnil(owner) {
@@ -1073,7 +1075,7 @@ fn resolve_fn(d: *mut ast.Decl) void {
     let mut tc = type_ctx(d.module, owner, d, oself);
     d.param_types = u.newn.[*mut ast.Type](d.params.len);
     for i in 0..d.params.len {
-        let p = d.params.at(i);
+        let p = d.params.at_mut(i);
         p.local = u.nil.[ast.Local]();
         d.param_types[i] = resolve_type(p.te, &mut tc);
         if d.param_types[i].kind == ast.TY_VOID {
@@ -1244,7 +1246,7 @@ fn resolve_enum(d: *mut ast.Decl) void {
     let mut lo = u.I128.zero();
     let mut hi = u.I128.zero();
     for i in 0..d.variants.len {
-        let v = d.variants.at(i);
+        let v = d.variants.at_mut(i);
         if not v.has_value {
             v.value = next;
         }
@@ -1283,7 +1285,7 @@ fn resolve_enum(d: *mut ast.Decl) void {
     }
     let r = ty.int_range(repr);
     for i in 0..d.variants.len {
-        let v = d.variants.at(i);
+        let v = d.variants.at_mut(i);
         if v.value.lt(r.lo) or v.value.gt(r.hi) {
             _ = dg.err(pick_span(v.has_value, v.value_span, v.span), "E0503",
                        u.f2("the value of '%s' does not fit in %s", v.name, tstr(repr)));
@@ -1464,7 +1466,7 @@ fn resolve_decl(d: *mut ast.Decl) void {
         let mut tc = type_ctx(d.module, d, dnil(), d.ty);
         d.state = ast.DeclState.DONE;  // fields may refer to Self through pointers
         for i in 0..d.fields.len {
-            let f = d.fields.at(i);
+            let f = d.fields.at_mut(i);
             f.ty = resolve_type(f.te, &mut tc);
             if f.ty.kind == ast.TY_VOID {
                 _ = dg.err(f.te.span, "E0404", u.f1("field '%s' cannot have type void", f.name));
@@ -1472,7 +1474,7 @@ fn resolve_decl(d: *mut ast.Decl) void {
             }
         }
         for i in 0..d.variants.len {
-            let v = d.variants.at(i);
+            let v = d.variants.at_mut(i);
             if u.notnil(v.te) {
                 v.ty = resolve_type(v.te, &mut tc);
                 if v.ty.kind == ast.TY_VOID {
@@ -1609,7 +1611,7 @@ fn is_const_init(e: *mut ast.Expr) bool {
     }
     if k == ast.E_STRUCT_LIT {
         for i in 0..ast.more(e).inits.len {
-            if not is_const_init(ast.more(e).inits.at(i).value) {
+            if not is_const_init(ast.ext(e).inits.at_mut(i).value) {
                 return false;
             }
         }
@@ -1630,7 +1632,7 @@ fn is_const_init(e: *mut ast.Expr) bool {
     }
     if k == ast.E_BUILTIN {
         return (ast.builtin_of(e) == ast.BI_PTR_FROM_INT) and (ast.more(e).bargs.len == 2) and
-               is_const_init(ast.more(e).bargs.at(1).e);
+               is_const_init(ast.ext(e).bargs.at_mut(1).e);
     }
     if k == ast.E_UNARY {
         return (ast.op_of(e) == lx.TK_MINUS) and is_const_init(e.a) and (e.a.kind == ast.E_FLOAT);
@@ -1663,6 +1665,7 @@ fn mkconv(e: *mut ast.Expr, k: ast.Conv, t: *mut ast.Type) *mut ast.Expr {
     ast.set_conv(c, k);
     c.ty = t;
     c.cat = ast.CAT_VALUE;
+    c.weakened = e.weakened;
     return c;
 }
 
@@ -1779,6 +1782,49 @@ fn can_take_untyped_float(t: *ast.Type) bool {
         return can_take_untyped_float(t.elem);
     }
     return false;
+}
+
+fn weaken_mut(t: *mut ast.Type) *mut ast.Type {
+    if u.isnil(t) {
+        return t;
+    }
+    if t.kind == ast.TY_PTR {
+        if t.is_mut {
+            return ty.type_ptr(t.elem, false);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_SLICE {
+        if t.is_mut {
+            return ty.type_slice(t.elem, false);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_OPT {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            return ty.type_opt(w);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_ERRUNION {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            return ty.type_errunion_set(w, t.decl);
+        }
+        return t;
+    }
+    if t.kind == ast.TY_ARRAY {
+        let w = weaken_mut(t.elem);
+        if w != t.elem {
+            if u.notnil(t.len_param) {
+                return ty.type_array_param(w, t.len_param);
+            }
+            return ty.type_array(w, t.len);
+        }
+        return t;
+    }
+    return t;
 }
 
 fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
@@ -1929,6 +1975,54 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
             return;
         }
     }
+    if e.weakened and (weaken_mut(target) == s) {
+        let d = dg.err(e.span, "E0707", u.f2("cannot obtain %s through an immutable place (weakened to %s)",
+                                             tstr(target), tstr(s)));
+        dg.set_types(d, tstr(target), tstr(s));
+        if u.notnil(C) and u.notnil(C.fnd) and (C.fnd.params.len > 0) {
+            let p0 = C.fnd.params.at(0);
+            if u.str_eq(p0.name, "self") and u.notnil(p0.te) {
+                match p0.te.shape {
+                    .Ptr(pt) => {
+                        if not pt.is_mut {
+                            let fx = dg.fix(d, "make 'self' mutable", "suggestion");
+                            let ts = p0.te.span;
+                            dg.edit(fx, u.mkspan(ts.file, ts.start + 1, ts.start + 1), "mut ");
+                        }
+                    }
+                    else => {}
+                }
+            }
+        }
+        if u.notnil(C) and C.in_return and u.notnil(C.fnd) and u.notnil(C.fnd.ret_te) {
+            let mut rt: *ast.TypeExpr = C.fnd.ret_te;
+            loop {
+                match rt.shape {
+                    .ErrUnion(eu) => { rt = eu.elem; }
+                    .Opt(inner)   => { rt = inner; }
+                    else          => { break; }
+                }
+            }
+            match rt.shape {
+                .Ptr(pt) => {
+                    if pt.is_mut {
+                        let fx = dg.fix(d, "return an immutable view", "suggestion");
+                        let rs = rt.span;
+                        dg.edit(fx, u.mkspan(rs.file, rs.start, pt.elem.span.start), "*");
+                    }
+                }
+                .Slice(pt) => {
+                    if pt.is_mut {
+                        let fx = dg.fix(d, "return an immutable view", "suggestion");
+                        let rs = rt.span;
+                        dg.edit(fx, u.mkspan(rs.file, rs.start, pt.elem.span.start), "[]");
+                    }
+                }
+                else => {}
+            }
+        }
+        return;
+    }
     type_mismatch(e, target, s);
 }
 
@@ -2058,6 +2152,32 @@ fn is_mut_place(e: *mut ast.Expr) bool {
         return e.a.ty.is_mut;
     }
     return false;
+}
+
+// True iff place `e` is reached through an immutable pointer (*T) or slice ([]T).
+fn via_immut_indirection(e0: *ast.Expr) bool {
+    let mut e = e0;
+    loop {
+        let k = e.kind;
+        if k == ast.E_DEREF {
+            return (e.a.ty.kind == ast.TY_PTR) and not e.a.ty.is_mut;
+        }
+        if (k == ast.E_FIELD) and (ast.field_kind_of(e) == ast.FK_STRUCT) {
+            if ast.self_mode_of(e) == ast.SELF_DEREF {
+                return not e.a.ty.is_mut;
+            }
+            e = e.a;
+            continue;
+        }
+        if k == ast.E_INDEX {
+            if ast.index_kind_of(e) == ast.IDX_ARRAY {
+                e = e.a;
+                continue;
+            }
+            return not e.a.ty.is_mut;
+        }
+        return false;
+    }
 }
 
 fn mark_addr_taken(e: *mut ast.Expr) void {
@@ -2579,12 +2699,12 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     while u.notnil(hint) and ((hint.kind == ast.TY_ERRUNION) or (hint.kind == ast.TY_OPT)) {
         hint = hint.elem;
     }
-    let l = check_expr(e.a, hint);
+    let mut l = check_expr(e.a, hint);
     let mut rhint = l;
     if ty.is_untyped(l) {
         rhint = hint;
     }
-    let r = check_expr(ast.b_of(e), rhint);
+    let mut r = check_expr(ast.b_of(e), rhint);
     let mut t = tnil();
     if ty.is_untyped(l) and ty.is_untyped(r) {
         t = ty.t_untyped_int;
@@ -2606,6 +2726,16 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         coerce(ast.b_mut(e), l);
         t = l;
     } else {
+        if ((op == lx.TK_EQEQ) or (op == lx.TK_NE)) and (l.kind == ast.TY_PTR) and (r.kind == ast.TY_PTR) and
+           (l.elem == r.elem) and (l.is_mut != r.is_mut) {
+            if l.is_mut {
+                coerce(&mut e.a, r);
+                l = r;
+            } else {
+                coerce(ast.b_mut(e), l);
+                r = l;
+            }
+        }
         t = l;
         if (l != r) and (l.kind != ast.TY_INVALID) and (r.kind != ast.TY_INVALID) and (l.kind != ast.TY_NEVER) and
            (r.kind != ast.TY_NEVER) and not ((l.kind == ast.TY_ERROR) and (r.kind == ast.TY_ERROR)) {
@@ -2861,9 +2991,10 @@ fn resolve_ident(e: *mut ast.Expr) void {
         ast.set_local(e, l);
         e.cat = ast.CAT_VALUE;
         e.ty = l.ty;
+        e.weakened = l.weakened;
         return;
     }
-    let gp = lookup_gparam(&C.tc, e.name);
+    let gp = lookup_gparam(&mut C.tc, e.name);
     if u.notnil(gp) {
         if gp.is_const {
             e.cat = ast.CAT_VALUE;
@@ -3001,7 +3132,17 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         if fi >= 0 {
             ast.set_field_kind(e, ast.FK_STRUCT);
             ast.set_index(e, fi);
-            e.ty = ty.type_field(base, @int_cast(usize, fi));
+            let mut ft = ty.type_field(base, @int_cast(usize, fi));
+            let base_immut = ((ast.self_mode_of(e) == ast.SELF_DEREF) and not t.is_mut) or
+                             ((ast.self_mode_of(e) != ast.SELF_DEREF) and via_immut_indirection(a));
+            if base_immut {
+                let wt = weaken_mut(ft);
+                if wt != ft {
+                    ft = wt;
+                    e.weakened = true;
+                }
+            }
+            e.ty = ft;
             return e.ty;
         }
     }
@@ -3026,6 +3167,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         if u.str_eq(name, "ptr") {
             ast.set_field_kind(e, ast.FK_SLICE_PTR);
             e.ty = ty.type_ptr(t.elem, t.is_mut);
+            e.weakened = a.weakened;
             return e.ty;
         }
     }
@@ -3342,7 +3484,7 @@ fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut
     for j in 0..ast.args_of(e).len {
         if j >= nparams {
             if f.variadic {
-                check_vararg(ast.args_of(e).at(j));
+                check_vararg(ast.args_mut(e).at_mut(j));
             } else {
                 _ = check_expr(ast.args_of(e).get(j), tnil());
             }
@@ -3365,7 +3507,7 @@ fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut
     // phase 3: coerce args
     for j in 0..nargs {
         let pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
-        coerce(ast.args_of(e).at(j), pt);
+        coerce(ast.args_mut(e).at_mut(j), pt);
     }
     ast.set_decl(e, f);
     ast.set_gargs(e, gargs);
@@ -3504,7 +3646,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         check_args_count(e, 1, dnil());
         for i in 0..ast.args_of(e).len {
             if i == 0 {
-                _ = check_expr_to(ast.args_of(e).at(0), pt);
+                _ = check_expr_to(ast.args_mut(e).at_mut(0), pt);
             } else {
                 _ = check_expr(ast.args_of(e).get(i), tnil());
             }
@@ -3541,7 +3683,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     check_args_count(e, ft.params.len, dnil());
     for i in 0..ast.args_of(e).len {
         if i < ft.params.len {
-            _ = check_expr_to(ast.args_of(e).at(i), ft.params[i]);
+            _ = check_expr_to(ast.args_mut(e).at_mut(i), ft.params[i]);
         } else {
             _ = check_expr(ast.args_of(e).get(i), tnil());
         }
@@ -3582,7 +3724,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if u.isnil(t) {
         for i in 0..ast.more(e).inits.len {
-            _ = check_expr(ast.more(e).inits.at(i).value, tnil());
+            _ = check_expr(ast.ext(e).inits.at_mut(i).value, tnil());
         }
         return set_ty(e, ty.t_invalid);
     }
@@ -3654,7 +3796,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
     }
     for i in 0..ast.more(e).inits.len {
-        let fi = ast.more(e).inits.at(i);
+        let fi = ast.ext(e).inits.at_mut(i);
         let idx = sb.find_field(d, fi.name);
         if idx < 0 {
             _ = dg.err(fi.span, "E0404", u.f2("%s has no field '%s'", tstr(t), fi.name));
@@ -3715,11 +3857,11 @@ fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let n = ast.args_of(e).len;
     for i in 0..n {
         if u.notnil(elem) {
-            _ = check_expr_to(ast.args_of(e).at(i), elem);
+            _ = check_expr_to(ast.args_mut(e).at_mut(i), elem);
         } else {
             elem = check_expr(ast.args_of(e).get(i), tnil());
             if ty.is_untyped(elem) {
-                _ = sb.finalize_untyped(ast.args_of(e).at(i));
+                _ = sb.finalize_untyped(ast.args_mut(e).at_mut(i));
                 elem = tnil();
             }
         }
@@ -3766,7 +3908,11 @@ fn check_return_value(pe: *mut *mut ast.Expr, sp: u.Span) void {
         _ = dg.err(pe.*.span, "E0603", "a void function cannot return a value");
         return;
     }
-    _ = check_expr_to(pe, r);
+    _ = check_expr(pe.*, r);
+    let prev_ret = C.in_return;
+    C.in_return = true;
+    coerce(pe, r);
+    C.in_return = prev_ret;
     check_escape(pe.*);
 }
 
@@ -3859,6 +4005,16 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
         }
     }
     scope_pop();
+    let mut hw = e.a.weakened;
+    match ast.more(e).handler {
+        .Value(h) => {
+            if h.weakened {
+                hw = true;
+            }
+        }
+        else => {}
+    }
+    e.weakened = hw;
     e.ty = vt;
     return e.ty;
 }
@@ -3887,6 +4043,7 @@ fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let t = opt_target(expected);
     if u.notnil(t) {
         _ = check_expr_to(&mut e.a, t.elem);
+        e.weakened = e.a.weakened;
         if t.elem.kind == ast.TY_INVALID {
             return set_ty(e, ty.t_invalid);
         }
@@ -3896,6 +4053,7 @@ fn check_opt_some(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if ty.is_untyped(it) {
         it = sb.finalize_untyped(&mut e.a);
     }
+    e.weakened = e.a.weakened;
     if it.kind == ast.TY_INVALID {
         return set_ty(e, ty.t_invalid);
     }
@@ -3957,6 +4115,15 @@ fn check_orelse(e: *mut ast.Expr) *mut ast.Type {
             }
         }
     }
+    e.weakened = e.a.weakened;
+    match ast.more(e).handler {
+        .Value(h) => {
+            if h.weakened {
+                e.weakened = true;
+            }
+        }
+        else => {}
+    }
     e.ty = vt;
     return e.ty;
 }
@@ -3989,6 +4156,7 @@ fn check_try(e: *mut ast.Expr) *mut ast.Type {
         _ = check_leave_ok(e.span, false);
         try_fits(e.span, t.decl, C.ret.decl);
     }
+    e.weakened = e.a.weakened;
     e.ty = t.elem;
     return e.ty;
 }
@@ -4046,6 +4214,7 @@ fn check_index(e: *mut ast.Expr) *mut ast.Type {
         }
         if u.notnil(elem) {
             e.ty = elem;
+            e.weakened = e.a.weakened;
         } else {
             e.ty = ty.t_invalid;
         }
@@ -4082,6 +4251,7 @@ fn check_index(e: *mut ast.Expr) *mut ast.Type {
         m = t.is_mut;
     }
     e.ty = ty.type_slice(elem, m);
+    e.weakened = e.a.weakened;
     return e.ty;
 }
 
@@ -4163,7 +4333,15 @@ fn check_deref(e: *mut ast.Expr) *mut ast.Type {
             _ = dg.err(e.span, "E0705", "cannot dereference *void; convert it with @ptr_cast first");
             return set_ty(e, ty.t_invalid);
         }
-        return set_ty(e, t.elem);
+        let mut res = t.elem;
+        if not t.is_mut {
+            let wt = weaken_mut(res);
+            if wt != res {
+                res = wt;
+                e.weakened = true;
+            }
+        }
+        return set_ty(e, res);
     }
     if t.kind != ast.TY_INVALID {
         _ = dg.err(e.span, "E0705", u.f1("cannot dereference a value of type %s", tstr(t)));
@@ -4187,7 +4365,7 @@ fn scope_lookup(name: []u8) *mut ast.Local {
     while i > 0 {
         i -= 1;
         if u.same(C.scope.at(i).name, name) {
-            return C.scope.at(i).local;
+            return C.scope.at_mut(i).local;
         }
     }
     return u.nil.[ast.Local]();
@@ -4201,7 +4379,7 @@ fn declare_local(name: []u8, sp: u.Span, t: *mut ast.Type, is_mut: bool, is_para
     }
     let mut clash = u.notnil(prev);
     let mut what: []u8 = "a variable";
-    if not clash and u.notnil(lookup_gparam(&C.tc, name)) {
+    if not clash and u.notnil(lookup_gparam(&mut C.tc, name)) {
         clash = true;
         what = "a generic parameter";
     }
@@ -4368,11 +4546,11 @@ fn check_assign(s: *mut ast.Stmt) void {
                 _ = dg.err(s.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(lt)));
             }
         }
-        ast.set_b(ast.stmt_more(s).e3, s.e2);
+        ast.set_b(ast.stmt_ext(s).e3, s.e2);
         return;
     }
     _ = check_expr_to(&mut s.e2, lt);
-    ast.set_b(ast.stmt_more(s).e3, s.e2);
+    ast.set_b(ast.stmt_ext(s).e3, s.e2);
     // reuse the binary-operator validation by type-checking a probe
     let probe = ast.copy_expr(ast.stmt_more(s).e3);
     probe.a = conv_probe(lt, lhs.span);
@@ -4392,7 +4570,7 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut
     let what = u.pick(is_enum, "member", "variant");
     let seen = u.newn.[bool](ud.variants.len);
     for i in 0..narms {
-        let a = ast.stmt_more(s).arms.at(i);
+        let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
@@ -4430,6 +4608,7 @@ fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type, by_ref: bool, ref_mut
                                     bt = ty.type_ptr(pt, ref_mut);
                                 }
                                 a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                                a.bind_local.weakened = s.e.weakened;
                             }
                         }
                     }
@@ -4475,7 +4654,7 @@ fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut:
     let mut seen_some = false;
     let narms = ast.stmt_more(s).arms.len;
     for i in 0..narms {
-        let a = ast.stmt_more(s).arms.at(i);
+        let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
@@ -4509,6 +4688,7 @@ fn check_opt_match(s: *mut ast.Stmt, base: *mut ast.Type, by_ref: bool, ref_mut:
                                 bt = ty.type_ptr(base.elem, ref_mut);
                             }
                             a.bind_local = declare_local(p.bind, p.bind_span, bt, false, false);
+                            a.bind_local.weakened = s.e.weakened;
                         }
                     }
                 } else {
@@ -4549,7 +4729,7 @@ fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
     let mut seen_true = false;
     let mut seen_false = false;
     for i in 0..narms {
-        let a = ast.stmt_more(s).arms.at(i);
+        let a = ast.stmt_ext(s).arms.at_mut(i);
         if has_else and not a.alt {
             _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
         }
@@ -4686,7 +4866,7 @@ fn check_match(s: *mut ast.Stmt) bool {
                 continue;
             }
             scope_push();
-            _ = check_block(ast.stmt_more(s).arms.at(i).body);
+            _ = check_block(ast.stmt_ext(s).arms.at_mut(i).body);
             scope_pop();
         }
     }
@@ -4788,6 +4968,7 @@ fn check_let(s: *mut ast.Stmt) bool {
         }
     }
     s.local = declare_local(s.name, s.name_span, t, s.is_mut, false);
+    s.local.weakened = s.e.weakened;
     return u.notnil(s.e.ty) and (s.e.ty.kind == ast.TY_NEVER);
 }
 
@@ -5012,7 +5193,7 @@ fn check_fn_body(f: *mut ast.Decl) void {
     C = &mut ctx;
     scope_push();
     for i in 0..f.params.len {
-        let p = f.params.at(i);
+        let p = f.params.at_mut(i);
         p.local = declare_local(p.name, p.span, f.param_types[i], false, true);
     }
     let div = check_block(f.body);

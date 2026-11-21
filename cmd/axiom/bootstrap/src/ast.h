@@ -182,6 +182,7 @@ struct Expr {
     i128 cval;          // folded integer constant (untyped / const refs)
     bool is_const;      // cval / fval valid
     bool lit_neg;       // literal arithmetic produced a negative value
+    bool weakened;
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +294,7 @@ struct Local {
     bool mut;
     bool is_param;
     bool addr_taken;
+    bool weakened;
     int index;  // within its function
 };
 

@@ -114,7 +114,7 @@ fn read_overlays() void {
 // -----------------------------------------------------------------------------
 // Positions: byte offsets <-> LSP positions
 // -----------------------------------------------------------------------------
-fn lines_of(f: *mut u.SourceFile) []mut u32 {
+fn lines_of(f: *mut u.SourceFile) []u32 {
     if f.line_starts.len == 0 {
         f.line_starts.push(0);
         for i in 0..f.text.len {
@@ -401,12 +401,12 @@ const R_BUILTIN: i32 = 6;  // builtin `index`
 struct Ref {
     span: u.Span,  // the name in the source
     kind: i32,
-    local: *mut ast.Local,
-    decl: *mut ast.Decl,
+    local: *ast.Local,
+    decl: *ast.Decl,
     index: i32,
-    name: []u8,         // R_ERROR
-    ty: *mut ast.Type,  // the type here, when the use knows better than the declaration
-    def: bool,          // declares it
+    name: []u8,     // R_ERROR
+    ty: *ast.Type,  // the type here, when the use knows better than the declaration
+    def: bool,      // declares it
 }
 
 threadlocal let mut refs: u.List.[Ref] = u.List.[Ref].{ data: @ptr_from_int(*mut Ref, 0), len: 0, cap: 0 };
@@ -426,20 +426,20 @@ threadlocal let mut call_off: i64 = -1;
 threadlocal let mut found_call: *mut ast.Expr = @ptr_from_int(*mut ast.Expr, 0);
 threadlocal let mut found_call_end: u32 = 0;
 
-fn add(sp: u.Span, kind: i32, d: *mut ast.Decl, index: i32, l: *mut ast.Local, def: bool, t: *mut ast.Type) void {
+fn add(sp: u.Span, kind: i32, d: *ast.Decl, index: i32, l: *ast.Local, def: bool, t: *ast.Type) void {
     if sp.end <= sp.start {
         return;
     }
     refs.push(Ref.{ span: sp, kind: kind, local: l, decl: d, index: index, name: "", ty: t, def: def });
 }
 
-fn add_decl(sp: u.Span, d: *mut ast.Decl, def: bool, t: *mut ast.Type) void {
+fn add_decl(sp: u.Span, d: *ast.Decl, def: bool, t: *ast.Type) void {
     if u.notnil(d) {
         add(sp, R_DECL, d, 0, u.nil.[ast.Local](), def, t);
     }
 }
 
-fn add_local(sp: u.Span, l: *mut ast.Local, def: bool) void {
+fn add_local(sp: u.Span, l: *ast.Local, def: bool) void {
     if u.notnil(l) {
         add(sp, R_LOCAL, u.nil.[ast.Decl](), 0, l, def, l.ty);
     }
@@ -510,7 +510,7 @@ fn gparam_ref(sp: u.Span, name: []u8) bool {
     return false;
 }
 
-fn wte(te: *mut ast.TypeExpr) void {
+fn wte(te: *ast.TypeExpr) void {
     if u.isnil(te) {
         return;
     }
@@ -642,15 +642,17 @@ fn wexpr(e: *mut ast.Expr) void {
     if k == ast.E_STRUCT_LIT {
         wexpr(e.a);
         let st = e.ty;
-        for i in 0..ast.more(e).inits.len {
-            let fi = ast.more(e).inits.at(i);
-            if has_decl(st) and (st.kind == ast.TY_STRUCT) {
-                let x = field_index(st.decl, fi.name);
-                if x >= 0 {
-                    add(fi.span, R_FIELD, st.decl, x, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        if u.notnil(e.more) {
+            for i in 0..e.more.inits.len {
+                let fi = e.more.inits.at_mut(i);
+                if has_decl(st) and (st.kind == ast.TY_STRUCT) {
+                    let x = field_index(st.decl, fi.name);
+                    if x >= 0 {
+                        add(fi.span, R_FIELD, st.decl, x, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+                    }
                 }
+                wexpr(fi.value);
             }
-            wexpr(fi.value);
         }
         return;
     }
@@ -665,10 +667,12 @@ fn wexpr(e: *mut ast.Expr) void {
         add(u.mkspan(e.span.file, e.span.start, e.span.start + 1 + @int_cast(u32, e.name.len)), R_BUILTIN,
             u.nil.[ast.Decl](), @int_from_enum(ast.builtin_of(e)), u.nil.[ast.Local](), false, u.nil.[ast.Type]());
         note_call(e, e.span.start + 1 + @int_cast(u32, e.name.len));
-        for i in 0..ast.more(e).bargs.len {
-            let ba = ast.more(e).bargs.at(i);
-            wte(ba.t);
-            wexpr(ba.e);
+        if u.notnil(e.more) {
+            for i in 0..e.more.bargs.len {
+                let ba = e.more.bargs.at_mut(i);
+                wte(ba.t);
+                wexpr(ba.e);
+            }
         }
         return;
     }
@@ -732,25 +736,27 @@ fn wstmt(s: *mut ast.Stmt) void {
         if u.notnil(s.e) {
             st = aggregate(s.e.ty);
         }
-        for i in 0..ast.stmt_more(s).arms.len {
-            let a = ast.stmt_more(s).arms.at(i);
-            let file = a.span.file;
-            match a.pat {
-                .Variant(p) => {
-                    if has_decl(st) {
-                        let v = variant_index(st.decl, p.name);
-                        if v >= 0 {
-                            add(word_span(file, a.span.start, a.span.end, p.name), R_VARIANT, st.decl, v,
-                                u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        if u.notnil(s.more) {
+            for i in 0..s.more.arms.len {
+                let a = s.more.arms.at_mut(i);
+                let file = a.span.file;
+                match a.pat {
+                    .Variant(p) => {
+                        if has_decl(st) {
+                            let v = variant_index(st.decl, p.name);
+                            if v >= 0 {
+                                add(word_span(file, a.span.start, a.span.end, p.name), R_VARIANT, st.decl, v,
+                                    u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+                            }
                         }
+                        add_local(p.bind_span, a.bind_local, true);
                     }
-                    add_local(p.bind_span, a.bind_local, true);
+                    .Error(name) => { add_error(word_span(file, a.span.start, a.span.end, name), name, false); }
+                    else => {}
                 }
-                .Error(name) => { add_error(word_span(file, a.span.start, a.span.end, name), name, false); }
-                else => {}
-            }
-            if not a.alt {
-                wstmt(a.body);
+                if not a.alt {
+                    wstmt(a.body);
+                }
             }
         }
         return;
@@ -758,7 +764,9 @@ fn wstmt(s: *mut ast.Stmt) void {
     wte(s.te);
     wexpr(s.e);
     wexpr(s.e2);
-    wexpr(ast.stmt_more(s).e3);
+    if u.notnil(s.more) {
+        wexpr(s.more.e3);
+    }
     wstmt(s.body);
     wstmt(s.els);
     for i in 0..s.stmts.len {
@@ -912,12 +920,11 @@ fn sort_names(xs: []mut Ref) usize {
 
 // The names found, sorted: runs of refs, or of the kept modules' indexes,
 // in order (one, refs, but for references and renames: names_by_module).
-threadlocal let mut name_runs: u.List.[[]mut Ref] = u.List.[[]mut Ref].{
-    data: @ptr_from_int(*mut []mut Ref, 0), len: 0, cap: 0 };
+threadlocal let mut name_runs: u.List.[[]Ref] = u.List.[[]Ref].{ data: @ptr_from_int(*mut []Ref, 0), len: 0, cap: 0 };
 
 // Sorts refs (as sort_names) as the names found.
 fn sort_refs() void {
-    refs.len = sort_names(refs.items());
+    refs.len = sort_names(refs.items_mut());
     name_runs.len = 0;
     name_runs.push(refs.items());
 }
@@ -986,7 +993,7 @@ pub fn index_kept(m: *mut ast.Module) void {
     drop_index(m.path);
     refs.len = 0;
     if walk_own(m) {
-        let n = sort_names(refs.items());
+        let n = sort_names(refs.items_mut());
         let xs = @slice_from_ptr(@ptr_cast(*mut Ref, u.malloc((n + 1) * @size_of(Ref))), n);
         for i in 0..n {
             xs[i] = refs.get(i);
@@ -1043,11 +1050,11 @@ fn names_by_module() bool {
         if not walk_own(m) {
             return false;
         }
-        let n = sort_names(refs.items()[from..]);
+        let n = sort_names(refs.items_mut()[from..]);
         refs.len = from + n;
         runs.push(Run.{ rank: rank, from: from, to: refs.len, kept: u.nil.[Index]() });
     }
-    u.sort.[Run](runs.items(), run_cmp);
+    u.sort.[Run](runs.items_mut(), run_cmp);
     name_runs.len = 0;
     for i in 0..runs.len {
         let r = runs.get(i);
@@ -1205,7 +1212,7 @@ fn builtin_label(i: ast.BuiltinId) []u8 {
     return b.done();
 }
 
-fn te_text(te: *mut ast.TypeExpr) []u8 {
+fn te_text(te: *ast.TypeExpr) []u8 {
     if u.isnil(te) {
         return "";
     }
@@ -1213,7 +1220,7 @@ fn te_text(te: *mut ast.TypeExpr) []u8 {
 }
 
 // A declaration as it is written, without bodies, methods or long values.
-fn sig_of(d: *mut ast.Decl) []u8 {
+fn sig_of(d: *ast.Decl) []u8 {
     let k = d.kind;
     let file = d.span.file;
     if d.is_test {
@@ -1432,7 +1439,7 @@ fn q_definition() []u8 {
     return b.done();
 }
 
-fn is_type_decl(d: *mut ast.Decl) bool {
+fn is_type_decl(d: *ast.Decl) bool {
     return (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM);
 }
 
@@ -1627,7 +1634,7 @@ fn fn_detail(d: *mut ast.Decl) []u8 {
     return trim(text_of(u.mkspan(d.span.file, d.name_span.end, d.span.end)));
 }
 
-fn span_to(sp: u.Span, te: *mut ast.TypeExpr) u.Span {
+fn span_to(sp: u.Span, te: *ast.TypeExpr) u.Span {
     if u.notnil(te) and (te.span.file == sp.file) and (te.span.end > sp.end) {
         return u.mkspan(sp.file, sp.start, te.span.end);
     }
@@ -1878,13 +1885,13 @@ fn member_items(b: *mut u.Buf, e: *mut ast.Expr) void {
 }
 
 // Locals in scope at the cursor.
-threadlocal let mut in_scope: u.List.[*mut ast.Local] = u.List.[*mut ast.Local].{
-    data: @ptr_from_int(*mut *mut ast.Local, 0),
+threadlocal let mut in_scope: u.List.[*ast.Local] = u.List.[*ast.Local].{
+    data: @ptr_from_int(*mut *ast.Local, 0),
     len: 0,
     cap: 0,
 };
 
-fn sc_add(l: *mut ast.Local) void {
+fn sc_add(l: *ast.Local) void {
     if u.notnil(l) {
         in_scope.push(l);
     }
@@ -1918,8 +1925,10 @@ fn sc_expr(e: *mut ast.Expr, off: u32) void {
     for i in 0..ast.args_of(e).len {
         sc_expr(ast.args_of(e).get(i), off);
     }
-    for i in 0..ast.more(e).inits.len {
-        sc_expr(ast.more(e).inits.at(i).value, off);
+    if u.notnil(e.more) {
+        for i in 0..e.more.inits.len {
+            sc_expr(e.more.inits.at_mut(i).value, off);
+        }
     }
 }
 
@@ -1942,12 +1951,14 @@ fn sc_stmt(s: *mut ast.Stmt, off: u32) void {
         return;
     }
     if k == ast.S_MATCH {
-        for i in 0..ast.stmt_more(s).arms.len {
-            let a = ast.stmt_more(s).arms.at(i);
-            if u.notnil(a.body) and contains(a.body.span, off) {
-                sc_add(a.bind_local);
-                sc_stmt(a.body, off);
-                return;
+        if u.notnil(s.more) {
+            for i in 0..s.more.arms.len {
+                let a = s.more.arms.at_mut(i);
+                if u.notnil(a.body) and contains(a.body.span, off) {
+                    sc_add(a.bind_local);
+                    sc_stmt(a.body, off);
+                    return;
+                }
             }
         }
         sc_expr(s.e, off);
@@ -1966,7 +1977,9 @@ fn sc_stmt(s: *mut ast.Stmt, off: u32) void {
     }
     sc_expr(s.e, off);
     sc_expr(s.e2, off);
-    sc_expr(ast.stmt_more(s).e3, off);
+    if u.notnil(s.more) {
+        sc_expr(s.more.e3, off);
+    }
 }
 
 fn enclosing_fn(off: u32) *mut ast.Decl {
@@ -2045,7 +2058,7 @@ fn builtin_items() []u8 {
 
 fn set_overlay(path: []u8, text: []u8) void {
     for i in 0..u.g_overlays.len {
-        let o = u.g_overlays.at(i);
+        let o = u.g_overlays.at_mut(i);
         if u.same_path(o.path, path) {
             let t = u.alloc(text.len + 1);
             @mem_copy(@slice_from_ptr(t, text.len), text);

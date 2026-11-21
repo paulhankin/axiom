@@ -67,11 +67,11 @@ pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
         rpo_si.push(0);
         rpo_post.push(ir.bnil());
     }
-    let st = rpo_st.items();
-    let stt = rpo_term.items();
-    let sn = rpo_ns.items();
-    let si = rpo_si.items();
-    let post = rpo_post.items();
+    let st = rpo_st.items_mut();
+    let stt = rpo_term.items_mut();
+    let sn = rpo_ns.items_mut();
+    let si = rpo_si.items_mut();
+    let post = rpo_post.items_mut();
     let mut np: usize = 0;
     let mut sp: usize = 0;
     st[0] = f.first;
@@ -350,8 +350,11 @@ pub fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64
             for j in 0..y.xs.len {
                 ir.set_x(y, j, member_copy(y.xs.get(j), tag));
             }
-            for j in 0..ir.bs_of(y).len {
-                ir.bs_of(y).set(j, member_copy_blk(ir.bs_of(y).get(j), tag));
+            if ir.bs_of(y).len > 0 {
+                let bs = ir.bs_mut(y);
+                for j in 0..bs.len {
+                    bs.set(j, member_copy_blk(bs.get(j), tag));
+                }
             }
             y.t1 = member_copy_blk(y.t1, tag);
             y.t2 = member_copy_blk(y.t2, tag);
@@ -594,7 +597,7 @@ pub fn mem2reg(f: *mut ir.Func) void {
         work.deinit();
     }
     // renaming, over the dominator tree
-    struct_rename(f, order.get(0), slots.items());
+    struct_rename(f, order.get(0), slots.items_mut());
     // delete the promoted allocas
     for si in 0..slots.len {
         let s = slots.get(si);
@@ -627,7 +630,7 @@ fn object_of(p: *mut ir.Value) *mut ir.Value {
     return ir.vnil();
 }
 
-fn writes_object(i: *ir.Value, a: *mut ir.Value) bool {
+fn writes_object(i: *mut ir.Value, a: *mut ir.Value) bool {
     if i.op == ir.OP_STORE {
         return object_of(i.b) == a;
     }
@@ -647,7 +650,7 @@ fn vars_before(f: *mut ir.Func) void {
         return;
     }
     for k in 0..vl.len {
-        let v = vl.at(k);
+        let v = vl.at_mut(k);
         let a = v.alloca;
         if u.notnil(v.global) {
             continue;
@@ -1403,7 +1406,7 @@ threadlocal let mut fold_doms: bool = false;
 fn fold_dominates(a: *mut ir.Block, b: *mut ir.Block) bool {
     if not fold_doms {
         compute_preds(fold_func);
-        let order = dominators(fold_func);
+        let mut order = dominators(fold_func);
         order.deinit();
         fold_doms = true;
     }
@@ -1495,7 +1498,7 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     // in reverse postorder, definitions come before their uses (but for
     // phis on back edges), so a round or two reach the fixed point
     compute_preds(f);
-    let order = rpo(f);
+    let mut order = rpo(f);
     fold_func = f;
     fold_doms = false;
     while changed and (rounds < 16) {
@@ -1767,7 +1770,7 @@ pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
 // integer below zero. (Loops and trap paths are
 // laid out by their own rules; the register allocator's block frequencies,
 // mach.ax, weigh the same edges with mc.UNLIKELY_WEIGHT.)
-pub fn unlikely_succ(b: *ir.Block) *mut ir.Block {
+pub fn unlikely_succ(b: *mut ir.Block) *mut ir.Block {
     let t = ir.terminator(b);
     if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
         return bnil();
@@ -1852,7 +1855,7 @@ fn one_bit(m: *ir.Value) bool {
 }
 
 // Could control pass from a to b without a jump (b is a successor of a)?
-fn falls_into(a: *ir.Block, b: *mut ir.Block) bool {
+fn falls_into(a: *mut ir.Block, b: *mut ir.Block) bool {
     let t = ir.terminator(a);
     if u.isnil(t) {
         return true;
@@ -1966,7 +1969,7 @@ fn place_unlikely(order: *mut u.List.[*mut ir.Block]) void {
 // body instead of a jump to the header followed by the test. Needs
 // dominators; b.rpo holds the positions.
 fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
-    let headers = loop_headers(order);
+    let mut headers = loop_headers(order);
     let mut body = u.List.[*mut ir.Block].empty();
     for hi in 0..headers.len {
         let h = headers.get(hi);
@@ -2219,14 +2222,14 @@ fn global_indexed(i: *ir.Value) bool {
         return false;
     }
     let g = a.a;
-    return (g.kind == ir.V_GLOBAL) and not ir.gv_of(g).tls;
+    return (g.kind == ir.V_GLOBAL) and not ir.is_tls_addr(g);
 }
 
 // Is g, operand k of i (0: a, 1: b, 2: c, 3: xs), the address of a (not
 // thread-local) global that i reads from a register? Not the address a load
 // or store goes to, or one with a constant added: those are pc-relative.
 fn global_in_reg(i: *ir.Value, g: *ir.Value, k: i32) bool {
-    if u.isnil(g) or (g.kind != ir.V_GLOBAL) or ir.gv_of(g).tls {
+    if u.isnil(g) or (g.kind != ir.V_GLOBAL) or ir.is_tls_addr(g) {
         return false;
     }
     let o = i.op;
@@ -2303,8 +2306,8 @@ pub fn share_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
         }
     }
     for k in 0..cs.len {
-        u.free(@ptr_cast(*mut void, cs.at(k).blocks.data));
-        u.free(@ptr_cast(*mut void, cs.at(k).copies.data));
+        u.free(@ptr_cast(*mut void, cs.at_mut(k).blocks.data));
+        u.free(@ptr_cast(*mut void, cs.at_mut(k).copies.data));
     }
     cs.deinit();
 }
@@ -2331,7 +2334,7 @@ fn note_const(cs: *mut u.List.[SharedConst], i: *mut ir.Value, v: *mut ir.Value,
         cs.push(SharedConst.{ k: v, blocks: u.List.[*mut ir.Block].empty(), copies: u.List.[*mut ir.Value].empty() });
         k = @int_cast(i64, cs.len) - 1;
     }
-    let c = cs.at(@int_cast(usize, k));
+    let c = cs.at_mut(@int_cast(usize, k));
     if c.blocks.len < 64 {
         c.blocks.push(b);
     }
@@ -2349,7 +2352,7 @@ fn shared(f: *mut ir.Func, cs: *mut u.List.[SharedConst], v: *mut ir.Value, i: *
     if k < 0 {
         return v;
     }
-    let c = cs.at(@int_cast(usize, k));
+    let c = cs.at_mut(@int_cast(usize, k));
     let b = i.blk;
     for j in 0..c.copies.len {
         if dominates(c.copies.get(j).blk, b) {
@@ -2474,7 +2477,7 @@ pub fn split_critical_edges(f: *mut ir.Func) void {
 // empty costs nothing (jumps to it go where it does).
 pub fn split_loop_exits(f: *mut ir.Func) void {
     compute_preds(f);
-    let order = dominators(f);
+    let mut order = dominators(f);
     loop_depths(f, &order);
     for oi in 0..order.len {
         let b = order.get(oi);
@@ -2541,7 +2544,7 @@ fn sink_and(c: *ir.Value) bool {
            (x.ty.bits <= 64);
 }
 
-fn clone_inst(f: *mut ir.Func, i: *ir.Value, before: *mut ir.Value) *mut ir.Value {
+fn clone_inst(f: *mut ir.Func, i: *mut ir.Value, before: *mut ir.Value) *mut ir.Value {
     let y = ir.new_inst(f, i.op, i.ty);
     y.cv = i.cv;
     ir.set_a(y, i.a);

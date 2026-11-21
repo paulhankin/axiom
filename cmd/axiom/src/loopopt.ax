@@ -80,7 +80,7 @@ pub fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
                         ir.remove_incoming(p, k);
                         continue;
                     }
-                    ir.bs_of(p).set(k, pre);
+                    ir.bs_mut(p).set(k, pre);
                 }
                 k += 1;
             }
@@ -96,7 +96,7 @@ pub fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
 }
 
 // Is the load at l safe to run before the loop without the loop's guard?
-fn deref_ok(l: *gvn.Loc, size: i64) bool {
+fn deref_ok(l: *mut gvn.Loc, size: i64) bool {
     if u.isnil(l.obj) and u.notnil(l.base) and (l.base.kind == ir.V_PARAM) and (l.off >= 0) and (size >= 0) {
         // a parameter declared [static n] (ir.Func.param_bytes): its first
         // bytes are there whenever the function runs (C 6.7.6.3p7)
@@ -210,7 +210,7 @@ pub fn licm(f: *mut ir.Func) bool {
         }
         // in dominance order: the header first, then the rest by rpo
         if members.len > 2 {
-            sort_by_rpo(members.items()[1..members.len]);
+            sort_by_rpo(members.items_mut()[1..members.len]);
         }
         let first = first_body(h, tag);
         for k in 0..members.len {
@@ -262,15 +262,15 @@ pub fn licm(f: *mut ir.Func) bool {
 // what the program may not have read (a global, in bounds: it cannot fault).
 // No other thread can see the difference without a data race.
 // -----------------------------------------------------------------------------
-fn promotable_store(i: *ir.Value, tag: i64) bool {
+fn promotable_store(i: *mut ir.Value, tag: i64) bool {
     if (i.op != ir.OP_STORE) or (i.flags != 0) or not invariant(i.b, tag) or (i.a.ty.size == 0) or
        ((i.a.ty.kind != ir.T_INT) and (i.a.ty.kind != ir.T_FLOAT) and (i.a.ty.kind != ir.T_PTR)) {
         return false;
     }
     let sz = @bit_cast(i64, i.a.ty.size);
-    let l = gvn.loc_of(i.b, sz);
+    let mut l = gvn.loc_of(i.b, sz);
     if u.isnil(l.obj) or (l.obj.kind != ir.V_GLOBAL) or gvn.noalias_global(l.obj) or ir.gv_of(l.obj).is_const or
-       not deref_ok(&l, sz) or (l.rlo != l.rhi) {
+       not deref_ok(&mut l, sz) or (l.rlo != l.rhi) {
         return false;
     }
     return true;
@@ -279,8 +279,8 @@ fn promotable_store(i: *ir.Value, tag: i64) bool {
 // Do the loop's other instructions leave the location at p (type t) alone,
 // and are its own accesses all loads and stores of t at p?
 fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut ir.Ty) bool {
-    let l = gvn.loc_of(p, @bit_cast(i64, t.size));
-    let w = gvn.loc_write(&l);
+    let mut l = gvn.loc_of(p, @bit_cast(i64, t.size));
+    let mut w = gvn.loc_write(&mut l);
     for k in 0..members.len {
         let mut i = members.get(k).first;
         while u.notnil(i) {
@@ -300,8 +300,8 @@ fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut 
                         return false;
                     }
                 } else {
-                    let x = gvn.loc_of(addr, @bit_cast(i64, ty.size));
-                    if gvn.may_alias(&x, &w) {
+                    let mut x = gvn.loc_of(addr, @bit_cast(i64, ty.size));
+                    if gvn.may_alias(&mut x, &mut w) {
                         return false;
                     }
                 }
@@ -310,13 +310,13 @@ fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut 
                     return false;
                 }
                 let n = gvn.size_of(i.c);
-                let d = gvn.loc_of(i.a, n);
-                if gvn.may_alias(&d, &w) {
+                let mut d = gvn.loc_of(i.a, n);
+                if gvn.may_alias(&mut d, &mut w) {
                     return false;
                 }
                 if op != ir.OP_MEMSET {
-                    let sl = gvn.loc_of(i.b, n);
-                    if gvn.may_alias(&sl, &w) {
+                    let mut sl = gvn.loc_of(i.b, n);
+                    if gvn.may_alias(&mut sl, &mut w) {
                         return false;
                     }
                 }
@@ -324,8 +324,8 @@ fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut 
                 return false;
             } else if gvn.exact_asm(i) {
                 for m in ir.asm_mem_of(i) {
-                    let x = gvn.asm_loc(i, m);
-                    if gvn.may_alias(&x, &w) {
+                    let mut x = gvn.asm_loc(i, m);
+                    if gvn.may_alias(&mut x, &mut w) {
                         return false;
                     }
                 }
@@ -786,9 +786,12 @@ fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
     ir.retarget(pre, h, g);
     q = h.first;
     while u.notnil(q) and (q.op == ir.OP_PHI) {
-        for k in 0..ir.bs_of(q).len {
-            if ir.bs_of(q).get(k) == pre {
-                ir.bs_of(q).set(k, p2);
+        if ir.bs_of(q).len > 0 {
+            let bs = ir.bs_mut(q);
+            for k in 0..bs.len {
+                if bs.get(k) == pre {
+                    bs.set(k, p2);
+                }
             }
         }
         q = q.next;
@@ -821,7 +824,7 @@ fn sort_by_rpo(bs: []mut *mut ir.Block) void {
         rpo_keys.push((@as(usize, @bit_cast(u32, bs[k].rpo)) << 32) | k);
         rpo_was.push(bs[k]);
     }
-    u.sort_usize(rpo_keys.items());
+    u.sort_usize(rpo_keys.items_mut());
     for k in 0..bs.len {
         bs[k] = rpo_was.get(rpo_keys.get(k) & 0xffff_ffff);
     }
@@ -848,12 +851,12 @@ fn hoist_ok(i: *mut ir.Value, tag: i64, in_header: bool) bool {
             return false;
         }
         let sz = @bit_cast(i64, i.ty.size);
-        let l = gvn.loc_of(i.a, sz);
-        if not in_header and not deref_ok(&l, sz) {
+        let mut l = gvn.loc_of(i.a, sz);
+        if not in_header and not deref_ok(&mut l, sz) {
             return false;
         }
         for w in 0..gvn.writes.len {
-            if gvn.may_alias(&l, gvn.writes.at(w)) {
+            if gvn.may_alias(&mut l, gvn.writes.at_mut(w)) {
                 return false;
             }
         }
@@ -875,7 +878,7 @@ fn hoist_ok(i: *mut ir.Value, tag: i64, in_header: bool) bool {
         }
         if fx == ir.FX_READS {
             for w in 0..gvn.writes.len {
-                if not gvn.unseen_by(gvn.writes.at(w), i) {
+                if not gvn.unseen_by(gvn.writes.at_mut(w), i) {
                     return false;
                 }
             }
@@ -1068,8 +1071,8 @@ pub fn loop_idioms(f: *mut ir.Func) bool {
         return false;
     }
     opt.compute_preds(f);
-    let order = opt.dominators(f);
-    let hs = opt.loop_headers(&order);
+    let mut order = opt.dominators(f);
+    let mut hs = opt.loop_headers(&order);
     let mut members = u.List.[*mut ir.Block].empty();
     let mut any = false;
     for k in 0..hs.len {
@@ -1350,8 +1353,8 @@ pub fn split_loops(f: *mut ir.Func) bool {
     while rounds < 8 {
         rounds += 1;
         opt.compute_preds(f);
-        let order = opt.dominators(f);
-        let hs = opt.loop_headers(&order);
+        let mut order = opt.dominators(f);
+        let mut hs = opt.loop_headers(&order);
         let mut members = u.List.[*mut ir.Block].empty();
         let mut did = false;
         for k in 0..hs.len {
@@ -1567,7 +1570,7 @@ fn fill_places(r: *mut ir.Block, users: []*mut ir.Value, to: *mut u.List.[*mut i
 
 fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mut ir.Value) void {
     if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux >= 0) {
-        uses.at(@int_cast(usize, o.aux)).push(x);
+        uses.at_mut(@int_cast(usize, o.aux)).push(x);
     }
 }
 
@@ -1684,7 +1687,7 @@ pub fn sink(f: *mut ir.Func) bool {
         return false;
     }
     opt.compute_preds(f);
-    let order = opt.dominators(f);
+    let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
     // users of each instruction (reachable ones): again when sink_fills
     // moved memsets (the lists hold the ones it took out)
@@ -1692,7 +1695,7 @@ pub fn sink(f: *mut ir.Func) bool {
     let mut any = sink_fills(f, &uses);
     if any {
         for k in 0..uses.len {
-            u.free(@ptr_cast(*mut void, uses.at(k).data));
+            u.free(@ptr_cast(*mut void, uses.at_mut(k).data));
         }
         uses.deinit();
         uses = sink_uses(f, &order);
@@ -1770,7 +1773,7 @@ pub fn sink(f: *mut ir.Func) bool {
         }
     }
     for k in 0..uses.len {
-        u.free(@ptr_cast(*mut void, uses.at(k).data));
+        u.free(@ptr_cast(*mut void, uses.at_mut(k).data));
     }
     uses.deinit();
     order.deinit();
@@ -2020,7 +2023,7 @@ fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                     let mut q = gvn.vnil();
                     let mut d: i64 = 0;
                     for k in 0..ivps.len {
-                        let e = ivps.at(k);
+                        let e = ivps.at_mut(k);
                         if u.isnil(q) and (e.step == st) {
                             if (e.base == base) and (e.off0 == off0) {
                                 q = e.q;
@@ -2070,8 +2073,8 @@ pub fn reduce_addresses(f: *mut ir.Func, no_modes: bool) bool {
     }
     let mut any = false;
     opt.compute_preds(f);
-    let order = opt.dominators(f);
-    let hs = opt.loop_headers(&order);
+    let mut order = opt.dominators(f);
+    let mut hs = opt.loop_headers(&order);
     let mut members = u.List.[*mut ir.Block].empty();
     // inner loops first (their pointers' starts are then reduced in the outer ones)
     let mut k = hs.len;

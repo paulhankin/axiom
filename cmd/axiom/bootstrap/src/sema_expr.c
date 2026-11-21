@@ -18,7 +18,32 @@ static Expr *mkconv(Expr *e, ConvKind k, Type *t) {
     c->op = k;
     c->type = t;
     c->cat = CAT_VALUE;
+    c->weakened = e->weakened;
     return c;
+}
+
+static Type *weaken_mut(Type *t) {
+    if (!t) return t;
+    switch (t->kind) {
+    case TY_PTR: return t->mut ? type_ptr(t->elem, false) : t;
+    case TY_SLICE: return t->mut ? type_slice(t->elem, false) : t;
+    case TY_OPT: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return type_opt(w);
+        return t;
+    }
+    case TY_ERRUNION: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return type_errunion_set(w, t->decl);
+        return t;
+    }
+    case TY_ARRAY: {
+        Type *w = weaken_mut(t->elem);
+        if (w != t->elem) return t->len_param ? type_array_param(w, t->len_param) : type_array(w, t->len);
+        return t;
+    }
+    default: return t;
+    }
 }
 
 static Type *unwrap_hint(Type *t) {
@@ -245,6 +270,29 @@ void coerce(Expr **pe, Type *target) {
             return;
         }
     }
+    if (e->weakened && weaken_mut(target) == s) {
+        Diag *d = diag_error(e->span, "E0707", "cannot obtain %s through an immutable place (weakened to %s)",
+                             type_str(target), type_str(s));
+        diag_types(d, type_str(target), type_str(s));
+        if (C && C->fn && C->fn->params.len > 0) {
+            Param *p0 = &C->fn->params.data[0];
+            if (p0->name && !strcmp(p0->name, "self") && p0->te && p0->te->kind == TE_PTR && !p0->te->mut) {
+                DiagFix *fx = diag_fix(d, "make 'self' mutable", "suggestion");
+                Span ts = p0->te->span;
+                diag_fix_edit(fx, (Span){ts.file, ts.start + 1, ts.start + 1}, "mut ");
+            }
+        }
+        if (C && C->in_return && C->fn && C->fn->ret_te) {
+            TypeExpr *rt = C->fn->ret_te;
+            while (rt && (rt->kind == TE_ERRUNION || rt->kind == TE_OPT)) rt = rt->elem;
+            if (rt && (rt->kind == TE_PTR || rt->kind == TE_SLICE) && rt->mut && rt->elem) {
+                DiagFix *fx = diag_fix(d, "return an immutable view", "suggestion");
+                Span rep = {rt->span.file, rt->span.start, rt->elem->span.start};
+                diag_fix_edit(fx, rep, rt->kind == TE_PTR ? "*" : "[]");
+            }
+        }
+        return;
+    }
     type_mismatch(e, target, s);
 }
 
@@ -347,6 +395,26 @@ bool is_mut_place(Expr *e) {
         if (e->op == IDX_ARRAY) return is_mut_place(e->a);
         return e->a->type->mut;
     default: return false;
+    }
+}
+
+// True iff place `e` is reached through an immutable pointer (`*T`) or immutable slice (`[]T`).
+static bool via_immut_indirection(Expr *e) {
+    for (;;) {
+        if (e->kind == E_DEREF) return e->a->type->kind == TY_PTR && !e->a->type->mut;
+        if (e->kind == E_FIELD && e->op == FK_STRUCT) {
+            if (e->self_mode == SELF_DEREF) return !e->a->type->mut;
+            e = e->a;
+            continue;
+        }
+        if (e->kind == E_INDEX) {
+            if (e->op == IDX_ARRAY) {
+                e = e->a;
+                continue;
+            }
+            return !e->a->type->mut;
+        }
+        return false;
     }
 }
 
@@ -671,6 +739,16 @@ static Type *check_binary(Expr *e, Type *expected) {
         coerce(&e->b, l);
         t = l;
     } else {
+        if ((op == TK_EQEQ || op == TK_NE) && l->kind == TY_PTR && r->kind == TY_PTR && l->elem == r->elem &&
+            l->mut != r->mut) {
+            if (l->mut) {
+                coerce(&e->a, r);
+                l = r;
+            } else {
+                coerce(&e->b, l);
+                r = l;
+            }
+        }
         t = l;
         if (l != r && l->kind != TY_INVALID && r->kind != TY_INVALID && l->kind != TY_NEVER && r->kind != TY_NEVER &&
             !(l->kind == TY_ERROR && r->kind == TY_ERROR)) {
@@ -896,6 +974,7 @@ static void resolve_ident(Expr *e) {
         e->local = l;
         e->cat = CAT_VALUE;
         e->type = l->type;
+        e->weakened = l->weakened;
         return;
     }
     Type *gp = lookup_gparam(&C->tc, e->name);
@@ -1036,7 +1115,16 @@ static Type *check_field(Expr *e) {
         if (fi >= 0) {
             e->op = FK_STRUCT;
             e->index = fi;
-            return e->type = type_field(base, fi);
+            Type *ft = type_field(base, fi);
+            bool base_immut = (e->self_mode == SELF_DEREF) ? !t->mut : via_immut_indirection(a);
+            if (base_immut) {
+                Type *wt = weaken_mut(ft);
+                if (wt != ft) {
+                    ft = wt;
+                    e->weakened = true;
+                }
+            }
+            return e->type = ft;
         }
     }
     if (base->kind == TY_STRUCT || base->kind == TY_UNION || base->kind == TY_ENUM) {
@@ -1059,6 +1147,7 @@ static Type *check_field(Expr *e) {
         }
         if (name == intern_cstr("ptr")) {
             e->op = FK_SLICE_PTR;
+            e->weakened = a->weakened;
             return e->type = type_ptr(t->elem, t->mut);
         }
     }
@@ -1614,11 +1703,12 @@ static void check_return_value(Expr **pe, Span sp) {
         diag_error((*pe)->span, "E0603", "a void function cannot return a value");
         return;
     }
-    if (r->kind == TY_ERRUNION && r->elem->kind == TY_VOID) {
-        check_expr_to(pe, r);
-        return;
-    }
-    check_expr_to(pe, r);
+    check_expr(*pe, r);
+    bool prev_ret = C->in_return;
+    C->in_return = true;
+    coerce(pe, r);
+    C->in_return = prev_ret;
+    if (r->kind == TY_ERRUNION && r->elem->kind == TY_VOID) return;
     check_escape(*pe);
 }
 
@@ -1664,6 +1754,7 @@ static Type *check_catch(Expr *e) {
         break;
     }
     scope_pop();
+    e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
 
@@ -1692,6 +1783,7 @@ static Type *check_orelse(Expr *e) {
                        type_str(vt));
         break;
     }
+    e->weakened = e->a->weakened || (e->hkind == H_VALUE && e->hexpr && e->hexpr->weakened);
     return e->type = vt;
 }
 
@@ -1713,6 +1805,7 @@ static Type *check_try(Expr *e) {
         check_leave_ok(e->span, false);
         try_fits(e->span, t->decl, C->ret->decl);
     }
+    e->weakened = e->a->weakened;
     return e->type = t->elem;
 }
 
@@ -1748,6 +1841,7 @@ static Type *check_index(Expr *e) {
         }
         if (e->b->is_const && t->kind == TY_ARRAY && !t->len_param && (e->b->cval < 0 || e->b->cval >= t->len))
             diag_error(e->b->span, "E0541", "index %s is out of bounds for %s", i128_str(e->b->cval), type_str(t));
+        if (elem) e->weakened = e->a->weakened;
         return e->type = elem ? elem : t_invalid;
     }
     // slice
@@ -1771,6 +1865,7 @@ static Type *check_index(Expr *e) {
     } else {
         mut = t->mut;
     }
+    e->weakened = e->a->weakened;
     return e->type = type_slice(elem, mut);
 }
 
@@ -1814,6 +1909,7 @@ static Type *check_operand(Expr *e, Type *expected) {
         Type *ot = find_opt_expected(expected);
         if (ot) {
             check_expr_to(&e->a, ot->elem);
+            e->weakened = e->a->weakened;
             return e->type = ot;
         }
         Type *it = check_expr(e->a, NULL);
@@ -1826,6 +1922,7 @@ static Type *check_operand(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if (it->kind == TY_INVALID) return e->type = t_invalid;
+        e->weakened = e->a->weakened;
         return e->type = type_opt(it);
     }
     case E_EMPTY_SLICE: {
@@ -1863,7 +1960,15 @@ static Type *check_operand(Expr *e, Type *expected) {
                 diag_error(e->span, "E0705", "cannot dereference *void; convert it with @ptr_cast first");
                 return e->type = t_invalid;
             }
-            return e->type = t->elem;
+            Type *res = t->elem;
+            if (!t->mut) {
+                Type *wt = weaken_mut(res);
+                if (wt != res) {
+                    res = wt;
+                    e->weakened = true;
+                }
+            }
+            return e->type = res;
         }
         if (t->kind != TY_INVALID) diag_error(e->span, "E0705", "cannot dereference a value of type %s", type_str(t));
         return e->type = t_invalid;

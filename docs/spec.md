@@ -883,6 +883,12 @@ A place is **mutable** if it is any of the following:
 - `p.*` or `p.f` where `p: *mut T`,
 - `s[i]` where `s: []mut T`.
 
+Immutability is **transitive through field projection**: projecting a field of pointer or
+slice type (`*mut U`, `[]mut U`, or an optional, error-union, or array containing one)
+through an immutable pointer (`*S`) or immutable slice (`[]S`) weakens `*mut U` to `*U`
+and `[]mut U` to `[]U` (§7.9). Using such a weakened value where a mutable pointer or
+slice is required is `E0707`.
+
 The left-hand side of an assignment must be a mutable place (`E0701`).
 
 ### 7.3 Operators
@@ -901,7 +907,8 @@ The logical operators are the keywords `and`, `or` and `not`. That leaves `!` to
 propagation (`e!`) and error-union types (`!T`), with no lexical ambiguity between them.
 
 Both operands of a binary operator must have the **same type**, after literal typing
-(`E0412` otherwise). Axiom has no implicit widening, and mixed `u32 + u64` is an error.
+(`E0412` otherwise), except that `==` and `!=` between `*mut T` and `*T` coerce `*mut T`
+to `*T`. Axiom has no implicit widening, and mixed `u32 + u64` is an error.
 
 Structs, unions, arrays and slices do not support `==`. Compare them field by field or
 with `@mem_eq` (Appendix A).
@@ -1076,6 +1083,13 @@ nothing. Write the `%`-suffixed operators (`A +% 100`) to wrap a constant on pur
 `e.f` reads field `f`. If `e` has type `*T` or `*mut T` with `T` a struct, `e.f` means
 `e.*.f`. This is the only automatic dereference in the language, and it goes exactly one
 level deep. `e.len` and `e.ptr` on slices and `e.len` on arrays are built-in fields.
+
+If the base of a struct field access is reached through an immutable pointer (`*S`) or
+immutable slice (`[]S`), any `*mut U` or `[]mut U` inside the field's type (directly or
+within `?`, `!`, or `[N]`) weakens to `*U` or `[]U`. Obtaining `*mut U` or `[]mut U`
+through such a field requires a mutable base (`*mut S`, `[]mut S`, or a direct local
+binding). Failing to satisfy a `*mut` or `[]mut` expectation because of this weakening is
+`E0707`.
 
 ### 7.10 Struct literals
 
@@ -2833,6 +2847,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0704 | Slicing a temporary array |
 | E0705 | Dereferencing `*void` or a non-pointer |
 | E0706 | A pointer operation that needs `*mut`, or assignment to a non-place |
+| E0707 | Cannot obtain `*mut` or `[]mut` through an immutable place |
 | E0801 | Type not allowed at the export or import boundary |
 | E0802 | Export name used more than once |
 | E0810 | Comparing vectors with `==` or `<` (use `@lanes_eq`, …) |

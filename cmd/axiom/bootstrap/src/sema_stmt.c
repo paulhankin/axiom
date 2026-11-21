@@ -256,6 +256,7 @@ static void check_match(Stmt *s, bool *diverges) {
                         else {
                             Type *pt = ref_ptr ? type_ptr(base->elem, ref_ptr->mut) : base->elem;
                             a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
+                            a->bind_local->weakened = s->e->weakened;
                         }
                     }
                 } else {
@@ -304,6 +305,7 @@ static void check_match(Stmt *s, bool *diverges) {
                         else {
                             Type *bt = ref_ptr ? type_ptr(pt, ref_ptr->mut) : pt;
                             a->bind_local = declare_local(a->bind, a->bind_span, bt, false, false);
+                            a->bind_local->weakened = s->e->weakened;
                         }
                     }
                 }
@@ -471,6 +473,7 @@ bool check_stmt(Stmt *s) {
         }
         if (s->e->type && s->e->type->kind == TY_NEVER) div = true;
         s->local = declare_local(s->name, s->name_span, t, s->mut, false);
+        if (s->e) s->local->weakened = s->e->weakened;
         break;
     }
     case S_EXPR: {

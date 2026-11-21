@@ -32,6 +32,7 @@ typedef struct FnCtx {
     Vec(bool) loop_breaks;  // per enclosing loop: has a break targeting it
     Vec(Sym) loop_labels;   // per enclosing loop: its label, or NULL
     bool const_ctx;
+    bool in_return;
 } FnCtx;
 
 extern FnCtx *C;
