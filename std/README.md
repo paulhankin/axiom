@@ -75,7 +75,7 @@ that owns memory has `deinit`).
 |---|---|
 | [`time`](time.ax) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`, `Weekday`), RFC 3339 and HTTP dates, `sleep` |
 | [`time/tz`](time/tz.ax) | Time zones: TZif files (RFC 8536, v1–v4) from the system's database (`Zone.load`, safe names) or bytes, POSIX TZ rules, `Zone.local` (`$TZ`, `/etc/localtime`); `lookup` (offset, DST, abbreviation), `to_local`, and `from_local` with PEP 495 folds for repeated and skipped times. Checked against Python's `zoneinfo` ([`time/tz/testdata`](time/tz/testdata)) |
-| [`time/cron`](time/cron.ax) | Cron expressions (Vixie cron's syntax): five fields or six with seconds, lists, ranges, steps, month and day names, `@daily` and the other macros, `L` and `5L`, day-of-month/day-of-week OR rule; `Schedule.next` / `prev` in UTC and `next_in` / `prev_in` a `tz.Zone` (skipped local times fire at the change, repeated ones once unless hourly); hand-checked cases incl. leap years and DST changes |
+| [`time/cron`](time/cron.ax) | Cron expressions (Vixie cron's syntax): five fields or six with seconds, lists, ranges, steps, month and day names, `@daily` and the other macros, `L` and `5L`, day-of-month/day-of-week OR rule; `Schedule.next_utc` / `prev_utc` in UTC and `next_in` / `prev_in` a `tz.Zone` (skipped local times fire at the change, repeated ones once unless hourly); hand-checked cases incl. leap years and DST changes |
 
 ## Networking
 
@@ -338,16 +338,28 @@ export fn main() i32 {
 See also [`examples/wordcount/wordcount.ax`](../examples/wordcount/wordcount.ax) and
 [`examples/http_server/http_server.ax`](../examples/http_server/http_server.ax), a JSON API over HTTP.
 
-Iterators (`str.split`, `regex.find_all`, …) have a `next()` that returns
-`.none` after the last item (with `!` when an iteration step can fail):
+Iterators (`str.split`, `regex.find_all`, `Map.iter`, …) have one protocol (spec
+§15.3): `next(self: *mut Self) ?T`, or `E!?T` when a step can fail, and the end is
+always `.none`. A `while let` loop drives one; the collections give entries of
+pointers into themselves (`e.key: *K`, `e.value: *mut V`):
 
 ```axiom
 let mut it = str.split(line, ",");
-loop {
-    let field = it.next() ?? break;
+while let .some(field) = it.next() {
+    ...
+}
+let mut es = ages.iter();
+while let .some(e) = es.next() {
+    e.value.* += 1;
+}
+let mut r = tar.Reader.init(bytes);
+while let .some(entry) = r.next()! {
     ...
 }
 ```
+
+A cursor read through its fields, such as the HTML and Markdown tree walkers, moves
+with `advance()` instead.
 
 ## Host ABI
 

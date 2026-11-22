@@ -7,7 +7,7 @@
 //     let v = m.get(5) ?? 0;
 //     let k = m.floor(7) ?? 0;              // the greatest key <= 7
 //     let mut it = m.iter();                // in key order
-//     while it.next(&mut k, &mut v) { ... }
+//     while let .some(e) = it.next() { ... e.key.* ... e.value.* ... }
 //     let mut r = m.iter_from(3);           // keys >= 3, in order
 //
 // Keys are ordered by `LESS` (`TreeMapDyn[K, V]` takes `less` at run time);
@@ -19,6 +19,7 @@
 // =============================================================================
 
 import "../mem.ax" as mem;
+import "map.ax" as maps;
 
 pub error TreemapError { NotFound, OutOfMemory }
 
@@ -382,13 +383,13 @@ struct Tree[K, V] {
 
     // --- iteration -----------------------------------------------------------------
 
-    fn iter(self: *Self) Iter.[K, V] {
+    fn iter(self: *mut Self) Iter.[K, V] {
         let mut it = Iter.[K, V].{ tree: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
         it.push_left(self.root);
         return it;
     }
 
-    fn iter_from[C, const LESS: fn(C, K, K) bool](self: *Self, ctx: C, lo: K) Iter.[K, V] {
+    fn iter_from[C, const LESS: fn(C, K, K) bool](self: *mut Self, ctx: C, lo: K) Iter.[K, V] {
         let mut it = Iter.[K, V].{ tree: self, stack: [NIL; MAX_HEIGHT], sp: 0 };
         let mut n = self.root;
         while n != NIL {
@@ -473,13 +474,14 @@ pub nocopy struct TreeMap[K, V, const LESS: fn(K, K) bool] {
         return self.t.take.[u8, call_less.[K, LESS]](0, k);
     }
 
-    /// Every entry in key order. Do not change the map while iterating.
-    pub fn iter(self: *Self) Iter.[K, V] {
+    /// Every entry in key order; values may be changed through the entries.
+    /// Do not add or remove entries while iterating.
+    pub fn iter(self: *mut Self) Iter.[K, V] {
         return self.t.iter();
     }
 
     /// The entries with keys >= lo, in key order.
-    pub fn iter_from(self: *Self, lo: K) Iter.[K, V] {
+    pub fn iter_from(self: *mut Self, lo: K) Iter.[K, V] {
         return self.t.iter_from.[u8, call_less.[K, LESS]](0, lo);
     }
 }
@@ -554,19 +556,22 @@ pub nocopy struct TreeMapDyn[K, V] {
         return self.t.take.[fn(K, K) bool, dyn_less.[K]](self.less, k);
     }
 
-    /// Every entry in key order. Do not change the map while iterating.
-    pub fn iter(self: *Self) Iter.[K, V] {
+    /// Every entry in key order; values may be changed through the entries.
+    /// Do not add or remove entries while iterating.
+    pub fn iter(self: *mut Self) Iter.[K, V] {
         return self.t.iter();
     }
 
     /// The entries with keys >= lo, in key order.
-    pub fn iter_from(self: *Self, lo: K) Iter.[K, V] {
+    pub fn iter_from(self: *mut Self, lo: K) Iter.[K, V] {
         return self.t.iter_from.[fn(K, K) bool, dyn_less.[K]](self.less, lo);
     }
 }
 
+/// The entries of a map in key order (TreeMap.iter, TreeMapDyn.iter and
+/// iter_from).
 pub struct Iter[K, V] {
-    tree: *Tree.[K, V],
+    tree: *mut Tree.[K, V],
     stack: [MAX_HEIGHT]u32,  // nodes whose left subtree is done
     sp: usize,
 
@@ -579,19 +584,17 @@ pub struct Iter[K, V] {
         }
     }
 
-    /// Stores the next entry through key and val and returns true, or
-    /// returns false at the end.
-    pub fn next(self: *mut Self, key: *mut K, val: *mut V) bool {
+    /// The next entry, with pointers to its key and value in the map, or
+    /// `.none` at the end.
+    pub fn next(self: *mut Self) ?maps.Entry.[K, V] {
         if self.sp == 0 {
-            return false;
+            return .none;
         }
         self.sp -= 1;
         let n = self.stack[self.sp];
         let i = @as(usize, n);
-        key.* = self.tree.keys[i];
-        val.* = self.tree.vals[i];
         self.push_left(self.tree.right[i]);
-        return true;
+        return maps.Entry.[K, V].{ key: &self.tree.keys[i], value: &mut self.tree.vals[i] };
     }
 }
 
@@ -646,11 +649,11 @@ test "ordered maps" {
     _ = check.[u64, u64, u8, call_less.[u64, lt]](&m.t, 0, m.t.root);
     // in order, and the values are the last put for each key
     let mut it = m.iter();
-    let mut k: u64 = 0;
-    let mut v: u64 = 0;
     let mut prev: u64 = 0;
     let mut n: usize = 0;
-    while it.next(&mut k, &mut v) {
+    while let .some(e) = it.next() {
+        let k = e.key.*;
+        let v = e.value.*;
         if n > 0 {
             @expect(k > prev);
         }
@@ -708,9 +711,11 @@ test "ordered maps" {
     }
     let mut r = s.iter_from(55);
     let mut sum: u64 = 0;
-    while r.next(&mut k, &mut v) {
-        sum += k;
+    while let .some(e) = r.next() {
+        sum += e.key.*;
+        e.value.* += 1;
     }
+    @expect_eq(s.get(60) ?? 0, 7);
     @expect_eq(sum, 60 + 70 + 80 + 90 + 100);
     (s.get_ptr(10) ?? {
         @trap();
@@ -731,12 +736,8 @@ test "ordered maps of strings" {
     m.put("apple", 2)!;
     m.put("fig", 3)!;
     let mut it = m.iter();
-    let mut k: []u8 = "";
-    let mut v: i32 = 0;
-    @expect(it.next(&mut k, &mut v));
-    @expect_eq(k, "apple");
-    @expect(it.next(&mut k, &mut v));
-    @expect_eq(k, "fig");
+    @expect_eq((it.next() ?? @trap()).key.*, "apple");
+    @expect_eq((it.next() ?? @trap()).key.*, "fig");
 }
 
 test "TreeMapDyn" {
@@ -772,11 +773,9 @@ test "TreeMapDyn" {
         @trap();
     }, 42);
     let mut r = m.iter_from(85);
-    let mut k: u64 = 0;
-    let mut v: u64 = 0;
     let mut sum: u64 = 0;
-    while r.next(&mut k, &mut v) {
-        sum += k;
+    while let .some(e) = r.next() {
+        sum += e.key.*;
     }
     @expect_eq(sum, 85 + 90 + 95);
     m.clear();
