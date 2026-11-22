@@ -61,6 +61,9 @@ fn gen_inst(v: *mut ir.Value) void {
     if (v.flag & 4) != 0 {
         return;  // (part of its user: a bit select or a bit clear)
     }
+    if (v.flag & (F_OVBR | F_OVPART)) != 0 {
+        return;  // (computed with an overflow: at its branch or select, or with its multiply)
+    }
     if (v.flag & 8) != 0 {
         gen_bsl(v);
         return;
@@ -541,6 +544,7 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
+    mark_overflow(f);  // (after the others: it takes only what they left alone)
 }
 
 // x + (p <u q) where p = q + r (the carry of a sum, which cmn q, r sets as
@@ -666,4 +670,221 @@ fn gen_carry(v: *mut ir.Value) void {
     } else {
         raw3(word, d, ry, rw);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Overflow from the flags
+// -----------------------------------------------------------------------------
+// The overflow of an operation that the branch of its block or a select
+// there tests, with nothing else in the block reading it (F_OVBR: computed
+// there by cond_code, ov_flags), and the operation and the parts of the
+// idiom that it computes there, or the plain product beside a
+// multiplication's overflow that the overflow's multiply gives (F_OVPART).
+const F_OVBR: i32 = 8192;
+const F_OVPART: i32 = 16384;
+
+// A multiplication's overflow (IN_UMUL_OV, IN_SMUL_OV), and the plain
+// product of the same operands (one it dominates, or one before it in its
+// block) if its multiply gives that (8 and 16 bits, and 64 bits signed): the
+// product moves next to the overflow and is marked F_OVPART (paired_mul). An
+// overflow that the branch of its block or a select there tests, an
+// intrinsic's or the idiom of an add's or sub's (is.ov_match), with nothing
+// else in the block reading it or the operation's result, is computed
+// there: `cset; cmp; b.ne` becomes `b.ne`, `eor; eor; and; cmp; b.lt`
+// becomes `adds; b.vs`, `cmp; b.lo` and the sub after it `subs; b.lo`.
+fn mark_overflow(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let nx = i.next;
+            if ir.is_mul_ov(i) and (i.xs.len == 2) and ir.mul_ov_width(i.xs.get(0).ty) and (i.flag == 0) {
+                pair_mul_ov(i);
+            }
+            i = nx;
+        }
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) {
+            mark_ov_branch(b, t);
+        }
+        b = b.next;
+    }
+}
+
+// The user of a multiplication's overflow i that reads its flags, i's only
+// use in its block (others are after it): the branch of the block, or a
+// select of general registers there; or nil.
+fn ov_user(i: *mut ir.Value) *mut ir.Value {
+    let ib = i.blk;
+    let t = ir.terminator(ib);
+    if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a == i) and (t.t1 != t.t2) and is.used_after(i, ib, t, t) {
+        return t;
+    }
+    let none = u.nil.[ir.Value]();
+    let mut s = none;
+    let mut q = i.first_use;
+    while u.notnil(q) {
+        let x = ir.use_user(q);
+        if (x.blk == ib) and (x.op != ir.OP_PHI) {
+            if u.notnil(s) or (x.op != ir.OP_SELECT) or (x.a != i) or (x.b == i) or (x.c == i) or (x.flag != 0) or
+               (class_of(x.ty) != GPR) {
+                return none;
+            }
+            s = x;
+        }
+        q = q.next;
+    }
+    return s;
+}
+
+fn pair_mul_ov(i: *mut ir.Value) void {
+    let a = i.xs.get(0);
+    let b = i.xs.get(1);
+    let ib = i.blk;
+    let bits = a.ty.bits;
+    let mut m = u.nil.[ir.Value]();
+    if (bits < 32) or ((bits == 64) and (ir.intr_id(i) == ir.IN_SMUL_OV)) {
+        // the plain product: in i's block, or in one i dominates
+        m = is.find_op(ir.OP_MUL, a, b, true, ib);
+    }
+    let s = ov_user(i);
+    if u.notnil(s) and (u.isnil(m) or is.used_after(m, ib, s, s)) {
+        // computed at the branch or select (its result, if any, read after it)
+        i.flag = i.flag | F_OVBR;
+    }
+    if u.isnil(m) {
+        return;
+    }
+    if (m.blk == ib) and is.before_in_block(m, i) and ((i.flag & F_OVBR) == 0) {
+        is.unlink_inst(i);
+        ir.insert_before(m.next, i);  // (i reads only what m reads)
+    } else {
+        is.unlink_inst(m);
+        ir.insert_before(i.next, m);  // (what m reads is there for i; what reads m comes after it)
+    }
+    m.flag = m.flag | F_OVPART;
+    i.aux2 = @as(i64, m.id) + 1;
+}
+
+// The plain product beside a multiplication's overflow i that i's multiply
+// gives (pair_mul_ov), or nil.
+fn paired_mul(i: *mut ir.Value) *mut ir.Value {
+    if i.aux2 == 0 {
+        return u.nil.[ir.Value]();
+    }
+    let mut j = i.blk.first;
+    while u.notnil(j) {
+        if (@as(i64, j.id) + 1) == i.aux2 {
+            return j;
+        }
+        j = j.next;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// The add or sub whose overflow b's branch t tests (is.ov_match), with its
+// result read only after b (and by the test): computed at the branch.
+fn mark_ov_branch(b: *mut ir.Block, t: *mut ir.Value) void {
+    let c = t.a;
+    if (c.kind != ir.V_INST) or (c.blk != b) or (c.op != ir.OP_ICMP) or ((c.flag & ~2) != 0) or
+       not is.used_after(c, b, t, t) {
+        return;
+    }
+    let mut kind: i32 = 0;
+    let v = is.ov_match(c, &mut kind, 0);
+    if u.isnil(v) or (v.flag != 0) or ((v.blk != b) and not is.dominates(b, v.blk)) {
+        return;
+    }
+    let x = c.a;
+    let signed = (kind & is.OV_UNSIGNED) == 0;
+    if signed {
+        // (the and and its xors, read only there)
+        if (x.nuses != 1) or (x.blk != b) or (x.flag != 0) or (x.a.nuses != 1) or (x.b.nuses != 1) or (x.a.blk != b) or
+           (x.b.blk != b) or (x.a.flag != 0) or (x.b.flag != 0) {
+            return;
+        }
+        if not is.used_after(v, b, x.a, x.b) {
+            return;
+        }
+    } else if not is.used_after(v, b, c, c) {
+        return;
+    }
+    let ops: [2]*mut ir.Value = [v.a, v.b];
+    for o in ops {
+        if (o.kind == ir.V_INST) and ((o.flag & 4) != 0) {
+            return;  // (computed by its user)
+        }
+    }
+    if v.blk != b {
+        is.unlink_inst(v);
+        ir.insert_before(t, v);
+    }
+    c.flag = (c.flag & ~2) | F_OVBR;
+    v.flag = v.flag | F_OVPART;
+    if signed {
+        x.flag = F_OVPART;
+        x.a.flag = F_OVPART;
+        x.b.flag = F_OVPART;
+    }
+}
+
+// The flags of overflow condition c (F_OVBR) from its operation, computed
+// here (at the end of c's block, or at its select) into the register of the
+// value it gives too: the condition code that is c. Signed: adds or subs
+// sets V; unsigned: C, set by an add's carry, clear on a sub's borrow (a
+// constant operand: an immediate of either, which gives the same flags).
+// Of 8 and 16 bits: the operation on the operands shifted to the top of 32
+// bits, whose flags are the narrow operation's, then the result shifted
+// back.
+fn ov_flags(c: *mut ir.Value) i32 {
+    if ir.is_mul_ov(c) {
+        return mul_ov_flags(c);
+    }
+    let mut kind: i32 = 0;
+    let v = is.ov_match(c, &mut kind, F_OVPART);
+    let sub = v.op == ir.OP_SUB;
+    let mut a = v.a;
+    let mut b = v.b;
+    if not sub and is.is_c(a) {
+        a = v.b;
+        b = v.a;
+    }
+    let bits = v.ty.bits;
+    let sf = sfv(v.ty);
+    let d = vreg(v);
+    if bits >= 32 {
+        let ra = reg(a);
+        if is.is_c(b) and addsub_imm_ok(is.cval(b)) and (is.cval(b) != 0) {
+            let mut x = is.cval(b);
+            if sub {
+                x = -x;
+            }
+            // (adds of -k sets the flags of subs of k: for k not 0, C is x >=u k, and V the same)
+            add_imm_s(sf, d, ra, x, true);
+        } else {
+            raw3(ae.addsub_reg(sf, sub, true, 0, 0, 0, 0, 0), d, ra, reg(b));
+        }
+    } else {
+        let s = @as(u64, @bit_cast(u32, 32 - bits));
+        let t = vgpr();
+        raw2(ae.lsl_imm(0, 0, 0, s), t, reg(a));
+        let w = vgpr();
+        raw3(ae.addsub_reg(0, sub, true, 0, 0, 0, 0, s), w, t, reg(b));
+        if (kind & is.OV_UNSIGNED) == 0 {
+            raw2(ae.asr_imm(0, 0, 0, s), d, w);
+        } else {
+            raw2(ae.lsr_imm(0, 0, 0, s), d, w);
+        }
+    }
+    let mut cc = VS;
+    if (kind & is.OV_UNSIGNED) != 0 {
+        cc = HS;
+        if sub {
+            cc = LO;
+        }
+    }
+    if (kind & is.OV_NOT) != 0 {
+        cc = is.invert(cc);
+    }
+    return cc;
 }
