@@ -161,7 +161,7 @@ that lacks the extensions it was built with.
 | Option | |
 |---|---|
 | `-O0` … `-O3` | Optimization level (default `-O0`). |
-| `--overflow=wrap\|trap\|saturate` | Integer overflow mode (spec §7.6; default `wrap`). |
+| `--overflow=wrap\|trap\|saturate\|report` | Integer overflow mode (spec §7.6; default `wrap`). `report` wraps, and the first time an operation overflows at a source location the program writes `file:line:col: integer overflow (T0002), wrapped: <code>` to its standard error, or appends it to the file `AXIOM_OVERFLOW_LOG` names. |
 | `--stack-traces=on\|off` | Record call sites for crash traces and profiles (default on; spec §16.4). |
 | `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). Default `none`, but for `axiom test` (see there). |
 | `--coverage=afl\|none` | Native Linux targets: edge coverage counters for a coverage-guided fuzzer, and its fork server (spec §16.9; default `none`). |
@@ -263,6 +263,7 @@ system's C library either) is a static executable. A WebAssembly program whose
 | `AXIOM_CACHE` | The cache directory: compiled modules in `<cache>/obj/`, git dependencies in `<cache>/`. Otherwise `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`. |
 | `AXIOM_UPDATE_URL` | The repository `axiom update` updates from, instead of `https://github.com/paulhankin/axiom`: a mirror whose `releases/download/v<version>/` holds the release archives and `SHA256SUMS`, and which git can fetch from. |
 | `AXIOM_JOBS` | How many modules (`--units=module`), or parts of an optimized program, are compiled at once: the number of processors by default. The output does not depend on it. |
+| `AXIOM_OVERFLOW_LOG` | Read by a program built with `--overflow=report`, not by the compiler: the file its reports of overflows are appended to, instead of its standard error. |
 | `AXIOM_CACHE_LIMIT` | The size the compiled-module cache is kept under after a build: a number of bytes, or one with a `k`, `m` or `g` suffix; `0` for no limit; 2 GiB by default (spec §16.7). |
 
 The variables that switch on debugging output inside the compiler are listed in

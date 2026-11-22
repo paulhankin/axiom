@@ -981,8 +981,56 @@ fn saturated(t: *mut ir.Ty, neg_direction: *mut ir.Value) *mut ir.Value {
     return cx.sel(neg_direction, int_min(t), int_max(t, true));
 }
 
+// --overflow=report: the mode of the code being generated, which is wrap in
+// the report's own module (std/internal/runtime/overflow.ax).
+pub fn overflow_mode() i32 {
+    let m = cx.O.overflow;
+    if (m == cx.OVF_REPORT) and u.notnil(cx.F) and u.notnil(cx.F.decl) and u.notnil(cx.F.decl.module) and
+       u.str_eq(u.file_of(cx.F.decl.module.file.id).display, "std/internal/runtime/overflow.ax") {
+        return cx.OVF_WRAP;
+    }
+    return m;
+}
+
+// The declaration of std/internal/runtime/overflow.ax's report (found once
+// per thread).
+threadlocal let mut g_report_decl: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+
+// --overflow=report: unless `ok` holds, the site's record goes to the report
+// (std/internal/runtime/overflow.ax: report), and the code goes on.
+pub fn check_or_report(ok: *mut ir.Value) void {
+    if cx.is_const_int(ok) and (ok.cv == 1) {
+        return;
+    }
+    if u.isnil(g_report_decl) {
+        let P = modl.g_prog;
+        for i in 0..P.fns.len {
+            let d = P.fns.get(i);
+            if u.str_eq(d.name, "report") and u.notnil(d.module) and
+               u.str_eq(u.file_of(d.module.file.id).display, "std/internal/runtime/overflow.ax") {
+                g_report_decl = d;
+            }
+        }
+        if u.isnil(g_report_decl) {
+            cx.internal_error("std/internal/runtime/overflow.ax has no report (is --std right?)");
+            return;
+        }
+    }
+    let fi = get_inst(g_report_decl, ty.no_types());
+    let cont = cx.new_bb("ok".ptr);
+    let bad = cx.new_bb("overflow".ptr);
+    bad.unlikely = true;
+    cx.condbr(ok, cont, bad);
+    cx.at_end(bad);
+    let mut args: [1]*mut ir.Value = [cgrt.site_record(cgrt.T_OVERFLOW, cx.S.cur_span)];
+    _ = cx.call(fi.llty, fi.fnv, args[..]);
+    cx.br(cont);
+    cx.at_end(cont);
+}
+
 pub fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
-    if cx.O.overflow == cx.OVF_WRAP {
+    let mode = overflow_mode();
+    if mode == cx.OVF_WRAP {
         if base == 0 {
             return cx.b_add(l, r);
         }
@@ -993,7 +1041,11 @@ pub fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Valu
     }
     let t = l.ty;
     let o = op_with_overflow(base, is_signed, l, r);
-    if cx.O.overflow == cx.OVF_TRAP {
+    if mode == cx.OVF_REPORT {
+        check_or_report(cx.b_not(o.ovf));
+        return o.val;
+    }
+    if mode == cx.OVF_TRAP {
         cgrt.check_or_trap(cx.b_not(o.ovf), cgrt.T_OVERFLOW);
         // (what uses the result comes after the check, where it did not
         // overflow; the check itself reads the operation's own bits, which
@@ -1156,15 +1208,19 @@ pub fn gen_binop(op: lx.TokKind, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.
         if not sgn {
             return ir.binop(cx.B, ir.OP_UDIV, l, r);
         }
-        if cx.O.overflow == cx.OVF_WRAP {
+        let mode = overflow_mode();
+        if (mode == cx.OVF_WRAP) or (mode == cx.OVF_REPORT) {
             // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
             let m1 = cx.icmp(ir.IntEQ, r, ir.cones(tt));
+            if mode == cx.OVF_REPORT {
+                check_or_report(cx.b_not(cx.b_and(cx.icmp(ir.IntEQ, l, int_min(tt)), m1)));
+            }
             let q = ir.binop(cx.B, ir.OP_SDIV, l, cx.sel(m1, ir.cint(tt, 1), r));
             return cx.sel(m1, ir.neg(cx.B, l), q);
         }
         let rm1 = cx.icmp(ir.IntEQ, r, ir.cones(tt));  // (right to left, as in the C implementation)
         let ovf = cx.b_and(cx.icmp(ir.IntEQ, l, int_min(tt)), rm1);
-        if cx.O.overflow == cx.OVF_TRAP {
+        if mode == cx.OVF_TRAP {
             cgrt.check_or_trap(cx.b_not(ovf), cgrt.T_OVERFLOW);
             return ir.binop(cx.B, ir.OP_SDIV, l, r);
         }
