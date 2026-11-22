@@ -18,7 +18,7 @@ compiles the sources correctly gives the same one.
 
    ```toml
    [seed]
-   version = "0.3.0"
+   version = "0.3.0-seed.1"
    linux-x86_64 = "<64 hex digits>"
    linux-aarch64 = "<64 hex digits>"
    macos-aarch64 = "<64 hex digits>"
@@ -32,10 +32,10 @@ compiles the sources correctly gives the same one.
 3. **The bootstrap compiler**, `cmd/axiom/bootstrap/`: a compiler for the language
    written in C, which uses LLVM 18. It is used while no file pins a release.
 
-No release is pinned yet: the newest one, 0.2.0, does not accept the language the
-compiler is now written in, so the bootstrap compiler is still the seed by default. The
-first release that builds the tree it was made from will be pinned, and the bootstrap
-compiler then stops being part of the build.
+The pinned seed is `0.3.0-seed.1`: the compiler of commit `4fea9e94`, made by
+`cmd/axiom/seed.sh` and published as a pre-release (which `axiom update` does not
+offer). A seed is a release's compiler without the standard library, made between
+releases when the compiler's sources need a newer language than the last release has.
 
 ## The rule a pinned seed brings
 
@@ -54,6 +54,7 @@ back to the C compiler.
 |---|---|---|
 | 0.1.0 | `3056b811` | the bootstrap compiler at that commit (C, LLVM 18) |
 | 0.2.0 | `871db851` | the bootstrap compiler at that commit (C, LLVM 18) |
+| 0.3.0-seed.1 (a seed) | `4fea9e94` | the bootstrap compiler at that commit (C, LLVM 18) |
 
 The archives are deterministic (`docs/releasing.md`): rebuilding a release from its seed
 gives the bytes its `SHA256SUMS` records.
