@@ -2662,6 +2662,12 @@ await section('', {
     "did you mean 'print'? fn print(", 'print');
   cases['two names as near: notes, no fix'] = near('fn f(abc: i32, abd: i32) i32 {\n    return abe;\n}\n', 'two-near',
     "did you mean 'abc'?", null);
+  cases['the editor completes in a poisoned body (`p.` being typed)'] = () => {
+    const f = path.join(tmp, 'one-complete.ax');
+    fs.writeFileSync(f, 'struct P {\n    xpos: i32,\n}\n\nfn f(p: P) i32 {\n    let a = p.\n    return 1;\n}\n');
+    const c = spawnSync(compiler, ['ide', f, '--query=completion', '--pos=5:14'], { encoding: 'utf8', input: '' });
+    return c.stdout.includes('"label":"xpos"') ? null : `completion: ${c.stdout}${c.stderr}`;
+  };
   cases['look-alikes of the idioms of other languages are not errors'] = codes('',
     'fn f(a: i64, b: i64, c: i64, d: i64) i64 {\n    if g(a<b, c>(d)) {\n        return a--b;\n    }\n    return 0;\n}\n\nfn g(x: bool, y: bool) bool {\n    return x and y;\n}\n', 'alike');
   await section('one error per mistake', cases, { timed: false });

@@ -2849,7 +2849,8 @@ with a syntax error is *poisoned*. What follows the error in it was parsed from 
 
 - the parser reports at most one `E0100` in it;
 - its body (a function's, or a global's initializer) is not checked; its signature is, so
-  code that uses it is checked as usual;
+  code that uses it is checked as usual (an editor's questions other than the
+  diagnostics, such as completion, still see the body's types);
 - no diagnostic inside it has a fix.
 
 When the parser cannot find where the statement with the error ends, it resumes at the next
