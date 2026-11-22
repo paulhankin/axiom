@@ -2158,11 +2158,12 @@ struct Cfg {
     loop_calls: bool,  // a block in a loop calls
     // hot_loops' scratch: the loops it weighs, a stretch's blocks and the
     // colder ones it reaches (by index in nl), marked in ins (1, 2; all 0
-    // between calls; empty: not yet made)
+    // between calls; empty: not yet made), and the predecessors in nl
     cands: u.List.[i32],
     hs: u.List.[i32],
     cs: u.List.[i32],
     ins: []mut u8,
+    preds: NlPreds,
 }
 
 fn find(p: *mut u.List.[i32], x: i32) i32 {
@@ -2431,7 +2432,7 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
     let cs = &mut g.cs;
     hs.clear();
     cs.clear();
-    let mut preds = NlPreds.{ start: u.newn.[i32](0), list: u.newn.[i32](0) };
+    let mut have_preds = false;
     for ci in 0..cands.len {
         let li = cands.get(ci);
         let l = f.loops.at(@int_cast(usize, li));
@@ -2503,8 +2504,9 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
                 defs = true;
             }
         }
-        if preds.start.len == 0 {
-            preds = nl_preds(f, g, ms);
+        if not have_preds {
+            nl_preds(f, g, ms, &mut g.preds);
+            have_preds = true;
         }
         // spill code on the edges touching the stretch, either way
         let mut one: f64 = 0.0;
@@ -2522,7 +2524,7 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
                     apart += edge_spill(ef, gap_label(ms, bj), gap_label(ms, sj), defs);
                 }
             }
-            for pj in preds.of(bj) {
+            for pj in g.preds.of(bj) {
                 let pju = @int_cast(usize, pj);
                 if ins[pju] != 1 {
                     let ef = edge_freq(f, g, @int_cast(usize, ms.nl[pju]), bi);
@@ -2602,19 +2604,27 @@ fn cold_calls(f: *MFunc, t: *Target, g: *Cfg, ms: *Split, l: *Loop, ins: []mut u
 }
 
 // The predecessors of the blocks of a split's nl within it (by index in
-// nl): those of block bj are list[start[bj]..start[bj + 1]].
+// nl): those of block bj are list[start[bj]..start[bj + 1]]. (Made again
+// for each vreg in the round's Cfg, and given back with it.)
 struct NlPreds {
-    start: []mut i32,
-    list: []mut i32,
+    start: u.List.[i32],
+    list: u.List.[i32],
 
     fn of(self: *NlPreds, bj: usize) []i32 {
-        return self.list[@int_cast(usize, self.start[bj])..@int_cast(usize, self.start[bj + 1])];
+        let st = self.start.items();
+        return self.list.items()[@int_cast(usize, st[bj])..@int_cast(usize, st[bj + 1])];
+    }
+
+    fn deinit(self: *mut NlPreds) void {
+        self.start.deinit();
+        self.list.deinit();
     }
 }
 
-fn nl_preds(f: *MFunc, g: *Cfg, ms: *Split) NlPreds {
+fn nl_preds(f: *MFunc, g: *Cfg, ms: *Split, p: *mut NlPreds) void {
     let m = ms.nl.len;
-    let start = u.newn.[i32](m + 2);
+    p.start.clear();
+    let start = p.start.extend(m + 2);
     for bj in 0..(m + 2) {
         start[bj] = 0;
     }
@@ -2630,7 +2640,8 @@ fn nl_preds(f: *MFunc, g: *Cfg, ms: *Split) NlPreds {
     for bj in 0..m {
         start[bj + 2] += start[bj + 1];
     }
-    let list = u.newn.[i32](@int_cast(usize, start[m + 1]) + 1);
+    p.list.clear();
+    let list = p.list.extend(@int_cast(usize, start[m + 1]));
     for pj in 0..m {
         let pb = f.blocks.get(@int_cast(usize, ms.nl[pj]));
         for k in 0..pb.succs.len {
@@ -2642,7 +2653,6 @@ fn nl_preds(f: *MFunc, g: *Cfg, ms: *Split) NlPreds {
             }
         }
     }
-    return NlPreds.{ start: start, list: list };
 }
 
 // The registers of the vreg's class free all through the stretch (hs): of
@@ -3970,7 +3980,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
                       cidx: u.newn.[i32](nb + 1), ev: u.newn.[u.List.[*mut MInst]](nb + 1),
                       stale: u.newn.[bool](nv + 1), nhot: u.newn.[i32](0), segs: segs, loop_calls: false,
                       cands: u.List.[i32].empty(), hs: u.List.[i32].empty(), cs: u.List.[i32].empty(),
-                      ins: u.newn.[u8](0) };
+                      ins: u.newn.[u8](0), preds: NlPreds.{ start: u.List.[i32].empty(), list: u.List.[i32].empty() } };
     for bi in 0..nb {
         g.npred[bi] = 0;
         g.label[bi] = false;
@@ -4134,6 +4144,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
     g.cands.deinit();
     g.hs.deinit();
     g.cs.deinit();
+    g.preds.deinit();
     spill_everywhere(f, t, every[0..nv]);
     spill_remat(f, t, rm[0..nv]);
 }

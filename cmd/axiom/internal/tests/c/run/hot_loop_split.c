@@ -3,7 +3,8 @@
    path through the loop that seldom runs (a grow path): the shapes the
    register allocator's hot-stretch splitting is for. They check the output,
    not the allocation: at the time of writing the allocator takes other
-   splits in these functions (tests/run/hot_stretch_*.ax take the new one).
+   splits in these functions (hot_stretch_split.c and hot_stretch_asm.c, and
+   tests/run/hot_stretch_*.ax, take the hot-stretch split).
    Shapes: a value changed only on the hot path and read on the cold one, a
    value changed only on the cold path and read on the hot one, exits from
    the middle of the loop, a loop inside an outer loop, and a cold path with
