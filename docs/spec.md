@@ -324,7 +324,7 @@ AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
                 | "&=" | "|=" | "^=" | "<<=" | ">>="
 
 IfStmt        ::= "if" ( Expr | "let" Patterns "=" Expr ) Block ( "else" ( IfStmt | Block ) )?
-WhileStmt     ::= Label? "while" Expr Block
+WhileStmt     ::= Label? "while" ( Expr | "let" Patterns "=" Expr ) Block
 LoopStmt      ::= Label? "loop" Block
 ForStmt       ::= Label? "for" ( "&" "mut"? )? IDENT "in" Expr ( ".." Expr )? Block
 Label         ::= IDENT ":"
@@ -1276,6 +1276,23 @@ if let .some(v) = opt {
 
 `while cond { … }` evaluates `cond` before each iteration. `loop { … }` repeats until it
 reaches a `break` or `return`.
+
+`while let P = e { A }` evaluates `e` before each iteration and tests it against the
+patterns `P`, as `if let` does (§8.3): it is exactly
+`loop { match e { P => { A } else => { break; } } }`. The loop ends the first time `e`
+does not match; a binding is in scope in `A` only, and `break` and `continue` in `A`
+apply to the loop (a label names it, as for `while`). It is how an iterator is
+driven; the call to `next` is written out:
+
+```axiom
+let mut lines = str.lines(text);
+while let .some(line) = lines.next() {
+    count += 1;
+}
+while let .some(ev) = events.next()! {   // a fallible iterator: E!?T
+    handle(ev);
+}
+```
 
 ### 8.5 `for`
 
