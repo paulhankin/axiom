@@ -48,9 +48,10 @@
   representations.)
 - **Implementation-defined** behavior is documented by each implementation and fixed
   for a given target (for example, the width of `usize`).
-- There is **no undefined behavior**. Every well-formed program has one meaning for each
-  input, apart from the explicitly listed unspecified values and implementation-defined
-  choices.
+- There is **no undefined behavior** in a program that keeps the two rules of §12.1: a
+  raw pointer stays inside its object, and memory is not used after it is freed. Such a
+  program has one meaning for each input, apart from the explicitly listed unspecified
+  values and implementation-defined choices.
 
 Grammar uses EBNF: `::=` is a definition, `|` is alternation, `?` means optional, `*` means
 zero or more, `+` means one or more, `( )` groups, and `"x"` is a literal token.
@@ -67,7 +68,7 @@ Each principle below is paired with the concrete rules that enforce it.
 |---|---|
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `axiom fmt`. |
-| **No undefined behavior outside raw pointers** | Arithmetic, shifts, casts, slices, arrays and every other checked operation have defined results or trap. The one rule a program can break unchecked is that an access through a raw pointer stays inside the object the pointer came from (§12.1): on WebAssembly the damage stays inside the module's memory, and on native targets it is undefined behavior. Compilers MUST NOT optimize on any other assumption. |
+| **Every operation checked or defined, but for two rules** | Arithmetic, shifts, casts, slices, arrays and every other operation have defined results or trap, except where a program breaks one of two rules it must keep itself (§12.1): an access through a raw pointer stays inside the object the pointer came from, and memory is not used after it is freed, through a pointer or a slice. On WebAssembly the damage of breaking them stays inside the module's memory, and on native targets it is undefined behavior. The address sanitizer (§16.8) catches breaks of the second. Compilers MUST NOT optimize on any other assumption. |
 | **First-class SIMD** | Vector types of 128, 256 and 512 bits are primitives. WebAssembly's semantics are the reference semantics, on every target. |
 | **Explicit allocation** | No language construct allocates. Heap memory comes from one global allocator, `std/mem` (§15.1), through calls you can see (`mem.alloc`, `mem.free`); `defer` releases it. |
 
@@ -1885,12 +1886,22 @@ exposed is reached only through the function's own pointers to it, that what the
 allocator returns is a new object no earlier pointer points into, and that constant data
 does not change.
 
-The checked operations never break the rule: indexing and slicing (§7.8), `@load` and
-`@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and `for` over a slice all trap
-first, given a slice that some operation made (not one torn by a data race, §12.8.2). Only a raw pointer can break it: one that dangles (its object freed, or its
-function returned), one moved outside its object by `@ptr_add` (§5.7) or made from a
-wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code in C
-(§14.5.5) can break it too. What happens then depends on the target:
+The checked operations keep the first half of the rule, and not the second. Indexing and
+slicing (§7.8), `@load` and `@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and
+`for` over a slice all trap before they reach outside the object a slice comes from,
+given a slice that some operation made (not one torn by a data race, §12.8.2). Nothing
+checks that the object still exists. So a program must keep two rules itself:
+
+1. **A raw pointer stays inside its object.** A pointer moved outside its object by
+   `@ptr_add` (§5.7) or made from a wrong address, or a slice made by `@slice_from_ptr`
+   with the wrong length, breaks it.
+2. **Memory is not used after it is freed**, through a pointer or a slice: a slice of an
+   allocator block kept after `mem.free`, or after a container moved its buffer (a
+   `Vec` that grew), or a pointer to a local kept after its function returned.
+
+The address sanitizer (`--sanitize=address`, §16.8) catches most breaks of the second
+rule, and of the first within the heap. Code in C (§14.5.5) can break either. What
+happens when a rule is broken depends on the target:
 
 - **WebAssembly.** All memory is the module's one linear memory, `M[0 .. size)`. An
   access that reaches past `size` traps (`T0005`). Any other access reads or writes
@@ -1900,7 +1911,7 @@ wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code 
   linear memory. Code, return addresses and the host are outside it, and calls through
   function pointers are checked, so control flow is never hijacked.
 - **Native targets.** Pointers are machine addresses (§14.5.5), and accesses through
-  them are not checked. Breaking the rule is **undefined behavior**: an access may reach
+  them are not checked. Breaking a rule is **undefined behavior**: an access may reach
   another object, the allocator's own data, or the native stack with its return
   addresses, and so may change anything the process does. An access to unmapped memory
   (address 0 among it) stops the program with a crash report and a stack trace (§16.4);

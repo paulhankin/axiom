@@ -6,8 +6,10 @@ WebAssembly. Its design mandate is:
 
 - **zero hidden control flow**: no exceptions, destructors, operator overloading, or implicit allocation
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
-- **no undefined behavior outside raw pointers**: arithmetic, slices, arrays and every other checked
-  operation have a defined result or a deterministic trap; a raw pointer must stay inside its object (spec §12.1)
+- **every operation checked or defined, but for two rules**: arithmetic, slices, arrays and every other
+  operation have a defined result or a deterministic trap, as long as the program keeps two rules itself: a raw
+  pointer stays inside its object, and memory is not used after it is freed (spec §12.1). The address sanitizer
+  (`--sanitize=address`) catches breaks of the second
 - **first-class SIMD**: vector primitives of 128, 256 and 512 bits, with the same (WebAssembly's) semantics on every target
 - **explicit allocation**: one global allocator (`std/mem`, written in Axiom), called explicitly; no language construct allocates
 

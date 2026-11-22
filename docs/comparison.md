@@ -16,8 +16,8 @@ Axiom's choices differ and what each choice costs.
 | | Axiom | Zig | Rust | C++ | C |
 |---|---|---|---|---|---|
 | **Primary aim** | Code that agents can write and check locally | A better C: explicit, simple, fast to compile | Memory and thread safety without a garbage collector | Zero-cost abstraction on top of C | A portable assembler |
-| **Undefined behavior** | None in checked code. A raw-pointer access outside its object is confined to the module's memory on WebAssembly, and undefined natively (spec §12.1) | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
-| **Memory safety** | Bounds-checked slices and arrays; raw pointers unchecked, and dangling pointers not prevented (`--sanitize=address` finds them) | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
+| **Undefined behavior** | None in a program that keeps two rules: a raw pointer stays inside its object, and memory is not used after it is freed (spec §12.1). Breaking them is confined to the module's memory on WebAssembly, and undefined natively | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
+| **Memory safety** | Bounds-checked slices and arrays; raw pointers unchecked, and dangling pointers and slices not prevented (`--sanitize=address` finds them) | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
 | **Allocation** | One global allocator (`std/mem`, written in Axiom), always called explicitly | Allocators passed explicitly; no global one | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
 | **Cleanup** | `defer`, `errdefer` | `defer`, `errdefer` | Destructors (`Drop`) | Destructors (RAII) | By hand (or compiler extensions) |
 | **Errors** | `!T` with one program-wide error set; postfix `!` propagates; `catch` | Error unions with per-function error sets; `try`; `catch` | `Result<T, E>` and `?`; panics | Exceptions; `std::expected` (C++23) | Return codes, `errno` |
@@ -182,13 +182,14 @@ Rust and Axiom both shrink undefined behavior, but in different ways. Rust **rej
 programs whose memory use it cannot prove sound, and gives an escape hatch (`unsafe`) in
 which UB is back. Axiom **defines** what every checked operation does: an index out of
 bounds, an overflow, a shift, a race or a type pun gives a trap or a defined answer, never
-a license for the optimizer. What it does not check is raw pointers. An access through a
-pointer must stay inside the object the pointer came from; on WebAssembly a program that
-breaks that rule can only corrupt its own memory, but natively it is undefined behavior,
-as in C, and the compiler relies on the rule (and on no other). Axiom catches fewer bugs
-at compile time than Rust. In exchange its programs are simpler (no lifetimes, no borrow
-checker), and code that keeps to slices has one reproducible outcome instead of whatever
-the optimizer made of it.
+a license for the optimizer. What it does not check is raw pointers and lifetimes. An
+access through a pointer must stay inside the object the pointer came from, and memory
+must not be used, through a pointer or a slice, after it is freed; on WebAssembly a
+program that breaks those rules can only corrupt its own memory, but natively it is
+undefined behavior, as in C, and the compiler relies on the rules (and on no other).
+Axiom catches fewer bugs at compile time than Rust. In exchange its programs are simpler
+(no lifetimes, no borrow checker), and code that keeps to slices and frees nothing it
+still uses has one reproducible outcome instead of whatever the optimizer made of it.
 
 Zig sits between them. It has UB, but its safe build modes check most of it at run time.
 C and C++ leave most mistakes undefined. Sanitizers and hardened library modes help, but

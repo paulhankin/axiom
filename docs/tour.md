@@ -370,9 +370,12 @@ The collections (`std/collections`: `vec`, `map`, `set`, `deque`, …) are built
 and own what they allocate until `deinit`. A `Map` takes its hash and equality
 functions as generic arguments, because the language has no traits to find them by.
 
-Raw pointers (`*T`, `*mut T`) exist for the allocator, the runtime and C interop, and
-are the one place the checks stop: a pointer must stay inside the object it came from
-(spec §12.1). Everything else is checked.
+The checks stop at two rules a program keeps itself (spec §12.1). Raw pointers (`*T`,
+`*mut T`) exist for the allocator, the runtime and C interop, and a raw pointer must stay
+inside the object it came from. And memory is not used after it is freed: a slice of a
+buffer that was freed, or that a `Vec` moved when it grew, still reaches the old memory,
+unchecked. The address sanitizer (`--sanitize=address`) catches that. Everything else is
+checked.
 
 ## Generics
 
