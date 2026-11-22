@@ -341,7 +341,7 @@ for f in "$R"/axiom-"$v"-*; do
         echo "$list" | grep -q "/$want" || echo "$list" | grep -q "/${want}.exe" ||
             { echo "release: $(basename "$f") lacks $want" >&2; exit 1; }
     done
-    echo "$list" | grep -q testdata && { echo "release: $(basename "$f") holds test data" >&2; exit 1; }
+    echo "$list" | grep -q /testdata/ && { echo "release: $(basename "$f") holds test data" >&2; exit 1; }
 done
 # The AArch64 compiler reports its version under qemu, where qemu is.
 if command -v qemu-aarch64 >/dev/null && [ "$(uname -m)" = x86_64 ]; then
