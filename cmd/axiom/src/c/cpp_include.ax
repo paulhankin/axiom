@@ -1,0 +1,647 @@
+// =============================================================================
+// cpp_include.ax - header search, #include, #include_next, #import, #embed,
+// and dependency output (--c-deps), part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "cpp_expr.ax" as ce;
+import "cpp_lex.ax" as lx;
+import "cpragma.ax" as cp;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// #include, #embed
+// -----------------------------------------------------------------------------
+fn dir_of(p: []u8) []u8 {
+    let k = u.rfind(p, '/');
+    if k < 0 {
+        return "";
+    }
+    return p[0..@int_cast(usize, k)];
+}
+
+fn join(d: []u8, name: []u8) []u8 {
+    if d.len == 0 {
+        return name;
+    }
+    if d[d.len - 1] == '/' {
+        return u.cat2(d, name);
+    }
+    return u.cat3(d, "/", name);
+}
+
+// The file a header name names (its characters between the delimiters),
+// or nil: "..." is looked for next to the including file first, then both
+// forms in the -I directories and the compiler's headers.
+fn find_file(P: *mut PP, name: []u8, quoted: bool) []u8 {
+    P.found_index = -1;
+    if (name.len > 0) and (name[0] != '/') and quoted {
+        let p = join(dir_of(cur_src(P).path), name);
+        if u.is_file(p) {
+            return p;
+        }
+    }
+    return find_file_from(P, name, 0);
+}
+
+// The file `name` in the include path, from its entry `from` on: the -I
+// directories in order (0, 1, ...), then the compiler's headers; or nil.
+// P.found_index is where it was found (-1: an absolute path).
+fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
+    P.found_index = -1;
+    if name.len == 0 {
+        return u.nosym();
+    }
+    if name[0] == '/' {
+        if u.is_file(name) {
+            return name;
+        }
+        return u.nosym();
+    }
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    let ns = @int_cast(i32, P.o.system_dirs.len);
+    let mut k = from;
+    while k <= (n + ns) {
+        let mut d = P.o.sys_include;
+        if k < n {
+            d = P.o.include_dirs[@int_cast(usize, k)];
+        } else if k < (n + ns) {
+            // the system's headers (--c-lib=system), but for the compiler's
+            // own freestanding ones, whose types are this compiler's
+            if system_own_header(name) {
+                k += 1;
+                continue;
+            }
+            d = P.o.system_dirs[@int_cast(usize, k - n)];
+        }
+        let p = join(d, name);
+        // (the compiler's own headers: the library's only when hosted, and
+        // with the system's library only the freestanding ones)
+        let ours_ok = (P.o.hosted and not P.o.system_lib) or freestanding_header(name) or system_own_header(name);
+        if u.is_file(p) and ((k < (n + ns)) or ours_ok) {
+            P.found_index = k;
+            return p;
+        }
+        k += 1;
+    }
+    // (--c-idirafter: after the system's and the compiler's)
+    let na = @int_cast(i32, P.o.after_dirs.len);
+    while k <= (n + ns + na) {
+        let p = join(P.o.after_dirs[@int_cast(usize, k - (n + ns + 1))], name);
+        if u.is_file(p) {
+            P.found_index = k;
+            return p;
+        }
+        k += 1;
+    }
+    return u.nosym();
+}
+
+// The file `name` in the system's header directories (--c-lib=system): the
+// #include_next of a compiler's header that wraps the system's (<limits.h>),
+// or nil. P.found_index is where it was found.
+fn find_system_file(P: *mut PP, name: []u8) []u8 {
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    for k in 0..P.o.system_dirs.len {
+        let p = join(P.o.system_dirs[k], name);
+        if u.is_file(p) {
+            P.found_index = n + @int_cast(i32, k);
+            return p;
+        }
+    }
+    P.found_index = -1;
+    return u.nosym();
+}
+
+// With the system's C library (--c-lib=system): is `name` one of the
+// headers that are the compiler's still (those of the language itself that
+// the system's library does not provide: its <limits.h> and <stdint.h>,
+// which have its POSIX limits and use its types, are its own; <alloca.h> is
+// the compiler's builtin)?
+fn system_own_header(name: []u8) bool {
+    if intrinsics_header(name) {
+        return true;
+    }
+    let names = ["float.h", "iso646.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h", "stddef.h",
+                 "stdnoreturn.h", "stdatomic.h", "complex.h", "tgmath.h", "limits.h", "axc/types.h",
+                 "axc/wchar_limits.h", "alloca.h"];
+    for x in names {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is the file being read one of the system's headers (--c-lib=system)?
+fn in_system_header(P: *mut PP) bool {
+    let d = cur_src(P).dir_index;
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    return P.o.system_lib and (d >= n) and (d < (n + @int_cast(i32, P.o.system_dirs.len)));
+}
+
+// With the system's C library (--c-lib=system), is the file being read one
+// of the compiler's own headers (system_own_header)?
+fn in_compiler_header(P: *mut PP) bool {
+    let n = @int_cast(i32, P.o.include_dirs.len + P.o.system_dirs.len);
+    return P.o.system_lib and (cur_src(P).dir_index == n);
+}
+
+// Is `name` one of the compiler's headers that a freestanding program has
+// (--c-freestanding)? Those of 4p6 (C23 4p7), and <complex.h>'s macros and
+// <alloca.h> (a GNU dialect's builtin), which need no library, and the private headers they include (axc/types.h,
+// axc/wchar_limits.h, axc/ext1.h); the others are the hosted library's.
+// Is `name` one of the headers of the processors' intrinsics (c/csema_simd.ax),
+// which are the compiler's in every program?
+fn intrinsics_header(name: []u8) bool {
+    let names = ["mmintrin.h", "xmmintrin.h", "emmintrin.h", "pmmintrin.h", "tmmintrin.h", "smmintrin.h", "nmmintrin.h",
+                 "wmmintrin.h", "immintrin.h", "x86intrin.h", "mm_malloc.h", "cpuid.h", "arm_neon.h", "arm_acle.h",
+                 "arm_fp16.h", "arm_bf16.h", "arm_sve.h", "wasm_simd128.h"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn freestanding_header(name: []u8) bool {
+    if intrinsics_header(name) {
+        return true;
+    }
+    let names = ["float.h", "iso646.h", "limits.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h",
+                 "stddef.h", "stdint.h", "stdnoreturn.h", "stdatomic.h", "complex.h", "string.h", "axc/types.h",
+                 "axc/wchar_limits.h", "axc/ext1.h", "alloca.h"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Where #include_next (and __has_include_next) searches from: the entry of
+// the include path after the current file's, or (a file not found by the
+// path) the first.
+fn next_index(P: *mut PP) i32 {
+    let d = cur_src(P).dir_index;
+    if d < 0 {
+        return 0;
+    }
+    return d + 1;
+}
+
+// The header name of #include, #embed, __has_include or __has_embed from
+// ts[k..] (moving k past it): written as one, or made by macro replacement
+// (6.10.2: a string literal, or the spellings from < to >). With its
+// delimiters; nil after an error (reported).
+fn header_operand(P: *mut PP, ts: []lx.PTok, k: *mut usize, params: bool, sp: u.Span) []u8 {
+    let i = k.*;
+    if (i < ts.len) and (ts[i].kind == lx.PK_HEADER) {
+        k.* = i + 1;
+        return ts[i].text;
+    }
+    // (the parameters of #embed are not replaced: the name is what comes
+    // before the first identifier followed by `(`, or all)
+    let mut j = ts.len;
+    if params {
+        j = i;
+        while j < ts.len {
+            if (ts[j].kind == lx.PK_IDENT) and ((j + 1) < ts.len) and
+               (lx.is_punct(&ts[j + 1], ct.P_LPAREN) or lx.is_punct(&ts[j + 1], ct.P_COLONCOLON)) and (j > i) {
+                break;
+            }
+            j += 1;
+        }
+    }
+    let r = expand_list(P, ts[i..j]);
+    k.* = j;
+    if (r.len >= 1) and (r[0].kind == lx.PK_STRING) and (r[0].id == ct.ENC_NONE) {
+        if r.len > 1 {
+            _ = dg.err(r[1].span, "C1070", "extra tokens after the header name");
+        }
+        return r[0].text;
+    }
+    if (r.len >= 2) and lx.is_punct(&r[0], ct.P_LT) {
+        let mut e: usize = 1;
+        while (e < r.len) and not lx.is_punct(&r[e], ct.P_GT) {
+            e += 1;
+        }
+        if e < r.len {
+            if (e + 1) < r.len {
+                _ = dg.err(r[e + 1].span, "C1070", "extra tokens after the header name");
+            }
+            let mut b = u.Buf.init();
+            b.c('<');
+            b.s(spelling(r[1..e]));
+            b.c('>');
+            return b.done();
+        }
+    }
+    _ = dg.err(sp, "C1080", "expected \"FILENAME\" or <FILENAME>");
+    return u.nosym();
+}
+
+fn load(P: *mut PP, path: []u8) *mut u.SourceFile {
+    let key = u.intern(path);
+    let f = P.loaded.get(key);
+    if u.notnil(f) {
+        return f;
+    }
+    let g = u.load_file(path, u.nosym());
+    if u.notnil(g) {
+        P.loaded.put(key, g);
+    }
+    return g;
+}
+
+// -----------------------------------------------------------------------------
+// Dependencies (--c-deps): the make rule of the files a unit reads
+// -----------------------------------------------------------------------------
+
+// Is the file at `path` one of the system's headers (the compiler's own,
+// the system C library's, or one in a --c-isystem directory)? By where it
+// is: a file included by "..." from one of them is in its directory too.
+fn system_path(P: *PP, path: []u8) bool {
+    let mut dirs = u.List.[[]u8].empty();
+    dirs.push(P.o.sys_include);
+    for d in P.o.system_dirs {
+        dirs.push(d);
+    }
+    let n = P.o.include_dirs.len;
+    let ni = @int_cast(usize, P.o.n_isystem);
+    for k in n - @min(n, ni)..n {
+        dirs.push(P.o.include_dirs[k]);
+    }
+    for d in P.o.after_dirs {
+        dirs.push(d);
+    }
+    for d in dirs.items() {
+        if (d.len > 0) and (path.len > d.len) and u.starts(path, d) and
+           ((path[d.len] == '/') or (d[d.len - 1] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Records file `path`, which the unit reads, among its dependencies.
+fn note_dep(P: *PP, path: []u8, source: bool) void {
+    if not g_deps_on {
+        return;
+    }
+    let mut p = path;
+    while (p.len > 2) and (p[0] == '.') and (p[1] == '/') {
+        p = p[2..];
+    }
+    if not source and g_deps_no_system and system_path(P, path) {
+        return;
+    }
+    let key = u.intern(p);
+    if g_deps_seen.get(key) != 0 {
+        return;
+    }
+    g_deps_seen.put(key, 1);
+    g_deps.push(key);
+}
+
+// A name in a make rule: a space or tab after a backslash, '#' as "\#",
+// '$' as "$$".
+fn make_quote(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    for c in s {
+        if (c == ' ') or (c == '\t') or (c == '#') {
+            b.c('\\');
+        } else if c == '$' {
+            b.c('$');
+        }
+        b.c(c);
+    }
+    return b.done();
+}
+
+// Writes the rule of the dependencies recorded (g_deps) to g_deps_out.
+fn write_deps() void {
+    let mut b = u.Buf.init();
+    let mut col: usize = 0;
+    for k in 0..g_deps_targets.len {
+        if k > 0 {
+            b.c(' ');
+            col += 1;
+        }
+        b.s(g_deps_targets.get(k));
+        col += g_deps_targets.get(k).len;
+    }
+    b.c(':');
+    col += 1;
+    for d in g_deps.items() {
+        let q = make_quote(d);
+        if (col > 1) and ((col + 1 + q.len) > 78) {
+            b.s(" \\\n ");
+            col = 1;
+        } else {
+            b.c(' ');
+            col += 1;
+        }
+        b.s(q);
+        col += q.len;
+    }
+    b.c('\n');
+    if g_deps_phony {
+        for k in 1..@max(g_deps.len, 1) {
+            b.s(u.f1("\n%s:\n", make_quote(g_deps.get(k))));
+        }
+    }
+    let text = b.done();
+    if u.str_eq(g_deps_out, "-") {
+        u.print(text);
+    } else if not u.write_file(g_deps_out, text) {
+        dg.emit_fatal(false, "E9001", u.f1("cannot write the dependencies to %s", g_deps_out));
+    }
+}
+
+// The unit's dependencies are recorded from here (the program's unit, if
+// they are asked for: g_deps_out).
+fn begin_deps() void {
+    g_deps_on = (g_deps_out.len > 0) and not g_lib_unit;
+    g_deps.clear();
+    g_deps_seen = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0,
+                                   len: 0 };
+}
+
+// The unit is read: its dependencies are written (once: the next units,
+// the C library's among them, are not recorded).
+fn end_deps() void {
+    if g_deps_on {
+        write_deps();
+        g_deps_on = false;
+        g_deps_out = "";
+    }
+}
+
+fn push_file(P: *mut PP, sf: *mut u.SourceFile, presumed: []u8) void {
+    if P.mac and not u.str_eq(presumed, "<built-in>") and not u.str_eq(presumed, "<command line>") {
+        // (the start of a file: included at INC's line, or the unit's own)
+        let mut at: i32 = -1;
+        if INC_LINE > 0 {
+            at = INC.file;
+        }
+        u.g_macros.push(u.MacroEv.{ kind: 3, at: at, line: INC_LINE, file: sf.id, text: "" });
+    }
+    INC_LINE = 0;
+    let L = lx.open(sf, P.o.std);
+    P.files.push(Src.{ L: L, path: sf.path, dir_index: -1, presumed: presumed, line_delta: 0, cond_base: P.conds.len });
+    cp.enter_file(sf.id);
+}
+
+// The key of a file for #pragma once: its real path.
+fn once_key(path: []u8) []u8 {
+    let r = u.real_path(path);
+    if u.isnos(r) {
+        return u.intern(path);
+    }
+    return u.intern(r);
+}
+
+// #include, or (next: a GNU dialect's #include_next) the next file of the
+// name in the include path after the current file's directory.
+fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
+    let mut k: usize = 0;
+    let hn = header_operand(P, line, &mut k, false, sp);
+    if u.isnos(hn) {
+        return;
+    }
+    extra(line, k, u.pick(next, "include_next", "include"));
+    let name = hn[1..hn.len - 1];
+    let mut path = u.nosym();
+    if next and in_compiler_header(P) {
+        path = find_system_file(P, name);
+    } else if next {
+        path = find_file_from(P, name, next_index(P));
+    } else {
+        path = find_file(P, name, hn[0] == '"');
+    }
+    let found = P.found_index;
+    if u.isnos(path) {
+        let mut msg = u.f1("cannot find include file %s", hn);
+        if (name.len > 0) and u.is_dir(join(dir_of(cur_src(P).path), name)) {
+            msg = u.f1("include file %s is a directory", hn);
+        }
+        if not P.o.hosted and u.is_file(join(P.o.sys_include, name)) {
+            msg = u.f1("%s is a header of the C library, which --c-freestanding leaves out", hn);
+        }
+        _ = dg.err(sp, "C1081", msg);
+        P.fatal = true;
+        return;
+    }
+    if P.files.len >= MAX_INCLUDE_DEPTH {
+        _ = dg.err(sp, "C1082", u.f1("#include nested too deeply (more than %s files)", u.zdec(MAX_INCLUDE_DEPTH)));
+        P.fatal = true;
+        return;
+    }
+    if (P.once.len > 0) and (P.once.get(once_key(path)) != 0) {
+        return;  // (#pragma once, or #import)
+    }
+    if P.importing {
+        P.once.put(once_key(path), 1);
+    }
+    let sf = load(P, path);
+    if u.isnil(sf) {
+        _ = dg.err(sp, "C1081", u.f1("cannot read include file %s", hn));
+        P.fatal = true;
+        return;
+    }
+    INC = sp;
+    INC_LINE = u.span_line(sp);
+    push_file(P, sf, path);
+    cur_src(P).dir_index = found;
+    note_dep(P, path, false);
+    if in_system_header(P) {
+        cp.system_file(sf.id);
+    }
+}
+
+struct EmbedParams {
+    limit: i64,  // -1: none
+    prefix: []lx.PTok,
+    suffix: []lx.PTok,
+    if_empty: []lx.PTok,
+    unsupported: bool,  // a parameter no standard has (for __has_embed)
+}
+
+fn no_params() EmbedParams {
+    return EmbedParams.{ limit: -1, prefix: u.nil_slice.[lx.PTok](), suffix: u.nil_slice.[lx.PTok](),
+                         if_empty: u.nil_slice.[lx.PTok](), unsupported: false };
+}
+
+// The parameters of #embed or __has_embed (C23 6.10.4.2): false after an
+// error (reported).
+fn embed_params(P: *mut PP, ts: []lx.PTok, ep: *mut EmbedParams) bool {
+    let mut i: usize = 0;
+    let mut seen: i32 = 0;  // the standard parameters given (bits), each at most once
+    while i < ts.len {
+        let t = &ts[i];
+        if t.kind != lx.PK_IDENT {
+            _ = dg.err(t.span, "C1083", u.f1("expected an embed parameter, not '%s'", t.text));
+            return false;
+        }
+        let mut name = t.name;
+        i += 1;
+        if ((i + 1) < ts.len) and lx.is_punct(&ts[i], ct.P_COLONCOLON) and (ts[i + 1].kind == lx.PK_IDENT) {
+            // a vendor's parameter: none is supported
+            name = u.nosym();
+            i += 2;
+        } else if (name.len > 4) and u.starts(name, "__") and u.ends(name, "__") {
+            name = u.intern(name[2..name.len - 2]);
+        }
+        // the clause, balanced
+        let mut a = i;
+        let mut b = i;
+        if (i < ts.len) and lx.is_punct(&ts[i], ct.P_LPAREN) {
+            let mut depth: i32 = 0;
+            let mut j = i;
+            loop {
+                if j >= ts.len {
+                    _ = dg.err(t.span, "C1083", "unbalanced parentheses in an embed parameter");
+                    return false;
+                }
+                if lx.is_punct(&ts[j], ct.P_LPAREN) or lx.is_punct(&ts[j], ct.P_LBRACKET) or
+                   lx.is_punct(&ts[j], ct.P_LBRACE) {
+                    depth += 1;
+                } else if lx.is_punct(&ts[j], ct.P_RPAREN) or lx.is_punct(&ts[j], ct.P_RBRACKET) or
+                          lx.is_punct(&ts[j], ct.P_RBRACE) {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            a = i + 1;
+            b = j;
+            i = j + 1;
+        } else if not u.isnos(name) and
+                  (u.str_eq(name, "limit") or u.str_eq(name, "prefix") or u.str_eq(name, "suffix") or
+                   u.str_eq(name, "if_empty")) {
+            _ = dg.err(t.span, "C1083", u.f1("embed parameter '%s' requires a parenthesized clause", t.name));
+            return false;
+        }
+        let clause = ts[a..b];
+        let mut bit: i32 = 0;
+        if not u.isnos(name) {
+            let names = ["limit", "prefix", "suffix", "if_empty"];
+            for q in 0..names.len {
+                if u.str_eq(name, names[q]) {
+                    bit = @as(i32, 1) << @int_cast(u32, q);
+                }
+            }
+        }
+        if (seen & bit) != 0 {
+            _ = dg.err(t.span, "C1083", u.f1("the embed parameter '%s' is given more than once", t.name));
+            return false;
+        }
+        seen = seen | bit;
+        if u.isnos(name) {
+            ep.unsupported = true;
+        } else if u.str_eq(name, "limit") {
+            for c in clause {
+                if (c.kind == lx.PK_IDENT) and
+                   (u.str_eq(c.name, "defined") or u.str_eq(c.name, "__has_include") or
+                    u.str_eq(c.name, "__has_embed") or u.str_eq(c.name, "__has_c_attribute")) {
+                    _ = dg.err(c.span, "C1083", u.f1("'%s' cannot appear in the limit of #embed", c.name));
+                    return false;
+                }
+            }
+            let all = if_tokens(P, clause, t.span);
+            let mut ok = true;
+            let v = ce.value(all, P.o, t.span, &mut ok);
+            if not ok {
+                return false;
+            }
+            if (v >> 63) != 0 {
+                _ = dg.err(t.span, "C1083", "the limit of #embed is negative");
+                return false;
+            }
+            ep.limit = @bit_cast(i64, v);
+        } else if u.str_eq(name, "prefix") {
+            ep.prefix = clause;
+        } else if u.str_eq(name, "suffix") {
+            ep.suffix = clause;
+        } else if u.str_eq(name, "if_empty") {
+            ep.if_empty = clause;
+        } else {
+            ep.unsupported = true;
+        }
+    }
+    return true;
+}
+
+fn do_embed(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
+    let mut k: usize = 0;
+    let hn = header_operand(P, line, &mut k, true, sp);
+    if u.isnos(hn) {
+        return;
+    }
+    let mut ep = no_params();
+    if not embed_params(P, line[k..], &mut ep) {
+        return;
+    }
+    if ep.unsupported {
+        _ = dg.err(sp, "C1084", "an embed parameter is not supported");
+        return;
+    }
+    let path = find_file(P, hn[1..hn.len - 1], hn[0] == '"');
+    if u.isnos(path) {
+        _ = dg.err(sp, "C1081", u.f1("cannot find embedded resource %s", hn));
+        P.fatal = true;
+        return;
+    }
+    let data = u.read_file(path);
+    if not u.isnos(data) {
+        note_dep(P, path, false);  // (an #embed's file is one the unit reads)
+    }
+    if u.isnos(data) {
+        _ = dg.err(sp, "C1081", u.f1("cannot read embedded resource %s", hn));
+        P.fatal = true;
+        return;
+    }
+    let mut n = data.len;
+    if (ep.limit >= 0) and (@bit_cast(u64, ep.limit) < @as(u64, n)) {
+        n = @int_cast(usize, ep.limit);
+    }
+    let mut l = tok_list();
+    if n == 0 {
+        for k2 in 0..ep.if_empty.len {
+            l.push(ep.if_empty[k2]);
+        }
+    } else {
+        for k2 in 0..ep.prefix.len {
+            l.push(ep.prefix[k2]);
+        }
+        let mut nums = u.List.[[]u8].empty();
+        let mut v: u64 = 0;
+        while v < 256 {
+            nums.push(u.intern(u.udec(v)));
+            v += 1;
+        }
+        for j in 0..n {
+            if j > 0 {
+                l.push(mklit(lx.PK_PUNCT, ct.P_COMMA, ",", sp));
+            }
+            let mut t = mklit(lx.PK_NUMBER, 0, nums.get(@as(usize, data[j])), sp);
+            t.space = j > 0;
+            l.push(t);
+        }
+        nums.deinit();
+        for k2 in 0..ep.suffix.len {
+            l.push(ep.suffix[k2]);
+        }
+    }
+    if l.len > 0 {
+        l.at_mut(0).bol = true;
+        l.at_mut(0).space = false;
+    }
+    // (the tokens are read before the file's, and replaced as text is)
+    P.inject = frozen(&mut l);
+    P.inject_pos = 0;
+}

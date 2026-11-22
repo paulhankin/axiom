@@ -1,0 +1,556 @@
+// =============================================================================
+// cgen_expr_lv.ax - IR generation for lvalues, member/index addressing,
+// lvalue loads/stores, vector copies, and floating-point pragma state
+// (FENV_ACCESS and FENV_ROUND). Part of cgen.ax (see also cgen_expr.ax,
+// cgen_expr_val.ax, cgen_expr_ops.ax).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen_debug.ax" as cdbg;
+import "cgen_tls.ax" as cgt;
+import "cpragma.ax" as cpg;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// Lvalues
+// -----------------------------------------------------------------------------
+
+/// The address of lvalue e (an object, a function, or a member of a
+/// structure value).
+// (`&e`, an array's decay): it may go anywhere (cgen_restrict.ax).
+fn addr_lv(e: *mut cast.Expr) *mut ir.Value {
+    let ao = g_addr;
+    g_addr = true;
+    let p = lv(e);
+    g_addr = ao;
+    return p;
+}
+
+fn lv(e: *mut cast.Expr) *mut ir.Value {
+    let k = e.kind;
+    if k == cast.ExprKind.IDENT {
+        let s = e.sym;
+        if s.kind == cast.SK_FUNC {
+            if u.notnil(s.nest_parent) {
+                return nest_address(s);  // (a nested function's: a trampoline, cgen_nest.ax)
+            }
+            return func_of(s, func_sig(s)).val;
+        }
+        if s.duration == cast.SD_STATIC {
+            return cgt.addr(M, B, s, object_addr(s));
+        }
+        if is_outer(s) {
+            return nest_object_addr(s);  // (an enclosing function's, in a nested function)
+        }
+        if u.isvnil(s.ir) {
+            s.ir = @ptr_cast(*mut void, alloca(s.ty, s.name));
+            cdbg.note_var(F.f, s, @ptr_cast(*mut ir.Value, s.ir));
+        }
+        return @ptr_cast(*mut ir.Value, s.ir);
+    }
+    if k == cast.ExprKind.STRING {
+        return string_addr(e);
+    }
+    if k == cast.ExprKind.COMPOUND {
+        return compound_literal(e);
+    }
+    if (k == cast.ExprKind.UNARY) and ((e.op == ct.P_REAL) or (e.op == ct.P_IMAG)) {
+        // (__real__ and __imag__ of an lvalue: its part's address; of a real or
+        // imaginary one, the object itself)
+        let p = lv(e.a);
+        if cty.is_complex(e.a.ty) and (e.op == ct.P_IMAG) {
+            return ir.ptradd(B, p, usz(cty.size_of(e.a.ty.unq.elem)));
+        }
+        return p;
+    }
+    if k == cast.ExprKind.UNARY {
+        // *p (through a restricted pointer: cgen_restrict.ax)
+        return restrict_wrap(e.a, rv(e.a));
+    }
+    if k == cast.ExprKind.INDEX {
+        // (a vector's lane: the vector's own memory, an lvalue's or a value's)
+        let mut p = rv_or_lv(e.a, cty.is_vector(e.a.ty));
+        if not cty.is_vector(e.a.ty) {
+            p = restrict_wrap(e.a, p);
+        }
+        let i = index_of(rv(e.b), e.b.ty);
+        return offset(p, i, vla_size_value(e.ty), false);
+    }
+    if k == cast.ExprKind.MEMBER {
+        let mut base = rv_or_lv(e.a, e.op == ct.P_DOT);
+        if e.op == ct.P_ARROW {
+            base = restrict_wrap(e.a, base);
+        }
+        return ir.ptradd(B, base, usz(e.cval));
+    }
+    // (a structure or union value: its address)
+    return rv(e);
+}
+
+// A compound literal's object: static, or (automatic) initialized again
+// each time it is evaluated.
+fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
+    let s = e.sym;
+    if s.duration == cast.SD_STATIC {
+        return cgt.addr(M, B, s, object_addr(s));
+    }
+    if u.isvnil(s.ir) {
+        s.ir = @ptr_cast(*mut void, aligned_alloca(s.ty, "literal", s.align));
+        restrict_lifetime(@ptr_cast(*mut ir.Value, s.ir));  // (its block's, 6.5.2.5p5)
+    }
+    let p = @ptr_cast(*mut ir.Value, s.ir);
+    init_local(s, p);
+    return p;
+}
+
+// The largest power of two that divides both a (a power of two) and off.
+fn common_align(a: u64, off: u64) u64 {
+    let mut r = a;
+    while (r > 1) and ((off % r) != 0) {
+        r = r / 2;
+    }
+    return r;
+}
+
+// The alignment lvalue e is known to have: its type's, or less for a member
+// of a packed structure (a GNU dialect: csema_bits.ax), whose offset is
+// only as aligned as the structure it is in.
+fn lv_align(e: *cast.Expr) u64 {
+    let a = cty.align_of(e.ty);
+    if (e.kind == cast.ExprKind.MEMBER) and u.notnil(e.mem) {
+        let mut base = e.a.ty;
+        let mut ba: u64 = 0;
+        if e.op == ct.P_ARROW {
+            base = e.a.ty.elem;
+        } else if e.a.lvalue {
+            ba = lv_align(e.a);
+        }
+        if ba == 0 {
+            ba = cty.align_of(base);
+        }
+        return @min(a, common_align(ba, e.cval));
+    }
+    if (e.kind == cast.ExprKind.INDEX) and (e.a.kind == cast.ExprKind.CAST) and (e.a.op == cast.CV_ADECAY) {
+        return @min(a, lv_align(e.a.a));
+    }
+    return a;
+}
+
+// The value of lvalue e at p (a bit-field's too; a wide long double's
+// copied, as the object may change before the value is used).
+/// The value of lvalue e, whose address is p.
+fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
+    let m = bf_of(e);
+    if u.notnil(m) {
+        return bf_load(m, e.ty, p);
+    }
+    if is_atomic(e.ty) {
+        return atomic_load(e.ty, p, ir.ORD_SEQ_CST);
+    }
+    if cty.is_wide(e.ty) or cty.is_dec128(e.ty) {
+        return ld_snapshot(p, is_volatile(e.ty));
+    }
+    if cty.is_wint(e.ty) {
+        return wint_snapshot(e.ty, p, is_volatile(e.ty));
+    }
+    if cty.is_vector(e.ty) {
+        return vec_snapshot(e.ty, p);
+    }
+    let v = load(e.ty, p);
+    let al = lv_align(e);
+    if ir.is_op(v, ir.OP_LOAD) and (al < @as(u64, v.align)) {
+        v.align = @truncate(u32, al);
+    }
+    return v;
+}
+
+// Stores v in lvalue e at p (of type t, e's unqualified); returns the value e then has.
+fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    let m = bf_of(e);
+    if u.notnil(m) {
+        return bf_store(m, e.ty, v, p);
+    }
+    if is_atomic(e.ty) {
+        atomic_store(e.ty, v, p, ir.ORD_SEQ_CST);
+        return v;
+    }
+    if cty.is_wide(t) or cty.is_dec128(t) {
+        ld_copy(p, v, is_volatile(e.ty));
+        return v;
+    }
+    if cty.is_wint(t) {
+        wint_copy(t, p, v, is_volatile(e.ty));
+        return v;
+    }
+    if cty.is_vector(t) {
+        vec_copy(e.ty, p, v);
+        return v;
+    }
+    store_al(t, v, p, lv_align(e));
+    return v;
+}
+
+/// A copy of the vector at p (of type t: volatile, as it says), in a temporary.
+fn vec_snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let r = alloca(cty.unqual(t), "vec");
+    vec_copy(t, r, p);
+    return r;
+}
+
+/// Copies the vector at src to dst (of type t: volatile, as it says).
+fn vec_copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
+    let n = cty.size_of(t);
+    if is_volatile(t) {
+        // (one volatile access per chunk of at most 8 bytes)
+        let mut off: u64 = 0;
+        while off < n {
+            let w = @min(n - off, 8);
+            let it = ir.t_int(@truncate(i32, @bit_cast(i64, w * 8)));
+            let x = ir.load(B, it, ir.ptradd(B, src, usz(off)));
+            x.flags = x.flags | ir.F_VOLATILE;
+            x.align = @truncate(u32, @min(w, cty.align_of(t)));
+            let s = ir.store(B, x, ir.ptradd(B, dst, usz(off)));
+            s.flags = s.flags | ir.F_VOLATILE;
+            s.align = x.align;
+            off += w;
+        }
+        return;
+    }
+    let m = ir.memop(B, ir.OP_MEMMOVE, dst, src, usz(n));
+    m.cv = ir.MEMMOVE_SAME_OR_APART;
+}
+
+fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
+    if want_lv and e.lvalue {
+        return lv(e);
+    }
+    return rv(e);
+}
+
+// An integer value v of type t as an index (an integer wider than 64 bits:
+// its low limb; its value beyond that leaves every object).
+fn index_of(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_wint(t) {
+        return wint_limb(v, 0);
+    }
+    return v;
+}
+
+// p + i * size (i: a pointer-sized integer; size: the elements', vla_size_value), or minus.
+fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: *mut ir.Value, neg: bool) *mut ir.Value {
+    let mut i = i0;
+    if i.ty.bits != T_isz.bits {
+        i = int_resize(i, true, T_isz);
+    }
+    // (p + i * size points into p's object or just past it, which is never
+    // more than the largest signed size: the product cannot overflow)
+    let mut d = no_wrap(ir.mul(B, i, size), ir.OP_MUL);
+    if neg {
+        d = ir.sub(B, usz(0), d);
+    }
+    return ir.ptradd(B, p, d);
+}
+
+// -----------------------------------------------------------------------------
+// The floating-point pragmas (cpragma.ax): FENV_ACCESS and FENV_ROUND
+// -----------------------------------------------------------------------------
+
+// The slots before a full expression began (fp_enter, fp_leave).
+struct FpPrev {
+    slot: *mut ir.Value,
+    dslot: *mut ir.Value,
+}
+
+// decimal.ax's dec_round_swap(m): the thread's decimal direction set to m
+// (an i32), the previous one returned.
+fn dec_swap(m: *mut ir.Value) *mut ir.Value {
+    let f = ld_fn("dec_round_swap");
+    let mut xs: [1]*mut ir.Value = [m];
+    return ir.call(B, ir.fnp_of(f).ty, f, xs[..]);
+}
+
+// Under FENV_ACCESS ON or FENV_ROUND (F.8.4, and 7.6.2 for FENV_ROUND's
+// static mode): is e an operation on floating values whose constant value
+// (folded by semantic analysis) is not used, the operation done at run time
+// instead, in the mode of that moment and raising its exceptions? (Not the
+// constants themselves, nor what is not of a floating type, binary or
+// decimal, and has no floating operand.)
+fn fp_runtime(e: *cast.Expr) bool {
+    if not cpg.fp_strict(fp_state) {
+        return false;
+    }
+    let k = e.kind;
+    if (k != cast.ExprKind.BINARY) and (k != cast.ExprKind.UNARY) and (k != cast.ExprKind.CAST) and
+       (k != cast.ExprKind.COND) {
+        return false;
+    }
+    if cty.is_real_floating(e.ty) or (cty.is_complex(e.ty)) {
+        return true;
+    }
+    return u.notnil(e.a) and u.notnil(e.a.ty) and (cty.is_real_floating(e.a.ty) or cty.is_complex(e.a.ty));
+}
+
+// The rounding-control bits of the environment's register (fenv_get's
+// value: MXCSR's RC, bits 13-14; AArch64's FPCR RMode, bits 22-23), and
+// their value for a static direction (cpragma.ax's FPR_).
+fn rm_mask() u64 {
+    if tg.g_arch == tg.ARCH_A64 {
+        return 0xC00000;
+    }
+    return 0x6000;
+}
+
+fn rm_bits(dir: u32) u64 {
+    let x86: [5]u64 = [0, 0, 0x4000, 0x2000, 0x6000];
+    let a64: [5]u64 = [0, 0, 0x400000, 0x800000, 0xC00000];
+    if tg.g_arch == tg.ARCH_A64 {
+        return a64[@as(usize, dir)];
+    }
+    return x86[@as(usize, dir)];
+}
+
+fn fenv_get() *mut ir.Value {
+    let p = alloca(cty.t_ullong, "fenv");
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
+    return ir.load(B, ir.t_int(64), p);
+}
+
+fn fenv_set(v: *mut ir.Value) void {
+    let p = alloca(cty.t_ullong, "fenv");
+    _ = ir.store(B, v, p);
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
+}
+
+// The environment with its rounding bits replaced by r (a value of those bits).
+fn with_rounding(r: *mut ir.Value) void {
+    let t64 = ir.t_int(64);
+    let cur = fenv_get();
+    fenv_set(ir.or_(B, ir.and_(B, cur, ir.cint(t64, ~rm_mask())), r));
+}
+
+// Starts a full expression under FENV_ROUND with a static direction: the
+// dynamic mode's rounding bits saved (in a slot of their own, so that full
+// expressions nest: GNU statement expressions), the static ones set; and
+// under FENV_DEC_ROUND's, the decimal direction likewise (decimal.ax's,
+// the software's: on every target). The previous slots, for fp_leave.
+fn fp_enter() FpPrev {
+    let prev = FpPrev.{ slot: fp_slot, dslot: fp_dslot };
+    if u.isnil(F) or terminated() {
+        return prev;
+    }
+    let ddir = cpg.fp_dec_round(fp_state);
+    if (ddir != cpg.FPD_DYNAMIC) and cty.g_used_dec {
+        let ds = alloca(cty.t_int, "fpdround");
+        _ = ir.store(B, dec_swap(ir.cint(ir.t_int(32), @as(u64, ddir - 1))), ds);
+        fp_dslot = ds;
+    }
+    let dir = cpg.fp_round(fp_state);
+    if (dir == cpg.FPR_DYNAMIC) or tg.is_wasm() {
+        return prev;
+    }
+    let t64 = ir.t_int(64);
+    let slot = alloca(cty.t_ullong, "fpround");
+    let cur = fenv_get();
+    _ = ir.store(B, ir.and_(B, cur, ir.cint(t64, rm_mask())), slot);
+    fenv_set(ir.or_(B, ir.and_(B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(dir))));
+    fp_slot = slot;
+    return prev;
+}
+
+// Ends it: the dynamic mode's rounding bits back (the exception flags the
+// expression raised are kept), and the dynamic decimal direction.
+fn fp_leave(prev: FpPrev) void {
+    if (fp_slot != prev.slot) and not terminated() {
+        with_rounding(ir.load(B, ir.t_int(64), fp_slot));
+    }
+    if (fp_dslot != prev.dslot) and not terminated() {
+        _ = dec_swap(ir.load(B, ir.t_int(32), fp_dslot));
+    }
+    fp_slot = prev.slot;
+    fp_dslot = prev.dslot;
+}
+
+/// The value of e, a full expression (a statement's, a condition, an
+/// initializer): under FENV_ROUND, evaluated in the static direction.
+fn lv_full(e: *mut cast.Expr) *mut ir.Value {
+    let prev = fp_enter();
+    let v = rv(e);
+    fp_leave(prev);
+    return v;
+}
+
+/// Branches on e, a full expression (to t if it is nonzero, else to f).
+fn branch_full(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
+    let bin_dyn = (cpg.fp_round(fp_state) == cpg.FPR_DYNAMIC) or tg.is_wasm();
+    if bin_dyn and ((cpg.fp_dec_round(fp_state) == cpg.FPD_DYNAMIC) or not cty.g_used_dec) {
+        branch(e, t, f);
+        return;
+    }
+    let prev = fp_enter();
+    let v = rv(e);
+    fp_leave(prev);
+    ir.condbr(B, truth(v, e.ty), t, f);
+}
+
+// The functions that FENV_ROUND's static direction applies to when called
+// in its scope (C23 7.6.2p4's table: <math.h>'s, and the conversions of
+// <stdlib.h>, <stdio.h> and <wchar.h>): the others run in the dynamic mode.
+fn static_rounding_fn(name: []u8) bool {
+    let n = name;
+    if io_conversion_fn(n) {
+        return true;
+    }
+    let fixed = ["atof", "strtod", "strtof", "strtold", "wcstod", "wcstof", "wcstold", "strfromd", "strfromf",
+                 "strfroml", "strtof16", "strtof32", "strtof64", "strtof128", "strtof32x", "strtof64x", "wcstof16",
+                 "wcstof32", "wcstof64", "wcstof128", "wcstof32x", "wcstof64x", "strfromf16", "strfromf32",
+                 "strfromf64", "strfromf128", "strfromf32x", "strfromf64x"];
+    for f in fixed {
+        if u.str_eq(n, f) {
+            return true;
+        }
+    }
+    if fixed_radix_fn(n) == 2 {
+        return true;
+    }
+    // (and their forms for the other types, Annex H's included)
+    let sfx = ["f", "l", "f16", "f32", "f64", "f128", "f32x", "f64x"];
+    let base = math_fns();
+    for b in base {
+        if u.str_eq(n, b) {
+            return true;
+        }
+        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
+            for x in sfx {
+                if u.str_eq(n[b.len..], x) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The radix (2 or 10) of a function of 7.6.2p4's or 7.6.3's table, or of
+// H.10p4-5's additions, whose name is not a family's name and a type's
+// suffix, or 0: the narrowing operations (7.12.14, H.11.2: f32addf64,
+// d64xsqrtd128 ...), the encoding conversions fMencfN, dMencdecdN and
+// dMencbindN (H.11.3.3), and the string conversions of encodings (H.12.4,
+// H.12.5: strfromencfN, strtoencdecdN, wcstoencbindN ...).
+fn fixed_radix_fn(n: []u8) i32 {
+    let pre = ["strfromenc", "strtoenc", "wcstoenc"];
+    for p in pre {
+        if (n.len > p.len) and u.str_eq(n[0..p.len], p) {
+            let r = n[p.len..];
+            if (r.len >= 3) and (r[0] == 'f') and type_width_end(r, 1) {
+                return 2;
+            }
+            if (r.len >= 6) and (u.str_eq(r[0..4], "decd") or u.str_eq(r[0..4], "bind")) and type_width_end(r, 4) {
+                return 10;
+            }
+            return 0;
+        }
+    }
+    if (n.len < 5) or ((n[0] != 'f') and (n[0] != 'd')) {
+        return 0;
+    }
+    // fM[x] then an operation or "enc", then the argument type
+    let mut i: usize = 1;
+    while (i < n.len) and (n[i] >= '0') and (n[i] <= '9') {
+        i += 1;
+    }
+    if i == 1 {
+        return 0;
+    }
+    if (i < n.len) and (n[i] == 'x') {
+        i += 1;
+    }
+    let ops = ["add", "sub", "mul", "div", "fma", "sqrt", "encdec", "encbin", "enc"];
+    for op in ops {
+        let e = i + op.len;
+        if (e < n.len) and u.str_eq(n[i..e], op) and (n[e] == n[0]) and type_width_end(n, e + 1) {
+            if u.str_eq(op, "enc") and (n[0] == 'd') {
+                return 0;  // (dMencdecdN and dMencbindN only)
+            }
+            if n[0] == 'f' {
+                return 2;
+            }
+            return 10;
+        }
+    }
+    return 0;
+}
+
+// Is s[i..] a type's width, digits and an optional x, to its end?
+fn type_width_end(s: []u8, i0: usize) bool {
+    let mut i = i0;
+    while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
+        i += 1;
+    }
+    if i == i0 {
+        return false;
+    }
+    if (i < s.len) and (s[i] == 'x') {
+        i += 1;
+    }
+    return i == s.len;
+}
+
+// The <math.h> functions of 7.6.2p4's table (without their suffixes).
+fn math_fns() [71][]u8 {
+    return ["acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh", "tanh",
+            "exp", "exp2", "expm1", "exp10", "exp10m1", "exp2m1", "log", "log10", "log1p", "log2", "logp1", "log10p1",
+            "log2p1", "cbrt", "hypot", "pow", "pown", "powr", "rootn", "compoundn", "rsqrt", "sqrt", "erf", "erfc",
+            "lgamma", "tgamma", "rint", "nearbyint", "lrint", "llrint", "fma", "acospi", "asinpi", "atanpi", "atan2pi",
+            "cospi", "sinpi", "tanpi", "fmod", "remainder", "remquo", "fdim", "scalbn", "scalbln", "ldexp", "fadd",
+            "fsub", "fmul", "fdiv", "ffma", "fsqrt", "dadd", "dsub", "dmul", "ddiv", "dfma", "dsqrt", "quantize"];
+}
+
+// The formatted input/output functions (in both tables).
+fn io_conversion_fn(n: []u8) bool {
+    let io = ["printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "scanf",
+              "fscanf", "sscanf", "vscanf", "vfscanf", "vsscanf", "wprintf", "fwprintf", "swprintf", "vwprintf",
+              "vfwprintf", "vswprintf", "wscanf", "fwscanf", "swscanf", "vwscanf", "vfwscanf", "vswscanf"];
+    for f in io {
+        if u.str_eq(n, f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The functions that FENV_DEC_ROUND's static direction applies to (C23
+// 7.6.3's table: <math.h>'s decimal forms of 7.6.2p4's functions, and
+// quantize; strtodN, wcstodN, strfromdN, and the formatted input/output).
+fn static_dec_rounding_fn(name: []u8) bool {
+    let n = name;
+    if io_conversion_fn(n) {
+        return true;
+    }
+    let fixed = ["strtod32", "strtod64", "strtod128", "strtod64x", "wcstod32", "wcstod64", "wcstod128", "wcstod64x",
+                 "strfromd32", "strfromd64", "strfromd128", "strfromd64x"];
+    for f in fixed {
+        if u.str_eq(n, f) {
+            return true;
+        }
+    }
+    if fixed_radix_fn(n) == 10 {
+        return true;
+    }
+    let sfx = ["d32", "d64", "d128", "d64x"];
+    let base = math_fns();
+    for b in base {
+        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
+            for x in sfx {
+                if u.str_eq(n[b.len..], x) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}

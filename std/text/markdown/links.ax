@@ -1,0 +1,736 @@
+// =============================================================================
+// std/text/markdown/links.ax - Link pieces, reference definitions, bracket links, and autolinks, part of std/text/markdown.
+// =============================================================================
+
+import "../../mem.ax" as mem;
+import "../../str.ax" as strs;
+import "../../unicode.ax" as uni;
+
+// -----------------------------------------------------------------------------
+// Link pieces and reference definitions
+// -----------------------------------------------------------------------------
+
+/// A link label at s[p] ('['): the index just past ']', with the label's
+/// contents in [ls, le); 0 if there is none (unbalanced or over 999 characters).
+fn scan_label(s: []u8, p: usize, ls: *mut usize, le: *mut usize) usize {
+    if at(s, p) != '[' {
+        return 0;
+    }
+    let mut i = p + 1;
+    while i < s.len {
+        let c = s[i];
+        if (c == '[') or (c == ']') {
+            break;
+        }
+        if c == '\\' {
+            i += 1;
+            if (i < s.len) and is_ascii_punct(s[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        if i - (p + 1) > 999 {
+            return 0;
+        }
+    }
+    if at(s, i) != ']' {
+        return 0;
+    }
+    ls.* = p + 1;
+    le.* = i;
+    return i + 1;
+}
+
+/// A link destination at s[p]: its length (the bytes in [ds, de)), or -1.
+fn scan_destination(s: []u8, p: usize, ds: *mut usize, de: *mut usize) i64 {
+    let mut i = p;
+    if at(s, i) == '<' {
+        i += 1;
+        while i < s.len {
+            let c = s[i];
+            if c == '>' {
+                ds.* = p + 1;
+                de.* = i;
+                return @int_cast(i64, i + 1 - p);
+            }
+            if c == '\\' {
+                i += 2;
+            } else if (c == '\n') or (c == '<') {
+                return -1;
+            } else {
+                i += 1;
+            }
+        }
+        return -1;
+    }
+    let mut depth: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c == '\\') and (i + 1 < s.len) and is_ascii_punct(s[i + 1]) {
+            i += 2;
+        } else if c == '(' {
+            depth += 1;
+            i += 1;
+            if depth > 32 {
+                return -1;
+            }
+        } else if c == ')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+            i += 1;
+        } else if (c <= 32) or (c == 127) {
+            if i == p {
+                return -1;
+            }
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    if (i >= s.len) or (depth != 0) {
+        return -1;
+    }
+    ds.* = p;
+    de.* = i;
+    return @int_cast(i64, i - p);
+}
+
+/// A link title at s[p]: its length, quotes included, or 0.
+fn scan_title(s: []u8, p: usize) usize {
+    let open = at(s, p);
+    let mut close = open;
+    if open == '(' {
+        close = ')';
+    } else if (open != '"') and (open != '\'') {
+        return 0;
+    }
+    let mut i = p + 1;
+    while i < s.len {
+        let c = s[i];
+        if c == close {
+            return i + 1 - p;
+        }
+        if (open == '(') and (c == '(') {
+            return 0;
+        }
+        if (c == '\\') and (i + 1 < s.len) and is_ascii_punct(s[i + 1]) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    return 0;
+}
+
+/// Skips spaces and tabs and at most one line ending.
+fn skip_spnl(s: []u8, p: usize) usize {
+    let mut i = p;
+    while is_space_or_tab(at(s, i)) {
+        i += 1;
+    }
+    if at(s, i) == '\r' {
+        i += 1;
+    }
+    if at(s, i) == '\n' {
+        i += 1;
+    }
+    while is_space_or_tab(at(s, i)) {
+        i += 1;
+    }
+    return i;
+}
+
+/// A reference label, normalized for matching: case-folded, runs of white
+/// space as one space, trimmed. Owned by the caller.
+fn normalize_label(label: []u8) MarkdownError![]mut u8 {
+    let folded = uni.case_fold(label)!;
+    defer mem.free(folded);
+    let mut out = strs.String.init();
+    let mut space = false;
+    for c in folded {
+        if is_ascii_space(c) {
+            space = out.len() > 0;
+            continue;
+        }
+        if space {
+            out.push(' ')!;
+            space = false;
+        }
+        out.push(c)!;
+    }
+    return out.take();
+}
+
+fn unescape_into_buf(p: *mut Parser, s: []u8) MarkdownError!Ref {
+    let off = p.doc.buf.len();
+    unescape_to(&mut p.doc.buf, s)!;
+    return Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len() - off), raw: false };
+}
+
+/// Takes the link reference definitions off the start of a paragraph;
+/// whether anything is left.
+fn resolve_refs(p: *mut Parser, id: u32) MarkdownError!bool {
+    let c = p.content(id);
+    let mut pos: usize = 0;
+    while (pos < c.len) and (c[pos] == '[') {
+        let n = parse_ref(p, c, pos)!;
+        if n == 0 {
+            break;
+        }
+        pos = n;
+    }
+    let r = p.nd(id);
+    r.text.off += @truncate(u32, pos);
+    r.text.len -= @truncate(u32, pos);
+    for b in c[pos..] {
+        if not is_ascii_space(b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A link reference definition at s[pos]: where it ends, or 0.
+fn parse_ref(p: *mut Parser, s: []u8, pos: usize) MarkdownError!usize {
+    let mut ls: usize = 0;
+    let mut le: usize = 0;
+    let mut i = scan_label(s, pos, &mut ls, &mut le);
+    if i == 0 {
+        return 0;
+    }
+    let label = trim_ascii(s[ls..le]);
+    if (label.len == 0) or (at(s, i) != ':') {
+        return 0;
+    }
+    i = skip_spnl(s, i + 1);
+    let mut ds: usize = 0;
+    let mut de: usize = 0;
+    let dl = scan_destination(s, i, &mut ds, &mut de);
+    if dl < 0 {
+        return 0;
+    }
+    i += @truncate(usize, @bit_cast(u64, dl));
+    let before_title = i;
+    let j = skip_spnl(s, i);
+    let mut tl: usize = 0;
+    if j != before_title {
+        tl = scan_title(s, j);
+    }
+    if tl > 0 {
+        i = j + tl;
+    }
+    let mut k = i;
+    while is_space_or_tab(at(s, k)) {
+        k += 1;
+    }
+    if (k < s.len) and (s[k] != '\n') {
+        if tl == 0 {
+            return 0;
+        }
+        tl = 0;
+        k = before_title;
+        while is_space_or_tab(at(s, k)) {
+            k += 1;
+        }
+        if (k < s.len) and (s[k] != '\n') {
+            return 0;
+        }
+    }
+    if k < s.len {
+        k += 1;
+    }
+    let key = normalize_label(label)!;
+    if (key.len == 0) or p.refs.contains(key) {
+        mem.free(key);
+        return k;
+    }
+    p.keys.push(key)!;
+    let url = unescape_into_buf(p, s[ds..de])!;
+    let mut title = no_ref();
+    if tl > 0 {
+        title = unescape_into_buf(p, s[j + 1..j + tl - 1])!;
+    }
+    p.refs.put(key, RefDef.{ url: url, title: title })!;
+    return k;
+}
+
+// -----------------------------------------------------------------------------
+// Bracketed links and images
+// -----------------------------------------------------------------------------
+
+fn push_bracket(p: *mut Parser, node: u32, image: bool) MarkdownError!void {
+    if p.brackets.len() > 0 {
+        p.brackets.get_ptr(p.brackets.len() - 1).after = true;
+    }
+    p.brackets.push(Bracket.{ node: node, pos: p.pos, image: image, after: false })!;
+}
+
+fn handle_close_bracket(p: *mut Parser) MarkdownError!void {
+    p.pos += 1;
+    let initial = p.pos;
+    if p.brackets.len() == 0 {
+        _ = text_node(p, p.pos - 1, p.pos)!;
+        return;
+    }
+    let opener = p.brackets.get(p.brackets.len() - 1);
+    if not opener.image and (p.brackets.len() - 1 < p.link_barrier) {
+        pop_bracket(p);
+        _ = text_node(p, p.pos - 1, p.pos)!;
+        return;
+    }
+    let s = p.s;
+    let mut url = no_ref();
+    let mut title = no_ref();
+    let mut matched = false;
+    // an inline link: (destination "title")
+    if peek(p) == '(' {
+        let sp = skip_spnl(s, p.pos + 1);
+        let mut ds: usize = 0;
+        let mut de: usize = 0;
+        let mut dl: i64 = -1;
+        if p.scan_budget > 0 {
+            dl = scan_destination(s, sp, &mut ds, &mut de);
+            let used = @max(de, sp) - sp + 1;
+            p.scan_budget -= @min(p.scan_budget, used);
+        }
+        if dl >= 0 {
+            let end_url = sp + @truncate(usize, @bit_cast(u64, dl));
+            let st = skip_spnl(s, end_url);
+            let mut et = st;
+            if st != end_url {
+                et = st + scan_title(s, st);
+            }
+            let ea = skip_spnl(s, et);
+            if at(s, ea) == ')' {
+                p.pos = ea + 1;
+                url = unescape_into_buf(p, s[ds..de])!;
+                if et > st {
+                    title = unescape_into_buf(p, s[st + 1..et - 1])!;
+                }
+                matched = true;
+            }
+        }
+    }
+    if not matched {
+        // a reference link: [text][label], [text][] or [text]
+        p.pos = initial;
+        let mut ls: usize = 0;
+        let mut le: usize = 0;
+        let after = scan_label(s, initial, &mut ls, &mut le);
+        let mut label: []u8 = "";
+        let mut found = after > 0;
+        if found {
+            label = trim_ascii(s[ls..le]);
+            p.pos = after;
+        }
+        if ((not found) or (label.len == 0)) and not opener.after {
+            label = s[opener.pos..initial - 1];
+            found = true;
+        }
+        if found and (label.len <= 999) {
+            let key = normalize_label(label)!;
+            defer mem.free(key);
+            if let .some(def) = p.refs.get(key) {
+                let cost = @as(usize, def.url.len) + @as(usize, def.title.len);
+                if cost <= p.ref_budget {
+                    p.ref_budget -= cost;
+                    url = def.url;
+                    title = def.title;
+                    matched = true;
+                }
+            }
+        }
+    }
+    if not matched {
+        pop_bracket(p);
+        p.pos = initial;
+        _ = text_node(p, initial - 1, initial)!;
+        return;
+    }
+    let mut kind = Kind.LINK;
+    if opener.image {
+        kind = Kind.IMAGE;
+    }
+    let link = p.append(NONE, kind)!;
+    let ln = p.nd(link);
+    ln.text = url;
+    ln.info = title;
+    insert_before(p.doc, opener.node, link);
+    let mut t = p.nd(opener.node).next;
+    while t != NONE {
+        let nx = p.nd(t).next;
+        append_child(p.doc, link, t);
+        t = nx;
+    }
+    unlink_node(p.doc, opener.node);
+    process_emphasis(p, opener.pos)!;
+    pop_bracket(p);
+    // no links in links: the link openers still open are now inactive
+    if not opener.image {
+        p.link_barrier = p.brackets.len();
+    }
+}
+
+fn pop_bracket(p: *mut Parser) void {
+    p.brackets.truncate(p.brackets.len() - 1);
+    p.link_barrier = @min(p.link_barrier, p.brackets.len());
+}
+
+// -----------------------------------------------------------------------------
+// Angle-bracket autolinks, raw HTML dispatch, and GFM extended autolinks
+// -----------------------------------------------------------------------------
+
+fn scan_autolink_uri(s: []u8, p: usize) usize {
+    let mut i = p;
+    if not strs.is_alpha(at(s, i)) {
+        return 0;
+    }
+    i += 1;
+    while strs.is_alnum(at(s, i)) or (at(s, i) == '.') or (at(s, i) == '+') or (at(s, i) == '-') {
+        i += 1;
+    }
+    let n = i - p;
+    if (n < 2) or (n > 32) or (at(s, i) != ':') {
+        return 0;
+    }
+    i += 1;
+    while i < s.len {
+        let c = s[i];
+        if c == '>' {
+            return i + 1 - p;
+        }
+        if (c <= 32) or (c == '<') {
+            return 0;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+fn is_email_local(c: u8) bool {
+    return strs.is_alnum(c) or ((c != 0) and (strs.index_of_byte(".!#$%&'*+/=?^_`{|}~-", c) ?? 99) != 99);
+}
+
+fn scan_autolink_email(s: []u8, p: usize) usize {
+    let mut i = p;
+    while is_email_local(at(s, i)) {
+        i += 1;
+    }
+    if (i == p) or (at(s, i) != '@') {
+        return 0;
+    }
+    i += 1;
+    while true {
+        // a label: alphanumerics and hyphens, not starting or ending with a hyphen, at most 63
+        let ls = i;
+        if not strs.is_alnum(at(s, i)) {
+            return 0;
+        }
+        while strs.is_alnum(at(s, i)) or (at(s, i) == '-') {
+            i += 1;
+        }
+        if (s[i - 1] == '-') or (i - ls > 63) {
+            return 0;
+        }
+        if at(s, i) == '.' {
+            i += 1;
+            continue;
+        }
+        if at(s, i) == '>' {
+            return i + 1 - p;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+fn handle_pointy(p: *mut Parser) MarkdownError!void {
+    let start = p.pos;
+    let mut n = scan_autolink_uri(p.s, start + 1);
+    let mut email = false;
+    if n == 0 {
+        n = scan_autolink_email(p.s, start + 1);
+        email = n > 0;
+    }
+    if n > 0 {
+        let contents = p.s[start + 1..start + n];
+        p.pos = start + 1 + n;
+        let link = p.append(p.block, Kind.LINK)!;
+        let off = p.doc.buf.len();
+        if email {
+            p.doc.buf.push_str("mailto:")!;
+        }
+        unescape_entities_to(&mut p.doc.buf, contents)!;
+        p.nd(link).text = Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len() - off), raw: false };
+        let toff = p.doc.buf.len();
+        unescape_entities_to(&mut p.doc.buf, contents)!;
+        let t = p.append(link, Kind.TEXT)!;
+        p.nd(t).text = Ref.{ off: @truncate(u32, toff), len: @truncate(u32, p.doc.buf.len() - toff), raw: false };
+        return;
+    }
+    let mut h = scan_tag(p.s, start);
+    if h == 0 {
+        h = scan_html_other(p, start);
+    }
+    if h > 0 {
+        p.pos = start + h;
+        let id = p.append(p.block, Kind.HTML_INLINE)!;
+        p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, start), len: @truncate(u32, h), raw: true };
+        return;
+    }
+    p.pos = start + 1;
+    _ = text_node(p, start, start + 1)!;
+}
+
+fn is_host_char(c: u8) bool {
+    return strs.is_alnum(c) or (c == '-') or (c >= 0x80);
+}
+
+/// A domain at s[0..]: its length, or 0. Underscores are not allowed in
+/// the last two labels; without allow_short it needs a dot.
+fn check_domain(s: []u8, allow_short: bool) usize {
+    let mut np: usize = 0;
+    let mut us1: usize = 0;
+    let mut us2: usize = 0;
+    let mut i: usize = 1;
+    while i + 1 < s.len + 1 {
+        if i >= s.len {
+            break;
+        }
+        let c = s[i];
+        if c == '_' {
+            us2 += 1;
+        } else if c == '.' {
+            us1 = us2;
+            us2 = 0;
+            np += 1;
+        } else if not is_host_char(c) {
+            break;
+        }
+        i += 1;
+    }
+    if (us1 > 0) or (us2 > 0) {
+        if np <= 10 {
+            return 0;
+        }
+    }
+    if allow_short or (np > 0) {
+        return i;
+    }
+    return 0;
+}
+
+/// Trims trailing punctuation, unbalanced ')' and entity-like "&x;" off
+/// the end of an autolink.
+fn autolink_delim(s: []u8, end0: usize) usize {
+    let mut end = end0;
+    let mut opening: usize = 0;
+    let mut closing: usize = 0;
+    for i in 0..end {
+        let c = s[i];
+        if c == '<' {
+            end = i;
+            break;
+        }
+        if c == '(' {
+            opening += 1;
+        } else if c == ')' {
+            closing += 1;
+        }
+    }
+    while end > 0 {
+        let c = s[end - 1];
+        if c == ')' {
+            if closing <= opening {
+                return end;
+            }
+            closing -= 1;
+            end -= 1;
+        } else if (c == '?') or (c == '!') or (c == '.') or (c == ',') or (c == ':') or (c == '*') or (c == '_') or
+                  (c == '~') or (c == '\'') or (c == '"') {
+            end -= 1;
+        } else if c == ';' {
+            if end < 2 {
+                end -= 1;
+                continue;
+            }
+            let mut ne = end - 2;
+            while (ne > 0) and strs.is_alpha(s[ne]) {
+                ne -= 1;
+            }
+            if (ne < end - 2) and (s[ne] == '&') {
+                end = ne;
+            } else {
+                end -= 1;
+            }
+        } else {
+            return end;
+        }
+    }
+    return end;
+}
+
+/// One extended autolink in s: [a, b) with the URL prefix to add ("",
+/// "http://" or "mailto:"); false if there is none.
+fn find_autolink(s: []u8, text_start: bool, a: *mut usize, b: *mut usize, prefix: *mut []u8) bool {
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c == 'w') and has_prefix(s, i, "www.") {
+            let ok = ((i == 0) and text_start) or
+                     ((i > 0) and
+                      (is_ascii_space(s[i - 1]) or (s[i - 1] == '*') or (s[i - 1] == '_') or (s[i - 1] == '~') or
+                       (s[i - 1] == '(')));
+            if ok {
+                let d = check_domain(s[i..], false);
+                if d > 0 {
+                    let mut e = i + d;
+                    while (e < s.len) and not is_ascii_space(s[e]) and (s[e] != '<') {
+                        e += 1;
+                    }
+                    let l = autolink_delim(s[i..], e - i);
+                    if l > 0 {
+                        a.* = i;
+                        b.* = i + l;
+                        prefix.* = "http://";
+                        return true;
+                    }
+                }
+            }
+        } else if (c == ':') and has_prefix(s, i + 1, "//") {
+            let mut r = i;
+            while (r > 0) and strs.is_alpha(s[r - 1]) {
+                r -= 1;
+            }
+            let scheme = s[r..i];
+            if (scheme.len > 0) and
+               (strs.eq_ignore_case(scheme, "http") or strs.eq_ignore_case(scheme, "https") or
+                strs.eq_ignore_case(scheme, "ftp")) {
+                let ds = i + 3;
+                let d = check_domain(s[ds..], true);
+                if (ds < s.len) and (d > 0) {
+                    let mut e = ds + d;
+                    while (e < s.len) and not is_ascii_space(s[e]) and (s[e] != '<') {
+                        e += 1;
+                    }
+                    let l = autolink_delim(s[r..], e - r);
+                    if l > 0 {
+                        a.* = r;
+                        b.* = r + l;
+                        prefix.* = "";
+                        return true;
+                    }
+                }
+            }
+        } else if c == '@' {
+            let mut r = i;
+            while (r > 0) and
+                  (strs.is_alnum(s[r - 1]) or (s[r - 1] == '.') or (s[r - 1] == '+') or (s[r - 1] == '-') or
+                   (s[r - 1] == '_')) {
+                r -= 1;
+            }
+            if r < i {
+                let mut e = i + 1;
+                let mut np: usize = 0;
+                while e < s.len {
+                    let d = s[e];
+                    if strs.is_alnum(d) {
+                        e += 1;
+                    } else if (d == '.') and (e + 1 < s.len) and strs.is_alnum(s[e + 1]) {
+                        np += 1;
+                        e += 1;
+                    } else if (d == '-') or (d == '_') {
+                        e += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let last = s[e - 1];
+                if (e - i >= 2) and (np > 0) and (strs.is_alpha(last) or (last == '.')) {
+                    let l = autolink_delim(s[r..], e - r);
+                    if l > i - r {
+                        a.* = r;
+                        b.* = r + l;
+                        prefix.* = "mailto:";
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn autolink_block(p: *mut Parser, block: u32) MarkdownError!void {
+    // depth first through the block's inlines, outside links
+    let mut id = p.nd(block).first;
+    let mut links: usize = 0;
+    while id != NONE {
+        let n = p.doc.nodes.get(@as(usize, id));
+        if (n.kind == Kind.LINK) or (n.kind == Kind.IMAGE) {
+            links += 1;
+        }
+        if (n.kind == Kind.TEXT) and (links == 0) {
+            autolink_text(p, id)!;
+        }
+        // next node: down, else along, else up
+        let first_child = p.nd(id).first;
+        if (first_child != NONE) and is_inline(p.kind(id)) {
+            id = first_child;
+            continue;
+        }
+        if (n.kind == Kind.LINK) or (n.kind == Kind.IMAGE) {
+            links -= 1;
+        }
+        while (id != block) and (p.nd(id).next == NONE) {
+            id = p.nd(id).parent;
+            if id == block {
+                break;
+            }
+            let k = p.kind(id);
+            if (k == Kind.LINK) or (k == Kind.IMAGE) {
+                links -= 1;
+            }
+        }
+        if id == block {
+            break;
+        }
+        id = p.nd(id).next;
+    }
+}
+
+/// Splits a text node around the first extended autolink in it (the
+/// traversal then visits the link and the rest).
+fn autolink_text(p: *mut Parser, id: u32) MarkdownError!void {
+    let n = p.doc.nodes.get(@as(usize, id));
+    let start_ok = (n.prev == NONE) or (p.kind(n.prev) != Kind.TEXT);
+    let s = p.doc.str(n.text);
+    let mut a: usize = 0;
+    let mut b: usize = 0;
+    let mut prefix: []u8 = "";
+    if not find_autolink(s, start_ok, &mut a, &mut b, &mut prefix) {
+        return;
+    }
+    let r = n.text;
+    let link = p.append(NONE, Kind.LINK)!;
+    // (s may point into buf, which the pushes below may move: copied first)
+    p.scratch.clear();
+    p.scratch.push_str(s[a..b])!;
+    let off = p.doc.buf.len();
+    p.doc.buf.push_str(prefix)!;
+    p.doc.buf.push_str(p.scratch.bytes())!;
+    p.nd(link).text = Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len() - off), raw: false };
+    insert_after(p.doc, id, link);
+    let t = p.append(link, Kind.TEXT)!;
+    p.nd(t).text = Ref.{ off: r.off + @truncate(u32, a), len: @truncate(u32, b - a), raw: r.raw };
+    if b < s.len {
+        let rest = p.append(NONE, Kind.TEXT)!;
+        p.nd(rest).text = Ref.{ off: r.off + @truncate(u32, b), len: r.len - @truncate(u32, b), raw: r.raw };
+        insert_after(p.doc, link, rest);
+    }
+    p.nd(id).text.len = @truncate(u32, a);
+}

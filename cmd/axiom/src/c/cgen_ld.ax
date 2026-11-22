@@ -2,16 +2,16 @@
 // cgen_ld.ax - IR generation for long double where it is wider than double
 // (cty.is_wide: --c-long-double=80, the x87's format, or 128, binary128), and
 // _Float128 and _Float64x (Annex H: binary128, or the x87's format), each in
-// its own format:
-// its arithmetic, comparisons and conversions as calls of
+// its own format: its arithmetic, comparisons and conversions as calls of
 // std/c/rt/ldouble.ax's functions, which codegen.ax generates into the
-// module (cg.ld_fn), so that only those a program uses are in it.
+// module (ld_fn), so that only those a program uses are in it. Part of
+// cgen.ax.
 //
-// A value is 16 bytes of memory, as a structure's is (cgen.ax): rv gives its
-// address, an object's own or a temporary's, never written through; each
-// operation writes its result into a new temporary, which scalar
-// replacement takes apart again where it can. The x87 format's six bytes of
-// padding are zero in every result (constants included).
+// A value is 16 bytes of memory, as a structure's is: rv gives its address,
+// an object's own or a temporary's, never written through; each operation
+// writes its result into a new temporary, which scalar replacement takes
+// apart again where it can. The x87 format's six bytes of padding are zero
+// in every result (constants included).
 //
 // In a function with strict floating point (FENV_ACCESS ON, a static
 // FENV_ROUND direction: ir.Func's strict_fp) on a target with a
@@ -27,7 +27,6 @@ import "../ir.ax" as ir;
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cconst.ax" as cc;
-import "cgen.ax" as cg;
 import "cldbl.ax" as cl;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -38,14 +37,6 @@ fn fmt(t: *cty.CType) u32 {
     return cc.fmt_t(t);
 }
 
-fn i32t() *mut ir.Ty {
-    return ir.t_int(32);
-}
-
-fn i64t() *mut ir.Ty {
-    return ir.t_int(64);
-}
-
 fn b01(b: bool) u64 {
     if b {
         return 1;
@@ -54,97 +45,94 @@ fn b01(b: bool) u64 {
 }
 
 fn fmt_arg(t: *cty.CType) *mut ir.Value {
-    return ir.cint(i32t(), @as(u64, fmt(t)));
+    return ir.cint(T_i32, @as(u64, fmt(t)));
 }
 
-/// A new temporary for a wide floating value (16 bytes aligned to 16,
-/// whichever format: long double, _Float128, _Float64x; or a _Decimal128's,
-/// which cgen_dec.ax handles as these).
-pub fn temp() *mut ir.Value {
-    return cg.alloca(cty.t_float128, "ld");
+// A new temporary for a wide floating value (16 bytes aligned to 16,
+// whichever format: long double, _Float128, _Float64x; or a _Decimal128's,
+// which cgen_dec.ax handles as these).
+fn ld_temp() *mut ir.Value {
+    return alloca(cty.t_float128, "ld");
 }
 
 // A call of ldouble.ax's function `name` with arguments xs.
-fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
-    let f = cg.ld_fn(name);
+fn ld_call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
+    let f = ld_fn(name);
     let fty = ir.fnp_of(f).ty;
-    return ir.call(cg.B, fty, f, xs);
+    return ir.call(B, fty, f, xs);
 }
 
-/// Do the operations generated now honour the floating-point environment
-/// (strict floating point, and a target that has one)?
-pub fn env_strict() bool {
-    return u.notnil(cg.F) and cg.F.f.strict_fp and not tg.is_wasm();
+// Do the operations generated now honour the floating-point environment
+// (strict floating point, and a target that has one)?
+fn ld_env_strict() bool {
+    return u.notnil(F) and F.f.strict_fp and not tg.is_wasm();
 }
 
-/// The kind of environment register (ldouble.ax's K_), as an i32 constant.
-pub fn env_kind() *mut ir.Value {
+// The kind of environment register (ldouble.ax's K_), as an i32 constant.
+fn ld_env_kind() *mut ir.Value {
     if tg.g_arch == tg.ARCH_A64 {
-        return ir.cint(i32t(), @as(u64, ld.K_A64));
+        return ir.cint(T_i32, @as(u64, ld.K_A64));
     }
-    return ir.cint(i32t(), @as(u64, ld.K_X64));
+    return ir.cint(T_i32, @as(u64, ld.K_X64));
 }
 
-/// A new slot holding the environment's register (for an `e_` function).
-pub fn env_read() *mut ir.Value {
-    let p = cg.alloca(cty.t_ullong, "fenv");
+// A new slot holding the environment's register (for an `e_` function).
+fn ld_env_read() *mut ir.Value {
+    let p = alloca(cty.t_ullong, "fenv");
     let mut a: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
+    _ = ir.intr(B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
     return p;
 }
 
-/// The slot's value written back to the register (the flags raised).
-pub fn env_write(p: *mut ir.Value) void {
+// The slot's value written back to the register (the flags raised).
+fn ld_env_write(p: *mut ir.Value) void {
     let mut a: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
+    _ = ir.intr(B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
 }
 
-/// A call of ldouble.ax's `e_` function `name` with arguments xs, followed
-/// by the environment slot and kind (which it adds): the register read
-/// before and written after.
-pub fn env_call(name: []u8, xs: []*mut ir.Value) *mut ir.Value {
-    let ev = env_read();
+// A call of ldouble.ax's `e_` function `name` with arguments xs, followed
+// by the environment slot and kind (which it adds): the register read
+// before and written after.
+fn ld_env_call(name: []u8, xs: []*mut ir.Value) *mut ir.Value {
+    let ev = ld_env_read();
     let all = u.newn.[*mut ir.Value](xs.len + 2);
     for i in 0..xs.len {
         all[i] = xs[i];
     }
     all[xs.len] = ev;
-    all[xs.len + 1] = env_kind();
+    all[xs.len + 1] = ld_env_kind();
     // (integer arguments made the parameters' widths: usize, bool)
-    let f = cg.ld_fn(name);
+    let f = ld_fn(name);
     let fty = ir.fnp_of(f).ty;
     for i in 0..(xs.len + 2) {
         let pt = fty.params[i];
         let x = all[i];
         if (pt.kind == ir.T_INT) and (x.ty.kind == ir.T_INT) and (pt.bits != x.ty.bits) {
             if pt.bits < x.ty.bits {
-                all[i] = ir.trunc(cg.B, x, pt);
+                all[i] = ir.trunc(B, x, pt);
             } else {
-                all[i] = ir.zext(cg.B, x, pt);
+                all[i] = ir.zext(B, x, pt);
             }
         }
     }
-    let r = ir.call(cg.B, fty, f, all[0..(xs.len + 2)]);
-    env_write(ev);
+    let r = ir.call(B, fty, f, all[0..(xs.len + 2)]);
+    ld_env_write(ev);
     return r;
 }
 
 // The constants made so far, by value (a constant global each).
-struct Const {
+struct LdConst {
     w: ld.W,
     g: *mut ir.Value,
 }
 
-let mut consts: u.List.[Const] = u.List.[Const].{ data: @ptr_from_int(*mut Const, 0), len: 0, cap: 0 };
-let mut consts_m: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
-
-/// The address of constant w (in memory that is never written).
-pub fn constant(w: ld.W) *mut ir.Value {
-    if consts_m != cg.M {
-        consts.clear();
-        consts_m = cg.M;
+// The address of constant w (in memory that is never written).
+fn ld_constant(w: ld.W) *mut ir.Value {
+    if ld_consts_m != M {
+        ld_consts.clear();
+        ld_consts_m = M;
     }
-    for c in consts.items() {
+    for c in ld_consts.items() {
         if (c.w.lo == w.lo) and (c.w.hi == w.hi) {
             return c.g;
         }
@@ -152,46 +140,46 @@ pub fn constant(w: ld.W) *mut ir.Value {
     let bs = cl.bytes(w);
     let xs = u.newn.[*mut ir.Value](17);
     for i in @as(usize, 0)..16 {
-        xs[i] = ir.cint(cg.T_i8, @as(u64, bs[i]));
+        xs[i] = ir.cint(T_i8, @as(u64, bs[i]));
     }
-    let init = ir.carray(cg.T_i8, xs[0..16]);
-    let g = ir.add_global(cg.M, init.ty, ".ldconst");
+    let init = ir.carray(T_i8, xs[0..16]);
+    let g = ir.add_global(M, init.ty, ".ldconst");
     g.init = init;
     g.linkage = ir.LINK_INTERNAL;
     g.is_const = true;
     g.align = 16;
-    consts.push(Const.{ w: w, g: g.val });
+    ld_consts.push(LdConst.{ w: w, g: g.val });
     return g.val;
 }
 
-/// Copies the value at src to dst (volatile: the object at dst or src is
-/// volatile, and is read or written as two volatile 8-byte accesses).
-pub fn copy(dst: *mut ir.Value, src: *mut ir.Value, volatile: bool) void {
+// Copies the value at src to dst (volatile: the object at dst or src is
+// volatile, and is read or written as two volatile 8-byte accesses).
+fn ld_copy(dst: *mut ir.Value, src: *mut ir.Value, volatile: bool) void {
     if not volatile {
-        let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(16));
+        let m = ir.memop(B, ir.OP_MEMMOVE, dst, src, usz(16));
         m.cv = ir.MEMMOVE_SAME_OR_APART;
         return;
     }
     for k in @as(u64, 0)..2 {
-        let x = ir.load(cg.B, i64t(), ir.ptradd(cg.B, src, cg.usz(k * 8)));
+        let x = ir.load(B, i64t(), ir.ptradd(B, src, usz(k * 8)));
         x.align = 8;
         x.flags = x.flags | ir.F_VOLATILE;
-        let s = ir.store(cg.B, x, ir.ptradd(cg.B, dst, cg.usz(k * 8)));
+        let s = ir.store(B, x, ir.ptradd(B, dst, usz(k * 8)));
         s.align = 8;
         s.flags = s.flags | ir.F_VOLATILE;
     }
 }
 
-/// A copy of the value at p in a new temporary (the value an object has
-/// now, which stores into the object do not change).
-pub fn snapshot(p: *mut ir.Value, volatile: bool) *mut ir.Value {
-    let t = temp();
-    copy(t, p, volatile);
+// A copy of the value at p in a new temporary (the value an object has
+// now, which stores into the object do not change).
+fn ld_snapshot(p: *mut ir.Value, volatile: bool) *mut ir.Value {
+    let t = ld_temp();
+    ld_copy(t, p, volatile);
     return t;
 }
 
-/// x op y (+ - * /), of wide floating type t.
-pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+// x op y (+ - * /), of wide floating type t.
+fn ld_arith(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let mut name: []u8 = "add";
     let mut k: u64 = 0;
     if op == ct.P_MINUS {
@@ -204,74 +192,74 @@ pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir
         name = "div";
         k = 3;
     }
-    let r = temp();
-    if env_strict() {
-        let xs: [5]*mut ir.Value = [r, x, y, fmt_arg(t), ir.cint(i32t(), k)];
-        _ = env_call("e_arith", xs[..]);
+    let r = ld_temp();
+    if ld_env_strict() {
+        let xs: [5]*mut ir.Value = [r, x, y, fmt_arg(t), ir.cint(T_i32, k)];
+        _ = ld_env_call("e_arith", xs[..]);
         return r;
     }
     let mut xs: [4]*mut ir.Value = [r, x, y, fmt_arg(t)];
-    _ = call(name, xs[..]);
+    _ = ld_call(name, xs[..]);
     return r;
 }
 
-/// The product (name "cmul") or quotient ("cdiv") of the complex values
-/// a + ib and c + id, as ldouble.ax computes them (C99 G.5.1): the
-/// addresses of its parts.
-pub fn complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value,
-                    t: *cty.CType) [2]*mut ir.Value {
-    let re = temp();
-    let im = temp();
-    if env_strict() {
+// The product (name "cmul") or quotient ("cdiv") of the complex values
+// a + ib and c + id, as ldouble.ax computes them (C99 G.5.1): the
+// addresses of its parts.
+fn ld_complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value,
+                   t: *cty.CType) [2]*mut ir.Value {
+    let re = ld_temp();
+    let im = ld_temp();
+    if ld_env_strict() {
         let ys: [8]*mut ir.Value = [re, im, a, b, c, d, fmt_arg(t), ir.cint(ir.t_int(8), b01(u.str_eq(name, "cdiv")))];
-        _ = env_call("e_cmuldiv", ys[..]);
+        _ = ld_env_call("e_cmuldiv", ys[..]);
         return [re, im];
     }
     let mut xs: [7]*mut ir.Value = [re, im, a, b, c, d, fmt_arg(t)];
-    _ = call(name, xs[..]);
+    _ = ld_call(name, xs[..]);
     return [re, im];
 }
 
-/// -x: the sign bit changed (the sign is bit 15 of the second eight bytes
-/// in the x87 format, their bit 63 in binary128).
-pub fn negate(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    let r = temp();
-    let lo = ir.load(cg.B, i64t(), x);
+// -x: the sign bit changed (the sign is bit 15 of the second eight bytes
+// in the x87 format, their bit 63 in binary128).
+fn ld_negate(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let r = ld_temp();
+    let lo = ir.load(B, i64t(), x);
     lo.align = 8;
-    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    let hi = ir.load(B, i64t(), ir.ptradd(B, x, usz(8)));
     hi.align = 8;
     let mut nh = ir.vnil();
     if fmt(t) == ld.FMT_X {
-        nh = ir.xor(cg.B, ir.and_(cg.B, hi, ir.cint(i64t(), 0xFFFF)), ir.cint(i64t(), 0x8000));
+        nh = ir.xor(B, ir.and_(B, hi, ir.cint(i64t(), 0xFFFF)), ir.cint(i64t(), 0x8000));
     } else {
-        nh = ir.xor(cg.B, hi, ir.cint(i64t(), 0x8000_0000_0000_0000));
+        nh = ir.xor(B, hi, ir.cint(i64t(), 0x8000_0000_0000_0000));
     }
-    let s0 = ir.store(cg.B, lo, r);
+    let s0 = ir.store(B, lo, r);
     s0.align = 8;
-    let s1 = ir.store(cg.B, nh, ir.ptradd(cg.B, r, cg.usz(8)));
+    let s1 = ir.store(B, nh, ir.ptradd(B, r, usz(8)));
     s1.align = 8;
     return r;
 }
 
-/// x != 0, as an i1: a bit other than the sign set (in the x87 format, of
-/// its ten bytes; a NaN is not zero, nor is an invalid encoding).
-pub fn truth(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    let lo = ir.load(cg.B, i64t(), x);
+// x != 0, as an i1: a bit other than the sign set (in the x87 format, of
+// its ten bytes; a NaN is not zero, nor is an invalid encoding).
+fn ld_truth(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let lo = ir.load(B, i64t(), x);
     lo.align = 8;
-    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    let hi = ir.load(B, i64t(), ir.ptradd(B, x, usz(8)));
     hi.align = 8;
     let mut h = ir.vnil();
     if fmt(t) == ld.FMT_X {
-        h = ir.and_(cg.B, hi, ir.cint(i64t(), 0x7FFF));
+        h = ir.and_(B, hi, ir.cint(i64t(), 0x7FFF));
     } else {
-        h = ir.binop(cg.B, ir.OP_SHL, hi, ir.cint(i64t(), 1));
+        h = ir.binop(B, ir.OP_SHL, hi, ir.cint(i64t(), 1));
     }
-    return ir.icmp(cg.B, ir.IntNE, ir.or_(cg.B, h, lo), ir.cint(i64t(), 0));
+    return ir.icmp(B, ir.IntNE, ir.or_(B, h, lo), ir.cint(i64t(), 0));
 }
 
-// Is v the address of a constant zero (of either sign: constant())?
+// Is v the address of a constant zero (of either sign: ld_constant())?
 fn zero_const(v: *mut ir.Value, t: *cty.CType) bool {
-    for c in consts.items() {
+    for c in ld_consts.items() {
         if c.g == v {
             let mut sign: u64 = 0x8000_0000_0000_0000;
             if fmt(t) == ld.FMT_X {
@@ -287,9 +275,9 @@ fn zero_const(v: *mut ir.Value, t: *cty.CType) bool {
 // 1, or 2 when x is a NaN or an encoding the x87 format does not have,
 // which it compares as unordered: ldouble.ax, unpack), from x's bits.
 fn sign_of(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    let lo = ir.load(cg.B, i64t(), x);
+    let lo = ir.load(B, i64t(), x);
     lo.align = 8;
-    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    let hi = ir.load(B, i64t(), ir.ptradd(B, x, usz(8)));
     hi.align = 8;
     let L = i64t();
     let mut unordered = ir.vnil();
@@ -298,35 +286,35 @@ fn sign_of(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if fmt(t) == ld.FMT_X {
         // (exponent e, explicit integer bit j: e == 0x7fff and not
         // infinity (j and no other bit), or 0 < e < 0x7fff without j)
-        let e = ir.and_(cg.B, hi, ir.cint(L, 0x7FFF));
-        let j = ir.icmp(cg.B, ir.IntSLT, lo, ir.cint(L, 0));
-        let top = ir.icmp(cg.B, ir.IntEQ, e, ir.cint(L, 0x7FFF));
-        let not_inf = ir.icmp(cg.B, ir.IntNE, lo, ir.cint(L, 0x8000_0000_0000_0000));
-        let e_nz = ir.icmp(cg.B, ir.IntNE, e, ir.cint(L, 0));
-        let unnormal = ir.and_(cg.B, e_nz, ir.xor(cg.B, j, ir.cint(cg.T_i1, 1)));
-        unordered = ir.or_(cg.B, ir.and_(cg.B, top, not_inf), unnormal);
-        zero = ir.icmp(cg.B, ir.IntEQ, ir.or_(cg.B, e, lo), ir.cint(L, 0));
-        neg = ir.icmp(cg.B, ir.IntNE, ir.and_(cg.B, hi, ir.cint(L, 0x8000)), ir.cint(L, 0));
+        let e = ir.and_(B, hi, ir.cint(L, 0x7FFF));
+        let j = ir.icmp(B, ir.IntSLT, lo, ir.cint(L, 0));
+        let top = ir.icmp(B, ir.IntEQ, e, ir.cint(L, 0x7FFF));
+        let not_inf = ir.icmp(B, ir.IntNE, lo, ir.cint(L, 0x8000_0000_0000_0000));
+        let e_nz = ir.icmp(B, ir.IntNE, e, ir.cint(L, 0));
+        let unnormal = ir.and_(B, e_nz, ir.xor(B, j, ir.cint(T_i1, 1)));
+        unordered = ir.or_(B, ir.and_(B, top, not_inf), unnormal);
+        zero = ir.icmp(B, ir.IntEQ, ir.or_(B, e, lo), ir.cint(L, 0));
+        neg = ir.icmp(B, ir.IntNE, ir.and_(B, hi, ir.cint(L, 0x8000)), ir.cint(L, 0));
     } else {
         // (binary128: exponent 0x7fff with a fraction is a NaN)
-        let mag = ir.and_(cg.B, hi, ir.cint(L, 0x7FFF_FFFF_FFFF_FFFF));
+        let mag = ir.and_(B, hi, ir.cint(L, 0x7FFF_FFFF_FFFF_FFFF));
         let inf_hi = ir.cint(L, 0x7FFF_0000_0000_0000);
-        let above = ir.icmp(cg.B, ir.IntUGT, mag, inf_hi);
-        let at = ir.and_(cg.B, ir.icmp(cg.B, ir.IntEQ, mag, inf_hi), ir.icmp(cg.B, ir.IntNE, lo, ir.cint(L, 0)));
-        unordered = ir.or_(cg.B, above, at);
-        zero = ir.icmp(cg.B, ir.IntEQ, ir.or_(cg.B, mag, lo), ir.cint(L, 0));
-        neg = ir.icmp(cg.B, ir.IntSLT, hi, ir.cint(L, 0));
+        let above = ir.icmp(B, ir.IntUGT, mag, inf_hi);
+        let at = ir.and_(B, ir.icmp(B, ir.IntEQ, mag, inf_hi), ir.icmp(B, ir.IntNE, lo, ir.cint(L, 0)));
+        unordered = ir.or_(B, above, at);
+        zero = ir.icmp(B, ir.IntEQ, ir.or_(B, mag, lo), ir.cint(L, 0));
+        neg = ir.icmp(B, ir.IntSLT, hi, ir.cint(L, 0));
     }
-    let I = i32t();
-    let sgn = ir.select(cg.B, neg, ir.cint(I, 0xFFFF_FFFF), ir.cint(I, 1));
-    let nz = ir.select(cg.B, zero, ir.cint(I, 0), sgn);
-    return ir.select(cg.B, unordered, ir.cint(I, 2), nz);
+    let I = T_i32;
+    let sgn = ir.select(B, neg, ir.cint(I, 0xFFFF_FFFF), ir.cint(I, 1));
+    let nz = ir.select(B, zero, ir.cint(I, 0), sgn);
+    return ir.select(B, unordered, ir.cint(I, 2), nz);
 }
 
-/// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
-/// Against a constant zero, inline (sign_of), unless the function is strict
-/// (the comparison may signal); otherwise ldouble.ax's cmp.
-pub fn compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
+// Against a constant zero, inline (sign_of), unless the function is strict
+// (the comparison may signal); otherwise ldouble.ax's cmp.
+fn ld_compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let mut op = op0;
     let mut x = x0;
     let mut y = y0;
@@ -345,44 +333,44 @@ pub fn compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *m
         }
     }
     let mut c = ir.vnil();
-    if env_strict() {
+    if ld_env_strict() {
         // (< <= > >= signal "invalid" for a NaN, == and != only for a
         // signaling one: F.9.3)
         let sig = (op != ct.P_EQ) and (op != ct.P_NE);
-        let ys: [4]*mut ir.Value = [x, y, fmt_arg(t), ir.cint(i32t(), b01(sig))];
-        c = env_call("e_cmp", ys[..]);
+        let ys: [4]*mut ir.Value = [x, y, fmt_arg(t), ir.cint(T_i32, b01(sig))];
+        c = ld_env_call("e_cmp", ys[..]);
     } else if zero_const(y, t) {
         c = sign_of(x, t);
     } else {
         let mut xs: [3]*mut ir.Value = [x, y, fmt_arg(t)];
-        c = call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
+        c = ld_call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
     }
-    let m1 = ir.cint(i32t(), 0xFFFF_FFFF);
-    let z = ir.cint(i32t(), 0);
-    let one = ir.cint(i32t(), 1);
+    let m1 = ir.cint(T_i32, 0xFFFF_FFFF);
+    let z = ir.cint(T_i32, 0);
+    let one = ir.cint(T_i32, 1);
     if op == ct.P_LT {
-        return ir.icmp(cg.B, ir.IntEQ, c, m1);
+        return ir.icmp(B, ir.IntEQ, c, m1);
     }
     if op == ct.P_GT {
-        return ir.icmp(cg.B, ir.IntEQ, c, one);
+        return ir.icmp(B, ir.IntEQ, c, one);
     }
     if op == ct.P_LE {
         // (-1 or 0: as unsigned, c + 1 <= 1)
-        return ir.icmp(cg.B, ir.IntULE, ir.add(cg.B, c, one), one);
+        return ir.icmp(B, ir.IntULE, ir.add(B, c, one), one);
     }
     if op == ct.P_GE {
-        return ir.icmp(cg.B, ir.IntULE, c, one);
+        return ir.icmp(B, ir.IntULE, c, one);
     }
     if op == ct.P_EQ {
-        return ir.icmp(cg.B, ir.IntEQ, c, z);
+        return ir.icmp(B, ir.IntEQ, c, z);
     }
-    return ir.icmp(cg.B, ir.IntNE, c, z);
+    return ir.icmp(B, ir.IntNE, c, z);
 }
 
-/// Scalar value v of type `from` converted to type `to`, one of them a
-/// wide long double (6.3.1.4, 6.3.1.5): a value's address for one, an IR
-/// scalar for others.
-pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+// Scalar value v of type `from` converted to type `to`, one of them a
+// wide long double (6.3.1.4, 6.3.1.5): a value's address for one, an IR
+// scalar for others.
+fn ld_convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
     let f = from.unq;
     let t = to.unq;
     if cty.is_wide(f) and cty.is_wide(t) {
@@ -390,71 +378,71 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
             return v;
         }
         // (between the x87's format and binary128: _Float64x, _Float128 and long double)
-        let r = temp();
+        let r = ld_temp();
         let mut xs: [4]*mut ir.Value = [r, v, fmt_arg(f), fmt_arg(t)];
-        if env_strict() {
-            _ = env_call("e_convert", xs[..]);
+        if ld_env_strict() {
+            _ = ld_env_call("e_convert", xs[..]);
         } else {
-            _ = call("convert", xs[..]);
+            _ = ld_call("convert", xs[..]);
         }
         return r;
     }
     if cty.is_wide(t) {
-        let r = temp();
+        let r = ld_temp();
         if cty.is_integer(f) {
             // (exact: every format here holds every 64-bit integer)
             let mut x = v;
             let sg = f.is_signed and (f.kind != cty.TK_BOOL);
             if x.ty.bits < 64 {
                 if sg {
-                    x = ir.sext(cg.B, x, i64t());
+                    x = ir.sext(B, x, i64t());
                 } else {
-                    x = ir.zext(cg.B, x, i64t());
+                    x = ir.zext(B, x, i64t());
                 }
             }
             let mut xs: [3]*mut ir.Value = [r, x, fmt_arg(t)];
-            _ = call(u.pick(sg, "from_i64", "from_u64"), xs[..]);
+            _ = ld_call(u.pick(sg, "from_i64", "from_u64"), xs[..]);
             return r;
         }
         // float or double: exact ("invalid" for a signaling NaN)
-        if env_strict() {
+        if ld_env_strict() {
             let w = @int_cast(u64, v.ty.bits);
-            let ys: [4]*mut ir.Value = [r, ir.zext(cg.B, ir.bitcast(cg.B, v, ir.t_int(v.ty.bits)), i64t()),
-                                        ir.cint(i32t(), w), fmt_arg(t)];
-            _ = env_call("e_from_bin", ys[..]);
+            let ys: [4]*mut ir.Value = [r, ir.zext(B, ir.bitcast(B, v, ir.t_int(v.ty.bits)), i64t()), ir.cint(T_i32, w),
+                                        fmt_arg(t)];
+            _ = ld_env_call("e_from_bin", ys[..]);
             return r;
         }
         if v.ty.bits == 32 {
-            let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i32t()), fmt_arg(t)];
-            _ = call("from_f32", xs[..]);
+            let mut xs: [3]*mut ir.Value = [r, ir.bitcast(B, v, T_i32), fmt_arg(t)];
+            _ = ld_call("from_f32", xs[..]);
             return r;
         }
-        let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i64t()), fmt_arg(t)];
-        _ = call("from_f64", xs[..]);
+        let mut xs: [3]*mut ir.Value = [r, ir.bitcast(B, v, i64t()), fmt_arg(t)];
+        _ = ld_call("from_f64", xs[..]);
         return r;
     }
-    let tt = cg.lty(t);
+    let tt = lty(t);
     if t.kind == cty.TK_BOOL {
-        return ir.zext(cg.B, truth(v, f), tt);
+        return ir.zext(B, ld_truth(v, f), tt);
     }
     let mut xs: [2]*mut ir.Value = [v, fmt_arg(f)];
-    if env_strict() and cty.is_integer(t) {
+    if ld_env_strict() and cty.is_integer(t) {
         // ("invalid" out of range, "inexact" for a fraction: F.4)
         let w = @int_cast(u64, cty.storage_bits(t));
-        let ys: [4]*mut ir.Value = [v, fmt_arg(f), ir.cint(i32t(), w), ir.cint(i32t(), b01(t.is_signed))];
-        let mut r = env_call("e_to_int", ys[..]);
+        let ys: [4]*mut ir.Value = [v, fmt_arg(f), ir.cint(T_i32, w), ir.cint(T_i32, b01(t.is_signed))];
+        let mut r = ld_env_call("e_to_int", ys[..]);
         if tt.bits < 64 {
-            r = ir.trunc(cg.B, r, tt);
+            r = ir.trunc(B, r, tt);
         }
         return r;
     }
-    if env_strict() {
-        let ys: [3]*mut ir.Value = [v, fmt_arg(f), ir.cint(i32t(), @int_cast(u64, cty.ffmt(t)))];
-        let r = env_call("e_to_bin", ys[..]);
+    if ld_env_strict() {
+        let ys: [3]*mut ir.Value = [v, fmt_arg(f), ir.cint(T_i32, @int_cast(u64, cty.ffmt(t)))];
+        let r = ld_env_call("e_to_bin", ys[..]);
         if cty.ffmt(t) == 32 {
-            return ir.bitcast(cg.B, ir.trunc(cg.B, r, i32t()), tt);
+            return ir.bitcast(B, ir.trunc(B, r, T_i32), tt);
         }
-        return ir.bitcast(cg.B, r, tt);
+        return ir.bitcast(B, r, tt);
     }
     if cty.is_integer(t) {
         // (truncated toward zero; a value out of range is undefined,
@@ -462,39 +450,34 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
         let mut r = ir.vnil();
         let w = cty.storage_bits(t);
         if t.is_signed {
-            r = call("to_i64", xs[..]);
+            r = ld_call("to_i64", xs[..]);
             if w < 64 {
                 let hi = ir.cint(i64t(), cty.int_max(t));
                 let lo = ir.cint(i64t(), 0 -% (cty.int_max(t) + 1));
-                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntSGT, r, hi), hi, r);
-                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntSLT, r, lo), lo, r);
+                r = ir.select(B, ir.icmp(B, ir.IntSGT, r, hi), hi, r);
+                r = ir.select(B, ir.icmp(B, ir.IntSLT, r, lo), lo, r);
             }
         } else {
-            r = call("to_u64", xs[..]);
+            r = ld_call("to_u64", xs[..]);
             if w < 64 {
                 let hi = ir.cint(i64t(), cty.int_max(t));
-                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntUGT, r, hi), hi, r);
+                r = ir.select(B, ir.icmp(B, ir.IntUGT, r, hi), hi, r);
             }
         }
         if tt.bits < 64 {
-            r = ir.trunc(cg.B, r, tt);
+            r = ir.trunc(B, r, tt);
         }
         return r;
     }
     if cty.ffmt(t) == 32 {
-        return ir.bitcast(cg.B, call("to_f32", xs[..]), tt);
+        return ir.bitcast(B, ld_call("to_f32", xs[..]), tt);
     }
-    return ir.bitcast(cg.B, call("to_f64", xs[..]), tt);
+    return ir.bitcast(B, ld_call("to_f64", xs[..]), tt);
 }
 
-/// The constant 1 of wide floating type t, for ++ and --.
-pub fn one_value(t: *cty.CType) *mut ir.Value {
-    return constant(cl.of_u64(1, fmt(t)));
-}
-
-/// The 16 bytes of w (for an object's initial value).
-pub fn bytes(w: ld.W) [16]u8 {
-    return cl.bytes(w);
+// The constant 1 of wide floating type t, for ++ and --.
+fn ld_one_value(t: *cty.CType) *mut ir.Value {
+    return ld_constant(cl.of_u64(1, fmt(t)));
 }
 
 // -----------------------------------------------------------------------------
@@ -502,14 +485,14 @@ pub fn bytes(w: ld.W) [16]u8 {
 // double result is in st(0); ir.IN_X87_LOAD, IN_X87_STORE)
 // -----------------------------------------------------------------------------
 
-/// Pushes the 80-bit value at p onto the x87 stack (before a return).
-pub fn x87_push(p: *mut ir.Value) void {
+// Pushes the 80-bit value at p onto the x87 stack (before a return).
+fn x87_push(p: *mut ir.Value) void {
     let mut xs: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_X87_LOAD, cg.T_void, xs[..]);
+    _ = ir.intr(B, ir.IN_X87_LOAD, T_void, xs[..]);
 }
 
-/// Pops st(0) into p (after a call).
-pub fn x87_pop(p: *mut ir.Value) void {
+// Pops st(0) into p (after a call).
+fn x87_pop(p: *mut ir.Value) void {
     let mut xs: [1]*mut ir.Value = [p];
-    _ = ir.intr(cg.B, ir.IN_X87_STORE, cg.T_void, xs[..]);
+    _ = ir.intr(B, ir.IN_X87_STORE, T_void, xs[..]);
 }

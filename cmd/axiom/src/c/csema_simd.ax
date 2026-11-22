@@ -52,15 +52,10 @@
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "csema.ax" as cs;
-import "csema_builtin.ax" as csb;
-import "csema_expr.ax" as cx;
-import "csema_gbuiltin.ax" as gb;
-import "csema_gnu.ax" as cgn;
 import "csimd_tab.ax" as tab;
 import "ctypes.ax" as cty;
 
-/// A call of __builtin_axiom_simd: its op is SB_SIMD + the entry's index.
+/// A simd_call of __builtin_axiom_simd: its op is SB_SIMD + the entry's index.
 pub const SB_SIMD: i32 = 5000;
 
 /// An operation of the table, parsed.
@@ -78,10 +73,6 @@ pub struct Op {
     imm: []u8,        // the ranges of its immediates, in order: "lo:hi,lo:hi" (empty: any value)
 }
 
-let mut ops: u.List.[Op] = u.List.[Op].{ data: @ptr_from_int(*mut Op, 0), len: 0, cap: 0 };
-let mut by_name: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
-                                                   cap: 0, len: 0 };
-
 fn field(fs: *u.List.[[]u8], k: usize) []u8 {
     if k < fs.len {
         return fs.get(k);
@@ -90,7 +81,7 @@ fn field(fs: *u.List.[[]u8], k: usize) []u8 {
 }
 
 fn load() void {
-    if ops.len > 0 {
+    if g_simd_ops.len > 0 {
         return;
     }
     for line in tab.TABLE {
@@ -102,16 +93,9 @@ fn load() void {
         o.arch = u8_at(a, 0);
         let r = field(&fs, 4);
         o.res = u8_at(r, 0);
-        ops.push(o);
-        by_name.put(o.name, @int_cast(i32, ops.len));
+        g_simd_ops.push(o);
+        g_simd_by_name.put(o.name, @int_cast(i32, g_simd_ops.len));
     }
-}
-
-fn u8_pick(c: bool, a: u8, b: u8) u8 {
-    if c {
-        return a;
-    }
-    return b;
 }
 
 fn u8_at(s: []u8, k: usize) u8 {
@@ -121,28 +105,18 @@ fn u8_at(s: []u8, k: usize) u8 {
     return 0;
 }
 
-/// The operation of a call typed here (its op: SB_SIMD + index).
+/// The operation of a simd_call typed here (its op: SB_SIMD + index).
 pub fn op_of(e: *cast.Expr) *Op {
     load();
-    return ops.at(@int_cast(usize, e.op - SB_SIMD));
+    return g_simd_ops.at(@int_cast(usize, e.op - SB_SIMD));
 }
 
-/// Is this a call's op of __builtin_axiom_simd?
+/// Is this a simd_call's op of __builtin_axiom_simd?
 pub fn is_simd(id: i32) bool {
     return id >= SB_SIMD;
 }
 
-fn bad(e: *mut cast.Expr) bool {
-    e.ty = cty.t_error;
-    e.lvalue = false;
-    return true;
-}
-
-fn is_err(e: *cast.Expr) bool {
-    return u.isnil(e.ty) or (e.ty.kind == cty.TK_ERROR);
-}
-
-fn arch_ok(a: u8) bool {
+fn simd_arch_ok(a: u8) bool {
     if a == '*' {
         return true;
     }
@@ -184,68 +158,64 @@ pub fn ext_bits(ext: []u8) u64 {
 /// The extensions the code being analyzed is compiled with: the build's,
 /// and those of the function's attribute target.
 pub fn cur_features() u64 {
-    return cgn.fn_target_bits(cs.cur_fn());
+    return fn_target_bits(cur_fn());
 }
 
 /// Installs the builtin in csema_builtin.ax.
-pub fn install() void {
-    csb.simd_call = call;
-}
-
-/// Types a call of __builtin_axiom_simd, __builtin_axiom_shufflevector
+/// Types a simd_call of __builtin_axiom_simd, __builtin_axiom_shufflevector
 /// (the dialects' __builtin_shufflevector, in every mode): true if the
 /// callee is one of them.
-pub fn call(e: *mut cast.Expr) bool {
+pub fn simd_call(e: *mut cast.Expr) bool {
     let name = e.a.name;
     if u.str_eq(name, "__builtin_axiom_shufflevector") {
-        return gb.vec_builtin(e, "__builtin_shufflevector");
+        return vec_builtin_call(e, "__builtin_shufflevector");
     }
     if not u.str_eq(name, "__builtin_axiom_simd") {
         return false;
     }
     load();
     if e.args.len == 0 {
-        cs.err(e.span, "C3241", "'__builtin_axiom_simd' takes an operation's name and its operands");
-        return bad(e);
+        err(e.span, "C3241", "'__builtin_axiom_simd' takes an operation's name and its operands");
+        return bad_true(e);
     }
-    e.args.set(0, cx.rv(e.args.get(0)));
+    e.args.set(0, rv(e.args.get(0)));
     let s = string_value(e.args.get(0));
     let mut k: i32 = 0;
     if not u.isnos(s) {
-        k = by_name.get(u.intern(s));
+        k = g_simd_by_name.get(u.intern(s));
     }
     if k == 0 {
-        cs.err(e.args.get(0).span, "C3241",
-               "the first argument of '__builtin_axiom_simd' must name one of its operations");
-        return bad(e);
+        err(e.args.get(0).span, "C3241",
+            "the first argument of '__builtin_axiom_simd' must name one of its operations");
+        return bad_true(e);
     }
-    let o = ops.at(@int_cast(usize, k - 1));
+    let o = g_simd_ops.at(@int_cast(usize, k - 1));
     e.op = SB_SIMD + (k - 1);
-    if not arch_ok(o.arch) {
-        cs.err(e.span, "C3240", u.f2("the operation '%s' is %s's", s, arch_name(o.arch)));
-        return bad(e);
+    if not simd_arch_ok(o.arch) {
+        err(e.span, "C3240", u.f2("the operation '%s' is %s's", s, arch_name(o.arch)));
+        return bad_true(e);
     }
     if (e.args.len - 1) != o.sig.len {
-        cs.err(e.span, "C3241", u.f3("the operation '%s' takes %s operands, not %s", s, u.zdec(o.sig.len),
-                                     u.zdec(e.args.len - 1)));
-        return bad(e);
+        err(e.span, "C3241", u.f3("the operation '%s' takes %s operands, not %s", s, u.zdec(o.sig.len),
+                                  u.zdec(e.args.len - 1)));
+        return bad_true(e);
     }
     let mut ok = true;
     for j in 0..o.sig.len {
-        let x = cx.rv(e.args.get(j + 1));
+        let x = rv(e.args.get(j + 1));
         e.args.set(j + 1, x);
         if is_err(x) {
             ok = false;
             continue;
         }
         if not sig_ok(o.sig[j], x, e.args.get(1)) {
-            cs.err(x.span, "C3241", u.f3("operand %s of the operation '%s' cannot be of type %s", u.zdec(j + 1), s,
-                                         cs.tq(x.ty)));
+            err(x.span, "C3241", u.f3("operand %s of the operation '%s' cannot be of type %s", u.zdec(j + 1), s,
+                                      tq(x.ty)));
             ok = false;
         }
     }
     if not ok {
-        return bad(e);
+        return bad_true(e);
     }
     // (an immediate out of its range: a lane, a shift count, ...)
     let mut ni: usize = 0;
@@ -261,9 +231,9 @@ pub fn call(e: *mut cast.Expr) bool {
         let x = e.args.get(j + 1);
         let v = @bit_cast(i64, x.cval);
         if (v < r.lo) or (v > r.hi) {
-            cs.err(x.span, "C3241", u.f3("operand %s of the operation '%s' must be from %s", u.zdec(j + 1), s,
-                                         u.f2("%s to %s", u.dec(r.lo), u.dec(r.hi))));
-            return bad(e);
+            err(x.span, "C3241", u.f3("operand %s of the operation '%s' must be from %s", u.zdec(j + 1), s,
+                                      u.f2("%s to %s", u.dec(r.lo), u.dec(r.hi))));
+            return bad_true(e);
         }
     }
     let mut need = ext_bits(o.ext);
@@ -275,10 +245,10 @@ pub fn call(e: *mut cast.Expr) bool {
         what = u.pick(u.str_eq(o.ext, "-"), "avx2", u.cat2(o.ext, "+avx2"));
     }
     if (need & ~cur_features()) != 0 {
-        cs.err(e.span, "C3240",
-               u.f2("the operation '%s' needs the processor extension '%s', which this function is not compiled for", s,
-                    what));
-        return bad(e);
+        err(e.span, "C3240",
+            u.f2("the operation '%s' needs the processor extension '%s', which this function is not compiled for", s,
+                 what));
+        return bad_true(e);
     }
     e.ty = result_type(o.res, e);
     e.lvalue = false;
@@ -304,7 +274,7 @@ fn imm_range(spec: []u8, k: usize) Range {
     return Range.{ any: false, lo: u.atol(lh.get(0)), hi: u.atol(field(&lh, 1)) };
 }
 
-// Has call e a vector operand (after the name) or result of 32 or more bytes?
+// Has simd_call e a vector operand (after the name) or result of 32 or more bytes?
 fn wide_operand(e: *cast.Expr) bool {
     for k in 1..e.args.len {
         let t = e.args.get(k).ty;
@@ -405,20 +375,3 @@ fn result_type(r: u8, e: *cast.Expr) *mut cty.CType {
 }
 
 // The text of string literal x (maybe converted), or nil.
-fn string_value(x: *cast.Expr) []u8 {
-    let mut s = x;
-    if (s.kind == cast.ExprKind.CAST) and u.notnil(s.a) {
-        s = s.a;
-    }
-    if (s.kind != cast.ExprKind.STRING) or u.isnil(s.tok) or (s.tok.prefix != 0) {
-        return u.nosym();
-    }
-    let mut b = u.Buf.init();
-    for c in s.tok.units {
-        if (c == 0) or (c > 0x7f) {
-            return u.nosym();
-        }
-        b.c(@truncate(u8, c));
-    }
-    return b.done();
-}

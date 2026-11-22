@@ -1,0 +1,676 @@
+// =============================================================================
+// cgen_stmt_ctrl.ax - IR generation for structured control flow (if, while,
+// do, for, switch, return), inlined __builtin_va_arg_pack wrappers, cleanups
+// and nested-function trampolines. Part of cgen.ax (see also cgen_stmt.ax).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen_abi.ax" as abi;
+import "cgen_debug.ax" as cdbg;
+import "cpragma.ax" as cpg;
+import "csema.ax" as cs;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+
+fn if_stmt(s: *mut cast.Stmt) void {
+    continue_after();
+    let yes = new_block("then");
+    let done = new_block("endif");
+    let mut no = done;
+    if u.notnil(s.els) {
+        no = new_block("else");
+    }
+    branch_full(s.e, yes, no);
+    at_end(yes);
+    stmt(s.body);
+    br(done);
+    if u.notnil(s.els) {
+        at_end(no);
+        stmt(s.els);
+        br(done);
+    }
+    at_end(done);
+}
+
+// What the loop pragmas before loop statement s ask of the loop whose
+// header is h (ir.Block's unroll_hint, ivdep, novector).
+fn loop_hints(h: *mut ir.Block, s: *cast.Stmt) void {
+    let x = s.hints;
+    let n = x & cpg.LH_UNROLL_MASK;
+    if n != 0 {
+        h.unroll_hint = @max(@bit_cast(i32, n - 1), 1);  // (unroll 0 and 1: none)
+    }
+    h.ivdep = (x & cpg.LH_IVDEP) != 0;
+    h.novector = (x & cpg.LH_NOVECTOR) != 0;
+}
+
+// A loop that 6.8.5p6 does not let be taken to end (its controlling
+// expression a constant, or none) clears the function's c_progress.
+fn loop_ends(e: *cast.Expr) void {
+    if u.isnil(e) or e.is_const {
+        F.f.c_progress = false;
+    }
+}
+
+fn while_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
+    let head = new_block("while");
+    loop_hints(head, s);
+    let body = new_block("body");
+    let done = new_block("endwhile");
+    br(head);
+    at_end(head);
+    branch_full(s.e, body, done);
+    at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: head, brk_depth: vla_depth(), cont_depth: vla_depth() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    br(head);
+    at_end(done);
+}
+
+fn do_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
+    let body = new_block("do");
+    loop_hints(body, s);
+    let cond = new_block("dotest");
+    let done = new_block("enddo");
+    br(body);
+    at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: cond, brk_depth: vla_depth(), cont_depth: vla_depth() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    br(cond);
+    at_end(cond);
+    branch_full(s.e, body, done);
+    at_end(done);
+}
+
+fn for_stmt(s: *mut cast.Stmt) void {
+    loop_ends(s.e);
+    let d0 = vla_depth();
+    let sc = cdbg.open_for(s.decl);
+    let mut rs = ir.rtag;
+    if u.notnil(s.decl) {
+        rs = restrict_block(s.items.items(), s);  // (restrict: cgen_restrict.ax)
+        decl(s.decl);
+    } else if u.notnil(s.first) {
+        continue_after();
+        _ = lv_full(s.first);
+    }
+    let d1 = vla_depth();
+    let head = new_block("for");
+    loop_hints(head, s);
+    let body = new_block("body");
+    let step = new_block("step");
+    let done = new_block("endfor");
+    // (the loop's end leaves the scope of the variable length arrays its
+    // first clause declares)
+    let mut exit = done;
+    if d1 > d0 {
+        exit = new_block("forexit");
+    }
+    br(head);
+    at_end(head);
+    if u.notnil(s.e) {
+        branch_full(s.e, body, exit);
+    } else {
+        ir.br(B, body);
+    }
+    at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: step, brk_depth: d0, cont_depth: d1 });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    br(step);
+    at_end(step);
+    if u.notnil(s.step) {
+        _ = lv_full(s.step);
+    }
+    br(head);
+    if d1 > d0 {
+        at_end(exit);
+        vla_leave(d0);
+        br(done);
+    }
+    restrict_close(rs);
+    cdbg.close_scope(sc);
+    at_end(done);
+}
+
+fn switch_stmt(s: *mut cast.Stmt) void {
+    continue_after();
+    let v = lv_full(s.e);
+    if cty.is_wint(s.e.ty) {
+        wide_switch(s, v);
+        return;
+    }
+    let done = new_block("endswitch");
+    let mut dflt = done;
+    let blocks = u.newn.[*mut ir.Block](s.cases.len + 1);
+    for i in 0..s.cases.len {
+        let c = s.cases.get(i);
+        let b = new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
+        blocks[i] = b;
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        if c.kind == cast.StmtKind.DEFAULT {
+            dflt = b;
+        }
+    }
+    let mut vs = u.List.[u64].empty();
+    let mut bs = u.List.[*mut ir.Block].empty();
+    let mask = ~@as(u64, 0) >> @int_cast(u32, 64 - v.ty.bits);
+    for i in 0..s.cases.len {
+        let c = s.cases.get(i);
+        if (c.kind == cast.StmtKind.CASE) and u.notnil(c.hi) {
+            // a case range (a GNU dialect): its values, if few; else a test first
+            let span = (c.cval_hi -% c.cval) & mask;
+            if span < 256 {
+                for k in 0..span + 1 {
+                    vs.push((c.cval +% k) & mask);
+                    bs.push(blocks[i]);
+                }
+            } else {
+                let next = new_block("range");
+                let d = ir.sub(B, v, ir.cint(v.ty, c.cval & mask));
+                ir.condbr(B, ir.icmp(B, ir.IntULE, d, ir.cint(v.ty, span)), blocks[i], next);
+                at_end(next);
+            }
+        } else if c.kind == cast.StmtKind.CASE {
+            vs.push(c.cval & mask);
+            bs.push(blocks[i]);
+        }
+    }
+    switch_to(v, s.e.ty.is_signed, vs.items(), bs.items(), dflt);
+    at_end(new_block("switchbody"));
+    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: vla_depth(), cont_depth: vla_depth() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    br(done);
+    at_end(done);
+}
+
+// A switch on a value v wider than 64 bits (its address): for each value of
+// the limbs above the first that some case has, a comparison of those, then
+// a switch on the first limb among those cases; before them, a test of
+// each case range.
+fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
+    let t = s.e.ty;
+    let n = cty.limbs(t);
+    let done = new_block("endswitch");
+    let mut dflt = done;
+    let nc = s.cases.len;
+    let blocks = u.newn.[*mut ir.Block](nc + 1);
+    let vals = u.newn.[[]u64](nc + 1);
+    for i in 0..nc {
+        let c = s.cases.get(i);
+        let b = new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
+        blocks[i] = b;
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        if c.kind == cast.StmtKind.DEFAULT {
+            dflt = b;
+        } else {
+            vals[i] = cw.value(c.e, n);
+        }
+    }
+    // the case ranges first: lo <= v and v <= hi
+    for i in 0..nc {
+        let c = s.cases.get(i);
+        if (c.kind != cast.StmtKind.CASE) or u.isnil(c.hi) {
+            continue;
+        }
+        let ge = wint_compare(ct.P_GE, t, v, wint_constant(t, vals[i]));
+        let le = wint_compare(ct.P_LE, t, v, wint_constant(t, cw.value(c.hi, n)));
+        let next = new_block("wrange");
+        ir.condbr(B, ir.and_(B, ge, le), blocks[i], next);
+        at_end(next);
+    }
+    let lo = wint_limb(v, 0);
+    let mut seen = u.List.[usize].empty();  // (a case of each group: its first)
+    for i in 0..nc {
+        if (s.cases.get(i).kind != cast.StmtKind.CASE) or u.notnil(s.cases.get(i).hi) {
+            continue;
+        }
+        let mut grouped = false;
+        for j in seen.items() {
+            if same_upper(vals[i], vals[j], n) {
+                grouped = true;
+            }
+        }
+        if grouped {
+            continue;
+        }
+        seen.push(i);
+        // the limbs above the first equal to this group's?
+        let mut d = ir.cint(ir.t_int(64), 0);
+        for k in 1..n {
+            d = ir.or_(B, d, ir.xor(B, wint_limb(v, k), ir.cint(ir.t_int(64), vals[i][k])));
+        }
+        let yes = new_block("wcase");
+        let no = new_block("wnext");
+        ir.condbr(B, ir.icmp(B, ir.IntEQ, d, ir.cint(ir.t_int(64), 0)), yes, no);
+        at_end(yes);
+        let mut vs = u.List.[u64].empty();
+        let mut bs = u.List.[*mut ir.Block].empty();
+        for k in i..nc {
+            if (s.cases.get(k).kind == cast.StmtKind.CASE) and u.isnil(s.cases.get(k).hi) and
+               same_upper(vals[k], vals[i], n) {
+                vs.push(vals[k][0]);
+                bs.push(blocks[k]);
+            }
+        }
+        switch_to(lo, false, vs.items(), bs.items(), dflt);
+        at_end(no);
+    }
+    br(dflt);
+    at_end(new_block("switchbody"));
+    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: vla_depth(), cont_depth: vla_depth() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    br(done);
+    at_end(done);
+}
+
+// Are the limbs of a and b above the first the same?
+fn same_upper(a: []u64, b: []u64, n: usize) bool {
+    for k in 1..n {
+        if a[k] != b[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn return_stmt(s: *mut cast.Stmt) void {
+    continue_after();
+    let inl = INL;
+    if u.notnil(inl) {
+        // (in an inlined call: the result stored, then its end)
+        if u.notnil(s.e) {
+            let v = lv_full(s.e);
+            if u.notnil(inl.res) {
+                stmt_put(inl.ret, v, inl.res);
+            }
+        }
+        br(inl.exit);
+        return;
+    }
+    if u.isnil(s.e) {
+        cleanups();
+        ret_default(F.sig.plan, F.sret);
+        return;
+    }
+    // (WebAssembly with tail calls: the calls of a return's expression,
+    // which may be in tail position, push no record on the shadow stack:
+    // cgen_va.ax; a sibling call leaves no frame for one)
+    let tail = ss_tail;
+    ss_tail = tg.is_wasm() and tg.has(tg.W_TAIL_CALL);
+    let mut v = lv_full(s.e);
+    ss_tail = tail;
+    if cty.is_void(F.ret) {
+        cleanups();
+        ir.ret_void(B);
+        return;
+    }
+    if vla_has_cleanups() and
+       (cty.is_record(F.ret) or cty.is_wint(F.ret) or cty.is_vector(F.ret) or cty.is_wide(F.ret)) {
+        // (the value copied before the cleanups run)
+        let tmp = alloca(F.ret, "retval");
+        copy(F.ret, tmp, v);
+        v = tmp;
+    }
+    cleanups();
+    ret_value(F.sig.plan, F.sret, v);
+}
+
+// -----------------------------------------------------------------------------
+// Inlined calls: an inline definition that forwards its caller's variable
+// arguments (__builtin_va_arg_pack: the system's headers' wrappers of
+// printf, open ... under _FORTIFY_SOURCE), which only inlining gives them,
+// generated in place of each call (csema_marks.va_wrapper). The arguments
+// are evaluated in order into objects of their own, the parameters' and the
+// variable arguments' (INL.pack); a call in the body whose last argument
+// is __builtin_va_arg_pack () gets the variable arguments in its place
+// (cgen_expr_ops.expr_call), and __builtin_va_arg_pack_len () is their number;
+// a return stores the result and goes to the end. The optimizer then sees
+// the caller's arguments in the parameters (__builtin_object_size,
+// __builtin_constant_p).
+// -----------------------------------------------------------------------------
+
+// A call e of function s, whose inline definition d (parameters ps)
+// forwards its variable arguments, inlined. done: false (and nothing
+// generated) when it cannot be: the body has what is not generated twice
+// in a function (a label, a static object, a statement expression ...),
+// an argument is of a type kept in memory other than a structure's, or the
+// call is in the inlined body of s itself; the call is then the external
+// function's.
+fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*mut cast.CSym,
+               done: *mut bool) *mut ir.Value {
+    done.* = false;
+    let n = e.args.len;
+    let mut locals = u.List.[*mut cast.CSym].empty();
+    if (ps.len > n) or u.isnil(d.body) or not inlinable(d.body, &mut locals) {
+        return ir.vnil();
+    }
+    for x in e.args.items() {
+        if not inline_type(x.ty) {
+            return ir.vnil();
+        }
+    }
+    for p in ps {
+        if not inline_type(p.ty) {
+            return ir.vnil();
+        }
+    }
+    let mut o = INL;
+    while u.notnil(o) {
+        if o.callee == s {
+            return ir.vnil();
+        }
+        o = o.outer;
+    }
+    done.* = true;
+    let vs = u.newn.[*mut ir.Value](n + 1);
+    for i in 0..n {
+        vs[i] = rv(e.args.get(i));
+    }
+    let inl = u.new.[Inline]();
+    inl.callee = s;
+    inl.outer = INL;
+    inl.pack = u.List.[*mut cast.Expr].empty();
+    // (the objects of the parameters and the body: this call's own)
+    let saved = u.newn.[*mut void](ps.len + locals.len + 1);
+    for j in 0..ps.len {
+        let p = ps[j];
+        saved[j] = p.ir;
+        let slot = aligned_alloca(cty.unqual(p.ty), p.name, p.align);
+        stmt_put(cty.unqual(p.ty), vs[j], slot);
+        p.ir = @ptr_cast(*mut void, slot);
+    }
+    for j in 0..locals.len {
+        let x = locals.get(j);
+        saved[ps.len + j] = x.ir;
+        x.ir = @ptr_from_int(*mut void, 0);
+    }
+    for k in ps.len..n {
+        let a = e.args.get(k);
+        let t = cty.unqual(a.ty);
+        let slot = alloca(t, "va.pack");
+        stmt_put(t, vs[k], slot);
+        let v = u.new.[cast.CSym]();
+        v.kind = cast.SK_OBJECT;
+        v.name = "va.pack";
+        v.span = a.span;
+        v.ty = t;
+        v.duration = cast.SD_AUTO;
+        v.ir = @ptr_cast(*mut void, slot);
+        let x = cast.new_expr(cast.ExprKind.IDENT, a.span);
+        x.name = v.name;
+        x.sym = v;
+        x.ty = t;
+        x.lvalue = true;
+        inl.pack.push(x);
+    }
+    inl.ret = cty.unqual(s.ty.ret);
+    if not cty.is_void(inl.ret) {
+        inl.res = alloca(inl.ret, "inl.ret");
+    }
+    inl.exit = new_block("inl.end");
+    INL = inl;
+    let fp = fp_state;
+    stmt(d.body);
+    fp_state = fp;
+    br(inl.exit);
+    at_end(inl.exit);
+    INL = inl.outer;
+    for j in 0..ps.len {
+        ps[j].ir = saved[j];
+    }
+    for j in 0..locals.len {
+        locals.get(j).ir = saved[ps.len + j];
+    }
+    if u.isnil(inl.res) {
+        return ir.vnil();
+    }
+    if cty.is_record(inl.ret) {
+        return inl.res;
+    }
+    return load(inl.ret, inl.res);
+}
+
+// Is a value of type t one inline_call keeps in an object of its own: a
+// scalar in registers, or a structure or union (its address)?
+fn inline_type(t: *mut cty.CType) bool {
+    if u.isnil(t) {
+        return false;
+    }
+    if cty.is_record(t) or cty.is_pointer(t) {
+        return true;
+    }
+    return cty.is_arith(t) and not cty.is_complex(t) and not cty.is_wide(t) and not cty.is_wint(t) and
+           not cty.is_dec128(t) and not cty.is_vector(t);
+}
+
+// Can the statements of s be generated in each inlined call (inline_call):
+// blocks, declarations of automatic objects of types that are not variably
+// modified, without cleanups (locals: them), expression statements, if,
+// the loops, break, continue and return, with no statement expression,
+// compound literal or address of a label in their expressions?
+fn inlinable(s: *mut cast.Stmt, locals: *mut u.List.[*mut cast.CSym]) bool {
+    if u.isnil(s) {
+        return true;
+    }
+    let k = s.kind;
+    if k == cast.StmtKind.COMPOUND {
+        for x in s.items.items() {
+            if not inlinable(x, locals) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == cast.StmtKind.DECL {
+        return inlinable_decl(s.decl, locals);
+    }
+    if (k == cast.StmtKind.EXPR) or (k == cast.StmtKind.RETURN) {
+        return inlinable_expr(s.e);
+    }
+    if k == cast.StmtKind.IF {
+        return inlinable_expr(s.e) and inlinable(s.body, locals) and inlinable(s.els, locals);
+    }
+    if (k == cast.StmtKind.WHILE) or (k == cast.StmtKind.DO) {
+        return inlinable_expr(s.e) and inlinable(s.body, locals);
+    }
+    if k == cast.StmtKind.FOR {
+        return inlinable_expr(s.first) and (u.isnil(s.decl) or inlinable_decl(s.decl, locals)) and
+               inlinable_expr(s.e) and inlinable_expr(s.step) and inlinable(s.body, locals);
+    }
+    return (k == cast.StmtKind.BREAK) or (k == cast.StmtKind.CONTINUE);
+}
+
+fn inlinable_decl(d: *mut cast.Decl, locals: *mut u.List.[*mut cast.CSym]) bool {
+    if d.kind != cast.DeclKind.DECL {
+        return d.kind == cast.DeclKind.STATIC_ASSERT;
+    }
+    for x in d.decls.items() {
+        let s = x.sym;
+        if u.isnil(s) {
+            continue;
+        }
+        if s.kind == cast.SK_FUNC {
+            if u.notnil(s.def) or u.notnil(s.nest_parent) {
+                return false;
+            }
+            continue;
+        }
+        if s.kind != cast.SK_OBJECT {
+            continue;
+        }
+        if s.duration != cast.SD_AUTO {
+            if s.linkage == cast.LK_NONE {
+                return false;  // (a static object of its own)
+            }
+            continue;
+        }
+        if cty.is_vm(s.ty) {
+            return false;
+        }
+        let n = cs.note_of(s);
+        if u.notnil(n) and u.notnil(n.cleanup_call) {
+            return false;
+        }
+        if u.notnil(s.init) {
+            if s.init.pre.len > 0 {
+                return false;
+            }
+            for it in s.init.items.items() {
+                if not inlinable_expr(it.e) {
+                    return false;
+                }
+            }
+        }
+        locals.push(s);
+    }
+    return true;
+}
+
+fn inlinable_expr(e: *mut cast.Expr) bool {
+    if u.isnil(e) {
+        return true;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.LABEL_ADDR) or
+       (k == cast.ExprKind.GENERIC) or (k == cast.ExprKind.VA_ARG) {
+        return false;
+    }
+    if not inlinable_expr(e.a) or not inlinable_expr(e.b) or not inlinable_expr(e.c) {
+        return false;
+    }
+    for x in e.args.items() {
+        if not inlinable_expr(x) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Stores value v of type t (a scalar, or a structure's address) at p.
+fn stmt_put(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    if cty.is_record(t) {
+        copy(t, p, v);
+    } else {
+        store(t, v, p);
+    }
+}
+
+// Before a return: the calls of the cleanups in scope (a GNU dialect), and
+// the trampolines of nested functions the call holds given back.
+fn cleanups() void {
+    if vla_has_cleanups() {
+        vla_release_to(0);
+        continue_after();
+    }
+    if u.notnil(F.sym) {
+        nest_leave(F.sym);
+    }
+}
+
+// The trampolines of function s's nested functions whose addresses are
+// taken (cgen_nest.ax): the function that gives one, and each one: a
+// function of the nested function's C type that calls it with the chain its
+// slot holds, its arguments as they arrive (cgen_va.ax: the C ABI's both
+// ways).
+//
+// A variadic nested function g (s itself) gets its entry too
+// (entry_of): the function its direct calls call, whose arguments are
+// g's and its chain as a last named argument (so that the variable
+// arguments start after it, on every ABI); it, and each trampoline of g,
+// starts a va_list of its variable arguments and calls g's IR function
+// with its address (which g's va_start copies: va_from).
+fn stmt_trampolines(s: *mut cast.CSym) void {
+    let saved = F;
+    for g in s.tramps.items() {
+        define_get(g);
+        let p = pool_of(g);
+        for i in 0..p.thunks.len {
+            forwarder(p.thunks[i], g, p.chains, i);
+        }
+    }
+    if u.notnil(s.nest_parent) and s.ty.variadic {
+        forwarder(entry_of(s), s, ir.vnil(), 0);
+    }
+    F = saved;
+}
+
+// Defines f, which calls nested function g with its arguments as they
+// arrive (cgen_va.ax: the C ABI's both ways) and the chain in slot i of the
+// table `chains`; or (chains nil: g's variadic entry) the chain its last
+// named argument is.
+fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize) void {
+    let pts0 = param_types(g);
+    let entry = u.isnil(chains);
+    let mut pts = pts0;
+    if entry {
+        pts = entry_params(g);
+    }
+    let st = u.new.[FnState]();
+    st.f = f;
+    st.ret = g.ty.ret;
+    st.sig = sig_of(g.ty.ret, pts, pts.len, g.ty.variadic, true);
+    F = st;
+    st.entry = new_block("entry");
+    let start = new_block("start");
+    at_end(start);
+    let fakes = u.newn.[*mut cast.CSym](pts.len + 1);
+    for j in 0..pts.len {
+        let x = u.new.[cast.CSym]();
+        x.kind = cast.SK_OBJECT;
+        x.name = "";
+        x.ty = pts[j];
+        x.duration = cast.SD_AUTO;
+        fakes[j] = x;
+    }
+    st.sret = enter_function(st.sig.plan, f, fakes[0..pts.len], g.ty.variadic);
+    let n = pts0.len;
+    let vs = u.newn.[*mut ir.Value](n + 2);
+    for j in 0..n {
+        let at = @ptr_cast(*mut ir.Value, fakes[j].ir);
+        if abi.aggregate(pts[j]) {
+            vs[j] = at;
+        } else {
+            vs[j] = load(pts[j], at);
+        }
+    }
+    let mut chain = ir.vnil();
+    if entry {
+        chain = load(pts[n], @ptr_cast(*mut ir.Value, fakes[n].ir));
+    } else {
+        let ch = ir.ptradd(B, chains, usz(@as(u64, i) * cty.ptr_bytes));
+        chain = ir.load(B, T_ptr, ch);
+        chain.flags = chain.flags | ir.F_VOLATILE;
+    }
+    let mut nv = n;
+    if g.ty.variadic {
+        // (its variable arguments: a va_list, whose address g takes)
+        let ap = alloca(cs.va_list_type(), "ap");
+        va_start_ap(ap);
+        vs[n] = ap;
+        nv = n + 1;
+    }
+    let gs = func_sig(g);
+    next_chain = chain;
+    let r = emit_call(gs.plan, gs.ty, func_of(g, gs).val, vs[0..nv]);
+    if cty.is_void(g.ty.ret) {
+        ret_value(st.sig.plan, st.sret, ir.vnil());
+    } else {
+        ret_value(st.sig.plan, st.sret, r);
+    }
+    at_end(st.entry);
+    ir.br(B, start);
+    ir.remove_unreachable(f);
+    if is_wasm {
+        make_reducible(f);
+    }
+}

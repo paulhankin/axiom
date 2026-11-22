@@ -1,0 +1,420 @@
+// =============================================================================
+// std/encoding/yaml/scanner_scalars.ax - YAML block, quoted, and plain scalar scanning, part of std/encoding/yaml.
+// =============================================================================
+
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Scalar scanning
+// -----------------------------------------------------------------------------
+
+fn scan_block_scalar(sc: *mut Scanner, literal: bool) YamlError!void {
+    sc.remove_key()!;
+    sc.allowed = true;
+    let start = sc.m;
+    sc.skip();
+    let mut chomp: i32 = 0;
+    let mut increment: i32 = 0;
+    let c = sc.at(0);
+    if (c == '+') or (c == '-') {
+        chomp = 1;
+        if c == '-' {
+            chomp = -1;
+        }
+        sc.skip();
+        if (sc.at(0) >= '0') and (sc.at(0) <= '9') {
+            if sc.at(0) == '0' {
+                return sc.fail("found an indentation indicator equal to 0");
+            }
+            increment = @as(i32, sc.at(0) - '0');
+            sc.skip();
+        }
+    } else if (c >= '0') and (c <= '9') {
+        if c == '0' {
+            return sc.fail("found an indentation indicator equal to 0");
+        }
+        increment = @as(i32, c - '0');
+        sc.skip();
+        let d = sc.at(0);
+        if (d == '+') or (d == '-') {
+            chomp = 1;
+            if d == '-' {
+                chomp = -1;
+            }
+            sc.skip();
+        }
+    }
+    let had_space = is_blank(sc.at(0));
+    while is_blank(sc.at(0)) {
+        sc.skip();
+    }
+    if sc.at(0) == '#' {
+        if not had_space {
+            return sc.fail("a comment needs white space before it");
+        }
+        while not sc.breakz(0) {
+            sc.skip();
+        }
+    }
+    if not sc.breakz(0) {
+        return sc.fail("did not find expected comment or line break");
+    }
+    if not sc.eof() {
+        sc.skip_line();
+    }
+    let mut indent: i32 = -1;
+    if increment > 0 {
+        indent = increment;
+        if sc.indent >= 0 {
+            indent = sc.indent + increment;
+        }
+    }
+    sc.buf.clear();
+    sc.lead.clear();
+    sc.trail.clear();
+    scan_block_breaks(sc, &mut indent)!;
+    let mut leading_blank = false;
+    while (@bit_cast(i32, sc.m.column) == indent) and not sc.eof() and not is_doc_marker(sc) {
+        let trailing_blank = is_blank(sc.at(0));
+        if not literal and (sc.lead.len() > 0) and (sc.lead.bytes()[0] == '\n') and not leading_blank and
+           not trailing_blank {
+            if sc.trail.len() == 0 {
+                sc.buf.push(' ')!;
+            }
+            sc.lead.clear();
+        } else {
+            sc.buf.push_str(sc.lead.bytes())!;
+            sc.lead.clear();
+        }
+        sc.buf.push_str(sc.trail.bytes())!;
+        sc.trail.clear();
+        leading_blank = is_blank(sc.at(0));
+        while not sc.breakz(0) {
+            sc.copy(&mut sc.buf)!;
+        }
+        if sc.eof() {
+            sc.lead.push('\n')!;  // the end of the input ends the line
+            break;
+        }
+        sc.read_line(&mut sc.lead)!;
+        scan_block_breaks(sc, &mut indent)!;
+    }
+    if chomp != -1 {
+        sc.buf.push_str(sc.lead.bytes())!;
+    }
+    if chomp == 1 {
+        sc.buf.push_str(sc.trail.bytes())!;
+    }
+    let mut t = sc.token(TokenKind.SCALAR, start);
+    t.value = sc.ar.dup(sc.buf.bytes())!;
+    t.style = Style.FOLDED;
+    if literal {
+        t.style = Style.LITERAL;
+    }
+    sc.push(t)!;
+}
+
+// Empty lines at the start of a block scalar (or between its lines),
+// working out the indentation (from the first line with content) if it
+// is not known yet (-1).
+fn scan_block_breaks(sc: *mut Scanner, indent: *mut i32) YamlError!void {
+    let mut empty_max: i32 = 0;
+    loop {
+        while ((indent.* < 0) or (@bit_cast(i32, sc.m.column) < indent.*)) and (sc.at(0) == ' ') {
+            sc.skip();
+        }
+        let col = @bit_cast(i32, sc.m.column);
+        if (indent.* >= 0) and (col < indent.*) and (sc.at(0) == '\t') {
+            // a tab inside the indentation: only on a line of white space
+            let mut k: usize = 0;
+            while is_blank(sc.at(k)) {
+                k += 1;
+            }
+            if not sc.breakz(k) {
+                return sc.fail("found a tab character where an indentation space is expected");
+            }
+            while is_blank(sc.at(0)) {
+                sc.skip();
+            }
+        }
+        if sc.eof() {
+            if (col > 0) and (indent.* < 0) {
+                sc.trail.push('\n')!;  // a last line of spaces
+            }
+            if col > empty_max {
+                empty_max = col;
+            }
+            break;
+        }
+        if not is_break(sc.at(0)) {
+            if indent.* < 0 {
+                // the first line with content (a tab counts) sets the indentation
+                if (sc.at(0) == '\t') and (col <= sc.indent) {
+                    return sc.fail("found a tab character where an indentation space is expected");
+                }
+                if is_doc_marker(sc) {
+                    break;
+                }
+                let ind = @max(col, sc.indent + 1);
+                if empty_max > ind {
+                    return sc.fail("a leading empty line has more spaces than the first line with content");
+                }
+                indent.* = ind;
+            }
+            break;
+        }
+        if col > empty_max {
+            empty_max = col;
+        }
+        sc.read_line(&mut sc.trail)!;
+    }
+    if indent.* < 0 {
+        indent.* = @max(empty_max, sc.indent + 1);
+    }
+}
+
+fn scan_flow_scalar(sc: *mut Scanner, single: bool) YamlError!void {
+    sc.save_key()!;
+    sc.allowed = false;
+    let start = sc.m;
+    let mut q: u8 = '"';
+    if single {
+        q = '\'';
+    }
+    sc.skip();
+    sc.buf.clear();
+    loop {
+        if (sc.m.column == 0) and
+           ((((sc.at(0) == '-') and (sc.at(1) == '-') and (sc.at(2) == '-')) or
+             ((sc.at(0) == '.') and (sc.at(1) == '.') and (sc.at(2) == '.'))) and sc.blankz(3)) {
+            return sc.fail("found unexpected document indicator in a quoted scalar");
+        }
+        if sc.eof() {
+            return sc.fail("found unexpected end of stream in a quoted scalar");
+        }
+        let mut leading_blanks = false;
+        let mut spaces: i32 = 0;
+        let mut counting = false;
+        while not sc.blankz(0) {
+            let c = sc.at(0);
+            if single and (c == '\'') and (sc.at(1) == '\'') {
+                sc.buf.push('\'')!;
+                sc.skip();
+                sc.skip();
+            } else if c == q {
+                break;
+            } else if not single and (c == '\\') and is_break(sc.at(1)) {
+                sc.skip();
+                sc.skip_line();
+                leading_blanks = true;
+                counting = true;
+                break;
+            } else if not single and (c == '\\') {
+                scan_escape(sc)!;
+            } else {
+                sc.copy(&mut sc.buf)!;
+            }
+        }
+        if sc.at(0) == q {
+            break;
+        }
+        // white space and line breaks, folded
+        sc.ws.clear();
+        sc.lead.clear();
+        sc.trail.clear();
+        while is_blank(sc.at(0)) or (not sc.eof() and is_break(sc.at(0))) {
+            if is_blank(sc.at(0)) {
+                if counting and (sc.at(0) == ' ') {
+                    spaces += 1;
+                } else {
+                    counting = false;
+                }
+                if not leading_blanks {
+                    sc.copy(&mut sc.ws)!;
+                } else {
+                    sc.skip();
+                }
+            } else if not leading_blanks {
+                sc.ws.clear();
+                sc.read_line(&mut sc.lead)!;
+                leading_blanks = true;
+                spaces = 0;
+                counting = true;
+            } else {
+                sc.read_line(&mut sc.trail)!;
+                spaces = 0;
+                counting = true;
+            }
+            if sc.eof() {
+                return sc.fail("found unexpected end of stream in a quoted scalar");
+            }
+        }
+        if leading_blanks {
+            // continuation lines of a block-context scalar must be indented (with spaces)
+            if (sc.flow == 0) and (spaces <= sc.indent) and not sc.eof() {
+                return sc.fail("a quoted scalar's continuation line is not indented enough");
+            }
+            if (sc.lead.len() > 0) and (sc.lead.bytes()[0] == '\n') {
+                if sc.trail.len() == 0 {
+                    sc.buf.push(' ')!;
+                } else {
+                    sc.buf.push_str(sc.trail.bytes())!;
+                }
+            } else {
+                sc.buf.push_str(sc.lead.bytes())!;
+                sc.buf.push_str(sc.trail.bytes())!;
+            }
+        } else {
+            sc.buf.push_str(sc.ws.bytes())!;
+        }
+    }
+    sc.skip();
+    let mut t = sc.token(TokenKind.SCALAR, start);
+    t.value = sc.ar.dup(sc.buf.bytes())!;
+    t.style = Style.DOUBLE_QUOTED;
+    if single {
+        t.style = Style.SINGLE_QUOTED;
+    }
+    sc.push(t)!;
+}
+
+fn scan_escape(sc: *mut Scanner) YamlError!void {
+    let c = sc.at(1);
+    let mut n: usize = 0;
+    let mut out: u32 = 0;
+    match c {
+        '0'  => { out = 0; }
+        'a'  => { out = 7; }
+        'b'  => { out = 8; }
+        't'  => { out = 9; }
+        '\t' => { out = 9; }
+        'n'  => { out = 10; }
+        'v'  => { out = 11; }
+        'f'  => { out = 12; }
+        'r'  => { out = 13; }
+        'e'  => { out = 27; }
+        ' '  => { out = 32; }
+        '"'  => { out = 34; }
+        '/'  => { out = 47; }
+        '\\' => { out = 92; }
+        'N'  => { out = 0x85; }
+        '_'  => { out = 0xa0; }
+        'L'  => { out = 0x2028; }
+        'P'  => { out = 0x2029; }
+        'x'  => { n = 2; }
+        'u'  => { n = 4; }
+        'U'  => { n = 8; }
+        else => { return sc.fail("found unknown escape character"); }
+    }
+    sc.skip();
+    sc.skip();
+    if n > 0 {
+        for k in @as(usize, 0)..n {
+            let h = hexv(sc.at(k));
+            if h > 15 {
+                return sc.fail("did not find expected hexadecimal number");
+            }
+            out = (out << 4) | h;
+        }
+        if ((out >= 0xd800) and (out <= 0xdfff)) or (out > 0x10ffff) {
+            return sc.fail("found invalid Unicode character escape code");
+        }
+        for _k in @as(usize, 0)..n {
+            sc.skip();
+        }
+    }
+    let mut b: [4]u8 = [0; 4];
+    sc.buf.push_str(strs.encode_rune(b[..], out))!;
+}
+
+fn scan_plain_scalar(sc: *mut Scanner) YamlError!void {
+    sc.save_key()!;
+    sc.allowed = false;
+    let start = sc.m;
+    let mut end = sc.m;
+    let indent = sc.indent + 1;
+    let mut leading_blanks = false;
+    sc.buf.clear();
+    sc.ws.clear();
+    sc.lead.clear();
+    sc.trail.clear();
+    loop {
+        if (sc.m.column == 0) and
+           ((((sc.at(0) == '-') and (sc.at(1) == '-') and (sc.at(2) == '-')) or
+             ((sc.at(0) == '.') and (sc.at(1) == '.') and (sc.at(2) == '.'))) and sc.blankz(3)) {
+            break;
+        }
+        if sc.at(0) == '#' {
+            break;
+        }
+        while not sc.blankz(0) {
+            let c = sc.at(0);
+            if (c == ':') and (sc.blankz(1) or ((sc.flow > 0) and is_flow_indicator(sc.at(1)))) {
+                break;
+            }
+            if (sc.flow > 0) and is_flow_indicator(c) {
+                break;
+            }
+            if leading_blanks or (sc.ws.len() > 0) {
+                if leading_blanks {
+                    if (sc.lead.len() > 0) and (sc.lead.bytes()[0] == '\n') {
+                        if sc.trail.len() == 0 {
+                            sc.buf.push(' ')!;
+                        } else {
+                            sc.buf.push_str(sc.trail.bytes())!;
+                            sc.trail.clear();
+                        }
+                        sc.lead.clear();
+                    } else {
+                        sc.buf.push_str(sc.lead.bytes())!;
+                        sc.buf.push_str(sc.trail.bytes())!;
+                        sc.lead.clear();
+                        sc.trail.clear();
+                    }
+                    leading_blanks = false;
+                } else {
+                    sc.buf.push_str(sc.ws.bytes())!;
+                    sc.ws.clear();
+                }
+            }
+            sc.copy(&mut sc.buf)!;
+            end = sc.m;
+        }
+        if not (is_blank(sc.at(0)) or (not sc.eof() and is_break(sc.at(0)))) {
+            break;
+        }
+        while is_blank(sc.at(0)) or (not sc.eof() and is_break(sc.at(0))) {
+            if is_blank(sc.at(0)) {
+                if leading_blanks and (@bit_cast(i32, sc.m.column) < indent) and (sc.at(0) == '\t') {
+                    let mut k: usize = 0;
+                    while is_blank(sc.at(k)) {
+                        k += 1;
+                    }
+                    if not sc.breakz(k) {
+                        return sc.fail("found a tab character that violates indentation");
+                    }
+                }
+                if not leading_blanks {
+                    sc.copy(&mut sc.ws)!;
+                } else {
+                    sc.skip();
+                }
+            } else if not leading_blanks {
+                sc.ws.clear();
+                sc.read_line(&mut sc.lead)!;
+                leading_blanks = true;
+            } else {
+                sc.read_line(&mut sc.trail)!;
+            }
+        }
+        if (sc.flow == 0) and (@bit_cast(i32, sc.m.column) < indent) {
+            break;
+        }
+    }
+    let mut t = Token.{ kind: TokenKind.SCALAR, start: start, end: end, value: sc.ar.dup(sc.buf.bytes())!, handle: "",
+                        style: Style.PLAIN };
+    sc.push(t)!;
+    if leading_blanks {
+        sc.allowed = true;
+    }
+}

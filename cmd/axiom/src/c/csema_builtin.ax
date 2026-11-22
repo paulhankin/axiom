@@ -45,10 +45,6 @@ import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "cldbl.ax" as cl;
 import "copts.ax" as co;
-import "csema.ax" as cs;
-import "csema_atomic.ax" as catm;
-import "csema_expr.ax" as cx;
-import "csema_fp.ax" as fp;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -83,40 +79,11 @@ pub const BI_CREAL: i32 = 41;
 pub const BI_CIMAG: i32 = 42;
 pub const BI_CONJ: i32 = 43;
 
-let stdc_names: [14][]u8 = ["leading_zeros", "leading_ones", "trailing_zeros", "trailing_ones", "first_leading_zero",
-                            "first_leading_one", "first_trailing_zero", "first_trailing_one", "count_zeros",
-                            "count_ones", "has_single_bit", "bit_width", "bit_floor", "bit_ceil"];
-
-fn no_simd(e: *mut cast.Expr) bool {
-    _ = e;
-    return false;
-}
-
-/// Types a call of __builtin_axiom_simd (set by csema_simd.ax): true if it is one.
-pub let mut simd_call: fn(*mut cast.Expr) bool = no_simd;
-
-/// Installs the builtins in csema_expr.ax.
-pub fn install() void {
-    cx.builtin_hooks = cx.BuiltinHooks.{ call: builtin_call, special: special };
-}
-
-/// Types a call of a GNU dialect's builtin (set by csema_gbuiltin.ax): true
-/// if e is one.
-pub let mut gnu_call: fn(*mut cast.Expr) bool = no_gnu_call;
-
-fn no_gnu_call(e: *mut cast.Expr) bool {
-    _ = e;
-    return false;
-}
-
 // -----------------------------------------------------------------------------
 // va_list
 // -----------------------------------------------------------------------------
 
-let mut g_va_list: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);
-let mut g_va_for: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);  // (the unit's int: types are per unit)
-
-fn member(ti: *mut cty.TagInfo, name: []u8, t: *mut cty.CType) void {
+fn add_tag_member(ti: *mut cty.TagInfo, name: []u8, t: *mut cty.CType) void {
     let m = u.new.[cty.Member]();
     m.name = name;
     m.ty = t;
@@ -139,10 +106,10 @@ pub fn va_list_type() *mut cty.CType {
         if w.bits != 32 {
             w = cty.t_ulong;
         }
-        member(t.tag, "gp_offset", w);
-        member(t.tag, "fp_offset", w);
-        member(t.tag, "overflow_arg_area", vp);
-        member(t.tag, "reg_save_area", vp);
+        add_tag_member(t.tag, "gp_offset", w);
+        add_tag_member(t.tag, "fp_offset", w);
+        add_tag_member(t.tag, "overflow_arg_area", vp);
+        add_tag_member(t.tag, "reg_save_area", vp);
         cty.layout(t.tag);
         g_va_list = cty.array_of(t, 1, true);
     } else if (tg.g_arch == tg.ARCH_A64) and not tg.is_darwin() and not tg.is_windows() {
@@ -151,11 +118,11 @@ pub fn va_list_type() *mut cty.CType {
         if w.bits != 32 {
             w = cty.t_long;
         }
-        member(t.tag, "__stack", vp);
-        member(t.tag, "__gr_top", vp);
-        member(t.tag, "__vr_top", vp);
-        member(t.tag, "__gr_offs", w);
-        member(t.tag, "__vr_offs", w);
+        add_tag_member(t.tag, "__stack", vp);
+        add_tag_member(t.tag, "__gr_top", vp);
+        add_tag_member(t.tag, "__vr_top", vp);
+        add_tag_member(t.tag, "__gr_offs", w);
+        add_tag_member(t.tag, "__vr_offs", w);
         cty.layout(t.tag);
         g_va_list = t;
     } else {
@@ -164,41 +131,31 @@ pub fn va_list_type() *mut cty.CType {
     return g_va_list;
 }
 
-fn is_err(e: *cast.Expr) bool {
-    return u.isnil(e.ty) or (e.ty.kind == cty.TK_ERROR);
-}
-
-fn bad(e: *mut cast.Expr) *mut cast.Expr {
-    e.ty = cty.t_error;
-    e.lvalue = false;
-    return e;
-}
-
 // The va_list operand x of builtin `what`, as a pointer to the va_list
 // object (nil after an error, reported).
 fn va_operand(x: *mut cast.Expr, what: []u8) *mut cast.Expr {
     let vt = va_list_type();
     if vt.kind == cty.TK_ARRAY {
-        let v = cx.rv(x);
+        let v = rv(x);
         if is_err(v) {
             return u.nil.[cast.Expr]();
         }
         if (v.ty.kind == cty.TK_POINTER) and cty.compatible_unq(v.ty.elem, vt.elem) {
             return v;
         }
-        cs.err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, cs.tq(v.ty)));
+        err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, tq(v.ty)));
         return u.nil.[cast.Expr]();
     }
-    let v = cx.check(x);
+    let v = expr_check(x);
     if is_err(v) {
         return u.nil.[cast.Expr]();
     }
     if not cty.compatible_unq(v.ty, vt) {
-        cs.err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, cs.tq(v.ty)));
+        err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, tq(v.ty)));
         return u.nil.[cast.Expr]();
     }
     if not v.lvalue {
-        cs.err(x.span, "C3080", u.f1("the operand of %s is not an object (an lvalue of type va_list)", what));
+        err(x.span, "C3080", u.f1("the operand of %s is not an object (an lvalue of type va_list)", what));
         return u.nil.[cast.Expr]();
     }
     let a = cast.new_expr(cast.ExprKind.UNARY, x.span);
@@ -213,7 +170,7 @@ fn va_operand(x: *mut cast.Expr, what: []u8) *mut cast.Expr {
 // Calls of builtins
 // -----------------------------------------------------------------------------
 
-fn arity(e: *mut cast.Expr, lo: usize, hi: usize) bool {
+fn bi_arity(e: *mut cast.Expr, lo: usize, hi: usize) bool {
     let n = e.args.len;
     if (n >= lo) and (n <= hi) {
         return true;
@@ -222,22 +179,22 @@ fn arity(e: *mut cast.Expr, lo: usize, hi: usize) bool {
     if hi > lo {
         want = u.f2("%s or %s", u.zdec(lo), u.zdec(hi));
     }
-    cs.err(e.span, "C3023", u.f3("'%s' takes %s arguments, not %s", e.a.name, want, u.zdec(n)));
+    err(e.span, "C3023", u.f3("'%s' takes %s arguments, not %s", e.a.name, want, u.zdec(n)));
     return false;
 }
 
 // The builtin `name` is: its BI_ number, or 0.
-fn builtin_id(name: []u8) i32 {
+fn bi_builtin_id(name: []u8) i32 {
     if u.starts(name, "__builtin_axiom_") {
-        return fp.builtin_id(name[16..]);  // <math.h>, <tgmath.h>, <fenv.h>
+        return fp_builtin_id(name[16..]);  // <math.h>, <tgmath.h>, <fenv.h>
     }
-    if cs.opts().gnu and
+    if opts().gnu and
        (u.str_eq(name, "__builtin_issignaling") or u.str_eq(name, "__builtin_issubnormal") or
         u.str_eq(name, "__builtin_iszero")) {
-        return fp.builtin_id(name[10..]);  // (a GNU dialect's spellings of C23's macros)
+        return fp_builtin_id(name[10..]);  // (a GNU dialect's spellings of C23's macros)
     }
-    if cs.opts().gnu and u.str_eq(name, "__builtin_isfpclass") {
-        return fp.BI_ISFPCLASS;
+    if opts().gnu and u.str_eq(name, "__builtin_isfpclass") {
+        return BI_ISFPCLASS;
     }
     if u.str_eq(name, "__builtin_va_start") {
         return BI_VA_START;
@@ -253,15 +210,15 @@ fn builtin_id(name: []u8) i32 {
     }
     if u.starts(name, "__builtin_stdc_") {
         let rest = name[15..];
-        for k in 0..stdc_names.len {
-            if u.str_eq(rest, stdc_names[k]) {
+        for k in 0..STDC_NAMES.len {
+            if u.str_eq(rest, STDC_NAMES[k]) {
                 return BI_STDC + @int_cast(i32, k);
             }
         }
         return 0;
     }
     if u.starts(name, "__builtin_atomic_") {
-        return catm.builtin_id(name);  // (<stdatomic.h>: BI_ATOMIC_FIRST..BI_ATOMIC_LAST)
+        return atm_builtin_id(name);  // (<stdatomic.h>: BI_ATOMIC_FIRST..BI_ATOMIC_LAST)
     }
     if u.str_eq(name, "__builtin_ckd_add") {
         return BI_CKD_ADD;
@@ -288,27 +245,27 @@ fn builtin_id(name: []u8) i32 {
 }
 
 // Types call e of a builtin, if its callee names one (true then).
-fn builtin_call(e: *mut cast.Expr) bool {
+fn std_builtin_call(e: *mut cast.Expr) bool {
     if simd_call(e) {
         return true;  // (the intrinsics' __builtin_axiom_simd: csema_simd.ax)
     }
-    let id = builtin_id(e.a.name);
+    let id = bi_builtin_id(e.a.name);
     if id == 0 {
-        return gnu_call(e);  // (a GNU dialect's: csema_gbuiltin.ax)
+        return gbi_call(e);  // (a GNU dialect's: csema_gbuiltin.ax)
     }
-    if id >= fp.BI_FP {
-        return fp.call(e, id);
+    if id >= BI_FP {
+        return fp_call(e, id);
     }
     e.op = id;
     e.ty = cty.t_void;
     if (id == BI_VA_START) or (id == BI_VA_END) or (id == BI_VA_COPY) {
         va_call(e, id);
     } else if id == BI_UNREACHABLE {
-        if not arity(e, 0, 0) {
-            _ = bad(e);
+        if not bi_arity(e, 0, 0) {
+            _ = bad_expr(e);
         }
-    } else if catm.is_builtin(id) {
-        catm.call(e, id);
+    } else if is_atomic_builtin(id) {
+        atm_call(e, id);
     } else if id < BI_CKD_ADD {
         stdc_call(e, id);
     } else if id < BI_COMPLEX {
@@ -326,15 +283,15 @@ fn complex_call(e: *mut cast.Expr, id: i32) void {
     if id == BI_COMPLEX {
         n = 2;
     }
-    if not arity(e, n, n) {
-        _ = bad(e);
+    if not bi_arity(e, n, n) {
+        _ = bad_expr(e);
         return;
     }
     for i in 0..n {
-        let x = cx.rv(e.args.get(i));
+        let x = rv(e.args.get(i));
         e.args.set(i, x);
         if is_err(x) {
-            _ = bad(e);
+            _ = bad_expr(e);
             return;
         }
     }
@@ -342,16 +299,16 @@ fn complex_call(e: *mut cast.Expr, id: i32) void {
     if (id != BI_COMPLEX) and cc.is_icx(a.ty) {
         // (an integer complex value, a GNU dialect's: as a double _Complex,
         // as the library's functions take it)
-        a = cx.convert(a, cty.t_cdouble);
+        a = convert(a, cty.t_cdouble);
         e.args.set(0, a);
     }
     if id == BI_COMPLEX {
         let b = e.args.get(1);
         if not cty.is_floating(a.ty) or (cty.unqual(a.ty) != cty.unqual(b.ty)) {
-            cs.err(e.span, "C3082",
-                   u.f2("the operands of __builtin_complex have types %s and %s, not one real floating type",
-                        cs.tq(a.ty), cs.tq(b.ty)));
-            _ = bad(e);
+            err(e.span, "C3082",
+                u.f2("the operands of __builtin_complex have types %s and %s, not one real floating type", tq(a.ty),
+                     tq(b.ty)));
+            _ = bad_expr(e);
             return;
         }
         e.ty = cty.complex_of(a.ty);
@@ -366,8 +323,8 @@ fn complex_call(e: *mut cast.Expr, id: i32) void {
         return;
     }
     if not cty.is_complex(a.ty) {
-        cs.err(a.span, "C3082", u.f2("the operand of %s has type %s, not a complex type", e.a.name, cs.tq(a.ty)));
-        _ = bad(e);
+        err(a.span, "C3082", u.f2("the operand of %s has type %s, not a complex type", e.a.name, tq(a.ty)));
+        _ = bad_expr(e);
         return;
     }
     if id == BI_CONJ {
@@ -401,7 +358,7 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
     if id == BI_VA_START {
         lo = 2;
         hi = 2;
-        if cs.std() >= co.C23 {
+        if std() >= co.C23 {
             lo = 1;
         }
     } else if id == BI_VA_COPY {
@@ -410,20 +367,20 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
     }
     let names = ["", "va_start", "va_end", "va_copy"];
     let what = names[@int_cast(usize, id)];
-    if not arity(e, lo, hi) {
-        _ = bad(e);
+    if not bi_arity(e, lo, hi) {
+        _ = bad_expr(e);
         return;
     }
     let ap = va_operand(e.args.get(0), what);
     if u.isnil(ap) {
-        _ = bad(e);
+        _ = bad_expr(e);
         return;
     }
     e.args.set(0, ap);
     if id == BI_VA_COPY {
         let src = va_operand(e.args.get(1), what);
         if u.isnil(src) {
-            _ = bad(e);
+            _ = bad_expr(e);
             return;
         }
         e.args.set(1, src);
@@ -432,16 +389,16 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
     if id != BI_VA_START {
         return;
     }
-    let f = cs.cur_fn();
+    let f = cur_fn();
     if u.isnil(f) or not f.ty.variadic {
-        cs.err(e.span, "C3080", "va_start in a function whose parameters do not end with '...'");
-        _ = bad(e);
+        err(e.span, "C3080", "va_start in a function whose parameters do not end with '...'");
+        _ = bad_expr(e);
         return;
     }
     if e.args.len < 2 {
         return;
     }
-    if cs.std() >= co.C23 {
+    if std() >= co.C23 {
         // (C23: the arguments after the first are not evaluated)
         _ = e.args.pop();
         return;
@@ -454,7 +411,7 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
         ok = u.str_eq(p.name, f.params.get(n - 1).name);
     }
     if not ok {
-        cs.warn(p.span, "C4080", "the second argument of va_start is not the last parameter of the function");
+        warn(p.span, "C4080", "the second argument of va_start is not the last parameter of the function");
     }
     _ = e.args.pop();
 }
@@ -474,21 +431,20 @@ fn stdbit_type(t: *cty.CType) bool {
 }
 
 fn stdc_call(e: *mut cast.Expr, id: i32) void {
-    if not arity(e, 1, 1) {
-        _ = bad(e);
+    if not bi_arity(e, 1, 1) {
+        _ = bad_expr(e);
         return;
     }
-    let x = cx.rv(e.args.get(0));
+    let x = rv(e.args.get(0));
     e.args.set(0, x);
     if is_err(x) {
-        _ = bad(e);
+        _ = bad_expr(e);
         return;
     }
-    let name = stdc_names[@int_cast(usize, id - BI_STDC)];
+    let name = STDC_NAMES[@int_cast(usize, id - BI_STDC)];
     if not stdbit_type(x.ty) {
-        cs.err(x.span, "C3082", u.f2("the operand of stdc_%s has type %s, not an unsigned integer type", name,
-                                     cs.tq(x.ty)));
-        _ = bad(e);
+        err(x.span, "C3082", u.f2("the operand of stdc_%s has type %s, not an unsigned integer type", name, tq(x.ty)));
+        _ = bad_expr(e);
         return;
     }
     if (id == BI_BIT_FLOOR) or (id == BI_BIT_CEIL) {
@@ -510,35 +466,35 @@ fn ckd_type(t: *cty.CType) bool {
 fn ckd_call(e: *mut cast.Expr, id: i32) void {
     let names = ["ckd_add", "ckd_sub", "ckd_mul"];
     let what = names[@int_cast(usize, id - BI_CKD_ADD)];
-    if not arity(e, 3, 3) {
-        _ = bad(e);
+    if not bi_arity(e, 3, 3) {
+        _ = bad_expr(e);
         return;
     }
     let mut ok = true;
     for i in @as(usize, 0)..3 {
-        let x = cx.rv(e.args.get(i));
+        let x = rv(e.args.get(i));
         e.args.set(i, x);
         if is_err(x) {
             ok = false;
         }
     }
     if not ok {
-        _ = bad(e);
+        _ = bad_expr(e);
         return;
     }
     let r = e.args.get(0);
     if (r.ty.kind != cty.TK_POINTER) or not ckd_type(r.ty.elem) or ((r.ty.elem.quals & cty.Q_CONST) != 0) {
-        cs.err(r.span, "C3082", u.f3("the first operand of %s has type %s, not a pointer to a modifiable integer %s",
-                                     what, cs.tq(r.ty), "(other than char, bool or an enumeration)"));
-        _ = bad(e);
+        err(r.span, "C3082", u.f3("the first operand of %s has type %s, not a pointer to a modifiable integer %s", what,
+                                  tq(r.ty), "(other than char, bool or an enumeration)"));
+        _ = bad_expr(e);
         return;
     }
     for i in @as(usize, 1)..3 {
         let x = e.args.get(i);
         if not ckd_type(x.ty) {
-            cs.err(x.span, "C3082", u.f4("operand %s of %s has type %s, not an integer type %s", u.zdec(i + 1), what,
-                                         cs.tq(x.ty), "(other than char, bool or an enumeration)"));
-            _ = bad(e);
+            err(x.span, "C3082", u.f4("operand %s of %s has type %s, not an integer type %s", u.zdec(i + 1), what,
+                                      tq(x.ty), "(other than char, bool or an enumeration)"));
+            _ = bad_expr(e);
             return;
         }
     }
@@ -550,7 +506,7 @@ fn ckd_call(e: *mut cast.Expr, id: i32) void {
 // -----------------------------------------------------------------------------
 
 // Types a VA_ARG or OFFSETOF node.
-fn special(e: *mut cast.Expr) *mut cast.Expr {
+fn builtin_special(e: *mut cast.Expr) *mut cast.Expr {
     if e.kind == cast.ExprKind.VA_ARG {
         return va_arg(e);
     }
@@ -559,66 +515,66 @@ fn special(e: *mut cast.Expr) *mut cast.Expr {
 
 fn va_arg(e: *mut cast.Expr) *mut cast.Expr {
     let ap = va_operand(e.a, "va_arg");
-    let t = cs.hooks.type_name(e.tname);
+    let t = type_name(e.tname);
     if u.isnil(ap) or cty.is_error(t) {
-        return bad(e);
+        return bad_expr(e);
     }
     e.a = ap;
     if cty.is_func(t) or (t.kind == cty.TK_ARRAY) or not cty.is_complete(t) {
-        cs.err(e.tname.span, "C3080", u.f1("va_arg of type %s (a complete object type that is not an array is needed)",
-                                           cs.tq(t)));
-        return bad(e);
+        err(e.tname.span, "C3080", u.f1("va_arg of type %s (a complete object type that is not an array is needed)",
+                                        tq(t)));
+        return bad_expr(e);
     }
     if cty.is_arith(t) and (cty.arg_promote(cty.unqual(t)) != cty.unqual(t)) {
-        cs.warn(e.tname.span, "C4081",
-                u.f2("va_arg of type %s, which the default argument promotions change (the argument has type %s)",
-                     cs.tq(t), cs.tq(cty.arg_promote(cty.unqual(t)))));
+        warn(e.tname.span, "C4081",
+             u.f2("va_arg of type %s, which the default argument promotions change (the argument has type %s)", tq(t),
+                  tq(cty.arg_promote(cty.unqual(t)))));
     }
     e.ty = cty.unqual(t);
     return e;
 }
 
 fn offsetof(e: *mut cast.Expr) *mut cast.Expr {
-    let t = cs.hooks.type_name(e.tname);
+    let t = type_name(e.tname);
     if cty.is_error(t) {
-        return bad(e);
+        return bad_expr(e);
     }
     if not cty.is_record(t) {
-        cs.err(e.tname.span, "C3025", u.f1("offsetof of %s, not a structure or union type", cs.tq(t)));
-        return bad(e);
+        err(e.tname.span, "C3025", u.f1("offsetof of %s, not a structure or union type", tq(t)));
+        return bad_expr(e);
     }
     let mut cur = t;
     let mut off: u64 = 0;
     for d in e.args.items() {
         if d.kind == cast.ExprKind.MEMBER {
             if not cty.is_record(cur) {
-                cs.err(d.span, "C3081", u.f2("'.%s' in the member designator of offsetof, on %s", d.name, cs.tq(cur)));
-                return bad(e);
+                err(d.span, "C3081", u.f2("'.%s' in the member designator of offsetof, on %s", d.name, tq(cur)));
+                return bad_expr(e);
             }
             if not cty.is_complete(cur) {
-                cs.err(d.span, "C3007", u.f2("'%s' in %s, an incomplete type", d.name, cs.tq(cur)));
-                return bad(e);
+                err(d.span, "C3007", u.f2("'%s' in %s, an incomplete type", d.name, tq(cur)));
+                return bad_expr(e);
             }
             let fm = cty.find_member(cur, d.name);
             if u.isnil(fm.m) {
-                cs.err(d.name_span, "C3025", u.f2("%s has no member named '%s'", cs.tq(cur), d.name));
-                return bad(e);
+                err(d.name_span, "C3025", u.f2("%s has no member named '%s'", tq(cur), d.name));
+                return bad_expr(e);
             }
             if is_bitfield(fm.m) {
-                cs.err(d.name_span, "C3081", u.f1("offsetof of the bit-field '%s'", d.name));
-                return bad(e);
+                err(d.name_span, "C3081", u.f1("offsetof of the bit-field '%s'", d.name));
+                return bad_expr(e);
             }
             off += fm.offset;
             cur = fm.m.ty;
         } else {
-            let x = cx.ice(d.b, "a subscript in the member designator of offsetof");
+            let x = ice(d.b, "a subscript in the member designator of offsetof");
             if not x.ok {
-                return bad(e);
+                return bad_expr(e);
             }
             d.b = x.e;
             if cur.kind != cty.TK_ARRAY {
-                cs.err(d.span, "C3081", u.f1("a subscript in the member designator of offsetof, on %s", cs.tq(cur)));
-                return bad(e);
+                err(d.span, "C3081", u.f1("a subscript in the member designator of offsetof, on %s", tq(cur)));
+                return bad_expr(e);
             }
             off += x.v * cty.size_of(cur.elem);
             cur = cur.elem;

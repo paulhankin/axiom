@@ -2491,6 +2491,7 @@ await section('', {
     const dir = path.join(tmp, 'stdcopy');
     fs.mkdirSync(path.join(dir, 'std'), { recursive: true });
     fs.copyFileSync(path.join(root, 'std/mem.ax'), path.join(dir, 'std/mem.ax'));
+    fs.cpSync(path.join(root, 'std/mem'), path.join(dir, 'std/mem'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'std/app.ax'), [
       'import "mem.ax" as mem;', '',
       'export fn main() i32 {',

@@ -1,0 +1,474 @@
+// =============================================================================
+// cgen_start.ax - Program entry wrapper (__axiom_c_main), constructors and
+// destructors (.init_array/.fini_array, __axiom_c_ctors/__axiom_c_dtors), and
+// wrapping Axiom's main (part of cgen.ax).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen_abi.ax" as abi;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+// START_SYMBOL(argc, argv): main's value (an i32).
+fn start_entry(cu: *mut cs.CUnit) void {
+    let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
+    let fty = ir.t_fn(T_i32, pi[..], false);
+    let mut f = ir.get_function(M, START_SYMBOL);
+    if u.isnil(f) {
+        f = ir.add_function(M, START_SYMBOL, fty);
+    }
+    if not ir.is_decl(f) {
+        return;
+    }
+    let st = u.new.[FnState]();
+    st.f = f;
+    F = st;
+    st.entry = new_block("entry");
+    at_end(st.entry);
+    let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
+    let mut n: usize = 0;
+    let mut np: usize = 0;
+    let mut sig = Sig.{ ty: fty, plan: u.nil.[abi.Plan]() };
+    let mut mf = u.nil.[ir.Func]();
+    let mut ib = cty.t_int.bits;
+    if u.notnil(cu) {
+        sig = func_sig(cu.main);
+        mf = func_of(cu.main, sig);
+        sig.ty = mf.ty;  // (the call's type: the function's)
+        np = cu.main.params.len;
+    } else {
+        // an object's main (linkin.ax: take_main): int main(int, char **),
+        // or int main(void) (a WebAssembly function of no parameters); or
+        // this compiler's object's start-up, which has START_SYMBOL's type
+        np = @int_cast(usize, g_obj_main_args);
+        if g_obj_main_start {
+            ib = 32;
+        } else if np == 2 {
+            let mut ps: [2]*mut cty.CType = [cty.t_int, cty.pointer_to(cty.pointer_to(cty.t_char))];
+            sig = sig_of(cty.t_int, ps[..], 2, false, false);
+        } else {
+            sig = sig_of(cty.t_int, u.nil_slice.[*mut cty.CType](), 0, false, false);
+        }
+        mf = ir.get_function(M, g_obj_main);
+        if u.isnil(mf) {
+            mf = ir.add_function(M, g_obj_main, sig.ty);
+        }
+    }
+    if np >= 1 {
+        // (main(int argc) in a GNU dialect: argc alone)
+        av[0] = f.params[0];
+        if not g_obj_main_start {
+            av[0] = conv_i32(f.params[0], cty.t_int);
+        }
+        n = 1;
+    }
+    if np == 2 {
+        av[1] = f.params[1];
+        n = 2;
+    }
+    let runners = define_runners();
+    if runners {
+        call_runner(CTORS_FN);
+    }
+    let r = ir.call(B, sig.ty, mf.val, av[0..n]);
+    if u.notnil(sig.plan) {
+        mark_call(r, sig.plan);
+    }
+    if runners and not program_exit {
+        // (a program without exit: the destructors when main returns; else
+        // exit runs them, through __axc_at_exit_dtors)
+        call_runner(DTORS_FN);
+    }
+    let mut status = r;
+    if ib > 32 {
+        status = ir.trunc(B, r, T_i32);
+    } else if ib < 32 {
+        status = ir.sext(B, r, T_i32);
+    }
+    if program_exit or (tg.is_windows() and tg.g_system_c_library) {
+        // returning from main is calling exit with its value (5.1.2.2.3):
+        // the C library's exit flushes its streams and runs the atexit
+        // functions (the start-up's return would end the process at once).
+        // That is the program's own exit if it has one (a C unit's, or an
+        // Axiom module's export: the hosted C library's, docs/c.md), else
+        // (tg.g_system_c_library) the system's C library's on Windows.
+        let mut pe: [1]*mut ir.Ty = [T_i32];
+        let ety = ir.t_fn(T_void, pe[..], false);
+        let mut ef = ir.get_function(M, "exit");
+        if u.isnil(ef) {
+            ef = ir.add_function(M, "exit", ety);
+        }
+        if not program_exit {
+            c_library_import("exit");
+        }
+        // (a C unit's exit takes an int of the build's width, --c-int)
+        let mut arg = status;
+        if ef.ty.params.len == 1 {
+            let pt = ef.ty.params[0];
+            if (pt.kind == ir.T_INT) and (pt.bits > 32) {
+                arg = ir.sext(B, status, pt);
+            } else if (pt.kind == ir.T_INT) and (pt.bits < 32) {
+                arg = ir.trunc(B, status, pt);
+            }
+        }
+        let mut ea: [1]*mut ir.Value = [arg];
+        _ = ir.call(B, ef.ty, ef.val, ea[..]);
+    }
+    ir.ret(B, status);
+    F = u.nil.[FnState]();
+}
+
+fn call_runner(name: []u8) void {
+    let f = ir.get_function(M, name);
+    _ = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
+}
+
+// A weak reference to the linker's symbol `name` (an address).
+fn weak_symbol(name: []u8) *mut ir.Global {
+    let g = ir.get_global(M, name);
+    if u.notnil(g) {
+        return g;
+    }
+    let n = ir.add_global(M, T_i8, name);
+    n.linkage = ir.LINK_EXTWEAK;
+    return n;
+}
+
+// Calls each function of the array between the weak symbols first_sym
+// and end_sym: forward, or from the end backward.
+fn walk_array(first_sym: []u8, end_sym: []u8, forward: bool) void {
+    let s = weak_symbol(first_sym);
+    let e = weak_symbol(end_sym);
+    let pre = ir.insert_block(B);
+    let head = new_block("array");
+    let body = new_block("array_call");
+    let out = new_block("array_done");
+    ir.br(B, head);
+    at_end(head);
+    let p = ir.phi(B, T_ptr);
+    let mut first = s.val;
+    let mut last = e.val;
+    if not forward {
+        first = e.val;
+        last = s.val;
+    }
+    ir.add_incoming(p, first, pre);
+    ir.condbr(B, ir.icmp(B, ir.IntNE, p, last), body, out);
+    at_end(body);
+    let mut at = p;
+    let mut next = ir.gep1(B, T_ptr, p, ir.cint(T_isz, 1));
+    if not forward {
+        at = ir.gep1(B, T_ptr, p, ir.cint(T_isz, 0xffff_ffff_ffff_ffff));
+        next = at;
+    }
+    let f = ir.load(B, T_ptr, at);
+    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    _ = ir.call(B, fty, f, u.nil_slice.[*mut ir.Value]());
+    ir.add_incoming(p, next, body);
+    ir.br(B, head);
+    at_end(out);
+}
+
+// The constructors in .init_array, the destructors in .fini_array: a
+// pointer each, in the section of their priority (.init_array.NNNNN, the
+// generic ABI's and the platform toolchain's convention, which its linkers
+// sort; the default priority: the plain section, after them). Once.
+fn put_in_arrays() void {
+    for i in 0..g_ctors.len {
+        let s = g_ctors.get(i);
+        let n = cs.note_of(s);
+        let f = func_of(s, func_sig(s));
+        for pass in @as(i32, 0)..2 {
+            let ctor = pass == 0;
+            if (ctor and not n.ctor) or (not ctor and not n.dtor) {
+                continue;
+            }
+            let mut prio = @as(i64, n.ctor_prio);
+            if not ctor {
+                prio = @as(i64, n.dtor_prio);
+            }
+            let mut sec = u.pick(ctor, ".init_array", ".fini_array");
+            if (prio >= 0) and (prio < 65535) {
+                let d = u.udec(@bit_cast(u64, prio));
+                let mut z = u.Buf.init();
+                z.s(sec);
+                z.c('.');
+                for k in d.len..5 {
+                    _ = k;
+                    z.c('0');
+                }
+                z.s(d);
+                sec = u.dup(z.view());
+            }
+            let name = u.f2("axiom.c.%s.%s", u.pick(ctor, "ctor", "dtor"), u.zdec(i));
+            if u.notnil(ir.get_global(M, name)) {
+                continue;
+            }
+            let mut fv = f.val;
+            if is_wasm and not ctor {
+                // (WebAssembly objects have constructors only, the tool
+                // conventions' INIT_FUNCS: one of the destructor's priority
+                // registers it with atexit, which runs it in the reverse
+                // order of registration, the higher priorities first)
+                fv = atexit_registrar(f, i);
+                sec = u.cat2(".init_array", sec[11..]);
+            }
+            let g = ir.add_global(M, T_ptr, name);
+            g.init = fv;
+            g.linkage = ir.LINK_INTERNAL;
+            g.section = u.perm_dup(sec);
+            g.align = 8;
+        }
+    }
+}
+
+// A function that registers destructor f (the i-th of g_ctors) with atexit.
+fn atexit_registrar(f: *mut ir.Func, i: usize) *mut ir.Value {
+    let saved_b = B;
+    let saved_f = F;
+    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let rf = ir.add_function(M, u.f1("axiom.c.atexit_dtor.%s", u.zdec(i)), fty);
+    rf.linkage = ir.LINK_INTERNAL;
+    let mut pa: [1]*mut ir.Ty = [T_ptr];
+    let aty = ir.t_fn(lty(cty.t_int), pa[..], false);
+    let mut af = ir.get_function(M, "atexit");
+    if u.isnil(af) {
+        af = ir.add_function(M, "atexit", aty);
+    }
+    B = ir.new_builder();
+    let st = u.new.[FnState]();
+    st.f = rf;
+    F = st;
+    at_end(new_block("entry"));
+    let mut args: [1]*mut ir.Value = [f.val];
+    _ = ir.call(B, af.ty, af.val, args[..]);
+    ir.ret_void(B);
+    B = saved_b;
+    F = saved_f;
+    return rf.val;
+}
+
+/// Defines CTORS_FN and DTORS_FN if the program has constructors or
+/// destructors (true then). CTORS_FN calls the constructors, and gives exit
+/// the destructors where the C library has exit's slot for them
+/// (DTORS_HOOK), so that exit, the program's end however it comes, runs
+/// them after the atexit functions; DTORS_FN calls them, once.
+pub fn define_runners() bool {
+    if g_object_output and not is_wasm {
+        return false;  // (put_in_arrays)
+    }
+    if (g_ctors.len == 0) and not g_init_arrays {
+        return false;
+    }
+    if u.notnil(ir.get_function(M, CTORS_FN)) {
+        return true;
+    }
+    let saved_b = B;
+    let saved_f = F;
+    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let df = ir.add_function(M, DTORS_FN, fty);
+    df.linkage = ir.LINK_INTERNAL;
+    let cf = ir.add_function(M, CTORS_FN, fty);
+    cf.linkage = ir.LINK_INTERNAL;
+    B = ir.new_builder();
+    // the destructors, once (exit's, or main's return)
+    let done = ir.add_global(M, T_i8, "axiom.c.dtors_done");
+    done.init = ir.cint(T_i8, 0);
+    done.linkage = ir.LINK_INTERNAL;
+    let dst = u.new.[FnState]();
+    dst.f = df;
+    F = dst;
+    let entry = new_block("entry");
+    let run = new_block("run");
+    let out = new_block("done");
+    at_end(entry);
+    let was = ir.load(B, T_i8, done.val);
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, was, ir.cint(T_i8, 0)), run, out);
+    at_end(run);
+    _ = ir.store(B, ir.cint(T_i8, 1), done.val);
+    call_ctors(false);
+    if g_init_arrays and not is_wasm {
+        // (backward, the generic ABI's order; forward on Windows, as the C
+        // runtime runs .CRT$XT*, whose suffixes say the order: coff.ax)
+        walk_array("__fini_array_start", "__fini_array_end", tg.is_windows());
+    }
+    ir.br(B, out);
+    at_end(out);
+    ir.ret_void(B);
+    let cst = u.new.[FnState]();
+    cst.f = cf;
+    F = cst;
+    at_end(new_block("entry"));
+    let hook = ir.get_global(M, DTORS_HOOK);
+    if u.notnil(hook) {
+        _ = ir.store(B, df.val, hook.val);
+    }
+    if g_init_arrays and is_wasm {
+        // (the objects' constructors on WebAssembly: their INIT_FUNCS, which
+        // the linker's __wasm_call_ctors calls, the tool conventions' name)
+        let mut wf = ir.get_function(M, "__wasm_call_ctors");
+        if u.isnil(wf) {
+            wf = ir.add_function(M, "__wasm_call_ctors", fty);
+        }
+        _ = ir.call(B, wf.ty, wf.val, u.nil_slice.[*mut ir.Value]());
+    } else if g_init_arrays {
+        walk_array("__preinit_array_start", "__preinit_array_end", true);
+        walk_array("__init_array_start", "__init_array_end", true);
+    }
+    call_ctors(true);
+    ir.ret_void(B);
+    B = saved_b;
+    F = saved_f;
+    return true;
+}
+
+/// For a program whose main is the Axiom module's (main: its function):
+/// the C units' constructors before it, their destructors when it returns
+/// (and from exit, as for a C program: define_runners).
+pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
+    M = m;
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    init_types();
+    if ir.is_decl(main) {
+        return;
+    }
+    let runners = define_runners();
+    // with the C library: when main returns, what exit does before the
+    // process ends (its atexit functions, the destructors through exit's
+    // slot for them, the streams' flushing), as for a C program's main
+    let handlers = ir.get_function(M, EXIT_HANDLERS);
+    let has_handlers = u.notnil(handlers) and not ir.is_decl(handlers);
+    if not runners and not has_handlers {
+        return;
+    }
+    let saved = B;
+    B = ir.new_builder();
+    let tmp = ir.append_block(main, "tmp");
+    if runners {
+        // a call before the first instruction
+        let cf = ir.get_function(M, CTORS_FN);
+        ir.at_end(B, tmp);
+        let c0 = ir.call(B, cf.ty, cf.val, u.nil_slice.[*mut ir.Value]());
+        unlink_last(tmp);
+        ir.insert_before(main.first.first, c0);
+    }
+    let mut end = handlers;
+    if not has_handlers {
+        end = ir.get_function(M, DTORS_FN);
+    }
+    // and one before each return
+    let mut b = main.first;
+    while u.notnil(b) {
+        let mut v = b.first;
+        while u.notnil(v) {
+            if v.op == ir.OP_RET {
+                ir.at_end(B, tmp);
+                let c = ir.call(B, end.ty, end.val, u.nil_slice.[*mut ir.Value]());
+                unlink_last(tmp);
+                ir.insert_before(v, c);
+            }
+            v = v.next;
+        }
+        b = b.next;
+    }
+    ir.remove_block(tmp);
+    B = saved;
+}
+
+// Takes the last instruction out of block b (to put it elsewhere).
+fn unlink_last(b: *mut ir.Block) void {
+    let v = b.last;
+    b.last = v.prev;
+    if u.notnil(v.prev) {
+        v.prev.next = ir.vnil();
+    } else {
+        b.first = ir.vnil();
+    }
+    v.prev = ir.vnil();
+}
+
+fn ctor_key(s: *mut cast.CSym, ctor: bool) i64 {
+    let n = cs.note_of(s);
+    if ctor {
+        return @as(i64, n.ctor_prio);
+    }
+    return @as(i64, n.dtor_prio);
+}
+
+// The constructors (ctor) before main, by priority, lowest first, and in
+// the order they are defined for a priority; or the destructors after it,
+// highest priority first, the last defined first for a priority. (A
+// program that ends otherwise than by returning from main does not run its
+// destructors: docs/c.md.)
+fn call_ctors(ctor: bool) void {
+    let xs = u.List.[*mut cast.CSym].empty();
+    let mut l = xs;
+    for s in g_ctors.items() {
+        let n = cs.note_of(s);
+        if (ctor and n.ctor) or (not ctor and n.dtor) {
+            l.push(s);
+        }
+    }
+    let items = l.items_mut();
+    // (a stable insertion sort: few of them)
+    for i in 1..items.len {
+        let mut j = i;
+        while j > 0 {
+            let a = ctor_key(items[j - 1], ctor);
+            let b = ctor_key(items[j], ctor);
+            let before = (ctor and (a <= b)) or (not ctor and (a >= b));
+            if before {
+                break;
+            }
+            let x = items[j];
+            items[j] = items[j - 1];
+            items[j - 1] = x;
+            j -= 1;
+        }
+    }
+    if not ctor {
+        // (the same priority: the last defined first)
+        let mut a: usize = 0;
+        while a < items.len {
+            let mut b = a + 1;
+            while (b < items.len) and (ctor_key(items[b], false) == ctor_key(items[a], false)) {
+                b += 1;
+            }
+            let mut x = a;
+            let mut y = b - 1;
+            while x < y {
+                let t = items[x];
+                items[x] = items[y];
+                items[y] = t;
+                x += 1;
+                y -= 1;
+            }
+            a = b;
+        }
+    }
+    for s in items {
+        let f = func_of(s, func_sig(s));
+        let sig = func_sig(s);
+        let r = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
+        if u.notnil(sig.plan) {
+            mark_call(r, sig.plan);
+        }
+    }
+    l.deinit();
+}
+
+// i32 v as a value of integer type t.
+fn conv_i32(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let it = lty(t);
+    if it.bits > 32 {
+        return ir.sext(B, v, it);
+    }
+    if it.bits < 32 {
+        return ir.trunc(B, v, it);
+    }
+    return v;
+}

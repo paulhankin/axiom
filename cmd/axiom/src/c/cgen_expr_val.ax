@@ -1,0 +1,479 @@
+// =============================================================================
+// cgen_expr_val.ax - IR generation helpers for C expression values: loads,
+// stores, copies, constants, truth values and conversions. Part of cgen.ax
+// (see also cgen_expr.ax, cgen_expr_lv.ax, cgen_expr_ops.ax).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cldbl.ax" as cl;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+
+fn is_volatile(t: *cty.CType) bool {
+    return (t.quals & cty.Q_VOLATILE) != 0;
+}
+
+fn is_atomic(t: *cty.CType) bool {
+    return (t.quals & cty.Q_ATOMIC) != 0;
+}
+
+/// Loads a scalar of type t from p (volatile: as its type says); a complex
+/// value is copied to a temporary (its address).
+fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    if cty.is_complex(t) {
+        return cx_snapshot(t, p);
+    }
+    if cty.is_wint(t) {
+        return wint_snapshot(t, p, is_volatile(t));
+    }
+    let v = ir.load(B, lty(t), p);
+    v.align = @truncate(u32, cty.align_of(t));
+    if is_volatile(t) {
+        v.flags = v.flags | ir.F_VOLATILE;
+    }
+    return v;
+}
+
+/// Stores scalar v of type t at p.
+fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    store_al(t, v, p, cty.align_of(t));
+}
+
+// Stores scalar v of type t at p, known to be aligned to al.
+fn store_al(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, al: u64) void {
+    if cty.is_complex(t) {
+        cx_put(t, cx_parts(t.unq, v), p);
+        return;
+    }
+    if cty.is_wint(t) {
+        wint_copy(t, p, v, is_volatile(t));
+        return;
+    }
+    let s = ir.store(B, v, p);
+    s.align = @truncate(u32, @min(al, cty.align_of(t)));
+    if is_volatile(t) {
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+}
+
+/// Copies an object of type t from src to dst (which may be the same).
+fn copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
+    let n = cty.size_of(t);
+    if n == 0 {
+        return;
+    }
+    // (a memmove: an assignment may copy an object onto itself, `*p = *q`
+    // with p == q; but never onto a part of itself, C11 6.5.16.1p3, nor
+    // an initializer, which copies into an object whose lifetime begins)
+    let m = ir.memop(B, ir.OP_MEMMOVE, dst, src, usz(n));
+    m.cv = ir.MEMMOVE_SAME_OR_APART;
+}
+
+/// Sets n bytes at p to zero.
+fn zero_mem(p: *mut ir.Value, n: u64) void {
+    if n == 0 {
+        return;
+    }
+    _ = ir.memop(B, ir.OP_MEMSET, p, ir.cint(T_i8, 0), usz(n));
+}
+
+/// The constant value of e (is_const, of arithmetic type).
+fn const_value(e: *mut cast.Expr) *mut ir.Value {
+    if cty.is_complex(e.ty) and cty.is_wide(e.ty.unq.elem) {
+        return cx_constant_wide(e.ty, e.xv, e.xvim);
+    }
+    if cty.is_complex(e.ty) and cty.is_integer(e.ty.unq.elem) {
+        return cx_constant_int(e.ty, e.cval, e.cimag);
+    }
+    if cty.is_complex(e.ty) {
+        return cx_constant(e.ty, e.fcval, e.fcimag);
+    }
+    if cty.is_wide(e.ty) {
+        return ld_constant(e.xv);
+    }
+    if cty.is_decimal(e.ty) {
+        return dec_constant_of(e.ty, e.xv);
+    }
+    if cty.is_wint(e.ty) {
+        return wint_constant(e.ty, cw.value(e, cty.limbs(e.ty)));
+    }
+    if cty.is_half(e.ty) or (cty.is_imaginary(e.ty) and cty.is_half(e.ty.unq.elem)) {
+        return half_constant(e.fcval, cty.real_of(e.ty));
+    }
+    let t = lty(e.ty);
+    if cty.is_floating(e.ty) or cty.is_imaginary(e.ty) {
+        return ir.cfp(t, e.fcval);
+    }
+    return ir.cint(t, e.cval);
+}
+
+fn i1_to(t: *mut cty.CType, c: *mut ir.Value) *mut ir.Value {
+    return ir.zext(B, c, lty(t));
+}
+
+/// The truth of scalar value v of type t, as an i1.
+fn truth(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    if cty.is_imaginary(t) and not cty.is_wide(t) {
+        return truth(v, t.unq.elem);  // (its coefficient's)
+    }
+    if cty.is_complex(t) {
+        return cx_truth(t, cx_parts(t, v));
+    }
+    if cty.is_wide(t) {
+        return ld_truth(v, t);
+    }
+    if cty.is_half(t) {
+        return half_truth(v);
+    }
+    if cty.is_decimal(t) {
+        return dec_truth(v, t);
+    }
+    if cty.is_wint(t) {
+        return wint_truth(t, v);
+    }
+    if cty.is_floating(t) {
+        return ir.fcmp(B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
+    }
+    if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
+        return ir.icmp(B, ir.IntNE, ir.ptrtoint(B, v, T_isz), usz(0));
+    }
+    if (t.unq.kind == cty.TK_BOOL) and (v.ty.kind == ir.T_INT) and (v.ty.bits > 1) {
+        // a _Bool is 0 or 1: its low bit is its truth (a _Bool object holds
+        // no other value, 6.2.5p2; the ABIs give a _Bool argument or result
+        // in a register with its low 8 bits 0 or 1)
+        return ir.trunc(B, v, ir.t_int(1));
+    }
+    return ir.icmp(B, ir.IntNE, v, ir.cint(v.ty, 0));
+}
+
+// The values of && and || (0 or 1) made in the function being generated:
+// converted to _Bool, they need no comparison.
+// (by number in the function: a value's memory may be another's later)
+fn note_01(v: *mut ir.Value) void {
+    let f = v.blk.fnp;
+    if f != known01_fn {
+        known01.clear();
+        known01_fn = f;
+    }
+    known01.push(v.id);
+}
+
+// Is v (an integer) 0 or 1: a constant, an i1 widened, or a value of && or
+// ||?
+fn is_01(v: *ir.Value) bool {
+    if ir.is_cint(v) {
+        return ir.cint_val(v) <= 1;
+    }
+    if ir.is_op(v, ir.OP_ZEXT) and (v.a.ty.bits == 1) {
+        return true;
+    }
+    if (v.kind != ir.V_INST) or (v.op != ir.OP_PHI) or u.isnil(v.blk) or (v.blk.fnp != known01_fn) {
+        return false;
+    }
+    for x in known01.items() {
+        if x == v.id {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Scalar value v of type `from` converted to type `to` (6.3.1, 6.3.2.3).
+fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    if cty.is_void(to) {
+        return ir.vnil();
+    }
+    let f = from.unq;
+    let t = to.unq;
+    if f == t {
+        return v;
+    }
+    if cty.is_imaginary(t) or cty.is_imaginary(f) {
+        return imag_convert(v, f, t);
+    }
+    if cty.is_complex(t) or cty.is_complex(f) {
+        return complex_convert(v, f, t);
+    }
+    if cty.is_decimal(f) or cty.is_decimal(t) {
+        return dec_convert(v, f, t);  // (with _Float16 too: rounded once, decimal.ax's B_F16)
+    }
+    if cty.is_half(f) {
+        // (exact to float, which is converted as from float: the same value)
+        if cty.is_wide(t) {
+            return half_to_wide(v, t, f);
+        }
+        return convert(half_to_f32(v, f), cty.t_float, t);
+    }
+    if cty.is_half(t) {
+        return half_from(v, f, t);
+    }
+    if cty.is_wint(f) or cty.is_wint(t) {
+        return wint_convert(v, f, t);
+    }
+    if cty.is_wide(f) or cty.is_wide(t) {
+        return ld_convert(v, f, t);
+    }
+    let tt = lty(t);
+    if t.kind == cty.TK_BOOL {
+        if cty.is_integer(f) and is_01(v) {
+            return int_resize(v, false, tt);
+        }
+        return ir.zext(B, truth(v, f), tt);
+    }
+    if cty.is_integer(t) {
+        if cty.is_integer(f) {
+            return bitint_norm(int_resize(v, f.is_signed, tt), t);
+        }
+        if f.kind == cty.TK_POINTER {
+            return bitint_norm(ir.ptrtoint(B, v, tt), t);
+        }
+        if t.is_signed {
+            return bitint_norm(ir.cast(B, ir.OP_FPTOSI_SAT, v, tt), t);
+        }
+        return bitint_norm(ir.cast(B, ir.OP_FPTOUI_SAT, v, tt), t);
+    }
+    if cty.is_floating(t) {
+        if cty.is_integer(f) {
+            if f.is_signed {
+                return ir.cast(B, ir.OP_SITOFP, v, tt);
+            }
+            return ir.cast(B, ir.OP_UITOFP, v, tt);
+        }
+        if tt.bits > v.ty.bits {
+            return ir.cast(B, ir.OP_FPEXT, v, tt);
+        }
+        if tt.bits < v.ty.bits {
+            return ir.cast(B, ir.OP_FPTRUNC, v, tt);
+        }
+        return v;
+    }
+    if t.kind == cty.TK_NULLPTR {
+        return ir.czero(T_ptr);
+    }
+    if t.kind == cty.TK_POINTER {
+        if cty.is_integer(f) {
+            if ir.is_cint(v) and (ir.cint_val(v) == 0) {
+                return ir.czero(T_ptr);
+            }
+            return ir.inttoptr(B, int_resize(v, f.is_signed, T_isz));
+        }
+        return v;
+    }
+    return v;
+}
+
+// v of type f converted to t, one of them imaginary (Annex G.4): an
+// imaginary value is its coefficient; a real value as an imaginary one, and
+// an imaginary one as a real one, is +0; between imaginary and complex
+// values, the imaginary part.
+fn imag_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(B, truth(v, f), lty(t));
+    }
+    if cty.is_imaginary(t) {
+        let el = t.elem;
+        if cty.is_imaginary(f) {
+            return convert(v, f.elem, el);
+        }
+        if cty.is_complex(f) {
+            return convert(cx_parts(f, v).im, part_type(f), el);
+        }
+        return zero_of(el);
+    }
+    if cty.is_complex(t) {
+        let el = t.elem;
+        return cx_make(t, Pair.{ re: as_part(zero_of(el), el), im: as_part(convert(v, f.elem, el), el) });
+    }
+    return convert(zero_of(f.elem), f.elem, t);
+}
+
+/// x op y (+ - * /) with an imaginary operand (Annex G.5.1, G.5.2): x of
+/// type xt, y of type yt, each in its own type domain of the real type of
+/// rt, the result's type (real, imaginary or complex: csema_expr.imag_arith).
+fn imag_arith(op: i32, rt: *mut cty.CType, x: *mut ir.Value, xt: *mut cty.CType, y: *mut ir.Value,
+              yt: *mut cty.CType) *mut ir.Value {
+    let t = cty.real_of(rt);
+    let ka = cty.is_imaginary(xt);
+    let kb = cty.is_imaginary(yt);
+    if not cty.is_complex(xt) and not cty.is_complex(yt) {
+        // (real and imaginary operands: one real operation, maybe negated)
+        if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+            if ka and kb {
+                return arith_op(op, t, x, y, t);
+            }
+            // (x + iv, iy + u: the complex value of the two parts)
+            let mut re = x;
+            let mut im = y;
+            if ka {
+                re = y;
+                im = x;
+                if op == ct.P_MINUS {
+                    re = negate_value(t, y);
+                }
+            } else if op == ct.P_MINUS {
+                im = negate_value(t, y);
+            }
+            return cx_make(rt, Pair.{ re: as_part(re, t), im: as_part(im, t) });
+        }
+        let r = arith_op(op, t, x, y, t);
+        if ka and kb and (op == ct.P_STAR) {
+            return negate_value(t, r);  // (iy * iv = -yv)
+        }
+        if not ka and kb and (op == ct.P_SLASH) {
+            return negate_value(t, r);  // (x / iv = i (-x/v))
+        }
+        return r;  // (x * iv, iy * u, iy / u, iy / iv)
+    }
+    // with a complex operand: on its parts (in float for _Float16's, as
+    // their complex type computes: cgen_complex.ax)
+    let ct_ = cty.complex_of(t);
+    let pt = part_type(ct_);
+    let mut a = cx_real(ir.vnil());
+    let mut b = cx_real(ir.vnil());
+    let mut ai = ir.vnil();
+    let mut bi = ir.vnil();
+    if cty.is_complex(xt) {
+        a = cx_parts(xt, x);
+    } else {
+        ai = as_part(x, t);  // (the imaginary operand's coefficient)
+    }
+    if cty.is_complex(yt) {
+        b = cx_parts(yt, y);
+    } else {
+        bi = as_part(y, t);
+    }
+    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+        if u.notnil(ai) {
+            // iy +- (u + iv)
+            let mut re = b.re;
+            if op == ct.P_MINUS {
+                re = negate_value(pt, b.re);
+            }
+            return cx_make(rt, Pair.{ re: re, im: arith_op(op, pt, ai, b.im, pt) });
+        }
+        return cx_make(rt, Pair.{ re: a.re, im: arith_op(op, pt, a.im, bi, pt) });
+    }
+    if op == ct.P_STAR {
+        if u.notnil(ai) {
+            // iy (u + iv) = -yv + i yu
+            return cx_make(
+                rt, Pair.{ re: negate_value(pt, arith_op(op, pt, ai, b.im, pt)), im: arith_op(op, pt, ai, b.re, pt) });
+        }
+        // (x + iy) iv = -yv + i xv
+        return cx_make(
+            rt, Pair.{ re: negate_value(pt, arith_op(op, pt, a.im, bi, pt)), im: arith_op(op, pt, a.re, bi, pt) });
+    }
+    if u.notnil(bi) {
+        // (x + iy) / iv = y/v + i (-x/v)
+        return cx_make(
+            rt, Pair.{ re: arith_op(op, pt, a.im, bi, pt), im: negate_value(pt, arith_op(op, pt, a.re, bi, pt)) });
+    }
+    // iy / (u + iv): the complex quotient of 0 + iy
+    let num = Pair.{ re: zero_of(pt), im: ai };
+    return cx_make(rt, cx_arith(CX_DIV, ct_, num, b));
+}
+
+// v of type f converted to t, one of them complex (6.3.1.6, 6.3.1.7): the
+// parts as real values are; a real value's imaginary part is +0; a complex
+// value to a real type is its real part's, to _Bool its truth.
+fn complex_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
+    if cty.is_complex(t) {
+        let el = t.elem;
+        if cty.is_complex(f) {
+            let p = cx_parts(f, v);
+            let fe = part_type(f);
+            return cx_make(t, Pair.{ re: as_part(convert(p.re, fe, el), el), im: as_part(convert(p.im, fe, el), el) });
+        }
+        return cx_make(t, Pair.{ re: as_part(convert(v, f, el), el), im: as_part(zero_of(el), el) });
+    }
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(B, truth(v, f), lty(t));
+    }
+    return convert(cx_parts(f, v).re, part_type(f), t);
+}
+
+// The real type of the parts cx_parts gives of complex type t (float for
+// _Float16 _Complex, whose parts are widened).
+fn part_type(t: *mut cty.CType) *mut cty.CType {
+    if cty.is_half(t.unq.elem) {
+        return cty.t_float;
+    }
+    return t.unq.elem;
+}
+
+// x (a value of real type el) as a part of a complex value (cx_make).
+fn as_part(x: *mut ir.Value, el: *mut cty.CType) *mut ir.Value {
+    if cty.is_half(el) {
+        return half_to_f32(x, el);
+    }
+    return x;
+}
+
+/// The value +0 of real floating type t.
+fn zero_of(t: *mut cty.CType) *mut ir.Value {
+    if cty.is_wide(t) {
+        return ld_constant(cl.zero());
+    }
+    if cty.is_half(t) {
+        return ir.cint(ir.t_int(16), 0);
+    }
+    return ir.cfp(lty(t), 0.0);
+}
+
+/// The value 1 of arithmetic type t (++ and --).
+fn one_of(t: *mut cty.CType) *mut ir.Value {
+    if cty.is_wide(t) {
+        return ld_one_value(t);
+    }
+    if cty.is_wint(t) {
+        return wint_one_value(t);
+    }
+    if cty.is_half(t) {
+        return half_constant(1.0, t);
+    }
+    if cty.is_decimal(t) {
+        return dec_one(t);
+    }
+    if cty.is_floating(t) {
+        return ir.cfp(lty(t), 1.0);
+    }
+    return ir.cint(lty(t), 1);
+}
+
+// The operand value of e: a complex value's parts, or a real value.
+fn operand(e: *mut cast.Expr) Pair {
+    let v = rv(e);
+    if cty.is_complex(e.ty) {
+        return cx_parts(e.ty, v);
+    }
+    return cx_real_t(v, e.ty);
+}
+
+// The operation of the arithmetic operator op on complex values.
+fn complex_op(op: i32) i32 {
+    if op == ct.P_PLUS {
+        return CX_ADD;
+    }
+    if op == ct.P_MINUS {
+        return CX_SUB;
+    }
+    if op == ct.P_STAR {
+        return CX_MUL;
+    }
+    return CX_DIV;
+}
+
+fn int_resize(v: *mut ir.Value, from_signed: bool, tt: *mut ir.Ty) *mut ir.Value {
+    if v.ty.bits == tt.bits {
+        return v;
+    }
+    if v.ty.bits > tt.bits {
+        return ir.trunc(B, v, tt);
+    }
+    if from_signed {
+        return ir.sext(B, v, tt);
+    }
+    return ir.zext(B, v, tt);
+}

@@ -1,0 +1,722 @@
+// =============================================================================
+// csema_expr_post.ax - comparisons, assignments, conditionals, calls, member
+// access, casts, sizeof and _Alignof, part of csema.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cconst.ax" as cc;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+fn compare(e: *mut cast.Expr) *mut cast.Expr {
+    let op = e.op;
+    let ta = e.a.ty;
+    let tb = e.b.ty;
+    e.ty = cty.t_int;
+    let eq = (op == ct.P_EQ) or (op == ct.P_NE);
+    if not eq and (cty.is_complex(ta) or cty.is_complex(tb)) and cty.is_arith(ta) and cty.is_arith(tb) {
+        // (6.5.8p2: the relational operators take real types)
+        err(e.span, "C3020",
+            u.f3("comparison with '%s' of a complex value (%s and %s): complex numbers are not ordered",
+                 cast.punct_text(op), tq(ta), tq(tb)));
+        return bad_expr(e);
+    }
+    if not eq and (cty.is_imaginary(ta) or cty.is_imaginary(tb)) and cty.is_arith(ta) and cty.is_arith(tb) {
+        // (6.5.8p2: the relational operators take real types)
+        err(e.span, "C3020", u.f3("comparison with '%s' of an imaginary value (%s and %s)", cast.punct_text(op), tq(ta),
+                                  tq(tb)));
+        return bad_expr(e);
+    }
+    if cty.is_arith(ta) and cty.is_arith(tb) {
+        if mixes_dec(e, ta, tb) {
+            return bad_expr(e);
+        }
+        let mut t = cty.common_type(ta, tb);
+        if (cty.is_imaginary(ta) or cty.is_imaginary(tb)) and not cty.is_complex(t) {
+            // (== and != of an imaginary value: as complex values, G.5)
+            if cty.is_imaginary(ta) and cty.is_imaginary(tb) {
+                t = cty.imaginary_of(t);
+            } else {
+                t = cty.complex_of(t);
+            }
+        }
+        e.a = convert(e.a, t);
+        e.b = convert(e.b, t);
+        cc.fold(e);
+        return e;
+    }
+    if eq and (cty.is_nullptr(ta) or cty.is_nullptr(tb)) {
+        // (C23 6.5.10p2: two nullptr_t values, or one and a pointer or a null pointer constant)
+        if cty.is_nullptr(ta) and cty.is_nullptr(tb) {
+            return e;
+        }
+        if cty.is_nullptr(ta) and ((tb.kind == cty.TK_POINTER) or is_npc(e.b)) {
+            e.a = convert(e.a, pick_ty(tb.kind == cty.TK_POINTER, tb, ta));
+            e.b = convert(e.b, e.a.ty);
+            return e;
+        }
+        if cty.is_nullptr(tb) and ((ta.kind == cty.TK_POINTER) or is_npc(e.a)) {
+            e.b = convert(e.b, pick_ty(ta.kind == cty.TK_POINTER, ta, tb));
+            e.a = convert(e.a, e.b.ty);
+            return e;
+        }
+        return bad_operands(e);
+    }
+    if (ta.kind == cty.TK_POINTER) and (tb.kind == cty.TK_POINTER) {
+        if not eq and (cty.is_func(ta.elem) or cty.is_func(tb.elem)) {
+            err(e.span, "C3020", u.f1("comparison with '%s' of pointers to functions (only '==' and '!=' compare them)",
+                                      cast.punct_text(op)));
+            return bad_expr(e);
+        }
+        // (6.5.8p2, 6.5.9p2: relational operators take pointers to object
+        // types; == and != also a pointer to void with one to an object
+        // type, or a null pointer constant)
+        let ok = (pointee_compatible(ta.elem, tb.elem) and (eq or not cty.is_func(ta.elem))) or
+                 (eq and
+                  ((cty.is_void(ta.elem) and not cty.is_func(tb.elem)) or
+                   (cty.is_void(tb.elem) and not cty.is_func(ta.elem)) or is_npc(e.a) or is_npc(e.b)));
+        if not ok and eq and opts().gnu and
+           ((cty.is_void(ta.elem) and cty.is_func(tb.elem)) or (cty.is_void(tb.elem) and cty.is_func(ta.elem))) {
+            // (a GNU dialect: a pointer to void compared with a pointer to a
+            // function, which 6.5.9p2 does not allow; the function pointer
+            // converted to the void pointer's type, with a warning)
+            warn(e.span, "C4149", u.f3("comparison with '%s' of a function pointer and 'void *' (%s and %s)",
+                                       cast.punct_text(op), tq(ta), tq(tb)));
+            if cty.is_void(ta.elem) {
+                e.b = convert(e.b, ta);
+            } else {
+                e.a = convert(e.a, tb);
+            }
+            return e;
+        }
+        if not ok {
+            err(e.span, "C3020", u.f3("comparison with '%s' of pointers to incompatible types (%s and %s)",
+                                      cast.punct_text(op), tq(ta), tq(tb)));
+            return bad_expr(e);
+        }
+        // (C89-C99 6.5.8p2: both point to object types, or both to incomplete types)
+        if (not eq) and (std() < co.C11) and (cty.is_complete(ta.elem) != cty.is_complete(tb.elem)) {
+            err(e.span, "C3020",
+                u.f1("comparison with '%s' of a pointer to a complete type and one to an incomplete type is not allowed before C11",
+                     cast.punct_text(op)));
+            return bad_expr(e);
+        }
+        return e;
+    }
+    if eq and (ta.kind == cty.TK_POINTER) and is_npc(e.b) {
+        e.b = convert(e.b, ta);
+        return e;
+    }
+    if eq and (tb.kind == cty.TK_POINTER) and is_npc(e.a) {
+        e.a = convert(e.a, tb);
+        return e;
+    }
+    return bad_operands(e);
+}
+
+fn assign(e: *mut cast.Expr) *mut cast.Expr {
+    let op = e.op;
+    let a = expr_check(e.a);
+    e.a = a;
+    let b = rv(e.b);
+    e.b = b;
+    if is_err(a) or is_err(b) {
+        return bad_expr(e);
+    }
+    let what = u.f1("'%s'", cast.punct_text(op));
+    if not modifiable(a, what) {
+        return bad_expr(e);
+    }
+    let lt = cty.unqual(a.ty);
+    e.ty = lt;
+    if op == ct.P_ASSIGN {
+        e.b = assign_convert(b, lt, "assignment");
+        return e;
+    }
+    let tb = b.ty;
+    if cty.is_vector(lt) or cty.is_vector(tb) {
+        return vec_expr(e, VX_ASSIGN);
+    }
+    if (op == ct.P_ADD_EQ) or (op == ct.P_SUB_EQ) {
+        if object_pointer(lt) and cty.is_integer(tb) {
+            e.opty = lt;
+            e.b = index_operand(b);
+            return e;
+        }
+        if cty.is_arith(lt) and cty.is_arith(tb) {
+            return compound_arith(e);
+        }
+    } else if (op == ct.P_MUL_EQ) or (op == ct.P_DIV_EQ) {
+        if cty.is_arith(lt) and cty.is_arith(tb) {
+            return compound_arith(e);
+        }
+    } else if (op == ct.P_SHL_EQ) or (op == ct.P_SHR_EQ) {
+        if cty.is_integer(lt) and cty.is_integer(tb) {
+            e.opty = promote_lvalue(a);
+            e.b = convert(b, cty.promote(tb));
+            return e;
+        }
+    } else if cty.is_integer(lt) and cty.is_integer(tb) {
+        return compound_arith(e);
+    }
+    err(e.span, "C3020", u.f3("invalid operands to '%s' (%s and %s)", cast.punct_text(op), tq(a.ty), tq(tb)));
+    return bad_expr(e);
+}
+
+// (with a complex opty, each operand in its own type domain, as arith says:
+// cgen converts the left one so too)
+fn compound_arith(e: *mut cast.Expr) *mut cast.Expr {
+    if mixes_dec(e, e.a.ty, e.b.ty) {
+        return bad_expr(e);
+    }
+    let t = cty.common_type(promote_lvalue(e.a), e.b.ty);
+    if cty.is_imaginary(e.a.ty) or cty.is_imaginary(e.b.ty) {
+        // (G.5: opty is the result's type; each operand in its own domain)
+        let r = cty.real_of(t);
+        let op = compound_base(e.op);
+        if (op != ct.P_PLUS) and (op != ct.P_MINUS) and (op != ct.P_STAR) and (op != ct.P_SLASH) {
+            err(e.span, "C3020", u.f2("invalid operands to '%s' (%s, an imaginary type)", cast.punct_text(e.op),
+                                      tq(e.a.ty)));
+            return bad_expr(e);
+        }
+        e.b = convert(e.b, in_domain(domain(e.b.ty), r));
+        e.opty = in_domain(imag_domain(op, domain(e.a.ty), domain(e.b.ty)), r);
+        return e;
+    }
+    e.opty = t;
+    e.b = convert(e.b, cty.domain_type(e.b.ty, t));
+    return e;
+}
+
+/// The operator of compound assignment op ('*=' is '*').
+pub fn compound_base(op: i32) i32 {
+    let ops: [10]i32 = [ct.P_MUL_EQ, ct.P_DIV_EQ, ct.P_MOD_EQ, ct.P_ADD_EQ, ct.P_SUB_EQ, ct.P_SHL_EQ, ct.P_SHR_EQ,
+                        ct.P_AND_EQ, ct.P_XOR_EQ, ct.P_OR_EQ];
+    let bs: [10]i32 = [ct.P_STAR, ct.P_SLASH, ct.P_PERCENT, ct.P_PLUS, ct.P_MINUS, ct.P_SHL, ct.P_SHR, ct.P_AMP,
+                       ct.P_CARET, ct.P_PIPE];
+    for k in 0..ops.len {
+        if ops[k] == op {
+            return bs[k];
+        }
+    }
+    return op;
+}
+
+fn conditional(e: *mut cast.Expr) *mut cast.Expr {
+    let x = rv(e.a);
+    if not is_err(x) and cty.is_vector(x.ty) {
+        // (a GNU dialect: the lanes of b or c chosen lane by lane)
+        e.a = x;
+        if u.isnil(e.b) {
+            err(e.span, "C3020", "'?:' without its second operand, of a vector condition");
+            return bad_expr(e);
+        }
+        e.b = rv(e.b);
+        e.c = rv(e.c);
+        if is_err(e.b) or is_err(e.c) {
+            return bad_expr(e);
+        }
+        return vec_expr(e, VX_COND);
+    }
+    e.a = cond_expr(x, "'?:'");
+    if u.isnil(e.b) {
+        // `a ?: c` (a GNU dialect): typed as `a ? a : c`, a evaluated once
+        // (IR generation converts its value to the result's type)
+        let c = rv(e.c);
+        e.c = c;
+        if is_err(e.a) or is_err(c) {
+            return bad_expr(e);
+        }
+        e.b = e.a;
+        let r = conditional_types(e);
+        e.b = u.nil.[cast.Expr]();
+        if not is_err(r) and e.a.is_const and cty.is_arith(e.ty) and cty.is_arith(e.a.ty) {
+            cc.fold(e);
+        }
+        return r;
+    }
+    let b = rv(e.b);
+    let c = rv(e.c);
+    e.b = b;
+    e.c = c;
+    if is_err(e.a) or is_err(b) or is_err(c) {
+        return bad_expr(e);
+    }
+    return conditional_types(e);
+}
+
+// The type of conditional expression e (its operands typed), its second
+// and third converted to it.
+fn conditional_types(e: *mut cast.Expr) *mut cast.Expr {
+    let b = e.b;
+    let c = e.c;
+    let tb = b.ty;
+    let tc = c.ty;
+    if cty.is_arith(tb) and cty.is_arith(tc) {
+        if mixes_dec(e, tb, tc) {
+            return bad_expr(e);
+        }
+        let mut t = cty.common_type(tb, tc);
+        if (cty.is_imaginary(tb) or cty.is_imaginary(tc)) and not cty.is_complex(t) {
+            // (an imaginary and a real operand: both complex; both imaginary: imaginary)
+            let mut d: i32 = 2;
+            if cty.is_imaginary(tb) and cty.is_imaginary(tc) {
+                d = 1;
+            }
+            t = in_domain(d, t);
+        }
+        e.b = convert(b, t);
+        e.c = convert(c, t);
+        e.ty = t;
+        cc.fold(e);
+        return e;
+    }
+    if (cty.is_record(tb) or cty.is_vector(tb)) and cty.compatible_unq(tb, tc) {
+        e.ty = cty.unqual(tb);
+        return e;
+    }
+    if cty.is_void(tb) and cty.is_void(tc) {
+        e.ty = cty.t_void;
+        return e;
+    }
+    if opts().gnu and (cty.is_void(tb) or cty.is_void(tc)) {
+        // (a GNU dialect: one operand void and the other not, which 6.5.15p3
+        // does not allow: the result is void, the other operand's value discarded)
+        warn(e.span, "C4142",
+             u.f2("the operands of '?:' are of void and non-void types (%s and %s): the result is void", tq(tb),
+                  tq(tc)));
+        e.b = convert(b, cty.t_void);
+        e.c = convert(c, cty.t_void);
+        e.ty = cty.t_void;
+        return e;
+    }
+    // (C23 6.5.16p3: two nullptr_t operands, or one and a pointer)
+    if cty.is_nullptr(tb) and cty.is_nullptr(tc) {
+        e.ty = cty.t_nullptr;
+        return e;
+    }
+    if cty.is_nullptr(tb) and (tc.kind == cty.TK_POINTER) {
+        e.ty = tc;
+        e.b = convert(b, tc);
+        return e;
+    }
+    if cty.is_nullptr(tc) and (tb.kind == cty.TK_POINTER) {
+        e.ty = tb;
+        e.c = convert(c, tb);
+        return e;
+    }
+    if (tb.kind == cty.TK_POINTER) and (tc.kind == cty.TK_POINTER) {
+        // (the qualifiers of both pointed-to types: in C23 an array's are
+        // its element's, so pointers to arrays whose elements differ in
+        // qualifiers point to compatible types, 6.5.16p6)
+        let q = pointee_quals(tb.elem) | pointee_quals(tc.elem);
+        if cty.compatible_unq(tb.elem, tc.elem) and cty.same_atomic(tb.elem, tc.elem) {
+            e.ty = cty.pointer_to(cty.qualify(cty.composite(cty.unqual(tb.elem), cty.unqual(tc.elem)), q));
+        } else if pointee_compatible(tb.elem, tc.elem) {
+            e.ty = cty.pointer_to(cty.qualify(cty.composite(strip_quals(tb.elem), strip_quals(tc.elem)), q));
+        } else if is_npc(c) {
+            e.ty = tb;
+        } else if is_npc(b) {
+            e.ty = tc;
+        } else if (cty.is_void(tb.elem) and not cty.is_func(tc.elem)) or
+                  (cty.is_void(tc.elem) and not cty.is_func(tb.elem)) {
+            e.ty = cty.pointer_to(cty.qualify(cty.t_void, q));
+        } else {
+            err(e.span, "C3020", u.f2("the operands of '?:' are pointers to incompatible types (%s and %s)", tq(tb),
+                                      tq(tc)));
+            return bad_expr(e);
+        }
+        e.b = convert(b, e.ty);
+        e.c = convert(c, e.ty);
+        return e;
+    }
+    if (tb.kind == cty.TK_POINTER) and is_npc(c) {
+        e.ty = tb;
+        e.c = convert(c, tb);
+        return e;
+    }
+    if (tc.kind == cty.TK_POINTER) and is_npc(b) {
+        e.ty = tc;
+        e.b = convert(b, tc);
+        return e;
+    }
+    err(e.span, "C3020", u.f2("the operands of '?:' have incompatible types (%s and %s)", tq(tb), tq(tc)));
+    return bad_expr(e);
+}
+
+// The compiler's own functions the headers use (builtin): a call of one, or false.
+fn expr_builtin_call(e: *mut cast.Expr) bool {
+    let f = e.a;
+    if (f.kind == cast.ExprKind.IDENT) and u.isnil(f.ty) and u.str_eq(f.name, "alloca") and opts().gnu and
+       opts().hosted {
+        // (a hosted GNU dialect: alloca, which the unit does not define,
+        // is __builtin_alloca, as the C library's <alloca.h> has it)
+        let s = lookup(f.name);
+        if u.isnil(s) or ((s.kind == cast.SK_FUNC) and not s.defined and (s.linkage == cast.LK_EXTERNAL)) {
+            f.name = u.intern("__builtin_alloca");
+        }
+    }
+    if (f.kind != cast.ExprKind.IDENT) or u.notnil(f.ty) or
+       not (u.starts(f.name, "__builtin_") or u.starts(f.name, "__sync_") or u.starts(f.name, "__atomic_")) or
+       u.notnil(lookup(f.name)) {
+        return false;
+    }
+    let n = f.name;
+    if u.str_eq(n, "__builtin_inff") or u.str_eq(n, "__builtin_nanf") {
+        // INFINITY and NAN (<float.h>): float constants
+        for x in e.args.items() {
+            _ = rv(x);
+        }
+        e.ty = cty.t_float;
+        e.is_const = true;
+        let z: f64 = 0.0;
+        if u.str_eq(n, "__builtin_inff") {
+            e.fcval = 1.0 / z;
+        } else {
+            // a positive quiet NaN (z / z would be the compiling machine's
+            // default NaN, negative on x86-64)
+            e.fcval = @bit_cast(f64, @as(u64, 0x7ff8000000000000));
+        }
+        return true;
+    }
+    // (csema_builtin.ax's; any other name is an ordinary identifier)
+    return std_builtin_call(e);
+}
+
+fn expr_call(e: *mut cast.Expr) *mut cast.Expr {
+    if expr_builtin_call(e) {
+        return e;
+    }
+    let f0 = e.a;
+    if (f0.kind == cast.ExprKind.IDENT) and (f0.parens == 0) and u.isnil(f0.ty) and u.isnil(lookup(f0.name)) {
+        if std() >= co.C99 {
+            err(f0.span, "C3060", u.f1("'%s' is not declared (a function must be declared before it is called)",
+                                       f0.name));
+            for x in e.args.items() {
+                _ = rv(x);
+            }
+            return bad_expr(e);
+        }
+        // C89, C95: an implicit declaration `extern int f();` (6.5.2.2 of C89)
+        warn(f0.span, "C4001", u.f1("implicit declaration of function '%s'", f0.name));
+        implicit_function(f0.name, f0.span);
+    }
+    let f = rv(e.a);
+    e.a = f;
+    if (f.kind == cast.ExprKind.CAST) and (f.op == cast.CV_FDECAY) and (f.a.kind == cast.ExprKind.IDENT) and
+       u.notnil(f.a.sym) {
+        use_address(f.a.sym, -1);  // (a direct call: no trampoline for it)
+    }
+    let n = e.args.len;
+    for i in 0..n {
+        e.args.set(i, rv(e.args.get(i)));
+    }
+    if is_err(f) {
+        return bad_expr(e);
+    }
+    if (f.ty.kind != cty.TK_POINTER) or (f.ty.elem.kind != cty.TK_FUNCTION) {
+        err(f.span, "C3024", u.f1("the called object has type %s, not a function or function pointer", tq(f.ty)));
+        return bad_expr(e);
+    }
+    let ft = f.ty.elem;
+    let mut name: []u8 = "the function";
+    if (f.kind == cast.ExprKind.CAST) and (f.a.kind == cast.ExprKind.IDENT) {
+        name = u.f1("'%s'", f.a.name);
+    }
+    if ft.proto {
+        let np = ft.params.len;
+        if (n < np) or ((n > np) and not ft.variadic) {
+            err(e.span, "C3023", u.f4("%s takes %s%s arguments, not %s", name, u.pick(ft.variadic, "at least ", ""),
+                                      u.zdec(np), u.zdec(n)));
+            return bad_expr(e);
+        }
+        for i in 0..n {
+            let a = e.args.get(i);
+            if i < np {
+                let ta = gnu_transparent(a, ft.params[i]);
+                e.args.set(i, assign_convert(ta, ft.params[i], u.f2("argument %s of %s", u.zdec(i + 1), name)));
+            } else {
+                e.args.set(i, promote_arg(a));
+            }
+        }
+    } else {
+        for i in 0..n {
+            e.args.set(i, promote_arg(e.args.get(i)));
+        }
+    }
+    // (__builtin_va_arg_pack (), in an inline definition: the last of the
+    // call's variable arguments, which the inlined call's replace; anywhere
+    // else it is C3090, csema_marks.end_body)
+    for i in 0..n {
+        let last = (i + 1 == n) and (not ft.proto or (ft.variadic and (i >= ft.params.len)));
+        _ = pack_argument(e.args.get(i), last);
+    }
+    let rt = ft.ret;
+    if not cty.is_void(rt) and not cty.is_complete(rt) {
+        err(e.span, "C3007", u.f1("the call's result has incomplete type %s", tq(rt)));
+        return bad_expr(e);
+    }
+    e.ty = cty.unqual(rt);
+    gnu_call_check(e);
+    return e;
+}
+
+// What vector_expr is asked to type (a GNU dialect's vector types:
+// csema_vec.ax, which sets the hook).
+pub const VX_BINARY: i32 = 1;   // a binary operator, an operand of vector type (typed)
+pub const VX_UNARY: i32 = 2;    // + - ~ ! of a vector (typed)
+pub const VX_ASSIGN: i32 = 3;   // a compound assignment, an operand of vector type (typed)
+pub const VX_INCDEC: i32 = 4;   // ++ or -- of a vector lvalue (typed)
+pub const VX_COND: i32 = 5;     // ?: whose first operand is a vector (typed; the others not)
+pub const VX_INDEX: i32 = 6;    // a subscript of a vector (the operands not typed)
+pub const VX_CAST: i32 = 7;     // a cast to or from a vector type (e.ty and e.a set)
+pub const VX_CONVERT: i32 = 8;  // __builtin_convertvector(e.a, e.tname) (a VA_ARG node: nothing typed)
+
+/// Checks a expr_call (typed) against its function's GNU attributes (nonnull,
+
+// An argument without a parameter: the default argument promotions.
+fn promote_arg(a: *mut cast.Expr) *mut cast.Expr {
+    if is_err(a) {
+        return a;
+    }
+    if cty.is_void(a.ty) {
+        err(a.span, "C3030", "a void value is passed as an argument");
+        return bad_expr(a);
+    }
+    if cty.is_arith(a.ty) {
+        return convert(a, cty.arg_promote(a.ty));
+    }
+    return a;
+}
+
+fn index(e: *mut cast.Expr) *mut cast.Expr {
+    let va = expr_check(e.a);
+    if not is_err(va) and cty.is_vector(va.ty) {
+        e.a = va;
+        return vec_expr(e, VX_INDEX);
+    }
+    let mut a = value_of(va);
+    let mut b = rv(e.b);
+    if is_err(a) or is_err(b) {
+        e.a = a;
+        e.b = b;
+        return bad_expr(e);
+    }
+    if cty.is_integer(a.ty) and (b.ty.kind == cty.TK_POINTER) {
+        let x = a;
+        a = b;
+        b = x;
+    }
+    e.a = a;
+    e.b = b;
+    if (a.ty.kind != cty.TK_POINTER) or not cty.is_integer(b.ty) {
+        err(e.span, "C3020", u.f2("subscript of %s by %s (an array or pointer and an integer are needed)", tq(a.ty),
+                                  tq(b.ty)));
+        return bad_expr(e);
+    }
+    if not object_pointer(a.ty) or cty.is_void(a.ty.elem) or cty.is_func(a.ty.elem) {
+        err(e.span, "C3007", u.f1("subscript of a pointer to an incomplete or function type (%s)", tq(a.ty)));
+        return bad_expr(e);
+    }
+    e.b = index_operand(b);
+    e.ty = a.ty.elem;
+    e.lvalue = true;
+    return e;
+}
+
+fn member_expr(e: *mut cast.Expr) *mut cast.Expr {
+    let arrow = e.op == ct.P_ARROW;
+    let mut base = u.nil.[cast.Expr]();
+    let mut st = cty.t_error;
+    if arrow {
+        base = rv(e.a);
+        e.a = base;
+        if is_err(base) {
+            return bad_expr(e);
+        }
+        if (base.ty.kind != cty.TK_POINTER) or not cty.is_record(base.ty.elem) {
+            err(e.span, "C3025", u.f2("'->%s' on %s, not a pointer to a structure or union", e.name, tq(base.ty)));
+            return bad_expr(e);
+        }
+        st = base.ty.elem;
+    } else {
+        base = expr_check(e.a);
+        e.a = base;
+        if is_err(base) {
+            return bad_expr(e);
+        }
+        if not cty.is_record(base.ty) {
+            err(e.span, "C3025", u.f2("'.%s' on %s, not a structure or union", e.name, tq(base.ty)));
+            return bad_expr(e);
+        }
+        st = base.ty;
+    }
+    if not cty.is_complete(st) {
+        err(e.span, "C3007", u.f2("'%s' in %s, an incomplete type", e.name, tq(st)));
+        return bad_expr(e);
+    }
+    let fm = cty.find_member(st, e.name);
+    if u.isnil(fm.m) {
+        err(e.name_span, "C3025", u.f2("%s has no member named '%s'", tq(st), e.name));
+        return bad_expr(e);
+    }
+    e.mem = fm.m;
+    use_member(fm.m, e.name_span);
+    e.cval = fm.offset;
+    if (st.quals & cty.Q_ATOMIC) != 0 {
+        // (6.5.2.3p5: undefined; the member is accessed as an ordinary object)
+        warn(e.name_span, "C4090", u.f2("accessing the member '%s' of an object of atomic type %s is undefined", e.name,
+                                        tq(st)));
+    }
+    e.ty = cty.qualify(fm.m.ty, st.quals & ~cty.Q_ATOMIC);
+    e.lvalue = arrow or base.lvalue;
+    return e;
+}
+
+fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
+    let t = type_name(e.tname);
+    let a = rv(e.a);
+    e.a = a;
+    if is_err(a) or cty.is_error(t) {
+        return bad_expr(e);
+    }
+    e.op = cast.CV_VALUE;
+    e.ty = cty.unqual(t);
+    if cty.is_void(t) {
+        return e;
+    }
+    let s = a.ty;
+    if cty.is_vector(s) or cty.is_vector(t) {
+        return vec_expr(e, VX_CAST);
+    }
+    if cty.is_nullptr(s) or cty.is_nullptr(t) {
+        // (C23 6.5.5p4: nullptr_t only to void, bool, a pointer type or itself; nothing else to nullptr_t)
+        let mut ok = (t.kind == cty.TK_BOOL) or (t.kind == cty.TK_POINTER);
+        if cty.is_nullptr(t) {
+            ok = cty.is_nullptr(s);
+        }
+        if not ok {
+            let why = "nullptr_t converts only to void, bool and pointer types, and only nullptr_t to it";
+            err(e.span, "C3028", u.f3("a cast from %s to %s (%s)", tq(s), tq(t), why));
+            return bad_expr(e);
+        }
+        cc.fold(e);
+        return e;
+    }
+    if opts().gnu and cty.is_record(t) and cty.compatible_unq(t, s) {
+        // (a GNU dialect: a structure or union cast to its own type, which
+        // 6.5.4p2 does not allow: the operand's value, with a warning)
+        warn(e.span, "C4143", u.f1("a cast of a value of type %s to its own type", tq(s)));
+        return a;
+    }
+    if opts().gnu and (t.kind == cty.TK_UNION) {
+        // (a GNU dialect: a cast to a union of a value of one of its
+        // members' types, which 6.5.4p2 does not allow: the union's value
+        // with that member given it)
+        let v = gnu_union_cast(a, t);
+        if u.notnil(v) {
+            return v;
+        }
+    }
+    if not cty.is_scalar(t) or not cty.is_scalar(s) {
+        err(e.span, "C3028", u.f2("a cast from %s to %s (casts are between scalar types, or to void)", tq(s), tq(t)));
+        return bad_expr(e);
+    }
+    // (6.5.4p4: and not to or from a complex type, which is floating too)
+    let tf = cty.is_real_floating(t) or cty.is_complex(t) or cty.is_imaginary(t);
+    let sf = cty.is_real_floating(s) or cty.is_complex(s) or cty.is_imaginary(s);
+    if ((t.kind == cty.TK_POINTER) and sf) or ((s.kind == cty.TK_POINTER) and tf) {
+        err(e.span, "C3028", u.f2("a cast between a pointer and a floating type (%s to %s)", tq(s), tq(t)));
+        return bad_expr(e);
+    }
+    cc.fold(e);
+    return e;
+}
+
+fn size_align(e: *mut cast.Expr) *mut cast.Expr {
+    let mut t = cty.t_error;
+    let k = e.kind;
+    let what = u.pick(k == cast.ExprKind.ALIGNOF, u.cat2("'", u.cat2(e.name, "'")), "'sizeof'");
+    if (k == cast.ExprKind.SIZEOF_EXPR) or ((k == cast.ExprKind.ALIGNOF) and u.isnil(e.tname)) {
+        unevaluated(1);
+        let a = expr_check(e.a);
+        unevaluated(-1);
+        e.a = a;
+        if is_err(a) {
+            return bad_expr(e);
+        }
+        if u.notnil(bit_member(a)) {
+            err(e.span, "C3070", u.f2("%s of the bit-field '%s'", what, a.mem.name));
+            return bad_expr(e);
+        }
+        t = a.ty;
+        if (k == cast.ExprKind.ALIGNOF) and u.notnil(a.mem) and (a.kind == cast.ExprKind.MEMBER) {
+            // (__alignof__ of a member: its own alignment, packed or aligned: the GNU dialects')
+            if not cty.is_complete(t) {
+                err(e.span, "C3029", u.f2("the operand of %s has incomplete type %s", what, tq(t)));
+                return bad_expr(e);
+            }
+            e.ty = cty.t_size;
+            e.is_const = true;
+            e.cval = member_align(a.mem);
+            if a.mem.place_align != 0 {
+                e.cval = a.mem.place_align;
+            }
+            return e;
+        }
+        if (k == cast.ExprKind.ALIGNOF) and (a.kind == cast.ExprKind.IDENT) and u.notnil(a.sym) and
+           (a.sym.kind == cast.SK_FUNC) and (a.sym.align > 1) and opts().gnu {
+            // (a GNU dialect: __alignof__ of a function declared aligned(n): n)
+            e.ty = cty.t_size;
+            e.is_const = true;
+            e.cval = a.sym.align;
+            return e;
+        }
+        if (k == cast.ExprKind.ALIGNOF) and (a.kind == cast.ExprKind.IDENT) and u.notnil(a.sym) and
+           (a.sym.kind != cast.SK_FUNC) and (a.sym.align > cty.align_of(t)) {
+            if not cty.is_complete(t) {
+                err(e.span, "C3029", u.f2("the operand of %s has incomplete type %s", what, tq(t)));
+                return bad_expr(e);
+            }
+            e.ty = cty.t_size;
+            e.is_const = true;
+            e.cval = a.sym.align;
+            return e;
+        }
+    } else {
+        t = type_name(e.tname);
+        if cty.is_error(t) {
+            return bad_expr(e);
+        }
+    }
+    if opts().gnu and (cty.is_func(t) or cty.is_void(t)) {
+        // (a GNU dialect: sizeof and alignof of void or a function type are 1)
+        e.ty = cty.t_size;
+        e.is_const = true;
+        e.cval = 1;
+        return e;
+    }
+    if cty.is_func(t) {
+        err(e.span, "C3029", u.f2("the operand of %s has function type %s", what, tq(t)));
+        return bad_expr(e);
+    }
+    let alignof_ = k == cast.ExprKind.ALIGNOF;
+    if cty.is_vla(t) and not alignof_ and cty.is_complete(t) {
+        // (evaluated, at run time: cgen_vla.ax)
+        e.ty = cty.t_size;
+        return e;
+    }
+    if not cty.is_complete(t) {
+        err(e.span, "C3029", u.f2("the operand of %s has incomplete type %s", what, tq(t)));
+        return bad_expr(e);
+    }
+    e.ty = cty.t_size;
+    e.is_const = true;
+    if alignof_ {
+        e.cval = cty.align_of(t);
+    } else {
+        e.cval = cty.size_of(t);
+    }
+    return e;
+}

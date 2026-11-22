@@ -1,0 +1,364 @@
+// =============================================================================
+// std/encoding/xml/writer.ax - XML escaping, streaming Writer, and Canonical XML
+// (W3C C14N 1.0 with comments), part of std/encoding/xml.
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../io.ax" as io;
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// Writes text escaped for XML content (&, <, >).
+pub fn escape_text(w: io.Writer, s: []u8) !void {
+    let mut st: usize = 0;
+    for i in @as(usize, 0)..s.len {
+        let c = s[i];
+        let mut rep: []u8 = "";
+        if c == '&' {
+            rep = "&amp;";
+        } else if c == '<' {
+            rep = "&lt;";
+        } else if c == '>' {
+            rep = "&gt;";
+        } else if c == '\r' {
+            rep = "&#xD;";
+        }
+        if rep.len > 0 {
+            w.write_all(s[st..i])!;
+            w.write_all(rep)!;
+            st = i + 1;
+        }
+    }
+    w.write_all(s[st..])!;
+}
+
+/// Writes text escaped for a double-quoted attribute value.
+pub fn escape_attr(w: io.Writer, s: []u8) !void {
+    let mut st: usize = 0;
+    for i in @as(usize, 0)..s.len {
+        let c = s[i];
+        let mut rep: []u8 = "";
+        if c == '&' {
+            rep = "&amp;";
+        } else if c == '<' {
+            rep = "&lt;";
+        } else if c == '"' {
+            rep = "&quot;";
+        } else if c == '\t' {
+            rep = "&#x9;";
+        } else if c == '\n' {
+            rep = "&#xA;";
+        } else if c == '\r' {
+            rep = "&#xD;";
+        }
+        if rep.len > 0 {
+            w.write_all(s[st..i])!;
+            w.write_all(rep)!;
+            st = i + 1;
+        }
+    }
+    w.write_all(s[st..])!;
+}
+
+/// An XML writer: start, attr, text, end; pretty() indents elements that
+/// hold only elements.
+pub nocopy struct Writer {
+    out: io.Writer,
+    names: vec.Vec.[[]u8],
+    mixed: vec.Vec.[bool],  // per open element: text was written in it
+    in_start: bool,         // the start tag is still open (attributes may follow)
+    indent: u32,            // 0: no indentation
+    wrote_any: bool,
+
+    pub fn init(out: io.Writer) Writer {
+        return Writer.{ out: out, names: vec.Vec.[[]u8].init(), mixed: vec.Vec.[bool].init(), in_start: false,
+                        indent: 0, wrote_any: false };
+    }
+
+    pub fn pretty(out: io.Writer, indent: u32) Writer {
+        let mut w = Writer.init(out);
+        w.indent = indent;
+        return w;
+    }
+
+    pub fn deinit(self: *mut Writer) void {
+        self.names.deinit();
+        self.mixed.deinit();
+    }
+
+    /// <?xml version="1.0" encoding="UTF-8"?>
+    pub fn declaration(self: *mut Writer) !void {
+        self.out.write_all("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")!;
+        self.wrote_any = true;
+    }
+
+    fn close_start(self: *mut Writer) !void {
+        if self.in_start {
+            self.out.write_all(">")!;
+            self.in_start = false;
+        }
+    }
+
+    fn newline(self: *mut Writer, depth: usize) !void {
+        if (self.indent == 0) or not self.wrote_any {
+            return;
+        }
+        if (self.mixed.len() > 0) and self.mixed.get(self.mixed.len() - 1) {
+            return;
+        }
+        self.out.write_all("\n")!;
+        for _k in @as(usize, 0)..depth * @as(usize, self.indent) {
+            self.out.write_all(" ")!;
+        }
+    }
+
+    pub fn start(self: *mut Writer, name: []u8) !void {
+        if not is_name(name) {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len())!;
+        self.out.write_all("<")!;
+        self.out.write_all(name)!;
+        self.names.push(name)!;
+        self.mixed.push(false)!;
+        self.in_start = true;
+        self.wrote_any = true;
+    }
+
+    pub fn attr(self: *mut Writer, name: []u8, value: []u8) !void {
+        if not self.in_start or not is_name(name) {
+            return error.SyntaxError;
+        }
+        self.out.write_all(" ")!;
+        self.out.write_all(name)!;
+        self.out.write_all("=\"")!;
+        escape_attr(self.out, value)!;
+        self.out.write_all("\"")!;
+    }
+
+    pub fn text(self: *mut Writer, s: []u8) !void {
+        self.close_start()!;
+        if self.mixed.len() > 0 {
+            self.mixed.set(self.mixed.len() - 1, true);
+        }
+        escape_text(self.out, s)!;
+    }
+
+    /// A CDATA section (split where s contains "]]>").
+    pub fn cdata(self: *mut Writer, s: []u8) !void {
+        self.close_start()!;
+        if self.mixed.len() > 0 {
+            self.mixed.set(self.mixed.len() - 1, true);
+        }
+        self.out.write_all("<![CDATA[")!;
+        let mut st: usize = 0;
+        loop {
+            let at = strs.index_of_from(s, "]]>", st) ?? break;
+            self.out.write_all(s[st..at + 2])!;
+            self.out.write_all("]]><![CDATA[")!;
+            st = at + 2;
+        }
+        self.out.write_all(s[st..])!;
+        self.out.write_all("]]>")!;
+    }
+
+    pub fn comment(self: *mut Writer, s: []u8) !void {
+        if strs.contains(s, "--") or strs.ends_with(s, "-") {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len())!;
+        self.out.write_all("<!--")!;
+        self.out.write_all(s)!;
+        self.out.write_all("-->")!;
+        self.wrote_any = true;
+    }
+
+    pub fn pi(self: *mut Writer, target: []u8, data: []u8) !void {
+        if not is_name(target) or strs.contains(data, "?>") {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len())!;
+        self.out.write_all("<?")!;
+        self.out.write_all(target)!;
+        if data.len > 0 {
+            self.out.write_all(" ")!;
+            self.out.write_all(data)!;
+        }
+        self.out.write_all("?>")!;
+        self.wrote_any = true;
+    }
+
+    /// Ends the innermost element (as <x/> if it is empty).
+    pub fn end(self: *mut Writer) !void {
+        let name = self.names.pop() ?? return error.BadNesting;
+        let was_mixed = self.mixed.pop() ?? false;
+        if self.in_start {
+            self.out.write_all("/>")!;
+            self.in_start = false;
+            return;
+        }
+        if not was_mixed {
+            self.newline(self.names.len())!;
+        }
+        self.out.write_all("</")!;
+        self.out.write_all(name)!;
+        self.out.write_all(">")!;
+    }
+
+    /// Writes a whole element (and what it holds).
+    pub fn element(self: *mut Writer, e: *Element) !void {
+        self.start(e.name)!;
+        for a in e.attrs {
+            self.attr(a.name, a.value)!;
+        }
+        for c in e.children {
+            match c {
+                .Element(x) => { self.element(x)!; }
+                .Text(t)    => { self.text(t)!; }
+                .Comment(t) => { self.comment(t)!; }
+                .PI(p)      => { self.pi(p.target, p.data)!; }
+            }
+        }
+        self.end()!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Canonical XML (1.0, with comments)
+// -----------------------------------------------------------------------------
+
+fn to_xml_write_error(e: error) XmlError {
+    if e == error.TooDeep {
+        return error.TooDeep;
+    }
+    if e == error.OutOfMemory {
+        return error.OutOfMemory;
+    }
+    return error.IoError;
+}
+
+/// The document's canonical form (W3C Canonical XML 1.0 with comments; free
+/// it with mem.free): no declaration or DOCTYPE, attributes sorted,
+/// namespace declarations only where they change something, empty elements
+/// as start-end pairs, and fixed escaping.
+pub fn canonicalize(doc: *Document) XmlError![]mut u8 {
+    let mut s = strs.String.init();
+    let mut rendered = Scope.init();
+    defer rendered.deinit();
+    canon_doc(doc, s.writer(), &mut rendered) catch |e| {
+        s.deinit();
+        return to_xml_write_error(e);
+    };
+    return s.take();
+}
+
+fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut Scope) !void {
+    for n in doc.prolog {
+        canon_node(n, w, rendered, 0)!;
+        w.write_all("\n")!;
+    }
+    canon_element(doc.root, w, rendered, 1)!;
+    for n in doc.epilog {
+        w.write_all("\n")!;
+        canon_node(n, w, rendered, 0)!;
+    }
+}
+
+fn canon_node(n: Node, w: io.Writer, rendered: *mut Scope, depth: usize) !void {
+    match n {
+        .Element(e) => { canon_element(e, w, rendered, depth + 1)!; }
+        .Text(t)    => { escape_text(w, t)!; }
+        .Comment(t) => {
+            w.write_all("<!--")!;
+            w.write_all(t)!;
+            w.write_all("-->")!;
+        }
+        .PI(p) => {
+            w.write_all("<?")!;
+            w.write_all(p.target)!;
+            if p.data.len > 0 {
+                w.write_all(" ")!;
+                w.write_all(p.data)!;
+            }
+            w.write_all("?>")!;
+        }
+    }
+}
+
+fn attr_less(a: Attr, b: Attr) bool {
+    let c = strs.compare(a.ns, b.ns);
+    if c != 0 {
+        return c < 0;
+    }
+    return strs.compare(a.local, b.local) < 0;
+}
+
+fn ns_less(a: Attr, b: Attr) bool {
+    // xmlns first, then by prefix
+    if strs.eq(a.name, "xmlns") {
+        return not strs.eq(b.name, "xmlns");
+    }
+    if strs.eq(b.name, "xmlns") {
+        return false;
+    }
+    return strs.compare(a.local, b.local) < 0;
+}
+
+fn canon_element(e: *Element, w: io.Writer, rendered: *mut Scope, depth: usize) !void {
+    if depth > (MAX_DEPTH + 1) {
+        return error.TooDeep;
+    }
+    let mark = rendered.stack.len();
+    let mut decls = vec.Vec.[Attr].init();
+    defer decls.deinit();
+    let mut plain = vec.Vec.[Attr].init();
+    defer plain.deinit();
+    for a in e.attrs {
+        if strs.eq(a.ns, XMLNS_NS) {
+            let mut prefix = a.local;
+            if strs.eq(a.name, "xmlns") {
+                prefix = "";
+            }
+            // only what changes the namespaces in effect (xml is always in effect)
+            if strs.eq(rendered.uri(prefix), a.value) or strs.eq(prefix, "xml") {
+                continue;
+            }
+            decls.push(a)!;
+            rendered.push(prefix, a.value, depth)!;
+        } else {
+            plain.push(a)!;
+        }
+    }
+    vec.sort.[Attr, ns_less](decls.items_mut());
+    vec.sort.[Attr, attr_less](plain.items_mut());
+    w.write_all("<")!;
+    w.write_all(e.name)!;
+    for a in decls.items() {
+        w.write_all(" ")!;
+        w.write_all(a.name)!;
+        w.write_all("=\"")!;
+        escape_attr(w, a.value)!;
+        w.write_all("\"")!;
+    }
+    for a in plain.items() {
+        w.write_all(" ")!;
+        w.write_all(a.name)!;
+        w.write_all("=\"")!;
+        escape_attr(w, a.value)!;
+        w.write_all("\"")!;
+    }
+    w.write_all(">")!;
+    for c in e.children {
+        canon_node(c, w, rendered, depth)!;
+    }
+    w.write_all("</")!;
+    w.write_all(e.name)!;
+    w.write_all(">")!;
+    rendered.truncate(mark);
+}

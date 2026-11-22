@@ -1,0 +1,571 @@
+// =============================================================================
+// cpp_builtins.ax - builtin macros, #if operators (__has_include, __has_embed,
+// __has_c_attribute, __has_attribute, __has_builtin), __DATE__/__TIME__/
+// __TIMESTAMP__, and predefined/-D/-U macros, part of cpp.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "../version.ax" as ver;
+import "cfeat.ax" as cf;
+import "copts.ax" as co;
+import "cpp_lex.ax" as lx;
+import "ctarget.ax" as ctg;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Builtin operators and macros
+// -----------------------------------------------------------------------------
+// The operators of #if expressions: defined, and C23's __has_include,
+// __has_embed and __has_c_attribute; t becomes the pp-number of the value.
+fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
+    let name = t.name;
+    if u.str_eq(name, "defined") {
+        if t.exp and not P.o.gnu and not t.sys and not in_system_header(P) {
+            // (undefined, 6.10.1p4; a GNU dialect or system header evaluates it,
+            // as the common compilers do: its operand is the tokens after it, not replaced)
+            _ = dg.err(t.span, "C1044", "'defined' made by macro replacement in a #if expression");
+        }
+        let mut n = raw_next(P);
+        let paren = lx.is_punct(&n, ct.P_LPAREN);
+        if paren {
+            n = raw_next(P);
+        }
+        if n.kind != lx.PK_IDENT {
+            _ = dg.err(t.span, "C1045", "operator 'defined' requires an identifier");
+            t.* = mklit(lx.PK_OTHER, 0, "defined", t.span);
+            return true;
+        }
+        if paren {
+            let c = raw_next(P);
+            if not lx.is_punct(&c, ct.P_RPAREN) {
+                _ = dg.err(t.span, "C1045", "missing ')' after 'defined'");
+                t.* = mklit(lx.PK_OTHER, 0, "defined", t.span);
+                return true;
+            }
+        }
+        t.* = number_tok(@as(i64, u.notnil(lookup(P, n.name))), t.span);
+        return true;
+    }
+    // (the operators are registered as macros in the modes that have them)
+    let m = lookup(P, name);
+    if u.isnil(m) or
+       ((m.builtin != B_HAS_INCLUDE) and (m.builtin != B_HAS_EMBED) and (m.builtin != B_HAS_ATTR) and
+        (m.builtin != B_HAS_GNU_ATTR) and (m.builtin != B_HAS_BUILTIN) and (m.builtin != B_HAS_FEATURE) and
+        (m.builtin != B_HAS_INCLUDE_NEXT)) {
+        return false;
+    }
+    let sp = t.span;
+    let mut ts = tok_list();
+    if not next_is_lparen(P) {
+        _ = dg.err(sp, "C1046", u.f1("'%s' must be followed by '('", name));
+        t.* = mklit(lx.PK_OTHER, 0, name, sp);
+        return true;
+    }
+    _ = raw_next(P);
+    let mut depth: i32 = 0;
+    loop {
+        let n = raw_next(P);
+        if n.kind == lx.PK_EOF {
+            _ = dg.err(sp, "C1046", u.f1("missing ')' after '%s'", name));
+            t.* = mklit(lx.PK_OTHER, 0, name, sp);
+            ts.deinit();
+            return true;
+        }
+        if lx.is_punct(&n, ct.P_LPAREN) {
+            depth += 1;
+        } else if lx.is_punct(&n, ct.P_RPAREN) {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        ts.push(n);
+    }
+    let items = frozen(&mut ts);
+    let mut v: i64 = 0;
+    if m.builtin == B_HAS_ATTR {
+        v = has_attribute(expand_list(P, items), sp);
+    } else if m.builtin == B_HAS_GNU_ATTR {
+        v = has_gnu_attribute(P, expand_list(P, items), sp);
+    } else if m.builtin == B_HAS_BUILTIN {
+        let bs = expand_list(P, items);
+        if (bs.len != 1) or (bs[0].kind != lx.PK_IDENT) {
+            _ = dg.err(sp, "C1048", "'__has_builtin' requires the name of a builtin");
+        } else {
+            v = @as(i64, cf.has_builtin(bs[0].name, P.o.gnu));
+        }
+    } else if m.builtin == B_HAS_FEATURE {
+        let bs = expand_list(P, items);
+        if (bs.len != 1) or (bs[0].kind != lx.PK_IDENT) {
+            _ = dg.err(sp, "C1048", u.f1("'%s' requires a feature name", name));
+        }
+    } else {
+        // the resource, and (for __has_embed) the parameters
+        let mut k: usize = 0;
+        let hn = header_operand(P, items, &mut k, m.builtin == B_HAS_EMBED, sp);
+        if not u.isnos(hn) {
+            let mut path = u.nosym();
+            if m.builtin == B_HAS_INCLUDE_NEXT {
+                path = find_file_from(P, hn[1..hn.len - 1], next_index(P));
+            } else {
+                path = find_file(P, hn[1..hn.len - 1], hn[0] == '"');
+            }
+            if (m.builtin == B_HAS_INCLUDE) or (m.builtin == B_HAS_INCLUDE_NEXT) {
+                extra(items, k, name);
+                v = @as(i64, not u.isnos(path));
+            } else {
+                let mut ep = no_params();
+                let ok = embed_params(P, items[k..], &mut ep);
+                if not ok or ep.unsupported or u.isnos(path) {
+                    v = 0;
+                } else if (u.file_size(path) == 0) or (ep.limit == 0) {
+                    v = 2;
+                } else {
+                    v = 1;
+                }
+            }
+        }
+    }
+    t.* = number_tok(v, sp);
+    return true;
+}
+
+// __has_c_attribute: the standard attributes' values (C23 6.10.2).
+fn has_attribute(ts: []lx.PTok, sp: u.Span) i64 {
+    if (ts.len == 3) and (ts[0].kind == lx.PK_IDENT) and lx.is_punct(&ts[1], ct.P_COLONCOLON) and
+       (ts[2].kind == lx.PK_IDENT) {
+        // (no attribute of a vendor's is supported)
+        return 0;
+    }
+    if (ts.len != 1) or (ts[0].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1048", "'__has_c_attribute' requires an attribute name");
+        return 0;
+    }
+    let mut n = ts[0].name;
+    if (n.len > 4) and u.starts(n, "__") and u.ends(n, "__") {
+        n = n[2..n.len - 2];
+    }
+    let names = ["deprecated", "fallthrough", "maybe_unused", "nodiscard", "noreturn", "_Noreturn", "unsequenced",
+                 "reproducible"];
+    let vals: [8]i64 = [201904, 201904, 202106, 202003, 202202, 202202, 202207, 202207];
+    for k in 0..names.len {
+        if u.str_eq(names[k], n) {
+            return vals[k];
+        }
+    }
+    return 0;
+}
+
+// __has_attribute (the compiler's, in every mode): nonzero for the
+// attributes that work in the mode: a standard attribute in C23 (its
+// __has_c_attribute value), and in a GNU dialect the GNU attributes
+// (cfeat.ax), as `name`, `__name__`, `gnu::name` or `__gnu__::name`.
+fn has_gnu_attribute(P: *PP, ts: []lx.PTok, sp: u.Span) i64 {
+    let gnu = P.o.gnu;
+    // (`prefix::name`; before C23 '::' is two ':')
+    let scoped = ((ts.len == 3) and lx.is_punct(&ts[1], ct.P_COLONCOLON)) or
+                 ((ts.len == 4) and lx.is_punct(&ts[1], ct.P_COLON) and lx.is_punct(&ts[2], ct.P_COLON));
+    if scoped and (ts[0].kind == lx.PK_IDENT) and (ts[ts.len - 1].kind == lx.PK_IDENT) {
+        let n = ts[ts.len - 1].name;
+        if gnu and (u.str_eq(ts[0].name, "gnu") or u.str_eq(ts[0].name, "__gnu__")) and cf.gnu_attribute(n) {
+            return 1;
+        }
+        return 0;
+    }
+    if (ts.len != 1) or (ts[0].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1048", "'__has_attribute' requires an attribute name");
+        return 0;
+    }
+    if gnu and cf.gnu_attribute(ts[0].name) {
+        return 1;
+    }
+    if P.o.std >= co.C23 {
+        return has_attribute(ts, sp);
+    }
+    return 0;
+}
+
+// The macros the preprocessor replaces itself.
+fn builtin(P: *mut PP, m: *mut Macro, inv: *lx.PTok) bool {
+    let b = m.builtin;
+    let mut l = tok_list();
+    if b == B_LINE {
+        let s = cur_src(P);
+        let mut t = number_tok(line_of(inv.span) + s.line_delta, inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if b == B_FILE {
+        let mut t = string_tok(cur_src(P).presumed, inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if (b == B_COUNTER) or (b == B_INCLUDE_LEVEL) {
+        let mut v = @int_cast(i64, P.files.len) - 1;
+        if b == B_COUNTER {
+            v = P.counter;
+            P.counter += 1;
+        }
+        let mut t = number_tok(v, inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if (b == B_DATE) or (b == B_TIME) {
+        let mut t = string_tok(build_date_time(b == B_DATE), inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if (b == B_BASE_FILE) or (b == B_TIMESTAMP) {
+        let mut t = string_tok(P.base_file, inv.span);
+        if b == B_TIMESTAMP {
+            t = string_tok(timestamp(cur_src(P).path), inv.span);
+        }
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if b == B_PRAGMA {
+        // _Pragma ( string-literal ): destringized, the pragma (6.10.9)
+        let mut ok = next_is_lparen(P);
+        if (P.o.std < co.C99) and not P.o.gnu {
+            if not ok {
+                return false;
+            }
+            _ = dg.err(inv.span, "C1051", "the '_Pragma' operator is a C99 feature");
+        }
+        let mut text: []u8 = "";
+        if ok {
+            _ = raw_next(P);
+            let s = raw_next(P);
+            ok = (s.kind == lx.PK_STRING) and ((s.id == ct.ENC_NONE) or (s.id == ct.ENC_WIDE));
+            if ok {
+                text = destringize(s.text);
+                let c = raw_next(P);
+                ok = lx.is_punct(&c, ct.P_RPAREN);
+            }
+        }
+        if not ok {
+            _ = dg.err(inv.span, "C1051", "'_Pragma' takes a parenthesized string literal");
+        } else {
+            let pt = do_pragma(P, lx.lex_all(text, P.o.std, inv.span), inv.span);
+            if pt.kind == lx.PK_PRAGMA {
+                l.push(pt);
+            }
+        }
+        P.pend_bol = P.pend_bol or inv.bol;
+        P.pend_space = P.pend_space or inv.space;
+        if l.len > 0 {
+            push_ctx(P, frozen(&mut l), nilmac());
+        }
+        return true;
+    } else {
+        _ = dg.err(inv.span, "C1049", u.f1("'%s' can appear only in #if and #elif", inv.name));
+        return false;
+    }
+    push_ctx(P, frozen(&mut l), nilmac());
+    return true;
+}
+
+// __TIMESTAMP__ of the file at path: when it was last modified, in UTC, as
+// asctime writes a time ("Sun Sep 16 01:03:52 1973").
+fn timestamp(path: []u8) []u8 {
+    let ns = u.file_mtime(path);
+    if ns < 0 {
+        return "??? ??? ?? ??:??:?? ????";
+    }
+    let secs = ns / 1000000000;
+    let mut date = "";
+    let mut time = "";
+    date_time(secs, &mut date, &mut time);
+    let days = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let mut d = (secs / 86400) % 7;
+    if d < 0 {
+        d += 7;
+    }
+    // (date is "Mmm dd yyyy")
+    return u.f4("%s %s %s %s", days[@int_cast(usize, d)], date[0..6], time, date[7..]);
+}
+
+// -----------------------------------------------------------------------------
+// The predefined macros
+// -----------------------------------------------------------------------------
+fn two(v: i64) []u8 {
+    if v < 10 {
+        return u.cat2("0", u.dec(v));
+    }
+    return u.dec(v);
+}
+
+// __DATE__ and __TIME__ for a time in seconds since 1970 (UTC).
+fn date_time(secs: i64, date: *mut []u8, time: *mut []u8) void {
+    let mut days = secs / 86400;
+    let mut rem = secs % 86400;
+    if rem < 0 {
+        rem += 86400;
+        days -= 1;
+    }
+    // the civil date of a day count
+    let z = days + 719468;
+    let mut era = z / 146097;
+    if z < 0 {
+        era = (z - 146096) / 146097;
+    }
+    let doe = z - (era * 146097);
+    let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365;
+    let mut y = yoe + (era * 400);
+    let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100));
+    let mp = ((5 * doy) + 2) / 153;
+    let d = doy - (((153 * mp) + 2) / 5) + 1;
+    let mut mo = mp + 3;
+    if mp >= 10 {
+        mo = mp - 9;
+    }
+    if mo <= 2 {
+        y += 1;
+    }
+    let mut dd = u.dec(d);
+    if d < 10 {
+        dd = u.cat2(" ", dd);
+    }
+    date.* = u.f3("%s %s %s", MONTHS[@int_cast(usize, mo - 1)], dd, u.dec(y));
+    time.* = u.f3("%s:%s:%s", two(rem / 3600), two((rem / 60) % 60), two(rem % 60));
+}
+
+fn add_builtin(P: *mut PP, name: []u8, b: i32) void {
+    let m = u.new.[Macro]();
+    m.name = u.intern(name);
+    m.builtin = b;
+    m.protected = true;
+    m.params = u.nil_slice.[[]u8]();
+    m.body = u.nil_slice.[lx.PTok]();
+    P.macros.put(m.name, m);
+}
+
+fn build_date_time(date: bool) []u8 {
+    if g_date.len == 0 {
+        let mut secs = u.wall_ns() / 1000000000;
+        let sde = u.env("SOURCE_DATE_EPOCH");
+        if not u.isnos(sde) and all_digits(sde) {
+            secs = u.atol(sde);
+        }
+        date_time(secs, &mut g_date, &mut g_time);
+    }
+    if date {
+        return g_date;
+    }
+    return g_time;
+}
+
+// The text of the predefined macros' definitions (but __DATE__ and
+// __TIME__: B_DATE).
+fn predefined_text(P: *PP) []u8 {
+    let o = P.o;
+    let std = o.std;
+    let mut b = u.Buf.init();
+    b.s("#define __STDC__ 1\n");
+    if o.system_lib {
+        b.s("#define __AXIOM_SYSTEM_C_LIB__ 1\n");
+    }
+    if std >= co.C95 {
+        b.s(u.f1("#define __STDC_VERSION__ %sL\n", u.dec(co.stdc_version(std))));
+    }
+    if std >= co.C99 {
+        // (hosted unless --c-freestanding: the C library is linked, 4p6)
+        b.s(u.f1("#define __STDC_HOSTED__ %s\n", u.pick(o.hosted, "1", "0")));
+        if o.hosted and not o.system_lib and not tg.is_wasm() {
+            // Annex F (IEC 60559 binary floating-point arithmetic) and Annex G
+            // (complex arithmetic) hold where the target has a floating-point
+            // environment and the library is ours (docs/c-conformance.md,
+            // "Annexes F, G and H"): not on WebAssembly, which has no rounding
+            // modes and no exception flags, nor with the system's C library
+            b.s("#define __STDC_IEC_559__ 1\n#define __STDC_IEC_559_COMPLEX__ 1\n");
+            if std >= co.C23 {
+                b.s("#define __STDC_IEC_60559_BFP__ 202311L\n#define __STDC_IEC_60559_COMPLEX__ 202311L\n");
+            }
+        }
+        if o.hosted and (o.wchar_bits == 32) {
+            // (6.10.8.2: every character of ISO/IEC 10646 is a wchar_t of its
+            // code point; the library's classes are Unicode 15.1's, of
+            // September 2023: std/unicode. Not with a 16-bit wchar_t)
+            b.s("#define __STDC_ISO_10646__ 202309L\n");
+        }
+    }
+    if std >= co.C11 {
+        b.s("#define __STDC_UTF_16__ 1\n#define __STDC_UTF_32__ 1\n");
+        if o.hosted {
+            // (6.10.8.3: the library has Annex K's bounds-checking
+            // interfaces, which a program asks for with
+            // __STDC_WANT_LIB_EXT1__: std/c/include/axc/ext1.h)
+            b.s("#define __STDC_LIB_EXT1__ 201112L\n");
+        }
+        // (complex types are supported, and the imaginary types: Annex G's
+        // macros are above; atomics are, <stdatomic.h>, and threads, the
+        // library's <threads.h>:
+        // no __STDC_NO_ATOMICS__, __STDC_NO_COMPLEX__ or __STDC_NO_THREADS__)
+    }
+    if std >= co.C23 {
+        b.s("#define __STDC_EMBED_NOT_FOUND__ 0\n#define __STDC_EMBED_FOUND__ 1\n#define __STDC_EMBED_EMPTY__ 2\n");
+        // (the decimal floating types, their arithmetic and the library's
+        // decimal functions: C23 6.10.10.4, Annex F's decimal parts)
+        b.s("#define __STDC_IEC_60559_DFP__ 202311L\n");
+        if o.hosted and not o.system_lib {
+            // (Annex H, the interchange and extended types: H.1p2 asks for
+            // DFP or BFP, and the library's functions of the types, which
+            // the system's C library does not have: docs/c-conformance.md)
+            b.s("#define __STDC_IEC_60559_TYPES__ 202311L\n");
+        }
+    }
+    b.s("#define __AXIOM__ 1\n");
+    if o.hosted {
+        // (in every mode, C89's included, which has no __STDC_HOSTED__: the
+        // headers' test for the library's hosted part)
+        b.s("#define __AXIOM_HOSTED__ 1\n");
+    }
+    if o.gnu {
+        // (a GNU dialect: its extensions; __GNUC__ only with --c-gnu-compat,
+        // since it claims another compiler's extensions: docs/c.md)
+        b.s("#define __AXIOM_GNU__ 1\n");
+        if o.iso_names {
+            // (--c-iso-names: as a cc's -std=cNN, which keeps the extensions)
+            b.s("#define __STRICT_ANSI__ 1\n");
+        }
+        if o.gnu_compat {
+            // (--c-gnu-compat: the GNU compilers' macros, which the system's
+            // headers, build systems and programs test for their GNU paths:
+            // version 9.4.0, the first for which build systems know the
+            // options of C23, and whose features the system's headers ask for
+            // this dialect has (_FloatN, __builtin_va_arg_pack ...): docs/c.md,
+            // "GNU compatibility")
+            b.s("#define __GNUC__ 9\n#define __GNUC_MINOR__ 4\n#define __GNUC_PATCHLEVEL__ 0\n");
+            b.s(u.f1("#define __VERSION__ \"9.4.0 Compatible Axiom %s\"\n", ver.VERSION));
+            b.s(u.pick(std >= co.C99, "#define __GNUC_STDC_INLINE__ 1\n", "#define __GNUC_GNU_INLINE__ 1\n"));
+            b.s("#define __FINITE_MATH_ONLY__ 0\n");
+            // (the __sync builtins of 1 to 8 bytes, and the atomic types
+            // that are always lock-free: 2)
+            b.s("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_1 1\n#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_2 1\n");
+            b.s("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4 1\n#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_8 1\n");
+            for n in ["BOOL", "CHAR", "CHAR16_T", "CHAR32_T", "WCHAR_T", "SHORT", "INT", "LONG", "LLONG", "POINTER"] {
+                b.s(u.f1("#define __GCC_ATOMIC_%s_LOCK_FREE 2\n", n));
+            }
+            b.s("#define __GCC_ATOMIC_TEST_AND_SET_TRUEVAL 1\n");
+            if not tg.is_wasm() {
+                // (IEC 60559 arithmetic with its rounding modes and exceptions)
+                b.s("#define __GCC_IEC_559 2\n#define __GCC_IEC_559_COMPLEX 2\n");
+            }
+        }
+        // (__int128 and unsigned __int128: ctypes.ax)
+        b.s("#define __AXIOM_INT128__ 1\n");
+        // (__bf16, bfloat16, and the characteristics of its format, in
+        // <float.h>'s terms: 5.2.4.2.2; FLT_EVAL_METHOD's 0 holds for it,
+        // each operation rounded to it: cgen_half.ax)
+        b.s("#define __AXIOM_BF16__ 1\n#define __BFLT16_MANT_DIG__ 8\n#define __BFLT16_DIG__ 2\n");
+        b.s("#define __BFLT16_DECIMAL_DIG__ 4\n#define __BFLT16_MIN_EXP__ (-125)\n");
+        b.s("#define __BFLT16_MIN_10_EXP__ (-37)\n#define __BFLT16_MAX_EXP__ 128\n#define __BFLT16_MAX_10_EXP__ 38\n");
+        b.s("#define __BFLT16_MAX__ ((__bf16)3.38953138925153547590470800371487867e+38F)\n");
+        b.s("#define __BFLT16_NORM_MAX__ __BFLT16_MAX__\n");
+        b.s("#define __BFLT16_MIN__ ((__bf16)1.17549435082228750796873653722224568e-38F)\n");
+        b.s("#define __BFLT16_EPSILON__ ((__bf16)7.81250000000000000000000000000000000e-3F)\n");
+        b.s("#define __BFLT16_DENORM_MIN__ ((__bf16)9.18354961579912115600575419704879436e-41F)\n");
+        b.s("#define __BFLT16_HAS_DENORM__ 1\n#define __BFLT16_HAS_INFINITY__ 1\n#define __BFLT16_HAS_QUIET_NAN__ 1\n");
+        b.s("#define __BFLT16_IS_IEC_60559__ 0\n");
+        // (the memory orders of the __atomic builtins)
+        b.s("#define __ATOMIC_RELAXED 0\n#define __ATOMIC_CONSUME 1\n#define __ATOMIC_ACQUIRE 2\n");
+        b.s("#define __ATOMIC_RELEASE 3\n#define __ATOMIC_ACQ_REL 4\n#define __ATOMIC_SEQ_CST 5\n");
+        // (inline assembly: the template language, where there is one)
+        if tg.g_arch == tg.ARCH_X64 {
+            b.s("#define __AXIOM_ASM_X86_64__ 1\n");
+        } else if tg.g_arch == tg.ARCH_A64 {
+            b.s("#define __AXIOM_ASM_AARCH64__ 1\n");
+        } else {
+            b.s("#define __AXIOM_ASM_WASM__ 1\n");
+        }
+    } else if P.asm_ and tg.is_wasm() {
+        b.s("#define __AXIOM_ASM_WASM__ 1\n");
+    } else if P.asm_ and (tg.g_arch == tg.ARCH_X64) {
+        b.s("#define __AXIOM_ASM_X86_64__ 1\n");  // (an assembly source: its language, in any mode)
+    } else if P.asm_ and (tg.g_arch == tg.ARCH_A64) {
+        b.s("#define __AXIOM_ASM_AARCH64__ 1\n");
+    }
+    b.s(u.f1("#define __AXIOM_INT_WIDTH__ %s\n", u.idec(o.int_bits)));
+    b.s(u.f1("#define __AXIOM_LONG_WIDTH__ %s\n", u.idec(o.long_bits)));
+    b.s(u.f1("#define __AXIOM_LDBL_WIDTH__ %s\n", u.idec(o.ld_bits)));
+    b.s(u.f1("#define __AXIOM_PTR_WIDTH__ %s\n", u.idec(o.ptr_bits)));
+    b.s(u.f1("#define __AXIOM_WCHAR_WIDTH__ %s\n", u.idec(o.wchar_bits)));
+    b.s(u.f1("#define __AXIOM_WCHAR_SIGNED__ %s\n", u.pick(o.wchar_signed, "1", "0")));
+    // (which ABI's rules lay out bit-fields: 0 System V, 1 AAPCS64, 2 Windows)
+    b.s(u.f1("#define __AXIOM_BITFIELD_LAYOUT__ %s\n", u.idec(o.bitfields)));
+    // (WebAssembly, and its extensions that the C library's code chooses by)
+    if tg.is_wasm() {
+        b.s("#define __AXIOM_WASM__ 1\n");
+        if tg.has(tg.W_BULK_MEMORY) {
+            b.s("#define __AXIOM_WASM_BULK_MEMORY__ 1\n");
+        }
+        if tg.has(tg.W_EXCEPTION_HANDLING) {
+            b.s("#define __AXIOM_WASM_EXCEPTION_HANDLING__ 1\n");
+        }
+    }
+    b.s(co.type_macros_text(o));
+    // (last: the target's conventional macros, which -D, -U, #define and
+    // #undef may change: protect_all)
+    g_target_from = @truncate(u32, b.len());
+    b.s(ctg.target_macros_text(o));
+    return b.done();
+}
+
+// -D and -U, as directives.
+fn options_text(P: *PP) []u8 {
+    let mut b = u.Buf.init();
+    let mut preds = u.List.[[]u8].empty();
+    preds.push("cpu");
+    preds.push("machine");
+    preds.push("system");
+    for d in P.o.defines {
+        if d.assertion {
+            // (-A: #assert and #unassert; -A- every predicate seen so far)
+            if d.name.len == 0 {
+                for x in preds.items() {
+                    b.s(u.f1("#unassert %s\n", x));
+                }
+            } else if d.body.len == 0 {
+                b.s(u.f1("#unassert %s\n", d.name));
+            } else {
+                b.s(u.f3("#%s %s(%s)\n", u.pick(d.undef, "unassert", "assert"), d.name, d.body));
+                preds.push(d.name);
+            }
+            continue;
+        }
+        if d.undef {
+            b.s(u.f1("#undef %s\n", d.name));
+            continue;
+        }
+        // (NAME(params)=body defines a function-like macro)
+        b.s("#define ");
+        b.s(d.name);
+        b.c(' ');
+        for c in d.body {
+            if (c == '\n') or (c == '\r') {
+                b.c(' ');
+            } else {
+                b.c(c);
+            }
+        }
+        b.c('\n');
+    }
+    return b.done();
+}
+
+// The predefined macros (all defined so far) may not be defined again or
+// undefined, but for the compiler's own and the target's (ctarget.ax: not
+// the standard's, C17 6.10.8p2, and conventionally changed with -D and -U).
+fn protect_all(P: *mut PP) void {
+    let ks = @slice_from_ptr(P.macros.keys, P.macros.cap);
+    let vs = @slice_from_ptr(P.macros.vals, P.macros.cap);
+    for k in 0..P.macros.cap {
+        if (ks[k] != 0) and u.notnil(vs[k]) and not u.starts(vs[k].name, "__AXIOM") {
+            let sp = vs[k].span;
+            if (vs[k].builtin != 0) or (sp.file != g_builtin_file) or (sp.start < g_target_from) {
+                vs[k].protected = true;
+            }
+        }
+    }
+}

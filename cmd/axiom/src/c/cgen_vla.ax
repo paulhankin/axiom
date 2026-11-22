@@ -1,10 +1,10 @@
 // =============================================================================
 // cgen_vla.ax - IR generation for variable length arrays (csema_vla.ax): the
 // lengths of their types, sizes known at run time, and the stack space of
-// automatic ones.
+// automatic ones. Part of cgen.ax.
 //
 // A variable length array type's length (its CType's vexpr) is evaluated
-// where its declarator is reached (eval_declarator: a declaration, a
+// where its declarator is reached (vla_eval_declarator: a declaration, a
 // function definition's parameters, the type name of a cast or sizeof) and
 // kept in a slot of the function's frame, which every use of the type then
 // reads: so a type keeps the length it had when it was declared.
@@ -25,52 +25,35 @@
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
 import "cgen_debug.ax" as cdbg;
 import "ctypes.ax" as cty;
 
-struct State {
+struct VlaState {
     lens: u.SymMap.[*mut ir.Value],  // a length's slot, by its expression's address
     chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope (nil: a cleanup's place)
     calls: u.List.[*mut cast.Expr],  // for each place in chain, a cleanup's call (nil: an allocation's)
     cut: i32,  // while the cleanup at this place is called: the places before it (else -1)
 }
 
-/// Generates an expression (cgen_expr.rv; set by cgen_stmt.ax).
-pub let mut gen_expr: fn(*mut cast.Expr) *mut ir.Value = no_expr;
-
-fn no_expr(e: *mut cast.Expr) *mut ir.Value {
-    _ = e;
-    return ir.vnil();
-}
-
-let mut VS: *mut State = @ptr_from_int(*mut State, 0);
-
-fn key(p: *void) []u8 {
+fn vla_key(p: *void) []u8 {
     return u.addr_key(@int_from_ptr(p));
 }
 
-/// Starts a function's body.
-pub fn begin_function() void {
-    VS = u.new.[State]();
+// Starts a function's body.
+fn vla_begin_function() void {
+    VS = u.new.[VlaState]();
     VS.cut = -1;
     VS.lens = u.SymMap.[*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Value](), cap: 0, len: 0 };
-}
-
-fn none() []mut *mut ir.Value {
-    let xs = u.newn.[*mut ir.Value](1);
-    return xs[0..0];
 }
 
 // -----------------------------------------------------------------------------
 // Lengths and sizes
 // -----------------------------------------------------------------------------
 
-/// Evaluates the lengths of the variable length arrays declarator d makes
-/// of type t (d's own derivations: what its declaration specifiers give was
-/// evaluated where that was declared), in the order they are written; ev
-/// is an expression's value (cgen_expr.rv).
-pub fn eval_declarator(d: *cast.Declarator, t0: *mut cty.CType, ev: fn(*mut cast.Expr) *mut ir.Value) void {
+// Evaluates the lengths of the variable length arrays declarator d makes
+// of type t (d's own derivations: what its declaration specifiers give was
+// evaluated where that was declared), in the order they are written.
+fn vla_eval_declarator(d: *cast.Declarator, t0: *mut cty.CType) void {
     let mut t = t0;
     for k in 0..d.derivs.len {
         let dv = d.derivs.at(k);
@@ -82,17 +65,17 @@ pub fn eval_declarator(d: *cast.Declarator, t0: *mut cty.CType, ev: fn(*mut cast
             return;  // (a parameter's array adjusted to a pointer)
         }
         if t.vla and not u.isvnil(t.vexpr) {
-            set_len(t, ev(@ptr_cast(*mut cast.Expr, t.vexpr)));
+            vla_set_len(t, rv(@ptr_cast(*mut cast.Expr, t.vexpr)));
         }
         t = t.elem;
     }
 }
 
-/// Evaluates what the typeof specifiers among declaration specifiers ds
-/// (C23 6.7.2.5) say is variably modified: a type name's lengths (ev, as
-/// in eval_declarator), an expression (evx: evaluated for its effects).
-/// Other types in them were evaluated where they were declared.
-pub fn eval_specs(ds: *cast.DeclSpec, ev: fn(*mut cast.Expr) *mut ir.Value, evx: fn(*mut cast.Expr) void) void {
+// Evaluates what the typeof specifiers among declaration specifiers ds
+// (C23 6.7.2.5) say is variably modified: a type name's lengths, or an
+// expression evaluated for its effects. Other types in them were evaluated
+// where they were declared.
+fn vla_eval_specs(ds: *cast.DeclSpec) void {
     if u.isnil(ds) {
         return;
     }
@@ -102,141 +85,122 @@ pub fn eval_specs(ds: *cast.DeclSpec, ev: fn(*mut cast.Expr) *mut ir.Value, evx:
         }
         if u.notnil(s.tname) {
             if u.notnil(s.tname.ty) and cty.is_vm(s.tname.ty) {
-                eval_specs(s.tname.specs, ev, evx);
-                eval_declarator(s.tname.decl, s.tname.ty, ev);
+                vla_eval_specs(s.tname.specs);
+                vla_eval_declarator(s.tname.decl, s.tname.ty);
             }
         } else if u.notnil(s.e) and u.notnil(s.e.ty) and cty.is_vm(s.e.ty) {
-            evx(s.e);
+            effects(s.e);
         }
     }
 }
 
-/// Evaluates the lengths of the variable length arrays type name tn makes.
-pub fn eval_type_name(tn: *mut cast.TypeName, ev: fn(*mut cast.Expr) *mut ir.Value, evx: fn(*mut cast.Expr) void) void {
-    eval_specs(tn.specs, ev, evx);
-    eval_declarator(tn.decl, tn.ty, ev);
+// Evaluates the lengths of the variable length arrays type name tn makes.
+fn vla_eval_type_name(tn: *mut cast.TypeName) void {
+    vla_eval_specs(tn.specs);
+    vla_eval_declarator(tn.decl, tn.ty);
 }
 
-/// The address of the slot of the length of a variable length array type
-/// that an enclosing function evaluates (cgen_nest.outer_len; set by
-/// cgen_stmt.ax), or nil.
-pub let mut outer_len: fn(*void) *mut ir.Value = no_outer;
-
-fn no_outer(n: *void) *mut ir.Value {
-    _ = n;
-    return ir.vnil();
-}
-
-/// The address of the slot of length n (a CType.vexpr) in the function
-/// being generated.
-pub fn len_addr(n: *mut void) *mut ir.Value {
-    let k = key(n);
+// The address of the slot of length n (a CType.vexpr) in the function
+// being generated.
+fn vla_len_addr(n: *mut void) *mut ir.Value {
+    let k = vla_key(n);
     let mut s = VS.lens.get(k);
     if u.isnil(s) {
-        s = cg.alloca(cty.t_size, "vla.len");
-        cdbg.note_vla_len(s);
+        s = alloca(cty.t_size, "vla.len");
+        cdbg.note_vla_len(n, s);
         VS.lens.put(k, s);
     }
     return s;
 }
 
-fn slot(t: *cty.CType) *mut ir.Value {
-    let k = key(t.vexpr);
+fn vla_slot(t: *cty.CType) *mut ir.Value {
+    let k = vla_key(t.vexpr);
     let mut s = VS.lens.get(k);
     if u.isnil(s) {
         let o = outer_len(t.vexpr);  // (an enclosing function's, in a nested function)
         if u.notnil(o) {
             return o;
         }
-        s = cg.alloca(cty.t_size, "vla.len");
-        cdbg.note_vla_len(s);
+        s = alloca(cty.t_size, "vla.len");
+        cdbg.note_vla_len(t.vexpr, s);
         VS.lens.put(k, s);
     }
     return s;
 }
 
-/// The object holding the length of variable length array type t, if one
-/// was made in the function (nil: none).
-pub fn len_slot(t: *cty.CType) *mut ir.Value {
-    if u.isnil(VS) or u.isvnil(t.vexpr) {
-        return ir.vnil();
-    }
-    return VS.lens.get(key(t.vexpr));
-}
-
-fn set_len(t: *cty.CType, v: *mut ir.Value) void {
-    _ = ir.store(cg.B, v, slot(t));
+fn vla_set_len(t: *cty.CType, v: *mut ir.Value) void {
+    _ = ir.store(B, v, vla_slot(t));
 }
 
 // The length of variable length array type t (as a pointer-sized integer).
-fn len(t: *cty.CType) *mut ir.Value {
+fn vla_len(t: *cty.CType) *mut ir.Value {
     if not t.vla {
-        return cg.usz(t.len);
+        return usz(t.len);
     }
     if u.isvnil(t.vexpr) {
         u.die("internal compiler error (C front end): the length of an array of unspecified size ([*]) is used");
     }
-    return ir.load(cg.B, cg.T_isz, slot(t));
+    return ir.load(B, T_isz, vla_slot(t));
 }
 
-/// The size of an object of type t, in bytes, as a pointer-sized integer:
-/// a constant unless t is a variable length array type.
-pub fn size_value(t: *cty.CType) *mut ir.Value {
+// The size of an object of type t, in bytes, as a pointer-sized integer:
+// a constant unless t is a variable length array type.
+fn vla_size_value(t: *cty.CType) *mut ir.Value {
     if cty.is_void(t) or cty.is_func(t) {
-        return cg.usz(1);  // (a GNU dialect's arithmetic on pointers to them: csema_expr.ax)
+        return usz(1);  // (a GNU dialect's arithmetic on pointers to them: csema_expr.ax)
     }
     if not cty.is_vla(t) {
-        return cg.usz(cty.size_of(t));
+        return usz(cty.size_of(t));
     }
-    let es = size_value(t.elem);
-    let n = len(t);
+    let es = vla_size_value(t.elem);
+    let n = vla_len(t);
     if ir.is_cint(es) and (ir.cint_val(es) == 1) {
         return n;
     }
-    return ir.mul(cg.B, n, es);
+    return ir.mul(B, n, es);
 }
 
 // -----------------------------------------------------------------------------
 // Stack space
 // -----------------------------------------------------------------------------
 
-/// The number of automatic variable length arrays in scope.
-pub fn depth() i32 {
+// The number of automatic variable length arrays in scope.
+fn vla_depth() i32 {
     return @int_cast(i32, VS.chain.len);
 }
 
-/// Allocates an object of variable length array type t, aligned to al
-/// (its type's alignment, or an alignment specifier's); its address.
-pub fn allocate(t: *cty.CType, al: u64) *mut ir.Value {
-    let size = size_value(t);
-    VS.chain.push(ir.intr(cg.B, ir.IN_STACK_SAVE, cg.T_ptr, none()));
+// Allocates an object of variable length array type t, aligned to al
+// (its type's alignment, or an alignment specifier's); its address.
+fn vla_allocate(t: *cty.CType, al: u64) *mut ir.Value {
+    let size = vla_size_value(t);
+    VS.chain.push(ir.intr(B, ir.IN_STACK_SAVE, T_ptr, no_vals()));
     VS.calls.push(u.nil.[cast.Expr]());
     let mut n = size;
     if al > 16 {
-        n = ir.add(cg.B, n, cg.usz(al - 16));  // (the stack keeps 16 bytes' alignment)
+        n = ir.add(B, n, usz(al - 16));  // (the stack keeps 16 bytes' alignment)
     }
     let mut args: [1]*mut ir.Value = [n];
-    let mut p = ir.intr(cg.B, ir.IN_STACK_ALLOC, cg.T_ptr, args[..]);
+    let mut p = ir.intr(B, ir.IN_STACK_ALLOC, T_ptr, args[..]);
     if al > 16 {
-        let a = ir.ptrtoint(cg.B, p, cg.T_isz);
-        let off = ir.and_(cg.B, ir.sub(cg.B, cg.usz(0), a), cg.usz(al - 1));
-        p = ir.ptradd(cg.B, p, off);
+        let a = ir.ptrtoint(B, p, T_isz);
+        let off = ir.and_(B, ir.sub(B, usz(0), a), usz(al - 1));
+        p = ir.ptradd(B, p, off);
     }
     return p;
 }
 
-/// An object with a cleanup comes in scope: its call (typed: csema_gnu.ax)
-/// is made when the scope is left.
-pub fn push_cleanup(call: *mut cast.Expr) void {
+// An object with a cleanup comes in scope: its call (typed: csema_gnu.ax)
+// is made when the scope is left.
+fn vla_push_cleanup(call: *mut cast.Expr) void {
     VS.chain.push(ir.vnil());
     VS.calls.push(call);
 }
 
-/// Releases the allocations beyond the first d in scope, and makes the
-/// cleanups' calls among them, the innermost first (before a jump to where
-/// only those are, at the end of a block, or before a return: d 0).
-pub fn release_to(d: i32) void {
-    if (depth() <= d) or cg.terminated() {
+// Releases the allocations beyond the first d in scope, and makes the
+// cleanups' calls among them, the innermost first (before a jump to where
+// only those are, at the end of a block, or before a return: d 0).
+fn vla_release_to(d: i32) void {
+    if (vla_depth() <= d) or terminated() {
         return;
     }
     let mut k = VS.chain.len;
@@ -246,9 +210,9 @@ pub fn release_to(d: i32) void {
         if u.notnil(c) {
             let oc = VS.cut;
             VS.cut = @int_cast(i32, k);  // (its own scope is left: snapshot)
-            _ = gen_expr(c);
+            _ = rv(c);
             VS.cut = oc;
-            if cg.terminated() {
+            if terminated() {
                 return;  // (a cleanup that does not return)
             }
         }
@@ -258,24 +222,24 @@ pub fn release_to(d: i32) void {
         let sp = VS.chain.get(j);
         if u.notnil(sp) {
             let mut args: [1]*mut ir.Value = [sp];
-            _ = ir.intr(cg.B, ir.IN_STACK_RESTORE, cg.T_void, args[..]);
+            _ = ir.intr(B, ir.IN_STACK_RESTORE, T_void, args[..]);
             return;
         }
     }
 }
 
-/// Leaves the scope of the allocations beyond the first d (the end of
-/// their block, as generated).
-pub fn leave(d: i32) void {
-    release_to(d);
-    while depth() > d {
+// Leaves the scope of the allocations beyond the first d (the end of
+// their block, as generated).
+fn vla_leave(d: i32) void {
+    vla_release_to(d);
+    while vla_depth() > d {
         _ = VS.chain.pop();
         _ = VS.calls.pop();
     }
 }
 
-/// Are there cleanups in scope (a return must make their calls)?
-pub fn has_cleanups() bool {
+// Are there cleanups in scope (a return must make their calls)?
+fn vla_has_cleanups() bool {
     for c in VS.calls.items() {
         if u.notnil(c) {
             return true;
@@ -285,18 +249,18 @@ pub fn has_cleanups() bool {
 }
 
 // What is in scope at a point, kept (a non-local goto's: cgen_nest.ax).
-struct Saved {
+struct VlaSaved {
     chain: []mut *mut ir.Value,
     calls: []mut *mut cast.Expr,
 }
 
-/// The places in scope here (inside a cleanup's call, those before it).
-pub fn snapshot() *mut void {
+// The places in scope here (inside a cleanup's call, those before it).
+fn vla_snapshot() *mut void {
     let mut n = VS.chain.len;
     if (VS.cut >= 0) and (@int_cast(usize, VS.cut) < n) {
         n = @int_cast(usize, VS.cut);
     }
-    let x = u.new.[Saved]();
+    let x = u.new.[VlaSaved]();
     x.chain = u.newn.[*mut ir.Value](n + 1)[0..n];
     x.calls = u.newn.[*mut cast.Expr](n + 1)[0..n];
     for i in 0..n {
@@ -306,9 +270,9 @@ pub fn snapshot() *mut void {
     return @ptr_cast(*mut void, x);
 }
 
-/// Makes snapshot x what is in scope (to generate a jump from there).
-pub fn restore(x0: *mut void) void {
-    let x = @ptr_cast(*mut Saved, x0);
+// Makes snapshot x what is in scope (to generate a jump from there).
+fn vla_restore(x0: *mut void) void {
+    let x = @ptr_cast(*mut VlaSaved, x0);
     VS.chain.clear();
     VS.calls.clear();
     for i in 0..x.chain.len {
@@ -317,11 +281,11 @@ pub fn restore(x0: *mut void) void {
     }
 }
 
-/// Is what snapshot a has in scope the first of what snapshot b has: may a
-/// goto jump from b's point to a's without entering a scope (6.8.6.1p1)?
-pub fn is_prefix(a0: *mut void, b0: *mut void) bool {
-    let a = @ptr_cast(*mut Saved, a0);
-    let b = @ptr_cast(*mut Saved, b0);
+// Is what snapshot a has in scope the first of what snapshot b has: may a
+// goto jump from b's point to a's without entering a scope (6.8.6.1p1)?
+fn vla_is_prefix(a0: *mut void, b0: *mut void) bool {
+    let a = @ptr_cast(*mut VlaSaved, a0);
+    let b = @ptr_cast(*mut VlaSaved, b0);
     if a.chain.len > b.chain.len {
         return false;
     }

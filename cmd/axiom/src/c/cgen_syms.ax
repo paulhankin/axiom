@@ -1,0 +1,484 @@
+// =============================================================================
+// cgen_syms.ax - Symbol names, C function/object IR declarations, aliases,
+// indirect functions, and GNU function/allocator attributes (part of cgen.ax).
+// =============================================================================
+import "../dbginfo.ax" as dbi;
+import "../diag.ax" as dg;
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen_abi.ax" as abi;
+import "cgen_debug.ax" as cdbg;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+fn is_darwin_inode64(n: []u8) bool {
+    for f in DARWIN_INODE64 {
+        if u.str_eq(f, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The symbol name of an entity: its own with external linkage (main's is
+// MAIN_SYMBOL), else made unique.
+pub fn symbol_name(s: *cast.CSym) []u8 {
+    if (s.linkage == cast.LK_EXTERNAL) and not ((s.kind == cast.SK_FUNC) and cs.is_inline_def(s)) {
+        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") and (g_obj_main.len > 0) and not g_obj_main_start {
+            return g_obj_main;  // (an object's main: cc.ax, set_object_main)
+        }
+        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") {
+            return MAIN_SYMBOL;
+        }
+        if s.asm_name.len > 0 {
+            if tg.is_darwin() {
+                // On Darwin __USER_LABEL_PREFIX__ is "_", so system headers
+                // write asm("_fopen") or asm("_fopen$DARWIN_EXTSN"). Strip a
+                // plain leading '_' so it matches unsuffixed C declarations,
+                // mark suffixed "_foo$..." names with '\x01' so macho.ax and
+                // mlink.ax emit them verbatim, and leave unprefixed names to
+                // normal Mach-O '_' mangling.
+                if s.asm_name[0] == 1 {
+                    return s.asm_name;
+                }
+                if (s.asm_name.len > 1) and (s.asm_name[0] == '_') {
+                    if (u.find(s.asm_name, '$') < 0) and
+                       not ((tg.g_arch == tg.ARCH_X64) and is_darwin_inode64(s.asm_name[1..])) {
+                        return s.asm_name[1..];
+                    }
+                    return u.cat2("\x01", s.asm_name);
+                }
+            }
+            return s.asm_name;  // (a GNU dialect's asm label)
+        }
+        return s.name;
+    }
+    return u.f2("%s.%s", s.name, u.idec(s.uid));
+}
+
+/// The parameter types of function s's IR signature: its definition's
+/// parameters (promoted, for a definition with an identifier list: the
+/// arguments arrive so), or its type's (a declaration with a prototype).
+pub fn param_types(s: *mut cast.CSym) []mut *mut cty.CType {
+    if u.notnil(s.def) {
+        let dt = s.def.decls.get(0).ty;
+        let kr = u.notnil(dt) and (dt.kind == cty.TK_FUNCTION) and dt.kr;
+        let n = s.params.len;
+        let ts = u.newn.[*mut cty.CType](n + 1);
+        for i in 0..n {
+            ts[i] = cty.unqual(s.params.get(i).ty);
+            if kr {
+                ts[i] = cty.arg_promote(ts[i]);
+            }
+        }
+        return ts[0..n];
+    }
+    return s.ty.params;
+}
+
+/// Function s's signature (nil ty: a function without a prototype that is
+/// not defined, whose signature comes from its calls).
+pub fn func_sig(s: *mut cast.CSym) Sig {
+    if not s.ty.proto and u.isnil(s.def) {
+        return Sig.{ ty: u.nil.[ir.Ty](), plan: u.nil.[abi.Plan]() };
+    }
+    let ps = param_types(s);
+    if u.notnil(s.nest_parent) {
+        // (a nested function: its chain after its arguments, cgen_nest.ax;
+        // a variadic one's IR function takes, before it, the address of its
+        // entry's va_list instead of variable arguments)
+        let mut sig = sig_of(s.ty.ret, ps, ps.len, false, u.notnil(s.def));
+        if s.ty.variadic {
+            let ps2 = u.newn.[*mut cty.CType](ps.len + 2);
+            for i in 0..ps.len {
+                ps2[i] = ps[i];
+            }
+            ps2[ps.len] = cty.pointer_to(cty.t_void);
+            sig = sig_of(s.ty.ret, ps2[0..ps.len + 1], ps.len + 1, false, u.notnil(s.def));
+        }
+        abi.add_chain(sig.plan);
+        return Sig.{ ty: sig.plan.fty, plan: sig.plan };
+    }
+    return sig_of(s.ty.ret, ps, ps.len, s.ty.variadic, u.notnil(s.def));
+}
+
+/// The IR function of C function s; `sig`: the signature to declare it
+/// with if it has none of its own (a call's, without a prototype).
+pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
+    if not u.isvnil(s.ir) {
+        return @ptr_cast(*mut ir.Func, s.ir);
+    }
+    let target = alias_target(s);
+    if u.notnil(target) {
+        let tf = func_of(target, sig0);
+        s.ir = @ptr_cast(*mut void, tf);
+        return tf;
+    }
+    let mut sig = func_sig(s);
+    if u.isnil(sig.ty) {
+        sig = sig0;
+    }
+    if u.isnil(sig.ty) {
+        // (the address of a function without a prototype that this unit
+        // neither defines nor has called yet: a declaration of no
+        // parameters; a call converts, as through any function pointer)
+        sig = Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), plan: u.nil.[abi.Plan]() };
+    }
+    let name = symbol_name(s);
+    let mut f = ir.get_function(M, name);
+    if u.notnil(f) and not ir.is_decl(f) and (c_functions.get(u.intern(name)) == 0) {
+        if u.notnil(s.def) or (s.linkage != cast.LK_EXTERNAL) {
+            _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
+            f = u.nil.[ir.Func]();
+        } else {
+            // a function C declares and Axiom code defines (an `export fn`,
+            // docs/c.md "C and Axiom in one program"): calls are to it, with
+            // the C signature, which the boundary types make the same ABI
+            s.ir = @ptr_cast(*mut void, f);
+            return f;
+        }
+    }
+    // (another unit's function of the same name is the same: cc.ax has
+    // checked that only one unit defines it)
+    c_functions.put(u.intern(name), 1);
+    if (tg.g_debug != tg.DEBUG_NONE) and not u.str_eq(name, s.name) {
+        dbi.note_func_name(name, s.name);
+    }
+    if u.isnil(f) {
+        f = ir.add_function(M, name, sig.ty);
+    } else if u.notnil(s.def) and ir.is_decl(f) {
+        // a declaration (another unit's, or an Axiom extern "C" one) of the
+        // function this unit defines: the definition's signature, whose
+        // parameters may differ (a variadic definition's save area)
+        ir.retype_decl(f, sig.ty);
+        f.import_module = u.nosym();
+        f.import_name = u.nosym();
+    } else if ir.is_decl(f) {
+        // (another declaration: a function already defined keeps its own)
+        ir.retype_decl(f, sig.ty);
+    }
+    cdbg.note_func(f, s);
+    if (s.linkage != cast.LK_EXTERNAL) or cs.is_inline_def(s) {
+        // (an inline definition is for this unit only: 6.7.4p7)
+        f.linkage = ir.LINK_INTERNAL;
+    }
+    if u.str_eq(name, MAIN_SYMBOL) {
+        f.linkage = ir.LINK_INTERNAL;
+    } else if s.weak and u.notnil(s.def) and (f.linkage != ir.LINK_INTERNAL) {
+        f.linkage = ir.LINK_WEAK;  // (kept: no unit has another definition; an object's users may)
+    }
+    if u.notnil(sig.plan) and (ir.is_decl(f) or u.notnil(s.def)) {
+        mark_func(f, sig.plan);
+    }
+    if u.isnil(s.def) and is_wasm and (s.linkage == cast.LK_EXTERNAL) and not s.weak {
+        // a function the program does not define: the host's (not a weak
+        // reference's, which is null when nothing defines it: wlink.ax)
+        f.import_module = "env";
+        f.import_name = name;
+    }
+    gnu_func(s, f);
+    if u.notnil(sig.plan) {
+        alloc_facts(s, f, sig.plan);
+    }
+    if u.isnil(s.def) and (s.linkage == cast.LK_EXTERNAL) and tg.is_windows() {
+        c_library_import(name);
+    }
+    s.ir = @ptr_cast(*mut void, f);
+    return f;
+}
+
+/// On Windows, a function C code declares and no unit defines is the C
+/// library's (or a system DLL's, by its name): the linker reads a constant
+/// axiom.import.<name> holding "c" (cmd/axiom/src/plink.ax). A unit that
+/// defines the function makes the constant unused.
+pub fn c_library_import(name: []u8) void {
+    let gname = u.cat2("axiom.import.", name);
+    if u.notnil(ir.get_global(M, gname)) {
+        return;
+    }
+    let g = ir.add_global(M, ir.t_array(T_i8, 2), gname);
+    g.init = ir.cstring("c");
+    g.linkage = ir.LINK_LINKONCE;
+    g.is_const = true;
+    g.align = 1;
+}
+
+/// Is object s one of a DLL's (Windows): external, and defined by no unit?
+/// Code reaches it through its import address table slot, as through a
+/// GOT (an external global's address is loaded: x64.ax), which plink.ax
+/// fills with the address of the DLL's object; c_library_import names the
+/// DLL (the C library's, or a system DLL's by the name's rules).
+pub fn dll_object(s: *cast.CSym) bool {
+    return tg.is_windows() and (s.linkage == cast.LK_EXTERNAL) and not defined_here(s.name);
+}
+
+/// The address of object s (with static storage duration).
+pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
+    if not u.isvnil(s.ir) {
+        return @ptr_cast(*mut ir.Value, s.ir);
+    }
+    let target = alias_target(s);
+    if u.notnil(target) {
+        let tv = object_addr(target);
+        s.ir = @ptr_cast(*mut void, tv);
+        return tv;
+    }
+    let name = symbol_name(s);
+    let mut g = ir.get_global(M, name);
+    if u.isnil(g) {
+        g = ir.add_global(M, lty(s.ty), name);
+    }
+    if dll_object(s) {
+        c_library_import(name);
+    }
+    g.align = object_align(s);
+    if s.linkage != cast.LK_EXTERNAL {
+        g.linkage = ir.LINK_INTERNAL;
+    } else if s.weak and s.defined {
+        g.linkage = ir.LINK_WEAK;  // (as a function's: func_of)
+    }
+    if ((s.flags & cast.CF_THREAD_LOCAL) != 0) and not is_wasm {
+        // (thread storage duration: on WebAssembly, cgen_tls.ax)
+        g.tls = true;
+    }
+    let n = cs.note_of(s);
+    if u.notnil(n) {
+        if n.weak and (s.linkage == cast.LK_EXTERNAL) and not s.defined and not defined_here(s.name) {
+            g.linkage = ir.LINK_EXTWEAK;  // a weak reference: no unit defines it (a weak definition: s.weak)
+        }
+        if n.section.len > 0 {
+            g.section = u.perm_dup(n.section);  // (the syntax tree is given back before code generation)
+            if u.starts(n.section, ".init_array") or u.starts(n.section, ".fini_array") or
+               u.starts(n.section, ".preinit_array") or u.contains(n.section, "__mod_init_func") or
+               u.contains(n.section, "__mod_term_func") {
+                g_init_arrays = true;
+            }
+        }
+        g.visibility = @truncate(u8, @bit_cast(u32, n.visibility));  // (for the object writers)
+        if n.used and s.defined {
+            keep(g.val);
+        }
+    }
+    s.ir = @ptr_cast(*mut void, g.val);
+    return g.val;
+}
+
+// -----------------------------------------------------------------------------
+// The GNU dialects' attributes of functions and objects (csema_gnu.ax)
+// -----------------------------------------------------------------------------
+
+// The entity s is another name for (alias("target")), or nil. The target
+// is defined in the same unit (else C3090); references to s are to it, and
+// s has no symbol of its own.
+fn alias_target(s: *mut cast.CSym) *mut cast.CSym {
+    let n = cs.note_of(s);
+    if u.isnil(n) or (n.alias.len == 0) {
+        return u.nil.[cast.CSym]();
+    }
+    let t = g_defs.get(n.alias);
+    if u.isnil(t) or (t == s) or (t.kind != s.kind) {
+        _ = dg.err(n.alias_span, "C3090",
+                   u.f1("the target of the alias, '%s', is not a function or object of the same kind defined in this translation unit",
+                        n.alias));
+        n.alias = "";
+        return u.nil.[cast.CSym]();
+    }
+    return t;
+}
+
+// An alias of external linkage (the attribute alias, a GNU dialect) is a
+// symbol of its own at its target's place, which other units' references to
+// its name are references to (ir.Alias).
+fn note_alias(s: *mut cast.CSym) void {
+    let n = cs.note_of(s);
+    if u.notnil(n) and (n.ifunc.len > 0) {
+        note_ifunc(s, n);
+        return;
+    }
+    if u.isnil(n) or (n.alias.len == 0) or (s.linkage != cast.LK_EXTERNAL) {
+        return;
+    }
+    let mut tv = u.nil.[ir.Value]();
+    if s.kind == cast.SK_FUNC {
+        tv = func_of(s, func_sig(s)).val;
+    } else {
+        tv = object_addr(s);
+    }
+    if n.alias.len > 0 {
+        ir.add_alias(M, symbol_name(s), tv, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
+    }
+}
+
+// An indirect function (the attribute ifunc): its name is a symbol of
+// type STT_GNU_IFUNC at its resolver, a function the unit defines (else
+// C3090), whose result the linker's start-up or the dynamic linker makes
+// the function's address (ir.Alias.ifunc); calls and addresses are the
+// name's, which the function's declaration stays.
+fn note_ifunc(s: *mut cast.CSym, n: *mut cs.Note) void {
+    let t = g_defs.get(n.ifunc);
+    if u.isnil(t) or (t == s) or (t.kind != cast.SK_FUNC) or u.isnil(t.def) {
+        _ = dg.err(n.alias_span, "C3090",
+                   u.f1("the resolver of the indirect function, '%s', is not a function defined in this translation unit",
+                        n.ifunc));
+        return;
+    }
+    if u.notnil(s.def) {
+        _ = dg.err(n.alias_span, "C3090", u.f1("the indirect function '%s' has a body: its resolver is its definition",
+                                               s.name));
+        return;
+    }
+    let tf = func_of(t, func_sig(t));
+    ir.add_ifunc(M, symbol_name(s), tf.val, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
+}
+
+// The IR function f of C function s: what its GNU attributes ask, and
+// C23's unsequenced and reproducible (cs.fx_of).
+fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
+    let mut fx = cs.fx_of(s);
+    let n = cs.note_of(s);
+    // const and pure: ir.Func.fx, the promise of a function that returns
+    // (not one declared not to: cs.is_noreturn, which ir.call_fx would
+    // see only once the IR's noreturn is set)
+    if u.notnil(n) and not cs.is_noreturn(s) {
+        if n.is_const {
+            fx = ir.FX_NONE;
+        } else if n.is_pure and (fx == ir.FX_ANY) {
+            fx = ir.FX_READS;
+        }
+    }
+    f.fx = @max(f.fx, fx_by_abi(s.ty, fx));
+    if u.isnil(n) {
+        return;
+    }
+    if n.noinline {
+        f.noinline = true;
+    }
+    if n.always_inline {
+        f.always_inline = true;
+    }
+    if n.cold {
+        f.cold = true;
+    }
+    if n.hot {
+        f.hot = true;
+    }
+    if n.opt_level >= 0 {
+        f.opt_override = @truncate(u8, @bit_cast(u32, n.opt_level + 1));
+    }
+    if n.target.len > 0 {
+        // (the target's extensions and these: the backends compile it so,
+        // and the inliner does not put it into code compiled for less)
+        f.features = tg.fn_features(f) | tg.parse_features(n.target).bits;
+        f.has_features = true;
+    }
+    if n.section.len > 0 {
+        f.section = u.perm_dup(n.section);  // (for the object writers; the syntax tree is given back first)
+    }
+    if n.aligned > 1 {
+        f.align = n.aligned;  // (the backends start its code there)
+    }
+    f.visibility = @truncate(u8, @bit_cast(u32, n.visibility));
+    if n.weak and (s.linkage == cast.LK_EXTERNAL) and u.isnil(s.def) and ir.is_decl(f) and not defined_here(s.name) {
+        f.linkage = ir.LINK_EXTWEAK;  // a weak reference: no unit defines it (a weak definition: s.weak, func_of)
+    }
+    if n.used and u.notnil(s.def) {
+        keep(f.val);
+    }
+}
+
+// What a call of a function of type t may be said to do (fx, ir.FX_) as the
+// platforms' calling conventions pass it: nothing for a result that is not
+// a plain scalar (a structure, union, complex or long double result may be
+// written to the caller's memory through an address that is an ordinary
+// argument in the IR, which ir.call_fx cannot tell from others); FX_READS at
+// most when a parameter is not one (it may be passed as the address of a
+// copy, which the callee reads).
+fn fx_by_abi(t: *cty.CType, fx: u8) u8 {
+    if (fx == ir.FX_ANY) or u.isnil(t) or not cty.is_func(t) or not plain_scalar(t.ret) {
+        return ir.FX_ANY;
+    }
+    for p in t.params {
+        if not plain_scalar(p) {
+            return @min(fx, ir.FX_READS);
+        }
+    }
+    return fx;
+}
+
+// An integer (no wider than 64 bits), a pointer, float or double.
+fn plain_scalar(t0: *cty.CType) bool {
+    let t = t0.unq;
+    if cty.is_pointer(t) {
+        return true;
+    }
+    if cty.is_integer(t) {
+        return cty.size_of(t) <= 8;
+    }
+    return (t == cty.t_float) or (t == cty.t_double);
+}
+
+// The IR parameter of C parameter k (from 1) of a call by plan, or -1
+// (one not passed as one scalar).
+fn ir_param(plan: *abi.Plan, k: i32) i32 {
+    if (k < 1) or (@int_cast(usize, k) > plan.args.len) {
+        return -1;
+    }
+    let a = plan.args[@int_cast(usize, k - 1)];
+    if a.kind != abi.A_SCALAR {
+        return -1;
+    }
+    return a.slot[0];
+}
+
+// What returns_nonnull, malloc, alloc_size, alloc_align and assume_aligned
+// say of function s's results (ir.Func's ret_nonnull, allocator, size_args,
+// align_arg, ret_align), for a result that is a pointer in a register.
+fn alloc_facts(s: *mut cast.CSym, f: *mut ir.Func, plan: *abi.Plan) void {
+    let n = cs.note_of(s);
+    if u.isnil(n) or (f.ty.ret.kind != ir.T_PTR) or (f.ret_ext != 0) {
+        return;
+    }
+    if n.ret_nonnull and not cs.opts().keep_null_checks {
+        f.ret_nonnull = true;
+    }
+    if n.malloc {
+        f.allocator = true;  // (gvn.fresh: an object of its own)
+    }
+    if n.alloc_size[0] > 0 {
+        let a = ir_param(plan, n.alloc_size[0]);
+        let mut b: i32 = 0;
+        if n.alloc_size[1] > 0 {
+            b = ir_param(plan, n.alloc_size[1]);
+        }
+        if (a >= 0) and (a < 127) and (b >= 0) and (b < 127) {
+            let mut second: i32 = 0;
+            if n.alloc_size[1] > 0 {
+                second = b + 1;
+            }
+            f.size_args = [@truncate(i8, a + 1), @truncate(i8, second)];
+        }
+    }
+    if n.alloc_align > 0 {
+        let a = ir_param(plan, n.alloc_align);
+        if (a >= 0) and (a < 127) {
+            f.align_arg = @truncate(i8, a + 1);
+        }
+    }
+    if n.assume_aligned > 0 {
+        f.ret_align = n.assume_aligned;
+    }
+}
+
+// Keeps the function or object at address v though nothing refers to it
+// (the attribute used): a constant holding its address refers to it.
+/// Keeps v (a function or object) in the program though no code refers to it.
+pub fn keep(v: *mut ir.Value) void {
+    g_kept += 1;
+    let g = ir.add_global(M, T_ptr, u.f1("axiom.c.used.%s", u.idec(g_kept)));
+    g.init = v;
+    g.linkage = ir.LINK_INTERNAL;
+    g.is_const = true;
+    g.align = cty.ptr_bytes;
+}

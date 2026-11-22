@@ -41,6 +41,7 @@ enum EntKind: i32 {
     COPY,   // key: base pointer, off: of the destination of val, a memcpy or memmove
     GE,     // key >= off (unsigned, off a small constant)
     CALL,   // key: a call that promises no writes (ir.call_fx), val: its result
+    CMP,    // key `pred` val holds (off: pred | mode << 8): the comparisons it decides (cmp_decides)
 }
 
 const K_EXPR: EntKind = EntKind.EXPR;
@@ -51,6 +52,7 @@ const K_FILL: EntKind = EntKind.FILL;
 const K_COPY: EntKind = EntKind.COPY;
 const K_GE: EntKind = EntKind.GE;
 const K_CALL: EntKind = EntKind.CALL;
+const K_CMP: EntKind = EntKind.CMP;
 
 struct Ent {
     kind: EntKind,
@@ -228,11 +230,22 @@ fn find_expr(i: *mut ir.Value) *mut ir.Value {
     let h = hash_expr(i);
     let mut e = bk.get(@truncate(usize, h) & (nb - 1));
     while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
+        let x = ents.at_mut(@int_cast(usize, e));
         if (x.kind == K_EXPR) and same_expr(x.key, i) {
-            return x.val;
+            break;
         }
         e = x.next;
+    }
+    // (a comparison: or a fact that decides it, whichever is the later)
+    if is_cmp_query(i) {
+        let mut d = false;
+        let f = find_cmp(ir.pred_of(i), i.a, i.b, &mut d);
+        if f > e {
+            return kb(d);
+        }
+    }
+    if e >= 0 {
+        return ents.at_mut(@int_cast(usize, e)).val;
     }
     return vnil();
 }
@@ -249,7 +262,7 @@ fn find_known(v: *mut ir.Value) *mut ir.Value {
     let h = known_hash(v);
     let mut e = bk.get(@truncate(usize, h) & (nb - 1));
     while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
+        let x = ents.at_mut(@int_cast(usize, e));
         if (x.kind == K_KNOWN) and (x.key == v) {
             return x.val;
         }
@@ -984,6 +997,10 @@ pub fn size_of(n: *ir.Value) i64 {
 // The writes of instruction i (for region summaries and the walk).
 pub fn note_writes(i: *mut ir.Value) void {
     let op = i.op;
+    // (most instructions: neither memory nor an intrinsic, nothing below applies)
+    if (op != ir.OP_INTR) and ((ir.op_props(op) & (ir.OPF_READS_MEM | ir.OPF_WRITES_MEM)) == 0) {
+        return;
+    }
     if op == ir.OP_STORE {
         if i.flags != 0 {
             push_write(W_ALL, nowhere());
@@ -1047,7 +1064,7 @@ fn find_mem(l: *mut Loc, t: *mut ir.Ty) *mut ir.Value {
     let h = mem_hash(l.base, l.off, t);
     let mut e = bk.get(@truncate(usize, h) & (nb - 1));
     while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
+        let x = ents.at_mut(@int_cast(usize, e));
         if (x.kind == K_MEM) and (x.key == l.base) and (x.off == l.off) and (x.ty == t) {
             // no possibly aliasing write since
             if (writes.len - x.height) > 256 {
@@ -1072,7 +1089,7 @@ fn find_mem(l: *mut Loc, t: *mut ir.Ty) *mut ir.Value {
 fn find_call(i: *mut ir.Value, fx: u8) *mut ir.Value {
     let mut e = bk.get(@truncate(usize, hash_expr(i)) & (nb - 1));
     while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
+        let x = ents.at_mut(@int_cast(usize, e));
         if (x.kind == K_CALL) and same_expr(x.key, i) and same_ext(x.key, i) {
             if fx == ir.FX_NONE {
                 return x.val;
@@ -1167,7 +1184,7 @@ fn fill_hash(base: *ir.Value) u64 {
 fn find_fill(l: *mut Loc) *mut ir.Value {
     let mut e = bk.get(@truncate(usize, fill_hash(l.base)) & (nb - 1));
     while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
+        let x = ents.at_mut(@int_cast(usize, e));
         if (x.kind == K_FILL) and (x.key == l.base) and (x.off <= l.off) and
            ((l.off + l.size) <= (x.off + size_of(x.val.c))) {
             if (writes.len - x.height) > 256 {
@@ -1484,12 +1501,6 @@ fn zero_since(l0: Loc) bool {
 // -----------------------------------------------------------------------------
 // Conditions
 // -----------------------------------------------------------------------------
-// Comparisons made up as keys for facts and queries: a pool that each run
-// of gvn starts again (the table they go in is cleared too).
-threadlocal let mut synth: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{
-    data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
-threadlocal let mut n_synth: usize = 0;
-
 // The constants true and false and their type, of the current run (looked
 // up once: assume makes several facts of each condition).
 threadlocal let mut g_true: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
@@ -1503,29 +1514,186 @@ fn kb(x: bool) *mut ir.Value {
     return g_false;
 }
 
-fn synth_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
-    if n_synth == synth.len {
-        synth.push(u.new.[ir.Value]());
-    }
-    let v = synth.get(n_synth);
-    n_synth += 1;
-    v.kind = ir.V_INST;
-    v.op = ir.OP_ICMP;
-    v.ty = g_i1;
-    v.cv = ir.pred_cv(p);
-    ir.set_a(v, a);
-    ir.set_b(v, b);
-    return v;
+// Facts about comparisons (K_CMP): `a p b` holds, and what that decides of
+// the comparisons of a and b (the query `x q y`) by its mode:
+//   CMP_ORDER: every comparison of a and b, in either order, that p
+//     decides (assume_order's rules: the same, the inverse and the swapped
+//     comparison, and the other orders the outcomes of p include or exclude);
+//   CMP_PAIR: `a p b` true and `a inv(p) b` false;
+//   CMP_ONE: `a p b` true;
+//   CMP_SELF: a CMP_ORDER fact whose a and b are the same value (which a
+//     path that does not run can say): the latest of the made-up
+//     comparisons the fact stands for decides (self_decides).
+// A query is answered by the latest entry that decides it, or by the
+// comparison instruction the table holds for it if that is later (find_expr):
+// one entry stands for what were a dozen made-up comparisons, each in the
+// table under its own hash.
+const CMP_ORDER: i64 = 0;
+const CMP_PAIR: i64 = 1;
+const CMP_ONE: i64 = 2;
+const CMP_SELF: i64 = 3;
+
+// (the hash is symmetric: a query in either order finds the fact)
+fn cmp_hash(ha: u64, hb: u64) u64 {
+    return mix(ha +% hb, 0x434d_5046);
 }
 
-// add_expr(synth_icmp(p, a, b), val), given hv(a) and hv(b): the hash is
-// hash_expr's of such a comparison (not commutative, no c, xs or mask).
-fn add_icmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, ha: u64, hb: u64, val: *mut ir.Value) void {
-    let key = synth_icmp(p, a, b);
+fn add_cmp(mode: i64, p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, ha: u64, hb: u64) void {
+    push_ent(K_CMP, cmp_hash(ha, hb), a, @as(i64, @int_from_enum(p)) | (mode << 8), g_i1, b);
+}
+
+fn add_one(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
+    add_cmp(CMP_ONE, p, a, b, hv(a), hv(b));
+}
+
+fn is_int_pred(p: ir.CmpPred) bool {
+    return (@int_from_enum(p) >= @int_from_enum(ir.IntEQ)) and (@int_from_enum(p) <= @int_from_enum(ir.IntSLE));
+}
+
+// Can a fact answer i, a comparison? (One of two scalar integers.)
+fn is_cmp_query(i: *ir.Value) bool {
+    if (i.op != ir.OP_ICMP) or (i.ty != g_i1) or u.notnil(i.c) or (i.xs.len != 0) {
+        return false;
+    }
+    let p = ir.pred_of(i);
+    return is_int_pred(p) and (i.cv == ir.pred_cv(p));
+}
+
+// What `a tp b` says of `a q b`: 1 true, 0 false, -1 nothing.
+fn order_decides(tp: ir.CmpPred, q: ir.CmpPred) i32 {
+    if q == tp {
+        return 1;
+    }
+    if q == ir.inv_pred(tp) {
+        return 0;
+    }
+    if (@int_from_enum(tp) > @int_from_enum(ir.IntNE)) and (@int_from_enum(q) > @int_from_enum(ir.IntNE)) and
+       (ir.is_signed_pred(q) != ir.is_signed_pred(tp)) {
+        return -1;
+    }
+    let s = outcomes(tp);
+    let o = outcomes(q);
+    if (s & o) == s {
+        return 1;
+    }
+    if (s & o) == 0 {
+        return 0;
+    }
+    return -1;
+}
+
+// What `a tp a` says of `a q a`: the made-up comparisons a CMP_ORDER fact
+// stands for were the same, the inverse, the swapped and the inverse of the
+// swapped comparison, then each other one tp decides, followed by its
+// swapped form; with both operands the same, the last of them that is q
+// decides.
+fn self_decides(tp: ir.CmpPred, q: ir.CmpPred) i32 {
+    let mut r: i32 = -1;
+    if q == tp {
+        r = 1;
+    }
+    if q == ir.inv_pred(tp) {
+        r = 0;
+    }
+    if q == ir.swap_pred(tp) {
+        r = 1;
+    }
+    if q == ir.inv_pred(ir.swap_pred(tp)) {
+        r = 0;
+    }
+    for pi in @int_from_enum(ir.IntEQ)..(@int_from_enum(ir.IntSLE) + 1) {
+        let p = @enum_from_int(ir.CmpPred, pi);
+        if (p == tp) or (p == ir.inv_pred(tp)) {
+            continue;
+        }
+        let d = order_decides(tp, p);
+        if (d >= 0) and ((q == p) or (q == ir.swap_pred(p))) {
+            r = d;
+        }
+    }
+    return r;
+}
+
+// What entry x (K_CMP) says of `a q b`: 1 true, 0 false, -1 nothing.
+fn cmp_decides(x: *Ent, q: ir.CmpPred, a: *ir.Value, b: *ir.Value) i32 {
+    let tp = @enum_from_int(ir.CmpPred, @truncate(i32, x.off & 0xff));
+    let mode = x.off >> 8;
+    if same_val(x.key, a) and same_val(x.val, b) {
+        if mode == CMP_SELF {
+            return self_decides(tp, q);
+        }
+        if mode == CMP_ORDER {
+            return order_decides(tp, q);
+        }
+        if q == tp {
+            return 1;
+        }
+        if (mode == CMP_PAIR) and (q == ir.inv_pred(tp)) {
+            return 0;
+        }
+        return -1;
+    }
+    if (mode == CMP_ORDER) and same_val(x.key, b) and same_val(x.val, a) {
+        return order_decides(tp, ir.swap_pred(q));
+    }
+    return -1;
+}
+
+// The latest fact that decides `a q b` (its index, or -1), and in *d what
+// it says.
+fn find_cmp(q: ir.CmpPred, a: *ir.Value, b: *ir.Value, d: *mut bool) i64 {
+    let mut e = bk.get(@truncate(usize, cmp_hash(hv(a), hv(b))) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at_mut(@int_cast(usize, e));
+        if x.kind == K_CMP {
+            let r = cmp_decides(x, q, a, b);
+            if r >= 0 {
+                d.* = r == 1;
+                return e;
+            }
+        }
+        e = x.next;
+    }
+    return -1;
+}
+
+// Is a known to be `a p b`? (A comparison of the table that is the same
+// as that, or a fact, whichever is the later, as find_expr finds them; and
+// not a fact fact_ok excludes.)
+fn known_cmp(p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) bool {
     let mut h = mix(@as(u64, @bit_cast(u32, ir.OP_ICMP)), @as(u64, @bit_cast(u32, g_i1.id)));
     h = mix(h, ir.pred_cv(p));
-    h = mix(mix(mix(h, ha), hb), 7);
-    push_ent(K_EXPR, h, key, 0, g_i1, val);
+    h = mix(mix(mix(h, hv(a)), hv(b)), 7);  // (hash_expr's of such a comparison)
+    let mut e = bk.get(@truncate(usize, h) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at_mut(@int_cast(usize, e));
+        if (x.kind == K_EXPR) and same_icmp(x.key, p, a, b) {
+            break;
+        }
+        e = x.next;
+    }
+    let mut d = false;
+    let f = find_cmp(p, a, b, &mut d);
+    if f > e {
+        return fact_ok(f) and d;
+    }
+    if e < 0 {
+        return false;
+    }
+    let v = ents.at_mut(@int_cast(usize, e)).val;
+    return fact_ok(e) and ir.is_cint(v) and (ir.cint_val(v) == 1);
+}
+
+// same_expr(x, i) for i the comparison `a p b` (of type i1).
+fn same_icmp(x: *mut ir.Value, p: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) bool {
+    if (x.op != ir.OP_ICMP) or (x.ty != g_i1) or (x.cv != ir.pred_cv(p)) or (x.xs.len != 0) or
+       (ir.mask_of(x).len != 0) or u.notnil(x.c) {
+        return false;
+    }
+    if not same_val(x.a, a) or not same_val(x.b, b) {
+        return false;
+    }
+    return u.isnil(x.a) or (x.a.ty == a.ty);
 }
 
 // c is known to be `val` in the current scope.
@@ -1544,13 +1712,11 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
             tp = ir.inv_pred(p);
         }
         assume_bounds(tp, c.a, c.b);
-        let ha = hv(c.a);
-        let hb = hv(c.b);
-        add_icmp(tp, c.a, c.b, ha, hb, g_true);
-        add_icmp(ir.inv_pred(tp), c.a, c.b, ha, hb, g_false);
-        add_icmp(ir.swap_pred(tp), c.b, c.a, hb, ha, g_true);
-        add_icmp(ir.inv_pred(ir.swap_pred(tp)), c.b, c.a, hb, ha, g_false);
-        assume_order(tp, c.a, c.b, ha, hb);
+        let mut mode = CMP_ORDER;
+        if same_val(c.a, c.b) {
+            mode = CMP_SELF;
+        }
+        add_cmp(mode, tp, c.a, c.b, hv(c.a), hv(c.b));
         // x > K is x >= K + 1, x >= K is x > K - 1, and so on
         if ir.is_cint(c.b) and not ir.is_const(c.a) {
             assume_adjacent(tp, c.a, c.b);
@@ -1617,33 +1783,6 @@ fn outcomes(p: ir.CmpPred) u32 {
     return 3;
 }
 
-// The other comparisons of a and b that `a tp b` decides (assume records
-// tp and its inverse): x < y makes x > y and x == y false and x != y and
-// x <= y true, in both operand orders; x == y decides every order; an
-// order of one signedness says nothing of the other's.
-fn assume_order(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value, ha: u64, hb: u64) void {
-    let s = outcomes(tp);
-    let signed = ir.is_signed_pred(tp);
-    for qi in @int_from_enum(ir.IntEQ)..(@int_from_enum(ir.IntSLE) + 1) {
-        let q = @enum_from_int(ir.CmpPred, qi);
-        if (q == tp) or (q == ir.inv_pred(tp)) {
-            continue;
-        }
-        if (@int_from_enum(tp) > @int_from_enum(ir.IntNE)) and (qi > @int_from_enum(ir.IntNE)) and
-           (ir.is_signed_pred(q) != signed) {
-            continue;
-        }
-        let o = outcomes(q);
-        if (s & o) == s {
-            add_icmp(q, a, b, ha, hb, g_true);
-            add_icmp(ir.swap_pred(q), b, a, hb, ha, g_true);
-        } else if (s & o) == 0 {
-            add_icmp(q, a, b, ha, hb, g_false);
-            add_icmp(ir.swap_pred(q), b, a, hb, ha, g_false);
-        }
-    }
-}
-
 // The fact x tp k as the same comparison with the neighbouring constant:
 // x > k as x >= k + 1, x >= k as x > k - 1, x < k as x <= k - 1, x <= k as
 // x < k + 1 (signed or unsigned), where k +- 1 does not wrap.
@@ -1677,10 +1816,7 @@ fn assume_adjacent(tp: ir.CmpPred, x: *mut ir.Value, k: *mut ir.Value) void {
     }
     let q = @enum_from_int(ir.CmpPred, np);
     let c = ir.cint(t, nk);
-    let hx = hv(x);
-    let hc = hv(c);
-    add_icmp(q, x, c, hx, hc, g_true);
-    add_icmp(ir.inv_pred(q), x, c, hx, hc, g_false);
+    add_cmp(CMP_PAIR, q, x, c, hv(x), hv(c));
 }
 
 const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
@@ -1757,8 +1893,8 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
     }
     add_le(x, vnil(), @bit_cast(i64, lo + (n - 1)));
     add_ge(x, @bit_cast(i64, lo));
-    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), g_true);
-    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), g_true);
+    add_one(ir.IntUGE, x, ir.cint(x.ty, lo));
+    add_one(ir.IntNE, x, ir.cint(x.ty, 0));
 }
 
 // a <= b + c with a = x + k (k a small constant, the sum not wrapping):
@@ -1907,16 +2043,16 @@ fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
         // a >= lo >= 0 (signed): a is not negative, and at least lo
         let lo = ir.sval(b) + pick1(tp == ir.IntSGT);
         if lo >= 0 {
-            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), g_true);
-            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), g_true);
+            add_one(ir.IntSGE, a, ir.cint(a.ty, 0));
+            add_one(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo)));
             if lo >= 1 {
-                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), g_true);
+                add_one(ir.IntNE, a, ir.cint(a.ty, 0));
             }
         }
     } else if ((tp == ir.IntSLT) or (tp == ir.IntSLE)) and ir.is_cint(b) and not ir.is_const(a) {
         // a <= hi (signed) with a not negative: a <= hi
         let hi = ir.sval(b) - pick1(tp == ir.IntSLT);
-        if (hi >= 0) and known_true(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0))) {
+        if (hi >= 0) and known_cmp(ir.IntSGE, a, ir.cint(a.ty, 0)) {
             add_le(a, vnil(), hi);
         }
         // k - x <= hi with x in [0, ub(x)] (no signed overflow): x >= k - hi
@@ -1932,8 +2068,8 @@ fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
             sub_le_busy = false;
             let lo = kv(a.a) - hi;
             if (m >= 0) and (m <= smax_of(a.ty)) and (lo >= 1) and (lo <= m) {
-                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), g_true);
-                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), g_true);
+                add_one(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo)));
+                add_one(ir.IntNE, a.b, ir.cint(a.ty, 0));
             }
         }
     }
@@ -1957,19 +2093,18 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
         return false;
     }
     if c == 1 {
-        if known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0))) {
+        if known_cmp(ir.IntNE, x, ir.cint(x.ty, 0)) {
             return true;
         }
     }
-    if known_true(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c)))) {
+    if known_cmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c))) {
         return true;
     }
     if ge_fact(x, c) {
         return true;
     }
     // x >= c - 1 and x != c - 1
-    if (c >= 2) and known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, @bit_cast(u64, c - 1)))) and
-       known_at_least(x, c - 1) {
+    if (c >= 2) and known_cmp(ir.IntNE, x, ir.cint(x.ty, @bit_cast(u64, c - 1))) and known_at_least(x, c - 1) {
         return true;
     }
     if ir.is_op(x, ir.OP_PHI) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) and (c < 0x1_0000_0000) {
@@ -1982,7 +2117,7 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
 fn ge_fact(x: *mut ir.Value, c: i64) bool {
     let mut e = bk.get(@truncate(usize, ge_hash(x)) & (nb - 1));
     while e >= 0 {
-        let en = ents.get(@int_cast(usize, e));
+        let en = ents.at_mut(@int_cast(usize, e));
         if (en.kind == K_GE) and (en.key == x) and fact_ok(e) and (en.off >= c) {
             return true;
         }
@@ -2066,20 +2201,6 @@ fn phi_at_least(x: *mut ir.Value, c: i64) bool {
     fact_lo = lo0;
     fact_hi = hi0;
     return ok;
-}
-
-// Is the comparison i known to hold (by a fact fact_ok allows)?
-fn known_true(i: *mut ir.Value) bool {
-    let h = hash_expr(i);
-    let mut e = bk.get(@truncate(usize, h) & (nb - 1));
-    while e >= 0 {
-        let x = ents.get(@int_cast(usize, e));
-        if (x.kind == K_EXPR) and same_expr(x.key, i) {
-            return fact_ok(e) and ir.is_cint(x.val) and (ir.cint_val(x.val) == 1);
-        }
-        e = x.next;
-    }
-    return false;
 }
 
 threadlocal let mut prove_budget: i32 = 0;
@@ -2543,8 +2664,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
            fits_type(a << @truncate(u32, k), x.ty) {
             d = a << @truncate(u32, k);
         }
-    } else if (op == ir.OP_SUB) and
-              (known_true(synth_icmp(ir.IntUGE, x.a, x.b)) or known_true(synth_icmp(ir.IntUGT, x.a, x.b))) {
+    } else if (op == ir.OP_SUB) and (known_cmp(ir.IntUGE, x.a, x.b) or known_cmp(ir.IntUGT, x.a, x.b)) {
         d = ub(x.a, depth + 1);  // y - z <= y when z <= y
     } else if (op == ir.OP_SEXT) or ((op == ir.OP_ASHR) and not small_k(x.b)) {
         // a value known not negative
@@ -2597,7 +2717,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
                 d = a - @bit_cast(i64, c);
             }
         } else if (c < 0x1_0000_0000) and (x.ty.bits <= 64) and (c <= (ir.mask_bits(x.ty.bits) >> 1) + 1) and
-                  known_true(synth_icmp(ir.IntSGE, x, ir.cint(x.ty, 0))) {
+                  known_cmp(ir.IntSGE, x, ir.cint(x.ty, 0)) {
             let a = ub(x.a, depth + 1);
             if (a >= 0) and (a <= smax_of(x.ty)) and (a >= @bit_cast(i64, c)) {
                 d = a - @bit_cast(i64, c);
@@ -3514,7 +3634,6 @@ pub fn gvn(f: *mut ir.Func) bool {
     ents.clear();
     vec_mems = false;
     writes.clear();
-    n_synth = 0;
     fact_lo = 0;
     fact_hi = 0;
     tab_key.clear();

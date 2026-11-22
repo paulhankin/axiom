@@ -1,0 +1,696 @@
+// =============================================================================
+// cparse_expr.ax - C expression parsing, operators, casts and builtins,
+// part of cparse.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Expressions
+// -----------------------------------------------------------------------------
+
+// An expression's height from its operands'; one too high is reported and
+// replaced by an ERROR.
+fn grown(P: *mut Parser, e: *mut cast.Expr) *mut cast.Expr {
+    let mut h: i32 = 0;
+    if u.notnil(e.a) {
+        h = @max(h, e.a.height);
+    }
+    if u.notnil(e.b) {
+        h = @max(h, e.b.height);
+    }
+    if u.notnil(e.c) {
+        h = @max(h, e.c.height);
+    }
+    for x in e.args.items() {
+        h = @max(h, x.height);
+    }
+    if u.notnil(e.assocs) {
+        for g in e.assocs.items() {
+            h = @max(h, g.e.height);
+        }
+    }
+    e.height = h + 1;
+    if e.height > MAX_DEPTH {
+        report_too_deep(P, e.span);
+        return cast.new_expr(cast.ExprKind.ERROR, e.span);
+    }
+    return e;
+}
+
+fn binary_node(P: *mut Parser, k: cast.ExprKind, op: i32, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
+    let e = cast.new_expr(k, u.span_join(a.span, b.span));
+    e.op = op;
+    e.a = a;
+    e.b = b;
+    return grown(P, e);
+}
+
+fn error_expr(P: *Parser) *mut cast.Expr {
+    return cast.new_expr(cast.ExprKind.ERROR, cur(P).span);
+}
+
+/// expression: assignment-expressions separated by ','.
+fn parse_expr(P: *mut Parser) *mut cast.Expr {
+    let mut e = parse_assign(P);
+    while at_p(P, ct.P_COMMA) {
+        _ = advance(P);
+        let r = parse_assign(P);
+        e = binary_node(P, cast.ExprKind.COMMA, ct.P_COMMA, e, r);
+    }
+    return e;
+}
+
+fn is_assign_op(t: *ct.Token) bool {
+    return (t.kind == ct.T_PUNCT) and ((t.id == ct.P_ASSIGN) or ((t.id >= ct.P_MUL_EQ) and (t.id <= ct.P_OR_EQ)));
+}
+
+// A unary expression syntactically (what may stand left of '='): not a
+// binary, conditional, cast, assignment or comma expression unless
+// parenthesized.
+fn is_unary_form(e: *cast.Expr) bool {
+    if e.parens > 0 {
+        return true;
+    }
+    let k = e.kind;
+    return not ((k == cast.ExprKind.BINARY) or (k == cast.ExprKind.COND) or (k == cast.ExprKind.CAST) or
+                (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.COMMA));
+}
+
+fn parse_assign(P: *mut Parser) *mut cast.Expr {
+    let lhs = parse_cond(P);
+    if not is_assign_op(cur(P)) {
+        return lhs;
+    }
+    let op = advance(P);
+    if not is_unary_form(lhs) {
+        error_at(lhs.span, "C2022", u.f1("the left operand of '%s' must be a unary expression", op.text));
+    }
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    let rhs = parse_assign(P);
+    leave(P);
+    return binary_node(P, cast.ExprKind.ASSIGN, op.id, lhs, rhs);
+}
+
+/// conditional-expression (a constant expression, where one is expected).
+fn parse_cond(P: *mut Parser) *mut cast.Expr {
+    let c = parse_binary(P, 1);
+    if not at_p(P, ct.P_QUESTION) {
+        return c;
+    }
+    _ = advance(P);
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    let mut a = u.nil.[cast.Expr]();
+    if not (P.gnu and at_p(P, ct.P_COLON)) {
+        // (a GNU dialect: `c ?: b` has no middle operand)
+        a = parse_expr(P);
+    }
+    let mut b = error_expr(P);
+    if expect_p(P, ct.P_COLON) {
+        b = parse_cond(P);
+    }
+    leave(P);
+    let e = cast.new_expr(cast.ExprKind.COND, u.span_join(c.span, b.span));
+    e.a = c;
+    e.b = a;
+    e.c = b;
+    return grown(P, e);
+}
+
+// The precedence of a binary operator (higher binds tighter), or 0.
+fn binary_prec(t: *ct.Token) i32 {
+    if t.kind != ct.T_PUNCT {
+        return 0;
+    }
+    let id = t.id;
+    if (id == ct.P_STAR) or (id == ct.P_SLASH) or (id == ct.P_PERCENT) {
+        return 10;
+    }
+    if (id == ct.P_PLUS) or (id == ct.P_MINUS) {
+        return 9;
+    }
+    if (id == ct.P_SHL) or (id == ct.P_SHR) {
+        return 8;
+    }
+    if (id == ct.P_LT) or (id == ct.P_GT) or (id == ct.P_LE) or (id == ct.P_GE) {
+        return 7;
+    }
+    if (id == ct.P_EQ) or (id == ct.P_NE) {
+        return 6;
+    }
+    if id == ct.P_AMP {
+        return 5;
+    }
+    if id == ct.P_CARET {
+        return 4;
+    }
+    if id == ct.P_PIPE {
+        return 3;
+    }
+    if id == ct.P_ANDAND {
+        return 2;
+    }
+    if id == ct.P_OROR {
+        return 1;
+    }
+    return 0;
+}
+
+// Binary operators of precedence `min` and above, left-associative.
+fn parse_binary(P: *mut Parser, min: i32) *mut cast.Expr {
+    let mut lhs = parse_cast(P);
+    loop {
+        let prec = binary_prec(cur(P));
+        if (prec == 0) or (prec < min) {
+            return lhs;
+        }
+        let op = advance(P).id;
+        let rhs = parse_binary(P, prec + 1);
+        lhs = binary_node(P, cast.ExprKind.BINARY, op, lhs, rhs);
+    }
+}
+
+// '(' at the current token begins a cast or compound literal: a type name
+// follows (or, for a compound literal, a storage-class specifier: C23).
+fn paren_type_follows(P: *mut Parser) bool {
+    if not at_p(P, ct.P_LPAREN) {
+        return false;
+    }
+    if starts_type_name(P, 1) {
+        return true;
+    }
+    let id = kw_at(P, 1);
+    return (id == ct.K_STATIC) or (id == ct.K_REGISTER) or (id == ct.K_THREAD_LOCAL) or (id == ct.K_CONSTEXPR);
+}
+
+// cast-expression: `( type-name ) cast-expression`, or a unary expression
+// (a compound literal among them).
+fn parse_cast(P: *mut Parser) *mut cast.Expr {
+    if not paren_type_follows(P) {
+        return parse_unary(P);
+    }
+    let start = advance(P).span;
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    let tn = parse_type_name(P, CTX_COMPOUND);
+    let closed = expect_p(P, ct.P_RPAREN);
+    if closed and at_p(P, ct.P_LBRACE) {
+        let x = compound_literal(P, tn, start);
+        leave(P);
+        return parse_postfix(P, x);
+    }
+    if closed and (tn.specs.storage != 0) {
+        // (only a compound literal has those)
+        syntax(P, "'{' of a compound literal");
+    }
+    let e = cast.new_expr(cast.ExprKind.CAST, start);
+    e.tname = tn;
+    e.a = parse_cast(P);
+    e.span = span_from(P, start);
+    leave(P);
+    return grown(P, e);
+}
+
+// `( type-name ) { initializer-list }`, at its '{'.
+fn compound_literal(P: *mut Parser, tn: *mut cast.TypeName, start: u.Span) *mut cast.Expr {
+    feature(P, co.C99, start, "C2109", "compound literals are");
+    let e = cast.new_expr(cast.ExprKind.COMPOUND, start);
+    e.tname = tn;
+    e.init = parse_initializer(P);
+    e.span = span_from(P, start);
+    return e;
+}
+
+fn parse_unary(P: *mut Parser) *mut cast.Expr {
+    let t = cur(P);
+    if at_kw(P, ct.K_EXTENSION) {
+        // (`__extension__ expression`: the expression)
+        _ = advance(P);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        let x = parse_cast(P);
+        leave(P);
+        return x;
+    }
+    if P.gnu and (t.kind == ct.T_IDENT) and real_imag(t.text) and not is_declared(P, t.text) {
+        // `__real__ e`, `__imag__ e` (a GNU dialect): the parts of a complex value
+        _ = advance(P);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        let e = cast.new_expr(cast.ExprKind.UNARY, t.span);
+        e.op = ct.P_REAL;
+        if u.str_eq(t.text, "__imag__") or u.str_eq(t.text, "__imag") {
+            e.op = ct.P_IMAG;
+        }
+        e.a = parse_cast(P);
+        leave(P);
+        e.span = span_from(P, t.span);
+        return grown(P, e);
+    }
+    if P.gnu and is_p(t, ct.P_ANDAND) and (peek(P, 1).kind == ct.T_IDENT) {
+        // `&&label` (a GNU dialect): the label's address
+        _ = advance(P);
+        let l = advance(P);
+        let e = cast.new_expr(cast.ExprKind.LABEL_ADDR, t.span);
+        e.name = l.text;
+        e.name_span = l.span;
+        e.span = span_from(P, t.span);
+        return e;
+    }
+    if t.kind == ct.T_PUNCT {
+        let id = t.id;
+        let pre = (id == ct.P_INC) or (id == ct.P_DEC);
+        if pre or (id == ct.P_AMP) or (id == ct.P_STAR) or (id == ct.P_PLUS) or (id == ct.P_MINUS) or
+           (id == ct.P_TILDE) or (id == ct.P_BANG) {
+            _ = advance(P);
+            if not enter(P) {
+                leave(P);
+                return error_expr(P);
+            }
+            let e = cast.new_expr(cast.ExprKind.UNARY, t.span);
+            e.op = id;
+            if pre and paren_type_follows(P) {
+                // a compound literal (a cast is not a unary expression)
+                e.a = parse_cast(P);
+                if e.a.kind == cast.ExprKind.CAST {
+                    error_at(e.a.span, "C2027", u.f1("the operand of '%s' cannot be a cast: parenthesize it",
+                                                     cast.punct_text(id)));
+                }
+            } else if pre {
+                e.a = parse_unary(P);
+            } else {
+                e.a = parse_cast(P);
+            }
+            leave(P);
+            e.span = span_from(P, t.span);
+            return grown(P, e);
+        }
+        return parse_postfix(P, parse_primary(P));
+    }
+    let kw = kw_at(P, 0);
+    if kw == ct.K_SIZEOF {
+        _ = advance(P);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        let mut e = error_expr(P);
+        if paren_type_follows(P) {
+            let lp = advance(P).span;
+            let tn = parse_type_name(P, CTX_COMPOUND);
+            let closed = expect_p(P, ct.P_RPAREN);
+            if closed and at_p(P, ct.P_LBRACE) {
+                // sizeof of a compound literal
+                e = cast.new_expr(cast.ExprKind.SIZEOF_EXPR, t.span);
+                e.a = parse_postfix(P, compound_literal(P, tn, lp));
+            } else {
+                if closed and (tn.specs.storage != 0) {
+                    syntax(P, "'{' of a compound literal");
+                }
+                e = cast.new_expr(cast.ExprKind.SIZEOF_TYPE, t.span);
+                e.tname = tn;
+            }
+        } else {
+            e = cast.new_expr(cast.ExprKind.SIZEOF_EXPR, t.span);
+            e.a = parse_unary(P);
+        }
+        leave(P);
+        e.span = span_from(P, t.span);
+        return grown(P, e);
+    }
+    if (kw == ct.K_ALIGNOF) or
+       ((t.kind == ct.T_IDENT) and u.str_eq(t.text, "alignof") and not is_declared(P, t.text) and
+        is_p(peek(P, 1), ct.P_LPAREN) and starts_type_name(P, 2)) {
+        _ = take_kw(P);
+        let e = cast.new_expr(cast.ExprKind.ALIGNOF, t.span);
+        e.name = t.text;
+        if P.gnu and not (at_p(P, ct.P_LPAREN) and starts_type_name(P, 1)) {
+            // (a GNU dialect: __alignof__ of an expression)
+            if not enter(P) {
+                leave(P);
+                return error_expr(P);
+            }
+            e.a = parse_unary(P);
+            leave(P);
+            e.span = span_from(P, t.span);
+            return grown(P, e);
+        }
+        if expect_p(P, ct.P_LPAREN) {
+            e.tname = parse_type_name(P, CTX_TYPENAME);
+            if not expect_p(P, ct.P_RPAREN) {
+                skip_to_rparen(P);
+            }
+        } else {
+            e.kind = cast.ExprKind.ERROR;
+        }
+        e.span = span_from(P, t.span);
+        return e;
+    }
+    return parse_postfix(P, parse_primary(P));
+}
+
+// Postfix operators after `e0`.
+fn parse_postfix(P: *mut Parser, e0: *mut cast.Expr) *mut cast.Expr {
+    let mut e = e0;
+    loop {
+        let t = cur(P);
+        if t.kind != ct.T_PUNCT {
+            return e;
+        }
+        let start = e.span;
+        if t.id == ct.P_LBRACKET {
+            if is_p(peek(P, 1), ct.P_LBRACKET) {
+                no_attrs(P);
+                continue;
+            }
+            _ = advance(P);
+            let x = cast.new_expr(cast.ExprKind.INDEX, start);
+            x.a = e;
+            x.b = parse_expr(P);
+            _ = expect_p(P, ct.P_RBRACKET);
+            x.span = span_from(P, start);
+            e = grown(P, x);
+            continue;
+        }
+        if t.id == ct.P_LPAREN {
+            _ = advance(P);
+            let x = cast.new_expr(cast.ExprKind.CALL, start);
+            x.a = e;
+            if not at_p(P, ct.P_RPAREN) {
+                loop {
+                    x.args.push(parse_assign(P));
+                    if not accept_p(P, ct.P_COMMA) {
+                        break;
+                    }
+                }
+            }
+            if not expect_p(P, ct.P_RPAREN) {
+                skip_to_rparen(P);
+            }
+            x.span = span_from(P, start);
+            e = grown(P, x);
+            continue;
+        }
+        if (t.id == ct.P_DOT) or (t.id == ct.P_ARROW) {
+            _ = advance(P);
+            let x = cast.new_expr(cast.ExprKind.MEMBER, start);
+            x.op = t.id;
+            x.a = e;
+            x.name = "";
+            let m = cur(P);
+            if m.kind == ct.T_IDENT {
+                _ = advance(P);
+                x.name = m.text;
+                x.name_span = m.span;
+            } else {
+                syntax(P, "a member name");
+            }
+            x.span = span_from(P, start);
+            e = grown(P, x);
+            continue;
+        }
+        if (t.id == ct.P_INC) or (t.id == ct.P_DEC) {
+            _ = advance(P);
+            let x = cast.new_expr(cast.ExprKind.POSTFIX, start);
+            x.op = t.id;
+            x.a = e;
+            x.span = span_from(P, start);
+            e = grown(P, x);
+            continue;
+        }
+        return e;
+    }
+}
+
+fn literal(P: *mut Parser, k: cast.ExprKind) *mut cast.Expr {
+    let t = advance(P);
+    let e = cast.new_expr(k, t.span);
+    let c = u.new.[ct.Token]();
+    c.* = t.*;
+    e.tok = c;
+    return e;
+}
+
+fn parse_primary(P: *mut Parser) *mut cast.Expr {
+    let t = cur(P);
+    if t.kind == ct.T_IDENT {
+        if (later_kw(P, 0) == ct.K_GENERIC) and is_p(peek(P, 1), ct.P_LPAREN) {
+            return parse_generic(P);
+        }
+        if (u.str_eq(t.text, "__builtin_va_arg") or u.str_eq(t.text, "__builtin_offsetof") or
+            (P.gnu and u.str_eq(t.text, "__builtin_convertvector")) or
+            u.str_eq(t.text, "__builtin_axiom_convertvector")) and is_p(peek(P, 1), ct.P_LPAREN) {
+            return parse_type_builtin(P);
+        }
+        if P.gnu and u.str_eq(t.text, "__builtin_types_compatible_p") and is_p(peek(P, 1), ct.P_LPAREN) {
+            return parse_types_compatible(P);
+        }
+        if is_typedef(P, t.text) {
+            syntax(P, "an expression");
+            let e = error_expr(P);
+            _ = advance(P);
+            return e;
+        }
+        let nx = peek(P, 1);
+        let ch = nx.kind == ct.T_CHAR;
+        let u8ch = ch and u.str_eq(t.text, "u8");
+        if (ch or (nx.kind == ct.T_STRING)) and not nx.space and
+           (u.str_eq(t.text, "u8") or u.str_eq(t.text, "u") or u.str_eq(t.text, "U")) and
+           ((P.std < co.C11) or (u8ch and (P.std < co.C23))) {
+            // (before C11, or C23 for u8'a', the prefix is an identifier before the literal)
+            let since = u.pick(u8ch, "C23", "C11");
+            error_at(t.span, "C2100",
+                     u.f3("'%s' %s are a %s feature", t.text, u.pick(ch, "character constants", "string literals"),
+                          since));
+            _ = advance(P);
+            if ch {
+                return literal(P, cast.ExprKind.CHAR);
+            }
+            return literal(P, cast.ExprKind.STRING);
+        }
+        _ = advance(P);
+        let e = cast.new_expr(cast.ExprKind.IDENT, t.span);
+        e.name = t.text;
+        return e;
+    }
+    if t.kind == ct.T_INT {
+        return literal(P, cast.ExprKind.INT);
+    }
+    if t.kind == ct.T_FLOAT {
+        return literal(P, cast.ExprKind.FLOAT);
+    }
+    if t.kind == ct.T_CHAR {
+        return literal(P, cast.ExprKind.CHAR);
+    }
+    if t.kind == ct.T_STRING {
+        return literal(P, cast.ExprKind.STRING);
+    }
+    if t.kind == ct.T_KEYWORD {
+        if (t.id == ct.K_TRUE) or (t.id == ct.K_FALSE) {
+            _ = advance(P);
+            let e = cast.new_expr(cast.ExprKind.BOOL, t.span);
+            e.bval = t.id == ct.K_TRUE;
+            return e;
+        }
+        if t.id == ct.K_NULLPTR {
+            _ = advance(P);
+            return cast.new_expr(cast.ExprKind.NULLPTR, t.span);
+        }
+        if t.id == ct.K_GENERIC {
+            return parse_generic(P);
+        }
+    }
+    if is_p(t, ct.P_LPAREN) and P.gnu and is_p(peek(P, 1), ct.P_LBRACE) {
+        // `({ ... })` (a GNU dialect): a statement expression
+        _ = advance(P);
+        let e = cast.new_expr(cast.ExprKind.STMT_EXPR, t.span);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        e.body = parse_compound(P, true);
+        leave(P);
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+        e.span = span_from(P, t.span);
+        return e;
+    }
+    if is_p(t, ct.P_LPAREN) {
+        _ = advance(P);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        let e = parse_expr(P);
+        leave(P);
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+        // (its span takes in the parentheses)
+        e.parens += 1;
+        e.span = span_from(P, t.span);
+        return e;
+    }
+    syntax(P, "an expression");
+    return error_expr(P);
+}
+
+// The builtins with a type name among their operands (the headers' va_arg
+// and offsetof): `__builtin_va_arg ( assignment-expression , type-name )`
+// and `__builtin_offsetof ( type-name , member-designator )`, where the
+// member designator is an identifier followed by any of `. identifier` and
+// `[ constant-expression ]` (each a MEMBER or an INDEX node in args).
+fn parse_type_builtin(P: *mut Parser) *mut cast.Expr {
+    let t = advance(P);
+    // (a GNU dialect's `__builtin_convertvector ( assignment-expression ,
+    // type-name )` is read as va_arg is, and is a VA_ARG of that name)
+    // (the headers' __builtin_axiom_convertvector, in every mode, is that builtin)
+    let cv = u.str_eq(t.text, "__builtin_convertvector") or u.str_eq(t.text, "__builtin_axiom_convertvector");
+    let va = u.str_eq(t.text, "__builtin_va_arg") or cv;
+    let e = cast.new_expr(cast.ExprKind.OFFSETOF, t.span);
+    if va {
+        e.kind = cast.ExprKind.VA_ARG;
+    }
+    e.name = t.text;
+    if cv {
+        e.name = "__builtin_convertvector";
+    }
+    _ = advance(P);  // (the '(')
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    let mut ok = true;
+    if va {
+        e.a = parse_assign(P);
+        ok = expect_p(P, ct.P_COMMA);
+        if ok {
+            e.tname = parse_type_name(P, CTX_TYPENAME);
+        }
+    } else {
+        e.tname = parse_type_name(P, CTX_TYPENAME);
+        ok = expect_p(P, ct.P_COMMA);
+        let mut first = true;
+        while ok {
+            let sp = cur(P).span;
+            if first or at_p(P, ct.P_DOT) {
+                if not first {
+                    _ = advance(P);
+                }
+                let m = cur(P);
+                if m.kind != ct.T_IDENT {
+                    syntax(P, "a member name");
+                    ok = false;
+                    break;
+                }
+                _ = advance(P);
+                let x = cast.new_expr(cast.ExprKind.MEMBER, m.span);
+                x.op = ct.P_DOT;
+                x.name = m.text;
+                x.name_span = m.span;
+                x.span = span_from(P, sp);
+                e.args.push(x);
+            } else if at_p(P, ct.P_LBRACKET) {
+                _ = advance(P);
+                let x = cast.new_expr(cast.ExprKind.INDEX, sp);
+                x.b = parse_cond(P);
+                ok = expect_p(P, ct.P_RBRACKET);
+                x.span = span_from(P, sp);
+                e.args.push(grown(P, x));
+            } else {
+                break;
+            }
+            first = false;
+        }
+    }
+    leave(P);
+    if not ok {
+        // (the tree after an error: no operand missing)
+        e.kind = cast.ExprKind.ERROR;
+        skip_to_rparen(P);
+    } else if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    e.span = span_from(P, t.span);
+    return grown(P, e);
+}
+
+// `__builtin_types_compatible_p ( type-name , type-name )` (a GNU dialect).
+fn parse_types_compatible(P: *mut Parser) *mut cast.Expr {
+    let t = advance(P);
+    let e = cast.new_expr(cast.ExprKind.TYPES_COMPAT, t.span);
+    e.name = t.text;
+    _ = advance(P);  // (the '(')
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    e.tname = parse_type_name(P, CTX_TYPENAME);
+    let ok = expect_p(P, ct.P_COMMA);
+    if ok {
+        e.tname2 = parse_type_name(P, CTX_TYPENAME);
+    }
+    leave(P);
+    if not ok {
+        e.kind = cast.ExprKind.ERROR;
+        skip_to_rparen(P);
+    } else if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    e.span = span_from(P, t.span);
+    return e;
+}
+
+// `_Generic ( assignment-expression , generic-association-list )`.
+fn parse_generic(P: *mut Parser) *mut cast.Expr {
+    let start = take_kw(P).span;
+    let e = cast.new_expr(cast.ExprKind.GENERIC, start);
+    if not expect_p(P, ct.P_LPAREN) {
+        e.kind = cast.ExprKind.ERROR;
+        return e;
+    }
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    e.a = parse_assign(P);
+    e.assocs = u.new.[u.List.[cast.GenericAssoc]]();
+    while accept_p(P, ct.P_COMMA) {
+        let sp = cur(P).span;
+        let mut tn = u.nil.[cast.TypeName]();
+        if at_kw(P, ct.K_DEFAULT) {
+            _ = advance(P);
+        } else {
+            tn = parse_type_name(P, CTX_TYPENAME);
+        }
+        let mut x = error_expr(P);
+        if expect_p(P, ct.P_COLON) {
+            x = parse_assign(P);
+        }
+        e.assocs.push(cast.GenericAssoc.{ span: span_from(P, sp), tname: tn, e: x });
+    }
+    if e.assocs.len == 0 {
+        syntax(P, "',' and a generic association");
+    }
+    leave(P);
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    e.span = span_from(P, start);
+    return grown(P, e);
+}

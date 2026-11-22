@@ -1,11 +1,10 @@
 // =============================================================================
 // csema.ax - semantic analysis of a C translation unit: the scopes and name
 // spaces, symbols and linkage, diagnostics, and the walk over the external
-// declarations (run). The other parts are csema_decl.ax (declarations),
-// csema_expr.ax (expressions), csema_stmt.ax (statements), csema_init.ax
-// (initializers) and cconst.ax (constant expressions); this module is the
-// one they all import, and it reaches them through the hooks they install
-// (csema_stmt.analyze does), so that the modules form no import cycle.
+// declarations (run). The submodules are brought in via `import part`
+// (csema_decl*.ax, csema_expr*.ax, csema_stmt.ax, csema_desig*.ax,
+// csema_gnu*.ax, csema_builtin.ax, csema_gbuiltin*.ax, etc.) together with
+// standalone helper cconst.ax (constant expressions).
 //
 // The typed tree (what IR generation, cgen*.ax, may rely on once a unit has
 // no errors) is the syntax tree annotated in place:
@@ -125,6 +124,7 @@
 //   C4150  (a GNU dialect) a string literal too long for its array, truncated
 //   C4151  (a GNU dialect) a flexible array member of a union
 // =============================================================================
+import "../asm/wasm.ax" as aw;
 import "../diag.ax" as dg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
@@ -133,8 +133,44 @@ import "cldbl.ax" as cl;
 import "copts.ax" as co;
 import "cpragma.ax" as cpg;
 import "ctypes.ax" as cty;
-import "std/c/rt/decimal" as dm;
+import "std/c/rt/decimal" as dfp;
 import "std/c/rt/ldouble" as ld;
+
+import part "csema_asm.ax";
+import part "csema_asm_stmt.ax";
+import part "csema_atomic.ax";
+import part "csema_attr.ax";
+import part "csema_bitint.ax";
+import part "csema_bits.ax";
+import part "csema_builtin.ax";
+import part "csema_decl.ax";
+import part "csema_decl_ent.ax";
+import part "csema_decl_tags.ax";
+import part "csema_desig.ax";
+import part "csema_desig_walk.ax";
+import part "csema_dspec.ax";
+import part "csema_enum.ax";
+import part "csema_expr.ax";
+import part "csema_expr_ops.ax";
+import part "csema_expr_post.ax";
+import part "csema_format.ax";
+import part "csema_format_want.ax";
+import part "csema_fp.ax";
+import part "csema_gbuiltin.ax";
+import part "csema_gbuiltin_lib.ax";
+import part "csema_gbuiltin_objsize.ax";
+import part "csema_generic.ax";
+import part "csema_gnu.ax";
+import part "csema_gnu_attr.ax";
+import part "csema_ice.ax";
+import part "csema_marks.ax";
+import part "csema_named.ax";
+import part "csema_nest.ax";
+import part "csema_simd.ax";
+import part "csema_stmt.ax";
+import part "csema_tgmath.ax";
+import part "csema_vec.ax";
+import part "csema_vla.ax";
 
 /// The translation unit, typed: what IR generation emits.
 pub struct CUnit {
@@ -150,38 +186,163 @@ pub struct CUnit {
     pub has_init_fini: bool,               // its asm puts pointers into .init_array / .fini_array / .preinit_array
 }
 
-/// The other parts of semantic analysis, reached from the ones they import.
-pub struct Hooks {
-    pub external: fn(*mut cast.Decl) void,                 // an external declaration (csema_decl)
-    pub type_name: fn(*mut cast.TypeName) *mut cty.CType,  // a type name's type (csema_decl)
-    pub body: fn(*mut cast.CSym, *mut cast.Decl) void,     // a function definition's body (csema_stmt)
-    pub compound: fn(*mut cast.Expr) *mut cast.Expr,       // a compound literal (csema_desig)
-    pub stmt_expr: fn(*mut cast.Expr) *mut cast.Expr,      // a statement expression (csema_stmt; GNU dialects)
-    pub label_addr: fn(*mut cast.Expr) *mut cast.Expr,     // `&&label` (csema_stmt; GNU dialects)
+// Module-level state and tables shared across csema parts.
+let ATM_NAMES: [14][]u8 = ["init", "load", "store", "exchange", "compare_exchange", "fetch_add", "fetch_sub",
+                           "fetch_or", "fetch_xor", "fetch_and", "is_lock_free", "thread_fence", "signal_fence",
+                           "compare_exchange_weak"];
+let ATM_STD_NAMES: [14][]u8 = ["atomic_init", "atomic_load", "atomic_store", "atomic_exchange",
+                               "atomic_compare_exchange_strong", "atomic_fetch_add", "atomic_fetch_sub",
+                               "atomic_fetch_or", "atomic_fetch_xor", "atomic_fetch_and", "atomic_is_lock_free",
+                               "atomic_thread_fence", "atomic_signal_fence", "atomic_compare_exchange_weak"];
+let ATM_ARITIES: [14]usize = [2, 2, 3, 3, 5, 3, 3, 3, 3, 3, 1, 1, 1, 5];
+let ATM_ORDER_NAMES: [6][]u8 = ["memory_order_relaxed", "memory_order_consume", "memory_order_acquire",
+                                "memory_order_release", "memory_order_acq_rel", "memory_order_seq_cst"];
+let ATM_GNU_ORDER_NAMES: [6][]u8 = ["__ATOMIC_RELAXED", "__ATOMIC_CONSUME", "__ATOMIC_ACQUIRE", "__ATOMIC_RELEASE",
+                                    "__ATOMIC_ACQ_REL", "__ATOMIC_SEQ_CST"];
+let mut g_attr_notes: u.SymMap.[*mut AttrNote] = u.SymMap.[*mut AttrNote].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut AttrNote, 0), cap: 0, len: 0 };
+let STDC_NAMES: [14][]u8 = ["leading_zeros", "leading_ones", "trailing_zeros", "trailing_ones", "first_leading_zero",
+                            "first_leading_one", "first_trailing_zero", "first_trailing_one", "count_zeros",
+                            "count_ones", "has_single_bit", "bit_width", "bit_floor", "bit_ceil"];
+let mut g_va_list: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);
+let mut g_va_for: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);  // (the unit's int: types are per unit)
+let mut g_marks: *mut Marks = @ptr_from_int(*mut Marks, 0);
+let mut gnu89_inline: bool = false;
+let mut g_vexpr_fn: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut cast.CSym, 0), cap: 0, len: 0 };
+let mut g_fn_lens: u.SymMap.[*mut u.List.[*mut void]] =
+    u.SymMap.[*mut u.List.[*mut void]].{ keys: @ptr_from_int(*mut usize, 0),
+                                         vals: @ptr_from_int(*mut *mut u.List.[*mut void], 0), cap: 0, len: 0 };
+let mut g_simd_ops: u.List.[Op] = u.List.[Op].{ data: @ptr_from_int(*mut Op, 0), len: 0, cap: 0 };
+let mut g_simd_by_name: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                          vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut g_body: *mut Body = @ptr_from_int(*mut Body, 0);
+let mut g_addr_labels: u.SymMap.[*mut u.List.[*mut cast.CSym]] =
+    u.SymMap.[*mut u.List.[*mut cast.CSym]].{ keys: @ptr_from_int(*mut usize, 0),
+                                              vals: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), cap: 0,
+                                              len: 0 };
+let mut g_follow_case: bool = false;
+let mut g_vla_scopes: *mut Scopes = @ptr_from_int(*mut Scopes, 0);
+let mut g_vla_depths: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut g_params: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                      len: 0, cap: 0 };
+let mut g_kr_ids: bool = false;    // ... given as an identifier list
+let mut g_defining: bool = false;  // the declarator is a function definition's (not its parameters')
+let mut in_compound: bool = false;
+let mut compound_align: u64 = 0;
+let mut g_fn_entity: bool = false;
+let mut g_enum_consts: u.SymMap.[*mut u.List.[*mut cast.CSym]] =
+    u.SymMap.[*mut u.List.[*mut cast.CSym]].{ keys: @ptr_from_int(*mut usize, 0),
+                                              vals: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), cap: 0,
+                                              len: 0 };
+let mut g_func_names: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut cast.CSym, 0), cap: 0, len: 0 };
+let mut complex_tilde_conjugates: bool = false;
+let mut g_gnu_notes: u.SymMap.[*mut Note] = u.SymMap.[*mut Note].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                   vals: @ptr_from_int(*mut *mut Note, 0), cap: 0,
+                                                                   len: 0 };
+let FUNC_ATTRS: [33][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
+                            "nonnull", "returns_nonnull", "warn_unused_result", "constructor", "destructor",
+                            "gnu_inline", "artificial", "nothrow", "leaf", "externally_visible",
+                            "no_instrument_function", "flatten", "noclone", "noipa", "sentinel", "alloc_size",
+                            "alloc_align", "assume_aligned", "error", "warning", "nodiscard", "returns_twice",
+                            "optimize", "naked", "target"];
+let mut g_wasm_defs: u.List.[aw.Ref] = u.List.[aw.Ref].{ data: @ptr_from_int(*mut aw.Ref, 0), len: 0, cap: 0 };
+let mut g_wasm_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut g_wasm_fkinds: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
+let mut g_wasm_fnames: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut g_wasm_fields: u.List.[aw.FieldRef] = u.List.[aw.FieldRef].{ data: @ptr_from_int(*mut aw.FieldRef, 0), len: 0,
+                                                                     cap: 0 };
+let mut g_wasm_unit: *mut CUnit = @ptr_from_int(*mut CUnit, 0);
+let mut g_naked_wasm: bool = false;
+let FP_NAMES: [23][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
+                          "issignaling", "iscanonical", "isgreater", "isgreaterequal", "isless", "islessequal",
+                          "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "snan", "tg", "tgn",
+                          "dec"];
+let FP_IDS: [23]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422,
+                       423, 430, 431, 440];
+let MATH_IDS: [9]i32 = [GB_FABS, GB_SQRT, GB_FLOOR, GB_CEIL, GB_TRUNC, GB_RINT, GB_RINT, GB_COPYSIGN, GB_FMA];
+let MATH_N: [9]usize = [1, 1, 1, 1, 1, 1, 1, 2, 3];
+let TCLASS_OF: [9][]u8 = ["isnan", "isnan", "isinf", "isinf", "signbit", "signbit", "isfinite", "isfinite", "isfinite"];
+let LIB_TYPES: [108][]u8 = ["iPPz", "zC", "iCC", "iCCz", "ccC", "ccCz", "ccC", "ccCz", "cCi", "cCi", "cCC", "pPiz",
+                            "iC.", "icC.", "iczC.", "iC", "ii", "pz", "pzz", "ppz", "vp", "v", "vi", "ll", "qq", "dd",
+                            "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd", "dd",
+                            "dd", "dd", "dd", "dd", "dd", "dd", "ff", "ff", "ff", "ff", "ff", "ff", "ff", "ff", "DD",
+                            "DD", "DD", "DD", "DD", "ddd", "ddd", "ddd", "ddd", "ddd", "ddd", "ddd", "ddd", "ddd",
+                            "fff", "fff", "fff", "fff", "fff", "fff", "DDD", "DDD", "DDD", "DDD", "ddi", "ffi", "ddI",
+                            "ffI", "ddG", "ffF", "ld", "qd", "ld", "qd", "ff", "ff", "ff", "ff", "ff", "ff", "ff",
+                            "ipC.", "iCp", "iip", "iip", "zPzzp", "zCC", "zCC", "cCC", "qq", "iC.", "iCC.", "ipC."];
+let CHK_TYPES: [16][]u8 = ["ppPzz", "ppPzz", "ppPzz", "ppizz", "ccCz", "ccCz", "ccCzz", "ccCzz", "ccCz", "ccCzz",
+                           "icizC.", "iczizC.", "icizCV", "iczizCV", "iiC.", "ipiC."];
+let CHK_PLAIN: [16][]u8 = ["memcpy", "memmove", "", "memset", "strcpy", "", "strncpy", "", "strcat", "strncat", "", "",
+                           "", "", "", ""];
+let X86_BASE: [5][]u8 = ["cmov", "mmx", "sse", "sse2", "x86-64"];
+let X86_LEVELS: [3][]u8 = ["x86-64-v2", "x86-64-v3", "x86-64-v4"];
+
+// -----------------------------------------------------------------------------
+// Shared internal helpers
+// -----------------------------------------------------------------------------
+
+fn is_err(e: *cast.Expr) bool {
+    return u.isnil(e.ty) or (e.ty.kind == cty.TK_ERROR);
 }
 
-fn no_external(d: *mut cast.Decl) void {
-    _ = d;
-}
-
-fn no_type_name(t: *mut cast.TypeName) *mut cty.CType {
-    _ = t;
-    return cty.t_error;
-}
-
-fn no_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
-    _ = f;
-    _ = d;
-}
-
-fn no_compound(e: *mut cast.Expr) *mut cast.Expr {
+fn bad_expr(e: *mut cast.Expr) *mut cast.Expr {
     e.ty = cty.t_error;
+    e.lvalue = false;
     return e;
 }
 
-pub let mut hooks: Hooks = Hooks.{ external: no_external, type_name: no_type_name, body: no_body, compound: no_compound,
-                                   stmt_expr: no_compound, label_addr: no_compound };
+fn bad_true(e: *mut cast.Expr) bool {
+    e.ty = cty.t_error;
+    e.lvalue = false;
+    return true;
+}
 
+fn add_once(l: *mut u.List.[*mut cast.CSym], s: *mut cast.CSym) void {
+    for x in l.items() {
+        if x == s {
+            return;
+        }
+    }
+    l.push(s);
+}
+
+fn string_value(x: *cast.Expr) []u8 {
+    let mut s = x;
+    if (s.kind == cast.ExprKind.CAST) and u.notnil(s.a) {
+        s = s.a;
+    }
+    if (s.kind != cast.ExprKind.STRING) or u.isnil(s.tok) or (s.tok.prefix != 0) {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    for c in s.tok.units {
+        if (c == 0) or (c > 0x7f) {
+            return u.nosym();
+        }
+        b.c(@truncate(u8, c));
+    }
+    return b.done();
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn kind_word(k: i32) []u8 {
+    if k == cty.TK_STRUCT {
+        return "struct";
+    }
+    if k == cty.TK_UNION {
+        return "union";
+    }
+    return "enum";
+}
 // -----------------------------------------------------------------------------
 // State
 // -----------------------------------------------------------------------------
@@ -476,11 +637,10 @@ pub fn set_cur_fn(f: *mut cast.CSym) void {
 // The walk
 // -----------------------------------------------------------------------------
 
-/// Analyzes the translation unit `t` under options `o` (with the hooks
-/// installed: csema_stmt.analyze). Errors are reported through diag.ax; the
+/// Analyzes the translation unit `t` under options `o`. Errors are reported through diag.ax; the
 /// unit is complete enough to walk either way, but only one without errors
 /// is the typed tree described above.
-pub fn run(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
+fn run_unit(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
     cty.init(o);
     S = u.new.[State]();
     S.o = o;
@@ -490,7 +650,7 @@ pub fn run(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
     S.unit = u.new.[CUnit]();
     S.next_uid = g_uid_base;
     for d in t.decls.items() {
-        hooks.external(d);
+        external(d);
     }
     // (6.9p3: a function with internal linkage used is defined; reported at its first use)
     let mut told = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
@@ -611,8 +771,16 @@ pub fn fp_dir(st: u32) void {
         cl.g_dir = ld.RZ;
     }
     let dr = cpg.fp_dec_round(st);
-    cdec.g_dir = dm.R_NEAREST;
+    cdec.g_dir = dfp.R_NEAREST;
     if dr != cpg.FPD_DYNAMIC {
         cdec.g_dir = dr - 1;
     }
+}
+
+/// Analyzes the translation unit: the typed tree.
+pub fn analyze(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
+    let cu = run_unit(t, o);
+    pragma_weaks();
+    marks_finish();
+    return cu;
 }

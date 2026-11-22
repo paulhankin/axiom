@@ -22,9 +22,9 @@
 // to its offset in the block.
 // =============================================================================
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
-import "cgen.ax" as cg;
 import "ctypes.ax" as cty;
 
 /// The function a WebAssembly thread's start calls with the top of its
@@ -53,49 +53,50 @@ fn is_thread_local(s: *cast.CSym) bool {
 
 // Whether object s lives in the WebAssembly threads' blocks.
 fn in_block(s: *cast.CSym) bool {
-    return cg.is_wasm and wasm_threads and is_thread_local(s);
+    return tg.is_wasm() and wasm_threads and is_thread_local(s);
 }
 
 /// The address of object s (with static or thread storage duration) in the
-/// function being generated: for a thread-local, the running thread's
-/// instance.
-pub fn addr(s: *mut cast.CSym) *mut ir.Value {
-    let gv = cg.object_addr(s);
+/// function being generated (`gv`: its global's address): for a
+/// thread-local, the running thread's instance.
+pub fn addr(m: *mut ir.Module, b: *mut ir.Builder, s: *mut cast.CSym, gv: *mut ir.Value) *mut ir.Value {
     if not in_block(s) {
         return gv;
     }
-    let off = ir.load(cg.B, cg.T_isz, offset_of(ir.gv_of(gv)));
-    let p = ir.load(cg.B, cg.T_ptr, tls_ptr());
-    let mine = ir.ptradd(cg.B, p, off);
-    return ir.select(cg.B, ir.is_null(cg.B, p), gv, mine);
+    let t_isz = ir.isz();
+    let t_ptr = ir.t_ptr();
+    let off = ir.load(b, t_isz, offset_of(m, ir.gv_of(gv), t_isz));
+    let p = ir.load(b, t_ptr, tls_ptr(m, t_ptr));
+    let mine = ir.ptradd(b, p, off);
+    return ir.select(b, ir.is_null(b, p), gv, mine);
 }
 
 // The block's address in this thread (null in the main thread): a wasm
 // global, so one per instance.
-fn tls_ptr() *mut ir.Value {
-    let g0 = ir.get_global(cg.M, TLS_PTR);
+fn tls_ptr(m: *mut ir.Module, t_ptr: *mut ir.Ty) *mut ir.Value {
+    let g0 = ir.get_global(m, TLS_PTR);
     if u.notnil(g0) {
         return g0.val;
     }
-    let g = ir.add_global(cg.M, cg.T_ptr, TLS_PTR);
-    g.init = ir.czero(cg.T_ptr);
+    let g = ir.add_global(m, t_ptr, TLS_PTR);
+    g.init = ir.czero(t_ptr);
     g.wasm_global = true;
     g.linkage = ir.LINK_INTERNAL;
     return g.val;
 }
 
 // The global holding the offset of g's object in the block.
-fn offset_of(g: *mut ir.Global) *mut ir.Value {
+fn offset_of(m: *mut ir.Module, g: *mut ir.Global, t_isz: *mut ir.Ty) *mut ir.Value {
     for e in entries.items() {
         if e.g == g {
             return e.off.val;
         }
     }
-    let o = ir.add_global(cg.M, cg.T_isz, u.cat2(g.name, ".tls_offset"));
+    let o = ir.add_global(m, t_isz, u.cat2(g.name, ".tls_offset"));
     o.is_const = true;
     o.linkage = ir.LINK_INTERNAL;
-    o.align = cg.T_isz.size;
-    o.init = ir.czero(cg.T_isz);
+    o.align = t_isz.size;
+    o.init = ir.czero(t_isz);
     entries.push(Entry.{ g: g, off: o });
     return o.val;
 }
@@ -103,15 +104,17 @@ fn offset_of(g: *mut ir.Global) *mut ir.Value {
 /// Defines TLS_START (WebAssembly with threads; after the units): copies
 /// each object's initial value into the new thread's block, below `top`,
 /// and records its address. The globals' sizes are known by now.
-pub fn define_start() void {
-    if not (cg.is_wasm and wasm_threads) {
+pub fn define_start(m: *mut ir.Module) void {
+    if not (tg.is_wasm() and wasm_threads) {
         return;
     }
-    let mut ps: [1]*mut ir.Ty = [cg.T_ptr];
-    let fty = ir.t_fn(cg.T_ptr, ps[..], false);
-    let mut f = ir.get_function(cg.M, TLS_START);
+    let t_isz = ir.isz();
+    let t_ptr = ir.t_ptr();
+    let mut ps: [1]*mut ir.Ty = [t_ptr];
+    let fty = ir.t_fn(t_ptr, ps[..], false);
+    let mut f = ir.get_function(m, TLS_START);
     if u.isnil(f) {
-        f = ir.add_function(cg.M, TLS_START, fty);
+        f = ir.add_function(m, TLS_START, fty);
     }
     if not ir.is_decl(f) {
         return;
@@ -128,39 +131,35 @@ pub fn define_start() void {
             block_align = al;
         }
         offs[k] = cty.round_up(block_size, al);
-        e.off.init = ir.cint(cg.T_isz, offs[k]);
+        e.off.init = ir.cint(t_isz, offs[k]);
         block_size = offs[k] + e.g.ty.size;
     }
-    let saved = cg.B;
     let B = ir.new_builder();
-    cg.B = B;
     ir.at_end(B, ir.append_block(f, "entry"));
     let top = f.params[0];
     if entries.len == 0 {
         ir.ret(B, top);
-        cg.B = saved;
         return;
     }
     let size = cty.round_up(block_size, block_align);
-    let base0 = ir.ptradd(B, top, ir.cint(cg.T_isz, 0 -% size));
+    let base0 = ir.ptradd(B, top, ir.cint(t_isz, 0 -% size));
     // (aligned down: the stack's top is 16-aligned, an object may need more)
-    let a = ir.ptrtoint(B, base0, cg.T_isz);
-    let base = ir.ptradd(B, base0, ir.sub(B, cg.usz(0), ir.and_(B, a, cg.usz(block_align - 1))));
+    let a = ir.ptrtoint(B, base0, t_isz);
+    let base = ir.ptradd(B, base0, ir.sub(B, ir.cint(t_isz, 0), ir.and_(B, a, ir.cint(t_isz, block_align - 1))));
     for k in 0..entries.len {
         let e = entries.get(k);
-        let t = initial_copy(e.g);
-        let dst = ir.ptradd(B, base, cg.usz(offs[k]));
-        _ = ir.memop(B, ir.OP_MEMCPY, dst, t, cg.usz(e.g.ty.size));
+        let t = initial_copy(m, e.g);
+        let dst = ir.ptradd(B, base, ir.cint(t_isz, offs[k]));
+        _ = ir.memop(B, ir.OP_MEMCPY, dst, t, ir.cint(t_isz, e.g.ty.size));
     }
-    _ = ir.store(B, base, tls_ptr());
+    _ = ir.store(B, base, tls_ptr(m, t_ptr));
     ir.ret(B, base);
-    cg.B = saved;
 }
 
 // A constant global holding g's initial value (the main thread's instance
 // changes).
-fn initial_copy(g: *mut ir.Global) *mut ir.Value {
-    let c = ir.add_global(cg.M, g.ty, u.cat2(g.name, ".tls_init"));
+fn initial_copy(m: *mut ir.Module, g: *mut ir.Global) *mut ir.Value {
+    let c = ir.add_global(m, g.ty, u.cat2(g.name, ".tls_init"));
     c.init = g.init;
     if u.isnil(c.init) {
         c.init = ir.czero(g.ty);

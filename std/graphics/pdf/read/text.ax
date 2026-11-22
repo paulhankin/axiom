@@ -1,0 +1,466 @@
+// =============================================================================
+// std/graphics/pdf/read/text.ax - Content stream interpreter, form XObject
+// execution, and positioned text extraction, part of std/graphics/pdf/read.
+// =============================================================================
+
+import "../../../collections/vec.ax" as vec;
+import "../../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Text extraction
+// -----------------------------------------------------------------------------
+
+const OP_NUM: u8 = 0;
+const OP_STR: u8 = 1;
+const OP_NAME: u8 = 2;
+const OP_OPEN: u8 = 3;
+const OP_CLOSE: u8 = 4;
+const OP_OTHER: u8 = 5;
+
+struct Operand {
+    kind: u8,
+    num: f64,
+    a: usize,
+    b: usize,
+}
+
+/// a then b, as PDF matrices [a b c d e f].
+fn mul(a: [6]f64, b: [6]f64) [6]f64 {
+    return [
+        (a[0] * b[0]) + (a[1] * b[2]),
+        (a[0] * b[1]) + (a[1] * b[3]),
+        (a[2] * b[0]) + (a[3] * b[2]),
+        (a[2] * b[1]) + (a[3] * b[3]),
+        (a[4] * b[0]) + (a[5] * b[2]) + b[4],
+        (a[4] * b[1]) + (a[5] * b[3]) + b[5],
+    ];
+}
+
+fn extract_page_text(r: *mut Reader, i: usize) ReadError![]mut u8 {
+    let d = r.page(i)!;
+    let mut ex = Extractor.init(r);
+    defer ex.deinit();
+    let res = r.get(d, "Resources")!;
+    let rd = res.as_dict() catch empty_dict();
+    let contents = r.get(d, "Contents")!;
+    let mut data = strs.String.init();
+    defer data.deinit();
+    match contents {
+        .Stream(st) => { data.push_str(decode_stream(r, st) catch "")!; }
+        .Array(a) => {
+            for c in a {
+                let o = r.resolve(c)!;
+                let st = o.as_stream() catch continue;
+                data.push_str(decode_stream(r, st) catch "")!;
+                data.push('\n')!;
+            }
+        }
+        else => {}
+    }
+    ex.run(data.bytes(), rd, 0)!;
+    return ex.out.take();
+}
+
+nocopy struct Extractor {
+    r: *mut Reader,
+    out: strs.String,
+    pool: strs.String,
+    fonts: vec.Vec.[FontMap],
+    // the text state
+    font: usize,  // index in fonts, or NONE
+    size: f64,
+    char_space: f64,
+    word_space: f64,
+    hscale: f64,
+    leading: f64,
+    rise: f64,
+    tm: [6]f64,
+    tlm: [6]f64,
+    ctm: [6]f64,
+    stack: vec.Vec.[[6]f64],
+    // where the last character ended, in device space
+    last_x: f64,
+    last_y: f64,
+    last_size: f64,
+    started: bool,
+    steps: usize,
+
+    fn init(r: *mut Reader) Extractor {
+        let id: [6]f64 = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        return Extractor.{
+            r: r,
+            out: strs.String.init(),
+            pool: strs.String.init(),
+            fonts: vec.Vec.[FontMap].init(),
+            font: NO_FONT,
+            size: 0.0,
+            char_space: 0.0,
+            word_space: 0.0,
+            hscale: 1.0,
+            leading: 0.0,
+            rise: 0.0,
+            tm: id,
+            tlm: id,
+            ctm: id,
+            stack: vec.Vec.[[6]f64].init(),
+            last_x: 0.0,
+            last_y: 0.0,
+            last_size: 0.0,
+            started: false,
+            steps: 0,
+        };
+    }
+
+    fn deinit(self: *mut Extractor) void {
+        self.out.deinit();
+        self.pool.deinit();
+        for &mut f in self.fonts.items_mut() {
+            f.uni.deinit();
+            f.widths.deinit();
+        }
+        self.fonts.deinit();
+        self.stack.deinit();
+    }
+
+    /// Interprets a content stream with its resources.
+    fn run(self: *mut Extractor, data: []u8, res: Dict, depth: u32) ReadError!void {
+        if depth > 8 {
+            return;
+        }
+        let mut ops = vec.Vec.[Operand].init();
+        defer ops.deinit();
+        let mut scratch = strs.String.init();
+        defer scratch.deinit();
+        let mut i: usize = 0;
+        while i < data.len {
+            self.steps += 1;
+            if self.steps > (1 << 26) {
+                return;
+            }
+            i = skip_white(data, i);
+            if i >= data.len {
+                break;
+            }
+            let c = data[i];
+            if (c == '+') or (c == '-') or (c == '.') or ((c >= '0') and (c <= '9')) {
+                let mut iv: i64 = 0;
+                let mut fv: f64 = 0.0;
+                let mut isint = false;
+                let e = scan_number(data, i, &mut iv, &mut fv, &mut isint);
+                if e == i {
+                    i += 1;
+                    continue;
+                }
+                ops.push(Operand.{ kind: OP_NUM, num: fv, a: 0, b: 0 })!;
+                i = e;
+            } else if c == '(' {
+                let a = scratch.len();
+                let mut p = i + 1;
+                literal_into(data, &mut p, &mut scratch)!;
+                ops.push(Operand.{ kind: OP_STR, num: 0.0, a: a, b: scratch.len() })!;
+                i = p;
+            } else if (c == '<') and (at(data, i + 1) != '<') {
+                let a = scratch.len();
+                let mut p = i + 1;
+                hex_into(data, &mut p, &mut scratch)!;
+                ops.push(Operand.{ kind: OP_STR, num: 0.0, a: a, b: scratch.len() })!;
+                i = p;
+            } else if c == '/' {
+                let a = scratch.len();
+                i += 1;
+                while (i < data.len) and is_regular(data[i]) {
+                    scratch.push(data[i])!;
+                    i += 1;
+                }
+                ops.push(Operand.{ kind: OP_NAME, num: 0.0, a: a, b: scratch.len() })!;
+            } else if c == '[' {
+                ops.push(Operand.{ kind: OP_OPEN, num: 0.0, a: 0, b: 0 })!;
+                i += 1;
+            } else if c == ']' {
+                ops.push(Operand.{ kind: OP_CLOSE, num: 0.0, a: 0, b: 0 })!;
+                i += 1;
+            } else if (c == '<') and (at(data, i + 1) == '<') {
+                // a dictionary operand (marked content): skip it
+                let mut depth2: usize = 0;
+                while i < data.len {
+                    if (data[i] == '<') and (at(data, i + 1) == '<') {
+                        depth2 += 1;
+                        i += 2;
+                    } else if (data[i] == '>') and (at(data, i + 1) == '>') {
+                        depth2 -= 1;
+                        i += 2;
+                        if depth2 == 0 {
+                            break;
+                        }
+                    } else if data[i] == '(' {
+                        let mut p = i + 1;
+                        let mut junk = strs.String.init();
+                        defer junk.deinit();
+                        literal_into(data, &mut p, &mut junk)!;
+                        i = p;
+                    } else {
+                        i += 1;
+                    }
+                }
+                ops.push(Operand.{ kind: OP_OTHER, num: 0.0, a: 0, b: 0 })!;
+            } else if is_regular(c) {
+                let s = i;
+                while (i < data.len) and is_regular(data[i]) {
+                    i += 1;
+                }
+                let op = data[s..i];
+                if strs.eq(op, "BI") {
+                    // an inline image: skip to EI
+                    let id = strs.index_of_from(data, "ID", i) ?? data.len;
+                    let mut k = id + 2;
+                    while k + 2 <= data.len {
+                        if is_white(at(data, k)) and (at(data, k + 1) == 'E') and (at(data, k + 2) == 'I') and
+                           ((k + 3 >= data.len) or not is_regular(data[k + 3])) {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    i = @min(k + 3, data.len);
+                } else {
+                    self.operator(op, ops.items(), scratch.bytes(), res, depth)!;
+                }
+                ops.clear();
+                scratch.clear();
+            } else {
+                i += 1;
+            }
+            if ops.len() > 4096 {
+                ops.clear();
+                scratch.clear();
+            }
+        }
+    }
+
+    fn num(ops: []Operand, k: usize) f64 {
+        if (k < ops.len) and (ops[k].kind == OP_NUM) {
+            return ops[k].num;
+        }
+        return 0.0;
+    }
+
+    fn operator(self: *mut Extractor, op: []u8, ops: []Operand, sc: []u8, res: Dict, depth: u32) ReadError!void {
+        let n = ops.len;
+        if strs.eq(op, "q") {
+            if self.stack.len() < 256 {
+                self.stack.push(self.ctm)!;
+            }
+        } else if strs.eq(op, "Q") {
+            self.ctm = self.stack.pop() ?? self.ctm;
+        } else if strs.eq(op, "cm") and (n >= 6) {
+            let m: [6]f64 = [
+                Extractor.num(ops, n - 6),
+                Extractor.num(ops, n - 5),
+                Extractor.num(ops, n - 4),
+                Extractor.num(ops, n - 3),
+                Extractor.num(ops, n - 2),
+                Extractor.num(ops, n - 1),
+            ];
+            self.ctm = mul(m, self.ctm);
+        } else if strs.eq(op, "BT") {
+            self.tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            self.tlm = self.tm;
+        } else if strs.eq(op, "Tf") and (n >= 2) {
+            self.size = Extractor.num(ops, n - 1);
+            if ops[n - 2].kind == OP_NAME {
+                self.font = load_font(self, sc[ops[n - 2].a..ops[n - 2].b], res)!;
+            }
+        } else if strs.eq(op, "Tc") and (n >= 1) {
+            self.char_space = Extractor.num(ops, n - 1);
+        } else if strs.eq(op, "Tw") and (n >= 1) {
+            self.word_space = Extractor.num(ops, n - 1);
+        } else if strs.eq(op, "Tz") and (n >= 1) {
+            self.hscale = Extractor.num(ops, n - 1) / 100.0;
+        } else if strs.eq(op, "TL") and (n >= 1) {
+            self.leading = Extractor.num(ops, n - 1);
+        } else if strs.eq(op, "Ts") and (n >= 1) {
+            self.rise = Extractor.num(ops, n - 1);
+        } else if (strs.eq(op, "Td") or strs.eq(op, "TD")) and (n >= 2) {
+            let tx = Extractor.num(ops, n - 2);
+            let ty = Extractor.num(ops, n - 1);
+            if strs.eq(op, "TD") {
+                self.leading = -ty;
+            }
+            self.tlm = mul([1.0, 0.0, 0.0, 1.0, tx, ty], self.tlm);
+            self.tm = self.tlm;
+        } else if strs.eq(op, "Tm") and (n >= 6) {
+            self.tlm = [
+                Extractor.num(ops, n - 6),
+                Extractor.num(ops, n - 5),
+                Extractor.num(ops, n - 4),
+                Extractor.num(ops, n - 3),
+                Extractor.num(ops, n - 2),
+                Extractor.num(ops, n - 1),
+            ];
+            self.tm = self.tlm;
+        } else if strs.eq(op, "T*") {
+            self.next_line();
+        } else if strs.eq(op, "Tj") and (n >= 1) and (ops[n - 1].kind == OP_STR) {
+            self.show(sc[ops[n - 1].a..ops[n - 1].b])!;
+        } else if strs.eq(op, "'") and (n >= 1) and (ops[n - 1].kind == OP_STR) {
+            self.next_line();
+            self.show(sc[ops[n - 1].a..ops[n - 1].b])!;
+        } else if strs.eq(op, "\"") and (n >= 3) and (ops[n - 1].kind == OP_STR) {
+            self.word_space = Extractor.num(ops, n - 3);
+            self.char_space = Extractor.num(ops, n - 2);
+            self.next_line();
+            self.show(sc[ops[n - 1].a..ops[n - 1].b])!;
+        } else if strs.eq(op, "TJ") {
+            for o in ops {
+                if o.kind == OP_STR {
+                    self.show(sc[o.a..o.b])!;
+                } else if o.kind == OP_NUM {
+                    let tx = (-o.num / 1000.0) * self.size * self.hscale;
+                    self.tm = mul([1.0, 0.0, 0.0, 1.0, tx, 0.0], self.tm);
+                }
+            }
+        } else if strs.eq(op, "Do") and (n >= 1) and (ops[n - 1].kind == OP_NAME) {
+            self.form(sc[ops[n - 1].a..ops[n - 1].b], res, depth)!;
+        }
+    }
+
+    fn next_line(self: *mut Extractor) void {
+        self.tlm = mul([1.0, 0.0, 0.0, 1.0, 0.0, -self.leading], self.tlm);
+        self.tm = self.tlm;
+    }
+
+    /// A form XObject: its content, with its own resources.
+    fn form(self: *mut Extractor, name: []u8, res: Dict, depth: u32) ReadError!void {
+        // each use costs steps of its own, so a form that draws itself many
+        // times over (a tree of uses, 8 deep) cannot run on for long
+        self.steps += 1024;
+        if self.steps > (1 << 26) {
+            return;
+        }
+        let xo = self.r.get(res, "XObject")!;
+        let xd = xo.as_dict() catch return;
+        let f = self.r.get(xd, name)!;
+        let st = f.as_stream() catch return;
+        let sub = self.r.get(st.dict, "Subtype")!;
+        let sn = sub.as_name() catch return;
+        if not strs.eq(sn, "Form") {
+            return;
+        }
+        let data = decode_stream(self.r, st) catch return;
+        let fr = self.r.get(st.dict, "Resources")!;
+        let frd = fr.as_dict() catch res;
+        let saved = self.ctm;
+        let mo = self.r.get(st.dict, "Matrix")!;
+        let ma = mo.as_array() catch [];
+        if ma.len == 6 {
+            let mut m: [6]f64 = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            for k in @as(usize, 0)..6 {
+                m[k] = ma[k].as_num() catch m[k];
+            }
+            self.ctm = mul(m, self.ctm);
+        }
+        // fonts are looked up by name in the form's own resources
+        let saved_fonts = self.fonts.len();
+        let saved_font = self.font;
+        self.run(data, frd, depth + 1)!;
+        // forget the form's fonts (their names may clash with the page's)
+        while self.fonts.len() > saved_fonts {
+            let mut f2 = self.fonts.pop() ?? break;
+            f2.uni.deinit();
+            f2.widths.deinit();
+        }
+        self.font = saved_font;
+        self.ctm = saved;
+    }
+
+    /// Shows a string: decodes it to characters, placing each.
+    fn show(self: *mut Extractor, s: []u8) ReadError!void {
+        if self.font == NO_FONT {
+            return;
+        }
+        let fi = self.font;
+        let mut i: usize = 0;
+        while i < s.len {
+            let f = self.fonts.get_ptr(fi);
+            // the code: its length from the codespace
+            let mut len: usize = 1;
+            if f.two_byte {
+                len = 2;
+            } else {
+                let mut code: u32 = @as(u32, s[i]);
+                len = 1;
+                while (len < 4) and (f.ranges[len - 1] == 0) and (i + len < s.len) {
+                    code = (code << 8) | @as(u32, s[i + len]);
+                    len += 1;
+                }
+                _ = code;
+            }
+            let mut code: u32 = 0;
+            for k in 0..len {
+                code = (code << 8) | @as(u32, at(s, i + k));
+            }
+            i += len;
+            let w = self.width(fi, code);
+            // where the glyph goes, in device space
+            let trm = mul([self.size * self.hscale, 0.0, 0.0, self.size, 0.0, self.rise], mul(self.tm, self.ctm));
+            let x = trm[4];
+            let y = trm[5];
+            let dev_size = @sqrt((trm[2] * trm[2]) + (trm[3] * trm[3]));
+            self.place(fi, code, x, y, dev_size)!;
+            // advance
+            let mut adv = ((w / 1000.0) * self.size) + self.char_space;
+            if (len == 1) and (code == 32) {
+                adv += self.word_space;
+            }
+            adv *= self.hscale;
+            self.tm = mul([1.0, 0.0, 0.0, 1.0, adv, 0.0], self.tm);
+            let end = mul(self.tm, self.ctm);
+            self.last_x = end[4];
+            self.last_y = end[5];
+        }
+    }
+
+    fn width(self: *mut Extractor, fi: usize, code: u32) f64 {
+        let f = self.fonts.get_ptr(fi);
+        return f.widths.get(code) ?? f.default_width;
+    }
+
+    /// Appends a character, with a line break or a space before it when it
+    /// is far from the last one.
+    fn place(self: *mut Extractor, fi: usize, code: u32, x: f64, y: f64, size: f64) ReadError!void {
+        let f = self.fonts.get_ptr(fi);
+        let mut text: []u8 = "";
+        let mut buf: [4]u8 = [0; 4];
+        if let .some(v) = f.uni.get(code) {
+            let off = @truncate(usize, v >> 16);
+            let len = @truncate(usize, v & 0xffff);
+            text = self.pool.bytes()[off..off + len];
+        } else if f.has_simple and (code < 256) {
+            let u = f.simple[@as(usize, code)];
+            if u != 0 {
+                text = strs.encode_rune(buf[..], u);
+            }
+        }
+        if text.len == 0 {
+            return;
+        }
+        let sz = @max(size, 1.0);
+        if self.started {
+            let dy = @abs(y - self.last_y);
+            let dx = x - self.last_x;
+            if dy > (0.5 * @max(sz, self.last_size)) {
+                self.out.push('\n')!;
+            } else if (dx > (0.15 * sz)) or (dx < -(0.5 * sz)) {
+                let n = self.out.len();
+                if n > 0 {
+                    let lastc = self.out.bytes()[n - 1];
+                    if (lastc != ' ') and (lastc != '\n') and (text[0] != ' ') {
+                        self.out.push(' ')!;
+                    }
+                }
+            }
+        }
+        self.out.push_str(text)!;
+        self.started = true;
+        self.last_size = sz;
+    }
+}

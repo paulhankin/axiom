@@ -1,7 +1,7 @@
 // =============================================================================
 // cgen_flow.ax - IR generation for C's control flow where the IR wants a
 // shape of its own: switch statements, and functions whose gotos make
-// control flow irreducible, made reducible for WebAssembly.
+// control flow irreducible, made reducible for WebAssembly. Part of cgen.ax.
 //
 // A switch statement is one IR switch, its cases sorted by value; code
 // generation (switches.ax) makes it jump tables, bit tests and a search
@@ -24,7 +24,6 @@
 import "../ir.ax" as ir;
 import "../opt.ax" as opt;
 import "../util.ax" as u;
-import "cgen.ax" as cg;
 
 // -----------------------------------------------------------------------------
 // Switch statements
@@ -35,15 +34,12 @@ struct Case {
     b: *mut ir.Block,
 }
 
-let mut g_signed: bool = false;
-let mut g_bits: i32 = 64;
-
 // The value's key for ordering: its bits, with the sign bit flipped for a
 // signed type (so that unsigned order is the signed one).
 fn ord(v: u64) u64 {
     let mut x = v;
-    if g_signed {
-        x = x ^ (@as(u64, 1) << @int_cast(u32, g_bits - 1));
+    if flow_signed {
+        x = x ^ (@as(u64, 1) << @int_cast(u32, flow_bits - 1));
     }
     return x;
 }
@@ -60,19 +56,19 @@ fn cmp_case(a: Case, b: Case) i32 {
     return 0;
 }
 
-/// Ends the current block with a switch on v (an integer of a signed or
-/// unsigned C type: sg) to the blocks bs for the values vs (distinct, as v's
-/// IR type's bits), or to dflt.
-pub fn switch_to(v: *mut ir.Value, sg: bool, vs: []u64, bs: []*mut ir.Block, dflt: *mut ir.Block) void {
+// Ends the current block with a switch on v (an integer of a signed or
+// unsigned C type: sg) to the blocks bs for the values vs (distinct, as v's
+// IR type's bits), or to dflt.
+fn switch_to(v: *mut ir.Value, sg: bool, vs: []u64, bs: []*mut ir.Block, dflt: *mut ir.Block) void {
     let n = vs.len;
     let cs = u.newn.[Case](n + 1);
     for i in 0..n {
         cs[i] = Case.{ v: vs[i], b: bs[i] };
     }
-    g_signed = sg;
-    g_bits = v.ty.bits;
+    flow_signed = sg;
+    flow_bits = v.ty.bits;
     u.sort.[Case](cs[0..n], cmp_case);
-    let sw = ir.switch_(cg.B, v, dflt);
+    let sw = ir.switch_(B, v, dflt);
     for c in cs[0..n] {
         ir.add_case(sw, ir.cint(v.ty, c.v), c.b);
     }
@@ -84,7 +80,7 @@ pub fn switch_to(v: *mut ir.Value, sg: bool, vs: []u64, bs: []*mut ir.Block, dfl
 
 // The function's reachable blocks, numbered (Block.mark: the number + 1;
 // 0 for those not reached), and the work arrays of the search, by number.
-struct Graph {
+struct FlowGraph {
     blocks: u.List.[*mut ir.Block],
     in_set: []mut bool,  // in the subgraph searched
     index: []mut i32,    // Tarjan's: the order of the visit (-1: not yet), the lowest index reached
@@ -92,7 +88,7 @@ struct Graph {
     on: []mut bool,  // on Tarjan's stack
 }
 
-fn number(f: *mut ir.Func, g: *mut Graph) void {
+fn flow_number(f: *mut ir.Func, g: *mut FlowGraph) void {
     g.blocks.clear();
     let mut b = f.first;
     while u.notnil(b) {
@@ -127,29 +123,29 @@ fn number(f: *mut ir.Func, g: *mut Graph) void {
     }
 }
 
-fn idx(b: *ir.Block) usize {
+fn flow_idx(b: *ir.Block) usize {
     return @int_cast(usize, b.mark - 1);
 }
 
-fn set_members(g: *mut Graph, ms: []*mut ir.Block, on: bool) void {
+fn set_members(g: *mut FlowGraph, ms: []*mut ir.Block, on: bool) void {
     for b in ms {
-        g.in_set[idx(b)] = on;
+        g.in_set[flow_idx(b)] = on;
     }
 }
 
 // The strongly connected components of the subgraph of the blocks ms
 // (Tarjan's algorithm, without recursion), each with more than one block
 // or a branch to itself: their blocks, in comps (each ended by a nil).
-fn components(g: *mut Graph, ms: []*mut ir.Block, comps: *mut u.List.[*mut ir.Block]) void {
+fn components(g: *mut FlowGraph, ms: []*mut ir.Block, comps: *mut u.List.[*mut ir.Block]) void {
     set_members(g, ms, true);
     for b in ms {
-        g.index[idx(b)] = -1;
+        g.index[flow_idx(b)] = -1;
     }
     let mut st = u.List.[usize].empty();    // Tarjan's stack
     let mut work = u.List.[usize].empty();  // the DFS: block, next successor (pairs)
     let mut next: i32 = 0;
     for rb in ms {
-        let root = idx(rb);
+        let root = flow_idx(rb);
         if g.index[root] >= 0 {
             continue;
         }
@@ -170,7 +166,7 @@ fn components(g: *mut Graph, ms: []*mut ir.Block, comps: *mut u.List.[*mut ir.Bl
                 if s.mark == 0 {
                     continue;
                 }
-                let w = idx(s);
+                let w = flow_idx(s);
                 if not g.in_set[w] {
                     continue;
                 }
@@ -233,9 +229,9 @@ fn has_phi(b: *ir.Block) bool {
     return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
 }
 
-/// Makes f's control flow reducible (for WebAssembly), as the header says.
-pub fn make_reducible(f: *mut ir.Func) void {
-    let g = u.new.[Graph]();
+// Makes f's control flow reducible (for WebAssembly), as the header says.
+fn make_reducible(f: *mut ir.Func) void {
+    let g = u.new.[FlowGraph]();
     let mut rounds: i32 = 0;
     while (rounds < 10000) and fix_one(f, g) {
         rounds += 1;
@@ -246,8 +242,8 @@ pub fn make_reducible(f: *mut ir.Func) void {
 // Gives the cycles with more than one entry one each (those found in one
 // search: the dispatch blocks may make others within them, which the next
 // finds); false if there were none.
-fn fix_one(f: *mut ir.Func, g: *mut Graph) bool {
-    number(f, g);
+fn fix_one(f: *mut ir.Func, g: *mut FlowGraph) bool {
+    flow_number(f, g);
     opt.compute_preds(f);
     // regions to search: lists of blocks, each ended by a nil
     let mut regions = u.List.[*mut ir.Block].empty();
@@ -281,7 +277,7 @@ fn fix_one(f: *mut ir.Func, g: *mut Graph) bool {
             for b in c {
                 let mut outside = b == f.first;
                 for p in b.preds.items() {
-                    if (p.mark == 0) or not g.in_set[idx(p)] {
+                    if (p.mark == 0) or not g.in_set[flow_idx(p)] {
                         outside = true;
                     }
                 }
@@ -321,15 +317,14 @@ fn dispatch(f: *mut ir.Func, entries: []*mut ir.Block) bool {
             return false;
         }
     }
-    let i32t = ir.t_int(32);
     // the selector, in the entry block
     let term = ir.terminator(f.first);
     if u.notnil(term) {
-        ir.at_before(cg.B, term);
+        ir.at_before(B, term);
     } else {
-        ir.at_end(cg.B, f.first);
+        ir.at_end(B, f.first);
     }
-    let sel = ir.alloca(cg.B, i32t, "dispatch");
+    let sel = ir.alloca(B, T_i32, "dispatch");
     let h = ir.append_block(f, "dispatch");
     for k in 0..entries.len {
         let e = entries[k];
@@ -339,17 +334,17 @@ fn dispatch(f: *mut ir.Func, entries: []*mut ir.Block) bool {
                 continue;  // (not reached)
             }
             let s = ir.append_block(f, "toentry");
-            ir.at_end(cg.B, s);
-            _ = ir.store(cg.B, ir.cint(i32t, @as(u64, k)), sel);
-            ir.br(cg.B, h);
+            ir.at_end(B, s);
+            _ = ir.store(B, ir.cint(T_i32, @as(u64, k)), sel);
+            ir.br(B, h);
             ir.retarget(p, e, s);
         }
     }
-    ir.at_end(cg.B, h);
-    let x = ir.load(cg.B, i32t, sel);
-    let sw = ir.switch_(cg.B, x, entries[0]);
+    ir.at_end(B, h);
+    let x = ir.load(B, T_i32, sel);
+    let sw = ir.switch_(B, x, entries[0]);
     for k in 1..entries.len {
-        ir.add_case(sw, ir.cint(i32t, @as(u64, k)), entries[k]);
+        ir.add_case(sw, ir.cint(T_i32, @as(u64, k)), entries[k]);
     }
     return true;
 }

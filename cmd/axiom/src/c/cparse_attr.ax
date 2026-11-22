@@ -1,0 +1,410 @@
+// =============================================================================
+// cparse_attr.ax - C23 attributes, GNU attributes, __declspec and asm labels,
+// part of cparse.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Attributes (C23)
+// -----------------------------------------------------------------------------
+// The number of tokens of the GNU attribute specifiers (`__attribute__((...))`,
+// `__declspec(...)`) at offset k: each keyword and its parenthesized group.
+fn gnu_attrs_ahead(P: *mut Parser, k0: usize) usize {
+    let mut k = k0;
+    while kw_at(P, k) == ct.K_ATTRIBUTE {
+        k += 1;
+        if not is_p(peek(P, k), ct.P_LPAREN) {
+            return k - k0;
+        }
+        let mut depth: i32 = 0;
+        loop {
+            let t = peek(P, k);
+            if t.kind == ct.T_EOF {
+                return k - k0;
+            }
+            k += 1;
+            if is_p(t, ct.P_LPAREN) {
+                depth += 1;
+            } else if is_p(t, ct.P_RPAREN) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    return k - k0;
+}
+
+fn at_attr(P: *Parser) bool {
+    return at_p(P, ct.P_LBRACKET) and is_p(peek(P, 1), ct.P_LBRACKET);
+}
+
+// The number of tokens of the attribute specifiers at the current token.
+fn attrs_ahead(P: *Parser) usize {
+    let mut k: usize = 0;
+    while is_p(peek(P, k), ct.P_LBRACKET) and is_p(peek(P, k + 1), ct.P_LBRACKET) {
+        let mut depth: i32 = 0;
+        loop {
+            let t = peek(P, k);
+            if t.kind == ct.T_EOF {
+                return k;
+            }
+            k += 1;
+            if is_p(t, ct.P_LBRACKET) {
+                depth += 1;
+            } else if is_p(t, ct.P_RBRACKET) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    return k;
+}
+
+fn attr_word(t: *ct.Token) bool {
+    return (t.kind == ct.T_IDENT) or (t.kind == ct.T_KEYWORD);
+}
+
+// One attribute specifier `[[ ... ]]` (at '[['), its attributes added to `out`.
+fn parse_attr_spec(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    let start = cur(P).span;
+    _ = advance(P);
+    _ = advance(P);
+    feature(P, co.C23, start, "C2130", "attributes are");
+    loop {
+        if at_p(P, ct.P_RBRACKET) or at_eof(P) {
+            break;
+        }
+        if accept_p(P, ct.P_COMMA) {
+            continue;
+        }
+        if not attr_word(cur(P)) {
+            syntax(P, "an attribute");
+            break;
+        }
+        let a = u.new.[cast.Attr]();
+        let w = advance(P);
+        a.span = w.span;
+        a.prefix = "";
+        a.name = w.text;
+        // `prefix::name` (before C23 '::' is two ':')
+        let mut scoped = false;
+        if at_p(P, ct.P_COLONCOLON) {
+            _ = advance(P);
+            scoped = true;
+        } else if at_p(P, ct.P_COLON) and is_p(peek(P, 1), ct.P_COLON) {
+            _ = advance(P);
+            _ = advance(P);
+            scoped = true;
+        }
+        if scoped {
+            if not attr_word(cur(P)) {
+                syntax(P, "an attribute name after '::'");
+                break;
+            }
+            a.prefix = a.name;
+            a.name = advance(P).text;
+            if P.gnu and u.str_eq(a.prefix, "__gnu__") {
+                a.prefix = "gnu";
+            }
+        }
+        if (a.prefix.len == 3) and u.str_eq(a.prefix, "gnu") and gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+            gnu_exprs(P, a);
+        } else {
+            attr_args(P, a);
+        }
+        a.span = span_from(P, a.span);
+        out.push(a);
+        if not at_p(P, ct.P_COMMA) {
+            break;
+        }
+    }
+    if not (at_p(P, ct.P_RBRACKET) and is_p(peek(P, 1), ct.P_RBRACKET)) {
+        syntax(P, "']]'");
+        // to the end of the specifier
+        while not at_eof(P) and not (at_p(P, ct.P_RBRACKET) and is_p(peek(P, 1), ct.P_RBRACKET)) {
+            if at_p(P, ct.P_SEMI) or at_p(P, ct.P_LBRACE) or at_p(P, ct.P_RBRACE) {
+                return;
+            }
+            _ = advance(P);
+        }
+    }
+    _ = advance(P);
+    _ = advance(P);
+}
+
+// An attribute's argument clause, if it has one: a balanced token sequence
+// in parentheses.
+fn attr_args(P: *mut Parser, a: *mut cast.Attr) void {
+    if not at_p(P, ct.P_LPAREN) {
+        return;
+    }
+    a.has_args = true;
+    _ = advance(P);
+    let from = P.pos;
+    let mut depth: i32 = 0;
+    while not at_eof(P) {
+        let t = cur(P);
+        if is_p(t, ct.P_LPAREN) or is_p(t, ct.P_LBRACKET) or is_p(t, ct.P_LBRACE) {
+            depth += 1;
+        } else if is_p(t, ct.P_RPAREN) or is_p(t, ct.P_RBRACKET) or is_p(t, ct.P_RBRACE) {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        _ = advance(P);
+    }
+    let toks = u.newn.[ct.Token](P.pos - from);
+    for k in 0..toks.len {
+        toks[k] = P.t[from + k];
+    }
+    a.args = toks;
+    _ = expect_p(P, ct.P_RPAREN);
+}
+
+// The GNU attributes whose arguments are expressions (to be parsed where
+// they are: they may name types), not tokens.
+fn gnu_expr_args(name0: []u8) bool {
+    let mut name = name0;
+    if (name.len > 4) and u.starts(name, "__") and u.ends(name, "__") {
+        name = name[2..name.len - 2];
+    }
+    let names = ["aligned", "vector_size", "constructor", "destructor", "alloc_size", "alloc_align", "assume_aligned",
+                 "nonnull", "format_arg", "sentinel"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The arguments of such an attribute (at its '('): assignment expressions.
+fn gnu_exprs(P: *mut Parser, a: *mut cast.Attr) void {
+    a.has_args = true;
+    _ = advance(P);
+    if not at_p(P, ct.P_RPAREN) {
+        loop {
+            a.exprs.push(parse_assign(P));
+            if not accept_p(P, ct.P_COMMA) {
+                break;
+            }
+        }
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+}
+
+// An attribute specifier sequence, if there is one, into `out`.
+fn parse_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    while at_attr(P) {
+        parse_attr_spec(P, out);
+    }
+}
+
+// An attribute specifier sequence, with (a GNU dialect) `__attribute__`
+// specifiers among it, where both appertain to the same thing: a
+// declaration's entities, a statement, a label, an enumerator, a tag.
+fn parse_attrs_g(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    // (a __declspec is left to the declaration specifiers it begins: parse_declspec)
+    while at_attr(P) or (at_kw(P, ct.K_ATTRIBUTE) and not u.str_eq(cur(P).text, "__declspec")) {
+        if at_attr(P) {
+            parse_attr_spec(P, out);
+        } else {
+            parse_gnu_attrs(P, out);
+        }
+    }
+}
+
+// `__attribute__ (( attribute-list ))` (a GNU dialect), as many as there
+// are: each attribute (a name, maybe a keyword, and its arguments) into
+// `out` with the prefix "gnu"; an empty one is none.
+fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    parse_gnu_attrs_ds(P, out, u.nil.[cast.DeclSpec]());
+}
+
+// parse_gnu_attrs among declaration specifiers ds (nil: elsewhere), where
+// `__declspec(thread)` is a storage-class specifier.
+fn parse_gnu_attrs_ds(P: *mut Parser, out: *mut u.List.[*mut cast.Attr], ds: *mut cast.DeclSpec) void {
+    while at_kw(P, ct.K_ATTRIBUTE) {
+        if u.str_eq(cur(P).text, "__declspec") {
+            parse_declspec(P, out, ds);
+            continue;
+        }
+        // (the compiler's headers' __axiom_attribute__, and the system's
+        // headers' __attribute__ under an ISO standard: prefix __axiom)
+        let attr_kw = advance(P);
+        let pre = u.pick(P.gnu and not u.str_eq(attr_kw.text, "__axiom_attribute__"), "gnu", "__axiom");
+        if not expect_p(P, ct.P_LPAREN) {
+            return;
+        }
+        if not expect_p(P, ct.P_LPAREN) {
+            skip_to_rparen(P);
+            return;
+        }
+        loop {
+            if at_p(P, ct.P_RPAREN) or at_eof(P) {
+                break;
+            }
+            if accept_p(P, ct.P_COMMA) {
+                continue;
+            }
+            if not attr_word(cur(P)) {
+                syntax(P, "an attribute");
+                break;
+            }
+            let a = u.new.[cast.Attr]();
+            let w = advance(P);
+            a.span = w.span;
+            a.prefix = pre;
+            a.name = w.text;
+            if gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+                gnu_exprs(P, a);
+            } else {
+                attr_args(P, a);
+            }
+            a.span = span_from(P, a.span);
+            out.push(a);
+            if not at_p(P, ct.P_COMMA) {
+                break;
+            }
+        }
+        if not expect_p(P, ct.P_RPAREN) or not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+    }
+}
+
+// `__declspec ( extended-decl-modifiers )`: the Windows spelling of
+// attributes (a GNU dialect's, on every target), each a name
+// with its arguments, separated by spaces (or commas), as the GNU attributes
+// that do what it says:
+//   align(n) aligned(n); allocate("s"), code_seg("s") section("s");
+//   deprecated, deprecated("text"); naked; noinline; noreturn; nothrow;
+//   restrict (of a function: its result is no other pointer's) malloc;
+//   selectany (a definition other units may make too) weak; thread (among
+//   declaration specifiers: elsewhere C2143) the storage-class specifier
+//   _Thread_local;
+//   dllexport, dllimport and noalias change nothing (a DLL exports its
+//   definitions of default visibility, and objects defined in another
+//   module are imported whatever their declarations say: docs/c.md);
+// any other name is kept as it is, which semantic analysis warns of as an
+// unknown attribute (C4052).
+fn parse_declspec(P: *mut Parser, out: *mut u.List.[*mut cast.Attr], ds: *mut cast.DeclSpec) void {
+    _ = advance(P);
+    if not expect_p(P, ct.P_LPAREN) {
+        return;
+    }
+    loop {
+        if at_p(P, ct.P_RPAREN) or at_eof(P) {
+            break;
+        }
+        if accept_p(P, ct.P_COMMA) {
+            continue;
+        }
+        if not attr_word(cur(P)) {
+            syntax(P, "a __declspec modifier");
+            break;
+        }
+        let w = advance(P);
+        let a = u.new.[cast.Attr]();
+        a.span = w.span;
+        // (under an ISO standard, where __declspec is a keyword for Windows'
+        // headers: the compiler's own spelling, which every mode reads)
+        a.prefix = u.pick(P.gnu, "gnu", "__axiom");
+        let n = w.text;
+        a.name = n;
+        if u.str_eq(n, "align") {
+            a.name = "aligned";
+        } else if u.str_eq(n, "allocate") or u.str_eq(n, "code_seg") {
+            a.name = "section";
+        } else if u.str_eq(n, "restrict") {
+            a.name = "malloc";
+        } else if u.str_eq(n, "selectany") {
+            a.name = "weak";
+        }
+        if gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+            gnu_exprs(P, a);
+        } else {
+            attr_args(P, a);
+        }
+        a.span = span_from(P, a.span);
+        if u.str_eq(n, "thread") {
+            if u.isnil(ds) {
+                error_at(a.span, "C2143",
+                         "'__declspec(thread)' is a storage-class specifier: only among a declaration's specifiers");
+            } else {
+                _ = add_spec(ds, cast.SpecKind.STORAGE, ct.K_THREAD_LOCAL, a.span);
+                ds.storage |= storage_bit(ct.K_THREAD_LOCAL);
+            }
+            continue;
+        }
+        if u.str_eq(n, "dllexport") or u.str_eq(n, "dllimport") or u.str_eq(n, "noalias") {
+            continue;
+        }
+        out.push(a);
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+}
+
+// GNU attributes, if there are any, into `out`.
+fn gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    if at_kw(P, ct.K_ATTRIBUTE) {
+        parse_gnu_attrs(P, out);
+    }
+}
+
+// `asm ( string-literal )` after a declarator (a GNU dialect): the
+// declared entity's symbol name.
+fn asm_label(P: *mut Parser, d: *mut cast.Declarator) void {
+    if not at_kw(P, ct.K_ASM) {
+        return;
+    }
+    let sp = advance(P).span;
+    d.asm_span = sp;
+    if not expect_p(P, ct.P_LPAREN) {
+        return;
+    }
+    let t = cur(P);
+    if (t.kind == ct.T_STRING) and (t.prefix == ct.ENC_NONE) {
+        _ = advance(P);
+        let mut b = u.Buf.init();
+        for x in t.units {
+            b.c(@truncate(u8, x));
+        }
+        d.asm_name = u.intern(b.done());
+        if d.asm_name.len == 0 {
+            error_at(t.span, "C2001", "an 'asm' label must not be empty");
+        }
+    } else {
+        syntax(P, "a string literal (the symbol name)");
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    d.asm_span = span_from(P, sp);
+}
+
+// Attributes where none can appear: reported and skipped.
+fn no_attrs(P: *mut Parser) void {
+    let k = attrs_ahead(P);
+    if k == 0 {
+        return;
+    }
+    let sp = cur(P).span;
+    P.pos += k;
+    if P.pos >= P.n {
+        P.pos = P.n - 1;
+    }
+    error_at(span_from(P, sp), "C2005", "an attribute cannot appear here");
+}

@@ -1,0 +1,606 @@
+// =============================================================================
+// cparse_type.ax - C declaration specifiers, tags, declarators and type names,
+// part of cparse.ax.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "cpragma.ax" as cpg;
+import "ctok.ax" as ct;
+
+// -----------------------------------------------------------------------------
+// Declaration specifiers
+// -----------------------------------------------------------------------------
+fn ctx_name(ctx: i32) []u8 {
+    if ctx == CTX_MEMBER {
+        return "member declaration";
+    }
+    if ctx == CTX_COMPOUND {
+        return "compound literal";
+    }
+    if ctx == CTX_TYPENAME {
+        return "type name";
+    }
+    return "declaration";
+}
+
+fn add_spec(ds: *mut cast.DeclSpec, k: cast.SpecKind, kw: i32, sp: u.Span) *mut cast.Spec {
+    let s = ds.items.extend(1);
+    s[0].kind = k;
+    s[0].kw = kw;
+    s[0].span = sp;
+    s[0].name = "";
+    s[0].tag = u.nil.[cast.TagSpec]();
+    s[0].tname = u.nil.[cast.TypeName]();
+    s[0].e = u.nil.[cast.Expr]();
+    return &mut s[0];
+}
+
+fn storage_bit(id: i32) i32 {
+    if id == ct.K_TYPEDEF {
+        return cast.SC_TYPEDEF;
+    }
+    if id == ct.K_EXTERN {
+        return cast.SC_EXTERN;
+    }
+    if id == ct.K_STATIC {
+        return cast.SC_STATIC;
+    }
+    if id == ct.K_THREAD_LOCAL {
+        return cast.SC_THREAD_LOCAL;
+    }
+    if id == ct.K_AUTO {
+        return cast.SC_AUTO;
+    }
+    if id == ct.K_REGISTER {
+        return cast.SC_REGISTER;
+    }
+    return cast.SC_CONSTEXPR;
+}
+
+fn qual_bit(id: i32) i32 {
+    if id == ct.K_CONST {
+        return cast.Q_CONST;
+    }
+    if id == ct.K_VOLATILE {
+        return cast.Q_VOLATILE;
+    }
+    if id == ct.K_RESTRICT {
+        return cast.Q_RESTRICT;
+    }
+    return cast.Q_ATOMIC;
+}
+
+// `( type-name )` or `( expression )` after typeof or alignas, into s.
+fn parse_type_or_expr(P: *mut Parser, s: *mut cast.Spec, full: bool) void {
+    if not expect_p(P, ct.P_LPAREN) {
+        s.e = error_expr(P);
+        return;
+    }
+    if starts_type_name(P, 0) {
+        s.tname = parse_type_name(P, CTX_TYPENAME);
+    } else if full {
+        s.e = parse_expr(P);
+    } else {
+        s.e = parse_cond(P);
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+}
+
+// Declaration specifiers (maybe none), and the attributes after them.
+fn parse_specs(P: *mut Parser, ctx: i32) *mut cast.DeclSpec {
+    let ds = u.new.[cast.DeclSpec]();
+    let start = cur(P).span;
+    ds.span = start;
+    let mut nlong: i32 = 0;
+    let mut said_compound = false;
+    loop {
+        if at_attr(P) {
+            if ds.items.len > 0 {
+                parse_attrs(P, &mut ds.attrs);
+            }
+            break;
+        }
+        if at_kw(P, ct.K_ATTRIBUTE) {
+            parse_gnu_attrs_ds(P, &mut ds.gattrs, ds);
+            continue;
+        }
+        if at_kw(P, ct.K_EXTENSION) {
+            _ = advance(P);
+            continue;
+        }
+        let t = cur(P);
+        let id = kw_at(P, 0);
+        if id == 0 {
+            if not ds.has_type and is_typedef_tok(P, t) {
+                let s = add_spec(ds, cast.SpecKind.TYPEDEF_NAME, 0, t.span);
+                s.name = t.text;
+                ds.has_type = true;
+                _ = advance(P);
+                continue;
+            }
+            break;
+        }
+        if not is_spec_kw(id) {
+            break;
+        }
+        let sp = t.span;
+        if is_storage_kw(id) or (id == ct.K_INLINE) or (id == ct.K_NORETURN) {
+            _ = take_kw(P);
+            let fs = (id == ct.K_INLINE) or (id == ct.K_NORETURN);
+            if (ctx == CTX_MEMBER) or (ctx == CTX_TYPENAME) or ((ctx == CTX_COMPOUND) and fs) {
+                error_at(sp, "C2020", u.f2("'%s' cannot appear in a %s", t.text, ctx_name(ctx)));
+            } else if (ctx == CTX_COMPOUND) and not said_compound {
+                said_compound = true;
+                feature(P, co.C23, sp, "C2140", "storage-class specifiers in compound literals are");
+            }
+            if fs {
+                _ = add_spec(ds, cast.SpecKind.FUNC, id, sp);
+                if id == ct.K_INLINE {
+                    ds.funcs |= cast.FS_INLINE;
+                } else {
+                    ds.funcs |= cast.FS_NORETURN;
+                }
+            } else {
+                _ = add_spec(ds, cast.SpecKind.STORAGE, id, sp);
+                ds.storage |= storage_bit(id);
+            }
+            continue;
+        }
+        if is_type_kw(id) {
+            _ = take_kw(P);
+            if id == ct.K_LONG {
+                nlong += 1;
+                if nlong == 2 {
+                    feature(P, co.C99, sp, "C2101", "'long long' is");
+                }
+            }
+            _ = add_spec(ds, cast.SpecKind.TYPE, id, sp);
+            ds.has_type = true;
+            continue;
+        }
+        if (id == ct.K_ATOMIC) and is_p(peek(P, 1), ct.P_LPAREN) {
+            // _Atomic ( type-name ): the type specifier
+            _ = take_kw(P);
+            _ = advance(P);
+            let s = add_spec(ds, cast.SpecKind.ATOMIC, id, sp);
+            s.tname = parse_type_name(P, CTX_TYPENAME);
+            if not expect_p(P, ct.P_RPAREN) {
+                skip_to_rparen(P);
+            }
+            s.span = span_from(P, sp);
+            ds.has_type = true;
+            continue;
+        }
+        if is_qual_kw(id) {
+            _ = take_kw(P);
+            _ = add_spec(ds, cast.SpecKind.QUAL, id, sp);
+            ds.quals |= qual_bit(id);
+            continue;
+        }
+        if id == ct.K_ALIGNAS {
+            _ = take_kw(P);
+            let s = add_spec(ds, cast.SpecKind.ALIGN, id, sp);
+            parse_type_or_expr(P, s, false);
+            s.span = span_from(P, sp);
+            continue;
+        }
+        if (id == ct.K_STRUCT) or (id == ct.K_UNION) or (id == ct.K_ENUM) {
+            let tag = parse_tag(P, id);
+            let s = add_spec(ds, cast.SpecKind.TAG, id, sp);
+            s.tag = tag;
+            s.span = tag.span;
+            ds.has_type = true;
+            continue;
+        }
+        if (id == ct.K_TYPEOF) or (id == ct.K_TYPEOF_UNQUAL) {
+            _ = take_kw(P);
+            let s = add_spec(ds, cast.SpecKind.TYPEOF, id, sp);
+            parse_type_or_expr(P, s, true);
+            s.span = span_from(P, sp);
+            ds.has_type = true;
+            continue;
+        }
+        // _BitInt ( constant-expression )
+        _ = take_kw(P);
+        let s = add_spec(ds, cast.SpecKind.BITINT, id, sp);
+        if expect_p(P, ct.P_LPAREN) {
+            s.e = parse_cond(P);
+            if not expect_p(P, ct.P_RPAREN) {
+                skip_to_rparen(P);
+            }
+        } else {
+            s.e = error_expr(P);
+        }
+        s.span = span_from(P, sp);
+        ds.has_type = true;
+    }
+    if ds.items.len > 0 {
+        ds.span = span_from(P, start);
+    } else {
+        ds.span.end = ds.span.start;
+    }
+    return ds;
+}
+
+// Specifiers without a type specifier mean int before C99 (implicit int);
+// in C23 `auto` alone asks for the type of the initializer.
+fn check_implicit_int(P: *Parser, ds: *cast.DeclSpec) void {
+    if ds.has_type or (ds.items.len == 0) {
+        return;
+    }
+    if (P.std >= co.C23) and ((ds.storage & cast.SC_AUTO) != 0) {
+        return;
+    }
+    if P.std >= co.C99 {
+        error_at(ds.span, "C2113", "a declaration without a type specifier (implicit int) is not allowed from C99 on");
+    }
+}
+
+// A struct, union or enum specifier (at its keyword).
+fn parse_tag(P: *mut Parser, kw: i32) *mut cast.TagSpec {
+    let tg = u.new.[cast.TagSpec]();
+    tg.kw = kw;
+    let start = advance(P).span;
+    tg.span = start;
+    tg.name = "";
+    parse_attrs_g(P, &mut tg.attrs);
+    while at_kw(P, ct.K_ATTRIBUTE) {
+        parse_declspec(P, &mut tg.attrs, u.nil.[cast.DeclSpec]());  // (`struct __declspec(align(16)) S`)
+        parse_attrs_g(P, &mut tg.attrs);
+    }
+    if cur(P).kind == ct.T_IDENT {
+        let t = advance(P);
+        tg.name = t.text;
+        tg.name_span = t.span;
+    }
+    if (kw == ct.K_ENUM) and at_p(P, ct.P_COLON) and starts_type_name(P, 1) {
+        // enum E : type (C23)
+        let sp = advance(P).span;
+        feature(P, co.C23, sp, "C2135", "enumerations with a fixed underlying type are");
+        tg.fixed = parse_type_name(P, CTX_TYPENAME);
+    }
+    if not at_p(P, ct.P_LBRACE) {
+        if tg.name.len == 0 {
+            syntax(P, u.pick(kw == ct.K_ENUM, "an enumeration tag or '{'", "a tag or '{'"));
+        }
+        tg.span = span_from(P, start);
+        return tg;
+    }
+    tg.has_body = true;
+    let lb = advance(P).span;
+    if not enter(P) {
+        leave(P);
+        return tg;
+    }
+    if kw == ct.K_ENUM {
+        parse_enumerators(P, tg, lb);
+    } else {
+        while not at_p(P, ct.P_RBRACE) and not at_eof(P) {
+            let before = P.pos;
+            let d = parse_declaration(P, CTX_MEMBER);
+            if u.notnil(d) {
+                tg.members.push(d);
+            }
+            if P.pos == before {
+                syntax(P, "a member declaration");
+                _ = advance(P);
+            }
+        }
+        // (a GNU dialect has structures and unions without members: of size 0)
+        if (tg.members.len == 0) and not P.gnu {
+            error_at(span_from(P, lb), "C2021",
+                     u.f1("a %s needs at least one member", u.pick(kw == ct.K_STRUCT, "structure", "union")));
+        }
+        // (#pragma pack as it is where the members end)
+        tg.pack = cpg.pack_at(P.pos);
+        tg.ms_struct = cpg.ms_struct_at(P.pos);
+    }
+    leave(P);
+    _ = expect_p(P, ct.P_RBRACE);
+    // (a GNU dialect: attributes after the '}' appertain to the type)
+    gnu_attrs(P, &mut tg.attrs);
+    tg.span = span_from(P, start);
+    return tg;
+}
+
+fn parse_enumerators(P: *mut Parser, tg: *mut cast.TagSpec, lb: u.Span) void {
+    loop {
+        if at_p(P, ct.P_RBRACE) or at_eof(P) {
+            break;
+        }
+        let t = cur(P);
+        if t.kind != ct.T_IDENT {
+            syntax(P, "an enumerator");
+            // to the end of the list
+            while not at_p(P, ct.P_RBRACE) and not at_eof(P) and not at_p(P, ct.P_SEMI) {
+                _ = advance(P);
+            }
+            break;
+        }
+        _ = advance(P);
+        let en = u.new.[cast.Enumerator]();
+        en.name = t.text;
+        en.span = t.span;
+        parse_attrs_g(P, &mut en.attrs);
+        if accept_p(P, ct.P_ASSIGN) {
+            en.value = parse_cond(P);
+        }
+        en.span = span_from(P, t.span);
+        tg.enumerators.push(en);
+        // in scope from the end of its enumerator
+        declare(P, en.name, false);
+        if not accept_p(P, ct.P_COMMA) {
+            break;
+        }
+        if at_p(P, ct.P_RBRACE) {
+            tg.trailing_comma = true;
+            feature(P, co.C99, prev_span(P), "C2112", "a trailing comma in an enumerator list is");
+        }
+    }
+    if tg.enumerators.len == 0 {
+        error_at(span_from(P, lb), "C2023", "an enumeration needs at least one enumerator");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Declarators
+// -----------------------------------------------------------------------------
+
+// Type qualifiers (after '*' or in '[...]') into d.
+fn parse_quals(P: *mut Parser, d: *mut cast.Deriv, in_array: bool) void {
+    loop {
+        let id = kw_at(P, 0);
+        if not is_qual_kw(id) {
+            return;
+        }
+        // `_Atomic (` is a type specifier, which cannot be here
+        if (id == ct.K_ATOMIC) and is_p(peek(P, 1), ct.P_LPAREN) {
+            return;
+        }
+        let t = take_kw(P);
+        if in_array {
+            feature(P, co.C99, t.span, "C2111", "type qualifiers in array declarators are");
+        }
+        let b = qual_bit(id);
+        if (d.quals & b) != 0 {
+            d.dup_quals = true;
+        }
+        d.quals |= b;
+    }
+}
+
+// Whether '(' at the current token, in a declarator that may be abstract,
+// begins a parameter list rather than a parenthesized declarator: in a
+// parameter, `(T)` with T a typedef name is a function taking a T.
+// In a GNU dialect attributes may begin either (`(__attribute__((a)) *)`,
+// `(__attribute__((a)) int)`): what follows them decides.
+fn paren_is_params(P: *mut Parser) bool {
+    let mut k: usize = 1;
+    if P.gnu or (kw_at(P, 1) == ct.K_ATTRIBUTE) {
+        k += gnu_attrs_ahead(P, 1);
+    }
+    let nx = peek(P, k);
+    if is_p(nx, ct.P_RPAREN) or is_p(nx, ct.P_ELLIPSIS) {
+        return k == 1;
+    }
+    if is_p(nx, ct.P_LBRACKET) and is_p(peek(P, k + 1), ct.P_LBRACKET) {
+        return true;
+    }
+    return starts_specs(P, k);
+}
+
+fn new_deriv(k: cast.DerivKind, sp: u.Span) cast.Deriv {
+    let mut d: cast.Deriv = undefined;
+    d.kind = k;
+    d.span = sp;
+    return d;
+}
+
+// The derivations of a declarator (and its name), appended to d.derivs from
+// the identifier outward.
+fn parse_declarator_into(P: *mut Parser, d: *mut cast.Declarator, mode: i32) void {
+    if not enter(P) {
+        leave(P);
+        return;
+    }
+    // pointers, written outermost first
+    let mut ptrs = u.List.[cast.Deriv].empty();
+    while at_p(P, ct.P_STAR) {
+        let mut pd = new_deriv(cast.DerivKind.POINTER, advance(P).span);
+        parse_attrs(P, &mut pd.attrs);
+        parse_quals(P, &mut pd, false);
+        while at_kw(P, ct.K_ATTRIBUTE) {
+            // (a GNU dialect: attributes among the qualifiers appertain to the declaration)
+            parse_gnu_attrs(P, &mut d.attrs);
+            parse_quals(P, &mut pd, false);
+        }
+        pd.span = span_from(P, pd.span);
+        ptrs.push(pd);
+    }
+    let t = cur(P);
+    if (t.kind == ct.T_IDENT) and (mode != D_ABSTRACT) {
+        _ = advance(P);
+        d.name = t.text;
+        d.name_span = t.span;
+        d.vis = cpg.visibility_at(P.pos);
+        d.fnopts = cpg.fn_options_at(P.pos);
+        parse_attrs_g(P, &mut d.attrs);
+    } else if at_p(P, ct.P_LPAREN) and ((mode == D_CONCRETE) or not paren_is_params(P)) {
+        _ = advance(P);
+        gnu_attrs(P, &mut d.attrs);
+        parse_declarator_into(P, d, mode);
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+    } else if mode == D_CONCRETE {
+        syntax(P, "a declarator");
+    }
+    // array and function suffixes
+    loop {
+        if at_p(P, ct.P_LBRACKET) and not is_p(peek(P, 1), ct.P_LBRACKET) {
+            let mut ad = new_deriv(cast.DerivKind.ARRAY, advance(P).span);
+            parse_array_suffix(P, &mut ad);
+            parse_attrs(P, &mut ad.attrs);
+            ad.span = span_from(P, ad.span);
+            d.derivs.push(ad);
+            continue;
+        }
+        if at_p(P, ct.P_LPAREN) {
+            let mut fd = new_deriv(cast.DerivKind.FUNCTION, advance(P).span);
+            parse_params(P, &mut fd);
+            parse_attrs(P, &mut fd.attrs);
+            fd.span = span_from(P, fd.span);
+            d.derivs.push(fd);
+            continue;
+        }
+        break;
+    }
+    // the pointers apply last: the innermost (last written) first
+    let ps = ptrs.items();
+    let mut k = ps.len;
+    while k > 0 {
+        k -= 1;
+        d.derivs.push(ps[k]);
+    }
+    ptrs.deinit();
+    leave(P);
+}
+
+// After '[': `static? quals static? size? ]` or `quals * ]`.
+fn parse_array_suffix(P: *mut Parser, ad: *mut cast.Deriv) void {
+    loop {
+        if at_kw(P, ct.K_STATIC) {
+            let sp = advance(P).span;
+            feature(P, co.C99, sp, "C2111", "'static' in array declarators is");
+            ad.is_static = true;
+            continue;
+        }
+        let before = P.pos;
+        parse_quals(P, ad, true);
+        if P.pos == before {
+            break;
+        }
+    }
+    if at_p(P, ct.P_STAR) and is_p(peek(P, 1), ct.P_RBRACKET) and ad.is_static {
+        syntax(P, "the array's size after 'static'");  // (6.7.5.2p1: no `[static *]`)
+        _ = advance(P);
+    } else if at_p(P, ct.P_STAR) and is_p(peek(P, 1), ct.P_RBRACKET) {
+        let sp = advance(P).span;
+        feature(P, co.C99, sp, "C2110", "variable-length arrays of unspecified size '[*]' are");
+        ad.is_star = true;
+    } else if not at_p(P, ct.P_RBRACKET) {
+        ad.size = parse_assign(P);
+    } else if ad.is_static {
+        syntax(P, "the array's size after 'static'");
+    }
+    _ = expect_p(P, ct.P_RBRACKET);
+}
+
+// After '(' of a function declarator: a parameter type list, an identifier
+// list or nothing, and the ')'. Parameters are in a scope of their own.
+fn parse_params(P: *mut Parser, fd: *mut cast.Deriv) void {
+    if accept_p(P, ct.P_RPAREN) {
+        fd.empty = true;
+        return;
+    }
+    let t = cur(P);
+    if (t.kind == ct.T_IDENT) and not is_typedef(P, t.text) and (later_kw(P, 0) == 0) and
+       (is_p(peek(P, 1), ct.P_COMMA) or is_p(peek(P, 1), ct.P_RPAREN)) {
+        // an identifier list
+        fd.id_list = true;
+        if P.std >= co.C23 {
+            error_at(t.span, "C2142", "identifier lists (K&R-style parameters) were removed in C23");
+        }
+        loop {
+            let x = cur(P);
+            if x.kind != ct.T_IDENT {
+                syntax(P, "an identifier");
+                break;
+            }
+            _ = advance(P);
+            fd.ids.push(cast.Ident.{ name: x.text, span: x.span });
+            if not accept_p(P, ct.P_COMMA) {
+                break;
+            }
+        }
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+        return;
+    }
+    push_scope(P);
+    loop {
+        if at_p(P, ct.P_ELLIPSIS) {
+            let sp = advance(P).span;
+            fd.variadic = true;
+            if fd.params.len == 0 {
+                feature(P, co.C23, sp, "C2139", "'...' as the only parameter is");
+            }
+            break;
+        }
+        let pm = u.new.[cast.Param]();
+        let start = cur(P).span;
+        parse_attrs_g(P, &mut pm.attrs);
+        pm.specs = parse_specs(P, CTX_PARAM);
+        if pm.specs.items.len == 0 {
+            syntax(P, "a parameter declaration");
+            break;
+        }
+        check_implicit_int(P, pm.specs);
+        pm.decl = parse_declarator(P, D_EITHER);
+        gnu_attrs(P, &mut pm.decl.attrs);
+        declare(P, pm.decl.name, false);
+        pm.span = span_from(P, start);
+        fd.params.push(pm);
+        if not accept_p(P, ct.P_COMMA) {
+            break;
+        }
+    }
+    pop_scope(P);
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+}
+
+fn parse_declarator(P: *mut Parser, mode: i32) *mut cast.Declarator {
+    let d = u.new.[cast.Declarator]();
+    d.name = "";
+    let start = cur(P).span;
+    d.span = start;
+    d.name_span = start;
+    let before = P.pos;
+    parse_declarator_into(P, d, mode);
+    if P.pos != before {
+        d.span = span_from(P, start);
+    } else {
+        d.span.end = d.span.start;
+    }
+    return d;
+}
+
+/// A type name (in a cast, sizeof, _Alignof, _Generic, _Atomic, typeof,
+/// alignas or a compound literal).
+fn parse_type_name(P: *mut Parser, ctx: i32) *mut cast.TypeName {
+    let tn = u.new.[cast.TypeName]();
+    let start = cur(P).span;
+    tn.span = start;
+    if not enter(P) {
+        leave(P);
+        tn.specs = u.new.[cast.DeclSpec]();
+        tn.decl = u.new.[cast.Declarator]();
+        tn.decl.name = "";
+        return tn;
+    }
+    tn.specs = parse_specs(P, ctx);
+    if tn.specs.items.len == 0 {
+        syntax(P, "a type name");
+    }
+    check_implicit_int(P, tn.specs);
+    tn.decl = parse_declarator(P, D_ABSTRACT);
+    tn.span = span_from(P, start);
+    leave(P);
+    return tn;
+}

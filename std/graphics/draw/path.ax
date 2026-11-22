@@ -1,0 +1,433 @@
+// =============================================================================
+// std/graphics/draw/path.ax - Geometry, paths, and flattening to polylines,
+// part of std/graphics/draw.
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../math.ax" as math;
+
+// -----------------------------------------------------------------------------
+// Geometry
+// -----------------------------------------------------------------------------
+
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// An affine transform: x' = a x + c y + e, y' = b x + d y + f (the matrix
+/// of SVG and HTML canvas).
+pub struct Affine {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+
+    pub fn identity() Affine {
+        return Affine.{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    }
+
+    pub fn translation(tx: f64, ty: f64) Affine {
+        return Affine.{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty };
+    }
+
+    pub fn scaling(sx: f64, sy: f64) Affine {
+        return Affine.{ a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 };
+    }
+
+    /// A rotation by `radians` (clockwise on screen, where y points down).
+    pub fn rotation(radians: f64) Affine {
+        let sc = math.sincos(radians);
+        return Affine.{ a: sc.cos, b: sc.sin, c: -sc.sin, d: sc.cos, e: 0.0, f: 0.0 };
+    }
+
+    /// self, then other.
+    pub fn then(self: Affine, o: Affine) Affine {
+        return Affine.{
+            a: (o.a * self.a) + (o.c * self.b),
+            b: (o.b * self.a) + (o.d * self.b),
+            c: (o.a * self.c) + (o.c * self.d),
+            d: (o.b * self.c) + (o.d * self.d),
+            e: ((o.a * self.e) + (o.c * self.f)) + o.e,
+            f: ((o.b * self.e) + (o.d * self.f)) + o.f,
+        };
+    }
+
+    pub fn apply(self: Affine, x: f64, y: f64) Point {
+        return Point.{ x: ((self.a * x) + (self.c * y)) + self.e, y: ((self.b * x) + (self.d * y)) + self.f };
+    }
+
+    pub fn determinant(self: Affine) f64 {
+        return (self.a * self.d) - (self.b * self.c);
+    }
+
+    /// The inverse (the identity if this one is singular).
+    pub fn invert(self: Affine) Affine {
+        let det = self.determinant();
+        if @abs(det) < 1.0e-12 {
+            return Affine.identity();
+        }
+        let id = 1.0 / det;
+        return Affine.{
+            a: self.d * id,
+            b: -self.b * id,
+            c: -self.c * id,
+            d: self.a * id,
+            e: ((self.c * self.f) - (self.d * self.e)) * id,
+            f: ((self.b * self.e) - (self.a * self.f)) * id,
+        };
+    }
+
+    /// How much the transform scales lengths (on average).
+    fn scale_factor(self: Affine) f64 {
+        return @max(@sqrt(@abs(self.determinant())), 1.0e-9);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Paths
+// -----------------------------------------------------------------------------
+
+/// A Path's verbs, for code that walks `verbs` and `pts` (move and line
+/// take one point, quad two, cubic three, close none).
+pub enum Verb: u8 {
+    MOVE,
+    LINE,
+    QUAD,
+    CUBIC,
+    CLOSE,
+}
+
+/// A sequence of subpaths, each starting with move_to.
+pub nocopy struct Path {
+    pub verbs: vec.Vec.[Verb],
+    pub pts: vec.Vec.[f64],  // x, y pairs
+    start_x: f64,            // the current subpath's first point
+    start_y: f64,
+    cur_x: f64,
+    cur_y: f64,
+    open: bool,  // a subpath has begun
+
+    pub fn init() Path {
+        return Path.{
+            verbs: vec.Vec.[Verb].init(),
+            pts: vec.Vec.[f64].init(),
+            start_x: 0.0,
+            start_y: 0.0,
+            cur_x: 0.0,
+            cur_y: 0.0,
+            open: false,
+        };
+    }
+
+    pub fn deinit(self: *mut Path) void {
+        self.verbs.deinit();
+        self.pts.deinit();
+    }
+
+    pub fn clear(self: *mut Path) void {
+        self.verbs.clear();
+        self.pts.clear();
+        self.open = false;
+    }
+
+    fn pt(self: *mut Path, x: f64, y: f64) DrawError!void {
+        self.pts.push(x)!;
+        self.pts.push(y)!;
+        self.cur_x = x;
+        self.cur_y = y;
+    }
+
+    /// Starts a subpath at (x, y) if none is open (for line_to and curves
+    /// with no current point).
+    fn ensure(self: *mut Path, x: f64, y: f64) DrawError!void {
+        if not self.open {
+            self.move_to(x, y)!;
+        }
+    }
+
+    pub fn move_to(self: *mut Path, x: f64, y: f64) DrawError!void {
+        self.verbs.push(Verb.MOVE)!;
+        self.pt(x, y)!;
+        self.start_x = x;
+        self.start_y = y;
+        self.open = true;
+    }
+
+    pub fn line_to(self: *mut Path, x: f64, y: f64) DrawError!void {
+        if not self.open {
+            return self.move_to(x, y);
+        }
+        self.verbs.push(Verb.LINE)!;
+        self.pt(x, y)!;
+    }
+
+    /// A quadratic Bézier with control point (cx, cy).
+    pub fn quad_to(self: *mut Path, cx: f64, cy: f64, x: f64, y: f64) DrawError!void {
+        self.ensure(cx, cy)!;
+        self.verbs.push(Verb.QUAD)!;
+        self.pt(cx, cy)!;
+        self.pt(x, y)!;
+    }
+
+    /// A cubic Bézier with control points (c1x, c1y) and (c2x, c2y).
+    pub fn cubic_to(self: *mut Path, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) DrawError!void {
+        self.ensure(c1x, c1y)!;
+        self.verbs.push(Verb.CUBIC)!;
+        self.pt(c1x, c1y)!;
+        self.pt(c2x, c2y)!;
+        self.pt(x, y)!;
+    }
+
+    /// Ends the subpath with a line back to its start.
+    pub fn close(self: *mut Path) DrawError!void {
+        if not self.open {
+            return;
+        }
+        self.verbs.push(Verb.CLOSE)!;
+        self.cur_x = self.start_x;
+        self.cur_y = self.start_y;
+        self.open = false;
+    }
+
+    /// An arc of the circle at (cx, cy) with radius r, from angle a0 to a1
+    /// (radians, clockwise on screen; counterclockwise if ccw), joined to
+    /// the current point by a line (as in HTML canvas).
+    pub fn arc(self: *mut Path, cx: f64, cy: f64, r: f64, a0: f64, a1: f64, ccw: bool) DrawError!void {
+        self.elliptic_arc(cx, cy, r, r, a0, a1, ccw)!;
+    }
+
+    pub fn elliptic_arc(self: *mut Path, cx: f64, cy: f64, rx: f64, ry: f64, a0: f64, a1: f64,
+                        ccw: bool) DrawError!void {
+        let mut sweep = a1 - a0;
+        let tau = math.TAU;
+        if ccw {
+            if sweep > 0.0 {
+                sweep = sweep - (tau * @ceil(sweep / tau));
+            }
+            sweep = @max(sweep, -tau);
+        } else {
+            if sweep < 0.0 {
+                sweep = sweep + (tau * @ceil(-sweep / tau));
+            }
+            sweep = @min(sweep, tau);
+        }
+        let sc0 = math.sincos(a0);
+        let x0 = cx + (rx * sc0.cos);
+        let y0 = cy + (ry * sc0.sin);
+        if self.open {
+            self.line_to(x0, y0)!;
+        } else {
+            self.move_to(x0, y0)!;
+        }
+        // cubic segments of at most a quarter turn
+        let n = @max(@ceil(@abs(sweep) / (math.PI / 2.0)), 1.0);
+        let step = sweep / n;
+        let k = (4.0 / 3.0) * math.tan(step / 4.0);
+        let mut a = a0;
+        let mut i: f64 = 0.0;
+        while i < n {
+            let s0 = math.sincos(a);
+            let s1 = math.sincos(a + step);
+            self.cubic_to(cx + (rx * (s0.cos - (k * s0.sin))), cy + (ry * (s0.sin + (k * s0.cos))),
+                          cx + (rx * (s1.cos + (k * s1.sin))), cy + (ry * (s1.sin - (k * s1.cos))), cx + (rx * s1.cos),
+                          cy + (ry * s1.sin))!;
+            a = a + step;
+            i += 1.0;
+        }
+    }
+
+    pub fn rect(self: *mut Path, x: f64, y: f64, w: f64, h: f64) DrawError!void {
+        self.move_to(x, y)!;
+        self.line_to(x + w, y)!;
+        self.line_to(x + w, y + h)!;
+        self.line_to(x, y + h)!;
+        self.close()!;
+    }
+
+    /// A rectangle with corners rounded to radius r.
+    pub fn rounded_rect(self: *mut Path, x: f64, y: f64, w: f64, h: f64, r: f64) DrawError!void {
+        let rr = @min(@max(r, 0.0), @min(@abs(w), @abs(h)) / 2.0);
+        if rr == 0.0 {
+            return self.rect(x, y, w, h);
+        }
+        let hp = math.PI / 2.0;
+        self.move_to(x + rr, y)!;
+        self.line_to((x + w) - rr, y)!;
+        self.arc((x + w) - rr, y + rr, rr, -hp, 0.0, false)!;
+        self.line_to(x + w, (y + h) - rr)!;
+        self.arc((x + w) - rr, (y + h) - rr, rr, 0.0, hp, false)!;
+        self.line_to(x + rr, y + h)!;
+        self.arc(x + rr, (y + h) - rr, rr, hp, math.PI, false)!;
+        self.line_to(x, y + rr)!;
+        self.arc(x + rr, y + rr, rr, math.PI, math.PI + hp, false)!;
+        self.close()!;
+    }
+
+    pub fn ellipse(self: *mut Path, cx: f64, cy: f64, rx: f64, ry: f64) DrawError!void {
+        self.move_to(cx + rx, cy)!;
+        self.elliptic_arc(cx, cy, rx, ry, 0.0, math.TAU, false)!;
+        self.close()!;
+    }
+
+    pub fn circle(self: *mut Path, cx: f64, cy: f64, r: f64) DrawError!void {
+        self.ellipse(cx, cy, r, r)!;
+    }
+
+    /// A closed polygon (x, y pairs).
+    pub fn polygon(self: *mut Path, xy: []f64) DrawError!void {
+        let mut i: usize = 0;
+        while (i + 1) < xy.len {
+            if i == 0 {
+                self.move_to(xy[0], xy[1])!;
+            } else {
+                self.line_to(xy[i], xy[i + 1])!;
+            }
+            i += 2;
+        }
+        self.close()!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Flattening: paths to polylines
+// -----------------------------------------------------------------------------
+
+/// Polylines: points (x, y pairs), where each one starts, and whether it is
+/// closed.
+nocopy struct Poly {
+    pts: vec.Vec.[f64],
+    starts: vec.Vec.[usize],  // index of each polyline's first point (in points)
+    closed: vec.Vec.[bool],
+
+    fn init() Poly {
+        return Poly.{ pts: vec.Vec.[f64].init(), starts: vec.Vec.[usize].init(), closed: vec.Vec.[bool].init() };
+    }
+
+    fn deinit(self: *mut Poly) void {
+        self.pts.deinit();
+        self.starts.deinit();
+        self.closed.deinit();
+    }
+
+    fn clear(self: *mut Poly) void {
+        self.pts.clear();
+        self.starts.clear();
+        self.closed.clear();
+    }
+
+    fn npoints(self: *Poly) usize {
+        return self.pts.len() / 2;
+    }
+
+    fn begin(self: *mut Poly) DrawError!void {
+        self.starts.push(self.npoints())!;
+        self.closed.push(false)!;
+    }
+
+    fn add(self: *mut Poly, x: f64, y: f64) DrawError!void {
+        self.pts.push(x)!;
+        self.pts.push(y)!;
+    }
+
+    fn close_last(self: *mut Poly) void {
+        if self.closed.len() > 0 {
+            self.closed.set(self.closed.len() - 1, true);
+        }
+    }
+
+    /// Points [first, end) of polyline i.
+    fn range(self: *Poly, i: usize) [2]usize {
+        let first = self.starts.get(i);
+        let mut end = self.npoints();
+        if (i + 1) < self.starts.len() {
+            end = self.starts.get(i + 1);
+        }
+        return [first, end];
+    }
+
+    fn x(self: *Poly, i: usize) f64 {
+        return self.pts.get(2 * i);
+    }
+
+    fn y(self: *Poly, i: usize) f64 {
+        return self.pts.get((2 * i) + 1);
+    }
+}
+
+/// The path through t as polylines, with curves split finely enough that
+/// they stray at most tol from the curve (in t's output space).
+fn flatten(noalias p: *Path, t: Affine, tol: f64, noalias out: *mut Poly) DrawError!void {
+    let verbs = p.verbs.items();
+    let pts = p.pts.items();
+    let mut k: usize = 0;
+    let mut cx: f64 = 0.0;
+    let mut cy: f64 = 0.0;
+    for v in verbs {
+        if v == Verb.MOVE {
+            let q = t.apply(pts[k], pts[k + 1]);
+            k += 2;
+            out.begin()!;
+            out.add(q.x, q.y)!;
+            cx = q.x;
+            cy = q.y;
+        } else if v == Verb.LINE {
+            let q = t.apply(pts[k], pts[k + 1]);
+            k += 2;
+            out.add(q.x, q.y)!;
+            cx = q.x;
+            cy = q.y;
+        } else if v == Verb.QUAD {
+            let c = t.apply(pts[k], pts[k + 1]);
+            let e = t.apply(pts[k + 2], pts[k + 3]);
+            k += 4;
+            let ddx = (cx - (2.0 * c.x)) + e.x;
+            let ddy = (cy - (2.0 * c.y)) + e.y;
+            let n = segments(@sqrt((ddx * ddx) + (ddy * ddy)) / (4.0 * tol));
+            for i in @as(usize, 1)..n + 1 {
+                let s = @float_from_int(f64, i) / @float_from_int(f64, n);
+                let u = 1.0 - s;
+                out.add(((u * u) * cx) + ((2.0 * u * s) * c.x) + ((s * s) * e.x),
+                        ((u * u) * cy) + ((2.0 * u * s) * c.y) + ((s * s) * e.y))!;
+            }
+            cx = e.x;
+            cy = e.y;
+        } else if v == Verb.CUBIC {
+            let c1 = t.apply(pts[k], pts[k + 1]);
+            let c2 = t.apply(pts[k + 2], pts[k + 3]);
+            let e = t.apply(pts[k + 4], pts[k + 5]);
+            k += 6;
+            let d1x = (cx - (2.0 * c1.x)) + c2.x;
+            let d1y = (cy - (2.0 * c1.y)) + c2.y;
+            let d2x = (c1.x - (2.0 * c2.x)) + e.x;
+            let d2y = (c1.y - (2.0 * c2.y)) + e.y;
+            let m = @max((d1x * d1x) + (d1y * d1y), (d2x * d2x) + (d2y * d2y));
+            let n = segments((0.75 * @sqrt(m)) / tol);
+            for i in @as(usize, 1)..n + 1 {
+                let s = @float_from_int(f64, i) / @float_from_int(f64, n);
+                let u = 1.0 - s;
+                let b0 = (u * u) * u;
+                let b1 = (3.0 * (u * u)) * s;
+                let b2 = (3.0 * u) * (s * s);
+                let b3 = (s * s) * s;
+                out.add((((b0 * cx) + (b1 * c1.x)) + (b2 * c2.x)) + (b3 * e.x),
+                        (((b0 * cy) + (b1 * c1.y)) + (b2 * c2.y)) + (b3 * e.y))!;
+            }
+            cx = e.x;
+            cy = e.y;
+        } else {
+            out.close_last();
+        }
+    }
+}
+
+/// Wang's bound: sqrt(x) segments, at least 1.
+fn segments(x: f64) usize {
+    let n = @ceil(@sqrt(@max(x, 0.0)));
+    if not (n >= 1.0) {
+        return 1;
+    }
+    return @int_from_float(usize, @min(n, 1000.0));
+}

@@ -1,0 +1,620 @@
+// =============================================================================
+// std/graphics/svg/parse.ax - Scene builder, length resolution, CSS cascade,
+// ID/stylesheet collection, and document root setup, part of std/graphics/svg.
+// =============================================================================
+
+import "../../collections/map.ax" as maps;
+import "../../collections/vec.ax" as vec;
+import "../../encoding/xml.ax" as xml;
+import "../../hash.ax" as hash;
+import "../../math.ax" as math;
+import "../../mem.ax" as mem;
+import "../../str.ax" as strs;
+import "../draw.ax" as draw;
+import "css.ax" as css;
+import "path.ax" as pathdata;
+
+// -----------------------------------------------------------------------------
+// Building the scene
+// -----------------------------------------------------------------------------
+
+nocopy struct Builder {
+    doc: *mut Document,
+    ids: maps.Map.[[]u8, *xml.Element, hash.hash_bytes, hash.eq_bytes],
+    sheet: css.Sheet,
+    chain: vec.Vec.[css.Elem],
+    decls: vec.Vec.[css.Decl],
+    rules: vec.Vec.[css.Rule],
+    uses: vec.Vec.[*xml.Element],   // the use elements being expanded
+    masks: vec.Vec.[*xml.Element],  // the masks being expanded
+    vw: f64,  // the viewport, for percentages
+    vh: f64,
+    candidates: vec.Vec.[u32],       // the sheet's rules that may match an element
+    bounds: vec.Vec.[pathdata.Box],  // each of the document's paths'
+    // by element address: the path of a path, polyline or polygon (NO_PATH:
+    // none), a clipPath's last path, a gradient's last stops, and an image
+    // element's index in Document.images (NO_PATH: none)
+    shape_paths: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize],
+    clips: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize],
+    stops: maps.Map.[usize, []draw.Stop, hash.hash_usize, hash.eq_usize],
+    image_index: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize],
+    work: usize,  // the work done, and its limit (see WORK_PER_BYTE)
+    work_limit: usize,
+    data: usize,  // the data kept, and its limit
+    data_limit: usize,
+    pixels: usize,  // the images' pixels
+
+    fn init(doc: *mut Document, text_len: usize) Builder {
+        return Builder.{
+            doc: doc,
+            ids: maps.Map.[[]u8, *xml.Element, hash.hash_bytes, hash.eq_bytes].init(),
+            sheet: css.Sheet.init(),
+            chain: vec.Vec.[css.Elem].init(),
+            decls: vec.Vec.[css.Decl].init(),
+            rules: vec.Vec.[css.Rule].init(),
+            uses: vec.Vec.[*xml.Element].init(),
+            masks: vec.Vec.[*xml.Element].init(),
+            vw: 300.0,
+            vh: 150.0,
+            candidates: vec.Vec.[u32].init(),
+            bounds: vec.Vec.[pathdata.Box].init(),
+            shape_paths: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize].init(),
+            clips: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize].init(),
+            stops: maps.Map.[usize, []draw.Stop, hash.hash_usize, hash.eq_usize].init(),
+            image_index: maps.Map.[usize, usize, hash.hash_usize, hash.eq_usize].init(),
+            work: 0,
+            work_limit: (WORK_PER_BYTE * text_len) + MIN_WORK,
+            data: 0,
+            data_limit: (DATA_PER_BYTE * text_len) + MIN_DATA,
+            pixels: 0,
+        };
+    }
+
+    fn deinit(self: *mut Builder) void {
+        self.ids.deinit();
+        self.sheet.deinit();
+        self.chain.deinit();
+        self.decls.deinit();
+        self.rules.deinit();
+        self.uses.deinit();
+        self.masks.deinit();
+        self.candidates.deinit();
+        self.bounds.deinit();
+        self.shape_paths.deinit();
+        self.clips.deinit();
+        self.stops.deinit();
+        self.image_index.deinit();
+    }
+
+    /// Counts n steps of work against the limit.
+    fn charge(self: *mut Builder, n: usize) SvgError!void {
+        self.work += n;
+        if self.work > self.work_limit {
+            return error.TooComplex;
+        }
+    }
+
+    /// Counts n bytes of data kept against the limit.
+    fn charge_data(self: *mut Builder, n: usize) SvgError!void {
+        self.data += n;
+        if self.data > self.data_limit {
+            return error.TooComplex;
+        }
+    }
+
+    /// Adds a path to the document (taking it), returning its index.
+    fn store_path(self: *mut Builder, p: *mut draw.Path) SvgError!usize {
+        let r = self.charge_data(((p.pts.len() * 8) + p.verbs.len()) + 64);
+        let r2 = self.bounds.push(pathdata.bounds(p));
+        r catch |e| {
+            p.deinit();
+            return e;
+        };
+        r2 catch |e| {
+            p.deinit();
+            return e;
+        };
+        return self.doc.add_path(p);
+    }
+
+    fn push_item(self: *mut Builder, it: Item) SvgError!void {
+        if self.doc.items.len() >= MAX_ITEMS {
+            return error.TooComplex;
+        }
+        self.doc.items.push(it)!;
+    }
+
+    // --- lengths ---
+
+    /// A length: a number with an optional unit, or a percentage of the
+    /// viewport's width ('x'), height ('y') or normalized diagonal ('o').
+    fn length(self: *Builder, v: []u8, axis: u8, font_size: f64) SvgError!f64 {
+        let t = strs.trim(v);
+        let mut sc = pathdata.Scanner.init(t);
+        let x = sc.raw_number() catch return error.SyntaxError;
+        let v2 = self.length_value(x, strs.trim(t[sc.i..]), axis, font_size)!;
+        if not math.is_finite(v2) {
+            return error.SyntaxError;
+        }
+        return v2;
+    }
+
+    fn length_value(self: *Builder, x: f64, u: []u8, axis: u8, font_size: f64) SvgError!f64 {
+        if (u.len == 0) or strs.eq(u, "px") {
+            return x;
+        }
+        if strs.eq(u, "%") {
+            let mut base = @sqrt(((self.vw * self.vw) + (self.vh * self.vh)) / 2.0);
+            if axis == 'x' {
+                base = self.vw;
+            } else if axis == 'y' {
+                base = self.vh;
+            }
+            return (x / 100.0) * base;
+        }
+        if strs.eq(u, "pt") {
+            return x * (4.0 / 3.0);
+        }
+        if strs.eq(u, "pc") {
+            return x * 16.0;
+        }
+        if strs.eq(u, "mm") {
+            return x * (96.0 / 25.4);
+        }
+        if strs.eq(u, "cm") {
+            return x * (96.0 / 2.54);
+        }
+        if strs.eq(u, "in") {
+            return x * 96.0;
+        }
+        if strs.eq(u, "em") {
+            return x * font_size;
+        }
+        if strs.eq(u, "ex") {
+            return x * (font_size / 2.0);
+        }
+        return error.SyntaxError;
+    }
+
+    /// An attribute's length, or a default if it is missing or malformed.
+    fn attr_length(self: *Builder, e: *xml.Element, name: []u8, axis: u8, fs: f64, default: f64) f64 {
+        let v = e.attr(name) catch return default;
+        return self.length(v, axis, fs) catch default;
+    }
+
+    /// The first length of a list attribute (x="1 2 3").
+    fn first_length(self: *Builder, e: *xml.Element, name: []u8, axis: u8, fs: f64) SvgError!f64 {
+        let v = strs.trim(e.attr(name)!);
+        let mut end: usize = 0;
+        while (end < v.len) and not pathdata.is_space(v[end]) and (v[end] != ',') {
+            end += 1;
+        }
+        return self.length(v[..end], axis, fs);
+    }
+
+    // --- the cascade ---
+
+    /// Applies one declaration to s (parent: for "inherit"); bad values are ignored.
+    fn apply(self: *mut Builder, s: *mut Style, parent: *Style, name: []u8, value0: []u8) void {
+        let value = strs.trim(value0);
+        if strs.eq(value, "inherit") {
+            self.inherit_one(s, parent, name);
+            return;
+        }
+        if strs.eq(name, "fill") {
+            parse_paint(value, &mut s.fill) catch return;
+        } else if strs.eq(name, "stroke") {
+            parse_paint(value, &mut s.stroke) catch return;
+        } else if strs.eq(name, "fill-opacity") {
+            s.fill_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "stroke-opacity") {
+            s.stroke_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "opacity") {
+            s.opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "stop-opacity") {
+            s.stop_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "fill-rule") {
+            if strs.eq(value, "evenodd") {
+                s.fill_rule = draw.FillRule.EVEN_ODD;
+            } else if strs.eq(value, "nonzero") {
+                s.fill_rule = draw.FillRule.NONZERO;
+            }
+        } else if strs.eq(name, "clip-rule") {
+            if strs.eq(value, "evenodd") {
+                s.clip_rule = draw.FillRule.EVEN_ODD;
+            } else if strs.eq(value, "nonzero") {
+                s.clip_rule = draw.FillRule.NONZERO;
+            }
+        } else if strs.eq(name, "stroke-width") {
+            let w = self.length(value, 'o', s.font_size) catch return;
+            if w >= 0.0 {
+                s.stroke_width = w;
+            }
+        } else if strs.eq(name, "stroke-linecap") {
+            if strs.eq(value, "butt") {
+                s.cap = draw.Cap.BUTT;
+            } else if strs.eq(value, "round") {
+                s.cap = draw.Cap.ROUND;
+            } else if strs.eq(value, "square") {
+                s.cap = draw.Cap.SQUARE;
+            }
+        } else if strs.eq(name, "stroke-linejoin") {
+            if strs.eq(value, "miter") or strs.eq(value, "miter-clip") or strs.eq(value, "arcs") {
+                s.join = draw.Join.MITER;
+            } else if strs.eq(value, "round") {
+                s.join = draw.Join.ROUND;
+            } else if strs.eq(value, "bevel") {
+                s.join = draw.Join.BEVEL;
+            }
+        } else if strs.eq(name, "stroke-miterlimit") {
+            let m = number_or_percent(value) catch return;
+            if m >= 1.0 {
+                s.miter = m;
+            }
+        } else if strs.eq(name, "stroke-dasharray") {
+            s.dash = self.parse_dashes(value, s.font_size) catch return;
+        } else if strs.eq(name, "stroke-dashoffset") {
+            s.dash_offset = self.length(value, 'o', s.font_size) catch return;
+        } else if strs.eq(name, "color") {
+            s.color = css.parse_color(value) catch return;
+        } else if strs.eq(name, "display") {
+            s.display = not strs.eq(value, "none");
+        } else if strs.eq(name, "visibility") {
+            if strs.eq(value, "visible") {
+                s.visible = true;
+            } else if strs.eq(value, "hidden") or strs.eq(value, "collapse") {
+                s.visible = false;
+            }
+        } else if strs.eq(name, "font-size") {
+            s.font_size = self.font_size(value, parent.font_size) catch return;
+        } else if strs.eq(name, "text-anchor") {
+            if strs.eq(value, "start") {
+                s.anchor = 0;
+            } else if strs.eq(value, "middle") {
+                s.anchor = 1;
+            } else if strs.eq(value, "end") {
+                s.anchor = 2;
+            }
+        } else if strs.eq(name, "stop-color") {
+            if strs.eq_ignore_case(value, "currentColor") {
+                s.stop_color = s.color;
+            } else {
+                s.stop_color = css.parse_color(value) catch return;
+            }
+        } else if strs.eq(name, "clip-path") {
+            if strs.eq(value, "none") {
+                s.clip_path = "";
+            } else {
+                s.clip_path = url_id(value) catch return;
+            }
+        } else if strs.eq(name, "mask") {
+            if strs.eq(value, "none") {
+                s.mask = "";
+            } else {
+                s.mask = url_id(value) catch return;
+            }
+        }
+    }
+
+    fn inherit_one(self: *mut Builder, s: *mut Style, p: *Style, name: []u8) void {
+        if strs.eq(name, "fill") {
+            s.fill = p.fill;
+        } else if strs.eq(name, "stroke") {
+            s.stroke = p.stroke;
+        } else if strs.eq(name, "fill-opacity") {
+            s.fill_opacity = p.fill_opacity;
+        } else if strs.eq(name, "stroke-opacity") {
+            s.stroke_opacity = p.stroke_opacity;
+        } else if strs.eq(name, "opacity") {
+            s.opacity = p.opacity;
+        } else if strs.eq(name, "stop-opacity") {
+            s.stop_opacity = p.stop_opacity;
+        } else if strs.eq(name, "stop-color") {
+            s.stop_color = p.stop_color;
+        } else if strs.eq(name, "clip-path") {
+            s.clip_path = p.clip_path;
+        } else if strs.eq(name, "mask") {
+            s.mask = p.mask;
+        } else if strs.eq(name, "display") {
+            s.display = p.display;
+        } else if strs.eq(name, "stroke-width") {
+            s.stroke_width = p.stroke_width;
+        } else if strs.eq(name, "stroke-dasharray") {
+            s.dash = p.dash;
+        }
+        // (the other properties are inherited anyway)
+        _ = self.vw;
+    }
+
+    fn font_size(self: *Builder, v: []u8, parent_size: f64) SvgError!f64 {
+        let names: [7][]u8 = ["xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large"];
+        let sizes: [7]f64 = [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0];
+        for i in @as(usize, 0)..7 {
+            if strs.eq(v, names[i]) {
+                return sizes[i];
+            }
+        }
+        if strs.eq(v, "larger") {
+            return parent_size * 1.2;
+        }
+        if strs.eq(v, "smaller") {
+            return parent_size / 1.2;
+        }
+        let t = strs.trim(v);
+        if strs.ends_with(t, "%") {
+            return (number_or_percent(t)!) * parent_size;
+        }
+        let size = self.length(t, 'o', parent_size)!;
+        if size < 0.0 {
+            return error.SyntaxError;
+        }
+        return size;
+    }
+
+    /// A dash array (none: solid); an odd count is repeated, as SVG says, and
+    /// a negative length or an all-zero pattern means solid.
+    fn parse_dashes(self: *mut Builder, v: []u8, fs: f64) SvgError![]f64 {
+        if strs.eq(v, "none") {
+            return [];
+        }
+        let mut vals = vec.Vec.[f64].init();
+        defer vals.deinit();
+        let mut i: usize = 0;
+        let mut total: f64 = 0.0;
+        while i < v.len {
+            while (i < v.len) and (pathdata.is_space(v[i]) or (v[i] == ',')) {
+                i += 1;
+            }
+            if i >= v.len {
+                break;
+            }
+            let start = i;
+            while (i < v.len) and not pathdata.is_space(v[i]) and (v[i] != ',') {
+                i += 1;
+            }
+            let d = self.length(v[start..i], 'o', fs)!;
+            if d < 0.0 {
+                return [];
+            }
+            total += d;
+            vals.push(d)!;
+            if vals.len() > 1000 {
+                return error.SyntaxError;
+            }
+        }
+        if (vals.len() == 0) or not (total > 0.0) {
+            return [];
+        }
+        let n = vals.len();
+        if (n % 2) == 1 {
+            for k in @as(usize, 0)..n {
+                vals.push(vals.get(k))!;
+            }
+        }
+        self.charge_data(vals.len() * 8)!;
+        return self.doc.arena.copy(vals.items())!;
+    }
+
+    /// The computed style of element e (whose css.Elem is the last of chain)
+    /// under parent.
+    fn compute_style(self: *mut Builder, e: *xml.Element, parent: *Style) SvgError!Style {
+        let mut s = inherit(parent);
+        // (the attributes are read here and by what draws the element: path
+        // data and points, parsed once per element, and an image's data, decoded
+        // once, are not counted)
+        let mut bytes: usize = 0;
+        for a in e.attrs {
+            if not strs.eq(a.local, "d") and not strs.eq(a.local, "points") and
+               not (strs.eq(a.local, "href") and strs.eq(e.local, "image")) {
+                bytes += a.value.len;
+            }
+        }
+        self.charge((1 + e.attrs.len) + (bytes / 16))!;
+        for a in e.attrs {
+            if (a.ns.len == 0) and is_property(a.local) {
+                self.apply(&mut s, parent, a.local, a.value);
+            }
+        }
+        // style sheet rules, by specificity and order (a rule found twice, for
+        // a class named twice, once)
+        self.rules.clear();
+        if (self.sheet.rules.len() > 0) and (self.chain.len() > 0) {
+            self.candidates.clear();
+            let mut steps = self.sheet.candidates(self.chain.get(self.chain.len() - 1), &mut self.candidates)!;
+            for ri in self.candidates.items() {
+                let r = self.sheet.rules.get(@as(usize, ri));
+                if self.sheet.match_steps(r, self.chain.items(), &mut steps) {
+                    self.rules.push(r)!;
+                }
+            }
+            self.charge(steps)!;
+            vec.sort.[css.Rule, rule_less](self.rules.items_mut());
+            let rs = self.rules.items_mut();
+            let mut n: usize = 0;
+            for k in @as(usize, 0)..rs.len {
+                if (n == 0) or (rs[n - 1].order != rs[k].order) {
+                    rs[n] = rs[k];
+                    n += 1;
+                }
+            }
+            self.rules.truncate(n);
+        }
+        for r in self.rules.items() {
+            for k in r.decl_first..r.decl_first + r.decl_count {
+                let d = self.sheet.decls.get(k);
+                if not d.important {
+                    self.apply_decl(&mut s, parent, d)!;
+                }
+            }
+        }
+        // the style attribute
+        self.decls.clear();
+        let st = e.attr("style") catch "";
+        if st.len > 0 {
+            let mut clean = st;
+            if strs.contains(st, "/*") {
+                self.charge_data(st.len)!;
+                let buf = self.doc.arena.bytes(st.len)!;
+                clean = css.strip_comments(st, buf);
+            }
+            css.parse_declarations(clean, &mut self.decls)!;
+            for d in self.decls.items() {
+                if not d.important {
+                    self.apply_decl(&mut s, parent, d)!;
+                }
+            }
+        }
+        // !important declarations
+        for r in self.rules.items() {
+            for k in r.decl_first..r.decl_first + r.decl_count {
+                let d = self.sheet.decls.get(k);
+                if d.important {
+                    self.apply_decl(&mut s, parent, d)!;
+                }
+            }
+        }
+        for d in self.decls.items() {
+            if d.important {
+                self.apply_decl(&mut s, parent, d)!;
+            }
+        }
+        return s;
+    }
+
+    fn apply_decl(self: *mut Builder, s: *mut Style, parent: *Style, d: css.Decl) SvgError!void {
+        self.charge(1 + (d.value.len / 16))!;
+        self.apply(s, parent, d.name, d.value);
+    }
+
+    fn enter(self: *mut Builder, e: *xml.Element) SvgError!void {
+        let id = e.attr("id") catch "";
+        let class = e.attr("class") catch "";
+        self.chain.push(css.Elem.{ tag: e.local, id: id, class: class })!;
+    }
+
+    fn leave(self: *mut Builder) void {
+        _ = self.chain.pop() ?? return;
+    }
+
+    // --- references ---
+
+    fn collect_ids(self: *mut Builder, e: *xml.Element, depth: usize) SvgError!void {
+        if depth > xml.MAX_DEPTH {
+            return error.TooComplex;
+        }
+        let id = e.attr("id") catch "";
+        if (id.len > 0) and not self.ids.contains(id) {
+            self.ids.put(id, e)!;
+        }
+        if strs.eq(e.local, "style") and is_svg(e) {
+            let typ = e.attr("type") catch "text/css";
+            if strs.eq(strs.trim(typ), "text/css") or (strs.trim(typ).len == 0) {
+                let t = e.text_alloc()!;
+                defer mem.free(t);
+                let buf = self.doc.arena.bytes(t.len)!;
+                let clean = css.strip_comments(t, buf);
+                self.sheet.add(clean)!;
+            }
+        }
+        for c in e.children {
+            match c {
+                .Element(x) => { self.collect_ids(x, depth + 1)!; }
+                else => {}
+            }
+        }
+    }
+
+    /// The element an href (xlink:href or href) points to ("#id").
+    fn href(self: *Builder, e: *xml.Element) SvgError!*xml.Element {
+        let t = strs.trim(href_value(e)!);
+        if (t.len < 2) or (t[0] != '#') {
+            return error.SyntaxError;
+        }
+        return self.ids.get(t[1..]) ?? return error.NotFound;
+    }
+}
+
+/// Parses preserveAspectRatio ("xMidYMid meet", "none", "xMinYMax slice").
+fn parse_fit(v: []u8) Fit {
+    let mut f = Fit.default();
+    let mut fields = strs.fields(v);
+    let mut first = fields.next() ?? return f;
+    if strs.eq(first, "defer") {
+        first = fields.next() ?? return f;
+    }
+    if strs.eq(first, "none") {
+        f.none = true;
+    } else if (first.len == 8) and (first[0] == 'x') and (first[4] == 'Y') {
+        let ax = first[1..4];
+        let ay = first[5..8];
+        if strs.eq(ax, "Min") {
+            f.align_x = 0;
+        } else if strs.eq(ax, "Max") {
+            f.align_x = 2;
+        }
+        if strs.eq(ay, "Min") {
+            f.align_y = 0;
+        } else if strs.eq(ay, "Max") {
+            f.align_y = 2;
+        }
+    }
+    let mode = fields.next() ?? return f;
+    f.slice = strs.eq(mode, "slice");
+    return f;
+}
+
+/// Parses a viewBox ("x y width height").
+fn parse_view_box(v: []u8) SvgError![4]f64 {
+    let mut sc = pathdata.Scanner.init(v);
+    let mut out: [4]f64 = [0.0; 4];
+    for i in @as(usize, 0)..4 {
+        out[i] = sc.number() catch return error.SyntaxError;
+    }
+    if not sc.at_end() or not (out[2] > 0.0) or not (out[3] > 0.0) {
+        return error.SyntaxError;
+    }
+    return out;
+}
+
+fn build(b: *mut Builder, root: *xml.Element) SvgError!void {
+    let vbv = root.attr("viewBox") catch "";
+    let mut has_vb = false;
+    let mut vb: [4]f64 = [0.0; 4];
+    if vbv.len > 0 {
+        vb = parse_view_box(vbv) catch [0.0; 4];
+        has_vb = vb[2] > 0.0;
+    }
+    if has_vb {
+        b.vw = vb[2];
+        b.vh = vb[3];
+    }
+    // the intrinsic size: width and height (percentages of the viewBox's, or
+    // of 300 x 150)
+    let w = b.attr_length(root, "width", 'x', 16.0, b.vw);
+    let h = b.attr_length(root, "height", 'y', 16.0, b.vh);
+    b.doc.width = w;
+    b.doc.height = h;
+    if not has_vb {
+        vb = [0.0, 0.0, w, h];
+    }
+    b.doc.view_box = vb;
+    b.doc.fit = parse_fit(root.attr("preserveAspectRatio") catch "");
+    b.vw = vb[2];
+    b.vh = vb[3];
+    b.collect_ids(root, 0)!;
+    let base = initial_style();
+    b.enter(root)!;
+    defer b.leave();
+    let s = b.compute_style(root, &base)!;
+    if not s.display {
+        return;
+    }
+    let mut wrapped = begin_group(b, &s, draw.Affine.identity(), pathdata.Box.empty())!;
+    for c in root.children {
+        match c {
+            .Element(x) => { walk(b, x, &s, draw.Affine.identity(), 1)!; }
+            else => {}
+        }
+    }
+    end_group(b, &mut wrapped, 0)!;
+}

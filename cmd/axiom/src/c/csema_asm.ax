@@ -1,24 +1,6 @@
 // =============================================================================
-// csema_asm.ax - asm statements and file-scope asm (a GNU dialect): their
-// operands, constraints, clobbers and template references checked, and what
-// each operand is chosen to be (asm/inline.ax: a register, a specific
-// register, memory or a constant), recorded in the statement's Blob for IR
-// generation (cgen_asm.ax). The labels of `asm goto` are checked as gotos
-// (csema_stmt.ax). Diagnostics: C3096 for a statement the GNU dialect's
-// rules reject (a constraint, an operand, a clobber, a template reference),
-// C3901 for what this implementation does not support (constraints it does
-// not know). On WebAssembly an operand is a local, a constant or a symbol
-// (asm/wasm.ax), and the template's names are looked up here (wasm_lookup).
-//
-// The rules (the GNU dialect's extended asm): an output's constraint begins with '='
-// or '+' and its operand is a modifiable lvalue; '+' makes it an input too
-// (an operand of its own after the inputs, tied to it, not referred to by
-// the template); a matching constraint (a digit, or [name]) ties an input to
-// an output of a register; operands are numbered outputs first, then inputs,
-// then the labels (%l); a clobber is a register, "cc" or "memory", and
-// cannot be a register an operand needs. An operand that names an explicit
-// register variable (`register int x asm("eax")`) in a register constraint
-// is in that register.
+// csema_asm.ax - file-scope asm and operand selection (GNU dialect), part of
+// csema.ax.
 // =============================================================================
 import "../asm/check.ax" as ack;
 import "../asm/inline.ax" as ai;
@@ -29,15 +11,11 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "cgen_abi.ax" as cab;
-import "csema.ax" as cs;
-import "csema_bits.ax" as cb;
-import "csema_expr.ax" as cx;
-import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
 
 // Is the target's assembly supported (x86-64, AArch64, WebAssembly)? The
 // names a WebAssembly text names are looked up as declared where it is.
-fn arch_ok(sp: u.Span) bool {
+fn asm_arch_ok(sp: u.Span) bool {
     _ = sp;
     aw.g_lookup = wasm_lookup;
     aw.g_field = wasm_field;
@@ -48,24 +26,14 @@ fn arch_ok(sp: u.Span) bool {
 // WebAssembly: what the text's names are (asm/wasm.ax's g_lookup)
 // -----------------------------------------------------------------------------
 // (the functions of the unit's file-scope asm so far: name, parameters, results)
-let mut g_wasm_defs: u.List.[aw.Ref] = u.List.[aw.Ref].{ data: @ptr_from_int(*mut aw.Ref, 0), len: 0, cap: 0 };
-let mut g_wasm_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
-
 // (the other fields of the unit's file-scope asm so far: kind, name, what it is)
-let mut g_wasm_fkinds: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
-let mut g_wasm_fnames: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
-let mut g_wasm_fields: u.List.[aw.FieldRef] = u.List.[aw.FieldRef].{ data: @ptr_from_int(*mut aw.FieldRef, 0), len: 0,
-                                                                     cap: 0 };
-
 // (the unit these lists are of: they are emptied when another unit's
 // analysis starts using them)
-let mut g_wasm_unit: *mut cs.CUnit = @ptr_from_int(*mut cs.CUnit, 0);
-
 fn wasm_lists() void {
-    if cs.unit() == g_wasm_unit {
+    if unit() == g_wasm_unit {
         return;
     }
-    g_wasm_unit = cs.unit();
+    g_wasm_unit = unit();
     g_wasm_defs.clear();
     g_wasm_names.clear();
     g_wasm_fkinds.clear();
@@ -97,9 +65,9 @@ fn keep_field(x: *aw.Asm, k: u8, n: []u8) void {
 // of file-scope asm before: its signature as WebAssembly value types.
 fn wasm_lookup(n: []u8) aw.Ref {
     wasm_lists();
-    let mut s = cs.lookup(u.intern(n));
+    let mut s = lookup(u.intern(n));
     if u.isnil(s) {
-        s = cs.linked(u.intern(n));
+        s = linked(u.intern(n));
     }
     if u.notnil(s) and (s.kind == cast.SK_FUNC) {
         return wasm_sig(s.ty);
@@ -148,28 +116,21 @@ fn ir_vt(t: *ir.Ty) u8 {
     return aw.V128;
 }
 
-fn u8_pick(c: bool, a: u8, b: u8) u8 {
-    if c {
-        return a;
-    }
-    return b;
-}
-
-fn bad(sp: u.Span, msg: []u8) void {
-    cs.err(sp, "C3096", msg);
+fn asm_bad(sp: u.Span, msg: []u8) void {
+    err(sp, "C3096", msg);
 }
 
 /// File-scope asm: a basic asm only (its text is the unit's assembly).
-pub fn toplevel(a: *mut cast.Asm) void {
-    if not arch_ok(a.span) {
+pub fn asm_toplevel(a: *mut cast.Asm) void {
+    if not asm_arch_ok(a.span) {
         return;
     }
     if not a.basic {
-        bad(a.span, "file-scope asm can have only a template (no operands, clobbers or labels)");
+        asm_bad(a.span, "file-scope asm can have only a template (no operands, clobbers or labels)");
         return;
     }
     if a.volatile_ or a.goto_ or a.inline_ {
-        bad(a.span, "file-scope asm cannot have qualifiers");
+        asm_bad(a.span, "file-scope asm cannot have qualifiers");
         return;
     }
     let b = new_blob(a);
@@ -177,10 +138,10 @@ pub fn toplevel(a: *mut cast.Asm) void {
         a.blob = b;
         b.locals = ack.g_local_defs;
         if ack.g_init_fini {
-            cs.unit().has_init_fini = true;
+            unit().has_init_fini = true;
         }
         for n in ack.g_globals.items() {
-            cs.unit().asm_defs.push(n);
+            unit().asm_defs.push(n);
         }
         if tg.is_wasm() {
             // (its functions: what later asm may call)
@@ -207,13 +168,13 @@ pub fn toplevel(a: *mut cast.Asm) void {
             }
         }
     }
-    cs.unit().asm_tops.push(a);
+    unit().asm_tops.push(a);
 }
 
 // Reports an error of the assembler in a's template (C3097): false if any.
 fn template_ok(a: *cast.Asm, msg: []u8) bool {
     if msg.len > 0 {
-        cs.err(a.tspan, "C3097", msg);
+        err(a.tspan, "C3097", msg);
         return false;
     }
     return true;
@@ -235,8 +196,8 @@ fn note_names(a: *mut cast.Asm, t: []u8) void {
                 i += 1;
             }
             let n = u.intern(t[st..i]);
-            cs.unit().asm_names.push(n);
-            cs.asm_static(a, n);
+            unit().asm_names.push(n);
+            asm_static(a, n);
             continue;
         }
         i += 1;
@@ -254,7 +215,7 @@ fn new_blob(a: *mut cast.Asm) *mut ai.Blob {
     b.goto_ = a.goto_;
     b.cc = true;
     b.memory = a.basic;
-    b.intel = (tg.g_arch == tg.ARCH_X64) and cs.opts().asm_intel;
+    b.intel = (tg.g_arch == tg.ARCH_X64) and opts().asm_intel;
     let lc = u.span_linecol(a.span);
     b.loc = u.perm_dup(u.f2("%s:%s", u.file_of(a.span.file).display, u.idec(lc.sl)));
     return b;
@@ -267,7 +228,7 @@ fn register_var(e: *cast.Expr) i32 {
         return -1;
     }
     let s = e.sym;
-    if (s.kind != cast.SK_OBJECT) or (s.duration != cast.SD_AUTO) or (s.asm_name.len == 0) or not csm.is_register(s) {
+    if (s.kind != cast.SK_OBJECT) or (s.duration != cast.SD_AUTO) or (s.asm_name.len == 0) or not is_register(s) {
         return -1;
     }
     return ai.reg_named(tg.g_arch, s.asm_name).reg;
@@ -315,7 +276,7 @@ fn value_type(e: *mut cast.Expr) *mut cty.CType {
 
 // What operand o (typed, maybe an lvalue: `e`) of asm a is, given
 // constraint c: op, or an error reported (false).
-fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: *mut ai.Op) bool {
+fn asm_choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: *mut ai.Op) bool {
     let t = value_type(e);
     op.out = output;
     op.early = c.early;
@@ -323,10 +284,10 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
     op.name = u.perm_dup(o.name);
     op.fp = cty.is_floating(t);
     op.bits = reg_bits(t);
-    let rv = register_var(e);
-    if c.pair and cty.is_wint(t) and (cty.size_of(t) == 16) and (rv < 0) {
+    let regv = register_var(e);
+    if c.pair and cty.is_wint(t) and (cty.size_of(t) == 16) and (regv < 0) {
         // 'A' of a 128-bit integer: its low half in rax (and its high half
-        // in rdx: an operand of its own that stmt adds)
+        // in rdx: an operand of its own that asm_stmt adds)
         op.kind = ai.OK_FIXED;
         op.cls = ai.CL_GPR;
         op.reg = 0;
@@ -334,7 +295,7 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         op.pair = 0;
         return true;
     }
-    if (tg.g_arch == tg.ARCH_A64) and c.reg and (c.cls == ai.CL_VEC) and (op.bits == 0) and (rv < 0) {
+    if (tg.g_arch == tg.ARCH_A64) and c.reg and (c.cls == ai.CL_VEC) and (op.bits == 0) and (regv < 0) {
         // an object that is no scalar of a register's width (a vector, a
         // structure, a long double, ...): in a vector register through memory,
         // q for up to 16 bytes, else an SVE z register (asm/inline.ax, expand)
@@ -346,7 +307,7 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         // it is, and in rdx:rax with x86-64's "A")
         let msg =
             "an asm operand of type %s (wider than 64 bits) is not a register's or a constant: it needs memory (m) or, on x86-64, A (rdx:rax)";
-        bad(o.span, u.f1(msg, cs.tq(e.ty)));
+        asm_bad(o.span, u.f1(msg, tq(e.ty)));
         return false;
     }
     if not output and c.imm and c.fpz and e.is_const and cty.is_floating(t) and not cty.is_complex(t) and
@@ -364,13 +325,13 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
             return true;
         }
         if not c.reg and not c.mem {
-            bad(o.span, u.f4("the operand '%s' (%s) is not in the range %s to %s that the constraint asks for",
-                             o.constraint, u.dec(v), u.dec(c.imm_lo), u.dec(c.imm_hi)));
+            asm_bad(o.span, u.f4("the operand '%s' (%s) is not in the range %s to %s that the constraint asks for",
+                                 o.constraint, u.dec(v), u.dec(c.imm_lo), u.dec(c.imm_hi)));
             return false;
         }
     }
-    if not output and c.imm and c.sym_ok and cty.is_pointer(t) and (rv < 0) {
-        let ad = cc.address(cx.value_of(e));
+    if not output and c.imm and c.sym_ok and cty.is_pointer(t) and (regv < 0) {
+        let ad = cc.address(value_of(e));
         if ad.ok and (u.notnil(ad.sym) or u.notnil(ad.str)) {
             op.kind = ai.OK_IMM;
             op.sym = true;
@@ -381,14 +342,14 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
                 op.wparams = r.params;
                 op.wresults = r.results;
                 if ad.off != 0 {
-                    bad(o.span, "the address of a function plus a constant is no function on WebAssembly");
+                    asm_bad(o.span, "the address of a function plus a constant is no function on WebAssembly");
                     return false;
                 }
             }
             return true;
         }
     }
-    if tg.is_wasm() and c.reg and cty.is_vector(t) and (cty.size_of(t) == 16) and (rv < 0) {
+    if tg.is_wasm() and c.reg and cty.is_vector(t) and (cty.size_of(t) == 16) and (regv < 0) {
         // (a 16-byte vector: a v128 local)
         op.kind = ai.OK_REG;
         op.cls = ai.CL_VEC;
@@ -397,25 +358,26 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
     }
     if c.reg and ((op.bits != 0) or not c.mem) {
         if op.bits == 0 {
-            bad(o.span, u.f1("the operand of type %s cannot be in a register", cs.tq(e.ty)));
+            asm_bad(o.span, u.f1("the operand of type %s cannot be in a register", tq(e.ty)));
             return false;
         }
         if (c.cls == ai.CL_VEC) and (op.bits < 32) {
-            bad(o.span, u.f1("the operand of type %s cannot be in a floating-point or vector register", cs.tq(e.ty)));
+            asm_bad(o.span, u.f1("the operand of type %s cannot be in a floating-point or vector register", tq(e.ty)));
             return false;
         }
-        if (tg.g_arch == tg.ARCH_A64) and ((c.fixed == 31) or (rv == 31)) and
-           (output or (rv != 31) or (c.fixed != 31)) {
+        if (tg.g_arch == tg.ARCH_A64) and ((c.fixed == 31) or (regv == 31)) and
+           (output or (regv != 31) or (c.fixed != 31)) {
             // the stack pointer (k): only read, and only as the register
             // variable that names it, whose value as an operand it is (the
             // compiler moves nothing into the stack pointer)
             if output {
-                bad(o.span, "the stack pointer cannot be an asm output");
-            } else if (rv == 31) and (c.fixed != 31) {
-                bad(o.span, u.f1("the register variable '%s' is the stack pointer: its constraint is 'k'", e.sym.name));
+                asm_bad(o.span, "the stack pointer cannot be an asm output");
+            } else if (regv == 31) and (c.fixed != 31) {
+                asm_bad(o.span, u.f1("the register variable '%s' is the stack pointer: its constraint is 'k'",
+                                     e.sym.name));
             } else {
-                bad(o.span,
-                    "the constraint 'k' is the stack pointer: its operand is a register variable declared asm(\"sp\")");
+                asm_bad(o.span,
+                        "the constraint 'k' is the stack pointer: its operand is a register variable declared asm(\"sp\")");
             }
             return false;
         }
@@ -426,16 +388,16 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
             op.kind = ai.OK_FIXED;
             op.reg = c.fixed;
         }
-        if rv >= 0 {
+        if regv >= 0 {
             let rc = ai.reg_named(tg.g_arch, e.sym.asm_name).cls;
-            if (rc != c.cls) or ((c.fixed >= 0) and (c.fixed != rv)) or
-               ((c.subset != 0) and ((c.subset & (@as(u64, 1) << @int_cast(u32, rv & 31))) == 0)) {
-                bad(o.span, u.f2("the register variable '%s' (in %s) does not meet the constraint", e.sym.name,
-                                 e.sym.asm_name));
+            if (rc != c.cls) or ((c.fixed >= 0) and (c.fixed != regv)) or
+               ((c.subset != 0) and ((c.subset & (@as(u64, 1) << @int_cast(u32, regv & 31))) == 0)) {
+                asm_bad(o.span, u.f2("the register variable '%s' (in %s) does not meet the constraint", e.sym.name,
+                                     e.sym.asm_name));
                 return false;
             }
             op.kind = ai.OK_FIXED;
-            op.reg = rv;
+            op.reg = regv;
         }
         return true;
     }
@@ -461,8 +423,8 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
             }
         }
         if not fits {
-            bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", cs.tq(e.ty),
-                             o.constraint));
+            asm_bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", tq(e.ty),
+                                 o.constraint));
             return false;
         }
         op.via = c.via;
@@ -471,18 +433,18 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
     }
     if c.mem {
         if not e.lvalue and output {
-            bad(o.span, "a memory output must be an lvalue");
+            asm_bad(o.span, "a memory output must be an lvalue");
             return false;
         }
-        if u.notnil(cb.member(e)) {
-            bad(o.span, "a memory operand cannot be a bit-field");
+        if u.notnil(bit_member(e)) {
+            asm_bad(o.span, "a memory operand cannot be a bit-field");
             return false;
         }
         // (an operand in an x87, MMX or mask register goes through memory
         // the compiler chooses, which an object declared register may be:
         // only its address is never taken, 6.7.1p6)
-        if e.lvalue and (c.via == ai.VIA_NONE) and u.notnil(csm.register_object(e)) {
-            bad(o.span, "a memory operand cannot be an object declared register (it has no address)");
+        if e.lvalue and (c.via == ai.VIA_NONE) and u.notnil(register_object(e)) {
+            asm_bad(o.span, "a memory operand cannot be an object declared register (it has no address)");
             return false;
         }
         op.kind = ai.OK_MEM;
@@ -491,10 +453,10 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         return true;
     }
     if c.imm {
-        bad(o.span, u.f1("the operand '%s' must be a constant", o.constraint));
+        asm_bad(o.span, u.f1("the operand '%s' must be a constant", o.constraint));
         return false;
     }
-    bad(o.span, u.f1("the constraint '%s' allows no operand of this kind", o.constraint));
+    asm_bad(o.span, u.f1("the constraint '%s' allows no operand of this kind", o.constraint));
     return false;
 }
 
@@ -508,16 +470,16 @@ fn via_object(o: *cast.AsmOperand, e: *mut cast.Expr, subset: u64, via: u8, max:
     }
     if (t.kind == cty.TK_FUNCTION) or (t.kind == cty.TK_VOID) or not cty.is_complete(t) or (cty.size_of(t) == 0) or
        (cty.size_of(t) > max) {
-        bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", cs.tq(e.ty),
-                         o.constraint));
+        asm_bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", tq(e.ty),
+                             o.constraint));
         return false;
     }
-    if e.lvalue and u.notnil(cb.member(e)) {
-        bad(o.span, "an operand in a register through memory cannot be a bit-field");
+    if e.lvalue and u.notnil(bit_member(e)) {
+        asm_bad(o.span, "an operand in a register through memory cannot be a bit-field");
         return false;
     }
-    if e.lvalue and u.notnil(csm.register_object(e)) {
-        bad(o.span, "an operand in a register through memory cannot be an object declared register");
+    if e.lvalue and u.notnil(register_object(e)) {
+        asm_bad(o.span, "an operand in a register through memory cannot be an object declared register");
         return false;
     }
     op.kind = ai.OK_MEM;
@@ -540,724 +502,3 @@ fn u64_pick(c: bool, a: u64, b: u64) u64 {
 /// an input a value, or for memory an lvalue), its Blob made (a.blob), its
 /// expressions for IR generation in a.exprs (one for each of the blob's
 /// operands).
-pub fn stmt(a: *mut cast.Asm) void {
-    for o in a.outputs.items() {
-        o.e = cx.check(o.e);
-    }
-    for o in a.inputs.items() {
-        o.e = cx.check(o.e);
-    }
-    if not arch_ok(a.span) {
-        return;
-    }
-    if a.basic and g_naked_wasm {
-        a.blob = new_blob(a);  // (checked with the function: naked_body)
-        return;
-    }
-    if a.basic {
-        let bb = new_blob(a);
-        if template_ok(a, ack.check(bb)) {
-            a.blob = bb;
-            if ack.g_init_fini {
-                cs.unit().has_init_fini = true;
-            }
-        }
-        return;
-    }
-    // the alternative of the constraints ("r,m" ...) that costs least, the
-    // same for every operand (else C3096)
-    let alt = choose_alt(a);
-    if alt < 0 {
-        return;
-    }
-    let arch = tg.g_arch;
-    let b = new_blob(a);
-    let mut ops = u.List.[ai.Op].empty();
-    let mut exprs = u.List.[*mut cast.Expr].empty();
-    let mut ok = true;
-    let nout = a.outputs.len;
-    let nin = a.inputs.len;
-    let mut names = u.List.[[]u8].empty();
-    // outputs (and the inputs '+' adds, after the inputs)
-    let mut plus = u.List.[usize].empty();
-    for k in 0..nout {
-        let o = a.outputs.get(k);
-        let c = ai.constraint(arch, alt_of(o.constraint, alt), true);
-        let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: true, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false, zero: false, wfunc: false, wparams: "", wresults: "" };
-        if not c.ok {
-            report_con(o, c.msg);
-            ok = false;
-        } else if not cx.modifiable(o.e, "an asm output") {
-            ok = false;
-        } else if choose(o, o.e, &c, true, &mut op) {
-            op.inout = c.inout;
-            if c.inout {
-                if (op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED) and (op.kind != ai.OK_MEM) {
-                    ok = false;
-                }
-                plus.push(k);
-            }
-        } else {
-            ok = false;
-        }
-        ops.push(op);
-        exprs.push(o.e);
-        names.push(o.name);
-    }
-    for k in 0..nin {
-        let o = a.inputs.get(k);
-        let c = ai.constraint(arch, alt_of(o.constraint, alt), false);
-        let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: false, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false, zero: false, wfunc: false, wparams: "", wresults: "" };
-        let mut e = o.e;
-        if not c.ok {
-            report_con(o, c.msg);
-            ok = false;
-        } else {
-            let mut tie = c.tie;
-            if c.tie_name.len > 0 {
-                tie = -1;
-                for j in 0..nout {
-                    if u.str_eq(names.get(j), c.tie_name) {
-                        tie = @int_cast(i32, j);
-                    }
-                }
-                if tie < 0 {
-                    bad(o.cspan, u.f1("no output is named '%s'", c.tie_name));
-                    ok = false;
-                }
-            }
-            let mut tie_bad = false;
-            if (c.tie >= 0) and (@as(usize, @int_cast(usize, c.tie)) >= nout) {
-                bad(o.cspan, u.f1("the matching constraint '%s' is not the number of an output", o.constraint));
-                ok = false;
-                tie = -1;
-                tie_bad = true;
-            }
-            if tie_bad or ((tie < 0) and (c.tie_name.len > 0)) {
-                // (reported)
-            } else if tie >= 0 {
-                let to = ops.get(@int_cast(usize, tie));
-                if to.via != ai.VIA_NONE {
-                    // (the output's mask, MMX or x87 register: the input's value through memory)
-                    e = cx.value_of(e);
-                    let mut c2 = c;
-                    c2.via = to.via;
-                    c2.x87 = to.x87;
-                    c2.mem = true;
-                    if choose(o, e, &c2, false, &mut op) {
-                        op.tie = tie;
-                    } else {
-                        ok = false;
-                    }
-                } else if (to.kind != ai.OK_REG) and (to.kind != ai.OK_FIXED) {
-                    bad(o.cspan, "a matching constraint ties an input to an output in a register");
-                    ok = false;
-                } else if to.pair >= 0 {
-                    // (an output in the rdx:rax pair: the input's 128-bit value there too)
-                    if not cty.is_wint(e.ty) or (cty.size_of(e.ty) != 16) {
-                        bad(o.span, "an input tied to an output in the rdx:rax pair must have 128 bits");
-                        ok = false;
-                    }
-                    op = to;
-                    op.out = false;
-                    op.early = false;
-                    op.inout = false;
-                    op.tie = tie;
-                    op.name = u.perm_dup(o.name);
-                } else {
-                    e = cx.value_of(e);
-                    op.kind = to.kind;
-                    op.cls = to.cls;
-                    op.reg = to.reg;
-                    op.tie = tie;
-                    op.bits = reg_bits(e.ty);
-                    op.fp = cty.is_floating(e.ty);
-                    op.name = u.perm_dup(o.name);
-                    if op.bits == 0 {
-                        bad(o.span, u.f1("the operand of type %s cannot be in a register", cs.tq(e.ty)));
-                        ok = false;
-                    }
-                }
-            } else if not choose(o, e, &c, false, &mut op) {
-                ok = false;
-            } else if (op.kind != ai.OK_MEM) or not e.lvalue {
-                e = cx.value_of(e);  // (memory that is not an lvalue: a temporary holds the value)
-            }
-        }
-        ops.push(op);
-        exprs.push(e);
-        names.push(o.name);
-    }
-    // the inputs of '+' outputs: the outputs' values
-    for k in plus.items() {
-        let mut op = ops.get(k);
-        op.out = false;
-        op.early = false;
-        op.tie = @int_cast(i32, k);
-        op.name = "";
-        if op.kind == ai.OK_MEM {
-            continue;  // (an output in memory, which the template also reads)
-        }
-        ops.push(op);
-        exprs.push(cx.value_of(a.outputs.get(k).e));
-    }
-    // the high halves of the operands in the rdx:rax pair ('A' of a 128-bit
-    // value): operands of their own in rdx, after all the others (the
-    // template does not name them), tied as their low halves are
-    let nlow = ops.len;
-    let his = u.newn.[i32](nlow + 1);
-    for k in 0..nlow {
-        his[k] = -1;
-        let mut lo = ops.get(k);
-        if lo.pair < 0 {
-            continue;
-        }
-        let mut hop = lo;
-        hop.reg = 2;
-        hop.hi = true;
-        hop.pair = @int_cast(i32, k);
-        hop.name = "";
-        if lo.tie >= 0 {
-            hop.tie = his[@int_cast(usize, lo.tie)];
-        }
-        lo.pair = @int_cast(i32, ops.len);
-        his[k] = lo.pair;
-        ops.set(k, lo);
-        ops.push(hop);
-        exprs.push(exprs.get(k));
-    }
-    // names are unique
-    for i in 0..names.len {
-        for j in 0..i {
-            if (names.get(i).len > 0) and u.str_eq(names.get(i), names.get(j)) {
-                bad(a.span, u.f1("two operands are named '%s'", names.get(i)));
-                ok = false;
-            }
-        }
-    }
-    // clobbers
-    for c in a.clobbers.items() {
-        if arch == tg.ARCH_X64 {
-            let mut which: i32 = 0;
-            let sk = ai.x86_special_clobber(c.name, &mut which);
-            let bit = @as(u32, 1) << @int_cast(u32, which & 7);
-            if sk == 1 {
-                b.stclob = b.stclob | bit;
-                continue;
-            }
-            if sk == 2 {
-                b.kclob = b.kclob | bit;
-                continue;
-            }
-            if sk == 3 {
-                b.mmclob = b.mmclob | bit;
-                continue;
-            }
-            if sk == 4 {
-                continue;  // (a tile register: the compiler keeps nothing in the tiles)
-            }
-            let wr = ai.x86_wide_clobber(c.name);
-            if wr == -1 {
-                continue;  // (xmm16-31, ymm16-31, zmm16-31: the compiler keeps nothing there across it)
-            }
-            if wr >= 0 {
-                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, wr));
-                continue;
-            }
-        }
-        if (arch == tg.ARCH_A64) and (c.name.len >= 2) and ((c.name[0] == 'z') or (c.name[0] == 'p')) {
-            // an SVE register: z<n> is v<n> (with its upper bits), p<n> one the
-            // operands through memory avoid (and pn<n>, SME2's name of p<n> as
-            // a predicate-as-counter)
-            let pn = (c.name[0] == 'p') and (c.name.len > 2) and (c.name[1] == 'n');
-            let mut k = ai.num(c.name[1..]);
-            if pn {
-                k = ai.num(c.name[2..]);
-            }
-            if (c.name[0] == 'z') and (k >= 0) and (k <= 31) {
-                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, 32 + k));
-                continue;
-            }
-            if (c.name[0] == 'p') and (k >= 0) and (k <= 15) {
-                b.kclob = b.kclob | (@as(u32, 1) << @int_cast(u32, k));
-                continue;
-            }
-        }
-        let kind = ai.clobber_kind(arch, c.name);
-        if kind == 2 {
-            b.memory = true;
-            continue;
-        }
-        if kind == 1 {
-            continue;
-        }
-        let r = ai.reg_named(arch, c.name);
-        if r.reg < 0 {
-            bad(c.span, u.f1("'%s' is not a register that can be clobbered", c.name));
-            ok = false;
-            continue;
-        }
-        let why = ai.reg_reserved(arch, r.reg, false);
-        if why.len > 0 {
-            bad(c.span, u.f2("'%s' is %s: it cannot be clobbered", c.name, why));
-            ok = false;
-            continue;
-        }
-        b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, r.reg));
-    }
-    // operands in mask, MMX and x87 registers: the rules of the x87 stack (the dialect's
-    // documentation of extended asm: the outputs and inputs in st(0) up, 't'
-    // before 'u'; the inputs the template pops, clobbered, are the topmost)
-    if ok and (arch == tg.ARCH_X64) {
-        let mut nk: u32 = 0;
-        let mut nmm: u32 = 0;
-        let mut out_t = false;
-        let mut out_u = false;
-        let mut in_t = false;
-        let mut in_u = false;
-        let mut nx87: u32 = 0;
-        for i in 0..ops.len {
-            let op = ops.get(i);
-            if op.via == ai.VIA_NONE {
-                continue;
-            }
-            if a.goto_ and op.out {
-                bad(a.span, "an asm goto cannot have outputs in mask, MMX or x87 registers");
-                ok = false;
-            }
-            if op.via == ai.VIA_K {
-                nk += 1;
-            } else if op.via == ai.VIA_MM {
-                nmm += 1;
-            } else {
-                nx87 += 1;
-                let is_in = not op.out or op.inout;
-                if op.out and (op.x87 == 't') {
-                    out_t = true;
-                }
-                if op.out and (op.x87 == 'u') {
-                    out_u = true;
-                }
-                if is_in and (op.x87 == 't') {
-                    in_t = true;
-                }
-                if is_in and (op.x87 == 'u') {
-                    in_u = true;
-                }
-                if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).x87 == 't') {
-                    in_t = true;
-                }
-                if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).x87 == 'u') {
-                    in_u = true;
-                }
-            }
-        }
-        if (out_u and not out_t) or (in_u and not in_t) {
-            bad(a.span, "an x87 operand in st(1) ('u') needs one in st(0) ('t')");
-            ok = false;
-        }
-        // (consumed: popped, clobbered, or replaced by the output tied to it)
-        let mut consumed = b.stclob;
-        for i in 0..ops.len {
-            let op = ops.get(i);
-            if (op.via == ai.VIA_X87) and ((op.tie >= 0) or op.inout) {
-                let x = ops.get(pick_us(op.tie >= 0, @int_cast(usize, @max(op.tie, 0)), i)).x87;
-                if (x == 't') or (x == 'u') {
-                    consumed = consumed | (@as(u32, 1) << @as(u32, x - 't'));
-                }
-            }
-        }
-        if (consumed != 0) and ((consumed & (consumed + 1)) != 0) {
-            bad(a.span, "the x87 registers an asm pops (its clobbers) must be the topmost, st(0) up");
-            ok = false;
-        }
-        if (nk > 7) or (nmm > 8) or (nx87 > 8) {
-            bad(a.span, "an asm statement with more mask, MMX or x87 operands than there are registers");
-            ok = false;
-        }
-    }
-    // a fixed register is not clobbered, nor given to two operands that are not tied
-    for i in 0..ops.len {
-        let op = ops.get(i);
-        if (op.kind != ai.OK_FIXED) or (op.reg < 0) {
-            continue;
-        }
-        let why = ai.reg_reserved(arch, op.reg, true);
-        if why.len > 0 {
-            bad(a.span, u.f2("operand %s would be in %s", u.zdec(i), why));
-            ok = false;
-        }
-        if (b.clobber & (@as(u64, 1) << @int_cast(u32, op.reg))) != 0 {
-            bad(a.span, u.f1("operand %s is in a register the asm also clobbers", u.zdec(i)));
-            ok = false;
-        }
-        for j in 0..i {
-            let p = ops.get(j);
-            if (p.kind == ai.OK_FIXED) and (p.reg == op.reg) and (p.out == op.out) and (op.tie != @int_cast(i32, j)) and
-               (p.tie != @int_cast(i32, i)) and not ((op.tie >= 0) and (op.tie == p.tie)) {
-                bad(a.span, u.f2("operands %s and %s are in the same register", u.zdec(j), u.zdec(i)));
-                ok = false;
-            }
-        }
-    }
-    // AArch64's operands through memory: their z (v) and p registers, those
-    // of no clobber, fixed operand or other such operand (the z ones then
-    // clobbered: the allocator keeps nothing in them across the asm)
-    if ok and (arch == tg.ARCH_A64) {
-        let mut vtaken = b.clobber >> 32;
-        let mut ptaken = b.kclob;
-        for i in 0..ops.len {
-            let op = ops.get(i);
-            if (op.kind == ai.OK_FIXED) and (op.reg >= 32) {
-                vtaken = vtaken | (@as(u64, 1) << @int_cast(u32, op.reg - 32));
-            }
-        }
-        for i in 0..ops.len {
-            let mut op = ops.get(i);
-            if (op.via != ai.VIA_V) and (op.via != ai.VIA_P) {
-                continue;
-            }
-            if a.goto_ and op.out {
-                bad(a.span, "an asm goto cannot have outputs in SVE or vector registers through memory");
-                ok = false;
-            }
-            if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).via == op.via) {
-                op.reg = ops.get(@int_cast(usize, op.tie)).reg;
-                ops.set(i, op);
-                continue;
-            }
-            let p = op.via == ai.VIA_P;
-            let mut sub = op.subset;
-            if sub == 0 {
-                sub = u64_pick(p, 0xffff, 0xffffffff);
-            }
-            // (from the top: z31 down are caller-saved; p15 down, or p7 down)
-            let mut r: i32 = -1;
-            let mut j: i32 = pick_i32(p, 15, 31);
-            while (j >= 0) and (r < 0) {
-                let bit = @as(u64, 1) << @int_cast(u32, j);
-                let used = u64_pick(p, @as(u64, ptaken), vtaken);
-                if ((sub & bit) != 0) and ((used & bit) == 0) {
-                    r = j;
-                }
-                j -= 1;
-            }
-            if r < 0 {
-                bad(a.span, "an asm statement with more SVE or vector operands through memory than free registers");
-                ok = false;
-                continue;
-            }
-            if p {
-                ptaken = ptaken | (@as(u32, 1) << @int_cast(u32, r));
-                op.reg = r;
-            } else {
-                vtaken = vtaken | (@as(u64, 1) << @int_cast(u32, r));
-                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, 32 + r));
-                op.reg = 32 + r;
-            }
-            ops.set(i, op);
-        }
-    }
-    // the template's references
-    let mut err = "";
-    let ps = ai.parse_template(arch, a.tmpl, b.intel, &mut err);
-    if err.len > 0 {
-        bad(a.tspan, err);
-        ok = false;
-    }
-    let nref = @int_cast(i32, nout + nin);
-    let nlab = @int_cast(i32, a.labels.len);
-    let pieces = u.perm_newn.[ai.Piece](ps.len + 1);
-    for i in 0..ps.len {
-        let mut p = ps[i];
-        if p.kind == ai.PK_OP {
-            if p.text.len > 0 {
-                p.op = -1;
-                for j in 0..names.len {
-                    if u.str_eq(names.get(j), p.text) {
-                        p.op = @int_cast(i32, j);
-                    }
-                }
-                if p.op < 0 {
-                    bad(a.tspan, u.f1("the template refers to '%%[%s]', but no operand has that name", p.text));
-                    ok = false;
-                }
-            } else if p.op >= nref {
-                bad(a.tspan, u.f1("the template refers to operand %s, which there is not", u.idec(p.op)));
-                ok = false;
-            }
-            if not ai.modifier_ok(arch, p.mod) {
-                bad(a.tspan, u.f1("'%s' is not an operand modifier supported here", ai.ch_text(p.mod)));
-                ok = false;
-            }
-        } else if p.kind == ai.PK_LABEL {
-            if p.text.len > 0 {
-                p.op = -1;
-                for j in 0..a.labels.len {
-                    if u.str_eq(a.labels.get(j).name, p.text) {
-                        p.op = @int_cast(i32, j);
-                    }
-                }
-            } else if p.op >= nref {
-                p.op -= nref;
-            } else {
-                p.op = -1;
-            }
-            if (p.op < 0) or (p.op >= nlab) {
-                bad(a.tspan, "the template's '%l' does not name a label of the asm goto");
-                ok = false;
-            }
-        }
-        p.text = u.perm_dup(p.text);
-        pieces[i] = p;
-    }
-    if not ok {
-        return;
-    }
-    let pops = u.perm_newn.[ai.Op](ops.len + 1);
-    for i in 0..ops.len {
-        pops[i] = ops.get(i);
-    }
-    b.ops = pops[0..ops.len];
-    b.pieces = pieces[0..ps.len];
-    b.nlabels = nlab;
-    if not template_ok(a, ack.check(b)) {
-        return;
-    }
-    if ack.g_init_fini {
-        cs.unit().has_init_fini = true;
-    }
-    a.blob = b;
-    a.exprs = exprs;
-}
-
-// The modifiers of constraint s (its leading '=' or '+'), and its
-// alternatives (separated by ',').
-fn con_mods(s: []u8) []u8 {
-    let mut k: usize = 0;
-    while (k < s.len) and ((s[k] == '=') or (s[k] == '+')) {
-        k += 1;
-    }
-    return s[0..k];
-}
-
-fn con_alts(s: []u8) [][]u8 {
-    let body = s[con_mods(s).len..];
-    let mut out = u.List.[[]u8].empty();
-    let mut st: usize = 0;
-    let mut k: usize = 0;
-    let mut depth: i32 = 0;
-    while k <= body.len {
-        if (k < body.len) and (body[k] == '[') {
-            depth += 1;
-        } else if (k < body.len) and (body[k] == ']') {
-            depth -= 1;
-        }
-        if (k == body.len) or ((body[k] == ',') and (depth == 0)) {
-            out.push(body[st..k]);
-            st = k + 1;
-        }
-        k += 1;
-    }
-    return out.items();
-}
-
-// Constraint s with only its alternative j (its modifiers kept).
-fn alt_of(s: []u8, j: i32) []u8 {
-    let alts = con_alts(s);
-    if alts.len <= 1 {
-        return s;
-    }
-    return u.cat2(con_mods(s), alts[@int_cast(usize, j)]);
-}
-
-// The cost of operand o (an output if `output`) in alternative text alt
-// (with its modifiers `mods`): the dialect's disparagement, `?` 1 and `!`
-// 600 for each, or -1 if the alternative cannot take the operand (a
-// constant it needs and the operand is not; a register of a type no
-// register holds; memory for an output that is no lvalue).
-fn alt_cost(arch: i32, o: *mut cast.AsmOperand, mods: []u8, alt: []u8, output: bool) i64 {
-    let mut cost: i64 = 0;
-    for ch in alt {
-        if ch == '?' {
-            cost += 1;
-        } else if ch == '!' {
-            cost += 600;
-        }
-    }
-    let c = ai.constraint(arch, u.cat2(mods, alt), output);
-    if not c.ok {
-        return cost;  // (reported when the alternative is the one chosen)
-    }
-    if (c.tie >= 0) or (c.tie_name.len > 0) {
-        return cost;  // (a matching constraint: its output's choice)
-    }
-    let t = value_type(o.e);
-    let rok = c.reg and (reg_bits(t) != 0) and not ((c.cls == ai.CL_VEC) and (reg_bits(t) < 32));
-    let kok = not output and c.imm and o.e.is_const and cty.is_integer(t);
-    let sok = not output and c.imm and c.sym_ok and cty.is_pointer(t) and cc.address(cx.value_of(o.e)).ok;
-    let mok = (c.mem or (c.via != ai.VIA_NONE)) and (o.e.lvalue or not output);
-    if kok or sok {
-        return cost;
-    }
-    if rok {
-        return cost + 1;  // (a register: the value loaded into it)
-    }
-    if mok {
-        return cost + 2;  // (memory: the value stored to it, or read through it)
-    }
-    return -1;
-}
-
-// The alternative of asm a's constraints that its operands fit at the
-// least cost (the first of those), or -1 after an error (reported: the
-// operands have different numbers of alternatives).
-fn choose_alt(a: *cast.Asm) i32 {
-    let mut n: usize = 1;
-    let mut first = true;
-    let mut all = u.List.[*mut cast.AsmOperand].empty();
-    for o in a.outputs.items() {
-        all.push(o);
-    }
-    for o in a.inputs.items() {
-        all.push(o);
-    }
-    for o in all.items() {
-        let m = con_alts(o.constraint).len;
-        if first {
-            n = m;
-            first = false;
-        } else if (m != n) and (m > 1) and (n > 1) {
-            bad(o.cspan, u.f2("the constraint '%s' has %s alternatives, and the others do not", o.constraint,
-                              u.zdec(m)));
-            return -1;
-        } else if m > n {
-            n = m;
-        }
-    }
-    if n <= 1 {
-        return 0;
-    }
-    let mut best: i32 = 0;
-    let mut best_cost: i64 = -1;
-    for j in 0..n {
-        let mut cost: i64 = 0;
-        let mut k: usize = 0;
-        for o in all.items() {
-            let alts = con_alts(o.constraint);
-            let mut x = alts[0];
-            if alts.len > 1 {
-                x = alts[j];
-            }
-            let c = alt_cost(tg.g_arch, o, con_mods(o.constraint), x, k < a.outputs.len);
-            k += 1;
-            if c < 0 {
-                cost = -1;
-                break;
-            }
-            cost += c;
-        }
-        if (cost >= 0) and ((best_cost < 0) or (cost < best_cost)) {
-            best = @int_cast(i32, j);
-            best_cost = cost;
-        }
-    }
-    return best;
-}
-
-fn report_con(o: *cast.AsmOperand, msg: []u8) void {
-    bad(o.cspan, u.f2("the constraint '%s': %s", o.constraint, msg));
-}
-
-/// `register T x asm("reg")` (an explicit register variable): the register
-/// is one of the target's that an operand may be pinned to; false (reported)
-/// if not.
-pub fn register_name(sp: u.Span, name: []u8) bool {
-    if (tg.g_arch != tg.ARCH_X64) and (tg.g_arch != tg.ARCH_A64) {
-        bad(sp, u.f1("'%s' is not a register of the target: WebAssembly has none (its locals are the compiler's)",
-                     name));
-        return false;
-    }
-    let r = ai.reg_named(tg.g_arch, name);
-    if r.reg < 0 {
-        bad(sp, u.f1("'%s' is not a register of the target", name));
-        return false;
-    }
-    let why = ai.reg_reserved(tg.g_arch, r.reg, true);
-    if why.len > 0 {
-        bad(sp, u.f2("'%s' is %s: a variable cannot be kept in it", name, why));
-        return false;
-    }
-    return true;
-}
-
-/// The body of a function with the attribute naked: asm statements only,
-/// with no operands (its text is the function: cgen_asm.ax).
-pub fn naked_body(f: *mut cast.CSym, body: *cast.Stmt) void {
-    for x in body.items.items() {
-        if x.kind == cast.StmtKind.ASM {
-            let a = x.asm;
-            if (a.outputs.len == 0) and (a.inputs.len == 0) and (a.labels.len == 0) {
-                continue;
-            }
-            bad(x.span, u.f1("the naked function '%s' can only have asm statements without operands", f.name));
-            return;
-        }
-        if (x.kind == cast.StmtKind.EXPR) and u.isnil(x.e) {
-            continue;
-        }
-        bad(x.span, u.f1("the body of the naked function '%s' can only be asm statements", f.name));
-        return;
-    }
-    if tg.is_wasm() {
-        let msg = ack.check_text(tg.g_arch, naked_text(f.name, f.ty, body), false, false);
-        if msg.len > 0 {
-            cs.err(body.span, "C3097", msg);
-        }
-    }
-}
-
-/// On WebAssembly, asm statements in a naked function (a GNU dialect)
-/// are its code: the function `name` of C type t as file-scope asm,
-/// `(func $name (param ...) (result ...) <the templates>)`, its
-/// parameters the locals 0 up (as the C ABI passes them: wasm_sig).
-pub let mut g_naked_wasm: bool = false;
-
-pub fn naked_text(name: []u8, t: *mut cty.CType, body: *cast.Stmt) []u8 {
-    let r = wasm_sig(t);
-    let mut b = u.Buf.init();
-    b.s(u.f1("(func $%s", name));
-    for p in r.params {
-        b.s(u.f1(" (param %s)", aw.vt_name(p)));
-    }
-    for p in r.results {
-        b.s(u.f1(" (result %s)", aw.vt_name(p)));
-    }
-    b.c('\n');
-    for x in body.items.items() {
-        if (x.kind == cast.StmtKind.ASM) and u.notnil(x.asm) {
-            b.s(x.asm.tmpl);
-            b.c('\n');
-        }
-    }
-    b.s(")\n");
-    return b.done();
-}
-
-fn pick_us(c: bool, a: usize, b: usize) usize {
-    if c {
-        return a;
-    }
-    return b;
-}
-
-fn pick_i32(c: bool, a: i32, b: i32) i32 {
-    if c {
-        return a;
-    }
-    return b;
-}

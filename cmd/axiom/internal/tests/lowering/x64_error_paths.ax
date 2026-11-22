@@ -1,0 +1,70 @@
+// Branch prediction of error paths (opt.unlikely_succ): the way an error
+// goes is predicted not taken, so the layout keeps the success path straight
+// and the error path out of it. An error code tested after a call (`catch`,
+// `!`) is a test of a value against 0 that the rule for equalities alone
+// would predict true; a `return error.E` under a condition that rule does
+// not predict; a checked operation's error code, tested where it is made,
+// becomes a branch on the overflow itself (no select of the code, no cmov).
+//
+// After each call through a pointer whose error side the layout can move
+// out of the way (one of the two in `twice` shares its error path with the
+// other), a jump away when the code is not 0:
+// lower-selfhost: --target=native --cpu=x86-64 -O2 | \bcall\s+\*%\w+\n[^\n]*\btest\s+%ax,\s*%ax\n[^\n]*\bjne\b | 3
+// lower-selfhost: --target=aarch64 -O2 | \bblr\s+x\d+\n[^\n]*\buxth\s+w\d+,\s*w0\n[^\n]*\bcmp\b[^\n]*\n[^\n]*\bb\.ne\b | 3
+// `if x > 100 { return error.Bad; }`: a jump away when x > 100
+// lower-selfhost: --target=native --cpu=x86-64 -O2 | \bcmp\s+\$0x65,\s*%edi\n[^\n]*\bjae\b | 1
+// lower-selfhost: --target=aarch64 -O2 | \bcmp\s+w0,\s*#0x64\n[^\n]*\bb\.hi\b | 1
+// @mul_checked ... catch, @add_checked ... catch: branches on the overflow
+// lower-selfhost: --target=native --cpu=x86-64 -O2 | \bcmov | 0
+// lower-selfhost: --target=aarch64 -O2 | \bcsel\b | 0
+
+error { Bad }
+
+fn parse(x: u32) !u32 {
+    if x > 100 {
+        return error.Bad;
+    }
+    return x + 1;
+}
+
+let mut P: fn(u32) !u32 = parse;
+
+export fn caught(x: u32) u32 {
+    let v = P(x) catch 7;
+    return v *% 3;
+}
+
+fn passes(x: u32) !u32 {
+    let v = P(x)!;
+    return v *% 5;
+}
+
+export fn tried(x: u32) u32 {
+    return passes(x) catch 9;
+}
+
+fn twice(x: u32) !u32 {
+    let a = P(x)!;
+    let b = P(a)!;
+    return a *% b;
+}
+
+export fn twice_caught(x: u32) u32 {
+    return twice(x) catch 11;
+}
+
+export fn products(xs: *[64]u64) u64 {
+    let mut s: u64 = 1;
+    for i in @as(usize, 0)..64 {
+        s = @mul_checked(s, xs[i]) catch 1;
+    }
+    return s;
+}
+
+export fn sums(xs: *[64]i32) i32 {
+    let mut s: i32 = 0;
+    for i in @as(usize, 0)..64 {
+        s = @add_checked(s, xs[i]) catch 0;
+    }
+    return s;
+}

@@ -1,0 +1,513 @@
+// =============================================================================
+// std/encoding/xml/dtd.ax - DOCTYPE and internal DTD subset declarations
+// (ENTITY, ATTLIST, ELEMENT, NOTATION), part of std/encoding/xml.
+// =============================================================================
+
+import "../../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// DOCTYPE and the internal DTD subset
+// -----------------------------------------------------------------------------
+
+struct Entity {
+    value: []u8,
+    external: bool,  // SYSTEM or PUBLIC: never loaded
+    unparsed: bool,  // with NDATA
+}
+
+struct AttDef {
+    element: []u8,
+    name: []u8,
+    cdata: bool,
+    has_default: bool,
+    value: []u8,
+    next: usize,  // the element's next default (an index in attdefs), or NONE
+}
+
+// The first and last of an element's attribute defaults.
+struct Defaults {
+    first: usize,
+    last: usize,
+}
+
+fn reader_doctype(r: *mut Reader) XmlError!Token {
+    r.advance(9);
+    if not r.skip_space() {
+        return r.fail("expected white space after DOCTYPE");
+    }
+    let n = r.name()!;
+    r.seen_doctype = true;
+    let sp = r.skip_space();
+    if r.looking_at("SYSTEM") or r.looking_at("PUBLIC") {
+        if not sp {
+            return r.fail("expected white space before the external ID");
+        }
+        reader_external_id(r, false)!;
+        r.has_external_subset = true;
+        _ = r.skip_space();
+    }
+    if r.at(0) == '[' {
+        r.advance(1);
+        reader_internal_subset(r)!;
+        _ = r.skip_space();
+    }
+    r.expect(">", "expected > to end the DOCTYPE")!;
+    let mut t = Reader.token(TokenKind.DOCTYPE);
+    t.name = n;
+    t.local = n;
+    return t;
+}
+
+fn reader_quoted(r: *mut Reader) XmlError![]u8 {
+    let q = r.at(0);
+    if (q != '"') and (q != '\'') {
+        return r.fail("expected a quoted literal");
+    }
+    r.advance(1);
+    let s = r.cur();
+    let st = s.pos;
+    while (s.pos < s.text.len) and (s.text[s.pos] != q) {
+        s.pos += 1;
+    }
+    if s.pos >= s.text.len {
+        return r.fail("unterminated literal");
+    }
+    let v = s.text[st..s.pos];
+    s.pos += 1;
+    return v;
+}
+
+// SYSTEM "uri" or PUBLIC "id" "uri" (the URI optional for notations).
+fn reader_external_id(r: *mut Reader, notation: bool) XmlError!void {
+    if r.looking_at("SYSTEM") {
+        r.advance(6);
+        if not r.skip_space() {
+            return r.fail("expected white space after SYSTEM");
+        }
+        _ = reader_quoted(r)!;
+        return;
+    }
+    r.advance(6);
+    if not r.skip_space() {
+        return r.fail("expected white space after PUBLIC");
+    }
+    let id = reader_quoted(r)!;
+    for c in id {
+        let ok = ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or
+                 ((strs.index_of_byte(" \n-'()+,./:=?;!*#@$_%", c) ?? 99) != 99);
+        if not ok {
+            return r.fail("a bad character in a public identifier");
+        }
+    }
+    let sp = r.skip_space();
+    if notation and ((r.at(0) != '"') and (r.at(0) != '\'')) {
+        return;
+    }
+    if not sp {
+        return r.fail("expected white space between the public and system IDs");
+    }
+    _ = reader_quoted(r)!;
+}
+
+fn reader_internal_subset(r: *mut Reader) XmlError!void {
+    let base = r.src.len();
+    loop {
+        _ = r.skip_space();
+        if r.eof() {
+            if r.src.len() > base {
+                _ = r.src.pop();
+                continue;
+            }
+            return r.fail("unterminated internal subset");
+        }
+        let c = r.at(0);
+        if (c == ']') and (r.src.len() == base) {
+            r.advance(1);
+            return;
+        }
+        if c == '%' {
+            // a parameter entity reference: its text holds declarations
+            r.advance(1);
+            let n = r.name()!;
+            r.expect(";", "expected ; after a parameter entity name")!;
+            let e = r.params.get(n) ?? return r.fail("reference to an undeclared parameter entity");
+            if e.external {
+                // not loaded: the rest of the subset can't be trusted for defaults
+                continue;
+            }
+            r.push_entity(n, e.value, false)!;
+            continue;
+        }
+        if r.looking_at("<!--") {
+            _ = r.comment()!;
+            continue;
+        }
+        if r.looking_at("<?") {
+            _ = r.pi()!;
+            continue;
+        }
+        if r.looking_at("<!ENTITY") {
+            reader_entity_decl(r)!;
+            continue;
+        }
+        if r.looking_at("<!ATTLIST") {
+            reader_attlist_decl(r)!;
+            continue;
+        }
+        if r.looking_at("<!ELEMENT") {
+            reader_element_decl(r)!;
+            continue;
+        }
+        if r.looking_at("<!NOTATION") {
+            reader_skip_decl(r)!;
+            continue;
+        }
+        return r.fail("unexpected content in the internal subset");
+    }
+}
+
+// Skips a declaration to its >, over quoted literals.
+fn reader_skip_decl(r: *mut Reader) XmlError!void {
+    let notation = r.looking_at("<!NOTATION");
+    r.advance(2);
+    let _kw = r.name()!;
+    if not r.skip_space() {
+        return r.fail("expected white space in a declaration");
+    }
+    let _n = r.name()!;
+    if notation {
+        _ = r.skip_space();
+        if r.looking_at("SYSTEM") or r.looking_at("PUBLIC") {
+            reader_external_id(r, true)!;
+        } else {
+            return r.fail("a notation needs an external ID");
+        }
+        _ = r.skip_space();
+        r.expect(">", "expected > to end a declaration")!;
+        return;
+    }
+    let mut depth: i32 = 0;
+    loop {
+        if r.eof() {
+            return r.fail("unterminated declaration");
+        }
+        let c = r.at(0);
+        if (c == '"') or (c == '\'') {
+            _ = reader_quoted(r)!;
+            continue;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        } else if (c == '>') and (depth == 0) {
+            r.advance(1);
+            return;
+        } else if (c == '<') or (c == '&') {
+            return r.fail("unexpected markup in a declaration");
+        }
+        r.advance(1);
+    }
+}
+
+// <!ELEMENT name contentspec>: checked, not kept (the parser does not
+// validate).
+fn reader_element_decl(r: *mut Reader) XmlError!void {
+    r.advance(9);
+    if not r.skip_space() {
+        return r.fail("expected white space after ELEMENT");
+    }
+    _ = r.name()!;
+    if not r.skip_space() {
+        return r.fail("expected white space after the element name");
+    }
+    if r.looking_at("EMPTY") {
+        r.advance(5);
+    } else if r.looking_at("ANY") {
+        r.advance(3);
+    } else if r.at(0) == '(' {
+        let s = r.cur();
+        let save = s.pos;
+        r.advance(1);
+        _ = r.skip_space();
+        if r.looking_at("#PCDATA") {
+            // Mixed: (#PCDATA) or (#PCDATA | a | b)*
+            r.advance(7);
+            let mut names: usize = 0;
+            loop {
+                _ = r.skip_space();
+                if r.at(0) == ')' {
+                    r.advance(1);
+                    break;
+                }
+                if r.at(0) != '|' {
+                    return r.fail("expected | or ) in mixed content");
+                }
+                r.advance(1);
+                _ = r.skip_space();
+                _ = r.name()!;
+                names += 1;
+            }
+            if r.at(0) == '*' {
+                r.advance(1);
+            } else if names > 0 {
+                return r.fail("mixed content with names must end with )*");
+            }
+        } else {
+            r.cur().pos = save;
+            reader_content_particle(r, 0)!;
+        }
+    } else {
+        return r.fail("expected a content specification");
+    }
+    _ = r.skip_space();
+    r.expect(">", "expected > to end an element declaration")!;
+}
+
+// A choice or sequence (or a name), with an optional ?, * or +.
+fn reader_content_particle(r: *mut Reader, depth: usize) XmlError!void {
+    if depth > 64 {
+        return r.fail_err("content model nested too deeply", error.TooDeep);
+    }
+    if r.at(0) == '(' {
+        r.advance(1);
+        let mut sep: u8 = 0;
+        let mut count: usize = 0;
+        loop {
+            _ = r.skip_space();
+            reader_content_particle(r, depth + 1)!;
+            count += 1;
+            _ = r.skip_space();
+            let c = r.at(0);
+            if c == ')' {
+                r.advance(1);
+                break;
+            }
+            if (c != '|') and (c != ',') {
+                return r.fail("expected | , or ) in a content model");
+            }
+            if (sep != 0) and (sep != c) {
+                return r.fail("mixed | and , in a content model");
+            }
+            sep = c;
+            r.advance(1);
+        }
+    } else {
+        if r.looking_at("#PCDATA") {
+            return r.fail("#PCDATA in a content model");
+        }
+        _ = r.name()!;
+    }
+    let q = r.at(0);
+    if (q == '?') or (q == '*') or (q == '+') {
+        r.advance(1);
+    }
+}
+
+fn reader_entity_decl(r: *mut Reader) XmlError!void {
+    r.advance(8);
+    if not r.skip_space() {
+        return r.fail("expected white space after ENTITY");
+    }
+    let mut param = false;
+    if r.at(0) == '%' {
+        r.advance(1);
+        if not r.skip_space() {
+            return r.fail("expected white space after %");
+        }
+        param = true;
+    }
+    let n = r.name()!;
+    if r.opts.namespaces and strs.contains(n, ":") {
+        return r.fail("a colon in an entity name");
+    }
+    if not r.skip_space() {
+        return r.fail("expected white space after the entity name");
+    }
+    let mut e = Entity.{ value: "", external: false, unparsed: false };
+    if (r.at(0) == '"') or (r.at(0) == '\'') {
+        e.value = reader_entity_value(r)!;
+    } else if r.looking_at("SYSTEM") or r.looking_at("PUBLIC") {
+        reader_external_id(r, false)!;
+        e.external = true;
+        let sp = r.skip_space();
+        if r.looking_at("NDATA") {
+            if param or not sp {
+                return r.fail("bad NDATA");
+            }
+            r.advance(5);
+            if not r.skip_space() {
+                return r.fail("expected white space after NDATA");
+            }
+            _ = r.name()!;
+            e.unparsed = true;
+        }
+    } else {
+        return r.fail("expected an entity value or external ID");
+    }
+    _ = r.skip_space();
+    r.expect(">", "expected > to end an entity declaration")!;
+    // the first declaration counts
+    let mut table = &mut r.general;
+    if param {
+        table = &mut r.params;
+    }
+    if not table.contains(n) {
+        if not param and (predefined(n).len > 0) and not e.external {
+            // a predefined entity may be declared, as the escaped character
+            table.put(n, e)!;
+        } else {
+            table.put(n, e)!;
+        }
+    }
+}
+
+// An entity's literal value: character references expanded, general
+// entity references kept as they are (and checked).
+fn reader_entity_value(r: *mut Reader) XmlError![]u8 {
+    let q = r.at(0);
+    r.advance(1);
+    r.buf2.clear();
+    loop {
+        if r.eof() {
+            return r.fail("unterminated entity value");
+        }
+        let c = r.at(0);
+        if c == q {
+            r.advance(1);
+            break;
+        }
+        if c == '%' {
+            return r.fail("a parameter entity reference in an entity value of the internal subset");
+        }
+        if c == '&' {
+            if r.at(1) == '#' {
+                r.char_ref(&mut r.buf2)!;
+                continue;
+            }
+            r.advance(1);
+            let n = r.name()!;
+            if r.at(0) != ';' {
+                return r.fail("expected ; after an entity name");
+            }
+            r.advance(1);
+            r.buf2.push('&')!;
+            r.buf2.push_str(n)!;
+            r.buf2.push(';')!;
+            continue;
+        }
+        r.buf2.push(c)!;
+        r.advance(1);
+    }
+    return r.ar.dup(r.buf2.bytes());
+}
+
+fn reader_attlist_decl(r: *mut Reader) XmlError!void {
+    r.advance(9);
+    if not r.skip_space() {
+        return r.fail("expected white space after ATTLIST");
+    }
+    let element = r.name()!;
+    loop {
+        let sp = r.skip_space();
+        if r.at(0) == '>' {
+            r.advance(1);
+            return;
+        }
+        if not sp {
+            return r.fail("expected white space in an attribute list");
+        }
+        let an = r.name()!;
+        if not r.skip_space() {
+            return r.fail("expected white space after the attribute name");
+        }
+        let mut cdata = false;
+        if r.at(0) == '(' {
+            reader_enumeration(r)!;
+        } else {
+            let ty = r.name()!;
+            if strs.eq(ty, "CDATA") {
+                cdata = true;
+            } else if strs.eq(ty, "NOTATION") {
+                if not r.skip_space() {
+                    return r.fail("expected white space after NOTATION");
+                }
+                reader_enumeration(r)!;
+            } else {
+                let known = ["ID", "IDREF", "IDREFS", "ENTITY", "ENTITIES", "NMTOKEN", "NMTOKENS"];
+                let mut ok = false;
+                for k in known {
+                    if strs.eq(ty, k) {
+                        ok = true;
+                    }
+                }
+                if not ok {
+                    return r.fail("an unknown attribute type");
+                }
+            }
+        }
+        if not r.skip_space() {
+            return r.fail("expected white space before the default");
+        }
+        let mut has_default = false;
+        let mut value: []u8 = "";
+        if r.looking_at("#REQUIRED") {
+            r.advance(9);
+        } else if r.looking_at("#IMPLIED") {
+            r.advance(8);
+        } else {
+            if r.looking_at("#FIXED") {
+                r.advance(6);
+                if not r.skip_space() {
+                    return r.fail("expected white space after #FIXED");
+                }
+            }
+            value = reader_attr_value(r, element, an)!;
+            if not cdata {
+                value = r.ar.dup(collapse(value, &mut r.buf))!;
+            }
+            has_default = true;
+        }
+        // the first declaration of an attribute counts
+        let k = reader_attdef_key(r, element, an)!;
+        if not r.attdef_of.contains(k) {
+            let i = r.attdefs.len();
+            r.attdefs.push(AttDef.{ element: element, name: an, cdata: cdata, has_default: has_default, value: value,
+                                    next: NONE })!;
+            r.attdef_of.put(r.ar.dup(k)!, i)!;
+            if has_default {
+                let p = r.defaults.get_ptr(element) ?? {
+                    r.defaults.put(element, Defaults.{ first: i, last: i })!;
+                    continue;
+                };
+                r.attdefs.get_ptr(p.last).next = i;
+                p.last = i;
+            }
+        }
+    }
+}
+
+fn reader_enumeration(r: *mut Reader) XmlError!void {
+    r.advance(1);
+    loop {
+        _ = r.skip_space();
+        let s = r.cur();
+        let st = s.pos;
+        while (s.pos < s.text.len) and not is_space(s.text[s.pos]) and (s.text[s.pos] != '|') and
+              (s.text[s.pos] != ')') {
+            s.pos += 1;
+        }
+        if not is_nmtoken(s.text[st..s.pos]) {
+            return r.fail("a bad token in an enumeration");
+        }
+        _ = r.skip_space();
+        if r.at(0) == ')' {
+            r.advance(1);
+            return;
+        }
+        if r.at(0) != '|' {
+            return r.fail("expected | or ) in an enumeration");
+        }
+        r.advance(1);
+    }
+}
