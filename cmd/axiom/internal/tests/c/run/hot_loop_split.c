@@ -1,13 +1,13 @@
 /* flags: --c-std=gnu17 -O2 */
 /* Loops whose values outnumber the callee-saved registers, with calls on a
-   path through the loop that seldom runs (a grow path): the register
-   allocator keeps a value in one register through the loop's hot stretch
-   and in memory on the cold path, reloading it where the cold path rejoins
-   (and storing it where the stretch is left, when the stretch changes it).
+   path through the loop that seldom runs (a grow path): the shapes the
+   register allocator's hot-stretch splitting is for. They check the output,
+   not the allocation: at the time of writing the allocator takes other
+   splits in these functions (tests/run/hot_stretch_*.ax take the new one).
    Shapes: a value changed only on the hot path and read on the cold one, a
    value changed only on the cold path and read on the hot one, exits from
-   the middle of the stretch, a stretch inside an outer loop, and a cold
-   path with a loop of its own. */
+   the middle of the loop, a loop inside an outer loop, and a cold path with
+   a loop of its own. */
 #include "host.h"
 
 typedef unsigned long long u64;

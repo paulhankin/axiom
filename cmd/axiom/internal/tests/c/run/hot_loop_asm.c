@@ -1,11 +1,11 @@
 /* flags: --c-std=gnu17 -O2 */
 /* native-only */
 /* Inline assembly in loops with calls on a path that seldom runs (see
-   hot_loop_split.c): an early-clobber output (`=&r`) and register clobbers
-   in the hot stretch, beside values held in registers through it and in
-   memory on the cold path, and the same asm on the cold path. The output
-   is written before the inputs are read, and the clobbered registers hold
-   nothing live across the asm. */
+   hot_loop_split.c, which also says these functions don't take the
+   hot-stretch split today): an early-clobber output (`=&r`) and register
+   clobbers on the hot path, beside values live through the loop, and the
+   same asm on the cold path. The output is written before the inputs are
+   read, and the clobbered registers hold nothing live across the asm. */
 #include "host.h"
 
 typedef unsigned long long u64;
