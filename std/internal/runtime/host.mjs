@@ -203,7 +203,7 @@ function formatValues(kind, dv, base, memory, instance) {
   }
 }
 
-// Frames in the AXT protocol of `axiom test` (see test_main.c: encode_stack).
+// Frames in the AXT protocol of `axiom test` (see test_report.ax: encode_stack).
 export function encodeFrames(frames, kindOfFirst) {
   return frames.map((f, i) => {
     if (f.repeat) return `R\x1f${f.repeat}\x1f0\x1f0\x1f`;
@@ -1309,7 +1309,7 @@ export function createHost(opts = {}) {
 
 // Sampling profiler (spec §16.6): a worker samples the main thread's shadow
 // stack (at ss; wide: wasm64); the result is written in the raw format read
-// by `axiom profile` (see std/internal/runtime/profile.c).
+// by `axiom profile` (see std/internal/runtime/profile_out.ax).
 function startProfiler({ ss, wide }, memory, hz) {
   if (!(memory.buffer instanceof SharedArrayBuffer)) throw new Error('--profile needs a program built by axiom profile (shared memory)');
   const control = new SharedArrayBuffer(8);

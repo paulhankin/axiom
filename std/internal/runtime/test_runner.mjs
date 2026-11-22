@@ -5,7 +5,7 @@
 //
 // Prints one line per test in the protocol read by `axiom test`:
 //   AXT <index> <status> <code> <file_id> <start> <end> <ms> <message> <output> <stack>
-// (<stack>: see test_main.c, encode_stack)
+// (<stack>: see test_report.ax, encode_stack)
 // (tab-separated; tabs, newlines and backslashes in fields are escaped).
 import fs from 'fs';
 import os from 'os';
