@@ -1934,15 +1934,14 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []mut SegSet, fra
     heap.deinit();
     vict.deinit();
     frameless.* = (nspill > 0) and spills_frameless(f, iv);
+    for k in 0..n {
+        u.free(@ptr_cast(*mut void, iv[k].ranges.data));
+    }
     return nspill;
 }
 
-// Gives back the intervals' ranges and the registers' segments (once
-// rewrite_spills is done with them).
-fn free_ranges(iv: []mut Interval, segs: []mut SegSet) void {
-    for k in 0..iv.len {
-        u.free(@ptr_cast(*mut void, iv[k].ranges.data));
-    }
+// Gives back the registers' segments (once rewrite_spills is done with them).
+fn free_segs(segs: []mut SegSet) void {
     for r in @as(usize, 0)..64 {
         segs[r].deinit();
     }
@@ -2157,6 +2156,13 @@ struct Cfg {
     nhot: []mut i32,
     segs: []SegSet,
     loop_calls: bool,  // a block in a loop calls
+    // hot_loops' scratch: the loops it weighs, a stretch's blocks and the
+    // colder ones it reaches (by index in nl), marked in ins (1, 2; all 0
+    // between calls; empty: not yet made)
+    cands: u.List.[i32],
+    hs: u.List.[i32],
+    cs: u.List.[i32],
+    ins: []mut u8,
 }
 
 fn find(p: *mut u.List.[i32], x: i32) i32 {
@@ -2385,8 +2391,8 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
         return;  // (no loop with a colder stretch that calls)
     }
     // the loops around the blocks naming the vreg, smallest first
-    let mut cands = u.List.[i32].empty();
-    defer cands.deinit();
+    let cands = &mut g.cands;
+    cands.clear();
     let mut last: i32 = -1;
     for bj in 0..m {
         let bi = @int_cast(usize, ms.nl[bj]);
@@ -2421,14 +2427,10 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
             k -= 1;
         }
     }
-    // the stretch's blocks (by index in nl), and the colder ones of the loop
-    // reached from it; ins: 1 in the stretch, 2 colder (made at the first
-    // loop that may have one)
-    let mut ins = u.newn.[u8](0);
-    let mut hs = u.List.[i32].empty();
-    defer hs.deinit();
-    let mut cs = u.List.[i32].empty();
-    defer cs.deinit();
+    let hs = &mut g.hs;
+    let cs = &mut g.cs;
+    hs.clear();
+    cs.clear();
     let mut preds = NlPreds.{ start: u.newn.[i32](0), list: u.newn.[i32](0) };
     for ci in 0..cands.len {
         let li = cands.get(ci);
@@ -2442,12 +2444,14 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
             continue;
         }
         let hf = f.blocks.get(h).freq;
-        if ins.len == 0 {
-            ins = u.newn.[u8](m + 1);
-            for bj in 0..m {
-                ins[bj] = 0;
+        if g.ins.len == 0 {
+            let nb = f.blocks.len;
+            g.ins = u.newn.[u8](nb + 1);
+            for bi in 0..nb {
+                g.ins[bi] = 0;
             }
         }
+        let ins = g.ins;
         for k in 0..hs.len {
             ins[@int_cast(usize, hs.get(k))] = 0;
         }
@@ -2489,7 +2493,7 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
         // one where the rest of the loop makes no call is left to the
         // clusters: the gain is from the calls' stretch, where the vreg
         // is in memory either way)
-        if not named or (cs.len == 0) or not cold_calls(f, t, g, ms, l, ins, &mut cs) {
+        if not named or (cs.len == 0) or not cold_calls(f, t, g, ms, l, ins, cs) {
             continue;
         }
         let mut defs = false;
@@ -2561,6 +2565,12 @@ fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
                 g.nhot[@int_cast(usize, ms.nl[bj])] += 1;
             }
         }
+    }
+    for k in 0..hs.len {
+        g.ins[@int_cast(usize, hs.get(k))] = 0;
+    }
+    for k in 0..cs.len {
+        g.ins[@int_cast(usize, cs.get(k))] = 0;
     }
 }
 
@@ -3958,7 +3968,9 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
     let mut g = Cfg.{ npred: u.newn.[i32](nb + 1), nsucc: u.newn.[i32](nb + 1), simple: u.newn.[bool](nb + 1),
                       endok: u.newn.[bool](nb + 1), label: u.newn.[bool](nb + 1), near: u.newn.[bool](nb + 1),
                       cidx: u.newn.[i32](nb + 1), ev: u.newn.[u.List.[*mut MInst]](nb + 1),
-                      stale: u.newn.[bool](nv + 1), nhot: u.newn.[i32](0), segs: segs, loop_calls: false };
+                      stale: u.newn.[bool](nv + 1), nhot: u.newn.[i32](0), segs: segs, loop_calls: false,
+                      cands: u.List.[i32].empty(), hs: u.List.[i32].empty(), cs: u.List.[i32].empty(),
+                      ins: u.newn.[u8](0) };
     for bi in 0..nb {
         g.npred[bi] = 0;
         g.label[bi] = false;
@@ -4119,6 +4131,9 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
         mn.nev[k].deinit();
         mn.beg[k].deinit();
     }
+    g.cands.deinit();
+    g.hs.deinit();
+    g.cs.deinit();
     spill_everywhere(f, t, every[0..nv]);
     spill_remat(f, t, rm[0..nv]);
 }
@@ -4718,7 +4733,7 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
         }
         let ns = greedy(f, t, iv, segs, &mut frameless);
         if frameless or (ns == 0) {
-            free_ranges(iv, segs);
+            free_segs(segs);
         }
         if debug_ra {
             u.eprint(u.f1("round %s\n", u.idec(rounds)));
@@ -4757,7 +4772,7 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
             u.die("internal compiler error: register allocation did not converge");
         }
         rewrite_spills(f, t, iv, segs);
-        free_ranges(iv, segs);
+        free_segs(segs);
         if debug_ra {
             dump(f, "rewritten");
         }
