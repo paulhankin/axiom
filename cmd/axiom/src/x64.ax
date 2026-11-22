@@ -302,8 +302,8 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if (v.flag &
-        (((((((((((16 | 32) | 256) | xsl.F_ANDN) | xis.F_BLS) | xsl.F_BCST) | xis.F_BT) | xis.F_SCALE) | xis.F_BTX) |
-           xis.F_BTR) | xis.F_CSKIP) | xsl.F_FMNEG)) != 0 {
+        ((((((((((((16 | 32) | 256) | xsl.F_ANDN) | xis.F_BLS) | xsl.F_BCST) | xis.F_BT) | xis.F_SCALE) | xis.F_BTX) |
+            xis.F_BTR) | xis.F_CSKIP) | xsl.F_FMNEG) | xsl.F_DOTACC)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & (xis.F_OVBR | xis.F_OVPART)) != 0 {
@@ -813,6 +813,7 @@ fn prepare(f: *mut ir.Func) void {
     each_inst(f, mark_btx);
     each_inst(f, mark_fma_neg);
     each_inst(f, mark_vandn);
+    each_inst(f, mark_dot_acc);
     each_inst(f, mark_lea);
     each_inst(f, mark_carry);
     if not tg.has(tg.X_LZCNT) {
@@ -1046,6 +1047,38 @@ fn mark_vandn(i: *mut ir.Value) void {
     }
 }
 
+// acc + @dot(x, y) of u8 by i8 lanes as one vpdpbusd into acc (F_DOTACC): the
+// @dot used only there, in its block, and its folded load (if any) still
+// readable at the add.
+fn mark_dot_acc(i: *mut ir.Value) void {
+    if (i.op != ir.OP_ADD) or (i.ty.kind != ir.T_VEC) or (i.flag != 0) or (i.a == i.b) {
+        return;
+    }
+    if dot_acc_ok(i.b, i) {
+        i.b.flag = i.b.flag | xsl.F_DOTACC;
+        unfold_load(i.a);
+    } else if dot_acc_ok(i.a, i) {
+        i.a.flag = i.a.flag | xsl.F_DOTACC;
+        unfold_load(i.b);
+    }
+}
+
+// A load folded into the add as its memory operand is loaded into a register
+// instead: vpdpbusd accumulates in one.
+fn unfold_load(x: *mut ir.Value) void {
+    if xsl.folded_load(x) {
+        x.flag = x.flag & (-9);
+    }
+}
+
+fn dot_acc_ok(x: *mut ir.Value, i: *mut ir.Value) bool {
+    if not ir.is_op(x, ir.OP_INTR) or (ir.intr_id(x) != ir.IN_DOT_U8I8) or (x.nuses != 1) or (x.blk != i.blk) or
+       (x.flag != 0) or (x.ty != i.ty) or (x.xs.len != 2) {
+        return false;
+    }
+    return not xsl.folded_load(x.xs.get(1)) or xsl.quiet_between(x, i);
+}
+
 // y + (x << k) and y | (x << k) (no bits in common) as lea.
 fn mark_lea(i: *mut ir.Value) void {
     if ((i.op == ir.OP_ADD) or (i.op == ir.OP_OR)) and (i.ty.kind == ir.T_INT) and
@@ -1242,7 +1275,7 @@ fn mark_ov_branch(b: *mut ir.Block, t: *mut ir.Value) void {
 fn plain_operand(v: *ir.Value) bool {
     let m =
         (((((((((8 | 16) | 32) | 256) | xsl.F_ANDN) | xis.F_BLS) | xsl.F_BCST) | xis.F_BT) | xis.F_SCALE) |
-         (xis.F_BTX | xis.F_BTR)) | xsl.F_FMNEG;
+         (xis.F_BTX | xis.F_BTR)) | (xsl.F_FMNEG | xsl.F_DOTACC);
     return (v.kind != ir.V_INST) or ((v.flag & m) == 0);
 }
 
