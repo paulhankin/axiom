@@ -1,19 +1,23 @@
 #!/bin/sh
-# Differential fuzzing of the compiler's backends against the bootstrap
-# compiler (stage 0, LLVM): gen.py writes a program that applies every
-# integer, float and SIMD operation to edge values and prints the results;
-# each backend's output must match the reference native build exactly.
+# Differential fuzzing of the compiler's backends: gen.py writes a program
+# that applies every integer, float and SIMD operation to edge values and
+# prints the results; every backend's output must match the reference
+# exactly. The reference is the bootstrap compiler's native build (stage 0,
+# LLVM) where that compiler is built, and otherwise the WebAssembly build's
+# output under node, so that the backends are checked against each other.
 #
 #   cmd/axiom/fuzz/run.sh [first seed] [last seed]    (default 1 5)
 #
 # Environment: NEW (default cmd/axiom/build/axiom), OLD (default
-# cmd/axiom/bootstrap/build/axiom). AArch64 runs need qemu-aarch64, the AArch64 C
+# cmd/axiom/bootstrap/build/axiom; OLD= for the WebAssembly reference). AArch64 runs need qemu-aarch64, the AArch64 C
 # library in /usr/aarch64-linux-gnu and aarch64-linux-gnu-gcc (for the test's
 # C host functions); they are skipped otherwise.
 set -u
 cd "$(dirname "$0")/../../.."
 NEW=${NEW:-cmd/axiom/build/axiom}
-OLD=${OLD:-cmd/axiom/bootstrap/build/axiom}
+OLD=${OLD-cmd/axiom/bootstrap/build/axiom}
+[ -n "$OLD" ] && [ ! -x "$OLD" ] && OLD=
+[ -z "$OLD" ] && echo "reference: wasm32 (no bootstrap compiler)"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 RT=cmd/axiom/internal/tests/native_rt.c
@@ -38,13 +42,20 @@ while [ "$seed" -le "$last" ]; do
     echo "seed $seed"
     f=$T/f$seed.ax
     python3 cmd/axiom/fuzz/gen.py "$seed" > "$f"
-    $OLD build "$f" --target=native --link=$RT -o "$T/ref" >/dev/null 2>&1 || { echo "  reference build failed"; exit 1; }
-    "$T/ref" > "$T/ref.txt" 2>&1
+    if [ -n "$OLD" ]; then
+        $OLD build "$f" --target=native --link=$RT -o "$T/ref" >/dev/null 2>&1 || { echo "  reference build failed"; exit 1; }
+        "$T/ref" > "$T/ref.txt" 2>&1
+    fi
     if $NEW build "$f" -o "$T/w.wasm" > "$T/log" 2>&1; then
         node cmd/axiom/fuzz/runw.mjs "$T/w.wasm" > "$T/w.txt" 2>&1
-        check wasm32 "$T/w.txt"
+        if [ -n "$OLD" ]; then
+            check wasm32 "$T/w.txt"
+        else
+            cp "$T/w.txt" "$T/ref.txt"
+        fi
     else
         echo "  wasm32: build failed"; fail=$((fail + 1))
+        [ -n "$OLD" ] || { echo "  no reference"; exit 1; }
     fi
     for cfg in "x86-64:--cpu=x86-64" "x86-64-v2:--cpu=x86-64-v2" "x86-64-v3:--cpu=x86-64-v3" "x86-64-O2:--cpu=x86-64-v3 -O2" \
                "x86-64-v4:--cpu=x86-64-v4" "x86-64-v4-O2:--cpu=x86-64-v4 -O2" \

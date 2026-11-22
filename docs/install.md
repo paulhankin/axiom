@@ -119,6 +119,11 @@ cmd/axiom/bootstrap.sh                 # about a minute: builds the compiler, th
 export PATH="$PWD/cmd/axiom/build:$PATH"
 ```
 
+With an Axiom compiler that accepts the current sources already on the machine (a build
+of a recent commit, say), `AXIOM_SEED=<that compiler> cmd/axiom/bootstrap.sh` builds
+from it instead, without LLVM or the C compiler, in about half a minute;
+[`docs/bootstrap-chain.md`](bootstrap-chain.md) says where the seed comes from.
+
 `bootstrap.sh` builds a compiler for the generic processor of this machine's
 architecture, so the binary runs on any machine of that kind; `TARGET=native
 cmd/axiom/bootstrap.sh` builds one tuned to this processor's extensions instead, which

@@ -96,6 +96,18 @@ LLVM build takes 98 s against 19 s.
   `docs/install.md` and `docs/releasing.md` drop the dual-compiler rule and the LLVM 18
   requirement. Building from source then needs only a seed and node.
 
+### Status
+
+Done: `bootstrap.sh` builds from `AXIOM_SEED` or from the release `cmd/axiom/seed.toml`
+pins (downloaded once, checked against the pinned hash), and gives the same compiler,
+byte for byte, as from the C bootstrap; the backend fuzzer runs without the bootstrap
+compiler, with the WebAssembly build as its reference; `docs/bootstrap-chain.md`.
+
+Waiting on a release: 0.2.0, the newest, does not accept the language the compiler is
+now written in (`import part`, `?T`, `nocopy`). The first release that builds its own
+tree gets pinned in `seed.toml`. F3 and F5 follow that: until then the C bootstrap is
+the default seed and the dual-compiler rule stands.
+
 ### Risks
 
 - **A bad seed.** If a release miscompiles the compiler, pin the previous one. The fixed
