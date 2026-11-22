@@ -1758,7 +1758,7 @@ fn save_dearer(f: *MFunc, t: *Target, cs: *CallSites, x: *Interval, c: u8) bool 
     return ncut > 0;
 }
 
-fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, frameless: *mut bool) usize {
+fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []mut SegSet, frameless: *mut bool) usize {
     let n = iv.len;
     let mut cs = CallSites.of(f);
     defer cs.deinit();
@@ -1774,10 +1774,6 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, frameless: *mut bool) u
         if iv[k].e >= 0 {
             heap_push(&mut heap, key[0..n], @int_cast(i32, k));
         }
-    }
-    let segs = u.newn.[SegSet](64);
-    for r in @as(usize, 0)..64 {
-        segs[r] = SegSet.empty();
     }
     let mut vict = u.List.[i32].empty();
     let mut nspill: usize = 0;
@@ -1935,16 +1931,21 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, frameless: *mut bool) u
         }
         assign_reg(segs, cur, ci, best);
     }
-    for r in @as(usize, 0)..64 {
-        segs[r].deinit();
-    }
     heap.deinit();
     vict.deinit();
     frameless.* = (nspill > 0) and spills_frameless(f, iv);
-    for k in 0..n {
+    return nspill;
+}
+
+// Gives back the intervals' ranges and the registers' segments (once
+// rewrite_spills is done with them).
+fn free_ranges(iv: []mut Interval, segs: []mut SegSet) void {
+    for k in 0..iv.len {
         u.free(@ptr_cast(*mut void, iv[k].ranges.data));
     }
-    return nspill;
+    for r in @as(usize, 0)..64 {
+        segs[r].deinit();
+    }
 }
 
 fn in_order(order: []i32, r: i32) bool {
@@ -2151,6 +2152,11 @@ struct Cfg {
     // instruction naming it was deleted, and a reload of it may have gone
     // in its place (see rewrite_block); split walks its blocks whole
     stale: []mut bool,
+    // (hot_loops) how many registers the hot stretches made so far take in
+    // each block (empty: none yet), and this round's assignments
+    nhot: []mut i32,
+    segs: []SegSet,
+    loop_calls: bool,  // a block in a loop calls
 }
 
 fn find(p: *mut u.List.[i32], x: i32) i32 {
@@ -2312,6 +2318,7 @@ struct Split {
     mbeg: []i32,
     skip: []mut bool,   // the vreg is dead before its first mention in the block
     quiet: []mut bool,  // per loop (MFunc.loops): see quiet_loops
+    hot: []mut i32,     // the loop whose hot stretch holds the block (see hot_loops; -1: none; empty: none at all)
 
     // A reload of the vreg into piece w.
     fn reload_into(self: *Split, f: *mut MFunc, t: *Target, w: i32) *mut MInst {
@@ -2344,7 +2351,389 @@ fn wants_cut(f: *MFunc, g: *Cfg, ms: *Split, p: usize, s: usize) bool {
             return true;
         }
     }
-    return (ms.mode == SPLIT_GAPS) and (ms.cl[pj] != ms.cl[@int_cast(usize, g.cidx[s])]);
+    if ms.mode != SPLIT_GAPS {
+        return false;
+    }
+    let sj = @int_cast(usize, g.cidx[s]);
+    if (ms.hot.len > 0) and ((ms.hot[pj] >= 0) or (ms.hot[sj] >= 0)) {
+        return ms.hot[pj] != ms.hot[sj];
+    }
+    return ms.cl[pj] != ms.cl[sj];
+}
+
+// A loop's hot stretch for the vreg being split (SPLIT_GAPS): the blocks of
+// the loop reachable from its header through blocks of the loop that run at
+// least 1/HOT_RATIO as often as the header and make no call the vreg is live
+// across, where it is live. Held in one piece, it is reloaded (or stored, if
+// defined there) only on the edges into (or out of) the stretch: from the
+// colder stretches (a grow path calling the allocator) and from outside the
+// loop. Between the clusters of its uses (as elsewhere) it is reloaded where
+// each is entered, each time around the loop. The loop's stretch is one
+// piece when that costs less (spill code weighted by the estimated
+// frequency of its edges), the innermost loops first, where a register is
+// free for it all through the stretch (HOT_ROOM: of this round's
+// assignments, less the stretches given one already)
+const HOT_RATIO: f64 = 2.5;
+const HOT_ROOM: i32 = 1;
+// ... and where that saves at least this much spill code per call of the
+// function (each piece made may cost an allocation round)
+const HOT_GAIN: f64 = 1.0;
+
+fn hot_loops(f: *MFunc, t: *Target, g: *mut Cfg, ms: *mut Split) void {
+    let m = ms.nl.len;
+    if not g.loop_calls {
+        return;  // (no loop with a colder stretch that calls)
+    }
+    // the loops around the blocks naming the vreg, smallest first
+    let mut cands = u.List.[i32].empty();
+    defer cands.deinit();
+    let mut last: i32 = -1;
+    for bj in 0..m {
+        let bi = @int_cast(usize, ms.nl[bj]);
+        if not ms.nm[bj] or (bi >= f.binner.len) or (f.binner[bi] == last) {
+            continue;
+        }
+        let mut li = f.binner[bi];
+        last = li;
+        while li >= 0 {
+            let mut seen = false;
+            for k in 0..cands.len {
+                if cands.get(k) == li {
+                    seen = true;
+                }
+            }
+            if not seen {
+                cands.push(li);
+            }
+            li = f.loops.at(@int_cast(usize, li)).parent;
+        }
+    }
+    if cands.len == 0 {
+        return;
+    }
+    for a in 1..cands.len {
+        let mut k = a;
+        while (k > 0) and
+              (f.loops.at(@int_cast(usize, cands.get(k))).size < f.loops.at(@int_cast(usize, cands.get(k - 1))).size) {
+            let tmp = cands.get(k);
+            cands.set(k, cands.get(k - 1));
+            cands.set(k - 1, tmp);
+            k -= 1;
+        }
+    }
+    // the stretch's blocks (by index in nl), and the colder ones of the loop
+    // reached from it; ins: 1 in the stretch, 2 colder (made at the first
+    // loop that may have one)
+    let mut ins = u.newn.[u8](0);
+    let mut hs = u.List.[i32].empty();
+    defer hs.deinit();
+    let mut cs = u.List.[i32].empty();
+    defer cs.deinit();
+    let mut preds = NlPreds.{ start: u.newn.[i32](0), list: u.newn.[i32](0) };
+    for ci in 0..cands.len {
+        let li = cands.get(ci);
+        let l = f.loops.at(@int_cast(usize, li));
+        let h = @int_cast(usize, l.head);
+        if not g.near[h] or not bget(f.blocks.get(h).live_in, ms.x) {
+            continue;
+        }
+        let hj = @int_cast(usize, g.cidx[h]);
+        if ((ms.hot.len > 0) and (ms.hot[hj] >= 0)) or not hot_block(t, g, ms, h) {
+            continue;
+        }
+        let hf = f.blocks.get(h).freq;
+        if ins.len == 0 {
+            ins = u.newn.[u8](m + 1);
+            for bj in 0..m {
+                ins[bj] = 0;
+            }
+        }
+        for k in 0..hs.len {
+            ins[@int_cast(usize, hs.get(k))] = 0;
+        }
+        for k in 0..cs.len {
+            ins[@int_cast(usize, cs.get(k))] = 0;
+        }
+        hs.clear();
+        cs.clear();
+        ins[hj] = 1;
+        hs.push(@int_cast(i32, hj));
+        let mut named = false;
+        let mut next: usize = 0;
+        while next < hs.len {
+            let bj = @int_cast(usize, hs.get(next));
+            next += 1;
+            if ms.nm[bj] {
+                named = true;
+            }
+            let b = f.blocks.get(@int_cast(usize, ms.nl[bj]));
+            for k in 0..b.succs.len {
+                let si = @int_cast(usize, b.succs.get(k));
+                if not g.near[si] or not in_loop(l, @int_cast(i32, si)) or not bget(f.blocks.get(si).live_in, ms.x) {
+                    continue;
+                }
+                let sj = @int_cast(usize, g.cidx[si]);
+                if (ins[sj] != 0) or ((ms.hot.len > 0) and (ms.hot[sj] >= 0)) {
+                    continue;
+                }
+                if ((f.blocks.get(si).freq * HOT_RATIO) < hf) or not hot_block(t, g, ms, si) {
+                    ins[sj] = 2;
+                    cs.push(@int_cast(i32, sj));
+                    continue;
+                }
+                ins[sj] = 1;
+                hs.push(@int_cast(i32, sj));
+            }
+        }
+        // (a stretch that is the whole loop is the piece that lost already;
+        // one where the rest of the loop makes no call is left to the
+        // clusters: the gain is from the calls' stretch, where the vreg
+        // is in memory either way)
+        if not named or (cs.len == 0) or not cold_calls(f, t, g, ms, l, ins, &mut cs) {
+            continue;
+        }
+        let mut defs = false;
+        for k in 0..hs.len {
+            let bj = @int_cast(usize, hs.get(k));
+            if ms.nm[bj] and not defs and defines_in(f, g, ms, bj) {
+                defs = true;
+            }
+        }
+        if preds.start.len == 0 {
+            preds = nl_preds(f, g, ms);
+        }
+        // spill code on the edges touching the stretch, either way
+        let mut one: f64 = 0.0;
+        let mut apart: f64 = 0.0;
+        for k in 0..hs.len {
+            let bj = @int_cast(usize, hs.get(k));
+            let bi = @int_cast(usize, ms.nl[bj]);
+            let b = f.blocks.get(bi);
+            for q in 0..b.succs.len {
+                let si = @int_cast(usize, b.succs.get(q));
+                if g.near[si] and bget(f.blocks.get(si).live_in, ms.x) {
+                    let sj = @int_cast(usize, g.cidx[si]);
+                    let ef = edge_freq(f, g, bi, si);
+                    one += edge_spill(ef, -2, hot_label(ms, ins, sj), defs);
+                    apart += edge_spill(ef, gap_label(ms, bj), gap_label(ms, sj), defs);
+                }
+            }
+            for pj in preds.of(bj) {
+                let pju = @int_cast(usize, pj);
+                if ins[pju] != 1 {
+                    let ef = edge_freq(f, g, @int_cast(usize, ms.nl[pju]), bi);
+                    one += edge_spill(ef, gap_label(ms, pju), -2, defs);
+                    apart += edge_spill(ef, gap_label(ms, pju), gap_label(ms, bj), defs);
+                }
+            }
+        }
+        // (and only where a register is free for it all through the stretch:
+        // else it would take one from what is there, which goes to memory
+        // in turn, or lose, and go to memory at every block)
+        let mut room: i32 = -1;
+        if one < apart {
+            room = hot_room(f, t, g, ms, hs.items());
+        }
+        let one_piece = (room >= HOT_ROOM) and ((apart - one) >= HOT_GAIN);
+        if debug_ra {
+            u.eprint(
+                u.f4("  hot loop b%s: one piece %s, apart %s%s", u.zdec(h), u.dec(@int_from_float(i64, one * 1000.0)),
+                     u.dec(@int_from_float(i64, apart * 1000.0)), u.pick(defs, " (defined)", "")));
+            u.eprint(u.f2(", room %s: %s\n", u.idec(room), u.pick(one_piece, "one", "apart")));
+        }
+        if one_piece {
+            if ms.hot.len == 0 {
+                ms.hot = u.newn.[i32](m + 1);
+                for bj in 0..m {
+                    ms.hot[bj] = -1;
+                }
+            }
+            if g.nhot.len == 0 {
+                let nb = f.blocks.len;
+                g.nhot = u.newn.[i32](nb + 1);
+                for bi in 0..nb {
+                    g.nhot[bi] = 0;
+                }
+            }
+            for k in 0..hs.len {
+                let bj = @int_cast(usize, hs.get(k));
+                ms.hot[bj] = li;
+                g.nhot[@int_cast(usize, ms.nl[bj])] += 1;
+            }
+        }
+    }
+}
+
+// Does a block of loop l reached from the stretch's colder successors (cs,
+// marked 2 in ins) through blocks of the vreg's nl make a call? (The blocks
+// searched are added to cs.)
+fn cold_calls(f: *MFunc, t: *Target, g: *Cfg, ms: *Split, l: *Loop, ins: []mut u8, cs: *mut u.List.[i32]) bool {
+    let mut next: usize = 0;
+    while next < cs.len {
+        let bj = @int_cast(usize, cs.get(next));
+        next += 1;
+        let bi = @int_cast(usize, ms.nl[bj]);
+        if not hot_block(t, g, ms, bi) {
+            return true;
+        }
+        let b = f.blocks.get(bi);
+        for k in 0..b.succs.len {
+            let si = @int_cast(usize, b.succs.get(k));
+            if g.near[si] and in_loop(l, @int_cast(i32, si)) {
+                let sj = @int_cast(usize, g.cidx[si]);
+                if ins[sj] == 0 {
+                    ins[sj] = 2;
+                    cs.push(@int_cast(i32, sj));
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The predecessors of the blocks of a split's nl within it (by index in
+// nl): those of block bj are list[start[bj]..start[bj + 1]].
+struct NlPreds {
+    start: []mut i32,
+    list: []mut i32,
+
+    fn of(self: *NlPreds, bj: usize) []i32 {
+        return self.list[@int_cast(usize, self.start[bj])..@int_cast(usize, self.start[bj + 1])];
+    }
+}
+
+fn nl_preds(f: *MFunc, g: *Cfg, ms: *Split) NlPreds {
+    let m = ms.nl.len;
+    let start = u.newn.[i32](m + 2);
+    for bj in 0..(m + 2) {
+        start[bj] = 0;
+    }
+    for pj in 0..m {
+        let pb = f.blocks.get(@int_cast(usize, ms.nl[pj]));
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            if g.near[si] {
+                start[@int_cast(usize, g.cidx[si]) + 2] += 1;
+            }
+        }
+    }
+    for bj in 0..m {
+        start[bj + 2] += start[bj + 1];
+    }
+    let list = u.newn.[i32](@int_cast(usize, start[m + 1]) + 1);
+    for pj in 0..m {
+        let pb = f.blocks.get(@int_cast(usize, ms.nl[pj]));
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            if g.near[si] {
+                let sj = @int_cast(usize, g.cidx[si]) + 1;
+                list[@int_cast(usize, start[sj])] = @int_cast(i32, pj);
+                start[sj] += 1;
+            }
+        }
+    }
+    return NlPreds.{ start: start, list: list };
+}
+
+// The registers of the vreg's class free all through the stretch (hs): of
+// intervals that keep their registers (this round's) and fixed ranges, less
+// one for each hot stretch made there so far.
+fn hot_room(f: *MFunc, t: *Target, g: *Cfg, ms: *Split, hs: []i32) i32 {
+    let mut most: i32 = 0;
+    if g.nhot.len > 0 {
+        for bj in hs {
+            most = @max(most, g.nhot[@int_cast(usize, ms.nl[@int_cast(usize, bj)])]);
+        }
+    }
+    let mut n: i32 = 0;
+    for r in t.alloc_order[@as(usize, ms.c)] {
+        let l = &g.segs[@int_cast(usize, r)];
+        let mut ok = true;
+        for bj in hs {
+            if ok {
+                let b = f.blocks.get(@int_cast(usize, ms.nl[@int_cast(usize, bj)]));
+                let k = seg_first(l, b.start);
+                if (seg_ok(l, k) and (seg_get(l, k).s <= b.end)) or fixed_conflict(r, b.start, b.end) {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            n += 1;
+        }
+    }
+    return n - most;
+}
+
+// Can block bi be in a hot stretch: it makes no call the vreg is live
+// across (it goes to memory there anyway).
+fn hot_block(t: *Target, g: *Cfg, ms: *Split, bi: usize) bool {
+    for j in g.ev[bi].items() {
+        if call_cut(t, ms.c, j) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Does block bj of ms's nl define the vreg (other than by its spill code)?
+fn defines_in(f: *MFunc, g: *Cfg, ms: *Split, bj: usize) bool {
+    let mut wk = MWalk.of(ms, g, f.blocks.get(@int_cast(usize, ms.nl[bj])), bj, false);
+    loop {
+        let i = wk.next(false);
+        if u.isnil(i) {
+            return false;
+        }
+        if writes_reg(i, ms.v) and real_use(f, i, ms.v) {
+            return true;
+        }
+    }
+}
+
+// The region labels hot_loops compares: a cluster (-1: none, in memory), or
+// a loop's hot stretch (-3 - its index; -2 for the one being weighed).
+fn gap_label(ms: *Split, bj: usize) i32 {
+    if (ms.hot.len > 0) and (ms.hot[bj] >= 0) {
+        return -3 - ms.hot[bj];
+    }
+    return ms.cl[bj];
+}
+
+fn hot_label(ms: *Split, ins: []u8, bj: usize) i32 {
+    if ins[bj] == 1 {
+        return -2;
+    }
+    return gap_label(ms, bj);
+}
+
+// Spill code on an edge of frequency ef between regions labelled a and b: a
+// reload (or a move) into b, if it holds the vreg in a register, and a store
+// from a if that does and the vreg is defined there.
+fn edge_spill(ef: f64, a: i32, b: i32, defs: bool) f64 {
+    if a == b {
+        return 0.0;
+    }
+    let mut c: f64 = 0.0;
+    if b != -1 {
+        c += ef;
+    }
+    if defs and (a != -1) {
+        c += ef;
+    }
+    return c;
+}
+
+// An estimate of how often the edge from block p to block s is taken.
+fn edge_freq(f: *MFunc, g: *Cfg, p: usize, s: usize) f64 {
+    let fp = f.blocks.get(p).freq;
+    let fs = f.blocks.get(s).freq;
+    if g.npred[s] == 1 {
+        return fs;
+    }
+    if g.nsucc[p] == 1 {
+        return fp;
+    }
+    return @min(fp, fs);
 }
 
 // The loops the vreg is live through without being named in, across a call
@@ -3157,12 +3546,13 @@ fn split(f: *mut MFunc, t: *Target, g: *mut Cfg, x: usize, mode: i32, level: u8,
                          head: u.newn.[i32](m + 1), tail: u.newn.[i32](m + 1), memtail: u.newn.[bool](m + 1),
                          cl: cl[0..m], allin: u.newn.[bool](m + 1), selfld: u.newn.[bool](m + 1),
                          sload: u.newn.[i32](m + 1), sg: Segs.empty(), men: men, men_ev: men_ev, mbeg: mbeg,
-                         skip: u.newn.[bool](m + 1), quiet: u.newn.[bool](f.loops.len + 1) };
+                         skip: u.newn.[bool](m + 1), quiet: u.newn.[bool](f.loops.len + 1), hot: u.newn.[i32](0) };
     defer ms.sg.deinit();
     ms.quiet = ms.quiet[0..f.loops.len];
     quiet_loops(f, t, g, &mut ms);
     if mode == SPLIT_GAPS {
         use_clusters(f, g, &ms, cl[0..m]);
+        hot_loops(f, t, g, &mut ms);
     }
     segments(f, t, g, &mut ms);
     // edges: joined, or split points (always after a call it is not used after
@@ -3562,13 +3952,13 @@ fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
 
 // Rewrites the spilled vregs: split (see above), spilled everywhere, or
 // rematerialized.
-fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
+fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet) void {
     let nv = iv.len;
     let nb = f.blocks.len;
     let mut g = Cfg.{ npred: u.newn.[i32](nb + 1), nsucc: u.newn.[i32](nb + 1), simple: u.newn.[bool](nb + 1),
                       endok: u.newn.[bool](nb + 1), label: u.newn.[bool](nb + 1), near: u.newn.[bool](nb + 1),
                       cidx: u.newn.[i32](nb + 1), ev: u.newn.[u.List.[*mut MInst]](nb + 1),
-                      stale: u.newn.[bool](nv + 1) };
+                      stale: u.newn.[bool](nv + 1), nhot: u.newn.[i32](0), segs: segs, loop_calls: false };
     for bi in 0..nb {
         g.npred[bi] = 0;
         g.label[bi] = false;
@@ -3590,6 +3980,9 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             }
             if jumped or (i.clobber != 0) {
                 g.ev[bi].push(i);
+            }
+            if (i.clobber != 0) and (bi < f.binner.len) and (f.binner[bi] >= 0) {
+                g.loop_calls = true;
             }
             i = i.next;
         }
@@ -4319,7 +4712,14 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
             }
         }
         let mut frameless = false;
-        let ns = greedy(f, t, iv, &mut frameless);
+        let segs = u.newn.[SegSet](64);
+        for r in @as(usize, 0)..64 {
+            segs[r] = SegSet.empty();
+        }
+        let ns = greedy(f, t, iv, segs, &mut frameless);
+        if frameless or (ns == 0) {
+            free_ranges(iv, segs);
+        }
         if debug_ra {
             u.eprint(u.f1("round %s\n", u.idec(rounds)));
         }
@@ -4356,7 +4756,8 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
         if rounds > 40 {
             u.die("internal compiler error: register allocation did not converge");
         }
-        rewrite_spills(f, t, iv);
+        rewrite_spills(f, t, iv, segs);
+        free_ranges(iv, segs);
         if debug_ra {
             dump(f, "rewritten");
         }
