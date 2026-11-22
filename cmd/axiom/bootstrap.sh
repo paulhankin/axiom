@@ -54,7 +54,7 @@ fi
 # unpacks it. Sets SEED to its compiler.
 pinned_seed() {
     toml=$1
-    version=$(sed -n 's/^version *= *"\([0-9][0-9.]*\)" *$/\1/p' "$toml")
+    version=$(sed -n 's/^version *= *"\([0-9][0-9a-z.-]*\)" *$/\1/p' "$toml")
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) plat=linux-x86_64 ;;
         Linux-aarch64 | Linux-arm64) plat=linux-aarch64 ;;
