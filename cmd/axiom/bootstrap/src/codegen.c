@@ -2410,6 +2410,7 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
     case E_DEREF: return gen(e->a);
     case E_FIELD: {
         if (e->op == FK_DECL && e->decl && e->decl->kind == D_GLOBAL) return global_addr(e->decl);
+        if (e->op != FK_STRUCT) break;
         Type *at = ct(e->a->type);
         LLVMValueRef base;
         Type *st;
@@ -4722,7 +4723,7 @@ static LLVMValueRef gen_unary(Expr *e) {
     Type *t = ct(e->type);
     switch (e->op) {
     case KW_NOT: return LLVMBuildNot(B, gen(e->a), "");
-    case TK_AMP: return gen_addr(e->a);
+    case TK_AMP: return addr_or_spill(e->a);
     case TK_TILDE: return LLVMBuildNot(B, gen(e->a), "");
     case TK_MINUS_PCT: return LLVMBuildNeg(B, gen(e->a), "");
     case TK_MINUS: {
