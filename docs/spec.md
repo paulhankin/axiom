@@ -1281,7 +1281,7 @@ reaches a `break` or `return`.
 patterns `P`, as `if let` does (§8.3): it is exactly
 `loop { match e { P => { A } else => { break; } } }`. The loop ends the first time `e`
 does not match; a binding is in scope in `A` only, and `break` and `continue` in `A`
-apply to the loop (a label names it, as for `while`). It is how an iterator is
+apply to the loop (a label names it, as for `while`). It is how an iterator (§15.3) is
 driven; the call to `next` is written out:
 
 ```axiom
@@ -2768,6 +2768,39 @@ included, unless it uses a shared library (the system's C library among them: a 
 function that neither the program nor the compiler's C library defines), in which case
 the compiler's linker links it dynamically against those (docs/c.md, "Objects and
 libraries").
+
+### 15.3 Iterators
+
+The standard library's iterators have one protocol. An iterator is a struct with a
+method
+
+```axiom
+pub fn next(self: *mut Self) ?T      // or E!?T, if producing an item can fail
+```
+
+that returns the next item, and `.none` when there are no more (and after that). The
+end is never an error, a sentinel value or a `bool`. The loop that drives one is
+`while let` (§8.4); `for` makes no call, so it does not drive an iterator (§8.5):
+
+```axiom
+let mut it = str.split(line, ",");
+while let .some(field) = it.next() {
+    ...
+}
+let mut r = tar.Reader.init(bytes);
+while let .some(entry) = r.next()! {     // fails with the archive's TarError
+    ...
+}
+```
+
+The collections' iterators give entries of pointers into the collection, so nothing is
+copied: `Map`, `Lru` and `TreeMap` (and their `Dyn` forms) give
+`map.Entry.[K, V]`, with `key: *K` and `value: *mut V` (a value may be changed
+through it; adding or removing entries while iterating is not allowed), from `iter`,
+which takes `*mut Self`; `Set` and `Map.keys` give `*K`. A cursor that is read
+through its fields, such as the HTML and Markdown tree walkers, names its step
+`advance`, not `next`. The test suite checks that every public method named `next`
+in the library has one of the two signatures.
 
 ---
 
