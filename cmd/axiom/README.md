@@ -446,10 +446,11 @@ types share a module.
 | `dwarf.ax`, `dbginfo.ax` | | DWARF 5 debug information (`-g`): line tables, frames, types, variables, lexical blocks, location lists |
 | `axdebug.ax` | | what an Axiom program's debug information says of its types and variables |
 | `dloc.ax` | | where variables are in optimized machine code (location lists), after register allocation |
-| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; argument parsing, target resolution, separate compilation, linking |
+| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`, `doc`; argument parsing, target resolution, separate compilation, linking |
 | `tester.ax` | `main.c` | `axiom test`: runs the test binary and reports its results, humanly or as agent-json |
 | `profiler.ax` | `main.c` | `axiom profile`: runs a program under the sampling profiler and reports hot functions, call sites and folded stacks |
 | `fmt.ax` | | `axiom fmt`: canonical layout from the token stream, imports tidied |
+| `doc.ax` | | `axiom doc`: signatures and documentation of modules and items from the parsed tree (no checking; signatures as `ide.ax` prints them), and the warning `W0320` |
 | `ide.ax` | | `axiom ide`: answers an editor's questions (diagnostics, hover, definitions, references, rename, completion, signatures, outline, formatting) from the checked tree, with unsaved buffers on stdin |
 | `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, answered in-process on a thread per request, with std/ and the files not being edited kept checked for the session (VS Code client in [`tools/editors/vscode`](../../tools/editors/vscode/README.md)) |
 | `c/` | | the C front end, `axiom build file.c`: preprocessor, parser, semantic analysis and IR generation for C89 to C23, in the compiler only ([`docs/c.md`](../../docs/c.md), design in [`docs/c-frontend.md`](../../docs/c-frontend.md)) |

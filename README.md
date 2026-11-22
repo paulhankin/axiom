@@ -54,6 +54,7 @@ axiom test mylib.ax                               # run a file's `test` blocks
 axiom new geometry                                # a package: axiom.toml + src/lib.ax (spec §4.6)
 axiom test geometry                               # build, check and test also take a package directory
 axiom fmt src/                                    # canonical layout, imports tidied (spec §16.5)
+axiom doc std/str.split                           # a signature and its documentation (std, a module, --search=)
 axiom profile prog.ax                             # sampling profiler: hot functions, call sites, flame graphs
 axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
 axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)

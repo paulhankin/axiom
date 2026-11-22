@@ -1,0 +1,1358 @@
+// =============================================================================
+// doc.ax - signatures and documentation from the command line (axiom doc).
+//
+//   axiom doc std                        the standard library's modules, one line each
+//   axiom doc std/str                    a module: its public items, one line each
+//   axiom doc std/str.split              an item: signature, documentation, errors, location
+//   axiom doc std/collections/vec.Vec    a type: its fields and methods (.Vec.push: one method)
+//   axiom doc pkg:<name>[/<module>]      a module of a package (the one here, or a dependency)
+//   axiom doc <file.ax> | <dir>          a module by its file; the modules under a directory,
+//                                        or a package directory's entry module
+//   axiom doc --search=<text> [<root>]   the public items under root (std by default) whose
+//                                        name or documentation contains text
+//   --format=human|agent-json (schema axiom-doc/1)   --std=<dir>
+//
+// It only parses (parser.ax), so it answers in milliseconds and answers for a
+// module that does not compile. Signatures are printed as ide.ax prints them
+// for hover and documentSymbol; an item's documentation is its `///` lines
+// (a field's or variant's, or the comment after it on its line, as hover
+// has it); a module's summary is the first comment block of its file. A
+// listing shows each item's first sentence.
+//
+// warn_undocumented is warning W0320 (--warn=W0320): a public item of the
+// program's own modules with no documentation.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "ide.ax" as ide;
+import "modload.ax" as modl;
+import "package.ax" as pkg;
+import "parser.ax" as parser;
+import "util.ax" as u;
+
+// A module, parsed: its file's declarations and its part files'.
+struct DocMod {
+    name: []u8,  // std/str, pkg:geometry, or the file's path without .ax
+    path: []u8,  // real path
+    file: *mut u.SourceFile,
+    decls: u.List.[*mut ast.Decl],
+}
+
+threadlocal let mut g_std: []u8 = "";  // the standard library's directory (real path)
+threadlocal let mut g_cwd: []u8 = "";
+threadlocal let mut g_json: bool = false;
+threadlocal let mut g_mods: u.SymMap.[*mut DocMod] = u.SymMap.[*mut DocMod].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut DocMod, 0), cap: 0, len: 0 };
+
+// -----------------------------------------------------------------------------
+// Text
+// -----------------------------------------------------------------------------
+fn is_space(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r');
+}
+
+fn lower(c: u8) u8 {
+    if (c >= 'A') and (c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+// Whether s contains sub, ignoring ASCII case.
+fn has_text(s: []u8, sub: []u8) bool {
+    if sub.len == 0 {
+        return true;
+    }
+    let mut i: usize = 0;
+    while (i + sub.len) <= s.len {
+        let mut j: usize = 0;
+        while (j < sub.len) and (lower(s[i + j]) == lower(sub[j])) {
+            j += 1;
+        }
+        if j == sub.len {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// s on one line: each run of white space one space, none just inside
+// brackets, and no comma before a closing one.
+fn flat(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    let mut sp = false;
+    for c in s {
+        if is_space(c) {
+            sp = true;
+            continue;
+        }
+        let n = b.len();
+        if sp and (n > 0) {
+            let prev = b.view()[n - 1];
+            if (prev != '(') and (prev != '[') and (c != ')') and (c != ']') {
+                b.c(' ');
+            }
+        }
+        sp = false;
+        if (c == ')') or (c == ']') {
+            let v = b.view();
+            if (v.len > 0) and (v[v.len - 1] == ',') {
+                b.b.len -= 1;
+            }
+        }
+        b.c(c);
+    }
+    return b.done();
+}
+
+fn trim(s: []u8) []u8 {
+    let mut a: usize = 0;
+    let mut e = s.len;
+    while (a < e) and is_space(s[a]) {
+        a += 1;
+    }
+    while (e > a) and is_space(s[e - 1]) {
+        e -= 1;
+    }
+    return s[a..e];
+}
+
+// s with its lines joined: each line break, and the white space around
+// it, one space.
+fn join_lines(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    while i < s.len {
+        if s[i] == '\n' {
+            while (b.len() > 0) and is_space(b.view()[b.len() - 1]) {
+                b.b.len -= 1;
+            }
+            i += 1;
+            while (i < s.len) and is_space(s[i]) {
+                i += 1;
+            }
+            b.c(' ');
+            continue;
+        }
+        b.c(s[i]);
+        i += 1;
+    }
+    return b.done();
+}
+
+// The first paragraph of a documentation text, on one line.
+fn first_paragraph(s: []u8) []u8 {
+    let t = trim(s);
+    let mut i: usize = 0;
+    while (i + 1) < t.len {
+        if (t[i] == '\n') and (t[i + 1] == '\n') {
+            return join_lines(t[..i]);
+        }
+        i += 1;
+    }
+    return join_lines(t);
+}
+
+// Whether the '.' at s[i] ends an abbreviation ("e.g.", "i.e.", "etc.").
+fn abbrev(s: []u8, i: usize) bool {
+    return ((i >= 3) and
+            (u.str_eq(s[i - 3..i], "e.g") or u.str_eq(s[i - 3..i], "i.e") or u.str_eq(s[i - 3..i], "etc") or
+             u.str_eq(s[i - 3..i], " vs")));
+}
+
+// The first sentence of a documentation text: of its first paragraph, up
+// to the first '.' (or '!', '?') followed by a space.
+pub fn first_sentence(s: []u8) []u8 {
+    let p = first_paragraph(s);
+    let mut i: usize = 0;
+    while (i + 1) < p.len {
+        let c = p[i];
+        if ((c == '.') or (c == '!') or (c == '?')) and (p[i + 1] == ' ') and not abbrev(p, i) {
+            return p[..i + 1];
+        }
+        i += 1;
+    }
+    return p;
+}
+
+// Whether a comment line is a rule (==== or ----).
+fn is_rule(s: []u8) bool {
+    if s.len < 3 {
+        return false;
+    }
+    for c in s {
+        if (c != '=') and (c != '-') and (c != '*') and (c != '~') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A module's summary: the first comment block of its file (`//` lines,
+// not `///`, from the first line that is not blank to the first that is not
+// such a comment), without its rule lines and without a "std/x.ax - " that
+// starts it. "" if the file starts otherwise.
+pub fn module_summary(text: []u8) []u8 {
+    let lines = u.split(text, '\n', 0xFFFF_FFFF);
+    let mut i: usize = 0;
+    while (i < lines.len) and (trim(lines.get(i)).len == 0) {
+        i += 1;
+    }
+    let mut b = u.Buf.init();
+    let mut gap = false;
+    while i < lines.len {
+        let l = lines.get(i);
+        if not u.starts(l, "//") or u.starts(l, "///") {
+            break;
+        }
+        i += 1;
+        let mut body = l[2..];
+        if (body.len > 0) and (body[0] == ' ') {
+            body = body[1..];
+        }
+        let tb = trim(body);
+        if is_rule(tb) {
+            continue;
+        }
+        if tb.len == 0 {
+            gap = b.len() > 0;
+            continue;
+        }
+        if gap {
+            b.c('\n');
+            gap = false;
+        }
+        let mut e = body.len;
+        while (e > 0) and is_space(body[e - 1]) {
+            e -= 1;
+        }
+        b.s(body[..e]);
+        b.c('\n');
+    }
+    let s = trim(b.done());
+    // "std/str.ax - byte strings ..." -> "byte strings ..."
+    let mut k: usize = 0;
+    while (k < s.len) and not is_space(s[k]) {
+        k += 1;
+    }
+    if (k > 3) and u.ends(s[..k], ".ax") and ((k + 3) <= s.len) and u.str_eq(s[k..k + 3], " - ") {
+        return trim(s[k + 3..]);
+    }
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// Modules
+// -----------------------------------------------------------------------------
+fn dir_of(p: []u8) []u8 {
+    let slash = u.rfind(p, '/');
+    if slash >= 0 {
+        return p[0..@int_cast(usize, slash)];
+    }
+    return ".";
+}
+
+// Whether p is dir or under it (both real paths).
+fn under(p: []u8, dir: []u8) bool {
+    return (dir.len > 0) and u.starts(p, dir) and ((p.len == dir.len) or (p[dir.len] == '/'));
+}
+
+// How a file is shown: std/... for the standard library's (as diagnostics
+// show them), relative to the current directory under it, else its path.
+fn display(rp: []u8) []u8 {
+    if under(rp, g_std) and (rp.len > g_std.len) {
+        return u.f1("std/%s", rp[g_std.len + 1..]);
+    }
+    if under(rp, g_cwd) and (rp.len > g_cwd.len) {
+        return u.dup(rp[g_cwd.len + 1..]);
+    }
+    return rp;
+}
+
+fn strip_ax(s: []u8) []u8 {
+    if (s.len > 3) and u.ends(s, ".ax") {
+        return s[..s.len - 3];
+    }
+    return s;
+}
+
+fn ax_path(p: []u8) []u8 {
+    return u.cat2(p, u.pick((p.len > 3) and u.ends(p, ".ax"), "", ".ax"));
+}
+
+// The module of file rp (a real path), parsed with its part files; none if
+// it cannot be read. What the parser reports is dropped: a module with
+// errors is documented as far as it parses.
+fn load(rp: []u8, name: []u8) ?*mut DocMod {
+    let key = u.intern(rp);
+    let found = g_mods.get(key);
+    if u.notnil(found) {
+        return found;
+    }
+    let f = u.load_file(rp, display(rp));
+    if u.isnil(f) {
+        return .none;
+    }
+    let m = u.new.[DocMod]();
+    m.path = key;
+    m.file = f;
+    m.name = name;
+    if u.isnos(name) {
+        m.name = strip_ax(f.display);
+    }
+    m.decls = u.List.[*mut ast.Decl].empty();
+    let pm = parser.parse_module(f);
+    for d in pm.decls.items() {
+        m.decls.push(d);
+    }
+    // (the part files' items after the module's own)
+    for i in 0..pm.decls.len {
+        let d = pm.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and d.is_part and not u.isnos(d.import_path) {
+            let pp = u.real_path(u.f2("%s/%s", dir_of(rp), ax_path(d.import_path)));
+            if u.isnos(pp) {
+                continue;
+            }
+            let pf = u.load_file(pp, display(pp));
+            if u.isnil(pf) {
+                continue;
+            }
+            let ppm = parser.parse_module(pf);
+            for j in 0..ppm.decls.len {
+                m.decls.push(ppm.decls.get(j));
+            }
+        }
+    }
+    dg.clear();
+    g_mods.put(key, m);
+    return m;
+}
+
+// The module an import declaration names (its real path), or a nil slice.
+fn import_target(d: *mut ast.Decl) []u8 {
+    let ip = d.import_path;
+    if u.isnos(ip) {
+        return u.nosym();
+    }
+    let from = u.file_of(d.span.file).path;
+    let mut p = u.nosym();
+    if u.starts(ip, "std/") {
+        p = u.f2("%s/%s", g_std, ax_path(ip[4..]));
+    } else if u.starts(ip, "pkg:") {
+        p = pkg.resolve_import(pkg.for_file(from), ip, d.import_path_span);
+        dg.clear();
+        if u.isnos(p) {
+            return p;
+        }
+    } else {
+        p = u.f2("%s/%s", dir_of(from), ax_path(ip));
+    }
+    return u.real_path(p);
+}
+
+// The files that are part files of other modules, among the .ax files
+// listed (each file's `import part` lines, read as text).
+fn part_files(paths: [][]u8) u.SymMap.[bool] {
+    let mut parts = u.SymMap.[bool].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut bool, 0), cap: 0,
+                                      len: 0 };
+    for p in paths {
+        let t = u.read_file(p);
+        if u.isnos(t) {
+            continue;
+        }
+        let lines = u.split(t, '\n', 0xFFFF_FFFF);
+        for l in lines.items() {
+            if not u.starts(l, "import part \"") {
+                continue;
+            }
+            let rest = l[13..];
+            let q = u.find(rest, '"');
+            if q <= 0 {
+                continue;
+            }
+            let pp = u.real_path(u.f2("%s/%s", dir_of(p), ax_path(rest[..@int_cast(usize, q)])));
+            if not u.isnos(pp) {
+                parts.put(u.intern(pp), true);
+            }
+        }
+    }
+    return parts;
+}
+
+// The modules under dir (a real path), sorted: its .ax files at any depth
+// but for part files and those under an internal/ or testdata/ directory
+// (which other code cannot import, or is not code).
+fn modules_under(dir: []u8, out: *mut u.List.[[]u8]) void {
+    let mut all = u.List.[[]u8].empty();
+    collect(dir, &mut all);
+    u.sort(all.items_mut(), u.str_cmp);
+    // (the modules that own part files here may be outside dir: in the
+    // standard library anywhere, elsewhere beside it, as x.ax owns x/y.ax)
+    let mut owners = u.List.[[]u8].empty();
+    if under(dir, g_std) {
+        collect(g_std, &mut owners);
+    } else {
+        let mut names = u.List.[[]u8].empty();
+        let up = dir_of(dir);
+        if u.list_dir(up, &mut names) {
+            for n in names.items() {
+                if (n.len > 3) and u.ends(n, ".ax") {
+                    owners.push(u.f2("%s/%s", up, n));
+                }
+            }
+        }
+        for p in all.items() {
+            owners.push(p);
+        }
+    }
+    let mut parts = part_files(owners.items());
+    for p in all.items() {
+        if not parts.has(u.intern(p)) {
+            out.push(p);
+        }
+    }
+}
+
+fn collect(dir: []u8, out: *mut u.List.[[]u8]) void {
+    let mut names = u.List.[[]u8].empty();
+    if not u.list_dir(dir, &mut names) {
+        return;
+    }
+    for n in names.items() {
+        if (n.len == 0) or (n[0] == '.') or u.str_eq(n, "internal") or u.str_eq(n, "testdata") {
+            continue;
+        }
+        let p = u.f2("%s/%s", dir, n);
+        if u.is_dir(p) {
+            collect(p, out);
+        } else if (n.len > 3) and u.ends(n, ".ax") {
+            out.push(p);
+        }
+    }
+}
+
+fn module_name(rp: []u8) []u8 {
+    return strip_ax(display(rp));
+}
+
+// -----------------------------------------------------------------------------
+// Items
+// -----------------------------------------------------------------------------
+fn is_type(d: *ast.Decl) bool {
+    return (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM);
+}
+
+// Whether d is an item axiom doc shows (with pub_only, a public one).
+fn shown(d: *ast.Decl, pub_only: bool) bool {
+    if (d.kind == ast.D_IMPORT) or d.is_test or u.isnos(d.name) or u.str_eq(d.name, "<error>") or d.anon {
+        return false;
+    }
+    return d.is_pub or not pub_only;
+}
+
+fn kind_name(d: *ast.Decl) []u8 {
+    let k = d.kind;
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        return u.pick(u.notnil(d.owner), "method", "fn");
+    }
+    if k == ast.D_STRUCT {
+        return "struct";
+    }
+    if k == ast.D_UNION {
+        return "union";
+    }
+    if k == ast.D_ENUM {
+        return "enum";
+    }
+    if k == ast.D_ERROR {
+        return "error";
+    }
+    if k == ast.D_CONST {
+        return "const";
+    }
+    return "global";
+}
+
+fn text_of(sp: u.Span) []u8 {
+    return ide.text_of(sp);
+}
+
+// A type's declaration up to its body: `pub nocopy struct String`.
+fn type_head(d: *ast.Decl) []u8 {
+    let t = u.file_of(d.span.file).text;
+    let mut i = @as(usize, d.name_span.end);
+    while (i < t.len) and (t[i] != '{') and (i < @as(usize, d.span.end)) {
+        i += 1;
+    }
+    return flat(t[@as(usize, d.span.start)..i]);
+}
+
+// An item's signature on one line, as written (ide.ax's, for functions,
+// constants and globals), starting with `pub` if it is public.
+pub fn signature(d: *ast.Decl) []u8 {
+    let mut s = "";
+    if is_type(d) {
+        s = type_head(d);
+    } else if d.kind == ast.D_ERROR {
+        s = flat(text_of(d.span));
+    } else {
+        s = flat(ide.sig_of(d));
+    }
+    if u.ends(s, ";") {
+        s = s[..s.len - 1];
+    }
+    if d.is_pub and not u.starts(s, "pub ") {
+        return u.cat2("pub ", s);
+    }
+    return s;
+}
+
+// An item's documentation: its `///` lines (ide.ax's, as hover shows it).
+pub fn doc_of(d: *ast.Decl) []u8 {
+    return trim(ide.doc_comment(d.span.file, d.span.start));
+}
+
+fn line_of(sp: u.Span) []u8 {
+    return u.idec(u.span_linecol(sp).sl);
+}
+
+fn location(sp: u.Span) []u8 {
+    return u.f2("%s:%s", u.file_of(sp.file).display, line_of(sp));
+}
+
+fn find_decl(m: *DocMod, name: []u8, pub_only: bool) ?*mut ast.Decl {
+    for d in m.decls.items() {
+        if shown(d, pub_only) and u.str_eq(d.name, name) {
+            return d;
+        }
+    }
+    return .none;
+}
+
+// The error set an error union's set names (`Set` or `mod.Set`, from module
+// m), with the sets it includes: its names, into *out (each once). False if
+// it cannot be found (a generic error parameter, an import not found).
+fn set_names(m: *DocMod, te: *ast.TypeExpr, out: *mut u.List.[[]u8], depth: i32) bool {
+    if depth > 16 {
+        return false;
+    }
+    match te.shape {
+        .Named(nt) => {
+            let mut sm: ?*DocMod = m;
+            if not u.isnos(nt.qual) {
+                sm = .none;
+                // (imports are a file's: a part file's own come first)
+                let mut imps = u.List.[*mut ast.Decl].empty();
+                for d in m.decls.items() {
+                    if (d.kind == ast.D_IMPORT) and (d.span.file == te.span.file) {
+                        imps.push(d);
+                    }
+                }
+                for d in m.decls.items() {
+                    if (d.kind == ast.D_IMPORT) and (d.span.file != te.span.file) {
+                        imps.push(d);
+                    }
+                }
+                for d in imps.items() {
+                    if not d.is_part and u.str_eq(d.name, nt.qual) {
+                        let rp = import_target(d);
+                        if not u.isnos(rp) {
+                            if let .some(im) = load(rp, u.nosym()) {
+                                sm = im;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            let dm = sm ?? return false;
+            for d in dm.decls.items() {
+                if (d.kind == ast.D_ERROR) and not u.isnos(d.name) and u.str_eq(d.name, nt.name) {
+                    for n in d.error_names.items() {
+                        add_name(out, n);
+                    }
+                    let mut ok = true;
+                    for r in d.error_refs.items() {
+                        ok = set_names(dm, r, out, depth + 1) and ok;
+                    }
+                    return ok;
+                }
+            }
+            return false;
+        }
+        .ErrSetInline(ies) => {
+            for n in ies.names.items() {
+                add_name(out, n);
+            }
+            return true;
+        }
+        else => { return false; }
+    }
+}
+
+fn add_name(out: *mut u.List.[[]u8], n: []u8) void {
+    for x in out.items() {
+        if u.str_eq(x, n) {
+            return;
+        }
+    }
+    out.push(n);
+}
+
+// What a function can return as errors: kind "set" (a named set, its name
+// and names), "inline" ({ A, B }), "any" (!T), "inferred" (infer!T),
+// "param" (a generic error parameter), or "" (no error union).
+struct Errors {
+    kind: []u8,
+    set: []u8,
+    names: u.List.[[]u8],
+}
+
+fn errors_of(m: *DocMod, d: *ast.Decl) Errors {
+    let mut e = Errors.{ kind: "", set: "", names: u.List.[[]u8].empty() };
+    if ((d.kind != ast.D_FN) and (d.kind != ast.D_HOST_FN)) or u.isnil(d.ret_te) {
+        return e;
+    }
+    match d.ret_te.shape {
+        .ErrUnion(eu) => {
+            if eu.is_infer {
+                e.kind = "inferred";
+            } else if u.isnil(eu.set) {
+                e.kind = "any";
+            } else {
+                match eu.set.shape {
+                    .ErrSetInline => { e.kind = "inline"; }
+                    else => {
+                        e.kind = "set";
+                        e.set = flat(text_of(eu.set.span));
+                    }
+                }
+                if not set_names(m, eu.set, &mut e.names, 0) {
+                    if u.str_eq(e.kind, "set") {
+                        e.kind = "param";
+                    }
+                }
+            }
+        }
+        else => {}
+    }
+    return e;
+}
+
+fn names_text(names: *u.List.[[]u8]) []u8 {
+    let mut b = u.Buf.init();
+    b.s("{ ");
+    for i in 0..names.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(names.get(i));
+    }
+    b.s(" }");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Human output
+// -----------------------------------------------------------------------------
+// An item on one line: its signature, and its documentation's first
+// sentence as a comment.
+fn line_h(b: *mut u.Buf, d: *ast.Decl, indent: []u8) void {
+    b.s(indent);
+    b.s(signature(d));
+    let doc = first_sentence(doc_of(d));
+    if doc.len > 0 {
+        b.s("  // ");
+        b.s(doc);
+    }
+    b.c('\n');
+}
+
+fn module_h(b: *mut u.Buf, m: *DocMod) void {
+    b.s(u.f2("module %s (%s)\n", m.name, m.file.display));
+    let s = module_summary(m.file.text);
+    if s.len > 0 {
+        b.s(s);
+        b.c('\n');
+    }
+    b.c('\n');
+    for d in m.decls.items() {
+        if not shown(d, true) {
+            continue;
+        }
+        line_h(b, d, "");
+        if is_type(d) {
+            for md in d.methods.items() {
+                if shown(md, true) {
+                    line_h(b, md, "    ");
+                }
+            }
+        }
+    }
+}
+
+fn doc_block(b: *mut u.Buf, doc: []u8) void {
+    if doc.len > 0 {
+        b.c('\n');
+        b.s(doc);
+        b.c('\n');
+    }
+}
+
+fn item_h(b: *mut u.Buf, m: *DocMod, d: *ast.Decl, qual: []u8) void {
+    b.s(qual);
+    b.c('\n');
+    if is_type(d) {
+        b.s(signature(d));
+        b.s(" {\n");
+        let mut hidden: usize = 0;
+        for f in d.fields.items() {
+            if not f.is_pub {
+                hidden += 1;
+                continue;
+            }
+            b.s(u.f2("    pub %s: %s,", f.name, flat(ide.te_text(f.te))));
+            let c = ide.trailing_comment(f.span.file, f.span.end);
+            let dc = trim(ide.doc_comment(f.span.file, f.span.start));
+            if dc.len > 0 {
+                b.s("  // ");
+                b.s(first_paragraph(dc));
+            } else if c.len > 0 {
+                b.s("  // ");
+                b.s(c);
+            }
+            b.c('\n');
+        }
+        if hidden > 0 {
+            b.s(u.f2("    // %s private field%s\n", u.zdec(hidden), u.pick(hidden == 1, "", "s")));
+        }
+        for v in d.variants.items() {
+            b.s("    ");
+            b.s(v.name);
+            if d.kind == ast.D_ENUM {
+                if v.has_value {
+                    b.s(" = ");
+                    b.s(flat(text_of(v.value_span)));
+                }
+            } else if u.notnil(v.te) {
+                b.s(": ");
+                b.s(flat(ide.te_text(v.te)));
+            }
+            b.c(',');
+            let dc = trim(ide.doc_comment(v.span.file, v.span.start));
+            let c = ide.trailing_comment(v.span.file, v.span.end);
+            if dc.len > 0 {
+                b.s("  // ");
+                b.s(first_paragraph(dc));
+            } else if c.len > 0 {
+                b.s("  // ");
+                b.s(c);
+            }
+            b.c('\n');
+        }
+        b.s("}\n");
+    } else {
+        b.s(signature(d));
+        b.c('\n');
+    }
+    doc_block(b, doc_of(d));
+    if d.kind == ast.D_ERROR {
+        let mut names = u.List.[[]u8].empty();
+        for n in d.error_names.items() {
+            add_name(&mut names, n);
+        }
+        if d.error_refs.len > 0 {
+            for r in d.error_refs.items() {
+                _ = set_names(m, r, &mut names, 1);
+            }
+            b.s(u.f1("\nerrors: %s\n", names_text(&names)));
+        }
+    }
+    let e = errors_of(m, d);
+    if u.str_eq(e.kind, "set") {
+        b.s(u.f2("\nerrors: %s %s\n", e.set, names_text(&e.names)));
+    } else if u.str_eq(e.kind, "any") {
+        b.s("\nerrors: any (!T)\n");
+    }
+    if is_type(d) {
+        let mut first = true;
+        for md in d.methods.items() {
+            if shown(md, true) {
+                if first {
+                    b.s("\nmethods:\n");
+                    first = false;
+                }
+                line_h(b, md, "");
+            }
+        }
+    }
+    b.s(u.f1("\n%s\n", location(d.name_span)));
+}
+
+// -----------------------------------------------------------------------------
+// JSON output (axiom-doc/1)
+// -----------------------------------------------------------------------------
+fn jkey(b: *mut u.Buf, k: []u8, v: []u8) void {
+    b.s(",\"");
+    b.s(k);
+    b.s("\":");
+    dg.json_str(b, v);
+}
+
+fn jfirst(b: *mut u.Buf, k: []u8, v: []u8) void {
+    b.s("{\"");
+    b.s(k);
+    b.s("\":");
+    dg.json_str(b, v);
+}
+
+fn jnames(b: *mut u.Buf, names: *u.List.[[]u8]) void {
+    b.c('[');
+    for i in 0..names.len {
+        if i != 0 {
+            b.c(',');
+        }
+        dg.json_str(b, names.get(i));
+    }
+    b.c(']');
+}
+
+// An item in a listing: name, kind, signature, summary, file and line, and
+// a type's methods.
+fn item_j(b: *mut u.Buf, m: *DocMod, d: *ast.Decl, full: bool, with_module: bool) void {
+    jfirst(b, "name", d.name);
+    jkey(b, "kind", kind_name(d));
+    if with_module {
+        jkey(b, "module", m.name);
+    }
+    if u.notnil(d.owner) {
+        jkey(b, "type", d.owner.name);
+    }
+    jkey(b, "signature", signature(d));
+    let doc = doc_of(d);
+    jkey(b, "summary", first_sentence(doc));
+    if full {
+        jkey(b, "doc", doc);
+    }
+    jkey(b, "file", u.file_of(d.name_span.file).display);
+    b.s(u.f1(",\"line\":%s", line_of(d.name_span)));
+    if full and (d.kind == ast.D_ERROR) {
+        let mut names = u.List.[[]u8].empty();
+        for n in d.error_names.items() {
+            add_name(&mut names, n);
+        }
+        for r in d.error_refs.items() {
+            _ = set_names(m, r, &mut names, 1);
+        }
+        b.s(",\"names\":");
+        jnames(b, &names);
+    }
+    if full {
+        let e = errors_of(m, d);
+        if e.kind.len > 0 {
+            b.s(",\"errors\":");
+            jfirst(b, "kind", e.kind);
+            if e.set.len > 0 {
+                jkey(b, "set", e.set);
+            }
+            b.s(",\"names\":");
+            jnames(b, &e.names);
+            b.c('}');
+        }
+    }
+    if full and is_type(d) {
+        b.s(",\"fields\":[");
+        let mut n: usize = 0;
+        for f in d.fields.items() {
+            if not f.is_pub {
+                continue;
+            }
+            b.s(u.pick(n != 0, ",", ""));
+            n += 1;
+            jfirst(b, "name", f.name);
+            jkey(b, "type", flat(ide.te_text(f.te)));
+            let mut fd = trim(ide.doc_comment(f.span.file, f.span.start));
+            if fd.len == 0 {
+                fd = ide.trailing_comment(f.span.file, f.span.end);
+            }
+            jkey(b, "doc", fd);
+            b.s(u.f1(",\"line\":%s}", line_of(f.span)));
+        }
+        b.s(u.f1("],\"private_fields\":%s", u.zdec(d.fields.len - n)));
+        b.s(",\"variants\":[");
+        for j in 0..d.variants.len {
+            let v = d.variants.at(j);
+            b.s(u.pick(j != 0, ",", ""));
+            jfirst(b, "name", v.name);
+            if (d.kind == ast.D_ENUM) and v.has_value {
+                jkey(b, "value", flat(text_of(v.value_span)));
+            } else if (d.kind != ast.D_ENUM) and u.notnil(v.te) {
+                jkey(b, "type", flat(ide.te_text(v.te)));
+            }
+            let mut vd = trim(ide.doc_comment(v.span.file, v.span.start));
+            if vd.len == 0 {
+                vd = ide.trailing_comment(v.span.file, v.span.end);
+            }
+            jkey(b, "doc", vd);
+            b.s(u.f1(",\"line\":%s}", line_of(v.span)));
+        }
+        b.c(']');
+    }
+    if is_type(d) {
+        b.s(",\"methods\":[");
+        let mut n: usize = 0;
+        for md in d.methods.items() {
+            if shown(md, true) {
+                b.s(u.pick(n != 0, ",", ""));
+                n += 1;
+                item_j(b, m, md, false, false);
+            }
+        }
+        b.c(']');
+    }
+    b.c('}');
+}
+
+fn module_j(b: *mut u.Buf, m: *DocMod) void {
+    jfirst(b, "name", m.name);
+    jkey(b, "file", m.file.display);
+    jkey(b, "summary", module_summary(m.file.text));
+    b.s(",\"items\":[");
+    let mut n: usize = 0;
+    for d in m.decls.items() {
+        if shown(d, true) {
+            b.s(u.pick(n != 0, ",\n  ", "\n  "));
+            n += 1;
+            item_j(b, m, d, false, false);
+        }
+    }
+    b.s("]}");
+}
+
+// -----------------------------------------------------------------------------
+// The command
+// -----------------------------------------------------------------------------
+fn fail(code: []u8, msg: []u8) i32 {
+    dg.emit_fatal(g_json, code, msg);
+    return 1;
+}
+
+fn print_buf(b: *mut u.Buf) i32 {
+    u.print(b.done());
+    return 0;
+}
+
+fn list_modules(dir: []u8) i32 {
+    let mut paths = u.List.[[]u8].empty();
+    modules_under(dir, &mut paths);
+    let mut b = u.Buf.init();
+    if g_json {
+        b.s("{\"schema\":\"axiom-doc/1\",\"status\":\"ok\",\"modules\":[");
+    }
+    for i in 0..paths.len {
+        let p = paths.get(i);
+        let t = u.read_file(p);
+        let s = first_sentence(module_summary(u.pick(u.isnos(t), "", t)));
+        if g_json {
+            b.s(u.pick(i != 0, ",\n  ", "\n  "));
+            jfirst(&mut b, "name", module_name(p));
+            jkey(&mut b, "file", display(p));
+            jkey(&mut b, "summary", s);
+            b.c('}');
+        } else {
+            b.s(module_name(p));
+            if s.len > 0 {
+                b.s("  ");
+                b.s(s);
+            }
+            b.c('\n');
+        }
+    }
+    if g_json {
+        b.s("]}\n");
+    }
+    return print_buf(&mut b);
+}
+
+// What a command-line target names: a module's file (and the item path
+// after it), or a directory of modules.
+struct Target {
+    file: []u8,  // real path, or nil
+    dir: []u8,   // real path, or nil
+    name: []u8,  // the module's name, or nil (from its file)
+    item: []u8,  // "split", "Vec.push", or ""
+}
+
+// Splits "a/b.c.d" into "a/b" and "c.d" (the dots after the last slash).
+fn split_item(s: []u8) [2][]u8 {
+    let slash = u.rfind(s, '/');
+    let mut i: usize = 0;
+    if slash >= 0 {
+        i = @int_cast(usize, slash) + 1;
+    }
+    while i < s.len {
+        if s[i] == '.' {
+            if ((i + 3) <= s.len) and u.str_eq(s[i..i + 3], ".ax") and (((i + 3) == s.len) or (s[i + 3] == '.')) {
+                // file.ax or file.ax.item
+                if (i + 3) == s.len {
+                    return [s[..i], ""];
+                }
+                return [s[..i], s[i + 4..]];
+            }
+            return [s[..i], s[i + 1..]];
+        }
+        i += 1;
+    }
+    return [s, ""];
+}
+
+fn resolve(arg: []u8, t: *mut Target) bool {
+    t.file = u.nosym();
+    t.dir = u.nosym();
+    t.name = u.nosym();
+    t.item = "";
+    if u.str_eq(arg, "std") or u.str_eq(arg, "std/") {
+        t.dir = g_std;
+        return true;
+    }
+    if u.starts(arg, "pkg:") {
+        let parts = split_item(arg);
+        let here = u.real_path(".");
+        let mut p = u.nil.[pkg.Package]();
+        if u.is_file(u.cat2(here, "/axiom.toml")) {
+            p = pkg.load_dir(here, u.nil.[u.Span]());
+        } else {
+            p = pkg.for_file(u.cat2(here, "/axiom.toml"));
+        }
+        if u.isnil(p) {
+            dg.clear();
+            _ = fail("E0214", u.f1("'%s' names a package, but the current directory is not in one (no axiom.toml)",
+                                   arg));
+            return false;
+        }
+        let rp = pkg.resolve_import(p, parts[0], u.mkspan(0, 0, 0));
+        let ds = dg.all();
+        if ds.len > 0 {
+            let first = ds[0];
+            dg.clear();
+            _ = fail(first.code, first.msg);
+            return false;
+        }
+        if u.isnos(rp) {
+            _ = fail("E0214", u.f1("cannot find '%s'", arg));
+            return false;
+        }
+        t.file = u.real_path(rp);
+        t.name = parts[0];
+        t.item = parts[1];
+        if u.isnos(t.file) {
+            _ = fail("E0211", u.f1("cannot find module '%s'", parts[0]));
+            return false;
+        }
+        return true;
+    }
+    let mut base = arg;
+    let mut name = u.nosym();
+    if u.starts(arg, "std/") {
+        base = u.f2("%s/%s", g_std, arg[4..]);
+        name = "std/";
+    }
+    // a directory: its modules, or a package's entry module (std/net/http
+    // is the module, std/net/http/ the directory beside it)
+    let rd = u.real_path(base);
+    if not u.isnos(rd) and u.is_dir(rd) and (u.ends(arg, "/") or not u.is_file(u.cat2(rd, ".ax"))) {
+        if u.is_file(u.cat2(rd, "/axiom.toml")) {
+            let p = pkg.load_dir(rd, u.nil.[u.Span]());
+            dg.clear();
+            if u.notnil(p) {
+                t.file = u.real_path(p.entry);
+                t.name = u.cat2("pkg:", p.name);
+                if not u.isnos(t.file) {
+                    return true;
+                }
+            }
+        }
+        t.dir = rd;
+        return true;
+    }
+    let parts = split_item(base);
+    let path = u.real_path(ax_path(parts[0]));
+    if u.isnos(path) or not u.is_file(path) {
+        _ = fail("E0211", u.f1("cannot find module '%s'", split_item(arg)[0]));
+        return false;
+    }
+    t.file = path;
+    t.item = parts[1];
+    if not u.isnos(name) {
+        t.name = strip_ax(split_item(arg)[0]);
+    }
+    return true;
+}
+
+fn show_item(m: *DocMod, item: []u8) i32 {
+    let dot = u.find(item, '.');
+    let first = u.pick(dot >= 0, item[..@int_cast(usize, @max(dot, 0))], item);
+    let rest = u.pick(dot >= 0, item[@int_cast(usize, @max(dot, 0)) + 1..], "");
+    let d0 = find_decl(m, first, false) ?? return not_found(m, first);
+    let mut d: *mut ast.Decl = d0;
+    if rest.len > 0 {
+        let mut found: ?*mut ast.Decl = .none;
+        for md in d0.methods.items() {
+            if u.str_eq(md.name, rest) {
+                found = md;
+            }
+        }
+        d = found ?? return not_found_member(m, d0, rest);
+    }
+    let mut b = u.Buf.init();
+    let qual = u.f2("%s.%s", m.name, item);
+    if g_json {
+        b.s("{\"schema\":\"axiom-doc/1\",\"status\":\"ok\",\"item\":");
+        item_j(&mut b, m, d, true, true);
+        b.s("}\n");
+    } else {
+        item_h(&mut b, m, d, qual);
+    }
+    return print_buf(&mut b);
+}
+
+// The names in m like `name` (sharing its first three letters, or
+// containing it), for a message.
+fn similar(m: *DocMod, name: []u8) []u8 {
+    let mut b = u.Buf.init();
+    let mut n: usize = 0;
+    let pre = name[..@min(name.len, 3)];
+    for d in m.decls.items() {
+        if shown(d, true) and (has_text(d.name, name) or (u.starts(d.name, pre) and (pre.len == 3))) and (n < 8) {
+            b.s(u.pick(n == 0, "; similar: ", ", "));
+            b.s(d.name);
+            n += 1;
+        }
+    }
+    return b.done();
+}
+
+fn not_found(m: *DocMod, name: []u8) i32 {
+    return fail("E0202", u.f3("%s has no item '%s'%s", m.name, name, similar(m, name)));
+}
+
+fn not_found_member(m: *DocMod, d: *ast.Decl, name: []u8) i32 {
+    let mut b = u.Buf.init();
+    let mut n: usize = 0;
+    for md in d.methods.items() {
+        if shown(md, true) {
+            b.s(u.pick(n == 0, "; its methods: ", ", "));
+            b.s(md.name);
+            n += 1;
+        }
+    }
+    return fail("E0202", u.f4("%s.%s has no method '%s'%s", m.name, d.name, name, b.done()));
+}
+
+fn search(text: []u8, t: *Target) i32 {
+    let mut paths = u.List.[[]u8].empty();
+    if not u.isnos(t.file) {
+        paths.push(t.file);
+    } else {
+        modules_under(t.dir, &mut paths);
+    }
+    // (names that match first, then documentation that does)
+    let mut by_name = u.List.[*mut ast.Decl].empty();
+    let mut by_doc = u.List.[*mut ast.Decl].empty();
+    let mut mods_n = u.List.[*mut DocMod].empty();
+    let mut mods_d = u.List.[*mut DocMod].empty();
+    for p in paths.items() {
+        let nm = u.pick(u.isnos(t.file) or u.isnos(t.name), u.nosym(), t.name);
+        let m = load(p, nm) ?? continue;
+        for d in m.decls.items() {
+            if not shown(d, true) {
+                continue;
+            }
+            match_item(m, d, text, &mut by_name, &mut by_doc, &mut mods_n, &mut mods_d);
+            if is_type(d) {
+                for md in d.methods.items() {
+                    if shown(md, true) {
+                        match_item(m, md, text, &mut by_name, &mut by_doc, &mut mods_n, &mut mods_d);
+                    }
+                }
+            }
+        }
+    }
+    let mut b = u.Buf.init();
+    if g_json {
+        b.s("{\"schema\":\"axiom-doc/1\",\"status\":\"ok\",\"query\":");
+        dg.json_str(&mut b, text);
+        b.s(",\"items\":[");
+    }
+    let total = by_name.len + by_doc.len;
+    for i in 0..total {
+        let mut d = u.nil.[ast.Decl]();
+        let mut m = u.nil.[DocMod]();
+        if i < by_name.len {
+            d = by_name.get(i);
+            m = mods_n.get(i);
+        } else {
+            d = by_doc.get(i - by_name.len);
+            m = mods_d.get(i - by_name.len);
+        }
+        if g_json {
+            b.s(u.pick(i != 0, ",\n  ", "\n  "));
+            item_j(&mut b, m, d, false, true);
+        } else {
+            let mut q = u.f2("%s.%s", m.name, d.name);
+            if u.notnil(d.owner) {
+                q = u.f3("%s.%s.%s", m.name, d.owner.name, d.name);
+            }
+            b.s(q);
+            b.s("  ");
+            line_h(&mut b, d, "");
+        }
+    }
+    if g_json {
+        b.s("]}\n");
+    }
+    return print_buf(&mut b);
+}
+
+fn match_item(m: *mut DocMod, d: *mut ast.Decl, text: []u8, by_name: *mut u.List.[*mut ast.Decl],
+              by_doc: *mut u.List.[*mut ast.Decl], mods_n: *mut u.List.[*mut DocMod],
+              mods_d: *mut u.List.[*mut DocMod]) void {
+    if has_text(d.name, text) {
+        by_name.push(d);
+        mods_n.push(m);
+    } else if has_text(doc_of(d), text) {
+        by_doc.push(d);
+        mods_d.push(m);
+    }
+}
+
+fn usage() i32 {
+    u.eprint("usage: axiom doc <std | std/<module>[.<item>] | pkg:<name>[/<module>][.<item>] | <file.ax>[.<item>] | <dir>>\n");
+    u.eprint("       axiom doc --search=<text> [<root>]   (root: as above, default std)\n");
+    u.eprint("  --format=human|agent-json  --std=<dir>\n");
+    return 2;
+}
+
+/// axiom doc (the arguments after `doc`).
+pub fn run_doc(args: [][]u8, std_dir: []u8) i32 {
+    let mut sdir = std_dir;
+    let mut query = u.nosym();
+    let mut target = u.nosym();
+    g_json = false;
+    for a in args {
+        if u.str_eq(a, "--format=agent-json") {
+            g_json = true;
+        }
+    }
+    for a in args {
+        if u.str_eq(a, "--format=agent-json") or u.str_eq(a, "--format=human") {
+            continue;
+        } else if u.starts(a, "--std=") {
+            sdir = a[6..];
+        } else if u.starts(a, "--target=") {
+            // (every command takes one; documentation does not depend on it)
+        } else if u.starts(a, "--search=") {
+            query = a[9..];
+        } else if u.starts(a, "-") {
+            dg.emit_fatal(g_json, "E9001", u.f1("unknown option '%s'", a));
+            return 2;
+        } else if u.isnos(target) {
+            target = a;
+        } else {
+            dg.emit_fatal(g_json, "E9001", u.f1("axiom doc: unexpected argument '%s'", a));
+            return 2;
+        }
+    }
+    if u.isnos(target) {
+        if u.isnos(query) {
+            if g_json {
+                dg.emit_fatal(true, "E9001", "axiom doc: nothing to document");
+                return 2;
+            }
+            return usage();
+        }
+        target = "std";
+    }
+    g_std = u.real_path(sdir);
+    if u.isnos(g_std) {
+        g_std = sdir;
+    }
+    g_cwd = u.cwd();
+    modl.g_std_dir = g_std;
+    let mut t = Target.{ file: u.nosym(), dir: u.nosym(), name: u.nosym(), item: "" };
+    if not resolve(target, &mut t) {
+        return 1;
+    }
+    if not u.isnos(query) {
+        if t.item.len > 0 {
+            dg.emit_fatal(g_json, "E9001", "axiom doc --search: the root is a module or a directory, not an item");
+            return 2;
+        }
+        return search(query, &t);
+    }
+    if not u.isnos(t.dir) {
+        return list_modules(t.dir);
+    }
+    let m = load(t.file, t.name) ?? return fail("E0211", u.f1("cannot read module '%s'", target));
+    if t.item.len > 0 {
+        return show_item(m, t.item);
+    }
+    let mut b = u.Buf.init();
+    if g_json {
+        b.s("{\"schema\":\"axiom-doc/1\",\"status\":\"ok\",\"module\":");
+        module_j(&mut b, m);
+        b.s("}\n");
+    } else {
+        module_h(&mut b, m);
+    }
+    return print_buf(&mut b);
+}
+
+// -----------------------------------------------------------------------------
+// W0320: a public item without documentation
+// -----------------------------------------------------------------------------
+fn undocumented(d: *mut ast.Decl) void {
+    if not shown(d, true) {
+        return;
+    }
+    if doc_of(d).len == 0 {
+        let mut what = u.f2("%s '%s'", kind_name(d), d.name);
+        if u.notnil(d.owner) {
+            what = u.f2("method '%s.%s'", d.owner.name, d.name);
+        }
+        _ = dg.warning(d.name_span, "W0320", u.f1("public %s has no documentation", what));
+    }
+}
+
+/// W0320 for the program's own modules (those whose tests run: the root
+/// module, and the root package's modules, or outside packages those not in
+/// the standard library): each public item, and each public method of a
+/// public type, that has no documentation.
+pub fn warn_undocumented() void {
+    let root = modl.g_prog.root;
+    if u.isnil(root) {
+        return;
+    }
+    for m in modl.g_prog.modules.items() {
+        let mut own = m == root;
+        if not own {
+            if u.notnil(root.pkg) {
+                own = m.pkg == root.pkg;
+            } else {
+                own = not modl.is_std_module(m);
+            }
+        }
+        if not own {
+            continue;
+        }
+        for d in m.decls.items() {
+            undocumented(d);
+            if is_type(d) and d.is_pub {
+                for md in d.methods.items() {
+                    undocumented(md);
+                }
+            }
+        }
+    }
+}
