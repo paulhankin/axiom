@@ -3,7 +3,7 @@
    be reloaded after each call more often than the loop reads it stays in
    its slot, read where it is used (mach.ax greedy), rather than all of them
    being reloaded after every call. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmov\s+-0x[0-9a-f]+\(%rbp\),%r\w+\n | 11
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmov\s+-0x[0-9a-f]+\(%rbp\),%r\w+\n | 11
 long op_a(long x);
 long op_b(long x, long y);
 void op_c(long *p);

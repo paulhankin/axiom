@@ -8,12 +8,12 @@
    s2's, and inbody's, whose restricted pointers are a block's in the
    loop's body: each iteration another execution of it, but still
    vectorized). */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xe,%eax | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xc,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3e9,%eax | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 4
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xe,%eax | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xc,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3e9,%eax | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 4
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 2
 // lower: --target=aarch64 -O2 --c-freestanding | \bldr\s+w\d+,\s+\[x0\] | 1
 int blk(int *a, int *b) {
     int *restrict p = a;

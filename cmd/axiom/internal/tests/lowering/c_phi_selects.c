@@ -3,8 +3,8 @@
    of the new one, here cmove), and the flag `prev = f` is computed after the
    old flag's last use (sink_phi_inputs): the loop that runs once per
    element copies nothing at its back edge. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcmove\s | 4
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmov\s+%r\w+,%r\w+\n | 5
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcmove\s | 4
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmov\s+%r\w+,%r\w+\n | 5
 unsigned long walk(const unsigned long *a, unsigned long n, int *nfree) {
     int bad = 0, nf = 0;
     _Bool prev = 0;

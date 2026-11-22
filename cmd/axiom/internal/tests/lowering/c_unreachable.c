@@ -3,9 +3,9 @@
    check when the value is bounded, or the default is unreachable, and a
    jump table's; a division of a value that is not negative is unsigned
    (no sign fix-up: sar). */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bcmp\b | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bud2\b | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bsar\b | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bcmp\b | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bud2\b | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bsar\b | 0
 // lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu23 | \bcmp\b | 0
 #include <stddef.h>
 int bounded(unsigned x) { if (x > 10) unreachable(); return x > 20; }

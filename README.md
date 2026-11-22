@@ -67,8 +67,8 @@ The compiler is written in Axiom and has its own backends (WebAssembly, x86-64, 
 and linkers, so it and the programs it builds need only the C library. It builds native
 programs for Linux, Windows and macOS on Apple silicon (where it also runs, tests and
 profiles them, and links system frameworks such as AppKit, Metal and Core Audio).
-Building it from source takes the bootstrap compiler, which needs LLVM 18
-([`docs/install.md`](docs/install.md)); `node cmd/axiom/internal/tests/run.mjs` runs
+Building it from source takes a released compiler as a seed, which
+`cmd/axiom/bootstrap.sh` fetches ([`docs/install.md`](docs/install.md)); `node cmd/axiom/internal/tests/run.mjs` runs
 the test suite.
 
 ## Repository
@@ -87,7 +87,7 @@ the test suite.
 | [`docs/releasing.md`](docs/releasing.md) | How releases are made, versioned and packaged; their notes are in [`docs/releases/`](docs/releases) |
 | [`docs/security.md`](docs/security.md) | How the standard library behaves on untrusted input: its rules, defences and checks |
 | [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom: its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers; no LLVM, no C toolchain |
-| [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 with LLVM, used only to bootstrap the one above (to a fixed point) |
+| [`docs/bootstrap-chain.md`](docs/bootstrap-chain.md) | How the compiler is built from a pinned seed, and what built each release |
 | [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | The test suite: run-and-compare programs, expected compile errors, `axiom test`, packages; its `tools/` generates test data and holds the std fuzzer and benchmark |
 | [`cmd/internal/tools/`](cmd/internal/tools) | Generators of the standard library's checked-in tables (Unicode, codecs, fonts) |
 | [`std/`](std/README.md) | The standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |

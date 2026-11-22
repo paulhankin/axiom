@@ -29,9 +29,9 @@
 #                  also create a draft security advisory (the JSON body of
 #                  GitHub's "create a repository security advisory" API)
 #
-# build needs a clean tree whose compilers' version (cmd/axiom/src/version.ax,
-# cmd/axiom/bootstrap/src/version.h) is <version>, and docs/releases/<version>.md.
-# It bootstraps, runs the test suite with both compilers, the fuzzer and the
+# build needs a clean tree whose compiler's version (cmd/axiom/src/version.ax)
+# is <version>, and docs/releases/<version>.md. It bootstraps (from the seed
+# cmd/axiom/seed.toml pins, or AXIOM_SEED), runs the test suite, the fuzzer and the
 # examples (cmd/axiom/examples.sh), builds the compiler
 # for every release target, and packs each with the standard library (its
 # sources, without test data), the licenses and the release notes. The
@@ -90,11 +90,9 @@ if [ "$cmd" = release ] || [ "$cmd" = fix ]; then
     }
     set_version() {
         sed -i.bak "s/pub let VERSION: \[\]u8 = \"[0-9.]*\";/pub let VERSION: []u8 = \"$1\";/" cmd/axiom/src/version.ax
-        sed -i.bak "s/#define AXIOM_VERSION \"[0-9.]*\"/#define AXIOM_VERSION \"$1\"/" cmd/axiom/bootstrap/src/version.h
-        rm -f cmd/axiom/src/version.ax.bak cmd/axiom/bootstrap/src/version.h.bak
-        grep -q "\"$1\"" cmd/axiom/src/version.ax && grep -q "\"$1\"" cmd/axiom/bootstrap/src/version.h ||
-            die "could not set the version to $1"
-        git add cmd/axiom/src/version.ax cmd/axiom/bootstrap/src/version.h
+        rm -f cmd/axiom/src/version.ax.bak
+        grep -q "\"$1\"" cmd/axiom/src/version.ax || die "could not set the version to $1"
+        git add cmd/axiom/src/version.ax
     }
     current_version() {
         sed -n 's/^pub let VERSION: \[\]u8 = "\([0-9.]*\)";/\1/p' cmd/axiom/src/version.ax
@@ -256,8 +254,6 @@ fi
 # The version, the tree and the notes.
 grep -q "pub let VERSION: \[\]u8 = \"$v\";" cmd/axiom/src/version.ax ||
     { echo "release: cmd/axiom/src/version.ax is not version $v" >&2; exit 1; }
-grep -q "#define AXIOM_VERSION \"$v\"" cmd/axiom/bootstrap/src/version.h ||
-    { echo "release: cmd/axiom/bootstrap/src/version.h is not version $v" >&2; exit 1; }
 [ -f "docs/releases/$v.md" ] || { echo "release: no docs/releases/$v.md (release.sh notes $v)" >&2; exit 1; }
 if [ -n "$(git status --porcelain)" ]; then
     echo "release: the tree has uncommitted changes" >&2
@@ -269,9 +265,8 @@ mtime=$(git log -1 --format=%ct)
 cmd/axiom/bootstrap.sh
 A=cmd/axiom/build/axiom
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
-    # the suite with both compilers, and with the compiler as the archives
-    # have it: native code at -O2
-    node cmd/axiom/internal/tests/run.mjs
+    # the suite, and with the compiler as the archives have it: native code
+    # at -O2
     AXIOM=$A node cmd/axiom/internal/tests/run.mjs
     # (on a Mac, the native suite links cmd/axiom/internal/tests/native_rt.ax, not C)
     native_target=""

@@ -7,12 +7,12 @@
    keeps a loop that would be unrolled fully (its imul), `GCC unroll 8`
    unrolls by 8 (the element at 7 * 4 bytes). On AArch64 ivd and wide are
    vector loops (avx2 is not an extension there: C4112). */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bsetl\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmulps\s+%xmm | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bvmulps\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | cmp\s+\$0xf, | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bimul\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | 0x1c\(%rdi,%rax,4\) | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bsetl\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmulps\s+%xmm | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bvmulps\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | cmp\s+\$0xf, | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bimul\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | 0x1c\(%rdi,%rax,4\) | 1
 // lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu17 | \bfmul\s+v\d+\.4s | 2
 #pragma GCC push_options
 #pragma GCC optimize ("O0")

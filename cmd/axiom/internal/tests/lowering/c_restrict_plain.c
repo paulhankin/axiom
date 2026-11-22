@@ -13,21 +13,21 @@
    assignment (a fill, 111, or a copy, 112) through a plain pointer is apart
    from a store through a block's restricted pointer. Loops through a block's restricted pointer,
    indexed or incremented, are vectorized without an overlap check. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x15,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x1f,%eax | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x21,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x29,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x33,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3d,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x47,%eax | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x61,%eax | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x5b,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x65,%eax | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x6f,%eax | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x70,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0xb,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x15,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x1f,%eax | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x21,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x29,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x33,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x3d,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x47,%eax | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x61,%eax | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x5b,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x65,%eax | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | cmp\s+\$0xf, | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x6f,%eax | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | mov\s+\$0x70,%eax | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \bldr\s+w\d+,\s+\[x0\] | 2
 int g;
 int plain_param(int *a, int *b) {
