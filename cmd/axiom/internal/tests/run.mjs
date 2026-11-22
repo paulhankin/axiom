@@ -2206,6 +2206,35 @@ await section('spec §16.3', {
   },
 }, { timed: false });
 
+// One iterator protocol (spec §15.3): every public method named `next` in std
+// is `next(self: *mut Self) ?T` or `next(self: *mut Self) E!?T` (the end is
+// `.none`, never an error, a sentinel or a bool). A cursor read through its
+// fields names its step `advance`. A free function named `next` is not a method.
+await section('spec §15.3', {
+  'every public method named next in std is an iterator\'s': () => {
+    const exempt = new Set([]);  // 'path/to/module.ax: Type', each with the reason why
+    const problems = [];
+    for (const [f, src] of stdSrc) {
+      const rel = path.relative(root, f);
+      const lines = src.split('\n');
+      let owner = '';
+      lines.forEach((line, i) => {
+        const o = line.match(/^(?:pub )?(?:nocopy )?(?:struct|union|enum) (\w+)/);
+        if (o) owner = o[1];
+        const m = line.match(/^\s+pub fn next(\[[^\]]*\])?\((.*)$/);
+        if (!m || !/^\s/.test(line)) return;
+        let sig = m[2];
+        for (let k = i + 1; !sig.includes('{') && k < lines.length; k++) sig += ' ' + lines[k].trim();
+        sig = sig.slice(0, sig.lastIndexOf('{')).trim();
+        const p = sig.match(/^self: \*mut (\w+)(?:\.\[[^\]]*\])?\) (.*)$/);
+        const ok = p && !m[1] && (p[1] === 'Self' || p[1] === owner) && /^(?:(?:[\w.]+|\{[^}]*\})?!)?\?\S/.test(p[2]);
+        if (!ok && !exempt.has(`${rel}: ${owner}`)) problems.push(`${rel}:${i + 1}: ${owner}.next(${sig}`);
+      });
+    }
+    return problems.length ? `\n  ${problems.join('\n  ')}` : null;
+  },
+}, { timed: false });
+
 // Flags with no other assertion: each builds a program that then runs, or
 // produces the text asked for; `axiom version`; the version module's tests.
 {

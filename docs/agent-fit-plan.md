@@ -544,6 +544,71 @@ boilerplate (`loop { let x = it.next() ?? break; ... }`).
 - **D5. Keep it that way.** `run.mjs` checks that every public method named `next` in
   the library has one of the two signatures.
 
+### Status
+
+Done. The Problem above describes the tree as it was.
+
+- D2: `while let` (spec §8.4) is parsed as `loop { match e { P => { A } else => {
+  break; } } }`, so it shares `if let`'s pattern checking and lowering, and `break`,
+  `continue` and labels need nothing new; `axiom fmt` and the language server needed
+  no change. Tests: `run/while_let.ax` (labels, `break` and `continue`, nesting,
+  `defer`, a fallible `next()!`, several patterns, `return` from the body),
+  `errors/while_let_*.ax`, and a case in the formatter's `layout` test. In passing,
+  an arm whose binding is refused (an invalid scrutinee, `E0634`, `E0635`) still
+  declares it, so `if let`, `while let` and `match` add no `E0202` after the error.
+- D3: `E0412` on a `for` over a value whose type has a conforming `next` says that
+  `for` does not call `next` and has a fix writing the `while let`: `machine` for a
+  mutable variable, a pointer to the iterator or a field of one when `next` cannot
+  fail; otherwise a suggestion (with `!` for a fallible `next`), which declares
+  `let mut it = ...;` first (before the loop's label) for any other operand. The
+  `str.lines` probe of workstream A now gives one `E0412` with that suggestion; the
+  machine-fix re-check passes on `errors/for_iterator*.ax`.
+- D4: the table above, checked, missed four: `html.Children` and `xml.Elements`
+  (`NotFound` at the end), `der.Reader` (`Corrupt` at the end) and `cron.Schedule`
+  (not an iterator). Every public `next` now follows D1:
+  - Already conforming, unchanged: `str` (`Split`, `Lines`, `Fields`, `Utf8Iter`),
+    `unicode` (`Graphemes`, `Words`, `Sentences`, `linebreak.Breaks`), `net/url`
+    `Query`, `regex` `Matches`, `yaml` `Events`, `protobuf` (`Varints`, `Fixed`,
+    `Reader`), `mime` `Multipart`.
+  - Collections: `Map`, `MapDyn`, `Lru`, `LruDyn`, `TreeMap`, `TreeMapDyn` give
+    `?map.Entry.[K, V]` (`key: *K`, `value: *mut V`); `Set`, `SetDyn` and the new
+    `Map.keys()` give `?*K` (`Iter.next_key` is gone).
+  - Error or sentinel at the end, now `E!?T` or `?T`: `tar`, `csv`, `der`, `xml`
+    `Reader` (`TokenKind.END_DOCUMENT` removed), `html` `Tokenizer` (`EOF` is now the
+    tree builder's alone), `x509` `PemIter`; and, as nothing else can fail, `?T`:
+    `cookie` `Pairs`, `os/path` `Elements`, `xml` `Elements`, `html` `Children`.
+    `Done` left `TarError`, `CsvError`, `DerError`, `CookieError`, `OsPathError` and
+    `FsError` (it was in the last only to pass on `os/path`'s).
+  - Cursors: the `html` and `markdown` `Walker`s' step is `advance`.
+  - `cron.Schedule.next` and `prev`, which take a time and are not iterators, became
+    `next_utc` and `prev_utc`, beside `next_in` and `prev_in`.
+  - Callers updated in std, `examples/`, the tests and the docs; 119 loops in std,
+    `examples/` and the tests became `while let` (none in the compiler's sources or
+    the std modules it imports, which the seed builds). The compiler itself calls
+    none of the changed methods.
+  - `cmd/axiom/bench/hashmap.ax`: its machine code is the same before and after (the
+    binaries differ only in stack-trace source text); CPU time, median of 21
+    alternating runs, 201 ms before and 205 ms after, which is noise on this shared
+    machine. A loop over a million-entry map, 400 times: `main` is the same
+    instructions with `next(&mut k, &mut v)` and with `?Entry` (the entry is kept in
+    registers), 1447 ms and 1460 ms.
+- D5: `run.mjs` (section `spec §15.3`) checks every public method named `next` in
+  std; no exemption was needed (the free function `next` in `std/c/rt/dfp.ax` is not
+  a method).
+
+Decided, where the plan left a choice:
+
+- `Map.iter` (and `Lru`'s and `TreeMap`'s) take `*mut Self`, since the entries hold
+  `*mut V`; `Map.keys()` iterates through `*Self`. `Lru` and `TreeMap` reuse
+  `map.Entry`; `lru.Entry` stays the by-value entry that `put`, `remove` and
+  `pop_lru` give back.
+- `der.Reader.next()` iterates the elements of a constructed value; `element()`
+  reads one whatever its tag, for code that knows the structure.
+
+Left: several std error sets still list a `Done` that nothing returns any more
+(`X509Error`, `TlsError`, `HtmlError`, `FmtError`, `JsonError` and others); taking
+it out changes their exhaustive matches, which is separate work.
+
 ### Decided
 
 `for` does not drive iterators (D3). It is what an agent writes first, and the D3 fix

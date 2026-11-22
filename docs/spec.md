@@ -325,7 +325,7 @@ AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
                 | "&=" | "|=" | "^=" | "<<=" | ">>="
 
 IfStmt        ::= "if" ( Expr | "let" Patterns "=" Expr ) Block ( "else" ( IfStmt | Block ) )?
-WhileStmt     ::= Label? "while" Expr Block
+WhileStmt     ::= Label? "while" ( Expr | "let" Patterns "=" Expr ) Block
 LoopStmt      ::= Label? "loop" Block
 ForStmt       ::= Label? "for" ( "&" "mut"? )? IDENT "in" Expr ( ".." Expr )? Block
 Label         ::= IDENT ":"
@@ -1278,6 +1278,23 @@ if let .some(v) = opt {
 `while cond { … }` evaluates `cond` before each iteration. `loop { … }` repeats until it
 reaches a `break` or `return`.
 
+`while let P = e { A }` evaluates `e` before each iteration and tests it against the
+patterns `P`, as `if let` does (§8.3): it is exactly
+`loop { match e { P => { A } else => { break; } } }`. The loop ends the first time `e`
+does not match; a binding is in scope in `A` only, and `break` and `continue` in `A`
+apply to the loop (a label names it, as for `while`). It is how an iterator (§15.3) is
+driven; the call to `next` is written out:
+
+```axiom
+let mut lines = str.lines(text);
+while let .some(line) = lines.next() {
+    count += 1;
+}
+while let .some(ev) = events.next()! {   // a fallible iterator: E!?T
+    handle(ev);
+}
+```
+
 ### 8.5 `for`
 
 `for` has two forms:
@@ -1294,6 +1311,13 @@ reaches a `break` or `return`.
    - `for &mut x in s` binds `x: *mut T` pointing to each element; `s` must be `[]mut T`
      or a mutable array place (`E0701` / `E0704` otherwise).
    By-reference `for &` / `for &mut` is not allowed on ranges `lo..hi` (`E0706`).
+
+`for` makes no call: it does not drive an iterator (a value with a `next` method,
+§15.3), which is written `while let .some(x) = it.next() { … }` (§8.4). A `for` over
+one is `E0412`, with a fix that writes that loop: `machine` when the operand is a
+mutable variable or a pointer to the iterator (or a field of one) and `next` cannot
+fail, otherwise a suggestion, which first declares a `let mut` variable for an operand
+that is not such a place.
 
 `break` and `continue` apply to the innermost loop, unless they name a label. A loop
 may be labeled, `rows: for r in 0..n { … }`, and `break rows;` or `continue rows;`
@@ -2758,6 +2782,39 @@ included, unless it uses a shared library (the system's C library among them: a 
 function that neither the program nor the compiler's C library defines), in which case
 the compiler's linker links it dynamically against those (docs/c.md, "Objects and
 libraries").
+
+### 15.3 Iterators
+
+The standard library's iterators have one protocol. An iterator is a struct with a
+method
+
+```axiom
+pub fn next(self: *mut Self) ?T      // or E!?T, if producing an item can fail
+```
+
+that returns the next item, and `.none` when there are no more (and after that). The
+end is never an error, a sentinel value or a `bool`. The loop that drives one is
+`while let` (§8.4); `for` makes no call, so it does not drive an iterator (§8.5):
+
+```axiom
+let mut it = str.split(line, ",");
+while let .some(field) = it.next() {
+    ...
+}
+let mut r = tar.Reader.init(bytes);
+while let .some(entry) = r.next()! {     // fails with the archive's TarError
+    ...
+}
+```
+
+The collections' iterators give entries of pointers into the collection, so nothing is
+copied: `Map`, `Lru` and `TreeMap` (and their `Dyn` forms) give
+`map.Entry.[K, V]`, with `key: *K` and `value: *mut V` (a value may be changed
+through it; adding or removing entries while iterating is not allowed), from `iter`,
+which takes `*mut Self`; `Set` and `Map.keys` give `*K`. A cursor that is read
+through its fields, such as the HTML and Markdown tree walkers, names its step
+`advance`, not `next`. The test suite checks that every public method named `next`
+in the library has one of the two signatures.
 
 ---
 
