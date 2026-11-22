@@ -709,6 +709,12 @@ pub const F_BTR: i32 = 16777216;   // a y >> k that its only user, an & 1 tested
 
 pub const F_CSKIP: i32 = 33554432;  // a p <u q, its zero-extension or a y +/- w that its only user computes (F_ADC)
 pub const F_ADC: i32 = 67108864;    // x + (p <u q) or x - (p <u q): cmp p, q; adc / sbb (mark_carry)
+// The overflow of an operation tested by the branch of its block (whose
+// jump reads the operation's own flags: cond_code), and the operation and
+// the parts of the test it computes there (mark_overflow); a product beside
+// a multiplication's overflow that the overflow's multiply gives.
+pub const F_OVBR: i32 = 536870912;
+pub const F_OVPART: i32 = 1073741824;
 
 // Is s a 1 << k that v (an xor or or) computes as btc or bts: one it
 // computes alone (F_BTX), or one computed for other users too?
@@ -893,6 +899,14 @@ pub fn branch_tree(c: *mut ir.Value, t: i32, f: i32, next: i32) void {
 }
 
 pub fn cond_code(c: *mut ir.Value) i32 {
+    if (c.kind == ir.V_INST) and ((c.flag & F_OVBR) != 0) and (c.blk == xsl.S.ib) {
+        // (the branch of c's block: its operation sets the flags it tests)
+        let cc = ov_flags(c);
+        if c.nuses > 1 {
+            xsl.materialize_cc(xsl.vreg(c), cc);  // (for its users elsewhere)
+        }
+        return cc;
+    }
     if (c.kind == ir.V_INST) and (c.op == ir.OP_TRUNC) and ((c.flag & F_BTR) != 0) {
         let sh = c.a;
         _ = xsl.e2(xe.BT, @truncate(u8, @as(u32, @bit_cast(u32, sh.ty.bits / 8))), xsl.R(xsl.reg(sh.a)),
@@ -2235,6 +2249,278 @@ pub fn gen_cmpxchg(v: *mut ir.Value) void {
 }
 
 // -----------------------------------------------------------------------------
+// Overflow from the flags
+// -----------------------------------------------------------------------------
+// The plain product of a multiplication's overflow i (the same operands)
+// that i's multiply gives (F_OVPART; mark_overflow puts it in i's block and
+// its id + 1 in i.aux2), or nil.
+pub fn paired_mul(i: *mut ir.Value) *mut ir.Value {
+    if i.aux2 == 0 {
+        return u.nil.[ir.Value]();
+    }
+    let mut j = i.blk.first;
+    while u.notnil(j) {
+        if (@as(i64, j.id) + 1) == i.aux2 {
+            return j;
+        }
+        j = j.next;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// The multiply of a multiplication's overflow i (IN_UMUL_OV, IN_SMUL_OV of
+// 8 to 64 bits), its product in the register of the plain product beside
+// it (paired_mul) if there is one: the condition code that is true when it
+// overflows. imul r, r (16 bits and more) sets OF when the signed product
+// does not fit, mul (32 and 64 bits; rdx:rax) CF when the high half is not
+// 0; one-operand mul and imul of 8 bits leave the product in ax (and set
+// CF, OF the same way), touching no other register; 16 bits unsigned:
+// products of the zero-extended operands, above 0xffff.
+fn mul_ov_flags(i: *mut ir.Value) i32 {
+    let a = i.xs.get(0);
+    let b = i.xs.get(1);
+    let signed = ir.intr_id(i) == ir.IN_SMUL_OV;
+    let bits = a.ty.bits;
+    let sz = @truncate(u8, @as(u32, @bit_cast(u32, bits / 8)));
+    let m = paired_mul(i);
+    let mut d: i32 = 0;
+    if u.notnil(m) {
+        d = xsl.vreg(m);
+    } else {
+        d = xsl.vgpr();
+    }
+    if signed and (bits >= 16) {
+        let ra = xsl.reg(a);
+        let rb = xsl.reg(b);
+        xsl.copy(d, ra, xsl.GPR);
+        _ = xsl.e2(xe.IMUL, sz, xsl.RW(d), xsl.R(rb));
+        return xe.CC_O;
+    }
+    if not signed and (bits == 16) {
+        let za = reg_ext(a, false);
+        let zb = reg_ext(b, false);
+        xsl.copy(d, za, xsl.GPR);
+        _ = xsl.e2(xe.IMUL, 4, xsl.RW(d), xsl.R(zb));
+        _ = xsl.alu(xe.ALU_CMP, 4, xsl.R(d), xsl.I(0xffff));
+        return xe.CC_A;
+    }
+    let ra = xsl.reg(a);
+    let rb = xsl.reg(b);
+    _ = xsl.e2(xe.MOV_RR, 8, xsl.W(xe.RAX), xsl.R(ra));
+    let mut hi = xsl.W(xe.RDX);
+    if bits == 8 {
+        hi = xsl.NONE();
+    }
+    let k = xsl.e4(xe.DIV, sz, xsl.RW(xe.RAX), hi, xsl.R(rb), xsl.NONE());
+    k.cc = 4;
+    if signed {
+        k.cc = 5;
+    }
+    xsl.copy(d, xe.RAX, xsl.GPR);
+    if signed {
+        return xe.CC_O;
+    }
+    return xe.CC_B;
+}
+
+// The add or sub whose overflow condition c is, as the idioms of checked
+// arithmetic test it (cgbase.ax: op_with_overflow), or nil; *cc the
+// condition code that is c after that add or sub. Signed: the and of two
+// xors (of the operands and the result) is negative, OF; unsigned: the sum
+// below an operand, the minuend below the subtrahend, CF (a sub found in
+// c's block or one it dominates; marked: one mark_overflow moved there).
+pub fn ov_match(c: *mut ir.Value, cc: *mut i32, marked: bool) *mut ir.Value {
+    let none = u.nil.[ir.Value]();
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.a.ty.kind != ir.T_INT) or not ir.mul_ov_width(c.a.ty) {
+        return none;
+    }
+    let p = ir.pred_of(c);
+    let x = c.a;
+    let y = c.b;
+    if is.is_c(y) and ir.is_op(x, ir.OP_AND) {
+        let k = is.cval(y);
+        let neg = ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1));
+        let pos = ((p == ir.IntSGE) and (k == 0)) or ((p == ir.IntSGT) and (k == -1));
+        if not neg and not pos {
+            return none;
+        }
+        cc.* = xe.CC_O;
+        if pos {
+            cc.* = xe.CC_NO;
+        }
+        if not ir.is_op(x.a, ir.OP_XOR) or not ir.is_op(x.b, ir.OP_XOR) {
+            return none;
+        }
+        // (l ^ v) & (r ^ v) for v = l + r; (l ^ r) & (l ^ v) for v = l - r
+        for k2 in @as(usize, 0)..2 {
+            let mut p1 = x.a;
+            let mut p2 = x.b;
+            if k2 == 1 {
+                p1 = x.b;
+                p2 = x.a;
+            }
+            for k1 in @as(usize, 0)..2 {
+                let mut v = p1.a;
+                let mut l = p1.b;
+                if k1 == 1 {
+                    v = p1.b;
+                    l = p1.a;
+                }
+                if ir.is_op(v, ir.OP_ADD) and (v.ty == x.ty) and
+                   (((v.a == l) and xor_of(p2, v.b, v)) or ((v.b == l) and xor_of(p2, v.a, v))) {
+                    return v;
+                }
+                if ir.is_op(v, ir.OP_SUB) and (v.ty == x.ty) and (v.a == l) and xor_of(p2, v.a, v.b) {
+                    return v;
+                }
+            }
+        }
+        return none;
+    }
+    // v <u l (v = l + r); l <u r (v = l - r); and those swapped or negated
+    let mut lo = x;
+    let mut hi = y;
+    let mut below = true;
+    if p == ir.IntUGT {
+        lo = y;
+        hi = x;
+    } else if p == ir.IntUGE {
+        below = false;
+    } else if p == ir.IntULE {
+        lo = y;
+        hi = x;
+        below = false;
+    } else if p != ir.IntULT {
+        return none;
+    }
+    cc.* = xe.CC_B;
+    if not below {
+        cc.* = xe.CC_AE;
+    }
+    if ir.is_op(lo, ir.OP_ADD) and ((lo.a == hi) or (lo.b == hi)) and not is.is_c(hi) {
+        return lo;
+    }
+    if is.is_c(lo) or is.is_c(hi) or (lo.kind == ir.V_GLOBAL) {
+        return none;
+    }
+    if marked {
+        // (moved to c's block: mark_overflow)
+        let mut j = c.blk.first;
+        while u.notnil(j) {
+            if ((j.flag & F_OVPART) != 0) and is_binop_of(j, ir.OP_SUB, lo, hi, false) {
+                return j;
+            }
+            j = j.next;
+        }
+        return none;
+    }
+    return find_op(ir.OP_SUB, lo, hi, false, c.blk);
+}
+
+// Is v the operation op of x and y (or of y and x, if comm)?
+pub fn is_binop_of(v: *ir.Value, op: i32, x: *ir.Value, y: *ir.Value, comm: bool) bool {
+    return ir.is_op(v, op) and (v.ty == x.ty) and (((v.a == x) and (v.b == y)) or (comm and (v.a == y) and (v.b == x)));
+}
+
+// An operation op of x and y (or y and x, if comm), unmarked, in block b
+// or in a block b dominates; or nil. (Through the uses of an operand that
+// is an instruction; else a look through the blocks b dominates.)
+pub fn find_op(op: i32, x: *mut ir.Value, y: *mut ir.Value, comm: bool, b: *mut ir.Block) *mut ir.Value {
+    let mut w = x;
+    if x.kind != ir.V_INST {
+        w = y;
+    }
+    if w.kind == ir.V_INST {
+        let mut q = w.first_use;
+        while u.notnil(q) {
+            let s = ir.use_user(q);
+            if is_binop_of(s, op, x, y, comm) and (s.flag == 0) and ((s.blk == b) or dominates(b, s.blk)) {
+                return s;
+            }
+            q = q.next;
+        }
+        return u.nil.[ir.Value]();
+    }
+    let mut stack = u.List.[*mut ir.Block].empty();
+    defer stack.deinit();
+    stack.push(b);
+    let mut budget: i32 = 4096;
+    while (stack.len > 0) and (budget > 0) {
+        let d = stack.pop();
+        let mut j = d.first;
+        while u.notnil(j) {
+            if is_binop_of(j, op, x, y, comm) and (j.flag == 0) {
+                return j;
+            }
+            budget -= 1;
+            j = j.next;
+        }
+        for k in 0..d.dom_kids.len {
+            stack.push(d.dom_kids.get(k));
+        }
+    }
+    return u.nil.[ir.Value]();
+}
+
+// Does block a dominate block b (the dominator tree of opt.dominators)?
+pub fn dominates(a: *ir.Block, b: *mut ir.Block) bool {
+    let mut x = b;
+    let mut k: i32 = 0;
+    while u.notnil(x) and (k < 100000) {
+        if x == a {
+            return true;
+        }
+        if x.idom == x {
+            return false;
+        }
+        x = x.idom;
+        k += 1;
+    }
+    return false;
+}
+
+// Is p the xor of x and y (either order)?
+fn xor_of(p: *ir.Value, x: *ir.Value, y: *ir.Value) bool {
+    return ((p.a == x) and (p.b == y)) or ((p.a == y) and (p.b == x));
+}
+
+// The flags of overflow condition c (F_OVBR) from its operation, computed
+// here (at the end of c's block) into the register of the value it gives
+// too: the condition code that is c.
+pub fn ov_flags(c: *mut ir.Value) i32 {
+    if ir.is_mul_ov(c) {
+        return mul_ov_flags(c);
+    }
+    let mut cc: i32 = 0;
+    let v = ov_match(c, &mut cc, true);
+    let mut a = v.a;
+    let mut b = v.b;
+    if (v.op == ir.OP_ADD) and is.is_c(a) {
+        a = v.b;
+        b = v.a;
+    }
+    let sz = @truncate(u8, @as(u32, @bit_cast(u32, v.ty.bits / 8)));
+    let d = xsl.vreg(v);
+    if is.is_c(a) and is.fits32(is.cval(a)) {
+        _ = xsl.e2(xe.MOV_RI, xsl.isz(v.ty), xsl.W(d), xsl.I(is.cval(a)));
+    } else {
+        let ra = xsl.reg(a);
+        xsl.copy(d, ra, xsl.GPR);
+        mc.hint(xc.FN.mf, d, ra);
+    }
+    let mut o = xe.ALU_ADD;
+    if v.op == ir.OP_SUB {
+        o = xe.ALU_SUB;
+    }
+    if xsl.imm_ok(b) {
+        _ = xsl.alu(o, sz, xsl.RW(d), xsl.I(is.cval(b)));
+    } else {
+        _ = xsl.alu(o, sz, xsl.RW(d), xsl.R(xsl.reg(b)));
+    }
+    return cc;
+}
+
+// -----------------------------------------------------------------------------
 // Integer intrinsics
 // -----------------------------------------------------------------------------
 pub fn gen_int_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
@@ -2242,20 +2528,7 @@ pub fn gen_int_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
     let d = xsl.vreg(v);
     let a0 = v.xs.get(0);
     if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
-        // the flags of the 64-bit multiply: mul sets CF (and OF) when the
-        // high half is nonzero, imul sets OF when the product does not fit
-        let b = xsl.reg(v.xs.get(1));
-        if id == ir.IN_UMUL_OV {
-            _ = xsl.e2(xe.MOV_RR, 8, xsl.W(xe.RAX), xsl.R(xsl.reg(a0)));
-            let i = xsl.e4(xe.DIV, 8, xsl.RW(xe.RAX), xsl.W(xe.RDX), xsl.R(b), xsl.NONE());
-            i.cc = 4;
-            xsl.materialize_cc(d, xe.CC_B);
-        } else {
-            let p = xsl.vgpr();
-            xsl.copy(p, xsl.reg(a0), xsl.GPR);
-            _ = xsl.e2(xe.IMUL, 8, xsl.RW(p), xsl.R(b));
-            xsl.materialize_cc(d, xe.CC_O);
-        }
+        xsl.materialize_cc(d, mul_ov_flags(v));
         return;
     }
     if (id == ir.IN_UMULH) or (id == ir.IN_SMULH) {

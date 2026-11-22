@@ -306,6 +306,9 @@ fn gen_inst_at(v: *mut ir.Value) void {
            xis.F_BTR) | xis.F_CSKIP) | xsl.F_FMNEG)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
+    if (v.flag & (xis.F_OVBR | xis.F_OVPART)) != 0 {
+        return;  // (computed with an overflow: at its branch, or with its multiply)
+    }
     if (v.flag & 64) != 0 {
         xsd.gen_blend(v);
         return;
@@ -815,6 +818,7 @@ fn prepare(f: *mut ir.Func) void {
     if not tg.has(tg.X_LZCNT) {
         mark_bsr(f);
     }
+    mark_overflow(f);  // (after the others: it takes only what they left alone)
     // consecutive stores of constants filling memory: vector stores (after
     // mark_fused_vectors, which clears aux2)
     b = f.first;
@@ -1099,6 +1103,137 @@ fn mark_carry(i: *mut ir.Value) void {
     if (x.kind == ir.V_INST) and (x.op == i.op) and (x.nuses == 1) and (x.blk == i.blk) and (x.flag == 0) and
        (x.ty == i.ty) and plain_operand(x.a) and plain_operand(x.b) {
         x.flag = x.flag | xis.F_CSKIP;
+    }
+}
+
+// Overflow from the flags. A multiplication's overflow (IN_UMUL_OV,
+// IN_SMUL_OV) and the plain product of the same operands (one it dominates,
+// or one before it in its block) are one multiply: the product moves next
+// to the overflow and is marked F_OVPART (xis.paired_mul). A condition that
+// is an overflow, an intrinsic's or the idiom of an add's or sub's
+// (xis.ov_match), that the branch of its block tests, with nothing else in
+// the block reading it or the operation's result: the operation is
+// computed at the branch, whose jump reads its flags (F_OVBR: the
+// condition, set up by xis.cond_code; F_OVPART: the operation and the
+// parts of the idiom). `seto; movzx; test; jne` becomes `jo`; `lea; xor;
+// xor; test; jl` becomes `add; jo`.
+fn mark_overflow(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let nx = i.next;
+            if ir.is_mul_ov(i) and (i.xs.len == 2) and ir.mul_ov_width(i.xs.get(0).ty) and (i.flag == 0) {
+                pair_mul_ov(i);
+            }
+            i = nx;
+        }
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) {
+            mark_ov_branch(b, t);
+        }
+        b = b.next;
+    }
+}
+
+// Is every use of v outside block b, but for phis (which read at the end
+// of a predecessor) and except (a part of) the condition b's branch tests?
+fn used_after(v: *mut ir.Value, b: *mut ir.Block, skip1: *ir.Value, skip2: *ir.Value) bool {
+    let t = ir.terminator(b);
+    let mut q = v.first_use;
+    while u.notnil(q) {
+        let s = ir.use_user(q);
+        if (s.blk == b) and (s.op != ir.OP_PHI) and (s != t) and (s != skip1) and (s != skip2) {
+            return false;
+        }
+        q = q.next;
+    }
+    return true;
+}
+
+fn pair_mul_ov(i: *mut ir.Value) void {
+    let a = i.xs.get(0);
+    let b = i.xs.get(1);
+    let ib = i.blk;
+    // the plain product: in i's block, or in one i dominates
+    let m = xis.find_op(ir.OP_MUL, a, b, true, ib);
+    let t = ir.terminator(ib);
+    let branch = u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a == i) and (t.t1 != t.t2) and used_after(i, ib, t, t);
+    if branch and (u.isnil(m) or used_after(m, ib, t, t)) {
+        // computed at the branch (its result, if any, read after the block)
+        i.flag = i.flag | xis.F_OVBR;
+    }
+    if u.isnil(m) {
+        return;
+    }
+    if (m.blk == ib) and before_in_block(m, i) and ((i.flag & xis.F_OVBR) == 0) {
+        unlink_inst(i);
+        ir.insert_before(m.next, i);  // (i reads only what m reads)
+    } else {
+        unlink_inst(m);
+        ir.insert_before(i.next, m);  // (what m reads is there for i; what reads m comes after it)
+    }
+    m.flag = m.flag | xis.F_OVPART;
+    i.aux2 = @as(i64, m.id) + 1;
+}
+
+fn before_in_block(x: *ir.Value, y: *ir.Value) bool {
+    let mut j = x.next;
+    while u.notnil(j) {
+        if j == y {
+            return true;
+        }
+        j = j.next;
+    }
+    return false;
+}
+
+// The add or sub whose overflow b's branch t tests (xis.ov_match), with
+// its result read only after b (and by the test): computed at the branch.
+fn mark_ov_branch(b: *mut ir.Block, t: *mut ir.Value) void {
+    let c = t.a;
+    if (c.kind != ir.V_INST) or (c.blk != b) or (c.op != ir.OP_ICMP) or ((c.flag & ~(2 | xis.F_VALUE)) != 0) or
+       not used_after(c, b, t, t) {
+        return;
+    }
+    let mut cc: i32 = 0;
+    let v = xis.ov_match(c, &mut cc, false);
+    if u.isnil(v) or (v.flag != 0) or ((v.blk != b) and not xis.dominates(b, v.blk)) {
+        return;
+    }
+    let x = c.a;
+    let signed = ir.is_op(x, ir.OP_AND) and is.is_c(c.b);
+    if signed {
+        // (the and and its xors, read only there)
+        if (x.nuses != 1) or (x.blk != b) or ((x.flag & ~4) != 0) or (x.a.nuses != 1) or (x.b.nuses != 1) or
+           (x.a.blk != b) or (x.b.blk != b) or (x.a.flag != 0) or (x.b.flag != 0) {
+            return;
+        }
+        if not used_after(v, b, x.a, x.b) {
+            return;
+        }
+    } else if not used_after(v, b, c, c) {
+        return;
+    }
+    let ops: [2]*mut ir.Value = [v.a, v.b];
+    for o in ops {
+        if (o.kind == ir.V_INST) and ((o.flag & 8) != 0) and (o.nuses == 1) {
+            o.flag = o.flag & ~8;  // (a load folded into v: read where it is)
+        }
+        if not plain_operand(o) {
+            return;
+        }
+    }
+    if v.blk != b {
+        unlink_inst(v);
+        ir.insert_before(t, v);
+    }
+    c.flag = (c.flag & ~2) | xis.F_OVBR;
+    v.flag = v.flag | xis.F_OVPART;
+    if signed {
+        x.flag = xis.F_OVPART;
+        x.a.flag = xis.F_OVPART;
+        x.b.flag = xis.F_OVPART;
     }
 }
 
