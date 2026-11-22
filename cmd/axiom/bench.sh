@@ -1,25 +1,25 @@
 #!/bin/sh
-# Measures the quality of the compiler's generated code against
-# LLVM's:
-#   - the compiler built by the bootstrap compiler (LLVM, -O2) and the compiler
-#     built by itself (stage 2) have the same source, so the ratio of their
-#     running times on the same job is the speed of our code relative to
-#     LLVM's. (bootstrap.sh builds stage 1 at -O0 to save a minute, so this
-#     script builds its own LLVM reference at -O2.)
-#   - the programs in cmd/axiom/bench/ (loops over arrays, hashing, sorting,
-#     floating point, the allocator: alloc_*, some with threads) built by the
-#     bootstrap compiler (LLVM) and by stage 2, -O2.
-# Needs cmd/axiom/bootstrap.sh, and a Linux x86-64 or AArch64 machine (the
-# bootstrap compiler builds native code there only). cmd/axiom/bench/layouts.py
-# instead compares the code of two builds of this compiler, on these programs
-# and the C ones in cmd/axiom/bench/c/, over several code layouts.
+# Measures the code of the compiler just built (cmd/axiom/build/axiom2,
+# stage 2 of bootstrap.sh) against that of another build of the compiler,
+# BASE: an earlier commit's, a release's or the seed's.
+#   - Each compiles the compiler's sources into a compiler of its own; the
+#     two results do the same job (compiling the sources again), so the ratio
+#     of their running times is the speed of this build's code relative to
+#     BASE's.
+#   - The programs in cmd/axiom/bench/ (loops over arrays, hashing, sorting,
+#     floating point, the allocator: alloc_*, some with threads) are built by
+#     both at -O2; their outputs must be the same.
+# Needs cmd/axiom/bootstrap.sh, and BASE to accept the language the sources
+# are written in. cmd/axiom/bench/layouts.py compares the code of two builds
+# too, on these programs and the C ones in cmd/axiom/bench/c/, over several
+# code layouts.
 #
-#   cmd/axiom/bench.sh [runs]      (default 3; the best run counts)
+#   BASE=<compiler> cmd/axiom/bench.sh [runs]      (default 3; the best run counts)
 set -eu
 cd "$(dirname "$0")/../.."
 RUNS=${1:-3}
 B=cmd/axiom/build
-C=cmd/axiom/bootstrap/build/axiom
+[ -n "${BASE:-}" ] && [ -x "$BASE" ] || { echo "bench: set BASE to the compiler to compare with" >&2; exit 2; }
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
@@ -38,27 +38,28 @@ best() {
     echo $b
 }
 
-echo "building the LLVM reference compiler at -O2 (about a minute)"
-$C build cmd/axiom/src/main.ax --target=native -O2 -o $T/llvm
+echo "building the compiler with each"
+"$BASE" build cmd/axiom/src/main.ax --std=std --target=native -O2 -o $T/base
+$B/axiom2 build cmd/axiom/src/main.ax --target=native -O2 -o $T/self
 for job in "-O0 --units=program" "-O2"; do
     # shellcheck disable=SC2086
-    a=$(best $T/llvm build cmd/axiom/src/main.ax --target=native $job -o $T/x)
+    a=$(best $T/base build cmd/axiom/src/main.ax --target=native $job -o $T/x)
     # shellcheck disable=SC2086
-    b=$(best $B/axiom2 build cmd/axiom/src/main.ax --target=native $job -o $T/y)
-    echo "compile the compiler $job: llvm-built ${a} ms, self-built ${b} ms, ratio $(ratio $a $b)"
+    b=$(best $T/self build cmd/axiom/src/main.ax --target=native $job -o $T/y)
+    echo "compile the compiler $job: base-built ${a} ms, self-built ${b} ms, ratio $(ratio $a $b)"
 done
-echo "size: llvm-built $(wc -c < $T/llvm) bytes, self-built $(wc -c < $B/axiom2) bytes"
+echo "size: base-built $(wc -c < $T/base) bytes, self-built $(wc -c < $T/self) bytes"
 
 for f in cmd/axiom/bench/*.ax; do
     n=$(basename "$f" .ax)
     [ "$n" = common ] && continue
-    $C build "$f" --target=native -O2 -o "$T/llvm_$n"
+    "$BASE" build "$f" --std=std --target=native -O2 -o "$T/base_$n"
     $B/axiom2 build "$f" --target=native -O2 -o "$T/self_$n"
-    if [ "$("$T/llvm_$n")" != "$("$T/self_$n")" ]; then
+    if [ "$("$T/base_$n")" != "$("$T/self_$n")" ]; then
         echo "$n: DIFFERENT OUTPUT" >&2
         exit 1
     fi
-    a=$(best "$T/llvm_$n")
+    a=$(best "$T/base_$n")
     b=$(best "$T/self_$n")
-    echo "bench $n: llvm ${a} ms, self ${b} ms, ratio $(ratio $a $b)"
+    echo "bench $n: base ${a} ms, self ${b} ms, ratio $(ratio $a $b)"
 done

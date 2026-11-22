@@ -6,8 +6,8 @@
    implied's `x > 5` after `x > 10` and flagged's `f`, a phi of
    constants, after the test of q in between (whose test is copied: 2 of
    them, and 1 test of x in flagged). */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \btest\s+%r\w+,%r\w+ | 7
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \btest\s+%edi,%edi | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \btest\s+%r\w+,%r\w+ | 7
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \btest\s+%edi,%edi | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \bcmp\s+x\d+, #0x0 | 7
 struct node { struct node *l, *r; int h; };
 static int ht(const struct node *t) { return t ? t->h : 0; }

@@ -3,9 +3,9 @@
    longer alive, 6.2.4p6; tailrec.ax mark_frame_dead), at -O2; while such an
    object is alive (the function's body's, or the call in its block) the
    call keeps the frame. */
-// lower-selfhost: --target=native -O2 --c-freestanding | leave\n\s+\w+:\s+jmp\s | 1
-// lower-selfhost: --target=native -O2 --c-freestanding | \bcall\s | 5
-// lower-selfhost: --target=native -O1 --c-freestanding | leave\n\s+\w+:\s+jmp\s | 0
+// lower: --target=native -O2 --c-freestanding | leave\n\s+\w+:\s+jmp\s | 1
+// lower: --target=native -O2 --c-freestanding | \bcall\s | 5
+// lower: --target=native -O1 --c-freestanding | leave\n\s+\w+:\s+jmp\s | 0
 // lower: --target=aarch64 -O2 --c-freestanding | \sb\s+\w+ <bt> | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \sbl\s+\w+ <bt> | 5
 struct cont { int node; const struct cont *next; };

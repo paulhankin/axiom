@@ -4,7 +4,7 @@
    destination is read while t is built), and `zero` fills r itself, with
    no copy of a filled temporary. Copy and fill loops on x86-64 align their
    destinations (and $63); on AArch64 a copy loop loads with LDP. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | and\s+\$0x3f, | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | and\s+\$0x3f, | 2
 // lower: --target=aarch64 -O2 --c-freestanding | \bldp\s+q\d+, q\d+, \[x\d+\], #64 | 1
 typedef struct { int n; unsigned d[400]; } big;
 static big G, H;

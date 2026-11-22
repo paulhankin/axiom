@@ -10,8 +10,6 @@
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
 //   // linux-only              natively, skip on macOS and Windows targets
-//   // selfhost-only: <why>    skip with the bootstrap compiler (whose LLVM differs:
-//                              it folds an integer round trip of a pointer, say)
 //   // x86-64-flags: --cpu=x86-64  extra flags for a native build on an x86-64 host
 //   // wasm-flags: --features=+tail-call  extra flags for a WebAssembly build
 //   // link: file.c            C source (next to the test) compiled and linked in
@@ -19,6 +17,9 @@
 //
 // Usage: node cmd/axiom/internal/tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program] [-g]
 //                                            [--list] [--verbose]
+//
+// The compiler tested is cmd/axiom/build/axiom (cmd/axiom/bootstrap.sh builds
+// it), or $AXIOM.
 //
 // --list prints the names of the tests that would run; --verbose names the
 // tests skipped and why. Environment: AXIOM_TEST_JOBS (tests run at a time;
@@ -45,7 +46,7 @@ import { checkPE, checkPEFile } from './pe.mjs';
 import { loadImage, checkDebug, checkEhFrame, readEhFrame, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt, locList, evalComputed, evalTyped } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
-const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
+const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/build/axiom'));
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
 // Cross testing: AXIOM_NATIVE_TARGET=aarch64 AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
@@ -92,7 +93,7 @@ const runTimeout = (process.env.AXIOM_NATIVE_EXEC ? 4 : 1) * 120000;
 const jobs = Math.max(1, Number(process.env.AXIOM_TEST_JOBS) || os.availableParallelism());
 const skipPlatform = !!process.env.AXIOM_TEST_SKIP_PLATFORM && process.env.AXIOM_TEST_SKIP_PLATFORM !== '0';
 // The compiler checks that the optimized IR's instructions come after their
-// operands (cmd/axiom/README.md; the bootstrap compiler ignores it).
+// operands (cmd/axiom/README.md).
 process.env.AXIOM_CHECK_IR ??= '1';
 // Emulated tests run several times slower, and tests sharing the CPUs
 // slower too: give each test a minute.
@@ -127,7 +128,7 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmFlags: [], wasmOnly: false, nativeOnly: false, linuxOnly: false, selfhostOnly: null, links: [], header: null };
+  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmFlags: [], wasmOnly: false, nativeOnly: false, linuxOnly: false, links: [], header: null };
   for (const [i, line] of src.split('\n').entries()) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
@@ -140,7 +141,6 @@ function directives(src) {
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
     else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
     else if (/\/\/ linux-only\b/.test(line)) d.linuxOnly = true;
-    else if ((m = line.match(/\/\/ selfhost-only\b:? ?(.*)$/))) d.selfhostOnly = m[1] || 'not for the bootstrap compiler';
     else if ((m = line.match(/\/\/ link: (\S+)/))) d.links.push(m[1]);
     else if ((m = line.match(/\/\/ header: (\S+)/))) d.header = m[1];
   }
@@ -373,11 +373,6 @@ const byFile = (list, tag, fn) => Object.fromEntries(list.map((f) => [`${path.re
 const hostRun = (out) => (native ? spawnExe(out, [], { encoding: 'utf8' })
   : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' }));
 const targetFlags = native ? [nativeTarget] : [];
-let isBootstrapCompiler = null;
-const bootstrapCompiler = () => {
-  if (isBootstrapCompiler === null) isBootstrapCompiler = /bootstrap/.test(spawnSync(compiler, ['version'], { encoding: 'utf8' }).stdout);
-  return isBootstrapCompiler;
-};
 
 // Run-and-compare programs and expected compile errors. Each test builds in
 // a directory of its own (run/ and errors/ share names).
@@ -386,7 +381,6 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const d = directives(src);
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   if (native && d.linuxOnly && noC) return { skip: true, reason: 'Linux targets only' };
-  if (d.selfhostOnly && bootstrapCompiler()) return { skip: true, reason: d.selfhostOnly };
   if (native && noC && (d.links.length || /extern "C"/.test(src))) return { skip: true, reason: 'links C code' };
   const dir = path.join(tmp, path.basename(path.dirname(f)) + '-' + path.basename(f, '.ax'));
   fs.mkdirSync(dir);
@@ -431,7 +425,6 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
 const cDir = path.join(root, 'cmd/axiom/internal/tests/c/pp');
 const cFiles = fs.existsSync(cDir) ? fs.readdirSync(cDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cDir, f)) : [];
 await section('', byFile(cFiles, '[c-pp]', async (f) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   const src = fs.readFileSync(f, 'utf8');
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
   const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
@@ -474,7 +467,6 @@ const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
 const cFilesIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(dir, f)) : [];
 const cRunFiles = cFilesIn(cRunDir);
 const cRunTest = async (f) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   const src = fs.readFileSync(f, 'utf8');
   if (native && noC && /\/\* linux-only \*\//.test(src)) return { skip: true, reason: 'links C code' };
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
@@ -562,7 +554,6 @@ await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/pr
 const cMixDir = path.join(root, 'cmd/axiom/internal/tests/c/mix');
 const cMixDirs = fs.existsSync(cMixDir) ? fs.readdirSync(cMixDir).filter((n) => fs.statSync(path.join(cMixDir, n)).isDirectory()).sort().map((n) => path.join(cMixDir, n)) : [];
 const cMixTest = async (dir) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   const axMain = fs.existsSync(path.join(dir, 'main.ax'));
   const main = path.join(dir, axMain ? 'main.ax' : 'main.c');
   const src = fs.readFileSync(main, 'utf8');
@@ -677,7 +668,6 @@ const cxxRuntime = (cxx) => {
   return null;
 };
 const cLinkTest = async (dir) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   if (!native || noC || process.platform !== 'linux' || !/^(x86_64|aarch64)$/.test(linkArch)) return { skip: true, reason: 'Linux natively' };
   const cc = sysTool(false);
   if (!cc) return { skip: true, reason: 'no system C compiler for the target' };
@@ -839,7 +829,6 @@ await section('', byFile(cLinkDirs, '[c-link]', cLinkTest), { parallel: true, bu
 const cCcDir = path.join(root, 'cmd/axiom/internal/tests/c/cc');
 const cCcDirs = fs.existsSync(cCcDir) ? fs.readdirSync(cCcDir).filter((n) => fs.statSync(path.join(cCcDir, n)).isDirectory()).sort().map((n) => path.join(cCcDir, n)) : [];
 const cCcTest = async (dir) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   if (!native || noC || buildOnly || process.platform !== 'linux' || process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'Linux natively' };
   const work = path.join(tmp, `cc-${path.basename(dir)}`);
   fs.cpSync(dir, work, { recursive: true });
@@ -876,7 +865,6 @@ const cLibDir = path.join(root, 'cmd/axiom/internal/tests/c/lib');
 const cLibFiles = fs.existsSync(cLibDir) ? fs.readdirSync(cLibDir).filter((n) => fs.statSync(path.join(cLibDir, n)).isDirectory()).sort()
   .flatMap((n) => cFilesIn(path.join(cLibDir, n))) : [];
 const cLibTest = async (f) => {
-  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   const src = fs.readFileSync(f, 'utf8');
   const dv = (name) => [...src.matchAll(new RegExp(`/\\* ${name}: ?(.*?) \\*/|// ${name}: ?(.*?)$`, 'gm'))].map((m) => m[1] ?? m[2]);
   const has = (name) => new RegExp(`(?:// |/\\* )${name}\\b`, 'm').test(src);
@@ -964,7 +952,6 @@ await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true, buil
 // writes from the sources.
 await section('', {
   'C library: std/c/lib/index is current': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/internal/tools/gen_c_lib_index.mjs'), '--check'],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
@@ -973,7 +960,6 @@ await section('', {
   // standard's names and those reserved to it, and all the names its
   // standard requires: tools/c_header_names.mjs, c/headers/names.txt)
   'C library: the headers\' names are their standards\'': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_header_names.mjs')],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
@@ -981,14 +967,12 @@ await section('', {
   // (every Constraints paragraph of clause 6 violated, and diagnosed:
   // tools/c_constraints.mjs over c/constraints.txt; docs/c-conformance.md)
   'C conformance: every constraint is diagnosed': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_constraints.mjs')],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: 4 * compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
   },
   // (every translation limit of 5.2.4.1 reached, and exceeded: tools/c_limits.mjs)
   'C conformance: the translation limits': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_limits.mjs')],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: 10 * compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
@@ -1013,10 +997,8 @@ function cDriverCases() {
     return c.status === 2 && re.test(c.stderr) ? null : `${args.join(' ')}: status ${c.status}, expected ${re}:\n${c.stdout}${c.stderr}`;
   };
   const codes = (c) => { try { return JSON.parse(c.stdout).diagnostics.map((x) => `${x.severity[0]}:${x.code}`); } catch { return null; } };
-  const skip = () => (bootstrapCompiler() ? { skip: true, reason: 'the C front end is the compiler\'s' } : null);
   return {
     'C: --c-std= names': async () => {
-      if (skip()) return skip();
       write({ 'std.c': 'long v = __STDC_VERSION__;\n' });
       const want = { c89: '__STDC_VERSION__', c90: '__STDC_VERSION__', c95: '199409L', c99: '199901L', c11: '201112L',
         c17: '201710L', c18: '201710L', c23: '202311L', gnu89: '__STDC_VERSION__', gnu90: '__STDC_VERSION__',
@@ -1039,7 +1021,6 @@ function cDriverCases() {
       return fatal(['build', 'std.c', '--c-int=64', '--c-long=32'], /--c-long must be at least --c-int/);
     },
     'C: -D, -U and -I, in order': async () => {
-      if (skip()) return skip();
       write({ 'm.c': 'A B C f(3) E\n#ifdef Z\nz\n#endif\n#include <h.h>\n#include "h.h"\n#include <g.h>\n',
         'i1/h.h': 'one\n', 'i2/h.h': 'two\n', 'i2/g.h': 'three\n', 'h.h': 'local\n' });
       const lines = (c) => c.stdout.split('\n').filter((l) => l.trim()).join('|');
@@ -1055,7 +1036,6 @@ function cDriverCases() {
       return p || fatal(['build', 'm.c', '-D'], /'-D' needs a value/);
     },
     'C: several translation units': async () => {
-      if (skip()) return skip();
       write({
         'a.c': '#include "host.h"\nstatic int helper(int x) { return x * 2; }\nint counter;\nextern int shared;\n' +
           'int b_func(int);\nint tentative;\nint main(void) {\n    counter = 5;\n' +
@@ -1086,7 +1066,6 @@ function cDriverCases() {
       return fatal(['build', 'a.c', 'b.c', '--emit=c-pp'], /--emit=c-pp takes one C source/);
     },
     'C: options for Axiom code, C options without C sources': async () => {
-      if (skip()) return skip();
       write({ 'w.c': 'int main(void) { return 0; }\n', 'x.ax': 'export fn main() i32 {\n    return 0;\n}\n' });
       for (const o of ['--overflow=trap', '--sanitize=address', '--coverage=afl', '--emit-header=w.h', '--units=module']) {
         const p = await fatal(['build', 'w.c', o], /is an option for Axiom code, and not for C sources/);
@@ -1110,7 +1089,6 @@ function cDriverCases() {
       return p || fatal(['fmt', 'w.c'], /axiom fmt formats Axiom sources, and 'w.c' is a C source/);
     },
     'C: files, outputs, --emit and -O, warnings and --format=agent-json': async () => {
-      if (skip()) return skip();
       write({ 'p.c': '#include "host.h"\nint main(void) {\n    print_i64(6 * 7);\nunused:\n    return 0;\n}\n', 'd.c/x': '' });
       const inc = `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`;
       let p = await fatal(['build', 'nosuch.c'], /E0211.*cannot read 'nosuch.c'/);
@@ -1135,7 +1113,6 @@ function cDriverCases() {
       return c.status === 0 && /--c-std=c89\|c90\|c95\|c99\|c11\|c17\|c18\|c23/.test(c.stderr) ? null : `--help: ${c.stderr}`;
     },
     'C: thread-locals and atomics in a program linked statically': async () => {
-      if (skip()) return skip();
       if (!native || noC) return { skip: true, reason: 'Linux targets only' };
       // (no C library: the compiler's linker, the runtime's threads and TLS blocks; the exit status says)
       write({ 'tls.c': '#include <threads.h>\nint g[4];\n_Thread_local int *tp = &g[2];\n' +
@@ -1157,7 +1134,6 @@ function cDriverCases() {
       return null;
     },
     'C: C and Axiom in one program: the command line': async () => {
-      if (skip()) return skip();
       write({ 'm.ax': 'extern "C" {\n    fn c_f(x: i32) i32;\n}\n\nexport fn main() i32 {\n    return c_f(2) - 4;\n}\n',
         'f.c': '#ifndef K\n#error K\n#endif\nint c_f(int x) { return x * K; }\n',
         'cm.c': 'int ax_g(int);\nint main(void) { return ax_g(3) - 9; }\n',
@@ -1191,7 +1167,6 @@ function cDriverCases() {
       return p || fatal(['build', 'cm.c', 'g.ax', '--overflow=trap'], /--overflow is an option for Axiom code/);
     },
     'C: what is linked: only what is reached': async () => {
-      if (skip()) return skip();
       // a library of 200 functions and a large table, of which a program
       // calls one: the executable is the size of the program without it
       let lib = '';
@@ -1223,7 +1198,6 @@ function cDriverCases() {
       return null;
     },
     'C: the C library directories (std/c/lib, std/c/rt)': async () => {
-      if (skip()) return skip();
       // a standard library whose c/lib and c/rt are this test's (the rest
       // is the real one's, linked)
       const std = path.join(dir, 'fakestd');
@@ -1252,7 +1226,6 @@ function cDriverCases() {
       return null;
     },
     'C: a package with C sources (c-sources)': async () => {
-      if (skip()) return skip();
       write({ 'pk/axiom.toml': '[package]\nname = "pk"\nversion = "0.1.0"\nc-sources = "csrc"\n',
         'pk/src/main.ax': 'extern "C" {\n    fn c_sq(x: i32) i32;\n}\n\nexport fn ax_one() i32 {\n    return 1;\n}\n\n' +
           'export fn main() i32 {\n    return c_sq(5) - 26;\n}\n',
@@ -1268,7 +1241,6 @@ function cDriverCases() {
       return b.status === 1 && /c-sources = "\.\.\." must name a directory/.test(b.stderr) ? null : `bad: ${b.status} ${b.stderr}`;
     },
     'C: C and Axiom built for Windows and macOS': async () => {
-      if (skip()) return skip();
       fs.mkdirSync(dir, { recursive: true });  // (run alone, --filter: no other case made it)
       // the c/mix programs, built (not run: that needs the systems)
       for (const d of cMixDirs) {
@@ -1293,7 +1265,6 @@ function cDriverCases() {
       return null;
     },
     'C: Windows: data of a DLL, and unwinding with a variable length array': async () => {
-      if (skip()) return skip();
       // (ntdll.dll's objects: the system's C library, which has others, is not linked)
       write({ 'dll.c': 'extern unsigned short NlsAnsiCodePage;\nextern unsigned char NlsMbCodePageTag;\nint get(void) { return NlsAnsiCodePage; }\n' +
           'unsigned short *where(void) { return &NlsAnsiCodePage; }\nint main(void) { return (get() == *where()) + 2 * NlsMbCodePageTag; }\n',
@@ -1320,7 +1291,6 @@ function cDriverCases() {
       return null;
     },
     'C: native stack traces through C functions': async () => {
-      if (skip()) return skip();
       if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
@@ -1335,7 +1305,6 @@ function cDriverCases() {
     // a program of the compiler's code only, none in an object), and the
     // program's own traces as before (they walk the frame pointers).
     'C: native stack traces with --unwind-tables=off': async () => {
-      if (skip()) return skip();
       if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
       write({ 'crash3.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
@@ -1368,7 +1337,6 @@ function cDriverCases() {
     // indirect call, which names it only so. (The C main may itself be
     // inlined into the runtime's.)
     'C: native stack traces through C functions at -O2': async () => {
-      if (skip()) return skip();
       if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash2.c': 'static int *volatile gp;\nstatic volatile int sink;\nint leafcrash(int x) {\n    return *gp + x;\n}\n' +
         'static int (*volatile leafp)(int) = leafcrash;\nint early(int *p, int x) {\n    if (!p) {\n        return leafp(x) + 1;\n' +
@@ -1385,7 +1353,6 @@ function cDriverCases() {
     // Axiom's do, and the optimizer's inlining keeps them: the C frames are
     // in a trap's trace at -O0 and -O2.
     'C: WebAssembly stack traces through C functions': async () => {
-      if (skip()) return skip();
       if (native && process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'cross native run' };
       write({ 'crash3.c': 'static volatile int zero = 0;\nstatic int divide(int *p) {\n    return *p / zero;\n}\n' +
         'static int middle(int k) {\n    int x = k;\n    return divide(&x) + 1;\n}\nint main(void) {\n    return middle(3) + 2;\n}\n' });
@@ -1419,7 +1386,6 @@ function cDriverCases() {
     // program inlined into main at -O2), with the functions inlined there
     // as frames of their own; the code is the same.
     'C: native stack traces with the faulting line (-g)': async () => {
-      if (skip()) return skip();
       if (!native || execWrap.length || process.env.AXIOM_NATIVE_TARGET || (process.platform !== 'linux' && process.platform !== 'darwin')) return { skip: true, reason: 'run on this Linux or macOS machine only' };
       write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
         'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n',
@@ -1449,7 +1415,6 @@ function cDriverCases() {
 // A C program as an object and as IR: the start-up's module with the unit in it.
 await section('C programs', {
   '--emit=ir and --emit=obj': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const f = path.join(cRunDir, 'funcs.c');
     const inc = `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`;
     const ir = path.join(tmp, 'c-emit.ir'), obj = path.join(tmp, 'c-emit.o');
@@ -1468,7 +1433,6 @@ await section('C programs', {
   // stack slots' colouring and the end of restrict scopes walked the whole
   // function for each value, slot or scope). Best of two of each.
   'compile time of a long function': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const src = fs.readFileSync(path.join(cRunDir, 'intrin_x86_compile.c'), 'utf8');
     const bodies = [...src.matchAll(/\nvoid __t\d+\(void\) \{\n([\s\S]*?)\n\}/g)].map((m) => m[1]);
     const head = src.slice(0, src.indexOf('\nvoid __t0(void)'));
@@ -1500,7 +1464,6 @@ await section('C programs', {
   // which leaves out what the program does not use (--no-gc-sections keeps
   // it) and the .eh_frame entries of what it leaves out.
   'sections: --units=module leaves out what the program does not use (its cached objects packed)': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the compiler\'s own linkers' };
     const d = path.join(tmp, 'units-gc');
     fs.mkdirSync(d, { recursive: true });
     fs.writeFileSync(path.join(d, 'gcu_a.ax'), 'pub fn twice[T: Int](x: T) T {\n    return x + x;\n}\n\npub fn used(x: i32) i32 {\n' +
@@ -1538,7 +1501,6 @@ await section('C programs', {
     return sizes[0] * 1.5 < sizes[1] ? null : `${sizes[0]} bytes with the garbage collection, ${sizes[1]} without`;
   },
   'sections: --function-sections, --gc-sections and COMDAT selections': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     // (an object's: what a program's own units do not reach is never compiled)
     const f = path.join(tmp, 'c-gc.c'), lib = path.join(tmp, 'c-gcl.c'), exe = path.join(tmp, 'c-gc'), obj = path.join(tmp, 'c-gc.o');
     fs.writeFileSync(lib, 'int gc_dead_fn(int x) { return x * 3; }\nint gc_dead_data[100] = {1};\nint gc_live_fn(int x) { return x + 1; }\n');
@@ -1617,7 +1579,6 @@ await section('C programs', {
   // compiler's linker (__wasm_call_ctors), the destructors (registered
   // with atexit) after it; and this compiler's run so by wasm-ld too.
   'WebAssembly: the constructors of objects (INIT_FUNCS)': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     if (native) return { skip: true, reason: 'WebAssembly' };
     const d = path.join(tmp, 'wasm-ctors');
     fs.mkdirSync(d, { recursive: true });
@@ -1656,7 +1617,6 @@ await section('C programs', {
   // defines, in an object: null (no import of the host's), the call a
   // trap, linked by the compiler's linker and by wasm-ld.
   'WebAssembly: weak undefined references in objects': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     if (native) return { skip: true, reason: 'WebAssembly' };
     const d = path.join(tmp, 'wasm-weak');
     fs.mkdirSync(d, { recursive: true });
@@ -1689,7 +1649,6 @@ await section('C programs', {
     return null;
   },
   'visibility in --emit=obj': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const f = path.join(tmp, 'c-vis.c'), obj = path.join(tmp, 'c-vis.o');
     fs.writeFileSync(f, '__attribute__((visibility("hidden"))) int vis_h(void) { return 1; }\n' +
       '__attribute__((visibility("internal"))) int vis_i(void) { return 2; }\n' +
@@ -1716,7 +1675,6 @@ await section('C programs', {
     return null;
   },
   'diagnostics at #line positions': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const f = path.join(cRunDir, 'err_line_presumed.c');
     const c = await spawnAsync(compiler, ['build', f, '-o', path.join(tmp, 'c-line')], { encoding: 'utf8' });
     for (const want of ['gen.y:100:9: error[C3001]', 'gen.y:7:9: error[C3001]']) if (!c.stderr.includes(want)) return `no ${want} in:\n${c.stderr}`;
@@ -1797,7 +1755,7 @@ await section('', {
       .filter((x) => x !== null).join(' ');
     // (// stack-wasm-O0: on WebAssembly below -O2, in place of that test's stack:)
     const wasmStack = new Map([...src.matchAll(/^\/\/ stack-wasm-O0: (.+?) \| (.+)$/gm)].map((m) => [m[1], m[2]]));
-    const low = !extraFlags.some((a) => a === '-O2' || a === '-O3') && !bootstrapCompiler();
+    const low = !extraFlags.some((a) => a === '-O2' || a === '-O3');
     for (const [, kind, tname, want0] of src.matchAll(/^\/\/ (stack|errors): (.+?) \| (.+)$/gm)) {
       const want = !native && low && kind === 'stack' && wasmStack.has(tname) ? wasmStack.get(tname) : want0;
       const t = json.tests.find((x) => x.name === tname);
@@ -1847,23 +1805,18 @@ await section('', byFile(files(path.join(root, 'cmd/axiom/internal/tests/sanitiz
 // Instruction selection: each "// lower: <flags> | <regex> | <count>" line
 // of cmd/axiom/internal/tests/lowering/*.ax builds the file with --emit=asm and those flags,
 // and the regex must match exactly <count> times. x86-64 lines run only on
-// x86-64 hosts (--target=native is the host). A compiler without
-// --emit=asm (the compiler) is checked on its object file as
-// objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
-// objdump is installed; it skips the others. "// lower-selfhost:" lines
-// check selection only the compiler's backends make (LLVM's differs). C
-// sources (*.c) there are checked alike; lines for --target=aarch64 are
-// checked where aarch64-linux-gnu-objdump is installed.
+// x86-64 hosts (--target=native is the host). The compiler has no
+// --emit=asm: the file is built with --emit=obj and checked as objdump
+// disassembles it (AT&T syntax), its x86-64 lines where objdump is
+// installed and its --target=aarch64 lines where aarch64-linux-gnu-objdump
+// is; the others are skipped. C sources (*.c) there are checked alike.
 const lowerFiles = fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests/lowering'))
   .filter((f) => f.endsWith('.ax') || f.endsWith('.c')).map((f) => path.join(root, 'cmd/axiom/internal/tests/lowering', f)).sort();
 await section('', byFile(lowerFiles, '[instruction selection]', async (f) => {
   let checked = 0, reason = 'no line applies to this host';
-  for (const [, only, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower(-selfhost)?: (.+?) \| (.+?) \| (\d+)$/gm)) {
+  for (const [, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
-    // (the bootstrap compiler compiles no C, and need not accept the flags
-    // of lines that are not for it)
-    if ((only || f.endsWith('.c')) && bootstrapCompiler()) { reason = "the bootstrap compiler's selection differs"; continue; }
     const a64 = fl.includes('--target=aarch64');
     const base = path.basename(f).replace(/\.(ax|c)$/, '');
     const out = path.join(tmp, `lower-${base}.s`);
@@ -1881,9 +1834,6 @@ await section('', byFile(lowerFiles, '[instruction selection]', async (f) => {
       text = d.stdout.split(/\n(?=[0-9a-f]+ <[^>]+>:\n)/).filter((b) => !/^[0-9a-f]+ <(std\/|ax_)/.test(b)).join('\n');
     } else if (c.status !== 0) {
       return `${flags}: build failed:\n${c.stdout}${c.stderr}`;
-    } else if (only) {
-      reason = "the bootstrap compiler's selection differs";
-      continue;  // (a compiler with --emit=asm: the bootstrap compiler's LLVM)
     } else {
       text = fs.readFileSync(out, 'utf8');
     }
@@ -2040,7 +1990,6 @@ await section('std/internal/runtime/host.mjs', {
   // JavaScript engine knows of $TZ is the database's, for zones whose
   // daylight saving flags the engine's offsets show (tests/host/tz_host.ax)
   'the local zone without a database (ax_tz_local)': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'tz_host.ax is checked with the compiler' };
     const out = path.join(tmp, 'tz_host.wasm');
     const c = spawnSync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/host/tz_host.ax'), '--target=wasm32', '-o', out], { encoding: 'utf8' });
     if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
@@ -2101,15 +2050,14 @@ await section('axiom test', {
   }), { timed: false });
 }
 
-// Diagnostic codes (spec §16.3): the table lists exactly the codes the two
-// compilers emit, and every emitted code is asserted by some test. A code
+// Diagnostic codes (spec §16.3): the table lists exactly the codes the
+// compiler emits, and every emitted code is asserted by some test. A code
 // that no test can reach is listed here with the reason.
 await section('spec §16.3', {
-  'diagnostic codes, both compilers and the tests agree': () => {
+  'diagnostic codes: the compiler, the spec and the tests agree': () => {
     const codesIn = (text) => new Set([...text.matchAll(/"(E\d{4})"/g)].map((m) => m[1]));
     const readAll = (dir, ext) => fs.readdirSync(dir).filter((f) => f.endsWith(ext)).map((f) => fs.readFileSync(path.join(dir, f), 'utf8')).join('\n');
     const emittedAx = codesIn(readAll(path.join(root, 'cmd/axiom/src'), '.ax'));
-    const emittedC = codesIn(readAll(path.join(root, 'cmd/axiom/bootstrap/src'), '.c'));
     const spec = fs.readFileSync(path.join(root, 'docs/spec.md'), 'utf8');
     const tableText = spec.slice(spec.indexOf('### 16.3 Diagnostic codes'), spec.indexOf('### 16.4 '));
     const table = new Set([...tableText.matchAll(/^\| (E\d{4}) \|/gm)].map((m) => m[1]));
@@ -2132,12 +2080,9 @@ await section('spec §16.3', {
     };
     const problems = [];
     const diff = (a, b) => [...a].filter((x) => !b.has(x)).sort();
-    const onlyAx = diff(emittedAx, emittedC), onlyC = diff(emittedC, emittedAx);
-    if (onlyAx.length) problems.push(`emitted only by the compiler: ${onlyAx.join(' ')}`);
-    if (onlyC.length) problems.push(`emitted only by the bootstrap compiler: ${onlyC.join(' ')}`);
     const notInTable = diff(emittedAx, table), notEmitted = diff(table, emittedAx);
     if (notInTable.length) problems.push(`emitted but not in the spec's table: ${notInTable.join(' ')}`);
-    if (notEmitted.length) problems.push(`in the spec's table but emitted by no compiler: ${notEmitted.join(' ')}`);
+    if (notEmitted.length) problems.push(`in the spec's table but not emitted: ${notEmitted.join(' ')}`);
     const untested = diff(emittedAx, asserted).filter((c) => !(c in unreachable));
     if (untested.length) problems.push(`emitted but asserted by no test: ${untested.join(' ')}`);
     return problems.length ? `\n  ${problems.join('\n  ')}` : null;
@@ -2153,7 +2098,6 @@ await section('spec §16.3', {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(src, 'import "std/io" as io;\n\nexport fn main() i32 {\n    io.stdout().write_all("flag ok\\n") catch return 1;\n    return 0;\n}\n');
   };
-  const isBootstrap = () => /bootstrap/.test(spawnSync(compiler, ['version'], { encoding: 'utf8' }).stdout);
   const runs = (out) => {
     const r = hostRun(out);
     return r.status === 0 && r.stdout === 'flag ok\n' ? null : `ran wrong: ${r.status}\n${r.stdout}${r.stderr}`;
@@ -2169,22 +2113,16 @@ await section('spec §16.3', {
     '--overflow=wrap': builds('--overflow=wrap', 'ow'),
     '--units=program': builds('--units=program', 'up'),
     '-g': builds('-g', 'g'),
-    '--emit=asm (the bootstrap compiler) or --emit=obj': () => {
+    '--emit=obj': () => {
       if (!native) return { skip: true, reason: 'native only' };
       prepare();
-      // the compiler's native backends write objects, not assembly
-      const asm = isBootstrap();
-      const o = path.join(dir, asm ? 'p.s' : 'p.o');
-      const c = spawnSync(compiler, ['build', src, asm ? '--emit=asm' : '--emit=obj', '-o', o, nativeTarget], { encoding: 'utf8' });
+      const o = path.join(dir, 'p.o');
+      const c = spawnSync(compiler, ['build', src, '--emit=obj', '-o', o, nativeTarget], { encoding: 'utf8' });
       if (c.status) return c.stderr;
-      if (asm) {
-        const text = fs.readFileSync(o, 'utf8');
-        return /main/.test(text) && text.length > 100 ? null : `assembly without main:\n${text.slice(0, 200)}`;
-      }
       return fs.statSync(o).size > 100 ? null : 'an empty object file';
     },
     'an --emit=obj object links into a C program (examples/c_interop)': () => {
-      if (!native || isBootstrap() || process.platform !== 'linux') return { skip: true, reason: 'the compiler on Linux only' };
+      if (!native || process.platform !== 'linux') return { skip: true, reason: 'native, on Linux only' };
       // (the host's cc links for the host)
       if (process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'not when cross testing' };
       if (spawnSync('cc', ['--version']).status !== 0) return { skip: true, reason: 'no C compiler' };
@@ -2202,7 +2140,7 @@ await section('spec §16.3', {
       return r.status === 0 && /sorted 5 values/.test(r.stdout) ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
     'compiled in parts (AXIOM_PARTS=3): runs, its trace names its functions, the same bytes each time': () => {
-      if (!native || isBootstrap()) return { skip: true, reason: 'the compiler, native' };
+      if (!native) return { skip: true, reason: 'native only' };
       prepare();
       const f = path.join(dir, 'parts.ax');
       fs.writeFileSync(f, [
@@ -2229,7 +2167,7 @@ await section('spec §16.3', {
         ? null : `status ${r.status}:\n${r.stdout}${r.stderr}`;
     },
     'C asm naming static functions and data, compiled in parts (AXIOM_PARTS=3)': () => {
-      if (!native || isBootstrap()) return { skip: true, reason: 'the compiler, native' };
+      if (!native) return { skip: true, reason: 'native only' };
       if (/macos/.test(process.env.AXIOM_NATIVE_TARGET || '') || (!process.env.AXIOM_NATIVE_TARGET && process.platform === 'darwin')) {
         return { skip: true, reason: 'not Mach-O (symbol names)' };
       }
@@ -2296,7 +2234,6 @@ await section('spec §16.3', {
       return null;
     },
     '--emit=ir': () => {
-      if (isBootstrap()) return { skip: true, reason: 'the bootstrap compiler has --emit=llvm instead' };
       prepare();
       const o = path.join(dir, 'p.ir');
       const c = spawnSync(compiler, ['build', src, '--emit=ir', '-o', o, ...targetFlags], { encoding: 'utf8' });
@@ -2317,7 +2254,6 @@ await section('spec §16.3', {
     // under afl-showmap (when installed) its two inputs, taking different
     // branches, cover different edges.
     '--coverage=afl: runs as usual, and afl-showmap sees the branches': () => {
-      if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
       if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch) || process.env.AXIOM_NATIVE_TARGET) {
         return { skip: true, reason: 'a Linux host, not cross testing' };
       }
@@ -2351,7 +2287,6 @@ await section('spec §16.3', {
       return only(edges[0], edges[1]) && only(edges[1], edges[0]) ? null : 'both inputs cover the same edges';
     },
     '--coverage=afl for wasm32 is E9001': () => {
-      if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
       prepare();
       const c = spawnSync(compiler, ['build', src, '--coverage=afl', '--target=wasm32', '--format=agent-json', '-o', path.join(dir, 'x.wasm')],
         { encoding: 'utf8' });
@@ -2374,7 +2309,6 @@ await section('spec §16.3', {
 // directory (AXIOM_UPDATE_URL), whose release 9.9.9 is a script that says so.
 {
   const dir = path.join(tmp, 'update');
-  const isBootstrap = () => /bootstrap/.test(spawnSync(compiler, ['version'], { encoding: 'utf8' }).stdout);
   const plat = { linux: 'linux', darwin: 'macos' }[process.platform];
   const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
   const has = (tool) => spawnSync(tool, ['--version']).status === 0;
@@ -2406,17 +2340,12 @@ await section('spec §16.3', {
     return path.join(inst, 'bin/axiom');
   };
   const skip = () => {
-    if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
     if (!plat || !arch || process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'Linux and macOS hosts' };
     if (!has('curl') || !has('tar')) return { skip: true, reason: 'no curl or tar' };
     return null;
   };
   const code = (r, status, c) => r.status === status && r.stdout.includes(`"${c}"`) ? null : `${r.status}: ${r.stdout}${r.stderr}`;
   await section('axiom update', {
-    'the bootstrap compiler does not update (E9008)': () => {
-      if (!isBootstrap()) return { skip: true, reason: 'the bootstrap compiler only' };
-      return code(spawnSync(compiler, ['update', '--format=agent-json'], { encoding: 'utf8' }), 1, 'E9008');
-    },
     'a release install refuses HEAD, in any case, and a non-version (E9001)': () => {
       const s = skip();
       if (s) return s;
@@ -2608,7 +2537,6 @@ await section('', {
     errors: [...src.matchAll(/\/\* expect-error: (C\d{4}) \*\//g)].map((m) => m[1]),
     anyErrors: /\/\* expect-errors \*\//.test(src),
   });
-  const skipBootstrap = () => (bootstrapCompiler() ? { skip: true, reason: 'the compiler only' } : null);
   // The compiler on file f: { status, codes, out } (codes of the errors), or a problem.
   // (the tree on standard output when there are no errors, the diagnostics' JSON when there are)
   const parseC = (f, flags) => {
@@ -2621,8 +2549,6 @@ await section('', {
     return { status: c.status, codes, out: c.stdout.slice(nl + 1) };
   };
   const cases = byFile(cfiles, '', (f) => {
-    const s = skipBootstrap();
-    if (s) return s;
     const src = fs.readFileSync(f, 'utf8');
     const d = cdirectives(src);
     const r = parseC(f, d.flags);
@@ -2643,8 +2569,6 @@ await section('', {
   };
   // ends with errors (any, or exactly one `code` when given), in a few seconds at most
   const fails = (name, text, code, flags = []) => () => {
-    const s = skipBootstrap();
-    if (s) return s;
     const t0 = Date.now();
     const r = parseC(write(name, text), flags);
     if (typeof r === 'string') return r;
@@ -2654,8 +2578,6 @@ await section('', {
     return null;
   };
   const passes = (name, text, flags = []) => () => {
-    const s = skipBootstrap();
-    if (s) return s;
     const r = parseC(write(name, text), flags);
     if (typeof r === 'string') return r;
     return r.status === 0 ? null : `errors [${r.codes.slice(0, 20).join(', ')}]`;
@@ -2701,8 +2623,6 @@ await section('', {
   }
   // truncated copies of the tests: diagnostics or a tree, nothing else
   cases['the tests, truncated'] = () => {
-    const s = skipBootstrap();
-    if (s) return s;
     for (const f of cfiles) {
       const src = fs.readFileSync(f, 'utf8');
       const d = cdirectives(src);
@@ -2717,7 +2637,7 @@ await section('', {
   await section('C parser', cases, { parallel: true, timed: false });
 }
 
-// `axiom fmt` (spec §16.5; the compiler only, not the bootstrap one). Each
+// `axiom fmt` (spec §16.5). Each
 // cmd/axiom/internal/tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
 // alone; the repository's own sources are canonical.
@@ -2762,10 +2682,7 @@ if (!skipPlatform) {
     const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'docs/tour', ...tests]);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
-  await section('fmt', cases, {
-    supported: () => (/usage:/.test(fmt(['--check', path.join(fdir, 'layout.expected')]).stderr) ? 'the bootstrap compiler has no axiom fmt' : null),
-    timed: false,
-  });
+  await section('fmt', cases, { timed: false });
 }
 
 // Debug information (-g; the compiler only): cmd/axiom/internal/tests/dwarf.mjs
@@ -3375,13 +3292,10 @@ if (!skipPlatform) {
       return null;
     };
   }
-  await section('debug information', dcases, {
-    parallel: true,
-    supported: () => (bootstrapCompiler() ? 'the compiler\'s own code generators only' : null),
-  });
+  await section('debug information', dcases, { parallel: true });
 }
 
-// macOS (spec §14.1; the compiler only, not the bootstrap one). cmd/axiom/internal/tests/macho.mjs checks
+// macOS (spec §14.1). cmd/axiom/internal/tests/macho.mjs checks
 // A C program of two translation units over the platform's C library (for the
 // macos and windows sections): printf, an atexit function (returning from
 // main is calling exit), the arguments, static functions of the same name.
@@ -3620,13 +3534,12 @@ if (!skipPlatform) {
       return onMac || (q.status !== 0 && /E9001/.test(q.stderr)) ? null : `axiom test: status ${q.status}: ${q.stderr}`;
     },
   }, {
-    supported: () => (/unknown target/.test(build(path.join(root, 'examples/wordcount/wordcount.ax'), 'probe').stderr) ? 'the bootstrap compiler has no macOS target' : null),
     note: onMac ? '' : 'built, not run: no Mac',
     timed: false,
   });
 }
 
-// Windows (spec §14.1; the compiler only, not the bootstrap one). Programs and the
+// Windows (spec §14.1). Programs and the
 // compiler itself are cross-built for --target=x86_64-windows and their PE
 // headers checked; with Wine installed they also run (the whole suite runs
 // on Windows with AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64).
@@ -3955,7 +3868,6 @@ if (!skipPlatform) {
       return r.status === 0 ? null : `wordcount: status ${r.status}: ${r.stdout}${r.stderr}`;
     },
   }, {
-    supported: () => (/unknown target/.test(build(path.join(root, 'examples/wordcount/wordcount.ax'), 'probe').stderr) ? 'the bootstrap compiler has no Windows target' : null),
     note: wine ? '' : 'built, not run: no Wine',
     timed: false,
   });
@@ -4006,7 +3918,6 @@ if (!skipPlatform && !native) {
   const wineDlls = ['/usr/lib/x86_64-linux-gnu/wine/x86_64-windows', '/usr/lib/wine/x86_64-windows', '/usr/lib64/wine/x86_64-windows'].find((d) => fs.existsSync(path.join(d, 'kernel32.dll')));
   const triples = { 'x86_64-windows': 'x86_64-pc-windows-msvc', 'aarch64-windows': 'aarch64-pc-windows-msvc', 'x86_64-macos': 'x86_64-apple-macos11', 'aarch64-macos': 'arm64-apple-macos11' };
   const objfmtTest = async (dir, t) => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     if (!clang || !llvmAr || !readobj) return { skip: true, reason: 'no clang, llvm-ar or llvm-readobj' };
     const src = fs.readFileSync(path.join(dir, 'main.c'), 'utf8');
     const dv = (name) => [...src.matchAll(new RegExp(`(?:// |/\\* )${name}: ?(.*?)(?: \\*/)?$`, 'gm'))].map((m) => m[1]);
@@ -4296,7 +4207,6 @@ if (!skipPlatform && !native) {
 // same buffers, through edits in the editor and on disk.
 await section('axiom lsp', {
   'answers as axiom ide does, through edits': async () => {
-    if (bootstrapCompiler()) return { skip: true, reason: 'axiom lsp is the compiler\'s' };
     const dir = path.join(tmp, 'lsp');
     fs.rmSync(dir, { recursive: true, force: true });
     const put = (n, t) => { fs.mkdirSync(path.dirname(path.join(dir, n)), { recursive: true }); fs.writeFileSync(path.join(dir, n), t); };

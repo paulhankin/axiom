@@ -2,13 +2,13 @@
    type's checked arithmetic (cgen_va_arg.ax: ckd_same): one multiply,
    add or sub, and a jump on its flags; the overflow as a value, a setcc of
    them. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bi?mul\s | 5
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bimul\s+%\w+,%\w+\n[^\n]*\bjn?o\b | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmul\s+%\w+\n[^\n]*\bj(b|ae)\b | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \badd\s+%\w+,%\w+\n[^\n]*\bjn?o\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bsub\s+%\w+,%\w+\n[^\n]*\bj(b|ae)\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmul\s+%\w+\n([^\n]*\bmov\s[^\n]*\n)?[^\n]*\bsetb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bset[a-z]+\s | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bi?mul\s | 5
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bimul\s+%\w+,%\w+\n[^\n]*\bjn?o\b | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmul\s+%\w+\n[^\n]*\bj(b|ae)\b | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \badd\s+%\w+,%\w+\n[^\n]*\bjn?o\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bsub\s+%\w+,%\w+\n[^\n]*\bj(b|ae)\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bmul\s+%\w+\n([^\n]*\bmov\s[^\n]*\n)?[^\n]*\bsetb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bset[a-z]+\s | 1
 
 long smul(long a, long b) {
     long r;

@@ -7,9 +7,9 @@
    ISHLD and a release or stronger one DMB ISH; a signal fence and a relaxed
    one are no instruction. A weak compare-exchange is one exclusive
    attempt (no loop back). */
-// lower-selfhost: --target=native -O2 --c-freestanding | \bxchg\b | 1
-// lower-selfhost: --target=native -O2 --c-freestanding | \bmfence\b | 1
-// lower-selfhost: --target=native -O2 --c-freestanding | \block xadd\b | 4
+// lower: --target=native -O2 --c-freestanding | \bxchg\b | 1
+// lower: --target=native -O2 --c-freestanding | \bmfence\b | 1
+// lower: --target=native -O2 --c-freestanding | \block xadd\b | 4
 // lower: --target=aarch64 -O2 --c-freestanding | \bldar\s | 2
 // lower: --target=aarch64 -O2 --c-freestanding | \bstlr\s | 2
 // lower: --target=aarch64 -O2 --c-freestanding | \bldxr\s | 2
