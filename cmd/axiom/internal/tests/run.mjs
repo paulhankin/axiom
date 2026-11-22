@@ -418,6 +418,91 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   return { problem, stderr: r.stderr };
 }), { parallel: true, buildOnly: true, note: buildNote });
 
+// Idioms from other languages (errors/idioms/): each file is one mistake, and
+// costs exactly one error, with the code its `// expect-error:` names.
+const idiomDir = path.join(root, 'cmd/axiom/internal/tests/errors/idioms');
+const idiomFiles = fs.existsSync(idiomDir) ? files(idiomDir) : [];
+const checkJson = async (f) => {
+  const c = await spawnAsync(compiler, ['check', f, '--format=agent-json'], { encoding: 'utf8', timeout: compileTimeout });
+  try { return { status: c.status, diags: JSON.parse(c.stdout).diagnostics }; } catch { return { status: c.status, diags: null, out: c.stdout + c.stderr }; }
+};
+const onlyWasm = () => (native ? 'checked by the run without --native' : null);
+await section('', byFile(idiomFiles, 'one error', async (f) => {
+  const want = directives(fs.readFileSync(f, 'utf8')).errors;
+  if (want.length !== 1) return 'the file must name exactly one expected error';
+  const r = await checkJson(f);
+  if (!r.diags) return `no diagnostics:\n${r.out}`;
+  const got = r.diags.filter((x) => x.severity === 'error');
+  const show = () => got.map((x) => `${x.code} ${x.span.start_line}:${x.span.start_col} ${x.message}`).join('\n  ');
+  return got.length === 1 && got[0].code === want[0] ? null : `expected one ${want[0]}, got ${got.length}:\n  ${show()}`;
+}), { parallel: true, supported: onlyWasm });
+
+// Machine fixes (spec §16.2): applying the edits of each fix marked
+// `machine`, alone, to a file of the errors suite yields a program without
+// that diagnostic (none with its code where it was), and with no more errors
+// than before. The fixed file is checked in a copy of its directory (links to
+// the other files) inside a copy of the directory above, so that relative
+// imports resolve as before; the copies are under cmd/axiom/build/ (ignored
+// by git), where the tests' internal modules may still be imported (§4.1).
+const fixDir = path.join(root, 'cmd/axiom/build', path.basename(tmp) + '-machine-fixes');
+process.on('exit', () => fs.rmSync(fixDir, { recursive: true, force: true }));
+let fixCopies = 0;
+const applyFix = (f, fx) => {
+  const src = fs.readFileSync(f);
+  const edits = [...fx.edits].sort((a, b) => a.start_byte - b.start_byte);
+  const out = [];
+  let at = 0;
+  for (const e of edits) {
+    if (e.start_byte < at) return { problem: 'overlapping edits' };
+    out.push(src.subarray(at, e.start_byte), Buffer.from(e.replacement, 'utf8'));
+    at = e.end_byte;
+  }
+  out.push(src.subarray(at));
+  // where an original byte offset can be in the fixed text (inside a
+  // replaced range: its start; at an insertion: before or after it)
+  const places = (b) => {
+    let delta = 0;
+    for (const e of edits) {
+      const n = Buffer.byteLength(e.replacement, 'utf8');
+      if (b < e.start_byte) break;
+      if (b === e.start_byte && e.end_byte === e.start_byte) return [b + delta, b + delta + n];
+      if (b < e.end_byte) return [e.start_byte + delta];
+      delta += n - (e.end_byte - e.start_byte);
+    }
+    return [b + delta];
+  };
+  const here = path.dirname(f), up = path.dirname(here);
+  const top = path.join(fixDir, String(fixCopies++)), dir = path.join(top, path.basename(here));
+  fs.mkdirSync(dir, { recursive: true });
+  for (const n of fs.readdirSync(up)) if (n !== path.basename(here)) fs.symlinkSync(path.join(up, n), path.join(top, n));
+  for (const n of fs.readdirSync(here)) if (n !== path.basename(f)) fs.symlinkSync(path.join(here, n), path.join(dir, n));
+  const g = path.join(dir, path.basename(f));
+  fs.writeFileSync(g, Buffer.concat(out));
+  return { file: g, places };
+};
+await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/errors')), ...idiomFiles], 'machine fixes', async (f) => {
+  const r = await checkJson(f);
+  if (!r.diags) return null;  // (a file the check cannot read: its build case reports it)
+  const before = r.diags.filter((x) => x.severity === 'error').length;
+  const problems = [];
+  for (const d of r.diags) {
+    for (const fx of d.fixes) {
+      if (fx.applicability !== 'machine') continue;
+      const what = `${d.code} at ${d.span.start_line}:${d.span.start_col} ("${fx.description}")`;
+      if (fx.edits.some((e) => path.resolve(e.file) !== f)) { problems.push(`${what}: an edit in another file`); continue; }
+      const a = applyFix(f, fx);
+      if (a.problem) { problems.push(`${what}: ${a.problem}`); continue; }
+      const r2 = await checkJson(a.file);
+      if (!r2.diags) { problems.push(`${what}: no diagnostics from the fixed program:\n${r2.out}`); continue; }
+      const at = a.places(d.span.start_byte);
+      if (r2.diags.some((x) => x.code === d.code && at.includes(x.span.start_byte))) problems.push(`${what}: still reported after the fix`);
+      const after = r2.diags.filter((x) => x.severity === 'error');
+      if (after.length > before) problems.push(`${what}: the fix adds errors: ${after.map((x) => `${x.code} ${x.span.start_line}:${x.span.start_col}`).join(', ')}`);
+    }
+  }
+  return problems.length ? problems.join('\n') : null;
+}), { parallel: true, supported: onlyWasm });
+
 // The C preprocessor (docs/c-frontend.md): each cmd/axiom/internal/tests/c/pp/*.c
 // is preprocessed (--emit=c-pp) with its /* flags: */; the output must be
 // the .pp file next to it, or the build must fail with each
@@ -2522,6 +2607,71 @@ await section('', {
     return n === 1000 && r.j.omitted === 2000 ? null : `${n} shown, omitted ${r.j.omitted}`;
   };
   await section('garbage in', cases, { timed: false });
+}
+
+// One error per mistake (spec §16.2): a declaration with a syntax error is
+// poisoned (one E0100, its body not checked, no fixes in it), and the parser
+// resumes at the next declaration; an unknown name, field or method comes
+// with the nearest names, and the nearest as a suggestion when it is the
+// only one within two edits.
+{
+  const cases = {};
+  const check = (src, name) => {
+    const f = path.join(tmp, `one-${name}.ax`);
+    fs.writeFileSync(f, src);
+    const c = spawnSync(compiler, ['check', f, '--format=agent-json'], { encoding: 'utf8' });
+    try { return JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error'); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+  };
+  const codes = (want, src, name) => () => {
+    const ds = check(src, name);
+    if (typeof ds === 'string') return ds;
+    const got = ds.map((x) => `${x.code}@${x.span.start_line}`).join(' ');
+    return got === want ? null : `expected ${want}, got ${got}`;
+  };
+  cases['two syntax errors in one function are one error'] = codes('E0100@2',
+    'fn f() i32 {\n    let x = ;\n    let y = ;\n    return 1;\n}\n', 'two');
+  cases['each function reports its own syntax error'] = codes('E0100@2 E0100@7',
+    'fn f() i32 {\n    let x = ;\n    return 1;\n}\n\nfn g() i32 {\n    let y = ;\n    return 2;\n}\n', 'each');
+  cases['a poisoned body is not checked, its signature is'] = codes('E0100@2 E0412@7',
+    'fn f(x: i32) i32 {\n    let a: bool = 1 +;\n    return x;\n}\n\nfn g() bool {\n    return f(1);\n}\n', 'body');
+  cases['a missing brace ends the declaration at the next one'] = codes('E0100@7 E0412@8',
+    'fn f() i32 {\n    if true {\n        return 1;\n    return 2;\n}\n\nfn g() void {\n    let x: i32 = "s";\n}\n',
+    'brace');
+  cases['a method has its own syntax error, and the others are checked'] = codes('E0100@4 E0412@8',
+    'struct S {\n    a: i32,\n    fn f(self: Self) i32 {\n        let = 1;\n        return self.a;\n    }\n    fn g(self: Self) bool {\n        return self.a;\n    }\n}\n', 'method');
+  cases['no fix in a poisoned declaration'] = () => {
+    const ds = check('fn f(x: i32) i32 {\n    let a = x + 1 << 2;\n    let = 1;\n    return a;\n}\n', 'nofix');
+    if (typeof ds === 'string') return ds;
+    const got = ds.map((x) => `${x.code}:${x.fixes.length}`).join(' ');
+    return got === 'E0150:0 E0100:0' ? null : `got ${got}`;
+  };
+  const near = (src, name, wantNote, wantFix) => () => {
+    const ds = check(src, name);
+    if (typeof ds === 'string') return ds;
+    if (ds.length !== 1) return `${ds.length} errors: ${ds.map((x) => x.code).join(' ')}`;
+    const notes = ds[0].notes.map((n) => n.message);
+    if (!notes.some((n) => n.includes(wantNote))) return `notes: ${JSON.stringify(notes)}`;
+    const fixes = ds[0].fixes.map((x) => `${x.applicability}:${x.edits.map((e) => e.replacement).join()}`);
+    return fixes.join(' ') === (wantFix ? `suggestion:${wantFix}` : '') ? null : `fixes: ${fixes.join(' ')}`;
+  };
+  cases['an unknown name: the nearest local'] = near('fn f(count: i32) i32 {\n    return coutn + 1;\n}\n', 'local',
+    "did you mean 'count'? count: i32", 'count');
+  cases['an unknown field: the nearest field'] = near('struct P {\n    x_pos: i32,\n}\n\nfn f(p: P) i32 {\n    return p.x_pso;\n}\n',
+    'field', "did you mean 'x_pos'? x_pos: i32", 'x_pos');
+  cases['a name a module does not declare: the nearest, with its signature'] = near(
+    'import "std/fmt" as fmt;\n\nexport fn main() i32 {\n    fmt.println("hi", []) catch return 1;\n    return 0;\n}\n', 'module',
+    "did you mean 'print'? fn print(", 'print');
+  cases['two names as near: notes, no fix'] = near('fn f(abc: i32, abd: i32) i32 {\n    return abe;\n}\n', 'two-near',
+    "did you mean 'abc'?", null);
+  cases['the editor completes in a poisoned body (`p.` being typed)'] = () => {
+    const f = path.join(tmp, 'one-complete.ax');
+    fs.writeFileSync(f, 'struct P {\n    xpos: i32,\n}\n\nfn f(p: P) i32 {\n    let a = p.\n    return 1;\n}\n');
+    const c = spawnSync(compiler, ['ide', f, '--query=completion', '--pos=5:14'], { encoding: 'utf8', input: '' });
+    return c.stdout.includes('"label":"xpos"') ? null : `completion: ${c.stdout}${c.stderr}`;
+  };
+  cases['look-alikes of the idioms of other languages are not errors'] = codes('',
+    'fn f(a: i64, b: i64, c: i64, d: i64) i64 {\n    if g(a<b, c>(d)) {\n        return a--b;\n    }\n    return 0;\n}\n\nfn g(x: bool, y: bool) bool {\n    return x and y;\n}\n', 'alike');
+  await section('one error per mistake', cases, { timed: false });
 }
 
 // The C parser (docs/c-frontend.md; the compiler only): each

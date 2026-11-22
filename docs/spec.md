@@ -2846,6 +2846,34 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
 | `fixes[].applicability` | `"machine"`: applying every edit yields a program without this diagnostic, and the fix does not change intended semantics. `"suggestion"`: plausible, needs review. `"placeholder"`: the edit contains `<…>` holes that must be filled in |
 | `fixes[].edits` | Non-overlapping byte-range replacements, applied together atomically |
 
+**Syntax errors.** A declaration (a function, a method, or another top-level declaration)
+with a syntax error is *poisoned*. What follows the error in it was parsed from a guess, so:
+
+- the parser reports at most one `E0100` in it;
+- its body (a function's, or a global's initializer) is not checked; its signature is, so
+  code that uses it is checked as usual (an editor's questions other than the
+  diagnostics, such as completion, still see the body's types);
+- no diagnostic inside it has a fix.
+
+When the parser cannot find where the statement with the error ends, it resumes at the next
+token in column 1 that starts a top-level declaration; a keyword that only starts a
+declaration (`fn`, `pub`, `struct`, ...) first on its line inside a block ends the block,
+as a `}` is missing there.
+
+**Idioms of other languages.** A form that another language spells differently (`!x`, `&&`,
+`i++`, `fn f() -> T`, `x as T`, `Vec<T>`, ...) is reported by its own code (`E0160` to
+`E0179`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
+`machine` fix, and the declaration is checked as if the Axiom form had been written, so
+that the mistake costs one error. The forms whose rewrite needs a choice (the conditional
+operator, a C-style `for`, `if` or `match` as an expression) have a note instead, and
+poison their declaration.
+
+**Nearest names.** With `E0202` (an unknown name, or one a module does not declare) and
+`E0404` (a field or method a type does not have), a note names each of the closest names
+there are (three at most, the closest first) with its signature. When exactly one is
+within two edits (insertions, deletions or substitutions of a byte) of the name written,
+the diagnostic has a `suggestion` fix that writes it.
+
 ### 16.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.
@@ -2881,6 +2909,26 @@ it does (and that each is asserted by a test):
 | E0110 | Expressions, types and blocks nested more than 1000 levels deep (§3) |
 | E0120 | Unknown builtin |
 | E0150 | Operators require parentheses (§7.4) |
+| E0160 | `!x` for `not x` |
+| E0161 | `&&` or `\|\|` for `and` or `or` |
+| E0162 | A struct literal `T{ ... }`, without the `.` of `T.{ ... }` |
+| E0163 | `->` or `:` before a function's return type |
+| E0164 | `x++` or `x--` (or before `x`) for `x += 1` or `x -= 1` |
+| E0165 | The conditional operator `c ? a : b` |
+| E0166 | `x as T` for `@as(T, x)` (or `@int_cast(T, x)`, when it may not fit) |
+| E0167 | `try f()` or `f()?` for `f()!` |
+| E0168 | `null`, `None`, `Some(x)`, `Ok(x)` or `Err(e)` for `.none`, `.some(x)`, `x` or `e` |
+| E0169 | `::` for `.` |
+| E0170 | `var x` or `mut x` for `let mut x` |
+| E0171 | `.len()` on a slice or array, whose `len` is a field |
+| E0172 | `if` or `match` used as an expression |
+| E0173 | A C-style `for (init; cond; step)` |
+| E0174 | An inclusive range `lo..=hi` for `lo..hi + 1` |
+| E0175 | A prefix `*p` for `p.*` |
+| E0176 | Generic parameters or arguments in angle brackets: `fn id<T>`, `Vec<T>` |
+| E0177 | Generic arguments without the `.` of `Name.[T]`: `Name[T]` |
+| E0178 | A string in single quotes |
+| E0179 | `+` on two slices or arrays (`str.concat` joins strings) |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
 | E0203 | Item, method, or field is not public |
@@ -2920,7 +2968,7 @@ it does (and that each is asserted by a test):
 | E0400 | A type expected, found an integer, an expression or a constant |
 | E0401 | Nested error union `!!T` |
 | E0403 | A struct or union that contains itself by value |
-| E0404 | An element, parameter or field of type `void` |
+| E0404 | An element, parameter or field of type `void`; a field, method or member a type does not have |
 | E0405 | A value expected, found a type, module or function |
 | E0406 | Calling something that is not a function |
 | E0407 | Indexing a value that is not an array, slice or pointer to array |

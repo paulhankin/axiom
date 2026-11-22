@@ -1,0 +1,378 @@
+// =============================================================================
+// sema_idioms.ax - forms from other languages that need types to name
+// (spec §16.3, E0160 ... E0179; the parser names the others), and the nearest
+// names offered with an unknown name, field or method; part of sema.ax.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "modload.ax" as modl;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+fn idiom_fix(d: *mut dg.Diag, description: []u8, applicability: []u8, sp: u.Span, text: []u8) void {
+    let fx = dg.fix(d, description, applicability);
+    dg.edit(fx, sp, text);
+}
+
+// The name is in scope here: a local, a generic parameter, a declaration or
+// an import of the module.
+fn name_known(e: *ast.Expr) bool {
+    return u.notnil(scope_lookup(e.name)) or u.notnil(lookup_gparam(&mut C.tc, e.name)) or
+           u.notnil(module_lookup(C.tc.mod, e.name)) or
+           u.notnil(modl.module_lookup_import(C.tc.mod, e.span.file, e.name));
+}
+
+fn is_opt(t: *ast.Type) bool {
+    return u.notnil(t) and (t.kind == ast.TY_OPT);
+}
+
+fn is_errunion(t: *ast.Type) bool {
+    return u.notnil(t) and (t.kind == ast.TY_ERRUNION);
+}
+
+// `null` or `None` as a value (E0168): true if e is one, now checked.
+fn idiom_name(e: *mut ast.Expr, expected: *mut ast.Type) bool {
+    if not (u.str_eq(e.name, "null") or u.str_eq(e.name, "None")) or name_known(e) {
+        return false;
+    }
+    let d = dg.err(e.span, "E0168", u.f1("Axiom has no '%s': an empty optional (?T) is '.none'", e.name));
+    e.cat = ast.CAT_VALUE;
+    if is_opt(expected) {
+        idiom_fix(d, "write '.none'", "machine", e.span, ".none");
+        e.ty = expected;
+    } else {
+        idiom_fix(d, "write '.none'", "suggestion", e.span, ".none");
+        e.ty = ty.t_invalid;
+    }
+    return true;
+}
+
+// `Some(x)`, `Ok(x)` or `Err(e)` (E0168): true if the call e is one, now
+// checked.
+fn idiom_call(e: *mut ast.Expr, expected: *mut ast.Type) bool {
+    let callee = e.a;
+    if callee.kind != ast.E_IDENT {
+        return false;
+    }
+    let n = callee.name;
+    let some = u.str_eq(n, "Some");
+    let ok = u.str_eq(n, "Ok");
+    if not (some or ok or u.str_eq(n, "Err")) or name_known(callee) or (ast.args_of(e).len != 1) {
+        return false;
+    }
+    e.cat = ast.CAT_VALUE;
+    callee.cat = ast.CAT_VALUE;
+    callee.ty = ty.t_invalid;
+    let arg = ast.args_of(e).get(0);
+    let pa = ast.args_mut(e).at_mut(0);
+    // `x`, without the wrapper
+    let open = u.mkspan(e.span.file, e.span.start, arg.span.start);
+    let close = u.mkspan(e.span.file, arg.span.end, e.span.end);
+    if some {
+        let d = dg.err(callee.span, "E0168", "an optional's value is written '.some(x)' in Axiom, not 'Some(x)'");
+        if is_opt(expected) {
+            idiom_fix(d, "write '.some'", "machine", callee.span, ".some");
+            _ = check_expr_to(pa, expected.elem);
+            e.ty = expected;
+            return true;
+        }
+        idiom_fix(d, "write '.some'", "suggestion", callee.span, ".some");
+        _ = check_expr(arg, tnil());
+        e.ty = ty.t_invalid;
+        return true;
+    }
+    let d = dg.err(callee.span, "E0168", u.pick(ok,
+                                                "a function that returns !T returns the value itself in Axiom: 'return x;', not 'Ok(x)'",
+                                                "a function that returns !T returns an error as 'error.Name' in Axiom, not 'Err(...)'"));
+    let fits = is_errunion(expected) and (ok or (arg.kind == ast.E_ERROR_VAL));
+    let fx = dg.fix(d, u.pick(ok, "remove 'Ok(...)'", "remove 'Err(...)'"), u.pick(fits, "machine", "suggestion"));
+    dg.edit(fx, open, "");
+    dg.edit(fx, close, "");
+    if fits {
+        if ok {
+            _ = check_expr_to(pa, expected.elem);
+        } else {
+            _ = check_expr_to(pa, expected);
+        }
+        e.ty = expected;
+        return true;
+    }
+    _ = check_expr(arg, tnil());
+    e.ty = ty.t_invalid;
+    return true;
+}
+
+// `s.len()` (E0171): true if the call e is one, now checked.
+fn idiom_len_call(e: *mut ast.Expr) bool {
+    let callee = e.a;
+    if (callee.kind != ast.E_FIELD) or (callee.cat != ast.CAT_VALUE) or (ast.args_of(e).len != 0) {
+        return false;
+    }
+    let fk = ast.field_kind_of(callee);
+    if (fk != ast.FK_SLICE_LEN) and (fk != ast.FK_ARRAY_LEN) {
+        return false;
+    }
+    let d = dg.err(e.span, "E0171", "'len' is a field in Axiom, not a method: write 's.len', not 's.len()'");
+    idiom_fix(d, "remove '()'", "machine", u.mkspan(e.span.file, callee.span.end, e.span.end), "");
+    e.cat = ast.CAT_VALUE;
+    e.ty = callee.ty;
+    return true;
+}
+
+// `x?` (E0167), whose operand has type t: true if it then passes an error on
+// as `x!` does.
+fn idiom_question(e: *mut ast.Expr, t: *mut ast.Type) bool {
+    let q = ast.name_span_of(e);
+    if t.kind == ast.TY_ERRUNION {
+        let d = dg.err(q, "E0167", "Axiom passes an error on with '!' after the call, 'f()!', not '?'");
+        idiom_fix(d, "write '!'", "machine", q, "!");
+        return true;
+    }
+    if t.kind == ast.TY_OPT {
+        let d = dg.err(q, "E0167", "'?' is not an operator in Axiom: an optional is unwrapped with '??'");
+        dg.note(d, q, "for example 'x ?? return .none', or 'if let .some(v) = x { ... }'");
+        e.ty = t.elem;
+        return false;
+    }
+    _ = dg.err(q, "E0167", u.f1("'?' is not an operator in Axiom (the operand has type %s)", tstr(t)));
+    e.ty = ty.t_invalid;
+    return false;
+}
+
+// `a + b` on slices or arrays (E0179): true if it was that.
+fn idiom_concat(op: lx.TokKind, t: *mut ast.Type, sp: u.Span) bool {
+    if (op != lx.TK_PLUS) or ((t.kind != ast.TY_SLICE) and (t.kind != ast.TY_ARRAY)) {
+        return false;
+    }
+    let d = dg.err(sp, "E0179", u.f1("'+' does not join slices in Axiom (the operands have type %s)", tstr(t)));
+    if t.elem == ty.t_u8 {
+        dg.note(d, sp, "str.concat(a, b) from std/str joins two strings into a new one, which the caller frees");
+    } else {
+        dg.note(d, sp, "copy both into a new slice (std/mem), or append them to a list");
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Nearest names (E0202, E0404): a note for each of the closest names, with
+// its signature, and a suggestion when exactly one is within two edits.
+// ---------------------------------------------------------------------------
+struct Near {
+    name: []u8,
+    sig: []u8,
+    span: u.Span,
+    dist: usize,
+}
+
+// The edit distance of a and b (insertions, deletions, substitutions), or
+// more than `max` (as max + 1) when it is more.
+fn edit_distance(a: []u8, b: []u8, max: usize) usize {
+    if (a.len > 64) or (b.len > 64) {
+        return max + 1;
+    }
+    let mut row: [65]usize = [0; 65];
+    for j in 0..b.len + 1 {
+        row[j] = j;
+    }
+    for i in 0..a.len {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        let mut low = row[0];
+        for j in 0..b.len {
+            let cur = row[j + 1];
+            let mut best = prev;
+            if a[i] != b[j] {
+                best = @min(@min(prev, cur), row[j]) + 1;
+            }
+            row[j + 1] = best;
+            low = @min(low, best);
+            prev = cur;
+        }
+        if low > max {
+            return max + 1;
+        }
+    }
+    return row[b.len];
+}
+
+// How far a name may be from the one written to be offered.
+fn near_limit(name: []u8) usize {
+    if name.len >= 8 {
+        return 3;
+    }
+    return 2;
+}
+
+fn near_add(list: *mut u.List.[Near], want: []u8, name: []u8, sig: []u8, sp: u.Span) void {
+    if u.str_eq(name, want) or (name.len == 0) or (name[0] == '<') {
+        return;
+    }
+    let d = edit_distance(want, name, near_limit(want));
+    if (d > near_limit(want)) or (d >= @max(want.len, name.len)) {
+        return;
+    }
+    for i in 0..list.len {
+        if u.str_eq(list.at(i).name, name) {
+            return;
+        }
+    }
+    list.push(Near.{ name: name, sig: sig, span: sp, dist: d });
+}
+
+fn decl_sig(d: *mut ast.Decl) []u8 {
+    let k = d.kind;
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        if u.notnil(d.ty) and (d.ty.kind == ast.TY_FN) {
+            return u.f2("fn %s%s", d.name, tstr(d.ty)[2..]);
+        }
+        return u.f1("fn %s", d.name);
+    }
+    if (k == ast.D_CONST) or (k == ast.D_GLOBAL) {
+        if u.notnil(d.ty) {
+            return u.f2("%s: %s", d.name, tstr(d.ty));
+        }
+        return d.name;
+    }
+    if k == ast.D_STRUCT {
+        return u.f1("struct %s", d.name);
+    }
+    if k == ast.D_UNION {
+        return u.f1("union %s", d.name);
+    }
+    if k == ast.D_ENUM {
+        return u.f1("enum %s", d.name);
+    }
+    if k == ast.D_IMPORT {
+        return u.f2("import \"%s\" as %s", d.import_path, d.name);
+    }
+    return d.name;
+}
+
+// The declarations of module m that code in file `file` of module `from`
+// may name (types only, when `types`), near `want`.
+fn near_decls(list: *mut u.List.[Near], m: *mut ast.Module, want: []u8, from: *mut ast.Module, file: i32,
+              types: bool) void {
+    if u.isnil(m) {
+        return;
+    }
+    for d in m.decls.items() {
+        let k = d.kind;
+        if d.is_test or (k == ast.D_ERROR) {
+            continue;
+        }
+        if k == ast.D_IMPORT {
+            if (m == from) and (d.span.file == file) and not types {
+                near_add(list, want, d.name, decl_sig(d), d.name_span);
+            }
+            continue;
+        }
+        let is_type = (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM);
+        if (types and not is_type) or ((m != from) and not d.is_pub) {
+            continue;
+        }
+        near_add(list, want, d.name, decl_sig(d), d.name_span);
+    }
+}
+
+// Notes on d for the names of `list`, the closest first (three at most), and
+// the suggestion to write the closest when it is the only one within two
+// edits of what was written at sp.
+fn near_report(d: *mut dg.Diag, list: *mut u.List.[Near], sp: u.Span) void {
+    if u.isnil(d) or (list.len == 0) {
+        list.deinit();
+        return;
+    }
+    let mut order = u.List.[usize].empty();
+    for i in 0..list.len {
+        order.push(i);
+    }
+    // (few: a selection sort, by distance then name)
+    for i in 0..order.len {
+        let mut best = i;
+        for j in i + 1..order.len {
+            let a = list.at(order.get(j));
+            let b = list.at(order.get(best));
+            if (a.dist < b.dist) or ((a.dist == b.dist) and (u.str_cmp(a.name, b.name) < 0)) {
+                best = j;
+            }
+        }
+        let t = order.get(i);
+        order.set(i, order.get(best));
+        order.set(best, t);
+    }
+    let mut close: usize = 0;
+    for i in 0..list.len {
+        if list.at(i).dist <= 2 {
+            close += 1;
+        }
+    }
+    for i in 0..@min(order.len, 3) {
+        let n = list.at(order.get(i));
+        dg.note(d, n.span, u.f2("did you mean '%s'? %s", n.name, n.sig));
+    }
+    let first = list.at(order.get(0));
+    if (close == 1) and (first.dist <= 2) {
+        idiom_fix(d, u.f1("write '%s'", first.name), "suggestion", sp, first.name);
+    }
+    order.deinit();
+    list.deinit();
+}
+
+// An unknown name in an expression.
+fn near_ident(d: *mut dg.Diag, e: *ast.Expr) void {
+    let mut list = u.List.[Near].empty();
+    let mut i = C.scope.len;
+    while i > 0 {
+        i -= 1;
+        let l = C.scope.at(i).local;
+        if u.notnil(l) and u.notnil(l.ty) {
+            near_add(&mut list, e.name, l.name, u.f2("%s: %s", l.name, tstr(l.ty)), l.span);
+        }
+    }
+    near_decls(&mut list, C.tc.mod, e.name, C.tc.mod, e.span.file, false);
+    near_report(d, &mut list, e.span);
+}
+
+// A name a module m does not declare, named in module `from` (`types`: as
+// a type).
+fn near_module(d: *mut dg.Diag, m: *mut ast.Module, from: *mut ast.Module, name: []u8, sp: u.Span, types: bool) void {
+    let mut list = u.List.[Near].empty();
+    near_decls(&mut list, m, name, from, sp.file, types);
+    near_report(d, &mut list, sp);
+}
+
+// A field or method that type t (a struct, union or enum, or a pointer to
+// one) does not have.
+fn near_member(d: *mut dg.Diag, t: *mut ast.Type, name: []u8, sp: u.Span) void {
+    let mut base = t;
+    if (base.kind == ast.TY_PTR) and u.notnil(base.elem) {
+        base = base.elem;
+    }
+    let mut list = u.List.[Near].empty();
+    if (base.kind == ast.TY_SLICE) or (base.kind == ast.TY_ARRAY) {
+        near_add(&mut list, name, "len", "len: usize", sp);
+    }
+    if ((base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM)) and
+       u.notnil(base.decl) {
+        let bd = base.decl;
+        if base.kind == ast.TY_STRUCT {
+            for fi in 0..bd.fields.len {
+                let f = bd.fields.at(fi);
+                if bd.anon or f.is_pub or (bd.module == C.tc.mod) {
+                    near_add(&mut list, name, f.name, u.f2("%s: %s", f.name, tstr(ty.type_field(base, fi))), f.span);
+                }
+            }
+        } else {
+            for v in bd.variants.items() {
+                near_add(&mut list, name, v.name, v.name, v.span);
+            }
+        }
+        for m in bd.methods.items() {
+            if m.is_pub or (m.module == C.tc.mod) {
+                near_add(&mut list, name, m.name, decl_sig(m), m.name_span);
+            }
+        }
+    }
+    near_report(d, &mut list, sp);
+}
