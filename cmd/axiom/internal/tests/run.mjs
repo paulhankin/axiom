@@ -2040,6 +2040,19 @@ await section('axiom test', {
     const wasm = fs.readFileSync(path.join(dir, 't64.wasm'));
     return wasm.includes(Buffer.from('AddressSanitizer')) ? 'wasm64: built with the sanitizer' : null;
   },
+  // (testing/lifetime.ax, which fails with T0012 under axiom test: W0711 is
+  // off by default, and with --warn=W0711 at both of its uses after free)
+  'W0711 is off by default, and --warn=W0711 turns it on': () => {
+    const f = path.join(root, 'cmd/axiom/internal/tests/testing/lifetime.ax');
+    const warnings = (flags) => {
+      const r = spawnSync(compiler, ['check', f, '--format=agent-json', ...flags], { encoding: 'utf8' });
+      return JSON.parse(r.stdout).diagnostics.map((x) => `${x.code}:${x.span.start_line}:${x.span.start_col}`).join(' ');
+    };
+    const off = warnings([]);
+    if (off) return `without the flag: ${off}`;
+    const on = warnings(['--warn=W0711']);
+    return on === 'W0711:25:13 W0711:25:20' ? null : `with --warn=W0711: ${on}`;
+  },
 }, { timed: false });
 
 // The tour (docs/tour.md): each program in docs/tour/ appears verbatim in
