@@ -351,11 +351,11 @@ boilerplate (`loop { let x = it.next() ?? break; ... }`).
 - **D5. Keep it that way.** `run.mjs` checks that every public method named `next` in
   the library has one of the two signatures.
 
-### Open decision
+### Decided
 
-Whether `for` should drive iterators after all. It is what an agent writes first, and
-the D3 fix makes that mistake cost one round. This plan recommends against it, to keep
-the mandate's rule without an exception.
+`for` does not drive iterators (D3). It is what an agent writes first, and the D3 fix
+makes that mistake cost one round; the mandate's rule of no implicit calls keeps no
+exception.
 
 ---
 
@@ -482,15 +482,18 @@ lines at once. An agent looking for a hash map also has to search past an AV1 de
     as a stress test of the backend.
   - Work on the C front end does not delay workstreams A to F.
 
-### Open decisions
+### Decided
 
-- **The AAC decoder.** It is under the LGPL, and `CLAUDE.md` forbids adding copyleft
-  code. Either `CLAUDE.md` records the exception, or the decoder moves to its own
-  repository and is used as a git dependency. This plan recommends the second.
-- **Media in this repository or its own.** Keeping it here keeps language migrations
-  atomic. Moving it out makes the repository match its stated scope. This plan
-  recommends keeping it here, under `lib/`, until the language stops making breaking
-  changes.
+- **The AAC decoder stays, as a recorded exception.** It is under the LGPL, and
+  `CLAUDE.md` forbids adding copyleft code. `CLAUDE.md`'s licensing section gains the
+  exception by name: the decoder (`audio/aac.ax` and `audio/internal/aac/`) keeps its
+  license, a program includes it only by importing it, and nothing else under a
+  copyleft license is added. It moves to `lib/` with the rest of `audio`.
+- **Media stays in this repository**, under `lib/`. That keeps language migrations
+  atomic while the language is still making breaking changes.
+
+### Open decision
+
 - **Where `encoding/json`, `net` sockets and `crypto` hashes belong.** The table puts
   JSON in core and the others in libraries. The compiler imports `crypto/sha2` and
   `crypto/md5`, so either those two move to `std/hash/` or the compiler's rule becomes
