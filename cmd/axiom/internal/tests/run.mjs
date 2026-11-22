@@ -25,7 +25,8 @@
 // tests skipped and why. Environment: AXIOM_TEST_JOBS (tests run at a time;
 // default the CPUs, 1 is serial); AXIOM_TEST_SKIP_PLATFORM=1 skips what does
 // not depend on the target and flags (fmt, macOS, Windows, the wasm32 check
-// of cmd/axiom/src), for runs after the first of several configurations.
+// of cmd/axiom/src), for runs after the first of several configurations;
+// AXIOM_UPDATE_DOC=1 rewrites the golden outputs of `axiom doc`.
 //
 // The suite is a list of sections (section(...) below): a map from test
 // names to functions that return null, a problem (a string), or
@@ -2055,19 +2056,19 @@ await section('axiom test', {
 // that no test can reach is listed here with the reason.
 await section('spec §16.3', {
   'diagnostic codes: the compiler, the spec and the tests agree': () => {
-    const codesIn = (text) => new Set([...text.matchAll(/"(E\d{4})"/g)].map((m) => m[1]));
+    const codesIn = (text) => new Set([...text.matchAll(/"([EW]\d{4})"/g)].map((m) => m[1]));
     const readAll = (dir, ext) => fs.readdirSync(dir).filter((f) => f.endsWith(ext)).map((f) => fs.readFileSync(path.join(dir, f), 'utf8')).join('\n');
     const emittedAx = codesIn(readAll(path.join(root, 'cmd/axiom/src'), '.ax'));
     const spec = fs.readFileSync(path.join(root, 'docs/spec.md'), 'utf8');
     const tableText = spec.slice(spec.indexOf('### 16.3 Diagnostic codes'), spec.indexOf('### 16.4 '));
-    const table = new Set([...tableText.matchAll(/^\| (E\d{4}) \|/gm)].map((m) => m[1]));
+    const table = new Set([...tableText.matchAll(/^\| ([EW]\d{4}) \|/gm)].map((m) => m[1]));
     // codes a test asserts: expect-error directives, and codes named in the suite's own checks
     const asserted = new Set();
     const walk = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
         const p = path.join(dir, e.name);
         if (e.isDirectory()) walk(p);
-        else if (/\.(ax|mjs|toml)$/.test(e.name)) for (const m of fs.readFileSync(p, 'utf8').matchAll(/\bE\d{4}\b/g)) asserted.add(m[0]);
+        else if (/\.(ax|mjs|toml)$/.test(e.name)) for (const m of fs.readFileSync(p, 'utf8').matchAll(/\b[EW]\d{4}\b/g)) asserted.add(m[0]);
       }
     };
     walk(path.join(root, 'cmd/axiom/internal/tests'));
@@ -2683,6 +2684,120 @@ if (!skipPlatform) {
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
   await section('fmt', cases, { timed: false });
+}
+
+// `axiom doc` (spec §16.10). The outputs of the commands below match
+// cmd/axiom/internal/tests/doc/<name>.txt (human) and <name>.json
+// (agent-json), for a fixture module (doc/shapes.ax, with a part file and an
+// error set from another module) and for std/str; AXIOM_UPDATE_DOC=1
+// rewrites them. Every module `axiom doc std` lists has a summary; a module
+// that does not compile is documented; W0320 is off by default.
+if (!skipPlatform) {
+  const ddir = path.join(root, 'cmd/axiom/internal/tests/doc');
+  const stdFlag = `--std=${path.join(root, 'std')}`;
+  const doc = (args, cwd = root) => spawnSync(compiler, ['doc', ...args, stdFlag], { encoding: 'utf8', cwd });
+  const fx = 'cmd/axiom/internal/tests/doc/shapes.ax';
+  const goldens = {
+    shapes: [[fx], [`${fx}.Point`], [`${fx}.Point.dist`], [`${fx}.Shape`], [`${fx}.Dir`], [`${fx}.circle`],
+      [`${fx}.circle_in`], [`${fx}.polygon`], [`${fx}.AnyError`], [`${fx}.LIMIT`], ['--search=circle', fx]],
+    str: [['std/str'], ['std/str.split'], ['std/str.Split'], ['std/str.String'], ['std/str.StrError'],
+      ['--search=trim', 'std/str']],
+  };
+  const firstDiff = (got, want) => {
+    const g = got.split('\n'), w = want.split('\n');
+    const i = g.findIndex((l, k) => l !== w[k]);
+    const k = i < 0 ? Math.min(g.length, w.length) : i;
+    return `line ${k + 1}:\n  got:      ${g[k] ?? '(end)'}\n  expected: ${w[k] ?? '(end)'}`;
+  };
+  const cases = {};
+  for (const [name, cmds] of Object.entries(goldens)) {
+    for (const json of [false, true]) {
+      const file = path.join(ddir, `${name}.${json ? 'json' : 'txt'}`);
+      cases[path.basename(file)] = () => {
+        let text = '';
+        for (const c of cmds) {
+          const args = json ? [...c, '--format=agent-json'] : c;
+          const r = doc(args);
+          if (r.status !== 0 || r.stderr) return `axiom doc ${args.join(' ')}: status ${r.status}:\n${r.stderr}${r.stdout}`;
+          if (json) {
+            let o = null;
+            try { o = JSON.parse(r.stdout); } catch { return `axiom doc ${args.join(' ')}: not JSON:\n${r.stdout}`; }
+            if (o.schema !== 'axiom-doc/1' || o.status !== 'ok') return `axiom doc ${args.join(' ')}: schema ${o.schema}, status ${o.status}`;
+          }
+          text += `$ axiom doc ${args.join(' ')}\n${r.stdout}`;
+        }
+        if (process.env.AXIOM_UPDATE_DOC) {
+          fs.writeFileSync(file, text);
+          return null;
+        }
+        const want = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+        return text === want ? null : `differs from ${path.basename(file)} (AXIOM_UPDATE_DOC=1 rewrites it): ${firstDiff(text, want)}`;
+      };
+    }
+  }
+  cases['every module axiom doc std lists has a summary'] = () => {
+    const r = doc(['std', '--format=agent-json']);
+    if (r.status !== 0) return `status ${r.status}: ${r.stderr}`;
+    const mods = JSON.parse(r.stdout).modules;
+    if (mods.length < 100) return `only ${mods.length} modules listed`;
+    if (mods.some((m) => m.name.includes('/internal/') || m.name.includes('/testdata/'))) return 'internal or testdata modules listed';
+    const missing = mods.filter((m) => !m.summary).map((m) => m.name);
+    return missing.length ? `no summary (a first comment block): ${missing.join(' ')}` : null;
+  };
+  cases['a module that does not compile is documented'] = () => {
+    const f = path.join(tmp, 'doc_broken.ax');
+    fs.writeFileSync(f, '// doc_broken.ax - a module with errors.\n\n/// One.\npub fn one() i32 {\n    return 1 +;\n}\n\n/// Two.\npub fn two() Missing {\n    return nothing;\n}\n');
+    const c = spawnSync(compiler, ['check', f, stdFlag], { encoding: 'utf8' });
+    if (c.status !== 1) return `axiom check: status ${c.status}`;
+    const r = doc([f]);
+    const want = 'a module with errors.\n\npub fn one() i32  // One.\npub fn two() Missing  // Two.\n';
+    if (r.status !== 0 || !r.stdout.endsWith(want)) return `status ${r.status}:\n${r.stdout}${r.stderr}`;
+    const s = doc([`${f}.two`, '--search=x']);
+    return s.status === 2 ? null : `an item as the root of --search: status ${s.status}`;
+  };
+  cases['pkg:<name> and a package directory'] = () => {
+    const dir = path.join(tmp, 'docpkg');
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'axiom.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\n');
+    fs.writeFileSync(path.join(dir, 'src/lib.ax'), '// geo - geometry.\n\n/// Twice x.\npub fn twice(x: i32) i32 {\n    return x * 2;\n}\n');
+    fs.writeFileSync(path.join(dir, 'src/more.ax'), '// more - more geometry.\n\n/// Thrice x.\npub fn thrice(x: i32) i32 {\n    return x * 3;\n}\n');
+    const want = 'module pkg:geo (src/lib.ax)\ngeo - geometry.\n\npub fn twice(x: i32) i32  // Twice x.\n';
+    const a = doc(['pkg:geo'], dir);
+    if (a.status !== 0 || a.stdout !== want) return `pkg:geo: status ${a.status}:\n${a.stdout}${a.stderr}`;
+    const b = doc(['pkg:geo/more.thrice'], dir);
+    if (b.status !== 0 || !b.stdout.startsWith('pkg:geo/more.thrice\npub fn thrice(x: i32) i32\n\nThrice x.\n')) return `pkg:geo/more.thrice: status ${b.status}:\n${b.stdout}${b.stderr}`;
+    const c = doc([dir]);
+    if (c.status !== 0 || !c.stdout.startsWith('module pkg:geo')) return `the package directory: status ${c.status}:\n${c.stdout}${c.stderr}`;
+    const d = doc(['pkg:nope', '--format=agent-json'], dir);
+    return d.status === 1 && JSON.parse(d.stdout).diagnostics[0].code === 'E0214' ? null : `pkg:nope: status ${d.status}: ${d.stdout}`;
+  };
+  cases['what is not found, and invalid invocations'] = () => {
+    const codeOf = (args) => {
+      const r = doc([...args, '--format=agent-json']);
+      let o = null;
+      try { o = JSON.parse(r.stdout); } catch { return `${r.status} (not JSON: ${r.stdout})`; }
+      return o.schema === 'axiom-diagnostics/1' ? `${r.status} ${o.diagnostics[0].code}` : `${r.status} ${o.schema}`;
+    };
+    const want = [[['std/str.nope'], '1 E0202'], [['std/str.Split.nope'], '1 E0202'], [['std/nope'], '1 E0211'],
+      [['std/str', '--bogus'], '2 E9001'], [['std/str', 'std/fmt'], '2 E9001']];
+    for (const [args, w] of want) {
+      const got = codeOf(args);
+      if (got !== w) return `axiom doc ${args.join(' ')}: ${got}, expected ${w}`;
+    }
+    const r = doc(['std/str.splt']);
+    return /similar: .*split/.test(r.stderr) ? null : `no suggestion: ${r.stderr}`;
+  };
+  cases['W0320 is off by default, and --warn=W0320 turns it on'] = () => {
+    const warnings = (flags) => {
+      const r = spawnSync(compiler, ['check', fx, stdFlag, '--format=agent-json', ...flags], { encoding: 'utf8', cwd: root });
+      return JSON.parse(r.stdout).diagnostics.filter((x) => x.code === 'W0320').map((x) => `${path.basename(x.file)}:${x.span.start_line}`);
+    };
+    const off = warnings([]);
+    if (off.length) return `without the flag: ${off.join(' ')}`;
+    const on = warnings(['--warn=W0320']).join(' ');
+    return on === 'shapes.ax:42 shapes.ax:95' ? null : `with --warn=W0320: ${on}`;
+  };
+  await section('axiom doc', cases, { timed: false });
 }
 
 // Debug information (-g; the compiler only): cmd/axiom/internal/tests/dwarf.mjs

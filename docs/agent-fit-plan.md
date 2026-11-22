@@ -265,6 +265,44 @@ axiom doc --search=split [std/]       # public items whose name or documentation
 Golden outputs for a small fixture module and for `std/str`, in both formats. `run.mjs`
 checks that every module listed by `axiom doc std` has a summary.
 
+### Status
+
+Done, but for turning `W0320` on for the core library, which is workstream G's.
+
+- `cmd/axiom/src/doc.ax`: every form of the design above, and `axiom doc <file.ax>`,
+  `<file.ax>.<item>`, a directory (`std/net/` lists the directory, `std/net` is the
+  module), a package directory, and `--search` under any of them. Signatures are
+  `ide.ax`'s (`sig_of`, as hover shows them), documentation its `doc_comment`. An
+  item's output expands a named error set, through the sets it includes and across
+  imports. An item that is not found is `E0202` with the module's similar names.
+  `--format=agent-json` is `axiom-doc/1` (spec §16.10; `docs/cli.md`).
+- Measured on one x86-64 Linux machine (median of 15 runs): `axiom doc std/str` 1.6 ms
+  (5.9 kB of output), `axiom doc std/str.split` 1.6 ms, `axiom doc std` 32 ms (212
+  modules, 28.6 kB: it reads every file of `std/` to find the part files), `axiom doc
+  --search=split` 0.35 s (it parses every module).
+- Module summaries: every one of the 212 modules `axiom doc std` lists (the `.ax` files
+  outside `internal/` and `testdata/` directories that are not part files) already had
+  one, so none was added; `run.mjs` checks all of them. Some summaries' first sentence
+  is long (the C runtime's modules).
+- `W0320`, off by default, is turned on by `--warn=W0320` (for `build`, `check` and
+  `test`), for the modules whose tests would run (spec §17.2). It treats only `///` as
+  documentation, as hover does. The registry in spec §16.3 now lists the warnings, and
+  its test in `run.mjs` checks `W` codes as it checks `E` codes; `W0601` and `W0631`,
+  which no test asserted, have one (`errors/unreachable_warn.ax`).
+- By `axiom doc`'s count, 3,039 of std's 5,330 public items and methods (57%) have a
+  `///` comment: what `W0320` would report today for all of std is the other 2,291.
+- Tests: golden outputs (`cmd/axiom/internal/tests/doc/`) for the fixture module
+  `shapes.ax` (a part file, an error set from another module, an item of each kind) and
+  for `std/str`, in both formats (`AXIOM_UPDATE_DOC=1` rewrites them); a module with
+  syntax and type errors; `pkg:`; what is not found; `W0320` off and on
+  (`errors/undocumented_warn.ax`).
+
+Not done:
+
+- `W0320` is not turned on for any part of `std/` (workstream G).
+- The language server does not use `doc.ax` (hover has its own, which shows the
+  doc comment but not the expanded error set).
+
 ---
 
 ## C. Memory Lifetime: An Accurate Claim

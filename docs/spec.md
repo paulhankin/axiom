@@ -2758,6 +2758,7 @@ axiom test  <file.ax | package dir> [--filter=text] [--timeout=ms] [--show-outpu
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 axiom profile <file.ax | package dir> [-- args]  # sampling profiler (§16.6)
 axiom new   <name>                               # create a package skeleton (§4.6)
+axiom doc   <std | module[.item] | dir> [--search=text]   # signatures and documentation (§16.10)
 axiom cache [path|size|clean]                    # the compiled-module cache (§16.7)
 axiom lsp                                        # the language server, over standard input and output
 axiom version                                    # the compiler's version
@@ -2774,7 +2775,8 @@ overflow, to find unintended overflows; `saturate` clamps. The remaining options
 settings, environment variables, exit codes) are the compiler's own and are listed in
 [`docs/cli.md`](cli.md); this specification defines the interfaces tools rely on: the
 diagnostics (§16.2, §16.3), the trap reports (§16.4), canonical formatting (§16.5), the
-profiler's output (§16.6), the cache's semantics (§16.7) and the test report (§17.2).
+profiler's output (§16.6), the cache's semantics (§16.7), documentation (§16.10) and the
+test report (§17.2).
 
 - Compiler output is **deterministic**. The same inputs and flags produce byte-identical
   outputs and diagnostics.
@@ -2859,7 +2861,7 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`, `W0655` inline error set contains errors the function can never return (§11.3) |
+| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges. A warning does not fail a build; one that is off by default is turned on with `--warn=<code>` |
 | `Txxxx` | Runtime traps (Appendix B) |
 
 The registry. It lists every code the compiler emits, and the test suite checks that
@@ -3016,6 +3018,10 @@ it does (and that each is asserted by a test):
 | E9006 | The test runner or profiler failed |
 | E9007 | Internal failure: code generation or formatting |
 | E9008 | `axiom update` failed: no such release, a download that fails or does not match its checksum, a checkout that cannot be moved or built |
+| W0320 | A public item, or a public method of a public type, without a `///` comment. Off by default: `--warn=W0320` turns it on, for the modules whose tests would run (§17.2) |
+| W0601 | Unreachable statement |
+| W0631 | Unreachable `match` arm after `else` |
+| W0655 | An inline error set contains errors the function can never return (§11.3) |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -3384,6 +3390,48 @@ protocol such fuzzers use. It is supported for native Linux targets (`x86_64`,
 Programs and their tests run slower: a few instructions per block, typically 1.3 to 2
 times the time. `prev` is one per program, not per thread, so
 the edges of threads running at the same time mix.
+
+### 16.10 Documentation
+
+`axiom doc` prints the signatures and documentation of modules and their items
+([`docs/cli.md`](cli.md) lists its forms: `std`, a module such as `std/str`, an item
+such as `std/str.split` or `std/collections/vec.Vec.push`, `pkg:<name>`, a file, a
+directory, and `--search=<text>`). It parses the modules it reads and does not check
+them, so it documents a module that does not compile as far as it parses.
+
+- **Documentation.** An item's documentation is the `///` comment lines just above it.
+  A field's or a variant's is that, or the `//` comment after it on its line. A
+  **module's summary** is the first comment block of its file: the `//` lines (not
+  `///`) from its first line that is not blank, without lines that are only `=` or `-`
+  and without a leading `<path>.ax - `.
+- **Items.** The public declarations of the module's file and its part files: functions,
+  structs, unions, enums, error sets, constants and globals, and the public methods of
+  types. Signatures are printed as written, on one line, without bodies. A function
+  that returns a named error set has the set's names (and those of the sets it
+  includes) listed; `!T` is "any".
+- **Modules.** Those under a directory are its `.ax` files at any depth, but part files
+  and those under a directory named `internal` (§4.1) or `testdata`.
+
+With `--format=agent-json`, stdout holds one object. Its schema is `axiom-doc/1`, with
+the field rules of §16.2; a failure is an `axiom-diagnostics/1` object. One of:
+
+```json
+{"schema":"axiom-doc/1","status":"ok","modules":[
+  {"name":"std/str","file":"std/str.ax","summary":"byte strings: comparing, searching, ..."}]}
+{"schema":"axiom-doc/1","status":"ok","module":{"name":"std/str","file":"std/str.ax",
+  "summary":"<the whole summary>","items":[<item>, ...]}}
+{"schema":"axiom-doc/1","status":"ok","item":<item, in full>}
+{"schema":"axiom-doc/1","status":"ok","query":"split","items":[<item, with "module">, ...]}
+```
+
+An item is `{"name", "kind", "signature", "summary", "file", "line"}`: `kind` is `fn`,
+`method`, `struct`, `union`, `enum`, `error`, `const` or `global`; `summary` is the
+documentation's first sentence; a method has `type` (its type's name), a type
+`methods` (items). In full, an item also has `module`, `doc` (the whole
+documentation), and as they apply `errors` (`{"kind", "set", "names"}`, with `kind`
+one of `set`, `inline`, `any`, `inferred` and `param`, a generic error parameter),
+`names` (an error set's), `fields` and `variants` (`{"name", "type" or "value", "doc",
+"line"}`) and `private_fields` (how many fields are not public).
 
 ## 17. Testing
 

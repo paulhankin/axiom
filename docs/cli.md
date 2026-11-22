@@ -2,8 +2,8 @@
 
 Every command of the compiler, its flags, the environment variables it reads, where it
 keeps its cache, and its exit codes. The stable interfaces for tools are in the
-specification: diagnostics as JSON (spec §16.2), the test report (§17.2) and canonical
-formatting (§16.5). This page describes the compiler as it is; the spec says what is
+specification: diagnostics as JSON (spec §16.2), the test report (§17.2), canonical
+formatting (§16.5) and the documentation of `axiom doc` (§16.10). This page describes the compiler as it is; the spec says what is
 promised.
 
 ```
@@ -15,6 +15,7 @@ axiom test    <file.ax | package dir> [options] [--filter=<text>] [--timeout=<ms
 axiom profile <file.ax | package dir> [options] [--rate=<hz>] [--folded=<path>] [-- <program args>]
 axiom fmt     <file.ax | dir>... [--check] [--stdout]
 axiom new     <name> [--format=agent-json]
+axiom doc     <std | module[.item] | pkg:<name>[/<module>][.item] | file.ax[.item] | dir> [--search=<text>]
 axiom lsp     [--target=<t>] [--std=<dir>]
 axiom cache   [path | size | clean]
 axiom version
@@ -82,6 +83,30 @@ files and directories (searched for `.ax` files).
 
 Creates a package: a directory `name/` with an `axiom.toml` and a `src/lib.ax` that has
 a test (spec §4.6). `--format=agent-json` reports the files created as JSON.
+
+### `axiom doc`
+
+Prints signatures and documentation, for a reader such as an agent that needs the
+signature of `str.split` without reading `std/str.ax` (spec §16.10). It parses and does
+not check, so it answers in milliseconds, and also for a module that does not compile.
+
+| Command | |
+|---|---|
+| `axiom doc std` | The standard library's modules, one a line: the name and the first sentence of its summary. Modules under an `internal/` directory, which a program cannot import, and part files are not listed. |
+| `axiom doc std/str` | A module: its summary, then its public items, one a line: the signature and the first sentence of the documentation as a comment. A type's public methods follow it, indented. |
+| `axiom doc std/str.split` | An item: its signature, its whole documentation, the errors it can return (a named error set expanded into its names, with the sets it includes), and where it is declared. |
+| `axiom doc std/collections/vec.Vec` | A type: its public fields and variants with their comments, its documentation, its public methods. `std/collections/vec.Vec.push` is one method. |
+| `axiom doc pkg:<name>[/<module>][.<item>]` | A module of the package in the current directory, or of one of its dependencies (as `import "pkg:..."` names it). |
+| `axiom doc <file.ax>[.<item>]`, `axiom doc <dir>` | A module by its file; the modules under a directory (`std/net/` is the directory, `std/net` the module), or a package directory's entry module. |
+| `axiom doc --search=<text> [<root>]` | The public items and methods under `root` (the standard library by default; a module, a directory or a package, as above) whose name contains `text` (ignoring ASCII case), then those whose documentation does: one a line, the item's full name, its signature and its first sentence. |
+
+An item's documentation is its `///` lines; a field's or a variant's, those or the
+comment after it on its line. A module's summary is its file's first comment block (the
+`//` lines at its start, without rule lines of `=` or `-` and without a leading
+`std/x.ax - `). `--format=agent-json` gives the same as one JSON object of the schema
+`axiom-doc/1`. An item that is not found is `E0202`, with the module's similar names in the message, and
+a module that is not found `E0211` (exit status 1). `--target` is accepted and changes
+nothing.
 
 ### `axiom lsp`
 
@@ -155,6 +180,7 @@ that lacks the extensions it was built with.
 | `--pic` | Code for a shared library made by another linker: on Linux, thread-locals use the initial-exec model (`--emit=shared` implies it; the rest of the code is position-independent already). |
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
+| `--warn=W0320` | Also warn of each public item, and public method of a public type, that has no `///` comment, in the modules whose tests would run: the input module and its package's modules, or outside a package those not in the standard library (spec §16.3). Off by default. |
 
 ### C sources
 
