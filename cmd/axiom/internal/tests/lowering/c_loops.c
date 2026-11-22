@@ -5,14 +5,14 @@
    addps; AArch64 fmul, fadd of .4s), an integer sum vector adds, a byte
    search vector compares (pcmpeqb; cmeq), a sign extension of a load one
    movslq from memory. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | rep movsb | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | rep stos | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \baddps\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpaddd\b | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpcmpeqb\b | 2
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | movslq\s+\(%r | 1
-// lower-selfhost: --target=native --cpu=x86-64-v3 -O2 --c-freestanding | \bvmulps\s.*ymm | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | rep movsb | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | rep stos | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bmulps\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \baddps\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpaddd\b | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpcmpeqb\b | 2
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | movslq\s+\(%r | 1
+// lower: --target=native --cpu=x86-64-v3 -O2 --c-freestanding | \bvmulps\s.*ymm | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \bfmul\s+v\d+\.4s | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \bfadd\s+v\d+\.4s | 1
 // lower: --target=aarch64 -O2 --c-freestanding | \badd\s+v\d+\.4s | 2

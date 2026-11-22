@@ -4,7 +4,7 @@
    level of the recursion would save and restore (mach.ax save_dearer); one
    live across a call in a loop (s, i, n and k) keeps a callee-saved
    register. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpush\s+%(rbx|r1[2-5])\b | 4
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpush\s+%(rbx|r1[2-5])\b | 4
 typedef struct node { struct node *l, *r; unsigned key; long v; } node;
 void *grab(unsigned long n);
 long tally(long x);

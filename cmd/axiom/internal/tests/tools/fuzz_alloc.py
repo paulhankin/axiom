@@ -14,9 +14,8 @@ build/fuzz/failures/alloc/<lane>-<seed>.txt, with the command that repeats it
 (failures with threads need not repeat every time; run it a few times).
 `alloc <seed> <threads> <mask>` narrows one down (see alloc.ax).
 
-Lanes: o2 and o0 (native, the compiler), asan (native, --sanitize=address),
-llvm (native, the bootstrap compiler, if it is built) and wasm (wasm32 under
-node). All by default. --runs N runs N seeds in all (200 by default);
+Lanes: o2 and o0 (native), asan (native, --sanitize=address) and wasm (wasm32
+under node). All by default. --runs N runs N seeds in all (200 by default);
 --minutes M runs for about M minutes instead. --seed 0 picks a seed from the
 clock and prints it. Each run starts up to 13 threads, so --jobs defaults to
 half the processors.
@@ -34,16 +33,15 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 OUT = os.path.join(ROOT, 'build', 'fuzz')
 SRC = os.path.join(ROOT, 'cmd', 'axiom', 'internal', 'tests', 'fuzz', 'alloc.ax')
 HOST = os.path.join(ROOT, 'std', 'internal', 'runtime', 'host.mjs')
-LANES = ['o2', 'asan', 'o0', 'llvm', 'wasm']
+LANES = ['o2', 'asan', 'o0', 'wasm']
 
 
-def build(lane, compiler, bootstrap):
+def build(lane, compiler):
     exe = os.path.join(OUT, 'alloc-' + lane)
     flags = {
         'o2': [compiler, '--target=native', '-O2'],
         'o0': [compiler, '--target=native', '-O0'],
         'asan': [compiler, '--target=native', '-O2', '--sanitize=address'],
-        'llvm': [bootstrap, '--target=native', '-O2'],
         'wasm': [compiler, '--target=wasm32', '-O2'],
     }[lane]
     if lane == 'wasm':
@@ -74,10 +72,9 @@ def main():
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--compiler', default=os.environ.get('AXIOM', os.path.join(ROOT, 'cmd', 'axiom', 'build', 'axiom')))
-    ap.add_argument('--bootstrap', default=os.path.join(ROOT, 'cmd', 'axiom', 'bootstrap', 'build', 'axiom'))
     ap.add_argument('lanes', nargs='*')
     a = ap.parse_args()
-    lanes = a.lanes or [l for l in LANES if l != 'llvm' or os.access(a.bootstrap, os.X_OK)]
+    lanes = a.lanes or LANES
     for l in lanes:
         if l not in LANES:
             sys.exit('fuzz_alloc: no lane %r (%s)' % (l, ' '.join(LANES)))
@@ -86,7 +83,7 @@ def main():
         print('seed %d' % a.seed)
     os.makedirs(OUT, exist_ok=True)
     fails_dir = os.path.join(OUT, 'failures', 'alloc')
-    cmds = {l: build(l, a.compiler, a.bootstrap) for l in lanes}
+    cmds = {l: build(l, a.compiler) for l in lanes}
     rng = random.Random(a.seed)
     lock = threading.Lock()
     state = {'n': 0, 'runs': {l: 0 for l in lanes}, 'failed': []}

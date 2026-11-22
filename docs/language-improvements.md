@@ -81,18 +81,22 @@ migrate once and every breaking rule in Phases 3-4 already has its idiomatic rep
 
 ---
 
-## Dual-Compiler & Bootstrap Discipline
+## Seed & Bootstrap Discipline
 
-Per `CLAUDE.md`, every phase must satisfy:
-1. All front-end, type-system, and diagnostic changes land in **both**
-   `cmd/axiom/bootstrap/src/` (C11 + LLVM) and `cmd/axiom/src/` (Axiom) with identical
-   diagnostic codes, spans, and `agent-json` fixes.
-2. **Bootstrap ordering:** Never use a new language feature inside `cmd/axiom/src/` until
-   the C bootstrap compiler supports it first.
+There is one compiler, `cmd/axiom/src/` (Axiom), built from the seed that
+`cmd/axiom/seed.toml` pins (`docs/bootstrap-chain.md`). The phases landed before this
+were made in a second compiler too, a bootstrap compiler in C that has since been
+removed. Per `CLAUDE.md`, every phase must satisfy:
+1. All front-end, type-system, and diagnostic changes land in `cmd/axiom/src/`, with
+   their diagnostic codes, spans, and `agent-json` fixes in the spec and the tests.
+2. **Bootstrap ordering:** Never use a new language feature inside `cmd/axiom/src/`, or
+   in the standard library modules it imports, until the pinned seed accepts it: the
+   feature lands first, then a new seed is made with `cmd/axiom/seed.sh` and pinned,
+   then the compiler's sources may use it. A change of meaning needs sources that are
+   correct under both the old and the new meaning until the new seed is pinned.
 3. **Verification gate for every phase:**
    - `cmd/axiom/bootstrap.sh` (stage 2 and stage 3 identical)
-   - `node cmd/axiom/internal/tests/run.mjs`
-   - `AXIOM=cmd/axiom/build/axiom node cmd/axiom/internal/tests/run.mjs` (includes `axiom fmt --check`)
+   - `node cmd/axiom/internal/tests/run.mjs` (includes `axiom fmt --check`)
    - `cmd/axiom/difftest.sh`
 
 ---
@@ -117,9 +121,8 @@ Addresses weaknesses #2, #3a, #3b, #3c, and #3d.
   - `@volatile_store(p: *mut T, v: T) void`
   - `@volatile_zero(s: []mut u8) void`
   - `@black_box(x: T) T` (opaque value barrier preventing constant folding / branch conversion)
-- **Front end & IR:** Add to `ast.ax`, `semabuiltin.ax`, `cgbuiltin.ax` (and bootstrap
-  `builtins.h`, `sema_builtins.c`, `codegen.c`), lowering directly to `ir.F_VOLATILE` and
-  LLVM `volatile` / empty inline-asm barrier.
+- **Front end & IR:** Add to `ast.ax`, `semabuiltin.ax`, `cgbuiltin.ax`, lowering directly to
+  `ir.F_VOLATILE` and an opaque barrier.
 - **Optimizer:** Ensure `cmd/axiom/src/dse.ax` never deletes a volatile memset/store.
 - **Stdlib:** Update `std/crypto/subtle.ax` (`subtle.zero` calls `@volatile_zero`;
   `subtle.equal` and `subtle.is_zero32` shield masks with `@black_box`).
@@ -136,7 +139,6 @@ Addresses weaknesses #2, #3a, #3b, #3c, and #3d.
   - Native x86-64 / AArch64: wire to existing `ir.IN_UMULH`, `ir.IN_SMULH`, `ir.IN_UDIV128`
     and add `adc`/`sbb`/`adds`/`adcs`/`subs`/`sbcs` lowering in `x64isel.ax` and `a64.ax`.
   - WebAssembly (`wasm.ax`): lower to portable 32-bit split sequences.
-  - Bootstrap (`codegen.c`): lower via LLVM `i128` arithmetic.
 - **Stdlib upgrades:**
   - `std/math/bigint.ax`: move from 32-bit limbs to 64-bit limbs.
   - `std/crypto/curve25519.ax`: move from 10 x 25.5-bit limbs to 5 x 51-bit limbs.
@@ -149,8 +151,8 @@ Addresses weaknesses #2, #3a, #3b, #3c, and #3d.
   Allow an optional trailing constant string order (`"relaxed"`, `"acquire"`, `"release"`,
   `"acq_rel"`, `"seq_cst"`), checked at compile time for validity per operation (new error
   code `E0830` for invalid order or invalid operation/order pair such as `"release"` on load).
-- **Lowering:** Map directly to existing `ir.ORD_*` flags (`cmd/axiom/src/ir.ax`) and
-  LLVM atomic orderings in bootstrap; WebAssembly keeps SC instructions (which validly
+- **Lowering:** Map directly to existing `ir.ORD_*` flags (`cmd/axiom/src/ir.ax`);
+  WebAssembly keeps SC instructions (which validly
   implement weaker orders).
 - **Stdlib:** Use `acquire`/`release`/`relaxed` on hot uncontended paths in `std/sync.ax`
   and `std/mem.ax`, verified with `fuzz_alloc.py` and AArch64 benchmarks.
@@ -159,7 +161,7 @@ Addresses weaknesses #2, #3a, #3b, #3c, and #3d.
 - **Grammar (§3.2):** `Param ::= "noalias"? IDENT ":" Type` (`noalias` contextual like
   `inline`/`threadlocal`; valid only on `*T`, `*mut T`, `[]T`, `[]mut T`, else `E0315`).
 - **Lowering:** Set the existing `noalias` parameter attribute already consumed by
-  `ir.restrict_apart` in `gvn.ax` and `vectorize.ax` (and LLVM `noalias` in bootstrap).
+  `ir.restrict_apart` in `gvn.ax` and `vectorize.ax`.
 - **Safety & Sanitizer:** Document in §12.1 that passing overlapping memory to `noalias`
   parameters violates the pointer-access rule. Under `--sanitize=address`, emit slice
   range-overlap checks at function entry that trap `T0012`.
@@ -210,8 +212,7 @@ Addresses weaknesses #4, #5, and #6b.
   `*mut U` (where `U` is a tagged union or `?T`), a payload binding `.Variant(p)` or
   `.some(p)` binds `p: *Payload` or `p: *mut Payload` pointing directly to the payload in
   place, with zero copying.
-- **Implementation:** Update `check_match` / `gen_match` in `sema.ax`, `codegen.ax`,
-  `sema_stmt.c`, and `codegen.c`.
+- **Implementation:** Update `check_match` / `gen_match` in `sema.ax` and `codegen.ax`.
 
 ### 1.4 By-Reference `for` Iteration
 - **Grammar (§8.5):** `ForStmt ::= Label? "for" ( "&" "mut"? )? IDENT "in" Expr ( ".." Expr )? Block`.
@@ -310,7 +311,7 @@ Addresses weaknesses #6a, #6c, and #6d. Scheduled after Phase 1 so `for &mut` an
 
 ### 3.4 Hard Local-Escape Error (`E0710`) + Stack ASan — BREAKING (Language)
 - **Compile-time check:** Promote `W0710` to compile error `E0710` and extend
-  `check_escape` (`cmd/axiom/src/sema.ax`, `cmd/axiom/bootstrap/src/sema_stmt.c`) with
+  `check_escape` (`cmd/axiom/src/sema.ax`) with
   intra-procedural local-origin taint tracking across `let` bindings, assignments, slicing
   (`a[lo..hi]`), field projection, and struct literals. Reject returning a local-derived
   pointer/slice or storing one into a global or parameter-reachable place.
@@ -375,8 +376,7 @@ Addresses weakness #8 and exercises Phases 1-4 inside the self-hosted compiler.
     locally self-contained for agents.
   - Inter-module imports remain strictly acyclic (`E0210`).
 - **Toolchain updates:**
-  - `modload.ax`, `sema.ax`, `units.ax` (and bootstrap `package.c`, `sema_decl.c`,
-    `units.c`): load part files into the owning `ast.Module`, hash the combined module
+  - `modload.ax`, `sema.ax`, `units.ax`: load part files into the owning `ast.Module`, hash the combined module
     interface for separate-compilation caching (§16.7), and optionally emit one cached
     object per part sharing that interface key.
   - `fmt.ax` and `lsp.ax`: tidy `import part` lines and resolve cross-part symbols.

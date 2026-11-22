@@ -35,8 +35,9 @@ copyleft license.
 ## Layout
 
 - `cmd/axiom/`: the compiler, written in Axiom. `cmd/axiom/bootstrap.sh` builds it
-  (to `cmd/axiom/build/axiom`) from the C compiler in `cmd/axiom/bootstrap/`, which
-  exists only for that and needs LLVM 18 (`llvm-18-dev`, `lld`).
+  (to `cmd/axiom/build/axiom`) from a *seed*: the released compiler that
+  `cmd/axiom/seed.toml` pins (downloaded once into `$AXIOM_CACHE/seed`), or the
+  compiler `AXIOM_SEED` names (`docs/bootstrap-chain.md`).
 - `std/`: the standard library; `std/internal/runtime/` is the runtime. Modules under
   an `internal/` directory may be imported only from its parent's tree (spec §4.1).
 - `docs/spec.md`: the language specification. `examples/`: example programs and
@@ -45,7 +46,7 @@ copyleft license.
   generators of test data, the std fuzzer (`fuzz.py`), the allocator's fuzzer
   (`fuzz_alloc.py`) and the C-library benchmark (`bench_std.py`).
 - `docs/releasing.md`: releases (`cmd/axiom/release.sh`); the compiler's version is in
-  `cmd/axiom/src/version.ax` and `cmd/axiom/bootstrap/src/version.h`.
+  `cmd/axiom/src/version.ax`.
 - `cmd/internal/tools/`: generators of std's checked-in tables (Unicode, codecs, ...).
   The generators are run by hand; each says how in its docstring.
 
@@ -53,10 +54,10 @@ copyleft license.
 
 ```
 cmd/axiom/bootstrap.sh       # build; stage 2 and 3 must be identical
-node cmd/axiom/internal/tests/run.mjs       # the suite with the C compiler
-AXIOM=cmd/axiom/build/axiom node cmd/axiom/internal/tests/run.mjs
-                             # with the compiler (includes axiom fmt --check)
-cmd/axiom/difftest.sh        # both compilers agree (diagnostics, suites, fuzzing)
+node cmd/axiom/internal/tests/run.mjs       # the suite (includes axiom fmt --check)
+cmd/axiom/difftest.sh        # the suite in its configurations, and the backends' fuzzer
 ```
 
-A change to the front end belongs in both compilers, with identical diagnostics.
+The compiler's sources (`cmd/axiom/src/`) and the std modules they import use only the
+language the pinned seed accepts. A newer feature needs a new seed first, made with
+`cmd/axiom/seed.sh` and pinned in `cmd/axiom/seed.toml`.

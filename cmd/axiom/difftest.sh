@@ -1,35 +1,17 @@
 #!/bin/sh
-# Differential test of the compiler against the bootstrap compiler:
-#   - for every .ax file under cmd/axiom/internal/tests/, std/, examples/ and cmd/axiom/src/, both
-#     must print the same diagnostics (agent-json) with the same exit status;
+# The compiler's whole check, in every configuration:
 #   - the test suite (cmd/axiom/internal/tests/run.mjs, which checks the programs' output) must
 #     pass for WebAssembly and native code in several configurations;
-#   - the backends must agree with the bootstrap compiler's LLVM-generated code on
-#     programs exercising every operation on edge values (fuzz/run.sh).
+#   - the backends must agree with each other on programs exercising every
+#     operation on edge values (fuzz/run.sh).
 #
 #   cmd/axiom/difftest.sh [compiler]     (default: cmd/axiom/build/axiom)
 set -u
 cd "$(dirname "$0")/../.."
 NEW=${1:-cmd/axiom/build/axiom}
-OLD=cmd/axiom/bootstrap/build/axiom
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-pass=0
 fail=0
-
-# Each file's verdict ("same f" or "DIFF check f"), several files at a time.
-export OLD NEW
-out=$(find cmd/axiom/internal/tests std examples cmd/axiom/src -name '*.ax' | sort |
-    xargs -P "$(nproc 2>/dev/null || echo 4)" -n 16 sh -c '
-        for f; do
-            a=$($OLD check "$f" --format=agent-json 2>&1; echo "status $?")
-            b=$($NEW check "$f" --format=agent-json 2>&1; echo "status $?")
-            if [ "$a" = "$b" ]; then echo "same $f"; else echo "DIFF check $f"; fi
-        done' sh)
-pass=$(printf '%s\n' "$out" | grep -c '^same ')
-fail=$(printf '%s\n' "$out" | grep -c '^DIFF ')
-printf '%s\n' "$out" | grep '^DIFF ' | sort -k3
-echo "diagnostics: $pass identical, $fail different"
 
 # The sections that do not depend on the configuration run with the first.
 skip_platform=
@@ -48,6 +30,7 @@ suite -O2
 suite --units=program
 suite --native
 suite --native -O2
+# (qemu-aarch64 by that name: `axiom test --target=aarch64` looks for it too)
 if command -v qemu-aarch64 >/dev/null && [ -d /usr/aarch64-linux-gnu ] && command -v aarch64-linux-gnu-gcc >/dev/null &&
    [ "$(uname -m)" = x86_64 ]; then
     AXIOM_NATIVE_TARGET=aarch64 AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu" suite --native

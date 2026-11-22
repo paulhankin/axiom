@@ -5,8 +5,8 @@
    loop); but a pure call after a store to a global is made again, and one in
    a loop that stores through a pointer stays in the loop. 9 calls in all
    (15 without the attributes, and no vector add). */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bcall\b | 9
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bpaddd\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bcall\b | 9
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu23 | \bpaddd\b | 1
 // lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu23 | \bbl\b | 9
 int g;
 __attribute__((const, noinline)) static int sq(int x) { return x * x; }

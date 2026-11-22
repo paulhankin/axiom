@@ -98,15 +98,33 @@ LLVM build takes 98 s against 19 s.
 
 ### Status
 
-Done: `bootstrap.sh` builds from `AXIOM_SEED` or from the release `cmd/axiom/seed.toml`
-pins (downloaded once, checked against the pinned hash), and gives the same compiler,
-byte for byte, as from the C bootstrap; the backend fuzzer runs without the bootstrap
-compiler, with the WebAssembly build as its reference; `docs/bootstrap-chain.md`.
+Done. The Problem above describes the tree as it was.
 
-Waiting on a release: 0.2.0, the newest, does not accept the language the compiler is
-now written in (`import part`, `?T`, `nocopy`). The first release that builds its own
-tree gets pinned in `seed.toml`. F3 and F5 follow that: until then the C bootstrap is
-the default seed and the dual-compiler rule stands.
+- F1, F2: `cmd/axiom/seed.toml` pins the seed `0.3.0-seed.1` (the compiler of commit
+  `4fea9e94`, made by `cmd/axiom/seed.sh`); `bootstrap.sh` builds from it, or from
+  `AXIOM_SEED`, and fails with neither. The rule is in `CLAUDE.md`, `CONTRIBUTING.md`
+  and `docs/bootstrap-chain.md`.
+- F3: `cmd/axiom/bootstrap/` is deleted; `8d7656f7` is the last commit that has it, and
+  `docs/bootstrap-chain.md` says how the chain is replayed from there. With it went the
+  C sources of the runtime that only it linked (`std/internal/runtime/native_host.c`,
+  `test_main.c`, `profile.c`, `trap_format.h`).
+- F4: `difftest.sh` runs the suite in its configurations and the fuzzer; the fuzzer's
+  reference is the WebAssembly build's output; `bench.sh` compares with the compiler
+  `BASE` names.
+- F5: `run.mjs` tests `cmd/axiom/build/axiom` by default and has no skip that depends
+  on the compiler; the `selfhost-only` and `lower-selfhost` directives are gone; the
+  docs describe one compiler and no LLVM.
+- Verified: the fixed point from the pinned seed, also with `CROSS=1` (the
+  AArch64-hosted compiler under qemu generates the same code), and the suite in the
+  configurations of `difftest.sh`.
+
+Not done:
+
+- The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead).
+- `docs/bootstrap-chain.md` records each release's commit and seed, not yet its hashes
+  (they are in each release's `SHA256SUMS`).
+- F4's mitigation for the lost independent lowering (more tests whose expected output
+  comes from outside the compiler) is not started.
 
 ### Risks
 

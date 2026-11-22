@@ -2,8 +2,8 @@
    value_range) needs no range check before its jump table: a state
    machine's state, phis and selects of the constants 0 to 5 (its cases).
    The only compares left are the loop's and the characters'. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcmp\s+\$0x[56],%e | 0
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bjmp\s+\*%r | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcmp\s+\$0x[56],%e | 0
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bjmp\s+\*%r | 1
 int states(const char *s, int n) {
     int st = 0, words = 0;
     for (int i = 0; i < n; i++) {

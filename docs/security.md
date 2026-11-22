@@ -49,8 +49,7 @@ limit).
   aligned and zeroed allocations, and pauses long enough for free memory to be given
   back. Every object's contents are checked when it is freed, and the allocator's
   counters must come back to where they started. It builds the program natively at
-  -O2 and -O0, with the address sanitizer, with the bootstrap compiler, and for
-  wasm32:
+  -O2 and -O0, with the address sanitizer, and for wasm32:
 
       cmd/axiom/internal/tests/tools/fuzz_alloc.py --runs 500
       cmd/axiom/internal/tests/tools/fuzz_alloc.py --minutes 30 --seed 0 o2 asan

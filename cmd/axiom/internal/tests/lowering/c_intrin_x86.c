@@ -6,21 +6,21 @@
    (vpshufb, vpmaddwd, vfmadd, vpgatherdd). The loops of a saturating blend
    and of a dot product have the instructions of hand-written assembly:
    two loads, the operation(s), a store or an add, and the loop's count. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpaddusb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpmaddwd\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpmaddwd\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpshufb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpshufb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcvttps2dq\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bminps\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpackuswb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpmovmskb\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcrc32\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \baesenc\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpclmul\w*\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bsha256rnds2\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvfmadd\d+ps\b | 1
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpgatherdd\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpaddusb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpmaddwd\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpmaddwd\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpshufb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpshufb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcvttps2dq\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bminps\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpackuswb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpmovmskb\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bcrc32\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \baesenc\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bpclmul\w*\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bsha256rnds2\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvfmadd\d+ps\b | 1
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding | \bvpgatherdd\b | 1
 #include <x86intrin.h>
 #include <stddef.h>
 

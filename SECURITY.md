@@ -49,6 +49,4 @@ issue is fine.
 - Data races on slices, unions and error unions, which can tear them (spec §12.8.2).
   Races on plain data are covered.
 - Bugs in C code linked into a program (spec §14.5.5).
-- The bootstrap compiler (`cmd/axiom/bootstrap/`), which exists only to build the
-  compiler, except where it miscompiles the compiler itself.
 - The examples (`examples/`) and the test suite, which are not hardened.

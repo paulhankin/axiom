@@ -82,7 +82,7 @@ a tag is checked out detached, and `head` fast-forwards `main` (checking it out 
 checkout is at a tag). It refuses a checkout with uncommitted changes, or on another
 branch than `main`. Then it builds the compiler, to `cmd/axiom/build/axiom`: with the
 compiler it replaces, and then with the result, which must build itself to the same
-bytes (the stages of `bootstrap.sh`, without LLVM, in under a minute); if the old
+bytes (the stages of `bootstrap.sh`, in under a minute); if the old
 compiler cannot build the new sources, it runs `cmd/axiom/bootstrap.sh`.
 
 ## A first program
@@ -108,21 +108,25 @@ listed by `axiom` with no arguments; the language is described in
 
 ## From source
 
-Building the compiler needs the bootstrap compiler, which is written in C and uses
-LLVM 18: on Ubuntu 24.04, `apt install llvm-18-dev lld clang nodejs`; on a Mac,
-`brew install llvm@18 node` with `llvm-config` on the `PATH`. Then:
+The compiler is written in Axiom, so building it takes an Axiom compiler, the *seed*:
+`cmd/axiom/bootstrap.sh` downloads the one `cmd/axiom/seed.toml` pins (once, into the
+cache, checked against the pinned hash). That needs `curl` and `tar`, and the test
+suite and WebAssembly programs need `node` (18 or later): on Ubuntu 24.04,
+`apt install curl nodejs`; on a Mac, `brew install node`. It needs no LLVM and no C
+compiler (the native tests on Linux link C host functions, and use `clang` or `gcc`). Seeds exist for Linux on x86-64 and AArch64 and for macOS on Apple silicon.
+Then:
 
 ```sh
 git clone https://github.com/paulhankin/axiom.git
 cd axiom
-cmd/axiom/bootstrap.sh                 # about a minute: builds the compiler, three stages, to a fixed point
+cmd/axiom/bootstrap.sh                 # under a minute: builds the compiler, three stages, to a fixed point
 export PATH="$PWD/cmd/axiom/build:$PATH"
 ```
 
 With an Axiom compiler that accepts the current sources already on the machine (a build
 of a recent commit, say), `AXIOM_SEED=<that compiler> cmd/axiom/bootstrap.sh` builds
-from it instead, without LLVM or the C compiler, in about half a minute;
-[`docs/bootstrap-chain.md`](bootstrap-chain.md) says where the seed comes from.
+from it instead, without the network;
+[`docs/bootstrap-chain.md`](bootstrap-chain.md) says where seeds come from.
 
 `bootstrap.sh` builds a compiler for the generic processor of this machine's
 architecture, so the binary runs on any machine of that kind; `TARGET=native

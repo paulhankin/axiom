@@ -540,8 +540,7 @@ json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c
 - `c-sources` names a directory of the package (relative to it); every `.c` file in it,
   at any depth, is a C translation unit of a program that uses the package, compiled by
   the compiler's C front end (docs/c.md, "C and Axiom in one program"). One that is not
-  a directory of the package is `E0215`; the bootstrap compiler, which has no C front
-  end, reports `E0215` for the key.
+  a directory of the package is `E0215`.
 - `axiom` names the oldest compiler version that builds the package (`a`, `a.b` or
   `a.b.c`; a value that is not a version is `E0215`). A compiler older than that
   (`axiom version`) refuses the package with `E0220`.
@@ -2457,10 +2456,10 @@ std/hash/crc, with the portable code where they are absent.
 | `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB) with no access, so that reserving it costs no memory; its 64 KiB pages are committed (made read-write) as it grows, and `@memory_grow` fails when the system cannot commit them. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
-| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; not the bootstrap compiler. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. C code, objects and `-l` libraries are linked by the compiler's own Mach-O linker (docs/c.md, "Objects and libraries"; its C output built and checked, not yet run on a Mac). Not yet supported: `axiom test` and `axiom profile` for this target |
-| `x86_64-macos` (also `x86_64-apple-darwin`) | 64 | An Intel Mac, macOS 11 or later; not the bootstrap compiler. As `aarch64-macos`, with the x86-64 System V calling convention. Builds; not yet run on a real system |
-| `aarch64-windows` (also `aarch64-pc-windows-msvc`) | 64 | Windows on ARM64; not the bootstrap compiler. As `x86_64-windows`, with the Windows ARM64 calling convention (AAPCS64, but every argument of a variadic function in `x0`-`x7` and then the stack, floating-point ones as their bits). `axiom test` and `axiom profile` run only on Windows on ARM64. Builds; not yet run on a real system |
-| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; not the bootstrap compiler. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), on other systems under a Windows compatibility layer when one is installed. Debug symbols (function names and line tables; with `-g` also types and variables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. C code, objects and `-l` libraries are linked by the compiler's own PE linker (docs/c.md, "Objects and libraries") |
+| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. C code, objects and `-l` libraries are linked by the compiler's own Mach-O linker (docs/c.md, "Objects and libraries"; its C output built and checked, not yet run on a Mac). Not yet supported: `axiom test` and `axiom profile` for this target |
+| `x86_64-macos` (also `x86_64-apple-darwin`) | 64 | An Intel Mac, macOS 11 or later. As `aarch64-macos`, with the x86-64 System V calling convention. Builds; not yet run on a real system |
+| `aarch64-windows` (also `aarch64-pc-windows-msvc`) | 64 | Windows on ARM64. As `x86_64-windows`, with the Windows ARM64 calling convention (AAPCS64, but every argument of a variadic function in `x0`-`x7` and then the stack, floating-point ones as their bits). `axiom test` and `axiom profile` run only on Windows on ARM64. Builds; not yet run on a real system |
+| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), on other systems under a Windows compatibility layer when one is installed. Debug symbols (function names and line tables; with `-g` also types and variables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. C code, objects and `-l` libraries are linked by the compiler's own PE linker (docs/c.md, "Objects and libraries") |
 
 Linux is the native operating system. `--target=native` on a Mac means
 `aarch64-macos` (or on an Intel Mac `x86_64-macos`), and on Windows `x86_64-windows`
@@ -2722,8 +2721,8 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
 The rest of the standard library, listed in `std/README.md`, is ordinary Axiom code. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"axiom"` (the
-*Axiom host ABI*). Implementations exist for node (`std/internal/runtime/host.mjs`) and POSIX
-(`std/internal/runtime/native_host.c` in C, `std/internal/runtime/native.ax` in Axiom). A program that uses only the language and `std/mem`, `vec`,
+*Axiom host ABI*). Implementations exist for node (`std/internal/runtime/host.mjs`) and for native
+programs (`native.ax` for Linux, `darwin.ax` for macOS and `windows.ax` for Windows, in `std/internal/runtime/`). A program that uses only the language and `std/mem`, `vec`,
 `hash`, `map` and `matrix` needs no host at all.
 
 One host function has no counterpart on WebAssembly: `ax_fork() i32` copies the
@@ -2863,8 +2862,8 @@ Codes are stable. A code's meaning is never reused for something else.
 | `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`, `W0655` inline error set contains errors the function can never return (§11.3) |
 | `Txxxx` | Runtime traps (Appendix B) |
 
-The registry. It lists every code the compilers emit, and the test suite checks that
-it does (and that both compilers emit the same codes, each asserted by a test):
+The registry. It lists every code the compiler emits, and the test suite checks that
+it does (and that each is asserted by a test):
 
 | Code | Meaning |
 |---|---|
@@ -3079,18 +3078,15 @@ is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
 
 **Frame tables.** Native code can be walked, so on every native target (x86-64 and
-AArch64 Linux, macOS, Windows) the compiler, and on x86-64 Linux the bootstrap
-compiler, build the same records without a shadow stack, and calls cost nothing:
+AArch64 Linux, macOS, Windows) the compiler builds the same records without a shadow
+stack, and calls cost nothing:
 
 - Every function keeps a frame pointer, and the executable has a table (the section
   `axiom_rets`) that maps the return address of each call to its call-site record,
   followed by the records of the calls inlined around it: calls to `inline` functions
   and the ones the optimizer inlined. The compiler keeps them with each call as it
-  inlines; the bootstrap compiler takes them from the inlining information its code
-  generator keeps in its debug locations, and drops the debug information afterwards unless
-  `-g` asks for it. (Its x86-64 code gives a leaf function, whose only calls are traps,
-  no frame: the table marks such functions, and the walk finds their return
-  addresses on the stack.)
+  inlines. (On x86-64 a leaf function, whose only calls are traps, has no frame: the
+  table marks such functions, and the walk finds their return addresses on the stack.)
 - A trap walks the frame-pointer chain from the trap's own frame, a crash from the
   interrupted one, and looks each return address up. The frames fill the thread's
   shadow-stack record (its calls and depth) as the stores would have, so the report,
@@ -3104,8 +3100,7 @@ compiler, build the same records without a shadow stack, and calls cost nothing:
   table 16 bytes per call. A recursive Fibonacci runs in about a third of the time it
   takes with the shadow stack, the same as with `--stack-traces=off` to within noise.
 - `axiom profile` (§16.6) and `--sanitize=address` (§16.8) builds, which read the
-  records while the program runs, keep the shadow stack, as do WebAssembly and, with
-  the bootstrap compiler, other native targets.
+  records while the program runs, keep the shadow stack, as does WebAssembly.
 
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.
@@ -3222,7 +3217,7 @@ How samples are taken:
 
 | Target | Clock | Mechanism | Threads |
 |---|---|---|---|
-| native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`std/internal/runtime/profile.c`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
+| native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`std/internal/runtime/profile.ax`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
 | x86_64-windows | process CPU time | a sampler thread credits each thread the cycles it ran (`QueryThreadCycleTime`) at every tick; a thread with a period's worth is suspended and its shadow stack copied (`std/internal/runtime/profile_windows.ax`). Each sample is weighted by the periods it stands for, and waiting threads are not sampled | all threads |
 | wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`std/internal/runtime/profile_worker.mjs`) | main thread only |
 

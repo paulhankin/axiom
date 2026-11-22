@@ -7,23 +7,21 @@
 //   AXIOM_CHECK_CINTS=1  shared constants are never changed by a pass
 //   AXIOM_CHECK_IR=1     instructions come after their operands
 //   AXIOM_POISON=1       released memory is poisoned and never reused
-// (both checked by the compiler; the bootstrap compiler ignores them).
+// (all checked by the compiler).
 //
 // Usage: node cmd/axiom/internal/tests/std_opt.mjs [-O1|-O2|-O3] [--target=wasm32|native|both]
 //                               [--jobs=N] [--filter=substr] [--timeout=seconds]
 //                               [--sanitize=address] [--test-timeout=ms]
 //
-// The compiler is $AXIOM, else cmd/axiom/build/axiom when built, else
-// cmd/axiom/bootstrap/build/axiom. AXIOM_NATIVE_TARGET and AXIOM_NATIVE_EXEC work as in
-// cmd/axiom/internal/tests/run.mjs.
+// The compiler is $AXIOM, else cmd/axiom/build/axiom. AXIOM_NATIVE_TARGET and
+// AXIOM_NATIVE_EXEC work as in cmd/axiom/internal/tests/run.mjs.
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
-const built = path.join(root, 'cmd/axiom/build/axiom');
-const compiler = path.resolve(process.env.AXIOM || (fs.existsSync(built) ? built : path.join(root, 'cmd/axiom/bootstrap/build/axiom')));
+const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/build/axiom'));
 const argv = process.argv.slice(2);
 const opt = argv.find((a) => /^-O[0-3]$/.test(a)) || '-O2';
 const arg = (name, dflt) => (argv.find((a) => a.startsWith(`--${name}=`)) || `=${dflt}`).split('=').slice(1).join('=');

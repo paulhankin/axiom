@@ -9,7 +9,7 @@
    constant. The calls of kept() stay: an order of the other signedness, a
    const volatile object, a const object defined weak, x >= +inf (x may be
    +inf). 4 calls in all. */
-// lower-selfhost: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bcall\b | 4
+// lower: --target=native --cpu=x86-64 -O2 --c-freestanding --c-std=gnu17 | \bcall\b | 4
 // lower: --target=aarch64 -O2 --c-freestanding --c-std=gnu17 | \bbl\b | 4
 void gone(void);
 void kept(void);
