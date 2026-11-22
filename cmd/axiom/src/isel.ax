@@ -1232,3 +1232,287 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
     }
     return relro;
 }
+
+// -----------------------------------------------------------------------------
+// The overflow of checked arithmetic
+// -----------------------------------------------------------------------------
+// What an overflow condition tests (ov_match): OV_SIGNED, that the signed
+// result of an add or sub does not fit (x86-64 OF, AArch64 V); OV_UNSIGNED,
+// that an add carries out of its top bit or a sub borrows (x86-64 CF;
+// AArch64 C set after the add, clear after the sub); with OV_NOT, that it
+// does not.
+pub const OV_SIGNED: i32 = 0;
+pub const OV_UNSIGNED: i32 = 2;
+pub const OV_NOT: i32 = 1;
+
+// The add or sub whose overflow condition c is, as the idioms of checked
+// arithmetic test it (cgbase.ax: op_with_overflow), or nil; *kind what c
+// tests of it (OV_SIGNED ...). Signed: the and of two xors (of the operands
+// and the result) is negative; unsigned: the sum below an operand, the
+// minuend below the subtrahend, or x against a constant t, which combine
+// makes of either when the other operand is a constant: x >=u t is the
+// carry of x + -t and the opposite of the borrow of x - t. The add or sub
+// is found in c's block or one it dominates, unmarked; with mark (a flag),
+// one so marked in c's block (where the selection moved it).
+pub fn ov_match(c: *mut ir.Value, kind: *mut i32, mark: i32) *mut ir.Value {
+    let none = u.nil.[ir.Value]();
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.a.ty.kind != ir.T_INT) or not ir.mul_ov_width(c.a.ty) {
+        return none;
+    }
+    let p = ir.pred_of(c);
+    let x = c.a;
+    let y = c.b;
+    if is_c(y) and ir.is_op(x, ir.OP_AND) and ir.is_signed_pred(p) {
+        let k = cval(y);
+        let neg = ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1));
+        let pos = ((p == ir.IntSGE) and (k == 0)) or ((p == ir.IntSGT) and (k == -1));
+        if not neg and not pos {
+            return none;
+        }
+        kind.* = OV_SIGNED;
+        if pos {
+            kind.* = OV_SIGNED | OV_NOT;
+        }
+        if not ir.is_op(x.a, ir.OP_XOR) or not ir.is_op(x.b, ir.OP_XOR) {
+            return none;
+        }
+        // (l ^ v) & (r ^ v) for v = l + r; (l ^ r) & (l ^ v) for v = l - r
+        for k2 in @as(usize, 0)..2 {
+            let mut p1 = x.a;
+            let mut p2 = x.b;
+            if k2 == 1 {
+                p1 = x.b;
+                p2 = x.a;
+            }
+            for k1 in @as(usize, 0)..2 {
+                let mut v = p1.a;
+                let mut l = p1.b;
+                if k1 == 1 {
+                    v = p1.b;
+                    l = p1.a;
+                }
+                if ir.is_op(v, ir.OP_ADD) and (v.ty == x.ty) and
+                   (((v.a == l) and xor_of(p2, v.b, v)) or ((v.b == l) and xor_of(p2, v.a, v))) {
+                    return v;
+                }
+                if ir.is_op(v, ir.OP_SUB) and (v.ty == x.ty) and (v.a == l) and xor_of(p2, v.a, v.b) {
+                    return v;
+                }
+            }
+        }
+        return none;
+    }
+    // v <u l (v = l + r); l <u r (v = l - r); and those swapped or negated
+    let mut lo = x;
+    let mut hi = y;
+    let mut below = true;
+    if p == ir.IntUGT {
+        lo = y;
+        hi = x;
+    } else if p == ir.IntUGE {
+        below = false;
+    } else if p == ir.IntULE {
+        lo = y;
+        hi = x;
+        below = false;
+    } else if p != ir.IntULT {
+        return none;
+    }
+    kind.* = OV_UNSIGNED;
+    if not below {
+        kind.* = OV_UNSIGNED | OV_NOT;
+    }
+    if ir.is_op(lo, ir.OP_ADD) and ((lo.a == hi) or (lo.b == hi)) and not is_c(hi) {
+        return lo;
+    }
+    if (is_c(lo) != is_c(hi)) and (lo.kind != ir.V_GLOBAL) and (hi.kind != ir.V_GLOBAL) {
+        // x >=u t: x <u t negated (lo x), t - 1 <u x (hi x)
+        let w = c.a.ty.bits;
+        let mut mask = ~@as(u64, 0);
+        if w < 64 {
+            mask = (@as(u64, 1) << @int_cast(u32, w)) - 1;
+        }
+        let mut xv = lo;
+        let mut t = @bit_cast(u64, cval(hi)) & mask;
+        let mut ge = not below;
+        if is_c(lo) {
+            xv = hi;
+            t = (@bit_cast(u64, cval(lo)) +% 1) & mask;
+            ge = below;
+        }
+        if t == 0 {
+            return none;  // (always or never)
+        }
+        let ck = OvKey.{ op: 0, x: xv, y: xv, comm: false, t: t, mask: mask };
+        let v = find_with(ck, c.blk, mark);
+        if u.notnil(v) {
+            // (the carry of x + -t is x >=u t; the borrow of x - t is x <u t)
+            let mut carry_is_ge = v.op == ir.OP_ADD;
+            if not ge {
+                carry_is_ge = not carry_is_ge;
+            }
+            kind.* = OV_UNSIGNED;
+            if not carry_is_ge {
+                kind.* = OV_UNSIGNED | OV_NOT;
+            }
+        }
+        return v;
+    }
+    if is_c(lo) or is_c(hi) or (lo.kind == ir.V_GLOBAL) {
+        return none;
+    }
+    let sk = OvKey.{ op: ir.OP_SUB, x: lo, y: hi, comm: false, t: 0, mask: 0 };
+    return find_with(sk, c.blk, mark);
+}
+
+// What find_with looks for: the operation op of x and y (y and x too, if
+// comm); with op 0, x + k or x - t for a constant k = -t, t (mod 2 ^ the
+// width: mask).
+struct OvKey {
+    op: i32,
+    x: *mut ir.Value,
+    y: *mut ir.Value,
+    comm: bool,
+    t: u64,
+    mask: u64,
+}
+
+fn key_is(v: *ir.Value, key: *OvKey) bool {
+    if key.op != 0 {
+        return is_binop_of(v, key.op, key.x, key.y, key.comm);
+    }
+    if (v.kind != ir.V_INST) or (v.ty != key.x.ty) {
+        return false;
+    }
+    if v.op == ir.OP_ADD {
+        let neg = (0 -% key.t) & key.mask;
+        return ((v.a == key.x) and is_c(v.b) and ((@bit_cast(u64, cval(v.b)) & key.mask) == neg)) or
+               ((v.b == key.x) and is_c(v.a) and ((@bit_cast(u64, cval(v.a)) & key.mask) == neg));
+    }
+    return (v.op == ir.OP_SUB) and (v.a == key.x) and is_c(v.b) and ((@bit_cast(u64, cval(v.b)) & key.mask) == key.t);
+}
+
+// Is v the operation op of x and y (or of y and x, if comm)?
+pub fn is_binop_of(v: *ir.Value, op: i32, x: *ir.Value, y: *ir.Value, comm: bool) bool {
+    return ir.is_op(v, op) and (v.ty == x.ty) and (((v.a == x) and (v.b == y)) or (comm and (v.a == y) and (v.b == x)));
+}
+
+// An operation op of x and y (or y and x, if comm), unmarked, in block b
+// or in a block b dominates; or nil.
+pub fn find_op(op: i32, x: *mut ir.Value, y: *mut ir.Value, comm: bool, b: *mut ir.Block) *mut ir.Value {
+    let key = OvKey.{ op: op, x: x, y: y, comm: comm, t: 0, mask: 0 };
+    return find_with(key, b, 0);
+}
+
+// The operation key describes: unmarked, in block b or in a block b
+// dominates (mark 0), or marked mark, in b; or nil. (Through the uses of an
+// operand that is an instruction; else a look through the blocks.)
+fn find_with(key: OvKey, b: *mut ir.Block, mark: i32) *mut ir.Value {
+    let mut w = key.x;
+    if (w.kind != ir.V_INST) and (key.op != 0) {
+        w = key.y;
+    }
+    if w.kind == ir.V_INST {
+        let mut q = w.first_use;
+        while u.notnil(q) {
+            let s = ir.use_user(q);
+            if key_is(s, &key) {
+                if (mark == 0) and (s.flag == 0) and ((s.blk == b) or dominates(b, s.blk)) {
+                    return s;
+                }
+                if (mark != 0) and ((s.flag & mark) != 0) and (s.blk == b) {
+                    return s;
+                }
+            }
+            q = q.next;
+        }
+        return u.nil.[ir.Value]();
+    }
+    let mut stack = u.List.[*mut ir.Block].empty();
+    defer stack.deinit();
+    stack.push(b);
+    let mut budget: i32 = 4096;
+    while (stack.len > 0) and (budget > 0) {
+        let d = stack.pop();
+        let mut j = d.first;
+        while u.notnil(j) {
+            if key_is(j, &key) and (((mark == 0) and (j.flag == 0)) or ((mark != 0) and ((j.flag & mark) != 0))) {
+                return j;
+            }
+            budget -= 1;
+            j = j.next;
+        }
+        if mark == 0 {
+            for k in 0..d.dom_kids.len {
+                stack.push(d.dom_kids.get(k));
+            }
+        }
+    }
+    return u.nil.[ir.Value]();
+}
+
+// Does block a dominate block b (the dominator tree of opt.dominators)?
+pub fn dominates(a: *ir.Block, b: *mut ir.Block) bool {
+    let mut x = b;
+    let mut k: i32 = 0;
+    while u.notnil(x) and (k < 100000) {
+        if x == a {
+            return true;
+        }
+        if x.idom == x {
+            return false;
+        }
+        x = x.idom;
+        k += 1;
+    }
+    return false;
+}
+
+// Is p the xor of x and y (either order)?
+fn xor_of(p: *ir.Value, x: *ir.Value, y: *ir.Value) bool {
+    return ((p.a == x) and (p.b == y)) or ((p.a == y) and (p.b == x));
+}
+
+// Is every use of v outside block b, but for phis (which read at the end
+// of a predecessor), b's terminator, and skip1 and skip2?
+pub fn used_after(v: *mut ir.Value, b: *mut ir.Block, skip1: *ir.Value, skip2: *ir.Value) bool {
+    let t = ir.terminator(b);
+    let mut q = v.first_use;
+    while u.notnil(q) {
+        let s = ir.use_user(q);
+        if (s.blk == b) and (s.op != ir.OP_PHI) and (s != t) and (s != skip1) and (s != skip2) {
+            return false;
+        }
+        q = q.next;
+    }
+    return true;
+}
+
+// Does x come before y in their block?
+pub fn before_in_block(x: *ir.Value, y: *ir.Value) bool {
+    let mut j = x.next;
+    while u.notnil(j) {
+        if j == y {
+            return true;
+        }
+        j = j.next;
+    }
+    return false;
+}
+
+// Takes instruction v out of its block's list (to insert it elsewhere: its
+// uses stay).
+pub fn unlink_inst(v: *mut ir.Value) void {
+    let b = v.blk;
+    ir.dbg_unlinked(v);
+    if u.notnil(v.prev) {
+        v.prev.next = v.next;
+    } else {
+        b.first = v.next;
+    }
+    if u.notnil(v.next) {
+        v.next.prev = v.prev;
+    } else {
+        b.last = v.prev;
+    }
+}

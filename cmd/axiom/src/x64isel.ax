@@ -1066,7 +1066,8 @@ pub fn gen_select(v: *mut ir.Value) void {
     if (cls == xsl.GPR) and (v.ty.kind == ir.T_INT) and (v.ty.bits >= 8) and (v.ty.bits <= 64) and
        ir.is_op(v.b, ir.OP_ADD) and (v.b.a == v.c) and is.is_c(v.b.b) and (is.cval(v.b.b) == 1) and not is.fused(sc) and
        not ((sc.kind == ir.V_INST) and (sc.blk == xsl.S.ib) and ((sc.op == ir.OP_ICMP) or (sc.op == ir.OP_FCMP))) and
-       (sc.ty.kind == ir.T_INT) and (sc.ty.bits == 1) and not is.is_c(sc) {
+       (sc.ty.kind == ir.T_INT) and (sc.ty.bits == 1) and not is.is_c(sc) and
+       ((sc.kind != ir.V_INST) or ((sc.flag & F_OVBR) == 0)) {
         // c ? x + 1 : x where c is a 0/1 value in a register (no flags to
         // reuse): x + c
         let rx = xsl.reg(v.c);
@@ -2323,165 +2324,25 @@ fn mul_ov_flags(i: *mut ir.Value) i32 {
     return xe.CC_B;
 }
 
-// The add or sub whose overflow condition c is, as the idioms of checked
-// arithmetic test it (cgbase.ax: op_with_overflow), or nil; *cc the
-// condition code that is c after that add or sub. Signed: the and of two
-// xors (of the operands and the result) is negative, OF; unsigned: the sum
-// below an operand, the minuend below the subtrahend, CF (a sub found in
-// c's block or one it dominates; marked: one mark_overflow moved there).
+// The add or sub whose overflow condition c is (is.ov_match), or nil; *cc
+// the condition code that is c after that add or sub: OF, CF or their
+// opposites (marked: one mark_overflow moved to c's block).
 pub fn ov_match(c: *mut ir.Value, cc: *mut i32, marked: bool) *mut ir.Value {
-    let none = u.nil.[ir.Value]();
-    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.a.ty.kind != ir.T_INT) or not ir.mul_ov_width(c.a.ty) {
-        return none;
-    }
-    let p = ir.pred_of(c);
-    let x = c.a;
-    let y = c.b;
-    if is.is_c(y) and ir.is_op(x, ir.OP_AND) {
-        let k = is.cval(y);
-        let neg = ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1));
-        let pos = ((p == ir.IntSGE) and (k == 0)) or ((p == ir.IntSGT) and (k == -1));
-        if not neg and not pos {
-            return none;
-        }
-        cc.* = xe.CC_O;
-        if pos {
-            cc.* = xe.CC_NO;
-        }
-        if not ir.is_op(x.a, ir.OP_XOR) or not ir.is_op(x.b, ir.OP_XOR) {
-            return none;
-        }
-        // (l ^ v) & (r ^ v) for v = l + r; (l ^ r) & (l ^ v) for v = l - r
-        for k2 in @as(usize, 0)..2 {
-            let mut p1 = x.a;
-            let mut p2 = x.b;
-            if k2 == 1 {
-                p1 = x.b;
-                p2 = x.a;
-            }
-            for k1 in @as(usize, 0)..2 {
-                let mut v = p1.a;
-                let mut l = p1.b;
-                if k1 == 1 {
-                    v = p1.b;
-                    l = p1.a;
-                }
-                if ir.is_op(v, ir.OP_ADD) and (v.ty == x.ty) and
-                   (((v.a == l) and xor_of(p2, v.b, v)) or ((v.b == l) and xor_of(p2, v.a, v))) {
-                    return v;
-                }
-                if ir.is_op(v, ir.OP_SUB) and (v.ty == x.ty) and (v.a == l) and xor_of(p2, v.a, v.b) {
-                    return v;
-                }
-            }
-        }
-        return none;
-    }
-    // v <u l (v = l + r); l <u r (v = l - r); and those swapped or negated
-    let mut lo = x;
-    let mut hi = y;
-    let mut below = true;
-    if p == ir.IntUGT {
-        lo = y;
-        hi = x;
-    } else if p == ir.IntUGE {
-        below = false;
-    } else if p == ir.IntULE {
-        lo = y;
-        hi = x;
-        below = false;
-    } else if p != ir.IntULT {
-        return none;
-    }
-    cc.* = xe.CC_B;
-    if not below {
-        cc.* = xe.CC_AE;
-    }
-    if ir.is_op(lo, ir.OP_ADD) and ((lo.a == hi) or (lo.b == hi)) and not is.is_c(hi) {
-        return lo;
-    }
-    if is.is_c(lo) or is.is_c(hi) or (lo.kind == ir.V_GLOBAL) {
-        return none;
-    }
+    let mut mark: i32 = 0;
     if marked {
-        // (moved to c's block: mark_overflow)
-        let mut j = c.blk.first;
-        while u.notnil(j) {
-            if ((j.flag & F_OVPART) != 0) and is_binop_of(j, ir.OP_SUB, lo, hi, false) {
-                return j;
-            }
-            j = j.next;
-        }
-        return none;
+        mark = F_OVPART;
     }
-    return find_op(ir.OP_SUB, lo, hi, false, c.blk);
-}
-
-// Is v the operation op of x and y (or of y and x, if comm)?
-pub fn is_binop_of(v: *ir.Value, op: i32, x: *ir.Value, y: *ir.Value, comm: bool) bool {
-    return ir.is_op(v, op) and (v.ty == x.ty) and (((v.a == x) and (v.b == y)) or (comm and (v.a == y) and (v.b == x)));
-}
-
-// An operation op of x and y (or y and x, if comm), unmarked, in block b
-// or in a block b dominates; or nil. (Through the uses of an operand that
-// is an instruction; else a look through the blocks b dominates.)
-pub fn find_op(op: i32, x: *mut ir.Value, y: *mut ir.Value, comm: bool, b: *mut ir.Block) *mut ir.Value {
-    let mut w = x;
-    if x.kind != ir.V_INST {
-        w = y;
-    }
-    if w.kind == ir.V_INST {
-        let mut q = w.first_use;
-        while u.notnil(q) {
-            let s = ir.use_user(q);
-            if is_binop_of(s, op, x, y, comm) and (s.flag == 0) and ((s.blk == b) or dominates(b, s.blk)) {
-                return s;
-            }
-            q = q.next;
-        }
-        return u.nil.[ir.Value]();
-    }
-    let mut stack = u.List.[*mut ir.Block].empty();
-    defer stack.deinit();
-    stack.push(b);
-    let mut budget: i32 = 4096;
-    while (stack.len > 0) and (budget > 0) {
-        let d = stack.pop();
-        let mut j = d.first;
-        while u.notnil(j) {
-            if is_binop_of(j, op, x, y, comm) and (j.flag == 0) {
-                return j;
-            }
-            budget -= 1;
-            j = j.next;
-        }
-        for k in 0..d.dom_kids.len {
-            stack.push(d.dom_kids.get(k));
-        }
-    }
-    return u.nil.[ir.Value]();
-}
-
-// Does block a dominate block b (the dominator tree of opt.dominators)?
-pub fn dominates(a: *ir.Block, b: *mut ir.Block) bool {
-    let mut x = b;
     let mut k: i32 = 0;
-    while u.notnil(x) and (k < 100000) {
-        if x == a {
-            return true;
-        }
-        if x.idom == x {
-            return false;
-        }
-        x = x.idom;
-        k += 1;
+    let v = is.ov_match(c, &mut k, mark);
+    let mut x = xe.CC_O;
+    if (k & is.OV_UNSIGNED) != 0 {
+        x = xe.CC_B;
     }
-    return false;
-}
-
-// Is p the xor of x and y (either order)?
-fn xor_of(p: *ir.Value, x: *ir.Value, y: *ir.Value) bool {
-    return ((p.a == x) and (p.b == y)) or ((p.a == y) and (p.b == x));
+    if (k & is.OV_NOT) != 0 {
+        x = is.invert(x);
+    }
+    cc.* = x;
+    return v;
 }
 
 // The flags of overflow condition c (F_OVBR) from its operation, computed

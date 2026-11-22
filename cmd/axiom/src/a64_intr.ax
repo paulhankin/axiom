@@ -33,20 +33,7 @@ fn gen_int_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
     let d = vreg(v);
     let a0 = v.xs.get(0);
     if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
-        // unsigned: the high half is nonzero; signed: the high half is not
-        // the sign extension of the low half
-        let a = reg(a0);
-        let b = reg(v.xs.get(1));
-        let h = vgpr();
-        raw3(ae.mulh(id == ir.IN_SMUL_OV, 0, 0, 0), h, a, b);
-        if id == ir.IN_UMUL_OV {
-            _ = cmp_imm(1, h, 0);
-        } else {
-            let l = vgpr();
-            raw3(ae.madd(1, false, 0, 0, 0, 31), l, a, b);
-            _ = raw(ae.addsub_reg(1, true, true, 31, 0, 0, 2, 63), NONE(), R(h), R(l), NONE());
-        }
-        cset(d, NE);
+        cset(d, mul_ov_flags(v));
         return;
     }
     if (id == ir.IN_UMULH) or (id == ir.IN_SMULH) {
@@ -132,6 +119,69 @@ fn gen_int_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
         return;
     }
     fail(u.f1("integer intrinsic %s", u.idec(@int_from_enum(id))));
+}
+
+// The multiply of a multiplication's overflow i (IN_UMUL_OV, IN_SMUL_OV of
+// 8 to 64 bits), its product in the register of the plain product beside
+// it (paired_mul) if there is one, and a compare: the condition code that
+// is true when it overflows. 64 bits: the high half (umulh, smulh) is not 0,
+// or not the sign of the low half; 32 bits: the 64-bit product (umull,
+// smull) is not its low half zero- or sign-extended; 8 and 16 bits: the
+// product of the extended operands in 32 bits is not its low 8 or 16 bits
+// extended.
+fn mul_ov_flags(i: *mut ir.Value) i32 {
+    let a0 = i.xs.get(0);
+    let b0 = i.xs.get(1);
+    let signed = ir.intr_id(i) == ir.IN_SMUL_OV;
+    let bits = a0.ty.bits;
+    let m = paired_mul(i);
+    let mut p: i32 = 0;
+    if u.notnil(m) {
+        p = vreg(m);
+    } else {
+        p = vgpr();
+    }
+    if bits == 64 {
+        let a = reg(a0);
+        let b = reg(b0);
+        let h = vgpr();
+        if not signed {
+            raw3(ae.mulh(false, 0, 0, 0), h, a, b);
+            _ = cmp_imm(1, h, 0);
+            return NE;
+        }
+        raw3(ae.madd(1, false, 0, 0, 0, 31), p, a, b);
+        raw3(ae.mulh(true, 0, 0, 0), h, a, b);
+        _ = raw(ae.addsub_reg(1, true, true, 31, 0, 0, 2, 63), NONE(), R(h), R(p), NONE());  // cmp h, p, asr #63
+        return NE;
+    }
+    if bits == 32 {
+        raw3(ae.mull_w(signed, 0, 0, 0), p, reg(a0), reg(b0));
+        if signed {
+            _ = raw(ae.addsub_xreg(1, true, true, 31, 0, 0, 6, 0), NONE(), R(p), R(p), NONE());  // cmp p, w(p), sxtw
+        } else {
+            let k = ae.logical_imm(0xffff_ffff_0000_0000, 64);
+            _ = raw(ae.logic_imm(1, 3, 31, 0, @bit_cast(u64, k)), NONE(), R(p), NONE(), NONE());  // tst p, #0xffffffff00000000
+        }
+        return NE;
+    }
+    let a = reg_ext(a0, signed);
+    let b = reg_ext(b0, signed);
+    raw3(ae.madd(0, false, 0, 0, 0, 31), p, a, b);
+    if signed {
+        let mut opt: u64 = 4;  // sxtb
+        if bits == 16 {
+            opt = 5;  // sxth
+        }
+        _ = raw(ae.addsub_xreg(0, true, true, 31, 0, 0, opt, 0), NONE(), R(p), R(p), NONE());  // cmp p, p, sxtb
+    } else {
+        let mut hi: u64 = 0xffff_ff00;
+        if bits == 16 {
+            hi = 0xffff_0000;
+        }
+        _ = raw(ae.logic_imm(0, 3, 31, 0, @bit_cast(u64, ae.logical_imm(hi, 32))), NONE(), R(p), NONE(), NONE());  // tst
+    }
+    return NE;
 }
 
 // d = v, a rotate left or right (id) of its first argument.
