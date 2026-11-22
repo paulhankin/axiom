@@ -2844,6 +2844,19 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
 | `fixes[].applicability` | `"machine"`: applying every edit yields a program without this diagnostic, and the fix does not change intended semantics. `"suggestion"`: plausible, needs review. `"placeholder"`: the edit contains `<…>` holes that must be filled in |
 | `fixes[].edits` | Non-overlapping byte-range replacements, applied together atomically |
 
+**Syntax errors.** A declaration (a function, a method, or another top-level declaration)
+with a syntax error is *poisoned*. What follows the error in it was parsed from a guess, so:
+
+- the parser reports at most one `E0100` in it;
+- its body (a function's, or a global's initializer) is not checked; its signature is, so
+  code that uses it is checked as usual;
+- no diagnostic inside it has a fix.
+
+When the parser cannot find where the statement with the error ends, it resumes at the next
+token in column 1 that starts a top-level declaration; a keyword that only starts a
+declaration (`fn`, `pub`, `struct`, ...) first on its line inside a block ends the block,
+as a `}` is missing there.
+
 ### 16.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.

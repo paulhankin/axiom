@@ -16,6 +16,10 @@ struct Parser {
     ntests: i32,         // test blocks so far (their symbol names are per module)
     depth: usize,        // expressions, types and blocks being parsed, one inside another
     high: usize,         // the deepest level of the tree reached (see chain_ok)
+    // A declaration with a syntax error is poisoned (spec §16.2): its body is
+    // not checked, it reports no further syntax error, and no fix.
+    poisoned: bool,      // the declaration being parsed (a function, method or other)
+    top_poisoned: bool,  // the top-level declaration being parsed, or one inside it
 }
 
 fn peek(P: *Parser) *lx.Token {
@@ -49,13 +53,67 @@ fn prev_span(P: *Parser) u.Span {
     return P.t[0].span;
 }
 
+// Marks the declaration being parsed as poisoned.
+fn poison(P: *mut Parser) void {
+    P.poisoned = true;
+    P.top_poisoned = true;
+}
+
+// An error the parser reports (none after a syntax error in the same
+// declaration: what follows it was parsed from a guess).
+fn perr(P: *Parser, sp: u.Span, code: []u8, msg: []u8) *mut dg.Diag {
+    if P.poisoned {
+        return u.nil.[dg.Diag]();
+    }
+    return dg.err(sp, code, msg);
+}
+
 fn syntax_error(P: *mut Parser, what: []u8) void {
-    if P.errors_at_pos == @int_cast(i64, P.pos) {
+    if P.poisoned or (P.errors_at_pos == @int_cast(i64, P.pos)) {
         return;
     }
     P.errors_at_pos = @int_cast(i64, P.pos);
     let t = peek(P);
     _ = dg.err(t.span, "E0100", u.f2("expected %s, found '%s'", what, lx.tok_kind_name(t.kind)));
+    poison(P);
+}
+
+// The next token is the first of its line, in column 1.
+fn at_line_start(P: *Parser) bool {
+    let s = @as(usize, peek(P).span.start);
+    return (s == 0) or (P.f.text[s - 1] == '\n');
+}
+
+// The next token is the first of its line.
+fn first_on_line(P: *Parser) bool {
+    if P.pos == 0 {
+        return true;
+    }
+    let a = @as(usize, P.t[P.pos - 1].span.end);
+    let b = @as(usize, peek(P).span.start);
+    return (a < b) and (u.find(P.f.text[a..b], '\n') >= 0);
+}
+
+// After a syntax error in this top-level declaration: the next token starts
+// another top-level declaration (a keyword that can, in column 1, where the
+// canonical layout puts them; `let` and `error` too when `all`, as they also
+// start statements and expressions).
+fn at_decl_start(P: *Parser, all: bool) bool {
+    if not P.top_poisoned or not at_line_start(P) {
+        return false;
+    }
+    let k = pk(P);
+    if (k == lx.KW_LET) or (k == lx.KW_ERROR) {
+        return all;
+    }
+    return decl_keyword(k);
+}
+
+// k starts a declaration, and never a statement.
+fn decl_keyword(k: lx.TokKind) bool {
+    return (k == lx.KW_IMPORT) or (k == lx.KW_TEST) or (k == lx.KW_EXPORT) or (k == lx.KW_PUB) or (k == lx.KW_NOCOPY) or
+           (k == lx.KW_EXTERN) or (k == lx.KW_FN) or (k == lx.KW_INLINE) or (k == lx.KW_STRUCT) or (k == lx.KW_UNION) or
+           (k == lx.KW_ENUM) or (k == lx.KW_CONST) or (k == lx.KW_THREADLOCAL);
 }
 
 fn expect(P: *mut Parser, k: lx.TokKind) *lx.Token {
@@ -84,8 +142,8 @@ fn expect_ident(P: *mut Parser) Ident {
         if t.kind == lx.TK_PRIM {
             w = lx.prim_name(@int_cast(usize, t.prim));
         }
-        _ = dg.err(t.span, "E0104", u.f2("'%s' is a reserved %s and cannot be used as a name", w,
-                                         u.pick(t.kind == lx.TK_PRIM, "type name", "keyword")));
+        _ = perr(P, t.span, "E0104", u.f2("'%s' is a reserved %s and cannot be used as a name", w,
+                                          u.pick(t.kind == lx.TK_PRIM, "type name", "keyword")));
         P.errors_at_pos = @int_cast(i64, P.pos);
         _ = advance(P);
         return Ident.{ name: u.intern(u.f1("<reserved %s>", w)), span: sp };
@@ -99,10 +157,11 @@ fn expect_ident(P: *mut Parser) Ident {
 const MAX_DEPTH: usize = 1000;
 
 fn too_deep(P: *mut Parser, sp: u.Span) void {
-    if P.errors_at_pos == @int_cast(i64, P.pos) {
+    if P.poisoned or (P.errors_at_pos == @int_cast(i64, P.pos)) {
         return;
     }
     P.errors_at_pos = @int_cast(i64, P.pos);
+    poison(P);
     _ = dg.err(sp, "E0110", "nested too deeply: more than 1000 levels of expressions, types and blocks");
 }
 
@@ -148,7 +207,7 @@ fn chain_ok(P: *mut Parser, outer: usize, n: usize, sp: u.Span) bool {
 // Skip to a plausible statement/declaration boundary after an error.
 fn sync_stmt(P: *mut Parser) void {
     let mut depth: i32 = 0;
-    while pk(P) != lx.TK_EOF {
+    while (pk(P) != lx.TK_EOF) and not at_decl_start(P, false) {
         let k = pk(P);
         if k == lx.TK_LBRACE {
             depth += 1;
@@ -456,7 +515,7 @@ fn parse_builtin(P: *mut Parser) *mut ast.Expr {
     e.name = t.name;
     let id = ast.builtin_lookup(t.name);
     if id == ast.BI_UNKNOWN {
-        _ = dg.err(t.span, "E0120", u.f1("unknown builtin '@%s'", t.name));
+        _ = perr(P, t.span, "E0120", u.f1("unknown builtin '@%s'", t.name));
     }
     ast.set_builtin(e, id);
     let mut sig: []u8 = "*";
@@ -834,7 +893,7 @@ fn fam_chainable(f: i32) bool {
     return (f != F_S) and (f != F_C) and (f != F_NONE);
 }
 
-fn check_mix(parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
+fn check_mix(P: *Parser, parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
     if (child.kind != ast.E_BINARY) or child.parens {
         return;
     }
@@ -846,14 +905,14 @@ fn check_mix(parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
     if (cf == pf) and fam_chainable(pf) and is_left {
         return;
     }
-    let d = dg.err(child.span, "E0150", u.f2("operators '%s' and '%s' cannot be mixed without parentheses",
-                                             lx.tok_kind_name(ast.op_of(child)), lx.tok_kind_name(ast.op_of(parent))));
+    let d = perr(P, child.span, "E0150", u.f2("operators '%s' and '%s' cannot be mixed without parentheses",
+                                              lx.tok_kind_name(ast.op_of(child)), lx.tok_kind_name(ast.op_of(parent))));
     let fx = dg.fix(d, "add parentheses", "machine");
     dg.edit(fx, u.mkspan(child.span.file, child.span.start, child.span.start), "(");
     dg.edit(fx, u.mkspan(child.span.file, child.span.end, child.span.end), ")");
 }
 
-fn reduce(out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[lx.TokKind]) void {
+fn reduce(P: *Parser, out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[lx.TokKind]) void {
     let op = st.pop();
     let r = out.pop();
     let l = out.pop();
@@ -861,8 +920,8 @@ fn reduce(out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[lx.TokKind]) void {
     ast.set_op(b, op);
     b.a = l;
     ast.set_b(b, r);
-    check_mix(b, l, true);
-    check_mix(b, r, false);
+    check_mix(P, b, l, true);
+    check_mix(P, b, r, false);
     out.push(b);
 }
 
@@ -892,13 +951,13 @@ fn parse_binexpr_rest(P: *mut Parser, first: *mut ast.Expr, outer: usize) *mut a
     for i in 0..ops.len {
         let lv = fam_level(op_family(ops.get(i)));
         while (st.len > 0) and (fam_level(op_family(st.last())) >= lv) {
-            reduce(&mut out, &mut st);
+            reduce(P, &mut out, &mut st);
         }
         st.push(ops.get(i));
         out.push(operands.get(i + 1));
     }
     while st.len > 0 {
-        reduce(&mut out, &mut st);
+        reduce(P, &mut out, &mut st);
     }
     let res = out.get(0);
     out.deinit();
@@ -922,8 +981,8 @@ fn parse_expr_rest(P: *mut Parser, e: *mut ast.Expr) *mut ast.Expr {
     }
     let start = e.span;
     if (e.kind == ast.E_BINARY) and not e.parens {
-        let d = dg.err(e.span, "E0150", u.f2("'%s' applies to the whole expression '... %s ...'; add parentheses",
-                                             u.pick(is_orelse, "??", "catch"), lx.tok_kind_name(ast.op_of(e))));
+        let d = perr(P, e.span, "E0150", u.f2("'%s' applies to the whole expression '... %s ...'; add parentheses",
+                                              u.pick(is_orelse, "??", "catch"), lx.tok_kind_name(ast.op_of(e))));
         let fx = dg.fix(d, u.pick(is_orelse, "unwrap only the right operand", "catch only the right operand"),
                         "suggestion");
         dg.edit(fx, u.mkspan(ast.b_of(e).span.file, ast.b_of(e).span.start, ast.b_of(e).span.start), "(");
@@ -994,7 +1053,10 @@ fn parse_expr_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
 // Statements
 // ---------------------------------------------------------------------------
 fn parse_block_rest(P: *mut Parser, b: *mut ast.Stmt, start: u.Span) void {
-    while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) {
+    while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) and not at_decl_start(P, false) {
+        if decl_keyword(pk(P)) and first_on_line(P) {
+            break;  // (a missing '}': the declaration ends here, and the next begins)
+        }
         let before = P.pos;
         if let .some(s) = parse_stmt(P) {
             b.stmts.push(s);
@@ -1492,14 +1554,14 @@ fn parse_params(P: *mut Parser, d: *mut ast.Decl) void {
     _ = expect(P, lx.TK_RPAREN);
 }
 
-fn missing_ret_error(sp: u.Span) void {
-    let dgn = dg.err(sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
+fn missing_ret_error(P: *Parser, sp: u.Span) void {
+    let dgn = perr(P, sp, "E0301", "missing return type (write 'void' if the function returns nothing)");
     let fx = dg.fix(dgn, "declare a void return type", "suggestion");
     dg.edit(fx, u.mkspan(sp.file, sp.start, sp.start), "void ");
 }
 
 fn parse_missing_ret_body(P: *mut Parser, lsp: u.Span, first: ?*lx.Token) *mut ast.Stmt {
-    missing_ret_error(lsp);
+    missing_ret_error(P, lsp);
     let b = ast.new_stmt(ast.S_BLOCK, lsp);
     if enter(P) {
         if let .some(f) = first {
@@ -1535,7 +1597,7 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
                 let eu = ast.ErrUnionType.{ set: set_te, elem: parse_type(P), is_infer: false };
                 d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, lsp));
             } else {
-                missing_ret_error(lsp);
+                missing_ret_error(P, lsp);
                 d.body = ast.new_stmt(ast.S_BLOCK, set_sp);
                 d.span = sp_from(P, start);
                 return d;
@@ -1565,7 +1627,20 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
     return d;
 }
 
+// A function or method: a declaration of its own (one syntax error each).
 fn parse_fn_inline(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut ast.Decl {
+    let outer = P.poisoned;
+    P.poisoned = false;
+    let d = parse_fn_inline_in(P, start, is_pub, is_export);
+    if P.poisoned {
+        d.poisoned = true;
+        dg.poison(sp_from(P, start));
+    }
+    P.poisoned = outer;
+    return d;
+}
+
+fn parse_fn_inline_in(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut ast.Decl {
     let is = peek(P).span;
     let inl = accept(P, lx.KW_INLINE);
     if inl and (pk(P) != lx.KW_FN) {
@@ -1597,11 +1672,11 @@ fn parse_fn_attr(P: *mut Parser, d: *mut ast.Decl) void {
     } else if u.str_eq(t.name, "multiversion") {
         kind = ast.ATTR_MULTIVERSION;
     } else {
-        _ = dg.err(t.span, "E0829", u.f1("unknown function attribute '@%s' (expected @features or @multiversion)",
-                                         t.name));
+        _ = perr(P, t.span, "E0829", u.f1("unknown function attribute '@%s' (expected @features or @multiversion)",
+                                          t.name));
     }
     if (kind != ast.ATTR_NONE) and (d.attr != ast.ATTR_NONE) {
-        _ = dg.err(t.span, "E0829", "a function has at most one attribute (@features or @multiversion)");
+        _ = perr(P, t.span, "E0829", "a function has at most one attribute (@features or @multiversion)");
         kind = ast.ATTR_NONE;
     }
     if kind != ast.ATTR_NONE {
@@ -1634,7 +1709,7 @@ fn new_variant(name: []u8, span: u.Span) ast.Variant {
 }
 
 fn parse_methods(P: *mut Parser, owner: *mut ast.Decl) void {
-    while (pk(P) == lx.KW_PUB) or (pk(P) == lx.KW_FN) or (pk(P) == lx.KW_INLINE) {
+    while ((pk(P) == lx.KW_PUB) or (pk(P) == lx.KW_FN) or (pk(P) == lx.KW_INLINE)) and not at_decl_start(P, false) {
         let ms = peek(P).span;
         let mp = accept(P, lx.KW_PUB);
         let m = parse_fn_inline(P, ms, mp, false);
@@ -1701,7 +1776,7 @@ fn parse_import(P: *mut Parser, start: u.Span) void {
     d.is_part = is_part;
     let s = expect(P, lx.TK_STRING);
     if (s.kind == lx.TK_STRING) and (u.find(s.str, 0) >= 0) {
-        _ = dg.err(s.span, "E0218", "an import path may not contain a NUL byte");
+        _ = perr(P, s.span, "E0218", "an import path may not contain a NUL byte");
     } else if s.kind == lx.TK_STRING {
         d.import_path = u.intern(s.str);
         d.import_path_span = s.span;
@@ -1749,7 +1824,7 @@ fn parse_test(P: *mut Parser, start: u.Span) *mut ast.Decl {
                     v = u.atol(c[1..]);
                 }
                 if (v < 0) or (v > 13) {
-                    _ = dg.err(code.span, "E0311", u.f1("unknown trap code '%s' (expected T0000 ... T0013)", c));
+                    _ = perr(P, code.span, "E0311", u.f1("unknown trap code '%s' (expected T0000 ... T0013)", c));
                 } else {
                     d.test_trap = @int_cast(i32, v);
                 }
@@ -1941,6 +2016,28 @@ fn parse_global(P: *mut Parser, start: u.Span, is_pub: bool, tls: bool) *mut ast
 }
 
 fn parse_top(P: *mut Parser) void {
+    let n0 = P.mod.decls.len;
+    let start = peek(P).span;
+    P.poisoned = false;
+    P.top_poisoned = false;
+    parse_top_in(P);
+    if P.poisoned {
+        for i in n0..P.mod.decls.len {
+            P.mod.decls.get(i).poisoned = true;
+        }
+        dg.poison(sp_from(P, start));
+    }
+}
+
+// After a syntax error outside any declaration: skip to the next one.
+fn skip_to_decl(P: *mut Parser) void {
+    _ = advance(P);
+    while (pk(P) != lx.TK_EOF) and not at_decl_start(P, true) {
+        _ = advance(P);
+    }
+}
+
+fn parse_top_in(P: *mut Parser) void {
     let t = peek(P);
     let start = t.span;
     let mdecls = &mut P.mod.decls;
@@ -2011,7 +2108,7 @@ fn parse_top(P: *mut Parser) void {
         mdecls.push(parse_global(P, start, is_pub, false));
     } else {
         syntax_error(P, "declaration");
-        sync_stmt(P);
+        skip_to_decl(P);
     }
 }
 
@@ -2019,7 +2116,7 @@ fn parse_top(P: *mut Parser) void {
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
     let mut toks = lx.lex_file(f);
     let mut P = Parser.{ f: f, t: toks.items(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
-                         ntests: 0, depth: 0, high: 0 };
+                         ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false };
     P.mod.file = f;
     while pk(&P) != lx.TK_EOF {
         let before = P.pos;

@@ -2608,6 +2608,43 @@ await section('', {
   await section('garbage in', cases, { timed: false });
 }
 
+// One error per mistake (spec §16.2): a declaration with a syntax error is
+// poisoned (one E0100, its body not checked, no fixes in it), and the parser
+// resumes at the next declaration.
+{
+  const cases = {};
+  const check = (src, name) => {
+    const f = path.join(tmp, `one-${name}.ax`);
+    fs.writeFileSync(f, src);
+    const c = spawnSync(compiler, ['check', f, '--format=agent-json'], { encoding: 'utf8' });
+    try { return JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error'); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+  };
+  const codes = (want, src, name) => () => {
+    const ds = check(src, name);
+    if (typeof ds === 'string') return ds;
+    const got = ds.map((x) => `${x.code}@${x.span.start_line}`).join(' ');
+    return got === want ? null : `expected ${want}, got ${got}`;
+  };
+  cases['two syntax errors in one function are one error'] = codes('E0100@2',
+    'fn f() i32 {\n    let x = ;\n    let y = ;\n    return 1;\n}\n', 'two');
+  cases['each function reports its own syntax error'] = codes('E0100@2 E0100@7',
+    'fn f() i32 {\n    let x = ;\n    return 1;\n}\n\nfn g() i32 {\n    let y = ;\n    return 2;\n}\n', 'each');
+  cases['a poisoned body is not checked, its signature is'] = codes('E0100@2 E0412@7',
+    'fn f(x: i32) i32 {\n    let a: bool = 1 +;\n    return x;\n}\n\nfn g() bool {\n    return f(1);\n}\n', 'body');
+  cases['a missing brace ends the declaration at the next one'] = codes('E0100@7 E0412@8',
+    'fn f() i32 {\n    if true {\n        return 1;\n    return 2;\n}\n\nfn g() void {\n    let x: i32 = "s";\n}\n',
+    'brace');
+  cases['a method has its own syntax error, and the others are checked'] = codes('E0100@4 E0412@8',
+    'struct S {\n    a: i32,\n    fn f(self: Self) i32 {\n        let = 1;\n        return self.a;\n    }\n    fn g(self: Self) bool {\n        return self.a;\n    }\n}\n', 'method');
+  cases['no fix in a poisoned declaration'] = () => {
+    const ds = check('fn f(x: i32) i32 {\n    let a = x + 1 << 2;\n    let = 1;\n    return a;\n}\n', 'nofix');
+    if (typeof ds === 'string') return ds;
+    const got = ds.map((x) => `${x.code}:${x.fixes.length}`).join(' ');
+    return got === 'E0150:0 E0100:0' ? null : `got ${got}`;
+  };
+  await section('one error per mistake', cases, { timed: false });
+}
+
 // The C parser (docs/c-frontend.md; the compiler only): each
 // cmd/axiom/internal/tests/c/parse/<name>.c gives the tree in <name>.ast
 // (--emit=c-ast), or with `/* expect-error: C2xxx */` directives exactly
