@@ -46,14 +46,24 @@ struct Pair {
     pub im: *mut ir.Value,
 }
 
+// A complex arithmetic operand: complex, or a real value (.none imaginary part).
+struct CxOp {
+    re: *mut ir.Value,
+    im: ?*mut ir.Value,
+}
+
+fn cx_of(p: Pair) CxOp {
+    return CxOp.{ re: p.re, im: .some(p.im) };
+}
+
 /// The value v of a real type as an operand.
-fn cx_real(v: *mut ir.Value) Pair {
-    return Pair.{ re: v, im: ir.vnil() };
+fn cx_real(v: *mut ir.Value) CxOp {
+    return CxOp.{ re: v, im: .none };
 }
 
 /// The value v of real type t as an operand (a _Float16 widened to float,
 /// as the parts of its complex type are).
-fn cx_real_t(v: *mut ir.Value, t: *cty.CType) Pair {
+fn cx_real_t(v: *mut ir.Value, t: *cty.CType) CxOp {
     if cty.is_half(t) {
         return cx_real(half_to_f32(v, t));
     }
@@ -77,14 +87,14 @@ fn cx_mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
     }
 }
 
-// Are v's parts wide long doubles (addresses)?
-fn cx_wide(v: Pair) bool {
-    return v.re.ty.kind == ir.T_PTR;
+// Are parts of this complex type wide long doubles (addresses)?
+fn cx_wide(re: *ir.Value) bool {
+    return re.ty.kind == ir.T_PTR;
 }
 
-// Are v's parts integers (an integer complex type's)?
-fn cx_ints(v: Pair) bool {
-    return v.re.ty.kind == ir.T_INT;
+// Are parts of this complex type integers?
+fn cx_ints(re: *ir.Value) bool {
+    return re.ty.kind == ir.T_INT;
 }
 
 /// The parts of the complex value of type t at p (volatile: as t says).
@@ -160,11 +170,11 @@ fn cx_snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 
 /// The truth of complex value v of type t (6.3.1.2: unequal to 0, either part), as an i1.
 fn cx_truth(t: *cty.CType, v: Pair) *mut ir.Value {
-    if cx_wide(v) {
+    if cx_wide(v.re) {
         let el = t.unq.elem;
         return ir.or_(B, ld_truth(v.re, el), ld_truth(v.im, el));
     }
-    if cx_ints(v) {
+    if cx_ints(v.re) {
         let zi = ir.cint(v.re.ty, 0);
         return ir.or_(B, ir.icmp(B, ir.IntNE, v.re, zi), ir.icmp(B, ir.IntNE, v.im, zi));
     }
@@ -173,33 +183,42 @@ fn cx_truth(t: *cty.CType, v: Pair) *mut ir.Value {
 }
 
 /// x == y (both of complex type t: both parts equal, 6.5.9p4), as an i1; ne: x != y.
-fn cx_equal(t: *cty.CType, x: Pair, y: Pair, ne: bool) *mut ir.Value {
-    if cx_wide(x) {
+fn cx_equal(t: *cty.CType, x: CxOp, y: CxOp, ne: bool) *mut ir.Value {
+    if cx_wide(x.re) {
         let el = t.unq.elem;
+        let z = ld_constant(cl.zero());
+        let xi = x.im ?? z;
+        let yi = y.im ?? z;
         if ne {
-            return ir.or_(B, ld_compare(ct.P_NE, x.re, y.re, el), ld_compare(ct.P_NE, x.im, y.im, el));
+            return ir.or_(B, ld_compare(ct.P_NE, x.re, y.re, el), ld_compare(ct.P_NE, xi, yi, el));
         }
-        return ir.and_(B, ld_compare(ct.P_EQ, x.re, y.re, el), ld_compare(ct.P_EQ, x.im, y.im, el));
+        return ir.and_(B, ld_compare(ct.P_EQ, x.re, y.re, el), ld_compare(ct.P_EQ, xi, yi, el));
     }
-    if cx_ints(x) {
+    if cx_ints(x.re) {
+        let z = ir.cint(x.re.ty, 0);
+        let xi = x.im ?? z;
+        let yi = y.im ?? z;
         if ne {
-            return ir.or_(B, ir.icmp(B, ir.IntNE, x.re, y.re), ir.icmp(B, ir.IntNE, x.im, y.im));
+            return ir.or_(B, ir.icmp(B, ir.IntNE, x.re, y.re), ir.icmp(B, ir.IntNE, xi, yi));
         }
-        return ir.and_(B, ir.icmp(B, ir.IntEQ, x.re, y.re), ir.icmp(B, ir.IntEQ, x.im, y.im));
+        return ir.and_(B, ir.icmp(B, ir.IntEQ, x.re, y.re), ir.icmp(B, ir.IntEQ, xi, yi));
     }
+    let z = ir.cfp(x.re.ty, 0.0);
+    let xi = x.im ?? z;
+    let yi = y.im ?? z;
     if ne {
-        return ir.or_(B, ir.fcmp(B, ir.RealUNE, x.re, y.re), ir.fcmp(B, ir.RealUNE, x.im, y.im));
+        return ir.or_(B, ir.fcmp(B, ir.RealUNE, x.re, y.re), ir.fcmp(B, ir.RealUNE, xi, yi));
     }
-    return ir.and_(B, ir.fcmp(B, ir.RealOEQ, x.re, y.re), ir.fcmp(B, ir.RealOEQ, x.im, y.im));
+    return ir.and_(B, ir.fcmp(B, ir.RealOEQ, x.re, y.re), ir.fcmp(B, ir.RealOEQ, xi, yi));
 }
 
 /// -v (of complex type t).
 fn cx_negate(t: *cty.CType, v: Pair) Pair {
-    if cx_wide(v) {
+    if cx_wide(v.re) {
         let el = t.unq.elem;
         return Pair.{ re: ld_negate(v.re, el), im: ld_negate(v.im, el) };
     }
-    if cx_ints(v) {
+    if cx_ints(v.re) {
         return Pair.{ re: ir.neg(B, v.re), im: ir.neg(B, v.im) };
     }
     return Pair.{ re: ir.fneg(B, v.re), im: ir.fneg(B, v.im) };
@@ -207,10 +226,10 @@ fn cx_negate(t: *cty.CType, v: Pair) Pair {
 
 /// The conjugate of v (of complex type t).
 fn cx_conj(t: *cty.CType, v: Pair) Pair {
-    if cx_wide(v) {
+    if cx_wide(v.re) {
         return Pair.{ re: v.re, im: ld_negate(v.im, t.unq.elem) };
     }
-    if cx_ints(v) {
+    if cx_ints(v.re) {
         return Pair.{ re: v.re, im: ir.neg(B, v.im) };
     }
     return Pair.{ re: v.re, im: ir.fneg(B, v.im) };
@@ -228,67 +247,56 @@ const CX_DIV: i32 = 4;
 
 /// x op y in complex type t (op: CX_ADD ... CX_DIV), either operand maybe
 /// real (G.5).
-fn cx_arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
+fn cx_arith(op: i32, t0: *mut cty.CType, x: CxOp, y: CxOp) Pair {
     let t = cx_compute_type(t0);
-    if cx_wide(x) {
+    if cx_wide(x.re) {
         return cx_arith_wide(op, x, y, t.unq.elem);
     }
-    if cx_ints(x) {
+    if cx_ints(x.re) {
         return cx_arith_int(op, t.unq.elem.is_signed, x, y);
     }
-    let xr = u.isnil(x.im);
-    let yr = u.isnil(y.im);
     if op == CX_ADD {
-        if xr {
-            return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: y.im };
+        if let .some(xi) = x.im {
+            if let .some(yi) = y.im {
+                return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: cx_bin(ir.OP_FADD, xi, yi) };
+            }
+            return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: xi };
         }
-        if yr {
-            return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: x.im };
-        }
-        return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: cx_bin(ir.OP_FADD, x.im, y.im) };
+        return Pair.{ re: cx_bin(ir.OP_FADD, x.re, y.re), im: y.im ?? ir.cfp(x.re.ty, 0.0) };
     }
     if op == CX_SUB {
-        if xr {
-            return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: ir.fneg(B, y.im) };
+        if let .some(xi) = x.im {
+            if let .some(yi) = y.im {
+                return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: cx_bin(ir.OP_FSUB, xi, yi) };
+            }
+            return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: xi };
         }
-        if yr {
-            return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: x.im };
-        }
-        return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: cx_bin(ir.OP_FSUB, x.im, y.im) };
+        return Pair.{ re: cx_bin(ir.OP_FSUB, x.re, y.re), im: ir.fneg(B, y.im ?? ir.cfp(x.re.ty, 0.0)) };
     }
     if op == CX_MUL {
-        if xr {
-            return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, x.re, y.im) };
+        if let .some(xi) = x.im {
+            if let .some(yi) = y.im {
+                return cx_multiply(t, Pair.{ re: x.re, im: xi }, Pair.{ re: y.re, im: yi });
+            }
+            return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, xi, y.re) };
         }
-        if yr {
-            return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, x.im, y.re) };
-        }
-        return cx_multiply(t, x, y);
+        return Pair.{ re: cx_bin(ir.OP_FMUL, x.re, y.re), im: cx_bin(ir.OP_FMUL, x.re, y.im ?? ir.cfp(x.re.ty, 0.0)) };
     }
-    if yr {
-        return Pair.{ re: cx_bin(ir.OP_FDIV, x.re, y.re), im: cx_bin(ir.OP_FDIV, x.im, y.re) };
+    if let .none = y.im {
+        return Pair.{ re: cx_bin(ir.OP_FDIV, x.re, y.re), im: cx_bin(ir.OP_FDIV, x.im ?? ir.cfp(x.re.ty, 0.0), y.re) };
     }
-    let mut xi = x.im;
-    if xr {
-        xi = ir.cfp(x.re.ty, 0.0);  // (x / (u + iv) as (x + i0) / (u + iv))
-    }
-    return cx_call_helper(t, false, x.re, xi, y.re, y.im);
+    let z = ir.cfp(x.re.ty, 0.0);
+    return cx_call_helper(t, false, x.re, x.im ?? z, y.re, y.im ?? z);
 }
 
 // cx_arith where the parts are integers (an integer complex type's, signed or
 // not): a real operand's imaginary part is 0.
-fn cx_arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
+fn cx_arith_int(op: i32, signed: bool, x: CxOp, y: CxOp) Pair {
     let a = x.re;
     let c = y.re;
     let z = ir.cint(a.ty, 0);
-    let mut b = x.im;
-    if u.isnil(b) {
-        b = z;
-    }
-    let mut d = y.im;
-    if u.isnil(d) {
-        d = z;
-    }
+    let b = x.im ?? z;
+    let d = y.im ?? z;
     if op == CX_ADD {
         return Pair.{ re: cx_bin(ir.OP_ADD, a, c), im: cx_bin(ir.OP_ADD, b, d) };
     }
@@ -304,7 +312,7 @@ fn cx_arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
     if signed {
         div = ir.OP_SDIV;
     }
-    if u.isnil(y.im) {
+    if let .none = y.im {
         return Pair.{ re: cx_bin(div, a, c), im: cx_bin(div, b, c) };
     }
     let n = cx_bin(ir.OP_ADD, cx_bin(ir.OP_MUL, c, c), cx_bin(ir.OP_MUL, d, d));
@@ -316,9 +324,7 @@ fn cx_arith_int(op: i32, signed: bool, x: Pair, y: Pair) Pair {
 // cx_arith where the parts are wide long doubles: the same operations, in
 // cgen_ld.ax's arithmetic; a complex product or quotient by ldouble.ax's
 // cmul and cdiv (ccomplex.ax's algorithms).
-fn cx_arith_wide(op: i32, x: Pair, y: Pair, el: *cty.CType) Pair {
-    let xr = u.isnil(x.im);
-    let yr = u.isnil(y.im);
+fn cx_arith_wide(op: i32, x: CxOp, y: CxOp, el: *cty.CType) Pair {
     let mut cop = ct.P_PLUS;
     if op == CX_SUB {
         cop = ct.P_MINUS;
@@ -329,35 +335,33 @@ fn cx_arith_wide(op: i32, x: Pair, y: Pair, el: *cty.CType) Pair {
     }
     if (op == CX_ADD) or (op == CX_SUB) {
         let re = ld_arith(cop, x.re, y.re, el);
-        if xr {
-            if op == CX_SUB {
-                return Pair.{ re: re, im: ld_negate(y.im, el) };
+        if let .some(xi) = x.im {
+            if let .some(yi) = y.im {
+                return Pair.{ re: re, im: ld_arith(cop, xi, yi, el) };
             }
-            return Pair.{ re: re, im: y.im };
+            return Pair.{ re: re, im: xi };
         }
-        if yr {
-            return Pair.{ re: re, im: x.im };
+        let yi = y.im ?? ld_constant(cl.zero());
+        if op == CX_SUB {
+            return Pair.{ re: re, im: ld_negate(yi, el) };
         }
-        return Pair.{ re: re, im: ld_arith(cop, x.im, y.im, el) };
+        return Pair.{ re: re, im: yi };
     }
     if op == CX_MUL {
-        if xr {
-            return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.re, y.im, el) };
+        if let .some(xi) = x.im {
+            if let .some(yi) = y.im {
+                let r = ld_complex_call("cmul", x.re, xi, y.re, yi, el);
+                return Pair.{ re: r[0], im: r[1] };
+            }
+            return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, xi, y.re, el) };
         }
-        if yr {
-            return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.im, y.re, el) };
-        }
-        let r = ld_complex_call("cmul", x.re, x.im, y.re, y.im, el);
-        return Pair.{ re: r[0], im: r[1] };
+        return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.re, y.im ?? ld_constant(cl.zero()), el) };
     }
-    if yr {
-        return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.im, y.re, el) };
+    if let .none = y.im {
+        return Pair.{ re: ld_arith(cop, x.re, y.re, el), im: ld_arith(cop, x.im ?? ld_constant(cl.zero()), y.re, el) };
     }
-    let mut xi = x.im;
-    if xr {
-        xi = ld_constant(cl.zero());  // (x / (u + iv) as (x + i0) / (u + iv))
-    }
-    let r = ld_complex_call("cdiv", x.re, xi, y.re, y.im, el);
+    let z = ld_constant(cl.zero());
+    let r = ld_complex_call("cdiv", x.re, x.im ?? z, y.re, y.im ?? z, el);
     return Pair.{ re: r[0], im: r[1] };
 }
 

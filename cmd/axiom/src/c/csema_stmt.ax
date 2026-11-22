@@ -13,12 +13,12 @@ import "ctypes.ax" as cty;
 import "cwide.ax" as cw;
 
 // A switch statement being analyzed.
-struct Switch {
+nocopy struct Switch {
     s: *mut cast.Stmt,
     ty: *mut cty.CType,  // the promoted type of its controlling expression
     values: u.SymMap.[i32],
     has_default: bool,
-    scope: *mut void,                 // the scope its body starts in (csema_vla.mark)
+    scope: ?*mut VNode,               // the scope its body starts in (csema_vla.mark)
     ranges: u.List.[*mut cast.Stmt],  // its case ranges (a GNU dialect)
 }
 
@@ -28,46 +28,51 @@ struct Local {
     sym: *mut cast.CSym,
 }
 
-struct Body {
+nocopy struct Body {
     f: *mut cast.CSym,
     ret: *mut cty.CType,
-    labels: u.SymMap.[*mut cast.CSym],
+    labels: u.SymMap.[?*mut cast.CSym],
     label_list: u.List.[*mut cast.CSym],
     switches: u.List.[*mut Switch],
     loops: i32,                            // loops around the current statement
     breakable: i32,                        // loops and switches around it
     locals: u.List.[Local],                // the local labels in scope, innermost last
     addr_labels: u.List.[*mut cast.Stmt],  // the computed gotos (`goto *p`)
-    parent: *mut Body,                     // a nested function's: its enclosing function's body
+    parent: ?*mut Body,                    // a nested function's: its enclosing function's body
+}
+
+fn cur_body() *mut Body {
+    return g_body ?? u.new.[Body]();
 }
 
 // Does an enclosing function of the body b (a nested function's) have the
 // label `name`, a local label or one used or defined so far?
 fn outer_label(b: *mut Body, name: []u8) bool {
-    let mut p = b.parent;
-    while u.notnil(p) {
-        if u.notnil(p.labels.get(name)) {
+    let mut op = b.parent;
+    loop {
+        let p = op ?? return false;
+        if let .some(lbl) = p.labels.get(name) {
+            _ = lbl;
             return true;
         }
-        for l in p.locals.items() {
+        for &l in p.locals.items() {
             if u.str_eq(l.name, name) {
                 return true;
             }
         }
-        p = p.parent;
+        op = p.parent;
     }
-    return false;
 }
 
 // The labels whose addresses are taken (`&&label`), by function: IR
 // generation's, for `goto *` (cgen_stmt.ax).
 fn addr_label_list(f: *cast.CSym) *mut u.List.[*mut cast.CSym] {
     let k = u.addr_key(@int_from_ptr(f));
-    let mut l = g_addr_labels.get(k);
-    if u.isnil(l) {
-        l = u.new.[u.List.[*mut cast.CSym]]();
-        g_addr_labels.put(k, l);
+    if let .some(l) = g_addr_labels.get(k) {
+        return l;
     }
+    let l = u.new.[u.List.[*mut cast.CSym]]();
+    g_addr_labels.put(k, .some(l));
     return l;
 }
 
@@ -83,34 +88,38 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     let b = u.new.[Body]();
     b.f = f;
     b.ret = f.ty.ret;
-    b.labels = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    b.labels = u.SymMap.[?*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[?*mut cast.CSym](), cap: 0, len: 0 };
     let saved = g_body;
     if u.notnil(f.nest_parent) {
         b.parent = saved;
     }
-    g_body = b;
+    g_body = .some(b);
     // (a nested function's body is analyzed inside its enclosing one's: what
     // describes that body is set aside, and taken up again after)
     let saved_fn = cur_fn();
     let saved_vla = vla_save();
     let saved_marks = marks_save_body();
-    set_cur_fn(f);
+    set_cur_fn(.some(f));
     vla_begin_body();
     push_scope();
     for p in f.params.items() {
         p.owner = f;
         if p.name.len > 0 {
-            let prior = lookup_here(p.name);
-            if u.isnil(prior) {
+            if let .some(prior) = lookup_here(p.name) {
+                _ = prior;
+            } else {
                 declare(p.name, p);
             }
         }
     }
     own_params(f);  // (the lengths in its parameters' types)
     let xs = d.body.items.items();
-    let gn = note_of(f);
+    let mut naked = false;
+    if let .some(gn) = gnu_note_if(@int_from_ptr(f)) {
+        naked = gn.naked;
+    }
     // (on WebAssembly a naked function's asm is its code, checked as a whole: csema_asm.ax)
-    g_naked_wasm = tg.is_wasm() and u.notnil(gn) and gn.naked;
+    g_naked_wasm = tg.is_wasm() and naked;
     let follow = g_follow_case;
     for i in 0..xs.len {
         g_follow_case = follows_case(xs, i, false);
@@ -120,7 +129,7 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     g_follow_case = follow;
     g_naked_wasm = false;
     pop_scope();
-    if u.notnil(gn) and gn.naked {
+    if naked {
         naked_body(f, d.body);
     }
     for l in b.label_list.items() {
@@ -147,20 +156,21 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
 }
 
 fn label_sym(name: []u8, sp: u.Span) *mut cast.CSym {
+    let b = cur_body();
     // (a local label of a block around it first: a GNU dialect)
-    let mut k = g_body.locals.len;
+    let mut k = b.locals.len;
     while k > 0 {
         k -= 1;
-        if u.same(g_body.locals.get(k).name, name) {
-            return g_body.locals.get(k).sym;
+        if u.same(b.locals.get(k).name, name) {
+            return b.locals.get(k).sym;
         }
     }
-    let mut l = g_body.labels.get(name);
-    if u.isnil(l) {
-        l = new_sym(cast.SK_LABEL, name, sp, cty.t_void);
-        g_body.labels.put(name, l);
-        g_body.label_list.push(l);
+    if let .some(l) = b.labels.get(name) {
+        return l;
     }
+    let l = new_sym(cast.SK_LABEL, name, sp, cty.t_void);
+    b.labels.put(name, .some(l));
+    b.label_list.push(l);
     return l;
 }
 
@@ -170,16 +180,20 @@ fn label_sym(name: []u8, sp: u.Span) *mut cast.CSym {
 // the nested function's call into its enclosing function's (6.8.6.1 for a
 // goto from there: cgen_nest.ax).
 fn goto_label(name: []u8, sp: u.Span) *mut cast.CSym {
-    let mut k = g_body.locals.len;
+    let b = cur_body();
+    let mut k = b.locals.len;
     while k > 0 {
         k -= 1;
-        if u.same(g_body.locals.get(k).name, name) {
-            return g_body.locals.get(k).sym;
+        if u.same(b.locals.get(k).name, name) {
+            return b.locals.get(k).sym;
         }
     }
-    if u.isnil(g_body.labels.get(name)) {
-        let mut p = g_body.parent;
-        while u.notnil(p) {
+    if let .some(lbl) = b.labels.get(name) {
+        _ = lbl;
+    } else {
+        let mut op = b.parent;
+        loop {
+            let p = op ?? break;
             let mut j = p.locals.len;
             while j > 0 {
                 j -= 1;
@@ -189,7 +203,7 @@ fn goto_label(name: []u8, sp: u.Span) *mut cast.CSym {
                     return l;
                 }
             }
-            p = p.parent;
+            op = p.parent;
         }
     }
     return label_sym(name, sp);
@@ -208,10 +222,11 @@ fn stmt(s: *mut cast.Stmt) void {
             attrs(&s.attrs, AP_STMT);
         }
     }
+    let b = cur_body();
     if k == cast.StmtKind.COMPOUND {
         push_scope();
         let m = vla_mark();
-        let nl = g_body.locals.len;
+        let nl = b.locals.len;
         let xs = s.items.items();
         let outer = g_follow_case;
         for i in 0..xs.len {
@@ -224,7 +239,7 @@ fn stmt(s: *mut cast.Stmt) void {
         }
         g_follow_case = outer;
         fp_dir(s.fp);
-        g_body.locals.len = nl;
+        b.locals.len = nl;
         vla_leave(m);
         pop_scope();
     } else if (k == cast.StmtKind.DECL) and (s.decl.kind == cast.DeclKind.LABELS) {
@@ -284,15 +299,15 @@ fn stmt(s: *mut cast.Stmt) void {
         let l = goto_label(s.label, s.label_span);
         l.used = true;
         s.sym = l;
-        if u.isnil(l.owner) or (l.owner == g_body.f) {
+        if u.isnil(l.owner) or (l.owner == b.f) {
             vla_goto(s);  // (a non-local goto leaves this function: cgen_nest.ax)
         }
     } else if k == cast.StmtKind.CONTINUE {
-        if g_body.loops == 0 {
+        if b.loops == 0 {
             err(s.span, "C3042", "'continue' is not in a loop");
         }
     } else if k == cast.StmtKind.BREAK {
-        if g_body.breakable == 0 {
+        if b.breakable == 0 {
             err(s.span, "C3042", "'break' is not in a loop or switch statement");
         }
     } else if k == cast.StmtKind.RETURN {
@@ -366,7 +381,7 @@ fn fallthrough(xs: []*mut cast.Stmt, i: usize, outer: bool) void {
     if not is_fallthrough(xs[i]) {
         return;
     }
-    if (g_body.switches.len == 0) or not follows_case(xs, i, outer) {
+    if (cur_body().switches.len == 0) or not follows_case(xs, i, outer) {
         err(xs[i].span, "C3077", "'[[fallthrough]]' is not followed by a case or default label of a switch statement");
     }
 }
@@ -388,17 +403,19 @@ fn stmt_sub(s: *mut cast.Stmt) void {
 }
 
 fn loop_body(s: *mut cast.Stmt) void {
-    g_body.loops += 1;
-    g_body.breakable += 1;
+    let b = cur_body();
+    b.loops += 1;
+    b.breakable += 1;
     let follow = g_follow_case;
     g_follow_case = false;  // (its end goes back to the loop's test)
     stmt_sub(s);
     g_follow_case = follow;
-    g_body.loops -= 1;
-    g_body.breakable -= 1;
+    b.loops -= 1;
+    b.breakable -= 1;
 }
 
 fn switch_stmt(s: *mut cast.Stmt) void {
+    let b = cur_body();
     let e = rv(s.e);
     let sw = u.new.[Switch]();
     sw.s = s;
@@ -414,18 +431,19 @@ fn switch_stmt(s: *mut cast.Stmt) void {
     }
     s.e = convert(e, sw.ty);
     sw.scope = vla_mark();
-    g_body.switches.push(sw);
-    g_body.breakable += 1;
+    b.switches.push(sw);
+    b.breakable += 1;
     let follow = g_follow_case;
     g_follow_case = false;  // (its end leaves the switch)
     stmt_sub(s.body);
     g_follow_case = follow;
-    g_body.breakable -= 1;
-    _ = g_body.switches.pop();
+    b.breakable -= 1;
+    _ = b.switches.pop();
 }
 
 fn case_stmt(s: *mut cast.Stmt) void {
-    if (g_body.switches.len > 0) and cty.is_wint(g_body.switches.last().ty) {
+    let b = cur_body();
+    if (b.switches.len > 0) and cty.is_wint(b.switches.last().ty) {
         wide_case(s);
         return;
     }
@@ -436,10 +454,10 @@ fn case_stmt(s: *mut cast.Stmt) void {
         hi = ice(s.hi, "the end of a case range");
         s.hi = hi.e;
     }
-    if g_body.switches.len == 0 {
+    if b.switches.len == 0 {
         err(s.span, "C3040", "'case' is not in a switch statement");
     } else if r.ok and hi.ok {
-        let sw = g_body.switches.last();
+        let sw = b.switches.last();
         if not cty.is_error(sw.ty) {
             // the value converted to the promoted controlling type (6.8.4.2p5)
             s.cval = cty.wrap(sw.ty, r.v);
@@ -455,7 +473,7 @@ fn case_stmt(s: *mut cast.Stmt) void {
                 sw.s.cases.push(s);
             }
         }
-        vla_case_label(s, g_body.switches.last().scope);
+        vla_case_label(s, b.switches.last().scope);
     }
     stmt(s.body);
 }
@@ -464,7 +482,7 @@ fn case_stmt(s: *mut cast.Stmt) void {
 // bits: its value converted to that type is the constant s.e (cwide.ax),
 // which cgen_stmt compares with; a case range's last value is s.hi, likewise.
 fn wide_case(s: *mut cast.Stmt) void {
-    let sw = g_body.switches.last();
+    let sw = cur_body().switches.last();
     let r = ice_wide(s.e, "a case label");
     s.e = r.e;
     let mut hi = r;
@@ -572,17 +590,18 @@ fn case_range(sw: *mut Switch, s: *mut cast.Stmt) void {
 
 // `__label__ a, b;` (a GNU dialect): labels of the enclosing block.
 fn local_labels(d: *mut cast.Decl) void {
-    let start = g_body.locals.len;
+    let b = cur_body();
+    let start = b.locals.len;
     for dc in d.decls.items() {
-        for k in start..g_body.locals.len {
-            if u.same(g_body.locals.get(k).name, dc.name) {
+        for k in start..b.locals.len {
+            if u.same(b.locals.get(k).name, dc.name) {
                 err(dc.name_span, "C3002", u.f1("the local label '%s' is declared twice", dc.name));
             }
         }
         let l = new_sym(cast.SK_LABEL, dc.name, dc.name_span, cty.t_void);
-        l.owner = g_body.f;  // (a nested function may jump to it: goto_label)
-        g_body.label_list.push(l);
-        g_body.locals.push(Local.{ name: dc.name, sym: l });
+        l.owner = b.f;  // (a nested function may jump to it: goto_label)
+        b.label_list.push(l);
+        b.locals.push(Local.{ name: dc.name, sym: l });
     }
 }
 
@@ -596,57 +615,66 @@ fn computed_goto(s: *mut cast.Stmt) void {
     if u.notnil(e.ty) and not cty.is_error(e.ty) and (e.ty.kind != cty.TK_POINTER) {
         err(e.span, "C3020", u.f1("the operand of 'goto *' has type %s, not a pointer type", tq(e.ty)));
     }
-    g_body.addr_labels.push(s);
+    cur_body().addr_labels.push(s);
 }
 
 // `&&label` (a GNU dialect): the label's address, a `void *`.
 fn label_addr(e: *mut cast.Expr) *mut cast.Expr {
-    if u.isnil(g_body) {
-        err(e.span, "C3090", "the address of a label outside a function");
-        e.ty = cty.t_error;
-        return e;
-    }
-    // (in a nested function, a local label (`__label__`) of an enclosing
-    // function in scope there, if it has no label of the name: that
-    // function's label, whose address its own `goto *` may jump to)
-    let mut owner = g_body.f;
-    let mut l = u.nil.[cast.CSym]();
-    let mut k = g_body.locals.len;
-    while (k > 0) and u.isnil(l) {
-        k -= 1;
-        if u.same(g_body.locals.get(k).name, e.name) {
-            l = g_body.locals.get(k).sym;
+    if let .some(b) = g_body {
+        // (in a nested function, a local label (`__label__`) of an enclosing
+        // function in scope there, if it has no label of the name: that
+        // function's label, whose address its own `goto *` may jump to)
+        let mut owner = b.f;
+        let mut ol: ?*mut cast.CSym = .none;
+        let mut k = b.locals.len;
+        while k > 0 {
+            k -= 1;
+            if u.same(b.locals.get(k).name, e.name) {
+                ol = .some(b.locals.get(k).sym);
+                break;
+            }
         }
-    }
-    if u.isnil(l) and u.isnil(g_body.labels.get(e.name)) {
-        let mut p = g_body.parent;
-        while u.notnil(p) and u.isnil(l) {
-            let mut j = p.locals.len;
-            while j > 0 {
-                j -= 1;
-                if u.same(p.locals.get(j).name, e.name) {
-                    l = p.locals.get(j).sym;
-                    owner = p.f;
+        if let .some(found) = ol {
+            _ = found;
+        } else if let .some(lbl) = b.labels.get(e.name) {
+            _ = lbl;
+        } else {
+            let mut op = b.parent;
+            loop {
+                let p = op ?? break;
+                let mut found = false;
+                let mut j = p.locals.len;
+                while j > 0 {
+                    j -= 1;
+                    if u.same(p.locals.get(j).name, e.name) {
+                        ol = .some(p.locals.get(j).sym);
+                        owner = p.f;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
                     break;
                 }
+                op = p.parent;
             }
-            p = p.parent;
         }
+        let l = ol ?? label_sym(e.name, e.name_span);
+        l.used = true;
+        if not l.label_addr {
+            // (its index among the function's labels whose addresses are taken)
+            l.label_addr = true;
+            l.owner = owner;
+            l.value = owner.value;
+            owner.value += 1;
+            addr_label_list(owner).push(l);
+        }
+        e.sym = l;
+        e.ty = cty.pointer_to(cty.t_void);
+        return e;
     }
-    if u.isnil(l) {
-        l = label_sym(e.name, e.name_span);
-    }
-    l.used = true;
-    if not l.label_addr {
-        // (its index among the function's labels whose addresses are taken)
-        l.label_addr = true;
-        l.owner = owner;
-        l.value = owner.value;
-        owner.value += 1;
-        addr_label_list(owner).push(l);
-    }
-    e.sym = l;
-    e.ty = cty.pointer_to(cty.t_void);
+    err(e.span, "C3090", "the address of a label outside a function");
+    e.ty = cty.t_error;
     return e;
 }
 
@@ -668,40 +696,41 @@ pub fn value_stmt(s0: *mut cast.Stmt) *mut cast.Stmt {
 // its value and type are those of its last item if that is an expression
 // statement, else void.
 fn stmt_expr(e: *mut cast.Expr) *mut cast.Expr {
-    if u.isnil(g_body) {
-        err(e.span, "C3090", "a statement expression outside a function");
-        e.ty = cty.t_error;
+    if let .some(b) = g_body {
+        let s = e.body;
+        push_scope();
+        let m = vla_mark();
+        let nl = b.locals.len;
+        let xs = s.items.items();
+        e.ty = cty.t_void;
+        let follow = g_follow_case;
+        for i in 0..xs.len {
+            let x = xs[i];
+            g_follow_case = follows_case(xs, i, false);
+            stmt(x);
+            fallthrough(xs, i, false);
+            let v = value_stmt(x);
+            if (i + 1 == xs.len) and u.notnil(v) and u.notnil(v.e.ty) {
+                e.ty = cty.unqual(v.e.ty);
+            }
+        }
+        g_follow_case = follow;
+        b.locals.len = nl;
+        vla_leave(m);
+        pop_scope();
         return e;
     }
-    let s = e.body;
-    push_scope();
-    let m = vla_mark();
-    let nl = g_body.locals.len;
-    let xs = s.items.items();
-    e.ty = cty.t_void;
-    let follow = g_follow_case;
-    for i in 0..xs.len {
-        let x = xs[i];
-        g_follow_case = follows_case(xs, i, false);
-        stmt(x);
-        fallthrough(xs, i, false);
-        let v = value_stmt(x);
-        if (i + 1 == xs.len) and u.notnil(v) and u.notnil(v.e.ty) {
-            e.ty = cty.unqual(v.e.ty);
-        }
-    }
-    g_follow_case = follow;
-    g_body.locals.len = nl;
-    vla_leave(m);
-    pop_scope();
+    err(e.span, "C3090", "a statement expression outside a function");
+    e.ty = cty.t_error;
     return e;
 }
 
 fn default_stmt(s: *mut cast.Stmt) void {
-    if g_body.switches.len == 0 {
+    let b = cur_body();
+    if b.switches.len == 0 {
         err(s.span, "C3040", "'default' is not in a switch statement");
     } else {
-        let sw = g_body.switches.last();
+        let sw = b.switches.last();
         if sw.has_default {
             err(s.span, "C3041", "a second 'default' label in one switch statement");
         }
@@ -713,10 +742,11 @@ fn default_stmt(s: *mut cast.Stmt) void {
 }
 
 fn return_stmt(s: *mut cast.Stmt) void {
-    let rt = g_body.ret;
+    let b = cur_body();
+    let rt = b.ret;
     if u.isnil(s.e) {
         if not cty.is_void(rt) and (std() >= co.C99) {
-            err(s.span, "C3044", u.f2("'return' without a value in '%s', which returns %s", g_body.f.name, tq(rt)));
+            err(s.span, "C3044", u.f2("'return' without a value in '%s', which returns %s", b.f.name, tq(rt)));
         }
         return;
     }
@@ -732,10 +762,10 @@ fn return_stmt(s: *mut cast.Stmt) void {
         if opts().gnu and (std() < co.C99) {
             // (gnu89: the value is evaluated and discarded, with a warning)
             warn(e.span, "C4146", u.f1("'return' with a value in '%s', which returns void: the value is discarded",
-                                       g_body.f.name));
+                                       b.f.name));
             return;
         }
-        err(e.span, "C3044", u.f1("'return' with a value in '%s', which returns void", g_body.f.name));
+        err(e.span, "C3044", u.f1("'return' with a value in '%s', which returns void", b.f.name));
         return;
     }
     s.e = assign_convert(e, cty.unqual(rt), "return");

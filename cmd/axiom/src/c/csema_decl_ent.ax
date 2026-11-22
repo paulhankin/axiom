@@ -57,12 +57,18 @@ pub fn for_decl(d: *mut cast.Decl) void {
     }
     declaration(d, CTX_FOR);
     // (6.8.5p3: only objects; not a tag, an enumeration constant or a function)
-    for s in d.specs.items.items() {
+    for &s in d.specs.items.items() {
         if (s.kind != cast.SpecKind.TAG) or u.isnil(s.tag.ty) or cty.is_error(s.tag.ty) {
             continue;
         }
         let ts = s.tag;
-        if (ts.name.len > 0) and (lookup_tag_here(ts.name) == ts.ty) {
+        let mut declared_here = false;
+        if ts.name.len > 0 {
+            if let .some(tt) = lookup_tag_here(ts.name) {
+                declared_here = tt == ts.ty;
+            }
+        }
+        if declared_here {
             err(ts.name_span, "C3006", u.f2("a declaration in 'for' declares the tag '%s %s', not only objects",
                                             cast.kw_text(ts.kw), ts.name));
         } else if (ts.kw == ct.K_ENUM) and ts.has_body and (ts.enumerators.len > 0) {
@@ -144,8 +150,7 @@ fn declare_one(sp: *mut Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast
             // (6.7.4p1: function specifiers only in the declaration of a function)
             err(dcl.name_span, "C3006", u.f1("'inline' or '_Noreturn' in the declaration of the typedef '%s'", name));
         }
-        let prior = lookup_here(name);
-        if u.notnil(prior) {
+        if let .some(prior) = lookup_here(name) {
             let same = (prior.kind == cast.SK_TYPEDEF) and cty.compatible(prior.ty, t) and
                        ((t.kind != cty.TK_ARRAY) or (prior.ty.has_len == t.has_len));
             // (C11 6.7p3; the GNU dialects have it before C11 too, as the
@@ -208,11 +213,13 @@ fn mark_decl(d: *mut cast.Decl, dcl: *mut cast.Declarator) void {
 // type made the composite, or a new one, bound in the current scope.
 fn decl_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32) *mut cast.CSym {
     let here = lookup_here(name);
-    let mut prior = here;
-    if u.isnil(prior) and (lk != cast.LK_NONE) {
-        prior = linked(name);
+    let mut oprior = here;
+    if let .some(h) = here {
+        _ = h;
+    } else if lk != cast.LK_NONE {
+        oprior = linked(name);
     }
-    if u.notnil(prior) {
+    if let .some(prior) = oprior {
         if prior.kind != kind {
             err_note(sp, "C3003", u.f1("'%s' is redeclared as a different kind of identifier", name), prior.span,
                      "declared before here");
@@ -234,7 +241,9 @@ fn decl_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32) *m
         } else {
             prior.ty = cty.composite(prior.ty, t);
         }
-        if u.isnil(here) {
+        if let .some(h) = here {
+            _ = h;
+        } else {
             declare(name, prior);
         }
         return prior;
@@ -254,7 +263,7 @@ fn new_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32, lin
 
 // Does declarator dcl derive a function type (a pointer to a function ...)?
 fn has_function_deriv(dcl: *cast.Declarator) bool {
-    for dv in dcl.derivs.items() {
+    for &dv in dcl.derivs.items() {
         if dv.kind == cast.DerivKind.FUNCTION {
             return true;
         }
@@ -283,16 +292,17 @@ fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32,
         }
     } else if (sc == cast.SC_AUTO) and opts().gnu {
         // (a GNU dialect: the declaration of a nested function defined later in the block)
-        let prior = lookup_here(dcl.name);
-        if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and u.notnil(prior.nest_parent) {
-            dcl.sym = prior;
-            return;
+        if let .some(prior) = lookup_here(dcl.name) {
+            if (prior.kind == cast.SK_FUNC) and u.notnil(prior.nest_parent) {
+                dcl.sym = prior;
+                return;
+            }
         }
         let s = new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
         s.linkage = cast.LK_NONE;
-        s.nest_parent = cur_fn();
-        if u.notnil(s.nest_parent) {
-            s.nest_parent.has_nested = true;
+        if let .some(pn) = cur_fn() {
+            s.nest_parent = pn;
+            pn.has_nested = true;
         }
         declare(dcl.name, s);
         dcl.sym = s;
@@ -384,12 +394,11 @@ fn object_decl(sp: *mut Specs, dcl: *mut cast.Declarator, t0: *mut cty.CType, ct
         }
         return;
     }
-    let prior = lookup_here(name);
-    if u.notnil(prior) {
+    if let .some(prior) = lookup_here(name) {
         err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
     }
     let s = new_sym(cast.SK_OBJECT, name, dcl.name_span, t);
-    s.owner = cur_fn();  // (a nested function may use it: csema_nest.ax)
+    s.owner = cur_fn() ?? u.nil.[cast.CSym]();  // (a nested function may use it: csema_nest.ax)
     if (sc == cast.SC_STATIC) or sp.thread {
         s.duration = cast.SD_STATIC;
     }
@@ -468,7 +477,7 @@ fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
 // auto; its body is analyzed in the scope of its block, so that it sees
 // the enclosing function's objects.
 fn nested_def(d: *mut cast.Decl) void {
-    let parent = cur_fn();
+    let oparent = cur_fn();
     let sp = specifiers(d.specs, CTX_BLOCK, false);
     let dcl = d.decls.get(0);
     g_params = u.List.[*mut cast.CSym].empty();
@@ -477,30 +486,34 @@ fn nested_def(d: *mut cast.Decl) void {
     let mut t = derive(sp.ty, dcl, CTX_BLOCK);
     g_defining = false;
     let params = g_params;
-    if cty.is_error(t) or not cty.is_func(t) or u.isnil(parent) {
+    if cty.is_error(t) or not cty.is_func(t) {
         return;
     }
+    let parent = oparent ?? return;
     if g_kr_ids {
         t = kr_params(t, d, &params);
     }
     if (sp.sc != 0) and (sp.sc != cast.SC_AUTO) {
         err(dcl.name_span, "C3006", u.f1("the nested function '%s' can only be declared auto", dcl.name));
     }
-    let prior = lookup_here(dcl.name);
     let mut s = u.nil.[cast.CSym]();
-    if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and (prior.nest_parent == parent) and not prior.defined {
-        // (declared auto before in the block: compatible types)
-        if not cty.compatible(prior.ty, t) {
-            err_note(dcl.name_span, "C3003", u.f1("conflicting types for '%s'", dcl.name), prior.span,
-                     "declared before here");
-        }
-        s = prior;
-        s.ty = t;
-    } else {
-        if u.notnil(prior) {
+    let mut reused = false;
+    if let .some(prior) = lookup_here(dcl.name) {
+        if (prior.kind == cast.SK_FUNC) and (prior.nest_parent == parent) and not prior.defined {
+            // (declared auto before in the block: compatible types)
+            if not cty.compatible(prior.ty, t) {
+                err_note(dcl.name_span, "C3003", u.f1("conflicting types for '%s'", dcl.name), prior.span,
+                         "declared before here");
+            }
+            s = prior;
+            s.ty = t;
+            reused = true;
+        } else {
             err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), prior.span,
                      "declared before here");
         }
+    }
+    if not reused {
         s = new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
         s.linkage = cast.LK_NONE;
         s.nest_parent = parent;
@@ -619,9 +632,10 @@ fn function_def(d: *mut cast.Decl) void {
 // promoted types, 6.7.6.3p15).
 fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CSym]) *mut cty.CType {
     let ps = params.items();
-    let mut given = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    let mut given = u.SymMap.[?*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[?*mut cast.CSym](), cap: 0,
+                                                 len: 0 };
     for p in ps {
-        given.put(p.name, p);
+        given.put(p.name, .some(p));
     }
     let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     // (each parameter is in scope after its declarator, for the sizes of
@@ -636,31 +650,33 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
             err(kd.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
         }
         for x in kd.decls.items() {
-            let p = given.get(x.name);
-            if u.isnil(p) {
+            if let .some(p) = given.get(x.name) {
+                if seen.get(x.name) != 0 {
+                    err(x.name_span, "C3002", u.f1("the parameter '%s' is declared twice", x.name));
+                }
+                seen.put(x.name, 1);
+                if u.notnil(x.init) {
+                    err(x.init.span, "C3033", u.f1("the parameter '%s' has an initializer", x.name));
+                }
+                let pt = derive(sp.ty, x, CTX_PARAM);
+                x.ty = pt;
+                x.sym = p;
+                if sp.sc == cast.SC_REGISTER {
+                    set_register(p);
+                }
+                p.ty = adjust_param(pt, x);
+                p.span = x.name_span;
+                declare(x.name, p);
+            } else {
                 err(x.name_span, "C3010", u.f1("'%s' is declared, but is not a parameter", x.name));
-                continue;
             }
-            if seen.get(x.name) != 0 {
-                err(x.name_span, "C3002", u.f1("the parameter '%s' is declared twice", x.name));
-            }
-            seen.put(x.name, 1);
-            if u.notnil(x.init) {
-                err(x.init.span, "C3033", u.f1("the parameter '%s' has an initializer", x.name));
-            }
-            let pt = derive(sp.ty, x, CTX_PARAM);
-            x.ty = pt;
-            x.sym = p;
-            if sp.sc == cast.SC_REGISTER {
-                set_register(p);
-            }
-            p.ty = adjust_param(pt, x);
-            p.span = x.name_span;
-            declare(x.name, p);
         }
     }
     pop_scope();
-    let types = u.newn.[*mut cty.CType](ps.len + 1);
+    let mut types: []mut *mut cty.CType = [];
+    if ps.len > 0 {
+        types = u.newn.[*mut cty.CType](ps.len);
+    }
     for i in 0..ps.len {
         let p = ps[i];
         if (seen.get(p.name) == 0) and (std() >= co.C99) {
@@ -670,7 +686,7 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
     }
     // (callers pass each argument promoted: IR generation receives the
     // parameters in their promoted types and converts them)
-    let f = cty.function(t.ret, types[0..ps.len], false, false);
+    let f = cty.function(t.ret, types, false, false);
     f.kr = true;
     return f;
 }

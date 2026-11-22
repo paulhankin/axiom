@@ -142,7 +142,7 @@ pub fn vla_init(s: *mut cast.CSym, it: *mut cast.Init) void {
 
 // The scope of one declaration of an identifier with a variably modified type.
 struct VNode {
-    parent: *mut VNode,
+    parent: ?*mut VNode,
     name: []u8,
     span: u.Span,
     depth: i32,     // the automatic variable length arrays in this scope and those around it (and cleanups)
@@ -154,18 +154,18 @@ pub fn has_cleanup(s: *cast.CSym) bool {
     if u.isnil(s) or (s.kind != cast.SK_OBJECT) {
         return false;
     }
-    let n = note_of(s);
-    return u.notnil(n) and u.notnil(n.cleanup_call);
+    let n = gnu_note_if(@int_from_ptr(s)) ?? return false;
+    return u.notnil(n.cleanup_call);
 }
 
 struct Goto {
     s: *mut cast.Stmt,
-    at: *mut VNode,
+    at: ?*mut VNode,
 }
 
-struct Scopes {
-    cur: *mut VNode,
-    labels: u.SymMap.[*mut VNode],  // a vla_label's scope, by its CSym's address (labels defined so far)
+nocopy struct Scopes {
+    cur: ?*mut VNode,
+    labels: u.SymMap.[?*mut VNode],  // a vla_label's scope, by its CSym's address (labels defined so far)
     gotos: u.List.[Goto],
 }
 
@@ -174,37 +174,40 @@ fn vla_key(l: *cast.CSym) []u8 {
     return u.addr_key(@int_from_ptr(l));
 }
 
+fn vla_cur() *mut Scopes {
+    return g_vla_scopes ?? u.new.[Scopes]();
+}
+
 /// Starts a function body.
 /// The state of the body being analyzed (a nested function's body is
 /// analyzed inside another's: vla_save and vla_restore keep the outer one's).
-pub fn vla_save() *mut void {
-    return @ptr_cast(*mut void, g_vla_scopes);
+pub fn vla_save() ?*mut Scopes {
+    return g_vla_scopes;
 }
 
-pub fn vla_restore(x: *mut void) void {
-    g_vla_scopes = @ptr_cast(*mut Scopes, x);
+pub fn vla_restore(x: ?*mut Scopes) void {
+    g_vla_scopes = x;
 }
 
 pub fn vla_begin_body() void {
-    g_vla_scopes = u.new.[Scopes]();
-    g_vla_scopes.labels = u.SymMap.[*mut VNode].{ keys: u.nil.[usize](), vals: u.nil.[*mut VNode](), cap: 0, len: 0 };
+    let sc = u.new.[Scopes]();
+    sc.labels = u.SymMap.[?*mut VNode].{ keys: u.nil.[usize](), vals: u.nil.[?*mut VNode](), cap: 0, len: 0 };
+    g_vla_scopes = .some(sc);
 }
 
 /// The current scope (for vla_leave).
-pub fn vla_mark() *mut void {
-    return @ptr_cast(*mut void, g_vla_scopes.cur);
+pub fn vla_mark() ?*mut VNode {
+    return vla_cur().cur;
 }
 
 /// Leaves the scopes opened since vla_mark m was taken (a block's end).
-pub fn vla_leave(m: *mut void) void {
-    g_vla_scopes.cur = @ptr_cast(*mut VNode, m);
+pub fn vla_leave(m: ?*mut VNode) void {
+    vla_cur().cur = m;
 }
 
 fn cur_depth() i32 {
-    if u.isnil(g_vla_scopes.cur) {
-        return 0;
-    }
-    return g_vla_scopes.cur.depth;
+    let cur = vla_cur().cur ?? return 0;
+    return cur.depth;
 }
 
 /// A declaration in a block (or a for statement), analyzed: each declarator
@@ -215,10 +218,11 @@ pub fn vla_declared(d: *cast.Decl) void {
     if d.kind != cast.DeclKind.DECL {
         return;
     }
+    let sc = vla_cur();
     for x in d.decls.items() {
         if has_cleanup(x.sym) {
             let n = u.new.[VNode]();
-            n.parent = g_vla_scopes.cur;
+            n.parent = sc.cur;
             n.name = x.name;
             n.span = x.name_span;
             n.depth = cur_depth() + 1;
@@ -226,21 +230,21 @@ pub fn vla_declared(d: *cast.Decl) void {
                 n.depth += 1;  // (a variable length vla_array with a cleanup: both)
             }
             n.cleanup = true;
-            g_vla_scopes.cur = n;
+            sc.cur = .some(n);
             continue;
         }
         if u.isnil(x.ty) or not cty.is_vm(x.ty) {
             continue;
         }
         let n = u.new.[VNode]();
-        n.parent = g_vla_scopes.cur;
+        n.parent = sc.cur;
         n.name = x.name;
         n.span = x.name_span;
         n.depth = cur_depth();
         if vla_allocates(x.sym) {
             n.depth += 1;
         }
-        g_vla_scopes.cur = n;
+        sc.cur = .some(n);
     }
 }
 
@@ -253,13 +257,15 @@ pub fn vla_allocates(s: *cast.CSym) bool {
 
 /// Label l is defined here.
 pub fn vla_label(l: *mut cast.CSym) void {
-    g_vla_scopes.labels.put(vla_key(l), g_vla_scopes.cur);
+    let sc = vla_cur();
+    sc.labels.put(vla_key(l), sc.cur);
     g_vla_depths.put(vla_key(l), cur_depth());
 }
 
 /// A goto statement is here (checked at the end of the body).
 pub fn vla_goto(s: *mut cast.Stmt) void {
-    g_vla_scopes.gotos.push(Goto.{ s: s, at: g_vla_scopes.cur });
+    let sc = vla_cur();
+    sc.gotos.push(Goto.{ s: s, at: sc.cur });
 }
 
 /// The automatic variable length arrays around vla_label l (IR generation).
@@ -267,16 +273,46 @@ pub fn vla_depth(l: *cast.CSym) i32 {
     return g_vla_depths.get(vla_key(l));
 }
 
+fn opt_vnode_eq(a: ?*mut VNode, b: ?*mut VNode) bool {
+    if let .some(pa) = a {
+        if let .some(pb) = b {
+            return pa == pb;
+        }
+        return false;
+    }
+    if let .some(pb) = b {
+        _ = pb;
+        return false;
+    }
+    return true;
+}
+
+fn vnode_reaches(from: ?*mut VNode, target: ?*mut VNode) bool {
+    let mut cur = from;
+    loop {
+        if opt_vnode_eq(cur, target) {
+            return true;
+        }
+        if let .some(n) = cur {
+            cur = n.parent;
+        } else {
+            return false;
+        }
+    }
+}
+
 /// A case or default vla_label s of a switch statement whose body starts in
 /// scope `at` (a vla_mark).
-pub fn vla_case_label(s: *cast.Stmt, at: *mut void) void {
-    let sw = @ptr_cast(*mut VNode, at);
-    if g_vla_scopes.cur == sw {
+pub fn vla_case_label(s: *cast.Stmt, at: ?*mut VNode) void {
+    let mut n = vla_cur().cur ?? return;
+    if opt_vnode_eq(.some(n), at) {
         return;
     }
-    let mut n = g_vla_scopes.cur;
-    while u.notnil(n.parent) and (n.parent != sw) {
-        n = n.parent;
+    loop {
+        if opt_vnode_eq(n.parent, at) {
+            break;
+        }
+        n = n.parent ?? break;
     }
     let what = u.pick(s.kind == cast.StmtKind.CASE, "case", "default");
     err_note(s.span, "C3084", u.f3("a '%s' vla_label in the scope of '%s', which has %s: the switch jumps past it",
@@ -286,35 +322,28 @@ pub fn vla_case_label(s: *cast.Stmt, at: *mut void) void {
 
 /// The end of the body: the gotos jump to labels in their scope.
 pub fn vla_end_body() void {
-    for g in g_vla_scopes.gotos.items() {
+    let sc = vla_cur();
+    for &mut g in sc.gotos.items_mut() {
         let l = g.s.sym;
         if u.isnil(l) or not l.defined {
             continue;
         }
-        let to = g_vla_scopes.labels.get(vla_key(l));
+        let to = sc.labels.get(vla_key(l));
         // the vla_label's scope encloses the goto's (or is it)
-        let mut n = g.at;
-        while u.notnil(n) and (n != to) {
-            n = n.parent;
-        }
-        if n == to {
+        if vnode_reaches(g.at, to) {
             continue;
         }
         // the outermost scope the vla_label is in and the goto is not
-        let mut x = to;
+        let mut x = to ?? continue;
         loop {
-            let mut y = g.at;
-            while u.notnil(y) and (y != x.parent) {
-                y = y.parent;
-            }
-            if y == x.parent {
+            if vnode_reaches(g.at, x.parent) {
                 break;
             }
-            x = x.parent;
+            x = x.parent ?? break;
         }
         err_note(g.s.span, "C3083", u.f3("'goto %s' jumps into the scope of '%s', which has %s", l.name, x.name,
                                          u.pick(x.cleanup, "a cleanup", "a variably modified type")), x.span,
                  "vla_declared here");
     }
-    g_vla_scopes = u.nil.[Scopes]();
+    g_vla_scopes = .none;
 }

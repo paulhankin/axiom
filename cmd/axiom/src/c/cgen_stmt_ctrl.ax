@@ -65,7 +65,7 @@ fn while_stmt(s: *mut cast.Stmt) void {
     at_end(head);
     branch_full(s.e, body, done);
     at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: head, brk_depth: vla_depth(), cont_depth: vla_depth() });
+    BD.jumps.push(Jump.{ brk: done, cont: .some(head), brk_depth: vla_depth(), cont_depth: vla_depth() });
     stmt(s.body);
     _ = BD.jumps.pop();
     br(head);
@@ -80,7 +80,7 @@ fn do_stmt(s: *mut cast.Stmt) void {
     let done = new_block("enddo");
     br(body);
     at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: cond, brk_depth: vla_depth(), cont_depth: vla_depth() });
+    BD.jumps.push(Jump.{ brk: done, cont: .some(cond), brk_depth: vla_depth(), cont_depth: vla_depth() });
     stmt(s.body);
     _ = BD.jumps.pop();
     br(cond);
@@ -95,7 +95,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
     let sc = cdbg.open_for(s.decl);
     let mut rs = ir.rtag;
     if u.notnil(s.decl) {
-        rs = restrict_block(s.items.items(), s);  // (restrict: cgen_restrict.ax)
+        rs = restrict_block(s.items.items(), .some(s));  // (restrict: cgen_restrict.ax)
         decl(s.decl);
     } else if u.notnil(s.first) {
         continue_after();
@@ -121,7 +121,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
         ir.br(B, body);
     }
     at_end(body);
-    BD.jumps.push(Jump.{ brk: done, cont: step, brk_depth: d0, cont_depth: d1 });
+    BD.jumps.push(Jump.{ brk: done, cont: .some(step), brk_depth: d0, cont_depth: d1 });
     stmt(s.body);
     _ = BD.jumps.pop();
     br(step);
@@ -154,7 +154,7 @@ fn switch_stmt(s: *mut cast.Stmt) void {
         let c = s.cases.get(i);
         let b = new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
         blocks[i] = b;
-        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), .some(b));
         if c.kind == cast.StmtKind.DEFAULT {
             dflt = b;
         }
@@ -185,7 +185,7 @@ fn switch_stmt(s: *mut cast.Stmt) void {
     }
     switch_to(v, s.e.ty.is_signed, vs.items(), bs.items(), dflt);
     at_end(new_block("switchbody"));
-    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: vla_depth(), cont_depth: vla_depth() });
+    BD.jumps.push(Jump.{ brk: done, cont: .none, brk_depth: vla_depth(), cont_depth: vla_depth() });
     stmt(s.body);
     _ = BD.jumps.pop();
     br(done);
@@ -208,7 +208,7 @@ fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
         let c = s.cases.get(i);
         let b = new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
         blocks[i] = b;
-        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), .some(b));
         if c.kind == cast.StmtKind.DEFAULT {
             dflt = b;
         } else {
@@ -266,7 +266,7 @@ fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
     }
     br(dflt);
     at_end(new_block("switchbody"));
-    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: vla_depth(), cont_depth: vla_depth() });
+    BD.jumps.push(Jump.{ brk: done, cont: .none, brk_depth: vla_depth(), cont_depth: vla_depth() });
     stmt(s.body);
     _ = BD.jumps.pop();
     br(done);
@@ -285,13 +285,12 @@ fn same_upper(a: []u64, b: []u64, n: usize) bool {
 
 fn return_stmt(s: *mut cast.Stmt) void {
     continue_after();
-    let inl = INL;
-    if u.notnil(inl) {
+    if let .some(inl) = INL {
         // (in an inlined call: the result stored, then its end)
         if u.notnil(s.e) {
             let v = lv_full(s.e);
-            if u.notnil(inl.res) {
-                stmt_put(inl.ret, v, inl.res);
+            if let .some(res) = inl.res {
+                stmt_put(inl.ret, v, res);
             }
         }
         br(inl.exit);
@@ -322,7 +321,7 @@ fn return_stmt(s: *mut cast.Stmt) void {
         v = tmp;
     }
     cleanups();
-    ret_value(F.sig.plan, F.sret, v);
+    ret_value(F.sig.plan, F.sret, .some(v));
 }
 
 // -----------------------------------------------------------------------------
@@ -365,11 +364,15 @@ fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*m
         }
     }
     let mut o = INL;
-    while u.notnil(o) {
-        if o.callee == s {
-            return ir.vnil();
+    while true {
+        if let .some(cur) = o {
+            if cur.callee == s {
+                return ir.vnil();
+            }
+            o = cur.outer;
+        } else {
+            break;
         }
-        o = o.outer;
     }
     done.* = true;
     let vs = u.newn.[*mut ir.Value](n + 1);
@@ -414,11 +417,12 @@ fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*m
         inl.pack.push(x);
     }
     inl.ret = cty.unqual(s.ty.ret);
+    inl.res = .none;
     if not cty.is_void(inl.ret) {
-        inl.res = alloca(inl.ret, "inl.ret");
+        inl.res = .some(alloca(inl.ret, "inl.ret"));
     }
     inl.exit = new_block("inl.end");
-    INL = inl;
+    INL = .some(inl);
     let fp = fp_state;
     stmt(d.body);
     fp_state = fp;
@@ -431,13 +435,13 @@ fn inline_call(e: *mut cast.Expr, s: *mut cast.CSym, d: *mut cast.Decl, ps: []*m
     for j in 0..locals.len {
         locals.get(j).ir = saved[ps.len + j];
     }
-    if u.isnil(inl.res) {
-        return ir.vnil();
+    if let .some(res) = inl.res {
+        if cty.is_record(inl.ret) {
+            return res;
+        }
+        return load(inl.ret, res);
     }
-    if cty.is_record(inl.ret) {
-        return inl.res;
-    }
-    return load(inl.ret, inl.res);
+    return ir.vnil();
 }
 
 // Is a value of type t one inline_call keeps in an object of its own: a
@@ -525,7 +529,7 @@ fn inlinable_decl(d: *mut cast.Decl, locals: *mut u.List.[*mut cast.CSym]) bool 
             if s.init.pre.len > 0 {
                 return false;
             }
-            for it in s.init.items.items() {
+            for &it in s.init.items.items() {
                 if not inlinable_expr(it.e) {
                     return false;
                 }
@@ -536,7 +540,7 @@ fn inlinable_decl(d: *mut cast.Decl, locals: *mut u.List.[*mut cast.CSym]) bool 
     return true;
 }
 
-fn inlinable_expr(e: *mut cast.Expr) bool {
+fn inlinable_expr(e: *cast.Expr) bool {
     if u.isnil(e) {
         return true;
     }
@@ -595,22 +599,26 @@ fn stmt_trampolines(s: *mut cast.CSym) void {
         define_get(g);
         let p = pool_of(g);
         for i in 0..p.thunks.len {
-            forwarder(p.thunks[i], g, p.chains, i);
+            forwarder(p.thunks[i], g, .some(p.chains), i);
         }
     }
     if u.notnil(s.nest_parent) and s.ty.variadic {
-        forwarder(entry_of(s), s, ir.vnil(), 0);
+        forwarder(entry_of(s), s, .none, 0);
     }
     F = saved;
 }
 
 // Defines f, which calls nested function g with its arguments as they
 // arrive (cgen_va.ax: the C ABI's both ways) and the chain in slot i of the
-// table `chains`; or (chains nil: g's variadic entry) the chain its last
+// table `chains`; or (chains .none: g's variadic entry) the chain its last
 // named argument is.
-fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize) void {
+fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: ?*mut ir.Value, i: usize) void {
     let pts0 = param_types(g);
-    let entry = u.isnil(chains);
+    let mut entry = true;
+    if let .some(ch) = chains {
+        _ = ch;
+        entry = false;
+    }
     let mut pts = pts0;
     if entry {
         pts = entry_params(g);
@@ -644,12 +652,12 @@ fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize
         }
     }
     let mut chain = ir.vnil();
-    if entry {
-        chain = load(pts[n], @ptr_cast(*mut ir.Value, fakes[n].ir));
-    } else {
-        let ch = ir.ptradd(B, chains, usz(@as(u64, i) * cty.ptr_bytes));
+    if let .some(ch_tab) = chains {
+        let ch = ir.ptradd(B, ch_tab, usz(@as(u64, i) * cty.ptr_bytes));
         chain = ir.load(B, T_ptr, ch);
         chain.flags = chain.flags | ir.F_VOLATILE;
+    } else {
+        chain = load(pts[n], @ptr_cast(*mut ir.Value, fakes[n].ir));
     }
     let mut nv = n;
     if g.ty.variadic {
@@ -659,13 +667,13 @@ fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize
         vs[n] = ap;
         nv = n + 1;
     }
-    let gs = func_sig(g);
+    let gs = func_sig(g) ?? st.sig;
     next_chain = chain;
-    let r = emit_call(gs.plan, gs.ty, func_of(g, gs).val, vs[0..nv]);
+    let r = emit_call(gs.plan, gs.ty, func_of(g, .some(gs)).val, vs[0..nv]);
     if cty.is_void(g.ty.ret) {
-        ret_value(st.sig.plan, st.sret, ir.vnil());
+        ret_value(st.sig.plan, st.sret, .none);
     } else {
-        ret_value(st.sig.plan, st.sret, r);
+        ret_value(st.sig.plan, st.sret, .some(r));
     }
     at_end(st.entry);
     ir.br(B, start);

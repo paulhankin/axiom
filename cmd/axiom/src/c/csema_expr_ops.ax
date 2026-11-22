@@ -195,81 +195,86 @@ pub fn expr_check(e: *mut cast.Expr) *mut cast.Expr {
 }
 
 fn ident(e: *mut cast.Expr) *mut cast.Expr {
-    let s = lookup(e.name);
-    if u.isnil(s) {
-        let gnu = opts().gnu;
-        if u.str_eq(e.name, "__func__") and u.notnil(cur_fn()) and ((std() >= co.C99) or gnu) {
-            return func_name(e);
-        }
-        if u.str_eq(e.name, "__builtin_axiom_imaginary_i") {
-            // (<complex.h>'s _Imaginary_I: the imaginary unit, of type const float _Imaginary)
-            e.ty = cty.imaginary_of(cty.t_float);
+    if let .some(s) = lookup(e.name) {
+        e.sym = s;
+        s.used = true;
+        used_at(s, e.span);
+        referred(s, e.span);
+        use_sym(s, e.span);
+        if s.kind == cast.SK_ENUMCONST {
+            e.ty = s.ty;
             e.is_const = true;
-            e.fcval = 1.0;
+            e.cval = s.value;
+            if cty.is_wint(s.ty) {
+                cw.set(e, cw.exact(s.wide, cty.limbs(s.ty)));
+            }
             return e;
         }
-        if gnu and (u.str_eq(e.name, "__FUNCTION__") or u.str_eq(e.name, "__PRETTY_FUNCTION__")) {
-            // (the GNU dialects' other names of __func__; outside a function, "")
-            return func_name(e);
+        if s.kind == cast.SK_TYPEDEF {
+            err(e.span, "C3020", u.f1("'%s' is a type name, not a value", e.name));
+            return bad_expr(e);
         }
-        let mut why: []u8 = "";
-        if u.str_eq(e.name, "true") or u.str_eq(e.name, "false") {
-            why = u.pick(std() >= co.C99, " (a keyword from C23; before, <stdbool.h> defines it)",
-                         " (a keyword from C23)");
-        } else if u.str_eq(e.name, "nullptr") {
-            why = " (a keyword from C23)";
-        } else if u.str_eq(e.name, "__func__") {
-            why = " (a predefined identifier from C99)";
+        if s.kind == cast.SK_OBJECT {
+            use_object(s, e.span);  // (another function's: a nested function's use)
         }
-        err(e.span, "C3001", u.f2("'%s' is not declared%s", e.name, why));
-        return bad_expr(e);
-    }
-    e.sym = s;
-    s.used = true;
-    used_at(s, e.span);
-    referred(s, e.span);
-    use_sym(s, e.span);
-    if s.kind == cast.SK_ENUMCONST {
         e.ty = s.ty;
-        e.is_const = true;
-        e.cval = s.value;
-        if cty.is_wint(s.ty) {
-            cw.set(e, cw.exact(s.wide, cty.limbs(s.ty)));
-        }
+        e.lvalue = true;
         return e;
     }
-    if s.kind == cast.SK_TYPEDEF {
-        err(e.span, "C3020", u.f1("'%s' is a type name, not a value", e.name));
-        return bad_expr(e);
+    let gnu = opts().gnu;
+    if u.str_eq(e.name, "__func__") and ((std() >= co.C99) or gnu) {
+        if let .some(cfn) = cur_fn() {
+            _ = cfn;
+            return func_name(e);
+        }
     }
-    if s.kind == cast.SK_OBJECT {
-        use_object(s, e.span);  // (another function's: a nested function's use)
+    if u.str_eq(e.name, "__builtin_axiom_imaginary_i") {
+        // (<complex.h>'s _Imaginary_I: the imaginary unit, of type const float _Imaginary)
+        e.ty = cty.imaginary_of(cty.t_float);
+        e.is_const = true;
+        e.fcval = 1.0;
+        return e;
     }
-    e.ty = s.ty;
-    e.lvalue = true;
-    return e;
+    if gnu and (u.str_eq(e.name, "__FUNCTION__") or u.str_eq(e.name, "__PRETTY_FUNCTION__")) {
+        // (the GNU dialects' other names of __func__; outside a function, "")
+        return func_name(e);
+    }
+    let mut why: []u8 = "";
+    if u.str_eq(e.name, "true") or u.str_eq(e.name, "false") {
+        why = u.pick(std() >= co.C99, " (a keyword from C23; before, <stdbool.h> defines it)", " (a keyword from C23)");
+    } else if u.str_eq(e.name, "nullptr") {
+        why = " (a keyword from C23)";
+    } else if u.str_eq(e.name, "__func__") {
+        why = " (a predefined identifier from C99)";
+    }
+    err(e.span, "C3001", u.f2("'%s' is not declared%s", e.name, why));
+    return bad_expr(e);
 }
 
 // __func__ (6.4.2.2): as if `static const char __func__[] = "name";` began
 // the function's body.
 fn func_name(e: *mut cast.Expr) *mut cast.Expr {
-    let f = cur_fn();
     let mut key = "0";
     let mut n: []u8 = "";
-    if u.notnil(f) {
+    if let .some(f) = cur_fn() {
         key = u.intern(u.idec(f.uid));
         n = f.name;
     }
-    let mut s = g_func_names.get(key);
-    if u.isnil(s) {
+    let mut s = u.nil.[cast.CSym]();
+    if let .some(existing) = g_func_names.get(key) {
+        s = existing;
+    } else {
         let tok = u.new.[ct.Token]();
         tok.kind = ct.T_STRING;
         tok.text = n;
-        let us = u.newn.[u32](n.len + 1);
-        for i in 0..n.len {
-            us[i] = @as(u32, n[i]);
+        let mut us: []mut u32 = [];
+        if n.len > 0 {
+            us = u.newn.[u32](n.len);
+            for i in 0..n.len {
+                us[i] = @as(u32, n[i]);
+            }
         }
-        tok.units = us[0..n.len];
+        tok.units = us;
         let str = cast.new_expr(cast.ExprKind.STRING, e.span);
         str.tok = tok;
         let t = cty.array_of(cty.qualify(cty.t_char, cty.Q_CONST), @as(u64, n.len) + 1, true);
@@ -281,7 +286,7 @@ fn func_name(e: *mut cast.Expr) *mut cast.Expr {
         s.init = u.new.[cast.InitList]();
         s.init.items.push(cast.InitItem.{ off: 0, ty: t, e: str, bits: u.nil.[cty.Member]() });
         add_object(s);
-        g_func_names.put(key, s);
+        g_func_names.put(key, .some(s));
     }
     e.sym = s;
     s.used = true;
@@ -379,8 +384,7 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
             err(e.span, "C3070", u.f1("the address of the bit-field '%s' is taken", a.mem.name));
             return bad_expr(e);
         }
-        let reg = register_object(a);
-        if u.notnil(reg) {
+        if let .some(reg) = register_object(a) {
             err(a.span, "C3222", u.f1("the address of %s, declared register, is taken", reg_name(reg)));
             return bad_expr(e);
         }

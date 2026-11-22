@@ -43,11 +43,11 @@ pub struct Note {
     pub ctor_prio: i32,  // 65535 without a priority (after those with one)
     pub dtor: bool,
     pub dtor_prio: i32,
-    cleanup: *mut cast.CSym,  // an automatic object's cleanup function
-    pub nonnull: u64,         // bit k: parameter k + 1 must not be a null pointer
-    pub nonnull_all: bool,    // nonnull without indexes: every pointer parameter
-    error_msg: []u8,          // error("m"): a call is an error
-    warning_msg: []u8,        // warning("m"): a call is warned about
+    cleanup: ?*mut cast.CSym,  // an automatic object's cleanup function
+    pub nonnull: u64,          // bit k: parameter k + 1 must not be a null pointer
+    pub nonnull_all: bool,     // nonnull without indexes: every pointer parameter
+    error_msg: []u8,           // error("m"): a call is an error
+    warning_msg: []u8,         // warning("m"): a call is warned about
     pub packed: bool,
     pub aligned: u64,
     pub layout: i32,                   // a structure's or union's ms_struct or gcc_struct (cty.LAYOUT_)
@@ -59,44 +59,48 @@ pub struct Note {
     pub cleanup_call: *mut cast.Expr,  // the call `cleanup(&object)`, typed
 }
 
-fn gnu_note_at(p: usize, make: bool) *mut Note {
+fn gnu_note_at(p: usize) ?*mut Note {
+    return g_gnu_notes.get(u.addr_key(p));
+}
+
+fn ensure_gnu_note(p: usize) *mut Note {
     let k = u.addr_key(p);
-    let mut n = g_gnu_notes.get(k);
-    if u.isnil(n) and make {
-        n = u.new.[Note]();
-        n.ctor_prio = 65535;
-        n.dtor_prio = 65535;
-        n.opt_level = -1;
-        g_gnu_notes.put(k, n);
+    if let .some(n) = g_gnu_notes.get(k) {
+        return n;
     }
+    let n = u.new.[Note]();
+    n.ctor_prio = 65535;
+    n.dtor_prio = 65535;
+    n.opt_level = -1;
+    g_gnu_notes.put(k, .some(n));
     return n;
 }
 
-fn gnu_note_if(p: usize) *mut Note {
+fn gnu_note_if(p: usize) ?*mut Note {
     if g_gnu_notes.len == 0 {
-        return u.nil.[Note]();
+        return .none;
     }
-    return gnu_note_at(p, false);
+    return gnu_note_at(p);
 }
 
 /// What GNU attributes said of symbol s, or nil.
 pub fn note_of(s: *cast.CSym) *mut Note {
-    return gnu_note_if(@int_from_ptr(s));
+    return gnu_note_if(@int_from_ptr(s)) ?? u.nil.[Note]();
 }
 
 /// Has function s the attribute cold?
 pub fn is_cold(s: *cast.CSym) bool {
-    let n = note_of(s);
-    return u.notnil(n) and n.cold;
+    let n = gnu_note_if(@int_from_ptr(s)) ?? return false;
+    return n.cold;
 }
 
-/// What GNU attributes said of a structure, union or enumeration, or nil.
-pub fn note_of_tag(ti: *cty.TagInfo) *mut Note {
+/// What GNU attributes said of a structure, union or enumeration, or .none.
+pub fn note_of_tag(ti: *cty.TagInfo) ?*mut Note {
     return gnu_note_if(@int_from_ptr(ti));
 }
 
-/// What GNU attributes said of a member, or nil.
-pub fn note_of_member(m: *cty.Member) *mut Note {
+/// What GNU attributes said of a member, or .none.
+pub fn note_of_member(m: *cty.Member) ?*mut Note {
     return gnu_note_if(@int_from_ptr(m));
 }
 
@@ -118,29 +122,29 @@ fn bad_args(a: *cast.Attr, want: []u8) void {
     err(a.span, "C3077", u.f2("the attribute '%s' takes %s", a.name, want));
 }
 
-// The string literal that is the attribute's one argument, or nil.
-fn string_arg(a: *cast.Attr) []u8 {
+// The string literal that is the attribute's one argument, or .none.
+fn string_arg(a: *cast.Attr) ?[]u8 {
     if not a.has_args or (a.args.len == 0) {
-        return u.nosym();
+        return .none;
     }
     let mut b = u.Buf.init();
-    for t in a.args {
+    for &t in a.args {
         if (t.kind != ct.T_STRING) or (t.prefix != ct.ENC_NONE) {
-            return u.nosym();
+            return .none;
         }
         for x in t.units {
             b.c(@truncate(u8, x));
         }
     }
-    return b.done();
+    return .some(b.done());
 }
 
-// The identifier that is the attribute's one argument, or nil.
-fn ident_arg(a: *cast.Attr) []u8 {
+// The identifier that is the attribute's one argument, or .none.
+fn ident_arg(a: *cast.Attr) ?[]u8 {
     if not a.has_args or (a.args.len != 1) or (a.args[0].kind != ct.T_IDENT) {
-        return u.nosym();
+        return .none;
     }
-    return a.args[0].text;
+    return .some(a.args[0].text);
 }
 
 // The integer constant expression argument k of an attribute (parsed: exprs);
@@ -166,11 +170,7 @@ fn opt_level_of(a: *cast.Attr) i32 {
         }
         return -2;
     }
-    let s0 = string_arg(a);
-    if u.isnos(s0) {
-        return -2;
-    }
-    let mut s = s0;
+    let mut s = string_arg(a) ?? return -2;
     if (s.len > 0) and (s[0] == '-') {
         s = s[1..];
     }
@@ -261,22 +261,28 @@ pub fn gnu_check(a: *mut cast.Attr, what: i32) void {
 fn check_args(a: *mut cast.Attr, n: []u8) void {
     let strs = ["section", "alias", "ifunc", "visibility", "error", "warning"];
     if cf.in_list(n, strs[..]) {
-        let s = string_arg(a);
-        if u.isnos(s) {
-            bad_args(a, "a string literal");
-        } else if u.str_eq(n, "visibility") {
-            let vs = ["default", "hidden", "protected", "internal"];
-            if not cf.in_list(s, vs[..]) {
-                err(a.span, "C3077", u.f1("the visibility '%s' is none of default, hidden, protected and internal", s));
+        if let .some(s) = string_arg(a) {
+            if u.str_eq(n, "visibility") {
+                let vs = ["default", "hidden", "protected", "internal"];
+                if not cf.in_list(s, vs[..]) {
+                    err(a.span, "C3077", u.f1("the visibility '%s' is none of default, hidden, protected and internal",
+                                              s));
+                }
+            } else if (s.len == 0) and not u.str_eq(n, "error") and not u.str_eq(n, "warning") {
+                err(a.span, "C3077", u.f1("the attribute '%s' takes a name that is not empty", a.name));
             }
-        } else if (s.len == 0) and not u.str_eq(n, "error") and not u.str_eq(n, "warning") {
-            err(a.span, "C3077", u.f1("the attribute '%s' takes a name that is not empty", a.name));
+        } else {
+            bad_args(a, "a string literal");
         }
         return;
     }
     if u.str_eq(n, "deprecated") or u.str_eq(n, "unavailable") {
-        if a.has_args and u.isnos(string_arg(a)) {
-            bad_args(a, "a string literal, or nothing");
+        if a.has_args {
+            if let .some(sa) = string_arg(a) {
+                _ = sa;
+            } else {
+                bad_args(a, "a string literal, or nothing");
+            }
         }
         return;
     }
@@ -316,14 +322,19 @@ fn check_args(a: *mut cast.Attr, n: []u8) void {
         return;
     }
     if u.str_eq(n, "cleanup") {
-        if u.isnos(ident_arg(a)) {
+        if let .some(ia) = ident_arg(a) {
+            _ = ia;
+        } else {
             bad_args(a, "the name of a function");
         }
         return;
     }
     if u.str_eq(n, "mode") {
-        let m = ident_arg(a);
-        if u.isnos(m) or (mode_of(m).kind == MK_NONE) {
+        let mut ok_mode = false;
+        if let .some(m) = ident_arg(a) {
+            ok_mode = mode_of(m).kind != MK_NONE;
+        }
+        if not ok_mode {
             bad_args(a,
                      "a mode: QI, HI, SI, DI, TI, word, pointer, byte, HF, SF, DF, XF, TF, HC, SC, DC, XC, TC, or a vector mode V<n><mode> (or __QI__ ...)");
         }
@@ -355,14 +366,13 @@ fn check_args(a: *mut cast.Attr, n: []u8) void {
         return;
     }
     if u.str_eq(n, "target") {
-        let s = string_arg(a);
-        if u.isnos(s) {
+        if let .some(s) = string_arg(a) {
+            let r = tg.parse_features(s);
+            if not u.isnos(r.bad) {
+                warn(a.span, "C4052", u.f1("the extension '%s' is not one this target has, and is ignored", r.bad));
+            }
+        } else {
             bad_args(a, "a string literal of extensions");
-            return;
-        }
-        let r = tg.parse_features(s);
-        if not u.isnos(r.bad) {
-            warn(a.span, "C4052", u.f1("the extension '%s' is not one this target has, and is ignored", r.bad));
         }
         return;
     }
@@ -422,28 +432,28 @@ fn mode_of(m0: []u8) Mode {
     return Mode.{ kind: MK_INT, bits: b, lanes: 0 };
 }
 
-// The real floating type of format `bits` (mode HF ... TF), or nil if the
+// The real floating type of format `bits` (mode HF ... TF), or .none if the
 // target has none (XF, the x87's, where long double is not that format).
-fn float_of_bits(bits: i32) *mut cty.CType {
+fn float_of_bits(bits: i32) ?*mut cty.CType {
     if bits == 16 {
-        return cty.t_float16;
+        return .some(cty.t_float16);
     }
     if bits == 32 {
-        return cty.t_float;
+        return .some(cty.t_float);
     }
     if bits == 64 {
-        return cty.t_double;
+        return .some(cty.t_double);
     }
     if bits == 80 {
         if cty.ld_bits() == 80 {
-            return cty.t_ldouble;
+            return .some(cty.t_ldouble);
         }
-        return u.nil.[cty.CType]();
+        return .none;
     }
     if cty.ld_bits() == 128 {
-        return cty.t_ldouble;  // (TF: long double where it is binary128, as AArch64's)
+        return .some(cty.t_ldouble);  // (TF: long double where it is binary128, as AArch64's)
     }
-    return cty.t_float128;
+    return .some(cty.t_float128);
 }
 
 // The width in bits of an integer machine mode of mode(m), or 0 if m is none.
@@ -503,7 +513,7 @@ pub fn mode_type(t: *mut cty.CType, l1: *u.List.[*mut cast.Attr], l2: *u.List.[*
             if not u.str_eq(an, "mode") {
                 continue;
             }
-            let md = mode_of(ident_arg(a));
+            let md = mode_of(ident_arg(a) ?? "");
             if md.kind == MK_NONE {
                 continue;
             }
@@ -519,7 +529,7 @@ pub fn mode_type(t: *mut cty.CType, l1: *u.List.[*mut cast.Attr], l2: *u.List.[*
                 continue;
             }
             let sg = t.is_signed;
-            let mut x = u.nil.[cty.CType]();
+            let mut x = t;
             if bits == 8 {
                 x = cty.t_uchar;
                 if sg {
@@ -539,8 +549,9 @@ pub fn mode_type(t: *mut cty.CType, l1: *u.List.[*mut cast.Attr], l2: *u.List.[*
             } else {
                 let cands: [3]*mut cty.CType = [cty.t_int, cty.t_long, cty.t_llong];
                 for c in cands {
-                    if u.isnil(x) and (c.bits == bits) {
+                    if c.bits == bits {
                         x = c;
+                        break;
                     }
                 }
                 if sg {
@@ -563,14 +574,14 @@ fn float_or_vector_mode(t: *mut cty.CType, md: Mode, a: *cast.Attr) *mut cty.CTy
     if cty.is_error(t) {
         return t;
     }
-    let mut el = u.nil.[cty.CType]();
+    let mut oel: ?*mut cty.CType = .none;
     if md.kind == MK_INT {
         if not cty.is_integer(t) or cty.is_bitint(t) or (t.kind == cty.TK_BOOL) {
             err(a.span, "C3077", u.f1("the vector mode of the attribute 'mode' on %s, which is not an integer type",
                                       tq(t)));
             return cty.t_error;
         }
-        el = int_of_bits(md.bits, t.is_signed);
+        oel = int_of_bits(md.bits, t.is_signed);
     } else {
         let want_cx = md.kind == MK_COMPLEX;
         if (want_cx and not cty.is_complex(t)) or (not want_cx and not cty.is_floating(t)) {
@@ -580,17 +591,21 @@ fn float_or_vector_mode(t: *mut cty.CType, md: Mode, a: *cast.Attr) *mut cty.CTy
                     u.pick(want_cx, "complex", "floating")));
             return cty.t_error;
         }
-        el = float_of_bits(md.bits);
-        if u.isnil(el) {
+        oel = float_of_bits(md.bits);
+        if let .some(el0) = oel {
+            cty.note_float_use(el0);
+            if want_cx {
+                return cty.qualify(cty.complex_of(el0), t.quals);
+            }
+        } else {
             err(a.span, "C3077", "mode(XF): the x87's format, which long double does not have on this target");
             return cty.t_error;
         }
-        cty.note_float_use(el);
-        if want_cx {
-            return cty.qualify(cty.complex_of(el), t.quals);
-        }
     }
-    if u.isnil(el) {
+    let mut el = cty.t_error;
+    if let .some(el1) = oel {
+        el = el1;
+    } else {
         err(a.span, "C3077", "the attribute 'mode' names no integer type of this target");
         return cty.t_error;
     }
@@ -600,19 +615,23 @@ fn float_or_vector_mode(t: *mut cty.CType, md: Mode, a: *cast.Attr) *mut cty.CTy
     return vector_type(cty.qualify(el, t.quals), md.lanes * cty.size_of(el), a.span, "the attribute 'mode'");
 }
 
-// The integer type of `bits` bits (8 ... 128) and signedness sg, or nil.
-fn int_of_bits(bits: i32, sg: bool) *mut cty.CType {
+// The integer type of `bits` bits (8 ... 128) and signedness sg, or .none.
+fn int_of_bits(bits: i32, sg: bool) ?*mut cty.CType {
     if bits == 128 {
-        return cty.int128(sg);
+        let t = cty.int128(sg);
+        if u.notnil(t) {
+            return .some(t);
+        }
+        return .none;
     }
     let cands: [5]*mut cty.CType = [cty.t_schar, cty.t_short, cty.t_int, cty.t_long, cty.t_llong];
     for c in cands {
         if c.bits == bits {
             if sg {
-                return c;
+                return .some(c);
             }
-            return cty.to_unsigned(c);
+            return .some(cty.to_unsigned(c));
         }
     }
-    return u.nil.[cty.CType]();
+    return .none;
 }

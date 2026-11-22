@@ -23,14 +23,14 @@ fn gnu_record(p: usize, a: *mut cast.Attr, what: i32) void {
     if (u.str_eq(n, "ms_struct") or u.str_eq(n, "gcc_struct")) and not cf.gnu_attribute(n) {
         return;  // (not x86-64's: ignored, as check says)
     }
-    let x = gnu_note_at(p, true);
+    let x = ensure_gnu_note(p);
     if u.str_eq(n, "section") {
-        x.section = string_arg(a);
+        x.section = string_arg(a) ?? "";
     } else if u.str_eq(n, "alias") {
-        x.alias = u.intern(string_arg(a));
+        x.alias = u.intern(string_arg(a) ?? "");
         x.alias_span = a.span;
     } else if u.str_eq(n, "ifunc") {
-        x.ifunc = u.intern(string_arg(a));
+        x.ifunc = u.intern(string_arg(a) ?? "");
         x.alias_span = a.span;
     } else if u.str_eq(n, "weak") {
         x.weak = true;
@@ -38,7 +38,7 @@ fn gnu_record(p: usize, a: *mut cast.Attr, what: i32) void {
         x.used = true;
     } else if u.str_eq(n, "visibility") {
         let vs = ["default", "hidden", "protected", "internal"];
-        let s = string_arg(a);
+        let s = string_arg(a) ?? "";
         for k in 0..vs.len {
             if u.str_eq(vs[k], s) {
                 x.visibility = @int_cast(i32, k);
@@ -65,9 +65,9 @@ fn gnu_record(p: usize, a: *mut cast.Attr, what: i32) void {
             x.opt_attr = true;
         }
     } else if u.str_eq(n, "target") {
-        if not u.isnos(string_arg(a)) {
-            x.target = string_arg(a);
-            x.target_attr = x.target;
+        if let .some(ts) = string_arg(a) {
+            x.target = ts;
+            x.target_attr = ts;
         }
     } else if u.str_eq(n, "returns_nonnull") {
         x.ret_nonnull = true;
@@ -105,12 +105,17 @@ fn gnu_record(p: usize, a: *mut cast.Attr, what: i32) void {
             x.dtor_prio = prio;
         }
     } else if u.str_eq(n, "cleanup") {
-        let f = lookup(ident_arg(a));
-        if u.isnil(f) or (f.kind != cast.SK_FUNC) {
-            err(a.span, "C3077", u.f1("the cleanup '%s' is not a function", ident_arg(a)));
-        } else {
-            x.cleanup = f;
-            f.used = true;
+        let cname = ident_arg(a) ?? "";
+        let mut ok_fn = false;
+        if let .some(f) = lookup(cname) {
+            if f.kind == cast.SK_FUNC {
+                x.cleanup = .some(f);
+                f.used = true;
+                ok_fn = true;
+            }
+        }
+        if not ok_fn {
+            err(a.span, "C3077", u.f1("the cleanup '%s' is not a function", cname));
         }
     } else if u.str_eq(n, "nonnull") {
         if a.exprs.len == 0 {
@@ -122,9 +127,9 @@ fn gnu_record(p: usize, a: *mut cast.Attr, what: i32) void {
             }
         }
     } else if u.str_eq(n, "error") {
-        x.error_msg = string_arg(a);
+        x.error_msg = string_arg(a) ?? "";
     } else if u.str_eq(n, "warning") {
-        x.warning_msg = string_arg(a);
+        x.warning_msg = string_arg(a) ?? "";
     } else if u.str_eq(n, "packed") {
         x.packed = true;
     } else if u.str_eq(n, "ms_struct") {
@@ -167,7 +172,7 @@ pub fn pragma_visibility(s: *cast.CSym, vis: u64) void {
     if u.isnil(s) or (vis == 0) or (s.linkage != cast.LK_EXTERNAL) {
         return;
     }
-    let x = gnu_note_at(@int_from_ptr(s), true);
+    let x = ensure_gnu_note(@int_from_ptr(s));
     if not x.vis_set {
         x.visibility = @truncate(i32, @bit_cast(i64, vis));
     }
@@ -186,7 +191,7 @@ pub fn pragma_options(s: *cast.CSym, k: u64) void {
     if (lv < 0) and (tgt.len == 0) {
         return;
     }
-    let x = gnu_note_at(@int_from_ptr(s), true);
+    let x = ensure_gnu_note(@int_from_ptr(s));
     if (lv >= 0) and not x.opt_attr {
         x.opt_level = lv;
     }
@@ -221,9 +226,10 @@ pub fn gnu_mark_tag(t: *mut cty.CType, list: *u.List.[*mut cast.Attr]) void {
             gnu_record(@int_from_ptr(t.tag), a, 0);
         }
     }
-    let n = note_of_tag(t.tag);
-    if u.notnil(n) and n.transparent {
-        t.tag.transparent = true;
+    if let .some(n) = note_of_tag(t.tag) {
+        if n.transparent {
+            t.tag.transparent = true;
+        }
     }
 }
 
@@ -259,16 +265,15 @@ pub fn gnu_entity(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
     if dcl.asm_name.len > 0 {
         asm_label(s, dcl);
     }
-    let n = note_of(s);
-    if u.isnil(n) {
-        return;
-    }
+    let n = gnu_note_if(@int_from_ptr(s)) ?? return;
     if (s.kind == cast.SK_OBJECT) or (s.kind == cast.SK_FUNC) {
         if n.aligned > s.align {
             s.align = n.aligned;  // (a function's: __alignof__'s, and its code's: cgen.ax)
         }
-        if u.notnil(n.cleanup) and u.isnil(n.cleanup_call) {
-            cleanup_call(s, n, dcl);
+        if let .some(cln) = n.cleanup {
+            if u.isnil(n.cleanup_call) {
+                cleanup_call(s, n, dcl, cln);
+            }
         }
     } else if (s.kind == cast.SK_TYPEDEF) and (n.aligned != 0) and (n.aligned != cty.align_of(s.ty)) {
         // (the typedef's type: its type aligned to n, more or less strictly:
@@ -285,7 +290,7 @@ pub fn gnu_entity(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
     if n.transparent and (s.kind == cast.SK_TYPEDEF) {
         // (a typedef's union is transparent)
         if (s.ty.kind == cty.TK_UNION) and cty.is_complete(s.ty) {
-            gnu_note_at(@int_from_ptr(s.ty.tag), true).transparent = true;
+            ensure_gnu_note(@int_from_ptr(s.ty.tag)).transparent = true;
             s.ty.tag.transparent = true;
         } else {
             err(dcl.name_span, "C3090", u.f1("'%s' is not a complete union type: it cannot be transparent", s.name));
@@ -369,17 +374,16 @@ fn asm_label(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
 
 // cleanup(f) on automatic object s: the call f(&s), typed (its argument
 // converted to f's parameter as by assignment: C3022 if it cannot be).
-fn cleanup_call(s: *mut cast.CSym, n: *mut Note, dcl: *mut cast.Declarator) void {
+fn cleanup_call(s: *mut cast.CSym, n: *mut Note, dcl: *mut cast.Declarator, f: *mut cast.CSym) void {
     if (s.duration != cast.SD_AUTO) or s.is_param {
         err(dcl.name_span, "C3090", u.f1("'%s' has a cleanup, but is not an automatic object", s.name));
-        n.cleanup = u.nil.[cast.CSym]();
+        n.cleanup = .none;
         return;
     }
-    let f = n.cleanup;
     let ft = f.ty;
     if ft.proto and (ft.params.len != 1) {
         err(dcl.name_span, "C3090", u.f1("the cleanup '%s' must take one argument", f.name));
-        n.cleanup = u.nil.[cast.CSym]();
+        n.cleanup = .none;
         return;
     }
     let sp = dcl.name_span;
@@ -403,29 +407,32 @@ fn cleanup_call(s: *mut cast.CSym, n: *mut Note, dcl: *mut cast.Declarator) void
 }
 
 // The function call e's callee designates (through the decay to a
-// pointer), or nil.
-fn called(e: *cast.Expr) *cast.CSym {
+// pointer), or .none.
+fn called(e: *cast.Expr) ?*cast.CSym {
     let mut f = e.a;
     while u.notnil(f) and (f.kind == cast.ExprKind.CAST) and u.isnil(f.tname) {
         f = f.a;
     }
     if u.notnil(f) and (f.kind == cast.ExprKind.IDENT) and u.notnil(f.sym) and (f.sym.kind == cast.SK_FUNC) {
-        return f.sym;
+        return .some(f.sym);
     }
-    return u.nil.[cast.CSym]();
+    return .none;
 }
 
 // A call of a function with the attributes error("m") (an error, C3091),
 // warning("m") (C4123), or nonnull (a null pointer constant for one of the
 // parameters it names: warning C4121).
-/// The extensions function f's code is compiled with: the build's and those
-/// of its attribute target (f nil: the build's).
-pub fn fn_target_bits(f: *cast.CSym) u64 {
+/// The extensions function of's code is compiled with: the build's and those
+/// of its attribute target (of .none: the build's).
+pub fn fn_target_bits(of: ?*mut cast.CSym) u64 {
     let mut bits = tg.g_features;
-    if u.notnil(f) and (g_gnu_notes.len > 0) {
-        let n = note_of(f);
-        if u.notnil(n) and (n.target.len > 0) {
-            bits = bits | tg.parse_features(n.target).bits;
+    if g_gnu_notes.len > 0 {
+        if let .some(f) = of {
+            if let .some(n) = gnu_note_if(@int_from_ptr(f)) {
+                if n.target.len > 0 {
+                    bits = bits | tg.parse_features(n.target).bits;
+                }
+            }
         }
     }
     return bits;
@@ -435,14 +442,8 @@ fn gnu_call_check(e: *mut cast.Expr) void {
     if g_gnu_notes.len == 0 {
         return;
     }
-    let f = called(e);
-    if u.isnil(f) {
-        return;
-    }
-    let n = note_of(f);
-    if u.isnil(n) {
-        return;
-    }
+    let f = called(e) ?? return;
+    let n = gnu_note_if(@int_from_ptr(f)) ?? return;
     if n.always_inline and (n.target.len > 0) {
         // (an intrinsic of the headers, or any function to be inlined that
         // is compiled for extensions: called only where they are, so that
@@ -464,9 +465,9 @@ fn gnu_call_check(e: *mut cast.Expr) void {
         // report only where it is left after the wrapper is inlined and
         // its dead code removed: the system's headers' checks of their
         // functions' arguments, open's ...)
-    } else if not u.isnos(n.error_msg) and (n.error_msg.len > 0) {
+    } else if n.error_msg.len > 0 {
         err(e.span, "C3091", u.f2("a call of '%s', declared with the attribute error: %s", f.name, n.error_msg));
-    } else if not u.isnos(n.warning_msg) and (n.warning_msg.len > 0) {
+    } else if n.warning_msg.len > 0 {
         warn(e.span, "C4123", u.f2("a call of '%s', declared with the attribute warning: %s", f.name, n.warning_msg));
     }
     if (n.nonnull == 0) and not n.nonnull_all {
@@ -483,20 +484,17 @@ fn gnu_call_check(e: *mut cast.Expr) void {
 }
 
 // If x is a call of a function with the attribute format_arg(n): its
-// argument n, whose format the result is; else nil.
-fn format_arg_of(x: *mut cast.Expr) *mut cast.Expr {
+// argument n, whose format the result is; else .none.
+fn format_arg_of(x: *mut cast.Expr) ?*mut cast.Expr {
     if x.kind != cast.ExprKind.CALL {
-        return u.nil.[cast.Expr]();
+        return .none;
     }
-    let f = called(x);
-    if u.isnil(f) {
-        return u.nil.[cast.Expr]();
+    let f = called(x) ?? return .none;
+    let n = gnu_note_if(@int_from_ptr(f)) ?? return .none;
+    if (n.format_arg < 1) or (@as(usize, @bit_cast(u32, n.format_arg)) > x.args.len) {
+        return .none;
     }
-    let n = note_of(f);
-    if u.isnil(n) or (n.format_arg < 1) or (@as(usize, @bit_cast(u32, n.format_arg)) > x.args.len) {
-        return u.nil.[cast.Expr]();
-    }
-    return x.args.get(@as(usize, @bit_cast(u32, n.format_arg - 1)));
+    return .some(x.args.get(@as(usize, @bit_cast(u32, n.format_arg - 1))));
 }
 
 // e without the conversions semantic analysis made (to see a null pointer constant).
@@ -544,19 +542,19 @@ fn gnu_transparent(a: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
 
 // A cast of a to union type t (a GNU dialect: "Cast to a Union Type"):
 // the union's value with its first member of a's type (unqualified) given
-// a, not an lvalue; nil if no member has that type.
-fn gnu_union_cast(a: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+// a, not an lvalue; .none if no member has that type.
+fn gnu_union_cast(a: *mut cast.Expr, t: *mut cty.CType) ?*mut cast.Expr {
     if u.isnil(t.tag) or not t.tag.complete {
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     for m in t.tag.members.items() {
         if (m.name.len > 0) and not m.is_bitfield and cty.compatible_unq(m.ty, a.ty) {
             let v = union_value(a, t, m);
             v.lvalue = false;
-            return v;
+            return .some(v);
         }
     }
-    return u.nil.[cast.Expr]();
+    return .none;
 }
 
 // A compound literal of union type t, its member m given a.
@@ -595,12 +593,12 @@ fn type_name_of(t: *mut cty.CType, sp: u.Span) *mut cast.TypeName {
 /// mode): name, if the unit declares it, is weak (and another name for
 /// target); a name it does not declare is ignored.
 pub fn pragma_weaks() void {
-    for w in cpg.weaks() {
-        let s = linked(w.name);
-        if u.isnil(s) or ((s.kind != cast.SK_FUNC) and (s.kind != cast.SK_OBJECT)) {
+    for &w in cpg.weaks() {
+        let s = linked(w.name) ?? continue;
+        if (s.kind != cast.SK_FUNC) and (s.kind != cast.SK_OBJECT) {
             continue;
         }
-        let n = gnu_note_at(@int_from_ptr(s), true);
+        let n = ensure_gnu_note(@int_from_ptr(s));
         n.weak = true;
         s.weak = true;
         if w.target.len > 0 {

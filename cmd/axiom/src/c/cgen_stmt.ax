@@ -22,17 +22,17 @@ import "ctypes.ax" as cty;
 
 struct Jump {
     brk: *mut ir.Block,
-    cont: *mut ir.Block,  // nil for a switch
-    brk_depth: i32,       // the variable length arrays in scope where they go (vla_depth)
+    cont: ?*mut ir.Block,  // .none for a switch
+    brk_depth: i32,        // the variable length arrays in scope where they go (vla_depth)
     cont_depth: i32,
 }
 
-struct Body {
+nocopy struct Body {
     jumps: u.List.[Jump],
-    cases: u.SymMap.[*mut ir.Block],  // a CASE or DEFAULT statement's block, by its address
+    cases: u.SymMap.[?*mut ir.Block],  // a CASE or DEFAULT statement's block, by its address
     is_main: bool,
-    at_labels: u.SymMap.[*mut void],  // what is in scope at each label whose address is taken (vla_snapshot)
-    landings: u.List.[Landing],       // the jumps of `goto *` that leave scopes (computed_goto), made at the end
+    at_labels: u.SymMap.[?*mut VlaSaved],  // what is in scope at each label whose address is taken (vla_snapshot)
+    landings: u.List.[Landing],            // the jumps of `goto *` that leave scopes (computed_goto), made at the end
 }
 
 // A jump of a `goto *` to a label whose address is taken, from where
@@ -41,7 +41,7 @@ struct Body {
 // at the label is known.
 struct Landing {
     blk: *mut ir.Block,
-    from: *mut void,  // what is in scope at the goto (vla_snapshot)
+    from: *mut VlaSaved,  // what is in scope at the goto (vla_snapshot)
     to: *mut cast.CSym,
 }
 
@@ -70,9 +70,9 @@ fn function_body(s: *mut cast.CSym) void {
     f.c_races = true;
     f.c_progress = true;
     let b = u.new.[Body]();
-    b.cases = u.SymMap.[*mut ir.Block].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Block](), cap: 0, len: 0 };
+    b.cases = u.SymMap.[?*mut ir.Block].{ keys: u.nil.[usize](), vals: u.nil.[?*mut ir.Block](), cap: 0, len: 0 };
     b.is_main = u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL);
-    b.at_labels = u.SymMap.[*mut void].{ keys: u.nil.[usize](), vals: u.nil.[*mut void](), cap: 0, len: 0 };
+    b.at_labels = u.SymMap.[?*mut VlaSaved].{ keys: u.nil.[usize](), vals: u.nil.[?*mut VlaSaved](), cap: 0, len: 0 };
     BD = b;
     vla_begin_function();
     sj_begin_function();
@@ -207,7 +207,7 @@ fn stmt(s: *mut cast.Stmt) void {
     if k == cast.StmtKind.COMPOUND {
         let d = vla_depth();
         let sc = cdbg.open_block(s.items.items());
-        let rs = restrict_block(s.items.items(), u.nil.[cast.Stmt]());  // (restrict: cgen_restrict.ax)
+        let rs = restrict_block(s.items.items(), .none);  // (restrict: cgen_restrict.ax)
         let outer = fp_state;
         for x in s.items.items() {
             stmt_item(x);
@@ -247,9 +247,10 @@ fn stmt(s: *mut cast.Stmt) void {
         let mut i = BD.jumps.len;
         while i > 0 {
             i -= 1;
-            if u.notnil(BD.jumps.at(i).cont) {
-                vla_release_to(BD.jumps.at(i).cont_depth);
-                br(BD.jumps.at_mut(i).cont);
+            let j = BD.jumps.at_mut(i);
+            if let .some(c) = j.cont {
+                vla_release_to(j.cont_depth);
+                br(c);
                 break;
             }
         }
@@ -264,7 +265,7 @@ fn stmt(s: *mut cast.Stmt) void {
         at_end(b);
         nest_label(s.sym);  // (a nested function's non-local goto's target)
         if s.sym.label_addr {
-            BD.at_labels.put(u.addr_key(@int_from_ptr(s.sym)), vla_snapshot());  // (a `goto *`'s target)
+            BD.at_labels.put(u.addr_key(@int_from_ptr(s.sym)), .some(vla_snapshot()));  // (a `goto *`'s target)
         }
         stmt(s.body);
     } else if k == cast.StmtKind.ASM {
@@ -272,9 +273,10 @@ fn stmt(s: *mut cast.Stmt) void {
         asm_stmt(s.asm);
     } else {
         // CASE, DEFAULT
-        let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
-        br(b);
-        at_end(b);
+        if let .some(b) = BD.cases.get(u.addr_key(@int_from_ptr(s))) {
+            br(b);
+            at_end(b);
+        }
         stmt(s.body);
     }
 }
@@ -285,7 +287,13 @@ fn stmt(s: *mut cast.Stmt) void {
 fn asm_stmt(a: *mut cast.Asm) void {
     continue_after();
     let r = asm_stmt_gen(a);
-    if u.isnil(r) or not a.goto_ {
+    if not a.goto_ {
+        return;
+    }
+    let mut rv_asm = ir.vnil();
+    if let .some(v) = r {
+        rv_asm = v;
+    } else {
         return;
     }
     let n = a.labels.len;
@@ -296,7 +304,7 @@ fn asm_stmt(a: *mut cast.Asm) void {
         bs[i] = new_block("asm.goto");
     }
     let next = new_block("asm.next");
-    switch_to(r, false, vs[0..n], bs[0..n], next);
+    switch_to(rv_asm, false, vs[0..n], bs[0..n], next);
     for i in 0..n {
         at_end(bs[i]);
         stmt(a.labels.get(i).stmt);
@@ -345,10 +353,15 @@ fn landings() void {
         return;
     }
     let saved = vla_snapshot();
-    for x in BD.landings.items() {
+    for &mut x in BD.landings.items_mut() {
         at_end(x.blk);
-        let at = BD.at_labels.get(u.addr_key(@int_from_ptr(x.to)));
-        if not u.isvnil(at) and vla_is_prefix(at, x.from) {
+        let mut ok = false;
+        if let .some(at) = BD.at_labels.get(u.addr_key(@int_from_ptr(x.to))) {
+            if vla_is_prefix(at, x.from) {
+                ok = true;
+            }
+        }
+        if ok {
             vla_restore(x.from);
             vla_release_to(cs.vla_depth(x.to));
             if not terminated() {
@@ -356,7 +369,7 @@ fn landings() void {
             }
         } else {
             // (into a scope the goto is not in: undefined, 6.8.6.1p1)
-            _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+            _ = ir.intr(B, ir.IN_TRAP, T_void, []);
             ir.unreachable(B);
         }
     }
@@ -373,17 +386,18 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
     let d = vla_depth();
     let xs = s.items.items();
     let sc = cdbg.open_block(xs);
-    let mut v = ir.vnil();
+    let mut v: ?*mut ir.Value = .none;
     for i in 0..xs.len {
         let x = xs[i];
         if (i + 1 == xs.len) and u.notnil(cs.value_stmt(x)) and not cty.is_void(e.ty) {
-            v = last_value(x);
+            let mut val = last_value(x);
             if (cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty)) and
                (vla_depth() > d) {
                 let tmp = alloca(e.ty, "stmtexpr");
-                copy(e.ty, tmp, v);
-                v = tmp;
+                copy(e.ty, tmp, val);
+                val = tmp;
             }
+            v = .some(val);
             continue;
         }
         stmt(x);
@@ -391,14 +405,17 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
     vla_leave(d);
     cdbg.close_scope(sc);
     continue_after();
-    if u.isnil(v) and not cty.is_void(e.ty) {
-        // (the block ended in a jump: the value is never used)
-        if cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
-            return alloca(e.ty, "stmtexpr");
-        }
-        return ir.czero(lty(e.ty));
+    if cty.is_void(e.ty) {
+        return v ?? ir.vnil();
     }
-    return v;
+    if let .some(val) = v {
+        return val;
+    }
+    // (the block ended in a jump: the value is never used)
+    if cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
+        return alloca(e.ty, "stmtexpr");
+    }
+    return ir.czero(lty(e.ty));
 }
 
 // The labels of statement s, then the value of its expression statement
@@ -412,9 +429,10 @@ fn last_value(s: *mut cast.Stmt) *mut ir.Value {
         return last_value(s.body);
     }
     if (s.kind == cast.StmtKind.CASE) or (s.kind == cast.StmtKind.DEFAULT) {
-        let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
-        br(b);
-        at_end(b);
+        if let .some(b) = BD.cases.get(u.addr_key(@int_from_ptr(s))) {
+            br(b);
+            at_end(b);
+        }
         return last_value(s.body);
     }
     continue_after();
@@ -430,7 +448,7 @@ fn label_block(l: *mut cast.CSym) *mut ir.Block {
 
 // Have declaration specifiers ds a typeof of a variably modified type?
 fn has_vm_typeof(ds: *cast.DeclSpec) bool {
-    for s in ds.items.items() {
+    for &s in ds.items.items() {
         if s.kind == cast.SpecKind.TYPEOF {
             if u.notnil(s.tname) and u.notnil(s.tname.ty) and cty.is_vm(s.tname.ty) {
                 return true;

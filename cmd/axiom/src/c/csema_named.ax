@@ -18,37 +18,36 @@ struct Root {
     off: u64,
 }
 
-fn root(e: *mut cast.Expr) Root {
+fn root(e: *mut cast.Expr) ?Root {
     if (e.kind == cast.ExprKind.IDENT) and u.notnil(e.sym) and (e.sym.kind == cast.SK_OBJECT) and
        ((e.sym.flags & cast.CF_CONSTEXPR) != 0) {
-        return Root.{ sym: e.sym, off: 0 };
+        return .some(Root.{ sym: e.sym, off: 0 });
     }
     if (e.kind == cast.ExprKind.COMPOUND) and u.notnil(e.sym) and ((e.sym.flags & cast.CF_CONSTEXPR) != 0) {
-        return Root.{ sym: e.sym, off: 0 };
+        return .some(Root.{ sym: e.sym, off: 0 });
     }
     if (e.kind == cast.ExprKind.MEMBER) and (e.op == ct.P_DOT) and u.notnil(e.mem) {
         // (only '.': p->m is not a named constant)
-        let r = root(e.a);
-        if u.notnil(r.sym) {
-            return Root.{ sym: r.sym, off: r.off + e.cval };
+        if let .some(r) = root(e.a) {
+            return .some(Root.{ sym: r.sym, off: r.off + e.cval });
         }
     }
-    return Root.{ sym: u.nil.[cast.CSym](), off: 0 };
+    return .none;
 }
 
 /// The constexpr object that lvalue e is (or a member of, at `off`): a
-/// named constant of structure or union type; nil sym if none.
+/// named constant of structure or union type.
 pub struct Object {
     pub sym: *mut cast.CSym,
     pub off: u64,
 }
 
-pub fn object_of(e: *mut cast.Expr) Object {
-    let r = root(e);
-    if u.isnil(r.sym) or u.isnil(r.sym.init) {
-        return Object.{ sym: u.nil.[cast.CSym](), off: 0 };
+pub fn object_of(e: *mut cast.Expr) ?Object {
+    let r = root(e) ?? return .none;
+    if u.isnil(r.sym.init) {
+        return .none;
     }
-    return Object.{ sym: r.sym, off: r.off };
+    return .some(Object.{ sym: r.sym, off: r.off });
 }
 
 /// Gives c, the lvalue conversion of c.a, the value of c.a if c.a is a
@@ -58,23 +57,21 @@ pub fn fold_load(c: *mut cast.Expr) void {
     if u.isnil(e.ty) or not cty.is_arith(e.ty) {
         return;
     }
-    let r = root(e);
-    if u.isnil(r.sym) or u.isnil(r.sym.init) {
+    let r = root(e) ?? return;
+    if u.isnil(r.sym.init) {
         return;
     }
-    let mut bits = u.nil.[cty.Member]();
-    if e.kind == cast.ExprKind.MEMBER {
-        bits = e.mem;
-        if not bits.is_bitfield {
-            bits = u.nil.[cty.Member]();
-        }
+    let mut obits: ?*mut cty.Member = .none;
+    if (e.kind == cast.ExprKind.MEMBER) and e.mem.is_bitfield {
+        obits = .some(e.mem);
     }
+    let want_bits = obits ?? u.nil.[cty.Member]();
     // the last item for that subobject (a later one overrides), else zero
-    let items = r.sym.init.items.items();
+    let items = r.sym.init.items.items_mut();
     let mut k = items.len;
     while k > 0 {
         k -= 1;
-        let it = items[k];
+        let it = &mut items[k];
         if u.isnil(it.e) and (it.off <= r.off) and (r.off < it.off + cty.size_of(it.ty)) {
             c.is_const = true;  // (a zero item)
             c.cval = 0;
@@ -83,7 +80,8 @@ pub fn fold_load(c: *mut cast.Expr) void {
             c.xv = cl.zero();
             return;
         }
-        if (it.off == r.off) and (it.bits == bits) and cty.is_arith(it.ty) and (cty.unqual(it.ty) == cty.unqual(e.ty)) {
+        if (it.off == r.off) and (it.bits == want_bits) and cty.is_arith(it.ty) and
+           (cty.unqual(it.ty) == cty.unqual(e.ty)) {
             if not it.e.is_const {
                 return;
             }
@@ -92,8 +90,8 @@ pub fn fold_load(c: *mut cast.Expr) void {
             c.fcval = it.e.fcval;
             c.fcimag = it.e.fcimag;
             c.xv = it.e.xv;
-            if u.notnil(bits) {
-                c.cval = cty.wrap_bits(it.e.cval, bits.bit_width, e.ty.is_signed and (e.ty.kind != cty.TK_BOOL));
+            if let .some(bm) = obits {
+                c.cval = cty.wrap_bits(it.e.cval, bm.bit_width, e.ty.is_signed and (e.ty.kind != cty.TK_BOOL));
             }
             return;
         }

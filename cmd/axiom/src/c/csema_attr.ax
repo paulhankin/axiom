@@ -45,13 +45,17 @@ struct AttrNote {
     static_bytes: u64,
 }
 
-fn attr_note_of(p: usize, make: bool) *mut AttrNote {
+fn attr_note_of(p: usize) ?*mut AttrNote {
+    return g_attr_notes.get(u.addr_key(p));
+}
+
+fn ensure_attr_note(p: usize) *mut AttrNote {
     let k = u.addr_key(p);
-    let mut n = g_attr_notes.get(k);
-    if u.isnil(n) and make {
-        n = u.new.[AttrNote]();
-        g_attr_notes.put(k, n);
+    if let .some(n) = g_attr_notes.get(k) {
+        return n;
     }
+    let n = u.new.[AttrNote]();
+    g_attr_notes.put(k, .some(n));
     return n;
 }
 
@@ -65,25 +69,25 @@ fn message(a: *cast.Attr) []u8 {
 
 // The standard attribute a GNU attribute is (a GNU dialect): deprecated
 // and unavailable as deprecated, warn_unused_result as nodiscard, unused as
-// maybe_unused, noreturn; nil for the others (csema_gnu.ax's).
-fn gnu_as_standard(a: *cast.Attr) []u8 {
+// maybe_unused, noreturn; .none for the others (csema_gnu.ax's).
+fn gnu_as_standard(a: *cast.Attr) ?[]u8 {
     if not u.str_eq(a.prefix, "gnu") or not opts().gnu {
-        return u.nosym();
+        return .none;
     }
     let n = cf.plain(a.name);
     if u.str_eq(n, "deprecated") or u.str_eq(n, "unavailable") {
-        return "deprecated";
+        return .some("deprecated");
     }
     if u.str_eq(n, "warn_unused_result") or u.str_eq(n, "nodiscard") {
-        return "nodiscard";
+        return .some("nodiscard");
     }
     if u.str_eq(n, "unused") or u.str_eq(n, "maybe_unused") {
-        return "maybe_unused";
+        return .some("maybe_unused");
     }
     if u.str_eq(n, "noreturn") {
-        return "noreturn";
+        return .some("noreturn");
     }
-    return u.nosym();
+    return .none;
 }
 
 // Records what the standard attributes among `list` say of the entity at p.
@@ -91,27 +95,28 @@ fn attr_record(p: usize, list: *u.List.[*mut cast.Attr]) void {
     for a in list.items() {
         let mut n = cf.plain(a.name);
         if a.prefix.len > 0 {
-            n = gnu_as_standard(a);
-            if u.isnos(n) {
+            if let .some(gn) = gnu_as_standard(a) {
+                n = gn;
+            } else {
                 continue;
             }
         }
         if u.str_eq(n, "deprecated") {
-            let x = attr_note_of(p, true);
+            let x = ensure_attr_note(p);
             x.deprecated = true;
             if message(a).len > 0 {
                 x.dep_msg = message(a);
             }
         } else if u.str_eq(n, "nodiscard") {
-            let x = attr_note_of(p, true);
+            let x = ensure_attr_note(p);
             x.nodiscard = true;
             if message(a).len > 0 {
                 x.nd_msg = message(a);
             }
         } else if u.str_eq(n, "maybe_unused") {
-            attr_note_of(p, true).maybe_unused = true;
+            ensure_attr_note(p).maybe_unused = true;
         } else if u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn") {
-            attr_note_of(p, true).noreturn = true;
+            ensure_attr_note(p).noreturn = true;
         }
     }
 }
@@ -151,9 +156,9 @@ pub fn mark_functype(s: *cast.CSym, dcl: *cast.Declarator) void {
         }
         let n = cf.plain(a.name);
         if u.str_eq(n, "unsequenced") {
-            attr_note_of(@int_from_ptr(s), true).unsequenced = true;
+            ensure_attr_note(@int_from_ptr(s)).unsequenced = true;
         } else if u.str_eq(n, "reproducible") {
-            attr_note_of(@int_from_ptr(s), true).reproducible = true;
+            ensure_attr_note(@int_from_ptr(s)).reproducible = true;
         }
     }
 }
@@ -171,8 +176,8 @@ pub fn fx_of(s: *cast.CSym) u8 {
     if (g_attr_notes.len == 0) or u.isnil(s) or u.isnil(s.ty) or not cty.is_func(s.ty) {
         return 0;
     }
-    let n = attr_note_of(@int_from_ptr(s), false);
-    if u.isnil(n) or not (n.unsequenced or n.reproducible) or n.noreturn or s.ty.variadic or not s.ty.proto {
+    let n = attr_note_of(@int_from_ptr(s)) ?? return 0;
+    if not (n.unsequenced or n.reproducible) or n.noreturn or s.ty.variadic or not s.ty.proto {
         return 0;
     }
     for p in s.ty.params {
@@ -189,7 +194,7 @@ pub fn fx_of(s: *cast.CSym) u8 {
 /// Parameter s is declared `[static n]`, n elements of `bytes` bytes in all
 /// (0: not known, a variable length array's).
 pub fn set_static_param(s: *cast.CSym, bytes: u64) void {
-    let n = attr_note_of(@int_from_ptr(s), true);
+    let n = ensure_attr_note(@int_from_ptr(s));
     n.static_param = true;
     n.static_bytes = bytes;
 }
@@ -199,8 +204,8 @@ pub fn static_param(s: *cast.CSym) i64 {
     if (g_attr_notes.len == 0) or u.isnil(s) {
         return -1;
     }
-    let n = attr_note_of(@int_from_ptr(s), false);
-    if u.isnil(n) or not n.static_param {
+    let n = attr_note_of(@int_from_ptr(s)) ?? return -1;
+    if not n.static_param {
         return -1;
     }
     return @bit_cast(i64, n.static_bytes);
@@ -209,7 +214,7 @@ pub fn static_param(s: *cast.CSym) i64 {
 /// Function s is declared with the function specifier _Noreturn.
 pub fn set_noreturn(s: *cast.CSym) void {
     if u.notnil(s) {
-        attr_note_of(@int_from_ptr(s), true).noreturn = true;
+        ensure_attr_note(@int_from_ptr(s)).noreturn = true;
     }
 }
 
@@ -219,18 +224,19 @@ pub fn is_noreturn(s: *cast.CSym) bool {
     if (g_attr_notes.len == 0) or u.isnil(s) {
         return false;
     }
-    let n = attr_note_of(@int_from_ptr(s), false);
-    return u.notnil(n) and n.noreturn;
+    let n = attr_note_of(@int_from_ptr(s)) ?? return false;
+    return n.noreturn;
 }
 
 /// Was label l declared [[maybe_unused]]?
 pub fn maybe_unused(l: *cast.CSym) bool {
-    let n = attr_note_of(@int_from_ptr(l), false);
-    return u.notnil(n) and n.maybe_unused;
+    let n = attr_note_of(@int_from_ptr(l)) ?? return false;
+    return n.maybe_unused;
 }
 
-fn warn_deprecated(n: *AttrNote, sp: u.Span, what: []u8) void {
-    if u.isnil(n) or not n.deprecated {
+fn warn_deprecated(on: ?*AttrNote, sp: u.Span, what: []u8) void {
+    let n = on ?? return;
+    if not n.deprecated {
         return;
     }
     let mut msg = u.cat2(what, " is deprecated");
@@ -245,7 +251,7 @@ pub fn use_sym(s: *cast.CSym, sp: u.Span) void {
     if g_attr_notes.len == 0 {
         return;
     }
-    warn_deprecated(attr_note_of(@int_from_ptr(s), false), sp, u.f1("'%s'", s.name));
+    warn_deprecated(attr_note_of(@int_from_ptr(s)), sp, u.f1("'%s'", s.name));
 }
 
 /// A use of the tag of t (a structure, union or enumeration) at sp, other
@@ -254,7 +260,7 @@ pub fn use_tag(t: *mut cty.CType, sp: u.Span) void {
     if (g_attr_notes.len == 0) or u.isnil(t) or u.isnil(t.tag) {
         return;
     }
-    warn_deprecated(attr_note_of(@int_from_ptr(t.tag), false), sp, tq(cty.unqual(t)));
+    warn_deprecated(attr_note_of(@int_from_ptr(t.tag)), sp, tq(cty.unqual(t)));
 }
 
 /// A use of member m at sp: warned about if it is deprecated.
@@ -262,12 +268,12 @@ pub fn use_member(m: *cty.Member, sp: u.Span) void {
     if g_attr_notes.len == 0 {
         return;
     }
-    warn_deprecated(attr_note_of(@int_from_ptr(m), false), sp, u.f1("the member '%s'", m.name));
+    warn_deprecated(attr_note_of(@int_from_ptr(m)), sp, u.f1("the member '%s'", m.name));
 }
 
 // The function a call's callee designates (through the decay to a pointer
-// and any `*`), or nil.
-fn call_callee(e0: *cast.Expr) *cast.CSym {
+// and any `*`), or .none.
+fn call_callee(e0: *cast.Expr) ?*cast.CSym {
     let mut e = e0;
     while u.notnil(e) {
         if (e.kind == cast.ExprKind.CAST) and u.isnil(e.tname) {
@@ -279,9 +285,9 @@ fn call_callee(e0: *cast.Expr) *cast.CSym {
         }
     }
     if u.notnil(e) and (e.kind == cast.ExprKind.IDENT) and u.notnil(e.sym) and (e.sym.kind == cast.SK_FUNC) {
-        return e.sym;
+        return .some(e.sym);
     }
-    return u.nil.[cast.CSym]();
+    return .none;
 }
 
 /// e (typed) is evaluated as a void expression: a call of a nodiscard
@@ -303,28 +309,30 @@ pub fn discarded(e: *cast.Expr) void {
     if e.kind != cast.ExprKind.CALL {
         return;
     }
-    let f = call_callee(e.a);
-    if u.notnil(f) {
-        let n = attr_note_of(@int_from_ptr(f), false);
-        if u.notnil(n) and n.nodiscard {
-            let mut msg = u.f1("the result of calling '%s' is discarded, and it is declared 'nodiscard'", f.name);
-            if n.nd_msg.len > 0 {
-                msg = u.cat3(msg, ": ", n.nd_msg);
+    if let .some(f) = call_callee(e.a) {
+        if let .some(n) = attr_note_of(@int_from_ptr(f)) {
+            if n.nodiscard {
+                let mut msg = u.f1("the result of calling '%s' is discarded, and it is declared 'nodiscard'", f.name);
+                if n.nd_msg.len > 0 {
+                    msg = u.cat3(msg, ": ", n.nd_msg);
+                }
+                warn(e.span, "C4051", msg);
+                return;
             }
-            warn(e.span, "C4051", msg);
-            return;
         }
     }
     let t = e.ty;
     if u.notnil(t) and u.notnil(t.tag) and
        ((t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION) or (t.kind == cty.TK_ENUM)) {
-        let n = attr_note_of(@int_from_ptr(t.tag), false);
-        if u.notnil(n) and n.nodiscard {
-            let mut msg = u.f1("the result of a call is discarded, and its type %s is declared 'nodiscard'", tq(t.unq));
-            if n.nd_msg.len > 0 {
-                msg = u.cat3(msg, ": ", n.nd_msg);
+        if let .some(n) = attr_note_of(@int_from_ptr(t.tag)) {
+            if n.nodiscard {
+                let mut msg = u.f1("the result of a call is discarded, and its type %s is declared 'nodiscard'",
+                                   tq(t.unq));
+                if n.nd_msg.len > 0 {
+                    msg = u.cat3(msg, ": ", n.nd_msg);
+                }
+                warn(e.span, "C4051", msg);
             }
-            warn(e.span, "C4051", msg);
         }
     }
 }

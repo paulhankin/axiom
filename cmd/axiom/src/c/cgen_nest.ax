@@ -112,13 +112,14 @@ fn nest_st(v: *mut ir.Value, p: *mut ir.Value) void {
 /// a function with nested functions made.
 fn nest_enter(s: *mut cast.CSym) void {
     if u.notnil(s.nest_parent) {
-        F.chain = alloca(cty.pointer_to(cty.t_void), "chain");
-        nest_st(F.f.params[@int_cast(usize, F.sig.plan.chain)], F.chain);
+        let ch = alloca(cty.pointer_to(cty.t_void), "chain");
+        F.chain = .some(ch);
+        nest_st(F.f.params[@int_cast(usize, F.sig.plan.chain)], ch);
     }
     g_sites.clear();
     g_hooks.clear();
     g_pending.clear();
-    g_hook_jb = ir.vnil();
+    g_hook_jb = .none;
     if not s.has_nested {
         return;
     }
@@ -128,9 +129,9 @@ fn nest_enter(s: *mut cast.CSym) void {
         n += 2;
     }
     let r = alloca(cty.array_of(cty.pointer_to(cty.t_void), n, true), "frame.rec");
-    F.rec = r;
-    if u.notnil(F.chain) {
-        nest_st(nest_ld(F.chain), r);
+    F.rec = .some(r);
+    if let .some(ch) = F.chain {
+        nest_st(nest_ld(ch), r);
     } else {
         nest_st(ir.czero(T_ptr), r);
     }
@@ -180,25 +181,27 @@ fn nest_lens_field(s: *cast.CSym) u64 {
 /// allocated (its address in s.ir): its address in the frame record, if a
 /// nested function uses it.
 fn nest_allocated(s: *mut cast.CSym) void {
-    if u.isnil(F) or u.isnil(F.rec) or u.isnil(F.sym) {
+    if u.isnil(F) or u.isnil(F.sym) {
         return;
     }
-    let idx = cs.rec_index(F.sym, s);
-    if idx >= 0 {
-        nest_st(@ptr_cast(*mut ir.Value, s.ir), nest_slot(F.rec, 1 + @as(u64, @bit_cast(u32, idx))));
+    if let .some(r) = F.rec {
+        let idx = cs.rec_index(F.sym, s);
+        if idx >= 0 {
+            nest_st(@ptr_cast(*mut ir.Value, s.ir), nest_slot(r, 1 + @as(u64, @bit_cast(u32, idx))));
+        }
     }
 }
 
 /// The address of the slot of length n (a CType.vexpr) that an enclosing
-/// function of the function being generated evaluates, from its record; nil
+/// function of the function being generated evaluates, from its record; .none
 /// if the function being generated evaluates it (vla_slot).
-fn outer_len(n: *void) *mut ir.Value {
+fn outer_len(n: *void) ?*mut ir.Value {
     if u.isnil(F) or u.isnil(F.sym) or u.isnil(F.sym.nest_parent) {
-        return ir.vnil();
+        return .none;
     }
     let p = cs.length_owner(n);
     if u.isnil(p) or (p == F.sym) {
-        return ir.vnil();
+        return .none;
     }
     let mut x = F.sym.nest_parent;
     while u.notnil(x) and (x != p) {
@@ -206,9 +209,9 @@ fn outer_len(n: *void) *mut ir.Value {
     }
     let idx = cs.length_index(p, n);
     if u.isnil(x) or (idx < 0) {
-        return ir.vnil();  // (not an enclosing function's)
+        return .none;  // (not an enclosing function's)
     }
-    return nest_ld(nest_slot(nest_record_of(p), nest_lens_field(p) + @as(u64, @bit_cast(u32, idx))));
+    return .some(nest_ld(nest_slot(nest_record_of(p), nest_lens_field(p) + @as(u64, @bit_cast(u32, idx)))));
 }
 
 /// The address of automatic object x of the function being generated, or
@@ -219,7 +222,9 @@ fn nest_object_addr(x: *mut cast.CSym) *mut ir.Value {
        (x.duration == cast.SD_AUTO) {
         let idx = cs.rec_index(cur.nest_parent, x);
         if idx >= 0 {
-            return nest_ld(nest_slot(nest_ld(F.chain), 1 + @as(u64, @bit_cast(u32, idx))));
+            if let .some(ch) = F.chain {
+                return nest_ld(nest_slot(nest_ld(ch), 1 + @as(u64, @bit_cast(u32, idx))));
+            }
         }
     }
     if u.isvnil(x.ir) {
@@ -246,9 +251,9 @@ fn chain_for(g: *mut cast.CSym) *mut ir.Value {
 fn nest_record_of(p: *mut cast.CSym) *mut ir.Value {
     let cur = F.sym;
     if cur == p {
-        return F.rec;
+        return F.rec ?? ir.vnil();
     }
-    let mut r = nest_ld(F.chain);
+    let mut r = nest_ld(F.chain ?? ir.vnil());
     let mut x = cur.nest_parent;
     while u.notnil(x) and (x != p) {
         r = nest_ld(r);  // (slot 0: that function's own chain)
@@ -259,7 +264,7 @@ fn nest_record_of(p: *mut cast.CSym) *mut ir.Value {
 
 // The globals of nested function g's trampolines: the table of chains, and
 // the table of the trampolines' addresses (and the functions, declared).
-struct Pool {
+nocopy struct Pool {
     pub chains: *mut ir.Value,
     fns: *mut ir.Value,
     get: *mut ir.Func,
@@ -273,8 +278,7 @@ fn nest_key(g: *cast.CSym) []u8 {
 /// The trampolines of nested function g (made once: their functions declared).
 fn pool_of(g: *mut cast.CSym) *mut Pool {
     let k = nest_key(g);
-    let had = g_pools.get(k);
-    if u.notnil(had) {
+    if let .some(had) = g_pools.get(k) {
         return had;
     }
     let p = u.new.[Pool]();
@@ -303,7 +307,7 @@ fn pool_of(g: *mut cast.CSym) *mut Pool {
     let mut one: [1]*mut ir.Ty = [T_ptr];
     p.get = ir.add_function(M, u.cat2(base, ".trampoline"), ir.t_fn(T_ptr, one[..], false));
     p.get.linkage = ir.LINK_INTERNAL;
-    g_pools.put(k, p);
+    g_pools.put(k, .some(p));
     return p;
 }
 
@@ -326,8 +330,7 @@ fn entry_params(g: *mut cast.CSym) []mut *mut cty.CType {
 /// arguments. A direct call of g calls it.
 fn entry_of(g: *mut cast.CSym) *mut ir.Func {
     let k = nest_key(g);
-    let had = g_entries.get(k);
-    if u.notnil(had) {
+    if let .some(had) = g_entries.get(k) {
         return had;
     }
     let ps = entry_params(g);
@@ -335,7 +338,7 @@ fn entry_of(g: *mut cast.CSym) *mut ir.Func {
     let f = ir.add_function(M, u.f2("%s.%s.entry", g.name, u.idec(g.uid)), sig.ty);
     f.linkage = ir.LINK_INTERNAL;
     mark_func(f, sig.plan);
-    g_entries.put(k, f);
+    g_entries.put(k, .some(f));
     return f;
 }
 
@@ -381,23 +384,25 @@ fn nest_address(g: *mut cast.CSym) *mut ir.Value {
 
 /// Before function s returns: the trampolines its call holds, given back.
 fn nest_leave(s: *cast.CSym) void {
-    if u.isnil(F) or u.isnil(F.rec) or (s.tramps.len == 0) or terminated() {
+    if u.isnil(F) or (s.tramps.len == 0) or terminated() {
         return;
     }
-    for g in s.tramps.items() {
-        let p = pool_of(g);
-        let v = ir.ptrtoint(B, nest_ld(nest_slot(F.rec, nest_tramp_field(g))), T_isz);
-        let has = ir.icmp(B, ir.IntNE, v, usz(0));
-        let yes = new_block("tramp.free");
-        let done = new_block("tramp.done");
-        ir.condbr(B, has, yes, done);
-        at_end(yes);
-        let at = ir.ptradd(B, p.chains, ir.mul(B, ir.sub(B, v, usz(1)), usz(nest_psz())));
-        let s0 = ir.store(B, ir.czero(T_ptr), at);
-        s0.align = @truncate(u32, nest_psz());
-        s0.flags = s0.flags | ir.F_VOLATILE;
-        ir.br(B, done);
-        at_end(done);
+    if let .some(r) = F.rec {
+        for g in s.tramps.items() {
+            let p = pool_of(g);
+            let v = ir.ptrtoint(B, nest_ld(nest_slot(r, nest_tramp_field(g))), T_isz);
+            let has = ir.icmp(B, ir.IntNE, v, usz(0));
+            let yes = new_block("tramp.free");
+            let done = new_block("tramp.done");
+            ir.condbr(B, has, yes, done);
+            at_end(yes);
+            let at = ir.ptradd(B, p.chains, ir.mul(B, ir.sub(B, v, usz(1)), usz(nest_psz())));
+            let s0 = ir.store(B, ir.czero(T_ptr), at);
+            s0.align = @truncate(u32, nest_psz());
+            s0.flags = s0.flags | ir.F_VOLATILE;
+            ir.br(B, done);
+            at_end(done);
+        }
     }
 }
 
@@ -440,7 +445,7 @@ fn define_get(g: *mut cast.CSym) void {
     ir.add_incoming(i, i1, next);
     ir.condbr(B, ir.icmp(B, ir.IntULT, i1, usz(POOL)), loop_b, full);
     at_end(full);
-    _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+    _ = ir.intr(B, ir.IN_TRAP, T_void, []);
     ir.unreachable(B);
     at_end(claimed);
     let num = ir.add(B, i, usz(1));
@@ -464,7 +469,7 @@ fn define_get(g: *mut cast.CSym) void {
 // after a non-local goto, and what is in scope there.
 struct NestSite {
     blk: *mut ir.Block,
-    vla: *mut void,
+    vla: *mut VlaSaved,
 }
 
 fn nest_nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
@@ -481,7 +486,7 @@ fn nest_nonlocal_index(p: *cast.CSym, l: *mut cast.CSym) i32 {
 // slots held before it.
 struct NestHook {
     blk: *mut ir.Block,
-    vla: *mut void,
+    vla: *mut VlaSaved,
     at: []mut *mut ir.Value,     // the slots
     saved: []mut *mut ir.Value,  // what they held
     fns: []mut *mut cast.CSym,   // whose
@@ -533,7 +538,12 @@ fn nest_arm() void {
         g_pending.push(NEST_NONE);
         return;
     }
-    if u.notnil(F.sym.nest_parent) and (vla_has_cleanups() or ((F.sym.tramps.len > 0) and u.notnil(F.rec))) {
+    let mut has_tramps = false;
+    if let .some(rec) = F.rec {
+        _ = rec;
+        has_tramps = F.sym.tramps.len > 0;
+    }
+    if u.notnil(F.sym.nest_parent) and (vla_has_cleanups() or has_tramps) {
         let mut fns = u.List.[*mut cast.CSym].empty();
         let mut a = F.sym.nest_parent;
         while u.notnil(a) {
@@ -543,20 +553,24 @@ fn nest_arm() void {
             a = a.nest_parent;
         }
         if fns.len > 0 {
-            if u.isnil(g_hook_jb) {
-                g_hook_jb = alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.hook");
+            let mut jb = ir.vnil();
+            if let .some(hook_jb) = g_hook_jb {
+                jb = hook_jb;
+            } else {
+                jb = alloca(cty.array_of(cty.t_llong, 32, true), "nonlocal.hook");
+                g_hook_jb = .some(jb);
             }
             let n = fns.len;
-            let h = NestHook.{ blk: u.nil.[ir.Block](), vla: vla_snapshot(), at: u.newn.[*mut ir.Value](n + 1)[0..n],
-                               saved: u.newn.[*mut ir.Value](n + 1)[0..n], fns: fns.items_mut() };
+            let at = u.newn.[*mut ir.Value](n)[0..n];
+            let saved = u.newn.[*mut ir.Value](n)[0..n];
+            let fns_slice = fns.items_mut();
             for k in 0..n {
-                h.at[k] = nest_slot(nest_record_of(fns.get(k)), nest_jb_field(fns.get(k)));
-                h.saved[k] = nest_ld(h.at[k]);
-                nest_st(g_hook_jb, h.at[k]);
+                at[k] = nest_slot(nest_record_of(fns_slice[k]), nest_jb_field(fns_slice[k]));
+                saved[k] = nest_ld(at[k]);
+                nest_st(jb, at[k]);
             }
-            let mut hh = h;
-            hh.blk = nest_split(nest_setjmp(g_hook_jb), "nonlocal.hooked");
-            g_hooks.push(hh);
+            let blk = nest_split(nest_setjmp(jb), "nonlocal.hooked");
+            g_hooks.push(NestHook.{ blk: blk, vla: vla_snapshot(), at: at, saved: saved, fns: fns_slice });
             g_pending.push(g_hooks.len - 1);
         } else {
             g_pending.push(NEST_NONE);
@@ -564,12 +578,14 @@ fn nest_arm() void {
     } else {
         g_pending.push(NEST_NONE);
     }
-    if (F.sym.nonlocal.len == 0) or u.isnil(F.rec) {
+    if F.sym.nonlocal.len == 0 {
         return;
     }
-    let jb = nest_ld(nest_slot(F.rec, nest_jb_field(F.sym)));
-    let site = nest_split(nest_setjmp(jb), "nonlocal.site");
-    g_sites.push(NestSite.{ blk: site, vla: vla_snapshot() });
+    if let .some(rec) = F.rec {
+        let jb = nest_ld(nest_slot(rec, nest_jb_field(F.sym)));
+        let site = nest_split(nest_setjmp(jb), "nonlocal.site");
+        g_sites.push(NestSite.{ blk: site, vla: vla_snapshot() });
+    }
 }
 
 const NEST_NONE: usize = 0xFFFF_FFFF;
@@ -583,7 +599,7 @@ fn nest_unhook() void {
     if (k == NEST_NONE) or terminated() {
         return;
     }
-    let h = g_hooks.get(k);
+    let h = g_hooks.at_mut(k);
     for i in 0..h.at.len {
         nest_st(h.saved[i], h.at[i]);
     }
@@ -592,7 +608,7 @@ fn nest_unhook() void {
 /// Label l of the function being generated begins here.
 fn nest_label(l: *mut cast.CSym) void {
     if u.notnil(F) and u.notnil(F.sym) and (nest_nonlocal_index(F.sym, l) >= 0) {
-        g_labels.put(u.addr_key(@int_from_ptr(l)), vla_snapshot());
+        g_labels.put(u.addr_key(@int_from_ptr(l)), .some(vla_snapshot()));
     }
 }
 
@@ -656,7 +672,7 @@ fn nest_finish() void {
         let site = g_sites.get(i);
         i += 1;
         at_end(site.blk);
-        let num = nest_slot(F.rec, nest_jb_field(F.sym) + 1);
+        let num = nest_slot(F.rec ?? ir.vnil(), nest_jb_field(F.sym) + 1);
         let t = ir.ptrtoint(B, nest_ld(num), T_isz);
         nest_st(ir.czero(T_ptr), num);  // (arrived: a hook on the way to another jump tells it from this one)
         let none = new_block("nonlocal.none");
@@ -666,8 +682,13 @@ fn nest_finish() void {
             let b = new_block("nonlocal.goto");
             ir.add_case(sw, usz(@as(u64, k) + 1), b);
             at_end(b);
-            let at = g_labels.get(u.addr_key(@int_from_ptr(l)));
-            if not u.isvnil(at) and vla_is_prefix(at, site.vla) {
+            let mut ok = false;
+            if let .some(at) = g_labels.get(u.addr_key(@int_from_ptr(l))) {
+                if vla_is_prefix(at, site.vla) {
+                    ok = true;
+                }
+            }
+            if ok {
                 vla_restore(site.vla);
                 vla_release_to(cs.vla_depth(l));
                 if not terminated() {
@@ -675,7 +696,7 @@ fn nest_finish() void {
                 }
             } else {
                 // (into a scope the call is not in: undefined, 6.8.6.1p1)
-                _ = ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+                _ = ir.intr(B, ir.IN_TRAP, T_void, []);
                 ir.unreachable(B);
             }
         }

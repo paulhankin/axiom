@@ -10,7 +10,7 @@ import "copts.ax" as co;
 import "ctypes.ax" as cty;
 import "cwide.ax" as cw;
 
-struct Filler {
+nocopy struct Filler {
     list: *mut cast.InitList,
     is_static: bool,
     constexpr_: bool,
@@ -31,11 +31,11 @@ pub struct InitResult {
     pub ty: *mut cty.CType,
 }
 
-// A subobject: its type, offset and bit-field (or nil).
+// A subobject: its type, offset and bit-field (or none).
 struct Sub {
     t: *mut cty.CType,
     off: u64,
-    bits: *mut cty.Member,
+    bits: ?*mut cty.Member,
 }
 
 // One level of the walk: an aggregate or union being filled, and the
@@ -46,8 +46,12 @@ struct Level {
     idx: u64,
 }
 
-fn no_bits() *mut cty.Member {
-    return u.nil.[cty.Member]();
+fn has_bits(bits: ?*mut cty.Member) bool {
+    if let .some(b) = bits {
+        _ = b;
+        return true;
+    }
+    return false;
 }
 
 /// The initializer `it` of an object of type t (static: of static storage
@@ -72,7 +76,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
                 err(x.span, "C3033", u.f1("an array (of type %s) is initialized by a brace-enclosed list", tq(t)));
             }
         } else {
-            expr_item(F, Sub.{ t: t, off: 0, bits: no_bits() }, rv(e));
+            expr_item(F, Sub.{ t: t, off: 0, bits: .none }, rv(e));
         }
         return InitResult.{ list: F.list, ty: ty };
     }
@@ -82,7 +86,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
         err(it.span, "C3033", u.f1("an initializer for an object of type %s", tq(t)));
         return InitResult.{ list: F.list, ty: ty };
     }
-    let n = fill_list(F, Sub.{ t: t, off: 0, bits: no_bits() }, it);
+    let n = fill_list(F, Sub.{ t: t, off: 0, bits: .none }, it);
     if (t.kind == cty.TK_ARRAY) and not t.has_len {
         if (n == 0) and not F.errors {
             err(it.span, "C3033", "an array of unknown length whose initializer gives it no element");
@@ -193,9 +197,9 @@ fn zero_if_copied(F: *mut Filler, off: u64, t: *mut cty.CType) void {
         return;
     }
     let size = cty.size_of(t);
-    for it in F.list.items.items() {
+    for &it in F.list.items.items() {
         if cty.is_record(it.ty) and u.notnil(it.e) and (it.off <= off) and (off + size <= it.off + cty.size_of(it.ty)) {
-            push(F, cast.InitItem.{ off: off, ty: t, e: u.nil.[cast.Expr](), bits: no_bits() });
+            push(F, cast.InitItem.{ off: off, ty: t, e: u.nil.[cast.Expr](), bits: u.nil.[cty.Member]() });
             return;
         }
     }
@@ -236,7 +240,7 @@ fn string_item(F: *mut Filler, t: *mut cty.CType, off: u64, e: *mut cast.Expr) *
     }
     drop_inside(F, off, cty.size_of(ty));
     zero_if_copied(F, off, ty);
-    push(F, cast.InitItem.{ off: off, ty: ty, e: x, bits: no_bits() });
+    push(F, cast.InitItem.{ off: off, ty: ty, e: x, bits: u.nil.[cty.Member]() });
     return ty;
 }
 
@@ -255,12 +259,11 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
     if cty.is_record(t) and (F.constexpr_ or F.is_static) and (x.kind == cast.ExprKind.CAST) and
        (x.op == cast.CV_LOAD) {
         // a named constant of structure or union type (C23 6.6p7): its items
-        let o = object_of(x.a);
-        if u.notnil(o.sym) {
+        if let .some(o) = object_of(x.a) {
             drop_inside(F, s.off, cty.size_of(t));
             F.list.zero = true;  // (what its items do not cover is zero)
             let size = cty.size_of(t);
-            for it in o.sym.init.items.items() {
+            for &mut it in o.sym.init.items.items_mut() {
                 if (it.off >= o.off) and (it.off + cty.size_of(it.ty) <= o.off + size) {
                     push(F, cast.InitItem.{ off: s.off + (it.off - o.off), ty: it.ty, e: it.e, bits: it.bits });
                 }
@@ -276,7 +279,7 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
         if not constexpr_value(e, x, t) {
             F.errors = true;
         }
-    } else if F.is_static and (not constant(x, t) or (u.notnil(s.bits) and not x.is_const)) {
+    } else if F.is_static and (not constant(x, t) or (has_bits(s.bits) and not x.is_const)) {
         err(x.span, "C3031", "the initializer of an object with static storage duration is not a constant");
         F.errors = true;
     } else if F.is_static and not const_in_range(x) {
@@ -290,7 +293,7 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
     if cty.is_record(t) or cty.is_vector(t) {
         drop_inside(F, s.off, cty.size_of(t));
     }
-    push(F, cast.InitItem.{ off: s.off, ty: t, e: x, bits: s.bits });
+    push(F, cast.InitItem.{ off: s.off, ty: t, e: x, bits: s.bits ?? u.nil.[cty.Member]() });
 }
 
 // The items of compound literal c (of subobject s's type) for subobject s
@@ -298,10 +301,10 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
 // (a GNU dialect); false (nothing done) if one is not.
 fn literal_items(F: *mut Filler, s: Sub, c: *mut cast.Expr) bool {
     let l = c.sym.init;
-    if u.isnil(l) or u.notnil(s.bits) {
+    if u.isnil(l) or has_bits(s.bits) {
         return false;
     }
-    for it in l.items.items() {
+    for &mut it in l.items.items_mut() {
         if u.notnil(it.e) and not constant(it.e, it.ty) and
            not ((it.ty.kind == cty.TK_ARRAY) and (it.e.kind == cast.ExprKind.STRING)) {
             return false;
@@ -313,8 +316,8 @@ fn literal_items(F: *mut Filler, s: Sub, c: *mut cast.Expr) bool {
         return true;
     }
     push(F, cast.InitItem.{ off: s.off, ty: cty.array_of(cty.t_uchar, size, true), e: u.nil.[cast.Expr](),
-                            bits: no_bits() });
-    for it in l.items.items() {
+                            bits: u.nil.[cty.Member]() });
+    for &mut it in l.items.items_mut() {
         push(F, cast.InitItem.{ off: s.off + it.off, ty: it.ty, e: it.e, bits: it.bits });
     }
     return true;

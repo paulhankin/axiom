@@ -152,14 +152,15 @@ fn va_sty(t: *mut cty.CType) *mut ir.Ty {
 fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: []mut *mut ir.Value) *mut ir.Value {
     let nt = p.tys.len;
     let args = u.newn.[*mut ir.Value](nt + 1);
-    let mut res = ir.vnil();
+    let mut res: ?*mut ir.Value = .none;
     let mut vb = ir.vnil();
     for k in 0..nt {
         let w = p.what.get(k);
         let t = p.tys.get(k);
         if w == abi.SL_RET {
-            res = alloca(p.rty, "ret");
-            args[k] = res;
+            let buf = alloca(p.rty, "ret");
+            res = .some(buf);
+            args[k] = buf;
         } else if w == abi.SL_VABUF {
             vb = va_buffer(p.vabuf_size + 8, 16);
             args[k] = vb;
@@ -219,12 +220,13 @@ fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: []mut
     // stack needs the stack pointer aligned to that at the call, as the
     // offsets of the plan assume; the stack is moved down by the remainder
     // and back after the call)
-    let mut sp0 = ir.vnil();
+    let mut sp0: ?*mut ir.Value = .none;
     if p.stack_align > 16 {
-        sp0 = ir.intr(B, ir.IN_STACK_SAVE, T_ptr, no_vals());
-        let pad = ir.and_(B, ir.ptrtoint(B, sp0, T_isz), usz(p.stack_align - 1));
+        let saved = ir.intr(B, ir.IN_STACK_SAVE, T_ptr, []);
+        let pad = ir.and_(B, ir.ptrtoint(B, saved, T_isz), usz(p.stack_align - 1));
         let mut one: [1]*mut ir.Value = [pad];
         _ = ir.intr(B, ir.IN_STACK_ALLOC, T_ptr, one[..]);
+        sp0 = .some(saved);
     }
     // (WebAssembly: the call's record on the shadow stack while it runs,
     // for stack traces; natively the frame table's chain)
@@ -253,20 +255,21 @@ fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: []mut
         }
     }
     let out = va_call_result(p, r, res);
-    if u.notnil(sp0) {
-        let mut one: [1]*mut ir.Value = [sp0];
+    if let .some(saved) = sp0 {
+        let mut one: [1]*mut ir.Value = [saved];
         _ = ir.intr(B, ir.IN_STACK_RESTORE, T_void, one[..]);
     }
     return out;
 }
 
 // The C value of the result of call r (plan p; res: the result's memory, R_SRET).
-fn va_call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.Value {
+fn va_call_result(p: *mut abi.Plan, r: *mut ir.Value, res: ?*mut ir.Value) *mut ir.Value {
     if p.ret == abi.R_SRET {
+        let sret = res ?? ir.vnil();
         if cty.is_wint(p.rty) {
-            wint_norm(p.rty, res);  // (see enter_function)
+            wint_norm(p.rty, sret);  // (see enter_function)
         }
-        return res;
+        return sret;
     }
     if p.ret == abi.R_X87 {
         // st(0) (and st(1)) popped into the result's memory (padding zero)
@@ -373,12 +376,12 @@ fn va_start_ap(ap: *mut ir.Value) void {
 /// its parameters ps (each one's ir set), the result's address (the
 /// returned value: R_SRET), and for a variadic function the registers its
 /// variadic arguments may be in, saved.
-fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, variadic: bool) *mut ir.Value {
+fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, variadic: bool) ?*mut ir.Value {
     VA = VaState.{ p: p, f: f, on: variadic, save: ir.vnil(), args: ir.vnil(), from: ir.vnil() };
-    let mut res = ir.vnil();
+    let mut res: ?*mut ir.Value = .none;
     for k in 0..p.what.len {
         if p.what.get(k) == abi.SL_RET {
-            res = f.params[k];
+            res = .some(f.params[k]);
         }
     }
     for i in 0..ps.len {
@@ -459,7 +462,7 @@ fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, varia
 }
 
 fn va_frame_args() *mut ir.Value {
-    let fa = ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, no_vals());
+    let fa = ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, []);
     return va_at(fa, 16);
 }
 
@@ -507,14 +510,17 @@ fn va_save_registers(p: *mut abi.Plan, f: *mut ir.Func) void {
     }
 }
 
-/// Returns value v (a scalar, or a structure's address; nil: none) of the
+/// Returns value v (a scalar, or a structure's address; .none: none) of the
 /// function with plan p, whose result's address is res.
-fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
+fn ret_value(p: *mut abi.Plan, res: ?*mut ir.Value, ov: ?*mut ir.Value) void {
     if p.ret == abi.R_VOID {
         ir.ret_void(B);
         return;
     }
-    if u.isnil(v) {
+    let mut v = ir.vnil();
+    if let .some(val) = ov {
+        v = val;
+    } else {
         ret_default(p, res);
         return;
     }
@@ -553,9 +559,10 @@ fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
         va_ret_regs(p, xs[..]);
         return;
     }
-    va_copy_bytes(res, v, size);
+    let sret = res ?? ir.vnil();
+    va_copy_bytes(sret, v, size);
     if p.ret_ptr {
-        ir.ret(B, res);
+        ir.ret(B, sret);
         return;
     }
     ir.ret_void(B);
@@ -563,7 +570,7 @@ fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
 
 /// The return at the end of a function body (plan p) that has none: the
 /// value is undefined (6.9.1p12), main's is 0 (it returns int).
-fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
+fn ret_default(p: *mut abi.Plan, res: ?*mut ir.Value) void {
     if p.ret == abi.R_SCALAR {
         ir.ret(B, ir.czero(p.rpieces[0].ty));
     } else if p.ret == abi.R_X87 {
@@ -580,7 +587,7 @@ fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
         }
         va_ret_regs(p, xs[..]);
     } else if (p.ret == abi.R_SRET) and p.ret_ptr {
-        ir.ret(B, res);
+        ir.ret(B, res ?? ir.vnil());
     } else {
         ir.ret_void(B);
     }

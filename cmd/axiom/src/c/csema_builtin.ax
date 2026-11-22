@@ -93,12 +93,17 @@ fn add_tag_member(ti: *mut cty.TagInfo, name: []u8, t: *mut cty.CType) void {
 
 /// The type __builtin_va_list names: the target's va_list.
 pub fn va_list_type() *mut cty.CType {
-    if u.notnil(g_va_list) and (g_va_for == cty.t_int) {
-        return g_va_list;
+    if let .some(vt) = g_va_list {
+        if let .some(vf) = g_va_for {
+            if vf == cty.t_int {
+                return vt;
+            }
+        }
     }
-    g_va_for = cty.t_int;
+    g_va_for = .some(cty.t_int);
     let sp = u.mkspan(0, 0, 0);
     let vp = cty.pointer_to(cty.t_void);
+    let mut res = cty.t_void;
     if (tg.g_arch == tg.ARCH_X64) and not tg.is_windows() {
         let t = cty.new_tagged(cty.TK_STRUCT, "__va_list_tag", sp);
         // (32-bit unsigned fields: unsigned int, or the 32-bit type when int is not)
@@ -111,7 +116,7 @@ pub fn va_list_type() *mut cty.CType {
         add_tag_member(t.tag, "overflow_arg_area", vp);
         add_tag_member(t.tag, "reg_save_area", vp);
         cty.layout(t.tag);
-        g_va_list = cty.array_of(t, 1, true);
+        res = cty.array_of(t, 1, true);
     } else if (tg.g_arch == tg.ARCH_A64) and not tg.is_darwin() and not tg.is_windows() {
         let t = cty.new_tagged(cty.TK_STRUCT, "__va_list", sp);
         let mut w = cty.t_int;
@@ -124,46 +129,47 @@ pub fn va_list_type() *mut cty.CType {
         add_tag_member(t.tag, "__gr_offs", w);
         add_tag_member(t.tag, "__vr_offs", w);
         cty.layout(t.tag);
-        g_va_list = t;
+        res = t;
     } else {
-        g_va_list = cty.pointer_to(cty.t_char);
+        res = cty.pointer_to(cty.t_char);
     }
-    return g_va_list;
+    g_va_list = .some(res);
+    return res;
 }
 
 // The va_list operand x of builtin `what`, as a pointer to the va_list
-// object (nil after an error, reported).
-fn va_operand(x: *mut cast.Expr, what: []u8) *mut cast.Expr {
+// object (.none after an error, reported).
+fn va_operand(x: *mut cast.Expr, what: []u8) ?*mut cast.Expr {
     let vt = va_list_type();
     if vt.kind == cty.TK_ARRAY {
         let v = rv(x);
         if is_err(v) {
-            return u.nil.[cast.Expr]();
+            return .none;
         }
         if (v.ty.kind == cty.TK_POINTER) and cty.compatible_unq(v.ty.elem, vt.elem) {
-            return v;
+            return .some(v);
         }
         err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, tq(v.ty)));
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     let v = expr_check(x);
     if is_err(v) {
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     if not cty.compatible_unq(v.ty, vt) {
         err(x.span, "C3080", u.f2("the operand of %s has type %s, not va_list", what, tq(v.ty)));
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     if not v.lvalue {
         err(x.span, "C3080", u.f1("the operand of %s is not an object (an lvalue of type va_list)", what));
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     let a = cast.new_expr(cast.ExprKind.UNARY, x.span);
     a.op = ct.P_AMP;
     a.a = v;
     a.ty = cty.pointer_to(v.ty);
     a.height = v.height + 1;
-    return a;
+    return .some(a);
 }
 
 // -----------------------------------------------------------------------------
@@ -371,26 +377,32 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
         _ = bad_expr(e);
         return;
     }
-    let ap = va_operand(e.args.get(0), what);
-    if u.isnil(ap) {
+    if let .some(ap) = va_operand(e.args.get(0), what) {
+        e.args.set(0, ap);
+    } else {
         _ = bad_expr(e);
         return;
     }
-    e.args.set(0, ap);
     if id == BI_VA_COPY {
-        let src = va_operand(e.args.get(1), what);
-        if u.isnil(src) {
+        if let .some(src) = va_operand(e.args.get(1), what) {
+            e.args.set(1, src);
+        } else {
             _ = bad_expr(e);
-            return;
         }
-        e.args.set(1, src);
         return;
     }
     if id != BI_VA_START {
         return;
     }
-    let f = cur_fn();
-    if u.isnil(f) or not f.ty.variadic {
+    let mut is_va = false;
+    let mut last_param: []u8 = "";
+    if let .some(cfn) = cur_fn() {
+        is_va = cfn.ty.variadic;
+        if cfn.params.len > 0 {
+            last_param = cfn.params.get(cfn.params.len - 1).name;
+        }
+    }
+    if not is_va {
         err(e.span, "C3080", "va_start in a function whose parameters do not end with '...'");
         _ = bad_expr(e);
         return;
@@ -405,11 +417,7 @@ fn va_call(e: *mut cast.Expr, id: i32) void {
     }
     // C89-C17: the second is the last named parameter (6.10.1.4: undefined otherwise)
     let p = e.args.get(1);
-    let n = f.params.len;
-    let mut ok = (p.kind == cast.ExprKind.IDENT) and (n > 0);
-    if ok {
-        ok = u.str_eq(p.name, f.params.get(n - 1).name);
-    }
+    let ok = (p.kind == cast.ExprKind.IDENT) and (last_param.len > 0) and u.str_eq(p.name, last_param);
     if not ok {
         warn(p.span, "C4080", "the second argument of va_start is not the last parameter of the function");
     }
@@ -514,12 +522,16 @@ fn builtin_special(e: *mut cast.Expr) *mut cast.Expr {
 }
 
 fn va_arg(e: *mut cast.Expr) *mut cast.Expr {
-    let ap = va_operand(e.a, "va_arg");
+    let oap = va_operand(e.a, "va_arg");
     let t = type_name(e.tname);
-    if u.isnil(ap) or cty.is_error(t) {
+    if cty.is_error(t) {
         return bad_expr(e);
     }
-    e.a = ap;
+    if let .some(ap) = oap {
+        e.a = ap;
+    } else {
+        return bad_expr(e);
+    }
     if cty.is_func(t) or (t.kind == cty.TK_ARRAY) or not cty.is_complete(t) {
         err(e.tname.span, "C3080", u.f1("va_arg of type %s (a complete object type that is not an array is needed)",
                                         tq(t)));

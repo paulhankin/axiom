@@ -70,19 +70,16 @@ fn is_function_declarator(d: *cast.Declarator) bool {
 }
 
 // A declaration in context ctx (CTX_FILE: an external declaration, which
-// may be a function definition), from its attributes to its ';'. Nil if
+// may be a function definition), from its attributes to its ';'. .none if
 // there was nothing to take but an error.
-fn parse_declaration(P: *mut Parser, ctx: i32) *mut cast.Decl {
+fn parse_declaration(P: *mut Parser, ctx: i32) ?*mut cast.Decl {
     let start = cur(P).span;
     let mut attrs = u.List.[*mut cast.Attr].empty();
     while at_kw(P, ct.K_EXTENSION) {
         _ = advance(P);
     }
     if at_kw(P, ct.K_ASM) and (ctx == CTX_FILE) {
-        let a = asm_statement(P);
-        if u.isnil(a) {
-            return u.nil.[cast.Decl]();
-        }
+        let a = asm_statement(P) ?? return .none;
         let d = cast.new_decl(cast.DeclKind.ASM, a.span);
         d.asm = a;
         return d;
@@ -121,7 +118,7 @@ fn parse_local_labels(P: *mut Parser, ctx: i32, start: u.Span) *mut cast.Decl {
     return d;
 }
 
-fn parse_declaration_after(P: *mut Parser, ctx: i32, attrs: u.List.[*mut cast.Attr], start: u.Span) *mut cast.Decl {
+fn parse_declaration_after(P: *mut Parser, ctx: i32, attrs: u.List.[*mut cast.Attr], start: u.Span) ?*mut cast.Decl {
     while at_kw(P, ct.K_EXTENSION) {
         _ = advance(P);
     }
@@ -155,7 +152,7 @@ fn parse_declaration_after(P: *mut Parser, ctx: i32, attrs: u.List.[*mut cast.At
         }
         syntax(P, u.pick(ctx == CTX_MEMBER, "a member declaration", "a declaration"));
         sync(P);
-        return u.nil.[cast.Decl]();
+        return .none;
     }
     check_implicit_int(P, d.specs);
     if at_p(P, ct.P_SEMI) {
@@ -172,7 +169,7 @@ fn parse_declaration_after(P: *mut Parser, ctx: i32, attrs: u.List.[*mut cast.At
 // A member declaration with no declarator: an anonymous structure or union
 // (C11), when its specifier is an untagged struct or union with a body.
 fn check_anonymous_member(P: *Parser, ds: *cast.DeclSpec) void {
-    for s in ds.items.items() {
+    for &s in ds.items.items() {
         if (s.kind == cast.SpecKind.TAG) and (s.kw != ct.K_ENUM) and s.tag.has_body and (s.tag.name.len == 0) {
             feature(P, co.C11, s.span, "C2127", "anonymous structures and unions are");
         }
@@ -180,7 +177,7 @@ fn check_anonymous_member(P: *Parser, ds: *cast.DeclSpec) void {
 }
 
 // A declaration without specifiers at file scope (at its declarator).
-fn parse_unspecified(P: *mut Parser, d: *mut cast.Decl, start: u.Span) *mut cast.Decl {
+fn parse_unspecified(P: *mut Parser, d: *mut cast.Decl, start: u.Span) ?*mut cast.Decl {
     let dc = parse_declarator(P, D_CONCRETE);
     if is_function_declarator(dc) and (at_p(P, ct.P_LBRACE) or (dc.derivs.at(0).id_list and starts_specs(P, 0))) {
         if P.std >= co.C99 {
@@ -191,7 +188,23 @@ fn parse_unspecified(P: *mut Parser, d: *mut cast.Decl, start: u.Span) *mut cast
     }
     error_at(dc.span, "C2024", "a declaration needs a type specifier or a storage-class specifier");
     sync(P);
-    return u.nil.[cast.Decl]();
+    return .none;
+}
+
+fn parse_init_declarator(P: *mut Parser, ctx: i32) *mut cast.Declarator {
+    if (ctx == CTX_MEMBER) and at_p(P, ct.P_COLON) {
+        // an unnamed bit-field
+        let dc = u.new.[cast.Declarator]();
+        dc.name = "";
+        dc.span = cur(P).span;
+        dc.name_span = dc.span;
+        return dc;
+    }
+    let dc = parse_declarator(P, D_CONCRETE);
+    gnu_attrs(P, &mut dc.attrs);
+    asm_label(P, dc);
+    gnu_attrs(P, &mut dc.attrs);
+    return dc;
 }
 
 // The init-declarators (or member declarators) of a declaration after its
@@ -199,19 +212,7 @@ fn parse_unspecified(P: *mut Parser, d: *mut cast.Decl, start: u.Span) *mut cast
 fn parse_init_declarators(P: *mut Parser, d: *mut cast.Decl, ctx: i32, start: u.Span) *mut cast.Decl {
     let is_type = (d.specs.storage & cast.SC_TYPEDEF) != 0;
     loop {
-        let mut dc = u.nil.[cast.Declarator]();
-        if (ctx == CTX_MEMBER) and at_p(P, ct.P_COLON) {
-            // an unnamed bit-field
-            dc = u.new.[cast.Declarator]();
-            dc.name = "";
-            dc.span = cur(P).span;
-            dc.name_span = dc.span;
-        } else {
-            dc = parse_declarator(P, D_CONCRETE);
-            gnu_attrs(P, &mut dc.attrs);
-            asm_label(P, dc);
-            gnu_attrs(P, &mut dc.attrs);
-        }
+        let dc = parse_init_declarator(P, ctx);
         if (d.decls.len == 0) and is_function_declarator(dc) and (ctx != CTX_MEMBER) and (ctx != CTX_KR) and
            (ctx != CTX_FOR) and (at_p(P, ct.P_LBRACE) or (dc.derivs.at(0).id_list and starts_specs(P, 0))) {
             return parse_function_def(P, d, dc, ctx, start);
@@ -258,13 +259,12 @@ fn parse_function_def(P: *mut Parser, d: *mut cast.Decl, dc: *mut cast.Declarato
     push_scope(P);
     let fd = dc.derivs.at(0);
     if fd.id_list {
-        for x in fd.ids.items() {
+        for &x in fd.ids.items() {
             declare(P, x.name, false);
         }
         while not at_p(P, ct.P_LBRACE) and not at_eof(P) {
             let before = P.pos;
-            let kd = parse_declaration(P, CTX_KR);
-            if u.notnil(kd) {
+            if let .some(kd) = parse_declaration(P, CTX_KR) {
                 d.kr_decls.push(kd);
             }
             if P.pos == before {
@@ -338,17 +338,19 @@ fn parse_initializer(P: *mut Parser) *mut cast.Init {
             if at_p(P, ct.P_LBRACKET) {
                 let sp = advance(P).span;
                 let e = parse_cond(P);
-                let mut e2 = u.nil.[cast.Expr]();
+                let mut e2: ?*mut cast.Expr = .none;
                 if P.gnu and accept_p(P, ct.P_ELLIPSIS) {
                     // `[first ... last]` (a GNU dialect)
                     e2 = parse_cond(P);
                 }
                 _ = expect_p(P, ct.P_RBRACKET);
-                let mut k = cast.DesigKind.INDEX;
-                if u.notnil(e2) {
-                    k = cast.DesigKind.RANGE;
+                if let .some(e2x) = e2 {
+                    desigs.push(cast.Designator.{ kind: cast.DesigKind.RANGE, span: span_from(P, sp), e: e, name: "",
+                                                  e2: e2x });
+                } else {
+                    desigs.push(cast.Designator.{ kind: cast.DesigKind.INDEX, span: span_from(P, sp), e: e, name: "",
+                                                  e2: u.nil.[cast.Expr]() });
                 }
-                desigs.push(cast.Designator.{ kind: k, span: span_from(P, sp), e: e, name: "", e2: e2 });
                 continue;
             }
             if at_p(P, ct.P_DOT) {

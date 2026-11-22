@@ -28,10 +28,10 @@ import "cast.ax" as cast;
 import "cgen_debug.ax" as cdbg;
 import "ctypes.ax" as cty;
 
-struct VlaState {
-    lens: u.SymMap.[*mut ir.Value],  // a length's slot, by its expression's address
-    chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope (nil: a cleanup's place)
-    calls: u.List.[*mut cast.Expr],  // for each place in chain, a cleanup's call (nil: an allocation's)
+nocopy struct VlaState {
+    lens: u.SymMap.[?*mut ir.Value],  // a length's slot, by its expression's address
+    chain: u.List.[?*mut ir.Value],   // the stack pointers saved before the allocations in scope (.none: a cleanup's place)
+    calls: u.List.[?*mut cast.Expr],  // for each place in chain, a cleanup's call (.none: an allocation's)
     cut: i32,  // while the cleanup at this place is called: the places before it (else -1)
 }
 
@@ -43,7 +43,7 @@ fn vla_key(p: *void) []u8 {
 fn vla_begin_function() void {
     VS = u.new.[VlaState]();
     VS.cut = -1;
-    VS.lens = u.SymMap.[*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Value](), cap: 0, len: 0 };
+    VS.lens = u.SymMap.[?*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[?*mut ir.Value](), cap: 0, len: 0 };
 }
 
 // -----------------------------------------------------------------------------
@@ -104,27 +104,26 @@ fn vla_eval_type_name(tn: *mut cast.TypeName) void {
 // being generated.
 fn vla_len_addr(n: *mut void) *mut ir.Value {
     let k = vla_key(n);
-    let mut s = VS.lens.get(k);
-    if u.isnil(s) {
-        s = alloca(cty.t_size, "vla.len");
-        cdbg.note_vla_len(n, s);
-        VS.lens.put(k, s);
+    if let .some(s) = VS.lens.get(k) {
+        return s;
     }
+    let s = alloca(cty.t_size, "vla.len");
+    cdbg.note_vla_len(n, s);
+    VS.lens.put(k, .some(s));
     return s;
 }
 
 fn vla_slot(t: *cty.CType) *mut ir.Value {
     let k = vla_key(t.vexpr);
-    let mut s = VS.lens.get(k);
-    if u.isnil(s) {
-        let o = outer_len(t.vexpr);  // (an enclosing function's, in a nested function)
-        if u.notnil(o) {
-            return o;
-        }
-        s = alloca(cty.t_size, "vla.len");
-        cdbg.note_vla_len(t.vexpr, s);
-        VS.lens.put(k, s);
+    if let .some(s) = VS.lens.get(k) {
+        return s;
     }
+    if let .some(o) = outer_len(t.vexpr) {  // (an enclosing function's, in a nested function)
+        return o;
+    }
+    let s = alloca(cty.t_size, "vla.len");
+    cdbg.note_vla_len(t.vexpr, s);
+    VS.lens.put(k, .some(s));
     return s;
 }
 
@@ -173,8 +172,8 @@ fn vla_depth() i32 {
 // (its type's alignment, or an alignment specifier's); its address.
 fn vla_allocate(t: *cty.CType, al: u64) *mut ir.Value {
     let size = vla_size_value(t);
-    VS.chain.push(ir.intr(B, ir.IN_STACK_SAVE, T_ptr, no_vals()));
-    VS.calls.push(u.nil.[cast.Expr]());
+    VS.chain.push(.some(ir.intr(B, ir.IN_STACK_SAVE, T_ptr, [])));
+    VS.calls.push(.none);
     let mut n = size;
     if al > 16 {
         n = ir.add(B, n, usz(al - 16));  // (the stack keeps 16 bytes' alignment)
@@ -192,8 +191,8 @@ fn vla_allocate(t: *cty.CType, al: u64) *mut ir.Value {
 // An object with a cleanup comes in scope: its call (typed: csema_gnu.ax)
 // is made when the scope is left.
 fn vla_push_cleanup(call: *mut cast.Expr) void {
-    VS.chain.push(ir.vnil());
-    VS.calls.push(call);
+    VS.chain.push(.none);
+    VS.calls.push(.some(call));
 }
 
 // Releases the allocations beyond the first d in scope, and makes the
@@ -206,8 +205,7 @@ fn vla_release_to(d: i32) void {
     let mut k = VS.chain.len;
     while k > @int_cast(usize, d) {
         k -= 1;
-        let c = VS.calls.get(k);
-        if u.notnil(c) {
+        if let .some(c) = VS.calls.get(k) {
             let oc = VS.cut;
             VS.cut = @int_cast(i32, k);  // (its own scope is left: snapshot)
             _ = rv(c);
@@ -219,8 +217,7 @@ fn vla_release_to(d: i32) void {
     }
     // the stack pointer back to before the first allocation among them
     for j in @int_cast(usize, d)..VS.chain.len {
-        let sp = VS.chain.get(j);
-        if u.notnil(sp) {
+        if let .some(sp) = VS.chain.get(j) {
             let mut args: [1]*mut ir.Value = [sp];
             _ = ir.intr(B, ir.IN_STACK_RESTORE, T_void, args[..]);
             return;
@@ -241,7 +238,8 @@ fn vla_leave(d: i32) void {
 // Are there cleanups in scope (a return must make their calls)?
 fn vla_has_cleanups() bool {
     for c in VS.calls.items() {
-        if u.notnil(c) {
+        if let .some(x) = c {
+            _ = x;
             return true;
         }
     }
@@ -249,30 +247,34 @@ fn vla_has_cleanups() bool {
 }
 
 // What is in scope at a point, kept (a non-local goto's: cgen_nest.ax).
-struct VlaSaved {
-    chain: []mut *mut ir.Value,
-    calls: []mut *mut cast.Expr,
+nocopy struct VlaSaved {
+    chain: []mut ?*mut ir.Value,
+    calls: []mut ?*mut cast.Expr,
 }
 
 // The places in scope here (inside a cleanup's call, those before it).
-fn vla_snapshot() *mut void {
+fn vla_snapshot() *mut VlaSaved {
     let mut n = VS.chain.len;
     if (VS.cut >= 0) and (@int_cast(usize, VS.cut) < n) {
         n = @int_cast(usize, VS.cut);
     }
     let x = u.new.[VlaSaved]();
-    x.chain = u.newn.[*mut ir.Value](n + 1)[0..n];
-    x.calls = u.newn.[*mut cast.Expr](n + 1)[0..n];
+    if n == 0 {
+        x.chain = [];
+        x.calls = [];
+        return x;
+    }
+    x.chain = u.newn.[?*mut ir.Value](n)[0..n];
+    x.calls = u.newn.[?*mut cast.Expr](n)[0..n];
     for i in 0..n {
         x.chain[i] = VS.chain.get(i);
         x.calls[i] = VS.calls.get(i);
     }
-    return @ptr_cast(*mut void, x);
+    return x;
 }
 
 // Makes snapshot x what is in scope (to generate a jump from there).
-fn vla_restore(x0: *mut void) void {
-    let x = @ptr_cast(*mut VlaSaved, x0);
+fn vla_restore(x: *VlaSaved) void {
     VS.chain.clear();
     VS.calls.clear();
     for i in 0..x.chain.len {
@@ -283,14 +285,12 @@ fn vla_restore(x0: *mut void) void {
 
 // Is what snapshot a has in scope the first of what snapshot b has: may a
 // goto jump from b's point to a's without entering a scope (6.8.6.1p1)?
-fn vla_is_prefix(a0: *mut void, b0: *mut void) bool {
-    let a = @ptr_cast(*mut VlaSaved, a0);
-    let b = @ptr_cast(*mut VlaSaved, b0);
+fn vla_is_prefix(a: *VlaSaved, b: *VlaSaved) bool {
     if a.chain.len > b.chain.len {
         return false;
     }
     for i in 0..a.chain.len {
-        if (a.chain[i] != b.chain[i]) or (a.calls[i] != b.calls[i]) {
+        if not same_opt(a.chain[i], b.chain[i]) or not same_opt(a.calls[i], b.calls[i]) {
             return false;
         }
     }

@@ -71,9 +71,8 @@ pub let mut g_lib_globals: usize = 0;
 // Whether each unit is a library's (check: lib).
 let mut g_lib: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
 // The external names the units define (after link_check): the definition.
-let mut g_defs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                        vals: @ptr_from_int(*mut *mut cast.CSym, 0),
-                                                                        cap: 0, len: 0 };
+let mut g_defs: u.SymMap.[?*mut cast.CSym] = u.SymMap.[?*mut cast.CSym].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut ?*mut cast.CSym, 0), cap: 0, len: 0 };
 
 /// Is `emit` one of the C front end's text outputs (run makes them)?
 pub fn text_emit(emit: []u8) bool {
@@ -157,7 +156,7 @@ pub fn lib_defs(path: []u8, o: *co.COptions, json: bool) i32 {
 /// The external names the last unit checked uses and does not define.
 pub fn last_refs() [][]u8 {
     if g_units.len == 0 {
-        return u.nil_slice.[[]u8]();
+        return [];
     }
     return g_units.get(g_units.len - 1).refs.items();
 }
@@ -206,11 +205,11 @@ pub fn lib_options(o: *co.COptions) *co.COptions {
     lo.warn_pragmas = false;
     lo.asm_intel = false;
     lo.warn_format = 1;  // (its own calls checked for what is wrong, not the level-2 matters)
-    lo.defines = u.nil_slice.[co.Define]();
-    lo.include_dirs = u.nil_slice.[[]u8]();
+    lo.defines = [];
+    lo.include_dirs = [];
     lo.n_isystem = 0;
-    lo.after_dirs = u.nil_slice.[[]u8]();
-    lo.includes = u.nil_slice.[[]u8]();
+    lo.after_dirs = [];
+    lo.includes = [];
     lo.hosted = true;  // (its headers are all found)
     return lo;
 }
@@ -230,7 +229,7 @@ fn def_span(s: *cast.CSym) u.Span {
 /// program unit defines is dropped (the header). True if so (else
 /// reported).
 pub fn link_check(program: bool) bool {
-    g_defs = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    g_defs = u.SymMap.[?*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[?*mut cast.CSym](), cap: 0, len: 0 };
     let mut ok = true;
     // the program's units first, so that a library's definitions find theirs
     g_dropped = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
@@ -308,28 +307,27 @@ fn drop(s: *mut cast.CSym) void {
 // false).
 fn define(s: *mut cast.CSym, lib: bool, ok: *mut bool) void {
     let key = u.intern(s.name);
-    let prev = g_defs.get(key);
-    if u.isnil(prev) {
+    if let .some(prev) = g_defs.get(key) {
+        if lib and not is_lib_sym(prev) {
+            drop(s);  // the program defines it: the library's is not linked
+            return;
+        }
+        if s.weak {
+            drop(s);  // (of two weak ones, the first)
+            return;
+        }
+        if prev.weak {
+            drop(prev);
+            g_defs.put(key, s);
+            return;
+        }
+        let d = dg.err(def_span(s), "C3064",
+                       u.f1("'%s' is defined in two translation units (an external name has one definition)", s.name));
+        dg.note(d, def_span(prev), "the other definition");
+        ok.* = false;
+    } else {
         g_defs.put(key, s);
-        return;
     }
-    if lib and not is_lib_sym(prev) {
-        drop(s);  // the program defines it: the library's is not linked
-        return;
-    }
-    if s.weak {
-        drop(s);  // (of two weak ones, the first)
-        return;
-    }
-    if prev.weak {
-        drop(prev);
-        g_defs.put(key, s);
-        return;
-    }
-    let d = dg.err(def_span(s), "C3064",
-                   u.f1("'%s' is defined in two translation units (an external name has one definition)", s.name));
-    dg.note(d, def_span(prev), "the other definition");
-    ok.* = false;
 }
 
 // Is s (in g_defs) a library unit's definition?
@@ -356,7 +354,10 @@ fn is_lib_sym(s: *mut cast.CSym) bool {
 /// Does a unit define the external name `name` (after link_check)? (An
 /// assembly source's global symbol too.)
 pub fn defines(name: []u8) bool {
-    return u.notnil(g_defs.get(u.intern(name))) or (g_asm_defs.get(u.intern(name)) != 0);
+    if let .some = g_defs.get(u.intern(name)) {
+        return true;
+    }
+    return g_asm_defs.get(u.intern(name)) != 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -379,6 +380,20 @@ pub fn is_asm_source(path: []u8) bool {
     return (path.len > 2) and (u.ends(path, ".s") or u.ends(path, ".S"));
 }
 
+fn opt_mut[T](p: *mut T) ?*mut T {
+    if u.isnil(p) {
+        return .none;
+    }
+    return p;
+}
+
+fn assemble_native(text: []u8, intel: bool) *mut acr.Asm {
+    if tg.g_arch == tg.ARCH_X64 {
+        return asm86.assemble_file(text, intel);
+    }
+    return asm64.assemble_file(text);
+}
+
 /// Reads (and for a .S source preprocesses) the assembly source at `path`
 /// and assembles it for the target (on WebAssembly, the text format: module
 /// fields), to check it and learn its names; true if it has no errors
@@ -390,14 +405,12 @@ pub fn check_asm(path: []u8, o: *co.COptions) bool {
     if u.ends(path, ".S") {
         text = cpp.preprocess_asm(path, o);
         fid = cpp.asm_file_id();
-    } else {
-        let sf = u.load_file(path, u.nosym());
-        if u.isnil(sf) {
-            dg.emit_fatal(false, "E0211", u.f1("cannot read '%s'", path));
-            return false;
-        }
+    } else if let .some(sf) = opt_mut(u.load_file(path, u.nosym())) {
         text = sf.text;
         fid = sf.id;
+    } else {
+        dg.emit_fatal(false, "E0211", u.f1("cannot read '%s'", path));
+        return false;
     }
     if dg.error_count() > before {
         return false;
@@ -407,12 +420,7 @@ pub fn check_asm(path: []u8, o: *co.COptions) bool {
         return check_wasm_asm(text, fid);
     }
     let intel = (tg.g_arch == tg.ARCH_X64) and o.asm_intel;
-    let mut A = u.nil.[acr.Asm]();
-    if tg.g_arch == tg.ARCH_X64 {
-        A = asm86.assemble_file(text, intel);
-    } else {
-        A = asm64.assemble_file(text);
-    }
+    let A = assemble_native(text, intel);
     if acr.failed(A) {
         // (at its line: the text keeps the source's lines)
         let line = @max(A.err_line, 1);
@@ -429,13 +437,13 @@ pub fn check_asm(path: []u8, o: *co.COptions) bool {
         return false;
     }
     // its names: the global symbols it defines, and those it refers to and does not define
-    for d in A.defs.items() {
+    for &d in A.defs.items() {
         if (d.global or d.weak) and (d.sec >= 0) and not d.abs {
             g_asm_defs.put(u.intern(d.name), 1);
             g_asm_def_names.push(u.intern(d.name));
         }
     }
-    for r in A.relocs.items() {
+    for &r in A.relocs.items() {
         let k = A.names.get(u.intern(r.name));
         if (k == 0) or (A.defs.get(@int_cast(usize, k - 1)).sec < 0) {
             g_asm_refs.push(u.intern(r.name));
@@ -482,7 +490,7 @@ fn check_wasm_asm(text: []u8, fid: i32) bool {
         g_asm_defs.put(u.intern(f.name), 1);
         g_asm_def_names.push(u.intern(f.name));
     }
-    for im in W.imports.items() {
+    for &im in W.imports.items() {
         if u.str_eq(im.module, "env") {
             g_asm_refs.push(u.intern(im.name));
         }
@@ -518,17 +526,14 @@ pub struct AxName {
 pub fn boundary_check(names: []AxName, axiom_main: bool) bool {
     let mut ok = true;
     let mut gave_way = false;
-    for x in names {
+    for &x in names {
         let key = u.intern(x.name);
-        let s = g_defs.get(key);
-        if u.isnil(s) {
-            continue;
-        }
+        let s = g_defs.get(key) ?? continue;
         if is_lib_sym(s) {
             // (the program's Axiom module defines it: the C library's
             // definition is not linked, as for a program's C unit)
             drop(s);
-            g_defs.put(key, u.nil.[cast.CSym]());
+            g_defs.put(key, .none);
             gave_way = true;
             continue;
         }
@@ -542,23 +547,24 @@ pub fn boundary_check(names: []AxName, axiom_main: bool) bool {
             drop_from(cu);
         }
     }
-    let mu = main_unit();
-    if axiom_main and u.notnil(mu) {
-        _ = dg.err(def_span(mu.main), "C3066",
-                   "the program's main is the Axiom module's, and a C translation unit defines main too");
-        ok = false;
+    if axiom_main {
+        if let .some(mu) = main_unit() {
+            _ = dg.err(def_span(mu.main), "C3066",
+                       "the program's main is the Axiom module's, and a C translation unit defines main too");
+            ok = false;
+        }
     }
     return ok;
 }
 
-// The unit that defines main, or nil.
-fn main_unit() *mut cs.CUnit {
+// The unit that defines main, or .none.
+fn main_unit() ?*mut cs.CUnit {
     for cu in g_units.items() {
         if u.notnil(cu.main) {
             return cu;
         }
     }
-    return u.nil.[cs.CUnit]();
+    return .none;
 }
 
 /// Does a unit use an integer type wider than 64 bits (whose operations
@@ -582,7 +588,10 @@ pub fn uses_xfloat() bool {
 /// Does a unit define main, or an object linked with the program
 /// (set_object_main)?
 pub fn has_main() bool {
-    return u.notnil(main_unit()) or (cg.g_obj_main.len > 0);
+    if let .some = main_unit() {
+        return true;
+    }
+    return cg.g_obj_main.len > 0;
 }
 
 /// The program's main is an object's (main.ax: object_main), which no
@@ -603,10 +612,7 @@ pub fn set_object_main(name: []u8, nargs: i32, start: bool, o: *co.COptions) voi
 /// A unit defines main too, and object `obj` (set_object_main's caller
 /// found it there): C3064 at the unit's definition. False if so.
 pub fn second_main(obj: []u8) bool {
-    let mu = main_unit();
-    if u.isnil(mu) {
-        return true;
-    }
+    let mu = main_unit() ?? return true;
     _ = dg.err(def_span(mu.main), "C3064",
                u.f1("'main' is defined in a translation unit and in '%s' (an external name has one definition)", obj));
     return false;
@@ -683,9 +689,12 @@ pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut i
         g_lib_funcs = m.funcs.len;
         g_lib_globals = m.globals.len;
     }
-    let mu = main_unit();
-    if ok and (u.notnil(mu) or (cg.g_obj_main.len > 0)) {
-        ok = cg.generate_start(m, mu, wasm, ax_exit or defines("exit"));
+    if ok {
+        if let .some(mu) = main_unit() {
+            ok = cg.generate_start(m, mu, wasm, ax_exit or defines("exit"));
+        } else if cg.g_obj_main.len > 0 {
+            ok = cg.generate_start(m, u.nil.[cs.CUnit](), wasm, ax_exit or defines("exit"));
+        }
     }
     if ok {
         cgt.define_start(m);  // (a C program's or an Axiom program's: its threads' start calls it)

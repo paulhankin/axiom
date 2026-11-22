@@ -80,7 +80,7 @@ struct Macro {
 struct Ctx {
     toks: []lx.PTok,
     pos: usize,
-    mac: *mut Macro,  // enabled again when the context is left
+    mac: ?*mut Macro,  // enabled again when the context is left
 }
 
 struct Src {
@@ -106,11 +106,11 @@ struct Arg {
     done: bool,  // exp is computed
 }
 
-struct PP {
+nocopy struct PP {
     mac: bool,   // -g: the macros' definitions and the files recorded (u.g_macros)
     asm_: bool,  // preprocessing assembly (preprocess_asm): `#` and an unknown directive's line are a comment
     o: *co.COptions,
-    macros: u.SymMap.[*mut Macro],
+    macros: u.SymMap.[?*mut Macro],
     files: u.List.[Src],
     ctx: u.List.[Ctx],
     floor: usize,     // contexts below this are not read
@@ -118,43 +118,39 @@ struct PP {
     conds: u.List.[Cond],
     out: u.List.[lx.PTok],
     in_if: bool,  // expanding an #if expression: defined and __has_include are operators
-    asserts: u.SymMap.[*mut u.List.[[]u8]],  // a GNU dialect's assertions: each predicate's answers (answer_key)
+    asserts: u.SymMap.[?*mut u.List.[[]u8]],  // a GNU dialect's assertions: each predicate's answers (answer_key)
     collecting: i32,  // reading a macro invocation's arguments
     pend_bol: bool,   // a macro at the start of a line was replaced by nothing
     pend_space: bool,
     expanded: usize,  // tokens made since the last token of the text was read
     arg_depth: i32,
     fatal: bool,
-    loaded: u.SymMap.[*mut u.SourceFile],
+    loaded: u.SymMap.[?*mut u.SourceFile],
     inject: []lx.PTok,  // tokens a directive made (#embed), read before the file's
     inject_pos: usize,
     eof_tok: lx.PTok,
-    found_index: i32,                    // find_file: where it found the file (-1: not by the include path)
-    counter: i64,                        // __COUNTER__'s next value
-    base_file: []u8,                     // __BASE_FILE__
-    once: u.SymMap.[i32],                // the files of `#pragma once` (real paths)
-    pushed: u.SymMap.[*mut MacroStack],  // #pragma push_macro: each name's saved definitions
-    poisoned: u.SymMap.[i32],            // #pragma GCC poison
-    packs: u.List.[Pack],                // #pragma pack(push): the values saved
-    pack: u64,                           // the #pragma pack value in force (0: none)
-    vis: u.List.[u64],                   // #pragma GCC visibility push: the values saved
-    fnopts: u64,                         // #pragma GCC optimize and target: the options in force (cpragma.fn_options)
-    importing: bool,                     // a GNU dialect's #import is being read: its file is read once
-    fnopts_saved: u.List.[u64],          // #pragma GCC push_options: those saved
+    found_index: i32,                     // find_file: where it found the file (-1: not by the include path)
+    counter: i64,                         // __COUNTER__'s next value
+    base_file: []u8,                      // __BASE_FILE__
+    once: u.SymMap.[i32],                 // the files of `#pragma once` (real paths)
+    pushed: u.SymMap.[?*mut MacroStack],  // #pragma push_macro: each name's saved definitions
+    poisoned: u.SymMap.[i32],             // #pragma GCC poison
+    packs: u.List.[Pack],                 // #pragma pack(push): the values saved
+    pack: u64,                            // the #pragma pack value in force (0: none)
+    vis: u.List.[u64],                    // #pragma GCC visibility push: the values saved
+    fnopts: u64,                          // #pragma GCC optimize and target: the options in force (cpragma.fn_options)
+    importing: bool,                      // a GNU dialect's #import is being read: its file is read once
+    fnopts_saved: u.List.[u64],           // #pragma GCC push_options: those saved
 }
 
-// The definitions #pragma push_macro saved for a name (nil: it was not defined).
-struct MacroStack {
-    defs: u.List.[*mut Macro],
+// The definitions #pragma push_macro saved for a name (.none: it was not defined).
+nocopy struct MacroStack {
+    defs: u.List.[?*mut Macro],
 }
 
 struct Pack {
     value: u64,
     id: []u8,  // `push, identifier`: the name of the entry (empty if none)
-}
-
-fn nilmac() *mut Macro {
-    return u.nil.[Macro]();
 }
 
 // -----------------------------------------------------------------------------
@@ -185,7 +181,7 @@ let mut g_deps_on: bool = false;
 pub let mut g_lib_unit: bool = false;
 
 // The preprocessor of the last unit preprocessed (for macros_text).
-let mut g_last: *mut PP = @ptr_from_int(*mut PP, 0);
+let mut g_last: ?*mut PP = .none;
 
 // The names whose macro of the system's headers the program has used
 // (keyword_away: one warning each).
@@ -360,7 +356,7 @@ pub fn preprocess_asm(path: []u8, o: *co.COptions) []u8 {
     let mut b = u.Buf.init();
     let mut line: i32 = 1;
     let mut first = true;
-    for t in g_asm_out.items() {
+    for &t in g_asm_out.items() {
         if t.kind == lx.PK_EOF {
             break;
         }
@@ -403,17 +399,17 @@ pub fn asm_file_id() i32 {
 /// unit's (not those the preprocessor itself replaces, __LINE__ ...).
 pub fn macros_text() []u8 {
     let mut lines = u.List.[[]u8].empty();
-    if u.isnil(g_last) {
-        return "";
-    }
-    let P = g_last;
+    let P = g_last ?? return "";
     let ks = @slice_from_ptr(P.macros.keys, P.macros.cap);
     let vs = @slice_from_ptr(P.macros.vals, P.macros.cap);
     for k in 0..P.macros.cap {
-        if (ks[k] == 0) or u.isnil(vs[k]) or (vs[k].builtin != 0) {
+        if ks[k] == 0 {
             continue;
         }
-        let m = vs[k];
+        let m = vs[k] ?? continue;
+        if m.builtin != 0 {
+            continue;
+        }
         let mut b = u.Buf.init();
         b.s("#define ");
         b.s(m.name);
@@ -466,14 +462,14 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     let mac0 = u.g_macros.len;
     P.eof_tok = lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
     P.eof_tok.bol = true;
-    P.inject = u.nil_slice.[lx.PTok]();
+    P.inject = [];
     lx.gnu = o.gnu;
     ct.g_no_ext_float = o.system_lib and not tg.is_darwin() and not o.gnu_compat;
     ct.g_declspec = o.declspec;
     ct.g_iso_names = o.iso_names;
     cout.g_line_directive = not o.gnu;
-    P.asserts = u.SymMap.[*mut u.List.[[]u8]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[[]u8]](), cap: 0,
-                                                len: 0 };
+    P.asserts = u.SymMap.[?*mut u.List.[[]u8]].{ keys: u.nil.[usize](), vals: u.nil.[?*mut u.List.[[]u8]](), cap: 0,
+                                                 len: 0 };
     if o.gnu {
         target_assertions(P);
     }
@@ -514,12 +510,14 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     run_file(P);
     _ = P.files.pop();
     P.out.clear();
-    let sf = load(P, path);
-    if P.mac and u.isnil(sf) {
-        u.g_macros.len = mac0;
-        P.mac = false;
-    }
-    if u.isnil(sf) {
+    let mut sf: *mut u.SourceFile = undefined;
+    if let .some(loaded) = load(P, path) {
+        sf = loaded;
+    } else {
+        if P.mac {
+            u.g_macros.len = mac0;
+            P.mac = false;
+        }
         dg.emit_fatal(false, "E0211", u.f1("cannot read '%s'", path));
         cv.convert(P.out.items(), o, &mut toks);
         return toks;
@@ -539,15 +537,17 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
         } else {
             ip = find_file_from(P, name, 0);
         }
-        let isf = load(P, u.pick(u.isnos(ip), name, ip));
-        if u.isnos(ip) or u.isnil(isf) {
-            _ = dg.err(u.mkspan(sf.id, 0, 0), "C1081",
-                       u.f1("cannot find the file \"%s\" to include before the source (--c-include)", name));
-            continue;
+        let mis = load(P, u.pick(u.isnos(ip), name, ip));
+        if not u.isnos(ip) {
+            if let .some(isf) = mis {
+                push_file(P, isf, ip);
+                cur_src(P).dir_index = P.found_index;
+                note_dep(P, ip, false);
+                continue;
+            }
         }
-        push_file(P, isf, ip);
-        cur_src(P).dir_index = P.found_index;
-        note_dep(P, ip, false);
+        _ = dg.err(u.mkspan(sf.id, 0, 0), "C1081",
+                   u.f1("cannot find the file \"%s\" to include before the source (--c-include)", name));
     }
     run_file(P);
     end_deps();

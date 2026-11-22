@@ -30,13 +30,17 @@ fn start_entry(cu: *mut cs.CUnit) void {
     let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
     let mut n: usize = 0;
     let mut np: usize = 0;
-    let mut sig = Sig.{ ty: fty, plan: u.nil.[abi.Plan]() };
+    let mut sig_ty = fty;
+    let mut sig_plan: ?*mut abi.Plan = .none;
     let mut mf = u.nil.[ir.Func]();
     let mut ib = cty.t_int.bits;
     if u.notnil(cu) {
-        sig = func_sig(cu.main);
+        let sig = func_sig(cu.main);
         mf = func_of(cu.main, sig);
-        sig.ty = mf.ty;  // (the call's type: the function's)
+        sig_ty = mf.ty;  // (the call's type: the function's)
+        if let .some(sg) = sig {
+            sig_plan = .some(sg.plan);
+        }
         np = cu.main.params.len;
     } else {
         // an object's main (linkin.ax: take_main): int main(int, char **),
@@ -47,13 +51,17 @@ fn start_entry(cu: *mut cs.CUnit) void {
             ib = 32;
         } else if np == 2 {
             let mut ps: [2]*mut cty.CType = [cty.t_int, cty.pointer_to(cty.pointer_to(cty.t_char))];
-            sig = sig_of(cty.t_int, ps[..], 2, false, false);
+            let sg = sig_of(cty.t_int, ps[..], 2, false, false);
+            sig_ty = sg.ty;
+            sig_plan = .some(sg.plan);
         } else {
-            sig = sig_of(cty.t_int, u.nil_slice.[*mut cty.CType](), 0, false, false);
+            let sg = sig_of(cty.t_int, [], 0, false, false);
+            sig_ty = sg.ty;
+            sig_plan = .some(sg.plan);
         }
         mf = ir.get_function(M, g_obj_main);
         if u.isnil(mf) {
-            mf = ir.add_function(M, g_obj_main, sig.ty);
+            mf = ir.add_function(M, g_obj_main, sig_ty);
         }
     }
     if np >= 1 {
@@ -72,9 +80,9 @@ fn start_entry(cu: *mut cs.CUnit) void {
     if runners {
         call_runner(CTORS_FN);
     }
-    let r = ir.call(B, sig.ty, mf.val, av[0..n]);
-    if u.notnil(sig.plan) {
-        mark_call(r, sig.plan);
+    let r = ir.call(B, sig_ty, mf.val, av[0..n]);
+    if let .some(pl) = sig_plan {
+        mark_call(r, pl);
     }
     if runners and not program_exit {
         // (a program without exit: the destructors when main returns; else
@@ -122,7 +130,7 @@ fn start_entry(cu: *mut cs.CUnit) void {
 
 fn call_runner(name: []u8) void {
     let f = ir.get_function(M, name);
-    _ = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
+    _ = ir.call(B, f.ty, f.val, []);
 }
 
 // A weak reference to the linker's symbol `name` (an address).
@@ -164,8 +172,8 @@ fn walk_array(first_sym: []u8, end_sym: []u8, forward: bool) void {
         next = at;
     }
     let f = ir.load(B, T_ptr, at);
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
-    _ = ir.call(B, fty, f, u.nil_slice.[*mut ir.Value]());
+    let fty = ir.t_fn(T_void, [], false);
+    _ = ir.call(B, fty, f, []);
     ir.add_incoming(p, next, body);
     ir.br(B, head);
     at_end(out);
@@ -228,7 +236,7 @@ fn put_in_arrays() void {
 fn atexit_registrar(f: *mut ir.Func, i: usize) *mut ir.Value {
     let saved_b = B;
     let saved_f = F;
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let fty = ir.t_fn(T_void, [], false);
     let rf = ir.add_function(M, u.f1("axiom.c.atexit_dtor.%s", u.zdec(i)), fty);
     rf.linkage = ir.LINK_INTERNAL;
     let mut pa: [1]*mut ir.Ty = [T_ptr];
@@ -267,7 +275,7 @@ pub fn define_runners() bool {
     }
     let saved_b = B;
     let saved_f = F;
-    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let fty = ir.t_fn(T_void, [], false);
     let df = ir.add_function(M, DTORS_FN, fty);
     df.linkage = ir.LINK_INTERNAL;
     let cf = ir.add_function(M, CTORS_FN, fty);
@@ -312,7 +320,7 @@ pub fn define_runners() bool {
         if u.isnil(wf) {
             wf = ir.add_function(M, "__wasm_call_ctors", fty);
         }
-        _ = ir.call(B, wf.ty, wf.val, u.nil_slice.[*mut ir.Value]());
+        _ = ir.call(B, wf.ty, wf.val, []);
     } else if g_init_arrays {
         walk_array("__preinit_array_start", "__preinit_array_end", true);
         walk_array("__init_array_start", "__init_array_end", true);
@@ -352,7 +360,7 @@ pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
         // a call before the first instruction
         let cf = ir.get_function(M, CTORS_FN);
         ir.at_end(B, tmp);
-        let c0 = ir.call(B, cf.ty, cf.val, u.nil_slice.[*mut ir.Value]());
+        let c0 = ir.call(B, cf.ty, cf.val, []);
         unlink_last(tmp);
         ir.insert_before(main.first.first, c0);
     }
@@ -367,7 +375,7 @@ pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
         while u.notnil(v) {
             if v.op == ir.OP_RET {
                 ir.at_end(B, tmp);
-                let c = ir.call(B, end.ty, end.val, u.nil_slice.[*mut ir.Value]());
+                let c = ir.call(B, end.ty, end.val, []);
                 unlink_last(tmp);
                 ir.insert_before(v, c);
             }
@@ -405,8 +413,7 @@ fn ctor_key(s: *mut cast.CSym, ctor: bool) i64 {
 // program that ends otherwise than by returning from main does not run its
 // destructors: docs/c.md.)
 fn call_ctors(ctor: bool) void {
-    let xs = u.List.[*mut cast.CSym].empty();
-    let mut l = xs;
+    let mut l = u.List.[*mut cast.CSym].empty();
     for s in g_ctors.items() {
         let n = cs.note_of(s);
         if (ctor and n.ctor) or (not ctor and n.dtor) {
@@ -451,11 +458,11 @@ fn call_ctors(ctor: bool) void {
         }
     }
     for s in items {
-        let f = func_of(s, func_sig(s));
         let sig = func_sig(s);
-        let r = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
-        if u.notnil(sig.plan) {
-            mark_call(r, sig.plan);
+        let f = func_of(s, sig);
+        let r = ir.call(B, f.ty, f.val, []);
+        if let .some(sg) = sig {
+            mark_call(r, sg.plan);
         }
     }
     l.deinit();

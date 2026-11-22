@@ -85,11 +85,11 @@ fn asm_to_class(v: *mut ir.Value, op: ai.Op, et: *cty.CType) *mut ir.Value {
 
 /// Asm statement a: IN_ASM, and the stores of its outputs. Returns the
 /// intrinsic (for `asm goto`, an i32 that says which label the template
-/// jumped to: 0 none, k + 1 label k), or nil after an error.
-fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
+/// jumped to: 0 none, k + 1 label k), or .none after an error.
+fn asm_stmt_gen(a: *mut cast.Asm) ?*mut ir.Value {
     let b = a.blob;
     if u.isnil(b) {
-        return u.nil.[ir.Value]();
+        return .none;
     }
     b.aliases = asm_aliases(a);
     let mut index = ai.add(b);
@@ -103,7 +103,7 @@ fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
     // (what the passes may do with it: ir.ASM_PURE, ASM_HINT)
     let mut mem_ops = b.memory or b.goto_;
     let mut nout: usize = 0;
-    for op in b.ops {
+    for &op in b.ops {
         if (op.kind == ai.OK_MEM) or (op.via != ai.VIA_NONE) or (op.pair >= 0) {
             mem_ops = true;
         }
@@ -179,10 +179,7 @@ fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
                 ptmps.push(alloca(t, "asm.out"));
                 xs.push(ir.ci32(0));
             } else {
-                let mut p = reuse;
-                if u.isnil(p) {
-                    p = rv(e);  // (a 128-bit value: its address)
-                }
+                let p = reuse ?? rv(e);  // (a 128-bit value: its address)
                 pairv[k] = p;
                 xs.push(ir.load(B, ir.t_int(64), p));
             }
@@ -202,8 +199,8 @@ fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
                 vouts.push(k);
                 vbufs.push(buf);
                 vaddrs.push(at);
-            } else if not u.isnil(reuse) {
-                copy(t, buf, reuse);
+            } else if let .some(rp) = reuse {
+                copy(t, buf, rp);
             } else if e.lvalue {
                 copy(t, buf, lv(e));
             } else if cty.is_wide(t) or not cty.is_scalar(t) {
@@ -251,8 +248,8 @@ fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
             continue;
         }
         let mut v = ir.vnil();
-        if not u.isnil(reuse) {
-            v = load_lv(e.a, reuse);
+        if let .some(rp) = reuse {
+            v = load_lv(e.a, rp);
         } else {
             v = rv(e);
         }
@@ -304,7 +301,7 @@ fn asm_stmt_gen(a: *mut cast.Asm) *mut ir.Value {
         _ = ir.store(B, hi[j], ir.ptradd(B, tmp, ir.cint(ir.isz(), 8)));
         _ = store_lv(e, t, load(t, tmp), paddrs.get(j));
     }
-    return r;
+    return .some(r);
 }
 
 // The memory operands of asm a (blob b), for ir.ASM_EXACT: each one's IN_ASM
@@ -335,19 +332,19 @@ fn asm_mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
 // Is op an AArch64 operand in a z, p or q register through memory (a buffer)?
 // The address of the output that operand k, an input '+' added (the value
 // of that output's lvalue, read before the asm), reads: oaddr's, the
-// output's lvalue evaluated once; or nil.
-fn asm_plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) *mut ir.Value {
+// output's lvalue evaluated once; or .none.
+fn asm_plus_input(a: *cast.Asm, b: *ai.Blob, k: usize, oaddr: []mut *mut ir.Value) ?*mut ir.Value {
     let op = b.ops[k];
     if op.out or op.hi or (op.tie < 0) {
-        return ir.vnil();
+        return .none;
     }
     let t = @int_cast(usize, op.tie);
     let e = a.exprs.get(k);
     if (t >= k) or not b.ops[t].inout or (e.kind != cast.ExprKind.CAST) or (e.op != cast.CV_LOAD) or
        (e.a != a.exprs.get(t)) {
-        return ir.vnil();
+        return .none;
     }
-    return oaddr[t];
+    return .some(oaddr[t]);
 }
 
 fn asm_is_vbuf(op: ai.Op) bool {
@@ -390,7 +387,7 @@ fn asm_pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
         k.c(3);
         k.s(c.name);
     }
-    for op in b.ops {
+    for &op in b.ops {
         k.s(u.f4("\x04%s.%s.%s.%s", u.udec(@as(u64, op.kind)), u.idec(op.reg), u.udec(@as(u64, op.bits)),
                  u.udec(op.subset)));
         k.s(
@@ -466,7 +463,7 @@ fn asm_naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
         return;
     }
     let mut t = u.Buf.init();
-    let mut first = u.nil.[ai.Blob]();
+    let mut first: ?*ai.Blob = .none;
     let mut al = u.List.[[]u8].empty();
     t.s(".text\n");
     if tg.g_arch == tg.ARCH_X64 {
@@ -481,8 +478,8 @@ fn asm_naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
             continue;
         }
         let b = x.asm.blob;
-        if u.isnil(first) {
-            first = b;
+        if let .none = first {
+            first = .some(b);
         }
         for n in asm_aliases(x.asm) {
             al.push(n);
@@ -490,7 +487,7 @@ fn asm_naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
         if b.basic {
             t.s(b.text);
         } else {
-            for p in b.pieces {
+            for &p in b.pieces {
                 if p.kind == ai.PK_TEXT {
                     t.s(p.text);
                 }
@@ -499,16 +496,19 @@ fn asm_naked(name: []u8, f: *mut ir.Func, ct: *mut cty.CType, body: *cast.Stmt) 
         t.s("\n");
     }
     t.s(u.f2(".size %s, . - %s\n", name, name));
-    if u.isnil(first) {
+    let mut fb: *ai.Blob = u.nil.[ai.Blob]();
+    if let .some(b0) = first {
+        fb = b0;
+    } else {
         return;
     }
     let nb = u.perm_new.[ai.Blob]();
-    nb.arch = first.arch;
+    nb.arch = fb.arch;
     nb.file_id = -1;
     nb.basic = true;
     nb.text = u.perm_dup(t.done());
-    nb.loc = first.loc;
-    nb.intel = first.intel;
+    nb.loc = fb.loc;
+    nb.intel = fb.intel;
     let als = u.perm_newn.[[]u8](al.len + 1);
     for k in 0..al.len {
         als[k] = al.get(k);

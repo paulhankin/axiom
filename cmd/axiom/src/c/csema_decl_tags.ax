@@ -38,29 +38,31 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
         return et;
     }
     let named = ts.name.len > 0;
-    let mut t = u.nil.[cty.CType]();
+    let mut t = cty.t_error;
     if ts.has_body or lone {
+        let mut ot: ?*mut cty.CType = .none;
         if named {
-            t = lookup_tag_here(ts.name);
+            ot = lookup_tag_here(ts.name);
         }
-        if u.notnil(t) {
-            if t.kind != kind {
+        if let .some(pt) = ot {
+            if pt.kind != kind {
                 err_note(ts.name_span, "C3011", u.f2("'%s' was declared as %s", ts.name,
                                                      u.cat2(
-                                                         "a different kind of tag (", u.cat2(kind_word(t.kind), ")"))),
-                         t.tag.span, "declared here");
+                                                         "a different kind of tag (", u.cat2(kind_word(pt.kind), ")"))),
+                         pt.tag.span, "declared here");
                 ts.ty = cty.t_error;
                 return ts.ty;
             }
-            if ts.has_body and t.tag.complete and (std() >= co.C23) {
-                return redefined_record(ts, t, kind);
+            if ts.has_body and pt.tag.complete and (std() >= co.C23) {
+                return redefined_record(ts, pt, kind);
             }
-            if ts.has_body and (t.tag.complete or t.tag.defining) {
-                err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s'", kind_word(kind), ts.name), t.tag.span,
+            if ts.has_body and (pt.tag.complete or pt.tag.defining) {
+                err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s'", kind_word(kind), ts.name), pt.tag.span,
                          "defined before here");
                 ts.ty = cty.t_error;
                 return ts.ty;
             }
+            t = pt;
         } else if (kind == cty.TK_ENUM) and not ts.has_body {
             return undefined_enum(ts);
         } else {
@@ -73,14 +75,14 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
             }
         }
     } else {
-        t = lookup_tag(ts.name);
-        if u.notnil(t) {
-            if t.kind != kind {
-                err_note(ts.name_span, "C3011", u.f2("'%s' is not a %s tag", ts.name, kind_word(kind)), t.tag.span,
+        if let .some(pt) = lookup_tag(ts.name) {
+            if pt.kind != kind {
+                err_note(ts.name_span, "C3011", u.f2("'%s' is not a %s tag", ts.name, kind_word(kind)), pt.tag.span,
                          "declared here");
                 ts.ty = cty.t_error;
                 return ts.ty;
             }
+            t = pt;
         } else if kind == cty.TK_ENUM {
             return undefined_enum(ts);
         } else {
@@ -144,7 +146,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
     let ti = t.tag;
     ti.defining = true;
     let mut names = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
-    let mut flex = u.nil.[cty.Member]();
+    let mut flex: ?*mut cty.Member = .none;
     let mut named: i32 = 0;
     for md in ts.members.items() {
         if md.kind == cast.DeclKind.STATIC_ASSERT {
@@ -189,9 +191,9 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 if w < 0 {
                     continue;
                 }
-                if u.notnil(flex) {
-                    err(flex.span, "C3008", "a flexible array member that is not the last member");
-                    flex = u.nil.[cty.Member]();
+                if let .some(fl) = flex {
+                    err(fl.span, "C3008", "a flexible array member that is not the last member");
+                    flex = .none;
                 }
                 if d.name.len > 0 {
                     check_dup(&mut names, d.name, d.name_span);
@@ -215,9 +217,9 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             if cty.is_error(mt) or not vla_check_member(d, mt) {
                 continue;
             }
-            if u.notnil(flex) {
-                err(flex.span, "C3008", "a flexible array member that is not the last member");
-                flex = u.nil.[cty.Member]();
+            if let .some(fl) = flex {
+                err(fl.span, "C3008", "a flexible array member that is not the last member");
+                flex = .none;
             }
             if cty.is_func(mt) {
                 err(d.name_span, "C3008", u.f1("the member '%s' has a function type", d.name));
@@ -261,7 +263,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                     err(d.name_span, "C3008",
                         u.f1("the flexible array member '%s' must follow another member of a structure", d.name));
                 }
-                flex = ti.members.last();
+                flex = .some(ti.members.last());
             }
         }
     }
@@ -269,8 +271,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
     if opts().gnu or opts().declspec {
         // (a GNU dialect, or __declspec on Windows: packed, aligned, #pragma
         // pack: csema_bits.ax)
-        let n = note_of_tag(ti);
-        if u.notnil(n) {
+        if let .some(n) = note_of_tag(ti) {
             ti.packed = n.packed;
             ti.min_align = n.aligned;
             ti.layout = n.layout;
@@ -294,10 +295,7 @@ fn gnu_member(m: *mut cty.Member, md: *mut cast.Decl, d: *mut cast.Declarator) v
     gnu_mark_member(m, &md.attrs);
     gnu_mark_member(m, &d.attrs);
     gnu_mark_member(m, &md.specs.gattrs);
-    let n = note_of_member(m);
-    if u.isnil(n) {
-        return;
-    }
+    let n = note_of_member(m) ?? return;
     m.packed = n.packed;
     if n.aligned > m.align {
         m.align = n.aligned;
@@ -451,7 +449,7 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             err(dv.ids.at(0).span, "C3008", "an identifier list in a function declarator that is not a definition");
         }
         let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
-        for id in dv.ids.items() {
+        for &id in dv.ids.items() {
             if seen.get(id.name) != 0 {
                 err(id.span, "C3002", u.f1("a second parameter named '%s'", id.name));
             }
@@ -506,8 +504,7 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             attr_mark_sym(s, &p.decl.attrs);
             attr_mark_sym(s, &p.specs.gattrs);
             if p.decl.name.len > 0 {
-                let prior = lookup_here(p.decl.name);
-                if u.notnil(prior) {
+                if let .some(prior) = lookup_here(p.decl.name) {
                     err_note(p.decl.name_span, "C3002", u.f1("a second parameter named '%s'", p.decl.name), prior.span,
                              "the first");
                 }

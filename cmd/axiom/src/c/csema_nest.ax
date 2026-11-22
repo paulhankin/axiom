@@ -32,13 +32,13 @@ import "ctypes.ax" as cty;
 /// in the function being analyzed: if s is another function's, every
 /// function from this one up to s's own passes it on (rec).
 pub fn use_object(s: *mut cast.CSym, sp: u.Span) void {
-    let cur = cur_fn();
+    let cur = cur_fn() ?? return;
     let owner = s.owner;
-    if u.isnil(cur) or u.isnil(owner) or (owner == cur) or (s.duration != cast.SD_AUTO) {
+    if u.isnil(owner) or (owner == cur) or (s.duration != cast.SD_AUTO) {
         return;
     }
     let mut f = cur;
-    while u.notnil(f) and (f != owner) and u.notnil(f.nest_parent) {
+    while (f != owner) and u.notnil(f.nest_parent) {
         add_once(&mut f.nest_parent.rec, s);
         f = f.nest_parent;
     }
@@ -85,40 +85,53 @@ fn fkey(f: *cast.CSym) []u8 {
     return u.addr_key(@int_from_ptr(f));
 }
 
-// Notes that function f (nil: none) evaluates length n (a CType.vexpr).
-fn own(n: *mut void, f: *mut cast.CSym) void {
+fn same_opt_sym(a: ?*mut cast.CSym, b: ?*mut cast.CSym) bool {
+    if let .some(pa) = a {
+        if let .some(pb) = b {
+            return pa == pb;
+        }
+        return false;
+    }
+    if let .some(pb) = b {
+        _ = pb;
+        return false;
+    }
+    return true;
+}
+
+// Notes that function of (.none: none) evaluates length n (a CType.vexpr).
+fn own(n: *mut void, of: ?*mut cast.CSym) void {
     let k = vkey(n);
-    let had = g_vexpr_fn.get(k);
-    if had == f {
+    let ohad = g_vexpr_fn.get(k);
+    if same_opt_sym(ohad, of) {
         return;
     }
-    if u.notnil(had) {
-        let l = g_fn_lens.get(fkey(had));
-        for i in 0..l.len {
-            if l.get(i) == n {
-                l.set(i, u.vnil());  // (another function's now: a function definition's parameter)
+    if let .some(had) = ohad {
+        if let .some(l) = g_fn_lens.get(fkey(had)) {
+            for i in 0..l.len {
+                if l.get(i) == n {
+                    l.set(i, u.vnil());  // (another function's now: a function definition's parameter)
+                }
             }
         }
     }
-    g_vexpr_fn.put(k, f);
-    if u.isnil(f) {
+    g_vexpr_fn.put(k, of);
+    let f = of ?? return;
+    let fk = fkey(f);
+    if let .some(l) = g_fn_lens.get(fk) {
+        l.push(n);
         return;
     }
-    let fk = fkey(f);
-    let mut l = g_fn_lens.get(fk);
-    if u.isnil(l) {
-        l = u.new.[u.List.[*mut void]]();
-        g_fn_lens.put(fk, l);
-    }
+    let l = u.new.[u.List.[*mut void]]();
+    g_fn_lens.put(fk, .some(l));
     l.push(n);
 }
 
 /// A variable length array type's length n (a CType.vexpr) is made, where
 /// the function being analyzed (if any) evaluates it.
 pub fn note_length(n: *mut void) void {
-    let f = cur_fn();
-    if u.notnil(f) {
-        own(n, f);
+    if let .some(f) = cur_fn() {
+        own(n, .some(f));
     }
 }
 
@@ -131,7 +144,7 @@ pub fn own_params(f: *mut cast.CSym) void {
         let mut t = p.ty;
         while u.notnil(t) and ((t.kind == cty.TK_ARRAY) or (t.kind == cty.TK_POINTER)) {
             if t.vla and not u.isvnil(t.vexpr) {
-                own(t.vexpr, f);
+                own(t.vexpr, .some(f));
                 if u.notnil(f.nest_parent) {
                     uses(@ptr_cast(*mut cast.Expr, t.vexpr));
                 }
@@ -159,17 +172,16 @@ fn uses(e: *mut cast.Expr) void {
 
 /// The function that evaluates length n (a CType.vexpr), or nil.
 pub fn length_owner(n: *void) *mut cast.CSym {
-    return g_vexpr_fn.get(vkey(n));
+    return g_vexpr_fn.get(vkey(n)) ?? u.nil.[cast.CSym]();
 }
 
 /// The lengths function f evaluates (nil entries: taken by a nested
 /// function's definition), in the order of their slots in its record.
 pub fn lengths(f: *cast.CSym) []*mut void {
-    let l = g_fn_lens.get(fkey(f));
-    if u.isnil(l) {
-        return u.nil_slice.[*mut void]();
+    if let .some(l) = g_fn_lens.get(fkey(f)) {
+        return l.items();
     }
-    return l.items();
+    return [];
 }
 
 /// The index of length n among function f's (lengths), or -1.

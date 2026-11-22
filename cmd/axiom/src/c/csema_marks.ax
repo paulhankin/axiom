@@ -26,7 +26,7 @@ import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
 // A function declared inline at file scope with external linkage.
-struct InlineFn {
+nocopy struct InlineFn {
     sym: *mut cast.CSym,
     plain: bool,    // a file-scope declaration without inline, or with extern
     gnu: bool,      // GNU89's `extern inline` (only for inlining, whatever else declares it)
@@ -38,7 +38,7 @@ struct InlineFn {
     // function inlines (cgen_stmt.inline_call)
     packs: u.List.[*mut cast.Expr],
     taken: u.List.[*mut cast.Expr],
-    wrapper: *mut cast.Decl,
+    wrapper: ?*mut cast.Decl,
     wparams: []*mut cast.CSym,
 }
 
@@ -47,21 +47,23 @@ struct Problem {
     msg: []u8,
 }
 
-struct Marks {
-    fns: u.SymMap.[*mut InlineFn],
+nocopy struct Marks {
+    fns: u.SymMap.[?*mut InlineFn],
     fn_list: u.List.[*mut InlineFn],
     registers: u.SymMap.[i32],
-    body: *mut InlineFn,  // the inline function whose body is being analyzed, or nil
+    body: ?*mut InlineFn,  // the inline function whose body is being analyzed, or .none
 }
 
 fn marks() *mut Marks {
-    if u.isnil(g_marks) {
-        g_marks = u.new.[Marks]();
-        g_marks.fns = u.SymMap.[*mut InlineFn].{ keys: u.nil.[usize](), vals: u.nil.[*mut InlineFn](), cap: 0, len: 0 };
-        g_marks.fn_list = u.List.[*mut InlineFn].empty();
-        g_marks.registers = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    if let .some(m) = g_marks {
+        return m;
     }
-    return g_marks;
+    let m = u.new.[Marks]();
+    m.fns = u.SymMap.[?*mut InlineFn].{ keys: u.nil.[usize](), vals: u.nil.[?*mut InlineFn](), cap: 0, len: 0 };
+    m.fn_list = u.List.[*mut InlineFn].empty();
+    m.registers = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    g_marks = .some(m);
+    return m;
 }
 
 fn marks_key(s: *cast.CSym) []u8 {
@@ -83,8 +85,8 @@ pub fn is_register(s: *cast.CSym) bool {
 }
 
 /// The object declared register that lvalue e (typed) designates or is a
-/// member or element of an array of (x.y, a[i] of an array), or nil.
-pub fn register_object(e: *mut cast.Expr) *mut cast.CSym {
+/// member or element of an array of (x.y, a[i] of an array), or .none.
+pub fn register_object(e: *mut cast.Expr) ?*mut cast.CSym {
     let mut x = e;
     loop {
         let k = x.kind;
@@ -100,9 +102,9 @@ pub fn register_object(e: *mut cast.Expr) *mut cast.CSym {
     }
     let named = (x.kind == cast.ExprKind.IDENT) or (x.kind == cast.ExprKind.COMPOUND);  // (C23: `(register T){...}`)
     if named and u.notnil(x.sym) and (x.sym.kind == cast.SK_OBJECT) and is_register(x.sym) {
-        return x.sym;
+        return .some(x.sym);
     }
-    return u.nil.[cast.CSym]();
+    return .none;
 }
 
 // -----------------------------------------------------------------------------
@@ -128,45 +130,51 @@ pub fn function_declared(s: *mut cast.CSym, funcs: i32, sc: i32, sp: u.Span) voi
         // (GNU89: `extern inline` is C99's `inline`, and `inline` is a plain definition)
         inl = inl and (sc == cast.SC_EXTERN);
     }
-    let mut f = m.fns.get(marks_key(s));
+    let of = m.fns.get(marks_key(s));
     if gnu89_inline and inl {
         // (GNU89's `extern inline` is a definition only for inlining, as the
         // system's headers define their wrappers of the library's functions,
         // which they declare without inline too: never an external
         // definition, whatever the other declarations)
         // (its body is checked as an inline definition's: 6.7.4p3, marks_finish)
-        if u.isnil(f) {
-            f = u.new.[InlineFn]();
+        if let .some(f) = of {
+            if f.plain and not f.gnu {
+                f.problems = u.List.[Problem].empty();
+                m.fn_list.push(f);  // (a declaration without inline came first)
+            }
+            f.plain = false;
+            f.gnu = true;
+        } else {
+            let f = u.new.[InlineFn]();
             f.sym = s;
             f.problems = u.List.[Problem].empty();
-            m.fns.put(marks_key(s), f);
+            f.plain = false;
+            f.gnu = true;
+            m.fns.put(marks_key(s), .some(f));
             m.fn_list.push(f);
-        } else if f.plain and not f.gnu {
-            f.problems = u.List.[Problem].empty();
-            m.fn_list.push(f);  // (a declaration without inline came first)
         }
-        f.plain = false;
-        f.gnu = true;
         return;
     }
-    if u.notnil(f) and f.gnu {
-        return;
-    }
-    if u.isnil(f) {
-        if not inl {
-            // (a declaration without inline first: never an inline definition)
-            f = u.new.[InlineFn]();
-            f.sym = s;
-            f.plain = true;
-            m.fns.put(marks_key(s), f);
+    if let .some(f) = of {
+        if f.gnu {
             return;
         }
-        f = u.new.[InlineFn]();
-        f.sym = s;
-        f.problems = u.List.[Problem].empty();
-        m.fns.put(marks_key(s), f);
-        m.fn_list.push(f);
+        if not inl or ((sc == cast.SC_EXTERN) and not gnu89_inline) {
+            f.plain = true;
+        }
+        return;
     }
+    let f = u.new.[InlineFn]();
+    f.sym = s;
+    if not inl {
+        // (a declaration without inline first: never an inline definition)
+        f.plain = true;
+        m.fns.put(marks_key(s), .some(f));
+        return;
+    }
+    f.problems = u.List.[Problem].empty();
+    m.fns.put(marks_key(s), .some(f));
+    m.fn_list.push(f);
     if not inl or ((sc == cast.SC_EXTERN) and not gnu89_inline) {
         f.plain = true;
     }
@@ -178,46 +186,46 @@ pub fn is_inline_def(s: *cast.CSym) bool {
     if (s.linkage != cast.LK_EXTERNAL) or u.isnil(s.def) {
         return false;
     }
-    let f = marks().fns.get(marks_key(s));
-    return u.notnil(f) and not f.plain;
+    let f = marks().fns.get(marks_key(s)) ?? return false;
+    return not f.plain;
 }
 
 /// The body of function s is analyzed from now (until marks_end_body).
 pub fn marks_begin_body(s: *mut cast.CSym) void {
     let m = marks();
-    m.body = u.nil.[InlineFn]();
+    m.body = .none;
     if s.linkage != cast.LK_EXTERNAL {
         return;
     }
-    let f = m.fns.get(marks_key(s));
-    if u.notnil(f) and not f.plain {
-        m.body = f;
+    if let .some(f) = m.fns.get(marks_key(s)) {
+        if not f.plain {
+            m.body = .some(f);
+        }
     }
 }
 
 /// Is the body being analyzed that of a GNU89 `extern inline` definition
 /// (only for inlining)?
 pub fn in_gnu_inline_body() bool {
-    return u.notnil(g_marks) and u.notnil(g_marks.body) and g_marks.body.gnu;
+    let m = g_marks ?? return false;
+    let b = m.body ?? return false;
+    return b.gnu;
 }
 
 /// The body being analyzed uses __builtin_va_arg_pack or _len (the caller's
 /// variable arguments, which an inline definition forwards): false if it
 /// is not that of an inline definition. e: the call of
-/// __builtin_va_arg_pack (nil for _len), which must be the last of a call's
+/// __builtin_va_arg_pack (.none for _len), which must be the last of a call's
 /// variable arguments (pack_argument).
-pub fn va_pack_use(e: *mut cast.Expr) bool {
-    let f = marks().body;
-    if u.isnil(f) {
-        return false;
-    }
+pub fn va_pack_use(e: ?*mut cast.Expr) bool {
+    let f = marks().body ?? return false;
     if not f.va_pack {
         f.packs = u.List.[*mut cast.Expr].empty();
         f.taken = u.List.[*mut cast.Expr].empty();
     }
     f.va_pack = true;
-    if u.notnil(e) {
-        f.packs.push(e);
+    if let .some(x) = e {
+        f.packs.push(x);
     }
     return true;
 }
@@ -226,8 +234,8 @@ pub fn va_pack_use(e: *mut cast.Expr) bool {
 /// last: it is the last of a call's variable arguments, the place it is
 /// replaced by them (taken: not reported at the body's end).
 pub fn pack_argument(e: *mut cast.Expr, last: bool) bool {
-    let f = marks().body;
-    if u.isnil(f) or not f.va_pack {
+    let f = marks().body ?? return false;
+    if not f.va_pack {
         return false;
     }
     for x in f.packs.items() {
@@ -245,15 +253,14 @@ pub fn pack_argument(e: *mut cast.Expr, last: bool) bool {
 /// definition that forwards its caller's variable arguments
 /// (__builtin_va_arg_pack), or nil; params: its parameters.
 pub fn va_wrapper(s: *cast.CSym, params: *mut []*mut cast.CSym) *mut cast.Decl {
-    if u.isnil(g_marks) or (s.linkage != cast.LK_EXTERNAL) {
+    let m = g_marks ?? return u.nil.[cast.Decl]();
+    if s.linkage != cast.LK_EXTERNAL {
         return u.nil.[cast.Decl]();
     }
-    let f = g_marks.fns.get(marks_key(s));
-    if u.isnil(f) or u.isnil(f.wrapper) {
-        return u.nil.[cast.Decl]();
-    }
+    let f = m.fns.get(marks_key(s)) ?? return u.nil.[cast.Decl]();
+    let w = f.wrapper ?? return u.nil.[cast.Decl]();
     params.* = f.wparams;
-    return f.wrapper;
+    return w;
 }
 
 /// The body analyzed ends. True when the inline definition is not to be
@@ -265,9 +272,9 @@ pub fn va_wrapper(s: *cast.CSym, params: *mut []*mut cast.CSym) *mut cast.Decl {
 /// arguments (C3090).
 pub fn marks_end_body() bool {
     let m = marks();
-    let f = m.body;
-    m.body = u.nil.[InlineFn]();
-    if u.isnil(f) or not f.va_pack {
+    let f = m.body ?? return false;
+    m.body = .none;
+    if not f.va_pack {
         return false;
     }
     let mut bad = false;
@@ -282,7 +289,7 @@ pub fn marks_end_body() bool {
         }
     }
     if not bad and u.notnil(f.sym.def) {
-        f.wrapper = f.sym.def;
+        f.wrapper = .some(f.sym.def);
         f.wparams = f.sym.params.items();
     }
     f.plain = true;
@@ -292,64 +299,56 @@ pub fn marks_end_body() bool {
 
 /// The inline definition whose body is being analyzed (around a nested
 /// function's body: marks_restore_body).
-pub fn marks_save_body() *mut void {
-    if u.isnil(g_marks) {
-        return @ptr_from_int(*mut void, 0);
-    }
-    return @ptr_cast(*mut void, g_marks.body);
+pub fn marks_save_body() ?*mut InlineFn {
+    let m = g_marks ?? return .none;
+    return m.body;
 }
 
-pub fn marks_restore_body(x: *mut void) void {
-    if u.notnil(g_marks) {
-        g_marks.body = @ptr_cast(*mut InlineFn, x);
+pub fn marks_restore_body(x: ?*mut InlineFn) void {
+    if let .some(m) = g_marks {
+        m.body = x;
     }
 }
 
 fn problem(sp: u.Span, msg: []u8) void {
-    let f = marks().body;
-    if u.notnil(f) {
-        f.problems.push(Problem.{ sp: sp, msg: msg });
-    }
+    let f = marks().body ?? return;
+    f.problems.push(Problem.{ sp: sp, msg: msg });
 }
 
 /// Identifier s is referred to at sp (in the body being analyzed, if any).
 pub fn referred(s: *cast.CSym, sp: u.Span) void {
-    if u.isnil(g_marks) or u.isnil(g_marks.body) {
-        return;
-    }
+    let m = g_marks ?? return;
+    let b = m.body ?? return;
     if (s.linkage == cast.LK_INTERNAL) and ((s.kind == cast.SK_OBJECT) or (s.kind == cast.SK_FUNC)) {
-        problem(sp, u.f2("the inline definition of '%s' refers to '%s', which has internal linkage",
-                         g_marks.body.sym.name, s.name));
+        problem(sp, u.f2("the inline definition of '%s' refers to '%s', which has internal linkage", b.sym.name,
+                         s.name));
     }
 }
 
 /// Object s with static storage duration is defined in a block (of the body
 /// being analyzed, if any).
 pub fn static_defined(s: *cast.CSym, sp: u.Span) void {
-    if u.isnil(g_marks) or u.isnil(g_marks.body) {
-        return;
-    }
+    let m = g_marks ?? return;
+    let b = m.body ?? return;
     let mut t = s.ty;
     while t.kind == cty.TK_ARRAY {
         t = t.elem;
     }
     if (t.quals & cty.Q_CONST) == 0 {
         problem(sp, u.f2("the inline definition of '%s' defines '%s', a modifiable object with static storage duration",
-                         g_marks.body.sym.name, s.name));
+                         b.sym.name, s.name));
     }
 }
 
 /// At the end of the unit: reports what the bodies of the inline
 /// definitions (those still so) do that they must not.
 pub fn marks_finish() void {
-    if u.isnil(g_marks) {
-        return;
-    }
-    for f in g_marks.fn_list.items() {
+    let m = g_marks ?? return;
+    for f in m.fn_list.items() {
         if f.plain {
             continue;
         }
-        for p in f.problems.items() {
+        for &p in f.problems.items() {
             err(p.sp, "C3221", p.msg);
         }
         // (reported once: the next unit's marks_finish sees this unit's functions too)

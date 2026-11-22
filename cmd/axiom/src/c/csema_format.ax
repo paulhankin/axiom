@@ -87,11 +87,11 @@ fn fmt_check_call(e: *mut cast.Expr, fname0: []u8, sp: FmtSpec) void {
     let mut x = fmt_strip(fe);
     // (a call of a format_arg function: its argument's format)
     loop {
-        let y = format_arg_of(x);
-        if u.isnil(y) {
+        if let .some(y) = format_arg_of(x) {
+            x = fmt_strip(y);
+        } else {
             break;
         }
-        x = fmt_strip(y);
     }
     if (x.kind != cast.ExprKind.STRING) or (x.tok.prefix != 0) {
         if (sp.first != 0) and (e.args.len <= @as(usize, @bit_cast(u32, sp.index))) {
@@ -103,19 +103,21 @@ fn fmt_check_call(e: *mut cast.Expr, fname0: []u8, sp: FmtSpec) void {
         return;
     }
     let us = x.tok.units;
-    let s = u.newn.[u8](us.len + 1);
-    for k in 0..us.len {
-        s[k] = @truncate(u8, us[k]);
+    let mut s: []mut u8 = [];
+    if us.len > 0 {
+        s = u.newn.[u8](us.len);
+        for k in 0..us.len {
+            s[k] = @truncate(u8, us[k]);
+        }
     }
-    let C = FmtChecker.{ e: e, fname: fname, sp: x.span, kind: sp.kind, first: sp.first, used: 0, max_pos: 0,
-                         plain: false, posit: false, bad: false };
     let c = u.new.[FmtChecker]();
-    c.* = C;
+    c.* = FmtChecker.{ e: e, fname: fname, sp: x.span, kind: sp.kind, first: sp.first, used: 0, max_pos: 0,
+                       plain: false, posit: false, bad: false };
     if sp.kind == FK_STRFTIME {
-        strftime(c, s[0..us.len]);
+        strftime(c, s);
         return;
     }
-    directives(c, s[0..us.len]);
+    directives(c, s);
     if c.bad or (sp.first == 0) {
         return;
     }
@@ -130,7 +132,7 @@ fn fmt_check_call(e: *mut cast.Expr, fname0: []u8, sp: FmtSpec) void {
     }
 }
 
-struct FmtChecker {
+nocopy struct FmtChecker {
     e: *mut cast.Expr,
     fname: []u8,
     sp: u.Span,  // the format string's
@@ -143,19 +145,19 @@ struct FmtChecker {
     bad: bool,       // a directive that is not one: the arguments are not counted
 }
 
-// The argument for the k-th (from 0) value the format uses (nil if there is none: reported).
-fn arg_at(c: *mut FmtChecker, k: usize, what: []u8) *mut cast.Expr {
+// The argument for the k-th (from 0) value the format uses (.none if there is none: reported).
+fn arg_at(c: *mut FmtChecker, k: usize, what: []u8) ?*mut cast.Expr {
     if c.first == 0 {
-        return u.nil.[cast.Expr]();  // (a va_list's: nothing to check)
+        return .none;  // (a va_list's: nothing to check)
     }
     let i = @as(usize, @bit_cast(u32, c.first - 1)) + k;
     if i >= c.e.args.len {
         fmt_warn(1, c.sp, "C4131", u.f3("too few arguments for the format of '%s': %s needs argument %s", c.fname, what,
                                         u.zdec(i + 1)));
         c.bad = true;
-        return u.nil.[cast.Expr]();
+        return .none;
     }
-    return c.e.args.get(i);
+    return .some(c.e.args.get(i));
 }
 
 // What a conversion takes (FmtWant.cat).
@@ -169,19 +171,15 @@ const W_PTRPTR: i32 = 7;  // a pointer to a void pointer (scanf %p)
 
 struct FmtWant {
     cat: i32,
-    bits: i32,             // the width the argument (or pointed-to object) has, 0: any
-    signed_: i32,          // 1 signed, 0 unsigned, -1 either
-    name: []u8,            // the type it takes, for the message
-    wide: bool,            // W_STR: wchar_t
-    rank: *mut cty.CType,  // the exact type, where one is (the same size but another type: level 2)
+    bits: i32,              // the width the argument (or pointed-to object) has, 0: any
+    signed_: i32,           // 1 signed, 0 unsigned, -1 either
+    name: []u8,             // the type it takes, for the message
+    wide: bool,             // W_STR: wchar_t
+    rank: ?*mut cty.CType,  // the exact type, where one is (the same size but another type: level 2)
 }
 
-fn fmt_want(cat: i32, bits: i32, sg: i32, name: []u8, rank: *mut cty.CType) FmtWant {
+fn fmt_want(cat: i32, bits: i32, sg: i32, name: []u8, rank: ?*mut cty.CType) FmtWant {
     return FmtWant.{ cat: cat, bits: bits, signed_: sg, name: name, wide: false, rank: rank };
-}
-
-fn nil_t() *mut cty.CType {
-    return u.nil.[cty.CType]();
 }
 
 fn is_digit(ch: u8) bool {
@@ -248,11 +246,11 @@ fn position(s: []u8, i: usize, end: *mut usize) usize {
 
 // The argument a directive (or its * width or precision) takes: at a %n$
 // position, or the next one.
-fn take(c: *mut FmtChecker, pos: usize, what: []u8) *mut cast.Expr {
+fn take(c: *mut FmtChecker, pos: usize, what: []u8) ?*mut cast.Expr {
     if pos > 0 {
         if c.plain {
             mixed(c);
-            return u.nil.[cast.Expr]();
+            return .none;
         }
         c.posit = true;
         if pos > c.max_pos {
@@ -262,7 +260,7 @@ fn take(c: *mut FmtChecker, pos: usize, what: []u8) *mut cast.Expr {
     }
     if c.posit {
         mixed(c);
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     c.plain = true;
     let k = c.used;
@@ -297,7 +295,7 @@ const L_DDD: i32 = 13;  // DD: a _Decimal128 (or a _Decimal64x: dd64x)
 // scanf take it with DD, as the type has _Decimal128's format and is passed
 // as it is (docs/c.md).
 fn dd64x(rank: *cty.CType, t: *cty.CType) bool {
-    return u.notnil(rank) and (rank.unq == cty.t_dec128) and (t.unq == cty.t_dec64x);
+    return (rank.unq == cty.t_dec128) and (t.unq == cty.t_dec64x);
 }
 
 // One conversion specification at s[start] ('%'): checked with its
@@ -448,8 +446,7 @@ fn fmt_spec(c: *mut FmtChecker, s: []u8, start: usize) usize {
     if suppress {
         return i;
     }
-    let a = take(c, pos, u.f1("'%s'", text));
-    if u.notnil(a) {
+    if let .some(a) = take(c, pos, u.f1("'%s'", text)) {
         match_arg(c, a, w, text);
     }
     return i;

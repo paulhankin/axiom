@@ -18,8 +18,7 @@ import "std/c/rt/ldouble" as ld;
 /// The address of string literal e (its array, NUL-terminated).
 pub fn string_addr(e: *mut cast.Expr) *mut ir.Value {
     let key = u.addr_key(@int_from_ptr(e));
-    let found = strings.get(key);
-    if u.notnil(found) {
+    if let .some(found) = strings.get(key) {
         return found;
     }
     let el = e.ty.elem;
@@ -45,7 +44,7 @@ pub fn string_addr(e: *mut cast.Expr) *mut ir.Value {
     g.linkage = ir.LINK_INTERNAL;
     g.is_const = true;
     g.align = cty.align_of(el);
-    strings.put(key, g.val);
+    strings.put(key, .some(g.val));
     return g.val;
 }
 
@@ -59,7 +58,7 @@ struct Reloc {
     v: *mut ir.Value,  // a global's or function's address, with its addend
 }
 
-struct Image {
+nocopy struct Image {
     bytes: []mut u8,
     relocs: u.List.[Reloc],
     reloc_end: u64,  // the end of the furthest address so far: an item before it may override one
@@ -112,10 +111,10 @@ fn put_bits(im: *mut Image, off: u64, m: *cty.Member, v: u64) void {
 
 // The address constant a as an IR constant (a global or function's
 // address with an addend), or nil for a plain integer.
-fn addr_value(a: cc.Addr) *mut ir.Value {
+fn addr_value(a: cc.Addr) ?*mut ir.Value {
     let mut base = ir.vnil();
     if u.notnil(a.sym) and (a.sym.kind == cast.SK_LABEL) {
-        return label_address(a.sym);
+        return .some(label_address(a.sym));
     }
     if u.notnil(a.sym) {
         if a.sym.kind == cast.SK_FUNC {
@@ -126,15 +125,15 @@ fn addr_value(a: cc.Addr) *mut ir.Value {
     } else if u.notnil(a.str) {
         base = string_addr(a.str);
     } else {
-        return ir.vnil();
+        return .none;
     }
     if a.off == 0 {
-        return base;
+        return .some(base);
     }
     if base.kind == ir.V_FUNC {
-        return base;  // (a function's address plus an offset: meaningless; the function)
+        return .some(base);  // (a function's address plus an offset: meaningless; the function)
     }
-    return ir.cgaddr(ir.gv_of(base), a.off);
+    return .some(ir.cgaddr(ir.gv_of(base), a.off));
 }
 
 // Writes the value f of real floating type t at off.
@@ -263,14 +262,13 @@ fn put_item(im: *mut Image, it: *mut cast.InitItem) void {
                    u.f1("the address of '%s', an object of a DLL, is not an address constant (on Windows the program finds it when it runs)",
                         a.sym.name));
     }
-    let v = addr_value(a);
-    if u.isnil(v) {
+    if let .some(v) = addr_value(a) {
+        im.relocs.push(Reloc.{ off: it.off, v: v });
+        if it.off + size > im.reloc_end {
+            im.reloc_end = it.off + size;
+        }
+    } else {
         put_le(im, it.off, a.off, size);
-        return;
-    }
-    im.relocs.push(Reloc.{ off: it.off, v: v });
-    if it.off + size > im.reloc_end {
-        im.reloc_end = it.off + size;
     }
 }
 
@@ -326,7 +324,7 @@ fn initial_value(s: *mut cast.CSym) *mut ir.Value {
     let mut parts = u.List.[*mut ir.Value].empty();
     let mut at: u64 = 0;
     let mut packed = false;
-    for r in rs {
+    for &mut r in rs {
         if (r.off % cty.ptr_bytes) != 0 {
             // (an address a packed structure, or #pragma pack, puts at an
             // offset that does not align it: the parts without padding)

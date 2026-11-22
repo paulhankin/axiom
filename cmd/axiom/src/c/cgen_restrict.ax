@@ -120,7 +120,7 @@ fn rs_open(syms: []*mut cast.CSym) void {
     F.f.rscopes = true;
     let mut k: u64 = 0;
     for s in syms {
-        g_scope.put(rs_key(s), t);
+        g_scope.put(rs_key(s), .some(t));
         g_num.put(rs_key(s), k);
         g_objs.push(s);
         k += 1;
@@ -205,10 +205,10 @@ fn restrict_lifetime(a: *mut ir.Value) void {
 fn restrict_function(body: []*mut cast.Stmt, is_main: bool) void {
     g_objs.clear();
     g_addr = false;
-    g_main = ir.vnil();
+    g_main = .none;
     g_scopes = 0;
     g_lscopes.clear();
-    g_body = ir.vnil();
+    g_body = .none;
     ir.rtag = ir.vnil();
     let mut syms = u.List.[*mut cast.CSym].empty();
     defer syms.deinit();
@@ -219,7 +219,7 @@ fn restrict_function(body: []*mut cast.Stmt, is_main: bool) void {
             syms.push(x);
         }
         rs_open(syms.items());
-        g_main = ir.rtag;
+        g_main = .some(ir.rtag);
         g_lscopes.clear();  // (main's scope is not one for lives only)
         syms.clear();
     }
@@ -239,9 +239,9 @@ fn restrict_function(body: []*mut cast.Stmt, is_main: bool) void {
     }
     for x in body {
         if rs_autos_in(x, 0) {
-            rs_open(syms.items()[0..0]);
+            rs_open([]);
             if g_lscopes.len > 0 {
-                g_body = g_lscopes.get(g_lscopes.len - 1);
+                g_body = .some(g_lscopes.get(g_lscopes.len - 1));
             }
             return;
         }
@@ -266,7 +266,10 @@ fn rs_drop_lives(f: *mut ir.Func) void {
         if u.isnil(t.blk) or (t.blk.fnp != f) {
             continue;
         }
-        let mut kept = (t == g_body) and (kept_ids.len > 0);
+        let mut kept = false;
+        if let .some(gb) = g_body {
+            kept = (t == gb) and (kept_ids.len > 0);
+        }
         for n in kept_ids.items() {
             if n == ir.scope_num(t) {
                 kept = true;
@@ -284,13 +287,13 @@ fn rs_drop_lives(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if ir.has_tag_slot(i) and u.notnil(ir.tag_slot(i)) and gone.get(rs_key_v(ir.tag_slot(i))) {
-                ir.set_tag(i, rs_kept_around(ir.tag_slot(i), &mut gone));
+                ir.set_tag(i, rs_kept_around(ir.tag_slot(i), &mut gone) ?? ir.vnil());
             } else if ir.is_rscope(i) and not gone.get(rs_key_v(i)) and (i.xs.len == 1) and
                       gone.get(rs_key_v(i.xs.get(0))) {
                 let p = rs_kept_around(i.xs.get(0), &mut gone);
                 ir.clear_x(i);
-                if u.notnil(p) {
-                    ir.push_x(i, p);
+                if let .some(pv) = p {
+                    ir.push_x(i, pv);
                 }
             }
             i = i.next;
@@ -309,8 +312,10 @@ fn rs_drop_lives(f: *mut ir.Func) void {
     }
     ir.forget_lives_of(f, &mut fl);
     fl.deinit();
-    if (left == 0) and (g_objs.len == 0) and u.isnil(g_main) {
-        f.rscopes = false;
+    if (left == 0) and (g_objs.len == 0) {
+        if let .none = g_main {
+            f.rscopes = false;
+        }
     }
 }
 
@@ -319,31 +324,31 @@ fn rs_key_v(v: *ir.Value) []u8 {
 }
 
 // Scope s if it stays (rs_drop_lives), else the nearest scope around it that
-// does, or nil.
-fn rs_kept_around(s0: *mut ir.Value, gone: *mut u.SymMap.[bool]) *mut ir.Value {
+// does, or .none.
+fn rs_kept_around(s0: *mut ir.Value, gone: *mut u.SymMap.[bool]) ?*mut ir.Value {
     let mut s = s0;
     let mut n: i32 = 0;
     while u.notnil(s) and gone.get(rs_key_v(s)) and (n < 64) {
         s = ir.rscope_parent(s);
         n += 1;
     }
-    if n >= 64 {
-        return ir.vnil();
+    if (n >= 64) or u.isnil(s) {
+        return .none;
     }
-    return s;
+    return .some(s);
 }
 
 /// The start of a block of items `items` (a compound statement), or of a
 /// for statement s with a declaration: a scope if it declares restricted
 /// objects, or automatic objects (rs_lives), and has no label in it. Returns
 /// what to pass to restrict_close at its end.
-fn restrict_block(items: []*mut cast.Stmt, s: *cast.Stmt) *mut ir.Value {
+fn restrict_block(items: []*mut cast.Stmt, s: ?*cast.Stmt) *mut ir.Value {
     let prev = ir.rtag;
     let mut syms = u.List.[*mut cast.CSym].empty();
     defer syms.deinit();
-    if u.notnil(s) {
-        rs_decl_syms(s.decl, &mut syms);
-        if ((syms.len == 0) and not (rs_lives() and rs_auto_decl(s.decl))) or rs_has_label(s.body, false) {
+    if let .some(st) = s {
+        rs_decl_syms(st.decl, &mut syms);
+        if ((syms.len == 0) and not (rs_lives() and rs_auto_decl(st.decl))) or rs_has_label(st.body, false) {
             return prev;
         }
     } else {
@@ -541,7 +546,7 @@ fn rs_mark_object(f: *mut ir.Func, a: *mut ir.Value, t: *mut ir.Value, k: u64) v
 fn restrict_finish(f: *mut ir.Func) void {
     ir.rtag = ir.vnil();
     g_addr = false;
-    g_main = ir.vnil();
+    g_main = .none;
     if not f.rscopes {
         g_objs.clear();
         return;
@@ -556,16 +561,17 @@ fn restrict_finish(f: *mut ir.Func) void {
     order.deinit();
     rs_check_tags(f);
     for s in g_objs.items() {
-        let t = g_scope.get(rs_key(s));
-        if u.isnil(t) or u.isvnil(s.ir) or u.isnil(t.blk) or (t.blk.fnp != f) {
-            continue;
+        if let .some(t) = g_scope.get(rs_key(s)) {
+            if u.isvnil(s.ir) or u.isnil(t.blk) or (t.blk.fnp != f) {
+                continue;
+            }
+            let a = @ptr_cast(*mut ir.Value, s.ir);
+            let slot = ir.is_op(a, ir.OP_ALLOCA) and u.notnil(a.blk) and (a.blk.fnp == f);
+            if not slot and (a.kind != ir.V_GLOBAL) {
+                continue;
+            }
+            rs_mark_object(f, a, t, g_num.get(rs_key(s)));
         }
-        let a = @ptr_cast(*mut ir.Value, s.ir);
-        let slot = ir.is_op(a, ir.OP_ALLOCA) and u.notnil(a.blk) and (a.blk.fnp == f);
-        if not slot and (a.kind != ir.V_GLOBAL) {
-            continue;
-        }
-        rs_mark_object(f, a, t, g_num.get(rs_key(s)));
     }
     g_objs.clear();
 }
@@ -575,24 +581,24 @@ fn restrict_finish(f: *mut ir.Func) void {
 // -----------------------------------------------------------------------------
 
 // The read of a restrict-qualified member that pointer expression e is,
-// plus offsets (a CV_LOAD cast of the member), or nil.
-fn rs_read_of(e: *cast.Expr) *cast.Expr {
+// plus offsets (a CV_LOAD cast of the member), or .none.
+fn rs_read_of(e: *cast.Expr) ?*cast.Expr {
     if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind != cty.TK_POINTER) {
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     if e.kind == cast.ExprKind.CAST {
         if e.op == cast.CV_LOAD {
             let x = e.a;
             if (x.kind == cast.ExprKind.MEMBER) and u.notnil(x.ty) and ((x.ty.quals & cty.Q_RESTRICT) != 0) and
                rs_struct_member(x) {
-                return e;
+                return .some(e);
             }
-            return u.nil.[cast.Expr]();
+            return .none;
         }
         if (e.op == cast.CV_VALUE) and u.notnil(e.a.ty) and (e.a.ty.kind == cty.TK_POINTER) {
             return rs_read_of(e.a);
         }
-        return u.nil.[cast.Expr]();
+        return .none;
     }
     if (e.kind == cast.ExprKind.BINARY) and ((e.op == ct.P_PLUS) or (e.op == ct.P_MINUS)) {
         if u.notnil(e.a.ty) and (e.a.ty.kind == cty.TK_POINTER) and rs_no_effects(e.b) {
@@ -602,7 +608,7 @@ fn rs_read_of(e: *cast.Expr) *cast.Expr {
             return rs_read_of(e.b);
         }
     }
-    return u.nil.[cast.Expr]();
+    return .none;
 }
 
 // Has e no effects (so that its value cannot hold a pointer it reads)?
@@ -647,18 +653,29 @@ fn rs_struct_member(x: *cast.Expr) bool {
 /// IN_RESTRICT if e is a restrict-qualified member's read, plus offsets,
 /// and the address is for an access through it (not g_addr).
 fn restrict_wrap(e: *cast.Expr, v: *mut ir.Value) *mut ir.Value {
-    if g_addr or u.isnil(g_main) or (g_main.blk.fnp != F.f) {
+    if g_addr {
         return v;
     }
-    let r = rs_read_of(e);
-    if u.isnil(r) or u.isnil(v) {
+    let mut main_tag = ir.vnil();
+    if let .some(gm) = g_main {
+        if gm.blk.fnp != F.f {
+            return v;
+        }
+        main_tag = gm;
+    } else {
+        return v;
+    }
+    if let .none = rs_read_of(e) {
+        return v;
+    }
+    if u.isnil(v) {
         return v;
     }
     // the read: the load under v's ptradds
-    let mut user = ir.vnil();
+    let mut user: ?*mut ir.Value = .none;
     let mut x = v;
     while ir.is_op(x, ir.OP_PTRADD) {
-        user = x;
+        user = .some(x);
         x = x.a;
     }
     if not ir.is_op(x, ir.OP_LOAD) or (x.ty.kind != ir.T_PTR) or ((x.flags & ir.F_VOLATILE) != 0) {
@@ -677,12 +694,12 @@ fn restrict_wrap(e: *cast.Expr, v: *mut ir.Value) *mut ir.Value {
     } else {
         ir.at_end(B, x.blk);
     }
-    let mut xs: [4]*mut ir.Value = [x, s, ir.cint(ir.t_int(64), k), g_main];
+    let mut xs: [4]*mut ir.Value = [x, s, ir.cint(ir.t_int(64), k), main_tag];
     let w = ir.intr(B, ir.IN_RESTRICT, x.ty, xs[..]);
     ir.at_end(B, cur);
-    if u.isnil(user) {
-        return w;
+    if let .some(u_inst) = user {
+        ir.set_a(u_inst, w);
+        return v;
     }
-    ir.set_a(user, w);
-    return v;
+    return w;
 }

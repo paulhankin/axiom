@@ -15,17 +15,16 @@ import "ctypes.ax" as cty;
 fn subobject(lv: *mut Level) Sub {
     let t = lv.t;
     if t.kind == cty.TK_ARRAY {
-        return Sub.{ t: t.elem, off: lv.off + lv.idx * cty.size_of(t.elem), bits: no_bits() };
+        return Sub.{ t: t.elem, off: lv.off + lv.idx * cty.size_of(t.elem), bits: .none };
     }
     if t.kind == cty.TK_VECTOR {
         // (a GNU dialect's vector: its lanes, as an array's elements)
-        return Sub.{ t: cty.qualify(t.unq.elem, t.quals), off: lv.off + lv.idx * cty.size_of(t.unq.elem),
-                     bits: no_bits() };
+        return Sub.{ t: cty.qualify(t.unq.elem, t.quals), off: lv.off + lv.idx * cty.size_of(t.unq.elem), bits: .none };
     }
     let m = t.unq.tag.members.get(@truncate(usize, lv.idx));
-    let mut bits = no_bits();
+    let mut bits: ?*mut cty.Member = .none;
     if m.is_bitfield {
-        bits = m;
+        bits = .some(m);
     }
     return Sub.{ t: cty.qualify(m.ty, t.quals), off: lv.off + m.offset, bits: bits };
 }
@@ -49,11 +48,11 @@ fn takes_part(m: *cty.Member) bool {
 
 // Moves lv's position past members that take no part; is it at a subobject?
 fn valid(lv: *mut Level) bool {
-    return valid_in(u.nil.[Filler](), lv);
+    return valid_in(.none, lv);
 }
 
-// valid, where (F not nil) a flexible array member may be initialized (flex_ok).
-fn valid_in(F: *Filler, lv: *mut Level) bool {
+// valid, where (oF is .some) a flexible array member may be initialized (flex_ok).
+fn valid_in(oF: ?*Filler, lv: *mut Level) bool {
     let t = lv.t;
     if t.kind == cty.TK_ARRAY {
         return not t.has_len or (lv.idx < t.len);
@@ -68,7 +67,13 @@ fn valid_in(F: *Filler, lv: *mut Level) bool {
     if lv.idx >= @as(u64, ms.len) {
         return false;
     }
-    return not is_flex_member(ms[@truncate(usize, lv.idx)]) or (u.notnil(F) and flex_ok(F, lv));
+    if not is_flex_member(ms[@truncate(usize, lv.idx)]) {
+        return true;
+    }
+    if let .some(F) = oF {
+        return flex_ok(F, lv);
+    }
+    return false;
 }
 
 // Past the subobject at lv's position (a union: past all of it).
@@ -84,7 +89,7 @@ fn desig_step(lv: *mut Level) void {
 // the list's object is done.
 fn desig_next(F: *Filler, st: *mut u.List.[Level]) bool {
     loop {
-        if valid_in(F, st.at_mut(st.len - 1)) {
+        if valid_in(.some(F), st.at_mut(st.len - 1)) {
             return true;
         }
         if st.len == 1 {
@@ -241,7 +246,7 @@ fn once(F: *mut Filler, it: *mut cast.Init) void {
     }
     let t = x.ty;
     let tmp = new_sym(cast.SK_OBJECT, "__range_value", x.span, t);
-    tmp.owner = cur_fn();
+    tmp.owner = cur_fn() ?? u.nil.[cast.CSym]();
     let y = u.new.[cast.Init]();
     y.kind = cast.InitKind.EXPR;
     y.span = it.span;
@@ -333,7 +338,7 @@ fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init, ri: 
         }
         if k + 1 < n {
             let s = subobject(st.at_mut(st.len - 1));
-            if u.notnil(s.bits) {
+            if has_bits(s.bits) {
                 err(item.desigs.at(k + 1).span, "C3072", "a designator for a part of a bit-field");
                 return false;
             }
@@ -348,7 +353,7 @@ fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init, ri: 
 // index initialized, plus 1).
 fn fill_list(F: *mut Filler, s: Sub, it: *mut cast.Init) u64 {
     let items = it.items.items();
-    if cty.is_scalar(s.t) or u.notnil(s.bits) {
+    if cty.is_scalar(s.t) or has_bits(s.bits) {
         braced_scalar(F, s, it);
         return 0;
     }
@@ -475,7 +480,7 @@ fn desig_place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) vo
             union_member(F, lv);
         }
     }
-    let mut x = u.nil.[cast.Expr]();  // item's expression, typed once
+    let mut ox: ?*mut cast.Expr = .none;  // item's expression, typed once
     loop {
         let lv = st.at_mut(st.len - 1);
         let s = subobject(lv);
@@ -489,7 +494,7 @@ fn desig_place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) vo
         // there may have its flexible array member initialized too)
         F.top_level = F.top_level and (st.len == 1) and (lv.t.kind == cty.TK_UNION);
         if item.kind == cast.InitKind.LIST {
-            if not cty.is_scalar(s.t) and u.isnil(s.bits) {
+            if not cty.is_scalar(s.t) and not has_bits(s.bits) {
                 drop_inside(F, s.off, cty.size_of(s.t));
                 zero_if_copied(F, s.off, s.t);
             }
@@ -503,18 +508,16 @@ fn desig_place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) vo
             desig_step(lv);
             return;
         }
-        if cty.is_scalar(s.t) or u.notnil(s.bits) {
-            if u.isnil(x) {
-                x = rv(e);
-            }
+        if cty.is_scalar(s.t) or has_bits(s.bits) {
+            let x = ox ?? rv(e);
+            ox = .some(x);
             expr_item(F, s, x);
             desig_step(lv);
             return;
         }
         if e.kind != cast.ExprKind.STRING {
-            if u.isnil(x) {
-                x = rv(e);
-            }
+            let x = ox ?? rv(e);
+            ox = .some(x);
             if is_err(x) {
                 F.errors = true;
                 desig_step(lv);

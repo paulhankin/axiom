@@ -14,27 +14,27 @@ import "std/c/rt/wideint" as wi;
 // Enumerations (6.7.2.2)
 // -----------------------------------------------------------------------------
 
-// The fixed underlying type of ts (C23), checked; nil if none (or invalid).
-fn fixed_type(ts: *mut cast.TagSpec) *mut cty.CType {
+// The fixed underlying type of ts (C23), checked; .none if none (or invalid).
+fn fixed_type(ts: *mut cast.TagSpec) ?*mut cty.CType {
     if u.isnil(ts.fixed) {
-        return u.nil.[cty.CType]();
+        return .none;
     }
     let t = type_name(ts.fixed);
     if cty.is_error(t) {
-        return u.nil.[cty.CType]();
+        return .none;
     }
     if not cty.is_integer(t) or (t.kind == cty.TK_ENUM) {
         err(ts.fixed.span, "C3075",
             u.f1("the underlying type of an enumeration is %s, not an integer type that is not an enumeration", tq(t)));
-        return u.nil.[cty.CType]();
+        return .none;
     }
     if cty.is_bitint(t.unq) {
         // (C23 6.7.2.2p5)
         err(ts.fixed.span, "C3075", u.f1("the underlying type of an enumeration is %s, a bit-precise integer type",
                                          tq(t)));
-        return u.nil.[cty.CType]();
+        return .none;
     }
-    return cty.unqual(t);
+    return .some(cty.unqual(t));
 }
 
 // A GNU dialect: an enumeration named before its list (6.7.2.3p3 asks for
@@ -49,21 +49,23 @@ fn forward_enum(ts: *mut cast.TagSpec) void {
 /// specifier and a ';'), declaring and defining it as it says.
 pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
     let named = ts.name.len > 0;
-    let ft = fixed_type(ts);
+    let oft = fixed_type(ts);
     if u.notnil(ts.fixed) and not ts.has_body and not lone {
         err(ts.fixed.span, "C3075",
             "an enumeration's underlying type is given only with its list, or in a declaration of the tag alone");
     }
     let declares = ts.has_body or u.notnil(ts.fixed);
-    let mut t = u.nil.[cty.CType]();
+    let mut ot: ?*mut cty.CType = .none;
     if declares {
         if named {
-            t = lookup_tag_here(ts.name);
+            ot = lookup_tag_here(ts.name);
         }
     } else if named {
-        t = lookup_tag(ts.name);
+        ot = lookup_tag(ts.name);
     }
-    if u.notnil(t) {
+    let mut t = cty.t_error;
+    if let .some(pt) = ot {
+        t = pt;
         if t.kind != cty.TK_ENUM {
             err_note(ts.name_span, "C3011",
                      u.f2("'%s' was declared as %s", ts.name, u.cat3("a different kind of tag (", kind_word(t.kind),
@@ -78,9 +80,14 @@ pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
                 err_note(ts.name_span, "C3075",
                          u.f1("'enum %s' is declared with a fixed underlying type and without one", ts.name), ti.span,
                          "declared before here");
-            } else if prev_fixed and u.notnil(ft) and not cty.compatible_unq(ti.fixed, ft) {
-                err_note(ts.name_span, "C3075", u.f3("'enum %s' has underlying type %s, declared before as %s", ts.name,
-                                                     tq(ft), tq(ti.fixed)), ti.span, "declared before here");
+            } else if prev_fixed {
+                if let .some(ft) = oft {
+                    if not cty.compatible_unq(ti.fixed, ft) {
+                        err_note(ts.name_span, "C3075", u.f3("'enum %s' has underlying type %s, declared before as %s",
+                                                             ts.name, tq(ft), tq(ti.fixed)), ti.span,
+                                 "declared before here");
+                    }
+                }
             }
             if ts.has_body and ti.listed and (std() >= co.C23) {
                 // (C23: the same constants again, with the same values, are the same type: 6.7.2.3)
@@ -118,7 +125,7 @@ pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
         if named {
             declare_tag(ts.name, t);
         }
-        if u.notnil(ft) {
+        if let .some(ft) = oft {
             t.tag.fixed = ft;
             cty.set_enum_base(t, ft);  // (complete from here on: C23 6.7.2.2p?)
         }
@@ -196,14 +203,14 @@ fn sym_val(s: *cast.CSym) Val {
     return Val.{ w: [s.wide[0], s.wide[1], s.wide[2]], huge: false };
 }
 
-// The first of the types `cands` that holds v; nil if none.
-fn first_fit(cands: []mut *mut cty.CType, x: Val) *mut cty.CType {
+// The first of the types `cands` that holds x; .none if none.
+fn first_fit(cands: []mut *mut cty.CType, x: Val) ?*mut cty.CType {
     for c in cands {
         if fitsv(c, x) {
-            return c;
+            return .some(c);
         }
     }
-    return u.nil.[cty.CType]();
+    return .none;
 }
 
 // The integer types wider than int an enumeration's type (or a constant's
@@ -233,12 +240,14 @@ fn wider_types(signed: bool) []mut *mut cty.CType {
 fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
     let fixed = t.tag.fixed;
     let key = u.addr_key(@int_from_ptr(t.tag));
-    let mut old = g_enum_consts.get(key);
+    let mut old = u.nil.[u.List.[*mut cast.CSym]]();
     let mut same = true;
     if not again {
         old = u.new.[u.List.[*mut cast.CSym]]();
-        g_enum_consts.put(key, old);
-    } else if u.isnil(old) {
+        g_enum_consts.put(key, .some(old));
+    } else if let .some(prev_old) = g_enum_consts.get(key) {
+        old = prev_old;
+    } else {
         return false;
     }
     let mut k: usize = 0;
@@ -298,14 +307,13 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
                 } else {
                     // (6.7.2.2p11: a wider type of the previous constant's
                     // signedness, not a bit-precise one)
-                    let nt = first_fit(wider_types(prev_ty.is_signed), x);
-                    if u.isnil(nt) {
+                    if let .some(nt) = first_fit(wider_types(prev_ty.is_signed), x) {
+                        ety = nt;
+                    } else {
                         err(en.span, "C3013",
                             u.f1("the value of '%s' (the previous one plus 1) is outside the range of every integer type",
                                  en.name));
                         x = prev;
-                    } else {
-                        ety = nt;
                     }
                 }
             } else {
@@ -336,8 +344,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
             k += 1;
             continue;
         }
-        let prior = lookup_here(en.name);
-        if u.notnil(prior) {
+        if let .some(prior) = lookup_here(en.name) {
             err_note(en.span, "C3002", u.f1("redefinition of '%s'", en.name), prior.span, "declared before here");
         }
         let mut st = ety;
@@ -366,7 +373,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
     }
     // the compatible type: unsigned int if no value is negative, else int,
     // or (C23) the first wider type that holds them all
-    let mut base = u.nil.[cty.CType]();
+    let mut obase: ?*mut cty.CType = .none;
     let mut cands = u.List.[*mut cty.CType].empty();
     if gnu_packed(&ts.attrs) {
         // (a GNU dialect's packed enumeration: the smallest type, from char on)
@@ -387,13 +394,16 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
         cands.push(c);
     }
     for c in cands.items() {
-        if u.isnil(base) and fitsv(c, min) and fitsv(c, max) {
-            base = c;
+        if fitsv(c, min) and fitsv(c, max) {
+            obase = .some(c);
+            break;
         }
     }
-    if u.isnil(base) {
+    let mut base = cty.t_llong;
+    if let .some(b) = obase {
+        base = b;
+    } else {
         err(ts.span, "C3013", "no integer type can represent all the values of the enumeration's constants");
-        base = cty.t_llong;
     }
     cty.set_enum_base(t, base);
     if not all_int {

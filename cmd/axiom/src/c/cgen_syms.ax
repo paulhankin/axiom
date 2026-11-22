@@ -78,11 +78,11 @@ pub fn param_types(s: *mut cast.CSym) []mut *mut cty.CType {
     return s.ty.params;
 }
 
-/// Function s's signature (nil ty: a function without a prototype that is
+/// Function s's signature (.none: a function without a prototype that is
 /// not defined, whose signature comes from its calls).
-pub fn func_sig(s: *mut cast.CSym) Sig {
+pub fn func_sig(s: *mut cast.CSym) ?Sig {
     if not s.ty.proto and u.isnil(s.def) {
-        return Sig.{ ty: u.nil.[ir.Ty](), plan: u.nil.[abi.Plan]() };
+        return .none;
     }
     let ps = param_types(s);
     if u.notnil(s.nest_parent) {
@@ -99,32 +99,36 @@ pub fn func_sig(s: *mut cast.CSym) Sig {
             sig = sig_of(s.ty.ret, ps2[0..ps.len + 1], ps.len + 1, false, u.notnil(s.def));
         }
         abi.add_chain(sig.plan);
-        return Sig.{ ty: sig.plan.fty, plan: sig.plan };
+        return .some(Sig.{ ty: sig.plan.fty, plan: sig.plan });
     }
-    return sig_of(s.ty.ret, ps, ps.len, s.ty.variadic, u.notnil(s.def));
+    return .some(sig_of(s.ty.ret, ps, ps.len, s.ty.variadic, u.notnil(s.def)));
 }
 
-/// The IR function of C function s; `sig`: the signature to declare it
+/// The IR function of C function s; `sig0`: the signature to declare it
 /// with if it has none of its own (a call's, without a prototype).
-pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
+pub fn func_of(s: *mut cast.CSym, sig0: ?Sig) *mut ir.Func {
     if not u.isvnil(s.ir) {
         return @ptr_cast(*mut ir.Func, s.ir);
     }
-    let target = alias_target(s);
-    if u.notnil(target) {
+    if let .some(target) = alias_target(s) {
         let tf = func_of(target, sig0);
         s.ir = @ptr_cast(*mut void, tf);
         return tf;
     }
+    let mut ty = T_void;
+    let mut plan: ?*mut abi.Plan = .none;
     let mut sig = func_sig(s);
-    if u.isnil(sig.ty) {
+    if let .none = sig {
         sig = sig0;
     }
-    if u.isnil(sig.ty) {
+    if let .some(sg) = sig {
+        ty = sg.ty;
+        plan = .some(sg.plan);
+    } else {
         // (the address of a function without a prototype that this unit
         // neither defines nor has called yet: a declaration of no
         // parameters; a call converts, as through any function pointer)
-        sig = Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), plan: u.nil.[abi.Plan]() };
+        ty = ir.t_fn(T_void, [], false);
     }
     let name = symbol_name(s);
     let mut f = ir.get_function(M, name);
@@ -147,17 +151,17 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
         dbi.note_func_name(name, s.name);
     }
     if u.isnil(f) {
-        f = ir.add_function(M, name, sig.ty);
+        f = ir.add_function(M, name, ty);
     } else if u.notnil(s.def) and ir.is_decl(f) {
         // a declaration (another unit's, or an Axiom extern "C" one) of the
         // function this unit defines: the definition's signature, whose
         // parameters may differ (a variadic definition's save area)
-        ir.retype_decl(f, sig.ty);
+        ir.retype_decl(f, ty);
         f.import_module = u.nosym();
         f.import_name = u.nosym();
     } else if ir.is_decl(f) {
         // (another declaration: a function already defined keeps its own)
-        ir.retype_decl(f, sig.ty);
+        ir.retype_decl(f, ty);
     }
     cdbg.note_func(f, s);
     if (s.linkage != cast.LK_EXTERNAL) or cs.is_inline_def(s) {
@@ -169,8 +173,10 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     } else if s.weak and u.notnil(s.def) and (f.linkage != ir.LINK_INTERNAL) {
         f.linkage = ir.LINK_WEAK;  // (kept: no unit has another definition; an object's users may)
     }
-    if u.notnil(sig.plan) and (ir.is_decl(f) or u.notnil(s.def)) {
-        mark_func(f, sig.plan);
+    if let .some(pl) = plan {
+        if ir.is_decl(f) or u.notnil(s.def) {
+            mark_func(f, pl);
+        }
     }
     if u.isnil(s.def) and is_wasm and (s.linkage == cast.LK_EXTERNAL) and not s.weak {
         // a function the program does not define: the host's (not a weak
@@ -179,8 +185,8 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
         f.import_name = name;
     }
     gnu_func(s, f);
-    if u.notnil(sig.plan) {
-        alloc_facts(s, f, sig.plan);
+    if let .some(pl) = plan {
+        alloc_facts(s, f, pl);
     }
     if u.isnil(s.def) and (s.linkage == cast.LK_EXTERNAL) and tg.is_windows() {
         c_library_import(name);
@@ -219,8 +225,7 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
     if not u.isvnil(s.ir) {
         return @ptr_cast(*mut ir.Value, s.ir);
     }
-    let target = alias_target(s);
-    if u.notnil(target) {
+    if let .some(target) = alias_target(s) {
         let tv = object_addr(target);
         s.ir = @ptr_cast(*mut void, tv);
         return tv;
@@ -269,23 +274,24 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
 // The GNU dialects' attributes of functions and objects (csema_gnu.ax)
 // -----------------------------------------------------------------------------
 
-// The entity s is another name for (alias("target")), or nil. The target
+// The entity s is another name for (alias("target")), or .none. The target
 // is defined in the same unit (else C3090); references to s are to it, and
 // s has no symbol of its own.
-fn alias_target(s: *mut cast.CSym) *mut cast.CSym {
+fn alias_target(s: *mut cast.CSym) ?*mut cast.CSym {
     let n = cs.note_of(s);
     if u.isnil(n) or (n.alias.len == 0) {
-        return u.nil.[cast.CSym]();
+        return .none;
     }
-    let t = g_defs.get(n.alias);
-    if u.isnil(t) or (t == s) or (t.kind != s.kind) {
-        _ = dg.err(n.alias_span, "C3090",
-                   u.f1("the target of the alias, '%s', is not a function or object of the same kind defined in this translation unit",
-                        n.alias));
-        n.alias = "";
-        return u.nil.[cast.CSym]();
+    if let .some(t) = g_defs.get(n.alias) {
+        if (t != s) and (t.kind == s.kind) {
+            return .some(t);
+        }
     }
-    return t;
+    _ = dg.err(n.alias_span, "C3090",
+               u.f1("the target of the alias, '%s', is not a function or object of the same kind defined in this translation unit",
+                    n.alias));
+    n.alias = "";
+    return .none;
 }
 
 // An alias of external linkage (the attribute alias, a GNU dialect) is a
@@ -300,7 +306,7 @@ fn note_alias(s: *mut cast.CSym) void {
     if u.isnil(n) or (n.alias.len == 0) or (s.linkage != cast.LK_EXTERNAL) {
         return;
     }
-    let mut tv = u.nil.[ir.Value]();
+    let mut tv = ir.vnil();
     if s.kind == cast.SK_FUNC {
         tv = func_of(s, func_sig(s)).val;
     } else {
@@ -317,20 +323,25 @@ fn note_alias(s: *mut cast.CSym) void {
 // the function's address (ir.Alias.ifunc); calls and addresses are the
 // name's, which the function's declaration stays.
 fn note_ifunc(s: *mut cast.CSym, n: *mut cs.Note) void {
-    let t = g_defs.get(n.ifunc);
-    if u.isnil(t) or (t == s) or (t.kind != cast.SK_FUNC) or u.isnil(t.def) {
-        _ = dg.err(n.alias_span, "C3090",
-                   u.f1("the resolver of the indirect function, '%s', is not a function defined in this translation unit",
-                        n.ifunc));
+    if let .some(t) = g_defs.get(n.ifunc) {
+        if (t == s) or (t.kind != cast.SK_FUNC) or u.isnil(t.def) {
+            _ = dg.err(n.alias_span, "C3090",
+                       u.f1("the resolver of the indirect function, '%s', is not a function defined in this translation unit",
+                            n.ifunc));
+            return;
+        }
+        if u.notnil(s.def) {
+            _ = dg.err(n.alias_span, "C3090",
+                       u.f1("the indirect function '%s' has a body: its resolver is its definition", s.name));
+            return;
+        }
+        let tf = func_of(t, func_sig(t));
+        ir.add_ifunc(M, symbol_name(s), tf.val, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
         return;
     }
-    if u.notnil(s.def) {
-        _ = dg.err(n.alias_span, "C3090", u.f1("the indirect function '%s' has a body: its resolver is its definition",
-                                               s.name));
-        return;
-    }
-    let tf = func_of(t, func_sig(t));
-    ir.add_ifunc(M, symbol_name(s), tf.val, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
+    _ = dg.err(n.alias_span, "C3090",
+               u.f1("the resolver of the indirect function, '%s', is not a function defined in this translation unit",
+                    n.ifunc));
 }
 
 // The IR function f of C function s: what its GNU attributes ask, and
@@ -425,7 +436,7 @@ fn ir_param(plan: *abi.Plan, k: i32) i32 {
     if (k < 1) or (@int_cast(usize, k) > plan.args.len) {
         return -1;
     }
-    let a = plan.args[@int_cast(usize, k - 1)];
+    let a = &plan.args[@int_cast(usize, k - 1)];
     if a.kind != abi.A_SCALAR {
         return -1;
     }

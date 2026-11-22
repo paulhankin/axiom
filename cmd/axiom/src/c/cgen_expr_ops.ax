@@ -26,9 +26,11 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
             ld_copy(p, v, is_volatile(lt));
             return p;
         }
-        if cty.is_wint(lt) and u.isnil(bf_of(e.a)) {
-            wint_copy(lt, p, v, is_volatile(lt));
-            return p;
+        if cty.is_wint(lt) {
+            if let .none = bf_of(e.a) {
+                wint_copy(lt, p, v, is_volatile(lt));
+                return p;
+            }
         }
         if cty.is_record(lt) {
             copy(lt, p, v);
@@ -72,11 +74,11 @@ fn compound_value(e: *mut cast.Expr, old: *mut ir.Value, r: *mut ir.Value) *mut 
         let x = convert(old, lt, xt);
         let mut cx = cx_real_t(x, xt);
         if cty.is_complex(xt) {
-            cx = cx_parts(xt, x);
+            cx = cx_of(cx_parts(xt, x));
         }
         let mut cy = cx_real_t(r, e.b.ty);
         if cty.is_complex(e.b.ty) {
-            cy = cx_parts(e.b.ty, r);
+            cy = cx_of(cx_parts(e.b.ty, r));
         }
         let res = cx_make(ot, cx_arith(complex_op(expr_base_op(e.op)), ot, cx, cy));
         nv = convert(res, ot, lt);
@@ -125,10 +127,10 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
     let ot = e.opty;
     let post = e.kind == cast.ExprKind.POSTFIX;
     let mut op = ct.P_PLUS;
-    let mut r = ir.vnil();
+    let mut r: ?*mut ir.Value = .none;
     if e.kind == cast.ExprKind.ASSIGN {
         op = expr_base_op(e.op);
-        r = rv(e.b);  // (before the object: the loop evaluates no operand again)
+        r = .some(rv(e.b));  // (before the object: the loop evaluates no operand again)
     } else if e.op == ct.P_DEC {
         op = ct.P_MINUS;
     }
@@ -144,14 +146,14 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
         let mut x = ir.vnil();
         if ptr_ok {
             let mut n = usz(1);
-            if u.notnil(r) {
-                n = int_resize(index_of(r, e.b.ty), true, T_isz);
+            if let .some(rhs) = r {
+                n = int_resize(index_of(rhs, e.b.ty), true, T_isz);
             }
             x = no_wrap(ir.mul(B, n, vla_size_value(ot.elem)), ir.OP_MUL);
-        } else if u.isnil(r) {
-            x = ir.cint(tt, 1);
+        } else if let .some(rhs) = r {
+            x = int_resize(rhs, ot.is_signed, tt);
         } else {
-            x = int_resize(r, ot.is_signed, tt);
+            x = ir.cint(tt, 1);
         }
         let mut rop = ir.RMW_ADD;
         let mut io = ir.OP_ADD;
@@ -181,7 +183,7 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
     let old = up.old;
     let mut nv = ir.vnil();
     if e.kind == cast.ExprKind.ASSIGN {
-        nv = compound_value(e, old, r);
+        nv = compound_value(e, old, r ?? ir.vnil());
     } else if ot.kind == cty.TK_POINTER {
         nv = offset(old, usz(1), vla_size_value(ot.elem), op == ct.P_MINUS);
     } else {
@@ -211,8 +213,9 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
     let no = new_block("else");
     let done = new_block("cond");
     let cplx = cty.is_complex(e.ty);
-    let mut px = cx_real(ir.vnil());
-    let mut py = cx_real(ir.vnil());
+    let zp = Pair.{ re: ir.vnil(), im: ir.vnil() };
+    let mut px = zp;
+    let mut py = zp;
     let mut x = ir.vnil();
     if u.isnil(e.b) {
         // `a ?: c` (a GNU dialect): a once, its value if nonzero
@@ -316,26 +319,29 @@ fn expr_call(e: *mut cast.Expr) *mut ir.Value {
         return va_builtin(e, vs[0..n]);
     }
     let fe = e.a;
-    if (n > 0) and u.notnil(INL) and (e.args.get(n - 1).kind == cast.ExprKind.CALL) and
-       (e.args.get(n - 1).op == cs.GB_VA_PACK) {
-        // (in an inlined call: __builtin_va_arg_pack () is its variable arguments)
-        let e2 = u.new.[cast.Expr]();
-        e2.* = e.*;
-        let mut xs = u.List.[*mut cast.Expr].empty();
-        for i in 0..(n - 1) {
-            xs.push(e.args.get(i));
+    if n > 0 {
+        if let .some(inl) = INL {
+            if (e.args.get(n - 1).kind == cast.ExprKind.CALL) and (e.args.get(n - 1).op == cs.GB_VA_PACK) {
+                // (in an inlined call: __builtin_va_arg_pack () is its variable arguments)
+                let e2 = u.new.[cast.Expr]();
+                e2.* = e.*;
+                let mut xs = u.List.[*mut cast.Expr].empty();
+                for i in 0..(n - 1) {
+                    xs.push(e.args.get(i));
+                }
+                for x in inl.pack.items() {
+                    xs.push(x);
+                }
+                e2.args = xs;
+                return expr_call(e2);
+            }
         }
-        for x in INL.pack.items() {
-            xs.push(x);
-        }
-        e2.args = xs;
-        return expr_call(e2);
     }
     if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) and
        u.notnil(fe.a.sym) {
         // (a function whose inline definition forwards its variable
         // arguments: the definition inlined, csema_marks.va_wrapper)
-        let mut ps: []*mut cast.CSym = u.newn.[*mut cast.CSym](1)[0..0];
+        let mut ps: []*mut cast.CSym = [];
         let w = cs.va_wrapper(fe.a.sym, &mut ps);
         if u.notnil.[cast.Decl](w) {
             let mut done = false;
@@ -359,7 +365,7 @@ fn expr_call(e: *mut cast.Expr) *mut ir.Value {
     let mut callee = ir.vnil();
     let mut noreturn = false;
     let mut callee_name: []u8 = "";
-    let mut va_nested = u.nil.[cast.CSym]();
+    let mut va_nested: ?*mut cast.CSym = .none;
     if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
         noreturn = cs.is_noreturn(fe.a.sym);
         callee_name = fe.a.sym.name;
@@ -370,12 +376,14 @@ fn expr_call(e: *mut cast.Expr) *mut ir.Value {
             // (a nested function: its signature, with its chain after the
             // arguments: the record of its enclosing function's call; a
             // variadic one's entry, below)
-            sig = func_sig(fe.a.sym);
+            if let .some(fs) = func_sig(fe.a.sym) {
+                sig = fs;
+            }
             if fe.a.sym.ty.variadic {
-                va_nested = fe.a.sym;
+                va_nested = .some(fe.a.sym);
             }
         }
-        let f = func_of(fe.a.sym, sig);
+        let f = func_of(fe.a.sym, .some(sig));
         callee = f.val;
         if same_sig(f.ty, sig.ty) {
             sig.ty = f.ty;
@@ -413,38 +421,48 @@ fn expr_call(e: *mut cast.Expr) *mut ir.Value {
     if not (tg.is_wasm() and lib_unit) {
         next_site = call_site(e.span, fname, callee_name);
     }
-    if (sig.plan.chain >= 0) and (fe.kind == cast.ExprKind.CAST) and (fe.a.kind == cast.ExprKind.IDENT) and
-       u.isnil(va_nested) {
-        next_chain = chain_for(fe.a.sym);
+    if (sig.plan.chain >= 0) and (fe.kind == cast.ExprKind.CAST) and (fe.a.kind == cast.ExprKind.IDENT) {
+        if let .none = va_nested {
+            next_chain = chain_for(fe.a.sym);
+        }
     }
     // under FENV_ROUND's static direction, a function that it does not apply
     // to runs in the dynamic mode (and may change it): restored for the
     // call, read again after it, and the static direction set again
-    let dynamic = u.notnil(fp_slot) and not static_rounding_fn(callee_name);
-    if dynamic {
-        with_rounding(ir.load(B, ir.t_int(64), fp_slot));
+    let mut active_fp: ?*mut ir.Value = .none;
+    if not static_rounding_fn(callee_name) {
+        if let .some(slot) = fp_slot {
+            with_rounding(ir.load(B, ir.t_int(64), slot));
+            active_fp = .some(slot);
+        }
     }
     // (and FENV_DEC_ROUND's likewise, for the functions of C23 7.6.3's table)
-    let ddynamic = u.notnil(fp_dslot) and not static_dec_rounding_fn(callee_name);
+    let mut active_dfp: ?*mut ir.Value = .none;
     let mut dstatic = ir.vnil();
-    if ddynamic {
-        dstatic = dec_swap(ir.load(B, ir.t_int(32), fp_dslot));
+    if not static_dec_rounding_fn(callee_name) {
+        if let .some(dslot) = fp_dslot {
+            dstatic = dec_swap(ir.load(B, ir.t_int(32), dslot));
+            active_dfp = .some(dslot);
+        }
     }
     let mut r = ir.vnil();
-    if u.notnil(va_nested) {
-        r = call_variadic(va_nested, ats[0..n], vs[0..n], nnamed);
+    if let .some(vn) = va_nested {
+        r = call_variadic(vn, ats[0..n], vs[0..n], nnamed);
     } else {
         r = emit_call(sig.plan, sig.ty, callee, vs[0..n]);
     }
     nest_unhook();
-    if ddynamic and not noreturn {
-        _ = ir.store(B, dec_swap(dstatic), fp_dslot);
-    }
-    if dynamic and not noreturn {
-        let t64 = ir.t_int(64);
-        let cur = fenv_get();
-        _ = ir.store(B, ir.and_(B, cur, ir.cint(t64, rm_mask())), fp_slot);
-        fenv_set(ir.or_(B, ir.and_(B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(cpg.fp_round(fp_state)))));
+    if not noreturn {
+        if let .some(dslot) = active_dfp {
+            _ = ir.store(B, dec_swap(dstatic), dslot);
+        }
+        if let .some(slot) = active_fp {
+            let t64 = ir.t_int(64);
+            let cur = fenv_get();
+            _ = ir.store(B, ir.and_(B, cur, ir.cint(t64, rm_mask())), slot);
+            fenv_set(
+                ir.or_(B, ir.and_(B, cur, ir.cint(t64, ~rm_mask())), ir.cint(t64, rm_bits(cpg.fp_round(fp_state)))));
+        }
     }
     if (fe.kind == cast.ExprKind.CAST) and (fe.a.kind == cast.ExprKind.IDENT) and u.notnil(fe.a.sym) and
        cs.is_cold(fe.a.sym) {

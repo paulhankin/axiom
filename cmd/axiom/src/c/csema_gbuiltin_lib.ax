@@ -164,7 +164,7 @@ fn typed_classify(e: *mut cast.Expr, rest: []u8) void {
 fn overflow(e: *mut cast.Expr, rest: []u8) void {
     let p = u.ends(rest, "_p");
     let mut op = rest[0..3];
-    let mut ty = u.nil.[cty.CType]();
+    let mut oty: ?*mut cty.CType = .none;
     if (rest.len > 4) and ((rest[0] == 's') or (rest[0] == 'u')) and not u.starts(rest, "sub_") {
         // typed: sadd, uaddl, smulll ...
         op = rest[1..4];
@@ -174,13 +174,13 @@ fn overflow(e: *mut cast.Expr, rest: []u8) void {
             longs += 1;
             k += 1;
         }
-        ty = by_longs(longs, rest[0] == 'u');
+        oty = .some(by_longs(longs, rest[0] == 'u'));
     }
     if not gbi_arity(e, 3, 3) {
         _ = bad_expr(e);
         return;
     }
-    if u.notnil(ty) {
+    if let .some(ty) = oty {
         if not gbi_arg_as(e, 0, ty) or not gbi_arg_as(e, 1, ty) or not gbi_arg_as(e, 2, cty.pointer_to(ty)) {
             _ = bad_expr(e);
             return;
@@ -300,8 +300,15 @@ fn chk_call(e: *mut cast.Expr, k: usize) bool {
 // LIB_TYPES gives, external).
 fn library(e: *mut cast.Expr, name0: []u8, code: []u8) void {
     let name = u.intern(name0);
-    let mut s = linked(name);
-    if u.isnil(s) or (s.kind != cast.SK_FUNC) {
+    let mut s = u.nil.[cast.CSym]();
+    let mut make_new = true;
+    if let .some(found) = linked(name) {
+        if found.kind == cast.SK_FUNC {
+            s = found;
+            make_new = false;
+        }
+    }
+    if make_new {
         let mut ps = u.List.[*mut cty.CType].empty();
         let mut variadic = false;
         for k in 1..code.len {
@@ -347,13 +354,13 @@ fn lock_free(e: *mut cast.Expr) void {
 
 // The type an atomic builtin works on: what argument k points to, an
 // integer or pointer type of 1, 2, 4 or 8 bytes (is_generic: any complete
-// object type, other sizes under cgen_atomic.ax's lock); nil after an error
+// object type, other sizes under cgen_atomic.ax's lock); .none after an error
 // (reported).
-fn atomic_type(e: *mut cast.Expr, k: usize, is_generic: bool) *mut cty.CType {
+fn atomic_type(e: *mut cast.Expr, k: usize, is_generic: bool) ?*mut cty.CType {
     let p = e.args.get(k);
     if (p.ty.kind != cty.TK_POINTER) {
         err(p.span, "C3082", u.f2("argument %s of '%s' is not a pointer", u.zdec(k + 1), e.a.name));
-        return u.nil.[cty.CType]();
+        return .none;
     }
     let t = p.ty.elem;
     let sz = cty.size_of(t);
@@ -365,15 +372,15 @@ fn atomic_type(e: *mut cast.Expr, k: usize, is_generic: bool) *mut cty.CType {
             u.f3("'%s' takes a pointer to %s, not %s", e.a.name, u.pick(is_generic, "a complete object type",
                                                                         "an integer or pointer type of 1, 2, 4 or 8 bytes"),
                  tq(p.ty)));
-        return u.nil.[cty.CType]();
+        return .none;
     }
     if (k == 0) and free and (cty.align_of(t) < sz) {
         // (an atomic operation is on an object aligned to its size)
         err(p.span, "C3082", u.f3("'%s' on an object of %s bytes aligned to %s (its size is needed)", e.a.name,
                                   u.udec(sz), u.udec(cty.align_of(t))));
-        return u.nil.[cty.CType]();
+        return .none;
     }
-    return t;
+    return .some(t);
 }
 
 fn atomic_call(e: *mut cast.Expr, at: Atomic) void {
@@ -446,8 +453,10 @@ fn atomic_call(e: *mut cast.Expr, at: Atomic) void {
     }
     let is_generic = (k == A_LOAD_G) or (k == A_STORE_G) or (k == A_XCHG_G) or (k == A_CMPXCHG_G) or
                      (k == A_TEST_SET) or (k == A_CLEAR);
-    let t = atomic_type(e, 0, is_generic);
-    if u.isnil(t) {
+    let mut t = cty.t_error;
+    if let .some(at_ty) = atomic_type(e, 0, is_generic) {
+        t = at_ty;
+    } else {
         _ = bad_expr(e);
         return;
     }
@@ -461,11 +470,13 @@ fn atomic_call(e: *mut cast.Expr, at: Atomic) void {
         // (the other pointers: to objects of the same size)
         let last = pick_n(k == A_CMPXCHG_G, 3, n);
         for i in 1..last {
-            let q = atomic_type(e, i, true);
-            if u.isnil(q) or (cty.size_of(q) != cty.size_of(t)) {
-                if u.notnil(q) {
+            if let .some(q) = atomic_type(e, i, true) {
+                if cty.size_of(q) != cty.size_of(t) {
                     err(e.args.get(i).span, "C3082", u.f1("the objects of '%s' are of different sizes", e.a.name));
+                    _ = bad_expr(e);
+                    return;
                 }
+            } else {
                 _ = bad_expr(e);
                 return;
             }
