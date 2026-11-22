@@ -5009,8 +5009,8 @@ static void gen_if(Stmt *s) {
     }
     if (tc == 0) {
         if (s->els) {
-            if (s->els->kind == S_IF) gen_if(s->els);
-            else gen_block(s->els);
+            if (s->els->kind == S_BLOCK) gen_block(s->els);
+            else gen_stmt(s->els);
         }
         return;
     }
@@ -5023,8 +5023,8 @@ static void gen_if(Stmt *s) {
     if (!terminated()) LLVMBuildBr(B, end);
     if (s->els) {
         LLVMPositionBuilderAtEnd(B, else_bb);
-        if (s->els->kind == S_IF) gen_if(s->els);
-        else gen_block(s->els);
+        if (s->els->kind == S_BLOCK) gen_block(s->els);
+        else gen_stmt(s->els);
         if (!terminated()) LLVMBuildBr(B, end);
     }
     LLVMPositionBuilderAtEnd(B, end);

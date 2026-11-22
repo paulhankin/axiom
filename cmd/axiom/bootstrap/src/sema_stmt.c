@@ -780,7 +780,7 @@ bool check_stmt(Stmt *s) {
         bool b = false;
         bool else_dead = dead_before;
         if (s->els) {
-            b = s->els->kind == S_IF ? check_stmt(s->els) : check_block(s->els);
+            b = s->els->kind == S_BLOCK ? check_block(s->els) : check_stmt(s->els);
             else_dead = dead_before || b || C->flow_dead;
         }
         if (dead_before) {
