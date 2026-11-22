@@ -455,8 +455,8 @@ lines at once. An agent looking for a hash map also has to search past an AV1 de
 
   | Tier | Root | Contents | Promise |
   |---|---|---|---|
-  | Core | `std/` | `mem`, `str`, `fmt`, `io`, `os` (files, paths, processes, cpu), `collections`, `hash`, `math` (scalar), `time`, `thread`, `sync`, `unicode` (UTF-8 and the tables the compiler needs), `diag`, `log`, `encoding/json` | Every rule below is enforced by the suite |
-  | Libraries | `lib/` | `net`, `crypto`, `compress`, `archive`, the rest of `encoding`, `text`, `unicode/collate` and segmentation, `math/bigint` and matrices | Tested and fuzzed as today; rules adopted module by module |
+  | Core | `std/` | `mem`, `str`, `fmt`, `io`, `os` (files, paths, processes, cpu), `collections`, `hash`, `math` (scalar), `time`, `thread`, `sync`, `unicode` (UTF-8 and the tables the compiler needs), `diag`, `log`, `encoding/json`, `encoding/binary`, `net` (sockets), the digests (`md5`, `sha1`, `sha2`, `sha3`, as `hash/...`) | Every rule below is enforced by the suite |
+  | Libraries | `lib/` | the rest of `net` (`http`, `tls`, `dns`, ...), the rest of `crypto` (ciphers, signatures, certificates), `compress`, `archive`, the rest of `encoding`, `text`, `unicode/collate` and segmentation, `math/bigint` and matrices | Tested and fuzzed as today; rules adopted module by module |
   | Media | `lib/` | `graphics`, `audio`, `os/window`, `os/cocoa`, `os/win32`, `os/gamepad` | Tested as today |
 
   The compiler resolves `import "lib/..."` from a `lib/` directory beside `std/`, by
@@ -491,13 +491,11 @@ lines at once. An agent looking for a hash map also has to search past an AV1 de
   copyleft license is added. It moves to `lib/` with the rest of `audio`.
 - **Media stays in this repository**, under `lib/`. That keeps language migrations
   atomic while the language is still making breaking changes.
-
-### Open decision
-
-- **Where `encoding/json`, `net` sockets and `crypto` hashes belong.** The table puts
-  JSON in core and the others in libraries. The compiler imports `crypto/sha2` and
-  `crypto/md5`, so either those two move to `std/hash/` or the compiler's rule becomes
-  "core plus named exceptions".
+- **JSON, sockets and the digests are core.** `encoding/json` and `net.ax` (sockets)
+  stay in `std/`. The digest functions (`md5`, `sha1`, `sha2`, `sha3`) move from
+  `crypto/` to `std/hash/`, and `encoding/binary`, which they import, stays in `std/`.
+  So core imports only core, and the compiler imports only core, with no exceptions.
+  `run.mjs` checks both.
 
 ### Verification
 
