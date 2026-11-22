@@ -1,0 +1,158 @@
+// W0711 (off by default; --warn=W0711): a local slice or pointer used after
+// it was passed to mem.free, or after a *mut Self method was called on the
+// container it came from through a *Self method. The functions that would
+// read freed memory are built and not run.
+// flags: --warn=W0711
+import "../lib/io.ax" as io;
+import "std/collections/vec" as vec;
+import "std/mem" as mem;
+
+fn freed_then_read() u8 {
+    let buf = mem.alloc.[u8](4) catch return 0;
+    buf[0] = 1;
+    mem.free(buf);
+    return buf[0];  // expect-warning: W0711
+}
+
+fn freed_then_length() usize {
+    let buf = mem.alloc.[u8](4) catch return 0;
+    mem.free(buf);
+    return buf.len;  // (its length is the slice's own: no access)
+}
+
+fn freed_on_a_path_that_leaves(bad: bool) u8 {
+    let buf = mem.alloc.[u8](4) catch return 0;
+    buf[0] = 1;
+    if bad {
+        mem.free(buf);
+        return 0;
+    }
+    let v = buf[0];
+    mem.free(buf);
+    return v;
+}
+
+fn freed_on_a_path_that_goes_on(bad: bool) u8 {
+    let buf = mem.alloc.[u8](4) catch return 0;
+    buf[0] = 1;
+    if bad {
+        mem.free(buf);
+    }
+    return buf[0];  // expect-warning: W0711
+}
+
+fn freed_then_replaced() u8 {
+    let mut buf = mem.alloc.[u8](4) catch return 0;
+    mem.free(buf);
+    buf = mem.alloc.[u8](4) catch return 0;
+    defer mem.free(buf);
+    buf[0] = 2;
+    return buf[0];
+}
+
+fn freed_by_defer() u8 {
+    let buf = mem.alloc.[u8](4) catch return 0;
+    defer mem.free(buf);
+    buf[0] = 3;
+    return buf[0];
+}
+
+fn destroyed_then_read() u32 {
+    let p = mem.create.[u32](5) catch return 0;
+    mem.destroy(p);
+    return p.*;  // expect-warning: W0711
+}
+
+fn view_across_a_push() u32 {
+    let mut v = vec.Vec.[u32].init();
+    defer v.deinit();
+    v.push(1) catch return 0;
+    let xs = v.items();
+    v.push(2) catch return 0;
+    return xs[0];  // expect-warning: W0711
+}
+
+fn view_across_pushes_in_a_loop() u32 {
+    let mut v = vec.Vec.[u32].init();
+    defer v.deinit();
+    v.push(1) catch return 0;
+    let xs = v.items();
+    for i in @as(u32, 0)..100 {
+        v.push(i) catch return 0;
+    }
+    return xs[0];  // expect-warning: W0711
+}
+
+fn view_after_the_push() u32 {
+    let mut v = vec.Vec.[u32].init();
+    defer v.deinit();
+    v.push(1) catch return 0;
+    v.push(2) catch return 0;
+    let xs = v.items();
+    return xs[0] + xs[1];
+}
+
+fn view_then_a_mutable_view() u32 {
+    let mut v = vec.Vec.[u32].init();
+    defer v.deinit();
+    v.push(1) catch return 0;
+    let xs = v.items();
+    let ys = v.items_mut();  // (a *mut Self method that returns a view: an accessor)
+    ys[0] = 4;
+    return xs[0];
+}
+
+fn element_that_is_a_pointer(n: *mut u32) u32 {
+    let mut v = vec.Vec.[*mut u32].init();
+    defer v.deinit();
+    v.push(n) catch return 0;
+    let p = v.get(0);  // (an element, not a view of v's memory)
+    v.push(n) catch return 0;
+    return p.*;
+}
+
+fn first(v: *vec.Vec.[u32]) []u32 {
+    return v.items();
+}
+
+fn grow(v: *mut vec.Vec.[u32]) void {
+    v.push(7) catch return;
+}
+
+fn view_through_functions() u32 {
+    let mut v = vec.Vec.[u32].init();
+    defer v.deinit();
+    v.push(1) catch return 0;
+    let xs = first(&v);
+    grow(&mut v);
+    return xs[0];  // expect-warning: W0711
+}
+
+struct Bag {
+    items: vec.Vec.[u32],
+
+    fn first_and_add(self: *mut Bag) u32 {
+        let xs = self.items.items();
+        self.items.push(9) catch return 0;
+        return xs[0];  // expect-warning: W0711
+    }
+}
+
+export fn run() void {
+    io.int(@int_cast(i64, freed_then_length()) + @as(i64, freed_on_a_path_that_leaves(false)) +
+           @as(i64, freed_then_replaced()) + @as(i64, freed_by_defer()) + @as(i64, view_after_the_push()) +
+           @as(i64, view_then_a_mutable_view()));
+    // expect: 17
+    let mut n: u32 = 6;
+    io.int(@as(i64, element_that_is_a_pointer(&mut n)));
+    // expect: 6
+    _ = freed_then_read;
+    _ = freed_on_a_path_that_goes_on;
+    _ = destroyed_then_read;
+    _ = view_across_a_push;
+    _ = view_across_pushes_in_a_loop;
+    _ = view_through_functions;
+    let mut b = Bag.{ items: vec.Vec.[u32].init() };
+    _ = &mut b;
+    _ = Bag.first_and_add;
+}

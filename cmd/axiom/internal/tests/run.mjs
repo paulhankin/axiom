@@ -2107,6 +2107,37 @@ await section('axiom test', {
     if (/output:/.test(quiet.stdout)) return `output shown without the flag:\n${quiet.stdout}`;
     return /ok   prints \(\d+ ms\)\n     output:\n       \| hello from the test\n/.test(shown.stdout) ? null : `output not shown:\n${shown.stdout}`;
   },
+  // (the address sanitizer is axiom test's default, spec §16.8; --sanitize=none
+  // turns it off, and wasm64 builds without it, quietly)
+  '--sanitize: address by default, none when asked': () => {
+    const dir = path.join(tmp, 'testsan');
+    fs.mkdirSync(dir, { recursive: true });
+    const src = path.join(dir, 't.ax');
+    fs.writeFileSync(src, ['test "the sanitizer is on" {', '    @expect(@sanitize_address());', '}', ''].join('\n'));
+    const on = spawnSync(compiler, ['test', src, ...targetFlags], { encoding: 'utf8' });
+    if (on.status !== 0) return `by default:\n${on.stdout}${on.stderr}`;
+    const off = spawnSync(compiler, ['test', src, '--sanitize=none', '--format=agent-json', ...targetFlags], { encoding: 'utf8' });
+    const t = off.status === 1 ? JSON.parse(off.stdout).tests[0] : null;
+    if (!t || t.failure.code !== 'T0011') return `--sanitize=none:\n${off.stdout}${off.stderr}`;
+    if (native) return null;
+    const w64 = spawnSync(compiler, ['test', src, '--target=wasm64', `--no-run=${path.join(dir, 't64.wasm')}`], { encoding: 'utf8' });
+    if (w64.status !== 0 || w64.stderr) return `wasm64:\n${w64.stdout}${w64.stderr}`;
+    const wasm = fs.readFileSync(path.join(dir, 't64.wasm'));
+    return wasm.includes(Buffer.from('AddressSanitizer')) ? 'wasm64: built with the sanitizer' : null;
+  },
+  // (testing/lifetime.ax, which fails with T0012 under axiom test: W0711 is
+  // off by default, and with --warn=W0711 at both of its uses after free)
+  'W0711 is off by default, and --warn=W0711 turns it on': () => {
+    const f = path.join(root, 'cmd/axiom/internal/tests/testing/lifetime.ax');
+    const warnings = (flags) => {
+      const r = spawnSync(compiler, ['check', f, '--format=agent-json', ...flags], { encoding: 'utf8' });
+      return JSON.parse(r.stdout).diagnostics.map((x) => `${x.code}:${x.span.start_line}:${x.span.start_col}`).join(' ');
+    };
+    const off = warnings([]);
+    if (off) return `without the flag: ${off}`;
+    const on = warnings(['--warn=W0711']);
+    return on === 'W0711:25:13 W0711:25:20' ? null : `with --warn=W0711: ${on}`;
+  },
 }, { timed: false });
 
 // The tour (docs/tour.md): each program in docs/tour/ appears verbatim in

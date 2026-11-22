@@ -5,11 +5,13 @@ check them. To report a vulnerability, see [`SECURITY.md`](../SECURITY.md).
 
 ## What "safe" means here
 
-Checked code cannot corrupt memory: indexing and slicing are bounds-checked, and
-integer overflow wraps (spec §7.6), so sizes computed from input use
-`@mul_checked`/`@add_checked` and a wrapped index still meets a bounds check. Where
-std uses raw pointers (the allocator, the runtime, codecs' inner loops), it keeps to
-the access rule of spec §12.1. Input can still cause harm in four ways:
+Checked code cannot reach outside an object: indexing and slicing are bounds-checked,
+and integer overflow wraps (spec §7.6), so sizes computed from input use
+`@mul_checked`/`@add_checked` and a wrapped index still meets a bounds check. Two rules
+are std's own to keep (spec §12.1): where it uses raw pointers (the allocator, the
+runtime, codecs' inner loops), they stay inside their objects, and it uses no memory
+after freeing it, through a pointer or a slice, which the address sanitizer checks in
+its tests (`axiom test` builds with it). Input can still cause harm in four ways:
 
 - **Traps.** An out-of-bounds index (or an overflow, in an `--overflow=trap` build) that
   input can reach kills the process. For a server, that is a denial of service.

@@ -48,9 +48,10 @@
   representations.)
 - **Implementation-defined** behavior is documented by each implementation and fixed
   for a given target (for example, the width of `usize`).
-- There is **no undefined behavior**. Every well-formed program has one meaning for each
-  input, apart from the explicitly listed unspecified values and implementation-defined
-  choices.
+- There is **no undefined behavior** in a program that keeps the two rules of §12.1: a
+  raw pointer stays inside its object, and memory is not used after it is freed. Such a
+  program has one meaning for each input, apart from the explicitly listed unspecified
+  values and implementation-defined choices.
 
 Grammar uses EBNF: `::=` is a definition, `|` is alternation, `?` means optional, `*` means
 zero or more, `+` means one or more, `( )` groups, and `"x"` is a literal token.
@@ -67,7 +68,7 @@ Each principle below is paired with the concrete rules that enforce it.
 |---|---|
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `axiom fmt`. |
-| **No undefined behavior outside raw pointers** | Arithmetic, shifts, casts, slices, arrays and every other checked operation have defined results or trap. The one rule a program can break unchecked is that an access through a raw pointer stays inside the object the pointer came from (§12.1): on WebAssembly the damage stays inside the module's memory, and on native targets it is undefined behavior. Compilers MUST NOT optimize on any other assumption. |
+| **Every operation checked or defined, but for two rules** | Arithmetic, shifts, casts, slices, arrays and every other operation have defined results or trap, except where a program breaks one of two rules it must keep itself (§12.1): an access through a raw pointer stays inside the object the pointer came from, and memory is not used after it is freed, through a pointer or a slice. On WebAssembly the damage of breaking them stays inside the module's memory, and on native targets it is undefined behavior. The address sanitizer (§16.8) catches breaks of the second. Compilers MUST NOT optimize on any other assumption. |
 | **First-class SIMD** | Vector types of 128, 256 and 512 bits are primitives. WebAssembly's semantics are the reference semantics, on every target. |
 | **Explicit allocation** | No language construct allocates. Heap memory comes from one global allocator, `std/mem` (§15.1), through calls you can see (`mem.alloc`, `mem.free`); `defer` releases it. |
 
@@ -1885,12 +1886,25 @@ exposed is reached only through the function's own pointers to it, that what the
 allocator returns is a new object no earlier pointer points into, and that constant data
 does not change.
 
-The checked operations never break the rule: indexing and slicing (§7.8), `@load` and
-`@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and `for` over a slice all trap
-first, given a slice that some operation made (not one torn by a data race, §12.8.2). Only a raw pointer can break it: one that dangles (its object freed, or its
-function returned), one moved outside its object by `@ptr_add` (§5.7) or made from a
-wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code in C
-(§14.5.5) can break it too. What happens then depends on the target:
+The checked operations keep the first half of the rule, and not the second. Indexing and
+slicing (§7.8), `@load` and `@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and
+`for` over a slice all trap before they reach outside the object a slice comes from,
+given a slice that some operation made (not one torn by a data race, §12.8.2). Nothing
+checks that the object still exists. So a program must keep two rules itself:
+
+1. **A raw pointer stays inside its object.** A pointer moved outside its object by
+   `@ptr_add` (§5.7) or made from a wrong address, or a slice made by `@slice_from_ptr`
+   with the wrong length, breaks it.
+2. **Memory is not used after it is freed**, through a pointer or a slice: a slice of an
+   allocator block kept after `mem.free`, or after a container moved its buffer (a
+   `Vec` that grew), or a pointer to a local kept after its function returned.
+
+The address sanitizer (`--sanitize=address`, §16.8), on by default in `axiom test`,
+catches most breaks of the second rule, and of the first within the heap. The warning
+`W0711` (§16.3, off by default) reports the plainest breaks of the second within one
+function: a slice used after `mem.free`, or after a `*mut Self` method of the container
+it came from. Code in C (§14.5.5) can break either. What
+happens when a rule is broken depends on the target:
 
 - **WebAssembly.** All memory is the module's one linear memory, `M[0 .. size)`. An
   access that reaches past `size` traps (`T0005`). Any other access reads or writes
@@ -1900,7 +1914,7 @@ wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code 
   linear memory. Code, return addresses and the host are outside it, and calls through
   function pointers are checked, so control flow is never hijacked.
 - **Native targets.** Pointers are machine addresses (§14.5.5), and accesses through
-  them are not checked. Breaking the rule is **undefined behavior**: an access may reach
+  them are not checked. Breaking a rule is **undefined behavior**: an access may reach
   another object, the allocator's own data, or the native stack with its return
   addresses, and so may change anything the process does. An access to unmapped memory
   (address 0 among it) stops the program with a crash report and a stack trace (§16.4);
@@ -2767,7 +2781,8 @@ axiom update [<version> | latest | head]         # replace the toolchain with an
 
 Every command accepts `--format=human` (the default) or `--format=agent-json` (§16.2)
 and `--std=<dir>`. `--target` names a target of §14; `--cpu` and `--features` select
-processor extensions (§13.4); `--sanitize=address` is §16.8, `--coverage` §16.9. `--overflow` selects the
+processor extensions (§13.4); `--sanitize=address` is §16.8 (`axiom test`'s default),
+`--coverage` §16.9. `--overflow` selects the
 overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
 every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
 overflow, to find unintended overflows; `saturate` clamps. The remaining options
@@ -3070,6 +3085,7 @@ it does (and that each is asserted by a test):
 | W0601 | Unreachable statement |
 | W0631 | Unreachable `match` arm after `else` |
 | W0655 | An inline error set contains errors the function can never return (§11.3) |
+| W0711 | A local slice or pointer used after the memory it points into was freed or may have moved (§12.1): after it was passed to `mem.free` or `mem.destroy`, or, when it came from a container through a `*Self` method (or from a function given `&container`) that returns a slice or pointer, after a `*mut Self` method that returns none was called on the same container (or it was given as `&mut`). A heuristic, within one function: it has false positives (a `*mut Self` method that does not move the memory) and misses uses through other variables. Off by default: `--warn=W0711` turns it on, for the modules whose tests would run (§17.2) |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -3369,7 +3385,12 @@ Slices, arrays and integer arithmetic are checked by the language itself (Append
 so the errors a sanitizer adds are those of memory *lifetime*: using memory after it is
 freed, freeing it twice or with the wrong size, reaching outside an allocation through a
 pointer made from an address, and never freeing it. `--sanitize=address` (accepted by
-`build`, `test` and `profile`) checks for them:
+`build`, `test` and `profile`) checks for them. `axiom test` builds with it unless given
+`--sanitize=none`: a program that keeps the rules of §12.1 behaves the same either way,
+so tests still test what ships. It applies on every target the tests run on but
+`wasm64`, and to Axiom code only (§14.5.5); for `wasm64`, a C program, or an Axiom
+program with C units, `axiom test` builds without it, and `--sanitize=address` given
+explicitly is refused for C sources as for `build`.
 
 - The global allocator (`std/mem`) puts a header before each allocation and a redzone
   after it, and keeps *shadow memory*: one byte per 8 bytes of heap, saying how many of
@@ -3390,16 +3411,19 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
   axiom: trap T0012 (memory error): xs[1] at uaf.ax:21:27
   ```
 
-- Freed memory is kept poisoned in a quarantine (64 MiB) before the allocator reuses it,
-  so late uses of it are caught for a while. `realloc` always moves.
+- Freed memory is kept poisoned in a quarantine (64 MiB; 16 MiB in a test, since tests
+  run in parallel) before the allocator reuses it, so late uses of it are caught for a
+  while. `realloc` always moves.
 - `free` checks its argument: a double free, a size other than the allocation's, or
   memory the allocator did not hand out traps with `T0012`.
 - When `main` returns, the allocations never freed are reported as leaks, and the exit
   status becomes 23 if it was 0. Memory kept on purpose until the end can be excluded:
   allocations made between `mem.leaks_ignored(true)` and `mem.leaks_ignored(false)`
-  are not reported. In a test binary (`axiom test --sanitize=address`), where each
-  test runs in a process or instance of its own, a test that passes but leaves
-  allocations unfreed fails with the code `leak`, and the report is its output.
+  are not reported. In a test binary (`axiom test`, unless `--sanitize=none`), where
+  each test runs in a process or instance of its own, a test that passes but leaves
+  allocations unfreed fails with the code `leak`, and the report is its output. A use
+  after free or another memory error fails the test with `T0012`, and a test's default
+  time limit is 30 s instead of 10 s.
 
 The allocator and the runtime are not instrumented. Under `--sanitize=address`,
 address-taken local arrays, structs, and unions are allocated in an ASan stack
@@ -3520,8 +3544,12 @@ test "indexing past the end traps" expect trap(T0001) {
 ### 17.2 Running tests
 
 ```
-axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--show-output] [--format=agent-json]
+axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--show-output] [--sanitize=address|none] [--format=agent-json]
 ```
+
+- **The sanitizer.** Tests are built with the address sanitizer (§16.8) unless
+  `--sanitize=none` is given, where it applies, so a test that uses memory after
+  freeing it fails with `T0012`, and one that leaks fails with `leak`.
 
 - **Which tests run.** The tests in `file.ax`, plus those of the modules it imports that
   belong to the same package as `file.ax`, or, outside packages, that are not standard
@@ -3553,6 +3581,7 @@ With `--format=agent-json`, stdout holds one object:
 
 - a trap code (`T0000` to `T0013`);
 - `error`: the test returned an error, and the message names it;
+- `leak`: the test passed and left allocations unfreed (with the sanitizer, §16.8);
 - `no_trap`: an `expect trap` test completed;
 - `timeout`.
 

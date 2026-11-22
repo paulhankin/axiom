@@ -370,9 +370,13 @@ The collections (`std/collections`: `vec`, `map`, `set`, `deque`, …) are built
 and own what they allocate until `deinit`. A `Map` takes its hash and equality
 functions as generic arguments, because the language has no traits to find them by.
 
-Raw pointers (`*T`, `*mut T`) exist for the allocator, the runtime and C interop, and
-are the one place the checks stop: a pointer must stay inside the object it came from
-(spec §12.1). Everything else is checked.
+The checks stop at two rules a program keeps itself (spec §12.1). Raw pointers (`*T`,
+`*mut T`) exist for the allocator, the runtime and C interop, and a raw pointer must stay
+inside the object it came from. And memory is not used after it is freed: a slice of a
+buffer that was freed, or that a `Vec` moved when it grew, still reaches the old memory,
+unchecked. The address sanitizer catches that: it is on in `axiom test`, and in other
+builds with `--sanitize=address`. Everything else is
+checked.
 
 ## Generics
 
@@ -470,8 +474,9 @@ test "indexing past the end traps" expect trap(T0001) {
 
 `test` blocks live next to the code, see the module's private items, and run with
 `axiom test tests.ax` (`--target=native` for native code; the default is WebAssembly,
-which needs Node.js), each in its own process. They are type-checked in every build, so
-they cannot rot, but add nothing to a normal build. `@expect` and `@expect_eq` are the
+which needs Node.js), each in its own process, with the address sanitizer on (a use
+after free fails the test with `T0012`; `--sanitize=none` turns it off). They are
+type-checked in every build, so they cannot rot, but add nothing to a normal build. `@expect` and `@expect_eq` are the
 assertions; `expect trap(T0001)` makes a test that must trap, since traps are defined
 behaviour and so testable.
 

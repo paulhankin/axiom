@@ -21,8 +21,9 @@ GitHub security advisory, crediting the reporter unless they prefer otherwise.
 
 ## What counts
 
-Axiom promises that checked code (everything except raw pointers) has defined
-results or traps, and the standard library promises that for any input, a parser
+Axiom promises that a program that keeps the two rules of spec §12.1 (a raw pointer
+stays inside its object; memory is not used after it is freed) has defined results or
+traps, and the standard library promises that for any input, a parser
 returns an error and its work and memory stay bounded by a small multiple of the
 input's size (see [`docs/security.md`](docs/security.md)). Breaking one of those
 promises is a vulnerability. For example:
@@ -44,8 +45,9 @@ issue is fine.
 
 ## What does not count
 
-- Programs that break the access rule of spec §12.1 with raw pointers: on native
-  targets that is undefined behavior, as in C, by design.
+- Programs that break the rules of spec §12.1 (a raw pointer outside its object, or
+  memory used after it is freed): on native targets that is undefined behavior, as in
+  C, by design. The standard library keeping them is covered.
 - Data races on slices, unions and error unions, which can tear them (spec §12.8.2).
   Races on plain data are covered.
 - Bugs in C code linked into a program (spec §14.5.5).

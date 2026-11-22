@@ -51,7 +51,8 @@ run; dependencies' tests do not.
 | Flag | |
 |---|---|
 | `--filter=<text>` | Run only the tests whose name contains `text`. |
-| `--timeout=<ms>` | Fail a test that runs longer (default 10000). |
+| `--timeout=<ms>` | Fail a test that runs longer (default 10000; 30000 with the sanitizer). |
+| `--sanitize=address\|none` | `address`, the default: build the tests with the address sanitizer (spec §16.8), so a use after free fails its test with `T0012` and a leak with `leak`. `none` builds without it. The default applies to Axiom programs on every target but `wasm64`; for `wasm64`, a C program or one with C units, the tests are built without it. |
 | `--show-output` | Print what each test wrote under its result line. Without it, only a failing test's output is shown. |
 | `--no-run=<file>` | Build the test binary into `<file>` (and, for Windows, its PDB) without running it: for a target this machine cannot run. |
 
@@ -162,7 +163,7 @@ that lacks the extensions it was built with.
 | `-O0` … `-O3` | Optimization level (default `-O0`). |
 | `--overflow=wrap\|trap\|saturate` | Integer overflow mode (spec §7.6; default `wrap`). |
 | `--stack-traces=on\|off` | Record call sites for crash traces and profiles (default on; spec §16.4). |
-| `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). |
+| `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). Default `none`, but for `axiom test` (see there). |
 | `--coverage=afl\|none` | Native Linux targets: edge coverage counters for a coverage-guided fuzzer, and its fork server (spec §16.9; default `none`). |
 | `-g`, `--debug-info=full\|lines\|none` | DWARF 5 debug information for debuggers and other tools (`-g` is `full`; default `none` at every optimization level: stack traces need none, and without it nothing is added). `lines`: a compile unit per object with a subprogram per function, line tables (C's `#line` followed; code inlined keeps its own lines), call frame information (`.debug_frame`) for every instruction; `full` adds the types, each function's result, parameters and locals in their lexical blocks, and the static objects and globals, for C and Axiom (locations at `-O0`, where every variable stays in its frame slot; at `-O1` and above, location lists that follow each variable through its assignments, and frame slots for the variables left in memory: never a wrong one, the others are "optimized out"). Axiom's types: integers, floats, bool, pointers, arrays, slices (a structure of `ptr` and `len`), structures, enumerations, unions (a tag and a DWARF variant part), error unions (`error`, `value`), function types; functions named `module.function` (an exported one by its own name), the units' language C11's (0x1d: debuggers evaluate Axiom's names, structures, slices and arithmetic under it, and one that knows no other code shows no variables otherwise; the producer, `axiom <version>`, names Axiom), or with `--debug-language=axiom` Axiom's own code of DWARF's user range (0x8a78). The instructions are the same with and without it: an object's code and relocations are identical, while in an executable the frame table's line rows (for crash traces) move the data after them, and with it the addresses instructions hold. ELF targets: in the executable or object; macOS: in `<out>.dSYM`; WebAssembly: `.debug_*` custom sections (code-section offsets); Windows: the PDB (`--pdb`) has the line tables either way, and with `full` the types and variables in CodeView form. See [debugging](c.md#debugging). |
 | `--debug-macros=on\|off` | With `-g`: C's macros in the debug information (`.debug_macro`; default `on`). |
@@ -181,6 +182,7 @@ that lacks the extensions it was built with.
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 | `--warn=W0320` | Also warn of each public item, and public method of a public type, that has no `///` comment, in the modules whose tests would run: the input module and its package's modules, or outside a package those not in the standard library (spec §16.3). Off by default. |
+| `--warn=W0711` | Also warn of a local slice or pointer used after the memory it points into was freed or may have moved, within one function: after `mem.free` or `mem.destroy` of it, or after a `*mut Self` method was called on the container it came from through a `*Self` method (`let xs = v.items(); v.push(x)!; xs[0]`), in the modules whose tests would run (spec §16.3). A heuristic, with false positives (a `*mut Self` method that does not move the memory); off by default. The address sanitizer, on in `axiom test`, catches these at run time. |
 
 ### C sources
 

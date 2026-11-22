@@ -6,8 +6,10 @@ WebAssembly. Its design mandate is:
 
 - **zero hidden control flow**: no exceptions, destructors, operator overloading, or implicit allocation
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
-- **no undefined behavior outside raw pointers**: arithmetic, slices, arrays and every other checked
-  operation have a defined result or a deterministic trap; a raw pointer must stay inside its object (spec §12.1)
+- **every operation checked or defined, but for two rules**: arithmetic, slices, arrays and every other
+  operation have a defined result or a deterministic trap, as long as the program keeps two rules itself: a raw
+  pointer stays inside its object, and memory is not used after it is freed (spec §12.1). The address sanitizer
+  (`--sanitize=address`, on in `axiom test`) catches breaks of the second
 - **first-class SIMD**: vector primitives of 128, 256 and 512 bits, with the same (WebAssembly's) semantics on every target
 - **explicit allocation**: one global allocator (`std/mem`, written in Axiom), called explicitly; no language construct allocates
 
@@ -50,7 +52,7 @@ axiom build prog.ax --target=native -O2 -o prog   # native code for this machine
                                                   # x86_64-macos and aarch64-windows build, but have not yet run on real systems)
 axiom build prog.ax -O2 -o prog.wasm              # WebAssembly (wasm32; also wasm64)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
-axiom test mylib.ax                               # run a file's `test` blocks
+axiom test mylib.ax                               # run a file's `test` blocks (with the address sanitizer)
 axiom new geometry                                # a package: axiom.toml + src/lib.ax (spec §4.6)
 axiom test geometry                               # build, check and test also take a package directory
 axiom fmt src/                                    # canonical layout, imports tidied (spec §16.5)

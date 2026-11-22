@@ -423,6 +423,66 @@ stated, and makes the remaining errors likely to be caught.
 The program above is a test: it fails under `axiom test` with `T0012`, and `W0711` fires
 at both uses once enabled. The standard library's own tests pass under the sanitizer.
 
+### Status
+
+Done, but for turning `W0711` on, which waits on the owner's decision with the numbers
+below. The Problem above describes the tree as it was.
+
+- C1: the README, spec §1 (and the definitions before it), §12.1 and the tour say that
+  every operation is checked or defined except two rules a program keeps itself: a raw
+  pointer stays inside its object, and memory is not used after it is freed, through a
+  pointer or a slice. §12.1 had said that only a raw pointer could break the access
+  rule. `SECURITY.md`, `docs/security.md` and `docs/comparison.md` made the old claim
+  too, and say the new one.
+- C2: `axiom test` builds with `--sanitize=address` unless given `--sanitize=none`
+  (spec §16.8, §17.2; `docs/cli.md`). The sanitizer works on wasm32, x86-64 and
+  AArch64 Linux and x86-64 Windows (run here under an emulator and an emulation
+  layer), and builds for macOS and AArch64 Windows; for wasm64 (whose host fails a
+  sanitized program, and runs no wasm64 tests at all), a C program or an Axiom program
+  with C units, `axiom test` quietly builds without it. A sanitized test's default time
+  limit is 30 s.
+- Measured before the switch, on one x86-64 Linux machine, two at a time, compile
+  included: the standard library's tests and the self-tests (154 files) took 43.0 s
+  natively and 60.6 s on wasm32 without the sanitizer, and 91.7 s and 112.3 s with
+  it, two svg tests timing out on wasm. The sanitizer now sets and checks shadow memory
+  a page at a time and caches which allocation sites are `std/mem`'s: 75.9 s and
+  96.2 s (1.8 and 1.6 times), nothing timing out.
+- Quarantine: a test keeps 16 MiB of freed memory, other programs 64 MiB. The wasm test
+  runner holds up to eight instances at once; at 64 MiB its peak memory was 579 MB for
+  `std/graphics/svg` (358 at 16 MiB, 320 at 8), 555 for `std/net/http` (466, 448).
+  Time did not change.
+- Every std test and self-test passes under the sanitizer, natively and on wasm32: it
+  found no use after free, overflow or leak in them. The compiler's own tests
+  (`axiom test cmd/axiom/src/version.ax`) reported its arenas as leaks; `util.ax`'s
+  allocation functions now mark their memory as kept on purpose.
+- C3: `W0711` (`cmd/axiom/src/lifetime.ax`, `--warn=W0711`, spec §16.3) reports the
+  two shapes, after checking, in statement order with branches merged. Over std/ (each
+  of its 271 modules as the root), the 18 examples and the compiler, 19,662
+  functions: 563 views taken from a container, 380 frees of a local, 124 changes of a
+  container after a view of it was taken, and 3 warnings. One is a meant double free
+  in a test that expects the trap (`std/mem/tests.ax`); two are false: a node pointer
+  kept across a `*mut Self` method that does not move the nodes
+  (`std/text/html/tree_builder.ax:748`), and a slice a function made from `&order` (a
+  new allocation, not a view) used after `order.deinit()`
+  (`cmd/axiom/src/outline.ax:431`). That rate came after three refinements, each
+  measured: an element that is a pointer (`List.get`) is not a view, nor is an error
+  union of a slice (most often a new allocation), and a `*mut Self` method that returns
+  a view is an accessor. `mem.realloc` is not a free. First there were 44 warnings.
+- Tests: `testing/lifetime.ax` is the program above (fails with `T0012` at line 25;
+  `W0711` at both uses with the flag, none without); `errors/lifetime_warn.ax` has each
+  shape and the cases not to report; `testing/leaks.ax` tests the sanitizer as the
+  default; a case checks `--sanitize=none` and the wasm64 fallback, and
+  `c/mix/test_with_c` the fallback for C units.
+
+Not done:
+
+- `W0711` is not on by default. Two false positives in about 650k lines is a low rate,
+  but the warning is narrow: a use through another variable, a field or another
+  function is not seen, so it catches the plainest cases only.
+- wasm64: a program built with `--sanitize=address` fails in the WebAssembly host
+  (`Cannot convert undefined to a BigInt`), and `axiom test --target=wasm64` fails in
+  its test runner with or without the sanitizer.
+
 ---
 
 ## D. One Iterator Protocol
