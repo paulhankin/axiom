@@ -12,14 +12,16 @@
 // records which heap bytes may be used: one byte per 8 bytes of heap, 0 if
 // all 8 may, k (1-7) if the first k may, or a poison kind. The compiler
 // checks every access through a pointer or slice against it (asan_check).
-// Freed memory stays poisoned in a quarantine (64 MiB) before it is really
-// freed, so that late uses of it are caught; frees are checked; and at exit
-// (asan_exit) the allocations never freed are reported as leaks.
+// Freed memory stays poisoned in a quarantine (64 MiB; 16 MiB in a test)
+// before it is really freed, so that late uses of it are caught; frees are
+// checked; and at exit (asan_exit) the allocations never freed are reported
+// as leaks.
 // -----------------------------------------------------------------------------
 
 const AS_HDR: usize = 64;
 const AS_RZ: usize = 32;
 const AS_QUARANTINE: usize = 64 << 20;
+const AS_TEST_QUARANTINE: usize = 16 << 20;  // (tests run in parallel: asan_test_start)
 const AS_SITES: usize = 3;
 const SH_LEFT: u8 = 0xfa;   // a header (the left redzone)
 const SH_RIGHT: u8 = 0xfb;  // the right redzone
@@ -37,6 +39,7 @@ let mut as_live: usize = 0;     // the newest live allocation's header
 let mut as_q_first: usize = 0;  // the quarantine, oldest first
 let mut as_q_last: usize = 0;
 let mut as_q_bytes: usize = 0;
+let mut as_q_max: usize = AS_QUARANTINE;
 let mut as_ignoring: u32 = 0;      // leaks_ignored depth
 let mut as_live_bytes: usize = 0;  // requested bytes of live allocations
 
@@ -115,13 +118,16 @@ fn sbyte(s: usize) *mut u8 {
 
 /// Sets the shadow of [addr, addr + len), both multiples of 8, to v.
 fn as_set(addr: usize, len: usize, v: u8) void {
+    let end = addr + len;
     let mut a = addr;
-    while a < (addr + len) {
+    while a < end {
+        // (the shadow bytes of one 64 KiB page are consecutive)
+        let next = @min((a | (PAGE - 1)) + 1, end);
         let s = as_shadow(a, true);
         if s != 0 {
-            sbyte(s).* = v;
+            @mem_set(@slice_from_ptr(sbyte(s), (next - a) >> 3), v);
         }
-        a += 8;
+        a = next;
     }
 }
 
@@ -161,29 +167,38 @@ fn as_check_slow(addr: usize, size: usize) bool {
     }
     let mut a = addr & ~@as(usize, 7);
     while a < end {
-        let s = as_shadow(a, false);
+        let page_end = (a | (PAGE - 1)) +% 1;  // (0 for the last page)
+        let mut s = as_shadow(a, false);
         if s == 0 {
-            a = (a | (PAGE - 1)) +% 1;  // the next page
+            a = page_end;  // the next page
             if a == 0 {
                 return true;
             }
             continue;
         }
-        let v = sbyte(s).*;
-        if v != 0 {
-            // the bytes of this granule the access uses: [lo, hi)
-            let lo = @max(a, addr) - a;
-            let hi = @min(a + 8, end) - a;
-            if (v >= 8) or (hi > @as(usize, v)) {
-                let mut bad = a + @max(lo, @as(usize, v));
-                if v >= 8 {
-                    bad = a + lo;
-                }
-                as_report_access(addr, size, bad, v);
-                return false;
-            }
+        // the granules in this page, whose shadow bytes are consecutive
+        let mut limit = end;
+        if (page_end != 0) and (page_end < end) {
+            limit = page_end;
         }
-        a += 8;
+        while a < limit {
+            let v = sbyte(s).*;
+            if v != 0 {
+                // the bytes of this granule the access uses: [lo, hi)
+                let lo = @max(a, addr) - a;
+                let hi = @min(a + 8, end) - a;
+                if (v >= 8) or (hi > @as(usize, v)) {
+                    let mut bad = a + @max(lo, @as(usize, v));
+                    if v >= 8 {
+                        bad = a + lo;
+                    }
+                    as_report_access(addr, size, bad, v);
+                    return false;
+                }
+            }
+            a += 8;
+            s += 1;
+        }
     }
     return true;
 }
@@ -328,16 +343,27 @@ fn cstr_starts(f: usize, prefix: []u8) bool {
     return true;
 }
 
+// The file names is_mem_site saw last, one of std/mem's and one of another
+// module's (under the sanitizer's lock): most sites repeat them.
+let mut as_mem_file: usize = 0;
+let mut as_other_file: usize = 0;
+
 fn is_mem_site(site: *AsSite) bool {
     let f = @int_from_ptr(site.file());
-    if f == 0 {
+    if (f == 0) or (f == as_other_file) {
         return false;
     }
-    if cstr_starts(f, "std/mem/") {
+    if f == as_mem_file {
         return true;
     }
     let want = "std/mem.ax";
-    return cstr_starts(f, want) and (@ptr_from_int(*u8, f + want.len).* == 0);
+    let yes = cstr_starts(f, "std/mem/") or (cstr_starts(f, want) and (@ptr_from_int(*u8, f + want.len).* == 0));
+    if yes {
+        as_mem_file = f;
+    } else {
+        as_other_file = f;
+    }
+    return yes;
 }
 
 /// Records where an allocation is made: the innermost call sites outside
@@ -626,7 +652,7 @@ fn asan_free_inner(p: usize, size: usize, is_stack: bool) void {
     }
     as_q_last = raw;
     as_q_bytes += as_total(size);
-    while as_q_bytes > AS_QUARANTINE {
+    while as_q_bytes > as_q_max {
         let old = as_q_first;
         let n = as_total(@truncate(usize, hfield(old, H_SIZE).*));
         let pad = @truncate(usize, hfield(old, H_FLAGS).* >> 8);
@@ -724,6 +750,13 @@ pub fn asan_exit(code: i32) i32 {
         return 23;
     }
     return code;
+}
+
+/// Called before a test runs (axiom test with the sanitizer): the
+/// quarantine is smaller, since tests run in parallel, each in an instance
+/// of its own on WebAssembly (spec §16.8).
+pub fn asan_test_start() void {
+    as_q_max = AS_TEST_QUARANTINE;
 }
 
 /// Called after a test passes (axiom test --sanitize=address; each test runs

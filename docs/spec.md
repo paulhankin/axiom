@@ -1899,8 +1899,8 @@ checks that the object still exists. So a program must keep two rules itself:
    allocator block kept after `mem.free`, or after a container moved its buffer (a
    `Vec` that grew), or a pointer to a local kept after its function returned.
 
-The address sanitizer (`--sanitize=address`, §16.8) catches most breaks of the second
-rule, and of the first within the heap. Code in C (§14.5.5) can break either. What
+The address sanitizer (`--sanitize=address`, §16.8), on by default in `axiom test`,
+catches most breaks of the second rule, and of the first within the heap. Code in C (§14.5.5) can break either. What
 happens when a rule is broken depends on the target:
 
 - **WebAssembly.** All memory is the module's one linear memory, `M[0 .. size)`. An
@@ -2778,7 +2778,8 @@ axiom update [<version> | latest | head]         # replace the toolchain with an
 
 Every command accepts `--format=human` (the default) or `--format=agent-json` (§16.2)
 and `--std=<dir>`. `--target` names a target of §14; `--cpu` and `--features` select
-processor extensions (§13.4); `--sanitize=address` is §16.8, `--coverage` §16.9. `--overflow` selects the
+processor extensions (§13.4); `--sanitize=address` is §16.8 (`axiom test`'s default),
+`--coverage` §16.9. `--overflow` selects the
 overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
 every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
 overflow, to find unintended overflows; `saturate` clamps. The remaining options
@@ -3332,7 +3333,12 @@ Slices, arrays and integer arithmetic are checked by the language itself (Append
 so the errors a sanitizer adds are those of memory *lifetime*: using memory after it is
 freed, freeing it twice or with the wrong size, reaching outside an allocation through a
 pointer made from an address, and never freeing it. `--sanitize=address` (accepted by
-`build`, `test` and `profile`) checks for them:
+`build`, `test` and `profile`) checks for them. `axiom test` builds with it unless given
+`--sanitize=none`: a program that keeps the rules of §12.1 behaves the same either way,
+so tests still test what ships. It applies on every target the tests run on but
+`wasm64`, and to Axiom code only (§14.5.5); for `wasm64`, a C program, or an Axiom
+program with C units, `axiom test` builds without it, and `--sanitize=address` given
+explicitly is refused for C sources as for `build`.
 
 - The global allocator (`std/mem`) puts a header before each allocation and a redzone
   after it, and keeps *shadow memory*: one byte per 8 bytes of heap, saying how many of
@@ -3353,16 +3359,19 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
   axiom: trap T0012 (memory error): xs[1] at uaf.ax:21:27
   ```
 
-- Freed memory is kept poisoned in a quarantine (64 MiB) before the allocator reuses it,
-  so late uses of it are caught for a while. `realloc` always moves.
+- Freed memory is kept poisoned in a quarantine (64 MiB; 16 MiB in a test, since tests
+  run in parallel) before the allocator reuses it, so late uses of it are caught for a
+  while. `realloc` always moves.
 - `free` checks its argument: a double free, a size other than the allocation's, or
   memory the allocator did not hand out traps with `T0012`.
 - When `main` returns, the allocations never freed are reported as leaks, and the exit
   status becomes 23 if it was 0. Memory kept on purpose until the end can be excluded:
   allocations made between `mem.leaks_ignored(true)` and `mem.leaks_ignored(false)`
-  are not reported. In a test binary (`axiom test --sanitize=address`), where each
-  test runs in a process or instance of its own, a test that passes but leaves
-  allocations unfreed fails with the code `leak`, and the report is its output.
+  are not reported. In a test binary (`axiom test`, unless `--sanitize=none`), where
+  each test runs in a process or instance of its own, a test that passes but leaves
+  allocations unfreed fails with the code `leak`, and the report is its output. A use
+  after free or another memory error fails the test with `T0012`, and a test's default
+  time limit is 30 s instead of 10 s.
 
 The allocator and the runtime are not instrumented. Under `--sanitize=address`,
 address-taken local arrays, structs, and unions are allocated in an ASan stack
@@ -3483,8 +3492,12 @@ test "indexing past the end traps" expect trap(T0001) {
 ### 17.2 Running tests
 
 ```
-axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--show-output] [--format=agent-json]
+axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--show-output] [--sanitize=address|none] [--format=agent-json]
 ```
+
+- **The sanitizer.** Tests are built with the address sanitizer (§16.8) unless
+  `--sanitize=none` is given, where it applies, so a test that uses memory after
+  freeing it fails with `T0012`, and one that leaks fails with `leak`.
 
 - **Which tests run.** The tests in `file.ax`, plus those of the modules it imports that
   belong to the same package as `file.ax`, or, outside packages, that are not standard
@@ -3516,6 +3529,7 @@ With `--format=agent-json`, stdout holds one object:
 
 - a trap code (`T0000` to `T0013`);
 - `error`: the test returned an error, and the message names it;
+- `leak`: the test passed and left allocations unfreed (with the sanitizer, §16.8);
 - `no_trap`: an `expect trap` test completed;
 - `timeout`.
 

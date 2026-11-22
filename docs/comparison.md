@@ -173,7 +173,7 @@ one-token way to pass an error up. The differences show up at the edges:
 | **Shift by ≥ the width** | Defined: the mathematical result (`0`, or `-1` for a negative `>>`) | Rejected by the shift-amount type unless cast | Panic in debug, count masked in release | Undefined | Undefined |
 | **A read of uninitialized memory** | Defined: a `let mut x: T = undefined` local, like allocator memory, holds unspecified bytes, never poison | Allowed through `undefined`; reading it is illegal behavior, mostly unchecked | Rejected at compile time | Undefined (erroneous behavior in C++26) | Undefined |
 | **A null pointer is used** | There is no null. Address 0 is not an object: natively an access there crashes with a report; on WebAssembly it reads the bottom of the stack | Only `?*T` (or `allowzero`) can be null; making a null `*T` is illegal behavior | No null in safe code | Undefined | Undefined |
-| **Use after free** | On WebAssembly, unspecified bytes, never outside the module's memory; natively, undefined (spec §12.1). `--sanitize=address` traps on it | Undefined | Rejected at compile time | Undefined | Undefined |
+| **Use after free** | On WebAssembly, unspecified bytes, never outside the module's memory; natively, undefined (spec §12.1). `--sanitize=address` (on in `axiom test`) traps on it | Undefined | Rejected at compile time | Undefined | Undefined |
 | **A data race** | Each byte reads a value some store wrote (tearing allowed) | Undefined | Rejected at compile time | Undefined | Undefined |
 | **An invalid union tag** | Trap `T0007` at `match` | Panic / undefined | Cannot happen in safe code | Undefined (`std::variant` is safe) | Undefined |
 | **A floating-point expression** | Evaluated as written: no FMA contraction, no fast-math | As written unless `@setFloatMode(.optimized)` | As written | Contraction is allowed and some compilers do it by default | The same as C++ (`FP_CONTRACT`) |
@@ -346,7 +346,8 @@ weakly ordered CPUs such as ARM.
 - **No compile-time memory safety, and unchecked raw pointers.** Use after free is not
   prevented, and natively a raw pointer outside its object is undefined behavior, as in
   C. Rust prevents both. Axiom finds lifetime errors at run time with
-  `--sanitize=address` (use after free, double free, leaks) when you ask. Races are
+  `--sanitize=address` (use after free, double free, leaks), which `axiom test` uses by
+  default. Races are
   defined but not prevented, and there is no race detector.
 - **Bounds checks and SC atomics cost speed.** The optimizer removes many checks, but not
   all.
