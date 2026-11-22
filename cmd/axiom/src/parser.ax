@@ -8,7 +8,7 @@ import "util.ax" as u;
 
 struct Parser {
     f: *mut u.SourceFile,
-    t: []lx.Token,
+    t: []mut lx.Token,
     pos: usize,
     n: usize,
     mod: *mut ast.Module,
@@ -114,6 +114,292 @@ fn decl_keyword(k: lx.TokKind) bool {
     return (k == lx.KW_IMPORT) or (k == lx.KW_TEST) or (k == lx.KW_EXPORT) or (k == lx.KW_PUB) or (k == lx.KW_NOCOPY) or
            (k == lx.KW_EXTERN) or (k == lx.KW_FN) or (k == lx.KW_INLINE) or (k == lx.KW_STRUCT) or (k == lx.KW_UNION) or
            (k == lx.KW_ENUM) or (k == lx.KW_CONST) or (k == lx.KW_THREADLOCAL);
+}
+
+// ---------------------------------------------------------------------------
+// Idioms of other languages (spec §16.3, E0160 ... E0179). Only a program
+// that is already wrong reaches these paths, so they may look ahead as far as
+// they like. Each reports one error, naming the Axiom form, and, where the
+// rewrite is certain, a machine fix; the tree built is the Axiom form's.
+// ---------------------------------------------------------------------------
+fn peek_at(P: *Parser, k: usize) *lx.Token {
+    return &P.t[@min(P.pos + k, P.n - 1)];
+}
+
+fn pk_at(P: *Parser, k: usize) lx.TokKind {
+    return peek_at(P, k).kind;
+}
+
+// The token k ahead (k > 0) starts where the one before it ends.
+fn joined(P: *Parser, k: usize) bool {
+    return ((P.pos + k) < P.n) and (peek_at(P, k - 1).span.end == peek_at(P, k).span.start);
+}
+
+fn sp_at(sp: u.Span) u.Span {
+    return u.mkspan(sp.file, sp.start, sp.start);
+}
+
+fn sp_end(sp: u.Span) u.Span {
+    return u.mkspan(sp.file, sp.end, sp.end);
+}
+
+// From the start of a to the start of b.
+fn sp_upto(a: u.Span, b: u.Span) u.Span {
+    return u.mkspan(a.file, a.start, b.start);
+}
+
+fn is_blank(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r');
+}
+
+// `word`, to replace the text at sp, with a space on each side that has none.
+fn spaced(P: *Parser, sp: u.Span, word: []u8) []u8 {
+    let t = P.f.text;
+    let a = @as(usize, sp.start);
+    let b = @as(usize, sp.end);
+    let before = (a == 0) or is_blank(t[a - 1]) or (t[a - 1] == '(');
+    let after = (b >= t.len) or is_blank(t[b]) or (t[b] == ')');
+    return u.f3("%s%s%s", u.pick(before, "", " "), word, u.pick(after, "", " "));
+}
+
+fn fix1(d: *mut dg.Diag, description: []u8, applicability: []u8, sp: u.Span, text: []u8) void {
+    let fx = dg.fix(d, description, applicability);
+    dg.edit(fx, sp, text);
+}
+
+// e as an operand of a postfix operator: it needs parentheses.
+fn needs_parens(e: *ast.Expr) bool {
+    let k = e.kind;
+    return not e.parens and ((k == ast.E_UNARY) or (k == ast.E_BINARY) or (k == ast.E_CATCH) or (k == ast.E_ORELSE));
+}
+
+// The edits that put `suffix` after e, with e in parentheses if it needs them.
+fn edit_suffix(fx: *mut dg.DiagFix, e: *ast.Expr, suffix: []u8) void {
+    if needs_parens(e) {
+        dg.edit(fx, sp_at(e.span), "(");
+        dg.edit(fx, sp_end(e.span), u.f1(")%s", suffix));
+    } else {
+        dg.edit(fx, sp_end(e.span), suffix);
+    }
+}
+
+// A placeholder for an expression that was skipped (in a poisoned declaration).
+fn skipped(sp: u.Span) *mut ast.Expr {
+    return ast.new_expr(ast.E_INT, sp);
+}
+
+// Skips tokens up to the one of kind `close` that matches the open one
+// before them, and that one.
+fn skip_balanced(P: *mut Parser, open: lx.TokKind, close: lx.TokKind) void {
+    let mut depth: i32 = 1;
+    while (pk(P) != lx.TK_EOF) and not at_decl_start(P, false) {
+        let k = advance(P).kind;
+        if k == open {
+            depth += 1;
+        } else if k == close {
+            depth -= 1;
+            if depth == 0 {
+                return;
+            }
+        }
+    }
+}
+
+// Skips an `if` or `match` used as an expression: up to its block (or its
+// arms), and any `else` branches.
+fn skip_construct(P: *mut Parser) void {
+    _ = advance(P);
+    loop {
+        let mut depth: i32 = 0;
+        while (pk(P) != lx.TK_EOF) and not at_decl_start(P, false) {
+            let k = pk(P);
+            if (k == lx.TK_LBRACE) and (depth == 0) {
+                break;
+            }
+            if ((k == lx.TK_SEMI) or (k == lx.TK_RBRACE)) and (depth == 0) {
+                return;
+            }
+            if (k == lx.TK_LPAREN) or (k == lx.TK_LBRACKET) {
+                depth += 1;
+            } else if ((k == lx.TK_RPAREN) or (k == lx.TK_RBRACKET)) and (depth > 0) {
+                depth -= 1;
+            }
+            _ = advance(P);
+        }
+        if not accept(P, lx.TK_LBRACE) {
+            return;
+        }
+        skip_balanced(P, lx.TK_LBRACE, lx.TK_RBRACE);
+        if not accept(P, lx.KW_ELSE) {
+            return;
+        }
+    }
+}
+
+// `x++` or `x--` comes next, at the end of a statement or argument.
+fn incdec_ahead(P: *Parser) bool {
+    let k = pk(P);
+    if ((k != lx.TK_PLUS) and (k != lx.TK_MINUS)) or (pk_at(P, 1) != k) or not joined(P, 1) {
+        return false;
+    }
+    let k2 = pk_at(P, 2);
+    return (k2 == lx.TK_SEMI) or (k2 == lx.TK_RPAREN) or (k2 == lx.TK_RBRACKET) or (k2 == lx.TK_COMMA) or
+           (k2 == lx.TK_RBRACE);
+}
+
+// `try` and an operand come next.
+fn try_ahead(P: *Parser) bool {
+    let t = peek(P);
+    if (t.kind != lx.TK_IDENT) or not u.str_eq(t.name, "try") {
+        return false;
+    }
+    let k = pk_at(P, 1);
+    return (k == lx.TK_IDENT) or (k == lx.TK_BUILTIN) or (k == lx.KW_SELF);
+}
+
+// A '?' that comes next ends an expression (`f()?`), rather than starting the
+// second operand of `c ? a : b`.
+fn question_is_postfix(P: *Parser) bool {
+    let k = pk_at(P, 1);
+    if (k == lx.TK_MINUS) or (k == lx.TK_MINUS_PCT) or (k == lx.TK_AMP) or (k == lx.TK_STAR) {
+        return false;
+    }
+    return (k == lx.TK_SEMI) or (k == lx.TK_RPAREN) or (k == lx.TK_COMMA) or (k == lx.TK_RBRACKET) or
+           (k == lx.TK_RBRACE) or (k == lx.TK_LBRACE) or (k == lx.TK_DOT) or (k == lx.TK_EOF) or (k == lx.KW_CATCH) or
+           (k == lx.TK_QQ) or (op_family(k) != F_NONE);
+}
+
+// `Name{ field: ...`: a struct literal without its '.' (a block cannot start
+// with `field:` unless a loop follows the label).
+fn struct_brace_ahead(P: *Parser, e: *ast.Expr) bool {
+    if e.parens or ((e.kind != ast.E_IDENT) and (e.kind != ast.E_FIELD) and (e.kind != ast.E_APPLY)) {
+        return false;
+    }
+    if (pk_at(P, 1) != lx.TK_IDENT) or (pk_at(P, 2) != lx.TK_COLON) {
+        return false;
+    }
+    let k = pk_at(P, 3);
+    return (k != lx.KW_WHILE) and (k != lx.KW_LOOP) and (k != lx.KW_FOR) and (k != lx.TK_COLON);
+}
+
+// `Name<Args>` followed by '.', '(' or '{', in an expression: a generic
+// application in angle brackets (a comparison chain such as `a < b > c`
+// is an error of its own, E0150). Not with a ',' before '(': `f(a < b, c >
+// (d))` is two comparisons.
+fn angle_apply_ahead(P: *Parser, base: *ast.Expr) bool {
+    if base.parens or ((base.kind != ast.E_IDENT) and (base.kind != ast.E_FIELD)) {
+        return false;
+    }
+    let mut depth: i32 = 1;
+    let mut comma = false;
+    let mut i: usize = 1;
+    while i < 64 {
+        let k = pk_at(P, i);
+        if k == lx.TK_LT {
+            depth += 1;
+        } else if k == lx.TK_GT {
+            depth -= 1;
+            if depth == 0 {
+                let n = pk_at(P, i + 1);
+                return (n == lx.TK_DOT) or ((n == lx.TK_LPAREN) and not comma) or (n == lx.TK_LBRACE);
+            }
+        } else if k == lx.TK_COMMA {
+            comma = true;
+        } else if not ((k == lx.TK_IDENT) or (k == lx.TK_PRIM) or (k == lx.TK_DOT) or (k == lx.TK_COMMA) or
+                       (k == lx.TK_STAR) or (k == lx.TK_LBRACKET) or (k == lx.TK_RBRACKET) or (k == lx.TK_INT) or
+                       (k == lx.KW_MUT) or (k == lx.TK_QUESTION)) {
+            return false;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// Generic arguments up to the token `close` (not consumed).
+fn parse_generic_args_until(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr], close: lx.TokKind) void {
+    while (pk(P) != close) and (pk(P) != lx.TK_EOF) {
+        if pk(P) == lx.TK_INT {
+            let t = advance(P);
+            out.push(ast.new_te(ast.TypeShape.IntLit(t.ival), t.span));
+        } else {
+            out.push(parse_type(P));
+        }
+        if not accept(P, lx.TK_COMMA) {
+            break;
+        }
+    }
+}
+
+// `<Args>` (at '<'): E0176, fixed to `.[Args]`.
+fn parse_angle_args(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) void {
+    let lt = advance(P).span;
+    parse_generic_args_until(P, out, lx.TK_GT);
+    let gt = peek(P).span;
+    _ = expect(P, lx.TK_GT);
+    angle_error(P, lt, gt, "generic arguments are written 'Name.[T]', not 'Name<T>'", ".[");
+}
+
+// '<' at lt and '>' at gt, which Axiom writes `open` and ']'.
+fn angle_error(P: *Parser, lt: u.Span, gt: u.Span, msg: []u8, open: []u8) void {
+    let d = idiom(P, u.span_join(lt, gt), "E0176", msg);
+    let fx = dg.fix(d, u.f1("write '%s' and ']'", open), "machine");
+    dg.edit(fx, lt, open);
+    dg.edit(fx, gt, "]");
+}
+
+fn parse_angle_apply(P: *mut Parser, base: *mut ast.Expr) *mut ast.Expr {
+    let ap = ast.new_expr(ast.E_APPLY, base.span);
+    ap.a = base;
+    parse_angle_args(P, &mut ast.ext(ap).targs);
+    ap.span = sp_from(P, base.span);
+    return parse_postfix_from(P, ap);
+}
+
+// A type's generic arguments written `Name<T>` (E0176) or `Name[T]`
+// (E0177), after the name; false if neither comes next.
+fn type_args_idiom(P: *mut Parser, nt: *mut ast.NamedType) bool {
+    if pk(P) == lx.TK_LBRACKET {
+        let b = advance(P).span;
+        let d = idiom(P, b, "E0177", "generic arguments follow a '.': write 'Name.[T]', not 'Name[T]'");
+        fix1(d, "write '.' before '['", "machine", sp_at(b), ".");
+        nt.has_args = true;
+        parse_generic_args_until(P, &mut nt.args, lx.TK_RBRACKET);
+        _ = expect(P, lx.TK_RBRACKET);
+        return true;
+    }
+    if pk(P) == lx.TK_LT {
+        nt.has_args = true;
+        parse_angle_args(P, &mut nt.args);
+        return true;
+    }
+    return false;
+}
+
+// After '..' (at dd): a range's end, or `..=e` (E0174), which is `..e + 1`.
+fn parse_range_end(P: *mut Parser, dd: u.Span) *mut ast.Expr {
+    if (pk(P) != lx.TK_EQ) or (peek(P).span.start != dd.end) {
+        return parse_expr(P);
+    }
+    let op = u.span_join(dd, advance(P).span);
+    let hi = parse_expr(P);
+    let d = idiom(P, op, "E0174", "Axiom has no '..=': 'lo..hi' excludes hi, so write 'lo..hi + 1'");
+    let fx = dg.fix(d, "write '..' and add 1 to the end", "machine");
+    dg.edit(fx, op, "..");
+    edit_suffix(fx, hi, " + 1");
+    if needs_parens(hi) {
+        hi.parens = true;
+    }
+    let one = ast.new_expr(ast.E_INT, sp_end(hi.span));
+    ast.set_ival(one, 1);
+    let b = ast.new_expr(ast.E_BINARY, hi.span);
+    ast.set_op(b, lx.TK_PLUS);
+    b.a = hi;
+    ast.set_b(b, one);
+    return b;
+}
+
+fn idiom(P: *Parser, sp: u.Span, code: []u8, msg: []u8) *mut dg.Diag {
+    return perr(P, sp, code, msg);
 }
 
 fn expect(P: *mut Parser, k: lx.TokKind) *lx.Token {
@@ -455,7 +741,9 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
         let mut nt = named_type(t);
         // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )? ( "." IDENT GenericArgs? )?
         let mut saw_dot = false;
-        if accept(P, lx.TK_DOT) {
+        if type_args_idiom(P, &mut nt) {
+            saw_dot = true;
+        } else if accept(P, lx.TK_DOT) {
             saw_dot = true;
             if pk(P) == lx.TK_LBRACKET {
                 _ = advance(P);
@@ -466,7 +754,7 @@ fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
                 nt.qual = nt.name;
                 nt.name = m.name;
                 nt.name_span = m.span;
-                if accept(P, lx.TK_DOT) {
+                if not type_args_idiom(P, &mut nt) and accept(P, lx.TK_DOT) {
                     if pk(P) == lx.TK_LBRACKET {
                         _ = advance(P);
                         nt.has_args = true;
@@ -551,6 +839,9 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     let start = t.span;
     let k = t.kind;
     if k == lx.TK_IDENT {
+        if u.str_eq(t.name, "null") {
+            P.t[P.pos].prim = 1;  // (as a value: the checker names .none, E0168)
+        }
         _ = advance(P);
         let e = ast.new_expr(ast.E_IDENT, start);
         e.name = t.name;
@@ -559,6 +850,17 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     if k == lx.KW_SELF {
         _ = advance(P);
         return ast.new_expr(ast.E_SELF, start);
+    }
+    if (k == lx.KW_IF) or (k == lx.KW_MATCH) {
+        // `let r = if c { a } else { b };`: E0172
+        let w = lx.tok_kind_name(k);
+        let d = idiom(P, start, "E0172", u.f1("'%s' is a statement in Axiom, not an expression", w));
+        dg.note(d, start, u.pick(k == lx.KW_IF,
+                                 "assign the variable in each branch: 'let mut r: T = undefined; if c { r = a; } else { r = b; }'",
+                                 "assign the variable in each arm: 'let mut r: T = undefined; match v { ... => { r = a; } }'"));
+        poison(P);
+        skip_construct(P);
+        return skipped(start);
     }
     if (k == lx.TK_INT) or (k == lx.TK_CHAR) {
         _ = advance(P);
@@ -731,6 +1033,19 @@ fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
                 e = c;
             }
             .LBRACKET => {
+                if pk_at(P, 1) == lx.TK_PRIM {
+                    // `Vec[u32]`: E0177
+                    let b = advance(P).span;
+                    let d = idiom(P, b, "E0177", "generic arguments follow a '.': write 'Name.[T]', not 'Name[T]'");
+                    fix1(d, "write '.' before '['", "machine", sp_at(b), ".");
+                    let ap = ast.new_expr(ast.E_APPLY, start);
+                    ap.a = e;
+                    parse_generic_args_until(P, &mut ast.ext(ap).targs, lx.TK_RBRACKET);
+                    _ = expect(P, lx.TK_RBRACKET);
+                    e = ap;
+                    e.span = sp_from(P, start);
+                    continue;
+                }
                 _ = advance(P);
                 let mut lo: ?*mut ast.Expr = .none;
                 let mut hi: ?*mut ast.Expr = .none;
@@ -738,14 +1053,14 @@ fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
                 if accept(P, lx.TK_DOTDOT) {
                     is_slice = true;
                     if pk(P) != lx.TK_RBRACKET {
-                        hi = parse_expr(P);
+                        hi = parse_range_end(P, prev_span(P));
                     }
                 } else {
                     lo = parse_expr(P);
                     if accept(P, lx.TK_DOTDOT) {
                         is_slice = true;
                         if pk(P) != lx.TK_RBRACKET {
-                            hi = parse_expr(P);
+                            hi = parse_range_end(P, prev_span(P));
                         }
                     }
                 }
@@ -769,6 +1084,47 @@ fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
                 let x = ast.new_expr(ast.E_TRY, start);
                 x.a = e;
                 e = x;
+            }
+            .QUESTION => {
+                // `f()?`: E0167 (the checker decides what it meant, by the type)
+                if not question_is_postfix(P) {
+                    break;
+                }
+                let q = advance(P);
+                let x = ast.new_expr(ast.E_TRY, start);
+                x.a = e;
+                ast.ext(x).idiom = ast.IDIOM_QUESTION;
+                ast.set_name_span(x, q.span);
+                e = x;
+            }
+            .LBRACE => {
+                // `P{ x: 1 }`: E0162
+                if not struct_brace_ahead(P, e) {
+                    break;
+                }
+                let b = advance(P).span;
+                let d = idiom(P, b, "E0162", "a struct literal is written 'T.{ ... }' in Axiom, with a '.'");
+                fix1(d, "write '.' before '{'", "machine", sp_at(b), ".");
+                let sl = ast.new_expr(ast.E_STRUCT_LIT, start);
+                sl.a = e;
+                parse_field_inits(P, sl);
+                e = sl;
+            }
+            .COLON => {
+                // `C::R`: E0169
+                if not (joined(P, 1) and (pk_at(P, 1) == lx.TK_COLON) and (pk_at(P, 2) == lx.TK_IDENT)) {
+                    break;
+                }
+                let c1 = advance(P).span;
+                let cs = u.span_join(c1, advance(P).span);
+                let d = idiom(P, cs, "E0169", "Axiom names a member with '.', not '::'");
+                fix1(d, "write '.'", "machine", cs, ".");
+                let n = advance(P);
+                let f = ast.new_expr(ast.E_FIELD, start);
+                f.a = e;
+                f.name = n.name;
+                ast.set_name_span(f, n.span);
+                e = f;
             }
             else => { break; }
         }
@@ -798,6 +1154,43 @@ fn parse_unary_in(P: *mut Parser) *mut ast.Expr {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
+    if k == lx.TK_BANG {
+        // `!ok`: E0160
+        _ = advance(P);
+        let d = idiom(P, start, "E0160", "Axiom negates a bool with 'not', not '!'");
+        fix1(d, "write 'not'", "machine", start, spaced(P, start, "not"));
+        let e = ast.new_expr(ast.E_UNARY, start);
+        ast.set_op(e, lx.KW_NOT);
+        e.a = parse_unary(P);
+        e.span = sp_from(P, start);
+        return e;
+    }
+    if k == lx.TK_STAR {
+        // `*p`: E0175
+        _ = advance(P);
+        let opnd = parse_unary(P);
+        let d = idiom(P, start, "E0175", "Axiom dereferences with a postfix '.*': write 'p.*', not '*p'");
+        let fx = dg.fix(d, "write '.*' after the operand", "machine");
+        dg.edit(fx, sp_upto(start, opnd.span), "");
+        edit_suffix(fx, opnd, ".*");
+        let x = ast.new_expr(ast.E_DEREF, start);
+        x.a = opnd;
+        x.span = sp_from(P, start);
+        return x;
+    }
+    if try_ahead(P) {
+        // `try f()`: E0167
+        _ = advance(P);
+        let opnd = parse_unary(P);
+        let d = idiom(P, start, "E0167", "Axiom has no 'try': write '!' after the call, 'f()!', to pass its error on");
+        let fx = dg.fix(d, "write '!' after the operand", "machine");
+        dg.edit(fx, sp_upto(start, opnd.span), "");
+        edit_suffix(fx, opnd, "!");
+        let x = ast.new_expr(ast.E_TRY, start);
+        x.a = opnd;
+        x.span = sp_from(P, start);
+        return x;
+    }
     if (k == lx.TK_MINUS) or (k == lx.TK_MINUS_PCT) or (k == lx.TK_TILDE) or (k == lx.KW_NOT) or (k == lx.TK_AMP) {
         _ = advance(P);
         let e = ast.new_expr(ast.E_UNARY, start);
@@ -925,7 +1318,26 @@ fn reduce(P: *Parser, out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[lx.TokK
     out.push(b);
 }
 
-fn parse_binexpr_rest(P: *mut Parser, first: *mut ast.Expr, outer: usize) *mut ast.Expr {
+// `x as T` after the operand e: @as(T, x), for the checker to name (E0166).
+fn as_tail(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
+    let mut e = e0;
+    while pk(P) == lx.KW_AS {
+        _ = advance(P);
+        let te = parse_type(P);
+        let b = ast.new_expr(ast.E_BUILTIN, e.span);
+        b.name = u.intern("as");
+        ast.set_builtin(b, ast.BI_AS);
+        ast.ext(b).bargs.push(ast.BuiltinArg.{ e: u.nil.[ast.Expr](), t: te });
+        ast.ext(b).bargs.push(ast.BuiltinArg.{ e: e, t: u.nil.[ast.TypeExpr]() });
+        ast.ext(b).idiom = ast.IDIOM_AS;
+        b.span = sp_from(P, e.span);
+        e = b;
+    }
+    return e;
+}
+
+fn parse_binexpr_rest(P: *mut Parser, first0: *mut ast.Expr, outer: usize) *mut ast.Expr {
+    let first = as_tail(P, first0);
     if op_family(pk(P)) == F_NONE {
         if outer > P.high {
             P.high = outer;
@@ -936,8 +1348,31 @@ fn parse_binexpr_rest(P: *mut Parser, first: *mut ast.Expr, outer: usize) *mut a
     let mut ops = u.List.[lx.TokKind].empty();
     operands.push(first);
     while op_family(pk(P)) != F_NONE {
-        ops.push(advance(P).kind);
-        operands.push(parse_unary(P));
+        if incdec_ahead(P) {
+            break;  // (`i++;`: the statement's)
+        }
+        if (pk(P) == lx.TK_LT) and angle_apply_ahead(P, operands.last()) {
+            // `Vec<u32>.init()`: E0176
+            let base = operands.pop();
+            operands.push(parse_angle_apply(P, base));
+            continue;
+        }
+        let ot = advance(P);
+        let mut op = ot.kind;
+        if ((op == lx.TK_AMP) or (op == lx.TK_PIPE)) and (pk(P) == op) and (peek(P).span.start == ot.span.end) {
+            // `a && b`, `a || b`: E0161
+            let osp = u.span_join(ot.span, advance(P).span);
+            let w = u.pick(op == lx.TK_AMP, "and", "or");
+            let d = idiom(P, osp, "E0161", u.f2("Axiom writes '%s' as '%s'", u.pick(op == lx.TK_AMP, "&&", "||"), w));
+            fix1(d, u.f1("write '%s'", w), "machine", osp, spaced(P, osp, w));
+            if op == lx.TK_AMP {
+                op = lx.KW_AND;
+            } else {
+                op = lx.KW_OR;
+            }
+        }
+        ops.push(op);
+        operands.push(as_tail(P, parse_unary(P)));
     }
     if not chain_ok(P, outer, ops.len, u.span_join(first.span, operands.last().span)) {
         operands.deinit();
@@ -974,6 +1409,18 @@ fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
 }
 
 fn parse_expr_rest(P: *mut Parser, e: *mut ast.Expr) *mut ast.Expr {
+    if pk(P) == lx.TK_QUESTION {
+        // `c ? a : b`: E0165
+        let q = advance(P).span;
+        let d = idiom(P, q, "E0165", "Axiom has no conditional operator 'c ? a : b'");
+        dg.note(d, q, "assign the variable in an 'if' statement: 'let mut x: T = b; if c { x = a; }'");
+        poison(P);
+        _ = parse_binexpr(P);
+        if accept(P, lx.TK_COLON) {
+            _ = parse_expr(P);
+        }
+        return skipped(e.span);
+    }
     let is_catch = pk(P) == lx.KW_CATCH;
     let is_orelse = pk(P) == lx.TK_QQ;
     if not is_catch and not is_orelse {
@@ -1088,7 +1535,40 @@ fn parse_block_in(P: *mut Parser) *mut ast.Stmt {
 }
 
 // ExprStmt ::= Expr ( AssignOp Expr )? ";"
+// `++` or `--` at op, after (before) the operand e: `e += 1` (E0164).
+fn incdec_stmt(P: *mut Parser, start: u.Span, op: u.Span, plus: bool, e: *mut ast.Expr, prefix: bool) *mut ast.Stmt {
+    let w = u.pick(plus, "+=", "-=");
+    let d = idiom(P, op, "E0164", u.f2("Axiom has no '%s' operator: write 'x %s 1'", u.pick(plus, "++", "--"), w));
+    let fx = dg.fix(d, u.f1("write '%s 1'", w), "machine");
+    if prefix {
+        dg.edit(fx, sp_upto(op, e.span), "");
+        dg.edit(fx, sp_end(e.span), u.f1(" %s 1", w));
+    } else {
+        dg.edit(fx, op, u.f1(" %s 1", w));
+    }
+    let s = ast.new_stmt(ast.S_ASSIGN, start);
+    if plus {
+        s.op = lx.TK_PLUS_EQ;
+    } else {
+        s.op = lx.TK_MINUS_EQ;
+    }
+    s.e = e;
+    s.e2 = ast.new_expr(ast.E_INT, op);
+    ast.set_ival(s.e2, 1);
+    if not accept(P, lx.TK_SEMI) {
+        syntax_error(P, "';'");
+        sync_stmt(P);
+    }
+    s.span = sp_from(P, start);
+    return s;
+}
+
 fn parse_expr_stmt_from(P: *mut Parser, start: u.Span, e: *mut ast.Expr) *mut ast.Stmt {
+    if incdec_ahead(P) {
+        let o1 = advance(P);
+        let op = u.span_join(o1.span, advance(P).span);
+        return incdec_stmt(P, start, op, o1.kind == lx.TK_PLUS, e, false);
+    }
     let mut k = ast.S_EXPR;
     if lx.is_assign_op(pk(P)) {
         k = ast.S_ASSIGN;
@@ -1274,6 +1754,18 @@ fn parse_loop_stmt(P: *mut Parser) ?*mut ast.Stmt {
     }
     if k == lx.KW_FOR {
         _ = advance(P);
+        if accept(P, lx.TK_LPAREN) {
+            // `for (init; cond; step)`: E0173
+            let d = idiom(P, start, "E0173", "Axiom has no C-style 'for (init; cond; step)'");
+            dg.note(d, start,
+                    "write 'for i in lo..hi { ... }' for a range, or a 'while' loop: 'let mut i: T = lo; while i < hi { ...; i += 1; }'");
+            poison(P);
+            skip_balanced(P, lx.TK_LPAREN, lx.TK_RPAREN);
+            let lp = ast.new_stmt(ast.S_LOOP, start);
+            lp.body = parse_block(P);
+            lp.span = sp_from(P, start);
+            return lp;
+        }
         let s = ast.new_stmt(ast.S_FOR, start);
         if accept(P, lx.TK_AMP) {
             ast.stmt_ext(s).ref_iter = true;
@@ -1285,7 +1777,7 @@ fn parse_loop_stmt(P: *mut Parser) ?*mut ast.Stmt {
         _ = expect(P, lx.KW_IN);
         s.e = parse_expr(P);
         if accept(P, lx.TK_DOTDOT) {
-            s.e2 = parse_expr(P);
+            s.e2 = parse_range_end(P, prev_span(P));
         }
         s.body = parse_block(P);
         s.span = sp_from(P, start);
@@ -1298,7 +1790,8 @@ fn parse_loop_stmt(P: *mut Parser) ?*mut ast.Stmt {
 
 fn parse_stmt_from_ident(P: *mut Parser, id: *lx.Token) ?*mut ast.Stmt {
     let start = id.span;
-    if accept(P, lx.TK_COLON) {
+    if (pk(P) == lx.TK_COLON) and not (joined(P, 1) and (pk_at(P, 1) == lx.TK_COLON)) {
+        _ = advance(P);
         let s = parse_loop_stmt(P) ?? return .none;
         ast.stmt_ext(s).label = id.name;
         ast.stmt_ext(s).label_span = id.span;
@@ -1310,40 +1803,69 @@ fn parse_stmt_from_ident(P: *mut Parser, id: *lx.Token) ?*mut ast.Stmt {
     return parse_expr_stmt_from(P, start, parse_expr_from(P, e0));
 }
 
+// LetStmt, after `let mut?`.
+fn parse_let_rest(P: *mut Parser, start: u.Span, is_mut: bool) *mut ast.Stmt {
+    let s = ast.new_stmt(ast.S_LET, start);
+    s.is_mut = is_mut;
+    let id = expect_ident(P);
+    s.name = id.name;
+    s.name_span = id.span;
+    if accept(P, lx.TK_COLON) {
+        s.te = parse_type(P);
+    }
+    _ = expect(P, lx.TK_EQ);
+    // `undefined` as the whole initializer: the variable's bytes left
+    // unspecified until written
+    if pk(P) == lx.KW_UNDEFINED {
+        let ut = advance(P);
+        s.undef = true;
+        s.e = ast.new_expr(ast.E_IDENT, ut.span);
+        s.e.name = u.intern("undefined");
+    } else {
+        s.e = parse_expr(P);
+    }
+    if not accept(P, lx.TK_SEMI) {
+        syntax_error(P, "';'");
+        sync_stmt(P);
+    }
+    s.span = sp_from(P, start);
+    return s;
+}
+
 fn parse_stmt(P: *mut Parser) ?*mut ast.Stmt {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
     if k == lx.TK_IDENT {
-        return parse_stmt_from_ident(P, advance(P));
+        let k2 = pk_at(P, 2);
+        if u.str_eq(t.name, "var") and (pk_at(P, 1) == lx.TK_IDENT) and ((k2 == lx.TK_COLON) or (k2 == lx.TK_EQ)) {
+            // `var i = 0;`: E0170
+            let d = idiom(P, start, "E0170", "Axiom declares a variable with 'let mut', not 'var'");
+            fix1(d, "write 'let mut'", "machine", start, "let mut");
+            _ = advance(P);
+            return parse_let_rest(P, start, true);
+        }
+        if not try_ahead(P) {
+            return parse_stmt_from_ident(P, advance(P));
+        }
+    }
+    if (k == lx.KW_MUT) and (pk_at(P, 1) == lx.TK_IDENT) {
+        // `mut i = 0;`: E0170
+        let d = idiom(P, start, "E0170", "Axiom declares a variable with 'let mut', not 'mut'");
+        fix1(d, "write 'let' before 'mut'", "machine", sp_at(start), "let ");
+        _ = advance(P);
+        return parse_let_rest(P, start, true);
+    }
+    if ((k == lx.TK_PLUS) or (k == lx.TK_MINUS)) and (pk_at(P, 1) == k) and joined(P, 1) {
+        // `++i;`: E0164
+        let o1 = advance(P).span;
+        let op = u.span_join(o1, advance(P).span);
+        let e = parse_expr(P);
+        return incdec_stmt(P, start, op, k == lx.TK_PLUS, e, true);
     }
     if k == lx.KW_LET {
         _ = advance(P);
-        let s = ast.new_stmt(ast.S_LET, start);
-        s.is_mut = accept(P, lx.KW_MUT);
-        let id = expect_ident(P);
-        s.name = id.name;
-        s.name_span = id.span;
-        if accept(P, lx.TK_COLON) {
-            s.te = parse_type(P);
-        }
-        _ = expect(P, lx.TK_EQ);
-        // `undefined` as the whole initializer: the variable's bytes left
-        // unspecified until written
-        if pk(P) == lx.KW_UNDEFINED {
-            let ut = advance(P);
-            s.undef = true;
-            s.e = ast.new_expr(ast.E_IDENT, ut.span);
-            s.e.name = u.intern("undefined");
-        } else {
-            s.e = parse_expr(P);
-        }
-        if not accept(P, lx.TK_SEMI) {
-            syntax_error(P, "';'");
-            sync_stmt(P);
-        }
-        s.span = sp_from(P, start);
-        return s;
+        return parse_let_rest(P, start, accept(P, lx.KW_MUT));
     }
     if k == lx.KW_IF {
         return parse_if(P);
@@ -1490,10 +2012,16 @@ fn new_decl(P: *mut Parser, k: ast.DeclKind, sp: u.Span) *mut ast.Decl {
 }
 
 fn parse_generic_params(P: *mut Parser, d: *mut ast.Decl) void {
-    if not accept(P, lx.TK_LBRACKET) {
+    let lt = peek(P).span;
+    let angle = pk(P) == lx.TK_LT;  // `fn id<T>`: E0176
+    let mut close = lx.TK_RBRACKET;
+    if angle {
+        _ = advance(P);
+        close = lx.TK_GT;
+    } else if not accept(P, lx.TK_LBRACKET) {
         return;
     }
-    while (pk(P) != lx.TK_RBRACKET) and (pk(P) != lx.TK_EOF) {
+    while (pk(P) != close) and (pk(P) != lx.TK_EOF) {
         let g = u.new.[ast.GenericParam]();
         if accept(P, lx.KW_CONST) {
             g.is_const = true;
@@ -1525,6 +2053,12 @@ fn parse_generic_params(P: *mut Parser, d: *mut ast.Decl) void {
         if not accept(P, lx.TK_COMMA) {
             break;
         }
+    }
+    if angle {
+        let gt = peek(P).span;
+        _ = expect(P, lx.TK_GT);
+        angle_error(P, lt, gt, "generic parameters are written in '[...]': 'fn id[T]', not 'fn id<T>'", "[");
+        return;
     }
     _ = expect(P, lx.TK_RBRACKET);
 }
@@ -1583,6 +2117,18 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
     parse_decl_name(P, d);
     parse_generic_params(P, d);
     parse_params(P, d);
+    let arrow = (pk(P) == lx.TK_MINUS) and (pk_at(P, 1) == lx.TK_GT) and joined(P, 1);
+    if arrow or (pk(P) == lx.TK_COLON) {
+        // `fn f() -> T`, `fn f(): T`: E0163
+        let a = advance(P).span;
+        if arrow {
+            _ = advance(P);
+        }
+        let w = u.pick(arrow, "->", ":");
+        let dg0 = idiom(P, sp_from(P, a), "E0163",
+                        u.f1("the return type follows the parameters directly, with no '%s': 'fn f(x: T) R'", w));
+        fix1(dg0, u.f1("remove '%s'", w), "machine", sp_upto(a, peek(P).span), "");
+    }
     if pk(P) == lx.TK_LBRACE {
         let lsp = advance(P).span;
         if pk(P) == lx.TK_RBRACE {
@@ -2115,7 +2661,7 @@ fn parse_top_in(P: *mut Parser) void {
 // Parser entry point. Returns a module with decls; errors via diag.
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
     let mut toks = lx.lex_file(f);
-    let mut P = Parser.{ f: f, t: toks.items(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
+    let mut P = Parser.{ f: f, t: toks.items_mut(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
                          ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false };
     P.mod.file = f;
     while pk(&P) != lx.TK_EOF {
@@ -2123,6 +2669,13 @@ pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
         parse_top(&mut P);
         if P.pos == before {
             _ = advance(&mut P);
+        }
+    }
+    // `null` as a name (as a value, the checker names .none instead)
+    for i in 0..P.n {
+        let t = &P.t[i];
+        if (t.kind == lx.TK_IDENT) and (t.prim == 0) and u.str_eq(t.name, "null") {
+            _ = dg.err(t.span, "E0003", "'null' is reserved for future use");
         }
     }
     // (the tree keeps the tokens' strings, not the tokens)

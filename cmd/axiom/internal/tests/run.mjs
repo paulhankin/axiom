@@ -2642,6 +2642,8 @@ await section('', {
     const got = ds.map((x) => `${x.code}:${x.fixes.length}`).join(' ');
     return got === 'E0150:0 E0100:0' ? null : `got ${got}`;
   };
+  cases['look-alikes of the idioms of other languages are not errors'] = codes('',
+    'fn f(a: i64, b: i64, c: i64, d: i64) i64 {\n    if g(a<b, c>(d)) {\n        return a--b;\n    }\n    return 0;\n}\n\nfn g(x: bool, y: bool) bool {\n    return x and y;\n}\n', 'alike');
   await section('one error per mistake', cases, { timed: false });
 }
 

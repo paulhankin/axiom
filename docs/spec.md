@@ -2857,6 +2857,14 @@ token in column 1 that starts a top-level declaration; a keyword that only start
 declaration (`fn`, `pub`, `struct`, ...) first on its line inside a block ends the block,
 as a `}` is missing there.
 
+**Idioms of other languages.** A form that another language spells differently (`!x`, `&&`,
+`i++`, `fn f() -> T`, `x as T`, `Vec<T>`, ...) is reported by its own code (`E0160` to
+`E0179`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
+`machine` fix, and the declaration is checked as if the Axiom form had been written, so
+that the mistake costs one error. The forms whose rewrite needs a choice (the conditional
+operator, a C-style `for`, `if` or `match` as an expression) have a note instead, and
+poison their declaration.
+
 ### 16.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.
@@ -2892,6 +2900,26 @@ it does (and that each is asserted by a test):
 | E0110 | Expressions, types and blocks nested more than 1000 levels deep (§3) |
 | E0120 | Unknown builtin |
 | E0150 | Operators require parentheses (§7.4) |
+| E0160 | `!x` for `not x` |
+| E0161 | `&&` or `\|\|` for `and` or `or` |
+| E0162 | A struct literal `T{ ... }`, without the `.` of `T.{ ... }` |
+| E0163 | `->` or `:` before a function's return type |
+| E0164 | `x++` or `x--` (or before `x`) for `x += 1` or `x -= 1` |
+| E0165 | The conditional operator `c ? a : b` |
+| E0166 | `x as T` for `@as(T, x)` (or `@int_cast(T, x)`, when it may not fit) |
+| E0167 | `try f()` or `f()?` for `f()!` |
+| E0168 | `null`, `None`, `Some(x)`, `Ok(x)` or `Err(e)` for `.none`, `.some(x)`, `x` or `e` |
+| E0169 | `::` for `.` |
+| E0170 | `var x` or `mut x` for `let mut x` |
+| E0171 | `.len()` on a slice or array, whose `len` is a field |
+| E0172 | `if` or `match` used as an expression |
+| E0173 | A C-style `for (init; cond; step)` |
+| E0174 | An inclusive range `lo..=hi` for `lo..hi + 1` |
+| E0175 | A prefix `*p` for `p.*` |
+| E0176 | Generic parameters or arguments in angle brackets: `fn id<T>`, `Vec<T>` |
+| E0177 | Generic arguments without the `.` of `Name.[T]`: `Name[T]` |
+| E0178 | A string in single quotes |
+| E0179 | `+` on two slices or arrays (`str.concat` joins strings) |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
 | E0203 | Item, method, or field is not public |
