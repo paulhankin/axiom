@@ -356,8 +356,8 @@ weakly ordered CPUs such as ARM.
   Zig or Rust.
 - **Young.** Axiom is a v0.1 draft with no third-party ecosystem, and its standard
   library has no locale-aware formatting. On this repository's benchmarks
-  (`cmd/axiom/bench.sh`), the compiler's own backend produces code that takes between
-  0.7 and 1.05 times as long as the LLVM-built code of the bootstrap compiler.
+  (`cmd/axiom/bench/`), the compiler's own backend produced code that took between
+  0.7 and 1.05 times as long as that of the LLVM-based bootstrap compiler it replaced.
 
 ## Choosing
 

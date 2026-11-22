@@ -148,8 +148,8 @@ lists the diagnostics.
   checked in carry their expected output; the suite does not run another compiler.
 - The usual repository rules hold (`CLAUDE.md`): no mention of outside projects in
   code, comments, tests or docs; canonical formatting (`axiom fmt`).
-- The C front end exists in the compiler only (`cmd/axiom/src/c/`); the bootstrap
-  compiler does not have it and does not need it.
+- The C front end is `cmd/axiom/src/c/`. Like the rest of the compiler's sources, it
+  is written in the language the pinned seed accepts (`docs/bootstrap-chain.md`).
 
 ## Layout
 

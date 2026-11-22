@@ -2,13 +2,14 @@
 
 This document lays out six architectural improvements to the self-hosted Axiom
 compiler (`cmd/axiom/src/`). Each item addresses a structural constraint left
-over from the initial port from `cmd/axiom/bootstrap/` or from how features
+over from the initial port from the C bootstrap compiler (since removed:
+`docs/bootstrap-chain.md`) or from how features
 grew around single-shot process execution and acyclic module imports.
 
 Scope: all six items live in `cmd/axiom/src/` (and, where noted, host helpers
 in `std/`). None changes the Axiom language (`docs/spec.md`) or front-end
-diagnostics, so `cmd/axiom/bootstrap/` needs no changes except where its `-g`
-parity check in the test suite can be widened once item 6 lands.
+diagnostics, and none needs a language feature newer than the pinned seed accepts
+(`cmd/axiom/seed.toml`).
 
 ---
 
@@ -957,8 +958,8 @@ it moved. Done:
 Compile time and memory are unchanged: the x86-64 -O2 build of the base
 compiler's source (one job, by compilers built at -O2) took 25.5-25.8 s
 of user time before and 25.2-26.2 s after, 2.23 GB peak both. The
-bootstrap compiler builds the new modules as they are (nothing beyond
-its subset: enums with explicit and negative values, `match` with
+bootstrap compiler of the time built the new modules as they were (nothing
+beyond its subset: enums with explicit and negative values, `match` with
 several patterns per arm).
 The x86-64 split and the enums after it did not change them either: the
 same build took 25.9 and 27.4 s of user time by the base compiler and
@@ -1081,13 +1082,13 @@ Nothing of this item remains.
   `ir.Value.src` -> `mc.MInst.src`.
 - On Linux (`elink.ax`) and macOS (`mlink.ax`), `-g` / `--debug-info=lines` is
   parsed and accepted by `main.ax` (`main.ax:70, 333-335`) for CLI compatibility
-  with the bootstrap compiler, **but ignored**: ELF and Mach-O outputs get a
+  with the bootstrap compiler of the time, **but ignored**: ELF and Mach-O outputs get a
   symbol table (`symtab`/`strtab`), yet no DWARF `.debug_line` or `.eh_frame`.
 - `a64.ax` propagates `MInst.src` through `mach.ax`, but does not yet record
   `.axiom.lines` during encoding.
 
-This is the one remaining functional capability where the C/LLVM bootstrap
-compiler produces richer output than the self-hosted compiler.
+This was the one remaining functional capability where the C bootstrap
+compiler produced richer output than the self-hosted compiler.
 
 ### Target design
 
@@ -1152,8 +1153,9 @@ Every step of this plan must preserve the repository's existing invariants:
    stage 3 bit-identical (`CROSS=1` included when touching backends or linkers).
 2. **Canonical formatting**: `cmd/axiom/build/axiom fmt --check` passes across
    the entire repository.
-3. **Differential parity**: `cmd/axiom/difftest.sh` passes (diagnostics, exit
-   codes, `-O0`/`-O2`, `--units=module|program`, backend fuzzer vs LLVM).
+3. **Differential parity**: `cmd/axiom/difftest.sh` passes (the suite at
+   `-O0`/`-O2`, `--units=module|program`, wasm and native; the backend fuzzer,
+   each backend against the WebAssembly build).
 4. **Optimizer & memory hygiene**: `node cmd/axiom/internal/tests/std_opt.mjs`
    passes with `AXIOM_CHECK_IR=1`, `AXIOM_CHECK_CINTS=1`, `AXIOM_POISON=1`, and
    `--sanitize=address`.

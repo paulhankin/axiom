@@ -9,8 +9,7 @@ notes say how.
 
 Releases are numbered `0.N.M`. `N` counts releases with new features (and possible
 breaking changes); `M` counts fix releases of `0.N` (security and critical fixes only).
-The compiler knows its version (`axiom version`), kept in `cmd/axiom/src/version.ax`
-and, for the bootstrap compiler, `cmd/axiom/bootstrap/src/version.h`. Between
+The compiler knows its version (`axiom version`), kept in `cmd/axiom/src/version.ax`. Between
 releases, `main` carries the version of the next release.
 
 A package says which compiler it needs in its `axiom.toml`:
@@ -53,8 +52,8 @@ which is then edited into shape.
 
 ## Making a release
 
-One command does every step, from a clean, up-to-date checkout with `llvm-18-dev`,
-`lld`, `node`, `python3`, push access and [`gh`](https://cli.github.com) logged in
+One command does every step, from a clean, up-to-date checkout with `curl`, `tar`,
+`node`, `python3`, push access and [`gh`](https://cli.github.com) logged in
 (`gh auth login`):
 
 ```
@@ -74,12 +73,12 @@ These are its steps:
 
 1. For a fix release, check out `release-0.N` (made from the tag `v0.N.(M-1)` if it
    does not exist yet) and cherry-pick the commits onto it (`git cherry-pick -x`).
-2. Set the version in `cmd/axiom/src/version.ax` and
-   `cmd/axiom/bootstrap/src/version.h`, run `cmd/axiom/release.sh notes <version>`,
+2. Set the version in `cmd/axiom/src/version.ax`, run `cmd/axiom/release.sh notes <version>`,
    open the notes in `$EDITOR` (when there is a terminal), and commit them as
    "Axiom <version>".
-3. `cmd/axiom/release.sh build <version>`: bootstraps, runs the test suite with both
-   compilers and the standard library's fuzzer for five minutes (`docs/security.md`),
+3. `cmd/axiom/release.sh build <version>`: bootstraps from the seed that
+   `cmd/axiom/seed.toml` pins (below), runs the test suite and the standard library's
+   fuzzer for five minutes (`docs/security.md`),
    builds every example for the targets it names and runs the ones that can run on
    the machine (`cmd/axiom/examples.sh`), and writes the archives and `SHA256SUMS` to
    `build/release/`.
@@ -88,6 +87,24 @@ These are its steps:
 5. For a new `0.N`, create the branch `release-0.N` from the tag, and set `main` to the
    next version (`0.N+1.0`). For a fix release, add its notes to `main`'s
    `docs/releases/`.
+
+## The seed
+
+The compiler is built from a *seed*, a compiler that already exists
+([`docs/bootstrap-chain.md`](bootstrap-chain.md)): `cmd/axiom/seed.toml` pins one, by
+version and by the SHA-256 of each platform's archive, and `bootstrap.sh` downloads it
+once (it needs `curl` and `tar`; `AXIOM_SEED=<compiler>` names one on the machine
+instead). A release is built from the seed its commit pins, and adds a row to the table
+in `docs/bootstrap-chain.md` (its version, its commit and its seed), so that it can be
+rebuilt from the release before it.
+
+A seed is either a release (its hashes are those of its `SHA256SUMS`) or, between
+releases, the compiler of a commit of `main`, made by `cmd/axiom/seed.sh
+<0.N.M-seed.K> --publish`: it builds the compiler alone for each platform, publishes
+the archives as a pre-release (which `axiom update` does not offer) and prints the
+`seed.toml` that pins them. A new seed is needed when the compiler's sources are to
+use a language feature the pinned one does not accept: the feature lands first, then
+the seed, then its uses in the compiler. A fix release keeps the seed of its branch.
 
 ## Fix releases
 
