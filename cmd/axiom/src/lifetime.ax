@@ -1,0 +1,545 @@
+// =============================================================================
+// lifetime.ax - W0711 (off by default; --warn=W0711): a local slice or
+// pointer used after the memory it points into was freed, or may have moved,
+// in the two plain shapes one function shows by itself (spec §16.3):
+//   - it was passed to mem.free (or mem.destroy);
+//   - it came from a container through a *Self method (or from a function
+//     given &container), and since then a *mut Self method was called on the
+//     same container (or the container was given as &mut).
+// A heuristic, run after checking over each function's statements in
+// order: a branch that falls through carries what it freed on, a loop's body
+// is walked once, and a defer is not followed. It has false positives (a
+// *mut Self method that does not move the buffer, such as a set) and misses
+// what goes through another variable, a field or another function.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "modload.ax" as modl;
+import "util.ax" as u;
+
+// A local whose memory was freed, or may have moved, at `at`.
+struct Stale {
+    l: *mut ast.Local,
+    at: u.Span,
+    freed: bool,  // passed to std/mem (else its container changed)
+    what: []u8,   // the call: "mem.free", "v.push takes *mut Self"
+    whose: []u8,  // the container ("v", "self.items"), when not freed
+}
+
+// A local slice or pointer that came from the container root.path.
+struct Derived {
+    l: *mut ast.Local,
+    root: *mut ast.Local,
+    path: []u8,
+}
+
+let mut g_stale: u.List.[Stale] = u.List.[Stale].{ data: @ptr_from_int(*mut Stale, 0), len: 0, cap: 0 };
+let mut g_derived: u.List.[Derived] = u.List.[Derived].{ data: @ptr_from_int(*mut Derived, 0), len: 0, cap: 0 };
+let mut g_reported: u.List.[Stale] = u.List.[Stale].{ data: @ptr_from_int(*mut Stale, 0), len: 0, cap: 0 };
+
+fn is_ref(t: *mut ast.Type) bool {
+    return u.notnil(t) and ((t.kind == ast.TY_SLICE) or (t.kind == ast.TY_PTR));
+}
+
+fn ref_local(e: *mut ast.Expr) *mut ast.Local {
+    if u.isnil(e) or (e.kind != ast.E_IDENT) {
+        return u.nil.[ast.Local]();
+    }
+    let l = ast.local_of(e);
+    if u.isnil(l) or not is_ref(l.ty) {
+        return u.nil.[ast.Local]();
+    }
+    return l;
+}
+
+fn same_span(a: u.Span, b: u.Span) bool {
+    return (a.file == b.file) and (a.start == b.start) and (a.end == b.end);
+}
+
+fn find_stale(l: *mut ast.Local) i64 {
+    for i in 0..g_stale.len {
+        if g_stale.at(i).l == l {
+            return @int_cast(i64, i);
+        }
+    }
+    return -1;
+}
+
+fn make_stale(s: Stale) void {
+    if find_stale(s.l) < 0 {
+        g_stale.push(s);
+    }
+}
+
+// l holds memory again (a new value): neither stale nor derived.
+fn renew(l: *mut ast.Local) void {
+    let mut n: usize = 0;
+    for i in 0..g_stale.len {
+        if g_stale.at(i).l != l {
+            g_stale.set(n, g_stale.get(i));
+            n += 1;
+        }
+    }
+    g_stale.len = n;
+    n = 0;
+    for i in 0..g_derived.len {
+        if g_derived.at(i).l != l {
+            g_derived.set(n, g_derived.get(i));
+            n += 1;
+        }
+    }
+    g_derived.len = n;
+}
+
+// The union of two states (what may be stale after either).
+fn merge(a: u.List.[Stale], b: u.List.[Stale]) u.List.[Stale] {
+    let mut r = a.copy();
+    for i in 0..b.len {
+        let s = b.get(i);
+        let mut have = false;
+        for j in 0..r.len {
+            if r.at(j).l == s.l {
+                have = true;
+                break;
+            }
+        }
+        if not have {
+            r.push(s);
+        }
+    }
+    return r;
+}
+
+// The container a place names: a local and its fields (v, self.items,
+// p.* as p), or no local.
+fn path_of(e: *mut ast.Expr, path: *mut []u8) *mut ast.Local {
+    if u.isnil(e) {
+        return u.nil.[ast.Local]();
+    }
+    if e.kind == ast.E_IDENT {
+        path.* = "";
+        return ast.local_of(e);
+    }
+    if e.kind == ast.E_DEREF {
+        return path_of(e.a, path);
+    }
+    if (e.kind == ast.E_FIELD) and (ast.field_kind_of(e) == ast.FK_STRUCT) {
+        let root = path_of(e.a, path);
+        if u.notnil(root) {
+            path.* = u.f2("%s.%s", path.*, e.name);
+        }
+        return root;
+    }
+    return u.nil.[ast.Local]();
+}
+
+// The callee of a call, or nil.
+fn callee(e: *mut ast.Expr) *mut ast.Decl {
+    let mut f = ast.decl_of(e);
+    if u.isnil(f) and u.notnil(e.a) and ((e.a.kind == ast.E_IDENT) or (e.a.kind == ast.E_FIELD)) {
+        f = ast.decl_of(e.a);
+    }
+    if u.notnil(f) and (f.kind != ast.D_FN) {
+        return u.nil.[ast.Decl]();
+    }
+    return f;
+}
+
+// A method call's receiver.
+fn receiver(e: *mut ast.Expr) *mut ast.Expr {
+    let r = ast.b_of(e);
+    if u.notnil(r) {
+        return r;
+    }
+    if u.notnil(e.a) and (e.a.kind == ast.E_FIELD) {
+        return e.a.a;
+    }
+    return u.nil.[ast.Expr]();
+}
+
+fn is_mem_free(f: *mut ast.Decl) bool {
+    if u.isnil(f) or u.isnil(f.module) or u.notnil(f.owner) {
+        return false;
+    }
+    if not u.str_eq(u.file_of(f.module.file.id).display, "std/mem.ax") {
+        return false;
+    }
+    return u.str_eq(f.name, "free") or u.str_eq(f.name, "destroy");
+}
+
+// Where a value comes from, past `!`, catch and slicing.
+fn strip(e0: *mut ast.Expr) *mut ast.Expr {
+    let mut e = e0;
+    while u.notnil(e) {
+        if (e.kind == ast.E_TRY) or (e.kind == ast.E_CATCH) or (e.kind == ast.E_ORELSE) or (e.kind == ast.E_SLICE) {
+            e = e.a;
+        } else {
+            break;
+        }
+    }
+    return e;
+}
+
+// Whether f is declared to return a view: a slice or a pointer (or an
+// optional one), and not an element of type T that is one (List.[*mut
+// T].get), nor an error union of one, which is most often a new allocation
+// (to_string).
+fn returns_ref(f: *mut ast.Decl) bool {
+    let mut t = f.ret_type;
+    if u.notnil(t) and (t.kind == ast.TY_OPT) {
+        t = t.elem;
+    }
+    return is_ref(t);
+}
+
+// l (a slice or pointer) now holds the value of init: whether it came from a
+// container.
+fn derive(l: *mut ast.Local, init: *mut ast.Expr) void {
+    renew(l);
+    if u.isnil(l) or not is_ref(l.ty) {
+        return;
+    }
+    let e = strip(init);
+    if u.isnil(e) {
+        return;
+    }
+    let mut path: []u8 = "";
+    let mut root = u.nil.[ast.Local]();
+    if e.kind == ast.E_IDENT {
+        // a copy of one that came from a container comes from it too
+        let src = ast.local_of(e);
+        for i in 0..g_derived.len {
+            let d = g_derived.get(i);
+            if d.l == src {
+                root = d.root;
+                path = d.path;
+                break;
+            }
+        }
+    } else if e.kind == ast.E_CALL {
+        let f = callee(e);
+        if u.isnil(f) or not returns_ref(f) {
+            return;
+        }
+        if f.self_kind == ast.SELF_ADDR {
+            root = path_of(receiver(e), &mut path);
+        } else if f.self_kind == ast.SELF_NONE {
+            for a in ast.args_of(e).items() {
+                if (a.kind == ast.E_UNARY) and (ast.op_of(a) == lx.TK_AMP) and not a.bval {
+                    root = path_of(a.a, &mut path);
+                    break;
+                }
+            }
+        }
+    }
+    if u.notnil(root) and (root != l) {
+        g_derived.push(Derived.{ l: l, root: root, path: path });
+    }
+}
+
+// The container root.path changed at call e: what came from it may point
+// into memory that moved.
+fn changed(root: *mut ast.Local, path: []u8, e: *mut ast.Expr, what: []u8) void {
+    if u.isnil(root) {
+        return;
+    }
+    for i in 0..g_derived.len {
+        let d = g_derived.get(i);
+        if (d.root == root) and u.str_eq(d.path, path) {
+            make_stale(Stale.{ l: d.l, at: e.span, freed: false, what: what, whose: u.cat2(root.name, path) });
+        }
+    }
+}
+
+// After a call's operands: what it frees or changes.
+fn call_done(e: *mut ast.Expr) void {
+    let f = callee(e);
+    if u.isnil(f) {
+        return;
+    }
+    let args = ast.args_of(e);
+    if is_mem_free(f) {
+        if args.len > 0 {
+            let l = ref_local(args.get(0));
+            if u.notnil(l) {
+                make_stale(Stale.{ l: l, at: e.span, freed: true, what: u.cat2("mem.", f.name), whose: "" });
+            }
+        }
+        return;
+    }
+    // (a *mut Self method that returns a view, items_mut, is an accessor)
+    if (f.self_kind == ast.SELF_PASS) and not returns_ref(f) {
+        let mut path: []u8 = "";
+        let root = path_of(receiver(e), &mut path);
+        changed(root, path, e, u.f3("%s%s.%s takes *mut Self", root_name(root), path, f.name));
+    }
+    for a in args.items() {
+        if (a.kind == ast.E_UNARY) and (ast.op_of(a) == lx.TK_AMP) and a.bval {
+            let mut path: []u8 = "";
+            let root = path_of(a.a, &mut path);
+            changed(root, path, e, u.f3("given to %s as &mut %s%s", f.name, root_name(root), path));
+        }
+    }
+}
+
+fn root_name(l: *mut ast.Local) []u8 {
+    if u.isnil(l) {
+        return "";
+    }
+    return l.name;
+}
+
+fn reported(s: *Stale) bool {
+    for i in 0..g_reported.len {
+        let r = g_reported.at(i);
+        if (r.l == s.l) and same_span(r.at, s.at) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn use_of(e: *mut ast.Expr) void {
+    let l = ast.local_of(e);
+    if u.isnil(l) {
+        return;
+    }
+    let k = find_stale(l);
+    if k < 0 {
+        return;
+    }
+    let s = g_stale.get(@int_cast(usize, k));
+    if reported(&s) {
+        return;
+    }
+    g_reported.push(s);
+    if s.freed {
+        let d = dg.warning(e.span, "W0711", u.f1("'%s' is used after the memory it points into was freed", l.name));
+        dg.note(d, s.at, u.f1("freed here (%s)", s.what));
+    } else {
+        let d = dg.warning(e.span, "W0711",
+                           u.f2("'%s' came from '%s', which changed since, and may point into memory that moved",
+                                l.name, s.whose));
+        dg.note(d, s.at, u.f2("'%s' changed here (%s)", s.whose, s.what));
+    }
+}
+
+fn ex(e: *mut ast.Expr) void {
+    if u.isnil(e) {
+        return;
+    }
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        use_of(e);
+        return;
+    }
+    if k == ast.E_FIELD {
+        let fk = ast.field_kind_of(e);
+        if ((fk == ast.FK_SLICE_LEN) or (fk == ast.FK_SLICE_PTR) or (fk == ast.FK_ARRAY_LEN)) and u.notnil(e.a) and
+           (e.a.kind == ast.E_IDENT) {
+            return;  // (a slice's length or address: no access to its memory)
+        }
+        ex(e.a);
+        return;
+    }
+    if k == ast.E_BUILTIN {
+        if ast.builtin_of(e) == ast.BI_INT_FROM_PTR {
+            return;
+        }
+        if u.notnil(e.more) {
+            for i in 0..e.more.bargs.len {
+                ex(e.more.bargs.at_mut(i).e);
+            }
+        }
+        return;
+    }
+    if k == ast.E_STRUCT_LIT {
+        ex(e.a);
+        if u.notnil(e.more) {
+            for i in 0..e.more.inits.len {
+                ex(e.more.inits.at_mut(i).value);
+            }
+        }
+        return;
+    }
+    if (k == ast.E_CATCH) or (k == ast.E_ORELSE) {
+        ex(e.a);
+        let before = g_stale.copy();
+        ex(ast.handler_expr(e));
+        let hb = ast.handler_block(e);
+        let mut leaves = false;
+        if u.notnil(hb) {
+            stmt(hb);
+            leaves = hb.diverges;
+        }
+        if k == ast.E_CATCH {
+            match ast.more(e).handler {
+                .Return(h) => {
+                    _ = h;
+                    leaves = true;
+                }
+                .Break    => { leaves = true; }
+                .Continue => { leaves = true; }
+                else => {}
+            }
+        }
+        if leaves {
+            g_stale = before;
+        } else {
+            g_stale = merge(before, g_stale);
+        }
+        return;
+    }
+    if k == ast.E_CALL {
+        ex(e.a);
+        let r = ast.b_of(e);
+        if r != e.a {
+            ex(r);
+        }
+        for a in ast.args_of(e).items() {
+            ex(a);
+        }
+        call_done(e);
+        return;
+    }
+    ex(e.a);
+    ex(ast.b_of(e));
+    ex(ast.c_of(e));
+    for a in ast.args_of(e).items() {
+        ex(a);
+    }
+}
+
+// A branch from the state `before`: the state after it, or none (.none)
+// when it does not fall through.
+fn branch(s: *mut ast.Stmt, before: *u.List.[Stale]) ?u.List.[Stale] {
+    g_stale = before.copy();
+    if u.isnil(s) {
+        return .some(g_stale);
+    }
+    stmt(s);
+    if s.diverges {
+        return .none;
+    }
+    return .some(g_stale);
+}
+
+fn join(acc: *mut ?u.List.[Stale], b: ?u.List.[Stale]) void {
+    if let .some(bs) = b {
+        if let .some(a) = acc.* {
+            acc.* = .some(merge(a, bs));
+        } else {
+            acc.* = .some(bs);
+        }
+    }
+}
+
+fn settle(acc: ?u.List.[Stale]) void {
+    if let .some(a) = acc {
+        g_stale = a;
+    } else {
+        g_stale = u.List.[Stale].empty();  // (what follows is not reached)
+    }
+}
+
+fn stmt(s: *mut ast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    let k = s.kind;
+    if k == ast.S_BLOCK {
+        for st in s.stmts.items() {
+            stmt(st);
+            if st.diverges {
+                break;
+            }
+        }
+        return;
+    }
+    if k == ast.S_DEFER {
+        return;  // (runs at the end of its scope)
+    }
+    if k == ast.S_LET {
+        ex(s.e);
+        if u.notnil(s.local) {
+            derive(s.local, s.e);
+        }
+        return;
+    }
+    if (k == ast.S_ASSIGN) and (s.op == lx.TK_EQ) and u.notnil(s.e) and (s.e.kind == ast.E_IDENT) and
+       u.notnil(ast.local_of(s.e)) {
+        ex(s.e2);
+        derive(ast.local_of(s.e), s.e2);
+        return;
+    }
+    if k == ast.S_IF {
+        ex(s.e);
+        let before = g_stale.copy();
+        let mut acc: ?u.List.[Stale] = .none;
+        join(&mut acc, branch(s.body, &before));
+        join(&mut acc, branch(s.els, &before));
+        settle(acc);
+        return;
+    }
+    if k == ast.S_MATCH {
+        ex(s.e);
+        let before = g_stale.copy();
+        let mut acc: ?u.List.[Stale] = .none;
+        if u.notnil(s.more) {
+            for i in 0..s.more.arms.len {
+                let a = s.more.arms.at_mut(i);
+                if not a.alt {
+                    join(&mut acc, branch(a.body, &before));
+                }
+            }
+        }
+        if u.isnil(s.more) or (s.more.arms.len == 0) {
+            acc = .some(before);
+        }
+        settle(acc);
+        return;
+    }
+    if (k == ast.S_WHILE) or (k == ast.S_LOOP) or (k == ast.S_FOR) {
+        ex(s.e);
+        ex(s.e2);
+        // (after it: what was stale before, and what the body leaves stale;
+        // a break's state is taken to be the body's end's)
+        let before = g_stale.copy();
+        let mut acc: ?u.List.[Stale] = .some(before.copy());
+        join(&mut acc, branch(s.body, &before));
+        settle(acc);
+        return;
+    }
+    ex(s.e);
+    ex(s.e2);
+    stmt(s.body);
+    stmt(s.els);
+    for st in s.stmts.items() {
+        stmt(st);
+    }
+}
+
+fn check_fn(d: *mut ast.Decl) void {
+    if (d.kind != ast.D_FN) or u.isnil(d.body) {
+        return;
+    }
+    g_stale = u.List.[Stale].empty();
+    g_derived = u.List.[Derived].empty();
+    stmt(d.body);
+}
+
+/// W0711 for the program's own modules (those whose tests run, as W0320's).
+pub fn warn_lifetimes() void {
+    for m in modl.g_prog.modules.items() {
+        if not modl.own_module(m) {
+            continue;
+        }
+        for d in m.decls.items() {
+            check_fn(d);
+            for md in d.methods.items() {
+                check_fn(md);
+            }
+        }
+    }
+}
