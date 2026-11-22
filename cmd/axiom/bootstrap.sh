@@ -5,10 +5,7 @@
 #   stage 0  the seed, the first of these that there is:
 #              - $AXIOM_SEED, a compiler on this machine;
 #              - the release that cmd/axiom/seed.toml pins, downloaded once
-#                into the cache and checked against the hash pinned there;
-#              - the bootstrap compiler (cmd/axiom/bootstrap/), in C, built
-#                with make (it uses LLVM): the way until a release that
-#                builds this tree is pinned
+#                into the cache and checked against the hash pinned there
 #   stage 1  cmd/axiom/src compiled by stage 0
 #   stage 2  cmd/axiom/src compiled by stage 1 (its own backends and linker)
 #   stage 3  cmd/axiom/src compiled by stage 2: must be bit-identical to stage 2
@@ -25,9 +22,8 @@
 #   AXIOM_UPDATE_URL  where releases are downloaded from (default
 #           https://github.com/paulhankin/axiom; `axiom update` reads it too)
 #   OPT     optimization level for stages 2 and 3 (default: -O2)
-#   OPT1    optimization level for stage 1 (default: -O0 with the bootstrap
-#           compiler, where LLVM takes a minute at -O2, and OPT with a seed;
-#           stage 2 comes out the same either way)
+#   OPT1    optimization level for stage 1 (default: OPT; stage 2 comes out
+#           the same either way)
 #   TARGET  the compiler's target (default: the generic processor of this
 #           machine's architecture, so the binary runs on any machine of its
 #           kind; TARGET=native tunes it to this processor's extensions, and
@@ -100,31 +96,24 @@ if [ -n "$SEED" ]; then
     [ -x "$SEED" ] || { echo "bootstrap: AXIOM_SEED=$SEED is not a program" >&2; exit 1; }
 elif [ -f "$SEED_TOML" ]; then
     pinned_seed "$SEED_TOML"
-fi
-if [ -n "$SEED" ]; then
-    OPT1=${OPT1:-$OPT}
 else
-    OPT1=${OPT1:--O0}
+    echo "bootstrap: no seed: $SEED_TOML does not exist and AXIOM_SEED is not set." >&2
+    echo "  Building the compiler takes an Axiom compiler (docs/bootstrap-chain.md):" >&2
+    echo "  set AXIOM_SEED to one, or restore the file that pins a release." >&2
+    exit 1
 fi
+OPT1=${OPT1:-$OPT}
 
 stage() {
     echo "stage $3: $1 -> $2"
     start=$(date +%s)
-    target=$TARGET
     std=
-    if [ "$3" = 1 ]; then
-        if [ -n "$SEED" ]; then
-            # (a release looks for the standard library beside itself: this
-            # tree's is the one to compile)
-            std=--std=std
-        else
-            # (the bootstrap compiler knows only --target=native)
-            target=native
-        fi
-    fi
+    # (a release looks for the standard library beside itself: this tree's
+    # is the one to compile)
+    [ "$3" = 1 ] && std=--std=std
     # shellcheck disable=SC2086
-    if ! "$1" build cmd/axiom/src/main.ax --target="$target" ${4:-$OPT} $std -o "$2"; then
-        [ "$3" = 1 ] && [ -n "$SEED" ] &&
+    if ! "$1" build cmd/axiom/src/main.ax --target="$TARGET" ${4:-$OPT} $std -o "$2"; then
+        [ "$3" = 1 ] &&
             echo "bootstrap: the seed ($("$SEED" version)) does not build these sources: it must accept the language they are written in" >&2
         exit 1
     fi
@@ -132,26 +121,8 @@ stage() {
 }
 
 mkdir -p $B
-if [ -n "$SEED" ]; then
-    echo "seed: $SEED ($("$SEED" version))"
-    stage "$SEED" $B/axiom1 1 "$OPT1"
-elif [ "$(uname -s)" = Darwin ]; then
-    make -C cmd/axiom/bootstrap --no-print-directory
-    # The bootstrap compiler does not build native Mac programs, but it
-    # builds WebAssembly: stage 1 is the compiler for wasm32,
-    # run under node, building itself for the Mac (by name: under node it
-    # cannot tell that it is on one).
-    echo "stage 1: cmd/axiom/bootstrap/build/axiom -> $B/axiom1.wasm (node) -> $B/axiom1"
-    start=$(date +%s)
-    # shellcheck disable=SC2086
-    cmd/axiom/bootstrap/build/axiom build cmd/axiom/src/main.ax --target=wasm32 $OPT1 -o $B/axiom1.wasm
-    # shellcheck disable=SC2086
-    node std/internal/runtime/host.mjs $B/axiom1.wasm -- build cmd/axiom/src/main.ax --target=aarch64-macos $OPT1 -o $B/axiom1
-    echo "         $(($(date +%s) - start)) s, $(wc -c < "$B/axiom1") bytes"
-else
-    make -C cmd/axiom/bootstrap --no-print-directory
-    stage cmd/axiom/bootstrap/build/axiom $B/axiom1 1 "$OPT1"
-fi
+echo "seed: $SEED ($("$SEED" version))"
+stage "$SEED" $B/axiom1 1 "$OPT1"
 # (stages 2 and 3 have the same file name: a Mac executable's code
 # signature holds it)
 mkdir -p $B/stage2 $B/stage3
@@ -177,7 +148,9 @@ if [ "$CROSS" = 1 ]; then
     $B/axiom build cmd/axiom/src/main.ax --target=$other $OPT -o $B/axiom-$other
     # (explicit targets: --target=native would use this machine's extensions)
     $B/axiom build cmd/axiom/src/main.ax --target=$host $OPT -o $B/axiom-generic
-    qemu-$other -L /usr/$other-linux-gnu $B/axiom-$other build cmd/axiom/src/main.ax --target=$host $OPT -o $B/axiom-cross
+    qemu=qemu-$other
+    command -v "$qemu" >/dev/null || qemu=qemu-$other-static
+    $qemu -L /usr/$other-linux-gnu $B/axiom-$other build cmd/axiom/src/main.ax --target=$host $OPT -o $B/axiom-cross
     if ! cmp -s $B/axiom-generic $B/axiom-cross; then
         echo "bootstrap FAILED: the $other-hosted compiler generates different code" >&2
         exit 1
