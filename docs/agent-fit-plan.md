@@ -215,6 +215,71 @@ missing return type and unannotated literals.
   gain a note listing the closest names in scope, or in the module or type, with their
   signatures. The fix is a suggestion when exactly one name is within edit distance 2.
 
+### Status
+
+Done. The Problem above describes the tree as it was.
+
+- Verification step 2 came first: `run.mjs` applies each `machine` fix of the errors suite
+  (`errors/` and `errors/idioms/`) alone, checks the result again, and requires the
+  diagnostic gone and no error added. On the probes it rejected nine of the sixteen
+  cascade `E0620` fixes; the other seven removed their diagnostic and were wrong all the
+  same. A1 removed all sixteen.
+- A1: a function, method or other top-level declaration with a syntax error is poisoned
+  (one `E0100`, its body unchecked, no fixes in it; spec §16.2). Recovery stops at a
+  column-1 token that starts a top-level declaration, and a declaration-only keyword
+  first on its line inside a block ends the block (a missing `}`).
+- A2: `E0160` to `E0179`, one per idiom (`&&` and `||` share `E0161`, `try` and `?`
+  share `E0167`, `fn id<T>` and `Vec<T>` share `E0176`; `E0179` is `+` on slices). The
+  parser builds the Axiom form's tree after a machine-fixed idiom, so the rest checks as
+  written. `errors/idioms/` has a file per form, each exactly one error.
+- A3: `E0202` and `E0404` have a note per closest name (at most three, with signatures),
+  and a suggestion when exactly one is within two edits.
+- Verified on the probes of the table (32 programs, one per form; the `Errors today`
+  column was measured the same way): every row now gives one error, with the stated code.
+  117 errors became 32; 24 of the 32 carry a machine fix, and each fixed program checks
+  with no error. The tour and `examples/` give no diagnostics; the full suite passes.
+
+| Probe | Before | After |
+|---|---|---|
+| `if !ok {` | 7 | 1, `E0160` |
+| `a \|\| b` / `a && b` | 5 / 1 | 1, `E0161` |
+| `P{ x: 1 }` | 2 | 1, `E0162` |
+| `fn f() -> T` / `fn f(): T` | 5 / 4 | 1, `E0163` |
+| `i++` / `i--` | 2 / 2 | 1, `E0164` |
+| `c ? a : b` | 2 | 1, `E0165` (note, no fix) |
+| `x as i32` (lossless / lossy) | 4 / 4 | 1, `E0166` (machine / suggestion) |
+| `try f()` / `f()?` | 2 / 2 | 1, `E0167` |
+| `null` / `None` / `Some(x)` | 2 / 1 / 1 | 1, `E0168` |
+| `C::R` | 4 | 1, `E0169` |
+| `var i` / `mut i` | 5 / 6 | 1, `E0170` |
+| `s.len()` | 1 | 1, `E0171` |
+| `let r = match v { ... }` / `if` | 3 / 3 | 1, `E0172` (note, no fix) |
+| `for (init; cond; step)` | 12 | 1, `E0173` (note, no fix) |
+| `0..=n` | 7 | 1, `E0174` |
+| `*p` | 4 | 1, `E0175` |
+| `fn id<T>(x: T)` / `Pair<u32>` | 4 / 5 | 1, `E0176` |
+| `Pair[u32]` | 7 | 1, `E0177` |
+| `'abc'` | 6 | 1, `E0178` |
+| `for l in str.lines(s)` | 1 | 1, `E0412` (workstream D) |
+| `fmt.println(...)` | 2 | 1, `E0202`, suggesting `print` |
+| `a + b` on slices | 1 | 1, `E0179` (note naming `str.concat`) |
+
+Decided, where the plan left a choice or was not quite right:
+
+- `null` stays reserved: as a name it is still `E0003`; as a value it is `E0168`.
+- `Ok(x)` and `Err(e)` lose the wrapper by a machine fix only where a `!T` is expected
+  (`Err` only around `error.X`); elsewhere the fix is a suggestion. A lossy `x as T`
+  between floats, or between a float and an integer, has no fix.
+- `+` on slices, the conditional operator, a C-style `for` and `if` or `match` as an
+  expression have notes only: their rewrite needs a name, a type or an allocator. The
+  last three poison their declaration.
+- The plan's `E0404` is "no such field or method"; the spec's table listed only its other
+  meaning (a `void` element), and now lists both.
+- Not recognised, conservatively: `f<A, B>(x)` in an expression (a `,` before `(` is two
+  comparisons as arguments, `f(a < b, c > (d))`); a nested `Vec<Vec<u32>>` (the `>>`);
+  `a[i++]`; `Pair[Foo]` in an expression, with a type of the program's own, which the
+  parser cannot tell from indexing; a `for` over an iterator (workstream D).
+
 ### Verification
 
 - A new directory `cmd/axiom/internal/tests/errors/idioms/` holds one file per row. Each
