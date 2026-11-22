@@ -182,6 +182,7 @@ that lacks the extensions it was built with.
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 | `--warn=W0320` | Also warn of each public item, and public method of a public type, that has no `///` comment, in the modules whose tests would run: the input module and its package's modules, or outside a package those not in the standard library (spec §16.3). Off by default. |
+| `--warn=W0711` | Also warn of a local slice or pointer used after the memory it points into was freed or may have moved, within one function: after `mem.free` or `mem.destroy` of it, or after a `*mut Self` method was called on the container it came from through a `*Self` method (`let xs = v.items(); v.push(x)!; xs[0]`), in the modules whose tests would run (spec §16.3). A heuristic, with false positives (a `*mut Self` method that does not move the memory); off by default. The address sanitizer, on in `axiom test`, catches these at run time. |
 
 ### C sources
 

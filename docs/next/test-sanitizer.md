@@ -12,6 +12,12 @@
 - The sanitizer's quarantine of freed memory is 16 MiB in a test (64 MiB elsewhere),
   since tests run in parallel, and the sanitizer is faster: it sets and checks shadow
   memory a page at a time, and remembers which allocation sites are `std/mem`'s.
+- A new warning, `W0711`, off by default and turned on with `--warn=W0711`, reports a
+  local slice or pointer used after the memory it points into was freed or may have
+  moved, in the two plain shapes one function shows: after it was passed to `mem.free`
+  (or `mem.destroy`), or after a `*mut Self` method was called on the container it came
+  from through a `*Self` method (`let xs = v.items(); v.push(x)!; xs[0]`). It is a
+  heuristic, with false positives.
 
 ## Language
 
