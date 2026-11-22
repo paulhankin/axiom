@@ -2610,7 +2610,9 @@ await section('', {
 
 // One error per mistake (spec §16.2): a declaration with a syntax error is
 // poisoned (one E0100, its body not checked, no fixes in it), and the parser
-// resumes at the next declaration.
+// resumes at the next declaration; an unknown name, field or method comes
+// with the nearest names, and the nearest as a suggestion when it is the
+// only one within two edits.
 {
   const cases = {};
   const check = (src, name) => {
@@ -2642,6 +2644,24 @@ await section('', {
     const got = ds.map((x) => `${x.code}:${x.fixes.length}`).join(' ');
     return got === 'E0150:0 E0100:0' ? null : `got ${got}`;
   };
+  const near = (src, name, wantNote, wantFix) => () => {
+    const ds = check(src, name);
+    if (typeof ds === 'string') return ds;
+    if (ds.length !== 1) return `${ds.length} errors: ${ds.map((x) => x.code).join(' ')}`;
+    const notes = ds[0].notes.map((n) => n.message);
+    if (!notes.some((n) => n.includes(wantNote))) return `notes: ${JSON.stringify(notes)}`;
+    const fixes = ds[0].fixes.map((x) => `${x.applicability}:${x.edits.map((e) => e.replacement).join()}`);
+    return fixes.join(' ') === (wantFix ? `suggestion:${wantFix}` : '') ? null : `fixes: ${fixes.join(' ')}`;
+  };
+  cases['an unknown name: the nearest local'] = near('fn f(count: i32) i32 {\n    return coutn + 1;\n}\n', 'local',
+    "did you mean 'count'? count: i32", 'count');
+  cases['an unknown field: the nearest field'] = near('struct P {\n    x_pos: i32,\n}\n\nfn f(p: P) i32 {\n    return p.x_pso;\n}\n',
+    'field', "did you mean 'x_pos'? x_pos: i32", 'x_pos');
+  cases['a name a module does not declare: the nearest, with its signature'] = near(
+    'import "std/fmt" as fmt;\n\nexport fn main() i32 {\n    fmt.println("hi", []) catch return 1;\n    return 0;\n}\n', 'module',
+    "did you mean 'print'? fn print(", 'print');
+  cases['two names as near: notes, no fix'] = near('fn f(abc: i32, abd: i32) i32 {\n    return abe;\n}\n', 'two-near',
+    "did you mean 'abc'?", null);
   cases['look-alikes of the idioms of other languages are not errors'] = codes('',
     'fn f(a: i64, b: i64, c: i64, d: i64) i64 {\n    if g(a<b, c>(d)) {\n        return a--b;\n    }\n    return 0;\n}\n\nfn g(x: bool, y: bool) bool {\n    return x and y;\n}\n', 'alike');
   await section('one error per mistake', cases, { timed: false });

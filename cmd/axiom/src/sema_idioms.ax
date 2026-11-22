@@ -1,6 +1,7 @@
 // =============================================================================
 // sema_idioms.ax - forms from other languages that need types to name
-// (spec §16.3, E0160 ... E0179; the parser names the others); part of sema.ax.
+// (spec §16.3, E0160 ... E0179; the parser names the others), and the nearest
+// names offered with an unknown name, field or method; part of sema.ax.
 // =============================================================================
 import "ast.ax" as ast;
 import "diag.ax" as dg;
@@ -151,4 +152,227 @@ fn idiom_concat(op: lx.TokKind, t: *mut ast.Type, sp: u.Span) bool {
         dg.note(d, sp, "copy both into a new slice (std/mem), or append them to a list");
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Nearest names (E0202, E0404): a note for each of the closest names, with
+// its signature, and a suggestion when exactly one is within two edits.
+// ---------------------------------------------------------------------------
+struct Near {
+    name: []u8,
+    sig: []u8,
+    span: u.Span,
+    dist: usize,
+}
+
+// The edit distance of a and b (insertions, deletions, substitutions), or
+// more than `max` (as max + 1) when it is more.
+fn edit_distance(a: []u8, b: []u8, max: usize) usize {
+    if (a.len > 64) or (b.len > 64) {
+        return max + 1;
+    }
+    let mut row: [65]usize = [0; 65];
+    for j in 0..b.len + 1 {
+        row[j] = j;
+    }
+    for i in 0..a.len {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        let mut low = row[0];
+        for j in 0..b.len {
+            let cur = row[j + 1];
+            let mut best = prev;
+            if a[i] != b[j] {
+                best = @min(@min(prev, cur), row[j]) + 1;
+            }
+            row[j + 1] = best;
+            low = @min(low, best);
+            prev = cur;
+        }
+        if low > max {
+            return max + 1;
+        }
+    }
+    return row[b.len];
+}
+
+// How far a name may be from the one written to be offered.
+fn near_limit(name: []u8) usize {
+    if name.len >= 8 {
+        return 3;
+    }
+    return 2;
+}
+
+fn near_add(list: *mut u.List.[Near], want: []u8, name: []u8, sig: []u8, sp: u.Span) void {
+    if u.str_eq(name, want) or (name.len == 0) or (name[0] == '<') {
+        return;
+    }
+    let d = edit_distance(want, name, near_limit(want));
+    if (d > near_limit(want)) or (d >= @max(want.len, name.len)) {
+        return;
+    }
+    for i in 0..list.len {
+        if u.str_eq(list.at(i).name, name) {
+            return;
+        }
+    }
+    list.push(Near.{ name: name, sig: sig, span: sp, dist: d });
+}
+
+fn decl_sig(d: *mut ast.Decl) []u8 {
+    let k = d.kind;
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        if u.notnil(d.ty) and (d.ty.kind == ast.TY_FN) {
+            return u.f2("fn %s%s", d.name, tstr(d.ty)[2..]);
+        }
+        return u.f1("fn %s", d.name);
+    }
+    if (k == ast.D_CONST) or (k == ast.D_GLOBAL) {
+        if u.notnil(d.ty) {
+            return u.f2("%s: %s", d.name, tstr(d.ty));
+        }
+        return d.name;
+    }
+    if k == ast.D_STRUCT {
+        return u.f1("struct %s", d.name);
+    }
+    if k == ast.D_UNION {
+        return u.f1("union %s", d.name);
+    }
+    if k == ast.D_ENUM {
+        return u.f1("enum %s", d.name);
+    }
+    if k == ast.D_IMPORT {
+        return u.f2("import \"%s\" as %s", d.import_path, d.name);
+    }
+    return d.name;
+}
+
+// The declarations of module m that code in file `file` of module `from`
+// may name (types only, when `types`), near `want`.
+fn near_decls(list: *mut u.List.[Near], m: *mut ast.Module, want: []u8, from: *mut ast.Module, file: i32,
+              types: bool) void {
+    if u.isnil(m) {
+        return;
+    }
+    for d in m.decls.items() {
+        let k = d.kind;
+        if d.is_test or (k == ast.D_ERROR) {
+            continue;
+        }
+        if k == ast.D_IMPORT {
+            if (m == from) and (d.span.file == file) and not types {
+                near_add(list, want, d.name, decl_sig(d), d.name_span);
+            }
+            continue;
+        }
+        let is_type = (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM);
+        if (types and not is_type) or ((m != from) and not d.is_pub) {
+            continue;
+        }
+        near_add(list, want, d.name, decl_sig(d), d.name_span);
+    }
+}
+
+// Notes on d for the names of `list`, the closest first (three at most), and
+// the suggestion to write the closest when it is the only one within two
+// edits of what was written at sp.
+fn near_report(d: *mut dg.Diag, list: *mut u.List.[Near], sp: u.Span) void {
+    if u.isnil(d) or (list.len == 0) {
+        list.deinit();
+        return;
+    }
+    let mut order = u.List.[usize].empty();
+    for i in 0..list.len {
+        order.push(i);
+    }
+    // (few: a selection sort, by distance then name)
+    for i in 0..order.len {
+        let mut best = i;
+        for j in i + 1..order.len {
+            let a = list.at(order.get(j));
+            let b = list.at(order.get(best));
+            if (a.dist < b.dist) or ((a.dist == b.dist) and (u.str_cmp(a.name, b.name) < 0)) {
+                best = j;
+            }
+        }
+        let t = order.get(i);
+        order.set(i, order.get(best));
+        order.set(best, t);
+    }
+    let mut close: usize = 0;
+    for i in 0..list.len {
+        if list.at(i).dist <= 2 {
+            close += 1;
+        }
+    }
+    for i in 0..@min(order.len, 3) {
+        let n = list.at(order.get(i));
+        dg.note(d, n.span, u.f2("did you mean '%s'? %s", n.name, n.sig));
+    }
+    let first = list.at(order.get(0));
+    if (close == 1) and (first.dist <= 2) {
+        idiom_fix(d, u.f1("write '%s'", first.name), "suggestion", sp, first.name);
+    }
+    order.deinit();
+    list.deinit();
+}
+
+// An unknown name in an expression.
+fn near_ident(d: *mut dg.Diag, e: *ast.Expr) void {
+    let mut list = u.List.[Near].empty();
+    let mut i = C.scope.len;
+    while i > 0 {
+        i -= 1;
+        let l = C.scope.at(i).local;
+        if u.notnil(l) and u.notnil(l.ty) {
+            near_add(&mut list, e.name, l.name, u.f2("%s: %s", l.name, tstr(l.ty)), l.span);
+        }
+    }
+    near_decls(&mut list, C.tc.mod, e.name, C.tc.mod, e.span.file, false);
+    near_report(d, &mut list, e.span);
+}
+
+// A name a module m does not declare, named in module `from` (`types`: as
+// a type).
+fn near_module(d: *mut dg.Diag, m: *mut ast.Module, from: *mut ast.Module, name: []u8, sp: u.Span, types: bool) void {
+    let mut list = u.List.[Near].empty();
+    near_decls(&mut list, m, name, from, sp.file, types);
+    near_report(d, &mut list, sp);
+}
+
+// A field or method that type t (a struct, union or enum, or a pointer to
+// one) does not have.
+fn near_member(d: *mut dg.Diag, t: *mut ast.Type, name: []u8, sp: u.Span) void {
+    let mut base = t;
+    if (base.kind == ast.TY_PTR) and u.notnil(base.elem) {
+        base = base.elem;
+    }
+    let mut list = u.List.[Near].empty();
+    if (base.kind == ast.TY_SLICE) or (base.kind == ast.TY_ARRAY) {
+        near_add(&mut list, name, "len", "len: usize", sp);
+    }
+    if ((base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM)) and
+       u.notnil(base.decl) {
+        let bd = base.decl;
+        if base.kind == ast.TY_STRUCT {
+            for fi in 0..bd.fields.len {
+                let f = bd.fields.at(fi);
+                if bd.anon or f.is_pub or (bd.module == C.tc.mod) {
+                    near_add(&mut list, name, f.name, u.f2("%s: %s", f.name, tstr(ty.type_field(base, fi))), f.span);
+                }
+            }
+        } else {
+            for v in bd.variants.items() {
+                near_add(&mut list, name, v.name, v.name, v.span);
+            }
+        }
+        for m in bd.methods.items() {
+            if m.is_pub or (m.module == C.tc.mod) {
+                near_add(&mut list, name, m.name, decl_sig(m), m.name_span);
+            }
+        }
+    }
+    near_report(d, &mut list, sp);
 }

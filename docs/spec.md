@@ -2865,6 +2865,12 @@ that the mistake costs one error. The forms whose rewrite needs a choice (the co
 operator, a C-style `for`, `if` or `match` as an expression) have a note instead, and
 poison their declaration.
 
+**Nearest names.** With `E0202` (an unknown name, or one a module does not declare) and
+`E0404` (a field or method a type does not have), a note names each of the closest names
+there are (three at most, the closest first) with its signature. When exactly one is
+within two edits (insertions, deletions or substitutions of a byte) of the name written,
+the diagnostic has a `suggestion` fix that writes it.
+
 ### 16.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.
@@ -2959,7 +2965,7 @@ it does (and that each is asserted by a test):
 | E0400 | A type expected, found an integer, an expression or a constant |
 | E0401 | Nested error union `!!T` |
 | E0403 | A struct or union that contains itself by value |
-| E0404 | An element, parameter or field of type `void` |
+| E0404 | An element, parameter or field of type `void`; a field, method or member a type does not have |
 | E0405 | A value expected, found a type, module or function |
 | E0406 | Calling something that is not a function |
 | E0407 | Indexing a value that is not an array, slice or pointer to array |
