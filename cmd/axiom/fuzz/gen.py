@@ -45,6 +45,8 @@ for t, bits, s in INTS:
     P('    }')
     P('    %s' % pr('@min(a, b)', t)); P('    %s' % pr('@max(a, b)', t))
     P('    %s' % pr('@add_sat(a, b)', t)); P('    %s' % pr('@sub_sat(a, b)', t)); P('    %s' % pr('@mul_sat(a, b)', t))
+    P('    %s' % pr('@sub_checked(a, b) catch 0', t)); P('    %s' % pr('@sub_checked(a, b) catch 1', t))
+    P('    %s' % pr('@mul_checked(a, b) catch 0', t)); P('    %s' % pr('@mul_checked(a, b) catch 1', t))
     P('    let x = @add_checked(a, b) catch { print_u64(777); return; };'); P('    %s' % pr('x', t))
     P('}')
     P('fn u_%s(a: %s) void {' % (t, t))

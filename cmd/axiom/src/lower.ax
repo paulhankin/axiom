@@ -700,32 +700,104 @@ pub fn scalarize(f: *mut ir.Func, legal: fn(*mut ir.Value) bool) void {
 }
 
 // -----------------------------------------------------------------------------
-// Multiplication overflow checks for targets without a wide multiply (wasm):
-// the product divided back by one operand must give the other.
+// Multiplication overflow (IN_UMUL_OV, IN_SMUL_OV) for targets that do not
+// select it at every width. One of 8 to 32 bits: the product twice as wide,
+// which overflows where its low half, extended back, differs from it; that
+// low half is the plain product of the same operands too, which then is not
+// computed again (AArch64, wasm). 64 bits (wasm, all: without a wide
+// multiply): the product divided back by one operand must give the other.
 // -----------------------------------------------------------------------------
-pub fn expand_mul_overflow(f: *mut ir.Func) void {
+pub fn expand_mul_overflow(f: *mut ir.Func, all: bool) void {
     if u.isnil(B) {
         B = ir.new_builder();
     }
-    let mut any = false;
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            let next = i.next;
-            if i.op == ir.OP_INTR {
-                let id = ir.intr_id(i);
-                if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
-                    ir.at_before(B, i);
-                    ir.forward(i, mul_overflow(id == ir.IN_SMUL_OV, i.xs.get(0), i.xs.get(1)));
+            let mut next = i.next;
+            if ir.is_mul_ov(i) {
+                let sg = ir.intr_id(i) == ir.IN_SMUL_OV;
+                let l = i.xs.get(0);
+                let r = i.xs.get(1);
+                if l.ty.bits < 64 {
+                    // (before a plain product of b that comes first: it is
+                    // the wide product's low half)
+                    let m = plain_mul(b, l, r);
+                    let mut at = i;
+                    if u.notnil(m) and before_in_block(m, i) {
+                        at = m;
+                    }
+                    ir.at_before(B, at);
+                    let w = wide_mul_overflow(sg, l, r);
+                    ir.forward(i, w[0]);
                     ir.remove_inst(i);
-                    any = true;
+                    if u.notnil(m) {
+                        if next == m {
+                            next = m.next;
+                        }
+                        ir.forward(m, w[1]);
+                        ir.remove_inst(m);
+                    }
+                } else if all {
+                    ir.at_before(B, i);
+                    ir.forward(i, mul_overflow(sg, l, r));
+                    ir.remove_inst(i);
                 }
             }
             i = next;
         }
         b = b.next;
     }
+}
+
+// The overflow of l * r (narrower than 64 bits) where B is, and the low
+// half of the wide product (l * r itself).
+fn wide_mul_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) [2]*mut ir.Value {
+    let t = l.ty;
+    let w = ir.t_int(t.bits * 2);
+    let mut lw = l;
+    let mut rw = r;
+    if is_signed {
+        lw = ir.sext(B, l, w);
+        rw = ir.sext(B, r, w);
+    } else {
+        lw = ir.zext(B, l, w);
+        rw = ir.zext(B, r, w);
+    }
+    let p = ir.mul(B, lw, rw);
+    let lo = ir.trunc(B, p, t);
+    let mut back = lo;
+    if is_signed {
+        back = ir.sext(B, lo, w);
+    } else {
+        back = ir.zext(B, lo, w);
+    }
+    return [ir.icmp(B, ir.IntNE, back, p), lo];
+}
+
+// A plain product l * r (either order) in block b, or nil.
+fn plain_mul(b: *mut ir.Block, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    let mut j = b.first;
+    while u.notnil(j) {
+        if ir.is_op(j, ir.OP_MUL) and (j.ty == l.ty) and (((j.a == l) and (j.b == r)) or ((j.a == r) and (j.b == l))) {
+            return j;
+        }
+        j = j.next;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// Does x come before y in their block?
+fn before_in_block(x: *mut ir.Value, y: *mut ir.Value) bool {
+    let mut j = x.next;
+    while u.notnil(j) {
+        if j == y {
+            return true;
+        }
+        j = j.next;
+    }
+    return false;
 }
 
 fn mul_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {

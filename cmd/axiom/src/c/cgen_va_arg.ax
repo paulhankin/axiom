@@ -468,12 +468,62 @@ fn va_max_of(t: *cty.CType) u64 {
     return cty.int_max(t);
 }
 
+// Are a, b and the result of ckd_add, ckd_sub or ckd_mul all of the same
+// width (8 to 64 bits) and signedness? Then the operation in that type
+// itself, and its overflow as checked arithmetic tests it (the idioms of
+// cgbase.ax: op_with_overflow), which a backend computes from its flags.
+fn ckd_same_type(rt: *cty.CType, a: *mut ir.Value, at_: *cty.CType, b: *mut ir.Value, bt: *cty.CType) bool {
+    let ts: [3]*cty.CType = [rt, at_, bt];
+    for t in ts {
+        let k = t.unq.kind;
+        if (k == cty.TK_BOOL) or (k == cty.TK_BITINT) or (t.unq.bits != rt.unq.bits) or
+           (t.unq.is_signed != rt.unq.is_signed) {
+            return false;
+        }
+    }
+    return (a.ty == b.ty) and ir.mul_ov_width(a.ty) and (a.ty.bits == rt.unq.bits);
+}
+
+fn ckd_same(id: i32, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let zero = ir.czero(a.ty);
+    let mut r = ir.vnil();
+    let mut ovf = ir.vnil();
+    if id == cs.BI_CKD_ADD {
+        r = ir.add(B, a, b);
+        if rt.unq.is_signed {
+            ovf = ir.icmp(B, ir.IntSLT, ir.and_(B, ir.xor(B, a, r), ir.xor(B, b, r)), zero);
+        } else {
+            ovf = ir.icmp(B, ir.IntULT, r, a);
+        }
+    } else if id == cs.BI_CKD_SUB {
+        r = ir.sub(B, a, b);
+        if rt.unq.is_signed {
+            ovf = ir.icmp(B, ir.IntSLT, ir.and_(B, ir.xor(B, a, b), ir.xor(B, a, r)), zero);
+        } else {
+            ovf = ir.icmp(B, ir.IntULT, a, b);
+        }
+    } else {
+        r = ir.mul(B, a, b);
+        let mut xs: [2]*mut ir.Value = [a, b];
+        let mut iid = ir.IN_UMUL_OV;
+        if rt.unq.is_signed {
+            iid = ir.IN_SMUL_OV;
+        }
+        ovf = ir.intr(B, iid, ir.t_int(1), xs[..]);
+    }
+    va_st(r, rp, cty.align_of(rt));
+    return ir.zext(B, ovf, ir.t_int(8));
+}
+
 // ckd_add, ckd_sub, ckd_mul (C23 7.20): the mathematical result of a op b
 // wrapped into *r (of type rt), and whether it did not fit.
 fn va_ckd(id: i32, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at_: *mut cty.CType, b: *mut ir.Value,
           bt: *mut cty.CType) *mut ir.Value {
     if cty.is_wint(rt) or cty.is_wint(at_) or cty.is_wint(bt) {
         return wint_ckd(id == cs.BI_CKD_ADD, id == cs.BI_CKD_SUB, rp, rt, a, at_, b, bt);
+    }
+    if ckd_same_type(rt, a, at_, b, bt) {
+        return ckd_same(id, rp, rt, a, b);
     }
     let wa = va_widen(a, at_);
     let wb = va_widen(b, bt);
