@@ -161,7 +161,7 @@ that lacks the extensions it was built with.
 | Option | |
 |---|---|
 | `-O0` … `-O3` | Optimization level (default `-O0`). |
-| `--overflow=wrap\|trap\|saturate\|report` | Integer overflow mode (spec §7.6; default `wrap`). `report` wraps, and the first time an operation overflows at a source location the program writes `file:line:col: integer overflow (T0002), wrapped: <code>` to its standard error, or appends it to the file `AXIOM_OVERFLOW_LOG` names. |
+| `--overflow=wrap\|trap\|saturate\|report` | Integer overflow mode (spec §7.6; default `wrap`). `report` wraps, and the first time an operation overflows at a source location the program writes `file:line:col: integer overflow (T0002), wrapped: <code>` to its standard error, or appends it to the file `AXIOM_OVERFLOW_LOG` names. On WebAssembly it uses the host functions `ax_write`, `ax_open` and `ax_getenv` (import module `axiom`), which the node host provides and another embedder must (also for `wasm32-freestanding`). |
 | `--stack-traces=on\|off` | Record call sites for crash traces and profiles (default on; spec §16.4). |
 | `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). Default `none`, but for `axiom test` (see there). |
 | `--coverage=afl\|none` | Native Linux targets: edge coverage counters for a coverage-guided fuzzer, and its fork server (spec §16.9; default `none`). |
