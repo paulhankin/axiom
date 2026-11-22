@@ -376,3 +376,125 @@ fn near_member(d: *mut dg.Diag, t: *mut ast.Type, name: []u8, sp: u.Span) void {
     }
     near_report(d, &mut list, sp);
 }
+
+// -----------------------------------------------------------------------------
+// `for x in it` over an iterator (E0412, spec §15.3)
+// -----------------------------------------------------------------------------
+
+// The iterator method `next` of a struct type t (or of the struct a pointer
+// t points to), visible here: `fn next(self: *mut Self) ?T` or `E!?T`; nil if
+// it has none.
+fn iterator_next(t: *mut ast.Type) *mut ast.Decl {
+    let mut base = t;
+    if (base.kind == ast.TY_PTR) and u.notnil(base.elem) {
+        if not base.is_mut {
+            return dnil();
+        }
+        base = base.elem;
+    }
+    if (base.kind != ast.TY_STRUCT) or u.isnil(base.decl) {
+        return dnil();
+    }
+    let m = find_method(base.decl, u.intern("next"));
+    if u.isnil(m) or not (m.is_pub or (m.module == C.tc.mod)) {
+        return dnil();
+    }
+    resolve_decl(m);
+    let r = m.ret_type;
+    if (m.self_kind != ast.SELF_PASS) or (m.params.len != 1) or (m.gparams.len != 0) or u.isnil(r) {
+        return dnil();
+    }
+    if (r.kind == ast.TY_OPT) or ((r.kind == ast.TY_ERRUNION) and u.notnil(r.elem) and (r.elem.kind == ast.TY_OPT)) {
+        return m;
+    }
+    return dnil();
+}
+
+// A place that reads the same storage each time it is evaluated: a variable,
+// and fields and dereferences of one.
+fn stable_place(e: *ast.Expr) bool {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        return true;
+    }
+    if (k == ast.E_DEREF) or ((k == ast.E_FIELD) and (ast.field_kind_of(e) == ast.FK_STRUCT)) {
+        return stable_place(e.a);
+    }
+    return false;
+}
+
+fn src_text(sp: u.Span) []u8 {
+    return u.file_of(sp.file).text[@as(usize, sp.start)..@as(usize, sp.end)];
+}
+
+fn is_blank(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\r') or (c == '\n');
+}
+
+// `for x in it` where it has an iterator's `next` (§15.3): E0412, with a fix
+// that writes the loop as `while let .some(x) = it.next() { ... }`. It is
+// `machine` when it is a mutable place (or a pointer to the iterator) and
+// `next` cannot fail; otherwise a suggestion, one that first copies the
+// operand into a `let mut` variable when it is not such a place. True if
+// the operand is an iterator.
+fn idiom_for_iter(s: *mut ast.Stmt, t: *mut ast.Type) bool {
+    let m = iterator_next(t);
+    if u.isnil(m) {
+        return false;
+    }
+    let d = dg.err(s.e.span, "E0412", u.f1("'for x in' needs an array or slice, found %s; 'for' does not call 'next'",
+                                           tstr(t)));
+    let fallible = m.ret_type.kind == ast.TY_ERRUNION;
+    let mut call = ".next()";
+    if fallible {
+        call = ".next()!";
+    }
+    dg.note(d, s.e.span, u.f2("an iterator is driven by 'while let': 'while let .some(%s) = it%s { ... }'", s.name,
+                              call));
+    if ast.stmt_more(s).ref_iter {
+        return true;
+    }
+    // the `for` keyword: just before the loop variable
+    let text = u.file_of(s.span.file).text;
+    let mut k = @as(usize, s.name_span.start);
+    while (k > 0) and is_blank(text[k - 1]) {
+        k -= 1;
+    }
+    if (k < 3) or not u.str_eq(text[k - 3..k], "for") {
+        return true;
+    }
+    let for_sp = u.mkspan(s.span.file, @int_cast(u32, k - 3), s.e.span.end);
+    let pointer = t.kind == ast.TY_PTR;
+    let place = is_place(s.e) and stable_place(s.e) and (pointer or is_mut_place(s.e));
+    if place {
+        let mut app = "machine";
+        if fallible {
+            app = "suggestion";
+        }
+        let fx = dg.fix(d, "drive the iterator with 'while let'", app);
+        dg.edit(fx, for_sp, u.f3("while let .some(%s) = %s%s", s.name, src_text(s.e.span), call));
+        return true;
+    }
+    // a variable for the iterator, declared before the loop
+    let mut name = "it";
+    let mut n: u64 = 2;
+    while u.notnil(scope_lookup(u.intern(name))) {
+        name = u.cat2("it", u.udec(n));
+        n += 1;
+    }
+    let st = @as(usize, s.span.start);
+    let mut ls = st;
+    while (ls > 0) and ((text[ls - 1] == ' ') or (text[ls - 1] == '\t')) {
+        ls -= 1;
+    }
+    let fx = dg.fix(d, u.f1("drive the iterator with 'while let', from a variable '%s'", name), "suggestion");
+    let decl = u.f3("let mut %s = %s;\n%s", name, src_text(s.e.span), text[ls..st]);
+    let head = u.f3("while let .some(%s) = %s%s", s.name, name, call);
+    if s.span.start == for_sp.start {
+        dg.edit(fx, for_sp, u.cat2(decl, head));
+    } else {
+        dg.edit(fx, sp_at(s.span), decl);  // (before the label)
+        dg.edit(fx, for_sp, head);
+    }
+    return true;
+}

@@ -1311,6 +1311,13 @@ while let .some(ev) = events.next()! {   // a fallible iterator: E!?T
      or a mutable array place (`E0701` / `E0704` otherwise).
    By-reference `for &` / `for &mut` is not allowed on ranges `lo..hi` (`E0706`).
 
+`for` makes no call: it does not drive an iterator (a value with a `next` method,
+§15.3), which is written `while let .some(x) = it.next() { … }` (§8.4). A `for` over
+one is `E0412`, with a fix that writes that loop: `machine` when the operand is a
+mutable variable or a pointer to the iterator (or a field of one) and `next` cannot
+fail, otherwise a suggestion, which first declares a `let mut` variable for an operand
+that is not such a place.
+
 `break` and `continue` apply to the innermost loop, unless they name a label. A loop
 may be labeled, `rows: for r in 0..n { … }`, and `break rows;` or `continue rows;`
 (also after `catch`) leaves or restarts that loop from any loop nested in it,
