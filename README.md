@@ -61,7 +61,7 @@ axiom profile prog.ax                             # sampling profiler: hot funct
 axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
 axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)
 axiom lsp                                         # the language server, for editors (docs/editors.md)
-axiom build prog.c --c-std=c11 -o prog            # C, with the compiler's own front end (docs/c.md)
+axiom build prog.c --c-std=c11 -o prog            # C, with the compiler's own front end (an experiment: docs/c.md)
 ```
 
 [`docs/cli.md`](docs/cli.md) lists every command, flag and environment variable.
@@ -81,7 +81,7 @@ the test suite.
 | [`docs/install.md`](docs/install.md) | Installing a release, a first program, building from source |
 | [`docs/tour.md`](docs/tour.md) | A tour of the language: values, slices, structs and unions, errors, memory, generics, tests, SIMD |
 | [`docs/cli.md`](docs/cli.md) | The `axiom` command: every command and flag, environment variables, the cache, exit codes |
-| [`docs/c.md`](docs/c.md) | Compiling C: `axiom build file.c`, the standards (C89 to C23), the implementation-defined choices, the headers, what is not supported |
+| [`docs/c.md`](docs/c.md) | Compiling C, an experiment: `axiom build file.c`, the standards (C89 to C23), the implementation-defined choices, the headers, what is not supported |
 | [`docs/c-diagnostics.md`](docs/c-diagnostics.md) | Every diagnostic code of the C front end |
 | [`docs/c-frontend.md`](docs/c-frontend.md) | The design of the C front end |
 | [`docs/editors.md`](docs/editors.md) | Editor support: the VS Code extension, and `axiom lsp` with Neovim, Helix and Emacs |
@@ -93,7 +93,8 @@ the test suite.
 | [`docs/bootstrap-chain.md`](docs/bootstrap-chain.md) | How the compiler is built from a pinned seed, and what built each release |
 | [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | The test suite: run-and-compare programs, expected compile errors, `axiom test`, packages; its `tools/` generates test data and holds the std fuzzer and benchmark |
 | [`cmd/internal/tools/`](cmd/internal/tools) | Generators of the standard library's checked-in tables (Unicode, codecs, fonts) |
-| [`std/`](std/README.md) | The standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
+| [`std/`](std/README.md) | The standard library, the core that every program and the compiler build on, held to the suite's rules (every public item documented, overflow trapping in tests): `mem`, `str`, `fmt`, `io`, `os` (and `os/` `fs`, `path`, `process`, `cli`, `term`, `cpu`, `random`), `collections/` (`vec`, `map`, `set`, …), `hash` (and `hash/` with the digests `md5`, `sha1`, `sha2`, `sha3`), `unicode`, `math`, `time`, `thread`, `sync`, `log`, `net` (sockets), `encoding/json`, `encoding/binary` |
+| [`lib/`](lib/README.md) | The libraries released with it (`import "lib/..."`): `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `crypto/`, `math/` (`bigint`, `matrix`, …), `unicode/` (segmentation, collation); media: `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC), windows and controllers (`os/`); and `c/`, the C front end's headers, C library and runtime |
 | [`std/internal/runtime/`](std/internal/runtime/host.mjs) | The runtime: the host ABI for node (`host.mjs`, also a runner), Linux (`native.ax`, `linux.ax`, no libc), macOS (`darwin.ax`) and Windows (`windows.ax`); test runners; the profiler |
 | [`examples/`](examples) | Example programs and packages (below) |
 | [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (highlighting, and diagnostics and navigation through `axiom lsp`) |

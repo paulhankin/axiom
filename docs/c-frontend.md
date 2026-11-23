@@ -12,13 +12,13 @@ lists the diagnostics.
   added or its own removed (C99 has no implicit `int` or implicit function
   declarations, C23 no K&R definitions).
 - **Hosted, with the C library**: `__STDC_HOSTED__` is 1 and the C library
-  (`std/c/include/`, `std/c/lib/`, `std/c/rt/`: docs/c.md, "The C library") is linked;
+  (`lib/c/include/`, `lib/c/lib/`, `lib/c/rt/`: docs/c.md, "The C library") is linked;
   `--c-freestanding` (`COptions.hosted` false) makes `__STDC_HOSTED__` 0 and finds only
   the freestanding headers (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
   `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`,
   `<stdnoreturn.h>`, C23's `<stdbit.h>` and `<stdckdint.h>`, `<complex.h>` and
   `<string.h>`: `cpp.ax`, `freestanding_header`), and of the library what C23 (4p7) asks
-  of a freestanding implementation in `<string.h>` (`std/c/lib/string/`, kept with
+  of a freestanding implementation in `<string.h>` (`lib/c/lib/string/`, kept with
   `--c-freestanding`). In C23 `<float.h>` has `FLT_SNAN`, `DBL_SNAN` and `LDBL_SNAN`
   (`__builtin_axiom_snan`: constants that stay signaling in the objects they initialize).
 - **Calling convention**: each target's C ABI (x86-64 System V, Windows x64,
@@ -60,10 +60,10 @@ lists the diagnostics.
   `<stdatomic.h>`'s generic functions are builtins. Thread-local objects are the
   IR's thread-local globals natively, and per-thread blocks on WebAssembly with
   threads (cgen_tls.ax). Threads are the C library's `<threads.h>`
-  (`std/c/lib/threads/`, `std/c/rt/threads*.ax`), on the runtime's threads.
+  (`lib/c/lib/threads/`, `lib/c/rt/threads*.ax`), on the runtime's threads.
 - **Complex types** (C99): `float`, `double` and `long double _Complex`, with
-  `<complex.h>` (the library's functions: `std/c/lib/math/complex_impl.h`,
-  `std/c/rt/math_cx.ax`), and the imaginary types
+  `<complex.h>` (the library's functions: `lib/c/lib/math/complex_impl.h`,
+  `lib/c/rt/math_cx.ax`), and the imaginary types
   (Annex G: an imaginary value is its real type's coefficient; csema_expr.ax's
   `imag_domain` gives each operator's domain by G.5, cconst.ax folds, cgen_expr.ax's  `imag_arith` generates). `__STDC_IEC_559_COMPLEX__` is defined where Annex F is
   claimed (below); multiplication and division follow Annex G.5.1 (`ccomplex.ax` folds constants,
@@ -99,9 +99,9 @@ lists the diagnostics.
 - **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
   `dd` `dl` constants; `__STDC_IEC_60559_DFP__`; Annex H's `_Decimal64x`, `d64x`,
   in decimal128's format, `cty.TK_DEC64X`, ranked by `cty.dec_rank`): IEEE 754-2019's decimal formats in
-  the BID encoding, computed in software (`std/c/rt/decimal.ax`, below), with the
+  the BID encoding, computed in software (`lib/c/rt/decimal.ax`, below), with the
   decimal rounding direction of `fe_dec_setround` and the exceptions in `<fenv.h>`'s
-  flags; the library's decimal functions are `std/c/rt/dfp.ax` and `dfp_math.ax`.
+  flags; the library's decimal functions are `lib/c/rt/dfp.ax` and `dfp_math.ax`.
 - **Annex F** for the binary types is claimed on x86-64 and AArch64 with the library
   (`__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`; not on WebAssembly, nor with
   `--c-lib=system` or `--c-freestanding`): the library's `<fenv.h>` reads and sets the
@@ -183,17 +183,17 @@ cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conven
                             wider than double; cgen_dec.ax: the decimal floating types;
                             cgen_wint.ax: integers wider than 64 bits;
                             cgen_atomic.ax: atomic operations; cgen_tls.ax: thread storage)
-std/c/rt/ldouble.ax         that long double's arithmetic, in software (the compiler's too)
-std/c/rt/decimal.ax         the decimal floating arithmetic and conversions, in software (the compiler's too;
+lib/c/rt/ldouble.ax         that long double's arithmetic, in software (the compiler's too)
+lib/c/rt/decimal.ax         the decimal floating arithmetic and conversions, in software (the compiler's too;
                             dec_env.ax: the thread's decimal rounding direction and flags)
-std/c/rt/dfp.ax, dfp_math.ax, dfp_env.ax   the library's decimal functions (<math.h>, <fenv.h>)
-std/c/rt/wideint.ax         the integers wider than 64 bits: what is not inline (the compiler's too)
+lib/c/rt/dfp.ax, dfp_math.ax, dfp_env.ax   the library's decimal functions (<math.h>, <fenv.h>)
+lib/c/rt/wideint.ax         the integers wider than 64 bits: what is not inline (the compiler's too)
 cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
 cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches
-std/c/include/              the compiler's headers
-std/c/lib/                  the library's sources (C), one function to a file (math:
-                            std/c/lib/math/)
-std/c/rt/                   the library's parts in Axiom (math: std/c/rt/math*.ax)
+lib/c/include/              the compiler's headers
+lib/c/lib/                  the library's sources (C), one function to a file (math:
+                            lib/c/lib/math/)
+lib/c/rt/                   the library's parts in Axiom (math: lib/c/rt/math*.ax)
 cmd/axiom/internal/tests/c/ tests ("Tests", below)
 ```
 
@@ -219,7 +219,7 @@ cmd/axiom/internal/tests/c/ tests ("Tests", below)
   runs. C's `main` is `axiom.c.main`, called through `__axiom_c_main`.
 - `long double` wider than `double` (`cty.is_wide`): a value is 16 bytes of memory,
   which cgen handles as it does a structure's (its address), its operations are calls
-  of `std/c/rt/ldouble.ax`'s functions (binary128 and the x87's format, written from IEEE
+  of `lib/c/rt/ldouble.ax`'s functions (binary128 and the x87's format, written from IEEE
   754-2019; codegen.ax generates those a program calls, `cg.ld_fn`, into its module),
   and its constants are values of that format (`Expr.xv`): floating constants read
   exactly (`cldbl.ax`, in arbitrary precision), folded with the same functions. The ABIs
@@ -230,7 +230,7 @@ cmd/axiom/internal/tests/c/ tests ("Tests", below)
 - The decimal floating types (`cty.is_decimal`): a `_Decimal32` or `_Decimal64` value
   is an integer of its width in the IR (its BID encoding: registers, no memory), a
   `_Decimal128` (or `_Decimal64x`) 16 bytes of memory as a wide long double is (`cty.is_dec128`). Their
-  operations are calls of `std/c/rt/decimal.ax`'s `dec_` functions (`cgen_dec.ax`,
+  operations are calls of `lib/c/rt/decimal.ax`'s `dec_` functions (`cgen_dec.ax`,
   through `cg.ld_fn`; `main.ax` loads the module when a unit operates on them:
   `cty.g_used_dec`), which round in the thread's decimal rounding direction and raise
   their exceptions in `dec_env.ax`, which `<fenv.h>` merges into the hardware's flags.
@@ -244,7 +244,7 @@ cmd/axiom/internal/tests/c/ tests ("Tests", below)
   a value is its 64-bit limbs in memory, which cgen handles as it does a structure's (its
   address; scalar replacement makes the two limbs of a 128-bit value two SSA values
   again). `cgen_wint.ax` generates two-limb operations inline (`IN_UMULH` for the
-  product's high half on the native targets) and calls `std/c/rt/wideint.ax`'s
+  product's high half on the native targets) and calls `lib/c/rt/wideint.ax`'s
   functions (`wi_*`, through `cg.ld_fn`, generated only when called; `main.ax` loads the
   module when a unit uses such a type: `cty.g_used_wint`) for wider ones and for
   division; constants are folded by `cwide.ax` with the same functions (an `Expr`'s
@@ -336,7 +336,7 @@ beside it (sema's extra files). In both, every unit and module is one IR module:
   width of the definition's `int`), as it calls the C library's on Windows. A library
   unit's definition gives way to an Axiom module's `export fn` of the same name
   (`cc.boundary_check`), as to a program's unit's (`link_check`).
-- `setjmp` (`std/c/include/setjmp.h`) is `__axc_setjmp`, whose direct calls mark the
+- `setjmp` (`lib/c/include/setjmp.h`) is `__axc_setjmp`, whose direct calls mark the
   calling function `returns_twice` (`cgen_expr.ax`: `ir.Func`): the optimizer leaves it
   alone but for folding and CFG simplification (`passes.ax`: no promotion of its
   objects to registers, no slot sharing, no value numbering), does not inline it or

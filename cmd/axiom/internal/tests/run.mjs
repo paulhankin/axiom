@@ -32,6 +32,13 @@
 // of cmd/axiom/src), for runs after the first of several configurations;
 // AXIOM_UPDATE_DOC=1 rewrites the golden outputs of `axiom doc`.
 //
+// The C front end's tests (C sources under cmd/axiom/internal/tests/c/, and
+// the cases named "C ..."; isCTest) run by default, and are counted as a
+// group of their own: the C front end is an experiment (docs/c.md), and a
+// release of the language does not wait on it. The exit status is 0 when
+// everything passed, 1 when a test of the language failed, and 3 when only
+// tests of the C front end did.
+//
 // The suite is a list of sections (section(...) below): a map from test
 // names to functions that return null, a problem (a string), or
 // { skip: true, reason }. Sections run their tests one at a time, or `jobs`
@@ -318,12 +325,17 @@ async function runNative(exe) {
 console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${axFlags().length ? `, ${axFlags().join(' ')}` : ''}, ${jobs} jobs`);
 let pass = 0, fail = 0, skip = 0;
 const failures = [], skips = [];
+// the C front end's group (see the top of this file)
+const isCTest = (name) => /cmd\/axiom\/internal\/tests\/c\//.test(name) || /^C[ :]/.test(name) || /: C[ :]/.test(name);
+let cPass = 0, cFail = 0, cSkip = 0;
 
 // One result: r is null (passed), a string (the problem), { skip: true,
 // reason }, or { problem, stderr } (stderr is shown, as the program wrote it).
 function record(name, r, ms, note) {
+  const inC = isCTest(name);
   if (r && r.skip) {
     skip++;
+    if (inC) cSkip++;
     skips.push(`${name}${r.reason ? `: ${r.reason}` : ''}`);
     if (verbose) console.log(`skip ${name}${r.reason ? ` (${r.reason})` : ''}`);
     return;
@@ -332,8 +344,8 @@ function record(name, r, ms, note) {
     if (r.stderr) process.stderr.write(r.stderr);
     r = r.problem;
   }
-  if (r) { fail++; failures.push(`FAIL ${name}: ${r}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name}${ms === undefined ? '' : ` (${ms.toFixed(0)} ms)`}${note ? ` (${note})` : ''}`); }
+  if (r) { fail++; if (inC) cFail++; failures.push(`FAIL ${name}: ${r}`); console.log(`FAIL ${name}`); }
+  else { pass++; if (inC) cPass++; console.log(`ok   ${name}${ms === undefined ? '' : ` (${ms.toFixed(0)} ms)`}${note ? ` (${note})` : ''}`); }
 }
 
 // A section of the suite. `cases` maps names (after `prefix: `, when there
@@ -1031,7 +1043,7 @@ const cLibTest = async (f) => {
   const want = dv('expect');
   // (expect-signal: <n>: on Linux and macOS the system's default action
   // kills the process with signal n; elsewhere the library ends it with
-  // status 3 for SIGABRT, 128 + n for the others: std/c/include/signal.h)
+  // status 3 for SIGABRT, 128 + n for the others: lib/c/include/signal.h)
   const sig = dv('expect-signal').length ? Number(dv('expect-signal')[0]) : 0;
   const names = { 2: 'SIGINT', 4: 'SIGILL', 6: 'SIGABRT', 8: 'SIGFPE', 11: 'SIGSEGV', 15: 'SIGTERM' };
   if (sig && native && !/windows/.test(nt)) {
@@ -1043,11 +1055,11 @@ const cLibTest = async (f) => {
   return { problem: want.join('\n') === got.join('\n') ? null : `output mismatch\n--- expected\n${want.join('\n')}\n--- got\n${got.join('\n')}`, stderr: dv('expect-stderr').length ? '' : stderr };
 };
 await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true, buildOnly: true, note: buildNote });
-// The C library's index (std/c/lib/index: which unit defines each name, for
+// The C library's index (lib/c/lib/index: which unit defines each name, for
 // loading the library on demand) is what cmd/internal/tools/gen_c_lib_index.mjs
 // writes from the sources.
 await section('', {
-  'C library: std/c/lib/index is current': async () => {
+  'C library: lib/c/lib/index is current': async () => {
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/internal/tools/gen_c_lib_index.mjs'), '--check'],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
@@ -1293,18 +1305,19 @@ function cDriverCases() {
       if (c.status !== 0 || !fs.readFileSync(obj).includes('lib_f199')) return `lib.c --emit=obj: ${c.stdout}${c.stderr}`;
       return null;
     },
-    'C: the C library directories (std/c/lib, std/c/rt)': async () => {
-      // a standard library whose c/lib and c/rt are this test's (the rest
-      // is the real one's, linked)
-      const std = path.join(dir, 'fakestd');
-      fs.rmSync(std, { recursive: true, force: true });
-      fs.mkdirSync(path.join(std, 'c/lib'), { recursive: true });
-      fs.mkdirSync(path.join(std, 'c/rt'), { recursive: true });
-      for (const n of fs.readdirSync(path.join(root, 'std'))) if (n !== 'c') fs.symlinkSync(path.join(root, 'std', n), path.join(std, n));
-      fs.symlinkSync(path.join(root, 'std/c/include'), path.join(std, 'c/include'));
-      fs.writeFileSync(path.join(std, 'c/lib/a.c'), 'int rt_twice(int);\nint lib_used(int x) { return rt_twice(x) + 1; }\n' +
+    'C: the C library directories (lib/c/lib, lib/c/rt)': async () => {
+      // the standard library, linked, and beside it libraries whose c/lib
+      // and c/rt are this test's (c/include is the real one's, linked)
+      const fake = path.join(dir, 'fakeroot');
+      const std = path.join(fake, 'std'), lc = path.join(fake, 'lib/c');
+      fs.rmSync(fake, { recursive: true, force: true });
+      fs.mkdirSync(path.join(lc, 'lib'), { recursive: true });
+      fs.mkdirSync(path.join(lc, 'rt'), { recursive: true });
+      fs.symlinkSync(path.join(root, 'std'), std);
+      fs.symlinkSync(path.join(root, 'lib/c/include'), path.join(lc, 'include'));
+      fs.writeFileSync(path.join(lc, 'lib/a.c'), 'int rt_twice(int);\nint lib_used(int x) { return rt_twice(x) + 1; }\n' +
         'int lib_replaced(int x) { return -1; }\nint rt_unused_fn(int);\nint lib_unused(int x) { return rt_unused_fn(x); }\n');
-      fs.writeFileSync(path.join(std, 'c/rt/rt.ax'), 'export fn rt_twice(x: i32) i32 {\n    return x * 2;\n}\n\n' +
+      fs.writeFileSync(path.join(lc, 'rt/rt.ax'), 'export fn rt_twice(x: i32) i32 {\n    return x * 2;\n}\n\n' +
         'export fn rt_unused_fn(x: i32) i32 {\n    return x;\n}\n');
       write({ 'use.c': 'int lib_used(int);\nint lib_replaced(int x) { return x + 100; }\n' +
         'int main(void) { return lib_used(20) + lib_replaced(0) - 141; }\n' });
@@ -1313,7 +1326,7 @@ function cDriverCases() {
       if (c.status !== 0) return `use.c with the library: ${c.stdout}${c.stderr}`;
       let r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
       if (r.status !== 0) return `use.c: exit ${r.status} ${r.stderr}`;
-      if (fs.readFileSync(out).includes('rt_unused_fn')) return 'an unused export of std/c/rt is in the program';
+      if (fs.readFileSync(out).includes('rt_unused_fn')) return 'an unused export of lib/c/rt is in the program';
       // without the library, lib_used is the host's (WebAssembly imports it)
       c = await ax(['build', 'use.c', `--std=${std}`, '--c-freestanding', '-o', out]);
       if (c.status !== 0) return `--c-freestanding: ${c.stdout}${c.stderr}`;
@@ -4823,5 +4836,8 @@ if (overflowLog) {
   for (const l of sites) console.log(`  ${l}`);
 }
 if (skip && !verbose) console.log(`\n${skip} skipped (--verbose names them)`);
-console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
-process.exit(fail ? 1 : 0);
+const counts = (p, f, s) => `${p} passed, ${f} failed${s ? `, ${s} skipped` : ''}`;
+console.log(`\nthe language: ${counts(pass - cPass, fail - cFail, skip - cSkip)}`);
+console.log(`the C front end (an experiment, docs/c.md): ${counts(cPass, cFail, cSkip)}`);
+console.log(`\n${counts(pass, fail, skip)}`);
+process.exit(fail > cFail ? 1 : fail ? 3 : 0);

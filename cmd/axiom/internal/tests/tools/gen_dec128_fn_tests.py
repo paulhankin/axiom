@@ -7,7 +7,7 @@ module in each direction:
     cmd/axiom/internal/tests/tools/gen_dec128_fn_tests.py      # needs mpmath
 
 writes cmd/axiom/internal/tests/c/lib/math/dec_fn_d128.c. The arguments are
-fixed and of every kind the functions take (most go through std/c/rt/
+fixed and of every kind the functions take (most go through lib/c/rt/
 dfp_fast.ax's wide form, some fall back to the decimal computation: near a
 rounding boundary, exact results, huge and tiny arguments); each line of the
 expected output is one argument's results in the five directions, printed
@@ -91,7 +91,7 @@ def main():
             calls.append(call)
     out = ['/* dec_fn_d128.c - written by cmd/axiom/internal/tests/tools/gen_dec128_fn_tests.py: _Decimal128\'s',
            '   elementary functions in every decimal rounding direction against correctly rounded values',
-           '   (the wide form of std/c/rt/dfp_fast.ax and the decimal computation it falls back to). */',
+           '   (the wide form of lib/c/rt/dfp_fast.ax and the decimal computation it falls back to). */',
            '/* flags: --c-std=c23 */']
     out += ['/* expect: %s */' % l for l in lines]
     out += ['#include <fenv.h>', '#include <math.h>', '#include <stdio.h>', '',

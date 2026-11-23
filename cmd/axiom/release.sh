@@ -7,6 +7,7 @@
 #                                                          release-0.N, with the commits (from
 #                                                          main) cherry-picked onto it first
 #   cmd/axiom/release.sh notes <version>   gather docs/next/*.md into docs/releases/<version>.md
+#                                          (the C front end's, c-*.md, in a section of their own)
 #   cmd/axiom/release.sh build <version>   build and check build/release/axiom-<version>-*.{tar.gz,zip}
 #                                          and build/release/SHA256SUMS
 #
@@ -235,13 +236,23 @@ if [ "$cmd" = notes ]; then
     out=docs/releases/$v.md
     [ -e "$out" ] && { echo "release: $out exists" >&2; exit 1; }
     mkdir -p docs/releases
+    # (the C front end's notes, docs/next/c-*.md, in a section of their own,
+    # their headings one level down: it is an experiment, docs/c.md)
     {
         echo "# Axiom $v"
         for f in docs/next/*.md; do
-            [ "$(basename "$f")" = README.md ] && continue
+            case $(basename "$f") in README.md | c-*) continue ;; esac
             echo
             cat "$f"
         done
+        if ls docs/next/c-*.md >/dev/null 2>&1; then
+            echo
+            echo "## The C front end (an experiment)"
+            for f in docs/next/c-*.md; do
+                echo
+                sed 's/^## /### /' "$f"
+            done
+        fi
     } > "$out"
     for f in docs/next/*.md; do
         [ "$(basename "$f")" = README.md ] || git rm -q "$f"
@@ -265,14 +276,23 @@ mtime=$(git log -1 --format=%ct)
 
 cmd/axiom/bootstrap.sh
 A=cmd/axiom/build/axiom
+# A run of the suite: when only the C front end's tests failed (status 3),
+# that is said, and the release goes on (the C front end is an experiment,
+# docs/c.md); any other failure stops it.
+suite() {
+    s=0
+    env "$@" || s=$?
+    [ "$s" = 3 ] && { echo "release: only the C front end's tests failed (an experiment): going on" >&2; return 0; }
+    [ "$s" = 0 ] || exit "$s"
+}
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
     # the suite, and with the compiler as the archives have it: native code
     # at -O2
-    AXIOM=$A node cmd/axiom/internal/tests/run.mjs
+    suite AXIOM=$A node cmd/axiom/internal/tests/run.mjs
     # (on a Mac, the native suite links cmd/axiom/internal/tests/native_rt.ax, not C)
     native_target=""
     [ "$(uname -s)" = Darwin ] && native_target=aarch64-macos
-    AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 AXIOM_NATIVE_TARGET=${AXIOM_NATIVE_TARGET:-$native_target} \
+    suite AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 AXIOM_NATIVE_TARGET=${AXIOM_NATIVE_TARGET:-$native_target} \
         node cmd/axiom/internal/tests/run.mjs --native -O2
     # the standard library's parsers against mutated inputs, with a seed of
     # this run's own

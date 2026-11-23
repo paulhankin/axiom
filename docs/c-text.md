@@ -4,10 +4,10 @@ The text part of the C library ([`docs/c.md`](c.md), "The C library") is `<local
 `<wchar.h>` (all but the input/output functions, which are `<stdio.h>`'s part's),
 `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>` and the multibyte functions of
 `<stdlib.h>` (`mblen`, `mbtowc`, `wctomb`, `mbstowcs`, `wcstombs`). Its sources are
-`std/c/lib/text/` (C17, one function to a file), its system layer
-`std/c/rt/text.ax` (Unicode's properties) and `std/c/rt/text_time.ax` (the clocks and the
-time zone), its internal interface `std/c/include/axc/text.h`, and what the other parts
-of the library ask of it `std/c/include/axc/locale.h`.
+`lib/c/lib/text/` (C17, one function to a file), its system layer
+`lib/c/rt/text.ax` (Unicode's properties) and `lib/c/rt/text_time.ax` (the clocks and the
+time zone), its internal interface `lib/c/include/axc/text.h`, and what the other parts
+of the library ask of it `lib/c/include/axc/locale.h`.
 
 Each header declares only what its standard has: `<wchar.h>` and `<wctype.h>` are C95's
 (Amendment 1), `<inttypes.h>` C99's and `<uchar.h>` C11's (an `#error`, `C1040`, in an
@@ -94,7 +94,7 @@ In a single-byte locale only ASCII characters have classes, those of `<ctype.h>`
 code point has these, from Unicode 15.1's properties (the standard library's tables,
 `std/unicode`, made into two-stage tables of the classes and of the case mappings'
 differences, blocks of 128 code points alike kept once, by
-`cmd/internal/tools/gen_c_wctype.py`: `std/c/lib/text/__axc_wctab.c`, about 50 KB, so a
+`cmd/internal/tools/gen_c_wctype.py`: `lib/c/lib/text/__axc_wctab.c`, about 50 KB, so a
 classification or mapping is two table loads):
 
 | Class | Code points |
@@ -176,13 +176,13 @@ a null pointer (`EOVERFLOW`) and `mktime` and `timegm` `(time_t)-1`.
 - Unicode 15.1: the classes of characters assigned later are those of unassigned ones.
 - Unicode collation: `strcoll`, `strxfrm`, `wcscoll` and `wcsxfrm` order by code
   values in every locale (ISO C asks for no other order).
-- Every hosted C program's build analyzes `std/c/rt/text_time.ax` and the modules it
+- Every hosted C program's build analyzes `lib/c/rt/text_time.ax` and the modules it
   imports (`std/time/tz`), whether it uses them or not.
 
 ## Speed
 
 Against the system's C library on x86-64 Linux (both at -O2): the classification and
 case mapping functions over the first three planes 0.7 times its time; `wcslen` of
-4096 wide characters 1.1 times, `wmemchr` 1.2 times (`std/c/rt/text_wide.ax`: 64 or
+4096 wide characters 1.1 times, `wmemchr` 1.2 times (`lib/c/rt/text_wide.ax`: 64 or
 128 bytes an iteration, with AVX-512 or AVX2 where the processor has them);
 `wmemcpy` and `wmemmove` are `memcpy` and `memmove`.

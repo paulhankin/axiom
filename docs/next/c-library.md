@@ -19,7 +19,7 @@
     system's time zone) and `<inttypes.h>`.
 - `exit` runs the `atexit` functions, then the GNU dialects' destructors, then flushes
   the streams; constructors and destructors also run around a `main` that is Axiom's.
-- Only the library's units that a program uses are compiled (`std/c/lib/index`, which
+- Only the library's units that a program uses are compiled (`lib/c/lib/index`, which
   `cmd/internal/tools/gen_c_lib_index.mjs` writes): a hosted program builds about as fast
   as a freestanding one, and `printf("hello\n")` adds about 40 KB (x86-64 Linux).
 - The runtime's `ax_open` opens files for reading and writing created or truncated

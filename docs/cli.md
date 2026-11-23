@@ -188,7 +188,10 @@ that lacks the extensions it was built with.
 
 Options for `axiom build` and `axiom check` with C sources (`.c`, and assembly sources
 `.s` and `.S`), which are compiled by the compiler's own C front end
-([`docs/c.md`](c.md), "C options"). They are errors with Axiom inputs.
+([`docs/c.md`](c.md), "C options"). They are errors with Axiom inputs. The C front end,
+and with it `axiom cc`, is an experiment: tested on every change, but a release of the
+language does not wait on it (`docs/c.md`). Its headers, C library and runtime are
+`lib/c/` beside the standard library.
 
 | Option | |
 |---|---|

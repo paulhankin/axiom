@@ -1,5 +1,5 @@
 /* Long double arithmetic and conversions bit for bit, in the format the
-   target's C ABI gives it (cgen_ld.ax, std/c/rt/ldouble.ax): the x87's
+   target's C ABI gives it (cgen_ld.ax, lib/c/rt/ldouble.ax): the x87's
    80-bit format (x86-64 Linux) or binary128 (AArch64 Linux, WebAssembly),
    against results computed in advance for operands that reach the formats'
    edges (subnormals, the largest exponents, infinities, NaNs, invalid x87

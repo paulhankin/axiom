@@ -1,6 +1,6 @@
 /* dec_fn_d128.c - written by cmd/axiom/internal/tests/tools/gen_dec128_fn_tests.py: _Decimal128's
    elementary functions in every decimal rounding direction against correctly rounded values
-   (the wide form of std/c/rt/dfp_fast.ax and the decimal computation it falls back to). */
+   (the wide form of lib/c/rt/dfp_fast.ax and the decimal computation it falls back to). */
 /* flags: --c-std=c23 */
 /* expect: 3.490342957461841376130546029672265e+00 3.490342957461841376130546029672265e+00 3.490342957461841376130546029672266e+00 3.490342957461841376130546029672265e+00 3.490342957461841376130546029672265e+00 */
 /* expect: 9.990004998333749916680553571676560e-01 9.990004998333749916680553571676559e-01 9.990004998333749916680553571676560e-01 9.990004998333749916680553571676559e-01 9.990004998333749916680553571676560e-01 */

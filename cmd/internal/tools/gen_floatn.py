@@ -10,23 +10,23 @@ conversions. A function of _Float32 is float's; of _Float64 and _Float32x,
 double's; of _Float64x, long double's where long double is wider than double
 (the x87 format or binary128), else _Float128's; the wrappers call those
 (each is the one of its format: the results are the same bits). The
-functions of _Float16 and _Float128 are the library's own (std/c/lib/math/
+functions of _Float16 and _Float128 are the library's own (lib/c/lib/math/
 m_f16.c, m_f128.c, m_f16_c23.c, m_f128_c23.c, m_ldwide.c); this file only
 declares them.
 
 Writes:
-    std/c/include/axc/math_floatn.h      <math.h>'s declarations (H.11)
-    std/c/include/axc/complex_floatn.h   <complex.h>'s (H.11)
-    std/c/lib/math/fn_f32.c, fn_f64.c, fn_f32x.c, fn_f64x.c   the wrappers
-    std/c/lib/math/fn_cx_f32.c ... fn_cx_f64x.c                the complex ones
-    std/c/lib/math/fn_narrow.c   the narrowing operations (H.11.2, 7.12.14)
-    std/c/lib/math/fn_enc.c      the encoding conversion functions (H.11.3)
-    std/c/lib/math/fn_d64x.c     _Decimal64x's functions (H.11.2): _Decimal128's,
+    lib/c/include/axc/math_floatn.h      <math.h>'s declarations (H.11)
+    lib/c/include/axc/complex_floatn.h   <complex.h>'s (H.11)
+    lib/c/lib/math/fn_f32.c, fn_f64.c, fn_f32x.c, fn_f64x.c   the wrappers
+    lib/c/lib/math/fn_cx_f32.c ... fn_cx_f64x.c                the complex ones
+    lib/c/lib/math/fn_narrow.c   the narrowing operations (H.11.2, 7.12.14)
+    lib/c/lib/math/fn_enc.c      the encoding conversion functions (H.11.3)
+    lib/c/lib/math/fn_d64x.c     _Decimal64x's functions (H.11.2): _Decimal128's,
                                  whose format it has (H.2.4p4), and the
                                  narrowing operations to and from it
-    std/c/lib/math/fn_str.c      the numeric conversions (H.12.2, H.12.3)
-    std/c/lib/math/fn_strenc.c   those of the encodings (H.12.4, H.12.5)
-    std/c/include/axc/stdlib_floatn.h, wchar_floatn.h   their declarations
+    lib/c/lib/math/fn_str.c      the numeric conversions (H.12.2, H.12.3)
+    lib/c/lib/math/fn_strenc.c   those of the encodings (H.12.4, H.12.5)
+    lib/c/include/axc/stdlib_floatn.h, wchar_floatn.h   their declarations
     cmd/axiom/internal/tests/c/lib/math/floatn_names.c        the test
 
     python3 cmd/internal/tools/gen_floatn.py
@@ -524,7 +524,7 @@ def narrow_c():
     out = ['/* fn_narrow.c - the narrowing operations of C23 Annex H.11.2 (7.12.14):',
            '   f16addf32 ... f32xsqrtf64x, each the operation\'s exact result rounded once',
            '   to the result\'s format in the current rounding direction, with the',
-           '   IEEE 754 exceptions: std/c/rt/math_narrow.ax\'s __axc_narrow on the',
+           '   IEEE 754 exceptions: lib/c/rt/math_narrow.ax\'s __axc_narrow on the',
            '   operands as binary128 (binary32 and binary64 ones converted exactly) or in',
            '   the x87 format, where the result is binary16, 32 or 64 or the x87 format\'s (to double: the',
            '   standard narrowing operations\' core, m_narrow.c); where the operands',
@@ -850,19 +850,19 @@ def strenc_c():
 
 
 def main():
-    write('std/c/include/axc/math_floatn.h', header())
+    write('lib/c/include/axc/math_floatn.h', header())
     for suf in ('f32', 'f64', 'f32x', 'f64x'):
-        write('std/c/lib/math/fn_%s.c' % suf, wrappers(suf, dict(SUFFIXES)[suf]))
-    write('std/c/lib/math/fn_narrow.c', narrow_c())
-    write('std/c/lib/math/fn_enc.c', enc_c())
-    write('std/c/lib/math/fn_str.c', str_c())
-    write('std/c/lib/math/fn_d64x.c', d64x_c())
-    write('std/c/lib/math/fn_strenc.c', strenc_c())
-    write('std/c/include/axc/stdlib_floatn.h', strenc_header(False))
-    write('std/c/include/axc/wchar_floatn.h', strenc_header(True))
-    write('std/c/include/axc/complex_floatn.h', cheader())
+        write('lib/c/lib/math/fn_%s.c' % suf, wrappers(suf, dict(SUFFIXES)[suf]))
+    write('lib/c/lib/math/fn_narrow.c', narrow_c())
+    write('lib/c/lib/math/fn_enc.c', enc_c())
+    write('lib/c/lib/math/fn_str.c', str_c())
+    write('lib/c/lib/math/fn_d64x.c', d64x_c())
+    write('lib/c/lib/math/fn_strenc.c', strenc_c())
+    write('lib/c/include/axc/stdlib_floatn.h', strenc_header(False))
+    write('lib/c/include/axc/wchar_floatn.h', strenc_header(True))
+    write('lib/c/include/axc/complex_floatn.h', cheader())
     for suf in ('f32', 'f64', 'f32x', 'f64x'):
-        write('std/c/lib/math/fn_cx_%s.c' % suf, cwrappers(suf, dict(SUFFIXES)[suf]))
+        write('lib/c/lib/math/fn_cx_%s.c' % suf, cwrappers(suf, dict(SUFFIXES)[suf]))
     write('cmd/axiom/internal/tests/c/lib/math/floatn_names.c', test())
 
 

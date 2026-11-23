@@ -10,4 +10,4 @@
   AAPCS64, Windows x64, WebAssembly), checked against the system's C compiler on x86-64
   and AArch64 Linux; bit-fields of these types too. Values of up to 128 bits are
   computed inline (add/adc, sub/sbb on x86-64; adds/adc, subs/sbc on AArch64), their
-  division on x86-64 with the 128-by-64-bit `div`; wider ones call `std/c/rt/wideint.ax`.
+  division on x86-64 with the 128-by-64-bit `div`; wider ones call `lib/c/rt/wideint.ax`.

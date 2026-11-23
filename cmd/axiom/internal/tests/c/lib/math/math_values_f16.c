@@ -1,4 +1,4 @@
-/* The _Float16 elementary functions (std/c/lib/math/m_f16.c), correctly
+/* The _Float16 elementary functions (lib/c/lib/math/m_f16.c), correctly
    rounded: their results' bits against an arbitrary-precision reference
    (written by cmd/axiom/internal/tests/tools/gen_f16_math_tests.py; do
    not edit). */

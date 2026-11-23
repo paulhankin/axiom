@@ -1,4 +1,4 @@
-/* The wide long double functions' values (std/c/rt/math_ld.ax), against
+/* The wide long double functions' values (lib/c/rt/math_ld.ax), against
    correctly rounded results (written by
    cmd/axiom/internal/tests/tools/gen_ld_math_tests.py; do not edit). */
 /* flags: --c-std=c23 */

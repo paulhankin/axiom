@@ -1,5 +1,5 @@
 /* <string.h>: each function C23 asks of a freestanding implementation
-   (std/c/lib/string/), with the cases at its edges: empty strings, the
+   (lib/c/lib/string/), with the cases at its edges: empty strings, the
    null byte, bytes above 0x7f, and every length and alignment up to a few
    words (the word-at-a-time paths), and longer, against byte-by-byte
    references. */

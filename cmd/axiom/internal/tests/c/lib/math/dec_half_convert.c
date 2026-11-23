@@ -1,5 +1,5 @@
 /* Conversions between the decimal floating types and _Float16 (binary16),
-   rounded once (std/c/rt/decimal.ax's binary16), in every binary rounding
+   rounded once (lib/c/rt/decimal.ax's binary16), in every binary rounding
    direction to _Float16 and every decimal one from it, with their
    exceptions: for each finite binary16 value h and its successor, values of
    each decimal type at h, at their midpoint and on each side of it, and

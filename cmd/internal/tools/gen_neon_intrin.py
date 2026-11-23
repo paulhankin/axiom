@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates the AArch64 intrinsics headers of the C compiler (std/c/include/:
+"""Generates the AArch64 intrinsics headers of the C compiler (lib/c/include/:
 <arm_neon.h>, <arm_fp16.h>, <arm_bf16.h>, <arm_acle.h>), the AArch64 part of
 its table of machine operations (cmd/axiom/src/c/csimd_tab.ax) and the tests
 of them (cmd/axiom/internal/tests/c/run/intrin_a64_*.c), from the tables
@@ -39,7 +39,7 @@ import struct
 from fractions import Fraction
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
-INC = os.path.join(ROOT, 'std', 'c', 'include')
+INC = os.path.join(ROOT, 'lib', 'c', 'include')
 TAB = os.path.join(ROOT, 'cmd', 'axiom', 'src', 'c', 'csimd_tab.ax')
 TESTS = os.path.join(ROOT, 'cmd', 'axiom', 'internal', 'tests', 'c')
 

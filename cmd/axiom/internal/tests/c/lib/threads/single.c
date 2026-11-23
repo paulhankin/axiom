@@ -1,6 +1,6 @@
 /* <threads.h> in a program that starts no thread (which on WebAssembly
    then has no shared memory, where a wait cannot be one of the processor:
-   std/c/rt/threads.ax sleeps instead): a timed wait times out, a timed
+   lib/c/rt/threads.ax sleeps instead): a timed wait times out, a timed
    lock of a mutex the thread holds (not recursive) times out, a sleep
    sleeps. The return from main runs no tss destructor (exit does not:
    7.26.6.1), but the atexit functions. (No thrd_exit, which would link
