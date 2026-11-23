@@ -10,8 +10,8 @@
 //
 // Layout (one 64 KiB-aligned PT_LOAD per permission; file offsets and
 // addresses agree modulo the page size):
-//   R   ELF and program headers, .interp, .dynsym, .dynstr, .hash, .rela.dyn,
-//       .rodata
+//   R   ELF and program headers, .interp, .dynsym, .dynstr, .hash,
+//       .gnu.version (_d, _r), .rela.dyn, .rodata
 //   RX  _start, .plt, .text
 //   RW  .dynamic, .got, .data (and .data.rel.ro), .tdata, then .bss
 // Thread-local .tdata/.tbss form the PT_TLS template (local-exec model). A
@@ -31,10 +31,14 @@
 // non-PIC reference to data of a shared library gets a copy relocation, and
 // to a function its canonical PLT stub. Indirect functions (STT_GNU_IFUNC)
 // are reached through PLT stubs and IRELATIVE slots; .eh_frame_hdr indexes
-// the objects' FDEs (PT_GNU_EH_FRAME).
+// the objects' FDEs (PT_GNU_EH_FRAME). The references to a versioned
+// library's symbols need their versions (.gnu.version_r: the default one, or
+// the `name@VER` of .symver), and a shared library's version script gives
+// its exports their versions (.gnu.version_d).
 // =============================================================================
 import "ar.ax" as ar;
 import "bin.ax" as bn;
+import "demangle.ax" as dm;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
 import "lstub.ax" as lstub;
@@ -57,9 +61,12 @@ const PAGE: u64 = 0x10000;
 // A shared library: its SONAME and defined dynamic symbols.
 struct Lib {
     soname: []u8,
-    syms: u.SymMap.[u8],         // name -> 1 function/other, 2 data object, 3 thread-local
-    sizes: u.SymMap.[u64],       // name -> its size (data objects, for copy relocations)
-    vers: u.SymMap.[[]u8],       // name -> its default version (if versioned)
+    syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object, 3 thread-local
+    sizes: u.SymMap.[u64],  // name -> its size (data objects, for copy relocations)
+    // name -> its default version (if versioned); `name@VER` -> VER for
+    // each version of a versioned name (the default and the hidden ones),
+    // which syms and sizes have too, for references to a version itself
+    vers: u.SymMap.[[]u8],
     prot: u.SymMap.[u8],         // name -> 1: protected (STV_PROTECTED)
     undefs: u.SymMap.[u8],       // name -> 1: what it refers to and does not define
     undef_names: u.List.[[]u8],  // (the same names, in the order read)
@@ -96,19 +103,51 @@ pub let mut g_soname: []u8 = "";
 pub let mut g_allow_undefined: bool = false;
 
 /// --version-script=<file>: which definitions a shared library exports
-/// (export_symbols): the patterns of its `global:` and `local:` lists (the
-/// version nodes' names, and the symbol versions they would give, are not
-/// kept: the library's symbols have no versions).
+/// (export_symbols), and their versions: the script's version nodes,
+/// `name { global: ...; local: ...; } deps;`, are the library's version
+/// definitions (.gnu.version_d: the base version, its soname, index 1, then
+/// each node in the script's order, with the nodes it names after its `}`
+/// as its parents), and an exported definition the node's version whose
+/// `global:` list matches it (one no node matches: the base version). One
+/// node of no name gives no versions, only its lists.
 pub let mut g_version_script: []u8 = "";
 let mut vs_read: bool = false;
-let mut vs_global: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
-let mut vs_local: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut vs_ok: bool = false;
+
+// A node of the version script: its name ("": the anonymous one) and the
+// nodes it depends on (indices in vs_nodes, which are before it).
+struct VNode {
+    name: []u8,
+    deps: u.List.[i32],
+}
+
+// A pattern of a node's lists: its node, which list, whether it matches C++
+// names (an extern "C++" block's: the demangled names), whether it is a name
+// itself (quoted: its `*`, `?` and `[` are no glob's).
+struct VPat {
+    pat: []u8,
+    node: i32,
+    local: bool,
+    cxx: bool,
+    literal: bool,
+}
+
+let mut vs_nodes: u.List.[VNode] = u.List.[VNode].{ data: @ptr_from_int(*mut VNode, 0), len: 0, cap: 0 };
+let mut vs_pats: u.List.[VPat] = u.List.[VPat].{ data: @ptr_from_int(*mut VPat, 0), len: 0, cap: 0 };
+let mut vs_cxx: bool = false;  // (some pattern is an extern "C++" block's)
+
+fn vs_space(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r');
+}
 
 // The words of a version script: `{`, `}`, `;` and `:` each one, the others
-// runs of other characters (comments, /* */ and #, are none).
+// runs of other characters (comments, /* */ and #, are none). In an extern
+// block (`extern "lang" {`) a pattern runs to its `;` or the block's `}`
+// (C++ names have spaces and colons), a quoted one to its closing quote.
 fn vs_words(text: []u8) u.List.[[]u8] {
     let mut ws = u.List.[[]u8].empty();
     let mut i: usize = 0;
+    let mut ext = false;
     while i < text.len {
         let c = text[i];
         if (c == '/') and ((i + 1) < text.len) and (text[i + 1] == '*') {
@@ -125,19 +164,46 @@ fn vs_words(text: []u8) u.List.[[]u8] {
             }
             continue;
         }
-        if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') {
+        if vs_space(c) {
             i += 1;
             continue;
         }
+        if ext and (c != '}') and (c != ';') {
+            let start = i;
+            while (i < text.len) and (text[i] != ';') and (text[i] != '}') {
+                if text[i] == '"' {
+                    i += 1;
+                    while (i < text.len) and (text[i] != '"') {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            if i > text.len {
+                i = text.len;
+            }
+            let mut end = i;
+            while (end > start) and vs_space(text[end - 1]) {
+                end -= 1;
+            }
+            ws.push(text[start..end]);
+            continue;
+        }
         if (c == '{') or (c == '}') or (c == ';') or (c == ':') {
+            if c == '{' {
+                let n = ws.len;
+                ext = (n >= 2) and u.str_eq(ws.get(n - 2), "extern");
+            } else if c == '}' {
+                ext = false;
+            }
             ws.push(text[i..i + 1]);
             i += 1;
             continue;
         }
         let start = i;
         while (i < text.len) and
-              not ((text[i] == ' ') or (text[i] == '\t') or (text[i] == '\n') or (text[i] == '\r') or
-                   (text[i] == ';') or (text[i] == '{') or (text[i] == '}') or (text[i] == ':') or (text[i] == '#')) {
+              not (vs_space(text[i]) or (text[i] == ';') or (text[i] == '{') or (text[i] == '}') or (text[i] == ':') or
+                   (text[i] == '#')) {
             i += 1;
         }
         ws.push(text[start..i]);
@@ -145,10 +211,24 @@ fn vs_words(text: []u8) u.List.[[]u8] {
     return ws;
 }
 
-// Reads the version script's patterns (vs_global, vs_local); false (with
-// the link's error) if it cannot be read or is not one: nodes `name { ... }
-// [deps] ;` (the name may be left out for one node), whose lists are
-// `global:` and `local:` and patterns each ended by `;`.
+// A pattern of node `node`'s list (`local`), as the script writes it.
+fn vs_pattern(w: []u8, node: i32, local: bool, cxx: bool) void {
+    let mut p = w;
+    let quoted = (p.len >= 2) and (p[0] == '"') and (p[p.len - 1] == '"');
+    if quoted {
+        p = p[1..p.len - 1];
+    }
+    vs_pats.push(VPat.{ pat: u.intern(p), node: node, local: local, cxx: cxx, literal: quoted or not is_glob(p) });
+    if cxx {
+        vs_cxx = true;
+    }
+}
+
+// Reads the version script (vs_nodes, vs_pats); false (with the link's
+// error) if it cannot be read or is not one: nodes `name { ... } [deps] ;`
+// (the name may be left out for one node, the script's only one), whose
+// lists are `global:` and `local:` and patterns each ended by `;`, and
+// extern blocks of patterns, `extern "C++" { ... };` (or "C").
 fn read_version_script() bool {
     vs_read = true;
     let text = u.read_file(g_version_script);
@@ -159,16 +239,34 @@ fn read_version_script() bool {
     let ws = vs_words(text).items();
     let bad = u.f1("the version script %s is malformed: ", g_version_script);
     let mut i: usize = 0;
+    let mut anon = false;
     while i < ws.len {
         // a node: [name] { ... } [deps] ;
+        let mut name: []u8 = "";
         if not u.str_eq(ws[i], "{") {
             if u.str_eq(ws[i], ";") or u.str_eq(ws[i], "}") or u.str_eq(ws[i], ":") or ((i + 1) >= ws.len) or
                not u.str_eq(ws[i + 1], "{") {
                 nl.err(u.cat3(bad, "expected a version node ('name {' or '{'), found ", ws[i]));
                 return false;
             }
+            name = u.intern(ws[i]);
             i += 1;
         }
+        if (name.len == 0) or anon {
+            anon = true;
+            if vs_nodes.len > 0 {
+                nl.err(u.cat2(bad, "a version node of no name must be the script's only one"));
+                return false;
+            }
+        }
+        for n in vs_nodes.items() {
+            if u.same(n.name, name) {
+                nl.err(u.f2("%sthe version %s is defined twice", bad, name));
+                return false;
+            }
+        }
+        let node = @int_cast(i32, vs_nodes.len);
+        vs_nodes.push(VNode.{ name: name, deps: u.List.[i32].empty() });
         i += 1;  // ({)
         let mut local = false;
         let mut closed = false;
@@ -185,8 +283,40 @@ fn read_version_script() bool {
                 continue;
             }
             if u.str_eq(w, "extern") {
-                nl.err(u.cat2(bad, "extern blocks (of another language's names) are not supported"));
-                return false;
+                // extern "lang" { pattern; ... } ;
+                if ((i + 2) >= ws.len) or not u.str_eq(ws[i + 2], "{") {
+                    nl.err(u.cat2(bad, "expected 'extern \"C++\" {' or 'extern \"C\" {'"));
+                    return false;
+                }
+                let lang = ws[i + 1];
+                if not u.str_eq(lang, "\"C++\"") and not u.str_eq(lang, "\"C\"") {
+                    nl.err(u.f2("%sextern blocks of the language %s are not supported", bad, lang));
+                    return false;
+                }
+                i += 3;
+                let mut ended = false;
+                while i < ws.len {
+                    let p = ws[i];
+                    if u.str_eq(p, "}") {
+                        ended = true;
+                        i += 1;
+                        break;
+                    }
+                    if u.str_eq(p, ";") {
+                        i += 1;
+                        continue;
+                    }
+                    vs_pattern(p, node, local, u.str_eq(lang, "\"C++\""));
+                    i += 1;
+                }
+                if not ended {
+                    nl.err(u.cat2(bad, "an extern block has no closing '}'"));
+                    return false;
+                }
+                if (i < ws.len) and u.str_eq(ws[i], ";") {
+                    i += 1;
+                }
+                continue;
             }
             if u.str_eq(w, "{") or u.str_eq(w, ";") or u.str_eq(w, ":") {
                 nl.err(u.cat3(bad, "expected a symbol pattern, found ", w));
@@ -196,23 +326,31 @@ fn read_version_script() bool {
                 nl.err(u.f2("%sthe pattern %s is not followed by ';'", bad, w));
                 return false;
             }
-            if local {
-                vs_local.push(w);
-            } else {
-                vs_global.push(w);
-            }
+            vs_pattern(w, node, local, false);
             i += 2;
         }
         if not closed {
             nl.err(u.cat2(bad, "a version node has no closing '}'"));
             return false;
         }
-        // (the versions it depends on), then ;
+        // (the versions it depends on: nodes before it), then ;
         while (i < ws.len) and not u.str_eq(ws[i], ";") {
             if u.str_eq(ws[i], "{") or u.str_eq(ws[i], "}") or u.str_eq(ws[i], ":") {
                 nl.err(u.cat3(bad, "expected ';' after a version node, found ", ws[i]));
                 return false;
             }
+            let dn = u.intern(ws[i]);
+            let mut found: i32 = -1;
+            for k in 0..vs_nodes.len {
+                if u.same(vs_nodes.get(k).name, dn) and (vs_nodes.get(k).name.len > 0) {
+                    found = @int_cast(i32, k);
+                }
+            }
+            if (found < 0) or (found == node) {
+                nl.err(u.f2("%sthe version %s it depends on is not defined before it", bad, dn));
+                return false;
+            }
+            vs_nodes.at_mut(@int_cast(usize, node)).deps.push(found);
             i += 1;
         }
         if i >= ws.len {
@@ -221,7 +359,29 @@ fn read_version_script() bool {
         }
         i += 1;
     }
+    vs_ok = true;
     return true;
+}
+
+// Reads the version script if there is one and it has not been read: false
+// if there is none, or it is malformed (the link's error).
+fn have_script() bool {
+    if g_version_script.len == 0 {
+        return false;
+    }
+    if not vs_read {
+        _ = read_version_script();
+    }
+    return vs_ok;
+}
+
+// The version definitions a shared library has (with the base version):
+// 0 without a script of named nodes.
+fn n_verdefs() u64 {
+    if not shared or not have_script() or (vs_nodes.len == 0) or (vs_nodes.get(0).name.len == 0) {
+        return 0;
+    }
+    return @as(u64, vs_nodes.len) + 1;
 }
 
 // Is pattern p a glob (with *, ? or [)?
@@ -282,37 +442,94 @@ fn glob_match(p: []u8, name: []u8) bool {
     return false;
 }
 
-// Does the version script let a shared library export `name`? A pattern
-// that is the name itself decides first (global: exported, local: not),
-// then a glob that matches it (global first), else it is exported.
-fn script_exports(name: []u8) bool {
-    if g_version_script.len == 0 {
-        return true;
+// What the version script says of a definition `name`.
+const VS_LOCAL: i32 = -2;  // not exported
+const VS_BASE: i32 = -1;   // exported, of the base version (or unversioned)
+
+// The version script's verdict on exporting `name` (VS_LOCAL, VS_BASE, or
+// the index of the node whose version it has). A pattern that is the name
+// itself decides first, then a glob but `*` that matches it, then `*`;
+// at each step a `global:` list's before a `local:` one's. What no
+// pattern matches is exported. An extern "C++" block's patterns match the
+// demangled name (dm.demangle), so nothing that does not demangle.
+fn script_node(name: []u8) i32 {
+    if not have_script() {
+        return VS_BASE;
     }
-    if not vs_read and not read_version_script() {
-        return true;
+    let mut cname: []u8 = "";
+    if vs_cxx {
+        cname = dm.demangle(name);
     }
-    for p in vs_global.items() {
-        if not is_glob(p) and u.str_eq(p, name) {
-            return true;
+    for step in @as(i32, 0)..3 {
+        for want_local in [false, true] {
+            for p in vs_pats.items() {
+                if p.local != want_local {
+                    continue;
+                }
+                let subject = u.pick(p.cxx, cname, name);
+                if subject.len == 0 {
+                    continue;
+                }
+                let star = not p.literal and u.str_eq(p.pat, "*");
+                let mut hit = false;
+                if step == 0 {
+                    hit = p.literal and u.str_eq(p.pat, subject);
+                } else if step == 1 {
+                    hit = not p.literal and not star and glob_match(p.pat, subject);
+                } else {
+                    hit = star;
+                }
+                if hit {
+                    if p.local {
+                        return VS_LOCAL;
+                    }
+                    if vs_nodes.get(@int_cast(usize, p.node)).name.len == 0 {
+                        return VS_BASE;
+                    }
+                    return p.node;
+                }
+            }
         }
     }
-    for p in vs_local.items() {
-        if not is_glob(p) and u.str_eq(p, name) {
-            return false;
+    return VS_BASE;
+}
+
+// A symbol name with a version (.symver's `name@VER`, `name@@VER`, VER of
+// letters, digits, `_` and `.`): where its `@` is, or -1 (for other names,
+// Axiom's generic instances' `f@[T]` among them).
+fn version_at(n: []u8) i64 {
+    let k = u.find(n, '@');
+    if k <= 0 {
+        return -1;
+    }
+    let mut j = @int_cast(usize, k) + 1;
+    if (j < n.len) and (n[j] == '@') {
+        j += 1;
+    }
+    if j >= n.len {
+        return -1;
+    }
+    for c in n[j..] {
+        if not (u.is_digit(c) or ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_') or
+                (c == '.')) {
+            return -1;
         }
     }
-    for p in vs_global.items() {
-        if is_glob(p) and glob_match(p, name) {
-            return true;
+    return k;
+}
+
+// The version node of name `v`, or -1.
+fn node_of(v: []u8) i32 {
+    if not have_script() {
+        return -1;
+    }
+    let k = u.intern(v);
+    for i in 0..vs_nodes.len {
+        if u.same(vs_nodes.get(i).name, k) and (k.len > 0) {
+            return @int_cast(i32, i);
         }
     }
-    for p in vs_local.items() {
-        if is_glob(p) and glob_match(p, name) {
-            return false;
-        }
-    }
-    return true;
+    return -1;
 }
 
 /// --export-dynamic: an executable's definitions are all exported (in
@@ -485,6 +702,9 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             let strh = shoff + (@truncate(usize, bn.rd32(d, h + 40)) * 64);
             let stroff = @truncate(usize, bn.rd64(d, strh + 24));
             let n = @truncate(usize, bn.rd32(d, h + 44));  // sh_info: number of entries
+            if (n + 2) > vnames.len {
+                vnames = u.newn.[[]u8](n + 2);
+            }
             let mut e = off;
             for k in 0..n {
                 let ndx = @truncate(usize, bn.rd16(d, e + 4));
@@ -543,16 +763,30 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             if versym_off != 0 {
                 vs = bn.rd16(d, versym_off + (j * 2));
             }
-            if (vs & 0x8000) != 0 {
-                continue;  // a hidden (old) version: not what new references bind to
-            }
             let name = u.intern(elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e))));
             let mut kind: u8 = 1;
             if (d[e + 4] & 15) == elf.T_OBJECT {
                 kind = 2;
-                l.sizes.put(name, bn.rd64(d, e + 16));
             } else if (d[e + 4] & 15) == elf.T_TLS {
                 kind = 3;
+            }
+            let vi = @truncate(usize, vs & 0x7fff);
+            if (vi >= 2) and (vi < vnames.len) and not u.isnos(vnames[vi]) {
+                // (`name@VER`: what a reference to that version binds to)
+                let vk = u.intern(u.f2("%s@%s", name, vnames[vi]));
+                if (bind != elf.B_WEAK) or (l.syms.get(vk) == 0) {
+                    l.syms.put(vk, kind);
+                    l.vers.put(vk, vnames[vi]);
+                    if kind == 2 {
+                        l.sizes.put(vk, bn.rd64(d, e + 16));
+                    }
+                }
+            }
+            if (vs & 0x8000) != 0 {
+                continue;  // a hidden (old) version: not what new references bind to
+            }
+            if kind == 2 {
+                l.sizes.put(name, bn.rd64(d, e + 16));
             }
             if (bind == elf.B_WEAK) and (l.syms.get(name) != 0) {
                 continue;  // (a strong definition of the name is there too)
@@ -561,7 +795,6 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             if (d[e + 5] & 3) == 3 {
                 l.prot.put(name, 1);
             }
-            let vi = @truncate(usize, vs & 0x7fff);
             if (vi >= 2) and (vi < vnames.len) and not u.isnos(vnames[vi]) {
                 l.vers.put(name, vnames[vi]);
             }
@@ -597,17 +830,66 @@ fn is_foreign_lib(name: []u8) bool {
 
 // The name of a symbol in its shared library: the runtime reaches some of
 // the system C library's functions as __axiom_libc_<name>, which only the
-// library defines (never the program, whose own <name> it may be).
+// library defines (never the program, whose own <name> it may be); a name
+// with a version (`name@VER`, `name@@VER`: .symver's) is `name` there.
 fn lib_name(n: []u8) []u8 {
+    let at = version_at(n);
+    if at >= 0 {
+        return u.intern(n[0..@int_cast(usize, at)]);
+    }
     if u.starts(n, "__axiom_libc_") {
         return u.intern(n[13..]);
     }
     return n;
 }
 
+// The key of a reference in a library's symbols (Lib.syms): its name there,
+// or `name@VER` for one to version VER (`name@@VER` too).
+fn lib_key(n: []u8) []u8 {
+    let at = version_at(n);
+    if at < 0 {
+        return lib_name(n);
+    }
+    let a = @int_cast(usize, at);
+    let mut v = n[a + 1..];
+    if (v.len > 0) and (v[0] == '@') {
+        v = v[1..];
+    }
+    return u.intern(u.f2("%s@%s", n[0..a], v));
+}
+
+// The plain names that the link defines only with a default version
+// (`name@@VER`, of .symver), whose references bind to that definition
+// (bind_default_versions); the library exports the versioned one.
+let mut by_default_version: u.SymMap.[u8] = u.SymMap.[u8].{ keys: @ptr_from_int(*mut usize, 0),
+                                                            vals: @ptr_from_int(*mut u8, 0), cap: 0, len: 0 };
+
+fn bind_default_versions() void {
+    by_default_version = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.get(gi);
+        let at = version_at(g.name);
+        if (g.obj < 0) or (at < 0) or (g.name[@int_cast(usize, at) + 1] != '@') {
+            continue;
+        }
+        let base = u.intern(g.name[0..@int_cast(usize, at)]);
+        let bi = nl.gmap.get(base);
+        if bi == 0 {
+            continue;
+        }
+        let b = nl.gsyms.at_mut(@as(usize, bi - 1));
+        if b.obj < 0 {
+            b.obj = g.obj;
+            b.sym = g.sym;
+            by_default_version.put(base, 1);
+        }
+    }
+}
+
 fn collect_symbols() void {
     nl.define_globals();
     nl.use_unavailable();
+    bind_default_versions();
     // Undefined symbols come from the shared libraries.
     let mut verified = true;
     for i in 0..libs.len {
@@ -621,7 +903,7 @@ fn collect_symbols() void {
             continue;
         }
         let mut found = false;
-        let ln = lib_name(g.name);
+        let ln = lib_key(g.name);
         for i in 0..libs.len {
             let l = libs.get(i);
             let k = l.syms.get(ln);
@@ -2339,7 +2621,9 @@ fn link_image(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8
 
 // A shared library's exports: the definitions of global symbols of default
 // visibility (not the linker's, not the runtime's internal ones), after the
-// imports in .dynsym.
+// imports in .dynsym, with their versions (GSym.vidx: their version
+// definitions' indices, script_node's; a name of .symver's, `name@VER` or
+// `name@@VER`, is `name` of version VER, hidden or the default).
 fn export_symbols() void {
     for gi in 0..nl.gsyms.len {
         let g = nl.gsyms.at_mut(gi);
@@ -2351,8 +2635,35 @@ fn export_symbols() void {
         // refers to it with: nl.GSym.vis_hidden)
         if s.hidden or g.vis_hidden or (s.bind == elf.B_LOCAL) or elf.is_part_name(s.name) or
            u.starts(s.name, "axiom.") or u.starts(s.name, "__start_") or u.starts(s.name, "__stop_") or
-           not script_exports(s.name) {
+           by_default_version.has(g.name) {
             continue;
+        }
+        let at = version_at(g.name);
+        if at >= 0 {
+            let a = @int_cast(usize, at);
+            let hidden = not u.starts(g.name[a..], "@@");
+            let mut va = a + 2;
+            if hidden {
+                va = a + 1;
+            }
+            let vn = g.name[va..];
+            let node = node_of(vn);
+            if (node < 0) or (n_verdefs() == 0) {
+                nl.err(u.f2("'%s': no version node of the version script defines the version %s", g.name, vn));
+                continue;
+            }
+            g.vidx = @int_cast(u32, node) + 2;
+            if hidden {
+                g.vidx |= 0x8000;
+            }
+        } else {
+            let node = script_node(s.name);
+            if node == VS_LOCAL {
+                continue;
+            }
+            if (node >= 0) and (n_verdefs() > 0) {
+                g.vidx = @int_cast(u32, node) + 2;
+            }
         }
         dyn_syms.push(@int_cast(u32, gi));
         g.dynidx = @int_cast(u32, dyn_syms.len);
@@ -2444,9 +2755,12 @@ struct DynStr {
     vn_lib: u.List.[u32],
     vn_name: u.List.[[]u8],
     vn_off: u.List.[u64],
-    n_vlibs: u64,      // the libraries with versions needed
-    soname_off: u64,   // a shared library's DT_SONAME
-    runpath_off: u64,  // DT_RUNPATH (if g_runpath has directories)
+    n_vlibs: u64,       // the libraries with versions needed
+    vn_base: u64,       // the .gnu.version index of the first version needed (after the definitions')
+    vd_off: []mut u64,  // per version node of the script: its name (version_defs)
+    n_vd: u64,          // the version definitions (the base one among them), or 0
+    soname_off: u64,    // a shared library's DT_SONAME
+    runpath_off: u64,   // DT_RUNPATH (if g_runpath has directories)
 }
 
 // .dynstr: the libraries needed, the symbol versions they must have (which
@@ -2465,7 +2779,13 @@ fn dynamic_strings() DynStr {
             dynstr.u8_(0);
         }
     }
-    // Symbol versions: which versions of each library the symbols need.
+    // Symbol versions: which versions of each library the symbols need (of
+    // .gnu.version's indices after the library's own definitions').
+    let n_vd = n_verdefs();
+    let mut vn_base: u64 = 2;
+    if n_vd > 0 {
+        vn_base = n_vd + 1;
+    }
     let mut vn_lib = u.List.[u32].empty();
     let mut vn_name = u.List.[[]u8].empty();
     let mut vn_off = u.List.[u64].empty();
@@ -2477,7 +2797,7 @@ fn dynamic_strings() DynStr {
         let mut found: u32 = 0;
         for k in 0..vn_lib.len {
             if (vn_lib.get(k) == @bit_cast(u32, g.lib)) and u.same(vn_name.get(k), g.ver) {
-                found = @int_cast(u32, k) + 2;
+                found = @int_cast(u32, k) + @truncate(u32, vn_base);
             }
         }
         if found == 0 {
@@ -2486,7 +2806,7 @@ fn dynamic_strings() DynStr {
             vn_off.push(@as(u64, dynstr.len()));
             dynstr.put(g.ver);
             dynstr.u8_(0);
-            found = @int_cast(u32, vn_lib.len) + 1;
+            found = @int_cast(u32, vn_lib.len - 1) + @truncate(u32, vn_base);
         }
         g.vidx = found;
     }
@@ -2502,6 +2822,14 @@ fn dynamic_strings() DynStr {
         dynstr.put(lib_name(nl.gsyms.at(@as(usize, dyn_syms.get(i))).name));
         dynstr.u8_(0);
     }
+    let vd_off = u.newn.[u64](vs_nodes.len + 1);
+    if n_vd > 0 {
+        for k in 0..vs_nodes.len {
+            vd_off[k] = @as(u64, dynstr.len());
+            dynstr.put(vs_nodes.get(k).name);
+            dynstr.u8_(0);
+        }
+    }
     let soname_off = @as(u64, dynstr.len());
     if shared {
         dynstr.put(g_soname);
@@ -2513,7 +2841,8 @@ fn dynamic_strings() DynStr {
         dynstr.u8_(0);
     }
     return DynStr.{ b: dynstr, needed: needed, lib_off: lib_off, sym_off: sym_off, vn_lib: vn_lib, vn_name: vn_name,
-                    vn_off: vn_off, n_vlibs: n_vlibs, soname_off: soname_off, runpath_off: runpath_off };
+                    vn_off: vn_off, n_vlibs: n_vlibs, vn_base: vn_base, vd_off: vd_off, n_vd: n_vd,
+                    soname_off: soname_off, runpath_off: runpath_off };
 }
 
 // How many of the versions needed are library i's.
@@ -2544,7 +2873,12 @@ struct Layout {
     dynstr_size: u64,
     hash_off: u64,
     versym_off: u64,
+    verdef_off: u64,
+    verdef_size: u64,
     verneed_off: u64,
+    verneed_size: u64,
+    n_vd: u64,     // the version definitions (DynStr.n_vd)
+    n_vlibs: u64,  // the libraries of the versions needed
     rela_off: u64,
     start: u64,     // _start
     dyn_addr: u64,  // .dynamic
@@ -2595,7 +2929,9 @@ fn lay_out(ds: *DynStr) Layout {
     let dynstr_off = dynsym_off + (nsyms * 24);
     let hash_off = nl.align_up(dynstr_off + @as(u64, ds.b.len()), 8);
     let versym_off = nl.align_up(hash_off + (4 * (2 + 1 + nsyms)), 2);
-    let verneed_off = nl.align_up(versym_off + (2 * nsyms), 8);
+    let verdef_off = nl.align_up(versym_off + (2 * nsyms), 8);
+    let verdef_size = verdef_bytes(ds);
+    let verneed_off = nl.align_up(verdef_off + verdef_size, 8);
     let verneed_size = (ds.n_vlibs * 16) + (@as(u64, ds.vn_lib.len) * 16);
     let rela_off = nl.align_up(verneed_off + verneed_size, 8);
     let rela_size = (n_rela + n_got_dyn) * 24;
@@ -2626,6 +2962,9 @@ fn lay_out(ds: *DynStr) Layout {
     let mut n_dyn = @as(u64, ds.needed.len) + 19;  // (DT_JMPREL, DT_PLTRELSZ, DT_PLTREL among them)
     if shared {
         n_dyn += 5;  // DT_SONAME, DT_INIT_ARRAY(SZ), DT_FINI_ARRAY(SZ)
+    }
+    if ds.n_vd > 0 {
+        n_dyn += 2;  // DT_VERDEF, DT_VERDEFNUM
     }
     if g_runpath.len > 0 {
         n_dyn += 1;  // DT_RUNPATH
@@ -2668,9 +3007,10 @@ fn lay_out(ds: *DynStr) Layout {
     segs[2].memsz = bss_end - segs[2].vaddr;
     return Layout.{ interp: interp, has_tls: has_tls, phnum: phnum, nsyms: nsyms, interp_off: interp_off,
                     dynsym_off: dynsym_off, dynstr_off: dynstr_off, dynstr_size: @as(u64, ds.b.len()),
-                    hash_off: hash_off, versym_off: versym_off, verneed_off: verneed_off, rela_off: rela_off,
-                    start: start, dyn_addr: dyn_addr, dyn_off: file_of(dyn_addr), n_dyn: n_dyn, tdata_end: tdata_end,
-                    main_tls: main_tls, main_tp: main_tp, ehh_addr: ehh_addr, ehh_max: ehh_max };
+                    hash_off: hash_off, versym_off: versym_off, verdef_off: verdef_off, verdef_size: verdef_size,
+                    verneed_off: verneed_off, verneed_size: verneed_size, n_vd: ds.n_vd, n_vlibs: ds.n_vlibs,
+                    rela_off: rela_off, start: start, dyn_addr: dyn_addr, dyn_off: file_of(dyn_addr), n_dyn: n_dyn,
+                    tdata_end: tdata_end, main_tls: main_tls, main_tp: main_tp, ehh_addr: ehh_addr, ehh_max: ehh_max };
 }
 
 // The sections, _start, the PLT, the GOT and what the runtime needs, all
@@ -2803,8 +3143,8 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
     return rels;
 }
 
-// .interp, .dynsym, .dynstr, .hash, .gnu.version, .gnu.version_r,
-// .rela.dyn and .dynamic.
+// .interp, .dynsym, .dynstr, .hash, .gnu.version, .gnu.version_d,
+// .gnu.version_r, .rela.dyn and .dynamic.
 fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[DynRel]) void {
     bn.put_at(b, ly.interp_off, ly.interp);
     for i in 0..dyn_syms.len {
@@ -2871,6 +3211,7 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
     for i in 0..dyn_syms.len {
         bn.w16(b, ly.versym_off + ((@as(u64, i) + 1) * 2), @as(u64, nl.gsyms.at(@as(usize, dyn_syms.get(i))).vidx));
     }
+    write_verdef(b, ly.verdef_off, ds);
     write_verneed(b, ly.verneed_off, ds);
     for i in 0..rels.len {
         let r = rels.get(i);
@@ -2901,9 +3242,17 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
         dy.u64_(20);  // DT_PLTREL: DT_RELA
         dy.u64_(7);
     }
-    if ds.n_vlibs > 0 {
+    if (ds.n_vlibs > 0) or (ds.n_vd > 0) {
         dy.u64_(0x6fff_fff0);  // DT_VERSYM
         dy.u64_(image_base + ly.versym_off);
+    }
+    if ds.n_vd > 0 {
+        dy.u64_(0x6fff_fffc);  // DT_VERDEF
+        dy.u64_(image_base + ly.verdef_off);
+        dy.u64_(0x6fff_fffd);  // DT_VERDEFNUM
+        dy.u64_(ds.n_vd);
+    }
+    if ds.n_vlibs > 0 {
         dy.u64_(0x6fff_fffe);  // DT_VERNEED
         dy.u64_(image_base + ly.verneed_off);
         dy.u64_(0x6fff_ffff);  // DT_VERNEEDNUM
@@ -2939,6 +3288,68 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
     bn.put_at(b, ly.dyn_off, dy.view());
 }
 
+fn pick_u64(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The size of .gnu.version_d: per version definition an entry (20 bytes)
+// and its names (8 bytes each: its own, then its parents').
+fn verdef_bytes(ds: *DynStr) u64 {
+    if ds.n_vd == 0 {
+        return 0;
+    }
+    let mut n: u64 = 28;  // (the base version)
+    for v in vs_nodes.items() {
+        n += 28 + (8 * @as(u64, v.deps.len));
+    }
+    return n;
+}
+
+// .gnu.version_d at `at`: the base version (VER_FLG_BASE, index 1: the
+// library's soname), then each version node's, its parents after its name.
+fn write_verdef(b: []mut u8, at: u64, ds: *DynStr) void {
+    if ds.n_vd == 0 {
+        return;
+    }
+    let mut e = at;
+    for k in 0..vs_nodes.len + 1 {
+        let mut cnt: u64 = 1;
+        let mut name = g_soname;
+        let mut name_off = ds.soname_off;
+        if k > 0 {
+            let v = vs_nodes.at(k - 1);
+            cnt += @as(u64, v.deps.len);
+            name = v.name;
+            name_off = ds.vd_off[k - 1];
+        }
+        bn.w16(b, e, 1);  // vd_version
+        bn.w16(b, e + 2, pick_u64(k == 0, 1, 0));  // vd_flags: VER_FLG_BASE
+        bn.w16(b, e + 4, @as(u64, k) + 1);         // vd_ndx
+        bn.w16(b, e + 6, cnt);
+        bn.w32(b, e + 8, elf_hash(name));
+        bn.w32(b, e + 12, 20);  // vd_aux
+        let mut next: u64 = 0;
+        if k < vs_nodes.len {
+            next = 20 + (8 * cnt);
+        }
+        bn.w32(b, e + 16, next);
+        let mut a = e + 20;
+        for j in 0..@truncate(usize, cnt) {
+            let mut off = name_off;
+            if j > 0 {
+                off = ds.vd_off[@int_cast(usize, vs_nodes.at(k - 1).deps.get(j - 1))];
+            }
+            bn.w32(b, a, off);
+            bn.w32(b, a + 4, pick_u64((j + 1) < @truncate(usize, cnt), 8, 0));
+            a += 8;
+        }
+        e = a;
+    }
+}
+
 // .gnu.version_r at `at`: per library, the versions of it needed.
 fn write_verneed(b: []mut u8, at: u64, ds: *DynStr) void {
     let mut vo = at;
@@ -2967,7 +3378,7 @@ fn write_verneed(b: []mut u8, at: u64, ds: *DynStr) void {
             done += 1;
             bn.w32(b, ao, elf_hash(ds.vn_name.get(k)));
             bn.w16(b, ao + 4, 0);
-            bn.w16(b, ao + 6, @as(u64, k) + 2);
+            bn.w16(b, ao + 6, @as(u64, k) + ds.vn_base);
             bn.w32(b, ao + 8, ds.vn_off.get(k));
             let mut an: u64 = 0;
             if done < cnt {
@@ -3135,7 +3546,7 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
     tail.put(st.strs.view());
     // (the call frame information and its index, for the tools that find
     // them by their section headers: debuggers, profilers)
-    let mut ehs: [2][10]u64 = [[0; 10], [0; 10]];
+    let mut ehs: [5][10]u64 = [[0; 10], [0; 10], [0; 10], [0; 10], [0; 10]];
     let mut neh: usize = 0;
     if ly.ehh_addr != 0 {
         ehs[neh] = [@as(u64, shs.len()), 1, 2, ly.ehh_addr, file_of(ly.ehh_addr), 12 + (ly.ehh_max * 8), 0, 0, 4, 0];
@@ -3150,6 +3561,25 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
         ehs[neh] = [@as(u64, shs.len()), ty, 2, nl.eh_lo, file_of(nl.eh_lo), (nl.eh_hi - nl.eh_lo) + 4, 0, 0, 8, 0];
         neh += 1;
         shs.put(".eh_frame\x00");
+    }
+    // (the symbol versions: .gnu.version, .gnu.version_d, .gnu.version_r)
+    if (ly.n_vd > 0) or (ly.n_vlibs > 0) {
+        ehs[neh] = [@as(u64, shs.len()), 0x6fff_ffff, 2, image_base + ly.versym_off, ly.versym_off, ly.nsyms * 2, 9, 0,
+                    2, 2];
+        neh += 1;
+        shs.put(".gnu.version\x00");
+    }
+    if ly.n_vd > 0 {
+        ehs[neh] = [@as(u64, shs.len()), 0x6fff_fffd, 2, image_base + ly.verdef_off, ly.verdef_off, ly.verdef_size, 10,
+                    ly.n_vd, 8, 0];
+        neh += 1;
+        shs.put(".gnu.version_d\x00");
+    }
+    if ly.n_vlibs > 0 {
+        ehs[neh] = [@as(u64, shs.len()), 0x6fff_fffe, 2, image_base + ly.verneed_off, ly.verneed_off, ly.verneed_size,
+                    10, ly.n_vlibs, 8, 0];
+        neh += 1;
+        shs.put(".gnu.version_r\x00");
     }
     let shs_off = @as(u64, tail.len());
     tail.put(shs.view());

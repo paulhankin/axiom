@@ -26,11 +26,11 @@ exports() {
 if command -v readelf > /dev/null; then
     printf '{ global:g; local: *; };\n' > v.map; exports "g"
     printf '{global:g;h;local:*;};\n' > v.map; exports "g h"
-    printf 'V1 { global: f*; local: fp; *; };\n' > v.map; exports "fq"
+    printf 'V1 { global: f*; local: fp; *; };\n' > v.map; exports "fq@@V1"
     run $CC $OPT ex.c -Wl,--export-dynamic-symbol,exported_one -o ex
     readelf --dyn-syms ex | grep -q exported_one || fail "--export-dynamic-symbol: not exported"
 fi
-for bad in '{ global: g' '{ global: g; ' 'V1 { g; } ' '{ extern "C++" { x; }; };' 'g;'; do
+for bad in '{ global: g' '{ global: g; ' 'V1 { g; } ' '{ extern "Java" { x; }; };' 'g;'; do
     printf '%s\n' "$bad" > v.map
     fails $CC -shared vs.c -Wl,--version-script=v.map -o v.so
     has fails.out "version script"

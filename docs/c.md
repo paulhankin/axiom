@@ -628,9 +628,13 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   AArch64 ones, `/usr/aarch64-linux-gnu/lib` among them). A linker script there (as the
   system's `libc.so` is one) is read for its `INPUT` and `GROUP`, `AS_NEEDED` included;
   another command is an error. The program is linked dynamically against the libraries
-  it uses (`DT_NEEDED`), with the symbol versions they define, eagerly bound; the dynamic
-  linker's own symbols (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too. The
-  program's definitions that such a library refers to or defines too are exported
+  it uses (`DT_NEEDED`), eagerly bound, and needs the symbol versions they define
+  (`.gnu.version_r`, `DT_VERNEED`): a reference to a versioned library's symbol (the
+  system C library's `libc.so.6` and `libm.so.6` are versioned) has the version the
+  library defines as its default (`name@@VER`), or the one a `.symver` of the reference
+  names (`name@VER`, an older one), so that the dynamic linker binds it to that version
+  and refuses a library that does not define it; the dynamic linker's own symbols
+  (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too. The program's definitions that such a library refers to or defines too are exported
   (`.dynsym`), so that the library's references bind to them (the program's definition
   preempts a library's): not for the system C library's own (`libc.so.6`, `libm.so.6`,
   the dynamic linker, ...), whose references, to `malloc` and its kin among them, stay its
@@ -900,6 +904,27 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
   `nlink.ax`). Every address it holds is relocated where
   it is loaded (`R_*_RELATIVE`), `DT_SONAME` its file name, `DT_INIT_ARRAY` and
   `DT_FINI_ARRAY` its constructors and destructors, and `DT_NEEDED` the libraries it uses.
+  A version script (`--version-script=`, `-Wl,--version-script=`) chooses its exports and
+  their versions: of its nodes, `NAME { global: patterns; local: patterns; } PARENTS;`, the
+  patterns (names, globs of `*`, `?` and `[...]`, quoted names, which are no globs) choose:
+  a name itself first, then a glob other than `*`, then `*`, of each a `global:` list's
+  before a `local:` one's; what a `local:` pattern chooses is not exported, what none
+  chooses is. Named nodes are the library's version definitions (`.gnu.version_d`,
+  `DT_VERDEF`), as the system's linker makes them: the base version (index 1, the library's
+  soname), then each node in the script's order with its parents (the nodes before it that
+  it names after its `}`); each export has the version of the node whose `global:` list
+  chose it (`.gnu.version`), or the base version. A node of no name is the script's only
+  one, and gives no versions. Patterns in an `extern "C++" { ... };` block match the
+  demangled names of C++ symbols (`"ns::f(int)"`, `ns::*`, `"vtable for A"`; the
+  linker's demangler reads functions and objects of namespaces and classes, templates of
+  type and integer arguments, constructors, destructors, operators, the builtin, pointer,
+  reference and cv-qualified types, ABI tags and the virtual table, type information and
+  guard variable names: a name with a function, array or member pointer type, an
+  expression, a local name or a lambda demangles to nothing, so no such pattern matches
+  it); `extern "C"`'s are as the node's own. A definition named `name@VER` (hidden: for
+  programs linked against an older library) or `name@@VER` (the default), as `.symver`
+  makes them, is exported as `name` of version `VER`, which a node must define; the
+  library's own references to `name` bind to the default one.
   Code that is not position-independent (an absolute address in code or read-only data,
   narrower than 64 bits, the local-exec model, a library's object reached without the GOT)
   is an error that names its object. Programs of this compiler link with it (`-L. -lprog`),
@@ -2674,7 +2699,12 @@ no other tool is needed:
   Mach-O's private extern for the hidden ones, Mach-O having no protected visibility,
   its image's references to its own definitions binding within it; nothing in COFF,
   where only a DLL's exports leave the image), `.type`, `.size`,
-  `.comm`, `.lcomm`, `.incbin` (within the include directories), COFF's `.rva` and
+  `.comm`, `.lcomm`, `.incbin` (within the include directories), ELF's `.symver name,
+  name2@VER` (in file-scope asm: `name2@VER`, hidden, `name2@@VER`, the default, or
+  `name2@@@VER`, the default if `name` is defined here, is another global name of
+  `name`'s definition, in the unit or the asm, for a version script's versions ("Shared
+  libraries"); if `name` is not defined, the unit's references to it are to `name2@VER`, that
+  version of a library's symbol), COFF's `.rva` and
   (x64) `.secrel32`. Labels: `name:` and numeric local labels (`1:`, `1b`, `1f`).
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
   (`@GOTPCREL`), on macOS `sym@TLVP(%rip)` in a `movq` (a thread-local's descriptor,

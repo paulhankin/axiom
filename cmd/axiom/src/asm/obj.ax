@@ -126,6 +126,87 @@ pub threadlocal let mut add_error: []u8 = "";
 pub threadlocal let mut funcs: u.List.[FileFunc] = u.List.[FileFunc].{ data: @ptr_from_int(*mut FileFunc, 0), len: 0,
                                                                        cap: 0 };
 
+// The versioned names of .symver at definitions (finish_symvers): the
+// name's symbol << 32 | the definition's.
+threadlocal let mut symver_fix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+/// The versioned names of .symver (add_file) get their definitions'
+/// places, once the code generator has placed the functions' code.
+pub fn finish_symvers(obj: *mut elf.Obj) void {
+    for x in symver_fix.items() {
+        let t = obj.syms.get(@truncate(usize, x & 0xffff_ffff));
+        let s = obj.syms.at_mut(@truncate(usize, x >> 32));
+        s.sec = t.sec;
+        s.value = t.value;
+        s.size = t.size;
+        s.ty = t.ty;
+    }
+    symver_fix.clear();
+}
+
+// The versioned names of .symver (ELF's): `name@VER` (or `name@@VER`) a
+// global symbol (weak if name's definition is) at name's definition, in
+// this text or in the object; or, if name is not defined, the name of the
+// undefined symbol that the object's references to name refer to (`@@@`
+// is `@@` for a definition, `@` for a reference).
+fn symvers(obj: *mut elf.Obj, A: *mut cr.Asm, syms: []i64, aliases: [][]u8) void {
+    let mut k: usize = 0;
+    while (k + 1) < A.symvers.len {
+        let n = A.symvers.get(k);
+        let mut v = A.symvers.get(k + 1);
+        k += 2;
+        if tg.is_windows() or tg.is_darwin() or tg.is_wasm() {
+            add_error = ".symver (symbol versions are ELF's)";
+            return;
+        }
+        let mut def: i64 = -1;
+        let d = A.names.get(n);
+        if (d != 0) and (syms[@int_cast(usize, d - 1)] >= 0) {
+            def = syms[@int_cast(usize, d - 1)];
+        } else {
+            let p = obj.symmap.get(n);
+            if (p != 0) and (obj.syms.get(@as(usize, p - 1)).sec >= 0) {
+                def = @as(i64, p - 1);
+            } else {
+                def = alias_sym(obj, aliases, n);
+            }
+        }
+        let at = @int_cast(usize, u.find(v, '@'));
+        let triple = u.starts(v[at..], "@@@");
+        if def >= 0 {
+            if triple {
+                v = u.cat2(v[0..at], v[at + 1..]);
+            }
+            let s = obj.syms.get(@truncate(usize, @bit_cast(u64, def)));
+            let prev = obj.symmap.get(u.intern(v));
+            if (prev != 0) and (obj.syms.get(@as(usize, prev - 1)).sec >= 0) {
+                add_error = u.f1("the versioned name '%s' (.symver) is defined twice", v);
+                return;
+            }
+            let mut bind = elf.B_GLOBAL;
+            if s.bind == elf.B_WEAK {
+                bind = elf.B_WEAK;
+            }
+            let a = elf.add_sym(obj, elf.Sym.{ name: u.perm_dup(v), sec: s.sec, value: s.value, size: s.size,
+                                               bind: bind, ty: s.ty, hidden: false, protected: false });
+            symver_fix.push((@as(u64, a) << 32) | @bit_cast(u64, def));
+            continue;
+        }
+        if triple {
+            v = u.cat2(v[0..at], v[at + 2..]);
+        }
+        // (undefined: the references' symbol is renamed; later ones find it by name too)
+        let p = obj.symmap.get(n);
+        if p != 0 {
+            obj.syms.at_mut(@as(usize, p - 1)).name = u.perm_dup(v);
+            obj.symmap.put(u.intern(v), p);
+        } else {
+            let e = elf.ext_sym(obj, u.perm_dup(v), false);
+            obj.symmap.put(n, e + 1);
+        }
+    }
+}
+
 /// Adds assembled file-scope asm A to obj, whose code section is `text`;
 /// `aliases`: its blob's (the names of internal linkage in it); `file_id`:
 /// the assembly source's file, whose lines its code's line information
@@ -258,6 +339,7 @@ pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm, aliases: [][]u8, f
             note_local(d.name, s);
         }
     }
+    symvers(obj, A, syms, aliases);
     // relocations
     for r in A.relocs.items() {
         let si = @int_cast(usize, r.sec);
