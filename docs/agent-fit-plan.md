@@ -425,8 +425,11 @@ at both uses once enabled. The standard library's own tests pass under the sanit
 
 ### Status
 
-Done, but for turning `W0711` on, which waits on the owner's decision with the numbers
-below. The Problem above describes the tree as it was.
+Done. `W0711` is on by default (`--no-warn=W0711` turns it off), with the numbers
+below; its three reports in the tree were removed: the free that `std/mem/tests.ax`
+repeats on purpose is in another function, and the two false positives were reordered
+(`fixed` is freed before `order` in `outline.ax`; the node pointer in `tree_builder.ax`
+is taken after `copy_attrs`). The Problem above describes the tree as it was.
 
 - C1: the README, spec §1 (and the definitions before it), §12.1 and the tour say that
   every operation is checked or defined except two rules a program keeps itself: a raw
@@ -455,7 +458,7 @@ below. The Problem above describes the tree as it was.
   found no use after free, overflow or leak in them. The compiler's own tests
   (`axiom test cmd/axiom/src/version.ax`) reported its arenas as leaks; `util.ax`'s
   allocation functions now mark their memory as kept on purpose.
-- C3: `W0711` (`cmd/axiom/src/lifetime.ax`, `--warn=W0711`, spec §16.3) reports the
+- C3: `W0711` (`cmd/axiom/src/lifetime.ax`, spec §16.3) reports the
   two shapes, after checking, in statement order with branches merged. Over std/ (each
   of its 271 modules as the root), the 18 examples and the compiler, 19,662
   functions: 563 views taken from a container, 380 frees of a local, 124 changes of a
@@ -469,16 +472,15 @@ below. The Problem above describes the tree as it was.
   union of a slice (most often a new allocation), and a `*mut Self` method that returns
   a view is an accessor. `mem.realloc` is not a free. First there were 44 warnings.
 - Tests: `testing/lifetime.ax` is the program above (fails with `T0012` at line 25;
-  `W0711` at both uses with the flag, none without); `errors/lifetime_warn.ax` has each
+  `W0711` at both uses by default, none with `--no-warn=W0711`); `errors/lifetime_warn.ax` has each
   shape and the cases not to report; `testing/leaks.ax` tests the sanitizer as the
   default; a case checks `--sanitize=none` and the wasm64 fallback, and
   `c/mix/test_with_c` the fallback for C units.
 
 Not done:
 
-- `W0711` is not on by default. Two false positives in about 650k lines is a low rate,
-  but the warning is narrow: a use through another variable, a field or another
-  function is not seen, so it catches the plainest cases only.
+- `W0711` is narrow: a use through another variable, a field or another function is
+  not seen, so it catches the plainest cases only.
 - wasm64: a program built with `--sanitize=address` fails in the WebAssembly host
   (`Cannot convert undefined to a BigInt`), and `axiom test --target=wasm64` fails in
   its test runner with or without the sanitizer.

@@ -1943,7 +1943,7 @@ checks that the object still exists. So a program must keep two rules itself:
 
 The address sanitizer (`--sanitize=address`, §16.8), on by default in `axiom test`,
 catches most breaks of the second rule, and of the first within the heap. The warning
-`W0711` (§16.3, off by default) reports the plainest breaks of the second within one
+`W0711` (§16.3) reports the plainest breaks of the second within one
 function: a slice used after `mem.free`, or after a `*mut Self` method of the container
 it came from. Code in C (§14.5.5) can break either. What
 happens when a rule is broken depends on the target:
@@ -3161,7 +3161,7 @@ it does (and that each is asserted by a test):
 | W0601 | Unreachable statement |
 | W0631 | Unreachable `match` arm after `else` |
 | W0655 | An inline error set contains errors the function can never return (§11.3) |
-| W0711 | A local slice or pointer used after the memory it points into was freed or may have moved (§12.1): after it was passed to `mem.free` or `mem.destroy`, or, when it came from a container through a `*Self` method (or from a function given `&container`) that returns a slice or pointer, after a `*mut Self` method that returns none was called on the same container (or it was given as `&mut`). A heuristic, within one function: it has false positives (a `*mut Self` method that does not move the memory) and misses uses through other variables. Off by default: `--warn=W0711` turns it on, for the modules whose tests would run (§17.2) |
+| W0711 | A local slice or pointer used after the memory it points into was freed or may have moved (§12.1): after it was passed to `mem.free` or `mem.destroy`, or, when it came from a container through a `*Self` method (or from a function given `&container`) that returns a slice or pointer, after a `*mut Self` method that returns none was called on the same container (or it was given as `&mut`). A heuristic, within one function: it has false positives (a `*mut Self` method that does not move the memory) and misses uses through other variables. On by default, for the modules whose tests would run (§17.2); `--no-warn=W0711` turns it off |
 
 ### 16.4 Runtime trap reporting and stack traces
 
