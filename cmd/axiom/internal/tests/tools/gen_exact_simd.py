@@ -638,6 +638,176 @@ def gen_lanes():
     p.write()
 
 
+def lanes_bits(vals, lt):
+    """The bits of a vector (lanes from low to high) as one integer."""
+    w = WIDTH[lt]
+    x = 0
+    for i, v in enumerate(vals):
+        x |= (f_bits(v, lt) if lt in FLANES else v & ((1 << w) - 1)) << (i * w)
+    return x
+
+
+def bits_lanes(x, lt, n):
+    w = WIDTH[lt]
+    out = []
+    for i in range(n):
+        b = (x >> (i * w)) & ((1 << w) - 1)
+        out.append(f_from_bits(b, lt) if lt in FLANES else wrap(b, lt))
+    return out
+
+
+def gen_mem():
+    p = Prog('exact_simd_mem.ax', [
+        'Vectors in memory and the raw vector types: on vectors of 128, 256 and 512',
+        'bits, of integer and float lanes, stores and loads through pointers made',
+        'by @ptr_cast from lanes of a global array (at offsets of a lane, so',
+        'unaligned and overlapping), @load and @store on slices at such offsets,',
+        'arrays of vectors (for &mut, @ptr_add, an element through a pointer),',
+        'slices of vectors (from @cast_slice and @slice_from_ptr, passed to a',
+        'function), *mut and * vector parameters and a vector field of a struct',
+        'changed through a pointer; v128, v256 and v512 (@bit_cast from and to',
+        'lane types, & | ^ ~, as parameters, results and through pointers); and',
+        'the @dot of 8-bit lanes (i8 by i8, u8 by i8: each i32 lane the sum of four',
+        'products). Each line hashes the results of one operation over the rows.',
+    ] + GEN)
+    for bits in (128, 256, 512):
+        for lt in ['u8', 'i16', 'i32', 'u64', 'f32', 'f64']:
+            vt = vname(lt, bits)
+            n = nlanes(vt)
+            fl = lt in FLANES
+            st = ('u32' if lt == 'f32' else 'u64') if fl else lt
+            sv = f'{st}x{n}'
+            arr = rows_of(p, vt, 3)
+            nb = 3 * n + 3
+            buf = f'M_{vt.upper()}'
+            init = [wrap(0x0123_4567_89ab_cdef * (i + 1) + i, st) if not fl else
+                    f_bits(float(i) - 7.5, lt) for i in range(nb)]
+            p.arrays[buf] = (st, init, None, ('buf', vt))
+            state = {'buf': list(init)}
+
+            def ld(text):  # a load of a vt from a slice of buf's storage
+                return f'@bit_cast({vt}, @load({sv}, {text}))' if fl else f'@load({vt}, {text})'
+
+            def stv(text, v):
+                return f'@store({text}, @bit_cast({sv}, {v}));' if fl else f'@store({text}, {v});'
+
+            def put(k, vals, state=state, lt=lt, fl=fl):
+                for i, v in enumerate(vals):
+                    state['buf'][k + i] = f_bits(v, lt) if fl else v
+
+            def get(k, state=state, lt=lt, fl=fl, n=n):
+                return [f_from_bits(x, lt) if fl else x for x in state['buf'][k:k + n]]
+            if fl:
+                op, opf = '+', (lambda x, y, lt=lt: f_add(x, y, lt))
+            else:
+                op, opf = '+%', (lambda x, y, lt=lt: wrap(x + y, lt))
+            k1, k2, k3, k4 = 1, n - 1 if n > 2 else 2, 2, n + 1
+            stmts = []
+
+            def s_ptr(a, b, k1=k1, k2=k2, put=put, get=get):
+                put(k1, a)
+                return get(k2)
+            stmts.append(Stmt('ptr store load', f'@ptr_cast(*{vt}, &{buf}[{k2}]).*', s_ptr, vt,
+                              pre=[f'let pm = @ptr_cast(*mut {vt}, &mut {buf}[{k1}]);', 'pm.* = a;']))
+
+            def s_slice(a, b, k3=k3, k4=k4, put=put, get=get):
+                put(k3, b)
+                return get(k4)
+            stmts.append(Stmt('slice store load', ld(f'{buf}[{k4}..]'), s_slice, vt,
+                              pre=[stv(f'{buf}[{k3}..]', 'b')]))
+
+            def s_arr(a, b, opf=opf):
+                av = [a, [opf(x, y) for x, y in zip(b, a)], [opf(x, y) for x, y in zip(a, a)]]
+                return av[2]
+            stmts.append(Stmt('array of vectors', 'q.*', s_arr, vt,
+                              pre=[f'let mut av: [3]{vt} = [a, b, a];', 'for &mut x in av[1..] {',
+                                   f'    x.* = x.* {op} a;', '}', 'let q = @ptr_add(&av[0], 2);']))
+
+            def s_mod(a, b, opf=opf):
+                v1 = [opf(x, y) for x, y in zip(b, a)]
+                return [opf(x, y) for x, y in zip(v1, a)]
+            stmts.append(Stmt('mut param', 'av[1]', s_mod, vt, pre=[f'vmod_{vt}(&mut av[1], &av[0]);']))
+
+            def s_sum(a, b, opf=opf):
+                v1 = [opf(opf(x, y), y) for x, y in zip(b, a)]
+                av = [a, v1, [opf(x, y) for x, y in zip(a, a)]]
+                r = av[0]
+                for x in av[1:]:
+                    r = [opf(u, v) for u, v in zip(r, x)]
+                return r
+            stmts.append(Stmt('slice param', f'vsum_{vt}(av[..])', s_sum, vt))
+
+            def s_cast(a, b, get=get, n=n):
+                return [opf(x, y) for x, y in zip(get(n), get(2 * n))]
+            stmts.append(Stmt('cast_slice', f'vsum_{vt}(@cast_slice({vt}, {buf}[{n}..{3 * n}]))', s_cast, vt))
+
+            def s_sfp(a, b, get=get, n=n):
+                return [opf(x, y) for x, y in zip(get(3), get(3 + n))]
+            stmts.append(Stmt('slice_from_ptr', f'vsum_{vt}(@slice_from_ptr(@ptr_cast(*{vt}, &{buf}[3]), 2))',
+                              s_sfp, vt))
+
+            def s_field(a, b, opf=opf):
+                return [opf(x, y) for x, y in zip(a, b)]
+            stmts.append(Stmt('struct field', 'wv.v', s_field, vt,
+                              pre=[f'let mut wv = WV_{vt}.{{ tag: 7, v: a, w: 9 }};', f'vbump_{vt}(&mut wv, b);']))
+            stmts.append(Stmt('struct others', '@as(u64, wv.tag) + @as(u64, wv.w)', lambda a, b: 8 + 10, 'u64'))
+            stmts.append(Stmt('buffer', ld(f'{buf}[{2 * n}..]'), lambda a, b, get=get, n=n: get(2 * n), vt))
+            p.fn(f'mem_{vt}', [('a', arr), ('b', arr)], stmts)
+            p.fns.append('\n'.join([
+                f'fn vmod_{vt}(p: *mut {vt}, q: *{vt}) void {{', f'    p.* = p.* {op} q.*;', '}', '',
+                f'fn vsum_{vt}(s: []{vt}) {vt} {{', '    let mut r = s[0];', '    for x in s[1..] {',
+                f'        r = r {op} x;', '    }', '    return r;', '}', '',
+                f'struct WV_{vt} {{', '    tag: u8,', f'    v: {vt},', '    w: u16,', '}', '',
+                f'fn vbump_{vt}(p: *mut WV_{vt}, x: {vt}) void {{', f'    p.v = p.v {op} x;', '    p.tag += 1;',
+                '    p.w += 1;', '}']))
+    # the raw types
+    for bits in (128, 256, 512):
+        raw = f'v{bits}'
+        k = bits // 64
+        ut = f'u64x{k}'
+        rows = {}
+        for lt in ('u64', 'i8', 'f32'):
+            rows[lt] = rows_of(p, vname(lt, bits), 3)
+        stmts = []
+        m = (1 << bits) - 1
+        for la, lb in (('u64', 'u64'), ('i8', 'u64'), ('f32', 'i8')):
+            ta, tb = vname(la, bits), vname(lb, bits)
+
+            def cv(text, lt=None):
+                return f'@bit_cast({raw}, {text})'
+            ba = lambda a, la=la: lanes_bits(a, la)  # noqa: E731
+            bb = lambda b, lb=lb: lanes_bits(b, lb)  # noqa: E731
+            stmts.append(Stmt(f'and {la} {lb}', f'@bit_cast({ut}, {cv("a")} & {cv("b")})',
+                              lambda a, b, ba=ba, bb=bb: bits_lanes(ba(a) & bb(b), 'u64', k), ut))
+            stmts.append(Stmt(f'or not {la} {lb}', f'@bit_cast({ut}, {cv("a")} | ~{cv("b")})',
+                              lambda a, b, ba=ba, bb=bb: bits_lanes(ba(a) | (~bb(b) & m), 'u64', k), ut))
+            stmts.append(Stmt(f'xor {la} {lb}', f'@bit_cast({vname("i16", bits)}, {cv("a")} ^ {cv("b")})',
+                              lambda a, b, ba=ba, bb=bb: bits_lanes(ba(a) ^ bb(b), 'i16', bits // 16),
+                              vname('i16', bits)))
+
+            def s_fn(a, b, ba=ba, bb=bb):
+                x, y = ba(a), bb(b)
+                loc = y ^ x
+                return bits_lanes(((x | y) & (~loc & m)) ^ loc, 'u64', k)
+            stmts.append(Stmt(f'fn {la} {lb}', f'@bit_cast({ut}, rf_{raw}({cv("a")}, {cv("b")}, &mut loc) ^ loc)', s_fn,
+                              ut, pre=[f'let mut loc: {raw} = {cv("b")};']))
+            p.fn(f'raw_{raw}_{la}_{lb}', [('a', rows[la]), ('b', rows[lb])], stmts)
+            stmts = []
+        p.fns.append('\n'.join([f'fn rf_{raw}(x: {raw}, y: {raw}, p: *mut {raw}) {raw} {{', '    p.* = p.* ^ x;',
+                                 '    return (x | y) & ~p.*;', '}']))
+    # @dot of 8-bit lanes
+    for bits in (128, 256, 512):
+        bt = vname('i8', bits)
+        n = nlanes(bt)
+        dt = vname('i32', bits)
+        ri = rows_of(p, bt, 4)
+        ru = rows_of(p, vname('u8', bits), 4)
+        dot = lambda a, b, n=n: [sum(a[4 * i + j] * b[4 * i + j] for j in range(4)) for i in range(n // 4)]  # noqa
+        p.fn(f'dot_{bt}', [('a', ri), ('b', ri)], [Stmt('dot i8', '@dot(a, b)', dot, dt)])
+        p.fn(f'dot_u8_{bt}', [('a', ru), ('b', ri)], [Stmt('dot u8 i8', '@dot(a, b)', dot, dt)])
+    p.write()
+
+
 def zero_of(lt):
     return 0.0 if lt in FLANES else 0
 
@@ -1124,6 +1294,8 @@ def main():
         gen_lanes()
     for fname, seed, ntrees, nsets in EPROGRAMS:
         write_trees(fname, seed, ntrees, nsets, expand=expand)
+    if not expand:
+        gen_mem()
 
 
 if __name__ == '__main__':
