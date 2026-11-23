@@ -33,7 +33,8 @@
 # is <version>, and docs/releases/<version>.md. It bootstraps (from the seed
 # cmd/axiom/seed.toml pins, or AXIOM_SEED), runs the test suite, the fuzzer and the
 # examples (cmd/axiom/examples.sh), builds the compiler
-# for every release target, and packs each with the standard library (its
+# for every release target, and packs each with the standard library and the
+# libraries (std/ and lib/: their
 # sources, without test data), the licenses and the release notes. The
 # archives are deterministic: the same commit gives the same bytes. Environment:
 #   SKIP_TESTS   1: do not run the test suite (for trying the script out)
@@ -293,13 +294,13 @@ for t in "linux-x86_64 x86_64 axiom" "linux-aarch64 aarch64 axiom" "macos-aarch6
     mkdir -p "$d/bin"
     echo "build $name"
     $A build cmd/axiom/src/main.ax --target="$2" -O2 --pdb=off -o "$d/bin/$3"
-    git ls-files std | grep -v '/testdata/' | while read -r f; do
+    git ls-files std lib | grep -v '/testdata/' | while read -r f; do
         mkdir -p "$d/$(dirname "$f")"
         cp "$f" "$d/$f"
     done
     cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "$d/"
     cp "docs/releases/$v.md" "$d/RELEASE-NOTES.md"
-    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n\nAxiom is experimental software, provided "as is", without warranty of any kind.\nUse it at your own risk; see LICENSE-MIT and LICENSE-APACHE for the full terms.\n' \
+    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ and lib/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n\nAxiom is experimental software, provided "as is", without warranty of any kind.\nUse it at your own risk; see LICENSE-MIT and LICENSE-APACHE for the full terms.\n' \
         "$v" "$1" "$commit" > "$d/README.txt"
     python3 - "$R" "$R/stage" "$name" "$mtime" <<'EOF'
 import gzip, io, os, sys, tarfile, zipfile, time

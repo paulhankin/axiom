@@ -15,7 +15,7 @@ axiom test    <file.ax | package dir> [options] [--filter=<text>] [--timeout=<ms
 axiom profile <file.ax | package dir> [options] [--rate=<hz>] [--folded=<path>] [-- <program args>]
 axiom fmt     <file.ax | dir>... [--check] [--stdout]
 axiom new     <name> [--format=agent-json]
-axiom doc     <std | module[.item] | pkg:<name>[/<module>][.item] | file.ax[.item] | dir> [--search=<text>]
+axiom doc     <std | lib | module[.item] | pkg:<name>[/<module>][.item] | file.ax[.item] | dir> [--search=<text>]
 axiom lsp     [--target=<t>] [--std=<dir>]
 axiom cache   [path | size | clean]
 axiom version
@@ -93,7 +93,7 @@ not check, so it answers in milliseconds, and also for a module that does not co
 
 | Command | |
 |---|---|
-| `axiom doc std` | The standard library's modules, one a line: the name and the first sentence of its summary. Modules under an `internal/` directory, which a program cannot import, and part files are not listed. |
+| `axiom doc std` | The standard library's modules, one a line: the name and the first sentence of its summary. Modules under an `internal/` directory, which a program cannot import, and part files are not listed. `axiom doc lib` lists the libraries' (`lib/`, spec §4.1), and `lib/<module>[.<item>]` works as `std/` does below. |
 | `axiom doc std/str` | A module: its summary, then its public items, one a line: the signature and the first sentence of the documentation as a comment. A type's public methods follow it, indented. |
 | `axiom doc std/str.split` | An item: its signature, its whole documentation, the errors it can return (a named error set expanded into its names, with the sets it includes), and where it is declared. |
 | `axiom doc std/collections/vec.Vec` | A type: its public fields and variants with their comments, its documentation, its public methods. `std/collections/vec.Vec.push` is one method. |
@@ -253,13 +253,13 @@ system's C library either) is a static executable. A WebAssembly program whose
 
 | Option | |
 |---|---|
-| `--std=<dir>` | The standard library's directory. Otherwise `$AXIOM_STD`, else `std/` next to the compiler's `bin/` directory, else `../share/axiom/std`, else the `std/` of the current directory. |
+| `--std=<dir>` | The standard library's directory. Otherwise `$AXIOM_STD`, else `std/` next to the compiler's `bin/` directory, else `../share/axiom/std`, else the `std/` of the current directory. The libraries (`import "lib/..."`, spec §4.1) are the directory named `lib` beside it, so `--std=/opt/axiom/std` reads them from `/opt/axiom/lib`. |
 
 ## Environment variables
 
 | Variable | |
 |---|---|
-| `AXIOM_STD` | The standard library's directory, when `--std` is not given. |
+| `AXIOM_STD` | The standard library's directory, when `--std` is not given (and so the libraries', `lib/` beside it). |
 | `AXIOM_CACHE` | The cache directory: compiled modules in `<cache>/obj/`, git dependencies in `<cache>/`. Otherwise `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`. |
 | `AXIOM_UPDATE_URL` | The repository `axiom update` updates from, instead of `https://github.com/paulhankin/axiom`: a mirror whose `releases/download/v<version>/` holds the release archives and `SHA256SUMS`, and which git can fetch from. |
 | `AXIOM_JOBS` | How many modules (`--units=module`), or parts of an optimized program, are compiled at once: the number of processors by default. The output does not depend on it. |

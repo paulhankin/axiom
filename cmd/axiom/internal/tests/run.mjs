@@ -2634,6 +2634,65 @@ await section('', {
   },
 }, { timed: false });
 
+// The libraries (spec §4.1): `import "lib/..."` resolves from the directory
+// named lib beside the standard library's, which the internal rule covers as
+// it does std (and which may import std/internal), whose modules show as
+// lib/..., whose tests a program's run does not, and which `axiom doc` and
+// `axiom fmt` know.
+await section('spec §4.1', {
+  'lib/ beside std/: imports, internal modules, tests, doc and fmt': () => {
+    const dir = path.join(tmp, 'libtier');
+    fs.rmSync(dir, { recursive: true, force: true });
+    const write = (files) => {
+      for (const [n, t] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, n)), { recursive: true });
+        fs.writeFileSync(path.join(dir, n), t);
+      }
+    };
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(path.join(root, 'std'), path.join(dir, 'std'));
+    write({
+      'lib/greet.ax': '// lib/greet.ax - greetings.\n\nimport "internal/word.ax" as w;\nimport "std/internal/math/core" as k;\n\n' +
+        '/// The greeting\'s length, and an errno value.\npub fn size() i32 {\n    return @int_cast(i32, w.WORD.len) + k.EDOM;\n}\n\n' +
+        'test "a library\'s test, which a program\'s does not run" {\n    @expect(false);\n}\n',
+      'lib/internal/word.ax': 'pub let WORD: []u8 = "hello";\n',
+      'app/main.ax': 'import "lib/greet" as greet;\n\nexport fn main() i32 {\n    return greet.size() - 38;\n}\n\ntest "own" {\n    @expect(greet.size() == 38);\n}\n',
+      'app/internal.ax': 'import "lib/internal/word" as w;\n\nexport fn main() i32 {\n    return @int_cast(i32, w.WORD.len);\n}\n',
+      'app/runtime.ax': 'import "std/internal/math/core" as k;\n\nexport fn main() i32 {\n    return k.EDOM;\n}\n',
+      'app/missing.ax': 'import "lib/nothing" as n;\n\nexport fn main() i32 {\n    return n.X;\n}\n',
+      'app/escape.ax': 'import "lib/../std/io" as io;\n\nexport fn main() i32 {\n    return 0;\n}\n',
+      'app/tidy.ax': 'export fn main() i32 {\n    return greet.size() - 38;\n}\n',
+    });
+    const std = path.join(dir, 'std');
+    const app = path.join(dir, 'app');
+    const ax = (args) => spawnSync(compiler, [...args, `--std=${std}`], { encoding: 'utf8', cwd: app });
+    const out = path.join(dir, 'main' + (native ? '' : '.wasm'));
+    let c = ax(['build', 'main.ax', '-o', out, ...targetFlags]);
+    if (c.status !== 0) return `main.ax: ${c.stdout}${c.stderr}`;
+    const r = hostRun(out);
+    if (r.status !== 0) return `main.ax ran: exit ${r.status} ${r.stderr}`;
+    c = ax(['test', 'main.ax', '--format=agent-json', '--sanitize=none']);
+    let j = null;
+    try { j = JSON.parse(c.stdout); } catch { return `test main.ax: ${c.stdout}${c.stderr}`; }
+    if (j.status !== 'pass' || j.tests.map((t) => t.name).join() !== 'own') return `test main.ax ran: ${c.stdout}`;
+    const err = (f, code, text) => {
+      const e = ax(['check', f]);
+      return e.status === 1 && e.stderr.includes(`error[${code}]`) && e.stderr.includes(text) ? null : `${f}: status ${e.status}:\n${e.stderr}`;
+    };
+    const p = err('internal.ax', 'E0219', "'lib/internal/word.ax' is internal: only modules under 'lib' may import it") ||
+      err('runtime.ax', 'E0219', "only modules under 'std' or 'lib' may import it") ||
+      err('missing.ax', 'E0211', 'lib/nothing') || err('escape.ax', 'E0218', 'must name a module in the libraries');
+    if (p) return p;
+    c = ax(['doc', 'lib']);
+    if (c.status !== 0 || c.stdout !== 'lib/greet  greetings.\n') return `doc lib: ${c.status} ${c.stdout}${c.stderr}`;
+    c = ax(['doc', 'lib/greet.size']);
+    if (c.status !== 0 || !c.stdout.startsWith('lib/greet.size\npub fn size() i32\n')) return `doc lib/greet.size: ${c.stdout}${c.stderr}`;
+    c = spawnSync(compiler, ['fmt', 'tidy.ax', '--stdout'], { encoding: 'utf8', cwd: app, env: { ...process.env, AXIOM_STD: std } });
+    if (c.status !== 0 || !c.stdout.startsWith('import "lib/greet" as greet;\n\n')) return `fmt tidy.ax: ${c.stdout}${c.stderr}`;
+    return null;
+  },
+}, { timed: false });
+
 // Nesting limit (spec §3): expressions, types and blocks nest at most 1000
 // levels deep, counting a chain of operators or of postfix operations as one
 // level for each link. A program 900 levels deep builds and runs; one 1100
