@@ -134,7 +134,11 @@ def lossless(s, d):
 
 
 def mix(h, x):
-    return ((h ^ (x & M64)) * FNV) & M64
+    """FNV-style, with the high half folded in: a multiplication alone
+    carries a change of the top bit to the top bit only, so that two
+    results wrong in their sign bit would cancel."""
+    y = ((h ^ (x & M64)) * FNV) & M64
+    return y ^ (y >> 32)
 
 
 class Node:
@@ -404,7 +408,7 @@ def write(fname, seed, nexpr, nsets, out_dir=RUN):
     out.append('')
     for v, t in VARS:
         out.append(f'const {const_names[v]}: {t} = {g.sets[v][0]};')
-    out += ['', 'fn mix(h: u64, x: u64) u64 {', '    return (h ^ x) *% 1099511628211;', '}', '']
+    out += ['', 'fn mix(h: u64, x: u64) u64 {', '    let y = (h ^ x) *% 1099511628211;', '    return y ^ (y >> 32);', '}', '']
     for t, (bits, signed) in TYPES.items():
         conv = f'@bit_cast(u64, @as(i64, r))' if signed and bits < 64 else (
             '@bit_cast(u64, r)' if signed else ('r' if bits == 64 else '@as(u64, r)'))
@@ -451,4 +455,5 @@ def main():
         write(fname, seed, nexpr, nsets)
 
 
-main()
+if __name__ == '__main__':
+    main()
