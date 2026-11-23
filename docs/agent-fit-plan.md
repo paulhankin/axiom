@@ -203,13 +203,44 @@ Done. The Problem above describes the tree as it was.
   and -O2, on x86-64 at -O0 to -O3 for the baseline and with AVX-512, and on AArch64
   under qemu at -O0 to -O3; they found no wrong result.
 
+- Threads, atomics and `usize`/`isize` in calls and control flow are covered too.
+  `gen_exact_atomics.py` (`exact_atomics_*.ax`): on one thread, every atomic builtin
+  (`load`, `store`, `add` `sub` `and` `or` `xor` `xchg` `min` `max`, `cas` succeeding
+  and failing, `@atomic_notify` with no waiter, `@fence`) on every integer type at
+  edge values from memory and with constant operands, on globals, struct fields
+  beside fields of every width (an 8- or 16-bit operation that writes its neighbours
+  shows), array elements, locals, fields of structs in arrays, through pointer and
+  generic `[T: Int]` parameters and through std/sync's `Atomic`, with the results
+  used or discarded and random memory orders; `usize` and `isize` keep 32-bit values
+  there, and `exact_atomics_size64_1.ax` (native-only) has them at 64 bits. The
+  threaded programs (2 to 4 threads, a few hundred iterations, started together by a
+  `Barrier`) have results that do not depend on the interleaving: atomic folds of
+  values from memory on shared counters, tickets (the old values of an `add` of one
+  constant are a known set), exchanges (the old values and the final one are the
+  initial value and every value written), compare-exchange retry loops computing a
+  sum, a product, a minimum and bitwise folds on 8- to 64-bit words, a `Mutex`,
+  plain stores to each thread's own bytes and sub-word fields, thread-locals, turns
+  passed with a releasing store and `@atomic_wait`/`@atomic_notify` (a plain log in a
+  known order), and `parallel_for`. `gen_exact_calls.py` now has `usize` and `isize`
+  in its pool of types (and as enum representations) with 32-bit values whose
+  helpers never wrap at 32 bits, so that one expected output holds on every target,
+  and `--size64` (`exact_calls_size64_1.ax`, native-only) the same with 64-bit
+  values; `gen_exact_flow.py` has `for`, `while` and `loop` counters and `match`
+  scrutinees of `usize` and `isize` (from negative values) and conditions on them
+  shifted, divided and reduced. (`run.mjs` has one expected output per test, so a
+  value that depends on the width is tested in a native-only program.) These
+  programs, and 100 more of other seeds per generator and mode (single-threaded,
+  threaded, 64-bit; calls, calls at 64 bits, flow), pass on wasm32 at -O0, -O2 and -O3,
+  wasm64 (by hand) at -O0 and -O2, x86-64 at -O0 to -O3 for the baseline and the
+  host's CPU (AVX-512), and AArch64 under qemu at -O0 to -O3; the threaded ones
+  passed several runs of each. They found no wrong result.
+
 Not done:
 
 - The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead): it
   needs a push with tag access.
-- The exact tests do not cover threads and atomics, the C front end's calls (its ABI
-  has generators of its own), or `usize`/`isize` in the call and control-flow
-  programs.
+- The exact tests do not cover the C front end's calls (its ABI has generators of its
+  own).
 
 ### Risks
 
