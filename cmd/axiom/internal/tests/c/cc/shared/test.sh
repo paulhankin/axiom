@@ -24,6 +24,9 @@ exports() {
     [ "$(cat got)" = "$1 " ] || fail "$(cat v.map): exports '$(cat got)', expected '$1'"
 }
 if command -v readelf > /dev/null; then
+    # (the library's undefined symbols are what it uses: no main, no
+    # ax_unavailable)
+    readelf --dyn-syms lib/libdemo.so.1 | grep -E ' (main|ax_unavailable)$' > got && fail "libdemo.so.1 lists: $(cat got)"
     printf '{ global:g; local: *; };\n' > v.map; exports "g"
     printf '{global:g;h;local:*;};\n' > v.map; exports "g h"
     printf 'V1 { global: f*; local: fp; *; };\n' > v.map; exports "fq@@V1"
