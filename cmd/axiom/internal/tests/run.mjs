@@ -16,13 +16,17 @@
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
 // Usage: node cmd/axiom/internal/tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program] [-g]
-//                                            [--list] [--verbose]
+//                                            [--overflow=trap|report] [--list] [--verbose]
 //
 // The compiler tested is cmd/axiom/build/axiom (cmd/axiom/bootstrap.sh builds
 // it), or $AXIOM.
 //
 // --list prints the names of the tests that would run; --verbose names the
-// tests skipped and why. Environment: AXIOM_TEST_JOBS (tests run at a time;
+// tests skipped and why. --overflow=trap or --overflow=report builds the
+// Axiom programs and tests (not the C ones, nor those whose own flags name
+// a mode) in that overflow mode (spec §7.6); with report, the sites that
+// overflowed are collected from every program run (AXIOM_OVERFLOW_LOG: the
+// file, default one in the run's temporary directory) and listed at the end. Environment: AXIOM_TEST_JOBS (tests run at a time;
 // default the CPUs, 1 is serial); AXIOM_TEST_SKIP_PLATFORM=1 skips what does
 // not depend on the target and flags (fmt, macOS, Windows, the wasm32 check
 // of cmd/axiom/src), for runs after the first of several configurations;
@@ -82,6 +86,12 @@ const listOnly = argv.includes('--list');
 const verbose = argv.includes('--verbose');
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a) || a === '-g');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-tests-'));
+// The flags of an Axiom build: the suite's, and its overflow mode unless the
+// test's own flags (own) name one.
+const overflowFlags = argv.filter((a) => /^--overflow=(wrap|trap|report)$/.test(a));
+const axFlags = (own = []) => [...extraFlags, ...(own.some((a) => a.startsWith('--overflow=')) ? [] : overflowFlags)];
+const overflowLog = overflowFlags.includes('--overflow=report') ? path.resolve(process.env.AXIOM_OVERFLOW_LOG || path.join(tmp, 'overflow.log')) : null;
+if (overflowLog) process.env.AXIOM_OVERFLOW_LOG = overflowLog;
 // the temporary directory goes whatever ends the run: the summary, an
 // uncaught error, or Ctrl-C
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -305,7 +315,7 @@ async function runNative(exe) {
   return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}`, status: r.status, stderr: r.stderr || '' };
 }
 
-console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${extraFlags.length ? `, ${extraFlags.join(' ')}` : ''}, ${jobs} jobs`);
+console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${axFlags().length ? `, ${axFlags().join(' ')}` : ''}, ${jobs} jobs`);
 let pass = 0, fail = 0, skip = 0;
 const failures = [], skips = [];
 
@@ -386,7 +396,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const dir = path.join(tmp, path.basename(path.dirname(f)) + '-' + path.basename(f, '.ax'));
   fs.mkdirSync(dir);
   const out = path.join(dir, path.basename(f, '.ax') + (native ? '' : '.wasm'));
-  const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
+  const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...axFlags(d.flags)];
   if (native) args.push(nativeTarget, `--link=${path.join(root, noC ? 'cmd/axiom/internal/tests/native_rt.ax' : 'cmd/axiom/internal/tests/native_rt.c')}`);
   if (native && process.arch === 'x64' && !process.env.AXIOM_NATIVE_TARGET) args.push(...d.x64Flags);
   if (!native) args.push(...d.wasmFlags);
@@ -669,7 +679,7 @@ const cMixTest = async (dir) => {
     for (const t of dv('expect-report')) if (!(c.stdout + c.stderr).includes(t)) return `no '${t}' in the report:\n${c.stdout}${c.stderr}`;
     return null;
   }
-  const args = ['build', main, ...others, ...uses, '--format=agent-json', '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+  const args = ['build', main, ...others, ...uses, '--format=agent-json', '-o', out, ...flags, ...(axMain ? axFlags(flags) : extraFlags).filter((a) => !a.startsWith('--units='))];
   if (native) args.push(nativeTarget);
   else if (process.env.AXIOM_C_TARGET) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
@@ -1805,11 +1815,11 @@ await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/inter
   if (buildOnly) {
     // (the test binary, built and checked: --no-run)
     const out = path.join(tmp, `test-${path.relative(root, f).replace(/[/.]/g, '-')}${/windows/.test(nativeTarget) ? '.exe' : ''}`);
-    const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', `--no-run=${out}`, ...testTargets, ...d.flags, ...extraFlags], { encoding: 'utf8', timeout: compileTimeout });
+    const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', `--no-run=${out}`, ...testTargets, ...d.flags, ...axFlags(d.flags)], { encoding: 'utf8', timeout: compileTimeout });
     if (c.status !== 0) return `the build failed (status ${c.status}):\n${c.stdout}${c.stderr}`;
     return checkBuilt(out);
   }
-  const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...extraFlags], { encoding: 'utf8' });
+  const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...axFlags(d.flags)], { encoding: 'utf8' });
   let json = null;
   try { json = JSON.parse(c.stdout); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
   const want = [...src.matchAll(/^\/\/ test-result: (.+?) \| (pass|fail)(?: \| (\S+))?(?: \| (\d+))?$/gm)];
@@ -1833,7 +1843,7 @@ await section('', {
   'cmd/axiom/internal/tests/traces/traces.ax [stack traces]': () => {
     const f = path.join(root, 'cmd/axiom/internal/tests/traces/traces.ax');
     const src = fs.readFileSync(f, 'utf8');
-    const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...extraFlags], { encoding: 'utf8' });
+    const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...axFlags()], { encoding: 'utf8' });
     let json = null;
     try { json = JSON.parse(c.stdout); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
     if (!json.tests) return `no test results (status ${c.status}):\n${c.stdout}${c.stderr}`;
@@ -1853,7 +1863,7 @@ await section('', {
   },
   'cmd/axiom/internal/tests/traces/crash.ax [crash report]': () => {
     const out = path.join(tmp, 'crash' + (native ? '' : '.wasm'));
-    const b = spawnSync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/traces/crash.ax'), '-o', out, ...targetFlags, ...extraFlags], { encoding: 'utf8' });
+    const b = spawnSync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/traces/crash.ax'), '-o', out, ...targetFlags, ...axFlags()], { encoding: 'utf8' });
     if (b.status !== 0) return `build failed: ${b.stdout}${b.stderr}`;
     // (a timeout: a recursion turned into a loop never overflows)
     const r = native ? spawnExe(out, [], { encoding: 'utf8', timeout: 60000 })
@@ -1874,7 +1884,7 @@ await section('', byFile(files(path.join(root, 'cmd/axiom/internal/tests/sanitiz
   const st = (src.match(/^\/\/ status: (\w+)/m) || [null, '0'])[1];
   const wants = [...src.matchAll(/^\/\/ stderr: (.+)$/gm)].map((m) => m[1].trim());
   const out = path.join(tmp, 'asan-' + path.basename(f, '.ax') + (native ? '' : '.wasm'));
-  const b = await spawnAsync(compiler, ['build', f, '--sanitize=address', '-o', out, ...targetFlags, ...extraFlags], { encoding: 'utf8' });
+  const b = await spawnAsync(compiler, ['build', f, '--sanitize=address', '-o', out, ...targetFlags, ...axFlags()], { encoding: 'utf8' });
   if (b.status !== 0) return `build failed: ${b.stdout}${b.stderr}`;
   const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8' })
     : await spawnAsync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
@@ -2258,6 +2268,45 @@ await section('spec §15.3', {
     '--stack-traces=off': builds('--stack-traces=off', 'st'),
     '--overflow=wrap': builds('--overflow=wrap', 'ow'),
     '--units=program': builds('--units=program', 'up'),
+    '--overflow=report: each site once, on stderr or in AXIOM_OVERFLOW_LOG, and the wrapped values': () => {
+      prepare();
+      const f = path.join(dir, 'ovr.ax');
+      fs.writeFileSync(f, [
+        'import "std/io" as io;', '',
+        'fn add(a: u8, b: u8) u8 {', '    return a + b;', '}', '',
+        'fn show(x: i64) void {', '    let mut buf: [24]u8 = [0; 24];',
+        '    io.stdout().println(io.fmt_i64(buf[..], x)) catch return;', '}', '',
+        'export fn main() i32 {',
+        '    let mut x: u8 = 0;', '    for _i in 0..@as(u32, 10) {', '        x = add(x, 200);', '    }',
+        '    show(@as(i64, x));',
+        '    let mut k: i32 = -2147483647;', '    k -= 1;',
+        '    for _j in 0..@as(u32, 3) {', '        k = -k;', '        k = k / -1;', '        k = @abs(k);', '        k = k * 3;', '    }',
+        '    show(@as(i64, k));',
+        '    let w: u32 = 7;', '    show(@as(i64, w -% 8));', '    show(@as(i64, w - 1));',
+        '    return 0;', '}', ''].join('\n'));
+      const want = ['ovr.ax:4:12: integer overflow (T0002), wrapped: a + b', 'ovr.ax:21:13: integer overflow (T0002), wrapped: -k',
+        'ovr.ax:22:13: integer overflow (T0002), wrapped: k / -1', 'ovr.ax:23:13: integer overflow (T0002), wrapped: @abs(k)',
+        'ovr.ax:24:13: integer overflow (T0002), wrapped: k * 3'].join('\n') + '\n';
+      const wantOut = '208\n-2147483648\n4294967295\n6\n';
+      for (const o of ['-O0', '-O2']) {
+        const exe = path.join(dir, `ovr${o}` + (native ? '' : '.wasm'));
+        const c = spawnSync(compiler, ['build', 'ovr.ax', '--overflow=report', o, '-o', exe, ...targetFlags], { encoding: 'utf8', cwd: dir });
+        if (c.status) return c.stderr;
+        const log = path.join(dir, `ovr${o}.log`);
+        for (const logged of [false, true]) {
+          const env = { ...process.env };
+          if (logged) env.AXIOM_OVERFLOW_LOG = log;
+          else delete env.AXIOM_OVERFLOW_LOG;
+          const r = native ? spawnExe(exe, [], { encoding: 'utf8', env })
+            : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), exe], { encoding: 'utf8', env });
+          const err = logged ? fs.readFileSync(log, 'utf8') : r.stderr.replace(/\r/g, '');
+          if (r.status !== 0 || r.stdout.replace(/\r/g, '') !== wantOut || err !== want || (logged && r.stderr)) {
+            return `${o}${logged ? ', AXIOM_OVERFLOW_LOG' : ''}: status ${r.status}\n${r.stdout}--- reported\n${err}--- stderr\n${logged ? r.stderr : ''}`;
+          }
+        }
+      }
+      return null;
+    },
     '-g': builds('-g', 'g'),
     '--emit=obj': () => {
       if (!native) return { skip: true, reason: 'native only' };
@@ -2611,7 +2660,7 @@ await section('', {
       const f = path.join(tmp, `nest-ok-${name.replace(/ /g, '_')}.ax`);
       fs.writeFileSync(f, gen(900));
       const out = f.replace(/\.ax$/, native ? '' : '.wasm');
-      const c = spawnSync(compiler, ['build', f, '-o', out, ...targetFlags, ...extraFlags], { encoding: 'utf8' });
+      const c = spawnSync(compiler, ['build', f, '-o', out, ...targetFlags, ...axFlags()], { encoding: 'utf8' });
       if (c.status !== 0) return `build failed (status ${c.status}):\n${c.stdout}${c.stderr}`.slice(0, 2000);
       const r = hostRun(out);
       return r.status !== 0 ? `exit status ${r.status}:\n${r.stderr}` : null;
@@ -4697,6 +4746,12 @@ if (!native) {
 
 if (listOnly) process.exit(0);
 for (const f of failures) console.log('\n' + f);
+if (overflowLog) {
+  // (--overflow=report: each site once, however many programs reported it)
+  const sites = fs.existsSync(overflowLog) ? [...new Set(fs.readFileSync(overflowLog, 'utf8').split('\n').filter((l) => l))].sort() : [];
+  console.log(`\n${sites.length} sites overflowed${sites.length ? ':' : ''}`);
+  for (const l of sites) console.log(`  ${l}`);
+}
 if (skip && !verbose) console.log(`\n${skip} skipped (--verbose names them)`);
 console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
 process.exit(fail ? 1 : 0);

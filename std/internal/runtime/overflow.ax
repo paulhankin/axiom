@@ -1,0 +1,90 @@
+// =============================================================================
+// std/internal/runtime/overflow.ax - the report of --overflow=report (spec
+// §7.6): the code generator calls `report` with the site record (spec
+// Appendix B; trap_format.ax: Site) of an integer operation that overflowed,
+// and the program goes on with the wrapped result. Each site is reported once
+// per process, as one line
+//
+//   file:line:col: integer overflow (T0002), wrapped: <the code>
+//
+// on the standard error, or appended to the file that the environment
+// variable AXIOM_OVERFLOW_LOG names (so that runs whose standard error is
+// checked or discarded can be collected). The compiler adds this module to a
+// program built with --overflow=report, and builds it as --overflow=wrap
+// (its arithmetic must not report itself).
+// =============================================================================
+import "trap_format.ax" as tf;
+
+import host "axiom" {
+    fn ax_write(fd: i32, p: *u8, n: usize) isize;
+    fn ax_open(path: *u8, len: usize, flags: u32) i32;
+    fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize;
+}
+
+// The sites reported, by address (an open-addressed set; 0 is free). When it
+// is full, sites are reported again.
+const CAP: usize = 4096;
+let mut seen: [4096]usize = [0; 4096];
+
+// Where the lines go: -1 until the first report decides.
+let mut out_fd: i32 = -1;
+
+// True the first time `s` is seen (by any thread).
+fn first_time(s: *tf.Site) bool {
+    let key = @int_from_ptr(s);
+    let mut i = (key >> 3) & (CAP - 1);
+    for _probe in 0..CAP {
+        let prev = @atomic_cas(&mut seen[i], 0, key);
+        if prev == 0 {
+            return true;
+        }
+        if prev == key {
+            return false;
+        }
+        i = (i +% 1) & (CAP - 1);
+    }
+    return true;
+}
+
+fn output() i32 {
+    let fd = @atomic_load(&out_fd);
+    if fd >= 0 {
+        return fd;
+    }
+    let name = "AXIOM_OVERFLOW_LOG";
+    let mut path: [1024]u8 = [0; 1024];
+    let n = ax_getenv(name.ptr, name.len, &mut path[0], path.len);
+    let mut f: i32 = 2;
+    if (n > 0) and (@bit_cast(usize, n) <= path.len) {
+        let g = ax_open(&path[0], @bit_cast(usize, n), 2);  // create or append
+        if g >= 0 {
+            f = g;
+        }
+    }
+    let prev = @atomic_cas(&mut out_fd, -1, f);
+    if prev >= 0 {
+        return prev;  // (another thread decided first; this one's descriptor stays open)
+    }
+    return f;
+}
+
+pub fn report(site: *void) void {
+    let s = @ptr_cast(*tf.Site, site);
+    if not first_time(s) {
+        return;
+    }
+    let mut buf: [512]u8 = [0; 512];
+    let mut o = tf.fmt(buf[..]);
+    o.s(tf.cstr(s.file()));
+    o.c(':');
+    o.u(@as(u64, s.line));
+    o.c(':');
+    o.u(@as(u64, s.col));
+    o.s(": integer overflow (");
+    o.code(s.code);
+    o.s("), wrapped: ");
+    o.s(tf.cstr(s.text()));
+    o.c('\n');
+    let t = o.text();
+    _ = ax_write(output(), t.ptr, t.len);
+}

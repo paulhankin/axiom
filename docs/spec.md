@@ -1078,6 +1078,13 @@ from untrusted input, and `@add_sat`, `@sub_sat` and `@mul_sat` to clamp (Append
   that wraps nowhere behaves the same in both modes, so the mode finds unintended
   overflows (in tests, say) at the cost of a check on every operation.
 - `saturate` (`--overflow=saturate`): the result is clamped to the type's MIN or MAX.
+- `report` (`--overflow=report`): as `wrap`, but the first time an operation that `trap`
+  checks overflows at a source location, the program writes one line naming the location
+  and the code (`file:line:col: integer overflow (T0002), wrapped: a + b`) to its
+  standard error, or appends it to the file that the environment variable
+  `AXIOM_OVERFLOW_LOG` names, and goes on with the wrapped value. One run of a test
+  suite so finds every site that overflows, to spell with `%` where the wrap is intended
+  or to fix.
 
 In every mode, the `%`-suffixed operators, the `@atomic_*` arithmetic and integer vector
 arithmetic (§13.1) wrap, and the `_sat` and `_checked` builtins behave as their names say.
@@ -2823,7 +2830,7 @@ in the library has one of the two signatures.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o <out>
+axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate|report] -o <out>
 axiom check <file.ax | package dir>              # parse and type-check only; no codegen
 axiom test  <file.ax | package dir> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
@@ -2842,7 +2849,8 @@ processor extensions (§13.4); `--sanitize=address` is §16.8 (`axiom test`'s de
 `--coverage` §16.9. `--overflow` selects the
 overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
 every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
-overflow, to find unintended overflows; `saturate` clamps. The remaining options
+overflow, to find unintended overflows; `saturate` clamps; `report` wraps and reports
+each site that overflowed once. The remaining options
 (output kinds, linking with C, Windows subsystems and icons, the module cache's
 settings, environment variables, exit codes) are the compiler's own and are listed in
 [`docs/cli.md`](cli.md); this specification defines the interfaces tools rely on: the

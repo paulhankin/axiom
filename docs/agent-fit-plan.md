@@ -641,9 +641,9 @@ cost of compute-heavy code". On x86-64 that is no longer so:
 | Compiler self-compile | 0.99 |
 | Compiler binary size | 1.07 |
 
-Not yet measured: AArch64 (the branch on flags is x86-64 only, issue #72), WebAssembly
-(no overflow flag, so each check is a compare and a branch), and integer reductions the
-vectorizer handles today.
+Not yet measured: AArch64 (when this was written the branch on flags was x86-64 only;
+issue #72 has since given AArch64 its own), WebAssembly (no overflow flag, so each check
+is a compare and a branch), and integer reductions the vectorizer handles today.
 
 ### Design
 
@@ -682,6 +682,75 @@ vectorizer handles today.
 The whole suite, the standard library's tests, the examples and both fuzzers pass with
 trapping on. Benchmark numbers for the three targets go in the commit that changes the
 default.
+
+### Status
+
+B4 and B3's measurements are done; B1, B2, B5 and B6 are not started, and the default
+is unchanged (wrap). The gate's decision is the owner's.
+
+- **`--overflow=report`** (spec §7.6, `docs/cli.md`): the program wraps, and the first
+  time a site that `trap` checks overflows it writes
+  `file:line:col: integer overflow (T0002), wrapped: <code>` to stderr, or appends it to
+  the file `AXIOM_OVERFLOW_LOG` names. The report is `std/internal/runtime/overflow.ax`,
+  added to programs built in that mode and called from a cold block after the check.
+  It runs on x86-64 and AArch64 Linux, x86-64 Windows, wasm32 and wasm64 (macOS: built,
+  not run). On WebAssembly it imports the host's `ax_write`, `ax_open` and `ax_getenv`.
+  `run.mjs --overflow=report` (or `trap`) builds the suite's Axiom programs and tests in
+  that mode, except tests whose own flags name one, and lists the sites at the end.
+- **B4, the tree is clean.** Runs with a compiler built with `--overflow=report`: the
+  whole suite on wasm32 (-O0, -O2) and natively (-O0, -O2); `tests/run/` on AArch64
+  (qemu) and x86-64 Windows (Wine); the std tests on wasm32 and x86-64; the examples
+  (`cmd/axiom/examples.sh`); the benchmarks on all three targets; and self-compiles for
+  x86-64, AArch64, wasm32, Windows and macOS at -O0 and -O2. The last runs report no
+  site. A compiler built with `--overflow=trap` compiles itself at -O0 and -O2.
+  - Intended wraps, now `+%` / `-%`: in the compiler, `elfpack.ax` (`diff`, `plus`: the
+    `-O0` trap the review found), `util.ax` (`U64Map.del`'s cyclic distances),
+    `c/cgen_va.ax` (an alignment mask), `dwarf.ax` and `codeview.ax` (`LAZY + 1` is 0,
+    "no symbol"), `mlink.ax` (the sizing pass of the compact unwind table), `switches.ax`
+    (a span negative past 2^63); in the tests, hashes of results and byte counts; in
+    std, a test's made-up script names (`graphics/shape.ax`). `ir_verify.ax` computed a
+    wrapped `k - 3` it then discarded; it no longer does. The compiler's machine code
+    is unchanged (`.text` and `.rodata` identical with `--stack-traces=off`; with
+    traces only site records differ), and the compilers before and after build the
+    same compiler.
+  - Tests of the default's wrapping (`overflow_wrap.ax`, `overflow_release.ax`,
+    `div_const.ax`, whose `MIN / -1` has no wrapping operator) name `--overflow=wrap`.
+  - Bugs: `std/mem`'s count of bytes freed in a decay epoch wrapped on wasm32 past
+    4 GiB (and with no clock the epoch never ends), so the allocator kept too little
+    free memory; it saturates now, with a test. `tests/run/tailrec.ax`'s combinatorial
+    index ran `r` below 0 and ended only because `n` wrapped round to it; its input is
+    now one that ends.
+- **B3, the measurements.** CPU time, trap / wrap, medians of alternating runs, all at
+  `-O2` with the compiler that has issue #72. x86-64: 11 runs on a quiet machine (two
+  earlier runs on a loaded one gave geomeans of 1.053 and 1.057, `alloc_tree` 1.13 and
+  1.45: these numbers move by several percent). AArch64: qemu user time, 7 runs, only
+  indicative (no hardware here, and the qemu here counts no instructions; its costs
+  are not a core's).
+  wasm32: node, 7 runs. The self-compile builds the compiler for x86-64 at `-O2`
+  (`AXIOM_JOBS=1`; on wasm32 with `--units=module`, since `--units=program` runs out of
+  wasm32's 4 GiB).
+
+  | Program | x86-64 | AArch64 (qemu) | wasm32 |
+  |---|---|---|---|
+  | 13 benchmarks of `cmd/axiom/bench/`, geometric mean | 1.035 | 1.039 | 0.997 |
+  | the 7 that are not `alloc_*` | 0.99 | 0.98 | 0.98 |
+  | the 6 `alloc_*` | 1.09 | 1.12 | 1.02 |
+  | worst | `alloc_tree` 1.27 | `alloc_threads` 1.35 | `vecpush` 1.12 |
+  | over 1.15 besides | none | `alloc_churn` 1.27 | none |
+  | compiler self-compile | 1.00 | 1.05 | 1.01 |
+  | `reduce_sum`, `+` / `+%` | 7.14 / 0.99 | 1.19 / 0.99 | 1.46 / 0.99 |
+  | `reduce_dot`, `+ *` / `+% *%` | 1.29 / 1.00 | 2.97 / 0.98 | 1.84 / 1.09 |
+  | `reduce_hist`, `+` / `+%` | 0.83 / 1.09 | 1.55 / 1.01 | 1.04 / 0.98 |
+
+  Against the bar (geometric mean within 3% on each target, no program more than 15%
+  slower that `+%` cannot fix): wasm32 meets it. x86-64 misses the mean by half a
+  percent and AArch64 (indicatively) by one, both from the allocator benchmarks, whose
+  checks are std/mem's own arithmetic, which does not wrap: `+%` cannot fix them, and
+  bounds the optimizer could use (B5) or a check-free spelling in the allocator could.
+  The reductions written with `+` lose their vectorization (`reduce_sum` on x86-64 is
+  7 times slower) and with `%` operators cost nothing, as B5 says.
+  `reduce_hist` with `+` ran faster trapping than wrapping on x86-64 in every run (0.81
+  to 0.83); not investigated (the loop's code differs in more than the check).
 
 ---
 
