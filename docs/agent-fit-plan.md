@@ -26,6 +26,21 @@ Every number below was measured on main at `92b8dd88` on one x86-64 Linux machin
 | **B** | Integer overflow traps by default | Yes (language) | Large | F, issue #72 |
 | **G** | Standard library tiers; the C compiler marked experimental | Yes (import paths) | Large, mechanical | D, E |
 
+### Where it stands
+
+Every workstream has landed; each section's `### Status` gives the details and what is
+left.
+
+| # | Done | Left |
+|---|---|---|
+| **F** | One compiler, built from the pinned seed; tests whose expected output comes from the spec (`gen_exact_ops.py`, `gen_exact_exprs.py`) | The `bootstrap-final` tag; release hashes in `docs/bootstrap-chain.md` |
+| **A** | One error per mistake, `E0160` to `E0180` with machine fixes | The idioms a valid program shares tokens with (issue #75) |
+| **E** | `axiom doc`, `W0320` | |
+| **C** | The accurate claim; the sanitizer on in `axiom test` on every target; `W0711` on | `W0711` sees only uses in one function |
+| **D** | `while let`; one iterator protocol in std | |
+| **B** | Overflow traps by default; `--overflow=report`; checks the ranges rule out are removed; `--overflow=saturate` gone | Checks that need relations between values or trip counts |
+| **G** | Core in `std/`, the rest in `lib/`; core's rules enforced; the C compiler an experiment | |
+
 ### Recommended order
 
 ```
