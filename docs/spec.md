@@ -976,7 +976,7 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 | Family | Operators | Operand types | Notes |
 |---|---|---|---|
 | **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` traps on overflow, `*%` wraps (§7.6) |
-| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` wrap (§7.6). The `%`-suffixed forms always wrap, int only |
+| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` trap on overflow (§7.6). The `%`-suffixed forms always wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
