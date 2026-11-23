@@ -2951,7 +2951,7 @@ as a `}` is missing there.
 
 **Idioms of other languages.** A form that another language spells differently (`!x`, `&&`,
 `i++`, `fn f() -> T`, `x as T`, `Vec<T>`, ...) is reported by its own code (`E0160` to
-`E0179`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
+`E0180`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
 `machine` fix, and the declaration is checked as if the Axiom form had been written, so
 that the mistake costs one error. The forms whose rewrite needs a choice (the conditional
 operator, a C-style `for`, `if` or `match` as an expression) have a note instead, and
@@ -3018,6 +3018,7 @@ it does (and that each is asserted by a test):
 | E0177 | Generic arguments without the `.` of `Name.[T]`: `Name[T]` |
 | E0178 | A string in single quotes |
 | E0179 | `+` on two slices or arrays (`str.concat` joins strings) |
+| E0180 | `const Name = enum { ... }` (or `struct`, `union`) for `enum Name { ... }` |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
 | E0203 | Item, method, or field is not public |

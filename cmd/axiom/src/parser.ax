@@ -20,6 +20,10 @@ struct Parser {
     // not checked, it reports no further syntax error, and no fix.
     poisoned: bool,      // the declaration being parsed (a function, method or other)
     top_poisoned: bool,  // the top-level declaration being parsed, or one inside it
+    // `const Name = enum { ... }` (E0180): the name, which comes before the
+    // keyword, taken by the declaration's parse_decl_name
+    early_name: []u8,
+    early_name_span: u.Span,
 }
 
 fn peek(P: *Parser) *lx.Token {
@@ -2303,6 +2307,12 @@ fn is_trap_code(c: []u8) bool {
 
 // Sets d's name from the identifier that comes next.
 fn parse_decl_name(P: *mut Parser, d: *mut ast.Decl) void {
+    if P.early_name.len > 0 {
+        d.name = P.early_name;
+        d.name_span = P.early_name_span;
+        P.early_name = "";
+        return;
+    }
     let id = expect_ident(P);
     d.name = id.name;
     d.name_span = id.span;
@@ -2673,6 +2683,30 @@ fn parse_top_in(P: *mut Parser) void {
         mdecls.push(parse_union(P, start, is_pub, false));
     } else if k == lx.KW_ENUM {
         mdecls.push(parse_enum(P, start, is_pub));
+    } else if (k == lx.KW_CONST) and (pk_at(P, 1) == lx.TK_IDENT) and (pk_at(P, 2) == lx.TK_EQ) and
+              ((pk_at(P, 3) == lx.KW_ENUM) or (pk_at(P, 3) == lx.KW_STRUCT) or (pk_at(P, 3) == lx.KW_UNION)) {
+        // `const Color = enum { ... };`: E0180
+        _ = advance(P);
+        let name = advance(P);
+        _ = advance(P);
+        let kw = peek(P);
+        let kws = lx.tok_kind_name(kw.kind);
+        let d = idiom(P, u.span_join(start, kw.span), "E0180",
+                      u.f3("a type is declared as '%s %s { ... }', not 'const %s = ...'", kws, name.name, name.name));
+        let fx = dg.fix(d, u.f2("write '%s %s'", kws, name.name), "machine");
+        dg.edit(fx, u.span_join(start, kw.span), u.f2("%s %s", kws, name.name));
+        P.early_name = name.name;
+        P.early_name_span = name.span;
+        if kw.kind == lx.KW_ENUM {
+            mdecls.push(parse_enum(P, start, is_pub));
+        } else if kw.kind == lx.KW_STRUCT {
+            mdecls.push(parse_struct(P, start, is_pub, false));
+        } else {
+            mdecls.push(parse_union(P, start, is_pub, false));
+        }
+        if pk(P) == lx.TK_SEMI {
+            dg.edit(fx, advance(P).span, "");  // (the ';' after the '}')
+        }
     } else if k == lx.KW_CONST {
         mdecls.push(parse_const(P, start, is_pub));
     } else if accept(P, lx.KW_THREADLOCAL) {
@@ -2694,7 +2728,8 @@ fn parse_top_in(P: *mut Parser) void {
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
     let mut toks = lx.lex_file(f);
     let mut P = Parser.{ f: f, t: toks.items_mut(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
-                         ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false };
+                         ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false, early_name: "",
+                         early_name_span: u.Span.{ file: 0, start: 0, end: 0 } };
     P.mod.file = f;
     while pk(&P) != lx.TK_EOF {
         let before = P.pos;
