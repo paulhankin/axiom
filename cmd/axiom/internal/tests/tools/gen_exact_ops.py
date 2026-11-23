@@ -40,12 +40,15 @@ pseudo-random values have a fixed seed):
   (a NaN operand gives NaN; -0 < +0), @copysign, @floor @ceil @trunc
   @nearest and the comparisons, of every pair (triple for @fma) of edge
   values: zeros, ones, subnormals, the largest and smallest normals, values
-  whose operations round (ties too), infinities and NaN. Every one of these
-  has one correctly rounded result, which Python computes with rationals.
+  whose operations round (ties too), infinities and NaN; and @fma and
+  a * b + c of products that round to a subnormal or a signed zero, plus a
+  zero or a subnormal. Every one of these has one correctly rounded result,
+  which Python computes with rationals.
 
 The operands come from memory (`let mut` globals), so that nothing is
 folded except in exact_int_fold.ax. Each output line is a hash (FNV-style,
-over the 64-bit patterns) of the results of one operation over all its
+over the 64-bit patterns, with each step's high half folded into its low
+half so that results wrong only in their top bits cannot cancel) of the results of one operation over all its
 operands, in a fixed order; a NaN result is hashed as one canonical NaN, as
 NaN payloads are unspecified (§7.7). To find the operand behind a wrong
 hash, print the values in the failing function.
@@ -150,7 +153,11 @@ def lit(v):
 
 
 def mix(h, x):
-    return ((h ^ (x & M64)) * FNV) & M64
+    """FNV-style, with the high half folded in: a multiplication alone
+    carries a change of the top bit to the top bit only, so that two
+    results wrong in their sign bit would cancel."""
+    y = ((h ^ (x & M64)) * FNV) & M64
+    return y ^ (y >> 32)
 
 
 # ---- floats --------------------------------------------------------------
@@ -379,7 +386,8 @@ def hash_bits(v, t):
 
 
 HELPERS = '''fn mix(h: u64, x: u64) u64 {
-    return (h ^ x) *% 1099511628211;
+    let y = (h ^ x) *% 1099511628211;
+    return y ^ (y >> 32);
 }
 
 fn h_u8(h: u64, r: u8) u64 {
@@ -1131,7 +1139,8 @@ def gen_float_arith():
         'of edge values: zeros, ones, values that round, subnormals, the extremes,',
         'infinities and NaN. + - * / @sqrt @fma, unary -, @abs, @min/@max (a NaN',
         'operand gives NaN; -0 < +0), @copysign, @floor @ceil @trunc @nearest and the',
-        'comparisons each have one result, computed in Python with rationals.',
+        'comparisons each have one result, computed in Python with rationals. Also',
+        '@fma and a * b + c of products that round to a subnormal or a signed zero.',
     ] + GEN)
     for t in FTYPES:
         fa = F(p, t)
@@ -1160,6 +1169,19 @@ def gen_float_arith():
         blocks.append(Block([('a', small), ('b', small), ('c', small)], [
             Stmt('fma', '@fma(a, b, c)', lambda a, b, c: f_fma(a, b, c, t), t),
             Stmt('mul add', 'a * b + c', lambda a, b, c: f_add(f_mul(a, b, t), c, t), t),
+        ]))
+        # products that round to a subnormal or to a signed zero, plus zero
+        # or a subnormal (an fma whose sum is the product alone)
+        q, emn = FMT[t][0], FMT[t][1]
+        sub = 2.0 ** (emn - q + 1)
+        tiny = [2.0 ** (emn // 2 - 20), -2.0 ** (emn // 2 - 20), sub, -sub, 2.0 ** (emn // 2), 3 * 2.0 ** (emn // 2 - 3),
+                2.0 ** emn, -2.0 ** emn, 0.5, 2.0 ** (-emn // 2)]
+        it = 'u32' if t == 'f32' else 'u64'
+        ta = p.array('T_' + t.upper(), it, [f_bits(v, t) for v in tiny], load=t)
+        tc = p.array('TC_' + t.upper(), it, [f_bits(v, t) for v in [0.0, -0.0, sub, -sub, 2.0 ** emn]], load=t)
+        blocks.append(Block([('a', ta), ('b', ta), ('c', tc)], [
+            Stmt('fma tiny', '@fma(a, b, c)', lambda a, b, c: f_fma(a, b, c, t), t),
+            Stmt('mul add tiny', 'a * b + c', lambda a, b, c: f_add(f_mul(a, b, t), c, t), t),
         ]))
         p.fn(f'arith_{t}', blocks)
     p.write()
@@ -1215,4 +1237,5 @@ def main():
     gen_float_arith()
 
 
-main()
+if __name__ == '__main__':
+    main()

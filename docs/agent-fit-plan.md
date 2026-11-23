@@ -151,14 +151,38 @@ Done. The Problem above describes the tree as it was.
   x86-64 from -O1 (a shift folded into `lea` was lost when the add became `adc`;
   fixed), and four overflow traps in the optimizer itself (`gvn.ax`, `opt.ax`: code
   written when overflow wrapped), which crash the compiler.
+- Since then the hash of these tests folds each step's high half into its low half (a
+  multiplication alone carried a wrong sign bit only to the top bit, so two such
+  results cancelled), and three more generators cover what was left out:
+  `gen_exact_fexprs.py` (`exact_fexprs_*.ax`: random trees of f32, f64 and integer
+  operations, `+ - * /` each rounded once, `@fma`, `@sqrt`, `@min` `@max`, `@copysign`,
+  the rounding builtins, literals rounded from their decimal, comparisons and every
+  conversion between floats and integers); `gen_exact_simd.py` (`exact_simd_*.ax`: every
+  integer and float vector type of 128 and 256 bits, and of 512 bits for the lane-wise
+  operators, at rows of edge values: the lane-wise operators and builtins, shifts by
+  scalar and vector counts, masks, `@select`, `@bitmask` `@any_true` `@all_true`,
+  `@reduce_add` and `@dot` with the halves folded, `@widen_*`, `@narrow`, the
+  conversions, `@shuffle`, `@swizzle`, `@swizzle2`, `@extract_lane` `@replace_lane`
+  `@splat` `@vec`, `@load_partial` `@store_partial`, and random trees of them); and
+  `gen_exact_exprs.py --size64` and `gen_exact_fexprs.py` (`exact_size64_*.ax`:
+  `usize` and `isize` with 64-bit values, native-only). Every program, and 100 to 120
+  more of other seeds per generator, passes on wasm32 (not the 64-bit ones), wasm64
+  (by hand: `run.mjs` builds its run tests for wasm32), x86-64 at -O0 to -O3 for the
+  baseline and with AVX-512, and AArch64 under qemu at -O0 to -O3. They found four
+  bugs, all fixed: the software `@fma` of f64 (WebAssembly, x86-64 without `fma`) gave
+  +0 for a product that rounds to -0 plus a zero; with AVX-512, a scalar move of
+  xmm16-31 stopped the compiler (`tests/run/evex_scalar_moves.ax`) and so did a 512-bit
+  shift by a lane of a vector (`vec_shift_lane_count.ax`); and `k - @clz(x)` with `k`
+  near the bottom of i64 overflowed in x86-64's instruction selection
+  (`clz_sub_const_min.ax`).
 
 Not done:
 
 - The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead).
 - `docs/bootstrap-chain.md` records each release's commit and seed, not yet its hashes
   (they are in each release's `SHA256SUMS`).
-- The exact tests leave out usize and isize beyond 32-bit values (their results
-  depend on the target), SIMD vectors, and floats in the random expressions.
+- The exact tests do not cover `@rem`, `v128`/`v256`/`v512`, the `@dot` of 8-bit
+  lanes, or vectors in memory through pointers and slices of vectors.
 
 ### Risks
 
