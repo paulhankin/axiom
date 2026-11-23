@@ -8,7 +8,12 @@ patterns to an arm), optionals, bools and errors, `if let` and `while let`,
 `defer` and `errdefer` in every block, early returns, calls of each other
 and errors returned with `return error.X`, propagated with `!` and handled
 with every form of `catch` (a value, a binding, a block, `return`, `break`
-and `continue`), and `and`/`or` whose operands log (short-circuit).
+and `continue`), and `and`/`or` whose operands log (short-circuit). The
+counters of `for`, `while` and `loop` and the scrutinees of `match` on
+integers are u64, usize or isize (from negative values), and conditions
+compare usize and isize values shifted right (arithmetic for isize),
+divided and reduced (toward zero); their values have 32 bits, so the
+results are the same on every target.
 
     python3 cmd/axiom/internal/tests/tools/gen_exact_flow.py
     cmd/axiom/build/axiom fmt cmd/axiom/internal/tests/run/exact_flow_*.ax
@@ -208,33 +213,50 @@ class Loop(S):
     """for (range), while (counter) and loop (counter): `head` is the text
     before the body, `pre` a statement before the loop."""
 
-    def __init__(self, kind, label, var, lo, hi, limit, body):
+    def __init__(self, kind, label, var, lo, hi, limit, body, ctype='u64', base=0):
         self.kind, self.label, self.var, self.lo, self.hi, self.limit, self.body = \
             kind, label, var, lo, hi, limit, body
+        # a counter of type usize or isize is seen by the body as `<var>w`,
+        # its u64 (sign-extended); an isize counter of while and loop
+        # counts from base
+        self.ctype, self.base = ctype, base
+
+    def view(self):
+        if self.ctype == 'u64':
+            return []
+        conv = f'@as(u64, {self.var})' if self.ctype == 'usize' else f'@bit_cast(u64, @as(i64, {self.var}))'
+        return [f'    let {self.var}w: u64 = {conv};']
 
     def lines(self):
         lab = f'{self.label}: ' if self.label else ''
         if self.kind == 'for':
-            return [f'{lab}for {self.var} in {self.lo.text}..{self.hi.text} {{'] + indent(self.body) + ['}']
+            return [f'{lab}for {self.var} in {self.lo.text}..{self.hi.text} {{'] + self.view() + indent(self.body) + ['}']
+        end = self.base + self.limit
         if self.kind == 'while':
-            return [f'let mut {self.var}: u64 = 0;', f'{lab}while {self.var} < {self.limit} {{',
-                    f'    {self.var} += 1;'] + indent(self.body) + ['}']
-        return [f'let mut {self.var}: u64 = 0;', f'{lab}loop {{', f'    {self.var} += 1;',
-                f'    if {self.var} > {self.limit} {{', '        break;', '    }'] + indent(self.body) + ['}']
+            return [f'let mut {self.var}: {self.ctype} = {self.base};', f'{lab}while {self.var} < {end} {{',
+                    f'    {self.var} += 1;'] + self.view() + indent(self.body) + ['}']
+        return [f'let mut {self.var}: {self.ctype} = {self.base};', f'{lab}loop {{', f'    {self.var} += 1;',
+                f'    if {self.var} > {end} {{', '        break;', '    }'] + self.view() + indent(self.body) + ['}']
+
+    def set(self, ctx, i):
+        ctx.vars[self.var if self.ctype == 'u64' else self.var + 'w'] = i & M64
 
     def iterate(self, ctx):
         if self.kind == 'for':
             lo, hi = self.lo.ev(ctx), self.hi.ev(ctx)
             for i in range(lo, hi):
-                ctx.vars[self.var] = i
+                self.set(ctx, i)
                 yield
             return
-        ctx.vars[self.var] = 0
+        c = self.base
+        end = self.base + self.limit
+        self.set(ctx, c)
         while True:
-            if self.kind == 'while' and not ctx.vars[self.var] < self.limit:
+            if self.kind == 'while' and not c < end:
                 return
-            ctx.vars[self.var] += 1
-            if self.kind == 'loop' and ctx.vars[self.var] > self.limit:
+            c += 1
+            self.set(ctx, c)
+            if self.kind == 'loop' and c > end:
                 return
             yield
 
@@ -507,12 +529,50 @@ class Gen:
                 return a.ev(ctx)
             return E(f'lb({k}, {a.text})', ev)
         e = self.expr(sc, 1)
-        m = r.choice([2, 3, 4, 5, 7, 16])
-        k = r.randrange(m)
         op = r.choice(['==', '!=', '<', '>='])
         f = {'==': lambda x, y: x == y, '!=': lambda x, y: x != y, '<': lambda x, y: x < y,
              '>=': lambda x, y: x >= y}[op]
+        if d > 0 and x < 0.55:
+            return self.size_cond(e, op, f)
+        m = r.choice([2, 3, 4, 5, 7, 16])
+        k = r.randrange(m)
         return E(f'(({e.text} % {m}) {op} {k})', lambda ctx, e=e, f=f: f(e.ev(ctx) % m, k))
+
+    def size_cond(self, e, op, f):
+        """A comparison of a usize or isize made from the low 32 bits of e
+        (the same value on every target): shifted right (arithmetic for
+        isize), or divided or reduced by a constant (toward zero: the
+        remainder has the sign of the dividend)."""
+        r = self.r
+        signed = r.random() < 0.6
+        if signed:
+            x = f'@as(isize, @bit_cast(i32, @truncate(u32, {e.text})))'
+
+            def val(ctx, e=e):
+                v = e.ev(ctx) & 0xffffffff
+                return v - (1 << 32) if v >> 31 else v
+        else:
+            x = f'@as(usize, @truncate(u32, {e.text}))'
+
+            def val(ctx, e=e):
+                return e.ev(ctx) & 0xffffffff
+        how = r.choice(['>>', '/', '%'])
+        if how == '>>':
+            sh = r.randint(26, 31)
+            text, g = f'({x} >> {sh})', (lambda v, sh=sh: v >> sh)
+            span = 1 << (32 - sh)
+        else:
+            dv = r.choice([3, 7, 1000, 65536, 1 << 30])
+            if how == '/':
+                g = (lambda v, dv=dv: abs(v) // dv * (1 if v >= 0 else -1))
+                span = max(2, (1 << 32) // dv)
+            else:
+                g = (lambda v, dv=dv: abs(v) % dv * (1 if v >= 0 else -1))
+                span = dv
+            text = f'({x} {how} {dv})'
+            span = min(span, 8)
+        k = r.randint(-span + 1, span - 1) if signed else r.randint(0, span - 1)
+        return E(f'({text} {op} {k})', lambda ctx, val=val, g=g, f=f, k=k: f(g(val(ctx)), k))
 
     # -- statements --
 
@@ -730,26 +790,36 @@ class Gen:
         if k in ('for', 'while', 'loop'):
             label = self.fresh('L') if r.random() < 0.5 else None
             var = self.fresh('k' if k == 'for' else 'c')
-            inner = {'vars': sc['vars'] + [var], 'muts': list(sc['muts']), 'loops': sc['loops'] + [label]}
+            ctype = r.choice(['u64', 'u64', 'usize', 'isize'])
+            seen = var if ctype == 'u64' else var + 'w'
+            inner = {'vars': sc['vars'] + [seen], 'muts': list(sc['muts']), 'loops': sc['loops'] + [label]}
             lo = hi = None
             limit = r.randint(0, 5)
+            base = -r.randint(0, 4) if ctype == 'isize' else 0
             if k == 'for':
                 a = self.expr(sc, 1)
                 n = r.randint(1, 5)
-                lo = E(f'({a.text} % 3)', lambda ctx, a=a: a.ev(ctx) % 3)
-                hi = E(f'(({a.text} % 3) + {n})' if r.random() < 0.7 else f'{r.randint(0, 3)}',
-                       None)
-                if hi.text.startswith('(('):
-                    hi.ev = lambda ctx, a=a, n=n: a.ev(ctx) % 3 + n
+                if ctype == 'u64':
+                    lt, m, off = f'({a.text} % 3)', 3, 0
+                elif ctype == 'usize':
+                    lt, m, off = f'@int_cast(usize, {a.text} % 3)', 3, 0
                 else:
-                    c = int(hi.text)
-                    hi.ev = lambda ctx, c=c: c
+                    lt, m, off = f'(@as(isize, @int_cast(i32, {a.text} % 7)) - 3)', 7, 3
+                lo = E(lt, lambda ctx, a=a, m=m, off=off: a.ev(ctx) % m - off)
+                if r.random() < 0.7:
+                    hi = E(f'({lt} + {n})', lambda ctx, a=a, n=n, m=m, off=off: a.ev(ctx) % m - off + n)
+                else:
+                    c = r.randint(-off, 3)
+                    hi = E(f'{c}', lambda ctx, c=c: c)
             body = self.block(inner, fn, depth - 1)
-            return Loop(k, label, var, lo, hi, limit, body)
+            return Loop(k, label, var, lo, hi, limit, body, ctype, base)
         if k == 'match_int':
             e = self.expr(sc, 1)
             m = r.choice([3, 4, 5, 8])
-            pool = list(range(m))
+            # the scrutinee is a u64, a usize or an isize (from -off)
+            ctype = r.choice(['u64', 'u64', 'usize', 'isize'])
+            off = r.randint(1, m) if ctype == 'isize' else 0
+            pool = list(range(-off, m - off))
             r.shuffle(pool)
             arms = []
             while pool and r.random() < 0.8:
@@ -757,7 +827,9 @@ class Gen:
                 pats, pool = pool[:c], pool[c:]
                 arms.append(([str(p) for p in pats], None, self.block(sc, fn, depth - 1)))
             arms.append((None, None, self.block(sc, fn, depth - 1)))
-            return Match(E(f'{e.text} % {m}', lambda ctx, e=e: e.ev(ctx) % m), arms, lambda v: str(v), None)
+            text = {'u64': f'{e.text} % {m}', 'usize': f'@int_cast(usize, {e.text} % {m})',
+                    'isize': f'@as(isize, @int_cast(i32, {e.text} % {m})) - {off}'}[ctype]
+            return Match(E(text, lambda ctx, e=e: e.ev(ctx) % m - off), arms, lambda v: str(v), None)
         if k == 'match_bool':
             c = self.cond(sc)
             if r.random() < 0.5:

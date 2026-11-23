@@ -10,7 +10,9 @@ out of it, or through a pointer changes an output line.
 
 writes cmd/axiom/internal/tests/run/exact_calls_<n>.ax (the same files every
 time: each has its own fixed seed). A program has a pool of random types:
-the integers of every width, f32, f64, bool, enums (with and without a
+the integers of every width (usize and isize with values of 32 bits whose
+helpers never wrap at 32 bits, so that the results are the same on every
+target), f32, f64, bool, enums (with and without a
 representation, negative values), structs (nested, with fields in orders
 that need padding, small and large), a generic struct instantiated at
 several types, arrays, tagged unions (payloads of any type, and none),
@@ -44,6 +46,11 @@ lines hash the globals, which the calls wrote through pointers and slices.
 
 writes more programs (exact_calls_s<seed>.ax, with other seeds) into <dir>,
 for a longer search; copied into tests/run/, the suite runs them.
+
+    gen_exact_calls.py --size64 [--seeds=<first>:<count> <dir>]
+
+writes exact_calls_size64_1.ax (or exact_calls_size64_s<seed>.ax): the same
+with usize and isize of 64-bit values, for the 64-bit targets (native-only).
 """
 import math
 import os
@@ -60,6 +67,7 @@ RUN = os.path.join(HERE, '..', 'run')
 M64 = (1 << 64) - 1
 
 PROGRAMS = [('exact_calls_1.ax', 3101), ('exact_calls_2.ax', 3202), ('exact_calls_3.ax', 3303)]
+SIZE64_PROGRAMS = [('exact_calls_size64_1.ax', 3404)]
 INTS = ['u8', 'i8', 'u16', 'i16', 'u32', 'i32', 'u64', 'i64']
 ERRS = ['Bad', 'Worse', 'Ugly']
 LANEW = {'i8': 8, 'u8': 8, 'i16': 16, 'u16': 16, 'i32': 32, 'u32': 32, 'i64': 64, 'u64': 64, 'f32': 32, 'f64': 64}
@@ -122,6 +130,9 @@ class IntT(Ty):
     def hash(self, h, v):
         return mix(h, v & M64)
 
+    def wrap(self, v):
+        return wrap_t(v, self.ax)
+
     def mk(self, x):
         return wrap_t(x, self.ax)
 
@@ -136,6 +147,59 @@ class IntT(Ty):
         return [f'fn hs_{t}(h: u64, v: {t}) u64 {{', f'    return mix(h, {conv});', '}', '',
                 f'fn mk_{t}(x: u64) {t} {{', f'    return {mk};', '}', '',
                 f'fn st_{t}(v: {t}) {t} {{', f'    return (v ^ {self.D}) +% {self.C};', '}', '']
+
+
+class PtrIntT(IntT):
+    """usize or isize. With 32-bit values (usize: 31 bits) whose helpers
+    never wrap at 32 bits, so that a value is the same on every target;
+    with size64 (programs for the 64-bit targets), as u64 and i64."""
+
+    def __init__(self, name, r, size64):
+        self.id = self.ax = name
+        self.size64 = size64
+        self.signed = name == 'isize'
+        if size64:
+            self.bits = 64
+            self.lo, self.hi = (-(1 << 63), (1 << 63) - 1) if self.signed else (0, M64)
+            lo, hi = self.lo, self.hi
+            self.C = r.choice([1, 3, hi, lo + 1 if self.signed else hi - 2, r.randint(lo, hi)])
+            self.D = r.choice([0, 1, -1 if self.signed else hi, r.randint(lo, hi)])
+            self.edges = edge_values('i64' if self.signed else 'u64')
+            return
+        self.bits = 32
+        self.lo, self.hi = (-(1 << 31), (1 << 31) - 1) if self.signed else (0, (1 << 31) - 1)
+        half = 1 << 30
+        clo = -half if self.signed else 0
+        self.C = r.choice([1, 3, half - 1, clo, r.randint(clo, half - 1)])
+        self.D = r.choice([0, 1, -1 if self.signed else self.hi, r.randint(self.lo, self.hi)])
+        self.edges = edge_values(name)
+
+    def wrap(self, v):
+        assert self.size64, 'a usize or isize of 32-bit values must not wrap'
+        return wrap_t(v, 'i64' if self.signed else 'u64')
+
+    def mk(self, x):
+        if self.size64:
+            return wrap_t(x, 'i64' if self.signed else 'u64')
+        return wrap_t(x, 'i32') if self.signed else (x & 0xffffffff) >> 1
+
+    def st(self, v):
+        if self.size64:
+            return wrap_t((v ^ self.D) + self.C, 'i64' if self.signed else 'u64')
+        return ((v ^ self.D) >> 1) + self.C
+
+    def helpers(self):
+        t = self.ax
+        conv = '@bit_cast(u64, @as(i64, v))' if self.signed else '@as(u64, v)'
+        if self.size64:
+            mk = f'@int_cast({t}, @bit_cast(i64, x))' if self.signed else f'@int_cast({t}, x)'
+            st = f'(v ^ {self.D}) +% {self.C}'
+        else:
+            mk = f'@as({t}, @bit_cast(i32, @truncate(u32, x)))' if self.signed else f'@as({t}, @truncate(u32, x) >> 1)'
+            st = f'((v ^ {self.D}) >> 1) +% {self.C}'
+        return [f'fn hs_{t}(h: u64, v: {t}) u64 {{', f'    return mix(h, {conv});', '}', '',
+                f'fn mk_{t}(x: u64) {t} {{', f'    return {mk};', '}', '',
+                f'fn st_{t}(v: {t}) {t} {{', f'    return {st};', '}', '']
 
 
 class FloatT(Ty):
@@ -205,7 +269,7 @@ class EnumT(Ty):
         self.id = ident
         self.ax = 'E' + ident[1:]
         n = r.randint(1, 6)
-        self.repr = r.choice([None, None, 'u8', 'i8', 'i16', 'u32', 'i64'])
+        self.repr = r.choice([None, None, 'u8', 'i8', 'i16', 'u32', 'i64', 'usize', 'isize'])
         lo, hi = (-100, 100) if self.repr is None or self.repr[0] == 'i' else (0, 200)
         vals, cur, used = [], None, set()
         for i in range(n):
@@ -742,11 +806,13 @@ fn eidx(e: Errs) u64 {
 
 
 class Prog:
-    def __init__(self, seed):
+    def __init__(self, seed, size64=False):
+        self.size64 = size64
         self.r = random.Random(seed)
         self.steps = 0
         r = self.r
         self.ints = {n: IntT(n, r) for n in INTS}
+        self.ints.update({n: PtrIntT(n, r, size64) for n in ('usize', 'isize')})
         self.floats = {n: FloatT(n, r) for n in ('f32', 'f64')}
         self.boolt = BoolT()
         self.scalars = list(self.ints.values()) + list(self.floats.values()) + [self.boolt]
@@ -941,7 +1007,7 @@ class Prog:
                 fam = r.choice([1, 1, 1, 2, 3]) if level < nlev - 1 else 1
                 group = []
                 for _ in range(fam):
-                    f = Fn(f'f{len(self.fns)}', sig, level)
+                    f = Fn(f'fu{len(self.fns)}', sig, level)  # (not f32, f64)
                     f.seed = r.getrandbits(64)
                     self.fns.append(f)
                     group.append(f)
@@ -1333,7 +1399,9 @@ class Prog:
                 env['h'] = t.elem.hash(env['h'], av[env['h'] % 5 % t.n])
             return St([f'let {g} = gget({a.text}, @int_cast(usize, h % 5));', f'h = hs_{t.elem.id}(h, {g});'], run)
         if kind in ('sum', 'max'):
-            ts = list(self.ints.values()) + (list(self.floats.values()) if kind == 'max' else [])
+            # (usize and isize of 32-bit values: a sum could wrap at 32 bits)
+            ts = [t for t in self.ints.values() if kind == 'max' or self.size64 or not isinstance(t, PtrIntT)]
+            ts += list(self.floats.values()) if kind == 'max' else []
             t = r.choice(ts)
             vs = [self.value_of(t, env_vars, r.randrange(1000)) for _ in range(3 if kind == 'sum' else 2)]
             g = self.local('g')
@@ -1343,7 +1411,7 @@ class Prog:
             def run(env, vs=vs, t=t, kind=kind):
                 xs = [v.ev(env) for v in vs]
                 if kind == 'sum':
-                    v = wrap_t(xs[0] + xs[1], t.ax) ^ xs[2]
+                    v = t.wrap(xs[0] + xs[1]) ^ xs[2]
                 elif isinstance(t, FloatT):
                     v = f_minmax(xs[0], xs[1], True)
                 else:
@@ -1466,6 +1534,10 @@ class Prog:
             '// (§5, §7.14, §9 to §11). (Generated by',
             '// cmd/axiom/internal/tests/tools/gen_exact_calls.py, with the expectations',
             '// computed in Python.)',
+        ]
+        if self.size64:
+            out += ['// (usize and isize have 64-bit values here: --size64, for the 64-bit targets.)', '// native-only']
+        out += [
             'import "../lib/io.ax" as io;',
             '',
             'error Errs { ' + ', '.join(ERRS) + ' }',
@@ -1521,13 +1593,19 @@ class Prog:
 
 def main():
     args = sys.argv[1:]
+    size64 = bool(args) and args[0] == '--size64'
+    if size64:
+        args = args[1:]
     if len(args) == 2 and args[0].startswith('--seeds='):
         first, count = (int(x) for x in args[0][len('--seeds='):].split(':'))
         for seed in range(first, first + count):
-            Prog(seed).write(f'exact_calls_s{seed}.ax', args[1])
+            Prog(seed, size64).write(f'exact_calls_{"size64_" if size64 else ""}s{seed}.ax', args[1])
         return
-    for fname, seed in PROGRAMS:
-        Prog(seed).write(fname, RUN)
+    if not size64:
+        for fname, seed in PROGRAMS:
+            Prog(seed).write(fname, RUN)
+    for fname, seed in SIZE64_PROGRAMS:
+        Prog(seed, True).write(fname, RUN)
 
 
 if __name__ == '__main__':
