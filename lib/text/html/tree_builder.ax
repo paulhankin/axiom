@@ -1,0 +1,779 @@
+// =============================================================================
+// lib/text/html/tree_builder.ax - HTML tree builder Parser state, stack and formatting list, part of lib/text/html.
+// =============================================================================
+
+import "../internal/html/tags.ax" as tags;
+import "std/collections/vec" as vec;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Tree builder state, open-element stack and formatting list
+// -----------------------------------------------------------------------------
+
+// Insertion modes
+enum Mode: u8 {
+    INITIAL,
+    BEFORE_HTML,
+    BEFORE_HEAD,
+    IN_HEAD,
+    IN_HEAD_NOSCRIPT,
+    AFTER_HEAD,
+    IN_BODY,
+    TEXT,
+    IN_TABLE,
+    IN_TABLE_TEXT,
+    IN_CAPTION,
+    IN_COLUMN_GROUP,
+    IN_TABLE_BODY,
+    IN_ROW,
+    IN_CELL,
+    IN_TEMPLATE,
+    AFTER_BODY,
+    IN_FRAMESET,
+    AFTER_FRAMESET,
+    AFTER_AFTER_BODY,
+    AFTER_AFTER_FRAMESET,
+}
+
+// Kinds of scope
+enum Scope: u8 {
+    DEFAULT,
+    LIST,
+    BUTTON,
+    TABLE,
+}
+
+const MARKER: u32 = 0xfffffffe;
+
+/// The most formatting elements that stay active (after the last marker);
+/// the spec's limit is three of each kind, which leaves quadratic growth
+/// open to hostile input.
+const MAX_ACTIVE_FORMATTING: usize = 32;
+
+struct Loc {
+    parent: u32,
+    before: u32,
+}
+
+struct Parser {
+    doc: *mut Document,
+    tz: *mut Tokenizer,
+    stack: vec.Vec.[u32],
+    open: [124]u32,  // how many HTML elements of each T_ are on the stack
+    afe: vec.Vec.[u32],
+    tmodes: vec.Vec.[Mode],
+    mode: Mode,
+    orig: Mode,
+    head: u32,
+    form: u32,
+    context: u32,
+    frameset_ok: bool,
+    foster: bool,
+    scripting: bool,
+    skip_lf: bool,
+    text_elem: u32,        // the element "text" mode reads into, if opened
+    pend: strs.String,     // pending table character tokens
+    pend_text: bool,       // ... some are not whitespace
+    sbuf: strs.String,     // scratch for characters
+    abuf: vec.Vec.[Attr],  // scratch for attributes
+
+    fn deinit(self: *mut Parser) void {
+        self.stack.deinit();
+        self.afe.deinit();
+        self.tmodes.deinit();
+        self.pend.deinit();
+        self.sbuf.deinit();
+        self.abuf.deinit();
+    }
+
+    fn nd(self: *Parser, id: u32) *Node {
+        return self.doc.node(id);
+    }
+
+    fn ndm(self: *mut Parser, id: u32) *mut Node {
+        return self.doc.nm(id);
+    }
+
+    fn cur(self: *Parser) u32 {
+        if self.stack.len() == 0 {
+            return NONE;
+        }
+        return self.stack.items()[self.stack.len() - 1];
+    }
+
+    fn adjusted_current(self: *Parser) u32 {
+        if (self.context != NONE) and (self.stack.len() == 1) {
+            return self.context;
+        }
+        return self.cur();
+    }
+
+    // Whether id is an HTML element with tag t.
+    fn is(self: *Parser, id: u32, t: u16) bool {
+        if id == NONE {
+            return false;
+        }
+        let n = self.nd(id);
+        return (n.ns == Namespace.HTML) and (n.tag == t) and (n.kind == Kind.ELEMENT);
+    }
+
+    fn cur_is(self: *Parser, t: u16) bool {
+        return self.is(self.cur(), t);
+    }
+
+    fn special(self: *Parser, id: u32) bool {
+        let n = self.nd(id);
+        if n.ns == Namespace.HTML {
+            return (tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_SPECIAL) != 0;
+        }
+        return scope_foreign(n);
+    }
+
+    fn mathml_text_ip(self: *Parser, id: u32) bool {
+        let n = self.nd(id);
+        return (n.ns == Namespace.MATHML) and
+               ((n.tag == tags.T_MI) or (n.tag == tags.T_MO) or (n.tag == tags.T_MN) or (n.tag == tags.T_MS) or
+                (n.tag == tags.T_MTEXT));
+    }
+
+    fn html_ip(self: *Parser, id: u32) bool {
+        let n = self.nd(id);
+        if n.ns == Namespace.MATHML {
+            return (n.flags & FL_HIP) != 0;
+        }
+        return (n.ns == Namespace.SVG) and
+               ((n.tag == tags.T_FOREIGNOBJECT) or (n.tag == tags.T_DESC) or (n.tag == tags.T_TITLE));
+    }
+
+    fn has_template(self: *Parser) bool {
+        return self.open[@as(usize, tags.T_TEMPLATE)] > 0;
+    }
+
+    fn in_template_contents(self: *Parser) bool {
+        return self.has_template() or self.is(self.context, tags.T_TEMPLATE);
+    }
+
+    // --- the stack of open elements
+
+    fn push(self: *mut Parser, id: u32) HtmlError!bool {
+        if self.stack.len() >= MAX_DEPTH {
+            return false;
+        }
+        self.stack.push(id)!;
+        self.opened_at(id);
+        return true;
+    }
+
+    // Bookkeeping for an element put on the stack, or taken off it.
+    fn opened_at(self: *mut Parser, id: u32) void {
+        let n = self.ndm(id);
+        n.flags |= FL_OPEN;
+        if n.ns == Namespace.HTML {
+            self.open[@as(usize, n.tag)] += 1;
+        }
+    }
+
+    fn closed_at(self: *mut Parser, id: u32) void {
+        let n = self.ndm(id);
+        n.flags &= ~FL_OPEN;
+        if n.ns == Namespace.HTML {
+            self.open[@as(usize, n.tag)] -= 1;
+        }
+    }
+
+    // Pops the current node (never the root element).
+    fn pop(self: *mut Parser) void {
+        if self.stack.len() <= 1 {
+            return;
+        }
+        let id = self.stack.items()[self.stack.len() - 1];
+        self.stack.truncate(self.stack.len() - 1);
+        self.closed_at(id);
+    }
+
+    // Pops up to (not including) index i.
+    fn pop_to(self: *mut Parser, i: usize) void {
+        let k = @max(i, 1);
+        while self.stack.len() > k {
+            self.pop();
+        }
+    }
+
+    fn pop_until(self: *mut Parser, t: u16) void {
+        while self.stack.len() > 1 {
+            let id = self.cur();
+            self.pop();
+            if self.is(id, t) {
+                return;
+            }
+        }
+    }
+
+    fn pop_until_node(self: *mut Parser, id: u32) void {
+        while self.stack.len() > 1 {
+            let c = self.cur();
+            self.pop();
+            if c == id {
+                return;
+            }
+        }
+    }
+
+    fn stack_index(self: *Parser, id: u32) usize {
+        let items = self.stack.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            if items[i] == id {
+                return i;
+            }
+        }
+        return NONE_USIZE;
+    }
+
+    fn stack_remove(self: *mut Parser, id: u32) void {
+        let i = self.stack_index(id);
+        if (i != NONE_USIZE) and (i > 0) {
+            _ = self.stack.remove(i);
+            self.closed_at(id);
+        }
+    }
+
+    fn boundary(self: *Parser, id: u32, sc: Scope) bool {
+        let n = self.nd(id);
+        if sc == Scope.TABLE {
+            return (n.ns == Namespace.HTML) and
+                   ((n.tag == tags.T_HTML) or (n.tag == tags.T_TABLE) or (n.tag == tags.T_TEMPLATE));
+        }
+        if n.ns == Namespace.HTML {
+            if (tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_SCOPE) != 0 {
+                return true;
+            }
+            if sc == Scope.LIST {
+                return (n.tag == tags.T_OL) or (n.tag == tags.T_UL);
+            }
+            if sc == Scope.BUTTON {
+                return n.tag == tags.T_BUTTON;
+            }
+            return false;
+        }
+        return scope_foreign(n);
+    }
+
+    fn in_scope(self: *Parser, t: u16, sc: Scope) bool {
+        if self.open[@as(usize, t)] == 0 {
+            return false;
+        }
+        let items = self.stack.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            if self.is(items[i], t) {
+                return true;
+            }
+            if self.boundary(items[i], sc) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    fn node_in_scope(self: *Parser, id: u32) bool {
+        let items = self.stack.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            if items[i] == id {
+                return true;
+            }
+            if self.boundary(items[i], Scope.DEFAULT) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    fn heading_in_scope(self: *Parser) bool {
+        let items = self.stack.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            let n = self.nd(items[i]);
+            if (n.ns == Namespace.HTML) and (n.tag >= tags.T_H1) and (n.tag <= tags.T_H6) {
+                return true;
+            }
+            if self.boundary(items[i], Scope.DEFAULT) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    fn gen_implied(self: *mut Parser, except: u16) void {
+        loop {
+            let c = self.cur();
+            let n = self.nd(c);
+            if (n.ns != Namespace.HTML) or (n.tag == except) or
+               ((tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_IMPLIED) == 0) {
+                return;
+            }
+            self.pop();
+        }
+    }
+
+    fn gen_thorough(self: *mut Parser) void {
+        loop {
+            let n = self.nd(self.cur());
+            if (n.ns != Namespace.HTML) or ((tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_THOROUGH) == 0) {
+                return;
+            }
+            self.pop();
+        }
+    }
+
+    fn close_p(self: *mut Parser) void {
+        self.gen_implied(tags.T_P);
+        self.pop_until(tags.T_P);
+    }
+
+    fn close_p_in_button_scope(self: *mut Parser) void {
+        if self.in_scope(tags.T_P, Scope.BUTTON) {
+            self.close_p();
+        }
+    }
+
+    // Pops until the current node is one of the tags, or html (or template).
+    fn clear_to(self: *mut Parser, a: u16, b: u16, c: u16) void {
+        loop {
+            let id = self.cur();
+            if self.is(id, a) or self.is(id, b) or self.is(id, c) or self.is(id, tags.T_TEMPLATE) or
+               self.is(id, tags.T_HTML) or (self.stack.len() <= 1) {
+                return;
+            }
+            self.pop();
+        }
+    }
+
+    fn reset_mode(self: *mut Parser) void {
+        let items = self.stack.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            let mut id = items[i];
+            let last = i == 0;
+            if last and (self.context != NONE) {
+                id = self.context;
+            }
+            let n = self.nd(id);
+            if n.ns == Namespace.HTML {
+                let t = n.tag;
+                if ((t == tags.T_TD) or (t == tags.T_TH)) and not last {
+                    self.mode = Mode.IN_CELL;
+                    return;
+                }
+                if t == tags.T_TR {
+                    self.mode = Mode.IN_ROW;
+                    return;
+                }
+                if (t == tags.T_TBODY) or (t == tags.T_THEAD) or (t == tags.T_TFOOT) {
+                    self.mode = Mode.IN_TABLE_BODY;
+                    return;
+                }
+                if t == tags.T_CAPTION {
+                    self.mode = Mode.IN_CAPTION;
+                    return;
+                }
+                if t == tags.T_COLGROUP {
+                    self.mode = Mode.IN_COLUMN_GROUP;
+                    return;
+                }
+                if t == tags.T_TABLE {
+                    self.mode = Mode.IN_TABLE;
+                    return;
+                }
+                if t == tags.T_TEMPLATE {
+                    self.mode = self.tmodes.last() ?? Mode.IN_BODY;
+                    return;
+                }
+                if (t == tags.T_HEAD) and not last {
+                    self.mode = Mode.IN_HEAD;
+                    return;
+                }
+                if t == tags.T_BODY {
+                    self.mode = Mode.IN_BODY;
+                    return;
+                }
+                if t == tags.T_FRAMESET {
+                    self.mode = Mode.IN_FRAMESET;
+                    return;
+                }
+                if t == tags.T_HTML {
+                    if self.head == NONE {
+                        self.mode = Mode.BEFORE_HEAD;
+                    } else {
+                        self.mode = Mode.AFTER_HEAD;
+                    }
+                    return;
+                }
+            }
+            if last {
+                self.mode = Mode.IN_BODY;
+                return;
+            }
+        }
+        self.mode = Mode.IN_BODY;
+    }
+
+    // --- the list of active formatting elements
+
+    fn afe_index(self: *Parser, id: u32) usize {
+        let items = self.afe.items();
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            if items[i] == id {
+                return i;
+            }
+        }
+        return NONE_USIZE;
+    }
+
+    fn afe_remove_at(self: *mut Parser, i: usize) void {
+        let id = self.afe.remove(i);
+        if id != MARKER {
+            self.ndm(id).flags &= ~FL_AFE;
+        }
+    }
+
+    fn afe_remove(self: *mut Parser, id: u32) void {
+        let i = self.afe_index(id);
+        if i != NONE_USIZE {
+            self.afe_remove_at(i);
+        }
+    }
+
+    fn afe_push(self: *mut Parser, id: u32) HtmlError!void {
+        if (self.nd(id).flags & FL_OPEN) == 0 {
+            return;  // (not opened: past MAX_DEPTH)
+        }
+        // Noah's Ark: at most three alike after the last marker
+        let items = self.afe.items();
+        let mut same: usize = 0;
+        let mut earliest = NONE_USIZE;
+        let mut count: usize = 0;
+        let mut first = NONE_USIZE;
+        let mut i = items.len;
+        while i > 0 {
+            i -= 1;
+            let e = items[i];
+            if e == MARKER {
+                break;
+            }
+            count += 1;
+            first = i;
+            if self.alike(e, id) {
+                same += 1;
+                earliest = i;
+            }
+        }
+        if same >= 3 {
+            self.afe_remove_at(earliest);
+        } else if count >= MAX_ACTIVE_FORMATTING {
+            self.afe_remove_at(first);
+        }
+        self.afe.push(id)!;
+        self.ndm(id).flags |= FL_AFE;
+    }
+
+    fn alike(self: *Parser, a: u32, b: u32) bool {
+        let x = self.nd(a);
+        let y = self.nd(b);
+        if (x.tag != y.tag) or (x.ns != y.ns) or not strs.eq(x.name, y.name) or (x.attrs.len != y.attrs.len) {
+            return false;
+        }
+        for p in x.attrs {
+            let mut found = false;
+            for q in y.attrs {
+                if (p.ns == q.ns) and strs.eq(p.name, q.name) and strs.eq(p.value, q.value) {
+                    found = true;
+                    break;
+                }
+            }
+            if not found {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn afe_clear_to_marker(self: *mut Parser) void {
+        while self.afe.len() > 0 {
+            let e = self.afe.items()[self.afe.len() - 1];
+            self.afe_remove_at(self.afe.len() - 1);
+            if e == MARKER {
+                return;
+            }
+        }
+    }
+
+    fn reconstruct(self: *mut Parser) HtmlError!void {
+        let n = self.afe.len();
+        if n == 0 {
+            return;
+        }
+        let items = self.afe.items();
+        let last = items[n - 1];
+        if (last == MARKER) or ((self.nd(last).flags & FL_OPEN) != 0) {
+            return;
+        }
+        let mut i = n - 1;
+        while i > 0 {
+            let e = self.afe.items()[i - 1];
+            if (e == MARKER) or ((self.nd(e).flags & FL_OPEN) != 0) {
+                break;
+            }
+            i -= 1;
+        }
+        while i < self.afe.len() {
+            if self.stack.len() >= MAX_DEPTH {
+                return;
+            }
+            let old = self.afe.items()[i];
+            let e = self.clone_element(old)!;
+            self.insert_node(self.place(NONE), e);
+            _ = self.push(e)!;
+            self.afe.items_mut()[i] = e;
+            self.ndm(old).flags &= ~FL_AFE;
+            self.ndm(e).flags |= FL_AFE;
+            i += 1;
+        }
+    }
+
+    // --- creating and inserting nodes
+
+    fn place(self: *Parser, override: u32) Loc {
+        let mut target = override;
+        if target == NONE {
+            target = self.cur();
+        }
+        let mut before = NONE;
+        if self.foster and
+           (self.is(target, tags.T_TABLE) or self.is(target, tags.T_TBODY) or self.is(target, tags.T_TFOOT) or
+            self.is(target, tags.T_THEAD) or self.is(target, tags.T_TR)) {
+            let items = self.stack.items();
+            let mut i = items.len;
+            let mut found = false;
+            while i > 0 {
+                i -= 1;
+                if self.is(items[i], tags.T_TEMPLATE) or self.is(items[i], tags.T_TABLE) {
+                    found = true;
+                    break;
+                }
+            }
+            if not found {
+                return Loc.{ parent: items[0], before: NONE };
+            }
+            let lt = items[i];
+            if self.is(lt, tags.T_TEMPLATE) {
+                target = lt;
+            } else if self.nd(lt).parent != NONE {
+                return Loc.{ parent: self.nd(lt).parent, before: lt };
+            } else {
+                target = items[i - 1];
+            }
+        }
+        if self.is(target, tags.T_TEMPLATE) and (self.nd(target).contents != NONE) {
+            return Loc.{ parent: self.nd(target).contents, before: NONE };
+        }
+        return Loc.{ parent: target, before: before };
+    }
+
+    fn insert_node(self: *mut Parser, at: Loc, id: u32) void {
+        self.doc.insert_before(at.parent, id, at.before);
+    }
+
+    fn insert_text(self: *mut Parser, data: []u8) HtmlError!void {
+        if data.len == 0 {
+            return;
+        }
+        let at = self.place(NONE);
+        let p = self.nd(at.parent);
+        if p.kind == Kind.DOCUMENT {
+            return;
+        }
+        let mut prev = p.last;
+        if at.before != NONE {
+            prev = self.nd(at.before).prev;
+        }
+        if (prev != NONE) and (self.nd(prev).kind == Kind.TEXT) {
+            self.doc.append_text(prev, data)!;
+            return;
+        }
+        let id = self.doc.new_text(data)!;
+        self.insert_node(at, id);
+    }
+
+    fn insert_comment(self: *mut Parser, t: *Token, at: Loc) HtmlError!void {
+        let id = self.doc.new_node(Kind.COMMENT)!;
+        self.ndm(id).text = self.doc.arena.dup(t.data)!;
+        self.insert_node(at, id);
+    }
+
+    fn create_element(self: *mut Parser, t: *Token, ns: Namespace) HtmlError!u32 {
+        let id = self.doc.new_node(Kind.ELEMENT)!;
+        let mut name = t.name;
+        if (ns == Namespace.HTML) and (t.tag != 0) {
+            name = tags.TAG_NAMES[@as(usize, t.tag) - 1];
+        } else if ns == Namespace.SVG {
+            name = svg_tag_name(t.name);
+        }
+        if name.ptr == t.name.ptr {
+            name = self.doc.arena.dup(name)!;
+        }
+        let attrs = self.copy_attrs(t.attrs, ns)!;
+        let n = self.ndm(id);
+        n.ns = ns;
+        n.tag = t.tag;
+        n.name = name;
+        n.attrs = attrs;
+        if (ns == Namespace.MATHML) and (t.tag == tags.T_ANNOTATION_XML) {
+            for a in attrs {
+                if strs.eq(a.name, "encoding") and
+                   (strs.eq_ignore_case(a.value, "text/html") or
+                    strs.eq_ignore_case(a.value, "application/xhtml+xml")) {
+                    n.flags |= FL_HIP;
+                }
+            }
+        }
+        if (ns == Namespace.HTML) and (t.tag == tags.T_TEMPLATE) {
+            let f = self.doc.new_node(Kind.FRAGMENT)!;
+            self.ndm(f).contents = id;
+            self.ndm(id).contents = f;
+        }
+        return id;
+    }
+
+    // The token's attributes in the arena, adjusted for SVG and MathML.
+    fn copy_attrs(self: *mut Parser, attrs: []Attr, ns: Namespace) HtmlError![]Attr {
+        if attrs.len == 0 {
+            return [];
+        }
+        let mut total: usize = 0;
+        for a in attrs {
+            total += a.name.len + a.value.len;
+        }
+        let buf = self.doc.arena.bytes(total)!;
+        let mut at: usize = 0;
+        self.abuf.clear();
+        for a in attrs {
+            @mem_copy(buf[at..at + a.name.len], a.name);
+            let nm = buf[at..at + a.name.len];
+            at += a.name.len;
+            @mem_copy(buf[at..at + a.value.len], a.value);
+            let v = buf[at..at + a.value.len];
+            at += a.value.len;
+            let mut b = Attr.{ ns: AttrNamespace.NONE, prefix: "", name: nm, value: v };
+            if ns == Namespace.MATHML {
+                if strs.eq(nm, "definitionurl") {
+                    b.name = "definitionURL";
+                }
+                foreign_attr(&mut b);
+            } else if ns == Namespace.SVG {
+                b.name = svg_attr_name(nm);
+                foreign_attr(&mut b);
+            }
+            self.abuf.push(b)!;
+        }
+        return self.doc.arena.copy.[Attr](self.abuf.items());
+    }
+
+    fn clone_element(self: *mut Parser, id: u32) HtmlError!u32 {
+        let e = self.doc.new_node(Kind.ELEMENT)!;
+        let o = self.nd(id);
+        let n = self.ndm(e);
+        n.ns = o.ns;
+        n.tag = o.tag;
+        n.name = o.name;
+        n.attrs = o.attrs;
+        n.flags = o.flags & FL_HIP;
+        return e;
+    }
+
+    // Inserts an element for the token and opens it (unless the stack is
+    // full).
+    fn insert(self: *mut Parser, t: *Token, ns: Namespace) HtmlError!u32 {
+        let at = self.place(NONE);
+        let id = self.create_element(t, ns)!;
+        self.insert_node(at, id);
+        _ = self.push(id)!;
+        return id;
+    }
+
+    // Inserts an element that is closed at once.
+    fn insert_void(self: *mut Parser, t: *Token) HtmlError!u32 {
+        let at = self.place(NONE);
+        let id = self.create_element(t, Namespace.HTML)!;
+        self.insert_node(at, id);
+        return id;
+    }
+
+    fn insert_fake(self: *mut Parser, tag: u16) HtmlError!u32 {
+        let mut t = fake_token(tag);
+        return self.insert(&mut t, Namespace.HTML);
+    }
+
+    fn opened(self: *Parser, id: u32) bool {
+        return (self.nd(id).flags & FL_OPEN) != 0;
+    }
+
+    fn raw_text(self: *mut Parser, t: *Token, state: State) HtmlError!void {
+        let id = self.insert(t, Namespace.HTML)!;
+        self.tz.state = state;
+        self.orig = self.mode;
+        self.mode = Mode.TEXT;
+        self.text_elem = NONE;
+        if self.opened(id) {
+            self.text_elem = id;
+        }
+    }
+
+    fn add_missing_attrs(self: *mut Parser, id: u32, t: *Token) HtmlError!void {
+        let n = self.nd(id);
+        let mut all = vec.Vec.[Attr].init();
+        defer all.deinit();
+        all.extend(n.attrs)!;
+        let extra = self.copy_attrs(t.attrs, Namespace.HTML)!;
+        for a in extra {
+            let mut have = false;
+            for b in n.attrs {
+                if strs.eq(a.name, b.name) and (b.ns == AttrNamespace.NONE) {
+                    have = true;
+                }
+            }
+            if not have {
+                all.push(a)!;
+            }
+        }
+        if all.len() != n.attrs.len {
+            self.ndm(id).attrs = self.doc.arena.copy.[Attr](all.items())!;
+        }
+    }
+}
+
+fn fake_token(tag: u16) Token {
+    return Token.{ kind: TokenKind.START, name: tags.TAG_NAMES[@as(usize, tag) - 1], tag: tag, attrs: [],
+                   self_closing: false, data: "", public_id: "", system_id: "", has_name: false, has_public: false,
+                   has_system: false, force_quirks: false };
+}
+
+fn leading_ws(s: []u8) usize {
+    let mut k: usize = 0;
+    while (k < s.len) and is_ws(s[k]) {
+        k += 1;
+    }
+    return k;
+}
+
+fn all_ws(s: []u8) bool {
+    return leading_ws(s) == s.len;
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/c/lib/text/__axc_wctab.c, the two-stage tables of the C
+"""Generates lib/c/lib/text/__axc_wctab.c, the two-stage tables of the C
 library's wide character classes and simple case mappings in a UTF-8 locale
 (docs/c-text.md, "Wide character classes"), from the standard library's
 Unicode data (std/unicode/tables.ax, which gen_unicode.py writes from the
@@ -7,7 +7,7 @@ Unicode Character Database).
 
     python3 cmd/internal/tools/gen_c_wctype.py
 
-A code point's classes are those std/c/rt/text.ax computes from its
+A code point's classes are those lib/c/rt/text.ax computes from its
 property record (general category, White_Space, Alphabetic, Uppercase,
 Lowercase), with digit and xdigit for the ASCII ones only. The tables:
 
@@ -24,7 +24,7 @@ import re
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
 SRC = os.path.join(ROOT, 'std', 'unicode', 'tables.ax')
-OUT = os.path.join(ROOT, 'std', 'c', 'lib', 'text', '__axc_wctab.c')
+OUT = os.path.join(ROOT, 'lib', 'c', 'lib', 'text', '__axc_wctab.c')
 N = 0x110000
 BLOCK = 128
 
@@ -47,7 +47,7 @@ RECORDS, LOW = array('RECORDS'), array('LOW')
 RUN_START, RUN_RECORD = array('RUN_START'), array('RUN_RECORD')
 LOW_LIMIT = const('LOW_LIMIT')
 
-# axc/text.h's class bits (as std/c/rt/text.ax has them)
+# axc/text.h's class bits (as lib/c/rt/text.ax has them)
 ALNUM, ALPHA, BLANK, CNTRL, DIGIT, GRAPH = 0x001, 0x002, 0x004, 0x008, 0x010, 0x020
 LOWER, PRINT, PUNCT, SPACE, UPPER, XDIGIT = 0x040, 0x080, 0x100, 0x200, 0x400, 0x800
 

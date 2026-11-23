@@ -204,8 +204,9 @@ fn dir_of(p: []u8) []u8 {
     return u.dup(p[0..@int_cast(usize, k)]);
 }
 
-// Where directory `dir` is within the standard library: "" for std itself,
-// "graphics/shape" for a subdirectory, or no string when it is outside.
+// Where directory `dir` is within the standard library (or the libraries,
+// given lib/ as std_dir): "" for std itself, "graphics/shape" for a
+// subdirectory, or no string when it is outside.
 fn std_subdir(dir: []u8, std_dir: []u8) []u8 {
     let ra = u.real_path(dir);
     let rb = u.real_path(std_dir);
@@ -270,14 +271,14 @@ fn removable(path: []u8, file_dir: []u8, std_dir: []u8) bool {
     if u.starts(path, "pkg:") {
         return false;  // it names a dependency, used or not
     }
-    if u.starts(path, "std/") {
+    if u.starts(path, "std/") or u.starts(path, "lib/") {
         return true;
     }
     let mut p = u.cat3(file_dir, "/", path);
     if not u.ends(p, ".ax") {
         p = u.cat2(p, ".ax");
     }
-    if not u.isnos(std_subdir(dir_of(p), std_dir)) {
+    if not u.isnos(std_subdir(dir_of(p), std_dir)) or not u.isnos(std_subdir(dir_of(p), u.lib_dir_of(std_dir))) {
         return true;
     }
     let text = u.read_file(p);
@@ -429,9 +430,11 @@ fn imports_to_keep(els: []El, imps: *u.List.[Imp], file_dir: []u8, std_dir: []u8
 }
 
 // The imports to add: standard library modules used as 'name.ident' (and
-// never otherwise). sub: the file's directory under std_dir, or nil.
-fn missing_imports(els: []El, imps: *u.List.[Imp], path: []u8, std_dir: []u8, sub: []u8) u.List.[Imp] {
+// never otherwise), and outside std/ the libraries' (lib/, spec §4.1). sub:
+// the file's directory under std_dir, or nil; lsub: under lib/, or nil.
+fn missing_imports(els: []El, imps: *u.List.[Imp], path: []u8, std_dir: []u8, sub: []u8, lsub: []u8) u.List.[Imp] {
     let in_std = not u.isnos(sub);
+    let in_lib = not u.isnos(lsub);
     let mut adds = imp_list();
     let mut state = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     let mut names = str_list();
@@ -469,16 +472,26 @@ fn missing_imports(els: []El, imps: *u.List.[Imp], path: []u8, std_dir: []u8, su
                 known = true;
             }
         }
-        if known or (in_std and u.str_eq(u.cat2(name, ".ax"), u.basename(path))) {
+        if known or ((in_std or in_lib) and u.str_eq(u.cat2(name, ".ax"), u.basename(path))) {
             continue;
         }
         let module = std_module(name, std_dir);
-        if u.isnos(module) {
-            continue;
-        }
         let mut ip = u.cat2("std/", module);
-        if in_std {
+        if in_std and not u.isnos(module) {
             ip = u.cat2(rel_to(module, sub), ".ax");
+        } else if u.isnos(module) {
+            // the libraries' modules: not for the standard library's own
+            if in_std {
+                continue;
+            }
+            let lm = std_module(name, u.lib_dir_of(std_dir));
+            if u.isnos(lm) {
+                continue;
+            }
+            ip = u.cat2("lib/", lm);
+            if in_lib {
+                ip = u.cat2(rel_to(lm, lsub), ".ax");
+            }
         }
         adds.push(Imp.{ a: NONE, b: NONE, path: ip, alias: name, run: NONE, is_part: false });
     }
@@ -498,9 +511,10 @@ fn push_import(out: *mut u.List.[El], path: []u8, alias: []u8, nl: i32) void {
 fn fix_imports(els: []El, path: []u8, std_dir: []u8) u.List.[El] {
     let file_dir = dir_of(path);
     let sub = std_subdir(file_dir, std_dir);
+    let lsub = std_subdir(file_dir, u.lib_dir_of(std_dir));
     let imps = find_imports(els);
     let keep = imports_to_keep(els, &imps, file_dir, std_dir);
-    let adds = missing_imports(els, &imps, path, std_dir, sub);
+    let adds = missing_imports(els, &imps, path, std_dir, sub, lsub);
     let mut out = el_list();
     let first_run = first_run_of(&imps);
     // runs, sorted

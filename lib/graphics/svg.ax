@@ -1,0 +1,585 @@
+// =============================================================================
+// lib/graphics/svg.ax - SVG 1.1: writing documents from draw.Paths and paints, and
+// reading static documents into a scene that renders onto a draw.Canvas, an
+// image or a pdf.Page.
+//
+//     let mut w = svg.Writer.begin(out, 200.0, 100.0)!;     // out: an io.Writer
+//     defer w.deinit();
+//     w.fill(&path, draw.Paint.solid(red), draw.FillRule.NONZERO)!;
+//     w.stroke(&path, draw.Paint.linear(0.0, 0.0, 200.0, 0.0, stops[..]), draw.Stroke.width(3.0))!;
+//     w.finish()!;
+//
+//     let mut doc = svg.parse(text)!;                        // reading
+//     defer doc.deinit();
+//     let mut img = svg.render_image(&doc, 512, 512)!;      // RGBA, transparent background
+//     svg.render(&doc, &mut canvas, x, y, w, h)!;            // into a rectangle of a canvas
+//     svg.render_page(&doc, &mut page, x, y, w, h)!;         // onto a PDF page
+//
+// Writing (Writer): paths as path data, fills (nonzero, even-odd) and strokes
+// (width, caps, joins, miter limit, dashes) in solid colours with opacity and
+// linear and radial gradients (with their spread and transform), groups with
+// a transform, an opacity or a clip path, text as plain <text>, and images
+// embedded as PNG data URIs (gradient stops are written as given: viewers
+// interpolate them as sRGB values, lib/graphics/draw in linear light).
+// path_data and parse_path_data convert between draw.Paths and path data.
+//
+// Reading (parse): the XML (lib/encoding/xml: no external entities) becomes a
+// list of drawing items. Supported: path data (every command; arcs become
+// cubics), rect (with rx/ry), circle, ellipse, line, polyline, polygon, g,
+// svg (nested viewports, clipped), use (of shapes, groups, symbols and svg
+// elements), defs, symbol, switch (its first child), a; transforms;
+// presentation attributes, the style attribute and <style> sheets (type,
+// class, id and universal selectors, compounds, descendant and child
+// combinators, by specificity; !important); fill, stroke, opacity,
+// fill-opacity, stroke-opacity, fill-rule, clip-rule, stroke-width,
+// stroke-linecap, stroke-linejoin, stroke-miterlimit, stroke-dasharray,
+// stroke-dashoffset, color/currentColor, display, visibility; linear and
+// radial gradients with gradientUnits, gradientTransform, spreadMethod,
+// focal points (fx, fy) and href inheritance; clip-path (its shapes unioned under the first one's
+// clip-rule; clipPathUnits); mask (luminance masks with maskUnits,
+// maskContentUnits and the mask region); viewBox and preserveAspectRatio
+// (on svg, symbol and image); images that are PNG or JPEG data URIs;
+// lengths in every unit (96 pixels an inch) and percentages. Text: <text>
+// and <tspan> with x, y, dx, dy (the first value of a list), font-size and
+// text-anchor (per run), drawn as outlines when RenderOptions gives a font
+// (one font for all text; font-family and font-weight are ignored), and
+// skipped otherwise. Not supported: SVG 2's focal radius (fr), patterns,
+// markers, filters, external references, textPath,
+// and animation.
+//
+// Rendering onto a canvas follows SVG renderers: the document is drawn into
+// an offscreen image where colours blend and gradients interpolate as sRGB
+// values (with colour and opacity interpolated separately), group opacity
+// and masks use offscreen layers, and the result is composited onto the
+// canvas (lib/graphics/draw composites in linear light). On a PDF page,
+// group opacity multiplies the opacity of the solid colours inside it,
+// gradients are opaque and masks are ignored. Corrupt input gives an
+// error or is skipped as SVG renderers do (a path is drawn up to an error
+// in its data); it never traps. Use elements that multiply past MAX_ITEMS
+// items, or past the work and data limits (WORK_PER_BYTE, DATA_PER_BYTE),
+// fail with TooComplex. A layer covers only what its group draws, and the
+// layers live at once are limited (past it, a group's opacity applies to
+// what it draws and its mask is ignored, as on a PDF page).
+//
+// Sources: Scalable Vector Graphics (SVG) 1.1 (Second Edition), W3C 2011;
+// checked against skia's SVG renderer (lib/graphics/svg/testdata, from
+// cmd/axiom/internal/tests/tools/gen_svg_tests.py: within 2 of 255 away from edges), hand-made
+// documents for what skia does not render, and analytic arc points.
+// =============================================================================
+
+import "../encoding/xml.ax" as xml;
+import "color.ax" as color;
+import "draw.ax" as draw;
+import "font.ax" as font;
+import "image.ax" as image;
+import "pdf.ax" as pdf;
+import "std/collections/arena" as arena;
+import "std/collections/vec" as vec;
+import "std/io" as io;
+import "std/str" as strs;
+import "svg/path.ax" as pathdata;
+
+import part "svg/elements.ax";
+import part "svg/paint.ax";
+import part "svg/parse.ax";
+import part "svg/render.ax";
+import part "svg/tests.ax";
+import part "svg/tests_slow.ax";
+import part "svg/walk.ax";
+import part "svg/writer.ax";
+
+pub error SvgError { SyntaxError, Unsupported, TooComplex, OutOfMemory, NotFound, InvalidBase64, Corrupt, BadFormat,
+                     InvalidPathData, Empty, InvalidPath, TooDeep, InvalidColor, IoError, Done, NoSpaceLeft,
+                     ChecksumMismatch, InvalidNumber, PermissionDenied, Finished, TooLarge, InvalidTransform,
+                     InvalidUtf8, Truncated, Overflow, Exists, EndOfStream, BadNesting, InvalidSelector, NotADirectory,
+                     InvalidFeature, IsDirectory, NotEmpty, BadPattern, InvalidArgument, Failed }
+
+/// The SVG namespace.
+pub let SVG_NS: []u8 = "http://www.w3.org/2000/svg";
+/// The XLink namespace (of xlink:href).
+pub let XLINK_NS: []u8 = "http://www.w3.org/1999/xlink";
+
+/// The most drawing items a document may make (use elements can multiply
+/// them): beyond it, parse fails with TooComplex.
+pub const MAX_ITEMS: usize = 100000;
+
+/// Parsing's work (elements walked and styled, rules and compounds tested,
+/// declarations applied, 16 bytes of attribute values read, items scanned
+/// for a box) is limited to WORK_PER_BYTE times the text's size plus
+/// MIN_WORK steps, and the data a document keeps (paths, gradient stops,
+/// dashes and text, in bytes) to DATA_PER_BYTE times the text's size plus
+/// MIN_DATA, so use elements cannot multiply either without limit: past
+/// them, parse fails with TooComplex. Path data and points are parsed once
+/// per element, and a clip path or a gradient's stops that come out the
+/// same for another use are shared.
+pub const WORK_PER_BYTE: usize = 16;
+pub const MIN_WORK: usize = 1 << 21;
+pub const DATA_PER_BYTE: usize = 32;
+pub const MIN_DATA: usize = 1 << 26;
+
+/// The most pixels a document's images may have together (each image
+/// element is decoded once, however often it is used); images past it are
+/// skipped.
+pub const MAX_IMAGE_PIXELS: usize = 1 << 25;
+
+// -----------------------------------------------------------------------------
+// Path data
+// -----------------------------------------------------------------------------
+
+/// Writes a path as SVG path data (absolute commands).
+pub fn write_path_data(w: io.Writer, p: *draw.Path) !void {
+    return pathdata.write(w, p);
+}
+
+/// A path as SVG path data (free it with mem.free).
+pub fn path_data(p: *draw.Path) { OutOfMemory }![]mut u8 {
+    let mut s = strs.String.init();
+    pathdata.write(s.writer(), p) catch {
+        s.deinit();
+        return error.OutOfMemory;
+    };
+    return s.take();
+}
+
+/// Appends the subpaths of SVG path data to p (arcs as cubic Béziers). On
+/// malformed data, p keeps what came before the error, which is returned.
+pub fn parse_path_data(d: []u8, p: *mut draw.Path) SvgError!void {
+    return pathdata.parse(d, p);
+}
+
+// -----------------------------------------------------------------------------
+// The scene
+// -----------------------------------------------------------------------------
+
+/// How a viewBox fits a viewport (preserveAspectRatio): aligned at the
+/// minimum, middle or maximum of each axis (0, 1, 2), and scaled uniformly to
+/// fit inside it (meet) or cover it (slice), or stretched (none).
+pub struct Fit {
+    align_x: u8,
+    align_y: u8,
+    none: bool,
+    slice: bool,
+
+    /// xMidYMid meet.
+    pub fn default() Fit {
+        return Fit.{ align_x: 1, align_y: 1, none: false, slice: false };
+    }
+}
+
+/// The transform that maps the box vb (x, y, width, height) into a viewport
+/// w by h at the origin, as fit says. A box without area maps nothing (to
+/// a zero scale).
+pub fn viewbox_transform(vb: [4]f64, fit: Fit, w: f64, h: f64) draw.Affine {
+    if not (vb[2] > 0.0) or not (vb[3] > 0.0) {
+        return draw.Affine.scaling(0.0, 0.0);
+    }
+    let mut sx = w / vb[2];
+    let mut sy = h / vb[3];
+    if not fit.none {
+        let mut s = @min(sx, sy);
+        if fit.slice {
+            s = @max(sx, sy);
+        }
+        sx = s;
+        sy = s;
+    }
+    let mut tx: f64 = 0.0;
+    let mut ty: f64 = 0.0;
+    if not fit.none {
+        tx = (w - (vb[2] * sx)) * (@float_from_int(f64, fit.align_x) / 2.0);
+        ty = (h - (vb[3] * sy)) * (@float_from_int(f64, fit.align_y) / 2.0);
+    }
+    return draw.Affine.translation(-vb[0], -vb[1]).then(draw.Affine.scaling(sx, sy)).then(
+        draw.Affine.translation(tx, ty));
+}
+
+/// What a drawing item does.
+pub enum ItemKind: u8 {
+    SHAPE,        // fill and stroke a path
+    TEXT,         // a run of text
+    IMAGE,        // an image
+    BEGIN_GROUP,  // until the matching END_GROUP: clipped, masked and with an opacity
+    BEGIN_MASK,   // what follows (to the group's END_GROUP) is the group's mask
+    END_GROUP,
+}
+
+/// One step of drawing a document. Coordinates are user units of the root
+/// element's viewBox (or of its viewport, without one).
+pub struct Item {
+    kind: ItemKind,
+    transform: draw.Affine,  // the item's user space to the document's
+    path: usize,             // SHAPE: its path; BEGIN_GROUP: the clip (NO_PATH: none), in the document's space
+    fill: draw.Paint,
+    has_fill: bool,
+    fill_rule: draw.FillRule,  // (BEGIN_GROUP: the clip's rule)
+    stroke: draw.Paint,
+    has_stroke: bool,
+    style: draw.Stroke,
+    opacity: f32,  // BEGIN_GROUP
+    masked: bool,  // BEGIN_GROUP: a BEGIN_MASK follows its content
+    text: []u8,    // TEXT: the characters, white space collapsed
+    x: f64,        // TEXT: the position, if set (has_x, has_y), else after the run before; IMAGE: its box
+    y: f64,
+    dx: f64,  // TEXT: shifts
+    dy: f64,
+    has_x: bool,
+    has_y: bool,
+    size: f64,     // TEXT: font size
+    anchor: u8,    // TEXT: 0 start, 1 middle, 2 end
+    image: usize,  // IMAGE: index in Document.images
+    width: f64,    // IMAGE
+    height: f64,
+}
+
+/// Item.path when there is none.
+pub const NO_PATH: usize = 0xffffffff;
+
+fn blank_item(kind: ItemKind, t: draw.Affine) Item {
+    return Item.{
+        kind: kind,
+        transform: t,
+        path: NO_PATH,
+        fill: draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)),
+        has_fill: false,
+        fill_rule: draw.FillRule.NONZERO,
+        stroke: draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)),
+        has_stroke: false,
+        style: draw.Stroke.width(1.0),
+        opacity: 1.0,
+        masked: false,
+        text: "",
+        x: 0.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        has_x: false,
+        has_y: false,
+        size: 16.0,
+        anchor: 0,
+        image: 0,
+        width: 0.0,
+        height: 0.0,
+    };
+}
+
+/// A parsed SVG document: its size and drawing items.
+pub nocopy struct Document {
+    width: f64,  // the intrinsic size, in CSS pixels
+    height: f64,
+    view_box: [4]f64,  // x, y, width, height (the viewport's, if the root has none)
+    fit: Fit,
+    items: vec.Vec.[Item],
+    paths: vec.Vec.[draw.Path],
+    images: vec.Vec.[image.Image],
+    arena: arena.Arena,  // stops, dashes, text
+
+    pub fn deinit(self: *mut Document) void {
+        for i in @as(usize, 0)..self.paths.len() {
+            self.paths.get_ptr(i).deinit();
+        }
+        self.paths.deinit();
+        for i in @as(usize, 0)..self.images.len() {
+            self.images.get_ptr(i).deinit();
+        }
+        self.images.deinit();
+        self.items.deinit();
+        self.arena.deinit();
+    }
+
+    fn add_path(self: *mut Document, p: *mut draw.Path) SvgError!usize {
+        self.paths.push(draw.Path.init()) catch |e| {
+            p.deinit();
+            return e;
+        };
+        let idx = self.paths.len() - 1;
+        @swap(self.paths.get_ptr(idx), p);
+        return idx;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parsing and rendering entry points
+// -----------------------------------------------------------------------------
+
+/// Parses an SVG document.
+pub fn parse(text: []u8) SvgError!Document {
+    let mut x = xml.parse(text) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return error.SyntaxError;
+    };
+    defer x.deinit();
+    let root = x.root;
+    if not is_svg(root) or not strs.eq(root.local, "svg") {
+        return error.SyntaxError;
+    }
+    let mut doc = Document.{
+        width: 0.0,
+        height: 0.0,
+        view_box: [0.0; 4],
+        fit: Fit.default(),
+        items: vec.Vec.[Item].init(),
+        paths: vec.Vec.[draw.Path].init(),
+        images: vec.Vec.[image.Image].init(),
+        arena: arena.Arena.init(),
+    };
+    let mut b = Builder.init(&mut doc, text.len);
+    defer b.deinit();
+    build(&mut b, root) catch |e| {
+        doc.deinit();
+        return e;
+    };
+    return doc;
+}
+
+/// What rendering needs besides the document: a font for text (none: text
+/// is not drawn).
+pub struct RenderOptions {
+    font: *font.Font,
+    has_font: bool,
+
+    /// No font: text is not drawn.
+    pub fn init() RenderOptions {
+        return RenderOptions.{ font: @ptr_from_int(*font.Font, 8), has_font: false };
+    }
+
+    /// Text drawn in f.
+    pub fn with_font(f: *font.Font) RenderOptions {
+        return RenderOptions.{ font: f, has_font: true };
+    }
+}
+
+/// Renders the document into the rectangle (x, y, w, h) of a canvas (in its
+/// current user space): the root's viewBox fits it as its
+/// preserveAspectRatio says. Text is not drawn (see render_with).
+pub fn render(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64, h: f64) SvgError!void {
+    return render_with(doc, cv, x, y, w, h, RenderOptions.init());
+}
+
+/// render, with options (a font for text). The document is drawn into an
+/// offscreen image as SVG says (blending sRGB values), which is then
+/// composited onto the canvas (with its clip, operator and alpha).
+pub fn render_with(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64, h: f64,
+                   opts: RenderOptions) SvgError!void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    // the pixels the rectangle covers
+    let outer = cv.transform;
+    let mut box = pathdata.Box.empty();
+    let xs: [2]f64 = [x, x + w];
+    let ys: [2]f64 = [y, y + h];
+    for xv in xs {
+        for yv in ys {
+            let q = outer.apply(xv, yv);
+            box.add(q.x, q.y);
+        }
+    }
+    let cw = @float_from_int(f64, cv.img.width);
+    let ch = @float_from_int(f64, cv.img.height);
+    let x0 = @floor(@min(@max(box.x0, 0.0), cw));
+    let y0 = @floor(@min(@max(box.y0, 0.0), ch));
+    let x1 = @ceil(@min(@max(box.x1, 0.0), cw));
+    let y1 = @ceil(@min(@max(box.y1, 0.0), ch));
+    if not (x1 > x0) or not (y1 > y0) {
+        return;
+    }
+    let ww = @int_from_float(usize, x1 - x0);
+    let wh = @int_from_float(usize, y1 - y0);
+    let shift = draw.Affine.translation(-x0, -y0);
+    let local = viewbox_transform(doc.view_box, doc.fit, w, h).then(draw.Affine.translation(x, y));
+    let work = new_layer(Rect.{ x0: 0, y0: 0, x1: ww, y1: wh }, cv)!;
+    let mut pt = Painter.init(doc, work, local.then(outer).then(shift), opts, LIVE_LAYERS * (ww * wh));
+    let r = paint_document(&mut pt, x, y, w, h, outer.then(shift));
+    pt.deinit();
+    r catch |e| {
+        free_layer(work);
+        return e;
+    };
+    // back to linear light, onto the canvas
+    let d = work.img.samples32_mut();
+    let mut i: usize = 0;
+    while (i + 3) < d.len {
+        d[i] = color.srgb_decode(@min(@max(d[i], 0.0), 1.0));
+        d[i + 1] = color.srgb_decode(@min(@max(d[i + 1], 0.0), 1.0));
+        d[i + 2] = color.srgb_decode(@min(@max(d[i + 2], 0.0), 1.0));
+        i += 4;
+    }
+    let saved = cv.transform;
+    cv.transform = draw.Affine.identity();
+    let r2 = cv.draw_image(work.img, x0, y0, x1 - x0, y1 - y0);
+    cv.transform = saved;
+    free_layer(work);
+    r2!;
+}
+
+/// Renders the document as a w by h RGBA image (8 bits, transparent
+/// background), its viewBox fitted as preserveAspectRatio says.
+pub fn render_image(doc: *Document, w: usize, h: usize) SvgError!image.Image {
+    return render_image_with(doc, w, h, RenderOptions.init());
+}
+
+/// render_image, with options (a font for text).
+pub fn render_image_with(doc: *Document, w: usize, h: usize, opts: RenderOptions) SvgError!image.Image {
+    let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+    img.fill(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    let mut cv = draw.Canvas.init(&mut img);
+    let r = render_with(doc, &mut cv, 0.0, 0.0, @float_from_int(f64, w), @float_from_int(f64, h), opts);
+    cv.deinit();
+    r catch |e| {
+        img.deinit();
+        return e;
+    };
+    return img;
+}
+
+/// A paint at an opacity (solid colours only: PDF gradients are opaque).
+fn faded(p: draw.Paint, a: f32) draw.Paint {
+    if (p.kind == draw.PaintKind.SOLID) and (a < 1.0) {
+        let mut q = p;
+        q.color = p.color.with_alpha(p.color.a * a);
+        return q;
+    }
+    return p;
+}
+
+fn to_pdf_error(e: error) pdf.PdfError {
+    match e {
+        error.Finished         => { return error.Finished; }
+        error.OutOfMemory      => { return error.OutOfMemory; }
+        error.NotFound         => { return error.NotFound; }
+        error.Empty            => { return error.Empty; }
+        error.Unsupported      => { return error.Unsupported; }
+        error.Done             => { return error.Done; }
+        error.InvalidPath      => { return error.InvalidPath; }
+        error.IoError          => { return error.IoError; }
+        error.ChecksumMismatch => { return error.ChecksumMismatch; }
+        error.InvalidUtf8      => { return error.InvalidUtf8; }
+        error.TooLarge         => { return error.TooLarge; }
+        error.InvalidFeature   => { return error.InvalidFeature; }
+        error.EndOfStream      => { return error.EndOfStream; }
+        error.Truncated        => { return error.Truncated; }
+        error.NoSpaceLeft      => { return error.NoSpaceLeft; }
+        error.PermissionDenied => { return error.PermissionDenied; }
+        error.IsDirectory      => { return error.IsDirectory; }
+        else                   => { return error.Corrupt; }
+    }
+}
+
+/// Renders the document onto a PDF page in the rectangle (x, y, w, h) (in
+/// the page's current user space). Group opacity multiplies the opacity of
+/// the solid colours inside it, and masks are ignored (what they mask is
+/// drawn whole); text is not drawn (see render_page_with).
+pub fn render_page(doc: *Document, page: *mut pdf.Page, x: f64, y: f64, w: f64, h: f64) pdf.PdfError!void {
+    return render_page_with(doc, page, x, y, w, h, RenderOptions.init());
+}
+
+/// render_page, with options (a font for text, drawn as outlines).
+pub fn render_page_with(doc: *Document, page: *mut pdf.Page, x: f64, y: f64, w: f64, h: f64,
+                        opts: RenderOptions) pdf.PdfError!void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    let base = viewbox_transform(doc.view_box, doc.fit, w, h).then(draw.Affine.translation(x, y));
+    if @abs(base.determinant()) < 1.0e-12 {
+        return;
+    }
+    let inv = base.invert();
+    page.save()!;
+    if doc.fit.slice {
+        let mut rp = rect_path(x, y, w, h)!;
+        defer rp.deinit();
+        page.clip(&rp, draw.FillRule.NONZERO)!;
+    }
+    let mut alphas = vec.Vec.[f32].init();
+    defer alphas.deinit();
+    let mut alpha: f32 = 1.0;
+    let mut pen = Pen.{ x: 0.0, y: 0.0 };
+    let mut tp = draw.Path.init();
+    defer tp.deinit();
+    let mut depth: usize = 0;
+    let mut skipping = false;  // a mask's content: not drawn
+    let mut skip_depth: usize = 0;
+    for i in @as(usize, 0)..doc.items.len() {
+        let it = &doc.items.items()[i];
+        if skipping {
+            if it.kind == ItemKind.BEGIN_GROUP {
+                skip_depth += 1;
+                continue;
+            }
+            if it.kind != ItemKind.END_GROUP {
+                continue;
+            }
+            if skip_depth > 0 {
+                skip_depth -= 1;
+                continue;
+            }
+            skipping = false;  // this END_GROUP ends the masked group
+        }
+        match it.kind {
+            .BEGIN_MASK => {
+                skipping = true;
+                skip_depth = 0;
+            }
+            .BEGIN_GROUP => {
+                page.save()!;
+                depth += 1;
+                if it.path != NO_PATH {
+                    page.concat(base)!;
+                    page.clip(&doc.paths.items()[it.path], it.fill_rule)!;
+                    page.concat(inv)!;
+                }
+                alphas.push(alpha)!;
+                alpha = alpha * it.opacity;
+            }
+            .END_GROUP => {
+                if depth > 0 {
+                    page.restore()!;
+                    depth -= 1;
+                }
+                alpha = alphas.pop() ?? 1.0;
+            }
+            .SHAPE => {
+                page.save()!;
+                page.concat(it.transform.then(base))!;
+                let p = &doc.paths.items()[it.path];
+                if it.has_fill {
+                    page.fill(p, faded(it.fill, alpha), it.fill_rule)!;
+                }
+                if it.has_stroke {
+                    page.stroke(p, faded(it.stroke, alpha), it.style)!;
+                }
+                page.restore()!;
+            }
+            .TEXT => {
+                if opts.has_font {
+                    tp.clear();
+                    text_item_path(it, opts, &mut pen, &mut tp)!;
+                    page.save()!;
+                    page.concat(it.transform.then(base))!;
+                    if it.has_fill {
+                        page.fill(&tp, faded(it.fill, alpha), it.fill_rule)!;
+                    }
+                    if it.has_stroke {
+                        page.stroke(&tp, faded(it.stroke, alpha), it.style)!;
+                    }
+                    page.restore()!;
+                }
+            }
+            .IMAGE => {
+                page.save()!;
+                page.concat(it.transform.then(base))!;
+                page.image(&doc.images.items()[it.image], 0.0, 0.0, it.width, it.height) catch |e| {
+                    return to_pdf_error(e);
+                };
+                page.restore()!;
+            }
+        }
+    }
+    while depth > 0 {
+        page.restore()!;
+        depth -= 1;
+    }
+    page.restore()!;
+}

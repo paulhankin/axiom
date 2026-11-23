@@ -1,0 +1,687 @@
+// =============================================================================
+// lib/encoding/yaml/events.ax - YAML event stream parser and formatter, part of lib/encoding/yaml.
+// =============================================================================
+
+import "std/collections/arena" as arena;
+import "std/collections/vec" as vec;
+import "std/io" as io;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Events
+// -----------------------------------------------------------------------------
+
+enum State: u8 {
+    STREAM_START,
+    IMPLICIT_DOCUMENT_START,
+    DOCUMENT_START,
+    DOCUMENT_CONTENT,
+    DOCUMENT_END,
+    BLOCK_NODE,
+    BLOCK_NODE_OR_INDENTLESS_SEQUENCE,
+    FLOW_NODE,
+    BLOCK_SEQUENCE_FIRST_ENTRY,
+    BLOCK_SEQUENCE_ENTRY,
+    INDENTLESS_SEQUENCE_ENTRY,
+    BLOCK_MAPPING_FIRST_KEY,
+    BLOCK_MAPPING_KEY,
+    BLOCK_MAPPING_VALUE,
+    FLOW_SEQUENCE_FIRST_ENTRY,
+    FLOW_SEQUENCE_ENTRY,
+    FLOW_SEQUENCE_ENTRY_MAPPING_KEY,
+    FLOW_SEQUENCE_ENTRY_MAPPING_VALUE,
+    FLOW_SEQUENCE_ENTRY_MAPPING_END,
+    FLOW_MAPPING_FIRST_KEY,
+    FLOW_MAPPING_KEY,
+    FLOW_MAPPING_VALUE,
+    FLOW_MAPPING_EMPTY_VALUE,
+    END,
+}
+
+struct TagDirective {
+    handle: []u8,
+    prefix: []u8,
+}
+
+/// The event stream of a YAML text. Strings in events live as long as the
+/// Events (or the arena it was given).
+pub nocopy struct Events {
+    sc: Scanner,
+    own: *mut arena.Arena,
+    state: State,
+    states: vec.Vec.[State],
+    tags: vec.Vec.[TagDirective],
+    had_doc: bool,     // a document has been seen
+    open_ended: bool,  // the last document ended without ... and may not be followed by directives
+    last_explicit: bool,
+
+    /// Events for text, with strings in a (the caller's) arena.
+    pub fn with_arena(text: []u8, a: *mut arena.Arena) Events {
+        return Events.{
+            sc: Scanner.{
+                s: text,
+                m: Mark.{ index: 0, line: 0, column: 0 },
+                ar: a,
+                tokens: vec.Vec.[Token].init(),
+                head: 0,
+                parsed: 0,
+                started: false,
+                ended: false,
+                indent: -1,
+                indents: vec.Vec.[i32].init(),
+                allowed: false,
+                keys: vec.Vec.[SimpleKey].init(),
+                flow: 0,
+                flow_maps: vec.Vec.[bool].init(),
+                line_start: 0,
+                token_line: 0,
+                last_kind: TokenKind.NONE,
+                last_style: Style.NONE,
+                last_end: 0,
+                buf: strs.String.init(),
+                lead: strs.String.init(),
+                trail: strs.String.init(),
+                ws: strs.String.init(),
+                err: "",
+                err_mark: Mark.{ index: 0, line: 0, column: 0 },
+            },
+            own: a,
+            state: State.STREAM_START,
+            states: vec.Vec.[State].init(),
+            tags: vec.Vec.[TagDirective].init(),
+            had_doc: false,
+            open_ended: false,
+            last_explicit: false,
+        };
+    }
+
+    pub fn deinit(self: *mut Events) void {
+        self.sc.tokens.deinit();
+        self.sc.indents.deinit();
+        self.sc.keys.deinit();
+        self.sc.flow_maps.deinit();
+        self.sc.buf.deinit();
+        self.sc.lead.deinit();
+        self.sc.trail.deinit();
+        self.sc.ws.deinit();
+        self.states.deinit();
+        self.tags.deinit();
+    }
+
+    /// Why the last SyntaxError happened, and where.
+    pub fn error_message(self: *Events) []u8 {
+        return self.sc.err;
+    }
+
+    pub fn error_mark(self: *Events) Mark {
+        return self.sc.err_mark;
+    }
+
+    fn fail(self: *mut Events, msg: []u8) YamlError {
+        return self.sc.fail(msg);
+    }
+
+    fn tok(self: *mut Events) YamlError!Token {
+        return (self.sc.peek_token()!).*;
+    }
+
+    fn skip(self: *mut Events) void {
+        self.sc.take_token();
+    }
+
+    fn push_state(self: *mut Events, s: State) YamlError!void {
+        if self.states.len() > (2 * MAX_DEPTH) {
+            if self.sc.err.len == 0 {
+                self.sc.err = "nesting too deep";
+                self.sc.err_mark = self.sc.m;
+            }
+            return error.TooDeep;
+        }
+        self.states.push(s)!;
+    }
+
+    fn pop_state(self: *mut Events) State {
+        return self.states.pop() ?? State.END;
+    }
+
+    fn ev(kind: EventKind, start: Mark, end: Mark) Event {
+        return Event.{ kind: kind, start: start, end: end, anchor: "", tag: "", value: "", style: Style.NONE,
+                       flow: false, explicit: false };
+    }
+
+    fn empty_scalar(self: *mut Events, m: Mark) Event {
+        let mut e = Events.ev(EventKind.SCALAR, m, m);
+        e.style = Style.PLAIN;
+        return e;
+    }
+
+    /// The next event; EventKind.STREAM_END is the last, followed by .none.
+    pub fn next(self: *mut Events) YamlError!?Event {
+        match self.state {
+            .STREAM_START => {
+                let t = self.tok()!;
+                if t.kind != TokenKind.STREAM_START {
+                    return self.fail("did not find expected <stream-start>");
+                }
+                self.skip();
+                self.state = State.IMPLICIT_DOCUMENT_START;
+                return .some(Events.ev(EventKind.STREAM_START, t.start, t.end));
+            }
+            .IMPLICIT_DOCUMENT_START           => { return .some(self.document_start(true)!); }
+            .DOCUMENT_START                    => { return .some(self.document_start(false)!); }
+            .DOCUMENT_CONTENT                  => { return .some(self.document_content()!); }
+            .DOCUMENT_END                      => { return .some(self.document_end()!); }
+            .BLOCK_NODE                        => { return .some(self.node(true, false)!); }
+            .BLOCK_NODE_OR_INDENTLESS_SEQUENCE => { return .some(self.node(true, true)!); }
+            .FLOW_NODE                         => { return .some(self.node(false, false)!); }
+            .BLOCK_SEQUENCE_FIRST_ENTRY        => { return .some(self.block_sequence_entry(true)!); }
+            .BLOCK_SEQUENCE_ENTRY              => { return .some(self.block_sequence_entry(false)!); }
+            .INDENTLESS_SEQUENCE_ENTRY         => { return .some(self.indentless_sequence_entry()!); }
+            .BLOCK_MAPPING_FIRST_KEY           => { return .some(self.block_mapping_key(true)!); }
+            .BLOCK_MAPPING_KEY                 => { return .some(self.block_mapping_key(false)!); }
+            .BLOCK_MAPPING_VALUE               => { return .some(self.block_mapping_value()!); }
+            .FLOW_SEQUENCE_FIRST_ENTRY         => { return .some(self.flow_sequence_entry(true)!); }
+            .FLOW_SEQUENCE_ENTRY               => { return .some(self.flow_sequence_entry(false)!); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_KEY   => { return .some(self.flow_sequence_entry_mapping_key()!); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_VALUE => { return .some(self.flow_sequence_entry_mapping_value()!); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_END => {
+                self.state = State.FLOW_SEQUENCE_ENTRY;
+                let t = self.tok()!;
+                return .some(Events.ev(EventKind.MAPPING_END, t.start, t.start));
+            }
+            .FLOW_MAPPING_FIRST_KEY   => { return .some(self.flow_mapping_key(true)!); }
+            .FLOW_MAPPING_KEY         => { return .some(self.flow_mapping_key(false)!); }
+            .FLOW_MAPPING_VALUE       => { return .some(self.flow_mapping_value(false)!); }
+            .FLOW_MAPPING_EMPTY_VALUE => { return .some(self.flow_mapping_value(true)!); }
+            .END                      => { return .none; }
+        }
+    }
+
+    fn document_start(self: *mut Events, implicit: bool) YamlError!Event {
+        let mut t = self.tok()!;
+        while t.kind == TokenKind.DOCUMENT_END {
+            self.skip();
+            self.open_ended = false;
+            t = self.tok()!;
+        }
+        let bare = (t.kind != TokenKind.VERSION_DIRECTIVE) and (t.kind != TokenKind.TAG_DIRECTIVE) and
+                   (t.kind != TokenKind.DOCUMENT_START) and (t.kind != TokenKind.STREAM_END);
+        // a document may start without --- at the start of the stream or after ...
+        if bare and (implicit or not self.open_ended) {
+            self.default_tags()!;
+            self.push_state(State.DOCUMENT_END)!;
+            self.state = State.BLOCK_NODE;
+            self.had_doc = true;
+            return Events.ev(EventKind.DOCUMENT_START, t.start, t.start);
+        }
+        if t.kind != TokenKind.STREAM_END {
+            if not implicit and bare {
+                // after an implicit end, a document needs --- (unless it is empty)
+                return self.fail("did not find expected <document start>");
+            }
+            let start = t.start;
+            let mut version = false;
+            self.tags.clear();
+            loop {
+                t = self.tok()!;
+                if t.kind == TokenKind.VERSION_DIRECTIVE {
+                    if version {
+                        return self.fail("found duplicate %YAML directive");
+                    }
+                    if self.open_ended {
+                        return self.fail("a directive follows a document without an explicit end");
+                    }
+                    version = true;
+                    self.skip();
+                } else if t.kind == TokenKind.TAG_DIRECTIVE {
+                    if self.open_ended {
+                        return self.fail("a directive follows a document without an explicit end");
+                    }
+                    for d in self.tags.items() {
+                        if strs.eq(d.handle, t.handle) {
+                            return self.fail("found duplicate %TAG directive");
+                        }
+                    }
+                    self.tags.push(TagDirective.{ handle: t.handle, prefix: t.value })!;
+                    self.skip();
+                } else {
+                    break;
+                }
+            }
+            self.default_tags()!;
+            if t.kind != TokenKind.DOCUMENT_START {
+                return self.fail("did not find expected <document start>");
+            }
+            self.skip();
+            self.push_state(State.DOCUMENT_END)!;
+            self.state = State.DOCUMENT_CONTENT;
+            self.had_doc = true;
+            let mut e = Events.ev(EventKind.DOCUMENT_START, start, t.end);
+            e.explicit = true;
+            return e;
+        }
+        self.skip();
+        self.state = State.END;
+        return Events.ev(EventKind.STREAM_END, t.start, t.end);
+    }
+
+    fn default_tags(self: *mut Events) YamlError!void {
+        let mut have1 = false;
+        let mut have2 = false;
+        for d in self.tags.items() {
+            if strs.eq(d.handle, "!") {
+                have1 = true;
+            }
+            if strs.eq(d.handle, "!!") {
+                have2 = true;
+            }
+        }
+        if not have1 {
+            self.tags.push(TagDirective.{ handle: "!", prefix: "!" })!;
+        }
+        if not have2 {
+            self.tags.push(TagDirective.{ handle: "!!", prefix: "tag:yaml.org,2002:" })!;
+        }
+    }
+
+    fn document_content(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        if (t.kind == TokenKind.VERSION_DIRECTIVE) or (t.kind == TokenKind.TAG_DIRECTIVE) or
+           (t.kind == TokenKind.DOCUMENT_START) or (t.kind == TokenKind.DOCUMENT_END) or
+           (t.kind == TokenKind.STREAM_END) {
+            self.state = self.pop_state();
+            return self.empty_scalar(t.start);
+        }
+        return self.node(true, false);
+    }
+
+    fn document_end(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        let mut e = Events.ev(EventKind.DOCUMENT_END, t.start, t.start);
+        if t.kind == TokenKind.DOCUMENT_END {
+            self.skip();
+            e.explicit = true;
+            self.open_ended = false;
+        } else {
+            self.open_ended = true;
+            if (t.kind != TokenKind.DOCUMENT_START) and (t.kind != TokenKind.STREAM_END) {
+                return self.fail("did not find expected <document end>");
+            }
+        }
+        self.tags.clear();
+        self.state = State.DOCUMENT_START;
+        return e;
+    }
+
+    fn resolve_tag(self: *mut Events, t: Token) YamlError![]u8 {
+        if t.handle.len == 0 {
+            return t.value;  // verbatim, or the non-specific "!"
+        }
+        for d in self.tags.items() {
+            if strs.eq(d.handle, t.handle) {
+                let out = self.own.bytes(d.prefix.len + t.value.len)!;
+                @mem_copy(out[..d.prefix.len], d.prefix);
+                @mem_copy(out[d.prefix.len..], t.value);
+                return out;
+            }
+        }
+        return self.fail("found undefined tag handle");
+    }
+
+    fn node(self: *mut Events, block: bool, indentless: bool) YamlError!Event {
+        let mut t = self.tok()!;
+        if t.kind == TokenKind.ALIAS {
+            self.state = self.pop_state();
+            self.skip();
+            let mut e = Events.ev(EventKind.ALIAS, t.start, t.end);
+            e.anchor = t.value;
+            return e;
+        }
+        let start = t.start;
+        let mut anchor: []u8 = "";
+        let mut tag: []u8 = "";
+        let mut have_props = false;
+        if t.kind == TokenKind.ANCHOR {
+            anchor = t.value;
+            have_props = true;
+            self.skip();
+            t = self.tok()!;
+            if t.kind == TokenKind.TAG {
+                tag = self.resolve_tag(t)!;
+                self.skip();
+                t = self.tok()!;
+            }
+        } else if t.kind == TokenKind.TAG {
+            tag = self.resolve_tag(t)!;
+            have_props = true;
+            self.skip();
+            t = self.tok()!;
+            if t.kind == TokenKind.ANCHOR {
+                anchor = t.value;
+                self.skip();
+                t = self.tok()!;
+            }
+        }
+        let mut e = Events.ev(EventKind.SCALAR, start, t.end);
+        e.anchor = anchor;
+        e.tag = tag;
+        if indentless and (t.kind == TokenKind.BLOCK_ENTRY) {
+            self.state = State.INDENTLESS_SEQUENCE_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
+            return e;
+        }
+        if t.kind == TokenKind.SCALAR {
+            self.state = self.pop_state();
+            self.skip();
+            e.value = t.value;
+            e.style = t.style;
+            return e;
+        }
+        if t.kind == TokenKind.FLOW_SEQUENCE_START {
+            self.state = State.FLOW_SEQUENCE_FIRST_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
+            e.flow = true;
+            return e;
+        }
+        if t.kind == TokenKind.FLOW_MAPPING_START {
+            self.state = State.FLOW_MAPPING_FIRST_KEY;
+            e.kind = EventKind.MAPPING_START;
+            e.flow = true;
+            return e;
+        }
+        if block and (t.kind == TokenKind.BLOCK_SEQUENCE_START) {
+            self.state = State.BLOCK_SEQUENCE_FIRST_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
+            return e;
+        }
+        if block and (t.kind == TokenKind.BLOCK_MAPPING_START) {
+            self.state = State.BLOCK_MAPPING_FIRST_KEY;
+            e.kind = EventKind.MAPPING_START;
+            return e;
+        }
+        if have_props {
+            self.state = self.pop_state();
+            e.style = Style.PLAIN;
+            return e;
+        }
+        return self.fail("did not find expected node content");
+    }
+
+    fn block_sequence_entry(self: *mut Events, first: bool) YamlError!Event {
+        if first {
+            self.skip();
+        }
+        let t = self.tok()!;
+        if t.kind == TokenKind.BLOCK_ENTRY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.BLOCK_ENTRY) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_SEQUENCE_ENTRY)!;
+                return self.node(true, false);
+            }
+            self.state = State.BLOCK_SEQUENCE_ENTRY;
+            return self.empty_scalar(m);
+        }
+        if t.kind == TokenKind.BLOCK_END {
+            self.state = self.pop_state();
+            self.skip();
+            return Events.ev(EventKind.SEQUENCE_END, t.start, t.end);
+        }
+        return self.fail("did not find expected '-' indicator");
+    }
+
+    fn indentless_sequence_entry(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        if t.kind == TokenKind.BLOCK_ENTRY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.BLOCK_ENTRY) and (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and
+               (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.INDENTLESS_SEQUENCE_ENTRY)!;
+                return self.node(true, false);
+            }
+            self.state = State.INDENTLESS_SEQUENCE_ENTRY;
+            return self.empty_scalar(m);
+        }
+        self.state = self.pop_state();
+        return Events.ev(EventKind.SEQUENCE_END, t.start, t.start);
+    }
+
+    fn block_mapping_key(self: *mut Events, first: bool) YamlError!Event {
+        if first {
+            self.skip();
+        }
+        let t = self.tok()!;
+        if t.kind == TokenKind.KEY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_MAPPING_VALUE)!;
+                return self.node(true, true);
+            }
+            self.state = State.BLOCK_MAPPING_VALUE;
+            return self.empty_scalar(m);
+        }
+        if t.kind == TokenKind.BLOCK_END {
+            self.state = self.pop_state();
+            self.skip();
+            return Events.ev(EventKind.MAPPING_END, t.start, t.end);
+        }
+        if t.kind == TokenKind.VALUE {
+            // ": value" with an empty key
+            self.state = State.BLOCK_MAPPING_VALUE;
+            return self.empty_scalar(t.start);
+        }
+        return self.fail("did not find expected key");
+    }
+
+    fn block_mapping_value(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        if t.kind == TokenKind.VALUE {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_MAPPING_KEY)!;
+                return self.node(true, true);
+            }
+            self.state = State.BLOCK_MAPPING_KEY;
+            return self.empty_scalar(m);
+        }
+        self.state = State.BLOCK_MAPPING_KEY;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_sequence_entry(self: *mut Events, first: bool) YamlError!Event {
+        if first {
+            self.skip();
+        }
+        let mut t = self.tok()!;
+        if t.kind != TokenKind.FLOW_SEQUENCE_END {
+            if not first {
+                if t.kind != TokenKind.FLOW_ENTRY {
+                    return self.fail("did not find expected ',' or ']'");
+                }
+                self.skip();
+                t = self.tok()!;
+            }
+            if (t.kind == TokenKind.KEY) or (t.kind == TokenKind.VALUE) {
+                // a single-pair mapping (": x" has an empty key)
+                self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_KEY;
+                if t.kind == TokenKind.KEY {
+                    self.skip();
+                }
+                let mut e = Events.ev(EventKind.MAPPING_START, t.start, t.end);
+                e.flow = true;
+                return e;
+            }
+            if t.kind != TokenKind.FLOW_SEQUENCE_END {
+                self.push_state(State.FLOW_SEQUENCE_ENTRY)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = self.pop_state();
+        self.skip();
+        return Events.ev(EventKind.SEQUENCE_END, t.start, t.end);
+    }
+
+    fn flow_sequence_entry_mapping_key(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        if (t.kind != TokenKind.VALUE) and (t.kind != TokenKind.FLOW_ENTRY) and
+           (t.kind != TokenKind.FLOW_SEQUENCE_END) {
+            self.push_state(State.FLOW_SEQUENCE_ENTRY_MAPPING_VALUE)!;
+            return self.node(false, false);
+        }
+        self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_VALUE;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_sequence_entry_mapping_value(self: *mut Events) YamlError!Event {
+        let t = self.tok()!;
+        if t.kind == TokenKind.VALUE {
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.FLOW_ENTRY) and (n.kind != TokenKind.FLOW_SEQUENCE_END) {
+                self.push_state(State.FLOW_SEQUENCE_ENTRY_MAPPING_END)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_END;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_mapping_key(self: *mut Events, first: bool) YamlError!Event {
+        if first {
+            self.skip();
+        }
+        let mut t = self.tok()!;
+        if t.kind != TokenKind.FLOW_MAPPING_END {
+            if not first {
+                if t.kind != TokenKind.FLOW_ENTRY {
+                    return self.fail("did not find expected ',' or '}'");
+                }
+                self.skip();
+                t = self.tok()!;
+            }
+            if t.kind == TokenKind.KEY {
+                self.skip();
+                let n = self.tok()!;
+                if (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.FLOW_ENTRY) and
+                   (n.kind != TokenKind.FLOW_MAPPING_END) {
+                    self.push_state(State.FLOW_MAPPING_VALUE)!;
+                    return self.node(false, false);
+                }
+                self.state = State.FLOW_MAPPING_VALUE;
+                return self.empty_scalar(n.start);
+            }
+            if t.kind == TokenKind.VALUE {
+                self.state = State.FLOW_MAPPING_VALUE;
+                return self.empty_scalar(t.start);  // an empty key
+            }
+            if t.kind != TokenKind.FLOW_MAPPING_END {
+                self.push_state(State.FLOW_MAPPING_EMPTY_VALUE)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = self.pop_state();
+        self.skip();
+        return Events.ev(EventKind.MAPPING_END, t.start, t.end);
+    }
+
+    fn flow_mapping_value(self: *mut Events, empty: bool) YamlError!Event {
+        let t = self.tok()!;
+        if empty {
+            self.state = State.FLOW_MAPPING_KEY;
+            return self.empty_scalar(t.start);
+        }
+        if t.kind == TokenKind.VALUE {
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != TokenKind.FLOW_ENTRY) and (n.kind != TokenKind.FLOW_MAPPING_END) {
+                self.push_state(State.FLOW_MAPPING_KEY)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = State.FLOW_MAPPING_KEY;
+        return self.empty_scalar(t.start);
+    }
+}
+
+/// An event in yaml-test-suite's text form ("+MAP {}", "=VAL :text", ...).
+pub fn format_event(e: Event, w: io.Writer) !void {
+    match e.kind {
+        .STREAM_START => { w.write_all("+STR")!; }
+        .STREAM_END   => { w.write_all("-STR")!; }
+        .DOCUMENT_START => {
+            w.write_all("+DOC")!;
+            if e.explicit {
+                w.write_all(" ---")!;
+            }
+        }
+        .DOCUMENT_END => {
+            w.write_all("-DOC")!;
+            if e.explicit {
+                w.write_all(" ...")!;
+            }
+        }
+        .ALIAS => {
+            w.write_all("=ALI *")!;
+            w.write_all(e.anchor)!;
+        }
+        .SCALAR => {
+            w.write_all("=VAL")!;
+            props(e, w)!;
+            let sigils = " :'\"|>";
+            let one: [2]u8 = [' ', sigils[@as(usize, @int_from_enum(e.style))]];
+            w.write_all(one[..])!;
+            for c in e.value {
+                if c == '\\' {
+                    w.write_all("\\\\")!;
+                } else if c == '\n' {
+                    w.write_all("\\n")!;
+                } else if c == '\t' {
+                    w.write_all("\\t")!;
+                } else if c == '\r' {
+                    w.write_all("\\r")!;
+                } else if c == 8 {
+                    w.write_all("\\b")!;
+                } else {
+                    let b: [1]u8 = [c];
+                    w.write_all(b[..])!;
+                }
+            }
+        }
+        .SEQUENCE_START => {
+            w.write_all("+SEQ")!;
+            if e.flow {
+                w.write_all(" []")!;
+            }
+            props(e, w)!;
+        }
+        .SEQUENCE_END => { w.write_all("-SEQ")!; }
+        .MAPPING_START => {
+            w.write_all("+MAP")!;
+            if e.flow {
+                w.write_all(" {}")!;
+            }
+            props(e, w)!;
+        }
+        .MAPPING_END => { w.write_all("-MAP")!; }
+        else => {}
+    }
+}
+
+fn props(e: Event, w: io.Writer) !void {
+    if e.anchor.len > 0 {
+        w.write_all(" &")!;
+        w.write_all(e.anchor)!;
+    }
+    if e.tag.len > 0 {
+        w.write_all(" <")!;
+        w.write_all(e.tag)!;
+        w.write_all(">")!;
+    }
+}

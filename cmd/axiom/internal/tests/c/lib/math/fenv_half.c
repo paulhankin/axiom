@@ -1,4 +1,4 @@
-/* _Float16 (binary16: computed in float, rounded by std/c/rt/ldouble.ax) in the floating-point environment: each operation in the four
+/* _Float16 (binary16: computed in float, rounded by lib/c/rt/ldouble.ax) in the floating-point environment: each operation in the four
    rounding directions, its result's bits and the exceptions it raises,
    against results computed exactly and rounded by IEEE 754's rules
    (written by cmd/axiom/internal/tests/tools/gen_fenv_wide_tests.py; do not

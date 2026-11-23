@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// gen_c_lib_index.mjs - writes std/c/lib/index, the C library's index: which
+// gen_c_lib_index.mjs - writes lib/c/lib/index, the C library's index: which
 // file defines each external name, so that a hosted C program checks and
 // compiles only the library's units it uses (cmd/axiom/src/main.ax,
 // c_library_units). Its lines:
 //
-//     D name path    path (under std/c/) defines name: a unit of std/c/lib/
+//     D name path    path (under lib/c/) defines name: a unit of lib/c/lib/
 //                    (the names the compiler prints with --emit=c-lib-defs)
-//                    or a run-time module of std/c/rt/ (its `export fn`s)
+//                    or a run-time module of lib/c/rt/ (its `export fn`s)
 //     N path name    the run-time module path calls the C function name (in
 //                    an extern "C" block), or a run-time module it imports does
 //     A path alt     where the target cannot have threads (WebAssembly
@@ -23,7 +23,7 @@ import fs from 'fs';
 import path from 'path';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
-const std = path.join(root, 'std', 'c');
+const std = path.join(root, 'lib', 'c');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/build/axiom'));
 const check = process.argv.includes('--check');
 
@@ -79,7 +79,7 @@ for (const f of walk(path.join(std, 'rt'), '.ax')) {
   for (const m of text.matchAll(/^export fn (\w+)/gm)) def(m[1], rel);
   for (const n of [...new Set(calls(f))]) lines.push(`N ${rel} ${n}`);
 }
-const text = `# std/c/lib/index - the C library's index (cmd/internal/tools/gen_c_lib_index.mjs
+const text = `# lib/c/lib/index - the C library's index (cmd/internal/tools/gen_c_lib_index.mjs
 # writes it; do not edit): D name path, N module name, A module alt
 ${lines.join('\n')}
 `;
@@ -87,7 +87,7 @@ const out = path.join(std, 'lib', 'index');
 if (check) {
   const old = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
   if (old !== text) {
-    console.error('std/c/lib/index is not current: run cmd/internal/tools/gen_c_lib_index.mjs');
+    console.error('lib/c/lib/index is not current: run cmd/internal/tools/gen_c_lib_index.mjs');
     process.exit(1);
   }
 } else {

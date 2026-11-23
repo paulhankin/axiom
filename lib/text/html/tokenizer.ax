@@ -1,0 +1,621 @@
+// =============================================================================
+// lib/text/html/tokenizer.ax - HTML tokenizer core and character references, part of lib/text/html.
+// =============================================================================
+
+import "../internal/html/entities.ax" as ent;
+import "../internal/html/tags.ax" as tags;
+import "std/collections/vec" as vec;
+import "std/hash" as hash;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Tokenizer
+// -----------------------------------------------------------------------------
+
+/// Token kinds.
+pub enum TokenKind: u8 {
+    NONE,
+    DOCTYPE,
+    START,
+    END,
+    COMMENT,
+    CHARS,
+    EOF,  // the end, as the tree builder sees it; Tokenizer.next() returns .none instead
+}
+
+/// Tokenizer states. A tree builder or a caller sets one of the first six
+/// (DATA to CDATA); the others are the tokenizer's own.
+pub enum State: u8 {
+    DATA,
+    RCDATA,
+    RAWTEXT,
+    SCRIPT,
+    PLAINTEXT,
+    CDATA,
+    TAG_OPEN,
+    END_TAG_OPEN,
+    TAG_NAME,
+    RCDATA_LT,
+    RCDATA_END_OPEN,
+    RCDATA_END_NAME,
+    RAWTEXT_LT,
+    RAWTEXT_END_OPEN,
+    RAWTEXT_END_NAME,
+    SCRIPT_LT,
+    SCRIPT_END_OPEN,
+    SCRIPT_END_NAME,
+    SCRIPT_ESC_START,
+    SCRIPT_ESC_START_DASH,
+    SCRIPT_ESC,
+    SCRIPT_ESC_DASH,
+    SCRIPT_ESC_DASH_DASH,
+    SCRIPT_ESC_LT,
+    SCRIPT_ESC_END_OPEN,
+    SCRIPT_ESC_END_NAME,
+    SCRIPT_DESC_START,
+    SCRIPT_DESC,
+    SCRIPT_DESC_DASH,
+    SCRIPT_DESC_DASH_DASH,
+    SCRIPT_DESC_LT,
+    SCRIPT_DESC_END,
+    BEFORE_ATTR_NAME,
+    ATTR_NAME,
+    AFTER_ATTR_NAME,
+    BEFORE_ATTR_VALUE,
+    ATTR_VALUE_DQ,
+    ATTR_VALUE_SQ,
+    ATTR_VALUE_UNQ,
+    AFTER_ATTR_VALUE,
+    SELF_CLOSING,
+    BOGUS_COMMENT,
+    MARKUP_DECL,
+    COMMENT_START,
+    COMMENT_START_DASH,
+    COMMENT,
+    COMMENT_LT,
+    COMMENT_LT_BANG,
+    COMMENT_LT_BANG_DASH,
+    COMMENT_LT_BANG_DASH_DASH,
+    COMMENT_END_DASH,
+    COMMENT_END,
+    COMMENT_END_BANG,
+    DOCTYPE,
+    BEFORE_DOCTYPE_NAME,
+    DOCTYPE_NAME,
+    AFTER_DOCTYPE_NAME,
+    AFTER_DOCTYPE_PUBLIC_KW,
+    BEFORE_DOCTYPE_PUBLIC_ID,
+    DOCTYPE_PUBLIC_ID_DQ,
+    DOCTYPE_PUBLIC_ID_SQ,
+    AFTER_DOCTYPE_PUBLIC_ID,
+    BETWEEN_DOCTYPE_IDS,
+    AFTER_DOCTYPE_SYSTEM_KW,
+    BEFORE_DOCTYPE_SYSTEM_ID,
+    DOCTYPE_SYSTEM_ID_DQ,
+    DOCTYPE_SYSTEM_ID_SQ,
+    AFTER_DOCTYPE_SYSTEM_ID,
+    BOGUS_DOCTYPE,
+    CDATA_BRACKET,
+    CDATA_END,
+}
+
+pub struct Attr {
+    ns: AttrNamespace,  // NONE, or XLINK, XML or XMLNS on foreign elements
+    prefix: []u8,       // "xlink" etc. with a namespace, else ""
+    name: []u8,         // the local name
+    value: []u8,
+}
+
+struct Span {
+    ns: usize,  // name and value, as offsets into the attribute buffer (the
+    ne: usize,  // value runs to the next attribute's name)
+    vs: usize,
+    dup: bool,  // repeats an earlier name: dropped
+}
+
+/// A token: valid until the next call of Tokenizer.next.
+pub struct Token {
+    kind: TokenKind,
+    name: []u8,  // tag name (lowercase) or DOCTYPE name
+    tag: u16,    // the tag name's T_ constant, or 0
+    attrs: []Attr,
+    self_closing: bool,
+    data: []u8,  // TokenKind.CHARS and TokenKind.COMMENT
+    public_id: []u8,
+    system_id: []u8,
+    has_name: bool,  // DOCTYPE: whether each part was present
+    has_public: bool,
+    has_system: bool,
+    force_quirks: bool,
+}
+
+/// The HTML tokenizer. Characters come as runs (TokenKind.CHARS); a caller building
+/// a tree changes `state` after start tags as the tree builder does.
+pub struct Tokenizer {
+    s: []u8,
+    owned: []mut u8,  // s, when preprocessing had to copy it
+    i: usize,
+    state: State,
+    last_start: strs.String,  // the last start tag's name (for appropriate end tags)
+    cdata_ok: bool,           // <![CDATA[ opens a section (set in foreign content)
+    kind: TokenKind,          // the tag being built: START or END
+    self_closing: bool,
+    name: strs.String,
+    tmp: strs.String,
+    comment: strs.String,
+    chars: strs.String,
+    abuf: strs.String,  // the tag's attribute names and values
+    spans: vec.Vec.[Span],
+    seen: vec.Vec.[u32],  // a hash index of spans (for tags with many attributes)
+    attrs: vec.Vec.[Attr],
+    public_id: strs.String,
+    system_id: strs.String,
+    has_name: bool,
+    has_public: bool,
+    has_system: bool,
+    force_quirks: bool,
+    pending: TokenKind,  // a finished token waiting behind characters
+    done: bool,
+    errors: u32,  // parse errors seen (they are not fatal)
+
+    /// A tokenizer over text (which must outlive it).
+    pub fn init(text: []u8) HtmlError!Tokenizer {
+        let mut owned: []mut u8 = [];
+        let s = preprocess(text, &mut owned)!;
+        return Tokenizer.{ s: s, owned: owned, i: 0, state: State.DATA, last_start: strs.String.init(), cdata_ok: false,
+                           kind: TokenKind.START, self_closing: false, name: strs.String.init(),
+                           tmp: strs.String.init(), comment: strs.String.init(), chars: strs.String.init(),
+                           abuf: strs.String.init(), spans: vec.Vec.[Span].init(), seen: vec.Vec.[u32].init(),
+                           attrs: vec.Vec.[Attr].init(), public_id: strs.String.init(), system_id: strs.String.init(),
+                           has_name: false, has_public: false, has_system: false, force_quirks: false,
+                           pending: TokenKind.NONE, done: false, errors: 0 };
+    }
+
+    pub fn deinit(self: *mut Tokenizer) void {
+        if self.owned.len > 0 {
+            mem.free(self.owned);
+        }
+        self.last_start.deinit();
+        self.name.deinit();
+        self.tmp.deinit();
+        self.comment.deinit();
+        self.chars.deinit();
+        self.abuf.deinit();
+        self.spans.deinit();
+        self.seen.deinit();
+        self.attrs.deinit();
+        self.public_id.deinit();
+        self.system_id.deinit();
+    }
+
+    /// Sets the name of the last start tag (as a tree builder's context
+    /// element would), which decides which end tags close RCDATA and the like.
+    pub fn set_last_start_tag(self: *mut Tokenizer, name: []u8) HtmlError!void {
+        self.last_start.clear();
+        self.last_start.push_str(name)!;
+    }
+
+    /// The next token, or `.none` at the end of the input (and after it).
+    pub fn next(self: *mut Tokenizer) HtmlError!?Token {
+        let t = self.next_token()!;
+        if t.kind == TokenKind.EOF {
+            return .none;
+        }
+        return t;
+    }
+
+    // The next token; at the end, an EOF token (which the tree builder
+    // dispatches), and EOF again after it.
+    fn next_token(self: *mut Tokenizer) HtmlError!Token {
+        if self.pending != TokenKind.NONE {
+            let k = self.pending;
+            self.pending = TokenKind.NONE;
+            return self.make(k);
+        }
+        self.chars.clear();
+        if self.done {
+            return self.make(TokenKind.EOF);
+        }
+        let k = self.run()!;
+        if k == TokenKind.EOF {
+            self.done = true;
+        } else if self.i >= self.s.len {
+            self.state = State.DATA;  // (a comment or DOCTYPE cut off by the end: EOF next)
+        }
+        if self.chars.len() > 0 {
+            self.pending = k;
+            return self.make(TokenKind.CHARS);
+        }
+        return self.make(k);
+    }
+
+    fn make(self: *mut Tokenizer, k: TokenKind) HtmlError!Token {
+        let mut t = Token.{ kind: k, name: "", tag: 0, attrs: [], self_closing: false, data: "", public_id: "",
+                            system_id: "", has_name: false, has_public: false, has_system: false, force_quirks: false };
+        if k == TokenKind.CHARS {
+            t.data = self.chars.bytes();
+        } else if k == TokenKind.COMMENT {
+            t.data = self.comment.bytes();
+        } else if (k == TokenKind.START) or (k == TokenKind.END) {
+            t.name = self.name.bytes();
+            t.tag = tags.tag_of(t.name);
+            t.self_closing = self.self_closing;
+            self.attrs.clear();
+            let b = self.abuf.bytes();
+            let sp = self.spans.items();
+            for k2 in @as(usize, 0)..sp.len {
+                let mut ve = b.len;
+                if (k2 + 1) < sp.len {
+                    ve = sp[k2 + 1].ns;
+                }
+                if sp[k2].dup {
+                    continue;
+                }
+                self.attrs.push(Attr.{ ns: AttrNamespace.NONE, prefix: "", name: b[sp[k2].ns..sp[k2].ne],
+                                       value: b[sp[k2].vs..ve] })!;
+            }
+            t.attrs = self.attrs.items();
+            if k == TokenKind.START {
+                self.last_start.clear();
+                self.last_start.push_str(t.name)!;
+            }
+        } else if k == TokenKind.DOCTYPE {
+            t.name = self.name.bytes();
+            t.public_id = self.public_id.bytes();
+            t.system_id = self.system_id.bytes();
+            t.has_name = self.has_name;
+            t.has_public = self.has_public;
+            t.has_system = self.has_system;
+            t.force_quirks = self.force_quirks;
+        }
+        return t;
+    }
+
+    fn at(self: *Tokenizer) i32 {
+        if self.i < self.s.len {
+            return @as(i32, self.s[self.i]);
+        }
+        return -1;
+    }
+
+    fn err(self: *mut Tokenizer) void {
+        self.errors +%= 1;
+    }
+
+    fn new_tag(self: *mut Tokenizer, k: TokenKind) void {
+        self.kind = k;
+        self.self_closing = false;
+        self.name.clear();
+        self.abuf.clear();
+        self.spans.clear();
+    }
+
+    fn new_doctype(self: *mut Tokenizer) void {
+        self.name.clear();
+        self.public_id.clear();
+        self.system_id.clear();
+        self.has_name = false;
+        self.has_public = false;
+        self.has_system = false;
+        self.force_quirks = false;
+    }
+
+    // Starts an attribute; its name follows in abuf.
+    fn new_attr(self: *mut Tokenizer) HtmlError!void {
+        self.spans.push(Span.{ ns: self.abuf.len(), ne: self.abuf.len(), vs: self.abuf.len(), dup: false })!;
+    }
+
+    // The attribute name is complete: mark it if it repeats one.
+    fn end_attr_name(self: *mut Tokenizer) HtmlError!void {
+        let n = self.spans.len();
+        let b = self.abuf.bytes();
+        let sp = self.spans.get_ptr(n - 1);
+        sp.ne = b.len;
+        sp.vs = b.len;
+        let nm = b[sp.ns..sp.ne];
+        if n <= 16 {
+            for k in @as(usize, 0)..n - 1 {
+                let o = self.spans.get(k);
+                if not o.dup and strs.eq(b[o.ns..o.ne], nm) {
+                    self.err();
+                    sp.dup = true;
+                    return;
+                }
+            }
+            return;
+        }
+        // many attributes: an open-addressed table of span indexes
+        if (n == 17) or ((n * 2) > self.seen.len()) {
+            let mut size: usize = 64;
+            while size < (n * 4) {
+                size *= 2;
+            }
+            self.seen.clear();
+            for _k in @as(usize, 0)..size {
+                self.seen.push(NONE)!;
+            }
+            for k in @as(usize, 0)..n - 1 {
+                let o = self.spans.get(k);
+                if not o.dup {
+                    _ = self.seen_insert(b, @truncate(u32, k));
+                }
+            }
+        }
+        if not self.seen_insert(b, @truncate(u32, n - 1)) {
+            self.err();
+            sp.dup = true;
+        }
+    }
+
+    // Adds span k to the index: false if its name is there already.
+    fn seen_insert(self: *mut Tokenizer, b: []u8, k: u32) bool {
+        let sp = self.spans.get(@as(usize, k));
+        let nm = b[sp.ns..sp.ne];
+        // (a keyed hash: names cannot be chosen to collide)
+        let mask = self.seen.len() - 1;
+        let mut at = @truncate(usize, hash.hash_bytes(nm)) & mask;
+        loop {
+            let e = self.seen.get(at);
+            if e == NONE {
+                self.seen.set(at, k);
+                return true;
+            }
+            let o = self.spans.get(@as(usize, e));
+            if strs.eq(b[o.ns..o.ne], nm) {
+                return false;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    // Finishes the current tag: the kind to return.
+    fn emit_tag(self: *mut Tokenizer) TokenKind {
+        if self.kind == TokenKind.END {
+            if (self.spans.len() > 0) or self.self_closing {
+                self.err();
+            }
+        }
+        return self.kind;
+    }
+
+    // Whether the end tag being read matches the last start tag.
+    fn appropriate(self: *Tokenizer) bool {
+        return (self.last_start.len() > 0) and strs.eq(self.name.bytes(), self.last_start.bytes());
+    }
+
+    // "</" and the temporary buffer, as characters.
+    fn flush_end_tag(self: *mut Tokenizer) HtmlError!void {
+        self.chars.push_str("</")!;
+        self.chars.push_str(self.tmp.bytes())!;
+    }
+
+    fn lookahead_ci(self: *Tokenizer, word: []u8) bool {
+        if (self.s.len - self.i) < word.len {
+            return false;
+        }
+        return strs.eq_ignore_case(self.s[self.i..self.i + word.len], word);
+    }
+
+    fn lookahead(self: *Tokenizer, word: []u8) bool {
+        return strs.starts_with(self.s[self.i..], word);
+    }
+
+    // Appends a character reference's text to the attribute value or the
+    // characters (after the "&" has been consumed).
+    fn char_ref(self: *mut Tokenizer, in_attr: bool) HtmlError!void {
+        let mut out = &mut self.chars;
+        if in_attr {
+            out = &mut self.abuf;
+        }
+        let s = self.s;
+        let i = self.i;
+        if (i < s.len) and is_alnum(@as(i32, s[i])) {
+            let mut k: usize = 0;
+            while ((i + k) < s.len) and is_alnum(@as(i32, s[i + k])) and (k < 40) {
+                k += 1;
+            }
+            // the longest match: with a semicolon (only possible after all k
+            // characters), or a legacy name without one
+            let mut len: usize = 0;
+            let mut idx: usize = 0;
+            let mut semi = false;
+            if ((i + k) < s.len) and (s[i + k] == ';') {
+                let e = entity_index(s[i..i + k]) catch NONE_USIZE;
+                if e != NONE_USIZE {
+                    len = k + 1;
+                    idx = e;
+                    semi = true;
+                }
+            }
+            if len == 0 {
+                let mut l = @min(k, 8);  // (legacy names are short)
+                while l > 0 {
+                    let e = legacy_index(s[i..i + l]) catch NONE_USIZE;
+                    if e != NONE_USIZE {
+                        len = l;
+                        idx = e;
+                        break;
+                    }
+                    l -= 1;
+                }
+            }
+            if len == 0 {
+                out.push('&')!;  // (the ambiguous ampersand: what follows is text)
+                return;
+            }
+            if in_attr and not semi and ((i + len) < s.len) and
+               ((s[i + len] == '=') or is_alnum(@as(i32, s[i + len]))) {
+                out.push('&')!;
+                out.push_str(s[i..i + len])!;
+                self.i = i + len;
+                return;
+            }
+            if not semi {
+                self.err();
+            }
+            out.push_rune(ent.FIRST[idx])!;
+            if ent.SECOND[idx] != 0 {
+                out.push_rune(ent.SECOND[idx])!;
+            }
+            self.i = i + len;
+            return;
+        }
+        if (i < s.len) and (s[i] == '#') {
+            let mut j = i + 1;
+            let mut hex = false;
+            if (j < s.len) and ((s[j] == 'x') or (s[j] == 'X')) {
+                hex = true;
+                j += 1;
+            }
+            let st = j;
+            let mut v: u32 = 0;
+            while j < s.len {
+                let c = s[j];
+                let mut d: u32 = 16;
+                if (c >= '0') and (c <= '9') {
+                    d = @as(u32, c - '0');
+                } else if hex and (c >= 'a') and (c <= 'f') {
+                    d = @as(u32, c - 'a') + 10;
+                } else if hex and (c >= 'A') and (c <= 'F') {
+                    d = @as(u32, c - 'A') + 10;
+                }
+                if d == 16 {
+                    break;
+                }
+                if hex {
+                    v = (v * 16) + d;
+                } else {
+                    v = (v * 10) + d;
+                }
+                if v > 0x10ffff {
+                    v = 0x110000;
+                }
+                j += 1;
+            }
+            if j == st {
+                self.err();
+                out.push_str(s[i - 1..j])!;  // "&#" or "&#x", as text
+                self.i = j;
+                return;
+            }
+            if (j < s.len) and (s[j] == ';') {
+                j += 1;
+            } else {
+                self.err();
+            }
+            self.i = j;
+            if (v == 0) or (v > 0x10ffff) or ((v >= 0xd800) and (v <= 0xdfff)) {
+                self.err();
+                v = 0xfffd;
+            } else if (v >= 0x80) and (v <= 0x9f) {
+                self.err();
+                let w = C1[@as(usize, v - 0x80)];
+                if w != 0 {
+                    v = w;
+                }
+            } else if ((v < 0x20) and (v != '\t') and (v != '\n') and (v != 12)) or (v == 0x7f) {
+                self.err();
+            }
+            out.push_rune(v)!;
+            return;
+        }
+        out.push('&')!;
+    }
+
+    // Runs the state machine until a token other than characters is complete
+    // (characters collect in self.chars): returns its kind. Each step below
+    // handles a group of states and returns TokenKind.NONE to go on.
+    fn run(self: *mut Tokenizer) HtmlError!TokenKind {
+        loop {
+            let st = self.state;
+            let mut k = TokenKind.NONE;
+            match st {
+                .DATA                                           => { k = tok_data(self)!; }
+                .RCDATA, .RAWTEXT, .SCRIPT, .PLAINTEXT          => { k = tok_text(self, st)!; }
+                .TAG_OPEN, .END_TAG_OPEN, .SELF_CLOSING         => { k = tok_tag(self, st)!; }
+                .TAG_NAME                                       => { k = tok_tag_name(self)!; }
+                .BEFORE_ATTR_NAME, .ATTR_NAME, .AFTER_ATTR_NAME => { k = tok_attr_name(self, st)!; }
+                .BEFORE_ATTR_VALUE, .ATTR_VALUE_DQ, .ATTR_VALUE_SQ, .ATTR_VALUE_UNQ, .AFTER_ATTR_VALUE => {
+                    k = tok_attr_value(self, st)!;
+                }
+                .RCDATA_LT, .RAWTEXT_LT, .RCDATA_END_OPEN, .RAWTEXT_END_OPEN, .SCRIPT_END_OPEN, .SCRIPT_ESC_END_OPEN,
+                    .RCDATA_END_NAME, .RAWTEXT_END_NAME, .SCRIPT_END_NAME, .SCRIPT_ESC_END_NAME => {
+                    k = tok_text_end_tag(self, st)!;
+                }
+                .SCRIPT_LT, .SCRIPT_ESC_START, .SCRIPT_ESC_START_DASH, .SCRIPT_ESC, .SCRIPT_ESC_DASH,
+                    .SCRIPT_ESC_DASH_DASH, .SCRIPT_ESC_LT => {
+                    k = tok_script_escaped(self, st)!;
+                }
+                .SCRIPT_DESC_START, .SCRIPT_DESC_END, .SCRIPT_DESC, .SCRIPT_DESC_DASH, .SCRIPT_DESC_DASH_DASH,
+                    .SCRIPT_DESC_LT => {
+                    k = tok_script_double_escaped(self, st)!;
+                }
+                .MARKUP_DECL, .BOGUS_COMMENT, .COMMENT_START, .COMMENT_START_DASH => {
+                    k = tok_comment_open(self, st)!;
+                }
+                .COMMENT, .COMMENT_LT, .COMMENT_LT_BANG, .COMMENT_LT_BANG_DASH, .COMMENT_LT_BANG_DASH_DASH => {
+                    k = tok_comment_body(self, st)!;
+                }
+                .COMMENT_END_DASH, .COMMENT_END, .COMMENT_END_BANG => { k = tok_comment_end(self, st)!; }
+                .CDATA, .CDATA_BRACKET, .CDATA_END                 => { k = tok_cdata(self, st)!; }
+                .DOCTYPE, .BEFORE_DOCTYPE_NAME, .DOCTYPE_NAME, .AFTER_DOCTYPE_NAME => {
+                    k = tok_doctype_name(self, st)!;
+                }
+                .AFTER_DOCTYPE_PUBLIC_KW, .BEFORE_DOCTYPE_PUBLIC_ID, .AFTER_DOCTYPE_SYSTEM_KW,
+                    .BEFORE_DOCTYPE_SYSTEM_ID, .DOCTYPE_PUBLIC_ID_DQ, .DOCTYPE_PUBLIC_ID_SQ, .DOCTYPE_SYSTEM_ID_DQ,
+                    .DOCTYPE_SYSTEM_ID_SQ => {
+                    k = tok_doctype_id(self, st)!;
+                }
+                .AFTER_DOCTYPE_PUBLIC_ID, .BETWEEN_DOCTYPE_IDS, .AFTER_DOCTYPE_SYSTEM_ID, .BOGUS_DOCTYPE => {
+                    k = tok_doctype_after_id(self, st)!;
+                }
+            }
+            if k != TokenKind.NONE {
+                return k;
+            }
+        }
+    }
+}
+
+fn entity_name(i: usize) []u8 {
+    return ent.NAMES[@as(usize, ent.OFFSET[i])..@as(usize, ent.OFFSET[i + 1])];
+}
+
+fn entity_index(name: []u8) HtmlError!usize {
+    let mut lo: usize = 0;
+    let mut hi: usize = ent.COUNT;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let c = strs.compare(entity_name(mid), name);
+        if c == 0 {
+            return mid;
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return error.NotFound;
+}
+
+// The index of a name that may appear without a semicolon.
+fn legacy_index(name: []u8) HtmlError!usize {
+    let mut lo: usize = 0;
+    let mut hi: usize = ent.LEGACY.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let k = @as(usize, ent.LEGACY[mid]);
+        let c = strs.compare(entity_name(k), name);
+        if c == 0 {
+            return k;
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return error.NotFound;
+}

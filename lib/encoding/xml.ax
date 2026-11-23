@@ -1,0 +1,327 @@
+// =============================================================================
+// lib/encoding/xml.ax - XML 1.0 (fifth edition) with namespaces: a pull parser, a
+// tree, a writer, and canonical output.
+//
+//     let mut doc = xml.parse(text)!;
+//     defer doc.deinit();
+//     let root = doc.root;                          // *xml.Element
+//     let id = root.attr("id")!;
+//     let mut it = root.elements();
+//     while let .some(c) = it.next() { ... c.local ... c.ns ... c.text_alloc()! }
+//
+//     let mut r = xml.Reader.init(text, xml.Options.default())!;   // streaming
+//     defer r.deinit();
+//     while let .some(t) = r.next()! { ... }
+//
+//     let mut w = xml.Writer.init(out);             // writing
+//     w.start("item")!; w.attr("id", "7")!; w.text("a < b")!; w.end()!;
+//
+// The parser is non-validating and checks well-formedness: matching tags,
+// unique attributes, legal names and characters, and namespace rules.
+// Input may be UTF-8, UTF-16 (with a byte-order mark) or ISO-8859-1 (when
+// declared); line ends are normalized. The internal DTD subset is read for
+// entity declarations and attribute defaults; external entities and DTDs
+// are never loaded (no XXE), and a reference to one is an error. Entity
+// expansion is limited (MAX_EXPANSION bytes), which defeats "billion
+// laughs" documents.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/diag" as diag;
+import "std/str" as strs;
+
+import part "xml/dtd.ax";
+import part "xml/elements.ax";
+import part "xml/input.ax";
+import part "xml/reader.ax";
+import part "xml/tests.ax";
+import part "xml/writer.ax";
+
+pub error XmlError { SyntaxError, TooDeep, TooLarge, Unsupported, NotFound, OutOfMemory, BadNesting, IoError, Empty,
+                     Done, InvalidUtf8 }
+
+/// Elements nested deeper than this are refused.
+pub const MAX_DEPTH: usize = 1024;
+
+/// The most text that entity references may expand to, in all.
+pub const MAX_EXPANSION: usize = 10 * 1024 * 1024;
+
+pub let XML_NS: []u8 = "http://www.w3.org/XML/1998/namespace";
+pub let XMLNS_NS: []u8 = "http://www.w3.org/2000/xmlns/";
+
+// -----------------------------------------------------------------------------
+// Tokens and options
+// -----------------------------------------------------------------------------
+
+/// Token kinds, with the Token fields each fills in.
+pub enum TokenKind: u8 {
+    START = 1,  // name, attrs; self_closing if <x/>
+    END,        // name
+    TEXT,       // text (character data, references resolved)
+    CDATA,      // text
+    COMMENT,    // text
+    PI,         // name (target), text (data)
+    DOCTYPE,    // name
+}
+
+pub struct Attr {
+    pub name: []u8,   // as written: "p:x"
+    pub local: []u8,  // "x"
+    pub ns: []u8,     // the namespace name ("" for none)
+    pub value: []u8,  // normalized, references resolved
+}
+
+pub struct Token {
+    pub kind: TokenKind,
+    pub name: []u8,
+    pub local: []u8,
+    pub ns: []u8,
+    pub attrs: []Attr,
+    pub text: []u8,
+    pub self_closing: bool,
+}
+
+pub struct Options {
+    pub namespaces: bool,       // resolve prefixes and check the namespace rules
+    pub keep_whitespace: bool,  // report text of white space only outside elements? (never in the tree)
+
+    pub fn default() Options {
+        return Options.{ namespaces: true, keep_whitespace: false };
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The tree
+// -----------------------------------------------------------------------------
+
+pub struct PI {
+    pub target: []u8,
+    pub data: []u8,
+}
+
+pub union Node {
+    Element: *Element,
+    Text: []u8,  // character data (CDATA sections included)
+    Comment: []u8,
+    PI: PI,
+}
+
+pub struct Element {
+    pub name: []u8,  // as written
+    pub local: []u8,
+    pub ns: []u8,  // the namespace name ("" for none)
+    pub attrs: []Attr,
+    pub children: []Node,
+
+    /// An attribute's value by its name as written ("id", "p:x").
+    pub fn attr(self: *Element, name: []u8) XmlError![]u8 {
+        for a in self.attrs {
+            if strs.eq(a.name, name) {
+                return a.value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// An attribute's value by namespace and local name.
+    pub fn attr_ns(self: *Element, ns: []u8, local: []u8) XmlError![]u8 {
+        for a in self.attrs {
+            if strs.eq(a.ns, ns) and strs.eq(a.local, local) {
+                return a.value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// The first child element with this local name.
+    pub fn child(self: *Element, local: []u8) XmlError!*Element {
+        for c in self.children {
+            match c {
+                .Element(e) => {
+                    if strs.eq(e.local, local) {
+                        return e;
+                    }
+                }
+                else => {}
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// The child elements, in order.
+    pub fn elements(self: *Element) Elements {
+        return Elements.{ e: self, i: 0 };
+    }
+
+    /// All the text inside the element (free it with mem.free).
+    pub fn text_alloc(self: *Element) XmlError![]mut u8 {
+        let mut s = strs.String.init();
+        collect_text(self, &mut s, 0) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+}
+
+fn collect_text(e: *Element, s: *mut strs.String, depth: usize) XmlError!void {
+    if depth > MAX_DEPTH {
+        return error.TooDeep;
+    }
+    for c in e.children {
+        match c {
+            .Text(t)    => { s.push_str(t)!; }
+            .Element(x) => { collect_text(x, s, depth + 1)!; }
+            else => {}
+        }
+    }
+}
+
+pub struct Elements {
+    e: *Element,
+    i: usize,
+
+    /// The next child element, or `.none` after the last.
+    pub fn next(self: *mut Elements) ?*Element {
+        while self.i < self.e.children.len {
+            let c = self.e.children[self.i];
+            self.i += 1;
+            match c {
+                .Element(x) => { return x; }
+                else => {}
+            }
+        }
+        return .none;
+    }
+}
+
+/// A parsed document.
+pub nocopy struct Document {
+    pub root: *Element,
+    pub prolog: []Node,  // comments and processing instructions before the root
+    pub epilog: []Node,  // and after it
+    pub doctype: []u8,   // the DOCTYPE's name, if there was one
+    reader: Reader,      // (owns the memory)
+
+    pub fn deinit(self: *mut Document) void {
+        self.reader.deinit();
+    }
+}
+
+/// Where and why parsing failed.
+pub struct ErrorInfo {
+    pub line: u32,
+    pub message: []u8,
+}
+
+nocopy struct Frame {
+    el: *mut Element,
+    kids: vec.Vec.[Node],
+}
+
+pub fn parse(text: []u8) XmlError!Document {
+    let mut info = ErrorInfo.{ line: 0, message: "" };
+    return parse_with(text, Options.default(), &mut info);
+}
+
+pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) XmlError!Document {
+    let mut dinfo = diag.ErrorInfo.init();
+    let doc = parse_with_diag(text, opts, &mut dinfo) catch |e| {
+        info.message = dinfo.detail;
+        info.line = dinfo.line;
+        return e;
+    };
+    return doc;
+}
+
+/// Parses an XML document; on failure fills `info` with byte offset, 1-based
+/// line and column, and detail.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) XmlError!Document {
+    return parse_with_diag(text, Options.default(), info);
+}
+
+/// Like parse_diag, with explicit Options.
+pub fn parse_with_diag(text: []u8, opts: Options, info: *mut diag.ErrorInfo) XmlError!Document {
+    info.* = diag.ErrorInfo.init();
+    let mut r = Reader.init_diag(text, opts, info) catch |e| {
+        return e;
+    };
+    let mut doc = Document.{ root: @ptr_from_int(*Element, 8), prolog: [], epilog: [], doctype: "", reader: r };
+    build(&mut doc) catch |e| {
+        if doc.reader.line == 0 {
+            doc.reader.record_pos();
+        }
+        let mut detail = doc.reader.error_message();
+        if (detail.len == 0) and (e == error.OutOfMemory) {
+            detail = "out of memory";
+        }
+        info.* = diag.ErrorInfo.at(map_input_offset(text, doc.reader.err_pos), doc.reader.line, doc.reader.col, detail);
+        doc.reader.deinit();
+        return e;
+    };
+    return doc;
+}
+
+fn build(doc: *mut Document) infer!void {
+    let r = &mut doc.reader;
+    let mut frames = vec.Vec.[Frame].init();
+    defer {
+        for &mut f in frames.items_mut() {
+            f.kids.deinit();
+        }
+        frames.deinit();
+    }
+    let mut top = vec.Vec.[Node].init();  // prolog, then epilog
+    defer top.deinit();
+    let mut prolog_len: usize = 0;
+    let mut text = strs.String.init();
+    defer text.deinit();
+    while let .some(t) = r.next()! {
+        // adjacent text (and CDATA) becomes one node
+        if (t.kind == TokenKind.TEXT) or (t.kind == TokenKind.CDATA) {
+            text.push_str(t.text)!;
+            continue;
+        }
+        if (text.len() > 0) and (frames.len() > 0) {
+            let f = frames.get_ptr(frames.len() - 1);
+            f.kids.push(Node.Text(r.ar.dup(text.bytes())!))!;
+            text.clear();
+        }
+        match t.kind {
+            .START => {
+                let el = @cast_slice(Element, r.ar.bytes(@size_of(Element))!);
+                el[0] = Element.{ name: t.name, local: t.local, ns: t.ns, attrs: t.attrs, children: [] };
+                frames.push(Frame.{ el: &mut el[0], kids: vec.Vec.[Node].init() })!;
+            }
+            .END => {
+                let mut f = frames.pop() ?? @trap();
+                f.el.children = r.ar.copy.[Node](f.kids.items()) catch |e| {
+                    f.kids.deinit();
+                    return e;
+                };
+                f.kids.deinit();
+                if frames.len() == 0 {
+                    doc.root = f.el;
+                    prolog_len = top.len();
+                } else {
+                    frames.get_ptr(frames.len() - 1).kids.push(Node.Element(f.el))!;
+                }
+            }
+            .COMMENT => { add_node(&mut frames, &mut top, Node.Comment(t.text))!; }
+            .PI      => { add_node(&mut frames, &mut top, Node.PI(PI.{ target: t.name, data: t.text }))!; }
+            .DOCTYPE => { doc.doctype = t.name; }
+            else => {}
+        }
+    }
+    let all = r.ar.copy.[Node](top.items())!;
+    doc.prolog = all[..prolog_len];
+    doc.epilog = all[prolog_len..];
+}
+
+fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) infer!void {
+    if frames.len() > 0 {
+        frames.get_ptr(frames.len() - 1).kids.push(n)!;
+    } else {
+        top.push(n)!;
+    }
+}

@@ -1,0 +1,355 @@
+// =============================================================================
+// lib/graphics/svg/writer.ax - Writing SVG documents from draw.Paths, paints,
+// text, and images, part of lib/graphics/svg.
+// =============================================================================
+
+import "../../encoding/base64.ax" as base64;
+import "../../encoding/xml.ax" as xml;
+import "../color.ax" as color;
+import "../draw.ax" as draw;
+import "../image.ax" as image;
+import "../image/png.ax" as png;
+import "path.ax" as pathdata;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// Which point of a line of text Writer.text_anchored places: its start,
+/// middle or end.
+pub enum Anchor: u8 {
+    START,
+    MIDDLE,
+    END,
+}
+
+/// Writes an SVG document: begin, drawing calls, finish.
+pub nocopy struct Writer {
+    xw: xml.Writer,
+    out: io.Writer,
+    next_id: u32,
+    groups: usize,
+    buf: strs.String,
+
+    /// Starts a document width by height user units (= CSS pixels) big.
+    pub fn begin(out: io.Writer, width: f64, height: f64) !Writer {
+        let mut w = Writer.{ xw: xml.Writer.init(out), out: out, next_id: 0, groups: 0, buf: strs.String.init() };
+        w.start_document(width, height) catch |e| {
+            w.deinit();
+            return e;
+        };
+        return w;
+    }
+
+    pub fn deinit(self: *mut Writer) void {
+        self.xw.deinit();
+        self.buf.deinit();
+    }
+
+    fn start_document(self: *mut Writer, width: f64, height: f64) !void {
+        self.xw.declaration()!;
+        self.xw.start("svg")!;
+        self.xw.attr("xmlns", SVG_NS)!;
+        self.xw.attr("xmlns:xlink", XLINK_NS)!;
+        self.xw.attr("version", "1.1")!;
+        self.num_attr("width", width)!;
+        self.num_attr("height", height)!;
+        self.buf.clear();
+        let bw = self.buf.writer();
+        bw.write_all("0 0 ")!;
+        pathdata.write_number(bw, width)!;
+        bw.write_all(" ")!;
+        pathdata.write_number(bw, height)!;
+        self.xw.attr("viewBox", self.buf.bytes())!;
+    }
+
+    /// Closes any open groups and the document.
+    pub fn finish(self: *mut Writer) !void {
+        while self.groups > 0 {
+            self.end_group()!;
+        }
+        self.xw.end()!;
+        self.out.write_all("\n")!;
+    }
+
+    fn num_attr(self: *mut Writer, name: []u8, v: f64) !void {
+        let mut nb: [40]u8 = [0; 40];
+        self.xw.attr(name, pathdata.format_number(nb[..], v))!;
+    }
+
+    fn color_attrs(self: *mut Writer, name: []u8, opacity_name: []u8, c: color.Color, alpha: f32) !void {
+        let mut hb: [12]u8 = [0; 12];
+        let mut c8 = c.to_rgba8();
+        c8.a = 255;
+        self.xw.attr(name, color.format_hex(c8, hb[..]))!;
+        let a = c.a * alpha;
+        if a < 1.0 {
+            self.num_attr(opacity_name, @as(f64, @max(a, 0.0)))!;
+        }
+    }
+
+    fn matrix_attr(self: *mut Writer, name: []u8, t: draw.Affine) !void {
+        self.buf.clear();
+        let bw = self.buf.writer();
+        bw.write_all("matrix(")!;
+        let v: [6]f64 = [t.a, t.b, t.c, t.d, t.e, t.f];
+        for i in @as(usize, 0)..6 {
+            if i > 0 {
+                bw.write_all(" ")!;
+            }
+            pathdata.write_number(bw, v[i])!;
+        }
+        bw.write_all(")")!;
+        self.xw.attr(name, self.buf.bytes())!;
+    }
+
+    /// Writes a gradient's definition (if the paint is one), returning its id.
+    fn define_paint(self: *mut Writer, p: draw.Paint) !u32 {
+        if (p.kind != draw.PaintKind.LINEAR) and (p.kind != draw.PaintKind.RADIAL) {
+            if p.kind == draw.PaintKind.IMAGE {
+                return error.Unsupported;
+            }
+            return 0;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.xw.start("defs")!;
+        if p.kind == draw.PaintKind.LINEAR {
+            self.xw.start("linearGradient")!;
+        } else {
+            self.xw.start("radialGradient")!;
+        }
+        let mut ib: [16]u8 = [0; 16];
+        self.xw.attr("id", id_text(ib[..], 'g', id))!;
+        self.xw.attr("gradientUnits", "userSpaceOnUse")!;
+        if p.kind == draw.PaintKind.LINEAR {
+            self.num_attr("x1", p.x0)!;
+            self.num_attr("y1", p.y0)!;
+            self.num_attr("x2", p.x1)!;
+            self.num_attr("y2", p.y1)!;
+        } else {
+            self.num_attr("cx", p.x0)!;
+            self.num_attr("cy", p.y0)!;
+            self.num_attr("r", p.r)!;
+            if p.x1_focal {
+                self.num_attr("fx", p.x1)!;
+                self.num_attr("fy", p.y1)!;
+            }
+        }
+        if p.spread == draw.Spread.REPEAT {
+            self.xw.attr("spreadMethod", "repeat")!;
+        } else if p.spread == draw.Spread.REFLECT {
+            self.xw.attr("spreadMethod", "reflect")!;
+        }
+        let t = p.transform;
+        if (t.a != 1.0) or (t.b != 0.0) or (t.c != 0.0) or (t.d != 1.0) or (t.e != 0.0) or (t.f != 0.0) {
+            self.matrix_attr("gradientTransform", t)!;
+        }
+        for s in p.stops {
+            self.xw.start("stop")!;
+            self.num_attr("offset", s.offset)!;
+            self.color_attrs("stop-color", "stop-opacity", s.color, 1.0)!;
+            self.xw.end()!;
+        }
+        self.xw.end()!;
+        self.xw.end()!;
+        return id;
+    }
+
+    fn paint_attrs(self: *mut Writer, name: []u8, opacity_name: []u8, p: draw.Paint, id: u32) !void {
+        if id == 0 {
+            return self.color_attrs(name, opacity_name, p.color, 1.0);
+        }
+        let mut ib: [24]u8 = [0; 24];
+        ib[0] = 'u';
+        ib[1] = 'r';
+        ib[2] = 'l';
+        ib[3] = '(';
+        ib[4] = '#';
+        let n = id_text(ib[5..], 'g', id).len;
+        ib[5 + n] = ')';
+        self.xw.attr(name, ib[..n + 6])!;
+    }
+
+    fn path_attr(self: *mut Writer, p: *draw.Path) !void {
+        self.buf.clear();
+        pathdata.write(self.buf.writer(), p)!;
+        self.xw.attr("d", self.buf.bytes())!;
+    }
+
+    /// Fills a path.
+    pub fn fill(self: *mut Writer, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        self.paint_attrs("fill", "fill-opacity", paint, id)!;
+        if rule == draw.FillRule.EVEN_ODD {
+            self.xw.attr("fill-rule", "evenodd")!;
+        }
+        self.xw.end()!;
+    }
+
+    /// Strokes a path.
+    pub fn stroke(self: *mut Writer, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        self.xw.attr("fill", "none")!;
+        self.paint_attrs("stroke", "stroke-opacity", paint, id)!;
+        self.num_attr("stroke-width", style.width)!;
+        if style.cap == draw.Cap.ROUND {
+            self.xw.attr("stroke-linecap", "round")!;
+        } else if style.cap == draw.Cap.SQUARE {
+            self.xw.attr("stroke-linecap", "square")!;
+        }
+        if style.join == draw.Join.ROUND {
+            self.xw.attr("stroke-linejoin", "round")!;
+        } else if style.join == draw.Join.BEVEL {
+            self.xw.attr("stroke-linejoin", "bevel")!;
+        }
+        if style.miter_limit != 4.0 {
+            self.num_attr("stroke-miterlimit", @max(style.miter_limit, 1.0))!;
+        }
+        if style.dash.len > 0 {
+            self.buf.clear();
+            let bw = self.buf.writer();
+            for i in @as(usize, 0)..style.dash.len {
+                if i > 0 {
+                    bw.write_all(" ")!;
+                }
+                pathdata.write_number(bw, style.dash[i])!;
+            }
+            self.xw.attr("stroke-dasharray", self.buf.bytes())!;
+            if style.dash_offset != 0.0 {
+                self.num_attr("stroke-dashoffset", style.dash_offset)!;
+            }
+        }
+        self.xw.end()!;
+    }
+
+    /// Fills a rectangle (as a <rect>).
+    pub fn fill_rect(self: *mut Writer, x: f64, y: f64, w: f64, h: f64, paint: draw.Paint) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("rect")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("width", w)!;
+        self.num_attr("height", h)!;
+        self.paint_attrs("fill", "fill-opacity", paint, id)!;
+        self.xw.end()!;
+    }
+
+    /// Opens a group: what follows (until end_group) is transformed by t (in
+    /// the current user space) and composited with an opacity.
+    pub fn begin_group(self: *mut Writer, t: draw.Affine, opacity: f32) !void {
+        self.xw.start("g")!;
+        if (t.a != 1.0) or (t.b != 0.0) or (t.c != 0.0) or (t.d != 1.0) or (t.e != 0.0) or (t.f != 0.0) {
+            self.matrix_attr("transform", t)!;
+        }
+        if opacity < 1.0 {
+            self.num_attr("opacity", @as(f64, @max(opacity, 0.0)))!;
+        }
+        self.groups += 1;
+    }
+
+    /// Opens a group clipped to a path (in the current user space).
+    pub fn begin_clip(self: *mut Writer, p: *draw.Path, rule: draw.FillRule) !void {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut ib: [24]u8 = [0; 24];
+        self.xw.start("defs")!;
+        self.xw.start("clipPath")!;
+        self.xw.attr("id", id_text(ib[..], 'c', id))!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        if rule == draw.FillRule.EVEN_ODD {
+            self.xw.attr("clip-rule", "evenodd")!;
+        }
+        self.xw.end()!;
+        self.xw.end()!;
+        self.xw.end()!;
+        self.xw.start("g")!;
+        ib[0] = 'u';
+        ib[1] = 'r';
+        ib[2] = 'l';
+        ib[3] = '(';
+        ib[4] = '#';
+        let n = id_text(ib[5..], 'c', id).len;
+        ib[5 + n] = ')';
+        self.xw.attr("clip-path", ib[..n + 6])!;
+        self.groups += 1;
+    }
+
+    /// Closes the innermost group.
+    pub fn end_group(self: *mut Writer) !void {
+        if self.groups == 0 {
+            return error.SyntaxError;
+        }
+        self.xw.end()!;
+        self.groups -= 1;
+    }
+
+    /// Writes a line of text with its baseline starting at (x, y).
+    pub fn text(self: *mut Writer, x: f64, y: f64, s: []u8, size: f64, family: []u8, c: color.Color) !void {
+        self.text_anchored(x, y, s, size, family, c, Anchor.START)!;
+    }
+
+    /// Writes a line of text on the baseline through (x, y), with its start,
+    /// middle or end at x (text-anchor), so that the viewer's font measures it.
+    pub fn text_anchored(self: *mut Writer, x: f64, y: f64, s: []u8, size: f64, family: []u8, c: color.Color,
+                         anchor: Anchor) !void {
+        self.xw.start("text")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("font-size", size)!;
+        if anchor == Anchor.MIDDLE {
+            self.xw.attr("text-anchor", "middle")!;
+        } else if anchor == Anchor.END {
+            self.xw.attr("text-anchor", "end")!;
+        }
+        if family.len > 0 {
+            self.xw.attr("font-family", family)!;
+        }
+        self.color_attrs("fill", "fill-opacity", c, 1.0)!;
+        self.xw.text(s)!;
+        self.xw.end()!;
+    }
+
+    /// Embeds an image (as a PNG data URI) into the rectangle (x, y, w, h).
+    pub fn image(self: *mut Writer, img: *image.Image, x: f64, y: f64, w: f64, h: f64) !void {
+        let data = png.encode(img, 6)!;
+        defer mem.free(data);
+        self.buf.clear();
+        self.buf.push_str("data:image/png;base64,")!;
+        base64.encode_to(self.buf.writer(), data, base64.STANDARD)!;
+        self.xw.start("image")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("width", w)!;
+        self.num_attr("height", h)!;
+        self.xw.attr("preserveAspectRatio", "none")!;
+        self.xw.attr("xlink:href", self.buf.bytes())!;
+        self.xw.end()!;
+    }
+}
+
+/// "g12" for prefix 'g' and 12, in buf.
+fn id_text(buf: []mut u8, prefix: u8, id: u32) []u8 {
+    buf[0] = prefix;
+    let mut nb: [12]u8 = [0; 12];
+    let s = io.fmt_u64(nb[..], @as(u64, id));
+    @mem_copy(buf[1..1 + s.len], s);
+    return buf[..1 + s.len];
+}
+
+/// Writes a document of one call: a path filled with a paint, w by h (for
+/// quick output; use Writer for more).
+pub fn write_path_document(out: io.Writer, p: *draw.Path, paint: draw.Paint, w: f64, h: f64) !void {
+    let mut sw = Writer.begin(out, w, h)!;
+    defer sw.deinit();
+    sw.fill(p, paint, draw.FillRule.NONZERO)!;
+    sw.finish()!;
+}

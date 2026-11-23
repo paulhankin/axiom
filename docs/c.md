@@ -1,5 +1,13 @@
 # Compiling C
 
+The C front end is an experiment. It is tested on every change, since its tests have
+found real bugs in the backends the language shares with it, and its results are reported
+as a group of their own; but a release of the language does not wait on them, work on it
+does not delay the language's, and the project's performance figures come from Axiom
+programs. Its headers, C library and runtime are in [`lib/c/`](../lib/c/) (`include/`,
+`lib/`, `rt/`), beside the standard library. Calling C from Axiom (`extern "C"`,
+[`std/c`](../std/c.ax)) is part of the language, not of the experiment.
+
 `axiom build file.c` compiles C. The C front end reads C translation units and hands them
 to the same optimizer, code generators and linkers that Axiom programs use, so a C program
 is built for every target of the compiler (WebAssembly, x86-64 and AArch64 Linux, x86-64
@@ -703,7 +711,7 @@ system's (`--c-lib=system`).
 libraries), against the system's headers, uses this library: its calls of the standard's functions are this library's
 functions, whose interfaces the C standard fixes, and the names the system's headers
 expand to that the Linux Standard Base specifies are this library's too
-(`std/c/lib/compat/`): `stdin`, `stdout` and `stderr` as objects of type `FILE *`;
+(`lib/c/lib/compat/`): `stdin`, `stdout` and `stderr` as objects of type `FILE *`;
 `errno`'s `__errno_location`; the tables of the `<ctype.h>` macros (`__ctype_b_loc`,
 `__ctype_tolower_loc`, `__ctype_toupper_loc`, the "C" locale's classes with the LSB's
 bits); `__assert_fail`; the fortified functions of `_FORTIFY_SOURCE` (`__printf_chk`,
@@ -964,13 +972,13 @@ parts, each with its sources and its private header:
 
 | Part | Headers | Sources |
 |---|---|---|
-| core | `<assert.h>`, `<ctype.h>`, `<errno.h>`, `<setjmp.h>`, `<signal.h>`, `<stdlib.h>` (but its multibyte functions), `<string.h>`'s hosted functions | `std/c/lib/core/`, `std/c/rt/core*.ax`, `axc/core_impl.h` |
-| strings | `<string.h>` (C23's freestanding functions) | `std/c/lib/string/` |
-| standard input/output | `<stdio.h>`, `<wchar.h>`'s input/output | `std/c/lib/stdio/`, `std/c/rt/stdio.ax` |
-| text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `std/c/lib/text/`, `std/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
-| mathematics | `<math.h>`, `<fenv.h>`, `<tgmath.h>`, `<complex.h>`'s functions | `std/c/lib/math/`, `std/c/rt/math*.ax` (below) |
-| threads | `<threads.h>`, and C23's `call_once` of `<stdlib.h>` | `std/c/lib/threads/`, `std/c/rt/threads.ax`, `std/c/rt/threads_spawn.ax` (`threads_spawn_none.ax`), `axc/threads_impl.h`, `axc/once.h` ("Threads", below) |
-| bounds-checking interfaces | Annex K: the `_s` functions of `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<time.h>` and `<wchar.h>`, `errno_t`, `rsize_t`, `RSIZE_MAX` | `std/c/lib/ext1/`, `axc/ext1.h`, `axc/ext1_impl.h` ("Annex K", below) |
+| core | `<assert.h>`, `<ctype.h>`, `<errno.h>`, `<setjmp.h>`, `<signal.h>`, `<stdlib.h>` (but its multibyte functions), `<string.h>`'s hosted functions | `lib/c/lib/core/`, `lib/c/rt/core*.ax`, `axc/core_impl.h` |
+| strings | `<string.h>` (C23's freestanding functions) | `lib/c/lib/string/` |
+| standard input/output | `<stdio.h>`, `<wchar.h>`'s input/output | `lib/c/lib/stdio/`, `lib/c/rt/stdio.ax` |
+| text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `lib/c/lib/text/`, `lib/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
+| mathematics | `<math.h>`, `<fenv.h>`, `<tgmath.h>`, `<complex.h>`'s functions | `lib/c/lib/math/`, `lib/c/rt/math*.ax` (below) |
+| threads | `<threads.h>`, and C23's `call_once` of `<stdlib.h>` | `lib/c/lib/threads/`, `lib/c/rt/threads.ax`, `lib/c/rt/threads_spawn.ax` (`threads_spawn_none.ax`), `axc/threads_impl.h`, `axc/once.h` ("Threads", below) |
+| bounds-checking interfaces | Annex K: the `_s` functions of `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<time.h>` and `<wchar.h>`, `errno_t`, `rsize_t`, `RSIZE_MAX` | `lib/c/lib/ext1/`, `axc/ext1.h`, `axc/ext1_impl.h` ("Annex K", below) |
 
 ### How the library is linked
 
@@ -989,7 +997,7 @@ parts, each with its sources and its private header:
   of them, but for the creation of threads (`threads_spawn.ax`, whose
   `std/thread` gives a WebAssembly program a shared memory), which it has only
   if its C sources name `thrd_create`, `thrd_exit`, `thrd_join` or
-  `thrd_detach`. `std/c/rt/ldouble.ax` (the arithmetic of a `long double` wider than `double`)
+  `thrd_detach`. `lib/c/rt/ldouble.ax` (the arithmetic of a `long double` wider than `double`)
   is every such program's, freestanding or not.
 - A name that one of the program's own units, or one of its Axiom modules (an `export
   fn`), defines is the program's, and the library's definition of it is left out (as a
@@ -1024,7 +1032,7 @@ library's heap (`__libc_malloc` and its kin), as they always do on macOS
 (`libSystem`'s), so that memory one library allocates the other frees; in a program that
 needs nothing of the system's (a static one on Linux; Windows; WebAssembly) they use the
 Axiom allocator. `errno` is then that library's too (its `__errno_location`, on macOS
-`__error`: `std/c/rt/core_errno.ax`), so that both libraries' functions set one object.
+`__error`: `lib/c/rt/core_errno.ax`), so that both libraries' functions set one object.
 Code compiled by the system's C compiler (its objects and libraries) uses this library,
 the program's: "Objects and libraries" says how. On
 Windows nothing comes from `msvcrt.dll` (the suite checks every Windows executable's
@@ -1033,7 +1041,7 @@ imports) unless `--c-lib=system` makes it the program's library. On macOS the ru
 its own (`__axiom_libc_...`, which the linker binds to those), so that they are never
 the program's.
 
-The library's core (`std/c/lib/core/`, `std/c/rt/core*.ax`):
+The library's core (`lib/c/lib/core/`, `lib/c/rt/core*.ax`):
 
 | Header | What is there |
 |---|---|
@@ -1122,7 +1130,7 @@ C23's `_Decimal32`, `_Decimal64` and `_Decimal128` (`__STDC_IEC_60559_DFP__` is
 encoded in BID (binary integer decimal), the encoding the C ABIs of x86-64 and AArch64
 specify: 4, 8 and 16 bytes, aligned to their sizes (and Annex H's `_Decimal64x`, in
 decimal128's format: "Annex H: the interchange and extended types"). Their arithmetic is software of the
-compiler's (`std/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
+compiler's (`lib/c/rt/decimal.ax`), the same on every target (`_Decimal32`'s and
 `_Decimal64`'s `+`, `*` and `/` in 64- and 128-bit integers, `_Decimal128`'s `+`, `-`, `*`
 and `/` in 128- and 256-bit integers (Knuth's Algorithm D for the quotients), where the
 result's exponent is far from the format's limits; elsewhere the general code, whose
@@ -1171,9 +1179,9 @@ results and flags these paths give bit for bit in every direction):
   many as cancellation needs; trigonometric arguments reduced exactly, up to 10^6145)
   and round once: within 1 ulp (measured against an arbitrary-precision reference, a few hundred arguments of
   every magnitude per function and format: the largest error 0.500 ulp). For
-  `_Decimal32` and `_Decimal64` they first take a binary path (`std/c/rt/dfp_fast.ax`):
+  `_Decimal32` and `_Decimal64` they first take a binary path (`lib/c/rt/dfp_fast.ax`):
   the argument converted to binary128 (within 2^-111, by a table of the powers of ten,
-  `std/c/rt/dfp_tables.ax`), the binary128 function (`math_ld.ax`), and the result
+  `lib/c/rt/dfp_tables.ax`), the binary128 function (`math_ld.ax`), and the result
   converted back with a rounding test that allows for the error of both and the
   function's condition number at the argument; where the test cannot decide, or the
   result may be exact (it then needs its preferred quantum), or the argument or the
@@ -1240,11 +1248,11 @@ library); its library identifiers are declared with `__STDC_WANT_IEC_60559_TYPES
   Its arithmetic is decimal128's, every ABI passes it as `_Decimal128`, and debug
   information names it (`DW_ATE_decimal_float`). `<float.h>` has `DEC64X_MANT_DIG` ...
   `DEC64X_SNAN`, `<math.h>` `HUGE_VAL_D64X` and every `d64x` function of H.11.2 (those of
-  `_Decimal128`, `std/c/lib/math/fn_d64x.c`: the same values and quanta), with the
+  `_Decimal128`, `lib/c/lib/math/fn_d64x.c`: the same values and quanta), with the
   narrowing operations `d32addd64x`, `d64addd64x` and `d64xaddd128` ... (one rounding),
   `<stdlib.h>` `strtod64x` and `strfromd64x`, `<wchar.h>` `wcstod64x`.
 - **The binary types' functions**: every function of H.11.2 for `_Float16`, `_Float32`, `_Float64`, `_Float128`,
-  `_Float32x` and `_Float64x` (`std/c/include/axc/math_floatn.h`, generated by
+  `_Float32x` and `_Float64x` (`lib/c/include/axc/math_floatn.h`, generated by
   `cmd/internal/tools/gen_floatn.py`, as are the definitions and the test
   `c/lib/math/floatn_names.c`): `_Float16`'s and `_Float128`'s the library's own
   (binary128's exact functions correctly rounded, its elementary ones in its precision;
@@ -1285,7 +1293,7 @@ library); its library identifiers are declared with `__STDC_WANT_IEC_60559_TYPES
 
 ### Standard input/output: `<stdio.h>`
 
-The library's `<stdio.h>` (`std/c/lib/stdio/`, over `std/c/rt/stdio.ax`) is all of
+The library's `<stdio.h>` (`lib/c/lib/stdio/`, over `lib/c/rt/stdio.ax`) is all of
 C17's 7.21 with C23's additions, and the wide-character input/output of `<wchar.h>`
 (7.29.2, 7.29.3), on every target. Its implementation-defined choices:
 
@@ -1391,7 +1399,7 @@ call through a pointer would not be known to return twice.
   to), so that the
   termination handlers of system frames in between run (a callback a DLL called, left
   by `longjmp`); the registers are then restored from `jmp_buf`
-  (`std/c/rt/core_jump.ax`). A freestanding program's `longjmp` restores them at once,
+  (`lib/c/rt/core_jump.ax`). A freestanding program's `longjmp` restores them at once,
   which is right for the program's own frames (they have no handlers), and its last
   instruction moves the stack pointer and returns in one step, so that the system's
   unwinder is right at every instruction of it.
@@ -1458,10 +1466,10 @@ cites, with polynomial coefficients and tables computed by
 `cmd/internal/tools/gen_math_tables.py` (in arbitrary precision; `std/internal/math/tables.ax`).
 The elementary double and float functions are kernels shared with Axiom's `std/math`
 (`std/internal/math/`), which report their errors through the library's wrappers
-(`std/c/rt/math*.ax`); C23's that compute are `std/c/rt/math_c23.ax`, its narrowing
+(`lib/c/rt/math*.ax`); C23's that compute are `lib/c/rt/math_c23.ax`, its narrowing
 operations `math_narrow.ax`; those that take or return `int` or `long`, the bit-level ones
 (payloads, total order, `fromfp`), the `long double` forms, `<fenv.h>` and the complex
-functions are C (`std/c/lib/math/`).
+functions are C (`lib/c/lib/math/`).
 
 - **Accuracy.** `sqrt`, `fma`, the rounding functions, `fmod`, `remainder`, `remquo`,
   `ldexp`/`scalbn`, `frexp`, `nextafter` and the other exact ones are exact or correctly
@@ -1504,13 +1512,13 @@ functions are C (`std/c/lib/math/`).
   divisions in a row (the quotient picks the table row of the second): an estimate of
   the quotient without a division, by Newton's iteration, made it slower.
 - **The complex functions** follow Annex G's special values (G.6) and Kahan's methods
-  (`std/c/lib/math/complex_impl.h`, one text for every type), in the forms where nothing
+  (`lib/c/lib/math/complex_impl.h`, one text for every type), in the forms where nothing
   cancels: `ctanh` from `sinh x cosh x / (sinh^2 x + cos^2 y)` and `sin y cos y / (sinh^2 x
   + cos^2 y)`, `casin` and `cacos` from the square roots of `1 - z` and `1 + z`, `catanh`'s
   real part from `log1p` (near +-1 from the difference of two logarithms), `e^x` beyond the
   overflow of its products as `(e^(x/2))^2`. Each part is computed in pairs of the real
   type (Dekker's error-free transformations) from real functions that give their values
-  in such pairs (double: `std/c/rt/math_cx.ax`, from the kernels of `std/internal/math`
+  in such pairs (double: `lib/c/rt/math_cx.ax`, from the kernels of `std/internal/math`
   before their last rounding, within 2^-56 or better; the wider types: `math_ld.ax`'s
   `__axc_ldcx`, its triple-double kernels), and rounded once. Measured against an
   arbitrary-precision reference (24,000 arguments per double function over the plane:
@@ -1524,7 +1532,7 @@ functions are C (`std/c/lib/math/`).
   rounded to the type. `cpow` is `e^(w log z)` with `log z` and its product with `w` in
   pairs, and where `B = (|Re w| + |Im w|)(|log |z|| + |arg z|)` is beyond what the
   pairs hold to the precision the angle `Im(w log z)` needs (2^12 for double, 2^50 for
-  the x87 format), in triple-double (`std/c/rt/math_ld.ax`'s `__axc_ldcpow`: `log |z|`
+  the x87 format), in triple-double (`lib/c/rt/math_ld.ax`'s `__axc_ldcpow`: `log |z|`
   and `arg z` within 2^-150, the angle reduced exactly by multiples of pi/2, a part at a
   time): each part within 2 ulps while `B` is below 2^90 for double, 2^120 for float
   (`_Float16`: everywhere), 2^70 for the x87 format and 2^26 for binary128 (whose pairs
@@ -1548,7 +1556,7 @@ functions are C (`std/c/lib/math/`).
   rounding functions, `fmodl`, `remainderl`, `remquol`, `frexpl`, `ldexpl`, `scalbnl`,
   `ilogbl`, `logbl`, `modfl`, `nextafterl`, `nexttowardl`, `nextupl`, `nextdownl`, `fmaxl`,
   `fminl`, `fdiml`, the `fmaximum` family) work on the format's bits and are exact, `sqrtl`
-  is correctly rounded (`std/c/lib/math/m_ldwide.c`), and so is `fmal` (exact in 512-bit
+  is correctly rounded (`lib/c/lib/math/m_ldwide.c`), and so is `fmal` (exact in 512-bit
   integers). The elementary ones (`expl`, `exp2l`, `exp10l`, `expm1l`, `logl`, `log2l`,
   `log10l`, `log1pl`, `sinl`, `cosl`, `tanl`, `asinl`, `acosl`, `atanl`, `atan2l`,
   `sinhl`, `coshl`, `tanhl`, `asinhl`, `acoshl`, `atanhl`, `powl`, `hypotl`, `cbrtl`)
@@ -1556,11 +1564,11 @@ functions are C (`std/c/lib/math/`).
   double-double's 106; the x87's 64 would not, but one implementation serves both),
   from the format's bits taken apart exactly, with tables of triple-doubles and an exact
   reduction of the trigonometric arguments over the whole exponent range, and round once
-  (`std/c/rt/math_ld.ax`): within 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's
+  (`lib/c/rt/math_ld.ax`): within 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's
   (measured: 0.500 for each, both formats). An integer power `powl(x, n)` whose exact
   value fits 128 bits is computed exactly and rounded once (so `x * x`'s halfway cases
   round to even). For the x87 format these functions (and the four below) first take a
-  double-double path (`std/c/rt/math_ldx.ax`: the same methods with fewer terms, the
+  double-double path (`lib/c/rt/math_ldx.ax`: the same methods with fewer terms, the
   `asin` and `acos` kernel from Taylor polynomials about j/32, within 2^-84 to 2^-98;
   the logarithms, `asinl`, `acosl`, the inverse hyperbolic functions and `lgammal` of a
   positive argument within 2^-85 to 2^-90, with the sums of their recurrences left
@@ -1700,7 +1708,7 @@ strict floating point (`FENV_ACCESS ON`, `--c-fenv-access`, or a static `FENV_RO
 direction in it) each operation reads the environment's register, rounds in its
 direction and raises its exceptions in it (invalid, divide-by-zero, overflow, underflow
 for a tiny inexact result with tininess detected after rounding, inexact), as the
-hardware's `float` and `double` operations do: `std/c/rt/ldouble.ax`'s `e_` functions.
+hardware's `float` and `double` operations do: `lib/c/rt/ldouble.ax`'s `e_` functions.
 Elsewhere it rounds to nearest and raises nothing, at no cost for the environment: code
 translated with `FENV_ACCESS` OFF runs in the default mode or has undefined behaviour,
 and its flags may not be tested (7.6.1p2), so the results are the same. A `_Float16`
@@ -1903,7 +1911,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later; also of `_Float16` ... `_Float64x`) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. The imaginary types (`float _Imaginary`, `double _Imaginary`, `long double _Imaginary`, C99 and later, Annex G) have their real type's representation (the imaginary part); their arithmetic is G.5's (an imaginary times an imaginary is real, a real plus an imaginary complex, ...), their conversions G.4's (an imaginary converted to a real type is 0, a complex one to an imaginary type its imaginary part). |
 | Interchange and extended floating types | (C23 Annex H, and in every mode before C23.) `_Float16` is binary16, `_Float32` binary32, `_Float64` and `_Float32x` binary64, `_Float128` binary128 (`__float128` in a GNU dialect), `_Float64x` the x87 format where `long double` has it, else binary128; each a type of its own. `_Float16`'s operations are rounded to binary16 each (`FLT_EVAL_METHOD` 0: computed in `float`, which is exact enough that the one rounding is correct), `_Float128`'s and `_Float64x`'s are `long double`'s software arithmetic in that format. The usual arithmetic conversions take the type with more values, then of two with the same values an interchange type over a standard one over an extended one (`float + _Float32` is `_Float32`, `double + _Float32x` is `double`). Constants take `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` (either case). `<float.h>` has their macros (`FLT16_MAX` ...) under `__STDC_WANT_IEC_60559_TYPES_EXT__`. `_Decimal64x` (C23, Annex H.2.4) is decimal128 (H.2.4p4 allows it), 16 bytes aligned to 16, passed as `_Decimal128` is; a type of its own ("Annex H: the interchange and extended types"). |
-| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals (`+ - * /` of normal operands with a normal result by 64-bit integer fast paths, division by Knuth's Algorithm D); constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
+| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`lib/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals (`+ - * /` of normal operands with a normal result by 64-bit integer fast paths, division by Knuth's Algorithm D); constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
@@ -1911,7 +1919,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23 (and in the GNU dialects before it, as the system's headers expect: `1u << 31`), if some enumerator does not fit `int`, the first of `long`, `long long` and, in a GNU dialect, `__int128` (`unsigned long`, `unsigned long long`, `unsigned __int128` for an unsigned type) that holds all of them, and then the constants have the enumerated type; while the list is read, a constant outside `int` has the type of its expression (a `_BitInt` too), and an implicit one (the previous plus 1) the previous one's type, or if that does not hold it the first of those wider types of its signedness that does (6.7.2.2p11). No such type: `C3013`. Before C23, under an ISO standard, a value outside `int` is `C3013`. With a fixed underlying type (C23), that type, which may be `__int128` or `unsigned __int128` in a GNU dialect (with any value of it). |
 | `_BitInt(N)` | `BITINT_MAXWIDTH` is 65535. For N up to 64 an object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it; as an argument or result it is that integer. Wider, it is stored in 64-bit limbs, the least significant first, as many as hold N, aligned to 8 (the x86-64 System V psABI's and Windows' array of 8-byte chunks; WebAssembly the same), or on AArch64 (Linux and macOS) in 16-byte units aligned to 16 (AAPCS64: `_BitInt(65)` to `_BitInt(128)` as `__int128`): `sizeof(_BitInt(129))` is 24, 32 on AArch64. The value is sign- or zero-extended through its storage; the bits beyond N that arrive (arguments, results, and objects in memory, which code compiled elsewhere writes) are not relied on: the ABIs leave them unspecified. |
 | `__int128` | GNU dialects: `__int128` and `unsigned __int128` are 16 bytes aligned to 16 on every target, an extended integer type whose rank is above `long long` and above `_BitInt(128)`'s, below `_BitInt(129)`'s. `__AXIOM_INT128__` is defined (1). `intmax_t` stays 64 bits (C23 7.22.1.5 lets an extended type be wider), and so does the preprocessor's arithmetic. |
-| Integers wider than 64 bits | `__int128` and `_BitInt(N)` for N > 64. Their arithmetic is exact to the type's width: two-limb values (up to 128 bits) inline (+ and - as add/adc and sub/sbb on x86-64, adds/adc and subs/sbc on AArch64, * with the 64-by-64-bit product's high half, shifts, comparisons, the bitwise operations; / and % inline when both operands are below 2^64, else a function: on x86-64 one generated into the program that uses the 128-by-64-bit `div`, elsewhere a run-time function), wider ones by the functions of `std/c/rt/wideint.ax` (generated into a program only when it calls them); division is Knuth's Algorithm D. Constant expressions are folded with the same functions, in the type's precision. Conversions to `float` and `double` are correctly rounded (to nearest, ties to even), as are those to a wide `long double` (`std/c/rt/ldouble.ax`); from them they truncate toward zero and saturate (undefined when the value does not fit, 6.3.1.4). A signed result that overflows wraps (undefined: a program must not rely on it; these operations are not marked as not overflowing, as the narrower types' are), but in a constant expression it is `C3036`. Bit-fields of these types are laid out as the ABIs say: in a unit of the type's size aligned as the type is, the last such window at or before the next free bit that holds it, else the next (System V, and for `__int128` AAPCS64; checked against the system's compilers on x86-64 and, for `__int128`, AArch64 Linux), on Windows in its runs of units of the type's size at its alignment; in a packed structure (System V, AAPCS64, WebAssembly) at the next bit, reached through the bytes it spans ("Attributes": `packed`). An enumeration may have `__int128` or `unsigned __int128` for its type ("Implementation-defined behavior": enumerations); one whose fixed underlying type is a `_BitInt` is `C3075` (C23 6.7.2.2p5). A `switch` on them takes case ranges. An integer constant expression where a value of at most 64 bits is needed (an alignment, a bit-field's width, an array's length: `C3009`) whose value is wider is `C3212`. `<stdbit.h>`'s type-generic functions take `unsigned __int128` and the unsigned `_BitInt` types (C23 7.18.1p4: those whose width is a standard or extended type's; here any above 64 bits too), `<stdckdint.h>`'s and the GNU `__builtin_*_overflow` functions any of them. An `_Atomic` one of 16 bytes is lock-free where 16-byte atomics are ("Atomics and threads"), a wider one under the lock; the GNU `__atomic` builtins' generic forms take them, the others only objects of 1, 2, 4 or 8 bytes. `printf` and `scanf` have no conversion for them: C23's `%wN` length modifiers are for the widths of the `intN_t` types `<stdint.h>` defines, which stop at 64. `intmax_t` and `uintmax_t` stay 64 bits on every target (C23 7.22.1.5 lets an extended or bit-precise type be wider), as do `INTMAX_WIDTH`, `%jd` and the preprocessor's arithmetic, in which a `wb` constant wider than 64 bits is `C1016`. |
+| Integers wider than 64 bits | `__int128` and `_BitInt(N)` for N > 64. Their arithmetic is exact to the type's width: two-limb values (up to 128 bits) inline (+ and - as add/adc and sub/sbb on x86-64, adds/adc and subs/sbc on AArch64, * with the 64-by-64-bit product's high half, shifts, comparisons, the bitwise operations; / and % inline when both operands are below 2^64, else a function: on x86-64 one generated into the program that uses the 128-by-64-bit `div`, elsewhere a run-time function), wider ones by the functions of `lib/c/rt/wideint.ax` (generated into a program only when it calls them); division is Knuth's Algorithm D. Constant expressions are folded with the same functions, in the type's precision. Conversions to `float` and `double` are correctly rounded (to nearest, ties to even), as are those to a wide `long double` (`lib/c/rt/ldouble.ax`); from them they truncate toward zero and saturate (undefined when the value does not fit, 6.3.1.4). A signed result that overflows wraps (undefined: a program must not rely on it; these operations are not marked as not overflowing, as the narrower types' are), but in a constant expression it is `C3036`. Bit-fields of these types are laid out as the ABIs say: in a unit of the type's size aligned as the type is, the last such window at or before the next free bit that holds it, else the next (System V, and for `__int128` AAPCS64; checked against the system's compilers on x86-64 and, for `__int128`, AArch64 Linux), on Windows in its runs of units of the type's size at its alignment; in a packed structure (System V, AAPCS64, WebAssembly) at the next bit, reached through the bytes it spans ("Attributes": `packed`). An enumeration may have `__int128` or `unsigned __int128` for its type ("Implementation-defined behavior": enumerations); one whose fixed underlying type is a `_BitInt` is `C3075` (C23 6.7.2.2p5). A `switch` on them takes case ranges. An integer constant expression where a value of at most 64 bits is needed (an alignment, a bit-field's width, an array's length: `C3009`) whose value is wider is `C3212`. `<stdbit.h>`'s type-generic functions take `unsigned __int128` and the unsigned `_BitInt` types (C23 7.18.1p4: those whose width is a standard or extended type's; here any above 64 bits too), `<stdckdint.h>`'s and the GNU `__builtin_*_overflow` functions any of them. An `_Atomic` one of 16 bytes is lock-free where 16-byte atomics are ("Atomics and threads"), a wider one under the lock; the GNU `__atomic` builtins' generic forms take them, the others only objects of 1, 2, 4 or 8 bytes. `printf` and `scanf` have no conversion for them: C23's `%wN` length modifiers are for the widths of the `intN_t` types `<stdint.h>` defines, which stop at 64. `intmax_t` and `uintmax_t` stay 64 bits on every target (C23 7.22.1.5 lets an extended or bit-precise type be wider), as do `INTMAX_WIDTH`, `%jd` and the preprocessor's arithmetic, in which a `wb` constant wider than 64 bits is `C1016`. |
 | Null pointer | All bits zero. |
 | Source and execution character sets | UTF-8. Narrow string literals are UTF-8 bytes (invalid UTF-8 in a literal is `C1024`). `L"..."` is UTF-16 on Windows (`wchar_t` is 16 bits) and UTF-32 elsewhere; `u"..."` is UTF-16 and `U"..."` UTF-32. |
 | Multi-character constants | `'ab'` is `'a' * 256 + 'b'` as an `int` of the build's width (the first character is the most significant); a warning, `C4102`. A wide one has the value of its last character. More characters than the type holds is `C1011`. |
@@ -1935,7 +1943,7 @@ format than the ABI's cannot pass `long double` values to it.
 ## Headers
 
 The compiler provides the headers a freestanding implementation must have, in
-`std/c/include/`, and the C library's ("The C library"). Each is available from the
+`lib/c/include/`, and the C library's ("The C library"). Each is available from the
 standard that introduced it; including it in an earlier mode is an `#error`. With
 `--c-freestanding` only the ones of this table and `<string.h>` are found; the
 library's are `C1081`.
@@ -3148,9 +3156,9 @@ The GNU dialects' `__thread` is `_Thread_local`.
 `<threads.h>` (C11 7.26, C17, and C23's changes: `thread_local` is a macro only before
 C23, where it is a keyword; `call_once`, `once_flag` and `ONCE_FLAG_INIT` are also in
 C23's `<stdlib.h>`) is the C library's threads part, on every target:
-`std/c/lib/threads/<name>.c` over `std/c/rt/threads.ax` (mutexes, condition variables, `call_once`,
+`lib/c/lib/threads/<name>.c` over `lib/c/rt/threads.ax` (mutexes, condition variables, `call_once`,
 thread-specific storage, `thrd_current`, `thrd_sleep`, `thrd_yield`) and
-`std/c/rt/threads_spawn.ax` (`thrd_create`, `thrd_join`, `thrd_detach`, `thrd_exit`),
+`lib/c/rt/threads_spawn.ax` (`thrd_create`, `thrd_join`, `thrd_detach`, `thrd_exit`),
 which build on `std/thread` and Axiom's atomics and `@atomic_wait`/`@atomic_notify` (the
 protocols of `std/sync`'s `Mutex`, `Condvar` and `Once`; `std/sync` itself is not
 imported, as it would make every WebAssembly program that uses a mutex threaded).
@@ -3803,7 +3811,7 @@ standard it claims, "Known deviations".
 
 - Locales: the `"C"` conventions only, collation by code values, Unicode 15.1's classes
   ([`docs/c-text.md`](c-text.md), "Not provided, or limits").
-- Every hosted program's build analyzes the time zone module (`std/c/rt/text_time.ax`,
+- Every hosted program's build analyzes the time zone module (`lib/c/rt/text_time.ax`,
   `std/time/tz`) whether it uses it or not (`docs/c-text.md`).
 - POSIX's streams (`fmemopen`, `fileno`, `popen`, ...) are not provided ("Standard
   input/output", Exit).

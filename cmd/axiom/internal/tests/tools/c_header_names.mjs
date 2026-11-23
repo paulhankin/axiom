@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // c_header_names.mjs - checks the namespace of the compiler's standard C
-// headers (std/c/include/) against cmd/axiom/internal/tests/c/headers/
+// headers (lib/c/include/) against cmd/axiom/internal/tests/c/headers/
 // names.txt, which lists, from the standards' synopses, the names each
 // header has in each standard and those the standard reserves to it.
 //
@@ -26,7 +26,7 @@ import path from 'path';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/build/axiom'));
-const incDir = path.join(root, 'std/c/include');
+const incDir = path.join(root, 'lib/c/include');
 const STDS = ['c89', 'c95', 'c99', 'c11', 'c17', 'c23'];
 const rank = (s) => STDS.indexOf(s);
 

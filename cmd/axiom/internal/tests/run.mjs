@@ -32,6 +32,13 @@
 // of cmd/axiom/src), for runs after the first of several configurations;
 // AXIOM_UPDATE_DOC=1 rewrites the golden outputs of `axiom doc`.
 //
+// The C front end's tests (C sources under cmd/axiom/internal/tests/c/, and
+// the cases named "C ..."; isCTest) run by default, and are counted as a
+// group of their own: the C front end is an experiment (docs/c.md), and a
+// release of the language does not wait on it. The exit status is 0 when
+// everything passed, 1 when a test of the language failed, and 3 when only
+// tests of the C front end did.
+//
 // The suite is a list of sections (section(...) below): a map from test
 // names to functions that return null, a problem (a string), or
 // { skip: true, reason }. Sections run their tests one at a time, or `jobs`
@@ -318,12 +325,17 @@ async function runNative(exe) {
 console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${axFlags().length ? `, ${axFlags().join(' ')}` : ''}, ${jobs} jobs`);
 let pass = 0, fail = 0, skip = 0;
 const failures = [], skips = [];
+// the C front end's group (see the top of this file)
+const isCTest = (name) => /cmd\/axiom\/internal\/tests\/c\//.test(name) || /^C[ :]/.test(name) || /: C[ :]/.test(name);
+let cPass = 0, cFail = 0, cSkip = 0;
 
 // One result: r is null (passed), a string (the problem), { skip: true,
 // reason }, or { problem, stderr } (stderr is shown, as the program wrote it).
 function record(name, r, ms, note) {
+  const inC = isCTest(name);
   if (r && r.skip) {
     skip++;
+    if (inC) cSkip++;
     skips.push(`${name}${r.reason ? `: ${r.reason}` : ''}`);
     if (verbose) console.log(`skip ${name}${r.reason ? ` (${r.reason})` : ''}`);
     return;
@@ -332,8 +344,8 @@ function record(name, r, ms, note) {
     if (r.stderr) process.stderr.write(r.stderr);
     r = r.problem;
   }
-  if (r) { fail++; failures.push(`FAIL ${name}: ${r}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name}${ms === undefined ? '' : ` (${ms.toFixed(0)} ms)`}${note ? ` (${note})` : ''}`); }
+  if (r) { fail++; if (inC) cFail++; failures.push(`FAIL ${name}: ${r}`); console.log(`FAIL ${name}`); }
+  else { pass++; if (inC) cPass++; console.log(`ok   ${name}${ms === undefined ? '' : ` (${ms.toFixed(0)} ms)`}${note ? ` (${note})` : ''}`); }
 }
 
 // A section of the suite. `cases` maps names (after `prefix: `, when there
@@ -1031,7 +1043,7 @@ const cLibTest = async (f) => {
   const want = dv('expect');
   // (expect-signal: <n>: on Linux and macOS the system's default action
   // kills the process with signal n; elsewhere the library ends it with
-  // status 3 for SIGABRT, 128 + n for the others: std/c/include/signal.h)
+  // status 3 for SIGABRT, 128 + n for the others: lib/c/include/signal.h)
   const sig = dv('expect-signal').length ? Number(dv('expect-signal')[0]) : 0;
   const names = { 2: 'SIGINT', 4: 'SIGILL', 6: 'SIGABRT', 8: 'SIGFPE', 11: 'SIGSEGV', 15: 'SIGTERM' };
   if (sig && native && !/windows/.test(nt)) {
@@ -1043,11 +1055,11 @@ const cLibTest = async (f) => {
   return { problem: want.join('\n') === got.join('\n') ? null : `output mismatch\n--- expected\n${want.join('\n')}\n--- got\n${got.join('\n')}`, stderr: dv('expect-stderr').length ? '' : stderr };
 };
 await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true, buildOnly: true, note: buildNote });
-// The C library's index (std/c/lib/index: which unit defines each name, for
+// The C library's index (lib/c/lib/index: which unit defines each name, for
 // loading the library on demand) is what cmd/internal/tools/gen_c_lib_index.mjs
 // writes from the sources.
 await section('', {
-  'C library: std/c/lib/index is current': async () => {
+  'C library: lib/c/lib/index is current': async () => {
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/internal/tools/gen_c_lib_index.mjs'), '--check'],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
@@ -1293,18 +1305,19 @@ function cDriverCases() {
       if (c.status !== 0 || !fs.readFileSync(obj).includes('lib_f199')) return `lib.c --emit=obj: ${c.stdout}${c.stderr}`;
       return null;
     },
-    'C: the C library directories (std/c/lib, std/c/rt)': async () => {
-      // a standard library whose c/lib and c/rt are this test's (the rest
-      // is the real one's, linked)
-      const std = path.join(dir, 'fakestd');
-      fs.rmSync(std, { recursive: true, force: true });
-      fs.mkdirSync(path.join(std, 'c/lib'), { recursive: true });
-      fs.mkdirSync(path.join(std, 'c/rt'), { recursive: true });
-      for (const n of fs.readdirSync(path.join(root, 'std'))) if (n !== 'c') fs.symlinkSync(path.join(root, 'std', n), path.join(std, n));
-      fs.symlinkSync(path.join(root, 'std/c/include'), path.join(std, 'c/include'));
-      fs.writeFileSync(path.join(std, 'c/lib/a.c'), 'int rt_twice(int);\nint lib_used(int x) { return rt_twice(x) + 1; }\n' +
+    'C: the C library directories (lib/c/lib, lib/c/rt)': async () => {
+      // the standard library, linked, and beside it libraries whose c/lib
+      // and c/rt are this test's (c/include is the real one's, linked)
+      const fake = path.join(dir, 'fakeroot');
+      const std = path.join(fake, 'std'), lc = path.join(fake, 'lib/c');
+      fs.rmSync(fake, { recursive: true, force: true });
+      fs.mkdirSync(path.join(lc, 'lib'), { recursive: true });
+      fs.mkdirSync(path.join(lc, 'rt'), { recursive: true });
+      fs.symlinkSync(path.join(root, 'std'), std);
+      fs.symlinkSync(path.join(root, 'lib/c/include'), path.join(lc, 'include'));
+      fs.writeFileSync(path.join(lc, 'lib/a.c'), 'int rt_twice(int);\nint lib_used(int x) { return rt_twice(x) + 1; }\n' +
         'int lib_replaced(int x) { return -1; }\nint rt_unused_fn(int);\nint lib_unused(int x) { return rt_unused_fn(x); }\n');
-      fs.writeFileSync(path.join(std, 'c/rt/rt.ax'), 'export fn rt_twice(x: i32) i32 {\n    return x * 2;\n}\n\n' +
+      fs.writeFileSync(path.join(lc, 'rt/rt.ax'), 'export fn rt_twice(x: i32) i32 {\n    return x * 2;\n}\n\n' +
         'export fn rt_unused_fn(x: i32) i32 {\n    return x;\n}\n');
       write({ 'use.c': 'int lib_used(int);\nint lib_replaced(int x) { return x + 100; }\n' +
         'int main(void) { return lib_used(20) + lib_replaced(0) - 141; }\n' });
@@ -1313,7 +1326,7 @@ function cDriverCases() {
       if (c.status !== 0) return `use.c with the library: ${c.stdout}${c.stderr}`;
       let r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
       if (r.status !== 0) return `use.c: exit ${r.status} ${r.stderr}`;
-      if (fs.readFileSync(out).includes('rt_unused_fn')) return 'an unused export of std/c/rt is in the program';
+      if (fs.readFileSync(out).includes('rt_unused_fn')) return 'an unused export of lib/c/rt is in the program';
       // without the library, lib_used is the host's (WebAssembly imports it)
       c = await ax(['build', 'use.c', `--std=${std}`, '--c-freestanding', '-o', out]);
       if (c.status !== 0) return `--c-freestanding: ${c.stdout}${c.stderr}`;
@@ -1781,16 +1794,21 @@ await section('C programs', {
   ...cDriverCases(),
 });
 
-// `axiom test`: the standard library's own tests must pass, and the
-// self-tests in cmd/axiom/internal/tests/testing/ must produce exactly the declared results.
+// `axiom test`: the standard library's and the libraries' own tests must
+// pass (under the address sanitizer, axiom test's default; the core's, std/,
+// also with --overflow=trap unless their flags name a mode: workstream G2),
+// and the self-tests in cmd/axiom/internal/tests/testing/ must produce
+// exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
 function dirsUnder(dir) {
   return [dir, ...fs.readdirSync(dir, { withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name !== 'testdata').map((e) => e.name).sort()
     .flatMap((n) => dirsUnder(path.join(dir, n)))];
 }
-const stdDirs = dirsUnder(path.join(root, 'std'));
-const allStdFiles = stdDirs.flatMap(files);
+// (the core, std/, and the libraries, lib/: spec §4.1)
+const coreFiles = dirsUnder(path.join(root, 'std')).flatMap(files);
+const libFiles = dirsUnder(path.join(root, 'lib')).flatMap(files);
+const allStdFiles = [...coreFiles, ...libFiles];
 const stdSrc = new Map(allStdFiles.map((f) => [path.resolve(f), fs.readFileSync(f, 'utf8')]));
 const partOwned = new Set();
 const partTargets = new Map();
@@ -1809,9 +1827,11 @@ const stdFiles = allStdFiles.filter((f) => {
   if (partOwned.has(r)) return false;
   return hasTestBlock(r) || (partTargets.get(r) || []).some(hasTestBlock);
 });
+const coreSet = new Set(coreFiles.map((f) => path.resolve(f)));
 await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/internal/tests/testing'))], '[axiom test]', async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
+  if (coreSet.has(path.resolve(f)) && !d.flags.some((x) => x.startsWith('--overflow='))) d.flags.push('--overflow=trap');
   if (buildOnly) {
     // (the test binary, built and checked: --no-run)
     const out = path.join(tmp, `test-${path.relative(root, f).replace(/[/.]/g, '-')}${/windows/.test(nativeTarget) ? '.exe' : ''}`);
@@ -2221,7 +2241,7 @@ await section('spec §16.3', {
 // `.none`, never an error, a sentinel or a bool). A cursor read through its
 // fields names its step `advance`. A free function named `next` is not a method.
 await section('spec §15.3', {
-  'every public method named next in std is an iterator\'s': () => {
+  'every public method named next in std and lib is an iterator\'s': () => {
     const exempt = new Set([]);  // 'path/to/module.ax: Type', each with the reason why
     const problems = [];
     for (const [f, src] of stdSrc) {
@@ -2244,6 +2264,85 @@ await section('spec §15.3', {
     return problems.length ? `\n  ${problems.join('\n  ')}` : null;
   },
 }, { timed: false });
+
+// The core (std/, workstream G2 of docs/agent-fit-plan.md; spec §4.1): it
+// imports only itself, the compiler imports only it, and every public item
+// of the modules `axiom doc std` lists has a `///` comment (W0320). Its tests
+// run with --overflow=trap ([axiom test], above).
+{
+  const impRe = /^\s*import\s+(?:part\s+)?"([^"]+)"/gm;
+  const target = (from, ip) => {
+    if (ip.startsWith('pkg:')) return null;
+    const p = /\.ax$/.test(ip) ? ip : `${ip}.ax`;
+    if (ip.startsWith('std/') || ip.startsWith('lib/')) return path.join(root, p);
+    return path.resolve(path.dirname(from), p);
+  };
+  const under = (p, dir) => p.startsWith(path.join(root, dir) + path.sep);
+  // the C front end's arithmetic, which the compiler folds C constants with
+  // and C programs link (docs/c.md): lib/c/rt, since a release finds the C
+  // runtime there, and imported by a relative path, which the seed resolves;
+  // these import nothing but each other
+  const compilerLib = new Set(['lib/c/rt/ldouble.ax', 'lib/c/rt/wideint.ax', 'lib/c/rt/decimal.ax', 'lib/c/rt/dec_env.ax']
+    .map((f) => path.join(root, f)));
+  await section('core', {
+    'the core imports only the core': () => {
+      const bad = [];
+      for (const f of coreFiles) {
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (t && !under(t, 'std')) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'the compiler imports only the core': () => {
+      const bad = [], seen = new Set();
+      const stack = fs.readdirSync(path.join(root, 'cmd/axiom/src'), { recursive: true })
+        .filter((n) => n.endsWith('.ax')).map((n) => path.join(root, 'cmd/axiom/src', n));
+      while (stack.length) {
+        const f = stack.pop();
+        if (seen.has(f)) continue;
+        seen.add(f);
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (!t) continue;
+          const ok = under(t, 'cmd/axiom/src') || under(t, 'std') || (compilerLib.has(t) && (under(f, 'cmd/axiom/src') || compilerLib.has(f)));
+          if (!ok) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+          if (fs.existsSync(t)) stack.push(t);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'of the libraries, only the C runtime imports std/internal': () => {
+      const bad = [];
+      for (const f of libFiles) {
+        if (under(f, 'lib/c/rt')) continue;
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (t && under(t, 'std/internal')) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'every public item of the core is documented (W0320)': async () => {
+      const stdDir = path.join(root, 'std');
+      const l = spawnSync(compiler, ['doc', 'std', '--format=agent-json', `--std=${stdDir}`], { encoding: 'utf8', cwd: root });
+      let mods;
+      try { mods = JSON.parse(l.stdout).modules; } catch { return `axiom doc std: ${l.stdout}${l.stderr}`; }
+      const got = [];
+      for (const m of mods) {
+        const c = await spawnAsync(compiler, ['check', m.file, '--warn=W0320', '--format=agent-json', `--std=${stdDir}`],
+          { encoding: 'utf8', cwd: root, timeout: compileTimeout });
+        let j;
+        try { j = JSON.parse(c.stdout); } catch { return `axiom check ${m.file}: ${c.stdout}${c.stderr}`; }
+        if (j.status === 'error') return `axiom check ${m.file}: ${c.stdout}`;
+        for (const d of j.diagnostics) if (d.code === 'W0320') got.push(`${d.file}:${d.span.start_line}: ${d.message}`);
+      }
+      if (mods.length < 40) return `axiom doc std listed only ${mods.length} modules`;
+      return got.length ? `\n  ${got.join('\n  ')}` : null;
+    },
+  }, { timed: false });
+}
 
 // Flags with no other assertion: each builds a program that then runs, or
 // produces the text asked for; `axiom version`; the version module's tests.
@@ -2516,6 +2615,7 @@ await section('spec §15.3', {
     fs.copyFileSync(compiler, path.join(inst, 'bin/axiom'));
     fs.chmodSync(path.join(inst, 'bin/axiom'), 0o755);
     fs.symlinkSync(path.join(root, 'std'), path.join(inst, 'std'));
+    fs.symlinkSync(path.join(root, 'lib'), path.join(inst, 'lib'));
     fs.writeFileSync(path.join(inst, 'RELEASE-NOTES.md'), 'old\n');
     // the release
     const name = `axiom-9.9.9-${plat}-${arch}`;
@@ -2524,6 +2624,8 @@ await section('spec §15.3', {
     fs.mkdirSync(path.join(rel, 'std'));
     fs.writeFileSync(path.join(rel, 'bin/axiom'), '#!/bin/sh\necho "axiom 9.9.9"\n', { mode: 0o755 });
     fs.writeFileSync(path.join(rel, 'std/mem.ax'), '');
+    fs.mkdirSync(path.join(rel, 'lib'));
+    fs.writeFileSync(path.join(rel, 'lib/README.md'), 'new\n');
     fs.writeFileSync(path.join(rel, 'RELEASE-NOTES.md'), 'new\n');
     const down = path.join(dir, 'mirror/releases/download/v9.9.9');
     fs.mkdirSync(down, { recursive: true });
@@ -2588,8 +2690,9 @@ await section('spec §15.3', {
       const v = spawnSync(exe, ['version'], { encoding: 'utf8' }).stdout;
       const notes = fs.readFileSync(path.join(dir, 'inst/RELEASE-NOTES.md'), 'utf8');
       const left = fs.readdirSync(path.join(dir, 'inst')).filter((f) => f.startsWith('.axiom-update'));
-      return v === 'axiom 9.9.9\n' && notes === 'new\n' && !left.length && fs.existsSync(path.join(root, 'std/mem.ax'))
-        ? null : `version ${v}, notes ${notes}, left ${left}`;
+      const libNew = fs.readFileSync(path.join(dir, 'inst/lib/README.md'), 'utf8') === 'new\n';
+      return v === 'axiom 9.9.9\n' && notes === 'new\n' && libNew && !left.length && fs.existsSync(path.join(root, 'std/mem.ax')) &&
+        fs.existsSync(path.join(root, 'lib/README.md')) ? null : `version ${v}, notes ${notes}, lib/ updated ${libNew}, left ${left}`;
     },
   }, { timed: false });
 }
@@ -2631,6 +2734,65 @@ await section('', {
     if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
     const r = hostRun(out);
     return r.status !== 0 ? `exit status ${r.status}:\n${r.stderr}` : null;
+  },
+}, { timed: false });
+
+// The libraries (spec §4.1): `import "lib/..."` resolves from the directory
+// named lib beside the standard library's, which the internal rule covers as
+// it does std (and which may import std/internal), whose modules show as
+// lib/..., whose tests a program's run does not, and which `axiom doc` and
+// `axiom fmt` know.
+await section('spec §4.1', {
+  'lib/ beside std/: imports, internal modules, tests, doc and fmt': () => {
+    const dir = path.join(tmp, 'libtier');
+    fs.rmSync(dir, { recursive: true, force: true });
+    const write = (files) => {
+      for (const [n, t] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, n)), { recursive: true });
+        fs.writeFileSync(path.join(dir, n), t);
+      }
+    };
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(path.join(root, 'std'), path.join(dir, 'std'));
+    write({
+      'lib/greet.ax': '// lib/greet.ax - greetings.\n\nimport "internal/word.ax" as w;\nimport "std/internal/math/core" as k;\n\n' +
+        '/// The greeting\'s length, and an errno value.\npub fn size() i32 {\n    return @int_cast(i32, w.WORD.len) + k.EDOM;\n}\n\n' +
+        'test "a library\'s test, which a program\'s does not run" {\n    @expect(false);\n}\n',
+      'lib/internal/word.ax': 'pub let WORD: []u8 = "hello";\n',
+      'app/main.ax': 'import "lib/greet" as greet;\n\nexport fn main() i32 {\n    return greet.size() - 38;\n}\n\ntest "own" {\n    @expect(greet.size() == 38);\n}\n',
+      'app/internal.ax': 'import "lib/internal/word" as w;\n\nexport fn main() i32 {\n    return @int_cast(i32, w.WORD.len);\n}\n',
+      'app/runtime.ax': 'import "std/internal/math/core" as k;\n\nexport fn main() i32 {\n    return k.EDOM;\n}\n',
+      'app/missing.ax': 'import "lib/nothing" as n;\n\nexport fn main() i32 {\n    return n.X;\n}\n',
+      'app/escape.ax': 'import "lib/../std/io" as io;\n\nexport fn main() i32 {\n    return 0;\n}\n',
+      'app/tidy.ax': 'export fn main() i32 {\n    return greet.size() - 38;\n}\n',
+    });
+    const std = path.join(dir, 'std');
+    const app = path.join(dir, 'app');
+    const ax = (args) => spawnSync(compiler, [...args, `--std=${std}`], { encoding: 'utf8', cwd: app });
+    const out = path.join(dir, 'main' + (native ? '' : '.wasm'));
+    let c = ax(['build', 'main.ax', '-o', out, ...targetFlags]);
+    if (c.status !== 0) return `main.ax: ${c.stdout}${c.stderr}`;
+    const r = hostRun(out);
+    if (r.status !== 0) return `main.ax ran: exit ${r.status} ${r.stderr}`;
+    c = ax(['test', 'main.ax', '--format=agent-json', '--sanitize=none']);
+    let j = null;
+    try { j = JSON.parse(c.stdout); } catch { return `test main.ax: ${c.stdout}${c.stderr}`; }
+    if (j.status !== 'pass' || j.tests.map((t) => t.name).join() !== 'own') return `test main.ax ran: ${c.stdout}`;
+    const err = (f, code, text) => {
+      const e = ax(['check', f]);
+      return e.status === 1 && e.stderr.includes(`error[${code}]`) && e.stderr.includes(text) ? null : `${f}: status ${e.status}:\n${e.stderr}`;
+    };
+    const p = err('internal.ax', 'E0219', "'lib/internal/word.ax' is internal: only modules under 'lib' may import it") ||
+      err('runtime.ax', 'E0219', "only modules under 'std' or 'lib' may import it") ||
+      err('missing.ax', 'E0211', 'lib/nothing') || err('escape.ax', 'E0218', 'must name a module in the libraries');
+    if (p) return p;
+    c = ax(['doc', 'lib']);
+    if (c.status !== 0 || c.stdout !== 'lib/greet  greetings.\n') return `doc lib: ${c.status} ${c.stdout}${c.stderr}`;
+    c = ax(['doc', 'lib/greet.size']);
+    if (c.status !== 0 || !c.stdout.startsWith('lib/greet.size\npub fn size() i32\n')) return `doc lib/greet.size: ${c.stdout}${c.stderr}`;
+    c = spawnSync(compiler, ['fmt', 'tidy.ax', '--stdout'], { encoding: 'utf8', cwd: app, env: { ...process.env, AXIOM_STD: std } });
+    if (c.status !== 0 || !c.stdout.startsWith('import "lib/greet" as greet;\n\n')) return `fmt tidy.ax: ${c.stdout}${c.stderr}`;
+    return null;
   },
 }, { timed: false });
 
@@ -2939,7 +3101,7 @@ if (!skipPlatform) {
       .filter((n) => n !== 'errors' && n !== 'fmt' && (n.endsWith('.ax') ||
         fs.statSync(path.join(root, 'cmd/axiom/internal/tests', n)).isDirectory()))
       .map((n) => `cmd/axiom/internal/tests/${n}`);
-    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'docs/tour', ...tests]);
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'lib', 'examples', 'docs/tour', ...tests]);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
   await section('fmt', cases, { timed: false });
@@ -2994,14 +3156,18 @@ if (!skipPlatform) {
       };
     }
   }
-  cases['every module axiom doc std lists has a summary'] = () => {
-    const r = doc(['std', '--format=agent-json']);
-    if (r.status !== 0) return `status ${r.status}: ${r.stderr}`;
-    const mods = JSON.parse(r.stdout).modules;
-    if (mods.length < 100) return `only ${mods.length} modules listed`;
-    if (mods.some((m) => m.name.includes('/internal/') || m.name.includes('/testdata/'))) return 'internal or testdata modules listed';
-    const missing = mods.filter((m) => !m.summary).map((m) => m.name);
-    return missing.length ? `no summary (a first comment block): ${missing.join(' ')}` : null;
+  cases['every module axiom doc std and axiom doc lib list has a summary'] = () => {
+    for (const [tier, least] of [['std', 40], ['lib', 100]]) {
+      const r = doc([tier, '--format=agent-json']);
+      if (r.status !== 0) return `${tier}: status ${r.status}: ${r.stderr}`;
+      const mods = JSON.parse(r.stdout).modules;
+      if (mods.length < least) return `${tier}: only ${mods.length} modules listed`;
+      if (mods.some((m) => !m.name.startsWith(`${tier}/`))) return `${tier}: a module of another tree listed`;
+      if (mods.some((m) => m.name.includes('/internal/') || m.name.includes('/testdata/'))) return `${tier}: internal or testdata modules listed`;
+      const missing = mods.filter((m) => !m.summary).map((m) => m.name);
+      if (missing.length) return `${tier}: no summary (a first comment block): ${missing.join(' ')}`;
+    }
+    return null;
   };
   cases['a module that does not compile is documented'] = () => {
     const f = path.join(tmp, 'doc_broken.ax');
@@ -3873,7 +4039,7 @@ if (!skipPlatform) {
       return null;
     },
     'x86_64-macos: the compiler': () => x86(path.join(root, 'cmd/axiom/src/main.ax'), 'x-axiom', ['-O2']),
-    'x86_64-macos: frameworks checked, examples on Metal built (structs on the stack: std/os/objc)': () => {
+    'x86_64-macos: frameworks checked, examples on Metal built (structs on the stack: lib/os/objc)': () => {
       for (const f of fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests/macos')).filter((n) => n.endsWith('.ax')).sort()) {
         const c = spawnSync(compiler, ['check', `cmd/axiom/internal/tests/macos/${f}`, '--target=x86_64-macos'], { encoding: 'utf8', cwd: root });
         if (c.status !== 0) return `${f}: check failed:\n${c.stdout}${c.stderr}`;
@@ -3943,7 +4109,7 @@ if (!skipPlatform) {
   const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
   const xvfb = ['xvfb-run'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
   const vulkan = ['/usr/share/vulkan/icd.d', '/etc/vulkan/icd.d'].some((d) => fs.existsSync(d) && fs.readdirSync(d).length > 0);
-  // An 8-bit RGBA PNG (what std/graphics/image/png writes for RGBA images).
+  // An 8-bit RGBA PNG (what lib/graphics/image/png writes for RGBA images).
   const decodePNG = (d) => {
     let at = 8, width = 0, height = 0;
     const idat = [];
@@ -4753,5 +4919,8 @@ if (overflowLog) {
   for (const l of sites) console.log(`  ${l}`);
 }
 if (skip && !verbose) console.log(`\n${skip} skipped (--verbose names them)`);
-console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
-process.exit(fail ? 1 : 0);
+const counts = (p, f, s) => `${p} passed, ${f} failed${s ? `, ${s} skipped` : ''}`;
+console.log(`\nthe language: ${counts(pass - cPass, fail - cFail, skip - cSkip)}`);
+console.log(`the C front end (an experiment, docs/c.md): ${counts(cPass, cFail, cSkip)}`);
+console.log(`\n${counts(pass, fail, skip)}`);
+process.exit(fail > cFail ? 1 : fail ? 3 : 0);

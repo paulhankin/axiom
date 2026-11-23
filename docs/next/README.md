@@ -8,9 +8,12 @@ paragraph or list starting with a `##` heading for its area, for example:
 ```markdown
 ## Standard library
 
-- `std/audio/formats` reads AAC only once a program adds `aac.DECODER` with
+- `lib/audio/formats` reads AAC only once a program adds `aac.DECODER` with
   `formats.add`.
 ```
+
+A note about the C front end, which is an experiment (`docs/c.md`), is named
+`c-<change>.md`: the release notes give those a section of their own.
 
 `cmd/axiom/release.sh notes <version>` gathers these files into
 `docs/releases/<version>.md` and removes them (see `docs/releasing.md`).

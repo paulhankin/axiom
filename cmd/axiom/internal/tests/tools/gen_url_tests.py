@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/net/url/testdata/cases.txt from Python's urllib.parse.
+"""Generates lib/net/url/testdata/cases.txt from Python's urllib.parse.
 
     cmd/axiom/internal/tests/tools/gen_url_tests.py
 
@@ -23,13 +23,13 @@ import os
 import random
 import urllib.parse as up
 
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'net', 'url', 'testdata',
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'net', 'url', 'testdata',
                         'cases.txt')
 rng = random.Random(3986)
 
 UNRESERVED = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~'
 SUB_DELIMS = "!$&'()*+,;="
-# the components of std/net/url's Component enum and the characters each
+# the components of lib/net/url's Component enum and the characters each
 # leaves alone besides the unreserved ones
 SAFE = {
     'component': '',

@@ -1,0 +1,1977 @@
+// =============================================================================
+// lib/graphics/d3d12.ax - Direct3D 12: a GPU device with one direct command
+// queue, recorded frames, pipelines built from HLSL (lib/graphics/hlsl), root
+// signatures with 32-bit constants, buffers, render targets (a window's swap
+// chain, or textures whose pixels can be read back), depth buffers.
+//
+//     let mut gpu = d3d12.Device.init_window(w.handle(), 800, 600)!;  // or Device.init() offscreen
+//     defer gpu.deinit();
+//     let rs = gpu.root_signature(4)!;                 // four constants at b0
+//     let p = gpu.pipeline(&rs, &vs_code, &ps_code, attrs[..], d3d12.TRIANGLE_LIST, false)!;
+//     loop {
+//         let t = gpu.screen();
+//         gpu.begin(t)!;
+//         gpu.clear(t, 0.1, 0.1, 0.2, 1.0);
+//         gpu.set_pipeline(&p);
+//         gpu.set_constants(consts[..]);
+//         gpu.set_vertices(&vb, 20);
+//         gpu.draw(3, 0);
+//         gpu.present(true)!;   // (Device.finish() for a texture)
+//     }
+//
+// In 3D, a depth buffer the size of the target hides what is behind:
+//
+//     let mut z = gpu.depth_buffer(800, 600)!;          // gpu.resize_depth(&mut z, w, h) after a resize
+//     let mut o = d3d12.PipelineOptions.defaults();
+//     o.depth = d3d12.DEPTH_WRITE;
+//     o.cull = d3d12.CULL_BACK;
+//     let p = gpu.pipeline_with(&rs, &vs_code, &ps_code, attrs[..], o)!;
+//     gpu.begin_depth(t, &mut z)!;
+//     gpu.clear(t, 0.0, 0.0, 0.0, 1.0);
+//     gpu.clear_depth(&z);
+//
+// Shadows: draw the scene from the light into a shadow map with a depth_only
+// pipeline, then read it in the pixel shader (a Texture2D<float> at t0 with
+// the comparison sampler s1). Larger per-frame data (lights, the light's
+// matrix) goes in constant buffers:
+//
+//     let rs = gpu.root_signature_with(52, 1, 1)!;        // constants, b1, t0
+//     let mut sm = gpu.shadow_map(4096)!;
+//     let mut cb = gpu.constant_buffer(1024)!;
+//     cb.write(bytes)!;
+//     gpu.begin_shadow(&mut sm)!;
+//     gpu.clear_depth(&sm);
+//     gpu.set_pipeline(&shadow_pipeline);                 // depth_only, with depth bias
+//     gpu.set_buffer(0, &cb);
+//     ... draw ...
+//     gpu.begin_depth(t, &mut z)!;
+//     gpu.set_pipeline(&lit_pipeline);
+//     gpu.set_buffer(0, &cb);
+//     gpu.set_texture(0, &mut sm);
+//     ... draw ...
+//
+// Images become textures that shaders read like a shadow map, through s0
+// (linear, wrapping), with set_image; texture_mipmapped gives them mipmaps
+// (made on the CPU, box-filtered), read trilinearly. Textures and storage
+// buffers are made between frames (each upload is submitted and waited
+// for).
+//
+//     let mut tex = gpu.texture(&img)!;
+//     gpu.set_image(0, &tex);                              // t0
+//
+// Offscreen targets can hold other formats (TARGET_*: half floats for
+// linear light beyond 1, HDR) and be drawn multisampled (target_with, with
+// a depth buffer of as many samples, depth_buffer_with, and pipelines that
+// say so, PipelineOptions.format and samples). A multisampled target is
+// resolved when its pass ends (the next begin, begin_depth or begin_shadow,
+// finish, present). Later passes read targets with set_target_texture,
+// through s2 (linear, clamped): a scene drawn into an HDR target, then
+// tone-mapped into the window.
+//
+//     let mut hdr = gpu.target_with(w, h, d3d12.TARGET_RGBA16F, 4)!;
+//     let mut z = gpu.depth_buffer_with(w, h, 4)!;
+//     gpu.begin_depth(&mut hdr, &mut z)!;                  // pipelines: format RGBA16F, 4 samples
+//     ... draw ...
+//     gpu.begin(gpu.screen())!;                            // (hdr is resolved)
+//     gpu.set_target_texture(0, &mut hdr);                 // t0
+//     gpu.draw(3, 0);
+//
+// Compute shaders work on storage buffers (RWStructuredBuffer<T> at u0, u1,
+// ...), which can be read back or drawn as vertices, in a frame of their
+// own or before the drawing in one:
+//
+//     let rs = gpu.compute_signature(1, 1)!;               // a constant at b0; u0
+//     let cp = gpu.compute_pipeline(&rs, &cs_code)!;       // hlsl.compile(src, "main", "cs_5_0")
+//     let mut b = gpu.storage_buffer(data)!;
+//     gpu.set_compute_pipeline(&cp)!;
+//     gpu.set_compute_constants(consts[..]);
+//     gpu.set_storage(0, &mut b);
+//     gpu.dispatch(n / 64, 1, 1);
+//     gpu.finish()!;                                       // or begin(t), then set_storage_vertices(&mut b, 16) ...
+//     gpu.read_buffer(&mut b, out)!;
+//
+// Front faces are counter-clockwise as seen, as in OpenGL: a mesh wound
+// counter-clockwise seen from outside, in a right-handed world (std/math/
+// geometry's look_at and perspective_zo), shows its outsides with CULL_BACK.
+//
+// Simplest correct use of the API, not the fastest: a frame is submitted
+// and waited for before the next is recorded (one allocator, one list).
+// Windows 10 or later only (--target=x86_64-windows). Without a GPU that can
+// run Direct3D 12 the device is WARP's, in software.
+// =============================================================================
+
+import "../os/com.ax" as com;
+import "color.ax" as color;
+import "hlsl.ax" as hlsl;
+import "image.ax" as image;
+import "std/mem" as mem;
+
+pub error D3d12Error { Unsupported, OutOfMemory, InvalidArgument, NoSpaceLeft, Corrupt, PermissionDenied, TooLarge,
+                       DeviceLost, Failed }
+
+extern "C" "d3d12" {
+    fn D3D12CreateDevice(adapter: usize, level: u32, riid: *u8, dev: *mut usize) i32;
+    fn D3D12SerializeRootSignature(desc: *u8, version: u32, blob: *mut usize, errors: *mut usize) i32;
+}
+
+extern "C" "d3d11" {
+    fn D3D11On12CreateDevice(dev: usize, flags: u32, levels: *u32, nlevels: u32, queues: *usize, nqueues: u32,
+                             node: u32, dev11: *mut usize, ctx: *mut usize, level: *mut u32) i32;
+}
+
+extern "C" "dxgi" {
+    fn CreateDXGIFactory1(riid: *u8, factory: *mut usize) i32;
+}
+
+extern "C" "kernel32" {
+    fn CreateEventW(sa: *void, manual: i32, initial: i32, name: *u16) usize;
+    fn WaitForSingleObject(h: usize, ms: u32) u32;
+    fn CloseHandle(h: usize) i32;
+}
+
+// DXGI formats
+pub const R8G8B8A8_UNORM: u32 = 28;
+pub const R32_FLOAT: u32 = 41;
+pub const R32G32_FLOAT: u32 = 16;
+pub const R32G32B32_FLOAT: u32 = 6;
+pub const R32G32B32A32_FLOAT: u32 = 2;
+pub const R16_UINT: u32 = 57;
+pub const R32_UINT: u32 = 42;
+const D32_FLOAT: u32 = 40;
+const R32_TYPELESS: u32 = 39;
+const R16G16B16A16_FLOAT: u32 = 10;
+const R16G16_FLOAT: u32 = 34;
+const R8G8B8A8_UNORM_SRGB: u32 = 29;
+
+// What offscreen targets hold (target_with), as lib/graphics/metal names them
+pub const TARGET_BGRA8: u32 = 0;    // 8-bit colour, what a window shows (here RGBA)
+pub const TARGET_RGBA16F: u32 = 1;  // half floats: linear light beyond 1 (HDR), for later passes to read
+pub const TARGET_RG16F: u32 = 2;    // two half floats (velocities, moments)
+pub const TARGET_R32F: u32 = 3;     // one float (depths, distances)
+
+fn target_format(format: u32) u32 {
+    if format == TARGET_RGBA16F {
+        return R16G16B16A16_FLOAT;
+    }
+    if format == TARGET_RG16F {
+        return R16G16_FLOAT;
+    }
+    if format == TARGET_R32F {
+        return R32_FLOAT;
+    }
+    return R8G8B8A8_UNORM;
+}
+
+// Primitive topologies
+pub const POINT_LIST: u32 = 1;
+pub const LINE_LIST: u32 = 2;
+pub const LINE_STRIP: u32 = 3;
+pub const TRIANGLE_LIST: u32 = 4;
+pub const TRIANGLE_STRIP: u32 = 5;
+
+// Pipeline blending (PipelineOptions.blend)
+pub const BLEND_NONE: u32 = 0;
+pub const BLEND_ALPHA: u32 = 1;  // over what is there, by the source's alpha
+pub const BLEND_ADD: u32 = 2;    // added to what is there, scaled by the source's alpha (glows)
+
+// Pipeline depth (PipelineOptions.depth)
+pub const DEPTH_NONE: u32 = 0;   // drawn without a depth buffer (begin)
+pub const DEPTH_OFF: u32 = 1;    // with one bound (begin_depth), not tested or written
+pub const DEPTH_TEST: u32 = 2;   // tested (nearer passes), not written: transparent things
+pub const DEPTH_WRITE: u32 = 3;  // tested and written: solid things
+
+// Pipeline culling (PipelineOptions.cull)
+pub const CULL_NONE: u32 = 1;
+pub const CULL_FRONT: u32 = 2;
+pub const CULL_BACK: u32 = 3;
+
+// Resource states
+const PRESENT: u32 = 0;
+const VERTEX_AND_CONSTANT_BUFFER: u32 = 0x1;
+const RENDER_TARGET: u32 = 0x4;
+const UNORDERED_ACCESS: u32 = 0x8;
+const SHADER_RESOURCE: u32 = 0xc0;  // pixel and non-pixel shaders
+const DEPTH_WRITE_STATE: u32 = 0x10;
+const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+const COPY_DEST: u32 = 0x400;
+const COPY_SOURCE: u32 = 0x800;
+const RESOLVE_DEST: u32 = 0x1000;
+const RESOLVE_SOURCE: u32 = 0x2000;
+const GENERIC_READ: u32 = 0xac3;
+
+const MAX_TARGETS: usize = 2048;  // render target views in the device's heap (2 the window's)
+const MAX_DEPTHS: usize = 64;     // depth stencil views in the device's heap
+const MAX_VIEWS: usize = 4096;    // shader resource views in the device's heap
+const MAX_ROOT_BUFFERS: u32 = 4;
+const MAX_ROOT_TEXTURES: u32 = 4;
+const NO_SLOT: u32 = 0xffff_ffff;
+
+// Which places in the device's heaps of views are taken. Things made by the
+// device keep a pointer to it, and give their places back when released.
+struct Slots {
+    rtv: [MAX_TARGETS]u8,
+    dsv: [MAX_DEPTHS]u8,
+    srv: [MAX_VIEWS]u8,
+}
+
+// The first free place in `used`, now taken (NO_SLOT: none is free).
+fn take(used: []mut u8) u32 {
+    for k in 0..used.len {
+        if used[k] == 0 {
+            used[k] = 1;
+            return @truncate(u32, k);
+        }
+    }
+    return NO_SLOT;
+}
+
+fn give_back(used: []mut u8, slot: *mut u32) void {
+    if (slot.* != NO_SLOT) and (@as(usize, slot.*) < used.len) {
+        used[@as(usize, slot.*)] = 0;
+    }
+    slot.* = NO_SLOT;
+}
+
+fn no_slots() *mut Slots {
+    return @ptr_from_int(*mut Slots, 0);
+}
+
+let IID_DEVICE: [16]u8 = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85,
+                          0xf7];
+let IID_QUEUE: [16]u8 = [0xa6, 0x70, 0xc8, 0x0e, 0x7e, 0x5d, 0x22, 0x4c, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16,
+                         0xed];
+let IID_ALLOCATOR: [16]u8 = [0xe4, 0xde, 0x02, 0x61, 0x59, 0xaf, 0x09, 0x4b, 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b,
+                             0x24];
+let IID_LIST: [16]u8 = [0x0f, 0x0d, 0x16, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55];
+let IID_FENCE: [16]u8 = [0xcf, 0x3d, 0x75, 0x0a, 0xd8, 0xc4, 0x91, 0x4b, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a,
+                         0x76];
+let IID_RESOURCE: [16]u8 = [0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40, 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f,
+                            0xad];
+let IID_HEAP: [16]u8 = [0x1d, 0x47, 0xfb, 0x8e, 0x6c, 0x61, 0x49, 0x4f, 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51];
+let IID_ROOT: [16]u8 = [0x66, 0x6b, 0x4a, 0xc5, 0xdf, 0x72, 0xe8, 0x4e, 0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14];
+let IID_PSO: [16]u8 = [0xf3, 0x30, 0x5a, 0x76, 0x24, 0xf6, 0x6f, 0x4c, 0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45];
+let IID_FACTORY4: [16]u8 = [0x02, 0xea, 0xc6, 0x1b, 0x36, 0xef, 0x4f, 0x46, 0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16,
+                            0x8a];
+let IID_SWAP3: [16]u8 = [0xdb, 0x9b, 0xd9, 0x94, 0xf8, 0xf1, 0xb0, 0x4a, 0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda,
+                         0xb1];
+let IID_ON12: [16]u8 = [0x73, 0x1e, 0x61, 0x85, 0xa9, 0x70, 0x0e, 0x49, 0x96, 0x14, 0xa9, 0xe3, 0x02, 0x77, 0x79, 0x04];
+let IID_TEXTURE2D: [16]u8 = [0xf2, 0xaa, 0x15, 0x6f, 0x08, 0xd2, 0x89, 0x4e, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f,
+                             0x9c];
+let IID_ADAPTER: [16]u8 = [0xe1, 0xe7, 0x11, 0x24, 0xac, 0x12, 0xcf, 0x4c, 0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d,
+                           0xc0];
+
+fn call0(obj: usize, i: usize) i32 {
+    return @bit_cast(fn(usize) i32, com.method(obj, i))(obj);
+}
+
+/// An attribute of a vertex: its HLSL semantic name and index, its format,
+/// its byte offset in the vertex.
+pub struct Attribute {
+    pub semantic: []u8,
+    pub index: u32,
+    pub format: u32,
+    pub offset: u32,
+}
+
+pub struct RootSignature {
+    pub p: usize,
+    pub constants: u32,
+    pub buffers: u32,   // root parameter of constant buffer b1 (then b2, ...); for compute, of storage u0 (u1, ...)
+    pub textures: u32,  // root parameter of texture t0's table (then t1's, ...)
+
+    pub fn deinit(self: *mut RootSignature) void {
+        com.release(self.p);
+        self.p = 0;
+    }
+}
+
+pub struct Pipeline {
+    pub p: usize,
+    pub root: usize,
+    pub topology: u32,
+    pub buffers: u32,  // as its root signature's
+    pub textures: u32,
+
+    pub fn deinit(self: *mut Pipeline) void {
+        com.release(self.p);
+        self.p = 0;
+    }
+}
+
+/// A buffer in memory the CPU writes and the GPU reads (vertices, indexes,
+/// constants).
+pub struct Buffer {
+    pub p: usize,
+    pub gpu: u64,  // its GPU virtual address
+    pub size: u32,
+    pub mapped: usize,  // a constant buffer's memory, always mapped (0: not)
+
+    /// Writes a constant buffer's contents (the GPU has finished with the
+    /// last frame's: frames are waited for).
+    pub fn write(self: *mut Buffer, data: []u8) D3d12Error!void {
+        if (self.mapped == 0) or (data.len > @as(usize, self.size)) {
+            return error.InvalidArgument;
+        }
+        @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, self.mapped), data.len), data);
+    }
+
+    /// An upload buffer's memory as floats, to write in place (empty if the
+    /// buffer is not mapped).
+    pub fn floats(self: *mut Buffer) []mut f32 {
+        if self.mapped == 0 {
+            return [];
+        }
+        return @slice_from_ptr(@ptr_from_int(*mut f32, self.mapped), @as(usize, self.size) / 4);
+    }
+
+    pub fn deinit(self: *mut Buffer) void {
+        com.release(self.p);
+        self.p = 0;
+        self.mapped = 0;
+    }
+}
+
+/// An image on the GPU for shaders to read (set_image).
+pub struct Texture {
+    res: usize,
+    srv: u32,  // its shader resource view's index in the device's heap
+    width: u32,
+    height: u32,
+    pub levels: u32,  // mipmap levels (1: none)
+    slots: *mut Slots,
+
+    /// A texture that is not there yet (release does nothing).
+    pub fn empty() Texture {
+        return Texture.{ res: 0, srv: NO_SLOT, width: 0, height: 0, levels: 1, slots: no_slots() };
+    }
+
+    pub fn deinit(self: *mut Texture) void {
+        com.release(self.res);
+        self.res = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.srv[..], &mut self.srv);
+        }
+    }
+}
+
+/// A buffer in GPU memory that compute shaders read and write (u0, u1,
+/// ...), and that can be drawn as vertices.
+pub struct StorageBuffer {
+    res: usize,
+    gpu: u64,
+    size: u32,
+    state: u32,
+
+    pub fn deinit(self: *mut StorageBuffer) void {
+        com.release(self.res);
+        self.res = 0;
+    }
+}
+
+/// Direct3D 11 on this device's queue (D3D11On12), so that Direct2D
+/// (lib/graphics/d2d) draws onto its targets: a HUD over the 3D scene.
+pub struct Overlay {
+    dev11: usize,       // ID3D11Device
+    ctx: usize,         // its immediate context
+    on12: usize,        // ID3D11On12Device
+    res: [8]usize,      // the targets wrapped (ID3D12Resource) ...
+    wrapped: [8]usize,  // ... as Direct3D 11 textures
+    n: usize,
+
+    /// Lets the wrapped targets go: before Device.resize, which makes new
+    /// back buffers (detach the d2d.Canvas first).
+    pub fn unwrap(self: *mut Overlay) void {
+        for k in 0..self.n {
+            com.release(self.wrapped[k]);
+            self.wrapped[k] = 0;
+            self.res[k] = 0;
+        }
+        self.n = 0;
+        if self.ctx != 0 {
+            @bit_cast(fn(usize) void, com.method(self.ctx, 111))(self.ctx);  // Flush: destroys them
+        }
+    }
+
+    pub fn deinit(self: *mut Overlay) void {
+        self.unwrap();
+        com.release(self.on12);
+        com.release(self.ctx);
+        com.release(self.dev11);
+        self.on12 = 0;
+        self.ctx = 0;
+        self.dev11 = 0;
+    }
+}
+
+/// Something to draw into: a back buffer of the window's swap chain or a texture.
+pub struct Target {
+    res: usize,  // ID3D12Resource: drawn into, or (multisampled) resolved into; what shaders read
+    rtv: usize,  // the view drawn into (a CPU descriptor handle)
+    pub width: u32,
+    pub height: u32,
+    state: u32,  // res's
+    owned: bool,
+    format: u32,    // TARGET_*
+    samples: u32,   // 1, or 2, 4, 8: multisampled
+    msaa: usize,    // the multisampled resource drawn into (0: none), always a render target
+    rtv_slot: u32,  // the view's place in the device's heap (NO_SLOT: not the device's to give back)
+    srv: u32,       // the shader resource view's place, for set_target_texture (NO_SLOT: none)
+    slots: *mut Slots,
+
+    /// A target that is not there yet (release does nothing).
+    pub fn empty() Target {
+        return Target.{ res: 0, rtv: 0, width: 0, height: 0, state: 0, owned: false, format: TARGET_BGRA8, samples: 1,
+                        msaa: 0, rtv_slot: NO_SLOT, srv: NO_SLOT, slots: no_slots() };
+    }
+
+    pub fn deinit(self: *mut Target) void {
+        if self.owned {
+            com.release(self.res);
+            com.release(self.msaa);
+        }
+        self.res = 0;
+        self.msaa = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.rtv[..], &mut self.rtv_slot);
+            give_back(self.slots.srv[..], &mut self.srv);
+        }
+    }
+}
+
+/// A depth buffer (32-bit float) to draw into with a target of its size, or
+/// alone (a shadow map, which shaders can then read: shadow_map).
+pub struct DepthBuffer {
+    res: usize,  // ID3D12Resource
+    dsv: usize,  // its view (a CPU descriptor handle)
+    srv: u32,    // its shader resource view's index in the device's heap (shadow maps)
+    sampled: bool,
+    width: u32,
+    height: u32,
+    state: u32,
+    samples: u32,  // as its target's
+    dsv_slot: u32,
+    slots: *mut Slots,
+
+    /// A depth buffer that is not there yet (release does nothing).
+    pub fn empty() DepthBuffer {
+        return DepthBuffer.{ res: 0, dsv: 0, srv: NO_SLOT, sampled: false, width: 0, height: 0, state: 0, samples: 1,
+                             dsv_slot: NO_SLOT, slots: no_slots() };
+    }
+
+    pub fn deinit(self: *mut DepthBuffer) void {
+        com.release(self.res);
+        self.res = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.dsv[..], &mut self.dsv_slot);
+            if self.sampled {
+                give_back(self.slots.srv[..], &mut self.srv);
+            }
+        }
+    }
+}
+
+/// How a pipeline draws: the topology, BLEND_*, DEPTH_* and CULL_*; depth
+/// bias (constant, in steps of the depth's precision, and scaled by the
+/// slope) against shadow acne; depth_only for a pass without a target
+/// (a shadow map: the pixel shader is not used); the format of the targets
+/// it draws into (TARGET_*) and their samples. (stride, a vertex's bytes,
+/// is lib/graphics/metal's; here set_vertices says it.)
+pub struct PipelineOptions {
+    pub topology: u32,
+    pub blend: u32,
+    pub depth: u32,
+    pub cull: u32,
+    pub depth_bias: i32,
+    pub slope_bias: f32,
+    pub depth_only: bool,
+    pub stride: u32,
+    pub format: u32,
+    pub samples: u32,
+
+    /// Triangles, no blending, depth or culling, no bias, into 8-bit
+    /// targets of one sample.
+    pub fn defaults() PipelineOptions {
+        return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0, format: TARGET_BGRA8,
+                                 samples: 1 };
+    }
+}
+
+pub struct Device {
+    dev: usize,
+    queue: usize,
+    alloc: usize,
+    list: usize,
+    fence: usize,
+    fence_value: u64,
+    event: usize,
+    factory: usize,
+    rtv_heap: usize,
+    rtv_base: usize,
+    rtv_size: u32,
+    dsv_heap: usize,
+    dsv_base: usize,
+    dsv_size: u32,
+    srv_heap: usize,  // shader-visible: views of textures shaders read
+    srv_cpu: usize,
+    srv_gpu: u64,
+    srv_size: u32,
+    slots: *mut Slots,  // which places in the heaps are taken
+    swap: usize,
+    back: [2]Target,
+    frame: u32,
+    cur: *mut Target,  // the target of the pass being recorded (null: none)
+    recording: bool,
+    heaps_set: bool,   // the frame's list has the view heap
+    cur_buffers: u32,  // the current pipeline's root signature's
+    cur_textures: u32,
+
+    /// A device for drawing offscreen (into textures).
+    pub fn init() D3d12Error!Device {
+        let mut d = Device.{ dev: 0, queue: 0, alloc: 0, list: 0, fence: 0, fence_value: 0, event: 0, factory: 0,
+                             rtv_heap: 0, rtv_base: 0, rtv_size: 0, dsv_heap: 0, dsv_base: 0, dsv_size: 0, srv_heap: 0,
+                             srv_cpu: 0, srv_gpu: 0, srv_size: 0, slots: no_slots(), swap: 0, back: [Target.empty(); 2],
+                             frame: 0, cur: @ptr_from_int(*mut Target, 0), recording: false, heaps_set: false,
+                             cur_buffers: 0, cur_textures: 0 };
+        d.slots = mem.new_zeroed.[Slots]()!;
+        d.slots.rtv[0] = 1;  // (the window's back buffers')
+        d.slots.rtv[1] = 1;
+        d.create() catch |e| {
+            d.deinit();
+            return e;
+        };
+        return d;
+    }
+
+    /// A device drawing into a window (its HWND: win32.Window.handle()) of
+    /// width × height pixels, through a swap chain of two buffers.
+    pub fn init_window(hwnd: usize, width: u32, height: u32) D3d12Error!Device {
+        let mut d = Device.init()!;
+        // DXGI_SWAP_CHAIN_DESC1: width, height, format, stereo, samples,
+        // usage at 24, buffers at 28, scaling, swap effect at 36
+        let mut sd: [48]u8 = [0; 48];
+        com.put32(sd[..], 0, width);
+        com.put32(sd[..], 4, height);
+        com.put32(sd[..], 8, R8G8B8A8_UNORM);
+        com.put32(sd[..], 16, 1);
+        com.put32(sd[..], 24, 0x20);  // DXGI_USAGE_RENDER_TARGET_OUTPUT
+        com.put32(sd[..], 28, 2);
+        com.put32(sd[..], 36, 4);  // DXGI_SWAP_EFFECT_FLIP_DISCARD
+        let mut sc1: usize = 0;
+        let f = @bit_cast(fn(usize, usize, usize, *u8, *void, usize, *mut usize) i32, com.method(d.factory, 15));
+        com.check(f(d.factory, d.queue, hwnd, &sd[0], @ptr_from_int(*void, 0), 0, &mut sc1)) catch |e| {  // CreateSwapChainForHwnd
+            d.deinit();
+            return e;
+        };
+        d.swap = com.query(sc1, &IID_SWAP3) catch |e| {
+            com.release(sc1);
+            d.deinit();
+            return e;
+        };
+        com.release(sc1);
+        d.back_buffers(width, height) catch |e| {
+            d.deinit();
+            return e;
+        };
+        return d;
+    }
+
+    fn create(self: *mut Device) D3d12Error!void {
+        if CreateDXGIFactory1(&IID_FACTORY4[0], &mut self.factory) < 0 {
+            return error.Unsupported;
+        }
+        if D3D12CreateDevice(0, 0xb000, &IID_DEVICE[0], &mut self.dev) < 0 {
+            // WARP, in software
+            let mut adapter: usize = 0;
+            let ew = @bit_cast(fn(usize, *u8, *mut usize) i32, com.method(self.factory, 27));  // EnumWarpAdapter
+            if ew(self.factory, &IID_ADAPTER[0], &mut adapter) < 0 {
+                return error.Unsupported;
+            }
+            let r = D3D12CreateDevice(adapter, 0xb000, &IID_DEVICE[0], &mut self.dev);
+            com.release(adapter);
+            if r < 0 {
+                return error.Unsupported;
+            }
+        }
+        let qd: [4]u32 = [0, 0, 0, 0];  // D3D12_COMMAND_QUEUE_DESC: direct
+        let cq = @bit_cast(fn(usize, *u32, *u8, *mut usize) i32, com.method(self.dev, 8));
+        com.check(cq(self.dev, &qd[0], &IID_QUEUE[0], &mut self.queue))!;
+        let ca = @bit_cast(fn(usize, u32, *u8, *mut usize) i32, com.method(self.dev, 9));
+        com.check(ca(self.dev, 0, &IID_ALLOCATOR[0], &mut self.alloc))!;
+        let cl = @bit_cast(fn(usize, u32, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 12));
+        com.check(cl(self.dev, 0, 0, self.alloc, 0, &IID_LIST[0], &mut self.list))!;
+        _ = call0(self.list, 9);  // Close: lists are created open
+        let cf = @bit_cast(fn(usize, u64, u32, *u8, *mut usize) i32, com.method(self.dev, 36));
+        com.check(cf(self.dev, 0, 0, &IID_FENCE[0], &mut self.fence))!;
+        self.event = CreateEventW(@ptr_from_int(*void, 0), 0, 0, @ptr_from_int(*u16, 0));
+        // D3D12_DESCRIPTOR_HEAP_DESC: RTV, count, flags, node mask
+        let hd: [4]u32 = [2, @truncate(u32, MAX_TARGETS), 0, 0];
+        let ch = @bit_cast(fn(usize, *u32, *u8, *mut usize) i32, com.method(self.dev, 14));
+        com.check(ch(self.dev, &hd[0], &IID_HEAP[0], &mut self.rtv_heap))!;
+        self.rtv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 2);
+        // GetCPUDescriptorHandleForHeapStart returns a struct: through a hidden pointer
+        let mut h: usize = 0;
+        _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.rtv_heap, 9))(self.rtv_heap, &mut h);
+        self.rtv_base = h;
+        // and one of depth stencil views
+        let dd: [4]u32 = [3, @truncate(u32, MAX_DEPTHS), 0, 0];
+        com.check(ch(self.dev, &dd[0], &IID_HEAP[0], &mut self.dsv_heap))!;
+        self.dsv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 3);
+        _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.dsv_heap, 9))(self.dsv_heap, &mut h);
+        self.dsv_base = h;
+        // and a shader-visible one of shader resource views
+        let sd: [4]u32 = [0, @truncate(u32, MAX_VIEWS), 1, 0];
+        com.check(ch(self.dev, &sd[0], &IID_HEAP[0], &mut self.srv_heap))!;
+        self.srv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 0);
+        _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.srv_heap, 9))(self.srv_heap, &mut h);
+        self.srv_cpu = h;
+        let mut g: u64 = 0;
+        _ = @bit_cast(fn(usize, *mut u64) *mut u64, com.method(self.srv_heap, 10))(self.srv_heap, &mut g);
+        self.srv_gpu = g;
+    }
+
+    fn back_buffers(self: *mut Device, width: u32, height: u32) D3d12Error!void {
+        let gb = @bit_cast(fn(usize, u32, *u8, *mut usize) i32, com.method(self.swap, 9));  // GetBuffer
+        for i in @as(usize, 0)..2 {
+            let mut res: usize = 0;
+            com.check(gb(self.swap, @truncate(u32, i), &IID_RESOURCE[0], &mut res))!;
+            let rtv = self.rtv_base + (i * @as(usize, self.rtv_size));
+            self.view(res, rtv);
+            let mut t = Target.empty();
+            t.res = res;
+            t.rtv = rtv;
+            t.width = width;
+            t.height = height;
+            t.state = PRESENT;
+            t.owned = true;
+            self.back[i] = t;
+        }
+        self.frame = @bit_cast(fn(usize) u32, com.method(self.swap, 36))(self.swap);  // GetCurrentBackBufferIndex
+    }
+
+    fn view(self: *mut Device, res: usize, handle: usize) void {
+        @bit_cast(fn(usize, usize, *void, usize) void, com.method(self.dev, 20))(
+            self.dev, res, @ptr_from_int(*void, 0), handle);
+    }
+
+    pub fn deinit(self: *mut Device) void {
+        if self.queue != 0 {
+            self.wait_idle();
+        }
+        self.back[0].deinit();
+        self.back[1].deinit();
+        com.release(self.swap);
+        com.release(self.srv_heap);
+        com.release(self.dsv_heap);
+        com.release(self.rtv_heap);
+        com.release(self.fence);
+        com.release(self.list);
+        com.release(self.alloc);
+        com.release(self.queue);
+        com.release(self.dev);
+        com.release(self.factory);
+        if self.event != 0 {
+            _ = CloseHandle(self.event);
+        }
+        if @int_from_ptr(self.slots) != 0 {
+            mem.destroy(self.slots);
+            self.slots = no_slots();
+        }
+        self.dev = 0;
+        self.queue = 0;
+        self.event = 0;
+    }
+
+    /// Waits until the GPU has done everything submitted.
+    pub fn wait_idle(self: *mut Device) void {
+        self.fence_value += 1;
+        let v = self.fence_value;
+        _ = @bit_cast(fn(usize, usize, u64) i32, com.method(self.queue, 14))(self.queue, self.fence, v);  // Signal
+        let done = @bit_cast(fn(usize) u64, com.method(self.fence, 8))(self.fence);  // GetCompletedValue
+        if done < v {
+            _ = @bit_cast(fn(usize, u64, usize) i32, com.method(self.fence, 9))(self.fence, v, self.event);
+            _ = WaitForSingleObject(self.event, 0xffff_ffff);
+        }
+    }
+
+    /// The window's back buffer to draw the next frame into.
+    pub fn screen(self: *mut Device) *mut Target {
+        return &mut self.back[@as(usize, self.frame)];
+    }
+
+    /// After the window's client area changed size.
+    pub fn resize(self: *mut Device, width: u32, height: u32) D3d12Error!void {
+        if (self.swap == 0) or (width == 0) or (height == 0) {
+            return;
+        }
+        self.wait_idle();
+        self.back[0].deinit();
+        self.back[1].deinit();
+        let f = @bit_cast(fn(usize, u32, u32, u32, u32, u32) i32, com.method(self.swap, 13));  // ResizeBuffers
+        com.check(f(self.swap, 0, width, height, 0, 0))!;
+        self.back_buffers(width, height)!;
+    }
+
+    /// A texture of width × height RGBA pixels to draw into offscreen.
+    pub fn target(self: *mut Device, width: u32, height: u32) D3d12Error!Target {
+        return self.target_with(width, height, TARGET_BGRA8, 1);
+    }
+
+    /// A texture of width × height pixels to draw into offscreen, holding
+    /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
+    /// multisampled, resolved as each pass ends). Later passes read it
+    /// with set_target_texture.
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) D3d12Error!Target {
+        let f = target_format(format);
+        let n = @max(samples, 1);
+        let mut t = Target.empty();
+        t.width = width;
+        t.height = height;
+        t.owned = true;
+        t.format = format;
+        t.samples = n;
+        t.slots = self.slots;
+        t.rtv_slot = take(self.slots.rtv[..]);
+        t.srv = take(self.slots.srv[..]);
+        if (t.rtv_slot == NO_SLOT) or (t.srv == NO_SLOT) {
+            t.deinit();
+            return error.NoSpaceLeft;
+        }
+        // D3D12_CLEAR_VALUE: format, colour
+        let mut cv: [20]u8 = [0; 20];
+        com.put32(cv[..], 0, f);
+        let mut rd: [56]u8 = [0; 56];
+        texture_desc_with(rd[..], width, height, f, 1, 1, 1);  // ALLOW_RENDER_TARGET
+        t.res = self.committed(1, rd[..], RENDER_TARGET, &cv[0]) catch |e| {
+            t.deinit();
+            return e;
+        };
+        t.state = RENDER_TARGET;
+        let mut drawn = t.res;
+        if n > 1 {
+            let mut md: [56]u8 = [0; 56];
+            texture_desc_with(md[..], width, height, f, 1, 1, n);
+            t.msaa = self.committed(1, md[..], RENDER_TARGET, &cv[0]) catch {
+                t.deinit();
+                return error.Unsupported;
+            };
+            drawn = t.msaa;
+        }
+        t.rtv = self.rtv_base + (@as(usize, t.rtv_slot) * @as(usize, self.rtv_size));
+        self.view(drawn, t.rtv);
+        let handle = self.srv_cpu + (@as(usize, t.srv) * @as(usize, self.srv_size));
+        @bit_cast(fn(usize, usize, *void, usize) void, com.method(self.dev, 18))(  // CreateShaderResourceView
+            self.dev, t.res, @ptr_from_int(*void, 0), handle);
+        return t;
+    }
+
+    /// Makes an offscreen target width × height (after the window's size
+    /// changed), keeping its format and samples.
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) D3d12Error!void {
+        if not t.owned or (t.rtv_slot == NO_SLOT) or (width == 0) or (height == 0) or
+           ((width == t.width) and (height == t.height)) {
+            return;
+        }
+        self.wait_idle();
+        let n = self.target_with(width, height, t.format, t.samples)!;
+        t.deinit();
+        t.* = n;
+    }
+
+    /// A depth buffer of width × height, for a target of that size.
+    pub fn depth_buffer(self: *mut Device, width: u32, height: u32) D3d12Error!DepthBuffer {
+        return self.depth_buffer_with(width, height, 1);
+    }
+
+    /// A depth buffer of width × height for a target of that size drawn
+    /// with `samples` a pixel.
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) D3d12Error!DepthBuffer {
+        let mut d = DepthBuffer.empty();
+        d.samples = @max(samples, 1);
+        d.slots = self.slots;
+        d.dsv_slot = take(self.slots.dsv[..]);
+        if d.dsv_slot == NO_SLOT {
+            return error.NoSpaceLeft;
+        }
+        d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
+        self.depth_resource(&mut d, width, height) catch |e| {
+            d.deinit();
+            return e;
+        };
+        return d;
+    }
+
+    /// A depth buffer of size × size to draw into alone (begin_shadow) and
+    /// then read in shaders (set_texture): a shadow map. Shaders read it as
+    /// a Texture2D<float> through register s1, a comparison sampler
+    /// (less or equal; outside the map, nothing is in shadow).
+    pub fn shadow_map(self: *mut Device, size: u32) D3d12Error!DepthBuffer {
+        let mut d = DepthBuffer.empty();
+        d.sampled = true;
+        d.slots = self.slots;
+        d.dsv_slot = take(self.slots.dsv[..]);
+        d.srv = take(self.slots.srv[..]);
+        if (d.dsv_slot == NO_SLOT) or (d.srv == NO_SLOT) {
+            d.deinit();
+            return error.NoSpaceLeft;
+        }
+        d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
+        self.depth_resource(&mut d, size, size) catch |e| {
+            d.deinit();
+            return e;
+        };
+        return d;
+    }
+
+    /// Makes d width × height (after the window's size changed), in the same view.
+    pub fn resize_depth(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) D3d12Error!void {
+        if (width == 0) or (height == 0) or ((width == d.width) and (height == d.height)) {
+            return;
+        }
+        self.wait_idle();
+        com.release(d.res);
+        d.res = 0;
+        self.depth_resource(d, width, height)!;
+    }
+
+    fn depth_resource(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) D3d12Error!void {
+        // one that shaders read is typeless: a D32 depth view and an R32 shader view
+        let mut format = D32_FLOAT;
+        if d.sampled {
+            format = R32_TYPELESS;
+        }
+        let mut rd: [56]u8 = [0; 56];
+        texture_desc_with(rd[..], width, height, format, 2, 1, d.samples);  // ALLOW_DEPTH_STENCIL
+        // D3D12_CLEAR_VALUE: format, depth (1: the far plane), stencil
+        let mut cv: [20]u8 = [0; 20];
+        com.put32(cv[..], 0, D32_FLOAT);
+        com.put32(cv[..], 4, @bit_cast(u32, @as(f32, 1.0)));
+        d.res = self.committed(1, rd[..], DEPTH_WRITE_STATE, &cv[0])!;
+        d.state = DEPTH_WRITE_STATE;
+        d.width = width;
+        d.height = height;
+        // D3D12_DEPTH_STENCIL_VIEW_DESC: format, dimension (TEXTURE2D, or
+        // TEXTURE2DMS), flags, mip
+        let mut dv: [24]u8 = [0; 24];
+        com.put32(dv[..], 0, D32_FLOAT);
+        com.put32(dv[..], 4, 3);
+        if d.samples > 1 {
+            com.put32(dv[..], 4, 5);
+        }
+        @bit_cast(fn(usize, usize, *u8, usize) void, com.method(self.dev, 21))(  // CreateDepthStencilView
+            self.dev, d.res, &dv[0], d.dsv);
+        if d.sampled {
+            // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension (TEXTURE2D),
+            // the default component mapping, then at 16 the most detailed mip
+            // and the number of mips
+            let mut sv: [40]u8 = [0; 40];
+            com.put32(sv[..], 0, R32_FLOAT);
+            com.put32(sv[..], 4, 4);
+            com.put32(sv[..], 8, 0x1688);
+            com.put32(sv[..], 20, 1);
+            let handle = self.srv_cpu + (@as(usize, d.srv) * @as(usize, self.srv_size));
+            @bit_cast(fn(usize, usize, *u8, usize) void, com.method(self.dev, 18))(  // CreateShaderResourceView
+                self.dev, d.res, &sv[0], handle);
+        }
+    }
+
+    fn committed(self: *mut Device, heap: u32, desc: []mut u8, state: u32, clear: *u8) D3d12Error!usize {
+        // D3D12_HEAP_PROPERTIES: type, CPU page property, pool, node masks
+        let hp: [5]u32 = [heap, 0, 0, 1, 1];
+        let mut res: usize = 0;
+        let f = @bit_cast(fn(usize, *u32, u32, *u8, u32, *u8, *u8, *mut usize) i32, com.method(self.dev, 27));
+        com.check(f(self.dev, &hp[0], 0, &desc[0], state, clear, &IID_RESOURCE[0], &mut res))!;
+        return res;
+    }
+
+    /// A buffer holding data (vertices or indexes), in memory the GPU reads.
+    pub fn buffer(self: *mut Device, data: []u8) D3d12Error!Buffer {
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, data.len));
+        let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];  // (the CPU reads nothing)
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
+            com.release(res);
+            return e;
+        };
+        @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p), data.len), data);
+        @bit_cast(fn(usize, u32, *void) void, com.method(res, 9))(res, 0, @ptr_from_int(*void, 0));  // Unmap
+        let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);  // GetGPUVirtualAddress
+        return Buffer.{ p: res, gpu: gpu, size: @truncate(u32, data.len), mapped: 0 };
+    }
+
+    /// A constant buffer of at least `size` bytes for shaders' b1, b2, ...
+    /// (set_buffer), its contents written with Buffer.write.
+    pub fn constant_buffer(self: *mut Device, size: usize) D3d12Error!Buffer {
+        return self.upload_buffer(size);
+    }
+
+    /// A buffer of at least `size` bytes the CPU rewrites every frame (with
+    /// Buffer.write, or through Buffer.floats): vertices made each frame,
+    /// constants. It stays mapped; frames are waited for, so the GPU has
+    /// finished reading the last frame's contents.
+    pub fn upload_buffer(self: *mut Device, size: usize) D3d12Error!Buffer {
+        let n = (size + 255) & ~@as(usize, 255);  // a multiple of 256 bytes
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, n));
+        let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
+            com.release(res);
+            return e;
+        };
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, p), n), 0);
+        let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);
+        return Buffer.{ p: res, gpu: gpu, size: @truncate(u32, n), mapped: p };
+    }
+
+    // An upload buffer holding `rows` rows of `row` bytes from data, each at a
+    // multiple of `pitch` (what a texture copy needs).
+    fn staging(self: *mut Device, data: []u8, row: usize, rows: usize, pitch: usize) D3d12Error!usize {
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, pitch * rows));
+        let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
+            com.release(res);
+            return e;
+        };
+        for y in 0..rows {
+            @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p + (y * pitch)), row), data[y * row..(y + 1) * row]);
+        }
+        @bit_cast(fn(usize, u32, *void) void, com.method(res, 9))(res, 0, @ptr_from_int(*void, 0));  // Unmap
+        return res;
+    }
+
+    /// A texture holding img (converted to 8-bit RGBA), for shaders to read
+    /// (set_image). Made between frames.
+    pub fn texture(self: *mut Device, img: *image.Image) D3d12Error!Texture {
+        if (img.channels == 4) and (img.depth == image.Depth.U8) {
+            return self.texture_rgba(img);
+        }
+        let mut conv = img.convert(4, image.Depth.U8)!;
+        defer conv.deinit();
+        return self.texture_rgba(&conv);
+    }
+
+    fn texture_rgba(self: *mut Device, img: *image.Image) D3d12Error!Texture {
+        return self.texture_levels(@truncate(u32, img.width), @truncate(u32, img.height), R8G8B8A8_UNORM, 4,
+                                   img.data[0..(img.width * img.height) * 4], 1);
+    }
+
+    /// A texture holding img with a full chain of mipmaps (made here,
+    /// box-filtered), read through s0 trilinearly. 8-bit images become
+    /// 8-bit RGBA: with `srgb`, their values are sRGB-encoded and shaders
+    /// read linear light (colours); without, as they are (normals, masks,
+    /// heights, distance fields). 16-bit and float images become half-float
+    /// RGBA (`srgb` ignored): linear light, HDR. Made between frames.
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) D3d12Error!Texture {
+        let w = img.width;
+        let h = img.height;
+        if (w == 0) or (h == 0) {
+            return error.InvalidArgument;
+        }
+        let levels = mip_levels(w, h);
+        let pixels = chain_pixels(w, h, levels);
+        if img.depth == image.Depth.U8 {
+            let mut data = mem.alloc.[u8](pixels * 4)!;
+            defer mem.free(data);
+            if img.channels == 4 {
+                @mem_copy(data[0..(w * h) * 4], img.data[0..(w * h) * 4]);
+            } else {
+                let mut conv = img.convert(4, image.Depth.U8)!;
+                defer conv.deinit();
+                @mem_copy(data[0..(w * h) * 4], conv.data[0..(w * h) * 4]);
+            }
+            let mut at: usize = 0;
+            for k in @as(u32, 1)..levels {
+                let pw = level_size(w, k - 1);
+                let ph = level_size(h, k - 1);
+                let next = at + ((pw * ph) * 4);
+                halve_u8(data[at..next], pw, ph, data[next..], level_size(w, k), level_size(h, k), srgb);
+                at = next;
+            }
+            let mut format = R8G8B8A8_UNORM;
+            if srgb {
+                format = R8G8B8A8_UNORM_SRGB;
+            }
+            return self.texture_levels(@truncate(u32, w), @truncate(u32, h), format, 4, data, levels);
+        }
+        let mut conv = img.convert(4, image.Depth.F32)!;
+        defer conv.deinit();
+        let mut lin = mem.alloc.[f32](pixels * 4)!;
+        defer mem.free(lin);
+        @mem_copy(lin[0..(w * h) * 4], conv.samples32()[0..(w * h) * 4]);
+        let mut at: usize = 0;
+        for k in @as(u32, 1)..levels {
+            let pw = level_size(w, k - 1);
+            let ph = level_size(h, k - 1);
+            let next = at + ((pw * ph) * 4);
+            halve_f32(lin[at..next], pw, ph, lin[next..], level_size(w, k), level_size(h, k));
+            at = next;
+        }
+        let mut half = mem.alloc.[u16](pixels * 4)!;
+        defer mem.free(half);
+        for i in 0..half.len {
+            half[i] = image.f32_to_half(lin[i]);
+        }
+        return self.texture_levels(@truncate(u32, w), @truncate(u32, h), R16G16B16A16_FLOAT, 8,
+                                   @slice_from_ptr(@ptr_cast(*u8, half.ptr), half.len * 2), levels);
+    }
+
+    // A texture of `format`, `bpp` bytes a pixel, from `levels` mip levels
+    // one after the other in data (each w × h halved, rounded down, at
+    // least 1; rows packed).
+    fn texture_levels(self: *mut Device, w: u32, h: u32, format: u32, bpp: usize, data: []u8,
+                      levels: u32) D3d12Error!Texture {
+        if self.recording or (levels == 0) or (levels > 16) {
+            return error.InvalidArgument;
+        }
+        let mut t = Texture.empty();
+        t.slots = self.slots;
+        t.srv = take(self.slots.srv[..]);
+        if t.srv == NO_SLOT {
+            return error.NoSpaceLeft;
+        }
+        let mut rd: [56]u8 = [0; 56];
+        texture_desc_with(rd[..], w, h, format, 0, levels, 1);
+        t.res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0)) catch |e| {
+            t.deinit();
+            return e;
+        };
+        t.width = w;
+        t.height = h;
+        t.levels = levels;
+        // the levels in an upload buffer, each at a multiple of 512 bytes,
+        // its rows at multiples of 256
+        let mut offs: [16]usize = [0; 16];
+        let mut pitches: [16]usize = [0; 16];
+        let mut size: usize = 0;
+        for k in @as(u32, 0)..levels {
+            let lw = level_size(@as(usize, w), k);
+            let lh = level_size(@as(usize, h), k);
+            size = (size + 511) & ~@as(usize, 511);
+            offs[@as(usize, k)] = size;
+            pitches[@as(usize, k)] = ((lw * bpp) + 255) & ~@as(usize, 255);
+            size += pitches[@as(usize, k)] * lh;
+        }
+        let mut bd: [56]u8 = [0; 56];
+        buffer_desc(bd[..], @as(u64, size));
+        let up = self.committed(2, bd[..], GENERIC_READ, @ptr_from_int(*u8, 0)) catch |e| {  // UPLOAD heap
+            t.deinit();
+            return e;
+        };
+        defer com.release(up);
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(up, 8))(up, 0, &range[0], &mut p)) catch |e| {
+            t.deinit();
+            return e;
+        };
+        let mut at: usize = 0;
+        for k in @as(u32, 0)..levels {
+            let lw = level_size(@as(usize, w), k);
+            let lh = level_size(@as(usize, h), k);
+            let row = lw * bpp;
+            for y in 0..lh {
+                let dst = p + offs[@as(usize, k)] + (y * pitches[@as(usize, k)]);
+                @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, dst), row),
+                          data[at + (y * row)..at + ((y + 1) * row)]);
+            }
+            at += row * lh;
+        }
+        @bit_cast(fn(usize, u32, *void) void, com.method(up, 9))(up, 0, @ptr_from_int(*void, 0));  // Unmap
+        self.open() catch |e| {
+            t.deinit();
+            return e;
+        };
+        // D3D12_TEXTURE_COPY_LOCATIONs: the texture's subresource k, the
+        // buffer's placed footprint of level k
+        let f = @bit_cast(fn(usize, *u8, u32, u32, u32, *u8, *void) void, com.method(self.list, 16));  // CopyTextureRegion
+        for k in @as(u32, 0)..levels {
+            let mut dst: [48]u8 = [0; 48];
+            com.ptr(dst[..], 0, t.res);
+            com.put32(dst[..], 16, k);
+            let mut src: [48]u8 = [0; 48];
+            com.ptr(src[..], 0, up);
+            com.put32(src[..], 8, 1);
+            com.put64(src[..], 16, @as(u64, offs[@as(usize, k)]));
+            com.put32(src[..], 24, format);
+            com.put32(src[..], 28, @truncate(u32, level_size(@as(usize, w), k)));
+            com.put32(src[..], 32, @truncate(u32, level_size(@as(usize, h), k)));
+            com.put32(src[..], 36, 1);
+            com.put32(src[..], 40, @truncate(u32, pitches[@as(usize, k)]));
+            f(self.list, &dst[0], 0, 0, 0, &src[0], @ptr_from_int(*void, 0));
+        }
+        self.barrier(t.res, COPY_DEST, SHADER_RESOURCE);
+        self.submit() catch |e| {
+            t.deinit();
+            return e;
+        };
+        // (the view's format and levels are the texture's)
+        let handle = self.srv_cpu + (@as(usize, t.srv) * @as(usize, self.srv_size));
+        @bit_cast(fn(usize, usize, *void, usize) void, com.method(self.dev, 18))(
+            self.dev, t.res, @ptr_from_int(*void, 0), handle);
+        return t;
+    }
+
+    /// A storage buffer holding data (its length a multiple of 4), for
+    /// compute shaders. Made between frames.
+    pub fn storage_buffer(self: *mut Device, data: []u8) D3d12Error!StorageBuffer {
+        if self.recording or (data.len == 0) or ((data.len % 4) != 0) {
+            return error.InvalidArgument;
+        }
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, data.len));
+        com.put32(rd[..], 48, 0x4);  // ALLOW_UNORDERED_ACCESS
+        let res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;
+        let up = self.staging(data, data.len, 1, data.len) catch |e| {
+            com.release(res);
+            return e;
+        };
+        defer com.release(up);
+        self.open() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let f = @bit_cast(fn(usize, usize, u64, usize, u64, u64) void, com.method(self.list, 15));  // CopyBufferRegion
+        f(self.list, res, 0, up, 0, @as(u64, data.len));
+        self.barrier(res, COPY_DEST, UNORDERED_ACCESS);
+        self.submit() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);
+        return StorageBuffer.{ res: res, gpu: gpu, size: @truncate(u32, data.len), state: UNORDERED_ACCESS };
+    }
+
+    /// Copies a storage buffer's contents into out (as much as fits), after
+    /// what was recorded so far has run.
+    pub fn read_buffer(self: *mut Device, b: *mut StorageBuffer, out: []mut u8) D3d12Error!void {
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, b.size));
+        let rb = self.committed(3, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;  // READBACK heap
+        defer com.release(rb);
+        self.open()!;
+        self.barrier(b.res, b.state, COPY_SOURCE);
+        let f = @bit_cast(fn(usize, usize, u64, usize, u64, u64) void, com.method(self.list, 15));  // CopyBufferRegion
+        f(self.list, rb, 0, b.res, 0, @as(u64, b.size));
+        self.barrier(b.res, COPY_SOURCE, b.state);
+        self.submit()!;
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, @as(u64, b.size)];
+        com.check(@bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p))!;
+        let n = @min(out.len, @as(usize, b.size));
+        @mem_copy(out[0..n], @slice_from_ptr(@ptr_from_int(*u8, p), n));
+        let none: [2]u64 = [0, 0];
+        @bit_cast(fn(usize, u32, *u64) void, com.method(rb, 9))(rb, 0, &none[0]);
+    }
+
+    /// A root signature for compute shaders: `constants` 32-bit constants at
+    /// b0 (0: none) and `storage` storage buffers at u0, u1, ...
+    pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) D3d12Error!RootSignature {
+        if storage > 8 {
+            return error.InvalidArgument;
+        }
+        // D3D12_ROOT_PARAMETERs: constants (register, space, count at 8, 12,
+        // 16); root UAVs (the register at 8)
+        let mut params: [9][32]u8 = [[0; 32]; 9];
+        let mut n: u32 = 0;
+        if constants > 0 {
+            com.put32(params[0][..], 0, 1);
+            com.put32(params[0][..], 16, constants);
+            n = 1;
+        }
+        let first = n;
+        for k in @as(u32, 0)..storage {
+            com.put32(params[@as(usize, n)][..], 0, 4);  // UAV
+            com.put32(params[@as(usize, n)][..], 8, k);
+            n += 1;
+        }
+        let mut desc: [40]u8 = [0; 40];
+        if n > 0 {
+            com.put32(desc[..], 0, n);
+            com.ptr(desc[..], 8, @int_from_ptr(&params[0][0]));
+        }
+        let p = self.serialize_root(desc[..])!;
+        return RootSignature.{ p: p, constants: constants, buffers: first, textures: 0 };
+    }
+
+    /// A compute pipeline: the compute shader and its root signature
+    /// (compute_signature).
+    pub fn compute_pipeline(self: *mut Device, root: *RootSignature, cs: *hlsl.Code) D3d12Error!Pipeline {
+        let cb = cs.bytes();
+        // D3D12_COMPUTE_PIPELINE_STATE_DESC: root signature, shader, node
+        // mask, cached state, flags
+        let mut d: [56]u8 = [0; 56];
+        com.ptr(d[..], 0, root.p);
+        com.ptr(d[..], 8, @int_from_ptr(cb.ptr));
+        com.put64(d[..], 16, @as(u64, cb.len));
+        let mut p: usize = 0;
+        let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 11));  // CreateComputePipelineState
+        com.check(f(self.dev, &d[0], &IID_PSO[0], &mut p))!;
+        return Pipeline.{ p: p, root: root.p, topology: 0, buffers: root.buffers, textures: 0 };
+    }
+
+    fn serialize_root(self: *mut Device, desc: []u8) D3d12Error!usize {
+        let mut blob: usize = 0;
+        let mut errs: usize = 0;
+        let r = D3D12SerializeRootSignature(&desc[0], 1, &mut blob, &mut errs);
+        com.release(errs);
+        com.check(r)!;
+        defer com.release(blob);
+        let bp = @bit_cast(fn(usize) usize, com.method(blob, 3))(blob);
+        let bn = @bit_cast(fn(usize) usize, com.method(blob, 4))(blob);
+        let mut p: usize = 0;
+        let f = @bit_cast(fn(usize, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 16));
+        com.check(f(self.dev, 0, bp, bn, &IID_ROOT[0], &mut p))!;
+        return p;
+    }
+
+    /// A root signature with `constants` 32-bit constants for both shaders
+    /// at register b0 (0: none), and vertex input.
+    pub fn root_signature(self: *mut Device, constants: u32) D3d12Error!RootSignature {
+        return self.root_signature_with(constants, 0, 0);
+    }
+
+    /// A root signature with `constants` 32-bit constants at b0 (0: none),
+    /// `buffers` constant buffers at b1, b2, ... (set_buffer) and `textures`
+    /// textures at t0, t1, ... (set_texture), for both shaders. Three
+    /// samplers are always there: s0 linear (trilinear) and wrapping, s1 a
+    /// comparison (less or equal, linear, white outside) for shadow maps,
+    /// s2 linear and clamped, for targets read by later passes.
+    pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32,
+                               textures: u32) D3d12Error!RootSignature {
+        if (buffers > MAX_ROOT_BUFFERS) or (textures > MAX_ROOT_TEXTURES) {
+            return error.InvalidArgument;
+        }
+        // D3D12_ROOT_PARAMETERs: type at 0; for constants the register,
+        // space and count at 8, 12, 16; for a constant buffer the register
+        // at 8; for a table the number of ranges at 8 and the ranges at 16;
+        // visibility (all) at 24
+        let mut params: [9][32]u8 = [[0; 32]; 9];
+        let mut ranges: [4][20]u8 = [[0; 20]; 4];
+        let mut n: u32 = 0;
+        if constants > 0 {
+            com.put32(params[0][..], 0, 1);
+            com.put32(params[0][..], 16, constants);
+            n = 1;
+        }
+        let first_buffer = n;
+        for k in @as(u32, 0)..buffers {
+            com.put32(params[@as(usize, n)][..], 0, 2);  // CBV
+            com.put32(params[@as(usize, n)][..], 8, k + 1);
+            n += 1;
+        }
+        let first_texture = n;
+        for k in @as(u32, 0)..textures {
+            // D3D12_DESCRIPTOR_RANGE: type (SRV), count, register, space, offset (appended)
+            let ri = @as(usize, k);
+            com.put32(ranges[ri][..], 4, 1);
+            com.put32(ranges[ri][..], 8, k);
+            com.put32(ranges[ri][..], 16, 0xffff_ffff);
+            com.put32(params[@as(usize, n)][..], 0, 0);  // DESCRIPTOR_TABLE
+            com.put32(params[@as(usize, n)][..], 8, 1);
+            com.ptr(params[@as(usize, n)][..], 16, @int_from_ptr(&ranges[ri][0]));
+            n += 1;
+        }
+        // D3D12_STATIC_SAMPLER_DESCs: filter, address u, v, w, mip bias,
+        // anisotropy, comparison, border colour, min and max LOD, register
+        let mut samplers: [3][52]u8 = [[0; 52]; 3];
+        for k in @as(usize, 0)..3 {
+            com.put32(samplers[k][..], 0, 0x15);  // MIN_MAG_MIP_LINEAR
+            com.put32(samplers[k][..], 4, 1);     // WRAP
+            com.put32(samplers[k][..], 8, 1);
+            com.put32(samplers[k][..], 12, 1);
+            com.put32(samplers[k][..], 20, 1);
+            com.put32(samplers[k][..], 24, 8);  // ALWAYS
+            com.put32(samplers[k][..], 36, @bit_cast(u32, @as(f32, 3.4e38)));
+            com.put32(samplers[k][..], 40, @truncate(u32, k));
+        }
+        com.put32(samplers[1][..], 0, 0x94);  // COMPARISON_MIN_MAG_LINEAR_MIP_POINT
+        com.put32(samplers[1][..], 4, 4);     // BORDER
+        com.put32(samplers[1][..], 8, 4);
+        com.put32(samplers[1][..], 12, 4);
+        com.put32(samplers[1][..], 24, 4);  // LESS_EQUAL
+        com.put32(samplers[1][..], 28, 2);  // OPAQUE_WHITE
+        com.put32(samplers[2][..], 4, 3);   // CLAMP
+        com.put32(samplers[2][..], 8, 3);
+        com.put32(samplers[2][..], 12, 3);
+        // D3D12_ROOT_SIGNATURE_DESC: count, parameters, static samplers, flags
+        let mut desc: [40]u8 = [0; 40];
+        if n > 0 {
+            com.put32(desc[..], 0, n);
+            com.ptr(desc[..], 8, @int_from_ptr(&params[0][0]));
+        }
+        com.put32(desc[..], 16, 3);
+        com.ptr(desc[..], 24, @int_from_ptr(&samplers[0][0]));
+        com.put32(desc[..], 32, 1);  // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+        let p = self.serialize_root(desc[..])!;
+        return RootSignature.{ p: p, constants: constants, buffers: first_buffer, textures: first_texture };
+    }
+
+    /// A pipeline: the shaders, the vertex layout, the topology; alpha
+    /// blending when `blend`. It draws into R8G8B8A8 targets.
+    pub fn pipeline(self: *mut Device, root: *RootSignature, vs: *hlsl.Code, ps: *hlsl.Code, attrs: []Attribute,
+                    topology: u32, blend: bool) D3d12Error!Pipeline {
+        let mut b = BLEND_NONE;
+        if blend {
+            b = BLEND_ALPHA;
+        }
+        let mut o = PipelineOptions.defaults();
+        o.topology = topology;
+        o.blend = b;
+        return self.pipeline_with(root, vs, ps, attrs, o);
+    }
+
+    /// A pipeline drawing as `o` says: blending, the depth test (DEPTH_NONE:
+    /// for begin, without a depth buffer; others for begin_depth or
+    /// begin_shadow), culling, depth bias, into targets of o.format and
+    /// o.samples.
+    pub fn pipeline_with(self: *mut Device, root: *RootSignature, vs: *hlsl.Code, ps: *hlsl.Code, attrs: []Attribute,
+                         o: PipelineOptions) D3d12Error!Pipeline {
+        let topology = o.topology;
+        if attrs.len > 16 {
+            return error.InvalidArgument;
+        }
+        let mut names: [16][64]u8 = [[0; 64]; 16];
+        let mut elems: [512]u8 = [0; 512];
+        for k in 0..attrs.len {
+            let a = attrs[k];
+            if (a.semantic.len + 1) > 64 {
+                return error.InvalidArgument;
+            }
+            @mem_copy(names[k][0..a.semantic.len], a.semantic);
+            com.ptr(elems[..], k * 32, @int_from_ptr(&names[k][0]));
+            com.put32(elems[..], (k * 32) + 8, a.index);
+            com.put32(elems[..], (k * 32) + 12, a.format);
+            com.put32(elems[..], (k * 32) + 20, a.offset);
+        }
+        let vb = vs.bytes();
+        let pb = ps.bytes();
+        // D3D12_GRAPHICS_PIPELINE_STATE_DESC (656 bytes; offsets from the
+        // Windows headers)
+        let mut d: [656]u8 = [0; 656];
+        com.ptr(d[..], 0, root.p);
+        com.ptr(d[..], 8, @int_from_ptr(vb.ptr));
+        com.put64(d[..], 16, @as(u64, vb.len));
+        if not o.depth_only {
+            com.ptr(d[..], 24, @int_from_ptr(pb.ptr));
+            com.put64(d[..], 32, @as(u64, pb.len));
+        }
+        // the blend state's first target at 128: enable, logic op, source,
+        // destination, operation, (alpha: source, destination, operation),
+        // logic op, write mask
+        let rt: usize = 128;
+        if o.blend == BLEND_ALPHA {
+            com.put32(d[..], rt, 1);
+            com.put32(d[..], rt + 8, 5);   // SRC_ALPHA
+            com.put32(d[..], rt + 12, 6);  // INV_SRC_ALPHA
+        } else if o.blend == BLEND_ADD {
+            com.put32(d[..], rt, 1);
+            com.put32(d[..], rt + 8, 5);   // SRC_ALPHA
+            com.put32(d[..], rt + 12, 2);  // ONE
+        } else {
+            com.put32(d[..], rt + 8, 2);   // ONE
+            com.put32(d[..], rt + 12, 1);  // ZERO
+        }
+        com.put32(d[..], rt + 16, 1);  // ADD
+        com.put32(d[..], rt + 20, 2);  // ONE
+        com.put32(d[..], rt + 24, 1);  // ZERO
+        if o.blend == BLEND_ALPHA {
+            com.put32(d[..], rt + 24, 6);  // alpha: INV_SRC_ALPHA, so opaque stays opaque
+        } else if o.blend == BLEND_ADD {
+            com.put32(d[..], rt + 20, 1);  // alpha: ZERO, ONE: unchanged
+            com.put32(d[..], rt + 24, 2);
+        }
+        com.put32(d[..], rt + 28, 1);  // ADD
+        com.put32(d[..], rt + 32, 4);  // NOOP
+        d[rt + 36] = 0xf;
+        com.put32(d[..], 448, 0xffff_ffff);  // sample mask
+        com.put32(d[..], 452, 3);            // rasterizer: solid
+        com.put32(d[..], 456, o.cull);
+        com.put32(d[..], 460, 1);  // front faces counter-clockwise
+        com.put32(d[..], 464, @bit_cast(u32, o.depth_bias));
+        com.put32(d[..], 472, @bit_cast(u32, o.slope_bias));
+        com.put32(d[..], 476, 1);  // depth clip
+        let samples = @max(o.samples, 1);
+        if samples > 1 {
+            com.put32(d[..], 480, 1);  // multisampling
+        }
+        // the depth stencil state at 496: depth enable, write mask, function,
+        // stencil enable, read and write masks, front and back faces' ops
+        if o.depth != DEPTH_NONE {
+            if o.depth != DEPTH_OFF {
+                com.put32(d[..], 496, 1);
+                com.put32(d[..], 504, 2);  // LESS
+            } else {
+                com.put32(d[..], 504, 8);  // ALWAYS
+            }
+            if o.depth == DEPTH_WRITE {
+                com.put32(d[..], 500, 1);  // ALL
+            }
+            d[512] = 0xff;
+            d[513] = 0xff;
+            for f in @as(usize, 0)..2 {
+                let at = 516 + (f * 16);
+                com.put32(d[..], at, 1);  // KEEP
+                com.put32(d[..], at + 4, 1);
+                com.put32(d[..], at + 8, 1);
+                com.put32(d[..], at + 12, 8);  // ALWAYS
+            }
+            com.put32(d[..], 612, D32_FLOAT);  // DSVFormat
+        }
+        if attrs.len > 0 {
+            com.ptr(d[..], 552, @int_from_ptr(&elems[0]));
+            com.put32(d[..], 560, @truncate(u32, attrs.len));
+        }
+        let mut kind: u32 = 3;  // triangles
+        if topology == POINT_LIST {
+            kind = 1;
+        } else if (topology == LINE_LIST) or (topology == LINE_STRIP) {
+            kind = 2;
+        }
+        com.put32(d[..], 572, kind);
+        if not o.depth_only {
+            com.put32(d[..], 576, 1);
+            com.put32(d[..], 580, target_format(o.format));
+        }
+        com.put32(d[..], 616, samples);
+        let mut p: usize = 0;
+        let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 10));
+        com.check(f(self.dev, &d[0], &IID_PSO[0], &mut p))!;
+        return Pipeline.{ p: p, root: root.p, topology: topology, buffers: root.buffers, textures: root.textures };
+    }
+
+    // --- recording a frame ---
+
+    fn barrier(self: *mut Device, res: usize, before: u32, after: u32) void {
+        if before == after {
+            return;
+        }
+        // D3D12_RESOURCE_BARRIER: transition of all subresources
+        let mut b: [32]u8 = [0; 32];
+        com.ptr(b[..], 8, res);
+        com.put32(b[..], 16, 0xffff_ffff);
+        com.put32(b[..], 20, before);
+        com.put32(b[..], 24, after);
+        @bit_cast(fn(usize, u32, *u8) void, com.method(self.list, 26))(self.list, 1, &b[0]);
+    }
+
+    fn open(self: *mut Device) D3d12Error!void {
+        if self.recording {
+            return;
+        }
+        com.check(call0(self.alloc, 8))!;  // Reset
+        com.check(@bit_cast(fn(usize, usize, usize) i32, com.method(self.list, 10))(self.list, self.alloc, 0))!;
+        self.recording = true;
+        self.heaps_set = false;
+    }
+
+    fn submit(self: *mut Device) D3d12Error!void {
+        com.check(call0(self.list, 9)) catch |e| {  // Close
+            self.recording = false;
+            return e;
+        };
+        self.recording = false;
+        let lists: [1]usize = [self.list];
+        @bit_cast(fn(usize, u32, *usize) void, com.method(self.queue, 10))(self.queue, 1, &lists[0]);
+        self.wait_idle();
+    }
+
+    /// Starts recording a frame that draws into t (over all of it).
+    pub fn begin(self: *mut Device, t: *mut Target) D3d12Error!void {
+        self.begin_with(t, @ptr_from_int(*usize, 0))!;
+    }
+
+    /// Starts recording a frame that draws into t, testing depth against d
+    /// (of t's size).
+    pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) D3d12Error!void {
+        if (d.width != t.width) or (d.height != t.height) {
+            return error.InvalidArgument;
+        }
+        self.open()!;
+        self.barrier(d.res, d.state, DEPTH_WRITE_STATE);
+        d.state = DEPTH_WRITE_STATE;
+        self.begin_with(t, &d.dsv)!;
+    }
+
+    /// Starts recording (or goes on recording the frame, before begin or
+    /// begin_depth) drawing into d alone, with depth_only pipelines: a
+    /// shadow map's pass.
+    pub fn begin_shadow(self: *mut Device, d: *mut DepthBuffer) D3d12Error!void {
+        self.open()!;
+        self.end_pass();
+        self.barrier(d.res, d.state, DEPTH_WRITE_STATE);
+        d.state = DEPTH_WRITE_STATE;
+        @bit_cast(fn(usize, u32, *usize, i32, *usize) void, com.method(self.list, 46))(
+            self.list, 0, @ptr_from_int(*usize, 0), 0, &d.dsv);
+        self.viewport(d.width, d.height);
+    }
+
+    fn begin_with(self: *mut Device, t: *mut Target, dsv: *usize) D3d12Error!void {
+        self.open()!;
+        self.end_pass();
+        if t.msaa == 0 {
+            self.barrier(t.res, t.state, RENDER_TARGET);
+            t.state = RENDER_TARGET;
+        }
+        self.cur = t;
+        let rtvs: [1]usize = [t.rtv];
+        @bit_cast(fn(usize, u32, *usize, i32, *usize) void, com.method(self.list, 46))(self.list, 1, &rtvs[0], 0, dsv);
+        self.viewport(t.width, t.height);
+    }
+
+    // Ends the pass drawing into cur: a multisampled target is resolved,
+    // for later passes to read.
+    fn end_pass(self: *mut Device) void {
+        if @int_from_ptr(self.cur) == 0 {
+            return;
+        }
+        let t = self.cur;
+        self.cur = @ptr_from_int(*mut Target, 0);
+        if (t.msaa == 0) or not self.recording {
+            return;
+        }
+        self.barrier(t.msaa, RENDER_TARGET, RESOLVE_SOURCE);
+        self.barrier(t.res, t.state, RESOLVE_DEST);
+        @bit_cast(fn(usize, usize, u32, usize, u32, u32) void, com.method(self.list, 19))(  // ResolveSubresource
+            self.list, t.res, 0, t.msaa, 0, target_format(t.format));
+        self.barrier(t.msaa, RESOLVE_SOURCE, RENDER_TARGET);
+        t.state = RESOLVE_DEST;
+    }
+
+    fn viewport(self: *mut Device, width: u32, height: u32) void {
+        let vp: [6]f32 = [0.0, 0.0, @float_from_int(f32, width), @float_from_int(f32, height), 0.0, 1.0];
+        @bit_cast(fn(usize, u32, *f32) void, com.method(self.list, 21))(self.list, 1, &vp[0]);
+        let sc: [4]i32 = [0, 0, @bit_cast(i32, width), @bit_cast(i32, height)];
+        @bit_cast(fn(usize, u32, *i32) void, com.method(self.list, 22))(self.list, 1, &sc[0]);
+    }
+
+    pub fn clear(self: *mut Device, t: *Target, r: f32, g: f32, b: f32, a: f32) void {
+        let c: [4]f32 = [r, g, b, a];
+        let f = @bit_cast(fn(usize, usize, *f32, u32, *void) void, com.method(self.list, 48));
+        f(self.list, t.rtv, &c[0], 0, @ptr_from_int(*void, 0));
+    }
+
+    /// Clears d to the far plane (depth 1).
+    pub fn clear_depth(self: *mut Device, d: *DepthBuffer) void {
+        let f = @bit_cast(fn(usize, usize, u32, f32, u8, u32, *void) void, com.method(self.list, 47));
+        f(self.list, d.dsv, 1, 1.0, 0, 0, @ptr_from_int(*void, 0));  // CLEAR_FLAG_DEPTH
+    }
+
+    /// The pipeline to draw with. Its root signature's constants, buffers
+    /// and textures must be set (again) after it.
+    pub fn set_pipeline(self: *mut Device, p: *Pipeline) void {
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 25))(self.list, p.p);
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 30))(self.list, p.root);
+        @bit_cast(fn(usize, u32) void, com.method(self.list, 20))(self.list, p.topology);
+        self.cur_buffers = p.buffers;
+        self.cur_textures = p.textures;
+    }
+
+    /// Constant buffer b(slot + 1) of the pipeline's root signature.
+    pub fn set_buffer(self: *mut Device, slot: u32, b: *Buffer) void {
+        @bit_cast(fn(usize, u32, u64) void, com.method(self.list, 38))(  // SetGraphicsRootConstantBufferView
+            self.list, self.cur_buffers + slot, b.gpu);
+    }
+
+    /// Texture t(slot) of the pipeline's root signature: a shadow map, drawn
+    /// earlier in the frame.
+    pub fn set_texture(self: *mut Device, slot: u32, d: *mut DepthBuffer) void {
+        if not d.sampled {
+            return;
+        }
+        self.barrier(d.res, d.state, PIXEL_SHADER_RESOURCE);
+        d.state = PIXEL_SHADER_RESOURCE;
+        self.bind_view(slot, d.srv);
+    }
+
+    /// Texture t(slot) of the pipeline's root signature: an image (texture).
+    pub fn set_image(self: *mut Device, slot: u32, t: *Texture) void {
+        self.bind_view(slot, t.srv);
+    }
+
+    /// Texture t(slot) of the pipeline's root signature: a target drawn in
+    /// an earlier pass (resolved, if multisampled), read through s2.
+    pub fn set_target_texture(self: *mut Device, slot: u32, t: *mut Target) void {
+        if t.srv == NO_SLOT {
+            return;
+        }
+        self.barrier(t.res, t.state, PIXEL_SHADER_RESOURCE);
+        t.state = PIXEL_SHADER_RESOURCE;
+        self.bind_view(slot, t.srv);
+    }
+
+    fn bind_view(self: *mut Device, slot: u32, srv: u32) void {
+        if not self.heaps_set {
+            let heaps: [1]usize = [self.srv_heap];
+            @bit_cast(fn(usize, u32, *usize) void, com.method(self.list, 28))(self.list, 1, &heaps[0]);  // SetDescriptorHeaps
+            self.heaps_set = true;
+        }
+        let handle = self.srv_gpu + (@as(u64, srv) * @as(u64, self.srv_size));
+        @bit_cast(fn(usize, u32, u64) void, com.method(self.list, 32))(  // SetGraphicsRootDescriptorTable
+            self.list, self.cur_textures + slot, handle);
+    }
+
+    // --- computing ---
+
+    /// The compute pipeline to run (compute_pipeline): starts recording, or
+    /// goes on recording the frame. Its constants and storage buffers must
+    /// be set (again) after it.
+    pub fn set_compute_pipeline(self: *mut Device, p: *Pipeline) D3d12Error!void {
+        self.open()!;
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 25))(self.list, p.p);
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 29))(self.list, p.root);  // SetComputeRootSignature
+        self.cur_buffers = p.buffers;
+    }
+
+    /// The compute root signature's constants (b0), as 32-bit words.
+    pub fn set_compute_constants(self: *mut Device, values: []u32) void {
+        let f = @bit_cast(fn(usize, u32, u32, *u32, u32) void, com.method(self.list, 35));
+        f(self.list, 0, @truncate(u32, values.len), values.ptr, 0);
+    }
+
+    /// Storage buffer u(slot) of the compute root signature.
+    pub fn set_storage(self: *mut Device, slot: u32, b: *mut StorageBuffer) void {
+        self.barrier(b.res, b.state, UNORDERED_ACCESS);
+        b.state = UNORDERED_ACCESS;
+        @bit_cast(fn(usize, u32, u64) void, com.method(self.list, 41))(  // SetComputeRootUnorderedAccessView
+            self.list, self.cur_buffers + slot, b.gpu);
+    }
+
+    /// Runs the compute shader on x × y × z groups of threads. What it
+    /// wrote is seen by what is recorded after.
+    pub fn dispatch(self: *mut Device, x: u32, y: u32, z: u32) void {
+        @bit_cast(fn(usize, u32, u32, u32) void, com.method(self.list, 14))(self.list, x, y, z);
+        // a UAV barrier on every resource
+        let mut b: [32]u8 = [0; 32];
+        b[0] = 2;  // D3D12_RESOURCE_BARRIER_TYPE_UAV, of no resource in particular
+        @bit_cast(fn(usize, u32, *u8) void, com.method(self.list, 26))(self.list, 1, &b[0]);
+    }
+
+    /// Draws a storage buffer's contents as the vertices, each `stride` bytes.
+    pub fn set_storage_vertices(self: *mut Device, b: *mut StorageBuffer, stride: u32) void {
+        self.barrier(b.res, b.state, VERTEX_AND_CONSTANT_BUFFER);
+        b.state = VERTEX_AND_CONSTANT_BUFFER;
+        let mut v: [16]u8 = [0; 16];
+        com.put64(v[..], 0, b.gpu);
+        com.put32(v[..], 8, b.size);
+        com.put32(v[..], 12, stride);
+        @bit_cast(fn(usize, u32, u32, *u8) void, com.method(self.list, 44))(self.list, 0, 1, &v[0]);
+    }
+
+    /// The root signature's constants (b0), as 32-bit words.
+    pub fn set_constants(self: *mut Device, values: []u32) void {
+        let f = @bit_cast(fn(usize, u32, u32, *u32, u32) void, com.method(self.list, 36));
+        f(self.list, 0, @truncate(u32, values.len), values.ptr, 0);
+    }
+
+    /// Some of the constants, from the 32-bit word `offset` on (the others
+    /// keep their values): per-frame ones set once, per-draw ones after.
+    pub fn set_constants_at(self: *mut Device, offset: u32, values: []u32) void {
+        let f = @bit_cast(fn(usize, u32, u32, *u32, u32) void, com.method(self.list, 36));
+        f(self.list, 0, @truncate(u32, values.len), values.ptr, offset);
+    }
+
+    /// The vertex buffer, each vertex `stride` bytes.
+    pub fn set_vertices(self: *mut Device, b: *Buffer, stride: u32) void {
+        // D3D12_VERTEX_BUFFER_VIEW: GPU address, size, stride
+        let mut v: [16]u8 = [0; 16];
+        com.put64(v[..], 0, b.gpu);
+        com.put32(v[..], 8, b.size);
+        com.put32(v[..], 12, stride);
+        @bit_cast(fn(usize, u32, u32, *u8) void, com.method(self.list, 44))(self.list, 0, 1, &v[0]);
+    }
+
+    /// The index buffer, of R16_UINT or R32_UINT indexes.
+    pub fn set_indices(self: *mut Device, b: *Buffer, format: u32) void {
+        let mut v: [16]u8 = [0; 16];
+        com.put64(v[..], 0, b.gpu);
+        com.put32(v[..], 8, b.size);
+        com.put32(v[..], 12, format);
+        @bit_cast(fn(usize, *u8) void, com.method(self.list, 43))(self.list, &v[0]);
+    }
+
+    pub fn draw(self: *mut Device, count: u32, first: u32) void {
+        @bit_cast(fn(usize, u32, u32, u32, u32) void, com.method(self.list, 12))(self.list, count, 1, first, 0);
+    }
+
+    pub fn draw_indexed(self: *mut Device, count: u32, first: u32, base: i32) void {
+        @bit_cast(fn(usize, u32, u32, u32, i32, u32) void, com.method(self.list, 13))(
+            self.list, count, 1, first, base, 0);
+    }
+
+    /// Submits the frame drawn into a texture and waits for it (and for the
+    /// overlay's drawing).
+    pub fn finish(self: *mut Device) D3d12Error!void {
+        if not self.recording {
+            self.wait_idle();
+            return;
+        }
+        self.end_pass();
+        self.submit()!;
+    }
+
+    // --- Direct2D on top ---
+
+    /// Direct3D 11 on this device, for Direct2D to draw onto its targets:
+    ///
+    ///     let mut ov = gpu.overlay()!;
+    ///     let mut c = d2d.Canvas.for_texture(gpu.overlay_texture(&mut ov, t)!, w, h)!;
+    ///     ... each frame: record the 3D drawing into t, then
+    ///     gpu.begin_overlay(&mut ov, t)!;     // submits it
+    ///     c.retarget(gpu.overlay_texture(&mut ov, t)!, w, h)!;   // (when t changed: back buffers alternate)
+    ///     c.begin(); ... c.end()!;
+    ///     gpu.end_overlay(&mut ov, t);
+    ///     gpu.present(true)!;                 // or finish(), read_pixels
+    pub fn overlay(self: *mut Device) D3d12Error!Overlay {
+        let mut o = Overlay.{ dev11: 0, ctx: 0, on12: 0, res: [0; 8], wrapped: [0; 8], n: 0 };
+        let queues: [1]usize = [self.queue];
+        let mut level: u32 = 0;
+        // BGRA_SUPPORT, for Direct2D
+        if D3D11On12CreateDevice(self.dev, 0x20, @ptr_from_int(*u32, 0), 0, &queues[0], 1, 0, &mut o.dev11, &mut o.ctx,
+                                 &mut level) < 0 {
+            return error.Unsupported;
+        }
+        o.on12 = com.query(o.dev11, &IID_ON12) catch {
+            o.deinit();
+            return error.Unsupported;
+        };
+        return o;
+    }
+
+    /// t as a Direct3D 11 texture (an ID3D11Texture2D) of the overlay, for
+    /// d2d.Canvas.for_texture or retarget; made the first time.
+    pub fn overlay_texture(self: *mut Device, o: *mut Overlay, t: *Target) D3d12Error!usize {
+        for k in 0..o.n {
+            if o.res[k] == t.res {
+                return o.wrapped[k];
+            }
+        }
+        if o.n == o.res.len {
+            return error.NoSpaceLeft;
+        }
+        // D3D11_RESOURCE_FLAGS: bind (render target), misc, CPU access, stride;
+        // in and out of Direct3D 11 as a render target
+        let flags: [4]u32 = [0x20, 0, 0, 0];
+        let mut w: usize = 0;
+        let f = @bit_cast(fn(usize, usize, *u32, u32, u32, *u8, *mut usize) i32, com.method(o.on12, 3));  // CreateWrappedResource
+        com.check(f(o.on12, t.res, &flags[0], RENDER_TARGET, RENDER_TARGET, &IID_TEXTURE2D[0], &mut w))!;
+        o.res[o.n] = t.res;
+        o.wrapped[o.n] = w;
+        o.n += 1;
+        return w;
+    }
+
+    /// Submits what was recorded for t, and hands t to the overlay: Direct2D
+    /// draws onto it until end_overlay.
+    pub fn begin_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) D3d12Error!void {
+        let w = self.overlay_texture(o, t)!;
+        self.end_pass();
+        if self.recording or (t.state != RENDER_TARGET) {
+            self.open()!;
+            self.barrier(t.res, t.state, RENDER_TARGET);
+            t.state = RENDER_TARGET;
+            self.submit()!;
+        }
+        let ws: [1]usize = [w];
+        @bit_cast(fn(usize, *usize, u32) void, com.method(o.on12, 5))(o.on12, &ws[0], 1);  // AcquireWrappedResources
+    }
+
+    /// Hands t back from the overlay (after d2d.Canvas.end), and runs what
+    /// Direct2D drew.
+    pub fn end_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) void {
+        _ = self;
+        for k in 0..o.n {
+            if o.res[k] == t.res {
+                let ws: [1]usize = [o.wrapped[k]];
+                @bit_cast(fn(usize, *usize, u32) void, com.method(o.on12, 4))(o.on12, &ws[0], 1);  // ReleaseWrappedResources
+            }
+        }
+        @bit_cast(fn(usize) void, com.method(o.ctx, 111))(o.ctx);  // Flush: onto the queue
+        t.state = RENDER_TARGET;
+    }
+
+    /// Submits the frame drawn into screen() and shows it; with vsync, at
+    /// the display's next refresh.
+    pub fn present(self: *mut Device, vsync: bool) D3d12Error!void {
+        self.end_pass();
+        let t = self.screen();
+        if self.recording or (t.state != PRESENT) {
+            self.open()!;
+            self.barrier(t.res, t.state, PRESENT);
+            t.state = PRESENT;
+            self.submit()!;
+        }
+        let mut sync: u32 = 0;
+        if vsync {
+            sync = 1;
+        }
+        com.check(@bit_cast(fn(usize, u32, u32) i32, com.method(self.swap, 8))(self.swap, sync, 0))!;
+        self.frame = @bit_cast(fn(usize) u32, com.method(self.swap, 36))(self.swap);
+    }
+
+    /// The pixels of a target (after finish()), as an RGBA image (free it
+    /// with deinit).
+    pub fn read_pixels(self: *mut Device, t: *mut Target) D3d12Error!image.Image {
+        if t.format != TARGET_BGRA8 {
+            return error.InvalidArgument;
+        }
+        self.end_pass();
+        let pitch = (t.width * 4 + 255) & ~@as(u32, 255);
+        let size = @as(u64, pitch) * @as(u64, t.height);
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], size);
+        let rb = self.committed(3, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;  // READBACK heap
+        defer com.release(rb);
+        self.open()!;
+        self.barrier(t.res, t.state, COPY_SOURCE);
+        // D3D12_TEXTURE_COPY_LOCATIONs: the buffer's placed footprint, the texture's subresource 0
+        let mut dst: [48]u8 = [0; 48];
+        com.ptr(dst[..], 0, rb);
+        com.put32(dst[..], 8, 1);
+        com.put32(dst[..], 24, R8G8B8A8_UNORM);
+        com.put32(dst[..], 28, t.width);
+        com.put32(dst[..], 32, t.height);
+        com.put32(dst[..], 36, 1);
+        com.put32(dst[..], 40, pitch);
+        let mut src: [48]u8 = [0; 48];
+        com.ptr(src[..], 0, t.res);
+        let f = @bit_cast(fn(usize, *u8, u32, u32, u32, *u8, *void) void, com.method(self.list, 16));
+        f(self.list, &dst[0], 0, 0, 0, &src[0], @ptr_from_int(*void, 0));
+        self.barrier(t.res, COPY_SOURCE, t.state);
+        self.submit()!;
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, size];
+        com.check(@bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p))!;
+        let w = @as(usize, t.width);
+        let h = @as(usize, t.height);
+        let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+        for y in 0..h {
+            let row = @slice_from_ptr(@ptr_from_int(*u8, p + (y * @as(usize, pitch))), w * 4);
+            @mem_copy(img.data[y * w * 4..(y + 1) * w * 4], row);
+        }
+        let none: [2]u64 = [0, 0];
+        @bit_cast(fn(usize, u32, *u64) void, com.method(rb, 9))(rb, 0, &none[0]);
+        return img;
+    }
+}
+
+// D3D12_RESOURCE_DESC (56 bytes): dimension, alignment, width at 16, height
+// at 24, depth at 28, mips at 30, format at 32, samples at 36, layout at 44,
+// flags at 48
+fn texture_desc(d: []mut u8, width: u32, height: u32, format: u32, flags: u32) void {
+    texture_desc_with(d, width, height, format, flags, 1, 1);
+}
+
+// ... of `mips` levels and `samples` a pixel
+fn texture_desc_with(d: []mut u8, width: u32, height: u32, format: u32, flags: u32, mips: u32, samples: u32) void {
+    com.put32(d, 0, 3);  // TEXTURE2D
+    com.put64(d, 16, @as(u64, width));
+    com.put32(d, 24, height);
+    com.put16(d, 28, 1);
+    com.put16(d, 30, @truncate(u16, mips));
+    com.put32(d, 32, format);
+    com.put32(d, 36, samples);
+    com.put32(d, 48, flags);
+}
+
+// --- mipmaps ---
+
+// A full chain's levels for w × h: down to 1 × 1.
+fn mip_levels(w: usize, h: usize) u32 {
+    let mut n: u32 = 1;
+    let mut m = @max(w, h);
+    while m > 1 {
+        m /= 2;
+        n += 1;
+    }
+    return n;
+}
+
+// Level k's width (or height) for a level 0 of `n`.
+fn level_size(n: usize, k: u32) usize {
+    return @max(n >> @as(usize, k), 1);
+}
+
+// The pixels of all the levels together.
+fn chain_pixels(w: usize, h: usize, levels: u32) usize {
+    let mut n: usize = 0;
+    for k in @as(u32, 0)..levels {
+        n += level_size(w, k) * level_size(h, k);
+    }
+    return n;
+}
+
+// The next level down from an RGBA level of pw × ph: each pixel the mean
+// of the (up to) 2 × 2 above it, of their linear light if `srgb` (alpha as
+// it is).
+fn halve_u8(src: []u8, pw: usize, ph: usize, dst: []mut u8, w: usize, h: usize, srgb: bool) void {
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = @min(x * 2, pw - 1);
+            let x1 = @min((x * 2) + 1, pw - 1);
+            let y0 = @min(y * 2, ph - 1);
+            let y1 = @min((y * 2) + 1, ph - 1);
+            for c in @as(usize, 0)..4 {
+                let a = src[(((y0 * pw) + x0) * 4) + c];
+                let b = src[(((y0 * pw) + x1) * 4) + c];
+                let e = src[(((y1 * pw) + x0) * 4) + c];
+                let g = src[(((y1 * pw) + x1) * 4) + c];
+                let mut v: u8 = 0;
+                if srgb and (c < 3) {
+                    let m =
+                        (color.srgb_decode(unit8(a)) + color.srgb_decode(unit8(b)) + color.srgb_decode(unit8(e)) +
+                         color.srgb_decode(unit8(g))) * 0.25;
+                    v = byte(color.srgb_encode(m));
+                } else {
+                    v = @truncate(u8, ((@as(u32, a) + @as(u32, b) + @as(u32, e) + @as(u32, g)) + 2) / 4);
+                }
+                dst[(((y * w) + x) * 4) + c] = v;
+            }
+        }
+    }
+}
+
+// The same for float RGBA.
+fn halve_f32(src: []f32, pw: usize, ph: usize, dst: []mut f32, w: usize, h: usize) void {
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = @min(x * 2, pw - 1);
+            let x1 = @min((x * 2) + 1, pw - 1);
+            let y0 = @min(y * 2, ph - 1);
+            let y1 = @min((y * 2) + 1, ph - 1);
+            for c in @as(usize, 0)..4 {
+                dst[(((y * w) + x) * 4) + c] =
+                    (src[(((y0 * pw) + x0) * 4) + c] + src[(((y0 * pw) + x1) * 4) + c] +
+                     src[(((y1 * pw) + x0) * 4) + c] + src[(((y1 * pw) + x1) * 4) + c]) * 0.25;
+            }
+        }
+    }
+}
+
+fn unit8(v: u8) f32 {
+    return @float_from_int(f32, v) / 255.0;
+}
+
+fn byte(v: f32) u8 {
+    return @int_from_float(u8, @nearest(@min(@max(v, 0.0), 1.0) * 255.0));
+}
+
+fn buffer_desc(d: []mut u8, size: u64) void {
+    com.put32(d, 0, 1);  // BUFFER
+    com.put64(d, 16, size);
+    com.put32(d, 24, 1);
+    com.put16(d, 28, 1);
+    com.put16(d, 30, 1);
+    com.put32(d, 36, 1);
+    com.put32(d, 44, 1);  // ROW_MAJOR
+}

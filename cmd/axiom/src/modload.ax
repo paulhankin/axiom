@@ -56,6 +56,7 @@ fn real_path_of(p: []u8) []u8 {
 pub threadlocal let mut g_std_dir: []u8 = "";
 pub threadlocal let mut g_cwd: []u8 = "";
 threadlocal let mut std_real: []u8 = "";
+threadlocal let mut lib_real: []u8 = "";
 threadlocal let mut std_real_done: bool = false;
 // ---------------------------------------------------------------------------
 // Module loading
@@ -66,29 +67,47 @@ fn has_ext(p: []u8) bool {
     return (dot >= 0) and ((slash < 0) or (dot > slash));
 }
 
-fn display_path(real: []u8) []u8 {
-    // Standard library modules (the runtime among them, in std/internal/runtime)
-    // show as std/<path> wherever the library lives, so that symbol names
-    // (prefixed with the display path) are the same from any directory
-    if not std_real_done {
+// The real paths of the standard library's directory and of the libraries'
+// (lib/ beside it, spec §4.1), or "" for one that does not exist.
+fn find_library_roots() void {
+    if not std_real_done and (g_std_dir.len > 0) {
         std_real_done = true;
-        if g_std_dir.len > 0 {
-            let r = u.real_path(g_std_dir);
-            if not u.isnos(r) {
-                std_real = r;
-            }
+        let r = u.real_path(g_std_dir);
+        if not u.isnos(r) {
+            std_real = r;
+        }
+        let l = u.real_path(u.lib_dir_of(g_std_dir));
+        if not u.isnos(l) {
+            lib_real = l;
         }
     }
-    let m = std_real.len;
-    if (m > 0) and (real.len > m) and u.starts(real, std_real) and (real[m] == '/') {
-        return u.f1("std/%s", real[m + 1..]);
+}
+
+// Whether real path p is under directory root (a real path, "" for none).
+fn under_root(p: []u8, root: []u8) bool {
+    let m = root.len;
+    return (m > 0) and (p.len > m) and u.starts(p, root) and (p[m] == '/');
+}
+
+fn display_path(real: []u8) []u8 {
+    // Standard library modules (the runtime among them, in std/internal/runtime)
+    // show as std/<path> wherever the library lives, and the libraries' as
+    // lib/<path>, so that symbol names (prefixed with the display path) are
+    // the same from any directory
+    find_library_roots();
+    if under_root(real, std_real) {
+        return u.f1("std/%s", real[std_real.len + 1..]);
+    }
+    if under_root(real, lib_real) {
+        return u.f1("lib/%s", real[lib_real.len + 1..]);
     }
     let n = g_cwd.len;
     if (n > 0) and (real.len > n) and u.starts(real, g_cwd) and (real[n] == '/') {
         let rel = real[n + 1..];
-        // std/ names the library's own modules (and prefixes their symbols):
-        // another copy in the working directory must not pass for them
-        if u.starts(rel, "std/") {
+        // std/ and lib/ name the library's own modules (and prefix their
+        // symbols): another copy in the working directory must not pass for
+        // them
+        if u.starts(rel, "std/") or u.starts(rel, "lib/") {
             return u.cat2("./", rel);
         }
         return u.dup(rel);
@@ -115,7 +134,7 @@ fn relative_import(ip: []u8) bool {
     return u.find(ip, '\\') < 0;
 }
 
-// Whether the part of an import path after "std/" or "pkg:name/" is relative,
+// Whether the part of an import path after "std/", "lib/" or "pkg:name/" is relative,
 // uses only '/' between its parts and has no ".." part, so that it stays in
 // the library or package.
 fn library_import(sub: []u8) bool {
@@ -136,9 +155,15 @@ fn library_import(sub: []u8) bool {
 
 // A module under a directory named `internal` may be imported only from the
 // tree rooted at that directory's parent (as in Go): std/internal/... only
-// from std. Returns the length of the parent's path in `target` when
-// `importer` is outside it, else 0.
+// from std, and from lib/, which is released with it (spec §4.1). Returns the
+// length of the parent's path in `target` when `importer` is outside it, else
+// 0.
 fn internal_violation(importer: []u8, target: []u8) usize {
+    find_library_roots();
+    if under_root(importer, lib_real) and under_root(target, std_real) and
+       u.starts(target[std_real.len..], "/internal/") {
+        return 0;
+    }
     let pat = "/internal/";
     let mut k: usize = 0;
     let mut found = false;
@@ -282,6 +307,30 @@ fn load_part_decl(m: *mut ast.Module, d: *mut ast.Decl, dir: []u8) void {
     }
 }
 
+// Where a module that left the standard library is, for its old path's rest
+// after "std/" (with or without ".ax"): the digests moved from crypto/ to
+// hash/, crypto/random to os/random, and the libraries to lib/ beside std/
+// (spec §4.1). No string when the module is not there either.
+fn moved_from_std(sub: []u8) []u8 {
+    let mut rest = sub;
+    if u.ends(rest, ".ax") {
+        rest = rest[..rest.len - 3];
+    }
+    let digests = ["md5", "sha1", "sha2", "sha3"];
+    for n in digests {
+        if u.str_eq(rest, u.cat2("crypto/", n)) {
+            return u.cat2("std/hash/", n);
+        }
+    }
+    if u.str_eq(rest, "crypto/random") {
+        return "std/os/random";
+    }
+    if u.is_file(u.f2("%s/%s.ax", u.lib_dir_of(g_std_dir), rest)) {
+        return u.cat2("lib/", rest);
+    }
+    return u.nosym();
+}
+
 fn load_regular_import(m: *mut ast.Module, importer_rp: []u8, d: *mut ast.Decl) void {
     let dir = dir_of(importer_rp);
     let ip = d.import_path;
@@ -307,6 +356,22 @@ fn load_regular_import(m: *mut ast.Module, importer_rp: []u8, d: *mut ast.Decl) 
             return;
         }
         path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
+        if u.isnos(real_path_of(path)) {
+            let moved = moved_from_std(ip[4..]);
+            if not u.isnos(moved) {
+                let e = dg.err(d.import_path_span, "E0211", u.f2("cannot find module '%s': it is '%s' now (spec §4.1)",
+                                                                 ip, moved));
+                dg.edit(dg.fix(e, u.f1("import '%s'", moved), "machine"), d.import_path_span, u.f1("\"%s\"", moved));
+                return;
+            }
+        }
+    } else if u.starts(ip, "lib/") {
+        if not library_import(ip[4..]) {
+            _ = dg.err(d.import_path_span, "E0218",
+                       u.f1("import path '%s' must name a module in the libraries, with '/' between its parts", ip));
+            return;
+        }
+        path = u.f3("%s/%s%s", u.lib_dir_of(g_std_dir), ip[4..], ext);
     } else if not relative_import(ip) {
         _ = dg.err(d.import_path_span, "E0218", u.f1("import path '%s' must be relative, with '/' between its parts",
                                                      ip));
@@ -318,8 +383,12 @@ fn load_regular_import(m: *mut ast.Module, importer_rp: []u8, d: *mut ast.Decl) 
     if not u.isnos(tp) {
         let k = internal_violation(importer_rp, tp);
         if k > 0 {
-            _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under '%s' may import it",
-                                                         display_path(tp), display_dir(tp[..k])));
+            let mut who = u.f1("'%s'", display_dir(tp[..k]));
+            if u.str_eq(tp[..k], std_real) and (lib_real.len > 0) {
+                who = "'std' or 'lib'";
+            }
+            _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under %s may import it",
+                                                         display_path(tp), who));
             return;
         }
     }
@@ -589,21 +658,16 @@ pub fn clean() u.List.[*mut ast.Module] {
 // An error name was looked up outside any module's code (then nothing of
 // the run is clean).
 pub threadlocal let mut g_error_use_unknown: bool = false;
-pub fn is_std_module(m: *mut ast.Module) bool {
-    if g_std_dir.len == 0 {
-        return false;
-    }
-    let rp = u.real_path(g_std_dir);
-    if u.isnos(rp) {
-        return false;
-    }
-    let n = rp.len;
-    return (m.path.len > n) and u.starts(m.path, rp) and (m.path[n] == '/');
+/// Whether m is one of the library's modules: in std/ or in lib/ beside it
+/// (spec §4.1).
+pub fn is_library_module(m: *mut ast.Module) bool {
+    find_library_roots();
+    return under_root(m.path, std_real) or under_root(m.path, lib_real);
 }
 
 /// Whether m is one of the program's own modules, those whose tests run
 /// (spec §17.2): the root module, and the root package's modules, or outside
-/// packages those not in the standard library. (The warnings that are off by
+/// packages those not in the standard library or the libraries. (The warnings that are off by
 /// default look at these.)
 pub fn own_module(m: *mut ast.Module) bool {
     let root = g_prog.root;
@@ -616,7 +680,7 @@ pub fn own_module(m: *mut ast.Module) bool {
     if u.notnil(root.pkg) {
         return m.pkg == root.pkg;
     }
-    return not is_std_module(m);
+    return not is_library_module(m);
 }
 
 /// What a worker thread starts from (units.ax): the main thread's program.

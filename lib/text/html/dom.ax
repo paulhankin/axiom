@@ -1,0 +1,709 @@
+// =============================================================================
+// lib/text/html/dom.ax - Document tree nodes, traversal, mutation and serialization, part of lib/text/html.
+// =============================================================================
+
+import "../internal/html/tags.ax" as tags;
+import "std/collections/arena" as arena;
+import "std/collections/vec" as vec;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// The tree
+// -----------------------------------------------------------------------------
+
+const FL_OPEN: u8 = 1;  // on the stack of open elements
+const FL_AFE: u8 = 2;   // in the list of active formatting elements
+const FL_HIP: u8 = 4;   // an HTML integration point (MathML annotation-xml)
+
+pub struct Node {
+    kind: Kind,
+    ns: Namespace,  // (elements)
+    tag: u16,       // (the parser's number for the name)
+    name: []u8,     // element local name; DOCTYPE name
+    attrs: []Attr,
+    text: []u8,       // TEXT and COMMENT data; DOCTYPE public identifier
+    system_id: []u8,  // DOCTYPE system identifier
+    parent: u32,
+    first: u32,
+    last: u32,
+    prev: u32,
+    next: u32,
+    contents: u32,  // a template's contents (a FRAGMENT); a FRAGMENT's template
+    flags: u8,
+    tx: u32,    // while parsing, a TEXT node's data is tbuf[toff..toff + tlen],
+    toff: u32,  // or texts[tx] when tx is not NONE
+    tlen: u32,
+}
+
+/// A parsed document (or fragment): it owns every node and string.
+pub struct Document {
+    nodes: vec.Vec.[Node],
+    arena: arena.Arena,
+    mode: QuirksMode,
+    tbuf: strs.String,
+    texts: vec.Vec.[strs.String],
+
+    fn init() Document {
+        return Document.{ nodes: vec.Vec.[Node].init(), arena: arena.Arena.init(), mode: QuirksMode.NO_QUIRKS,
+                          tbuf: strs.String.init(), texts: vec.Vec.[strs.String].init() };
+    }
+
+    pub fn deinit(self: *mut Document) void {
+        self.nodes.deinit();
+        self.arena.deinit();
+        self.tbuf.deinit();
+        for k in @as(usize, 0)..self.texts.len() {
+            self.texts.get_ptr(k).deinit();
+        }
+        self.texts.deinit();
+    }
+
+    pub fn node(self: *Document, id: u32) *Node {
+        return &self.nodes.items()[@as(usize, id)];
+    }
+
+    fn nm(self: *mut Document, id: u32) *mut Node {
+        return self.nodes.get_ptr(@as(usize, id));
+    }
+
+    fn new_node(self: *mut Document, kind: Kind) HtmlError!u32 {
+        let id = @truncate(u32, self.nodes.len());
+        self.nodes.push(Node.{ kind: kind, ns: Namespace.HTML, tag: 0, name: "", attrs: [], text: "", system_id: "",
+                               parent: NONE, first: NONE, last: NONE, prev: NONE, next: NONE, contents: NONE, flags: 0,
+                               tx: NONE, toff: 0, tlen: 0 })!;
+        return id;
+    }
+
+    /// Inserts child (which must have no parent) into parent before ref
+    /// (NONE: at the end).
+    pub fn insert_before(self: *mut Document, parent: u32, child: u32, ref: u32) void {
+        let c = self.nm(child);
+        c.parent = parent;
+        let p = self.nm(parent);
+        if ref == NONE {
+            c.prev = p.last;
+            c.next = NONE;
+            if p.last != NONE {
+                self.nm(p.last).next = child;
+            } else {
+                p.first = child;
+            }
+            p.last = child;
+        } else {
+            let r = self.nm(ref);
+            c.prev = r.prev;
+            c.next = ref;
+            if r.prev != NONE {
+                self.nm(r.prev).next = child;
+            } else {
+                p.first = child;
+            }
+            r.prev = child;
+        }
+    }
+
+    pub fn append_child(self: *mut Document, parent: u32, child: u32) void {
+        self.insert_before(parent, child, NONE);
+    }
+
+    /// Takes id out of its parent (it and its subtree stay, detached).
+    pub fn remove(self: *mut Document, id: u32) void {
+        let c = self.nm(id);
+        let p = c.parent;
+        if p == NONE {
+            return;
+        }
+        if c.prev != NONE {
+            self.nm(c.prev).next = c.next;
+        } else {
+            self.nm(p).first = c.next;
+        }
+        if c.next != NONE {
+            self.nm(c.next).prev = c.prev;
+        } else {
+            self.nm(p).last = c.prev;
+        }
+        c.parent = NONE;
+        c.prev = NONE;
+        c.next = NONE;
+    }
+
+    // The data of a text node while parsing.
+    fn tdata(self: *Document, id: u32) []u8 {
+        let n = self.node(id);
+        if n.tx != NONE {
+            return self.texts.items()[@as(usize, n.tx)].bytes();
+        }
+        return self.tbuf.bytes()[@as(usize, n.toff)..@as(usize, n.toff + n.tlen)];
+    }
+
+    fn new_text(self: *mut Document, data: []u8) HtmlError!u32 {
+        let id = self.new_node(Kind.TEXT)!;
+        let n = self.nm(id);
+        n.toff = @truncate(u32, self.tbuf.len());
+        n.tlen = @truncate(u32, data.len);
+        self.tbuf.push_str(data)!;
+        return id;
+    }
+
+    fn append_text(self: *mut Document, id: u32, data: []u8) HtmlError!void {
+        let n = self.nm(id);
+        if n.tx == NONE {
+            if (@as(usize, n.toff + n.tlen) == self.tbuf.len()) {
+                self.tbuf.push_str(data)!;
+                n.tlen += @truncate(u32, data.len);
+                return;
+            }
+            // not at the end of the shared buffer: give it its own
+            let mut s = strs.String.from(self.tdata(id))!;
+            s.push_str(data) catch |e| {
+                s.deinit();
+                return e;
+            };
+            self.texts.push(strs.String.init()) catch |e| {
+                s.deinit();
+                return e;
+            };
+            let idx = self.texts.len() - 1;
+            @swap(self.texts.get_ptr(idx), &mut s);
+            self.nm(id).tx = @truncate(u32, idx);
+            return;
+        }
+        self.texts.get_ptr(@as(usize, n.tx)).push_str(data)!;
+    }
+
+    // Points text nodes' `text` at their data (after parsing).
+    fn finish_text(self: *mut Document) void {
+        for k in @as(usize, 0)..self.nodes.len() {
+            let id = @truncate(u32, k);
+            let n = self.nm(id);
+            if (n.kind == Kind.TEXT) and (n.text.len == 0) {
+                n.text = self.tdata(id);
+            }
+        }
+    }
+
+    // --- reading
+
+    /// The document element (<html>), or NONE.
+    pub fn root(self: *Document) u32 {
+        let mut c = self.node(0).first;
+        while c != NONE {
+            if self.node(c).kind == Kind.ELEMENT {
+                return c;
+            }
+            c = self.node(c).next;
+        }
+        return NONE;
+    }
+
+    /// The first child element of the root with this name, or NONE.
+    fn root_child(self: *Document, name: []u8) u32 {
+        let r = self.root();
+        if r == NONE {
+            return NONE;
+        }
+        let mut c = self.node(r).first;
+        while c != NONE {
+            let n = self.node(c);
+            if (n.kind == Kind.ELEMENT) and (n.ns == Namespace.HTML) and strs.eq(n.name, name) {
+                return c;
+            }
+            c = n.next;
+        }
+        return NONE;
+    }
+
+    pub fn head(self: *Document) u32 {
+        return self.root_child("head");
+    }
+
+    /// The <body> (or <frameset>), or NONE.
+    pub fn body(self: *Document) u32 {
+        let b = self.root_child("body");
+        if b != NONE {
+            return b;
+        }
+        return self.root_child("frameset");
+    }
+
+    /// The text of the first <title>, with whitespace collapsed ("" if
+    /// none); the caller frees it.
+    pub fn title(self: *Document) HtmlError![]mut u8 {
+        let id = self.find(0, "title");
+        let mut s = strs.String.init();
+        if id == NONE {
+            return s.take();
+        }
+        let t = self.text_content(id)!;
+        defer mem.free(t);
+        let mut it = strs.fields(t);
+        while let .some(w) = it.next() {
+            if s.len() > 0 {
+                s.push(' ') catch |e| {
+                    s.deinit();
+                    return e;
+                };
+            }
+            s.push_str(w) catch |e| {
+                s.deinit();
+                return e;
+            };
+        }
+        return s.take();
+    }
+
+    pub fn walk(self: *Document, id: u32) Walker {
+        return Walker.{ doc: self, root: id, id: id, entering: true, started: false, templates: true };
+    }
+
+    pub fn children(self: *Document, id: u32) Children {
+        return Children.{ doc: self, id: self.first_kid(id, true) };
+    }
+
+    // The first child, or for a template the first node of its contents.
+    fn first_kid(self: *Document, id: u32, templates: bool) u32 {
+        let n = self.node(id);
+        if templates and (n.kind == Kind.ELEMENT) and (n.contents != NONE) {
+            return self.node(n.contents).first;
+        }
+        return n.first;
+    }
+
+    // The parent, or for template contents the template.
+    fn up(self: *Document, id: u32) u32 {
+        let p = self.node(id).parent;
+        if (p != NONE) and (self.node(p).kind == Kind.FRAGMENT) and (self.node(p).contents != NONE) {
+            return self.node(p).contents;
+        }
+        return p;
+    }
+
+    /// The parent element (NONE for the root and detached nodes).
+    pub fn parent_element(self: *Document, id: u32) u32 {
+        let p = self.up(id);
+        if (p != NONE) and (self.node(p).kind == Kind.ELEMENT) {
+            return p;
+        }
+        return NONE;
+    }
+
+    /// An attribute's value (attributes with a namespace are matched by
+    /// "prefix:name").
+    pub fn attr(self: *Document, id: u32, name: []u8) HtmlError![]u8 {
+        for a in self.node(id).attrs {
+            if attr_is(a, name) {
+                return a.value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    pub fn has_attr(self: *Document, id: u32, name: []u8) bool {
+        _ = self.attr(id, name) catch return false;
+        return true;
+    }
+
+    /// The text of the node and its descendants, in order (as the DOM's
+    /// textContent); the caller frees it.
+    pub fn text_content(self: *Document, id: u32) HtmlError![]mut u8 {
+        let mut s = strs.String.init();
+        let mut w = self.walk(id);
+        w.templates = false;
+        while w.advance() {
+            let n = self.node(w.id);
+            if w.entering and (n.kind == Kind.TEXT) {
+                s.push_str(n.text) catch |e| {
+                    s.deinit();
+                    return e;
+                };
+            }
+        }
+        return s.take();
+    }
+
+    /// The first element under id (in document order, id included) with
+    /// the local name, or NONE.
+    pub fn find(self: *Document, id: u32, name: []u8) u32 {
+        let mut w = self.walk(id);
+        while w.advance() {
+            let n = self.node(w.id);
+            if w.entering and (n.kind == Kind.ELEMENT) and name_is(n, name) {
+                return w.id;
+            }
+        }
+        return NONE;
+    }
+
+    // --- changing
+
+    /// A new, detached HTML element.
+    pub fn create_element(self: *mut Document, name: []u8) HtmlError!u32 {
+        let id = self.new_node(Kind.ELEMENT)!;
+        let lname = self.arena.bytes(name.len)!;
+        for k in @as(usize, 0)..name.len {
+            lname[k] = strs.to_lower_byte(name[k]);
+        }
+        let n = self.nm(id);
+        n.name = lname;
+        n.tag = tags.tag_of(lname);
+        if n.tag == tags.T_TEMPLATE {
+            let f = self.new_node(Kind.FRAGMENT)!;
+            self.nm(f).contents = id;
+            self.nm(id).contents = f;
+        }
+        return id;
+    }
+
+    pub fn create_text(self: *mut Document, data: []u8) HtmlError!u32 {
+        let id = self.new_node(Kind.TEXT)!;
+        self.nm(id).text = self.arena.dup(data)!;
+        return id;
+    }
+
+    pub fn create_comment(self: *mut Document, data: []u8) HtmlError!u32 {
+        let id = self.new_node(Kind.COMMENT)!;
+        self.nm(id).text = self.arena.dup(data)!;
+        return id;
+    }
+
+    /// Sets (or adds) an attribute without a namespace.
+    pub fn set_attr(self: *mut Document, id: u32, name: []u8, value: []u8) HtmlError!void {
+        let v = self.arena.dup(value)!;
+        let old = self.nm(id).attrs;
+        let mut all = vec.Vec.[Attr].init();
+        defer all.deinit();
+        let mut found = false;
+        for a in old {
+            let mut b = a;
+            if (a.ns == AttrNamespace.NONE) and strs.eq(a.name, name) {
+                b.value = v;
+                found = true;
+            }
+            all.push(b)!;
+        }
+        if not found {
+            all.push(Attr.{ ns: AttrNamespace.NONE, prefix: "", name: self.arena.dup(name)!, value: v })!;
+        }
+        self.nm(id).attrs = self.arena.copy.[Attr](all.items())!;
+    }
+
+    pub fn remove_attr(self: *mut Document, id: u32, name: []u8) HtmlError!void {
+        let old = self.nm(id).attrs;
+        let mut all = vec.Vec.[Attr].init();
+        defer all.deinit();
+        for a in old {
+            if not attr_is(a, name) {
+                all.push(a)!;
+            }
+        }
+        if all.len() != old.len {
+            self.nm(id).attrs = self.arena.copy.[Attr](all.items())!;
+        }
+    }
+
+    /// A deep copy of a node (detached).
+    pub fn clone_tree(self: *mut Document, id: u32) HtmlError!u32 {
+        let top = self.copy_node(id)!;
+        let mut work = vec.Vec.[u32].init();  // pairs: source, copy
+        defer work.deinit();
+        work.push(id)!;
+        work.push(top)!;
+        while work.len() > 0 {
+            let dst = work.pop() ?? break;
+            let src = work.pop() ?? break;
+            let mut from = src;
+            let mut to = dst;
+            if (self.nm(src).kind == Kind.ELEMENT) and (self.nm(src).contents != NONE) {
+                from = self.nm(src).contents;
+                to = self.nm(dst).contents;
+            }
+            let mut c = self.nm(from).first;
+            while c != NONE {
+                let k = self.copy_node(c)!;
+                self.append_child(to, k);
+                work.push(c)!;
+                work.push(k)!;
+                c = self.nm(c).next;
+            }
+        }
+        return top;
+    }
+
+    fn copy_node(self: *mut Document, id: u32) HtmlError!u32 {
+        let k = self.new_node(self.nm(id).kind)!;
+        let o = self.nm(id);
+        let n = self.nm(k);
+        n.ns = o.ns;
+        n.tag = o.tag;
+        n.name = o.name;
+        n.attrs = o.attrs;
+        n.text = o.text;
+        n.system_id = o.system_id;
+        if (o.kind == Kind.ELEMENT) and (o.contents != NONE) {
+            let f = self.new_node(Kind.FRAGMENT)!;
+            self.nm(f).contents = k;
+            self.nm(k).contents = f;
+        }
+        return k;
+    }
+
+    // --- serialization
+
+    /// The HTML for a node and its descendants (outerHTML); for node 0,
+    /// the whole document. The caller frees it.
+    pub fn to_html(self: *Document, id: u32) ![]mut u8 {
+        let mut s = strs.String.init();
+        self.serialize(s.writer(), id, true) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+
+    /// The HTML for a node's children (innerHTML).
+    pub fn inner_html(self: *Document, id: u32) ![]mut u8 {
+        let mut s = strs.String.init();
+        self.serialize(s.writer(), id, false) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+
+    /// Writes the HTML serialization of a node (outer: the node itself too).
+    pub fn serialize(self: *Document, out: io.Writer, id: u32, outer: bool) !void {
+        let mut w = self.walk(id);
+        while w.advance() {
+            let n = self.node(w.id);
+            let is_top = w.id == id;
+            if is_top and not outer {
+                continue;
+            }
+            if not w.entering {
+                if (n.kind == Kind.ELEMENT) and
+                   not ((n.ns == Namespace.HTML) and ((tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_VOID) != 0)) {
+                    out.write_all("</")!;
+                    out.write_all(n.name)!;
+                    out.write_all(">")!;
+                }
+                continue;
+            }
+            if n.kind == Kind.ELEMENT {
+                out.write_all("<")!;
+                out.write_all(n.name)!;
+                for a in n.attrs {
+                    out.write_all(" ")!;
+                    if a.ns == AttrNamespace.XML {
+                        out.write_all("xml:")!;
+                    } else if a.ns == AttrNamespace.XLINK {
+                        out.write_all("xlink:")!;
+                    } else if (a.ns == AttrNamespace.XMLNS) and not strs.eq(a.name, "xmlns") {
+                        out.write_all("xmlns:")!;
+                    }
+                    out.write_all(a.name)!;
+                    out.write_all("=\"")!;
+                    escape(out, a.value, true)!;
+                    out.write_all("\"")!;
+                }
+                out.write_all(">")!;
+                if (n.ns == Namespace.HTML) and ((tags.TAG_FLAGS[@as(usize, n.tag)] & tags.F_VOID) != 0) {
+                    w.skip();
+                }
+            } else if n.kind == Kind.TEXT {
+                let p = self.parent_element(w.id);
+                if (p != NONE) and (self.node(p).ns == Namespace.HTML) and
+                   ((tags.TAG_FLAGS[@as(usize, self.node(p).tag)] & tags.F_RAW) != 0) {
+                    out.write_all(n.text)!;
+                } else {
+                    escape(out, n.text, false)!;
+                }
+            } else if n.kind == Kind.COMMENT {
+                out.write_all("<!--")!;
+                out.write_all(n.text)!;
+                out.write_all("-->")!;
+            } else if n.kind == Kind.DOCTYPE {
+                out.write_all("<!DOCTYPE ")!;
+                out.write_all(n.name)!;
+                out.write_all(">")!;
+            }
+        }
+    }
+
+    // --- selectors
+
+    /// The first element under id (id excluded) that matches a CSS
+    /// selector, or NONE.
+    pub fn query_from(self: *Document, id: u32, selector: []u8) HtmlError!u32 {
+        let mut sel = compile(selector)!;
+        defer sel.deinit();
+        let mut w = self.walk(id);
+        _ = w.advance();
+        while w.advance() {
+            if w.entering and (self.node(w.id).kind == Kind.ELEMENT) and sel.matches(self, w.id) {
+                return w.id;
+            }
+        }
+        return NONE;
+    }
+
+    /// The first element in the document matching a CSS selector, or NONE.
+    pub fn query(self: *Document, selector: []u8) HtmlError!u32 {
+        return self.query_from(0, selector);
+    }
+
+    /// Every element under id (id excluded) that matches, in document
+    /// order; the caller frees the list.
+    pub fn query_all_from(self: *Document, id: u32, selector: []u8) HtmlError![]mut u32 {
+        let mut sel = compile(selector)!;
+        defer sel.deinit();
+        let mut out = vec.Vec.[u32].init();
+        let mut w = self.walk(id);
+        _ = w.advance();
+        while w.advance() {
+            if w.entering and (self.node(w.id).kind == Kind.ELEMENT) and sel.matches(self, w.id) {
+                out.push(w.id) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+            }
+        }
+        return take_vec(&mut out);
+    }
+
+    pub fn query_all(self: *Document, selector: []u8) HtmlError![]mut u32 {
+        return self.query_all_from(0, selector);
+    }
+
+    /// Whether an element matches a CSS selector.
+    pub fn matches(self: *Document, id: u32, selector: []u8) HtmlError!bool {
+        let mut sel = compile(selector)!;
+        defer sel.deinit();
+        return sel.matches(self, id);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Walking, reading and changing the tree
+// -----------------------------------------------------------------------------
+
+/// A depth-first walk over a subtree: each node is visited entering (before
+/// its children) and leaving (after them). Template contents are walked as
+/// the template's children.
+pub struct Walker {
+    doc: *Document,
+    root: u32,
+    id: u32,
+    entering: bool,
+    started: bool,
+    templates: bool,
+
+    /// Moves on; false when the walk is over.
+    pub fn advance(self: *mut Walker) bool {
+        if not self.started {
+            self.started = true;
+            self.id = self.root;
+            self.entering = true;
+            return true;
+        }
+        if self.entering {
+            let f = self.doc.first_kid(self.id, self.templates);
+            if f != NONE {
+                self.id = f;
+                return true;
+            }
+            self.entering = false;
+            return true;
+        }
+        if self.id == self.root {
+            return false;
+        }
+        let nx = self.doc.node(self.id).next;
+        if nx != NONE {
+            self.id = nx;
+            self.entering = true;
+            return true;
+        }
+        self.id = self.doc.up(self.id);
+        return true;
+    }
+
+    /// Skips the children of the node just entered.
+    pub fn skip(self: *mut Walker) void {
+        self.entering = false;
+    }
+}
+
+/// The children of a node, in order.
+pub struct Children {
+    doc: *Document,
+    id: u32,
+
+    /// The next child, or `.none` after the last.
+    pub fn next(self: *mut Children) ?u32 {
+        if self.id == NONE {
+            return .none;
+        }
+        let r = self.id;
+        self.id = self.doc.node(r).next;
+        return r;
+    }
+}
+
+fn take_vec(v: *mut vec.Vec.[u32]) HtmlError![]mut u32 {
+    let out = mem.alloc.[u32](v.len())!;
+    @mem_copy(out, v.items());
+    v.deinit();
+    return out;
+}
+
+fn attr_is(a: Attr, name: []u8) bool {
+    if a.prefix.len == 0 {
+        return strs.eq(a.name, name);
+    }
+    return (name.len == a.prefix.len + 1 + a.name.len) and strs.starts_with(name, a.prefix) and
+           (name[a.prefix.len] == ':') and strs.ends_with(name, a.name);
+}
+
+// Whether an element has a local name (ASCII case-insensitively for HTML).
+fn name_is(n: *Node, name: []u8) bool {
+    if n.ns == Namespace.HTML {
+        return strs.eq_ignore_case(n.name, name);
+    }
+    return strs.eq(n.name, name);
+}
+
+/// Writes text escaped for HTML: & < > and no-break space, and " too in
+/// attribute values.
+pub fn escape(out: io.Writer, s: []u8, attr: bool) !void {
+    let mut st: usize = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        let mut rep: []u8 = "";
+        let mut len: usize = 1;
+        if c == '&' {
+            rep = "&amp;";
+        } else if c == '<' {
+            rep = "&lt;";
+        } else if c == '>' {
+            rep = "&gt;";
+        } else if (c == '"') and attr {
+            rep = "&quot;";
+        } else if (c == 0xc2) and ((i + 1) < s.len) and (s[i + 1] == 0xa0) {
+            rep = "&nbsp;";
+            len = 2;
+        }
+        if rep.len > 0 {
+            out.write_all(s[st..i])!;
+            out.write_all(rep)!;
+            i += len;
+            st = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.write_all(s[st..])!;
+}

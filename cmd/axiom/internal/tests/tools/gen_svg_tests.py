@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Generates std/graphics/svg/testdata: small SVG documents (written here)
+"""Generates lib/graphics/svg/testdata: small SVG documents (written here)
 and, for each, NAME.probes: pixels of skia's rendering of it (skia-python's
 SVGDOM, at the document's size, transparent background), taken where the
-picture is smooth (no edge within two pixels), for std/graphics/svg's tests.
+picture is smooth (no edge within two pixels), for lib/graphics/svg's tests.
 
 The documents keep to what skia renders as SVG 1.1 says: it skips <style>,
 symbol, switch, masks, nested viewport clipping, images, em units and
-visible children of hidden groups, which std/graphics/svg's own tests (on
+visible children of hidden groups, which lib/graphics/svg's own tests (on
 the hand-written documents in testdata) cover.
 
 NAME.probes lines: x y r g b a (unpremultiplied 8-bit sRGB).
@@ -16,7 +16,7 @@ import os
 import numpy as np
 import skia
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'graphics', 'svg', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'graphics', 'svg', 'testdata')
 
 DOCS = {
     'alpha': '''\

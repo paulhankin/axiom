@@ -1,5 +1,5 @@
 /* wcslen, wmemchr and wmemcmp search many wide characters at a time
-   (std/c/rt/text_wide.ax): their results agree with element-by-element
+   (lib/c/rt/text_wide.ax): their results agree with element-by-element
    searches for every alignment of the start and every length up to 300,
    for characters with high bits set, and for a string that ends at the end
    of its allocation (the whole aligned groups read past its null do not

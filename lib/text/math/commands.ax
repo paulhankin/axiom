@@ -1,0 +1,575 @@
+// =============================================================================
+// lib/text/math/commands.ax - TeX math command and environment parsers, part of lib/text/math.
+// =============================================================================
+
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Commands and environments
+// -----------------------------------------------------------------------------
+
+// \big and the like: \big, \Big, \bigg and \Bigg (in that order) for each class.
+let SIZES: [16][]u8 = ["big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl", "bigr", "Bigr", "biggr", "Biggr",
+                       "bigm", "Bigm", "biggm", "Biggm"];
+let SIZE_EMS: [4]f32 = [1.2, 1.8, 2.4, 3.0];
+
+// Font commands and their fonts; from \bf on, they set the rest of the group.
+let FONTS: [17][]u8 = ["mathbf", "mathit", "boldsymbol", "mathcal", "mathscr", "mathfrak", "mathbb", "mathsf", "mathtt",
+                       "mathrm", "bm", "mathbfit", "mathsfit", "bf", "rm", "it", "Bbb"];
+let FONT_OF: [17]MathFont = [MathFont.BOLD, MathFont.ITALIC, MathFont.BOLD_ITALIC, MathFont.SCRIPT, MathFont.SCRIPT,
+                             MathFont.FRAKTUR, MathFont.DOUBLE_STRUCK, MathFont.SANS, MathFont.MONO, MathFont.ROMAN,
+                             MathFont.BOLD_ITALIC, MathFont.BOLD_ITALIC, MathFont.SANS_ITALIC, MathFont.BOLD,
+                             MathFont.ROMAN, MathFont.ITALIC, MathFont.DOUBLE_STRUCK];
+
+fn command(p: *mut Parser) TexError!u32 {
+    let at = p.pos;
+    let name = take_command(p);
+    if name.len == 0 {
+        return fail(p, "a lone backslash");
+    }
+    // spaces
+    let spaces: [8][]u8 = [",", ":", ">", ";", "!", "quad", "qquad", " "];
+    let widths: [8]f32 = [0.1667, 0.2222, 0.2222, 0.2778, -0.1667, 1.0, 2.0, 0.333];
+    for k in @as(usize, 0)..8 {
+        if strs.eq(name, spaces[k]) {
+            let sp = new_node(p, Kind.SPACE)!;
+            p.f.node_mut(sp).width = widths[k];
+            return sp;
+        }
+    }
+    if strs.eq(name, "frac") or strs.eq(name, "dfrac") or strs.eq(name, "tfrac") or strs.eq(name, "cfrac") {
+        return fraction(p, name);
+    }
+    if strs.eq(name, "binom") or strs.eq(name, "dbinom") or strs.eq(name, "tbinom") {
+        return binomial(p, name);
+    }
+    if strs.eq(name, "sqrt") {
+        return square_root(p);
+    }
+    if strs.eq(name, "left") {
+        return left_right(p);
+    }
+    for k in @as(usize, 0)..SIZES.len {
+        if strs.eq(name, SIZES[k]) {
+            return sized_delimiter(p, k);
+        }
+    }
+    if strs.eq(name, "text") or strs.eq(name, "textrm") or strs.eq(name, "textit") or strs.eq(name, "textbf") or
+       strs.eq(name, "mbox") or strs.eq(name, "textnormal") or strs.eq(name, "textsf") or strs.eq(name, "texttt") {
+        return text_mode(p);
+    }
+    if strs.eq(name, "textcolor") {
+        let st = color_style(p)!;
+        let content = argument(p)!;  // (it may move the nodes)
+        p.f.node_mut(st).a = content;
+        return st;
+    }
+    if strs.eq(name, "bmod") {
+        return op_node(p, "mod", C_BIN);
+    }
+    if strs.eq(name, "pmod") or strs.eq(name, "mod") {
+        return modulo(p, strs.eq(name, "pmod"));
+    }
+    if strs.eq(name, "operatorname") or strs.eq(name, "operatorname*") {
+        return operator_name(p);
+    }
+    for k in @as(usize, 0)..FONTS.len {
+        if strs.eq(name, FONTS[k]) {
+            return font_command(p, k);
+        }
+    }
+    if strs.eq(name, "overset") or strs.eq(name, "underset") or strs.eq(name, "stackrel") {
+        return over_under_set(p, name);
+    }
+    if strs.eq(name, "not") {
+        return negation(p);
+    }
+    if strs.eq(name, "begin") {
+        return environment(p);
+    }
+    if strs.eq(name, "mathop") {
+        let a = argument(p)!;
+        let an = p.f.node_mut(a);
+        if (an.kind == Kind.IDENT) or (an.kind == Kind.OP) {
+            an.cls = C_LARGE;
+        }
+        return a;
+    }
+    let encl: [7][]u8 = ["boxed", "phantom", "hphantom", "vphantom", "cancel", "bcancel", "xcancel"];
+    for k in @as(usize, 0)..7 {
+        if strs.eq(name, encl[k]) {
+            let content = argument(p)!;
+            let e = new_node(p, Kind.ENCLOSE)!;
+            p.f.node_mut(e).a = content;
+            p.f.node_mut(e).cls = @truncate(u8, k);
+            return e;
+        }
+    }
+    if strs.eq(name, "mathstrut") {
+        // as tall and deep as a parenthesis, no wider than nothing
+        let paren = op_node(p, "(", C_OPEN)!;
+        let e = new_node(p, Kind.ENCLOSE)!;
+        p.f.node_mut(e).a = paren;
+        p.f.node_mut(e).cls = E_VPHANTOM;
+        return e;
+    }
+    let k = find_symbol(name);
+    if k == SYMBOLS.len {
+        p.pos = at;
+        return fail(p, "unknown command");
+    }
+    return symbol(p, name, SYMBOLS[k]);
+}
+
+// \frac and its display and text style forms (\cfrac is \dfrac).
+fn fraction(p: *mut Parser, name: []u8) TexError!u32 {
+    let num = argument(p)!;
+    let den = argument(p)!;
+    let f = new_node(p, Kind.FRAC)!;
+    let fnode = p.f.node_mut(f);
+    fnode.a = num;
+    fnode.b = den;
+    if strs.eq(name, "dfrac") or strs.eq(name, "cfrac") {
+        fnode.flags = F_DISPLAY;
+    } else if strs.eq(name, "tfrac") {
+        fnode.flags = F_TEXTSTYLE;
+    }
+    return f;
+}
+
+// \binom and its display and text style forms: a fraction without a rule, in
+// parentheses.
+fn binomial(p: *mut Parser, name: []u8) TexError!u32 {
+    let top = argument(p)!;
+    let bottom = argument(p)!;
+    let f = new_node(p, Kind.FRAC)!;
+    let fnode = p.f.node_mut(f);
+    fnode.a = top;
+    fnode.b = bottom;
+    fnode.flags = F_THIN0;
+    if strs.eq(name, "dbinom") {
+        fnode.flags |= F_DISPLAY;
+    } else if strs.eq(name, "tbinom") {
+        fnode.flags |= F_TEXTSTYLE;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node_mut(fe).a = f;
+    set_s(p, fe, "(")!;
+    set_s2(p, fe, ")")!;
+    return fe;
+}
+
+// \sqrt, with an optional index in brackets.
+fn square_root(p: *mut Parser) TexError!u32 {
+    if peek(p) == '[' {
+        p.pos += 1;
+        let idx = new_node(p, Kind.ROW)!;
+        let mut last: u32 = NIL;
+        while peek(p) != ']' {
+            if peek(p) == 0 {
+                return fail(p, "missing ]");
+            }
+            enter(p)!;
+            let a = atom(p)!;
+            p.depth -= 1;
+            if a == NIL {
+                return fail(p, "missing ]");
+            }
+            append_child(p, idx, a, &mut last);
+        }
+        p.pos += 1;
+        let body = argument(p)!;
+        let rt = new_node(p, Kind.ROOT)!;
+        p.f.node_mut(rt).a = body;
+        p.f.node_mut(rt).b = idx;
+        return rt;
+    }
+    let body = argument(p)!;
+    let sq = new_node(p, Kind.SQRT)!;
+    p.f.node_mut(sq).a = body;
+    return sq;
+}
+
+// \left ... \right, with any \middle delimiters between.
+fn left_right(p: *mut Parser) TexError!u32 {
+    let open = delimiter(p)!;
+    let content = row(p)!;
+    let mut last_mid: u32 = NIL;
+    // \middle delimiters split the content
+    let mut parts = content;
+    while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "middle") {
+        _ = take_command(p);
+        let mid = delimiter(p)!;
+        let m = op_node(p, mid, C_REL)!;
+        p.f.node_mut(m).flags = F_STRETCHY;
+        let more = row(p)!;
+        let r = new_node(p, Kind.ROW)!;
+        let mut last: u32 = NIL;
+        append_child(p, r, parts, &mut last);
+        append_child(p, r, m, &mut last);
+        append_child(p, r, more, &mut last);
+        parts = r;
+        last_mid = m;
+    }
+    _ = last_mid;
+    if not ((peek(p) == '\\') and strs.eq(command_at(p, p.pos), "right")) {
+        return fail(p, "\\left without \\right");
+    }
+    _ = take_command(p);
+    let close = delimiter(p)!;
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node_mut(fe).a = parts;
+    p.f.node_mut(fe).flags = F_STRETCHY;
+    set_s(p, fe, open)!;
+    set_s2(p, fe, close)!;
+    return fe;
+}
+
+// \big and the like (SIZES[k]): a delimiter of a fixed size.
+fn sized_delimiter(p: *mut Parser, k: usize) TexError!u32 {
+    let d = delimiter(p)!;
+    let mut cls = C_ORD;
+    if (k >= 4) and (k < 8) {
+        cls = C_OPEN;
+    } else if (k >= 8) and (k < 12) {
+        cls = C_CLOSE;
+    } else if k >= 12 {
+        cls = C_REL;
+    }
+    let o = op_node(p, d, cls)!;
+    p.f.node_mut(o).flags = F_SIZED;
+    p.f.node_mut(o).width = SIZE_EMS[k % 4];
+    return o;
+}
+
+// \text and the like: the group as text.
+fn text_mode(p: *mut Parser) TexError!u32 {
+    let t = raw_group(p)!;
+    let n = new_node(p, Kind.TEXT)!;
+    // the few escapes text mode has
+    let mut b = strs.String.init();
+    defer b.deinit();
+    let mut i: usize = 0;
+    while i < t.len {
+        if (t[i] == '\\') and ((i + 1) < t.len) and not is_letter(t[i + 1]) {
+            b.push(t[i + 1])!;
+            i += 2;
+            continue;
+        }
+        if (t[i] == '{') or (t[i] == '}') {
+            i += 1;
+            continue;
+        }
+        b.push(t[i])!;
+        i += 1;
+    }
+    set_s(p, n, b.bytes())!;
+    return n;
+}
+
+// \pmod{n} (paren): a quad and (mod n); \mod{n}: a quad, mod and n.
+fn modulo(p: *mut Parser, paren: bool) TexError!u32 {
+    let arg = argument(p)!;
+    let r = new_node(p, Kind.ROW)!;
+    let mut last: u32 = NIL;
+    let sp = new_node(p, Kind.SPACE)!;
+    p.f.node_mut(sp).width = 1.0;
+    append_child(p, r, sp, &mut last);
+    let inner = new_node(p, Kind.ROW)!;
+    let mut il: u32 = NIL;
+    let m = ident(p, "mod", true)!;
+    p.f.node_mut(m).flags = F_FUNC;
+    p.f.node_mut(m).cls = C_FUNC;
+    append_child(p, inner, m, &mut il);
+    let sp2 = new_node(p, Kind.SPACE)!;
+    p.f.node_mut(sp2).width = 0.333;
+    append_child(p, inner, sp2, &mut il);
+    append_child(p, inner, arg, &mut il);
+    if not paren {
+        append_child(p, r, inner, &mut last);
+        return r;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node_mut(fe).a = inner;
+    set_s(p, fe, "(")!;
+    set_s2(p, fe, ")")!;
+    append_child(p, r, fe, &mut last);
+    return r;
+}
+
+// \operatorname and \operatorname*.
+fn operator_name(p: *mut Parser) TexError!u32 {
+    let mut star = false;
+    if peek(p) == '*' {
+        p.pos += 1;
+        star = true;
+    }
+    let t = raw_group(p)!;
+    let n = ident(p, strs.trim(t), true)!;
+    p.f.node_mut(n).flags = F_FUNC;
+    if star {
+        p.f.node_mut(n).cls = C_FUNCL;
+    } else {
+        p.f.node_mut(n).cls = C_FUNC;
+    }
+    return n;
+}
+
+// \mathbf and the like (FONTS[k]).
+fn font_command(p: *mut Parser, k: usize) TexError!u32 {
+    let saved = p.font;
+    p.font = FONT_OF[k];
+    defer p.font = saved;
+    if k >= 13 {
+        // \bf and the like: the rest of the group
+        return row(p);
+    }
+    if p.font == MathFont.ROMAN {
+        // \mathrm{abc}: one upright identifier
+        let save = p.pos;
+        let t = raw_group(p)!;
+        let mut letters = t.len > 1;
+        for ch in t {
+            if not is_letter(ch) {
+                letters = false;
+            }
+        }
+        if letters {
+            return ident(p, t, true);
+        }
+        p.pos = save;
+    }
+    return argument(p);
+}
+
+// \overset, \underset and \stackrel.
+fn over_under_set(p: *mut Parser, name: []u8) TexError!u32 {
+    let top = argument(p)!;
+    let base = argument(p)!;
+    let l = new_node(p, Kind.LIMITS)!;
+    let ln = p.f.node_mut(l);
+    ln.a = base;
+    if strs.eq(name, "underset") {
+        ln.b = top;
+    } else {
+        ln.c = top;
+    }
+    return l;
+}
+
+// \not: the next operator or identifier, struck through.
+fn negation(p: *mut Parser) TexError!u32 {
+    enter(p)!;
+    defer p.depth -= 1;
+    let next = primary(p)!;
+    if next == NIL {
+        return fail(p, "\\not of nothing");
+    }
+    let nd = p.f.node(next);
+    if (nd.kind == Kind.OP) or (nd.kind == Kind.IDENT) {
+        // the character with U+0338 (a precomposed one where there is)
+        let t = p.f.str(nd.s, nd.sl);
+        let pre: [6][]u8 = ["=", "\u{2208}", "\u{2264}", "\u{2265}", "\u{2282}", "\u{2261}"];
+        let neg: [6][]u8 = ["\u{2260}", "\u{2209}", "\u{2270}", "\u{2271}", "\u{2284}", "\u{2262}"];
+        for k in @as(usize, 0)..6 {
+            if strs.eq(t, pre[k]) {
+                return op_node(p, neg[k], C_REL);
+            }
+        }
+        let mut b = strs.String.init();
+        defer b.deinit();
+        b.push_str(t)!;
+        b.push_str("\u{338}")!;
+        return op_node(p, b.bytes(), C_REL);
+    }
+    return next;
+}
+
+// A command from SYMBOLS: an accent, a Greek letter, a function name or an operator.
+fn symbol(p: *mut Parser, name: []u8, sym: Sym) TexError!u32 {
+    if sym.cls == C_ACCENT {
+        return accent(p, name, sym);
+    }
+    if (sym.cls == C_GREEK) or (sym.cls == C_UGREEK) {
+        if p.font != MathFont.NONE {
+            let d = strs.decode_rune(sym.text);
+            if d.len == sym.text.len {
+                return styled_ident(p, d.value);
+            }
+            return ident(p, sym.text, p.font == MathFont.ROMAN);
+        }
+        return ident(p, sym.text, sym.cls == C_UGREEK);
+    }
+    if (sym.cls == C_FUNC) or (sym.cls == C_FUNCL) {
+        let n = ident(p, sym.text, true)!;
+        p.f.node_mut(n).flags = F_FUNC;
+        p.f.node_mut(n).cls = sym.cls;
+        return n;
+    }
+    return op_node(p, sym.text, sym.cls);
+}
+
+// An accent over (or under) the argument.
+fn accent(p: *mut Parser, name: []u8, sym: Sym) TexError!u32 {
+    let base = argument(p)!;
+    let acc = new_node(p, Kind.ACCENT)!;
+    let parts = accent_parts(sym.text);
+    set_s(p, acc, parts[0])!;
+    set_s2(p, acc, parts[1])!;
+    let an = p.f.node_mut(acc);
+    an.a = base;
+    if strs.eq(name, "underline") or strs.eq(name, "underbrace") {
+        an.flags = F_UNDER;
+    }
+    if strs.eq(name, "widehat") or strs.eq(name, "widetilde") or strs.eq(name, "overline") or
+       strs.eq(name, "underline") or strs.eq(name, "overrightarrow") or strs.eq(name, "overleftarrow") or
+       strs.eq(name, "overbrace") or strs.eq(name, "underbrace") {
+        an.flags |= F_STRETCHY;
+    }
+    if strs.eq(name, "overbrace") {
+        an.cls = 1;
+    } else if strs.eq(name, "underbrace") {
+        an.cls = 2;
+    }
+    return acc;
+}
+
+// A delimiter after \left, \right, \middle or \big: its text ("" for '.').
+fn delimiter(p: *mut Parser) TexError![]u8 {
+    let c = peek(p);
+    if c == 0 {
+        return fail(p, "missing delimiter");
+    }
+    if c == '.' {
+        p.pos += 1;
+        return "";
+    }
+    if c == '\\' {
+        let name = take_command(p);
+        let k = find_symbol(name);
+        if (k == SYMBOLS.len) or
+           not ((SYMBOLS[k].cls == C_OPEN) or (SYMBOLS[k].cls == C_CLOSE) or (SYMBOLS[k].cls == C_ORD) or
+                (SYMBOLS[k].cls == C_REL)) {
+            return fail(p, "not a delimiter");
+        }
+        return SYMBOLS[k].text;
+    }
+    let delims = "()[]|/<>";
+    for d in delims {
+        if c == d {
+            p.pos += 1;
+            if c == '<' {
+                return "\u{27e8}";
+            }
+            if c == '>' {
+                return "\u{27e9}";
+            }
+            return p.src[p.pos - 1..p.pos];
+        }
+    }
+    return fail(p, "not a delimiter");
+}
+
+fn environment(p: *mut Parser) TexError!u32 {
+    let name = raw_group(p)!;
+    let mut open: []u8 = "";
+    let mut close: []u8 = "";
+    let mut flags: u16 = 0;
+    if strs.eq(name, "matrix") or strs.eq(name, "array") or strs.eq(name, "gathered") or strs.eq(name, "gather*") or
+       strs.eq(name, "gather") {
+        if strs.eq(name, "array") {
+            _ = raw_group(p)!;  // the column specification
+        }
+    } else if strs.eq(name, "smallmatrix") {
+        flags = F_SMALL;
+    } else if strs.eq(name, "pmatrix") {
+        open = "(";
+        close = ")";
+    } else if strs.eq(name, "bmatrix") {
+        open = "[";
+        close = "]";
+    } else if strs.eq(name, "Bmatrix") {
+        open = "{";
+        close = "}";
+    } else if strs.eq(name, "vmatrix") {
+        open = "|";
+        close = "|";
+    } else if strs.eq(name, "Vmatrix") {
+        open = "\u{2016}";
+        close = "\u{2016}";
+    } else if strs.eq(name, "cases") {
+        open = "{";
+        flags = F_LEFT;
+    } else if strs.eq(name, "aligned") or strs.eq(name, "align") or strs.eq(name, "align*") or strs.eq(name, "split") or
+              strs.eq(name, "alignedat") {
+        flags = F_ALIGN;
+        if strs.eq(name, "alignedat") {
+            _ = raw_group(p)!;
+        }
+    } else {
+        return fail(p, "unknown environment");
+    }
+    let table = new_node(p, Kind.TABLE)!;
+    p.f.node_mut(table).flags = flags;
+    let mut last_row: u32 = NIL;
+    loop {
+        let tr = new_node(p, Kind.TROW)!;
+        let mut last_cell: u32 = NIL;
+        loop {
+            // \hline between rows is dropped
+            while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "hline") {
+                _ = take_command(p);
+            }
+            let content = row(p)!;
+            let cell = new_node(p, Kind.TCELL)!;
+            p.f.node_mut(cell).a = content;
+            append_child(p, tr, cell, &mut last_cell);
+            if peek(p) == '&' {
+                p.pos += 1;
+                continue;
+            }
+            break;
+        }
+        append_child(p, table, tr, &mut last_row);
+        let c = peek(p);
+        if c == 0 {
+            return fail(p, "missing \\end");
+        }
+        if c == '}' {
+            return fail(p, "unexpected }");
+        }
+        let cmd = take_command(p);
+        if strs.eq(cmd, "\\") or strs.eq(cmd, "cr") {
+            // an optional [length] after \\
+            if peek(p) == '[' {
+                while (p.pos < p.src.len) and (p.src[p.pos] != ']') {
+                    p.pos += 1;
+                }
+                p.pos = @min(p.pos + 1, p.src.len);
+            }
+            // a trailing \\ before \end makes no row
+            if (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "end") {
+                _ = take_command(p);
+                break;
+            }
+            continue;
+        }
+        if strs.eq(cmd, "end") {
+            break;
+        }
+        return fail(p, "unexpected command in a table");
+    }
+    let end_name = raw_group(p)!;
+    if not strs.eq(end_name, name) {
+        return fail(p, "\\end does not match \\begin");
+    }
+    if (open.len == 0) and (close.len == 0) {
+        return table;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node_mut(fe).a = table;
+    p.f.node_mut(fe).flags = F_STRETCHY;
+    set_s(p, fe, open)!;
+    set_s2(p, fe, close)!;
+    return fe;
+}

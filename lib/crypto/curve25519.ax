@@ -1,0 +1,943 @@
+// =============================================================================
+// lib/crypto/curve25519.ax - X25519 key agreement (RFC 7748) and Ed25519
+// signatures (RFC 8032).
+//
+//     let kp = curve25519.x25519_keypair()!;          // or from a secret
+//     curve25519.x25519(secret, their_public, shared[..])!;
+//
+//     let key = curve25519.Ed25519.from_seed(seed);   // 32 random bytes
+//     key.sign(message, sig[..]);                     // 64 bytes
+//     curve25519.ed25519_verify(public, message, sig)  // bool
+//
+// Field elements are five unsigned 51-bit limbs (radix 2^51), multiplied with
+// 128-bit accumulators. Operations on secrets (the X25519 ladder, signing)
+// take the same time whatever the secret: they swap with masks, never branch
+// or index on secret bits. The curve constants are computed from their
+// definitions rather than written out.
+// =============================================================================
+
+import "std/encoding/binary" as binary;
+import "std/hash/sha2" as sha2;
+import "std/os/random" as random;
+import "std/sync" as sync;
+import "subtle.ax" as subtle;
+
+pub error Curve25519Error { InvalidPoint, InvalidLength, WeakKey, RandomFailed }
+
+// -----------------------------------------------------------------------------
+// The field GF(2^255 - 19)
+// -----------------------------------------------------------------------------
+
+const MASK51: u64 = (@as(u64, 1) << 51) - 1;
+const P8_0: u64 = 8 * (MASK51 - 18);  // 8 * (2^51 - 19)
+const P8_N: u64 = 8 * MASK51;         // 8 * (2^51 - 1)
+
+struct Wide {
+    lo: u64,
+    hi: u64,
+}
+
+inline fn wide_mul(a: u64, b: u64) Wide {
+    let p = @mul_wide(a, b);
+    return Wide.{ lo: p.lo, hi: p.hi };
+}
+
+inline fn mul_acc(acc: Wide, a: u64, b: u64) Wide {
+    let p = @mul_wide(a, b);
+    let s = @add_carry(acc.lo, p.lo, 0);
+    let c = @add_carry(acc.hi, p.hi, s.carry);
+    return Wide.{ lo: s.value, hi: c.value };
+}
+
+inline fn wide_shr51(t: Wide) u64 {
+    return (t.hi << 13) | (t.lo >> 51);
+}
+
+/// value = sum of l[i] * 2^(51 i).
+struct Fe {
+    l: [5]u64,
+}
+
+fn fe_zero() Fe {
+    return Fe.{ l: [0; 5] };
+}
+
+fn fe_one() Fe {
+    return Fe.{ l: [1, 0, 0, 0, 0] };
+}
+
+fn fe_small(v: i64) Fe {
+    let neg = @bit_cast(u64, v >> 63);
+    let mut f = fe_zero();
+    f.l[0] = (@bit_cast(u64, v) ^ neg) -% neg;
+    fe_carry(&mut f);
+    let nf = fe_neg(&f);
+    for i in @as(usize, 0)..5 {
+        f.l[i] = (f.l[i] & ~neg) | (nf.l[i] & neg);
+    }
+    return f;
+}
+
+/// Brings every limb back below 2^51.
+fn fe_carry(noalias f: *mut Fe) void {
+    for _pass in @as(usize, 0)..2 {
+        for i in @as(usize, 0)..5 {
+            let c = f.l[i] >> 51;
+            f.l[i] = f.l[i] & MASK51;
+            if i == 4 {
+                f.l[0] += c * 19;
+            } else {
+                f.l[i + 1] += c;
+            }
+        }
+    }
+}
+
+inline fn wrap_carry(noalias r: *mut Fe, c: u64) void {
+    r.l[0] += c * 19;
+    let d = r.l[0] >> 51;
+    r.l[0] = r.l[0] & MASK51;
+    r.l[1] += d;
+}
+
+fn fe_add(a: *Fe, b: *Fe) Fe {
+    let mut r = fe_zero();
+    for i in @as(usize, 0)..5 {
+        r.l[i] = a.l[i] + b.l[i];
+    }
+    return r;
+}
+
+fn fe_sub(a: *Fe, b: *Fe) Fe {
+    let mut r = fe_zero();
+    r.l[0] = (a.l[0] + P8_0) - b.l[0];
+    for i in @as(usize, 1)..5 {
+        r.l[i] = (a.l[i] + P8_N) - b.l[i];
+    }
+    fe_carry(&mut r);
+    return r;
+}
+
+fn fe_neg(noalias a: *Fe) Fe {
+    let z = fe_zero();
+    return fe_sub(&z, a);
+}
+
+fn fe_mul(a: *Fe, b: *Fe) Fe {
+    let a0 = a.l[0];
+    let a1 = a.l[1];
+    let a2 = a.l[2];
+    let a3 = a.l[3];
+    let a4 = a.l[4];
+    let b0 = b.l[0];
+    let b1 = b.l[1];
+    let b2 = b.l[2];
+    let b3 = b.l[3];
+    let b4 = b.l[4];
+    // 2^255 = 19 (mod p), so products with index sum >= 5 wrap with factor 19.
+    let b1_19 = b1 * 19;
+    let b2_19 = b2 * 19;
+    let b3_19 = b3 * 19;
+    let b4_19 = b4 * 19;
+
+    let mut t = wide_mul(a0, b0);
+    t = mul_acc(t, a1, b4_19);
+    t = mul_acc(t, a2, b3_19);
+    t = mul_acc(t, a3, b2_19);
+    t = mul_acc(t, a4, b1_19);
+    let r0 = t.lo & MASK51;
+    let mut c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0, b1);
+    t = mul_acc(t, a1, b0);
+    t = mul_acc(t, a2, b4_19);
+    t = mul_acc(t, a3, b3_19);
+    t = mul_acc(t, a4, b2_19);
+    let r1 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0, b2);
+    t = mul_acc(t, a1, b1);
+    t = mul_acc(t, a2, b0);
+    t = mul_acc(t, a3, b4_19);
+    t = mul_acc(t, a4, b3_19);
+    let r2 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0, b3);
+    t = mul_acc(t, a1, b2);
+    t = mul_acc(t, a2, b1);
+    t = mul_acc(t, a3, b0);
+    t = mul_acc(t, a4, b4_19);
+    let r3 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0, b4);
+    t = mul_acc(t, a1, b3);
+    t = mul_acc(t, a2, b2);
+    t = mul_acc(t, a3, b1);
+    t = mul_acc(t, a4, b0);
+    let r4 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    let mut r = Fe.{ l: [r0, r1, r2, r3, r4] };
+    wrap_carry(&mut r, c);
+    return r;
+}
+
+fn fe_sq(noalias a: *Fe) Fe {
+    let a0 = a.l[0];
+    let a1 = a.l[1];
+    let a2 = a.l[2];
+    let a3 = a.l[3];
+    let a4 = a.l[4];
+    let a0_2 = a0 * 2;
+    let a1_2 = a1 * 2;
+    let a2_2 = a2 * 2;
+    let a3_2 = a3 * 2;
+    let a3_19 = a3 * 19;
+    let a4_19 = a4 * 19;
+
+    let mut t = wide_mul(a0, a0);
+    t = mul_acc(t, a1_2, a4_19);
+    t = mul_acc(t, a2_2, a3_19);
+    let r0 = t.lo & MASK51;
+    let mut c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0_2, a1);
+    t = mul_acc(t, a2_2, a4_19);
+    t = mul_acc(t, a3, a3_19);
+    let r1 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0_2, a2);
+    t = mul_acc(t, a1, a1);
+    t = mul_acc(t, a3_2, a4_19);
+    let r2 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0_2, a3);
+    t = mul_acc(t, a1_2, a2);
+    t = mul_acc(t, a4, a4_19);
+    let r3 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    t = Wide.{ lo: c, hi: 0 };
+    t = mul_acc(t, a0_2, a4);
+    t = mul_acc(t, a1_2, a3);
+    t = mul_acc(t, a2, a2);
+    let r4 = t.lo & MASK51;
+    c = wide_shr51(t);
+
+    let mut r = Fe.{ l: [r0, r1, r2, r3, r4] };
+    wrap_carry(&mut r, c);
+    return r;
+}
+
+/// Multiplies a by a small constant k (< 2^55).
+fn fe_mul_small(noalias a: *Fe, k: u64) Fe {
+    let mut r = fe_zero();
+    let mut c: u64 = 0;
+    for i in @as(usize, 0)..5 {
+        let t = mul_acc(Wide.{ lo: c, hi: 0 }, a.l[i], k);
+        r.l[i] = t.lo & MASK51;
+        c = wide_shr51(t);
+    }
+    wrap_carry(&mut r, c);
+    return r;
+}
+
+/// a^e for a public exponent given as 32 little-endian bytes.
+fn fe_pow(noalias a: *Fe, noalias e: []u8) Fe {
+    let mut r = fe_one();
+    let mut i: usize = 256;
+    while i > 0 {
+        i -= 1;
+        r = fe_sq(&r);
+        if ((e[i / 8] >> @truncate(u8, i % 8)) & 1) == 1 {
+            r = fe_mul(&r, a);
+        }
+    }
+    return r;
+}
+
+/// p - 2 and (p - 5) / 8 as little-endian bytes.
+let P_MINUS_2: [32]u8 = [0xeb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                         0x7f];
+let P_MINUS_5_OVER_8: [32]u8 = [0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                0xff, 0xff, 0xff, 0x0f];
+
+fn fe_invert(noalias a: *Fe) Fe {
+    return fe_pow(a, P_MINUS_2[..]);
+}
+
+/// Loads 32 little-endian bytes, ignoring the top bit.
+fn fe_from_bytes(noalias s: []u8) Fe {
+    let w0 = binary.u64_le(s[0..8]);
+    let w1 = binary.u64_le(s[8..16]);
+    let w2 = binary.u64_le(s[16..24]);
+    let w3 = binary.u64_le(s[24..32]);
+    return Fe.{
+        l: [
+            w0 & MASK51,
+            ((w0 >> 51) | (w1 << 13)) & MASK51,
+            ((w1 >> 38) | (w2 << 26)) & MASK51,
+            ((w2 >> 25) | (w3 << 39)) & MASK51,
+            (w3 >> 12) & MASK51,
+        ],
+    };
+}
+
+/// The canonical 32-byte little-endian encoding (fully reduced mod p).
+fn fe_to_bytes(noalias a: *Fe, noalias out: []mut u8) void {
+    let mut h = a.*;
+    fe_carry(&mut h);
+    // q = floor((h + 19) / 2^255), which is 1 exactly when h >= p
+    let mut q = (h.l[0] + 19) >> 51;
+    q = (h.l[1] + q) >> 51;
+    q = (h.l[2] + q) >> 51;
+    q = (h.l[3] + q) >> 51;
+    q = (h.l[4] + q) >> 51;
+    let mask = @black_box(@as(u64, 0) -% q);
+    h.l[0] += 19 & mask;
+    // carry without folding the top carry back (that removes 2^255)
+    for i in @as(usize, 0)..5 {
+        let c = h.l[i] >> 51;
+        h.l[i] = h.l[i] & MASK51;
+        if i < 4 {
+            h.l[i + 1] += c;
+        }
+    }
+    binary.put_u64_le(out[0..8], h.l[0] | (h.l[1] << 51));
+    binary.put_u64_le(out[8..16], (h.l[1] >> 13) | (h.l[2] << 38));
+    binary.put_u64_le(out[16..24], (h.l[2] >> 26) | (h.l[3] << 25));
+    binary.put_u64_le(out[24..32], (h.l[3] >> 39) | (h.l[4] << 12));
+}
+
+fn fe_is_zero(noalias a: *Fe) bool {
+    let mut b: [32]u8 = [0; 32];
+    fe_to_bytes(a, b[..]);
+    let z: [32]u8 = [0; 32];
+    return subtle.equal(b[..], z[..]);
+}
+
+fn fe_is_negative(noalias a: *Fe) u8 {
+    let mut b: [32]u8 = [0; 32];
+    fe_to_bytes(a, b[..]);
+    return b[0] & 1;
+}
+
+fn fe_eq(a: *Fe, b: *Fe) bool {
+    let d = fe_sub(a, b);
+    return fe_is_zero(&d);
+}
+
+/// Swaps a and b when swap is 1, in constant time.
+fn fe_cswap(noalias a: *mut Fe, noalias b: *mut Fe, swap: u64) void {
+    let mask = @black_box(@as(u64, 0) -% @black_box(swap));
+    for i in @as(usize, 0)..5 {
+        let x = (a.l[i] ^ b.l[i]) & mask;
+        a.l[i] ^= x;
+        b.l[i] ^= x;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// X25519
+// -----------------------------------------------------------------------------
+
+/// shared = X25519(scalar, point): 32 bytes each. Fails with WeakKey if the
+/// result is all zeros (a small-order point), as TLS requires.
+pub fn x25519(scalar: []u8, point: []u8, shared: []mut u8) Curve25519Error!void {
+    if (scalar.len != 32) or (point.len != 32) or (shared.len < 32) {
+        return error.InvalidLength;
+    }
+    let mut k: [32]u8 = [0; 32];
+    @mem_copy(k[..], scalar);
+    k[0] = k[0] & 248;
+    k[31] = (k[31] & 127) | 64;
+    let x1 = fe_from_bytes(point);
+    let mut x2 = fe_one();
+    let mut z2 = fe_zero();
+    let mut x3 = x1;
+    let mut z3 = fe_one();
+    let mut swap: u64 = 0;
+    let mut t: usize = 255;
+    while t > 0 {
+        t -= 1;
+        let kt = @as(u64, (k[t / 8] >> @truncate(u8, t % 8)) & 1);
+        swap ^= kt;
+        fe_cswap(&mut x2, &mut x3, swap);
+        fe_cswap(&mut z2, &mut z3, swap);
+        swap = kt;
+        let a = fe_add(&x2, &z2);
+        let aa = fe_sq(&a);
+        let b = fe_sub(&x2, &z2);
+        let bb = fe_sq(&b);
+        let e = fe_sub(&aa, &bb);
+        let c = fe_add(&x3, &z3);
+        let d = fe_sub(&x3, &z3);
+        let da = fe_mul(&d, &a);
+        let cb = fe_mul(&c, &b);
+        let s1 = fe_add(&da, &cb);
+        x3 = fe_sq(&s1);
+        let s2 = fe_sub(&da, &cb);
+        let s2s = fe_sq(&s2);
+        z3 = fe_mul(&x1, &s2s);
+        x2 = fe_mul(&aa, &bb);
+        let e121 = fe_mul_small(&e, 121665);
+        let sum = fe_add(&aa, &e121);
+        z2 = fe_mul(&e, &sum);
+    }
+    fe_cswap(&mut x2, &mut x3, swap);
+    fe_cswap(&mut z2, &mut z3, swap);
+    let zi = fe_invert(&z2);
+    let r = fe_mul(&x2, &zi);
+    fe_to_bytes(&r, shared[..32]);
+    let zero: [32]u8 = [0; 32];
+    if subtle.equal(shared[..32], zero[..]) {
+        return error.WeakKey;
+    }
+}
+
+/// The public key for an X25519 secret: X25519(secret, 9).
+pub fn x25519_public(secret: []u8, public: []mut u8) Curve25519Error!void {
+    let mut nine: [32]u8 = [0; 32];
+    nine[0] = 9;
+    x25519(secret, nine[..], public)!;
+}
+
+pub struct X25519Keypair {
+    pub secret: [32]u8,
+    pub public: [32]u8,
+}
+
+/// A new random key pair.
+pub fn x25519_keypair() Curve25519Error!X25519Keypair {
+    let mut kp = X25519Keypair.{ secret: [0; 32], public: [0; 32] };
+    random.fill(kp.secret[..]) catch return error.RandomFailed;
+    x25519_public(kp.secret[..], kp.public[..])!;
+    return kp;
+}
+
+// -----------------------------------------------------------------------------
+// Edwards25519: -x^2 + y^2 = 1 + d x^2 y^2 in extended coordinates
+// -----------------------------------------------------------------------------
+
+struct Point {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    t: Fe,
+}
+
+/// Curve constants, computed once from their definitions.
+struct Consts {
+    d: Fe,        // -121665 / 121666
+    d2: Fe,       // 2d
+    sqrtm1: Fe,   // a square root of -1: 2^((p-1)/4)
+    base: Point,  // the point with y = 4/5 and x even
+}
+
+let mut CONSTS: Consts = Consts.{
+    d: Fe.{ l: [0; 5] },
+    d2: Fe.{ l: [0; 5] },
+    sqrtm1: Fe.{ l: [0; 5] },
+    base: Point.{ x: Fe.{ l: [0; 5] }, y: Fe.{ l: [0; 5] }, z: Fe.{ l: [0; 5] }, t: Fe.{ l: [0; 5] } },
+};
+let mut CONSTS_ONCE: sync.Once = sync.ONCE_INIT;
+
+fn build_consts(_u: u8) void {
+    let n = fe_small(-121665);
+    let dd = fe_small(121666);
+    let di = fe_invert(&dd);
+    let d = fe_mul(&n, &di);
+    let two = fe_small(2);
+    // (p - 1) / 4 = 2^253 - 5
+    let mut e: [32]u8 = [0xff; 32];
+    e[0] = 0xfb;
+    e[31] = 0x1f;
+    let sq = fe_pow(&two, e[..]);
+    let mut c = Consts.{ d: d, d2: fe_add(&d, &d), sqrtm1: sq, base: identity() };
+    fe_carry(&mut c.d2);
+    // y = 4/5, x recovered from the curve equation, sign bit 0
+    let four = fe_small(4);
+    let five = fe_small(5);
+    let fi = fe_invert(&five);
+    let y = fe_mul(&four, &fi);
+    let mut yb: [32]u8 = [0; 32];
+    fe_to_bytes(&y, yb[..]);
+    CONSTS = c;
+    c.base = decode_point(yb[..]) catch identity();
+    CONSTS = c;
+}
+
+fn consts() *Consts {
+    CONSTS_ONCE.call(build_consts, @as(u8, 0));
+    return &CONSTS;
+}
+
+fn identity() Point {
+    return Point.{ x: fe_zero(), y: fe_one(), z: fe_one(), t: fe_zero() };
+}
+
+/// P + Q (a complete formula: correct for every pair, doubling included).
+fn point_add(p: *Point, q: *Point) Point {
+    let c = consts();
+    let ymx1 = fe_sub(&p.y, &p.x);
+    let ymx2 = fe_sub(&q.y, &q.x);
+    let a = fe_mul(&ymx1, &ymx2);
+    let ypx1 = fe_add(&p.y, &p.x);
+    let ypx2 = fe_add(&q.y, &q.x);
+    let b = fe_mul(&ypx1, &ypx2);
+    let tt = fe_mul(&p.t, &q.t);
+    let cc = fe_mul(&tt, &c.d2);
+    let zz = fe_mul(&p.z, &q.z);
+    let dd = fe_add(&zz, &zz);
+    let e = fe_sub(&b, &a);
+    let f = fe_sub(&dd, &cc);
+    let g = fe_add(&dd, &cc);
+    let h = fe_add(&b, &a);
+    return Point.{ x: fe_mul(&e, &f), y: fe_mul(&g, &h), z: fe_mul(&f, &g), t: fe_mul(&e, &h) };
+}
+
+fn point_cswap(noalias a: *mut Point, noalias b: *mut Point, swap: u64) void {
+    fe_cswap(&mut a.x, &mut b.x, swap);
+    fe_cswap(&mut a.y, &mut b.y, swap);
+    fe_cswap(&mut a.z, &mut b.z, swap);
+    fe_cswap(&mut a.t, &mut b.t, swap);
+}
+
+/// [k]P for a 32-byte little-endian scalar, as a constant-time ladder.
+fn scalar_mul(noalias k: []u8, noalias p: *Point) Point {
+    let mut r0 = identity();
+    let mut r1 = p.*;
+    let mut i: usize = 256;
+    while i > 0 {
+        i -= 1;
+        let b = @as(u64, (k[i / 8] >> @truncate(u8, i % 8)) & 1);
+        point_cswap(&mut r0, &mut r1, b);
+        r1 = point_add(&r0, &r1);
+        r0 = point_add(&r0, &r0);
+        point_cswap(&mut r0, &mut r1, b);
+    }
+    return r0;
+}
+
+fn encode_point(noalias p: *Point, noalias out: []mut u8) void {
+    let zi = fe_invert(&p.z);
+    let x = fe_mul(&p.x, &zi);
+    let y = fe_mul(&p.y, &zi);
+    fe_to_bytes(&y, out[..32]);
+    out[31] = out[31] | (fe_is_negative(&x) << 7);
+}
+
+/// Decodes a point (RFC 8032 5.1.3).
+fn decode_point(noalias s: []u8) Curve25519Error!Point {
+    let c = &CONSTS;
+    // y must be canonical
+    let y = fe_from_bytes(s);
+    let mut canon: [32]u8 = [0; 32];
+    fe_to_bytes(&y, canon[..]);
+    canon[31] = canon[31] | (s[31] & 0x80);
+    if not @mem_eq(canon[..], s[..32]) {
+        return error.InvalidPoint;
+    }
+    let sign = s[31] >> 7;
+    // x^2 = (y^2 - 1) / (d y^2 + 1); x = u v^3 (u v^7)^((p-5)/8)
+    let yy = fe_sq(&y);
+    let one = fe_one();
+    let u = fe_sub(&yy, &one);
+    let dyy = fe_mul(&c.d, &yy);
+    let v = fe_add(&dyy, &one);
+    let v2 = fe_sq(&v);
+    let v3 = fe_mul(&v2, &v);
+    let v7a = fe_sq(&v3);
+    let v7 = fe_mul(&v7a, &v);
+    let uv7 = fe_mul(&u, &v7);
+    let pw = fe_pow(&uv7, P_MINUS_5_OVER_8[..]);
+    let uv3 = fe_mul(&u, &v3);
+    let mut x = fe_mul(&uv3, &pw);
+    let xx = fe_sq(&x);
+    let vxx = fe_mul(&v, &xx);
+    if not fe_eq(&vxx, &u) {
+        let nu = fe_neg(&u);
+        if not fe_eq(&vxx, &nu) {
+            return error.InvalidPoint;
+        }
+        x = fe_mul(&x, &c.sqrtm1);
+    }
+    if fe_is_zero(&x) and (sign == 1) {
+        return error.InvalidPoint;
+    }
+    if fe_is_negative(&x) != sign {
+        x = fe_neg(&x);
+    }
+    let t = fe_mul(&x, &y);
+    return Point.{ x: x, y: y, z: fe_one(), t: t };
+}
+
+// -----------------------------------------------------------------------------
+// Scalars mod L = 2^252 + 27742317777372353535851937790883648493
+// (after TweetNaCl's modL)
+// -----------------------------------------------------------------------------
+
+let L: [32]i64 = [
+    0xed,
+    0xd3,
+    0xf5,
+    0x5c,
+    0x1a,
+    0x63,
+    0x12,
+    0x58,
+    0xd6,
+    0x9c,
+    0xf7,
+    0xa2,
+    0xde,
+    0xf9,
+    0xde,
+    0x14,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0x10,
+];
+
+/// out = x mod L, where x holds 64 byte-sized (possibly larger) digits.
+fn mod_l(noalias out: []mut u8, noalias x: *mut [64]i64) void {
+    let mut i: usize = 63;
+    while i >= 32 {
+        let mut carry: i64 = 0;
+        let mut j = i - 32;
+        while j < (i - 12) {
+            x[j] += carry - ((16 * x[i]) * L[j - (i - 32)]);
+            carry = (x[j] + 128) >> 8;
+            x[j] -= carry << 8;
+            j += 1;
+        }
+        x[j] += carry;
+        x[i] = 0;
+        i -= 1;
+    }
+    let mut carry: i64 = 0;
+    for j in @as(usize, 0)..32 {
+        x[j] += carry - ((x[31] >> 4) * L[j]);
+        carry = x[j] >> 8;
+        x[j] = x[j] & 255;
+    }
+    for j in @as(usize, 0)..32 {
+        x[j] -= carry * L[j];
+    }
+    for k in @as(usize, 0)..32 {
+        x[k + 1] += x[k] >> 8;
+        out[k] = @truncate(u8, @bit_cast(u64, x[k]) & 255);
+    }
+}
+
+/// A 64-byte hash reduced mod L.
+fn reduce64(noalias h: []u8, noalias out: []mut u8) void {
+    let mut x: [64]i64 = [0; 64];
+    for i in @as(usize, 0)..64 {
+        x[i] = @as(i64, h[i]);
+    }
+    mod_l(out, &mut x);
+}
+
+/// Whether a 32-byte scalar is below L (as signatures require).
+fn scalar_canonical(noalias s: []u8) bool {
+    let mut i: usize = 32;
+    while i > 0 {
+        i -= 1;
+        let a = @as(i64, s[i]);
+        if a < L[i] {
+            return true;
+        }
+        if a > L[i] {
+            return false;
+        }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Ed25519
+// -----------------------------------------------------------------------------
+
+pub struct Ed25519 {
+    seed: [32]u8,
+    scalar: [32]u8,  // the clamped secret scalar
+    prefix: [32]u8,  // the second half of the seed's hash
+    pub public: [32]u8,
+
+    /// The key pair for a 32-byte secret seed.
+    pub fn from_seed(noalias seed: []u8) Ed25519 {
+        let mut h: [64]u8 = [0; 64];
+        sha2.sha512(seed[..32], h[..]);
+        let mut k = Ed25519.{ seed: [0; 32], scalar: [0; 32], prefix: [0; 32], public: [0; 32] };
+        @mem_copy(k.seed[..], seed[..32]);
+        @mem_copy(k.scalar[..], h[..32]);
+        k.scalar[0] = k.scalar[0] & 248;
+        k.scalar[31] = (k.scalar[31] & 127) | 64;
+        @mem_copy(k.prefix[..], h[32..]);
+        let c = consts();
+        let a = scalar_mul(k.scalar[..], &c.base);
+        encode_point(&a, k.public[..]);
+        return k;
+    }
+
+    /// A new random key.
+    pub fn generate() Curve25519Error!Ed25519 {
+        let mut seed: [32]u8 = [0; 32];
+        random.fill(seed[..]) catch return error.RandomFailed;
+        return Ed25519.from_seed(seed[..]);
+    }
+
+    /// The 64-byte signature of message.
+    pub fn sign(self: *Ed25519, message: []u8, noalias sig: []mut u8) void {
+        let c = consts();
+        // r = H(prefix || M) mod L
+        let mut h = sha2.Sha512.init();
+        h.update(self.prefix[..]);
+        h.update(message);
+        let mut rh: [64]u8 = [0; 64];
+        h.final(rh[..]);
+        let mut r: [32]u8 = [0; 32];
+        reduce64(rh[..], r[..]);
+        let rp = scalar_mul(r[..], &c.base);
+        encode_point(&rp, sig[..32]);
+        // k = H(R || A || M) mod L
+        let mut h2 = sha2.Sha512.init();
+        h2.update(sig[..32]);
+        h2.update(self.public[..]);
+        h2.update(message);
+        let mut kh: [64]u8 = [0; 64];
+        h2.final(kh[..]);
+        let mut k: [32]u8 = [0; 32];
+        reduce64(kh[..], k[..]);
+        // S = r + k a mod L
+        let mut x: [64]i64 = [0; 64];
+        for i in @as(usize, 0)..32 {
+            x[i] = @as(i64, r[i]);
+        }
+        for i in @as(usize, 0)..32 {
+            for j in @as(usize, 0)..32 {
+                x[i + j] += @as(i64, k[i]) * @as(i64, self.scalar[j]);
+            }
+        }
+        mod_l(sig[32..64], &mut x);
+    }
+}
+
+/// Whether sig is a valid signature of message by the 32-byte public key.
+pub fn ed25519_verify(public: []u8, message: []u8, sig: []u8) bool {
+    if (public.len != 32) or (sig.len != 64) {
+        return false;
+    }
+    let c = consts();
+    let a = decode_point(public) catch return false;
+    if not scalar_canonical(sig[32..64]) {
+        return false;
+    }
+    let mut h = sha2.Sha512.init();
+    h.update(sig[..32]);
+    h.update(public);
+    h.update(message);
+    let mut kh: [64]u8 = [0; 64];
+    h.final(kh[..]);
+    let mut k: [32]u8 = [0; 32];
+    reduce64(kh[..], k[..]);
+    // [S]B = R + [k]A, checked as [S]B - [k]A == R
+    let sb = scalar_mul(sig[32..64], &c.base);
+    let ka = scalar_mul(k[..], &a);
+    let neg_ka = Point.{ x: fe_neg(&ka.x), y: ka.y, z: ka.z, t: fe_neg(&ka.t) };
+    let r = point_add(&sb, &neg_ka);
+    let mut enc: [32]u8 = [0; 32];
+    encode_point(&r, enc[..]);
+    return subtle.equal(enc[..], sig[..32]);
+}
+
+// -----------------------------------------------------------------------------
+// Tests (RFC 7748 and RFC 8032)
+// -----------------------------------------------------------------------------
+
+fn unhex(s: []u8, out: []mut u8) []mut u8 {
+    for i in 0..s.len / 2 {
+        out[i] = (hexv(s[2 * i]) << 4) | hexv(s[(2 * i) + 1]);
+    }
+    return out[..s.len / 2];
+}
+
+fn hexv(c: u8) u8 {
+    if c <= '9' {
+        return c - '0';
+    }
+    return ((c | 0x20) - 'a') + 10;
+}
+
+test "x25519" {
+    let mut a: [32]u8 = [0; 32];
+    let mut b: [32]u8 = [0; 32];
+    let mut w: [32]u8 = [0; 32];
+    let mut out: [32]u8 = [0; 32];
+    x25519(unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", a[..]),
+           unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c", b[..]), out[..])!;
+    @expect_eq(out[..], unhex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", w[..]));
+    // Alice and Bob (6.1)
+    let alice = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", a[..]);
+    let mut apub: [32]u8 = [0; 32];
+    x25519_public(alice, apub[..])!;
+    @expect_eq(apub[..], unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", w[..]));
+    let bob = unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", b[..]);
+    x25519(bob, apub[..], out[..])!;
+    @expect_eq(out[..], unhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", w[..]));
+    // a zero result is refused
+    let zero: [32]u8 = [0; 32];
+    x25519(bob, zero[..], out[..]) catch |e| {
+        @expect_eq(e, error.WeakKey);
+        return;
+    };
+    @trap();
+}
+
+test "ed25519" {
+    let mut sb: [32]u8 = [0; 32];
+    let mut w: [64]u8 = [0; 64];
+    // RFC 8032 test 1: the empty message
+    let k = Ed25519.from_seed(unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", sb[..]));
+    @expect_eq(k.public[..], unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", w[..]));
+    let mut sig: [64]u8 = [0; 64];
+    k.sign("", sig[..]);
+    @expect_eq(sig[..],
+               unhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+                     w[..]));
+    @expect(ed25519_verify(k.public[..], "", sig[..]));
+    // test 2: one byte
+    let k2 = Ed25519.from_seed(unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", sb[..]));
+    let msg: [1]u8 = [0x72];
+    k2.sign(msg[..], sig[..]);
+    @expect_eq(sig[..],
+               unhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+                     w[..]));
+    @expect(ed25519_verify(k2.public[..], msg[..], sig[..]));
+    @expect(not ed25519_verify(k2.public[..], "x", sig[..]));
+    sig[40] ^= 1;
+    @expect(not ed25519_verify(k2.public[..], msg[..], sig[..]));
+    let g = Ed25519.generate()!;
+    g.sign("hello", sig[..]);
+    @expect(ed25519_verify(g.public[..], "hello", sig[..]));
+}
+
+test "x25519 iterated (RFC 7748 5.2)" {
+    let mut k: [32]u8 = [0; 32];
+    k[0] = 9;
+    let mut u: [32]u8 = [0; 32];
+    u[0] = 9;
+    let mut r: [32]u8 = [0; 32];
+    let mut w: [32]u8 = [0; 32];
+    for i in @as(u32, 0)..1000 {
+        x25519(k[..], u[..], r[..])!;
+        u = k;
+        k = r;
+        if i == 0 {
+            @expect_eq(k[..], unhex("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079", w[..]));
+        }
+    }
+    @expect_eq(k[..], unhex("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51", w[..]));
+}
+
+test "field arithmetic" {
+    let mut tmp: [32]u8 = [0; 32];
+    let mut out: [32]u8 = [0; 32];
+    // Canonical reduction of p, p+1, 2^255-1, and top-bit masking.
+    let p_bytes = unhex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", tmp[..]);
+    let fp = fe_from_bytes(p_bytes);
+    @expect(fe_is_zero(&fp));
+    let mut p1_bytes: [32]u8 = [0; 32];
+    @mem_copy(p1_bytes[..], p_bytes);
+    p1_bytes[0] = 0xee;
+    let fp1 = fe_from_bytes(p1_bytes[..]);
+    let one = fe_one();
+    @expect(fe_eq(&fp1, &one));
+
+    let mut max255: [32]u8 = [0xff; 32];
+    let fmax_hi = fe_from_bytes(max255[..]);  // top bit ignored -> 2^255 - 1 = 18 (mod p)
+    max255[31] = 0x7f;
+    let fmax = fe_from_bytes(max255[..]);
+    let f18 = fe_small(18);
+    @expect(fe_eq(&fmax_hi, &f18));
+    @expect(fe_eq(&fmax, &f18));
+    fe_to_bytes(&fmax, out[..]);
+    @expect_eq(out[0], 18);
+    for i in @as(usize, 1)..32 {
+        @expect_eq(out[i], 0);
+    }
+
+    // Arithmetic identities: (p - 1)^2 == 1, (-k) + k == 0, mul vs sq, mul_small vs mul.
+    let zero = fe_zero();
+    let pm1 = fe_sub(&zero, &one);
+    let pm1_sq = fe_sq(&pm1);
+    @expect(fe_eq(&pm1_sq, &one));
+
+    let k121 = fe_small(121665);
+    let nk121 = fe_small(-121665);
+    let sum_k = fe_add(&k121, &nk121);
+    @expect(fe_is_zero(&sum_k));
+
+    let x = fe_from_bytes(unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", tmp[..]));
+    let x_sq = fe_sq(&x);
+    let x_mul_x = fe_mul(&x, &x);
+    @expect(fe_eq(&x_sq, &x_mul_x));
+
+    let x_121a = fe_mul_small(&x, 121665);
+    let x_121b = fe_mul(&x, &k121);
+    @expect(fe_eq(&x_121a, &x_121b));
+
+    let xi = fe_invert(&x);
+    let xxi = fe_mul(&x, &xi);
+    @expect(fe_eq(&xxi, &one));
+
+    // Chained uncarried fe_add into fe_sub, fe_mul, and fe_sq (limb growth safety).
+    let mut acc = x;
+    for _i in @as(usize, 0)..6 {
+        acc = fe_add(&acc, &x);  // 7 * x
+    }
+    let seven_x = fe_mul_small(&x, 7);
+    let diff = fe_sub(&seven_x, &acc);
+    @expect(fe_is_zero(&diff));
+    let sq_acc = fe_sq(&acc);
+    let sq_7x = fe_sq(&seven_x);
+    @expect(fe_eq(&sq_acc, &sq_7x));
+
+    // Constant-time conditional swap.
+    let mut a = x;
+    let mut b = one;
+    fe_cswap(&mut a, &mut b, 0);
+    @expect(fe_eq(&a, &x));
+    @expect(fe_eq(&b, &one));
+    fe_cswap(&mut a, &mut b, 1);
+    @expect(fe_eq(&a, &one));
+    @expect(fe_eq(&b, &x));
+}

@@ -252,6 +252,14 @@ for line in data_lines('BidiBrackets.txt'):
 
 # --- output -------------------------------------------------------------------
 
+# the property each record field holds, for the constants' documentation
+FIELD_PROPS = {'GC': 'General_Category', 'GB': 'Grapheme_Cluster_Break', 'WB': 'Word_Break', 'SB': 'Sentence_Break',
+               'LB': 'Line_Break', 'EA': 'East_Asian_Width', 'BIDI': 'Bidi_Class', 'CCC': 'Canonical_Combining_Class',
+               'EXT_PICT': 'Extended_Pictographic', 'WHITE': 'White_Space', 'ALPHA': 'Alphabetic', 'LOWER': 'Lowercase',
+               'UPPER': 'Uppercase', 'IGNORABLE': 'Default_Ignorable_Code_Point', 'INCB': 'Indic_Conjunct_Break',
+               'EMOJI_PRES': 'Emoji_Presentation', 'MIRRORED': 'Bidi_Mirrored', 'ID_START': 'ID_Start',
+               'ID_CONTINUE': 'ID_Continue', 'CASED': 'Cased', 'CASE_IGNORABLE': 'Case_Ignorable'}
+
 
 def arr(name, ty, vals, per=16, doc=None):
     out = []
@@ -274,14 +282,14 @@ def seq_table(prefix, table, doc):
     return '\n\n'.join([
         arr(prefix + '_KEYS', 'u32', keys, doc=doc + ': the code points (sorted)'),
         arr(prefix + '_SEQ', 'u32', offs, doc='(offset into ' + prefix + '_POOL) << 8 | length'),
-        arr(prefix + '_POOL', 'u32', pool)])
+        arr(prefix + '_POOL', 'u32', pool, doc='The code points of the sequences ' + prefix + '_SEQ points into')])
 
 
 def pair_table(prefix, table, doc):
     keys = sorted(table)
     return '\n\n'.join([
         arr(prefix + '_FROM', 'u32', keys, doc=doc + ' (sorted)'),
-        arr(prefix + '_TO', 'u32', [table[k] for k in keys])])
+        arr(prefix + '_TO', 'u32', [table[k] for k in keys], doc='What each code point of %s_FROM maps to' % prefix)])
 
 
 # the version, from DerivedAge's header
@@ -295,15 +303,17 @@ parts = ['''// =================================================================
 // cmd/internal/tools/gen_unicode.py from the Unicode Character Database. Do not edit.
 // =============================================================================
 ''' % ver]
-parts.append('pub let VERSION: []u8 = "%s";' % ver)
-parts.append('\n'.join('pub const F_%s: u32 = %d;' % (n, offsets[n][0]) for n, _ in FIELDS))
-parts.append('\n'.join('pub const W_%s: u32 = %d;' % (n, offsets[n][1]) for n, _ in FIELDS))
+parts.append('/// The version of Unicode these tables hold.\npub let VERSION: []u8 = "%s";' % ver)
+parts.append('\n'.join('/// The bit offset in a record of its %s field.\npub const F_%s: u32 = %d;' % (FIELD_PROPS[n], n, offsets[n][0])
+                       for n, _ in FIELDS))
+parts.append('\n'.join('/// The width in bits of a record\'s %s field.\npub const W_%s: u32 = %d;' % (FIELD_PROPS[n], n, offsets[n][1])
+                       for n, _ in FIELDS))
 rec_list = sorted(recs, key=lambda r: recs[r])
 parts.append(arr('RECORDS', 'u64', rec_list, per=8, doc='The distinct property records (fields at F_*, widths W_*).'))
 parts.append(arr('LOW', 'u16', rec_of[:LOW], per=32, doc='The record of each code point below U+%04X.' % LOW))
-parts.append('pub const LOW_LIMIT: u32 = %d;' % LOW)
+parts.append('/// The code points below this have their record in LOW; the others in a run.\npub const LOW_LIMIT: u32 = %d;' % LOW)
 parts.append(arr('RUN_START', 'u32', run_start, doc='Runs of code points with one record: where each starts.'))
-parts.append(arr('RUN_RECORD', 'u16', run_rec, per=24))
+parts.append(arr('RUN_RECORD', 'u16', run_rec, per=24, doc='The record of each run of RUN_START.'))
 parts.append(pair_table('UPPER', upper, 'Simple uppercase mappings'))
 parts.append(pair_table('LOWER', lower, 'Simple lowercase mappings'))
 parts.append(pair_table('TITLE', {k: v for k, v in title.items() if upper.get(k) != v}, 'Simple titlecase mappings that differ from the uppercase ones'))
@@ -318,16 +328,20 @@ parts.append(seq_table('CANON', canon, 'Canonical decompositions (one level)'))
 parts.append(seq_table('COMPAT', compat_, 'Compatibility decompositions (one level)'))
 ckeys = sorted(compose)
 parts.append(arr('COMPOSE_KEY', 'u64', [(a << 21) | b for a, b in ckeys], per=8, doc='Canonical compositions: first << 21 | second (sorted)'))
-parts.append(arr('COMPOSE_TO', 'u32', [compose[k] for k in ckeys]))
+parts.append(arr('COMPOSE_TO', 'u32', [compose[k] for k in ckeys], doc='The composition of each pair of COMPOSE_KEY.'))
 parts.append(pair_table('MIRROR', mirror, 'Bidi mirroring glyphs'))
 bkeys = sorted(brackets)
 parts.append(arr('BRACKET_FROM', 'u32', bkeys, doc='Bidi paired brackets (sorted)'))
-parts.append(arr('BRACKET_PAIR', 'u32', [brackets[k][0] for k in bkeys]))
-parts.append(arr('BRACKET_OPEN', 'u8', [1 if brackets[k][1] == 'o' else 0 for k in bkeys], per=32))
+parts.append(arr('BRACKET_PAIR', 'u32', [brackets[k][0] for k in bkeys], doc='The bracket paired with each of BRACKET_FROM.'))
+parts.append(arr('BRACKET_OPEN', 'u8', [1 if brackets[k][1] == 'o' else 0 for k in bkeys], per=32,
+                 doc='1 where the bracket of BRACKET_FROM opens, 0 where it closes.'))
 for label, names in [('GC', GC_NAMES), ('GB', GB_NAMES), ('WB', WB_NAMES), ('SB', SB_NAMES), ('LB', LB_NAMES),
                      ('EA', EA_NAMES), ('BIDI', BIDI_NAMES)]:
-    parts.append('\n'.join('pub const %s_%s: u32 = %d;' % (label, n.upper(), k) for k, n in enumerate(names)))
-    parts.append('pub let %s_NAMES: [%d][]u8 = [%s];' % (label, len(names), ', '.join('"%s"' % n for n in names)))
+    prop = FIELD_PROPS[label]
+    parts.append('\n'.join('/// The %s value %s, as a record holds it.\npub const %s_%s: u32 = %d;' % (prop, n, label, n.upper(), k)
+                           for k, n in enumerate(names)))
+    parts.append('/// The names of the %s values, by their codes.\npub let %s_NAMES: [%d][]u8 = [%s];'
+                 % (prop, label, len(names), ', '.join('"%s"' % n for n in names)))
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, 'w') as f:
     f.write('\n\n'.join(parts) + '\n')

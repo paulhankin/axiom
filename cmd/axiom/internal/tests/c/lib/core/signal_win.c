@@ -1,5 +1,5 @@
 /* Windows x64: the processor's faults in the program's code, delivered to
-   signal's handlers (std/c/rt/core_signal.ax): an access violation is
+   signal's handlers (lib/c/rt/core_signal.ax): an access violation is
    SIGSEGV, an integer division by zero SIGFPE, an illegal instruction
    SIGILL. The handlers leave with longjmp (which unwinds from the handler
    through the faulting function: the trampoline's machine frame). With

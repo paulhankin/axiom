@@ -40,7 +40,7 @@ promises is a vulnerability. For example:
   escape the guarantees above.
 
 A trap that untrusted input can reach is a denial of service, and worth reporting
-privately if it affects a network-facing module (`std/net/...`); elsewhere, a public
+privately if it affects a network-facing module (`lib/net/...`); elsewhere, a public
 issue is fine.
 
 ## What does not count

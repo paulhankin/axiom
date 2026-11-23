@@ -7,6 +7,7 @@
 #                                                          release-0.N, with the commits (from
 #                                                          main) cherry-picked onto it first
 #   cmd/axiom/release.sh notes <version>   gather docs/next/*.md into docs/releases/<version>.md
+#                                          (the C front end's, c-*.md, in a section of their own)
 #   cmd/axiom/release.sh build <version>   build and check build/release/axiom-<version>-*.{tar.gz,zip}
 #                                          and build/release/SHA256SUMS
 #
@@ -33,7 +34,8 @@
 # is <version>, and docs/releases/<version>.md. It bootstraps (from the seed
 # cmd/axiom/seed.toml pins, or AXIOM_SEED), runs the test suite, the fuzzer and the
 # examples (cmd/axiom/examples.sh), builds the compiler
-# for every release target, and packs each with the standard library (its
+# for every release target, and packs each with the standard library and the
+# libraries (std/ and lib/: their
 # sources, without test data), the licenses and the release notes. The
 # archives are deterministic: the same commit gives the same bytes. Environment:
 #   SKIP_TESTS   1: do not run the test suite (for trying the script out)
@@ -234,13 +236,23 @@ if [ "$cmd" = notes ]; then
     out=docs/releases/$v.md
     [ -e "$out" ] && { echo "release: $out exists" >&2; exit 1; }
     mkdir -p docs/releases
+    # (the C front end's notes, docs/next/c-*.md, in a section of their own,
+    # their headings one level down: it is an experiment, docs/c.md)
     {
         echo "# Axiom $v"
         for f in docs/next/*.md; do
-            [ "$(basename "$f")" = README.md ] && continue
+            case $(basename "$f") in README.md | c-*) continue ;; esac
             echo
             cat "$f"
         done
+        if ls docs/next/c-*.md >/dev/null 2>&1; then
+            echo
+            echo "## The C front end (an experiment)"
+            for f in docs/next/c-*.md; do
+                echo
+                sed 's/^## /### /' "$f"
+            done
+        fi
     } > "$out"
     for f in docs/next/*.md; do
         [ "$(basename "$f")" = README.md ] || git rm -q "$f"
@@ -264,14 +276,23 @@ mtime=$(git log -1 --format=%ct)
 
 cmd/axiom/bootstrap.sh
 A=cmd/axiom/build/axiom
+# A run of the suite: when only the C front end's tests failed (status 3),
+# that is said, and the release goes on (the C front end is an experiment,
+# docs/c.md); any other failure stops it.
+suite() {
+    s=0
+    env "$@" || s=$?
+    [ "$s" = 3 ] && { echo "release: only the C front end's tests failed (an experiment): going on" >&2; return 0; }
+    [ "$s" = 0 ] || exit "$s"
+}
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
     # the suite, and with the compiler as the archives have it: native code
     # at -O2
-    AXIOM=$A node cmd/axiom/internal/tests/run.mjs
+    suite AXIOM=$A node cmd/axiom/internal/tests/run.mjs
     # (on a Mac, the native suite links cmd/axiom/internal/tests/native_rt.ax, not C)
     native_target=""
     [ "$(uname -s)" = Darwin ] && native_target=aarch64-macos
-    AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 AXIOM_NATIVE_TARGET=${AXIOM_NATIVE_TARGET:-$native_target} \
+    suite AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 AXIOM_NATIVE_TARGET=${AXIOM_NATIVE_TARGET:-$native_target} \
         node cmd/axiom/internal/tests/run.mjs --native -O2
     # the standard library's parsers against mutated inputs, with a seed of
     # this run's own
@@ -293,13 +314,13 @@ for t in "linux-x86_64 x86_64 axiom" "linux-aarch64 aarch64 axiom" "macos-aarch6
     mkdir -p "$d/bin"
     echo "build $name"
     $A build cmd/axiom/src/main.ax --target="$2" -O2 --pdb=off -o "$d/bin/$3"
-    git ls-files std | grep -v '/testdata/' | while read -r f; do
+    git ls-files std lib | grep -v '/testdata/' | while read -r f; do
         mkdir -p "$d/$(dirname "$f")"
         cp "$f" "$d/$f"
     done
     cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "$d/"
     cp "docs/releases/$v.md" "$d/RELEASE-NOTES.md"
-    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n\nAxiom is experimental software, provided "as is", without warranty of any kind.\nUse it at your own risk; see LICENSE-MIT and LICENSE-APACHE for the full terms.\n' \
+    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ and lib/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n\nAxiom is experimental software, provided "as is", without warranty of any kind.\nUse it at your own risk; see LICENSE-MIT and LICENSE-APACHE for the full terms.\n' \
         "$v" "$1" "$commit" > "$d/README.txt"
     python3 - "$R" "$R/stage" "$name" "$mtime" <<'EOF'
 import gzip, io, os, sys, tarfile, zipfile, time
@@ -331,13 +352,15 @@ else:
 EOF
 done
 
-# Every archive holds the compiler, the library and the runtime, and no test data.
+# Every archive holds the compiler, the standard library, the libraries and the
+# runtime, and no test data.
 for f in "$R"/axiom-"$v"-*; do
     case $f in
         *.zip) list=$(unzip -Z1 "$f") ;;
         *) list=$(tar -tzf "$f") ;;
     esac
-    for want in bin/axiom std/mem.ax std/internal/runtime/host.mjs std/internal/runtime/rt.ax LICENSE-MIT RELEASE-NOTES.md; do
+    for want in bin/axiom std/mem.ax std/internal/runtime/host.mjs std/internal/runtime/rt.ax lib/README.md lib/encoding/hex.ax \
+        LICENSE-MIT RELEASE-NOTES.md; do
         echo "$list" | grep -q "/$want" || echo "$list" | grep -q "/${want}.exe" ||
             { echo "release: $(basename "$f") lacks $want" >&2; exit 1; }
     done
@@ -350,14 +373,15 @@ if command -v qemu-aarch64 >/dev/null && [ "$(uname -m)" = x86_64 ]; then
     [ "$(qemu-aarch64 "$R/stage/qa/axiom-$v-linux-aarch64/bin/axiom" version)" = "axiom $v" ] ||
         { echo "release: the AArch64 compiler does not run under qemu" >&2; exit 1; }
 fi
-# The Linux x86-64 archive, unpacked, builds and runs a program.
+# The Linux x86-64 archive, unpacked, builds and runs a program (which imports
+# a library, from lib/ beside std/).
 if [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ]; then
     T=$R/stage/check
     mkdir -p "$T"
     tar -xzf "$R/axiom-$v-linux-x86_64.tar.gz" -C "$T"
-    printf 'import "std/io" as io;\n\nexport fn main() i32 {\n    io.stdout().write_all("ok\\n") catch return 1;\n    return 0;\n}\n' > "$T/hello.ax"
+    printf 'import "lib/encoding/hex" as hex;\nimport "std/io" as io;\n\nexport fn main() i32 {\n    let mut b: [4]u8 = [0; 4];\n    io.stdout().write_all(hex.encode("ok", b[..])) catch return 1;\n    return 0;\n}\n' > "$T/hello.ax"
     out=$(cd "$T" && "./axiom-$v-linux-x86_64/bin/axiom" build hello.ax --target=native -o hello && ./hello)
-    [ "$out" = ok ] || { echo "release: the unpacked compiler does not work: $out" >&2; exit 1; }
+    [ "$out" = 6f6b ] || { echo "release: the unpacked compiler does not work: $out" >&2; exit 1; }
     [ "$("$T/axiom-$v-linux-x86_64/bin/axiom" version)" = "axiom $v" ] || { echo "release: wrong version" >&2; exit 1; }
 fi
 rm -rf "$R/stage"

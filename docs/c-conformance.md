@@ -335,7 +335,7 @@ target, the table of `c.md` "Per target" gives it.
 
 | Item | Choice |
 |---|---|
-| The locations searched for `<...>` and `"..."` headers, and how the name is mapped | `"file"`: the includer's directory, then `-I`, then `std/c/include`; `<file>`: the last two. The name is a path as written. |
+| The locations searched for `<...>` and `"..."` headers, and how the name is mapped | `"file"`: the includer's directory, then `-I`, then `lib/c/include`; `<file>`: the last two. The name is a path as written. |
 | The mapping of a header name's characters to a file name | Byte for byte (UTF-8). |
 | How `#include` with macro-replaced tokens is combined into a header name | The tokens' spellings joined, spaces where the tokens had them. |
 | The nesting limit for `#include` | 200. |

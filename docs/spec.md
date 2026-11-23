@@ -421,16 +421,27 @@ module's `pub` declarations. Paths are relative to the importing file, with `/` 
 their parts on every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\`
 or a NUL byte is `E0218`.
 A path beginning with `std/` resolves to the standard library, for example
-`import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
-(§4.6). The rest of a `std/` path, and of a `pkg:name/` path, may not have a `..` part, so
-that it stays inside the library or the package's `src` (`E0218`). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
+`import "std/mem" as mem;`, and one beginning with `lib/` to the libraries released with it,
+for example `import "lib/encoding/csv" as csv;`: the directory named `lib` beside the
+standard library's (so `lib/` beside `std/` in a release and in the source tree; the
+compiler finds the standard library from `--std=<dir>`, else `AXIOM_STD`, else next to its
+executable). The standard library (`std/`, the core) is what every program and the compiler
+itself build on: it imports only itself. The libraries (`lib/`: protocols, formats,
+compression, cryptography, text processing, graphics and audio) may import the standard
+library and each other. A path beginning with `pkg:` names a module of another package
+(§4.6). The rest of a `std/` or `lib/` path, and of a `pkg:name/` path, may not have a `..`
+part, so that it stays inside the library or the package's `src` (`E0218`). An import of a
+module that has left the standard library (for the libraries, or `crypto/md5`, `sha1`,
+`sha2`, `sha3` and `random`, which are `std/hash/...` and `std/os/random`) is `E0211` with a
+machine fix that imports it where it is. The `.ax` extension may be left out. A path that doesn't resolve to a readable file
 is `E0211`.
 
 A module in a directory named `internal`, or below one, may be imported only by modules in
 the tree rooted at that directory's parent, as in Go: `a/b/internal/c.ax` by `a/b/x.ax` or
 `a/b/d/y.ax`, not by `a/z.ax`. Any other import of it is `E0219`. The rule applies to the
-standard library too, so `std/internal/...` (the runtime among it) can be imported only from
-`std`.
+standard library and the libraries too, so `lib/x/internal/...` can be imported only from
+`lib/x`, and `std/internal/...` (the runtime among it) only from `std` and from `lib`, which
+is released with it.
 
 Inter-module import cycles are a compile error (`E0210`) in v0.1.
 
@@ -2487,8 +2498,8 @@ fn crc32c_step(crc: u32, x: u64) u32 @multiversion("sse4.2", "crc") {
 }
 ```
 
-The standard library uses them in std/crypto (`aes_gcm`, `sha1`, `sha2`, `sha3`) and
-std/hash/crc, with the portable code where they are absent.
+The standard library uses them in std/hash (`sha1`, `sha2`, `sha3`, `crc`), and the
+libraries in lib/crypto/aes_gcm, with the portable code where they are absent.
 
 ---
 
@@ -3302,7 +3313,10 @@ sorted by path; a duplicate import and an unused one are removed, except an impo
 package (`pkg:`) or of a module that has tests (importing it runs them, §17); and a
 standard library module that the file uses as `name.x`, where `name` is declared nowhere,
 is imported: `std/name`, or `std/group/name` when that is the only module of that name one
-directory down (`vec` is `std/collections/vec`).
+directory down (`vec` is `std/collections/vec`); failing that, outside the standard
+library, a library module the same way (`lib/name`, `lib/group/name`: `csv` is
+`lib/encoding/csv`). Inside the standard library or the libraries the import is a relative
+path.
 
 ### 16.6 Profiling
 

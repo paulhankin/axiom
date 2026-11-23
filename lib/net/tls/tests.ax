@@ -1,0 +1,424 @@
+// =============================================================================
+// lib/net/tls/tests.ax - test certificates/keys and TLS 1.3 / 1.2 unit and
+// loopback tests (part of lib/net/tls).
+// =============================================================================
+
+import "std/hash/sha2" as sha2;
+import "std/mem" as mem;
+import "std/net" as net;
+import "std/str" as strs;
+import "std/thread" as thread;
+
+// -----------------------------------------------------------------------------
+// Tests: a client and a server in one process, over loopback. The server
+// has a self-signed P-256 certificate for localhost and 127.0.0.1.
+// -----------------------------------------------------------------------------
+
+let TEST_CERT: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBmjCCAUGgAwIBAgIUTGKoTgwLCyiQ8r9NVkXLVdhYYd0wCgYIKoZIzj0EAwIw\n",
+    "FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkyODIzMTA1NloYDzIxMjYwOTA0\n",
+    "MjMxMDU2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\n",
+    "PQMBBwNCAASaXwl2y2wrvsRBwKcBCfVYRP6n+UoDEUmfRQEyVk2p9N6ndI8C/y3W\n",
+    "CDL4HVY6cvUGuiHGz6JE9+EFQnQ71rUko28wbTAdBgNVHQ4EFgQUUVQuA75uDa3E\n",
+    "2wzrMq/3FPC91PMwHwYDVR0jBBgwFoAUUVQuA75uDa3E2wzrMq/3FPC91PMwDwYD\n",
+    "VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI\n",
+    "zj0EAwIDRwAwRAIgK1dyc1W73OQJn/0NmyNXLBzbpck2UpqI3gYtW8nBa9gCIBLK\n",
+    "ioXsQVpLpg05LzG+kqwafLSlgwMS0FA0VSfW6O3d\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let TEST_KEY: [5][]u8 = [
+    "-----BEGIN PRIVATE KEY-----\n",
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnXxOrb06o0h/7Rns\n",
+    "/1p67T6EuZ5xqfjbQRRdFxQAZB2hRANCAASaXwl2y2wrvsRBwKcBCfVYRP6n+UoD\n",
+    "EUmfRQEyVk2p9N6ndI8C/y3WCDL4HVY6cvUGuiHGz6JE9+EFQnQ71rUk\n",
+    "-----END PRIVATE KEY-----\n",
+];
+
+fn join(lines: [][]u8) TlsError![]mut u8 {
+    let mut s = strs.String.init();
+    for l in lines {
+        s.push_str(l)!;
+    }
+    return s.take();
+}
+
+/// A self-signed P-256 certificate for localhost and 127.0.0.1, as PEM (free
+/// it with mem.free). Its private key (test_key_pem) is published here, so
+/// it is for tests only.
+pub fn test_certificate_pem() TlsError![]mut u8 {
+    return join(TEST_CERT[..]);
+}
+
+/// The private key of test_certificate_pem, as PEM (free it with mem.free).
+pub fn test_key_pem() TlsError![]mut u8 {
+    return join(TEST_KEY[..]);
+}
+
+nocopy struct TestServer {
+    listener: net.TcpListener,
+    cfg: *ServerConfig,
+    failures: u32,
+}
+
+/// Serves connections: echoes what it reads until the client closes.
+fn test_serve(t: *mut TestServer) void {
+    loop {
+        let s = t.listener.accept() catch return;
+        let c = server(s, t.cfg) catch {
+            t.failures += 1;
+            continue;
+        };
+        let mut buf: [4096]u8 = [0; 4096];
+        loop {
+            let n = c.read(buf[..]) catch break;
+            if n == 0 {
+                break;
+            }
+            c.write_all(buf[..n]) catch break;
+        }
+        c.close();
+    }
+}
+
+fn fails[T](r: !T) bool {
+    _ = r catch return true;
+    return false;
+}
+
+test "client and server" {
+    let cert = join(TEST_CERT[..])!;
+    defer mem.free(cert);
+    let key = join(TEST_KEY[..])!;
+    defer mem.free(key);
+    let mut scfg = ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    let protos: [2][]u8 = ["h2", "http/1.1"];
+    scfg.alpn = protos[1..];
+    let mut ts = TestServer.{ listener: net.listen("127.0.0.1", 0)!, cfg: &scfg, failures: 0 };
+    let port = ts.listener.port();
+    let mut th = thread.spawn(test_serve, &mut ts)!;
+
+    let mut ccfg = ClientConfig.with_roots_pem(cert)!;
+    defer ccfg.deinit();
+    ccfg.alpn = protos[..];
+    let c = connect("localhost", port, &ccfg)!;
+    @expect_eq(c.protocol(), "http/1.1");
+    c.write_all("hello")!;
+    let mut buf: [8]u8 = [0; 8];
+    c.reader().read_exact(buf[..5])!;
+    @expect_eq(buf[..5], "hello");
+    // more than one record each way, and a key update in the middle
+    let big = mem.alloc.[u8](100000)!;
+    defer mem.free(big);
+    for i in 0..big.len {
+        big[i] = @truncate(u8, i * 7);
+    }
+    c.write_all(big[..50000])!;
+    c.key_update()!;
+    c.write_all(big[50000..])!;
+    let back = mem.alloc.[u8](100000)!;
+    defer mem.free(back);
+    c.reader().read_exact(back)!;
+    @expect(@mem_eq(back, big));
+    c.close();
+
+    // by IP address too
+    let c2 = connect("127.0.0.1", port, &ccfg)!;
+    c2.close();
+
+    // an untrusted certificate and a wrong name are refused
+    let mut empty = ClientConfig.with_roots_pem("")!;
+    defer empty.deinit();
+    @expect(fails(connect("localhost", port, &empty)));
+    let s3 = net.connect("127.0.0.1", port)!;
+    @expect(fails(client(s3, "other.test", &ccfg)));
+    // unless verification is off
+    let mut insecure = ClientConfig.insecure();
+    defer insecure.deinit();
+    let c4 = connect("127.0.0.1", port, &insecure)!;
+    c4.write_all("x")!;
+    c4.reader().read_exact(buf[..1])!;
+    c4.close();
+
+    ts.listener.close();
+    th.join();
+    @expect_eq(ts.failures, 2);
+}
+
+// A self-signed RSA-2048 certificate for localhost, for the TLS 1.2 tests.
+let TEST_RSA_CERT: [19][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIDJzCCAg+gAwIBAgIUO7BLwGp13FEDhd3kq6/di3D4fDswDQYJKoZIhvcNAQEL\n",
+    "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAwMjA3NDk1MFoYDzIxMjYw\n",
+    "OTA4MDc0OTUwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n",
+    "AQUAA4IBDwAwggEKAoIBAQCw8JW7L+HpVnkZKYLvZfzPxpAXx5h/ApItlHGvVTr2\n",
+    "eI8R4zDTWOrWtAtSamCt5zyGgdq0oTVPL0xV0lgffREYGp24+UNFHUoeoZfVNOWw\n",
+    "aFu+N6eDakioYWsuoKJjy9GbdsB7O4pF9WezDScNOfJptzq3sI74qJH71b2tN7gU\n",
+    "P6x1mcGSkutL1p2WHf+cE4yiHcerH9xsW4KuJjHgLab5x4NtM3cx3oYTd6TB2sBO\n",
+    "/uCj9yVkHHSg9baLS+0pXWuNxgYQqXQAYW916wMF9VqwvvHcIDDjMNejKOm8OMCv\n",
+    "FzyskDAX7wW7nopNdBNedxCtS3on82smcr1tylO75qpHAgMBAAGjbzBtMB0GA1Ud\n",
+    "DgQWBBTLT21iGEy3lb7IGNOWhlCJYA53EjAfBgNVHSMEGDAWgBTLT21iGEy3lb7I\n",
+    "GNOWhlCJYA53EjAPBgNVHRMBAf8EBTADAQH/MBoGA1UdEQQTMBGCCWxvY2FsaG9z\n",
+    "dIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEAEUkK+T3JY4L8UxpnfwrBVAaYnX7u\n",
+    "j0KzWLfEAlMdTtyh656Lj59AAlG/dCZemohz0jRAUMLjdYXs8dujTfhzqE4peKzi\n",
+    "HWTmX9FJoM7x5IrpX3Chs5rzzHewg5bsy9Bsq3et8GA6iwIxTnfsHPHwI6qsg1FL\n",
+    "U7qZH5sQTpn0wo3zwHZ5mM2AEcczy9oB/KhULooxkEjnFZw8p7m6I3nvHmj0kWm/\n",
+    "lwsGGpbRxnCz7B0NMT2MlO7eUMjIY9567UmUxJL41Z7vdk/4jujPhGWpS4c62F35\n",
+    "yqK5Bvw1GxyT3OPnI5jKhkLCFMnxg9ZDxdxGsL3V7QcKxkdjhAU/fl+twQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let TEST_RSA_KEY: [28][]u8 = [
+    "-----BEGIN PRIVATE KEY-----\n",
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCw8JW7L+HpVnkZ\n",
+    "KYLvZfzPxpAXx5h/ApItlHGvVTr2eI8R4zDTWOrWtAtSamCt5zyGgdq0oTVPL0xV\n",
+    "0lgffREYGp24+UNFHUoeoZfVNOWwaFu+N6eDakioYWsuoKJjy9GbdsB7O4pF9Wez\n",
+    "DScNOfJptzq3sI74qJH71b2tN7gUP6x1mcGSkutL1p2WHf+cE4yiHcerH9xsW4Ku\n",
+    "JjHgLab5x4NtM3cx3oYTd6TB2sBO/uCj9yVkHHSg9baLS+0pXWuNxgYQqXQAYW91\n",
+    "6wMF9VqwvvHcIDDjMNejKOm8OMCvFzyskDAX7wW7nopNdBNedxCtS3on82smcr1t\n",
+    "ylO75qpHAgMBAAECggEAOXlsqakcENdt7qZ1SZ4vSK6PD6pd9qO3J+cYJoPg6z6t\n",
+    "+nl52qz/W06QfuzfCp4aIvb7O8FBt779ZMM2rMPLUbETmoodN84TzW9gCnlsQqkj\n",
+    "Y95gI2fawhci4bp8BT6nj4A7dcwZVjAoxxh2nu07uOszv4cyacMX6F29hw6aVLjv\n",
+    "3yhCJVOkOLF9K6JNQy9ejkOSWp/bsH4L3/M6y6l4lStKnSjyc7W9wMbLTcXntmzn\n",
+    "YRpCni9qk6A6mPFEo3D1q4h/170lK8fqEaxD+LYvpgbJOhNgSMv/ZTXuQJ5bIQ/c\n",
+    "UA3z030oMolgnS0mvR2wP10N44jgD/zt5X0euKPoAQKBgQDWLGjXVA3hUetNG6GT\n",
+    "PugA766kZHh3qSYnqGC374ACIS4m/Ds1ksZrgd8iQm7yDRa/RR67AU9b9TfVv1Xa\n",
+    "r8zoHMpzwIsKgnc+7GA30ODEMJn2YNrDPTiBA5jtjo5vf56XmauA9jMU7c4KQGB4\n",
+    "WETIDsPkYcRWE+20efvGG7DHxwKBgQDTfq3ecKs2qMAMTdqAHbc2rkWR7srpzx3s\n",
+    "5H7UShjcX1W7Y782Np0jDXPOil+20+O7ObDUr72AiPppfTgxlqWqQP+q8D08En1P\n",
+    "4X44JalpbR1kJD8+K1qoMKu/GyN9WatHqQqKv8lEy0tQvGNP3HyVz4e23ISpN3+T\n",
+    "pmwV4NQJgQKBgCyKDb+B9mT+QT3G2kIh2eOf9KSxVDAmWA31QS/fObK3rb5jw/hv\n",
+    "Lp5a4slgIWxq9mkOecaQDi3kgBkOck9JMgavPhb2WrPzz9KhG51f7e4+4TXQjI3/\n",
+    "pEmIMvxsIgjj9Fo4leb6zEK09Z1CKA2+5YbpMynCfy8bc9qNZ6OaTJgvAoGASS2H\n",
+    "03OAikURTjCR7cpaXl0mTTwmkYfMfu8Aw0twFrAV5eS5gHSdIkfBTjGqtIPURC/N\n",
+    "84lrNFIw8tcU3nOVlrcuv2KojWSIX19SYPMHDydmCARSrZwqng9ZHaKyQOkJzp26\n",
+    "vA9oAJmm0aSdaECOCvfnqWnbrQE670eiFl/YfgECgYEAotB4LM7Ix3BCfr69cMpd\n",
+    "Iq8maT1vZ2TGj5oT1ExsATlWtn5H3FaywhJgQc0Nc18IzSkjW7uH/g02DMOWxkvd\n",
+    "2SDPGDf8fT7M1Mo1O+ilTuyo3BMZqbrbDb12HN4uAMQAL4GXLSRXLJ6fhu+XIJ0P\n",
+    "lKlezj1z0wavquIYSsPi6tM=\n",
+    "-----END PRIVATE KEY-----\n",
+];
+
+fn serve_once_with(cfg: *ServerConfig, port_out: *mut u16) TlsError!TestServer {
+    let ts = TestServer.{ listener: net.listen("127.0.0.1", 0)!, cfg: cfg, failures: 0 };
+    port_out.* = ts.listener.port();
+    return ts;
+}
+
+fn key_update_fails(c: *mut Conn) bool {
+    c.key_update() catch return true;
+    return false;
+}
+
+fn exchange_12(port: u16, ccfg: *ClientConfig) !void {
+    let c = connect("localhost", port, ccfg)!;
+    defer c.close();
+    @expect_eq(c.version(), VERSION_1_2);
+    @expect(c.suite.v12);
+    c.write_all("hello")!;
+    let mut buf: [8]u8 = [0; 8];
+    c.reader().read_exact(buf[..5])!;
+    @expect_eq(buf[..5], "hello");
+    let big = mem.alloc.[u8](70000)!;
+    defer mem.free(big);
+    for i in 0..big.len {
+        big[i] = @truncate(u8, i * 13);
+    }
+    c.write_all(big)!;
+    let back = mem.alloc.[u8](70000)!;
+    defer mem.free(back);
+    c.reader().read_exact(back)!;
+    @expect(@mem_eq(back, big));
+    @expect(key_update_fails(c));
+}
+
+test "TLS 1.2" {
+    let protos: [2][]u8 = ["h2", "http/1.1"];
+    for kind in @as(u32, 0)..2 {
+        let mut cert = join(TEST_CERT[..])!;
+        let mut key = join(TEST_KEY[..])!;
+        if kind == 1 {
+            mem.free(cert);
+            mem.free(key);
+            cert = join(TEST_RSA_CERT[..])!;
+            key = join(TEST_RSA_KEY[..])!;
+        }
+        defer mem.free(cert);
+        defer mem.free(key);
+        let mut scfg = ServerConfig.from_pem(cert, key)!;
+        defer scfg.deinit();
+        scfg.alpn = protos[1..];
+        let mut port: u16 = 0;
+        let mut ts = serve_once_with(&scfg, &mut port)!;
+        let mut th = thread.spawn(test_serve, &mut ts)!;
+        let mut ccfg = ClientConfig.with_roots_pem(cert)!;
+        defer ccfg.deinit();
+        ccfg.max_version = VERSION_1_2;
+        ccfg.alpn = protos[..];
+        exchange_12(port, &ccfg)!;
+        let c = connect("localhost", port, &ccfg)!;
+        @expect_eq(c.protocol(), "http/1.1");
+        c.close();
+        // by default the same pair speaks 1.3
+        ccfg.max_version = VERSION_1_3;
+        let c3 = connect("localhost", port, &ccfg)!;
+        @expect_eq(c3.version(), VERSION_1_3);
+        c3.close();
+        // a 1.3-only client and a 1.2-only one meet a server that wants 1.3
+        scfg.min_version = VERSION_1_3;
+        ccfg.max_version = VERSION_1_2;
+        @expect(fails(connect("localhost", port, &ccfg)));
+        scfg.min_version = VERSION_1_2;
+        ccfg.max_version = VERSION_1_3;
+        ccfg.min_version = VERSION_1_3;
+        let c4 = connect("localhost", port, &ccfg)!;
+        @expect_eq(c4.version(), VERSION_1_3);
+        c4.close();
+        // the wrong name is still refused over 1.2
+        ccfg.min_version = VERSION_1_2;
+        ccfg.max_version = VERSION_1_2;
+        let s5 = net.connect("127.0.0.1", port)!;
+        @expect(fails(client(s5, "other.test", &ccfg)));
+        ts.listener.close();
+        th.join();
+        @expect_eq(ts.failures, 2);
+    }
+}
+
+test "TLS 1.2 PRF" {
+    // the TLS 1.2 PRF test vector for SHA-256 (from the IETF TLS mailing
+    // list, used by Go and others)
+    let secret: [16]u8 = [0x9b, 0xbe, 0x43, 0x6b, 0xa9, 0x40, 0xf0, 0x17, 0xb1, 0x76, 0x52, 0x84, 0x9a, 0x71, 0xdb,
+                          0x35];
+    let seed: [16]u8 = [0xa0, 0xba, 0x9f, 0x93, 0x6c, 0xda, 0x31, 0x18, 0x27, 0xa6, 0xf7, 0x96, 0xff, 0xd5, 0x19, 0x8c];
+    let mut o: [100]u8 = [0; 100];
+    prf12(sha2.Algorithm.SHA256, secret[..], "test label", seed[..], o[..]);
+    let want: [16]u8 = [0xe3, 0xf2, 0x29, 0xba, 0x72, 0x7b, 0xe1, 0x7b, 0x8d, 0x12, 0x26, 0x20, 0x55, 0x7c, 0xd4, 0x53];
+    @expect_eq(o[..16], want[..]);
+    let tail: [4]u8 = [0x87, 0x34, 0x7b, 0x66];  // (computed with Python's hmac)
+    @expect_eq(o[96..], tail[..]);
+}
+
+// A ClientHello offering one suite, with server_name `name`.
+fn hello_with_name(name: []u8) TlsError!Out {
+    let mut o = out();
+    o.put8(HS_CLIENT_HELLO)!;
+    let body = o.open(3)!;
+    o.put16(0x0303)!;
+    let rnd: [32]u8 = [7; 32];
+    o.put(rnd[..])!;
+    o.put8(0)!;
+    o.put16(2)!;
+    o.put16(TLS_AES_128_GCM_SHA256)!;
+    o.put8(1)!;
+    o.put8(0)!;
+    let exts = o.open(2)!;
+    o.put16(EXT_SERVER_NAME)!;
+    let e = o.open(2)!;
+    let l = o.open(2)!;
+    o.put8(0)!;
+    o.put16(@truncate(u16, name.len))!;
+    o.put(name)!;
+    o.close(l, 2);
+    o.close(e, 2);
+    o.close(exts, 2);
+    o.close(body, 3);
+    return o;
+}
+
+fn name_refused(name: []u8) bool {
+    let mut o = hello_with_name(name) catch return false;
+    defer o.s.deinit();
+    parse_hello(o.s.bytes()) catch |e| return e == error.IllegalParameter;
+    return false;
+}
+
+test "server names" {
+    let long = mem.alloc.[u8](300)!;
+    defer mem.free(long);
+    @mem_set(long, 'a');
+    // control bytes, slashes, spaces, a NUL, an empty name, and one past 255 bytes
+    let bad: [6][]u8 = ["../../etc/passwd", "a\r\nX-Injected: 1", "a\x00b", "a b", "", long];
+    for k in @as(usize, 0)..bad.len {
+        if not name_refused(bad[k]) {
+            @expect_eq(k, 99);
+        }
+    }
+    let mut ok = hello_with_name("_a-b.example.com")!;
+    defer ok.s.deinit();
+    parse_hello(ok.s.bytes())!;
+    @expect(not name_refused(long[..255]));
+    // and the client does not send one
+    let l = net.listen("127.0.0.1", 0)!;
+    defer l.close();
+    let mut insecure = ClientConfig.insecure();
+    defer insecure.deinit();
+    let st = net.connect("127.0.0.1", l.port())!;
+    let r = client(st, "a\r\nb", &insecure);
+    _ = r catch |e| {
+        @expect(e == error.InvalidArgument);
+        return;
+    };
+    @expect(false);
+}
+
+// A server that answers the ClientHello with one ServerHello (or retry).
+nocopy struct FakeServer {
+    listener: net.TcpListener,
+    suite: u16,
+    hrr: bool,
+    group: u16,
+}
+
+fn fake_serve(f: *mut FakeServer) void {
+    let s = f.listener.accept() catch return;
+    defer s.close();
+    let mut hdr: [5]u8 = [0; 5];
+    s.reader().read_exact(hdr[..]) catch return;
+    let n = (@as(usize, hdr[3]) << 8) | @as(usize, hdr[4]);
+    let mut body: [4096]u8 = [0; 4096];
+    if (n > body.len) or (n < 40) {
+        return;
+    }
+    s.reader().read_exact(body[..n]) catch return;
+    let sl = @as(usize, body[38]);
+    let share: [32]u8 = [9; 32];
+    let mut sh = server_hello(body[39..39 + sl], f.suite, f.hrr, f.group, share[..]) catch return;
+    defer sh.s.deinit();
+    let rec: [5]u8 = [CT_HANDSHAKE, 3, 3, @truncate(u8, sh.s.len() >> 8), @truncate(u8, sh.s.len())];
+    s.write_all(rec[..]) catch return;
+    s.write_all(sh.s.bytes()) catch return;
+    // (until the client's alert and close)
+    let mut buf: [256]u8 = [0; 256];
+    loop {
+        let got = s.read(buf[..]) catch return;
+        if got == 0 {
+            return;
+        }
+    }
+}
+
+fn against_server_hello(suite: u16, hrr: bool, group: u16) error {
+    let mut f = FakeServer.{ listener: net.listen("127.0.0.1", 0) catch |e| return e, suite: suite, hrr: hrr,
+                             group: group };
+    defer f.listener.close();
+    let mut th = thread.spawn(fake_serve, &mut f) catch |e| return e;
+    defer th.join();
+    let mut insecure = ClientConfig.insecure();
+    defer insecure.deinit();
+    let st = net.connect("127.0.0.1", f.listener.port()) catch |e| return e;
+    let c = client(st, "localhost", &insecure) catch |e| return e;
+    c.close();
+    return error.Closed;
+}
+
+test "a TLS 1.3 client checks the ServerHello" {
+    // a TLS 1.2 suite in a 1.3 ServerHello, and one never offered
+    @expect(against_server_hello(ECDHE_RSA_AES_128_GCM_SHA256, false, GROUP_X25519) == error.IllegalParameter);
+    @expect(against_server_hello(0x1304, false, GROUP_X25519) == error.HandshakeFailure);
+    // a retry asking for a group the first hello already had a share for
+    @expect(against_server_hello(TLS_AES_128_GCM_SHA256, true, GROUP_X25519) == error.IllegalParameter);
+    @expect(against_server_hello(TLS_AES_128_GCM_SHA256, true, GROUP_P256) == error.IllegalParameter);
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Writes the C library's test of the _Float16 elementary functions
-(std/c/lib/math/m_f16.c), which are correctly rounded: for each function,
+(lib/c/lib/math/m_f16.c), which are correctly rounded: for each function,
 binary16 arguments (random over the function's domain, and every exponent)
 and the correctly rounded binary16 results, computed here in arbitrary
 precision (mpmath) and rounded to nearest with ties to even:
@@ -74,7 +74,7 @@ def ref(fn, xs):
 def main():
     rng = random.Random(16)
     finite = [b for b in range(65536) if (b & 0x7c00) != 0x7c00 and (b & 0x7fff) != 0]
-    L = ['/* The _Float16 elementary functions (std/c/lib/math/m_f16.c), correctly',
+    L = ['/* The _Float16 elementary functions (lib/c/lib/math/m_f16.c), correctly',
          '   rounded: their results\' bits against an arbitrary-precision reference',
          '   (written by cmd/axiom/internal/tests/tools/gen_f16_math_tests.py; do',
          '   not edit). */',

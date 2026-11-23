@@ -714,11 +714,11 @@ static void bits(volatile T *p, U *lo, U *hi)
 def main():
     rng = random.Random(20261113)
     qp = operands('q', rng, 50)
-    emit(os.path.join(OUT, 'fenv_wide_q.c'), '_Float128 (binary128, software arithmetic: std/c/rt/ldouble.ax)', '', 'q',
+    emit(os.path.join(OUT, 'fenv_wide_q.c'), '_Float128 (binary128, software arithmetic: lib/c/rt/ldouble.ax)', '', 'q',
          '_Float128', 16, qp, OPS, WIDE_GET.format(n=16), WIDE_CALLS)
     xp = operands('x', rng, 50)
     emit(os.path.join(OUT, 'fenv_wide_x.c'),
-         'long double in the x87\'s 80-bit format (x86-64 Linux; software arithmetic: std/c/rt/ldouble.ax)',
+         'long double in the x87\'s 80-bit format (x86-64 Linux; software arithmetic: lib/c/rt/ldouble.ax)',
          '/* linux-only */\n/* x86-64-only */\n', 'x', 'long double', 10, xp, OPS, WIDE_GET.format(n=10), WIDE_CALLS)
     fq = operands('q', rng, 40)
     emit(os.path.join(OUT, 'fenv_wide_fn_q.c'),
@@ -733,7 +733,7 @@ def main():
     half_ops = ['add', 'sub', 'mul', 'div', 'lt', 'eq']
     half_calls = WIDE_CALLS[:WIDE_CALLS.index('            {\n                volatile double d')] + \
         WIDE_CALLS[WIDE_CALLS.index('            {\n                volatile int c'):]
-    emit(os.path.join(OUT, 'fenv_half.c'), '_Float16 (binary16: computed in float, rounded by std/c/rt/ldouble.ax)', '',
+    emit(os.path.join(OUT, 'fenv_half.c'), '_Float16 (binary16: computed in float, rounded by lib/c/rt/ldouble.ax)', '',
          'h', '_Float16', 2, hp, half_ops, HALF_GET, half_calls)
 
 

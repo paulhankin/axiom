@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/encoding/uuid/testdata/cases.txt from Python's uuid module.
+"""Generates lib/encoding/uuid/testdata/cases.txt from Python's uuid module.
 
     cmd/axiom/internal/tests/tools/gen_uuid_tests.py
 
@@ -12,7 +12,7 @@ Lines (fields separated by single spaces):
     bad <text>                                 uuid.UUID(text) raises ValueError
 
 Python's UUID() also takes hyphens in any position; the cases here keep to
-the forms std/encoding/uuid accepts (canonical, braces, urn:uuid:, 32 hex
+the forms lib/encoding/uuid accepts (canonical, braces, urn:uuid:, 32 hex
 digits).
 """
 import hashlib
@@ -20,7 +20,7 @@ import os
 import random
 import uuid
 
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'encoding', 'uuid', 'testdata',
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'encoding', 'uuid', 'testdata',
                         'cases.txt')
 rng = random.Random(9562)
 VARIANTS = {uuid.RESERVED_NCS: 0, uuid.RFC_4122: 1, uuid.RESERVED_MICROSOFT: 2, uuid.RESERVED_FUTURE: 3}

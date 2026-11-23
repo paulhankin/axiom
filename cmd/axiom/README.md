@@ -149,8 +149,8 @@ library in `/usr/lib` (`"z"`, `"libz.1.dylib"`) or a path; each is an `LC_LOAD_D
 its symbols bound with its ordinal. Functions of another system's libraries (Windows
 DLLs here, Apple frameworks in `plink.ax`) are linked to the runtime's
 `ax_unavailable`, which reports the call: a program can support both systems and
-choose at run time (std/graphics/gpu, std/os/window). Not yet: linking C code or `-l`
-libraries, and structs passed to or returned from C functions (std/os/objc explains
+choose at run time (lib/graphics/gpu, lib/os/window). Not yet: linking C code or `-l`
+libraries, and structs passed to or returned from C functions (lib/os/objc explains
 the workarounds).
 
 `--target=x86_64-windows` (also `x86_64-pc-windows-msvc` or `windows`) builds a PE32+
@@ -198,7 +198,7 @@ x86-64 functions whose structures have 32-bit inode numbers (`stat`, `readdir`, 
 bound to their `$INODE64` variants, whose layouts are arm64's and the runtime's.
 `std/internal/runtime/darwin.ax` reads the x86-64 thread state from a signal's context;
 the frameworks' modules pass structs of more than 16 bytes on the stack there
-(std/os/objc). The CPU defaults to `x86-64-v2`.
+(lib/os/objc). The CPU defaults to `x86-64-v2`.
 
 `--target=aarch64-windows` (also `aarch64-pc-windows-msvc`) builds a PE32+ executable
 for Windows on ARM64 (machine `0xAA64`), with `plink.ax`: thunks `adrp x16; ldr x16;

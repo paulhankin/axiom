@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generates std/graphics/qr/testdata/cases.txt: QR code matrices made by
+"""Generates lib/graphics/qr/testdata/cases.txt: QR code matrices made by
 segno (https://github.com/heuer/segno; `pip install segno`), an independent
-implementation of ISO/IEC 18004, for std/graphics/qr's tests.
+implementation of ISO/IEC 18004, for lib/graphics/qr's tests.
 
-std/graphics/qr chooses its segments itself (the shortest bit stream, by
+lib/graphics/qr chooses its segments itself (the shortest bit stream, by
 dynamic programming); this script repeats that choice (segment_text below,
 a port of qr.segment_text), checks it against a brute-force search over
 every segmentation of short strings, and hands the same segments to segno,
@@ -39,7 +39,7 @@ def _write_padding_bits(buff, version, length):
 
 segno.encoder.write_padding_bits = _write_padding_bits
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'graphics', 'qr', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'graphics', 'qr', 'testdata')
 
 ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'
 

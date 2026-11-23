@@ -30,7 +30,9 @@ messages or issues; describe the code shape or the measurement in general terms.
 The repository is MIT OR Apache-2.0. Code or data ported, translated or generated from
 another project (rather than written from a specification) needs that project's license
 to allow it and an entry in `THIRD-PARTY-NOTICES.md`; don't add anything under a
-copyleft license.
+copyleft license. One recorded exception: the AAC decoder (`lib/audio/aac.ax` and
+`lib/audio/internal/aac/`) keeps its license (LGPL), and a program includes it only by
+importing it; nothing else under a copyleft license is added.
 
 ## Layout
 
@@ -40,6 +42,8 @@ copyleft license.
   compiler `AXIOM_SEED` names (`docs/bootstrap-chain.md`).
 - `std/`: the standard library; `std/internal/runtime/` is the runtime. Modules under
   an `internal/` directory may be imported only from its parent's tree (spec §4.1).
+- `lib/`: the libraries (`import "lib/..."`), beside `std/`; `lib/c/` is the C front
+  end's headers, C library and runtime.
 - `docs/spec.md`: the language specification. `examples/`: example programs and
   packages. `tools/`: editor support (`tools/editors/vscode/`).
 - `cmd/axiom/internal/tests/`: the test suite (`run.mjs`). Its `tools/` holds the

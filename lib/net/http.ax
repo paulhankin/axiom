@@ -1,0 +1,720 @@
+// =============================================================================
+// lib/net/http.ax - an HTTP/1.1 server and client, over TCP or TLS.
+//
+// A server:
+//
+//     fn hello(app: *mut App, req: *http.Request, res: *mut http.Response) !void {
+//         let name = req.query_param("name") catch "world";
+//         res.header("Content-Type", "text/plain")!;
+//         fmt.write(res.writer(), "hello, {}\n", [fmt.str(name)])!;
+//     }
+//
+//     let mut app = App.{ ... };
+//     let mut r = http.Router.[App].init(&mut app);
+//     r.get("/hello", hello)!;
+//     r.get("/users/{id}", show_user)!;      // req.param("id")
+//     r.get("/static/*", files)!;            // req.param("*")
+//     r.serve("0.0.0.0", 8080, http.Options.default())!;
+//
+// or, without a router, http.serve(hostname, port, handler, ctx, options).
+// Handlers run on a pool of threads (Options.threads), each answering one
+// request at a time; the context pointer is shared by all of them, so
+// synchronize what it points at (std/sync). A Request and everything it
+// points at lives until the handler returns. A connection holds a thread
+// only while one of its requests is answered: run()'s thread waits on the
+// others (idle, or with a request or TLS handshake still arriving), so slow
+// or idle clients cannot take the threads.
+//
+// The response body is buffered and sent with a Content-Length, unless it
+// grows past 64 KiB or the handler calls flush(), when it is streamed
+// (chunked for HTTP/1.1). A handler that fails before anything was sent
+// produces a 500 response.
+//
+// The server speaks HTTP/1.0 and 1.1 with keep-alive and pipelining,
+// chunked request bodies and `Expect: 100-continue`, and limits the size of
+// request heads and bodies (431, 413), how long they and TLS handshakes
+// may take (408), how long a connection may idle, and how many may be
+// open, in all and from one address (see Options). Before exposing it to
+// the internet at large, consider a reverse proxy all the same: it can
+// limit what one client may do across connections and addresses, and
+// handle clients that read responses slowly (a worker writing a response
+// waits up to idle_timeout_ms for each write).
+//
+// A client:
+//
+//     let mut resp = http.get("http://example.com/")!;
+//     defer resp.deinit();
+//     io.stdout().print(resp.body)!;
+//
+// https:// URLs are fetched over TLS 1.3 (lib/net/tls), checking the server's
+// certificate against the system's roots unless ClientOptions.with_tls
+// gives another configuration. The client follows up to 10 redirects
+// (with_redirects), keeps cookies in a lib/net/cookie Jar (with_cookies),
+// and goes through HTTP proxies (with_proxy; Proxy.from_env reads
+// HTTP_PROXY, HTTPS_PROXY and NO_PROXY), tunnelling https:// with CONNECT:
+//
+//     let mut jar = cookie.Jar.init();
+//     let mut px = http.Proxy.from_env()!;
+//     let opts = http.ClientOptions.default().with_cookies(&mut jar).with_proxy(&px);
+//     let mut resp = http.request("GET", url, http.no_headers(), "", opts)!; A server serves HTTPS when made with
+// server_tls (or Router.serve_tls) and a tls.ServerConfig.
+//
+// The server and the client are threads and sockets over std/net (the
+// server waits on its connections with a net.Poller), so they run natively
+// and on WebAssembly under node alike.
+// =============================================================================
+
+import "hpack.ax" as hpack;
+import "http2.ax" as http2;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/net" as net;
+import "std/str" as strs;
+import "std/time" as time;
+import "tls.ax" as tls;
+import "url.ax" as urls;
+
+import part "http/client.ax";
+import part "http/client_request.ax";
+import part "http/parse.ax";
+import part "http/server.ax";
+import part "http/server_pool.ax";
+import part "http/server_proto.ax";
+import part "http/tests.ax";
+import part "http/tests_slow.ax";
+
+pub error HttpParseError { BadRequest, BadResponse, BadUrl, HeadTooLarge, TooLarge, InvalidHeader, InvalidArgument,
+                           Unsupported, InvalidUrl, InvalidEscape, NotAbsolute, InvalidNumber, InvalidUtf8, BadFormat,
+                           InvalidCookie, DecodeError, Overflow, Negative, InvalidBase64, UnexpectedTag, Corrupt }
+
+pub error HttpTransportError { Closed, NetError, TimedOut, WouldBlock, ConnectionRefused, AddressInUse, InvalidAddress,
+                               IoError, EndOfStream, NoSpaceLeft, ProxyRefused, ProtocolError, StreamReset,
+                               FlowControlError, FrameSizeError, CompressionError, StreamClosed, GoAway, TooBig,
+                               ListTooLarge }
+
+pub error HttpTlsError { HandshakeFailure, UnexpectedMessage, BadRecordMac, RecordOverflow, ProtocolVersion,
+                         IllegalParameter, AlertReceived, BadCertificate, NoCertificate, RandomFailed, InvalidKey,
+                         InvalidPoint, InvalidCertificate, AuthFailed, InvalidLength, InvalidPem, MessageTooLong,
+                         WeakKey, UnsupportedAlgorithm, DivisionByZero, UnknownAuthority, Expired, NotYetValid,
+                         HostnameMismatch, NotInvertible, BadSignature, NotCA, IncompatibleUsage, NameConstraint,
+                         UnhandledCriticalExtension, Distrusted, PathTooLong }
+
+pub error HttpServerError { OutOfMemory, NotFound, Empty, Done, PermissionDenied, NotADirectory, Failed }
+
+pub error HttpError = HttpParseError | HttpTransportError | HttpTlsError | HttpServerError;
+
+pub struct Header {
+    pub name: []u8,
+    pub value: []u8,
+}
+
+/// Case-insensitive header lookup: the first header called `name`, or .none.
+pub fn find_header(headers: []Header, name: []u8) ?[]u8 {
+    for h in headers {
+        if strs.eq_ignore_case(h.name, name) {
+            return h.value;
+        }
+    }
+    return .none;
+}
+
+/// Whether a comma-separated header value (such as Connection) contains
+/// `token`, ignoring case.
+fn has_token(value: []u8, token: []u8) bool {
+    let mut it = strs.split(value, ",");
+    while let .some(t) = it.next() {
+        if strs.eq_ignore_case(strs.trim(t), token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_header(headers: []Header, name: []u8) bool {
+    _ = find_header(headers, name) ?? return false;
+    return true;
+}
+
+/// The standard reason phrase for a status code ("" if unknown).
+pub fn reason_phrase(status: u16) []u8 {
+    match status {
+        100  => { return "Continue"; }
+        101  => { return "Switching Protocols"; }
+        200  => { return "OK"; }
+        201  => { return "Created"; }
+        202  => { return "Accepted"; }
+        204  => { return "No Content"; }
+        206  => { return "Partial Content"; }
+        301  => { return "Moved Permanently"; }
+        302  => { return "Found"; }
+        303  => { return "See Other"; }
+        304  => { return "Not Modified"; }
+        307  => { return "Temporary Redirect"; }
+        308  => { return "Permanent Redirect"; }
+        400  => { return "Bad Request"; }
+        401  => { return "Unauthorized"; }
+        403  => { return "Forbidden"; }
+        404  => { return "Not Found"; }
+        405  => { return "Method Not Allowed"; }
+        408  => { return "Request Timeout"; }
+        409  => { return "Conflict"; }
+        411  => { return "Length Required"; }
+        413  => { return "Content Too Large"; }
+        414  => { return "URI Too Long"; }
+        415  => { return "Unsupported Media Type"; }
+        422  => { return "Unprocessable Content"; }
+        429  => { return "Too Many Requests"; }
+        431  => { return "Request Header Fields Too Large"; }
+        500  => { return "Internal Server Error"; }
+        501  => { return "Not Implemented"; }
+        502  => { return "Bad Gateway"; }
+        503  => { return "Service Unavailable"; }
+        504  => { return "Gateway Timeout"; }
+        505  => { return "HTTP Version Not Supported"; }
+        else => { return ""; }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Percent-encoding
+// -----------------------------------------------------------------------------
+
+/// Decodes %XX escapes (and, if `plus_space`, '+' as a space, as in query
+/// strings) into out, which must be at least as long as s. Fails with
+/// BadRequest on a malformed escape. (lib/net/url has the rest of
+/// percent-encoding.)
+pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) HttpParseError![]u8 {
+    return urls.percent_decode(s, out, plus_space) catch return error.BadRequest;
+}
+
+/// Writes s with everything but unreserved characters (letters, digits and
+/// -._~) percent-encoded, for use in a path segment or query value.
+pub fn percent_encode(w: io.Writer, s: []u8) !void {
+    urls.encode_to(w, s, urls.Component.COMPONENT)!;
+}
+
+/// The value of `name` in a query string ("a=1&b=x%20y"), still encoded.
+pub fn query_raw(query: []u8, name: []u8) ?[]u8 {
+    return urls.query_value(query, name);
+}
+
+/// A connection, plain or TLS.
+/// A connection, plain or over TLS (for lib/net/websocket, and upgraded
+/// connections).
+pub struct Transport {
+    pub tcp: net.TcpStream,
+    tls: *mut tls.Conn,  // when secure
+    secure: bool,
+
+    pub fn plain(s: net.TcpStream) Transport {
+        return Transport.{ tcp: s, tls: @ptr_from_int(*mut tls.Conn, 8), secure: false };
+    }
+
+    pub fn over_tls(c: *mut tls.Conn) Transport {
+        return Transport.{ tcp: c.stream, tls: c, secure: true };
+    }
+
+    pub fn read(self: Transport, buf: []mut u8) HttpError!usize {
+        if self.secure {
+            return self.tls.read(buf);
+        }
+        return self.tcp.read(buf);
+    }
+
+    pub fn write_all(self: Transport, bytes: []u8) HttpError!void {
+        if self.secure {
+            return self.tls.write_all(bytes);
+        }
+        let mut rest = bytes;
+        while rest.len > 0 {
+            let n = self.tcp.write(rest)!;
+            if n == 0 {
+                return error.IoError;
+            }
+            rest = rest[n..];
+        }
+    }
+
+    pub fn close(self: Transport) void {
+        if self.secure {
+            self.tls.close();
+        } else {
+            self.tcp.close();
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Requests
+// -----------------------------------------------------------------------------
+
+pub struct Param {
+    name: []u8,
+    value: []u8,
+}
+
+const MAX_PARAMS: usize = 8;
+
+/// Memory that lives until the current request is answered, and the route
+/// parameters.
+struct Scratch {
+    blocks: vec.Vec.[[]mut u8],
+    params: [8]Param,
+    nparams: usize,
+
+    fn alloc(self: *mut Scratch, n: usize) { OutOfMemory }![]mut u8 {
+        let b = mem.alloc.[u8](n)!;
+        self.blocks.push(b) catch |e| {
+            mem.free(b);
+            return e;
+        };
+        return b;
+    }
+
+    fn clear(self: *mut Scratch) void {
+        for b in self.blocks.items() {
+            mem.free(b);
+        }
+        self.blocks.clear();
+        self.nparams = 0;
+    }
+}
+
+fn new_scratch() Scratch {
+    return Scratch.{ blocks: vec.Vec.[[]mut u8].init(), params: [Param.{ name: "", value: "" }; 8], nparams: 0 };
+}
+
+/// HTTP versions of a request (HTTP/2 requests are served as HTTP_1_1).
+pub enum Version: u8 {
+    HTTP_1_0 = 0,
+    HTTP_1_1 = 1,
+}
+
+pub struct Request {
+    pub method: []u8,  // "GET", "POST", ...
+    target: []u8,      // as sent: "/search?q=x"
+    path: []u8,        // the target before any '?', still percent-encoded
+    query: []u8,       // the target after '?', or ""
+    version: Version,
+    headers: []Header,
+    pub body: []u8,
+    scratch: *mut Scratch,
+
+    /// The first header called `name` (case-insensitive), or .none.
+    pub fn header(self: *Request, name: []u8) ?[]u8 {
+        return find_header(self.headers, name);
+    }
+
+    /// A route parameter, such as "id" for the pattern "/users/{id}", or "*"
+    /// for the rest of the path after a trailing "/*". Percent-decoded; a
+    /// path whose parameter would hold NUL, a ".." segment, "\" or ":" (or,
+    /// except in "*", "/") matches no route.
+    pub fn param(self: *Request, name: []u8) { NotFound }![]u8 {
+        let sc = self.scratch;
+        for i in 0..sc.nparams {
+            if @mem_eq(sc.params[i].name, name) {
+                return sc.params[i].value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    // Scratch belongs to the connection slot (one worker thread per request)
+    // and backs route params and decoded query/path slices while keeping
+    // Request itself read-only to handlers.
+    fn scratch_mut(self: *Request) *mut Scratch {
+        return @ptr_from_int(*mut Scratch, @int_from_ptr(self.scratch));
+    }
+
+    /// The decoded value of `name` in the query string, or NotFound.
+    pub fn query_param(self: *Request, name: []u8) HttpError![]u8 {
+        let raw = query_raw(self.query, name) ?? return error.NotFound;
+        let out = self.scratch_mut().alloc(raw.len)!;
+        return percent_decode(raw, out, true);
+    }
+
+    /// The decoded path.
+    pub fn decoded_path(self: *Request) HttpError![]u8 {
+        let out = self.scratch_mut().alloc(self.path.len)!;
+        return percent_decode(self.path, out, false);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Responses
+// -----------------------------------------------------------------------------
+
+/// Bodies bigger than this are streamed rather than buffered.
+const STREAM_THRESHOLD: usize = 65536;
+
+pub struct Response {
+    stream: Transport,
+    status: u16,
+    head: strs.String,  // "Name: value\r\n" for each header the handler set
+    body: strs.String,  // buffered, not yet sent
+    version: Version,
+    head_only: bool,  // a HEAD request: no body is sent
+    keep_alive: bool,
+    started: bool,  // the status line and headers have been sent
+    chunked: bool,
+    has_type: bool,
+    upgraded: bool,       // the handler took the connection over
+    h2: *mut http2.Conn,  // for HTTP/2 (is_h2): the connection and stream
+    h2_id: u32,
+    is_h2: bool,
+
+    pub fn set_status(self: *mut Response, status: u16) void {
+        self.status = status;
+    }
+
+    /// Adds a header. Content-Length, Transfer-Encoding and Date are set by
+    /// the server; "Connection: close" ends the connection after this
+    /// response. Fails if called after the head was sent, or if the name or
+    /// value is malformed.
+    pub fn header(self: *mut Response, name: []u8, value: []u8) { InvalidHeader, OutOfMemory }!void {
+        if self.started or (name.len == 0) {
+            return error.InvalidHeader;
+        }
+        for c in name {
+            if not is_token_char(c) {
+                return error.InvalidHeader;
+            }
+        }
+        for c in value {
+            if (c == '\r') or (c == '\n') or (c == 0) {
+                return error.InvalidHeader;
+            }
+        }
+        if strs.eq_ignore_case(name, "Content-Length") or strs.eq_ignore_case(name, "Transfer-Encoding") {
+            return error.InvalidHeader;
+        }
+        if strs.eq_ignore_case(name, "Content-Type") {
+            self.has_type = true;
+        }
+        if strs.eq_ignore_case(name, "Connection") and has_token(value, "close") {
+            self.keep_alive = false;
+            return;
+        }
+        self.head.push_str(name)!;
+        self.head.push_str(": ")!;
+        self.head.push_str(value)!;
+        self.head.push_str("\r\n")!;
+    }
+
+    /// Appends to the body.
+    pub fn write(self: *mut Response, bytes: []u8) HttpError!void {
+        self.body.push_str(bytes)!;
+        if self.body.len() >= STREAM_THRESHOLD {
+            self.flush()!;
+        }
+    }
+
+    /// A Writer for the body (for fmt.write, json.Writer, ...).
+    pub fn writer(self: *mut Response) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: response_write };
+    }
+
+    /// Sets the status and a text/plain body in one go.
+    pub fn text(self: *mut Response, status: u16, body: []u8) HttpError!void {
+        self.status = status;
+        if not self.has_type {
+            self.header("Content-Type", "text/plain; charset=utf-8")!;
+        }
+        self.write(body)!;
+    }
+
+    /// Sends what is buffered now and streams the rest of the body.
+    pub fn flush(self: *mut Response) HttpError!void {
+        if self.is_h2 {
+            if not self.started {
+                self.h2_head(false, 0, false)!;
+            }
+            if (self.body.len() > 0) and not self.head_only and not self.no_body() {
+                self.h2.send_data(self.h2_id, self.body.bytes(), false) catch |e| return to_http_error(e);
+            }
+            self.body.clear();
+            return;
+        }
+        let no_body = self.no_body();
+        if not self.started {
+            if no_body {
+                // (no body, so no framing for one: Content-Length or chunked
+                // would make the client read the next response as a body)
+            } else if self.version == Version.HTTP_1_0 {
+                // no chunked encoding in HTTP/1.0: the body ends at close
+                self.keep_alive = false;
+            } else {
+                self.chunked = true;
+            }
+            self.send_head(0, false, "")!;
+        }
+        if (self.body.len() == 0) or self.head_only or no_body {
+            self.body.clear();
+            return;
+        }
+        if self.chunked {
+            // one write per chunk: small separate writes stall on Nagle's
+            // algorithm and delayed ACKs
+            let mut b: [20]u8 = [0; 20];
+            let size = fmt.format_uint(b[..18], @as(u64, self.body.len()), 16, false);
+            let mut chunk = strs.String.with_capacity(self.body.len() + 24)!;
+            defer chunk.deinit();
+            chunk.push_str(size)!;
+            chunk.push_str("\r\n")!;
+            chunk.push_str(self.body.bytes())!;
+            chunk.push_str("\r\n")!;
+            self.stream.write_all(chunk.bytes())!;
+        } else {
+            self.stream.write_all(self.body.bytes())!;
+        }
+        self.body.clear();
+    }
+
+    /// Takes the connection over for another protocol (as lib/net/websocket
+    /// does): sends "101 Switching Protocols" with the headers set so far,
+    /// and returns the connection. The handler then speaks the new protocol
+    /// on it until it returns, when the server closes it.
+    pub fn upgrade(self: *mut Response) HttpError!Transport {
+        if self.started or self.is_h2 {
+            return error.InvalidHeader;
+        }
+        self.status = 101;
+        self.keep_alive = true;
+        self.send_head(0, false, "")!;
+        self.upgraded = true;
+        return self.stream;
+    }
+
+    /// Sends the status line and headers, followed by `body` in the same
+    /// write.
+    fn send_head(self: *mut Response, length: usize, with_length: bool, body: []u8) HttpError!void {
+        let mut h = strs.String.with_capacity(256 + self.head.len() + body.len)!;
+        defer h.deinit();
+        if self.version == Version.HTTP_1_0 {
+            h.push_str("HTTP/1.0 ")!;
+        } else {
+            h.push_str("HTTP/1.1 ")!;
+        }
+        let mut sb: [20]u8 = [0; 20];
+        h.push_str(io.fmt_u64(sb[..], @as(u64, self.status)))!;
+        h.push(' ')!;
+        h.push_str(reason_phrase(self.status))!;
+        h.push_str("\r\nDate: ")!;
+        let mut db: [32]u8 = [0; 32];
+        h.push_str(time.now().format_http(db[..]))!;
+        h.push_str("\r\n")!;
+        h.push_str(self.head.bytes())!;
+        if (not self.has_type) and ((length > 0) or self.chunked) {
+            h.push_str("Content-Type: text/plain; charset=utf-8\r\n")!;
+        }
+        if with_length and not self.no_body() {
+            h.push_str("Content-Length: ")!;
+            h.push_str(io.fmt_u64(sb[..], @as(u64, length)))!;
+            h.push_str("\r\n")!;
+        }
+        if self.chunked {
+            h.push_str("Transfer-Encoding: chunked\r\n")!;
+        }
+        if not self.keep_alive {
+            h.push_str("Connection: close\r\n")!;
+        } else if self.version == Version.HTTP_1_0 {
+            h.push_str("Connection: keep-alive\r\n")!;
+        }
+        h.push_str("\r\n")!;
+        h.push_str(body)!;
+        self.started = true;
+        self.stream.write_all(h.bytes())!;
+    }
+
+    // HTTP/2: the status and headers as a HEADERS frame (the connection's
+    // own headers do not exist in HTTP/2, and names are lower-case)
+    fn h2_head(self: *mut Response, with_length: bool, length: usize, end: bool) HttpError!void {
+        let mut store = strs.String.init();
+        defer store.deinit();
+        let mut spans = vec.Vec.[[4]usize].init();
+        defer spans.deinit();
+        let mut sb: [8]u8 = [0; 8];
+        let st = fmt.format_int(sb[..], self.status);
+        store.push_str(":status")!;
+        store.push_str(st)!;
+        spans.push([0, 7, 7, st.len])!;
+        let mut lines = strs.lines(self.head.bytes());
+        while let .some(line) = lines.next() {
+            let c = strs.index_of(line, ": ") ?? continue;
+            let name = line[..c];
+            if strs.eq_ignore_case(name, "Connection") or strs.eq_ignore_case(name, "Keep-Alive") or
+               strs.eq_ignore_case(name, "Upgrade") or strs.eq_ignore_case(name, "Transfer-Encoding") {
+                continue;
+            }
+            let na = store.len();
+            for ch in name {
+                store.push(strs.to_lower_byte(ch))!;
+            }
+            let va = store.len();
+            store.push_str(strs.trim_right(line[c + 2..]))!;
+            spans.push([na, name.len, va, store.len() - va])!;
+        }
+        let mut db: [32]u8 = [0; 32];
+        let date = time.now().format_http(db[..]);
+        let da = store.len();
+        store.push_str("date")!;
+        store.push_str(date)!;
+        spans.push([da, 4, da + 4, date.len])!;
+        if not self.has_type and (with_length and (length > 0)) {
+            let ta = store.len();
+            store.push_str("content-typetext/plain; charset=utf-8")!;
+            spans.push([ta, 12, ta + 12, 25])!;
+        }
+        if with_length {
+            let mut lb: [24]u8 = [0; 24];
+            let l = fmt.format_int(lb[..], length);
+            let la = store.len();
+            store.push_str("content-length")!;
+            store.push_str(l)!;
+            spans.push([la, 14, la + 14, l.len])!;
+        }
+        let mut hs = vec.Vec.[hpack.Header].init();
+        defer hs.deinit();
+        let b = store.bytes();
+        for sp in spans.items() {
+            hs.push(hpack.Header.{ name: b[sp[0]..sp[0] + sp[1]], value: b[sp[2]..sp[2] + sp[3]] })!;
+        }
+        self.h2.send_headers(self.h2_id, hs.items(), end)!;
+        self.started = true;
+    }
+
+    // Whether the status is one whose responses have no body (1xx, 204
+    // and 304: RFC 9110 section 6.4.1).
+    fn no_body(self: *Response) bool {
+        return ((self.status >= 100) and (self.status < 200)) or (self.status == 204) or (self.status == 304);
+    }
+
+    /// Completes the response after the handler returns.
+    fn finish(self: *mut Response) HttpError!void {
+        if self.is_h2 {
+            let no_body = self.no_body() or self.head_only;
+            if not self.started {
+                let n = self.body.len();
+                self.h2_head(true, n, no_body or (n == 0))!;
+                if not no_body and (n > 0) {
+                    self.h2.send_data(self.h2_id, self.body.bytes(), true) catch |e| return to_http_error(e);
+                }
+            } else {
+                let mut rest: []u8 = "";
+                if not no_body {
+                    rest = self.body.bytes();
+                }
+                self.h2.send_data(self.h2_id, rest, true) catch |e| return to_http_error(e);
+            }
+            self.body.clear();
+            return;
+        }
+        if not self.started {
+            let n = self.body.len();
+            let mut body: []u8 = "";
+            if (not self.head_only) and not self.no_body() {
+                body = self.body.bytes();
+            }
+            self.send_head(n, true, body)!;
+            self.body.clear();
+            return;
+        }
+        self.flush()!;
+        if self.chunked and not self.head_only {
+            self.stream.write_all("0\r\n\r\n")!;
+        }
+    }
+}
+
+fn to_http_error(e: error) HttpError {
+    match e {
+        error.BadRequest                 => { return error.BadRequest; }
+        error.BadResponse                => { return error.BadResponse; }
+        error.BadUrl                     => { return error.BadUrl; }
+        error.HeadTooLarge               => { return error.HeadTooLarge; }
+        error.TooLarge                   => { return error.TooLarge; }
+        error.InvalidHeader              => { return error.InvalidHeader; }
+        error.InvalidArgument            => { return error.InvalidArgument; }
+        error.Unsupported                => { return error.Unsupported; }
+        error.InvalidUrl                 => { return error.InvalidUrl; }
+        error.InvalidEscape              => { return error.InvalidEscape; }
+        error.NotAbsolute                => { return error.NotAbsolute; }
+        error.InvalidNumber              => { return error.InvalidNumber; }
+        error.InvalidUtf8                => { return error.InvalidUtf8; }
+        error.BadFormat                  => { return error.BadFormat; }
+        error.InvalidCookie              => { return error.InvalidCookie; }
+        error.DecodeError                => { return error.DecodeError; }
+        error.Overflow                   => { return error.Overflow; }
+        error.Negative                   => { return error.Negative; }
+        error.InvalidBase64              => { return error.InvalidBase64; }
+        error.UnexpectedTag              => { return error.UnexpectedTag; }
+        error.Corrupt                    => { return error.Corrupt; }
+        error.Closed                     => { return error.Closed; }
+        error.NetError                   => { return error.NetError; }
+        error.TimedOut                   => { return error.TimedOut; }
+        error.WouldBlock                 => { return error.WouldBlock; }
+        error.ConnectionRefused          => { return error.ConnectionRefused; }
+        error.AddressInUse               => { return error.AddressInUse; }
+        error.InvalidAddress             => { return error.InvalidAddress; }
+        error.IoError                    => { return error.IoError; }
+        error.EndOfStream                => { return error.EndOfStream; }
+        error.NoSpaceLeft                => { return error.NoSpaceLeft; }
+        error.ProxyRefused               => { return error.ProxyRefused; }
+        error.ProtocolError              => { return error.ProtocolError; }
+        error.StreamReset                => { return error.StreamReset; }
+        error.FlowControlError           => { return error.FlowControlError; }
+        error.FrameSizeError             => { return error.FrameSizeError; }
+        error.CompressionError           => { return error.CompressionError; }
+        error.StreamClosed               => { return error.StreamClosed; }
+        error.GoAway                     => { return error.GoAway; }
+        error.TooBig                     => { return error.TooBig; }
+        error.ListTooLarge               => { return error.ListTooLarge; }
+        error.HandshakeFailure           => { return error.HandshakeFailure; }
+        error.UnexpectedMessage          => { return error.UnexpectedMessage; }
+        error.BadRecordMac               => { return error.BadRecordMac; }
+        error.RecordOverflow             => { return error.RecordOverflow; }
+        error.ProtocolVersion            => { return error.ProtocolVersion; }
+        error.IllegalParameter           => { return error.IllegalParameter; }
+        error.AlertReceived              => { return error.AlertReceived; }
+        error.BadCertificate             => { return error.BadCertificate; }
+        error.NoCertificate              => { return error.NoCertificate; }
+        error.RandomFailed               => { return error.RandomFailed; }
+        error.InvalidKey                 => { return error.InvalidKey; }
+        error.InvalidPoint               => { return error.InvalidPoint; }
+        error.InvalidCertificate         => { return error.InvalidCertificate; }
+        error.AuthFailed                 => { return error.AuthFailed; }
+        error.InvalidLength              => { return error.InvalidLength; }
+        error.InvalidPem                 => { return error.InvalidPem; }
+        error.MessageTooLong             => { return error.MessageTooLong; }
+        error.WeakKey                    => { return error.WeakKey; }
+        error.UnsupportedAlgorithm       => { return error.UnsupportedAlgorithm; }
+        error.DivisionByZero             => { return error.DivisionByZero; }
+        error.UnknownAuthority           => { return error.UnknownAuthority; }
+        error.Expired                    => { return error.Expired; }
+        error.NotYetValid                => { return error.NotYetValid; }
+        error.HostnameMismatch           => { return error.HostnameMismatch; }
+        error.NotInvertible              => { return error.NotInvertible; }
+        error.BadSignature               => { return error.BadSignature; }
+        error.NotCA                      => { return error.NotCA; }
+        error.IncompatibleUsage          => { return error.IncompatibleUsage; }
+        error.NameConstraint             => { return error.NameConstraint; }
+        error.UnhandledCriticalExtension => { return error.UnhandledCriticalExtension; }
+        error.Distrusted                 => { return error.Distrusted; }
+        error.PathTooLong                => { return error.PathTooLong; }
+        error.OutOfMemory                => { return error.OutOfMemory; }
+        error.NotFound                   => { return error.NotFound; }
+        error.Empty                      => { return error.Empty; }
+        error.Done                       => { return error.Done; }
+        error.PermissionDenied           => { return error.PermissionDenied; }
+        error.NotADirectory              => { return error.NotADirectory; }
+        else                             => { return error.Failed; }
+    }
+}
+
+fn response_write(ctx: *mut void, bytes: []u8) !usize {
+    let r = @ptr_cast(*mut Response, ctx);
+    r.write(bytes)!;
+    return bytes.len;
+}

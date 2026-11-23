@@ -90,10 +90,10 @@ def make_seeds(exe):
     # the same fonts for shaping
     shutil.copytree(fonts, os.path.join(seeds, 'shape'), dirs_exist_ok=True)
     arch = os.path.join(seeds, 'archive')
-    for f in sorted(glob.glob(os.path.join(ROOT, 'std', 'archive', 'zip', 'testdata', '*.zip')))[:6]:
+    for f in sorted(glob.glob(os.path.join(ROOT, 'lib', 'archive', 'zip', 'testdata', '*.zip')))[:6]:
         if os.path.getsize(f) < 30000:
             shutil.copy(f, arch)
-    for f in sorted(glob.glob(os.path.join(ROOT, 'std', 'graphics', 'svg', 'testdata', '*.svg')))[:20]:
+    for f in sorted(glob.glob(os.path.join(ROOT, 'lib', 'graphics', 'svg', 'testdata', '*.svg')))[:20]:
         shutil.copy(f, os.path.join(seeds, 'svg'))
     certs = os.path.join(seeds, 'x509')
     os.makedirs(certs, exist_ok=True)

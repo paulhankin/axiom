@@ -1,0 +1,557 @@
+// =============================================================================
+// lib/graphics/pdf/read/xref.ax - Cross-reference tables and streams, damaged
+// file repair, indirect object resolution, object streams, and the page tree,
+// part of lib/graphics/pdf/read.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Cross-reference tables, repair, and document loading
+// -----------------------------------------------------------------------------
+
+struct Entry {
+    kind: u8,    // 0 free, 1 at an offset, 2 in an object stream
+    off: u64,    // the offset, or the object stream's number
+    index: u32,  // the index in the object stream
+}
+
+nocopy struct ObjStm {
+    data: []u8,
+    offsets: vec.Vec.[u64],  // where each object starts in data
+}
+
+fn read_load(r: *mut Reader) ReadError!void {
+    if not strs.contains(r.data[..@min(r.data.len, 1024)], "%PDF-") {
+        return error.Corrupt;
+    }
+    let ok = read_xref_chain(r) catch false;
+    if not ok or (r.trailer.get("Root").is_null()) {
+        reconstruct(r)!;
+    }
+    if not r.trailer.get("Encrypt").is_null() {
+        return error.Encrypted;
+    }
+    load_pages(r) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        // a damaged page tree: try again from a rebuilt table
+        r.pages.clear();
+        reconstruct(r)!;
+        load_pages(r)!;
+    };
+}
+
+fn set_entry(r: *mut Reader, num: usize, e: Entry) ReadError!void {
+    // (a file of n bytes holds fewer than n objects: a larger number,
+    // from a damaged table or a stray "N 0 obj", would only grow the
+    // tables, to 2^23 entries)
+    if (num >= (1 << 23)) or (num > r.data.len) {
+        return;
+    }
+    while r.xref.len() <= num {
+        r.xref.push(Entry.{ kind: 0, off: 0, index: 0 })!;
+        r.cache.push(Object.Null)!;
+        r.state.push(0)!;
+    }
+    r.xref.set(num, e);
+}
+
+/// Sets an entry unless a newer section already did.
+// (num is a u64, so that a subsection starting past 2^32 cannot wrap to
+// low object numbers where usize is 32 bits)
+fn add_entry(r: *mut Reader, num64: u64, e: Entry, seen: *mut vec.Vec.[u8]) ReadError!void {
+    if num64 >= (1 << 23) {
+        return;
+    }
+    let num = @truncate(usize, num64);
+    while seen.len() <= num {
+        seen.push(0)!;
+    }
+    if seen.get(num) != 0 {
+        return;
+    }
+    seen.set(num, 1);
+    set_entry(r, num, e)!;
+}
+
+/// Follows startxref and the /Prev chain; false if the file has no usable table.
+fn read_xref_chain(r: *mut Reader) ReadError!bool {
+    let d = r.data;
+    let tail = d.len - @min(d.len, 2048);
+    let sx = strs.last_index_of(d[tail..], "startxref") ?? return false;
+    let mut iv: i64 = 0;
+    let mut fv: f64 = 0.0;
+    let mut isint = false;
+    let p = skip_white(d, tail + sx + 9);
+    if scan_number(d, p, &mut iv, &mut fv, &mut isint) == p {
+        return false;
+    }
+    let mut seen = vec.Vec.[u8].init();
+    defer seen.deinit();
+    let mut visited = vec.Vec.[i64].init();
+    defer visited.deinit();
+    let mut off = iv;
+    let mut first = true;
+    while (off >= 0) and (@as(u64, @bit_cast(u64, off)) < @as(u64, d.len)) and (visited.len() < 256) {
+        for v in visited.items() {
+            if v == off {
+                return not first;
+            }
+        }
+        visited.push(off)!;
+        let o = @truncate(usize, @bit_cast(u64, off));
+        let mut trailer = empty_dict();
+        let q = skip_white(d, o);
+        if strs.starts_with(d[q..], "xref") {
+            trailer = xref_table(r, q + 4, &mut seen)!;
+            // a hybrid file's cross-reference stream
+            let xs = trailer.get("XRefStm").as_int() catch -1;
+            if (xs > 0) and (xs < @as(i64, @bit_cast(i64, @as(u64, d.len)))) {
+                _ = xref_stream(r, @truncate(usize, @bit_cast(u64, xs)), &mut seen) catch empty_dict();
+            }
+        } else {
+            trailer = xref_stream(r, q, &mut seen)!;
+        }
+        if first {
+            r.trailer = trailer;
+            first = false;
+        }
+        off = trailer.get("Prev").as_int() catch -1;
+    }
+    return not first;
+}
+
+fn xref_table(r: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) ReadError!Dict {
+    let d = r.data;
+    let mut i = p;
+    while true {
+        i = skip_white(d, i);
+        if strs.starts_with(d[i..], "trailer") {
+            let mut lx = Lexer.{ s: d, pos: i + 7 };
+            let t = parse_obj(r, &mut lx, 0)!;
+            return t.as_dict();
+        }
+        let mut start: i64 = 0;
+        let mut count: i64 = 0;
+        let mut fv: f64 = 0.0;
+        let mut isint = false;
+        let a = scan_number(d, i, &mut start, &mut fv, &mut isint);
+        if a == i {
+            return error.Corrupt;
+        }
+        let b0 = skip_white(d, a);
+        let b = scan_number(d, b0, &mut count, &mut fv, &mut isint);
+        if (b == b0) or (start < 0) or (count < 0) or (count > (1 << 23)) {
+            return error.Corrupt;
+        }
+        i = b;
+        for k in 0..@truncate(usize, @bit_cast(u64, count)) {
+            i = skip_white(d, i);
+            let mut off: i64 = 0;
+            let mut gen: i64 = 0;
+            let e1 = scan_number(d, i, &mut off, &mut fv, &mut isint);
+            let g0 = skip_white(d, e1);
+            let e2 = scan_number(d, g0, &mut gen, &mut fv, &mut isint);
+            let t0 = skip_white(d, e2);
+            if (e1 == i) or (e2 == g0) or (t0 >= d.len) {
+                return error.Corrupt;
+            }
+            let kind = d[t0];
+            i = t0 + 1;
+            let num = @bit_cast(u64, start) + @as(u64, k);
+            if (kind == 'n') and (off > 0) {
+                add_entry(r, num, Entry.{ kind: 1, off: @bit_cast(u64, off), index: 0 }, seen)!;
+            } else {
+                add_entry(r, num, Entry.{ kind: 0, off: 0, index: 0 }, seen)!;
+            }
+        }
+    }
+    return error.Corrupt;
+}
+
+fn xref_stream(r: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) ReadError!Dict {
+    let mut lx = Lexer.{ s: r.data, pos: p };
+    let obj = parse_indirect(r, &mut lx)!;
+    let st = obj.as_stream()!;
+    let data = decode_stream(r, st)!;
+    let w = st.dict.get("W").as_array()!;
+    if w.len < 3 {
+        return error.Corrupt;
+    }
+    let mut ws: [3]usize = [0, 0, 0];
+    for k in @as(usize, 0)..3 {
+        let v = w[k].as_int()!;
+        if (v < 0) or (v > 8) {
+            return error.Corrupt;
+        }
+        ws[k] = @truncate(usize, @bit_cast(u64, v));
+    }
+    let row = ws[0] + ws[1] + ws[2];
+    if row == 0 {
+        return error.Corrupt;
+    }
+    let size = st.dict.get("Size").as_int() catch 0;
+    let idx = st.dict.get("Index");
+    let mut ranges = vec.Vec.[i64].init();
+    defer ranges.deinit();
+    match idx {
+        .Array(a) => {
+            for v in a {
+                ranges.push(v.as_int()!)!;
+            }
+        }
+        else => {
+            ranges.push(0)!;
+            ranges.push(size)!;
+        }
+    }
+    let mut pos: usize = 0;
+    let mut k: usize = 0;
+    while k + 1 < ranges.len() {
+        let start = ranges.get(k);
+        let count = ranges.get(k + 1);
+        if (start < 0) or (count < 0) or (count > (1 << 23)) {
+            return error.Corrupt;
+        }
+        for j in 0..@truncate(usize, @bit_cast(u64, count)) {
+            if pos + row > data.len {
+                return st.dict;
+            }
+            let mut f: [3]u64 = [1, 0, 0];
+            let mut q = pos;
+            for c in @as(usize, 0)..3 {
+                if ws[c] > 0 {
+                    let mut v: u64 = 0;
+                    for _b in 0..ws[c] {
+                        v = (v << 8) | @as(u64, data[q]);
+                        q += 1;
+                    }
+                    f[c] = v;
+                }
+            }
+            pos += row;
+            let num = @bit_cast(u64, start) + @as(u64, j);
+            if f[0] == 1 {
+                add_entry(r, num, Entry.{ kind: 1, off: f[1], index: 0 }, seen)!;
+            } else if f[0] == 2 {
+                add_entry(r, num, Entry.{ kind: 2, off: f[1], index: @truncate(u32, f[2]) }, seen)!;
+            } else {
+                add_entry(r, num, Entry.{ kind: 0, off: 0, index: 0 }, seen)!;
+            }
+        }
+        k += 2;
+    }
+    return st.dict;
+}
+
+/// Rebuilds the table from "n g obj" markers, and the trailer from the
+/// last trailer dictionary or the catalog.
+fn reconstruct(r: *mut Reader) ReadError!void {
+    let d = r.data;
+    r.xref.clear();
+    r.cache.clear();
+    r.state.clear();
+    let mut i: usize = 0;
+    let mut last_trailer: usize = 0;
+    while i + 3 < d.len {
+        let o = strs.index_of_from(d, "obj", i) ?? break;
+        i = o + 3;
+        if strs.starts_with(d[o..], "obj") and (o >= 4) {
+            // walk back over "n g "
+            let mut j = o;
+            while (j > 0) and is_white(d[j - 1]) {
+                j -= 1;
+            }
+            let ge = j;
+            while (j > 0) and (d[j - 1] >= '0') and (d[j - 1] <= '9') {
+                j -= 1;
+            }
+            if (j == ge) or (j == 0) or not is_white(d[j - 1]) {
+                continue;
+            }
+            while (j > 0) and is_white(d[j - 1]) {
+                j -= 1;
+            }
+            let ne = j;
+            while (j > 0) and (d[j - 1] >= '0') and (d[j - 1] <= '9') {
+                j -= 1;
+            }
+            if (j == ne) or ((j > 0) and is_regular(d[j - 1])) {
+                continue;
+            }
+            let mut num: i64 = 0;
+            let mut fv: f64 = 0.0;
+            let mut isint = false;
+            _ = scan_number(d, j, &mut num, &mut fv, &mut isint);
+            if (num > 0) and (num < (1 << 23)) {
+                set_entry(r, @truncate(usize, @bit_cast(u64, num)), Entry.{ kind: 1, off: @as(u64, j), index: 0 })!;
+            }
+        }
+    }
+    let mut k: usize = 0;
+    while true {
+        let t = strs.index_of_from(d, "trailer", k) ?? break;
+        last_trailer = t + 7;
+        k = t + 7;
+    }
+    if last_trailer > 0 {
+        let mut lx = Lexer.{ s: d, pos: last_trailer };
+        let t = parse_obj(r, &mut lx, 0) catch Object.Null;
+        r.trailer = t.as_dict() catch empty_dict();
+    }
+    if r.trailer.get("Root").is_null() {
+        // find the catalog
+        for num in 1..r.xref.len() {
+            let o = r.object(@truncate(u32, num)) catch continue;
+            let dd = o.as_dict() catch continue;
+            let ty = dd.get("Type").as_name() catch continue;
+            if strs.eq(ty, "Catalog") {
+                let keys = mem.alloc.[[]u8](1)!;
+                let vals = mem.alloc.[Object](1) catch |e| {
+                    mem.free(keys);
+                    return e;
+                };
+                keys[0] = "Root";
+                vals[0] = Object.Ref(Ref.{ num: @truncate(u32, num), gen: 0 });
+                r.names.push(keys)!;
+                r.objects.push(vals)!;
+                r.trailer = Dict.{ keys: keys, vals: vals };
+                break;
+            }
+        }
+    }
+    if r.trailer.get("Root").is_null() {
+        return error.Corrupt;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Indirect objects and object streams
+// -----------------------------------------------------------------------------
+
+fn read_object(r: *mut Reader, num: u32) ReadError!Object {
+    let n = @as(usize, num);
+    if n >= r.xref.len() {
+        return Object.Null;
+    }
+    let st = r.state.get(n);
+    if st == 2 {
+        return r.cache.get(n);
+    }
+    if (st == 1) or (r.parse_budget == 0) {
+        return Object.Null;  // a cycle, or the work allowed is done
+    }
+    // an object is parsed once, the parsing counted against the budget; one
+    // that fails is Null from then on, with what its parse made freed
+    r.state.set(n, 1);
+    r.cache.set(n, Object.Null);
+    let e = r.xref.get(n);
+    let mut o = Object.Null;
+    if (e.kind == 1) and (e.off < @as(u64, r.data.len)) {
+        let start = @truncate(usize, e.off);
+        let mut lx = Lexer.{ s: r.data, pos: start };
+        let marks: [3]usize = [r.bytes.len(), r.objects.len(), r.names.len()];
+        let res = parse_indirect(r, &mut lx);
+        r.charge(lx.pos - @min(lx.pos, start));
+        o = res catch |err| {
+            r.release(marks[0], marks[1], marks[2]);
+            r.state.set(n, 2);
+            if err == error.OutOfMemory {
+                r.state.set(n, 0);
+                return err;
+            }
+            return Object.Null;
+        };
+    } else if e.kind == 2 {
+        o = from_objstm(r, e.off, e.index) catch |err| {
+            r.state.set(n, 2);
+            if err == error.OutOfMemory {
+                r.state.set(n, 0);
+                return err;
+            }
+            return Object.Null;
+        };
+    }
+    r.cache.set(n, o);
+    r.state.set(n, 2);
+    return o;
+}
+
+fn read_resolve(r: *mut Reader, o: Object) ReadError!Object {
+    let mut cur = o;
+    for _k in @as(usize, 0)..16 {
+        match cur {
+            .Ref(rf) => { cur = r.object(rf.num)!; }
+            else     => { return cur; }
+        }
+    }
+    return Object.Null;
+}
+
+fn from_objstm(r: *mut Reader, stm: u64, index: u32) ReadError!Object {
+    let mut oi: usize = 0;
+    if let .some(found) = r.objstm.get(stm) {
+        oi = found;
+    } else {
+        if stm >= (1 << 23) {
+            return error.Corrupt;
+        }
+        let so = r.object(@truncate(u32, stm))!;
+        let st = so.as_stream()!;
+        let data = decode_stream(r, st)!;
+        let n = st.dict.get("N").as_int()!;
+        let first = st.dict.get("First").as_int()!;
+        if (n < 0) or (first < 0) or (n > @as(i64, @bit_cast(i64, @as(u64, data.len)))) {
+            return error.Corrupt;
+        }
+        // the header: pairs of object number and offset
+        let mut offs = vec.Vec.[u64].init();
+        let mut lx = Lexer.{ s: data, pos: 0 };
+        for _k in 0..@truncate(usize, @bit_cast(u64, n)) {
+            let a = parse_obj(r, &mut lx, 0) catch break;
+            let b = parse_obj(r, &mut lx, 0) catch break;
+            _ = a;
+            let off = b.as_int() catch -1;
+            let abs = first + off;
+            if (off < 0) or (abs < 0) or (abs >= @as(i64, @bit_cast(i64, @as(u64, data.len)))) {
+                offs.push(0xffffffffffffffff) catch |e| {
+                    offs.deinit();
+                    return e;
+                };
+            } else {
+                offs.push(@bit_cast(u64, abs)) catch |e| {
+                    offs.deinit();
+                    return e;
+                };
+            }
+        }
+        r.streams.push(ObjStm.{ data: data, offsets: vec.Vec.[u64].init() }) catch |e| {
+            offs.deinit();
+            return e;
+        };
+        oi = r.streams.len() - 1;
+        @swap(&mut r.streams.get_ptr(oi).offsets, &mut offs);
+        r.objstm.put(stm, oi)!;
+        r.parse_budget = @add_sat(r.parse_budget, data.len * 8);  // (once for each)
+    }
+    let os = r.streams.get(oi);
+    if @as(usize, index) >= os.offsets.len() {
+        return error.Corrupt;
+    }
+    let at_ = os.offsets.get(@as(usize, index));
+    if at_ >= @as(u64, os.data.len) {
+        return error.Corrupt;
+    }
+    let mut lx2 = Lexer.{ s: os.data, pos: @truncate(usize, at_) };
+    let res = parse_obj(r, &mut lx2, 0);
+    r.charge(lx2.pos - @min(lx2.pos, @truncate(usize, at_)));
+    return res;
+}
+
+// -----------------------------------------------------------------------------
+// Page tree and document queries
+// -----------------------------------------------------------------------------
+
+fn load_pages(r: *mut Reader) ReadError!void {
+    let root = r.get(r.trailer, "Root")!;
+    let cat = root.as_dict() catch return error.Corrupt;
+    let top = r.get(cat, "Pages")!;
+    let top_d = top.as_dict() catch return error.Corrupt;
+    // depth first, with inherited attributes copied into each page
+    let mut stack = vec.Vec.[Dict].init();
+    defer stack.deinit();
+    let mut seen = vec.Vec.[u8].init();
+    defer seen.deinit();
+    for _k in 0..r.xref.len() {
+        seen.push(0)!;
+    }
+    stack.push(top_d)!;
+    let mut steps: usize = 0;
+    while stack.len() > 0 {
+        steps += 1;
+        if steps > (1 << 22) {
+            return error.Corrupt;
+        }
+        let d = stack.pop() ?? break;
+        let kids = r.get(d, "Kids")!;
+        let ty = r.get(d, "Type")!;
+        let tn = ty.as_name() catch "";
+        match kids {
+            .Array(a) => {
+                if not strs.eq(tn, "Page") {
+                    // children in reverse, so they come off the stack in order
+                    let mut k = a.len;
+                    while k > 0 {
+                        k -= 1;
+                        let mut num: usize = 0;
+                        match a[k] {
+                            .Ref(rf) => { num = @as(usize, rf.num); }
+                            else => {}
+                        }
+                        if (num > 0) and (num < seen.len()) {
+                            if seen.get(num) != 0 {
+                                continue;
+                            }
+                            seen.set(num, 1);
+                        }
+                        let kid = r.resolve(a[k])!;
+                        let kd = kid.as_dict() catch continue;
+                        stack.push(inherit_attrs(r, d, kd)!)!;
+                    }
+                    continue;
+                }
+            }
+            else => {}
+        }
+        r.pages.push(d)!;
+    }
+}
+
+/// A child with its parent's inheritable attributes where it has none.
+fn inherit_attrs(r: *mut Reader, parent: Dict, kid: Dict) ReadError!Dict {
+    let names: [4][]u8 = ["Resources", "MediaBox", "CropBox", "Rotate"];
+    let mut keys = vec.Vec.[[]u8].init();
+    defer keys.deinit();
+    let mut vals = vec.Vec.[Object].init();
+    defer vals.deinit();
+    keys.extend(kid.keys)!;
+    vals.extend(kid.vals)!;
+    let mut added = false;
+    for n in names {
+        if kid.get(n).is_null() and not parent.get(n).is_null() {
+            keys.push(n)!;
+            vals.push(parent.get(n))!;
+            added = true;
+        }
+    }
+    if not added {
+        return kid;
+    }
+    return make_dict(r, keys.items(), vals.items());
+}
+
+fn read_page_size(r: *mut Reader, i: usize) ReadError![2]f64 {
+    let d = r.page(i)!;
+    let mb = r.get(d, "MediaBox")!;
+    let a = mb.as_array() catch return [612.0, 792.0];
+    if a.len < 4 {
+        return [612.0, 792.0];
+    }
+    let x0 = (r.resolve(a[0])!).as_num() catch 0.0;
+    let y0 = (r.resolve(a[1])!).as_num() catch 0.0;
+    let x1 = (r.resolve(a[2])!).as_num() catch 612.0;
+    let y1 = (r.resolve(a[3])!).as_num() catch 792.0;
+    return [@abs(x1 - x0), @abs(y1 - y0)];
+}
+
+fn read_info(r: *mut Reader, key: []u8) ReadError![]mut u8 {
+    let io_ = r.get(r.trailer, "Info")!;
+    let d = io_.as_dict() catch return [];
+    let v = r.get(d, key)!;
+    let s = v.as_str() catch return [];
+    return text_string(s);
+}

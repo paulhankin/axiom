@@ -1,6 +1,6 @@
 ## Standard library
 
-- The image decoders (`std/graphics/image/formats` and each format's `decode`,
+- The image decoders (`lib/graphics/image/formats` and each format's `decode`,
   `decode_all`, `decode_page`, `load`, ...) now refuse an image of more than
   `image.DEFAULT_MAX_PIXELS` pixels (2^26, 64 Mi: 8192 x 8192) with `TooLarge`, before
   allocating anything for it; the limit was `image.MAX_PIXELS` (2^28). A file of a few

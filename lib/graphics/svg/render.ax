@@ -1,0 +1,658 @@
+// =============================================================================
+// lib/graphics/svg/render.ax - Offscreen sRGB layer planner and canvas
+// rasterizer, part of lib/graphics/svg.
+// =============================================================================
+
+import "../color.ax" as color;
+import "../draw.ax" as draw;
+import "../font.ax" as font;
+import "../image.ax" as image;
+import "path.ax" as pathdata;
+import "std/collections/vec" as vec;
+import "std/math" as math;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Rendering
+// -----------------------------------------------------------------------------
+
+/// The outline of a run of text at (x, y) (the baseline's start, after the
+/// anchor), appended to p; returns its advance.
+fn text_outline(f: *font.Font, s: []u8, x: f64, y: f64, size: f64, p: *mut draw.Path) infer!f64 {
+    let sc = font.scale_for(f, size);
+    let mut it = strs.runes(s);
+    let mut pen = x;
+    let mut prev: u32 = 0xffffffff;
+    while let .some(r) = it.next() {
+        let g = f.glyph_index(r);
+        if prev != 0xffffffff {
+            pen += @float_from_int(f64, f.kerning(prev, g)) * sc;
+        }
+        f.glyph_path(g, p, pen, y, sc)!;
+        pen += @float_from_int(f64, f.advance(g)) * sc;
+        prev = g;
+    }
+    return pen - x;
+}
+
+/// Where text runs continue from.
+struct Pen {
+    x: f64,
+    y: f64,
+}
+
+/// A text item's outline; moves the pen past it.
+fn text_item_path(it: *Item, opts: RenderOptions, pen: *mut Pen, p: *mut draw.Path) infer!void {
+    if it.has_x {
+        pen.x = it.x;
+    }
+    if it.has_y {
+        pen.y = it.y;
+    }
+    pen.x += it.dx;
+    pen.y += it.dy;
+    let f = opts.font;
+    let w = font.measure(f, it.text, it.size);
+    let mut x = pen.x;
+    if it.anchor == 1 {
+        x -= w / 2.0;
+    } else if it.anchor == 2 {
+        x -= w;
+    }
+    _ = text_outline(f, it.text, x, pen.y, it.size, p)!;
+    pen.x = x + w;
+}
+
+/// A colour with its sRGB-encoded components standing in for linear ones:
+/// drawing with these composites and interpolates sRGB values, as SVG
+/// renderers do.
+fn encoded(c: color.Color) color.Color {
+    return color.Color.{
+        r: color.srgb_encode(@min(@max(c.r, 0.0), 1.0)),
+        g: color.srgb_encode(@min(@max(c.g, 0.0), 1.0)),
+        b: color.srgb_encode(@min(@max(c.b, 0.0), 1.0)),
+        a: c.a,
+    };
+}
+
+/// A paint in encoded colours (gradient stops into scratch).
+fn encoded_paint(p: draw.Paint, scratch: *mut vec.Vec.[draw.Stop]) SvgError!draw.Paint {
+    let mut q = p;
+    q.color = encoded(p.color);
+    if (p.kind == draw.PaintKind.LINEAR) or (p.kind == draw.PaintKind.RADIAL) {
+        // SVG interpolates colour and opacity separately (draw interpolates
+        // premultiplied colours): spans whose opacity changes are split
+        scratch.clear();
+        let n = p.stops.len;
+        for i in @as(usize, 0)..n {
+            let a = p.stops[i];
+            let ea = encoded(a.color);
+            scratch.push(draw.Stop.{ offset: a.offset, color: ea })!;
+            if ((i + 1) < n) and (a.color.a != p.stops[i + 1].color.a) {
+                let b = p.stops[i + 1];
+                let eb = encoded(b.color);
+                for j in @as(usize, 1)..SUBSTOPS {
+                    let t = @float_from_int(f32, j) / @float_from_int(f32, SUBSTOPS);
+                    let c = color.Color.{ r: ea.r + ((eb.r - ea.r) * t), g: ea.g + ((eb.g - ea.g) * t),
+                                          b: ea.b + ((eb.b - ea.b) * t), a: ea.a + ((eb.a - ea.a) * t) };
+                    scratch.push(draw.Stop.{ offset: a.offset + ((b.offset - a.offset) * @as(f64, t)), color: c })!;
+                }
+            }
+        }
+        q.stops = scratch.items();
+    }
+    return q;
+}
+
+const SUBSTOPS: usize = 16;
+
+/// An offscreen layer (for a group's opacity, clip or mask, or a mask
+/// itself): its pixels are those of the work image from (x, y).
+struct Layer {
+    img: *mut image.Image,
+    cv: *mut draw.Canvas,
+    x: usize,
+    y: usize,
+}
+
+fn new_layer(r: Rect, like: *draw.Canvas) SvgError!Layer {
+    let img = mem.create(image.Image.init(r.x1 - r.x0, r.y1 - r.y0, 4, image.Depth.F32)!)!;
+    let cv = mem.create(draw.Canvas.init(img)) catch |e| {
+        img.deinit();
+        mem.destroy(img);
+        return e;
+    };
+    cv.antialias = like.antialias;
+    cv.tolerance = like.tolerance;
+    return Layer.{ img: img, cv: cv, x: r.x0, y: r.y0 };
+}
+
+fn free_layer(l: Layer) void {
+    l.cv.deinit();
+    mem.destroy(l.cv);
+    l.img.deinit();
+    mem.destroy(l.img);
+}
+
+fn layer_rect(l: Layer) Rect {
+    return Rect.{ x0: l.x, y0: l.y, x1: l.x + l.img.width, y1: l.y + l.img.height };
+}
+
+/// Pixels x0..x1 by y0..y1 of the work image.
+struct Rect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+
+    fn area(self: Rect) usize {
+        if (self.x1 <= self.x0) or (self.y1 <= self.y0) {
+            return 0;
+        }
+        return (self.x1 - self.x0) * (self.y1 - self.y0);
+    }
+
+    fn meet(self: Rect, o: Rect) Rect {
+        return Rect.{
+            x0: @max(self.x0, o.x0), y0: @max(self.y0, o.y0), x1: @min(self.x1, o.x1), y1: @min(self.y1, o.y1) };
+    }
+}
+
+/// What a group needs, found before drawing: the pixels it can change, and
+/// whether its clip changes any of them.
+struct Plan {
+    rect: Rect,
+    clip: bool,
+}
+
+/// What a BEGIN_GROUP (or BEGIN_MASK) started.
+struct Frame {
+    kind: u8,
+    opacity: f32,
+    masked: bool,
+    alpha: f32,  // FOLDED: the canvas's alpha before
+}
+
+const PLAIN: u8 = 0;    // nothing to do (no opacity, no clip that matters)
+const LAYER: u8 = 1;    // drawn on a layer of its box, composited at its end
+const MASK: u8 = 2;     // a mask, drawn on a layer like its group's
+const FOLDED: u8 = 3;   // past the layer limits: its opacity applied to what it draws, its mask ignored
+const HIDDEN: u8 = 4;   // nothing of it shows (or it is clipped, past the layer limits)
+const NO_MASK: u8 = 5;  // a mask not drawn (its group's is ignored or hidden)
+
+/// The layers live at once have at most this many times the work image's
+/// pixels: past it a group's opacity is applied to what it draws and its
+/// mask is ignored (as on a PDF page), and a clipped group is not drawn.
+/// (A layer covers what its group draws, so it costs about what drawing
+/// that does.)
+const LIVE_LAYERS: usize = 8;
+
+/// The state of rendering onto a canvas.
+nocopy struct Painter {
+    doc: *Document,
+    work: Layer,  // the document, in encoded colours
+    layers: vec.Vec.[Layer],
+    frames: vec.Vec.[Frame],
+    images: vec.Vec.[image.Image],  // the document's images, encoded
+    stops: vec.Vec.[draw.Stop],
+    base: draw.Affine,
+    opts: RenderOptions,
+    boxes: vec.Vec.[pathdata.Box],  // the document's paths' bounds
+    plans: vec.Vec.[Plan],          // by item (for BEGIN_GROUP items)
+    hidden: usize,                  // the HIDDEN and NO_MASK frames open
+    live: usize,                    // the pixels of the layers
+    live_limit: usize,
+
+    fn init(doc: *Document, work: Layer, base: draw.Affine, opts: RenderOptions, live_limit: usize) Painter {
+        return Painter.{
+            doc: doc,
+            work: work,
+            layers: vec.Vec.[Layer].init(),
+            frames: vec.Vec.[Frame].init(),
+            images: vec.Vec.[image.Image].init(),
+            stops: vec.Vec.[draw.Stop].init(),
+            base: base,
+            opts: opts,
+            boxes: vec.Vec.[pathdata.Box].init(),
+            plans: vec.Vec.[Plan].init(),
+            hidden: 0,
+            live: 0,
+            live_limit: live_limit,
+        };
+    }
+
+    fn deinit(self: *mut Painter) void {
+        while self.layers.len() > 0 {
+            let l = self.layers.pop() ?? break;
+            free_layer(l);
+        }
+        self.layers.deinit();
+        self.frames.deinit();
+        for i in @as(usize, 0)..self.images.len() {
+            self.images.get_ptr(i).deinit();
+        }
+        self.images.deinit();
+        self.stops.deinit();
+        self.boxes.deinit();
+        self.plans.deinit();
+    }
+
+    /// The layer drawn on now.
+    fn top(self: *Painter) Layer {
+        if self.layers.len() > 0 {
+            return self.layers.get(self.layers.len() - 1);
+        }
+        return self.work;
+    }
+
+    /// The canvas drawn on now.
+    fn cur(self: *Painter) *mut draw.Canvas {
+        return self.top().cv;
+    }
+
+    /// A transform from the document's space (through t) to the pixels of
+    /// the layer drawn on now.
+    fn at(self: *Painter, t: draw.Affine) draw.Affine {
+        let l = self.top();
+        return t.then(self.base).then(draw.Affine.translation(-@float_from_int(f64, l.x), -@float_from_int(f64, l.y)));
+    }
+
+    fn fill(self: *mut Painter, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) SvgError!void {
+        let q = encoded_paint(paint, &mut self.stops)!;
+        self.cur().fill(p, q, rule)!;
+    }
+
+    fn stroke(self: *mut Painter, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) SvgError!void {
+        let q = encoded_paint(paint, &mut self.stops)!;
+        self.cur().stroke(p, q, style)!;
+    }
+
+    /// The whole work image, as a box.
+    fn everywhere(self: *Painter) pathdata.Box {
+        return pathdata.Box.{ x0: 0.0, y0: 0.0, x1: @float_from_int(f64, self.work.img.width),
+                              y1: @float_from_int(f64, self.work.img.height) };
+    }
+
+    /// The box of the work image that box b covers through t (the whole
+    /// image if it is not finite).
+    fn device_box(self: *Painter, b: pathdata.Box, t: draw.Affine) pathdata.Box {
+        let mut out = pathdata.Box.empty();
+        let xs: [2]f64 = [b.x0, b.x1];
+        let ys: [2]f64 = [b.y0, b.y1];
+        for xv in xs {
+            for yv in ys {
+                let q = t.apply(xv, yv);
+                if not math.is_finite(q.x) or not math.is_finite(q.y) {
+                    return self.everywhere();
+                }
+                out.add(q.x, q.y);
+            }
+        }
+        return out;
+    }
+
+    /// The box of the work image an item draws in (empty: none; tp holds a
+    /// text item's outline).
+    fn item_box(self: *Painter, it: *Item, tp: *draw.Path) pathdata.Box {
+        let mut local = pathdata.Box.empty();
+        if it.kind == ItemKind.SHAPE {
+            local = self.boxes.get(it.path);
+            if local.is_empty() {
+                return self.everywhere();  // (not finite)
+            }
+            if it.has_stroke {
+                // square caps reach half the width times √2 out, miters up to
+                // the miter limit times it
+                let mut k: f64 = 1.5;
+                if it.style.join == draw.Join.MITER {
+                    k = @max(k, it.style.miter_limit);
+                }
+                let pad = (k * it.style.width) / 2.0;
+                local = pathdata.Box.{ x0: local.x0 - pad, y0: local.y0 - pad, x1: local.x1 + pad, y1: local.y1 + pad };
+            }
+        } else if it.kind == ItemKind.IMAGE {
+            local = pathdata.Box.{ x0: 0.0, y0: 0.0, x1: it.width, y1: it.height };
+        } else if (it.kind == ItemKind.TEXT) and (tp.verbs.len() > 0) {
+            local = pathdata.bounds(tp);
+            if local.is_empty() {
+                return self.everywhere();
+            }
+            if it.has_stroke {
+                let pad = (@max(1.5, it.style.miter_limit) * it.style.width) / 2.0;
+                local = pathdata.Box.{ x0: local.x0 - pad, y0: local.y0 - pad, x1: local.x1 + pad, y1: local.y1 + pad };
+            }
+        } else {
+            return local;
+        }
+        return self.device_box(local, it.transform.then(self.base));
+    }
+
+    /// The pixels of the work image that a box can change (with a pixel
+    /// more on each side, for antialiasing).
+    fn pixels(self: *Painter, b: pathdata.Box) Rect {
+        if b.is_empty() {
+            return Rect.{ x0: 0, y0: 0, x1: 0, y1: 0 };
+        }
+        let w = @float_from_int(f64, self.work.img.width);
+        let h = @float_from_int(f64, self.work.img.height);
+        return Rect.{ x0: @int_from_float(usize, low_px(b.x0 - 1.0, w)),
+                      y0: @int_from_float(usize, low_px(b.y0 - 1.0, h)),
+                      x1: @int_from_float(usize, high_px(b.x1 + 1.0, w)),
+                      y1: @int_from_float(usize, high_px(b.y1 + 1.0, h)) };
+    }
+
+    /// Whether clip path p is a rectangle of the work image holding box b
+    /// (so that clipping to it changes nothing b covers).
+    fn rect_holds(self: *Painter, p: *draw.Path, b: pathdata.Box) bool {
+        let v = p.verbs.items();
+        let q = p.pts.items();
+        if (v.len != 5) or (q.len != 8) or (v[0] != draw.Verb.MOVE) or (v[4] != draw.Verb.CLOSE) {
+            return false;
+        }
+        let mut xs: [4]f64 = [0.0; 4];
+        let mut ys: [4]f64 = [0.0; 4];
+        for k in @as(usize, 0)..4 {
+            if (k > 0) and (v[k] != draw.Verb.LINE) {
+                return false;
+            }
+            let d = self.base.apply(q[2 * k], q[(2 * k) + 1]);
+            xs[k] = d.x;
+            ys[k] = d.y;
+        }
+        let along = (ys[0] == ys[1]) and (xs[1] == xs[2]) and (ys[2] == ys[3]) and (xs[3] == xs[0]);
+        let across = (xs[0] == xs[1]) and (ys[1] == ys[2]) and (xs[2] == xs[3]) and (ys[3] == ys[0]);
+        if not along and not across {
+            return false;
+        }
+        return (b.x0 >= @min(xs[0], xs[2])) and (b.x1 <= @max(xs[0], xs[2])) and (b.y0 >= @min(ys[0], ys[2])) and
+               (b.y1 <= @max(ys[0], ys[2]));
+    }
+
+    /// Finds each group's box: the pixels of what it draws (not its mask's
+    /// content) within its clip's.
+    fn plan(self: *mut Painter) SvgError!void {
+        let doc = self.doc;
+        for i in @as(usize, 0)..doc.paths.len() {
+            self.boxes.push(pathdata.bounds(&doc.paths.items()[i]))!;
+        }
+        let mut open = vec.Vec.[usize].init();
+        defer open.deinit();
+        let mut acc = vec.Vec.[pathdata.Box].init();
+        defer acc.deinit();
+        let mut pen = Pen.{ x: 0.0, y: 0.0 };
+        let mut tp = draw.Path.init();
+        defer tp.deinit();
+        let items = doc.items.items();
+        let none = Rect.{ x0: 0, y0: 0, x1: 0, y1: 0 };
+        for i in @as(usize, 0)..items.len {
+            let it = &items[i];
+            self.plans.push(Plan.{ rect: none, clip: false })!;
+            if (it.kind == ItemKind.BEGIN_GROUP) or (it.kind == ItemKind.BEGIN_MASK) {
+                open.push(i)!;
+                acc.push(pathdata.Box.empty())!;
+                continue;
+            }
+            let mut b = pathdata.Box.empty();
+            if it.kind == ItemKind.END_GROUP {
+                let mut gi = open.pop() ?? continue;
+                b = acc.pop() ?? continue;
+                if items[gi].kind == ItemKind.BEGIN_MASK {
+                    gi = open.pop() ?? continue;
+                    b = acc.pop() ?? continue;
+                }
+                let g = &items[gi];
+                let mut clip = g.path != NO_PATH;
+                if clip and not b.is_empty() {
+                    let cp = &doc.paths.items()[g.path];
+                    let cb = self.device_box(self.boxes.get(g.path), self.base);
+                    if self.rect_holds(cp, b) {
+                        clip = false;
+                    }
+                    b = pathdata.Box.{ x0: @max(b.x0, cb.x0), y0: @max(b.y0, cb.y0), x1: @min(b.x1, cb.x1),
+                                       y1: @min(b.y1, cb.y1) };
+                }
+                self.plans.items_mut()[gi] = Plan.{ rect: self.pixels(b), clip: clip };
+            } else {
+                tp.clear();
+                if (it.kind == ItemKind.TEXT) and self.opts.has_font {
+                    text_item_path(it, self.opts, &mut pen, &mut tp)!;
+                }
+                b = self.item_box(it, &tp);
+            }
+            if (acc.len() > 0) and not b.is_empty() {
+                let top = acc.get_ptr(acc.len() - 1);
+                top.add(b.x0, b.y0);
+                top.add(b.x1, b.y1);
+            }
+        }
+    }
+
+    /// Whether a layer of px pixels fits the limits.
+    fn room_for(self: *Painter, n: usize) bool {
+        return (self.live + n) <= self.live_limit;
+    }
+
+    fn push_layer(self: *mut Painter, r: Rect) SvgError!Layer {
+        let l = new_layer(r, self.cur())!;
+        self.layers.push(l) catch |e| {
+            free_layer(l);
+            return e;
+        };
+        self.live += r.area();
+        return l;
+    }
+
+    fn begin_group(self: *mut Painter, i: usize, it: *Item) SvgError!Frame {
+        let mut fr = Frame.{ kind: PLAIN, opacity: it.opacity, masked: it.masked, alpha: 1.0 };
+        if self.hidden > 0 {
+            fr.kind = HIDDEN;
+            self.hidden += 1;
+            return fr;
+        }
+        let pl = self.plans.get(i);
+        if not (it.opacity < 1.0) and not it.masked and not pl.clip {
+            return fr;
+        }
+        let r = pl.rect.meet(layer_rect(self.top()));
+        let n = r.area();
+        if (n == 0) or (pl.clip and not self.room_for(n)) {
+            fr.kind = HIDDEN;
+            self.hidden += 1;
+            return fr;
+        }
+        if not self.room_for(n) {
+            let c = self.cur();
+            fr.kind = FOLDED;
+            fr.alpha = c.alpha;
+            c.alpha = c.alpha * it.opacity;
+            return fr;
+        }
+        let l = self.push_layer(r)!;
+        fr.kind = LAYER;
+        if pl.clip {
+            l.cv.transform = self.at(draw.Affine.identity());
+            l.cv.clip_to(&self.doc.paths.items()[it.path], it.fill_rule)!;
+        }
+        return fr;
+    }
+
+    fn begin_mask(self: *mut Painter) SvgError!Frame {
+        let mut fr = Frame.{ kind: NO_MASK, opacity: 1.0, masked: false, alpha: 1.0 };
+        if (self.hidden == 0) and (self.frames.len() > 0) and (self.frames.get(self.frames.len() - 1).kind == LAYER) {
+            let r = layer_rect(self.top());
+            if self.room_for(r.area()) {
+                _ = self.push_layer(r)!;
+                fr.kind = MASK;
+                return fr;
+            }
+        }
+        self.hidden += 1;
+        return fr;
+    }
+
+    /// Ends a group (unmasked: its mask was not drawn).
+    fn end_group(self: *mut Painter, fr: Frame, unmasked: bool) SvgError!void {
+        if fr.kind == LAYER {
+            if fr.masked and not unmasked {
+                // (a mask that made no BEGIN_MASK: nothing shows)
+                let l = self.layers.pop() ?? return error.Empty;
+                self.live -= layer_rect(l).area();
+                free_layer(l);
+            } else {
+                self.pop_layer(fr.opacity, self.work.img, false)!;
+            }
+        } else if fr.kind == FOLDED {
+            self.cur().alpha = fr.alpha;
+        } else if fr.kind == HIDDEN {
+            self.hidden -= 1;
+        }
+    }
+
+    /// Composites the top layer onto the one below at an opacity, after
+    /// masking it with a mask layer (if masked; it covers the same pixels).
+    fn pop_layer(self: *mut Painter, opacity: f32, mask: *image.Image, masked: bool) SvgError!void {
+        let l = self.layers.pop() ?? return error.Empty;
+        self.live -= layer_rect(l).area();
+        if masked {
+            // alpha times the mask's luminance (from its sRGB values) and alpha
+            let d = l.img.samples32_mut();
+            let m = mask.samples32();
+            let mut i: usize = 0;
+            while ((i + 3) < d.len) and ((i + 3) < m.len) {
+                let lum = (((0.2125 * m[i]) + (0.7154 * m[i + 1])) + (0.0721 * m[i + 2])) * m[i + 3];
+                d[i + 3] = d[i + 3] * @min(@max(lum, 0.0), 1.0);
+                i += 4;
+            }
+        }
+        let below = self.top();
+        let c = below.cv;
+        let saved_t = c.transform;
+        let saved_a = c.alpha;
+        c.transform = draw.Affine.identity();
+        c.alpha = saved_a * opacity;
+        let r = c.draw_image(l.img, @float_from_int(f64, l.x - below.x), @float_from_int(f64, l.y - below.y),
+                             @float_from_int(f64, l.img.width), @float_from_int(f64, l.img.height));
+        c.transform = saved_t;
+        c.alpha = saved_a;
+        free_layer(l);
+        r!;
+    }
+
+    fn run(self: *mut Painter) SvgError!void {
+        let doc = self.doc;
+        let mut pen = Pen.{ x: 0.0, y: 0.0 };
+        let mut tp = draw.Path.init();
+        defer tp.deinit();
+        for i in @as(usize, 0)..doc.items.len() {
+            let it = &doc.items.items()[i];
+            match it.kind {
+                .BEGIN_GROUP => {
+                    let fr = self.begin_group(i, it)!;
+                    self.frames.push(fr)!;
+                }
+                .BEGIN_MASK => {
+                    let fr = self.begin_mask()!;
+                    self.frames.push(fr)!;
+                }
+                .END_GROUP => {
+                    let fr = self.frames.pop() ?? continue;
+                    if fr.kind == MASK {
+                        // the mask is done: apply it to the group's layer
+                        let ml = self.layers.pop() ?? return error.Empty;
+                        self.live -= layer_rect(ml).area();
+                        let g = self.frames.pop() ?? {
+                            free_layer(ml);
+                            continue;
+                        };
+                        let r = self.pop_layer(g.opacity, ml.img, true);
+                        free_layer(ml);
+                        r!;
+                    } else if fr.kind == NO_MASK {
+                        self.hidden -= 1;
+                        let g = self.frames.pop() ?? continue;
+                        self.end_group(g, true)!;
+                    } else {
+                        self.end_group(fr, false)!;
+                    }
+                }
+                .SHAPE => {
+                    if self.hidden == 0 {
+                        self.cur().transform = self.at(it.transform);
+                        let p = &doc.paths.items()[it.path];
+                        if it.has_fill {
+                            self.fill(p, it.fill, it.fill_rule)!;
+                        }
+                        if it.has_stroke {
+                            self.stroke(p, it.stroke, it.style)!;
+                        }
+                    }
+                }
+                .TEXT => {
+                    if self.opts.has_font {
+                        tp.clear();
+                        text_item_path(it, self.opts, &mut pen, &mut tp)!;  // (moves the pen, drawn or not)
+                        if self.hidden == 0 {
+                            self.cur().transform = self.at(it.transform);
+                            if it.has_fill {
+                                self.fill(&tp, it.fill, it.fill_rule)!;
+                            }
+                            if it.has_stroke {
+                                self.stroke(&tp, it.stroke, it.style)!;
+                            }
+                        }
+                    }
+                }
+                .IMAGE => {
+                    if self.hidden == 0 {
+                        let c = self.cur();
+                        c.transform = self.at(it.transform);
+                        c.draw_image(&self.images.items()[it.image], 0.0, 0.0, it.width, it.height)!;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The first pixel from v (0 if v is not a number, at most hi).
+fn low_px(v: f64, hi: f64) f64 {
+    if v > 0.0 {
+        return @min(@floor(v), hi);
+    }
+    return 0.0;
+}
+
+/// The pixel past v (hi if v is not a number, at least 0).
+fn high_px(v: f64, hi: f64) f64 {
+    if v < hi {
+        return @max(@ceil(v), 0.0);
+    }
+    return hi;
+}
+
+fn paint_document(pt: *mut Painter, x: f64, y: f64, w: f64, h: f64, outer: draw.Affine) SvgError!void {
+    // the images, encoded
+    for i in @as(usize, 0)..pt.doc.images.len() {
+        let src = &pt.doc.images.items()[i];
+        let mut e = image.Image.init(src.width, src.height, 4, image.Depth.F32)!;
+        for iy in @as(usize, 0)..src.height {
+            for ix in @as(usize, 0)..src.width {
+                e.set(ix, iy, encoded(src.get(ix, iy)));
+            }
+        }
+        pt.images.push(image.Image.{ width: 0, height: 0, channels: 4, depth: image.Depth.U8, data: [] }) catch |er| {
+            e.deinit();
+            return er;
+        };
+        @swap(pt.images.get_ptr(pt.images.len() - 1), &mut e);
+    }
+    if pt.doc.fit.slice {
+        let mut rp = rect_path(x, y, w, h)!;
+        defer rp.deinit();
+        pt.work.cv.transform = outer;
+        pt.work.cv.clip_to(&rp, draw.FillRule.NONZERO)!;
+    }
+    pt.plan()!;
+    pt.run()!;
+}

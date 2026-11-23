@@ -6,7 +6,7 @@ format:
     cmd/axiom/internal/tests/tools/gen_ld_math_tests.py      # needs mpmath
 
 writes cmd/axiom/internal/tests/c/lib/math/math_values_ldouble.c. It holds,
-for every function that std/c/rt/math_ld.ax computes in the format's
+for every function that lib/c/rt/math_ld.ax computes in the format's
 precision, inputs (random over the function's domain, and its hard places:
 huge arguments of the trigonometric functions, results near overflow and in
 the subnormal range, arguments near 1 for the logarithms) and the correctly
@@ -203,7 +203,7 @@ def gen(fmt):
 
 def main():
     rx, rq = gen('x'), gen('q')
-    L = ['/* The wide long double functions\' values (std/c/rt/math_ld.ax), against',
+    L = ['/* The wide long double functions\' values (lib/c/rt/math_ld.ax), against',
          '   correctly rounded results (written by',
          '   cmd/axiom/internal/tests/tools/gen_ld_math_tests.py; do not edit). */',
          '/* flags: --c-std=c23 */',

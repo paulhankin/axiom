@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates the x86-64 intrinsics headers of the C compiler (std/c/include/:
+"""Generates the x86-64 intrinsics headers of the C compiler (lib/c/include/:
 <mmintrin.h> ... <immintrin.h>, <x86intrin.h>, <cpuid.h>), the x86-64 part of
 its table of machine operations (cmd/axiom/src/c/csimd_tab.ax) and the tests
 of them (cmd/axiom/internal/tests/c/run/intrin_x86_*.c,
@@ -32,7 +32,7 @@ import random
 import re
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
-INC = os.path.join(ROOT, 'std', 'c', 'include')
+INC = os.path.join(ROOT, 'lib', 'c', 'include')
 TAB = os.path.join(ROOT, 'cmd', 'axiom', 'src', 'c', 'csimd_tab.ax')
 TESTS = os.path.join(ROOT, 'cmd', 'axiom', 'internal', 'tests', 'c')
 

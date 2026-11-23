@@ -1,5 +1,5 @@
 /* The functions of _Float16 and _Float128 (ISO/IEC TS 18661-3, C23 Annex
-   H; std/c/lib/math/m_f16.c, m_f128.c): binary128's correctly rounded
+   H; lib/c/lib/math/m_f16.c, m_f128.c): binary128's correctly rounded
    exact functions, its elementary functions in its precision, strtof128
    and strfromf128 (whatever long double is), binary16's functions through
    float, strtof16 and strfromf16 with its subnormals and overflow, and the

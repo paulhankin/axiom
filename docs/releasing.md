@@ -36,7 +36,7 @@ axiom-<version>-<os>-<arch>/
   RELEASE-NOTES.md  README.txt
 ```
 
-The compiler finds `std/` next to its `bin/`, and `axiom update` downloads the archives
+The compiler finds `std/` and `lib/` next to its `bin/`, and `axiom update` downloads the archives
 by these names, and checks them against `SHA256SUMS`, so a release keeps them. All four archives are built on one Linux
 machine (the compiler cross-compiles itself), and they are deterministic: building
 the same commit gives the same bytes, which `SHA256SUMS` records, so anyone can check a
@@ -48,7 +48,11 @@ Changes that a release's users should hear about (new features, anything that br
 programs, notable fixes) get a note in `docs/next/` when they land: one small Markdown
 file per change, named for it (see `docs/next/README.md`). At release time
 `cmd/axiom/release.sh notes <version>` gathers them into `docs/releases/<version>.md`,
-which is then edited into shape.
+which is then edited into shape. The C front end is an experiment (`docs/c.md`): its
+notes, named `c-<change>.md`, form a section of their own at the end, "The C front end
+(an experiment)", their headings one level down; and a release of the language does not
+wait on its tests: `run.mjs` counts them as a group of their own and exits with status 3
+when only they failed, which `release.sh` reports and goes on.
 
 ## Making a release
 

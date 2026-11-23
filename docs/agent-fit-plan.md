@@ -829,6 +829,78 @@ lines at once. An agent looking for a hash map also has to search past an AV1 de
 The suite passes after the rename. `axiom doc std` lists only core, and reports no
 undocumented public item.
 
+### Status
+
+Done. The Problem above describes the tree as it was.
+
+- G1, the mechanism: `import "lib/..."` reads the directory named `lib` beside the
+  standard library's (the one `--std`, `AXIOM_STD` or the compiler's location gives), so
+  no new setting: `lib/` beside `std/` in a release and in the source tree
+  (`modload.ax`; spec §4.1, `docs/cli.md`). Its modules show as `lib/...` (and name
+  their symbols so), count as the library's (their tests do not run with a program's;
+  exports as std's), and follow the `internal` rule as std's do; `std/internal/` may be
+  imported from `lib/` too, which the C runtime needs (below). `axiom doc lib` and
+  `lib/<module>[.<item>]`; `axiom fmt` adds a missing import of a library module outside
+  std/ (never inside it); the language server does not rename into `lib/`; `axiom
+  update` and `release.sh` carry `lib/`, whose smoke test builds a program that imports
+  one. The editor extension names no std paths, and needed nothing. A test in `run.mjs`
+  (section `spec §4.1`) builds a tree with its own `lib/`.
+- G1, the move (`git mv`, so history follows; every import, test data path, generator
+  and document followed, `docs/releases/` and the plans excepted): the core is `mem`,
+  `str`, `fmt`, `io`, `os` (and `os/path`, `fs`, `process`, `cli`, `cpu`, `term`,
+  `random`), `collections/*`, `hash` (and `hash/crc`, `fnv`, `murmur3`, `siphash`,
+  `xxhash`, and the digests `md5`, `sha1`, `sha2`, `sha3` from `crypto/`), `math` (and
+  `math/complex`, `rand`, `stats`), `time` (and `time/tz`, `cron`), `thread` (and
+  `thread/pool`), `sync`, `unicode` (and `unicode/tables`), `diag`, `log`, `net`,
+  `encoding/json`, `encoding/binary`, `c` and `internal/`: 49 modules as `axiom doc std`
+  lists them, 105k lines (49k of them the Unicode tables). The rest, 283k lines, is in
+  `lib/` at the same paths. Following the imports (all of them, tests' too), the table
+  left four core modules importing library ones, resolved thus: `crypto/random` (the
+  OS's random bytes, which `hash`, `os/fs` and `math/rand` import) is core, as
+  `std/os/random`; `math/decimal` and `math/rational` (on `bigint`) and `math/geometry`
+  (on `matrix`) went with what they import, as did `math/fft`, which is not scalar.
+  `unicode`: UTF-8 is `str`'s; the compiler uses properties, case folding and
+  normalization, which stay with the break properties; the segmenters (graphemes,
+  words, sentences), `string_width` and `title` (which works by words) are
+  `lib/unicode/segment` (`std/unicode.title_word` title-cases one word for it), and
+  `bidi`, `linebreak` and `collate` are `lib/unicode/`. `os/window`, `cocoa`, `win32`,
+  `gamepad` and their backends `gamecontroller`, `xinput`, `objc` and `com` are media.
+  An import of a moved `std/` path is `E0211` with a machine fix to where it is
+  (`errors/import_moved.ax`). `std/README.md` describes the core, `lib/README.md` the
+  libraries.
+- G2: `run.mjs` (section `core`) checks that the core imports only the core, that the
+  compiler imports only the core, and that `W0320` is clean over every module `axiom doc
+  std` lists. That needed 835 `///` comments (of the 1,703 public items and methods
+  the 49 modules have now), written from the code; 221 of them are the generated
+  Unicode tables', which `gen_unicode.py` now writes (and the checked-in file has as it
+  would write them). The core's tests run with `--overflow=trap` as well as the
+  sanitizer: none trapped, on wasm32 or natively. The iterator check (§15.3) still
+  covers `std/` and `lib/`, which passes it.
+- G3: the README, `docs/c.md`, `docs/cli.md`, `axiom cc --help` and the compiler's
+  usage say the C front end is an experiment. Its headers, C library and runtime moved
+  from `std/c/` to `lib/c/`: a release carries `lib/` and the compiler finds it beside
+  `std/`, so the C front end needs no other search path there, where
+  `cmd/axiom/src/c/rt/` would have needed one and a copy in every release. `run.mjs`
+  counts the C front end's tests (C sources under `tests/c/`, and the cases named
+  "C ...") as their own group, still run by default, and exits with status 3 when only
+  they failed, which `release.sh` reports and goes on past; the release notes put
+  `docs/next/c-*.md` in a section of their own. The C front end's behaviour is
+  unchanged.
+- The AAC exception is in `CLAUDE.md`'s licensing section as decided above.
+
+Not as decided:
+
+- "The compiler imports only core, with no exceptions" has one: the C front end folds
+  C constants with the C runtime's arithmetic (`lib/c/rt/ldouble`, `wideint`, `decimal`
+  and `dec_env`), which C programs link too, so one copy serves both. The compiler
+  imports those four by a relative path (the seed resolves only `std/`), they import
+  nothing but each other, and the check names them. Keeping them in `std/` would have
+  put C's soft floating point in the core; keeping them in `cmd/axiom/src/c/rt/` would
+  have left C programs without them in a release.
+- `std/internal/` may be imported from `lib/` (spec §4.1): the C runtime's `<math.h>`
+  shares std/math's kernels (`std/internal/math`). `run.mjs` checks that no other
+  library module imports `std/internal/`.
+
 ---
 
 ## Not in This Plan

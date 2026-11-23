@@ -1,5 +1,5 @@
 /* The wide long double functions where a fast path's rounding test must
-   hand over to the exact path (std/c/rt/math_ldx.ax for the x87 format,
+   hand over to the exact path (lib/c/rt/math_ldx.ax for the x87 format,
    math_ld.ax): exact results, results exactly halfway between two values of
    the format (rounded to even), the far ranges of the inverse hyperbolic
    functions, lgamma near its zeros; in every format the result is the

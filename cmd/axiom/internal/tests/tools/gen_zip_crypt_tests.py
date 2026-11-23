@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates the encrypted archives in std/archive/zip/testdata for
-std/archive/zip's tests (password "secret"):
+"""Generates the encrypted archives in lib/archive/zip/testdata for
+lib/archive/zip's tests (password "secret"):
 
   zipcrypto.zip         traditional PKWARE encryption, by Info-ZIP's zip -P
   zipcrypto_stream.zip  the same, written to a pipe (data descriptors, so the
@@ -22,7 +22,7 @@ import tempfile
 
 import pyzipper
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'archive', 'zip', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'archive', 'zip', 'testdata')
 PASSWORD = b'secret'
 
 

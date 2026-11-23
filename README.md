@@ -61,7 +61,7 @@ axiom profile prog.ax                             # sampling profiler: hot funct
 axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
 axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)
 axiom lsp                                         # the language server, for editors (docs/editors.md)
-axiom build prog.c --c-std=c11 -o prog            # C, with the compiler's own front end (docs/c.md)
+axiom build prog.c --c-std=c11 -o prog            # C, with the compiler's own front end (an experiment: docs/c.md)
 ```
 
 [`docs/cli.md`](docs/cli.md) lists every command, flag and environment variable.
@@ -81,7 +81,7 @@ the test suite.
 | [`docs/install.md`](docs/install.md) | Installing a release, a first program, building from source |
 | [`docs/tour.md`](docs/tour.md) | A tour of the language: values, slices, structs and unions, errors, memory, generics, tests, SIMD |
 | [`docs/cli.md`](docs/cli.md) | The `axiom` command: every command and flag, environment variables, the cache, exit codes |
-| [`docs/c.md`](docs/c.md) | Compiling C: `axiom build file.c`, the standards (C89 to C23), the implementation-defined choices, the headers, what is not supported |
+| [`docs/c.md`](docs/c.md) | Compiling C, an experiment: `axiom build file.c`, the standards (C89 to C23), the implementation-defined choices, the headers, what is not supported |
 | [`docs/c-diagnostics.md`](docs/c-diagnostics.md) | Every diagnostic code of the C front end |
 | [`docs/c-frontend.md`](docs/c-frontend.md) | The design of the C front end |
 | [`docs/editors.md`](docs/editors.md) | Editor support: the VS Code extension, and `axiom lsp` with Neovim, Helix and Emacs |
@@ -93,7 +93,8 @@ the test suite.
 | [`docs/bootstrap-chain.md`](docs/bootstrap-chain.md) | How the compiler is built from a pinned seed, and what built each release |
 | [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | The test suite: run-and-compare programs, expected compile errors, `axiom test`, packages; its `tools/` generates test data and holds the std fuzzer and benchmark |
 | [`cmd/internal/tools/`](cmd/internal/tools) | Generators of the standard library's checked-in tables (Unicode, codecs, fonts) |
-| [`std/`](std/README.md) | The standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
+| [`std/`](std/README.md) | The standard library, the core that every program and the compiler build on, held to the suite's rules (every public item documented, overflow trapping in tests): `mem`, `str`, `fmt`, `io`, `os` (and `os/` `fs`, `path`, `process`, `cli`, `term`, `cpu`, `random`), `collections/` (`vec`, `map`, `set`, …), `hash` (and `hash/` with the digests `md5`, `sha1`, `sha2`, `sha3`), `unicode`, `math`, `time`, `thread`, `sync`, `log`, `net` (sockets), `encoding/json`, `encoding/binary` |
+| [`lib/`](lib/README.md) | The libraries released with it (`import "lib/..."`): `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `crypto/`, `math/` (`bigint`, `matrix`, …), `unicode/` (segmentation, collation); media: `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC), windows and controllers (`os/`); and `c/`, the C front end's headers, C library and runtime |
 | [`std/internal/runtime/`](std/internal/runtime/host.mjs) | The runtime: the host ABI for node (`host.mjs`, also a runner), Linux (`native.ax`, `linux.ax`, no libc), macOS (`darwin.ax`) and Windows (`windows.ax`); test runners; the profiler |
 | [`examples/`](examples) | Example programs and packages (below) |
 | [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (highlighting, and diagnostics and navigation through `axiom lsp`) |
@@ -111,14 +112,14 @@ changed. To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 | [`examples/generics/generics.ax`](examples/generics/generics.ax) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ax) | An Axiom library called from C through a generated header |
 | [`examples/wordcount/wordcount.ax`](examples/wordcount/wordcount.ax) | Word frequencies of stdin, for WebAssembly or native |
-| [`examples/http_server/http_server.ax`](examples/http_server/http_server.ax) | A small JSON API over HTTP (std/net/http): notes listed, added, read and deleted |
+| [`examples/http_server/http_server.ax`](examples/http_server/http_server.ax) | A small JSON API over HTTP (lib/net/http): notes listed, added, read and deleted |
 | [`examples/texmath/texmath.ax`](examples/texmath/texmath.ax) | TeX math typeset as SVG, PNG or PDF with a math font, or as MathML or Unicode text |
 | [`examples/pi/pi.ax`](examples/pi/pi.ax) | π to 2000 places (Machin's formula in big integers) on an A4 PDF page with typeset mathematics |
-| [`examples/charts/charts.ax`](examples/charts/charts.ax) | Bar, line, scatter, stacked-area and donut charts (std/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
-| [`examples/md2pdf/md2pdf.ax`](examples/md2pdf/md2pdf.ax) | Markdown to PDF (std/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
-| [`examples/metal/metal.ax`](examples/metal/metal.ax) | Metal on macOS: a window with a spinning triangle drawn by MSL shaders and a Core Text caption (std/os/cocoa, std/graphics/metal, std/graphics/quartz) |
-| [`examples/directx/directx.ax`](examples/directx/directx.ax) | Direct3D 11 on Windows: a window with a spinning triangle drawn by HLSL shaders and a Direct2D caption (std/os/win32, std/graphics/d3d11, std/graphics/d2d) |
-| [`examples/game/game.ax`](examples/game/game.ax) | A small game on Windows and macOS: Direct3D 12 or Metal graphics, keyboard and controllers (with rumble), sound effects and music (std/graphics/gpu, std/os/window, std/os/gamepad, std/audio/output) |
+| [`examples/charts/charts.ax`](examples/charts/charts.ax) | Bar, line, scatter, stacked-area and donut charts (lib/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
+| [`examples/md2pdf/md2pdf.ax`](examples/md2pdf/md2pdf.ax) | Markdown to PDF (lib/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
+| [`examples/metal/metal.ax`](examples/metal/metal.ax) | Metal on macOS: a window with a spinning triangle drawn by MSL shaders and a Core Text caption (lib/os/cocoa, lib/graphics/metal, lib/graphics/quartz) |
+| [`examples/directx/directx.ax`](examples/directx/directx.ax) | Direct3D 11 on Windows: a window with a spinning triangle drawn by HLSL shaders and a Direct2D caption (lib/os/win32, lib/graphics/d3d11, lib/graphics/d2d) |
+| [`examples/game/game.ax`](examples/game/game.ax) | A small game on Windows and macOS: Direct3D 12 or Metal graphics, keyboard and controllers (with rumble), sound effects and music (lib/graphics/gpu, lib/os/window, lib/os/gamepad, lib/audio/output) |
 | [`examples/trench/trench.ax`](examples/trench/trench.ax) | A trench run in 3D on Windows and macOS, after the vector arcade games of the early 1980s: Direct3D 12 or Metal with a depth buffer, culling, additive glows, sun shadows from a shadow map and dynamic point lights, surfaces textured in the pixel shader, an autopilot |
 | [`examples/swarm/swarm.ax`](examples/swarm/swarm.ax) | A 3D formation shooter on Windows and macOS in which everything is made of small cubes: voxel aliens with flashing lights, anything destroyed breaking into its cubes, shadows and point lights from shots and explosions, screen shake; one vertex buffer of cubes written in place each frame |
 | [`examples/drumkin/`](examples/drumkin/src/main.ax) | A drum machine on macOS (a package): eight drums of FM and noise through a morphing state-variable filter and ADSR envelopes, two settings of each blended between, a 16-step sequencer with swing and accents, knobs drawn with Quartz over Metal, sound through Core Audio from a thread of its own |
@@ -143,6 +144,6 @@ under the same terms, unless stated otherwise.
 
 Some of the standard library is derived from other projects and keeps their terms; see
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). In particular the AAC decoder
-(`std/audio/aac.ax` and `std/audio/internal/aac/`) follows FFmpeg's and is licensed under the LGPL 2.1 or later; a program
-includes it only if it imports `std/audio/aac` (`std/audio/formats` reads AAC only once
+(`lib/audio/aac.ax` and `lib/audio/internal/aac/`) follows FFmpeg's and is licensed under the LGPL 2.1 or later; a program
+includes it only if it imports `lib/audio/aac` (`lib/audio/formats` reads AAC only once
 the program adds `aac.DECODER` to it).

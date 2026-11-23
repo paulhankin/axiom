@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates the WebAssembly intrinsics header of the C compiler
-(std/c/include/wasm_simd128.h), the WebAssembly part of its table of machine
+(lib/c/include/wasm_simd128.h), the WebAssembly part of its table of machine
 operations (cmd/axiom/src/c/csimd_tab.ax) and the tests of them
 (cmd/axiom/internal/tests/c/run/intrin_wasm_*.c), from the tables below.
 

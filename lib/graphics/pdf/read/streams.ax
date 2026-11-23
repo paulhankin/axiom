@@ -1,0 +1,457 @@
+// =============================================================================
+// lib/graphics/pdf/read/streams.ax - Stream decoding, filter dispatch,
+// PNG/TIFF predictors, LZW, ASCII85, and RunLength, part of lib/graphics/pdf/read.
+// =============================================================================
+
+import "../../../compress/deflate.ax" as deflate;
+import "std/collections/vec" as vec;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Streams and filters
+// -----------------------------------------------------------------------------
+
+struct Decoded {
+    dict: usize,  // the address of the stream's dictionary values
+    data: []u8,
+}
+
+fn decode_stream(r: *mut Reader, st: Stream) ReadError![]u8 {
+    if (st.start > r.data.len) or (st.len > r.data.len - st.start) {
+        return error.Corrupt;
+    }
+    // a stream is decoded once, however often it is used (a form drawn
+    // many times); the dictionary is the stream object's own
+    let dict = @int_from_ptr(st.dict.vals.ptr);
+    let key = @as(u64, st.start);
+    if let .some(d) = r.decoded.get(key) {
+        if d.dict == dict {
+            return d.data;
+        }
+    }
+    let raw = r.data[st.start..st.start + st.len];
+    let filters = r.resolve(st.dict.get("Filter"))!;
+    let parms = r.resolve(st.dict.get("DecodeParms"))!;
+    let mut cur = mem.dup.[u8](raw)!;
+    let mut k: usize = 0;
+    while true {
+        let mut f: []u8 = "";
+        let mut pr = Object.Null;
+        match filters {
+            .Name(n) => {
+                if k == 0 {
+                    f = n;
+                    pr = parms;
+                }
+            }
+            .Array(a) => {
+                if k < a.len {
+                    let fo = r.resolve(a[k]) catch Object.Null;
+                    f = fo.as_name() catch "";
+                    match parms {
+                        .Array(pa) => {
+                            if k < pa.len {
+                                pr = r.resolve(pa[k]) catch Object.Null;
+                            }
+                        }
+                        else => {}
+                    }
+                    if f.len == 0 {
+                        f = "?";
+                    }
+                }
+            }
+            else => {}
+        }
+        if f.len == 0 {
+            break;
+        }
+        let next = apply_filter(r, f, cur, pr) catch |e| {
+            mem.free(cur);
+            if e == error.TooLarge {
+                r.budget -= @min(r.budget, r.max_stream);  // (it decoded that much, or the rest)
+            }
+            return e;
+        };
+        mem.free(cur);
+        cur = next;
+        k += 1;
+        if k > 8 {
+            break;
+        }
+    }
+    if cur.len > r.budget {
+        mem.free(cur);
+        return error.TooLarge;
+    }
+    r.budget -= cur.len;
+    let data = r.keep(cur)!;
+    r.decoded.put(key, Decoded.{ dict: dict, data: data })!;
+    return data;
+}
+
+fn apply_filter(r: *mut Reader, f: []u8, data: []u8, parms: Object) ReadError![]mut u8 {
+    let limit = @min(r.max_stream, r.budget);
+    if strs.eq(f, "FlateDecode") or strs.eq(f, "Fl") {
+        let out = deflate.decompress(data, deflate.Format.ZLIB, limit) catch |e| {
+            if e == error.OutOfMemory {
+                return error.OutOfMemory;
+            }
+            if e == error.TooLarge {
+                return error.TooLarge;
+            }
+            // raw deflate?
+            let raw = deflate.decompress(data, deflate.Format.RAW, limit) catch |e2| {
+                if e2 == error.OutOfMemory {
+                    return error.OutOfMemory;
+                }
+                if e2 == error.TooLarge {
+                    return error.TooLarge;
+                }
+                return [];
+            };
+            return predict(raw, parms);
+        };
+        return predict(out, parms);
+    }
+    if strs.eq(f, "LZWDecode") or strs.eq(f, "LZW") {
+        let mut early: i64 = 1;
+        match parms {
+            .Dict(d) => { early = d.get("EarlyChange").as_int() catch 1; }
+            else => {}
+        }
+        let out = lzw_decode(data, early != 0, limit)!;
+        return predict(out, parms);
+    }
+    if strs.eq(f, "ASCIIHexDecode") or strs.eq(f, "AHx") {
+        let mut out = strs.String.init();
+        let mut p: usize = 0;
+        let mut tmp: []u8 = data;
+        let mut src = strs.String.init();
+        defer src.deinit();
+        src.push('<') catch |e| {
+            out.deinit();
+            return e;
+        };
+        src.push_str(tmp) catch |e| {
+            out.deinit();
+            return e;
+        };
+        tmp = src.bytes();
+        hex_into(tmp, &mut p, &mut out) catch |e| {
+            out.deinit();
+            return e;
+        };
+        return out.take();
+    }
+    if strs.eq(f, "ASCII85Decode") or strs.eq(f, "A85") {
+        return ascii85(data, limit);
+    }
+    if strs.eq(f, "RunLengthDecode") or strs.eq(f, "RL") {
+        return run_length(data, limit);
+    }
+    // images (DCT, JPX, JBIG2, CCITT) and anything else stay as they are
+    return mem.dup.[u8](data);
+}
+
+/// PNG (10 and up) and TIFF (2) predictors.
+fn predict(data: []mut u8, parms: Object) ReadError![]mut u8 {
+    let d = parms.as_dict() catch return data;
+    let pred = d.get("Predictor").as_int() catch 1;
+    if pred < 2 {
+        return data;
+    }
+    let colors = @min(@max(d.get("Colors").as_int() catch 1, 1), 32);
+    let bpc = @min(@max(d.get("BitsPerComponent").as_int() catch 8, 1), 16);
+    let cols = @min(@max(d.get("Columns").as_int() catch 1, 1), 1 << 24);
+    let bpp = @truncate(usize, @bit_cast(u64, @max((colors * bpc) / 8, 1)));
+    let row = @truncate(usize, @bit_cast(u64, ((colors * bpc * cols) + 7) / 8));
+    if pred == 2 {
+        if bpc == 8 {
+            let mut i: usize = 0;
+            while i < data.len {
+                let e = @min(i + row, data.len);
+                for k in i + bpp..e {
+                    data[k] = data[k] +% data[k - bpp];
+                }
+                i = e;
+            }
+        }
+        return data;
+    }
+    // PNG: each row starts with a filter type byte
+    let mut out = mem.alloc.[u8]((data.len / (row + 1)) * row) catch |e| {
+        mem.free(data);
+        return e;
+    };
+    let rows = data.len / (row + 1);
+    for r in 0..rows {
+        let src = data[r * (row + 1)..(r + 1) * (row + 1)];
+        let ft = src[0];
+        let o = r * row;
+        for k in 0..row {
+            let x = src[k + 1];
+            let mut a: u8 = 0;
+            if k >= bpp {
+                a = out[o + k - bpp];
+            }
+            let mut b: u8 = 0;
+            if r > 0 {
+                b = out[o + k - row];
+            }
+            let mut c: u8 = 0;
+            if (r > 0) and (k >= bpp) {
+                c = out[o + k - row - bpp];
+            }
+            let mut v = x;
+            if ft == 1 {
+                v = x +% a;
+            } else if ft == 2 {
+                v = x +% b;
+            } else if ft == 3 {
+                v = x +% @truncate(u8, (@as(u32, a) + @as(u32, b)) / 2);
+            } else if ft == 4 {
+                let p = @as(i32, a) + @as(i32, b) - @as(i32, c);
+                let pa = @abs(p - @as(i32, a));
+                let pb = @abs(p - @as(i32, b));
+                let pc = @abs(p - @as(i32, c));
+                let mut pr = c;
+                if (pa <= pb) and (pa <= pc) {
+                    pr = a;
+                } else if pb <= pc {
+                    pr = b;
+                }
+                v = x +% pr;
+            }
+            out[o + k] = v;
+        }
+    }
+    mem.free(data);
+    return out;
+}
+
+fn lzw_decode(data: []u8, early: bool, limit: usize) ReadError![]mut u8 {
+    let mut out = strs.String.init();
+    // the table: each entry is a previous entry plus a byte
+    let mut prefix = vec.Vec.[u32].init();
+    defer prefix.deinit();
+    let mut last = vec.Vec.[u8].init();
+    defer last.deinit();
+    let mut first = vec.Vec.[u8].init();
+    defer first.deinit();
+    let mut lens = vec.Vec.[u32].init();
+    defer lens.deinit();
+    let mut tmp = vec.Vec.[u8].init();
+    defer tmp.deinit();
+    let r = lzw_run(data, early, limit, &mut out, &mut prefix, &mut last, &mut first, &mut lens, &mut tmp);
+    r catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+fn lzw_reset(prefix: *mut vec.Vec.[u32], last: *mut vec.Vec.[u8], first: *mut vec.Vec.[u8],
+             lens: *mut vec.Vec.[u32]) ReadError!void {
+    prefix.clear();
+    last.clear();
+    first.clear();
+    lens.clear();
+    for k in @as(u32, 0)..258 {
+        prefix.push(0xffffffff)!;
+        last.push(@truncate(u8, k))!;
+        first.push(@truncate(u8, k))!;
+        lens.push(1)!;
+    }
+}
+
+fn lzw_run(data: []u8, early: bool, limit: usize, out: *mut strs.String, prefix: *mut vec.Vec.[u32],
+           last: *mut vec.Vec.[u8], first: *mut vec.Vec.[u8], lens: *mut vec.Vec.[u32],
+           tmp: *mut vec.Vec.[u8]) ReadError!void {
+    lzw_reset(prefix, last, first, lens)!;
+    let mut bits: u32 = 9;
+    let mut acc: u64 = 0;
+    let mut have: u32 = 0;
+    let mut prev: u32 = 0xffffffff;
+    let mut i: usize = 0;
+    while true {
+        while (have < bits) and (i < data.len) {
+            acc = (acc << 8) | @as(u64, data[i]);
+            have += 8;
+            i += 1;
+        }
+        if have < bits {
+            break;
+        }
+        let code = @truncate(u32, (acc >> @as(u64, have - bits)) & ((@as(u64, 1) << @as(u64, bits)) - 1));
+        have -= bits;
+        if code == 256 {
+            lzw_reset(prefix, last, first, lens)!;
+            bits = 9;
+            prev = 0xffffffff;
+            continue;
+        }
+        if code == 257 {
+            break;
+        }
+        let n = @truncate(u32, prefix.len());
+        if code > n {
+            break;  // corrupt
+        }
+        if prev != 0xffffffff {
+            // add prev + first byte of this code's string
+            let fb = if_code(code == n, first.get(@as(usize, prev)), first.get(@as(usize, @min(code, n - 1))));
+            if n < 4096 {
+                prefix.push(prev)!;
+                last.push(fb)!;
+                first.push(first.get(@as(usize, prev)))!;
+                lens.push(lens.get(@as(usize, prev)) + 1)!;
+            }
+        } else if code == n {
+            break;
+        }
+        // emit code's string
+        let c = @min(code, @truncate(u32, prefix.len()) - 1);
+        tmp.clear();
+        let mut k = c;
+        let mut guard: u32 = 0;
+        while (k != 0xffffffff) and (guard < 4097) {
+            tmp.push(last.get(@as(usize, k)))!;
+            k = prefix.get(@as(usize, k));
+            guard += 1;
+        }
+        let t = tmp.items();
+        let mut j = t.len;
+        while j > 0 {
+            j -= 1;
+            out.push(t[j])!;
+        }
+        if out.len() > limit {
+            return error.TooLarge;
+        }
+        prev = c;
+        let size = @truncate(u32, prefix.len()) + if_u32(early, 1, 0);
+        if (size >= 512) and (bits == 9) {
+            bits = 10;
+        } else if (size >= 1024) and (bits == 10) {
+            bits = 11;
+        } else if (size >= 2048) and (bits == 11) {
+            bits = 12;
+        }
+    }
+}
+
+fn if_code(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn if_u32(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn ascii85(data: []u8, limit: usize) ReadError![]mut u8 {
+    let mut out = strs.String.init();
+    let mut group: [5]u32 = [0, 0, 0, 0, 0];
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    if strs.starts_with(data, "<~") {
+        i = 2;
+    }
+    while i < data.len {
+        let c = data[i];
+        i += 1;
+        if c == '~' {
+            break;
+        }
+        if is_white(c) {
+            continue;
+        }
+        if (c == 'z') and (n == 0) {
+            out.push_str("\x00\x00\x00\x00") catch |e| {
+                out.deinit();
+                return e;
+            };
+            continue;
+        }
+        if (c < '!') or (c > 'u') {
+            continue;
+        }
+        group[n] = @as(u32, c - '!');
+        n += 1;
+        if n == 5 {
+            let mut v: u64 = 0;
+            for k in @as(usize, 0)..5 {
+                v = (v * 85) + @as(u64, group[k]);
+            }
+            let w = @truncate(u32, v);
+            for k in @as(u32, 0)..4 {
+                out.push(@truncate(u8, w >> (24 - (8 * k)))) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+            }
+            n = 0;
+        }
+        if out.len() > limit {
+            out.deinit();
+            return error.TooLarge;
+        }
+    }
+    if n > 1 {
+        for k in n..5 {
+            group[k] = 84;
+        }
+        let mut v: u64 = 0;
+        for k in @as(usize, 0)..5 {
+            v = (v * 85) + @as(u64, group[k]);
+        }
+        let w = @truncate(u32, v);
+        for k in @as(u32, 0)..@truncate(u32, n - 1) {
+            out.push(@truncate(u8, w >> (24 - (8 * k)))) catch |e| {
+                out.deinit();
+                return e;
+            };
+        }
+    }
+    return out.take();
+}
+
+fn run_length(data: []u8, limit: usize) ReadError![]mut u8 {
+    let mut out = strs.String.init();
+    let mut i: usize = 0;
+    while i < data.len {
+        let n = @as(usize, data[i]);
+        i += 1;
+        if n == 128 {
+            break;
+        }
+        if n < 128 {
+            let e = @min(i + n + 1, data.len);
+            out.push_str(data[i..e]) catch |err| {
+                out.deinit();
+                return err;
+            };
+            i = e;
+        } else if i < data.len {
+            for _k in 0..257 - n {
+                out.push(data[i]) catch |err| {
+                    out.deinit();
+                    return err;
+                };
+            }
+            i += 1;
+        }
+        if out.len() > limit {
+            out.deinit();
+            return error.TooLarge;
+        }
+    }
+    return out.take();
+}

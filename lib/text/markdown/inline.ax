@@ -1,0 +1,678 @@
+// =============================================================================
+// lib/text/markdown/inline.ax - Inline parsing, code spans, math, emphasis, and text merging, part of lib/text/markdown.
+// =============================================================================
+
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Inlines
+// -----------------------------------------------------------------------------
+
+pub const MAX_BACKTICKS: usize = 1000;
+
+const NO_CLOSER: usize = 0xffffffff;  // (inputs are under 1 GB)
+
+fn inlines_all(p: *mut Parser) MarkdownError!void {
+    p.ticks.clear();
+    for _k in 0..MAX_BACKTICKS + 1 {
+        p.ticks.push(0)!;
+    }
+    let count = p.doc.nodes.len();
+    for i in 0..count {
+        let n = p.doc.nodes.get(i);
+        if n.parent == NONE and (i != 0) {
+            continue;  // removed
+        }
+        if (n.kind != Kind.PARAGRAPH) and (n.kind != Kind.HEADING) and (n.kind != Kind.TABLE_CELL) {
+            continue;
+        }
+        let id = @truncate(u32, i);
+        let mut r = n.text;
+        if n.kind == Kind.TABLE_CELL {
+            // \| stands for a pipe in a cell, even inside code
+            let c = p.doc.str(r);
+            if strs.contains(c, "\\|") {
+                let start = p.doc.raw.len();
+                let mut k: usize = 0;
+                p.scratch.clear();
+                while k < c.len {
+                    if (c[k] == '\\') and (k + 1 < c.len) and (c[k + 1] == '|') {
+                        k += 1;
+                    }
+                    p.scratch.push(c[k])!;
+                    k += 1;
+                }
+                p.doc.raw.push_str(p.scratch.bytes())!;
+                r = Ref.{ off: @truncate(u32, start), len: @truncate(u32, p.doc.raw.len() - start), raw: true };
+            }
+        }
+        let first = @truncate(u32, p.doc.nodes.len());
+        parse_inlines(p, id, r)!;
+        merge_text(p, id, first)!;
+        if p.opts.gfm {
+            autolink_block(p, id)!;
+        }
+    }
+}
+
+fn subject_at(p: *mut Parser, i: usize) u8 {
+    if i < p.s.len {
+        return p.s[i];
+    }
+    return 0;
+}
+
+fn peek(p: *mut Parser) u8 {
+    return subject_at(p, p.pos);
+}
+
+fn parse_inlines(p: *mut Parser, block: u32, r: Ref) MarkdownError!void {
+    let mut s = p.doc.str(r);
+    while (s.len > 0) and is_ascii_space(s[s.len - 1]) {
+        s = s[..s.len - 1];
+    }
+    p.s = s;
+    p.sbase = r.off;
+    p.pos = 0;
+    p.block = block;
+    p.delims.clear();
+    p.last_delim = NONE;
+    p.brackets.clear();
+    p.link_barrier = 0;
+    p.ticks_scanned = false;
+    p.math1_from = NO_CLOSER;
+    p.math2_from = NO_CLOSER;
+    p.no_comment_end = false;
+    p.no_pi_end = false;
+    p.no_decl_end = false;
+    p.no_cdata_end = false;
+    p.scan_budget = (s.len * 8) + 4096;
+    while p.pos < p.s.len {
+        parse_inline(p)!;
+    }
+    process_emphasis(p, 0)!;
+}
+
+fn text_node(p: *mut Parser, a: usize, b: usize) MarkdownError!u32 {
+    let id = p.append(p.block, Kind.TEXT)!;
+    p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, a), len: @truncate(u32, b - a), raw: true };
+    return id;
+}
+
+fn text_node_buf(p: *mut Parser, r: Ref) MarkdownError!u32 {
+    let id = p.append(p.block, Kind.TEXT)!;
+    p.nd(id).text = r;
+    return id;
+}
+
+fn buf_ref(p: *mut Parser, s: []u8) MarkdownError!Ref {
+    let off = p.doc.buf.len();
+    p.doc.buf.push_str(s)!;
+    return Ref.{ off: @truncate(u32, off), len: @truncate(u32, s.len), raw: false };
+}
+
+fn is_special(c: u8, gfm: bool, math: bool) bool {
+    return (c == '\n') or (c == '\r') or (c == '`') or (c == '\\') or (c == '&') or (c == '_') or (c == '*') or
+           (c == '[') or (c == ']') or (c == '<') or (c == '!') or (gfm and (c == '~')) or (math and (c == '$'));
+}
+
+fn parse_inline(p: *mut Parser) MarkdownError!void {
+    let c = peek(p);
+    if (c == '\n') or (c == '\r') {
+        let nl = p.pos;
+        if peek(p) == '\r' {
+            p.pos += 1;
+        }
+        if peek(p) == '\n' {
+            p.pos += 1;
+        }
+        while is_space_or_tab(peek(p)) {
+            p.pos += 1;
+        }
+        if (nl > 1) and (p.s[nl - 1] == ' ') and (p.s[nl - 2] == ' ') {
+            _ = p.append(p.block, Kind.HARD_BREAK)!;
+        } else {
+            _ = p.append(p.block, Kind.SOFT_BREAK)!;
+        }
+    } else if c == '`' {
+        handle_backticks(p)!;
+    } else if (c == '$') and p.opts.math {
+        handle_dollars(p)!;
+    } else if c == '\\' {
+        p.pos += 1;
+        let d = peek(p);
+        if is_ascii_punct(d) {
+            p.pos += 1;
+            _ = text_node(p, p.pos - 1, p.pos)!;
+        } else if (d == '\n') or (d == '\r') {
+            if d == '\r' {
+                p.pos += 1;
+            }
+            if peek(p) == '\n' {
+                p.pos += 1;
+            }
+            while is_space_or_tab(peek(p)) {
+                p.pos += 1;
+            }
+            _ = p.append(p.block, Kind.HARD_BREAK)!;
+        } else {
+            _ = text_node(p, p.pos - 1, p.pos)!;
+        }
+    } else if c == '&' {
+        let mut a: u32 = 0;
+        let mut b: u32 = 0;
+        let n = scan_entity(p.s, p.pos, &mut a, &mut b);
+        if n > 0 {
+            let off = p.doc.buf.len();
+            p.doc.buf.push_rune(a)!;
+            if b != 0 {
+                p.doc.buf.push_rune(b)!;
+            }
+            _ = text_node_buf(p, Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len() - off),
+                                       raw: false })!;
+            p.pos += n;
+        } else {
+            p.pos += 1;
+            _ = text_node(p, p.pos - 1, p.pos)!;
+        }
+    } else if c == '<' {
+        handle_pointy(p)!;
+    } else if (c == '*') or (c == '_') or ((c == '~') and p.opts.gfm) {
+        handle_delim(p, c)!;
+    } else if c == '[' {
+        p.pos += 1;
+        let t = text_node(p, p.pos - 1, p.pos)!;
+        push_bracket(p, t, false)!;
+    } else if c == ']' {
+        handle_close_bracket(p)!;
+    } else if c == '!' {
+        p.pos += 1;
+        if peek(p) == '[' {
+            p.pos += 1;
+            let t = text_node(p, p.pos - 2, p.pos)!;
+            push_bracket(p, t, true)!;
+        } else {
+            _ = text_node(p, p.pos - 1, p.pos)!;
+        }
+    } else {
+        let start = p.pos;
+        let gfm = p.opts.gfm;
+        let math = p.opts.math;
+        let mut e = p.pos;
+        while (e < p.s.len) and not is_special(p.s[e], gfm, math) {
+            e += 1;
+        }
+        p.pos = e;
+        let mut te = e;
+        if (e < p.s.len) and ((p.s[e] == '\n') or (p.s[e] == '\r')) {
+            while (te > start) and is_ascii_space(p.s[te - 1]) {
+                te -= 1;
+            }
+        }
+        if te > start {
+            _ = text_node(p, start, te)!;
+        }
+        if e == start {
+            // (a special character with no handler here)
+            p.pos += 1;
+            _ = text_node(p, start, p.pos)!;
+        }
+    }
+}
+
+// --- code spans ---
+
+fn handle_backticks(p: *mut Parser) MarkdownError!void {
+    let start = p.pos;
+    while peek(p) == '`' {
+        p.pos += 1;
+    }
+    let n = p.pos - start;
+    let after = p.pos;
+    let close = scan_closing_ticks(p, n);
+    if close == 0 {
+        p.pos = after;
+        _ = text_node(p, start, after)!;
+        return;
+    }
+    // contents: line endings become spaces; one space off each end if both have one
+    let raw = p.s[after..close - n];
+    let off = p.doc.buf.len();
+    for b in raw {
+        if (b == '\n') or (b == '\r') {
+            p.doc.buf.push(' ')!;
+        } else {
+            p.doc.buf.push(b)!;
+        }
+    }
+    let mut a = off;
+    let mut e = p.doc.buf.len();
+    let body = p.doc.buf.bytes()[off..e];
+    if (body.len >= 2) and (body[0] == ' ') and (body[body.len - 1] == ' ') {
+        let mut all = true;
+        for b in body {
+            if b != ' ' {
+                all = false;
+                break;
+            }
+        }
+        if not all {
+            a += 1;
+            e -= 1;
+        }
+    }
+    let id = p.append(p.block, Kind.CODE)!;
+    p.nd(id).text = Ref.{ off: @truncate(u32, a), len: @truncate(u32, e - a), raw: false };
+}
+
+/// Where the run of exactly n backticks closing a code span ends, or 0.
+fn scan_closing_ticks(p: *mut Parser, n: usize) usize {
+    if n > MAX_BACKTICKS {
+        return 0;
+    }
+    if p.ticks_scanned and (p.ticks.get(n) <= p.pos) {
+        return 0;
+    }
+    if not p.ticks_scanned {
+        for k in 0..MAX_BACKTICKS + 1 {
+            p.ticks.set(k, 0);
+        }
+    }
+    while true {
+        while (p.pos < p.s.len) and (p.s[p.pos] != '`') {
+            p.pos += 1;
+        }
+        if p.pos >= p.s.len {
+            break;
+        }
+        let ts = p.pos;
+        while peek(p) == '`' {
+            p.pos += 1;
+        }
+        let m = p.pos - ts;
+        if m <= MAX_BACKTICKS {
+            p.ticks.set(m, ts);
+        }
+        if m == n {
+            return p.pos;
+        }
+    }
+    p.ticks_scanned = true;
+    return 0;
+}
+
+// --- math ---
+
+fn handle_dollars(p: *mut Parser) MarkdownError!void {
+    let start = p.pos;
+    while peek(p) == '$' {
+        p.pos += 1;
+    }
+    let n = p.pos - start;
+    let after = p.pos;
+    if n == 1 {
+        let c = peek(p);
+        if c == '`' {
+            // GitHub's $`...`$: the backticks as in a code span (the same
+            // number on each side), then the $ right after them
+            while peek(p) == '`' {
+                p.pos += 1;
+            }
+            let k = p.pos - after;
+            let close = scan_closing_ticks(p, k);
+            if (close != 0) and (at(p.s, close) == '$') {
+                let id = p.append(p.block, Kind.MATH)!;
+                p.nd(id).text = Ref.{
+                    off: p.sbase + @truncate(u32, after + k), len: @truncate(u32, close - k - (after + k)), raw: true };
+                p.pos = close + 1;
+                return;
+            }
+        } else if (c != 0) and not is_ascii_space(c) {
+            let close = math_closer1(p, after);
+            if close != NO_CLOSER {
+                let id = p.append(p.block, Kind.MATH)!;
+                p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, after), len: @truncate(u32, close - after),
+                                      raw: true };
+                p.pos = close + 1;
+                return;
+            }
+        }
+    } else if n == 2 {
+        let close = math_closer2(p, after);
+        if close != NO_CLOSER {
+            let mut a = after;
+            let mut e = close;
+            while (a < e) and is_ascii_space(p.s[a]) {
+                a += 1;
+            }
+            while (e > a) and is_ascii_space(p.s[e - 1]) {
+                e -= 1;
+            }
+            if e > a {
+                let id = p.append(p.block, Kind.DISPLAY_MATH)!;
+                p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, a), len: @truncate(u32, e - a), raw: true };
+                p.pos = close + 2;
+                return;
+            }
+        }
+    }
+    p.pos = after;
+    _ = text_node(p, start, after)!;
+}
+
+/// The next $ at or after `from` that can close inline math: alone (not
+/// in $$), not escaped, after a non-space and not before a digit.
+fn math_closer1(p: *mut Parser, from: usize) usize {
+    if (p.math1_from != NO_CLOSER) and (p.math1_from <= from) and ((p.math1 == NO_CLOSER) or (p.math1 >= from)) {
+        return p.math1;
+    }
+    let s = p.s;
+    let mut found = NO_CLOSER;
+    let mut i = @max(from, 1);
+    while i < s.len {
+        if s[i] == '$' {
+            let b = s[i - 1];
+            let nx = at(s, i + 1);
+            if (b != '$') and (b != '\\') and not is_ascii_space(b) and (nx != '$') and not strs.is_digit(nx) {
+                found = i;
+                break;
+            }
+        }
+        i += 1;
+    }
+    p.math1_from = from;
+    p.math1 = found;
+    return found;
+}
+
+/// The next unescaped $$ at or after `from`.
+fn math_closer2(p: *mut Parser, from: usize) usize {
+    if (p.math2_from != NO_CLOSER) and (p.math2_from <= from) and ((p.math2 == NO_CLOSER) or (p.math2 >= from)) {
+        return p.math2;
+    }
+    let s = p.s;
+    let mut found = NO_CLOSER;
+    let mut i = from;
+    while i + 1 < s.len {
+        if (s[i] == '$') and (s[i + 1] == '$') and ((i == 0) or (s[i - 1] != '\\')) {
+            found = i;
+            break;
+        }
+        i += 1;
+    }
+    p.math2_from = from;
+    p.math2 = found;
+    return found;
+}
+
+// --- emphasis ---
+
+fn char_before(s: []u8, i: usize) u32 {
+    if i == 0 {
+        return '\n';
+    }
+    let mut k = i - 1;
+    while (k > 0) and ((s[k] & 0xc0) == 0x80) and (i - k < 4) {
+        k -= 1;
+    }
+    let r = strs.decode_rune(s[k..i]);
+    return r.value;
+}
+
+fn char_at(s: []u8, i: usize) u32 {
+    if i >= s.len {
+        return '\n';
+    }
+    return strs.decode_rune(s[i..]).value;
+}
+
+fn handle_delim(p: *mut Parser, c: u8) MarkdownError!void {
+    let start = p.pos;
+    while peek(p) == c {
+        p.pos += 1;
+    }
+    let n = p.pos - start;
+    let before = char_before(p.s, start);
+    let after = char_at(p.s, p.pos);
+    let sp_before = is_unicode_space(before);
+    let sp_after = is_unicode_space(after);
+    let pu_before = is_unicode_punct(before);
+    let pu_after = is_unicode_punct(after);
+    let left = not sp_after and (not pu_after or sp_before or pu_before);
+    let right = not sp_before and (not pu_before or sp_after or pu_after);
+    let mut can_open = left;
+    let mut can_close = right;
+    if c == '_' {
+        can_open = left and (not right or pu_before);
+        can_close = right and (not left or pu_after);
+    }
+    let t = text_node(p, start, p.pos)!;
+    if c == '~' and (n > 2) {
+        return;
+    }
+    if can_open or can_close {
+        let d = Delim.{
+            node: t,
+            c: c,
+            len: n,
+            can_open: can_open,
+            can_close: can_close,
+            pos: p.pos,
+            prev: p.last_delim,
+            next: NONE,
+        };
+        let id = @truncate(u32, p.delims.len());
+        p.delims.push(d)!;
+        if p.last_delim != NONE {
+            p.delims.get_ptr(@as(usize, p.last_delim)).next = id;
+        }
+        p.last_delim = id;
+    }
+}
+
+fn remove_delim(p: *mut Parser, id: u32) void {
+    let d = p.delims.get(@as(usize, id));
+    if d.next != NONE {
+        p.delims.get_ptr(@as(usize, d.next)).prev = d.prev;
+    } else {
+        p.last_delim = d.prev;
+    }
+    if d.prev != NONE {
+        p.delims.get_ptr(@as(usize, d.prev)).next = d.next;
+    }
+}
+
+fn bottom_index(d: Delim) usize {
+    if d.c == '~' {
+        return 12;
+    }
+    let mut k = d.len % 3;
+    if d.can_open {
+        k += 3;
+    }
+    if d.c == '*' {
+        k += 6;
+    }
+    return k;
+}
+
+fn process_emphasis(p: *mut Parser, stack_bottom: usize) MarkdownError!void {
+    let mut bottoms: [13]usize = [stack_bottom; 13];
+    // the first delimiter above the bottom
+    let mut closer = NONE;
+    let mut cand = p.last_delim;
+    while (cand != NONE) and (p.delims.get(@as(usize, cand)).pos >= stack_bottom) {
+        closer = cand;
+        cand = p.delims.get(@as(usize, cand)).prev;
+    }
+    while closer != NONE {
+        let cd = p.delims.get(@as(usize, closer));
+        if not cd.can_close {
+            closer = cd.next;
+            continue;
+        }
+        let bi = bottom_index(cd);
+        let mut opener = cd.prev;
+        let mut found = false;
+        while opener != NONE {
+            let od = p.delims.get(@as(usize, opener));
+            if od.pos < bottoms[bi] {
+                break;
+            }
+            if od.can_open and (od.c == cd.c) {
+                if (not (cd.can_open or od.can_close)) or (cd.len % 3 == 0) or ((od.len + cd.len) % 3 != 0) {
+                    found = true;
+                    break;
+                }
+            }
+            opener = od.prev;
+        }
+        let old = closer;
+        if found {
+            if cd.c == '~' {
+                closer = insert_strike(p, opener, closer)!;
+            } else {
+                closer = insert_emph(p, opener, closer)!;
+            }
+        } else {
+            closer = cd.next;
+            bottoms[bi] = cd.pos;
+            if not cd.can_open {
+                remove_delim(p, old);
+            }
+        }
+    }
+    while (p.last_delim != NONE) and (p.delims.get(@as(usize, p.last_delim)).pos >= stack_bottom) {
+        remove_delim(p, p.last_delim);
+    }
+}
+
+fn insert_emph(p: *mut Parser, opener: u32, closer: u32) MarkdownError!u32 {
+    let od = p.delims.get(@as(usize, opener));
+    let cd = p.delims.get(@as(usize, closer));
+    let mut on = @as(usize, p.nd(od.node).text.len);
+    let mut cn = @as(usize, p.nd(cd.node).text.len);
+    let mut use: usize = 1;
+    if (on >= 2) and (cn >= 2) {
+        use = 2;
+    }
+    on -= use;
+    cn -= use;
+    p.nd(od.node).text.len = @truncate(u32, on);
+    p.nd(cd.node).text.len = @truncate(u32, cn);
+    // delimiters in between are done
+    let mut d = cd.prev;
+    while (d != NONE) and (d != opener) {
+        let prev = p.delims.get(@as(usize, d)).prev;
+        remove_delim(p, d);
+        d = prev;
+    }
+    let mut kind = Kind.EMPH;
+    if use == 2 {
+        kind = Kind.STRONG;
+    }
+    let emph = p.append(NONE, kind)!;
+    let mut t = p.nd(od.node).next;
+    while (t != NONE) and (t != cd.node) {
+        let nx = p.nd(t).next;
+        append_child(p.doc, emph, t);
+        t = nx;
+    }
+    insert_after(p.doc, od.node, emph);
+    if on == 0 {
+        unlink_node(p.doc, od.node);
+        remove_delim(p, opener);
+    }
+    if cn == 0 {
+        unlink_node(p.doc, cd.node);
+        let nx = p.delims.get(@as(usize, closer)).next;
+        remove_delim(p, closer);
+        return nx;
+    }
+    return closer;
+}
+
+fn insert_strike(p: *mut Parser, opener: u32, closer: u32) MarkdownError!u32 {
+    let od = p.delims.get(@as(usize, opener));
+    let cd = p.delims.get(@as(usize, closer));
+    let res = cd.next;
+    if p.nd(od.node).text.len == p.nd(cd.node).text.len {
+        let st = p.append(NONE, Kind.STRIKETHROUGH)!;
+        let mut t = p.nd(od.node).next;
+        while (t != NONE) and (t != cd.node) {
+            let nx = p.nd(t).next;
+            append_child(p.doc, st, t);
+            t = nx;
+        }
+        insert_after(p.doc, od.node, st);
+        unlink_node(p.doc, od.node);
+        unlink_node(p.doc, cd.node);
+    }
+    let mut d = closer;
+    while (d != NONE) and (d != opener) {
+        let prev = p.delims.get(@as(usize, d)).prev;
+        remove_delim(p, d);
+        d = prev;
+    }
+    remove_delim(p, opener);
+    return res;
+}
+
+// --- after the inline parse of a block ---
+
+/// Joins runs of adjacent TEXT nodes (the parser makes many small ones).
+fn merge_text(p: *mut Parser, block: u32, first: u32) MarkdownError!void {
+    merge_children(p, block)!;
+    // the inline containers made for this block
+    let mut i = @as(usize, first);
+    while i < p.doc.nodes.len() {
+        let n = p.doc.nodes.get(i);
+        if (n.first != NONE) and is_inline(n.kind) {
+            merge_children(p, @truncate(u32, i))!;
+        }
+        i += 1;
+    }
+}
+
+fn merge_children(p: *mut Parser, parent: u32) MarkdownError!void {
+    let mut c = p.nd(parent).first;
+    while c != NONE {
+        let n = p.doc.nodes.get(@as(usize, c));
+        if (n.kind != Kind.TEXT) or (n.next == NONE) or (p.kind(n.next) != Kind.TEXT) {
+            c = n.next;
+            continue;
+        }
+        // a run of text nodes from c: contiguous in one buffer?
+        let mut contiguous = true;
+        let mut end = n.text.off + n.text.len;
+        let mut e = n.next;
+        while (e != NONE) and (p.kind(e) == Kind.TEXT) {
+            let t = p.nd(e).text;
+            if (t.raw != n.text.raw) or (t.off != end) {
+                contiguous = false;
+            }
+            end = t.off + t.len;
+            e = p.nd(e).next;
+        }
+        if contiguous {
+            p.nd(c).text.len = end - n.text.off;
+        } else {
+            p.scratch.clear();
+            let mut k = c;
+            while k != e {
+                p.scratch.push_str(p.doc.str(p.nd(k).text))!;
+                k = p.nd(k).next;
+            }
+            let r = buf_ref(p, p.scratch.bytes())!;
+            p.nd(c).text = r;
+        }
+        // drop the rest of the run
+        let mut k = p.nd(c).next;
+        while k != e {
+            let nx = p.nd(k).next;
+            unlink_node(p.doc, k);
+            k = nx;
+        }
+        c = e;
+    }
+}

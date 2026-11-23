@@ -38,7 +38,9 @@ struct DocMod {
     decls: u.List.[*mut ast.Decl],
 }
 
-threadlocal let mut g_std: []u8 = "";  // the standard library's directory (real path)
+threadlocal let mut g_std: []u8 = "";        // the standard library's directory (real path)
+threadlocal let mut g_lib: []u8 = "";        // the libraries' (lib/ beside it; real path, or "")
+threadlocal let mut g_lib_named: []u8 = "";  // and as named
 threadlocal let mut g_cwd: []u8 = "";
 threadlocal let mut g_json: bool = false;
 threadlocal let mut g_mods: u.SymMap.[*mut DocMod] = u.SymMap.[*mut DocMod].{
@@ -258,11 +260,15 @@ fn under(p: []u8, dir: []u8) bool {
     return (dir.len > 0) and u.starts(p, dir) and ((p.len == dir.len) or (p[dir.len] == '/'));
 }
 
-// How a file is shown: std/... for the standard library's (as diagnostics
-// show them), relative to the current directory under it, else its path.
+// How a file is shown: std/... for the standard library's and lib/... for
+// the libraries' (as diagnostics show them), relative to the current
+// directory under it, else its path.
 fn display(rp: []u8) []u8 {
     if under(rp, g_std) and (rp.len > g_std.len) {
         return u.f1("std/%s", rp[g_std.len + 1..]);
+    }
+    if under(rp, g_lib) and (rp.len > g_lib.len) {
+        return u.f1("lib/%s", rp[g_lib.len + 1..]);
     }
     if under(rp, g_cwd) and (rp.len > g_cwd.len) {
         return u.dup(rp[g_cwd.len + 1..]);
@@ -339,6 +345,8 @@ fn import_target(d: *mut ast.Decl) []u8 {
     let mut p = u.nosym();
     if u.starts(ip, "std/") {
         p = u.f2("%s/%s", g_std, ax_path(ip[4..]));
+    } else if u.starts(ip, "lib/") {
+        p = u.f2("%s/%s", g_lib_named, ax_path(ip[4..]));
     } else if u.starts(ip, "pkg:") {
         p = pkg.resolve_import(pkg.for_file(from), ip, d.import_path_span);
         dg.clear();
@@ -388,10 +396,13 @@ fn modules_under(dir: []u8, out: *mut u.List.[[]u8]) void {
     collect(dir, &mut all);
     u.sort(all.items_mut(), u.str_cmp);
     // (the modules that own part files here may be outside dir: in the
-    // standard library anywhere, elsewhere beside it, as x.ax owns x/y.ax)
+    // standard library or the libraries anywhere, elsewhere beside it, as
+    // x.ax owns x/y.ax)
     let mut owners = u.List.[[]u8].empty();
     if under(dir, g_std) {
         collect(g_std, &mut owners);
+    } else if under(dir, g_lib) {
+        collect(g_lib, &mut owners);
     } else {
         let mut names = u.List.[[]u8].empty();
         let up = dir_of(dir);
@@ -1016,6 +1027,14 @@ fn resolve(arg: []u8, t: *mut Target) bool {
         t.dir = g_std;
         return true;
     }
+    if u.str_eq(arg, "lib") or u.str_eq(arg, "lib/") {
+        if g_lib.len == 0 {
+            _ = fail("E0211", u.f1("cannot find the libraries' directory '%s'", g_lib_named));
+            return false;
+        }
+        t.dir = g_lib;
+        return true;
+    }
     if u.starts(arg, "pkg:") {
         let parts = split_item(arg);
         let here = u.real_path(".");
@@ -1057,9 +1076,12 @@ fn resolve(arg: []u8, t: *mut Target) bool {
     if u.starts(arg, "std/") {
         base = u.f2("%s/%s", g_std, arg[4..]);
         name = "std/";
+    } else if u.starts(arg, "lib/") {
+        base = u.f2("%s/%s", g_lib_named, arg[4..]);
+        name = "lib/";
     }
-    // a directory: its modules, or a package's entry module (std/net/http
-    // is the module, std/net/http/ the directory beside it)
+    // a directory: its modules, or a package's entry module (lib/net/http
+    // is the module, lib/net/http/ the directory beside it)
     let rd = u.real_path(base);
     if not u.isnos(rd) and u.is_dir(rd) and (u.ends(arg, "/") or not u.is_file(u.cat2(rd, ".ax"))) {
         if u.is_file(u.cat2(rd, "/axiom.toml")) {
@@ -1228,7 +1250,8 @@ fn match_item(m: *mut DocMod, d: *mut ast.Decl, text: []u8, by_name: *mut u.List
 }
 
 fn usage() i32 {
-    u.eprint("usage: axiom doc <std | std/<module>[.<item>] | pkg:<name>[/<module>][.<item>] | <file.ax>[.<item>] | <dir>>\n");
+    u.eprint("usage: axiom doc <std | std/<module>[.<item>] | lib | lib/<module>[.<item>] | pkg:<name>[/<module>][.<item>] |\n");
+    u.eprint("                  <file.ax>[.<item>] | <dir>>\n");
     u.eprint("       axiom doc --search=<text> [<root>]   (root: as above, default std)\n");
     u.eprint("  --format=human|agent-json  --std=<dir>\n");
     return 2;
@@ -1277,6 +1300,11 @@ pub fn run_doc(args: [][]u8, std_dir: []u8) i32 {
     g_std = u.real_path(sdir);
     if u.isnos(g_std) {
         g_std = sdir;
+    }
+    g_lib_named = u.lib_dir_of(sdir);
+    g_lib = u.real_path(g_lib_named);
+    if u.isnos(g_lib) {
+        g_lib = "";
     }
     g_cwd = u.cwd();
     modl.g_std_dir = g_std;
