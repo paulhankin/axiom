@@ -175,14 +175,42 @@ Done. The Problem above describes the tree as it was.
   shift by a lane of a vector (`vec_shift_lane_count.ax`); and `k - @clz(x)` with `k`
   near the bottom of i64 overflowed in x86-64's instruction selection
   (`clz_sub_const_min.ax`).
+- Two more generators cover calls, aggregates and control flow, and the gaps above are
+  closed. `gen_exact_calls.py` (`exact_calls_*.ax`): random functions, in levels that
+  call only lower ones, taking and returning random types (integers of every width,
+  floats, bools, enums with and without a representation, nested structs in orders that
+  need padding, a generic struct, arrays, unions, optionals, error unions, vectors of 128
+  to 512 bits) by value, through `*T` and `*mut T` (to globals, their fields and
+  elements, the callers' locals and parameters) and in slices of global and local
+  arrays, with up to 30 parameters mixing integers, floats and vectors; methods by
+  `Self`, `*Self` and `*mut Self`, generic functions (deduced and explicit, with `const`
+  function and length parameters), recursion to a depth from memory, calls through
+  tables of functions and function parameters, and errors returned, propagated with `!`
+  and replaced with `catch`; each line hashes a call's results and the memory it
+  wrote. `gen_exact_flow.py` (`exact_flow_*.ax`): random nested `if`, `for`, `while`
+  and `loop` with labelled `break` and `continue`, `match` on enums, unions (also
+  through a pointer), integers, optionals, bools and errors, `if let`, `while let`,
+  `defer` and `errdefer`, early and error returns, every form of `catch`, and `and`/`or`
+  whose operands log; each line hashes a function's results with the log of every
+  statement that ran, in order. `exact_float_arith.ax` adds `@rem`, and
+  `exact_simd_mem.ax` (from `gen_exact_simd.py`) covers `v128`/`v256`/`v512`, the
+  `@dot` of `i8` and `u8` by `i8` lanes, and vectors stored and loaded through pointers
+  from `@ptr_cast` (unaligned, overlapping), slices at lane offsets, arrays and slices
+  of vectors (`@cast_slice`, `@slice_from_ptr`, `@ptr_add`), vector parameters by
+  pointer and a vector field changed through a pointer. Appendix A now defines `@rem`
+  and the `@dot` of 8-bit lanes, as the compiler had them. These programs, and 100
+  more of other seeds per new generator, pass on wasm32 and wasm64 (by hand) at -O0
+  and -O2, on x86-64 at -O0 to -O3 for the baseline and with AVX-512, and on AArch64
+  under qemu at -O0 to -O3; they found no wrong result.
 
 Not done:
 
 - The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead).
 - `docs/bootstrap-chain.md` records each release's commit and seed, not yet its hashes
   (they are in each release's `SHA256SUMS`).
-- The exact tests do not cover `@rem`, `v128`/`v256`/`v512`, the `@dot` of 8-bit
-  lanes, or vectors in memory through pointers and slices of vectors.
+- The exact tests do not cover threads and atomics, the C front end's calls (its ABI
+  has generators of its own), or `usize`/`isize` in the call and control-flow
+  programs.
 
 ### Risks
 
