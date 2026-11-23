@@ -1795,7 +1795,9 @@ await section('C programs', {
 });
 
 // `axiom test`: the standard library's and the libraries' own tests must
-// pass, and the self-tests in cmd/axiom/internal/tests/testing/ must produce
+// pass (under the address sanitizer, axiom test's default; the core's, std/,
+// also with --overflow=trap unless their flags name a mode: workstream G2),
+// and the self-tests in cmd/axiom/internal/tests/testing/ must produce
 // exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
 function dirsUnder(dir) {
@@ -1825,9 +1827,11 @@ const stdFiles = allStdFiles.filter((f) => {
   if (partOwned.has(r)) return false;
   return hasTestBlock(r) || (partTargets.get(r) || []).some(hasTestBlock);
 });
+const coreSet = new Set(coreFiles.map((f) => path.resolve(f)));
 await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/internal/tests/testing'))], '[axiom test]', async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
+  if (coreSet.has(path.resolve(f)) && !d.flags.some((x) => x.startsWith('--overflow='))) d.flags.push('--overflow=trap');
   if (buildOnly) {
     // (the test binary, built and checked: --no-run)
     const out = path.join(tmp, `test-${path.relative(root, f).replace(/[/.]/g, '-')}${/windows/.test(nativeTarget) ? '.exe' : ''}`);
@@ -2260,6 +2264,85 @@ await section('spec §15.3', {
     return problems.length ? `\n  ${problems.join('\n  ')}` : null;
   },
 }, { timed: false });
+
+// The core (std/, workstream G2 of docs/agent-fit-plan.md; spec §4.1): it
+// imports only itself, the compiler imports only it, and every public item
+// of the modules `axiom doc std` lists has a `///` comment (W0320). Its tests
+// run with --overflow=trap ([axiom test], above).
+{
+  const impRe = /^\s*import\s+(?:part\s+)?"([^"]+)"/gm;
+  const target = (from, ip) => {
+    if (ip.startsWith('pkg:')) return null;
+    const p = /\.ax$/.test(ip) ? ip : `${ip}.ax`;
+    if (ip.startsWith('std/') || ip.startsWith('lib/')) return path.join(root, p);
+    return path.resolve(path.dirname(from), p);
+  };
+  const under = (p, dir) => p.startsWith(path.join(root, dir) + path.sep);
+  // the C front end's arithmetic, which the compiler folds C constants with
+  // and C programs link (docs/c.md): lib/c/rt, since a release finds the C
+  // runtime there, and imported by a relative path, which the seed resolves;
+  // these import nothing but each other
+  const compilerLib = new Set(['lib/c/rt/ldouble.ax', 'lib/c/rt/wideint.ax', 'lib/c/rt/decimal.ax', 'lib/c/rt/dec_env.ax']
+    .map((f) => path.join(root, f)));
+  await section('core', {
+    'the core imports only the core': () => {
+      const bad = [];
+      for (const f of coreFiles) {
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (t && !under(t, 'std')) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'the compiler imports only the core': () => {
+      const bad = [], seen = new Set();
+      const stack = fs.readdirSync(path.join(root, 'cmd/axiom/src'), { recursive: true })
+        .filter((n) => n.endsWith('.ax')).map((n) => path.join(root, 'cmd/axiom/src', n));
+      while (stack.length) {
+        const f = stack.pop();
+        if (seen.has(f)) continue;
+        seen.add(f);
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (!t) continue;
+          const ok = under(t, 'cmd/axiom/src') || under(t, 'std') || (compilerLib.has(t) && (under(f, 'cmd/axiom/src') || compilerLib.has(f)));
+          if (!ok) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+          if (fs.existsSync(t)) stack.push(t);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'of the libraries, only the C runtime imports std/internal': () => {
+      const bad = [];
+      for (const f of libFiles) {
+        if (under(f, 'lib/c/rt')) continue;
+        for (const m of fs.readFileSync(f, 'utf8').matchAll(impRe)) {
+          const t = target(f, m[1]);
+          if (t && under(t, 'std/internal')) bad.push(`${path.relative(root, f)}: ${m[1]}`);
+        }
+      }
+      return bad.length ? `\n  ${bad.join('\n  ')}` : null;
+    },
+    'every public item of the core is documented (W0320)': async () => {
+      const stdDir = path.join(root, 'std');
+      const l = spawnSync(compiler, ['doc', 'std', '--format=agent-json', `--std=${stdDir}`], { encoding: 'utf8', cwd: root });
+      let mods;
+      try { mods = JSON.parse(l.stdout).modules; } catch { return `axiom doc std: ${l.stdout}${l.stderr}`; }
+      const got = [];
+      for (const m of mods) {
+        const c = await spawnAsync(compiler, ['check', m.file, '--warn=W0320', '--format=agent-json', `--std=${stdDir}`],
+          { encoding: 'utf8', cwd: root, timeout: compileTimeout });
+        let j;
+        try { j = JSON.parse(c.stdout); } catch { return `axiom check ${m.file}: ${c.stdout}${c.stderr}`; }
+        if (j.status === 'error') return `axiom check ${m.file}: ${c.stdout}`;
+        for (const d of j.diagnostics) if (d.code === 'W0320') got.push(`${d.file}:${d.span.start_line}: ${d.message}`);
+      }
+      if (mods.length < 40) return `axiom doc std listed only ${mods.length} modules`;
+      return got.length ? `\n  ${got.join('\n  ')}` : null;
+    },
+  }, { timed: false });
+}
 
 // Flags with no other assertion: each builds a program that then runs, or
 // produces the text asked for; `axiom version`; the version module's tests.

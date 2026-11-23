@@ -9,6 +9,7 @@
 
 import "mem.ax" as mem;
 
+/// The errors of this module.
 pub error SyncError { Closed, Empty, OutOfMemory }
 
 const WAIT_FOREVER: i64 = -1;
@@ -18,12 +19,15 @@ const NOTIFY_ALL: u32 = 0xFFFF_FFFF;
 pub struct Atomic[T: Int] {
     value: T,
 
+    /// An atomic holding v.
     pub fn init(v: T) Self {
         return Self.{ value: v };
     }
+    /// The value (sequentially consistent).
     pub fn load(self: *Self) T {
         return @atomic_load(&self.value, "seq_cst");
     }
+    /// Stores v (sequentially consistent).
     pub fn store(self: *mut Self, v: T) void {
         @atomic_store(&mut self.value, v, "seq_cst");
     }
@@ -35,6 +39,7 @@ pub struct Atomic[T: Int] {
     pub fn sub(self: *mut Self, v: T) T {
         return @atomic_sub(&mut self.value, v, "seq_cst");
     }
+    /// Stores v and returns the previous value.
     pub fn swap(self: *mut Self, v: T) T {
         return @atomic_xchg(&mut self.value, v, "seq_cst");
     }
@@ -49,10 +54,12 @@ pub struct Atomic[T: Int] {
 pub nocopy struct Mutex {
     state: u32,  // 0 unlocked, 1 locked, 2 locked with waiters
 
+    /// An unlocked mutex (MUTEX_INIT for a global).
     pub fn init() Mutex {
         return Mutex.{ state: 0 };
     }
 
+    /// Locks the mutex, waiting while another thread holds it.
     pub fn lock(self: *mut Mutex) void {
         let mut s = @atomic_cas(&mut self.state, 0, 1, "acquire");
         if s == 0 {
@@ -67,10 +74,12 @@ pub nocopy struct Mutex {
         }
     }
 
+    /// Locks the mutex if no thread holds it; returns whether it did.
     pub fn try_lock(self: *mut Mutex) bool {
         return @atomic_cas(&mut self.state, 0, 1, "acquire") == 0;
     }
 
+    /// Unlocks the mutex, waking a thread that waits for it.
     pub fn unlock(self: *mut Mutex) void {
         if @atomic_sub(&mut self.state, 1, "release") != 1 {
             @atomic_store(&mut self.state, 0, "release");
@@ -86,14 +95,17 @@ pub const MUTEX_INIT: Mutex = Mutex.{ state: 0 };
 pub nocopy struct WaitGroup {
     count: u32,
 
+    /// A WaitGroup with nothing to wait for.
     pub fn init() WaitGroup {
         return WaitGroup.{ count: 0 };
     }
 
+    /// Adds n tasks to wait for.
     pub fn add(self: *mut WaitGroup, n: u32) void {
         _ = @atomic_add(&mut self.count, n, "relaxed");
     }
 
+    /// Marks one task finished, waking the waiters when it was the last.
     pub fn done(self: *mut WaitGroup) void {
         if @atomic_sub(&mut self.count, 1, "acq_rel") == 1 {
             _ = @atomic_notify(&self.count, NOTIFY_ALL);
@@ -122,6 +134,7 @@ pub nocopy struct Channel[T] {
     not_empty: u32,  // bumped (and notified) whenever an item arrives or on close
     not_full: u32,   // bumped (and notified) whenever a slot frees or on close
 
+    /// An open channel that holds up to capacity items (at least 1); free it with deinit.
     pub fn init(capacity: usize) SyncError!Self {
         let buf = mem.alloc.[T](@max(capacity, 1))!;
         return Self.{ buf: buf, head: 0, len: 0, closed: false, lock: Mutex.init(), not_empty: 0, not_full: 0 };
@@ -220,6 +233,7 @@ pub nocopy struct Channel[T] {
 pub nocopy struct Condvar {
     seq: u32,
 
+    /// A condition variable with no waiters.
     pub fn init() Condvar {
         return Condvar.{ seq: 0 };
     }
@@ -264,10 +278,13 @@ pub nocopy struct RwLock {
     waiting: u32,  // writers waiting
     seq: u32,      // bumped (and notified) when the lock is released
 
+    /// An unlocked RwLock.
     pub fn init() RwLock {
         return RwLock.{ lock: Mutex.init(), readers: 0, writer: false, waiting: 0, seq: 0 };
     }
 
+    /// Takes the lock for reading, with other readers, waiting while a writer holds it or waits for
+    /// it.
     pub fn read_lock(self: *mut RwLock) void {
         self.lock.lock();
         while self.writer or (self.waiting > 0) {
@@ -277,6 +294,7 @@ pub nocopy struct RwLock {
         self.lock.unlock();
     }
 
+    /// Takes the lock for reading if no writer holds it or waits for it; returns whether it did.
     pub fn try_read_lock(self: *mut RwLock) bool {
         self.lock.lock();
         let ok = not self.writer and (self.waiting == 0);
@@ -287,6 +305,7 @@ pub nocopy struct RwLock {
         return ok;
     }
 
+    /// Gives back a read lock, waking a waiting writer after the last reader.
     pub fn read_unlock(self: *mut RwLock) void {
         self.lock.lock();
         self.readers -= 1;
@@ -300,6 +319,7 @@ pub nocopy struct RwLock {
         }
     }
 
+    /// Takes the lock for writing, alone, waiting until no reader or writer holds it.
     pub fn write_lock(self: *mut RwLock) void {
         self.lock.lock();
         self.waiting += 1;
@@ -311,6 +331,7 @@ pub nocopy struct RwLock {
         self.lock.unlock();
     }
 
+    /// Takes the lock for writing if no reader or writer holds it; returns whether it did.
     pub fn try_write_lock(self: *mut RwLock) bool {
         self.lock.lock();
         let ok = not self.writer and (self.readers == 0);
@@ -321,6 +342,7 @@ pub nocopy struct RwLock {
         return ok;
     }
 
+    /// Gives back the write lock, waking the threads that wait for it.
     pub fn write_unlock(self: *mut RwLock) void {
         self.lock.lock();
         self.writer = false;
@@ -343,10 +365,12 @@ pub nocopy struct RwLock {
 pub nocopy struct Semaphore {
     permits: u32,
 
+    /// A semaphore that holds `permits` permits.
     pub fn init(permits: u32) Semaphore {
         return Semaphore.{ permits: permits };
     }
 
+    /// Takes a permit, waiting until there is one.
     pub fn acquire(self: *mut Semaphore) void {
         loop {
             let p = @atomic_load(&self.permits, "relaxed");
@@ -373,6 +397,7 @@ pub nocopy struct Semaphore {
         }
     }
 
+    /// Gives back n permits, waking up to n waiting threads.
     pub fn release(self: *mut Semaphore, n: u32) void {
         _ = @atomic_add(&mut self.permits, n, "release");
         _ = @atomic_notify(&self.permits, n);
@@ -389,10 +414,13 @@ pub nocopy struct Semaphore {
 pub nocopy struct Once {
     state: u32,  // 0 not run, 1 running, 2 done
 
+    /// A Once that has not run (ONCE_INIT for a global).
     pub fn init() Once {
         return Once.{ state: 0 };
     }
 
+    /// Calls f(arg) if no call has yet; a thread that comes while it runs waits until it has
+    /// finished.
     pub fn call[C](self: *mut Once, f: fn(C) void, arg: C) void {
         if @atomic_load(&self.state, "acquire") == 2 {
             return;
@@ -408,6 +436,7 @@ pub nocopy struct Once {
         }
     }
 
+    /// Whether the function has run to its end.
     pub fn done(self: *Once) bool {
         return @atomic_load(&self.state, "acquire") == 2;
     }
@@ -424,6 +453,7 @@ pub nocopy struct Barrier {
     arrived: u32,
     generation: u32,
 
+    /// A barrier for n threads (at least 1).
     pub fn init(n: u32) Barrier {
         return Barrier.{ lock: Mutex.init(), n: @max(n, 1), arrived: 0, generation: 0 };
     }
