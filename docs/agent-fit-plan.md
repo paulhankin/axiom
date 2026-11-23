@@ -117,14 +117,33 @@ Done. The Problem above describes the tree as it was.
 - Verified: the fixed point from the pinned seed, also with `CROSS=1` (the
   AArch64-hosted compiler under qemu generates the same code), and the suite in the
   configurations of `difftest.sh`.
+- F4's mitigation for the lost independent lowering: the generators
+  `cmd/axiom/internal/tests/tools/gen_exact_ops.py` and `gen_exact_exprs.py` write
+  `tests/run/exact_*.ax`, whose expected outputs Python computes from the spec's rules,
+  not from the compiler. They cover, on every integer width and signedness at the edge
+  values, the conversions (`@as`, `@int_cast` and its trap, `@truncate`, `@bit_cast`),
+  shifts and rotations (counts of every unsigned type, at and past the width, and
+  constant), the signs of `/` and `%`, the wrapping, bitwise, saturating and checked
+  operations, `+ - *` where they do not overflow, the compound assignments, `@min`
+  `@max` `@abs` `@clz` `@ctz` `@popcount` `@mul_high`, the comparisons (as values, as
+  branches, against constants, and between types through `@as`) and the same on
+  constants, which the compiler folds; the conversions between floats and integers; and
+  IEEE arithmetic on f32 and f64 (`+ - * /`, `@sqrt`, `@fma` and the uncontracted
+  `a * b + c`, the rounding builtins, `@min`/`@max` with NaN and signed zeros,
+  `@copysign`, comparisons). `gen_exact_exprs.py` adds a few hundred random expression
+  trees mixing them. They pass on wasm32, x86-64 and AArch64, at -O0 and -O2. Longer
+  runs of the random generator (`--seeds`, 210 programs) found one wrong result, on
+  x86-64 from -O1 (a shift folded into `lea` was lost when the add became `adc`;
+  fixed), and four overflow traps in the optimizer itself (`gvn.ax`, `opt.ax`: code
+  written when overflow wrapped), which crash the compiler.
 
 Not done:
 
 - The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead).
 - `docs/bootstrap-chain.md` records each release's commit and seed, not yet its hashes
   (they are in each release's `SHA256SUMS`).
-- F4's mitigation for the lost independent lowering (more tests whose expected output
-  comes from outside the compiler) is not started.
+- The exact tests leave out usize and isize beyond 32-bit values (their results
+  depend on the target), SIMD vectors, and floats in the random expressions.
 
 ### Risks
 
