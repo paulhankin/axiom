@@ -1,0 +1,617 @@
+// =============================================================================
+// demangle.ax - C++ names in the Itanium C++ ABI's mangling (its section
+// 5.1), demangled for a version script's extern "C++" patterns (elink.ax),
+// written as C++ code names them: `ns::f(int, char const*)`,
+// `std::vector<int, std::allocator<int> >::size() const`, `vtable for X`.
+// What this reads: functions and objects of namespaces and classes
+// (nested names, the std:: abbreviations, substitutions), templates and
+// their parameters (type arguments, integer and bool literals),
+// constructors, destructors and operators, the builtin types, pointers,
+// references and cv-qualifiers, ABI tags, the special names of virtual
+// tables, type information and guard variables, and clones' suffixes. A
+// name with anything else (function, array and member pointer types,
+// expressions, local names, lambdas, thunks, packs) demangles to "".
+// =============================================================================
+import "util.ax" as u;
+
+struct D {
+    s: []u8,
+    i: usize,
+    ok: bool,
+    subs: u.List.[[]u8],   // the substitution candidates (S_, S0_, ...)
+    targs: u.List.[[]u8],  // the template arguments of the encoding's name (T_, T0_, ...)
+    depth: i32,            // > 0 in a type (whose names' template arguments are not targs)
+}
+
+// What a name is: a template's (its last part has template arguments), a
+// constructor's, destructor's or conversion operator's (whose template's
+// encoding has no return type), and a member function's qualifiers.
+struct NameInfo {
+    tmpl: bool,
+    special: bool,
+    quals: []u8,
+}
+
+/// The demangled form of `n`, or "" if it is not a mangled name this reads.
+pub fn demangle(n: []u8) []u8 {
+    if not u.starts(n, "_Z") {
+        return "";
+    }
+    let mut d = D.{ s: n, i: 2, ok: true, subs: u.List.[[]u8].empty(), targs: u.List.[[]u8].empty(), depth: 0 };
+    let mut r = encoding(&mut d);
+    if d.ok and (d.i < n.len) and (n[d.i] == '.') {
+        r = u.f2("%s [clone %s]", r, n[d.i..]);  // (a clone of the function: .cold, .constprop.0 ...)
+        d.i = n.len;
+    }
+    if not d.ok or (d.i != n.len) {
+        return "";
+    }
+    return r;
+}
+
+fn peek(d: *D) u8 {
+    if d.i < d.s.len {
+        return d.s[d.i];
+    }
+    return 0;
+}
+
+fn peek2(d: *D) u8 {
+    if (d.i + 1) < d.s.len {
+        return d.s[d.i + 1];
+    }
+    return 0;
+}
+
+fn bad(d: *mut D) []u8 {
+    d.ok = false;
+    return "";
+}
+
+fn at_end(d: *D) bool {
+    return (d.i >= d.s.len) or (d.s[d.i] == '.') or (d.s[d.i] == 'E');
+}
+
+// <encoding> ::= <name> <bare-function-type> | <name> | <special-name>
+fn encoding(d: *mut D) []u8 {
+    if peek(d) == 'T' {
+        let what = peek2(d);
+        let mut label: []u8 = "";
+        if what == 'V' {
+            label = "vtable for ";
+        } else if what == 'I' {
+            label = "typeinfo for ";
+        } else if what == 'S' {
+            label = "typeinfo name for ";
+        } else if what == 'T' {
+            label = "VTT for ";
+        } else {
+            return bad(d);  // (thunks, ...)
+        }
+        d.i += 2;
+        return u.cat2(label, ty(d));
+    }
+    if (peek(d) == 'G') and (peek2(d) == 'V') {
+        d.i += 2;
+        let mut gi = NameInfo.{ tmpl: false, special: false, quals: "" };
+        return u.cat2("guard variable for ", name_of(d, &mut gi));
+    }
+    if peek(d) == 'G' {
+        return bad(d);
+    }
+    let mut ni = NameInfo.{ tmpl: false, special: false, quals: "" };
+    let nm = name_of(d, &mut ni);
+    if not d.ok {
+        return "";
+    }
+    if at_end(d) {
+        return nm;  // an object
+    }
+    let mut ret: []u8 = "";
+    if ni.tmpl and not ni.special {
+        ret = ty(d);  // (a function template's return type comes first)
+    }
+    let mut b = u.Buf.init();
+    if ret.len > 0 {
+        b.s(ret);
+        b.s(" ");
+    }
+    b.s(nm);
+    b.s("(");
+    let mut n: usize = 0;
+    while d.ok and not at_end(d) {
+        let t = ty(d);
+        if (n == 0) and u.str_eq(t, "void") and at_end(d) {
+            break;  // (no parameters)
+        }
+        if n > 0 {
+            b.s(", ");
+        }
+        b.s(t);
+        n += 1;
+    }
+    b.s(")");
+    b.s(ni.quals);
+    return b.done();
+}
+
+// <name> ::= <nested-name> | <unscoped-name> | <unscoped-template-name> <template-args>
+fn name_of(d: *mut D, ni: *mut NameInfo) []u8 {
+    let c = peek(d);
+    if c == 'N' {
+        return nested(d, ni);
+    }
+    if c == 'Z' {
+        return bad(d);  // (a local name)
+    }
+    let mut nm: []u8 = "";
+    let mut sub = false;
+    if (c == 'S') and (peek2(d) == 't') {
+        d.i += 2;
+        nm = u.cat2("std::", unqualified(d, "", ni));
+    } else if c == 'S' {
+        nm = substitution(d);
+        sub = true;
+        if peek(d) != 'I' {
+            return bad(d);  // (a substitution is a name only as a template's)
+        }
+    } else {
+        nm = unqualified(d, "", ni);
+    }
+    if d.ok and (peek(d) == 'I') {
+        if not sub {
+            d.subs.push(nm);  // (the template's name)
+        }
+        nm = with_args(nm, template_args(d));
+        ni.tmpl = true;
+    }
+    return nm;
+}
+
+// A template's name and its arguments (`operator< <int>`: no `<<`).
+fn with_args(nm: []u8, args: []u8) []u8 {
+    if u.ends(nm, "<") {
+        return u.f2("%s %s", nm, args);
+    }
+    return u.cat2(nm, args);
+}
+
+// <nested-name> ::= N [<CV-qualifiers>] [<ref-qualifier>] <prefix> <unqualified-name> E;
+// each prefix (but a substitution, std) is a substitution candidate.
+fn nested(d: *mut D, ni: *mut NameInfo) []u8 {
+    d.i += 1;  // (N)
+    let mut k = false;
+    let mut v = false;
+    let mut r = false;
+    while (peek(d) == 'r') or (peek(d) == 'V') or (peek(d) == 'K') {
+        if peek(d) == 'r' {
+            r = true;
+        } else if peek(d) == 'V' {
+            v = true;
+        } else {
+            k = true;
+        }
+        d.i += 1;
+    }
+    let mut quals = u.Buf.init();
+    if k {
+        quals.s(" const");
+    }
+    if v {
+        quals.s(" volatile");
+    }
+    if r {
+        quals.s(" restrict");
+    }
+    if (peek(d) == 'R') or (peek(d) == 'O') {
+        quals.s(u.pick(peek(d) == 'R', " &", " &&"));
+        d.i += 1;
+    }
+    let mut pre: []u8 = "";
+    let mut last: []u8 = "";  // (the last part's name: its constructors')
+    while d.ok and (peek(d) != 'E') {
+        let c = peek(d);
+        let mut cand = true;
+        if d.i >= d.s.len {
+            return bad(d);
+        }
+        if c == 'I' {
+            if pre.len == 0 {
+                return bad(d);
+            }
+            pre = with_args(pre, template_args(d));
+            ni.tmpl = true;
+        } else {
+            ni.tmpl = false;
+            let mut comp: []u8 = "";
+            if (c == 'S') and (peek2(d) == 't') {
+                d.i += 2;
+                comp = "std";
+                cand = false;
+            } else if c == 'S' {
+                comp = substitution(d);
+                cand = false;
+            } else if c == 'T' {
+                comp = template_param(d);
+            } else if (c == 'D') and ((peek2(d) == 't') or (peek2(d) == 'T')) {
+                return bad(d);  // (decltype)
+            } else {
+                comp = unqualified(d, last, ni);
+            }
+            last = base_name(comp);
+            if pre.len == 0 {
+                pre = comp;
+            } else {
+                pre = u.f2("%s::%s", pre, comp);
+            }
+        }
+        if cand and d.ok and (peek(d) != 'E') {
+            d.subs.push(pre);
+        }
+    }
+    if not d.ok or (peek(d) != 'E') or (pre.len == 0) {
+        return bad(d);
+    }
+    d.i += 1;
+    ni.quals = quals.done();
+    return pre;
+}
+
+// A class's name for its constructors: without its scope and template
+// arguments.
+fn base_name(s: []u8) []u8 {
+    let mut start: usize = 0;
+    let mut end = s.len;
+    let mut depth: i32 = 0;
+    for k in 0..s.len {
+        let c = s[k];
+        if c == '<' {
+            if (depth == 0) and (k > start) {
+                end = k;
+            }
+            depth += 1;
+        } else if c == '>' {
+            depth -= 1;
+        } else if (c == ':') and (depth == 0) and ((k + 1) < s.len) and (s[k + 1] == ':') {
+            start = k + 2;
+            end = s.len;
+        }
+    }
+    if end < start {
+        end = s.len;
+    }
+    return s[start..end];
+}
+
+// <unqualified-name> ::= <operator-name> | <ctor-dtor-name> | <source-name>,
+// then its ABI tags (B <source-name>). `last`: the name of the class whose
+// constructor or destructor it may be.
+fn unqualified(d: *mut D, last: []u8, ni: *mut NameInfo) []u8 {
+    if peek(d) == 'L' {
+        d.i += 1;  // (internal linkage)
+    }
+    let c = peek(d);
+    let c2 = peek2(d);
+    let mut nm: []u8 = "";
+    if u.is_digit(c) {
+        nm = source_name(d);
+    } else if (c == 'C') and (c2 >= '1') and (c2 <= '5') {
+        if last.len == 0 {
+            return bad(d);
+        }
+        d.i += 2;
+        nm = last;
+        ni.special = true;
+    } else if (c == 'D') and (c2 >= '0') and (c2 <= '5') {
+        if last.len == 0 {
+            return bad(d);
+        }
+        d.i += 2;
+        nm = u.cat2("~", last);
+        ni.special = true;
+    } else if (c == 'c') and (c2 == 'v') {
+        d.i += 2;
+        nm = u.cat2("operator ", ty(d));
+        ni.special = true;
+    } else if (c >= 'a') and (c <= 'z') {
+        nm = operator_name(d);
+    } else {
+        return bad(d);
+    }
+    while d.ok and (peek(d) == 'B') {
+        d.i += 1;
+        nm = u.f2("%s[abi:%s]", nm, source_name(d));
+    }
+    return nm;
+}
+
+// <source-name> ::= <length> <identifier>
+fn source_name(d: *mut D) []u8 {
+    let mut n: usize = 0;
+    let st = d.i;
+    while u.is_digit(peek(d)) {
+        n = (n * 10) + @as(usize, peek(d) - '0');
+        d.i += 1;
+        if n > d.s.len {
+            return bad(d);
+        }
+    }
+    if (d.i == st) or (n == 0) or ((d.i + n) > d.s.len) {
+        return bad(d);
+    }
+    let nm = d.s[d.i..d.i + n];
+    d.i += n;
+    if u.starts(nm, "_GLOBAL__N") {
+        return "(anonymous namespace)";
+    }
+    return nm;
+}
+
+fn operator_name(d: *mut D) []u8 {
+    let codes = ["nw", "na", "dl", "da", "ps", "ng", "ad", "de", "co", "pl", "mi", "ml", "dv", "rm", "an", "or", "eo",
+                 "aS", "pL", "mI", "mL", "dV", "rM", "aN", "oR", "eO", "ls", "rs", "lS", "rS", "eq", "ne", "lt", "gt",
+                 "le", "ge", "ss", "nt", "aa", "oo", "pp", "mm", "cm", "pm", "pt", "cl", "ix", "qu"];
+    let names = [" new", " new[]", " delete", " delete[]", "+", "-", "&", "*", "~", "+", "-", "*", "/", "%", "&", "|",
+                 "^", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "<<=", ">>=", "==", "!=", "<",
+                 ">", "<=", ">=", "<=>", "!", "&&", "||", "++", "--", ",", "->*", "->", "()", "[]", "?"];
+    if (d.i + 2) > d.s.len {
+        return bad(d);
+    }
+    let code = d.s[d.i..d.i + 2];
+    for k in 0..codes.len {
+        if u.str_eq(codes[k], code) {
+            d.i += 2;
+            return u.cat2("operator", names[k]);
+        }
+    }
+    return bad(d);
+}
+
+// <template-args> ::= I <template-arg>+ E, written `<a, b>` (`<a<b> >`: no
+// `>>`); the encoding's name's are what its template parameters name.
+fn template_args(d: *mut D) []u8 {
+    d.i += 1;  // (I)
+    let mut args = u.List.[[]u8].empty();
+    let top = d.depth == 0;
+    d.depth += 1;
+    while d.ok and (peek(d) != 'E') {
+        if d.i >= d.s.len {
+            return bad(d);
+        }
+        if peek(d) == 'L' {
+            args.push(literal(d));
+        } else if (peek(d) == 'X') or (peek(d) == 'J') {
+            return bad(d);  // (expressions, packs)
+        } else {
+            args.push(ty(d));
+        }
+    }
+    d.depth -= 1;
+    if not d.ok or (args.len == 0) {
+        return bad(d);
+    }
+    d.i += 1;  // (E)
+    if top {
+        d.targs = args.copy();
+    }
+    let mut b = u.Buf.init();
+    b.s("<");
+    for k in 0..args.len {
+        if k > 0 {
+            b.s(", ");
+        }
+        b.s(args.get(k));
+    }
+    if u.ends(b.view(), ">") {
+        b.s(" ");
+    }
+    b.s(">");
+    return b.done();
+}
+
+// <expr-primary> ::= L <type> [n] <number> E, of an integer type or bool
+fn literal(d: *mut D) []u8 {
+    d.i += 1;  // (L)
+    let c = peek(d);
+    if u.find("bijlmsthcaxy", c) < 0 {
+        return bad(d);
+    }
+    let t = ty(d);
+    let mut neg = false;
+    if peek(d) == 'n' {
+        neg = true;
+        d.i += 1;
+    }
+    let st = d.i;
+    while u.is_digit(peek(d)) {
+        d.i += 1;
+    }
+    if (d.i == st) or (peek(d) != 'E') {
+        return bad(d);
+    }
+    let v = d.s[st..d.i];
+    d.i += 1;
+    let num = u.cat2(u.pick(neg, "-", ""), v);
+    if (c == 'b') and u.str_eq(v, "0") {
+        return "false";
+    }
+    if (c == 'b') and u.str_eq(v, "1") {
+        return "true";
+    }
+    if c == 'i' {
+        return num;
+    }
+    if c == 'j' {
+        return u.cat2(num, "u");
+    }
+    if c == 'l' {
+        return u.cat2(num, "l");
+    }
+    if c == 'm' {
+        return u.cat2(num, "ul");
+    }
+    return u.f2("(%s)%s", t, num);
+}
+
+// <substitution> ::= S_ | S <seq-id> _ | Sa | Sb | Ss | Si | So | Sd
+fn substitution(d: *mut D) []u8 {
+    d.i += 1;  // (S)
+    let abbrevs = "absiod";
+    let names = ["std::allocator", "std::basic_string", "std::string", "std::istream", "std::ostream", "std::iostream"];
+    let k = u.find(abbrevs, peek(d));
+    if (k >= 0) and (peek(d) != 0) {
+        d.i += 1;
+        return names[@int_cast(usize, k)];
+    }
+    let n = seq_id(d, 36);
+    if not d.ok or (n >= d.subs.len) {
+        return bad(d);
+    }
+    return d.subs.get(n);
+}
+
+// A <seq-id> (base 36: substitutions; base 10: template parameters) with its
+// `_`: 0 for `_` alone, n + 1 for n.
+fn seq_id(d: *mut D, base: usize) usize {
+    let mut n: usize = 0;
+    let st = d.i;
+    while true {
+        let c = peek(d);
+        if u.is_digit(c) {
+            n = (n * base) + @as(usize, c - '0');
+        } else if (base == 36) and (c >= 'A') and (c <= 'Z') {
+            n = (n * base) + @as(usize, c - 'A') + 10;
+        } else {
+            break;
+        }
+        d.i += 1;
+        if n > d.s.len {
+            d.ok = false;
+            return 0;
+        }
+    }
+    if peek(d) != '_' {
+        d.ok = false;
+        return 0;
+    }
+    d.i += 1;
+    if d.i == (st + 1) {
+        return 0;
+    }
+    return n + 1;
+}
+
+// <template-param> ::= T_ | T <number> _
+fn template_param(d: *mut D) []u8 {
+    d.i += 1;  // (T)
+    let k = seq_id(d, 10);
+    if not d.ok or (k >= d.targs.len) {
+        return bad(d);
+    }
+    return d.targs.get(k);
+}
+
+fn builtin(c: u8) []u8 {
+    let names = ["void", "wchar_t", "bool", "char", "signed char", "unsigned char", "short", "unsigned short", "int",
+                 "unsigned int", "long", "unsigned long", "long long", "unsigned long long", "__int128",
+                 "unsigned __int128", "float", "double", "long double", "__float128", "..."];
+    let k = u.find("vwbcahstijlmxynofdegz", c);
+    if (k < 0) or (c == 0) {
+        return "";
+    }
+    return names[@int_cast(usize, k)];
+}
+
+// <type>, written as C++ does (`char const*`); what is not a builtin type
+// is a substitution candidate.
+fn ty(d: *mut D) []u8 {
+    if not d.ok {
+        return "";
+    }
+    let b = builtin(peek(d));
+    if b.len > 0 {
+        d.i += 1;
+        return b;
+    }
+    d.depth += 1;
+    let t = ty_inner(d);
+    d.depth -= 1;
+    return t;
+}
+
+fn ty_inner(d: *mut D) []u8 {
+    let c = peek(d);
+    if (c == 'r') or (c == 'V') or (c == 'K') {
+        let mut k = false;
+        let mut v = false;
+        let mut r = false;
+        while (peek(d) == 'r') or (peek(d) == 'V') or (peek(d) == 'K') {
+            if peek(d) == 'r' {
+                r = true;
+            } else if peek(d) == 'V' {
+                v = true;
+            } else {
+                k = true;
+            }
+            d.i += 1;
+        }
+        let mut q = u.Buf.init();
+        q.s(ty(d));
+        if k {
+            q.s(" const");
+        }
+        if v {
+            q.s(" volatile");
+        }
+        if r {
+            q.s(" restrict");
+        }
+        let t = q.done();
+        d.subs.push(t);
+        return t;
+    }
+    if (c == 'P') or (c == 'R') or (c == 'O') {
+        d.i += 1;
+        let t = u.cat2(ty(d), u.pick(c == 'P', "*", u.pick(c == 'R', "&", "&&")));
+        d.subs.push(t);
+        return t;
+    }
+    let mut ni = NameInfo.{ tmpl: false, special: false, quals: "" };
+    if (c == 'S') and (peek2(d) == 't') {
+        let t = name_of(d, &mut ni);
+        d.subs.push(t);
+        return t;
+    }
+    if c == 'S' {
+        let mut t = substitution(d);
+        if d.ok and (peek(d) == 'I') {
+            t = with_args(t, template_args(d));
+            d.subs.push(t);
+        }
+        return t;
+    }
+    if c == 'T' {
+        let mut t = template_param(d);
+        d.subs.push(t);
+        if d.ok and (peek(d) == 'I') {
+            t = with_args(t, template_args(d));
+            d.subs.push(t);
+        }
+        return t;
+    }
+    if c == 'D' {
+        let k = u.find("nisuac", peek2(d));
+        if (k < 0) or (peek2(d) == 0) {
+            return bad(d);  // (decltype, packs, vector types ...)
+        }
+        let names = ["decltype(nullptr)", "char32_t", "char16_t", "char8_t", "auto", "decltype(auto)"];
+        d.i += 2;
+        return names[@int_cast(usize, k)];
+    }
+    if (c == 'N') or u.is_digit(c) {
+        let t = name_of(d, &mut ni);
+        d.subs.push(t);
+        return t;
+    }
+    return bad(d);  // (function, array and member pointer types, vendor types ...)
+}
