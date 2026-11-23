@@ -2699,7 +2699,12 @@ no other tool is needed:
   Mach-O's private extern for the hidden ones, Mach-O having no protected visibility,
   its image's references to its own definitions binding within it; nothing in COFF,
   where only a DLL's exports leave the image), `.type`, `.size`,
-  `.comm`, `.lcomm`, `.incbin` (within the include directories), COFF's `.rva` and
+  `.comm`, `.lcomm`, `.incbin` (within the include directories), ELF's `.symver name,
+  name2@VER` (in file-scope asm: `name2@VER`, hidden, `name2@@VER`, the default, or
+  `name2@@@VER`, the default if `name` is defined here, is another global name of
+  `name`'s definition, in the unit or the asm, for a version script's versions ("Shared
+  libraries"); if `name` is not defined, the unit's references to it are to `name2@VER`, that
+  version of a library's symbol), COFF's `.rva` and
   (x64) `.secrel32`. Labels: `name:` and numeric local labels (`1:`, `1b`, `1f`).
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
   (`@GOTPCREL`), on macOS `sym@TLVP(%rip)` in a `movq` (a thread-local's descriptor,
