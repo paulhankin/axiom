@@ -10,3 +10,9 @@
   of its own.
 - The test suite takes `--overflow=report` (and `--overflow=trap`) to build its Axiom
   programs and tests in that mode, and lists the sites reported at the end.
+
+## Standard library
+
+- `std/mem`: the count of bytes freed in each decay epoch saturates. On wasm32 a
+  program that freed more than 4 GiB in one epoch (or in all, with no clock) wrapped
+  it, and the allocator then kept less free memory than it should.
