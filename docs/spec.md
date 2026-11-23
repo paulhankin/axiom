@@ -976,7 +976,7 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 | Family | Operators | Operand types | Notes |
 |---|---|---|---|
 | **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` traps on overflow, `*%` wraps (§7.6) |
-| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` wrap (§7.6). The `%`-suffixed forms always wrap, int only |
+| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` trap on overflow (§7.6). The `%`-suffixed forms always wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
@@ -1047,7 +1047,7 @@ than unary operators: `-a.b` is `-(a.b)`, and `&a[i]` is `&(a[i])`.
 
 | Operator | Operand | Meaning |
 |---|---|---|
-| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it is `MIN` by default (§7.6) |
+| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it traps by default, and `-%x` wraps to `MIN` (§7.6) |
 | `-%x` | signed or unsigned int, SIMD int | Wrapping negation, in every overflow mode |
 | `~x` | int, SIMD int, `v128` | Bitwise NOT |
 | `not x` | bool | Logical NOT |
@@ -1104,8 +1104,9 @@ NOT change observable behavior.
 
 Why trap by default: an unintended overflow is a wrong answer that goes on silently,
 and a trap names the place. The check costs little where the processor has an overflow
-flag; measured over the compiler and its benchmarks it is within a few percent, more in
-code dominated by allocator arithmetic. It keeps the optimizer from vectorizing a
+flag, and an optimizer leaves out the checks that the ranges of the operands show cannot
+fail (a counter below its limit, a difference of ordered values); measured over the
+compiler and its benchmarks the cost is within a few percent. It keeps the optimizer from vectorizing a
 reduction written with `+`, so such a loop that may wrap is written with `+%`. Trapping
 in debug builds and wrapping or saturating in release builds was rejected because tested
 and shipped programs would differ. A C program (§14.5) keeps C's arithmetic: the overflow

@@ -687,8 +687,66 @@ default.
 
 ### Status
 
-B4 and B3's measurements are done; B1, B2, B5 and B6 are not started, and the default
-is unchanged (wrap). The gate's decision is the owner's.
+B1, B3's measurements, B4 and B5 are done: the default is trap. B6 holds (the seed
+builds the tree in either meaning, and the tree overflows nowhere: B4). B2 is not
+started (`--overflow=saturate` is still there).
+
+- **B1** (spec §7.6, `docs/next/overflow-trap-default.md`): `+ - *`, unary `-`, `@abs`
+  and `MIN / -1` trap with `T0002` in every build; the `%` operators wrap;
+  `--overflow=wrap` gives the old meaning for a build. A C program keeps C's arithmetic.
+- **B5, the optimizer** (`docs/next/optimizer-overflow-checks.md`). Most of the
+  allocator benchmarks' cost was not the checks but what they did to inlining: the
+  inliner counted each check as three instructions, so std/mem's `is_object_start` and
+  `class_of`, on the allocator's fast paths, grew past its limits trapping and stayed
+  within them wrapping. An overflow check's trap block is now marked
+  (`ir.Block.ovf_trap`) and the inliner leaves it, its branch and its comparison out of
+  a function's cost: trapping code is inlined as wrapping code is (the compiler built
+  trapping is 3% larger for it). GVN removes the checks the operands' ranges show
+  cannot fail: signed facts from signed comparisons (`x <=s y + c`, `x >=s y + c`) and a
+  signed range (`srange`) from them, extensions, unsigned bounds and lower bounds decide
+  the tests of signed `+` and `-` (a counter below a limit, `x - 1` where `x > lo`,
+  sums of extended values), of `-x` and `@abs`, and of `IN_SMUL_OV` / `IN_UMUL_OV`
+  (products of extended 32-bit values); unsigned, a value under a mask or shifted
+  right, any value with a bound (a remainder) is below `MAX - d`, `x << k` for `k` below
+  the width keeps `(1 << k) - 1` from needing a check, a factor is at most a product
+  that did not wrap (`while p * p <= n`, then `m += p` under `m <= n`), and `x != MAX`
+  holds for a bounded `x`. `lowering/overflow_ranges.ax` and
+  `overflow_ranges_kept.ax` show what goes and what stays; `run/overflow_ranges*.ax`
+  run the edges. In std/mem, `is_object_start` masks its shift count with 31 (the
+  count is at most 13): the free fast path has no check left.
+
+  Measured after B5, trap / wrap CPU time at `-O2`, on a machine shared with another
+  job (load 3 to 7 on 4 processors, so differences of a few percent are not resolved):
+  medians of 15 alternating runs on x86-64 and 9 on AArch64 (qemu user time, only
+  indicative) and wasm32 (node), and in brackets the median of each run's own ratio.
+  The self-compile is as in B3 (7 runs; wasm32 with a fresh module cache each run).
+
+  | Program | x86-64 | AArch64 (qemu) | wasm32 |
+  |---|---|---|---|
+  | 13 benchmarks of `cmd/axiom/bench/`, geometric mean | 1.005 (1.026) | 1.023 (1.029) | 1.003 (1.001) |
+  | the 7 that are not `alloc_*` | 1.012 (1.020) | 1.021 (1.027) | 1.010 (0.996) |
+  | the 6 `alloc_*` | 0.997 (1.032) | 1.025 (1.032) | 0.995 (1.006) |
+  | `alloc_tree` | 0.90 (1.04) | 0.97 (0.97) | 1.06 (1.01) |
+  | worst | `checked` 1.06 (1.07) | `sieve` 1.15 (1.21) | `sieve` 1.21 (1.10) |
+  | compiler self-compile | 1.01 | 1.06 | 1.01 |
+  | `reduce_sum`, `+` / `+%` | 6.69 / 0.99 | 1.20 / 1.02 | 1.49 / 0.98 |
+
+  Before B5 (B3's table above; here the B1 compiler's `alloc_tree` gave 1.13, 1.07,
+  1.29, 0.97 and 1.03 in five sets of runs, as the load changed):
+  x86-64 1.035, AArch64 1.039, the allocator benchmarks 1.09 and 1.12, worst
+  `alloc_tree` 1.27 and `alloc_threads` 1.35. Against the bar (a geometric mean within
+  3% on each target, no program more than 15% slower that `+%` cannot fix): met on
+  x86-64 and wasm32, and on AArch64 by the medians (1.023; 1.029 by the runs' ratios).
+  The worst, `sieve` on AArch64 and wasm32, is its count of the primes,
+  `total += flags[i]`, a reduction with `+` that no longer vectorizes: `+%` fixes it.
+  `alloc_handoff`, whose threads wait on each other, moves by 50% from run to run
+  here and is not resolved (0.99 on x86-64, 0.86 on AArch64, 0.98 on wasm32).
+
+  Left: the AArch64 self-compile (1.05 before and after); the threaded allocator paths
+  on AArch64 (`alloc_threads`, `alloc_churn` about 1.06 to 1.09); checks whose bounds
+  need relations between values (`lo + (hi - lo) / 2` after `lo < hi`) or the count
+  of a loop's iterations (a sum of bytes over a bounded loop); std/mem's size-class
+  arithmetic past 1024 bytes (`class_of`'s `63 - clz`), on its slow paths.
 
 - **`--overflow=report`** (spec §7.6, `docs/cli.md`): the program wraps, and the first
   time a site that `trap` checks overflows it writes
