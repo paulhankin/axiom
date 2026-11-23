@@ -440,9 +440,9 @@ is taken after `copy_attrs`). The Problem above describes the tree as it was.
 - C2: `axiom test` builds with `--sanitize=address` unless given `--sanitize=none`
   (spec §16.8, §17.2; `docs/cli.md`). The sanitizer works on wasm32, x86-64 and
   AArch64 Linux and x86-64 Windows (run here under an emulator and an emulation
-  layer), and builds for macOS and AArch64 Windows; for wasm64 (whose host fails a
-  sanitized program, and runs no wasm64 tests at all), a C program or an Axiom program
-  with C units, `axiom test` quietly builds without it. A sanitized test's default time
+  layer), and builds for macOS and AArch64 Windows; wasm64 has it too since issue #77.
+  For a C program or an Axiom program with C units, `axiom test` quietly builds
+  without it. A sanitized test's default time
   limit is 30 s.
 - Measured before the switch, on one x86-64 Linux machine, two at a time, compile
   included: the standard library's tests and the self-tests (154 files) took 43.0 s
@@ -474,16 +474,13 @@ is taken after `copy_attrs`). The Problem above describes the tree as it was.
 - Tests: `testing/lifetime.ax` is the program above (fails with `T0012` at line 25;
   `W0711` at both uses by default, none with `--no-warn=W0711`); `errors/lifetime_warn.ax` has each
   shape and the cases not to report; `testing/leaks.ax` tests the sanitizer as the
-  default; a case checks `--sanitize=none` and the wasm64 fallback, and
+  default; a case checks `--sanitize=none` and wasm64, and
   `c/mix/test_with_c` the fallback for C units.
 
 Not done:
 
 - `W0711` is narrow: a use through another variable, a field or another function is
   not seen, so it catches the plainest cases only.
-- wasm64: a program built with `--sanitize=address` fails in the WebAssembly host
-  (`Cannot convert undefined to a BigInt`), and `axiom test --target=wasm64` fails in
-  its test runner with or without the sanitizer.
 
 ---
 

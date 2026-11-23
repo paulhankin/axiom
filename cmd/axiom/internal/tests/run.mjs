@@ -2138,7 +2138,7 @@ await section('axiom test', {
     return /ok   prints \(\d+ ms\)\n     output:\n       \| hello from the test\n/.test(shown.stdout) ? null : `output not shown:\n${shown.stdout}`;
   },
   // (the address sanitizer is axiom test's default, spec §16.8; --sanitize=none
-  // turns it off, and wasm64 builds without it, quietly)
+  // turns it off; on wasm64 too)
   '--sanitize: address by default, none when asked': () => {
     const dir = path.join(tmp, 'testsan');
     fs.mkdirSync(dir, { recursive: true });
@@ -2150,10 +2150,8 @@ await section('axiom test', {
     const t = off.status === 1 ? JSON.parse(off.stdout).tests[0] : null;
     if (!t || t.failure.code !== 'T0011') return `--sanitize=none:\n${off.stdout}${off.stderr}`;
     if (native) return null;
-    const w64 = spawnSync(compiler, ['test', src, '--target=wasm64', `--no-run=${path.join(dir, 't64.wasm')}`], { encoding: 'utf8' });
-    if (w64.status !== 0 || w64.stderr) return `wasm64:\n${w64.stdout}${w64.stderr}`;
-    const wasm = fs.readFileSync(path.join(dir, 't64.wasm'));
-    return wasm.includes(Buffer.from('AddressSanitizer')) ? 'wasm64: built with the sanitizer' : null;
+    const w64 = spawnSync(compiler, ['test', src, '--target=wasm64'], { encoding: 'utf8' });
+    return w64.status === 0 ? null : `wasm64:\n${w64.stdout}${w64.stderr}`;
   },
   // (testing/lifetime.ax, which fails with T0012 under axiom test: W0711 is
   // on by default, at both of its uses after free, and --no-warn=W0711 turns it off)

@@ -3464,9 +3464,9 @@ freed, freeing it twice or with the wrong size, reaching outside an allocation t
 pointer made from an address, and never freeing it. `--sanitize=address` (accepted by
 `build`, `test` and `profile`) checks for them. `axiom test` builds with it unless given
 `--sanitize=none`: a program that keeps the rules of §12.1 behaves the same either way,
-so tests still test what ships. It applies on every target the tests run on but
-`wasm64`, and to Axiom code only (§14.5.5); for `wasm64`, a C program, or an Axiom
-program with C units, `axiom test` builds without it, and `--sanitize=address` given
+so tests still test what ships. It applies on every target the tests run on, and to
+Axiom code only (§14.5.5); for a C program, or an Axiom program with C units,
+`axiom test` builds without it, and `--sanitize=address` given
 explicitly is refused for C sources as for `build`.
 
 - The global allocator (`std/mem`) puts a header before each allocation and a redzone

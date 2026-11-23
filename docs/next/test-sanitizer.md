@@ -7,8 +7,8 @@
   test allocates (`defer`), or keep memory on purpose inside `mem.leaks_ignored`. Tests
   take longer (the standard library's: 1.8 times as long natively, 1.6 on WebAssembly),
   so a test's default time limit is 30 s with the sanitizer. The default applies to
-  Axiom programs on every target but `wasm64`; for `wasm64`, a C program, or an Axiom
-  program with C units, `axiom test` builds without the sanitizer, as before.
+  Axiom programs on every target; for a C program, or an Axiom program with C units,
+  `axiom test` builds without the sanitizer, as before.
 - The sanitizer's quarantine of freed memory is 16 MiB in a test (64 MiB elsewhere),
   since tests run in parallel, and the sanitizer is faster: it sets and checks shadow
   memory a page at a time, and remembers which allocation sites are `std/mem`'s.

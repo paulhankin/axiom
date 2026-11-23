@@ -52,7 +52,7 @@ run; dependencies' tests do not.
 |---|---|
 | `--filter=<text>` | Run only the tests whose name contains `text`. |
 | `--timeout=<ms>` | Fail a test that runs longer (default 10000; 30000 with the sanitizer). |
-| `--sanitize=address\|none` | `address`, the default: build the tests with the address sanitizer (spec §16.8), so a use after free fails its test with `T0012` and a leak with `leak`. `none` builds without it. The default applies to Axiom programs on every target but `wasm64`; for `wasm64`, a C program or one with C units, the tests are built without it. |
+| `--sanitize=address\|none` | `address`, the default: build the tests with the address sanitizer (spec §16.8), so a use after free fails its test with `T0012` and a leak with `leak`. `none` builds without it. The default applies to Axiom programs on every target; for a C program or one with C units, the tests are built without it. |
 | `--show-output` | Print what each test wrote under its result line. Without it, only a failing test's output is shown. |
 | `--no-run=<file>` | Build the test binary into `<file>` (and, for Windows, its PDB) without running it: for a target this machine cannot run. |
 
