@@ -133,11 +133,18 @@ objects and archives define no `main` is `C3063`.
 | `--c-keep-null-checks` | The optimizer is not told that a parameter the attribute `nonnull` names, or one declared `[static n]`, and the result of a function with `returns_nonnull`, are not null pointers: tests of them stay ("Optimization"). |
 | `--c-warn-format=0\|1\|2` | The checks of format strings ("Attributes": `format`): 0 none, 1 (the default) what is undefined or fails on any target (C4130, C4131, C4133), 2 also what is suspect (C4132, C4134, C4135). |
 | `-Idir` | Add a directory to the include path. |
+| `--c-iquote=dir` | A directory searched for `#include "..."` (and `__has_include("...")`) only: after the including file's directory, before the `-I` directories, in order; `#include <...>` does not look there. An `#include_next` in a header found there searches the include path from its start. |
 | `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
 | `--c-lib=axiom\|system` | Whose C library the program has: the compiler's (the default), or the system's, whose headers are then the hosted headers ("The system's C library", below). |
 | `--c-system-include=dir` | With `--c-lib=system`: a directory of the system's headers (instead of the system's own, `/usr/include` and its target directory on Linux). |
 | `--c-isystem=dir` | A directory of headers searched after the `-I` directories, whose headers are system headers for `--c-deps-no-system`. |
-| `--c-include=file` | The file is included before the source's first line (looked for in the current directory, then on the include path); several in order. |
+| `--c-include=file` | The file is included before the source's first line (looked for in the current directory, then as `#include "file"` would find it there: the `--c-iquote` directories, then the include path); several in order. |
+| `--c-imacros=file` | The file (found as `--c-include`'s) is read before the `--c-include` files and the source, and its text is dropped: what stays is its macros (and its pragmas' state); several in order. Its macros are not in the debug information's description of the unit's (`-g`). |
+| `--c-nostdinc` | Neither the compiler's headers nor the system's (`--c-lib=system`) are searched: only the `--c-iquote`, `-I`, `--c-isystem` and `--c-idirafter` directories (a header the compiler has is then `C1081`, saying so). The C library's own units are compiled as ever. |
+| `--c-undef` | The target's conventional macros ("Predefined macros": `__x86_64__`, `__linux__`, `unix`, the processor's extensions ...) and the GNU compilers' (`--c-gnu-compat`: `__GNUC__` and its companions) are not predefined; the standard's (`__STDC__`, `__STDC_VERSION__` ...) and the compiler's own (`__AXIOM_...`), which its headers use, are. The system's headers (`--c-lib=system`), which test the target's macros, do not work without them. |
+| `--c-show-includes` | Each header the unit reads (by `#include`, `#include_next`, `#import`, `--c-include` and `--c-imacros`) is named on standard error as it is entered, after a dot for each level of inclusion (`. a.h`, `.. b.h`); not the C library's own units' headers. |
+| `--c-visibility=default\|hidden\|protected\|internal` | The visibility of the unit's definitions of external linkage (functions, objects, aliases) that neither the attribute `visibility` nor `#pragma GCC visibility` gives one (default: default). Declarations keep theirs: an entity only declared may be another module's. The C library's own units are not affected. `axiom cc -fvisibility=` gives it. |
+| `--c-pp-defines` | `--emit=c-pp` keeps the `#define` and `#undef` directives of the files read, each where it was (its operands spelled from their tokens); not the predefined macros, `-D` and `-U` (`--emit=c-macros` lists every macro), nor a system header's definition of a name the implementation predefines, which is not done. The text compiles again. |
 | `--c-warnings=on\|off\|error` | What becomes of the front end's warnings that the pragmas leave: shown (the default), none shown, or errors. |
 | `--c-wrapv` | Signed `+`, `-` and `*` wrap in two's complement: the optimizer is not told they do not overflow. |
 | `--c-deps=file` | The source's make rule of the files it reads (the source, then each header once, in the order first read) is written to file (`-`: standard output) as it is preprocessed; one source. `--c-deps-target=t` names the rule's target (repeatable, written as given; default the object, `x.o` or `-o`'s with `--emit=obj`), `--c-deps-phony` adds a rule without prerequisites for each header, `--c-deps-no-system` leaves out the system's headers (the compiler's, the system C library's, `--c-isystem`'s). |
@@ -280,7 +287,8 @@ to every build as it is, and changes a default.
 | Options | |
 |---|---|
 | `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version (and `gcc version 9.4.0 compatible`, the GNU version the macros claim, which configure scripts read) and each build's command to standard error, `-###` the commands without running them. |
-| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
+| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-imacros file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `--c-iquote` (for `"..."` only, before the `-I` directories), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`, `-imacros` as `--c-imacros` (before the `-include` files); `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
+| `-nostdinc`, `-undef`, `-H`, `-dD` | `--c-nostdinc`, `--c-undef` (the standard's macros stay), `--c-show-includes` (to standard error), and with `-E` `--c-pp-defines` (the unit's `#define` and `#undef` in the text; without `-E` it changes nothing). |
 | `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later, or a GNU dialect (gnu89 too, as `-std=gnu89`, `-std=c89` and `-ansi` give). |
 | `-O0` ... `-O3`, `-O`, `-Os`, `-Oz`, `-Og`, `-Ofast` | `-O` and `-Og` are `-O1`, `-Os` and `-Oz` `-O2`, `-Ofast` and above 3 `-O3` (no fast-math: the arithmetic stays IEEE 754's). |
 | `-g`, `-g2`, `-g3`, `-ggdb`, `-gdwarf-N`; `-g1`; `-g0` | `-g` (full); `--debug-info=lines`; none. Other `-g...` are accepted. |
@@ -289,11 +297,12 @@ to every build as it is, and changes a default.
 | `-funsigned-char`, `-fsigned-char` | `--c-char=`. |
 | `-fwrapv`, `-fno-strict-overflow` | `--c-wrapv`. |
 | `-fno-delete-null-pointer-checks` | `--c-keep-null-checks`. |
+| `-fvisibility=v` | `--c-visibility=v` (`default`, `hidden`, `protected`, `internal`; another is an error): the visibility of the definitions given none, under `#pragma GCC visibility` and the attribute. |
 | `-frounding-math` | `--c-fenv-access`. |
 | `-ffreestanding` | `--c-freestanding` (then no C library). |
 | `-fno-builtin`, `-fno-builtin-NAME` | `--c-no-builtin` (for any NAME, all of them); `-fbuiltin` undoes it. |
 | `-ffunction-sections`, `-fdata-sections` | The options of the same names. |
-| `-fopenmp`, `-fsanitize=...`, `-fprofile-arcs`, `-ftest-coverage`, `-fshort-enums`, `-fshort-wchar`, `-fpack-struct`, `-funsigned-bitfields`, a character set other than UTF-8 | Errors: the program would not be what they ask. Every other `-f...` is accepted, and changes nothing (`-fno-common`, `-fvisibility=`, `-fno-strict-aliasing`, which the optimizer never assumes, `-fstack-protector`, `-fomit-frame-pointer` ...). |
+| `-fopenmp`, `-fsanitize=...`, `-fprofile-arcs`, `-ftest-coverage`, `-fshort-enums`, `-fshort-wchar`, `-fpack-struct`, `-funsigned-bitfields`, a character set other than UTF-8 | Errors: the program would not be what they ask. Every other `-f...` is accepted, and changes nothing (`-fno-common`, `-fno-strict-aliasing`, which the optimizer never assumes, `-fstack-protector`, `-fomit-frame-pointer` ...). |
 | `-march=cpu`, `-mcpu=cpu`, `-m<ext>`, `-mno-<ext>` | `--cpu=` (`native`, or one of `--cpu`'s names; `x86-64` and `armv8-a` are the baseline); `--features=+ext`, `-ext` for an extension of `--features`' names (`-msse4.2`, `-mavx2`); the x86-64 extensions every program here has are accepted and change nothing (`-msse2`, `-mmmx`, `-mfxsr`, `-mrdrnd`, `-mrdseed`, `-mxsave` ..., which the attribute and pragma `target` take too). `-m64`, `-mtune=` and the like are accepted; `-m32`, `-mx32`, `-mabi=`, `-mlong-double-...` (another ABI), and the options that ask for code this compiler does not make (`-mno-red-zone`, `-mgeneral-regs-only`, `-mno-sse`, `-mno-sse2`, `-mno-mmx`, `-mno-80387`, `-mcmodel=` other than `small`, `-mregparm`, `-mretpoline`, `-mstrict-align` ...) are errors; another `-m...` is ignored with a warning. |
 | `-pthread` | `-D_REENTRANT` (the threads are in the C library). |
 | `-l`, `-L`, `-shared`, `-static`, `-rdynamic` | As `axiom build`'s (`-L` of a directory that does not exist is skipped); `-shared` is `--emit=shared` (and `--pic`); `-static` is an error with the system's C library, which is linked dynamically (with `--c-lib=axiom` a program that needs no shared library is a static executable anyway); `-rdynamic` is `--export-dynamic` (with the system's C library). |
@@ -302,7 +311,7 @@ to every build as it is, and changes a default.
 | `--version`, `-dumpversion`, `-dumpmachine`, `-print-prog-name=p`, `-print-file-name=f`, `-print-search-dirs`, `-print-multiarch`, `-print-multi-os-directory` | The questions configure scripts ask: the compiler's version; the target's triple (`x86_64-linux-gnu`); `p` itself (there are no programs of the compiler's own); `f`'s path in the library directories, else `f`; ... |
 | `-pedantic`, `-Wpedantic`, `-pedantic-errors` | `--c-pedantic` (the warnings stay warnings); `-Wno-pedantic` undoes it. |
 | `-pipe`, `-save-temps`, `-C`, `-B...`, `-Wa,...`, `-static-libgcc`, `-pie`, `-no-pie`, `-s` | Accepted; nothing changes. |
-| `-nostdlib`, `-nostartfiles`, `-nodefaultlibs`, `-nostdinc`, `-undef`, `-imacros`, `-traditional`, `-H`, `-dD`, `--sysroot`, `-u`, `-T` | Errors: not supported. |
+| `-nostdlib`, `-nostartfiles`, `-nodefaultlibs`, `-traditional`, `-dN`, `-dI`, `-dU`, `--sysroot`, `-u`, `-T` | Errors: not supported. |
 
 An unknown option is an error (`unknown option '-x'`), as are the options above that cannot
 be honoured: ignoring them would make another program than the one asked for.
@@ -323,12 +332,12 @@ code: attributes, builtins, inline assembly. `__has_attribute`, `__has_builtin`,
 `__has_include` and `__has_feature` say exactly what works; `__clang__` and `_MSC_VER` are
 not defined.
 
-**Known differences.** `-fvisibility=hidden` is accepted and does nothing (a shared
-library exports its definitions of default visibility; a version script, or the attribute
-`visibility`, limits them). A shared library's own calls and references to its
+**Known differences.** A shared library's own calls and references to its
 definitions may be bound to them when it is compiled (its functions inlined or called
 directly, as with `-Bsymbolic`), so a program's definition of the same name does not
-interpose them everywhere. `-iquote` directories are searched for `<...>` too. With
+interpose them everywhere. `-H` names the headers read, without a list of those that
+could use include guards; `-dD` keeps the unit's own `#define` and `#undef` directives, not
+the predefined macros (`-dM` lists those). With
 `--c-lib=axiom`, `-rdynamic` does nothing (a warning). `-std=c89`, a GNU dialect (gnu89,
 which takes the system's headers' `long long`), accepts `//` comments.
 
@@ -418,8 +427,8 @@ axiom build pkg/                                  # a package with c-sources (be
 - **A package** names a directory of C sources in its manifest: `c-sources = "csrc"`
   under `[package]`. Every `.c` file in it, at any depth and in the order of their paths,
   is a C unit of the program, as if given on the command line; so are those of the
-  packages it depends on. `#include "..."` finds headers next to the including file and
-  in the `-I` directories.
+  packages it depends on. `#include "..."` finds headers next to the including file,
+  in the `--c-iquote` directories and in the `-I` directories.
 - **Axiom calls C** through its foreign declarations (spec §14.5.1): a function in an
   `extern "C"` block that a C unit defines is that definition. Its arguments and result
   are passed as the target's C ABI says, so the types at the boundary (spec §14.5.3)
@@ -886,7 +895,9 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
   and a reference that cannot (one not through the GOT in code that is not
   position-independent) is an error. The compiler takes the definition it compiles to be
   the one that runs when it optimizes (it may inline the function). Protected and hidden
-  definitions bind within the library. Every address it holds is relocated where
+  definitions bind within the library, as do the definitions its objects declare hidden
+  (the most constraining visibility of a symbol's, in any object, is its own:
+  `nlink.ax`). Every address it holds is relocated where
   it is loaded (`R_*_RELATIVE`), `DT_SONAME` its file name, `DT_INIT_ARRAY` and
   `DT_FINI_ARRAY` its constructors and destructors, and `DT_NEEDED` the libraries it uses.
   Code that is not position-independent (an absolute address in code or read-only data,
@@ -2265,7 +2276,7 @@ GNU compilers apply them to that type: `format` on a table of `printf`-like func
 | `unused` | any declaration, labels | As `[[maybe_unused]]`. |
 | `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if nothing linked defines it: on WebAssembly too, table slot 0 and no import of the host's, a call of it reaching a stub of the linker's that traps; weak data there is at address 0). `#pragma weak` too. |
 | `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): a symbol of its own (with `weak`, a weak one) at target's place in every object format, which other objects refer to; the program's other units' references to the name are to target (unless a weak alias's name is defined otherwise, which then wins). An object for other links keeps target for it. |
-| `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to objects and shared libraries (ELF: `STV_HIDDEN` for hidden and internal, `STV_PROTECTED`, `STV_DEFAULT`; Mach-O: hidden as a private extern; COFF and Mach-O have no protected symbols: default there). With `--pic` (and `--emit=shared`) on ELF a definition of default visibility is preemptible, its address taken from the GOT and its calls through the PLT; hidden and protected ones are reached directly ("Shared libraries"). No effect on an executable's own code. |
+| `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to objects and shared libraries (ELF: `STV_HIDDEN` for hidden and internal, `STV_PROTECTED`, `STV_DEFAULT`; Mach-O: hidden as a private extern; COFF and Mach-O have no protected symbols: default there). With `--pic` (and `--emit=shared`) on ELF a definition of default visibility is preemptible, its address taken from the GOT and its calls through the PLT; hidden and protected ones are reached directly ("Shared libraries"). A declaration carries it too: an entity's visibility is the most constraining of its declarations' and its definition's, in a build of several units and, on ELF, in a link of objects (whose undefined symbols have their declarations' visibility); a hidden or internal one declared and not defined is the module's own on ELF, its address reached directly, not through the GOT (in a shared library, one that no object of the link defines is then an error of the link). `--c-visibility` (`-fvisibility=`) gives the definitions with none theirs. No effect on an executable's own code. |
 | `ifunc("resolver")` | function declarations of external linkage | An indirect function (ELF's `STT_GNU_IFUNC`; Linux targets only, else C3090, and `__has_attribute(ifunc)` is 0): the symbol of its name is at resolver, a function the unit defines (else C3090), taking no arguments (on AArch64 it may take the hardware capabilities: "Objects and libraries") and returning the function's address, which the program's start-up (a static program's, before anything else runs) or the dynamic linker calls once; the function's calls and its address are its name's, one address wherever it is taken. A definition of it with a body is a redefinition (C3002); it is not also an alias. |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
 | `noinline`, `always_inline` | functions | Given to the optimizer. |
@@ -2950,7 +2961,7 @@ is the warning C4112 and is ignored; an unknown one is ignored (the warning C411
 | `STDC FENV_ROUND dir` (C23) | Honoured, at translation and at run time ("The floating-point environment"); `FE_TONEARESTFROMZERO`, and a directed rounding on WebAssembly, are C4113. |
 | `STDC FENV_DEC_ROUND dir` (C23) | Honoured, every direction, on every target. |
 | `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123), `-Wformat` (C4130 to C4135), `-Wformat-extra-args` (C4132), `-Wformat-nonliteral` and `-Wformat-security` (C4134), `-Wformat-signedness` (C4135); others are ignored. An error is never made a warning (nor a check `--c-warn-format` does not make enabled). |
-| `GCC visibility push(v)`, `pop` | The declarations with external linkage up to the matching `pop` get visibility v (as the attribute, which overrides it). |
+| `GCC visibility push(v)`, `pop` | The declarations with external linkage up to the matching `pop` (definitions and declarations: the attribute `visibility`) get visibility v, over `--c-visibility`'s; the attribute overrides it. Pushes nest: `push(default)` inside `push(hidden)` is default, under `--c-visibility=hidden` too, and after the `pop` of the outermost, `--c-visibility`'s holds again. |
 | `GCC poison x y` | A later use of x or y is the error C1086 (not one a macro defined before makes). |
 | `GCC system_header` | The rest of the file gives no warnings (in the main file it means nothing). |
 | `GCC warning "m"`, `GCC error "m"` | The warning C4103, or the error C1040. |

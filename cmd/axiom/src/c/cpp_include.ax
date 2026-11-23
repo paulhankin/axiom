@@ -31,8 +31,9 @@ fn join(d: []u8, name: []u8) []u8 {
 }
 
 // The file a header name names (its characters between the delimiters),
-// or nil: "..." is looked for next to the including file first, then both
-// forms in the -I directories and the compiler's headers.
+// or nil: "..." is looked for next to the including file first, then in
+// the --c-iquote directories, then both forms in the -I directories and
+// the compiler's headers.
 fn find_file(P: *mut PP, name: []u8, quoted: bool) []u8 {
     P.found_index = -1;
     if (name.len > 0) and (name[0] != '/') and quoted {
@@ -40,8 +41,25 @@ fn find_file(P: *mut PP, name: []u8, quoted: bool) []u8 {
         if u.is_file(p) {
             return p;
         }
+        let q = find_quoted(P, name);
+        if not u.isnos(q) {
+            return q;
+        }
     }
     return find_file_from(P, name, 0);
+}
+
+// The file `name` in the --c-iquote directories, or nil. (Not an entry of
+// the include path: P.found_index stays -1, and an #include_next in the
+// file searches the path from its start.)
+fn find_quoted(P: *mut PP, name: []u8) []u8 {
+    for d in P.o.quote_dirs {
+        let p = join(d, name);
+        if u.is_file(p) {
+            return p;
+        }
+    }
+    return u.nosym();
 }
 
 // The file `name` in the include path, from its entry `from` on: the -I
@@ -62,6 +80,11 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
     let ns = @int_cast(i32, P.o.system_dirs.len);
     let mut k = from;
     while k <= (n + ns) {
+        if P.o.nostdinc and (k >= n) {
+            // (--c-nostdinc: neither the system's directories nor the compiler's)
+            k = n + ns + 1;
+            break;
+        }
         let mut d = P.o.sys_include;
         if k < n {
             d = P.o.include_dirs[@int_cast(usize, k)];
@@ -102,6 +125,10 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
 // or nil. P.found_index is where it was found.
 fn find_system_file(P: *mut PP, name: []u8) []u8 {
     let n = @int_cast(i32, P.o.include_dirs.len);
+    if P.o.nostdinc {
+        P.found_index = -1;
+        return u.nosym();
+    }
     for k in 0..P.o.system_dirs.len {
         let p = join(P.o.system_dirs[k], name);
         if u.is_file(p) {
@@ -390,7 +417,8 @@ fn push_file(P: *mut PP, sf: *mut u.SourceFile, presumed: []u8) void {
     }
     INC_LINE = 0;
     let L = lx.open(sf, P.o.std);
-    P.files.push(Src.{ L: L, path: sf.path, dir_index: -1, presumed: presumed, line_delta: 0, cond_base: P.conds.len });
+    P.files.push(Src.{ L: L, path: sf.path, dir_index: -1, presumed: presumed, line_delta: 0, cond_base: P.conds.len,
+                       depth: 0 });
     cp.enter_file(sf.id);
 }
 
@@ -429,6 +457,10 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
         }
         if not P.o.hosted and u.is_file(join(P.o.sys_include, name)) {
             msg = u.f1("%s is a header of the C library, which --c-freestanding leaves out", hn);
+        } else if P.o.nostdinc and u.is_file(join(P.o.sys_include, name)) {
+            msg =
+                u.f1("cannot find include file %s (--c-nostdinc: the compiler's and the system's headers are not searched)",
+                     hn);
         }
         _ = dg.err(sp, "C1081", msg);
         P.fatal = true;
@@ -448,9 +480,12 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
     if let .some(sf) = load(P, path) {
         INC = sp;
         INC_LINE = u.span_line(sp);
+        let depth = cur_src(P).depth + 1;
         push_file(P, sf, path);
         cur_src(P).dir_index = found;
+        cur_src(P).depth = depth;
         note_dep(P, path, false);
+        show_include(P, path);
         if in_system_header(P) {
             cp.system_file(sf.id);
         }
