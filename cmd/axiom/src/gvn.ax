@@ -42,6 +42,8 @@ enum EntKind: i32 {
     GE,     // key >= off (unsigned, off a small constant)
     CALL,   // key: a call that promises no writes (ir.call_fx), val: its result
     CMP,    // key `pred` val holds (off: pred | mode << 8): the comparisons it decides (cmp_decides)
+    SLE,    // key <=s val + off (signed; val nil: key <=s off)
+    SGE,    // key >=s val + off (signed; val nil: key >=s off)
 }
 
 const K_EXPR: EntKind = EntKind.EXPR;
@@ -53,6 +55,8 @@ const K_COPY: EntKind = EntKind.COPY;
 const K_GE: EntKind = EntKind.GE;
 const K_CALL: EntKind = EntKind.CALL;
 const K_CMP: EntKind = EntKind.CMP;
+const K_SLE: EntKind = EntKind.SLE;
+const K_SGE: EntKind = EntKind.SGE;
 
 struct Ent {
     kind: EntKind,
@@ -1973,6 +1977,19 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     if ir.is_op(a, ir.OP_ZEXT) {
         return at_least(a.a, k, depth + 1);
     }
+    if ir.is_op(a, ir.OP_SHL) and not ir.is_cint(a.b) {
+        // x << n with n below the width and no bit of x shifted out: at least x
+        let saved = prove_budget;
+        prove_budget = 64;
+        let m = ub(a.a, 0);
+        let n = ub(a.b, 0);
+        prove_budget = saved;
+        if (m >= 0) and (m < 0x1_0000_0000) and (n >= 0) and (n < 32) and (n < @as(i64, a.ty.bits)) and
+           fits_type(m << @truncate(u32, n), a.ty) {
+            return at_least(a.a, k, depth + 1);
+        }
+        return false;
+    }
     let mut c: i64 = 0;
     if ir.is_op(a, ir.OP_MUL) and small_k(a.b) {
         c = kv(a.b);
@@ -1997,10 +2014,57 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     return at_least(s, (k + c - 1) / c, depth + 1);
 }
 
+// x * y <= b + c, the product not wrapping (F_NUW: an overflow check came
+// before): each factor is at most the product when the other is at least 1,
+// and x <= x * x (a loop while p * p <= n: p <= n).
+threadlocal let mut factors_busy: bool = false;
+
+fn assume_factors_le(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
+    if not ir.is_op(a, ir.OP_MUL) or not ir.no_wrap(a, ir.F_NUW) or (not small_k(b) and ir.is_const(b)) or
+       factors_busy {
+        return;
+    }
+    factors_busy = true;
+    assume_factors(a, b, c);
+    factors_busy = false;
+}
+
+fn assume_factors(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
+    for side in @as(i32, 0)..2 {
+        let mut x = a.a;
+        let mut y = a.b;
+        if side == 1 {
+            x = a.b;
+            y = a.a;
+        }
+        // (the facts: a proof here could follow a phi's edges and assume
+        // their conditions, coming back here, which factors_busy stops)
+        if ir.is_const(x) or not ((x == y) or (small_k(y) and (kv(y) >= 1)) or known_at_least(y, 1)) {
+            continue;
+        }
+        if small_k(b) {
+            if (kv(b) + c) >= 0 {
+                add_le(x, vnil(), kv(b) + c);
+            }
+        } else {
+            add_le(x, b, c);
+        }
+        if x == y {
+            break;
+        }
+    }
+}
+
 // Unsigned comparison facts: tp holds for (a, b).
 fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
         return;
+    }
+    if ir.is_signed_pred(tp) {
+        assume_signed(tp, a, b);
+    }
+    if (tp == ir.IntULT) or (tp == ir.IntULE) {
+        assume_factors_le(a, b, 0 - pick1(tp == ir.IntULT));
     }
     if tp == ir.IntULT {
         if small_k(b) {
@@ -2481,16 +2545,23 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
         e = en.next;
     }
     if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and ir.is_cint(x.b) and
-       (ir.cint_val(x.b) >= 2) {
+       ((ir.cint_val(x.b) >= 2) or ((x.op == ir.OP_LSHR) and (ir.cint_val(x.b) == 1))) {
         return true;  // at most MAX / 2
+    }
+    if ir.is_op(x, ir.OP_AND) and ir.is_cint(x.b) and (ir.cint_val(x.b) <= (ir.mask_bits(64) - @bit_cast(u64, d))) {
+        return true;  // x & k <= k (a mask that clears the top bits: an address's page)
     }
     if ir.is_op(x, ir.OP_PHI) {
         return phi_below_max(x, d, depth);
     }
     if (x.kind == ir.V_INST) and ((x.op == ir.OP_ZEXT) or (x.op == ir.OP_TRUNC) or (x.op == ir.OP_AND)) {
-        return below_max(x.a, d, depth + 1) or ((x.op == ir.OP_AND) and small_k(x.b));
+        if below_max(x.a, d, depth + 1) or ((x.op == ir.OP_AND) and small_k(x.b)) {
+            return true;
+        }
     }
-    return false;
+    // an upper bound (below 2^62, far below MAX - d): a remainder, a sum of
+    // bounded values
+    return (x.kind == ir.V_INST) and (ub(x, depth + 1) >= 0);
 }
 
 // Is x <= y + bound?
@@ -3177,6 +3248,296 @@ fn fits_type(v: i64, t: *ir.Ty) bool {
     return @bit_cast(u64, v) <= ir.mask_bits(t.bits);
 }
 
+// -----------------------------------------------------------------------------
+// Signed bounds, for overflow checks: facts x <=s y + c and x >=s y + c (y
+// nil: x <=s c, x >=s c) from the signed comparisons in scope, and the
+// ranges of values that they, the unsigned bounds and the values'
+// computations give (srange). The check of a signed addition or
+// subtraction (op_with_overflow's test, cgbase.ax) or of a multiplication
+// (IN_SMUL_OV, IN_UMUL_OV) whose operands' ranges show that it cannot
+// overflow is folded: a counter below a limit, `x - 1` where x > lo, sums of
+// extended narrow values.
+// -----------------------------------------------------------------------------
+fn sle_hash(v: *ir.Value) u64 {
+    return mix(hp(v), 0x534c45);
+}
+
+fn sge_hash(v: *ir.Value) u64 {
+    return mix(hp(v), 0x534745);
+}
+
+fn smin_of(t: *ir.Ty) i64 {
+    return (0 - smax_of(t)) - 1;
+}
+
+// a tp b holds, tp signed: a <s b is a <=s b - 1 and b >=s a + 1, and so on.
+fn assume_signed(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
+    if (tp == ir.IntSGT) or (tp == ir.IntSGE) {
+        assume_signed(ir.swap_pred(tp), b, a);
+        return;
+    }
+    let lt = tp == ir.IntSLT;
+    if ir.is_const(a) and ir.is_const(b) {
+        return;
+    }
+    if ir.is_cint(b) {
+        if not lt or (ir.sval(b) > smin_of(b.ty)) {
+            push_ent(K_SLE, sle_hash(a), a, ir.sval(b) - pick1(lt), a.ty, vnil());
+        }
+    } else if ir.is_cint(a) {
+        if not lt or (ir.sval(a) < smax_of(a.ty)) {
+            push_ent(K_SGE, sge_hash(b), b, ir.sval(a) + pick1(lt), b.ty, vnil());
+        }
+    } else if not ir.is_const(a) and not ir.is_const(b) {
+        push_ent(K_SLE, sle_hash(a), a, 0 - pick1(lt), a.ty, b);
+        push_ent(K_SGE, sge_hash(b), b, pick1(lt), b.ty, a);
+    }
+}
+
+struct SRange {
+    lo: i64,
+    hi: i64,
+}
+
+// Does the sum of values in x and y stay within t (signed)?
+fn sum_fits(x: SRange, y: SRange, t: *ir.Ty) bool {
+    let up = (y.hi <= 0) or (x.hi <= (smax_of(t) - y.hi));
+    let down = (y.lo >= 0) or (x.lo >= (smin_of(t) - y.lo));
+    return up and down;
+}
+
+// Does x - y for values in x and y stay within t (signed)?
+fn diff_fits(x: SRange, y: SRange, t: *ir.Ty) bool {
+    let up = (y.lo >= 0) or (x.hi <= (smax_of(t) + y.lo));
+    let down = (y.hi <= 0) or (x.lo >= (smin_of(t) + y.hi));
+    return up and down;
+}
+
+// The values v (an integer of at most 64 bits) can take, as signed numbers
+// of its type: a range that holds for every one (the whole type when nothing
+// is known).
+fn srange(v: *mut ir.Value, depth: i32) SRange {
+    let t = v.ty;
+    if ir.is_cint(v) {
+        let x = ir.sval(v);
+        return SRange.{ lo: x, hi: x };
+    }
+    let mut r = SRange.{ lo: smin_of(t), hi: smax_of(t) };
+    if (depth > 4) or (prove_budget <= 0) or ((v.kind != ir.V_INST) and (v.kind != ir.V_PARAM)) {
+        return r;
+    }
+    prove_budget -= 1;
+    // the facts (a fact of a dead path may say nothing can be: r.lo > r.hi)
+    let mut e = bk.get(@truncate(usize, sle_hash(v)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.get(@int_cast(usize, e));
+        if (en.kind == K_SLE) and (en.key == v) and fact_ok(e) {
+            let mut c = en.off;
+            if u.notnil(en.val) {
+                let w = srange(en.val, depth + 1).hi;  // (en.off is -1 or 0)
+                c = smin_of(t);
+                if (w > smin_of(t)) or (en.off == 0) {
+                    c = w + en.off;
+                }
+            }
+            r.hi = @min(r.hi, c);
+        }
+        e = en.next;
+    }
+    e = bk.get(@truncate(usize, sge_hash(v)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.get(@int_cast(usize, e));
+        if (en.kind == K_SGE) and (en.key == v) and fact_ok(e) {
+            let mut c = en.off;
+            if u.notnil(en.val) {
+                let w = srange(en.val, depth + 1).lo;  // (en.off is 0 or 1)
+                c = smax_of(t);
+                if (w < smax_of(t)) or (en.off == 0) {
+                    c = w + en.off;
+                }
+            }
+            r.lo = @max(r.lo, c);
+        }
+        e = en.next;
+    }
+    // an unsigned bound below the sign bit: 0 to it
+    let m = ub(v, depth + 1);
+    if (m >= 0) and (m <= smax_of(t)) {
+        r.lo = @max(r.lo, 0);
+        r.hi = @min(r.hi, m);
+    }
+    let mn = min_of(v, 0);
+    if mn.ok {
+        r.lo = @max(r.lo, mn.lo);
+    }
+    if v.kind != ir.V_INST {
+        return r;
+    }
+    let op = v.op;
+    if op == ir.OP_SEXT {
+        let x = srange(v.a, depth + 1);
+        r.lo = @max(r.lo, x.lo);
+        r.hi = @min(r.hi, x.hi);
+    } else if (op == ir.OP_ZEXT) and (v.a.ty.bits < t.bits) {
+        r.lo = @max(r.lo, 0);
+        r.hi = @min(r.hi, @bit_cast(i64, ir.mask_bits(v.a.ty.bits)));
+    } else if (op == ir.OP_ADD) or (op == ir.OP_SUB) {
+        // (whatever its flags say: the sum is exact when the ranges show it
+        // does not wrap)
+        let x = srange(v.a, depth + 1);
+        let y = srange(v.b, depth + 1);
+        if (x.lo <= x.hi) and (y.lo <= y.hi) {
+            if (op == ir.OP_ADD) and sum_fits(x, y, t) {
+                r.lo = @max(r.lo, x.lo + y.lo);
+                r.hi = @min(r.hi, x.hi + y.hi);
+            } else if (op == ir.OP_SUB) and diff_fits(x, y, t) {
+                r.lo = @max(r.lo, x.lo - y.hi);
+                r.hi = @min(r.hi, x.hi - y.lo);
+            }
+        }
+    }
+    return r;
+}
+
+// x's operand other than y (x an instruction of two operands), or nil.
+fn other_op(x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    if x.a == y {
+        return x.b;
+    }
+    if x.b == y {
+        return x.a;
+    }
+    return vnil();
+}
+
+// Is s the sum a + b (either order)?
+fn is_sum(s: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) bool {
+    return ir.is_op(s, ir.OP_ADD) and (((s.a == a) and (s.b == b)) or ((s.a == b) and (s.b == a)));
+}
+
+// Is s the difference a - b (or a + -b, b a constant)?
+fn is_diff(s: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) bool {
+    if ir.is_op(s, ir.OP_SUB) {
+        return (s.a == a) and (s.b == b);
+    }
+    return ir.is_op(s, ir.OP_ADD) and (s.a == a) and ir.is_cint(s.b) and ir.is_cint(b) and
+           (((0 -% ir.cint_val(b)) & ir.mask_bits(b.ty.bits)) == (ir.cint_val(s.b) & ir.mask_bits(b.ty.bits)));
+}
+
+// The value of i, the test whether a signed addition or subtraction
+// overflows (((a ^ s) & (b ^ s)) < 0 for s = a + b, ((a ^ b) & (a ^ s)) < 0
+// for s = a - b, or the inverse: >= 0), when the operands' ranges show that
+// it does not; or nil.
+fn decide_sovf(i: *mut ir.Value) *mut ir.Value {
+    let p = ir.pred_of(i);
+    let x = i.a;
+    if not ir.is_cint(i.b) or not ir.is_op(x, ir.OP_AND) or (x.ty.bits < 2) {
+        return vnil();
+    }
+    let k = ir.sval(i.b);
+    let mut on_ovf = false;  // the value of i when the operation overflows
+    if ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1)) {
+        on_ovf = true;
+    } else if not (((p == ir.IntSGE) and (k == 0)) or ((p == ir.IntSGT) and (k == -1))) {
+        return vnil();
+    }
+    let pp = x.a;
+    let qq = x.b;
+    let mut a = vnil();
+    let mut b = vnil();
+    let mut sub = false;
+    // -y: (y & (0 - y)) < 0, the xors with 0 folded away
+    if is_diff(qq, ir.czero(x.ty), pp) or is_diff(pp, ir.czero(x.ty), qq) {
+        a = ir.czero(x.ty);
+        b = pp;
+        if is_diff(pp, ir.czero(x.ty), qq) {
+            b = qq;
+        }
+        sub = true;
+    }
+    for side in @as(i32, 0)..2 {
+        if u.notnil(a) or not ir.is_op(pp, ir.OP_XOR) or not ir.is_op(qq, ir.OP_XOR) {
+            break;
+        }
+        // the value both xors have: s (a sum) or a (a difference)
+        let mut c = pp.a;
+        if side == 1 {
+            c = pp.b;
+        }
+        let y = other_op(pp, c);
+        let z = other_op(qq, c);
+        if u.isnil(y) or u.isnil(z) {
+            continue;
+        }
+        if is_sum(c, y, z) {
+            a = y;
+            b = z;
+            break;
+        }
+        if is_diff(y, c, z) or is_diff(z, c, y) {
+            a = c;
+            b = z;
+            if is_diff(z, c, y) {
+                b = y;
+            }
+            sub = true;
+            break;
+        }
+    }
+    if u.isnil(a) {
+        return vnil();
+    }
+    prove_budget = 64;
+    let ra = srange(a, 0);
+    let rb = srange(b, 0);
+    if (ra.lo > ra.hi) or (rb.lo > rb.hi) {
+        return vnil();  // (a dead path)
+    }
+    if (not sub and sum_fits(ra, rb, a.ty)) or (sub and diff_fits(ra, rb, a.ty)) {
+        return kb(not on_ovf);
+    }
+    return vnil();
+}
+
+// The value of i, IN_UMUL_OV or IN_SMUL_OV, when the operands' ranges show
+// that the product fits; or nil.
+fn decide_mul_ov(i: *mut ir.Value) *mut ir.Value {
+    if i.xs.len != 2 {
+        return vnil();
+    }
+    let a = i.xs.get(0);
+    let b = i.xs.get(1);
+    let t = a.ty;
+    if (t.kind != ir.T_INT) or (t.bits > 64) or (t.bits < 2) {
+        return vnil();
+    }
+    prove_budget = 64;
+    if ir.intr_id(i) == ir.IN_UMUL_OV {
+        let x = ub(a, 0);
+        let y = ub(b, 0);
+        if (x >= 0) and (y >= 0) and ((x == 0) or (@bit_cast(u64, y) <= (ir.mask_bits(t.bits) / @bit_cast(u64, x)))) {
+            return g_false;
+        }
+        return vnil();
+    }
+    let x = srange(a, 0);
+    let y = srange(b, 0);
+    let lim: i64 = 0x7FFF_FFFF;  // (products of these fit an i64)
+    if (x.lo > x.hi) or (y.lo > y.hi) or (x.lo < -lim) or (x.hi > lim) or (y.lo < -lim) or (y.hi > lim) {
+        return vnil();
+    }
+    let p1 = x.lo * y.lo;
+    let p2 = x.lo * y.hi;
+    let p3 = x.hi * y.lo;
+    let p4 = x.hi * y.hi;
+    let lo = @min(@min(p1, p2), @min(p3, p4));
+    let hi = @max(@max(p1, p2), @max(p3, p4));
+    if (lo >= smin_of(t)) and (hi <= smax_of(t)) {
+        return g_false;
+    }
+    return vnil();
+}
+
 // The value of an unsigned comparison the bounds decide, or nil.
 fn decide(i: *mut ir.Value) *mut ir.Value {
     let mut p = ir.pred_of(i);
@@ -3184,6 +3545,12 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
     let b = i.b;
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (i.ty.kind != ir.T_INT) {
         return vnil();
+    }
+    if ir.is_signed_pred(p) and ir.is_op(a, ir.OP_AND) {
+        let r = decide_sovf(i);
+        if u.notnil(r) {
+            return r;
+        }
     }
     // comparisons with constants near the top of the range (overflow checks)
     if ir.is_cint(b) and not small_k(b) and (a.ty.bits == 64) {
@@ -3223,6 +3590,28 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
                 return kb(p == ir.IntULE);
             }
         }
+    }
+    // x == MIN and x != MIN (signed, the overflow check of -x), x == MAX
+    // and x != MAX, for x whose range leaves it out
+    if ir.is_cint(b) and ((p == ir.IntEQ) or (p == ir.IntNE)) and not ir.is_const(a) and (a.ty.bits >= 2) and
+       ((ir.sval(b) == smin_of(a.ty)) or (ir.sval(b) == smax_of(a.ty))) {
+        let r = srange(a, 0);
+        if (r.lo <= r.hi) and ((ir.sval(b) < r.lo) or (ir.sval(b) > r.hi)) {
+            return kb(p == ir.IntNE);
+        }
+    }
+    // x == MAX and x != MAX (unsigned: the check of x + 1) for x with a bound
+    if ir.is_cint(b) and ((p == ir.IntEQ) or (p == ir.IntNE)) and not ir.is_const(a) and
+       (ir.cint_val(b) == ir.mask_bits(a.ty.bits)) {
+        let m = ub(a, 0);
+        if (m >= 0) and (@bit_cast(u64, m) < ir.cint_val(b)) {
+            return kb(p == ir.IntNE);
+        }
+    }
+    // x == 0 and x != 0 for x at least 1
+    if ir.is_cint(b) and (ir.cint_val(b) == 0) and ((p == ir.IntEQ) or (p == ir.IntNE)) and not ir.is_const(a) and
+       at_least(a, 1, 0) {
+        return kb(p == ir.IntNE);
     }
     // lower bounds: n - x >= k when x + k <= n, and multiples of them
     if small_k(b) and ((p == ir.IntUGE) or (p == ir.IntUGT) or (p == ir.IntULT) or (p == ir.IntULE)) {
@@ -3499,6 +3888,9 @@ fn visit_block(b: *mut ir.Block) void {
                 if u.isnil(r) {
                     r = table_cmp(i);
                 }
+            }
+            if u.isnil(r) and ir.is_mul_ov(i) {
+                r = decide_mul_ov(i);
             }
             if u.notnil(r) {
                 // (r, which dominates i, now stands for i too: what i's
