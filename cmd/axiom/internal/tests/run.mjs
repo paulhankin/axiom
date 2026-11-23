@@ -1561,8 +1561,10 @@ await section('C programs', {
       }
       return best;
     };
+    // (8 times the blocks: a quadratic pass would take about 64 times as long;
+    // a linear compiler measures from 12 to 27 times on a shared machine)
     const t1 = await time(300), t8 = await time(2400);
-    return t8 < 25 * t1 ? null : `300 blocks: ${t1.toFixed(0)} ms, 2400: ${t8.toFixed(0)} ms`;
+    return t8 < 36 * t1 ? null : `300 blocks: ${t1.toFixed(0)} ms, 2400: ${t8.toFixed(0)} ms`;
   },
   // (C's attribute visibility in the ELF object's symbols: hidden and
   // internal are STV_HIDDEN, protected and default STV_DEFAULT)
