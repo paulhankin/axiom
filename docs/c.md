@@ -805,7 +805,9 @@ and named variadic macro parameters (`name...`), which they take their compiler 
 (AArch64 Linux's `<signal.h>` reaches kernel headers with `__signed__` and
 `__uint128_t`): in them, and in their macros' expansions, those are accepted.
 Without `--c-gnu-compat` `__GNUC__` is not defined, so they use what they have for other
-compilers; with it (`axiom cc`) their GNU paths ("GNU compatibility"). The standard
+compilers; with it (`axiom cc`) their GNU paths ("GNU compatibility"), which on AArch64
+also name the GNU compilers' built-in Advanced SIMD types (`__Float32x4_t` and the rest:
+`<math.h>`'s vector declarations), defined as `arm_neon.h`'s. The standard
 must be C99 or later or a GNU dialect (gnu89 and gnu90 take the headers' `long long`), the C options the platform's ABI's (`--c-int`, `--c-long`), and
 `--c-freestanding` is not given. `setjmp` and the other functions POSIX says return twice
 (`_setjmp`, `sigsetjmp`, `vfork`, `getcontext`) make their callers return twice. The
