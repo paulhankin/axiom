@@ -28,8 +28,8 @@ returns an error and its work and memory stay bounded by a small multiple of the
 input's size (see [`docs/security.md`](docs/security.md)). Breaking one of those
 promises is a vulnerability. For example:
 
-- **The compiler** generating code that skips a bounds check, an overflow check in an
-  `--overflow=trap` build, or any other check the spec requires; or code that is wrong
+- **The compiler** generating code that skips a bounds check, an overflow check (in the
+  default `trap` overflow mode), or any other check the spec requires; or code that is wrong
   in a way an attacker could exploit.
 - **The standard library**: memory corruption, an input that a parser should refuse
   but accepts (request smuggling, certificate-validation gaps, TLS state-machine

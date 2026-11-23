@@ -36,7 +36,7 @@ def pr(expr, t):
 for t, bits, s in INTS:
     P('fn t_%s(a: %s, b: %s) void {' % (t, t, t))
     P('    print_u64(9000001);')
-    for op in ['+%', '-%', '*%', '+', '-', '*', '&', '|', '^']:  # (+ - * wrap by default)
+    for op in ['+%', '-%', '*%', '+', '-', '*', '&', '|', '^']:  # (+ - * wrap: run.sh builds with --overflow=wrap)
         P('    %s' % pr('a %s b' % op, t))
     for op in ['==', '!=', '<', '<=', '>', '>=']:
         P('    print_u64(bv(a %s b));' % op)

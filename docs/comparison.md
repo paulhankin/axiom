@@ -25,7 +25,7 @@ Axiom's choices differ and what each choice costs.
 | **Generics** | Monomorphized; a closed set of builtin constraints; bodies checked at the definition | `comptime` parameters; checked at each instantiation | Traits; checked at the definition | Templates, concepts; checked at each instantiation | Macros, `_Generic`, `void *` |
 | **Metaprogramming** | None: no macros, no compile-time execution | `comptime` code | Declarative and procedural macros, `const fn` | Templates, `constexpr`/`consteval`, preprocessor | Preprocessor |
 | **Hidden control flow** | None: no exceptions, destructors, overloading or implicit calls | None (by design) | Destructors, `Deref`, overloading, panics | Destructors, overloading, conversions, exceptions | Almost none (`setjmp`/`longjmp` aside) |
-| **Integer overflow** | Wraps in every build (`--overflow=trap` checks, for debugging); `+%` says so explicitly; `@add_checked`, `@add_sat` | Checked in safe modes; `+%` wraps, `+\|` saturates | Panics in debug, wraps in release | Signed: undefined; unsigned: wraps | Signed: undefined; unsigned: wraps |
+| **Integer overflow** | Traps in every build (`T0002`); `+%` wraps; `@add_checked`, `@add_sat` | Checked in safe modes; `+%` wraps, `+\|` saturates | Panics in debug, wraps in release | Signed: undefined; unsigned: wraps | Signed: undefined; unsigned: wraps |
 | **Data races** | Defined (each byte reads some written value); sequentially consistent atomics only | Undefined; atomics with orderings | Prevented by `Send`/`Sync` in safe code | Undefined; atomics with orderings | Undefined; atomics with orderings |
 | **SIMD** | Vector primitives of 128, 256 and 512 bits (`f32x4`, `i8x32`, `f32x16`, …) with the same results on every target; processor extensions chosen at build or run time | `@Vector(N, T)` of any width | Intrinsics (`core::arch`); portable `std::simd` is unstable | Intrinsics, vector extensions; `std::simd` in C++26 | Intrinsics, vector extensions |
 | **Grammar** | LL(1), context-free, no macros; operator precedence is a partial order | Simple, no macros | Large; macros | Very large, context-sensitive | Small, but the preprocessor sits on top |
@@ -149,9 +149,8 @@ static int sum_digits(const unsigned char *s, size_t n, uint32_t *out) {
 The Axiom, Zig and Rust versions look alike: an error type in the signature and a
 one-token way to pass an error up. The differences show up at the edges:
 
-- **A very long input** makes `total` overflow. Axiom wraps, in every build, as Go
-  does (an `--overflow=trap` build traps with code `T0002` and a stack trace instead);
-  code that must notice writes `@add_checked(total, d) catch return error.Overflow`.
+- **A very long input** makes `total` overflow. Axiom traps, in every build, with code
+  `T0002` and a stack trace; code that must handle it writes `@add_checked(total, d) catch return error.Overflow`.
   Zig panics in Debug and ReleaseSafe builds, and has undefined behavior in ReleaseFast.
   Rust panics in debug builds and silently wraps in release builds. C++ and C wrap
   silently: `uint32_t` arithmetic is modular.
@@ -168,7 +167,7 @@ one-token way to pass an error up. The differences show up at the edges:
 | | Axiom | Zig (ReleaseSafe / ReleaseFast) | Rust (safe code) | C++ | C |
 |---|---|---|---|---|---|
 | **An index is out of bounds** | Trap `T0001` | Panic / undefined | Panic | Undefined (`at()` throws; hardened libraries check) | Undefined |
-| **Signed overflow** | Wraps (trap `T0002` with `--overflow=trap`) | Panic / undefined | Panic in debug, wrap in release | Undefined | Undefined |
+| **Signed overflow** | Traps (`T0002`; `+%` wraps) | Panic / undefined | Panic in debug, wrap in release | Undefined | Undefined |
 | **Division by zero** | Trap `T0003` | Panic / undefined | Panic | Undefined | Undefined |
 | **Shift by ≥ the width** | Defined: the mathematical result (`0`, or `-1` for a negative `>>`) | Rejected by the shift-amount type unless cast | Panic in debug, count masked in release | Undefined | Undefined |
 | **A read of uninitialized memory** | Defined: a `let mut x: T = undefined` local, like allocator memory, holds unspecified bytes, never poison | Allowed through `undefined`; reading it is illegal behavior, mostly unchecked | Rejected at compile time | Undefined (erroneous behavior in C++26) | Undefined |
@@ -291,10 +290,11 @@ small, but real code relies on the preprocessor.
 
 ## Numbers and SIMD
 
-- **Integers.** Integer arithmetic wraps by default in every build, as in Go and Java. A build can opt into checking (`--overflow=trap`, which traps with
-  `T0002`) or saturation (`--overflow=saturate`); the overflow mode is the only build
-  setting that can change what a program means, and optimization levels must not. The
-  wrapping operators (`+%`, `-%`, `*%`) remain as explicit spellings, and
+- **Integers.** Integer arithmetic traps on overflow (`T0002`) in every build. A build
+  can opt into wrapping (`--overflow=wrap`) or saturation (`--overflow=saturate`); the
+  overflow mode is the only build setting that can change what a program means, and
+  optimization levels must not. The wrapping operators (`+%`, `-%`, `*%`) wrap in every
+  mode, and
   `@add_checked`/`@add_sat` (and `sub`, `mul`) ask for a checked or saturated result.
   Shifts are defined for every count, and division by zero always traps. Zig and Rust
   offer similar operators (`+%`, `+|`; `wrapping_add`, `saturating_add`, `checked_add`),

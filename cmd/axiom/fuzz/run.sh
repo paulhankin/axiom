@@ -3,7 +3,9 @@
 # that applies every integer, float and SIMD operation to edge values and
 # prints the results; every backend's output must match the reference
 # exactly. The reference is the WebAssembly build's output under node, so
-# that the backends are checked against each other.
+# that the backends are checked against each other. The programs are built
+# with --overflow=wrap: they apply + - * to edge values and print the
+# wrapped results (checked arithmetic has its own tests, run/checked_forms.ax).
 #
 #   cmd/axiom/fuzz/run.sh [first seed] [last seed]    (default 1 5)
 #
@@ -40,7 +42,7 @@ while [ "$seed" -le "$last" ]; do
     echo "seed $seed"
     f=$T/f$seed.ax
     python3 cmd/axiom/fuzz/gen.py "$seed" > "$f"
-    if $NEW build "$f" -o "$T/w.wasm" > "$T/log" 2>&1; then
+    if $NEW build "$f" --overflow=wrap -o "$T/w.wasm" > "$T/log" 2>&1; then
         node cmd/axiom/fuzz/runw.mjs "$T/w.wasm" > "$T/w.txt" 2>&1
         cp "$T/w.txt" "$T/ref.txt"
     else
@@ -58,7 +60,7 @@ while [ "$seed" -le "$last" ]; do
             x86-64-v4* | avx512bw) grep -q avx512bw /proc/cpuinfo 2>/dev/null || { echo "  $name: skipped (no AVX-512 here)"; continue; } ;;
         esac
         # shellcheck disable=SC2086
-        if $NEW build "$f" --target=x86_64 ${cfg#*:} --link=$RT -o "$T/x" > "$T/log" 2>&1; then
+        if $NEW build "$f" --overflow=wrap --target=x86_64 ${cfg#*:} --link=$RT -o "$T/x" > "$T/log" 2>&1; then
             "$T/x" > "$T/x.txt" 2>&1
             check "$name" "$T/x.txt"
         else
@@ -69,7 +71,7 @@ while [ "$seed" -le "$last" ]; do
         for cfg in "aarch64:--cpu=generic" "aarch64-lse:--features=+lse" "aarch64-O2:-O2"; do
             name=${cfg%%:*}
             # shellcheck disable=SC2086
-            if $NEW build "$f" --target=aarch64 ${cfg#*:} --link=$RT -o "$T/a" > "$T/log" 2>&1; then
+            if $NEW build "$f" --overflow=wrap --target=aarch64 ${cfg#*:} --link=$RT -o "$T/a" > "$T/log" 2>&1; then
                 $qemu -L /usr/aarch64-linux-gnu "$T/a" > "$T/a.txt" 2>&1
                 check "$name" "$T/a.txt"
             else
