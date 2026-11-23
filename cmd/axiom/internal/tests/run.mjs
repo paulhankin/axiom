@@ -1550,8 +1550,9 @@ await section('C programs', {
       const f = path.join(tmp, `c-long-${n}.c`);
       const body = Array.from({ length: n }, (_, k) => `{\n${bodies[(k * 7) % bodies.length]}\n}\n`).join('');
       fs.writeFileSync(f, `${head}\nvoid big(void) {\n${body}}\n`);
+      // (the best of 3: on a loaded machine one run can take twice as long)
       let best = Infinity;
-      for (let k = 0; k < 2; k++) {
+      for (let k = 0; k < 3; k++) {
         const t0 = process.hrtime.bigint();
         const c = await spawnAsync(compiler, ['build', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '--emit=obj',
           '--target=x86_64', '-O2', ...flags, '-o', f.replace(/\.c$/, '.o')], { encoding: 'utf8', timeout: compileTimeout });
