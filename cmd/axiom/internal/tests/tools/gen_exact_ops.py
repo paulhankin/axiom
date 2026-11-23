@@ -37,8 +37,9 @@ pseudo-random values have a fixed seed):
   floats and integers.
 - exact_float_arith.ax: IEEE 754 binary32 and binary64 + - * / @sqrt @fma
   (and a * b + c, which must not be contracted), unary -, @abs, @min/@max
-  (a NaN operand gives NaN; -0 < +0), @copysign, @floor @ceil @trunc
-  @nearest and the comparisons, of every pair (triple for @fma) of edge
+  (a NaN operand gives NaN; -0 < +0), @copysign, @rem (exact: x - n * y,
+  n = trunc(x / y)), @floor @ceil @trunc @nearest and the comparisons, of
+  every pair (triple for @fma) of edge
   values: zeros, ones, subnormals, the largest and smallest normals, values
   whose operations round (ties too), infinities and NaN; and @fma and
   a * b + c of products that round to a subnormal or a signed zero, plus a
@@ -288,6 +289,25 @@ def f_fma(a, b, c, t):
     prod = Fraction(a) * Fraction(b)
     exact = prod + Fraction(c)
     return rnd_result(exact, t, prod == 0 and c == 0 and pneg and is_neg(c))
+
+
+def f_rem(a, b, t):
+    """@rem: x - n * y with n = trunc(x / y), exact (it has a value of the
+    type), a zero of x's sign; NaN when x is infinite or NaN, or y zero or
+    NaN; x when y is infinite."""
+    if math.isnan(a) or math.isnan(b) or math.isinf(a) or b == 0:
+        return NAN
+    if math.isinf(b):
+        return a
+    fa, fb = Fraction(a), Fraction(b)
+    q = fa / fb
+    n = q.numerator // q.denominator if q >= 0 else -((-q.numerator) // q.denominator)
+    r = fa - n * fb
+    if r == 0:
+        return signed_zero(is_neg(a))
+    v = float(r)
+    assert Fraction(v) == r and round_frac(r, t) == v
+    return v
 
 
 def f_minmax(a, b, is_max):
@@ -1138,7 +1158,8 @@ def gen_float_arith():
         'contraction) on f32 and f64, of every pair (triple for @fma and a * b + c)',
         'of edge values: zeros, ones, values that round, subnormals, the extremes,',
         'infinities and NaN. + - * / @sqrt @fma, unary -, @abs, @min/@max (a NaN',
-        'operand gives NaN; -0 < +0), @copysign, @floor @ceil @trunc @nearest and the',
+        'operand gives NaN; -0 < +0), @copysign, @rem (the remainder of the division',
+        'truncated toward zero, exact), @floor @ceil @trunc @nearest and the',
         'comparisons each have one result, computed in Python with rationals. Also',
         '@fma and a * b + c of products that round to a subnormal or a signed zero.',
     ] + GEN)
@@ -1162,6 +1183,7 @@ def gen_float_arith():
             Stmt('min', '@min(a, b)', lambda a, b: f_minmax(a, b, False), t),
             Stmt('max', '@max(a, b)', lambda a, b: f_minmax(a, b, True), t),
             Stmt('copysign', '@copysign(a, b)', lambda a, b: math.copysign(a, b) if not math.isnan(a) else NAN, t),
+            Stmt('rem', '@rem(a, b)', lambda a, b: f_rem(a, b, t), t),
             Stmt('cmp', CMP_EXPR, f_cmp, 'u8'),
             Stmt('cmp branch', 'c', cmp_branch_py, 'u8', pre=CMP_BRANCH),
         ]))
