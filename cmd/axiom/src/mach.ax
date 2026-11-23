@@ -1267,6 +1267,8 @@ struct Interval {
     reads: f64,              // instructions reading it, other than stores into its slot
     ranges: u.List.[Range],  // the positions it is live at: sorted, disjoint, inclusive
     size: i32,               // positions covered
+    cpos: i32,               // where an interval evicted it, this round (-1: nowhere; see stuck_spills)
+    by: i32,                 // ... which one (-1: none)
 }
 
 const WEIGHT_PAD: i32 = 50;
@@ -1319,7 +1321,8 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     let iv = u.newn.[Interval](nv + 1);
     for k in 0..nv {
         iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false, nosave: false,
-                           uses: 0.0, reloads: 0.0, reads: 0.0, ranges: u.List.[Range].empty(), size: 0 };
+                           uses: 0.0, reloads: 0.0, reads: 0.0, ranges: u.List.[Range].empty(), size: 0, cpos: -1,
+                           by: -1 };
     }
     let w = words(nv);
     let live = u.newn.[u64](w + 1);
@@ -1814,6 +1817,7 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []mut SegSet, fra
                 u.eprint(u.f1("  v%s spilled (reloaded more often than read)\n", u.idec(ci)));
             }
             cur.spilled = true;
+            cur.by = -1;
             nspill += 1;
             continue;
         }
@@ -1916,6 +1920,8 @@ fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []mut SegSet, fra
                 }
                 if not seen {
                     vict.push(x);
+                    iv[@int_cast(usize, x)].cpos = @max(rg.s, seg_get(l, k).s);
+                    iv[@int_cast(usize, x)].by = ci;
                 }
                 k = seg_next(l, k);
             }
@@ -3544,11 +3550,13 @@ fn rewrite_edges(f: *mut MFunc, t: *Target, g: *Cfg, ms: *mut Split, rg: *Region
 
 // Splits vreg x into regions (see above), where mode says (SPLIT_LOOPS,
 // SPLIT_GAPS, SPLIT_ALL). Returns false, changing nothing, if there is
-// nothing to split.
+// nothing to split, or if a piece would hold it in a register at cpos (if
+// >= 0: where an interval evicted it, see stuck_spills) as it was: the
+// split would make no room there.
 // (nm: whether each block of nl names the vreg; where it does not, the vreg
 // is live through it, and only its calls and jumps matter)
 fn split(f: *mut MFunc, t: *Target, g: *mut Cfg, x: usize, mode: i32, level: u8, nl: []i32, nm: []bool,
-         men0: []*mut MInst, men_ev: []i32, mbeg: []i32) bool {
+         men0: []*mut MInst, men_ev: []i32, mbeg: []i32, cpos: i32) bool {
     let v = VREG0 + @int_cast(i32, x);
     let mut rd = f.remat.get(x);
     let isrm = u.notnil(rd);
@@ -3583,8 +3591,14 @@ fn split(f: *mut MFunc, t: *Target, g: *mut Cfg, x: usize, mode: i32, level: u8,
         return false;  // (one region, live across no call)
     }
     let mut rg = regions(f, g, &mut ms);
-    region_pieces(f, &mut ms, &mut rg, level);
     self_loads(f, g, &mut ms, &rg);
+    if (cpos >= 0) and holds_at(f, g, &mut ms, &rg, cpos) {
+        if debug_ra {
+            u.eprint(u.f2("  split v%s mode %s: still held where it was evicted\n", u.zdec(x), u.idec(mode)));
+        }
+        return false;
+    }
+    region_pieces(f, &mut ms, &mut rg, level);
     if debug_ra {
         u.eprint(u.f2("split v%s mode %s\n", u.zdec(x), u.idec(mode)));
         for bj in 0..m {
@@ -3611,6 +3625,40 @@ fn split(f: *mut MFunc, t: *Target, g: *mut Cfg, x: usize, mode: i32, level: u8,
         }
     }
     return true;
+}
+
+// Would the split leave the vreg in a register at position p, as it was?
+// Where the block holding p is one segment (no call it is live across)
+// whose region uses it (a piece holds it there), and the vreg is defined
+// in the block, or is live into it and not reloaded by the block itself
+// before its first use (self_loads), but in a register on entry (joined
+// edges, or reloads on the split ones): then the piece holds it from the
+// block's start or its definition past p, as the vreg did.
+fn holds_at(f: *MFunc, g: *Cfg, ms: *mut Split, rg: *Regions, p: i32) bool {
+    // (the last block starting at or before p: blocks are numbered in order,
+    // an empty one where the next starts)
+    let mut lo: usize = 0;
+    let mut hi = f.blocks.len;
+    while (hi - lo) > 1 {
+        let mid = (lo + hi) / 2;
+        if f.blocks.get(mid).start <= p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let bi = lo;
+    if (f.blocks.len == 0) or (p > f.blocks.get(bi).end) or not g.near[bi] {
+        return false;
+    }
+    let bj = @int_cast(usize, g.cidx[bi]);
+    if ms.head[bj] != ms.tail[bj] {
+        return false;
+    }
+    if not rg.occ[@int_cast(usize, ms.sg.root(ms.head[bj]))] {
+        return false;
+    }
+    return not bget(f.blocks.get(bi).live_in, ms.x) or (ms.sload[bj] < 0);
 }
 
 // Notes block bi in r's nl (and that bi names it), if r is a spilled vreg
@@ -4094,10 +4142,11 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
             g.cidx[@int_cast(usize, nl[j])] = @int_cast(i32, j);
         }
         let lv = f.level.get(k);
+        let cp = iv[k].cpos;
         if iv[k].nosave {
             // (save_dearer: split at its calls, or if it cannot be, left to
             // take its callee-saved register next round)
-            if not split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb) {
+            if not split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb, -1) {
                 f.nosave.set(k, true);
             }
             for j in 0..nl.len {
@@ -4110,10 +4159,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
             // code that use it; then built again in each block reading it
             let mut sp = false;
             if lv == 0 {
-                sp = split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb);
+                sp = split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb, cp);
             }
             if not sp and (lv <= 1) {
-                sp = split(f, t, &mut g, k, SPLIT_GAPS, 2, nl, nm, ml, me, mb);
+                sp = split(f, t, &mut g, k, SPLIT_GAPS, 2, nl, nm, ml, me, mb, cp);
             }
             rm[k] = not sp;
             for j in 0..nl.len {
@@ -4123,13 +4172,13 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval, segs: []SegSet)
         }
         let mut done = false;
         if lv == 0 {
-            done = split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb);
+            done = split(f, t, &mut g, k, SPLIT_LOOPS, 1, nl, nm, ml, me, mb, cp);
         }
         if not done and (lv <= 1) {
-            done = split(f, t, &mut g, k, SPLIT_GAPS, 2, nl, nm, ml, me, mb);
+            done = split(f, t, &mut g, k, SPLIT_GAPS, 2, nl, nm, ml, me, mb, cp);
         }
         if not done and (lv <= 2) {
-            done = split(f, t, &mut g, k, SPLIT_ALL, 3, nl, nm, ml, me, mb);
+            done = split(f, t, &mut g, k, SPLIT_ALL, 3, nl, nm, ml, me, mb, cp);
         }
         every[k] = not done;
         for j in 0..nl.len {
@@ -4707,8 +4756,41 @@ fn spills_frameless(f: *MFunc, iv: []Interval) bool {
     return false;
 }
 
+// The intervals of this round that evicted a value then spilled (by vreg).
+// Where one of them also did last round, the value it evicted keeps its
+// cpos: rewrite_spills takes the first mode of splitting it that does not
+// leave it in a register there, or else spills it everywhere. The others'
+// cpos is cleared (their splits are as before: another value spilled in
+// the round may make the room). Without this, where one register too few
+// is free in the body of a loop that more values are live through than
+// there are registers, each round the interval there evicts the cheapest
+// of them, whose split leaves a piece in a register through the body as
+// before, dearer than the next value: a round per value and mode, more
+// than allocate allows.
+fn stuck_spills(iv: []mut Interval, prev: []bool) []mut bool {
+    let n = iv.len;
+    let by = u.newn.[bool](n + 1);
+    for k in 0..n {
+        by[k] = false;
+    }
+    for k in 0..n {
+        let x = &mut iv[k];
+        if x.spilled and (x.by >= 0) {
+            let e = @int_cast(usize, x.by);
+            by[e] = true;
+            if (e >= prev.len) or not prev[e] {
+                x.cpos = -1;
+            }
+        } else {
+            x.cpos = -1;
+        }
+    }
+    return by[0..n];
+}
+
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
+    let mut evictors = u.newn.[bool](0);
     block_freqs(f);
     if debug_ra {
         dump(f, "before allocation");
@@ -4782,6 +4864,7 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
         if rounds > 40 {
             u.die("internal compiler error: register allocation did not converge");
         }
+        evictors = stuck_spills(iv, evictors);
         rewrite_spills(f, t, iv, segs);
         free_segs(segs);
         if debug_ra {

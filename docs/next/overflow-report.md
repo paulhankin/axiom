@@ -1,8 +1,8 @@
 ## Compiler
 
-- `--overflow=report`: a program built with it wraps on overflow, as by default, and the
-  first time an operation that `--overflow=trap` checks (`+`, `-`, `*`, unary `-`,
-  `MIN / -1`, `@abs`) overflows at a source location, it writes one line to its standard
+- `--overflow=report`: a program built with it wraps on overflow, as `--overflow=wrap`
+  does, and the first time an operation that the default `trap` mode checks (`+`, `-`,
+  `*`, unary `-`, `MIN / -1`, `@abs`) overflows at a source location, it writes one line to its standard
   error, `file:line:col: integer overflow (T0002), wrapped: <the code>`, or appends it
   to the file that the environment variable `AXIOM_OVERFLOW_LOG` names. One run of a
   program or a test suite finds every site that overflows (spec §7.6). It works on

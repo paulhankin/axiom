@@ -20,6 +20,17 @@ struct Parser {
     // not checked, it reports no further syntax error, and no fix.
     poisoned: bool,      // the declaration being parsed (a function, method or other)
     top_poisoned: bool,  // the top-level declaration being parsed, or one inside it
+    // `const Name = enum { ... }` (E0180): the name, which comes before the
+    // keyword, taken by the declaration's parse_decl_name
+    early_name: []u8,
+    early_name_span: u.Span,
+    // `Vec<Vec<T>>` (E0176): the '>>' that comes next has had its first '>'
+    // taken, by the inner list
+    half_gt: bool,
+    // the '<' and '>' of the lists inside the one being read, which its
+    // error fixes too (one error for `Vec<Vec<T>>`)
+    angle_depth: i32,
+    angle_inner: u.List.[u.Span],
 }
 
 fn peek(P: *Parser) *lx.Token {
@@ -247,6 +258,25 @@ fn incdec_ahead(P: *Parser) bool {
            (k2 == lx.TK_RBRACE);
 }
 
+// `a[i++]`, `f(i++)`: `++` or `--` after an operand inside an expression
+// (E0164). The increment is a statement in Axiom, and whether it goes before
+// or after the use is the writer's choice: a note, and the declaration is
+// poisoned. e, with the operator skipped.
+fn incdec_in_expr(P: *mut Parser, e: *mut ast.Expr) *mut ast.Expr {
+    if not incdec_ahead(P) {
+        return e;
+    }
+    let o1 = advance(P);
+    let op = u.span_join(o1.span, advance(P).span);
+    let plus = o1.kind == lx.TK_PLUS;
+    let d = idiom(P, op, "E0164", u.f1("Axiom has no '%s' operator, and an assignment is not an expression",
+                                       u.pick(plus, "++", "--")));
+    dg.note(
+        d, op, u.f1("write 'x %s 1;' as a statement of its own, before or after the use", u.pick(plus, "+=", "-=")));
+    poison(P);
+    return e;
+}
+
 // `try` and an operand come next.
 fn try_ahead(P: *Parser) bool {
     let t = peek(P);
@@ -285,26 +315,33 @@ fn struct_brace_ahead(P: *Parser, e: *ast.Expr) bool {
 // `Name<Args>` followed by '.', '(' or '{', in an expression: a generic
 // application in angle brackets (a comparison chain such as `a < b > c`
 // is an error of its own, E0150). Not with a ',' before '(': `f(a < b, c >
-// (d))` is two comparisons.
+// (d))` is two comparisons; unless a primitive type is in the list
+// (`f<i32, u8>(x)`), which no comparison has.
 fn angle_apply_ahead(P: *Parser, base: *ast.Expr) bool {
     if base.parens or ((base.kind != ast.E_IDENT) and (base.kind != ast.E_FIELD)) {
         return false;
     }
     let mut depth: i32 = 1;
     let mut comma = false;
+    let mut prim = false;  // (a primitive type in the list: not comparisons)
     let mut i: usize = 1;
     while i < 64 {
         let k = pk_at(P, i);
         if k == lx.TK_LT {
             depth += 1;
-        } else if k == lx.TK_GT {
+        } else if (k == lx.TK_GT) or ((k == lx.TK_SHR) and (depth >= 2)) {
             depth -= 1;
+            if k == lx.TK_SHR {
+                depth -= 1;  // (`Vec<Vec<u32>>`: two)
+            }
             if depth == 0 {
                 let n = pk_at(P, i + 1);
-                return (n == lx.TK_DOT) or ((n == lx.TK_LPAREN) and not comma) or (n == lx.TK_LBRACE);
+                return (n == lx.TK_DOT) or ((n == lx.TK_LPAREN) and (prim or not comma)) or (n == lx.TK_LBRACE);
             }
         } else if k == lx.TK_COMMA {
             comma = true;
+        } else if k == lx.TK_PRIM {
+            prim = true;
         } else if not ((k == lx.TK_IDENT) or (k == lx.TK_PRIM) or (k == lx.TK_DOT) or (k == lx.TK_COMMA) or
                        (k == lx.TK_STAR) or (k == lx.TK_LBRACKET) or (k == lx.TK_RBRACKET) or (k == lx.TK_INT) or
                        (k == lx.KW_MUT) or (k == lx.TK_QUESTION)) {
@@ -317,7 +354,7 @@ fn angle_apply_ahead(P: *Parser, base: *ast.Expr) bool {
 
 // Generic arguments up to the token `close` (not consumed).
 fn parse_generic_args_until(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr], close: lx.TokKind) void {
-    while (pk(P) != close) and (pk(P) != lx.TK_EOF) {
+    while (pk(P) != close) and (pk(P) != lx.TK_EOF) and not ((close == lx.TK_GT) and (pk(P) == lx.TK_SHR)) {
         if pk(P) == lx.TK_INT {
             let t = advance(P);
             out.push(ast.new_te(ast.TypeShape.IntLit(t.ival), t.span));
@@ -333,10 +370,37 @@ fn parse_generic_args_until(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]
 // `<Args>` (at '<'): E0176, fixed to `.[Args]`.
 fn parse_angle_args(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) void {
     let lt = advance(P).span;
+    P.angle_depth += 1;
     parse_generic_args_until(P, out, lx.TK_GT);
-    let gt = peek(P).span;
-    _ = expect(P, lx.TK_GT);
-    angle_error(P, lt, gt, "generic arguments are written 'Name.[T]', not 'Name<T>'", ".[");
+    P.angle_depth -= 1;
+    let mut gt = peek(P).span;
+    if pk(P) == lx.TK_SHR {
+        // `Vec<Vec<T>>`: one '>' of the '>>' closes each list
+        if P.half_gt {
+            P.half_gt = false;
+            gt.start += 1;
+            _ = advance(P);
+        } else {
+            P.half_gt = true;
+            gt.end = gt.start + 1;
+        }
+    } else {
+        _ = expect(P, lx.TK_GT);
+    }
+    if P.angle_depth > 0 {
+        P.angle_inner.push(lt);
+        P.angle_inner.push(gt);
+        return;
+    }
+    let d = idiom(P, u.span_join(lt, gt), "E0176", "generic arguments are written 'Name.[T]', not 'Name<T>'");
+    let fx = dg.fix(d, "write '.[' and ']'", "machine");
+    dg.edit(fx, lt, ".[");
+    for k in 0..(P.angle_inner.len / 2) {
+        dg.edit(fx, P.angle_inner.get(2 * k), ".[");
+        dg.edit(fx, P.angle_inner.get((2 * k) + 1), "]");
+    }
+    dg.edit(fx, gt, "]");
+    P.angle_inner.len = 0;
 }
 
 // '<' at lt and '>' at gt, which Axiom writes `open` and ']'.
@@ -1024,7 +1088,7 @@ fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
                 let c = ast.new_expr(ast.E_CALL, start);
                 c.a = e;
                 while (pk(P) != lx.TK_RPAREN) and (pk(P) != lx.TK_EOF) {
-                    ast.args_mut(c).push(parse_expr(P));
+                    ast.args_mut(c).push(incdec_in_expr(P, parse_expr(P)));
                     if not accept(P, lx.TK_COMMA) {
                         break;
                     }
@@ -1056,7 +1120,7 @@ fn parse_postfix_from(P: *mut Parser, e0: *mut ast.Expr) *mut ast.Expr {
                         hi = parse_range_end(P, prev_span(P));
                     }
                 } else {
-                    lo = parse_expr(P);
+                    lo = incdec_in_expr(P, parse_expr(P));
                     if accept(P, lx.TK_DOTDOT) {
                         is_slice = true;
                         if pk(P) != lx.TK_RBRACKET {
@@ -2303,6 +2367,12 @@ fn is_trap_code(c: []u8) bool {
 
 // Sets d's name from the identifier that comes next.
 fn parse_decl_name(P: *mut Parser, d: *mut ast.Decl) void {
+    if P.early_name.len > 0 {
+        d.name = P.early_name;
+        d.name_span = P.early_name_span;
+        P.early_name = "";
+        return;
+    }
     let id = expect_ident(P);
     d.name = id.name;
     d.name_span = id.span;
@@ -2673,6 +2743,30 @@ fn parse_top_in(P: *mut Parser) void {
         mdecls.push(parse_union(P, start, is_pub, false));
     } else if k == lx.KW_ENUM {
         mdecls.push(parse_enum(P, start, is_pub));
+    } else if (k == lx.KW_CONST) and (pk_at(P, 1) == lx.TK_IDENT) and (pk_at(P, 2) == lx.TK_EQ) and
+              ((pk_at(P, 3) == lx.KW_ENUM) or (pk_at(P, 3) == lx.KW_STRUCT) or (pk_at(P, 3) == lx.KW_UNION)) {
+        // `const Color = enum { ... };`: E0180
+        _ = advance(P);
+        let name = advance(P);
+        _ = advance(P);
+        let kw = peek(P);
+        let kws = lx.tok_kind_name(kw.kind);
+        let d = idiom(P, u.span_join(start, kw.span), "E0180",
+                      u.f3("a type is declared as '%s %s { ... }', not 'const %s = ...'", kws, name.name, name.name));
+        let fx = dg.fix(d, u.f2("write '%s %s'", kws, name.name), "machine");
+        dg.edit(fx, u.span_join(start, kw.span), u.f2("%s %s", kws, name.name));
+        P.early_name = name.name;
+        P.early_name_span = name.span;
+        if kw.kind == lx.KW_ENUM {
+            mdecls.push(parse_enum(P, start, is_pub));
+        } else if kw.kind == lx.KW_STRUCT {
+            mdecls.push(parse_struct(P, start, is_pub, false));
+        } else {
+            mdecls.push(parse_union(P, start, is_pub, false));
+        }
+        if pk(P) == lx.TK_SEMI {
+            dg.edit(fx, advance(P).span, "");  // (the ';' after the '}')
+        }
     } else if k == lx.KW_CONST {
         mdecls.push(parse_const(P, start, is_pub));
     } else if accept(P, lx.KW_THREADLOCAL) {
@@ -2694,7 +2788,9 @@ fn parse_top_in(P: *mut Parser) void {
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
     let mut toks = lx.lex_file(f);
     let mut P = Parser.{ f: f, t: toks.items_mut(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
-                         ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false };
+                         ntests: 0, depth: 0, high: 0, poisoned: false, top_poisoned: false, early_name: "",
+                         early_name_span: u.Span.{ file: 0, start: 0, end: 0 }, half_gt: false, angle_depth: 0,
+                         angle_inner: u.List.[u.Span].empty() };
     P.mod.file = f;
     while pk(&P) != lx.TK_EOF {
         let before = P.pos;

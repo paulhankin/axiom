@@ -975,8 +975,8 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 
 | Family | Operators | Operand types | Notes |
 |---|---|---|---|
-| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` wraps (§7.6) |
-| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` wrap (§7.6). The `%`-suffixed forms always wrap, int only |
+| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` traps on overflow, `*%` wraps (§7.6) |
+| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` trap on overflow (§7.6). The `%`-suffixed forms always wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
@@ -1047,7 +1047,7 @@ than unary operators: `-a.b` is `-(a.b)`, and `&a[i]` is `&(a[i])`.
 
 | Operator | Operand | Meaning |
 |---|---|---|
-| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it is `MIN` by default (§7.6) |
+| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it traps by default, and `-%x` wraps to `MIN` (§7.6) |
 | `-%x` | signed or unsigned int, SIMD int | Wrapping negation, in every overflow mode |
 | `~x` | int, SIMD int, `v128` | Bitwise NOT |
 | `not x` | bool | Logical NOT |
@@ -1065,30 +1065,28 @@ valid for the rest of the function. `&mut` of a temporary is a compile error (`E
 
 ### 7.6 Integer arithmetic semantics
 
-**Overflow wraps.** `+`, `-`, `*` and unary `-` on integers, the compound assignments
-built from them (`+=`, `-=`, `*=`), and `MIN / -1` compute their result **modulo 2ⁿ**,
-where `n` is the bit width: the result is the one value of the type congruent to the
-mathematical result. For example, with `x: u8 = 250`, `x + 10` is `4`; with
-`m: i32 = @min_value(i32)`, `-m`, `m * -1`, `m / -1` and `@abs(m)` are all `m`, and
-`m - 1` is `@max_value(i32)`. This is the meaning in every build, at every optimization
-level, on every target (as in Go and Java, and Rust's release builds).
+**Overflow traps.** `+`, `-`, `*` and unary `-` on integers, the compound assignments
+built from them (`+=`, `-=`, `*=`), `MIN / -1` and `@abs(MIN)` trap (`T0002`) when the
+mathematical result is not representable in the type. For example, with `x: u8 = 250`,
+`x + 10` traps; with `m: i32 = @min_value(i32)`, `-m`, `m * -1`, `m / -1`, `@abs(m)` and
+`m - 1` trap. This is the meaning in every build, at every optimization level, on every
+target.
 
-`+%`, `-%`, `*%` and unary `-%` are explicit spellings of the same wrapping arithmetic.
-They are still valid, and they keep wrapping in every overflow mode, so code that relies on
-wrapping (hashes, checksums, random number generators) can say so and stays correct
-under `--overflow=trap`. Use `@add_checked`, `@sub_checked` and `@mul_checked` (which
+**Wrapping is spelled.** `+%`, `-%`, `*%` and unary `-%` compute their result **modulo
+2ⁿ**, where `n` is the bit width: the result is the one value of the type congruent to
+the mathematical result (`x +% 10` is `4`; `-%m`, `m *% -1` and `m -% 1` are `m`, `m` and
+`@max_value(i32)`). They wrap in every overflow mode, so code that relies on wrapping
+(hashes, checksums, random number generators) says so. Use `@add_checked`, `@sub_checked` and `@mul_checked` (which
 return `error.Overflow`) where an overflow must be detected, for example in sizes computed
 from untrusted input, and `@add_sat`, `@sub_sat` and `@mul_sat` to clamp (Appendix A).
 
 **Overflow modes.** A build may ask for another overflow mode with a compiler flag
-(§16.1). They are debugging aids, not the language's meaning:
+(§16.1). They are aids for migrating and measuring, not the language's meaning:
 
-- `wrap` (the default): as above.
-- `trap` (`--overflow=trap`): if the mathematical result of `+`, `-`, `*`, unary `-`,
-  `MIN / -1` or `@abs(MIN)` is not representable, the program traps (`T0002`). A program
-  that wraps nowhere behaves the same in both modes, so the mode finds unintended
-  overflows (in tests, say) at the cost of a check on every operation.
-- `saturate` (`--overflow=saturate`): the result is clamped to the type's MIN or MAX.
+- `trap` (the default): as above.
+- `wrap` (`--overflow=wrap`): `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)`
+  wrap, as their `%` spellings do (`@abs(MIN)` and `MIN / -1` are `MIN`). A program
+  that overflows nowhere behaves the same in both modes.
 - `report` (`--overflow=report`): as `wrap`, but the first time an operation that `trap`
   checks overflows at a source location, the program writes one line naming the location
   and the code (`file:line:col: integer overflow (T0002), wrapped: a + b`) to its
@@ -1103,14 +1101,15 @@ The overflow mode is the **only** way build configuration can change a program's
 and only for a program whose arithmetic overflows. Optimization level (`-O0`…`-O3`) MUST
 NOT change observable behavior.
 
-Why wrap by default rather than trap: a check on every operation was the largest
-remaining cost of compute-heavy code against the same code built without checks, and it
-kept the optimizer from vectorizing reductions (WebAssembly has no overflow flag, so each
-check is an extra compare and branch, and a checked multiply needs a wider one). Trapping
-in debug builds and saturating in release builds was rejected because tested and shipped
-programs would differ, and a saturated length silently gives wrong answers. Overflow
-bugs are still caught by bounds checks where they would matter for memory, by
-`--overflow=trap` in tests, and by `@*_checked` where a program must handle them.
+Why trap by default: an unintended overflow is a wrong answer that goes on silently,
+and a trap names the place. The check costs little where the processor has an overflow
+flag, and an optimizer leaves out the checks that the ranges of the operands show cannot
+fail (a counter below its limit, a difference of ordered values); measured over the
+compiler and its benchmarks the cost is within a few percent. It keeps the optimizer from vectorizing a
+reduction written with `+`, so such a loop that may wrap is written with `+%`. Trapping
+in debug builds and wrapping or saturating in release builds was rejected because tested
+and shipped programs would differ. A C program (§14.5) keeps C's arithmetic: the overflow
+mode does not apply to it.
 
 **Division.** `/` truncates toward zero. `%` gives a result with the sign of the dividend,
 so `a == (a / b) * b + (a % b)` (with wrapping arithmetic, this holds for `MIN / -1` too).
@@ -1943,7 +1942,7 @@ checks that the object still exists. So a program must keep two rules itself:
 
 The address sanitizer (`--sanitize=address`, §16.8), on by default in `axiom test`,
 catches most breaks of the second rule, and of the first within the heap. The warning
-`W0711` (§16.3, off by default) reports the plainest breaks of the second within one
+`W0711` (§16.3) reports the plainest breaks of the second within one
 function: a slice used after `mem.free`, or after a `*mut Self` method of the container
 it came from. Code in C (§14.5.5) can break either. What
 happens when a rule is broken depends on the target:
@@ -2277,9 +2276,8 @@ every module's cache key.
 | unary `-` | yes | signed lanes, wrapping; `-%` on any lanes | no |
 | `==` `<` … | no. Use `@lanes_eq`, `@lanes_lt`, … | no | no |
 
-Integer vector arithmetic wraps, like scalar arithmetic by default (§7.6). It wraps under
-`--overflow=trap` and `--overflow=saturate` too: checking every lane would be expensive,
-and WebAssembly and most processors have no lane-wise overflow flags. `+%`, `-%` and
+Integer vector arithmetic wraps, unlike scalar arithmetic (§7.6), in every overflow
+mode: checking every lane would be expensive, and WebAssembly and most processors have no lane-wise overflow flags. `+%`, `-%` and
 `*%` on integer vectors mean the same as `+`, `-` and `*`.
 
 Scalars are **never** broadcast implicitly. Write `@splat(x)`.
@@ -2841,7 +2839,7 @@ in the library has one of the two signatures.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate|report] -o <out>
+axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=trap|wrap|report] -o <out>
 axiom check <file.ax | package dir>              # parse and type-check only; no codegen
 axiom test  <file.ax | package dir> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
@@ -2858,9 +2856,9 @@ Every command accepts `--format=human` (the default) or `--format=agent-json` (�
 and `--std=<dir>`. `--target` names a target of §14; `--cpu` and `--features` select
 processor extensions (§13.4); `--sanitize=address` is §16.8 (`axiom test`'s default),
 `--coverage` §16.9. `--overflow` selects the
-overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
-every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
-overflow, to find unintended overflows; `saturate` clamps; `report` wraps and reports
+overflow mode (§7.6): `trap`, the default, is the language's meaning: every `+`, `-`,
+`*`, unary `-`, `MIN / -1` and `@abs` on integers traps (`T0002`) on overflow; `wrap`
+wraps them; `report` wraps and reports
 each site that overflowed once. The remaining options
 (output kinds, linking with C, Windows subsystems and icons, the module cache's
 settings, environment variables, exit codes) are the compiler's own and are listed in
@@ -2953,7 +2951,7 @@ as a `}` is missing there.
 
 **Idioms of other languages.** A form that another language spells differently (`!x`, `&&`,
 `i++`, `fn f() -> T`, `x as T`, `Vec<T>`, ...) is reported by its own code (`E0160` to
-`E0179`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
+`E0180`), whose message names the Axiom form. Where the rewrite is certain, it comes with a
 `machine` fix, and the declaration is checked as if the Axiom form had been written, so
 that the mistake costs one error. The forms whose rewrite needs a choice (the conditional
 operator, a C-style `for`, `if` or `match` as an expression) have a note instead, and
@@ -3020,6 +3018,7 @@ it does (and that each is asserted by a test):
 | E0177 | Generic arguments without the `.` of `Name.[T]`: `Name[T]` |
 | E0178 | A string in single quotes |
 | E0179 | `+` on two slices or arrays (`str.concat` joins strings) |
+| E0180 | `const Name = enum { ... }` (or `struct`, `union`) for `enum Name { ... }` |
 | E0201 | Name already declared in this module |
 | E0202 | Unknown module, type or name |
 | E0203 | Item, method, or field is not public |
@@ -3161,7 +3160,7 @@ it does (and that each is asserted by a test):
 | W0601 | Unreachable statement |
 | W0631 | Unreachable `match` arm after `else` |
 | W0655 | An inline error set contains errors the function can never return (§11.3) |
-| W0711 | A local slice or pointer used after the memory it points into was freed or may have moved (§12.1): after it was passed to `mem.free` or `mem.destroy`, or, when it came from a container through a `*Self` method (or from a function given `&container`) that returns a slice or pointer, after a `*mut Self` method that returns none was called on the same container (or it was given as `&mut`). A heuristic, within one function: it has false positives (a `*mut Self` method that does not move the memory) and misses uses through other variables. Off by default: `--warn=W0711` turns it on, for the modules whose tests would run (§17.2) |
+| W0711 | A local slice or pointer used after the memory it points into was freed or may have moved (§12.1): after it was passed to `mem.free` or `mem.destroy`, or, when it came from a container through a `*Self` method (or from a function given `&container`) that returns a slice or pointer, after a `*mut Self` method that returns none was called on the same container (or it was given as `&mut`). A heuristic, within one function: it has false positives (a `*mut Self` method that does not move the memory) and misses uses through other variables. On by default, for the modules whose tests would run (§17.2); `--no-warn=W0711` turns it off |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -3466,9 +3465,9 @@ freed, freeing it twice or with the wrong size, reaching outside an allocation t
 pointer made from an address, and never freeing it. `--sanitize=address` (accepted by
 `build`, `test` and `profile`) checks for them. `axiom test` builds with it unless given
 `--sanitize=none`: a program that keeps the rules of §12.1 behaves the same either way,
-so tests still test what ships. It applies on every target the tests run on but
-`wasm64`, and to Axiom code only (§14.5.5); for `wasm64`, a C program, or an Axiom
-program with C units, `axiom test` builds without it, and `--sanitize=address` given
+so tests still test what ships. It applies on every target the tests run on, and to
+Axiom code only (§14.5.5); for a C program, or an Axiom program with C units,
+`axiom test` builds without it, and `--sanitize=address` given
 explicitly is refused for C sources as for `build`.
 
 - The global allocator (`std/mem`) puts a header before each allocation and a redzone
@@ -3802,8 +3801,9 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@sub_borrow(a, b, bin)` | `T, T, u8 → struct { value: T, borrow: u8 }` for unsigned `T` (`bin & 1` in, `0`/`1` out) |
 | `@div_wide(hi, lo, d)` | `T, T, T → struct { quo: T, rem: T }` for unsigned `T`; traps `T0003` if `d == 0` or `hi >= d` |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
-| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it is `MIN` by default, traps under `--overflow=trap`. Lane-wise on vectors, where it always wraps |
-| `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |
+| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it traps by default, and is `MIN` under `--overflow=wrap`. Lane-wise on vectors, where it always wraps |
+| `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@copysign(a, b)` | Floats |
+| `@rem(a, b)` | Floats: `a - n * b`, where `n` is `a / b` truncated toward zero, computed exactly (C's `fmod`): the result is exact, and a zero has the sign of `a`. NaN if `a` is infinite or NaN or `b` is zero or NaN; `a` if `b` is infinite |
 
 ### A.5 SIMD
 
@@ -3824,7 +3824,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
 | `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
 | `@reduce_add(v)` | Halves folded (§13.2). Integer lanes wrap |
-| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes; lane `i` is `a[2i] * b[2i] + a[2i+1] * b[2i+1]` in `i32`, which wraps only when both products are `-32768 * -32768`. One instruction per register on x86 (`pmaddwd`) and WebAssembly |
+| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes; lane `i` is `a[2i] * b[2i] + a[2i+1] * b[2i+1]` in `i32`, which wraps only when both products are `-32768 * -32768`. One instruction per register on x86 (`pmaddwd`) and WebAssembly. `i8` lanes, or `u8` lanes by `i8` lanes as many (a multiple of 4): a quarter as many `i32` lanes; lane `i` is the sum of `a[4i+k] * b[4i+k]` for `k` from 0 to 3, which never wraps |
 | `@widen_low(v)`, `@widen_high(v)` | Integer `Vec` of 8-, 16- or 32-bit lanes → half its lanes, twice as wide, extended by the lane type (§13.2) |
 | `@narrow(T, a, b)` | `Vec, Vec → T`: the lanes of `a` then `b`, saturated to `T`'s narrower lanes (§13.2) |
 
@@ -3878,7 +3878,7 @@ This is the complete list of runtime traps. Each has a stable code.
 |---|---|
 | `T0000` | `@trap()` or WASM `unreachable` |
 | `T0001` | Index or slice bounds violation |
-| `T0002` | Integer overflow, only in the opt-in `trap` overflow mode (`--overflow=trap`, §7.6); by default overflow wraps |
+| `T0002` | Integer overflow of `+`, `-`, `*`, unary `-`, `MIN / -1` or `@abs` (§7.6), in the default `trap` overflow mode |
 | `T0003` | Integer division or remainder by zero |
 | `T0004` | `@int_cast` value out of range |
 | `T0005` | Linear-memory access out of bounds |

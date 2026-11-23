@@ -47,7 +47,7 @@ export fn main() i32 {
     count += 1;
     let ratio: f64 = 2.5 * 4.0;
     let big: u8 = 250;
-    let wrapped = big +% 10;  // 4: wrapping is the default meaning of +, and +% says so
+    let wrapped = big +% 10;  // 4: +% wraps, where big + 10 would trap
     let name = "Ada";         // a []u8: a slice of bytes
     fmt.print("{} {} {} {} {} {}\n", [fmt.int(answer), fmt.int(count), fmt.float(ratio), fmt.int(wrapped),
                                       fmt.str(name), fmt.int(LIMIT)]) catch return 1;
@@ -64,9 +64,8 @@ own, so a declaration with only a literal names its type; `count += 1` then know
 to do. Integer types are `u8` … `u64`, `i8` … `i64`, `usize` and `isize`; floats are
 `f32` and `f64`.
 
-Integer arithmetic wraps by default, and never silently changes type: `big +% 10` says
-the wrap is intended. `axiom build --overflow=trap` makes every `+`, `-` and `*` trap on
-overflow instead, to find the unintended ones (spec §7.6). `const` declares a
+Integer arithmetic traps on overflow, and never silently changes type: `big + 10` would
+trap, and `big +% 10` says the wrap is intended (spec §7.6). `const` declares a
 compile-time constant, usable as an array length.
 
 `std/fmt` formats values through templates: `{}` takes the next argument, and the

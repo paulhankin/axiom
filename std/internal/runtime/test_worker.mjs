@@ -23,11 +23,13 @@ const cstr = (p) => {
   return Buffer.from(u.subarray(p, e)).toString('utf8');
 };
 const ex = instance.exports;
+// (an address: a Number on wasm32, a BigInt on wasm64)
+const addr = (p) => (typeof p === 'bigint' ? Number(p) : p >>> 0);
 
 if (list) {
   const n = ex.axiom_test_count();
   const names = [];
-  for (let i = 0; i < n; i++) names.push(cstr(ex.axiom_test_name(i) >>> 0));
+  for (let i = 0; i < n; i++) names.push(cstr(addr(ex.axiom_test_name(i))));
   parentPort.postMessage(names);
 } else {
   const expect = ex.axiom_test_expect(index);
@@ -37,7 +39,7 @@ if (list) {
   try {
     const code = ex.axiom_test_run(index) >>> 0;
     if (code !== 0) {
-      r = { status: 'fail', code: 'error', message: `test returned error.${cstr(ex.axiom_error_name(code) >>> 0)}` };
+      r = { status: 'fail', code: 'error', message: `test returned error.${cstr(addr(ex.axiom_error_name(code)))}` };
       const st = readStack(instance, mem());
       if (st) r.stack = st.errors.map((e) => `E\x1f${e.fileId}\x1f${e.start}\x1f${e.end}\x1f${e.fn}\x1e`).join('');
     } else if (expect !== -1) {
