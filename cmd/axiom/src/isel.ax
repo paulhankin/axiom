@@ -675,8 +675,37 @@ pub fn fsym_at(obj: *mut elf.Obj, fsym: *mut u.List.[u32], f: *ir.Func) u32 {
     }
     // (perm: the code that first refers to it is compiled in a scratch scope)
     let n = elf.ext_sym(obj, u.perm_dup(sym_name(f.name, f.linkage, "f", k)), f.linkage == ir.LINK_EXTWEAK);
+    ref_visibility(obj, n, f.visibility);
     fsym.set(k, n);
     return n;
+}
+
+// An undefined symbol of an ELF object carries its declarations'
+// visibility (n: its index), which the linker combines with its
+// definition's (the most constraining: nlink.ax).
+fn ref_visibility(obj: *mut elf.Obj, n: u32, vis: u8) void {
+    if not elf_vis() or (vis == ir.VIS_DEFAULT) {
+        return;
+    }
+    let s = obj.syms.at_mut(@as(usize, n));
+    if s.sec == -1 {
+        s.hidden = s.hidden or hidden_vis(vis);
+        s.protected = not s.hidden and (s.protected or (vis == ir.VIS_PROTECTED));
+    }
+}
+
+// Is the object ELF (Linux), whose visibilities say how a module's
+// references bind (not Mach-O's or COFF's, nor WebAssembly's)?
+fn elf_vis() bool {
+    return (tg.g_os == tg.OS_LINUX) and not tg.is_wasm();
+}
+
+/// Is a function or global of this visibility, declared and not defined
+/// here, the module's own (ELF: hidden or internal, which another module
+/// cannot define), so that its address is reached directly, as a hidden
+/// definition's, not through the GOT?
+pub fn local_decl(vis: u8) bool {
+    return elf_vis() and hidden_vis(vis);
 }
 
 pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
@@ -686,6 +715,7 @@ pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
         return s;
     }
     let n = elf.ext_sym(obj, u.perm_dup(sym_name(g.name, g.linkage, "g", k)), g.linkage == ir.LINK_EXTWEAK);
+    ref_visibility(obj, n, g.visibility);
     if g.tls and not tg.platform_tls() {
         obj.syms.at_mut(@as(usize, n)).ty = elf.T_TLS;  // (the platform's: the descriptor, platform_tlv)
     }
@@ -696,7 +726,12 @@ pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
 /// Is a global's address taken from the GOT: a declaration (possibly in a
 /// shared library), or a preemptible definition (preemptible)?
 pub fn extern_global(g: *mut ir.Global) bool {
-    return u.isnil(ir.init_of(g)) or (not g.tls and preemptible(g.linkage, g.visibility));
+    if u.isnil(ir.init_of(g)) {
+        // (a hidden one is the module's: local_decl; not a weak reference,
+        // which may stay undefined, nor a thread-local, reached by its model)
+        return g.tls or (g.linkage == ir.LINK_EXTWEAK) or not local_decl(g.visibility);
+    }
+    return not g.tls and preemptible(g.linkage, g.visibility);
 }
 
 /// Is a definition of this linkage and visibility (ir.VIS_) preemptible:
