@@ -684,9 +684,10 @@ default.
 
 ### Status
 
-B1, B3's measurements, B4 and B5 are done: the default is trap. B6 holds (the seed
-builds the tree in either meaning, and the tree overflows nowhere: B4). B2 is not
-started (`--overflow=saturate` is still there).
+B1 to B5 are done: the default is trap. B6 holds (the seed builds the tree in either
+meaning, and the tree overflows nowhere: B4). B2: `--overflow=wrap` stays, for
+measuring, and `--overflow=saturate` is gone (an `E9001` names `@add_sat` and its
+siblings).
 
 - **B1** (spec §7.6, `docs/next/overflow-trap-default.md`): `+ - *`, unary `-`, `@abs`
   and `MIN / -1` trap with `T0002` in every build; the `%` operators wrap;

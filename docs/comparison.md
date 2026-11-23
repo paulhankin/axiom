@@ -291,10 +291,9 @@ small, but real code relies on the preprocessor.
 ## Numbers and SIMD
 
 - **Integers.** Integer arithmetic traps on overflow (`T0002`) in every build. A build
-  can opt into wrapping (`--overflow=wrap`) or saturation (`--overflow=saturate`); the
-  overflow mode is the only build setting that can change what a program means, and
-  optimization levels must not. The wrapping operators (`+%`, `-%`, `*%`) wrap in every
-  mode, and
+  can opt into wrapping (`--overflow=wrap`, for measuring); the overflow mode is the
+  only build setting that can change what a program means, and optimization levels
+  must not. The wrapping operators (`+%`, `-%`, `*%`) wrap in every mode, and
   `@add_checked`/`@add_sat` (and `sub`, `mul`) ask for a checked or saturated result.
   Shifts are defined for every count, and division by zero always traps. Zig and Rust
   offer similar operators (`+%`, `+|`; `wrapping_add`, `saturating_add`, `checked_add`),

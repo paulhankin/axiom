@@ -17,3 +17,6 @@
 
   A C program (`axiom cc`, or a build whose first input is C) keeps C's arithmetic, and
   its Axiom runtime wraps as before; `--overflow` is still an error for it.
+
+  `--overflow=saturate` is removed (it is an error that names the builtins): saturate an
+  operation where it is meant, with `@add_sat`, `@sub_sat` or `@mul_sat`.

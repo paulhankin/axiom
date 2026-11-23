@@ -1087,7 +1087,6 @@ from untrusted input, and `@add_sat`, `@sub_sat` and `@mul_sat` to clamp (Append
 - `wrap` (`--overflow=wrap`): `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)`
   wrap, as their `%` spellings do (`@abs(MIN)` and `MIN / -1` are `MIN`). A program
   that overflows nowhere behaves the same in both modes.
-- `saturate` (`--overflow=saturate`): the result is clamped to the type's MIN or MAX.
 - `report` (`--overflow=report`): as `wrap`, but the first time an operation that `trap`
   checks overflows at a source location, the program writes one line naming the location
   and the code (`file:line:col: integer overflow (T0002), wrapped: a + b`) to its
@@ -2840,7 +2839,7 @@ in the library has one of the two signatures.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=trap|wrap|saturate|report] -o <out>
+axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=trap|wrap|report] -o <out>
 axiom check <file.ax | package dir>              # parse and type-check only; no codegen
 axiom test  <file.ax | package dir> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
@@ -2859,7 +2858,7 @@ processor extensions (§13.4); `--sanitize=address` is §16.8 (`axiom test`'s de
 `--coverage` §16.9. `--overflow` selects the
 overflow mode (§7.6): `trap`, the default, is the language's meaning: every `+`, `-`,
 `*`, unary `-`, `MIN / -1` and `@abs` on integers traps (`T0002`) on overflow; `wrap`
-wraps them; `saturate` clamps; `report` wraps and reports
+wraps them; `report` wraps and reports
 each site that overflowed once. The remaining options
 (output kinds, linking with C, Windows subsystems and icons, the module cache's
 settings, environment variables, exit codes) are the compiler's own and are listed in

@@ -2365,6 +2365,11 @@ await section('spec §15.3', {
     '--stack-traces=off': builds('--stack-traces=off', 'st'),
     '--overflow=wrap': builds('--overflow=wrap', 'ow'),
     '--units=program': builds('--units=program', 'up'),
+    '--overflow=saturate is refused, naming the @*_sat builtins': () => {
+      prepare();
+      const c = spawnSync(compiler, ['build', src, '--overflow=saturate', '-o', path.join(dir, 'os'), ...targetFlags], { encoding: 'utf8' });
+      return c.status !== 0 && /E9001/.test(c.stderr) && /@add_sat/.test(c.stderr) ? null : `status ${c.status}: ${c.stderr}`;
+    },
     '--overflow=report: each site once, on stderr or in AXIOM_OVERFLOW_LOG, and the wrapped values': () => {
       prepare();
       const f = path.join(dir, 'ovr.ax');
