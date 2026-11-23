@@ -918,7 +918,7 @@ All other conversions use builtins (Appendix A):
 |---|---|---|
 | `@as(T, x)` | Lossless numeric widening (for example `u8 → u32`, `i16 → i64`, `u32 → i64`, `f32 → f64`), and `bool` to any integer type (`false` is 0, `true` is 1) | A conversion that can lose information is a compile error (`E0510`) |
 | `@int_cast(T, x)` | Integer-to-integer conversion, checked at runtime | Traps if the value is out of range (`T0004`) |
-| `@truncate(T, x)` | Integer-to-integer conversion keeping the low bits | Never fails |
+| `@truncate(T, x)` | Integer-to-integer conversion keeping the low bits. To a type at least as wide, the value is first extended by `x`'s type (sign-extended if it is signed, zero-extended if not), then read as `T`: `@truncate(u32, @as(i8, -2))` is `0xFFFFFFFE` | Never fails |
 | `@int_from_float(T, x)` | Truncates toward zero and **saturates** | Never fails. NaN becomes 0 (matches WASM `trunc_sat`) |
 | `@float_from_int(T, x)` | Rounds to nearest, ties to even | Never fails |
 | `@float_cast(T, x)` | `f64 → f32` with round-to-nearest-even | Never fails |
