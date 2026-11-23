@@ -99,8 +99,8 @@ The compiler is built from a *seed*, a compiler that already exists
 version and by the SHA-256 of each platform's archive, and `bootstrap.sh` downloads it
 once (it needs `curl` and `tar`; `AXIOM_SEED=<compiler>` names one on the machine
 instead). A release is built from the seed its commit pins, and adds a row to the table
-in `docs/bootstrap-chain.md` (its version, its commit and its seed), so that it can be
-rebuilt from the release before it.
+in `docs/bootstrap-chain.md` (its version, its commit and its seed), and its archives'
+hashes to the table below it, so that it can be rebuilt from the release before it.
 
 A seed is either a release (its hashes are those of its `SHA256SUMS`) or, between
 releases, the compiler of a commit of `main`, made by `cmd/axiom/seed.sh

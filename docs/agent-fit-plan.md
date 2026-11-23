@@ -33,7 +33,7 @@ left.
 
 | # | Done | Left |
 |---|---|---|
-| **F** | One compiler, built from the pinned seed; tests whose expected output comes from the spec (`gen_exact_ops.py`, `gen_exact_exprs.py`) | The `bootstrap-final` tag; release hashes in `docs/bootstrap-chain.md` |
+| **F** | One compiler, built from the pinned seed; tests whose expected output comes from the spec (`gen_exact_ops.py`, `gen_exact_exprs.py`) | The `bootstrap-final` tag |
 | **A** | One error per mistake, `E0160` to `E0180` with machine fixes | The idioms a valid program shares tokens with (issue #75) |
 | **E** | `axiom doc`, `W0320` | |
 | **C** | The accurate claim; the sanitizer on in `axiom test` on every target; `W0711` on | `W0711` sees only uses in one function |
@@ -205,9 +205,8 @@ Done. The Problem above describes the tree as it was.
 
 Not done:
 
-- The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead).
-- `docs/bootstrap-chain.md` records each release's commit and seed, not yet its hashes
-  (they are in each release's `SHA256SUMS`).
+- The tag `bootstrap-final` on `8d7656f7` (the document names the commit instead): it
+  needs a push with tag access.
 - The exact tests do not cover threads and atomics, the C front end's calls (its ABI
   has generators of its own), or `usize`/`isize` in the call and control-flow
   programs.

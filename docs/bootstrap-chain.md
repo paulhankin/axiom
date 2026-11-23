@@ -73,3 +73,24 @@ whose seed is the bootstrap compiler, build it there, and go down the table from
 
 The archives are deterministic (`docs/releasing.md`): rebuilding a release from its seed
 gives the bytes its `SHA256SUMS` records.
+
+### The archives' hashes
+
+The SHA-256 of each release's archives, as its `SHA256SUMS` records them:
+
+| Release | Archive | SHA-256 |
+|---|---|---|
+| 0.1.0 | `axiom-0.1.0-linux-aarch64.tar.gz` | `a34a2f879b4b3cdb320d31d9a2339720f24ade6f39e64b2e317a323e71e9b5cb` |
+| 0.1.0 | `axiom-0.1.0-linux-x86_64.tar.gz` | `fd79593fa4c235bf7c418a3713614181b7a3b0a93f7807c876221f4cbc5bffbf` |
+| 0.1.0 | `axiom-0.1.0-macos-aarch64.tar.gz` | `a03feb17247f12e80dc6bb79969efd4cf0a8a5ffb23d2cb02ac8de526b397baf` |
+| 0.1.0 | `axiom-0.1.0-windows-x86_64.zip` | `0fdc042de0d49474b8bbbb32b7ffe153f9c072da0a83b357067e8629dd3cc0a0` |
+| 0.2.0 | `axiom-0.2.0-linux-aarch64.tar.gz` | `ab86cd1c165ae775f2eff6c2f2198b2201a002c84bf804e4b66f64e02534bddc` |
+| 0.2.0 | `axiom-0.2.0-linux-x86_64.tar.gz` | `66fb2a67dfa7ac65ef46197fbeae60144a261cbd2ea510b2449fb0cb57eff6a1` |
+| 0.2.0 | `axiom-0.2.0-macos-aarch64.tar.gz` | `09b7e66016e3b680d682c235b603e93001ce289f9cff0e551f9a40d5c1287cc0` |
+| 0.2.0 | `axiom-0.2.0-windows-x86_64.zip` | `0f963b3af5f1ca26c8c78dff8ca0eb710ef0a300056d2ec8667daf35b0e2836e` |
+| 0.3.0-seed.1 | `axiom-0.3.0-seed.1-linux-aarch64.tar.gz` | `d51f7ca8a5e44fef1396412891caa6e7a6920c1620cc55ebc617d236c600aae9` |
+| 0.3.0-seed.1 | `axiom-0.3.0-seed.1-linux-x86_64.tar.gz` | `4a0394e1acdbc260692617d578806122d363d0a784c0788de4e2dd474cf25176` |
+| 0.3.0-seed.1 | `axiom-0.3.0-seed.1-macos-aarch64.tar.gz` | `05953038c18c0f1ac719c9f145ccfec66c768a813ece5ee7c581fb9faf28a54e` |
+
+The seed's are the ones `cmd/axiom/seed.toml` pins. A new release adds its rows here.
+
