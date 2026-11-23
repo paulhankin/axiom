@@ -1919,13 +1919,12 @@ fn assume_sum_le(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
         return;  // (ub follows phis, assuming their edges' conditions)
     }
     sum_le_busy = true;
-    let saved = prove_budget;
-    prove_budget = 64;
+    let saved = proof_begin();
     let m = ub(a.a, 0);
-    prove_budget = 64;
+    proof_refill();
     // (below_max answers for 64-bit values only)
     let ok = ((m >= 0) and fits_type(m + k, a.ty)) or ((a.ty.bits == 64) and below_max(a.a, k, 0));
-    prove_budget = saved;
+    proof_end(saved);
     sum_le_busy = false;
     if ok {
         add_le(a.a, b, c - k);
@@ -1966,10 +1965,9 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     // x + j (j >= 1) that does not wrap: at least j, and at least k when x >= k - j
     if ir.is_op(a, ir.OP_ADD) and small_k(a.b) and (kv(a.b) >= 1) and (kv(a.b) < 0x1_0000_0000) and (a.ty.bits == 64) {
         let j = kv(a.b);
-        let saved = prove_budget;
-        prove_budget = 64;
+        let saved = proof_begin();
         let nowrap = below_max(a.a, j, 0);
-        prove_budget = saved;
+        proof_end(saved);
         if nowrap {
             return (j >= k) or at_least(a.a, k - j, depth + 1);
         }
@@ -1979,11 +1977,10 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     }
     if ir.is_op(a, ir.OP_SHL) and not ir.is_cint(a.b) {
         // x << n with n below the width and no bit of x shifted out: at least x
-        let saved = prove_budget;
-        prove_budget = 64;
+        let saved = proof_begin();
         let m = ub(a.a, 0);
         let n = ub(a.b, 0);
-        prove_budget = saved;
+        proof_end(saved);
         if (m >= 0) and (m < 0x1_0000_0000) and (n >= 0) and (n < 32) and (n < @as(i64, a.ty.bits)) and
            fits_type(m << @truncate(u32, n), a.ty) {
             return at_least(a.a, k, depth + 1);
@@ -2000,14 +1997,13 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
         return false;
     }
     let s = a.a;
-    let saved = prove_budget;
-    prove_budget = 64;
+    let saved = proof_begin();
     let mut m = ub(s, 0);
     if (m < 0) and ir.is_op(s, ir.OP_SUB) and prove_le(s.b, s.a, 0) {
-        prove_budget = 64;
+        proof_refill();
         m = ub(s.a, 0);  // n - x <= n when x <= n
     }
-    prove_budget = saved;
+    proof_end(saved);
     // (m and c are below 2^32: m * c is checked so that it cannot overflow i64)
     if (m < 0) or (m >= 0x1_0000_0000) or (m > (0x7fff_ffff_ffff_ffff / c)) or not fits_type(m * c, a.ty) {
         return false;
@@ -2126,10 +2122,9 @@ fn assume_bounds(tp: ir.CmpPred, a: *mut ir.Value, b: *mut ir.Value) void {
         if ir.is_op(a, ir.OP_SUB) and small_k(a.a) and not ir.is_const(a.b) and (kv(a.a) <= smax_of(a.ty)) and
            (hi > -0x4000_0000_0000_0000) and not sub_le_busy {
             sub_le_busy = true;
-            let saved = prove_budget;
-            prove_budget = 64;
+            let saved = proof_begin();
             let m = ub(a.b, 0);
-            prove_budget = saved;
+            proof_end(saved);
             sub_le_busy = false;
             let lo = kv(a.a) - hi;
             if (m >= 0) and (m <= smax_of(a.ty)) and (lo >= 1) and (lo <= m) {
@@ -2284,6 +2279,34 @@ fn phi_at_least_of(x: *mut ir.Value, c: i64) bool {
 }
 
 threadlocal let mut prove_budget: i32 = 0;
+// The proofs started inside a proof (proof_begin): they share its budget, so
+// that 64 steps bound the work done for one question (issue #73).
+threadlocal let mut prove_nest: i32 = 0;
+
+// Starts a proof: a fresh budget, unless inside another proof, whose budget
+// it shares. The budget to give back to proof_end.
+fn proof_begin() i32 {
+    let saved = prove_budget;
+    if prove_nest == 0 {
+        prove_budget = 64;
+    }
+    prove_nest += 1;
+    return saved;
+}
+
+// A second question of the same proof: a fresh budget only for the outermost.
+fn proof_refill() void {
+    if prove_nest == 1 {
+        prove_budget = 64;
+    }
+}
+
+fn proof_end(saved: i32) void {
+    prove_nest -= 1;
+    if prove_nest == 0 {
+        prove_budget = saved;
+    }
+}
 
 // Is x <= y + bound (y nil: x <= bound)? acc is the weight so far.
 fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
@@ -2567,7 +2590,13 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
 
 // Is x <= y + bound?
 fn prove_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64) bool {
-    prove_budget = 64;
+    let saved = proof_begin();
+    let r = prove_le_in(x, y, bound);
+    proof_end(saved);
+    return r;
+}
+
+fn prove_le_in(x: *mut ir.Value, y: *mut ir.Value, bound: i64) bool {
     if small_k(y) {
         return le_path(x, vnil(), bound + kv(y), 0);
     }
