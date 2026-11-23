@@ -766,7 +766,8 @@ def gen_arith():
         'Binary integer operations of every pair of edge values of every integer',
         'type: the wrapping operators, the bitwise ones, @min @max, the saturating',
         'builtins, @mul_high; / and % (truncating; the remainder has the sign of the',
-        'dividend; MIN % -1 is 0), not by 0 and / not MIN by -1; + - * where they do',
+        'dividend; MIN % -1 is 0), not by 0 and / not MIN by -1; a shift plus or',
+        'minus a comparison; + - * where they do',
         'not overflow (spec §7.6: there they would trap); the compound assignments;',
         'and the operations with a constant operand on either side.',
     ] + GEN)
@@ -782,6 +783,15 @@ def gen_arith():
         no_div_py = (lambda a, b: b == 0 or (signed and a == lo and b == -1))
         blocks = []
         blocks.append(Block([('a', vs), ('b', vs)], [Stmt(n, e.format(a='a', b='b'), f, t) for n, e, f in ops]))
+        # a sum or difference with a comparison (x86-64 takes it from the
+        # carry flag: adc, sbb) whose other operand is a shift (lea's scale),
+        # of values in registers (a load would be the cmp's operand)
+        reg = ['let p = @black_box(a);', 'let q = @black_box(b);']
+        blocks.append(Block([('a', vs), ('b', vs)], [
+            Stmt('shl + cmp', f'(p << 2) +% @as({t}, q < p)', lambda a, b: wrap_t(a * 4 + int(b < a), t), t, pre=reg),
+            Stmt('shl - cmp', f'(p << 3) -% @as({t}, p < q)', lambda a, b: wrap_t(a * 8 - int(a < b), t), t),
+            Stmt('shl + cmp k', f'(q << 1) +% @as({t}, p < 34)', lambda a, b: wrap_t(b * 2 + int(a < 34), t), t),
+        ]))
         blocks.append(Block([('a', vs), ('b', vs)], [
             Stmt('%', 'a % b', trem, t),
             Stmt('%=', 'x', trem, t, pre=['let mut x = a;', 'x %= b;']),
