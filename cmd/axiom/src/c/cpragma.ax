@@ -37,6 +37,7 @@ pub const EV_FENV_DEC_ROUND: i32 = 5;  // #pragma STDC FENV_DEC_ROUND: an FPD_ v
 pub const EV_FNOPTS: i32 = 6;          // #pragma GCC optimize, target, ..._options: fn_options' number (0: none)
 pub const EV_LOOP: i32 = 7;            // #pragma GCC unroll, ivdep, novector: LH_ bits, for the loop at its position
 pub const EV_MS_STRUCT: i32 = 8;       // #pragma ms_struct (a GNU dialect, x86-64): 1 on, 0 off or reset
+pub const EV_DIRECTIVE: i32 = 9;       // --c-pp-defines: a #define or #undef for the text (directive's number)
 
 /// What the loop pragmas say of the loop statement after them (cast.Stmt's
 /// hints): `GCC unroll n` as n + 1 in the low 16 bits (n at most 65534;
@@ -168,6 +169,7 @@ const R_ENTER: i32 = 7;   // the file is entered (included) here
 
 let mut g_changes: u.List.[Change] = u.List.[Change].{ data: @ptr_from_int(*mut Change, 0), len: 0, cap: 0 };
 let mut g_weak: u.List.[Weak] = u.List.[Weak].{ data: @ptr_from_int(*mut Weak, 0), len: 0, cap: 0 };
+let mut g_directives: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 let mut g_rules: u.List.[Rule] = u.List.[Rule].{ data: @ptr_from_int(*mut Rule, 0), len: 0, cap: 0 };
 let mut g_installed: bool = false;
 
@@ -175,6 +177,7 @@ let mut g_installed: bool = false;
 pub fn begin_unit() void {
     g_changes.clear();
     g_weak.clear();
+    g_directives.clear();
     g_fnopts.clear();
     if not g_installed {
         g_installed = true;
@@ -191,6 +194,13 @@ pub fn begin_unit() void {
 pub fn event(kind: i32, value: u64) i32 {
     g_changes.push(Change.{ kind: kind, value: value, pos: 0, placed: false });
     return @int_cast(i32, g_changes.len - 1);
+}
+
+/// --c-pp-defines: a #define or #undef directive (its text, `#define X 1`)
+/// for the preprocessed text; the event's number, as `event`'s.
+pub fn directive(text: []u8) i32 {
+    g_directives.push(text);
+    return event(EV_DIRECTIVE, @as(u64, g_directives.len - 1));
 }
 
 /// The change numbered id holds from the token at index pos on.
@@ -273,13 +283,18 @@ pub fn shift(from: usize, n: usize) void {
 pub struct Line {
     pub pos: usize,
     pub text: []u8,
+    pub raw: bool,  // the line is text as it is (a directive: --c-pp-defines), not a pragma's
 }
 
 // Adds a line at pos, after those at or before it (in order of position:
 // few of them).
 fn add_line(l: *mut u.List.[Line], pos: usize, t: []u8) void {
+    add_line_of(l, pos, t, false);
+}
+
+fn add_line_of(l: *mut u.List.[Line], pos: usize, t: []u8, raw: bool) void {
     let mut k = l.len;
-    l.push(Line.{ pos: pos, text: t });
+    l.push(Line.{ pos: pos, text: t, raw: raw });
     while (k > 0) and (l.get(k - 1).pos > pos) {
         let x = l.get(k - 1);
         l.set(k - 1, l.get(k));
@@ -313,6 +328,10 @@ pub fn lines() []Line {
             if fn_target(c.value).len > 0 {
                 add_line(&mut l, c.pos, u.f1("GCC target(\"%s\")", fn_target(c.value)));
             }
+            continue;
+        }
+        if kind == EV_DIRECTIVE {
+            add_line_of(&mut l, c.pos, g_directives.get(@truncate(usize, c.value)), true);
             continue;
         }
         if kind == EV_LOOP {
@@ -364,7 +383,7 @@ pub fn lines() []Line {
         if w.target.len > 0 {
             t = u.f2("weak %s = %s", w.name, w.target);
         }
-        l.push(Line.{ pos: 0xFFFF_FFFF, text: t });
+        l.push(Line.{ pos: 0xFFFF_FFFF, text: t, raw: false });
     }
     return l.items();
 }

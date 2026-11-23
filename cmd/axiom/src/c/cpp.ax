@@ -90,6 +90,7 @@ struct Src {
     presumed: []u8,   // __FILE__
     line_delta: i64,  // #line: the presumed line less the physical line
     cond_base: usize,
+    depth: i32,  // how deeply it is included (the unit's source 0; --c-show-includes)
 }
 
 struct Cond {
@@ -319,6 +320,54 @@ fn out_tok(P: *mut PP, t0: lx.PTok) void {
     P.out.push(t);
 }
 
+// Drops the tokens made so far but the pragmas' changes of values (and
+// --c-pp-defines' directives): what the predefined macros, the command
+// line and --c-imacros' files made.
+fn keep_events(P: *mut PP) void {
+    let mut n: usize = 0;
+    for k in 0..P.out.len {
+        let t = P.out.get(k);
+        if t.kind == lx.PK_PRAGMA {
+            P.out.set(n, t);
+            n += 1;
+        }
+    }
+    P.out.len = n;
+}
+
+// The file of --c-include or --c-imacros named `name`: in the current
+// directory, else as `#include "name"` would find it from there (the
+// --c-iquote directories, then the include path); or nil.
+fn find_option_file(P: *mut PP, name: []u8) []u8 {
+    P.found_index = -1;
+    if u.is_file(name) {
+        return name;
+    }
+    if (name.len > 0) and (name[0] != '/') {
+        let q = find_quoted(P, name);
+        if not u.isnos(q) {
+            return q;
+        }
+    }
+    return find_file_from(P, name, 0);
+}
+
+// --c-show-includes: names the file just entered on standard error, after a
+// dot for each level it is included at (as a cc's -H).
+fn show_include(P: *mut PP, path: []u8) void {
+    if not P.o.show_includes or g_lib_unit or P.asm_ {
+        return;
+    }
+    let mut b = u.Buf.init();
+    for _k in 0..cur_src(P).depth {
+        b.c('.');
+    }
+    b.c(' ');
+    b.s(path);
+    b.c('\n');
+    u.eprint(b.done());
+}
+
 // Reads all of the file on top.
 fn run_file(P: *mut PP) void {
     loop {
@@ -509,7 +558,7 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     push_file(P, text_file("<command line>", options_text(P)), "<command line>");
     run_file(P);
     _ = P.files.pop();
-    P.out.clear();
+    keep_events(P);
     let mut sf: *mut u.SourceFile = undefined;
     if let .some(loaded) = load(P, path) {
         sf = loaded;
@@ -522,6 +571,33 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
         cv.convert(P.out.items(), o, &mut toks);
         return toks;
     }
+    // (--c-imacros: each file read in order, before the --c-include ones;
+    // its text is dropped, its macros (and pragmas) stay)
+    for name in o.imacros {
+        let ip = find_option_file(P, name);
+        let mut done = false;
+        if not u.isnos(ip) {
+            if let .some(isf) = load(P, ip) {
+                // (-g: its macros are not described, as the file is not the unit's)
+                let mac = P.mac;
+                P.mac = false;
+                push_file(P, isf, ip);
+                cur_src(P).dir_index = P.found_index;
+                cur_src(P).depth = 1;
+                note_dep(P, ip, false);
+                show_include(P, ip);
+                run_file(P);
+                _ = P.files.pop();
+                P.mac = mac;
+                keep_events(P);
+                done = true;
+            }
+        }
+        if not done {
+            _ = dg.err(u.mkspan(sf.id, 0, 0), "C1081",
+                       u.f1("cannot find the file \"%s\" whose macros are read before the source (--c-imacros)", name));
+        }
+    }
     push_file(P, sf, path);
     note_dep(P, path, true);
     // (--c-include: each file as if included before the source's first
@@ -531,18 +607,15 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     while k > 0 {
         k -= 1;
         let name = o.includes[k];
-        let mut ip = u.nosym();
-        if u.is_file(name) {
-            ip = name;
-        } else {
-            ip = find_file_from(P, name, 0);
-        }
+        let ip = find_option_file(P, name);
         let mis = load(P, u.pick(u.isnos(ip), name, ip));
         if not u.isnos(ip) {
             if let .some(isf) = mis {
                 push_file(P, isf, ip);
                 cur_src(P).dir_index = P.found_index;
+                cur_src(P).depth = 1;
                 note_dep(P, ip, false);
+                show_include(P, ip);
                 continue;
             }
         }

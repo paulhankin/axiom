@@ -45,12 +45,17 @@ struct St {
     ins: u.List.[In],         // the inputs, -l and -L, in order
     xlang: i32,               // -x: the language of the inputs after it (0: by their names)
     defs: u.List.[[]u8],      // -D, -U, -A, in order
-    incs: u.List.[[]u8],      // -I and -iquote, in order (as -I<dir>)
-    quotes: u.List.[[]u8],    // -iquote (before the -I directories)
+    incs: u.List.[[]u8],      // -I, in order (as -I<dir>)
+    quotes: u.List.[[]u8],    // -iquote (--c-iquote: for "..." only, before the -I directories)
     isys: u.List.[[]u8],      // -isystem (--c-isystem)
     after: u.List.[[]u8],     // -idirafter (--c-idirafter: after the system's directories)
     iso: bool,                // -std=cNN, -ansi: an ISO standard, as a cc's (with the reserved extensions)
     pre: u.List.[[]u8],       // -include
+    imacros: u.List.[[]u8],   // -imacros (--c-imacros)
+    nostdinc: bool,           // -nostdinc
+    undef: bool,              // -undef
+    show_includes: bool,      // -H
+    keep_defines: bool,       // -dD
     pass: u.List.[[]u8],      // `axiom build` options given as they are (--cpu=, --c-..., ...)
     lflags: u.List.[[]u8],    // -Wl, and -Xlinker's arguments, in order
     target: []u8,             // --target= (empty: the host)
@@ -125,6 +130,7 @@ fn usage() void {
     u.print("  does not wait on it (docs/c.md).\n");
     u.print("  -c  -o <file>  -E  -P  -dM  -fsyntax-only  -S (no assembly output: an error)\n");
     u.print("  -I<dir>  -iquote <dir>  -isystem <dir>  -idirafter <dir>  -include <file>  -D<name>[=<v>]  -U<name>\n");
+    u.print("  -imacros <file>  -nostdinc  -undef  -H (the headers read)  -dD (with -E: the #defines kept)\n");
     u.print("  -std=<c89 ... c23 | gnu89 ... gnu23>  -ansi       (default gnu17)\n");
     u.print("  -O0 -O1 -O2 -O3 -Os -Oz -Og -Ofast  -g -g1 -g0  (default -O0, no debug information)\n");
     u.print("  -w  -Werror  -Wall  -Wformat=2  (other -W... accepted)  -f... (-fPIC, -funsigned-char,\n");
@@ -670,8 +676,8 @@ fn joined(a: []u8, v: []u8) i32 {
         // (nothing to do: there is no external assembler, nor other programs)
     } else if u.str_eq(a, "-u") or u.str_eq(a, "-T") or u.str_eq(a, "-e") {
         return err(u.f2("'%s %s': the linker's option is not supported", a, v));
-    } else if u.str_eq(a, "-imacros") or u.str_eq(a, "-iprefix") or u.str_eq(a, "-iwithprefix") or
-              u.str_eq(a, "-isysroot") or u.str_eq(a, "--sysroot") {
+    } else if u.str_eq(a, "-iprefix") or u.str_eq(a, "-iwithprefix") or u.str_eq(a, "-isysroot") or
+              u.str_eq(a, "--sysroot") {
         return err(u.f1("'%s' is not supported", a));
     } else {
         // -I dir, -D name ...: as joined
@@ -717,8 +723,10 @@ fn option(a: []u8) i32 {
         }
     } else if u.starts(a, "-iquote") {
         if dir_ok(a[7..]) {
-            S.quotes.push(u.cat2("-I", a[7..]));
+            S.quotes.push(a[7..]);
         }
+    } else if u.starts(a, "-imacros") {
+        S.imacros.push(a[8..]);
     } else if u.starts(a, "-isystem") {
         if dir_ok(a[8..]) {
             S.isys.push(a[8..]);
@@ -881,8 +889,15 @@ fn option(a: []u8) i32 {
               u.str_eq(a, "-nolibc") {
         return err(u.f1("'%s' is not supported: the start-up and the C library are the compiler's to link (a shared library: -shared)",
                         a));
-    } else if u.str_eq(a, "-nostdinc") or u.str_eq(a, "-undef") or u.str_eq(a, "-H") or u.str_eq(a, "-dD") or
-              u.str_eq(a, "-dN") or u.str_eq(a, "-dI") or u.str_eq(a, "-dU") or u.starts(a, "-traditional") or
+    } else if u.str_eq(a, "-nostdinc") {
+        S.nostdinc = true;
+    } else if u.str_eq(a, "-undef") {
+        S.undef = true;
+    } else if u.str_eq(a, "-H") {
+        S.show_includes = true;
+    } else if u.str_eq(a, "-dD") {
+        S.keep_defines = true;
+    } else if u.str_eq(a, "-dN") or u.str_eq(a, "-dI") or u.str_eq(a, "-dU") or u.starts(a, "-traditional") or
               u.str_eq(a, "-static-pie") or u.str_eq(a, "-r") or u.str_eq(a, "-dumpspecs") or u.starts(a, "-specs") or
               u.starts(a, "--sysroot=") {
         return err(u.f1("'%s' is not supported", a));
@@ -1068,7 +1083,7 @@ fn source_options(av: *mut u.List.[[]u8]) void {
         av.push(d);
     }
     for d in S.quotes.items() {
-        av.push(d);
+        av.push(u.cat2("--c-iquote=", d));
     }
     for d in S.incs.items() {
         av.push(d);
@@ -1079,8 +1094,23 @@ fn source_options(av: *mut u.List.[[]u8]) void {
     for d in S.after.items() {
         av.push(u.cat2("--c-idirafter=", d));
     }
+    for f in S.imacros.items() {
+        av.push(u.cat2("--c-imacros=", f));
+    }
     for f in S.pre.items() {
         av.push(u.cat2("--c-include=", f));
+    }
+    if S.nostdinc {
+        av.push("--c-nostdinc");
+    }
+    if S.undef {
+        av.push("--c-undef");
+    }
+    if S.show_includes {
+        av.push("--c-show-includes");
+    }
+    if S.keep_defines and (S.mode == M_PP) {
+        av.push("--c-pp-defines");  // (with -E; else nothing to keep them in)
     }
     for p in S.pass.items() {
         av.push(p);

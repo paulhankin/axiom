@@ -133,11 +133,17 @@ objects and archives define no `main` is `C3063`.
 | `--c-keep-null-checks` | The optimizer is not told that a parameter the attribute `nonnull` names, or one declared `[static n]`, and the result of a function with `returns_nonnull`, are not null pointers: tests of them stay ("Optimization"). |
 | `--c-warn-format=0\|1\|2` | The checks of format strings ("Attributes": `format`): 0 none, 1 (the default) what is undefined or fails on any target (C4130, C4131, C4133), 2 also what is suspect (C4132, C4134, C4135). |
 | `-Idir` | Add a directory to the include path. |
+| `--c-iquote=dir` | A directory searched for `#include "..."` (and `__has_include("...")`) only: after the including file's directory, before the `-I` directories, in order; `#include <...>` does not look there. An `#include_next` in a header found there searches the include path from its start. |
 | `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
 | `--c-lib=axiom\|system` | Whose C library the program has: the compiler's (the default), or the system's, whose headers are then the hosted headers ("The system's C library", below). |
 | `--c-system-include=dir` | With `--c-lib=system`: a directory of the system's headers (instead of the system's own, `/usr/include` and its target directory on Linux). |
 | `--c-isystem=dir` | A directory of headers searched after the `-I` directories, whose headers are system headers for `--c-deps-no-system`. |
-| `--c-include=file` | The file is included before the source's first line (looked for in the current directory, then on the include path); several in order. |
+| `--c-include=file` | The file is included before the source's first line (looked for in the current directory, then as `#include "file"` would find it there: the `--c-iquote` directories, then the include path); several in order. |
+| `--c-imacros=file` | The file (found as `--c-include`'s) is read before the `--c-include` files and the source, and its text is dropped: what stays is its macros (and its pragmas' state); several in order. Its macros are not in the debug information's description of the unit's (`-g`). |
+| `--c-nostdinc` | Neither the compiler's headers nor the system's (`--c-lib=system`) are searched: only the `--c-iquote`, `-I`, `--c-isystem` and `--c-idirafter` directories (a header the compiler has is then `C1081`, saying so). The C library's own units are compiled as ever. |
+| `--c-undef` | The target's conventional macros ("Predefined macros": `__x86_64__`, `__linux__`, `unix`, the processor's extensions ...) and the GNU compilers' (`--c-gnu-compat`: `__GNUC__` and its companions) are not predefined; the standard's (`__STDC__`, `__STDC_VERSION__` ...) and the compiler's own (`__AXIOM_...`), which its headers use, are. The system's headers (`--c-lib=system`), which test the target's macros, do not work without them. |
+| `--c-show-includes` | Each header the unit reads (by `#include`, `#include_next`, `#import`, `--c-include` and `--c-imacros`) is named on standard error as it is entered, after a dot for each level of inclusion (`. a.h`, `.. b.h`); not the C library's own units' headers. |
+| `--c-pp-defines` | `--emit=c-pp` keeps the `#define` and `#undef` directives of the files read, each where it was (its operands spelled from their tokens); not the predefined macros, `-D` and `-U` (`--emit=c-macros` lists every macro), nor a system header's definition of a name the implementation predefines, which is not done. The text compiles again. |
 | `--c-warnings=on\|off\|error` | What becomes of the front end's warnings that the pragmas leave: shown (the default), none shown, or errors. |
 | `--c-wrapv` | Signed `+`, `-` and `*` wrap in two's complement: the optimizer is not told they do not overflow. |
 | `--c-deps=file` | The source's make rule of the files it reads (the source, then each header once, in the order first read) is written to file (`-`: standard output) as it is preprocessed; one source. `--c-deps-target=t` names the rule's target (repeatable, written as given; default the object, `x.o` or `-o`'s with `--emit=obj`), `--c-deps-phony` adds a rule without prerequisites for each header, `--c-deps-no-system` leaves out the system's headers (the compiler's, the system C library's, `--c-isystem`'s). |
@@ -280,7 +286,8 @@ to every build as it is, and changes a default.
 | Options | |
 |---|---|
 | `-c`, `-o file`, `-E`, `-P`, `-dM`, `-fsyntax-only`, `-x lang`, `-v`, `-###` | As above; of `-E` (and `-fsyntax-only`), `-S` and `-c`, the earliest stage given is what is done, whatever their order (`-E -c` preprocesses); `-v` writes the version (and `gcc version 9.4.0 compatible`, the GNU version the macros claim, which configure scripts read) and each build's command to standard error, `-###` the commands without running them. |
-| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `-I` before them (for `<...>` too), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`; `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
+| `-Idir`, `-iquote dir`, `-isystem dir`, `-idirafter dir`, `-include file`, `-imacros file`, `-Dname[=v]`, `-Uname`, `-Apred=ans` | `-I` (a directory that does not exist is skipped, as a cc does), `-iquote` as `--c-iquote` (for `"..."` only, before the `-I` directories), `-isystem` as `--c-isystem`, `-idirafter` as `--c-idirafter` (after the system's directories), `-include` as `--c-include`, `-imacros` as `--c-imacros` (before the `-include` files); `-Wp,...` and `-Xpreprocessor` give these to the preprocessor too. |
+| `-nostdinc`, `-undef`, `-H`, `-dD` | `--c-nostdinc`, `--c-undef` (the standard's macros stay), `--c-show-includes` (to standard error), and with `-E` `--c-pp-defines` (the unit's `#define` and `#undef` in the text; without `-E` it changes nothing). |
 | `-std=`, `-ansi` | `-std=gnuNN` is `--c-std=gnuNN` (`gnu89` ... `gnu2x`, `gnu23`). `-std=cNN` (`c89`, `c90`, `iso9899:1990`, `c99`, `c9x`, `c11`, `c1x`, `c17`, `c18`, `c2x`, `c23`, `iso9899:...`; `-ansi` is `c89`) is `--c-std=gnuNN --c-iso-names`, as a conventional cc's: the standard, its names the program's (`asm` and `typeof` are identifiers, `__STRICT_ANSI__` is defined, so the system's headers declare only the standard's functions unless a feature macro such as `_POSIX_C_SOURCE` asks for more), and the extensions in the reserved namespace (`__attribute__`, `__asm__`, `__typeof__`, `__extension__`, `__inline__` ...) kept, which the system's headers and programs use under every standard; the GNU dialect's other extensions are accepted too, without the ISO mode's errors. `iso9899:199409` (C95) is the strict `--c-std=c95`. With the system's C library the standard must be C99 or later, or a GNU dialect (gnu89 too, as `-std=gnu89`, `-std=c89` and `-ansi` give). |
 | `-O0` ... `-O3`, `-O`, `-Os`, `-Oz`, `-Og`, `-Ofast` | `-O` and `-Og` are `-O1`, `-Os` and `-Oz` `-O2`, `-Ofast` and above 3 `-O3` (no fast-math: the arithmetic stays IEEE 754's). |
 | `-g`, `-g2`, `-g3`, `-ggdb`, `-gdwarf-N`; `-g1`; `-g0` | `-g` (full); `--debug-info=lines`; none. Other `-g...` are accepted. |
@@ -302,7 +309,7 @@ to every build as it is, and changes a default.
 | `--version`, `-dumpversion`, `-dumpmachine`, `-print-prog-name=p`, `-print-file-name=f`, `-print-search-dirs`, `-print-multiarch`, `-print-multi-os-directory` | The questions configure scripts ask: the compiler's version; the target's triple (`x86_64-linux-gnu`); `p` itself (there are no programs of the compiler's own); `f`'s path in the library directories, else `f`; ... |
 | `-pedantic`, `-Wpedantic`, `-pedantic-errors` | `--c-pedantic` (the warnings stay warnings); `-Wno-pedantic` undoes it. |
 | `-pipe`, `-save-temps`, `-C`, `-B...`, `-Wa,...`, `-static-libgcc`, `-pie`, `-no-pie`, `-s` | Accepted; nothing changes. |
-| `-nostdlib`, `-nostartfiles`, `-nodefaultlibs`, `-nostdinc`, `-undef`, `-imacros`, `-traditional`, `-H`, `-dD`, `--sysroot`, `-u`, `-T` | Errors: not supported. |
+| `-nostdlib`, `-nostartfiles`, `-nodefaultlibs`, `-traditional`, `-dN`, `-dI`, `-dU`, `--sysroot`, `-u`, `-T` | Errors: not supported. |
 
 An unknown option is an error (`unknown option '-x'`), as are the options above that cannot
 be honoured: ignoring them would make another program than the one asked for.
@@ -328,7 +335,9 @@ library exports its definitions of default visibility; a version script, or the 
 `visibility`, limits them). A shared library's own calls and references to its
 definitions may be bound to them when it is compiled (its functions inlined or called
 directly, as with `-Bsymbolic`), so a program's definition of the same name does not
-interpose them everywhere. `-iquote` directories are searched for `<...>` too. With
+interpose them everywhere. `-H` names the headers read, without a list of those that
+could use include guards; `-dD` keeps the unit's own `#define` and `#undef` directives, not
+the predefined macros (`-dM` lists those). With
 `--c-lib=axiom`, `-rdynamic` does nothing (a warning). `-std=c89`, a GNU dialect (gnu89,
 which takes the system's headers' `long long`), accepts `//` comments.
 
@@ -418,8 +427,8 @@ axiom build pkg/                                  # a package with c-sources (be
 - **A package** names a directory of C sources in its manifest: `c-sources = "csrc"`
   under `[package]`. Every `.c` file in it, at any depth and in the order of their paths,
   is a C unit of the program, as if given on the command line; so are those of the
-  packages it depends on. `#include "..."` finds headers next to the including file and
-  in the `-I` directories.
+  packages it depends on. `#include "..."` finds headers next to the including file,
+  in the `--c-iquote` directories and in the `-I` directories.
 - **Axiom calls C** through its foreign declarations (spec §14.5.1): a function in an
   `extern "C"` block that a C unit defines is that definition. Its arguments and result
   are passed as the target's C ABI says, so the types at the boundary (spec §14.5.3)

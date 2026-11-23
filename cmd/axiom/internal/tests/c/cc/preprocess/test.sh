@@ -1,5 +1,5 @@
-# -E (to standard output, -o, line markers, -P), -D, -U, -I, -include,
-# -std=, -dM, standard input as the source (-), -x c; the preprocessed
+# -E (to standard output, -o, line markers, -P), -D, -U, -I, -iquote,
+# -include, -imacros, -nostdinc, -undef, -H, -dD, -std=, -dM, standard input as the source (-), -x c; the preprocessed
 # text compiled again (its line markers keep the diagnostics' lines).
 . "$CC_LIB"
 run $CC -E -P -Iinc -include pre.h -DDEF=3 -DGONE -UGONE pp.c > got
@@ -59,6 +59,45 @@ printf 'int main(void) { return 4; }\n' | $CC $OPT -x c - -o fromstdin || fail "
 printf 'int main(void) { return 5; }\n' > prog.txt
 run $CC $OPT -x c prog.txt -x none -o fromtxt
 ./fromtxt; [ $? -eq 5 ] || fail "fromtxt's exit status"
+# -iquote: for "..." only, after the source's directory and before -I (and
+# axiom build's --c-iquote)
+run $CC $OPT -iquote quote -Iinc iquote.c -o iquote
+./iquote > got
+same got "4 2"
+run "$AXIOM" build iquote.c --target=native --c-iquote=quote -Iinc --emit=c-pp -o iquote.i
+has iquote.i "int q = 1 + 3;"
+has iquote.i "int i = 2;"
+fails $CC -Iquote -c iquote.c -o iquote.o
+has fails.out "the -iquote directory was searched"
+# -imacros: its macros, not its text, before the -include files
+run $CC -E -P -imacros imac.h -include pre.h imac.c > got
+same got "int x = 7;
+int y = 9;"
+# -nostdinc: neither the compiler's headers nor the system's
+fails $CC -nostdinc -c nostdinc.c -o nostdinc.o
+has fails.out "--c-nostdinc"
+run $CC -nostdinc -isystem own -c nostdinc.c -o nostdinc.o
+# -undef: no target's macros, nor the GNU compilers'; the standard's stay
+run $CC $OPT -undef --c-lib=axiom undef.c -o undef
+./undef; [ $? -eq 6 ] || fail "undef's exit status"
+printf '' | $CC -undef -dM -E - > macros || fail "-undef -dM -E -"
+has macros "#define __STDC__ 1"
+grep -q '__GNUC__\|__x86_64__\|__aarch64__\|__linux__' macros && fail "-undef: $(grep '__GNUC__\|__x86_64__\|__linux__' macros)"
+# -H: each header read, after a dot for each level
+run $CC -H -iquote quote -Iinc -c iquote.c -o iquote.o 2> headers
+has headers ". quote/which.h"
+has headers ".. quote/nested.h"
+has headers ". inc/which.h"
+grep -q '^\. .*stdio\.h$' headers || fail "-H: no stdio.h: $(cat headers)"
+# -dD: the #define and #undef directives in the text, where they were
+run $CC -E -P -dD defines.c > got
+same got "#define A 1
+int a = 1;
+#undef A
+#define F(x, y) ((x) + (y))
+int b = ((2) + (3));"
+run $CC -E -dD pp.c -Iinc -include pre.h -o dd.i
+run $CC -c dd.i -o dd.o
 # a header does not exist: an error (as configure's checks of headers expect)
 printf '#include <no_such_header.h>\n' > nohdr.c
 fails $CC -E nohdr.c
