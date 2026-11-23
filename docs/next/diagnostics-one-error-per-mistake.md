@@ -9,7 +9,8 @@
   names the Axiom form: `!x`, `&&` and `||`, `T{ ... }`, `->` or `:` before a return
   type, `i++`, `c ? a : b`, `x as T`, `try f()` and `f()?`, `null`, `None`, `Some(x)`,
   `Ok(x)` and `Err(e)`, `C::R`, `var` and a leading `mut`, `s.len()`, `if` and `match`
-  as expressions, a C-style `for`, `lo..=hi`, `*p`, `fn id<T>` and `Vec<T>`, `Vec[T]`,
+  as expressions, a C-style `for`, `lo..=hi`, `*p`, `fn id<T>` and `Vec<T>`, `Vec[T]` (also
+  where `T` is a declared type, found by the checker),
   `'abc'`, `+` on slices, and `const Color = enum { ... }` (or `struct`, `union`). Most
   have a `machine` fix, and the code is checked as if the Axiom form had been written;
   each costs one error.
