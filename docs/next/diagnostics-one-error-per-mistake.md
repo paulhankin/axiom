@@ -7,7 +7,7 @@
   mistake such as `fn f() -> i32` cost five errors, one of them a wrong `machine` fix.
 - Forms from other languages have a diagnostic of their own, `E0160` to `E0180`, that
   names the Axiom form: `!x`, `&&` and `||`, `T{ ... }`, `->` or `:` before a return
-  type, `i++`, `c ? a : b`, `x as T`, `try f()` and `f()?`, `null`, `None`, `Some(x)`,
+  type, `i++` (also inside an expression, `a[i++]`), `c ? a : b`, `x as T`, `try f()` and `f()?`, `null`, `None`, `Some(x)`,
   `Ok(x)` and `Err(e)`, `C::R`, `var` and a leading `mut`, `s.len()`, `if` and `match`
   as expressions, a C-style `for`, `lo..=hi`, `*p`, `fn id<T>` and `Vec<T>`, `Vec[T]` (also
   where `T` is a declared type, found by the checker),
