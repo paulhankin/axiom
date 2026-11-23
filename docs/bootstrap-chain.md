@@ -59,7 +59,7 @@ back to the C compiler.
 The first links were built by the *bootstrap compiler*: a compiler for the language
 written in C (20,000 lines, on LLVM 18), which mirrored the front end and existed only
 to build stage 1. It is no longer in the tree. The last commit that has it is
-`8d7656f7`, in `cmd/axiom/bootstrap/`, where `make -C cmd/axiom/bootstrap` builds it and
+`8d7656f7` (the tag `bootstrap-final`), in `cmd/axiom/bootstrap/`, where `make -C cmd/axiom/bootstrap` builds it and
 `SEED_TOML=/nonexistent cmd/axiom/bootstrap.sh` builds the compiler from it (stage 2
 does not depend on the seed, so that is the compiler the pinned seed gives there too).
 So the chain can be replayed from C and LLVM: check out the commit of a row below
