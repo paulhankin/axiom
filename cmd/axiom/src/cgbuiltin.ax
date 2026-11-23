@@ -1036,9 +1036,10 @@ fn gen_widen(e: *mut ast.Expr, id: ast.BuiltinId, rt: *mut ast.Type) *mut ir.Val
     return r;
 }
 
-// @narrow(T, x, y): the lanes of x then y, lane by lane, each saturated to
-// the result's range: WebAssembly's narrow_*_sat, by the operand and result
-// lane types.
+// @narrow(T, x, y): the lanes of x then y, each saturated to the result's
+// range: on x86-64 a pack (IN_NARROW_SS, IN_NARROW_SU), elsewhere (and for
+// unsigned lanes without SSE4.1) lane by lane (WebAssembly's narrow_*_sat), by
+// the operand and result lane types.
 fn gen_narrow(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
     let vt = cx.ct(barg(e, 1).ty);
     let x = gen(barg(e, 1));
@@ -1052,6 +1053,30 @@ fn gen_narrow(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
     if rt.elem.is_signed {
         hi = (@as(u64, 1) << (bits - 1)) - 1;
         lo = 0 -% (@as(u64, 1) << (bits - 1));
+    }
+    let sbits = @as(u64, @bit_cast(u32, vt.elem.bits));
+    let size = sbits * n;
+    // (SSE2 has the packs of signed lanes but packusdw, and the clamp of unsigned
+    // lanes, pminuw and pminud, need SSE4.1)
+    let sse2_ok = vt.elem.is_signed and ((sbits == 16) or rt.elem.is_signed);
+    if cgb.on_x64() and (sse2_ok or x64c.has41()) and ((sbits == 16) or (sbits == 32)) and ((size % 128) == 0) {
+        // packsswb, packuswb, packssdw, packusdw (x64simd.ax), which read their
+        // lanes as signed: unsigned ones are first clamped to the result's top
+        let mut nid = ir.IN_NARROW_SS;
+        if not rt.elem.is_signed {
+            nid = ir.IN_NARROW_SU;
+        }
+        let mut xa = x;
+        let mut ya = y;
+        if not vt.elem.is_signed {
+            let top = ir.splat(cx.B, cx.lty(vt), ir.cint(wt, hi));
+            let mut ax: [2]*mut ir.Value = [x, top];
+            xa = ir.intr(cx.B, ir.IN_UMIN, cx.lty(vt), ax[..]);
+            let mut ay: [2]*mut ir.Value = [y, top];
+            ya = ir.intr(cx.B, ir.IN_UMIN, cx.lty(vt), ay[..]);
+        }
+        let mut nargs: [2]*mut ir.Value = [xa, ya];
+        return ir.intr(cx.B, nid, cx.lty(rt), nargs[..]);
     }
     let mut r = ir.czero(cx.lty(rt));
     for i in @as(u64, 0)..(2 * n) {

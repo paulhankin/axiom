@@ -705,7 +705,8 @@ fn own_vec_op(v: *mut ir.Value) bool {
         return false;
     }
     let id = ir.intr_id(v);
-    if ir.intr_between(id, ir.IN_PERM, ir.IN_STORE_PARTIAL) or (id == ir.IN_SAD_U8) {
+    if ir.intr_between(id, ir.IN_PERM, ir.IN_STORE_PARTIAL) or (id == ir.IN_SAD_U8) or (id == ir.IN_NARROW_SS) or
+       (id == ir.IN_NARROW_SU) {
         return true;
     }
     if ir.intr_between(id, ir.IN_SHLV, ir.IN_ASHRV) {
@@ -755,7 +756,7 @@ pub fn vec_binop(v: *mut ir.Value) void {
             let x = xsl.reg(m.xs.get(0));
             let y = xsl.vsrc(m.xs.get(1));
             xsl.copy(d, xsl.reg(acc), xsl.vclass());
-            _ = xsl.vlz(xsl.sse4(xe.VPDPBUSD, 0, xsl.RW(d), y, xsl.R(x), xsl.NONE()));
+            _ = xsl.vlz(xsl.sse4(vnni_op(), 0, xsl.RW(d), y, xsl.R(x), xsl.NONE()));
             return;
         }
     }
@@ -1422,6 +1423,52 @@ pub fn gen_shuffle(v: *mut ir.Value) void {
     _ = xsl.sse2(xe.MOVDQU_LD, xsl.W(d), mc.mem_slot(r, 0));
 }
 
+// vpdpbusd at the width being selected (x64caps.vnni_op_evex).
+fn vnni_op() i32 {
+    if x64c.vnni_op_evex(@as(u64, xsl.S.vl)) {
+        return xe.VPDPBUSD_E;
+    }
+    return xe.VPDPBUSD;
+}
+
+// The lanes of a then b, each saturated to half its width (IN_NARROW_SS,
+// IN_NARROW_SU): a pack, which works in 128-bit lanes (a's then b's half of
+// each), then at 256 and 512 bits a vpermq putting the 64-bit pieces in order.
+fn gen_narrow(v: *mut ir.Value, id: ir.Intrinsic, d: i32) void {
+    let sb = is.lane_bits(v.xs.get(0).ty);
+    let mut op = xe.PACKSSWB;
+    if sb == 32 {
+        op = xe.PACKSSDW;
+    }
+    if id == ir.IN_NARROW_SU {
+        op = xe.PACKUSWB;
+        if sb == 32 {
+            op = xe.PACKUSDW;
+        }
+    }
+    let a = xsl.reg(v.xs.get(0));
+    let b = xsl.reg(v.xs.get(1));
+    if xsl.S.vl <= 16 {
+        xsl.sse3(op, d, a, xsl.R(b));
+        return;
+    }
+    let p = xsl.vxmm();
+    xsl.sse3(op, p, a, xsl.R(b));
+    if xsl.S.vl == 32 {
+        _ = xsl.sse_i(xe.VPERMQ_I, xsl.W(d), xsl.R(p), 0xd8);
+        return;
+    }
+    // the 64-bit pieces a0 b0 a1 b1 a2 b2 a3 b3, to a0 a1 a2 a3 b0 b1 b2 b3
+    let mut bs = bn.new_bytes();
+    let order: [8]u64 = [0, 2, 4, 6, 1, 3, 5, 7];
+    for x in order {
+        bs.u64_(x);
+    }
+    let idx = xsl.const_vreg(xe.MOVDQU_LD, xsl.const_bytes(&bs, 64), 0, 0);
+    bs.free();
+    xsl.sse3(xe.VPERMQV, d, idx, xsl.R(p));
+}
+
 // The even (or odd) 8- or 16-bit lanes of a then b (a narrowing truncation,
 // or the high halves): each source with its other halves cleared (or shifted
 // down), then a pack, which does not saturate those. Without SSSE3 the
@@ -1991,12 +2038,16 @@ pub fn gen_vec_intr(v: *mut ir.Value, id: ir.Intrinsic) void {
         xsl.sse3(xe.PMADDWD, d, a, b);
         return;
     }
+    if (id == ir.IN_NARROW_SS) or (id == ir.IN_NARROW_SU) {
+        gen_narrow(v, id, d);
+        return;
+    }
     if id == ir.IN_DOT_U8I8 {
         // vpdpbusd d (zeroed) += four products of a's unsigned and b's signed bytes a lane
         let a = xsl.reg(a0);
         let b = xsl.vsrc(v.xs.get(1));
         xsl.vzero(d);
-        _ = xsl.vlz(xsl.sse4(xe.VPDPBUSD, 0, xsl.RW(d), b, xsl.R(a), xsl.NONE()));
+        _ = xsl.vlz(xsl.sse4(vnni_op(), 0, xsl.RW(d), b, xsl.R(a), xsl.NONE()));
         return;
     }
     if ir.is_widen(id) {
