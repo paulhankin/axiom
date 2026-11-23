@@ -1,0 +1,256 @@
+// =============================================================================
+// lib/encoding/yaml.ax - YAML 1.2: parsing into json.Value trees, events, and writing.
+//
+//     let mut doc = yaml.parse(text)!;               // one document
+//     defer doc.deinit();
+//     let name = doc.root.get("name")!.as_str()!;    // a json.Value
+//
+//     let mut all = yaml.parse_all(text)!;           // a stream of documents
+//     for v in all.documents { ... }
+//
+//     let s = yaml.stringify(value)!;                // block-style YAML (mem.free)
+//     yaml.stringify_to(w, value)!;                  // to an io.Writer
+//
+// Scalars are resolved with the YAML 1.2 core schema: null (~, null, empty),
+// booleans (true/false in three cases), integers (decimal, 0o octal, 0x
+// hex), floats (with .inf and .nan) and strings; quoted scalars are always
+// strings, and the !!str, !!int, !!float, !!bool and !!null tags are
+// honoured. Mapping keys must be scalars (they become strings); duplicate
+// keys are an error. Aliases share the anchored value (the tree is a DAG),
+// and the expanded size is limited (to 100 times the text's length plus
+// 100000, counting each node as 1 and each scalar's bytes too), so that
+// "billion laughs" documents are refused rather than exploding in code that
+// walks the tree.
+//
+// For everything the tree can't show (tags, styles, anchors, complex keys)
+// there is the event interface: `Events` gives the stream as libyaml does.
+// Passes all 402 cases of the yaml-test-suite (lib/encoding/yaml/testdata, from
+// cmd/axiom/internal/tests/tools/gen_yaml_tests.py), as events and, where the suite gives JSON, as
+// trees.
+// =============================================================================
+
+import "std/collections/arena" as arena;
+import "std/collections/vec" as vec;
+import "std/diag" as diag;
+import "std/encoding/json" as json;
+import "std/io" as io;
+import "std/str" as strs;
+
+import part "yaml/composer.ax";
+import part "yaml/events.ax";
+import part "yaml/scanner.ax";
+import part "yaml/scanner_scalars.ax";
+import part "yaml/tests.ax";
+import part "yaml/writer.ax";
+
+pub error YamlError { SyntaxError, TooDeep, TooLarge, DuplicateKey, Unsupported, WrongType, OutOfMemory,
+                      MultipleDocuments, BadNesting, Empty, IoError, BadFormat, InvalidUtf8, InvalidNumber, EndOfStream,
+                      Overflow, NoSpaceLeft }
+
+/// Collections nested deeper than this are refused.
+pub const MAX_DEPTH: usize = 512;
+
+// The most bytes an implicit key ("key: value") may take (YAML's limit).
+const MAX_IMPLICIT_KEY: usize = 1024;
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
+pub struct Mark {
+    pub index: usize,
+    pub line: u32,    // from 0
+    pub column: u32,  // from 0, in characters
+}
+
+/// Scalar styles.
+pub enum Style: u8 {
+    NONE,  // not a scalar
+    PLAIN,
+    SINGLE_QUOTED,
+    DOUBLE_QUOTED,
+    LITERAL,
+    FOLDED,
+}
+
+/// Event kinds.
+pub enum EventKind: u8 {
+    STREAM_START = 1,
+    STREAM_END,
+    DOCUMENT_START,
+    DOCUMENT_END,
+    ALIAS,
+    SCALAR,
+    SEQUENCE_START,
+    SEQUENCE_END,
+    MAPPING_START,
+    MAPPING_END,
+}
+
+pub struct Event {
+    pub kind: EventKind,
+    pub start: Mark,
+    pub end: Mark,
+    pub anchor: []u8,    // for nodes (the name, for aliases)
+    pub tag: []u8,       // resolved: "tag:yaml.org,2002:str", "!" (non-specific), "" (none)
+    pub value: []u8,     // scalars
+    pub style: Style,    // scalars
+    pub flow: bool,      // collections written in flow style
+    pub explicit: bool,  // documents with --- (start) or ... (end)
+}
+
+/// A parsed document: its root and the memory behind it.
+pub nocopy struct Document {
+    pub root: json.Value,
+    arena: arena.Arena,
+
+    pub fn deinit(self: *mut Document) void {
+        self.arena.deinit();
+        self.root = json.Value.Null;
+    }
+}
+
+/// All the documents of a stream.
+pub nocopy struct Stream {
+    pub documents: []json.Value,
+    arena: arena.Arena,
+
+    pub fn deinit(self: *mut Stream) void {
+        self.arena.deinit();
+    }
+}
+
+/// Where and why parsing failed.
+pub struct ErrorInfo {
+    pub line: u32,    // from 1
+    pub column: u32,  // from 1
+    pub message: []u8,
+}
+
+// -----------------------------------------------------------------------------
+// Public entry points
+// -----------------------------------------------------------------------------
+
+/// Parses a stream holding (at most) one document; an empty stream gives
+/// null. MultipleDocuments if there are more.
+pub fn parse(text: []u8) YamlError!Document {
+    let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
+    return parse_with(text, &mut info);
+}
+
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) YamlError!Document {
+    let mut dinfo = diag.ErrorInfo.init();
+    let d = parse_diag(text, &mut dinfo) catch |e| {
+        info.line = dinfo.line;
+        info.column = dinfo.col;
+        info.message = dinfo.detail;
+        return e;
+    };
+    return d;
+}
+
+/// Parses a stream holding (at most) one document; on failure fills `info`
+/// with byte offset, 1-based line and column, and detail.
+pub fn parse_diag(text: []u8, info: *mut diag.ErrorInfo) YamlError!Document {
+    info.* = diag.ErrorInfo.init();
+    let mut d = Document.{ root: json.Value.Null, arena: arena.Arena.init() };
+    let mut docs = vec.Vec.[json.Value].init();
+    defer docs.deinit();
+    compose_all_diag(text, &mut d.arena, &mut docs, info, true) catch |e| {
+        d.arena.deinit();
+        return e;
+    };
+    if docs.len() > 0 {
+        d.root = docs.get(0);
+    }
+    return d;
+}
+
+/// Parses every document of a stream.
+pub fn parse_all(text: []u8) YamlError!Stream {
+    let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
+    return parse_all_with(text, &mut info);
+}
+
+pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) YamlError!Stream {
+    let mut dinfo = diag.ErrorInfo.init();
+    let s = parse_all_diag(text, &mut dinfo) catch |e| {
+        info.line = dinfo.line;
+        info.column = dinfo.col;
+        info.message = dinfo.detail;
+        return e;
+    };
+    return s;
+}
+
+/// Parses every document of a stream; on failure fills `info` with byte
+/// offset, 1-based line and column, and detail.
+pub fn parse_all_diag(text: []u8, info: *mut diag.ErrorInfo) YamlError!Stream {
+    info.* = diag.ErrorInfo.init();
+    let mut s = Stream.{ documents: [], arena: arena.Arena.init() };
+    let mut docs = vec.Vec.[json.Value].init();
+    defer docs.deinit();
+    compose_all_diag(text, &mut s.arena, &mut docs, info, false) catch |e| {
+        s.arena.deinit();
+        return e;
+    };
+    s.documents = s.arena.copy.[json.Value](docs.items()) catch |e| {
+        info.* = diag.ErrorInfo.at(text.len, 1, 1, "out of memory");
+        s.arena.deinit();
+        return e;
+    };
+    return s;
+}
+
+/// A value as block-style YAML (free it with mem.free). Strings are plain
+/// when that reads back as the same string, and double-quoted otherwise.
+pub fn stringify(v: json.Value) YamlError![]mut u8 {
+    let mut s = strs.String.init();
+    stringify_to(s.writer(), v) catch |e| {
+        s.deinit();
+        return to_yaml_write_error(e);
+    };
+    return s.take();
+}
+
+/// Writes a value as block-style YAML (see stringify) to w, through a 4 KB
+/// buffer flushed before returning.
+pub fn stringify_to(w: io.Writer, v: json.Value) !void {
+    let mut bw = io.BufWriter.init(w);
+    write_block(bw.writer(), v, 0, 0)!;
+    bw.flush()!;
+}
+
+// -----------------------------------------------------------------------------
+// Shared character predicates
+// -----------------------------------------------------------------------------
+
+fn is_break(c: u8) bool {
+    return (c == '\n') or (c == '\r');
+}
+
+fn is_blank(c: u8) bool {
+    return (c == ' ') or (c == '\t');
+}
+
+fn is_flow_indicator(c: u8) bool {
+    return (c == ',') or (c == '[') or (c == ']') or (c == '{') or (c == '}');
+}
+
+fn is_word(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or (c == '-') or
+           (c == '_');
+}
+
+fn hexv(c: u8) u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(u32, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(u32, c - 'A') + 10;
+    }
+    return 99;
+}

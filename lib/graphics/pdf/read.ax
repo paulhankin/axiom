@@ -1,0 +1,308 @@
+// =============================================================================
+// lib/graphics/pdf/read.ax - Reading PDF files: objects, streams, pages and text.
+//
+//     let data = fs.read_file("paper.pdf")!;
+//     defer mem.free(data);
+//     let mut r = read.Reader.open(data)!;
+//     defer r.deinit();
+//     for i in 0..r.page_count() {
+//         let t = r.page_text(i)!;     // UTF-8, lines in reading order
+//         defer mem.free(t);
+//     }
+//     let title = r.info("Title")!;   // metadata, as UTF-8
+//
+// The reader parses the cross-reference tables and streams (following
+// updates with /Prev, and object streams), and rebuilds the table by
+// scanning the file when it is missing or broken. Objects are parsed on
+// demand (object(), resolve()); stream data is decoded through FlateDecode
+// (with PNG and TIFF predictors), LZWDecode, ASCIIHexDecode, ASCII85Decode
+// and RunLengthDecode. Text comes from interpreting the pages' content
+// streams (and the forms they use), decoding strings through each font's
+// ToUnicode map or its encoding (WinAnsi, MacRoman, Standard, differences
+// by glyph name), and ordering it into lines and words by position.
+//
+// Untrusted files: nothing here trusts the input. Offsets and lengths are
+// checked, nesting and reference chains are limited, the page tree and
+// form XObjects are walked without recursion into cycles, decoded streams
+// are capped (Reader.max_stream), and the work any one file can cause is
+// bounded. Encrypted files are refused (error.Encrypted).
+// =============================================================================
+
+import "std/collections/map" as maps;
+import "std/collections/vec" as vec;
+import "std/hash" as hash;
+import "std/mem" as mem;
+import "std/str" as strs;
+
+import part "read/fonts.ax";
+import part "read/lexer.ax";
+import part "read/streams.ax";
+import part "read/tests.ax";
+import part "read/text.ax";
+import part "read/xref.ax";
+
+pub error ReadError { Corrupt, Encrypted, NotFound, WrongType, TooLarge, Unsupported, OutOfMemory, Done, Empty,
+                      ChecksumMismatch, InvalidUtf8, Truncated, IoError, EndOfStream, NoSpaceLeft, PermissionDenied,
+                      IsDirectory }
+
+/// Arrays and dictionaries nested deeper than this are malformed.
+pub const MAX_DEPTH: u32 = 64;
+
+pub struct Ref {
+    num: u32,
+    gen: u32,
+}
+
+pub struct Dict {
+    keys: [][]u8,
+    vals: []Object,
+
+    /// The value for a key (Null if absent; not resolved).
+    pub fn get(self: Dict, key: []u8) Object {
+        for i in 0..self.keys.len {
+            if strs.eq(self.keys[i], key) {
+                return self.vals[i];
+            }
+        }
+        return Object.Null;
+    }
+}
+
+pub struct Stream {
+    dict: Dict,
+    start: usize,  // the raw data in the file
+    len: usize,
+}
+
+pub union Object {
+    Null,
+    Bool: bool,
+    Int: i64,
+    Real: f64,
+    Str: []u8,
+    Name: []u8,
+    Array: []Object,
+    Dict: Dict,
+    Stream: Stream,
+    Ref: Ref,
+
+    pub fn is_null(self: Object) bool {
+        match self {
+            .Null => { return true; }
+            else  => { return false; }
+        }
+    }
+
+    pub fn as_int(self: Object) ReadError!i64 {
+        match self {
+            .Int(v) => { return v; }
+            .Real(v) => {
+                if (v > -9.0e18) and (v < 9.0e18) {
+                    return @int_from_float(i64, v);
+                }
+                return error.WrongType;
+            }
+            else => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_num(self: Object) ReadError!f64 {
+        match self {
+            .Int(v)  => { return @float_from_int(f64, v); }
+            .Real(v) => { return v; }
+            else     => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_name(self: Object) ReadError![]u8 {
+        match self {
+            .Name(v) => { return v; }
+            else     => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_str(self: Object) ReadError![]u8 {
+        match self {
+            .Str(v) => { return v; }
+            else    => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_array(self: Object) ReadError![]Object {
+        match self {
+            .Array(v) => { return v; }
+            else      => { return error.WrongType; }
+        }
+    }
+
+    /// The dictionary of a Dict or a Stream.
+    pub fn as_dict(self: Object) ReadError!Dict {
+        match self {
+            .Dict(v)   => { return v; }
+            .Stream(s) => { return s.dict; }
+            else       => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_stream(self: Object) ReadError!Stream {
+        match self {
+            .Stream(s) => { return s; }
+            else       => { return error.WrongType; }
+        }
+    }
+}
+
+fn empty_dict() Dict {
+    return Dict.{ keys: [], vals: [] };
+}
+
+// -----------------------------------------------------------------------------
+// The reader
+// -----------------------------------------------------------------------------
+
+pub nocopy struct Reader {
+    data: []u8,
+    xref: vec.Vec.[Entry],
+    trailer: Dict,
+    cache: vec.Vec.[Object],
+    state: vec.Vec.[u8],        // per object: 0 not parsed, 1 being parsed, 2 cached
+    bytes: vec.Vec.[[]mut u8],  // memory the objects point into
+    objects: vec.Vec.[[]mut Object],
+    names: vec.Vec.[[]mut []u8],
+    objstm: maps.Map.[u64, usize, hash.hash_u64, hash.eq_u64],  // object stream number -> index in `streams`
+    streams: vec.Vec.[ObjStm],
+    decoded: maps.Map.[u64, Decoded, hash.hash_u64, hash.eq_u64],  // stream start -> its data, decoded
+    pages: vec.Vec.[Dict],
+    /// The most a stream may decode to (bytes).
+    max_stream: usize,
+    /// Work left (bytes decoded); a file cannot use more.
+    budget: usize,
+    /// Bytes of objects left to parse: a few times the file and its object
+    /// streams (objects that overlap, or many entries for one place, would
+    /// parse the same bytes again and again).
+    parse_budget: usize,
+
+    /// Opens a PDF held in memory (which must outlive the Reader).
+    pub fn open(data: []u8) ReadError!Reader {
+        let mut r = Reader.{
+            data: data,
+            xref: vec.Vec.[Entry].init(),
+            trailer: empty_dict(),
+            cache: vec.Vec.[Object].init(),
+            state: vec.Vec.[u8].init(),
+            bytes: vec.Vec.[[]mut u8].init(),
+            objects: vec.Vec.[[]mut Object].init(),
+            names: vec.Vec.[[]mut []u8].init(),
+            objstm: maps.Map.[u64, usize, hash.hash_u64, hash.eq_u64].init(),
+            streams: vec.Vec.[ObjStm].init(),
+            decoded: maps.Map.[u64, Decoded, hash.hash_u64, hash.eq_u64].init(),
+            pages: vec.Vec.[Dict].init(),
+            max_stream: 256 * 1024 * 1024,
+            budget: (@min(data.len, 1 << 24) * 64) + (1 << 28),
+            parse_budget: (data.len * 8) + (1 << 20),
+        };
+        read_load(&mut r) catch |e| {
+            r.deinit();
+            return e;
+        };
+        return r;
+    }
+
+    pub fn deinit(self: *mut Reader) void {
+        self.xref.deinit();
+        self.cache.deinit();
+        self.state.deinit();
+        for b in self.bytes.items() {
+            mem.free(b);
+        }
+        self.bytes.deinit();
+        for o in self.objects.items() {
+            mem.free(o);
+        }
+        self.objects.deinit();
+        for n in self.names.items() {
+            mem.free(n);
+        }
+        self.names.deinit();
+        self.objstm.deinit();
+        for &mut o in self.streams.items_mut() {
+            o.offsets.deinit();
+        }
+        self.streams.deinit();
+        self.decoded.deinit();
+        self.pages.deinit();
+    }
+
+    fn keep(self: *mut Reader, b: []mut u8) ReadError![]u8 {
+        self.bytes.push(b) catch |e| {
+            mem.free(b);
+            return e;
+        };
+        return b;
+    }
+
+    // frees what was kept after these counts (by a parse that failed)
+    fn release(self: *mut Reader, nbytes: usize, nobjects: usize, nnames: usize) void {
+        while self.bytes.len() > nbytes {
+            mem.free(self.bytes.pop() ?? break);
+        }
+        while self.objects.len() > nobjects {
+            mem.free(self.objects.pop() ?? break);
+        }
+        while self.names.len() > nnames {
+            mem.free(self.names.pop() ?? break);
+        }
+    }
+
+    // counts parsing against its budget
+    fn charge(self: *mut Reader, n: usize) void {
+        self.parse_budget -= @min(self.parse_budget, n);
+    }
+
+    /// Indirect object `num` (Null if it does not exist).
+    pub fn object(self: *mut Reader, num: u32) ReadError!Object {
+        return read_object(self, num);
+    }
+
+    /// Follows references (a few levels at most) to a direct object.
+    pub fn resolve(self: *mut Reader, o: Object) ReadError!Object {
+        return read_resolve(self, o);
+    }
+
+    /// A dictionary entry, resolved.
+    pub fn get(self: *mut Reader, d: Dict, key: []u8) ReadError!Object {
+        return self.resolve(d.get(key));
+    }
+
+    /// A stream's data, decoded (kept until deinit).
+    pub fn stream_data(self: *mut Reader, st: Stream) ReadError![]u8 {
+        return decode_stream(self, st);
+    }
+
+    pub fn page_count(self: *Reader) usize {
+        return self.pages.len();
+    }
+
+    /// A page's dictionary (with inherited attributes).
+    pub fn page(self: *Reader, i: usize) ReadError!Dict {
+        if i >= self.pages.len() {
+            return error.NotFound;
+        }
+        return self.pages.get(i);
+    }
+
+    /// A page's size in points: [width, height] of its MediaBox.
+    pub fn page_size(self: *mut Reader, i: usize) ReadError![2]f64 {
+        return read_page_size(self, i);
+    }
+
+    /// A metadata entry (Title, Author, ...) as UTF-8; empty if absent.
+    pub fn info(self: *mut Reader, key: []u8) ReadError![]mut u8 {
+        return read_info(self, key);
+    }
+
+    /// The text of page i, as UTF-8 lines.
+    pub fn page_text(self: *mut Reader, i: usize) ReadError![]mut u8 {
+        return extract_page_text(self, i);
+    }
+}

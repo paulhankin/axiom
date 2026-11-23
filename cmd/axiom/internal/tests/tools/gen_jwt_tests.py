@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Keys and tokens for std/encoding/jwt, made by PyJWT and the cryptography
+"""Keys and tokens for lib/encoding/jwt, made by PyJWT and the cryptography
 package.
 
     pip install pyjwt cryptography
     cmd/axiom/internal/tests/tools/gen_jwt_tests.py
 
-std/encoding/jwt/testdata/ gets the keys (PKCS #8 and SubjectPublicKeyInfo PEM
+lib/encoding/jwt/testdata/ gets the keys (PKCS #8 and SubjectPublicKeyInfo PEM
 files: an RSA 2048-bit key, P-256, P-384 and Ed25519 keys, and a second P-256
 key that signed nothing) and cases.json: tokens signed by PyJWT, each with the
 algorithm and key to verify it with, the claim checks to make at the time
-"now" (when the file was made), and PyJWT's verdict as std/encoding/jwt's
-error name ("ok" if it accepts; where std/encoding/jwt is stricter, as with
+"now" (when the file was made), and PyJWT's verdict as lib/encoding/jwt's
+error name ("ok" if it accepts; where lib/encoding/jwt is stricter, as with
 a header naming "alg" twice, "result" says so and "pyjwt" has PyJWT's verdict). For the deterministic algorithms (HMAC,
 RSASSA-PKCS1-v1_5, EdDSA) "payload" is the exact JSON PyJWT signed, so the
 test can sign it again and compare the tokens byte for byte.
@@ -26,7 +26,7 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
-out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'encoding', 'jwt', 'testdata')
+out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'encoding', 'jwt', 'testdata')
 os.makedirs(out_dir, exist_ok=True)
 
 keys = {

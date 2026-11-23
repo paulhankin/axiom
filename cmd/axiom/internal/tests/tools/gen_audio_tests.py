@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/audio/testdata: Opus streams from libopus (through ffmpeg)
+"""Generates lib/audio/testdata: Opus streams from libopus (through ffmpeg)
 in each of its modes, with libopus's own decoding (through ctypes) as
 16-bit PCM to compare with; AAC streams (ADTS and MP4) from FFmpeg's
 encoder in each of its profiles and tools, and HE-AAC (v1 and v2) streams
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import wave
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'audio', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'audio', 'testdata')
 
 
 def signal(seconds, channels, rate=48000, seed=0):

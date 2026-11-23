@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Archives made by Python's zipfile and tarfile, for std/archive/zip and std/archive/tar.
+"""Archives made by Python's zipfile and tarfile, for lib/archive/zip and lib/archive/tar.
 
     cmd/axiom/internal/tests/tools/gen_archive_tests.py
 
-Writes std/archive/zip/testdata/*.zip and std/archive/tar/testdata/*.tar.gz, and for each
+Writes lib/archive/zip/testdata/*.zip and lib/archive/tar/testdata/*.tar.gz, and for each
 a listing `<archive>.txt` with a line per entry: `<kind> <size> <mode octal>
 <mtime> <crc32 of the contents, hex> <name>` (kind: f file, d directory,
 l symlink with ` -> target` added).
@@ -16,7 +16,7 @@ import time
 import zipfile
 import zlib
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'std', 'archive')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..', 'lib', 'archive')
 MTIME = 1700000000  # 2023-11-14T22:13:20Z (even seconds, for DOS times)
 
 files = [

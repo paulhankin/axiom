@@ -1781,16 +1781,19 @@ await section('C programs', {
   ...cDriverCases(),
 });
 
-// `axiom test`: the standard library's own tests must pass, and the
-// self-tests in cmd/axiom/internal/tests/testing/ must produce exactly the declared results.
+// `axiom test`: the standard library's and the libraries' own tests must
+// pass, and the self-tests in cmd/axiom/internal/tests/testing/ must produce
+// exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
 function dirsUnder(dir) {
   return [dir, ...fs.readdirSync(dir, { withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name !== 'testdata').map((e) => e.name).sort()
     .flatMap((n) => dirsUnder(path.join(dir, n)))];
 }
-const stdDirs = dirsUnder(path.join(root, 'std'));
-const allStdFiles = stdDirs.flatMap(files);
+// (the core, std/, and the libraries, lib/: spec §4.1)
+const coreFiles = dirsUnder(path.join(root, 'std')).flatMap(files);
+const libFiles = dirsUnder(path.join(root, 'lib')).flatMap(files);
+const allStdFiles = [...coreFiles, ...libFiles];
 const stdSrc = new Map(allStdFiles.map((f) => [path.resolve(f), fs.readFileSync(f, 'utf8')]));
 const partOwned = new Set();
 const partTargets = new Map();
@@ -2221,7 +2224,7 @@ await section('spec §16.3', {
 // `.none`, never an error, a sentinel or a bool). A cursor read through its
 // fields names its step `advance`. A free function named `next` is not a method.
 await section('spec §15.3', {
-  'every public method named next in std is an iterator\'s': () => {
+  'every public method named next in std and lib is an iterator\'s': () => {
     const exempt = new Set([]);  // 'path/to/module.ax: Type', each with the reason why
     const problems = [];
     for (const [f, src] of stdSrc) {
@@ -2516,6 +2519,7 @@ await section('spec §15.3', {
     fs.copyFileSync(compiler, path.join(inst, 'bin/axiom'));
     fs.chmodSync(path.join(inst, 'bin/axiom'), 0o755);
     fs.symlinkSync(path.join(root, 'std'), path.join(inst, 'std'));
+    fs.symlinkSync(path.join(root, 'lib'), path.join(inst, 'lib'));
     fs.writeFileSync(path.join(inst, 'RELEASE-NOTES.md'), 'old\n');
     // the release
     const name = `axiom-9.9.9-${plat}-${arch}`;
@@ -2524,6 +2528,8 @@ await section('spec §15.3', {
     fs.mkdirSync(path.join(rel, 'std'));
     fs.writeFileSync(path.join(rel, 'bin/axiom'), '#!/bin/sh\necho "axiom 9.9.9"\n', { mode: 0o755 });
     fs.writeFileSync(path.join(rel, 'std/mem.ax'), '');
+    fs.mkdirSync(path.join(rel, 'lib'));
+    fs.writeFileSync(path.join(rel, 'lib/README.md'), 'new\n');
     fs.writeFileSync(path.join(rel, 'RELEASE-NOTES.md'), 'new\n');
     const down = path.join(dir, 'mirror/releases/download/v9.9.9');
     fs.mkdirSync(down, { recursive: true });
@@ -2588,8 +2594,9 @@ await section('spec §15.3', {
       const v = spawnSync(exe, ['version'], { encoding: 'utf8' }).stdout;
       const notes = fs.readFileSync(path.join(dir, 'inst/RELEASE-NOTES.md'), 'utf8');
       const left = fs.readdirSync(path.join(dir, 'inst')).filter((f) => f.startsWith('.axiom-update'));
-      return v === 'axiom 9.9.9\n' && notes === 'new\n' && !left.length && fs.existsSync(path.join(root, 'std/mem.ax'))
-        ? null : `version ${v}, notes ${notes}, left ${left}`;
+      const libNew = fs.readFileSync(path.join(dir, 'inst/lib/README.md'), 'utf8') === 'new\n';
+      return v === 'axiom 9.9.9\n' && notes === 'new\n' && libNew && !left.length && fs.existsSync(path.join(root, 'std/mem.ax')) &&
+        fs.existsSync(path.join(root, 'lib/README.md')) ? null : `version ${v}, notes ${notes}, lib/ updated ${libNew}, left ${left}`;
     },
   }, { timed: false });
 }
@@ -2998,7 +3005,7 @@ if (!skipPlatform) {
       .filter((n) => n !== 'errors' && n !== 'fmt' && (n.endsWith('.ax') ||
         fs.statSync(path.join(root, 'cmd/axiom/internal/tests', n)).isDirectory()))
       .map((n) => `cmd/axiom/internal/tests/${n}`);
-    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'docs/tour', ...tests]);
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'lib', 'examples', 'docs/tour', ...tests]);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
   await section('fmt', cases, { timed: false });
@@ -3053,14 +3060,18 @@ if (!skipPlatform) {
       };
     }
   }
-  cases['every module axiom doc std lists has a summary'] = () => {
-    const r = doc(['std', '--format=agent-json']);
-    if (r.status !== 0) return `status ${r.status}: ${r.stderr}`;
-    const mods = JSON.parse(r.stdout).modules;
-    if (mods.length < 100) return `only ${mods.length} modules listed`;
-    if (mods.some((m) => m.name.includes('/internal/') || m.name.includes('/testdata/'))) return 'internal or testdata modules listed';
-    const missing = mods.filter((m) => !m.summary).map((m) => m.name);
-    return missing.length ? `no summary (a first comment block): ${missing.join(' ')}` : null;
+  cases['every module axiom doc std and axiom doc lib list has a summary'] = () => {
+    for (const [tier, least] of [['std', 40], ['lib', 100]]) {
+      const r = doc([tier, '--format=agent-json']);
+      if (r.status !== 0) return `${tier}: status ${r.status}: ${r.stderr}`;
+      const mods = JSON.parse(r.stdout).modules;
+      if (mods.length < least) return `${tier}: only ${mods.length} modules listed`;
+      if (mods.some((m) => !m.name.startsWith(`${tier}/`))) return `${tier}: a module of another tree listed`;
+      if (mods.some((m) => m.name.includes('/internal/') || m.name.includes('/testdata/'))) return `${tier}: internal or testdata modules listed`;
+      const missing = mods.filter((m) => !m.summary).map((m) => m.name);
+      if (missing.length) return `${tier}: no summary (a first comment block): ${missing.join(' ')}`;
+    }
+    return null;
   };
   cases['a module that does not compile is documented'] = () => {
     const f = path.join(tmp, 'doc_broken.ax');
@@ -3932,7 +3943,7 @@ if (!skipPlatform) {
       return null;
     },
     'x86_64-macos: the compiler': () => x86(path.join(root, 'cmd/axiom/src/main.ax'), 'x-axiom', ['-O2']),
-    'x86_64-macos: frameworks checked, examples on Metal built (structs on the stack: std/os/objc)': () => {
+    'x86_64-macos: frameworks checked, examples on Metal built (structs on the stack: lib/os/objc)': () => {
       for (const f of fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests/macos')).filter((n) => n.endsWith('.ax')).sort()) {
         const c = spawnSync(compiler, ['check', `cmd/axiom/internal/tests/macos/${f}`, '--target=x86_64-macos'], { encoding: 'utf8', cwd: root });
         if (c.status !== 0) return `${f}: check failed:\n${c.stdout}${c.stderr}`;
@@ -4002,7 +4013,7 @@ if (!skipPlatform) {
   const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
   const xvfb = ['xvfb-run'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
   const vulkan = ['/usr/share/vulkan/icd.d', '/etc/vulkan/icd.d'].some((d) => fs.existsSync(d) && fs.readdirSync(d).length > 0);
-  // An 8-bit RGBA PNG (what std/graphics/image/png writes for RGBA images).
+  // An 8-bit RGBA PNG (what lib/graphics/image/png writes for RGBA images).
   const decodePNG = (d) => {
     let at = 8, width = 0, height = 0;
     const idat = [];

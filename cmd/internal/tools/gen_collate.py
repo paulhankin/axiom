@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generates std/unicode/collate/tables.ax: the Default Unicode Collation
+"""Generates lib/unicode/collate/tables.ax: the Default Unicode Collation
 Element Table (DUCET) and the data for implicit weights, for
-std/unicode/collate (UTS #10).
+lib/unicode/collate (UTS #10).
 
     python3 cmd/internal/tools/gen_collate.py [UCD directory]   # default /usr/share/unicode
 
@@ -24,7 +24,7 @@ import subprocess
 import sys
 
 UCD = sys.argv[1] if len(sys.argv) > 1 else '/usr/share/unicode'
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'unicode', 'collate', 'tables.ax')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'lib', 'unicode', 'collate', 'tables.ax')
 
 
 def pack(ce):

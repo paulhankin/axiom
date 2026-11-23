@@ -8,28 +8,28 @@ reproducing a notice from this file, as each entry says.
 
 ## Code and data compiled into programs
 
-### FFmpeg (LGPL-2.1-or-later): `std/audio/aac.ax`, `std/audio/internal/aac/`
+### FFmpeg (LGPL-2.1-or-later): `lib/audio/aac.ax`, `lib/audio/internal/aac/`
 
-The AAC decoder (`std/audio/internal/aac/decoder.ax`, `sbr.ax`, `ps.ax`, `bits.ax`) follows
+The AAC decoder (`lib/audio/internal/aac/decoder.ax`, `sbr.ax`, `ps.ax`, `bits.ax`) follows
 FFmpeg's float AAC decoder (libavcodec/aacdec_template.c, aacsbr*.c, aacps*.c,
-sbrdsp_template.c) with the same arithmetic, and `std/audio/internal/aac/tables.ax` is generated
+sbrdsp_template.c) with the same arithmetic, and `lib/audio/internal/aac/tables.ax` is generated
 from FFmpeg's tables (libavcodec/aactab.c and others). These files are licensed under the
 GNU Lesser General Public License, version 2.1 or (at your option) any later version, as
-FFmpeg is; the text is in [`std/audio/internal/aac/LICENSE`](std/audio/internal/aac/LICENSE). FFmpeg is
+FFmpeg is; the text is in [`lib/audio/internal/aac/LICENSE`](lib/audio/internal/aac/LICENSE). FFmpeg is
 Copyright (c) the FFmpeg developers.
 
-Only `std/audio/aac.ax` imports these files, and nothing else in the repository imports it
-(`std/audio/formats.ax` reads AAC only when a program adds `aac.DECODER` to it); a program
-that does not import `std/audio/aac` does not include them. A program that does is a work that uses the
+Only `lib/audio/aac.ax` imports these files, and nothing else in the repository imports it
+(`lib/audio/formats.ax` reads AAC only when a program adds `aac.DECODER` to it); a program
+that does not import `lib/audio/aac` does not include them. A program that does is a work that uses the
 library under the LGPL's terms: whoever distributes it must also offer the LGPL-covered
 source and let recipients relink the program with a modified version of it (LGPL-2.1
 section 6), which for a statically compiled Axiom program means providing the program's
 object files or source.
 
-### libopus (BSD-3-Clause): `std/audio/opus.ax`, `std/audio/internal/opus/`
+### libopus (BSD-3-Clause): `lib/audio/opus.ax`, `lib/audio/internal/opus/`
 
 The Opus decoder and encoder are ported from libopus (CELT and SILK), and
-`std/audio/internal/opus/tables.ax` is generated from its tables.
+`lib/audio/internal/opus/tables.ax` is generated from its tables.
 
 ```
 Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
@@ -78,10 +78,10 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-### dav1d and rav1d (BSD-2-Clause): `std/graphics/image/internal/av1/`, `std/graphics/image/avif.ax`
+### dav1d and rav1d (BSD-2-Clause): `lib/graphics/image/internal/av1/`, `lib/graphics/image/avif.ax`
 
 The AV1 decoder follows dav1d, by way of its Rust port rav1d, so that its output is
-bit-exact; `std/graphics/image/internal/av1/cdf.ax`, `tables.ax` and `itx1d.ax` are generated or
+bit-exact; `lib/graphics/image/internal/av1/cdf.ax`, `tables.ax` and `itx1d.ax` are generated or
 translated from rav1d's sources.
 
 ```
@@ -137,7 +137,7 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### libwebp (BSD-3-Clause): `std/graphics/image/webp.ax`, `std/graphics/image/internal/webp/`
+### libwebp (BSD-3-Clause): `lib/graphics/image/webp.ax`, `lib/graphics/image/internal/webp/`
 
 The VP8 and lossless WebP decoders reproduce libwebp's decoding (its filtering,
 upsampling and fixed-point colour conversion) so that pixels match.
@@ -174,7 +174,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### The Independent JPEG Group's software: `std/graphics/image/jpeg.ax`
+### The Independent JPEG Group's software: `lib/graphics/image/jpeg.ax`
 
 The JPEG codec's inverse DCT is libjpeg's `jidctint`, and its upsampling and colour
 conversion follow libjpeg. This software is based in part on the work of the Independent
@@ -204,10 +204,10 @@ full responsibility for any undesirable consequences; the authors accept
 NO LIABILITY for damages of any kind.
 ```
 
-### HarfBuzz (Old MIT): `std/graphics/shape.ax`, `std/graphics/internal/shape/`
+### HarfBuzz (Old MIT): `lib/graphics/shape.ax`, `lib/graphics/internal/shape/`
 
 The text shaper follows HarfBuzz's implementation (buffers, normalization, the Arabic and
-Indic shapers, GSUB/GPOS matching), and `std/graphics/internal/shape/tables.ax` follows HarfBuzz's
+Indic shapers, GSUB/GPOS matching), and `lib/graphics/internal/shape/tables.ax` follows HarfBuzz's
 table generators.
 
 ```
@@ -283,7 +283,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Brotli (MIT): `std/compress/brotli/tables.ax`
+### Brotli (MIT): `lib/compress/brotli/tables.ax`
 
 The static dictionary and word transforms (RFC 7932 appendices A and B) are generated from
 the brotli sources.
@@ -310,7 +310,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Unicode data (Unicode License V3): `std/unicode/tables.ax`, `std/unicode/collate/tables.ax`, `std/graphics/internal/shape/tables.ax`
+### Unicode data (Unicode License V3): `std/unicode/tables.ax`, `lib/unicode/collate/tables.ax`, `lib/graphics/internal/shape/tables.ax`
 
 Generated from the Unicode Character Database and the Default Unicode Collation Element
 Table.
@@ -357,7 +357,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### Adobe Glyph List (BSD-3-Clause): `std/graphics/pdf/tables.ax`
+### Adobe Glyph List (BSD-3-Clause): `lib/graphics/pdf/tables.ax`
 
 The glyph-name-to-Unicode table is generated from the Adobe Glyph List.
 
@@ -394,13 +394,13 @@ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
 ```
 
-### Hyphenation patterns: `std/text/hyphen/en_us.ax`
+### Hyphenation patterns: `lib/text/hyphen/en_us.ax`
 
 The American English hyphenation patterns and exceptions are from the hyph-utf8 package
 (TeX's ushyphmax: Donald Knuth's patterns with Gerard D.C. Kuiken's additions); their
 copyright and permission notice is at the top of the file.
 
-### HTML named character references (CC BY 4.0): `std/text/internal/html/entities.ax`
+### HTML named character references (CC BY 4.0): `lib/text/internal/html/entities.ax`
 
 The table of named character references is from the WHATWG HTML Living Standard,
 Copyright © WHATWG (Apple, Google, Mozilla, Microsoft), licensed under the
@@ -408,13 +408,13 @@ Copyright © WHATWG (Apple, Google, Mozilla, Microsoft), licensed under the
 
 ## Test data (in the repository, not compiled into programs)
 
-- `std/text/html/testdata/`: from html5lib-tests (MIT).
-- `std/encoding/toml/testdata/`: from toml-test (MIT).
-- `std/encoding/yaml/testdata/`: from the YAML test suite (MIT).
-- `std/encoding/msgpack/testdata/`: from msgpack-test-suite (MIT).
-- `std/encoding/cbor/testdata/appendix_a.txt`: the examples of RFC 8949, Appendix A
+- `lib/text/html/testdata/`: from html5lib-tests (MIT).
+- `lib/encoding/toml/testdata/`: from toml-test (MIT).
+- `lib/encoding/yaml/testdata/`: from the YAML test suite (MIT).
+- `lib/encoding/msgpack/testdata/`: from msgpack-test-suite (MIT).
+- `lib/encoding/cbor/testdata/appendix_a.txt`: the examples of RFC 8949, Appendix A
   (IETF Trust; code components under the Revised BSD License).
-- `std/text/markdown/testdata/commonmark-0.31.2.txt`: the CommonMark Spec, by John
+- `lib/text/markdown/testdata/commonmark-0.31.2.txt`: the CommonMark Spec, by John
   MacFarlane, and `gfm-0.29.txt`: the GitHub Flavored Markdown Spec; both licensed under
   [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 - `std/time/tz/testdata/`: zones from the tz database (public domain).

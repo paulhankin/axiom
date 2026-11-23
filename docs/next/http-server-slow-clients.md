@@ -1,6 +1,6 @@
 ## Standard library
 
-- The `std/net/http` server no longer lets a few idle or slow clients take it offline
+- The `lib/net/http` server no longer lets a few idle or slow clients take it offline
   (issue #54). Its worker threads (`Options.threads`, still 8) now only answer requests:
   `run()`'s own thread waits on every connection with a `net.Poller` and hands one to a
   worker when bytes arrive, and the worker reads without waiting, so a connection
@@ -46,6 +46,6 @@
   of file descriptors, closes an idle connection. `run()`'s thread no longer serves
   connections itself: there are `threads` workers besides it. A program that builds
   `Options` with a struct literal must add the new fields; one that starts from
-  `Options.default()` gets them. `std/net/tls` can run a server handshake in steps
+  `Options.default()` gets them. `lib/net/tls` can run a server handshake in steps
   (`server_start`, `Conn.handshake_step` with `Conn.nonblocking`), `net.poll_one` waits
   for one socket, and `net.Poller.clear` empties a poller.

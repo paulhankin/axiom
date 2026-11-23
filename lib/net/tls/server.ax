@@ -1,0 +1,671 @@
+// =============================================================================
+// lib/net/tls/server.ax - TLS 1.3 and TLS 1.2 server handshake state machine,
+// ClientHello parsing, ServerHello building, and ALPN/suite selection
+// (part of lib/net/tls).
+// =============================================================================
+
+import "../../crypto/subtle.ax" as subtle;
+import "../../crypto/x509.ax" as x509;
+import "std/hash/sha2" as sha2;
+import "std/mem" as mem;
+import "std/net" as net;
+import "std/os/random" as random;
+import "std/time" as time;
+
+// -----------------------------------------------------------------------------
+// The server
+// -----------------------------------------------------------------------------
+
+/// Runs the server handshake on an accepted connection. The stream
+/// belongs to the Conn afterwards (and is closed if the handshake fails).
+pub fn server(stream: net.TcpStream, cfg: *ServerConfig) TlsError!*mut Conn {
+    let c = server_start(stream, cfg) catch |e| {
+        stream.close();
+        return e;
+    };
+    loop {
+        let done = c.handshake_step() catch |e| {
+            c.drop_server_state();
+            c.stream.close();
+            c.hs.deinit();
+            mem.destroy(c);
+            return e;
+        };
+        if done {
+            return c;
+        }
+    }
+}
+
+/// Starts a server handshake on an accepted connection without reading
+/// from it: handshake_step runs it. The stream belongs to the Conn (close()
+/// closes it and frees the Conn, the handshake done or not). The handshake
+/// must finish within HANDSHAKE_TIMEOUT_MS (Conn.deadline, which the caller
+/// may change).
+pub fn server_start(stream: net.TcpStream, cfg: *ServerConfig) TlsError!*mut Conn {
+    let c = new_conn(stream, false)!;
+    let st = mem.new_zeroed.[ServerHs]() catch |e| {
+        c.hs.deinit();
+        mem.destroy(c);
+        return e;
+    };
+    st.cfg = cfg;
+    st.phase = PHASE_HELLO;
+    st.tr = Transcript.init();
+    st.ks = KeySchedule.init(sha2.Algorithm.SHA256);
+    st.sw = Cipher.none();
+    c.srv = st;
+    c.has_srv = true;
+    c.deadline = time.Instant.now().ns + (HANDSHAKE_TIMEOUT_MS * 1000000);
+    return c;
+}
+
+/// Parses one handshake message as a connection would: a ServerHello (type
+/// 2, as a client reads it) or a ClientHello (type 1, as a server reads
+/// it), `msg` being the message with its 4-byte header. Fails as the
+/// handshake would on a malformed message. For tests and the fuzzer: no
+/// connection is involved.
+pub fn parse_hello(msg: []u8) TlsError!void {
+    if msg.len < 4 {
+        return error.DecodeError;
+    }
+    if msg[0] == 2 {
+        _ = parse_server_hello(msg)!;
+        return;
+    }
+    if msg[0] != 1 {
+        return error.UnexpectedMessage;
+    }
+    let c = new_conn(net.TcpStream.{ handle: -1 }, false)!;
+    defer mem.destroy(c);
+    defer c.hs.deinit();
+    _ = parse_client_hello(c, msg)!;
+}
+
+/// What the server takes from a ClientHello.
+struct Hello {
+    session_id: []u8,
+    suite: u16,
+    tls13: bool,
+    legacy_version: u16,
+    random: []u8,
+    suites: []u8,  // the cipher_suites list
+    wants_p384: bool,
+    ems: bool,    // extended_master_secret offered
+    reneg: bool,  // renegotiation_info (empty) or its signalling suite offered
+    point_formats: bool,
+    fallback: bool,  // TLS_FALLBACK_SCSV
+    group: u16,      // the group of a usable share (0: none)
+    share: []u8,
+    wants_x25519: bool,  // listed in supported_groups
+    wants_p256: bool,
+    schemes: []u8,
+    alpn: []u8,  // the protocol_name_list
+    cookie: []u8,
+}
+
+fn parse_client_hello(c: *mut Conn, msg: []u8) TlsError!Hello {
+    let mut h = Hello.{ session_id: "", suite: 0, tls13: false, legacy_version: 0, random: "", suites: "",
+                        wants_p384: false, ems: false, reneg: false, point_formats: false, fallback: false, group: 0,
+                        share: "", wants_x25519: false, wants_p256: false, schemes: "", alpn: "", cookie: "" };
+    let mut r = cur(msg[4..]);
+    h.legacy_version = r.get16()!;
+    h.random = r.bytes(32)!;
+    h.session_id = r.vec8()!;
+    h.suites = r.vec16()!;
+    let mut suites = cur(h.suites);
+    // our preference: ChaCha20 (fastest in software), then AES-128, AES-256
+    let mut best: u32 = 99;
+    while not suites.done() {
+        let s = suites.get16()!;
+        let mut rank: u32 = 99;
+        if s == EMPTY_RENEGOTIATION_INFO_SCSV {
+            h.reneg = true;
+        } else if s == FALLBACK_SCSV {
+            h.fallback = true;
+        }
+        if s == TLS_CHACHA20_POLY1305_SHA256 {
+            rank = 0;
+        } else if s == TLS_AES_128_GCM_SHA256 {
+            rank = 1;
+        } else if s == TLS_AES_256_GCM_SHA384 {
+            rank = 2;
+        }
+        if rank < best {
+            best = rank;
+            h.suite = s;
+        }
+    }
+    _ = r.vec8()!;
+    if r.done() {
+        return h;  // no extensions: not TLS 1.3
+    }
+    let mut e = cur(r.vec16()!);
+    while not e.done() {
+        let ty = e.get16()!;
+        let data = e.vec16()!;
+        let mut d = cur(data);
+        if ty == EXT_SUPPORTED_VERSIONS {
+            let mut vs = cur(d.vec8()!);
+            while not vs.done() {
+                if vs.get16()! == 0x0304 {
+                    h.tls13 = true;
+                }
+            }
+        } else if ty == EXT_SUPPORTED_GROUPS {
+            let mut gs = cur(d.vec16()!);
+            while not gs.done() {
+                let g = gs.get16()!;
+                if g == GROUP_X25519 {
+                    h.wants_x25519 = true;
+                } else if g == GROUP_P256 {
+                    h.wants_p256 = true;
+                } else if g == GROUP_P384 {
+                    h.wants_p384 = true;
+                }
+            }
+        } else if ty == EXT_KEY_SHARE {
+            let mut ks = cur(d.vec16()!);
+            while not ks.done() {
+                let g = ks.get16()!;
+                let k = ks.vec16()!;
+                if (g == GROUP_X25519) and (h.group != GROUP_X25519) {
+                    h.group = g;
+                    h.share = k;
+                } else if (g == GROUP_P256) and (h.group == 0) {
+                    h.group = g;
+                    h.share = k;
+                }
+            }
+        } else if ty == EXT_SIGNATURE_ALGORITHMS {
+            h.schemes = d.vec16()!;
+        } else if ty == EXT_ALPN {
+            h.alpn = d.vec16()!;
+        } else if ty == EXT_COOKIE {
+            h.cookie = d.vec16()!;
+        } else if ty == EXT_EXTENDED_MASTER_SECRET {
+            h.ems = true;
+        } else if ty == EXT_RENEGOTIATION_INFO {
+            let ri = d.vec8()!;
+            if ri.len != 0 {
+                return error.HandshakeFailure;  // not an initial handshake
+            }
+            h.reneg = true;
+        } else if ty == EXT_EC_POINT_FORMATS {
+            h.point_formats = true;
+        } else if ty == EXT_SERVER_NAME {
+            let mut l = cur(d.vec16()!);
+            if l.get8()! == 0 {
+                // (the name reaches the program: no control bytes, no
+                // slashes, nothing past 255 bytes)
+                let name = l.vec16()!;
+                if not is_host_name(name) {
+                    return error.IllegalParameter;
+                }
+                @mem_copy(c.sni[..name.len], name);
+                c.sni_len = name.len;
+            }
+        }
+    }
+    return h;
+}
+
+fn server_hello(sid: []u8, suite: u16, hrr: bool, group: u16, share: []u8) TlsError!Out {
+    let mut o = out();
+    o.put8(HS_SERVER_HELLO)!;
+    let body = o.open(3)!;
+    o.put16(0x0303)!;
+    if hrr {
+        o.put(HRR_RANDOM[..])!;
+    } else {
+        let mut rnd: [32]u8 = [0; 32];
+        random.fill(rnd[..])!;
+        o.put(rnd[..])!;
+    }
+    o.put8(@truncate(u8, sid.len))!;
+    o.put(sid)!;
+    o.put16(suite)!;
+    o.put8(0)!;
+    let exts = o.open(2)!;
+    o.put16(EXT_SUPPORTED_VERSIONS)!;
+    o.put16(2)!;
+    o.put16(0x0304)!;
+    o.put16(EXT_KEY_SHARE)!;
+    if hrr {
+        o.put16(2)!;
+        o.put16(group)!;
+    } else {
+        let k = o.open(2)!;
+        o.put16(group)!;
+        o.put16(@truncate(u16, share.len))!;
+        o.put(share)!;
+        o.close(k, 2);
+    }
+    o.close(exts, 2);
+    o.close(body, 3);
+    return o;
+}
+
+// The alert for a ClientHello that parse_client_hello refused.
+fn hello_alert(e: error) u8 {
+    if e == error.IllegalParameter {
+        return ALERT_ILLEGAL_PARAMETER;
+    }
+    if e == error.DecodeError {
+        return ALERT_DECODE_ERROR;
+    }
+    return ALERT_HANDSHAKE_FAILURE;
+}
+
+/// A server's handshake between steps (server_start, handshake_step).
+nocopy struct ServerHs {
+    cfg: *ServerConfig,
+    phase: u8,
+    tr: Transcript,
+    ks: KeySchedule,  // (TLS 1.3)
+    sid: [32]u8,      // the client's legacy session id, echoed
+    sid_len: usize,
+    sent_ccs: bool,
+    hrr_group: u16,  // the group a HelloRetryRequest asked for
+    eph: Eph,        // (TLS 1.2) our share, the randoms, the master secret
+    cr: [32]u8,
+    sr: [32]u8,
+    ems: bool,
+    master: [48]u8,
+    sw: Cipher,  // (TLS 1.2) our write keys after our ChangeCipherSpec
+}
+
+// What a server's handshake waits for next.
+const PHASE_HELLO: u8 = 0;           // the ClientHello
+const PHASE_HELLO2: u8 = 1;          // the ClientHello after a HelloRetryRequest
+const PHASE_FINISHED: u8 = 2;        // (1.3) the client's Finished
+const PHASE_KEY_EXCHANGE12: u8 = 3;  // (1.2) ClientKeyExchange
+const PHASE_FINISHED12: u8 = 4;      // (1.2) ChangeCipherSpec and Finished
+
+// The ClientHello: a HelloRetryRequest, or our flight.
+fn srv_hello(c: *mut Conn, st: *mut ServerHs) TlsError!void {
+    let cfg = st.cfg;
+    let msg = c.expect_message(HS_CLIENT_HELLO)!;
+    let hello = parse_client_hello(c, msg) catch |e| {
+        return c.fail(hello_alert(e), e);
+    };
+    if not hello.tls13 {
+        if cfg.min_version > VERSION_1_2 {
+            return c.fail(ALERT_PROTOCOL_VERSION, error.ProtocolVersion);
+        }
+        return srv12_flight(c, st, msg, hello);
+    }
+    if (hello.suite == 0) or (hello.schemes.len == 0) {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
+    }
+    c.suite = suite_of(hello.suite)!;
+    let hash = c.suite.hash;
+    let hl = sha2.digest_size(hash);
+    st.tr.add(msg)!;
+    st.sid_len = @min(hello.session_id.len, 32);
+    @mem_copy(st.sid[..st.sid_len], hello.session_id[..st.sid_len]);
+    if hello.group != 0 {
+        return srv13_flight(c, st, hello);
+    }
+    // no usable share: ask for one (HelloRetryRequest)
+    let mut g: u16 = 0;
+    if hello.wants_x25519 {
+        g = GROUP_X25519;
+    } else if hello.wants_p256 {
+        g = GROUP_P256;
+    } else {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
+    }
+    let mut h1: [48]u8 = [0; 48];
+    sha2.hash(hash, st.tr.pending.bytes(), h1[..]);
+    st.tr.pending.clear();
+    let hdr: [4]u8 = [HS_MESSAGE_HASH, 0, 0, @truncate(u8, hl)];
+    st.tr.add(hdr[..])!;
+    st.tr.add(h1[..hl])!;
+    let mut hrr = server_hello(st.sid[..st.sid_len], hello.suite, true, g, "")!;
+    defer hrr.s.deinit();
+    st.tr.add(hrr.bytes())!;
+    c.send_handshake(hrr.bytes())!;
+    if st.sid_len > 0 {
+        let ccs: [1]u8 = [1];
+        c.send_record(CT_CHANGE_CIPHER_SPEC, ccs[..])!;
+        st.sent_ccs = true;
+    }
+    st.hrr_group = g;
+    st.phase = PHASE_HELLO2;
+}
+
+// The second ClientHello, with a share of the group asked for.
+fn srv_hello2(c: *mut Conn, st: *mut ServerHs) TlsError!void {
+    let msg = c.expect_message(HS_CLIENT_HELLO)!;
+    let hello = parse_client_hello(c, msg) catch |e| {
+        return c.fail(hello_alert(e), e);
+    };
+    if (hello.group != st.hrr_group) or (hello.suite != c.suite.id) {
+        return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
+    }
+    st.tr.add(msg)!;
+    return srv13_flight(c, st, hello);
+}
+
+// TLS 1.3: our flight, from ServerHello to Finished.
+fn srv13_flight(c: *mut Conn, st: *mut ServerHs, hello: Hello) TlsError!void {
+    let cfg = st.cfg;
+    let hash = c.suite.hash;
+    let hl = sha2.digest_size(hash);
+    let tr = &mut st.tr;
+    tr.start(hash);
+    // our share and the shared secret
+    let mut shares = make_shares()!;
+    let mut shared_buf: [48]u8 = [0; 48];
+    let shared = agree(&shares, hello.group, hello.share, shared_buf[..]) catch return c.fail(
+        ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
+    let mut ours: []u8 = shares.x25519.public[..];
+    if hello.group == GROUP_P256 {
+        ours = shares.p256_pub[..];
+    }
+    let mut sh = server_hello(st.sid[..st.sid_len], hello.suite, false, hello.group, ours)!;
+    tr.add(sh.bytes())!;
+    c.send_handshake(sh.bytes())!;
+    sh.s.deinit();
+    if (st.sid_len > 0) and not st.sent_ccs {
+        let ccs: [1]u8 = [1];
+        c.send_record(CT_CHANGE_CIPHER_SPEC, ccs[..])!;
+    }
+    st.ks = KeySchedule.init(hash);
+    let ks = &mut st.ks;
+    let mut th: [48]u8 = [0; 48];
+    ks.handshake(shared, tr.current(th[..]));
+    c.wr.set(c.suite, ks.server_hs[..hl])!;
+    c.handshake_read_key(ks.client_hs[..hl])!;
+    // EncryptedExtensions, with the ALPN choice
+    let mut ee = out();
+    defer ee.s.deinit();
+    ee.put8(HS_ENCRYPTED_EXTENSIONS)!;
+    let eb = ee.open(3)!;
+    let el = ee.open(2)!;
+    let chosen = choose_alpn(cfg.alpn, hello.alpn);
+    if chosen.len > 0 {
+        ee.put16(EXT_ALPN)!;
+        let a = ee.open(2)!;
+        let al = ee.open(2)!;
+        ee.put8(@truncate(u8, chosen.len))!;
+        ee.put(chosen)!;
+        ee.close(al, 2);
+        ee.close(a, 2);
+        @mem_copy(c.alpn_selected[..chosen.len], chosen);
+        c.alpn_len = chosen.len;
+    } else if (hello.alpn.len > 0) and (cfg.alpn.len > 0) {
+        return c.fail(ALERT_NO_APPLICATION_PROTOCOL, error.HandshakeFailure);
+    }
+    ee.close(el, 2);
+    ee.close(eb, 3);
+    tr.add(ee.bytes())!;
+    c.send_handshake(ee.bytes())!;
+    // Certificate
+    let mut cm = out();
+    defer cm.s.deinit();
+    cm.put8(HS_CERTIFICATE)!;
+    let cb = cm.open(3)!;
+    cm.put8(0)!;
+    let cl = cm.open(3)!;
+    for d in cfg.chain.items() {
+        cm.put24(d.len)!;
+        cm.put(d)!;
+        cm.put16(0)!;
+    }
+    cm.close(cl, 3);
+    cm.close(cb, 3);
+    tr.add(cm.bytes())!;
+    c.send_handshake(cm.bytes())!;
+    // CertificateVerify
+    let mut content_buf: [200]u8 = [0; 200];
+    let content = verify_content(true, tr.current(th[..]), content_buf[..]);
+    let mut sig_buf: [1024]u8 = [0; 1024];
+    let mut scheme: u16 = 0;
+    let sig = sign_content(cfg, hello.schemes, content, sig_buf[..], &mut scheme) catch |e| {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, e);
+    };
+    let mut cv = out();
+    defer cv.s.deinit();
+    cv.put8(HS_CERTIFICATE_VERIFY)!;
+    let vb = cv.open(3)!;
+    cv.put16(scheme)!;
+    cv.put16(@truncate(u16, sig.len))!;
+    cv.put(sig)!;
+    cv.close(vb, 3);
+    tr.add(cv.bytes())!;
+    c.send_handshake(cv.bytes())!;
+    // Finished
+    let mut fin: [52]u8 = [0; 52];
+    fin[0] = HS_FINISHED;
+    fin[3] = @truncate(u8, hl);
+    finished_mac(hash, ks.server_hs[..hl], tr.current(th[..]), fin[4..4 + hl]);
+    tr.add(fin[..4 + hl])!;
+    c.send_handshake(fin[..4 + hl])!;
+    ks.application(tr.current(th[..]));
+    c.wr.set(c.suite, ks.server_ap[..hl])!;
+    st.phase = PHASE_FINISHED;
+}
+
+// TLS 1.3: the client's Finished.
+fn srv13_finished(c: *mut Conn, st: *mut ServerHs) TlsError!void {
+    let hash = c.suite.hash;
+    let hl = sha2.digest_size(hash);
+    let ks = &st.ks;
+    let cf = c.expect_message(HS_FINISHED)!;
+    let mut th: [48]u8 = [0; 48];
+    let mut want: [48]u8 = [0; 48];
+    finished_mac(hash, ks.client_hs[..hl], st.tr.current(th[..]), want[..hl]);
+    if (cf.len != (4 + hl)) or not subtle.equal(cf[4..], want[..hl]) {
+        return c.fail(ALERT_DECRYPT_ERROR, error.HandshakeFailure);
+    }
+    c.handshake_read_key(ks.client_ap[..hl])!;
+    c.established = true;
+    @mem_copy(c.secret_rd[..hl], ks.client_ap[..hl]);
+    @mem_copy(c.secret_wr[..hl], ks.server_ap[..hl]);
+}
+
+/// The first of our protocols that the client offers ("" if none).
+fn choose_alpn(ours: [][]u8, offered: []u8) []u8 {
+    for p in ours {
+        let mut l = cur(offered);
+        while not l.done() {
+            let q = l.vec8() catch return "";
+            if @mem_eq(p, q) {
+                return p;
+            }
+        }
+    }
+    return "";
+}
+
+// -----------------------------------------------------------------------------
+// TLS 1.2 server handshake
+// -----------------------------------------------------------------------------
+
+// The best TLS 1.2 suite the client offers for our key: ChaCha20, AES-128,
+// AES-256; ECDSA suites for EC and Ed25519 keys, RSA ones for RSA keys.
+fn choose_suite12(offered: []u8, kind: x509.KeyKind) u16 {
+    let mut prefs: [3]u16 = [ECDHE_ECDSA_CHACHA20_POLY1305, ECDHE_ECDSA_AES_128_GCM_SHA256,
+                             ECDHE_ECDSA_AES_256_GCM_SHA384];
+    if kind == x509.KeyKind.RSA {
+        prefs = [ECDHE_RSA_CHACHA20_POLY1305, ECDHE_RSA_AES_128_GCM_SHA256, ECDHE_RSA_AES_256_GCM_SHA384];
+    }
+    for x in prefs {
+        if scheme_offered(offered, x) {
+            return x;
+        }
+    }
+    return 0;
+}
+
+// TLS 1.2, after the ClientHello: our flight, from ServerHello to
+// ServerHelloDone. The client's answer is read by srv12_key_exchange and
+// srv12_finished.
+fn srv12_flight(c: *mut Conn, st: *mut ServerHs, ch_msg: []u8, hello: Hello) TlsError!void {
+    let cfg = st.cfg;
+    let tr = &mut st.tr;
+    c.v12 = true;
+    if hello.legacy_version < VERSION_1_2 {
+        return c.fail(ALERT_PROTOCOL_VERSION, error.ProtocolVersion);
+    }
+    if hello.fallback {
+        // a client retrying with a lower version than it could: we speak 1.3
+        return c.fail(ALERT_INAPPROPRIATE_FALLBACK, error.ProtocolVersion);
+    }
+    let id = choose_suite12(hello.suites, cfg.key_kind);
+    if (id == 0) or (hello.schemes.len == 0) {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
+    }
+    let mut group: u16 = 0;
+    if hello.wants_x25519 {
+        group = GROUP_X25519;
+    } else if hello.wants_p256 {
+        group = GROUP_P256;
+    } else if hello.wants_p384 {
+        group = GROUP_P384;
+    } else {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
+    }
+    c.suite = suite_of(id)!;
+    @mem_copy(st.cr[..], hello.random);
+    st.ems = hello.ems;
+    tr.add(ch_msg)!;
+    // ServerHello
+    random.fill(st.sr[..24])!;
+    @mem_copy(st.sr[24..], DOWNGRADE_12[..]);  // we speak 1.3 (RFC 8446 4.1.3)
+    let mut o = out();
+    defer o.s.deinit();
+    o.put8(HS_SERVER_HELLO)!;
+    let body = o.open(3)!;
+    o.put16(VERSION_1_2)!;
+    o.put(st.sr[..])!;
+    o.put8(0)!;  // no session id: no resumption
+    o.put16(id)!;
+    o.put8(0)!;
+    let exts = o.open(2)!;
+    if hello.reneg {
+        o.put16(EXT_RENEGOTIATION_INFO)!;
+        o.put16(1)!;
+        o.put8(0)!;
+    }
+    if hello.ems {
+        o.put16(EXT_EXTENDED_MASTER_SECRET)!;
+        o.put16(0)!;
+    }
+    if hello.point_formats {
+        o.put16(EXT_EC_POINT_FORMATS)!;
+        o.put16(2)!;
+        o.put8(1)!;
+        o.put8(0)!;
+    }
+    let chosen = choose_alpn(cfg.alpn, hello.alpn);
+    if chosen.len > 0 {
+        o.put16(EXT_ALPN)!;
+        let a = o.open(2)!;
+        let al = o.open(2)!;
+        o.put8(@truncate(u8, chosen.len))!;
+        o.put(chosen)!;
+        o.close(al, 2);
+        o.close(a, 2);
+        @mem_copy(c.alpn_selected[..chosen.len], chosen);
+        c.alpn_len = chosen.len;
+    } else if (hello.alpn.len > 0) and (cfg.alpn.len > 0) {
+        return c.fail(ALERT_NO_APPLICATION_PROTOCOL, error.HandshakeFailure);
+    }
+    o.close(exts, 2);
+    o.close(body, 3);
+    tr.add(o.bytes())!;
+    tr.start(c.suite.hash);
+    c.send_handshake(o.bytes())!;
+    // Certificate
+    let mut cm = out();
+    defer cm.s.deinit();
+    cm.put8(HS_CERTIFICATE)!;
+    let cb = cm.open(3)!;
+    let cl = cm.open(3)!;
+    for d in cfg.chain.items() {
+        cm.put24(d.len)!;
+        cm.put(d)!;
+    }
+    cm.close(cl, 3);
+    cm.close(cb, 3);
+    tr.add(cm.bytes())!;
+    c.send_handshake(cm.bytes())!;
+    // ServerKeyExchange: our share, signed with the randoms
+    st.eph = eph_new(group)!;
+    let pl = st.eph.public_len;
+    let mut params: [101]u8 = [0; 101];
+    params[0] = 3;
+    params[1] = @truncate(u8, group >> 8);
+    params[2] = @truncate(u8, group);
+    params[3] = @truncate(u8, pl);
+    @mem_copy(params[4..4 + pl], st.eph.public[..pl]);
+    let mut content: [168]u8 = [0; 168];
+    @mem_copy(content[..32], st.cr[..]);
+    @mem_copy(content[32..64], st.sr[..]);
+    @mem_copy(content[64..68 + pl], params[..4 + pl]);
+    let mut sig_buf: [1024]u8 = [0; 1024];
+    let mut scheme: u16 = 0;
+    let sig = sign_content12(cfg, hello.schemes, content[..68 + pl], sig_buf[..], &mut scheme) catch |e| {
+        return c.fail(ALERT_HANDSHAKE_FAILURE, e);
+    };
+    let mut sk = out();
+    defer sk.s.deinit();
+    sk.put8(HS_SERVER_KEY_EXCHANGE)!;
+    let skb = sk.open(3)!;
+    sk.put(params[..4 + pl])!;
+    sk.put16(scheme)!;
+    sk.put16(@truncate(u16, sig.len))!;
+    sk.put(sig)!;
+    sk.close(skb, 3);
+    tr.add(sk.bytes())!;
+    c.send_handshake(sk.bytes())!;
+    let done: [4]u8 = [HS_SERVER_HELLO_DONE, 0, 0, 0];
+    tr.add(done[..])!;
+    c.send_handshake(done[..])!;
+    st.phase = PHASE_KEY_EXCHANGE12;
+}
+
+// TLS 1.2: the client's ClientKeyExchange.
+fn srv12_key_exchange(c: *mut Conn, st: *mut ServerHs) TlsError!void {
+    let cke = c.expect_message(HS_CLIENT_KEY_EXCHANGE)!;
+    let mut r = cur(cke[4..]);
+    let point = r.vec8()!;
+    if not r.done() {
+        return c.fail(ALERT_DECODE_ERROR, error.DecodeError);
+    }
+    let mut pms_buf: [48]u8 = [0; 48];
+    let pms = eph_agree(&st.eph, point, pms_buf[..]) catch return c.fail(
+        ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
+    st.tr.add(cke)!;
+    let mut th: [48]u8 = [0; 48];
+    master12(c.suite.hash, pms, st.ems, st.tr.current(th[..]), st.cr[..], st.sr[..], st.master[..]);
+    keys12(c.suite, st.master[..], st.cr[..], st.sr[..], &mut c.rd_next, &mut st.sw)!;
+    c.ccs_expected = true;
+    st.phase = PHASE_FINISHED12;
+}
+
+// TLS 1.2: the client's ChangeCipherSpec and Finished, then ours.
+fn srv12_finished(c: *mut Conn, st: *mut ServerHs) TlsError!void {
+    let hash = c.suite.hash;
+    let cf = c.expect_message(HS_FINISHED)!;
+    if c.ccs_expected {
+        return c.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+    }
+    let mut th: [48]u8 = [0; 48];
+    let mut want: [16]u8 = [0; 16];
+    let w = finished12(hash, st.master[..], "client finished", st.tr.current(th[..]), want[..]);
+    if not subtle.equal(cf, w) {
+        return c.fail(ALERT_DECRYPT_ERROR, error.HandshakeFailure);
+    }
+    st.tr.add(cf)!;
+    // ours
+    let ccs: [1]u8 = [1];
+    c.send_record(CT_CHANGE_CIPHER_SPEC, ccs[..])!;
+    c.wr = st.sw;
+    let mut fin: [16]u8 = [0; 16];
+    c.send_handshake(finished12(hash, st.master[..], "server finished", st.tr.current(th[..]), fin[..]))!;
+    c.established = true;
+}

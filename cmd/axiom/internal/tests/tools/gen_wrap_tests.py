@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/text/wrap/testdata/cases.json: random ASCII texts wrapped,
+"""Generates lib/text/wrap/testdata/cases.json: random ASCII texts wrapped,
 dedented and indented by Python's textwrap.
 
 Each case is an object: {"op": "wrap", "text", "width", "initial_indent",
@@ -115,7 +115,7 @@ for i in range(100):
     cases.append({'op': 'indent', 'text': t, 'prefix': prefix, 'want': textwrap.indent(t, prefix)})
 
 here = os.path.dirname(os.path.abspath(__file__))
-out = os.path.join(here, '..', '..', '..', '..', '..', 'std', 'text', 'wrap', 'testdata', 'cases.json')
+out = os.path.join(here, '..', '..', '..', '..', '..', 'lib', 'text', 'wrap', 'testdata', 'cases.json')
 with open(out, 'w') as f:
     f.write('[\n')
     f.write(',\n'.join(json.dumps(c) for c in cases))

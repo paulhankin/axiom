@@ -1,0 +1,822 @@
+// =============================================================================
+// lib/unicode/segment.ax - text segmentation (UAX #29): extended grapheme
+// clusters, words and sentences; title case, by words; and the width of
+// text in a terminal.
+//
+//     let mut g = segment.graphemes("e\u{301}🇫🇷");  // "é", "🇫🇷"
+//     segment.grapheme_count("\r\nab")              // 3
+//     let mut w = segment.words("Hello, world!");     // "Hello", ",", " ", ...
+//     let mut s = segment.sentences("Hi. Bye.");      // "Hi. ", "Bye."
+//     let cols = segment.string_width("日本語");       // 6 terminal columns
+//     let t = segment.title("hello wORLD")!;            // "Hello World"; mem.free it
+//
+// The break properties are std/unicode's (grapheme_break, word_break,
+// sentence_break), from the same tables (std/unicode/tables). Text is UTF-8;
+// invalid bytes read as U+FFFD.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/mem" as mem;
+import "std/str" as strs;
+import "std/unicode" as uni;
+import "std/unicode/tables" as t;
+
+// The property record of a code point (as std/unicode reads it).
+fn rec(cp: u32) u64 {
+    if cp < t.LOW_LIMIT {
+        return t.RECORDS[@as(usize, t.LOW[@as(usize, cp)])];
+    }
+    let c = @min(cp, 0x10FFFF);
+    let runs = t.RUN_START[..];
+    let mut lo: usize = 0;
+    let mut hi = runs.len;
+    while (hi - lo) > 1 {
+        let mid = (lo + hi) / 2;
+        if runs[mid] <= c {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return t.RECORDS[@as(usize, t.RUN_RECORD[lo])];
+}
+
+fn field(r: u64, off: u32, bits: u32) u32 {
+    return @truncate(u32, (r >> @as(u64, off)) & ((@as(u64, 1) << @as(u64, bits)) - 1));
+}
+
+// -----------------------------------------------------------------------------
+// Width
+// -----------------------------------------------------------------------------
+
+/// The columns text takes in a terminal: each grapheme cluster as wide as
+/// its first character (emoji sequences and characters followed by the
+/// emoji variation selector U+FE0F are 2); control characters count 0.
+pub fn string_width(s: []u8) usize {
+    let mut total: usize = 0;
+    let mut g = graphemes(s);
+    loop {
+        let cl = g.next() ?? break;
+        let first = strs.decode_rune(cl);
+        let mut w = uni.width(first.value);
+        if w < 0 {
+            w = 0;
+        }
+        if (w == 1) and (cl.len > first.len) and uni.is_extended_pictographic(first.value) {
+            // emoji presentation asked for, or an emoji sequence
+            let mut i = first.len;
+            while i < cl.len {
+                let r = strs.decode_rune(cl[i..]);
+                if (r.value == 0xfe0f) or (r.value == 0x200d) {
+                    w = 2;
+                }
+                i += r.len;
+            }
+        }
+        if (w == 1) and (cl.len > first.len) and (uni.grapheme_break(first.value) == t.GB_REGIONAL_INDICATOR) {
+            w = 2;  // a flag
+        }
+        total += @as(usize, @bit_cast(u32, w));
+    }
+    return total;
+}
+
+// -----------------------------------------------------------------------------
+// Segmentation (UAX #29)
+// -----------------------------------------------------------------------------
+
+/// Where the code point before position i starts.
+fn prev_start(s: []u8, i: usize) usize {
+    let mut k = i - 1;
+    let mut n: usize = 0;
+    while (k > 0) and ((s[k] & 0xc0) == 0x80) and (n < 3) {
+        k -= 1;
+        n += 1;
+    }
+    // accept the lead byte only if it really spans to i
+    let r = strs.decode_rune(s[k..]);
+    if (k + r.len) == i {
+        return k;
+    }
+    return i - 1;
+}
+
+const INCB_LINKER: u32 = 1;
+const INCB_CONSONANT: u32 = 2;
+const INCB_EXTEND: u32 = 3;
+
+/// Extended grapheme clusters of text, in order.
+pub struct Graphemes {
+    s: []u8,
+    pos: usize,
+
+    /// The next cluster, or .none.
+    pub fn next(self: *mut Graphemes) ?[]u8 {
+        if self.pos >= self.s.len {
+            return .none;
+        }
+        let start = self.pos;
+        let s = self.s;
+        // two ASCII characters always break, except CR LF (no ASCII
+        // character extends or prepends)
+        let b0 = s[start];
+        if (b0 < 0x80) and
+           (((start + 1) == s.len) or ((s[start + 1] < 0x80) and not ((b0 == '\r') and (s[start + 1] == '\n')))) {
+            self.pos = start + 1;
+            return s[start..start + 1];
+        }
+        let first = strs.decode_rune(s[start..]);
+        let mut i = start + first.len;
+        let mut prev = rec(first.value);
+        let mut pgb = field(prev, t.F_GB, t.W_GB);
+        // state for GB11 (emoji ZWJ sequences), GB12/13 (flags), GB9c (conjuncts)
+        let mut emoji = field(prev, t.F_EXT_PICT, 1) == 1;  // ExtPict Extend*
+        let mut emoji_zwj = false;  // ExtPict Extend* ZWJ
+        let mut ri: u32 = 0;
+        if pgb == t.GB_REGIONAL_INDICATOR {
+            ri = 1;
+        }
+        let pincb = field(prev, t.F_INCB, t.W_INCB);
+        let mut conj: u32 = 0;  // 1: after a consonant, 2: and a linker since
+        if pincb == INCB_CONSONANT {
+            conj = 1;
+        }
+        while i < s.len {
+            let r = strs.decode_rune(s[i..]);
+            let cur = rec(r.value);
+            let gb = field(cur, t.F_GB, t.W_GB);
+            let incb = field(cur, t.F_INCB, t.W_INCB);
+            let ext_pict = field(cur, t.F_EXT_PICT, 1) == 1;
+            if not grapheme_joins(pgb, gb, emoji_zwj and ext_pict, ri, (conj == 2) and (incb == INCB_CONSONANT)) {
+                break;
+            }
+            // advance the state
+            if emoji and (gb == t.GB_EXTEND) {
+                // still ExtPict Extend*
+            } else if emoji and (gb == t.GB_ZWJ) {
+                emoji = false;
+                emoji_zwj = true;
+            } else {
+                emoji_zwj = false;
+                emoji = ext_pict;
+            }
+            if gb == t.GB_REGIONAL_INDICATOR {
+                ri += 1;
+            } else {
+                ri = 0;
+            }
+            if incb == INCB_CONSONANT {
+                conj = 1;
+            } else if (conj > 0) and (incb == INCB_LINKER) {
+                conj = 2;
+            } else if (conj > 0) and (incb == INCB_EXTEND) {
+                // unchanged
+            } else {
+                conj = 0;
+            }
+            pgb = gb;
+            i += r.len;
+        }
+        self.pos = i;
+        return s[start..i];
+    }
+}
+
+/// Whether there is no break between characters of classes a and b.
+fn grapheme_joins(a: u32, b: u32, gb11: bool, ri: u32, gb9c: bool) bool {
+    if (a == t.GB_CR) and (b == t.GB_LF) {
+        return true;
+    }
+    if (a == t.GB_CONTROL) or (a == t.GB_CR) or (a == t.GB_LF) {
+        return false;
+    }
+    if (b == t.GB_CONTROL) or (b == t.GB_CR) or (b == t.GB_LF) {
+        return false;
+    }
+    if (a == t.GB_L) and ((b == t.GB_L) or (b == t.GB_V) or (b == t.GB_LV) or (b == t.GB_LVT)) {
+        return true;
+    }
+    if ((a == t.GB_LV) or (a == t.GB_V)) and ((b == t.GB_V) or (b == t.GB_T)) {
+        return true;
+    }
+    if ((a == t.GB_LVT) or (a == t.GB_T)) and (b == t.GB_T) {
+        return true;
+    }
+    if (b == t.GB_EXTEND) or (b == t.GB_ZWJ) or (b == t.GB_SPACINGMARK) {
+        return true;
+    }
+    if a == t.GB_PREPEND {
+        return true;
+    }
+    if gb9c or gb11 {
+        return true;
+    }
+    if (a == t.GB_REGIONAL_INDICATOR) and (b == t.GB_REGIONAL_INDICATOR) and ((ri % 2) == 1) {
+        return true;
+    }
+    return false;
+}
+
+pub fn graphemes(s: []u8) Graphemes {
+    return Graphemes.{ s: s, pos: 0 };
+}
+
+/// How many grapheme clusters (user-perceived characters) text has.
+pub fn grapheme_count(s: []u8) usize {
+    let mut g = graphemes(s);
+    let mut n: usize = 0;
+    loop {
+        _ = g.next() ?? break;
+        n += 1;
+    }
+    return n;
+}
+
+// Words ------------------------------------------------------------------------
+
+fn wb_at(s: []u8, i: usize) u32 {
+    return (uni.word_break(strs.decode_rune(s[i..]).value));
+}
+
+fn wb_ignorable(w: u32) bool {
+    return (w == t.WB_EXTEND) or (w == t.WB_FORMAT) or (w == t.WB_ZWJ);
+}
+
+fn ahletter(w: u32) bool {
+    return (w == t.WB_ALETTER) or (w == t.WB_HEBREW_LETTER);
+}
+
+fn midnumletq(w: u32) bool {
+    return (w == t.WB_MIDNUMLET) or (w == t.WB_SINGLE_QUOTE);
+}
+
+/// The word-break class of the character before position i, skipping
+/// Extend, Format and ZWJ (WB4); its start in *at. 0xff at the start.
+fn wb_before(s: []u8, i: usize, at: *mut usize) u32 {
+    let mut k = i;
+    while k > 0 {
+        k = prev_start(s, k);
+        let w = wb_at(s, k);
+        if not wb_ignorable(w) {
+            at.* = k;
+            return w;
+        }
+        // an ignorable directly after a hard break stands alone
+        if k > 0 {
+            let p = prev_start(s, k);
+            let pw = wb_at(s, p);
+            if (pw == t.WB_CR) or (pw == t.WB_LF) or (pw == t.WB_NEWLINE) {
+                at.* = k;
+                return w;
+            }
+        } else {
+            at.* = k;
+            return w;
+        }
+    }
+    at.* = 0;
+    return 0xff;
+}
+
+/// The class of the first character at or after i that is not ignorable
+/// (0xff at the end); the position after it in *after.
+fn wb_after(s: []u8, i: usize, after: *mut usize) u32 {
+    let mut k = i;
+    while k < s.len {
+        let r = strs.decode_rune(s[k..]);
+        let w = (uni.word_break(r.value));
+        k += r.len;
+        if not wb_ignorable(w) {
+            after.* = k;
+            return w;
+        }
+    }
+    after.* = k;
+    return 0xff;
+}
+
+/// Whether there is a word boundary at position i (0 < i < s.len).
+fn word_boundary(s: []u8, i: usize, floor: usize) bool {
+    let pstart = prev_start(s, i);
+    let prev_cp = strs.decode_rune(s[pstart..]).value;
+    let a_raw = (uni.word_break(prev_cp));
+    let next = strs.decode_rune(s[i..]);
+    let b_raw = (uni.word_break(next.value));
+    // WB3-WB3d
+    if (a_raw == t.WB_CR) and (b_raw == t.WB_LF) {
+        return false;
+    }
+    if (a_raw == t.WB_CR) or (a_raw == t.WB_LF) or (a_raw == t.WB_NEWLINE) {
+        return true;
+    }
+    if (b_raw == t.WB_CR) or (b_raw == t.WB_LF) or (b_raw == t.WB_NEWLINE) {
+        return true;
+    }
+    if (a_raw == t.WB_ZWJ) and uni.is_extended_pictographic(next.value) {
+        return false;
+    }
+    if (a_raw == t.WB_WSEGSPACE) and (b_raw == t.WB_WSEGSPACE) {
+        return false;
+    }
+    // WB4
+    if wb_ignorable(b_raw) {
+        return false;
+    }
+    let mut a_at: usize = 0;
+    let a = wb_before(s, i, &mut a_at);
+    let b = b_raw;
+    let mut a2_at: usize = 0;
+    let mut a2: u32 = 0xff;
+    if a_at > 0 {
+        a2 = wb_before(s, a_at, &mut a2_at);
+    }
+    let mut after_b: usize = 0;
+    _ = wb_after(s, i, &mut after_b);
+    let mut after_b2: usize = 0;
+    let b2 = wb_after(s, after_b, &mut after_b2);
+    if ahletter(a) and ahletter(b) {
+        return false;  // WB5
+    }
+    if ahletter(a) and ((b == t.WB_MIDLETTER) or midnumletq(b)) and ahletter(b2) {
+        return false;  // WB6
+    }
+    if ahletter(a2) and ((a == t.WB_MIDLETTER) or midnumletq(a)) and ahletter(b) {
+        return false;  // WB7
+    }
+    if (a == t.WB_HEBREW_LETTER) and (b == t.WB_SINGLE_QUOTE) {
+        return false;  // WB7a
+    }
+    if (a == t.WB_HEBREW_LETTER) and (b == t.WB_DOUBLE_QUOTE) and (b2 == t.WB_HEBREW_LETTER) {
+        return false;  // WB7b
+    }
+    if (a2 == t.WB_HEBREW_LETTER) and (a == t.WB_DOUBLE_QUOTE) and (b == t.WB_HEBREW_LETTER) {
+        return false;  // WB7c
+    }
+    if (a == t.WB_NUMERIC) and (b == t.WB_NUMERIC) {
+        return false;  // WB8
+    }
+    if ahletter(a) and (b == t.WB_NUMERIC) {
+        return false;  // WB9
+    }
+    if (a == t.WB_NUMERIC) and ahletter(b) {
+        return false;  // WB10
+    }
+    if (a2 == t.WB_NUMERIC) and ((a == t.WB_MIDNUM) or midnumletq(a)) and (b == t.WB_NUMERIC) {
+        return false;  // WB11
+    }
+    if (a == t.WB_NUMERIC) and ((b == t.WB_MIDNUM) or midnumletq(b)) and (b2 == t.WB_NUMERIC) {
+        return false;  // WB12
+    }
+    if (a == t.WB_KATAKANA) and (b == t.WB_KATAKANA) {
+        return false;  // WB13
+    }
+    if (ahletter(a) or (a == t.WB_NUMERIC) or (a == t.WB_KATAKANA) or (a == t.WB_EXTENDNUMLET)) and
+       (b == t.WB_EXTENDNUMLET) {
+        return false;  // WB13a
+    }
+    if (a == t.WB_EXTENDNUMLET) and (ahletter(b) or (b == t.WB_NUMERIC) or (b == t.WB_KATAKANA)) {
+        return false;  // WB13b
+    }
+    if (a == t.WB_REGIONAL_INDICATOR) and (b == t.WB_REGIONAL_INDICATOR) {
+        // WB15/16: an odd number of RI before (counted back to floor, the
+        // start of the current segment: a boundary inside a run of RIs
+        // only ever falls after a pair, so the parity is the same, and a
+        // long run costs linear time, not quadratic)
+        let mut n: usize = 0;
+        let mut k = i;
+        loop {
+            if k <= floor {
+                break;
+            }
+            let mut at: usize = 0;
+            let w = wb_before(s, k, &mut at);
+            if w != t.WB_REGIONAL_INDICATOR {
+                break;
+            }
+            n += 1;
+            k = at;
+            if k == 0 {
+                break;
+            }
+        }
+        return (n % 2) == 0;
+    }
+    return true;  // WB999
+}
+
+/// Words and the text between them (spaces, punctuation), as UAX #29
+/// splits text: concatenated, the pieces are the whole text.
+pub struct Words {
+    s: []u8,
+    pos: usize,
+
+    pub fn next(self: *mut Words) ?[]u8 {
+        if self.pos >= self.s.len {
+            return .none;
+        }
+        let start = self.pos;
+        let mut i = start + strs.decode_rune(self.s[start..]).len;
+        while (i < self.s.len) and not word_boundary(self.s, i, start) {
+            i += strs.decode_rune(self.s[i..]).len;
+        }
+        self.pos = i;
+        return self.s[start..i];
+    }
+}
+
+pub fn words(s: []u8) Words {
+    return Words.{ s: s, pos: 0 };
+}
+
+/// Whether a piece from words() is a word (has a letter, digit or
+/// ideograph) rather than spaces or punctuation.
+pub fn is_word(piece: []u8) bool {
+    let mut i: usize = 0;
+    while i < piece.len {
+        let r = strs.decode_rune(piece[i..]);
+        let w = (uni.word_break(r.value));
+        if ahletter(w) or (w == t.WB_NUMERIC) or (w == t.WB_KATAKANA) or (w == t.WB_EXTENDNUMLET) or
+           uni.is_alphabetic(r.value) or uni.is_number(r.value) {
+            return true;
+        }
+        i += r.len;
+    }
+    return false;
+}
+
+// Sentences ------------------------------------------------------------------
+
+fn sb_at(s: []u8, i: usize) u32 {
+    return (uni.sentence_break(strs.decode_rune(s[i..]).value));
+}
+
+fn sb_ignorable(v: u32) bool {
+    return (v == t.SB_EXTEND) or (v == t.SB_FORMAT);
+}
+
+fn para_sep(v: u32) bool {
+    return (v == t.SB_SEP) or (v == t.SB_CR) or (v == t.SB_LF);
+}
+
+fn saterm(v: u32) bool {
+    return (v == t.SB_STERM) or (v == t.SB_ATERM);
+}
+
+/// The sentence-break class before i, skipping Extend and Format (SB5);
+/// its start in *at; 0xff at the start.
+fn sb_before(s: []u8, i: usize, at: *mut usize) u32 {
+    let mut k = i;
+    while k > 0 {
+        k = prev_start(s, k);
+        let v = sb_at(s, k);
+        if not sb_ignorable(v) {
+            at.* = k;
+            return v;
+        }
+        if k > 0 {
+            let p = prev_start(s, k);
+            if para_sep(sb_at(s, p)) {
+                at.* = k;
+                return v;
+            }
+        } else {
+            at.* = k;
+            return v;
+        }
+    }
+    at.* = 0;
+    return 0xff;
+}
+
+/// What precedes a position, for SB8-SB11: SATerm Close* Sp* (term is
+/// 0xff if the text before does not end so).
+struct Suffix {
+    term: u32,
+    close_seen: bool,
+    sp_seen: bool,
+}
+
+/// The suffix before i, scanning back (used once per sentence).
+fn suffix_before(s: []u8, i: usize) Suffix {
+    let mut k = i;
+    let mut sp_seen = false;
+    let mut close_seen = false;
+    loop {
+        let mut at: usize = 0;
+        let v = sb_before(s, k, &mut at);
+        if v == 0xff {
+            break;
+        }
+        if (v == t.SB_SP) and not close_seen {
+            sp_seen = true;
+            k = at;
+            continue;
+        }
+        if v == t.SB_CLOSE {
+            close_seen = true;
+            k = at;
+            continue;
+        }
+        if saterm(v) {
+            return Suffix.{ term: v, close_seen: close_seen, sp_seen: sp_seen };
+        }
+        break;
+    }
+    return Suffix.{ term: 0xff, close_seen: false, sp_seen: false };
+}
+
+/// The suffix after one more character of class v (as suffix_before would
+/// find it, in constant time).
+fn suffix_step(st: Suffix, v: u32) Suffix {
+    if sb_ignorable(v) {
+        return st;
+    }
+    if saterm(v) {
+        return Suffix.{ term: v, close_seen: false, sp_seen: false };
+    }
+    if (st.term != 0xff) and (v == t.SB_CLOSE) and not st.sp_seen {
+        return Suffix.{ term: st.term, close_seen: true, sp_seen: false };
+    }
+    if (st.term != 0xff) and (v == t.SB_SP) {
+        return Suffix.{ term: st.term, close_seen: st.close_seen, sp_seen: true };
+    }
+    return Suffix.{ term: 0xff, close_seen: false, sp_seen: false };
+}
+
+/// SB8's look ahead from `from` stopped at `to` and found a Lower or not;
+/// the answer holds for every position in between.
+struct Sb8Cache {
+    from: usize,
+    to: usize,
+    lower: bool,
+    valid: bool,
+}
+
+fn sentence_boundary(s: []u8, i: usize, suf: Suffix, sb8: *mut Sb8Cache) bool {
+    let pstart = prev_start(s, i);
+    let a_raw = sb_at(s, pstart);
+    let b = sb_at(s, i);
+    if (a_raw == t.SB_CR) and (b == t.SB_LF) {
+        return false;  // SB3
+    }
+    if para_sep(a_raw) {
+        return true;  // SB4
+    }
+    if sb_ignorable(b) {
+        return false;  // SB5
+    }
+    let mut a_at: usize = 0;
+    let a = sb_before(s, i, &mut a_at);
+    if (a == t.SB_ATERM) and (b == t.SB_NUMERIC) {
+        return false;  // SB6
+    }
+    if a == t.SB_ATERM {
+        let mut x: usize = 0;
+        let a2 = sb_before(s, a_at, &mut x);
+        if ((a2 == t.SB_UPPER) or (a2 == t.SB_LOWER)) and (b == t.SB_UPPER) {
+            return false;  // SB7
+        }
+    }
+    // SATerm Close* Sp* before i (kept up to date by the caller)
+    let term = suf.term;
+    let sp_seen = suf.sp_seen;
+    if term == 0xff {
+        return false;  // SB998
+    }
+    if term == t.SB_ATERM {
+        // SB8: ( ¬(OLetter | Upper | Lower | ParaSep | SATerm) )* Lower
+        if not (sb8.valid and (sb8.from <= i) and (i <= sb8.to)) {
+            let mut j = i;
+            let mut found = false;
+            while j < s.len {
+                let v = sb_at(s, j);
+                if v == t.SB_LOWER {
+                    found = true;
+                    break;
+                }
+                if (v == t.SB_OLETTER) or (v == t.SB_UPPER) or para_sep(v) or saterm(v) {
+                    break;
+                }
+                j += strs.decode_rune(s[j..]).len;
+            }
+            sb8.* = Sb8Cache.{ from: i, to: j, lower: found, valid: true };
+        }
+        if sb8.lower {
+            return false;
+        }
+    }
+    if (b == t.SB_SCONTINUE) or saterm(b) {
+        return false;  // SB8a
+    }
+    if not sp_seen and ((b == t.SB_CLOSE) or (b == t.SB_SP) or para_sep(b)) {
+        return false;  // SB9
+    }
+    if (b == t.SB_SP) or para_sep(b) {
+        return false;  // SB10
+    }
+    return true;  // SB11
+}
+
+/// Sentences of text (with their trailing spaces), per UAX #29.
+pub struct Sentences {
+    s: []u8,
+    pos: usize,
+
+    pub fn next(self: *mut Sentences) ?[]u8 {
+        if self.pos >= self.s.len {
+            return .none;
+        }
+        let start = self.pos;
+        let first = strs.decode_rune(self.s[start..]).len;
+        let mut i = start + first;
+        // the SATerm Close* Sp* state, carried forward a character at a time
+        let mut suf = suffix_before(self.s, i);
+        let mut sb8 = Sb8Cache.{ from: 0, to: 0, lower: false, valid: false };
+        while (i < self.s.len) and not sentence_boundary(self.s, i, suf, &mut sb8) {
+            suf = suffix_step(suf, sb_at(self.s, i));
+            i += strs.decode_rune(self.s[i..]).len;
+        }
+        self.pos = i;
+        return self.s[start..i];
+    }
+}
+
+pub fn sentences(s: []u8) Sentences {
+    return Sentences.{ s: s, pos: 0 };
+}
+
+// -----------------------------------------------------------------------------
+// Title case
+// -----------------------------------------------------------------------------
+
+/// Title case: in each word (words), the first cased character in
+/// titlecase and the rest in lowercase ("hello wORLD" becomes "Hello
+/// World"); mem.free the result.
+pub fn title(s: []u8) uni.UnicodeError![]mut u8 {
+    let mut out = strs.String.init();
+    title_into(s, &mut out) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+fn title_into(s: []u8, out: *mut strs.String) uni.UnicodeError!void {
+    let mut w = words(s);
+    let mut base: usize = 0;
+    while let .some(word) = w.next() {
+        uni.title_word(s, base, base + word.len, out)!;
+        base += word.len;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+import "std/fmt" as fmt;
+import "std/io" as io;
+
+fn push_cp(out: *mut strs.String, cp: u32) uni.UnicodeError!void {
+    let mut b: [4]u8 = [0; 4];
+    out.push_str(strs.encode_rune(b[..], cp))!;
+}
+
+fn read_optional(p: []u8) ![]mut u8 {
+    let f = io.open(p)!;
+    defer f.close();
+    return f.reader().read_all();
+}
+
+enum Segmentation: u8 {
+    GRAPHEME,
+    WORD,
+    SENTENCE,
+}
+
+/// Runs a UCD segmentation test file (lines like "÷ 0020 × 0308 ÷"):
+/// returns [cases, failures], or [0, 0] if the file is missing.
+fn run_seg_test(file: []u8, kind: Segmentation) uni.UnicodeError![2]usize {
+    let data = read_optional(file) catch return [@as(usize, 0), 0];
+    defer mem.free(data);
+    let mut cases: usize = 0;
+    let mut failures: usize = 0;
+    let mut lines = strs.lines(data);
+    loop {
+        let raw = lines.next() ?? break;
+        let hash = strs.index_of(raw, "#") ?? raw.len;
+        let line = strs.trim(raw[..hash]);
+        if line.len == 0 {
+            continue;
+        }
+        // the text, and where the breaks should be
+        let mut text = strs.String.init();
+        defer text.deinit();
+        let mut want = vec.Vec.[usize].init();
+        defer want.deinit();
+        let mut f = strs.fields(line);
+        loop {
+            let tok = f.next() ?? break;
+            if @mem_eq(tok, "\xc3\xb7") {
+                want.push(text.len())!;
+            } else if @mem_eq(tok, "\xc3\x97") {
+                // no break
+            } else {
+                let cp = fmt.parse_int_base.[u32](tok, 16) catch 0;
+                push_cp(&mut text, cp)!;
+            }
+        }
+        cases += 1;
+        let s = text.bytes();
+        let mut got = vec.Vec.[usize].init();
+        defer got.deinit();
+        got.push(0)!;
+        if kind == Segmentation.GRAPHEME {
+            let mut it = graphemes(s);
+            let mut at: usize = 0;
+            loop {
+                let piece = it.next() ?? break;
+                at += piece.len;
+                got.push(at)!;
+            }
+        } else if kind == Segmentation.WORD {
+            let mut it = words(s);
+            let mut at: usize = 0;
+            loop {
+                let piece = it.next() ?? break;
+                at += piece.len;
+                got.push(at)!;
+            }
+        } else {
+            let mut it = sentences(s);
+            let mut at: usize = 0;
+            loop {
+                let piece = it.next() ?? break;
+                at += piece.len;
+                got.push(at)!;
+            }
+        }
+        let mut same = got.len() == want.len();
+        if same {
+            for k in @as(usize, 0)..got.len() {
+                if got.get(k) != want.get(k) {
+                    same = false;
+                }
+            }
+        }
+        if not same {
+            failures += 1;
+        }
+    }
+    return [cases, failures];
+}
+
+test "segmentation conformance (UCD test files, when installed)" {
+    let g = run_seg_test("/usr/share/unicode/auxiliary/GraphemeBreakTest.txt", Segmentation.GRAPHEME)!;
+    @expect_eq(g[1], 0);
+    let w = run_seg_test("/usr/share/unicode/auxiliary/WordBreakTest.txt", Segmentation.WORD)!;
+    @expect_eq(w[1], 0);
+    let s = run_seg_test("/usr/share/unicode/auxiliary/SentenceBreakTest.txt", Segmentation.SENTENCE)!;
+    @expect_eq(s[1], 0);
+}
+
+test "title case" {
+    let got = title("hello wORLD, \xc7\x86ungla")!;
+    defer mem.free(got);
+    @expect_eq(got, "Hello World, \xc7\x85ungla");
+}
+
+test "width of text" {
+    @expect_eq(string_width("日本語 ok"), 9);
+    @expect_eq(string_width("e\xcc\x81"), 1);
+    @expect_eq(string_width("\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb"), 2);  // woman technologist (ZWJ)
+    @expect_eq(string_width("\xf0\x9f\x87\xab\xf0\x9f\x87\xb7"), 2);              // flag
+}
+
+test "segmentation" {
+    let mut g = graphemes("e\xcc\x81\xf0\x9f\x87\xab\xf0\x9f\x87\xb7!");
+    @expect_eq(g.next() ?? @trap(), "e\xcc\x81");
+    @expect_eq(g.next() ?? @trap(), "\xf0\x9f\x87\xab\xf0\x9f\x87\xb7");
+    @expect_eq(g.next() ?? @trap(), "!");
+    if let .some = g.next() {
+        @trap();
+    }
+    @expect_eq(grapheme_count("\r\nab"), 3);
+    let mut w = words("Hello, world! It's 3.14.");
+    let want: [11][]u8 = ["Hello", ",", " ", "world", "!", " ", "It's", " ", "3.14", ".", ""];
+    for k in @as(usize, 0)..10 {
+        @expect_eq(w.next() ?? @trap(), want[k]);
+    }
+    if let .some = w.next() {
+        @trap();
+    }
+    @expect(is_word("It's"));
+    @expect(not is_word(", "));
+    let mut s = sentences("He said hi. Then he left! OK?");
+    @expect_eq(s.next() ?? @trap(), "He said hi. ");
+    @expect_eq(s.next() ?? @trap(), "Then he left! ");
+    @expect_eq(s.next() ?? @trap(), "OK?");
+    if let .some = s.next() {
+        @trap();
+    }
+}

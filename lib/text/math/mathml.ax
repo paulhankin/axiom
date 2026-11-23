@@ -1,0 +1,338 @@
+// =============================================================================
+// lib/text/math/mathml.ax - MathML Core output, part of lib/text/math.
+// =============================================================================
+
+import "std/fmt" as fmt;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// MathML
+// -----------------------------------------------------------------------------
+
+// A length in em, to at most 4 decimals ("0.1667em").
+fn em(o: *mut Out, v: f32) !void {
+    let mut b: [48]u8 = [0; 48];
+    let t = fmt.bufprint(b[..], "{:.4}", [fmt.float(@float_cast(f64, v))]) catch "0";
+    let mut n = t.len;
+    if strs.contains(t, ".") {
+        while (n > 0) and (t[n - 1] == 0x30) {
+            n -= 1;
+        }
+        if (n > 0) and (t[n - 1] == 0x2e) {
+            n -= 1;
+        }
+    }
+    o.s(t[..n])!;
+    o.s("em")!;
+}
+
+fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
+    if i == NIL {
+        o.s("<mrow></mrow>")!;
+        return;
+    }
+    let n = f.node(i);
+    let t = f.str(n.s, n.sl);
+    match n.kind {
+        .ROW => {
+            // a row of one child needs no mrow
+            if (n.first != NIL) and (f.node(n.first).next == NIL) {
+                mathml(f, o, n.first)!;
+                return;
+            }
+            o.s("<mrow>")!;
+            let mut c = n.first;
+            while c != NIL {
+                mathml(f, o, c)!;
+                c = f.node(c).next;
+            }
+            o.s("</mrow>")!;
+        }
+        .IDENT => {
+            if ((n.flags & F_NORMAL) != 0) and (strs.rune_count(t) == 1) {
+                o.s("<mi mathvariant=\"normal\">")!;
+            } else {
+                o.s("<mi>")!;
+            }
+            o.esc(t)!;
+            o.s("</mi>")!;
+            if (n.flags & F_FUNC) != 0 {
+                o.s("<mo>\u{2061}</mo>")!;
+            }
+        }
+        .NUMBER => {
+            o.s("<mn>")!;
+            o.esc(t)!;
+            o.s("</mn>")!;
+        }
+        .OP => { op_mathml(o, n, t)!; }
+        .TEXT => {
+            o.s("<mtext>")!;
+            o.esc(t)!;
+            o.s("</mtext>")!;
+        }
+        .SPACE => {
+            o.s("<mspace width=\"")!;
+            em(o, n.width)!;
+            o.s("\"></mspace>")!;
+        }
+        .FRAC => { frac_mathml(f, o, n)!; }
+        .SQRT => {
+            o.s("<msqrt>")!;
+            mathml(f, o, n.a)!;
+            o.s("</msqrt>")!;
+        }
+        .ROOT => {
+            o.s("<mroot>")!;
+            mathml(f, o, n.a)!;
+            mathml(f, o, n.b)!;
+            o.s("</mroot>")!;
+        }
+        .SCRIPTS => { scripts_mathml(f, o, n)!; }
+        .LIMITS  => { limits_mathml(f, o, n)!; }
+        .ACCENT  => { accent_mathml(f, o, n, t)!; }
+        .FENCE   => { fence_mathml(f, o, n, t)!; }
+        .TABLE   => { table_mathml(f, o, n)!; }
+        .TROW => {}
+        .TCELL => {}
+        .ENCLOSE => { enclose_mathml(f, o, n)!; }
+        .STYLE => {
+            if n.sl != 0 {
+                o.s("<mstyle style=\"color:")!;
+                o.esc(t)!;
+                o.s("\">")!;
+            } else if (n.flags & F_DISPLAY) != 0 {
+                o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
+            } else {
+                o.s("<mstyle displaystyle=\"false\">")!;
+            }
+            mathml(f, o, n.a)!;
+            o.s("</mstyle>")!;
+        }
+    }
+}
+
+// An operator: <mo>, stretchy or not, sized, or (a lone ordinary symbol) without
+// space around it.
+fn op_mathml(o: *mut Out, n: *Node, t: []u8) !void {
+    if (n.flags & F_SIZED) != 0 {
+        o.s("<mo minsize=\"")!;
+        em(o, n.width)!;
+        o.s("\" maxsize=\"")!;
+        em(o, n.width)!;
+        o.s("\">")!;
+    } else if (n.flags & F_STRETCHY) != 0 {
+        o.s("<mo stretchy=\"true\">")!;
+    } else if (n.cls == C_OPEN) or (n.cls == C_CLOSE) {
+        o.s("<mo stretchy=\"false\">")!;
+    } else if (n.cls == C_ORD) and not strs.eq(t, "|") and not strs.eq(t, "/") {
+        o.s("<mo form=\"prefix\" lspace=\"0\" rspace=\"0\">")!;
+    } else {
+        o.s("<mo>")!;
+    }
+    o.esc(t)!;
+    o.s("</mo>")!;
+}
+
+// A fraction (in a style of its own for \dfrac and \tfrac).
+fn frac_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.flags & F_DISPLAY) != 0 {
+        o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
+    } else if (n.flags & F_TEXTSTYLE) != 0 {
+        o.s("<mstyle displaystyle=\"false\">")!;
+    }
+    if (n.flags & F_THIN0) != 0 {
+        o.s("<mfrac linethickness=\"0\">")!;
+    } else {
+        o.s("<mfrac>")!;
+    }
+    mathml(f, o, n.a)!;
+    mathml(f, o, n.b)!;
+    o.s("</mfrac>")!;
+    if (n.flags & (F_DISPLAY | F_TEXTSTYLE)) != 0 {
+        o.s("</mstyle>")!;
+    }
+}
+
+// A base with a subscript, a superscript or both.
+fn scripts_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    let mut tag: []u8 = "msup";
+    if (n.b != NIL) and (n.c != NIL) {
+        tag = "msubsup";
+    } else if n.b != NIL {
+        tag = "msub";
+    }
+    o.s("<")!;
+    o.s(tag)!;
+    o.s(">")!;
+    mathml(f, o, n.a)!;
+    if n.b != NIL {
+        mathml(f, o, n.b)!;
+    }
+    if n.c != NIL {
+        mathml(f, o, n.c)!;
+    }
+    o.s("</")!;
+    o.s(tag)!;
+    o.s(">")!;
+}
+
+// A base with limits under it, over it or both.
+fn limits_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    let base = f.node(n.a);
+    // big operators move their limits to the side in inline style
+    // (movablelimits); \limits keeps them above and below
+    let mut tag: []u8 = "munderover";
+    if n.b == NIL {
+        tag = "mover";
+    } else if n.c == NIL {
+        tag = "munder";
+    }
+    o.s("<")!;
+    o.s(tag)!;
+    o.s(">")!;
+    if ((n.flags & F_LIMITS) != 0) and (base.kind == Kind.OP) {
+        o.s("<mo movablelimits=\"false\">")!;
+        o.esc(f.str(base.s, base.sl))!;
+        o.s("</mo>")!;
+    } else if base.kind == Kind.IDENT and ((base.flags & F_FUNC) != 0) {
+        // lim: an identifier whose limits may move
+        o.s("<mo movablelimits=\"true\" form=\"prefix\">")!;
+        o.esc(f.str(base.s, base.sl))!;
+        o.s("</mo>")!;
+    } else {
+        mathml(f, o, n.a)!;
+    }
+    if n.b != NIL {
+        mathml(f, o, n.b)!;
+    }
+    if n.c != NIL {
+        mathml(f, o, n.c)!;
+    }
+    o.s("</")!;
+    o.s(tag)!;
+    o.s(">")!;
+}
+
+// An accent over or under the base.
+fn accent_mathml(f: *Formula, o: *mut Out, n: *Node, t: []u8) !void {
+    let under = (n.flags & F_UNDER) != 0;
+    if under {
+        o.s("<munder accentunder=\"true\">")!;
+    } else {
+        o.s("<mover accent=\"true\">")!;
+    }
+    mathml(f, o, n.a)!;
+    if (n.flags & F_STRETCHY) != 0 {
+        o.s("<mo stretchy=\"true\">")!;
+    } else {
+        o.s("<mo stretchy=\"false\">")!;
+    }
+    o.esc(t)!;
+    o.s("</mo>")!;
+    if under {
+        o.s("</munder>")!;
+    } else {
+        o.s("</mover>")!;
+    }
+}
+
+// Content between delimiters (stretchy ones from \left and \right).
+fn fence_mathml(f: *Formula, o: *mut Out, n: *Node, t: []u8) !void {
+    let t2 = f.str(n.s2, n.s2l);
+    let mut st: []u8 = "<mo fence=\"true\" stretchy=\"false\">";
+    if (n.flags & F_STRETCHY) != 0 {
+        st = "<mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">";
+    }
+    o.s("<mrow>")!;
+    if t.len > 0 {
+        o.s(st)!;
+        o.esc(t)!;
+        o.s("</mo>")!;
+    }
+    mathml(f, o, n.a)!;
+    if t2.len > 0 {
+        o.s(st)!;
+        o.esc(t2)!;
+        o.s("</mo>")!;
+    }
+    o.s("</mrow>")!;
+}
+
+// An array or matrix.
+fn table_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.flags & F_SMALL) != 0 {
+        o.s("<mstyle scriptlevel=\"1\">")!;
+    }
+    o.s("<mtable>")!;
+    let mut r = n.first;
+    while r != NIL {
+        o.s("<mtr>")!;
+        let mut c = f.node(r).first;
+        let mut col: usize = 0;
+        while c != NIL {
+            if (n.flags & F_LEFT) != 0 {
+                o.s("<mtd style=\"text-align:left\">")!;
+            } else if (n.flags & F_ALIGN) != 0 {
+                if (col % 2) == 0 {
+                    o.s("<mtd style=\"text-align:right;padding-right:0\">")!;
+                } else {
+                    o.s("<mtd style=\"text-align:left;padding-left:0\">")!;
+                }
+            } else {
+                o.s("<mtd>")!;
+            }
+            mathml(f, o, f.node(c).a)!;
+            o.s("</mtd>")!;
+            c = f.node(c).next;
+            col += 1;
+        }
+        o.s("</mtr>")!;
+        r = f.node(r).next;
+    }
+    o.s("</mtable>")!;
+    if (n.flags & F_SMALL) != 0 {
+        o.s("</mstyle>")!;
+    }
+}
+
+// The diagonal strokes of \cancel and friends, as CSS gradients ("to
+// bottom right" runs its 50% line from bottom left to top right).
+let STRIKE_UP: []u8 =
+    "linear-gradient(to bottom right,transparent calc(50% - 0.04em),currentColor calc(50% - 0.04em),currentColor calc(50% + 0.04em),transparent calc(50% + 0.04em))";
+let STRIKE_DOWN: []u8 =
+    "linear-gradient(to top right,transparent calc(50% - 0.04em),currentColor calc(50% - 0.04em),currentColor calc(50% + 0.04em),transparent calc(50% + 0.04em))";
+
+fn enclose_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if n.cls == E_BOX {
+        o.s("<mrow style=\"padding:0.3em;border:0.04em solid\">")!;
+        mathml(f, o, n.a)!;
+        o.s("</mrow>")!;
+    } else if n.cls == E_PHANTOM {
+        o.s("<mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom>")!;
+    } else if n.cls == E_HPHANTOM {
+        o.s("<mpadded height=\"0\" depth=\"0\"><mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom></mpadded>")!;
+    } else if n.cls == E_VPHANTOM {
+        o.s("<mpadded width=\"0\"><mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom></mpadded>")!;
+    } else {
+        o.s("<mrow style=\"background:")!;
+        if n.cls == E_CANCEL {
+            o.s(STRIKE_UP)!;
+        } else if n.cls == E_BCANCEL {
+            o.s(STRIKE_DOWN)!;
+        } else {
+            o.s(STRIKE_UP)!;
+            o.s(",")!;
+            o.s(STRIKE_DOWN)!;
+        }
+        o.s("\">")!;
+        mathml(f, o, n.a)!;
+        o.s("</mrow>")!;
+    }
+}

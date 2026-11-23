@@ -332,13 +332,15 @@ else:
 EOF
 done
 
-# Every archive holds the compiler, the library and the runtime, and no test data.
+# Every archive holds the compiler, the standard library, the libraries and the
+# runtime, and no test data.
 for f in "$R"/axiom-"$v"-*; do
     case $f in
         *.zip) list=$(unzip -Z1 "$f") ;;
         *) list=$(tar -tzf "$f") ;;
     esac
-    for want in bin/axiom std/mem.ax std/internal/runtime/host.mjs std/internal/runtime/rt.ax LICENSE-MIT RELEASE-NOTES.md; do
+    for want in bin/axiom std/mem.ax std/internal/runtime/host.mjs std/internal/runtime/rt.ax lib/README.md lib/encoding/hex.ax \
+        LICENSE-MIT RELEASE-NOTES.md; do
         echo "$list" | grep -q "/$want" || echo "$list" | grep -q "/${want}.exe" ||
             { echo "release: $(basename "$f") lacks $want" >&2; exit 1; }
     done
@@ -351,14 +353,15 @@ if command -v qemu-aarch64 >/dev/null && [ "$(uname -m)" = x86_64 ]; then
     [ "$(qemu-aarch64 "$R/stage/qa/axiom-$v-linux-aarch64/bin/axiom" version)" = "axiom $v" ] ||
         { echo "release: the AArch64 compiler does not run under qemu" >&2; exit 1; }
 fi
-# The Linux x86-64 archive, unpacked, builds and runs a program.
+# The Linux x86-64 archive, unpacked, builds and runs a program (which imports
+# a library, from lib/ beside std/).
 if [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ]; then
     T=$R/stage/check
     mkdir -p "$T"
     tar -xzf "$R/axiom-$v-linux-x86_64.tar.gz" -C "$T"
-    printf 'import "std/io" as io;\n\nexport fn main() i32 {\n    io.stdout().write_all("ok\\n") catch return 1;\n    return 0;\n}\n' > "$T/hello.ax"
+    printf 'import "lib/encoding/hex" as hex;\nimport "std/io" as io;\n\nexport fn main() i32 {\n    let mut b: [4]u8 = [0; 4];\n    io.stdout().write_all(hex.encode("ok", b[..])) catch return 1;\n    return 0;\n}\n' > "$T/hello.ax"
     out=$(cd "$T" && "./axiom-$v-linux-x86_64/bin/axiom" build hello.ax --target=native -o hello && ./hello)
-    [ "$out" = ok ] || { echo "release: the unpacked compiler does not work: $out" >&2; exit 1; }
+    [ "$out" = 6f6b ] || { echo "release: the unpacked compiler does not work: $out" >&2; exit 1; }
     [ "$("$T/axiom-$v-linux-x86_64/bin/axiom" version)" = "axiom $v" ] || { echo "release: wrong version" >&2; exit 1; }
 fi
 rm -rf "$R/stage"

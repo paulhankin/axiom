@@ -1,0 +1,303 @@
+// =============================================================================
+// lib/text/markdown.ax - Markdown: CommonMark 0.31.2 with the GitHub extensions.
+//
+//     let html = markdown.to_html(text, markdown.Options.init())!;
+//     defer mem.free(html);
+//     markdown.to_html_to(w, text, markdown.Options.init())!;   // to an io.Writer
+//
+// or, to look at the tree:
+//
+//     let mut doc = markdown.parse(text, markdown.Options.init())!;
+//     defer doc.deinit();
+//     let mut w = doc.walk();
+//     while w.advance() {
+//         let n = doc.node(w.id);
+//         if w.entering and (n.kind == markdown.Kind.HEADING) { ... doc.text(child) ... }
+//     }
+//
+// parse() builds a tree of Nodes (blocks: paragraphs, headings, lists, code,
+// block quotes, tables, ...; inlines: text, emphasis, links, images, code
+// spans, ...) that the Document owns; nodes are numbered, the root is 0, and
+// each has parent, first/last child and next/previous sibling links (NONE when
+// absent). The parser follows the CommonMark reference implementation (cmark)
+// and passes all 652 examples of the CommonMark 0.31.2 specification. With
+// Options.gfm it also reads the GitHub Flavored Markdown extensions: tables,
+// strikethrough (~~x~~), autolinks without angle brackets (www.x.com,
+// https://..., a@b.com) and task list items ([ ] and [x]). With Options.math
+// it reads TeX math, $...$, $`...`$ and $$...$$ (as MATH and DISPLAY_MATH
+// nodes) and ```math code blocks, and writes it as MathML (lib/text/math), or as SVG
+// through Options.math_html and lib/text/math/typeset.
+//
+// Untrusted input: the HTML output is safe by default. Raw HTML in the input
+// is replaced by a comment (Options.unsafe_html keeps it), links and images
+// to javascript:, vbscript:, file: and data: URLs (other than raw images)
+// lose their destinations, and everything else is escaped. With unsafe_html,
+// Options.tagfilter (on by default with gfm) still defuses <script>, <style>,
+// <iframe> and the like. Every part of the parser takes time linear in the
+// input (or close to it) whatever its shape, nesting is not limited but
+// nothing recurses, and the HTML that reference links can expand to is
+// bounded by the size of the input.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/io" as io;
+import "std/str" as strs;
+import "std/unicode" as uni;
+
+import part "markdown/block.ax";
+import part "markdown/inline.ax";
+import part "markdown/links.ax";
+import part "markdown/render.ax";
+import part "markdown/scan.ax";
+import part "markdown/tests.ax";
+import part "markdown/types.ax";
+
+pub error MarkdownError { TooLarge, OutOfMemory, NoSpaceLeft, IoError, NotFound, InvalidMath, Empty, Done, EndOfStream,
+                          InvalidUtf8, PermissionDenied, Exists, IsDirectory }
+
+pub const NONE: u32 = 0xffffffff;
+
+/// The kinds of node: blocks (DOCUMENT to TABLE_CELL), then inlines.
+pub enum Kind: u8 {
+    // Block nodes
+    DOCUMENT,
+    BLOCK_QUOTE,
+    LIST,
+    ITEM,
+    CODE_BLOCK,
+    HTML_BLOCK,
+    PARAGRAPH,
+    HEADING,
+    THEMATIC_BREAK,
+    TABLE,
+    TABLE_ROW,
+    TABLE_CELL,
+    // Inline nodes
+    TEXT,
+    SOFT_BREAK,
+    HARD_BREAK,
+    CODE,
+    HTML_INLINE,
+    EMPH,
+    STRONG,
+    STRIKETHROUGH,
+    LINK,
+    IMAGE,
+    /// With Options.math: $...$, $`...`$ and $$...$$ (the TeX source is the text).
+    MATH,
+    DISPLAY_MATH,
+
+    /// The name cmark uses ("block_quote", "softbreak", ...).
+    pub fn name(self: Kind) []u8 {
+        return KIND_NAMES[@as(usize, @int_from_enum(self))];
+    }
+
+    /// Whether this is an inline (TEXT and after) rather than a block.
+    pub fn is_inline(self: Kind) bool {
+        return @int_from_enum(self) >= @int_from_enum(Kind.TEXT);
+    }
+}
+
+let KIND_NAMES: [24][]u8 = [
+    "document",
+    "block_quote",
+    "list",
+    "item",
+    "code_block",
+    "html_block",
+    "paragraph",
+    "heading",
+    "thematic_break",
+    "table",
+    "table_row",
+    "table_cell",
+    "text",
+    "softbreak",
+    "linebreak",
+    "code",
+    "html_inline",
+    "emph",
+    "strong",
+    "strikethrough",
+    "link",
+    "image",
+    "math",
+    "display_math",
+];
+
+/// Table cell alignment.
+pub enum Align: u8 {
+    NONE,
+    LEFT,
+    CENTER,
+    RIGHT,
+}
+
+/// Task list items: not one, "[ ]" or "[x]".
+pub enum Task: u8 {
+    NONE,
+    OPEN,
+    DONE,
+}
+
+pub struct Options {
+    /// The GitHub extensions: tables, strikethrough, extended autolinks, task lists.
+    gfm: bool,
+    /// Pass raw HTML and dangerous URLs through to the output.
+    unsafe_html: bool,
+    /// With unsafe_html: escape the tags GitHub disallows (<script>, <style>,
+    /// <iframe>, <textarea>, <title>, <xmp>, <noembed>, <noframes>, <plaintext>).
+    tagfilter: bool,
+    /// Render soft line breaks as <br />.
+    hard_breaks: bool,
+    /// TeX math (lib/text/math) as MathML: $...$ inline, $$...$$ displayed,
+    /// and ```math code blocks. A $ needs a non-space after it to open and
+    /// before it to close (and no digit after it), so "$5 and $10" stays
+    /// text; \$ is a dollar sign. GitHub's $`...`$ (backticks as in a code
+    /// span, the same number on each side) is inline math too, and avoids
+    /// those rules. Math that does not parse is left as its source.
+    pub math: bool,
+    /// How math is written: MathML (MathHtml.mathml(), the default), or
+    /// another renderer such as lib/text/math/typeset's SVG.
+    pub math_html: MathHtml,
+
+    /// GitHub Flavored Markdown, safe for untrusted input.
+    pub fn init() Options {
+        return Options.{ gfm: true, unsafe_html: false, tagfilter: true, hard_breaks: false, math: false,
+                         math_html: MathHtml.mathml() };
+    }
+
+    /// Plain CommonMark, raw HTML allowed (as the specification's examples expect).
+    pub fn commonmark() Options {
+        return Options.{ gfm: false, unsafe_html: true, tagfilter: false, hard_breaks: false, math: false,
+                         math_html: MathHtml.mathml() };
+    }
+}
+
+/// A way to write math as HTML: `render(ctx, tex, displayed, out)` appends
+/// it to out and returns true, or returns false (having written nothing)
+/// to leave it to MathML.
+pub struct MathHtml {
+    pub ctx: *void,
+    pub render: fn(*void, []u8, bool, *mut strs.String) !bool,
+
+    /// MathML (lib/text/math).
+    pub fn mathml() MathHtml {
+        return MathHtml.{ ctx: @ptr_from_int(*void, 8), render: no_math_html };
+    }
+}
+
+fn no_math_html(ctx: *void, tex: []u8, displayed: bool, out: *mut strs.String) MarkdownError!bool {
+    _ = ctx;
+    _ = tex;
+    _ = displayed;
+    _ = out;
+    return false;
+}
+
+/// Parses Markdown text. The input need not be valid UTF-8 (bad bytes
+/// pass through); NUL bytes become U+FFFD.
+pub fn parse(src: []u8, opts: Options) MarkdownError!Document {
+    if src.len >= 0x40000000 {
+        return error.TooLarge;
+    }
+    let mut doc = Document.{ nodes: vec.Vec.[Node].init(), raw: strs.String.init(), buf: strs.String.init(),
+                             opts: opts };
+    build(&mut doc, src, opts) catch |e| {
+        doc.deinit();
+        return e;
+    };
+    return doc;
+}
+
+fn build(doc: *mut Document, src: []u8, opts: Options) MarkdownError!void {
+    doc.raw.reserve(src.len + (src.len / 8) + 16)!;
+    let mut p = Parser.init(doc, opts, src.len);
+    defer p.deinit();
+    document(&mut p, src)!;
+    inlines_all(&mut p)!;
+}
+
+/// Markdown to HTML in one step.
+pub fn to_html(src: []u8, opts: Options) ![]mut u8 {
+    let mut doc = parse(src, opts)!;
+    defer doc.deinit();
+    return doc.html();
+}
+
+/// Markdown to HTML in one step, written to w as it is rendered (the tree
+/// is built first, in memory).
+pub fn to_html_to(w: io.Writer, src: []u8, opts: Options) !void {
+    let mut doc = parse(src, opts)!;
+    defer doc.deinit();
+    doc.write_html(w)!;
+}
+
+// -----------------------------------------------------------------------------
+// Characters
+// -----------------------------------------------------------------------------
+
+fn is_space_or_tab(c: u8) bool {
+    return (c == ' ') or (c == '\t');
+}
+
+fn is_line_end(c: u8) bool {
+    return (c == '\n') or (c == '\r') or (c == 0);
+}
+
+/// Space, tab, newline, vertical tab, form feed, carriage return.
+fn is_ascii_space(c: u8) bool {
+    return (c == ' ') or ((c >= 9) and (c <= 13));
+}
+
+fn is_ascii_punct(c: u8) bool {
+    return ((c >= 33) and (c <= 47)) or ((c >= 58) and (c <= 64)) or ((c >= 91) and (c <= 96)) or
+           ((c >= 123) and (c <= 126));
+}
+
+fn lower(c: u8) u8 {
+    if (c >= 'A') and (c <= 'Z') {
+        return c | 0x20;
+    }
+    return c;
+}
+
+/// Unicode whitespace in CommonMark's sense: Zs, tab, line feed, form feed, carriage return.
+fn is_unicode_space(cp: u32) bool {
+    if cp < 128 {
+        return (cp == ' ') or (cp == '\t') or (cp == '\n') or (cp == 12) or (cp == '\r');
+    }
+    return uni.category(cp) == uni.Category.ZS;
+}
+
+/// Unicode punctuation in CommonMark's sense: the P and S categories.
+fn is_unicode_punct(cp: u32) bool {
+    if cp < 128 {
+        return is_ascii_punct(@truncate(u8, cp));
+    }
+    return uni.is_punct(cp) or uni.is_symbol(cp);
+}
+
+/// Case-insensitive ASCII prefix test at s[i..].
+fn has_prefix_ci(s: []u8, i: usize, p: []u8) bool {
+    if i + p.len > s.len {
+        return false;
+    }
+    for k in 0..p.len {
+        if lower(s[i + k]) != p[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn has_prefix(s: []u8, i: usize, p: []u8) bool {
+    return (i + p.len <= s.len) and @mem_eq(s[i..i + p.len], p);
+}
+
+fn at(s: []u8, i: usize) u8 {
+    if i < s.len {
+        return s[i];
+    }
+    return 0;
+}

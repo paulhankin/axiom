@@ -1,0 +1,315 @@
+// =============================================================================
+// lib/text/math.ax - TeX-style mathematics: parsing, MathML Core and plain
+// Unicode text.
+//
+//     let html = math.to_mathml("\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}", math.Display.BLOCK)!;  // mem.free
+//     let txt = math.to_text("x^2 + y_1")!;          // "x² + y₁"
+//
+//     let mut f = math.parse(tex)!;                  // or parse_with(tex, &mut info)
+//     defer f.deinit();
+//     f.write_mathml(w, math.Display.BLOCK)!;
+//     f.write_text(w)!;
+//
+// The input is the math mode of LaTeX as people write it on the web:
+// letters, digits and operators; groups { }; superscripts ^ and subscripts _
+// (and primes '); \frac, \dfrac, \tfrac, \cfrac, \binom, \over, \choose,
+// \atop; \sqrt and \sqrt[n]; \left ... \middle ... \right and \big .. \Bigg;
+// Greek letters and some 300 symbols, relations, arrows and big operators
+// (\sum, \int, ...) with \limits and \nolimits; functions (\sin, \lim,
+// \operatorname); accents (\hat, \vec, \bar, \overline, \overbrace, ...) and
+// \overset, \underset, \stackrel; fonts (\mathbf, \mathbb, \mathcal,
+// \mathfrak, \mathrm, \mathsf, \mathtt, \boldsymbol) as Unicode mathematical
+// alphanumerics; \text; \color and \textcolor; \boxed; \phantom, \hphantom,
+// \vphantom and \mathstrut; \cancel, \bcancel and \xcancel; \bmod and \pmod;
+// spaces (\, \: \; \! \quad \qquad); \not; and the environments matrix,
+// pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix, smallmatrix, cases, aligned,
+// gathered, split and array.
+//
+// MathML follows MathML Core (rendered by current browsers without
+// scripts), with the source in an annotation. Text is a linear form for
+// places without MathML: Unicode symbols, super- and subscript characters
+// where they exist ("x²"), else "^(...)", and "(a+b)/(c+d)" for fractions.
+// Errors (InvalidMath) give the offset and a message; nesting is limited
+// to 64 levels.
+// lib/text/math/typeset sets formulas with a math font, as SVG or onto a
+// canvas, for places MathML cannot go.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/io" as io;
+import "std/str" as strs;
+
+import part "math/commands.ax";
+import part "math/mathml.ax";
+import part "math/parser.ax";
+import part "math/symbols.ax";
+import part "math/tests.ax";
+import part "math/text_render.ax";
+
+pub error TexError { InvalidMath, OutOfMemory, NotFound, IoError, Empty, Done, InvalidUtf8 }
+
+/// Where a parse failed.
+pub struct ErrorInfo {
+    pub offset: usize,
+    pub message: []u8,
+}
+
+/// Inline math, or a block of its own (display style).
+pub enum Display: u8 {
+    INLINE,
+    BLOCK,
+}
+
+const MAX_DEPTH: u32 = 64;
+const NIL: u32 = 0xffffffff;
+
+/// The kinds of node in a Formula's tree (read by lib/text/math/typeset).
+pub enum Kind: u8 {
+    ROW,
+    IDENT,
+    NUMBER,
+    OP,
+    TEXT,
+    SPACE,
+    FRAC,
+    SQRT,
+    ROOT,
+    SCRIPTS,  // a: base, b: subscript, c: superscript
+    LIMITS,   // a: base, b: under, c: over
+    ACCENT,   // a: base; s: the accent; s2: its combining character
+    FENCE,    // a: content; s, s2: the delimiters
+    TABLE,    // rows
+    TROW,     // cells
+    TCELL,    // a: content
+    STYLE,    // a: content (display style)
+    ENCLOSE,  // a: content; cls: an E_ value
+}
+
+// operator classes
+pub const C_ORD: u8 = 0;
+pub const C_BIN: u8 = 1;
+pub const C_REL: u8 = 2;
+pub const C_OPEN: u8 = 3;
+pub const C_CLOSE: u8 = 4;
+pub const C_PUNCT: u8 = 5;
+pub const C_LARGE: u8 = 6;    // big operators: limits in display style
+pub const C_INT: u8 = 7;      // integrals: scripts at the side
+pub const C_FUNC: u8 = 8;     // functions (sin)
+pub const C_FUNCL: u8 = 9;    // functions with limits (lim)
+pub const C_GREEK: u8 = 10;   // an identifier
+pub const C_UGREEK: u8 = 11;  // an upright identifier
+pub const C_ACCENT: u8 = 12;
+
+// ENCLOSE kinds (a node's cls)
+pub const E_BOX: u8 = 0;       // \boxed: a frame
+pub const E_PHANTOM: u8 = 1;   // the space the content takes, empty
+pub const E_HPHANTOM: u8 = 2;  // its width only
+pub const E_VPHANTOM: u8 = 3;  // its height and depth only
+pub const E_CANCEL: u8 = 4;    // struck through, /
+pub const E_BCANCEL: u8 = 5;   // \
+pub const E_XCANCEL: u8 = 6;   // X
+
+// node flags
+pub const F_NORMAL: u16 = 1;  // an upright identifier
+pub const F_STRETCHY: u16 = 2;
+pub const F_THIN0: u16 = 4;  // a fraction without a line (\binom)
+pub const F_DISPLAY: u16 = 8;
+pub const F_TEXTSTYLE: u16 = 16;
+pub const F_UNDER: u16 = 32;   // an accent below
+pub const F_LIMITS: u16 = 64;  // limits forced (\limits)
+pub const F_NOLIMITS: u16 = 128;
+pub const F_FUNC: u16 = 256;    // a function name: U+2061 follows in MathML
+pub const F_SIZED: u16 = 512;   // a \big delimiter (width: its size in em)
+pub const F_LEFT: u16 = 1024;   // a table whose columns align left (cases)
+pub const F_ALIGN: u16 = 2048;  // a table whose columns align right, left, right, ...
+pub const F_SMALL: u16 = 4096;  // a small matrix
+
+/// A node of a Formula's tree.
+pub struct Node {
+    pub kind: Kind,
+    pub cls: u8,
+    pub flags: u16,
+    pub s: u32,
+    pub sl: u32,
+    pub s2: u32,
+    pub s2l: u32,
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub first: u32,
+    pub next: u32,
+    pub width: f32,
+}
+
+/// A parsed formula.
+pub nocopy struct Formula {
+    nodes: vec.Vec.[Node],
+    strs: strs.String,
+    source: strs.String,
+    pub root: u32,
+
+    pub fn deinit(self: *mut Formula) void {
+        self.nodes.deinit();
+        self.strs.deinit();
+        self.source.deinit();
+    }
+
+    /// The node with index `i`.
+    pub fn node(self: *Formula, i: u32) *Node {
+        return &self.nodes.items()[@as(usize, i)];
+    }
+
+    /// The node with index `i`, mutable.
+    pub fn node_mut(self: *mut Formula, i: u32) *mut Node {
+        return &mut self.nodes.items_mut()[@as(usize, i)];
+    }
+
+    /// The `len` bytes of the string table at `off`.
+    pub fn str(self: *Formula, off: u32, len: u32) []u8 {
+        return self.strs.bytes()[@as(usize, off)..@as(usize, off + len)];
+    }
+
+    /// MathML Core: a <math> element (display="block" for BLOCK), the
+    /// source kept in an annotation.
+    pub fn write_mathml(self: *Formula, w: io.Writer, display: Display) !void {
+        let mut o = Out.init(w);
+        if display == Display.BLOCK {
+            o.s("<math display=\"block\"><semantics>")!;
+        } else {
+            o.s("<math><semantics>")!;
+        }
+        mathml(self, &mut o, self.root)!;
+        o.s("<annotation encoding=\"application/x-tex\">")!;
+        o.esc(self.source.bytes())!;
+        o.s("</annotation></semantics></math>")!;
+        o.flush()!;
+    }
+
+    /// The formula as linear Unicode text.
+    pub fn write_text(self: *Formula, w: io.Writer) !void {
+        let mut o = Out.init(w);
+        text(self, &mut o, self.root)!;
+        o.flush()!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Public entry points
+// -----------------------------------------------------------------------------
+
+/// Parses TeX math (InvalidMath for bad input).
+pub fn parse(tex: []u8) TexError!Formula {
+    let mut info = ErrorInfo.{ offset: 0, message: "" };
+    return parse_with(tex, &mut info);
+}
+
+/// parse, with where and why it failed in info.
+pub fn parse_with(tex: []u8, info: *mut ErrorInfo) TexError!Formula {
+    let mut f = Formula.{ nodes: vec.Vec.[Node].init(), strs: strs.String.init(), source: strs.String.init(),
+                          root: NIL };
+    f.source.push_str(tex) catch |e| {
+        f.deinit();
+        return e;
+    };
+    let mut p = Parser.{ src: tex, pos: 0, f: &mut f, depth: 0, info: info, font: MathFont.NONE };
+    let r = row(&mut p) catch |e| {
+        f.deinit();
+        return e;
+    };
+    if p.pos < tex.len {
+        let msg: []u8 = "unexpected }";
+        if tex[p.pos] == '&' {
+            info.message = "& outside a table";
+        } else if tex[p.pos] == '\\' {
+            info.message = "unexpected command";
+        } else {
+            info.message = msg;
+        }
+        info.offset = p.pos;
+        f.deinit();
+        return error.InvalidMath;
+    }
+    f.root = r;
+    return f;
+}
+
+/// The MathML of TeX math, in new memory (free it with mem.free).
+pub fn to_mathml(tex: []u8, display: Display) ![]mut u8 {
+    let mut f = parse(tex)!;
+    defer f.deinit();
+    let mut s = strs.String.init();
+    f.write_mathml(s.writer(), display) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// TeX math as linear Unicode text, in new memory (free it with mem.free).
+pub fn to_text(tex: []u8) ![]mut u8 {
+    let mut f = parse(tex)!;
+    defer f.deinit();
+    let mut s = strs.String.init();
+    f.write_text(s.writer()) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+// -----------------------------------------------------------------------------
+// Output buffer
+// -----------------------------------------------------------------------------
+
+// A small buffer in front of the writer.
+struct Out {
+    w: io.Writer,
+    buf: [512]u8,
+    n: usize,
+
+    fn init(w: io.Writer) Out {
+        return Out.{ w: w, buf: [0; 512], n: 0 };
+    }
+
+    fn s(self: *mut Out, t: []u8) !void {
+        if (self.n + t.len) > self.buf.len {
+            self.flush()!;
+            if t.len > self.buf.len {
+                self.w.write_all(t)!;
+                return;
+            }
+        }
+        @mem_copy(self.buf[self.n..self.n + t.len], t);
+        self.n += t.len;
+    }
+
+    fn esc(self: *mut Out, t: []u8) !void {
+        let mut from: usize = 0;
+        for i in @as(usize, 0)..t.len {
+            let c = t[i];
+            let mut rep: []u8 = "";
+            if c == '&' {
+                rep = "&amp;";
+            } else if c == '<' {
+                rep = "&lt;";
+            } else if c == '>' {
+                rep = "&gt;";
+            } else if c == '"' {
+                rep = "&quot;";
+            }
+            if rep.len > 0 {
+                self.s(t[from..i])!;
+                self.s(rep)!;
+                from = i + 1;
+            }
+        }
+        self.s(t[from..])!;
+    }
+
+    fn flush(self: *mut Out) !void {
+        if self.n > 0 {
+            self.w.write_all(self.buf[..self.n])!;
+            self.n = 0;
+        }
+    }
+}

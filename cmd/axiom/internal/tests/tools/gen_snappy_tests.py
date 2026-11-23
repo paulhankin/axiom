@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Test files for std/compress/snappy, made by the reference library (through
+"""Test files for lib/compress/snappy, made by the reference library (through
 python-snappy, which wraps Google's snappy for the raw format and the Rust snap
 crate for the framing format) and by hand from the format descriptions.
 
     pip install python-snappy
     cmd/axiom/internal/tests/tools/gen_snappy_tests.py
 
-std/compress/snappy/testdata/ gets NAME.raw (a raw block) or NAME.sz (the
+lib/compress/snappy/testdata/ gets NAME.raw (a raw block) or NAME.sz (the
 framing format) with NAME.out, what it decompresses to; the library's decoders
 agree with every pair. corpus-*.raw and corpus-*.sz decompress to
-std/compress/testdata/corpus.bin (made by cmd/axiom/internal/tests/tools/gen_compress_tests.py) and
+lib/compress/testdata/corpus.bin (made by cmd/axiom/internal/tests/tools/gen_compress_tests.py) and
 have no .out file.
 """
 import os
@@ -17,8 +17,8 @@ import os
 import snappy
 
 here = os.path.dirname(os.path.abspath(__file__))
-out_dir = os.path.join(here, '..', '..', '..', '..', '..', 'std', 'compress', 'snappy', 'testdata')
-corpus = open(os.path.join(here, '..', '..', '..', '..', '..', 'std', 'compress', 'testdata', 'corpus.bin'), 'rb').read()
+out_dir = os.path.join(here, '..', '..', '..', '..', '..', 'lib', 'compress', 'snappy', 'testdata')
+corpus = open(os.path.join(here, '..', '..', '..', '..', '..', 'lib', 'compress', 'testdata', 'corpus.bin'), 'rb').read()
 os.makedirs(out_dir, exist_ok=True)
 
 

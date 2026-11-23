@@ -430,7 +430,10 @@ itself build on: it imports only itself. The libraries (`lib/`: protocols, forma
 compression, cryptography, text processing, graphics and audio) may import the standard
 library and each other. A path beginning with `pkg:` names a module of another package
 (§4.6). The rest of a `std/` or `lib/` path, and of a `pkg:name/` path, may not have a `..`
-part, so that it stays inside the library or the package's `src` (`E0218`). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
+part, so that it stays inside the library or the package's `src` (`E0218`). An import of a
+module that has left the standard library (for the libraries, or `crypto/md5`, `sha1`,
+`sha2`, `sha3` and `random`, which are `std/hash/...` and `std/os/random`) is `E0211` with a
+machine fix that imports it where it is. The `.ax` extension may be left out. A path that doesn't resolve to a readable file
 is `E0211`.
 
 A module in a directory named `internal`, or below one, may be imported only by modules in
@@ -2495,8 +2498,8 @@ fn crc32c_step(crc: u32, x: u64) u32 @multiversion("sse4.2", "crc") {
 }
 ```
 
-The standard library uses them in std/crypto (`aes_gcm`, `sha1`, `sha2`, `sha3`) and
-std/hash/crc, with the portable code where they are absent.
+The standard library uses them in std/hash (`sha1`, `sha2`, `sha3`, `crc`), and the
+libraries in lib/crypto/aes_gcm, with the portable code where they are absent.
 
 ---
 

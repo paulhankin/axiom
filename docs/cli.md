@@ -98,7 +98,7 @@ not check, so it answers in milliseconds, and also for a module that does not co
 | `axiom doc std/str.split` | An item: its signature, its whole documentation, the errors it can return (a named error set expanded into its names, with the sets it includes), and where it is declared. |
 | `axiom doc std/collections/vec.Vec` | A type: its public fields and variants with their comments, its documentation, its public methods. `std/collections/vec.Vec.push` is one method. |
 | `axiom doc pkg:<name>[/<module>][.<item>]` | A module of the package in the current directory, or of one of its dependencies (as `import "pkg:..."` names it). |
-| `axiom doc <file.ax>[.<item>]`, `axiom doc <dir>` | A module by its file; the modules under a directory (`std/net/` is the directory, `std/net` the module), or a package directory's entry module. |
+| `axiom doc <file.ax>[.<item>]`, `axiom doc <dir>` | A module by its file; the modules under a directory (`std/os/` is the directory, `std/os` the module), or a package directory's entry module. |
 | `axiom doc --search=<text> [<root>]` | The public items and methods under `root` (the standard library by default; a module, a directory or a package, as above) whose name contains `text` (ignoring ASCII case), then those whose documentation does: one a line, the item's full name, its signature and its first sentence. |
 
 An item's documentation is its `///` lines; a field's or a variant's, those or the

@@ -1,4 +1,4 @@
-// cmd/axiom/internal/tests/std_opt.mjs - the standard library's tests at -O2, on wasm32 and native.
+// cmd/axiom/internal/tests/std_opt.mjs - the standard library's and the libraries' tests at -O2, on wasm32 and native.
 //
 // `node cmd/axiom/internal/tests/run.mjs` runs each std module's `axiom test` once, at the
 // optimization level given (default -O0) and on one target. This sweep builds
@@ -53,7 +53,7 @@ function dirsUnder(dir) {
 const flagsOf = (src) => [...src.matchAll(/^\/\/ flags: (.*)$/gm)].flatMap((m) => m[1].trim().split(/\s+/));
 
 const work = [];
-for (const f of dirsUnder(path.join(root, 'std')).flatMap(files)) {
+for (const f of [...dirsUnder(path.join(root, 'std')), ...dirsUnder(path.join(root, 'lib'))].flatMap(files)) {
   const src = fs.readFileSync(f, 'utf8');
   if (!/^test "/m.test(src)) continue;
   for (const t of targets) {

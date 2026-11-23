@@ -1,0 +1,460 @@
+// =============================================================================
+// lib/graphics/svg/tests.ax - Tests for path data, Skia reference probes,
+// CSS cascade, opacity, use, masks, images, and text, part of lib/graphics/svg.
+// =============================================================================
+
+import "../../encoding/base64.ax" as base64;
+import "../color.ax" as color;
+import "../draw.ax" as draw;
+import "../font.ax" as font;
+import "../image.ax" as image;
+import "../image/png.ax" as png;
+import "../pdf.ax" as pdf;
+import "path.ax" as pathdata;
+import "std/fmt" as fmt;
+import "std/io" as io;
+import "std/math" as math;
+import "std/mem" as mem;
+import "std/os/fs" as files;
+import "std/str" as strs;
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+/// Renders an SVG text at its own size.
+fn render_text(text: []u8) infer!image.Image {
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    return render_image(&doc, @int_from_float(usize, doc.width), @int_from_float(usize, doc.height));
+}
+
+fn px(img: *image.Image, x: usize, y: usize) u32 {
+    return img.get(x, y).to_rgba8().to_u32();
+}
+
+fn near(img: *image.Image, x: usize, y: usize, want: u32, tol: u32) bool {
+    let got = px(img, x, y);
+    for k in @as(u32, 0)..4 {
+        let a = (got >> (8 * k)) & 0xff;
+        let b = (want >> (8 * k)) & 0xff;
+        if (@max(a, b) - @min(a, b)) > tol {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn void_fails(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+/// Whether the pixels around (x, y) are all the same.
+fn uniform(img: *image.Image, x: usize, y: usize) bool {
+    let c = px(img, x, y);
+    for dy in @as(usize, 0)..3 {
+        for dx in @as(usize, 0)..3 {
+            if ((x + dx) < 1) or ((y + dy) < 1) or ((x + dx) > img.width) or ((y + dy) > img.height) {
+                continue;
+            }
+            if px(img, (x + dx) - 1, (y + dy) - 1) != c {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn same_points(p: *draw.Path, want: []f64) bool {
+    let pts = p.pts.items();
+    if pts.len != want.len {
+        return false;
+    }
+    for i in @as(usize, 0)..pts.len {
+        if @abs(pts[i] - want[i]) > 1.0e-9 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn fails_parse(src: []u8, want: error) bool {
+    let mut d = parse(src) catch |e| return e == want;
+    d.deinit();
+    return false;
+}
+
+test "path data" {
+    let mut p = draw.Path.init();
+    defer p.deinit();
+    // relative commands, implicit linetos, H and V, close then draw on
+    parse_path_data("m10,20 30 0 v10 H5 z l5 5", &mut p)!;
+    let want: [12]f64 = [10.0, 20.0, 40.0, 20.0, 40.0, 30.0, 5.0, 30.0, 10.0, 20.0, 15.0, 25.0];
+    @expect(same_points(&p, want[..]));
+    @expect_eq(p.verbs.len(), 7);  // M L L L Z M L
+    @expect(p.verbs.get(4) == draw.Verb.CLOSE);
+    @expect(p.verbs.get(5) == draw.Verb.MOVE);
+    // compact numbers: "1.5.5" is 1.5 then .5, "-1-2" two numbers, exponents
+    p.clear();
+    parse_path_data("M1.5.5L-1-2l1e1,2E-1", &mut p)!;
+    let want2: [6]f64 = [1.5, 0.5, -1.0, -2.0, 9.0, -1.8];
+    @expect(same_points(&p, want2[..]));
+    // S and T reflect the last control point
+    p.clear();
+    parse_path_data("M0 0 C10 0 20 10 20 20 S30 40 40 40 M0 0 Q10 0 10 10 T20 20", &mut p)!;
+    let pts = p.pts.items();
+    @expect_eq(pts[8], 20.0);  // the reflection of (20, 10) about (20, 20)
+    @expect_eq(pts[9], 30.0);
+    @expect_eq(pts[20], 10.0);  // the reflection of (10, 0) about (10, 10)
+    @expect_eq(pts[21], 20.0);
+    // errors keep what came before
+    p.clear();
+    let r = parse_path_data("M0 0 L10 10 L20 x L30 30", &mut p);
+    @expect(void_fails(r, error.InvalidPathData));
+    @expect_eq(p.verbs.len(), 2);
+    p.clear();
+    @expect(void_fails(parse_path_data("L10 10", &mut p), error.InvalidPathData));
+    @expect_eq(p.verbs.len(), 0);
+    @expect(void_fails(parse_path_data("M0 0 Z 5", &mut p), error.InvalidPathData));
+    p.clear();
+    // arc flags need no separators
+    parse_path_data("M0 0a10 10 0 1110 10", &mut p)!;
+    @expect(p.verbs.get(p.verbs.len() - 1) == draw.Verb.CUBIC);
+    @expect_eq(p.pts.get(p.pts.len() - 2), 10.0);
+    @expect_eq(p.pts.get(p.pts.len() - 1), 10.0);
+    // round trip
+    let mut q = draw.Path.init();
+    defer q.deinit();
+    q.move_to(1.25, -2.0)!;
+    q.quad_to(3.0, 4.0, 5.0, 6.0)!;
+    q.cubic_to(7.0, 8.0, 9.5, 10.0, 11.0, 12.0)!;
+    q.line_to(0.001, 1000000.0)!;
+    q.close()!;
+    let d = path_data(&q)!;
+    defer mem.free(d);
+    @expect(strs.eq(d, "M1.25 -2Q3 4 5 6C7 8 9.5 10 11 12L0.001 1000000Z"));
+    p.clear();
+    parse_path_data(d, &mut p)!;
+    @expect(same_points(&p, q.pts.items()));
+    @expect_eq(p.verbs.len(), q.verbs.len());
+}
+
+/// The largest distance of the arc's curve points (sampled) from the
+/// ellipse centred at (cx, cy) with radii rx, ry rotated by rot degrees, in
+/// units of the radii.
+fn ellipse_error(p: *draw.Path, cx: f64, cy: f64, rx: f64, ry: f64, rot: f64) f64 {
+    let sc = math.sincos(rot * (math.PI / 180.0));
+    let pts = p.pts.items();
+    let mut worst: f64 = 0.0;
+    let mut k: usize = 2;  // after the move
+    let mut x0 = pts[0];
+    let mut y0 = pts[1];
+    while (k + 6) <= pts.len {
+        for i in @as(usize, 0)..21 {
+            let t = @float_from_int(f64, i) / 20.0;
+            let x = pathdata_cubic(x0, pts[k], pts[k + 2], pts[k + 4], t) - cx;
+            let y = pathdata_cubic(y0, pts[k + 1], pts[k + 3], pts[k + 5], t) - cy;
+            let u = ((x * sc.cos) + (y * sc.sin)) / rx;
+            let v = ((y * sc.cos) - (x * sc.sin)) / ry;
+            worst = @max(worst, @abs(@sqrt((u * u) + (v * v)) - 1.0));
+        }
+        x0 = pts[k + 4];
+        y0 = pts[k + 5];
+        k += 6;
+    }
+    return worst;
+}
+
+fn pathdata_cubic(a: f64, b: f64, c: f64, d: f64, t: f64) f64 {
+    let u = 1.0 - t;
+    return ((((u * u) * u) * a) + (((3.0 * (u * u)) * t) * b)) + ((((3.0 * u) * (t * t)) * c) + (((t * t) * t) * d));
+}
+
+test "arcs against the ellipse" {
+    let mut p = draw.Path.init();
+    defer p.deinit();
+    // a half circle from (0, 0) to (100, 0), sweeping through (50, -50)
+    parse_path_data("M0 0 A50 50 0 0 1 100 0", &mut p)!;
+    @expect_eq(p.verbs.len(), 3);
+    @expect(@abs(p.pts.get(6) - 50.0) < 1.0e-9);
+    @expect(@abs(p.pts.get(7) + 50.0) < 1.0e-9);
+    @expect(ellipse_error(&p, 50.0, 0.0, 50.0, 50.0, 0.0) < 3.0e-4);
+    // the other sweep goes through (50, 50); radii too small are scaled up
+    p.clear();
+    parse_path_data("M0 0 A1 1 0 0 0 100 0", &mut p)!;
+    @expect(@abs(p.pts.get(7) - 50.0) < 1.0e-9);
+    @expect(ellipse_error(&p, 50.0, 0.0, 50.0, 50.0, 0.0) < 3.0e-4);
+    // a rotated ellipse: from angle 0 to 90 degrees of x = 40 cos t, y = 20
+    // sin t turned by 30 degrees, the small arc and (centred on the
+    // reflection) the large one
+    let s30: f64 = 0.5;
+    let c30 = @sqrt(3.0) / 2.0;
+    let ax = 40.0 * c30;
+    let ay = 40.0 * s30;
+    let bx = -20.0 * s30;
+    let by = 20.0 * c30;
+    for large in @as(u32, 0)..2 {
+        for sweep in @as(u32, 0)..2 {
+            p.clear();
+            p.move_to(ax, ay)!;
+            arc_case(&mut p, ax, ay, bx, by, large == 1, sweep == 1)!;
+            // the centre: (0, 0) when large != sweep... as SVG F.6.5 picks
+            let mut cx: f64 = 0.0;
+            let mut cy: f64 = 0.0;
+            if (large == 1) == (sweep == 1) {
+                cx = ax + bx;
+                cy = ay + by;
+            }
+            @expect(ellipse_error(&p, cx, cy, 40.0, 20.0, 30.0) < 3.0e-4);
+            // it ends exactly at the end point
+            @expect_eq(p.pts.get(p.pts.len() - 2), bx);
+            @expect_eq(p.pts.get(p.pts.len() - 1), by);
+            // large arcs take more than half a turn: at least 3 segments
+            if large == 1 {
+                @expect(p.verbs.len() >= 4);
+            } else {
+                @expect_eq(p.verbs.len(), 2);
+            }
+        }
+    }
+    // degenerate arcs: same end point (nothing), zero radius (a line)
+    p.clear();
+    parse_path_data("M5 5 A10 10 0 0 0 5 5 A0 10 0 0 0 20 20", &mut p)!;
+    @expect_eq(p.verbs.len(), 2);
+    @expect(p.verbs.get(1) == draw.Verb.LINE);
+}
+
+fn arc_case(p: *mut draw.Path, ax: f64, ay: f64, bx: f64, by: f64, large: bool, sweep: bool) SvgError!void {
+    pathdata.arc_to(p, ax, ay, 40.0, 20.0, 30.0, large, sweep, bx, by)!;
+}
+
+fn check_probes(name: []u8) infer!void {
+    let mut pathb = strs.String.init();
+    defer pathb.deinit();
+    pathb.push_str("lib/graphics/svg/testdata/")!;
+    pathb.push_str(name)!;
+    pathb.push_str(".svg")!;
+    let text = files.read_file(pathb.bytes())!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    pathb.truncate(pathb.bytes().len - 3);
+    pathb.push_str("probes")!;
+    let probes = files.read_file(pathb.bytes())!;
+    defer mem.free(probes);
+    let mut lines = strs.lines(probes);
+    let mut n: usize = 0;
+    while let .some(line) = lines.next() {
+        if (line.len == 0) or (line[0] == '#') {
+            continue;
+        }
+        let mut f = strs.fields(line);
+        let mut v: [6]u32 = [0; 6];
+        for i in @as(usize, 0)..6 {
+            v[i] = fmt.parse_int.[u32](f.next() ?? {
+                @trap();
+            })!;
+        }
+        let got = img.get(@as(usize, v[0]), @as(usize, v[1])).to_rgba8();
+        let want: [4]u32 = [v[2], v[3], v[4], v[5]];
+        let have: [4]u32 = [@as(u32, got.r), @as(u32, got.g), @as(u32, got.b), @as(u32, got.a)];
+        let mut ok = (@max(have[3], want[3]) - @min(have[3], want[3])) <= 2;
+        if want[3] > 0 {
+            for k in @as(usize, 0)..3 {
+                if (@max(have[k], want[k]) - @min(have[k], want[k])) > 2 {
+                    ok = false;
+                }
+            }
+        }
+        if not ok {
+            let mut eb: [160]u8 = [0; 160];
+            let msg = fmt.bufprint(eb[..], "{}: ({}, {}) is {} {} {} {}, skia {} {} {} {}\n",
+                                   [fmt.str(name), fmt.int(v[0]), fmt.int(v[1]), fmt.int(have[0]), fmt.int(have[1]),
+                                    fmt.int(have[2]), fmt.int(have[3]), fmt.int(want[0]), fmt.int(want[1]),
+                                    fmt.int(want[2]), fmt.int(want[3])]) catch "";
+            io.stderr().write_all(msg) catch {};
+        }
+        @expect(ok);
+        n += 1;
+    }
+    @expect(n > 50);
+}
+
+test "rendering matches skia" {
+    let names: [12][]u8 = ["shapes", "paths", "gradients", "strokes", "transforms", "fit", "fit2", "fit3", "clip",
+                           "alpha", "groups", "focal"];
+    for name in names {
+        check_probes(name)!;
+    }
+}
+
+test "style sheets and the cascade" {
+    let doc = files.read_file("lib/graphics/svg/testdata/cascade.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    @expect(near(&img, 25, 25, 0x0000ffff, 0));    // type selector
+    @expect(near(&img, 75, 25, 0xffa500ff, 0));    // class
+    @expect(near(&img, 56, 25, 0x000000ff, 0));    // its stroke
+    @expect(near(&img, 125, 25, 0x008000ff, 0));   // id beats class
+    @expect(near(&img, 175, 25, 0xffff00ff, 0));   // the style attribute beats all
+    @expect(near(&img, 25, 75, 0x800080ff, 0));    // child combinator
+    @expect(near(&img, 75, 75, 0x008080ff, 0));    // currentColor
+    @expect(near(&img, 125, 75, 0x008000ff, 1));   // hsl()
+    @expect(near(&img, 175, 75, 0x0000ffff, 0));   // sheets beat presentation attributes
+    @expect(near(&img, 25, 125, 0x00ff00ff, 0));   // !important beats the style attribute
+    @expect(near(&img, 75, 125, 0x800000ff, 0));   // descendant combinator
+    @expect(near(&img, 125, 125, 0x000080ff, 0));  // compound classes
+    @expect(near(&img, 175, 125, 0x000000ff, 0));  // inherit: the root's black
+}
+
+test "opacity: groups and elements" {
+    let doc = files.read_file("lib/graphics/svg/testdata/opacity.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    // the group is drawn, then blended (as SVG renderers blend: sRGB values):
+    // its overlap is half blue over white
+    let half_blue: u32 = 0x8080ffff;
+    let half_red: u32 = 0xff8080ff;
+    @expect(near(&img, 20, 10, half_blue, 1));
+    @expect(near(&img, 5, 10, half_red, 1));
+    // two translucent elements blend each
+    @expect(near(&img, 70, 10, 0x8040bfff, 1));
+    // fill and stroke with opacity: a group, so the stroke over the fill is half blue
+    @expect(near(&img, 12, 45, half_blue, 1));
+    @expect(near(&img, 25, 45, half_red, 1));
+    @expect(near(&img, 75, 45, half_red, 1));
+}
+
+test "use, symbol, switch and nested viewports" {
+    let doc = files.read_file("lib/graphics/svg/testdata/use.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    @expect(near(&img, 35, 150, 0x008000ff, 0));   // the symbol, scaled into the use's box
+    @expect(near(&img, 90, 130, 0x000000ff, 0));   // the nested viewport's content
+    @expect_eq(px(&img, 75, 170), 0);              // and its clip: no red outside it
+    @expect(near(&img, 150, 150, 0x008080ff, 0));  // switch: the first child only
+    @expect(near(&img, 160, 20, 0xffa500ff, 0));   // the use cycle is cut, the rest drawn
+}
+
+test "masks" {
+    let text = files.read_file("lib/graphics/svg/testdata/mask.svg")!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    @expect(near(&img, 5, 5, 0x0000ffff, 0));    // under the mask's white
+    @expect_eq(px(&img, 25, 25), 0);             // its black: a hole
+    @expect(near(&img, 75, 10, 0x0000ff80, 1));  // its grey: half
+    @expect(near(&img, 10, 60, 0xff0000ff, 0));  // a mask in bounding box units
+    @expect_eq(px(&img, 30, 60), 0);
+    @expect(near(&img, 65, 60, 0x008000ff, 0));  // a mask's region
+    @expect_eq(px(&img, 55, 60), 0);
+    @expect_eq(px(&img, 75, 60), 0);
+    // a PDF page draws what is masked whole
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let mut pd = pdf.Document.init();
+    defer pd.deinit();
+    let mut page = pd.page(100.0, 70.0)!;
+    defer page.deinit();
+    render_page(&doc, &mut page, 0.0, 0.0, 100.0, 70.0)!;
+}
+
+fn data_uri_svg(img: *image.Image) ![]mut u8 {
+    let data = png.encode(img, 6)!;
+    defer mem.free(data);
+    let mut s = strs.String.init();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'>")!;
+    for k in @as(usize, 0)..2 {
+        if k == 0 {
+            s.push_str("<image x='10' y='10' width='80' height='80' preserveAspectRatio='none' href='")!;
+        } else {
+            s.push_str("<image x='110' y='10' width='80' height='40' href='")!;
+        }
+        s.push_str("data:image/png;base64,\n")!;
+        base64.encode_to(s.writer(), data, base64.STANDARD)!;
+        s.push_str("'/>")!;
+    }
+    s.push_str("<image x='0' y='0' width='10' height='10' href='data:image/png;base64,AAAA'/>")!;
+    s.push_str("<image x='0' y='0' width='10' height='10' href='picture.png'/></svg>")!;
+    return s.take();
+}
+
+test "images" {
+    let mut src = image.Image.init(4, 4, 4, image.Depth.U8)!;
+    defer src.deinit();
+    let cols: [4]u32 = [0xff0000ff, 0x00ff00ff, 0x0000ffff, 0xffff00ff];
+    for y in @as(usize, 0)..4 {
+        for x in @as(usize, 0)..4 {
+            src.set(x, y, color.Color.from_rgba8(color.Rgba8.from_u32(cols[(x / 2) + (2 * (y / 2))])));
+        }
+    }
+    let text = data_uri_svg(&src)!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    // stretched (none): each quadrant 40 pixels square
+    @expect(near(&img, 20, 20, 0xff0000ff, 0));
+    @expect(near(&img, 70, 20, 0x00ff00ff, 0));
+    @expect(near(&img, 20, 70, 0x0000ffff, 0));
+    @expect(near(&img, 70, 70, 0xffff00ff, 0));
+    // meet: 40 x 40, centred in 80 x 40
+    @expect_eq(px(&img, 125, 30), 0);
+    @expect(near(&img, 135, 15, 0xff0000ff, 0));
+    @expect(near(&img, 160, 40, 0xffff00ff, 0));
+    @expect_eq(px(&img, 175, 30), 0);
+    // the broken and external images draw nothing
+    @expect_eq(px(&img, 5, 5), 0);
+}
+
+test "text" {
+    let mut f = font.Font.load("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch return;
+    defer f.deinit();
+    let docs: [3][]u8 = ["text-middle", "text-end", "text-tspan"];
+    for k in @as(usize, 0)..3 {
+        let mut nb = strs.String.init();
+        defer nb.deinit();
+        nb.push_str("lib/graphics/svg/testdata/")!;
+        nb.push_str(docs[k])!;
+        nb.push_str(".svg")!;
+        let text = files.read_file(nb.bytes())!;
+        defer mem.free(text);
+        let mut doc = parse(text)!;
+        defer doc.deinit();
+        let mut img = render_image_with(&doc, 200, 60, RenderOptions.with_font(&f))!;
+        defer img.deinit();
+        let mut minx: usize = 1000;
+        let mut maxx: usize = 0;
+        let mut red_top: usize = 1000;
+        for y in @as(usize, 0)..60 {
+            for x in @as(usize, 0)..200 {
+                let c = img.get(x, y);
+                if c.a > 0.5 {
+                    minx = @min(minx, x);
+                    maxx = @max(maxx, x);
+                    if c.r > 0.5 {
+                        red_top = @min(red_top, y);
+                    }
+                }
+            }
+        }
+        @expect(maxx > minx);
+        if k == 0 {
+            let mid = (minx + maxx) / 2;
+            @expect((mid >= 97) and (mid <= 103));
+        } else if k == 1 {
+            @expect((maxx <= 190) and (maxx >= 180));  // ("I" has side bearings)
+        } else {
+            @expect(red_top > 30);  // the tspan moved down
+        }
+        // without a font nothing is drawn
+        let mut bare = render_image(&doc, 200, 60)!;
+        defer bare.deinit();
+        @expect_eq(px(&bare, (minx + maxx) / 2, 40), 0);
+    }
+}

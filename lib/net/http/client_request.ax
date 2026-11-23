@@ -1,0 +1,450 @@
+// =============================================================================
+// lib/net/http/client_request.ax - HTTP client request execution, redirects,
+// cookies, proxy tunnelling, HTTP/1.1, and HTTP/2 (part of lib/net/http).
+// =============================================================================
+
+import "../../encoding/base64.ax" as base64;
+import "../hpack.ax" as hpack;
+import "../http2.ax" as http2;
+import "../tls.ax" as tls;
+import "../url.ax" as urls;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/net" as net;
+import "std/str" as strs;
+import "std/time" as time;
+
+let H2_ALPN: [2][]u8 = ["h2", "http/1.1"];
+
+fn request_h2(t: *mut Transport, u: Url, method: []u8, headers: []Header, body: []u8,
+              opts: ClientOptions) !ClientResponse {
+    let r = io.Reader.{ ctx: @ptr_cast(*mut void, t), read_fn: transport_read };
+    let w = io.Writer.{ ctx: @ptr_cast(*mut void, t), write_fn: transport_write };
+    let mut auth = strs.String.init();
+    defer auth.deinit();
+    auth.push_str(u.hostname)!;
+    if ((u.port != 80) and not u.secure) or ((u.port != 443) and u.secure) {
+        fmt.write(auth.writer(), ":{}", [fmt.int(u.port)])!;
+    }
+    let mut scheme: []u8 = "http";
+    if u.secure {
+        scheme = "https";
+    }
+    let mut c = http2.Client.init(r, w, auth.bytes(), scheme)!;
+    defer c.deinit();
+    c.conn.max_body = opts.max_body_bytes;
+    // names in lower case, for HTTP/2
+    let mut store = strs.String.init();
+    defer store.deinit();
+    for x in headers {
+        for ch in x.name {
+            store.push(strs.to_lower_byte(ch))!;
+        }
+    }
+    let mut hs = vec.Vec.[hpack.Header].init();
+    defer hs.deinit();
+    let mut at: usize = 0;
+    let lower = store.bytes();
+    for x in headers {
+        hs.push(hpack.Header.{ name: lower[at..at + x.name.len], value: x.value })!;
+        at += x.name.len;
+    }
+    let mut resp = c.request(method, u.target, hs.items(), body)!;
+    defer resp.deinit();
+    // a ClientResponse owning copies
+    let mut total: usize = 0;
+    for x in resp.headers {
+        total += x.name.len + x.value.len;
+    }
+    let hm = mem.alloc.[u8](total)!;
+    let hdrs = mem.alloc.[Header](resp.headers.len) catch |e| {
+        mem.free(hm);
+        return e;
+    };
+    let mut k: usize = 0;
+    for i in @as(usize, 0)..resp.headers.len {
+        let x = resp.headers[i];
+        @mem_copy(hm[k..k + x.name.len], x.name);
+        @mem_copy(hm[k + x.name.len..k + x.name.len + x.value.len], x.value);
+        hdrs[i] = Header.{ name: hm[k..k + x.name.len], value: hm[k + x.name.len..k + x.name.len + x.value.len] };
+        k += x.name.len + x.value.len;
+    }
+    let mut rb = strs.String.init();
+    rb.push_str(resp.body) catch |e| {
+        mem.free(hm);
+        mem.free(hdrs);
+        return e;
+    };
+    return ClientResponse.{ status: resp.status, reason: reason_phrase(resp.status), headers: hdrs, body: rb.bytes(),
+                            head_mem: hm, header_mem: hdrs, body_mem: rb };
+}
+
+fn transport_read(ctx: *mut void, buf: []mut u8) !usize {
+    let t = @ptr_cast(*mut Transport, ctx);
+    return t.read(buf)!;
+}
+
+fn transport_write(ctx: *mut void, bytes: []u8) !usize {
+    let t = @ptr_cast(*mut Transport, ctx);
+    t.write_all(bytes)!;
+    return bytes.len;
+}
+
+/// Sends a request and reads the whole response, following redirects
+/// (opts.max_redirects) and keeping cookies (opts.with_cookies). Each
+/// request goes on a new connection; Host, Content-Length and
+/// "Connection: close" are added. A redirect to another origin drops the
+/// Authorization, Cookie and Proxy-Authorization headers given here; a 303
+/// (or a 301 or 302 answering a POST) is followed with a GET and no body.
+pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
+    // nothing a caller passes may change the request's framing
+    if method.len == 0 {
+        return error.InvalidArgument;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return error.InvalidArgument;
+        }
+    }
+    for x in headers {
+        if (x.name.len == 0) or strs.eq_ignore_case(x.name, "Host") or strs.eq_ignore_case(x.name, "Content-Length") or
+           strs.eq_ignore_case(x.name, "Transfer-Encoding") or strs.eq_ignore_case(x.name, "Connection") {
+            return error.InvalidArgument;
+        }
+        for ch in x.name {
+            if not is_token_char(ch) {
+                return error.InvalidArgument;
+            }
+        }
+        for ch in x.value {
+            if ((ch < 0x20) and (ch != '\t')) or (ch == 0x7f) {
+                return error.InvalidArgument;
+            }
+        }
+    }
+    let mut cur = strs.String.init();
+    defer cur.deinit();
+    cur.push_str(url)!;
+    let mut m = method;
+    let mut b = body;
+    let mut sensitive = true;  // Authorization and Cookie headers still go along
+    let mut hops: u32 = 0;
+    loop {
+        let u = parse_url(cur.bytes())!;
+        let mut resp = exchange(m, u, headers, b, opts, sensitive)!;
+        let st = resp.status;
+        let redirect = (st == 301) or (st == 302) or (st == 303) or (st == 307) or (st == 308);
+        if (hops >= opts.max_redirects) or not redirect {
+            return resp;
+        }
+        let loc = resp.header("Location") ?? return resp;
+        let next = urls.join(cur.bytes(), loc) catch |e| {
+            if e == error.OutOfMemory {
+                resp.deinit();
+                return e;
+            }
+            return resp;  // a Location that is no URL: the 3xx is the answer
+        };
+        let nu = parse_url(next) catch {
+            mem.free(next);
+            return resp;  // not http(s)
+        };
+        if not (strs.eq_ignore_case(nu.hostname, u.hostname) and (nu.port == u.port) and (nu.secure == u.secure)) {
+            sensitive = false;
+        }
+        if ((st == 303) and not strs.eq(m, "HEAD")) or (((st == 301) or (st == 302)) and strs.eq(m, "POST")) {
+            m = "GET";
+            b = "";
+        }
+        resp.deinit();
+        cur.clear();
+        cur.push_str(next) catch |e| {
+            mem.free(next);
+            return e;
+        };
+        mem.free(next);
+        hops += 1;
+    }
+}
+
+// One request of request(): the headers for this hop, cookies in and out.
+fn exchange(method: []u8, u: Url, headers: []Header, body: []u8, opts: ClientOptions, sensitive: bool) !ClientResponse {
+    let mut hs = vec.Vec.[Header].init();
+    defer hs.deinit();
+    let mut ck = strs.String.init();
+    defer ck.deinit();
+    for x in headers {
+        let is_cookie = strs.eq_ignore_case(x.name, "Cookie");
+        if not sensitive and
+           (is_cookie or strs.eq_ignore_case(x.name, "Authorization") or
+            strs.eq_ignore_case(x.name, "Proxy-Authorization")) {
+            continue;
+        }
+        if is_cookie and opts.has_jar {
+            if ck.len() > 0 {
+                ck.push_str("; ")!;
+            }
+            ck.push_str(x.value)!;
+            continue;
+        }
+        hs.push(x)!;
+    }
+    let path = target_path(u.target);
+    if opts.has_jar {
+        let jc = opts.jar.header_alloc(u.hostname, path, u.secure, time.now())!;
+        defer mem.free(jc);
+        if (jc.len > 0) and (ck.len() > 0) {
+            ck.push_str("; ")!;
+        }
+        ck.push_str(jc)!;
+    }
+    if ck.len() > 0 {
+        hs.push(Header.{ name: "Cookie", value: ck.bytes() })!;
+    }
+    let mut resp = request_once(method, u, hs.items(), body, opts)!;
+    if opts.has_jar {
+        let now = time.now();
+        for x in resp.headers {
+            if strs.eq_ignore_case(x.name, "Set-Cookie") {
+                opts.jar.set_cookie(u.hostname, path, u.secure, x.value, now) catch |e| {
+                    resp.deinit();
+                    return e;
+                };
+            }
+        }
+    }
+    return resp;
+}
+
+// The path of a request target, without its query.
+fn target_path(target: []u8) []u8 {
+    let q = strs.index_of_byte(target, '?') ?? target.len;
+    return target[..q];
+}
+
+// "Basic base64(user:password)" for a proxy's credentials, in buf.
+fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) { BadUrl }![]u8 {
+    let mut raw: [384]u8 = [0; 384];
+    // (percent_decode needs room for its input: decoding only shortens)
+    if (pa.user.len >= 256) or (pa.password.len > (raw.len - 256)) {
+        return error.BadUrl;
+    }
+    let user = urls.percent_decode(pa.user, raw[..256], false) catch return error.BadUrl;
+    raw[user.len] = ':';
+    let pw = urls.percent_decode(pa.password, raw[user.len + 1..], false) catch return error.BadUrl;
+    let cred = raw[..(user.len + 1) + pw.len];
+    if (6 + base64.encoded_len(cred.len)) > buf.len {
+        return error.BadUrl;
+    }
+    @mem_copy(buf[..6], "Basic ");
+    let enc = base64.encode(cred, buf[6..], base64.STANDARD);
+    return buf[..6 + enc.len];
+}
+
+// Asks the proxy on tcp for a tunnel to u's host and port (CONNECT) and
+// reads its answer, a byte at a time so as to read nothing beyond it.
+fn connect_tunnel(tcp: net.TcpStream, u: Url, auth: []u8) !void {
+    let mut h = strs.String.init();
+    defer h.deinit();
+    fmt.write(h.writer(), "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n", [fmt.str(u.hostname), fmt.int(u.port),
+                                                                        fmt.str(u.hostname), fmt.int(u.port)])!;
+    if auth.len > 0 {
+        fmt.write(h.writer(), "Proxy-Authorization: {}\r\n", [fmt.str(auth)])!;
+    }
+    h.push_str("\r\n")!;
+    tcp.write_all(h.bytes())!;
+    let mut head: [8192]u8 = [0; 8192];
+    let mut n: usize = 0;
+    loop {
+        if n == head.len {
+            return error.BadResponse;
+        }
+        if tcp.read(head[n..n + 1])! == 0 {
+            return error.BadResponse;
+        }
+        n += 1;
+        if (n >= 4) and strs.eq(head[n - 4..n], "\r\n\r\n") {
+            break;
+        }
+    }
+    let status = parse_status(head[..n])!;
+    if (status < 200) or (status > 299) {
+        return error.ProxyRefused;
+    }
+}
+
+fn request_once(method: []u8, u: Url, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
+    let mut via: []u8 = "";
+    if opts.has_proxy {
+        via = opts.proxy.url_for(u);
+    }
+    let proxied = via.len > 0;
+    let mut abuf: [512]u8 = [0; 512];
+    let mut pauth: []u8 = "";
+    let mut tcp_host = u.hostname;
+    let mut tcp_port = u.port;
+    if proxied {
+        let pa = parse_proxy_url(via)!;
+        if pa.has_auth {
+            pauth = proxy_basic_auth(pa, abuf[..])!;
+        }
+        tcp_host = pa.hostname;
+        tcp_port = pa.port;
+    }
+    let tcp = net.connect(tcp_host, tcp_port)!;
+    tcp.set_timeout(opts.timeout_ms) catch |e| {
+        tcp.close();
+        return e;
+    };
+    if proxied and u.secure {
+        connect_tunnel(tcp, u, pauth) catch |e| {
+            tcp.close();
+            return e;
+        };
+    }
+    let mut stream = Transport.plain(tcp);
+    let mut use_h2 = opts.http2 and not u.secure and not proxied;
+    if u.secure {
+        let mut cfg = opts.tls_config;
+        if not opts.has_tls_config {
+            cfg = system_tls() catch |e| {
+                tcp.close();
+                return e;
+            };
+        }
+        // (offering h2 by ALPN without copying the configuration)
+        let mut alpn = cfg.alpn;
+        if opts.http2 {
+            alpn = H2_ALPN[..];
+        }
+        stream = Transport.over_tls(tls.client_with_alpn(tcp, u.hostname, cfg, alpn)!);  // closes tcp on failure
+        use_h2 = opts.http2 and strs.eq(stream.tls.protocol(), "h2");
+    }
+    defer stream.close();
+    if use_h2 {
+        return request_h2(&mut stream, u, method, headers, body, opts)!;
+    }
+    // the request head
+    let mut h = strs.String.init();
+    defer h.deinit();
+    let w = h.writer();
+    let mut hostport = strs.String.init();
+    defer hostport.deinit();
+    hostport.push_str(u.hostname)!;
+    if ((u.port != 80) and not u.secure) or ((u.port != 443) and u.secure) {
+        fmt.write(hostport.writer(), ":{}", [fmt.int(u.port)])!;
+    }
+    if proxied and not u.secure {
+        // to a proxy, the absolute form of the target
+        fmt.write(w, "{} http://{}{} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(hostport.bytes()),
+                                                             fmt.str(u.target), fmt.str(hostport.bytes())])!;
+        if pauth.len > 0 {
+            fmt.write(w, "\r\nProxy-Authorization: {}", [fmt.str(pauth)])!;
+        }
+    } else {
+        fmt.write(w, "{} {} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(u.target), fmt.str(hostport.bytes())])!;
+    }
+    h.push_str("\r\nConnection: close\r\n")!;
+    if (body.len > 0) or @mem_eq(method, "POST") or @mem_eq(method, "PUT") {
+        fmt.write(w, "Content-Length: {}\r\n", [fmt.int(body.len)])!;
+    }
+    for x in headers {
+        fmt.write(w, "{}: {}\r\n", [fmt.str(x.name), fmt.str(x.value)])!;
+    }
+    h.push_str("\r\n")!;
+    h.push_str(body)!;
+    stream.write_all(h.bytes())!;
+    // the response
+    let mut c = Conn.init(stream, 1048576)!;
+    let mut head_len: usize = 0;
+    let mut status: u16 = 0;
+    loop {
+        head_len = c.read_head() catch |e| {
+            c.deinit();
+            return e;
+        };
+        if head_len == 0 {
+            c.deinit();
+            return error.BadResponse;
+        }
+        status = parse_status(c.buf[c.start..c.start + head_len]) catch |e| {
+            c.deinit();
+            return e;
+        };
+        if (status >= 100) and (status < 200) and (status != 101) {
+            // an interim response: skip it
+            c.start += head_len;
+            c.reset();
+            continue;
+        }
+        break;
+    }
+    let head = c.buf[c.start..c.start + head_len];
+    c.start += head_len;
+    c.pin = c.start;
+    let line_end = strs.index_of_byte(head, '\n') ?? {
+        c.deinit();
+        return error.BadResponse;
+    };
+    let hmem = mem.alloc.[Header](100) catch |e| {
+        c.deinit();
+        return e;
+    };
+    let nh = parse_headers(head[line_end + 1..], hmem) catch |e| {
+        c.deinit();
+        mem.free(hmem);
+        return e;
+    };
+    let mut rb = strs.String.init();
+    let has_body = not (@mem_eq(method, "HEAD") or (status == 204) or (status == 304));
+    if has_body {
+        read_response_body(&mut c, hmem[..nh], &mut rb, opts.max_body_bytes) catch |e| {
+            c.deinit();
+            mem.free(hmem);
+            rb.deinit();
+            return e;
+        };
+    }
+    let mut reason = head[..line_end];
+    if (reason.len > 0) and (reason[reason.len - 1] == '\r') {
+        reason = reason[..reason.len - 1];
+    }
+    reason = reason[@min(reason.len, 13)..];
+    return ClientResponse.{
+        status: status,
+        reason: reason,
+        headers: hmem[..nh],
+        body: rb.bytes(),
+        head_mem: c.buf,
+        header_mem: hmem,
+        body_mem: rb,
+    };
+}
+
+fn read_response_body(c: *mut Conn, headers: []Header, out: *mut strs.String, max: usize) !void {
+    let fr = framing(headers) catch return error.BadResponse;
+    if fr.chunked {
+        c.read_chunked(out, max)!;
+    } else if fr.has_length {
+        if fr.length > max {
+            return error.TooLarge;
+        }
+        c.read_into(out, fr.length)!;
+    } else {
+        c.read_to_end(out, max)!;
+    }
+}
+
+/// The status code from "HTTP/1.1 200 OK".
+fn parse_status(head: []u8) { BadResponse }!u16 {
+    if (head.len < 12) or not strs.starts_with(head, "HTTP/1.") or (head[8] != ' ') {
+        return error.BadResponse;
+    }
+    let code = fmt.parse_int.[u16](head[9..12]) catch return error.BadResponse;
+    if (code < 100) or (code > 999) {
+        return error.BadResponse;
+    }
+    return code;
+}
